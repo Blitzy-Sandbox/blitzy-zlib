@@ -7,3 +7,4 @@
 pub mod tables;
 pub mod fixed;
 pub mod state;
+pub mod fast;
