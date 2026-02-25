@@ -1,0 +1,20 @@
+# Clippy lint configuration for zlib-rs workspace
+# Enforces strict lint mode per project coding standards
+
+# Maximum cognitive complexity allowed for functions
+cognitive-complexity-threshold = 50
+
+# Maximum number of lines in a function body
+too-many-lines-threshold = 200
+
+# Maximum number of arguments a function can have
+too-many-arguments-threshold = 8
+
+# Maximum number of struct fields that are booleans
+max-struct-bools = 3
+
+# Type complexity threshold
+type-complexity-threshold = 350
+
+# MSRV for lint checks — matches rust-toolchain.toml
+msrv = "1.85.0"

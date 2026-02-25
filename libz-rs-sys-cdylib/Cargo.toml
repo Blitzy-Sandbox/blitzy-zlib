@@ -1,0 +1,23 @@
+[package]
+name = "libz-rs-sys-cdylib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C-compatible shared library (cdylib) for zlib-rs — drop-in replacement for libz.so/zlib1.dll"
+
+[lib]
+name = "z"
+crate-type = ["cdylib"]
+
+[dependencies]
+libz-rs-sys = { path = "../libz-rs-sys" }
+
+[features]
+default = ["gz-io", "gzip"]
+gz-io = ["libz-rs-sys/gz-io"]
+gzip = ["libz-rs-sys/gzip"]
+
+# Note: panic = "abort" for release builds is set in the workspace root Cargo.toml
+# This is required for the cdylib to prevent undefined behavior from unwinding across FFI boundaries

@@ -1,0 +1,16 @@
+# Cargo build configuration for the zlib-rs workspace
+#
+# This file provides LLVM optimization flags that complement the
+# [profile.release] section in the workspace Cargo.toml.
+#
+# Performance target: within 90% throughput of C zlib
+# (per project requirements)
+
+[build]
+# Enable LLVM DFA (Deterministic Finite Automaton) jump threading pass.
+# This optimization is particularly beneficial for the zlib state machines:
+# - Deflate engine: 8-state progression (INIT → FINISH)
+# - Inflate engine: 30+ mode state machine (HEAD → SYNC)
+# Combined with LTO and single codegen-unit (set in workspace Cargo.toml),
+# this achieves near C-level performance for state-machine-heavy code.
+rustflags = ["-C", "llvm-args=-enable-dfa-jump-thread"]

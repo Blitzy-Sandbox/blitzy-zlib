@@ -1,0 +1,25 @@
+[package]
+name = "zlib-rs-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Integration tests for zlib-rs"
+
+[lib]
+name = "zlib_rs_tests"
+path = "src/lib.rs"
+
+[dependencies]
+zlib-rs = { path = "../zlib-rs" }
+libz-rs-sys = { path = "../libz-rs-sys" }
+
+[dev-dependencies]
+flate2 = { workspace = true }
+tempfile = { workspace = true }
+crc = { workspace = true }
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"

@@ -1,0 +1,30 @@
+[workspace]
+members = [
+    "zlib-rs",
+    "libz-rs-sys",
+    "libz-rs-sys-cdylib",
+    "tests",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+license = "Zlib AND (MIT OR Apache-2.0)"
+repository = "https://github.com/ArtifactedAI/zlib-rs"
+description = "A pure Rust implementation of zlib"
+
+[workspace.dependencies]
+libc = "0.2"
+cfg-if = "1.0"
+criterion = "0.5"
+crc = "3.2"
+flate2 = "1.0"
+tempfile = "3.14"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"

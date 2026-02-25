@@ -1,0 +1,44 @@
+[package]
+name = "zlib-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A pure safe Rust implementation of the zlib compression library"
+categories = ["compression", "no-std"]
+keywords = ["zlib", "deflate", "compression", "gzip", "inflate"]
+
+[lib]
+name = "zlib_rs"
+path = "src/lib.rs"
+
+[features]
+default = ["gz-io", "gzip"]
+gz-io = []
+gzip = []
+
+[dependencies]
+cfg-if = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "deflate_bench"
+harness = false
+
+[[bench]]
+name = "inflate_bench"
+harness = false
+
+[[bench]]
+name = "checksum_bench"
+harness = false
+
+[lints.rust]
+missing_docs = "deny"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"

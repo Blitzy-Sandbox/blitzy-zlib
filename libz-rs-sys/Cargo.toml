@@ -1,0 +1,26 @@
+[package]
+name = "libz-rs-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C-compatible FFI bindings for zlib-rs, a pure Rust zlib implementation"
+
+build = "build.rs"
+
+[lib]
+name = "libz_rs_sys"
+
+[dependencies]
+zlib-rs = { path = "../zlib-rs" }
+libc = { workspace = true }
+
+[features]
+default = ["export-symbols"]
+export-symbols = []
+gz-io = ["zlib-rs/gz-io"]
+gzip = ["zlib-rs/gzip"]
+
+[package.metadata.docs.rs]
+all-features = true
