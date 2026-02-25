@@ -14,27 +14,50 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use zlib_rs::{
-    // Error types and result alias
-    ZlibError, ReturnCode, ZlibResult,
-    error_message,
-    // Stream types
-    ZStream, GzHeader, StreamState,
+    Code,
+    CodeType,
+    ENOUGH_DISTS,
+    FlushMode,
+    GzHeader,
+    InflateBackInput,
+    InflateBackOutput,
+    InflateMode,
     // Inflate state introspection (for coverage testing)
-    InflateState, InflateMode,
-    // Inflate public API
-    inflate_init, inflate_init2, inflate, inflate_end,
-    inflate_reset2, inflate_prime, inflate_set_dictionary,
-    inflate_get_header, inflate_copy, inflate_sync,
-    inflate_sync_point, inflate_undermine, inflate_mark,
-    // InflateBack (callback-based decompression)
-    inflate_back_init, inflate_back, inflate_back_end,
-    InflateBackInput, InflateBackOutput,
-    // Huffman table builder (for cover_trees)
-    inflate_table, Code, CodeType, ENOUGH_DISTS,
-    // Version
-    zlib_version, ZLIB_VERSION,
+    InflateState,
+    ReturnCode,
+    StreamState,
     // Constants
-    Z_NO_FLUSH, Z_TREES, FlushMode,
+    Z_NO_FLUSH,
+    Z_TREES,
+    ZLIB_VERSION,
+    // Stream types
+    ZStream,
+    // Error types and result alias
+    ZlibError,
+    ZlibResult,
+    error_message,
+    inflate,
+    inflate_back,
+    inflate_back_end,
+    // InflateBack (callback-based decompression)
+    inflate_back_init,
+    inflate_copy,
+    inflate_end,
+    inflate_get_header,
+    // Inflate public API
+    inflate_init,
+    inflate_init2,
+    inflate_mark,
+    inflate_prime,
+    inflate_reset2,
+    inflate_set_dictionary,
+    inflate_sync,
+    inflate_sync_point,
+    // Huffman table builder (for cover_trees)
+    inflate_table,
+    inflate_undermine,
+    // Version
+    zlib_version,
 };
 
 // ---------------------------------------------------------------------------
@@ -558,7 +581,11 @@ fn cover_wrap() {
         let mut out = [0u8; 1];
         strm.set_output(&mut out);
         let ret = inflate(&mut strm, Z_NO_FLUSH);
-        assert_eq!(result_to_code(ret), Z_STREAM_ERROR, "inflate(uninit) should fail");
+        assert_eq!(
+            result_to_code(ret),
+            Z_STREAM_ERROR,
+            "inflate(uninit) should fail"
+        );
 
         // inflateEnd with uninitialised stream → Z_STREAM_ERROR
         let ret = inflate_end(&mut strm);
@@ -672,11 +699,7 @@ fn cover_wrap() {
 
         // inflatePrime(16, 0)
         let ret = inflate_prime(&mut strm, 16, 0);
-        assert_eq!(
-            result_to_code(ret),
-            Z_OK,
-            "inflatePrime(16, 0) failed"
-        );
+        assert_eq!(result_to_code(ret), Z_OK, "inflatePrime(16, 0) failed");
 
         // inflateSync with insufficient sync pattern → Z_DATA_ERROR
         let sync_in = [0x80u8];
@@ -943,11 +966,7 @@ fn cover_inflate() {
         "long code",
         0,
     );
-    try_inflate(
-        "ed c0 1 1 0 0 0 40 20 ff 57 1b 42 2c 4f",
-        "length extra",
-        0,
-    );
+    try_inflate("ed c0 1 1 0 0 0 40 20 ff 57 1b 42 2c 4f", "length extra", 0);
     try_inflate(
         "ed cf c1 b1 2c 47 10 c4 30 fa 6f 35 1d 1 82 59 3d fb be 2e 2a fc f c",
         "long distance and extra",

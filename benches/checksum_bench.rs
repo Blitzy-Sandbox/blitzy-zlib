@@ -16,7 +16,7 @@
 //!
 //! Run with: `cargo bench --bench checksum_bench`
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use zlib_rs::checksum::{adler32, adler32_combine, adler32_z, crc32, crc32_combine, crc32_z};
 
 // ---------------------------------------------------------------------------
@@ -84,19 +84,15 @@ fn bench_adler32(c: &mut Criterion) {
 
         // Incremental computation in INCREMENTAL_CHUNK-byte blocks, measuring
         // the overhead of repeated function calls with partial updates.
-        group.bench_with_input(
-            BenchmarkId::new("incremental", size),
-            &data,
-            |b, data| {
-                b.iter(|| {
-                    let mut checksum: u32 = 1;
-                    for chunk in data.chunks(INCREMENTAL_CHUNK) {
-                        checksum = adler32_z(checksum, chunk);
-                    }
-                    checksum
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("incremental", size), &data, |b, data| {
+            b.iter(|| {
+                let mut checksum: u32 = 1;
+                for chunk in data.chunks(INCREMENTAL_CHUNK) {
+                    checksum = adler32_z(checksum, chunk);
+                }
+                checksum
+            });
+        });
     }
 
     // --- Single-byte update throughput ---
@@ -140,19 +136,15 @@ fn bench_crc32(c: &mut Criterion) {
         });
 
         // Incremental computation in INCREMENTAL_CHUNK-byte blocks.
-        group.bench_with_input(
-            BenchmarkId::new("incremental", size),
-            &data,
-            |b, data| {
-                b.iter(|| {
-                    let mut checksum: u32 = 0;
-                    for chunk in data.chunks(INCREMENTAL_CHUNK) {
-                        checksum = crc32_z(checksum, chunk);
-                    }
-                    checksum
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("incremental", size), &data, |b, data| {
+            b.iter(|| {
+                let mut checksum: u32 = 0;
+                for chunk in data.chunks(INCREMENTAL_CHUNK) {
+                    checksum = crc32_z(checksum, chunk);
+                }
+                checksum
+            });
+        });
     }
 
     // --- Single-byte update throughput ---

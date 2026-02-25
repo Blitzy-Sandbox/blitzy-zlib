@@ -1247,14 +1247,7 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                     // out_pos is zero-based into out_buf, so the initial
                     // value is always 0 (not out_start, which tracks the
                     // initial *remaining* output capacity in the C convention).
-                    inflate_fast(
-                        state,
-                        in_buf,
-                        out_buf,
-                        &mut in_pos,
-                        &mut out_pos,
-                        0,
-                    );
+                    inflate_fast(state, in_buf, out_buf, &mut in_pos, &mut out_pos, 0);
                     have = (in_buf.len() - in_pos) as u32;
                     left = (out_buf.len() - out_pos) as u32;
                     hold = state.hold;

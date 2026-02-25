@@ -14,14 +14,16 @@
 // strategy functions (deflate_stored for level 0, deflate_fast for levels
 // 1-3, deflate_slow for levels 4-9).
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use zlib_rs::constants::{
     DEF_MEM_LEVEL, MAX_WBITS, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY, Z_DEFLATED, Z_FILTERED,
     Z_FINISH, Z_FIXED, Z_HUFFMAN_ONLY, Z_NO_FLUSH, Z_RLE,
 };
 use zlib_rs::error::ReturnCode;
-use zlib_rs::{compress2, compress_bound, deflate, deflate_bound, deflate_end, deflate_init2, ZStream};
+use zlib_rs::{
+    ZStream, compress_bound, compress2, deflate, deflate_bound, deflate_end, deflate_init2,
+};
 
 // ===========================================================================
 // Test data generators

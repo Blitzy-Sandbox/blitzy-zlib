@@ -67,10 +67,7 @@ fn hello_with_null() -> Vec<u8> {
 fn test_version() {
     // C: if (zlibVersion()[0] != myVersion[0]) { ... }
     let version = zlib_version();
-    assert!(
-        !version.is_empty(),
-        "zlib_version() returned empty string"
-    );
+    assert!(!version.is_empty(), "zlib_version() returned empty string");
 
     // Verify the version string matches the compile-time constant.
     assert_eq!(
@@ -98,16 +95,14 @@ fn test_compress() {
     let mut uncompr = vec![0u8; UNCOMPR_LEN];
 
     // compress(compr, &comprLen, hello, len)
-    let compr_used = compress(&mut compr, &hello_data)
-        .expect("compress error");
+    let compr_used = compress(&mut compr, &hello_data).expect("compress error");
     assert!(compr_used > 0, "compress produced zero bytes");
 
     // Garbage-fill uncompr before decompression — matches C: strcpy(uncompr, "garbage")
     uncompr[..7].copy_from_slice(b"garbage");
 
     // uncompress(uncompr, &uncomprLen, compr, comprLen)
-    let uncompr_used = uncompress(&mut uncompr, &compr[..compr_used])
-        .expect("uncompress error");
+    let uncompr_used = uncompress(&mut uncompr, &compr[..compr_used]).expect("uncompress error");
 
     // Verify decompressed data matches original.
     assert_eq!(
@@ -130,20 +125,27 @@ fn test_gzio() {
 
     // === Write phase (C lines 99-114) ===
     {
-        let mut file = gz_open(gz_path.as_path(), "wb")
-            .expect("gzopen error (write)");
+        let mut file = gz_open(gz_path.as_path(), "wb").expect("gzopen error (write)");
 
         // gzputc(file, 'h')
         gz_putc(&mut file, b'h').expect("gzputc error");
 
         // gzputs(file, "ello") → verify returns 4
         let puts_result = gz_puts(&mut file, "ello").expect("gzputs error");
-        assert_eq!(puts_result, 4, "gzputs err: expected 4, got {}", puts_result);
+        assert_eq!(
+            puts_result, 4,
+            "gzputs err: expected 4, got {}",
+            puts_result
+        );
 
         // gzprintf(file, ", %s!", "hello") → verify returns 8
         let formatted = format!(", {}!", "hello");
         let printf_result = gz_printf(&mut file, &formatted).expect("gzprintf error");
-        assert_eq!(printf_result, 8, "gzprintf err: expected 8, got {}", printf_result);
+        assert_eq!(
+            printf_result, 8,
+            "gzprintf err: expected 8, got {}",
+            printf_result
+        );
 
         // gzseek(file, 1L, SEEK_CUR) — add one zero byte
         // SEEK_CUR = 1
@@ -155,16 +157,14 @@ fn test_gzio() {
 
     // === Read phase (C lines 116-163) ===
     {
-        let mut file = gz_open(gz_path.as_path(), "rb")
-            .expect("gzopen error (read)");
+        let mut file = gz_open(gz_path.as_path(), "rb").expect("gzopen error (read)");
 
         let mut uncompr = vec![0u8; UNCOMPR_LEN];
         // Garbage-fill: strcpy(uncompr, "garbage")
         uncompr[..7].copy_from_slice(b"garbage");
 
         // gzread(file, uncompr, uncomprLen) → verify returns len (14)
-        let read_len = gz_read(&mut file, &mut uncompr)
-            .expect("gzread error");
+        let read_len = gz_read(&mut file, &mut uncompr).expect("gzread error");
         assert_eq!(
             read_len, HELLO_LEN,
             "gzread err: expected {}, got {}",
@@ -180,8 +180,7 @@ fn test_gzio() {
         );
 
         // gzseek(file, -8L, SEEK_CUR) → pos must be 6
-        let pos = gz_seek(&mut file, -8, 1)
-            .expect("gzseek error (read)");
+        let pos = gz_seek(&mut file, -8, 1).expect("gzseek error (read)");
         assert_eq!(pos, 6, "gzseek error, pos={}", pos);
 
         // gztell must equal pos
@@ -198,8 +197,7 @@ fn test_gzio() {
 
         // gzgets(file, uncompr, uncomprLen)
         let mut gets_buf = vec![0u8; UNCOMPR_LEN];
-        let gets_len = gz_gets(&mut file, &mut gets_buf)
-            .expect("gzgets error");
+        let gets_len = gz_gets(&mut file, &mut gets_buf).expect("gzgets error");
         // The Rust gz_gets returns the raw byte count (includes embedded null
         // from gz_seek), while C uses strlen which stops at null. The C test
         // checks strlen == 7 for " hello!"; the total bytes read by Rust
@@ -334,11 +332,11 @@ fn test_large_deflate_inflate() {
 
         // First pass: Feed uncompr (mostly zeros, should compress well).
         c_stream.set_input(&uncompr);
-        check_ok(deflate(&mut c_stream, Z_NO_FLUSH), "deflate (large, pass 1)");
-        assert_eq!(
-            c_stream.avail_in, 0,
-            "deflate not greedy"
+        check_ok(
+            deflate(&mut c_stream, Z_NO_FLUSH),
+            "deflate (large, pass 1)",
         );
+        assert_eq!(c_stream.avail_in, 0, "deflate not greedy");
 
         // Switch to no compression and feed compressed data back.
         // C: deflateParams(&c_stream, Z_NO_COMPRESSION, Z_DEFAULT_STRATEGY)
@@ -350,14 +348,20 @@ fn test_large_deflate_inflate() {
         // Feed compr data (up to uncomprLen/2 bytes) — use a snapshot of compr.
         let pass2_data: Vec<u8> = compr[..uncompr_len / 2].to_vec();
         c_stream.set_input(&pass2_data);
-        check_ok(deflate(&mut c_stream, Z_NO_FLUSH), "deflate (large, pass 2)");
+        check_ok(
+            deflate(&mut c_stream, Z_NO_FLUSH),
+            "deflate (large, pass 2)",
+        );
 
         // Switch back to best compression with filtered strategy.
         // NOTE: Return value intentionally not checked (matches C test/example.c).
         let _ = deflate_params(&mut c_stream, Z_BEST_COMPRESSION, Z_FILTERED);
         // Feed uncompr again.
         c_stream.set_input(&uncompr);
-        check_ok(deflate(&mut c_stream, Z_NO_FLUSH), "deflate (large, pass 3)");
+        check_ok(
+            deflate(&mut c_stream, Z_NO_FLUSH),
+            "deflate (large, pass 3)",
+        );
 
         // Finish.
         let result = deflate(&mut c_stream, Z_FINISH);
@@ -608,18 +612,13 @@ fn full_regression_sequence() {
     // 1. test_compress (C lines 66-85)
     // -----------------------------------------------------------------------
     {
-        let compr_used = compress(&mut compr, &hello_data)
-            .expect("compress error");
+        let compr_used = compress(&mut compr, &hello_data).expect("compress error");
         assert!(compr_used > 0);
 
         uncompr[..7].copy_from_slice(b"garbage");
-        let uncompr_used = uncompress(&mut uncompr, &compr[..compr_used])
-            .expect("uncompress error");
-        assert_eq!(
-            &uncompr[..uncompr_used],
-            &hello_data[..],
-            "bad uncompress"
-        );
+        let uncompr_used =
+            uncompress(&mut uncompr, &compr[..compr_used]).expect("uncompress error");
+        assert_eq!(&uncompr[..uncompr_used], &hello_data[..], "bad uncompress");
     }
 
     // -----------------------------------------------------------------------
@@ -632,8 +631,7 @@ fn full_regression_sequence() {
 
         // Write phase.
         {
-            let mut file = gz_open(gz_path.as_path(), "wb")
-                .expect("gzopen error (write)");
+            let mut file = gz_open(gz_path.as_path(), "wb").expect("gzopen error (write)");
 
             gz_putc(&mut file, b'h').expect("gzputc error");
             let puts_result = gz_puts(&mut file, "ello").expect("gzputs error");
@@ -649,23 +647,16 @@ fn full_regression_sequence() {
 
         // Read phase.
         {
-            let mut file = gz_open(gz_path.as_path(), "rb")
-                .expect("gzopen error (read)");
+            let mut file = gz_open(gz_path.as_path(), "rb").expect("gzopen error (read)");
 
             uncompr[..7].copy_from_slice(b"garbage");
-            let read_len = gz_read(&mut file, &mut uncompr)
-                .expect("gzread error");
+            let read_len = gz_read(&mut file, &mut uncompr).expect("gzread error");
             assert_eq!(read_len, HELLO_LEN, "gzread length mismatch");
 
             let hello_null = hello_with_null();
-            assert_eq!(
-                &uncompr[..hello_null.len()],
-                &hello_null[..],
-                "bad gzread"
-            );
+            assert_eq!(&uncompr[..hello_null.len()], &hello_null[..], "bad gzread");
 
-            let pos = gz_seek(&mut file, -8, 1)
-                .expect("gzseek error (read)");
+            let pos = gz_seek(&mut file, -8, 1).expect("gzseek error (read)");
             assert_eq!(pos, 6, "gzseek error, pos={}", pos);
             assert_eq!(gz_tell(&file), pos, "gztell mismatch");
 
@@ -676,15 +667,10 @@ fn full_regression_sequence() {
             assert_eq!(unch, b' ', "gzungetc error");
 
             let mut gets_buf = vec![0u8; UNCOMPR_LEN];
-            let gets_len = gz_gets(&mut file, &mut gets_buf)
-                .expect("gzgets error");
+            let gets_len = gz_gets(&mut file, &mut gets_buf).expect("gzgets error");
             // Rust gz_gets returns raw byte count (>=7), C checks strlen==7.
             assert!(gets_len >= 7, "gzgets err after gzseek: len={}", gets_len);
-            assert_eq!(
-                &gets_buf[..7],
-                b" hello!",
-                "bad gzgets after gzseek"
-            );
+            assert_eq!(&gets_buf[..7], b" hello!", "bad gzgets after gzseek");
 
             gz_close(&mut file).expect("gzclose error (read)");
         }
@@ -760,11 +746,7 @@ fn full_regression_sequence() {
         check_ok(inflate_end(&mut d_stream), "inflateEnd");
 
         let decompressed_len = d_stream.total_out as usize;
-        assert_eq!(
-            &uncompr[..decompressed_len],
-            &hello_data[..],
-            "bad inflate"
-        );
+        assert_eq!(&uncompr[..decompressed_len], &hello_data[..], "bad inflate");
     }
 
     // -----------------------------------------------------------------------
@@ -785,7 +767,10 @@ fn full_regression_sequence() {
 
         // First pass: feed uncompr (mostly zeros).
         c_stream.set_input(&uncompr);
-        check_ok(deflate(&mut c_stream, Z_NO_FLUSH), "deflate (large, pass 1)");
+        check_ok(
+            deflate(&mut c_stream, Z_NO_FLUSH),
+            "deflate (large, pass 1)",
+        );
         assert_eq!(c_stream.avail_in, 0, "deflate not greedy");
 
         // Switch to no compression.
@@ -793,13 +778,19 @@ fn full_regression_sequence() {
         let _ = deflate_params(&mut c_stream, Z_NO_COMPRESSION, Z_DEFAULT_STRATEGY);
         let pass2_data: Vec<u8> = compr[..uncompr_len / 2].to_vec();
         c_stream.set_input(&pass2_data);
-        check_ok(deflate(&mut c_stream, Z_NO_FLUSH), "deflate (large, pass 2)");
+        check_ok(
+            deflate(&mut c_stream, Z_NO_FLUSH),
+            "deflate (large, pass 2)",
+        );
 
         // Switch to best compression.
         // NOTE: Return value intentionally not checked (matches C test).
         let _ = deflate_params(&mut c_stream, Z_BEST_COMPRESSION, Z_FILTERED);
         c_stream.set_input(&uncompr);
-        check_ok(deflate(&mut c_stream, Z_NO_FLUSH), "deflate (large, pass 3)");
+        check_ok(
+            deflate(&mut c_stream, Z_NO_FLUSH),
+            "deflate (large, pass 3)",
+        );
 
         let result = deflate(&mut c_stream, Z_FINISH);
         match result {
@@ -968,10 +959,7 @@ fn full_regression_sequence() {
             match result {
                 Ok(ReturnCode::StreamEnd) => break,
                 Ok(ReturnCode::NeedDict) => {
-                    assert_eq!(
-                        d_stream.adler, dict_id,
-                        "unexpected dictionary"
-                    );
+                    assert_eq!(d_stream.adler, dict_id, "unexpected dictionary");
                     check_ok(
                         inflate_set_dictionary(&mut d_stream, DICTIONARY),
                         "inflateSetDictionary",

@@ -774,14 +774,7 @@ where
                     // computes `written = start - avail_out`; the
                     // Rust adaptation computes `written = out_pos -
                     // start`, so start must be 0.
-                    inflate_fast(
-                        state,
-                        &input_buf,
-                        &mut work_buf,
-                        &mut fi_in,
-                        &mut fi_out,
-                        0,
-                    );
+                    inflate_fast(state, &input_buf, &mut work_buf, &mut fi_in, &mut fi_out, 0);
                     state.window[..wsize].copy_from_slice(&work_buf[..wsize]);
 
                     in_pos = fi_in;

@@ -19,9 +19,8 @@
 // ============================================================================
 
 use zlib_rs::checksum::{
-    adler32, adler32_combine, adler32_z,
-    crc32, crc32_combine, crc32_combine_gen, crc32_combine_op, crc32_z,
-    get_crc_table,
+    adler32, adler32_combine, adler32_z, crc32, crc32_combine, crc32_combine_gen, crc32_combine_op,
+    crc32_z, get_crc_table,
 };
 
 // ============================================================================
@@ -177,7 +176,8 @@ fn adler32_combine_basic() {
     let reference = adler32(1, data);
 
     assert_eq!(
-        combined, reference,
+        combined,
+        reference,
         "adler32_combine({checksum_a:#010X}, {checksum_b:#010X}, {}) != {reference:#010X}",
         part_b.len()
     );
@@ -225,7 +225,10 @@ fn adler32_combine_empty() {
 #[test]
 fn adler32_combine_negative_length() {
     let result = adler32_combine(0x12345678, 0x87654321, -1);
-    assert_eq!(result, 0xFFFF_FFFF, "negative length should return sentinel");
+    assert_eq!(
+        result, 0xFFFF_FFFF,
+        "negative length should return sentinel"
+    );
 }
 
 /// Adler-32 combine with longer data segments for additional coverage.
@@ -239,10 +242,7 @@ fn adler32_combine_long_data() {
         let a = adler32(1, &data[..split]);
         let b = adler32(1, &data[split..]);
         let combined = adler32_combine(a, b, (data.len() - split) as i64);
-        assert_eq!(
-            combined, full,
-            "long data combine failed at split={split}"
-        );
+        assert_eq!(combined, full, "long data combine failed at split={split}");
     }
 }
 
@@ -353,7 +353,8 @@ fn crc32_combine_basic() {
     let reference = crc32(0, data);
 
     assert_eq!(
-        combined, reference,
+        combined,
+        reference,
         "crc32_combine({crc_a:#010X}, {crc_b:#010X}, {}) != {reference:#010X}",
         part_b.len()
     );
@@ -440,10 +441,7 @@ fn crc32_combine_gen_op_various_lengths() {
         let combined_direct = crc32_combine(crc_a, crc_b, len_b);
         let full = crc32(0, &data);
 
-        assert_eq!(
-            combined_op, full,
-            "gen+op failed at split={split}"
-        );
+        assert_eq!(combined_op, full, "gen+op failed at split={split}");
         assert_eq!(
             combined_direct, full,
             "direct combine failed at split={split}"
@@ -476,7 +474,8 @@ fn crc32_combine_op_reuse() {
         let reference = crc32(0, &full_data);
 
         assert_eq!(
-            combined, reference,
+            combined,
+            reference,
             "reused operator failed for {:?}+{:?}",
             std::str::from_utf8(data1).unwrap_or("?"),
             std::str::from_utf8(data2).unwrap_or("?"),
@@ -507,10 +506,7 @@ fn crc32_combine_long_data() {
         let a = crc32(0, &data[..split]);
         let b = crc32(0, &data[split..]);
         let combined = crc32_combine(a, b, (data.len() - split) as i64);
-        assert_eq!(
-            combined, full,
-            "long data combine failed at split={split}"
-        );
+        assert_eq!(combined, full, "long data combine failed at split={split}");
     }
 }
 
@@ -543,7 +539,10 @@ fn crc32_table_first_entries() {
     assert_eq!(table[255], 0x2D02_EF8D);
 
     // Additional known entries for extra verification
-    assert_eq!(table[128], 0xEDB8_8320, "table[128] should be the polynomial");
+    assert_eq!(
+        table[128], 0xEDB8_8320,
+        "table[128] should be the polynomial"
+    );
 }
 
 /// Verify that get_crc_table() returns a consistent reference.
@@ -582,10 +581,7 @@ fn crc32_table_matches_single_byte_crcs() {
         let computed = crc32(0, &[i]);
         // Just ensure we get a non-trivial result for non-zero bytes
         if i > 0 {
-            assert_ne!(
-                computed, 0,
-                "CRC-32 of byte {i:#04X} should not be 0"
-            );
+            assert_ne!(computed, 0, "CRC-32 of byte {i:#04X} should not be 0");
         }
     }
 }
@@ -688,7 +684,9 @@ fn checksums_large_input() {
 /// Test with alternating byte patterns.
 #[test]
 fn checksums_alternating_pattern() {
-    let data: Vec<u8> = (0..1024).map(|i| if i % 2 == 0 { 0xAA } else { 0x55 }).collect();
+    let data: Vec<u8> = (0..1024)
+        .map(|i| if i % 2 == 0 { 0xAA } else { 0x55 })
+        .collect();
 
     let a = adler32(1, &data);
     let c = crc32(0, &data);
@@ -723,15 +721,16 @@ fn adler32_z_matches_adler32() {
         b"123456789",
         &[0x00],
         &[0xFF],
-        &vec![0u8; 5552],       // NMAX
-        &vec![0xABu8; 10000],   // > NMAX
+        &vec![0u8; 5552],     // NMAX
+        &vec![0xABu8; 10000], // > NMAX
     ];
 
     for data in test_data {
         let via_adler32 = adler32(1, data);
         let via_adler32_z = adler32_z(1, data);
         assert_eq!(
-            via_adler32, via_adler32_z,
+            via_adler32,
+            via_adler32_z,
             "adler32 vs adler32_z mismatch for data len={}",
             data.len()
         );
@@ -761,7 +760,8 @@ fn crc32_z_matches_crc32() {
         let via_crc32 = crc32(0, data);
         let via_crc32_z = crc32_z(0, data);
         assert_eq!(
-            via_crc32, via_crc32_z,
+            via_crc32,
+            via_crc32_z,
             "crc32 vs crc32_z mismatch for data len={}",
             data.len()
         );
@@ -929,7 +929,9 @@ fn adler32_dictionary_hello() {
 #[test]
 fn checksum_nmax_boundary_precision() {
     const NMAX: usize = 5552;
-    let data: Vec<u8> = (0..NMAX + 100).map(|i| ((i * 7 + 13) % 256) as u8).collect();
+    let data: Vec<u8> = (0..NMAX + 100)
+        .map(|i| ((i * 7 + 13) % 256) as u8)
+        .collect();
 
     // Test sizes right around NMAX
     for size in (NMAX - 2)..=(NMAX + 2) {

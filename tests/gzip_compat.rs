@@ -453,11 +453,7 @@ fn gz_compression_levels() {
             let mut gzf = gz_open(&path, "rb").expect("gz_open rb");
             let mut buf = vec![0u8; test_data.len() + 64];
             let n = gz_read(&mut gzf, &mut buf).expect("gz_read");
-            assert_eq!(
-                &buf[..n], test_data,
-                "level {} data mismatch",
-                level
-            );
+            assert_eq!(&buf[..n], test_data, "level {} data mismatch", level);
             gz_close(&mut gzf).expect("gz_close");
         }
         cleanup(&path);
@@ -576,11 +572,7 @@ fn gz_multistream_read() {
             "multistream read too short: {} bytes",
             total.len()
         );
-        assert_eq!(
-            &total[..part_a.len()],
-            part_a,
-            "first stream data mismatch"
-        );
+        assert_eq!(&total[..part_a.len()], part_a, "first stream data mismatch");
 
         gz_close(&mut gzf).expect("gz_close");
     }
@@ -606,8 +598,7 @@ fn gz_fread_fwrite() {
     {
         let mut gzf = gz_open(&path, "wb").expect("gz_open wb");
         let items_written =
-            gz_fwrite(&mut gzf, &data[..item_size * nitems], item_size, nitems)
-                .expect("gz_fwrite");
+            gz_fwrite(&mut gzf, &data[..item_size * nitems], item_size, nitems).expect("gz_fwrite");
         assert_eq!(items_written, nitems, "gz_fwrite items mismatch");
         gz_close(&mut gzf).expect("gz_close");
     }
@@ -669,13 +660,11 @@ fn gz_setparams_midstream() {
         gz_write(&mut gzf, b"level 6 data ").expect("gz_write 6");
 
         // Switch to best compression
-        gz_setparams(&mut gzf, Z_BEST_COMPRESSION, Z_DEFAULT_STRATEGY)
-            .expect("gz_setparams best");
+        gz_setparams(&mut gzf, Z_BEST_COMPRESSION, Z_DEFAULT_STRATEGY).expect("gz_setparams best");
         gz_write(&mut gzf, b"best compression data").expect("gz_write best");
 
         // Switch to no compression
-        gz_setparams(&mut gzf, Z_NO_COMPRESSION, Z_DEFAULT_STRATEGY)
-            .expect("gz_setparams none");
+        gz_setparams(&mut gzf, Z_NO_COMPRESSION, Z_DEFAULT_STRATEGY).expect("gz_setparams none");
         gz_write(&mut gzf, b" none data").expect("gz_write none");
 
         gz_close(&mut gzf).expect("gz_close");
@@ -686,10 +675,7 @@ fn gz_setparams_midstream() {
         let mut gzf = gz_open(&path, "rb").expect("gz_open rb");
         let mut buf = [0u8; 256];
         let n = gz_read(&mut gzf, &mut buf).expect("gz_read");
-        assert_eq!(
-            &buf[..n],
-            b"level 6 data best compression data none data"
-        );
+        assert_eq!(&buf[..n], b"level 6 data best compression data none data");
         gz_close(&mut gzf).expect("gz_close");
     }
 

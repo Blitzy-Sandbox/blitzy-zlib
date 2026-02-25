@@ -31,9 +31,9 @@
 
 use zlib_rs::*;
 
+use flate2::Compression;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
-use flate2::Compression;
 use std::io::{Read, Write};
 
 // ============================================================================
@@ -83,8 +83,15 @@ fn rust_streaming_compress(
     strategy: i32,
 ) -> Vec<u8> {
     let mut strm = ZStream::new();
-    deflate_init2(&mut strm, level, Z_DEFLATED, window_bits, mem_level, strategy)
-        .expect("deflate_init2 should succeed");
+    deflate_init2(
+        &mut strm,
+        level,
+        Z_DEFLATED,
+        window_bits,
+        mem_level,
+        strategy,
+    )
+    .expect("deflate_init2 should succeed");
 
     // Allocate generous output buffer
     let bound = compress_bound(data.len()) + 256;
@@ -135,7 +142,9 @@ fn rust_streaming_decompress(data: &[u8], window_bits: i32, expected_size: usize
 /// Compresses `data` using flate2 (C zlib backend) as a zlib stream.
 fn c_zlib_compress(data: &[u8], level: u32) -> Vec<u8> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
-    encoder.write_all(data).expect("flate2 ZlibEncoder write_all");
+    encoder
+        .write_all(data)
+        .expect("flate2 ZlibEncoder write_all");
     encoder.finish().expect("flate2 ZlibEncoder finish")
 }
 
@@ -152,7 +161,9 @@ fn c_zlib_decompress(data: &[u8]) -> Vec<u8> {
 /// Compresses `data` using flate2 raw DEFLATE encoder.
 fn c_raw_deflate_compress(data: &[u8], level: u32) -> Vec<u8> {
     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(level));
-    encoder.write_all(data).expect("flate2 DeflateEncoder write_all");
+    encoder
+        .write_all(data)
+        .expect("flate2 DeflateEncoder write_all");
     encoder.finish().expect("flate2 DeflateEncoder finish")
 }
 
@@ -254,13 +265,16 @@ fn rust_compress_c_decompress_raw_deflate() {
     let data = generate_compressible_data(2048);
 
     // Raw DEFLATE: window_bits = -15
-    let compressed =
-        rust_streaming_compress(&data, Z_DEFAULT_COMPRESSION, -MAX_WBITS, DEF_MEM_LEVEL, Z_DEFAULT_STRATEGY);
+    let compressed = rust_streaming_compress(
+        &data,
+        Z_DEFAULT_COMPRESSION,
+        -MAX_WBITS,
+        DEF_MEM_LEVEL,
+        Z_DEFAULT_STRATEGY,
+    );
 
     if compressed.is_empty() {
-        eprintln!(
-            "WARNING: raw DEFLATE produced 0 bytes (known limitation) — skipping"
-        );
+        eprintln!("WARNING: raw DEFLATE produced 0 bytes (known limitation) — skipping");
         return;
     }
 
@@ -281,8 +295,7 @@ fn c_compress_rust_decompress_zlib() {
     // Test with HELLO
     let compressed = c_zlib_compress(HELLO, 6);
     let mut decompressed = vec![0u8; HELLO.len() + 256];
-    let decomp_len =
-        uncompress(&mut decompressed, &compressed).expect("uncompress should succeed");
+    let decomp_len = uncompress(&mut decompressed, &compressed).expect("uncompress should succeed");
     assert_eq!(
         &decompressed[..decomp_len],
         HELLO,
@@ -293,8 +306,7 @@ fn c_compress_rust_decompress_zlib() {
     let large_data = generate_compressible_data(LARGE_DATA_SIZE);
     let compressed = c_zlib_compress(&large_data, 6);
     let mut decompressed = vec![0u8; large_data.len() + 256];
-    let decomp_len =
-        uncompress(&mut decompressed, &compressed).expect("uncompress large data");
+    let decomp_len = uncompress(&mut decompressed, &compressed).expect("uncompress large data");
     assert_eq!(
         &decompressed[..decomp_len],
         &large_data[..],
@@ -434,13 +446,8 @@ fn rust_strategies_fast_level_c_decompress() {
     ];
 
     for (name, strategy) in &strategies {
-        let compressed = rust_streaming_compress(
-            &data,
-            Z_BEST_SPEED,
-            MAX_WBITS,
-            DEF_MEM_LEVEL,
-            *strategy,
-        );
+        let compressed =
+            rust_streaming_compress(&data, Z_BEST_SPEED, MAX_WBITS, DEF_MEM_LEVEL, *strategy);
 
         let decompressed = c_zlib_decompress(&compressed);
         assert_eq!(
@@ -750,8 +757,7 @@ fn interop_single_byte() {
     // C → Rust
     let c_compressed = c_zlib_compress(data, 6);
     let mut decompressed = vec![0u8; 256];
-    let decomp_len =
-        uncompress(&mut decompressed, &c_compressed).expect("uncompress single byte");
+    let decomp_len = uncompress(&mut decompressed, &c_compressed).expect("uncompress single byte");
     assert_eq!(
         &decompressed[..decomp_len],
         data,
@@ -767,8 +773,7 @@ fn interop_all_zeros() {
     // Rust → C
     let bound = compress_bound(data.len());
     let mut compressed = vec![0u8; bound];
-    let comp_len =
-        compress(&mut compressed, &data).expect("compress all-zeros");
+    let comp_len = compress(&mut compressed, &data).expect("compress all-zeros");
     compressed.truncate(comp_len);
     let decompressed = c_zlib_decompress(&compressed);
     assert_eq!(decompressed, data, "All-zeros: Rust→C mismatch");
@@ -776,8 +781,7 @@ fn interop_all_zeros() {
     // C → Rust
     let c_compressed = c_zlib_compress(&data, 6);
     let mut decompressed = vec![0u8; data.len() + 256];
-    let decomp_len =
-        uncompress(&mut decompressed, &c_compressed).expect("uncompress all-zeros");
+    let decomp_len = uncompress(&mut decompressed, &c_compressed).expect("uncompress all-zeros");
     assert_eq!(
         &decompressed[..decomp_len],
         &data[..],
@@ -816,11 +820,7 @@ fn gzip_all_levels_interop() {
             Z_DEFAULT_STRATEGY,
         );
         let decompressed = c_gzip_decompress(&compressed);
-        assert_eq!(
-            decompressed, data,
-            "Gzip level {}: Rust→C mismatch",
-            level
-        );
+        assert_eq!(decompressed, data, "Gzip level {}: Rust→C mismatch", level);
 
         // C gzip → Rust gunzip
         let c_compressed = c_gzip_compress(&data, level as u32);

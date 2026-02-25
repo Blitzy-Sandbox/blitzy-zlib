@@ -17,9 +17,9 @@
 // Imports
 // ============================================================================
 
-use zlib_rs::*;
-use quickcheck::{quickcheck, TestResult};
+use quickcheck::{TestResult, quickcheck};
 use rand::Rng;
+use zlib_rs::*;
 
 // ============================================================================
 // Helper: one-call compress/decompress round-trip verification
@@ -63,7 +63,11 @@ fn streaming_roundtrip_full(
     strategy: i32,
 ) -> bool {
     // --- Compress ---
-    let bound = if data.is_empty() { 64 } else { data.len() * 2 + 64 };
+    let bound = if data.is_empty() {
+        64
+    } else {
+        data.len() * 2 + 64
+    };
     let mut compressed = vec![0u8; bound];
 
     let mut c_stream = ZStream::new();
@@ -129,13 +133,7 @@ fn streaming_roundtrip_full(
 
 /// Simplified streaming round-trip using default window_bits and mem_level.
 fn streaming_roundtrip(data: &[u8], level: i32) -> bool {
-    streaming_roundtrip_full(
-        data,
-        level,
-        MAX_WBITS,
-        DEF_MEM_LEVEL,
-        Z_DEFAULT_STRATEGY,
-    )
+    streaming_roundtrip_full(data, level, MAX_WBITS, DEF_MEM_LEVEL, Z_DEFAULT_STRATEGY)
 }
 
 // ============================================================================
@@ -462,9 +460,7 @@ fn prop_auto_detect_zlib() {
             _ => return TestResult::failed(),
         }
 
-        TestResult::from_bool(
-            decomp_len == data.len() && decompressed[..decomp_len] == *data,
-        )
+        TestResult::from_bool(decomp_len == data.len() && decompressed[..decomp_len] == *data)
     }
     quickcheck(roundtrip as fn(Vec<u8>) -> TestResult);
 }
@@ -521,9 +517,7 @@ fn prop_auto_detect_gzip() {
             _ => return TestResult::failed(),
         }
 
-        TestResult::from_bool(
-            decomp_len == data.len() && decompressed[..decomp_len] == *data,
-        )
+        TestResult::from_bool(decomp_len == data.len() && decompressed[..decomp_len] == *data)
     }
     quickcheck(roundtrip as fn(Vec<u8>) -> TestResult);
 }
@@ -541,7 +535,13 @@ fn empty_data_roundtrip() {
     let levels = [
         Z_NO_COMPRESSION,
         Z_BEST_SPEED,
-        2, 3, 4, 5, 6, 7, 8,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
         Z_BEST_COMPRESSION,
         Z_DEFAULT_COMPRESSION,
     ];
@@ -567,8 +567,7 @@ fn empty_data_roundtrip() {
         // Decompress: empty data still produces a valid zlib stream
         let mut decompressed = vec![0u8; 1];
         let mut d_stream = ZStream::new();
-        inflate_init(&mut d_stream)
-            .unwrap_or_else(|e| panic!("inflate_init failed: {:?}", e));
+        inflate_init(&mut d_stream).unwrap_or_else(|e| panic!("inflate_init failed: {:?}", e));
         d_stream.set_input(&compressed);
         d_stream.set_output(&mut decompressed);
         let result = inflate(&mut d_stream, Z_FINISH);
@@ -594,7 +593,13 @@ fn single_byte_roundtrip() {
     let levels = [
         Z_NO_COMPRESSION,
         Z_BEST_SPEED,
-        2, 3, 4, 5, 6, 7, 8,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
         Z_BEST_COMPRESSION,
         Z_DEFAULT_COMPRESSION,
     ];
@@ -686,7 +691,13 @@ fn large_data_roundtrip() {
     let levels = [
         Z_NO_COMPRESSION,
         Z_BEST_SPEED,
-        2, 3, 4, 5, 6, 7, 8,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
         Z_BEST_COMPRESSION,
         Z_DEFAULT_COMPRESSION,
     ];
@@ -733,10 +744,9 @@ fn flush_modes_roundtrip() {
 
     for &flush_mode in &flush_modes {
         let mut c_stream = ZStream::new();
-        deflate_init(&mut c_stream, Z_DEFAULT_COMPRESSION)
-            .unwrap_or_else(|e| {
-                panic!("deflate_init failed for flush mode {}: {:?}", flush_mode, e)
-            });
+        deflate_init(&mut c_stream, Z_DEFAULT_COMPRESSION).unwrap_or_else(|e| {
+            panic!("deflate_init failed for flush mode {}: {:?}", flush_mode, e)
+        });
 
         let mut compressed = vec![0u8; data.len() * 4 + 128];
         let chunk_size = 32;
@@ -778,10 +788,7 @@ fn flush_modes_roundtrip() {
                         c_stream.set_output(&mut compressed[out_pos..]);
                     }
                     Err(e) => {
-                        panic!(
-                            "deflate error {:?} with flush mode {}",
-                            e, flush_mode
-                        );
+                        panic!("deflate error {:?} with flush mode {}", e, flush_mode);
                     }
                     _ => break,
                 }
@@ -789,10 +796,12 @@ fn flush_modes_roundtrip() {
         }
 
         // Ensure the stream is finished
-        if c_stream.avail_in > 0 || !matches!(
-            deflate(&mut c_stream, Z_NO_FLUSH),
-            Ok(ReturnCode::StreamEnd)
-        ) {
+        if c_stream.avail_in > 0
+            || !matches!(
+                deflate(&mut c_stream, Z_NO_FLUSH),
+                Ok(ReturnCode::StreamEnd)
+            )
+        {
             // Force finish
             c_stream.set_input(&[]);
             let out_pos = c_stream.total_out as usize;
@@ -818,8 +827,7 @@ fn flush_modes_roundtrip() {
         // Decompress and verify
         let mut decompressed = vec![0u8; data.len()];
         let mut d_stream = ZStream::new();
-        inflate_init(&mut d_stream)
-            .unwrap_or_else(|e| panic!("inflate_init failed: {:?}", e));
+        inflate_init(&mut d_stream).unwrap_or_else(|e| panic!("inflate_init failed: {:?}", e));
         d_stream.set_input(&compressed);
         d_stream.set_output(&mut decompressed);
 
@@ -1004,7 +1012,10 @@ fn z_block_flush_deflate_roundtrip() {
     let _ = deflate_end(&mut c_stream);
     compressed.truncate(comp_len);
 
-    assert!(comp_len > 0, "Z_BLOCK: compressed output should not be empty");
+    assert!(
+        comp_len > 0,
+        "Z_BLOCK: compressed output should not be empty"
+    );
 
     // Decompress and verify identity
     let mut decompressed = vec![0u8; data.len()];
@@ -1047,8 +1058,7 @@ fn z_trees_flush_inflate_test() {
     // First, verify that Z_TREES is rejected by deflate
     {
         let mut c_stream = ZStream::new();
-        deflate_init(&mut c_stream, Z_DEFAULT_COMPRESSION)
-            .expect("deflate_init failed");
+        deflate_init(&mut c_stream, Z_DEFAULT_COMPRESSION).expect("deflate_init failed");
         let data = b"test data for Z_TREES";
         let mut output = vec![0u8; 256];
         c_stream.set_input(data);

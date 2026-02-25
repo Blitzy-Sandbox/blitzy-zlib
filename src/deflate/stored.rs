@@ -195,9 +195,7 @@ pub(crate) fn deflate_stored(
         // Check minimum block threshold.
         // C: deflate.c lines 1703–1710
         if len < min_block
-            && ((len == 0 && flush != Z_FINISH)
-                || flush == Z_NO_FLUSH
-                || len != total_avail)
+            && ((len == 0 && flush != Z_FINISH) || flush == Z_NO_FLUSH || len != total_avail)
         {
             break;
         }
@@ -264,26 +262,17 @@ pub(crate) fn deflate_stored(
                 let copy_len = min(len, strm.avail_in as usize);
 
                 // Copy input → output
-                core::ptr::copy_nonoverlapping(
-                    strm.next_in,
-                    strm.next_out,
-                    copy_len,
-                );
+                core::ptr::copy_nonoverlapping(strm.next_in, strm.next_out, copy_len);
 
                 // Update checksum (Adler-32 for zlib, CRC-32 for gzip)
                 // matching C's read_buf checksum update behavior.
                 if state.wrap == 1 {
                     let slice = core::slice::from_raw_parts(strm.next_out, copy_len);
-                    strm.adler = crate::checksum::adler32::adler32_z(
-                        strm.adler as u32,
-                        slice,
-                    ) as u64;
+                    strm.adler =
+                        crate::checksum::adler32::adler32_z(strm.adler as u32, slice) as u64;
                 } else if state.wrap == 2 {
                     let slice = core::slice::from_raw_parts(strm.next_out, copy_len);
-                    strm.adler = crate::checksum::crc32::crc32_z(
-                        strm.adler as u32,
-                        slice,
-                    ) as u64;
+                    strm.adler = crate::checksum::crc32::crc32_z(strm.adler as u32, slice) as u64;
                 }
 
                 // Advance input and output pointers
@@ -323,11 +312,7 @@ pub(crate) fn deflate_stored(
                 let strm = &*_strm;
                 // Copy the last w_size bytes of consumed input to window[0..]
                 let src = strm.next_in.sub(state.w_size);
-                core::ptr::copy_nonoverlapping(
-                    src,
-                    state.window.as_mut_ptr(),
-                    state.w_size,
-                );
+                core::ptr::copy_nonoverlapping(src, state.window.as_mut_ptr(), state.w_size);
             }
             state.strstart = state.w_size;
             state.insert = state.strstart;
@@ -337,7 +322,8 @@ pub(crate) fn deflate_stored(
                 // Slide window down to make room
                 // C: deflate.c lines 1782–1789
                 state.strstart -= state.w_size;
-                state.window
+                state
+                    .window
                     .copy_within(state.w_size..state.w_size + state.strstart, 0);
                 if state.matches < 2 {
                     state.matches += 1;
@@ -405,7 +391,8 @@ pub(crate) fn deflate_stored(
             // Slide window to make room
             state.block_start -= state.w_size as i64;
             state.strstart -= state.w_size;
-            state.window
+            state
+                .window
                 .copy_within(state.w_size..state.w_size + state.strstart, 0);
             if state.matches < 2 {
                 state.matches += 1;
@@ -438,7 +425,10 @@ pub(crate) fn deflate_stored(
     // ---------------------------------------------------------------
     {
         let header_bytes = ((state.bi_valid as usize) + 42) >> 3;
-        let have = min(state.pending_buf_size.saturating_sub(header_bytes), MAX_STORED);
+        let have = min(
+            state.pending_buf_size.saturating_sub(header_bytes),
+            MAX_STORED,
+        );
         let new_min_block = min(have, state.w_size);
         let left = if state.block_start >= 0 {
             state.strstart.saturating_sub(state.block_start as usize)
@@ -457,8 +447,7 @@ pub(crate) fn deflate_stored(
             last = flush == Z_FINISH && avail_in == 0 && len == left;
 
             let block_start_idx = state.block_start.max(0) as usize;
-            let block_data: Vec<u8> =
-                state.window[block_start_idx..block_start_idx + len].to_vec();
+            let block_data: Vec<u8> = state.window[block_start_idx..block_start_idx + len].to_vec();
             tr_stored_block(state, &block_data, len as u64, last);
             state.block_start += len as i64;
 
@@ -522,8 +511,7 @@ fn deflate_stored_pending_path(
         last = flush == Z_FINISH && len == left;
 
         let block_start_idx = state.block_start.max(0) as usize;
-        let block_data: Vec<u8> =
-            state.window[block_start_idx..block_start_idx + len].to_vec();
+        let block_data: Vec<u8> = state.window[block_start_idx..block_start_idx + len].to_vec();
         tr_stored_block(state, &block_data, len as u64, last);
         state.block_start += len as i64;
 

@@ -15,15 +15,15 @@
 // AAP §0.8.3: "Decompression throughput must match or exceed C zlib due to
 // Rust's bounds-checking elision optimizations."
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use zlib_rs::error::ReturnCode;
-use zlib_rs::{
-    compress2, compress_bound, deflate, deflate_end, deflate_init2, inflate, inflate_end,
-    inflate_init2, uncompress, ZStream,
-};
 use zlib_rs::constants::{
     DEF_MEM_LEVEL, MAX_WBITS, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY, Z_DEFLATED, Z_FINISH,
+};
+use zlib_rs::error::ReturnCode;
+use zlib_rs::{
+    ZStream, compress_bound, compress2, deflate, deflate_end, deflate_init2, inflate, inflate_end,
+    inflate_init2, uncompress,
 };
 
 // ===========================================================================
@@ -187,8 +187,7 @@ fn bench_inflate_streaming(c: &mut Criterion) {
             |b, compressed| {
                 b.iter(|| {
                     let mut stream = ZStream::new();
-                    inflate_init2(&mut stream, MAX_WBITS)
-                        .expect("inflate_init2 must succeed");
+                    inflate_init2(&mut stream, MAX_WBITS).expect("inflate_init2 must succeed");
 
                     let mut output = vec![0u8; orig_size];
                     stream.set_input(compressed);
@@ -314,8 +313,7 @@ fn bench_inflate_window_sizes(c: &mut Criterion) {
             |b, compressed| {
                 b.iter(|| {
                     let mut stream = ZStream::new();
-                    inflate_init2(&mut stream, wbits)
-                        .expect("inflate_init2 must succeed");
+                    inflate_init2(&mut stream, wbits).expect("inflate_init2 must succeed");
 
                     let mut output = vec![0u8; original_size];
                     stream.set_input(compressed);
@@ -375,8 +373,7 @@ fn bench_inflate_formats(c: &mut Criterion) {
             |b, compressed| {
                 b.iter(|| {
                     let mut stream = ZStream::new();
-                    inflate_init2(&mut stream, inf_wbits)
-                        .expect("inflate_init2 must succeed");
+                    inflate_init2(&mut stream, inf_wbits).expect("inflate_init2 must succeed");
 
                     let mut output = vec![0u8; original_size];
                     stream.set_input(compressed);
