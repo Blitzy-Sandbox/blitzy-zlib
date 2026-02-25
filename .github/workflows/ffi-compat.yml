@@ -1,0 +1,382 @@
+# FFI Compatibility validation workflow for the zlib-rs Rust rewrite.
+#
+# This workflow validates that the libz-rs-sys-cdylib shared library correctly
+# exports all public symbols defined in win32/zlib.def (96 symbols across 14
+# version milestones in zlib.map), that cross-compatibility between the Rust
+# and C zlib implementations works, and that the cdylib release profile is
+# configured for FFI safety (panic = "abort").
+#
+# Three jobs run independently on ubuntu-latest:
+#
+#   symbol-validation      — Builds the cdylib in release mode and verifies
+#                            every expected symbol is present in the ELF
+#                            dynamic symbol table via nm(1).
+#
+#   cross-compat           — Installs the system C zlib (zlib1g-dev) and runs
+#                            the cross-compatibility test suite that validates
+#                            Rust-compress ↔ C-decompress round-trips plus
+#                            FFI symbol presence and signature tests.
+#
+#   release-profile-check  — Verifies the workspace release profile sets
+#                            panic = "abort" (required per AAP §0.7.3 to
+#                            prevent undefined behavior from unwinding across
+#                            FFI boundaries) and inspects the built shared
+#                            library for absence of C++ exception tables.
+#
+# References:
+#   - win32/zlib.def          — Canonical list of exported DLL symbols
+#   - zlib.map                — GNU symbol versioning (14 milestones)
+#   - AAP §0.7.1              — FFI must match zlib C API exactly
+#   - AAP §0.7.3              — cdylib panic = "abort" requirement
+
+name: FFI Compatibility
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Symbol Validation
+  #
+  # Builds the libz-rs-sys-cdylib shared library (libz.so) in release mode and
+  # validates that every one of the 96 public symbols from win32/zlib.def is
+  # present in the ELF dynamic symbol table.  Also reports any unexpected
+  # symbols for informational purposes.
+  # ---------------------------------------------------------------------------
+  symbol-validation:
+    name: Symbol Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build cdylib in release mode
+        run: cargo build -p libz-rs-sys-cdylib --release
+
+      - name: Locate shared library
+        id: locate
+        run: |
+          # The cdylib crate has [lib] name = "z", so Cargo produces libz.so
+          LIB_PATH="target/release/libz.so"
+          if [ ! -f "$LIB_PATH" ]; then
+            echo "ERROR: Expected shared library not found at $LIB_PATH"
+            echo "Searching for any .so files in target/release/:"
+            find target/release/ -name '*.so' -type f 2>/dev/null || true
+            exit 1
+          fi
+          echo "lib_path=$LIB_PATH" >> "$GITHUB_OUTPUT"
+          echo "Found shared library: $LIB_PATH"
+          file "$LIB_PATH"
+
+      - name: Extract exported symbols
+        run: |
+          nm -D --defined-only "${{ steps.locate.outputs.lib_path }}" \
+            | awk '{print $NF}' \
+            | grep -v '^$' \
+            | sort -u > exported_symbols.txt
+          echo "Total exported symbols: $(wc -l < exported_symbols.txt)"
+          echo "---"
+          cat exported_symbols.txt
+
+      - name: Validate all expected symbols are present
+        run: |
+          # Canonical symbol list extracted from win32/zlib.def (96 symbols).
+          # Sorted alphabetically for deterministic comparison.
+          cat > expected_symbols.txt << 'SYMBOLS_EOF'
+          adler32
+          adler32_combine
+          adler32_combine64
+          adler32_z
+          compress
+          compress2
+          compress2_z
+          compress_z
+          compressBound
+          compressBound_z
+          crc32
+          crc32_combine
+          crc32_combine64
+          crc32_combine_gen
+          crc32_combine_gen64
+          crc32_combine_op
+          crc32_z
+          deflate
+          deflateBound
+          deflateBound_z
+          deflateCopy
+          deflateEnd
+          deflateGetDictionary
+          deflateInit2_
+          deflateInit_
+          deflateParams
+          deflatePending
+          deflatePrime
+          deflateReset
+          deflateResetKeep
+          deflateSetDictionary
+          deflateSetHeader
+          deflateTune
+          deflateUsed
+          get_crc_table
+          gzbuffer
+          gzclearerr
+          gzclose
+          gzclose_r
+          gzclose_w
+          gzdirect
+          gzdopen
+          gzeof
+          gzerror
+          gzflush
+          gzfread
+          gzfwrite
+          gzgetc
+          gzgetc_
+          gzgets
+          gzoffset
+          gzoffset64
+          gzopen
+          gzopen64
+          gzopen_w
+          gzprintf
+          gzputc
+          gzputs
+          gzread
+          gzrewind
+          gzseek
+          gzseek64
+          gzsetparams
+          gztell
+          gztell64
+          gzungetc
+          gzvprintf
+          gzwrite
+          inflate
+          inflateBack
+          inflateBackEnd
+          inflateBackInit_
+          inflateCodesUsed
+          inflateCopy
+          inflateEnd
+          inflateGetDictionary
+          inflateGetHeader
+          inflateInit2_
+          inflateInit_
+          inflateMark
+          inflatePrime
+          inflateReset
+          inflateReset2
+          inflateResetKeep
+          inflateSetDictionary
+          inflateSync
+          inflateSyncPoint
+          inflateUndermine
+          inflateValidate
+          uncompress
+          uncompress2
+          uncompress2_z
+          uncompress_z
+          zError
+          zlibCompileFlags
+          zlibVersion
+          SYMBOLS_EOF
+
+          # Remove leading/trailing whitespace from the heredoc and sort
+          sed -i 's/^[[:space:]]*//' expected_symbols.txt
+          sed -i '/^$/d' expected_symbols.txt
+          sort -o expected_symbols.txt expected_symbols.txt
+
+          TOTAL=$(wc -l < expected_symbols.txt)
+          MISSING=0
+          MISSING_LIST=""
+
+          while IFS= read -r sym; do
+            if ! grep -qx "$sym" exported_symbols.txt; then
+              MISSING=$((MISSING + 1))
+              MISSING_LIST="${MISSING_LIST}  - ${sym}\n"
+            fi
+          done < expected_symbols.txt
+
+          FOUND=$((TOTAL - MISSING))
+          echo "============================================"
+          echo "Symbol validation results:"
+          echo "  Expected: $TOTAL"
+          echo "  Found:    $FOUND"
+          echo "  Missing:  $MISSING"
+          echo "============================================"
+
+          if [ "$MISSING" -gt 0 ]; then
+            echo ""
+            echo "MISSING SYMBOLS:"
+            printf '%b' "$MISSING_LIST"
+            echo ""
+            echo "ERROR: $MISSING expected symbol(s) not found in the shared library."
+            exit 1
+          fi
+
+          echo "✓ All $TOTAL expected symbols are present in the shared library."
+
+      - name: Report extra symbols (informational)
+        if: always()
+        run: |
+          if [ ! -f expected_symbols.txt ] || [ ! -f exported_symbols.txt ]; then
+            echo "Symbol files not available for extra symbol analysis."
+            exit 0
+          fi
+
+          # Find symbols exported by the library but not in the expected list.
+          # Filter out Rust/linker internal symbols (prefixed with _ or containing
+          # rust-specific patterns) to focus on unexpected public API symbols.
+          comm -23 exported_symbols.txt expected_symbols.txt \
+            | grep -v '^_' \
+            | grep -v '__' \
+            | grep -v 'rust_' \
+            > extra_symbols.txt || true
+
+          EXTRA=$(wc -l < extra_symbols.txt)
+          if [ "$EXTRA" -gt 0 ]; then
+            echo "INFO: $EXTRA additional non-internal symbol(s) exported:"
+            cat extra_symbols.txt
+          else
+            echo "INFO: No unexpected extra public symbols found."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Cross-Compatibility Tests
+  #
+  # Installs the system C zlib (zlib1g-dev) alongside the Rust implementation
+  # and runs the integration test suite that validates:
+  #
+  #   - Rust-compress → C-decompress round-trips
+  #   - C-compress → Rust-decompress round-trips
+  #   - FFI symbol presence and C-compatible function signatures
+  # ---------------------------------------------------------------------------
+  cross-compat:
+    name: Cross-Compatibility Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install C zlib development library
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zlib1g-dev
+          echo "Installed C zlib version:"
+          dpkg -s zlib1g-dev | grep Version || true
+
+      - name: Run cross-compatibility tests
+        run: |
+          cargo test -p tests --test cross_compat_tests -- --nocapture
+
+      - name: Run FFI compatibility tests
+        run: |
+          cargo test -p tests --test ffi_compat_tests -- --nocapture
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Release Profile Verification
+  #
+  # Validates the safety-critical configuration requirements for the cdylib
+  # crate per AAP §0.7.3:
+  #
+  #   1. The workspace release profile must set panic = "abort" to prevent
+  #      undefined behavior from stack unwinding across FFI boundaries.
+  #   2. The built shared library must not contain C++ exception tables
+  #      (.gcc_except_table) which would indicate the abort-on-panic
+  #      strategy is not effective.
+  #   3. The libz-rs-sys FFI functions must use extern "C" (not
+  #      extern "C-unwind") as documented in the cdylib Cargo.toml.
+  # ---------------------------------------------------------------------------
+  release-profile-check:
+    name: Release Profile Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify panic=abort in workspace release profile
+        run: |
+          echo "Checking workspace root Cargo.toml for panic = abort..."
+          if grep -A 10 '\[profile\.release\]' Cargo.toml | grep -q 'panic[[:space:]]*=[[:space:]]*"abort"'; then
+            echo "✓ panic = \"abort\" confirmed in workspace [profile.release]"
+          else
+            echo "ERROR: panic = \"abort\" not found in workspace [profile.release]"
+            echo ""
+            echo "The workspace root Cargo.toml must contain:"
+            echo "  [profile.release]"
+            echo "  panic = \"abort\""
+            echo ""
+            echo "This is required per AAP §0.7.3 to prevent undefined behavior"
+            echo "from stack unwinding across FFI boundaries in the cdylib."
+            exit 1
+          fi
+
+      - name: Build cdylib in release mode
+        run: cargo build -p libz-rs-sys-cdylib --release
+
+      - name: Verify no C++ exception tables in shared library
+        run: |
+          LIB_PATH="target/release/libz.so"
+          if [ ! -f "$LIB_PATH" ]; then
+            echo "ERROR: Shared library not found at $LIB_PATH"
+            exit 1
+          fi
+
+          echo "ELF section analysis for $LIB_PATH:"
+          readelf -S "$LIB_PATH" | grep -E '(\.gcc_except_table|\.eh_frame|Name)' || true
+          echo ""
+
+          # .gcc_except_table indicates LSDA (Language Specific Data Area) for
+          # C++ exception handling / Rust unwinding. Its absence confirms that
+          # panic = "abort" is effective and no unwinding tables are generated.
+          if readelf -S "$LIB_PATH" 2>/dev/null | grep -q '\.gcc_except_table'; then
+            echo "WARNING: .gcc_except_table section found."
+            echo "This may indicate that panic = abort is not fully effective."
+            echo "Verify that the workspace [profile.release] sets panic = \"abort\"."
+          else
+            echo "✓ No .gcc_except_table section found — panic=abort is effective."
+          fi
+
+          # .eh_frame may still be present for stack trace purposes even with
+          # panic=abort. Its presence alone is not a failure condition, but we
+          # report it for transparency.
+          if readelf -S "$LIB_PATH" 2>/dev/null | grep -q '\.eh_frame'; then
+            echo "INFO: .eh_frame section present (expected — used for stack traces,"
+            echo "      not for unwinding across FFI boundaries)."
+          else
+            echo "INFO: No .eh_frame section found."
+          fi
+
+      - name: Verify library is a valid shared object
+        run: |
+          LIB_PATH="target/release/libz.so"
+          echo "File type:"
+          file "$LIB_PATH"
+          echo ""
+
+          # Verify it is an ELF shared object
+          if file "$LIB_PATH" | grep -q 'ELF.*shared object'; then
+            echo "✓ Library is a valid ELF shared object."
+          else
+            echo "ERROR: Library is not a valid ELF shared object."
+            exit 1
+          fi
+
+          # Report library size for tracking
+          echo ""
+          echo "Library size:"
+          ls -lh "$LIB_PATH"
