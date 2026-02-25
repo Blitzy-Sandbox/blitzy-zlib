@@ -9,6 +9,9 @@ pub mod params;
 /// DeflateState struct and supporting types (status enum, CtData, newtypes).
 pub mod state;
 
+/// Hash chain management, window filling, and longest-match search.
+pub mod hash;
+
 /// Huffman tree construction, bit-level output, and block encoding.
 pub mod trees;
 
