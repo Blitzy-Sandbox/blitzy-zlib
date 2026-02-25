@@ -1,25 +1,45 @@
-name: OSS-Fuzz
+name: Fuzz
 on: [pull_request]
 jobs:
   Fuzzing:
     runs-on: ubuntu-latest
     steps:
-    - name: Build Fuzzers
-      uses: google/oss-fuzz/infra/cifuzz/actions/build_fuzzers@master
-      with:
-        oss-fuzz-project-name: 'zlib'
-        dry-run: false
+    - name: Checkout
+      uses: actions/checkout@v4
 
-    - name: Run Fuzzers
-      uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@master
-      with:
-        oss-fuzz-project-name: 'zlib'
-        fuzz-seconds: 300
-        dry-run: false
+    - name: Install Rust Nightly Toolchain
+      uses: dtolnay/rust-toolchain@nightly
+
+    - name: Install cargo-fuzz
+      run: cargo install cargo-fuzz
+
+    - name: Build Fuzz Targets
+      run: cargo fuzz build
+
+    - name: Run Fuzz Targets
+      run: |
+        # Total fuzz budget in seconds (matches original fuzz-seconds: 300)
+        FUZZ_SECONDS=300
+        TARGETS=$(cargo fuzz list 2>/dev/null || true)
+        if [ -z "$TARGETS" ]; then
+          echo "No fuzz targets found — skipping"
+          exit 0
+        fi
+        NUM_TARGETS=$(echo "$TARGETS" | wc -l)
+        PER_TARGET=$((FUZZ_SECONDS / NUM_TARGETS))
+        # Guarantee at least 10 seconds per target
+        if [ "$PER_TARGET" -lt 10 ]; then
+          PER_TARGET=10
+        fi
+        for target in $TARGETS; do
+          echo "::group::Fuzzing $target for ${PER_TARGET}s"
+          cargo fuzz run "$target" -- -max_total_time="$PER_TARGET"
+          echo "::endgroup::"
+        done
 
     - name: Upload Crash
       uses: actions/upload-artifact@v6
       if: failure()
       with:
         name: artifacts
-        path: ./out/artifacts
+        path: fuzz/artifacts/
