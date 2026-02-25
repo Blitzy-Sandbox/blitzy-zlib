@@ -42,3 +42,4 @@ missing_docs = "deny"
 [lints.clippy]
 all = "deny"
 pedantic = "deny"
+

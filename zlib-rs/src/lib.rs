@@ -6,3 +6,4 @@ pub mod constants;
 pub mod deflate;
 pub mod error;
 pub mod inflate;
+pub mod util;
