@@ -1,3 +1,31 @@
+# Cargo manifest for the zlib-rs-tests integration test crate.
+#
+# This crate validates the correctness, compatibility, and cross-interop of the
+# zlib-rs Rust rewrite. It is a separate workspace member that depends on both
+# zlib-rs (core Rust library) and libz-rs-sys (FFI bindings).
+#
+# Derived from test/CMakeLists.txt, which defined the original C test targets:
+#
+#   zlib_example  (example.c)   → tests/tests/example_compat.rs
+#   infcover      (infcover.c)  → tests/tests/infcover_compat.rs
+#   minigzip      (minigzip.c)  → examples/minigzip.rs
+#
+# The integration test suite covers:
+#
+#   example_compat.rs    — Port of test/example.c (13+ regression tests:
+#                          compress, gzip I/O, deflate/inflate, flush/sync,
+#                          dictionary)
+#   infcover_compat.rs   — Port of test/infcover.c (exhaustive inflate coverage
+#                          with memory tracking and hex fixture decoding)
+#   deflate_tests.rs     — Deflate edge cases (all levels, strategies, windowBits)
+#   inflate_tests.rs     — Inflate edge cases (auto-detect, corrupt data, sync)
+#   gz_tests.rs          — Gzip file I/O round-trip tests, seek, transparent read
+#   checksum_tests.rs    — Adler-32 and CRC-32 correctness and combine operations
+#   ffi_compat_tests.rs  — FFI symbol presence and signature validation
+#   cross_compat_tests.rs — Rust-compress ↔ C-decompress round-trips
+#
+# This crate is never published to crates.io (publish = false).
+
 [package]
 name = "zlib-rs-tests"
 version.workspace = true
@@ -7,19 +35,56 @@ license.workspace = true
 publish = false
 description = "Integration tests for zlib-rs"
 
+# Library target providing shared test utilities (common helpers, fixture
+# loading functions, test vector constants) used by the integration test files
+# in tests/tests/*.rs. Per AAP Section 0.4.1: tests/src/lib.rs — Test utilities.
 [lib]
 name = "zlib_rs_tests"
 path = "src/lib.rs"
 
+# Core dependencies: the two crates under test.
+#
+# These are [dependencies] (not [dev-dependencies]) because integration test
+# files in tests/tests/*.rs need access to both the safe Rust API and the FFI
+# layer. Cargo treats integration tests as external consumers of the library
+# target, so these crates must be available as regular dependencies.
+#
+#   zlib-rs      — Core Rust library: all safe Rust compression, decompression,
+#                   checksum, and gzip file I/O APIs. This is the primary crate
+#                   under test for correctness and RFC compliance.
+#   libz-rs-sys  — C-compatible FFI bindings: validates extern "C" function
+#                   signatures matching all 105 symbols from win32/zlib.def and
+#                   the 14 version milestones in zlib.map.
 [dependencies]
 zlib-rs = { path = "../zlib-rs" }
 libz-rs-sys = { path = "../libz-rs-sys" }
 
+# Dev-dependencies used only during test execution (not compiled into the
+# library target). All versions are inherited from the workspace root
+# Cargo.toml [workspace.dependencies] section.
+#
+#   flate2 (1.0)    — Reference zlib implementation for cross-compatibility
+#                      testing. Used in cross_compat_tests.rs for validating
+#                      Rust-compress ↔ C-decompress and C-compress ↔
+#                      Rust-decompress round-trips.
+#   tempfile (3.14)  — Temporary file creation for gzip file I/O round-trip
+#                      tests. Used in gz_tests.rs.
+#   crc (3.2)        — Reference CRC-32 implementation for cross-validation
+#                      of the Rust checksum engine against an independent
+#                      implementation. Used in checksum_tests.rs.
 [dev-dependencies]
 flate2 = { workspace = true }
 tempfile = { workspace = true }
 crc = { workspace = true }
 
+# Lint configuration: strict Clippy enforcement.
+#
+# Per AAP Section 0.7.2: clippy::all and clippy::pedantic are denied across
+# all workspace crates. Note that missing_docs is intentionally NOT enforced
+# on the test crate (it is only required on the zlib-rs core crate via its
+# own [lints.rust] section). Test code is also exempt from the
+# no-unwrap/no-expect library rule — test assertions may freely use unwrap()
+# and expect() for clarity.
 [lints.clippy]
 all = "deny"
 pedantic = "deny"
