@@ -1,3 +1,28 @@
+# Workspace root manifest for the zlib-rs Rust rewrite.
+#
+# This Cargo workspace replaces the CMakeLists.txt build system from the
+# original C zlib 1.3.2.1-motley library. The workspace contains four crates
+# that mirror the architectural separation of the original C library:
+#
+#   zlib-rs              — Core Rust library implementing DEFLATE compression,
+#                          decompression, checksums, and gzip file I/O in pure
+#                          safe Rust with zero unsafe blocks.
+#
+#   libz-rs-sys          — C-compatible FFI bindings exposing all 105 public
+#                          symbols from zlib via #[no_mangle] extern "C"
+#                          functions. This is the only crate with unsafe code.
+#
+#   libz-rs-sys-cdylib   — Shared library output crate (cdylib) producing a
+#                          drop-in replacement for libz.so / zlib1.dll.
+#
+#   tests                — Integration test suite ported from the original C
+#                          test/example.c and test/infcover.c harnesses, plus
+#                          cross-compatibility and FFI validation tests.
+#
+# Format compliance: RFC 1950 (zlib), RFC 1951 (DEFLATE), RFC 1952 (gzip).
+# Original C library: zlib 1.3.2.1-motley (VERNUM 0x1321) by Jean-loup Gailly
+# and Mark Adler.
+
 [workspace]
 members = [
     "zlib-rs",
@@ -7,6 +32,8 @@ members = [
 ]
 resolver = "2"
 
+# Shared package metadata inherited by all workspace members via
+# `field.workspace = true` in their individual Cargo.toml files.
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
@@ -15,14 +42,55 @@ license = "Zlib AND (MIT OR Apache-2.0)"
 repository = "https://github.com/ArtifactedAI/zlib-rs"
 description = "A pure Rust implementation of zlib"
 
+# Shared dependency versions for all workspace crates. The core library
+# (zlib-rs) has zero external runtime dependencies beyond cfg-if; additional
+# dependencies are used only by the FFI crate and test infrastructure. This
+# mirrors the original C zlib philosophy of zero external runtime dependencies.
 [workspace.dependencies]
+# C type definitions (c_int, c_uint, c_ulong, c_char, c_void) for FFI
+# function signatures in the libz-rs-sys crate.
 libc = "0.2"
+# Conditional compilation macro for platform-specific code paths in the
+# zlib-rs core crate, replacing C #ifdef directives.
 cfg-if = "1.0"
+# Benchmark framework for performance regression testing of deflate, inflate,
+# and checksum operations (dev-dependency of zlib-rs).
 criterion = "0.5"
+# Reference CRC-32 implementation for cross-validation of the Rust checksum
+# engine against an independent implementation (dev-dependency of tests).
 crc = "3.2"
+# Reference zlib implementation for cross-compatibility testing: Rust-compress
+# ↔ C-decompress and C-compress ↔ Rust-decompress round-trips
+# (dev-dependency of tests).
 flate2 = "1.0"
+# Temporary file creation for gzip file I/O integration tests
+# (dev-dependency of tests).
 tempfile = "3.14"
 
+# Workspace-wide lint configuration enforcing strict code quality standards.
+# Individual crates inherit these via `[lints] workspace = true` in their own
+# Cargo.toml, or may define additional crate-specific lints (e.g., zlib-rs
+# additionally enforces `missing_docs = "deny"`).
+[workspace.lints.clippy]
+all = "deny"
+pedantic = "deny"
+
+# Release profile optimized for performance parity with C zlib.
+#
+# These settings are critical for meeting the performance constraint:
+# "Compression/decompression throughput within 90% of C zlib."
+#
+#   lto = "fat"       — Full link-time optimization across all crates for
+#                        maximum cross-crate inlining (especially critical for
+#                        the hot inflate_fast and longest_match paths).
+#   codegen-units = 1 — Single codegen unit enables LLVM to optimize across
+#                        the entire crate as one compilation unit.
+#   opt-level = 3     — Maximum optimization level matching C zlib's -O3.
+#   panic = "abort"   — Required for the cdylib crate to prevent undefined
+#                        behavior from stack unwinding across FFI boundaries
+#                        (per AAP Section 0.7.3). Applied workspace-wide since
+#                        Cargo does not support per-package panic strategy
+#                        overrides.
 [profile.release]
 lto = "fat"
 codegen-units = 1
