@@ -81,6 +81,8 @@ pub mod tables;
 // ── Imports ─────────────────────────────────────────────────────────────────
 
 // In no_std mode, pull alloc types that the std prelude normally provides.
+#[cfg(all(not(feature = "std"), feature = "gzip"))]
+use alloc::string::String;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec, vec::Vec};
 
