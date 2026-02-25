@@ -1,3 +1,7 @@
+// Allow dead_code: these constants will be used by inflate/mod.rs and
+// inflate/fast.rs once those modules are fully implemented.
+#![allow(dead_code)]
+
 //! Pre-built fixed Huffman decode tables for DEFLATE block type 1.
 //!
 //! This module is a faithful port of the C `inffixed.h` header from zlib
