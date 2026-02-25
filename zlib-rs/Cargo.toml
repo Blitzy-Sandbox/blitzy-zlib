@@ -23,6 +23,7 @@ cfg-if = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "deflate_bench"

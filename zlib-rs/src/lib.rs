@@ -8,3 +8,6 @@ pub mod error;
 pub mod inflate;
 pub mod stream;
 pub mod util;
+
+#[cfg(feature = "gz-io")]
+pub mod gz;
