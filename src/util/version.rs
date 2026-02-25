@@ -182,22 +182,12 @@ const fn size_encoding(bytes: usize) -> u64 {
 /// assert_eq!(error_message(-6), "incompatible version"); // Z_VERSION_ERROR
 /// assert_eq!(error_message(99), "");              // out of range
 /// ```
+#[inline]
 pub fn error_message(code: i32) -> &'static str {
-    // The C z_errmsg table is indexed by `2 - code` (zutil.h line 65).
-    // Valid codes range from -6 (Z_VERSION_ERROR) to +2 (Z_NEED_DICT).
-    // We use a direct match for clarity and exhaustiveness.
-    match code {
-        2 => "need dictionary",       // Z_NEED_DICT
-        1 => "stream end",            // Z_STREAM_END
-        0 => "",                      // Z_OK
-        -1 => "file error",           // Z_ERRNO
-        -2 => "stream error",         // Z_STREAM_ERROR
-        -3 => "data error",           // Z_DATA_ERROR
-        -4 => "insufficient memory",  // Z_MEM_ERROR
-        -5 => "buffer error",         // Z_BUF_ERROR
-        -6 => "incompatible version", // Z_VERSION_ERROR
-        _ => "",                      // out of range → empty (z_errmsg[9])
-    }
+    // Delegate to the canonical implementation in the error module to
+    // maintain a single source of truth (DRY). The z_errmsg table and
+    // lookup logic live in crate::error::error_message.
+    crate::error::error_message(code)
 }
 
 // ---------------------------------------------------------------------------

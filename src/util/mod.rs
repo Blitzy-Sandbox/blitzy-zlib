@@ -12,4 +12,4 @@
 pub mod version;
 
 // Re-export version / metadata public items for flat access via `util::*`.
-pub use self::version::{compile_flags, error_message, zlib_version, ZLIB_VERSION};
+pub use self::version::{ZLIB_VERSION, compile_flags, error_message, zlib_version};

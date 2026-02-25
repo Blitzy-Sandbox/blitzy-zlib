@@ -155,6 +155,13 @@ const X2N_TABLE: [u32; 32] = [
 /// each bit, `b` is shifted right by one (i.e. multiplied by x), with an XOR
 /// of the polynomial if the low bit was set (reflecting the modular reduction).
 fn multmodp(a: u32, mut b: u32) -> u32 {
+    // Early return guard for a == 0, consistent with build.rs and the C
+    // precondition comment. When a is zero no bits are set, so the loop
+    // would never XOR anything into the accumulator — the result is 0.
+    if a == 0 {
+        return 0;
+    }
+
     let mut m: u32 = 1u32 << 31;
     let mut p: u32 = 0;
     loop {
@@ -903,10 +910,7 @@ mod tests {
             for &byte in &data {
                 crc_inc = crc32(crc_inc, &[byte]);
             }
-            assert_eq!(
-                crc_one_shot, crc_inc,
-                "Mismatch for length {len}"
-            );
+            assert_eq!(crc_one_shot, crc_inc, "Mismatch for length {len}");
         }
     }
 }

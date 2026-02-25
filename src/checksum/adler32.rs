@@ -629,10 +629,7 @@ mod tests {
     fn test_combine64_matches_combine() {
         let a1 = adler32(1, b"part1");
         let a2 = adler32(1, b"part2");
-        assert_eq!(
-            adler32_combine(a1, a2, 5),
-            adler32_combine64(a1, a2, 5),
-        );
+        assert_eq!(adler32_combine(a1, a2, 5), adler32_combine64(a1, a2, 5),);
     }
 
     #[test]
