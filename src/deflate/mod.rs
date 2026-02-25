@@ -690,11 +690,7 @@ pub(crate) fn flush_pending_via_ptr(s: &mut DeflateState, strm: *mut ZStream) {
 /// This is the safe-API entry point for `deflate_stored`'s fallback path
 /// to call [`fill_window_read`] without needing its own `unsafe` block.
 #[inline(always)]
-pub(crate) fn fill_window_read_via_ptr(
-    s: &mut DeflateState,
-    strm: *mut ZStream,
-    to_read: usize,
-) {
+pub(crate) fn fill_window_read_via_ptr(s: &mut DeflateState, strm: *mut ZStream, to_read: usize) {
     debug_assert!(!strm.is_null(), "strm must be non-null");
     // SAFETY: `strm` is the raw pointer to the parent `ZStream` passed from
     // `deflate()`. It is valid for the entire call. `fill_window_read` only

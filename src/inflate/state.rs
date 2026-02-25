@@ -707,3 +707,158 @@ impl fmt::Debug for InflateState {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::DEF_WBITS;
+
+    #[test]
+    fn parse_window_bits_zlib_format() {
+        let (wrap, wbits) = parse_window_bits(15).unwrap();
+        assert_eq!(wrap, 5); // zlib format (bits: format=1 | validate=4)
+        assert_eq!(wbits, 15);
+    }
+
+    #[test]
+    fn parse_window_bits_raw_deflate() {
+        let (wrap, wbits) = parse_window_bits(-15).unwrap();
+        assert_eq!(wrap, 0); // raw DEFLATE
+        assert_eq!(wbits, 15);
+    }
+
+    #[test]
+    fn parse_window_bits_gzip_format() {
+        let (wrap, wbits) = parse_window_bits(31).unwrap();
+        assert_eq!(wrap, 6); // gzip (bits: format=2 | validate=4)
+        assert_eq!(wbits, 15);
+    }
+
+    #[test]
+    fn parse_window_bits_auto_detect() {
+        let (wrap, wbits) = parse_window_bits(47).unwrap();
+        assert_eq!(wrap, 7); // auto-detect (bits: format=3 | validate=4)
+        assert_eq!(wbits, 15);
+    }
+
+    #[test]
+    fn parse_window_bits_min_zlib() {
+        // wbits=8 is promoted to 9 per zlib spec
+        let (wrap, wbits) = parse_window_bits(8).unwrap();
+        assert_eq!(wrap, 5); // zlib format
+        assert_eq!(wbits, 9); // promoted from 8 to 9
+    }
+
+    #[test]
+    fn parse_window_bits_min_raw() {
+        // -8 → raw DEFLATE, actual=8 promoted to 9
+        let (wrap, wbits) = parse_window_bits(-8).unwrap();
+        assert_eq!(wrap, 0); // raw
+        assert_eq!(wbits, 9); // promoted from 8 to 9
+    }
+
+    #[test]
+    fn parse_window_bits_zero_allowed() {
+        // 0 is permitted (means "keep existing window" for reset2)
+        let (wrap, wbits) = parse_window_bits(0).unwrap();
+        assert_eq!(wbits, 0);
+        assert_eq!(wrap, 5);
+    }
+
+    #[test]
+    fn parse_window_bits_out_of_range() {
+        // Values that result in actual not in {0, 8..=15} should fail
+        assert!(parse_window_bits(-16).is_err());
+        assert!(parse_window_bits(48).is_err());
+        // wbits that map to actual in 1..7 should also fail
+        assert!(parse_window_bits(7).is_err());
+        assert!(parse_window_bits(-7).is_err());
+    }
+
+    #[test]
+    fn inflate_state_new_default() {
+        let state = InflateState::new(DEF_WBITS).unwrap();
+        assert_eq!(state.mode, InflateMode::Head);
+        assert_eq!(state.wbits, DEF_WBITS as u32);
+    }
+
+    #[test]
+    fn inflate_state_new_raw() {
+        let state = InflateState::new(-15).unwrap();
+        assert_eq!(state.mode, InflateMode::Head);
+        assert_eq!(state.wbits, 15);
+        assert_eq!(state.wrap, 0); // raw mode
+    }
+
+    #[test]
+    fn inflate_state_new_gzip() {
+        let state = InflateState::new(31).unwrap();
+        assert_eq!(state.mode, InflateMode::Head);
+        assert_eq!(state.wbits, 15);
+        assert_eq!(state.wrap, 6); // gzip
+    }
+
+    #[test]
+    fn inflate_state_new_auto() {
+        let state = InflateState::new(47).unwrap();
+        assert_eq!(state.mode, InflateMode::Head);
+        assert_eq!(state.wbits, 15);
+        assert_eq!(state.wrap, 7); // auto-detect
+    }
+
+    #[test]
+    fn inflate_state_new_invalid() {
+        // -16 is out of range
+        assert!(InflateState::new(-16).is_err());
+        // 48 would map to actual=48 which is out of range
+        assert!(InflateState::new(48).is_err());
+    }
+
+    #[test]
+    fn inflate_mode_all_variants_distinct() {
+        let modes = [
+            InflateMode::Head,
+            InflateMode::Flags,
+            InflateMode::Time,
+            InflateMode::Os,
+            InflateMode::ExLen,
+            InflateMode::Extra,
+            InflateMode::Name,
+            InflateMode::Comment,
+            InflateMode::HCrc,
+            InflateMode::DictId,
+            InflateMode::Dict,
+            InflateMode::Type,
+            InflateMode::TypeDo,
+            InflateMode::Stored,
+            InflateMode::Copy_,
+            InflateMode::Copy,
+            InflateMode::Table,
+            InflateMode::LenLens,
+            InflateMode::CodeLens,
+            InflateMode::Len_,
+            InflateMode::Len,
+            InflateMode::LenExt,
+            InflateMode::Dist,
+            InflateMode::DistExt,
+            InflateMode::Match,
+            InflateMode::Lit,
+            InflateMode::Check,
+            InflateMode::Length,
+            InflateMode::Done,
+            InflateMode::Bad,
+            InflateMode::Mem,
+            InflateMode::Sync,
+        ];
+        // Verify all are distinct by collecting as strings
+        let mut names: Vec<String> = modes.iter().map(|m| format!("{m:?}")).collect();
+        let len_before = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            len_before,
+            "all InflateMode variants must be distinct"
+        );
+    }
+}

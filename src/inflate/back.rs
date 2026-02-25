@@ -75,7 +75,7 @@ const ORDER: [usize; 19] = [
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// use zlib_rs::inflate::back::InflateBackInput;
 ///
 /// struct SliceInput<'a> {
@@ -117,7 +117,7 @@ pub trait InflateBackInput {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// use zlib_rs::inflate::back::InflateBackOutput;
 /// use zlib_rs::error::ZlibError;
 ///
@@ -170,7 +170,7 @@ pub trait InflateBackOutput {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// use zlib_rs::stream::ZStream;
 /// use zlib_rs::inflate::back::inflate_back_init;
 ///

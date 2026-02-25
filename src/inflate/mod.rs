@@ -299,7 +299,7 @@ const ORDER: [u16; 19] = [
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// use zlib_rs::stream::ZStream;
 /// use zlib_rs::inflate::inflate_init;
 ///
