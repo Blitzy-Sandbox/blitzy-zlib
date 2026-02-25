@@ -94,36 +94,10 @@ const TOO_FAR: usize = 4096;
 // Local helpers
 // ===========================================================================
 
-/// Fill the sliding window with data from the input stream.
-///
-/// Delegates to the real `fill_window` implementation in the parent
-/// `deflate` module (`mod.rs`). This reads bytes from the `ZStream`'s
-/// input buffer into `DeflateState.window`, updating `lookahead`,
-/// potentially sliding the window, and updating the hash table.
-///
-/// Strategy functions call `fill_window` when `lookahead` drops below
-/// `MIN_LOOKAHEAD`. After the call, the function checks whether
-/// `lookahead` is still insufficient:
-///
-/// - If `lookahead < MIN_LOOKAHEAD && flush == Z_NO_FLUSH`: the function
-///   returns `BlockState::NeedMore`, signalling the main `deflate()` loop
-///   to provide more input and re-enter the strategy.
-/// - If `lookahead == 0`: the loop breaks to flush the current block.
-///
-/// # Safety
-///
-/// `strm` must be a valid pointer to the `ZStream` that owns this
-/// `DeflateState`. The pointer is valid for the lifetime of the
-/// `deflate()` call. We only access non-overlapping fields
-/// (`avail_in`, `next_in`, `total_in`, `adler`) through it.
-#[inline(always)]
-unsafe fn do_fill_window(state: &mut DeflateState, strm: *mut ZStream) {
-    // SAFETY: strm is the raw pointer to the parent ZStream passed from
-    // deflate(). It is valid for the entire deflate() call. fill_window
-    // only reads/writes strm fields (avail_in, next_in, total_in, adler)
-    // that do not overlap with the DeflateState fields accessed via `state`.
-    super::fill_window(state, unsafe { &mut *strm });
-}
+// NOTE: The `do_fill_window` unsafe helper that was previously defined here
+// has been replaced by `super::fill_window_via_ptr`, a safe wrapper in
+// `deflate/mod.rs` that centralizes the raw-pointer-to-reference conversion.
+// See `deflate/mod.rs` "Centralized safe wrappers" section.
 
 /// Flush the current block to the pending output buffer (no early return).
 ///
@@ -169,12 +143,7 @@ fn flush_block_only(state: &mut DeflateState, strm: *mut ZStream, last: bool) {
 
     // Drain pending buffer to the output stream, matching C zlib's
     // FLUSH_BLOCK_ONLY macro which calls flush_pending(s->strm).
-    // SAFETY: strm is the raw pointer to the parent ZStream passed from
-    // deflate(). flush_pending_from_state only reads/writes strm fields
-    // (avail_out, next_out, total_out) that do not overlap with DeflateState.
-    unsafe {
-        super::flush_pending_from_state(state, &mut *strm);
-    }
+    super::flush_pending_via_ptr(state, strm);
 }
 
 /// Flush the current block and drain pending data to the output stream.
@@ -393,10 +362,7 @@ pub(crate) fn deflate_slow(state: &mut DeflateState, strm: *mut ZStream, flush: 
         // MIN_LOOKAHEAD = MAX_MATCH + MIN_MATCH + 1 = 262 bytes.
         // ==================================================================
         if state.lookahead < MIN_LOOKAHEAD {
-            // SAFETY: strm is valid for the duration of deflate().
-            unsafe {
-                do_fill_window(state, strm);
-            }
+            super::fill_window_via_ptr(state, strm);
             if state.lookahead < MIN_LOOKAHEAD && flush == Z_NO_FLUSH {
                 return BlockState::NeedMore;
             }
@@ -512,8 +478,7 @@ pub(crate) fn deflate_slow(state: &mut DeflateState, strm: *mut ZStream, flush: 
             if bflush {
                 flush_block(state, strm, false);
                 // C: if (s->strm->avail_out == 0) return need_more;
-                let strm_ref = unsafe { &*strm };
-                if strm_ref.avail_out == 0 {
+                if super::strm_avail_out(strm) == 0 {
                     return BlockState::NeedMore;
                 }
             }
@@ -539,8 +504,7 @@ pub(crate) fn deflate_slow(state: &mut DeflateState, strm: *mut ZStream, flush: 
             // Now that flush_block_only drains pending to the output
             // stream (matching C's FLUSH_BLOCK_ONLY), we can check
             // avail_out directly and return NeedMore if exhausted.
-            let strm_ref = unsafe { &*strm };
-            if strm_ref.avail_out == 0 {
+            if super::strm_avail_out(strm) == 0 {
                 return BlockState::NeedMore;
             }
         } else {
@@ -581,8 +545,7 @@ pub(crate) fn deflate_slow(state: &mut DeflateState, strm: *mut ZStream, flush: 
         flush_block(state, strm, true);
         // C: after FLUSH_BLOCK with last=true, if avail_out == 0 return
         // finish_started (data flushed but output buffer full).
-        let strm_ref = unsafe { &*strm };
-        if strm_ref.avail_out == 0 {
+        if super::strm_avail_out(strm) == 0 {
             return BlockState::FinishStarted;
         }
         return BlockState::FinishDone;

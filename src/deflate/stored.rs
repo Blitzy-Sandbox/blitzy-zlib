@@ -157,7 +157,7 @@ pub(crate) fn deflate_stored(
     //   c) Copying remaining input data directly to output
     // ---------------------------------------------------------------
     let mut last = false;
-    let used_start = unsafe { (*_strm).avail_in };
+    let used_start = super::strm_avail_in(_strm);
 
     loop {
         // Compute maximum block size considering output capacity.
@@ -167,7 +167,7 @@ pub(crate) fn deflate_stored(
         // Header overhead: bytes consumed by the stored block header
         // (BFINAL/BTYPE + padding + LEN + NLEN).
         let header_bytes = ((state.bi_valid as usize) + 42) >> 3;
-        let avail_out = unsafe { (*_strm).avail_out } as usize;
+        let avail_out = super::strm_avail_out(_strm) as usize;
         if avail_out < header_bytes {
             break; // Not enough output space for even the header
         }
@@ -183,7 +183,7 @@ pub(crate) fn deflate_stored(
         };
 
         // Total available = window data + remaining input
-        let avail_in = unsafe { (*_strm).avail_in } as usize;
+        let avail_in = super::strm_avail_in(_strm) as usize;
         let total_avail = left + avail_in;
         if len > total_avail {
             len = total_avail;
@@ -223,9 +223,7 @@ pub(crate) fn deflate_stored(
 
         // Flush the header bytes to the output stream.
         // C: deflate.c line 1723
-        unsafe {
-            super::flush_pending_from_state(state, &mut *_strm);
-        }
+        super::flush_pending_via_ptr(state, _strm);
 
         // Copy window data (left bytes) directly to output.
         // C: deflate.c lines 1731–1738
@@ -300,7 +298,7 @@ pub(crate) fn deflate_stored(
     //
     // C: deflate.c lines 1768–1794
     // ---------------------------------------------------------------
-    let used = (used_start - unsafe { (*_strm).avail_in }) as usize;
+    let used = (used_start - super::strm_avail_in(_strm)) as usize;
     if used > 0 {
         // Some input was consumed via direct copy. Update the window
         // with the last w_size bytes of that input.
@@ -308,6 +306,12 @@ pub(crate) fn deflate_stored(
             // Consumed more than a full window — replace entire window
             // C: deflate.c lines 1774–1779
             state.matches = 2; // clear hash on next strategy switch
+            // SAFETY: _strm is valid per the deflate() call contract. We read
+            // next_in (which has been advanced by `used` bytes during the main
+            // loop's direct copy) and copy the last w_size bytes of consumed
+            // input into the window. `next_in.sub(w_size)` stays within the
+            // original caller-provided input buffer because `used >= w_size`.
+            // `state.window` has capacity >= w_size (allocated at init time).
             unsafe {
                 let strm = &*_strm;
                 // Copy the last w_size bytes of consumed input to window[0..]
@@ -334,6 +338,12 @@ pub(crate) fn deflate_stored(
             }
             // Copy the consumed input data into the window
             // C: deflate.c line 1791
+            // SAFETY: _strm is valid per the deflate() call contract.
+            // `next_in.sub(used)` stays within the original caller-provided
+            // input buffer because `used` bytes were consumed from it during
+            // the main loop. `state.window[strstart..]` has at least `used`
+            // bytes of space because `window_size - strstart > used` was
+            // verified by the enclosing `if` condition.
             unsafe {
                 let strm = &*_strm;
                 let src = strm.next_in.sub(used);
@@ -369,7 +379,7 @@ pub(crate) fn deflate_stored(
     // all window data emitted, return BlockDone.
     // C: deflate.c lines 1801–1804
     // ---------------------------------------------------------------
-    let avail_in = unsafe { (*_strm).avail_in } as usize;
+    let avail_in = super::strm_avail_in(_strm) as usize;
     if flush != Z_NO_FLUSH
         && flush != Z_FINISH
         && avail_in == 0
@@ -404,9 +414,7 @@ pub(crate) fn deflate_stored(
         }
         let to_read = min(have, avail_in);
         if to_read > 0 {
-            unsafe {
-                super::fill_window_read(state, &mut *_strm, to_read);
-            }
+            super::fill_window_read_via_ptr(state, _strm, to_read);
         }
     }
 
@@ -435,7 +443,7 @@ pub(crate) fn deflate_stored(
         } else {
             0
         };
-        let avail_in = unsafe { (*_strm).avail_in } as usize;
+        let avail_in = super::strm_avail_in(_strm) as usize;
 
         if left >= new_min_block
             || ((left > 0 || flush == Z_FINISH)
@@ -451,9 +459,7 @@ pub(crate) fn deflate_stored(
             tr_stored_block(state, &block_data, len as u64, last);
             state.block_start += len as i64;
 
-            unsafe {
-                super::flush_pending_from_state(state, &mut *_strm);
-            }
+            super::flush_pending_via_ptr(state, _strm);
         }
     }
 
@@ -516,9 +522,7 @@ fn deflate_stored_pending_path(
         state.block_start += len as i64;
 
         if !_strm.is_null() {
-            unsafe {
-                super::flush_pending_from_state(state, &mut *_strm);
-            }
+            super::flush_pending_via_ptr(state, _strm);
         }
 
         if last || len == 0 {
@@ -532,11 +536,8 @@ fn deflate_stored_pending_path(
 
     if last {
         state.bi_used = 8;
-        if !_strm.is_null() {
-            let strm_ref = unsafe { &*_strm };
-            if strm_ref.avail_out == 0 {
-                return BlockState::FinishStarted;
-            }
+        if !_strm.is_null() && super::strm_avail_out(_strm) == 0 {
+            return BlockState::FinishStarted;
         }
         return BlockState::FinishDone;
     }

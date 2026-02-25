@@ -283,6 +283,8 @@ pub fn read_buf(strm: &mut ZStream, wrap: i32, buf: &mut [u8], size: usize) -> u
     }
 
     // Advance input pointer and total
+    // SAFETY: `len <= avail_in`, so `next_in.add(len)` stays within (or one-
+    // past-end of) the caller's input buffer, satisfying `pointer::add`.
     strm.next_in = unsafe { strm.next_in.add(len) };
     strm.total_in += len as u64;
 
@@ -606,6 +608,98 @@ pub(crate) fn flush_pending_from_state(s: &mut DeflateState, strm: &mut ZStream)
     if s.pending == 0 {
         s.pending_out = 0;
     }
+}
+
+// ============================================================
+// Centralized safe wrappers for raw ZStream pointer access
+//
+// Strategy functions (stored.rs, fast.rs, slow.rs, huff.rs,
+// rle.rs) receive a `*mut ZStream` raw pointer from `deflate()`
+// to work around Rust's split-borrow limitation (DeflateState is
+// owned by ZStream, so we cannot hold `&mut DeflateState` and
+// `&mut ZStream` simultaneously). These wrappers centralize all
+// unsafe pointer dereferences into this module, per AAP §0.7.2's
+// goal of concentrating unsafe code in as few files as possible.
+//
+// Each wrapper:
+//   1. Debug-asserts the pointer is non-null.
+//   2. Contains a single `unsafe` block with a `// SAFETY:` comment.
+//   3. Is `#[inline(always)]` to avoid call overhead in hot loops.
+// ============================================================
+
+/// Reads `avail_in` from a raw `ZStream` pointer.
+///
+/// Used by strategy functions to check how much input remains without
+/// creating an `unsafe` block at each call site.
+#[inline(always)]
+pub(crate) fn strm_avail_in(strm: *const ZStream) -> u32 {
+    debug_assert!(!strm.is_null(), "strm must be non-null");
+    // SAFETY: `strm` is the raw pointer to the parent `ZStream` passed from
+    // `deflate()`. The pointer is valid and non-null for the entire duration
+    // of the `deflate()` call. The read-only dereference of the `avail_in`
+    // field has no aliasing concerns because `DeflateState` (the only other
+    // live mutable reference) does not contain `avail_in`.
+    unsafe { (*strm).avail_in }
+}
+
+/// Reads `avail_out` from a raw `ZStream` pointer.
+///
+/// Used by strategy functions to check if the output buffer is exhausted
+/// after flushing a block (the C `FLUSH_BLOCK` macro's `avail_out == 0`
+/// check).
+#[inline(always)]
+pub(crate) fn strm_avail_out(strm: *const ZStream) -> u32 {
+    debug_assert!(!strm.is_null(), "strm must be non-null");
+    // SAFETY: Same guarantees as `strm_avail_in` — `strm` is valid for the
+    // entire `deflate()` call. `avail_out` is a non-overlapping field.
+    unsafe { (*strm).avail_out }
+}
+
+/// Fills the sliding window, accepting a raw `ZStream` pointer.
+///
+/// This is the safe-API entry point for strategy functions to call
+/// [`fill_window`] without needing their own `unsafe` block.
+#[inline(always)]
+pub(crate) fn fill_window_via_ptr(s: &mut DeflateState, strm: *mut ZStream) {
+    debug_assert!(!strm.is_null(), "strm must be non-null");
+    // SAFETY: `strm` is the raw pointer to the parent `ZStream` passed from
+    // `deflate()`. It is valid for the entire call. `fill_window` only
+    // reads/writes non-overlapping `ZStream` fields (`avail_in`, `next_in`,
+    // `total_in`, `adler`) that are distinct from the `DeflateState` fields
+    // accessed via `s`.
+    fill_window(s, unsafe { &mut *strm });
+}
+
+/// Flushes pending output bytes, accepting a raw `ZStream` pointer.
+///
+/// This is the safe-API entry point for strategy functions to call
+/// [`flush_pending_from_state`] without needing their own `unsafe` block.
+#[inline(always)]
+pub(crate) fn flush_pending_via_ptr(s: &mut DeflateState, strm: *mut ZStream) {
+    debug_assert!(!strm.is_null(), "strm must be non-null");
+    // SAFETY: `strm` is the raw pointer to the parent `ZStream` passed from
+    // `deflate()`. It is valid for the entire call. `flush_pending_from_state`
+    // only reads/writes non-overlapping `ZStream` fields (`avail_out`,
+    // `next_out`, `total_out`) that are distinct from the `DeflateState`
+    // fields accessed via `s`.
+    flush_pending_from_state(s, unsafe { &mut *strm });
+}
+
+/// Reads input directly into the window, accepting a raw `ZStream` pointer.
+///
+/// This is the safe-API entry point for `deflate_stored`'s fallback path
+/// to call [`fill_window_read`] without needing its own `unsafe` block.
+#[inline(always)]
+pub(crate) fn fill_window_read_via_ptr(
+    s: &mut DeflateState,
+    strm: *mut ZStream,
+    to_read: usize,
+) {
+    debug_assert!(!strm.is_null(), "strm must be non-null");
+    // SAFETY: `strm` is the raw pointer to the parent `ZStream` passed from
+    // `deflate()`. It is valid for the entire call. `fill_window_read` only
+    // reads/writes non-overlapping `ZStream` fields via `read_buf`.
+    fill_window_read(s, unsafe { &mut *strm }, to_read);
 }
 
 /// Initializes the "longest match" routines for a new zlib stream.

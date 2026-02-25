@@ -543,6 +543,8 @@ mod tests {
     fn test_copy_match_non_overlapping() {
         let mut buf = vec![1u8, 2, 3, 4, 5, 0, 0, 0, 0, 0];
         let mut out_pos = 5usize;
+        // SAFETY: from(0)+len(3)=3 <= 10, out_pos(5)+len(3)=8 <= 10,
+        // from(0) < out_pos(5), and dist(5) >= len(3) so no overlap issue.
         unsafe {
             copy_match(&mut buf, 0, &mut out_pos, 5, 3);
         }
@@ -556,6 +558,10 @@ mod tests {
         let mut buf = vec![0u8; 20];
         buf[0] = b'A';
         let mut out_pos = 1usize;
+        // SAFETY: from(0)+len(9)=9 <= 20, out_pos(1)+len(9)=10 <= 20,
+        // from(0) < out_pos(1). Overlapping copy (dist=1) is intentional to
+        // produce a repeating pattern; copy_match handles byte-by-byte copy
+        // for dist < len.
         unsafe {
             copy_match(&mut buf, 0, &mut out_pos, 1, 9);
         }
@@ -570,6 +576,10 @@ mod tests {
         buf[0] = b'A';
         buf[1] = b'B';
         let mut out_pos = 2usize;
+        // SAFETY: from(0)+len(6)=6 <= 20, out_pos(2)+len(6)=8 <= 20,
+        // from(0) < out_pos(2). Overlapping copy (dist=2 < len=6) is
+        // intentional to verify the repeating "AB" pattern; copy_match
+        // handles byte-by-byte copy for dist < len.
         unsafe {
             copy_match(&mut buf, 0, &mut out_pos, 2, 6);
         }

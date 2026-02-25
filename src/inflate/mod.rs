@@ -898,11 +898,13 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                     strm.avail_out = left;
                     strm.total_in += (in_start - have) as u64;
                     strm.total_out += (out_start - left) as u64;
-                    // SAFETY: next_in/next_out are non-null (guarded) and in_pos/out_pos
-                    // are bounded by the original avail_in/avail_out supplied by the caller.
+                    // SAFETY: next_in is non-null (guarded) and in_pos ≤ original
+                    // avail_in, so next_in.add(in_pos) stays within the input buffer.
                     if !strm.next_in.is_null() && in_pos > 0 {
                         strm.next_in = unsafe { strm.next_in.add(in_pos) };
                     }
+                    // SAFETY: next_out is non-null (guarded) and out_pos ≤ original
+                    // avail_out, so next_out.add(out_pos) stays within the output buffer.
                     if !strm.next_out.is_null() && out_pos > 0 {
                         strm.next_out = unsafe { strm.next_out.add(out_pos) };
                     }
@@ -1582,11 +1584,13 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                 strm.total_in += (in_start - have) as u64;
                 strm.total_out += (out_start - left) as u64;
                 state.total += (out_start - left) as u64;
-                // SAFETY: next_in/next_out are non-null (guarded) and in_pos/out_pos
-                // are bounded by the original avail_in/avail_out supplied by the caller.
+                // SAFETY: next_in is non-null (guarded) and in_pos ≤ original
+                // avail_in, so next_in.add(in_pos) stays within the input buffer.
                 if !strm.next_in.is_null() && in_pos > 0 {
                     strm.next_in = unsafe { strm.next_in.add(in_pos) };
                 }
+                // SAFETY: next_out is non-null (guarded) and out_pos ≤ original
+                // avail_out, so next_out.add(out_pos) stays within the output buffer.
                 if !strm.next_out.is_null() && out_pos > 0 {
                     strm.next_out = unsafe { strm.next_out.add(out_pos) };
                 }
@@ -1642,11 +1646,13 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
     strm.total_in += in_consumed;
     strm.total_out += out_consumed;
     state.total += out_consumed;
-    // SAFETY: next_in/next_out are non-null (guarded) and in_pos/out_pos
-    // are bounded by the original avail_in/avail_out supplied by the caller.
+    // SAFETY: next_in is non-null (guarded) and in_pos ≤ original avail_in,
+    // so next_in.add(in_pos) stays within the caller's input buffer.
     if !strm.next_in.is_null() && in_pos > 0 {
         strm.next_in = unsafe { strm.next_in.add(in_pos) };
     }
+    // SAFETY: next_out is non-null (guarded) and out_pos ≤ original avail_out,
+    // so next_out.add(out_pos) stays within the caller's output buffer.
     if !strm.next_out.is_null() && out_pos > 0 {
         strm.next_out = unsafe { strm.next_out.add(out_pos) };
     }

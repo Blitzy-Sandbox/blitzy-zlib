@@ -50,22 +50,10 @@ use crate::stream::ZStream;
 // Local helpers
 // ===========================================================================
 
-/// Fill the sliding window with data from the input stream.
-///
-/// Delegates to the real `fill_window` in the parent `deflate` module.
-///
-/// # Safety
-///
-/// `strm` must be a valid pointer to the `ZStream` that owns this
-/// `DeflateState`. The pointer is valid for the lifetime of the
-/// `deflate()` call.
-#[inline(always)]
-unsafe fn do_fill_window(state: &mut DeflateState, strm: *mut ZStream) {
-    // SAFETY: strm is the raw pointer to the parent ZStream passed from
-    // deflate(). fill_window only reads/writes strm fields (avail_in,
-    // next_in, total_in, adler) that do not overlap with DeflateState.
-    super::fill_window(state, unsafe { &mut *strm });
-}
+// NOTE: The `do_fill_window` unsafe helper that was previously defined here
+// has been replaced by `super::fill_window_via_ptr`, a safe wrapper in
+// `deflate/mod.rs` that centralizes the raw-pointer-to-reference conversion.
+// See `deflate/mod.rs` "Centralized safe wrappers" section.
 
 /// Flush the current block to the pending output buffer and drain pending
 /// data to the output stream.
@@ -112,12 +100,7 @@ fn flush_block(state: &mut DeflateState, strm: *mut ZStream, last: bool) {
 
     // Drain pending buffer to the output stream, matching C zlib's
     // FLUSH_BLOCK_ONLY macro which calls flush_pending(s->strm).
-    // SAFETY: strm is the raw pointer to the parent ZStream passed from
-    // deflate(). flush_pending_from_state only reads/writes strm fields
-    // (avail_out, next_out, total_out) that do not overlap with DeflateState.
-    unsafe {
-        super::flush_pending_from_state(state, &mut *strm);
-    }
+    super::flush_pending_via_ptr(state, strm);
 }
 
 // ===========================================================================
@@ -175,10 +158,7 @@ pub(crate) fn deflate_rle(state: &mut DeflateState, strm: *mut ZStream, flush: i
         // because it does not need the extra bytes for hash insertion.
         // ------------------------------------------------------------------
         if state.lookahead <= MAX_MATCH {
-            // SAFETY: strm is valid for the duration of deflate().
-            unsafe {
-                do_fill_window(state, strm);
-            }
+            super::fill_window_via_ptr(state, strm);
 
             if state.lookahead <= MAX_MATCH && flush == Z_NO_FLUSH {
                 return BlockState::NeedMore;
@@ -261,8 +241,7 @@ pub(crate) fn deflate_rle(state: &mut DeflateState, strm: *mut ZStream, flush: i
         if bflush {
             flush_block(state, strm, false);
             // C: if (s->strm->avail_out == 0) return need_more;
-            let strm_ref = unsafe { &*strm };
-            if strm_ref.avail_out == 0 {
+            if super::strm_avail_out(strm) == 0 {
                 return BlockState::NeedMore;
             }
         }
@@ -282,8 +261,7 @@ pub(crate) fn deflate_rle(state: &mut DeflateState, strm: *mut ZStream, flush: i
         flush_block(state, strm, true);
         // C: after FLUSH_BLOCK with last=true, if avail_out == 0 return
         // finish_started (data flushed but output buffer full).
-        let strm_ref = unsafe { &*strm };
-        if strm_ref.avail_out == 0 {
+        if super::strm_avail_out(strm) == 0 {
             return BlockState::FinishStarted;
         }
         return BlockState::FinishDone;
