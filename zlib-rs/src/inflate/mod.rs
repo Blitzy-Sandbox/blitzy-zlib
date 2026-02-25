@@ -4,6 +4,7 @@
 //! from the C zlib library's `inflate.c`, `inftrees.c`, `inffast.c`,
 //! `infback.c`, and `inffixed.h`.
 
+pub mod back;
 pub mod fast;
 pub mod fixed;
 pub mod state;
