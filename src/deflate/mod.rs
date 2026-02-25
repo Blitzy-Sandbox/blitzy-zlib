@@ -289,6 +289,23 @@ pub fn read_buf(strm: &mut ZStream, wrap: i32, buf: &mut [u8], size: usize) -> u
     len
 }
 
+/// Reads input bytes directly into the window at the current strstart position.
+///
+/// This is a simplified version of fill_window used by deflate_stored's
+/// fallback path to load remaining input into the window without the
+/// full hash table maintenance that fill_window performs.
+///
+/// # Safety
+///
+/// The caller must ensure `to_read` does not exceed the available space
+/// in the window buffer beyond `strstart`.
+pub fn fill_window_read(s: &mut DeflateState, strm: &mut ZStream, to_read: usize) {
+    let start = s.strstart;
+    let n = read_buf(strm, s.wrap, &mut s.window[start..start + to_read], to_read);
+    s.strstart += n;
+    s.insert += min(n, s.w_size.saturating_sub(s.insert));
+}
+
 /// Slides the hash table when the window slides down.
 ///
 /// For each entry in `head` and `prev`, subtracts `w_size` if the value
@@ -563,8 +580,12 @@ pub fn flush_pending(strm: &mut ZStream) {
 /// Internal version of `flush_pending` that takes state and stream separately.
 ///
 /// This avoids borrowing issues when the state is already borrowed from the
-/// stream. Used by helper functions like `flush_block_only`.
-fn flush_pending_from_state(s: &mut DeflateState, strm: &mut ZStream) {
+/// stream. Used by helper functions like `flush_block_only` and by the
+/// strategy-level `flush_block` helpers in `fast.rs`, `slow.rs`, `huff.rs`,
+/// `rle.rs`, and `stored.rs` to drain the pending buffer to the output
+/// between block emissions — matching C zlib's `FLUSH_BLOCK_ONLY` macro
+/// which calls `flush_pending(s->strm)` after each `_tr_flush_block`.
+pub(crate) fn flush_pending_from_state(s: &mut DeflateState, strm: &mut ZStream) {
     tr_flush_bits(s);
     let len = min(s.pending, strm.avail_out as usize);
     if len == 0 {
@@ -1195,7 +1216,23 @@ pub fn deflate(strm: &mut ZStream, flush: i32) -> Result<ReturnCode, ZlibError> 
     if flush != Z_FINISH {
         return Ok(ReturnCode::Ok);
     }
+
+    // Flush any remaining pending output produced by the strategy
+    // function. In C zlib, the strategy functions call flush_pending()
+    // via the FLUSH_BLOCK_ONLY macro after each _tr_flush_block, so
+    // pending is normally empty here. This belt-and-suspenders call
+    // ensures the pending buffer is drained for raw DEFLATE mode
+    // (wrap <= 0) which returns early below without writing a trailer.
+    flush_pending_from_state(s, strm);
+
     if s.wrap <= 0 {
+        // Raw DEFLATE: no trailer to write. Return StreamEnd only if
+        // all pending data has been flushed to the output buffer. If
+        // the output buffer was too small, return Ok so the caller
+        // provides more output space and calls deflate() again.
+        if s.pending != 0 {
+            return Ok(ReturnCode::Ok);
+        }
         return Ok(ReturnCode::StreamEnd);
     }
 

@@ -5,6 +5,12 @@
 // Gzip format compatibility tests — port of test/minigzip.c patterns and
 // test/example.c test_gzio (lines 90-164).
 
+// Gate the entire test file on the gz-io feature: all gz_* functions are only
+// available when the gz-io feature is enabled. Without this gate,
+// `cargo test --no-default-features` would fail with "not found in this scope"
+// errors for all gz_* API calls.
+#![cfg(feature = "gz-io")]
+
 //! Integration tests for the gzip file I/O subsystem (`gz` module).
 //!
 //! Validates RFC 1952 gzip format compatibility by exercising every public

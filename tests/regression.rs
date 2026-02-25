@@ -122,6 +122,7 @@ fn test_compress() {
 // ============================================================================
 
 #[test]
+#[cfg(feature = "gz-io")]
 fn test_gzio() {
     // Construct a temporary file path for the gzip test.
     let temp_dir = std::env::temp_dir();
@@ -622,8 +623,9 @@ fn full_regression_sequence() {
     }
 
     // -----------------------------------------------------------------------
-    // 2. test_gzio (C lines 90-164)
+    // 2. test_gzio (C lines 90-164) — gated on gz-io feature
     // -----------------------------------------------------------------------
+    #[cfg(feature = "gz-io")]
     {
         let temp_dir = std::env::temp_dir();
         let gz_path = temp_dir.join("zlib_rs_full_regression.gz");

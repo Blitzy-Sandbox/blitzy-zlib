@@ -69,7 +69,8 @@ unsafe fn do_fill_window(state: &mut DeflateState, strm: *mut ZStream) {
     super::fill_window(state, unsafe { &mut *strm });
 }
 
-/// Flush the current block to the pending output buffer.
+/// Flush the current block to the pending output buffer and drain pending
+/// data to the output stream.
 ///
 /// This local helper corresponds to the C `FLUSH_BLOCK_ONLY` macro
 /// (deflate.c lines 1630–1639). It:
@@ -82,12 +83,16 @@ unsafe fn do_fill_window(state: &mut DeflateState, strm: *mut ZStream) {
 ///    compressed block into the pending buffer.
 /// 3. Advances `block_start` to `strstart`, marking the start of the
 ///    next block.
+/// 4. Calls [`flush_pending_from_state`] to drain the pending buffer to
+///    the output stream — matching C's `FLUSH_BLOCK_ONLY` which calls
+///    `flush_pending(s->strm)` after `_tr_flush_block`.
 ///
-/// The C `FLUSH_BLOCK` macro additionally checks `avail_out` and may
-/// return `NeedMore`/`FinishStarted`. That output-buffer check is
-/// handled by the main `deflate()` loop after the strategy function
-/// returns, not within the strategy function itself.
-fn flush_block(state: &mut DeflateState, last: bool) {
+/// # Safety
+///
+/// `strm` must be a valid pointer to the `ZStream` that owns this
+/// `DeflateState`. The pointer is valid for the lifetime of the
+/// `deflate()` call.
+fn flush_block(state: &mut DeflateState, strm: *mut ZStream, last: bool) {
     let stored_len = (state.strstart as i64 - state.block_start) as u64;
 
     // We need to pass a slice of the window to tr_flush_block, but
@@ -106,6 +111,15 @@ fn flush_block(state: &mut DeflateState, last: bool) {
     }
 
     state.block_start = state.strstart as i64;
+
+    // Drain pending buffer to the output stream, matching C zlib's
+    // FLUSH_BLOCK_ONLY macro which calls flush_pending(s->strm).
+    // SAFETY: strm is the raw pointer to the parent ZStream passed from
+    // deflate(). flush_pending_from_state only reads/writes strm fields
+    // (avail_out, next_out, total_out) that do not overlap with DeflateState.
+    unsafe {
+        super::flush_pending_from_state(state, &mut *strm);
+    }
 }
 
 // ===========================================================================
@@ -198,7 +212,12 @@ pub(crate) fn deflate_huff(state: &mut DeflateState, strm: *mut ZStream, flush: 
 
         // If the symbol buffer is full, flush the current block.
         if bflush {
-            flush_block(state, false);
+            flush_block(state, strm, false);
+            // C: if (s->strm->avail_out == 0) return need_more;
+            let strm_ref = unsafe { &*strm };
+            if strm_ref.avail_out == 0 {
+                return BlockState::NeedMore;
+            }
         }
     }
 
@@ -213,14 +232,20 @@ pub(crate) fn deflate_huff(state: &mut DeflateState, strm: *mut ZStream, flush: 
 
     if flush == Z_FINISH {
         // Emit the final block (last = true).
-        flush_block(state, true);
+        flush_block(state, strm, true);
+        // C: after FLUSH_BLOCK with last=true, if avail_out == 0 return
+        // finish_started (data flushed but output buffer full).
+        let strm_ref = unsafe { &*strm };
+        if strm_ref.avail_out == 0 {
+            return BlockState::FinishStarted;
+        }
         return BlockState::FinishDone;
     }
 
     // If there are any pending symbols that haven't been flushed yet,
     // emit a non-final block.
     if state.sym_next > 0 {
-        flush_block(state, false);
+        flush_block(state, strm, false);
     }
 
     BlockState::BlockDone
@@ -283,8 +308,12 @@ mod tests {
         let data = vec![b'A'; 300];
         let mut state = make_test_state(&data, 0, 100);
 
+        let mut out_buf = [0u8; 4096];
+        let mut strm = dummy_strm();
+        strm.set_output(&mut out_buf);
+
         // Run with Z_FINISH to process all data
-        let result = deflate_huff(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
+        let result = deflate_huff(&mut state, &mut strm as *mut ZStream, Z_FINISH);
 
         // The function should process data and return FinishDone
         assert_eq!(result, BlockState::FinishDone);
@@ -311,7 +340,11 @@ mod tests {
         }
         let mut state = make_test_state(&data, 0, 200);
 
-        let result = deflate_huff(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
+        let mut out_buf = [0u8; 4096];
+        let mut strm = dummy_strm();
+        strm.set_output(&mut out_buf);
+
+        let result = deflate_huff(&mut state, &mut strm as *mut ZStream, Z_FINISH);
 
         assert_eq!(result, BlockState::FinishDone);
         assert_eq!(state.insert, 0);
@@ -338,7 +371,11 @@ mod tests {
         let data = vec![0u8; 300];
         let mut state = make_test_state(&data, 100, 0);
 
-        let result = deflate_huff(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
+        let mut out_buf = [0u8; 4096];
+        let mut strm = dummy_strm();
+        strm.set_output(&mut out_buf);
+
+        let result = deflate_huff(&mut state, &mut strm as *mut ZStream, Z_FINISH);
 
         assert_eq!(result, BlockState::FinishDone);
         assert_eq!(state.insert, 0);
@@ -351,7 +388,11 @@ mod tests {
         let data = vec![b'X'; 300];
         let mut state = make_test_state(&data, 0, 1);
 
-        let result = deflate_huff(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
+        let mut out_buf = [0u8; 4096];
+        let mut strm = dummy_strm();
+        strm.set_output(&mut out_buf);
+
+        let result = deflate_huff(&mut state, &mut strm as *mut ZStream, Z_FINISH);
 
         assert_eq!(result, BlockState::FinishDone);
         assert_eq!(state.strstart, 1);
@@ -366,7 +407,11 @@ mod tests {
         let data = vec![b'Q'; 300];
         let mut state = make_test_state(&data, 0, 50);
 
-        let result = deflate_huff(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
+        let mut out_buf = [0u8; 4096];
+        let mut strm = dummy_strm();
+        strm.set_output(&mut out_buf);
+
+        let result = deflate_huff(&mut state, &mut strm as *mut ZStream, Z_FINISH);
 
         assert_eq!(result, BlockState::FinishDone);
         assert_eq!(state.match_length, 0);
@@ -399,7 +444,11 @@ mod tests {
         let mut state = make_test_state(&data, 5, 50);
         state.insert = 42; // Set to non-zero to verify it gets cleared
 
-        let result = deflate_huff(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
+        let mut out_buf = [0u8; 4096];
+        let mut strm = dummy_strm();
+        strm.set_output(&mut out_buf);
+
+        let result = deflate_huff(&mut state, &mut strm as *mut ZStream, Z_FINISH);
 
         assert_eq!(result, BlockState::FinishDone);
         assert_eq!(state.insert, 0);

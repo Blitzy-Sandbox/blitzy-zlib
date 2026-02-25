@@ -9,18 +9,9 @@
 // Extends the basic verification from test/example.c into comprehensive
 // randomized testing using the `quickcheck` and `rand` dev-dependencies.
 //
-// # Known Library Limitations
-//
-// The following library issues have been identified and tests are designed
-// to work around them:
-// - Raw DEFLATE mode (negative windowBits) produces 0-byte output (deflate
-//   engine does not emit raw blocks correctly).
-// - Level 0 (Z_NO_COMPRESSION / stored blocks) produces data that does not
-//   decompress correctly (stored block headers are malformed).
-// - Random/incompressible data exceeding ~65 KB can overflow the pending
-//   buffer in trees.rs (copy_block does not flush before copying).
-//
-// Tests exercise all working code paths and document the above limitations.
+// All compression levels (0-9 and Z_DEFAULT_COMPRESSION), all windowBits
+// variants (zlib, raw DEFLATE, gzip, auto-detect), all strategies, and all
+// flush modes are fully tested.
 
 // ============================================================================
 // Imports
@@ -261,19 +252,17 @@ fn prop_compress_uncompress_identity() {
     quickcheck(roundtrip as fn(Vec<u8>) -> TestResult);
 }
 
-/// Quickcheck: compress2→uncompress identity for levels 1-9 and
-/// Z_DEFAULT_COMPRESSION. Levels are the core compression levels; level 0
-/// (stored blocks) is tested separately in deterministic tests.
+/// Quickcheck: compress2→uncompress identity for levels 0-9 and
+/// Z_DEFAULT_COMPRESSION. All 10 compression levels per AAP §0.8.1.
 #[test]
 fn prop_compress2_all_levels() {
     fn roundtrip(data: Vec<u8>, level_raw: u8) -> TestResult {
         if data.is_empty() || data.len() > 60000 {
             return TestResult::discard();
         }
-        // Map to levels 1-9 or -1 (default). Skip level 0 (stored block
-        // mode has a known library issue).
-        let level = match level_raw % 10 {
-            0 => Z_DEFAULT_COMPRESSION,
+        // Map to levels 0-9 or -1 (default).
+        let level = match level_raw % 11 {
+            10 => Z_DEFAULT_COMPRESSION,
             n => n as i32,
         };
         TestResult::from_bool(one_call_roundtrip(&data, level))
@@ -285,15 +274,15 @@ fn prop_compress2_all_levels() {
 // Phase 3: Streaming Round-Trip Property Tests
 // ============================================================================
 
-/// Quickcheck: streaming deflate→inflate identity with random levels (1-9).
+/// Quickcheck: streaming deflate→inflate identity with random levels (0-9).
 #[test]
 fn prop_streaming_deflate_inflate_identity() {
     fn roundtrip(data: Vec<u8>, level_raw: u8) -> TestResult {
         if data.is_empty() || data.len() > 60000 {
             return TestResult::discard();
         }
-        // Map to levels 1-9
-        let level = (level_raw % 9) as i32 + 1;
+        // Map to levels 0-9
+        let level = (level_raw % 10) as i32;
         TestResult::from_bool(streaming_roundtrip(&data, level))
     }
     quickcheck(roundtrip as fn(Vec<u8>, u8) -> TestResult);
@@ -362,8 +351,8 @@ fn prop_gzip_format_roundtrip() {
 }
 
 /// Test raw DEFLATE round-trip (negative windowBits: -9 to -15) with
-/// known compressible data. Raw DEFLATE mode is tested deterministically
-/// because the library's raw mode has limited support for certain inputs.
+/// property-based data. AAP §0.8.1 requires negative windowBits for raw
+/// DEFLATE to be fully functional.
 #[test]
 fn prop_raw_deflate_roundtrip() {
     fn roundtrip(data: Vec<u8>, wbits_raw: u8) -> TestResult {
@@ -371,21 +360,13 @@ fn prop_raw_deflate_roundtrip() {
             return TestResult::discard();
         }
         let wbits = -((wbits_raw % 7) as i32 + 9);
-        // Raw DEFLATE may produce 0 bytes for certain inputs; treat as
-        // discard rather than failure to allow the property test to find
-        // working cases.
-        let result = streaming_roundtrip_full(
+        TestResult::from_bool(streaming_roundtrip_full(
             &data,
             Z_DEFAULT_COMPRESSION,
             wbits,
             DEF_MEM_LEVEL,
             Z_DEFAULT_STRATEGY,
-        );
-        if result {
-            TestResult::passed()
-        } else {
-            TestResult::discard()
-        }
+        ))
     }
     quickcheck(roundtrip as fn(Vec<u8>, u8) -> TestResult);
 }
@@ -551,14 +532,14 @@ fn prop_auto_detect_gzip() {
 // Phase 7: Edge Case Round-Trip Tests
 // ============================================================================
 
-/// Compress empty input (0 bytes) at all working levels, decompress and
-/// verify empty output.
+/// Compress empty input (0 bytes) at all levels (0-9 and default), decompress
+/// and verify empty output. AAP §0.8.1 requires all 10 compression levels.
 #[test]
 fn empty_data_roundtrip() {
     let data: &[u8] = &[];
-    // Levels 1-9 and default (-1). Level 0 is excluded due to stored block
-    // library issue.
+    // Levels 0-9 and default (-1).
     let levels = [
+        Z_NO_COMPRESSION,
         Z_BEST_SPEED,
         2, 3, 4, 5, 6, 7, 8,
         Z_BEST_COMPRESSION,
@@ -606,10 +587,12 @@ fn empty_data_roundtrip() {
     }
 }
 
-/// Compress a single byte at all working levels, decompress and verify.
+/// Compress a single byte at all levels (0-9 and default), decompress and
+/// verify. AAP §0.8.1 requires all 10 compression levels.
 #[test]
 fn single_byte_roundtrip() {
     let levels = [
+        Z_NO_COMPRESSION,
         Z_BEST_SPEED,
         2, 3, 4, 5, 6, 7, 8,
         Z_BEST_COMPRESSION,
@@ -629,15 +612,15 @@ fn single_byte_roundtrip() {
     }
 }
 
-/// Compress highly compressible data (all zeros) at working compression
-/// levels. Pattern from test/example.c test_large_deflate: "uncompr is still
-/// mostly zeroes, so it should compress very well."
+/// Compress highly compressible data (all zeros) at all compression levels.
+/// Pattern from test/example.c test_large_deflate: "uncompr is still mostly
+/// zeroes, so it should compress very well."
+/// AAP §0.8.1 requires all 10 compression levels.
 #[test]
 fn highly_compressible_data_roundtrip() {
     let sizes = [1, 10, 100, 1_000, 10_000, 100_000];
-    // Levels 1-9 and default — all working levels. Level 0 (stored blocks)
-    // is excluded due to a library issue with stored block decompression.
     let levels = [
+        Z_NO_COMPRESSION,
         Z_BEST_SPEED,
         Z_DEFAULT_COMPRESSION,
         Z_BEST_COMPRESSION,
@@ -657,18 +640,19 @@ fn highly_compressible_data_roundtrip() {
 }
 
 /// Compress incompressible (random) data, decompress and verify identity.
-/// Random data is limited to 60 KB to stay within the pending buffer bounds
-/// of the deflate engine.
+/// Exercises all levels including level 0 (stored blocks) and tests data
+/// sizes up to 100 KB to verify pending buffer overflow is resolved.
 #[test]
 fn incompressible_data_roundtrip() {
     let mut rng = rand::rng();
-    let sizes = [1, 10, 100, 1_000, 10_000, 50_000];
+    let sizes = [1, 10, 100, 1_000, 10_000, 50_000, 100_000];
 
     for &size in &sizes {
         let mut data = vec![0u8; size];
         rng.fill(&mut data[..]);
 
         let levels = [
+            Z_NO_COMPRESSION,
             Z_BEST_SPEED,
             Z_DEFAULT_COMPRESSION,
             Z_BEST_COMPRESSION,
@@ -686,10 +670,7 @@ fn incompressible_data_roundtrip() {
 
 /// Compress large compressible data (1 MB+), decompress and verify identity.
 /// Uses highly compressible (patterned) data that compresses well.
-///
-/// Note: levels 1-2 with 1 MB data can overflow the pending buffer due to
-/// `deflate_fast` producing less efficient compression. Levels 3-9 and -1
-/// (default=6) compress efficiently and work correctly.
+/// Tests all levels (0-9) to verify pending buffer overflow fix.
 #[test]
 fn large_data_roundtrip() {
     // 1 MB of highly compressible data (repeated pattern)
@@ -701,23 +682,21 @@ fn large_data_roundtrip() {
         data.extend_from_slice(&pattern[..chunk]);
     }
 
-    // Default compression (level 6) — compresses 1 MB pattern to ~10 KB
-    assert!(
-        one_call_roundtrip(&data, Z_DEFAULT_COMPRESSION),
-        "large compressible data round-trip failed at default level"
-    );
-
-    // Best compression (level 9) — compresses 1 MB pattern to ~3 KB
-    assert!(
-        one_call_roundtrip(&data, Z_BEST_COMPRESSION),
-        "large compressible data round-trip failed at best compression"
-    );
-
-    // Level 5 — moderate compression that works with large data
-    assert!(
-        one_call_roundtrip(&data, 5),
-        "large compressible data round-trip failed at level 5"
-    );
+    // Test all levels 0-9 and default (-1) per AAP §0.8.1
+    let levels = [
+        Z_NO_COMPRESSION,
+        Z_BEST_SPEED,
+        2, 3, 4, 5, 6, 7, 8,
+        Z_BEST_COMPRESSION,
+        Z_DEFAULT_COMPRESSION,
+    ];
+    for &level in &levels {
+        assert!(
+            one_call_roundtrip(&data, level),
+            "large compressible data round-trip failed at level {}",
+            level
+        );
+    }
 }
 
 // ============================================================================
@@ -726,11 +705,17 @@ fn large_data_roundtrip() {
 
 /// Test streaming round-trip using various flush modes at intermediate points.
 /// For each non-final flush mode (Z_NO_FLUSH, Z_PARTIAL_FLUSH, Z_SYNC_FLUSH,
-/// Z_FULL_FLUSH), stream data with that flush mode, finish with Z_FINISH,
-/// decompress and verify identity.
+/// Z_FULL_FLUSH, Z_BLOCK), stream data with that flush mode, finish with
+/// Z_FINISH, decompress and verify identity.
 ///
-/// Z_BLOCK and Z_TREES are advanced modes that may not produce complete
-/// blocks suitable for round-trip testing and are tested separately.
+/// Z_BLOCK causes deflate to stop after producing the next block header or
+/// coded data, which is useful for block-boundary inspection. The data is
+/// still valid DEFLATE and can be decompressed normally.
+///
+/// Note: Z_TREES (value 6) is NOT a valid flush mode for deflate() — in C zlib,
+/// deflate.c line 985 checks `flush > Z_BLOCK` and returns Z_STREAM_ERROR.
+/// Z_TREES is only valid for inflate() where it stops after decoding the
+/// Huffman trees. Z_TREES inflate-side testing is in a separate test below.
 #[test]
 fn flush_modes_roundtrip() {
     let data = b"Hello, this is a test string for flush mode round-trip testing. \
@@ -743,6 +728,7 @@ fn flush_modes_roundtrip() {
         Z_PARTIAL_FLUSH,
         Z_SYNC_FLUSH,
         Z_FULL_FLUSH,
+        Z_BLOCK,
     ];
 
     for &flush_mode in &flush_modes {
@@ -866,16 +852,17 @@ fn flush_modes_roundtrip() {
 // Exhaustive deterministic tests
 // ============================================================================
 
-/// Exhaustive deterministic test: all working levels × all strategies with
-/// known data. Ensures every combination works, complementing the
-/// property-based tests.
+/// Exhaustive deterministic test: all levels (0-9 and default) × all strategies
+/// with known data. Ensures every combination works, complementing the
+/// property-based tests. AAP §0.8.1 requires all 10 compression levels and
+/// all 5 strategies.
 #[test]
 fn exhaustive_level_strategy_roundtrip() {
     let data = b"hello, hello! This is a test of all compression levels and \
                  strategies. Repeated words help: hello hello hello test test.";
 
-    // Levels 1-9 and -1 (default). Level 0 excluded due to stored block bug.
-    let levels: Vec<i32> = (1..=9).chain(std::iter::once(-1)).collect();
+    // Levels 0-9 and -1 (default).
+    let levels: Vec<i32> = (0..=9).chain(std::iter::once(-1)).collect();
     let strategies = [
         Z_DEFAULT_STRATEGY,
         Z_FILTERED,
@@ -929,6 +916,301 @@ fn exhaustive_window_bits_roundtrip() {
             ),
             "gzip format round-trip failed for windowBits={}",
             wbits + 16
+        );
+    }
+
+    // Raw DEFLATE format: windowBits -9 to -15
+    // AAP §0.8.1 requires negative windowBits for raw DEFLATE
+    for wbits in 9..=15 {
+        assert!(
+            streaming_roundtrip_full(
+                data,
+                Z_DEFAULT_COMPRESSION,
+                -wbits,
+                DEF_MEM_LEVEL,
+                Z_DEFAULT_STRATEGY,
+            ),
+            "raw DEFLATE round-trip failed for windowBits={}",
+            -wbits
+        );
+    }
+}
+
+// ============================================================================
+// Phase 9: Z_BLOCK and Z_TREES Flush Mode Tests
+// ============================================================================
+
+/// Test Z_BLOCK flush mode for deflate: Z_BLOCK causes the deflate engine
+/// to stop output at the next block boundary. The compressed data is still
+/// valid DEFLATE and can be decompressed normally. This test verifies the
+/// round-trip works when Z_BLOCK is used as the intermediate flush mode.
+///
+/// Per AAP §0.8.1, all 7 flush modes must produce identical behavior to C zlib.
+#[test]
+fn z_block_flush_deflate_roundtrip() {
+    let data = b"Z_BLOCK flush mode test. This data needs to be long enough \
+                 to produce multiple blocks. Repeated words help: block block \
+                 block flush flush flush test test test data data data zlib.";
+
+    let mut c_stream = ZStream::new();
+    deflate_init(&mut c_stream, Z_DEFAULT_COMPRESSION)
+        .expect("deflate_init failed for Z_BLOCK test");
+
+    let mut compressed = vec![0u8; data.len() * 4 + 128];
+    let chunk_size = 16; // Small chunks to exercise Z_BLOCK multiple times
+
+    let mut input_fed = 0;
+    c_stream.set_output(&mut compressed);
+
+    while input_fed < data.len() {
+        let this_chunk = chunk_size.min(data.len() - input_fed);
+        c_stream.set_input(&data[input_fed..input_fed + this_chunk]);
+        input_fed += this_chunk;
+
+        let out_pos = c_stream.total_out as usize;
+        c_stream.set_output(&mut compressed[out_pos..]);
+
+        loop {
+            let result = deflate(&mut c_stream, Z_BLOCK);
+            match result {
+                Ok(ReturnCode::Ok) => {
+                    if c_stream.avail_in == 0 {
+                        break;
+                    }
+                    let out_pos = c_stream.total_out as usize;
+                    c_stream.set_output(&mut compressed[out_pos..]);
+                }
+                Err(e) => panic!("deflate Z_BLOCK error: {:?}", e),
+                _ => break,
+            }
+        }
+    }
+
+    // Finish the stream
+    c_stream.set_input(&[]);
+    loop {
+        let out_pos = c_stream.total_out as usize;
+        c_stream.set_output(&mut compressed[out_pos..]);
+        let result = deflate(&mut c_stream, Z_FINISH);
+        match result {
+            Ok(ReturnCode::StreamEnd) => break,
+            Ok(ReturnCode::Ok) => continue,
+            Err(e) => panic!("deflate FINISH after Z_BLOCK error: {:?}", e),
+            _ => break,
+        }
+    }
+
+    let comp_len = c_stream.total_out as usize;
+    let _ = deflate_end(&mut c_stream);
+    compressed.truncate(comp_len);
+
+    assert!(comp_len > 0, "Z_BLOCK: compressed output should not be empty");
+
+    // Decompress and verify identity
+    let mut decompressed = vec![0u8; data.len()];
+    let mut d_stream = ZStream::new();
+    inflate_init(&mut d_stream).expect("inflate_init failed for Z_BLOCK test");
+    d_stream.set_input(&compressed);
+    d_stream.set_output(&mut decompressed);
+
+    let result = inflate(&mut d_stream, Z_FINISH);
+    let decomp_len = d_stream.total_out as usize;
+    let _ = inflate_end(&mut d_stream);
+
+    assert!(
+        matches!(result, Ok(ReturnCode::StreamEnd)),
+        "inflate should succeed for Z_BLOCK compressed data (got {:?})",
+        result
+    );
+    assert_eq!(
+        decomp_len,
+        data.len(),
+        "Z_BLOCK: decompressed length mismatch"
+    );
+    assert_eq!(
+        &decompressed[..decomp_len],
+        &data[..],
+        "Z_BLOCK: data mismatch"
+    );
+}
+
+/// Test Z_TREES flush mode for inflate: Z_TREES (value 6) is valid for
+/// inflate() — it causes inflate to return after decoding the Huffman tree
+/// headers at the beginning of a dynamic block, before decoding the actual
+/// symbols. This is useful for examining the code trees.
+///
+/// Z_TREES is NOT valid for deflate() — C zlib rejects it with Z_STREAM_ERROR
+/// because deflate.c checks `flush > Z_BLOCK`. This test verifies both
+/// behaviors per AAP §0.8.1.
+#[test]
+fn z_trees_flush_inflate_test() {
+    // First, verify that Z_TREES is rejected by deflate
+    {
+        let mut c_stream = ZStream::new();
+        deflate_init(&mut c_stream, Z_DEFAULT_COMPRESSION)
+            .expect("deflate_init failed");
+        let data = b"test data for Z_TREES";
+        let mut output = vec![0u8; 256];
+        c_stream.set_input(data);
+        c_stream.set_output(&mut output);
+        let result = deflate(&mut c_stream, Z_TREES);
+        assert!(
+            result.is_err(),
+            "deflate should reject Z_TREES flush mode (got {:?})",
+            result
+        );
+        let _ = deflate_end(&mut c_stream);
+    }
+
+    // Now test Z_TREES with inflate: compress data normally, then decompress
+    // using Z_TREES flush mode which pauses after Huffman tree headers
+    let data = b"Z_TREES inflate test. Repeated data helps produce dynamic \
+                 Huffman trees: trees trees trees inflate inflate inflate \
+                 zlib zlib zlib test test test data data data round round.";
+
+    // Compress with default settings
+    let mut c_stream = ZStream::new();
+    deflate_init(&mut c_stream, Z_DEFAULT_COMPRESSION)
+        .expect("deflate_init failed for Z_TREES test");
+
+    let mut compressed = vec![0u8; data.len() * 2 + 64];
+    c_stream.set_input(data);
+    c_stream.set_output(&mut compressed);
+    let result = deflate(&mut c_stream, Z_FINISH);
+    let comp_len = c_stream.total_out as usize;
+    let _ = deflate_end(&mut c_stream);
+    assert!(
+        matches!(result, Ok(ReturnCode::StreamEnd)),
+        "deflate should succeed for Z_TREES test data"
+    );
+    compressed.truncate(comp_len);
+
+    // Decompress using Z_TREES flush mode: this should pause after parsing
+    // the Huffman tree headers, then subsequent calls continue decompression
+    let mut decompressed = vec![0u8; data.len()];
+    let mut d_stream = ZStream::new();
+    inflate_init(&mut d_stream).expect("inflate_init failed for Z_TREES test");
+    d_stream.set_input(&compressed);
+    d_stream.set_output(&mut decompressed);
+
+    // Use Z_TREES for the initial inflate call — inflate should return Ok
+    // after decoding the Huffman tree headers, then we continue with
+    // Z_NO_FLUSH calls to complete decompression.
+    let initial_result = inflate(&mut d_stream, Z_TREES);
+    match initial_result {
+        Ok(ReturnCode::StreamEnd) => {
+            // Very small data completed in one call — this is valid
+        }
+        Ok(ReturnCode::Ok) => {
+            // Z_TREES returned after tree headers — complete decompression
+            loop {
+                let out_pos = d_stream.total_out as usize;
+                if out_pos < decompressed.len() {
+                    d_stream.set_output(&mut decompressed[out_pos..]);
+                }
+                let result = inflate(&mut d_stream, Z_NO_FLUSH);
+                match result {
+                    Ok(ReturnCode::StreamEnd) => break,
+                    Ok(ReturnCode::Ok) => continue,
+                    Err(e) => panic!("inflate Z_NO_FLUSH after Z_TREES error: {:?}", e),
+                    _ => break,
+                }
+            }
+        }
+        Err(e) => panic!("inflate Z_TREES error: {:?}", e),
+        _ => {} // Other return codes are acceptable
+    }
+    let decomp_len = d_stream.total_out as usize;
+    let _ = inflate_end(&mut d_stream);
+
+    assert_eq!(
+        decomp_len,
+        data.len(),
+        "Z_TREES: decompressed length mismatch: {} vs {}",
+        decomp_len,
+        data.len()
+    );
+    assert_eq!(
+        &decompressed[..decomp_len],
+        &data[..],
+        "Z_TREES: data mismatch"
+    );
+}
+
+/// Test Z_BLOCK with all levels and formats to ensure comprehensive coverage.
+/// Per AAP §0.8.1, Z_BLOCK must work correctly across all configurations.
+#[test]
+fn z_block_all_levels_roundtrip() {
+    let data = b"Block flush across all levels test. Repeated content helps \
+                 compression: block level test block level test block level.";
+
+    // Test all levels 0-9 with Z_BLOCK as intermediate flush
+    for level in 0..=9i32 {
+        let mut c_stream = ZStream::new();
+        deflate_init(&mut c_stream, level)
+            .unwrap_or_else(|e| panic!("deflate_init level {} failed: {:?}", level, e));
+
+        let mut compressed = vec![0u8; data.len() * 4 + 128];
+        c_stream.set_input(data);
+        c_stream.set_output(&mut compressed);
+
+        // Feed half the data with Z_BLOCK
+        let half = data.len() / 2;
+        c_stream.set_input(&data[..half]);
+        loop {
+            let result = deflate(&mut c_stream, Z_BLOCK);
+            match result {
+                Ok(ReturnCode::Ok) => {
+                    if c_stream.avail_in == 0 {
+                        break;
+                    }
+                    let out_pos = c_stream.total_out as usize;
+                    c_stream.set_output(&mut compressed[out_pos..]);
+                }
+                Err(e) => panic!("deflate Z_BLOCK level {} error: {:?}", level, e),
+                _ => break,
+            }
+        }
+
+        // Feed the rest with Z_FINISH
+        c_stream.set_input(&data[half..]);
+        loop {
+            let out_pos = c_stream.total_out as usize;
+            c_stream.set_output(&mut compressed[out_pos..]);
+            let result = deflate(&mut c_stream, Z_FINISH);
+            match result {
+                Ok(ReturnCode::StreamEnd) => break,
+                Ok(ReturnCode::Ok) => continue,
+                Err(e) => panic!("deflate FINISH level {} error: {:?}", level, e),
+                _ => break,
+            }
+        }
+
+        let comp_len = c_stream.total_out as usize;
+        let _ = deflate_end(&mut c_stream);
+        compressed.truncate(comp_len);
+
+        // Decompress and verify
+        let mut decompressed = vec![0u8; data.len()];
+        let mut d_stream = ZStream::new();
+        inflate_init(&mut d_stream).expect("inflate_init failed");
+        d_stream.set_input(&compressed);
+        d_stream.set_output(&mut decompressed);
+        let result = inflate(&mut d_stream, Z_FINISH);
+        let decomp_len = d_stream.total_out as usize;
+        let _ = inflate_end(&mut d_stream);
+
+        assert!(
+            matches!(result, Ok(ReturnCode::StreamEnd)),
+            "inflate level {} Z_BLOCK failed: {:?}",
+            level,
+            result
+        );
+        assert_eq!(
+            &decompressed[..decomp_len],
+            &data[..],
+            "Z_BLOCK level {} data mismatch",
+            level
         );
     }
 }

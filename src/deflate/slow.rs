@@ -138,10 +138,16 @@ unsafe fn do_fill_window(state: &mut DeflateState, strm: *mut ZStream) {
 ///    compressed block into the pending buffer.
 /// 3. Advances `block_start` to `strstart`, marking the start of the
 ///    next block.
+/// 4. Calls [`flush_pending_from_state`] to drain the pending buffer to
+///    the output stream — matching C's `FLUSH_BLOCK_ONLY` which calls
+///    `flush_pending(s->strm)` after `_tr_flush_block`.
 ///
-/// Unlike [`flush_block`], this function does **not** check `avail_out` or
-/// return early. It corresponds to `FLUSH_BLOCK_ONLY` in C.
-fn flush_block_only(state: &mut DeflateState, last: bool) {
+/// # Safety
+///
+/// `strm` must be a valid pointer to the `ZStream` that owns this
+/// `DeflateState`. The pointer is valid for the lifetime of the
+/// `deflate()` call.
+fn flush_block_only(state: &mut DeflateState, strm: *mut ZStream, last: bool) {
     let stored_len = (state.strstart as i64 - state.block_start) as u64;
 
     // We need to pass a slice of the window to tr_flush_block, but
@@ -160,22 +166,30 @@ fn flush_block_only(state: &mut DeflateState, last: bool) {
     }
 
     state.block_start = state.strstart as i64;
+
+    // Drain pending buffer to the output stream, matching C zlib's
+    // FLUSH_BLOCK_ONLY macro which calls flush_pending(s->strm).
+    // SAFETY: strm is the raw pointer to the parent ZStream passed from
+    // deflate(). flush_pending_from_state only reads/writes strm fields
+    // (avail_out, next_out, total_out) that do not overlap with DeflateState.
+    unsafe {
+        super::flush_pending_from_state(state, &mut *strm);
+    }
 }
 
-/// Flush the current block and return `NeedMore`/`FinishStarted` if the
-/// output buffer is exhausted.
+/// Flush the current block and drain pending data to the output stream.
 ///
 /// This helper corresponds to the C `FLUSH_BLOCK` macro (deflate.c lines
-/// 1642–1645), which calls `FLUSH_BLOCK_ONLY` and then checks if
-/// `avail_out == 0`. In the Rust implementation, the `avail_out` check
-/// is deferred to the caller (the main `deflate()` loop handles output
-/// buffer management). This function calls `flush_block_only` and the
-/// return value indicates whether a flush was performed. The `avail_out`
-/// check (and potential NeedMore return) is handled inline after calling
-/// this function — mirroring the C macro expansion pattern.
+/// 1642–1645), which calls `FLUSH_BLOCK_ONLY` (including
+/// `flush_pending(s->strm)`) and then checks if `avail_out == 0`.
+///
+/// # Safety
+///
+/// `strm` must be a valid pointer to the `ZStream` that owns this
+/// `DeflateState`.
 #[inline(always)]
-fn flush_block(state: &mut DeflateState, last: bool) {
-    flush_block_only(state, last);
+fn flush_block(state: &mut DeflateState, strm: *mut ZStream, last: bool) {
+    flush_block_only(state, strm, last);
 }
 
 /// Maximum match distance for the current window configuration.
@@ -496,7 +510,12 @@ pub(crate) fn deflate_slow(state: &mut DeflateState, strm: *mut ZStream, flush: 
             // C: if (bflush) FLUSH_BLOCK(s, 0);
             // FLUSH_BLOCK = FLUSH_BLOCK_ONLY + avail_out check
             if bflush {
-                flush_block(state, false);
+                flush_block(state, strm, false);
+                // C: if (s->strm->avail_out == 0) return need_more;
+                let strm_ref = unsafe { &*strm };
+                if strm_ref.avail_out == 0 {
+                    return BlockState::NeedMore;
+                }
             }
         } else if state.match_available {
             // ----------------------------------------------------------
@@ -509,24 +528,21 @@ pub(crate) fn deflate_slow(state: &mut DeflateState, strm: *mut ZStream, flush: 
             let bflush = tally_lit(state, c);
 
             if bflush {
-                // C: FLUSH_BLOCK_ONLY(s, 0) — no early return
-                flush_block_only(state, false);
+                // C: FLUSH_BLOCK_ONLY(s, 0)
+                flush_block_only(state, strm, false);
             }
 
             state.strstart += 1;
             state.lookahead -= 1;
 
             // C: if (s->strm->avail_out == 0) return need_more;
-            // In the integrated system, the main deflate() loop checks
-            // avail_out after the strategy function returns. The strategy
-            // function signals NeedMore to indicate it needs more space.
-            // Since we don't have direct access to avail_out here, the
-            // main deflate() loop handles this check. However, to match
-            // the C behavior where FLUSH_BLOCK_ONLY + avail_out check
-            // can cause an early return, we check pending vs
-            // pending_buf_size as a proxy: if pending has filled the
-            // buffer, we need more output space.
-            // For now, this check is deferred to the main loop.
+            // Now that flush_block_only drains pending to the output
+            // stream (matching C's FLUSH_BLOCK_ONLY), we can check
+            // avail_out directly and return NeedMore if exhausted.
+            let strm_ref = unsafe { &*strm };
+            if strm_ref.avail_out == 0 {
+                return BlockState::NeedMore;
+            }
         } else {
             // ----------------------------------------------------------
             // Case C: There is no previous match to compare with. Wait
@@ -562,13 +578,19 @@ pub(crate) fn deflate_slow(state: &mut DeflateState, strm: *mut ZStream, flush: 
 
     if flush == Z_FINISH {
         // Emit the final block (last = true).
-        flush_block(state, true);
+        flush_block(state, strm, true);
+        // C: after FLUSH_BLOCK with last=true, if avail_out == 0 return
+        // finish_started (data flushed but output buffer full).
+        let strm_ref = unsafe { &*strm };
+        if strm_ref.avail_out == 0 {
+            return BlockState::FinishStarted;
+        }
         return BlockState::FinishDone;
     }
 
     // If there are pending symbols in the buffer, flush a non-final block.
     if state.sym_next > 0 {
-        flush_block(state, false);
+        flush_block(state, strm, false);
     }
 
     BlockState::BlockDone
@@ -642,12 +664,15 @@ mod tests {
     fn test_finish_empty() {
         let data = [0u8; 512];
         let mut state = make_test_state(&data, 0, 0);
-        let result = deflate_slow(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
+        let mut out_buf = [0u8; 4096];
+        let mut strm = dummy_strm();
+        strm.set_output(&mut out_buf);
+        let result = deflate_slow(&mut state, &mut strm as *mut ZStream, Z_FINISH);
         assert_eq!(result, BlockState::FinishDone);
     }
 
-    /// Test that `deflate_slow` correctly returns `BlockDone` after
-    /// processing all available data with a non-finish flush.
+    /// Test that `deflate_slow` correctly returns `FinishDone` after
+    /// processing all available data with Z_FINISH.
     #[test]
     fn test_block_done_with_data() {
         // Create data with no repeating patterns (all literals)
@@ -659,7 +684,11 @@ mod tests {
         let mut state = make_test_state(&data, 0, 200);
         state.window_size = state.window.len();
 
-        let result = deflate_slow(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
+        let mut out_buf = [0u8; 65536];
+        let mut strm = dummy_strm();
+        strm.set_output(&mut out_buf);
+
+        let result = deflate_slow(&mut state, &mut strm as *mut ZStream, Z_FINISH);
         assert_eq!(result, BlockState::FinishDone);
     }
 
@@ -687,7 +716,11 @@ mod tests {
                 & state.hash_mask;
         }
 
-        let result = deflate_slow(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
+        let mut out_buf = [0u8; 65536];
+        let mut strm = dummy_strm();
+        strm.set_output(&mut out_buf);
+
+        let result = deflate_slow(&mut state, &mut strm as *mut ZStream, Z_FINISH);
         assert_eq!(result, BlockState::FinishDone);
     }
 
@@ -741,10 +774,14 @@ mod tests {
         let mut state = make_test_state(&data, 10, 0);
         state.match_available = true;
 
+        let mut out_buf = [0u8; 4096];
+        let mut strm = dummy_strm();
+        strm.set_output(&mut out_buf);
+
         // With Z_FINISH and lookahead == 0, the loop should exit
         // immediately and the post-loop cleanup should handle
         // the deferred literal.
-        let result = deflate_slow(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
+        let result = deflate_slow(&mut state, &mut strm as *mut ZStream, Z_FINISH);
         assert_eq!(result, BlockState::FinishDone);
         assert!(!state.match_available);
     }
@@ -755,7 +792,11 @@ mod tests {
         let data = [0u8; 1024];
         let mut state = make_test_state(&data, 100, 0);
 
-        deflate_slow(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
+        let mut out_buf = [0u8; 4096];
+        let mut strm = dummy_strm();
+        strm.set_output(&mut out_buf);
+
+        deflate_slow(&mut state, &mut strm as *mut ZStream, Z_FINISH);
         assert!(state.insert < MIN_MATCH);
     }
 }

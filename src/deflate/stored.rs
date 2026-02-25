@@ -59,7 +59,7 @@ use core::cmp::min;
 use alloc::vec::Vec;
 
 use crate::constants::{Z_FINISH, Z_NO_FLUSH};
-use crate::deflate::state::{BlockState, DeflateState, MIN_LOOKAHEAD};
+use crate::deflate::state::{BlockState, DeflateState};
 use crate::deflate::trees::tr_stored_block;
 use crate::stream::ZStream;
 
@@ -116,122 +116,402 @@ pub(crate) fn deflate_stored(
     flush: i32,
 ) -> BlockState {
     // ---------------------------------------------------------------
-    // Setup: compute minimum block size threshold.
+    // Port of C `deflate_stored` from deflate.c lines 1648–1848.
     //
-    // min_block is the smallest block worth emitting when not forced by
-    // a flush. It avoids generating many tiny stored blocks for small
-    // input increments. The value must leave room for the 5-byte stored
-    // block header in the pending buffer, and is capped at the window
-    // size (w_size) which is the maximum amount of data that can be
-    // referenced after a window slide.
+    // The C implementation has two code paths:
+    //   Fast path: copies data directly from input/window to output,
+    //     bypassing the pending buffer. Handles arbitrarily large data.
+    //   Fallback path: writes stored blocks to the pending buffer for
+    //     smaller leftover data at the end.
     //
-    // C: deflate.c line 1651
+    // This Rust implementation follows the C algorithm faithfully:
+    //   1. Main do-while loop: emit stored blocks using direct copy
+    //      from window and input to output
+    //   2. Post-loop: update window with copied data
+    //   3. Fallback: use pending buffer for remaining data
+    //
+    // SAFETY: _strm is a raw pointer to the parent ZStream passed from
+    // deflate(). We dereference it with appropriate unsafe blocks.
     // ---------------------------------------------------------------
+
+    // Smallest worthy block size when not flushing or finishing.
+    // C: deflate.c line 1651
     let min_block = min(state.pending_buf_size.saturating_sub(5), state.w_size);
 
     // ---------------------------------------------------------------
-    // Main loop: fill window from stream, then emit stored blocks.
-    //
-    // Like the C implementation (deflate.c lines 1652–1848), we must
-    // call fill_window to read data from the stream's input buffer into
-    // the sliding window before processing it. Without this, input set
-    // via set_input (e.g. after a deflateParams call) is never consumed.
-    //
-    // The outer loop repeatedly fills the window and emits stored
-    // blocks until no more input is available.
+    // Unit test path: when _strm is null or window not initialized,
+    // use the simplified pending-buffer-only approach for pre-loaded
+    // window data. This supports unit tests that create minimal
+    // DeflateState with pre-loaded window data.
     // ---------------------------------------------------------------
-
-    // Fill the window from the stream's input buffer.
-    // SAFETY: _strm was derived from a valid &mut ZStream in the main
-    // deflate() call. fill_window only accesses non-overlapping fields
-    // (avail_in, next_in, total_in) vs the state fields we use.
-    //
-    // Guard: only attempt fill_window when the stream and window are
-    // properly initialized (window_size > 0). Unit tests that create
-    // minimal DeflateState with pre-loaded window data bypass this.
-    if !_strm.is_null() && state.window_size > 0 {
-        loop {
-            if state.lookahead <= 1 {
-                unsafe {
-                    super::fill_window(state, &mut *_strm);
-                }
-                if state.lookahead == 0 {
-                    if flush == Z_NO_FLUSH {
-                        return BlockState::NeedMore;
-                    }
-                    break; // flush the current block
-                }
-            }
-            // Consume all loaded lookahead — for level 0, every byte passes
-            // through verbatim (no LZ77 matching).
-            state.strstart += state.lookahead;
-            state.lookahead = 0;
-        }
-    } else {
-        // Pre-loaded window path (used by unit tests or when window is
-        // already populated): consume all existing lookahead.
-        state.strstart += state.lookahead;
-        state.lookahead = 0;
+    if _strm.is_null() || state.window_size == 0 {
+        return deflate_stored_pending_path(state, _strm, flush, min_block);
     }
 
     // ---------------------------------------------------------------
-    // Emit stored blocks from window data.
+    // Main loop (C: do { ... } while (last == 0); lines 1680–1765)
+    //
+    // Each iteration emits one stored block by:
+    //   a) Writing the 5-byte header to pending, flushing to output
+    //   b) Copying window data directly to output
+    //   c) Copying remaining input data directly to output
     // ---------------------------------------------------------------
+    let mut last = false;
+    let used_start = unsafe { (*_strm).avail_in };
+
+    loop {
+        // Compute maximum block size considering output capacity.
+        // C: deflate.c lines 1688–1701
+        let mut len: usize = MAX_STORED;
+
+        // Header overhead: bytes consumed by the stored block header
+        // (BFINAL/BTYPE + padding + LEN + NLEN).
+        let header_bytes = ((state.bi_valid as usize) + 42) >> 3;
+        let avail_out = unsafe { (*_strm).avail_out } as usize;
+        if avail_out < header_bytes {
+            break; // Not enough output space for even the header
+        }
+
+        // Maximum payload that fits in available output after header
+        let have = avail_out - header_bytes;
+
+        // Data in the window not yet emitted (left)
+        let left = if state.block_start >= 0 {
+            state.strstart.saturating_sub(state.block_start as usize)
+        } else {
+            0
+        };
+
+        // Total available = window data + remaining input
+        let avail_in = unsafe { (*_strm).avail_in } as usize;
+        let total_avail = left + avail_in;
+        if len > total_avail {
+            len = total_avail;
+        }
+        if len > have {
+            len = have;
+        }
+
+        // Check minimum block threshold.
+        // C: deflate.c lines 1703–1710
+        if len < min_block
+            && ((len == 0 && flush != Z_FINISH)
+                || flush == Z_NO_FLUSH
+                || len != total_avail)
+        {
+            break;
+        }
+
+        // Is this the final block? Only when all available data fits
+        // and Z_FINISH was requested.
+        // C: deflate.c line 1712
+        last = flush == Z_FINISH && len == total_avail;
+
+        // Write a dummy stored block header to the pending buffer.
+        // tr_stored_block with empty data writes the 5-byte header
+        // (BFINAL/BTYPE + LEN=0 + NLEN=0xFFFF).
+        // C: deflate.c line 1714
+        tr_stored_block(state, &[], 0, last);
+
+        // Overwrite the LEN/NLEN fields in the pending buffer with the
+        // actual block payload length. The last 4 bytes of pending are
+        // the LEN (2 bytes) and NLEN (2 bytes) from the dummy header.
+        // C: deflate.c lines 1717–1720
+        let len16 = len as u16;
+        state.pending_buf[state.pending - 4] = len16 as u8;
+        state.pending_buf[state.pending - 3] = (len16 >> 8) as u8;
+        state.pending_buf[state.pending - 2] = (!len16) as u8;
+        state.pending_buf[state.pending - 1] = ((!len16) >> 8) as u8;
+
+        // Flush the header bytes to the output stream.
+        // C: deflate.c line 1723
+        unsafe {
+            super::flush_pending_from_state(state, &mut *_strm);
+        }
+
+        // Copy window data (left bytes) directly to output.
+        // C: deflate.c lines 1731–1738
+        let copy_from_window = min(left, len);
+        if copy_from_window > 0 {
+            let block_start_idx = state.block_start.max(0) as usize;
+            // SAFETY: next_out is a valid writable pointer with at least
+            // avail_out bytes available. copy_from_window <= avail_out
+            // because len <= have <= avail_out - header_bytes, and we
+            // already flushed the header reducing pending.
+            unsafe {
+                let strm = &mut *_strm;
+                core::ptr::copy_nonoverlapping(
+                    state.window[block_start_idx..].as_ptr(),
+                    strm.next_out,
+                    copy_from_window,
+                );
+                strm.next_out = strm.next_out.add(copy_from_window);
+                strm.avail_out -= copy_from_window as u32;
+                strm.total_out += copy_from_window as u64;
+            }
+            state.block_start += copy_from_window as i64;
+            len -= copy_from_window;
+        }
+
+        // Copy remaining bytes directly from input to output.
+        // C: deflate.c lines 1741–1747 uses read_buf which also
+        // updates the checksum. We replicate that behavior here.
+        if len > 0 {
+            // SAFETY: next_in and next_out are valid pointers with
+            // sufficient remaining capacity.
+            unsafe {
+                let strm = &mut *_strm;
+                let copy_len = min(len, strm.avail_in as usize);
+
+                // Copy input → output
+                core::ptr::copy_nonoverlapping(
+                    strm.next_in,
+                    strm.next_out,
+                    copy_len,
+                );
+
+                // Update checksum (Adler-32 for zlib, CRC-32 for gzip)
+                // matching C's read_buf checksum update behavior.
+                if state.wrap == 1 {
+                    let slice = core::slice::from_raw_parts(strm.next_out, copy_len);
+                    strm.adler = crate::checksum::adler32::adler32_z(
+                        strm.adler as u32,
+                        slice,
+                    ) as u64;
+                } else if state.wrap == 2 {
+                    let slice = core::slice::from_raw_parts(strm.next_out, copy_len);
+                    strm.adler = crate::checksum::crc32::crc32_z(
+                        strm.adler as u32,
+                        slice,
+                    ) as u64;
+                }
+
+                // Advance input and output pointers
+                strm.next_in = strm.next_in.add(copy_len);
+                strm.avail_in -= copy_len as u32;
+                strm.total_in += copy_len as u64;
+                strm.next_out = strm.next_out.add(copy_len);
+                strm.avail_out -= copy_len as u32;
+                strm.total_out += copy_len as u64;
+            }
+        }
+
+        if last {
+            break;
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Post-loop: Update the sliding window with the data that was
+    // copied directly from input to output (bypassing the window).
+    //
+    // The window must be updated so that if deflateParams() switches
+    // to a hash-based compression level later, the window contains
+    // valid history data.
+    //
+    // C: deflate.c lines 1768–1794
+    // ---------------------------------------------------------------
+    let used = (used_start - unsafe { (*_strm).avail_in }) as usize;
+    if used > 0 {
+        // Some input was consumed via direct copy. Update the window
+        // with the last w_size bytes of that input.
+        if used >= state.w_size {
+            // Consumed more than a full window — replace entire window
+            // C: deflate.c lines 1774–1779
+            state.matches = 2; // clear hash on next strategy switch
+            unsafe {
+                let strm = &*_strm;
+                // Copy the last w_size bytes of consumed input to window[0..]
+                let src = strm.next_in.sub(state.w_size);
+                core::ptr::copy_nonoverlapping(
+                    src,
+                    state.window.as_mut_ptr(),
+                    state.w_size,
+                );
+            }
+            state.strstart = state.w_size;
+            state.insert = state.strstart;
+        } else {
+            // Consumed less than a full window — append or slide
+            if state.window_size.saturating_sub(state.strstart) <= used {
+                // Slide window down to make room
+                // C: deflate.c lines 1782–1789
+                state.strstart -= state.w_size;
+                state.window
+                    .copy_within(state.w_size..state.w_size + state.strstart, 0);
+                if state.matches < 2 {
+                    state.matches += 1;
+                }
+                if state.insert > state.strstart {
+                    state.insert = state.strstart;
+                }
+            }
+            // Copy the consumed input data into the window
+            // C: deflate.c line 1791
+            unsafe {
+                let strm = &*_strm;
+                let src = strm.next_in.sub(used);
+                core::ptr::copy_nonoverlapping(
+                    src,
+                    state.window[state.strstart..].as_mut_ptr(),
+                    used,
+                );
+            }
+            state.strstart += used;
+            state.insert += min(used, state.w_size - state.insert);
+        }
+        state.block_start = state.strstart as i64;
+    }
+
+    // Update high water mark.
+    // C: deflate.c line 1795
+    if state.high_water < state.strstart {
+        state.high_water = state.strstart;
+    }
+
+    // ---------------------------------------------------------------
+    // If last block was emitted, we're done.
+    // C: deflate.c line 1798
+    // ---------------------------------------------------------------
+    if last {
+        state.bi_used = 8;
+        return BlockState::FinishDone;
+    }
+
+    // ---------------------------------------------------------------
+    // If a non-finish flush was requested and all input consumed with
+    // all window data emitted, return BlockDone.
+    // C: deflate.c lines 1801–1804
+    // ---------------------------------------------------------------
+    let avail_in = unsafe { (*_strm).avail_in } as usize;
+    if flush != Z_NO_FLUSH
+        && flush != Z_FINISH
+        && avail_in == 0
+        && state.strstart as i64 == state.block_start
+    {
+        return BlockState::BlockDone;
+    }
+
+    // ---------------------------------------------------------------
+    // Fallback: fill remaining input into the window for the pending
+    // buffer path. This handles the case where the direct-copy loop
+    // broke out early (output buffer too small for a full block).
+    //
+    // C: deflate.c lines 1806–1820
+    // ---------------------------------------------------------------
+    {
+        let mut have = state.window_size.saturating_sub(state.strstart);
+        if avail_in > have && state.block_start >= state.w_size as i64 {
+            // Slide window to make room
+            state.block_start -= state.w_size as i64;
+            state.strstart -= state.w_size;
+            state.window
+                .copy_within(state.w_size..state.w_size + state.strstart, 0);
+            if state.matches < 2 {
+                state.matches += 1;
+            }
+            have += state.w_size;
+            if state.insert > state.strstart {
+                state.insert = state.strstart;
+            }
+        }
+        let to_read = min(have, avail_in);
+        if to_read > 0 {
+            unsafe {
+                super::fill_window_read(state, &mut *_strm, to_read);
+            }
+        }
+    }
+
+    if state.high_water < state.strstart {
+        state.high_water = state.strstart;
+    }
+
+    // ---------------------------------------------------------------
+    // Fallback pending-buffer stored block for remaining window data.
+    //
+    // This handles the case where avail_out is too small for the
+    // direct-copy path but there is data in the window that should
+    // be written to pending for the next flush_pending call.
+    //
+    // C: deflate.c lines 1823–1845
+    // ---------------------------------------------------------------
+    {
+        let header_bytes = ((state.bi_valid as usize) + 42) >> 3;
+        let have = min(state.pending_buf_size.saturating_sub(header_bytes), MAX_STORED);
+        let new_min_block = min(have, state.w_size);
+        let left = if state.block_start >= 0 {
+            state.strstart.saturating_sub(state.block_start as usize)
+        } else {
+            0
+        };
+        let avail_in = unsafe { (*_strm).avail_in } as usize;
+
+        if left >= new_min_block
+            || ((left > 0 || flush == Z_FINISH)
+                && flush != Z_NO_FLUSH
+                && avail_in == 0
+                && left <= have)
+        {
+            let len = min(left, have);
+            last = flush == Z_FINISH && avail_in == 0 && len == left;
+
+            let block_start_idx = state.block_start.max(0) as usize;
+            let block_data: Vec<u8> =
+                state.window[block_start_idx..block_start_idx + len].to_vec();
+            tr_stored_block(state, &block_data, len as u64, last);
+            state.block_start += len as i64;
+
+            unsafe {
+                super::flush_pending_from_state(state, &mut *_strm);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Return appropriate block state.
+    // C: deflate.c lines 1846–1848
+    // ---------------------------------------------------------------
+    if last {
+        state.bi_used = 8;
+        return BlockState::FinishStarted;
+    }
+
+    BlockState::NeedMore
+}
+
+/// Simplified pending-buffer-only path for stored blocks.
+///
+/// Used when the stream pointer is null (unit tests) or when the window
+/// is not initialized. Emits stored blocks from pre-loaded window data
+/// to the pending buffer without direct I/O copies.
+fn deflate_stored_pending_path(
+    state: &mut DeflateState,
+    _strm: *mut ZStream,
+    flush: i32,
+    min_block: usize,
+) -> BlockState {
+    // Consume any remaining lookahead
+    state.strstart += state.lookahead;
+    state.lookahead = 0;
+
     let mut last = false;
 
     loop {
-        // Header overhead calculation.
-        //
-        // The stored block header consumes:
-        //   - Byte-alignment padding for any partial bits in bi_buf
-        //   - 1 byte for BFINAL bit + BTYPE=00 (3 bits, padded to byte)
-        //   - 4 bytes for LEN (16 bits) + NLEN (16 bits)
-        //
-        // The formula (bi_valid + 42) >> 3 computes this:
-        //   42 = 3 (block type bits) + 32 (LEN + NLEN bits) + 7 (round up)
-        //
-        // C: deflate.c line 1824
         let header_bytes = ((state.bi_valid as usize) + 42) >> 3;
-
-        // Maximum stored block payload that fits in the remaining pending
-        // buffer. Subtract current pending content and header overhead,
-        // then cap at the RFC limit of 65535 bytes per stored block.
         let available_pending = state
             .pending_buf_size
             .saturating_sub(state.pending + header_bytes);
         let have = min(available_pending, MAX_STORED);
 
-        // Data in the window that hasn't been emitted as a stored block.
-        // This is the difference between the current write position
-        // (strstart) and the start of the current block (block_start).
-        //
-        // block_start is normally non-negative, but can theoretically be
-        // negative if a window slide occurred while a block was in
-        // progress (unusual for stored blocks, but handled defensively).
         let left = if state.block_start >= 0 {
             state.strstart.saturating_sub(state.block_start as usize)
         } else {
             state.strstart
         };
 
-        // Clamp the stored block payload length to available data and
-        // pending buffer space.
         let len = min(left, have);
 
-        // Determine whether to emit a stored block now.
-        //
-        // The decision logic from C deflate.c lines 1832–1838:
-        //
-        //   Emit if:
-        //     1. We have enough data for a worthwhile block (len >= min_block)
-        //   OR
-        //     2. ALL of the following:
-        //        a. There is data to write, or we're finishing (Z_FINISH)
-        //        b. We are actually flushing (not Z_NO_FLUSH)
-        //        c. All remaining data fits in one block (len == left)
-        //
-        // Condition (2c) ensures we don't write a partial last block when
-        // more data might arrive (unless forced by a flush).
         let should_emit = len >= min_block
             || ((len > 0 || flush == Z_FINISH) && flush != Z_NO_FLUSH && len == left);
 
@@ -239,137 +519,44 @@ pub(crate) fn deflate_stored(
             break;
         }
 
-        // Is this the final block in the stream? Only when Z_FINISH is
-        // requested and we can emit ALL remaining data in this block.
         last = flush == Z_FINISH && len == left;
 
-        // Extract the block data from the window.
-        //
-        // We copy to a temporary Vec to avoid simultaneous mutable and
-        // immutable borrows of `state` — `tr_stored_block` takes
-        // `&mut DeflateState` while we need to read from `state.window`.
-        // For the stored block path this copy is unavoidable in safe Rust.
-        // The copy only affects level 0 performance (which is I/O-bound
-        // rather than CPU-bound in practice).
         let block_start_idx = state.block_start.max(0) as usize;
-        let block_data: Vec<u8> = state.window[block_start_idx..block_start_idx + len].to_vec();
-
-        // Write the stored block (header + data) to the pending buffer.
-        // tr_stored_block handles:
-        //   - send_bits for BFINAL/BTYPE (3 bits)
-        //   - bi_windup for byte alignment
-        //   - LEN/NLEN header (4 bytes)
-        //   - Literal data copy
+        let block_data: Vec<u8> =
+            state.window[block_start_idx..block_start_idx + len].to_vec();
         tr_stored_block(state, &block_data, len as u64, last);
-
-        // Advance block_start past the emitted data.
         state.block_start += len as i64;
 
-        if last {
-            break;
+        if !_strm.is_null() {
+            unsafe {
+                super::flush_pending_from_state(state, &mut *_strm);
+            }
         }
 
-        // Safety valve: if we emitted zero bytes in a non-last context,
-        // break to avoid an infinite loop. This shouldn't normally happen
-        // given the should_emit checks, but is defensive.
-        if len == 0 {
+        if last || len == 0 {
             break;
         }
     }
 
-    // ---------------------------------------------------------------
-    // Update high water mark.
-    //
-    // The high_water field tracks the highest initialized byte position
-    // in the window, used to zero-fill beyond the current data for
-    // deterministic behavior in longest_match. For stored blocks we
-    // simply ensure it's at least at strstart.
-    //
-    // C: deflate.c line 1819
-    // ---------------------------------------------------------------
     if state.high_water < state.strstart {
         state.high_water = state.strstart;
     }
 
-    // ---------------------------------------------------------------
-    // Window management: slide the window when needed.
-    //
-    // When strstart has advanced far enough into the upper half of the
-    // window buffer (past w_size + w_size - MIN_LOOKAHEAD), the window
-    // must be slid down by w_size bytes. This:
-    //
-    //   1. Makes room in the upper half for new input data that the
-    //      main deflate() loop's fill_window will load.
-    //   2. Maintains the sliding window invariant so that if
-    //      deflateParams later switches to a hash-based strategy
-    //      (levels 1–9), the window contains valid history.
-    //
-    // The slide only occurs when all block data has been emitted
-    // (block_start == strstart), ensuring we don't lose data that
-    // hasn't been written to a stored block yet.
-    //
-    // C: deflate.c lines 1771–1779 (post-main-loop slide)
-    // ---------------------------------------------------------------
-    if state.block_start == state.strstart as i64 {
-        let w_size = state.w_size;
-        if state.strstart >= w_size + w_size.saturating_sub(MIN_LOOKAHEAD) {
-            // Slide window: copy the upper-half data (bytes at positions
-            // w_size..w_size+strstart_new) down to the lower half (positions
-            // 0..strstart_new) where strstart_new = strstart - w_size.
-            state.strstart -= w_size;
-            state.block_start -= w_size as i64;
-
-            // The copy source is window[w_size..w_size+strstart] (after
-            // strstart was decremented). This moves the most recent w_size
-            // bytes of data to the beginning of the window buffer.
-            let copy_len = state.strstart;
-            if copy_len > 0 {
-                state.window.copy_within(w_size..w_size + copy_len, 0);
-            }
-
-            // Signal that the hash table needs updating. The `matches`
-            // field serves as a counter for deferred slide_hash operations:
-            //   matches == 2 → clear hash table entirely
-            //   matches += 1 → schedule one slide_hash pass
-            //
-            // C: deflate.c lines 1776–1777
-            if state.matches < 2 {
-                state.matches += 1;
-            }
-
-            // Clamp `insert` to the new strstart position, since the
-            // hash entries beyond strstart are no longer valid after
-            // the window slide.
-            if state.insert > state.strstart {
-                state.insert = state.strstart;
+    if last {
+        state.bi_used = 8;
+        if !_strm.is_null() {
+            let strm_ref = unsafe { &*_strm };
+            if strm_ref.avail_out == 0 {
+                return BlockState::FinishStarted;
             }
         }
-    }
-
-    // ---------------------------------------------------------------
-    // Return appropriate block state.
-    // ---------------------------------------------------------------
-
-    if last {
-        // The final stored block was written to the pending buffer.
-        // Set bi_used to 8 to indicate that we ended on a byte boundary
-        // (stored blocks are always byte-aligned after LEN/NLEN/data).
-        //
-        // C: deflate.c line 1846
-        state.bi_used = 8;
         return BlockState::FinishDone;
     }
 
-    // If a non-finish flush was requested (Z_SYNC_FLUSH, Z_FULL_FLUSH,
-    // Z_PARTIAL_FLUSH, Z_BLOCK) and all available data has been emitted
-    // as stored blocks, report that the block is done.
     if flush != Z_NO_FLUSH && flush != Z_FINISH && state.strstart as i64 == state.block_start {
         return BlockState::BlockDone;
     }
 
-    // Default: more input or output space needed. The main deflate()
-    // loop will flush the pending buffer, call fill_window to load
-    // more input, and invoke this function again.
     BlockState::NeedMore
 }
 
@@ -428,8 +615,13 @@ mod tests {
         let data = b"Hello, zlib-rs stored block test!";
         let mut state = make_test_state(data, 0, 10);
 
+        // Provide a valid output buffer so flush_pending can drain pending data.
+        let mut out_buf = [0u8; 4096];
+        let mut strm = dummy_strm();
+        strm.set_output(&mut out_buf);
+
         // Call with Z_FINISH to emit a final stored block.
-        let result = deflate_stored(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
+        let result = deflate_stored(&mut state, &mut strm as *mut ZStream, Z_FINISH);
 
         // Should emit the final block and return FinishDone.
         assert_eq!(result, BlockState::FinishDone);
@@ -440,9 +632,9 @@ mod tests {
         // block_start should have advanced to match strstart.
         assert_eq!(state.block_start, 10);
 
-        // pending should be > 0 (stored block header + data in pending_buf).
+        // Data should have been flushed to the output buffer.
         // Stored block = header overhead + 10 data bytes.
-        assert!(state.pending > 10);
+        assert!(strm.total_out > 10);
 
         // bi_used should be set to 8 (byte boundary after final block).
         assert_eq!(state.bi_used, 8);
@@ -453,16 +645,21 @@ mod tests {
         // Set up state with no data (lookahead = 0, strstart = 0).
         let mut state = make_test_state(&[], 0, 0);
 
+        // Provide a valid output buffer so flush_pending can drain pending data.
+        let mut out_buf = [0u8; 4096];
+        let mut strm = dummy_strm();
+        strm.set_output(&mut out_buf);
+
         // Call with Z_FINISH — should emit an empty final stored block.
-        let result = deflate_stored(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
+        let result = deflate_stored(&mut state, &mut strm as *mut ZStream, Z_FINISH);
 
         assert_eq!(result, BlockState::FinishDone);
         assert_eq!(state.strstart, 0);
         assert_eq!(state.block_start, 0);
 
-        // Pending should have the stored block header (empty block).
+        // Data should have been flushed to the output buffer.
         // An empty stored block: byte-aligned BFINAL/BTYPE + LEN=0 + NLEN=0xFFFF.
-        assert!(state.pending > 0);
+        assert!(strm.total_out > 0);
         assert_eq!(state.bi_used, 8);
     }
 
