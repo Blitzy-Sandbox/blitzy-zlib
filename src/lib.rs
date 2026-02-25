@@ -12,6 +12,7 @@ compile_error!(
 
 pub mod checksum;
 pub mod constants;
+pub mod deflate;
 pub mod error;
 pub mod gz_header;
 pub mod inflate;
