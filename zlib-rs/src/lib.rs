@@ -1,0 +1,4 @@
+//! A pure safe Rust implementation of the zlib compression library.
+#![forbid(unsafe_code)]
+
+pub mod constants;
