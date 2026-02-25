@@ -63,8 +63,7 @@ const _: () = assert!(ENOUGH == 1444);
 /// in the documentation of your product. If for some reason you cannot
 /// include such an acknowledgment, we appreciate that you keep this
 /// copyright string in the executable of your product.
-pub(crate) const INFLATE_COPYRIGHT: &str =
-    " inflate 1.3.2.1 Copyright 1995-2026 Mark Adler ";
+pub(crate) const INFLATE_COPYRIGHT: &str = " inflate 1.3.2.1 Copyright 1995-2026 Mark Adler ";
 
 // ---------------------------------------------------------------------------
 // Code struct — Huffman table entry
@@ -176,9 +175,7 @@ impl fmt::Display for InflateTableError {
             Self::InvalidCodeSet => {
                 f.write_str("over-subscribed or incomplete set of code lengths")
             }
-            Self::NotEnoughSpace => {
-                f.write_str("not enough table space (ENOUGH exceeded)")
-            }
+            Self::NotEnoughSpace => f.write_str("not enough table space (ENOUGH exceeded)"),
         }
     }
 }
@@ -192,8 +189,8 @@ impl fmt::Display for InflateTableError {
 /// Index `i` gives the base match length for length code `257 + i`.
 /// The last two entries (codes 286, 287) are unused and set to 0.
 const LBASE: [u16; 31] = [
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59,
-    67, 83, 99, 115, 131, 163, 195, 227, 258, 0, 0,
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258, 0, 0,
 ];
 
 /// Extra bits for length codes 257..285.
@@ -205,8 +202,8 @@ const LBASE: [u16; 31] = [
 /// - Value 68 (`0x44`): invalid code marker (code 286)
 /// - Value 193 (`0xC1`): invalid code marker (code 287)
 const LEXT: [u16; 31] = [
-    16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 18, 18, 18, 18, 19, 19,
-    19, 19, 20, 20, 20, 20, 21, 21, 21, 21, 16, 68, 193,
+    16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 18, 18, 18, 18, 19, 19, 19, 19, 20, 20, 20, 20,
+    21, 21, 21, 21, 16, 68, 193,
 ];
 
 /// Base values for distance codes 0..29.
@@ -214,9 +211,8 @@ const LEXT: [u16; 31] = [
 /// Index `i` gives the base backward distance for distance code `i`.
 /// The last two entries (codes 30, 31) are unused and set to 0.
 const DBASE: [u16; 32] = [
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385,
-    513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
-    0, 0,
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577, 0, 0,
 ];
 
 /// Extra bits for distance codes 0..29.
@@ -224,8 +220,8 @@ const DBASE: [u16; 32] = [
 /// Same encoding as [`LEXT`] — low 4 bits are the extra bit count, high bits
 /// are flags. Values 64 at indices 30 and 31 mark invalid codes.
 const DEXT: [u16; 32] = [
-    16, 16, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22, 22, 23, 23,
-    24, 24, 25, 25, 26, 26, 27, 27, 28, 28, 29, 29, 64, 64,
+    16, 16, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22, 22, 23, 23, 24, 24, 25, 25, 26, 26,
+    27, 27, 28, 28, 29, 29, 64, 64,
 ];
 
 // ---------------------------------------------------------------------------
@@ -413,31 +409,30 @@ pub(crate) fn inflate_table(
         let here_bits = (len - drop_bits) as u8;
 
         let work_sym = u32::from(work[sym]);
-        let (here_op, here_val): (u8, u16) =
-            if work_sym.wrapping_add(1) < match_val {
-                // Literal or short code — op is 0, val is the symbol.
-                (0, work[sym])
-            } else if work_sym >= match_val {
-                // Length or distance code — look up base value and extra bits.
-                // Safety: base_table and extra_table are non-empty for LENS/DISTS,
-                // and for CODES this branch is unreachable (all symbols < match_val=20).
-                let idx = (work_sym - match_val) as usize;
-                #[allow(clippy::cast_possible_truncation)]
-                let op = if idx < extra_table.len() {
-                    extra_table[idx] as u8
-                } else {
-                    64 // invalid code marker (defensive)
-                };
-                let val = if idx < base_table.len() {
-                    base_table[idx]
-                } else {
-                    0
-                };
-                (op, val)
+        let (here_op, here_val): (u8, u16) = if work_sym.wrapping_add(1) < match_val {
+            // Literal or short code — op is 0, val is the symbol.
+            (0, work[sym])
+        } else if work_sym >= match_val {
+            // Length or distance code — look up base value and extra bits.
+            // Safety: base_table and extra_table are non-empty for LENS/DISTS,
+            // and for CODES this branch is unreachable (all symbols < match_val=20).
+            let idx = (work_sym - match_val) as usize;
+            #[allow(clippy::cast_possible_truncation)]
+            let op = if idx < extra_table.len() {
+                extra_table[idx] as u8
             } else {
-                // End of block (symbol 256 for LENS type, work[sym]+1 == match_val).
-                (32 + 64, 0)
+                64 // invalid code marker (defensive)
             };
+            let val = if idx < base_table.len() {
+                base_table[idx]
+            } else {
+                0
+            };
+            (op, val)
+        } else {
+            // End of block (symbol 256 for LENS type, work[sym]+1 == match_val).
+            (32 + 64, 0)
+        };
 
         let here = Code::new(here_op, here_bits, here_val);
 
@@ -516,11 +511,8 @@ pub(crate) fn inflate_table(
             low = huff & mask;
             #[allow(clippy::cast_possible_truncation)]
             {
-                table[table_start + low as usize] = Code::new(
-                    curr as u8,
-                    root as u8,
-                    (next - table_start) as u16,
-                );
+                table[table_start + low as usize] =
+                    Code::new(curr as u8, root as u8, (next - table_start) as u16);
             }
         }
     }
@@ -607,8 +599,8 @@ mod tests {
         assert_eq!(
             LBASE,
             [
-                3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35,
-                43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258, 0, 0,
+                3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83,
+                99, 115, 131, 163, 195, 227, 258, 0, 0,
             ]
         );
 
@@ -617,9 +609,8 @@ mod tests {
         assert_eq!(
             LEXT,
             [
-                16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 18, 18, 18,
-                18, 19, 19, 19, 19, 20, 20, 20, 20, 21, 21, 21, 21, 16, 68,
-                193,
+                16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 18, 18, 18, 18, 19, 19, 19, 19, 20,
+                20, 20, 20, 21, 21, 21, 21, 16, 68, 193,
             ]
         );
 
@@ -628,9 +619,8 @@ mod tests {
         assert_eq!(
             DBASE,
             [
-                1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
-                257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193,
-                12289, 16385, 24577, 0, 0,
+                1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769,
+                1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577, 0, 0,
             ]
         );
 
@@ -639,9 +629,8 @@ mod tests {
         assert_eq!(
             DEXT,
             [
-                16, 16, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22,
-                22, 23, 23, 24, 24, 25, 25, 26, 26, 27, 27, 28, 28, 29, 29,
-                64, 64,
+                16, 16, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22, 22, 23, 23, 24, 24, 25,
+                25, 26, 26, 27, 27, 28, 28, 29, 29, 64, 64,
             ]
         );
     }
