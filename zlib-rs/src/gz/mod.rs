@@ -6,4 +6,6 @@
 
 /// Gzip read pipeline with LOOK/COPY/GZIP auto-detection.
 pub mod read;
+/// Gzip write pipeline with buffered compression.
+pub mod write;
 pub(crate) mod state;

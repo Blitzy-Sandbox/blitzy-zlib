@@ -290,7 +290,10 @@ pub(crate) fn fill_window(state: &mut DeflateState, stream: &mut ZStream) {
 
     loop {
         // ── 1. Free space at the window tail ────────────────────────────
-        let mut more = state.window_size - state.lookahead - state.strstart;
+        let mut more = state
+            .window_size
+            .saturating_sub(state.lookahead)
+            .saturating_sub(state.strstart);
 
         // ── 2. Window sliding ───────────────────────────────────────────
         // MAX_DIST = w_size - MIN_LOOKAHEAD
