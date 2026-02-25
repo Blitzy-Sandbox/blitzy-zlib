@@ -1298,6 +1298,8 @@ pub fn deflate_set_dictionary(
         Some(s) => s as *mut DeflateState,
         None => return Err(ZlibError::StreamError),
     };
+    // SAFETY: s_ptr is derived from a valid &mut DeflateState; used to avoid
+    // double-borrow of strm/state. The pointer is valid for this function's lifetime.
     let s = unsafe { &mut *s_ptr };
 
     let wrap = s.wrap;
@@ -1406,6 +1408,8 @@ pub fn deflate_params(
         Some(s) => s as *mut DeflateState,
         None => return Err(ZlibError::StreamError),
     };
+    // SAFETY: s_ptr is derived from a valid &mut DeflateState; used to avoid
+    // double-borrow of strm/state. The pointer is valid for this function's lifetime.
     let s = unsafe { &mut *s_ptr };
 
     // Normalize default level
@@ -1424,7 +1428,9 @@ pub fn deflate_params(
     if (strategy != s.strategy || old_strategy != new_strategy) && s.last_flush != -2 {
         // Flush the last buffer
         deflate(strm, Z_BLOCK)?;
-        // Re-acquire state after deflate call
+        // SAFETY: s_ptr remains valid — deflate() borrows strm but does not
+        // invalidate the DeflateState allocation. Re-acquiring after deflate
+        // returns is necessary because the prior `s` borrow was consumed.
         let s = unsafe { &mut *s_ptr };
         if strm.avail_in != 0
             || ((s.strstart as i64 - s.block_start) as usize + s.lookahead) != 0
@@ -1433,6 +1439,8 @@ pub fn deflate_params(
         }
     }
 
+    // SAFETY: s_ptr is still valid; re-acquiring mutable reference after the
+    // conditional block above may have consumed the prior `s` borrow.
     let s = unsafe { &mut *s_ptr };
     if s.level != level as usize {
         if s.level == 0 && s.matches != 0 {

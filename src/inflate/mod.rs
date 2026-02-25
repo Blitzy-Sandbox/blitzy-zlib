@@ -40,6 +40,30 @@
 //! ```
 //! When input is exhausted or output is full, `break 'inf` jumps to cleanup
 //! code that updates window state and returns the appropriate status code.
+//!
+//! # Safety
+//!
+//! This module contains `unsafe` blocks outside of `inflate/fast.rs`. The AAP
+//! §0.8.2 targets confining unsafe to the performance-critical fast-path, but
+//! the streaming API requires raw-pointer buffer arithmetic that cannot be
+//! expressed in safe Rust:
+//!
+//! 1. **Slice construction from raw pointers** — `ZStream.next_in` /
+//!    `ZStream.next_out` are `*const u8` / `*mut u8` raw pointers (matching the
+//!    C `z_stream` ABI). Creating `&[u8]` / `&mut [u8]` views requires
+//!    `core::slice::from_raw_parts(_mut)`, which is inherently `unsafe`.
+//!    Callers of `inflate()` must uphold the contract that these pointers are
+//!    valid for `avail_in` / `avail_out` bytes respectively; null checks guard
+//!    every call site.
+//!
+//! 2. **Pointer advancement** — After consuming input bytes or producing output
+//!    bytes, `next_in` / `next_out` must be advanced via `ptr::add()`. This
+//!    mirrors C's `strm->next_in += consumed` and cannot be expressed without
+//!    `unsafe` since the pointers are raw. Each call site is guarded by a
+//!    null check and a positivity check on the offset.
+//!
+//! All `unsafe` blocks in this module have `// SAFETY:` comments documenting
+//! the specific invariants relied upon.
 
 // ── Submodule declarations ──────────────────────────────────────────────────
 
@@ -476,12 +500,16 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
     let in_buf: &[u8] = if strm.next_in.is_null() || strm.avail_in == 0 {
         &[]
     } else {
+        // SAFETY: next_in is non-null (checked above) and the caller guarantees it
+        // points to at least avail_in valid bytes, per the z_stream contract.
         unsafe { core::slice::from_raw_parts(strm.next_in, strm.avail_in as usize) }
     };
 
     let out_buf: &mut [u8] = if strm.next_out.is_null() || strm.avail_out == 0 {
         &mut []
     } else {
+        // SAFETY: next_out is non-null (checked above) and the caller guarantees it
+        // points to at least avail_out writable bytes, per the z_stream contract.
         unsafe { core::slice::from_raw_parts_mut(strm.next_out, strm.avail_out as usize) }
     };
 
@@ -727,6 +755,8 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                     strm.avail_in = have; strm.avail_out = left;
                     strm.total_in += (in_start - have) as u64;
                     strm.total_out += (out_start - left) as u64;
+                    // SAFETY: next_in/next_out are non-null (guarded) and in_pos/out_pos
+                    // are bounded by the original avail_in/avail_out supplied by the caller.
                     if !strm.next_in.is_null() && in_pos > 0 { strm.next_in = unsafe { strm.next_in.add(in_pos) }; }
                     if !strm.next_out.is_null() && out_pos > 0 { strm.next_out = unsafe { strm.next_out.add(out_pos) }; }
                     strm.state = StreamState::Inflate(state_box);
@@ -1102,6 +1132,8 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                 strm.total_in += (in_start - have) as u64;
                 strm.total_out += (out_start - left) as u64;
                 state.total += (out_start - left) as u64;
+                // SAFETY: next_in/next_out are non-null (guarded) and in_pos/out_pos
+                // are bounded by the original avail_in/avail_out supplied by the caller.
                 if !strm.next_in.is_null() && in_pos > 0 { strm.next_in = unsafe { strm.next_in.add(in_pos) }; }
                 if !strm.next_out.is_null() && out_pos > 0 { strm.next_out = unsafe { strm.next_out.add(out_pos) }; }
                 strm.data_type = bits_count as i32 + (if state.last { 64 } else { 0 })
@@ -1133,6 +1165,8 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
     strm.avail_in = have; strm.avail_out = left;
     strm.total_in += in_consumed; strm.total_out += out_consumed;
     state.total += out_consumed;
+    // SAFETY: next_in/next_out are non-null (guarded) and in_pos/out_pos
+    // are bounded by the original avail_in/avail_out supplied by the caller.
     if !strm.next_in.is_null() && in_pos > 0 { strm.next_in = unsafe { strm.next_in.add(in_pos) }; }
     if !strm.next_out.is_null() && out_pos > 0 { strm.next_out = unsafe { strm.next_out.add(out_pos) }; }
     if (state.wrap & 4) != 0 && out_consumed > 0 {
@@ -1225,9 +1259,13 @@ pub fn inflate_sync(strm: &mut ZStream) -> ZlibResult {
         sync_search(&mut state.have, &buf[..len]);
     }
     if strm.avail_in > 0 && !strm.next_in.is_null() {
+        // SAFETY: next_in is non-null (checked above) and the caller guarantees
+        // it points to at least avail_in valid bytes, per the z_stream contract.
         let input = unsafe { core::slice::from_raw_parts(strm.next_in, strm.avail_in as usize) };
         let consumed = sync_search(&mut state.have, input);
         strm.avail_in -= consumed as u32;
+        // SAFETY: consumed ≤ avail_in, so next_in.add(consumed) stays within the
+        // original caller-provided input buffer.
         strm.next_in = unsafe { strm.next_in.add(consumed) };
         strm.total_in += consumed as u64;
     }
