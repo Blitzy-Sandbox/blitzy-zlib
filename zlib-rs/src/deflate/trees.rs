@@ -20,7 +20,7 @@ use super::state::DeflateState;
 use crate::constants::{
     BL_CODES, BUF_SIZE, D_CODES, DYN_TREES, HEAP_SIZE, L_CODES, LENGTH_CODES,
     LITERALS, MAX_BITS, MAX_MATCH, MIN_MATCH, STATIC_TREES, STORED_BLOCK,
-    Z_BINARY, Z_FIXED, Z_TEXT,
+    Z_BINARY, Z_FIXED, Z_TEXT, Z_UNKNOWN,
 };
 
 // ─── CtData (trees.rs compact representation) ────────────────────────────────
@@ -519,9 +519,20 @@ pub(crate) static STATIC_BL_DESC: StaticTreeDesc = StaticTreeDesc {
 // =============================================================================
 
 /// Append two bytes (little-endian) to the pending output buffer.
+///
+/// The pending buffer is always pre-sized by `deflateInit2` to accommodate
+/// the worst-case output for any single block (see `lit_bufsize * 4`
+/// allocation in `DeflateState::new`).  A full buffer here indicates a
+/// logic error in the caller's block flushing sequence.
 #[inline]
 fn put_short(state: &mut DeflateState, val: u16) {
     let p = state.pending;
+    debug_assert!(
+        p + 1 < state.pending_buf.len(),
+        "put_short: pending buffer overflow (pending={}, capacity={})",
+        p,
+        state.pending_buf.len()
+    );
     if p + 1 < state.pending_buf.len() {
         state.pending_buf[p] = val as u8;
         state.pending_buf[p + 1] = (val >> 8) as u8;
@@ -530,9 +541,19 @@ fn put_short(state: &mut DeflateState, val: u16) {
 }
 
 /// Append a single byte to the pending output buffer.
+///
+/// The pending buffer is always pre-sized to accommodate worst-case output
+/// for any single block.  A full buffer here indicates a logic error in the
+/// caller's block flushing sequence.
 #[inline]
 fn put_byte(state: &mut DeflateState, val: u8) {
     let p = state.pending;
+    debug_assert!(
+        p < state.pending_buf.len(),
+        "put_byte: pending buffer overflow (pending={}, capacity={})",
+        p,
+        state.pending_buf.len()
+    );
     if p < state.pending_buf.len() {
         state.pending_buf[p] = val;
         state.pending += 1;
@@ -1204,9 +1225,13 @@ pub(crate) fn tr_flush_block(
     let mut max_blindex: usize = 0;
 
     if state.level > 0 {
-        // Auto-detect data type if needed (wrap != 2 means non-raw stream).
-        if state.wrap != 2 {
-            let _ = detect_data_type(state);
+        // Auto-detect data type if not yet determined (matches C's
+        // `if (s->strm->data_type == Z_UNKNOWN) s->strm->data_type = detect_data_type(s);`
+        // in `_tr_flush_block`, `trees.c` line 1010). The result is stored
+        // on `DeflateState.data_type` and propagated to `stream.data_type`
+        // by the caller (`flush_block_only` in `algorithm.rs`).
+        if state.wrap != 2 && state.data_type == Z_UNKNOWN {
+            state.data_type = detect_data_type(state);
         }
 
         build_tree(state, TreeKind::Literal, &STATIC_L_DESC);

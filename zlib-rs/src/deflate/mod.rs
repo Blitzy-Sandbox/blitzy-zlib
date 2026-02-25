@@ -40,7 +40,7 @@ pub use self::state::{DeflateState, DeflateStatus};
 use crate::checksum::adler32;
 use crate::checksum::crc32;
 use crate::constants::{
-    DEF_MEM_LEVEL, MAX_MEM_LEVEL, MAX_WBITS, MIN_MATCH,
+    DEF_MEM_LEVEL, MAX_MATCH, MAX_MEM_LEVEL, MAX_WBITS, MIN_MATCH,
     PRESET_DICT, Z_BLOCK, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY,
     Z_DEFLATED, Z_FINISH, Z_FIXED, Z_FULL_FLUSH, Z_HUFFMAN_ONLY,
     Z_NO_FLUSH, Z_PARTIAL_FLUSH, Z_RLE, Z_UNKNOWN,
@@ -48,6 +48,18 @@ use crate::constants::{
 use crate::error::ReturnCode;
 use crate::stream::{GzHeader, ZStream};
 use crate::util;
+
+// ─── Shared Deflate Constants ────────────────────────────────────────────────
+
+/// Minimum amount of lookahead, except at the end of the input.
+///
+/// Defined as `MAX_MATCH + MIN_MATCH + 1` in `deflate.h` line 296. The
+/// deflate engine calls [`hash::fill_window`] whenever `lookahead` drops
+/// below this threshold.
+///
+/// Shared across `hash` and `algorithm` submodules to avoid constant
+/// duplication.
+pub(crate) const MIN_LOOKAHEAD: usize = MAX_MATCH + MIN_MATCH + 1;
 
 use self::algorithm::{
     deflate_fast, deflate_huff, deflate_rle, deflate_slow, deflate_stored,

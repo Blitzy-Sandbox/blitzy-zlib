@@ -51,19 +51,9 @@ use super::state::DeflateState;
 /// (`deflate.c` line 85).
 pub(crate) const NIL: u16 = 0;
 
-/// Distance threshold for discarding short (3-byte) matches.
-///
-/// Matches of exactly `MIN_MATCH` (3) bytes are discarded when the distance
-/// between the current position and the match exceeds `TOO_FAR`, because
-/// the encoding overhead outweighs the savings. From `deflate.c` line 91.
-const TOO_FAR: usize = 4096;
-
-/// Minimum amount of lookahead, except at the end of the input.
-///
-/// Defined as `MAX_MATCH + MIN_MATCH + 1` in `deflate.h` line 296. The
-/// deflate engine calls [`fill_window`] whenever `lookahead` drops below
-/// this threshold.
-const MIN_LOOKAHEAD: usize = MAX_MATCH + MIN_MATCH + 1;
+// `MIN_LOOKAHEAD` is defined once in `super` (deflate/mod.rs) and imported
+// to avoid constant duplication across submodules.
+use super::MIN_LOOKAHEAD;
 
 /// Number of bytes after the end of current data to zero-initialize in the
 /// window, preventing uninitialised memory reads by [`longest_match`].

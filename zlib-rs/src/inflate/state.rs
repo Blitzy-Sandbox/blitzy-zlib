@@ -398,6 +398,35 @@ impl InflateState {
         }
     }
 
+    /// Returns a shared reference to the stored gzip header, if one was
+    /// registered via [`inflate_get_header`](super::inflate_get_header).
+    ///
+    /// This method is the Rust-side equivalent of inspecting the `gz_header *`
+    /// pointer that the C API's `inflateGetHeader()` stores.  After
+    /// decompression completes (or after the gzip header has been fully
+    /// parsed), callers can inspect the header fields through this reference.
+    ///
+    /// # Returns
+    ///
+    /// `Some(&GzHeader)` if a header was registered, `None` otherwise.
+    #[must_use]
+    pub fn header(&self) -> Option<&GzHeader> {
+        self.head.as_deref()
+    }
+
+    /// Returns a mutable reference to the stored gzip header, if one was
+    /// registered via [`inflate_get_header`](super::inflate_get_header).
+    ///
+    /// Allows callers to modify header fields before or after decompression.
+    ///
+    /// # Returns
+    ///
+    /// `Some(&mut GzHeader)` if a header was registered, `None` otherwise.
+    #[must_use]
+    pub fn header_mut(&mut self) -> Option<&mut GzHeader> {
+        self.head.as_deref_mut()
+    }
+
     /// Ensure the sliding window buffer is allocated.
     ///
     /// If the window is empty, allocates a buffer of `2^wbits` bytes filled

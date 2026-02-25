@@ -884,7 +884,7 @@ pub unsafe extern "C" fn inflateGetHeader(
         done: head_ref.done != 0,
     };
 
-    let ret = zlib_rs::inflate::inflate_get_header(state, rust_header);
+    let ret = zlib_rs::inflate::inflate_get_header(state, Box::new(rust_header));
     ret as c_int
 }
 

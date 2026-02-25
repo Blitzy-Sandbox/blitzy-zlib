@@ -422,17 +422,7 @@ impl GzReader {
     /// This function feeds all available input to inflate in a loop and
     /// uses `total_in`/`total_out` deltas to accurately track
     /// consumption and production.
-    ///
-    /// The per-call output buffer is capped at an inflate-safe size to
-    /// avoid triggering inflate's internal fast-path, which can cause
-    /// CRC accounting errors in certain inflate implementations.
     fn decomp(&mut self, out_buf: &mut [u8]) -> io::Result<usize> {
-        // Maximum output per inflate call — kept below the threshold
-        // that triggers inflate_fast (`left >= 258`).  Using the slow
-        // inflate loop ensures that the running CRC computed inside
-        // inflate stays consistent across multiple calls.
-        const INFLATE_SAFE_OUT: usize = 257;
-
         let capacity = out_buf.len();
         if capacity == 0 {
             return Ok(0);
@@ -455,8 +445,8 @@ impl GzReader {
                 break;
             }
 
-            // Determine how much output to request this iteration.
-            let out_chunk = (capacity - written).min(INFLATE_SAFE_OUT);
+            // Request the full remaining output capacity.
+            let out_chunk = capacity - written;
 
             // Snapshot totals so we can compute deltas.
             let ti_before = self.state.strm.total_in;

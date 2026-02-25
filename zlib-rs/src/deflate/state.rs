@@ -31,6 +31,7 @@
 
 use crate::constants::{
     BL_CODES, BUF_SIZE, D_CODES, HEAP_SIZE, L_CODES, MAX_BITS, MAX_MATCH, MIN_MATCH,
+    Z_UNKNOWN,
 };
 use crate::stream::GzHeader;
 use super::params::{CompressionConfig, CONFIGURATION_TABLE, get_config};
@@ -648,6 +649,20 @@ pub struct DeflateState {
 
     /// High water mark for window initialization (zero-fill tracking).
     pub high_water: usize,
+
+    // ─── Data Type Classification ────────────────────────────────────────
+
+    /// Detected data type classification for the current block.
+    ///
+    /// Set by [`detect_data_type`](super::trees::detect_data_type) in
+    /// `tr_flush_block` when the stream's `data_type` is `Z_UNKNOWN`.
+    /// Propagated to `stream.data_type` by the block flushing logic so
+    /// that the public API correctly reports `Z_BINARY`, `Z_TEXT`, or
+    /// `Z_UNKNOWN` per the C zlib contract.
+    ///
+    /// Initialized to `Z_UNKNOWN` and updated once per compression session
+    /// when the first block is flushed.
+    pub data_type: i32,
 }
 
 // ─── DeflateState Implementation ──────────────────────────────────────────────
@@ -809,6 +824,9 @@ impl DeflateState {
             opt_len: 0,
             static_len: 0,
             high_water: 0,
+
+            // Data type classification — starts unknown, set on first block flush
+            data_type: Z_UNKNOWN,
         }
     }
 
@@ -893,6 +911,9 @@ impl DeflateState {
         self.opt_len = 0;
         self.static_len = 0;
         self.high_water = 0;
+
+        // ── Reset data type classification ───────────────────────────────
+        self.data_type = Z_UNKNOWN;
     }
 
     /// Returns the maximum match length for hash insertion.

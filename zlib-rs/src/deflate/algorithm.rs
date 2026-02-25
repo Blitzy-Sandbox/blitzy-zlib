@@ -27,14 +27,11 @@ use super::hash;
 use super::state::DeflateState;
 use super::trees;
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// `MIN_LOOKAHEAD` is defined once in `super` (deflate/mod.rs) and imported
+// to avoid constant duplication across submodules.
+use super::MIN_LOOKAHEAD;
 
-/// Minimum amount of lookahead, except at the end of the input.
-///
-/// Defined as `MAX_MATCH + MIN_MATCH + 1` in `deflate.h` line 296. The
-/// deflate engine calls [`hash::fill_window`] whenever `lookahead` drops
-/// below this threshold.
-const MIN_LOOKAHEAD: usize = MAX_MATCH + MIN_MATCH + 1;
+// ─── Constants ────────────────────────────────────────────────────────────────
 
 /// Maximum stored block length in deflate format (not including header).
 ///
@@ -114,7 +111,10 @@ fn flush_pending(state: &mut DeflateState, stream: &mut ZStream) {
 fn flush_block_only(state: &mut DeflateState, stream: &mut ZStream, last: bool) {
     // Copy the block data from the window into a temporary buffer to avoid
     // holding an immutable borrow on `state.window` while passing `&mut state`
-    // to `tr_flush_block`.
+    // to `tr_flush_block`.  This allocation is required by Rust's borrow rules:
+    // `state.window` cannot be borrowed immutably while `state` is passed
+    // mutably.  The cost is proportional to block size and amortised across
+    // the many bytes each block encodes.
     let buf = if state.block_start >= 0 {
         let start = state.block_start as usize;
         let end = state.strstart;
@@ -124,6 +124,10 @@ fn flush_block_only(state: &mut DeflateState, stream: &mut ZStream, last: bool) 
     };
     let stored_len = (state.strstart as i64 - state.block_start) as u64;
     trees::tr_flush_block(state, buf.as_deref(), stored_len, last);
+    // Propagate data type classification detected by `tr_flush_block` to the
+    // stream's public `data_type` field, matching the C behaviour where
+    // `s->strm->data_type` is set inside `_tr_flush_block` (trees.c L1010).
+    stream.data_type = state.data_type;
     state.block_start = state.strstart as i64;
     flush_pending(state, stream);
 }
@@ -196,7 +200,10 @@ pub(crate) fn deflate_stored(
     // Save initial avail_in to compute how much input was consumed later.
     let saved_avail_in = stream.avail_in();
     // Collect input bytes consumed in the main loop for later window update.
-    let mut consumed_input: Vec<u8> = Vec::new();
+    // Pre-allocate with expected capacity to reduce reallocations.  The
+    // upper bound is the available input, but in practice only a fraction
+    // is consumed per iteration.
+    let mut consumed_input: Vec<u8> = Vec::with_capacity(stream.avail_in().min(state.w_size));
 
     // --- Phase 1: Main loop — copy stored blocks directly to output ---
     let mut last: bool = false;

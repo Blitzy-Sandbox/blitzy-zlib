@@ -477,18 +477,18 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
     }
 
     // Build local copies of input/output slices for efficient processing.
-    // We work on the raw vectors of the stream by taking mutable references.
+    // The input is copied to a local Vec to decouple from the stream's
+    // borrow, matching the C LOAD()/RESTORE() pattern where local pointer
+    // copies avoid repeated struct indirection.
     let input = stream.input_remaining().to_vec();
     let in_len = input.len();
 
-    // We need to know how much output space is available
+    // We need to know how much output space is available.
+    // C inflate() allows avail_out == 0 — it can still process headers and
+    // advance state without producing output.  We must NOT reject this case.
     let out_capacity = stream.avail_out();
-    // Pre-allocate a local output buffer
+    // Pre-allocate a local output buffer (may be empty when avail_out == 0).
     let mut output_buf: Vec<u8> = vec![0u8; out_capacity];
-
-    if out_capacity == 0 {
-        return ReturnCode::StreamError;
-    }
 
     // Local variables mirroring C's LOAD() macro
     let mut next: usize = 0; // index into input
@@ -499,7 +499,7 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
     let mut bits: u32 = state.bits;
 
     let in_start = have; // save starting available input
-    let out_start = left; // save starting available output
+    let mut out_start = left; // save starting available output (mutable for Check mode reset)
 
     if state.mode == InflateMode::Type {
         state.mode = InflateMode::TypeDo; // skip check
@@ -1195,71 +1195,69 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
             }
 
             InflateMode::Len => {
-                // Fast path: call inflate_fast when enough I/O available
+                // Fast path: call inflate_fast when enough I/O available.
+                //
+                // Unlike the previous implementation that created a separate
+                // output buffer for inflate_fast, this version shares the
+                // single `output_buf` between the slow path and the fast path.
+                // This ensures that back-references spanning the slow→fast
+                // transition can correctly read the slow-path literals from
+                // the same contiguous buffer, matching the C implementation
+                // which operates on a single `put` pointer throughout.
                 if have >= 6 && left >= 258 {
-                    // RESTORE — save local state back
+                    // RESTORE — save hold/bits back to state for inflate_fast.
                     state.hold = hold;
                     state.bits = bits;
 
-                    // Write output so far to stream
-                    let written = put;
-                    if written > 0 {
-                        let out_space = stream.output_remaining_mut();
-                        let copy_len = written.min(out_space.len());
-                        out_space[..copy_len].copy_from_slice(&output_buf[..copy_len]);
-                        let _ = stream.advance_output(copy_len);
-                    }
-                    let consumed = next;
-                    if consumed > 0 {
-                        let _ = stream.advance_input(consumed);
-                    }
+                    // Compute safe input/output limits for the fast path.
+                    // inflate_fast reads up to 5 bytes ahead and writes up to
+                    // 258 bytes ahead without per-byte bounds checks.
+                    let in_end = if in_len >= 5 { in_len - 5 } else { 0 };
+                    let out_end = if out_capacity >= 257 {
+                        out_capacity - 257
+                    } else {
+                        0
+                    };
 
-                    // Rebuild input/output for inflate_fast
-                    let fast_input = stream.input_remaining().to_vec();
-                    let fast_avail_out = stream.avail_out();
-                    let mut fast_output: Vec<u8> = vec![0u8; fast_avail_out];
-                    // Copy existing output context for window distance refs
-                    let mut in_pos: usize = 0;
-                    let mut out_pos: usize = 0;
-                    let in_end = if fast_input.len() >= 6 { fast_input.len() - 5 } else { 0 };
-                    let out_end = if fast_avail_out >= 258 { fast_avail_out - 257 } else { 0 };
+                    // Use the same input and output_buf buffers that the slow
+                    // path writes to.  `put` is the current write position,
+                    // `next` is the current read position.  `start = 0` tells
+                    // inflate_fast that the output buffer starts at index 0 so
+                    // backward distances up to `put` can be resolved directly
+                    // from output_buf, and distances beyond that fall back to
+                    // the sliding window.
+                    let mut in_pos: usize = next;
+                    let mut out_pos: usize = put;
 
                     let err = inflate_fast(
                         state,
-                        &fast_input,
-                        &mut fast_output,
+                        &input,
+                        &mut output_buf,
                         &mut in_pos,
                         &mut out_pos,
                         in_end,
                         out_end,
-                        0, // output start for distance calculations
+                        0, // start = beginning of output_buf
                     );
                     if let Some(msg) = err {
                         stream.msg = Some(msg);
                     }
 
-                    // Write fast output to stream
-                    if out_pos > 0 {
-                        let out_space = stream.output_remaining_mut();
-                        let copy_len = out_pos.min(out_space.len());
-                        out_space[..copy_len].copy_from_slice(&fast_output[..copy_len]);
-                        let _ = stream.advance_output(copy_len);
-                    }
-                    if in_pos > 0 {
-                        let _ = stream.advance_input(in_pos);
-                    }
+                    // Update local tracking variables from inflate_fast's
+                    // returned positions.
+                    have = in_len.saturating_sub(in_pos);
+                    next = in_pos;
+                    left = out_capacity.saturating_sub(out_pos);
+                    put = out_pos;
 
-                    // Reload hold/bits from state (fast path modifies them)
+                    // Reload hold/bits from state (fast path modifies them).
                     hold = state.hold;
                     bits = state.bits;
 
-                    // After the fast path, our local buffers are out of sync
-                    // with the stream. The simplest correct approach is to
-                    // break and let inf_leave handle the bookkeeping.
                     if state.mode == InflateMode::Type {
                         state.back = -1;
                     }
-                    break 'inf_loop;
+                    continue 'inf_loop;
                 }
 
                 // Slow path
@@ -1530,16 +1528,23 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                         next += 1;
                         bits += 8;
                     }
+                    // Compute output produced since last accounting point.
+                    // This matches C inflate.c CHECK mode (line 1075):
+                    //   out -= left;
+                    //   strm->total_out += out;
+                    //   state->total += out;
                     let out_count = out_start - left;
-                    stream.total_out += out_count as u64;
                     state.total += out_count as u64;
                     if (state.wrap & 4) != 0 && out_count > 0 {
                         let check_data = &output_buf[put - out_count..put];
                         stream.adler = update_check(state.check as u32, check_data, state.flags);
                         state.check = stream.adler as u64;
                     }
-                    // Reset out tracking for inf_leave
-                    // (C code does: out = left here to avoid double-counting)
+                    // Reset `out_start` to `left` to prevent inf_leave from
+                    // double-counting the same output bytes.  This corresponds
+                    // to C inflate.c line 1081: `out = left;`
+                    out_start = left;
+
                     let check_hold = if state.flags != 0 {
                         hold as u32
                     } else {
@@ -1662,13 +1667,15 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
             0
         });
 
-    // If no progress and flush != Z_FINISH, return Z_BUF_ERROR
-    if (in_consumed == 0 && out_done == 0) || flush == Z_FINISH {
-        if ret == ReturnCode::Ok {
-            if in_consumed == 0 && out_done == 0 {
-                ret = ReturnCode::BufError;
-            }
-        }
+    // Return Z_BUF_ERROR if no progress was made OR if Z_FINISH was requested
+    // but we haven't reached Z_STREAM_END yet.  This matches C inflate.c
+    // line 1150:
+    //   if (((in == 0 && out == 0) || flush == Z_FINISH) && ret == Z_OK)
+    //       ret = Z_BUF_ERROR;
+    if ((in_consumed == 0 && out_done == 0) || flush == Z_FINISH)
+        && ret == ReturnCode::Ok
+    {
+        ret = ReturnCode::BufError;
     }
 
     ret
@@ -1819,23 +1826,33 @@ pub fn inflate_set_dictionary(
 ///
 /// Port of `inflateGetHeader()` from `inflate.c` lines 1219–1231.
 ///
+/// # Ownership Model
+///
+/// The C API takes a `gz_header *` pointer to caller-owned memory, allowing
+/// the caller to inspect fields after inflate fills them via the same
+/// pointer.  In the Rust API, ownership of the boxed header is transferred
+/// to `InflateState`.  To inspect the header after decompression, use
+/// [`InflateState::header`] or read the fields from the returned reference.
+///
 /// # Parameters
 ///
 /// * `state` — Mutable reference to the inflate state.
-/// * `head` — The gzip header structure to populate during decompression.
+/// * `head` — Boxed gzip header structure.  Ownership is transferred to
+///   the inflate state; the header fields will be populated during
+///   decompression.
 ///
 /// # Returns
 ///
 /// [`ReturnCode::Ok`] on success, [`ReturnCode::StreamError`] if state invalid
 /// or not in gzip mode.
-pub fn inflate_get_header(state: &mut InflateState, head: GzHeader) -> ReturnCode {
+pub fn inflate_get_header(state: &mut InflateState, head: Box<GzHeader>) -> ReturnCode {
     if !inflate_state_check(state) {
         return ReturnCode::StreamError;
     }
     if (state.wrap & 2) == 0 {
         return ReturnCode::StreamError;
     }
-    state.head = Some(Box::new(head));
+    state.head = Some(head);
     if let Some(ref mut h) = state.head {
         h.done = false;
     }
