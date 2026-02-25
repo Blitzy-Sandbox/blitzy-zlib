@@ -127,6 +127,7 @@ pub const WIN_INIT: usize = MAX_MATCH;
 #[cfg(target_os = "windows")]
 pub const OS_CODE: u8 = 0x00;
 
+/// OS code for the gzip header on non-Windows platforms (Unix = 3).
 #[cfg(not(target_os = "windows"))]
 pub const OS_CODE: u8 = 0x03;
 

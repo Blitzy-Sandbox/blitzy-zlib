@@ -43,7 +43,7 @@ use crate::gz_header::GzHeader;
 /// In Rust the type system guarantees validity, so standard zero-based
 /// discriminants are used instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InflateMode {
+pub enum InflateMode {
     // === Gzip/Zlib Header Processing (wrap != 0) ===
     /// Initial state: determine stream format (zlib / gzip / raw).
     Head,
@@ -189,7 +189,7 @@ impl fmt::Display for InflateMode {
 /// - `msg` — optional error message string
 ///
 /// All other fields are inline scalars or fixed-size arrays.
-pub(crate) struct InflateState {
+pub struct InflateState {
     // --- Stream format state ---
     /// Current state machine mode.
     pub mode: InflateMode,

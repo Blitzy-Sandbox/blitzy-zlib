@@ -70,7 +70,7 @@ use self::fast::inflate_fast;
 // Types from submodules re-exported at the inflate module level so that
 // dependents can import e.g. `crate::inflate::InflateState`.
 
-pub(crate) use self::state::{InflateState, InflateMode};
+pub use self::state::{InflateState, InflateMode};
 pub use self::tables::{inflate_table, Code, CodeType};
 pub use self::back::{
     inflate_back_init, inflate_back, inflate_back_end,

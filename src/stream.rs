@@ -85,7 +85,7 @@ use crate::inflate::state::InflateState;
 /// `ZStream` is dropped, Rust's ownership model automatically deallocates
 /// all nested `Vec` buffers inside the state structs — sliding window, hash
 /// tables, Huffman trees, pending buffer, Huffman decode tables, etc.
-pub(crate) enum StreamState {
+pub enum StreamState {
     /// No compression or decompression state has been initialised.
     None,
 
