@@ -1,0 +1,518 @@
+{
+  "metadata": {
+    "source": "adler32.c, crc32.c, crc32.h from zlib 1.3.2.1-motley",
+    "description": "Known-good Adler-32 and CRC-32 checksum test vectors for validating zlib-rs checksum implementations",
+    "zlib_version": "1.3.2.1-motley",
+    "crc32_polynomial": "0xEDB88320 (reflected form of 0x04C11DB7)",
+    "crc32_algorithm": "CRC-32/ISO-HDLC (same as CRC-32/ADCCP, CRC-32/V-42, CRC-32/XZ)",
+    "adler32_base": 65521,
+    "adler32_nmax": 5552,
+    "verification_method": "All values verified against Python zlib module (which wraps the reference C zlib implementation)"
+  },
+  "adler32": {
+    "initial_value": 1,
+    "algorithm_description": "Adler-32: s1 starts at 1, s2 starts at 0. For each byte b: s1 = (s1 + b) mod BASE, s2 = (s2 + s1) mod BASE. Result = (s2 << 16) | s1. BASE = 65521.",
+    "basic_vectors": [
+      {
+        "description": "Empty input — Adler-32 initial value returned unchanged",
+        "input_hex": "",
+        "input_ascii": "",
+        "input_length": 0,
+        "initial_adler": 1,
+        "expected": "0x00000001",
+        "expected_decimal": 1,
+        "note": "adler32(1, NULL, 0) returns 1 per zlib convention"
+      },
+      {
+        "description": "Single zero byte",
+        "input_hex": "00",
+        "input_length": 1,
+        "initial_adler": 1,
+        "expected": "0x00010001",
+        "expected_decimal": 65537,
+        "note": "s1 = (1 + 0) = 1, s2 = (0 + 1) = 1, result = (1 << 16) | 1 = 0x00010001"
+      },
+      {
+        "description": "Single byte 0x01",
+        "input_hex": "01",
+        "input_length": 1,
+        "initial_adler": 1,
+        "expected": "0x00020002",
+        "expected_decimal": 131074,
+        "note": "s1 = (1 + 1) = 2, s2 = (0 + 2) = 2, result = (2 << 16) | 2 = 0x00020002"
+      },
+      {
+        "description": "Single byte 0xFF — maximum single-byte contribution",
+        "input_hex": "FF",
+        "input_length": 1,
+        "initial_adler": 1,
+        "expected": "0x01000100",
+        "expected_decimal": 16777472,
+        "note": "s1 = (1 + 255) = 256, s2 = (0 + 256) = 256, result = (256 << 16) | 256"
+      },
+      {
+        "description": "Single byte 'a' (0x61)",
+        "input_hex": "61",
+        "input_ascii": "a",
+        "input_length": 1,
+        "initial_adler": 1,
+        "expected": "0x00620062",
+        "expected_decimal": 6422626,
+        "note": "s1 = (1 + 97) = 98 = 0x62, s2 = (0 + 98) = 98 = 0x62"
+      },
+      {
+        "description": "String 'abc'",
+        "input_hex": "61 62 63",
+        "input_ascii": "abc",
+        "input_length": 3,
+        "initial_adler": 1,
+        "expected": "0x024D0127",
+        "expected_decimal": 38600999
+      },
+      {
+        "description": "String 'message digest'",
+        "input_hex": "6D 65 73 73 61 67 65 20 64 69 67 65 73 74",
+        "input_ascii": "message digest",
+        "input_length": 14,
+        "initial_adler": 1,
+        "expected": "0x29750586",
+        "expected_decimal": 695534982
+      },
+      {
+        "description": "String 'abcdefghijklmnopqrstuvwxyz'",
+        "input_hex": "61 62 63 64 65 66 67 68 69 6A 6B 6C 6D 6E 6F 70 71 72 73 74 75 76 77 78 79 7A",
+        "input_ascii": "abcdefghijklmnopqrstuvwxyz",
+        "input_length": 26,
+        "initial_adler": 1,
+        "expected": "0x90860B20",
+        "expected_decimal": 2424703776
+      },
+      {
+        "description": "String '123456789' — standard check value",
+        "input_hex": "31 32 33 34 35 36 37 38 39",
+        "input_ascii": "123456789",
+        "input_length": 9,
+        "initial_adler": 1,
+        "expected": "0x091E01DE",
+        "expected_decimal": 152961502,
+        "note": "Standard Adler-32 check value for the ASCII string '123456789'"
+      },
+      {
+        "description": "String 'Hello World!'",
+        "input_hex": "48 65 6C 6C 6F 20 57 6F 72 6C 64 21",
+        "input_ascii": "Hello World!",
+        "input_length": 12,
+        "initial_adler": 1,
+        "expected": "0x1C49043E",
+        "expected_decimal": 474547262
+      },
+      {
+        "description": "The zlib test string 'hello, hello!' with trailing null byte",
+        "input_hex": "68 65 6C 6C 6F 2C 20 68 65 6C 6C 6F 21 00",
+        "input_ascii": "hello, hello!\\0",
+        "input_length": 14,
+        "initial_adler": 1,
+        "expected": "0x26060496",
+        "expected_decimal": 637928598,
+        "note": "Canonical test string from test/example.c including the null terminator"
+      },
+      {
+        "description": "Mixed-case alphanumeric string 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'",
+        "input_hex": "41 42 43 44 45 46 47 48 49 4A 4B 4C 4D 4E 4F 50 51 52 53 54 55 56 57 58 59 5A 61 62 63 64 65 66 67 68 69 6A 6B 6C 6D 6E 6F 70 71 72 73 74 75 76 77 78 79 7A 30 31 32 33 34 35 36 37 38 39",
+        "input_ascii": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+        "input_length": 62,
+        "initial_adler": 1,
+        "expected": "0x8ADB150C",
+        "expected_decimal": 2329613580
+      }
+    ],
+    "incremental_vectors": [
+      {
+        "description": "Incremental computation: adler32(adler32(1, 'a'), 'bc') must equal adler32(1, 'abc')",
+        "first_input_hex": "61",
+        "first_input_ascii": "a",
+        "second_input_hex": "62 63",
+        "second_input_ascii": "bc",
+        "first_result": "0x00620062",
+        "first_result_decimal": 6422626,
+        "expected": "0x024D0127",
+        "expected_decimal": 38600999,
+        "note": "Validates that incremental Adler-32 computation produces identical results to one-shot computation"
+      },
+      {
+        "description": "Incremental computation: adler32(adler32(1, 'hello'), ', hello!') must equal adler32(1, 'hello, hello!')",
+        "first_input_hex": "68 65 6C 6C 6F",
+        "first_input_ascii": "hello",
+        "second_input_hex": "2C 20 68 65 6C 6C 6F 21",
+        "second_input_ascii": ", hello!",
+        "first_result": "0x062C0215",
+        "first_result_decimal": 103547413,
+        "expected": "0x21700496",
+        "expected_decimal": 560989334,
+        "note": "Validates incremental Adler-32 across the canonical zlib test string"
+      }
+    ],
+    "combine_vectors": [
+      {
+        "description": "adler32_combine(adler32(1, 'hello'), adler32(1, ', hello!'), 8) must equal adler32(1, 'hello, hello!')",
+        "first_part_ascii": "hello",
+        "first_part_hex": "68 65 6C 6C 6F",
+        "first_part_adler": "0x062C0215",
+        "first_part_adler_decimal": 103547413,
+        "second_part_ascii": ", hello!",
+        "second_part_hex": "2C 20 68 65 6C 6C 6F 21",
+        "second_part_adler": "0x0AA40282",
+        "second_part_adler_decimal": 178520706,
+        "second_part_length": 8,
+        "expected": "0x21700496",
+        "expected_decimal": 560989334,
+        "note": "Combined result must equal adler32(1, 'hello, hello!')"
+      },
+      {
+        "description": "adler32_combine with negative length returns 0xFFFFFFFF as error indicator",
+        "first_part_adler": "0x062C0215",
+        "second_part_adler": "0x0AA40282",
+        "second_part_length": -1,
+        "expected": "0xFFFFFFFF",
+        "expected_decimal": 4294967295,
+        "note": "Negative len2 is invalid; the C implementation returns 0xFFFFFFFF as a debugging clue"
+      }
+    ],
+    "nmax_boundary_vectors": [
+      {
+        "description": "NMAX=5552 boundary: exactly 5552 bytes of 0xFF",
+        "input_pattern": "FF",
+        "input_length": 5552,
+        "initial_adler": 1,
+        "expected": "0xF18F9B8C",
+        "expected_decimal": 4052720524,
+        "note": "Exercises the exact NMAX boundary where the first modulo reduction occurs. NMAX=5552 is the largest n such that 255*n*(n+1)/2 + (n+1)*(BASE-1) <= 2^32-1."
+      },
+      {
+        "description": "NMAX+1: exactly 5553 bytes of 0xFF",
+        "input_pattern": "FF",
+        "input_length": 5553,
+        "initial_adler": 1,
+        "expected": "0x8E299C8B",
+        "expected_decimal": 2385091723,
+        "note": "Exercises the code path where input exceeds NMAX, requiring a second block with modulo reduction"
+      }
+    ],
+    "edge_case_vectors": [
+      {
+        "description": "256 zero bytes — exercises the block processing path with no byte contribution",
+        "input_pattern": "00",
+        "input_length": 256,
+        "initial_adler": 1,
+        "expected": "0x01000001",
+        "expected_decimal": 16777217,
+        "note": "s1 stays at 1, s2 accumulates to 256. Result = (256 << 16) | 1 = 0x01000001"
+      },
+      {
+        "description": "256 bytes of 0xFF — exercises accumulation near block boundary",
+        "input_pattern": "FF",
+        "input_length": 256,
+        "initial_adler": 1,
+        "expected": "0x0800FF01",
+        "expected_decimal": 134283009
+      }
+    ]
+  },
+  "crc32": {
+    "initial_value": 0,
+    "polynomial": "0xEDB88320",
+    "polynomial_normal": "0x04C11DB7",
+    "algorithm_description": "CRC-32/ISO-HDLC: Initialize CRC to 0xFFFFFFFF, process each byte with table lookup (reflected), final XOR with 0xFFFFFFFF. The zlib API presents initial value as 0 and handles the internal pre/post complementing transparently.",
+    "basic_vectors": [
+      {
+        "description": "Empty input — CRC-32 of nothing is 0",
+        "input_hex": "",
+        "input_ascii": "",
+        "input_length": 0,
+        "initial_crc": 0,
+        "expected": "0x00000000",
+        "expected_decimal": 0
+      },
+      {
+        "description": "Single zero byte",
+        "input_hex": "00",
+        "input_length": 1,
+        "initial_crc": 0,
+        "expected": "0xD202EF8D",
+        "expected_decimal": 3523407757
+      },
+      {
+        "description": "Single byte 0x01",
+        "input_hex": "01",
+        "input_length": 1,
+        "initial_crc": 0,
+        "expected": "0xA505DF1B",
+        "expected_decimal": 2768625435
+      },
+      {
+        "description": "Single byte 0xFF",
+        "input_hex": "FF",
+        "input_length": 1,
+        "initial_crc": 0,
+        "expected": "0xFF000000",
+        "expected_decimal": 4278190080
+      },
+      {
+        "description": "Single byte 'a' (0x61)",
+        "input_hex": "61",
+        "input_ascii": "a",
+        "input_length": 1,
+        "initial_crc": 0,
+        "expected": "0xE8B7BE43",
+        "expected_decimal": 3904355907
+      },
+      {
+        "description": "String 'abc'",
+        "input_hex": "61 62 63",
+        "input_ascii": "abc",
+        "input_length": 3,
+        "initial_crc": 0,
+        "expected": "0x352441C2",
+        "expected_decimal": 891568578
+      },
+      {
+        "description": "String 'message digest'",
+        "input_hex": "6D 65 73 73 61 67 65 20 64 69 67 65 73 74",
+        "input_ascii": "message digest",
+        "input_length": 14,
+        "initial_crc": 0,
+        "expected": "0x20159D7F",
+        "expected_decimal": 538287487
+      },
+      {
+        "description": "String 'abcdefghijklmnopqrstuvwxyz'",
+        "input_hex": "61 62 63 64 65 66 67 68 69 6A 6B 6C 6D 6E 6F 70 71 72 73 74 75 76 77 78 79 7A",
+        "input_ascii": "abcdefghijklmnopqrstuvwxyz",
+        "input_length": 26,
+        "initial_crc": 0,
+        "expected": "0x4C2750BD",
+        "expected_decimal": 1277644989
+      },
+      {
+        "description": "String '123456789' — THE canonical CRC-32 check value",
+        "input_hex": "31 32 33 34 35 36 37 38 39",
+        "input_ascii": "123456789",
+        "input_length": 9,
+        "initial_crc": 0,
+        "expected": "0xCBF43926",
+        "expected_decimal": 3421780262,
+        "note": "This is THE universally accepted standard CRC-32 check value used to verify all CRC-32 implementations. If this value does not match, the implementation is incorrect."
+      },
+      {
+        "description": "String 'Hello World!'",
+        "input_hex": "48 65 6C 6C 6F 20 57 6F 72 6C 64 21",
+        "input_ascii": "Hello World!",
+        "input_length": 12,
+        "initial_crc": 0,
+        "expected": "0x1C291CA3",
+        "expected_decimal": 472456355
+      },
+      {
+        "description": "The zlib test string 'hello, hello!' with trailing null byte",
+        "input_hex": "68 65 6C 6C 6F 2C 20 68 65 6C 6C 6F 21 00",
+        "input_ascii": "hello, hello!\\0",
+        "input_length": 14,
+        "initial_crc": 0,
+        "expected": "0xB56C3F9D",
+        "expected_decimal": 3043770269,
+        "note": "Canonical test string from test/example.c including the null terminator"
+      },
+      {
+        "description": "Mixed-case alphanumeric string 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'",
+        "input_hex": "41 42 43 44 45 46 47 48 49 4A 4B 4C 4D 4E 4F 50 51 52 53 54 55 56 57 58 59 5A 61 62 63 64 65 66 67 68 69 6A 6B 6C 6D 6E 6F 70 71 72 73 74 75 76 77 78 79 7A 30 31 32 33 34 35 36 37 38 39",
+        "input_ascii": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+        "input_length": 62,
+        "initial_crc": 0,
+        "expected": "0x1FC2E6D2",
+        "expected_decimal": 532866770
+      }
+    ],
+    "incremental_vectors": [
+      {
+        "description": "Incremental: crc32(crc32(0, 'abc'), 'def') must equal crc32(0, 'abcdef')",
+        "first_input_hex": "61 62 63",
+        "first_input_ascii": "abc",
+        "second_input_hex": "64 65 66",
+        "second_input_ascii": "def",
+        "first_result": "0x352441C2",
+        "first_result_decimal": 891568578,
+        "expected": "0x4B8E39EF",
+        "expected_decimal": 1267612143,
+        "note": "CRC-32 of 'abcdef' computed incrementally must match one-shot computation"
+      },
+      {
+        "description": "Incremental: crc32(crc32(0, 'hello'), ', hello!') must equal crc32(0, 'hello, hello!')",
+        "first_input_hex": "68 65 6C 6C 6F",
+        "first_input_ascii": "hello",
+        "second_input_hex": "2C 20 68 65 6C 6C 6F 21",
+        "second_input_ascii": ", hello!",
+        "first_result": "0x3610A686",
+        "first_result_decimal": 907060870,
+        "expected": "0xB39ADC9B",
+        "expected_decimal": 3013270683,
+        "note": "Validates incremental CRC-32 across the canonical zlib test string (without null)"
+      }
+    ],
+    "combine_vectors": [
+      {
+        "description": "crc32_combine(crc32(0, 'hello'), crc32(0, ', hello!'), 8) must equal crc32(0, 'hello, hello!')",
+        "first_part_ascii": "hello",
+        "first_part_hex": "68 65 6C 6C 6F",
+        "first_part_crc": "0x3610A686",
+        "first_part_crc_decimal": 907060870,
+        "second_part_ascii": ", hello!",
+        "second_part_hex": "2C 20 68 65 6C 6C 6F 21",
+        "second_part_crc": "0x2F02F92F",
+        "second_part_crc_decimal": 788724015,
+        "second_part_length": 8,
+        "expected": "0xB39ADC9B",
+        "expected_decimal": 3013270683,
+        "note": "Uses GF(2) matrix multiplication to combine CRCs without the original data. Combined result must equal crc32(0, 'hello, hello!')."
+      }
+    ],
+    "single_byte_vectors": {
+      "description": "CRC-32 of each selected byte value for CRC table validation",
+      "note": "For a single byte b with initial CRC 0, the result is computed as: crc = table[(0xFF ^ b) & 0xFF] ^ 0x00FFFFFF, then final = crc ^ 0xFFFFFFFF. These values validate that the CRC lookup tables from crc32.h are correctly ported to Rust const arrays.",
+      "entries": [
+        {
+          "byte": "0x00",
+          "byte_decimal": 0,
+          "expected_crc": "0xD202EF8D",
+          "expected_crc_decimal": 3523407757
+        },
+        {
+          "byte": "0x01",
+          "byte_decimal": 1,
+          "expected_crc": "0xA505DF1B",
+          "expected_crc_decimal": 2768625435
+        },
+        {
+          "byte": "0x02",
+          "byte_decimal": 2,
+          "expected_crc": "0x3C0C8EA1",
+          "expected_crc_decimal": 1007455905
+        },
+        {
+          "byte": "0x0F",
+          "byte_decimal": 15,
+          "expected_crc": "0x42BDF21C",
+          "expected_crc_decimal": 1119744540
+        },
+        {
+          "byte": "0x10",
+          "byte_decimal": 16,
+          "expected_crc": "0xCFB5FFE9",
+          "expected_crc_decimal": 3484811241
+        },
+        {
+          "byte": "0x31",
+          "byte_decimal": 49,
+          "expected_crc": "0x83DCEFB7",
+          "expected_crc_decimal": 2212294583,
+          "note": "ASCII '1' — first byte of the standard check string '123456789'"
+        },
+        {
+          "byte": "0x61",
+          "byte_decimal": 97,
+          "expected_crc": "0xE8B7BE43",
+          "expected_crc_decimal": 3904355907,
+          "note": "ASCII 'a'"
+        },
+        {
+          "byte": "0x7F",
+          "byte_decimal": 127,
+          "expected_crc": "0x12B88320",
+          "expected_crc_decimal": 314082080,
+          "note": "DEL character — last ASCII character"
+        },
+        {
+          "byte": "0x80",
+          "byte_decimal": 128,
+          "expected_crc": "0x3FBA6CAD",
+          "expected_crc_decimal": 1069182125,
+          "note": "First byte outside 7-bit ASCII range"
+        },
+        {
+          "byte": "0xFE",
+          "byte_decimal": 254,
+          "expected_crc": "0x88073096",
+          "expected_crc_decimal": 2282172566
+        },
+        {
+          "byte": "0xFF",
+          "byte_decimal": 255,
+          "expected_crc": "0xFF000000",
+          "expected_crc_decimal": 4278190080,
+          "note": "Maximum byte value"
+        }
+      ]
+    },
+    "edge_case_vectors": [
+      {
+        "description": "256 zero bytes",
+        "input_pattern": "00",
+        "input_length": 256,
+        "initial_crc": 0,
+        "expected": "0x0D968558",
+        "expected_decimal": 227968344
+      },
+      {
+        "description": "256 bytes of 0xFF",
+        "input_pattern": "FF",
+        "input_length": 256,
+        "initial_crc": 0,
+        "expected": "0xFEA8A821",
+        "expected_decimal": 4272465953
+      }
+    ]
+  },
+  "cross_validation": {
+    "description": "Test vectors designed to cross-validate Adler-32 and CRC-32 together on the same input, ensuring both checksum engines are correctly processing identical data",
+    "vectors": [
+      {
+        "description": "Empty input",
+        "input_hex": "",
+        "input_length": 0,
+        "adler32": "0x00000001",
+        "adler32_decimal": 1,
+        "crc32": "0x00000000",
+        "crc32_decimal": 0
+      },
+      {
+        "description": "Standard check string '123456789'",
+        "input_hex": "31 32 33 34 35 36 37 38 39",
+        "input_ascii": "123456789",
+        "input_length": 9,
+        "adler32": "0x091E01DE",
+        "adler32_decimal": 152961502,
+        "crc32": "0xCBF43926",
+        "crc32_decimal": 3421780262
+      },
+      {
+        "description": "zlib canonical test string with null",
+        "input_hex": "68 65 6C 6C 6F 2C 20 68 65 6C 6C 6F 21 00",
+        "input_ascii": "hello, hello!\\0",
+        "input_length": 14,
+        "adler32": "0x26060496",
+        "adler32_decimal": 637928598,
+        "crc32": "0xB56C3F9D",
+        "crc32_decimal": 3043770269
+      },
+      {
+        "description": "65536-byte repeating pattern (0x00-0xFF repeated 256 times)",
+        "input_pattern": "repeating 0x00-0xFF",
+        "input_length": 65536,
+        "adler32": "0xBBBA8772",
+        "adler32_decimal": 3149563762,
+        "crc32": "0xB11DE6A1",
+        "crc32_decimal": 2971526817,
+        "note": "Large input exercising multiple NMAX block reductions in Adler-32 and word-level CRC processing"
+      }
+    ]
+  }
+}
