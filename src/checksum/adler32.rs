@@ -146,18 +146,18 @@ fn do16(chunk: &[u8], adler: &mut u32, sum2: &mut u32) {
 /// let full    = adler32_z(partial, b"llo");
 /// assert_eq!(full, result);
 ///
-/// // Empty buffer returns the initial value unchanged
-/// assert_eq!(adler32_z(42, b""), 42);
+/// // Empty buffer always returns 1 (matching C adler32(x, NULL, 0) == 1)
+/// assert_eq!(adler32_z(42, b""), 1);
 /// ```
 pub fn adler32_z(adler: u32, buf: &[u8]) -> u32 {
-    // Empty buffer: return the initial value unchanged.
-    // In C (line 81-82): `if (buf == Z_NULL) return 1L;`
-    // In Rust we handle this via the is_empty() check; the C code also
-    // returns 1 when buf is NULL regardless of the adler argument, but the
-    // Rust API cannot receive a null slice, so the "initial Adler" semantic
-    // is simply: adler32_z(anything, &[]) → anything.
+    // Empty buffer: return the initial Adler-32 value.
+    // C (line 81-82): `if (buf == Z_NULL) return 1L;`
+    // The C implementation returns 1 for any NULL-pointer call regardless of
+    // the `adler` argument.  In Rust, an empty slice is the idiomatic
+    // equivalent of `(NULL, 0)`.  Returning 1 here preserves the canonical
+    // "get initial value" semantic: `adler32(0, &[]) == 1`.
     if buf.is_empty() {
-        return adler;
+        return 1;
     }
 
     // Split the composite Adler-32 value into its two 16-bit component sums.

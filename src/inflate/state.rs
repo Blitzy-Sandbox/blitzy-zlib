@@ -336,11 +336,11 @@ pub struct InflateState {
 ///
 /// | Input range      | Format                     | `wrap` | Actual window bits |
 /// |------------------|----------------------------|--------|--------------------|
-/// | `8..=15`         | zlib (RFC 1950)            | 1      | `wbits`            |
+/// | `8..=15`         | zlib (RFC 1950)            | 5      | `wbits`            |
 /// | `-15..=-8`       | raw DEFLATE (RFC 1951)     | 0      | `abs(wbits)`       |
-/// | `24..=31` (+16)  | gzip only (RFC 1952)       | 2      | `wbits & 15`       |
-/// | `40..=47` (+32)  | auto-detect zlib or gzip   | 3      | `wbits & 15`       |
-/// | `0`              | keep existing (reset only)  | 1      | 0                  |
+/// | `24..=31` (+16)  | gzip only (RFC 1952)       | 6      | `wbits & 15`       |
+/// | `40..=47` (+32)  | auto-detect zlib or gzip   | 7      | `wbits & 15`       |
+/// | `0`              | keep existing (reset only)  | 5      | 0                  |
 ///
 /// Per the zlib specification, `windowBits = 8` is promoted to `9` because
 /// the LZ77 algorithm requires a minimum 512-byte window.
@@ -354,7 +354,7 @@ pub struct InflateState {
 ///
 /// ```ignore
 /// let (wrap, wbits) = parse_window_bits(15).unwrap();
-/// assert_eq!(wrap, 1);  // zlib format
+/// assert_eq!(wrap, 5);  // zlib format (bits: format=1 | validate=4)
 /// assert_eq!(wbits, 15);
 ///
 /// let (wrap, wbits) = parse_window_bits(-15).unwrap();
@@ -362,11 +362,11 @@ pub struct InflateState {
 /// assert_eq!(wbits, 15);
 ///
 /// let (wrap, wbits) = parse_window_bits(31).unwrap();
-/// assert_eq!(wrap, 2);  // gzip
+/// assert_eq!(wrap, 6);  // gzip (bits: format=2 | validate=4)
 /// assert_eq!(wbits, 15);
 ///
 /// let (wrap, wbits) = parse_window_bits(47).unwrap();
-/// assert_eq!(wrap, 3);  // auto-detect
+/// assert_eq!(wrap, 7);  // auto-detect (bits: format=3 | validate=4)
 /// assert_eq!(wbits, 15);
 /// ```
 pub(crate) fn parse_window_bits(wbits: i32) -> Result<(i32, u32), ZlibError> {
@@ -382,11 +382,17 @@ pub(crate) fn parse_window_bits(wbits: i32) -> Result<(i32, u32), ZlibError> {
         actual = (-wbits) as u32;
     } else {
         // --- Zlib, gzip, or auto-detect ---
-        // Compute wrap from the high bits of the parameter:
-        //   wbits  0..15:  (wbits >> 4) = 0, +1 = 1  (zlib)
-        //   wbits 16..31:  (wbits >> 4) = 1, +1 = 2  (gzip)
-        //   wbits 32..47:  (wbits >> 4) = 2, +1 = 3  (auto-detect)
-        wrap = (wbits >> 4) + 1;
+        // Per C zlib inflateInit2_ (inflate.c line 152):
+        //   wrap = (windowBits >> 4) + 5;
+        // The +5 offset encodes both the format selector (bits 0-1) and
+        // the validation flag (bit 2) in a single integer:
+        //   wbits  0..15 → wrap = 5 (0b101): zlib  + validate
+        //   wbits 16..31 → wrap = 6 (0b110): gzip  + validate
+        //   wbits 32..47 → wrap = 7 (0b111): auto  + validate
+        // Bit 0: zlib format enabled
+        // Bit 1: gzip format enabled
+        // Bit 2: checksum validation enabled (can be toggled by inflate_validate)
+        wrap = (wbits >> 4) + 5;
 
         // Strip format-selection bits to isolate the actual window size.
         // Values >= 48 are left unchanged and will fail validation below.

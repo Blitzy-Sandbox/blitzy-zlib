@@ -463,9 +463,9 @@ mod tests {
     /// Verify levels 1–3 map to Fast strategy.
     #[test]
     fn config_levels_1_to_3_are_fast() {
-        for level in 1..=3 {
+        for (level, cfg) in CONFIG_TABLE.iter().enumerate().take(4).skip(1) {
             assert_eq!(
-                CONFIG_TABLE[level].strategy,
+                cfg.strategy,
                 CompressionStrategy::Fast,
                 "Level {} should use Fast strategy",
                 level
@@ -476,9 +476,9 @@ mod tests {
     /// Verify levels 4–9 map to Slow strategy.
     #[test]
     fn config_levels_4_to_9_are_slow() {
-        for level in 4..=9 {
+        for (level, cfg) in CONFIG_TABLE.iter().enumerate().skip(4) {
             assert_eq!(
-                CONFIG_TABLE[level].strategy,
+                cfg.strategy,
                 CompressionStrategy::Slow,
                 "Level {} should use Slow strategy",
                 level
@@ -672,7 +672,7 @@ mod tests {
     fn strategy_derives() {
         let s = CompressionStrategy::Fast;
         let s2 = s; // Copy
-        let s3 = s.clone(); // Clone
+        let s3 = s; // Copy (also validates Clone since Copy implies Clone)
         assert_eq!(s2, s3); // PartialEq + Eq
         let _ = format!("{:?}", s); // Debug
     }
@@ -682,7 +682,7 @@ mod tests {
     fn config_derives() {
         let c = CONFIG_TABLE[6];
         let c2 = c; // Copy
-        let c3 = c.clone(); // Clone
+        let c3 = c; // Copy (also validates Clone since Copy implies Clone)
         let _ = format!("{:?}", c2); // Debug
         let _ = format!("{:?}", c3); // Debug (suppress unused warning)
     }

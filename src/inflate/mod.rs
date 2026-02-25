@@ -528,7 +528,7 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
     let mut hold = state.hold;
     let mut bits_count = state.bits;
     let in_start = have;
-    let out_start = left;
+    let mut out_start = left;
     let mut ret = ReturnCode::Ok;
 
     // Main state machine — 'inf label replaces C goto inf_leave
@@ -1494,6 +1494,11 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                         in_pos += 1;
                         bits_count += 8;
                     }
+                    // Per C inflate.c CHECK mode: compute output produced
+                    // so far, update total_out/total/check, then reset
+                    // out_start = left so the post-loop code sees 0
+                    // additional output (avoiding double-counting of both
+                    // the checksum and total_out).
                     let out_bytes = out_start - left;
                     strm.total_out += out_bytes as u64;
                     state.total += out_bytes as u64;
@@ -1503,6 +1508,10 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                         strm.adler = nc as u64;
                         state.check = nc;
                     }
+                    // Reset out_start so post-loop code (inf_leave
+                    // equivalent) sees out_consumed = 0. This mirrors
+                    // C inflate.c: "out = left;" after the CHECK update.
+                    out_start = left;
                     let check_hold = {
                         #[cfg(feature = "gzip")]
                         {
@@ -1520,14 +1529,8 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                     if (state.wrap & 4) != 0 && check_hold != state.check {
                         strm.msg = Some("incorrect data check".into());
                         state.mode = InflateMode::Bad;
-                        // Undo total_out adjustment
-                        strm.total_out -= out_bytes as u64;
-                        state.total -= out_bytes as u64;
                         continue;
                     }
-                    // Undo total_out since inf_leave will redo
-                    strm.total_out -= out_bytes as u64;
-                    state.total -= out_bytes as u64;
                     init_bits(&mut hold, &mut bits_count);
                 }
                 #[cfg(feature = "gzip")]

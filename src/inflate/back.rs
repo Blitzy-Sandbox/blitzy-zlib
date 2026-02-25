@@ -768,13 +768,19 @@ where
                     let mut work_buf = state.window.clone();
                     let mut fi_in = in_pos;
                     let mut fi_out = put;
+                    // `start` = 0 because `put` (the output position)
+                    // is 0-based into the window buffer. In the C
+                    // version, `start = wsize` because the C code
+                    // computes `written = start - avail_out`; the
+                    // Rust adaptation computes `written = out_pos -
+                    // start`, so start must be 0.
                     inflate_fast(
                         state,
                         &input_buf,
                         &mut work_buf,
                         &mut fi_in,
                         &mut fi_out,
-                        wsize,
+                        0,
                     );
                     state.window[..wsize].copy_from_slice(&work_buf[..wsize]);
 

@@ -38,9 +38,10 @@ fn adler32_empty_input() {
     assert_eq!(adler32(1, &[]), 1);
     // adler32_z with empty slice must also return 1
     assert_eq!(adler32_z(1, &[]), 1);
-    // Non-standard initial value should be preserved on empty input
-    assert_eq!(adler32(42, &[]), 42);
-    assert_eq!(adler32_z(0xDEAD_BEEF, &[]), 0xDEAD_BEEF);
+    // Per C zlib, adler32(anything, NULL, 0) always returns 1 (the initial
+    // Adler-32 value). In Rust, an empty slice is the equivalent of NULL.
+    assert_eq!(adler32(42, &[]), 1);
+    assert_eq!(adler32_z(0xDEAD_BEEF, &[]), 1);
 }
 
 /// Known-answer test for adler32(1, b"hello").

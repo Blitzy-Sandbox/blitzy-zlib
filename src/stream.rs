@@ -664,6 +664,34 @@ impl ZStream {
     }
 
     // -----------------------------------------------------------------------
+    // Public state accessors for testing and advanced introspection
+    // -----------------------------------------------------------------------
+
+    /// Returns a shared reference to the internal [`StreamState`].
+    ///
+    /// This accessor enables advanced introspection and coverage testing
+    /// (e.g., inspecting the current [`InflateMode`](crate::InflateMode)
+    /// during decompression). Most applications should use the public
+    /// `deflate_*` / `inflate_*` API functions instead.
+    #[inline]
+    pub fn stream_state(&self) -> &StreamState {
+        &self.state
+    }
+
+    /// Returns a mutable reference to the internal [`StreamState`].
+    ///
+    /// **Use with care.** Mutating the internal state directly can violate
+    /// algorithm invariants. This accessor is provided for exhaustive
+    /// coverage testing (e.g., forcing specific [`InflateMode`] transitions
+    /// to reach otherwise-unreachable error paths, mirroring the C
+    /// `test/infcover.c` pattern of casting `strm->state` and setting fields
+    /// directly).
+    #[inline]
+    pub fn stream_state_mut(&mut self) -> &mut StreamState {
+        &mut self.state
+    }
+
+    // -----------------------------------------------------------------------
     // Crate-internal error management helpers
     // -----------------------------------------------------------------------
 
