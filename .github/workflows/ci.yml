@@ -1,0 +1,166 @@
+name: CI
+
+# Primary GitHub Actions CI workflow for the zlib-rs Rust workspace.
+# Replaces the C-era build/test workflows (c-std.yml, cmake.yml, configure.yml)
+# with a Rust-native Cargo-based CI pipeline covering build, test, lint, format,
+# benchmarks, and documentation across multiple Rust toolchain versions and OS.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build Job — compile the workspace in debug and release modes
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.os }}, ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rust:
+          - stable
+          - "1.85.0"
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace (debug)
+        run: cargo build --workspace
+
+      - name: Build workspace (release)
+        run: cargo build --workspace --release
+
+  # ---------------------------------------------------------------------------
+  # Test Job — run all workspace tests including doc tests
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (${{ matrix.os }}, ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rust:
+          - stable
+          - "1.85.0"
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run all tests
+        run: cargo test --workspace
+
+      - name: Run tests with all features
+        run: cargo test --workspace --all-features
+
+      - name: Run doc tests
+        run: cargo test --workspace --doc
+
+  # ---------------------------------------------------------------------------
+  # Clippy Lint Job — enforce strict lint standards
+  # ---------------------------------------------------------------------------
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Clippy with warnings as errors
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # Rustfmt Formatting Check Job — enforce consistent code style
+  # ---------------------------------------------------------------------------
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # ---------------------------------------------------------------------------
+  # Benchmark Job — informational performance regression detection
+  # ---------------------------------------------------------------------------
+  bench:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run benchmarks
+        run: cargo bench --workspace
+
+  # ---------------------------------------------------------------------------
+  # Documentation Build Job — validate doc generation and missing_docs
+  # ---------------------------------------------------------------------------
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build documentation with warnings as errors
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps
