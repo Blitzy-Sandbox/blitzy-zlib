@@ -638,14 +638,14 @@ mod tests {
     fn zlib_result_ok_variant() {
         let result: ZlibResult = Ok(ReturnCode::Ok);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), ReturnCode::Ok);
+        assert_eq!(result, Ok(ReturnCode::Ok));
     }
 
     #[test]
     fn zlib_result_err_variant() {
         let result: ZlibResult = Err(ZlibError::DataError);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), ZlibError::DataError);
+        assert_eq!(result, Err(ZlibError::DataError));
     }
 
     #[test]

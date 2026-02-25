@@ -747,7 +747,7 @@ mod tests {
     fn flush_mode_clone_copy_eq() {
         let a = FlushMode::SyncFlush;
         let b = a;
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, b);
         assert_eq!(a, c);
         assert_ne!(a, FlushMode::Finish);
@@ -873,7 +873,7 @@ mod tests {
     fn compression_level_clone_copy_eq() {
         let a = CompressionLevel::BestCompression;
         let b = a;
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, b);
         assert_eq!(a, c);
         assert_ne!(a, CompressionLevel::None);
