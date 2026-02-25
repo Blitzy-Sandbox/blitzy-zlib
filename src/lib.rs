@@ -116,21 +116,19 @@
 // Enable `no_std` mode when the `std` feature is not active (AAP §0.6.3, §0.8.2).
 // Core compression, decompression, and checksum modules compile with no_std.
 #![cfg_attr(not(feature = "std"), no_std)]
-
 // Encourage documentation on all public items.
 #![warn(missing_docs)]
 
 // ============================================================================
-// Feature conflict guard
+// Feature design note
 // ============================================================================
 
-// The `no-std` and `gz-io` features are contradictory: `gz-io` requires `std`
-// for file I/O, which is incompatible with bare-metal `no-std` mode.
-#[cfg(all(feature = "no-std", feature = "gz-io"))]
-compile_error!(
-    "Feature conflict: `no-std` and `gz-io` cannot be enabled simultaneously. \
-     `gz-io` requires `std` for file I/O, which is incompatible with `no-std` mode."
-);
+// The `no-std` feature is provided as an explicit opt-in marker for bare-metal
+// targets, but the actual `#![no_std]` attribute above is governed by the
+// *absence* of the `std` feature (`not(feature = "std")`). When `std` and
+// `no-std` are both enabled (e.g. via `--all-features`), `std` takes priority
+// and the crate builds with full standard library support. This design follows
+// the Cargo convention that features must be additive.
 
 // ============================================================================
 // Conditional compilation for std / no_std
@@ -332,46 +330,46 @@ pub use gz_header::GzHeader;
 // Public API re-exports — Deflate API (from src/deflate/mod.rs)
 // ============================================================================
 
+pub use deflate::deflate;
+pub use deflate::deflate_bound;
+pub use deflate::deflate_copy;
+pub use deflate::deflate_end;
+pub use deflate::deflate_get_dictionary;
 pub use deflate::deflate_init;
 pub use deflate::deflate_init2;
-pub use deflate::deflate;
-pub use deflate::deflate_end;
-pub use deflate::deflate_reset;
 pub use deflate::deflate_params;
-pub use deflate::deflate_tune;
-pub use deflate::deflate_bound;
 pub use deflate::deflate_pending;
 pub use deflate::deflate_prime;
-pub use deflate::deflate_set_header;
+pub use deflate::deflate_reset;
 pub use deflate::deflate_set_dictionary;
-pub use deflate::deflate_get_dictionary;
-pub use deflate::deflate_copy;
+pub use deflate::deflate_set_header;
+pub use deflate::deflate_tune;
 
 // ============================================================================
 // Public API re-exports — Inflate API (from src/inflate/mod.rs)
 // ============================================================================
 
+pub use inflate::inflate;
+pub use inflate::inflate_copy;
+pub use inflate::inflate_end;
+pub use inflate::inflate_get_dictionary;
+pub use inflate::inflate_get_header;
 pub use inflate::inflate_init;
 pub use inflate::inflate_init2;
-pub use inflate::inflate;
-pub use inflate::inflate_end;
+pub use inflate::inflate_mark;
+pub use inflate::inflate_prime;
 pub use inflate::inflate_reset;
 pub use inflate::inflate_reset2;
-pub use inflate::inflate_sync;
-pub use inflate::inflate_copy;
-pub use inflate::inflate_prime;
-pub use inflate::inflate_mark;
-pub use inflate::inflate_get_header;
 pub use inflate::inflate_set_dictionary;
-pub use inflate::inflate_get_dictionary;
-pub use inflate::inflate_validate;
+pub use inflate::inflate_sync;
 pub use inflate::inflate_sync_point;
 pub use inflate::inflate_undermine;
+pub use inflate::inflate_validate;
 
 // Callback-based raw DEFLATE decompression (inflateBack family)
-pub use inflate::inflate_back_init;
 pub use inflate::inflate_back;
 pub use inflate::inflate_back_end;
+pub use inflate::inflate_back_init;
 
 /// Re-export of [`inflate::InflateBackInput`] — callback trait for inflate_back input.
 pub use inflate::InflateBackInput;
@@ -401,13 +399,13 @@ pub use inflate::CodeType;
 // ============================================================================
 
 pub use checksum::adler32;
-pub use checksum::adler32_z;
 pub use checksum::adler32_combine;
+pub use checksum::adler32_z;
 pub use checksum::crc32;
-pub use checksum::crc32_z;
 pub use checksum::crc32_combine;
 pub use checksum::crc32_combine_gen;
 pub use checksum::crc32_combine_op;
+pub use checksum::crc32_z;
 pub use checksum::get_crc_table;
 
 // ============================================================================
@@ -500,7 +498,7 @@ pub use gz::gz_ungetc;
 // ============================================================================
 
 pub use util::compress;
-pub use util::compress2;
 pub use util::compress_bound;
+pub use util::compress2;
 pub use util::uncompress;
 pub use util::uncompress2;

@@ -35,6 +35,10 @@
 //! assert_eq!(header.os, os::UNIX);
 //! ```
 
+// In no_std mode, pull alloc types that the std prelude normally provides.
+#[cfg(not(feature = "std"))]
+use alloc::{string::String, vec::Vec};
+
 /// Operating system identifiers for the gzip header OS field.
 ///
 /// These constants are defined in RFC 1952 §2.3.1. The OS field in a gzip

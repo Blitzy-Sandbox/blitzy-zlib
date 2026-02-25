@@ -43,12 +43,12 @@
 //! compression level, strategy, and input, the Rust implementation will
 //! produce byte-identical DEFLATE output to C zlib.
 
-use crate::deflate::state::{BlockState, DeflateState};
 use crate::deflate::fast::deflate_fast;
-use crate::deflate::slow::deflate_slow;
-use crate::deflate::stored::deflate_stored;
 use crate::deflate::huff::deflate_huff;
 use crate::deflate::rle::deflate_rle;
+use crate::deflate::slow::deflate_slow;
+use crate::deflate::state::{BlockState, DeflateState};
+use crate::deflate::stored::deflate_stored;
 use crate::stream::ZStream;
 
 // ===========================================================================
@@ -152,7 +152,12 @@ impl CompressionStrategy {
     /// - `FinishStarted` — finish started, need only more output at next call.
     /// - `FinishDone` — finish done, accept no more input or output.
     #[inline]
-    pub(crate) fn compress(self, state: &mut DeflateState, strm: *mut ZStream, flush: i32) -> BlockState {
+    pub(crate) fn compress(
+        self,
+        state: &mut DeflateState,
+        strm: *mut ZStream,
+        flush: i32,
+    ) -> BlockState {
         match self {
             CompressionStrategy::Stored => deflate_stored(state, strm, flush),
             CompressionStrategy::Fast => deflate_fast(state, strm, flush),
@@ -486,14 +491,14 @@ mod tests {
     fn config_table_exact_values() {
         // (good_length, max_lazy, nice_length, max_chain) from deflate.c
         let expected: [(u16, u16, u16, u16); 10] = [
-            (0, 0, 0, 0),       // Level 0
-            (4, 4, 8, 4),       // Level 1
-            (4, 5, 16, 8),      // Level 2
-            (4, 6, 32, 32),     // Level 3
-            (4, 4, 16, 16),     // Level 4
-            (8, 16, 32, 32),    // Level 5
-            (8, 16, 128, 128),  // Level 6 (default)
-            (8, 32, 128, 256),  // Level 7
+            (0, 0, 0, 0),         // Level 0
+            (4, 4, 8, 4),         // Level 1
+            (4, 5, 16, 8),        // Level 2
+            (4, 6, 32, 32),       // Level 3
+            (4, 4, 16, 16),       // Level 4
+            (8, 16, 32, 32),      // Level 5
+            (8, 16, 128, 128),    // Level 6 (default)
+            (8, 32, 128, 256),    // Level 7
             (32, 128, 258, 1024), // Level 8
             (32, 258, 258, 4096), // Level 9
         ];

@@ -39,6 +39,10 @@
 //! - **Called by:** Main `deflate()` loop when `state.strategy == Z_HUFFMAN_ONLY`
 //! - **Calls:** `fill_window`, `tally_lit`, `tr_flush_block`
 
+// In no_std mode, pull alloc types that the std prelude normally provides.
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::constants::{Z_FINISH, Z_NO_FLUSH};
 use crate::deflate::state::{BlockState, DeflateState};
 use crate::deflate::trees::{tally_lit, tr_flush_block};
@@ -164,7 +168,9 @@ pub(crate) fn deflate_huff(state: &mut DeflateState, strm: *mut ZStream, flush: 
         // ------------------------------------------------------------------
         if state.lookahead == 0 {
             // SAFETY: strm is valid for the duration of deflate().
-            unsafe { do_fill_window(state, strm); }
+            unsafe {
+                do_fill_window(state, strm);
+            }
 
             if state.lookahead == 0 {
                 if flush == Z_NO_FLUSH {
@@ -229,7 +235,9 @@ mod tests {
     use super::*;
     use crate::stream::ZStream;
 
-    fn dummy_strm() -> ZStream { ZStream::new() }
+    fn dummy_strm() -> ZStream {
+        ZStream::new()
+    }
 
     /// Helper: create a minimal `DeflateState` for testing the Huffman-only
     /// algorithm. Sets up a small window with controlled data and configures
@@ -374,7 +382,11 @@ mod tests {
 
         // Use Z_SYNC_FLUSH (not NO_FLUSH, not FINISH) to trigger
         // the break-out path.
-        let result = deflate_huff(&mut state, &mut dummy_strm() as *mut ZStream, crate::constants::Z_SYNC_FLUSH);
+        let result = deflate_huff(
+            &mut state,
+            &mut dummy_strm() as *mut ZStream,
+            crate::constants::Z_SYNC_FLUSH,
+        );
 
         assert_eq!(result, BlockState::BlockDone);
         assert_eq!(state.insert, 0);

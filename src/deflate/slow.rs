@@ -66,6 +66,10 @@
 
 use core::cmp::min;
 
+// In no_std mode, pull alloc types that the std prelude normally provides.
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::constants::{MIN_MATCH, Z_FILTERED, Z_FINISH, Z_NO_FLUSH};
 use crate::deflate::state::{BlockState, DeflateState, MIN_LOOKAHEAD};
 use crate::deflate::trees::{tally_dist, tally_lit, tr_flush_block};
@@ -252,7 +256,11 @@ fn longest_match(state: &mut DeflateState, cur_match: u16) -> usize {
     };
 
     let prev_length = state.prev_length;
-    let mut best_len = if prev_length > 0 { prev_length } else { MIN_MATCH - 1 };
+    let mut best_len = if prev_length > 0 {
+        prev_length
+    } else {
+        MIN_MATCH - 1
+    };
     let mut best_match = state.match_start;
 
     // If the previous match was long enough, reduce chain search depth.
@@ -372,7 +380,9 @@ pub(crate) fn deflate_slow(state: &mut DeflateState, strm: *mut ZStream, flush: 
         // ==================================================================
         if state.lookahead < MIN_LOOKAHEAD {
             // SAFETY: strm is valid for the duration of deflate().
-            unsafe { do_fill_window(state, strm); }
+            unsafe {
+                do_fill_window(state, strm);
+            }
             if state.lookahead < MIN_LOOKAHEAD && flush == Z_NO_FLUSH {
                 return BlockState::NeedMore;
             }
@@ -584,11 +594,7 @@ mod tests {
     /// Helper: create a minimal `DeflateState` for testing the lazy-match
     /// algorithm. Sets up a small window with controlled data and
     /// configures the state so that the compression loop can run.
-    fn make_test_state(
-        window_data: &[u8],
-        strstart: usize,
-        lookahead: usize,
-    ) -> DeflateState {
+    fn make_test_state(window_data: &[u8], strstart: usize, lookahead: usize) -> DeflateState {
         use crate::constants::Z_DEFAULT_STRATEGY;
 
         // Use minimal window/memory configuration
@@ -677,8 +683,7 @@ mod tests {
         if state.lookahead >= MIN_MATCH {
             // Initialize hash with first two bytes
             state.ins_h = state.window[0] as u32;
-            state.ins_h = ((state.ins_h << state.hash_shift as u32)
-                ^ state.window[1] as u32)
+            state.ins_h = ((state.ins_h << state.hash_shift as u32) ^ state.window[1] as u32)
                 & state.hash_mask;
         }
 
@@ -709,9 +714,8 @@ mod tests {
 
         // Initialize the hash with the first two bytes
         state.ins_h = state.window[0] as u32;
-        state.ins_h = ((state.ins_h << state.hash_shift as u32)
-            ^ state.window[1] as u32)
-            & state.hash_mask;
+        state.ins_h =
+            ((state.ins_h << state.hash_shift as u32) ^ state.window[1] as u32) & state.hash_mask;
 
         // Insert the string at position 0
         let head = insert_string(&mut state, 0);

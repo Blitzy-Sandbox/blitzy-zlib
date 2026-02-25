@@ -89,7 +89,7 @@ pub mod version;
 // ---------------------------------------------------------------------------
 
 // Compression utilities (from compress.c)
-pub use self::compress::{compress, compress2, compress_bound};
+pub use self::compress::{compress, compress_bound, compress2};
 
 // Decompression utilities (from uncompr.c)
 pub use self::uncompress::{uncompress, uncompress2};

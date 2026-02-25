@@ -57,6 +57,10 @@
 
 use core::cmp::min;
 
+// In no_std mode, pull alloc types that the std prelude normally provides.
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::constants::{MIN_MATCH, Z_FINISH, Z_NO_FLUSH};
 use crate::deflate::state::{BlockState, DeflateState, MIN_LOOKAHEAD};
 use crate::deflate::trees::{tally_dist, tally_lit, tr_flush_block};
@@ -353,7 +357,9 @@ pub(crate) fn deflate_fast(state: &mut DeflateState, strm: *mut ZStream, flush: 
         // ==================================================================
         if state.lookahead < MIN_LOOKAHEAD {
             // SAFETY: strm is valid for the duration of deflate().
-            unsafe { do_fill_window(state, strm); }
+            unsafe {
+                do_fill_window(state, strm);
+            }
             if state.lookahead < MIN_LOOKAHEAD && flush == Z_NO_FLUSH {
                 return BlockState::NeedMore;
             }
@@ -375,9 +381,7 @@ pub(crate) fn deflate_fast(state: &mut DeflateState, strm: *mut ZStream, flush: 
         // Step 3: Find the longest match, discarding those <= prev_length.
         // At this point we have always match_length < MIN_MATCH.
         // ==================================================================
-        if hash_head != NIL
-            && state.strstart - (hash_head as usize) <= max_dist(state)
-        {
+        if hash_head != NIL && state.strstart - (hash_head as usize) <= max_dist(state) {
             // To simplify the code, we prevent matches with the string
             // of window index 0 (in particular we have to avoid a match
             // of the string with itself at the start of the input file).
@@ -519,16 +523,14 @@ mod tests {
     use crate::deflate::trees::tr_init;
     use crate::stream::ZStream;
 
-    fn dummy_strm() -> ZStream { ZStream::new() }
+    fn dummy_strm() -> ZStream {
+        ZStream::new()
+    }
 
     /// Helper: create a minimal `DeflateState` for testing the greedy
     /// matching algorithm. Sets up a small window with controlled data
     /// and configures the state so that the compression loop can run.
-    fn make_test_state(
-        window_data: &[u8],
-        strstart: usize,
-        lookahead: usize,
-    ) -> DeflateState {
+    fn make_test_state(window_data: &[u8], strstart: usize, lookahead: usize) -> DeflateState {
         use crate::constants::Z_DEFAULT_STRATEGY;
 
         // Use minimal window/memory configuration.
@@ -537,8 +539,7 @@ mod tests {
         let level: usize = 1; // Fast compression level
         let wrap: i32 = 0; // raw deflate
 
-        let mut state =
-            DeflateState::new(w_bits, mem_level, level, Z_DEFAULT_STRATEGY, wrap);
+        let mut state = DeflateState::new(w_bits, mem_level, level, Z_DEFAULT_STRATEGY, wrap);
 
         // Initialize tree structures (descriptors, frequencies, block state).
         tr_init(&mut state);
@@ -613,9 +614,7 @@ mod tests {
         // Pre-initialize hash for the data — insert first MIN_MATCH - 1
         // bytes to warm up the hash.
         state.ins_h = data[0] as u32;
-        state.ins_h =
-            ((state.ins_h << state.hash_shift as u32) ^ data[1] as u32)
-                & state.hash_mask;
+        state.ins_h = ((state.ins_h << state.hash_shift as u32) ^ data[1] as u32) & state.hash_mask;
 
         let result = deflate_fast(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
         assert_eq!(result, BlockState::FinishDone);
@@ -633,8 +632,7 @@ mod tests {
         // Initialize hash for position 0.
         state.ins_h = state.window[0] as u32;
         state.ins_h =
-            ((state.ins_h << state.hash_shift as u32) ^ state.window[1] as u32)
-                & state.hash_mask;
+            ((state.ins_h << state.hash_shift as u32) ^ state.window[1] as u32) & state.hash_mask;
 
         let head = insert_string(&mut state, 0);
         assert_eq!(head, NIL);
@@ -657,9 +655,7 @@ mod tests {
 
         // Initialize hash state.
         state.ins_h = data[0] as u32;
-        state.ins_h =
-            ((state.ins_h << state.hash_shift as u32) ^ data[1] as u32)
-                & state.hash_mask;
+        state.ins_h = ((state.ins_h << state.hash_shift as u32) ^ data[1] as u32) & state.hash_mask;
 
         // First insert at position 0.
         let head1 = insert_string(&mut state, 0);
@@ -668,8 +664,7 @@ mod tests {
         // Re-seed hash for position 10.
         state.ins_h = data[10] as u32;
         state.ins_h =
-            ((state.ins_h << state.hash_shift as u32) ^ data[11] as u32)
-                & state.hash_mask;
+            ((state.ins_h << state.hash_shift as u32) ^ data[11] as u32) & state.hash_mask;
 
         // Second insert at position 10 should chain to position 0.
         let head2 = insert_string(&mut state, 10);

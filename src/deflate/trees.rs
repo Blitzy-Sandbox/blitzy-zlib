@@ -12,13 +12,10 @@
 //! - Bit-level output buffer management (`send_bits`, `bi_flush`, etc.)
 
 use crate::constants::{
-    BL_CODES, BUF_SIZE, D_CODES, DYN_TREES, HEAP_SIZE, LENGTH_CODES, LITERALS,
-    L_CODES, MAX_BITS, MAX_MATCH, MIN_MATCH, STATIC_TREES, STORED_BLOCK,
-    Z_BINARY, Z_FIXED, Z_TEXT,
+    BL_CODES, BUF_SIZE, D_CODES, DYN_TREES, HEAP_SIZE, L_CODES, LENGTH_CODES, LITERALS, MAX_BITS,
+    MAX_MATCH, MIN_MATCH, STATIC_TREES, STORED_BLOCK, Z_BINARY, Z_FIXED, Z_TEXT,
 };
-use crate::deflate::state::{
-    DeflateState, HuffmanNode, StaticTreeDesc, TreeType, END_BLOCK,
-};
+use crate::deflate::state::{DeflateState, END_BLOCK, HuffmanNode, StaticTreeDesc, TreeType};
 
 // ===========================================================================
 // Local constants (from trees.c lines 47–81)
@@ -49,20 +46,17 @@ const SMALLEST: usize = 1;
 
 /// Extra bits for each length code (0–28).
 const EXTRA_LBITS: [u8; LENGTH_CODES] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
-    3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 ];
 
 /// Extra bits for each distance code (0–29).
 const EXTRA_DBITS: [u8; D_CODES] = [
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
-    7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13,
 ];
 
 /// Extra bits for each bit-length code.
-const EXTRA_BLBITS: [u8; BL_CODES] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 7,
-];
+const EXTRA_BLBITS: [u8; BL_CODES] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 7];
 
 /// Order of the bit-length code lengths when transmitted in the compressed
 /// block header.  Per RFC 1951 §3.2.7.
@@ -82,153 +76,297 @@ const BL_ORDER: [u8; BL_CODES] = [
 /// Codes 256–279 : 7-bit codes 0x000–0x017 (reversed)
 /// Codes 280–287 : 8-bit codes 0x0C0–0x0C7 (reversed)
 pub(crate) const STATIC_LTREE: [HuffmanNode; L_CODES + 2] = [
-    HuffmanNode { fc:  12, dl: 8 }, HuffmanNode { fc: 140, dl: 8 },
-    HuffmanNode { fc:  76, dl: 8 }, HuffmanNode { fc: 204, dl: 8 },
-    HuffmanNode { fc:  44, dl: 8 }, HuffmanNode { fc: 172, dl: 8 },
-    HuffmanNode { fc: 108, dl: 8 }, HuffmanNode { fc: 236, dl: 8 },
-    HuffmanNode { fc:  28, dl: 8 }, HuffmanNode { fc: 156, dl: 8 },
-    HuffmanNode { fc:  92, dl: 8 }, HuffmanNode { fc: 220, dl: 8 },
-    HuffmanNode { fc:  60, dl: 8 }, HuffmanNode { fc: 188, dl: 8 },
-    HuffmanNode { fc: 124, dl: 8 }, HuffmanNode { fc: 252, dl: 8 },
-    HuffmanNode { fc:   2, dl: 8 }, HuffmanNode { fc: 130, dl: 8 },
-    HuffmanNode { fc:  66, dl: 8 }, HuffmanNode { fc: 194, dl: 8 },
-    HuffmanNode { fc:  34, dl: 8 }, HuffmanNode { fc: 162, dl: 8 },
-    HuffmanNode { fc:  98, dl: 8 }, HuffmanNode { fc: 226, dl: 8 },
-    HuffmanNode { fc:  18, dl: 8 }, HuffmanNode { fc: 146, dl: 8 },
-    HuffmanNode { fc:  82, dl: 8 }, HuffmanNode { fc: 210, dl: 8 },
-    HuffmanNode { fc:  50, dl: 8 }, HuffmanNode { fc: 178, dl: 8 },
-    HuffmanNode { fc: 114, dl: 8 }, HuffmanNode { fc: 242, dl: 8 },
-    HuffmanNode { fc:  10, dl: 8 }, HuffmanNode { fc: 138, dl: 8 },
-    HuffmanNode { fc:  74, dl: 8 }, HuffmanNode { fc: 202, dl: 8 },
-    HuffmanNode { fc:  42, dl: 8 }, HuffmanNode { fc: 170, dl: 8 },
-    HuffmanNode { fc: 106, dl: 8 }, HuffmanNode { fc: 234, dl: 8 },
-    HuffmanNode { fc:  26, dl: 8 }, HuffmanNode { fc: 154, dl: 8 },
-    HuffmanNode { fc:  90, dl: 8 }, HuffmanNode { fc: 218, dl: 8 },
-    HuffmanNode { fc:  58, dl: 8 }, HuffmanNode { fc: 186, dl: 8 },
-    HuffmanNode { fc: 122, dl: 8 }, HuffmanNode { fc: 250, dl: 8 },
-    HuffmanNode { fc:   6, dl: 8 }, HuffmanNode { fc: 134, dl: 8 },
-    HuffmanNode { fc:  70, dl: 8 }, HuffmanNode { fc: 198, dl: 8 },
-    HuffmanNode { fc:  38, dl: 8 }, HuffmanNode { fc: 166, dl: 8 },
-    HuffmanNode { fc: 102, dl: 8 }, HuffmanNode { fc: 230, dl: 8 },
-    HuffmanNode { fc:  22, dl: 8 }, HuffmanNode { fc: 150, dl: 8 },
-    HuffmanNode { fc:  86, dl: 8 }, HuffmanNode { fc: 214, dl: 8 },
-    HuffmanNode { fc:  54, dl: 8 }, HuffmanNode { fc: 182, dl: 8 },
-    HuffmanNode { fc: 118, dl: 8 }, HuffmanNode { fc: 246, dl: 8 },
-    HuffmanNode { fc:  14, dl: 8 }, HuffmanNode { fc: 142, dl: 8 },
-    HuffmanNode { fc:  78, dl: 8 }, HuffmanNode { fc: 206, dl: 8 },
-    HuffmanNode { fc:  46, dl: 8 }, HuffmanNode { fc: 174, dl: 8 },
-    HuffmanNode { fc: 110, dl: 8 }, HuffmanNode { fc: 238, dl: 8 },
-    HuffmanNode { fc:  30, dl: 8 }, HuffmanNode { fc: 158, dl: 8 },
-    HuffmanNode { fc:  94, dl: 8 }, HuffmanNode { fc: 222, dl: 8 },
-    HuffmanNode { fc:  62, dl: 8 }, HuffmanNode { fc: 190, dl: 8 },
-    HuffmanNode { fc: 126, dl: 8 }, HuffmanNode { fc: 254, dl: 8 },
-    HuffmanNode { fc:   1, dl: 8 }, HuffmanNode { fc: 129, dl: 8 },
-    HuffmanNode { fc:  65, dl: 8 }, HuffmanNode { fc: 193, dl: 8 },
-    HuffmanNode { fc:  33, dl: 8 }, HuffmanNode { fc: 161, dl: 8 },
-    HuffmanNode { fc:  97, dl: 8 }, HuffmanNode { fc: 225, dl: 8 },
-    HuffmanNode { fc:  17, dl: 8 }, HuffmanNode { fc: 145, dl: 8 },
-    HuffmanNode { fc:  81, dl: 8 }, HuffmanNode { fc: 209, dl: 8 },
-    HuffmanNode { fc:  49, dl: 8 }, HuffmanNode { fc: 177, dl: 8 },
-    HuffmanNode { fc: 113, dl: 8 }, HuffmanNode { fc: 241, dl: 8 },
-    HuffmanNode { fc:   9, dl: 8 }, HuffmanNode { fc: 137, dl: 8 },
-    HuffmanNode { fc:  73, dl: 8 }, HuffmanNode { fc: 201, dl: 8 },
-    HuffmanNode { fc:  41, dl: 8 }, HuffmanNode { fc: 169, dl: 8 },
-    HuffmanNode { fc: 105, dl: 8 }, HuffmanNode { fc: 233, dl: 8 },
-    HuffmanNode { fc:  25, dl: 8 }, HuffmanNode { fc: 153, dl: 8 },
-    HuffmanNode { fc:  89, dl: 8 }, HuffmanNode { fc: 217, dl: 8 },
-    HuffmanNode { fc:  57, dl: 8 }, HuffmanNode { fc: 185, dl: 8 },
-    HuffmanNode { fc: 121, dl: 8 }, HuffmanNode { fc: 249, dl: 8 },
-    HuffmanNode { fc:   5, dl: 8 }, HuffmanNode { fc: 133, dl: 8 },
-    HuffmanNode { fc:  69, dl: 8 }, HuffmanNode { fc: 197, dl: 8 },
-    HuffmanNode { fc:  37, dl: 8 }, HuffmanNode { fc: 165, dl: 8 },
-    HuffmanNode { fc: 101, dl: 8 }, HuffmanNode { fc: 229, dl: 8 },
-    HuffmanNode { fc:  21, dl: 8 }, HuffmanNode { fc: 149, dl: 8 },
-    HuffmanNode { fc:  85, dl: 8 }, HuffmanNode { fc: 213, dl: 8 },
-    HuffmanNode { fc:  53, dl: 8 }, HuffmanNode { fc: 181, dl: 8 },
-    HuffmanNode { fc: 117, dl: 8 }, HuffmanNode { fc: 245, dl: 8 },
-    HuffmanNode { fc:  13, dl: 8 }, HuffmanNode { fc: 141, dl: 8 },
-    HuffmanNode { fc:  77, dl: 8 }, HuffmanNode { fc: 205, dl: 8 },
-    HuffmanNode { fc:  45, dl: 8 }, HuffmanNode { fc: 173, dl: 8 },
-    HuffmanNode { fc: 109, dl: 8 }, HuffmanNode { fc: 237, dl: 8 },
-    HuffmanNode { fc:  29, dl: 8 }, HuffmanNode { fc: 157, dl: 8 },
+    HuffmanNode { fc: 12, dl: 8 },
+    HuffmanNode { fc: 140, dl: 8 },
+    HuffmanNode { fc: 76, dl: 8 },
+    HuffmanNode { fc: 204, dl: 8 },
+    HuffmanNode { fc: 44, dl: 8 },
+    HuffmanNode { fc: 172, dl: 8 },
+    HuffmanNode { fc: 108, dl: 8 },
+    HuffmanNode { fc: 236, dl: 8 },
+    HuffmanNode { fc: 28, dl: 8 },
+    HuffmanNode { fc: 156, dl: 8 },
+    HuffmanNode { fc: 92, dl: 8 },
+    HuffmanNode { fc: 220, dl: 8 },
+    HuffmanNode { fc: 60, dl: 8 },
+    HuffmanNode { fc: 188, dl: 8 },
+    HuffmanNode { fc: 124, dl: 8 },
+    HuffmanNode { fc: 252, dl: 8 },
+    HuffmanNode { fc: 2, dl: 8 },
+    HuffmanNode { fc: 130, dl: 8 },
+    HuffmanNode { fc: 66, dl: 8 },
+    HuffmanNode { fc: 194, dl: 8 },
+    HuffmanNode { fc: 34, dl: 8 },
+    HuffmanNode { fc: 162, dl: 8 },
+    HuffmanNode { fc: 98, dl: 8 },
+    HuffmanNode { fc: 226, dl: 8 },
+    HuffmanNode { fc: 18, dl: 8 },
+    HuffmanNode { fc: 146, dl: 8 },
+    HuffmanNode { fc: 82, dl: 8 },
+    HuffmanNode { fc: 210, dl: 8 },
+    HuffmanNode { fc: 50, dl: 8 },
+    HuffmanNode { fc: 178, dl: 8 },
+    HuffmanNode { fc: 114, dl: 8 },
+    HuffmanNode { fc: 242, dl: 8 },
+    HuffmanNode { fc: 10, dl: 8 },
+    HuffmanNode { fc: 138, dl: 8 },
+    HuffmanNode { fc: 74, dl: 8 },
+    HuffmanNode { fc: 202, dl: 8 },
+    HuffmanNode { fc: 42, dl: 8 },
+    HuffmanNode { fc: 170, dl: 8 },
+    HuffmanNode { fc: 106, dl: 8 },
+    HuffmanNode { fc: 234, dl: 8 },
+    HuffmanNode { fc: 26, dl: 8 },
+    HuffmanNode { fc: 154, dl: 8 },
+    HuffmanNode { fc: 90, dl: 8 },
+    HuffmanNode { fc: 218, dl: 8 },
+    HuffmanNode { fc: 58, dl: 8 },
+    HuffmanNode { fc: 186, dl: 8 },
+    HuffmanNode { fc: 122, dl: 8 },
+    HuffmanNode { fc: 250, dl: 8 },
+    HuffmanNode { fc: 6, dl: 8 },
+    HuffmanNode { fc: 134, dl: 8 },
+    HuffmanNode { fc: 70, dl: 8 },
+    HuffmanNode { fc: 198, dl: 8 },
+    HuffmanNode { fc: 38, dl: 8 },
+    HuffmanNode { fc: 166, dl: 8 },
+    HuffmanNode { fc: 102, dl: 8 },
+    HuffmanNode { fc: 230, dl: 8 },
+    HuffmanNode { fc: 22, dl: 8 },
+    HuffmanNode { fc: 150, dl: 8 },
+    HuffmanNode { fc: 86, dl: 8 },
+    HuffmanNode { fc: 214, dl: 8 },
+    HuffmanNode { fc: 54, dl: 8 },
+    HuffmanNode { fc: 182, dl: 8 },
+    HuffmanNode { fc: 118, dl: 8 },
+    HuffmanNode { fc: 246, dl: 8 },
+    HuffmanNode { fc: 14, dl: 8 },
+    HuffmanNode { fc: 142, dl: 8 },
+    HuffmanNode { fc: 78, dl: 8 },
+    HuffmanNode { fc: 206, dl: 8 },
+    HuffmanNode { fc: 46, dl: 8 },
+    HuffmanNode { fc: 174, dl: 8 },
+    HuffmanNode { fc: 110, dl: 8 },
+    HuffmanNode { fc: 238, dl: 8 },
+    HuffmanNode { fc: 30, dl: 8 },
+    HuffmanNode { fc: 158, dl: 8 },
+    HuffmanNode { fc: 94, dl: 8 },
+    HuffmanNode { fc: 222, dl: 8 },
+    HuffmanNode { fc: 62, dl: 8 },
+    HuffmanNode { fc: 190, dl: 8 },
+    HuffmanNode { fc: 126, dl: 8 },
+    HuffmanNode { fc: 254, dl: 8 },
+    HuffmanNode { fc: 1, dl: 8 },
+    HuffmanNode { fc: 129, dl: 8 },
+    HuffmanNode { fc: 65, dl: 8 },
+    HuffmanNode { fc: 193, dl: 8 },
+    HuffmanNode { fc: 33, dl: 8 },
+    HuffmanNode { fc: 161, dl: 8 },
+    HuffmanNode { fc: 97, dl: 8 },
+    HuffmanNode { fc: 225, dl: 8 },
+    HuffmanNode { fc: 17, dl: 8 },
+    HuffmanNode { fc: 145, dl: 8 },
+    HuffmanNode { fc: 81, dl: 8 },
+    HuffmanNode { fc: 209, dl: 8 },
+    HuffmanNode { fc: 49, dl: 8 },
+    HuffmanNode { fc: 177, dl: 8 },
+    HuffmanNode { fc: 113, dl: 8 },
+    HuffmanNode { fc: 241, dl: 8 },
+    HuffmanNode { fc: 9, dl: 8 },
+    HuffmanNode { fc: 137, dl: 8 },
+    HuffmanNode { fc: 73, dl: 8 },
+    HuffmanNode { fc: 201, dl: 8 },
+    HuffmanNode { fc: 41, dl: 8 },
+    HuffmanNode { fc: 169, dl: 8 },
+    HuffmanNode { fc: 105, dl: 8 },
+    HuffmanNode { fc: 233, dl: 8 },
+    HuffmanNode { fc: 25, dl: 8 },
+    HuffmanNode { fc: 153, dl: 8 },
+    HuffmanNode { fc: 89, dl: 8 },
+    HuffmanNode { fc: 217, dl: 8 },
+    HuffmanNode { fc: 57, dl: 8 },
+    HuffmanNode { fc: 185, dl: 8 },
+    HuffmanNode { fc: 121, dl: 8 },
+    HuffmanNode { fc: 249, dl: 8 },
+    HuffmanNode { fc: 5, dl: 8 },
+    HuffmanNode { fc: 133, dl: 8 },
+    HuffmanNode { fc: 69, dl: 8 },
+    HuffmanNode { fc: 197, dl: 8 },
+    HuffmanNode { fc: 37, dl: 8 },
+    HuffmanNode { fc: 165, dl: 8 },
+    HuffmanNode { fc: 101, dl: 8 },
+    HuffmanNode { fc: 229, dl: 8 },
+    HuffmanNode { fc: 21, dl: 8 },
+    HuffmanNode { fc: 149, dl: 8 },
+    HuffmanNode { fc: 85, dl: 8 },
+    HuffmanNode { fc: 213, dl: 8 },
+    HuffmanNode { fc: 53, dl: 8 },
+    HuffmanNode { fc: 181, dl: 8 },
+    HuffmanNode { fc: 117, dl: 8 },
+    HuffmanNode { fc: 245, dl: 8 },
+    HuffmanNode { fc: 13, dl: 8 },
+    HuffmanNode { fc: 141, dl: 8 },
+    HuffmanNode { fc: 77, dl: 8 },
+    HuffmanNode { fc: 205, dl: 8 },
+    HuffmanNode { fc: 45, dl: 8 },
+    HuffmanNode { fc: 173, dl: 8 },
+    HuffmanNode { fc: 109, dl: 8 },
+    HuffmanNode { fc: 237, dl: 8 },
+    HuffmanNode { fc: 29, dl: 8 },
+    HuffmanNode { fc: 157, dl: 8 },
     // --- entries 144–255 (9-bit codes) ---
-    HuffmanNode { fc:  93, dl: 8 }, HuffmanNode { fc: 221, dl: 8 },
-    HuffmanNode { fc:  61, dl: 8 }, HuffmanNode { fc: 189, dl: 8 },
-    HuffmanNode { fc: 125, dl: 8 }, HuffmanNode { fc: 253, dl: 8 },
-    HuffmanNode { fc:  19, dl: 9 }, HuffmanNode { fc: 275, dl: 9 },
-    HuffmanNode { fc: 147, dl: 9 }, HuffmanNode { fc: 403, dl: 9 },
-    HuffmanNode { fc:  83, dl: 9 }, HuffmanNode { fc: 339, dl: 9 },
-    HuffmanNode { fc: 211, dl: 9 }, HuffmanNode { fc: 467, dl: 9 },
-    HuffmanNode { fc:  51, dl: 9 }, HuffmanNode { fc: 307, dl: 9 },
-    HuffmanNode { fc: 179, dl: 9 }, HuffmanNode { fc: 435, dl: 9 },
-    HuffmanNode { fc: 115, dl: 9 }, HuffmanNode { fc: 371, dl: 9 },
-    HuffmanNode { fc: 243, dl: 9 }, HuffmanNode { fc: 499, dl: 9 },
-    HuffmanNode { fc:  11, dl: 9 }, HuffmanNode { fc: 267, dl: 9 },
-    HuffmanNode { fc: 139, dl: 9 }, HuffmanNode { fc: 395, dl: 9 },
-    HuffmanNode { fc:  75, dl: 9 }, HuffmanNode { fc: 331, dl: 9 },
-    HuffmanNode { fc: 203, dl: 9 }, HuffmanNode { fc: 459, dl: 9 },
-    HuffmanNode { fc:  43, dl: 9 }, HuffmanNode { fc: 299, dl: 9 },
-    HuffmanNode { fc: 171, dl: 9 }, HuffmanNode { fc: 427, dl: 9 },
-    HuffmanNode { fc: 107, dl: 9 }, HuffmanNode { fc: 363, dl: 9 },
-    HuffmanNode { fc: 235, dl: 9 }, HuffmanNode { fc: 491, dl: 9 },
-    HuffmanNode { fc:  27, dl: 9 }, HuffmanNode { fc: 283, dl: 9 },
-    HuffmanNode { fc: 155, dl: 9 }, HuffmanNode { fc: 411, dl: 9 },
-    HuffmanNode { fc:  91, dl: 9 }, HuffmanNode { fc: 347, dl: 9 },
-    HuffmanNode { fc: 219, dl: 9 }, HuffmanNode { fc: 475, dl: 9 },
-    HuffmanNode { fc:  59, dl: 9 }, HuffmanNode { fc: 315, dl: 9 },
-    HuffmanNode { fc: 187, dl: 9 }, HuffmanNode { fc: 443, dl: 9 },
-    HuffmanNode { fc: 123, dl: 9 }, HuffmanNode { fc: 379, dl: 9 },
-    HuffmanNode { fc: 251, dl: 9 }, HuffmanNode { fc: 507, dl: 9 },
-    HuffmanNode { fc:   7, dl: 9 }, HuffmanNode { fc: 263, dl: 9 },
-    HuffmanNode { fc: 135, dl: 9 }, HuffmanNode { fc: 391, dl: 9 },
-    HuffmanNode { fc:  71, dl: 9 }, HuffmanNode { fc: 327, dl: 9 },
-    HuffmanNode { fc: 199, dl: 9 }, HuffmanNode { fc: 455, dl: 9 },
-    HuffmanNode { fc:  39, dl: 9 }, HuffmanNode { fc: 295, dl: 9 },
-    HuffmanNode { fc: 167, dl: 9 }, HuffmanNode { fc: 423, dl: 9 },
-    HuffmanNode { fc: 103, dl: 9 }, HuffmanNode { fc: 359, dl: 9 },
-    HuffmanNode { fc: 231, dl: 9 }, HuffmanNode { fc: 487, dl: 9 },
-    HuffmanNode { fc:  23, dl: 9 }, HuffmanNode { fc: 279, dl: 9 },
-    HuffmanNode { fc: 151, dl: 9 }, HuffmanNode { fc: 407, dl: 9 },
-    HuffmanNode { fc:  87, dl: 9 }, HuffmanNode { fc: 343, dl: 9 },
-    HuffmanNode { fc: 215, dl: 9 }, HuffmanNode { fc: 471, dl: 9 },
-    HuffmanNode { fc:  55, dl: 9 }, HuffmanNode { fc: 311, dl: 9 },
-    HuffmanNode { fc: 183, dl: 9 }, HuffmanNode { fc: 439, dl: 9 },
-    HuffmanNode { fc: 119, dl: 9 }, HuffmanNode { fc: 375, dl: 9 },
-    HuffmanNode { fc: 247, dl: 9 }, HuffmanNode { fc: 503, dl: 9 },
-    HuffmanNode { fc:  15, dl: 9 }, HuffmanNode { fc: 271, dl: 9 },
-    HuffmanNode { fc: 143, dl: 9 }, HuffmanNode { fc: 399, dl: 9 },
-    HuffmanNode { fc:  79, dl: 9 }, HuffmanNode { fc: 335, dl: 9 },
-    HuffmanNode { fc: 207, dl: 9 }, HuffmanNode { fc: 463, dl: 9 },
-    HuffmanNode { fc:  47, dl: 9 }, HuffmanNode { fc: 303, dl: 9 },
-    HuffmanNode { fc: 175, dl: 9 }, HuffmanNode { fc: 431, dl: 9 },
-    HuffmanNode { fc: 111, dl: 9 }, HuffmanNode { fc: 367, dl: 9 },
-    HuffmanNode { fc: 239, dl: 9 }, HuffmanNode { fc: 495, dl: 9 },
-    HuffmanNode { fc:  31, dl: 9 }, HuffmanNode { fc: 287, dl: 9 },
-    HuffmanNode { fc: 159, dl: 9 }, HuffmanNode { fc: 415, dl: 9 },
-    HuffmanNode { fc:  95, dl: 9 }, HuffmanNode { fc: 351, dl: 9 },
-    HuffmanNode { fc: 223, dl: 9 }, HuffmanNode { fc: 479, dl: 9 },
-    HuffmanNode { fc:  63, dl: 9 }, HuffmanNode { fc: 319, dl: 9 },
-    HuffmanNode { fc: 191, dl: 9 }, HuffmanNode { fc: 447, dl: 9 },
-    HuffmanNode { fc: 127, dl: 9 }, HuffmanNode { fc: 383, dl: 9 },
-    HuffmanNode { fc: 255, dl: 9 }, HuffmanNode { fc: 511, dl: 9 },
+    HuffmanNode { fc: 93, dl: 8 },
+    HuffmanNode { fc: 221, dl: 8 },
+    HuffmanNode { fc: 61, dl: 8 },
+    HuffmanNode { fc: 189, dl: 8 },
+    HuffmanNode { fc: 125, dl: 8 },
+    HuffmanNode { fc: 253, dl: 8 },
+    HuffmanNode { fc: 19, dl: 9 },
+    HuffmanNode { fc: 275, dl: 9 },
+    HuffmanNode { fc: 147, dl: 9 },
+    HuffmanNode { fc: 403, dl: 9 },
+    HuffmanNode { fc: 83, dl: 9 },
+    HuffmanNode { fc: 339, dl: 9 },
+    HuffmanNode { fc: 211, dl: 9 },
+    HuffmanNode { fc: 467, dl: 9 },
+    HuffmanNode { fc: 51, dl: 9 },
+    HuffmanNode { fc: 307, dl: 9 },
+    HuffmanNode { fc: 179, dl: 9 },
+    HuffmanNode { fc: 435, dl: 9 },
+    HuffmanNode { fc: 115, dl: 9 },
+    HuffmanNode { fc: 371, dl: 9 },
+    HuffmanNode { fc: 243, dl: 9 },
+    HuffmanNode { fc: 499, dl: 9 },
+    HuffmanNode { fc: 11, dl: 9 },
+    HuffmanNode { fc: 267, dl: 9 },
+    HuffmanNode { fc: 139, dl: 9 },
+    HuffmanNode { fc: 395, dl: 9 },
+    HuffmanNode { fc: 75, dl: 9 },
+    HuffmanNode { fc: 331, dl: 9 },
+    HuffmanNode { fc: 203, dl: 9 },
+    HuffmanNode { fc: 459, dl: 9 },
+    HuffmanNode { fc: 43, dl: 9 },
+    HuffmanNode { fc: 299, dl: 9 },
+    HuffmanNode { fc: 171, dl: 9 },
+    HuffmanNode { fc: 427, dl: 9 },
+    HuffmanNode { fc: 107, dl: 9 },
+    HuffmanNode { fc: 363, dl: 9 },
+    HuffmanNode { fc: 235, dl: 9 },
+    HuffmanNode { fc: 491, dl: 9 },
+    HuffmanNode { fc: 27, dl: 9 },
+    HuffmanNode { fc: 283, dl: 9 },
+    HuffmanNode { fc: 155, dl: 9 },
+    HuffmanNode { fc: 411, dl: 9 },
+    HuffmanNode { fc: 91, dl: 9 },
+    HuffmanNode { fc: 347, dl: 9 },
+    HuffmanNode { fc: 219, dl: 9 },
+    HuffmanNode { fc: 475, dl: 9 },
+    HuffmanNode { fc: 59, dl: 9 },
+    HuffmanNode { fc: 315, dl: 9 },
+    HuffmanNode { fc: 187, dl: 9 },
+    HuffmanNode { fc: 443, dl: 9 },
+    HuffmanNode { fc: 123, dl: 9 },
+    HuffmanNode { fc: 379, dl: 9 },
+    HuffmanNode { fc: 251, dl: 9 },
+    HuffmanNode { fc: 507, dl: 9 },
+    HuffmanNode { fc: 7, dl: 9 },
+    HuffmanNode { fc: 263, dl: 9 },
+    HuffmanNode { fc: 135, dl: 9 },
+    HuffmanNode { fc: 391, dl: 9 },
+    HuffmanNode { fc: 71, dl: 9 },
+    HuffmanNode { fc: 327, dl: 9 },
+    HuffmanNode { fc: 199, dl: 9 },
+    HuffmanNode { fc: 455, dl: 9 },
+    HuffmanNode { fc: 39, dl: 9 },
+    HuffmanNode { fc: 295, dl: 9 },
+    HuffmanNode { fc: 167, dl: 9 },
+    HuffmanNode { fc: 423, dl: 9 },
+    HuffmanNode { fc: 103, dl: 9 },
+    HuffmanNode { fc: 359, dl: 9 },
+    HuffmanNode { fc: 231, dl: 9 },
+    HuffmanNode { fc: 487, dl: 9 },
+    HuffmanNode { fc: 23, dl: 9 },
+    HuffmanNode { fc: 279, dl: 9 },
+    HuffmanNode { fc: 151, dl: 9 },
+    HuffmanNode { fc: 407, dl: 9 },
+    HuffmanNode { fc: 87, dl: 9 },
+    HuffmanNode { fc: 343, dl: 9 },
+    HuffmanNode { fc: 215, dl: 9 },
+    HuffmanNode { fc: 471, dl: 9 },
+    HuffmanNode { fc: 55, dl: 9 },
+    HuffmanNode { fc: 311, dl: 9 },
+    HuffmanNode { fc: 183, dl: 9 },
+    HuffmanNode { fc: 439, dl: 9 },
+    HuffmanNode { fc: 119, dl: 9 },
+    HuffmanNode { fc: 375, dl: 9 },
+    HuffmanNode { fc: 247, dl: 9 },
+    HuffmanNode { fc: 503, dl: 9 },
+    HuffmanNode { fc: 15, dl: 9 },
+    HuffmanNode { fc: 271, dl: 9 },
+    HuffmanNode { fc: 143, dl: 9 },
+    HuffmanNode { fc: 399, dl: 9 },
+    HuffmanNode { fc: 79, dl: 9 },
+    HuffmanNode { fc: 335, dl: 9 },
+    HuffmanNode { fc: 207, dl: 9 },
+    HuffmanNode { fc: 463, dl: 9 },
+    HuffmanNode { fc: 47, dl: 9 },
+    HuffmanNode { fc: 303, dl: 9 },
+    HuffmanNode { fc: 175, dl: 9 },
+    HuffmanNode { fc: 431, dl: 9 },
+    HuffmanNode { fc: 111, dl: 9 },
+    HuffmanNode { fc: 367, dl: 9 },
+    HuffmanNode { fc: 239, dl: 9 },
+    HuffmanNode { fc: 495, dl: 9 },
+    HuffmanNode { fc: 31, dl: 9 },
+    HuffmanNode { fc: 287, dl: 9 },
+    HuffmanNode { fc: 159, dl: 9 },
+    HuffmanNode { fc: 415, dl: 9 },
+    HuffmanNode { fc: 95, dl: 9 },
+    HuffmanNode { fc: 351, dl: 9 },
+    HuffmanNode { fc: 223, dl: 9 },
+    HuffmanNode { fc: 479, dl: 9 },
+    HuffmanNode { fc: 63, dl: 9 },
+    HuffmanNode { fc: 319, dl: 9 },
+    HuffmanNode { fc: 191, dl: 9 },
+    HuffmanNode { fc: 447, dl: 9 },
+    HuffmanNode { fc: 127, dl: 9 },
+    HuffmanNode { fc: 383, dl: 9 },
+    HuffmanNode { fc: 255, dl: 9 },
+    HuffmanNode { fc: 511, dl: 9 },
     // --- entries 256–279 (7-bit codes) ---
-    HuffmanNode { fc:   0, dl: 7 }, HuffmanNode { fc:  64, dl: 7 },
-    HuffmanNode { fc:  32, dl: 7 }, HuffmanNode { fc:  96, dl: 7 },
-    HuffmanNode { fc:  16, dl: 7 }, HuffmanNode { fc:  80, dl: 7 },
-    HuffmanNode { fc:  48, dl: 7 }, HuffmanNode { fc: 112, dl: 7 },
-    HuffmanNode { fc:   8, dl: 7 }, HuffmanNode { fc:  72, dl: 7 },
-    HuffmanNode { fc:  40, dl: 7 }, HuffmanNode { fc: 104, dl: 7 },
-    HuffmanNode { fc:  24, dl: 7 }, HuffmanNode { fc:  88, dl: 7 },
-    HuffmanNode { fc:  56, dl: 7 }, HuffmanNode { fc: 120, dl: 7 },
-    HuffmanNode { fc:   4, dl: 7 }, HuffmanNode { fc:  68, dl: 7 },
-    HuffmanNode { fc:  36, dl: 7 }, HuffmanNode { fc: 100, dl: 7 },
-    HuffmanNode { fc:  20, dl: 7 }, HuffmanNode { fc:  84, dl: 7 },
-    HuffmanNode { fc:  52, dl: 7 }, HuffmanNode { fc: 116, dl: 7 },
+    HuffmanNode { fc: 0, dl: 7 },
+    HuffmanNode { fc: 64, dl: 7 },
+    HuffmanNode { fc: 32, dl: 7 },
+    HuffmanNode { fc: 96, dl: 7 },
+    HuffmanNode { fc: 16, dl: 7 },
+    HuffmanNode { fc: 80, dl: 7 },
+    HuffmanNode { fc: 48, dl: 7 },
+    HuffmanNode { fc: 112, dl: 7 },
+    HuffmanNode { fc: 8, dl: 7 },
+    HuffmanNode { fc: 72, dl: 7 },
+    HuffmanNode { fc: 40, dl: 7 },
+    HuffmanNode { fc: 104, dl: 7 },
+    HuffmanNode { fc: 24, dl: 7 },
+    HuffmanNode { fc: 88, dl: 7 },
+    HuffmanNode { fc: 56, dl: 7 },
+    HuffmanNode { fc: 120, dl: 7 },
+    HuffmanNode { fc: 4, dl: 7 },
+    HuffmanNode { fc: 68, dl: 7 },
+    HuffmanNode { fc: 36, dl: 7 },
+    HuffmanNode { fc: 100, dl: 7 },
+    HuffmanNode { fc: 20, dl: 7 },
+    HuffmanNode { fc: 84, dl: 7 },
+    HuffmanNode { fc: 52, dl: 7 },
+    HuffmanNode { fc: 116, dl: 7 },
     // --- entries 280–287 (8-bit codes) ---
-    HuffmanNode { fc:   3, dl: 8 }, HuffmanNode { fc: 131, dl: 8 },
-    HuffmanNode { fc:  67, dl: 8 }, HuffmanNode { fc: 195, dl: 8 },
-    HuffmanNode { fc:  35, dl: 8 }, HuffmanNode { fc: 163, dl: 8 },
-    HuffmanNode { fc:  99, dl: 8 }, HuffmanNode { fc: 227, dl: 8 },
+    HuffmanNode { fc: 3, dl: 8 },
+    HuffmanNode { fc: 131, dl: 8 },
+    HuffmanNode { fc: 67, dl: 8 },
+    HuffmanNode { fc: 195, dl: 8 },
+    HuffmanNode { fc: 35, dl: 8 },
+    HuffmanNode { fc: 163, dl: 8 },
+    HuffmanNode { fc: 99, dl: 8 },
+    HuffmanNode { fc: 227, dl: 8 },
 ];
 
 // ===========================================================================
@@ -238,21 +376,36 @@ pub(crate) const STATIC_LTREE: [HuffmanNode; L_CODES + 2] = [
 
 /// Pre-computed static distance Huffman tree (30 entries, all 5-bit codes).
 pub(crate) const STATIC_DTREE: [HuffmanNode; D_CODES] = [
-    HuffmanNode { fc:  0, dl: 5 }, HuffmanNode { fc: 16, dl: 5 },
-    HuffmanNode { fc:  8, dl: 5 }, HuffmanNode { fc: 24, dl: 5 },
-    HuffmanNode { fc:  4, dl: 5 }, HuffmanNode { fc: 20, dl: 5 },
-    HuffmanNode { fc: 12, dl: 5 }, HuffmanNode { fc: 28, dl: 5 },
-    HuffmanNode { fc:  2, dl: 5 }, HuffmanNode { fc: 18, dl: 5 },
-    HuffmanNode { fc: 10, dl: 5 }, HuffmanNode { fc: 26, dl: 5 },
-    HuffmanNode { fc:  6, dl: 5 }, HuffmanNode { fc: 22, dl: 5 },
-    HuffmanNode { fc: 14, dl: 5 }, HuffmanNode { fc: 30, dl: 5 },
-    HuffmanNode { fc:  1, dl: 5 }, HuffmanNode { fc: 17, dl: 5 },
-    HuffmanNode { fc:  9, dl: 5 }, HuffmanNode { fc: 25, dl: 5 },
-    HuffmanNode { fc:  5, dl: 5 }, HuffmanNode { fc: 21, dl: 5 },
-    HuffmanNode { fc: 13, dl: 5 }, HuffmanNode { fc: 29, dl: 5 },
-    HuffmanNode { fc:  3, dl: 5 }, HuffmanNode { fc: 19, dl: 5 },
-    HuffmanNode { fc: 11, dl: 5 }, HuffmanNode { fc: 27, dl: 5 },
-    HuffmanNode { fc:  7, dl: 5 }, HuffmanNode { fc: 23, dl: 5 },
+    HuffmanNode { fc: 0, dl: 5 },
+    HuffmanNode { fc: 16, dl: 5 },
+    HuffmanNode { fc: 8, dl: 5 },
+    HuffmanNode { fc: 24, dl: 5 },
+    HuffmanNode { fc: 4, dl: 5 },
+    HuffmanNode { fc: 20, dl: 5 },
+    HuffmanNode { fc: 12, dl: 5 },
+    HuffmanNode { fc: 28, dl: 5 },
+    HuffmanNode { fc: 2, dl: 5 },
+    HuffmanNode { fc: 18, dl: 5 },
+    HuffmanNode { fc: 10, dl: 5 },
+    HuffmanNode { fc: 26, dl: 5 },
+    HuffmanNode { fc: 6, dl: 5 },
+    HuffmanNode { fc: 22, dl: 5 },
+    HuffmanNode { fc: 14, dl: 5 },
+    HuffmanNode { fc: 30, dl: 5 },
+    HuffmanNode { fc: 1, dl: 5 },
+    HuffmanNode { fc: 17, dl: 5 },
+    HuffmanNode { fc: 9, dl: 5 },
+    HuffmanNode { fc: 25, dl: 5 },
+    HuffmanNode { fc: 5, dl: 5 },
+    HuffmanNode { fc: 21, dl: 5 },
+    HuffmanNode { fc: 13, dl: 5 },
+    HuffmanNode { fc: 29, dl: 5 },
+    HuffmanNode { fc: 3, dl: 5 },
+    HuffmanNode { fc: 19, dl: 5 },
+    HuffmanNode { fc: 11, dl: 5 },
+    HuffmanNode { fc: 27, dl: 5 },
+    HuffmanNode { fc: 7, dl: 5 },
+    HuffmanNode { fc: 23, dl: 5 },
 ];
 
 // ===========================================================================
@@ -261,38 +414,27 @@ pub(crate) const STATIC_DTREE: [HuffmanNode; D_CODES] = [
 
 /// Maps a distance value (or distance >> 7 + 256) to a distance code (0-29).
 pub(crate) const DIST_CODE: [u8; DIST_CODE_LEN] = [
-     0,  1,  2,  3,  4,  4,  5,  5,  6,  6,  6,  6,  7,  7,  7,  7,
-     8,  8,  8,  8,  8,  8,  8,  8,  9,  9,  9,  9,  9,  9,  9,  9,
-    10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
-    11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,
-    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
-    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
-    13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
-    13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
-    14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
-    14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
-    14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
-    14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
-    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-     0,  0, 16, 17, 18, 18, 19, 19, 20, 20, 20, 20, 21, 21, 21, 21,
-    22, 22, 22, 22, 22, 22, 22, 22, 23, 23, 23, 23, 23, 23, 23, 23,
-    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
-    25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25,
-    26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26,
-    26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26,
-    27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
-    27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
-    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
-    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
-    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
-    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
-    29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29,
-    29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29,
-    29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29,
-    29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29,
+    0, 1, 2, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9,
+    10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11,
+    11, 11, 11, 11, 11, 11, 11, 11, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13,
+    13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+    14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+    14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+    14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15, 0, 0, 16, 17, 18, 18, 19, 19, 20, 20, 20, 20, 21, 21, 21, 21,
+    22, 22, 22, 22, 22, 22, 22, 22, 23, 23, 23, 23, 23, 23, 23, 23, 24, 24, 24, 24, 24, 24, 24, 24,
+    24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25,
+    26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26,
+    26, 26, 26, 26, 26, 26, 26, 26, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
+    27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 28, 28, 28, 28, 28, 28, 28, 28,
+    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    28, 28, 28, 28, 28, 28, 28, 28, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29,
+    29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29,
+    29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29,
 ];
 
 // ===========================================================================
@@ -302,22 +444,17 @@ pub(crate) const DIST_CODE: [u8; DIST_CODE_LEN] = [
 
 /// Maps (match_length - MIN_MATCH) to a length code (0-28).
 pub(crate) const LENGTH_CODE: [u8; MAX_MATCH - MIN_MATCH + 1] = [
-     0,  1,  2,  3,  4,  5,  6,  7,  8,  8,  9,  9, 10, 10, 11, 11,
-    12, 12, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15,
-    16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 17, 17, 17, 17,
-    18, 18, 18, 18, 18, 18, 18, 18, 19, 19, 19, 19, 19, 19, 19, 19,
-    20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20,
-    21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21,
-    22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22,
-    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
-    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
-    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
-    25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25,
-    25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25,
-    26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26,
-    26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26,
-    27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
-    27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 28,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 12, 12, 13, 13, 13, 13, 14, 14, 14,
+    14, 15, 15, 15, 15, 16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 17, 17, 17, 17, 18, 18, 18,
+    18, 18, 18, 18, 18, 19, 19, 19, 19, 19, 19, 19, 19, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20,
+    20, 20, 20, 20, 20, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 22, 22, 22,
+    22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+    23, 23, 23, 23, 23, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25,
+    25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 26, 26, 26,
+    26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26,
+    26, 26, 26, 26, 26, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27,
+    27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 28,
 ];
 
 // ===========================================================================
@@ -326,16 +463,14 @@ pub(crate) const LENGTH_CODE: [u8; MAX_MATCH - MIN_MATCH + 1] = [
 
 /// Base length value for each length code (0-28).
 pub(crate) const BASE_LENGTH: [i32; LENGTH_CODES] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28,
-    32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 0,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128,
+    160, 192, 224, 0,
 ];
 
 /// Base distance value for each distance code (0-29).
 pub(crate) const BASE_DIST: [i32; D_CODES] = [
-        0,     1,     2,     3,     4,     6,     8,    12,
-       16,    24,    32,    48,    64,    96,   128,   192,
-      256,   384,   512,   768,  1024,  1536,  2048,  3072,
-     4096,  6144,  8192, 12288, 16384, 24576,
+    0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536,
+    2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576,
 ];
 
 // ===========================================================================
@@ -377,8 +512,8 @@ pub(crate) static STATIC_BL_DESC: StaticTreeDesc = StaticTreeDesc {
 #[inline(always)]
 fn tree_fc(state: &DeflateState, tt: TreeType, idx: usize) -> u16 {
     match tt {
-        TreeType::Literal   => state.dyn_ltree[idx].fc,
-        TreeType::Distance  => state.dyn_dtree[idx].fc,
+        TreeType::Literal => state.dyn_ltree[idx].fc,
+        TreeType::Distance => state.dyn_dtree[idx].fc,
         TreeType::BitLength => state.bl_tree[idx].fc,
     }
 }
@@ -387,8 +522,8 @@ fn tree_fc(state: &DeflateState, tt: TreeType, idx: usize) -> u16 {
 #[inline(always)]
 fn set_tree_fc(state: &mut DeflateState, tt: TreeType, idx: usize, val: u16) {
     match tt {
-        TreeType::Literal   => state.dyn_ltree[idx].fc = val,
-        TreeType::Distance  => state.dyn_dtree[idx].fc = val,
+        TreeType::Literal => state.dyn_ltree[idx].fc = val,
+        TreeType::Distance => state.dyn_dtree[idx].fc = val,
         TreeType::BitLength => state.bl_tree[idx].fc = val,
     }
 }
@@ -397,8 +532,8 @@ fn set_tree_fc(state: &mut DeflateState, tt: TreeType, idx: usize, val: u16) {
 #[inline(always)]
 fn tree_dl(state: &DeflateState, tt: TreeType, idx: usize) -> u16 {
     match tt {
-        TreeType::Literal   => state.dyn_ltree[idx].dl,
-        TreeType::Distance  => state.dyn_dtree[idx].dl,
+        TreeType::Literal => state.dyn_ltree[idx].dl,
+        TreeType::Distance => state.dyn_dtree[idx].dl,
         TreeType::BitLength => state.bl_tree[idx].dl,
     }
 }
@@ -407,8 +542,8 @@ fn tree_dl(state: &DeflateState, tt: TreeType, idx: usize) -> u16 {
 #[inline(always)]
 fn set_tree_dl(state: &mut DeflateState, tt: TreeType, idx: usize, val: u16) {
     match tt {
-        TreeType::Literal   => state.dyn_ltree[idx].dl = val,
-        TreeType::Distance  => state.dyn_dtree[idx].dl = val,
+        TreeType::Literal => state.dyn_ltree[idx].dl = val,
+        TreeType::Distance => state.dyn_dtree[idx].dl = val,
         TreeType::BitLength => state.bl_tree[idx].dl = val,
     }
 }
@@ -418,8 +553,8 @@ fn set_tree_dl(state: &mut DeflateState, tt: TreeType, idx: usize, val: u16) {
 #[inline(always)]
 fn inc_tree_fc(state: &mut DeflateState, tt: TreeType, idx: usize) {
     match tt {
-        TreeType::Literal   => state.dyn_ltree[idx].fc = state.dyn_ltree[idx].fc.wrapping_add(1),
-        TreeType::Distance  => state.dyn_dtree[idx].fc = state.dyn_dtree[idx].fc.wrapping_add(1),
+        TreeType::Literal => state.dyn_ltree[idx].fc = state.dyn_ltree[idx].fc.wrapping_add(1),
+        TreeType::Distance => state.dyn_dtree[idx].fc = state.dyn_dtree[idx].fc.wrapping_add(1),
         TreeType::BitLength => state.bl_tree[idx].fc = state.bl_tree[idx].fc.wrapping_add(1),
     }
 }
@@ -602,13 +737,13 @@ fn pqdownheap(state: &mut DeflateState, tt: TreeType, mut k: usize) {
 /// constraint. Updates bl_count, opt_len, and static_len in state.
 fn gen_bitlen(state: &mut DeflateState, tt: TreeType) {
     let stat_desc: &'static StaticTreeDesc = match tt {
-        TreeType::Literal   => state.l_desc.stat_desc,
-        TreeType::Distance  => state.d_desc.stat_desc,
+        TreeType::Literal => state.l_desc.stat_desc,
+        TreeType::Distance => state.d_desc.stat_desc,
         TreeType::BitLength => state.bl_desc.stat_desc,
     };
     let max_code = match tt {
-        TreeType::Literal   => state.l_desc.max_code,
-        TreeType::Distance  => state.d_desc.max_code,
+        TreeType::Literal => state.l_desc.max_code,
+        TreeType::Distance => state.d_desc.max_code,
         TreeType::BitLength => state.bl_desc.max_code,
     };
     let stree = stat_desc.static_tree;
@@ -645,9 +780,13 @@ fn gen_bitlen(state: &mut DeflateState, tt: TreeType) {
         let f = tree_fc(state, tt, n) as u64;
         // Use wrapping arithmetic — C zlib relies on unsigned modular math
         // when filler nodes cause opt_len to underflow temporarily.
-        state.opt_len = state.opt_len.wrapping_add(f.wrapping_mul((bits as u32 + xbits) as u64));
+        state.opt_len = state
+            .opt_len
+            .wrapping_add(f.wrapping_mul((bits as u32 + xbits) as u64));
         if let Some(st) = stree {
-            state.static_len = state.static_len.wrapping_add(f.wrapping_mul((st[n].dl as u32 + xbits) as u64));
+            state.static_len = state
+                .static_len
+                .wrapping_add(f.wrapping_mul((st[n].dl as u32 + xbits) as u64));
         }
     }
 
@@ -682,8 +821,7 @@ fn gen_bitlen(state: &mut DeflateState, tt: TreeType) {
             }
             let cur_len = tree_dl(state, tt, m) as u64;
             if cur_len != bits as u64 {
-                let adj = (bits as i64 - cur_len as i64)
-                    * tree_fc(state, tt, m) as i64;
+                let adj = (bits as i64 - cur_len as i64) * tree_fc(state, tt, m) as i64;
                 state.opt_len = (state.opt_len as i64).wrapping_add(adj) as u64;
                 set_tree_dl(state, tt, m, bits as u16);
             }
@@ -697,8 +835,8 @@ fn gen_bitlen(state: &mut DeflateState, tt: TreeType) {
 /// contains canonical Huffman codes and the descriptor's max_code is updated.
 fn build_tree(state: &mut DeflateState, tt: TreeType) {
     let stat_desc: &'static StaticTreeDesc = match tt {
-        TreeType::Literal   => state.l_desc.stat_desc,
-        TreeType::Distance  => state.d_desc.stat_desc,
+        TreeType::Literal => state.l_desc.stat_desc,
+        TreeType::Distance => state.d_desc.stat_desc,
         TreeType::BitLength => state.bl_desc.stat_desc,
     };
     let elems = stat_desc.elems;
@@ -743,8 +881,8 @@ fn build_tree(state: &mut DeflateState, tt: TreeType) {
 
     // Store max_code in the descriptor.
     match tt {
-        TreeType::Literal   => state.l_desc.max_code = max_code,
-        TreeType::Distance  => state.d_desc.max_code = max_code,
+        TreeType::Literal => state.l_desc.max_code = max_code,
+        TreeType::Distance => state.d_desc.max_code = max_code,
         TreeType::BitLength => state.bl_desc.max_code = max_code,
     }
 
@@ -796,8 +934,8 @@ fn build_tree(state: &mut DeflateState, tt: TreeType) {
     // Compute optimal bit-lengths and generate canonical codes.
     gen_bitlen(state, tt);
     let mc = match tt {
-        TreeType::Literal   => state.l_desc.max_code,
-        TreeType::Distance  => state.d_desc.max_code,
+        TreeType::Literal => state.l_desc.max_code,
+        TreeType::Distance => state.d_desc.max_code,
         TreeType::BitLength => state.bl_desc.max_code,
     };
     gen_codes(state, tt, mc as usize);
@@ -1034,10 +1172,7 @@ fn detect_data_type(state: &DeflateState) -> i32 {
             return Z_TEXT;
         }
     }
-    if state.dyn_ltree[9].fc != 0
-        || state.dyn_ltree[10].fc != 0
-        || state.dyn_ltree[13].fc != 0
-    {
+    if state.dyn_ltree[9].fc != 0 || state.dyn_ltree[10].fc != 0 || state.dyn_ltree[13].fc != 0 {
         return Z_TEXT;
     }
 
@@ -1120,12 +1255,7 @@ pub fn tr_align(state: &mut DeflateState) {
 
 /// Determine the best block type (stored, static, or dynamic Huffman),
 /// output the block, and reset for the next one.
-pub fn tr_flush_block(
-    state: &mut DeflateState,
-    buf: Option<&[u8]>,
-    stored_len: u64,
-    last: bool,
-) {
+pub fn tr_flush_block(state: &mut DeflateState, buf: Option<&[u8]>, stored_len: u64, last: bool) {
     let opt_lenb: u64;
     let static_lenb: u64;
     let mut max_blindex: usize = 0;

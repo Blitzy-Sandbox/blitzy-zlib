@@ -190,4 +190,3 @@ pub(crate) const DISTFIX: [Code; 32] = [
     Code::new(16, 5, 4), Code::new(24, 5, 769), Code::new(20, 5, 49), Code::new(28, 5, 12289),
     Code::new(18, 5, 13), Code::new(26, 5, 3073), Code::new(22, 5, 193), Code::new(64, 5, 0),
 ];
-

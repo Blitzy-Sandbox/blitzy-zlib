@@ -220,26 +220,18 @@ pub(crate) fn gz_comp(state: &mut GzState, flush: i32) -> Result<(), ZlibError> 
         //  For Z_FINISH, wait until Z_STREAM_END so the complete trailer
         //  is written in one shot.
         let should_write = state.strm.avail_out == 0
-            || (flush != Z_NO_FLUSH
-                && (flush != Z_FINISH || ret == ReturnCode::StreamEnd));
+            || (flush != Z_NO_FLUSH && (flush != Z_FINISH || ret == ReturnCode::StreamEnd));
 
         if should_write && out_pos > state.next {
             let write_result = {
                 let data = &state.out_buf[state.next..out_pos];
                 match state.file.as_mut() {
                     Some(f) => f.write_all(data),
-                    None => Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "no file handle",
-                    )),
+                    None => Err(io::Error::new(io::ErrorKind::Other, "no file handle")),
                 }
             };
             if let Err(e) = write_result {
-                gz_error(
-                    state,
-                    Some(ZlibError::Errno),
-                    Some(e.to_string()),
-                );
+                gz_error(state, Some(ZlibError::Errno), Some(e.to_string()));
                 return Err(ZlibError::Errno);
             }
             state.next = out_pos;
@@ -340,10 +332,7 @@ pub(crate) fn gz_zero(state: &mut GzState, mut remaining: u64) -> Result<(), Zli
                 let data = &state.in_buf[..n];
                 match state.file.as_mut() {
                     Some(f) => f.write_all(data),
-                    None => Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "no file handle",
-                    )),
+                    None => Err(io::Error::new(io::ErrorKind::Other, "no file handle")),
                 }
             };
             if let Err(e) = write_result {
@@ -470,8 +459,7 @@ fn gz_write_internal(state: &mut GzState, buf: &[u8]) -> Result<usize, ZlibError
             let copy = core::cmp::min(space, len - offset);
 
             // Copy caller's data into in_buf.
-            state.in_buf[have..have + copy]
-                .copy_from_slice(&buf[offset..offset + copy]);
+            state.in_buf[have..have + copy].copy_from_slice(&buf[offset..offset + copy]);
             state.strm.avail_in += copy as u32;
             state.pos += copy as u64;
             offset += copy;

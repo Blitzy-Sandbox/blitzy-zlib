@@ -22,7 +22,11 @@
 //! | `block_state` enum (deflate.c:63-68) | [`BlockState`] |
 //! | State constants (INIT_STATE..FINISH_STATE) | [`DeflateStatus`] |
 
-use crate::constants::{MAX_MATCH, MIN_MATCH, Z_DEFLATED, Z_DEFAULT_STRATEGY, Z_UNKNOWN};
+// In no_std mode, pull alloc types that the std prelude normally provides.
+#[cfg(not(feature = "std"))]
+use alloc::{vec, vec::Vec};
+
+use crate::constants::{MAX_MATCH, MIN_MATCH, Z_DEFAULT_STRATEGY, Z_DEFLATED, Z_UNKNOWN};
 use crate::gz_header::GzHeader;
 
 // ===========================================================================
@@ -553,13 +557,7 @@ impl DeflateState {
     /// - `level`: compression level 0..=9.
     /// - `strategy`: compression strategy (e.g., `Z_DEFAULT_STRATEGY`).
     /// - `wrap`: wrapping mode (0 = raw, 1 = zlib, 2 = gzip).
-    pub fn new(
-        w_bits: usize,
-        mem_level: usize,
-        level: usize,
-        strategy: i32,
-        wrap: i32,
-    ) -> Self {
+    pub fn new(w_bits: usize, mem_level: usize, level: usize, strategy: i32, wrap: i32) -> Self {
         // Derived window parameters
         let w_size: usize = 1 << w_bits;
         let w_mask: usize = w_size - 1;

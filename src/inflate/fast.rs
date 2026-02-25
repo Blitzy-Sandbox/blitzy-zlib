@@ -36,13 +36,7 @@ use super::tables::Code;
 /// - `from < *out_pos` (source region precedes destination)
 #[allow(dead_code)] // Called by inflate_fast; unused until mod.rs calls inflate_fast
 #[inline(always)]
-unsafe fn copy_match(
-    output: &mut [u8],
-    from: usize,
-    out_pos: &mut usize,
-    dist: usize,
-    len: usize,
-) {
+unsafe fn copy_match(output: &mut [u8], from: usize, out_pos: &mut usize, dist: usize, len: usize) {
     // SAFETY: All pointer arithmetic and dereferences below are valid because
     // the caller guarantees:
     //   - from + len <= output.len()
@@ -272,8 +266,7 @@ pub(crate) fn inflate_fast(
 
                         // Validate maximum distance (INFLATE_STRICT)
                         if state.sane && dist > state.dmax as usize {
-                            state.msg =
-                                Some("invalid distance too far back".into());
+                            state.msg = Some("invalid distance too far back".into());
                             state.mode = InflateMode::Bad;
                             break 'outer;
                         }
@@ -294,17 +287,12 @@ pub(crate) fn inflate_fast(
                                 // always an error (safe Rust cannot access
                                 // memory beyond window bounds regardless of
                                 // the sane flag).
-                                state.msg = Some(
-                                    "invalid distance too far back".into(),
-                                );
+                                state.msg = Some("invalid distance too far back".into());
                                 state.mode = InflateMode::Bad;
                                 break 'outer;
                             }
 
-                            copy_from_window(
-                                state, output, out_pos, dist, len, op,
-                                wsize, wnext,
-                            );
+                            copy_from_window(state, output, out_pos, dist, len, op, wsize, wnext);
                         } else {
                             // ================================================
                             // Common fast path: copy from already-written
@@ -341,10 +329,8 @@ pub(crate) fn inflate_fast(
                     // ---- 2nd-level distance code (op & 64 == 0) ----
                     // (inffast.c lines 264-267)
                     if op & 64 == 0 {
-                        here = state.dist_code(
-                            here.val as usize
-                                + ((hold & ((1u64 << op) - 1)) as usize),
-                        );
+                        here = state
+                            .dist_code(here.val as usize + ((hold & ((1u64 << op) - 1)) as usize));
                         continue 'dodist;
                     }
 
@@ -361,10 +347,7 @@ pub(crate) fn inflate_fast(
             // ---- Case 3: 2nd-level length code (op & 64 == 0) ----
             // (inffast.c lines 274-277)
             if op & 64 == 0 {
-                here = state.len_code(
-                    here.val as usize
-                        + ((hold & ((1u64 << op) - 1)) as usize),
-                );
+                here = state.len_code(here.val as usize + ((hold & ((1u64 << op) - 1)) as usize));
                 continue 'dolen;
             }
 
@@ -622,7 +605,7 @@ mod tests {
         // In real inflate tables, EOB has op = 32|64 = 96 (set by inflate_table).
         let len_codes = vec![
             Code::new(0, 1, b'X' as u16), // code 0 => literal 'X'
-            Code::new(96, 1, 0),           // code 1 => EOB (op=32+64)
+            Code::new(96, 1, 0),          // code 1 => EOB (op=32+64)
         ];
         let dist_codes = vec![Code::new(0, 1, 0); 2];
         let mut state = make_state(&len_codes, &dist_codes, 1, 1);
@@ -633,7 +616,14 @@ mod tests {
         let mut in_pos = 0;
         let mut out_pos = 0;
 
-        inflate_fast(&mut state, &input, &mut output, &mut in_pos, &mut out_pos, 0);
+        inflate_fast(
+            &mut state,
+            &input,
+            &mut output,
+            &mut in_pos,
+            &mut out_pos,
+            0,
+        );
 
         assert_eq!(out_pos, 1);
         assert_eq!(output[0], b'X');
@@ -658,7 +648,14 @@ mod tests {
         let mut in_pos = 0;
         let mut out_pos = 0;
 
-        inflate_fast(&mut state, &input, &mut output, &mut in_pos, &mut out_pos, 0);
+        inflate_fast(
+            &mut state,
+            &input,
+            &mut output,
+            &mut in_pos,
+            &mut out_pos,
+            0,
+        );
 
         assert_eq!(out_pos, 3);
         assert_eq!(&output[..3], b"ABC");
@@ -680,7 +677,14 @@ mod tests {
         let mut in_pos = 0;
         let mut out_pos = 0;
 
-        inflate_fast(&mut state, &input, &mut output, &mut in_pos, &mut out_pos, 0);
+        inflate_fast(
+            &mut state,
+            &input,
+            &mut output,
+            &mut in_pos,
+            &mut out_pos,
+            0,
+        );
 
         assert_eq!(out_pos, 0);
         assert_eq!(state.mode, InflateMode::Type);
@@ -701,10 +705,23 @@ mod tests {
         let mut in_pos = 0;
         let mut out_pos = 0;
 
-        inflate_fast(&mut state, &input, &mut output, &mut in_pos, &mut out_pos, 0);
+        inflate_fast(
+            &mut state,
+            &input,
+            &mut output,
+            &mut in_pos,
+            &mut out_pos,
+            0,
+        );
 
         assert_eq!(state.mode, InflateMode::Bad);
-        assert!(state.msg.as_ref().unwrap().contains("invalid literal/length code"));
+        assert!(
+            state
+                .msg
+                .as_ref()
+                .unwrap()
+                .contains("invalid literal/length code")
+        );
     }
 
     /// State restoration puts bits < 8 back into hold.
@@ -713,8 +730,8 @@ mod tests {
         // With 0xFF input, hold & 1 = 1, so code index 1 is looked up.
         // Put EOB at index 1 so it's hit immediately.
         let len_codes = vec![
-            Code::new(0, 1, 0),   // code 0 => literal (not reached)
-            Code::new(96, 1, 0),  // code 1 => EOB (op=32+64)
+            Code::new(0, 1, 0),  // code 0 => literal (not reached)
+            Code::new(96, 1, 0), // code 1 => EOB (op=32+64)
         ];
         let dist_codes = vec![Code::new(0, 1, 0); 2];
         let mut state = make_state(&len_codes, &dist_codes, 1, 1);
@@ -726,10 +743,21 @@ mod tests {
         let mut in_pos = 0;
         let mut out_pos = 0;
 
-        inflate_fast(&mut state, &input, &mut output, &mut in_pos, &mut out_pos, 0);
+        inflate_fast(
+            &mut state,
+            &input,
+            &mut output,
+            &mut in_pos,
+            &mut out_pos,
+            0,
+        );
 
         assert_eq!(state.mode, InflateMode::Type);
-        assert!(state.bits < 8, "bits should be < 8 after restoration, got {}", state.bits);
+        assert!(
+            state.bits < 8,
+            "bits should be < 8 after restoration, got {}",
+            state.bits
+        );
     }
 
     /// Window copy sub-case A: wnext == 0 (no wrap).
@@ -737,16 +765,13 @@ mod tests {
     fn test_inflate_fast_window_copy_no_wrap() {
         // Length code: op=16 (length, 0 extra), bits=2, val=3 (base=3)
         let len_codes = vec![
-            Code::new(16, 2, 3),  // code 00 => length 3
-            Code::new(96, 2, 0),  // code 01 => EOB (op=32+64)
+            Code::new(16, 2, 3), // code 00 => length 3
+            Code::new(96, 2, 0), // code 01 => EOB (op=32+64)
             Code::new(0, 2, 0),
             Code::new(0, 2, 0),
         ];
         // Distance code: op=16 (dist, 0 extra), bits=1, val=1 (dist=1)
-        let dist_codes = vec![
-            Code::new(16, 1, 1),
-            Code::new(16, 1, 2),
-        ];
+        let dist_codes = vec![Code::new(16, 1, 1), Code::new(16, 1, 2)];
         let mut state = make_state(&len_codes, &dist_codes, 2, 1);
         state.wsize = 32768;
         state.whave = 5;
@@ -761,7 +786,14 @@ mod tests {
         let mut in_pos = 0;
         let mut out_pos = 0;
 
-        inflate_fast(&mut state, &input, &mut output, &mut in_pos, &mut out_pos, 0);
+        inflate_fast(
+            &mut state,
+            &input,
+            &mut output,
+            &mut in_pos,
+            &mut out_pos,
+            0,
+        );
 
         assert_eq!(state.mode, InflateMode::Type);
         assert_eq!(out_pos, 3);
@@ -772,8 +804,8 @@ mod tests {
     #[test]
     fn test_inflate_fast_window_copy_contiguous() {
         let len_codes = vec![
-            Code::new(16, 2, 3),  // code 00 => length 3
-            Code::new(96, 2, 0),  // code 01 => EOB (op=32+64)
+            Code::new(16, 2, 3), // code 00 => length 3
+            Code::new(96, 2, 0), // code 01 => EOB (op=32+64)
             Code::new(0, 2, 0),
             Code::new(0, 2, 0),
         ];
@@ -799,7 +831,14 @@ mod tests {
         let mut in_pos = 0;
         let mut out_pos = 0;
 
-        inflate_fast(&mut state, &input, &mut output, &mut in_pos, &mut out_pos, 0);
+        inflate_fast(
+            &mut state,
+            &input,
+            &mut output,
+            &mut in_pos,
+            &mut out_pos,
+            0,
+        );
 
         assert_eq!(state.mode, InflateMode::Type);
         assert_eq!(out_pos, 3);
@@ -812,8 +851,8 @@ mod tests {
     #[test]
     fn test_inflate_fast_invalid_distance_too_far() {
         let len_codes = vec![
-            Code::new(16, 2, 3),  // code 00 => length 3
-            Code::new(96, 2, 0),  // EOB (op=32+64)
+            Code::new(16, 2, 3), // code 00 => length 3
+            Code::new(96, 2, 0), // EOB (op=32+64)
             Code::new(0, 2, 0),
             Code::new(0, 2, 0),
         ];
@@ -834,10 +873,23 @@ mod tests {
         let mut in_pos = 0;
         let mut out_pos = 0;
 
-        inflate_fast(&mut state, &input, &mut output, &mut in_pos, &mut out_pos, 0);
+        inflate_fast(
+            &mut state,
+            &input,
+            &mut output,
+            &mut in_pos,
+            &mut out_pos,
+            0,
+        );
 
         assert_eq!(state.mode, InflateMode::Bad);
-        assert!(state.msg.as_ref().unwrap().contains("invalid distance too far back"));
+        assert!(
+            state
+                .msg
+                .as_ref()
+                .unwrap()
+                .contains("invalid distance too far back")
+        );
     }
 
     /// Direct output copy (common fast path, no window access).
@@ -848,16 +900,13 @@ mod tests {
         // code 01 => length 3, 0 extra
         // code 10 => EOB (op=32+64)
         let len_codes = vec![
-            Code::new(0, 2, b'M' as u16),  // literal
-            Code::new(16, 2, 3),            // length 3
-            Code::new(96, 2, 0),            // EOB (op=32+64)
+            Code::new(0, 2, b'M' as u16), // literal
+            Code::new(16, 2, 3),          // length 3
+            Code::new(96, 2, 0),          // EOB (op=32+64)
             Code::new(0, 2, 0),
         ];
         // dist code 0 => distance 1
-        let dist_codes = vec![
-            Code::new(16, 1, 1),
-            Code::new(16, 1, 2),
-        ];
+        let dist_codes = vec![Code::new(16, 1, 1), Code::new(16, 1, 2)];
         let mut state = make_state(&len_codes, &dist_codes, 2, 1);
         state.wsize = 0; // no window
         state.whave = 0;
@@ -871,7 +920,14 @@ mod tests {
         let mut in_pos = 0;
         let mut out_pos = 0;
 
-        inflate_fast(&mut state, &input, &mut output, &mut in_pos, &mut out_pos, 0);
+        inflate_fast(
+            &mut state,
+            &input,
+            &mut output,
+            &mut in_pos,
+            &mut out_pos,
+            0,
+        );
 
         assert_eq!(state.mode, InflateMode::Type);
         assert_eq!(out_pos, 4);
@@ -904,9 +960,22 @@ mod tests {
         let mut in_pos = 0;
         let mut out_pos = 0;
 
-        inflate_fast(&mut state, &input, &mut output, &mut in_pos, &mut out_pos, 0);
+        inflate_fast(
+            &mut state,
+            &input,
+            &mut output,
+            &mut in_pos,
+            &mut out_pos,
+            0,
+        );
 
         assert_eq!(state.mode, InflateMode::Bad);
-        assert!(state.msg.as_ref().unwrap().contains("invalid distance code"));
+        assert!(
+            state
+                .msg
+                .as_ref()
+                .unwrap()
+                .contains("invalid distance code")
+        );
     }
 }

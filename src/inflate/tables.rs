@@ -55,8 +55,8 @@ pub const ENOUGH: usize = ENOUGH_LENS + ENOUGH_DISTS;
 /// Indexed by `symbol - 257`. For example, length code 257 has base length 3,
 /// length code 258 has base length 4, etc. Codes 286–287 are sentinels (value 0).
 const LBASE: [u16; 31] = [
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59,
-    67, 83, 99, 115, 131, 163, 195, 227, 258, 0, 0,
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258, 0, 0,
 ];
 
 /// Length codes 257..285 extra bits (encoded with op-field semantics).
@@ -65,8 +65,8 @@ const LBASE: [u16; 31] = [
 /// Value 16 means 0 extra bits, 17 means 1 extra bit, etc.
 /// Values 68 and 193 for codes 286–287 set the invalid code marker (`op & 64 != 0`).
 const LEXT: [u16; 31] = [
-    16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 18, 18, 18, 18, 19, 19,
-    19, 19, 20, 20, 20, 20, 21, 21, 21, 21, 16, 68, 193,
+    16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 18, 18, 18, 18, 19, 19, 19, 19, 20, 20, 20, 20,
+    21, 21, 21, 21, 16, 68, 193,
 ];
 
 /// Distance codes 0..29 base distance values (plus 2 sentinel entries).
@@ -74,8 +74,8 @@ const LEXT: [u16; 31] = [
 /// Indexed directly by distance code symbol. For example, distance code 0 has
 /// base distance 1, code 1 has base distance 2, etc. Codes 30–31 are sentinels.
 const DBASE: [u16; 32] = [
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513,
-    769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577, 0, 0,
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577, 0, 0,
 ];
 
 /// Distance codes 0..29 extra bits (encoded with op-field semantics).
@@ -83,8 +83,8 @@ const DBASE: [u16; 32] = [
 /// Values 16–29 encode `(op & 16) != 0` (distance flag) with `op & 15` extra bits.
 /// Value 64 for codes 30–31 marks them as invalid (`op & 64 != 0`).
 const DEXT: [u16; 32] = [
-    16, 16, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22, 22, 23, 23,
-    24, 24, 25, 25, 26, 26, 27, 27, 28, 28, 29, 29, 64, 64,
+    16, 16, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22, 22, 23, 23, 24, 24, 25, 25, 26, 26,
+    27, 27, 28, 28, 29, 29, 64, 64,
 ];
 
 // ---------------------------------------------------------------------------
@@ -572,8 +572,15 @@ mod tests {
         let mut bits = 7u32;
         let mut work = [0u16; 19];
 
-        let result =
-            inflate_table(CodeType::Codes, &lens, 19, &mut table, &mut offset, &mut bits, &mut work);
+        let result = inflate_table(
+            CodeType::Codes,
+            &lens,
+            19,
+            &mut table,
+            &mut offset,
+            &mut bits,
+            &mut work,
+        );
         assert!(result.is_ok());
         assert_eq!(bits, 1);
         assert_eq!(offset, 2);
@@ -594,8 +601,15 @@ mod tests {
         let mut bits = 7u32;
         let mut work = [0u16; 3];
 
-        let result =
-            inflate_table(CodeType::Codes, &lens, 3, &mut table, &mut offset, &mut bits, &mut work);
+        let result = inflate_table(
+            CodeType::Codes,
+            &lens,
+            3,
+            &mut table,
+            &mut offset,
+            &mut bits,
+            &mut work,
+        );
         assert!(result.is_err());
     }
 
@@ -610,8 +624,15 @@ mod tests {
         let mut bits = 7u32;
         let mut work = [0u16; 2];
 
-        let result =
-            inflate_table(CodeType::Codes, &lens, 2, &mut table, &mut offset, &mut bits, &mut work);
+        let result = inflate_table(
+            CodeType::Codes,
+            &lens,
+            2,
+            &mut table,
+            &mut offset,
+            &mut bits,
+            &mut work,
+        );
         assert!(result.is_ok());
         assert_eq!(bits, 1); // root clamped to max=1
         assert_eq!(offset, 2); // 1 << 1 = 2 entries
@@ -709,8 +730,15 @@ mod tests {
         let mut bits = 7u32;
         let mut work = [0u16; 3];
 
-        let result =
-            inflate_table(CodeType::Codes, &lens, 3, &mut table, &mut offset, &mut bits, &mut work);
+        let result = inflate_table(
+            CodeType::Codes,
+            &lens,
+            3,
+            &mut table,
+            &mut offset,
+            &mut bits,
+            &mut work,
+        );
         assert!(result.is_err());
     }
 
@@ -753,8 +781,15 @@ mod tests {
         let mut bits = 9u32;
         let mut work = [0u16; 4];
 
-        let result =
-            inflate_table(CodeType::Lens, &lens, 4, &mut table, &mut offset, &mut bits, &mut work);
+        let result = inflate_table(
+            CodeType::Lens,
+            &lens,
+            4,
+            &mut table,
+            &mut offset,
+            &mut bits,
+            &mut work,
+        );
         assert!(result.is_err());
     }
 

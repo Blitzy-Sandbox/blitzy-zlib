@@ -188,7 +188,9 @@ pub(crate) fn gz_avail(state: &mut GzState) -> Result<(), ZlibError> {
         if avail > 0 {
             let next_in_offset = buffer_offset_of_next_in(state);
             if next_in_offset != 0 {
-                state.in_buf.copy_within(next_in_offset..next_in_offset + avail, 0);
+                state
+                    .in_buf
+                    .copy_within(next_in_offset..next_in_offset + avail, 0);
             }
         }
 
@@ -315,12 +317,7 @@ pub(crate) fn gz_look(state: &mut GzState) -> Result<GzHow, ZlibError> {
     // ---- Check for gzip magic header ----
     // Gzip header: magic[0]=0x1f, magic[1]=0x8b, method=8, flags<32.
     let inp = &state.in_buf[..avail.min(state.size)];
-    if avail > 3
-        && inp[0] == 0x1f
-        && inp[1] == 0x8b
-        && inp[2] == 8
-        && inp[3] < 32
-    {
+    if avail > 3 && inp[0] == 0x1f && inp[1] == 0x8b && inp[2] == 8 && inp[3] < 32 {
         // Looks like gzip — reset inflate and switch to GZIP mode.
         // The inflate engine (initialised with windowBits=15+16) will
         // parse the gzip header itself.
@@ -504,7 +501,9 @@ pub(crate) fn gz_fetch(state: &mut GzState) -> Result<(), ZlibError> {
             }
             GzHow::Gzip => {
                 let out_len = (state.size << 1) as u32;
-                state.strm.set_output(&mut state.out_buf[..out_len as usize]);
+                state
+                    .strm
+                    .set_output(&mut state.out_buf[..out_len as usize]);
                 gz_decomp(state)?;
             }
         }
@@ -562,10 +561,7 @@ pub(crate) fn gz_skip(state: &mut GzState) -> Result<(), ZlibError> {
 /// # C Reference
 ///
 /// Port of `gzread.c` `gz_read()` (lines 311–393).
-pub(crate) fn gz_read_internal(
-    state: &mut GzState,
-    buf: &mut [u8],
-) -> Result<usize, ZlibError> {
+pub(crate) fn gz_read_internal(state: &mut GzState, buf: &mut [u8]) -> Result<usize, ZlibError> {
     let len = buf.len();
     if len == 0 {
         return Ok(0);
@@ -586,14 +582,11 @@ pub(crate) fn gz_read_internal(
 
         if state.have > 0 {
             let n = state.have.min(n_max);
-            buf[got..got + n]
-                .copy_from_slice(&state.out_buf[state.next..state.next + n]);
+            buf[got..got + n].copy_from_slice(&state.out_buf[state.next..state.next + n]);
             state.next += n;
             state.have -= n;
 
-            if state.err.is_some()
-                && state.err != Some(ZlibError::BufError)
-            {
+            if state.err.is_some() && state.err != Some(ZlibError::BufError) {
                 err_flag = true;
             }
 

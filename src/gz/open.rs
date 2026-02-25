@@ -22,7 +22,7 @@ use crate::constants::{
 use crate::error::ZlibError;
 use crate::inflate::inflate_reset;
 
-use super::state::{GzHow, GzMode, GzState, GZBUFSIZE};
+use super::state::{GZBUFSIZE, GzHow, GzMode, GzState};
 
 // ========================================================================
 // Seek whence constants (matching POSIX SEEK_SET / SEEK_CUR / SEEK_END)
@@ -261,11 +261,7 @@ pub fn gz_dopen(file: File, mode: &str) -> Result<GzState, ZlibError> {
 /// mode string, handles append-mode seek-to-end, records the start
 /// position for read-mode rewind support, and calls [`gz_reset`] to
 /// initialise remaining fields.
-fn gz_open_common(
-    mut file: File,
-    path: PathBuf,
-    parsed: ParsedMode,
-) -> Result<GzState, ZlibError> {
+fn gz_open_common(mut file: File, path: PathBuf, parsed: ParsedMode) -> Result<GzState, ZlibError> {
     let mut effective_mode = parsed.mode;
 
     // For append mode: the file was opened with O_APPEND semantics.
@@ -471,10 +467,7 @@ pub fn gz_seek(state: &mut GzState, offset: i64, whence: i32) -> Result<u64, Zli
     };
 
     // ---- Optimisation: raw COPY area direct seek (gzlib.c lines 393-407). ----
-    if state.mode == GzMode::Read
-        && state.how == GzHow::Copy
-        && (state.pos as i64 + offset) >= 0
-    {
+    if state.mode == GzMode::Read && state.how == GzHow::Copy && (state.pos as i64 + offset) >= 0 {
         let seek_delta = offset - state.have as i64;
         if let Some(ref mut file) = state.file {
             file.seek(SeekFrom::Current(seek_delta))

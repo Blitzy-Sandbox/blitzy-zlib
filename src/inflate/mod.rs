@@ -67,39 +67,44 @@
 
 // ── Submodule declarations ──────────────────────────────────────────────────
 
-/// Inflate state machine types and state struct.
-pub mod state;
-/// Fast-path inflate decode loop.
-pub mod fast;
-/// Huffman table builder for inflate.
-pub mod tables;
-/// Pre-built fixed Huffman decode tables.
-pub mod fixed;
 /// Callback-based raw DEFLATE decompression.
 pub mod back;
+/// Fast-path inflate decode loop.
+pub mod fast;
+/// Pre-built fixed Huffman decode tables.
+pub mod fixed;
+/// Inflate state machine types and state struct.
+pub mod state;
+/// Huffman table builder for inflate.
+pub mod tables;
 
 // ── Imports ─────────────────────────────────────────────────────────────────
 
+// In no_std mode, pull alloc types that the std prelude normally provides.
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec, vec::Vec};
+
+use crate::checksum::adler32;
+#[cfg(feature = "gzip")]
+use crate::checksum::crc32;
+use crate::constants::{DEF_WBITS, Z_BLOCK, Z_DEFLATED, Z_FINISH, Z_TREES};
 use crate::error::{ReturnCode, ZlibError, ZlibResult};
-use crate::constants::{DEF_WBITS, Z_DEFLATED, Z_BLOCK, Z_TREES, Z_FINISH};
-use crate::stream::{StreamState, ZStream};
 #[cfg(feature = "gzip")]
 use crate::gz_header::GzHeader;
-use crate::checksum::{adler32, crc32};
+use crate::stream::{StreamState, ZStream};
 
-use self::state::parse_window_bits;
 use self::fast::inflate_fast;
+use self::state::parse_window_bits;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────
 // Types from submodules re-exported at the inflate module level so that
 // dependents can import e.g. `crate::inflate::InflateState`.
 
-pub use self::state::{InflateState, InflateMode};
-pub use self::tables::{inflate_table, Code, CodeType};
 pub use self::back::{
-    inflate_back_init, inflate_back, inflate_back_end,
-    InflateBackInput, InflateBackOutput,
+    InflateBackInput, InflateBackOutput, inflate_back, inflate_back_end, inflate_back_init,
 };
+pub use self::state::{InflateMode, InflateState};
+pub use self::tables::{Code, CodeType, inflate_table};
 
 // ── Bit manipulation helpers ────────────────────────────────────────────────
 // These replace the C macros BITS, DROPBITS, BYTEBITS, INITBITS from
@@ -192,11 +197,7 @@ fn zswap32(q: u32) -> u32 {
 
 /// Update the sliding window with the last `copy` bytes written before
 /// the position indicated by `end`. Allocates the window on first use.
-fn update_window(
-    state: &mut InflateState,
-    end: &[u8],
-    copy: usize,
-) -> Result<(), ZlibError> {
+fn update_window(state: &mut InflateState, end: &[u8], copy: usize) -> Result<(), ZlibError> {
     // Allocate window on first use
     if state.window.is_empty() {
         let size = 1usize << state.wbits;
@@ -353,8 +354,7 @@ pub fn inflate_init2(strm: &mut ZStream, window_bits: i32) -> ZlibResult {
 ///
 /// `Err(ZlibError::StreamError)` if the stream is not in inflate mode.
 pub fn inflate_reset(strm: &mut ZStream) -> ZlibResult {
-    let state = strm.state.as_inflate_mut()
-        .ok_or(ZlibError::StreamError)?;
+    let state = strm.state.as_inflate_mut().ok_or(ZlibError::StreamError)?;
     state.wsize = 0;
     state.whave = 0;
     state.wnext = 0;
@@ -371,8 +371,7 @@ pub fn inflate_reset(strm: &mut ZStream) -> ZlibResult {
 /// `Err(ZlibError::StreamError)` if the stream is not in inflate mode
 /// or if `window_bits` is out of range.
 pub fn inflate_reset2(strm: &mut ZStream, window_bits: i32) -> ZlibResult {
-    let state = strm.state.as_inflate_mut()
-        .ok_or(ZlibError::StreamError)?;
+    let state = strm.state.as_inflate_mut().ok_or(ZlibError::StreamError)?;
     let (wrap, actual_wbits) = parse_window_bits(window_bits)?;
 
     // If the window size changed, deallocate
@@ -396,8 +395,7 @@ pub fn inflate_reset2(strm: &mut ZStream, window_bits: i32) -> ZlibResult {
 ///
 /// `Err(ZlibError::StreamError)` if the stream is not in inflate mode.
 pub fn inflate_reset_keep(strm: &mut ZStream) -> ZlibResult {
-    let state = strm.state.as_inflate_mut()
-        .ok_or(ZlibError::StreamError)?;
+    let state = strm.state.as_inflate_mut().ok_or(ZlibError::StreamError)?;
     strm.total_in = 0;
     strm.total_out = 0;
     strm.msg = None;
@@ -439,8 +437,7 @@ pub fn inflate_reset_keep(strm: &mut ZStream) -> ZlibResult {
 /// `Err(ZlibError::StreamError)` if the stream is not in inflate mode
 /// or if the bit count exceeds limits.
 pub fn inflate_prime(strm: &mut ZStream, bits_count: i32, value: i32) -> ZlibResult {
-    let state = strm.state.as_inflate_mut()
-        .ok_or(ZlibError::StreamError)?;
+    let state = strm.state.as_inflate_mut().ok_or(ZlibError::StreamError)?;
     if bits_count == 0 {
         return Ok(ReturnCode::Ok);
     }
@@ -490,9 +487,7 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
     if !strm.state.is_inflate() {
         return Err(ZlibError::StreamError);
     }
-    if strm.next_out.is_null()
-        || (strm.next_in.is_null() && strm.avail_in != 0)
-    {
+    if strm.next_out.is_null() || (strm.next_in.is_null() && strm.avail_in != 0) {
         return Err(ZlibError::StreamError);
     }
 
@@ -546,7 +541,9 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                     continue;
                 }
                 while bits_count < 16 {
-                    if have == 0 { break 'inf; }
+                    if have == 0 {
+                        break 'inf;
+                    }
                     have -= 1;
                     hold |= (in_buf[in_pos] as u64) << bits_count;
                     in_pos += 1;
@@ -555,7 +552,9 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                 #[cfg(feature = "gzip")]
                 {
                     if (state.wrap & 2) != 0 && hold == 0x8b1f {
-                        if state.wbits == 0 { state.wbits = 15; }
+                        if state.wbits == 0 {
+                            state.wbits = 15;
+                        }
                         state.check = crc32(0, &[]);
                         state.check = crc2(state.check, hold);
                         init_bits(&mut hold, &mut bits_count);
@@ -588,7 +587,9 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                 }
                 drop_bits(&mut hold, &mut bits_count, 4);
                 let len = bits_val(hold, 4) + 8;
-                if state.wbits == 0 { state.wbits = len; }
+                if state.wbits == 0 {
+                    state.wbits = len;
+                }
                 if len > 15 || len > state.wbits {
                     strm.msg = Some("invalid window size".into());
                     state.mode = InflateMode::Bad;
@@ -599,60 +600,125 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                 let a = adler32(0, &[]);
                 strm.adler = a as u64;
                 state.check = a;
-                state.mode = if hold & 0x200 != 0 { InflateMode::DictId } else { InflateMode::Type };
+                state.mode = if hold & 0x200 != 0 {
+                    InflateMode::DictId
+                } else {
+                    InflateMode::Type
+                };
                 init_bits(&mut hold, &mut bits_count);
             }
 
             // ── Gzip header modes (FLAGS through HCRC) ──────────────
             #[cfg(feature = "gzip")]
             InflateMode::Flags => {
-                while bits_count < 16 { if have == 0 { break 'inf; } have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8; }
+                while bits_count < 16 {
+                    if have == 0 {
+                        break 'inf;
+                    }
+                    have -= 1;
+                    hold |= (in_buf[in_pos] as u64) << bits_count;
+                    in_pos += 1;
+                    bits_count += 8;
+                }
                 state.flags = hold as i32;
                 if (state.flags & 0xff) != Z_DEFLATED {
                     strm.msg = Some("unknown compression method".into());
-                    state.mode = InflateMode::Bad; continue;
+                    state.mode = InflateMode::Bad;
+                    continue;
                 }
                 if state.flags & 0xe000 != 0 {
                     strm.msg = Some("unknown header flags set".into());
-                    state.mode = InflateMode::Bad; continue;
+                    state.mode = InflateMode::Bad;
+                    continue;
                 }
-                if let Some(ref mut h) = state.head { h.text = ((hold >> 8) & 1) != 0; }
-                if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 { state.check = crc2(state.check, hold); }
+                if let Some(ref mut h) = state.head {
+                    h.text = ((hold >> 8) & 1) != 0;
+                }
+                if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
+                    state.check = crc2(state.check, hold);
+                }
                 init_bits(&mut hold, &mut bits_count);
-                state.mode = InflateMode::Time; continue;
+                state.mode = InflateMode::Time;
+                continue;
             }
             #[cfg(feature = "gzip")]
             InflateMode::Time => {
-                while bits_count < 32 { if have == 0 { break 'inf; } have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8; }
-                if let Some(ref mut h) = state.head { h.time = hold as u32; }
-                if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 { state.check = crc4(state.check, hold); }
+                while bits_count < 32 {
+                    if have == 0 {
+                        break 'inf;
+                    }
+                    have -= 1;
+                    hold |= (in_buf[in_pos] as u64) << bits_count;
+                    in_pos += 1;
+                    bits_count += 8;
+                }
+                if let Some(ref mut h) = state.head {
+                    h.time = hold as u32;
+                }
+                if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
+                    state.check = crc4(state.check, hold);
+                }
                 init_bits(&mut hold, &mut bits_count);
-                state.mode = InflateMode::Os; continue;
+                state.mode = InflateMode::Os;
+                continue;
             }
             #[cfg(feature = "gzip")]
             InflateMode::Os => {
-                while bits_count < 16 { if have == 0 { break 'inf; } have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8; }
-                if let Some(ref mut h) = state.head { h.xflags = (hold & 0xff) as i32; h.os = (hold >> 8) as i32; }
-                if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 { state.check = crc2(state.check, hold); }
+                while bits_count < 16 {
+                    if have == 0 {
+                        break 'inf;
+                    }
+                    have -= 1;
+                    hold |= (in_buf[in_pos] as u64) << bits_count;
+                    in_pos += 1;
+                    bits_count += 8;
+                }
+                if let Some(ref mut h) = state.head {
+                    h.xflags = (hold & 0xff) as i32;
+                    h.os = (hold >> 8) as i32;
+                }
+                if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
+                    state.check = crc2(state.check, hold);
+                }
                 init_bits(&mut hold, &mut bits_count);
-                state.mode = InflateMode::ExLen; continue;
+                state.mode = InflateMode::ExLen;
+                continue;
             }
             #[cfg(feature = "gzip")]
             InflateMode::ExLen => {
                 if (state.flags & 0x0400) != 0 {
-                    while bits_count < 16 { if have == 0 { break 'inf; } have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8; }
+                    while bits_count < 16 {
+                        if have == 0 {
+                            break 'inf;
+                        }
+                        have -= 1;
+                        hold |= (in_buf[in_pos] as u64) << bits_count;
+                        in_pos += 1;
+                        bits_count += 8;
+                    }
                     state.length = (hold & 0xffff) as u32;
-                    if let Some(ref mut h) = state.head { if h.extra.is_none() { h.extra = Some(Vec::with_capacity(state.length as usize)); } }
-                    if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 { state.check = crc2(state.check, hold); }
+                    if let Some(ref mut h) = state.head {
+                        if h.extra.is_none() {
+                            h.extra = Some(Vec::with_capacity(state.length as usize));
+                        }
+                    }
+                    if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
+                        state.check = crc2(state.check, hold);
+                    }
                     init_bits(&mut hold, &mut bits_count);
-                } else if let Some(ref mut h) = state.head { h.extra = None; }
-                state.mode = InflateMode::Extra; continue;
+                } else if let Some(ref mut h) = state.head {
+                    h.extra = None;
+                }
+                state.mode = InflateMode::Extra;
+                continue;
             }
             #[cfg(feature = "gzip")]
             InflateMode::Extra => {
                 if (state.flags & 0x0400) != 0 {
                     let mut cp = state.length as usize;
-                    if cp > have as usize { cp = have as usize; }
+                    if cp > have as usize {
+                        cp = have as usize;
+                    }
                     if cp > 0 {
                         if let Some(ref mut h) = state.head {
                             if let Some(ref mut ex) = h.extra {
@@ -664,132 +730,236 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                         if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
                             state.check = crc32(state.check, &in_buf[in_pos..in_pos + cp]);
                         }
-                        have -= cp as u32; in_pos += cp; state.length -= cp as u32;
+                        have -= cp as u32;
+                        in_pos += cp;
+                        state.length -= cp as u32;
                     }
-                    if state.length != 0 { break 'inf; }
+                    if state.length != 0 {
+                        break 'inf;
+                    }
                 }
                 state.length = 0;
-                state.mode = InflateMode::Name; continue;
+                state.mode = InflateMode::Name;
+                continue;
             }
             #[cfg(feature = "gzip")]
             InflateMode::Name => {
                 if (state.flags & 0x0800) != 0 {
-                    if have == 0 { break 'inf; }
+                    if have == 0 {
+                        break 'inf;
+                    }
                     let mut cp = 0usize;
                     loop {
-                        if cp >= have as usize { break; }
-                        let b = in_buf[in_pos + cp]; cp += 1;
+                        if cp >= have as usize {
+                            break;
+                        }
+                        let b = in_buf[in_pos + cp];
+                        cp += 1;
                         if let Some(ref mut h) = state.head {
                             if b != 0 {
-                                if h.name.is_none() { h.name = Some(String::new()); }
-                                if let Some(ref mut n) = h.name { n.push(b as char); }
+                                if h.name.is_none() {
+                                    h.name = Some(String::new());
+                                }
+                                if let Some(ref mut n) = h.name {
+                                    n.push(b as char);
+                                }
                             }
                         }
-                        if b == 0 { break; }
+                        if b == 0 {
+                            break;
+                        }
                     }
-                    if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 { state.check = crc32(state.check, &in_buf[in_pos..in_pos + cp]); }
-                    have -= cp as u32; in_pos += cp;
-                    if cp > 0 && in_buf[in_pos - 1] != 0 { break 'inf; }
-                } else if let Some(ref mut h) = state.head { h.name = None; }
+                    if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
+                        state.check = crc32(state.check, &in_buf[in_pos..in_pos + cp]);
+                    }
+                    have -= cp as u32;
+                    in_pos += cp;
+                    if cp > 0 && in_buf[in_pos - 1] != 0 {
+                        break 'inf;
+                    }
+                } else if let Some(ref mut h) = state.head {
+                    h.name = None;
+                }
                 state.length = 0;
-                state.mode = InflateMode::Comment; continue;
+                state.mode = InflateMode::Comment;
+                continue;
             }
             #[cfg(feature = "gzip")]
             InflateMode::Comment => {
                 if (state.flags & 0x1000) != 0 {
-                    if have == 0 { break 'inf; }
+                    if have == 0 {
+                        break 'inf;
+                    }
                     let mut cp = 0usize;
                     loop {
-                        if cp >= have as usize { break; }
-                        let b = in_buf[in_pos + cp]; cp += 1;
+                        if cp >= have as usize {
+                            break;
+                        }
+                        let b = in_buf[in_pos + cp];
+                        cp += 1;
                         if let Some(ref mut h) = state.head {
                             if b != 0 {
-                                if h.comment.is_none() { h.comment = Some(String::new()); }
-                                if let Some(ref mut c) = h.comment { c.push(b as char); }
+                                if h.comment.is_none() {
+                                    h.comment = Some(String::new());
+                                }
+                                if let Some(ref mut c) = h.comment {
+                                    c.push(b as char);
+                                }
                             }
                         }
-                        if b == 0 { break; }
+                        if b == 0 {
+                            break;
+                        }
                     }
-                    if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 { state.check = crc32(state.check, &in_buf[in_pos..in_pos + cp]); }
-                    have -= cp as u32; in_pos += cp;
-                    if cp > 0 && in_buf[in_pos - 1] != 0 { break 'inf; }
-                } else if let Some(ref mut h) = state.head { h.comment = None; }
-                state.mode = InflateMode::HCrc; continue;
+                    if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
+                        state.check = crc32(state.check, &in_buf[in_pos..in_pos + cp]);
+                    }
+                    have -= cp as u32;
+                    in_pos += cp;
+                    if cp > 0 && in_buf[in_pos - 1] != 0 {
+                        break 'inf;
+                    }
+                } else if let Some(ref mut h) = state.head {
+                    h.comment = None;
+                }
+                state.mode = InflateMode::HCrc;
+                continue;
             }
             #[cfg(feature = "gzip")]
             InflateMode::HCrc => {
                 if (state.flags & 0x0200) != 0 {
-                    while bits_count < 16 { if have == 0 { break 'inf; } have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8; }
+                    while bits_count < 16 {
+                        if have == 0 {
+                            break 'inf;
+                        }
+                        have -= 1;
+                        hold |= (in_buf[in_pos] as u64) << bits_count;
+                        in_pos += 1;
+                        bits_count += 8;
+                    }
                     if (state.wrap & 4) != 0 && (hold as u32) != (state.check & 0xffff) {
                         strm.msg = Some("header crc mismatch".into());
-                        state.mode = InflateMode::Bad; continue;
+                        state.mode = InflateMode::Bad;
+                        continue;
                     }
                     init_bits(&mut hold, &mut bits_count);
                 }
-                if let Some(ref mut h) = state.head { h.hcrc = (state.flags >> 9) & 1 != 0; h.done = true; }
-                let ci = crc32(0, &[]); strm.adler = ci as u64; state.check = ci;
+                if let Some(ref mut h) = state.head {
+                    h.hcrc = (state.flags >> 9) & 1 != 0;
+                    h.done = true;
+                }
+                let ci = crc32(0, &[]);
+                strm.adler = ci as u64;
+                state.check = ci;
                 state.mode = InflateMode::Type;
             }
             // When gzip disabled, these are unreachable
             #[cfg(not(feature = "gzip"))]
-            InflateMode::Flags | InflateMode::Time | InflateMode::Os
-            | InflateMode::ExLen | InflateMode::Extra | InflateMode::Name
-            | InflateMode::Comment | InflateMode::HCrc => {
+            InflateMode::Flags
+            | InflateMode::Time
+            | InflateMode::Os
+            | InflateMode::ExLen
+            | InflateMode::Extra
+            | InflateMode::Name
+            | InflateMode::Comment
+            | InflateMode::HCrc => {
                 strm.msg = Some("gzip not supported".into());
-                state.mode = InflateMode::Bad; continue;
+                state.mode = InflateMode::Bad;
+                continue;
             }
 
             // ── DICTID ──────────────────────────────────────────────
             InflateMode::DictId => {
-                while bits_count < 32 { if have == 0 { break 'inf; } have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8; }
+                while bits_count < 32 {
+                    if have == 0 {
+                        break 'inf;
+                    }
+                    have -= 1;
+                    hold |= (in_buf[in_pos] as u64) << bits_count;
+                    in_pos += 1;
+                    bits_count += 8;
+                }
                 let sw = zswap32(hold as u32);
-                strm.adler = sw as u64; state.check = sw;
+                strm.adler = sw as u64;
+                state.check = sw;
                 init_bits(&mut hold, &mut bits_count);
-                state.mode = InflateMode::Dict; continue;
+                state.mode = InflateMode::Dict;
+                continue;
             }
 
             // ── DICT ────────────────────────────────────────────────
             InflateMode::Dict => {
                 if !state.havedict {
-                    state.hold = hold; state.bits = bits_count;
-                    strm.avail_in = have; strm.avail_out = left;
+                    state.hold = hold;
+                    state.bits = bits_count;
+                    strm.avail_in = have;
+                    strm.avail_out = left;
                     strm.total_in += (in_start - have) as u64;
                     strm.total_out += (out_start - left) as u64;
                     // SAFETY: next_in/next_out are non-null (guarded) and in_pos/out_pos
                     // are bounded by the original avail_in/avail_out supplied by the caller.
-                    if !strm.next_in.is_null() && in_pos > 0 { strm.next_in = unsafe { strm.next_in.add(in_pos) }; }
-                    if !strm.next_out.is_null() && out_pos > 0 { strm.next_out = unsafe { strm.next_out.add(out_pos) }; }
+                    if !strm.next_in.is_null() && in_pos > 0 {
+                        strm.next_in = unsafe { strm.next_in.add(in_pos) };
+                    }
+                    if !strm.next_out.is_null() && out_pos > 0 {
+                        strm.next_out = unsafe { strm.next_out.add(out_pos) };
+                    }
                     strm.state = StreamState::Inflate(state_box);
                     return Ok(ReturnCode::NeedDict);
                 }
-                let ai = adler32(0, &[]); strm.adler = ai as u64; state.check = ai;
-                state.mode = InflateMode::Type; continue;
+                let ai = adler32(0, &[]);
+                strm.adler = ai as u64;
+                state.check = ai;
+                state.mode = InflateMode::Type;
+                continue;
             }
 
             // ── TYPE ────────────────────────────────────────────────
             InflateMode::Type => {
-                if flush == Z_BLOCK || flush == Z_TREES { break 'inf; }
-                state.mode = InflateMode::TypeDo; continue;
+                if flush == Z_BLOCK || flush == Z_TREES {
+                    break 'inf;
+                }
+                state.mode = InflateMode::TypeDo;
+                continue;
             }
 
             // ── TYPEDO ──────────────────────────────────────────────
             InflateMode::TypeDo => {
                 if state.last {
                     byte_bits(&mut hold, &mut bits_count);
-                    state.mode = InflateMode::Check; continue;
+                    state.mode = InflateMode::Check;
+                    continue;
                 }
-                while bits_count < 3 { if have == 0 { break 'inf; } have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8; }
+                while bits_count < 3 {
+                    if have == 0 {
+                        break 'inf;
+                    }
+                    have -= 1;
+                    hold |= (in_buf[in_pos] as u64) << bits_count;
+                    in_pos += 1;
+                    bits_count += 8;
+                }
                 state.last = bits_val(hold, 1) != 0;
                 drop_bits(&mut hold, &mut bits_count, 1);
                 match bits_val(hold, 2) {
-                    0 => { state.mode = InflateMode::Stored; }
+                    0 => {
+                        state.mode = InflateMode::Stored;
+                    }
                     1 => {
                         state.use_fixed_codes();
                         state.mode = InflateMode::Len_;
-                        if flush == Z_TREES { drop_bits(&mut hold, &mut bits_count, 2); break 'inf; }
+                        if flush == Z_TREES {
+                            drop_bits(&mut hold, &mut bits_count, 2);
+                            break 'inf;
+                        }
                     }
-                    2 => { state.mode = InflateMode::Table; }
-                    _ => { strm.msg = Some("invalid block type".into()); state.mode = InflateMode::Bad; }
+                    2 => {
+                        state.mode = InflateMode::Table;
+                    }
+                    _ => {
+                        strm.msg = Some("invalid block type".into());
+                        state.mode = InflateMode::Bad;
+                    }
                 }
                 drop_bits(&mut hold, &mut bits_count, 2);
             }
@@ -797,30 +967,53 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
             // ── STORED ──────────────────────────────────────────────
             InflateMode::Stored => {
                 byte_bits(&mut hold, &mut bits_count);
-                while bits_count < 32 { if have == 0 { break 'inf; } have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8; }
+                while bits_count < 32 {
+                    if have == 0 {
+                        break 'inf;
+                    }
+                    have -= 1;
+                    hold |= (in_buf[in_pos] as u64) << bits_count;
+                    in_pos += 1;
+                    bits_count += 8;
+                }
                 if (hold & 0xffff) != ((hold >> 16) ^ 0xffff) & 0xffff {
                     strm.msg = Some("invalid stored block lengths".into());
-                    state.mode = InflateMode::Bad; continue;
+                    state.mode = InflateMode::Bad;
+                    continue;
                 }
                 state.length = (hold & 0xffff) as u32;
                 init_bits(&mut hold, &mut bits_count);
                 state.mode = InflateMode::Copy_;
-                if flush == Z_TREES { break 'inf; }
-                state.mode = InflateMode::Copy; continue;
+                if flush == Z_TREES {
+                    break 'inf;
+                }
+                state.mode = InflateMode::Copy;
+                continue;
             }
 
-            InflateMode::Copy_ => { state.mode = InflateMode::Copy; continue; }
+            InflateMode::Copy_ => {
+                state.mode = InflateMode::Copy;
+                continue;
+            }
 
             // ── COPY ────────────────────────────────────────────────
             InflateMode::Copy => {
                 let mut cp = state.length as usize;
                 if cp > 0 {
-                    if cp > have as usize { cp = have as usize; }
-                    if cp > left as usize { cp = left as usize; }
-                    if cp == 0 { break 'inf; }
+                    if cp > have as usize {
+                        cp = have as usize;
+                    }
+                    if cp > left as usize {
+                        cp = left as usize;
+                    }
+                    if cp == 0 {
+                        break 'inf;
+                    }
                     out_buf[out_pos..out_pos + cp].copy_from_slice(&in_buf[in_pos..in_pos + cp]);
-                    have -= cp as u32; in_pos += cp;
-                    left -= cp as u32; out_pos += cp;
+                    have -= cp as u32;
+                    in_pos += cp;
+                    left -= cp as u32;
+                    out_pos += cp;
                     state.length -= cp as u32;
                 } else {
                     state.mode = InflateMode::Type;
@@ -829,36 +1022,74 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
 
             // ── TABLE ───────────────────────────────────────────────
             InflateMode::Table => {
-                while bits_count < 14 { if have == 0 { break 'inf; } have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8; }
-                state.nlen = bits_val(hold, 5) + 257; drop_bits(&mut hold, &mut bits_count, 5);
-                state.ndist = bits_val(hold, 5) + 1; drop_bits(&mut hold, &mut bits_count, 5);
-                state.ncode = bits_val(hold, 4) + 4; drop_bits(&mut hold, &mut bits_count, 4);
+                while bits_count < 14 {
+                    if have == 0 {
+                        break 'inf;
+                    }
+                    have -= 1;
+                    hold |= (in_buf[in_pos] as u64) << bits_count;
+                    in_pos += 1;
+                    bits_count += 8;
+                }
+                state.nlen = bits_val(hold, 5) + 257;
+                drop_bits(&mut hold, &mut bits_count, 5);
+                state.ndist = bits_val(hold, 5) + 1;
+                drop_bits(&mut hold, &mut bits_count, 5);
+                state.ncode = bits_val(hold, 4) + 4;
+                drop_bits(&mut hold, &mut bits_count, 4);
                 if state.nlen > 286 || state.ndist > 30 {
                     strm.msg = Some("too many length or distance symbols".into());
-                    state.mode = InflateMode::Bad; continue;
+                    state.mode = InflateMode::Bad;
+                    continue;
                 }
                 state.have = 0;
-                state.mode = InflateMode::LenLens; continue;
+                state.mode = InflateMode::LenLens;
+                continue;
             }
 
             // ── LENLENS ─────────────────────────────────────────────
             InflateMode::LenLens => {
                 while state.have < state.ncode {
-                    while bits_count < 3 { if have == 0 { break 'inf; } have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8; }
+                    while bits_count < 3 {
+                        if have == 0 {
+                            break 'inf;
+                        }
+                        have -= 1;
+                        hold |= (in_buf[in_pos] as u64) << bits_count;
+                        in_pos += 1;
+                        bits_count += 8;
+                    }
                     state.lens[ORDER[state.have as usize] as usize] = bits_val(hold, 3) as u16;
                     drop_bits(&mut hold, &mut bits_count, 3);
                     state.have += 1;
                 }
-                while state.have < 19 { state.lens[ORDER[state.have as usize] as usize] = 0; state.have += 1; }
-                state.next = 0; state.lencode_idx = 0; state.distcode_idx = 0;
+                while state.have < 19 {
+                    state.lens[ORDER[state.have as usize] as usize] = 0;
+                    state.have += 1;
+                }
+                state.next = 0;
+                state.lencode_idx = 0;
+                state.distcode_idx = 0;
                 let mut rb = 7u32;
-                if inflate_table(CodeType::Codes, &state.lens, 19, &mut state.codes, &mut state.next, &mut rb, &mut state.work).is_err() {
+                if inflate_table(
+                    CodeType::Codes,
+                    &state.lens,
+                    19,
+                    &mut state.codes,
+                    &mut state.next,
+                    &mut rb,
+                    &mut state.work,
+                )
+                .is_err()
+                {
                     strm.msg = Some("invalid code lengths set".into());
-                    state.mode = InflateMode::Bad; continue;
+                    state.mode = InflateMode::Bad;
+                    continue;
                 }
                 state.lenbits = rb;
                 state.have = 0;
-                state.mode = InflateMode::CodeLens; continue;
+                state.mode = InflateMode::CodeLens;
+                continue;
             }
 
             // ── CODELENS ────────────────────────────────────────────
@@ -868,71 +1099,165 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                     loop {
                         let idx = bits_val(hold, state.lenbits) as usize;
                         let e = state.codes[state.lencode_idx + idx];
-                        if (e.bits as u32) <= bits_count { here = e; break; }
-                        if have == 0 { break 'inf; }
-                        have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8;
+                        if (e.bits as u32) <= bits_count {
+                            here = e;
+                            break;
+                        }
+                        if have == 0 {
+                            break 'inf;
+                        }
+                        have -= 1;
+                        hold |= (in_buf[in_pos] as u64) << bits_count;
+                        in_pos += 1;
+                        bits_count += 8;
                     }
                     if here.val < 16 {
                         drop_bits(&mut hold, &mut bits_count, here.bits as u32);
-                        state.lens[state.have as usize] = here.val; state.have += 1;
+                        state.lens[state.have as usize] = here.val;
+                        state.have += 1;
                     } else {
                         let (len_val, copy_count);
                         if here.val == 16 {
                             let need = here.bits as u32 + 2;
-                            while bits_count < need { if have == 0 { break 'inf; } have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8; }
+                            while bits_count < need {
+                                if have == 0 {
+                                    break 'inf;
+                                }
+                                have -= 1;
+                                hold |= (in_buf[in_pos] as u64) << bits_count;
+                                in_pos += 1;
+                                bits_count += 8;
+                            }
                             drop_bits(&mut hold, &mut bits_count, here.bits as u32);
-                            if state.have == 0 { strm.msg = Some("invalid bit length repeat".into()); state.mode = InflateMode::Bad; break; }
+                            if state.have == 0 {
+                                strm.msg = Some("invalid bit length repeat".into());
+                                state.mode = InflateMode::Bad;
+                                break;
+                            }
                             len_val = state.lens[(state.have - 1) as usize];
-                            copy_count = 3 + bits_val(hold, 2); drop_bits(&mut hold, &mut bits_count, 2);
+                            copy_count = 3 + bits_val(hold, 2);
+                            drop_bits(&mut hold, &mut bits_count, 2);
                         } else if here.val == 17 {
                             let need = here.bits as u32 + 3;
-                            while bits_count < need { if have == 0 { break 'inf; } have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8; }
+                            while bits_count < need {
+                                if have == 0 {
+                                    break 'inf;
+                                }
+                                have -= 1;
+                                hold |= (in_buf[in_pos] as u64) << bits_count;
+                                in_pos += 1;
+                                bits_count += 8;
+                            }
                             drop_bits(&mut hold, &mut bits_count, here.bits as u32);
-                            len_val = 0; copy_count = 3 + bits_val(hold, 3); drop_bits(&mut hold, &mut bits_count, 3);
+                            len_val = 0;
+                            copy_count = 3 + bits_val(hold, 3);
+                            drop_bits(&mut hold, &mut bits_count, 3);
                         } else {
                             let need = here.bits as u32 + 7;
-                            while bits_count < need { if have == 0 { break 'inf; } have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8; }
+                            while bits_count < need {
+                                if have == 0 {
+                                    break 'inf;
+                                }
+                                have -= 1;
+                                hold |= (in_buf[in_pos] as u64) << bits_count;
+                                in_pos += 1;
+                                bits_count += 8;
+                            }
                             drop_bits(&mut hold, &mut bits_count, here.bits as u32);
-                            len_val = 0; copy_count = 11 + bits_val(hold, 7); drop_bits(&mut hold, &mut bits_count, 7);
+                            len_val = 0;
+                            copy_count = 11 + bits_val(hold, 7);
+                            drop_bits(&mut hold, &mut bits_count, 7);
                         }
                         if state.have + copy_count > state.nlen + state.ndist {
                             strm.msg = Some("invalid bit length repeat".into());
-                            state.mode = InflateMode::Bad; break;
+                            state.mode = InflateMode::Bad;
+                            break;
                         }
-                        for _ in 0..copy_count { state.lens[state.have as usize] = len_val; state.have += 1; }
+                        for _ in 0..copy_count {
+                            state.lens[state.have as usize] = len_val;
+                            state.have += 1;
+                        }
                     }
                 }
-                if state.mode == InflateMode::Bad { continue; }
-                if state.lens[256] == 0 { strm.msg = Some("invalid code -- missing end-of-block".into()); state.mode = InflateMode::Bad; continue; }
+                if state.mode == InflateMode::Bad {
+                    continue;
+                }
+                if state.lens[256] == 0 {
+                    strm.msg = Some("invalid code -- missing end-of-block".into());
+                    state.mode = InflateMode::Bad;
+                    continue;
+                }
                 // Build length/literal table
-                state.next = 0; state.lencode_idx = 0;
+                state.next = 0;
+                state.lencode_idx = 0;
                 let mut rb = 9u32;
-                if inflate_table(CodeType::Lens, &state.lens, state.nlen as usize, &mut state.codes, &mut state.next, &mut rb, &mut state.work).is_err() {
-                    strm.msg = Some("invalid literal/lengths set".into()); state.mode = InflateMode::Bad; continue;
+                if inflate_table(
+                    CodeType::Lens,
+                    &state.lens,
+                    state.nlen as usize,
+                    &mut state.codes,
+                    &mut state.next,
+                    &mut rb,
+                    &mut state.work,
+                )
+                .is_err()
+                {
+                    strm.msg = Some("invalid literal/lengths set".into());
+                    state.mode = InflateMode::Bad;
+                    continue;
                 }
                 state.lenbits = rb;
                 state.distcode_idx = state.next;
                 let mut db = 6u32;
-                if inflate_table(CodeType::Dists, &state.lens[state.nlen as usize..], state.ndist as usize, &mut state.codes, &mut state.next, &mut db, &mut state.work).is_err() {
-                    strm.msg = Some("invalid distances set".into()); state.mode = InflateMode::Bad; continue;
+                if inflate_table(
+                    CodeType::Dists,
+                    &state.lens[state.nlen as usize..],
+                    state.ndist as usize,
+                    &mut state.codes,
+                    &mut state.next,
+                    &mut db,
+                    &mut state.work,
+                )
+                .is_err()
+                {
+                    strm.msg = Some("invalid distances set".into());
+                    state.mode = InflateMode::Bad;
+                    continue;
                 }
                 state.distbits = db;
                 state.mode = InflateMode::Len_;
-                if flush == Z_TREES { break 'inf; }
-                state.mode = InflateMode::Len; continue;
+                if flush == Z_TREES {
+                    break 'inf;
+                }
+                state.mode = InflateMode::Len;
+                continue;
             }
 
-            InflateMode::Len_ => { state.mode = InflateMode::Len; continue; }
+            InflateMode::Len_ => {
+                state.mode = InflateMode::Len;
+                continue;
+            }
 
             // ── LEN ─────────────────────────────────────────────────
             InflateMode::Len => {
                 if have >= 6 && left >= 258 {
-                    state.hold = hold; state.bits = bits_count;
-                    inflate_fast(state, in_buf, out_buf, &mut in_pos, &mut out_pos, out_start as usize);
+                    state.hold = hold;
+                    state.bits = bits_count;
+                    inflate_fast(
+                        state,
+                        in_buf,
+                        out_buf,
+                        &mut in_pos,
+                        &mut out_pos,
+                        out_start as usize,
+                    );
                     have = (in_buf.len() - in_pos) as u32;
                     left = (out_buf.len() - out_pos) as u32;
-                    hold = state.hold; bits_count = state.bits;
-                    if state.mode == InflateMode::Type { state.back = -1; }
+                    hold = state.hold;
+                    bits_count = state.bits;
+                    if state.mode == InflateMode::Type {
+                        state.back = -1;
+                    }
                     continue;
                 }
                 state.back = 0;
@@ -940,18 +1265,34 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                 loop {
                     let idx = bits_val(hold, state.lenbits) as usize;
                     here = state.len_code(idx);
-                    if (here.bits as u32) <= bits_count { break; }
-                    if have == 0 { break 'inf; }
-                    have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8;
+                    if (here.bits as u32) <= bits_count {
+                        break;
+                    }
+                    if have == 0 {
+                        break 'inf;
+                    }
+                    have -= 1;
+                    hold |= (in_buf[in_pos] as u64) << bits_count;
+                    in_pos += 1;
+                    bits_count += 8;
                 }
                 if here.op != 0 && (here.op & 0xf0) == 0 {
                     let last_e = here;
                     loop {
-                        let idx = last_e.val as usize + (bits_val(hold, last_e.bits as u32 + last_e.op as u32) >> last_e.bits) as usize;
+                        let idx = last_e.val as usize
+                            + (bits_val(hold, last_e.bits as u32 + last_e.op as u32) >> last_e.bits)
+                                as usize;
                         here = state.len_code(idx);
-                        if (last_e.bits as u32 + here.bits as u32) <= bits_count { break; }
-                        if have == 0 { break 'inf; }
-                        have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8;
+                        if (last_e.bits as u32 + here.bits as u32) <= bits_count {
+                            break;
+                        }
+                        if have == 0 {
+                            break 'inf;
+                        }
+                        have -= 1;
+                        hold |= (in_buf[in_pos] as u64) << bits_count;
+                        in_pos += 1;
+                        bits_count += 8;
                     }
                     drop_bits(&mut hold, &mut bits_count, last_e.bits as u32);
                     state.back += last_e.bits as i32;
@@ -959,23 +1300,44 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                 drop_bits(&mut hold, &mut bits_count, here.bits as u32);
                 state.back += here.bits as i32;
                 state.length = here.val as u32;
-                if here.op == 0 { state.mode = InflateMode::Lit; continue; }
-                if (here.op & 32) != 0 { state.back = -1; state.mode = InflateMode::Type; continue; }
-                if (here.op & 64) != 0 { strm.msg = Some("invalid literal/length code".into()); state.mode = InflateMode::Bad; continue; }
+                if here.op == 0 {
+                    state.mode = InflateMode::Lit;
+                    continue;
+                }
+                if (here.op & 32) != 0 {
+                    state.back = -1;
+                    state.mode = InflateMode::Type;
+                    continue;
+                }
+                if (here.op & 64) != 0 {
+                    strm.msg = Some("invalid literal/length code".into());
+                    state.mode = InflateMode::Bad;
+                    continue;
+                }
                 state.extra = (here.op & 15) as u32;
-                state.mode = InflateMode::LenExt; continue;
+                state.mode = InflateMode::LenExt;
+                continue;
             }
 
             // ── LENEXT ──────────────────────────────────────────────
             InflateMode::LenExt => {
                 if state.extra != 0 {
-                    while bits_count < state.extra { if have == 0 { break 'inf; } have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8; }
+                    while bits_count < state.extra {
+                        if have == 0 {
+                            break 'inf;
+                        }
+                        have -= 1;
+                        hold |= (in_buf[in_pos] as u64) << bits_count;
+                        in_pos += 1;
+                        bits_count += 8;
+                    }
                     state.length += bits_val(hold, state.extra);
                     drop_bits(&mut hold, &mut bits_count, state.extra);
                     state.back += state.extra as i32;
                 }
                 state.was = state.length;
-                state.mode = InflateMode::Dist; continue;
+                state.mode = InflateMode::Dist;
+                continue;
             }
 
             // ── DIST ────────────────────────────────────────────────
@@ -984,44 +1346,76 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                 loop {
                     let idx = bits_val(hold, state.distbits) as usize;
                     here = state.dist_code(idx);
-                    if (here.bits as u32) <= bits_count { break; }
-                    if have == 0 { break 'inf; }
-                    have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8;
+                    if (here.bits as u32) <= bits_count {
+                        break;
+                    }
+                    if have == 0 {
+                        break 'inf;
+                    }
+                    have -= 1;
+                    hold |= (in_buf[in_pos] as u64) << bits_count;
+                    in_pos += 1;
+                    bits_count += 8;
                 }
                 if (here.op & 0xf0) == 0 {
                     let last_e = here;
                     loop {
-                        let idx = last_e.val as usize + (bits_val(hold, last_e.bits as u32 + last_e.op as u32) >> last_e.bits) as usize;
+                        let idx = last_e.val as usize
+                            + (bits_val(hold, last_e.bits as u32 + last_e.op as u32) >> last_e.bits)
+                                as usize;
                         here = state.dist_code(idx);
-                        if (last_e.bits as u32 + here.bits as u32) <= bits_count { break; }
-                        if have == 0 { break 'inf; }
-                        have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8;
+                        if (last_e.bits as u32 + here.bits as u32) <= bits_count {
+                            break;
+                        }
+                        if have == 0 {
+                            break 'inf;
+                        }
+                        have -= 1;
+                        hold |= (in_buf[in_pos] as u64) << bits_count;
+                        in_pos += 1;
+                        bits_count += 8;
                     }
                     drop_bits(&mut hold, &mut bits_count, last_e.bits as u32);
                     state.back += last_e.bits as i32;
                 }
                 drop_bits(&mut hold, &mut bits_count, here.bits as u32);
                 state.back += here.bits as i32;
-                if (here.op & 64) != 0 { strm.msg = Some("invalid distance code".into()); state.mode = InflateMode::Bad; continue; }
+                if (here.op & 64) != 0 {
+                    strm.msg = Some("invalid distance code".into());
+                    state.mode = InflateMode::Bad;
+                    continue;
+                }
                 state.offset = here.val as u32;
                 state.extra = (here.op & 15) as u32;
-                state.mode = InflateMode::DistExt; continue;
+                state.mode = InflateMode::DistExt;
+                continue;
             }
 
             // ── DISTEXT ─────────────────────────────────────────────
             InflateMode::DistExt => {
                 if state.extra != 0 {
-                    while bits_count < state.extra { if have == 0 { break 'inf; } have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8; }
+                    while bits_count < state.extra {
+                        if have == 0 {
+                            break 'inf;
+                        }
+                        have -= 1;
+                        hold |= (in_buf[in_pos] as u64) << bits_count;
+                        in_pos += 1;
+                        bits_count += 8;
+                    }
                     state.offset += bits_val(hold, state.extra);
                     drop_bits(&mut hold, &mut bits_count, state.extra);
                     state.back += state.extra as i32;
                 }
-                state.mode = InflateMode::Match; continue;
+                state.mode = InflateMode::Match;
+                continue;
             }
 
             // ── MATCH ───────────────────────────────────────────────
             InflateMode::Match => {
-                if left == 0 { break 'inf; }
+                if left == 0 {
+                    break 'inf;
+                }
                 let written = (out_start - left) as usize;
                 if (state.offset as usize) > written {
                     // Copy from window
@@ -1040,7 +1434,8 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                     let mut cp = copy_from_win.min(left as usize);
                     for i in 0..cp {
                         out_buf[out_pos] = state.window[(from_idx + i) % state.wsize];
-                        out_pos += 1; left -= 1;
+                        out_pos += 1;
+                        left -= 1;
                     }
                     state.length -= cp as u32;
                     // Continue from output if more needed
@@ -1049,101 +1444,177 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                         cp = (state.length as usize).min(left as usize);
                         for i in 0..cp {
                             out_buf[out_pos] = out_buf[from_out + i];
-                            out_pos += 1; left -= 1;
+                            out_pos += 1;
+                            left -= 1;
                         }
                         state.length -= cp as u32;
                     }
                 } else {
                     let from_out = out_pos - state.offset as usize;
                     let mut cp = state.length as usize;
-                    if cp > left as usize { cp = left as usize; }
+                    if cp > left as usize {
+                        cp = left as usize;
+                    }
                     for i in 0..cp {
                         out_buf[out_pos] = out_buf[from_out + i];
                         out_pos += 1;
                     }
-                    left -= cp as u32; state.length -= cp as u32;
+                    left -= cp as u32;
+                    state.length -= cp as u32;
                 }
-                if state.length == 0 { state.mode = InflateMode::Len; }
+                if state.length == 0 {
+                    state.mode = InflateMode::Len;
+                }
             }
 
             // ── LIT ─────────────────────────────────────────────────
             InflateMode::Lit => {
-                if left == 0 { break 'inf; }
+                if left == 0 {
+                    break 'inf;
+                }
                 out_buf[out_pos] = state.length as u8;
-                out_pos += 1; left -= 1;
+                out_pos += 1;
+                left -= 1;
                 state.mode = InflateMode::Len;
             }
 
             // ── CHECK ───────────────────────────────────────────────
             InflateMode::Check => {
                 if state.wrap != 0 {
-                    while bits_count < 32 { if have == 0 { break 'inf; } have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8; }
+                    while bits_count < 32 {
+                        if have == 0 {
+                            break 'inf;
+                        }
+                        have -= 1;
+                        hold |= (in_buf[in_pos] as u64) << bits_count;
+                        in_pos += 1;
+                        bits_count += 8;
+                    }
                     let out_bytes = out_start - left;
-                    strm.total_out += out_bytes as u64; state.total += out_bytes as u64;
+                    strm.total_out += out_bytes as u64;
+                    state.total += out_bytes as u64;
                     if (state.wrap & 4) != 0 && out_bytes > 0 {
                         let cs = out_pos - out_bytes as usize;
                         let nc = update_check(state.check, &out_buf[cs..out_pos], state.flags);
-                        strm.adler = nc as u64; state.check = nc;
+                        strm.adler = nc as u64;
+                        state.check = nc;
                     }
                     let check_hold = {
                         #[cfg(feature = "gzip")]
-                        { if state.flags != 0 { hold as u32 } else { zswap32(hold as u32) } }
+                        {
+                            if state.flags != 0 {
+                                hold as u32
+                            } else {
+                                zswap32(hold as u32)
+                            }
+                        }
                         #[cfg(not(feature = "gzip"))]
-                        { zswap32(hold as u32) }
+                        {
+                            zswap32(hold as u32)
+                        }
                     };
                     if (state.wrap & 4) != 0 && check_hold != state.check {
                         strm.msg = Some("incorrect data check".into());
                         state.mode = InflateMode::Bad;
                         // Undo total_out adjustment
-                        strm.total_out -= out_bytes as u64; state.total -= out_bytes as u64;
+                        strm.total_out -= out_bytes as u64;
+                        state.total -= out_bytes as u64;
                         continue;
                     }
                     // Undo total_out since inf_leave will redo
-                    strm.total_out -= out_bytes as u64; state.total -= out_bytes as u64;
+                    strm.total_out -= out_bytes as u64;
+                    state.total -= out_bytes as u64;
                     init_bits(&mut hold, &mut bits_count);
                 }
                 #[cfg(feature = "gzip")]
-                { state.mode = InflateMode::Length; continue; }
+                {
+                    state.mode = InflateMode::Length;
+                    continue;
+                }
                 #[cfg(not(feature = "gzip"))]
-                { state.mode = InflateMode::Done; continue; }
+                {
+                    state.mode = InflateMode::Done;
+                    continue;
+                }
             }
 
             // ── LENGTH ──────────────────────────────────────────────
             #[cfg(feature = "gzip")]
             InflateMode::Length => {
                 if state.wrap != 0 && state.flags != 0 {
-                    while bits_count < 32 { if have == 0 { break 'inf; } have -= 1; hold |= (in_buf[in_pos] as u64) << bits_count; in_pos += 1; bits_count += 8; }
+                    while bits_count < 32 {
+                        if have == 0 {
+                            break 'inf;
+                        }
+                        have -= 1;
+                        hold |= (in_buf[in_pos] as u64) << bits_count;
+                        in_pos += 1;
+                        bits_count += 8;
+                    }
                     if (state.wrap & 4) != 0 && hold as u32 != (state.total & 0xffffffff) as u32 {
                         strm.msg = Some("incorrect length check".into());
-                        state.mode = InflateMode::Bad; continue;
+                        state.mode = InflateMode::Bad;
+                        continue;
                     }
                     init_bits(&mut hold, &mut bits_count);
                 }
-                state.mode = InflateMode::Done; continue;
+                state.mode = InflateMode::Done;
+                continue;
             }
             #[cfg(not(feature = "gzip"))]
-            InflateMode::Length => { state.mode = InflateMode::Done; continue; }
+            InflateMode::Length => {
+                state.mode = InflateMode::Done;
+                continue;
+            }
 
             // ── Terminal states ──────────────────────────────────────
-            InflateMode::Done => { ret = ReturnCode::StreamEnd; break 'inf; }
+            InflateMode::Done => {
+                ret = ReturnCode::StreamEnd;
+                break 'inf;
+            }
             InflateMode::Bad => {
-                state.hold = hold; state.bits = bits_count;
-                strm.avail_in = have; strm.avail_out = left;
+                state.hold = hold;
+                state.bits = bits_count;
+                strm.avail_in = have;
+                strm.avail_out = left;
                 strm.total_in += (in_start - have) as u64;
                 strm.total_out += (out_start - left) as u64;
                 state.total += (out_start - left) as u64;
                 // SAFETY: next_in/next_out are non-null (guarded) and in_pos/out_pos
                 // are bounded by the original avail_in/avail_out supplied by the caller.
-                if !strm.next_in.is_null() && in_pos > 0 { strm.next_in = unsafe { strm.next_in.add(in_pos) }; }
-                if !strm.next_out.is_null() && out_pos > 0 { strm.next_out = unsafe { strm.next_out.add(out_pos) }; }
-                strm.data_type = bits_count as i32 + (if state.last { 64 } else { 0 })
-                    + (if state.mode == InflateMode::Type { 128 } else { 0 })
-                    + (if state.mode == InflateMode::Len_ || state.mode == InflateMode::Copy_ { 256 } else { 0 });
+                if !strm.next_in.is_null() && in_pos > 0 {
+                    strm.next_in = unsafe { strm.next_in.add(in_pos) };
+                }
+                if !strm.next_out.is_null() && out_pos > 0 {
+                    strm.next_out = unsafe { strm.next_out.add(out_pos) };
+                }
+                strm.data_type = bits_count as i32
+                    + (if state.last { 64 } else { 0 })
+                    + (if state.mode == InflateMode::Type {
+                        128
+                    } else {
+                        0
+                    })
+                    + (if state.mode == InflateMode::Len_ || state.mode == InflateMode::Copy_ {
+                        256
+                    } else {
+                        0
+                    });
                 strm.state = StreamState::Inflate(state_box);
                 return Err(ZlibError::DataError);
             }
-            InflateMode::Mem => { state.hold = hold; state.bits = bits_count; strm.state = StreamState::Inflate(state_box); return Err(ZlibError::MemError); }
-            InflateMode::Sync => { state.hold = hold; state.bits = bits_count; strm.state = StreamState::Inflate(state_box); return Err(ZlibError::StreamError); }
+            InflateMode::Mem => {
+                state.hold = hold;
+                state.bits = bits_count;
+                strm.state = StreamState::Inflate(state_box);
+                return Err(ZlibError::MemError);
+            }
+            InflateMode::Sync => {
+                state.hold = hold;
+                state.bits = bits_count;
+                strm.state = StreamState::Inflate(state_box);
+                return Err(ZlibError::StreamError);
+            }
         }
     }
 
@@ -1151,8 +1622,10 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
     state.hold = hold;
     state.bits = bits_count;
     let out_produced = (out_start - left) as usize;
-    if (state.wsize > 0 || (out_produced > 0 && state.mode != InflateMode::Bad
-        && (state.mode != InflateMode::Check || flush != Z_FINISH)))
+    if (state.wsize > 0
+        || (out_produced > 0
+            && state.mode != InflateMode::Bad
+            && (state.mode != InflateMode::Check || flush != Z_FINISH)))
         && out_produced > 0
         && update_window(state, &out_buf[..out_pos], out_produced).is_err()
     {
@@ -1162,25 +1635,39 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
     }
     let in_consumed = (in_start - have) as u64;
     let out_consumed = (out_start - left) as u64;
-    strm.avail_in = have; strm.avail_out = left;
-    strm.total_in += in_consumed; strm.total_out += out_consumed;
+    strm.avail_in = have;
+    strm.avail_out = left;
+    strm.total_in += in_consumed;
+    strm.total_out += out_consumed;
     state.total += out_consumed;
     // SAFETY: next_in/next_out are non-null (guarded) and in_pos/out_pos
     // are bounded by the original avail_in/avail_out supplied by the caller.
-    if !strm.next_in.is_null() && in_pos > 0 { strm.next_in = unsafe { strm.next_in.add(in_pos) }; }
-    if !strm.next_out.is_null() && out_pos > 0 { strm.next_out = unsafe { strm.next_out.add(out_pos) }; }
+    if !strm.next_in.is_null() && in_pos > 0 {
+        strm.next_in = unsafe { strm.next_in.add(in_pos) };
+    }
+    if !strm.next_out.is_null() && out_pos > 0 {
+        strm.next_out = unsafe { strm.next_out.add(out_pos) };
+    }
     if (state.wrap & 4) != 0 && out_consumed > 0 {
         let cs = out_pos - out_consumed as usize;
         let nc = update_check(state.check, &out_buf[cs..out_pos], state.flags);
-        strm.adler = nc as u64; state.check = nc;
+        strm.adler = nc as u64;
+        state.check = nc;
     }
-    strm.data_type = bits_count as i32 + (if state.last { 64 } else { 0 })
-        + (if state.mode == InflateMode::Type { 128 } else { 0 })
-        + (if state.mode == InflateMode::Len_ || state.mode == InflateMode::Copy_ { 256 } else { 0 });
+    strm.data_type = bits_count as i32
+        + (if state.last { 64 } else { 0 })
+        + (if state.mode == InflateMode::Type {
+            128
+        } else {
+            0
+        })
+        + (if state.mode == InflateMode::Len_ || state.mode == InflateMode::Copy_ {
+            256
+        } else {
+            0
+        });
     strm.state = StreamState::Inflate(state_box);
-    if ((in_consumed == 0 && out_consumed == 0) || flush == Z_FINISH)
-        && ret == ReturnCode::Ok
-    {
+    if ((in_consumed == 0 && out_consumed == 0) || flush == Z_FINISH) && ret == ReturnCode::Ok {
         return Err(ZlibError::BufError);
     }
     Ok(ret)
@@ -1192,7 +1679,9 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
 
 /// End an inflate stream, freeing all allocated memory.
 pub fn inflate_end(strm: &mut ZStream) -> ZlibResult {
-    if !strm.state.is_inflate() { return Err(ZlibError::StreamError); }
+    if !strm.state.is_inflate() {
+        return Err(ZlibError::StreamError);
+    }
     strm.state = StreamState::None;
     Ok(ReturnCode::Ok)
 }
@@ -1216,13 +1705,20 @@ pub fn inflate_get_dictionary(strm: &ZStream, dictionary: &mut [u8]) -> Result<u
 /// Set a preset decompression dictionary.
 pub fn inflate_set_dictionary(strm: &mut ZStream, dictionary: &[u8]) -> ZlibResult {
     let state = strm.state.as_inflate_mut().ok_or(ZlibError::StreamError)?;
-    if state.wrap != 0 && state.mode != InflateMode::Dict { return Err(ZlibError::StreamError); }
+    if state.wrap != 0 && state.mode != InflateMode::Dict {
+        return Err(ZlibError::StreamError);
+    }
     if state.mode == InflateMode::Dict {
         let mut id = adler32(0, &[]);
         id = adler32(id, dictionary);
-        if id != state.check { return Err(ZlibError::DataError); }
+        if id != state.check {
+            return Err(ZlibError::DataError);
+        }
     }
-    update_window(state, dictionary, dictionary.len()).map_err(|_| { state.mode = InflateMode::Mem; ZlibError::MemError })?;
+    update_window(state, dictionary, dictionary.len()).map_err(|_| {
+        state.mode = InflateMode::Mem;
+        ZlibError::MemError
+    })?;
     state.havedict = true;
     Ok(ReturnCode::Ok)
 }
@@ -1231,8 +1727,11 @@ pub fn inflate_set_dictionary(strm: &mut ZStream, dictionary: &[u8]) -> ZlibResu
 #[cfg(feature = "gzip")]
 pub fn inflate_get_header(strm: &mut ZStream, head: GzHeader) -> ZlibResult {
     let state = strm.state.as_inflate_mut().ok_or(ZlibError::StreamError)?;
-    if (state.wrap & 2) == 0 { return Err(ZlibError::StreamError); }
-    let mut h = head; h.done = false;
+    if (state.wrap & 2) == 0 {
+        return Err(ZlibError::StreamError);
+    }
+    let mut h = head;
+    h.done = false;
     state.head = Some(Box::new(h));
     Ok(ReturnCode::Ok)
 }
@@ -1240,21 +1739,30 @@ pub fn inflate_get_header(strm: &mut ZStream, head: GzHeader) -> ZlibResult {
 /// Register a GzHeader (no-op when gzip feature disabled).
 #[cfg(not(feature = "gzip"))]
 pub fn inflate_get_header(strm: &mut ZStream, _head: crate::gz_header::GzHeader) -> ZlibResult {
-    if !strm.state.is_inflate() { return Err(ZlibError::StreamError); }
+    if !strm.state.is_inflate() {
+        return Err(ZlibError::StreamError);
+    }
     Err(ZlibError::StreamError)
 }
 
 /// Search for a synchronization point in the compressed stream.
 pub fn inflate_sync(strm: &mut ZStream) -> ZlibResult {
     let state = strm.state.as_inflate_mut().ok_or(ZlibError::StreamError)?;
-    if strm.avail_in == 0 && state.bits < 8 { return Err(ZlibError::BufError); }
+    if strm.avail_in == 0 && state.bits < 8 {
+        return Err(ZlibError::BufError);
+    }
     if state.mode != InflateMode::Sync {
         state.mode = InflateMode::Sync;
         state.hold >>= state.bits & 7;
         state.bits -= state.bits & 7;
         let mut buf = [0u8; 4];
         let mut len = 0usize;
-        while state.bits >= 8 { buf[len] = state.hold as u8; state.hold >>= 8; state.bits -= 8; len += 1; }
+        while state.bits >= 8 {
+            buf[len] = state.hold as u8;
+            state.hold >>= 8;
+            state.bits -= 8;
+            len += 1;
+        }
         state.have = 0;
         sync_search(&mut state.have, &buf[..len]);
     }
@@ -1269,30 +1777,46 @@ pub fn inflate_sync(strm: &mut ZStream) -> ZlibResult {
         strm.next_in = unsafe { strm.next_in.add(consumed) };
         strm.total_in += consumed as u64;
     }
-    if state.have != 4 { return Err(ZlibError::DataError); }
-    if state.flags == -1 { state.wrap = 0; } else { state.wrap &= !4; }
+    if state.have != 4 {
+        return Err(ZlibError::DataError);
+    }
+    if state.flags == -1 {
+        state.wrap = 0;
+    } else {
+        state.wrap &= !4;
+    }
     let flags = state.flags;
-    let ti = strm.total_in; let to = strm.total_out;
+    let ti = strm.total_in;
+    let to = strm.total_out;
     inflate_reset(strm)?;
     let state = strm.state.as_inflate_mut().ok_or(ZlibError::StreamError)?;
-    strm.total_in = ti; strm.total_out = to;
-    state.flags = flags; state.mode = InflateMode::Type;
+    strm.total_in = ti;
+    strm.total_out = to;
+    state.flags = flags;
+    state.mode = InflateMode::Type;
     Ok(ReturnCode::Ok)
 }
 
 /// Returns true if inflate is at the end of a sync-flush block.
 pub fn inflate_sync_point(strm: &ZStream) -> bool {
-    strm.state.as_inflate().is_some_and(|s| s.mode == InflateMode::Stored && s.bits == 0)
+    strm.state
+        .as_inflate()
+        .is_some_and(|s| s.mode == InflateMode::Stored && s.bits == 0)
 }
 
 /// Deep-copy an inflate stream state.
 pub fn inflate_copy(dest: &mut ZStream, source: &ZStream) -> ZlibResult {
     let src_state = source.state.as_inflate().ok_or(ZlibError::StreamError)?;
     let cloned = src_state.clone();
-    dest.avail_in = source.avail_in; dest.avail_out = source.avail_out;
-    dest.total_in = source.total_in; dest.total_out = source.total_out;
-    dest.msg = source.msg.clone(); dest.data_type = source.data_type;
-    dest.adler = source.adler; dest.next_in = source.next_in; dest.next_out = source.next_out;
+    dest.avail_in = source.avail_in;
+    dest.avail_out = source.avail_out;
+    dest.total_in = source.total_in;
+    dest.total_out = source.total_out;
+    dest.msg = source.msg.clone();
+    dest.data_type = source.data_type;
+    dest.adler = source.adler;
+    dest.next_in = source.next_in;
+    dest.next_out = source.next_out;
     dest.state = StreamState::Inflate(Box::new(cloned));
     Ok(ReturnCode::Ok)
 }
@@ -1301,7 +1825,11 @@ pub fn inflate_copy(dest: &mut ZStream, source: &ZStream) -> ZlibResult {
 pub fn inflate_mark(strm: &ZStream) -> i64 {
     strm.state.as_inflate().map_or(-(1i64 << 16), |s| {
         let back = ((s.back as i64) & 0xffff) << 16;
-        let li = match s.mode { InflateMode::Copy => s.length as i64, InflateMode::Match => (s.was - s.length) as i64, _ => 0 };
+        let li = match s.mode {
+            InflateMode::Copy => s.length as i64,
+            InflateMode::Match => (s.was - s.length) as i64,
+            _ => 0,
+        };
         back + li
     })
 }
@@ -1309,7 +1837,11 @@ pub fn inflate_mark(strm: &ZStream) -> i64 {
 /// Enable or disable check-value validation.
 pub fn inflate_validate(strm: &mut ZStream, check: bool) -> ZlibResult {
     let state = strm.state.as_inflate_mut().ok_or(ZlibError::StreamError)?;
-    if check && state.wrap != 0 { state.wrap |= 4; } else { state.wrap &= !4; }
+    if check && state.wrap != 0 {
+        state.wrap |= 4;
+    } else {
+        state.wrap &= !4;
+    }
     Ok(ReturnCode::Ok)
 }
 

@@ -37,6 +37,10 @@
 //! - **Called by:** Main `deflate()` loop when `state.strategy == Z_RLE`
 //! - **Calls:** `fill_window`, `tally_dist`, `tally_lit`, `tr_flush_block`
 
+// In no_std mode, pull alloc types that the std prelude normally provides.
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::constants::{MAX_MATCH, MIN_MATCH, Z_FINISH, Z_NO_FLUSH};
 use crate::deflate::state::{BlockState, DeflateState};
 use crate::deflate::trees::{tally_dist, tally_lit, tr_flush_block};
@@ -158,7 +162,9 @@ pub(crate) fn deflate_rle(state: &mut DeflateState, strm: *mut ZStream, flush: i
         // ------------------------------------------------------------------
         if state.lookahead <= MAX_MATCH {
             // SAFETY: strm is valid for the duration of deflate().
-            unsafe { do_fill_window(state, strm); }
+            unsafe {
+                do_fill_window(state, strm);
+            }
 
             if state.lookahead <= MAX_MATCH && flush == Z_NO_FLUSH {
                 return BlockState::NeedMore;
@@ -275,7 +281,9 @@ mod tests {
     use super::*;
     use crate::stream::ZStream;
 
-    fn dummy_strm() -> ZStream { ZStream::new() }
+    fn dummy_strm() -> ZStream {
+        ZStream::new()
+    }
 
     /// Helper: create a minimal `DeflateState` for testing the RLE
     /// algorithm. Sets up a small window with controlled data and

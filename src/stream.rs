@@ -63,6 +63,13 @@
 use core::fmt;
 use core::ptr;
 
+// In no_std mode, pull alloc types that the std prelude normally provides.
+#[cfg(not(feature = "std"))]
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+};
+
 use crate::constants::{Z_BINARY, Z_TEXT, Z_UNKNOWN};
 use crate::deflate::state::DeflateState;
 use crate::error::{ReturnCode, ZlibError};
@@ -253,7 +260,6 @@ impl Default for StreamState {
 /// ```
 pub struct ZStream {
     // --- Input buffer management ---
-
     /// Raw pointer to the next unprocessed input byte.
     ///
     /// Updated by [`set_input`](Self::set_input) and advanced internally by
@@ -276,7 +282,6 @@ pub struct ZStream {
     pub total_in: u64,
 
     // --- Output buffer management ---
-
     /// Raw pointer to the next output position.
     ///
     /// Updated by [`set_output`](Self::set_output) and advanced internally
@@ -297,7 +302,6 @@ pub struct ZStream {
     pub total_out: u64,
 
     // --- Error / status ---
-
     /// Last error message, or `None` if no error has occurred.
     ///
     /// Set by the engine when a [`ZlibError`] is returned. Provides
@@ -306,7 +310,6 @@ pub struct ZStream {
     pub msg: Option<String>,
 
     // --- Internal state ---
-
     /// Internal compression or decompression engine state.
     ///
     /// - [`StreamState::None`] before any `*_init` call.
@@ -319,7 +322,6 @@ pub struct ZStream {
     pub(crate) state: StreamState,
 
     // --- Data type and checksum ---
-
     /// Best guess about the data type being compressed.
     ///
     /// One of [`Z_BINARY`], [`Z_TEXT`], or [`Z_UNKNOWN`]. Updated by the
@@ -754,12 +756,7 @@ impl fmt::Display for ZStream {
         write!(
             f,
             "ZStream(state={}, in={}/{}, out={}/{}, adler=0x{:08x})",
-            self.state,
-            self.avail_in,
-            self.total_in,
-            self.avail_out,
-            self.total_out,
-            self.adler,
+            self.state, self.avail_in, self.total_in, self.avail_out, self.total_out, self.adler,
         )
     }
 }

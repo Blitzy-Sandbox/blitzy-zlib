@@ -32,12 +32,16 @@
 // once the full inflate API surface is wired up through mod.rs.
 #![allow(dead_code)]
 
+// In no_std mode, pull alloc types that the std prelude normally provides.
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec, vec::Vec};
+
 use crate::error::{ReturnCode, ZlibError, ZlibResult};
 use crate::stream::{StreamState, ZStream};
 
 use super::fast::inflate_fast;
 use super::state::{InflateMode, InflateState};
-use super::tables::{inflate_table, Code, CodeType};
+use super::tables::{Code, CodeType, inflate_table};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -174,11 +178,7 @@ pub trait InflateBackOutput {
 /// let mut window = vec![0u8; 1 << 15];
 /// inflate_back_init(&mut strm, 15, &mut window).unwrap();
 /// ```
-pub fn inflate_back_init(
-    strm: &mut ZStream,
-    window_bits: i32,
-    window: &mut [u8],
-) -> ZlibResult {
+pub fn inflate_back_init(strm: &mut ZStream, window_bits: i32, window: &mut [u8]) -> ZlibResult {
     // Validate window_bits range: raw DEFLATE only (8..=15)
     if !(8..=15).contains(&window_bits) {
         return Err(ZlibError::StreamError);
@@ -296,11 +296,7 @@ fn need_bits<I: InflateBackInput>(
 /// * `Err(ZlibError::BufError)` -- Input callback returned empty or output
 ///   callback returned an error.
 /// * `Err(ZlibError::StreamError)` -- Stream not properly initialised.
-pub fn inflate_back<I, O>(
-    strm: &mut ZStream,
-    in_fn: &mut I,
-    out_fn: &mut O,
-) -> ZlibResult
+pub fn inflate_back<I, O>(strm: &mut ZStream, in_fn: &mut I, out_fn: &mut O) -> ZlibResult
 where
     I: InflateBackInput,
     O: InflateBackOutput,
@@ -358,14 +354,18 @@ where
                     let drop_count = bits & 7;
                     hold >>= drop_count;
                     bits -= drop_count;
-                    strm.state.as_inflate_mut().unwrap().mode =
-                        InflateMode::Done;
+                    strm.state.as_inflate_mut().unwrap().mode = InflateMode::Done;
                     continue;
                 }
 
                 if !need_bits(
-                    3, &mut hold, &mut bits, &mut have,
-                    in_fn, &mut input_buf, &mut in_pos,
+                    3,
+                    &mut hold,
+                    &mut bits,
+                    &mut have,
+                    in_fn,
+                    &mut input_buf,
+                    &mut in_pos,
                 ) {
                     ret = Err(ZlibError::BufError);
                     break 'inf;
@@ -406,18 +406,21 @@ where
                 bits -= drop_count;
 
                 if !need_bits(
-                    32, &mut hold, &mut bits, &mut have,
-                    in_fn, &mut input_buf, &mut in_pos,
+                    32,
+                    &mut hold,
+                    &mut bits,
+                    &mut have,
+                    in_fn,
+                    &mut input_buf,
+                    &mut in_pos,
                 ) {
                     ret = Err(ZlibError::BufError);
                     break 'inf;
                 }
 
                 if (hold & 0xffff) != ((hold >> 16) ^ 0xffff) {
-                    strm.msg =
-                        Some("invalid stored block lengths".into());
-                    strm.state.as_inflate_mut().unwrap().mode =
-                        InflateMode::Bad;
+                    strm.msg = Some("invalid stored block lengths".into());
+                    strm.state.as_inflate_mut().unwrap().mode = InflateMode::Bad;
                     continue;
                 }
 
@@ -427,21 +430,14 @@ where
                 bits = 0;
 
                 while strm.state.as_inflate().unwrap().length != 0 {
-                    if have == 0
-                        && !pull_input(
-                            in_fn, &mut input_buf,
-                            &mut in_pos, &mut have,
-                        )
-                    {
+                    if have == 0 && !pull_input(in_fn, &mut input_buf, &mut in_pos, &mut have) {
                         ret = Err(ZlibError::BufError);
                         break 'inf;
                     }
 
                     if left == 0 {
-                        let state =
-                            strm.state.as_inflate_mut().unwrap();
-                        let flush_data =
-                            state.window[..wsize].to_vec();
+                        let state = strm.state.as_inflate_mut().unwrap();
+                        let flush_data = state.window[..wsize].to_vec();
                         if let Err(e) = out_fn.write(&flush_data) {
                             ret = Err(e);
                             break 'inf;
@@ -451,9 +447,7 @@ where
                         state.whave = wsize;
                     }
 
-                    let remaining =
-                        strm.state.as_inflate().unwrap().length
-                            as usize;
+                    let remaining = strm.state.as_inflate().unwrap().length as usize;
                     let mut copy = remaining;
                     if copy > have {
                         copy = have;
@@ -462,11 +456,9 @@ where
                         copy = left;
                     }
 
-                    let state =
-                        strm.state.as_inflate_mut().unwrap();
-                    state.window[put..put + copy].copy_from_slice(
-                        &input_buf[in_pos..in_pos + copy],
-                    );
+                    let state = strm.state.as_inflate_mut().unwrap();
+                    state.window[put..put + copy]
+                        .copy_from_slice(&input_buf[in_pos..in_pos + copy]);
                     have -= copy;
                     in_pos += copy;
                     left -= copy;
@@ -474,15 +466,19 @@ where
                     state.length -= copy as u32;
                 }
 
-                strm.state.as_inflate_mut().unwrap().mode =
-                    InflateMode::Type;
+                strm.state.as_inflate_mut().unwrap().mode = InflateMode::Type;
             }
 
             // TABLE: read dynamic table descriptor (lines 294-418)
             InflateMode::Table => {
                 if !need_bits(
-                    14, &mut hold, &mut bits, &mut have,
-                    in_fn, &mut input_buf, &mut in_pos,
+                    14,
+                    &mut hold,
+                    &mut bits,
+                    &mut have,
+                    in_fn,
+                    &mut input_buf,
+                    &mut in_pos,
                 ) {
                     ret = Err(ZlibError::BufError);
                     break 'inf;
@@ -499,17 +495,13 @@ where
                 bits -= 4;
 
                 if nlen > 286 || ndist > 30 {
-                    strm.msg = Some(
-                        "too many length or distance symbols".into(),
-                    );
-                    strm.state.as_inflate_mut().unwrap().mode =
-                        InflateMode::Bad;
+                    strm.msg = Some("too many length or distance symbols".into());
+                    strm.state.as_inflate_mut().unwrap().mode = InflateMode::Bad;
                     continue;
                 }
 
                 {
-                    let state =
-                        strm.state.as_inflate_mut().unwrap();
+                    let state = strm.state.as_inflate_mut().unwrap();
                     state.nlen = nlen;
                     state.ndist = ndist;
                     state.ncode = ncode;
@@ -518,19 +510,22 @@ where
 
                 // Read code-length code lengths
                 {
-                    let state =
-                        strm.state.as_inflate_mut().unwrap();
+                    let state = strm.state.as_inflate_mut().unwrap();
                     let mut local_have = state.have;
                     while local_have < ncode {
                         if !need_bits(
-                            3, &mut hold, &mut bits, &mut have,
-                            in_fn, &mut input_buf, &mut in_pos,
+                            3,
+                            &mut hold,
+                            &mut bits,
+                            &mut have,
+                            in_fn,
+                            &mut input_buf,
+                            &mut in_pos,
                         ) {
                             ret = Err(ZlibError::BufError);
                             break 'inf;
                         }
-                        state.lens[ORDER[local_have as usize]] =
-                            (hold & 7) as u16;
+                        state.lens[ORDER[local_have as usize]] = (hold & 7) as u16;
                         hold >>= 3;
                         bits -= 3;
                         local_have += 1;
@@ -544,8 +539,7 @@ where
 
                 // Build code-length decode table
                 {
-                    let state =
-                        strm.state.as_inflate_mut().unwrap();
+                    let state = strm.state.as_inflate_mut().unwrap();
                     state.lencode_idx = 0;
                     state.next = 0;
                     let mut root_bits = 7u32;
@@ -561,8 +555,7 @@ where
                     )
                     .is_err()
                     {
-                        strm.msg =
-                            Some("invalid code lengths set".into());
+                        strm.msg = Some("invalid code lengths set".into());
                         state.mode = InflateMode::Bad;
                         continue;
                     }
@@ -571,28 +564,22 @@ where
 
                 // Read lit/len and distance code lengths
                 let total_codes = {
-                    let st =
-                        strm.state.as_inflate_mut().unwrap();
+                    let st = strm.state.as_inflate_mut().unwrap();
                     st.have = 0;
                     st.nlen + st.ndist
                 };
 
                 'codelens: loop {
-                    let current_have =
-                        strm.state.as_inflate().unwrap().have;
+                    let current_have = strm.state.as_inflate().unwrap().have;
                     if current_have >= total_codes {
                         break 'codelens;
                     }
 
                     let here: Code;
                     loop {
-                        let state =
-                            strm.state.as_inflate().unwrap();
-                        let idx = (hold
-                            & ((1u64 << state.lenbits) - 1))
-                            as usize;
-                        let entry =
-                            state.codes[state.lencode_idx + idx];
+                        let state = strm.state.as_inflate().unwrap();
+                        let idx = (hold & ((1u64 << state.lenbits) - 1)) as usize;
+                        let entry = state.codes[state.lencode_idx + idx];
                         if (entry.bits as u32) <= bits {
                             here = entry;
                             break;
@@ -614,8 +601,7 @@ where
                     if here.val < 16 {
                         hold >>= here.bits as u32;
                         bits -= here.bits as u32;
-                        let state =
-                            strm.state.as_inflate_mut().unwrap();
+                        let state = strm.state.as_inflate_mut().unwrap();
                         state.lens[state.have as usize] = here.val;
                         state.have += 1;
                     } else {
@@ -625,45 +611,39 @@ where
                         if here.val == 16 {
                             let need = here.bits as u32 + 2;
                             if !need_bits(
-                                need, &mut hold, &mut bits,
-                                &mut have, in_fn,
-                                &mut input_buf, &mut in_pos,
+                                need,
+                                &mut hold,
+                                &mut bits,
+                                &mut have,
+                                in_fn,
+                                &mut input_buf,
+                                &mut in_pos,
                             ) {
                                 ret = Err(ZlibError::BufError);
                                 break 'inf;
                             }
                             hold >>= here.bits as u32;
                             bits -= here.bits as u32;
-                            let sh = strm
-                                .state
-                                .as_inflate()
-                                .unwrap()
-                                .have;
+                            let sh = strm.state.as_inflate().unwrap().have;
                             if sh == 0 {
-                                strm.msg = Some(
-                                    "invalid bit length repeat"
-                                        .into(),
-                                );
-                                strm.state
-                                    .as_inflate_mut()
-                                    .unwrap()
-                                    .mode = InflateMode::Bad;
+                                strm.msg = Some("invalid bit length repeat".into());
+                                strm.state.as_inflate_mut().unwrap().mode = InflateMode::Bad;
                                 break 'codelens;
                             }
-                            len = strm
-                                .state
-                                .as_inflate()
-                                .unwrap()
-                                .lens[(sh - 1) as usize];
+                            len = strm.state.as_inflate().unwrap().lens[(sh - 1) as usize];
                             copy_count = 3 + (hold & 3) as u32;
                             hold >>= 2;
                             bits -= 2;
                         } else if here.val == 17 {
                             let need = here.bits as u32 + 3;
                             if !need_bits(
-                                need, &mut hold, &mut bits,
-                                &mut have, in_fn,
-                                &mut input_buf, &mut in_pos,
+                                need,
+                                &mut hold,
+                                &mut bits,
+                                &mut have,
+                                in_fn,
+                                &mut input_buf,
+                                &mut in_pos,
                             ) {
                                 ret = Err(ZlibError::BufError);
                                 break 'inf;
@@ -678,9 +658,13 @@ where
                             // here.val == 18
                             let need = here.bits as u32 + 7;
                             if !need_bits(
-                                need, &mut hold, &mut bits,
-                                &mut have, in_fn,
-                                &mut input_buf, &mut in_pos,
+                                need,
+                                &mut hold,
+                                &mut bits,
+                                &mut have,
+                                in_fn,
+                                &mut input_buf,
+                                &mut in_pos,
                             ) {
                                 ret = Err(ZlibError::BufError);
                                 break 'inf;
@@ -688,29 +672,18 @@ where
                             hold >>= here.bits as u32;
                             bits -= here.bits as u32;
                             len = 0;
-                            copy_count =
-                                11 + (hold & 0x7f) as u32;
+                            copy_count = 11 + (hold & 0x7f) as u32;
                             hold >>= 7;
                             bits -= 7;
                         }
 
-                        let sh = strm
-                            .state
-                            .as_inflate()
-                            .unwrap()
-                            .have;
+                        let sh = strm.state.as_inflate().unwrap().have;
                         if sh + copy_count > total_codes {
-                            strm.msg = Some(
-                                "invalid bit length repeat".into(),
-                            );
-                            strm.state
-                                .as_inflate_mut()
-                                .unwrap()
-                                .mode = InflateMode::Bad;
+                            strm.msg = Some("invalid bit length repeat".into());
+                            strm.state.as_inflate_mut().unwrap().mode = InflateMode::Bad;
                             break 'codelens;
                         }
-                        let state =
-                            strm.state.as_inflate_mut().unwrap();
+                        let state = strm.state.as_inflate_mut().unwrap();
                         for _ in 0..copy_count {
                             state.lens[state.have as usize] = len;
                             state.have += 1;
@@ -718,33 +691,25 @@ where
                     }
                 } // end codelens
 
-                if strm.state.as_inflate().unwrap().mode
-                    == InflateMode::Bad
-                {
+                if strm.state.as_inflate().unwrap().mode == InflateMode::Bad {
                     continue;
                 }
 
                 // Validate end-of-block code
                 if strm.state.as_inflate().unwrap().lens[256] == 0 {
-                    strm.msg = Some(
-                        "invalid code -- missing end-of-block"
-                            .into(),
-                    );
-                    strm.state.as_inflate_mut().unwrap().mode =
-                        InflateMode::Bad;
+                    strm.msg = Some("invalid code -- missing end-of-block".into());
+                    strm.state.as_inflate_mut().unwrap().mode = InflateMode::Bad;
                     continue;
                 }
 
                 // Build literal/length decode table
                 {
-                    let state =
-                        strm.state.as_inflate_mut().unwrap();
+                    let state = strm.state.as_inflate_mut().unwrap();
                     state.lencode_idx = 0;
                     state.next = 0;
                     let nlen_usize = state.nlen as usize;
                     let mut len_root = 9u32;
-                    let lens_copy: Vec<u16> =
-                        state.lens.to_vec();
+                    let lens_copy: Vec<u16> = state.lens.to_vec();
                     if inflate_table(
                         CodeType::Lens,
                         &lens_copy,
@@ -756,9 +721,7 @@ where
                     )
                     .is_err()
                     {
-                        strm.msg = Some(
-                            "invalid literal/lengths set".into(),
-                        );
+                        strm.msg = Some("invalid literal/lengths set".into());
                         state.mode = InflateMode::Bad;
                         continue;
                     }
@@ -767,14 +730,12 @@ where
 
                 // Build distance decode table
                 {
-                    let state =
-                        strm.state.as_inflate_mut().unwrap();
+                    let state = strm.state.as_inflate_mut().unwrap();
                     state.distcode_idx = state.next;
                     let nlen_usize = state.nlen as usize;
                     let ndist_usize = state.ndist as usize;
                     let mut dist_root = 6u32;
-                    let lens_copy: Vec<u16> =
-                        state.lens.to_vec();
+                    let lens_copy: Vec<u16> = state.lens.to_vec();
                     if inflate_table(
                         CodeType::Dists,
                         &lens_copy[nlen_usize..],
@@ -786,24 +747,21 @@ where
                     )
                     .is_err()
                     {
-                        strm.msg =
-                            Some("invalid distances set".into());
+                        strm.msg = Some("invalid distances set".into());
                         state.mode = InflateMode::Bad;
                         continue;
                     }
                     state.distbits = dist_root;
                 }
 
-                strm.state.as_inflate_mut().unwrap().mode =
-                    InflateMode::Len;
+                strm.state.as_inflate_mut().unwrap().mode = InflateMode::Len;
             }
 
             // LEN: decode literals, lengths, distances (lines 422-543)
             InflateMode::Len => {
                 // Fast path via inflate_fast
                 if have >= 6 && left >= 258 {
-                    let state =
-                        strm.state.as_inflate_mut().unwrap();
+                    let state = strm.state.as_inflate_mut().unwrap();
                     state.hold = hold;
                     state.bits = bits;
 
@@ -818,20 +776,17 @@ where
                         &mut fi_out,
                         wsize,
                     );
-                    state.window[..wsize]
-                        .copy_from_slice(&work_buf[..wsize]);
+                    state.window[..wsize].copy_from_slice(&work_buf[..wsize]);
 
                     in_pos = fi_in;
                     put = fi_out;
                     hold = state.hold;
                     bits = state.bits;
-                    have =
-                        input_buf.len().saturating_sub(in_pos);
+                    have = input_buf.len().saturating_sub(in_pos);
                     left = wsize.saturating_sub(put);
 
                     if state.mode == InflateMode::Bad {
-                        strm.msg =
-                            state.msg.as_ref().cloned();
+                        strm.msg = state.msg.as_ref().cloned();
                         continue;
                     }
                     continue;
@@ -840,11 +795,8 @@ where
                 // Slow path: one symbol at a time
                 let here: Code;
                 loop {
-                    let state =
-                        strm.state.as_inflate().unwrap();
-                    let idx = (hold
-                        & ((1u64 << state.lenbits) - 1))
-                        as usize;
+                    let state = strm.state.as_inflate().unwrap();
+                    let idx = (hold & ((1u64 << state.lenbits) - 1)) as usize;
                     let entry = state.len_code(idx);
                     if (entry.bits as u32) <= bits {
                         here = entry;
@@ -865,49 +817,38 @@ where
                 }
 
                 // Handle 2nd-level sub-table for length codes
-                let here =
-                    if here.op != 0 && (here.op & 0xf0) == 0 {
-                        let last = here;
-                        let resolved: Code;
-                        loop {
-                            let state =
-                                strm.state.as_inflate().unwrap();
-                            let idx = last.val as usize
-                                + ((hold
-                                    & ((1u64
-                                        << (last.bits + last.op))
-                                        - 1))
-                                    >> last.bits)
-                                    as usize;
-                            let entry = state.len_code(idx);
-                            if (last.bits as u32
-                                + entry.bits as u32)
-                                <= bits
-                            {
-                                resolved = entry;
-                                break;
-                            }
-                            if !need_bits(
-                                last.bits as u32
-                                    + entry.bits as u32,
-                                &mut hold,
-                                &mut bits,
-                                &mut have,
-                                in_fn,
-                                &mut input_buf,
-                                &mut in_pos,
-                            ) {
-                                ret =
-                                    Err(ZlibError::BufError);
-                                break 'inf;
-                            }
+                let here = if here.op != 0 && (here.op & 0xf0) == 0 {
+                    let last = here;
+                    let resolved: Code;
+                    loop {
+                        let state = strm.state.as_inflate().unwrap();
+                        let idx = last.val as usize
+                            + ((hold & ((1u64 << (last.bits + last.op)) - 1)) >> last.bits)
+                                as usize;
+                        let entry = state.len_code(idx);
+                        if (last.bits as u32 + entry.bits as u32) <= bits {
+                            resolved = entry;
+                            break;
                         }
-                        hold >>= last.bits as u32;
-                        bits -= last.bits as u32;
-                        resolved
-                    } else {
-                        here
-                    };
+                        if !need_bits(
+                            last.bits as u32 + entry.bits as u32,
+                            &mut hold,
+                            &mut bits,
+                            &mut have,
+                            in_fn,
+                            &mut input_buf,
+                            &mut in_pos,
+                        ) {
+                            ret = Err(ZlibError::BufError);
+                            break 'inf;
+                        }
+                    }
+                    hold >>= last.bits as u32;
+                    bits -= last.bits as u32;
+                    resolved
+                } else {
+                    here
+                };
 
                 hold >>= here.bits as u32;
                 bits -= here.bits as u32;
@@ -915,13 +856,9 @@ where
                 // Literal byte (op == 0)
                 if here.op == 0 {
                     if left == 0 {
-                        let state =
-                            strm.state.as_inflate_mut().unwrap();
-                        let flush_data =
-                            state.window[..wsize].to_vec();
-                        if let Err(e) =
-                            out_fn.write(&flush_data)
-                        {
+                        let state = strm.state.as_inflate_mut().unwrap();
+                        let flush_data = state.window[..wsize].to_vec();
+                        if let Err(e) = out_fn.write(&flush_data) {
                             ret = Err(e);
                             break 'inf;
                         }
@@ -929,8 +866,7 @@ where
                         left = wsize;
                         state.whave = wsize;
                     }
-                    let state =
-                        strm.state.as_inflate_mut().unwrap();
+                    let state = strm.state.as_inflate_mut().unwrap();
                     state.window[put] = here.val as u8;
                     put += 1;
                     left -= 1;
@@ -940,18 +876,14 @@ where
 
                 // End of block (op & 32)
                 if here.op & 32 != 0 {
-                    strm.state.as_inflate_mut().unwrap().mode =
-                        InflateMode::Type;
+                    strm.state.as_inflate_mut().unwrap().mode = InflateMode::Type;
                     continue;
                 }
 
                 // Invalid code (op & 64)
                 if here.op & 64 != 0 {
-                    strm.msg = Some(
-                        "invalid literal/length code".into(),
-                    );
-                    strm.state.as_inflate_mut().unwrap().mode =
-                        InflateMode::Bad;
+                    strm.msg = Some("invalid literal/length code".into());
+                    strm.state.as_inflate_mut().unwrap().mode = InflateMode::Bad;
                     continue;
                 }
 
@@ -960,15 +892,18 @@ where
                 let extra = (here.op & 15) as u32;
                 let length_val = if extra != 0 {
                     if !need_bits(
-                        extra, &mut hold, &mut bits,
-                        &mut have, in_fn,
-                        &mut input_buf, &mut in_pos,
+                        extra,
+                        &mut hold,
+                        &mut bits,
+                        &mut have,
+                        in_fn,
+                        &mut input_buf,
+                        &mut in_pos,
                     ) {
                         ret = Err(ZlibError::BufError);
                         break 'inf;
                     }
-                    let extra_val =
-                        (hold & ((1u64 << extra) - 1)) as u32;
+                    let extra_val = (hold & ((1u64 << extra) - 1)) as u32;
                     hold >>= extra;
                     bits -= extra;
                     length_base + extra_val
@@ -976,17 +911,13 @@ where
                     length_base
                 };
 
-                strm.state.as_inflate_mut().unwrap().length =
-                    length_val;
+                strm.state.as_inflate_mut().unwrap().length = length_val;
 
                 // Distance code
                 let dist_here: Code;
                 loop {
-                    let state =
-                        strm.state.as_inflate().unwrap();
-                    let idx = (hold
-                        & ((1u64 << state.distbits) - 1))
-                        as usize;
+                    let state = strm.state.as_inflate().unwrap();
+                    let idx = (hold & ((1u64 << state.distbits) - 1)) as usize;
                     let entry = state.dist_code(idx);
                     if (entry.bits as u32) <= bits {
                         dist_here = entry;
@@ -1007,59 +938,46 @@ where
                 }
 
                 // Handle 2nd-level distance sub-table
-                let dist_here =
-                    if (dist_here.op & 0xf0) == 0 {
-                        let last = dist_here;
-                        let resolved: Code;
-                        loop {
-                            let state =
-                                strm.state.as_inflate().unwrap();
-                            let idx = last.val as usize
-                                + ((hold
-                                    & ((1u64
-                                        << (last.bits + last.op))
-                                        - 1))
-                                    >> last.bits)
-                                    as usize;
-                            let entry = state.dist_code(idx);
-                            if (last.bits as u32
-                                + entry.bits as u32)
-                                <= bits
-                            {
-                                resolved = entry;
-                                break;
-                            }
-                            if !need_bits(
-                                last.bits as u32
-                                    + entry.bits as u32,
-                                &mut hold,
-                                &mut bits,
-                                &mut have,
-                                in_fn,
-                                &mut input_buf,
-                                &mut in_pos,
-                            ) {
-                                ret =
-                                    Err(ZlibError::BufError);
-                                break 'inf;
-                            }
+                let dist_here = if (dist_here.op & 0xf0) == 0 {
+                    let last = dist_here;
+                    let resolved: Code;
+                    loop {
+                        let state = strm.state.as_inflate().unwrap();
+                        let idx = last.val as usize
+                            + ((hold & ((1u64 << (last.bits + last.op)) - 1)) >> last.bits)
+                                as usize;
+                        let entry = state.dist_code(idx);
+                        if (last.bits as u32 + entry.bits as u32) <= bits {
+                            resolved = entry;
+                            break;
                         }
-                        hold >>= last.bits as u32;
-                        bits -= last.bits as u32;
-                        resolved
-                    } else {
-                        dist_here
-                    };
+                        if !need_bits(
+                            last.bits as u32 + entry.bits as u32,
+                            &mut hold,
+                            &mut bits,
+                            &mut have,
+                            in_fn,
+                            &mut input_buf,
+                            &mut in_pos,
+                        ) {
+                            ret = Err(ZlibError::BufError);
+                            break 'inf;
+                        }
+                    }
+                    hold >>= last.bits as u32;
+                    bits -= last.bits as u32;
+                    resolved
+                } else {
+                    dist_here
+                };
 
                 hold >>= dist_here.bits as u32;
                 bits -= dist_here.bits as u32;
 
                 // Invalid distance code
                 if dist_here.op & 64 != 0 {
-                    strm.msg =
-                        Some("invalid distance code".into());
-                    strm.state.as_inflate_mut().unwrap().mode =
-                        InflateMode::Bad;
+                    strm.msg = Some("invalid distance code".into());
+                    strm.state.as_inflate_mut().unwrap().mode = InflateMode::Bad;
                     continue;
                 }
 
@@ -1067,54 +985,42 @@ where
                 let dist_extra = (dist_here.op & 15) as u32;
                 if dist_extra != 0 {
                     if !need_bits(
-                        dist_extra, &mut hold, &mut bits,
-                        &mut have, in_fn,
-                        &mut input_buf, &mut in_pos,
+                        dist_extra,
+                        &mut hold,
+                        &mut bits,
+                        &mut have,
+                        in_fn,
+                        &mut input_buf,
+                        &mut in_pos,
                     ) {
                         ret = Err(ZlibError::BufError);
                         break 'inf;
                     }
-                    offset_val +=
-                        (hold & ((1u64 << dist_extra) - 1))
-                            as u32;
+                    offset_val += (hold & ((1u64 << dist_extra) - 1)) as u32;
                     hold >>= dist_extra;
                     bits -= dist_extra;
                 }
 
                 let offset = offset_val as usize;
                 {
-                    let state =
-                        strm.state.as_inflate_mut().unwrap();
+                    let state = strm.state.as_inflate_mut().unwrap();
                     state.offset = offset_val;
                 }
-                let whave =
-                    strm.state.as_inflate().unwrap().whave;
-                let max_dist =
-                    wsize - if whave < wsize { left } else { 0 };
+                let whave = strm.state.as_inflate().unwrap().whave;
+                let max_dist = wsize - if whave < wsize { left } else { 0 };
                 if offset > max_dist {
-                    strm.msg = Some(
-                        "invalid distance too far back".into(),
-                    );
-                    strm.state.as_inflate_mut().unwrap().mode =
-                        InflateMode::Bad;
+                    strm.msg = Some("invalid distance too far back".into());
+                    strm.state.as_inflate_mut().unwrap().mode = InflateMode::Bad;
                     continue;
                 }
 
                 // Copy match from window (lines 500-542)
-                let mut remaining = strm
-                    .state
-                    .as_inflate()
-                    .unwrap()
-                    .length as usize;
+                let mut remaining = strm.state.as_inflate().unwrap().length as usize;
                 while remaining > 0 {
                     if left == 0 {
-                        let state =
-                            strm.state.as_inflate_mut().unwrap();
-                        let flush_data =
-                            state.window[..wsize].to_vec();
-                        if let Err(e) =
-                            out_fn.write(&flush_data)
-                        {
+                        let state = strm.state.as_inflate_mut().unwrap();
+                        let flush_data = state.window[..wsize].to_vec();
+                        if let Err(e) = out_fn.write(&flush_data) {
                             ret = Err(e);
                             break 'inf;
                         }
@@ -1129,16 +1035,14 @@ where
                         put - offset
                     };
 
-                    let state =
-                        strm.state.as_inflate_mut().unwrap();
+                    let state = strm.state.as_inflate_mut().unwrap();
                     state.window[put] = state.window[from];
                     put += 1;
                     left -= 1;
                     remaining -= 1;
                 }
 
-                strm.state.as_inflate_mut().unwrap().mode =
-                    InflateMode::Len;
+                strm.state.as_inflate_mut().unwrap().mode = InflateMode::Len;
             }
 
             // DONE: decompression completed (lines 545-548)

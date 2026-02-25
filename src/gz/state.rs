@@ -311,7 +311,6 @@ pub struct GzState {
     // =======================================================================
     // Exposed fields (gzFile_s equivalent)
     // =======================================================================
-
     /// Number of bytes available in the output buffer.
     ///
     /// In read mode, this is the count of decompressed bytes ready for the
@@ -341,7 +340,6 @@ pub struct GzState {
     // =======================================================================
     // Shared fields (used for both reading and writing)
     // =======================================================================
-
     /// File operation mode (Read, Write, Append, or None).
     ///
     /// Set during `gz_open()` / `gz_dopen()` based on the mode string.
@@ -482,7 +480,6 @@ pub struct GzState {
     // =======================================================================
     // Read-only fields (used only in read mode)
     // =======================================================================
-
     /// Read pipeline state: how to produce output (Look, Copy, Gzip).
     ///
     /// Drives the read state machine in `gz_fetch()`:
@@ -534,7 +531,6 @@ pub struct GzState {
     // =======================================================================
     // Write-only fields (used only in write mode)
     // =======================================================================
-
     /// Compression level (0–9, or `Z_DEFAULT_COMPRESSION` = -1).
     ///
     /// Passed to `deflateInit2()` when the write pipeline is initialised
@@ -710,10 +706,7 @@ mod tests {
     fn temp_file() -> (File, PathBuf) {
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "gz_state_test_{}_{id}",
-            std::process::id()
-        ));
+        let path = dir.join(format!("gz_state_test_{}_{id}", std::process::id()));
         let file = File::create(&path).expect("create temp file");
         (file, path)
     }

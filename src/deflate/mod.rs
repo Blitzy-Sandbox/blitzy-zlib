@@ -54,14 +54,14 @@
 // Submodule declarations
 // ============================================================================
 
-pub mod state;
-pub mod trees;
-pub mod strategy;
 pub mod fast;
-pub mod slow;
-pub mod stored;
 pub mod huff;
 pub mod rle;
+pub mod slow;
+pub mod state;
+pub mod stored;
+pub mod strategy;
+pub mod trees;
 
 // ============================================================================
 // Imports — crate-level modules
@@ -69,33 +69,34 @@ pub mod rle;
 
 use core::cmp::min;
 
-use crate::error::{ZlibError, ReturnCode};
+// In no_std mode, pull alloc types that the std prelude normally provides.
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::ToString, vec::Vec};
+
+use crate::checksum::adler32::{adler32, adler32_z};
+#[cfg(feature = "gzip")]
+use crate::checksum::crc32::{crc32, crc32_z};
 use crate::constants::{
-    Z_NO_FLUSH, Z_PARTIAL_FLUSH, Z_FULL_FLUSH, Z_FINISH,
-    Z_BLOCK,
-    Z_DEFAULT_COMPRESSION,
-    Z_DEFAULT_STRATEGY, Z_HUFFMAN_ONLY, Z_RLE, Z_FIXED,
-    Z_DEFLATED, Z_UNKNOWN,
-    MIN_MATCH, MAX_MATCH, MAX_WBITS, DEF_MEM_LEVEL, MAX_MEM_LEVEL,
-    PRESET_DICT,
+    DEF_MEM_LEVEL, MAX_MATCH, MAX_MEM_LEVEL, MAX_WBITS, MIN_MATCH, PRESET_DICT, Z_BLOCK,
+    Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY, Z_DEFLATED, Z_FINISH, Z_FIXED, Z_FULL_FLUSH,
+    Z_HUFFMAN_ONLY, Z_NO_FLUSH, Z_PARTIAL_FLUSH, Z_RLE, Z_UNKNOWN,
 };
-use crate::stream::ZStream;
+use crate::error::{ReturnCode, ZlibError};
 use crate::gz_header::GzHeader;
-use crate::checksum::adler32::{adler32_z, adler32};
-use crate::checksum::crc32::{crc32_z, crc32};
+use crate::stream::ZStream;
 
 // ============================================================================
 // Imports — local submodules
 // ============================================================================
 
-use self::state::{BlockState, MIN_LOOKAHEAD, BUF_SIZE};
-use self::trees::{tr_init, tr_flush_block, tr_stored_block, tr_align, tr_flush_bits};
-use self::strategy::{CONFIG_TABLE, CompressionStrategy, flush_rank};
 use self::fast::deflate_fast;
-use self::slow::deflate_slow;
-use self::stored::deflate_stored;
 use self::huff::deflate_huff;
 use self::rle::deflate_rle;
+use self::slow::deflate_slow;
+use self::state::{BUF_SIZE, BlockState, MIN_LOOKAHEAD};
+use self::stored::deflate_stored;
+use self::strategy::{CONFIG_TABLE, CompressionStrategy, flush_rank};
+use self::trees::{tr_align, tr_flush_bits, tr_flush_block, tr_init, tr_stored_block};
 
 // ============================================================================
 // Re-exports
@@ -223,11 +224,7 @@ pub fn flush_block_only(s: &mut DeflateState, strm: &mut ZStream, last: bool) {
 /// exhausted after the flush, or `None` if no early return is needed.
 ///
 /// Port of C `FLUSH_BLOCK` macro (deflate.c:1642-1645).
-pub fn flush_block(
-    s: &mut DeflateState,
-    strm: &mut ZStream,
-    last: bool,
-) -> Option<BlockState> {
+pub fn flush_block(s: &mut DeflateState, strm: &mut ZStream, last: bool) -> Option<BlockState> {
     flush_block_only(s, strm, last);
     if strm.avail_out == 0 {
         return Some(if last {
@@ -260,12 +257,7 @@ pub fn flush_block(
 /// # Returns
 ///
 /// Number of bytes actually read (may be 0 if no input is available).
-pub fn read_buf(
-    strm: &mut ZStream,
-    wrap: i32,
-    buf: &mut [u8],
-    size: usize,
-) -> usize {
+pub fn read_buf(strm: &mut ZStream, wrap: i32, buf: &mut [u8], size: usize) -> usize {
     let len = min(strm.avail_in as usize, size);
     if len == 0 {
         return 0;
@@ -886,9 +878,7 @@ pub fn deflate(strm: &mut ZStream, flush: i32) -> Result<ReturnCode, ZlibError> 
             s.last_flush = -1;
             return Ok(ReturnCode::Ok);
         }
-    } else if strm.avail_in == 0
-        && flush_rank(flush) <= flush_rank(old_flush)
-        && flush != Z_FINISH
+    } else if strm.avail_in == 0 && flush_rank(flush) <= flush_rank(old_flush) && flush != Z_FINISH
     {
         strm.msg = Some("buffer error".to_string());
         return Err(ZlibError::BufError);
@@ -907,8 +897,7 @@ pub fn deflate(strm: &mut ZStream, flush: i32) -> Result<ReturnCode, ZlibError> 
 
     if s.status == DeflateStatus::Init {
         // Zlib header (RFC 1950)
-        let mut header: u32 =
-            (Z_DEFLATED as u32 + ((s.w_bits as u32 - 8) << 4)) << 8;
+        let mut header: u32 = (Z_DEFLATED as u32 + ((s.w_bits as u32 - 8) << 4)) << 8;
         let level_flags: u32 = if s.strategy >= Z_HUFFMAN_ONLY || (s.level < 2) {
             0
         } else if s.level < 6 {
@@ -956,13 +945,16 @@ pub fn deflate(strm: &mut ZStream, flush: i32) -> Result<ReturnCode, ZlibError> 
                 put_byte(s, 0);
                 put_byte(s, 0);
                 put_byte(s, 0);
-                put_byte(s, if s.level == 9 {
-                    2
-                } else if s.strategy >= Z_HUFFMAN_ONLY || s.level < 2 {
-                    4
-                } else {
-                    0
-                });
+                put_byte(
+                    s,
+                    if s.level == 9 {
+                        2
+                    } else if s.strategy >= Z_HUFFMAN_ONLY || s.level < 2 {
+                        4
+                    } else {
+                        0
+                    },
+                );
                 put_byte(s, OS_CODE);
                 s.status = DeflateStatus::Busy;
                 flush_pending_from_state(s, strm);
@@ -993,21 +985,23 @@ pub fn deflate(strm: &mut ZStream, flush: i32) -> Result<ReturnCode, ZlibError> 
                 put_byte(s, ((gz_time >> 8) & 0xff) as u8);
                 put_byte(s, ((gz_time >> 16) & 0xff) as u8);
                 put_byte(s, ((gz_time >> 24) & 0xff) as u8);
-                put_byte(s, if s.level == 9 {
-                    2
-                } else if s.strategy >= Z_HUFFMAN_ONLY || s.level < 2 {
-                    4
-                } else {
-                    0
-                });
+                put_byte(
+                    s,
+                    if s.level == 9 {
+                        2
+                    } else if s.strategy >= Z_HUFFMAN_ONLY || s.level < 2 {
+                        4
+                    } else {
+                        0
+                    },
+                );
                 put_byte(s, (gz_os & 0xff) as u8);
                 if gz_has_extra {
                     put_byte(s, (gz_extra_len & 0xff) as u8);
                     put_byte(s, ((gz_extra_len >> 8) & 0xff) as u8);
                 }
                 if gz_hcrc {
-                    strm.adler =
-                        crc32_z(strm.adler as u32, &s.pending_buf[..s.pending]) as u64;
+                    strm.adler = crc32_z(strm.adler as u32, &s.pending_buf[..s.pending]) as u64;
                 }
                 s.gzindex = 0;
                 s.status = DeflateStatus::Extra;
@@ -1025,10 +1019,8 @@ pub fn deflate(strm: &mut ZStream, flush: i32) -> Result<ReturnCode, ZlibError> 
                     s.pending += copy;
                     // Update CRC if hcrc
                     if s.gzhead.as_ref().is_some_and(|g| g.hcrc) && s.pending > beg {
-                        strm.adler = crc32_z(
-                            strm.adler as u32,
-                            &s.pending_buf[beg..s.pending],
-                        ) as u64;
+                        strm.adler =
+                            crc32_z(strm.adler as u32, &s.pending_buf[beg..s.pending]) as u64;
                     }
                     s.gzindex += copy;
                     left -= copy;
@@ -1052,10 +1044,8 @@ pub fn deflate(strm: &mut ZStream, flush: i32) -> Result<ReturnCode, ZlibError> 
                     if s.pending == s.pending_buf_size {
                         if s.gzhead.as_ref().is_some_and(|g| g.hcrc) {
                             // beg = 0 for continuation
-                            strm.adler = crc32_z(
-                                strm.adler as u32,
-                                &s.pending_buf[..s.pending],
-                            ) as u64;
+                            strm.adler =
+                                crc32_z(strm.adler as u32, &s.pending_buf[..s.pending]) as u64;
                         }
                         flush_pending_from_state(s, strm);
                         if s.pending != 0 {
@@ -1075,10 +1065,7 @@ pub fn deflate(strm: &mut ZStream, flush: i32) -> Result<ReturnCode, ZlibError> 
                     }
                 }
                 if s.gzhead.as_ref().is_some_and(|g| g.hcrc) {
-                    strm.adler = crc32_z(
-                        strm.adler as u32,
-                        &s.pending_buf[..s.pending],
-                    ) as u64;
+                    strm.adler = crc32_z(strm.adler as u32, &s.pending_buf[..s.pending]) as u64;
                 }
                 s.gzindex = 0;
             }
@@ -1091,10 +1078,8 @@ pub fn deflate(strm: &mut ZStream, flush: i32) -> Result<ReturnCode, ZlibError> 
                 loop {
                     if s.pending == s.pending_buf_size {
                         if s.gzhead.as_ref().is_some_and(|g| g.hcrc) {
-                            strm.adler = crc32_z(
-                                strm.adler as u32,
-                                &s.pending_buf[..s.pending],
-                            ) as u64;
+                            strm.adler =
+                                crc32_z(strm.adler as u32, &s.pending_buf[..s.pending]) as u64;
                         }
                         flush_pending_from_state(s, strm);
                         if s.pending != 0 {
@@ -1114,10 +1099,7 @@ pub fn deflate(strm: &mut ZStream, flush: i32) -> Result<ReturnCode, ZlibError> 
                     }
                 }
                 if s.gzhead.as_ref().is_some_and(|g| g.hcrc) {
-                    strm.adler = crc32_z(
-                        strm.adler as u32,
-                        &s.pending_buf[..s.pending],
-                    ) as u64;
+                    strm.adler = crc32_z(strm.adler as u32, &s.pending_buf[..s.pending]) as u64;
                 }
             }
             s.status = DeflateStatus::HCrc;
@@ -1432,9 +1414,7 @@ pub fn deflate_params(
         // invalidate the DeflateState allocation. Re-acquiring after deflate
         // returns is necessary because the prior `s` borrow was consumed.
         let s = unsafe { &mut *s_ptr };
-        if strm.avail_in != 0
-            || ((s.strstart as i64 - s.block_start) as usize + s.lookahead) != 0
-        {
+        if strm.avail_in != 0 || ((s.strstart as i64 - s.block_start) as usize + s.lookahead) != 0 {
             return Err(ZlibError::BufError);
         }
     }
@@ -1512,7 +1492,11 @@ pub fn deflate_bound(strm: &ZStream, source_len: usize) -> usize {
     let s = match strm.state.as_deflate() {
         Some(s) => s,
         None => {
-            let bound = if fixedlen > storelen { fixedlen } else { storelen };
+            let bound = if fixedlen > storelen {
+                fixedlen
+            } else {
+                storelen
+            };
             return bound.checked_add(18).unwrap_or(usize::MAX);
         }
     };
@@ -1621,10 +1605,7 @@ pub fn deflate_prime(
 /// Port of C `deflateSetHeader` (deflate.c:714-719).
 /// Only available when gzip wrapping is in use.
 #[cfg(feature = "gzip")]
-pub fn deflate_set_header(
-    strm: &mut ZStream,
-    head: &GzHeader,
-) -> Result<ReturnCode, ZlibError> {
+pub fn deflate_set_header(strm: &mut ZStream, head: &GzHeader) -> Result<ReturnCode, ZlibError> {
     let s = strm.state.as_deflate_mut().ok_or(ZlibError::StreamError)?;
     if s.wrap != 2 {
         return Err(ZlibError::StreamError);
@@ -1635,10 +1616,7 @@ pub fn deflate_set_header(
 
 /// Sets the gzip header — no-op when gzip feature is disabled.
 #[cfg(not(feature = "gzip"))]
-pub fn deflate_set_header(
-    _strm: &mut ZStream,
-    _head: &GzHeader,
-) -> Result<ReturnCode, ZlibError> {
+pub fn deflate_set_header(_strm: &mut ZStream, _head: &GzHeader) -> Result<ReturnCode, ZlibError> {
     Err(ZlibError::StreamError)
 }
 
@@ -1648,10 +1626,7 @@ pub fn deflate_set_header(
 /// completely independent of the source.
 ///
 /// Port of C `deflateCopy` (deflate.c:1317-1377).
-pub fn deflate_copy(
-    dest: &mut ZStream,
-    source: &ZStream,
-) -> Result<ReturnCode, ZlibError> {
+pub fn deflate_copy(dest: &mut ZStream, source: &ZStream) -> Result<ReturnCode, ZlibError> {
     let ss = source.state.as_deflate().ok_or(ZlibError::StreamError)?;
 
     // Copy stream-level fields
@@ -1708,8 +1683,7 @@ pub fn deflate_copy(
         ds.window[..hw].copy_from_slice(&ss.window[..hw]);
     }
     // Copy prev table
-    let prev_copy = if ss.slid || (ss.strstart > ss.insert && ss.strstart - ss.insert > ds.w_size)
-    {
+    let prev_copy = if ss.slid || (ss.strstart > ss.insert && ss.strstart - ss.insert > ds.w_size) {
         ds.w_size
     } else {
         ss.strstart.saturating_sub(ss.insert)

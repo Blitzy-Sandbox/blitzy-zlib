@@ -54,6 +54,10 @@
 
 use core::cmp::min;
 
+// In no_std mode, pull alloc types that the std prelude normally provides.
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::constants::{Z_FINISH, Z_NO_FLUSH};
 use crate::deflate::state::{BlockState, DeflateState, MIN_LOOKAHEAD};
 use crate::deflate::trees::tr_stored_block;
@@ -106,7 +110,11 @@ const MAX_STORED: usize = 65535;
 /// corresponds to the C fallback path (lines 1823–1848) applied in a loop,
 /// since the Rust strategy function does not have direct access to the
 /// stream's I/O buffers needed by the C fast path (lines 1682–1751).
-pub(crate) fn deflate_stored(state: &mut DeflateState, _strm: *mut ZStream, flush: i32) -> BlockState {
+pub(crate) fn deflate_stored(
+    state: &mut DeflateState,
+    _strm: *mut ZStream,
+    flush: i32,
+) -> BlockState {
     // ---------------------------------------------------------------
     // Setup: compute minimum block size threshold.
     //
@@ -119,10 +127,7 @@ pub(crate) fn deflate_stored(state: &mut DeflateState, _strm: *mut ZStream, flus
     //
     // C: deflate.c line 1651
     // ---------------------------------------------------------------
-    let min_block = min(
-        state.pending_buf_size.saturating_sub(5),
-        state.w_size,
-    );
+    let min_block = min(state.pending_buf_size.saturating_sub(5), state.w_size);
 
     // ---------------------------------------------------------------
     // Consume all lookahead.
@@ -208,9 +213,7 @@ pub(crate) fn deflate_stored(state: &mut DeflateState, _strm: *mut ZStream, flus
         // Condition (2c) ensures we don't write a partial last block when
         // more data might arrive (unless forced by a flush).
         let should_emit = len >= min_block
-            || ((len > 0 || flush == Z_FINISH)
-                && flush != Z_NO_FLUSH
-                && len == left);
+            || ((len > 0 || flush == Z_FINISH) && flush != Z_NO_FLUSH && len == left);
 
         if !should_emit || (len == 0 && flush != Z_FINISH) {
             break;
@@ -229,8 +232,7 @@ pub(crate) fn deflate_stored(state: &mut DeflateState, _strm: *mut ZStream, flus
         // The copy only affects level 0 performance (which is I/O-bound
         // rather than CPU-bound in practice).
         let block_start_idx = state.block_start.max(0) as usize;
-        let block_data: Vec<u8> =
-            state.window[block_start_idx..block_start_idx + len].to_vec();
+        let block_data: Vec<u8> = state.window[block_start_idx..block_start_idx + len].to_vec();
 
         // Write the stored block (header + data) to the pending buffer.
         // tr_stored_block handles:
@@ -341,10 +343,7 @@ pub(crate) fn deflate_stored(state: &mut DeflateState, _strm: *mut ZStream, flus
     // If a non-finish flush was requested (Z_SYNC_FLUSH, Z_FULL_FLUSH,
     // Z_PARTIAL_FLUSH, Z_BLOCK) and all available data has been emitted
     // as stored blocks, report that the block is done.
-    if flush != Z_NO_FLUSH
-        && flush != Z_FINISH
-        && state.strstart as i64 == state.block_start
-    {
+    if flush != Z_NO_FLUSH && flush != Z_FINISH && state.strstart as i64 == state.block_start {
         return BlockState::BlockDone;
     }
 
@@ -362,18 +361,16 @@ pub(crate) fn deflate_stored(state: &mut DeflateState, _strm: *mut ZStream, flus
 mod tests {
     use super::*;
     use crate::stream::ZStream;
-    fn dummy_strm() -> ZStream { ZStream::new() }
+    fn dummy_strm() -> ZStream {
+        ZStream::new()
+    }
     use crate::deflate::trees::tr_init;
 
     /// Create a minimal `DeflateState` for testing the stored block
     /// compression algorithm. Sets up a small window with controlled data
     /// and configures the state so the compression loop can run without
     /// the full deflate infrastructure.
-    fn make_test_state(
-        window_data: &[u8],
-        strstart: usize,
-        lookahead: usize,
-    ) -> DeflateState {
+    fn make_test_state(window_data: &[u8], strstart: usize, lookahead: usize) -> DeflateState {
         use crate::constants::Z_DEFAULT_STRATEGY;
 
         // Use minimal window/memory configuration.
@@ -382,8 +379,7 @@ mod tests {
         let level: usize = 0; // stored compression
         let wrap: i32 = 0; // raw deflate (no wrapper)
 
-        let mut state =
-            DeflateState::new(w_bits, mem_level, level, Z_DEFAULT_STRATEGY, wrap);
+        let mut state = DeflateState::new(w_bits, mem_level, level, Z_DEFAULT_STRATEGY, wrap);
 
         // Initialize tree structures. tr_init sets up descriptors,
         // frequency tables, and block state needed by tr_stored_block.

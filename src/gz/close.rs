@@ -342,11 +342,11 @@ pub fn gz_close_w(state: &mut GzState) -> Result<ReturnCode, ZlibError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::stream::ZStream;
-    use super::super::state::GzHow;
-    use crate::constants::{Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY};
     use super::super::state::GZBUFSIZE;
+    use super::super::state::GzHow;
+    use super::*;
+    use crate::constants::{Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY};
+    use crate::stream::ZStream;
     use std::path::PathBuf;
 
     /// Build a minimal `GzState` for testing, with no file handle and

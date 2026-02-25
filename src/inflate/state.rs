@@ -23,6 +23,10 @@
 
 use core::fmt;
 
+// In no_std mode, pull alloc types that the std prelude normally provides.
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec, vec::Vec};
+
 use super::fixed::{DISTFIX, FIXDCODES_BITS, FIXLCODES_BITS, LENFIX};
 use super::tables::{Code, ENOUGH};
 use crate::error::ZlibError;
