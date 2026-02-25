@@ -1,3 +1,21 @@
+# Cargo manifest for the libz-rs-sys-cdylib crate.
+#
+# This crate produces the platform-native C-compatible shared library that
+# serves as a drop-in replacement for the original C zlib shared library:
+#
+#   Linux / Unix  →  libz.so   (via [lib] name = "z", crate-type = ["cdylib"])
+#   Windows       →  z.dll
+#   macOS         →  libz.dylib
+#
+# Derived from CMakeLists.txt shared library target (lines 157–201):
+#   add_library(zlib SHARED ...)  →  crate-type = ["cdylib"]
+#   OUTPUT_NAME z                 →  [lib] name = "z"
+#   LINK_FLAGS --version-script   →  handled by libz-rs-sys/build.rs
+#
+# The crate re-exports all 105 public FFI symbols defined in libz-rs-sys
+# (matching win32/zlib.def), enabling C/C++ applications to link against
+# this library exactly as they would link against the original C libz.
+
 [package]
 name = "libz-rs-sys-cdylib"
 version.workspace = true
@@ -19,5 +37,23 @@ default = ["gz-io", "gzip"]
 gz-io = ["libz-rs-sys/gz-io"]
 gzip = ["libz-rs-sys/gzip"]
 
-# Note: panic = "abort" for release builds is set in the workspace root Cargo.toml
-# This is required for the cdylib to prevent undefined behavior from unwinding across FFI boundaries
+[lints]
+workspace = true
+
+# Release profile safety configuration:
+#
+# The workspace root Cargo.toml sets the following in [profile.release]:
+#
+#   lto = "fat"        — Full link-time optimization across all crates for
+#                         maximum cross-crate inlining of hot paths.
+#   codegen-units = 1  — Single codegen unit for LLVM whole-program optimization.
+#   opt-level = 3      — Maximum optimization matching C zlib's -O3.
+#   panic = "abort"    — MANDATORY for cdylib crates per AAP Section 0.7.3.
+#                         Prevents undefined behavior from stack unwinding
+#                         across FFI boundaries. When a panic occurs in Rust
+#                         code called from C, the process aborts immediately.
+#
+# Cargo applies profile settings exclusively from the workspace root manifest;
+# per-member [profile.*] overrides are not supported in workspace members.
+# All FFI functions in libz-rs-sys use extern "C" (not extern "C-unwind")
+# as an additional safety layer against unwinding into C callers.
