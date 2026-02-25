@@ -130,32 +130,52 @@ pub(crate) fn deflate_stored(
     let min_block = min(state.pending_buf_size.saturating_sub(5), state.w_size);
 
     // ---------------------------------------------------------------
-    // Consume all lookahead.
+    // Main loop: fill window from stream, then emit stored blocks.
     //
-    // For level 0 (stored), there is no LZ77 matching — every byte passes
-    // through verbatim. All lookahead data in the window is immediately
-    // available for output as stored blocks. Advance strstart past all
-    // lookahead bytes to mark them as consumed by the strategy function.
+    // Like the C implementation (deflate.c lines 1652–1848), we must
+    // call fill_window to read data from the stream's input buffer into
+    // the sliding window before processing it. Without this, input set
+    // via set_input (e.g. after a deflateParams call) is never consumed.
     //
-    // In the C implementation this is handled implicitly by `read_buf`
-    // copying bytes from the stream's input buffer and advancing
-    // strstart within the main loop. Here, the main `deflate()` loop's
-    // `fill_window` call has already loaded data into the window at
-    // window[strstart..strstart+lookahead].
+    // The outer loop repeatedly fills the window and emits stored
+    // blocks until no more input is available.
     // ---------------------------------------------------------------
-    state.strstart += state.lookahead;
-    state.lookahead = 0;
+
+    // Fill the window from the stream's input buffer.
+    // SAFETY: _strm was derived from a valid &mut ZStream in the main
+    // deflate() call. fill_window only accesses non-overlapping fields
+    // (avail_in, next_in, total_in) vs the state fields we use.
+    //
+    // Guard: only attempt fill_window when the stream and window are
+    // properly initialized (window_size > 0). Unit tests that create
+    // minimal DeflateState with pre-loaded window data bypass this.
+    if !_strm.is_null() && state.window_size > 0 {
+        loop {
+            if state.lookahead <= 1 {
+                unsafe {
+                    super::fill_window(state, &mut *_strm);
+                }
+                if state.lookahead == 0 {
+                    if flush == Z_NO_FLUSH {
+                        return BlockState::NeedMore;
+                    }
+                    break; // flush the current block
+                }
+            }
+            // Consume all loaded lookahead — for level 0, every byte passes
+            // through verbatim (no LZ77 matching).
+            state.strstart += state.lookahead;
+            state.lookahead = 0;
+        }
+    } else {
+        // Pre-loaded window path (used by unit tests or when window is
+        // already populated): consume all existing lookahead.
+        state.strstart += state.lookahead;
+        state.lookahead = 0;
+    }
 
     // ---------------------------------------------------------------
-    // Main loop: emit stored blocks from window data.
-    //
-    // Write as many complete stored blocks as will fit in the pending
-    // buffer before returning to the main deflate() loop for flushing.
-    // Each iteration writes one stored block (header + data) via
-    // tr_stored_block.
-    //
-    // Corresponds to the C fallback path at deflate.c lines 1823–1848,
-    // applied iteratively.
+    // Emit stored blocks from window data.
     // ---------------------------------------------------------------
     let mut last = false;
 

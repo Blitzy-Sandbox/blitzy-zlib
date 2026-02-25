@@ -1243,13 +1243,17 @@ pub fn inflate(strm: &mut ZStream, flush: i32) -> ZlibResult {
                 if have >= 6 && left >= 258 {
                     state.hold = hold;
                     state.bits = bits_count;
+                    // `start` is the initial out_pos when inflate() was called.
+                    // out_pos is zero-based into out_buf, so the initial
+                    // value is always 0 (not out_start, which tracks the
+                    // initial *remaining* output capacity in the C convention).
                     inflate_fast(
                         state,
                         in_buf,
                         out_buf,
                         &mut in_pos,
                         &mut out_pos,
-                        out_start as usize,
+                        0,
                     );
                     have = (in_buf.len() - in_pos) as u32;
                     left = (out_buf.len() - out_pos) as u32;
