@@ -155,6 +155,16 @@ fn file_write_all(state: &mut GzState, data: &[u8]) -> io::Result<()> {
 /// - [`ZlibError::Errno`] — file write failed.
 /// - [`ZlibError::StreamError`] — deflate returned an internal error.
 pub(crate) fn gz_comp(state: &mut GzState, flush: i32) -> Result<(), ZlibError> {
+    // In direct (transparent) mode there are no compression buffers and
+    // no deflate engine — nothing to do.  This guard is necessary because
+    // gz_close_w calls gz_comp(state, Z_FINISH) unconditionally (matching
+    // the C code), but in direct mode the output buffer and deflate
+    // stream are never initialised.  In C this "works" through undefined
+    // behavior (NULL pointer comparisons); in Rust we handle it cleanly.
+    if state.direct {
+        return Ok(());
+    }
+
     // Lazy allocation on first call.
     if state.size == 0 {
         gz_init(state)?;
