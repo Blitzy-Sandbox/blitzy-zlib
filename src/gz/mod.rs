@@ -19,3 +19,4 @@
 //! and `gzip` features.
 
 pub mod state;
+pub mod open;
