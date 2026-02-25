@@ -1,0 +1,353 @@
+{
+  "metadata": {
+    "source": "test/infcover.c",
+    "description": "Hex-encoded DEFLATE bitstream fixtures for inflate coverage testing",
+    "format": "Space-separated hex bytes as strings, parseable by h2b() equivalent"
+  },
+  "cover_support": [
+    {
+      "hex": "63 0",
+      "description": "force window allocation",
+      "step": 0,
+      "window_bits": -15,
+      "output_len": 1,
+      "expected_return": "Z_OK"
+    },
+    {
+      "hex": "63 18 5",
+      "description": "force window replacement",
+      "step": 0,
+      "window_bits": -8,
+      "output_len": 259,
+      "expected_return": "Z_OK"
+    },
+    {
+      "hex": "63 18 68 30 d0 0 0",
+      "description": "force split window update",
+      "step": 4,
+      "window_bits": -8,
+      "output_len": 259,
+      "expected_return": "Z_OK"
+    },
+    {
+      "hex": "3 0",
+      "description": "use fixed blocks",
+      "step": 0,
+      "window_bits": -15,
+      "output_len": 1,
+      "expected_return": "Z_STREAM_END"
+    },
+    {
+      "hex": "",
+      "description": "bad window size",
+      "step": 0,
+      "window_bits": 1,
+      "output_len": 0,
+      "expected_return": "Z_STREAM_ERROR"
+    }
+  ],
+  "cover_wrap": [
+    {
+      "hex": "1f 8b 0 0",
+      "description": "bad gzip method",
+      "step": 0,
+      "window_bits": 31,
+      "output_len": 0,
+      "expected_return": "Z_DATA_ERROR"
+    },
+    {
+      "hex": "1f 8b 8 80",
+      "description": "bad gzip flags",
+      "step": 0,
+      "window_bits": 31,
+      "output_len": 0,
+      "expected_return": "Z_DATA_ERROR"
+    },
+    {
+      "hex": "77 85",
+      "description": "bad zlib method",
+      "step": 0,
+      "window_bits": 15,
+      "output_len": 0,
+      "expected_return": "Z_DATA_ERROR"
+    },
+    {
+      "hex": "8 99",
+      "description": "set window size from header",
+      "step": 0,
+      "window_bits": 0,
+      "output_len": 0,
+      "expected_return": "Z_OK"
+    },
+    {
+      "hex": "78 9c",
+      "description": "bad zlib window size",
+      "step": 0,
+      "window_bits": 8,
+      "output_len": 0,
+      "expected_return": "Z_DATA_ERROR"
+    },
+    {
+      "hex": "78 9c 63 0 0 0 1 0 1",
+      "description": "check adler32",
+      "step": 0,
+      "window_bits": 15,
+      "output_len": 1,
+      "expected_return": "Z_STREAM_END"
+    },
+    {
+      "hex": "1f 8b 8 1e 0 0 0 0 0 0 1 0 0 0 0 0 0",
+      "description": "bad header crc",
+      "step": 0,
+      "window_bits": 47,
+      "output_len": 1,
+      "expected_return": "Z_DATA_ERROR"
+    },
+    {
+      "hex": "1f 8b 8 2 0 0 0 0 0 0 1d 26 3 0 0 0 0 0 0 0 0 0",
+      "description": "check gzip length",
+      "step": 0,
+      "window_bits": 47,
+      "output_len": 0,
+      "expected_return": "Z_STREAM_END"
+    },
+    {
+      "hex": "78 90",
+      "description": "bad zlib header check",
+      "step": 0,
+      "window_bits": 47,
+      "output_len": 0,
+      "expected_return": "Z_DATA_ERROR"
+    },
+    {
+      "hex": "8 b8 0 0 0 1",
+      "description": "need dictionary",
+      "step": 0,
+      "window_bits": 8,
+      "output_len": 0,
+      "expected_return": "Z_NEED_DICT"
+    },
+    {
+      "hex": "78 9c 63 0",
+      "description": "compute adler32",
+      "step": 0,
+      "window_bits": 15,
+      "output_len": 1,
+      "expected_return": "Z_OK"
+    }
+  ],
+  "cover_inflate": [
+    {
+      "hex": "0 0 0 0 0",
+      "description": "invalid stored block lengths",
+      "expect_error": 1
+    },
+    {
+      "hex": "3 0",
+      "description": "fixed",
+      "expect_error": 0
+    },
+    {
+      "hex": "6",
+      "description": "invalid block type",
+      "expect_error": 1
+    },
+    {
+      "hex": "1 1 0 fe ff 0",
+      "description": "stored",
+      "expect_error": 0
+    },
+    {
+      "hex": "fc 0 0",
+      "description": "too many length or distance symbols",
+      "expect_error": 1
+    },
+    {
+      "hex": "4 0 fe ff",
+      "description": "invalid code lengths set",
+      "expect_error": 1
+    },
+    {
+      "hex": "4 0 24 49 0",
+      "description": "invalid bit length repeat",
+      "expect_error": 1
+    },
+    {
+      "hex": "4 0 24 e9 ff ff",
+      "description": "invalid bit length repeat",
+      "expect_error": 1
+    },
+    {
+      "hex": "4 0 24 e9 ff 6d",
+      "description": "invalid code -- missing end-of-block",
+      "expect_error": 1
+    },
+    {
+      "hex": "4 80 49 92 24 49 92 24 71 ff ff 93 11 0",
+      "description": "invalid literal/lengths set",
+      "expect_error": 1
+    },
+    {
+      "hex": "4 80 49 92 24 49 92 24 f b4 ff ff c3 84",
+      "description": "invalid distances set",
+      "expect_error": 1
+    },
+    {
+      "hex": "4 c0 81 8 0 0 0 0 20 7f eb b 0 0",
+      "description": "invalid literal/length code",
+      "expect_error": 1
+    },
+    {
+      "hex": "2 7e ff ff",
+      "description": "invalid distance code",
+      "expect_error": 1
+    },
+    {
+      "hex": "c c0 81 0 0 0 0 0 90 ff 6b 4 0",
+      "description": "invalid distance too far back",
+      "expect_error": 1
+    },
+    {
+      "hex": "1f 8b 8 0 0 0 0 0 0 0 3 0 0 0 0 1",
+      "description": "incorrect data check",
+      "expect_error": -1
+    },
+    {
+      "hex": "1f 8b 8 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0 0 1",
+      "description": "incorrect length check",
+      "expect_error": -1
+    },
+    {
+      "hex": "5 c0 21 d 0 0 0 80 b0 fe 6d 2f 91 6c",
+      "description": "pull 17",
+      "expect_error": 0
+    },
+    {
+      "hex": "5 e0 81 91 24 cb b2 2c 49 e2 f 2e 8b 9a 47 56 9f fb fe ec d2 ff 1f",
+      "description": "long code",
+      "expect_error": 0
+    },
+    {
+      "hex": "ed c0 1 1 0 0 0 40 20 ff 57 1b 42 2c 4f",
+      "description": "length extra",
+      "expect_error": 0
+    },
+    {
+      "hex": "ed cf c1 b1 2c 47 10 c4 30 fa 6f 35 1d 1 82 59 3d fb be 2e 2a fc f c",
+      "description": "long distance and extra",
+      "expect_error": 0
+    },
+    {
+      "hex": "ed c0 81 0 0 0 0 80 a0 fd a9 17 a9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 6",
+      "description": "window end",
+      "expect_error": 0
+    }
+  ],
+  "cover_inflate_additional": [
+    {
+      "hex": "2 8 20 80 0 3 0",
+      "description": "inflate_fast TYPE return",
+      "step": 0,
+      "window_bits": -15,
+      "output_len": 258,
+      "expected_return": "Z_STREAM_END"
+    },
+    {
+      "hex": "63 18 5 40 c 0",
+      "description": "window wrap",
+      "step": 3,
+      "window_bits": -8,
+      "output_len": 300,
+      "expected_return": "Z_OK"
+    }
+  ],
+  "cover_fast": [
+    {
+      "hex": "e5 e0 81 ad 6d cb b2 2c c9 01 1e 59 63 ae 7d ee fb 4d fd b5 35 41 68 ff 7f 0f 0 0 0",
+      "description": "fast length extra bits",
+      "step": 0,
+      "window_bits": -8,
+      "output_len": 258,
+      "expected_return": "Z_DATA_ERROR"
+    },
+    {
+      "hex": "25 fd 81 b5 6d 59 b6 6a 49 ea af 35 6 34 eb 8c b9 f6 b9 1e ef 67 49 50 fe ff ff 3f 0 0",
+      "description": "fast distance extra bits",
+      "step": 0,
+      "window_bits": -8,
+      "output_len": 258,
+      "expected_return": "Z_DATA_ERROR"
+    },
+    {
+      "hex": "3 7e 0 0 0 0 0",
+      "description": "fast invalid distance code",
+      "step": 0,
+      "window_bits": -8,
+      "output_len": 258,
+      "expected_return": "Z_DATA_ERROR"
+    },
+    {
+      "hex": "1b 7 0 0 0 0 0",
+      "description": "fast invalid literal/length code",
+      "step": 0,
+      "window_bits": -8,
+      "output_len": 258,
+      "expected_return": "Z_DATA_ERROR"
+    },
+    {
+      "hex": "d c7 1 ae eb 38 c 4 41 a0 87 72 de df fb 1f b8 36 b1 38 5d ff ff 0",
+      "description": "fast 2nd level codes and too far back",
+      "step": 0,
+      "window_bits": -8,
+      "output_len": 258,
+      "expected_return": "Z_DATA_ERROR"
+    },
+    {
+      "hex": "63 18 5 8c 10 8 0 0 0 0",
+      "description": "very common case",
+      "step": 0,
+      "window_bits": -8,
+      "output_len": 259,
+      "expected_return": "Z_OK"
+    },
+    {
+      "hex": "63 60 60 18 c9 0 8 18 18 18 26 c0 28 0 29 0 0 0",
+      "description": "contiguous and wrap around window",
+      "step": 6,
+      "window_bits": -8,
+      "output_len": 259,
+      "expected_return": "Z_OK"
+    },
+    {
+      "hex": "63 0 3 0 0 0 0 0",
+      "description": "copy direct from output",
+      "step": 0,
+      "window_bits": -8,
+      "output_len": 259,
+      "expected_return": "Z_STREAM_END"
+    }
+  ],
+  "cover_back": {
+    "pull_data": [99, 0, 2, 0],
+    "pull_data_hex": "63 00 02 00",
+    "description": "Static data used by pull() callback for inflateBack tests",
+    "tests": [
+      {
+        "description": "inflateBack Z_STREAM_END",
+        "avail_in": 2,
+        "next_in_hex": "03",
+        "expected_return": "Z_STREAM_END"
+      },
+      {
+        "description": "force output error",
+        "avail_in": 3,
+        "next_in_hex": "63 00",
+        "expected_return": "Z_BUF_ERROR"
+      },
+      {
+        "description": "force mode error",
+        "expected_return": "Z_STREAM_ERROR"
+      }
+    ]
+  }
+}
