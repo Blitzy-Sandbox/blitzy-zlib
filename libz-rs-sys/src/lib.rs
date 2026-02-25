@@ -15,6 +15,7 @@
 #![allow(clippy::wildcard_imports)]
 
 pub mod checksum;
+pub mod compress;
 pub mod deflate;
 pub mod inflate;
 pub mod types;
