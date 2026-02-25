@@ -1,0 +1,86 @@
+# Cross-Platform CI Workflow for zlib-rs
+#
+# Validates the Rust zlib-rs workspace builds and passes tests across multiple
+# target architectures and operating systems. Replaces the C-era configure.yml
+# cross-compilation patterns and c-std.yml/cmake.yml platform coverage with
+# Cargo-based build and test using Rust target triples.
+#
+# Targets covered:
+#   - x86_64-unknown-linux-gnu    (native Linux x86_64)
+#   - aarch64-unknown-linux-gnu   (cross-compiled via `cross` + QEMU)
+#   - x86_64-apple-darwin         (native macOS Intel)
+#   - aarch64-apple-darwin        (native macOS Apple Silicon)
+#   - x86_64-pc-windows-msvc      (native Windows x86_64)
+
+name: Cross-Platform
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cross-platform:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native Linux x86_64 — builds and tests directly on the runner
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+            run_tests: true
+
+          # Linux AArch64 — cross-compiled via `cross` tool (Docker + QEMU)
+          # Replaces the C-era QEMU + gcc-aarch64-linux-gnu pattern from configure.yml
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+            run_tests: true
+
+          # Native macOS Intel — uses macos-13 runner (last Intel-based runner)
+          - target: x86_64-apple-darwin
+            os: macos-13
+            cross: false
+            run_tests: true
+
+          # Native macOS Apple Silicon — uses macos-latest (ARM64 runner)
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+            run_tests: true
+
+          # Native Windows x86_64 — MSVC toolchain
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+            run_tests: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build workspace
+        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --workspace --target ${{ matrix.target }}
+
+      - name: Run tests
+        if: matrix.run_tests
+        run: ${{ matrix.cross && 'cross' || 'cargo' }} test --workspace --target ${{ matrix.target }}
+
+      - name: Build release profile
+        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --workspace --release --target ${{ matrix.target }}
