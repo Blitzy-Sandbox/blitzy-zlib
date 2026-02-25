@@ -16,4 +16,5 @@ pub mod deflate;
 pub mod error;
 pub mod gz_header;
 pub mod inflate;
+pub mod stream;
 pub mod util;
