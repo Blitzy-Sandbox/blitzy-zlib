@@ -14,6 +14,7 @@
 //! This module is `no_std` compatible when the `std` feature is disabled.
 
 pub mod adler32;
+pub mod crc32;
 
 // Re-export Adler-32 public API for convenience access via `checksum::*`.
 pub use self::adler32::adler32 as adler32_func;
@@ -21,3 +22,14 @@ pub use self::adler32::adler32_combine;
 pub use self::adler32::adler32_combine64;
 pub use self::adler32::adler32_z;
 pub use self::adler32::Adler32;
+
+// Re-export CRC-32 public API for convenience access via `checksum::*`.
+pub use self::crc32::crc32;
+pub use self::crc32::crc32_combine;
+pub use self::crc32::crc32_combine64;
+pub use self::crc32::crc32_combine_gen;
+pub use self::crc32::crc32_combine_gen64;
+pub use self::crc32::crc32_combine_op;
+pub use self::crc32::crc32_z;
+pub use self::crc32::get_crc_table;
+pub use self::crc32::Crc32;
