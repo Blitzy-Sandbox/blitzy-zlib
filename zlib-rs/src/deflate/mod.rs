@@ -9,6 +9,9 @@ pub mod params;
 /// DeflateState struct and supporting types (status enum, CtData, newtypes).
 pub mod state;
 
+/// Huffman tree construction, bit-level output, and block encoding.
+pub mod trees;
+
 // Re-export primary public types from the params module.
 pub use params::{CONFIGURATION_TABLE, CompressionConfig, CompressionFunc};
 
