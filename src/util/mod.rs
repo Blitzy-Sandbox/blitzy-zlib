@@ -9,7 +9,11 @@
 //! - [`compile_flags`] — Get compile-time configuration flags
 //! - [`error_message`] — Convert error code to human-readable message
 
+pub mod compress;
 pub mod version;
+
+// Re-export compression utility public items for flat access via `util::*`.
+pub use self::compress::{compress, compress2, compress_bound};
 
 // Re-export version / metadata public items for flat access via `util::*`.
 pub use self::version::{ZLIB_VERSION, compile_flags, error_message, zlib_version};
