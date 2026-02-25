@@ -9,6 +9,8 @@ pub mod constants;
 pub mod deflate;
 /// Return codes and error types for zlib operations.
 pub mod error;
+/// One-call compression and decompression wrappers.
+pub mod compress;
 /// DEFLATE decompression engine: streaming decompression, sync recovery, and format auto-detection.
 pub mod inflate;
 /// Streaming I/O types: `ZStream` and `GzHeader`.
