@@ -108,7 +108,7 @@ const DEXT: [u16; 32] = [
 /// | `00000000`     | Literal byte — `val` is the byte value (0–255) |
 /// | `0000tttt`     | Sub-table link — `t` is the number of index bits for the next lookup; `val` is the offset to the sub-table |
 /// | `0001eeee`     | Length or distance — `e` is the number of extra bits to read; `val` is the base value |
-/// | `00100000`     | End of block (EOB) |
+/// | `01100000`     | End of block (EOB) — 96 = 32 (end flag) + 64 (invalid flag) |
 /// | `01000000`     | Invalid code |
 ///
 /// The inflate fast-path tests these with bitmask operations:

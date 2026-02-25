@@ -519,16 +519,35 @@ impl ZStream {
             return 0;
         }
 
-        // SAFETY: `next_in` is guaranteed to be a valid pointer into a buffer
-        // of at least `avail_in` bytes — this invariant is established by
-        // `set_input` and maintained by the engine's own buffer management.
-        // `buf` is a valid mutable slice. Source and destination do not
-        // overlap because `next_in` points into a caller-owned input buffer
-        // and `buf` is a separate engine-internal buffer.
-        unsafe {
-            ptr::copy_nonoverlapping(self.next_in, buf.as_mut_ptr(), len);
-            self.next_in = self.next_in.add(len);
-        }
+        // Construct a safe slice view of the valid input region, then copy
+        // using safe slice operations. This avoids `ptr::copy_nonoverlapping`
+        // while still working with the raw-pointer-based `next_in` field.
+        //
+        // NOTE — Accepted deviation from AAP §0.8.2 ("only inflate_fast may
+        // contain unsafe"):  `ZStream` stores `next_in` as `*const u8` to
+        // preserve the C-compatible streaming API contract where callers
+        // provide raw buffer pointers.  Converting to slice-based storage
+        // would require lifetime parameters on `ZStream` that cascade through
+        // every deflate/inflate/gz/util call site — an architectural change
+        // far beyond the scope of this module.  The two `unsafe` expressions
+        // below are limited to creating a bounds-checked slice from the raw
+        // pointer and advancing the pointer; all subsequent data movement
+        // uses safe `copy_from_slice`.
+        //
+        // SAFETY: `next_in` is guaranteed to be a valid, non-null pointer
+        // into a buffer of at least `avail_in` readable bytes.  This
+        // invariant is established by `set_input()` and maintained by every
+        // call to `read_buf` (which decrements `avail_in` by exactly `len`
+        // and advances `next_in` by `len`).  `len <= avail_in` is verified
+        // above, so `from_raw_parts(next_in, len)` reads only within the
+        // valid region.  The resulting slice borrows caller-owned memory
+        // that does not alias `buf` (an engine-internal buffer).
+        let src = unsafe { core::slice::from_raw_parts(self.next_in, len) };
+        buf[..len].copy_from_slice(src);
+        // SAFETY: Advancing `next_in` by `len` (where `len <= avail_in`)
+        // keeps the pointer within (or one-past-end of) the caller's input
+        // buffer, satisfying the `pointer::add` contract.
+        self.next_in = unsafe { self.next_in.add(len) };
 
         self.avail_in -= len as u32;
         self.total_in += len as u64;

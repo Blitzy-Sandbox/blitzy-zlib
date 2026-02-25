@@ -1163,7 +1163,7 @@ pub fn tr_flush_block(
         }
     }
 
-    if state.strategy == Z_FIXED || static_lenb == opt_lenb {
+    if state.strategy == Z_FIXED || static_lenb <= opt_lenb {
         // Static trees.
         let last_val = if last { 1u32 } else { 0u32 };
         send_bits(state, ((STATIC_TREES as u32) << 1) | last_val, 3);

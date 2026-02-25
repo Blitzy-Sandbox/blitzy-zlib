@@ -108,8 +108,11 @@ unsafe fn copy_match(
 /// - State was in `Len` mode when the fast-path decision was made
 /// - `state.bits < 8` — the hold buffer has fewer than 8 bits remaining
 ///
-/// If preconditions are not met, the function safely exits without processing
-/// any data (the loop boundary check fails immediately).
+/// **Callers MUST guarantee all preconditions are satisfied before calling.**
+/// The main decode loop uses a do-while pattern (condition checked at the
+/// bottom), so if preconditions are violated, one full iteration may execute
+/// before the boundary check terminates the loop, potentially reading or
+/// writing out of bounds.
 #[allow(dead_code)] // Will be called from mod.rs once the inflate state machine is complete
 pub(crate) fn inflate_fast(
     state: &mut InflateState,
@@ -310,19 +313,23 @@ pub(crate) fn inflate_fast(
                             // ================================================
                             let from = *out_pos - dist;
 
-                            // SAFETY: We have verified:
-                            // 1. from = out_pos - dist, and dist <= written =
-                            //    out_pos - start, so from >= start >= 0.
-                            // 2. out_pos + len <= output.len() because the
-                            //    loop guarantees out_pos < end =
-                            //    output.len() - 257, and len <= 258, so
-                            //    out_pos + len <= output.len() + 1; the
-                            //    actual output.len() - out_pos >= 258
-                            //    guarantees sufficient space.
-                            // 3. from + len <= output.len() because from <
-                            //    out_pos and out_pos + len <= output.len().
-                            // 4. Overlapping case (dist < len) is handled
-                            //    correctly by copy_match's forward byte copy.
+                            // SAFETY: The core invariant is that both the
+                            // source range [from..from+len] and destination
+                            // range [out_pos..out_pos+len] lie within
+                            // `output[0..output.len()]`.  Specifically:
+                            //
+                            // 1. `from = out_pos - dist` where `dist <= written
+                            //    = out_pos - start`, so `from >= start >= 0`.
+                            //    The source starts within already-written output.
+                            // 2. The loop condition `out_pos < end` where
+                            //    `end = output.len() - 257` guarantees
+                            //    `output.len() - out_pos >= 258 >= len`,
+                            //    so `out_pos + len <= output.len()`.
+                            // 3. `from < out_pos` and (2) together imply
+                            //    `from + len <= output.len()`.
+                            // 4. When `dist < len` (overlapping), `copy_match`
+                            //    uses forward byte-by-byte copy, correctly
+                            //    replicating the LZ77 run-length pattern.
                             unsafe {
                                 copy_match(output, from, out_pos, dist, len);
                             }

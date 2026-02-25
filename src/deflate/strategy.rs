@@ -408,16 +408,18 @@ pub(crate) const CONFIG_TABLE: [CompressionConfig; 10] = [
 ///
 /// # Examples
 ///
-/// ```rust
-/// # use zlib_rs::deflate::strategy::flush_rank;
-/// assert_eq!(flush_rank(0), 0);  // Z_NO_FLUSH
-/// assert_eq!(flush_rank(5), 1);  // Z_BLOCK
-/// assert_eq!(flush_rank(1), 2);  // Z_PARTIAL_FLUSH
-/// assert_eq!(flush_rank(6), 3);  // Z_TREES
-/// assert_eq!(flush_rank(2), 4);  // Z_SYNC_FLUSH
-/// assert_eq!(flush_rank(3), 6);  // Z_FULL_FLUSH
-/// assert_eq!(flush_rank(4), 8);  // Z_FINISH
+/// ```text
+/// flush_rank(0) == 0   // Z_NO_FLUSH
+/// flush_rank(5) == 1   // Z_BLOCK
+/// flush_rank(1) == 2   // Z_PARTIAL_FLUSH
+/// flush_rank(6) == 3   // Z_TREES
+/// flush_rank(2) == 4   // Z_SYNC_FLUSH
+/// flush_rank(3) == 6   // Z_FULL_FLUSH
+/// flush_rank(4) == 8   // Z_FINISH
 /// ```
+///
+/// (This function is `pub(crate)` — see the unit tests below for executable
+/// verification of these values.)
 #[inline(always)]
 pub(crate) fn flush_rank(f: i32) -> i32 {
     (f * 2) - if f > 4 { 9 } else { 0 }
