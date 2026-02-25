@@ -1315,17 +1315,17 @@ mod tests {
     fn test_static_ltree_bit_lengths() {
         // RFC 1951 fixed Huffman table:
         // 0-143: 8 bits, 144-255: 9 bits, 256-279: 7 bits, 280-287: 8 bits
-        for i in 0..=143 {
-            assert_eq!(STATIC_LTREE[i].dl, 8, "STATIC_LTREE[{i}] should be 8 bits");
+        for (i, entry) in STATIC_LTREE.iter().enumerate().take(144) {
+            assert_eq!(entry.dl, 8, "STATIC_LTREE[{i}] should be 8 bits");
         }
-        for i in 144..=255 {
-            assert_eq!(STATIC_LTREE[i].dl, 9, "STATIC_LTREE[{i}] should be 9 bits");
+        for (i, entry) in STATIC_LTREE.iter().enumerate().take(256).skip(144) {
+            assert_eq!(entry.dl, 9, "STATIC_LTREE[{i}] should be 9 bits");
         }
-        for i in 256..=279 {
-            assert_eq!(STATIC_LTREE[i].dl, 7, "STATIC_LTREE[{i}] should be 7 bits");
+        for (i, entry) in STATIC_LTREE.iter().enumerate().take(280).skip(256) {
+            assert_eq!(entry.dl, 7, "STATIC_LTREE[{i}] should be 7 bits");
         }
-        for i in 280..=287 {
-            assert_eq!(STATIC_LTREE[i].dl, 8, "STATIC_LTREE[{i}] should be 8 bits");
+        for (i, entry) in STATIC_LTREE.iter().enumerate().take(288).skip(280) {
+            assert_eq!(entry.dl, 8, "STATIC_LTREE[{i}] should be 8 bits");
         }
     }
 

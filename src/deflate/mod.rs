@@ -9,3 +9,4 @@ pub mod trees;
 pub mod rle;
 pub mod huff;
 pub mod stored;
+pub mod slow;

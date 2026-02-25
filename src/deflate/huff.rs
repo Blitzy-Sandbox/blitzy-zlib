@@ -304,8 +304,8 @@ mod tests {
     fn test_huff_varying_bytes() {
         // Window filled with varying byte values — each encoded as a literal.
         let mut data = vec![0u8; 300];
-        for i in 0..data.len() {
-            data[i] = (i & 0xFF) as u8;
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
         }
         let mut state = make_test_state(&data, 0, 200);
 

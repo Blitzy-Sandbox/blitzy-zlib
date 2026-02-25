@@ -637,17 +637,17 @@ mod tests {
         // 144–255: 9 bits
         // 256–279: 7 bits
         // 280–287: 8 bits
-        for i in 0..144 {
-            lens[i] = 8;
+        for l in lens.iter_mut().take(144) {
+            *l = 8;
         }
-        for i in 144..256 {
-            lens[i] = 9;
+        for l in lens.iter_mut().take(256).skip(144) {
+            *l = 9;
         }
-        for i in 256..280 {
-            lens[i] = 7;
+        for l in lens.iter_mut().take(280).skip(256) {
+            *l = 7;
         }
-        for i in 280..288 {
-            lens[i] = 8;
+        for l in lens.iter_mut().take(288).skip(280) {
+            *l = 8;
         }
 
         let mut table = vec![Code::default(); ENOUGH];
@@ -675,8 +675,8 @@ mod tests {
     #[test]
     fn inflate_table_fixed_dists() {
         let mut lens = [0u16; 32];
-        for i in 0..32 {
-            lens[i] = 5;
+        for l in &mut lens {
+            *l = 5;
         }
 
         let mut table = vec![Code::default(); ENOUGH];

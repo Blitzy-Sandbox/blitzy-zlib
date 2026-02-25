@@ -345,8 +345,8 @@ mod tests {
     fn test_rle_no_runs() {
         // Window filled with alternating bytes (no runs of length >= 3)
         let mut data = vec![0u8; 300];
-        for i in 0..data.len() {
-            data[i] = (i % 2) as u8;
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i % 2) as u8;
         }
         let mut state = make_test_state(&data, 1, 200);
 
@@ -385,8 +385,8 @@ mod tests {
         // Data with some runs and some non-repeating bytes
         let mut data = vec![0u8; 300];
         // Bytes 0-9: all 'A' (run of 10)
-        for i in 0..10 {
-            data[i] = b'A';
+        for b in data.iter_mut().take(10) {
+            *b = b'A';
         }
         // Bytes 10-14: different bytes (no run)
         data[10] = b'B';
@@ -395,8 +395,8 @@ mod tests {
         data[13] = b'E';
         data[14] = b'F';
         // Bytes 15-24: all 'X' (run of 10)
-        for i in 15..25 {
-            data[i] = b'X';
+        for b in data.iter_mut().take(25).skip(15) {
+            *b = b'X';
         }
 
         let mut state = make_test_state(&data, 1, 24);
