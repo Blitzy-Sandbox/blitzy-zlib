@@ -15,6 +15,9 @@ pub mod hash;
 /// Huffman tree construction, bit-level output, and block encoding.
 pub mod trees;
 
+/// Five compression strategy functions (stored, fast, slow, rle, huff).
+pub mod algorithm;
+
 // Re-export primary public types from the params module.
 pub use params::{CONFIGURATION_TABLE, CompressionConfig, CompressionFunc};
 
