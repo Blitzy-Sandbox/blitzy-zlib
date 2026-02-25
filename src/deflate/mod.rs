@@ -6,3 +6,4 @@
 
 pub mod state;
 pub mod trees;
+pub mod rle;
