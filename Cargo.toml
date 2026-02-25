@@ -9,9 +9,33 @@ authors = [
 ]
 description = "A pure Rust implementation of the zlib compression library"
 license = "Zlib"
+repository = "https://github.com/nicholasgasior/zlib-rs"
+documentation = "https://docs.rs/zlib-rs"
 readme = "README.md"
 keywords = ["compression", "zlib", "deflate", "gzip", "inflate"]
 categories = ["compression", "no-std"]
+exclude = [
+    "amiga/**",
+    "contrib/**",
+    "doc/**",
+    "examples/**",
+    "os400/**",
+    "test/**",
+    "watcom/**",
+    "win32/**",
+    ".github/**",
+    "*.c",
+    "*.h",
+    "CMakeLists.txt",
+    "Makefile",
+    "Makefile.in",
+    "configure",
+    "zlib.map",
+    "zlib.pc.cmakein",
+    "treebuild.xml",
+    ".cmake-format.yaml",
+    "README-cmake.md",
+]
 
 [lib]
 name = "zlib_rs"
