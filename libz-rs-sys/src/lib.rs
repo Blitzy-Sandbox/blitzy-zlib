@@ -18,5 +18,6 @@ pub mod checksum;
 pub mod deflate;
 pub mod inflate;
 pub mod types;
+pub mod version;
 
 pub use types::*;
