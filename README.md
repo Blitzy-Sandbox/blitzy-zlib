@@ -5,7 +5,6 @@
 [![Crates.io](https://img.shields.io/crates/v/zlib-rs.svg)](https://crates.io/crates/zlib-rs)
 [![Documentation](https://docs.rs/zlib-rs/badge.svg)](https://docs.rs/zlib-rs)
 [![License: Zlib](https://img.shields.io/badge/license-Zlib-blue.svg)](LICENSE)
-[![CI](https://github.com/nicholasgasior/zlib-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/nicholasgasior/zlib-rs/actions)
 
 Byte-level DEFLATE compression and decompression fully compatible with
 [C zlib](https://zlib.net/) (version 1.3.2.1-motley). This crate implements the
@@ -84,7 +83,7 @@ For incremental or large-data compression, use the streaming `ZStream` API:
 ```rust
 use zlib_rs::stream::ZStream;
 use zlib_rs::deflate;
-use zlib_rs::constants::{FlushMode, Z_DEFAULT_COMPRESSION};
+use zlib_rs::constants::{Z_DEFAULT_COMPRESSION, Z_FINISH};
 
 // Initialize a deflate stream
 let mut stream = ZStream::new();
@@ -97,11 +96,11 @@ let mut output = vec![0u8; 256];
 stream.set_input(input);
 stream.set_output(&mut output);
 
-// Compress in one pass (use FlushMode::Finish for single-buffer input)
-let status = deflate::deflate(&mut stream, FlushMode::Finish).unwrap();
+// Compress in one pass (use Z_FINISH for single-buffer input)
+let status = deflate::deflate(&mut stream, Z_FINISH).unwrap();
 
 // Finalize
-let compressed_size = stream.total_out() as usize;
+let compressed_size = stream.total_out as usize;
 deflate::deflate_end(&mut stream).unwrap();
 
 output.truncate(compressed_size);
@@ -112,7 +111,7 @@ output.truncate(compressed_size);
 ```rust
 use zlib_rs::stream::ZStream;
 use zlib_rs::inflate;
-use zlib_rs::constants::FlushMode;
+use zlib_rs::constants::Z_FINISH;
 
 // Initialize an inflate stream
 let mut stream = ZStream::new();
@@ -124,9 +123,9 @@ let mut output = vec![0u8; expected_size];
 stream.set_output(&mut output);
 
 // Decompress
-let status = inflate::inflate(&mut stream, FlushMode::Finish).unwrap();
+let status = inflate::inflate(&mut stream, Z_FINISH).unwrap();
 
-let decompressed_size = stream.total_out() as usize;
+let decompressed_size = stream.total_out as usize;
 inflate::inflate_end(&mut stream).unwrap();
 
 output.truncate(decompressed_size);
@@ -156,19 +155,20 @@ println!("CRC-32:   {:#010x}", c32);
 Read and write `.gz` files with a `stdio`-like interface:
 
 ```rust
+use std::path::Path;
 use zlib_rs::gz;
 
 // Write compressed data to a gzip file
-let mut gzfile = gz::open("output.gz", "wb").unwrap();
-gz::write(&mut gzfile, b"Hello from gzip file I/O!").unwrap();
-gz::close(gzfile).unwrap();
+let mut gzfile = gz::gz_open(Path::new("output.gz"), "wb").unwrap();
+gz::gz_write(&mut gzfile, b"Hello from gzip file I/O!").unwrap();
+gz::gz_close(&mut gzfile).unwrap();
 
 // Read it back
-let mut gzfile = gz::open("output.gz", "rb").unwrap();
+let mut gzfile = gz::gz_open(Path::new("output.gz"), "rb").unwrap();
 let mut buf = vec![0u8; 256];
-let n = gz::read(&mut gzfile, &mut buf).unwrap();
+let n = gz::gz_read(&mut gzfile, &mut buf).unwrap();
 buf.truncate(n);
-gz::close(gzfile).unwrap();
+gz::gz_close(&mut gzfile).unwrap();
 
 assert_eq!(&buf, b"Hello from gzip file I/O!");
 ```
@@ -209,11 +209,11 @@ zlib-rs = { version = "1.3.2", default-features = false, features = ["std", "gzi
 
 | Module | Description |
 |--------|-------------|
-| `zlib_rs::stream` | `ZStream` struct and `StreamState` trait — the central exchange object for streaming operations |
+| `zlib_rs::stream` | `ZStream` struct and `StreamState` enum — the central exchange object for streaming operations |
 | `zlib_rs::deflate` | DEFLATE compression: `deflate_init`, `deflate_init2`, `deflate`, `deflate_end`, `deflate_reset`, `deflate_params`, `deflate_tune`, `deflate_bound`, `deflate_pending`, `deflate_prime`, `deflate_set_header`, `deflate_set_dictionary`, `deflate_get_dictionary`, `deflate_copy` |
 | `zlib_rs::inflate` | DEFLATE decompression: `inflate_init`, `inflate_init2`, `inflate`, `inflate_end`, `inflate_reset`, `inflate_reset2`, `inflate_sync`, `inflate_copy`, `inflate_prime`, `inflate_mark`, `inflate_get_header`, `inflate_set_dictionary`, `inflate_get_dictionary`, `inflate_back` |
 | `zlib_rs::checksum` | `adler32`, `adler32_z`, `adler32_combine`, `crc32`, `crc32_z`, `crc32_combine`, `crc32_combine_gen`, `crc32_combine_op` |
-| `zlib_rs::gz` | Gzip file I/O: `gz_open`, `gz_read`, `gz_write`, `gz_close`, `gz_seek`, `gz_tell`, `gz_eof`, `gz_direct`, `gz_error`, `gz_clearerr`, and more |
+| `zlib_rs::gz` | Gzip file I/O: `gz_open`, `gz_read`, `gz_write`, `gz_close`, `gz_seek`, `gz_tell`, `gz_eof`, `gz_direct`, `gz_error_msg`, `gz_clearerr`, and more |
 | `zlib_rs::util` | One-call utilities: `compress`, `compress2`, `compress_bound`, `uncompress`, `uncompress2`, `zlib_version`, `compile_flags` |
 | `zlib_rs::error` | `ZlibError` enum (failure cases), `ReturnCode` enum (success variants), and `Result` type alias |
 | `zlib_rs::constants` | Flush modes, compression levels, strategies, data types, and limit constants |
@@ -317,13 +317,13 @@ All 10 compression levels are supported:
 
 All 5 compression strategies are supported:
 
-| Strategy | Description |
-|----------|-------------|
-| `Strategy::Default` | Balanced LZ77 + Huffman coding (suitable for most data) |
-| `Strategy::Filtered` | Tuned for data produced by a filter or predictor |
-| `Strategy::HuffmanOnly` | Huffman coding only, no LZ77 string matching |
-| `Strategy::Rle` | Run-length encoding — matches only at distance 1 |
-| `Strategy::Fixed` | Use fixed (pre-defined) Huffman codes instead of dynamic |
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `Z_DEFAULT_STRATEGY` | 0 | Balanced LZ77 + Huffman coding (suitable for most data) |
+| `Z_FILTERED` | 1 | Tuned for data produced by a filter or predictor |
+| `Z_HUFFMAN_ONLY` | 2 | Huffman coding only, no LZ77 string matching |
+| `Z_RLE` | 3 | Run-length encoding — matches only at distance 1 |
+| `Z_FIXED` | 4 | Use fixed (pre-defined) Huffman codes instead of dynamic |
 
 ## Building and Testing
 

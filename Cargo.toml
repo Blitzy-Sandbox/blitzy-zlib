@@ -9,7 +9,7 @@ authors = [
 ]
 description = "A pure Rust implementation of the zlib compression library"
 license = "Zlib"
-repository = "https://github.com/nicholasgasior/zlib-rs"
+repository = "https://github.com/madler/zlib"
 documentation = "https://docs.rs/zlib-rs"
 readme = "README.md"
 keywords = ["compression", "zlib", "deflate", "gzip", "inflate"]
