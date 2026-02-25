@@ -60,6 +60,7 @@ use core::cmp::min;
 use crate::constants::{MIN_MATCH, Z_FINISH, Z_NO_FLUSH};
 use crate::deflate::state::{BlockState, DeflateState, MIN_LOOKAHEAD};
 use crate::deflate::trees::{tally_dist, tally_lit, tr_flush_block};
+use crate::stream::ZStream;
 
 // ===========================================================================
 // Local constants
@@ -77,31 +78,22 @@ const NIL: u16 = 0;
 
 /// Fill the sliding window with data from the input stream.
 ///
-/// In the fully integrated system, `fill_window` is defined in the parent
-/// `deflate` module (`mod.rs`) and reads bytes from the `ZStream`'s input
-/// buffer into `DeflateState.window`, updating `lookahead`, potentially
-/// sliding the window, and updating the hash table.
+/// Delegates to the real `fill_window` implementation in the parent
+/// `deflate` module (`mod.rs`). This reads bytes from the `ZStream`'s
+/// input buffer into `DeflateState.window`, updating `lookahead`,
+/// potentially sliding the window, and updating the hash table.
 ///
-/// Strategy functions call `fill_window` when `lookahead` drops below
-/// `MIN_LOOKAHEAD`. After the call, the function checks whether `lookahead`
-/// is still insufficient:
+/// # Safety
 ///
-/// - If `lookahead < MIN_LOOKAHEAD && flush == Z_NO_FLUSH`: the function
-///   returns `BlockState::NeedMore`, signalling the main `deflate()` loop
-///   to provide more input and re-enter the strategy.
-/// - If `lookahead == 0`: the loop breaks to flush the current block.
-///
-/// This local definition is a no-op stub. When the `deflate` module's
-/// public API (`mod.rs`) is fully assembled, it will contain the real
-/// `fill_window` implementation. The strategy functions are designed so
-/// that the no-op correctly triggers the `NeedMore` / break paths above,
-/// ensuring the main `deflate()` loop takes over window management.
+/// `strm` must be a valid pointer to the `ZStream` that owns this
+/// `DeflateState`. The pointer is valid for the lifetime of the
+/// `deflate()` call.
 #[inline(always)]
-fn fill_window(_state: &mut DeflateState) {
-    // Intentional no-op: window filling is orchestrated by the main
-    // deflate() loop in mod.rs, which calls the real fill_window
-    // before and after invoking the strategy function. The lookahead
-    // checks after this call handle the case where no data is available.
+unsafe fn do_fill_window(state: &mut DeflateState, strm: *mut ZStream) {
+    // SAFETY: strm is the raw pointer to the parent ZStream passed from
+    // deflate(). fill_window only reads/writes strm fields (avail_in,
+    // next_in, total_in, adler) that do not overlap with DeflateState.
+    super::fill_window(state, unsafe { &mut *strm });
 }
 
 /// Flush the current block to the pending output buffer.
@@ -347,7 +339,7 @@ fn longest_match(state: &mut DeflateState, cur_match: u16) -> usize {
 /// # C Source
 ///
 /// Direct port of `deflate_fast` in `deflate.c:1857–1948`.
-pub(crate) fn deflate_fast(state: &mut DeflateState, flush: i32) -> BlockState {
+pub(crate) fn deflate_fast(state: &mut DeflateState, strm: *mut ZStream, flush: i32) -> BlockState {
     let mut hash_head: u16; // head of the hash chain
     let mut bflush: bool; // set if current block must be flushed
 
@@ -360,7 +352,8 @@ pub(crate) fn deflate_fast(state: &mut DeflateState, flush: i32) -> BlockState {
         // MIN_LOOKAHEAD = MAX_MATCH + MIN_MATCH + 1 = 262 bytes.
         // ==================================================================
         if state.lookahead < MIN_LOOKAHEAD {
-            fill_window(state);
+            // SAFETY: strm is valid for the duration of deflate().
+            unsafe { do_fill_window(state, strm); }
             if state.lookahead < MIN_LOOKAHEAD && flush == Z_NO_FLUSH {
                 return BlockState::NeedMore;
             }
@@ -524,6 +517,9 @@ pub(crate) fn deflate_fast(state: &mut DeflateState, flush: i32) -> BlockState {
 mod tests {
     use super::*;
     use crate::deflate::trees::tr_init;
+    use crate::stream::ZStream;
+
+    fn dummy_strm() -> ZStream { ZStream::new() }
 
     /// Helper: create a minimal `DeflateState` for testing the greedy
     /// matching algorithm. Sets up a small window with controlled data
@@ -572,7 +568,7 @@ mod tests {
     fn test_deflate_fast_no_input_no_flush() {
         // With no lookahead and Z_NO_FLUSH, should return NeedMore.
         let mut state = make_test_state(&[], 0, 0);
-        let result = deflate_fast(&mut state, Z_NO_FLUSH);
+        let result = deflate_fast(&mut state, &mut dummy_strm() as *mut ZStream, Z_NO_FLUSH);
         assert_eq!(result, BlockState::NeedMore);
     }
 
@@ -581,7 +577,7 @@ mod tests {
         // With no lookahead and Z_FINISH, should return FinishDone
         // (emitting an empty final block).
         let mut state = make_test_state(&[], 0, 0);
-        let result = deflate_fast(&mut state, Z_FINISH);
+        let result = deflate_fast(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
         assert_eq!(result, BlockState::FinishDone);
     }
 
@@ -593,7 +589,7 @@ mod tests {
 
         // With Z_FINISH, the function should process all bytes as literals
         // and emit the final block.
-        let result = deflate_fast(&mut state, Z_FINISH);
+        let result = deflate_fast(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
         assert_eq!(result, BlockState::FinishDone);
 
         // strstart should have advanced by the number of literals processed.
@@ -621,7 +617,7 @@ mod tests {
             ((state.ins_h << state.hash_shift as u32) ^ data[1] as u32)
                 & state.hash_mask;
 
-        let result = deflate_fast(&mut state, Z_FINISH);
+        let result = deflate_fast(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
         assert_eq!(result, BlockState::FinishDone);
         // The function should have processed all 16 bytes.
         assert_eq!(state.strstart, 16);
@@ -695,7 +691,7 @@ mod tests {
         let data: Vec<u8> = (0..32).collect();
         let mut state = make_test_state(&data, 0, 0);
         assert_eq!(
-            deflate_fast(&mut state, Z_NO_FLUSH),
+            deflate_fast(&mut state, &mut dummy_strm() as *mut ZStream, Z_NO_FLUSH),
             BlockState::NeedMore
         );
     }

@@ -42,6 +42,7 @@
 use crate::constants::{Z_FINISH, Z_NO_FLUSH};
 use crate::deflate::state::{BlockState, DeflateState};
 use crate::deflate::trees::{tally_lit, tr_flush_block};
+use crate::stream::ZStream;
 
 // ===========================================================================
 // Local helpers
@@ -49,31 +50,19 @@ use crate::deflate::trees::{tally_lit, tr_flush_block};
 
 /// Fill the sliding window with data from the input stream.
 ///
-/// In the fully integrated system, `fill_window` is defined in the parent
-/// `deflate` module (`mod.rs`) and reads bytes from the `ZStream`'s input
-/// buffer into `DeflateState.window`, updating `lookahead`, potentially
-/// sliding the window, and updating the hash table.
+/// Delegates to the real `fill_window` in the parent `deflate` module.
 ///
-/// Strategy functions call `fill_window` when `lookahead` drops to zero.
-/// After the call, the function checks whether `lookahead` is still zero:
+/// # Safety
 ///
-/// - If `lookahead == 0 && flush == Z_NO_FLUSH`: the function returns
-///   `BlockState::NeedMore`, signalling the main `deflate()` loop to
-///   provide more input and re-enter the strategy.
-/// - If `lookahead == 0` with any other flush mode: the loop breaks to
-///   flush the current block.
-///
-/// This local definition is a no-op stub. When the `deflate` module's
-/// public API (`mod.rs`) is fully assembled, it will contain the real
-/// `fill_window` implementation. The strategy functions are designed so
-/// that the no-op correctly triggers the `NeedMore` / break paths above,
-/// ensuring the main `deflate()` loop takes over window management.
+/// `strm` must be a valid pointer to the `ZStream` that owns this
+/// `DeflateState`. The pointer is valid for the lifetime of the
+/// `deflate()` call.
 #[inline(always)]
-fn fill_window(_state: &mut DeflateState) {
-    // Intentional no-op: window filling is orchestrated by the main
-    // deflate() loop in mod.rs, which calls the real fill_window
-    // before and after invoking the strategy function. The lookahead
-    // checks after this call handle the case where no data is available.
+unsafe fn do_fill_window(state: &mut DeflateState, strm: *mut ZStream) {
+    // SAFETY: strm is the raw pointer to the parent ZStream passed from
+    // deflate(). fill_window only reads/writes strm fields (avail_in,
+    // next_in, total_in, adler) that do not overlap with DeflateState.
+    super::fill_window(state, unsafe { &mut *strm });
 }
 
 /// Flush the current block to the pending output buffer.
@@ -163,7 +152,7 @@ fn flush_block(state: &mut DeflateState, last: bool) {
 /// # C Source
 ///
 /// Direct port of `deflate_huff` in `deflate.c:2155–2185`.
-pub(crate) fn deflate_huff(state: &mut DeflateState, flush: i32) -> BlockState {
+pub(crate) fn deflate_huff(state: &mut DeflateState, strm: *mut ZStream, flush: i32) -> BlockState {
     loop {
         // ------------------------------------------------------------------
         // Ensure we have a literal byte to write.
@@ -174,7 +163,8 @@ pub(crate) fn deflate_huff(state: &mut DeflateState, flush: i32) -> BlockState {
         // literal symbol.
         // ------------------------------------------------------------------
         if state.lookahead == 0 {
-            fill_window(state);
+            // SAFETY: strm is valid for the duration of deflate().
+            unsafe { do_fill_window(state, strm); }
 
             if state.lookahead == 0 {
                 if flush == Z_NO_FLUSH {
@@ -237,6 +227,9 @@ pub(crate) fn deflate_huff(state: &mut DeflateState, flush: i32) -> BlockState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::ZStream;
+
+    fn dummy_strm() -> ZStream { ZStream::new() }
 
     /// Helper: create a minimal `DeflateState` for testing the Huffman-only
     /// algorithm. Sets up a small window with controlled data and configures
@@ -267,6 +260,7 @@ mod tests {
         state.strstart = strstart;
         state.lookahead = lookahead;
         state.block_start = 0;
+        state.window_size = state.window.len();
         state.match_length = 0;
         state.insert = 0;
         state.strategy = Z_HUFFMAN_ONLY;
@@ -282,7 +276,7 @@ mod tests {
         let mut state = make_test_state(&data, 0, 100);
 
         // Run with Z_FINISH to process all data
-        let result = deflate_huff(&mut state, Z_FINISH);
+        let result = deflate_huff(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
 
         // The function should process data and return FinishDone
         assert_eq!(result, BlockState::FinishDone);
@@ -309,7 +303,7 @@ mod tests {
         }
         let mut state = make_test_state(&data, 0, 200);
 
-        let result = deflate_huff(&mut state, Z_FINISH);
+        let result = deflate_huff(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
 
         assert_eq!(result, BlockState::FinishDone);
         assert_eq!(state.insert, 0);
@@ -324,7 +318,7 @@ mod tests {
         let data = vec![b'B'; 300];
         let mut state = make_test_state(&data, 0, 0);
 
-        let result = deflate_huff(&mut state, Z_NO_FLUSH);
+        let result = deflate_huff(&mut state, &mut dummy_strm() as *mut ZStream, Z_NO_FLUSH);
 
         assert_eq!(result, BlockState::NeedMore);
     }
@@ -336,7 +330,7 @@ mod tests {
         let data = vec![0u8; 300];
         let mut state = make_test_state(&data, 100, 0);
 
-        let result = deflate_huff(&mut state, Z_FINISH);
+        let result = deflate_huff(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
 
         assert_eq!(result, BlockState::FinishDone);
         assert_eq!(state.insert, 0);
@@ -349,7 +343,7 @@ mod tests {
         let data = vec![b'X'; 300];
         let mut state = make_test_state(&data, 0, 1);
 
-        let result = deflate_huff(&mut state, Z_FINISH);
+        let result = deflate_huff(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
 
         assert_eq!(result, BlockState::FinishDone);
         assert_eq!(state.strstart, 1);
@@ -364,7 +358,7 @@ mod tests {
         let data = vec![b'Q'; 300];
         let mut state = make_test_state(&data, 0, 50);
 
-        let result = deflate_huff(&mut state, Z_FINISH);
+        let result = deflate_huff(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
 
         assert_eq!(result, BlockState::FinishDone);
         assert_eq!(state.match_length, 0);
@@ -380,7 +374,7 @@ mod tests {
 
         // Use Z_SYNC_FLUSH (not NO_FLUSH, not FINISH) to trigger
         // the break-out path.
-        let result = deflate_huff(&mut state, crate::constants::Z_SYNC_FLUSH);
+        let result = deflate_huff(&mut state, &mut dummy_strm() as *mut ZStream, crate::constants::Z_SYNC_FLUSH);
 
         assert_eq!(result, BlockState::BlockDone);
         assert_eq!(state.insert, 0);
@@ -393,7 +387,7 @@ mod tests {
         let mut state = make_test_state(&data, 5, 50);
         state.insert = 42; // Set to non-zero to verify it gets cleared
 
-        let result = deflate_huff(&mut state, Z_FINISH);
+        let result = deflate_huff(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
 
         assert_eq!(result, BlockState::FinishDone);
         assert_eq!(state.insert, 0);

@@ -1145,23 +1145,32 @@ pub fn deflate(strm: &mut ZStream, flush: i32) -> Result<ReturnCode, ZlibError> 
     } // end #[cfg(feature = "gzip")]
 
     // === Strategy dispatch — the core compression loop ===
+    //
+    // We pass a raw pointer to `strm` so that strategy functions can call
+    // `fill_window(state, &mut *strm)` to read input from the stream.
+    // This mirrors C zlib's `internal_state.strm` back-pointer.
+    //
+    // SAFETY: `strm` is valid for the lifetime of this function and
+    // strategy functions only access non-overlapping fields through it.
+    let strm_ptr: *mut ZStream = strm as *mut ZStream;
+
     if strm.avail_in != 0
         || s.lookahead != 0
         || (flush != Z_NO_FLUSH && s.status != DeflateStatus::Finish)
     {
         let bstate: BlockState = if s.level == 0 {
-            deflate_stored(s, flush)
+            deflate_stored(s, strm_ptr, flush)
         } else if s.strategy == Z_HUFFMAN_ONLY {
-            deflate_huff(s, flush)
+            deflate_huff(s, strm_ptr, flush)
         } else if s.strategy == Z_RLE {
-            deflate_rle(s, flush)
+            deflate_rle(s, strm_ptr, flush)
         } else {
             match CONFIG_TABLE[s.level].strategy {
-                CompressionStrategy::Stored => deflate_stored(s, flush),
-                CompressionStrategy::Fast => deflate_fast(s, flush),
-                CompressionStrategy::Slow => deflate_slow(s, flush),
-                CompressionStrategy::Huff => deflate_huff(s, flush),
-                CompressionStrategy::Rle => deflate_rle(s, flush),
+                CompressionStrategy::Stored => deflate_stored(s, strm_ptr, flush),
+                CompressionStrategy::Fast => deflate_fast(s, strm_ptr, flush),
+                CompressionStrategy::Slow => deflate_slow(s, strm_ptr, flush),
+                CompressionStrategy::Huff => deflate_huff(s, strm_ptr, flush),
+                CompressionStrategy::Rle => deflate_rle(s, strm_ptr, flush),
             }
         };
 

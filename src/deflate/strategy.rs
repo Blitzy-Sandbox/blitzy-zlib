@@ -49,6 +49,7 @@ use crate::deflate::slow::deflate_slow;
 use crate::deflate::stored::deflate_stored;
 use crate::deflate::huff::deflate_huff;
 use crate::deflate::rle::deflate_rle;
+use crate::stream::ZStream;
 
 // ===========================================================================
 // CompressionStrategy — replaces C function pointer `compress_func`
@@ -151,13 +152,13 @@ impl CompressionStrategy {
     /// - `FinishStarted` — finish started, need only more output at next call.
     /// - `FinishDone` — finish done, accept no more input or output.
     #[inline]
-    pub(crate) fn compress(self, state: &mut DeflateState, flush: i32) -> BlockState {
+    pub(crate) fn compress(self, state: &mut DeflateState, strm: *mut ZStream, flush: i32) -> BlockState {
         match self {
-            CompressionStrategy::Stored => deflate_stored(state, flush),
-            CompressionStrategy::Fast => deflate_fast(state, flush),
-            CompressionStrategy::Slow => deflate_slow(state, flush),
-            CompressionStrategy::Huff => deflate_huff(state, flush),
-            CompressionStrategy::Rle => deflate_rle(state, flush),
+            CompressionStrategy::Stored => deflate_stored(state, strm, flush),
+            CompressionStrategy::Fast => deflate_fast(state, strm, flush),
+            CompressionStrategy::Slow => deflate_slow(state, strm, flush),
+            CompressionStrategy::Huff => deflate_huff(state, strm, flush),
+            CompressionStrategy::Rle => deflate_rle(state, strm, flush),
         }
     }
 }

@@ -57,6 +57,7 @@ use core::cmp::min;
 use crate::constants::{Z_FINISH, Z_NO_FLUSH};
 use crate::deflate::state::{BlockState, DeflateState, MIN_LOOKAHEAD};
 use crate::deflate::trees::tr_stored_block;
+use crate::stream::ZStream;
 
 /// Maximum stored block payload length per RFC 1951 §3.2.4.
 ///
@@ -105,7 +106,7 @@ const MAX_STORED: usize = 65535;
 /// corresponds to the C fallback path (lines 1823–1848) applied in a loop,
 /// since the Rust strategy function does not have direct access to the
 /// stream's I/O buffers needed by the C fast path (lines 1682–1751).
-pub(crate) fn deflate_stored(state: &mut DeflateState, flush: i32) -> BlockState {
+pub(crate) fn deflate_stored(state: &mut DeflateState, _strm: *mut ZStream, flush: i32) -> BlockState {
     // ---------------------------------------------------------------
     // Setup: compute minimum block size threshold.
     //
@@ -360,6 +361,8 @@ pub(crate) fn deflate_stored(state: &mut DeflateState, flush: i32) -> BlockState
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::ZStream;
+    fn dummy_strm() -> ZStream { ZStream::new() }
     use crate::deflate::trees::tr_init;
 
     /// Create a minimal `DeflateState` for testing the stored block
@@ -410,7 +413,7 @@ mod tests {
         let mut state = make_test_state(data, 0, 10);
 
         // Call with Z_FINISH to emit a final stored block.
-        let result = deflate_stored(&mut state, Z_FINISH);
+        let result = deflate_stored(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
 
         // Should emit the final block and return FinishDone.
         assert_eq!(result, BlockState::FinishDone);
@@ -435,7 +438,7 @@ mod tests {
         let mut state = make_test_state(&[], 0, 0);
 
         // Call with Z_FINISH — should emit an empty final stored block.
-        let result = deflate_stored(&mut state, Z_FINISH);
+        let result = deflate_stored(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
 
         assert_eq!(result, BlockState::FinishDone);
         assert_eq!(state.strstart, 0);
@@ -455,7 +458,7 @@ mod tests {
 
         // Call with Z_NO_FLUSH — not enough data for min_block, should
         // return NeedMore.
-        let result = deflate_stored(&mut state, Z_NO_FLUSH);
+        let result = deflate_stored(&mut state, &mut dummy_strm() as *mut ZStream, Z_NO_FLUSH);
 
         assert_eq!(result, BlockState::NeedMore);
 
@@ -470,7 +473,7 @@ mod tests {
         let mut state = make_test_state(&[], 0, 0);
 
         // Call with Z_NO_FLUSH — nothing to do.
-        let result = deflate_stored(&mut state, Z_NO_FLUSH);
+        let result = deflate_stored(&mut state, &mut dummy_strm() as *mut ZStream, Z_NO_FLUSH);
 
         assert_eq!(result, BlockState::NeedMore);
         assert_eq!(state.pending, 0);
@@ -485,7 +488,7 @@ mod tests {
 
         // Use Z_SYNC_FLUSH (value 2) — should emit the block and
         // return BlockDone.
-        let result = deflate_stored(&mut state, 2); // Z_SYNC_FLUSH = 2
+        let result = deflate_stored(&mut state, &mut dummy_strm() as *mut ZStream, 2); // Z_SYNC_FLUSH = 2
 
         // After consuming lookahead, strstart = 20, block_start should
         // also advance to 20 (all data emitted). Return should be BlockDone.
@@ -500,7 +503,7 @@ mod tests {
         let data = [0xABu8; 200];
         let mut state = make_test_state(&data, 0, 100);
 
-        let _result = deflate_stored(&mut state, Z_FINISH);
+        let _result = deflate_stored(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
 
         // Lookahead should be zero after the call.
         assert_eq!(state.lookahead, 0);
@@ -517,7 +520,7 @@ mod tests {
         let mut state = make_test_state(&data, 0, 50);
 
         // First call: emit a block (with Z_SYNC_FLUSH to force emission).
-        let result1 = deflate_stored(&mut state, 2); // Z_SYNC_FLUSH
+        let result1 = deflate_stored(&mut state, &mut dummy_strm() as *mut ZStream, 2); // Z_SYNC_FLUSH
         assert_eq!(result1, BlockState::BlockDone);
         assert_eq!(state.strstart, 50);
         let pending_after_first = state.pending;
@@ -526,7 +529,7 @@ mod tests {
         state.lookahead = 50;
 
         // Second call: emit another block.
-        let result2 = deflate_stored(&mut state, 2);
+        let result2 = deflate_stored(&mut state, &mut dummy_strm() as *mut ZStream, 2);
         assert_eq!(result2, BlockState::BlockDone);
         assert_eq!(state.strstart, 100);
 
@@ -540,7 +543,7 @@ mod tests {
         let mut state = make_test_state(&data, 0, 80);
         state.high_water = 0;
 
-        let _result = deflate_stored(&mut state, Z_FINISH);
+        let _result = deflate_stored(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
 
         // high_water should be updated to at least strstart.
         assert!(state.high_water >= 80);
@@ -552,7 +555,7 @@ mod tests {
         let data = [0xEFu8; 100];
         let mut state = make_test_state(&data, 0, 30);
 
-        let _result = deflate_stored(&mut state, Z_FINISH);
+        let _result = deflate_stored(&mut state, &mut dummy_strm() as *mut ZStream, Z_FINISH);
 
         // block_start should equal strstart (all data emitted).
         assert_eq!(state.block_start, state.strstart as i64);
