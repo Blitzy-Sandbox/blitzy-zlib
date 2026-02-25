@@ -22,5 +22,8 @@ export-symbols = []
 gz-io = ["zlib-rs/gz-io"]
 gzip = ["zlib-rs/gzip"]
 
+[lints]
+workspace = true
+
 [package.metadata.docs.rs]
 all-features = true
