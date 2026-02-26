@@ -2,7 +2,6 @@
 
 **A complete Rust rewrite of zlib 1.3.2.1-motley**
 
-[![CI](https://github.com/ArtifactedAI/zlib-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/ArtifactedAI/zlib-rs/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/zlib-rs.svg)](https://crates.io/crates/zlib-rs)
 [![docs.rs](https://docs.rs/zlib-rs/badge.svg)](https://docs.rs/zlib-rs)
 [![License](https://img.shields.io/crates/l/zlib-rs.svg)](LICENSE-ZLIB)
@@ -28,7 +27,7 @@ semantics and eliminates undefined behavior by design.
   eliminate memory safety issues at compile time.
 
 - **C-compatible FFI** — Drop-in replacement for `libz.so` / `zlib1.dll` via
-  the `libz-rs-sys` and `libz-rs-sys-cdylib` crates, exposing all 105 public
+  the `libz-rs-sys` and `libz-rs-sys-cdylib` crates, exposing all 96 public
   symbols from the original zlib C API through `#[no_mangle] extern "C"`
   functions.
 
@@ -89,7 +88,7 @@ zlib-rs/               Core Rust library (pure safe Rust, no external runtime de
 
 libz-rs-sys/          C-compatible FFI bindings (#[no_mangle] extern "C")
   src/
-    lib.rs             Re-exports all 105 extern "C" symbols
+    lib.rs             Re-exports all 96 extern "C" symbols
     types.rs           #[repr(C)] z_stream, gz_header, alloc_func
     deflate.rs         deflateInit_, deflate, deflateEnd, etc.
     inflate.rs         inflateInit_, inflate, inflateEnd, etc.
@@ -106,7 +105,7 @@ libz-rs-sys-cdylib/   Shared library output (drop-in libz.so replacement)
 
 tests/                 Integration test suite
   tests/
-    example_compat.rs  Port of test/example.c (13+ test functions)
+    example_compat.rs  Port of test/example.c (9 test functions)
     infcover_compat.rs Port of test/infcover.c (coverage harness)
     deflate_tests.rs   Deflate-specific edge cases
     inflate_tests.rs   Inflate-specific edge cases
@@ -249,7 +248,7 @@ and retrieve decompressed output.
 | **Original C library** | zlib 1.3.2.1-motley (`VERNUM 0x1321`) |
 | **Original authors** | Jean-loup Gailly and Mark Adler |
 | **Format compliance** | RFC 1950 (zlib), RFC 1951 (DEFLATE), RFC 1952 (gzip) |
-| **FFI symbols exported** | 105 (matching `win32/zlib.def` from original zlib) |
+| **FFI symbols exported** | 96 |
 | **Symbol versioning** | 14 milestones (`ZLIB_1.2.0` through `ZLIB_1.3.2`) |
 
 ### Format Selection via `windowBits`
@@ -323,7 +322,7 @@ The following GitHub Actions workflows validate every pull request:
 - **[ci.yml](.github/workflows/ci.yml)** — Build, test, clippy, and format
   checks across the full workspace.
 - **[ffi-compat.yml](.github/workflows/ffi-compat.yml)** — FFI compatibility
-  validation ensuring all 105 symbols are correctly exported.
+  validation ensuring all 96 symbols are correctly exported.
 - **[cross-platform.yml](.github/workflows/cross-platform.yml)** —
   Cross-compilation matrix for supported targets.
 

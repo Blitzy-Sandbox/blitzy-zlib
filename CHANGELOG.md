@@ -3,7 +3,7 @@
 All notable changes to the **zlib-rs** project will be documented in this file.
 
 This is the changelog for the Rust rewrite of the
-[zlib 1.3.2.1-motley](https://github.com/ArtifactedAI/zlib-rs) compression
+[zlib 1.3.2.1-motley](https://zlib.net/) compression
 library (C, `VERNUM 0x1321`), originally authored by Jean-loup Gailly and
 Mark Adler. The Rust implementation lives in the same repository and provides a
 drop-in replacement for the original C `libz`.
@@ -12,9 +12,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## Unreleased
 
-## [0.1.0] — Initial Rust Rewrite
+## 0.1.0 — Initial Rust Rewrite
 
 Complete rewrite of zlib 1.3.2.1-motley from C to idiomatic, production-ready
 Rust. This release establishes byte-level compatibility with the original C
@@ -74,7 +74,7 @@ library for all supported compression formats.
 
 #### FFI Bindings (`libz-rs-sys` crate)
 
-- All 105 public symbols from `win32/zlib.def` exposed as
+- All 96 public symbols from the original zlib C API exposed as
   `#[no_mangle] extern "C"` functions.
 - `#[repr(C)]` type definitions for `z_stream`, `gz_header`, `alloc_func`,
   and `free_func` ensuring binary layout compatibility with C zlib.
@@ -97,10 +97,11 @@ library for all supported compression formats.
 
 #### Test Suite (`tests` crate)
 
-- Ported regression tests from `test/example.c` (13+ test functions):
-  `test_compress`, `test_gzio`, `test_deflate`, `test_inflate`,
-  `test_large_deflate`, `test_large_inflate`, `test_flush`, `test_sync`,
-  `test_dict_deflate`, `test_dict_inflate`.
+- Ported regression tests from `test/example.c` (9 test functions):
+  `test_version_check`, `test_compress`, `test_gzio`,
+  `test_deflate_small_buffers`, `test_inflate_small_buffers`,
+  `test_large_deflate`, `test_large_inflate`, `test_flush_and_sync`,
+  `test_dict_deflate_inflate`.
 - Ported inflate coverage harness from `test/infcover.c` with memory
   tracking and hex fixture decoding.
 - Deflate-specific edge case tests (all levels, strategies, `windowBits`
@@ -181,6 +182,3 @@ library, one of the most widely deployed software libraries in existence.
 The original C source code served as the authoritative specification for
 every algorithm, data structure, and behavioral contract in this Rust
 implementation.
-
-[Unreleased]: https://github.com/ArtifactedAI/zlib-rs/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/ArtifactedAI/zlib-rs/releases/tag/v0.1.0
