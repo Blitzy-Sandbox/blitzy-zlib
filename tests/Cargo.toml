@@ -57,7 +57,7 @@ path = "src/lib.rs"
 #                   the 14 version milestones in zlib.map.
 [dependencies]
 zlib-rs = { path = "../zlib-rs" }
-libz-rs-sys = { path = "../libz-rs-sys" }
+libz-rs-sys = { path = "../libz-rs-sys", features = ["gz-io"] }
 
 # Dev-dependencies used only during test execution (not compiled into the
 # library target). All versions are inherited from the workspace root
