@@ -2177,3 +2177,72 @@ pub fn inflate_mark(state: &InflateState) -> i64 {
 pub fn inflate_codes_used(state: &InflateState) -> usize {
     state.next
 }
+
+// ─── Stream-Level Convenience Wrappers ──────────────────────────────────────
+//
+// These functions mirror the deflate module's pattern where the public API
+// takes `&mut ZStream` and handles state extraction internally.  They make
+// the inflate streaming API accessible to external callers (benchmarks,
+// integration tests) that cannot reach the `pub(crate)` `ZStream::state`
+// field directly.
+
+/// Perform a single inflate decompression step on a stream.
+///
+/// This is a convenience wrapper around [`inflate`] that handles the
+/// internal [`InflateState`] extraction from the [`ZStream`] automatically.
+/// It performs a single decompression step, equivalent to the C pattern of
+/// calling `inflate(strm, flush)`.
+///
+/// The stream must have been previously initialized with [`inflate_init2`]
+/// or [`inflate_init`], and input/output buffers must be configured via
+/// [`ZStream::set_input`] and [`ZStream::set_output_buffer`].
+///
+/// # Parameters
+///
+/// * `stream` — Mutable reference to a pre-initialized inflate stream.
+/// * `flush` — Flush mode (e.g., `Z_NO_FLUSH`, `Z_FINISH`).
+///
+/// # Returns
+///
+/// The [`ReturnCode`] from the underlying [`inflate`] call, or
+/// [`ReturnCode::StreamError`] if the stream state is missing or invalid.
+pub fn inflate_run(stream: &mut ZStream, flush: i32) -> ReturnCode {
+    let Some(mut state_box) = stream.state.take() else {
+        return ReturnCode::StreamError;
+    };
+    let Some(state) = state_box.downcast_mut::<InflateState>() else {
+        stream.state = Some(state_box);
+        return ReturnCode::StreamError;
+    };
+
+    let ret = inflate(state, stream, flush);
+    stream.state = Some(state_box);
+    ret
+}
+
+/// Clean up the inflate state stored in a stream.
+///
+/// This is a convenience wrapper around [`inflate_end`] that handles the
+/// internal [`InflateState`] extraction from the [`ZStream`] automatically.
+///
+/// # Parameters
+///
+/// * `stream` — Mutable reference to the inflate stream to clean up.
+///
+/// # Returns
+///
+/// [`ReturnCode::Ok`] on success, or [`ReturnCode::StreamError`] if the
+/// stream state is missing or invalid.
+pub fn inflate_end_stream(stream: &mut ZStream) -> ReturnCode {
+    let Some(mut state_box) = stream.state.take() else {
+        return ReturnCode::StreamError;
+    };
+    let Some(state) = state_box.downcast_mut::<InflateState>() else {
+        stream.state = Some(state_box);
+        return ReturnCode::StreamError;
+    };
+
+    let ret = inflate_end(state, stream);
+    stream.state = Some(state_box);
+    ret
+}
