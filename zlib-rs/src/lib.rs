@@ -185,7 +185,7 @@ pub mod checksum;
 ///
 /// Selected functions (`zlib_version`, `zlib_compile_flags`, `err_msg`) are
 /// re-exported at the crate root for use by the FFI crate.
-pub mod util;
+pub(crate) mod util;
 
 // ─── Primary Type Re-exports ─────────────────────────────────────────────────
 //

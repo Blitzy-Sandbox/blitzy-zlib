@@ -1182,10 +1182,7 @@ impl GzWriter {
     ///
     /// Returns the byte offset, or -1 on I/O error.
     pub fn offset(&mut self) -> i64 {
-        match super::gz_offset(&mut self.state) {
-            Ok(off) => off,
-            Err(_) => -1,
-        }
+        super::gz_offset(&mut self.state).unwrap_or(-1)
     }
 
     /// Returns the current error code for the last operation.

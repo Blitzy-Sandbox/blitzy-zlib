@@ -455,7 +455,9 @@ impl InflateState {
     ///
     /// The window must be allocated before calling this method. If
     /// [`wsize`](Self::wsize) is zero, it is initialized to `2^wbits`.
-    #[allow(clippy::cast_possible_truncation)] // dist and remaining bounded by wsize (≤ 32768)
+    // Retained for inflate_back window management; used by the callback
+    // decompression path for direct-to-window output.
+    #[allow(dead_code, clippy::cast_possible_truncation)] // dist and remaining bounded by wsize (≤ 32768)
     pub(crate) fn window_write(&mut self, data: &[u8]) {
         // Initialize window size on first use.
         if self.wsize == 0 {

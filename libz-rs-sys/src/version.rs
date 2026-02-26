@@ -199,8 +199,8 @@ unsafe fn build_rust_stream(strm: *const z_stream) -> zlib_rs::stream::ZStream {
     let strm_ref = unsafe { &*strm };
 
     let mut rs = zlib_rs::stream::ZStream::new();
-    rs.total_in = strm_ref.total_in as u64;
-    rs.total_out = strm_ref.total_out as u64;
+    rs.total_in = strm_ref.total_in;
+    rs.total_out = strm_ref.total_out;
     rs.adler = strm_ref.adler as u32;
     rs.data_type = strm_ref.data_type;
     rs

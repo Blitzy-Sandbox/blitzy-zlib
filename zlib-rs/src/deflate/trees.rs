@@ -16,6 +16,24 @@
 // This module contains **zero** `unsafe` blocks. All buffer management
 // uses safe Rust indexing and owned collections.
 
+// --------------------------------------------------------------------------
+// Clippy allowances — justified for faithful C zlib port.
+//
+// This module is a direct translation of `trees.c` which performs extensive
+// arithmetic on mixed integer types (u8, u16, u32, i32, usize). The original
+// C code uses implicit integer promotion and truncation pervasively; the Rust
+// port preserves these semantics via explicit `as` casts. All truncation and
+// sign casts have been verified correct against the C originals: values are
+// bounded by the DEFLATE specification (max 15-bit codes, max 286 literals,
+// max 32768 window positions).
+// --------------------------------------------------------------------------
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_lossless
+)]
+
 use super::state::DeflateState;
 use crate::constants::{
     BL_CODES, BUF_SIZE, D_CODES, DYN_TREES, HEAP_SIZE, L_CODES, LENGTH_CODES,
@@ -71,6 +89,11 @@ impl Default for CtData {
     }
 }
 
+// The `CtData` accessor methods mirror the dual-purpose `ct_data` union from
+// `deflate.h`.  The module's tree helper functions (`tree_freq`, `set_tree_freq`,
+// etc.) are used in the hot path instead, but these methods are retained for
+// completeness and clarity of the data model.
+#[allow(dead_code)]
 impl CtData {
     /// Creates a new `CtData` with the given code and length values.
     #[inline]
@@ -83,7 +106,7 @@ impl CtData {
 
     /// Returns the frequency (tree-building interpretation of `freq_or_code`).
     #[inline]
-    pub fn freq(&self) -> u16 {
+    pub fn freq(self) -> u16 {
         self.freq_or_code
     }
 
@@ -95,7 +118,7 @@ impl CtData {
 
     /// Returns the Huffman code (encoding interpretation of `freq_or_code`).
     #[inline]
-    pub fn code(&self) -> u16 {
+    pub fn code(self) -> u16 {
         self.freq_or_code
     }
 
@@ -107,7 +130,7 @@ impl CtData {
 
     /// Returns the parent index (tree-building interpretation of `dad_or_len`).
     #[inline]
-    pub fn dad(&self) -> u16 {
+    pub fn dad(self) -> u16 {
         self.dad_or_len
     }
 
@@ -119,7 +142,7 @@ impl CtData {
 
     /// Returns the bit-string length (encoding interpretation of `dad_or_len`).
     #[inline]
-    pub fn len(&self) -> u16 {
+    pub fn len(self) -> u16 {
         self.dad_or_len
     }
 
@@ -317,10 +340,10 @@ const BL_ORDER: [u8; BL_CODES] = [
 
 // ─── Static literal/length tree (from trees.h) ──────────────────────────────
 
-/// Pre-computed static literal/length Huffman tree (L_CODES + 2 = 288 entries).
+/// Pre-computed static literal/length Huffman tree (`L_CODES` + 2 = 288 entries).
 /// Values copied exactly from `trees.h` `static_ltree`.
 ///
-/// Note: L_CODES is 286, so L_CODES + 2 = 288.  The array contains codes
+/// Note: `L_CODES` is 286, so `L_CODES` + 2 = 288.  The array contains codes
 /// 0–287 plus 2 zero-sentinels, but the sentinels are at indices 286 and 287
 /// which gives exactly 288 elements total.
 #[allow(clippy::unreadable_literal)]
@@ -819,9 +842,9 @@ fn gen_bitlen(state: &mut DeflateState, kind: TreeKind, stat_desc: &StaticTreeDe
 fn gen_codes(state: &mut DeflateState, kind: TreeKind, max_code: usize) {
     let mut next_code = [0u16; MAX_BITS + 1];
     let mut code: u16 = 0;
-    for bits in 1..=MAX_BITS {
+    for (bits, slot) in next_code.iter_mut().enumerate().skip(1) {
         code = (code.wrapping_add(state.bl_count[bits - 1])) << 1;
-        next_code[bits] = code;
+        *slot = code;
     }
     for n in 0..=max_code {
         let len = tree_len(state, kind, n) as usize;
@@ -929,7 +952,8 @@ fn build_tree(state: &mut DeflateState, kind: TreeKind, stat_desc: &StaticTreeDe
 /// Ported from `trees.c` lines 712–747.
 fn scan_tree(state: &mut DeflateState, kind: TreeKind, max_code: usize) {
     let mut prevlen: i32 = -1;
-    let mut curlen: u16 = 0;
+    // Reassigned before first read inside the loop (mirrors C `trees.c` line 714).
+    let mut curlen: u16;
     let mut nextlen: u16 = tree_len(state, kind, 0);
     let mut count: u32 = 0;
     let mut max_count: u32 = 7;
@@ -979,12 +1003,13 @@ fn scan_tree(state: &mut DeflateState, kind: TreeKind, max_code: usize) {
     }
 }
 
-/// Send the bit-length encoded representation of a tree using the bl_tree.
+/// Send the bit-length encoded representation of a tree using the `bl_tree`.
 ///
 /// Ported from `trees.c` lines 753–794.
 fn send_tree(state: &mut DeflateState, kind: TreeKind, max_code: usize) {
     let mut prevlen: i32 = -1;
-    let mut curlen: u16 = 0;
+    // Reassigned before first read inside the loop (mirrors C `trees.c` line 755).
+    let mut curlen: u16;
     let mut nextlen: u16 = tree_len(state, kind, 0);
     let mut count: u32 = 0;
     let mut max_count: u32 = 7;
@@ -1068,8 +1093,8 @@ fn send_all_trees(state: &mut DeflateState, lcodes: usize, dcodes: usize, blcode
     send_bits(state, (lcodes - 257) as u32, 5);
     send_bits(state, (dcodes - 1) as u32, 5);
     send_bits(state, (blcodes - 4) as u32, 4);
-    for rank in 0..blcodes {
-        send_bits(state, state.bl_tree[BL_ORDER[rank] as usize].len as u32, 3);
+    for &bl_order_val in &BL_ORDER[..blcodes] {
+        send_bits(state, state.bl_tree[bl_order_val as usize].len as u32, 3);
     }
     let l_max = get_max_code(state, TreeKind::Literal) as usize;
     let d_max = get_max_code(state, TreeKind::Distance) as usize;

@@ -107,7 +107,7 @@ pub(crate) fn err_msg(err: i32) -> &'static str {
 /// # Examples
 ///
 /// ```
-/// use zlib_rs::util::zlib_version;
+/// use zlib_rs::zlib_version;
 ///
 /// assert!(zlib_version().starts_with("1.3.2"));
 /// ```
@@ -164,7 +164,7 @@ const fn size_to_flag(size: usize) -> u64 {
 /// # Examples
 ///
 /// ```
-/// use zlib_rs::util::zlib_compile_flags;
+/// use zlib_rs::zlib_compile_flags;
 ///
 /// let flags = zlib_compile_flags();
 /// // u32 is always 4 bytes in Rust → bits 0–1 = 1
@@ -224,6 +224,8 @@ pub fn zlib_compile_flags() -> u64 {
 /// This string is embedded in compiled output for attribution and is used by
 /// the deflate module. It matches the C `deflate_copyright[]` array declared
 /// in `zutil.h` line 39 and defined in `trees.c`.
+// Retained for binary embedding per zlib convention; accessed via zlibCompileFlags FFI.
+#[allow(dead_code)]
 pub(crate) const DEFLATE_COPYRIGHT: &str =
     " deflate 1.3.2.1 Copyright 1995-2026 Jean-loup Gailly and Mark Adler ";
 
@@ -232,6 +234,7 @@ pub(crate) const DEFLATE_COPYRIGHT: &str =
 /// This string is embedded in compiled output for attribution and is used by
 /// the inflate module. It matches the C `inflate_copyright[]` array declared
 /// in `zutil.h` line 40 and defined in `inflate.c`.
+#[allow(dead_code)]
 pub(crate) const INFLATE_COPYRIGHT: &str =
     " inflate 1.3.2.1 Copyright 1995-2026 Mark Adler ";
 

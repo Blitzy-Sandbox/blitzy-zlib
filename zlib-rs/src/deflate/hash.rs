@@ -1,3 +1,16 @@
+// --------------------------------------------------------------------------
+// Clippy allowances — justified for faithful C zlib port.
+//
+// Hash chain operations mix u16 window positions, usize buffer indices, and
+// i32 signed comparisons. Values are bounded by the DEFLATE window size
+// (max 32768) and hash table size (max 65536).
+// --------------------------------------------------------------------------
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 //! Hash chain management, window filling, and longest-match search.
 //!
 //! Ports the LZ77 dictionary matching engine from `deflate.c`:
@@ -169,7 +182,7 @@ pub(crate) fn clear_hash(state: &mut DeflateState) {
 pub(crate) fn slide_hash(state: &mut DeflateState) {
     let wsize = state.w_size as u16;
 
-    for entry in state.head[..state.hash_size].iter_mut() {
+    for entry in &mut state.head[..state.hash_size] {
         *entry = if *entry >= wsize {
             *entry - wsize
         } else {
@@ -177,7 +190,7 @@ pub(crate) fn slide_hash(state: &mut DeflateState) {
         };
     }
 
-    for entry in state.prev[..state.w_size].iter_mut() {
+    for entry in &mut state.prev[..state.w_size] {
         *entry = if *entry >= wsize {
             *entry - wsize
         } else {
@@ -410,8 +423,8 @@ pub(crate) fn fill_window(state: &mut DeflateState, stream: &mut ZStream) {
 /// 2. Use heuristic bytes at the end of the best match so far for
 ///    early rejection — most chain entries are eliminated without a full
 ///    byte comparison.
-/// 3. Compare bytes 2..MAX_MATCH (bytes 0–1 are guaranteed equal by
-///    the hash function when `hash_bits ≥ 8`).
+/// 3. Compare bytes 2..`MAX_MATCH` (bytes 0–1 are guaranteed equal by
+///    the hash function when `hash_bits` ≥ 8).
 /// 4. Stop when the chain is exhausted, `nice_match` is reached, or the
 ///    traversal limit (`max_chain_length`) is hit.
 ///

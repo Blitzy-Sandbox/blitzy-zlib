@@ -422,8 +422,8 @@ pub unsafe extern "C" fn deflate(strm: *mut z_stream, flush: c_int) -> c_int {
     }
 
     // Sync scalar fields from C to Rust.
-    rs.total_in = c_total_in as u64;
-    rs.total_out = c_total_out as u64;
+    rs.total_in = c_total_in;
+    rs.total_out = c_total_out;
     rs.adler = c_adler as u32;
     rs.data_type = c_data_type;
 
@@ -783,8 +783,8 @@ pub unsafe extern "C" fn deflateParams(
     if avail_out > 0 {
         rs.set_output_buffer(avail_out);
     }
-    rs.total_in = c_total_in as u64;
-    rs.total_out = c_total_out as u64;
+    rs.total_in = c_total_in;
+    rs.total_out = c_total_out;
     rs.adler = c_adler as u32;
     rs.data_type = c_data_type;
 

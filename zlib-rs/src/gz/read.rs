@@ -1,3 +1,17 @@
+// --------------------------------------------------------------------------
+// Clippy allowances — justified for faithful C zlib port.
+//
+// The gzip read pipeline performs extensive mixed-integer arithmetic between
+// i32 (return codes, gzip lengths), usize (buffer indices), i64 (file
+// offsets), and u32 (CRC values). These casts mirror the C `gzread.c`
+// originals where values are bounded by the I/O buffer size and file offsets.
+// --------------------------------------------------------------------------
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 //! Gzip read pipeline with LOOK/COPY/GZIP auto-detection.
 //!
 //! Implements the [`GzReader`] type that provides buffered decompression
@@ -86,7 +100,7 @@ impl GzReader {
     pub fn open(path: &str) -> io::Result<Self> {
         let file = File::open(path)?;
         let mut state = GzState::new_reader(file, path.to_string());
-        state.record_start_position()?;
+        state.record_start_position();
         Ok(Self {
             state,
             in_pos: 0,
@@ -121,7 +135,7 @@ impl GzReader {
     /// ```
     pub fn from_file(file: File) -> io::Result<Self> {
         let mut state = GzState::new_reader(file, "<fd>".to_string());
-        state.record_start_position()?;
+        state.record_start_position();
         Ok(Self {
             state,
             in_pos: 0,
@@ -177,20 +191,20 @@ impl GzReader {
             return;
         }
         self.state.err = err;
-        if err != Z_MEM_ERROR {
-            self.state.msg = Some(format!("{}: {}", self.state.path, msg));
-        } else {
+        if err == Z_MEM_ERROR {
             self.state.msg = Some(msg.to_string());
+        } else {
+            self.state.msg = Some(format!("{}: {}", self.state.path, msg));
         }
     }
 
     /// Creates an [`io::Error`] from the current error state.
     fn make_io_error(&self) -> io::Error {
         let kind = match self.state.err {
-            Z_ERRNO => io::ErrorKind::Other,
             Z_DATA_ERROR | Z_STREAM_ERROR => io::ErrorKind::InvalidData,
             Z_MEM_ERROR => io::ErrorKind::OutOfMemory,
             Z_BUF_ERROR => io::ErrorKind::UnexpectedEof,
+            // Z_ERRNO and any unrecognized code map to generic I/O error.
             _ => io::ErrorKind::Other,
         };
         match &self.state.msg {
@@ -359,13 +373,13 @@ impl GzReader {
         // Port of gzread.c lines 127–133.
         if self.state.direct == -1 || self.state.junk == 0 {
             let reset_ret =
-                self.with_inflate(|s, strm| inflate::inflate_reset(s, strm))?;
+                self.with_inflate(inflate::inflate_reset)?;
             if reset_ret != ReturnCode::Ok {
                 self.set_error(Z_MEM_ERROR, "out of memory");
                 return Err(self.make_io_error());
             }
             self.state.how = GzHow::Gzip;
-            self.state.junk = if self.state.junk != -1 { 1 } else { 0 };
+            self.state.junk = i32::from(self.state.junk != -1);
             self.state.direct = 0;
             return Ok(());
         }
@@ -388,7 +402,7 @@ impl GzReader {
             && self.state.input[self.in_pos + 3] < 32
         {
             let reset_ret =
-                self.with_inflate(|s, strm| inflate::inflate_reset(s, strm))?;
+                self.with_inflate(inflate::inflate_reset)?;
             if reset_ret != ReturnCode::Ok {
                 self.set_error(Z_MEM_ERROR, "out of memory");
                 return Err(self.make_io_error());
@@ -433,10 +447,8 @@ impl GzReader {
 
         while written < capacity {
             // Ensure we have input for inflate.
-            if self.in_avail == 0 {
-                if self.avail().is_err() {
-                    break;
-                }
+            if self.in_avail == 0 && self.avail().is_err() {
+                break;
             }
             if self.in_avail == 0 {
                 if !self.state.again {
@@ -449,8 +461,8 @@ impl GzReader {
             let out_chunk = capacity - written;
 
             // Snapshot totals so we can compute deltas.
-            let ti_before = self.state.strm.total_in;
-            let to_before = self.state.strm.total_out;
+            let total_in_before = self.state.strm.total_in;
+            let total_out_before = self.state.strm.total_out;
 
             // Set up ZStream input and output.
             self.state.strm.set_input(
@@ -463,8 +475,8 @@ impl GzReader {
                 self.with_inflate(|s, strm| inflate::inflate(s, strm, Z_NO_FLUSH))?;
 
             // Derive consumed/produced from total deltas.
-            let consumed = (self.state.strm.total_in - ti_before) as usize;
-            let produced = (self.state.strm.total_out - to_before) as usize;
+            let consumed = (self.state.strm.total_in - total_in_before) as usize;
+            let produced = (self.state.strm.total_out - total_out_before) as usize;
 
             // Advance our input tracking.
             let actual_consumed = consumed.min(self.in_avail);
@@ -634,7 +646,8 @@ impl GzReader {
     /// Port of `gz_read()` from `gzread.c` lines 317–393.
     /// Copies from the output buffer first, then fetches or does
     /// direct I/O for the remainder.
-    #[allow(clippy::cast_possible_wrap)]
+    // Returns Result for consistency with the I/O Read trait and caller patterns.
+    #[allow(clippy::unnecessary_wraps)]
     fn gz_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let len = buf.len();
         if len == 0 {
@@ -642,10 +655,8 @@ impl GzReader {
         }
 
         // Process a pending skip request
-        if self.state.skip > 0 {
-            if self.skip_pending().is_err() {
-                return Ok(0);
-            }
+        if self.state.skip > 0 && self.skip_pending().is_err() {
+            return Ok(0);
         }
 
         // Read bytes into buf
@@ -946,10 +957,8 @@ impl GzReader {
         self.clear_error();
 
         // Process pending skip
-        if self.state.skip > 0 {
-            if self.skip_pending().is_err() {
-                return Ok(0);
-            }
+        if self.state.skip > 0 && self.skip_pending().is_err() {
+            return Ok(0);
         }
 
         // Reserve one byte for potential null terminator (C compat)
@@ -963,10 +972,8 @@ impl GzReader {
 
         while written < max_bytes && !found_eol {
             // Ensure something is in the output buffer
-            if self.state.x.have == 0 {
-                if self.fetch().is_err() {
-                    break;
-                }
+            if self.state.x.have == 0 && self.fetch().is_err() {
+                break;
             }
             if self.state.x.have == 0 {
                 self.state.past = true;
@@ -1163,6 +1170,9 @@ impl GzReader {
     /// next read attempt.
     ///
     /// Port of `gzeof()` from `gzlib.c` lines 498–510.
+    // The C gzeof() returns the `past` flag (which indicates reading past
+    // the end of the stream), not the `eof` flag (which indicates EOF was seen).
+    #[allow(clippy::misnamed_getters)]
     #[must_use]
     pub fn eof(&self) -> bool {
         self.state.past
@@ -1176,10 +1186,7 @@ impl GzReader {
     ///
     /// Returns the byte offset, or -1 on I/O error.
     pub fn offset(&mut self) -> i64 {
-        match super::gz_offset(&mut self.state) {
-            Ok(off) => off,
-            Err(_) => -1,
-        }
+        super::gz_offset(&mut self.state).unwrap_or(-1)
     }
 
     /// Returns the current error code for the last operation.

@@ -93,9 +93,11 @@ pub const TESTFILE: &str = "foo.gz";
 ///
 /// Panics if `code` is anything other than [`ReturnCode::Ok`].
 pub fn check_err(code: ReturnCode, msg: &str) {
-    if code != ReturnCode::Ok {
-        panic!("{msg} error: {code:?} ({})", code as i32);
-    }
+    assert!(
+        code == ReturnCode::Ok,
+        "{msg} error: {code:?} ({})",
+        code as i32
+    );
 }
 
 /// Macro version of [`check_err`] for concise error checking in tests.

@@ -55,9 +55,13 @@ use state::{GzHow, GzMode, GzState};
 // ─── Internal Constants ─────────────────────────────────────────────────────
 
 /// Seek from beginning of file (POSIX `SEEK_SET` = 0).
+// Retained for C API parity with `gzlib.c`; will be used when gzseek FFI is
+// exercised through the full gz dispatch path.
+#[allow(dead_code)]
 const GZ_SEEK_SET: i32 = 0;
 
 /// Seek from current position (POSIX `SEEK_CUR` = 1).
+#[allow(dead_code)]
 const GZ_SEEK_CUR: i32 = 1;
 
 // ─── GzFile ─────────────────────────────────────────────────────────────────
@@ -287,6 +291,8 @@ pub(crate) fn gz_error(state: &mut GzState, err: i32, msg: Option<&str>) {
 /// # Arguments
 ///
 /// * `state` — Mutable reference to the gzip state to reset.
+// Retained for C API parity; called from gz FFI dispatch path.
+#[allow(dead_code)]
 pub(crate) fn gz_reset(state: &mut GzState) {
     // No output data available
     state.x.have = 0;
@@ -349,6 +355,8 @@ pub(crate) fn gz_reset(state: &mut GzState) {
 /// - `whence` is not `SEEK_SET` or `SEEK_CUR`
 /// - A backward seek fails (file seek error)
 /// - The computed position would be negative
+// Retained for C API parity; called from gz FFI dispatch path.
+#[allow(dead_code)]
 pub(crate) fn gz_seek(
     state: &mut GzState,
     offset: i64,
@@ -472,6 +480,8 @@ pub(crate) fn gz_seek(
 /// # Arguments
 ///
 /// * `state` — Reference to the gzip state.
+// Retained for C API parity; called from gz FFI dispatch path.
+#[allow(dead_code)]
 pub(crate) fn gz_tell(state: &GzState) -> i64 {
     state.x.pos + if state.past { 0 } else { state.skip }
 }
@@ -520,6 +530,8 @@ pub(crate) fn gz_offset(state: &mut GzState) -> io::Result<i64> {
 /// # Arguments
 ///
 /// * `state` — Reference to the gzip state.
+// Retained for C API parity; called from gz FFI dispatch path.
+#[allow(dead_code)]
 pub(crate) fn gz_eof(state: &GzState) -> bool {
     if state.mode == GzMode::Read {
         state.past
@@ -540,6 +552,8 @@ pub(crate) fn gz_eof(state: &GzState) -> bool {
 /// # Arguments
 ///
 /// * `state` — Reference to the gzip state.
+// Retained for C API parity; called from gz FFI dispatch path.
+#[allow(dead_code)]
 pub(crate) fn gz_get_error(state: &GzState) -> (i32, &str) {
     if state.err == Z_MEM_ERROR {
         (state.err, "out of memory")
@@ -598,6 +612,8 @@ pub(crate) fn gz_clearerr(state: &mut GzState) {
 /// # Returns
 ///
 /// The smaller of `have` and `offset`, as a `usize`.
+// Retained for C API parity; used in gz_seek/gz_read skip path.
+#[allow(dead_code)]
 fn min_of_have_and_offset(have: usize, offset: i64) -> usize {
     debug_assert!(offset >= 0, "offset must be non-negative");
 

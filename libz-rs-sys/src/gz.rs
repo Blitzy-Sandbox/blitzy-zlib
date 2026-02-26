@@ -587,7 +587,7 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
     };
     // C gzungetc accepts int; only the low byte is pushed.
     // Return -1 if c is out of single-byte range.
-    if c < 0 || c > 255 {
+    if !(0..=255).contains(&c) {
         return -1;
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -855,14 +855,8 @@ pub unsafe extern "C" fn gzseek64(
         return -1;
     };
     match gz {
-        RustGzFile::Reader(reader) => match reader.seek(offset, seek_from) {
-            Ok(pos) => pos,
-            Err(_) => -1,
-        },
-        RustGzFile::Writer(writer) => match writer.seek(offset, seek_from) {
-            Ok(pos) => pos,
-            Err(_) => -1,
-        },
+        RustGzFile::Reader(reader) => reader.seek(offset, seek_from).unwrap_or(-1),
+        RustGzFile::Writer(writer) => writer.seek(offset, seek_from).unwrap_or(-1),
     }
 }
 

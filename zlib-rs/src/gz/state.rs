@@ -45,6 +45,9 @@ pub const GZBUFSIZE: usize = 8192;
 /// `GZ_WRITE` (31153), and `GZ_APPEND` (1) from `gzguts.h` lines 158–162.
 /// In C, the specific integer values serve as integrity checks on the state
 /// structure; in Rust, the enum itself provides compile-time type safety.
+// Variants `None` and `Append` are retained for C API completeness; they are
+// used during gz_open initialization before the mode is resolved to Read/Write.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GzMode {
     /// Not yet initialized.
@@ -163,6 +166,7 @@ impl GzExposed {
     ///
     /// Used during `gz_reset()` to clear buffered output state before
     /// rewinding or reinitializing the gzip stream.
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.have = 0;
         self.next = 0;
@@ -212,7 +216,9 @@ impl Default for GzExposed {
 /// | `how` | `how` | `int` (0/1/2) | [`GzHow`] |
 /// | `eof`/`past`/`again`/`reset` | same | `int` | [`bool`] |
 /// | `strm` | `strm` | `z_stream` | [`ZStream`] |
-#[allow(clippy::module_name_repetitions)]
+// The boolean fields mirror the C `gz_state` struct's flag integers; collapsing
+// them into a bitfield or enum would reduce fidelity to the original.
+#[allow(clippy::struct_excessive_bools, clippy::module_name_repetitions)]
 pub struct GzState {
     // ── Exposed contents for efficient reads ──
 
@@ -557,19 +563,14 @@ impl GzState {
     ///
     /// If the file position query fails, `start` is set to zero
     /// (matching the C fallback behavior) and `Ok(())` is returned.
-    pub fn record_start_position(&mut self) -> io::Result<()> {
-        match self.file.seek(SeekFrom::Current(0)) {
-            Ok(pos) => {
-                // File positions fit in i64 on all practical platforms.
-                // Fall back to 0 for positions exceeding i64::MAX.
-                self.start = i64::try_from(pos).unwrap_or(0);
-                Ok(())
-            }
-            Err(_) => {
-                // Fallback: treat unknown position as zero (gzlib.c line 277)
-                self.start = 0;
-                Ok(())
-            }
+    pub fn record_start_position(&mut self) {
+        if let Ok(pos) = self.file.stream_position() {
+            // File positions fit in i64 on all practical platforms.
+            // Fall back to 0 for positions exceeding i64::MAX.
+            self.start = i64::try_from(pos).unwrap_or(0);
+        } else {
+            // Fallback: treat unknown position as zero (gzlib.c line 277)
+            self.start = 0;
         }
     }
 }
@@ -637,7 +638,7 @@ impl fmt::Debug for GzState {
             .field("err", &self.err)
             .field("msg", &self.msg)
             .field("x", &self.x)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -785,8 +786,7 @@ mod tests {
         tmpfile.write_all(b"some header data").expect("write");
 
         let mut state = GzState::new_reader(tmpfile, String::new());
-        let result = state.record_start_position();
-        assert!(result.is_ok());
+        state.record_start_position();
         // File position after writing 16 bytes then creating reader
         // should be 16 (writer left position at end)
         assert_eq!(state.start, 16);

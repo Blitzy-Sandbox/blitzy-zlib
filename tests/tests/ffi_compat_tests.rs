@@ -1,8 +1,8 @@
 //! FFI symbol presence and signature validation tests.
 //!
-//! Validates that all 96 symbols from `win32/zlib.def` are present in the
-//! `libz-rs-sys` FFI crate with correct `extern "C"` signatures. This ensures
-//! the Rust library functions as a drop-in replacement for `libz.so` /
+//! Validates that all 96 unique symbol names from the canonical `win32/zlib.def`
+//! are present in the `libz-rs-sys` FFI crate with correct `extern "C"` signatures.
+//! This ensures the Rust library functions as a drop-in replacement for `libz.so` /
 //! `zlib1.dll`.
 //!
 //! Each test verifies a symbol's existence by coercing its name to the expected

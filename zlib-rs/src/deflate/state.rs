@@ -52,12 +52,15 @@ const BL_TREE_SIZE: usize = 2 * BL_CODES + 1;
 /// memory checker errors from `longest_match()` routines.
 ///
 /// Ported from `deflate.h` line 306: `#define WIN_INIT MAX_MATCH`.
+// Retained for C API parity; currently unused because the Rust implementation
+// relies on `Vec` zero-initialization instead of explicit `WIN_INIT` filling.
+#[allow(dead_code)]
 pub(crate) const WIN_INIT: usize = MAX_MATCH;
 
 // ─── Compile-Time Invariant Assertions ────────────────────────────────────────
 // These verify that the Huffman tree array sizes match the C definitions.
 
-/// Verify that HEAP_SIZE == 2 * L_CODES + 1 (from `deflate.h` line 49).
+/// Verify that `HEAP_SIZE` == 2 * `L_CODES` + 1 (from `deflate.h` line 49).
 const _HEAP_SIZE_CHECK: () = assert!(HEAP_SIZE == 2 * L_CODES + 1);
 
 /// Verify that the bit buffer width matches the expected 16-bit value.
@@ -707,10 +710,12 @@ impl DeflateState {
         // ── Hash table sizing ────────────────────────────────────────────
         let hash_bits: usize = mem_level + 7;
         let hash_size: usize = 1_usize << hash_bits;
+        #[allow(clippy::cast_possible_truncation)]
         let hash_mask: u32 = (hash_size as u32).wrapping_sub(1);
         // hash_shift ensures oldest byte drops out after MIN_MATCH steps:
         //   hash_shift × MIN_MATCH >= hash_bits
-        let hash_shift: u32 = ((hash_bits + MIN_MATCH - 1) / MIN_MATCH) as u32;
+        #[allow(clippy::cast_possible_truncation)]
+        let hash_shift: u32 = hash_bits.div_ceil(MIN_MATCH) as u32;
 
         // ── Buffer sizing ────────────────────────────────────────────────
         let lit_bufsize: usize = 1_usize << (mem_level + 6);
@@ -868,7 +873,7 @@ impl DeflateState {
 
         // Clear hash table — zero all head entries and reset slid flag.
         // This replaces the CLEAR_HASH macro from deflate.c lines 170–175.
-        for entry in self.head.iter_mut() {
+        for entry in &mut self.head {
             *entry = 0;
         }
         self.slid = false;

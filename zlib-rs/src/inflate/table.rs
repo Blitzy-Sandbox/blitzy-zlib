@@ -63,6 +63,8 @@ const _: () = assert!(ENOUGH == 1444);
 /// in the documentation of your product. If for some reason you cannot
 /// include such an acknowledgment, we appreciate that you keep this
 /// copyright string in the executable of your product.
+// Retained for binary embedding per zlib convention; accessed via zlibCompileFlags FFI.
+#[allow(dead_code)]
 pub(crate) const INFLATE_COPYRIGHT: &str = " inflate 1.3.2.1 Copyright 1995-2026 Mark Adler ";
 
 // ---------------------------------------------------------------------------

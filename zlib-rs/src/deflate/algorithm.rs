@@ -20,6 +20,21 @@
 // has been replaced with safe Rust slice indexing and `copy_from_slice` /
 // `copy_within` operations.
 
+// --------------------------------------------------------------------------
+// Clippy allowances — justified for faithful C zlib port.
+//
+// The five compression strategy functions perform extensive mixed-integer
+// arithmetic between u16 (window positions), u32 (hash values), usize
+// (buffer indices), i32 (signed comparisons), and i64 (stream offsets).
+// These casts mirror the C originals where values are bounded by the
+// DEFLATE window size (max 32768) and MAX_MATCH (258).
+// --------------------------------------------------------------------------
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use crate::constants::{MAX_MATCH, MIN_MATCH, Z_FILTERED, Z_FINISH, Z_NO_FLUSH};
 use crate::stream::ZStream;
 

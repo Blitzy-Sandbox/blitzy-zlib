@@ -6,7 +6,7 @@
 //! 1. **Version script generation** — Copies the GNU symbol version script (`zlib.map`)
 //!    to `OUT_DIR` and configures the linker to use it on supported platforms. This enables
 //!    binary-compatible symbol versioning with the original C zlib across 14 version
-//!    milestones (ZLIB_1.2.0 through ZLIB_1.3.2).
+//!    milestones (`ZLIB_1.2.0` through `ZLIB_1.3.2`).
 //!
 //! 2. **pkg-config file generation** — Produces a `zlib.pc` file in `OUT_DIR` for
 //!    downstream C/C++ consumers that link against this Rust zlib implementation via
@@ -18,7 +18,7 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Entry point for the Cargo build script.
 ///
@@ -40,8 +40,8 @@ fn main() {
 /// Copies the GNU symbol version script (`zlib.map`) to `OUT_DIR` and, on supported
 /// platforms, instructs the linker to apply it when producing the cdylib shared library.
 ///
-/// The version script defines 14 symbol version milestones (ZLIB_1.2.0 through
-/// ZLIB_1.3.2) that partition the 105+ exported symbols into versioned sets. This is
+/// The version script defines 14 symbol version milestones (`ZLIB_1.2.0` through
+/// `ZLIB_1.3.2`) that partition the 105+ exported symbols into versioned sets. This is
 /// required for binary compatibility when the Rust-built `libz.so` is used as a
 /// drop-in replacement for the C-built `libz.so`.
 ///
@@ -49,12 +49,12 @@ fn main() {
 ///
 /// Per the original `CMakeLists.txt`, the `--version-script` linker flag is applied
 /// on GNU/Linux and compatible ELF platforms, but **not** on macOS (which uses a
-/// different export mechanism), AIX, or SunOS.
+/// different export mechanism), AIX, or `SunOS`.
 ///
 /// The version script linker argument is only emitted when the `export-symbols`
 /// Cargo feature is enabled, which gates whether C-compatible symbols are exported
 /// from the shared library.
-fn generate_version_script(out_dir: &PathBuf) {
+fn generate_version_script(out_dir: &Path) {
     let version_script_src = PathBuf::from("zlib.map");
     let version_script_dst = out_dir.join("zlib.map");
 
@@ -127,7 +127,7 @@ fn generate_version_script(out_dir: &PathBuf) {
 ///
 /// The `License` field reflects the dual-licensing of this Rust implementation:
 /// the original zlib license plus MIT or Apache-2.0 for the Rust code.
-fn generate_pkg_config(out_dir: &PathBuf) {
+fn generate_pkg_config(out_dir: &Path) {
     let version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.1.0".into());
 
     // The pkg-config template preserves the same variable layout as the original

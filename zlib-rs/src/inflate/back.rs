@@ -1,3 +1,17 @@
+// --------------------------------------------------------------------------
+// Clippy allowances — justified for faithful C zlib port.
+//
+// The inflate_back callback decompression performs mixed-integer arithmetic
+// on bit accumulators (u64), code values (u32/u16), and buffer indices
+// (usize/i32). These casts mirror the C `infback.c` originals where values
+// are bounded by DEFLATE specification limits.
+// --------------------------------------------------------------------------
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 //! Callback-based DEFLATE decompression (`inflateBack`).
 //!
 //! This module provides a callback-driven interface for raw DEFLATE decompression.
@@ -45,7 +59,7 @@ const ORDER: [u16; 19] = [
 /// Extracts the low `n` bits from the bit accumulator `hold`.
 ///
 /// Equivalent to the C macro `BITS(n)` in `infback.c`.
-#[inline(always)]
+#[inline]
 fn bits_val(hold: u64, n: u32) -> u32 {
     (hold as u32) & ((1u32 << n).wrapping_sub(1))
 }
@@ -71,7 +85,7 @@ fn bits_val(hold: u64, n: u32) -> u32 {
 ///
 /// `inflateBackInit_()` from `infback.c` lines 25–64.
 pub fn inflate_back_init(state: &mut InflateState, window_bits: i32) -> ReturnCode {
-    if window_bits < 8 || window_bits > MAX_WBITS as i32 {
+    if !(8..=MAX_WBITS).contains(&window_bits) {
         return ReturnCode::StreamError;
     }
 
@@ -388,20 +402,17 @@ pub fn inflate_back(
                 state.lenbits = lenbits_temp;
                 state.lencode = CodeTableRef::Dynamic(0);
 
-                match build_result {
-                    Ok(used) => {
-                        state.next = used;
-                    }
-                    Err(_) => {
-                        stream.msg = Some("invalid code lengths set");
-                        state.mode = InflateMode::Bad;
-                        continue;
-                    }
+                if let Ok(used) = build_result {
+                    state.next = used;
+                } else {
+                    stream.msg = Some("invalid code lengths set");
+                    state.mode = InflateMode::Bad;
+                    continue;
                 }
 
                 // Decode length and distance code code lengths
                 state.have = 0;
-                let total_codes = (state.nlen + state.ndist) as u32;
+                let total_codes = state.nlen + state.ndist;
                 while state.have < total_codes {
                     // Decode using code length table
                     let here;
@@ -570,15 +581,12 @@ pub fn inflate_back(
                 state.lenbits = lenbits_temp2;
                 state.lencode = CodeTableRef::Dynamic(0);
 
-                match lens_build {
-                    Ok(used) => {
-                        state.next = used;
-                    }
-                    Err(_) => {
-                        stream.msg = Some("invalid literal/lengths set");
-                        state.mode = InflateMode::Bad;
-                        continue;
-                    }
+                if let Ok(used) = lens_build {
+                    state.next = used;
+                } else {
+                    stream.msg = Some("invalid literal/lengths set");
+                    state.mode = InflateMode::Bad;
+                    continue;
                 }
 
                 // Build distance table
@@ -597,13 +605,10 @@ pub fn inflate_back(
                 state.distbits = distbits_temp;
                 state.distcode = CodeTableRef::Dynamic(dist_start);
 
-                match dist_build {
-                    Ok(_used) => {}
-                    Err(_) => {
-                        stream.msg = Some("invalid distances set");
-                        state.mode = InflateMode::Bad;
-                        continue;
-                    }
+                if dist_build.is_err() {
+                    stream.msg = Some("invalid distances set");
+                    state.mode = InflateMode::Bad;
+                    continue;
                 }
 
                 // Tables built successfully — proceed to decoding
