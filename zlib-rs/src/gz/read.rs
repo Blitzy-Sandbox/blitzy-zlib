@@ -1148,9 +1148,11 @@ impl GzReader {
     /// Returns the current position in the uncompressed output stream.
     ///
     /// Port of `gztell64()` from `gzlib.c` lines 446–458.
+    /// Includes any pending skip amount that has not yet been consumed,
+    /// matching the C behaviour: `state->x.pos + (state->past ? 0 : state->skip)`.
     #[must_use]
     pub fn tell(&self) -> i64 {
-        self.state.x.pos
+        self.state.x.pos + if self.state.past { 0 } else { self.state.skip }
     }
 
     /// Returns `true` if the end of the input has been reached.

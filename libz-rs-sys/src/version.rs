@@ -286,7 +286,7 @@ unsafe fn sync_deflate_to_c(
 pub extern "C" fn zlibVersion() -> *const c_char {
     // Verify consistency with the safe Rust core at debug time.
     debug_assert!(
-        zlib_rs::util::zlib_version().starts_with("1.3.2"),
+        zlib_rs::zlib_version().starts_with("1.3.2"),
         "version mismatch between FFI and core"
     );
     ZLIB_VERSION_BYTES.as_ptr().cast::<c_char>()
@@ -310,7 +310,7 @@ pub extern "C" fn zlibCompileFlags() -> c_ulong {
     // The Rust core returns u64; c_ulong is u32 on 32-bit and u64 on LP64.
     // The value always fits in 32 bits (only bits 0–27 are used), so the
     // truncation on 32-bit systems is safe and correct.
-    zlib_rs::util::zlib_compile_flags() as c_ulong
+    zlib_rs::zlib_compile_flags() as c_ulong
 }
 
 // =============================================================================
