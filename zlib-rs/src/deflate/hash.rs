@@ -15,16 +15,16 @@
 //!
 //! Ports the LZ77 dictionary matching engine from `deflate.c`:
 //!
-//! - **Hash table operations** — [`update_hash`], [`insert_string`],
-//!   [`clear_hash`], [`slide_hash`] manage the rolling hash used to locate
+//! - **Hash table operations** — `update_hash`, `insert_string`,
+//!   `clear_hash`, `slide_hash` manage the rolling hash used to locate
 //!   repeated byte sequences in the sliding window.
-//! - **Input reading** — [`read_buf`] is the sole input path; every byte that
+//! - **Input reading** — `read_buf` is the sole input path; every byte that
 //!   enters the deflate engine passes through this function (with optional
 //!   checksum update).
-//! - **Window management** — [`fill_window`] keeps the sliding window populated,
+//! - **Window management** — `fill_window` keeps the sliding window populated,
 //!   triggering a slide when the upper half overflows and maintaining the high
 //!   water mark for safe `longest_match` scanning.
-//! - **String matching** — [`longest_match`] traverses the hash chain to find
+//! - **String matching** — `longest_match` traverses the hash chain to find
 //!   the longest matching string in the dictionary, returning the match length
 //!   so that the caller can decide between emitting a literal or a
 //!   length-distance pair.
@@ -129,11 +129,7 @@ pub(crate) fn update_hash(state: &DeflateState, h: u32, c: u8) -> u32 {
 pub(crate) fn insert_string(state: &mut DeflateState, str_pos: usize) -> u16 {
     // Update the running hash with the third byte of the trigram
     // (positions 0 and 1 were already folded in by prior calls).
-    state.ins_h = update_hash(
-        state,
-        state.ins_h,
-        state.window[str_pos + MIN_MATCH - 1],
-    );
+    state.ins_h = update_hash(state, state.ins_h, state.window[str_pos + MIN_MATCH - 1]);
 
     let hash_idx = state.ins_h as usize;
 
@@ -183,19 +179,11 @@ pub(crate) fn slide_hash(state: &mut DeflateState) {
     let wsize = state.w_size as u16;
 
     for entry in &mut state.head[..state.hash_size] {
-        *entry = if *entry >= wsize {
-            *entry - wsize
-        } else {
-            NIL
-        };
+        *entry = if *entry >= wsize { *entry - wsize } else { NIL };
     }
 
     for entry in &mut state.prev[..state.w_size] {
-        *entry = if *entry >= wsize {
-            *entry - wsize
-        } else {
-            NIL
-        };
+        *entry = if *entry >= wsize { *entry - wsize } else { NIL };
     }
 
     state.slid = true;
@@ -348,11 +336,8 @@ pub(crate) fn fill_window(state: &mut DeflateState, stream: &mut ZStream) {
             state.ins_h = update_hash(state, state.ins_h, state.window[str_idx + 1]);
 
             while state.insert > 0 {
-                state.ins_h = update_hash(
-                    state,
-                    state.ins_h,
-                    state.window[str_idx + MIN_MATCH - 1],
-                );
+                state.ins_h =
+                    update_hash(state, state.ins_h, state.window[str_idx + MIN_MATCH - 1]);
 
                 // Link into prev chain (non-FASTEST path).
                 let hash_idx = state.ins_h as usize;
@@ -401,8 +386,7 @@ pub(crate) fn fill_window(state: &mut DeflateState, stream: &mut ZStream) {
     }
 
     debug_assert!(
-        state.strstart <= state.window_size.saturating_sub(MIN_LOOKAHEAD)
-            || stream.avail_in() == 0,
+        state.strstart <= state.window_size.saturating_sub(MIN_LOOKAHEAD) || stream.avail_in() == 0,
         "fill_window: not enough room for search"
     );
 }
@@ -447,7 +431,11 @@ pub(crate) fn longest_match(state: &mut DeflateState, cur_match: u32) -> usize {
 
     // MAX_DIST = w_size - MIN_LOOKAHEAD
     let max_dist = state.w_size.saturating_sub(MIN_LOOKAHEAD);
-    let limit: usize = if scan > max_dist { scan - max_dist } else { NIL as usize };
+    let limit: usize = if scan > max_dist {
+        scan - max_dist
+    } else {
+        NIL as usize
+    };
 
     // Optimisation: halve the chain length when the previous match was
     // already good (deflate.c lines 1423–1424).
@@ -543,7 +531,7 @@ mod tests {
     use super::*;
     use crate::stream::ZStream;
 
-    /// Helper: build a `DeflateState` with window_size initialised.
+    /// Helper: build a `DeflateState` with `window_size` initialised.
     fn make_state() -> DeflateState {
         let mut s = DeflateState::new(9, 1, 8, 0, 6, 1);
         s.window_size = 2 * s.w_size;
@@ -564,7 +552,7 @@ mod tests {
         let state = DeflateState::new(15, 8, 8, 0, 6, 1);
         assert_eq!(state.hash_shift, 5);
         let h = update_hash(&state, 0, b'a');
-        let expected = ((0u32 << 5) ^ u32::from(b'a')) & state.hash_mask;
+        let expected = u32::from(b'a') & state.hash_mask;
         assert_eq!(h, expected);
     }
 

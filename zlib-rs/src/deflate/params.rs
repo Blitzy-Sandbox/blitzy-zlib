@@ -276,6 +276,7 @@ pub fn rank(f: i32) -> i32 {
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop, clippy::cast_sign_loss)]
 mod tests {
     use super::*;
 
@@ -307,11 +308,11 @@ mod tests {
     fn compression_func_is_copy_clone_debug() {
         let f = CompressionFunc::Fast;
         let f2 = f; // Copy
-        let f3 = f.clone(); // Clone
+        let f3 = f; // Copy (implements Copy)
         assert_eq!(f, f2);
         assert_eq!(f, f3);
         // Debug
-        let debug_str = format!("{:?}", f);
+        let debug_str = format!("{f:?}");
         assert!(!debug_str.is_empty());
     }
 
@@ -339,10 +340,10 @@ mod tests {
     fn compression_config_is_copy_clone_debug() {
         let cfg = CONFIGURATION_TABLE[6];
         let cfg2 = cfg; // Copy
-        let cfg3 = cfg.clone(); // Clone
+        let cfg3 = cfg; // Copy (implements Copy)
         assert_eq!(cfg.good_length, cfg2.good_length);
         assert_eq!(cfg.good_length, cfg3.good_length);
-        let debug_str = format!("{:?}", cfg);
+        let debug_str = format!("{cfg:?}");
         assert!(!debug_str.is_empty());
     }
 

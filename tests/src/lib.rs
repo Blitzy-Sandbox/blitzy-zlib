@@ -26,7 +26,7 @@
 // These make all zlib types and functions available to test files via a single
 // `use zlib_rs_tests::*;` import.
 
-pub use zlib_rs::compress::{compress, compress2, compress_bound, uncompress, uncompress2};
+pub use zlib_rs::compress::{compress, compress_bound, compress2, uncompress, uncompress2};
 #[allow(clippy::wildcard_imports)]
 pub use zlib_rs::constants::*;
 pub use zlib_rs::error::ReturnCode;
@@ -100,7 +100,7 @@ pub fn check_err(code: ReturnCode, msg: &str) {
     );
 }
 
-/// Macro version of [`check_err`] for concise error checking in tests.
+/// Macro version of [`check_err()`] for concise error checking in tests.
 ///
 /// # Examples
 ///
@@ -514,6 +514,5 @@ pub fn load_fixture(name: &str) -> Vec<u8> {
 #[must_use]
 pub fn load_test_vector(name: &str) -> Vec<u8> {
     let path = test_vectors_dir().join(name);
-    fs::read(&path)
-        .unwrap_or_else(|e| panic!("failed to load test vector {}: {e}", path.display()))
+    fs::read(&path).unwrap_or_else(|e| panic!("failed to load test vector {}: {e}", path.display()))
 }

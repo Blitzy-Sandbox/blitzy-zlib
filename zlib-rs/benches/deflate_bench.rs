@@ -33,7 +33,7 @@
 //! cargo bench -p zlib-rs --bench deflate_bench
 //! ```
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use zlib_rs::constants::{
     Z_BEST_COMPRESSION, Z_BEST_SPEED, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY, Z_DEFLATED,
@@ -42,7 +42,7 @@ use zlib_rs::constants::{
 use zlib_rs::deflate;
 use zlib_rs::error::ReturnCode;
 use zlib_rs::stream::ZStream;
-use zlib_rs::{compress, compress2, compress_bound};
+use zlib_rs::{compress, compress_bound, compress2};
 
 // ─── Data Generation Helpers ────────────────────────────────────────────────
 //
@@ -151,10 +151,7 @@ fn streaming_compress(
         mem_level,
         strategy,
     );
-    assert!(
-        ret == ReturnCode::Ok,
-        "deflate_init2 failed with {ret:?}"
-    );
+    assert!(ret == ReturnCode::Ok, "deflate_init2 failed with {ret:?}");
 
     // Provide all input at once and allocate sufficient output space.
     stream.set_input(data);
@@ -172,10 +169,7 @@ fn streaming_compress(
 
     // Release all internal deflate state.
     let ret = deflate::deflate_end(&mut stream);
-    assert!(
-        ret == ReturnCode::Ok,
-        "deflate_end failed with {ret:?}"
-    );
+    assert!(ret == ReturnCode::Ok, "deflate_end failed with {ret:?}");
 
     output
 }
@@ -203,17 +197,13 @@ fn bench_compress_one_call(c: &mut Criterion) {
         let data = generate_compressible_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("default", size),
-            &data,
-            |b, data| {
-                b.iter(|| {
-                    let mut dest = Vec::new();
-                    compress(&mut dest, data).unwrap();
-                    dest
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("default", size), &data, |b, data| {
+            b.iter(|| {
+                let mut dest = Vec::new();
+                compress(&mut dest, data).unwrap();
+                dest
+            });
+        });
     }
 
     group.finish();
@@ -259,17 +249,13 @@ fn bench_compression_levels(c: &mut Criterion) {
     ];
 
     for &(level, name) in named_levels {
-        group.bench_with_input(
-            BenchmarkId::new("level", name),
-            &level,
-            |b, &level| {
-                b.iter(|| {
-                    let mut dest = Vec::new();
-                    compress2(&mut dest, &data, level).unwrap();
-                    dest
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("level", name), &level, |b, &level| {
+            b.iter(|| {
+                let mut dest = Vec::new();
+                compress2(&mut dest, &data, level).unwrap();
+                dest
+            });
+        });
     }
 
     group.finish();
@@ -339,17 +325,13 @@ fn bench_data_patterns(c: &mut Criterion) {
     ];
 
     for (name, data) in &patterns {
-        group.bench_with_input(
-            BenchmarkId::new("pattern", *name),
-            data,
-            |b, data| {
-                b.iter(|| {
-                    let mut dest = Vec::new();
-                    compress(&mut dest, data).unwrap();
-                    dest
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("pattern", *name), data, |b, data| {
+            b.iter(|| {
+                let mut dest = Vec::new();
+                compress(&mut dest, data).unwrap();
+                dest
+            });
+        });
     }
 
     group.finish();

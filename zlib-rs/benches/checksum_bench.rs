@@ -16,7 +16,7 @@
 #![allow(clippy::all)]
 #![allow(clippy::pedantic)]
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use zlib_rs::checksum::adler32::{adler32, adler32_combine};
 use zlib_rs::checksum::crc32::{crc32, crc32_combine};
 
@@ -231,17 +231,13 @@ fn bench_checksum_patterns(c: &mut Criterion) {
     ];
 
     for (name, data) in &patterns {
-        group.bench_with_input(
-            BenchmarkId::new("adler32", *name),
-            data,
-            |b, data| b.iter(|| adler32(1, data)),
-        );
+        group.bench_with_input(BenchmarkId::new("adler32", *name), data, |b, data| {
+            b.iter(|| adler32(1, data))
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("crc32", *name),
-            data,
-            |b, data| b.iter(|| crc32(0, data)),
-        );
+        group.bench_with_input(BenchmarkId::new("crc32", *name), data, |b, data| {
+            b.iter(|| crc32(0, data))
+        });
     }
     group.finish();
 }

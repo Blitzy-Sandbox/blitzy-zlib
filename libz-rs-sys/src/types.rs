@@ -40,9 +40,8 @@ use libc::{c_char, c_int, c_uchar, c_uint, c_ulong, c_void};
 /// The allocator receives the opaque pointer from [`z_stream`], the number
 /// of items to allocate, and the size of each item. It returns a pointer to
 /// the allocated memory or null on failure.
-pub type alloc_func = Option<
-    unsafe extern "C" fn(opaque: *mut c_void, items: c_uint, size: c_uint) -> *mut c_void,
->;
+pub type alloc_func =
+    Option<unsafe extern "C" fn(opaque: *mut c_void, items: c_uint, size: c_uint) -> *mut c_void>;
 
 /// Custom memory deallocation function type.
 ///
@@ -53,8 +52,7 @@ pub type alloc_func = Option<
 ///
 /// The deallocator receives the opaque pointer from [`z_stream`] and the
 /// address of the memory block to free.
-pub type free_func =
-    Option<unsafe extern "C" fn(opaque: *mut c_void, address: *mut c_void)>;
+pub type free_func = Option<unsafe extern "C" fn(opaque: *mut c_void, address: *mut c_void)>;
 
 /// Input callback function type for `inflateBack`.
 ///
@@ -66,12 +64,8 @@ pub type free_func =
 /// Called to provide input data. Sets `*buf` to point at the input buffer
 /// and returns the number of bytes available. Returns zero when no more
 /// input is available.
-pub type in_func = Option<
-    unsafe extern "C" fn(
-        in_desc: *mut c_void,
-        buf: *mut *const c_uchar,
-    ) -> c_uint,
->;
+pub type in_func =
+    Option<unsafe extern "C" fn(in_desc: *mut c_void, buf: *mut *const c_uchar) -> c_uint>;
 
 /// Output callback function type for `inflateBack`.
 ///
@@ -82,13 +76,8 @@ pub type in_func = Option<
 ///
 /// Called to consume output data. Receives a pointer to the output buffer
 /// and its length. Returns zero on success or non-zero on failure.
-pub type out_func = Option<
-    unsafe extern "C" fn(
-        out_desc: *mut c_void,
-        buf: *mut c_uchar,
-        len: c_uint,
-    ) -> c_int,
->;
+pub type out_func =
+    Option<unsafe extern "C" fn(out_desc: *mut c_void, buf: *mut c_uchar, len: c_uint) -> c_int>;
 
 // ---------------------------------------------------------------------------
 // z_stream — central stream structure

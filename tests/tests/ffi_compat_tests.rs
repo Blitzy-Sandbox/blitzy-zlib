@@ -45,6 +45,7 @@
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::cast_sign_loss)]
 
+use std::ffi::CStr;
 use std::ffi::c_char;
 use std::ffi::c_int;
 use std::ffi::c_long;
@@ -52,7 +53,6 @@ use std::ffi::c_uchar;
 use std::ffi::c_uint;
 use std::ffi::c_ulong;
 use std::ffi::c_void;
-use std::ffi::CStr;
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
 
@@ -112,8 +112,7 @@ fn test_ffi_inflate_end() {
 /// Verify `deflateSetDictionary` symbol and signature.
 #[test]
 fn test_ffi_deflate_set_dictionary() {
-    let _: unsafe extern "C" fn(*mut z_stream, *const u8, c_uint) -> c_int =
-        deflateSetDictionary;
+    let _: unsafe extern "C" fn(*mut z_stream, *const u8, c_uint) -> c_int = deflateSetDictionary;
 }
 
 /// Verify `deflateGetDictionary` symbol and signature.
@@ -144,8 +143,7 @@ fn test_ffi_deflate_params() {
 /// Verify `deflateTune` symbol and signature.
 #[test]
 fn test_ffi_deflate_tune() {
-    let _: unsafe extern "C" fn(*mut z_stream, c_int, c_int, c_int, c_int) -> c_int =
-        deflateTune;
+    let _: unsafe extern "C" fn(*mut z_stream, c_int, c_int, c_int, c_int) -> c_int = deflateTune;
 }
 
 /// Verify `deflateBound` symbol and signature.
@@ -163,8 +161,7 @@ fn test_ffi_deflate_bound_z() {
 /// Verify `deflatePending` symbol and signature.
 #[test]
 fn test_ffi_deflate_pending() {
-    let _: unsafe extern "C" fn(*mut z_stream, *mut c_uint, *mut c_int) -> c_int =
-        deflatePending;
+    let _: unsafe extern "C" fn(*mut z_stream, *mut c_uint, *mut c_int) -> c_int = deflatePending;
 }
 
 /// Verify `deflateUsed` symbol and signature.
@@ -182,8 +179,7 @@ fn test_ffi_deflate_prime() {
 /// Verify `deflateSetHeader` symbol and signature.
 #[test]
 fn test_ffi_deflate_set_header() {
-    let _: unsafe extern "C" fn(*mut z_stream, *mut gz_header) -> c_int =
-        deflateSetHeader;
+    let _: unsafe extern "C" fn(*mut z_stream, *mut gz_header) -> c_int = deflateSetHeader;
 }
 
 // ===========================================================================
@@ -194,8 +190,7 @@ fn test_ffi_deflate_set_header() {
 /// Verify `inflateSetDictionary` symbol and signature.
 #[test]
 fn test_ffi_inflate_set_dictionary() {
-    let _: unsafe extern "C" fn(*mut z_stream, *const u8, c_uint) -> c_int =
-        inflateSetDictionary;
+    let _: unsafe extern "C" fn(*mut z_stream, *const u8, c_uint) -> c_int = inflateSetDictionary;
 }
 
 /// Verify `inflateGetDictionary` symbol and signature.
@@ -244,8 +239,7 @@ fn test_ffi_inflate_mark() {
 /// Verify `inflateGetHeader` symbol and signature.
 #[test]
 fn test_ffi_inflate_get_header() {
-    let _: unsafe extern "C" fn(*mut z_stream, *mut gz_header) -> c_int =
-        inflateGetHeader;
+    let _: unsafe extern "C" fn(*mut z_stream, *mut gz_header) -> c_int = inflateGetHeader;
 }
 
 /// Verify `inflateBack` symbol and signature.
@@ -283,8 +277,7 @@ fn test_ffi_zlib_compile_flags() {
 /// Verify `compress` symbol and signature.
 #[test]
 fn test_ffi_compress() {
-    let _: unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong) -> c_int =
-        compress;
+    let _: unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong) -> c_int = compress;
 }
 
 /// Verify `compress2` symbol and signature.
@@ -297,20 +290,14 @@ fn test_ffi_compress2() {
 /// Verify `compress_z` symbol and signature.
 #[test]
 fn test_ffi_compress_z() {
-    let _: unsafe extern "C" fn(*mut u8, *mut z_size_t, *const u8, z_size_t) -> c_int =
-        compress_z;
+    let _: unsafe extern "C" fn(*mut u8, *mut z_size_t, *const u8, z_size_t) -> c_int = compress_z;
 }
 
 /// Verify `compress2_z` symbol and signature.
 #[test]
 fn test_ffi_compress2_z() {
-    let _: unsafe extern "C" fn(
-        *mut u8,
-        *mut z_size_t,
-        *const u8,
-        z_size_t,
-        c_int,
-    ) -> c_int = compress2_z;
+    let _: unsafe extern "C" fn(*mut u8, *mut z_size_t, *const u8, z_size_t, c_int) -> c_int =
+        compress2_z;
 }
 
 /// Verify `compressBound` symbol and signature, plus sane runtime output.
@@ -341,19 +328,14 @@ fn test_ffi_compress_bound_z() {
 /// Verify `uncompress` symbol and signature.
 #[test]
 fn test_ffi_uncompress() {
-    let _: unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong) -> c_int =
-        uncompress;
+    let _: unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong) -> c_int = uncompress;
 }
 
 /// Verify `uncompress2` symbol and signature.
 #[test]
 fn test_ffi_uncompress2() {
-    let _: unsafe extern "C" fn(
-        *mut u8,
-        *mut c_ulong,
-        *const u8,
-        *mut c_ulong,
-    ) -> c_int = uncompress2;
+    let _: unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, *mut c_ulong) -> c_int =
+        uncompress2;
 }
 
 /// Verify `uncompress_z` symbol and signature.
@@ -366,12 +348,8 @@ fn test_ffi_uncompress_z() {
 /// Verify `uncompress2_z` symbol and signature.
 #[test]
 fn test_ffi_uncompress2_z() {
-    let _: unsafe extern "C" fn(
-        *mut u8,
-        *mut z_size_t,
-        *const u8,
-        *mut z_size_t,
-    ) -> c_int = uncompress2_z;
+    let _: unsafe extern "C" fn(*mut u8, *mut z_size_t, *const u8, *mut z_size_t) -> c_int =
+        uncompress2_z;
 }
 
 // ===========================================================================
@@ -411,12 +389,7 @@ fn test_ffi_gzread() {
 /// Verify `gzfread` symbol and signature.
 #[test]
 fn test_ffi_gzfread() {
-    let _: unsafe extern "C" fn(
-        *mut c_void,
-        z_size_t,
-        z_size_t,
-        gzFile,
-    ) -> z_size_t = gzfread;
+    let _: unsafe extern "C" fn(*mut c_void, z_size_t, z_size_t, gzFile) -> z_size_t = gzfread;
 }
 
 /// Verify `gzwrite` symbol and signature.
@@ -428,12 +401,7 @@ fn test_ffi_gzwrite() {
 /// Verify `gzfwrite` symbol and signature.
 #[test]
 fn test_ffi_gzfwrite() {
-    let _: unsafe extern "C" fn(
-        *const c_void,
-        z_size_t,
-        z_size_t,
-        gzFile,
-    ) -> z_size_t = gzfwrite;
+    let _: unsafe extern "C" fn(*const c_void, z_size_t, z_size_t, gzFile) -> z_size_t = gzfwrite;
 }
 
 /// Verify `gzprintf` symbol and signature.
@@ -451,8 +419,7 @@ fn test_ffi_gzprintf() {
 /// Full `va_list` support requires nightly with the `c_variadic` feature.
 #[test]
 fn test_ffi_gzvprintf() {
-    let _: unsafe extern "C" fn(gzFile, *const c_char, *mut c_void) -> c_int =
-        gzvprintf;
+    let _: unsafe extern "C" fn(gzFile, *const c_char, *mut c_void) -> c_int = gzvprintf;
 }
 
 /// Verify `gzputs` symbol and signature.
@@ -588,15 +555,13 @@ fn test_ffi_gzoffset64() {
 /// Verify `adler32_combine64` symbol and signature.
 #[test]
 fn test_ffi_adler32_combine64() {
-    let _: extern "C" fn(c_ulong, c_ulong, z_off64_t) -> c_ulong =
-        adler32_combine64;
+    let _: extern "C" fn(c_ulong, c_ulong, z_off64_t) -> c_ulong = adler32_combine64;
 }
 
 /// Verify `crc32_combine64` symbol and signature.
 #[test]
 fn test_ffi_crc32_combine64() {
-    let _: extern "C" fn(c_ulong, c_ulong, z_off64_t) -> c_ulong =
-        crc32_combine64;
+    let _: extern "C" fn(c_ulong, c_ulong, z_off64_t) -> c_ulong = crc32_combine64;
 }
 
 /// Verify `crc32_combine_gen64` symbol and signature.
@@ -672,8 +637,7 @@ fn test_ffi_crc32_combine_op() {
 /// Verify `deflateInit_` symbol and signature.
 #[test]
 fn test_ffi_deflate_init_() {
-    let _: unsafe extern "C" fn(*mut z_stream, c_int, *const c_char, c_int) -> c_int =
-        deflateInit_;
+    let _: unsafe extern "C" fn(*mut z_stream, c_int, *const c_char, c_int) -> c_int = deflateInit_;
 }
 
 /// Verify `deflateInit2_` symbol and signature.
@@ -694,8 +658,7 @@ fn test_ffi_deflate_init2_() {
 /// Verify `inflateInit_` symbol and signature.
 #[test]
 fn test_ffi_inflate_init_() {
-    let _: unsafe extern "C" fn(*mut z_stream, *const c_char, c_int) -> c_int =
-        inflateInit_;
+    let _: unsafe extern "C" fn(*mut z_stream, *const c_char, c_int) -> c_int = inflateInit_;
 }
 
 /// Verify `inflateInit2_` symbol and signature.
@@ -708,13 +671,8 @@ fn test_ffi_inflate_init2_() {
 /// Verify `inflateBackInit_` symbol and signature.
 #[test]
 fn test_ffi_inflate_back_init_() {
-    let _: unsafe extern "C" fn(
-        *mut z_stream,
-        c_int,
-        *mut c_uchar,
-        *const c_char,
-        c_int,
-    ) -> c_int = inflateBackInit_;
+    let _: unsafe extern "C" fn(*mut z_stream, c_int, *mut c_uchar, *const c_char, c_int) -> c_int =
+        inflateBackInit_;
 }
 
 /// Verify `gzgetc_` symbol and signature.
@@ -791,8 +749,7 @@ fn test_ffi_gzopen_w() {
     }
     #[cfg(target_os = "windows")]
     {
-        let _: unsafe extern "C" fn(*const libc::wchar_t, *const c_char) -> gzFile =
-            gzopen_w;
+        let _: unsafe extern "C" fn(*const libc::wchar_t, *const c_char) -> gzFile = gzopen_w;
     }
 }
 
@@ -807,6 +764,7 @@ fn test_ffi_gzopen_w() {
 /// symbols cause a compile-time error. At runtime, the count is verified
 /// to match the expected total.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_ffi_all_96_symbols_present() {
     // We count symbols by category to match the zlib.def file organization.
     // Any missing symbol will cause a compile error before the test runs.
@@ -825,63 +783,49 @@ fn test_ffi_all_96_symbols_present() {
     count += 1;
 
     // --- Advanced functions (24) -------------------------------------------
-    let _ = deflateSetDictionary
-        as unsafe extern "C" fn(*mut z_stream, *const u8, c_uint) -> c_int;
+    let _ = deflateSetDictionary as unsafe extern "C" fn(*mut z_stream, *const u8, c_uint) -> c_int;
     count += 1;
-    let _ = deflateGetDictionary
-        as unsafe extern "C" fn(*mut z_stream, *mut u8, *mut c_uint) -> c_int;
+    let _ =
+        deflateGetDictionary as unsafe extern "C" fn(*mut z_stream, *mut u8, *mut c_uint) -> c_int;
     count += 1;
-    let _ = deflateCopy
-        as unsafe extern "C" fn(*mut z_stream, *mut z_stream) -> c_int;
+    let _ = deflateCopy as unsafe extern "C" fn(*mut z_stream, *mut z_stream) -> c_int;
     count += 1;
     let _ = deflateReset as unsafe extern "C" fn(*mut z_stream) -> c_int;
     count += 1;
-    let _ = deflateParams
-        as unsafe extern "C" fn(*mut z_stream, c_int, c_int) -> c_int;
+    let _ = deflateParams as unsafe extern "C" fn(*mut z_stream, c_int, c_int) -> c_int;
     count += 1;
-    let _ = deflateTune
-        as unsafe extern "C" fn(*mut z_stream, c_int, c_int, c_int, c_int) -> c_int;
+    let _ = deflateTune as unsafe extern "C" fn(*mut z_stream, c_int, c_int, c_int, c_int) -> c_int;
     count += 1;
     let _ = deflateBound as unsafe extern "C" fn(*mut z_stream, c_ulong) -> c_ulong;
     count += 1;
-    let _ = deflateBound_z
-        as unsafe extern "C" fn(*mut z_stream, z_size_t) -> z_size_t;
+    let _ = deflateBound_z as unsafe extern "C" fn(*mut z_stream, z_size_t) -> z_size_t;
     count += 1;
-    let _ = deflatePending
-        as unsafe extern "C" fn(*mut z_stream, *mut c_uint, *mut c_int) -> c_int;
+    let _ = deflatePending as unsafe extern "C" fn(*mut z_stream, *mut c_uint, *mut c_int) -> c_int;
     count += 1;
-    let _ = deflateUsed
-        as unsafe extern "C" fn(*mut z_stream, *mut c_int) -> c_int;
+    let _ = deflateUsed as unsafe extern "C" fn(*mut z_stream, *mut c_int) -> c_int;
     count += 1;
-    let _ = deflatePrime
-        as unsafe extern "C" fn(*mut z_stream, c_int, c_int) -> c_int;
+    let _ = deflatePrime as unsafe extern "C" fn(*mut z_stream, c_int, c_int) -> c_int;
     count += 1;
-    let _ = deflateSetHeader
-        as unsafe extern "C" fn(*mut z_stream, *mut gz_header) -> c_int;
+    let _ = deflateSetHeader as unsafe extern "C" fn(*mut z_stream, *mut gz_header) -> c_int;
     count += 1;
-    let _ = inflateSetDictionary
-        as unsafe extern "C" fn(*mut z_stream, *const u8, c_uint) -> c_int;
+    let _ = inflateSetDictionary as unsafe extern "C" fn(*mut z_stream, *const u8, c_uint) -> c_int;
     count += 1;
-    let _ = inflateGetDictionary
-        as unsafe extern "C" fn(*mut z_stream, *mut u8, *mut c_uint) -> c_int;
+    let _ =
+        inflateGetDictionary as unsafe extern "C" fn(*mut z_stream, *mut u8, *mut c_uint) -> c_int;
     count += 1;
     let _ = inflateSync as unsafe extern "C" fn(*mut z_stream) -> c_int;
     count += 1;
-    let _ = inflateCopy
-        as unsafe extern "C" fn(*mut z_stream, *mut z_stream) -> c_int;
+    let _ = inflateCopy as unsafe extern "C" fn(*mut z_stream, *mut z_stream) -> c_int;
     count += 1;
     let _ = inflateReset as unsafe extern "C" fn(*mut z_stream) -> c_int;
     count += 1;
-    let _ = inflateReset2
-        as unsafe extern "C" fn(*mut z_stream, c_int) -> c_int;
+    let _ = inflateReset2 as unsafe extern "C" fn(*mut z_stream, c_int) -> c_int;
     count += 1;
-    let _ = inflatePrime
-        as unsafe extern "C" fn(*mut z_stream, c_int, c_int) -> c_int;
+    let _ = inflatePrime as unsafe extern "C" fn(*mut z_stream, c_int, c_int) -> c_int;
     count += 1;
     let _ = inflateMark as unsafe extern "C" fn(*mut z_stream) -> c_long;
     count += 1;
-    let _ = inflateGetHeader
-        as unsafe extern "C" fn(*mut z_stream, *mut gz_header) -> c_int;
+    let _ = inflateGetHeader as unsafe extern "C" fn(*mut z_stream, *mut gz_header) -> c_int;
     count += 1;
     let _ = inflateBack
         as unsafe extern "C" fn(
@@ -898,14 +842,13 @@ fn test_ffi_all_96_symbols_present() {
     count += 1;
 
     // --- Utility functions (10) -------------------------------------------
-    let _ = compress
-        as unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong) -> c_int;
+    let _ = compress as unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong) -> c_int;
     count += 1;
     let _ = compress2
         as unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong, c_int) -> c_int;
     count += 1;
-    let _ = compress_z
-        as unsafe extern "C" fn(*mut u8, *mut z_size_t, *const u8, z_size_t) -> c_int;
+    let _ =
+        compress_z as unsafe extern "C" fn(*mut u8, *mut z_size_t, *const u8, z_size_t) -> c_int;
     count += 1;
     let _ = compress2_z
         as unsafe extern "C" fn(*mut u8, *mut z_size_t, *const u8, z_size_t, c_int) -> c_int;
@@ -914,52 +857,42 @@ fn test_ffi_all_96_symbols_present() {
     count += 1;
     let _ = compressBound_z as extern "C" fn(z_size_t) -> z_size_t;
     count += 1;
-    let _ = uncompress
-        as unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong) -> c_int;
+    let _ = uncompress as unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong) -> c_int;
     count += 1;
     let _ = uncompress2
         as unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, *mut c_ulong) -> c_int;
     count += 1;
-    let _ = uncompress_z
-        as unsafe extern "C" fn(*mut u8, *mut z_size_t, *const u8, z_size_t) -> c_int;
+    let _ =
+        uncompress_z as unsafe extern "C" fn(*mut u8, *mut z_size_t, *const u8, z_size_t) -> c_int;
     count += 1;
     let _ = uncompress2_z
         as unsafe extern "C" fn(*mut u8, *mut z_size_t, *const u8, *mut z_size_t) -> c_int;
     count += 1;
 
     // --- Gz functions (27) ------------------------------------------------
-    let _ = gzopen
-        as unsafe extern "C" fn(*const c_char, *const c_char) -> gzFile;
+    let _ = gzopen as unsafe extern "C" fn(*const c_char, *const c_char) -> gzFile;
     count += 1;
     let _ = gzdopen as unsafe extern "C" fn(c_int, *const c_char) -> gzFile;
     count += 1;
     let _ = gzbuffer as unsafe extern "C" fn(gzFile, c_uint) -> c_int;
     count += 1;
-    let _ = gzsetparams
-        as unsafe extern "C" fn(gzFile, c_int, c_int) -> c_int;
+    let _ = gzsetparams as unsafe extern "C" fn(gzFile, c_int, c_int) -> c_int;
     count += 1;
-    let _ = gzread
-        as unsafe extern "C" fn(gzFile, *mut c_void, c_uint) -> c_int;
+    let _ = gzread as unsafe extern "C" fn(gzFile, *mut c_void, c_uint) -> c_int;
     count += 1;
-    let _ = gzfread
-        as unsafe extern "C" fn(*mut c_void, z_size_t, z_size_t, gzFile) -> z_size_t;
+    let _ = gzfread as unsafe extern "C" fn(*mut c_void, z_size_t, z_size_t, gzFile) -> z_size_t;
     count += 1;
-    let _ = gzwrite
-        as unsafe extern "C" fn(gzFile, *const c_void, c_uint) -> c_int;
+    let _ = gzwrite as unsafe extern "C" fn(gzFile, *const c_void, c_uint) -> c_int;
     count += 1;
-    let _ = gzfwrite
-        as unsafe extern "C" fn(*const c_void, z_size_t, z_size_t, gzFile) -> z_size_t;
+    let _ = gzfwrite as unsafe extern "C" fn(*const c_void, z_size_t, z_size_t, gzFile) -> z_size_t;
     count += 1;
-    let _ = gzprintf
-        as unsafe extern "C" fn(gzFile, *const c_char) -> c_int;
+    let _ = gzprintf as unsafe extern "C" fn(gzFile, *const c_char) -> c_int;
     count += 1;
-    let _ = gzvprintf
-        as unsafe extern "C" fn(gzFile, *const c_char, *mut c_void) -> c_int;
+    let _ = gzvprintf as unsafe extern "C" fn(gzFile, *const c_char, *mut c_void) -> c_int;
     count += 1;
     let _ = gzputs as unsafe extern "C" fn(gzFile, *const c_char) -> c_int;
     count += 1;
-    let _ = gzgets
-        as unsafe extern "C" fn(gzFile, *mut c_char, c_int) -> *mut c_char;
+    let _ = gzgets as unsafe extern "C" fn(gzFile, *mut c_char, c_int) -> *mut c_char;
     count += 1;
     let _ = gzputc as unsafe extern "C" fn(gzFile, c_int) -> c_int;
     count += 1;
@@ -987,60 +920,48 @@ fn test_ffi_all_96_symbols_present() {
     count += 1;
     let _ = gzclose_w as unsafe extern "C" fn(gzFile) -> c_int;
     count += 1;
-    let _ = gzerror
-        as unsafe extern "C" fn(gzFile, *mut c_int) -> *const c_char;
+    let _ = gzerror as unsafe extern "C" fn(gzFile, *mut c_int) -> *const c_char;
     count += 1;
     let _ = gzclearerr as unsafe extern "C" fn(gzFile);
     count += 1;
 
     // --- Large file functions (7) -----------------------------------------
-    let _ = gzopen64
-        as unsafe extern "C" fn(*const c_char, *const c_char) -> gzFile;
+    let _ = gzopen64 as unsafe extern "C" fn(*const c_char, *const c_char) -> gzFile;
     count += 1;
-    let _ = gzseek64
-        as unsafe extern "C" fn(gzFile, z_off64_t, c_int) -> z_off64_t;
+    let _ = gzseek64 as unsafe extern "C" fn(gzFile, z_off64_t, c_int) -> z_off64_t;
     count += 1;
     let _ = gztell64 as unsafe extern "C" fn(gzFile) -> z_off64_t;
     count += 1;
     let _ = gzoffset64 as unsafe extern "C" fn(gzFile) -> z_off64_t;
     count += 1;
-    let _ = adler32_combine64
-        as extern "C" fn(c_ulong, c_ulong, z_off64_t) -> c_ulong;
+    let _ = adler32_combine64 as extern "C" fn(c_ulong, c_ulong, z_off64_t) -> c_ulong;
     count += 1;
-    let _ = crc32_combine64
-        as extern "C" fn(c_ulong, c_ulong, z_off64_t) -> c_ulong;
+    let _ = crc32_combine64 as extern "C" fn(c_ulong, c_ulong, z_off64_t) -> c_ulong;
     count += 1;
     let _ = crc32_combine_gen64 as extern "C" fn(z_off64_t) -> c_ulong;
     count += 1;
 
     // --- Checksum functions (8) -------------------------------------------
-    let _ = adler32
-        as unsafe extern "C" fn(c_ulong, *const u8, c_uint) -> c_ulong;
+    let _ = adler32 as unsafe extern "C" fn(c_ulong, *const u8, c_uint) -> c_ulong;
     count += 1;
-    let _ = adler32_z
-        as unsafe extern "C" fn(c_ulong, *const u8, usize) -> c_ulong;
+    let _ = adler32_z as unsafe extern "C" fn(c_ulong, *const u8, usize) -> c_ulong;
     count += 1;
-    let _ = crc32
-        as unsafe extern "C" fn(c_ulong, *const u8, c_uint) -> c_ulong;
+    let _ = crc32 as unsafe extern "C" fn(c_ulong, *const u8, c_uint) -> c_ulong;
     count += 1;
-    let _ = crc32_z
-        as unsafe extern "C" fn(c_ulong, *const u8, usize) -> c_ulong;
+    let _ = crc32_z as unsafe extern "C" fn(c_ulong, *const u8, usize) -> c_ulong;
     count += 1;
-    let _ = adler32_combine
-        as extern "C" fn(c_ulong, c_ulong, z_off_t) -> c_ulong;
+    let _ = adler32_combine as extern "C" fn(c_ulong, c_ulong, z_off_t) -> c_ulong;
     count += 1;
-    let _ = crc32_combine
-        as extern "C" fn(c_ulong, c_ulong, z_off_t) -> c_ulong;
+    let _ = crc32_combine as extern "C" fn(c_ulong, c_ulong, z_off_t) -> c_ulong;
     count += 1;
     let _ = crc32_combine_gen as extern "C" fn(z_off_t) -> c_ulong;
     count += 1;
-    let _ = crc32_combine_op
-        as extern "C" fn(c_ulong, c_ulong, c_ulong) -> c_ulong;
+    let _ = crc32_combine_op as extern "C" fn(c_ulong, c_ulong, c_ulong) -> c_ulong;
     count += 1;
 
     // --- Various hacks (15) -----------------------------------------------
-    let _ = deflateInit_
-        as unsafe extern "C" fn(*mut z_stream, c_int, *const c_char, c_int) -> c_int;
+    let _ =
+        deflateInit_ as unsafe extern "C" fn(*mut z_stream, c_int, *const c_char, c_int) -> c_int;
     count += 1;
     let _ = deflateInit2_
         as unsafe extern "C" fn(
@@ -1054,48 +975,35 @@ fn test_ffi_all_96_symbols_present() {
             c_int,
         ) -> c_int;
     count += 1;
-    let _ = inflateInit_
-        as unsafe extern "C" fn(*mut z_stream, *const c_char, c_int) -> c_int;
+    let _ = inflateInit_ as unsafe extern "C" fn(*mut z_stream, *const c_char, c_int) -> c_int;
     count += 1;
-    let _ = inflateInit2_
-        as unsafe extern "C" fn(*mut z_stream, c_int, *const c_char, c_int) -> c_int;
+    let _ =
+        inflateInit2_ as unsafe extern "C" fn(*mut z_stream, c_int, *const c_char, c_int) -> c_int;
     count += 1;
     let _ = inflateBackInit_
-        as unsafe extern "C" fn(
-            *mut z_stream,
-            c_int,
-            *mut c_uchar,
-            *const c_char,
-            c_int,
-        ) -> c_int;
+        as unsafe extern "C" fn(*mut z_stream, c_int, *mut c_uchar, *const c_char, c_int) -> c_int;
     count += 1;
     let _ = gzgetc_ as unsafe extern "C" fn(gzFile) -> c_int;
     count += 1;
     let _ = zError as extern "C" fn(c_int) -> *const c_char;
     count += 1;
-    let _ = inflateSyncPoint
-        as unsafe extern "C" fn(*mut z_stream) -> c_int;
+    let _ = inflateSyncPoint as unsafe extern "C" fn(*mut z_stream) -> c_int;
     count += 1;
     let _ = get_crc_table as extern "C" fn() -> *const u32;
     count += 1;
-    let _ = inflateUndermine
-        as unsafe extern "C" fn(*mut z_stream, c_int) -> c_int;
+    let _ = inflateUndermine as unsafe extern "C" fn(*mut z_stream, c_int) -> c_int;
     count += 1;
-    let _ = inflateValidate
-        as unsafe extern "C" fn(*mut z_stream, c_int) -> c_int;
+    let _ = inflateValidate as unsafe extern "C" fn(*mut z_stream, c_int) -> c_int;
     count += 1;
-    let _ = inflateCodesUsed
-        as unsafe extern "C" fn(*mut z_stream) -> c_ulong;
+    let _ = inflateCodesUsed as unsafe extern "C" fn(*mut z_stream) -> c_ulong;
     count += 1;
-    let _ = inflateResetKeep
-        as unsafe extern "C" fn(*mut z_stream) -> c_int;
+    let _ = inflateResetKeep as unsafe extern "C" fn(*mut z_stream) -> c_int;
     count += 1;
-    let _ = deflateResetKeep
-        as unsafe extern "C" fn(*mut z_stream) -> c_int;
+    let _ = deflateResetKeep as unsafe extern "C" fn(*mut z_stream) -> c_int;
     count += 1;
     // gzopen_w — platform-conditional signature
     count += 1;
-    let _exists = gzopen_w; // compile-time presence check
+    let _ = gzopen_w; // compile-time presence check
 
     assert_eq!(
         count, 96,
@@ -1149,14 +1057,8 @@ fn test_ffi_compress_decompress_smoke() {
             compressed_len,
         )
     };
-    assert_eq!(
-        rc, Z_OK,
-        "uncompress() returned {rc}, expected Z_OK (0)"
-    );
-    assert_eq!(
-        decompressed_len, source_len,
-        "decompressed length mismatch"
-    );
+    assert_eq!(rc, Z_OK, "uncompress() returned {rc}, expected Z_OK (0)");
+    assert_eq!(decompressed_len, source_len, "decompressed length mismatch");
     assert_eq!(
         &decompressed[..decompressed_len as usize],
         &source[..],
@@ -1189,7 +1091,10 @@ fn test_ffi_streaming_deflate_inflate_smoke() {
     strm.avail_out = compressed.len() as c_uint;
 
     let rc = unsafe { deflate(&mut strm, Z_FINISH) };
-    assert_eq!(rc, Z_STREAM_END, "deflate() returned {rc}, expected Z_STREAM_END");
+    assert_eq!(
+        rc, Z_STREAM_END,
+        "deflate() returned {rc}, expected Z_STREAM_END"
+    );
 
     let compressed_len = strm.total_out as usize;
     let rc = unsafe { deflateEnd(&mut strm) };

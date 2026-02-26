@@ -44,15 +44,15 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::missing_panics_doc)]
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use zlib_rs::constants::{
-    Z_BEST_COMPRESSION, Z_BEST_SPEED, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
-    Z_DEFAULT_STRATEGY, Z_FINISH, Z_NO_COMPRESSION, Z_NO_FLUSH, MAX_WBITS,
+    MAX_WBITS, Z_BEST_COMPRESSION, Z_BEST_SPEED, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY,
+    Z_DEFLATED, Z_FINISH, Z_NO_COMPRESSION, Z_NO_FLUSH,
 };
 use zlib_rs::error::ReturnCode;
 use zlib_rs::stream::ZStream;
-use zlib_rs::{compress, compress2, compress_bound, uncompress, uncompress2};
+use zlib_rs::{compress, compress_bound, compress2, uncompress, uncompress2};
 use zlib_rs::{deflate, inflate};
 
 // ─── Data Generation Helpers ────────────────────────────────────────────────
@@ -136,8 +136,8 @@ fn prepare_raw_deflate(data: &[u8]) -> Vec<u8> {
         &mut stream,
         Z_DEFAULT_COMPRESSION,
         Z_DEFLATED,
-        -MAX_WBITS,       // negative = raw DEFLATE (no zlib/gzip wrapper)
-        8,                 // DEF_MEM_LEVEL
+        -MAX_WBITS, // negative = raw DEFLATE (no zlib/gzip wrapper)
+        8,          // DEF_MEM_LEVEL
         Z_DEFAULT_STRATEGY,
     );
     assert_eq!(ret, ReturnCode::Ok, "deflate_init2 failed for raw DEFLATE");
@@ -171,8 +171,8 @@ fn prepare_gzip_compressed(data: &[u8]) -> Vec<u8> {
         &mut stream,
         Z_DEFAULT_COMPRESSION,
         Z_DEFLATED,
-        MAX_WBITS + 16,    // 31 = gzip format
-        8,                  // DEF_MEM_LEVEL
+        MAX_WBITS + 16, // 31 = gzip format
+        8,              // DEF_MEM_LEVEL
         Z_DEFAULT_STRATEGY,
     );
     assert_eq!(ret, ReturnCode::Ok, "deflate_init2 failed for gzip");
@@ -318,9 +318,7 @@ fn bench_inflate_formats(c: &mut Criterion) {
     // ── Auto-detect (windowBits = MAX_WBITS + 32 = 47) ──
     // Feed zlib-wrapped data and let inflate auto-detect the container.
     group.bench_function("auto_detect", |b| {
-        b.iter(|| {
-            streaming_inflate_decompress(&zlib_data, MAX_WBITS + 32, size)
-        });
+        b.iter(|| streaming_inflate_decompress(&zlib_data, MAX_WBITS + 32, size));
     });
 
     group.finish();
@@ -339,14 +337,7 @@ fn bench_inflate_scaling(c: &mut Criterion) {
 
     // Geometric progression from 256 B to 4 MB (×4 per step).
     let sizes: &[usize] = &[
-        256,
-        1_024,
-        4_096,
-        16_384,
-        65_536,
-        262_144,
-        1_048_576,
-        4_194_304,
+        256, 1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576, 4_194_304,
     ];
 
     for &size in sizes {
@@ -409,12 +400,7 @@ fn bench_inflate_fast_path(c: &mut Criterion) {
     });
 
     // Level variants: stored (0), fast (1), default (6), best (9).
-    for &level in &[
-        Z_NO_COMPRESSION,
-        Z_BEST_SPEED,
-        6_i32,
-        Z_BEST_COMPRESSION,
-    ] {
+    for &level in &[Z_NO_COMPRESSION, Z_BEST_SPEED, 6_i32, Z_BEST_COMPRESSION] {
         let compressed = prepare_zlib_compressed_level(&source, level);
 
         group.bench_with_input(
@@ -472,8 +458,7 @@ fn bench_inflate_patterns(c: &mut Criterion) {
             |b, compressed| {
                 b.iter(|| {
                     let mut dest = vec![0u8; size];
-                    let (dest_used, src_consumed) =
-                        uncompress2(&mut dest, compressed).unwrap();
+                    let (dest_used, src_consumed) = uncompress2(&mut dest, compressed).unwrap();
                     // Verify that the full compressed payload was consumed and
                     // the expected uncompressed size was produced.
                     debug_assert_eq!(dest_used, size);

@@ -1,3 +1,9 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::uninlined_format_args
+)]
 //! Adler-32 and CRC-32 checksum correctness tests.
 //!
 //! Validates the checksum implementations in `zlib-rs` against known test vectors
@@ -16,10 +22,10 @@
 //!
 //! # Source Derivation
 //!
-//! - `adler32.c` (164 lines) — Adler-32 with NMAX=5552, BASE=65521
+//! - `adler32.c` (164 lines) — Adler-32 with `NMAX`=5552, `BASE`=65521
 //! - `crc32.c` (983 lines) — CRC-32 with table-based computation
 
-use crc::{Crc, CRC_32_ISO_HDLC};
+use crc::{CRC_32_ISO_HDLC, Crc};
 use zlib_rs::checksum::adler32::{adler32, adler32_combine};
 use zlib_rs::checksum::crc32::{crc32, crc32_combine};
 #[allow(unused_imports)]
@@ -62,34 +68,34 @@ fn test_adler32_empty() {
 
 /// Adler-32 of single bytes — verify fundamental accumulation logic.
 ///
-/// For byte 0x00: s1 = 1+0 = 1, s2 = 0+1 = 1 → (1 << 16) | 1 = 0x00010001
+/// For byte `0x00`: s1 = 1+0 = 1, s2 = 0+1 = 1 → (1 << 16) | 1 = `0x00010001`
 ///
 /// Wait — the implementation passes `adler` as the running value. When we call
 /// `adler32(1, &[0])`, s1 starts at 1 and s2 starts at 0:
-///   s1 = (1 + 0) = 1, s2 = (0 + 1) = 1 → 0x0001_0001
+///   s1 = (1 + 0) = 1, s2 = (0 + 1) = 1 → `0x0001_0001`
 ///
-/// For byte 0x01: s1 = 1+1 = 2, s2 = 0+2 = 2 → (2 << 16) | 2 = 0x0002_0002
+/// For byte `0x01`: s1 = 1+1 = 2, s2 = 0+2 = 2 → (2 << 16) | 2 = `0x0002_0002`
 ///
 /// Wait, that's not right either. Let me trace through the C code:
-///   adler = 1 (passed in), sum2 = (adler >> 16) & 0xffff = 0
-///   adler &= 0xffff → adler = 1
+///   adler = 1 (passed in), sum2 = (adler >> 16) & `0xffff` = 0
+///   adler &= `0xffff` → adler = 1
 ///   For single byte path: adler += buf[0], sum2 += adler
 ///
-/// Byte 0x00: adler = 1+0 = 1, sum2 = 0+1 = 1 → 1 | (1 << 16) = 0x0001_0001
-/// Byte 0x01: adler = 1+1 = 2, sum2 = 0+2 = 2 → 2 | (2 << 16) = 0x0002_0002
+/// Byte `0x00`: adler = 1+0 = 1, sum2 = 0+1 = 1 → 1 | (1 << 16) = `0x0001_0001`
+/// Byte `0x01`: adler = 1+1 = 2, sum2 = 0+2 = 2 → 2 | (2 << 16) = `0x0002_0002`
 ///
 /// Hmm that doesn't match the spec doc. Let me re-derive:
 ///
 /// Actually from the code: `adler += buf[0]` then `sum2 += adler`.
-/// So for byte 0x00: adler = 1, sum2 = 0+1 = 1 → 0x0001_0001
-/// For byte 0x01: adler = 2, sum2 = 0+2 = 2 → 0x0002_0002
+/// So for byte `0x00`: adler = 1, sum2 = 0+1 = 1 → `0x0001_0001`
+/// For byte `0x01`: adler = 2, sum2 = 0+2 = 2 → `0x0002_0002`
 ///
-/// But the spec says 0x00020001 and 0x00030002. Let me look again at the spec:
-///   "For byte 0x00: adler32(1, [0]) should be ... (2 << 16) | 1 = 0x00020001"
+/// But the spec says `0x00020001` and `0x00030002`. Let me look again at the spec:
+///   "For byte `0x00`: adler32(1, [0]) should be ... (2 << 16) | 1 = `0x00020001`"
 ///
 /// The spec says s2 = (1+1) = 2 for the high bits. But from the actual C code,
-/// sum2 = (adler >> 16) & 0xffff = 0, then sum2 += adler (after adler was updated).
-/// For byte 0x00: adler stays 1, sum2 = 0+1 = 1 → 0x0001_0001.
+/// sum2 = (adler >> 16) & `0xffff` = 0, then sum2 += adler (after adler was updated).
+/// For byte `0x00`: adler stays 1, sum2 = 0+1 = 1 → `0x0001_0001`.
 ///
 /// The spec doc had an error in the expected values for single byte tests. Let's
 /// verify against the reference implementation and the actual C algorithm.
@@ -124,9 +130,9 @@ fn test_adler32_hello() {
 /// Adler-32 against well-known test vectors.
 ///
 /// These are mathematically derived from the Adler-32 definition:
-///   s1 = (1 + sum_of_bytes) mod 65521
-///   s2 = (sum_of_running_s1) mod 65521
-///   result = (s2 << 16) | s1
+///   `s1` = (1 + `sum_of_bytes`) mod 65521
+///   `s2` = (`sum_of_running_s1`) mod 65521
+///   result = (`s2` << 16) | `s1`
 #[test]
 fn test_adler32_known_vectors() {
     // Empty input returns initial value 1
@@ -153,7 +159,8 @@ fn test_adler32_known_vectors() {
         let actual = adler32(1, data);
         let expected = reference_adler32(data);
         assert_eq!(
-            actual, expected,
+            actual,
+            expected,
             "Adler-32 mismatch for {:?}",
             std::str::from_utf8(data).unwrap_or("<binary>")
         );
@@ -194,9 +201,9 @@ fn test_adler32_incremental() {
 // Phase 3: Adler-32 NMAX Boundary Tests
 // =============================================================================
 
-/// Test Adler-32 around the NMAX=5552 boundary.
+/// Test Adler-32 around the `NMAX`=5552 boundary.
 ///
-/// NMAX is the maximum number of bytes that can be processed in a single block
+/// `NMAX` is the maximum number of bytes that can be processed in a single block
 /// before a modulo reduction is required. Testing at and around this boundary
 /// exercises the block-processing modulo path in the optimized loop.
 #[test]
@@ -226,7 +233,7 @@ fn test_adler32_nmax_boundary() {
     assert_eq!(result, expected, "Adler-32 for NMAX+16 failed");
 }
 
-/// Test Adler-32 with large input (64KB+) to exercise the NMAX-optimized
+/// Test Adler-32 with large input (64KB+) to exercise the `NMAX`-optimized
 /// block processing loop from `adler32.c`.
 #[test]
 fn test_adler32_large_data() {
@@ -317,7 +324,10 @@ fn test_adler32_combine_various_splits() {
 #[test]
 fn test_adler32_combine_negative_length() {
     let result = adler32_combine(0x0001_0001, 0x0001_0001, -1);
-    assert_eq!(result, 0xFFFF_FFFF, "Negative len2 should return 0xFFFFFFFF");
+    assert_eq!(
+        result, 0xFFFF_FFFF,
+        "Negative len2 should return 0xFFFFFFFF"
+    );
 }
 
 // =============================================================================
@@ -334,7 +344,7 @@ fn test_crc32_empty() {
 
 /// CRC-32 against well-known test vectors.
 ///
-/// These are the canonical CRC-32/ISO-HDLC test values (polynomial 0xEDB88320
+/// These are the canonical CRC-32/ISO-HDLC test values (polynomial `0xEDB88320`
 /// in reflected form, also known as CRC-32, CRC-32/ADCCP, CRC-32/V-42,
 /// CRC-32/XZ, PKZIP CRC-32).
 #[test]
@@ -420,7 +430,7 @@ fn test_crc32_cross_validate() {
         vec![0xFF; 1024],
         // Pseudo-random deterministic pattern (1KB)
         (0..1024_u32)
-            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
             .collect(),
     ];
 
@@ -428,7 +438,8 @@ fn test_crc32_cross_validate() {
         let zlib_result = crc32(0, input);
         let ref_result = crc_engine.checksum(input);
         assert_eq!(
-            zlib_result, ref_result,
+            zlib_result,
+            ref_result,
             "CRC-32 cross-validation mismatch for test input #{} (len={})",
             idx,
             input.len()
@@ -445,7 +456,7 @@ fn test_crc32_cross_validate_large() {
     let data: Vec<u8> = (0..1_048_576_u32)
         .map(|i| {
             // Knuth's multiplicative hash for deterministic pseudo-random bytes
-            (i.wrapping_mul(2654435761) >> 24) as u8
+            (i.wrapping_mul(2_654_435_761) >> 24) as u8
         })
         .collect();
 
@@ -558,9 +569,9 @@ fn test_adler32_all_zeros() {
     }
 }
 
-/// Adler-32 of a large buffer of all 0xFF bytes.
+/// Adler-32 of a large buffer of all `0xFF` bytes.
 ///
-/// This stresses the accumulator because 0xFF=255 is the maximum byte value,
+/// This stresses the accumulator because `0xFF`=255 is the maximum byte value,
 /// causing the fastest growth of s1 and s2 and exercising the modulo reduction
 /// path most aggressively.
 #[test]
@@ -594,7 +605,7 @@ fn test_crc32_all_zeros() {
     }
 }
 
-/// CRC-32 of a large buffer of all 0xFF bytes.
+/// CRC-32 of a large buffer of all `0xFF` bytes.
 #[test]
 fn test_crc32_all_ones() {
     let crc_engine = Crc::<u32>::new(&CRC_32_ISO_HDLC);
@@ -603,15 +614,11 @@ fn test_crc32_all_ones() {
         let data = vec![0xFF_u8; len];
         let result = crc32(0, &data);
         let expected = crc_engine.checksum(&data);
-        assert_eq!(
-            result, expected,
-            "CRC-32 all-0xFF mismatch for len={}",
-            len
-        );
+        assert_eq!(result, expected, "CRC-32 all-0xFF mismatch for len={}", len);
     }
 }
 
-/// CRC-32 of each individual byte value 0x00–0xFF.
+/// CRC-32 of each individual byte value `0x00`–`0xFF`.
 ///
 /// This validates the entire first row of the CRC lookup table, since
 /// CRC-32 of a single byte is effectively a direct table lookup.
@@ -668,7 +675,9 @@ fn test_adler32_combine_stress() {
         // Descending bytes
         (0..200_u8).rev().collect(),
         // Alternating 0x00 and 0xFF
-        (0..200).map(|i| if i % 2 == 0 { 0x00 } else { 0xFF }).collect(),
+        (0..200)
+            .map(|i| if i % 2 == 0 { 0x00 } else { 0xFF })
+            .collect(),
         // Large data
         vec![0x42_u8; 10_000],
     ];
@@ -683,7 +692,8 @@ fn test_adler32_combine_stress() {
         let combined = adler32_combine(adler1, adler2, (data.len() - split) as i64);
 
         assert_eq!(
-            full, combined,
+            full,
+            combined,
             "adler32_combine stress test #{} failed (len={})",
             idx,
             data.len()
@@ -697,7 +707,9 @@ fn test_crc32_combine_stress() {
     let patterns: Vec<Vec<u8>> = vec![
         (0..200_u8).collect(),
         (0..200_u8).rev().collect(),
-        (0..200).map(|i| if i % 2 == 0 { 0x00 } else { 0xFF }).collect(),
+        (0..200)
+            .map(|i| if i % 2 == 0 { 0x00 } else { 0xFF })
+            .collect(),
         vec![0x42_u8; 10_000],
     ];
 
@@ -710,7 +722,8 @@ fn test_crc32_combine_stress() {
         let combined = crc32_combine(crc1, crc2, (data.len() - split) as i64);
 
         assert_eq!(
-            full, combined,
+            full,
+            combined,
             "crc32_combine stress test #{} failed (len={})",
             idx,
             data.len()
@@ -719,7 +732,7 @@ fn test_crc32_combine_stress() {
 }
 
 /// Adler-32 short input path: inputs of length 2–15 exercise the
-/// `len < 16` fast path that avoids NMAX blocking.
+/// `len < 16` fast path that avoids `NMAX` blocking.
 #[test]
 fn test_adler32_short_inputs() {
     for len in 2..16_usize {
@@ -756,7 +769,7 @@ fn test_crc32_byte_at_a_time() {
 
     // Byte-at-a-time
     let mut running_crc = 0_u32;
-    for &byte in data.iter() {
+    for &byte in data {
         running_crc = crc32(running_crc, &[byte]);
     }
 
@@ -776,7 +789,7 @@ fn test_adler32_byte_at_a_time() {
 
     // Byte-at-a-time
     let mut running = 1_u32; // Initial Adler-32 value
-    for &byte in data.iter() {
+    for &byte in data {
         running = adler32(running, &[byte]);
     }
 

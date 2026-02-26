@@ -7,8 +7,8 @@
 //!
 //! - `deflate.c` lines 107–124: `configuration_table[10]` mapping levels 0–9
 //! - `deflate.c` lines 766–812: `deflateParams()` level/strategy switching
-//! - `deflate.h` lines 58–67: state constants (INIT_STATE, BUSY_STATE, FINISH_STATE)
-//! - `zlib.h` `deflateInit2` documentation: windowBits overloading (positive=zlib,
+//! - `deflate.h` lines 58–67: state constants (`INIT_STATE`, `BUSY_STATE`, `FINISH_STATE`)
+//! - `zlib.h` `deflateInit2` documentation: `windowBits` overloading (positive=zlib,
 //!   negative=raw, +16=gzip)
 //! - `test/example.c`: reference test patterns for dictionary, flush, large data
 
@@ -87,7 +87,11 @@ fn streaming_round_trip(
     assert_ok(ret, "inflateInit2");
 
     i_stream.set_input(&compressed);
-    let out_size = if data.is_empty() { 512 } else { data.len() + 512 };
+    let out_size = if data.is_empty() {
+        512
+    } else {
+        data.len() + 512
+    };
     i_stream.set_output_buffer(out_size);
 
     // Use the convenience wrapper that handles state extraction internally.
@@ -131,11 +135,7 @@ fn test_deflate_all_levels() {
             panic!("uncompress(level={level}) failed: {e:?}");
         });
 
-        assert_bytes_equal(
-            &decompressed,
-            data,
-            &format!("level {level} round-trip"),
-        );
+        assert_bytes_equal(&decompressed, data, &format!("level {level} round-trip"));
     }
 
     // Level 0 (stored) should produce output larger than input for small data
@@ -299,7 +299,7 @@ fn test_deflate_strategy_fixed() {
 
 /// Standard zlib format with various window sizes.
 ///
-/// windowBits 8 is promoted to 9 by `deflateInit2` (historical workaround
+/// `windowBits` 8 is promoted to 9 by `deflateInit2` (historical workaround
 /// from `deflate.c` line 265).
 #[test]
 fn test_deflate_window_bits_zlib() {
@@ -367,7 +367,7 @@ fn test_deflate_window_bits_raw() {
 
 /// Gzip format (`windowBits + 16`).
 ///
-/// windowBits = 15 + 16 = 31 produces gzip-wrapped output with a 10-byte
+/// `windowBits` = 15 + 16 = 31 produces gzip-wrapped output with a 10-byte
 /// header, CRC-32 checksum, and 8-byte trailer.
 #[test]
 fn test_deflate_window_bits_gzip() {
@@ -432,9 +432,7 @@ fn test_deflate_params_switch_level() {
     let chunk_len = 2048_usize;
     let chunk1: Vec<u8> = (0..chunk_len).map(|i| (i % 251) as u8).collect();
     let chunk2: Vec<u8> = vec![0xFF; chunk_len];
-    let chunk3: Vec<u8> = (0..chunk_len)
-        .map(|i| ((i * 7 + 3) % 256) as u8)
-        .collect();
+    let chunk3: Vec<u8> = (0..chunk_len).map(|i| ((i * 7 + 3) % 256) as u8).collect();
 
     let mut full_data = Vec::with_capacity(chunk_len * 3);
     full_data.extend_from_slice(&chunk1);
@@ -462,11 +460,7 @@ fn test_deflate_params_switch_level() {
     assert_eq!(stream.avail_in(), 0, "phase 1: all input consumed");
 
     // ── Switch to Z_NO_COMPRESSION ──
-    let ret = deflate::deflate_params(
-        &mut stream,
-        Z_NO_COMPRESSION,
-        Z_DEFAULT_STRATEGY,
-    );
+    let ret = deflate::deflate_params(&mut stream, Z_NO_COMPRESSION, Z_DEFAULT_STRATEGY);
     assert_ok(ret, "deflateParams → Z_NO_COMPRESSION");
 
     // ── Phase 2: compress chunk2 at Z_NO_COMPRESSION ──
@@ -476,11 +470,7 @@ fn test_deflate_params_switch_level() {
     assert_eq!(stream.avail_in(), 0, "phase 2: all input consumed");
 
     // ── Switch to Z_BEST_COMPRESSION + Z_FILTERED ──
-    let ret = deflate::deflate_params(
-        &mut stream,
-        Z_BEST_COMPRESSION,
-        Z_FILTERED,
-    );
+    let ret = deflate::deflate_params(&mut stream, Z_BEST_COMPRESSION, Z_FILTERED);
     assert_ok(ret, "deflateParams → Z_BEST_COMPRESSION + Z_FILTERED");
 
     // ── Phase 3: compress chunk3 and finish ──
@@ -489,7 +479,10 @@ fn test_deflate_params_switch_level() {
     assert_return_code(ret, ReturnCode::StreamEnd, "deflate(Z_FINISH)");
 
     let compressed = stream.take_output();
-    assert!(!compressed.is_empty(), "compressed output should not be empty");
+    assert!(
+        !compressed.is_empty(),
+        "compressed output should not be empty"
+    );
     let _ret = deflate::deflate_end(&mut stream);
 
     // ── Decompress and verify ──
@@ -507,9 +500,7 @@ fn test_deflate_params_switch_level() {
 fn test_deflate_params_switch_strategy() {
     let chunk_len = 1024_usize;
     let chunk1: Vec<u8> = (0..chunk_len).map(|i| (i % 200) as u8).collect();
-    let chunk2: Vec<u8> = (0..chunk_len)
-        .map(|i| ((i * 3) % 256) as u8)
-        .collect();
+    let chunk2: Vec<u8> = (0..chunk_len).map(|i| ((i * 3) % 256) as u8).collect();
     let chunk3: Vec<u8> = vec![0x42; chunk_len];
 
     let mut full_data = Vec::with_capacity(chunk_len * 3);
@@ -536,11 +527,7 @@ fn test_deflate_params_switch_strategy() {
     check_err(ret, "deflate phase 1");
 
     // Switch to Z_HUFFMAN_ONLY
-    let ret = deflate::deflate_params(
-        &mut stream,
-        Z_DEFAULT_COMPRESSION,
-        Z_HUFFMAN_ONLY,
-    );
+    let ret = deflate::deflate_params(&mut stream, Z_DEFAULT_COMPRESSION, Z_HUFFMAN_ONLY);
     assert_ok(ret, "deflateParams → Z_HUFFMAN_ONLY");
 
     // Phase 2: Z_HUFFMAN_ONLY
@@ -549,11 +536,7 @@ fn test_deflate_params_switch_strategy() {
     check_err(ret, "deflate phase 2");
 
     // Switch to Z_RLE
-    let ret = deflate::deflate_params(
-        &mut stream,
-        Z_DEFAULT_COMPRESSION,
-        Z_RLE,
-    );
+    let ret = deflate::deflate_params(&mut stream, Z_DEFAULT_COMPRESSION, Z_RLE);
     assert_ok(ret, "deflateParams → Z_RLE");
 
     // Phase 3: Z_RLE + finish
@@ -566,11 +549,7 @@ fn test_deflate_params_switch_strategy() {
 
     let mut decompressed = alloc_uncompr_buffer(full_data.len());
     uncompress(&mut decompressed, &compressed).unwrap();
-    assert_bytes_equal(
-        &decompressed,
-        &full_data,
-        "strategy-switch round-trip",
-    );
+    assert_bytes_equal(&decompressed, &full_data, "strategy-switch round-trip");
 }
 
 // =============================================================================
@@ -1044,10 +1023,7 @@ fn test_deflate_full_flush() {
 
     // The full flush marker `00 00 FF FF` should be present.
     let has_marker = output.windows(4).any(|w| w == [0x00, 0x00, 0xFF, 0xFF]);
-    assert!(
-        has_marker,
-        "full flush output should contain 00 00 FF FF"
-    );
+    assert!(has_marker, "full flush output should contain 00 00 FF FF");
 
     // Finish the stream.
     stream.set_input(&[]);
@@ -1089,7 +1065,10 @@ fn test_deflate_partial_flush() {
     check_err(ret, "deflate(Z_PARTIAL_FLUSH)");
 
     let output = stream.take_output();
-    assert!(!output.is_empty(), "partial flush should produce some output");
+    assert!(
+        !output.is_empty(),
+        "partial flush should produce some output"
+    );
 
     // Finish the stream.
     stream.set_input(&[]);
@@ -1182,12 +1161,7 @@ fn test_deflate_repeated_data() {
     assert_round_trip(&all_ones);
 
     // Repeating two-byte pattern.
-    let pattern: Vec<u8> = [0xAB, 0xCD]
-        .iter()
-        .copied()
-        .cycle()
-        .take(10_000)
-        .collect();
+    let pattern: Vec<u8> = [0xAB, 0xCD].iter().copied().cycle().take(10_000).collect();
     assert_round_trip(&pattern);
 
     // Repeating 8-byte pattern — exercises longer match chains.

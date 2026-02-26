@@ -4,7 +4,7 @@
 //! the C zlib library into safe, idiomatic Rust. It defines the [`Code`] struct
 //! representing a single Huffman lookup table entry, the [`CodeType`] enum for
 //! selecting the type of code being built, the `ENOUGH` family of constants for
-//! table sizing, and the [`inflate_table`] function that builds Huffman decoding
+//! table sizing, and the `inflate_table` function that builds Huffman decoding
 //! tables from canonical code lengths.
 //!
 //! Every other inflate module depends on the types and constants defined here.
@@ -37,7 +37,7 @@ pub(crate) const MAXBITS: u32 = 15;
 /// The maximum number of table entries for length/literal codes when the
 /// root table index bits is 9. Computed by the `enough` program
 /// (`examples/enough.c`) with root = 9. The value 852 guarantees that
-/// [`inflate_table`] will never exceed this bound for valid DEFLATE length
+/// `inflate_table` will never exceed this bound for valid DEFLATE length
 /// code sets.
 pub const ENOUGH_LENS: usize = 852;
 
@@ -126,7 +126,7 @@ impl Default for Code {
 // CodeType enum
 // ---------------------------------------------------------------------------
 
-/// Type of Huffman code being built by [`inflate_table`].
+/// Type of Huffman code being built by `inflate_table`.
 ///
 /// Determines how symbols are interpreted during table construction:
 ///
@@ -151,7 +151,7 @@ pub enum CodeType {
 // InflateTableError
 // ---------------------------------------------------------------------------
 
-/// Errors from Huffman table construction via [`inflate_table`].
+/// Errors from Huffman table construction via `inflate_table`.
 ///
 /// Maps to the C return codes: `-1` → [`InvalidCodeSet`](Self::InvalidCodeSet),
 /// `+1` → [`NotEnoughSpace`](Self::NotEnoughSpace).
@@ -663,7 +663,7 @@ mod tests {
         assert_eq!(table[1].bits, 1);
     }
 
-    /// Over-subscribed code set should return InvalidCodeSet.
+    /// Over-subscribed code set should return `InvalidCodeSet`.
     #[test]
     fn inflate_table_oversubscribed() {
         // Two symbols both with 1-bit codes would need 2 codes in 1 bit,

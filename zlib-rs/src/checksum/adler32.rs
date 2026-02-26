@@ -48,7 +48,7 @@ const NMAX: usize = 5552;
 ///
 /// # Algorithm
 ///
-/// The input is processed in blocks of up to [`NMAX`] bytes. Within each block,
+/// The input is processed in blocks of up to `NMAX` bytes. Within each block,
 /// bytes are consumed 16 at a time (replacing the C library's `DO16` macro
 /// unrolling). A modulo reduction is applied once per block, which is safe
 /// because the `NMAX` bound guarantees no `u32` overflow within a block.
@@ -207,7 +207,7 @@ pub fn adler32(adler: u32, buf: &[u8]) -> u32 {
 /// # Mathematical Basis
 ///
 /// The combination formula exploits the linearity of the Adler-32 sums
-/// modulo [`BASE`]. Given the individual checksums and the length of the
+/// modulo `BASE`. Given the individual checksums and the length of the
 /// second sequence, the combined `s1` and `s2` values can be computed
 /// algebraically without re-processing any data.
 #[must_use]
@@ -268,6 +268,7 @@ pub fn adler32_combine(adler1: u32, adler2: u32, len2: i64) -> u32 {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_wrap)]
 mod tests {
     use super::*;
 
@@ -332,7 +333,7 @@ mod tests {
         // Verify by computing manually or by cross-checking
         let mut s1: u32 = 1;
         let mut s2: u32 = 0;
-        for &b in data.iter() {
+        for &b in data {
             s1 += u32::from(b);
             s2 += s1;
         }

@@ -39,7 +39,7 @@ use std::ptr;
 
 use libc::{c_char, c_int, c_uint, c_void};
 
-use crate::types::{gzFile, z_off64_t, z_off_t, z_size_t, Z_ERRNO, Z_OK, Z_STREAM_ERROR};
+use crate::types::{Z_ERRNO, Z_OK, Z_STREAM_ERROR, gzFile, z_off_t, z_off64_t, z_size_t};
 
 use zlib_rs::gz::{GzFile as RustGzFile, GzReader, GzWriter};
 
@@ -62,7 +62,7 @@ unsafe fn gz_handle_mut(file: gzFile) -> Option<&'static mut RustGzFile> {
     if file.is_null() {
         return None;
     }
-    Some(unsafe { &mut *(file as *mut RustGzFile) })
+    Some(unsafe { &mut *(file.cast::<RustGzFile>()) })
 }
 
 /// Converts a raw `gzFile` opaque pointer to a shared reference to the
@@ -182,10 +182,7 @@ pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> g
 /// `gzopen_w` — `win32/zlib.def` line 104.
 #[cfg(target_os = "windows")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gzopen_w(
-    path: *const libc::wchar_t,
-    mode: *const c_char,
-) -> gzFile {
+pub unsafe extern "C" fn gzopen_w(path: *const libc::wchar_t, mode: *const c_char) -> gzFile {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
@@ -223,10 +220,7 @@ pub unsafe extern "C" fn gzopen_w(
 /// concept.
 #[cfg(not(target_os = "windows"))]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gzopen_w(
-    _path: *const c_void,
-    _mode: *const c_char,
-) -> gzFile {
+pub unsafe extern "C" fn gzopen_w(_path: *const c_void, _mode: *const c_char) -> gzFile {
     ptr::null_mut()
 }
 
@@ -339,7 +333,7 @@ pub unsafe extern "C" fn gzclose(file: gzFile) -> c_int {
         return Z_STREAM_ERROR;
     }
     // Reclaim ownership of the boxed GzFile and close.
-    let gz = unsafe { *Box::from_raw(file as *mut RustGzFile) };
+    let gz = unsafe { *Box::from_raw(file.cast::<RustGzFile>()) };
     match gz.close() {
         Ok(()) => Z_OK,
         Err(_) => Z_ERRNO,
@@ -361,7 +355,7 @@ pub unsafe extern "C" fn gzclose_r(file: gzFile) -> c_int {
     if file.is_null() {
         return Z_STREAM_ERROR;
     }
-    let gz = unsafe { Box::from_raw(file as *mut RustGzFile) };
+    let gz = unsafe { Box::from_raw(file.cast::<RustGzFile>()) };
     if matches!(gz.as_ref(), RustGzFile::Writer(_)) {
         // Wrong type — return the pointer without dropping the writer.
         let _ = Box::into_raw(gz);
@@ -387,7 +381,7 @@ pub unsafe extern "C" fn gzclose_w(file: gzFile) -> c_int {
     if file.is_null() {
         return Z_STREAM_ERROR;
     }
-    let gz = unsafe { Box::from_raw(file as *mut RustGzFile) };
+    let gz = unsafe { Box::from_raw(file.cast::<RustGzFile>()) };
     // Check variant before consuming the box.
     if matches!(gz.as_ref(), RustGzFile::Reader(_)) {
         // Wrong type — return the pointer without dropping the reader.
@@ -435,7 +429,7 @@ pub unsafe extern "C" fn gzread(file: gzFile, buf: *mut c_void, len: c_uint) -> 
         return 0;
     }
 
-    let slice = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
+    let slice = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), len as usize) };
     match reader.read(slice) {
         Ok(n) => {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -473,12 +467,11 @@ pub unsafe extern "C" fn gzfread(
         RustGzFile::Writer(_) => return 0,
     };
 
-    let total_bytes = match size.checked_mul(nitems) {
-        Some(n) => n,
-        None => return 0,
+    let Some(total_bytes) = size.checked_mul(nitems) else {
+        return 0;
     };
 
-    let slice = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, total_bytes) };
+    let slice = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), total_bytes) };
     match reader.read(slice) {
         Ok(n) => n / size,
         Err(_) => 0,
@@ -496,11 +489,7 @@ pub unsafe extern "C" fn gzfread(
 ///
 /// `gzgets` — `win32/zlib.def` line 56.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gzgets(
-    file: gzFile,
-    buf: *mut c_char,
-    len: c_int,
-) -> *mut c_char {
+pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *mut c_char {
     let Some(gz) = (unsafe { gz_handle_mut(file) }) else {
         return ptr::null_mut();
     };
@@ -513,8 +502,8 @@ pub unsafe extern "C" fn gzgets(
     };
 
     // Create a slice for the output buffer (len bytes including null terminator).
-    let out_slice =
-        unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
+    #[allow(clippy::cast_sign_loss)]
+    let out_slice = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), len as usize) };
 
     match reader.gets(out_slice) {
         Ok(n) if n > 0 => {
@@ -626,7 +615,7 @@ pub unsafe extern "C" fn gzwrite(file: gzFile, buf: *const c_void, len: c_uint) 
         return 0;
     }
 
-    let slice = unsafe { std::slice::from_raw_parts(buf as *const u8, len as usize) };
+    let slice = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), len as usize) };
     match writer.write(slice) {
         Ok(n) => {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -664,12 +653,11 @@ pub unsafe extern "C" fn gzfwrite(
         RustGzFile::Reader(_) => return 0,
     };
 
-    let total_bytes = match size.checked_mul(nitems) {
-        Some(n) => n,
-        None => return 0,
+    let Some(total_bytes) = size.checked_mul(nitems) else {
+        return 0;
     };
 
-    let slice = unsafe { std::slice::from_raw_parts(buf as *const u8, total_bytes) };
+    let slice = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), total_bytes) };
     match writer.write(slice) {
         Ok(n) => n / size,
         Err(_) => 0,
@@ -702,9 +690,8 @@ pub unsafe extern "C" fn gzprintf(file: gzFile, format: *const c_char) -> c_int 
         RustGzFile::Reader(_) => return -1,
     };
 
-    let fmt_str = match unsafe { CStr::from_ptr(format) }.to_str() {
-        Ok(s) => s,
-        Err(_) => return -1,
+    let Ok(fmt_str) = unsafe { CStr::from_ptr(format) }.to_str() else {
+        return -1;
     };
 
     match writer.printf(fmt_str) {
@@ -843,11 +830,7 @@ pub unsafe extern "C" fn gzflush(file: gzFile, flush: c_int) -> c_int {
 ///
 /// `gzseek64` — `win32/zlib.def` line 74.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gzseek64(
-    file: gzFile,
-    offset: z_off64_t,
-    whence: c_int,
-) -> z_off64_t {
+pub unsafe extern "C" fn gzseek64(file: gzFile, offset: z_off64_t, whence: c_int) -> z_off64_t {
     let Some(gz) = (unsafe { gz_handle_mut(file) }) else {
         return -1;
     };
@@ -990,13 +973,7 @@ pub unsafe extern "C" fn gzeof(file: gzFile) -> c_int {
         return 0;
     };
     match gz {
-        RustGzFile::Reader(reader) => {
-            if reader.eof() {
-                1
-            } else {
-                0
-            }
-        }
+        RustGzFile::Reader(reader) => c_int::from(reader.eof()),
         RustGzFile::Writer(_) => 0,
     }
 }
@@ -1015,13 +992,7 @@ pub unsafe extern "C" fn gzdirect(file: gzFile) -> c_int {
         return 0;
     };
     match gz {
-        RustGzFile::Reader(reader) => {
-            if reader.is_direct() {
-                1
-            } else {
-                0
-            }
-        }
+        RustGzFile::Reader(reader) => c_int::from(reader.is_direct()),
         RustGzFile::Writer(_) => 0,
     }
 }
@@ -1069,14 +1040,13 @@ pub unsafe extern "C" fn gzerror(file: gzFile, errnum: *mut c_int) -> *const c_c
 
     // Map error code to a static C-compatible message string.
     let msg = match code {
-        0 | 1 => EMPTY.as_ptr(),     // Z_OK (0), Z_STREAM_END (1)
-        2 => EMPTY.as_ptr(),          // Z_NEED_DICT (no message)
-        -1 => ERRNO_MSG.as_ptr(),     // Z_ERRNO
-        -2 => STREAM_MSG.as_ptr(),    // Z_STREAM_ERROR
-        -3 => DATA_MSG.as_ptr(),      // Z_DATA_ERROR
-        -4 => OOM_MSG.as_ptr(),       // Z_MEM_ERROR
-        -5 => BUF_MSG.as_ptr(),       // Z_BUF_ERROR
-        -6 => VERSION_MSG.as_ptr(),   // Z_VERSION_ERROR
+        0..=2 => EMPTY.as_ptr(),    // Z_OK (0), Z_STREAM_END (1), Z_NEED_DICT (2)
+        -1 => ERRNO_MSG.as_ptr(),   // Z_ERRNO
+        -2 => STREAM_MSG.as_ptr(),  // Z_STREAM_ERROR
+        -3 => DATA_MSG.as_ptr(),    // Z_DATA_ERROR
+        -4 => OOM_MSG.as_ptr(),     // Z_MEM_ERROR
+        -5 => BUF_MSG.as_ptr(),     // Z_BUF_ERROR
+        -6 => VERSION_MSG.as_ptr(), // Z_VERSION_ERROR
         _ => EMPTY.as_ptr(),
     };
     msg.cast::<c_char>()

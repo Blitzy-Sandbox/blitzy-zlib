@@ -1,7 +1,8 @@
+#![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 //! Inflate-specific edge case tests.
 //!
-//! Tests format auto-detection (windowBits+32), corrupt data handling,
-//! inflateSync recovery, and inflate state machine edge cases.
+//! Tests format auto-detection (`windowBits`+32), corrupt data handling,
+//! `inflateSync` recovery, and inflate state machine edge cases.
 
 // Test code may use wildcard imports for concise access to shared helpers.
 #![allow(clippy::wildcard_imports)]
@@ -95,7 +96,7 @@ fn streaming_decompress_with_buf(
 // Phase 2: Format Auto-Detection Tests (windowBits + 32)
 // =============================================================================
 
-/// Test: windowBits=47 (MAX_WBITS+32) auto-detects zlib format.
+/// Test: `windowBits`=47 (`MAX_WBITS`+32) auto-detects zlib format.
 ///
 /// The inflate engine should correctly identify and decompress a zlib-format
 /// stream when auto-detection mode is active.
@@ -106,11 +107,15 @@ fn test_inflate_auto_detect_zlib() {
 
     // Decompress with auto-detect (windowBits = MAX_WBITS + 32 = 47)
     let (ret, output) = streaming_decompress(&compressed, MAX_WBITS + 32);
-    assert_eq!(ret, ReturnCode::StreamEnd, "auto-detect zlib failed: {ret:?}");
+    assert_eq!(
+        ret,
+        ReturnCode::StreamEnd,
+        "auto-detect zlib failed: {ret:?}"
+    );
     assert_bytes_equal(&output, HELLO, "auto-detect zlib output");
 }
 
-/// Test: windowBits=47 (MAX_WBITS+32) auto-detects gzip format.
+/// Test: `windowBits`=47 (`MAX_WBITS`+32) auto-detects gzip format.
 ///
 /// The inflate engine should correctly identify and decompress a gzip-format
 /// stream when auto-detection mode is active.
@@ -121,11 +126,15 @@ fn test_inflate_auto_detect_gzip() {
 
     // Decompress with auto-detect (windowBits = MAX_WBITS + 32 = 47)
     let (ret, output) = streaming_decompress(&compressed, MAX_WBITS + 32);
-    assert_eq!(ret, ReturnCode::StreamEnd, "auto-detect gzip failed: {ret:?}");
+    assert_eq!(
+        ret,
+        ReturnCode::StreamEnd,
+        "auto-detect gzip failed: {ret:?}"
+    );
     assert_bytes_equal(&output, HELLO, "auto-detect gzip output");
 }
 
-/// Test: windowBits=-15 for raw DEFLATE.
+/// Test: `windowBits`=-15 for raw DEFLATE.
 ///
 /// Raw DEFLATE streams have no wrapper headers or trailers.
 #[test]
@@ -139,10 +148,10 @@ fn test_inflate_auto_detect_raw() {
     assert_bytes_equal(&output, HELLO, "raw inflate output");
 }
 
-/// Test: format mismatch produces Z_DATA_ERROR.
+/// Test: format mismatch produces `Z_DATA_ERROR`.
 ///
 /// When the format of the compressed data doesn't match what inflate expects,
-/// the inflate engine should return Z_DATA_ERROR.
+/// the inflate engine should return `Z_DATA_ERROR`.
 #[test]
 fn test_inflate_format_mismatch() {
     // Compress as gzip, try to decompress as zlib → should fail
@@ -168,7 +177,7 @@ fn test_inflate_format_mismatch() {
 // Phase 3: Corrupt Data Handling
 // =============================================================================
 
-/// Test: invalid zlib header bytes produce Z_DATA_ERROR.
+/// Test: invalid zlib header bytes produce `Z_DATA_ERROR`.
 ///
 /// The CMF/FLG check (CMF*256 + FLG) % 31 must be zero. Modifying
 /// the header bytes violates this check.
@@ -190,7 +199,7 @@ fn test_inflate_corrupt_header() {
     );
 }
 
-/// Test: corrupted compressed data body produces Z_DATA_ERROR.
+/// Test: corrupted compressed data body produces `Z_DATA_ERROR`.
 ///
 /// Flipping bits in the middle of the compressed data payload should
 /// cause the inflate engine to detect the corruption.
@@ -215,7 +224,7 @@ fn test_inflate_corrupt_data() {
     );
 }
 
-/// Test: corrupted Adler-32 trailer produces Z_DATA_ERROR.
+/// Test: corrupted Adler-32 trailer produces `Z_DATA_ERROR`.
 ///
 /// The last 4 bytes of a zlib stream are the Adler-32 checksum. Corrupting
 /// them should cause inflate to report "incorrect data check".
@@ -240,7 +249,7 @@ fn test_inflate_corrupt_checksum() {
     );
 }
 
-/// Test: truncated compressed stream produces Z_BUF_ERROR or Z_DATA_ERROR.
+/// Test: truncated compressed stream produces `Z_BUF_ERROR` or `Z_DATA_ERROR`.
 ///
 /// Providing incomplete compressed data should prevent successful decompression.
 #[test]
@@ -262,7 +271,7 @@ fn test_inflate_truncated_stream() {
     );
 }
 
-/// Test: empty input to inflate produces Z_BUF_ERROR.
+/// Test: empty input to inflate produces `Z_BUF_ERROR`.
 ///
 /// When no input is available, inflate cannot make progress.
 #[test]
@@ -290,12 +299,12 @@ fn test_inflate_empty_input() {
 // Phase 4: inflateSync Recovery Tests
 // =============================================================================
 
-/// Test: inflateSync recovery after corruption at a Z_FULL_FLUSH sync point.
+/// Test: `inflateSync` recovery after corruption at a `Z_FULL_FLUSH` sync point.
 ///
 /// Port of `test_flush` + `test_sync` from `test/example.c`.
-/// Compresses data with Z_FULL_FLUSH to create sync points, corrupts the
+/// Compresses data with `Z_FULL_FLUSH` to create sync points, corrupts the
 /// data between the header and the sync point, and verifies that
-/// inflateSync can skip past the corrupted region and recover.
+/// `inflateSync` can skip past the corrupted region and recover.
 #[test]
 fn test_inflate_sync_recovery() {
     // Step 1: Compress with Z_FULL_FLUSH after the first 3 bytes to create
@@ -374,7 +383,8 @@ fn test_inflate_sync_recovery() {
             // After sync recovery, we may reach StreamEnd or DataError
             // (depending on how much data was recoverable)
             assert!(
-                ret == ReturnCode::StreamEnd || ret == ReturnCode::DataError
+                ret == ReturnCode::StreamEnd
+                    || ret == ReturnCode::DataError
                     || ret == ReturnCode::BufError,
                 "post-sync inflate unexpected: {ret:?}"
             );
@@ -384,10 +394,10 @@ fn test_inflate_sync_recovery() {
     let _ = inflate::inflate_end(&mut istate, &mut istream);
 }
 
-/// Test: inflateSync on data compressed without any full flush.
+/// Test: `inflateSync` on data compressed without any full flush.
 ///
-/// When no sync points exist in the stream, inflateSync should return
-/// Z_DATA_ERROR because there is no sync pattern to find.
+/// When no sync points exist in the stream, `inflateSync` should return
+/// `Z_DATA_ERROR` because there is no sync pattern to find.
 #[test]
 fn test_inflate_sync_no_sync_point() {
     // Compress without any full flush — no sync points
@@ -431,9 +441,9 @@ fn test_inflate_sync_no_sync_point() {
 // Phase 5: inflateReset and inflateCopy Tests
 // =============================================================================
 
-/// Test: inflateReset reuses the stream for multiple decompression passes.
+/// Test: `inflateReset` reuses the stream for multiple decompression passes.
 ///
-/// After a successful decompression, inflateReset should allow the same
+/// After a successful decompression, `inflateReset` should allow the same
 /// state to decompress another stream without re-initialization.
 #[test]
 fn test_inflate_reset() {
@@ -452,7 +462,11 @@ fn test_inflate_reset() {
     while ret == ReturnCode::Ok {
         ret = inflate::inflate(&mut state, &mut stream, Z_NO_FLUSH);
     }
-    assert_eq!(ret, ReturnCode::StreamEnd, "first decompress failed: {ret:?}");
+    assert_eq!(
+        ret,
+        ReturnCode::StreamEnd,
+        "first decompress failed: {ret:?}"
+    );
     let output1 = stream.take_output();
     assert_bytes_equal(&output1, HELLO, "first decompression output");
 
@@ -479,7 +493,7 @@ fn test_inflate_reset() {
     let _ = inflate::inflate_end(&mut state, &mut stream);
 }
 
-/// Test: inflateReset2 changes windowBits format.
+/// Test: `inflateReset2` changes `windowBits` format.
 ///
 /// Initialize for zlib, reset to raw DEFLATE, then decompress raw data.
 #[test]
@@ -599,7 +613,7 @@ fn test_inflate_copy() {
 // Phase 6: inflateGetHeader Tests (gzip header extraction)
 // =============================================================================
 
-/// Test: inflateGetHeader extracts gzip header information.
+/// Test: `inflateGetHeader` extracts gzip header information.
 #[test]
 fn test_inflate_get_header() {
     let mut stream = ZStream::new();
@@ -732,10 +746,7 @@ fn test_inflate_set_dictionary() {
 
     let ret = inflate::inflate(&mut istate, &mut istream, Z_NO_FLUSH);
     assert_eq!(ret, ReturnCode::NeedDict, "should get NeedDict");
-    assert_eq!(
-        istream.adler, dict_adler,
-        "dictionary ID mismatch"
-    );
+    assert_eq!(istream.adler, dict_adler, "dictionary ID mismatch");
 
     let ret = inflate::inflate_set_dictionary(&mut istate, &mut istream, DICTIONARY);
     assert_eq!(ret, ReturnCode::Ok, "inflate_set_dictionary failed");
@@ -744,7 +755,11 @@ fn test_inflate_set_dictionary() {
     while ret == ReturnCode::Ok {
         ret = inflate::inflate(&mut istate, &mut istream, Z_NO_FLUSH);
     }
-    assert_eq!(ret, ReturnCode::StreamEnd, "inflate with dict failed: {ret:?}");
+    assert_eq!(
+        ret,
+        ReturnCode::StreamEnd,
+        "inflate with dict failed: {ret:?}"
+    );
 
     let output = istream.take_output();
     assert_bytes_equal(&output, HELLO, "dictionary round-trip");
@@ -794,7 +809,11 @@ fn test_inflate_wrong_dictionary() {
 
     // Supply wrong dictionary — the Adler-32 won't match, so should get DataError
     let ret = inflate::inflate_set_dictionary(&mut istate, &mut istream, wrong_dict);
-    assert_eq!(ret, ReturnCode::DataError, "wrong dictionary should cause DataError");
+    assert_eq!(
+        ret,
+        ReturnCode::DataError,
+        "wrong dictionary should cause DataError"
+    );
 
     let _ = inflate::inflate_end(&mut istate, &mut istream);
 }
@@ -803,14 +822,22 @@ fn test_inflate_wrong_dictionary() {
 // Phase 8: Window Size Tests
 // =============================================================================
 
-/// Test: Verify round-trip with each valid windowBits value (9..=15).
+/// Test: Verify round-trip with each valid `windowBits` value (9..=15).
 #[test]
 fn test_inflate_various_window_sizes() {
     for wbits in 9..=15 {
         let compressed = streaming_compress(HELLO, wbits, Z_DEFAULT_COMPRESSION);
         let (ret, decompressed) = streaming_decompress(&compressed, wbits);
-        assert_eq!(ret, ReturnCode::StreamEnd, "windowBits={wbits} inflate failed");
-        assert_bytes_equal(&decompressed, HELLO, &format!("windowBits={wbits} round-trip"));
+        assert_eq!(
+            ret,
+            ReturnCode::StreamEnd,
+            "windowBits={wbits} inflate failed"
+        );
+        assert_bytes_equal(
+            &decompressed,
+            HELLO,
+            &format!("windowBits={wbits} round-trip"),
+        );
     }
 }
 
@@ -869,7 +896,7 @@ fn test_inflate_byte_at_a_time() {
     loop {
         // Feed one input byte at a time
         if istream.avail_in() == 0 && pos < compressed.len() {
-            istream.set_input(&compressed[pos..pos + 1]);
+            istream.set_input(&compressed[pos..=pos]);
             pos += 1;
         }
 
@@ -961,10 +988,10 @@ fn test_inflate_large_output() {
 // Phase 10: Error Handling and Additional Edge Cases
 // =============================================================================
 
-/// Test: Invalid windowBits values should return StreamError.
+/// Test: Invalid `windowBits` values should return `StreamError`.
 ///
 /// Note: `windowBits=0` is intentionally *valid* — it means "keep the
-/// current windowBits" (same semantics as C zlib's `inflateReset2(strm, 0)`
+/// current `windowBits`" (same semantics as C zlib's `inflateReset2(strm, 0)`
 /// introduced in zlib 1.2.3.5). Values 1..7 and -1..-7 are too small for
 /// the DEFLATE window, and values >= 48 (when positive) exceed the auto-detect
 /// range, so those are invalid.
@@ -983,7 +1010,7 @@ fn test_inflate_invalid_window_bits() {
     }
 }
 
-/// Test: inflatePrime inserts bits for custom header processing.
+/// Test: `inflatePrime` inserts bits for custom header processing.
 #[test]
 fn test_inflate_prime() {
     let mut istream = ZStream::new();
@@ -1001,7 +1028,7 @@ fn test_inflate_prime() {
     let _ = inflate::inflate_end(&mut istate, &mut istream);
 }
 
-/// Test: inflateMark returns -65536 (-(1<<16)) when not inside a block.
+/// Test: `inflateMark` returns -65536 (-(1<<16)) when not inside a block.
 #[test]
 fn test_inflate_mark() {
     let mut istream = ZStream::new();
@@ -1011,12 +1038,16 @@ fn test_inflate_mark() {
 
     let mark = inflate::inflate_mark(&istate);
     // Before any data is processed, mark returns -(1 << 16) = -65536
-    assert_eq!(mark, -(1_i64 << 16), "initial inflate_mark should be -65536");
+    assert_eq!(
+        mark,
+        -(1_i64 << 16),
+        "initial inflate_mark should be -65536"
+    );
 
     let _ = inflate::inflate_end(&mut istate, &mut istream);
 }
 
-/// Test: inflateGetHeader on a non-gzip stream returns StreamError.
+/// Test: `inflateGetHeader` on a non-gzip stream returns `StreamError`.
 #[test]
 fn test_inflate_get_header_wrong_format() {
     let mut istream = ZStream::new();
@@ -1043,11 +1074,7 @@ fn test_inflate_all_compression_levels() {
         let compressed = streaming_compress(HELLO, MAX_WBITS, level);
         let (ret, decompressed) = streaming_decompress(&compressed, MAX_WBITS);
         assert_eq!(ret, ReturnCode::StreamEnd, "level {level} inflate failed");
-        assert_bytes_equal(
-            &decompressed,
-            HELLO,
-            &format!("level {level} round-trip"),
-        );
+        assert_bytes_equal(&decompressed, HELLO, &format!("level {level} round-trip"));
     }
 }
 
@@ -1076,7 +1103,7 @@ fn test_inflate_fast_path() {
     assert_eq!(decompressed, big_input, "fast-path data mismatch");
 }
 
-/// Test: Decompress gzip format with explicit windowBits (MAX_WBITS + 16).
+/// Test: Decompress gzip format with explicit `windowBits` (`MAX_WBITS` + 16).
 #[test]
 fn test_inflate_gzip_explicit() {
     let compressed = streaming_compress(HELLO, MAX_WBITS + 16, Z_DEFAULT_COMPRESSION);
@@ -1085,7 +1112,7 @@ fn test_inflate_gzip_explicit() {
     assert_bytes_equal(&decompressed, HELLO, "explicit gzip round-trip");
 }
 
-/// Test: inflateReset after partial decompression allows full restart.
+/// Test: `inflateReset` after partial decompression allows full restart.
 #[test]
 fn test_inflate_reset_after_partial() {
     let compressed = streaming_compress(HELLO, MAX_WBITS, Z_DEFAULT_COMPRESSION);
@@ -1117,7 +1144,11 @@ fn test_inflate_reset_after_partial() {
     while ret == ReturnCode::Ok {
         ret = inflate::inflate(&mut istate, &mut istream, Z_NO_FLUSH);
     }
-    assert_eq!(ret, ReturnCode::StreamEnd, "full inflate after reset failed");
+    assert_eq!(
+        ret,
+        ReturnCode::StreamEnd,
+        "full inflate after reset failed"
+    );
 
     let output = istream.take_output();
     assert_bytes_equal(&output, HELLO, "reset after partial");
@@ -1140,11 +1171,7 @@ fn test_inflate_multiple_streams() {
         let (ret, decompressed) =
             streaming_decompress_with_buf(&compressed, MAX_WBITS, data.len() + 1024);
         assert_eq!(ret, ReturnCode::StreamEnd, "stream #{i} inflate failed");
-        assert_eq!(
-            decompressed.as_slice(),
-            data,
-            "stream #{i} data mismatch"
-        );
+        assert_eq!(decompressed.as_slice(), data, "stream #{i} data mismatch");
     }
 }
 
@@ -1153,7 +1180,7 @@ fn test_inflate_multiple_streams() {
 // =============================================================================
 
 /// Test: Use `compress2` at a specific level and decompress using `inflate_init`
-/// (the default-windowBits variant) and `inflate_init2`.
+/// (the default-`windowBits` variant) and `inflate_init2`.
 ///
 /// Exercises: `compress2`, `inflate_init`, `inflate_init2`, `assert_ok`,
 /// `assert_return_code`, `alloc_compr_buffer`, `alloc_uncompr_buffer`,
@@ -1164,8 +1191,7 @@ fn test_inflate_init_with_compress2() {
     let _uncompr = alloc_uncompr_buffer(UNCOMPR_LEN);
 
     // Compress using compress2 at best compression
-    compress2(&mut compr, HELLO, Z_BEST_COMPRESSION)
-        .expect("compress2 should succeed");
+    compress2(&mut compr, HELLO, Z_BEST_COMPRESSION).expect("compress2 should succeed");
 
     // Decompress using inflate_init (default windowBits = DEF_WBITS = 15, zlib format)
     let mut stream = ZStream::new();
@@ -1219,7 +1245,11 @@ fn test_inflate_one_call_helpers() {
 
     assert!(stream.total_in > 0, "total_in should be > 0");
     assert!(stream.total_out > 0, "total_out should be > 0");
-    assert_eq!(stream.total_out as usize, HELLO.len(), "total_out vs HELLO len");
+    assert_eq!(
+        stream.total_out as usize,
+        HELLO.len(),
+        "total_out vs HELLO len"
+    );
 
     let output = stream.take_output();
     assert_bytes_equal(&output, HELLO, "one_call_helpers round-trip");
@@ -1361,8 +1391,11 @@ fn test_inflate_gz_header_xflags_hcrc() {
 
     if let Some(head) = istate.header() {
         assert!(head.done, "header done flag should be set");
-        // xflags is set by the compressor; verify it is accessible
-        let _xf = head.xflags;
+        // xflags is set by the compressor; verify the field is accessible and valid
+        assert!(
+            head.xflags <= 4,
+            "xflags should be a valid compression flag (0-4)"
+        );
         // hcrc: we set hcrc=false, verify the flag is accessible
         assert!(!head.hcrc, "hcrc should be false when not requested");
     } else {
@@ -1392,7 +1425,11 @@ fn test_inflate_one_call_compress_uncompress() {
 
     // Also verify the compressed data decompresses via streaming inflate
     let (ret, streamed) = streaming_decompress(&compr, MAX_WBITS);
-    assert_eq!(ret, ReturnCode::StreamEnd, "streaming inflate of compress()");
+    assert_eq!(
+        ret,
+        ReturnCode::StreamEnd,
+        "streaming inflate of compress()"
+    );
     assert_bytes_equal(&streamed, HELLO, "compress->streaming_decompress");
 }
 

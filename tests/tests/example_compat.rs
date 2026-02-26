@@ -13,9 +13,8 @@
 #![allow(clippy::missing_panics_doc)]
 
 use zlib_rs::constants::{
-    Z_BEST_COMPRESSION, Z_BEST_SPEED, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY,
-    Z_FILTERED, Z_FINISH, Z_FULL_FLUSH, Z_NO_COMPRESSION, Z_NO_FLUSH,
-    MAX_WBITS, ZLIB_VERNUM, ZLIB_VERSION,
+    MAX_WBITS, Z_BEST_COMPRESSION, Z_BEST_SPEED, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY,
+    Z_FILTERED, Z_FINISH, Z_FULL_FLUSH, Z_NO_COMPRESSION, Z_NO_FLUSH, ZLIB_VERNUM, ZLIB_VERSION,
 };
 use zlib_rs::deflate;
 use zlib_rs::error::ReturnCode;
@@ -24,9 +23,8 @@ use zlib_rs::inflate::{self, InflateState};
 use zlib_rs::stream::ZStream;
 
 use zlib_rs_tests::{
-    alloc_compr_buffer, alloc_test_buffers, alloc_uncompr_buffer,
-    assert_bytes_equal, assert_ok, assert_return_code, check_err,
-    COMPR_LEN, DICTIONARY, HELLO, UNCOMPR_LEN,
+    COMPR_LEN, DICTIONARY, HELLO, UNCOMPR_LEN, alloc_compr_buffer, alloc_test_buffers,
+    alloc_uncompr_buffer, assert_bytes_equal, assert_ok, assert_return_code, check_err,
 };
 
 // =============================================================================
@@ -84,8 +82,7 @@ fn test_gzio() {
     // ── Write phase ──────────────────────────────────────────────────────
 
     // C: file = gzopen(fname, "wb");
-    let mut writer = GzWriter::open_with_mode(path, "wb")
-        .expect("gzopen(wb) failed");
+    let mut writer = GzWriter::open_with_mode(path, "wb").expect("gzopen(wb) failed");
 
     // C: gzputc(file, 'h');
     writer.putc(b'h').expect("gzputc failed");
@@ -119,12 +116,11 @@ fn test_gzio() {
     loop {
         let mut buf = [0u8; 4096];
         match std::io::Read::read(&mut reader, &mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
+            Ok(n) if n > 0 => {
                 uncompr[total_read..total_read + n].copy_from_slice(&buf[..n]);
                 total_read += n;
             }
-            Err(_) => break,
+            _ => break,
         }
     }
 
@@ -134,11 +130,7 @@ fn test_gzio() {
     );
 
     // C: if (strcmp((char*)uncompr, hello))
-    assert_bytes_equal(
-        &uncompr[..len],
-        HELLO,
-        "gzread data should match HELLO",
-    );
+    assert_bytes_equal(&uncompr[..len], HELLO, "gzread data should match HELLO");
 
     // Re-open for seek/getc/ungetc/gets tests
     drop(reader);
@@ -149,9 +141,8 @@ fn test_gzio() {
     let mut pos = 0usize;
     while pos < len {
         match std::io::Read::read(&mut reader, &mut discard) {
-            Ok(0) => break,
-            Ok(n) => pos += n,
-            Err(_) => break,
+            Ok(n) if n > 0 => pos += n,
+            _ => break,
         }
     }
 
@@ -175,9 +166,7 @@ fn test_gzio() {
 
     // C: gzgets(file, (char*)uncompr, (int)uncomprLen);
     let mut gets_buf = vec![0u8; UNCOMPR_LEN];
-    let gets_len = reader
-        .gets(&mut gets_buf)
-        .expect("gzgets failed");
+    let gets_len = reader.gets(&mut gets_buf).expect("gzgets failed");
 
     // The Rust gets() returns raw byte count (may include the trailing null
     // byte from the decompressed data).  The C test uses strlen() which
@@ -205,7 +194,10 @@ fn test_gzio() {
     // GzFile::open wraps GzReader/GzWriter and serves as the Rust
     // equivalent of the C gzopen() dispatcher.
     let gz = GzFile::open(path, "rb").expect("GzFile::open(rb) failed");
-    assert!(matches!(gz, GzFile::Reader(_)), "GzFile rb should be Reader");
+    assert!(
+        matches!(gz, GzFile::Reader(_)),
+        "GzFile rb should be Reader"
+    );
 }
 
 // =============================================================================
@@ -493,7 +485,7 @@ fn helper_flush_and_corrupt() -> Vec<u8> {
     compr
 }
 
-/// Combined test for Z_FULL_FLUSH corruption and inflateSync recovery.
+/// Combined test for `Z_FULL_FLUSH` corruption and `inflateSync` recovery.
 ///
 /// Port of `test_flush()` + `test_sync()` from test/example.c lines 338–408.
 /// Combined because the C version passes the corrupted buffer from
@@ -624,9 +616,7 @@ fn test_dict_deflate_inflate() {
             );
 
             // C: inflateSetDictionary(&d_stream, dictionary, sizeof(dictionary));
-            let ret = inflate::inflate_set_dictionary(
-                &mut state, &mut d_stream, DICTIONARY,
-            );
+            let ret = inflate::inflate_set_dictionary(&mut state, &mut d_stream, DICTIONARY);
             check_err(ret, "inflateSetDictionary");
             continue;
         }
@@ -662,10 +652,7 @@ fn test_version_check() {
     );
 
     // C: ZLIB_VERNUM == 0x1321
-    assert_eq!(
-        ZLIB_VERNUM, 0x1321,
-        "ZLIB_VERNUM should be 0x1321"
-    );
+    assert_eq!(ZLIB_VERNUM, 0x1321, "ZLIB_VERNUM should be 0x1321");
 
     // Verify the version function returns the same string
     let version = zlib_rs::zlib_version();

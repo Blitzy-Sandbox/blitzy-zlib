@@ -153,11 +153,7 @@ fn flush_block_only(state: &mut DeflateState, stream: &mut ZStream, last: bool) 
 /// Returns `Some(BlockState)` if the output buffer is exhausted (the caller
 /// should return that value), or `None` if processing can continue.
 #[inline]
-fn flush_block(
-    state: &mut DeflateState,
-    stream: &mut ZStream,
-    last: bool,
-) -> Option<BlockState> {
+fn flush_block(state: &mut DeflateState, stream: &mut ZStream, last: bool) -> Option<BlockState> {
     flush_block_only(state, stream, last);
     if stream.avail_out() == 0 {
         return Some(if last {
@@ -233,8 +229,7 @@ pub(crate) fn deflate_stored(
         let have = stream.avail_out() - have_header;
 
         // left = window bytes in the current block not yet output
-        let left_full =
-            (state.strstart as i64 - state.block_start).max(0) as usize;
+        let left_full = (state.strstart as i64 - state.block_start).max(0) as usize;
         let left = left_full;
 
         if len as u64 > left as u64 + stream.avail_in() as u64 {
@@ -277,9 +272,7 @@ pub(crate) fn deflate_stored(
             let copy_len = left.min(len);
             let win_start = state.block_start as usize;
             let out = stream.output_remaining_mut();
-            out[..copy_len].copy_from_slice(
-                &state.window[win_start..win_start + copy_len],
-            );
+            out[..copy_len].copy_from_slice(&state.window[win_start..win_start + copy_len]);
             let _ = stream.advance_output(copy_len);
             state.block_start += copy_len as i64;
             len -= copy_len;
@@ -314,15 +307,15 @@ pub(crate) fn deflate_stored(
             state.matches = 2; // signal clear hash
             let start = consumed_input.len().saturating_sub(state.w_size);
             let copy_len = state.w_size.min(consumed_input.len() - start);
-            state.window[..copy_len]
-                .copy_from_slice(&consumed_input[start..start + copy_len]);
+            state.window[..copy_len].copy_from_slice(&consumed_input[start..start + copy_len]);
             state.strstart = state.w_size;
             state.insert = state.strstart;
         } else {
             if state.window_size - state.strstart <= used {
                 // Slide the window down.
                 state.strstart -= state.w_size;
-                state.window
+                state
+                    .window
                     .copy_within(state.w_size..state.w_size + state.strstart, 0);
                 if state.matches < 2 {
                     state.matches += 1; // add a pending slide_hash()
@@ -366,7 +359,8 @@ pub(crate) fn deflate_stored(
         // Slide the window down.
         state.block_start -= state.w_size as i64;
         state.strstart -= state.w_size;
-        state.window
+        state
+            .window
             .copy_within(state.w_size..state.w_size + state.strstart, 0);
         if state.matches < 2 {
             state.matches += 1;
@@ -403,9 +397,7 @@ pub(crate) fn deflate_stored(
             && left <= have_pending)
     {
         let len = left.min(have_pending);
-        let last_pending = flush == Z_FINISH
-            && stream.avail_in() == 0
-            && len == left;
+        let last_pending = flush == Z_FINISH && stream.avail_in() == 0 && len == left;
         let block_start_usize = state.block_start.max(0) as usize;
         let buf = state.window[block_start_usize..block_start_usize + len].to_vec();
         trees::tr_stored_block(state, Some(&buf), len as u64, last_pending);
@@ -477,27 +469,20 @@ pub(crate) fn deflate_fast(
         if hash_head != hash::NIL
             && state.strstart.saturating_sub(hash_head as usize) <= max_dist(state)
         {
-            state.match_length =
-                hash::longest_match(state, u32::from(hash_head));
+            state.match_length = hash::longest_match(state, u32::from(hash_head));
             // longest_match() sets match_start
         }
 
         if state.match_length >= MIN_MATCH {
             // Tally the distance/length pair.
             let dist = state.strstart - state.match_start;
-            let bflush = trees::tr_tally_dist(
-                state,
-                dist as u32,
-                state.match_length as u32,
-            );
+            let bflush = trees::tr_tally_dist(state, dist as u32, state.match_length as u32);
 
             state.lookahead -= state.match_length;
 
             // Insert new strings in the hash table only if the match length
             // is not too large. This saves time but degrades compression.
-            if state.match_length <= state.max_insert_length()
-                && state.lookahead >= MIN_MATCH
-            {
+            if state.match_length <= state.max_insert_length() && state.lookahead >= MIN_MATCH {
                 state.match_length -= 1; // string at strstart already in table
                 while state.match_length > 0 {
                     state.strstart += 1;
@@ -509,11 +494,8 @@ pub(crate) fn deflate_fast(
                 state.strstart += state.match_length;
                 state.match_length = 0;
                 state.ins_h = u32::from(state.window[state.strstart]);
-                state.ins_h = hash::update_hash(
-                    state,
-                    state.ins_h,
-                    state.window[state.strstart + 1],
-                );
+                state.ins_h =
+                    hash::update_hash(state, state.ins_h, state.window[state.strstart + 1]);
                 // If lookahead < MIN_MATCH, ins_h is garbage, but it does
                 // not matter since it will be recomputed at the next call.
             }
@@ -525,8 +507,7 @@ pub(crate) fn deflate_fast(
             }
         } else {
             // No match — output a literal byte.
-            let bflush =
-                trees::tr_tally_lit(state, state.window[state.strstart]);
+            let bflush = trees::tr_tally_lit(state, state.window[state.strstart]);
             state.lookahead -= 1;
             state.strstart += 1;
 
@@ -614,8 +595,7 @@ pub(crate) fn deflate_slow(
             && state.prev_length < state.max_lazy_match
             && state.strstart.saturating_sub(hash_head as usize) <= max_dist(state)
         {
-            state.match_length =
-                hash::longest_match(state, u32::from(hash_head));
+            state.match_length = hash::longest_match(state, u32::from(hash_head));
             // longest_match() sets match_start
 
             // Discard short matches if the strategy is Z_FILTERED and the
@@ -630,19 +610,13 @@ pub(crate) fn deflate_slow(
         }
 
         // Decision: output previous match, literal, or defer.
-        if state.prev_length >= MIN_MATCH
-            && state.match_length <= state.prev_length
-        {
+        if state.prev_length >= MIN_MATCH && state.match_length <= state.prev_length {
             // The previous match is at least as good as the current one —
             // output the previous match.
             let max_insert = state.strstart + state.lookahead - MIN_MATCH;
 
             let dist = state.strstart - 1 - state.prev_match;
-            let bflush = trees::tr_tally_dist(
-                state,
-                dist as u32,
-                state.prev_length as u32,
-            );
+            let bflush = trees::tr_tally_dist(state, dist as u32, state.prev_length as u32);
 
             // Insert hash entries for all strings up to the end of the match.
             // Ported from the C `do { ... } while (--s->prev_length != 0);`
@@ -673,8 +647,7 @@ pub(crate) fn deflate_slow(
             // No better match found — output the previous position as a
             // single literal. Use flush_block_only (not flush_block) to
             // avoid premature exit on full output buffer.
-            let bflush =
-                trees::tr_tally_lit(state, state.window[state.strstart - 1]);
+            let bflush = trees::tr_tally_lit(state, state.window[state.strstart - 1]);
             if bflush {
                 flush_block_only(state, stream, false);
             }
@@ -792,8 +765,7 @@ pub(crate) fn deflate_rle(
 
         // Emit match or literal.
         if state.match_length >= MIN_MATCH {
-            let bflush =
-                trees::tr_tally_dist(state, 1, state.match_length as u32);
+            let bflush = trees::tr_tally_dist(state, 1, state.match_length as u32);
 
             state.lookahead -= state.match_length;
             state.strstart += state.match_length;
@@ -806,8 +778,7 @@ pub(crate) fn deflate_rle(
             }
         } else {
             // No run — output a literal byte.
-            let bflush =
-                trees::tr_tally_lit(state, state.window[state.strstart]);
+            let bflush = trees::tr_tally_lit(state, state.window[state.strstart]);
             state.lookahead -= 1;
             state.strstart += 1;
 
@@ -866,8 +837,7 @@ pub(crate) fn deflate_huff(
 
         // Output every byte as a literal — no matching.
         state.match_length = 0;
-        let bflush =
-            trees::tr_tally_lit(state, state.window[state.strstart]);
+        let bflush = trees::tr_tally_lit(state, state.window[state.strstart]);
         state.lookahead -= 1;
         state.strstart += 1;
 
@@ -893,5 +863,3 @@ pub(crate) fn deflate_huff(
     }
     BlockState::BlockDone
 }
-
-

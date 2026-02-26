@@ -19,7 +19,7 @@
 //! (uncompressed) input. This is a direct port of `gzread.c` (668 lines)
 //! from zlib 1.3.2.1-motley.
 //!
-//! The read pipeline operates in three modes, controlled by [`GzHow`]:
+//! The read pipeline operates in three modes, controlled by `GzHow`:
 //!
 //! - **Look** — Examining input to determine if it's gzip-compressed
 //! - **Copy** — Passing through uncompressed data transparently
@@ -32,8 +32,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 
 use crate::constants::{
-    MAX_WBITS, Z_BUF_ERROR, Z_DATA_ERROR, Z_ERRNO, Z_MEM_ERROR, Z_NO_FLUSH, Z_OK,
-    Z_STREAM_ERROR,
+    MAX_WBITS, Z_BUF_ERROR, Z_DATA_ERROR, Z_ERRNO, Z_MEM_ERROR, Z_NO_FLUSH, Z_OK, Z_STREAM_ERROR,
 };
 use crate::error::ReturnCode;
 use crate::inflate;
@@ -236,16 +235,16 @@ impl GzReader {
     where
         F: FnOnce(&mut inflate::InflateState, &mut ZStream) -> ReturnCode,
     {
-        let mut boxed = self.state.strm.state.take().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "inflate state not initialized")
-        })?;
-        let istate =
-            boxed
-                .downcast_mut::<inflate::InflateState>()
-                .ok_or_else(|| {
-                    // Put state back before returning error
-                    io::Error::new(io::ErrorKind::Other, "invalid inflate state type")
-                })?;
+        let mut boxed =
+            self.state.strm.state.take().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "inflate state not initialized")
+            })?;
+        let istate = boxed
+            .downcast_mut::<inflate::InflateState>()
+            .ok_or_else(|| {
+                // Put state back before returning error
+                io::Error::new(io::ErrorKind::Other, "invalid inflate state type")
+            })?;
         let ret = f(istate, &mut self.state.strm);
         self.state.strm.state = Some(boxed);
         Ok(ret)
@@ -333,8 +332,7 @@ impl GzReader {
                     }
                     Err(e) => {
                         self.state.err = Z_ERRNO;
-                        self.state.msg =
-                            Some(format!("{}: {}", self.state.path, e));
+                        self.state.msg = Some(format!("{}: {}", self.state.path, e));
                         return Err(e);
                     }
                 }
@@ -372,8 +370,7 @@ impl GzReader {
         // or if we're past the first member (junk == 0), go directly to GZIP.
         // Port of gzread.c lines 127–133.
         if self.state.direct == -1 || self.state.junk == 0 {
-            let reset_ret =
-                self.with_inflate(inflate::inflate_reset)?;
+            let reset_ret = self.with_inflate(inflate::inflate_reset)?;
             if reset_ret != ReturnCode::Ok {
                 self.set_error(Z_MEM_ERROR, "out of memory");
                 return Err(self.make_io_error());
@@ -401,8 +398,7 @@ impl GzReader {
             && self.state.input[self.in_pos + 2] == 8
             && self.state.input[self.in_pos + 3] < 32
         {
-            let reset_ret =
-                self.with_inflate(inflate::inflate_reset)?;
+            let reset_ret = self.with_inflate(inflate::inflate_reset)?;
             if reset_ret != ReturnCode::Ok {
                 self.set_error(Z_MEM_ERROR, "out of memory");
                 return Err(self.make_io_error());
@@ -417,8 +413,7 @@ impl GzReader {
         // The output buffer is larger than the input buffer, ensuring
         // there is also room for gzungetc().
         let n = self.in_avail;
-        self.state.output[..n]
-            .copy_from_slice(&self.state.input[self.in_pos..self.in_pos + n]);
+        self.state.output[..n].copy_from_slice(&self.state.input[self.in_pos..self.in_pos + n]);
         self.state.x.next = 0;
         self.state.x.have = n;
         self.in_avail = 0;
@@ -465,14 +460,13 @@ impl GzReader {
             let total_out_before = self.state.strm.total_out;
 
             // Set up ZStream input and output.
-            self.state.strm.set_input(
-                &self.state.input[self.in_pos..self.in_pos + self.in_avail],
-            );
+            self.state
+                .strm
+                .set_input(&self.state.input[self.in_pos..self.in_pos + self.in_avail]);
             self.state.strm.set_output_buffer(out_chunk);
 
             // Call inflate once.
-            last_ret =
-                self.with_inflate(|s, strm| inflate::inflate(s, strm, Z_NO_FLUSH))?;
+            last_ret = self.with_inflate(|s, strm| inflate::inflate(s, strm, Z_NO_FLUSH))?;
 
             // Derive consumed/produced from total deltas.
             let consumed = (self.state.strm.total_in - total_in_before) as usize;
@@ -489,8 +483,7 @@ impl GzReader {
                 let src = self.state.strm.output_written();
                 let real_len = copy_len.min(src.len());
                 if real_len > 0 {
-                    out_buf[written..written + real_len]
-                        .copy_from_slice(&src[..real_len]);
+                    out_buf[written..written + real_len].copy_from_slice(&src[..real_len]);
                     written += real_len;
                 }
                 self.state.junk = 0;
@@ -499,10 +492,7 @@ impl GzReader {
             // Handle inflate return codes.
             match last_ret {
                 ReturnCode::StreamError | ReturnCode::NeedDict => {
-                    self.set_error(
-                        Z_STREAM_ERROR,
-                        "internal error: inflate stream corrupt",
-                    );
+                    self.set_error(Z_STREAM_ERROR, "internal error: inflate stream corrupt");
                     return Err(self.make_io_error());
                 }
                 ReturnCode::MemError => {
@@ -580,8 +570,7 @@ impl GzReader {
                         }
                         Err(e) => {
                             self.state.err = Z_ERRNO;
-                            self.state.msg =
-                                Some(format!("{}: {}", self.state.path, e));
+                            self.state.msg = Some(format!("{}: {}", self.state.path, e));
                             return Err(e);
                         }
                     }
@@ -595,17 +584,14 @@ impl GzReader {
                     // because decomp needs &mut self and &mut output simultaneously.
                     let mut temp = vec![0u8; out_len];
                     let produced = self.decomp(&mut temp)?;
-                    self.state.output[..produced]
-                        .copy_from_slice(&temp[..produced]);
+                    self.state.output[..produced].copy_from_slice(&temp[..produced]);
                     self.state.x.have = produced;
                     self.state.x.next = 0;
                 }
             }
 
             // Loop until we have output or reach EOF with no remaining input
-            if self.state.x.have != 0
-                || (self.state.eof && self.in_avail == 0)
-            {
+            if self.state.x.have != 0 || (self.state.eof && self.in_avail == 0) {
                 break;
             }
         }
@@ -669,8 +655,7 @@ impl GzReader {
             if self.state.x.have > 0 {
                 let n = self.state.x.have.min(remaining);
                 let src_start = self.state.x.next;
-                buf[got..got + n]
-                    .copy_from_slice(&self.state.output[src_start..src_start + n]);
+                buf[got..got + n].copy_from_slice(&self.state.output[src_start..src_start + n]);
                 self.state.x.next += n;
                 self.state.x.have -= n;
                 if self.state.err != Z_OK {
@@ -686,8 +671,7 @@ impl GzReader {
                 break;
             }
             // Third: small read or LOOK mode — buffer through output
-            else if self.state.how == GzHow::Look
-                || remaining < self.state.size.saturating_mul(2)
+            else if self.state.how == GzHow::Look || remaining < self.state.size.saturating_mul(2)
             {
                 match self.fetch() {
                     Ok(()) => {
@@ -723,8 +707,7 @@ impl GzReader {
                     }
                     Err(e) => {
                         self.state.err = Z_ERRNO;
-                        self.state.msg =
-                            Some(format!("{}: {}", self.state.path, e));
+                        self.state.msg = Some(format!("{}: {}", self.state.path, e));
                         had_error = true;
                     }
                 }
@@ -773,10 +756,7 @@ impl Read for GzReader {
         }
 
         // Check that there was no serious error
-        if self.state.err != Z_OK
-            && self.state.err != Z_BUF_ERROR
-            && !self.state.again
-        {
+        if self.state.err != Z_OK && self.state.err != Z_BUF_ERROR && !self.state.again {
             return Err(self.make_io_error());
         }
 
@@ -809,10 +789,7 @@ impl GzReader {
         }
 
         // Check for serious error
-        if self.state.err != Z_OK
-            && self.state.err != Z_BUF_ERROR
-            && !self.state.again
-        {
+        if self.state.err != Z_OK && self.state.err != Z_BUF_ERROR && !self.state.again {
             return Err(self.make_io_error());
         }
         self.clear_error();
@@ -865,10 +842,7 @@ impl GzReader {
         }
 
         // Check for serious error
-        if self.state.err != Z_OK
-            && self.state.err != Z_BUF_ERROR
-            && !self.state.again
-        {
+        if self.state.err != Z_OK && self.state.err != Z_BUF_ERROR && !self.state.again {
             return Err(self.make_io_error());
         }
         self.clear_error();
@@ -948,10 +922,7 @@ impl GzReader {
         }
 
         // Check for serious error
-        if self.state.err != Z_OK
-            && self.state.err != Z_BUF_ERROR
-            && !self.state.again
-        {
+        if self.state.err != Z_OK && self.state.err != Z_BUF_ERROR && !self.state.again {
             return Err(self.make_io_error());
         }
         self.clear_error();
@@ -985,8 +956,7 @@ impl GzReader {
             let src_start = self.state.x.next;
 
             // Look for newline in available output
-            let scan_slice =
-                &self.state.output[src_start..src_start + avail];
+            let scan_slice = &self.state.output[src_start..src_start + avail];
             let n = match scan_slice.iter().position(|&b| b == b'\n') {
                 Some(pos) => {
                     found_eol = true;
@@ -996,8 +966,7 @@ impl GzReader {
             };
 
             // Copy through end-of-line or remainder
-            buf[written..written + n]
-                .copy_from_slice(&self.state.output[src_start..src_start + n]);
+            buf[written..written + n].copy_from_slice(&self.state.output[src_start..src_start + n]);
             self.state.x.have -= n;
             self.state.x.next += n;
             self.state.x.pos += n as i64;
@@ -1107,10 +1076,7 @@ impl GzReader {
             SeekFrom::Current(_) => {
                 let current = self.state.x.pos - self.state.x.have as i64;
                 current.checked_add(offset).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "seek position overflow",
-                    )
+                    io::Error::new(io::ErrorKind::InvalidInput, "seek position overflow")
                 })?
             }
             SeekFrom::End(_) => {
@@ -1222,11 +1188,8 @@ impl Drop for GzReader {
         // Clean up inflate state if it was initialized
         if self.state.size > 0 {
             if let Some(mut boxed) = self.state.strm.state.take() {
-                if let Some(istate) =
-                    boxed.downcast_mut::<inflate::InflateState>()
-                {
-                    let _ =
-                        inflate::inflate_end(istate, &mut self.state.strm);
+                if let Some(istate) = boxed.downcast_mut::<inflate::InflateState>() {
+                    let _ = inflate::inflate_end(istate, &mut self.state.strm);
                 }
                 // Don't put state back — we're dropping
             }

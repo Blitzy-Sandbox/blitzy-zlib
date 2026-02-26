@@ -235,8 +235,7 @@ pub(crate) const DEFLATE_COPYRIGHT: &str =
 /// the inflate module. It matches the C `inflate_copyright[]` array declared
 /// in `zutil.h` line 40 and defined in `inflate.c`.
 #[allow(dead_code)]
-pub(crate) const INFLATE_COPYRIGHT: &str =
-    " inflate 1.3.2.1 Copyright 1995-2026 Mark Adler ";
+pub(crate) const INFLATE_COPYRIGHT: &str = " inflate 1.3.2.1 Copyright 1995-2026 Mark Adler ";
 
 // =============================================================================
 // OS Code Constant

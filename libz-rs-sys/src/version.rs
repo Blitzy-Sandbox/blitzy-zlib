@@ -38,7 +38,7 @@
 
 use libc::{c_char, c_int, c_ulong};
 
-use crate::types::{z_stream, Z_STREAM_ERROR};
+use crate::types::{Z_STREAM_ERROR, z_stream};
 
 // =============================================================================
 // Null-Terminated Error Messages for FFI
@@ -75,16 +75,16 @@ const ERR_SENTINEL: &[u8] = b"\0";
 /// Array of null-terminated error message byte strings, indexed by
 /// `(2 - error_code)` for codes in `[-6, 2]`. Matches the C `z_errmsg[10]`.
 const Z_ERRMSG_FFI: [&[u8]; 10] = [
-    ERR_NEED_DICT,      // index 0 — Z_NEED_DICT       (2)
-    ERR_STREAM_END,     // index 1 — Z_STREAM_END      (1)
-    ERR_OK,             // index 2 — Z_OK              (0)
-    ERR_ERRNO,          // index 3 — Z_ERRNO         (-1)
-    ERR_STREAM_ERROR,   // index 4 — Z_STREAM_ERROR  (-2)
-    ERR_DATA_ERROR,     // index 5 — Z_DATA_ERROR    (-3)
-    ERR_MEM_ERROR,      // index 6 — Z_MEM_ERROR     (-4)
-    ERR_BUF_ERROR,      // index 7 — Z_BUF_ERROR     (-5)
-    ERR_VERSION_ERROR,  // index 8 — Z_VERSION_ERROR (-6)
-    ERR_SENTINEL,       // index 9 — sentinel (out of range)
+    ERR_NEED_DICT,     // index 0 — Z_NEED_DICT       (2)
+    ERR_STREAM_END,    // index 1 — Z_STREAM_END      (1)
+    ERR_OK,            // index 2 — Z_OK              (0)
+    ERR_ERRNO,         // index 3 — Z_ERRNO         (-1)
+    ERR_STREAM_ERROR,  // index 4 — Z_STREAM_ERROR  (-2)
+    ERR_DATA_ERROR,    // index 5 — Z_DATA_ERROR    (-3)
+    ERR_MEM_ERROR,     // index 6 — Z_MEM_ERROR     (-4)
+    ERR_BUF_ERROR,     // index 7 — Z_BUF_ERROR     (-5)
+    ERR_VERSION_ERROR, // index 8 — Z_VERSION_ERROR (-6)
+    ERR_SENTINEL,      // index 9 — sentinel (out of range)
 ];
 
 // =============================================================================
@@ -116,7 +116,9 @@ fn err_msg_ptr(err: c_int) -> *const c_char {
     let index = if (-6..=2).contains(&err) {
         // `(2 - err)` is in [0, 8] since err is in [-6, 2].
         #[allow(clippy::cast_sign_loss)]
-        { (2 - err) as usize }
+        {
+            (2 - err) as usize
+        }
     } else {
         9 // sentinel for out-of-range
     };
@@ -145,7 +147,7 @@ unsafe fn get_inflate_state_mut<'a>(
     if state_ptr.is_null() {
         return None;
     }
-    Some(unsafe { &mut *(state_ptr as *mut zlib_rs::inflate::InflateState) })
+    Some(unsafe { &mut *(state_ptr.cast::<zlib_rs::inflate::InflateState>()) })
 }
 
 /// Extract an immutable reference to the [`InflateState`] stored in
@@ -183,7 +185,7 @@ unsafe fn get_deflate_stream_mut<'a>(
     if state_ptr.is_null() {
         return None;
     }
-    Some(unsafe { &mut *(state_ptr as *mut zlib_rs::stream::ZStream) })
+    Some(unsafe { &mut *(state_ptr.cast::<zlib_rs::stream::ZStream>()) })
 }
 
 /// Build a temporary [`ZStream`] from the scalar fields of a C
@@ -201,7 +203,11 @@ unsafe fn build_rust_stream(strm: *const z_stream) -> zlib_rs::stream::ZStream {
     let mut rs = zlib_rs::stream::ZStream::new();
     rs.total_in = strm_ref.total_in;
     rs.total_out = strm_ref.total_out;
-    rs.adler = strm_ref.adler as u32;
+    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_lossless)]
+    {
+        rs.adler = strm_ref.adler as u32;
+    }
     rs.data_type = strm_ref.data_type;
     rs
 }
@@ -215,10 +221,7 @@ unsafe fn build_rust_stream(strm: *const z_stream) -> zlib_rs::stream::ZStream {
 /// `strm` must be a valid, non-null pointer.
 #[inline]
 #[allow(clippy::cast_lossless)]
-unsafe fn sync_inflate_to_c(
-    strm: *mut z_stream,
-    rust_stream: &zlib_rs::stream::ZStream,
-) {
+unsafe fn sync_inflate_to_c(strm: *mut z_stream, rust_stream: &zlib_rs::stream::ZStream) {
     let s = unsafe { &mut *strm };
     s.total_in = rust_stream.total_in as c_ulong;
     s.total_out = rust_stream.total_out as c_ulong;
@@ -242,10 +245,7 @@ unsafe fn sync_inflate_to_c(
 /// `strm` must be a valid, non-null pointer.
 #[inline]
 #[allow(clippy::cast_lossless)]
-unsafe fn sync_deflate_to_c(
-    strm: *mut z_stream,
-    rust_stream: &zlib_rs::stream::ZStream,
-) {
+unsafe fn sync_deflate_to_c(strm: *mut z_stream, rust_stream: &zlib_rs::stream::ZStream) {
     let s = unsafe { &mut *strm };
     s.total_in = rust_stream.total_in as c_ulong;
     s.total_out = rust_stream.total_out as c_ulong;
@@ -271,7 +271,7 @@ unsafe fn sync_deflate_to_c(
 /// zlib version identifier `"1.3.2.1-motley"` (matching `ZLIB_VERSION` from
 /// `zlib.h` line 44).
 ///
-/// The safe Rust core function [`zlib_rs::util::zlib_version`] returns a
+/// The safe Rust core function [`zlib_rs::zlib_version`] returns a
 /// `&'static str`; this FFI wrapper returns the equivalent null-terminated
 /// byte string as `*const c_char` for C callers.
 ///
@@ -294,7 +294,7 @@ pub extern "C" fn zlibVersion() -> *const c_char {
 
 /// Return compile-time configuration flags as a bit field.
 ///
-/// Delegates to [`zlib_rs::util::zlib_compile_flags`] which encodes type sizes
+/// Delegates to [`zlib_rs::zlib_compile_flags`] which encodes type sizes
 /// (bits 0–7) and feature flags (bits 8–31) in the returned value. See the
 /// core function documentation for the complete bit layout.
 ///
@@ -324,7 +324,7 @@ pub extern "C" fn zlibCompileFlags() -> c_ulong {
 /// to `Z_NEED_DICT` (2). Out-of-range codes yield an empty string.
 ///
 /// This is the FFI equivalent of the safe Rust
-/// [`zlib_rs::util::err_msg`] function, returning a C-compatible
+/// `zlib_rs::err_msg` function, returning a C-compatible
 /// null-terminated string instead of a Rust `&str`.
 ///
 /// C signature (`zlib.h` line 2033):
@@ -391,9 +391,8 @@ pub unsafe extern "C" fn inflateSyncPoint(strm: *mut z_stream) -> c_int {
         return Z_STREAM_ERROR;
     }
 
-    let state = match unsafe { get_inflate_state_ref(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(state) = (unsafe { get_inflate_state_ref(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     // inflate_sync_point returns bool; C API returns int (non-zero = true).
@@ -419,17 +418,13 @@ pub unsafe extern "C" fn inflateSyncPoint(strm: *mut z_stream) -> c_int {
 /// `z_stream`, or null (returns `Z_STREAM_ERROR`).
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
-pub unsafe extern "C" fn inflateUndermine(
-    strm: *mut z_stream,
-    subvert: c_int,
-) -> c_int {
+pub unsafe extern "C" fn inflateUndermine(strm: *mut z_stream, subvert: c_int) -> c_int {
     if strm.is_null() {
         return Z_STREAM_ERROR;
     }
 
-    let state = match unsafe { get_inflate_state_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(state) = (unsafe { get_inflate_state_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     let ret = zlib_rs::inflate::inflate_undermine(state, subvert != 0);
@@ -455,17 +450,13 @@ pub unsafe extern "C" fn inflateUndermine(
 /// `z_stream`, or null (returns `Z_STREAM_ERROR`).
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
-pub unsafe extern "C" fn inflateValidate(
-    strm: *mut z_stream,
-    check: c_int,
-) -> c_int {
+pub unsafe extern "C" fn inflateValidate(strm: *mut z_stream, check: c_int) -> c_int {
     if strm.is_null() {
         return Z_STREAM_ERROR;
     }
 
-    let state = match unsafe { get_inflate_state_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(state) = (unsafe { get_inflate_state_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     let ret = zlib_rs::inflate::inflate_validate(state, check != 0);
@@ -494,9 +485,8 @@ pub unsafe extern "C" fn inflateCodesUsed(strm: *mut z_stream) -> c_ulong {
         return Z_STREAM_ERROR as c_ulong;
     }
 
-    let state = match unsafe { get_inflate_state_ref(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR as c_ulong,
+    let Some(state) = (unsafe { get_inflate_state_ref(strm) }) else {
+        return Z_STREAM_ERROR as c_ulong;
     };
 
     zlib_rs::inflate::inflate_codes_used(state) as c_ulong
@@ -531,9 +521,8 @@ pub unsafe extern "C" fn inflateResetKeep(strm: *mut z_stream) -> c_int {
         return Z_STREAM_ERROR;
     }
 
-    let state = match unsafe { get_inflate_state_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(state) = (unsafe { get_inflate_state_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     // Build a temporary Rust ZStream from the C z_stream scalar fields.
@@ -572,9 +561,8 @@ pub unsafe extern "C" fn deflateResetKeep(strm: *mut z_stream) -> c_int {
         return Z_STREAM_ERROR;
     }
 
-    let rs = match unsafe { get_deflate_stream_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(rs) = (unsafe { get_deflate_stream_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     let ret = zlib_rs::deflate::deflate_reset_keep(rs);

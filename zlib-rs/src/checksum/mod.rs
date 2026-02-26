@@ -17,11 +17,11 @@
 //! The checksum functionality is split into two submodules, each ported from the
 //! corresponding C source file:
 //!
-//! - [`adler32`] — Ported from `adler32.c`. Provides [`adler32::adler32`],
-//!   [`adler32::adler32_z`], and [`adler32::adler32_combine`].
-//! - [`crc32`] — Ported from `crc32.c` and `crc32.h`. Provides [`crc32::crc32`],
-//!   [`crc32::crc32_z`], [`crc32::crc32_combine`], [`crc32::crc32_combine_op`],
-//!   [`crc32::crc32_combine_gen`], and [`crc32::get_crc_table`].
+//! - `adler32` — Ported from `adler32.c`. Provides `adler32`,
+//!   `adler32_z`, and `adler32_combine`.
+//! - `crc32` — Ported from `crc32.c` and `crc32.h`. Provides `crc32`,
+//!   `crc32_z`, `crc32_combine`, `crc32_combine_op`,
+//!   `crc32_combine_gen`, and `get_crc_table`.
 //!
 //! Primary functions are re-exported at this module level for convenience, so
 //! callers may use either `checksum::adler32::adler32(...)` or the fully
@@ -35,9 +35,9 @@
 ///
 /// # Key Functions
 ///
-/// - [`adler32::adler32`] — Compute/update an Adler-32 checksum (convenience alias).
-/// - [`adler32::adler32_z`] — Compute/update an Adler-32 checksum (size-typed).
-/// - [`adler32::adler32_combine`] — Combine two Adler-32 checksums algebraically.
+/// - `adler32` — Compute/update an Adler-32 checksum (convenience alias).
+/// - `adler32_z` — Compute/update an Adler-32 checksum (size-typed).
+/// - `adler32_combine` — Combine two Adler-32 checksums algebraically.
 pub mod adler32;
 
 /// CRC-32 checksum engine.
@@ -48,12 +48,12 @@ pub mod adler32;
 ///
 /// # Key Functions
 ///
-/// - [`crc32::crc32`] — Compute/update a CRC-32 checksum (convenience alias).
-/// - [`crc32::crc32_z`] — Compute/update a CRC-32 checksum (size-typed).
-/// - [`crc32::crc32_combine`] — Combine two CRC-32 checksums for concatenated data.
-/// - [`crc32::crc32_combine_op`] — Combine CRC-32 values using a pre-computed operator.
-/// - [`crc32::crc32_combine_gen`] — Pre-compute an operator for CRC-32 combination.
-/// - [`crc32::get_crc_table`] — Obtain a reference to the CRC-32 lookup table.
+/// - `crc32` — Compute/update a CRC-32 checksum (convenience alias).
+/// - `crc32_z` — Compute/update a CRC-32 checksum (size-typed).
+/// - `crc32_combine` — Combine two CRC-32 checksums for concatenated data.
+/// - `crc32_combine_op` — Combine CRC-32 values using a pre-computed operator.
+/// - `crc32_combine_gen` — Pre-compute an operator for CRC-32 combination.
+/// - `get_crc_table` — Obtain a reference to the CRC-32 lookup table.
 pub mod crc32;
 
 // ---------------------------------------------------------------------------
@@ -73,31 +73,31 @@ pub mod crc32;
 
 // -- Adler-32 re-exports --
 
-/// Re-export of [`adler32::adler32`] for convenient access.
+/// Re-export of `adler32::adler32` for convenient access.
 pub use adler32::adler32;
 
-/// Re-export of [`adler32::adler32_z`] for convenient access.
+/// Re-export of `adler32::adler32_z` for convenient access.
 pub use adler32::adler32_z;
 
-/// Re-export of [`adler32::adler32_combine`] for convenient access.
+/// Re-export of `adler32::adler32_combine` for convenient access.
 pub use adler32::adler32_combine;
 
 // -- CRC-32 re-exports --
 
-/// Re-export of [`crc32::crc32`] for convenient access.
+/// Re-export of `crc32::crc32` for convenient access.
 pub use crc32::crc32;
 
-/// Re-export of [`crc32::crc32_z`] for convenient access.
+/// Re-export of `crc32::crc32_z` for convenient access.
 pub use crc32::crc32_z;
 
-/// Re-export of [`crc32::crc32_combine`] for convenient access.
+/// Re-export of `crc32::crc32_combine` for convenient access.
 pub use crc32::crc32_combine;
 
-/// Re-export of [`crc32::crc32_combine_op`] for convenient access.
+/// Re-export of `crc32::crc32_combine_op` for convenient access.
 pub use crc32::crc32_combine_op;
 
-/// Re-export of [`crc32::crc32_combine_gen`] for convenient access.
+/// Re-export of `crc32::crc32_combine_gen` for convenient access.
 pub use crc32::crc32_combine_gen;
 
-/// Re-export of [`crc32::get_crc_table`] for convenient access.
+/// Re-export of `crc32::get_crc_table` for convenient access.
 pub use crc32::get_crc_table;

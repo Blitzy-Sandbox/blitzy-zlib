@@ -8,9 +8,9 @@
 //!
 //! The inflate engine processes DEFLATE-compressed data (RFC 1951) optionally
 //! wrapped in zlib (RFC 1950) or gzip (RFC 1952) headers/trailers. The core
-//! state machine in [`inflate()`] drives decompression through 32 modes,
-//! dispatching to [`inflate_fast()`](fast::inflate_fast) for performance-critical
-//! inner loops and [`inflate_table()`](table::inflate_table) for Huffman table
+//! state machine in `inflate()` drives decompression through 32 modes,
+//! dispatching to `inflate_fast()` for performance-critical
+//! inner loops and `inflate_table()` for Huffman table
 //! construction.
 //!
 //! # Safety
@@ -42,9 +42,9 @@ use crate::checksum::adler32::adler32;
 use crate::checksum::crc32::crc32;
 #[allow(unused_imports)]
 use crate::constants::{
-    DEF_WBITS, MAX_MATCH, MAX_WBITS, PRESET_DICT, Z_BINARY, Z_BLOCK, Z_BUF_ERROR,
-    Z_DATA_ERROR, Z_DEFLATED, Z_FINISH, Z_MEM_ERROR, Z_NEED_DICT, Z_NO_FLUSH, Z_NULL, Z_OK,
-    Z_STREAM_END, Z_STREAM_ERROR, Z_TEXT, Z_TREES, Z_UNKNOWN, Z_VERSION_ERROR,
+    DEF_WBITS, MAX_MATCH, MAX_WBITS, PRESET_DICT, Z_BINARY, Z_BLOCK, Z_BUF_ERROR, Z_DATA_ERROR,
+    Z_DEFLATED, Z_FINISH, Z_MEM_ERROR, Z_NEED_DICT, Z_NO_FLUSH, Z_NULL, Z_OK, Z_STREAM_END,
+    Z_STREAM_ERROR, Z_TEXT, Z_TREES, Z_UNKNOWN, Z_VERSION_ERROR,
 };
 use crate::error::ReturnCode;
 use crate::stream::{GzHeader, ZStream};
@@ -517,7 +517,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                 }
                 // NEEDBITS(16)
                 while bits < 16 {
-                    if have == 0 { break 'inf_loop; }
+                    if have == 0 {
+                        break 'inf_loop;
+                    }
                     have -= 1;
                     hold += u64::from(input[next]) << bits;
                     next += 1;
@@ -578,7 +580,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
             InflateMode::Flags => {
                 // NEEDBITS(16)
                 while bits < 16 {
-                    if have == 0 { break 'inf_loop; }
+                    if have == 0 {
+                        break 'inf_loop;
+                    }
                     have -= 1;
                     hold += u64::from(input[next]) << bits;
                     next += 1;
@@ -610,7 +614,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
             InflateMode::Time => {
                 // NEEDBITS(32)
                 while bits < 32 {
-                    if have == 0 { break 'inf_loop; }
+                    if have == 0 {
+                        break 'inf_loop;
+                    }
                     have -= 1;
                     hold += u64::from(input[next]) << bits;
                     next += 1;
@@ -631,7 +637,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
             InflateMode::Os => {
                 // NEEDBITS(16)
                 while bits < 16 {
-                    if have == 0 { break 'inf_loop; }
+                    if have == 0 {
+                        break 'inf_loop;
+                    }
                     have -= 1;
                     hold += u64::from(input[next]) << bits;
                     next += 1;
@@ -654,7 +662,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                 if state.flags & 0x0400 != 0 {
                     // NEEDBITS(16)
                     while bits < 16 {
-                        if have == 0 { break 'inf_loop; }
+                        if have == 0 {
+                            break 'inf_loop;
+                        }
                         have -= 1;
                         hold += u64::from(input[next]) << bits;
                         next += 1;
@@ -730,8 +740,7 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                         }
                     }
                     if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
-                        state.check =
-                            crc32(state.check as u32, &input[next..next + copy]) as u64;
+                        state.check = crc32(state.check as u32, &input[next..next + copy]) as u64;
                     }
                     have -= copy;
                     next += copy;
@@ -769,8 +778,7 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                         }
                     }
                     if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
-                        state.check =
-                            crc32(state.check as u32, &input[next..next + copy]) as u64;
+                        state.check = crc32(state.check as u32, &input[next..next + copy]) as u64;
                     }
                     have -= copy;
                     next += copy;
@@ -789,15 +797,15 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                 if state.flags & 0x0200 != 0 {
                     // NEEDBITS(16)
                     while bits < 16 {
-                        if have == 0 { break 'inf_loop; }
+                        if have == 0 {
+                            break 'inf_loop;
+                        }
                         have -= 1;
                         hold += u64::from(input[next]) << bits;
                         next += 1;
                         bits += 8;
                     }
-                    if (state.wrap & 4) != 0
-                        && (hold as u32) != (state.check as u32 & 0xffff)
-                    {
+                    if (state.wrap & 4) != 0 && (hold as u32) != (state.check as u32 & 0xffff) {
                         stream.msg = Some("header crc mismatch");
                         state.mode = InflateMode::Bad;
                         continue 'inf_loop;
@@ -818,7 +826,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
             InflateMode::DictId => {
                 // NEEDBITS(32)
                 while bits < 32 {
-                    if have == 0 { break 'inf_loop; }
+                    if have == 0 {
+                        break 'inf_loop;
+                    }
                     have -= 1;
                     hold += u64::from(input[next]) << bits;
                     next += 1;
@@ -874,7 +884,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                 }
                 // NEEDBITS(3)
                 while bits < 3 {
-                    if have == 0 { break 'inf_loop; }
+                    if have == 0 {
+                        break 'inf_loop;
+                    }
                     have -= 1;
                     hold += u64::from(input[next]) << bits;
                     next += 1;
@@ -918,7 +930,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                 bits -= bits & 7;
                 // NEEDBITS(32)
                 while bits < 32 {
-                    if have == 0 { break 'inf_loop; }
+                    if have == 0 {
+                        break 'inf_loop;
+                    }
                     have -= 1;
                     hold += u64::from(input[next]) << bits;
                     next += 1;
@@ -947,9 +961,15 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
             InflateMode::Copy => {
                 let mut copy = state.length as usize;
                 if copy > 0 {
-                    if copy > have { copy = have; }
-                    if copy > left { copy = left; }
-                    if copy == 0 { break 'inf_loop; }
+                    if copy > have {
+                        copy = have;
+                    }
+                    if copy > left {
+                        copy = left;
+                    }
+                    if copy == 0 {
+                        break 'inf_loop;
+                    }
                     output_buf[put..put + copy].copy_from_slice(&input[next..next + copy]);
                     have -= copy;
                     next += copy;
@@ -965,7 +985,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
             InflateMode::Table => {
                 // NEEDBITS(14)
                 while bits < 14 {
-                    if have == 0 { break 'inf_loop; }
+                    if have == 0 {
+                        break 'inf_loop;
+                    }
                     have -= 1;
                     hold += u64::from(input[next]) << bits;
                     next += 1;
@@ -994,7 +1016,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                 while state.have < state.ncode {
                     // NEEDBITS(3)
                     while bits < 3 {
-                        if have == 0 { break 'inf_loop; }
+                        if have == 0 {
+                            break 'inf_loop;
+                        }
                         have -= 1;
                         hold += u64::from(input[next]) << bits;
                         next += 1;
@@ -1037,9 +1061,7 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                 'codelens: while state.have < state.nlen + state.ndist {
                     // Decode one code length
                     loop {
-                        let here = state.len_code(
-                            bits_val(hold, state.lenbits),
-                        );
+                        let here = state.len_code(bits_val(hold, state.lenbits));
                         if u32::from(here.bits) <= bits {
                             // Got enough bits for this code
                             if here.val < 16 {
@@ -1053,7 +1075,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                                     let need = u32::from(here.bits) + 2;
                                     // NEEDBITS(here.bits + 2)
                                     while bits < need {
-                                        if have == 0 { break 'inf_loop; }
+                                        if have == 0 {
+                                            break 'inf_loop;
+                                        }
                                         have -= 1;
                                         hold += u64::from(input[next]) << bits;
                                         next += 1;
@@ -1073,7 +1097,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                                 } else if here.val == 17 {
                                     let need = u32::from(here.bits) + 3;
                                     while bits < need {
-                                        if have == 0 { break 'inf_loop; }
+                                        if have == 0 {
+                                            break 'inf_loop;
+                                        }
                                         have -= 1;
                                         hold += u64::from(input[next]) << bits;
                                         next += 1;
@@ -1089,7 +1115,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                                     // here.val == 18
                                     let need = u32::from(here.bits) + 7;
                                     while bits < need {
-                                        if have == 0 { break 'inf_loop; }
+                                        if have == 0 {
+                                            break 'inf_loop;
+                                        }
                                         have -= 1;
                                         hold += u64::from(input[next]) << bits;
                                         next += 1;
@@ -1115,7 +1143,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                             break; // continue to next code length in 'codelens
                         }
                         // PULLBYTE
-                        if have == 0 { break 'inf_loop; }
+                        if have == 0 {
+                            break 'inf_loop;
+                        }
                         have -= 1;
                         hold += u64::from(input[next]) << bits;
                         next += 1;
@@ -1164,7 +1194,8 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                 // Need to pass the lens slice starting from nlen
                 // Build a temporary slice for distance lens
                 let dist_result = {
-                    let lens_copy: Vec<u16> = state.lens[dist_lens_start..dist_lens_start + dist_codes].to_vec();
+                    let lens_copy: Vec<u16> =
+                        state.lens[dist_lens_start..dist_lens_start + dist_codes].to_vec();
                     inflate_table(
                         CodeType::Dists,
                         &lens_copy,
@@ -1268,7 +1299,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                     if u32::from(here.bits) <= bits {
                         break;
                     }
-                    if have == 0 { break 'inf_loop; }
+                    if have == 0 {
+                        break 'inf_loop;
+                    }
                     have -= 1;
                     hold += u64::from(input[next]) << bits;
                     next += 1;
@@ -1309,7 +1342,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                             state.mode = InflateMode::LenExt;
                             continue 'inf_loop;
                         }
-                        if have == 0 { break 'inf_loop; }
+                        if have == 0 {
+                            break 'inf_loop;
+                        }
                         have -= 1;
                         hold += u64::from(input[next]) << bits;
                         next += 1;
@@ -1344,7 +1379,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                 if state.extra != 0 {
                     // NEEDBITS(state.extra)
                     while bits < state.extra {
-                        if have == 0 { break 'inf_loop; }
+                        if have == 0 {
+                            break 'inf_loop;
+                        }
                         have -= 1;
                         hold += u64::from(input[next]) << bits;
                         next += 1;
@@ -1390,7 +1427,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                                     state.mode = InflateMode::DistExt;
                                     break;
                                 }
-                                if have == 0 { break 'inf_loop; }
+                                if have == 0 {
+                                    break 'inf_loop;
+                                }
                                 have -= 1;
                                 hold += u64::from(input[next]) << bits;
                                 next += 1;
@@ -1415,7 +1454,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                         }
                         break;
                     }
-                    if have == 0 { break 'inf_loop; }
+                    if have == 0 {
+                        break 'inf_loop;
+                    }
                     have -= 1;
                     hold += u64::from(input[next]) << bits;
                     next += 1;
@@ -1430,7 +1471,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
             InflateMode::DistExt => {
                 if state.extra != 0 {
                     while bits < state.extra {
-                        if have == 0 { break 'inf_loop; }
+                        if have == 0 {
+                            break 'inf_loop;
+                        }
                         have -= 1;
                         hold += u64::from(input[next]) << bits;
                         next += 1;
@@ -1522,7 +1565,9 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                 if state.wrap != 0 {
                     // NEEDBITS(32)
                     while bits < 32 {
-                        if have == 0 { break 'inf_loop; }
+                        if have == 0 {
+                            break 'inf_loop;
+                        }
                         have -= 1;
                         hold += u64::from(input[next]) << bits;
                         next += 1;
@@ -1566,14 +1611,15 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
                 if state.wrap != 0 && state.flags != 0 {
                     // NEEDBITS(32) for gzip length
                     while bits < 32 {
-                        if have == 0 { break 'inf_loop; }
+                        if have == 0 {
+                            break 'inf_loop;
+                        }
                         have -= 1;
                         hold += u64::from(input[next]) << bits;
                         next += 1;
                         bits += 8;
                     }
-                    if (state.wrap & 4) != 0
-                        && (hold as u32) != (state.total as u32 & 0xffff_ffff)
+                    if (state.wrap & 4) != 0 && (hold as u32) != (state.total as u32 & 0xffff_ffff)
                     {
                         stream.msg = Some("incorrect length check");
                         state.mode = InflateMode::Bad;
@@ -1631,8 +1677,10 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
     if state.wsize > 0
         || (out_produced > 0
             && !matches!(state.mode, InflateMode::Bad | InflateMode::Mem)
-            && (!matches!(state.mode, InflateMode::Check | InflateMode::Length | InflateMode::Done)
-                || flush != Z_FINISH))
+            && (!matches!(
+                state.mode,
+                InflateMode::Check | InflateMode::Length | InflateMode::Done
+            ) || flush != Z_FINISH))
     {
         if out_produced > 0 {
             let end_data = &output_buf[..put];
@@ -1660,7 +1708,11 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
     // Set data_type
     stream.data_type = (state.bits as i32)
         + (if state.last { 64 } else { 0 })
-        + (if state.mode == InflateMode::Type { 128 } else { 0 })
+        + (if state.mode == InflateMode::Type {
+            128
+        } else {
+            0
+        })
         + (if state.mode == InflateMode::Len_ || state.mode == InflateMode::Copy_ {
             256
         } else {
@@ -1672,9 +1724,7 @@ pub fn inflate(state: &mut InflateState, stream: &mut ZStream, flush: i32) -> Re
     // line 1150:
     //   if (((in == 0 && out == 0) || flush == Z_FINISH) && ret == Z_OK)
     //       ret = Z_BUF_ERROR;
-    if ((in_consumed == 0 && out_done == 0) || flush == Z_FINISH)
-        && ret == ReturnCode::Ok
-    {
+    if ((in_consumed == 0 && out_done == 0) || flush == Z_FINISH) && ret == ReturnCode::Ok {
         ret = ReturnCode::BufError;
     }
 
@@ -1725,10 +1775,7 @@ pub fn inflate_end(state: &mut InflateState, stream: &mut ZStream) -> ReturnCode
 ///
 /// A tuple of (`ReturnCode`, `bytes_written`). The dictionary bytes are copied
 /// into the provided buffer. Returns [`ReturnCode::StreamError`] if state is invalid.
-pub fn inflate_get_dictionary(
-    state: &InflateState,
-    dictionary: &mut [u8],
-) -> (ReturnCode, usize) {
+pub fn inflate_get_dictionary(state: &InflateState, dictionary: &mut [u8]) -> (ReturnCode, usize) {
     // Validate state
     if state.mode == InflateMode::Mem {
         return (ReturnCode::StreamError, 0);

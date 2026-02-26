@@ -9,10 +9,10 @@
 //!
 //! The library offers three levels of API:
 //!
-//! - **One-call functions** — [`compress`], [`compress2`], [`uncompress`], and
+//! - **One-call functions** — [`compress()`](fn@compress), [`compress2`], [`uncompress`], and
 //!   [`uncompress2`] handle complete compression or decompression in a single
 //!   call.
-//! - **Streaming API** — [`ZStream`] paired with the [`deflate`] and [`inflate`]
+//! - **Streaming API** — [`ZStream`] paired with the [`deflate`](mod@deflate) and [`inflate`](mod@inflate)
 //!   modules provides incremental compression and decompression for large or
 //!   unbounded data.
 //! - **Gzip file I/O** — The [`gz`] module (enabled by the `gz-io` feature)
@@ -20,8 +20,8 @@
 //!
 //! Two checksum algorithms are provided for data integrity:
 //!
-//! - [`adler32`] — Adler-32 checksum used by the zlib format.
-//! - [`crc32`] — CRC-32 checksum used by the gzip format.
+//! - [`adler32()`](fn@adler32) — Adler-32 checksum used by the zlib format.
+//! - [`crc32()`](fn@crc32) — CRC-32 checksum used by the gzip format.
 //!
 //! # Safety
 //!
@@ -84,7 +84,7 @@
 //! | [`constants`] | Version info, flush modes, strategies, limits |
 //! | [`deflate`] | DEFLATE compression engine |
 //! | [`inflate`] | DEFLATE decompression engine |
-//! | [`compress`](self::compress) | One-call compress/uncompress wrappers |
+//! | [`compress`](mod@compress) | One-call compress/uncompress wrappers |
 //! | [`checksum`] | Adler-32 and CRC-32 checksum engines |
 //! | [`gz`] | Gzip file I/O (requires `gz-io` feature) |
 //!
@@ -234,7 +234,7 @@ pub use gz::write::GzWriter;
 // Convenience functions for single-call compression and decompression,
 // re-exported from the `compress` module.
 
-pub use self::compress::{compress, compress2, compress_bound, uncompress, uncompress2};
+pub use self::compress::{compress, compress_bound, compress2, uncompress, uncompress2};
 
 // ─── Checksum Function Re-exports ───────────────────────────────────────────
 //

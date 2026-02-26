@@ -193,14 +193,12 @@ fn file_compress(prog: &str, file: &str, mode: &str) -> io::Result<()> {
         error(prog, "filename too long");
     }
 
-    let input_file = fs::File::open(file).map_err(|e| {
-        io::Error::new(e.kind(), format!("{file}: {e}"))
-    })?;
+    let input_file =
+        fs::File::open(file).map_err(|e| io::Error::new(e.kind(), format!("{file}: {e}")))?;
     let mut input = BufReader::new(input_file);
 
-    let output = create_gz_writer(&outfile, mode).map_err(|e| {
-        io::Error::new(e.kind(), format!("can't gzopen {outfile}: {e}"))
-    })?;
+    let output = create_gz_writer(&outfile, mode)
+        .map_err(|e| io::Error::new(e.kind(), format!("can't gzopen {outfile}: {e}")))?;
 
     gz_compress(&mut input, output)?;
 
@@ -218,8 +216,7 @@ fn file_compress(prog: &str, file: &str, mode: &str) -> io::Result<()> {
 ///
 /// Port of `file_uncompress()` from `minigzip.c` lines 454‒492.
 fn file_uncompress(prog: &str, file: &str) -> io::Result<()> {
-    let (infile, outfile) = if file.ends_with(GZ_SUFFIX) {
-        let out = &file[..file.len() - GZ_SUFFIX.len()];
+    let (infile, outfile) = if let Some(out) = file.strip_suffix(GZ_SUFFIX) {
         (file.to_string(), out.to_string())
     } else {
         let inf = format!("{file}{GZ_SUFFIX}");
@@ -230,13 +227,11 @@ fn file_uncompress(prog: &str, file: &str) -> io::Result<()> {
         error(prog, "filename too long");
     }
 
-    let input = GzReader::open(&infile).map_err(|e| {
-        io::Error::new(e.kind(), format!("can't gzopen {infile}: {e}"))
-    })?;
+    let input = GzReader::open(&infile)
+        .map_err(|e| io::Error::new(e.kind(), format!("can't gzopen {infile}: {e}")))?;
 
-    let output_file = fs::File::create(&outfile).map_err(|e| {
-        io::Error::new(e.kind(), format!("{outfile}: {e}"))
-    })?;
+    let output_file = fs::File::create(&outfile)
+        .map_err(|e| io::Error::new(e.kind(), format!("{outfile}: {e}")))?;
     let mut output = BufWriter::new(output_file);
 
     gz_uncompress(input, &mut output)?;
@@ -333,12 +328,10 @@ fn pipe_decompress(prog: &str) -> io::Result<()> {
     // Uses GzReader::from_file() (the fd-based open equivalent) since the
     // file was just created by us and we already have the path.
     let decompress_result = (|| -> io::Result<()> {
-        let file = fs::File::open(&tmp_gz).map_err(|e| {
-            io::Error::new(e.kind(), format!("{prog}: can't gzopen temp: {e}"))
-        })?;
-        let reader = GzReader::from_file(file).map_err(|e| {
-            io::Error::new(e.kind(), format!("{prog}: can't gzopen temp: {e}"))
-        })?;
+        let file = fs::File::open(&tmp_gz)
+            .map_err(|e| io::Error::new(e.kind(), format!("{prog}: can't gzopen temp: {e}")))?;
+        let reader = GzReader::from_file(file)
+            .map_err(|e| io::Error::new(e.kind(), format!("{prog}: can't gzopen temp: {e}")))?;
         let mut stdout_handle = io::stdout().lock();
         gz_uncompress(reader, &mut stdout_handle)
     })();
@@ -372,12 +365,8 @@ fn copyout_compress(prog: &str, path: &str, mode: &str) -> io::Result<()> {
     let compress_result = (|| -> io::Result<()> {
         let tmp_gz_str = path_to_str(&tmp_gz)?;
         let mut input = BufReader::new(input_file);
-        let output = GzWriter::open_with_mode(tmp_gz_str, mode).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("{prog}: can't create temp gz: {e}"),
-            )
-        })?;
+        let output = GzWriter::open_with_mode(tmp_gz_str, mode)
+            .map_err(|e| io::Error::new(e.kind(), format!("{prog}: can't create temp gz: {e}")))?;
         gz_compress(&mut input, output)
     })();
 
@@ -400,14 +389,11 @@ fn copyout_compress(prog: &str, path: &str, mode: &str) -> io::Result<()> {
 /// output goes to `stdout` instead of a file, and the `.gz` file is **not**
 /// deleted (matching the C `minigzip` behaviour).
 fn copyout_decompress(prog: &str, path: &str) -> io::Result<()> {
-    let reader = match GzReader::open(path) {
-        Ok(r) => r,
-        Err(_) => {
-            // Non‑fatal: print error and skip this file (matches C behaviour
-            // where copyout decompress prints fprintf and continues).
-            eprintln!("{prog}: can't gzopen {path}");
-            return Ok(());
-        }
+    let Ok(reader) = GzReader::open(path) else {
+        // Non‑fatal: print error and skip this file (matches C behaviour
+        // where copyout decompress prints fprintf and continues).
+        eprintln!("{prog}: can't gzopen {path}");
+        return Ok(());
     };
 
     let mut stdout_handle = io::stdout().lock();
@@ -462,11 +448,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "-f" => strategy = Some('f'),
             "-h" => strategy = Some('h'),
             "-r" => strategy = Some('R'),
-            _ if bytes.len() == 2
-                && bytes[0] == b'-'
-                && bytes[1] >= b'1'
-                && bytes[1] <= b'9' =>
-            {
+            _ if bytes.len() == 2 && bytes[0] == b'-' && bytes[1] >= b'1' && bytes[1] <= b'9' => {
                 level = bytes[1] - b'0';
             }
             _ => break,

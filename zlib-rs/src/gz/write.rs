@@ -2,8 +2,8 @@
 //!
 //! This module provides [`GzWriter`], a buffered gzip writer that compresses
 //! data on the fly using the DEFLATE algorithm with gzip framing (RFC 1952).
-//! It implements the standard [`Write`] trait for seamless integration with
-//! Rust's I/O ecosystem, and additionally supports [`fmt::Write`] for
+//! It implements the standard `Write` trait for seamless integration with
+//! Rust's I/O ecosystem, and additionally supports `fmt::Write` for
 //! formatted output via `write!()` macros.
 //!
 //! Ported from C `gzwrite.c` (700 lines) in the zlib 1.3.2.1-motley library.
@@ -16,7 +16,7 @@
 //! - **Input staging buffer** (`state.input`): Double-sized (`want * 2`)
 //!   buffer that accumulates small writes before compression. The double
 //!   sizing supports the `printf()` formatting path.
-//! - **Output buffer** (managed via [`ZStream`]): Holds compressed data
+//! - **Output buffer** (managed via `ZStream`): Holds compressed data
 //!   produced by the deflate engine before flushing to the output file.
 //!
 //! # Direct (Transparent) Mode
@@ -30,10 +30,9 @@ use std::fs::File;
 use std::io::{self, Write};
 
 use crate::constants::{
-    DEF_MEM_LEVEL, MAX_WBITS, Z_BLOCK, Z_BUF_ERROR, Z_DATA_ERROR,
-    Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY, Z_DEFLATED, Z_ERRNO,
-    Z_FILTERED, Z_FINISH, Z_FIXED, Z_HUFFMAN_ONLY, Z_MEM_ERROR,
-    Z_NO_FLUSH, Z_OK, Z_RLE, Z_STREAM_ERROR, Z_SYNC_FLUSH,
+    DEF_MEM_LEVEL, MAX_WBITS, Z_BLOCK, Z_BUF_ERROR, Z_DATA_ERROR, Z_DEFAULT_COMPRESSION,
+    Z_DEFAULT_STRATEGY, Z_DEFLATED, Z_ERRNO, Z_FILTERED, Z_FINISH, Z_FIXED, Z_HUFFMAN_ONLY,
+    Z_MEM_ERROR, Z_NO_FLUSH, Z_OK, Z_RLE, Z_STREAM_ERROR, Z_SYNC_FLUSH,
 };
 use crate::deflate;
 use crate::error::ReturnCode;
@@ -193,8 +192,7 @@ impl GzWriter {
                 .create(true)
                 .truncate(false)
                 .open(path)?;
-            let state =
-                GzState::new_appender(file, path.to_string(), level, strategy)?;
+            let state = GzState::new_appender(file, path.to_string(), level, strategy)?;
             Ok(Self {
                 state,
                 input_len: 0,
@@ -202,13 +200,7 @@ impl GzWriter {
             })
         } else {
             let file = File::create(path)?;
-            let state = GzState::new_writer(
-                file,
-                path.to_string(),
-                level,
-                strategy,
-                direct,
-            );
+            let state = GzState::new_writer(file, path.to_string(), level, strategy, direct);
             Ok(Self {
                 state,
                 input_len: 0,
@@ -311,10 +303,7 @@ impl GzWriter {
                 self.state.input.clear();
                 self.state.output.clear();
                 self.set_error(Z_MEM_ERROR, "out of memory");
-                return Err(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "out of memory",
-                ));
+                return Err(io::Error::new(io::ErrorKind::OutOfMemory, "out of memory"));
             }
 
             // Set up the ZStream output buffer for compressed data
@@ -359,10 +348,7 @@ impl GzWriter {
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     self.state.again = true;
                     self.set_error(Z_ERRNO, "would block");
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "would block",
-                    ));
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "would block"));
                 }
                 Err(e) => {
                     self.state.again = false;
@@ -382,8 +368,7 @@ impl GzWriter {
         let written_len = self.state.strm.output_written().len();
         if written_len > self.state.x.next {
             // Copy the unflushed portion to avoid borrow conflict
-            let data =
-                self.state.strm.output_written()[self.state.x.next..].to_vec();
+            let data = self.state.strm.output_written()[self.state.x.next..].to_vec();
             self.write_bytes_to_file(&data)?;
             self.state.x.next = written_len;
         }
@@ -428,10 +413,7 @@ impl GzWriter {
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                         self.state.again = true;
                         self.set_error(Z_ERRNO, "would block");
-                        return Err(io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            "would block",
-                        ));
+                        return Err(io::Error::new(io::ErrorKind::WouldBlock, "would block"));
                     }
                     Err(e) => {
                         self.state.again = false;
@@ -461,9 +443,7 @@ impl GzWriter {
             // Write out current buffer contents if full, or if flushing.
             // For Z_FINISH, don't write until we get Z_STREAM_END.
             let should_flush_output = self.state.strm.avail_out() == 0
-                || (flush != Z_NO_FLUSH
-                    && (flush != Z_FINISH
-                        || ret == ReturnCode::StreamEnd));
+                || (flush != Z_NO_FLUSH && (flush != Z_FINISH || ret == ReturnCode::StreamEnd));
 
             if should_flush_output {
                 // Write unflushed compressed data to file
@@ -480,10 +460,7 @@ impl GzWriter {
             let old_avail = self.state.strm.avail_out();
             ret = deflate::deflate(&mut self.state.strm, flush);
             if ret == ReturnCode::StreamError {
-                self.set_error(
-                    Z_STREAM_ERROR,
-                    "internal error: deflate stream corrupt",
-                );
+                self.set_error(Z_STREAM_ERROR, "internal error: deflate stream corrupt");
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
                     "internal error: deflate stream corrupt",
@@ -536,8 +513,7 @@ impl GzWriter {
             // `skip` is always > 0 here (while guard) and bounded by i64::MAX.
             // Clamp to usize::MAX then take the smaller of size and clamped skip.
             #[allow(clippy::cast_sign_loss)]
-            let skip_clamped = usize::try_from(self.state.skip)
-                .unwrap_or(usize::MAX);
+            let skip_clamped = usize::try_from(self.state.skip).unwrap_or(usize::MAX);
             let n: usize = self.state.size.min(skip_clamped);
 
             if first {
@@ -624,10 +600,8 @@ impl GzWriter {
                     // Sync remaining input back
                     let rem = self.state.strm.avail_in();
                     if rem > 0 {
-                        let rem_data =
-                            self.state.strm.input_remaining().to_vec();
-                        self.state.input[..rem]
-                            .copy_from_slice(&rem_data);
+                        let rem_data = self.state.strm.input_remaining().to_vec();
+                        self.state.input[..rem].copy_from_slice(&rem_data);
                         self.input_len = rem;
                     }
                     if self.state.again {
@@ -638,8 +612,7 @@ impl GzWriter {
                 // Sync remaining input back from ZStream
                 let rem = self.state.strm.avail_in();
                 if rem > 0 {
-                    let rem_data =
-                        self.state.strm.input_remaining().to_vec();
+                    let rem_data = self.state.strm.input_remaining().to_vec();
                     self.state.input[..rem].copy_from_slice(&rem_data);
                 }
                 self.input_len = rem;
@@ -834,7 +807,7 @@ impl GzWriter {
     /// In Rust, formatting is done with [`format!()`] or `write!()` macros
     /// before calling this method, so the C variadic pattern is unnecessary.
     ///
-    /// The double-sized input buffer (allocated in [`init`](GzWriter::init))
+    /// The double-sized input buffer (allocated in `init()`)
     /// supports the vacate logic that ensures buffer space is available for
     /// formatted output, matching the C `gzvprintf` / `gz_vacate` behavior.
     ///
@@ -884,8 +857,7 @@ impl GzWriter {
         }
 
         // Write formatted data into the input staging buffer
-        self.state.input[self.input_len..self.input_len + len]
-            .copy_from_slice(&bytes[..len]);
+        self.state.input[self.input_len..self.input_len + len].copy_from_slice(&bytes[..len]);
         self.input_len += len;
         #[allow(clippy::cast_possible_wrap)]
         {
@@ -902,7 +874,7 @@ impl GzWriter {
     ///
     /// Valid flush values are [`Z_NO_FLUSH`] through [`Z_FINISH`]:
     /// - [`Z_SYNC_FLUSH`]: Flush pending output and insert a sync point
-    /// - [`Z_FULL_FLUSH`]: Like sync flush, but also reset compression state
+    /// - `Z_FULL_FLUSH`: Like sync flush, but also reset compression state
     /// - [`Z_FINISH`]: Complete the gzip stream (required before close)
     /// - [`Z_BLOCK`]: Flush to the next block boundary
     ///
@@ -961,7 +933,7 @@ impl GzWriter {
     ///
     /// If neither the level nor strategy has changed, this is a no-op.
     /// Otherwise, any buffered input is flushed with [`Z_BLOCK`] before
-    /// the parameters are updated via [`deflate_params`].
+    /// the parameters are updated via `deflate_params`.
     ///
     /// Ported from C `gzsetparams()` in `gzwrite.c` lines 630–664.
     ///
@@ -969,11 +941,7 @@ impl GzWriter {
     ///
     /// Returns an I/O error if flushing fails or if the deflate state
     /// cannot accept the new parameters.
-    pub fn set_params(
-        &mut self,
-        level: i32,
-        strategy: i32,
-    ) -> io::Result<()> {
+    pub fn set_params(&mut self, level: i32, strategy: i32) -> io::Result<()> {
         // Cannot change params in direct mode
         if self.state.direct != 0 {
             self.set_error(Z_STREAM_ERROR, "cannot set params in direct mode");
@@ -1015,11 +983,7 @@ impl GzWriter {
 
         // Update deflate parameters
         if self.state.size != 0 {
-            let _ = deflate::deflate_params(
-                &mut self.state.strm,
-                level,
-                strategy,
-            );
+            let _ = deflate::deflate_params(&mut self.state.strm, level, strategy);
         }
 
         self.state.level = level;
@@ -1131,10 +1095,7 @@ impl GzWriter {
             io::SeekFrom::Current(_) => {
                 let current = self.state.x.pos;
                 current.checked_add(offset).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "seek position overflow",
-                    )
+                    io::Error::new(io::ErrorKind::InvalidInput, "seek position overflow")
                 })?
             }
             io::SeekFrom::End(_) => {
@@ -1234,7 +1195,9 @@ impl fmt::Write for GzWriter {
     /// formatted output to the gzip stream. This is the Rust equivalent
     /// of C's `gzprintf()` variadic formatting.
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.gz_write(s.as_bytes()).map(|_| ()).map_err(|_| fmt::Error)
+        self.gz_write(s.as_bytes())
+            .map(|_| ())
+            .map_err(|_| fmt::Error)
     }
 }
 

@@ -266,9 +266,9 @@ fn decompress_stream(
 /// Prints a descriptive error message to stderr based on the [`ReturnCode`]
 /// variant. For I/O errors (not represented as `ReturnCode`), the caller
 /// handles output directly.
-fn report_error(code: &ReturnCode) {
+fn report_error(code: ReturnCode) {
     eprint!("zpipe: ");
-    match *code {
+    match code {
         ReturnCode::Errno => {
             eprintln!("error reading stdin or writing stdout");
         }
@@ -285,7 +285,7 @@ fn report_error(code: &ReturnCode) {
             eprintln!("zlib version mismatch!");
         }
         _ => {
-            eprintln!("unknown error ({})", code);
+            eprintln!("unknown error ({code})");
         }
     }
 }
@@ -330,7 +330,7 @@ fn main() {
     // Handle errors: print diagnostics and exit with non-zero status.
     // C equivalent: if (ret != Z_OK) zerr(ret); return ret;
     if let Err(e) = result {
-        if let Some(code) = e.downcast_ref::<ReturnCode>() {
+        if let Some(&code) = e.downcast_ref::<ReturnCode>() {
             report_error(code);
         } else {
             // I/O error or other non-zlib error.

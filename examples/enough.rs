@@ -148,6 +148,7 @@ impl State {
         // were no limit to the code length, this would become: most = left - 1.)
         let shift = self.max - len;
         let most = (((left as u64) << shift) - syms as u64) / ((1u64 << shift) - 1);
+        #[allow(clippy::cast_possible_truncation)]
         let most = most as usize;
 
         // Count all possible codes from this juncture and add them up
@@ -177,23 +178,16 @@ impl State {
     /// `(mem, rem)`. The bit vector is lengthened as needed.
     ///
     /// Port of `been_here()` (line 308 of `enough.c`).
-    fn been_here(
-        &mut self,
-        syms: usize,
-        left: usize,
-        len: usize,
-        mem: usize,
-        rem: usize,
-    ) -> bool {
+    fn been_here(&mut self, syms: usize, left: usize, len: usize, mem: usize, rem: usize) -> bool {
         // Point to vector for (syms,left,len), bit in vector for (mem,rem)
         let index = self.map(syms, left, len);
-        let adj_mem = (mem - (1 << self.root)) >> 1; // mem always includes root table; always even
-        let adj_rem = rem >> 1; // rem is always even
+        let mem_offset = (mem - (1 << self.root)) >> 1; // mem always includes root table; always even
+        let rem_offset = rem >> 1; // rem is always even
 
         // Skewed triangular array formula — 8x range for mem vs rem
-        let offset_base = (adj_mem >> 3) + adj_rem;
-        let offset = (offset_base * (offset_base + 1)) / 2 + adj_rem;
-        let bit: u8 = 1 << (adj_mem & 7);
+        let offset_base = (mem_offset >> 3) + rem_offset;
+        let offset = (offset_base * (offset_base + 1)) / 2 + rem_offset;
+        let bit: u8 = 1 << (mem_offset & 7);
 
         // See if we've been here
         let length = self.done[index].vec.len();
@@ -312,6 +306,7 @@ impl State {
         // We can use at most this many bit patterns
         let shift = max - len;
         let most = (((left as u64) << shift) - syms as u64) / ((1u64 << shift) - 1);
+        #[allow(clippy::cast_possible_truncation)]
         let most = most as usize;
 
         // Occupy least table spaces, creating new sub-tables as needed
@@ -327,7 +322,13 @@ impl State {
         for used in least..=most {
             self.code[len] = used;
             let sub_table = if rem != 0 { 1 << (len - root) } else { 0 };
-            self.examine(syms - used, (left - used) << 1, len + 1, mem + sub_table, rem << 1);
+            self.examine(
+                syms - used,
+                (left - used) << 1,
+                len + 1,
+                mem + sub_table,
+                rem << 1,
+            );
             if rem == 0 {
                 rem = 1 << (len - root);
                 mem += rem;
@@ -411,7 +412,7 @@ impl State {
 ///
 /// The default arguments correspond to the deflate literal/length code.
 /// For the deflate distance code, use `enough 30 6`.
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     let args: Vec<String> = env::args().collect();
 
     // Get arguments — default to the deflate literal/length code
@@ -420,34 +421,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut max: usize = 15;
 
     if args.len() > 1 {
-        syms = match args[1].parse() {
-            Ok(v) => v,
-            Err(_) => {
-                eprintln!(
-                    "invalid arguments, need: [sym >= 2 [root >= 1 [max >= 1]]]"
-                );
-                process::exit(1);
-            }
+        syms = if let Ok(v) = args[1].parse() {
+            v
+        } else {
+            eprintln!("invalid arguments, need: [sym >= 2 [root >= 1 [max >= 1]]]");
+            process::exit(1);
         };
         if args.len() > 2 {
-            root = match args[2].parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    eprintln!(
-                        "invalid arguments, need: [sym >= 2 [root >= 1 [max >= 1]]]"
-                    );
-                    process::exit(1);
-                }
+            root = if let Ok(v) = args[2].parse() {
+                v
+            } else {
+                eprintln!("invalid arguments, need: [sym >= 2 [root >= 1 [max >= 1]]]");
+                process::exit(1);
             };
             if args.len() > 3 {
-                max = match args[3].parse() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        eprintln!(
-                            "invalid arguments, need: [sym >= 2 [root >= 1 [max >= 1]]]"
-                        );
-                        process::exit(1);
-                    }
+                max = if let Ok(v) = args[3].parse() {
+                    v
+                } else {
+                    eprintln!("invalid arguments, need: [sym >= 2 [root >= 1 [max >= 1]]]");
+                    process::exit(1);
                 };
             }
         }
@@ -489,20 +481,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         let mut sz: usize = syms / 2;
         let n1 = (syms - 1) / 2;
-        sz = match sz.checked_mul(n1) {
-            Some(v) => v,
-            None => {
-                eprintln!("abort: overflow computing array size");
-                process::exit(1);
-            }
+        sz = if let Some(v) = sz.checked_mul(n1) {
+            v
+        } else {
+            eprintln!("abort: overflow computing array size");
+            process::exit(1);
         };
         let n2 = max - 1;
-        sz = match sz.checked_mul(n2) {
-            Some(v) => v,
-            None => {
-                eprintln!("abort: overflow computing array size");
-                process::exit(1);
-            }
+        sz = if let Some(v) = sz.checked_mul(n2) {
+            v
+        } else {
+            eprintln!("abort: overflow computing array size");
+            process::exit(1);
         };
         (sz, vec![0u64; sz])
     };
@@ -531,9 +521,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Print total codes summary
     if max < syms - 1 {
-        println!(
-            "{sum} total codes for 2 to {syms} symbols ({max}-bit length limit)"
-        );
+        println!("{sum} total codes for 2 to {syms} symbols ({max}-bit length limit)");
     } else {
         println!("{sum} total codes for 2 to {syms} symbols (no length limit)");
     }
@@ -555,6 +543,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         eprint!("cannot handle minimum code lengths > root");
     }
-
-    Ok(())
 }

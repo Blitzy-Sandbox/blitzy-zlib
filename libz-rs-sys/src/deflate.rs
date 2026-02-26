@@ -10,7 +10,7 @@
 //! All 16 deflate symbols from `win32/zlib.def`:
 //!
 //! ## Basic Functions (def lines 5–6)
-//! - [`deflate`] — Main compression function
+//! - [`deflate()`](fn@deflate) — Main compression function
 //! - [`deflateEnd`] — Free compression state
 //!
 //! ## Advanced Functions (def lines 10–21)
@@ -52,7 +52,7 @@
 
 use libc::{c_char, c_int, c_uint, c_ulong, c_void};
 
-use crate::types::{gz_header, z_size_t, z_stream, Z_STREAM_ERROR};
+use crate::types::{Z_STREAM_ERROR, gz_header, z_size_t, z_stream};
 
 // ─── Internal Constants ──────────────────────────────────────────────────────
 
@@ -82,7 +82,8 @@ unsafe fn version_check(version: *const c_char, stream_size: c_int) -> bool {
     }
     // Compare only the first byte — same check C zlib performs.
     let expected_first = ZLIB_VERSION_BYTES[0];
-    let actual_first = unsafe { *version as u8 };
+    #[allow(clippy::cast_sign_loss)]
+    let actual_first = unsafe { *version } as u8;
     if actual_first != expected_first {
         return false;
     }
@@ -101,14 +102,12 @@ unsafe fn version_check(version: *const c_char, stream_size: c_int) -> bool {
 /// `strm` must be a valid, non-null pointer to a `z_stream` whose `state`
 /// field was previously set by `deflateInit_` / `deflateInit2_`.
 #[inline]
-unsafe fn get_stream_mut<'a>(
-    strm: *mut z_stream,
-) -> Option<&'a mut zlib_rs::stream::ZStream> {
+unsafe fn get_stream_mut<'a>(strm: *mut z_stream) -> Option<&'a mut zlib_rs::stream::ZStream> {
     let state_ptr = unsafe { (*strm).state };
     if state_ptr.is_null() {
         return None;
     }
-    Some(unsafe { &mut *(state_ptr as *mut zlib_rs::stream::ZStream) })
+    Some(unsafe { &mut *state_ptr.cast::<zlib_rs::stream::ZStream>() })
 }
 
 /// Get an immutable reference to the Rust [`ZStream`] stored in
@@ -120,14 +119,12 @@ unsafe fn get_stream_mut<'a>(
 ///
 /// `strm` must be a valid pointer to an initialized `z_stream`.
 #[inline]
-unsafe fn get_stream_ref<'a>(
-    strm: *const z_stream,
-) -> Option<&'a zlib_rs::stream::ZStream> {
+unsafe fn get_stream_ref<'a>(strm: *const z_stream) -> Option<&'a zlib_rs::stream::ZStream> {
     let state_ptr = unsafe { (*strm).state };
     if state_ptr.is_null() {
         return None;
     }
-    Some(unsafe { &*(state_ptr as *const zlib_rs::stream::ZStream) })
+    Some(unsafe { &*state_ptr.cast::<zlib_rs::stream::ZStream>() })
 }
 
 /// Synchronize scalar stream fields from the Rust [`ZStream`] back to
@@ -140,10 +137,7 @@ unsafe fn get_stream_ref<'a>(
 /// `strm` must be a valid, non-null pointer.
 #[inline]
 #[allow(clippy::cast_lossless)]
-unsafe fn sync_to_c(
-    strm: *mut z_stream,
-    rs: &zlib_rs::stream::ZStream,
-) {
+unsafe fn sync_to_c(strm: *mut z_stream, rs: &zlib_rs::stream::ZStream) {
     let s = unsafe { &mut *strm };
     s.total_in = rs.total_in as c_ulong;
     s.total_out = rs.total_out as c_ulong;
@@ -151,7 +145,7 @@ unsafe fn sync_to_c(
     s.data_type = rs.data_type;
     match rs.msg {
         Some(msg) => {
-            s.msg = msg.as_ptr() as *const c_char;
+            s.msg = msg.as_ptr().cast::<c_char>();
         }
         None => {
             s.msg = std::ptr::null();
@@ -185,39 +179,33 @@ unsafe fn c_strlen(ptr: *const u8) -> usize {
 /// `head` must be a valid, non-null pointer. Any non-null pointer fields
 /// within the `gz_header` must point to valid memory of the indicated
 /// lengths. `name` and `comment` must be null-terminated when non-null.
-unsafe fn convert_gz_header(
-    head: *const gz_header,
-) -> zlib_rs::stream::GzHeader {
+unsafe fn convert_gz_header(head: *const gz_header) -> zlib_rs::stream::GzHeader {
     let h = unsafe { &*head };
 
     // extra: raw pointer + length → Option<Vec<u8>>
     let extra = if !h.extra.is_null() && h.extra_len > 0 {
-        let slice = unsafe {
-            std::slice::from_raw_parts(h.extra, h.extra_len as usize)
-        };
+        let slice = unsafe { std::slice::from_raw_parts(h.extra, h.extra_len as usize) };
         Some(slice.to_vec())
     } else {
         None
     };
 
     // name: null-terminated raw pointer → Option<Vec<u8>>
-    let name = if !h.name.is_null() {
+    let name = if h.name.is_null() {
+        None
+    } else {
         let len = unsafe { c_strlen(h.name) };
         let slice = unsafe { std::slice::from_raw_parts(h.name, len) };
         Some(slice.to_vec())
-    } else {
-        None
     };
 
     // comment: null-terminated raw pointer → Option<Vec<u8>>
-    let comment = if !h.comment.is_null() {
-        let len = unsafe { c_strlen(h.comment) };
-        let slice = unsafe {
-            std::slice::from_raw_parts(h.comment, len)
-        };
-        Some(slice.to_vec())
-    } else {
+    let comment = if h.comment.is_null() {
         None
+    } else {
+        let len = unsafe { c_strlen(h.comment) };
+        let slice = unsafe { std::slice::from_raw_parts(h.comment, len) };
+        Some(slice.to_vec())
     };
 
     #[allow(clippy::cast_possible_truncation)]
@@ -331,11 +319,10 @@ pub unsafe extern "C" fn deflateInit2_(
 
     // Store the entire Rust ZStream as opaque state in the C z_stream.
     let strm_ref = unsafe { &mut *strm };
-    strm_ref.state = Box::into_raw(Box::new(rust_stream)) as *mut c_void;
+    strm_ref.state = Box::into_raw(Box::new(rust_stream)).cast::<c_void>();
 
     // Initialize C scalar fields from the freshly initialized Rust stream.
-    let rs_ref =
-        unsafe { &*(strm_ref.state as *const zlib_rs::stream::ZStream) };
+    let rs_ref = unsafe { &*strm_ref.state.cast::<zlib_rs::stream::ZStream>() };
     strm_ref.total_in = 0;
     strm_ref.total_out = 0;
     strm_ref.adler = rs_ref.adler as c_ulong;
@@ -403,9 +390,8 @@ pub unsafe extern "C" fn deflate(strm: *mut z_stream, flush: c_int) -> c_int {
     };
 
     // Get the stored Rust ZStream.
-    let rs = match unsafe { get_stream_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(rs) = (unsafe { get_stream_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     // Set up input from the C buffer.
@@ -442,11 +428,7 @@ pub unsafe extern "C" fn deflate(strm: *mut z_stream, flush: c_int) -> c_int {
         let copy_len = output_produced.min(written.len());
         if copy_len > 0 {
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    written.as_ptr(),
-                    next_out,
-                    copy_len,
-                );
+                std::ptr::copy_nonoverlapping(written.as_ptr(), next_out, copy_len);
             }
         }
     }
@@ -499,7 +481,7 @@ pub unsafe extern "C" fn deflateEnd(strm: *mut z_stream) -> c_int {
     }
 
     // Reconstruct the Box<ZStream> to take ownership for proper drop.
-    let state_ptr = strm_ref.state as *mut zlib_rs::stream::ZStream;
+    let state_ptr = strm_ref.state.cast::<zlib_rs::stream::ZStream>();
     let mut rust_stream = unsafe { Box::from_raw(state_ptr) };
 
     let ret = zlib_rs::deflate::deflate_end(&mut rust_stream);
@@ -545,17 +527,14 @@ pub unsafe extern "C" fn deflateSetDictionary(
         return Z_STREAM_ERROR;
     }
 
-    let rs = match unsafe { get_stream_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(rs) = (unsafe { get_stream_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     // Build the dictionary slice. A null dictionary with zero length is
     // treated as an empty dictionary (no-op).
     let dict_slice = if !dictionary.is_null() && dictLength > 0 {
-        unsafe {
-            std::slice::from_raw_parts(dictionary, dictLength as usize)
-        }
+        unsafe { std::slice::from_raw_parts(dictionary, dictLength as usize) }
     } else {
         &[]
     };
@@ -597,9 +576,8 @@ pub unsafe extern "C" fn deflateGetDictionary(
         return Z_STREAM_ERROR;
     }
 
-    let rs = match unsafe { get_stream_ref(strm as *const z_stream) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(rs) = (unsafe { get_stream_ref(strm.cast_const()) }) else {
+        return Z_STREAM_ERROR;
     };
 
     if dictionary.is_null() {
@@ -617,9 +595,7 @@ pub unsafe extern "C" fn deflateGetDictionary(
     } else {
         // Write the dictionary into the caller-provided buffer.
         // Maximum dictionary size is the window size (32768 bytes).
-        let buf = unsafe {
-            std::slice::from_raw_parts_mut(dictionary, 32768)
-        };
+        let buf = unsafe { std::slice::from_raw_parts_mut(dictionary, 32768) };
         match zlib_rs::deflate::deflate_get_dictionary(rs, buf) {
             Ok(len) => {
                 if !dictLength.is_null() {
@@ -656,19 +632,14 @@ pub unsafe extern "C" fn deflateGetDictionary(
 /// must be a properly initialized deflate stream.
 #[unsafe(no_mangle)]
 #[allow(non_snake_case, clippy::cast_lossless)]
-pub unsafe extern "C" fn deflateCopy(
-    dest: *mut z_stream,
-    source: *mut z_stream,
-) -> c_int {
+pub unsafe extern "C" fn deflateCopy(dest: *mut z_stream, source: *mut z_stream) -> c_int {
     if dest.is_null() || source.is_null() {
         return Z_STREAM_ERROR;
     }
 
-    let source_rs =
-        match unsafe { get_stream_ref(source as *const z_stream) } {
-            Some(s) => s,
-            None => return Z_STREAM_ERROR,
-        };
+    let Some(source_rs) = (unsafe { get_stream_ref(source.cast_const()) }) else {
+        return Z_STREAM_ERROR;
+    };
 
     // Create a fresh Rust ZStream for the destination and deep-copy.
     let mut dest_rs = zlib_rs::stream::ZStream::new();
@@ -680,12 +651,10 @@ pub unsafe extern "C" fn deflateCopy(
 
     // Store the new ZStream in the destination C z_stream.
     let dest_ref = unsafe { &mut *dest };
-    dest_ref.state = Box::into_raw(Box::new(dest_rs)) as *mut c_void;
+    dest_ref.state = Box::into_raw(Box::new(dest_rs)).cast::<c_void>();
 
     // Sync scalar fields from the copied Rust stream to C.
-    let dest_rs_ref = unsafe {
-        &*(dest_ref.state as *const zlib_rs::stream::ZStream)
-    };
+    let dest_rs_ref = unsafe { &*dest_ref.state.cast::<zlib_rs::stream::ZStream>() };
     unsafe { sync_to_c(dest, dest_rs_ref) };
 
     ret as c_int
@@ -712,9 +681,8 @@ pub unsafe extern "C" fn deflateReset(strm: *mut z_stream) -> c_int {
         return Z_STREAM_ERROR;
     }
 
-    let rs = match unsafe { get_stream_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(rs) = (unsafe { get_stream_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     let ret = zlib_rs::deflate::deflate_reset(rs);
@@ -743,7 +711,11 @@ pub unsafe extern "C" fn deflateReset(strm: *mut z_stream) -> c_int {
 ///
 /// `strm` must be valid and initialized with valid I/O buffer pointers.
 #[unsafe(no_mangle)]
-#[allow(non_snake_case, clippy::cast_possible_truncation, clippy::cast_lossless)]
+#[allow(
+    non_snake_case,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless
+)]
 pub unsafe extern "C" fn deflateParams(
     strm: *mut z_stream,
     level: c_int,
@@ -768,9 +740,8 @@ pub unsafe extern "C" fn deflateParams(
         (s.total_in, s.total_out, s.adler, s.data_type)
     };
 
-    let rs = match unsafe { get_stream_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(rs) = (unsafe { get_stream_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     // Set up I/O — deflate_params may call deflate(Z_BLOCK) internally.
@@ -802,11 +773,7 @@ pub unsafe extern "C" fn deflateParams(
         let copy_len = output_produced.min(written.len());
         if copy_len > 0 {
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    written.as_ptr(),
-                    next_out,
-                    copy_len,
-                );
+                std::ptr::copy_nonoverlapping(written.as_ptr(), next_out, copy_len);
             }
         }
     }
@@ -853,18 +820,11 @@ pub unsafe extern "C" fn deflateTune(
         return Z_STREAM_ERROR;
     }
 
-    let rs = match unsafe { get_stream_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(rs) = (unsafe { get_stream_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
-    zlib_rs::deflate::deflate_tune(
-        rs,
-        good_length,
-        max_lazy,
-        nice_length,
-        max_chain,
-    ) as c_int
+    zlib_rs::deflate::deflate_tune(rs, good_length, max_lazy, nice_length, max_chain) as c_int
 }
 
 // ==========================================================================
@@ -886,29 +846,26 @@ pub unsafe extern "C" fn deflateTune(
 ///
 /// `strm` may be null (returns a generic upper bound).
 #[unsafe(no_mangle)]
-#[allow(non_snake_case, clippy::cast_lossless, clippy::cast_possible_truncation)]
-pub unsafe extern "C" fn deflateBound(
-    strm: *mut z_stream,
-    sourceLen: c_ulong,
-) -> c_ulong {
+#[allow(
+    non_snake_case,
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation
+)]
+pub unsafe extern "C" fn deflateBound(strm: *mut z_stream, sourceLen: c_ulong) -> c_ulong {
     let source_len = sourceLen as usize;
 
     if strm.is_null() {
         // Use a dummy stream for a generic bound calculation.
         let dummy = zlib_rs::stream::ZStream::new();
-        return zlib_rs::deflate::deflate_bound(&dummy, source_len)
-            as c_ulong;
+        return zlib_rs::deflate::deflate_bound(&dummy, source_len) as c_ulong;
     }
 
-    match unsafe { get_stream_ref(strm as *const z_stream) } {
-        Some(rs) => {
-            zlib_rs::deflate::deflate_bound(rs, source_len) as c_ulong
-        }
-        None => {
-            // State not initialized — return generic bound.
-            let dummy = zlib_rs::stream::ZStream::new();
-            zlib_rs::deflate::deflate_bound(&dummy, source_len) as c_ulong
-        }
+    if let Some(rs) = unsafe { get_stream_ref(strm.cast_const()) } {
+        zlib_rs::deflate::deflate_bound(rs, source_len) as c_ulong
+    } else {
+        // State not initialized — return generic bound.
+        let dummy = zlib_rs::stream::ZStream::new();
+        zlib_rs::deflate::deflate_bound(&dummy, source_len) as c_ulong
     }
 }
 
@@ -928,21 +885,17 @@ pub unsafe extern "C" fn deflateBound(
 /// `strm` may be null (returns a generic upper bound).
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
-pub unsafe extern "C" fn deflateBound_z(
-    strm: *mut z_stream,
-    sourceLen: z_size_t,
-) -> z_size_t {
+pub unsafe extern "C" fn deflateBound_z(strm: *mut z_stream, sourceLen: z_size_t) -> z_size_t {
     if strm.is_null() {
         let dummy = zlib_rs::stream::ZStream::new();
         return zlib_rs::deflate::deflate_bound(&dummy, sourceLen);
     }
 
-    match unsafe { get_stream_ref(strm as *const z_stream) } {
-        Some(rs) => zlib_rs::deflate::deflate_bound(rs, sourceLen),
-        None => {
-            let dummy = zlib_rs::stream::ZStream::new();
-            zlib_rs::deflate::deflate_bound(&dummy, sourceLen)
-        }
+    if let Some(rs) = unsafe { get_stream_ref(strm.cast_const()) } {
+        zlib_rs::deflate::deflate_bound(rs, sourceLen)
+    } else {
+        let dummy = zlib_rs::stream::ZStream::new();
+        zlib_rs::deflate::deflate_bound(&dummy, sourceLen)
     }
 }
 
@@ -979,9 +932,8 @@ pub unsafe extern "C" fn deflatePending(
         return Z_STREAM_ERROR;
     }
 
-    let rs = match unsafe { get_stream_ref(strm as *const z_stream) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(rs) = (unsafe { get_stream_ref(strm.cast_const()) }) else {
+        return Z_STREAM_ERROR;
     };
 
     match zlib_rs::deflate::deflate_pending(rs) {
@@ -1012,17 +964,13 @@ pub unsafe extern "C" fn deflatePending(
 /// `strm` must be valid and initialized. `bits` may be null.
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
-pub unsafe extern "C" fn deflateUsed(
-    strm: *mut z_stream,
-    bits: *mut c_int,
-) -> c_int {
+pub unsafe extern "C" fn deflateUsed(strm: *mut z_stream, bits: *mut c_int) -> c_int {
     if strm.is_null() {
         return Z_STREAM_ERROR;
     }
 
-    let rs = match unsafe { get_stream_ref(strm as *const z_stream) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(rs) = (unsafe { get_stream_ref(strm.cast_const()) }) else {
+        return Z_STREAM_ERROR;
     };
 
     match zlib_rs::deflate::deflate_used(rs) {
@@ -1056,18 +1004,13 @@ pub unsafe extern "C" fn deflateUsed(
 /// `strm` must be valid and initialized.
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
-pub unsafe extern "C" fn deflatePrime(
-    strm: *mut z_stream,
-    bits: c_int,
-    value: c_int,
-) -> c_int {
+pub unsafe extern "C" fn deflatePrime(strm: *mut z_stream, bits: c_int, value: c_int) -> c_int {
     if strm.is_null() {
         return Z_STREAM_ERROR;
     }
 
-    let rs = match unsafe { get_stream_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(rs) = (unsafe { get_stream_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     zlib_rs::deflate::deflate_prime(rs, bits, value) as c_int
@@ -1091,10 +1034,7 @@ pub unsafe extern "C" fn deflatePrime(
 /// (`extra`, `name`, `comment`) must point to valid memory.
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
-pub unsafe extern "C" fn deflateSetHeader(
-    strm: *mut z_stream,
-    head: *mut gz_header,
-) -> c_int {
+pub unsafe extern "C" fn deflateSetHeader(strm: *mut z_stream, head: *mut gz_header) -> c_int {
     if strm.is_null() {
         return Z_STREAM_ERROR;
     }
@@ -1102,11 +1042,10 @@ pub unsafe extern "C" fn deflateSetHeader(
         return Z_STREAM_ERROR;
     }
 
-    let rs = match unsafe { get_stream_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(rs) = (unsafe { get_stream_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
-    let rust_header = unsafe { convert_gz_header(head as *const gz_header) };
+    let rust_header = unsafe { convert_gz_header(head.cast_const()) };
     zlib_rs::deflate::deflate_set_header(rs, rust_header) as c_int
 }

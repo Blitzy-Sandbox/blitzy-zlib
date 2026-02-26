@@ -221,7 +221,6 @@ impl Default for GzExposed {
 #[allow(clippy::struct_excessive_bools, clippy::module_name_repetitions)]
 pub struct GzState {
     // ── Exposed contents for efficient reads ──
-
     /// Exposed state providing fast-path access to buffered output.
     ///
     /// Contains `have` (bytes available), `next` (buffer index), and
@@ -229,7 +228,6 @@ pub struct GzState {
     pub x: GzExposed,
 
     // ── Used for both reading and writing ──
-
     /// Current operating mode (Read, Write, Append, or None).
     ///
     /// Replaces C `int mode` with the magic values 7247/31153/1/0.
@@ -286,7 +284,6 @@ pub struct GzState {
     pub direct: i32,
 
     // ── Just for reading ──
-
     /// Junk detection state for multi-member gzip streams.
     ///
     /// - `-1` = start (first member, haven't read anything yet)
@@ -327,7 +324,6 @@ pub struct GzState {
     pub past: bool,
 
     // ── Just for writing ──
-
     /// Compression level for the deflate engine.
     ///
     /// Valid range: `-1` ([`Z_DEFAULT_COMPRESSION`](constants::Z_DEFAULT_COMPRESSION))
@@ -350,7 +346,6 @@ pub struct GzState {
     pub reset: bool,
 
     // ── Seek request ──
-
     /// Amount of data to skip, in bytes.
     ///
     /// For forward seeks, this is the number of bytes to discard from
@@ -360,7 +355,6 @@ pub struct GzState {
     pub skip: i64,
 
     // ── Error information ──
-
     /// Error code from the last operation.
     ///
     /// Holds one of the `Z_*` return codes (e.g., [`Z_OK`](constants::Z_OK),
@@ -376,7 +370,6 @@ pub struct GzState {
     pub msg: Option<String>,
 
     // ── zlib inflate or deflate stream ──
-
     /// Embedded compression/decompression stream.
     ///
     /// Owned in-place (not behind a pointer), mirroring the C pattern
@@ -412,8 +405,8 @@ impl GzState {
             want: GZBUFSIZE,
             input: Vec::new(),
             output: Vec::new(),
-            direct: 1,   // auto-detect for reading (gzlib.c line 189)
-            junk: -1,    // mark first member (gzlib.c line 75)
+            direct: 1, // auto-detect for reading (gzlib.c line 189)
+            junk: -1,  // mark first member (gzlib.c line 75)
             how: GzHow::Look,
             again: false,
             start: 0,
@@ -446,13 +439,7 @@ impl GzState {
     /// * `strategy` — Compression strategy (`Z_DEFAULT_STRATEGY`, etc.).
     /// * `direct` — If `true`, write data transparently without compression.
     #[must_use]
-    pub fn new_writer(
-        file: File,
-        path: String,
-        level: i32,
-        strategy: i32,
-        direct: bool,
-    ) -> Self {
+    pub fn new_writer(file: File, path: String, level: i32, strategy: i32, direct: bool) -> Self {
         Self {
             x: GzExposed::new(),
             mode: GzMode::Write,
@@ -707,7 +694,7 @@ mod tests {
         assert!(state.input.is_empty());
         assert!(state.output.is_empty());
         assert_eq!(state.direct, 1); // auto-detect
-        assert_eq!(state.junk, -1);  // mark first member
+        assert_eq!(state.junk, -1); // mark first member
         assert_eq!(state.how, GzHow::Look);
         assert!(!state.again);
         assert_eq!(state.start, 0);
@@ -744,13 +731,7 @@ mod tests {
     #[test]
     fn test_new_writer_direct_mode() {
         let tmpfile = tempfile::tempfile().expect("create temp file");
-        let state = GzState::new_writer(
-            tmpfile,
-            "/tmp/test.gz".to_string(),
-            0,
-            0,
-            true,
-        );
+        let state = GzState::new_writer(tmpfile, "/tmp/test.gz".to_string(), 0, 0, true);
         assert_eq!(state.direct, 1); // transparent mode
     }
 

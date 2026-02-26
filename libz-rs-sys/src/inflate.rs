@@ -10,7 +10,7 @@
 //! All 16 inflate symbols from `win32/zlib.def`:
 //!
 //! ## Basic Functions (def lines 7–8)
-//! - [`inflate`] — Main decompression function
+//! - [`inflate()`](fn@inflate) — Main decompression function
 //! - [`inflateEnd`] — Free decompression state
 //!
 //! ## Advanced Functions (def lines 22–32)
@@ -44,7 +44,7 @@
 
 use libc::{c_char, c_int, c_long, c_uchar, c_uint, c_void};
 
-use crate::types::{gz_header, in_func, out_func, z_stream, Z_STREAM_ERROR};
+use crate::types::{Z_STREAM_ERROR, gz_header, in_func, out_func, z_stream};
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 
@@ -75,7 +75,8 @@ unsafe fn version_check(version: *const c_char, stream_size: c_int) -> bool {
     // This is the same check C zlib performs — it only compares the
     // major version character to catch gross ABI mismatches.
     let expected_first = ZLIB_VERSION_BYTES[0];
-    let actual_first = unsafe { *version as u8 };
+    #[allow(clippy::cast_sign_loss)]
+    let actual_first = unsafe { *version } as u8;
     if actual_first != expected_first {
         return false;
     }
@@ -96,14 +97,12 @@ unsafe fn version_check(version: *const c_char, stream_size: c_int) -> bool {
 ///   to point to a valid `InflateState` allocation
 /// - No other mutable references to the state exist
 #[inline]
-unsafe fn get_state_mut<'a>(
-    strm: *mut z_stream,
-) -> Option<&'a mut zlib_rs::inflate::InflateState> {
+unsafe fn get_state_mut<'a>(strm: *mut z_stream) -> Option<&'a mut zlib_rs::inflate::InflateState> {
     let state_ptr = unsafe { (*strm).state };
     if state_ptr.is_null() {
         return None;
     }
-    Some(unsafe { &mut *(state_ptr as *mut zlib_rs::inflate::InflateState) })
+    Some(unsafe { &mut *(state_ptr.cast::<zlib_rs::inflate::InflateState>()) })
 }
 
 /// Extract an immutable reference to the [`InflateState`] stored in
@@ -115,9 +114,7 @@ unsafe fn get_state_mut<'a>(
 /// - `strm` is a valid, non-null pointer to an initialized `z_stream`
 /// - `strm.state` was previously set by an init function
 #[inline]
-unsafe fn get_state_ref<'a>(
-    strm: *mut z_stream,
-) -> Option<&'a zlib_rs::inflate::InflateState> {
+unsafe fn get_state_ref<'a>(strm: *mut z_stream) -> Option<&'a zlib_rs::inflate::InflateState> {
     let state_ptr = unsafe { (*strm).state };
     if state_ptr.is_null() {
         return None;
@@ -135,10 +132,7 @@ unsafe fn get_state_ref<'a>(
 /// `strm` must be a valid, non-null pointer.
 #[inline]
 #[allow(clippy::cast_lossless)]
-unsafe fn sync_scalars_to_c(
-    strm: *mut z_stream,
-    rust_stream: &zlib_rs::stream::ZStream,
-) {
+unsafe fn sync_scalars_to_c(strm: *mut z_stream, rust_stream: &zlib_rs::stream::ZStream) {
     let strm_ref = unsafe { &mut *strm };
     strm_ref.total_in = rust_stream.total_in as libc::c_ulong;
     strm_ref.total_out = rust_stream.total_out as libc::c_ulong;
@@ -146,7 +140,7 @@ unsafe fn sync_scalars_to_c(
     strm_ref.data_type = rust_stream.data_type;
     match rust_stream.msg {
         Some(msg) => {
-            strm_ref.msg = msg.as_ptr() as *const c_char;
+            strm_ref.msg = msg.as_ptr().cast::<c_char>();
         }
         None => {
             strm_ref.msg = std::ptr::null();
@@ -168,14 +162,17 @@ unsafe fn build_rust_stream(strm: *const z_stream) -> zlib_rs::stream::ZStream {
     let mut rs = zlib_rs::stream::ZStream::new();
     rs.total_in = strm_ref.total_in;
     rs.total_out = strm_ref.total_out;
-    rs.adler = strm_ref.adler as u32;
+    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_lossless)]
+    {
+        rs.adler = strm_ref.adler as u32;
+    }
     rs.data_type = strm_ref.data_type;
 
     // Copy input from C buffer into the Rust stream.
     let avail_in = strm_ref.avail_in as usize;
     if !strm_ref.next_in.is_null() && avail_in > 0 {
-        let input_slice =
-            unsafe { std::slice::from_raw_parts(strm_ref.next_in, avail_in) };
+        let input_slice = unsafe { std::slice::from_raw_parts(strm_ref.next_in, avail_in) };
         rs.set_input(input_slice);
     }
 
@@ -188,7 +185,7 @@ unsafe fn build_rust_stream(strm: *const z_stream) -> zlib_rs::stream::ZStream {
     rs
 }
 
-/// After a core operation, advance the C z_stream buffer pointers by the
+/// After a core operation, advance the C `z_stream` buffer pointers by the
 /// consumed/produced amounts and copy produced output back to the C buffer.
 ///
 /// # Safety
@@ -211,11 +208,7 @@ unsafe fn finalize_buffers(
         let copy_len = output_produced.min(written.len());
         if copy_len > 0 {
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    written.as_ptr(),
-                    strm_ref.next_out,
-                    copy_len,
-                );
+                std::ptr::copy_nonoverlapping(written.as_ptr(), strm_ref.next_out, copy_len);
             }
         }
     }
@@ -332,15 +325,14 @@ pub unsafe extern "C" fn inflateInit2_(
 
     // inflate_reset2 initializes the state fields (wrap, wbits, etc.)
     // and resets the stream counters.
-    let ret =
-        zlib_rs::inflate::inflate_reset2(&mut state, &mut rust_stream, windowBits);
+    let ret = zlib_rs::inflate::inflate_reset2(&mut state, &mut rust_stream, windowBits);
     if ret != zlib_rs::error::ReturnCode::Ok {
         return ret as c_int;
     }
 
     // Store the state as a raw pointer in the C z_stream.
     let strm_ref = unsafe { &mut *strm };
-    strm_ref.state = Box::into_raw(Box::new(state)) as *mut c_void;
+    strm_ref.state = Box::into_raw(Box::new(state)).cast::<c_void>();
 
     // Initialize the C stream scalar fields from the Rust stream.
     strm_ref.total_in = 0;
@@ -388,9 +380,8 @@ pub unsafe extern "C" fn inflate(strm: *mut z_stream, flush: c_int) -> c_int {
     }
 
     // Extract the inflate state.
-    let state = match unsafe { get_state_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(state) = (unsafe { get_state_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     // Build a temporary Rust stream from the C fields.
@@ -449,7 +440,7 @@ pub unsafe extern "C" fn inflateEnd(strm: *mut z_stream) -> c_int {
     // Reconstruct the Box<InflateState> to properly drop it.
     // The Box reclaims ownership of the heap allocation, and when dropped,
     // all owned buffers (window, codes, etc.) are freed automatically.
-    let state_ptr = strm_ref.state as *mut zlib_rs::inflate::InflateState;
+    let state_ptr = strm_ref.state.cast::<zlib_rs::inflate::InflateState>();
     let mut state = unsafe { Box::from_raw(state_ptr) };
 
     // Build a temporary Rust stream for the end call.
@@ -473,7 +464,7 @@ pub unsafe extern "C" fn inflateEnd(strm: *mut z_stream) -> c_int {
 
 /// Set the decompression dictionary from the given byte sequence.
 ///
-/// Must be called immediately after [`inflate`] returns `Z_NEED_DICT`.
+/// Must be called immediately after [`inflate()`](fn@inflate) returns `Z_NEED_DICT`.
 /// The provided dictionary must match the one used during compression
 /// (verified by Adler-32 checksum comparison).
 ///
@@ -498,9 +489,8 @@ pub unsafe extern "C" fn inflateSetDictionary(
         return Z_STREAM_ERROR;
     }
 
-    let state = match unsafe { get_state_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(state) = (unsafe { get_state_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     // Construct a slice from the dictionary pointer.
@@ -519,8 +509,7 @@ pub unsafe extern "C" fn inflateSetDictionary(
     // Build a temporary Rust stream for scalar field synchronization.
     let mut rust_stream = unsafe { build_rust_stream(strm) };
 
-    let ret =
-        zlib_rs::inflate::inflate_set_dictionary(state, &mut rust_stream, dict_slice);
+    let ret = zlib_rs::inflate::inflate_set_dictionary(state, &mut rust_stream, dict_slice);
 
     // Sync back adler and msg which may have been updated.
     unsafe { sync_scalars_to_c(strm, &rust_stream) };
@@ -556,15 +545,13 @@ pub unsafe extern "C" fn inflateGetDictionary(
         return Z_STREAM_ERROR;
     }
 
-    let state = match unsafe { get_state_ref(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(state) = (unsafe { get_state_ref(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     if dictionary.is_null() {
         // Caller only wants the length — pass an empty buffer.
-        let (ret, len) =
-            zlib_rs::inflate::inflate_get_dictionary(state, &mut []);
+        let (ret, len) = zlib_rs::inflate::inflate_get_dictionary(state, &mut []);
         if !dictLength.is_null() {
             unsafe { *dictLength = len as c_uint };
         }
@@ -613,9 +600,8 @@ pub unsafe extern "C" fn inflateSync(strm: *mut z_stream) -> c_int {
         return Z_STREAM_ERROR;
     }
 
-    let state = match unsafe { get_state_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(state) = (unsafe { get_state_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     let mut rust_stream = unsafe { build_rust_stream(strm) };
@@ -651,23 +637,18 @@ pub unsafe extern "C" fn inflateSync(strm: *mut z_stream) -> c_int {
 /// initialized inflate stream.
 #[unsafe(no_mangle)]
 #[allow(non_snake_case, clippy::cast_lossless)]
-pub unsafe extern "C" fn inflateCopy(
-    dest: *mut z_stream,
-    source: *mut z_stream,
-) -> c_int {
+pub unsafe extern "C" fn inflateCopy(dest: *mut z_stream, source: *mut z_stream) -> c_int {
     if dest.is_null() || source.is_null() {
         return Z_STREAM_ERROR;
     }
 
-    let src_state = match unsafe { get_state_ref(source) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(src_state) = (unsafe { get_state_ref(source) }) else {
+        return Z_STREAM_ERROR;
     };
 
     // Deep-copy the inflate state.
-    let new_state = match zlib_rs::inflate::inflate_copy(src_state) {
-        Some(s) => s,
-        None => return zlib_rs::error::ReturnCode::MemError as c_int,
+    let Some(new_state) = zlib_rs::inflate::inflate_copy(src_state) else {
+        return zlib_rs::error::ReturnCode::MemError as c_int;
     };
 
     // Copy the C z_stream scalar fields from source to dest.
@@ -677,7 +658,7 @@ pub unsafe extern "C" fn inflateCopy(
 
     // Store the new (independent) state in the destination stream.
     let dest_ref = unsafe { &mut *dest };
-    dest_ref.state = Box::into_raw(Box::new(new_state)) as *mut c_void;
+    dest_ref.state = Box::into_raw(Box::new(new_state)).cast::<c_void>();
 
     zlib_rs::error::ReturnCode::Ok as c_int
 }
@@ -702,9 +683,8 @@ pub unsafe extern "C" fn inflateReset(strm: *mut z_stream) -> c_int {
         return Z_STREAM_ERROR;
     }
 
-    let state = match unsafe { get_state_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(state) = (unsafe { get_state_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     let mut rust_stream = unsafe { build_rust_stream(strm) };
@@ -737,23 +717,18 @@ pub unsafe extern "C" fn inflateReset(strm: *mut z_stream) -> c_int {
 /// `strm` must be valid and initialized.
 #[unsafe(no_mangle)]
 #[allow(non_snake_case, clippy::cast_lossless)]
-pub unsafe extern "C" fn inflateReset2(
-    strm: *mut z_stream,
-    windowBits: c_int,
-) -> c_int {
+pub unsafe extern "C" fn inflateReset2(strm: *mut z_stream, windowBits: c_int) -> c_int {
     if strm.is_null() {
         return Z_STREAM_ERROR;
     }
 
-    let state = match unsafe { get_state_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(state) = (unsafe { get_state_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     let mut rust_stream = unsafe { build_rust_stream(strm) };
 
-    let ret =
-        zlib_rs::inflate::inflate_reset2(state, &mut rust_stream, windowBits);
+    let ret = zlib_rs::inflate::inflate_reset2(state, &mut rust_stream, windowBits);
 
     let strm_ref = unsafe { &mut *strm };
     strm_ref.total_in = rust_stream.total_in as libc::c_ulong;
@@ -780,18 +755,13 @@ pub unsafe extern "C" fn inflateReset2(
 /// `strm` must be valid and initialized.
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
-pub unsafe extern "C" fn inflatePrime(
-    strm: *mut z_stream,
-    bits: c_int,
-    value: c_int,
-) -> c_int {
+pub unsafe extern "C" fn inflatePrime(strm: *mut z_stream, bits: c_int, value: c_int) -> c_int {
     if strm.is_null() {
         return Z_STREAM_ERROR;
     }
 
-    let state = match unsafe { get_state_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(state) = (unsafe { get_state_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     let ret = zlib_rs::inflate::inflate_prime(state, bits, value);
@@ -830,9 +800,8 @@ pub unsafe extern "C" fn inflateMark(strm: *mut z_stream) -> c_long {
         return ERROR_MARK;
     }
 
-    let state = match unsafe { get_state_ref(strm) } {
-        Some(s) => s,
-        None => return ERROR_MARK,
+    let Some(state) = (unsafe { get_state_ref(strm) }) else {
+        return ERROR_MARK;
     };
 
     zlib_rs::inflate::inflate_mark(state) as c_long
@@ -855,17 +824,13 @@ pub unsafe extern "C" fn inflateMark(strm: *mut z_stream) -> c_long {
 /// to a `gz_header` struct.
 #[unsafe(no_mangle)]
 #[allow(non_snake_case, clippy::cast_lossless)]
-pub unsafe extern "C" fn inflateGetHeader(
-    strm: *mut z_stream,
-    head: *mut gz_header,
-) -> c_int {
+pub unsafe extern "C" fn inflateGetHeader(strm: *mut z_stream, head: *mut gz_header) -> c_int {
     if strm.is_null() || head.is_null() {
         return Z_STREAM_ERROR;
     }
 
-    let state = match unsafe { get_state_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(state) = (unsafe { get_state_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     // Convert the C gz_header to a Rust GzHeader.
@@ -874,6 +839,7 @@ pub unsafe extern "C" fn inflateGetHeader(
     let head_ref = unsafe { &*head };
     let rust_header = zlib_rs::stream::GzHeader {
         text: head_ref.text != 0,
+        #[allow(clippy::cast_possible_truncation)]
         time: head_ref.time as u32,
         xflags: head_ref.xflags,
         os: head_ref.os,
@@ -929,8 +895,7 @@ pub unsafe extern "C" fn inflateBackInit_(
 
     // Create a new InflateState and initialize it for back mode.
     let mut state = zlib_rs::inflate::InflateState::new();
-    let ret =
-        zlib_rs::inflate::back::inflate_back_init(&mut state, windowBits);
+    let ret = zlib_rs::inflate::back::inflate_back_init(&mut state, windowBits);
 
     if ret != zlib_rs::error::ReturnCode::Ok {
         return ret as c_int;
@@ -938,7 +903,7 @@ pub unsafe extern "C" fn inflateBackInit_(
 
     // Store the state in the C stream.
     let strm_ref = unsafe { &mut *strm };
-    strm_ref.state = Box::into_raw(Box::new(state)) as *mut c_void;
+    strm_ref.state = Box::into_raw(Box::new(state)).cast::<c_void>();
     strm_ref.msg = std::ptr::null();
 
     ret as c_int
@@ -979,18 +944,15 @@ pub unsafe extern "C" fn inflateBack(
 
     // Validate callback function pointers. `in_func` and `out_func` are
     // `Option<unsafe extern "C" fn(...)>`, so `None` means null pointer.
-    let in_callback = match in_fn {
-        Some(f) => f,
-        None => return Z_STREAM_ERROR,
+    let Some(in_callback) = in_fn else {
+        return Z_STREAM_ERROR;
     };
-    let out_callback = match out_fn {
-        Some(f) => f,
-        None => return Z_STREAM_ERROR,
+    let Some(out_callback) = out_fn else {
+        return Z_STREAM_ERROR;
     };
 
-    let state = match unsafe { get_state_mut(strm) } {
-        Some(s) => s,
-        None => return Z_STREAM_ERROR,
+    let Some(state) = (unsafe { get_state_mut(strm) }) else {
+        return Z_STREAM_ERROR;
     };
 
     let mut rust_stream = unsafe { build_rust_stream(strm) };
@@ -1003,9 +965,7 @@ pub unsafe extern "C" fn inflateBack(
         if avail == 0 || buf_ptr.is_null() {
             return Vec::new();
         }
-        let slice = unsafe {
-            std::slice::from_raw_parts(buf_ptr, avail as usize)
-        };
+        let slice = unsafe { std::slice::from_raw_parts(buf_ptr, avail as usize) };
         slice.to_vec()
     };
 
@@ -1013,13 +973,8 @@ pub unsafe extern "C" fn inflateBack(
         if data.is_empty() {
             return true;
         }
-        let result = unsafe {
-            out_callback(
-                out_desc,
-                data.as_ptr() as *mut c_uchar,
-                data.len() as c_uint,
-            )
-        };
+        let result =
+            unsafe { out_callback(out_desc, data.as_ptr().cast_mut(), data.len() as c_uint) };
         result == 0
     };
 
@@ -1033,7 +988,7 @@ pub unsafe extern "C" fn inflateBack(
     // Sync back error message if one was set.
     let strm_ref = unsafe { &mut *strm };
     match rust_stream.msg {
-        Some(msg) => strm_ref.msg = msg.as_ptr() as *const c_char,
+        Some(msg) => strm_ref.msg = msg.as_ptr().cast::<c_char>(),
         None => strm_ref.msg = std::ptr::null(),
     }
 
@@ -1064,7 +1019,7 @@ pub unsafe extern "C" fn inflateBackEnd(strm: *mut z_stream) -> c_int {
 
     // Reconstruct the Box to get mutable access, then clean up via
     // the core inflate_back_end function which releases internal buffers.
-    let state_ptr = strm_ref.state as *mut zlib_rs::inflate::InflateState;
+    let state_ptr = strm_ref.state.cast::<zlib_rs::inflate::InflateState>();
     let mut state = unsafe { Box::from_raw(state_ptr) };
 
     let ret = zlib_rs::inflate::back::inflate_back_end(&mut state);

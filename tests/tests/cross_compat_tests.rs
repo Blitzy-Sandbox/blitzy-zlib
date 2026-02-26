@@ -24,9 +24,9 @@
 
 use std::io::{Read, Write};
 
+use flate2::Compression;
 use flate2::read::{DeflateDecoder, DeflateEncoder, GzDecoder, ZlibDecoder};
 use flate2::write::{GzEncoder as GzWriteEncoder, ZlibEncoder as ZlibWriteEncoder};
-use flate2::Compression;
 
 use zlib_rs::deflate;
 use zlib_rs::inflate;
@@ -63,7 +63,11 @@ fn zlib_rs_streaming_compress(data: &[u8], window_bits: i32, level: i32) -> Vec<
     while ret == ReturnCode::Ok {
         ret = deflate::deflate(&mut stream, Z_FINISH);
     }
-    assert_eq!(ret, ReturnCode::StreamEnd, "deflate did not complete: {ret:?}");
+    assert_eq!(
+        ret,
+        ReturnCode::StreamEnd,
+        "deflate did not complete: {ret:?}"
+    );
 
     let output = stream.take_output();
     let _ = deflate::deflate_end(&mut stream);
@@ -253,7 +257,10 @@ fn test_rust_compress_flate2_decompress_zlib_small() {
     let source = &HELLO[..HELLO.len() - 1]; // strip NUL terminator
     let mut compressed = Vec::new();
     compress(&mut compressed, source).expect("zlib-rs compress failed");
-    assert!(!compressed.is_empty(), "compressed output must not be empty");
+    assert!(
+        !compressed.is_empty(),
+        "compressed output must not be empty"
+    );
     let decompressed = flate2_zlib_decompress(&compressed);
     assert_bytes_equal(&decompressed, source, "small zlib-rs→flate2");
 }
@@ -350,29 +357,34 @@ fn test_flate2_compress_rust_decompress_all_levels() {
 // Phase 4: Gzip Format Cross-Compatibility
 // =============================================================================
 
-/// zlib-rs compresses with gzip framing (windowBits = MAX_WBITS + 16 = 31),
+/// zlib-rs compresses with gzip framing (`windowBits` = `MAX_WBITS` + 16 = 31),
 /// flate2 decompresses with its `GzDecoder`.
 #[test]
 fn test_rust_compress_flate2_decompress_gzip() {
     let data = generate_medium_data();
     let gzip_window_bits = MAX_WBITS + 16; // 31 → gzip format
-    let compressed =
-        zlib_rs_streaming_compress(&data, gzip_window_bits, Z_DEFAULT_COMPRESSION);
-    assert!(!compressed.is_empty(), "gzip compressed output must not be empty");
+    let compressed = zlib_rs_streaming_compress(&data, gzip_window_bits, Z_DEFAULT_COMPRESSION);
+    assert!(
+        !compressed.is_empty(),
+        "gzip compressed output must not be empty"
+    );
 
     let decompressed = flate2_gz_decompress(&compressed);
     assert_bytes_equal(&decompressed, &data, "gzip zlib-rs→flate2");
 }
 
 /// flate2 compresses with gzip framing, zlib-rs decompresses using
-/// windowBits = MAX_WBITS + 32 = 47 (auto-detect zlib / gzip).
+/// `windowBits` = `MAX_WBITS` + 32 = 47 (auto-detect zlib / gzip).
 #[test]
 fn test_flate2_compress_rust_decompress_gzip() {
     let data = generate_medium_data();
     let compressed = flate2_gz_compress(&data, 6);
-    assert!(!compressed.is_empty(), "flate2 gzip output must not be empty");
+    assert!(
+        !compressed.is_empty(),
+        "flate2 gzip output must not be empty"
+    );
 
-    // auto-detect: windowBits = MAX_WBITS + 32 = 47 accepts either zlib or gzip.
+    // auto-detect: `windowBits` = `MAX_WBITS` + 32 = 47 accepts either zlib or gzip.
     let auto_detect_window_bits = MAX_WBITS + 32; // 47
     let decompressed =
         zlib_rs_streaming_decompress(&compressed, auto_detect_window_bits, data.len());
@@ -388,8 +400,7 @@ fn test_flate2_compress_rust_decompress_gzip() {
 fn test_rust_compress_flate2_decompress_raw() {
     let data = generate_medium_data();
     let raw_window_bits = -MAX_WBITS; // −15 → raw DEFLATE
-    let compressed =
-        zlib_rs_streaming_compress(&data, raw_window_bits, Z_DEFAULT_COMPRESSION);
+    let compressed = zlib_rs_streaming_compress(&data, raw_window_bits, Z_DEFAULT_COMPRESSION);
     assert!(
         !compressed.is_empty(),
         "raw compressed output must not be empty"
@@ -404,11 +415,13 @@ fn test_rust_compress_flate2_decompress_raw() {
 fn test_flate2_compress_rust_decompress_raw() {
     let data = generate_medium_data();
     let compressed = flate2_raw_compress(&data, 6);
-    assert!(!compressed.is_empty(), "flate2 raw output must not be empty");
+    assert!(
+        !compressed.is_empty(),
+        "flate2 raw output must not be empty"
+    );
 
     let raw_window_bits = -MAX_WBITS; // −15
-    let decompressed =
-        zlib_rs_streaming_decompress(&compressed, raw_window_bits, data.len());
+    let decompressed = zlib_rs_streaming_decompress(&compressed, raw_window_bits, data.len());
     assert_bytes_equal(&decompressed, &data, "raw flate2→zlib-rs");
 }
 
@@ -539,7 +552,7 @@ fn test_cross_compat_streaming() {
         &mut stream,
         Z_DEFAULT_COMPRESSION,
         Z_DEFLATED,
-        MAX_WBITS,    // zlib format
+        MAX_WBITS, // zlib format
         DEF_MEM_LEVEL,
         Z_DEFAULT_STRATEGY,
     );
@@ -552,20 +565,12 @@ fn test_cross_compat_streaming() {
     // --- Chunk 1: compress with Z_SYNC_FLUSH ---
     stream.set_input(&data[..chunk_size]);
     let ret = deflate::deflate(&mut stream, Z_SYNC_FLUSH);
-    assert_eq!(
-        ret,
-        ReturnCode::Ok,
-        "sync flush chunk 1 failed: {ret:?}"
-    );
+    assert_eq!(ret, ReturnCode::Ok, "sync flush chunk 1 failed: {ret:?}");
 
     // --- Chunk 2: compress with Z_SYNC_FLUSH ---
     stream.set_input(&data[chunk_size..chunk_size * 2]);
     let ret = deflate::deflate(&mut stream, Z_SYNC_FLUSH);
-    assert_eq!(
-        ret,
-        ReturnCode::Ok,
-        "sync flush chunk 2 failed: {ret:?}"
-    );
+    assert_eq!(ret, ReturnCode::Ok, "sync flush chunk 2 failed: {ret:?}");
 
     // --- Chunk 3: finish the stream ---
     stream.set_input(&data[chunk_size * 2..]);

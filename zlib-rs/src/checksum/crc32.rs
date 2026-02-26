@@ -7,8 +7,8 @@
 //! The lookup table is a compile-time `const` array, eliminating the need for
 //! the C library's `DYNAMIC_CRC_TABLE` runtime initialization pattern.
 //!
-//! Provides [`crc32`], [`crc32_z`], [`crc32_combine`], [`crc32_combine_op`],
-//! [`crc32_combine_gen`], and [`get_crc_table`] functions matching the C zlib
+//! Provides `crc32`, `crc32_z`, `crc32_combine`, `crc32_combine_op`,
+//! `crc32_combine_gen`, and `get_crc_table` functions matching the C zlib
 //! API semantics.
 //!
 //! Ported from `crc32.c` and `crc32.h` (zlib 1.3.2.1-motley).

@@ -1,7 +1,7 @@
 //! Fast-path inflate decoder for literal, length, and distance codes.
 //!
 //! This module ports `inffast.c` (321 lines) and `inffast.h` (11 lines) from
-//! the C zlib library into safe Rust. The [`inflate_fast`] function is the
+//! the C zlib library into safe Rust. The `inflate_fast` function is the
 //! **performance-critical inner decode loop** of the inflate engine. When
 //! sufficient input (≥ 6 bytes) and output (≥ 258 bytes) are available, the
 //! main `inflate()` function dispatches here to process literal, length, and
@@ -13,7 +13,7 @@
 //! # Entry Assumptions
 //!
 //! The caller must ensure the following invariants before calling
-//! [`inflate_fast`]:
+//! `inflate_fast`:
 //!
 //! - `state.mode == InflateMode::Len`
 //! - At least 6 input bytes available beyond `in_pos`
@@ -234,9 +234,7 @@ pub(crate) fn inflate_fast(
                             if window_back > whave {
                                 if state.sane {
                                     state.mode = InflateMode::Bad;
-                                    error_msg = Some(
-                                        "invalid distance too far back",
-                                    );
+                                    error_msg = Some("invalid distance too far back");
                                     break 'outer;
                                 }
                                 // If !sane, invalid distance is tolerated
@@ -257,17 +255,16 @@ pub(crate) fn inflate_fast(
                             // After sub-case logic, `from_window` and
                             // `src_idx` describe where the shared unrolled
                             // copy should read remaining bytes from.
-                            let (from_window, mut src_idx) =
-                                copy_from_window_subcases(
-                                    state,
-                                    output,
-                                    out_pos,
-                                    &mut remaining,
-                                    window_back,
-                                    wsize,
-                                    wnext,
-                                    dist,
-                                );
+                            let (from_window, mut src_idx) = copy_from_window_subcases(
+                                state,
+                                output,
+                                out_pos,
+                                &mut remaining,
+                                window_back,
+                                wsize,
+                                wnext,
+                                dist,
+                            );
 
                             // Shared unrolled copy for the remaining bytes
                             // (3 bytes per iteration, then 1–2 remainder).
@@ -280,12 +277,7 @@ pub(crate) fn inflate_fast(
                                     remaining,
                                 );
                             } else {
-                                unrolled_copy_from_output(
-                                    output,
-                                    out_pos,
-                                    &mut src_idx,
-                                    remaining,
-                                );
+                                unrolled_copy_from_output(output, out_pos, &mut src_idx, remaining);
                             }
                         } else {
                             // ── Copy direct from output ────────────────
@@ -329,10 +321,8 @@ pub(crate) fn inflate_fast(
                         // The entry is a sub-table link. val is the offset
                         // to the sub-table; the low `op` bits of hold
                         // index into it.
-                        here = state.dist_code(
-                            u32::from(here.val)
-                                + ((hold as u32) & ((1u32 << op) - 1)),
-                        );
+                        here = state
+                            .dist_code(u32::from(here.val) + ((hold as u32) & ((1u32 << op) - 1)));
                         continue 'dodist;
                     }
 
@@ -349,10 +339,7 @@ pub(crate) fn inflate_fast(
                 // ── 2nd-level length code ──────────────────────────────
                 // The entry is a sub-table link. val is the offset to the
                 // sub-table; the low `op` bits of hold index into it.
-                here = state.len_code(
-                    u32::from(here.val)
-                        + ((hold as u32) & ((1u32 << op) - 1)),
-                );
+                here = state.len_code(u32::from(here.val) + ((hold as u32) & ((1u32 << op) - 1)));
                 continue 'dolen;
             }
 
@@ -576,7 +563,7 @@ mod tests {
     use crate::inflate::state::CodeTableRef;
     use crate::inflate::table::Code;
 
-    /// Build a minimal InflateState configured for testing inflate_fast.
+    /// Build a minimal `InflateState` configured for testing `inflate_fast`.
     fn make_test_state(
         lencode: &'static [Code],
         distcode: &'static [Code],
@@ -615,7 +602,9 @@ mod tests {
     ) -> Option<&'static str> {
         let in_end = input.len().saturating_sub(5);
         let out_end = output.len().saturating_sub(257);
-        inflate_fast(state, input, output, in_pos, out_pos, in_end, out_end, start)
+        inflate_fast(
+            state, input, output, in_pos, out_pos, in_end, out_end, start,
+        )
     }
 
     #[test]
@@ -629,7 +618,12 @@ mod tests {
         let mut out_pos = 0usize;
 
         let msg = call_inflate_fast(
-            &mut state, &input, &mut output, &mut in_pos, &mut out_pos, 0,
+            &mut state,
+            &input,
+            &mut output,
+            &mut in_pos,
+            &mut out_pos,
+            0,
         );
 
         assert!(msg.is_none(), "Expected no error, got: {msg:?}");
@@ -655,7 +649,12 @@ mod tests {
         let mut out_pos = 0usize;
 
         let msg = call_inflate_fast(
-            &mut state, &input, &mut output, &mut in_pos, &mut out_pos, 0,
+            &mut state,
+            &input,
+            &mut output,
+            &mut in_pos,
+            &mut out_pos,
+            0,
         );
 
         assert!(msg.is_none());
@@ -677,7 +676,12 @@ mod tests {
         let mut out_pos = 0usize;
 
         let msg = call_inflate_fast(
-            &mut state, &input, &mut output, &mut in_pos, &mut out_pos, 0,
+            &mut state,
+            &input,
+            &mut output,
+            &mut in_pos,
+            &mut out_pos,
+            0,
         );
 
         assert_eq!(msg, Some("invalid literal/length code"));
@@ -697,7 +701,12 @@ mod tests {
         let mut out_pos = 0usize;
 
         call_inflate_fast(
-            &mut state, &input, &mut output, &mut in_pos, &mut out_pos, 0,
+            &mut state,
+            &input,
+            &mut output,
+            &mut in_pos,
+            &mut out_pos,
+            0,
         );
 
         // back should be reset to 0 by inflate_fast.
@@ -733,7 +742,12 @@ mod tests {
         let mut out_pos = 0usize;
 
         let msg = call_inflate_fast(
-            &mut state, &input, &mut output, &mut in_pos, &mut out_pos, 0,
+            &mut state,
+            &input,
+            &mut output,
+            &mut in_pos,
+            &mut out_pos,
+            0,
         );
 
         assert_eq!(msg, Some("invalid distance too far back"));

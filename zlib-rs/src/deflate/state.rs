@@ -29,12 +29,11 @@
 // This module contains **zero** `unsafe` blocks. All buffer management uses
 // safe Rust indexing and owned collections.
 
+use super::params::{CONFIGURATION_TABLE, CompressionConfig, get_config};
 use crate::constants::{
-    BL_CODES, BUF_SIZE, D_CODES, HEAP_SIZE, L_CODES, MAX_BITS, MAX_MATCH, MIN_MATCH,
-    Z_UNKNOWN,
+    BL_CODES, BUF_SIZE, D_CODES, HEAP_SIZE, L_CODES, MAX_BITS, MAX_MATCH, MIN_MATCH, Z_UNKNOWN,
 };
 use crate::stream::GzHeader;
-use super::params::{CompressionConfig, CONFIGURATION_TABLE, get_config};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -100,7 +99,7 @@ pub enum DeflateStatus {
     ///
     /// Entered after `deflateInit2` with `wrap == 2` (gzip wrapper). The
     /// engine will emit the 10-byte gzip header, then optionally transition
-    /// through [`Extra`], [`Name`], [`Comment`], and [`Hcrc`] states before
+    /// through `Extra`, `Name`, `Comment`, and `Hcrc` states before
     /// reaching [`Busy`](DeflateStatus::Busy).
     GzipHeader,
 
@@ -361,7 +360,6 @@ impl Default for TreeDescState {
 #[derive(Debug, Clone)]
 pub struct DeflateState {
     // ─── Stream Status ───────────────────────────────────────────────────
-
     /// Current state in the deflate state machine.
     ///
     /// Tracks progression from header emission through active compression
@@ -369,7 +367,6 @@ pub struct DeflateState {
     pub status: DeflateStatus,
 
     // ─── Pending Output Buffer ───────────────────────────────────────────
-
     /// Output buffer for compressed data not yet flushed to the stream.
     ///
     /// Compressed bytes are appended here by the Huffman encoder and block
@@ -391,7 +388,6 @@ pub struct DeflateState {
     pub pending_buf_size: usize,
 
     // ─── Header / Trailer State ──────────────────────────────────────────
-
     /// Wrapper format selector.
     ///
     /// - `0` — raw DEFLATE (no header or trailer)
@@ -416,14 +412,12 @@ pub struct DeflateState {
     pub gzip_index: usize,
 
     // ─── Compression Method ──────────────────────────────────────────────
-
     /// Compression method identifier.
     ///
     /// Always `Z_DEFLATED` (8). Stored here for protocol header emission.
     pub method: u8,
 
     // ─── Flush Handling ──────────────────────────────────────────────────
-
     /// Value of the `flush` parameter from the previous `deflate()` call.
     ///
     /// Used to detect whether the caller has changed flush mode between
@@ -432,7 +426,6 @@ pub struct DeflateState {
     pub last_flush: i32,
 
     // ─── Sliding Window ──────────────────────────────────────────────────
-
     /// Sliding window buffer.
     ///
     /// Input bytes are read into the second half of the window, then slid
@@ -458,7 +451,6 @@ pub struct DeflateState {
     pub w_mask: usize,
 
     // ─── Hash Chains ─────────────────────────────────────────────────────
-
     /// Previous-position links for hash chains.
     ///
     /// `prev[pos & w_mask]` holds the previous window position that shares
@@ -497,7 +489,6 @@ pub struct DeflateState {
     pub hash_shift: u32,
 
     // ─── Match State ─────────────────────────────────────────────────────
-
     /// Number of valid bytes ahead of `strstart` in the window.
     pub lookahead: usize,
 
@@ -528,7 +519,6 @@ pub struct DeflateState {
     pub insert: usize,
 
     // ─── Block State ─────────────────────────────────────────────────────
-
     /// Window position at the beginning of the current output block.
     ///
     /// May become negative when the window is slid backwards, which is why
@@ -539,7 +529,6 @@ pub struct DeflateState {
     pub slid: bool,
 
     // ─── Compression Configuration ───────────────────────────────────────
-
     /// Maximum hash chain length to search per match attempt.
     pub max_chain_length: usize,
 
@@ -562,7 +551,6 @@ pub struct DeflateState {
     pub strategy: i32,
 
     // ─── Huffman Trees ───────────────────────────────────────────────────
-
     /// Dynamic literal/length Huffman tree.
     ///
     /// Size is `HEAP_SIZE` (573) entries, matching `dyn_ltree[HEAP_SIZE]`.
@@ -609,7 +597,6 @@ pub struct DeflateState {
     pub depth: [u8; HEAP_SIZE],
 
     // ─── Symbol Buffer ───────────────────────────────────────────────────
-
     /// Buffer for match distances and literal bytes (3 bytes per symbol).
     ///
     /// Size is `lit_bufsize × 3`.
@@ -632,7 +619,6 @@ pub struct DeflateState {
     pub matches: u32,
 
     // ─── Bit Buffer ──────────────────────────────────────────────────────
-
     /// Pending output bit accumulator (16-bit width).
     pub bi_buf: u16,
 
@@ -643,7 +629,6 @@ pub struct DeflateState {
     pub bi_used: i32,
 
     // ─── Bookkeeping ─────────────────────────────────────────────────────
-
     /// Bit length of the current block with optimal Huffman trees.
     pub opt_len: u64,
 
@@ -654,10 +639,9 @@ pub struct DeflateState {
     pub high_water: usize,
 
     // ─── Data Type Classification ────────────────────────────────────────
-
     /// Detected data type classification for the current block.
     ///
-    /// Set by [`detect_data_type`](super::trees::detect_data_type) in
+    /// Set by `detect_data_type` in
     /// `tr_flush_block` when the stream's `data_type` is `Z_UNKNOWN`.
     /// Propagated to `stream.data_type` by the block flushing logic so
     /// that the public API correctly reports `Z_BINARY`, `Z_TEXT`, or
@@ -725,8 +709,7 @@ impl DeflateState {
         // ── Load compression config ──────────────────────────────────────
         // get_config returns None for levels outside 0..=9; fall back to
         // the level-0 (stored) configuration in that case.
-        let config: &CompressionConfig = get_config(level)
-            .unwrap_or(&CONFIGURATION_TABLE[0]);
+        let config: &CompressionConfig = get_config(level).unwrap_or(&CONFIGURATION_TABLE[0]);
 
         // ── Initial status ───────────────────────────────────────────────
         let status = if wrap == 2 {
@@ -1032,11 +1015,12 @@ mod tests {
 
     #[test]
     fn ct_data_fields_independent() {
-        let mut ct = CtData::default();
-        ct.freq = 42;
-        ct.code = 99;
-        ct.dad = 7;
-        ct.len = 15;
+        let ct = CtData {
+            freq: 42,
+            code: 99,
+            dad: 7,
+            len: 15,
+        };
         assert_eq!(ct.freq, 42);
         assert_eq!(ct.code, 99);
         assert_eq!(ct.dad, 7);
@@ -1045,7 +1029,12 @@ mod tests {
 
     #[test]
     fn ct_data_copy_clone() {
-        let ct = CtData { freq: 1, code: 2, dad: 3, len: 4 };
+        let ct = CtData {
+            freq: 1,
+            code: 2,
+            dad: 3,
+            len: 4,
+        };
         let ct2 = ct;
         assert_eq!(ct, ct2);
     }
@@ -1175,6 +1164,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_sign_loss)]
     fn new_all_levels_load_correct_config() {
         for lvl in 0..=9 {
             let state = DeflateState::new(15, 8, 8, 0, lvl, 1);

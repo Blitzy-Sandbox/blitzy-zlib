@@ -1,3 +1,4 @@
+#![allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! Gzip file I/O round-trip tests.
 //!
 //! Tests [`GzReader`], [`GzWriter`], seek, transparent read, and gzip file
@@ -195,7 +196,10 @@ fn test_gz_write_empty() {
     }
 
     let data = read_gz_file(path);
-    assert!(data.is_empty(), "empty gzip file should decompress to empty");
+    assert!(
+        data.is_empty(),
+        "empty gzip file should decompress to empty"
+    );
 }
 
 /// Test explicit `gz_flush` with `Z_SYNC_FLUSH`.
@@ -284,8 +288,7 @@ fn test_gz_write_set_params() {
 
     let data = read_gz_file(path);
     assert_eq!(
-        data,
-        b"default level best speed best compression",
+        data, b"default level best speed best compression",
         "set_params round-trip content"
     );
 }
@@ -298,11 +301,8 @@ fn test_gz_write_no_compression() {
 
     {
         // "w0" sets compression level 0 (Z_NO_COMPRESSION)
-        let mut writer = GzWriter::open_with_mode(path, "w0")
-            .expect("open_with_mode(w0) failed");
-        writer
-            .write_all(b"stored mode data")
-            .expect("write failed");
+        let mut writer = GzWriter::open_with_mode(path, "w0").expect("open_with_mode(w0) failed");
+        writer.write_all(b"stored mode data").expect("write failed");
         writer.close().expect("close failed");
     }
 
@@ -521,7 +521,11 @@ fn test_gz_tell_offset() {
     assert_eq!(n, 10, "should read exactly 10 bytes");
 
     // tell should reflect the uncompressed position
-    assert_eq!(reader.tell(), 10, "tell should be 10 after reading 10 bytes");
+    assert_eq!(
+        reader.tell(),
+        10,
+        "tell should be 10 after reading 10 bytes"
+    );
 
     // offset returns the compressed file position (must be non-negative)
     let off = reader.offset();
@@ -548,7 +552,7 @@ fn test_gz_transparent_read() {
         let mut file = std::fs::File::create(path).expect("File::create failed");
         file.write_all(raw_data).expect("raw write failed");
         // Verify file position via Seek trait
-        let pos = file.seek(SeekFrom::Current(0)).expect("seek failed");
+        let pos = file.stream_position().expect("seek failed");
         assert_eq!(pos, raw_data.len() as u64, "file position after write");
     }
 
@@ -715,8 +719,8 @@ fn test_gz_multiple_members() {
 
     // Append second gzip member using 'a' (append) mode
     {
-        let mut writer = GzWriter::open_with_mode(path, "ab")
-            .expect("GzWriter::open_with_mode('ab') failed");
+        let mut writer =
+            GzWriter::open_with_mode(path, "ab").expect("GzWriter::open_with_mode('ab') failed");
         writer
             .write_all(b"second member")
             .expect("second member write failed");
@@ -726,8 +730,7 @@ fn test_gz_multiple_members() {
     // Read all — should get both members' data concatenated
     let data = read_gz_file(path);
     assert_eq!(
-        data,
-        b"first member second member",
+        data, b"first member second member",
         "multiple gzip members should be concatenated on read"
     );
 }
@@ -750,8 +753,7 @@ fn test_gz_write_best_compression() {
 
     {
         // "w9" sets Z_BEST_COMPRESSION (level 9)
-        let mut writer = GzWriter::open_with_mode(path, "w9")
-            .expect("open_with_mode('w9') failed");
+        let mut writer = GzWriter::open_with_mode(path, "w9").expect("open_with_mode('w9') failed");
         writer.write_all(&data).expect("write failed");
         writer.close().expect("close failed");
     }
@@ -770,8 +772,7 @@ fn test_gz_write_best_speed() {
 
     {
         // "w1" sets Z_BEST_SPEED (level 1)
-        let mut writer = GzWriter::open_with_mode(path, "w1")
-            .expect("open_with_mode('w1') failed");
+        let mut writer = GzWriter::open_with_mode(path, "w1").expect("open_with_mode('w1') failed");
         writer.write_all(data).expect("write failed");
         writer.close().expect("close failed");
     }
@@ -822,8 +823,7 @@ fn test_gz_write_set_params_default() {
 
     {
         // Start with best speed
-        let mut writer = GzWriter::open_with_mode(path, "w1")
-            .expect("open_with_mode('w1') failed");
+        let mut writer = GzWriter::open_with_mode(path, "w1").expect("open_with_mode('w1') failed");
         writer.write_all(b"speed ").expect("write failed");
 
         // Switch to Z_DEFAULT_COMPRESSION
@@ -843,8 +843,7 @@ fn test_gz_write_set_params_default() {
 
     let data = read_gz_file(path);
     assert_eq!(
-        data,
-        b"speed default stored",
+        data, b"speed default stored",
         "set_params multi-level round-trip"
     );
 }

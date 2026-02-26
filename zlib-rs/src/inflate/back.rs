@@ -29,14 +29,14 @@
 
 // MAX_MATCH (258) is the maximum DEFLATE match length; used for inflate_fast
 // threshold check and match length validation bounds.
+use super::fixed::inflate_fixed;
+use super::state::{CodeTableRef, InflateMode, InflateState};
+use super::table::{CodeType, ENOUGH, inflate_table};
 #[allow(unused_imports)]
 use crate::constants::MAX_MATCH;
 use crate::constants::MAX_WBITS;
 use crate::error::ReturnCode;
 use crate::stream::ZStream;
-use super::fixed::inflate_fixed;
-use super::state::{CodeTableRef, InflateMode, InflateState};
-use super::table::{CodeType, inflate_table, ENOUGH};
 
 // inflate_fast is imported for future optimization integration; the current
 // implementation uses the complete slow-path decode to avoid aliasing issues
@@ -373,8 +373,7 @@ pub fn inflate_back(
                         have -= 1;
                         bits += 8;
                     }
-                    state.lens[ORDER[state.have as usize] as usize] =
-                        bits_val(hold, 3) as u16;
+                    state.lens[ORDER[state.have as usize] as usize] = bits_val(hold, 3) as u16;
                     hold >>= 3;
                     bits -= 3;
                     state.have += 1;
@@ -388,7 +387,14 @@ pub fn inflate_back(
 
                 // Build the code lengths table
                 state.next = 0;
-                state.codes.resize(ENOUGH, super::table::Code { op: 0, bits: 0, val: 0 });
+                state.codes.resize(
+                    ENOUGH,
+                    super::table::Code {
+                        op: 0,
+                        bits: 0,
+                        val: 0,
+                    },
+                );
                 let mut lenbits_temp = 7u32;
                 let build_result = inflate_table(
                     CodeType::Codes,
@@ -850,11 +856,7 @@ pub fn inflate_back(
 
                 // Validate distance against available window data
                 // whave < wsize means window not yet fully populated
-                let correction = if state.whave < state.wsize {
-                    left
-                } else {
-                    0
-                };
+                let correction = if state.whave < state.wsize { left } else { 0 };
                 let max_dist = wsize - correction;
                 if state.offset as usize > max_dist {
                     stream.msg = Some("invalid distance too far back");
@@ -1059,24 +1061,21 @@ mod tests {
         // Construct a raw DEFLATE stream with a single stored block.
         // Block header: BFINAL=1, BTYPE=00 (stored) = 0b001 = 0x01
         // Then byte-aligned: LEN=0x0005, NLEN=0xFFFA, data = "hello"
-        let mut deflate_data: Vec<u8> = Vec::new();
-        deflate_data.push(0x01); // BFINAL=1, BTYPE=00
-        // LEN = 5 (little-endian)
-        deflate_data.push(0x05);
-        deflate_data.push(0x00);
-        // NLEN = ~5 = 0xFFFA (little-endian)
-        deflate_data.push(0xFA);
-        deflate_data.push(0xFF);
-        // Data: "hello"
-        deflate_data.extend_from_slice(b"hello");
+        let deflate_data: Vec<u8> = vec![
+            0x01, // BFINAL=1, BTYPE=00
+            0x05, 0x00, // LEN = 5 (little-endian)
+            0xFA, 0xFF, // NLEN = ~5 = 0xFFFA (little-endian)
+            // Data: "hello"
+            b'h', b'e', b'l', b'l', b'o',
+        ];
 
         let mut input_called = false;
         let mut input_cb = move || -> Vec<u8> {
-            if !input_called {
+            if input_called {
+                Vec::new()
+            } else {
                 input_called = true;
                 deflate_data.clone()
-            } else {
-                Vec::new()
             }
         };
 
@@ -1097,11 +1096,13 @@ mod tests {
     fn test_order_constant() {
         assert_eq!(
             ORDER,
-            [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+            [
+                16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
+            ]
         );
     }
 
-    /// Verify bits_val extraction helper.
+    /// Verify `bits_val` extraction helper.
     #[test]
     fn test_bits_val() {
         assert_eq!(bits_val(0xFF, 4), 0x0F);

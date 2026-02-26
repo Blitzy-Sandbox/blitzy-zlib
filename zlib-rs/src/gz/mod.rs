@@ -8,8 +8,8 @@
 //!
 //! - [`GzReader`] — Buffered gzip reader with auto-detect pipeline
 //! - [`GzWriter`] — Buffered gzip writer with compression
-//! - [`GzFile`] — Unified handle wrapping either a reader or writer
-//! - [`GzState`](state::GzState) — Internal state shared between reader/writer
+//! - `GzFile` — Unified handle wrapping either a reader or writer
+//! - `GzState` — Internal state shared between reader/writer
 //!
 //! # Ported From
 //!
@@ -26,10 +26,10 @@
 
 /// Gzip read pipeline with LOOK/COPY/GZIP auto-detection.
 pub mod read;
-/// Gzip write pipeline with buffered compression.
-pub mod write;
 /// Internal state types for the gzip file I/O layer.
 pub(crate) mod state;
+/// Gzip write pipeline with buffered compression.
+pub mod write;
 
 // ─── Re-exports ─────────────────────────────────────────────────────────────
 
@@ -357,11 +357,7 @@ pub(crate) fn gz_reset(state: &mut GzState) {
 /// - The computed position would be negative
 // Retained for C API parity; called from gz FFI dispatch path.
 #[allow(dead_code)]
-pub(crate) fn gz_seek(
-    state: &mut GzState,
-    offset: i64,
-    whence: i32,
-) -> io::Result<i64> {
+pub(crate) fn gz_seek(state: &mut GzState, offset: i64, whence: i32) -> io::Result<i64> {
     // Validate mode — must be in a valid read or write state
     if state.mode != GzMode::Read && state.mode != GzMode::Write {
         return Err(io::Error::new(
@@ -401,10 +397,7 @@ pub(crate) fn gz_seek(
     // Fast path: if within raw area while reading (COPY mode), just
     // seek the underlying file directly.
     // gzlib.c lines 396–409
-    if state.mode == GzMode::Read
-        && state.how == GzHow::Copy
-        && state.x.pos + offset >= 0
-    {
+    if state.mode == GzMode::Read && state.how == GzHow::Copy && state.x.pos + offset >= 0 {
         // Compute the seek delta: offset minus buffered-but-undelivered bytes
         #[allow(clippy::cast_possible_wrap)]
         let seek_delta = offset - state.x.have as i64;
@@ -744,7 +737,7 @@ mod tests {
         gz_error(&mut state, Z_BUF_ERROR, Some("stall detected"));
         assert_eq!(state.err, Z_BUF_ERROR);
         assert!(state.msg.is_some());
-        let msg = state.msg.as_ref().map(String::as_str).unwrap_or("");
+        let msg = state.msg.as_deref().unwrap_or("");
         assert!(msg.contains("stall detected"));
     }
 
@@ -873,12 +866,7 @@ mod tests {
     }
 
     /// Creates a `GzState` with specific skip and past values.
-    fn make_test_state_with_skip(
-        mode: GzMode,
-        pos: i64,
-        past: bool,
-        skip: i64,
-    ) -> GzState {
+    fn make_test_state_with_skip(mode: GzMode, pos: i64, past: bool, skip: i64) -> GzState {
         let mut state = make_test_state(mode, Z_OK, pos, past);
         state.skip = skip;
         state

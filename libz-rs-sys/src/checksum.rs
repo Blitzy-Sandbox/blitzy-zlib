@@ -153,11 +153,7 @@ pub unsafe extern "C" fn adler32_z(adler: c_ulong, buf: *const u8, len: usize) -
     clippy::cast_lossless,
     clippy::unnecessary_cast
 )]
-pub extern "C" fn adler32_combine(
-    adler1: c_ulong,
-    adler2: c_ulong,
-    len2: z_off_t,
-) -> c_ulong {
+pub extern "C" fn adler32_combine(adler1: c_ulong, adler2: c_ulong, len2: z_off_t) -> c_ulong {
     // The z_off_t → i64 cast is lossless on LP64 (identity) and sign-extending
     // on ILP32. The core function always takes i64 for portability.
     zlib_rs::checksum::adler32::adler32_combine(adler1 as u32, adler2 as u32, len2 as i64)
@@ -178,11 +174,7 @@ pub extern "C" fn adler32_combine(
 /// Listed in `win32/zlib.def` line 77 under "large file functions".
 #[unsafe(no_mangle)]
 #[allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
-pub extern "C" fn adler32_combine64(
-    adler1: c_ulong,
-    adler2: c_ulong,
-    len2: z_off64_t,
-) -> c_ulong {
+pub extern "C" fn adler32_combine64(adler1: c_ulong, adler2: c_ulong, len2: z_off64_t) -> c_ulong {
     // z_off64_t is i64, which the core function accepts directly.
     zlib_rs::checksum::adler32::adler32_combine(adler1 as u32, adler2 as u32, len2) as c_ulong
 }

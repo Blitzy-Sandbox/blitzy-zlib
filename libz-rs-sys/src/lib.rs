@@ -15,12 +15,12 @@
 //!                  function pointer typedefs, type aliases, and all zlib
 //!                  C-ABI constants (`Z_OK` through `Z_VERSION_ERROR`, flush
 //!                  modes, strategies, levels, etc.).
-//! - [`deflate`]  — Deflate (compression) functions (16 symbols).
-//! - [`inflate`]  — Inflate (decompression) functions (16 symbols).
+//! - [`deflate`](mod@deflate)  — Deflate (compression) functions (16 symbols).
+//! - [`inflate`](mod@inflate)  — Inflate (decompression) functions (16 symbols).
 //! - [`checksum`] — Adler-32 and CRC-32 checksum functions (11 symbols).
-//! - [`compress`] — One-call compress/uncompress wrappers (10 symbols).
+//! - [`compress`](mod@compress) — One-call compress/uncompress wrappers (10 symbols).
 //! - [`version`]  — Version info and undocumented utility functions (10 symbols).
-//! - [`gz`]       — Gzip file I/O functions (33 symbols). Conditionally compiled
+//! - `gz`         — Gzip file I/O functions (33 symbols). Conditionally compiled
 //!                  with the `gz-io` Cargo feature (corresponding to the C
 //!                  `Z_SOLO` exclusion pattern).
 //!
@@ -255,6 +255,7 @@ const _: () = {
 
 /// Compile-time assertion verifying that the version string starts with
 /// the correct major.minor.revision.subrevision prefix.
+#[allow(clippy::cast_possible_truncation)]
 const _: () = {
     // "1.3.2.1-motley\0"
     //  ^ major

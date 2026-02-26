@@ -11,7 +11,7 @@
 //!   the C `z_stream_s` struct from `zlib.h` lines 90–110.
 //! - [`GzHeader`] — Gzip header metadata, replacing the C `gz_header_s`
 //!   struct from `zlib.h` lines 118–133.
-//! - [`Byte`], [`UInt`], [`ULong`] — Type aliases mapping C zlib types to
+//! - `Byte`, `UInt`, `ULong` — Type aliases mapping C zlib types to
 //!   standard Rust integer types.
 //!
 //! # Safety
@@ -478,7 +478,7 @@ impl ZStream {
 
     /// Advances the input read position by `count` bytes.
     ///
-    /// Updates the internal position tracker and increments [`total_in`]
+    /// Updates the internal position tracker and increments `total_in`
     /// by the same amount. Returns [`ReturnCode::Ok`] on success.
     ///
     /// Returns [`ReturnCode::StreamError`] if `count` exceeds the available
@@ -518,7 +518,7 @@ impl ZStream {
 
     /// Advances the output write position by `count` bytes.
     ///
-    /// Updates the internal position tracker and increments [`total_out`]
+    /// Updates the internal position tracker and increments `total_out`
     /// by the same amount. Returns [`ReturnCode::Ok`] on success.
     ///
     /// Returns [`ReturnCode::StreamError`] if `count` exceeds the available
@@ -583,7 +583,7 @@ impl ZStream {
     /// Returns `true` if the current data type is
     /// [`Z_BINARY`](crate::constants::Z_BINARY).
     ///
-    /// This is a convenience method for checking the [`data_type`] field.
+    /// This is a convenience method for checking the `data_type` field.
     ///
     /// # Examples
     ///

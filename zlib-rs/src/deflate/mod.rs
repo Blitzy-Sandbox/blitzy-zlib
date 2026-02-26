@@ -40,10 +40,9 @@ pub use self::state::{DeflateState, DeflateStatus};
 use crate::checksum::adler32;
 use crate::checksum::crc32;
 use crate::constants::{
-    DEF_MEM_LEVEL, MAX_MATCH, MAX_MEM_LEVEL, MAX_WBITS, MIN_MATCH,
-    PRESET_DICT, Z_BLOCK, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY,
-    Z_DEFLATED, Z_FINISH, Z_FIXED, Z_FULL_FLUSH, Z_HUFFMAN_ONLY,
-    Z_NO_FLUSH, Z_PARTIAL_FLUSH, Z_RLE, Z_UNKNOWN,
+    DEF_MEM_LEVEL, MAX_MATCH, MAX_MEM_LEVEL, MAX_WBITS, MIN_MATCH, PRESET_DICT, Z_BLOCK,
+    Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY, Z_DEFLATED, Z_FINISH, Z_FIXED, Z_FULL_FLUSH,
+    Z_HUFFMAN_ONLY, Z_NO_FLUSH, Z_PARTIAL_FLUSH, Z_RLE, Z_UNKNOWN,
 };
 use crate::error::ReturnCode;
 use crate::stream::{GzHeader, ZStream};
@@ -54,7 +53,7 @@ use crate::util;
 /// Minimum amount of lookahead, except at the end of the input.
 ///
 /// Defined as `MAX_MATCH + MIN_MATCH + 1` in `deflate.h` line 296. The
-/// deflate engine calls [`hash::fill_window`] whenever `lookahead` drops
+/// deflate engine calls `hash::fill_window` whenever `lookahead` drops
 /// below this threshold.
 ///
 /// Shared across `hash` and `algorithm` submodules to avoid constant
@@ -62,10 +61,9 @@ use crate::util;
 pub(crate) const MIN_LOOKAHEAD: usize = MAX_MATCH + MIN_MATCH + 1;
 
 use self::algorithm::{
-    deflate_fast, deflate_huff, deflate_rle, deflate_slow, deflate_stored,
-    BlockState,
+    BlockState, deflate_fast, deflate_huff, deflate_rle, deflate_slow, deflate_stored,
 };
-use self::params::{rank, CompressionFunc, CONFIGURATION_TABLE};
+use self::params::{CONFIGURATION_TABLE, CompressionFunc, rank};
 
 // ─── Internal Helpers ────────────────────────────────────────────────────────
 
@@ -152,10 +150,7 @@ fn flush_pending_inner(state: &mut DeflateState, stream: &mut ZStream) {
 fn hcrc_update(state: &DeflateState, stream_adler: u32, beg: usize) -> u32 {
     if let Some(ref gzhead) = state.gzip_header {
         if gzhead.hcrc && state.pending > beg {
-            return crc32::crc32_z(
-                stream_adler,
-                &state.pending_buf[beg..state.pending],
-            );
+            return crc32::crc32_z(stream_adler, &state.pending_buf[beg..state.pending]);
         }
     }
     stream_adler
@@ -395,11 +390,7 @@ pub fn deflate_used(stream: &ZStream) -> Result<i32, ReturnCode> {
 }
 
 /// Insert bits in the deflate output stream.
-pub fn deflate_prime(
-    stream: &mut ZStream,
-    mut bits: i32,
-    mut value: i32,
-) -> ReturnCode {
+pub fn deflate_prime(stream: &mut ZStream, mut bits: i32, mut value: i32) -> ReturnCode {
     if deflate_state_check(stream) {
         return ReturnCode::StreamError;
     }
@@ -441,11 +432,7 @@ pub fn deflate_prime(
 }
 
 /// Dynamically update the compression level and strategy.
-pub fn deflate_params(
-    stream: &mut ZStream,
-    mut level: i32,
-    strategy: i32,
-) -> ReturnCode {
+pub fn deflate_params(stream: &mut ZStream, mut level: i32, strategy: i32) -> ReturnCode {
     if deflate_state_check(stream) {
         return ReturnCode::StreamError;
     }
@@ -465,8 +452,7 @@ pub fn deflate_params(
         let cur_func = CONFIGURATION_TABLE[state.level as usize].func;
         #[allow(clippy::cast_sign_loss)]
         let new_func = CONFIGURATION_TABLE[level as usize].func;
-        (strategy != state.strategy || cur_func != new_func)
-            && state.last_flush != -2
+        (strategy != state.strategy || cur_func != new_func) && state.last_flush != -2
     };
 
     if need_flush {
@@ -482,8 +468,7 @@ pub fn deflate_params(
             clippy::cast_possible_wrap,
             clippy::cast_possible_truncation
         )]
-        let pending_input = (state.strstart as i64 - state.block_start) as usize
-            + state.lookahead;
+        let pending_input = (state.strstart as i64 - state.block_start) as usize + state.lookahead;
         if stream.avail_in() != 0 || pending_input != 0 {
             return ReturnCode::BufError;
         }
@@ -614,10 +599,7 @@ pub fn deflate_bound(stream: &ZStream, source_len: usize) -> usize {
 }
 
 /// Set the preset dictionary for compression.
-pub fn deflate_set_dictionary(
-    stream: &mut ZStream,
-    dictionary: &[u8],
-) -> ReturnCode {
+pub fn deflate_set_dictionary(stream: &mut ZStream, dictionary: &[u8]) -> ReturnCode {
     if deflate_state_check(stream) {
         return ReturnCode::StreamError;
     }
@@ -739,8 +721,7 @@ pub fn deflate_get_dictionary(
         let start = state.strstart + state.lookahead - len;
         let end = start + copy_len;
         if end <= state.window.len() {
-            dictionary[..copy_len]
-                .copy_from_slice(&state.window[start..end]);
+            dictionary[..copy_len].copy_from_slice(&state.window[start..end]);
         }
     }
 
@@ -805,9 +786,7 @@ pub fn deflate(stream: &mut ZStream, flush: i32) -> ReturnCode {
 /// `deflate_params` to call `deflate(Z_BLOCK)` without name collision.
 fn deflate_inner(stream: &mut ZStream, flush: i32) -> ReturnCode {
     // ── Validate ──
-    if deflate_state_check(stream)
-        || !(0..=Z_BLOCK).contains(&flush)
-    {
+    if deflate_state_check(stream) || !(0..=Z_BLOCK).contains(&flush) {
         return ReturnCode::StreamError;
     }
     {
@@ -842,10 +821,7 @@ fn deflate_inner(stream: &mut ZStream, flush: i32) -> ReturnCode {
             stream.state = Some(state_box);
             return ReturnCode::Ok;
         }
-    } else if stream.avail_in() == 0
-        && rank(flush) <= rank(old_flush)
-        && flush != Z_FINISH
-    {
+    } else if stream.avail_in() == 0 && rank(flush) <= rank(old_flush) && flush != Z_FINISH {
         stream.state = Some(state_box);
         return ReturnCode::BufError;
     }
@@ -888,15 +864,11 @@ fn deflate_inner(stream: &mut ZStream, flush: i32) -> ReturnCode {
             }
         };
 
-        if bstate == BlockState::FinishStarted
-            || bstate == BlockState::FinishDone
-        {
+        if bstate == BlockState::FinishStarted || bstate == BlockState::FinishDone {
             state.status = DeflateStatus::Finish;
         }
 
-        if bstate == BlockState::NeedMore
-            || bstate == BlockState::FinishStarted
-        {
+        if bstate == BlockState::NeedMore || bstate == BlockState::FinishStarted {
             if stream.avail_out() == 0 {
                 state.last_flush = -1;
             }
@@ -962,10 +934,7 @@ fn deflate_inner(stream: &mut ZStream, flush: i32) -> ReturnCode {
 /// Returns `Some(ReturnCode)` if the caller should return early,
 /// `None` if header writing is complete and the caller can proceed to
 /// the compression dispatch.
-fn write_header_phase(
-    state: &mut DeflateState,
-    stream: &mut ZStream,
-) -> Option<ReturnCode> {
+fn write_header_phase(state: &mut DeflateState, stream: &mut ZStream) -> Option<ReturnCode> {
     // Raw deflate with no wrapper: skip directly to Busy.
     if state.status == DeflateStatus::Init && state.wrap == 0 {
         state.status = DeflateStatus::Busy;
@@ -1013,25 +982,21 @@ fn write_header_phase(
 }
 
 /// Write the zlib header (CMF + FLG + optional FDICT).
-fn write_zlib_header_impl(
-    state: &mut DeflateState,
-    stream: &mut ZStream,
-) -> Option<ReturnCode> {
+fn write_zlib_header_impl(state: &mut DeflateState, stream: &mut ZStream) -> Option<ReturnCode> {
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let w_bits_adj = (state.w_bits as i32) - 8;
     #[allow(clippy::cast_sign_loss)]
     let header_base = ((Z_DEFLATED + (w_bits_adj << 4)) << 8) as u32;
 
-    let level_flags: u32 =
-        if state.strategy >= Z_HUFFMAN_ONLY || state.level < 2 {
-            0
-        } else if state.level < 6 {
-            1
-        } else if state.level == 6 {
-            2
-        } else {
-            3
-        };
+    let level_flags: u32 = if state.strategy >= Z_HUFFMAN_ONLY || state.level < 2 {
+        0
+    } else if state.level < 6 {
+        1
+    } else if state.level == 6 {
+        2
+    } else {
+        3
+    };
 
     let mut header = header_base | (level_flags << 6);
     if state.strstart != 0 {
@@ -1058,14 +1023,11 @@ fn write_zlib_header_impl(
 }
 
 /// Write the gzip header start (ID1, ID2, CM, FLG, MTIME, XFL, OS).
-fn write_gzip_header_impl(
-    state: &mut DeflateState,
-    stream: &mut ZStream,
-) -> Option<ReturnCode> {
+fn write_gzip_header_impl(state: &mut DeflateState, stream: &mut ZStream) -> Option<ReturnCode> {
     stream.adler = crc32::crc32(0, &[]);
-    put_byte(state, 31);  // ID1
+    put_byte(state, 31); // ID1
     put_byte(state, 139); // ID2
-    put_byte(state, 8);   // CM = deflate
+    put_byte(state, 8); // CM = deflate
 
     if state.gzip_header.is_none() {
         // Minimal header — no user-supplied fields.
@@ -1131,8 +1093,7 @@ fn write_gzip_header_impl(
         }
     }
     if gz.hcrc {
-        stream.adler =
-            crc32::crc32_z(stream.adler, &state.pending_buf[..state.pending]);
+        stream.adler = crc32::crc32_z(stream.adler, &state.pending_buf[..state.pending]);
     }
     state.gzip_index = 0;
     state.status = DeflateStatus::Extra;
@@ -1140,13 +1101,8 @@ fn write_gzip_header_impl(
 }
 
 /// Write the gzip extra field.
-fn write_gzip_extra_impl(
-    state: &mut DeflateState,
-    stream: &mut ZStream,
-) -> Option<ReturnCode> {
-    let Some(extra) =
-        state.gzip_header.as_ref().and_then(|g| g.extra.clone())
-    else {
+fn write_gzip_extra_impl(state: &mut DeflateState, stream: &mut ZStream) -> Option<ReturnCode> {
+    let Some(extra) = state.gzip_header.as_ref().and_then(|g| g.extra.clone()) else {
         state.status = DeflateStatus::Name;
         return None;
     };
@@ -1179,13 +1135,8 @@ fn write_gzip_extra_impl(
 }
 
 /// Write the gzip file name (null-terminated).
-fn write_gzip_name_impl(
-    state: &mut DeflateState,
-    stream: &mut ZStream,
-) -> Option<ReturnCode> {
-    let Some(name) =
-        state.gzip_header.as_ref().and_then(|g| g.name.clone())
-    else {
+fn write_gzip_name_impl(state: &mut DeflateState, stream: &mut ZStream) -> Option<ReturnCode> {
+    let Some(name) = state.gzip_header.as_ref().and_then(|g| g.name.clone()) else {
         state.status = DeflateStatus::Comment;
         return None;
     };
@@ -1223,13 +1174,8 @@ fn write_gzip_name_impl(
 }
 
 /// Write the gzip comment (null-terminated).
-fn write_gzip_comment_impl(
-    state: &mut DeflateState,
-    stream: &mut ZStream,
-) -> Option<ReturnCode> {
-    let Some(comment) =
-        state.gzip_header.as_ref().and_then(|g| g.comment.clone())
-    else {
+fn write_gzip_comment_impl(state: &mut DeflateState, stream: &mut ZStream) -> Option<ReturnCode> {
+    let Some(comment) = state.gzip_header.as_ref().and_then(|g| g.comment.clone()) else {
         state.status = DeflateStatus::Hcrc;
         return None;
     };
@@ -1267,14 +1213,8 @@ fn write_gzip_comment_impl(
 }
 
 /// Write the gzip header CRC-16 and transition to Busy.
-fn write_gzip_hcrc_impl(
-    state: &mut DeflateState,
-    stream: &mut ZStream,
-) -> Option<ReturnCode> {
-    let has_hcrc = state
-        .gzip_header
-        .as_ref()
-        .is_some_and(|gz| gz.hcrc);
+fn write_gzip_hcrc_impl(state: &mut DeflateState, stream: &mut ZStream) -> Option<ReturnCode> {
+    let has_hcrc = state.gzip_header.as_ref().is_some_and(|gz| gz.hcrc);
 
     if has_hcrc {
         if state.pending + 2 > state.pending_buf_size {

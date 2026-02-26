@@ -162,7 +162,7 @@ const _: () = assert!(InflateMode::Sync as u32 == 16211);
 /// - [`Fixed`](Self::Fixed) holds a `&'static [Code]` slice referencing
 ///   compile-time const tables (e.g., `LENFIX[512]` or `DISTFIX[32]`).
 /// - [`Dynamic`](Self::Dynamic) holds a `usize` start index into the
-///   [`InflateState::codes`] vector for tables built at runtime during
+///   `InflateState::codes` vector for tables built at runtime during
 ///   dynamic block decoding.
 #[derive(Debug, Clone, Copy)]
 pub enum CodeTableRef {
@@ -172,7 +172,7 @@ pub enum CodeTableRef {
     /// compile-time const tables (`LENFIX` or `DISTFIX`).
     Fixed(&'static [Code]),
 
-    /// Index into [`InflateState::codes`] for a dynamically built table.
+    /// Index into `InflateState::codes` for a dynamically built table.
     ///
     /// The `usize` value is the start offset in the codes vector where
     /// the table begins. Code lookups add the masked hold-register bits
@@ -200,7 +200,6 @@ pub enum CodeTableRef {
 #[derive(Debug, Clone)]
 pub struct InflateState {
     // ── State machine ──────────────────────────────────────────────────────
-
     /// Current inflate mode — determines which state machine branch executes.
     pub(crate) mode: InflateMode,
 
@@ -239,7 +238,6 @@ pub struct InflateState {
     pub(crate) head: Option<Box<GzHeader>>,
 
     // ── Sliding window ─────────────────────────────────────────────────────
-
     /// Log base 2 of the requested window size (8..=15).
     pub(crate) wbits: u32,
 
@@ -259,7 +257,6 @@ pub struct InflateState {
     pub(crate) window: Vec<u8>,
 
     // ── Bit accumulator ────────────────────────────────────────────────────
-
     /// Input bit accumulator — bits are shifted in from the low end.
     pub(crate) hold: u64,
 
@@ -267,7 +264,6 @@ pub struct InflateState {
     pub(crate) bits: u32,
 
     // ── String and stored block copying ────────────────────────────────────
-
     /// Literal byte value or remaining length of data to copy.
     pub(crate) length: u32,
 
@@ -275,12 +271,10 @@ pub struct InflateState {
     pub(crate) offset: u32,
 
     // ── Table and code decoding ────────────────────────────────────────────
-
     /// Number of extra bits needed for the current code.
     pub(crate) extra: u32,
 
     // ── Fixed and dynamic code tables ──────────────────────────────────────
-
     /// Reference to the length/literal code table.
     ///
     /// Points either to the fixed `LENFIX` table or into [`codes`](Self::codes).
@@ -298,7 +292,6 @@ pub struct InflateState {
     pub(crate) distbits: u32,
 
     // ── Dynamic table building ─────────────────────────────────────────────
-
     /// Number of code length code lengths read so far.
     pub(crate) ncode: u32,
 
@@ -320,7 +313,7 @@ pub struct InflateState {
     /// lengths, plus 4 spare entries (matching the C `unsigned short lens[320]`).
     pub(crate) lens: [u16; 320],
 
-    /// Work area for code table building in [`inflate_table()`](super::table::inflate_table).
+    /// Work area for code table building in `inflate_table()`.
     ///
     /// Sized at 288 to accommodate up to 286 length/literal symbols plus
     /// 2 spare entries (matching the C `unsigned short work[288]`).
@@ -333,7 +326,6 @@ pub struct InflateState {
     pub(crate) codes: Vec<Code>,
 
     // ── Safety and progress tracking ───────────────────────────────────────
-
     /// If `false`, allow invalid "distance too far back" errors to be
     /// tolerated (for testing purposes via `inflate_undermine()`).
     pub(crate) sane: bool,
@@ -567,19 +559,41 @@ mod tests {
     #[test]
     fn mode_all_32_sequential() {
         let modes = [
-            InflateMode::Head, InflateMode::Flags, InflateMode::Time,
-            InflateMode::Os, InflateMode::ExLen, InflateMode::Extra,
-            InflateMode::Name, InflateMode::Comment, InflateMode::Hcrc,
-            InflateMode::DictId, InflateMode::Dict, InflateMode::Type,
-            InflateMode::TypeDo, InflateMode::Stored, InflateMode::Copy_,
-            InflateMode::Copy, InflateMode::Table, InflateMode::LenLens,
-            InflateMode::CodeLens, InflateMode::Len_, InflateMode::Len,
-            InflateMode::LenExt, InflateMode::Dist, InflateMode::DistExt,
-            InflateMode::Match, InflateMode::Lit, InflateMode::Check,
-            InflateMode::Length, InflateMode::Done, InflateMode::Bad,
-            InflateMode::Mem, InflateMode::Sync,
+            InflateMode::Head,
+            InflateMode::Flags,
+            InflateMode::Time,
+            InflateMode::Os,
+            InflateMode::ExLen,
+            InflateMode::Extra,
+            InflateMode::Name,
+            InflateMode::Comment,
+            InflateMode::Hcrc,
+            InflateMode::DictId,
+            InflateMode::Dict,
+            InflateMode::Type,
+            InflateMode::TypeDo,
+            InflateMode::Stored,
+            InflateMode::Copy_,
+            InflateMode::Copy,
+            InflateMode::Table,
+            InflateMode::LenLens,
+            InflateMode::CodeLens,
+            InflateMode::Len_,
+            InflateMode::Len,
+            InflateMode::LenExt,
+            InflateMode::Dist,
+            InflateMode::DistExt,
+            InflateMode::Match,
+            InflateMode::Lit,
+            InflateMode::Check,
+            InflateMode::Length,
+            InflateMode::Done,
+            InflateMode::Bad,
+            InflateMode::Mem,
+            InflateMode::Sync,
         ];
         assert_eq!(modes.len(), 32);
+        #[allow(clippy::cast_possible_truncation)]
         for (i, mode) in modes.iter().enumerate() {
             assert_eq!(
                 *mode as u32,
@@ -749,6 +763,7 @@ mod tests {
         let mut s = InflateState::new();
         s.wbits = 8;
         let _ = s.ensure_window();
+        #[allow(clippy::cast_possible_truncation)]
         let data: Vec<u8> = (0u16..256).map(|i| i as u8).collect();
         s.window_write(&data);
         assert_eq!(s.wnext, 0);

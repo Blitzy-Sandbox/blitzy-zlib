@@ -15,7 +15,7 @@
 //! - `cover_wrap` — header/trailer/copy/miscellaneous coverage
 //! - `cover_back` — inflateBack callback decompression edge cases
 //! - `cover_inflate` — deflate data format coverage (both inflate + inflateBack)
-//! - `cover_trees` — inflate_table error coverage
+//! - `cover_trees` — `inflate_table` error coverage
 //! - `cover_fast` — inffast.c fast-path decode and window coverage
 //!
 //! # Differences from C original
@@ -37,19 +37,19 @@ use zlib_rs::constants::*;
 use zlib_rs::error::ReturnCode;
 use zlib_rs::inflate::back::{inflate_back, inflate_back_end, inflate_back_init};
 use zlib_rs::inflate::{
-    inflate, inflate_copy, inflate_end, inflate_get_header, inflate_mark, inflate_prime,
-    inflate_reset2, inflate_set_dictionary, inflate_sync, inflate_sync_point, inflate_undermine,
-    InflateState,
+    InflateState, inflate, inflate_copy, inflate_end, inflate_get_header, inflate_mark,
+    inflate_prime, inflate_reset2, inflate_set_dictionary, inflate_sync, inflate_sync_point,
+    inflate_undermine,
 };
 use zlib_rs::stream::{GzHeader, ZStream};
-use zlib_rs_tests::{h2b, MemZone};
+use zlib_rs_tests::{MemZone, h2b};
 
 // =============================================================================
 // inf() helper — generic inflate() runner with hex input
 // Port of inf() from infcover.c lines 284–347
 // =============================================================================
 
-/// Generic inflate() run using hex-encoded input data.
+/// Generic `inflate()` run using hex-encoded input data.
 ///
 /// Converts `hex` to bytes, initializes inflate with `win` window bits,
 /// feeds input in chunks of `step` bytes (0 = all at once), and asserts that
@@ -84,7 +84,11 @@ fn inf(hex: &str, what: &str, step: usize, win: i32, len: usize, expected_err: R
     // Convert hex to bytes.
     let data = h2b(hex);
     let total = data.len();
-    let step_size = if step == 0 || step > total { total } else { step };
+    let step_size = if step == 0 || step > total {
+        total
+    } else {
+        step
+    };
 
     // Position tracking for stepped input feeding.
     let mut pos: usize = 0;
@@ -109,7 +113,10 @@ fn inf(hex: &str, what: &str, step: usize, win: i32, len: usize, expected_err: R
 
         // Assert first call matches expected error — C line 320 assert.
         if check_first {
-            assert_eq!(ret, expected_err, "{what}: first inflate expected {expected_err:?}");
+            assert_eq!(
+                ret, expected_err,
+                "{what}: first inflate expected {expected_err:?}"
+            );
         }
 
         // Break on terminal errors — C lines 321–322.
@@ -220,11 +227,7 @@ fn try_inflate(hex: &str, id: &str, err: i32) -> ReturnCode {
 
         if err != 0 {
             assert_eq!(ret, ReturnCode::DataError, "{prefix}: expected DataError");
-            assert_eq!(
-                stream.msg,
-                Some(id),
-                "{prefix}: error message mismatch"
-            );
+            assert_eq!(stream.msg, Some(id), "{prefix}: error message mismatch");
         }
 
         inflate_end(&mut state, &mut stream);
@@ -247,23 +250,18 @@ fn try_inflate(hex: &str, id: &str, err: i32) -> ReturnCode {
         let input_data = data.clone();
         let mut input_provided = false;
         let mut input_cb = move || -> Vec<u8> {
-            if !input_provided {
+            if input_provided {
+                Vec::new()
+            } else {
                 input_provided = true;
                 input_data.clone()
-            } else {
-                Vec::new()
             }
         };
 
         // Output callback: always succeeds — C line 563 push with Z_NULL.
         let mut output_cb = |_: &[u8]| -> bool { true };
 
-        let ret = inflate_back(
-            &mut state,
-            &mut stream,
-            &mut input_cb,
-            &mut output_cb,
-        );
+        let ret = inflate_back(&mut state, &mut stream, &mut input_cb, &mut output_cb);
         assert!(
             ret != ReturnCode::StreamError,
             "{prefix}: inflateBack returned StreamError"
@@ -271,11 +269,7 @@ fn try_inflate(hex: &str, id: &str, err: i32) -> ReturnCode {
 
         if err != 0 {
             assert_eq!(ret, ReturnCode::DataError, "{prefix}: expected DataError");
-            assert_eq!(
-                stream.msg,
-                Some(id),
-                "{prefix}: error message mismatch"
-            );
+            assert_eq!(stream.msg, Some(id), "{prefix}: error message mismatch");
         }
 
         inflate_back_end(&mut state);
@@ -305,7 +299,11 @@ fn test_cover_support() {
     let ret = inflate_prime(&mut state, -1, 0);
     assert_eq!(ret, ReturnCode::Ok, "inflatePrime(-1, 0)");
     let ret = inflate_set_dictionary(&mut state, &mut stream, &[]);
-    assert_eq!(ret, ReturnCode::StreamError, "inflateSetDictionary on non-Dict state");
+    assert_eq!(
+        ret,
+        ReturnCode::StreamError,
+        "inflateSetDictionary on non-Dict state"
+    );
 
     let ret = inflate_end(&mut state, &mut stream);
     assert_eq!(ret, ReturnCode::Ok);
@@ -397,14 +395,7 @@ fn test_cover_wrap() {
         0,
         ReturnCode::DataError,
     );
-    inf(
-        "77 85",
-        "bad zlib method",
-        0,
-        15,
-        0,
-        ReturnCode::DataError,
-    );
+    inf("77 85", "bad zlib method", 0, 15, 0, ReturnCode::DataError);
     inf(
         "8 99",
         "set window size from header",
@@ -461,14 +452,7 @@ fn test_cover_wrap() {
         0,
         ReturnCode::NeedDict,
     );
-    inf(
-        "78 9c 63 0",
-        "compute adler32",
-        0,
-        15,
-        1,
-        ReturnCode::Ok,
-    );
+    inf("78 9c 63 0", "compute adler32", 0, 15, 1, ReturnCode::Ok);
 
     // ── Memory limit, inflateSync, inflateCopy, undermine, mark ──
     // C lines 413–443.  Rust's standard allocator has no allocation-limit
@@ -558,21 +542,16 @@ fn test_cover_back() {
         let mut input_provided = false;
         let test_data = fixed_data;
         let mut input_cb = move || -> Vec<u8> {
-            if !input_provided {
+            if input_provided {
+                Vec::new()
+            } else {
                 input_provided = true;
                 test_data.clone()
-            } else {
-                Vec::new()
             }
         };
         let mut output_cb = |_: &[u8]| -> bool { true };
 
-        let ret = inflate_back(
-            &mut state,
-            &mut stream,
-            &mut input_cb,
-            &mut output_cb,
-        );
+        let ret = inflate_back(&mut state, &mut stream, &mut input_cb, &mut output_cb);
         assert_eq!(ret, ReturnCode::StreamEnd, "inflateBack fixed block");
 
         // Test 2: Force output error — C lines 491–495.
@@ -584,21 +563,16 @@ fn test_cover_back() {
         let mut input_provided2 = false;
         let test_data2 = output_data;
         let mut input_cb2 = move || -> Vec<u8> {
-            if !input_provided2 {
+            if input_provided2 {
+                Vec::new()
+            } else {
                 input_provided2 = true;
                 test_data2.clone()
-            } else {
-                Vec::new()
             }
         };
         let mut output_err_cb = |_: &[u8]| -> bool { false };
 
-        let _ret = inflate_back(
-            &mut state,
-            &mut stream,
-            &mut input_cb2,
-            &mut output_err_cb,
-        );
+        let _ret = inflate_back(&mut state, &mut stream, &mut input_cb2, &mut output_err_cb);
         // In C this returns Z_BUF_ERROR because push returns 1 (failure).
 
         // Test 3: Force mode error — C lines 496–498.
@@ -640,11 +614,7 @@ fn test_cover_inflate() {
     try_inflate("4 0 fe ff", "invalid code lengths set", 1);
     try_inflate("4 0 24 49 0", "invalid bit length repeat", 1);
     try_inflate("4 0 24 e9 ff ff", "invalid bit length repeat", 1);
-    try_inflate(
-        "4 0 24 e9 ff 6d",
-        "invalid code -- missing end-of-block",
-        1,
-    );
+    try_inflate("4 0 24 e9 ff 6d", "invalid code -- missing end-of-block", 1);
     try_inflate(
         "4 80 49 92 24 49 92 24 71 ff ff 93 11 0",
         "invalid literal/lengths set",
@@ -686,11 +656,7 @@ fn test_cover_inflate() {
         "long code",
         0,
     );
-    try_inflate(
-        "ed c0 1 1 0 0 0 40 20 ff 57 1b 42 2c 4f",
-        "length extra",
-        0,
-    );
+    try_inflate("ed c0 1 1 0 0 0 40 20 ff 57 1b 42 2c 4f", "length extra", 0);
     try_inflate(
         "ed cf c1 b1 2c 47 10 c4 30 fa 6f 35 1d 1 82 59 3d fb be 2e 2a fc f c",
         "long distance and extra",

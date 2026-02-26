@@ -4,14 +4,14 @@
 //! This module provides `#[unsafe(no_mangle)] extern "C"` wrapper functions that
 //! bridge between the C zlib compress/uncompress API (using `c_ulong`, `z_size_t`,
 //! raw pointers, and C integer types) and the safe Rust implementations in
-//! [`zlib_rs::compress`].
+//! `zlib_rs::compress`.
 //!
 //! # Exported Symbols
 //!
 //! All 10 compress/uncompress symbols from `win32/zlib.def` lines 35–44:
 //!
 //! ## Compression
-//! - [`compress`] — One-call compress with `uLong` lengths (def line 35)
+//! - [`compress()`](fn@compress) — One-call compress with `uLong` lengths (def line 35)
 //! - [`compress2`] — One-call compress with explicit level, `uLong` (def line 36)
 //! - [`compress_z`] — One-call compress with `z_size_t` lengths (def line 37)
 //! - [`compress2_z`] — One-call compress with level, `z_size_t` (def line 38)
@@ -94,8 +94,8 @@ use crate::types::*;
 /// # Returns
 ///
 /// - [`Z_OK`] on success
-/// - [`Z_MEM_ERROR`](crate::types::Z_MEM_ERROR) if there was not enough memory
-/// - [`Z_BUF_ERROR`](crate::types::Z_BUF_ERROR) if dest buffer was too small
+/// - [`Z_MEM_ERROR`] if there was not enough memory
+/// - [`Z_BUF_ERROR`] if dest buffer was too small
 /// - [`Z_STREAM_ERROR`] if level is invalid or pointers are null
 ///
 /// # Safety
@@ -213,9 +213,7 @@ pub unsafe extern "C" fn compress2(
     //   *destLen = (uLong)got;
     let mut got: z_size_t = unsafe { *dest_len } as z_size_t;
 
-    let ret = unsafe {
-        compress2_z(dest, &mut got, source, source_len as z_size_t, level)
-    };
+    let ret = unsafe { compress2_z(dest, &mut got, source, source_len as z_size_t, level) };
 
     // Narrow z_size_t → c_ulong. On LP64 this is identity; on LLP64 (Windows)
     // this truncates, matching the C cast `*destLen = (uLong)got`.
@@ -333,10 +331,10 @@ pub extern "C" fn compressBound(source_len: c_ulong) -> c_ulong {
     // Check if narrowing to c_ulong would lose information.
     // On LP64: c_ulong is u64 = z_size_t, so this always passes.
     // On LLP64: c_ulong is u32, so very large bounds overflow.
-    if bound as c_ulong as z_size_t != bound {
-        c_ulong::MAX
-    } else {
+    if bound as c_ulong as z_size_t == bound {
         bound as c_ulong
+    } else {
+        c_ulong::MAX
     }
 }
 
@@ -377,9 +375,9 @@ pub extern "C" fn compressBound(source_len: c_ulong) -> c_ulong {
 /// # Returns
 ///
 /// - [`Z_OK`] on success
-/// - [`Z_MEM_ERROR`](crate::types::Z_MEM_ERROR) if there was not enough memory
-/// - [`Z_BUF_ERROR`](crate::types::Z_BUF_ERROR) if dest buffer was too small
-/// - [`Z_DATA_ERROR`](crate::types::Z_DATA_ERROR) if input data was corrupted
+/// - [`Z_MEM_ERROR`] if there was not enough memory
+/// - [`Z_BUF_ERROR`] if dest buffer was too small
+/// - [`Z_DATA_ERROR`] if input data was corrupted
 ///   or incomplete
 /// - [`Z_STREAM_ERROR`] if pointers are null
 ///

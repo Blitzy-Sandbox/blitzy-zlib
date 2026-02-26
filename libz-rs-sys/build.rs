@@ -76,8 +76,7 @@ fn generate_version_script(out_dir: &Path) {
     //
     // The export-symbols feature gates whether C-compatible symbols are exported.
     // When disabled, no version script is applied and symbols are not externally visible.
-    let export_symbols_enabled =
-        env::var("CARGO_FEATURE_EXPORT_SYMBOLS").is_ok();
+    let export_symbols_enabled = env::var("CARGO_FEATURE_EXPORT_SYMBOLS").is_ok();
 
     if export_symbols_enabled && version_script_dst.exists() {
         // Retrieve the target operating system from Cargo's build environment.
@@ -177,8 +176,7 @@ fn emit_platform_cfg_flags() {
     // 64-bit off_t detection — replaces the CMakeLists.txt `check_type_size(off64_t)`
     // and the `_LARGEFILE64_SOURCE` compile definition. On 64-bit platforms, `off_t`
     // is natively 64 bits, so the `*64` suffix variants of gz functions are aliases.
-    let target_pointer_width =
-        env::var("CARGO_CFG_TARGET_POINTER_WIDTH").unwrap_or_default();
+    let target_pointer_width = env::var("CARGO_CFG_TARGET_POINTER_WIDTH").unwrap_or_default();
     if target_pointer_width == "64" {
         println!("cargo:rustc-cfg=has_64bit_off_t");
     }
