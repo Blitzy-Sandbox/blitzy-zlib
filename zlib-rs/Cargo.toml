@@ -34,6 +34,10 @@ name = "minigzip"
 path = "../examples/minigzip.rs"
 required-features = ["gz-io"]
 
+[[example]]
+name = "enough"
+path = "../examples/enough.rs"
+
 [[bench]]
 name = "deflate_bench"
 harness = false
