@@ -25,6 +25,11 @@ cfg-if = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 
+[[example]]
+name = "minigzip"
+path = "../examples/minigzip.rs"
+required-features = ["gz-io"]
+
 [[bench]]
 name = "deflate_bench"
 harness = false
