@@ -630,6 +630,9 @@ pub(crate) fn deflate_slow(
             );
 
             // Insert hash entries for all strings up to the end of the match.
+            // Ported from the C `do { ... } while (--s->prev_length != 0);`
+            // loop.  The decrement MUST happen before the zero-check to avoid
+            // one extra iteration that would advance strstart past the input.
             state.lookahead -= state.prev_length - 1;
             state.prev_length -= 2;
             loop {
@@ -637,10 +640,10 @@ pub(crate) fn deflate_slow(
                 if state.strstart <= max_insert {
                     let _ = hash::insert_string(state, state.strstart);
                 }
+                state.prev_length -= 1;
                 if state.prev_length == 0 {
                     break;
                 }
-                state.prev_length -= 1;
             }
             state.match_available = false;
             state.match_length = MIN_MATCH - 1;

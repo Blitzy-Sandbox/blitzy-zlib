@@ -571,9 +571,14 @@ pub(crate) fn send_bits(state: &mut DeflateState, value: u32, length: u32) {
     if bi_valid > buf_size - length as i32 {
         state.bi_buf |= (value << bi_valid as u32) as u16;
         put_short(state, state.bi_buf);
-        let right_shift = buf_size - bi_valid;
-        state.bi_buf = if right_shift > 0 && right_shift < 32 {
-            (value >> right_shift as u32) as u16
+        // Carry the upper bits of `value` that did not fit into the 16-bit
+        // buffer.  `right_shift` is `buf_size - bi_valid` (0..16).  A shift
+        // of 0 means the entire value overflows into the next word — this is
+        // legal in Rust (unlike C where shifting by >= width is UB).  Only
+        // guard against shifts ≥ 32 which would discard the value entirely.
+        let right_shift = (buf_size - bi_valid) as u32;
+        state.bi_buf = if right_shift < 32 {
+            (value >> right_shift) as u16
         } else {
             0
         };
