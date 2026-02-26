@@ -1165,6 +1165,39 @@ impl GzReader {
     pub fn eof(&self) -> bool {
         self.state.past
     }
+
+    /// Returns the current offset in the compressed file, adjusted for
+    /// buffered data that has been read from the file but not yet
+    /// consumed by the application.
+    ///
+    /// Port of `gzoffset64()` from `gzlib.c` lines 461–495.
+    ///
+    /// Returns the byte offset, or -1 on I/O error.
+    pub fn offset(&mut self) -> i64 {
+        match super::gz_offset(&mut self.state) {
+            Ok(off) => off,
+            Err(_) => -1,
+        }
+    }
+
+    /// Returns the current error code for the last operation.
+    ///
+    /// The return value is one of the `Z_*` constants (e.g., `Z_OK`,
+    /// `Z_ERRNO`, `Z_STREAM_ERROR`).
+    #[must_use]
+    pub fn error_code(&self) -> i32 {
+        self.state.err
+    }
+
+    /// Clears the error and end-of-file flags for this reader.
+    ///
+    /// After calling this, `eof()` will return `false` and `error_code()`
+    /// will return `Z_OK`, allowing further read attempts on the stream.
+    ///
+    /// Port of `gzclearerr()` from `gzlib.c` lines 564–580.
+    pub fn clearerr(&mut self) {
+        super::gz_clearerr(&mut self.state);
+    }
 }
 
 // ─── Drop ────────────────────────────────────────────────────────────────────

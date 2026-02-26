@@ -1099,6 +1099,113 @@ impl GzWriter {
     }
 }
 
+// ─── FFI-Support Methods (seek, tell, offset, error, clearerr) ──────────────
+
+impl GzWriter {
+    /// Seeks to a position in the uncompressed output stream.
+    ///
+    /// For write-mode gzip files, only forward seeks from the current
+    /// position (`SeekFrom::Current`) or absolute forward seeks
+    /// (`SeekFrom::Start`) are supported. Forward seeking is implemented
+    /// by writing zero bytes to advance the position.
+    ///
+    /// Port of `gz_seek()` write-mode path from `gzlib.c`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the seek target is negative or backward.
+    pub fn seek(&mut self, offset: i64, whence: io::SeekFrom) -> io::Result<i64> {
+        use crate::constants::Z_BUF_ERROR;
+
+        // Check for serious error
+        if self.state.err != Z_OK && self.state.err != Z_BUF_ERROR {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stream in error state",
+            ));
+        }
+
+        // Compute the absolute target position.
+        let target = match whence {
+            io::SeekFrom::Start(_) => offset,
+            io::SeekFrom::Current(_) => {
+                let current = self.state.x.pos;
+                current.checked_add(offset).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "seek position overflow",
+                    )
+                })?
+            }
+            io::SeekFrom::End(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "SEEK_END not supported for gzip streams",
+                ));
+            }
+        };
+
+        if target < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "negative seek position",
+            ));
+        }
+
+        // For write mode, we can only seek forward. Compute how many
+        // zero bytes need to be written to reach the target.
+        let current = self.state.x.pos;
+        if target < current {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "backward seek not supported for write mode",
+            ));
+        }
+
+        let n = target - current;
+        self.state.skip = n;
+        Ok(target)
+    }
+
+    /// Returns the current position in the uncompressed output stream.
+    ///
+    /// Port of `gztell64()` from `gzlib.c`.
+    #[must_use]
+    pub fn tell(&self) -> i64 {
+        self.state.x.pos
+    }
+
+    /// Returns the current offset in the compressed file, adjusted for
+    /// buffered data.
+    ///
+    /// Port of `gzoffset64()` from `gzlib.c`.
+    ///
+    /// Returns the byte offset, or -1 on I/O error.
+    pub fn offset(&mut self) -> i64 {
+        match super::gz_offset(&mut self.state) {
+            Ok(off) => off,
+            Err(_) => -1,
+        }
+    }
+
+    /// Returns the current error code for the last operation.
+    ///
+    /// The return value is one of the `Z_*` constants.
+    #[must_use]
+    pub fn error_code(&self) -> i32 {
+        self.state.err
+    }
+
+    /// Clears the error state for this writer.
+    ///
+    /// Resets the error code to `Z_OK` and clears the error message.
+    ///
+    /// Port of `gzclearerr()` from `gzlib.c`.
+    pub fn clearerr(&mut self) {
+        super::gz_clearerr(&mut self.state);
+    }
+}
+
 // ─── Write Trait Implementation ──────────────────────────────────────────────
 
 impl Write for GzWriter {

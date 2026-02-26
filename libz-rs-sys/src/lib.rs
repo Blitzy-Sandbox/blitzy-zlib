@@ -17,8 +17,12 @@
 pub mod checksum;
 pub mod compress;
 pub mod deflate;
+#[cfg(feature = "gz-io")]
+pub mod gz;
 pub mod inflate;
 pub mod types;
 pub mod version;
 
 pub use types::*;
+#[cfg(feature = "gz-io")]
+pub use gz::*;
