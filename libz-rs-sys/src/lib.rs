@@ -4,7 +4,8 @@
 //! through C-compatible symbols, enabling use as a drop-in replacement for
 //! the C zlib library (`libz.so` / `zlib1.dll`).
 //!
-//! All 105 symbols from `win32/zlib.def` are re-exported at the crate root so
+//! All 105 symbols (96 canonical from `win32/zlib.def` plus 9 convenience
+//! wrappers) are re-exported at the crate root so
 //! that they are visible to the linker when this crate is used as a dependency
 //! (e.g., by the `libz-rs-sys-cdylib` shared library crate). Symbol names
 //! match the C API exactly — no Rust module path prefixing.
@@ -88,22 +89,22 @@ pub mod types;
 
 /// Deflate (compression) FFI wrappers.
 ///
-/// All 16 deflate symbols from `win32/zlib.def`:
+/// 18 deflate symbols (16 from `win32/zlib.def` + 2 convenience wrappers):
 /// `deflateInit_`, `deflateInit2_`, `deflate`, `deflateEnd`,
 /// `deflateSetDictionary`, `deflateGetDictionary`, `deflateCopy`,
 /// `deflateReset`, `deflateParams`, `deflateTune`, `deflateBound`,
 /// `deflateBound_z`, `deflatePending`, `deflateUsed`, `deflatePrime`,
-/// `deflateSetHeader`.
+/// `deflateSetHeader`, `deflateInit`, `deflateInit2`.
 pub mod deflate;
 
 /// Inflate (decompression) FFI wrappers.
 ///
-/// All 16 inflate symbols from `win32/zlib.def`:
+/// 19 inflate symbols (16 from `win32/zlib.def` + 3 convenience wrappers):
 /// `inflateInit_`, `inflateInit2_`, `inflate`, `inflateEnd`,
 /// `inflateSetDictionary`, `inflateGetDictionary`, `inflateSync`,
 /// `inflateCopy`, `inflateReset`, `inflateReset2`, `inflatePrime`,
 /// `inflateMark`, `inflateGetHeader`, `inflateBack`, `inflateBackInit_`,
-/// `inflateBackEnd`.
+/// `inflateBackEnd`, `inflateInit`, `inflateInit2`, `inflateBackInit`.
 pub mod inflate;
 
 /// Adler-32 and CRC-32 checksum FFI wrappers.

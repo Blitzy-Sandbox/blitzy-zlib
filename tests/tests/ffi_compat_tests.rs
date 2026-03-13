@@ -1320,3 +1320,91 @@ fn test_ffi_version_consistency() {
     assert_eq!(minor, 3, "minor version from ZLIB_VERNUM");
     assert_eq!(revision, 2, "revision from ZLIB_VERNUM");
 }
+
+// ===========================================================================
+// Section 8: Convenience Init Wrappers (5 symbols)
+// ===========================================================================
+//
+// These test the non-underscore convenience wrappers that correspond to
+// the C macros `deflateInit`, `deflateInit2`, `inflateInit`, `inflateInit2`,
+// and `inflateBackInit`.
+
+/// Verify `deflateInit` convenience wrapper.
+#[test]
+fn test_ffi_deflate_init_convenience() {
+    let _: unsafe extern "C" fn(*mut z_stream, c_int) -> c_int = deflateInit;
+
+    // Null pointer should return Z_STREAM_ERROR.
+    let rc = unsafe { deflateInit(null_mut(), 6) };
+    assert_eq!(rc, Z_STREAM_ERROR);
+}
+
+/// Verify `deflateInit2` convenience wrapper.
+#[test]
+fn test_ffi_deflate_init2_convenience() {
+    let _: unsafe extern "C" fn(*mut z_stream, c_int, c_int, c_int, c_int, c_int) -> c_int =
+        deflateInit2;
+
+    let rc = unsafe { deflateInit2(null_mut(), 6, 8, 15, 8, 0) };
+    assert_eq!(rc, Z_STREAM_ERROR);
+}
+
+/// Verify `inflateInit` convenience wrapper.
+#[test]
+fn test_ffi_inflate_init_convenience() {
+    let _: unsafe extern "C" fn(*mut z_stream) -> c_int = inflateInit;
+
+    let rc = unsafe { inflateInit(null_mut()) };
+    assert_eq!(rc, Z_STREAM_ERROR);
+}
+
+/// Verify `inflateInit2` convenience wrapper.
+#[test]
+fn test_ffi_inflate_init2_convenience() {
+    let _: unsafe extern "C" fn(*mut z_stream, c_int) -> c_int = inflateInit2;
+
+    let rc = unsafe { inflateInit2(null_mut(), 15) };
+    assert_eq!(rc, Z_STREAM_ERROR);
+}
+
+/// Verify `inflateBackInit` convenience wrapper.
+#[test]
+fn test_ffi_inflate_back_init_convenience() {
+    let _: unsafe extern "C" fn(*mut z_stream, c_int, *mut c_uchar) -> c_int = inflateBackInit;
+
+    let rc = unsafe { inflateBackInit(null_mut(), 15, null_mut()) };
+    assert_eq!(rc, Z_STREAM_ERROR);
+}
+
+// ===========================================================================
+// Section 9: Additional Version Info Symbols (4 symbols)
+// ===========================================================================
+
+/// Verify `zlibVerNum` returns the packed version number.
+#[test]
+fn test_ffi_zlib_ver_num() {
+    let _: extern "C" fn() -> c_ulong = zlibVerNum;
+    let n = zlibVerNum();
+    assert_eq!(n as u32, ZLIB_VERNUM, "zlibVerNum mismatch");
+}
+
+/// Verify `zlibVerMajor` returns the major version.
+#[test]
+fn test_ffi_zlib_ver_major() {
+    let _: extern "C" fn() -> c_int = zlibVerMajor;
+    assert_eq!(zlibVerMajor(), 1);
+}
+
+/// Verify `zlibVerMinor` returns the minor version.
+#[test]
+fn test_ffi_zlib_ver_minor() {
+    let _: extern "C" fn() -> c_int = zlibVerMinor;
+    assert_eq!(zlibVerMinor(), 3);
+}
+
+/// Verify `zlibVerRevision` returns the revision number.
+#[test]
+fn test_ffi_zlib_ver_revision() {
+    let _: extern "C" fn() -> c_int = zlibVerRevision;
+    assert_eq!(zlibVerRevision(), 2);
+}

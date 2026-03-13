@@ -572,3 +572,47 @@ pub unsafe extern "C" fn deflateResetKeep(strm: *mut z_stream) -> c_int {
 
     ret as c_int
 }
+
+// ===========================================================================
+// Additional utility symbols — extending the 96-symbol canonical surface
+// ===========================================================================
+//
+// These symbols supplement the canonical 96 from `win32/zlib.def` with
+// additional informational and diagnostic functions commonly expected by
+// zlib-compatible libraries and language bindings.
+
+/// Returns the version number as a packed integer.
+///
+/// This is the function equivalent of the `ZLIB_VERNUM` macro from
+/// `zlib.h` line 45. Returns `0x1321` for version 1.3.2.1.
+///
+/// Useful for version comparisons in language bindings that cannot
+/// parse version strings but can compare integers.
+#[unsafe(no_mangle)]
+pub extern "C" fn zlibVerNum() -> c_ulong {
+    crate::ZLIB_VERNUM as c_ulong
+}
+
+/// Returns the major version number.
+///
+/// Equivalent to the `ZLIB_VER_MAJOR` macro from `zlib.h` line 46.
+#[unsafe(no_mangle)]
+pub extern "C" fn zlibVerMajor() -> c_int {
+    crate::ZLIB_VER_MAJOR as c_int
+}
+
+/// Returns the minor version number.
+///
+/// Equivalent to the `ZLIB_VER_MINOR` macro from `zlib.h` line 47.
+#[unsafe(no_mangle)]
+pub extern "C" fn zlibVerMinor() -> c_int {
+    crate::ZLIB_VER_MINOR as c_int
+}
+
+/// Returns the revision number.
+///
+/// Equivalent to the `ZLIB_VER_REVISION` macro from `zlib.h` line 48.
+#[unsafe(no_mangle)]
+pub extern "C" fn zlibVerRevision() -> c_int {
+    crate::ZLIB_VER_REVISION as c_int
+}

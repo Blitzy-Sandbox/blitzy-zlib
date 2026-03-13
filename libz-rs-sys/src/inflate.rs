@@ -1033,3 +1033,82 @@ pub unsafe extern "C" fn inflateBackEnd(strm: *mut z_stream) -> c_int {
 
     ret as c_int
 }
+
+// ===========================================================================
+// Convenience wrappers (non-underscore variants)
+// ===========================================================================
+//
+// In the C API, `inflateInit`, `inflateInit2`, and `inflateBackInit` are
+// macros that expand to calls to `inflateInit_`, `inflateInit2_`, and
+// `inflateBackInit_` with `ZLIB_VERSION` and `sizeof(z_stream)` injected
+// automatically. These wrapper functions provide the same convenience as
+// proper exported symbols, allowing callers that treat them as functions
+// (rather than macros) to link successfully.
+
+/// Convenience wrapper for [`inflateInit_`].
+///
+/// Calls [`inflateInit_`] with the library's own version string and
+/// `z_stream` size, matching the behavior of the C `inflateInit` macro.
+///
+/// # Safety
+///
+/// `strm` must be a valid pointer to a `z_stream` or null.
+#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn inflateInit(strm: *mut z_stream) -> c_int {
+    unsafe {
+        inflateInit_(
+            strm,
+            crate::ZLIB_VERSION.as_ptr().cast::<c_char>(),
+            std::mem::size_of::<z_stream>() as c_int,
+        )
+    }
+}
+
+/// Convenience wrapper for [`inflateInit2_`].
+///
+/// Calls [`inflateInit2_`] with the library's own version string and
+/// `z_stream` size, matching the behavior of the C `inflateInit2` macro.
+///
+/// # Safety
+///
+/// `strm` must be a valid pointer to a `z_stream` or null.
+#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn inflateInit2(strm: *mut z_stream, windowBits: c_int) -> c_int {
+    unsafe {
+        inflateInit2_(
+            strm,
+            windowBits,
+            crate::ZLIB_VERSION.as_ptr().cast::<c_char>(),
+            std::mem::size_of::<z_stream>() as c_int,
+        )
+    }
+}
+
+/// Convenience wrapper for [`inflateBackInit_`].
+///
+/// Calls [`inflateBackInit_`] with the library's own version string and
+/// `z_stream` size, matching the behavior of the C `inflateBackInit` macro.
+///
+/// # Safety
+///
+/// `strm` must be valid. `window` must point to at least `2^windowBits`
+/// writable bytes for the duration of subsequent `inflateBack` calls.
+#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn inflateBackInit(
+    strm: *mut z_stream,
+    windowBits: c_int,
+    window: *mut c_uchar,
+) -> c_int {
+    unsafe {
+        inflateBackInit_(
+            strm,
+            windowBits,
+            window,
+            crate::ZLIB_VERSION.as_ptr().cast::<c_char>(),
+            std::mem::size_of::<z_stream>() as c_int,
+        )
+    }
+}

@@ -1049,3 +1049,68 @@ pub unsafe extern "C" fn deflateSetHeader(strm: *mut z_stream, head: *mut gz_hea
     let rust_header = unsafe { convert_gz_header(head.cast_const()) };
     zlib_rs::deflate::deflate_set_header(rs, rust_header) as c_int
 }
+
+// ===========================================================================
+// Convenience wrappers (non-underscore variants)
+// ===========================================================================
+//
+// In the C API, `deflateInit` and `deflateInit2` are macros that expand to
+// calls to `deflateInit_` and `deflateInit2_` with `ZLIB_VERSION` and
+// `sizeof(z_stream)` injected automatically. These wrapper functions
+// provide the same convenience as proper exported symbols, allowing
+// callers that treat them as functions (rather than macros) to link
+// successfully. This includes certain language bindings and FFI generators
+// that resolve symbols at load time rather than through the C preprocessor.
+
+/// Convenience wrapper for [`deflateInit_`].
+///
+/// Calls [`deflateInit_`] with the library's own version string and
+/// `z_stream` size, matching the behavior of the C `deflateInit` macro.
+///
+/// # Safety
+///
+/// `strm` must be a valid pointer to a `z_stream` or null.
+#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn deflateInit(strm: *mut z_stream, level: c_int) -> c_int {
+    unsafe {
+        deflateInit_(
+            strm,
+            level,
+            crate::ZLIB_VERSION.as_ptr().cast::<c_char>(),
+            std::mem::size_of::<z_stream>() as c_int,
+        )
+    }
+}
+
+/// Convenience wrapper for [`deflateInit2_`].
+///
+/// Calls [`deflateInit2_`] with the library's own version string and
+/// `z_stream` size, matching the behavior of the C `deflateInit2` macro.
+///
+/// # Safety
+///
+/// `strm` must be a valid pointer to a `z_stream` or null.
+#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn deflateInit2(
+    strm: *mut z_stream,
+    level: c_int,
+    method: c_int,
+    windowBits: c_int,
+    memLevel: c_int,
+    strategy: c_int,
+) -> c_int {
+    unsafe {
+        deflateInit2_(
+            strm,
+            level,
+            method,
+            windowBits,
+            memLevel,
+            strategy,
+            crate::ZLIB_VERSION.as_ptr().cast::<c_char>(),
+            std::mem::size_of::<z_stream>() as c_int,
+        )
+    }
+}
