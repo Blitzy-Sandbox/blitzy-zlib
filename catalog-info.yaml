@@ -5,11 +5,9 @@ metadata:
   description: "Complete C-to-Rust rewrite of zlib 1.3.2.1 compression library"
   tags:
     - rust
-    - c
     - library
-    - in-progress
+    - refactor
   labels:
-    blitzy.com/status: in-progress
     blitzy.com/language: rust
   annotations:
     github.com/project-slug: Blitzy-Sandbox/blitzy-zlib
