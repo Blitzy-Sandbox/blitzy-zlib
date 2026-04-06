@@ -1,0 +1,5 @@
+site_name: 'blitzy-zlib'
+nav:
+  - Home: index.md
+plugins:
+  - techdocs-core
