@@ -1,0 +1,30 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: blitzy-zlib
+  description: "Complete C-to-Rust rewrite of zlib 1.3.2.1 compression library"
+  tags:
+    - rust
+    - c
+    - library
+    - in-progress
+  labels:
+    blitzy.com/status: in-progress
+    blitzy.com/language: rust
+  annotations:
+    github.com/project-slug: Blitzy-Sandbox/blitzy-zlib
+    backstage.io/source-location: url:https://github.com/Blitzy-Sandbox/blitzy-zlib/tree/develop/
+  links:
+    - url: https://github.com/Blitzy-Sandbox/blitzy-zlib
+      title: GitHub Repository
+    - url: https://github.com/Blitzy-Sandbox/blitzy-zlib/pull/2
+      title: "PR #2: C-to-Rust Rewrite of zlib"
+      icon: github
+    - url: https://github.com/Blitzy-Sandbox/blitzy-zlib/tree/develop/blitzy/documentation
+      title: Blitzy Documentation
+      icon: docs
+spec:
+  type: library
+  lifecycle: experimental
+  owner: blitzy-sandbox
+  system: blitzy-sandbox-projects
