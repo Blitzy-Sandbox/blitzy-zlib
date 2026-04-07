@@ -4,3 +4,4 @@ nav:
   - Home: index.md
 plugins:
   - techdocs-core
+  - mermaid2
