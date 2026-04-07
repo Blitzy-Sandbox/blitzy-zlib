@@ -1,3 +1,4 @@
+docs_dir: doc
 site_name: 'blitzy-zlib'
 nav:
   - Home: index.md
