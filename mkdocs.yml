@@ -2,6 +2,8 @@ docs_dir: doc
 site_name: 'blitzy-zlib'
 nav:
   - Home: index.md
+  - Project Guide: project-guide.md
+  - Technical Specifications: technical-specifications.md
 plugins:
   - techdocs-core
   - mermaid2
