@@ -4,9 +4,11 @@ metadata:
   name: blitzy-zlib
   description: Complete C-to-Rust rewrite of zlib 1.3.2.1 compression library
   tags:
+  - c
   - library
   - migration
   - refactor
+  - rewrite
   - rust
   labels:
     blitzy.com/language: rust
