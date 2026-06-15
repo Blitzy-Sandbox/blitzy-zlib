@@ -11,10 +11,11 @@
 //! | Submodule      | C source    | Responsibility                                |
 //! |----------------|-------------|-----------------------------------------------|
 //! | [`mod@state`]  | `gzguts.h`  | [`GzState`](state::GzState) handle, the frozen `Mode`/`How` sentinels, `gz_error` parity, and the RAII `Drop` that replaces `gzclose` |
+//! | [`mod@read`]   | `gzread.c`  | gzip read path: drives the inflate engine through the `windowBits = 31` gzip wrapper (sniffing the gzip magic, else transparent passthrough) and reads from the file. Defines the `pub(crate)` pipeline (`gz_load`/`gz_avail`/`gz_look`/`gz_decomp`/`gz_fetch`/`gz_skip`/`gz_read`/`gzclose_r`), the public `gzread`/`gzfread`/`gzgetc`/`gzungetc`/`gzgets`/`gzdirect` API, and the idiomatic `impl Read`/`BufRead` adapters |
 //! | [`mod@write`]  | `gzwrite.c` | gzip write path: drives the deflate engine through the `windowBits = 31` gzip wrapper and writes to the file. Defines the shared `pub(crate)` helpers (`gz_init`/`gz_comp`/`gz_zero`/`set_params`/`finish`/`gzclose_w`) reused by `open`/`close`/`Drop`, plus the public `gzwrite`/`gzfwrite`/`gzputc`/`gzputs`/`gzprintf`/`gzflush` API and the idiomatic [`GzWriter`](write::GzWriter) |
 //!
-//! The `open` / `read` / `close` submodules (`gzlib.c` / `gzread.c` /
-//! `gzclose.c`, AAP §0.4.1) layer on top of this `state` foundation and join
+//! The `open` / `close` submodules (`gzlib.c` / `gzclose.c`, AAP §0.4.1) layer
+//! on top of this `state` foundation and join
 //! this list as they are completed. Until those consumers (and the
 //! `extern "C"` FFI shim) land, the crate-internal `GzState` API has no
 //! in-crate caller, so the `pub mod gz` declaration in `src/lib.rs` carries a
