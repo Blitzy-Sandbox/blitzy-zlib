@@ -1,0 +1,90 @@
+//! DEFLATE engine module root — shared types and submodule wiring.
+//!
+//! This is the module root for `crate::deflate`, the safe-Rust port of zlib's
+//! compression engine (`deflate.c` + `deflate.h`). It declares the engine's
+//! foundation submodules and defines the header-emission state machine
+//! ([`DeflateStatus`]) that every part of the engine shares.
+//!
+//! # Layout
+//!
+//! | Submodule           | C source     | Responsibility                                            |
+//! |---------------------|--------------|-----------------------------------------------------------|
+//! | [`mod@state`]       | `deflate.h`  | [`DeflateState`](state::DeflateState) + LZ77 plumbing      |
+//! | [`mod@strategy`]    | `deflate.c`  | Per-level [`CONFIG_TABLE`](strategy::CONFIG_TABLE) sizing  |
+//! | [`mod@trees`]       | `trees.c`    | Huffman tree build/emit, static tables, bit-level output  |
+//!
+//! The per-level strategy inner loops (`deflate_stored`/`deflate_fast`/
+//! `deflate_slow`/`deflate_rle`/`deflate_huff`), the strategy dispatch over
+//! [`CONFIG_TABLE`](strategy::CONFIG_TABLE),
+//! the `flush_block` helpers, and the public `deflate*` orchestration
+//! (`deflate()`/`deflateInit2_`/`deflateEnd`, AAP §0.4.1) build on the
+//! foundation declared here. They are layered on top of this root as the
+//! deflate engine is completed; this file owns only the cross-cutting state
+//! enum and the submodule declarations they all depend on.
+//!
+//! # `DeflateStatus` — the header-emission state machine
+//!
+//! The C implementation tracks header emission with an integer `status` field
+//! on `deflate_state`, compared against eight sentinel `#define`s in
+//! `deflate.h` (`INIT_STATE`=42 … `FINISH_STATE`=666). Per AAP §0.6.1 this
+//! becomes the exhaustive [`DeflateStatus`] enum: an integer `status` can hold
+//! an out-of-range value (which C's `deflateStateCheck` must guard against),
+//! whereas a `DeflateStatus` is *always* one of the legal states by
+//! construction, so the status-validity check
+//! ([`DeflateState::is_valid_status`](state::DeflateState::is_valid_status))
+//! becomes trivially true.
+//!
+//! # Constraints
+//!
+//! * **No `unsafe`.** The entire `crate::deflate` tree is safe Rust; `unsafe`
+//!   lives only in `crate::ffi` and `crate::inflate::fast` (AAP §0.6.2).
+//! * **`no_std`-clean.** Only `core`/`alloc` are referenced, never `std`.
+
+pub mod state;
+pub mod strategy;
+pub mod trees;
+
+/// Header-emission state machine for the DEFLATE engine — the safe-Rust
+/// replacement for the integer `status` field and its `*_STATE` sentinel
+/// `#define`s in `deflate.h` (AAP §0.6.1).
+///
+/// The discriminants are pinned to the canonical zlib sentinel values so the
+/// state semantics line up exactly with the C engine (and so the values are
+/// recognizable when debugging against a C reference). The enum is evaluated
+/// with exhaustive `match`, which both removes the need for C's
+/// `deflateStateCheck` status guard (an enum can never hold an out-of-range
+/// value) and lets the compiler prove every state transition is handled.
+///
+/// State flow (from `deflate.h`):
+///
+/// * [`Init`](DeflateStatus::Init) → [`Busy`](DeflateStatus::Busy) — emit the
+///   zlib (RFC 1950) two-byte header, then compress.
+/// * [`Gzip`](DeflateStatus::Gzip) →
+///   [`Extra`](DeflateStatus::Extra)/[`Busy`](DeflateStatus::Busy) — emit the
+///   gzip (RFC 1952) header, optionally followed by the extra/name/comment/HCRC
+///   fields.
+/// * [`Extra`](DeflateStatus::Extra) → [`Name`](DeflateStatus::Name) →
+///   [`Comment`](DeflateStatus::Comment) → [`Hcrc`](DeflateStatus::Hcrc) →
+///   [`Busy`](DeflateStatus::Busy) — the optional gzip header fields.
+/// * [`Busy`](DeflateStatus::Busy) → [`Finish`](DeflateStatus::Finish) —
+///   compression in progress, then the stream trailer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(i32)]
+pub(crate) enum DeflateStatus {
+    /// `INIT_STATE` (42): about to emit the zlib wrapper header.
+    Init = 42,
+    /// `GZIP_STATE` (57): about to emit the gzip wrapper header.
+    Gzip = 57,
+    /// `EXTRA_STATE` (69): emitting the gzip header's optional extra field.
+    Extra = 69,
+    /// `NAME_STATE` (73): emitting the gzip header's optional file name.
+    Name = 73,
+    /// `COMMENT_STATE` (91): emitting the gzip header's optional comment.
+    Comment = 91,
+    /// `HCRC_STATE` (103): emitting the gzip header's optional CRC-16.
+    Hcrc = 103,
+    /// `BUSY_STATE` (113): header complete; compressing the payload.
+    Busy = 113,
+    /// `FINISH_STATE` (666): payload complete; emitting the stream trailer.
+    Finish = 666,
+}

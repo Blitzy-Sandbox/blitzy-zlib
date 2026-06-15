@@ -142,17 +142,17 @@ no-std = []
 # implicit feature of the same name.
 simd = ["dep:crc32fast"]
 
-# NOTE (symbol-collision contingency — coordinate with the `src/ffi.rs`
-# author): the `#[no_mangle] extern "C"` exports in `src/ffi.rs` use the
-# canonical zlib symbol names (`deflate`, `inflate`, `crc32`, ...). The
-# `flate2` dev-dependency below links the canonical C zlib (via its `zlib`
-# feature) for oracle testing, so building the test binary links BOTH the Rust
-# FFI shim and C zlib, which can produce duplicate-symbol link errors. The five
-# features above are the primary, AAP-mandated surface. IF (and only if) a link
-# conflict surfaces once `src/ffi.rs` exists, introduce an optional non-default
-# `capi` feature here that gates the `#[no_mangle]` C-ABI exports — enabled for
-# the cdylib/staticlib drop-in, disabled for `cargo test`. It is intentionally
-# NOT added now because it cannot be validated without `src/ffi.rs`.
+# `capi`: gates the `#[no_mangle] extern "C"` C-ABI drop-in exports (the future
+# `src/ffi.rs`, AAP §0.6.2). Non-default and currently empty: declaring it now
+# fixes the public feature graph so the C-ABI exports can be wired in later
+# WITHOUT a feature-graph change. Why it must be opt-in: those exports use the
+# canonical zlib symbol names (`deflate`, `inflate`, `crc32`, ...), and the
+# `flate2` dev-dependency links canonical C zlib (via its `zlib` feature) for
+# oracle testing — building the test binary with the shim enabled would link
+# BOTH and produce duplicate-symbol errors. Keeping `capi` out of `default`
+# (and therefore out of `cargo test`) avoids that collision; the
+# cdylib/staticlib drop-in build enables it explicitly.
+capi = []
 
 # ----------------------------------------------------------------------------
 # [dependencies] — runtime
@@ -202,25 +202,30 @@ rand = "0.9.0"
 # ----------------------------------------------------------------------------
 # [[bench]] — criterion harnesses (AAP §0.3.1, §0.4.1)
 # ----------------------------------------------------------------------------
-# `harness = false` is required so criterion can supply its own `main()`
-# instead of the default libtest harness.
-[[bench]]
-name = "deflate_bench"
-harness = false
-
-[[bench]]
-name = "inflate_bench"
-harness = false
-
-[[bench]]
-name = "checksum_bench"
-harness = false
+# The criterion benchmark harnesses live in `benches/{deflate,inflate,checksum}
+# _bench.rs`. Cargo validates every explicitly declared target's source file at
+# manifest-parse time, so the `[[bench]]` target declarations are introduced
+# together with those source files (in the benchmark checkpoint) — declaring
+# them before the files exist makes EVERY cargo command (build/clippy/test/
+# metadata) fail to even parse the manifest. The `criterion` dev-dependency and
+# the `[profile.bench]` profile below are kept in place so the harnesses drop in
+# with `harness = false` (criterion supplies its own `main()`) once authored.
 
 # ----------------------------------------------------------------------------
 # [profile.*] — optimization profiles supporting the performance gates
 # (AAP §0.3.3: ≥80% compression throughput, ≥ decompression throughput,
 # ≤ memory footprint, all relative to C zlib).
 # ----------------------------------------------------------------------------
+[profile.dev]
+# `panic = "abort"` so the debug build of the C-linkable `cdylib`/`staticlib`
+# drop-in (crate-type = ["lib","cdylib","staticlib"]) links under
+# `--no-default-features` (no_std), where unwinding is unavailable — without it
+# `cargo build --no-default-features` fails with "unwinding panics are not
+# supported without std". Cargo always builds test/bench targets with unwind
+# even when a profile sets abort, so `cargo test` is unaffected (matching the
+# release profile's rationale below).
+panic = "abort"
+
 [profile.release]
 # Maximize optimization, enable link-time optimization, and use a single
 # codegen unit for the best cross-function inlining — important for matching

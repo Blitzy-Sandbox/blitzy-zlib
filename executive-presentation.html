@@ -47,151 +47,173 @@
       --ff-display: 'Space Grotesk', sans-serif;
       --ff-mono: 'Fira Code', monospace;
 
-      /* Gradients (colors sourced from brand tokens) */
-      --gradient-hero: linear-gradient(68deg, var(--blitzy-primary-light) 15.56%, var(--blitzy-primary) 62.74%, var(--blitzy-primary-deep) 84.44%);
-      --gradient-divider: linear-gradient(135deg, var(--blitzy-primary-dark) 0%, var(--blitzy-primary) 100%);
-      --gradient-accent: linear-gradient(90deg, var(--blitzy-primary) 0%, var(--blitzy-accent-teal) 100%);
+      /* Gradients — exact literal values mandated by the Blitzy reveal.js design
+         system (AAP §0.8.3). Declared as literals (no var() indirection) so each
+         token matches the design-system specification byte-for-byte. The hex
+         stops equal the brand tokens above: #7A6DEC=primary-light,
+         #5B39F3=primary, #4101DB=primary-deep, #2D1C77=primary-dark,
+         #94FAD5=accent-teal. --gradient-accent is the design-system accent bar
+         gradient defined in AAP §0.8.2. */
+      --gradient-hero: linear-gradient(68deg, #7A6DEC 15.56%, #5B39F3 62.74%, #4101DB 84.44%);
+      --gradient-divider: linear-gradient(135deg, #2D1C77 0%, #5B39F3 100%);
+      --gradient-accent: linear-gradient(90deg, #5B39F3 0%, #94FAD5 100%);
 
       /* Root font size (drives rem scale on the 1920x1080 canvas) */
-      --root-fs: 16px;
+      --blitzy-root-fs: 16px;
 
       /* Spacing scale */
-      --space-3xs: 0.25rem;
-      --space-2xs: 0.5rem;
-      --space-xs: 0.75rem;
-      --space-sm: 1rem;
-      --space-md: 1.5rem;
-      --space-lg: 2rem;
-      --space-xl: 3rem;
-      --space-2xl: 4rem;
-      --space-3xl: 6rem;
+      --blitzy-space-3xs: 0.25rem;
+      --blitzy-space-2xs: 0.5rem;
+      --blitzy-space-xs: 0.75rem;
+      --blitzy-space-sm: 1rem;
+      --blitzy-space-md: 1.5rem;
+      --blitzy-space-lg: 2rem;
+      --blitzy-space-xl: 3rem;
+      --blitzy-space-2xl: 4rem;
+      --blitzy-space-3xl: 6rem;
 
       /* Font-size scale */
-      --fs-eyebrow: 1.5rem;
-      --fs-small: 1.5rem;
-      --fs-body: 2rem;
-      --fs-body-lg: 2.3rem;
-      --fs-h3: 2.5rem;
-      --fs-h2: 3.5rem;
-      --fs-h1: 5rem;
-      --fs-display: 6.5rem;
-      --fs-kpi: 4rem;
-      --fs-divider: 6rem;
+      --blitzy-fs-eyebrow: 1.5rem;
+      --blitzy-fs-small: 1.5rem;
+      --blitzy-fs-body: 2rem;
+      --blitzy-fs-body-lg: 2.3rem;
+      --blitzy-fs-h3: 2.5rem;
+      --blitzy-fs-h2: 3.5rem;
+      --blitzy-fs-h1: 5rem;
+      --blitzy-fs-display: 6.5rem;
+      --blitzy-fs-kpi: 4rem;
+      --blitzy-fs-divider: 6rem;
+      /* Relative (em) inline-code sizing — shrinks code to its surrounding text */
+      --blitzy-fs-code: 0.9em;
+      --blitzy-fs-code-cell: 0.95em;
 
       /* Radius / border widths / line heights / letter spacing */
-      --radius-sm: 6px;
-      --radius-md: 12px;
-      --radius-lg: 20px;
-      --radius-pill: 999px;
-      --bw-thin: 1px;
-      --bw-med: 2px;
-      --bw-thick: 4px;
-      --bw-accent: 8px;
-      --lh-tight: 1.1;
-      --lh-snug: 1.3;
-      --lh-body: 1.55;
-      --ls-eyebrow: 0.28em;
-      --ls-wide: 0.04em;
+      --blitzy-radius-sm: 6px;
+      --blitzy-radius-md: 12px;
+      --blitzy-radius-lg: 20px;
+      --blitzy-radius-pill: 999px;
+      --blitzy-bw-thin: 1px;
+      --blitzy-bw-med: 2px;
+      --blitzy-bw-thick: 4px;
+      --blitzy-bw-accent: 8px;
+      --blitzy-lh-tight: 1.1;
+      --blitzy-lh-snug: 1.3;
+      --blitzy-lh-body: 1.55;
+      --blitzy-ls-eyebrow: 0.28em;
+      --blitzy-ls-wide: 0.04em;
+
+      /* SVG icon stroke widths */
+      --blitzy-icon-stroke: 1.5;
+      --blitzy-icon-stroke-strong: 1.75;
 
       /* Sizes */
-      --size-hero-icon: 7rem;
-      --size-divider-icon: 5rem;
-      --size-kpi-icon: 3.2rem;
-      --size-icon: 2.8rem;
-      --size-chip-icon: 1.8rem;
-      --size-bullet: 0.85rem;
-      --size-mark: 2.2rem;
-      --size-accent-bar: 18rem;
-      --maxw-content: 84%;
-      --maxw-wide: 90%;
+      --blitzy-size-hero-icon: 7rem;
+      --blitzy-size-divider-icon: 5rem;
+      --blitzy-size-kpi-icon: 3.2rem;
+      --blitzy-size-icon: 2.8rem;
+      --blitzy-size-chip-icon: 1.8rem;
+      --blitzy-size-bullet: 0.85rem;
+      --blitzy-size-mark: 2.2rem;
+      --blitzy-size-accent-bar: 18rem;
+      --blitzy-size-full: 100%;
+      --blitzy-maxw-content: 84%;
+      --blitzy-maxw-wide: 90%;
+
+      /* Grid column templates */
+      --blitzy-grid-4: repeat(4, 1fr);
+      --blitzy-grid-3: repeat(3, 1fr);
+      --blitzy-grid-2: 1fr 1fr;
 
       /* Shadows (tints derived from brand tokens via color-mix) */
-      --shadow-card: 0 10px 30px color-mix(in srgb, var(--blitzy-primary-navy) 16%, transparent);
-      --shadow-soft: 0 6px 18px color-mix(in srgb, var(--blitzy-primary-dark) 12%, transparent);
+      --blitzy-shadow-card: 0 10px 30px color-mix(in srgb, var(--blitzy-primary-navy) 16%, transparent);
+      --blitzy-shadow-soft: 0 6px 18px color-mix(in srgb, var(--blitzy-primary-dark) 12%, transparent);
+
+      /* Translucent inline-code background for dark slides (title/divider/closing) */
+      --blitzy-overlay-code: color-mix(in srgb, var(--blitzy-surface-0) 16%, transparent);
 
       /* Font weights */
-      --fw-regular: 400;
-      --fw-medium: 500;
-      --fw-semibold: 600;
-      --fw-bold: 700;
+      --blitzy-fw-regular: 400;
+      --blitzy-fw-medium: 500;
+      --blitzy-fw-semibold: 600;
+      --blitzy-fw-bold: 700;
     }
 
-    :root { font-size: var(--root-fs); }
+    :root { font-size: var(--blitzy-root-fs); }
 
     /* ---- Base ----------------------------------------------------------- */
     .reveal {
       font-family: var(--ff-body);
-      font-weight: var(--fw-regular);
+      font-weight: var(--blitzy-fw-regular);
       color: var(--blitzy-text);
-      font-size: var(--fs-body);
+      font-size: var(--blitzy-fs-body);
     }
     .reveal-viewport { background-color: var(--blitzy-surface-2); }
 
     .reveal h1, .reveal h2, .reveal h3 {
       font-family: var(--ff-display);
       color: var(--blitzy-primary-dark);
-      font-weight: var(--fw-bold);
-      line-height: var(--lh-tight);
-      letter-spacing: var(--ls-wide);
-      margin: 0 0 var(--space-md) 0;
+      font-weight: var(--blitzy-fw-bold);
+      line-height: var(--blitzy-lh-tight);
+      letter-spacing: var(--blitzy-ls-wide);
+      margin: 0 0 var(--blitzy-space-md) 0;
       text-transform: none;
     }
-    .reveal h1 { font-size: var(--fs-h1); }
-    .reveal h2 { font-size: var(--fs-h2); }
-    .reveal h3 { font-size: var(--fs-h3); }
-    .reveal p { margin: 0 0 var(--space-sm) 0; line-height: var(--lh-body); }
+    .reveal h1 { font-size: var(--blitzy-fs-h1); }
+    .reveal h2 { font-size: var(--blitzy-fs-h2); }
+    .reveal h3 { font-size: var(--blitzy-fs-h3); }
+    .reveal p { margin: 0 0 var(--blitzy-space-sm) 0; line-height: var(--blitzy-lh-body); }
 
     /* Slide shell: an inner wrapper handles padding + max width */
     .slide-inner {
-      width: 100%;
-      max-width: var(--maxw-content);
+      width: var(--blitzy-size-full);
+      max-width: var(--blitzy-maxw-content);
       margin: 0 auto;
       text-align: left;
     }
     .slide-inner.centered { text-align: center; }
-    .slide-inner.wide { max-width: var(--maxw-wide); }
+    .slide-inner.wide { max-width: var(--blitzy-maxw-wide); }
 
     /* ---- Eyebrow (Fira Code) ------------------------------------------- */
     .eyebrow {
       display: inline-block;
       font-family: var(--ff-mono);
-      font-size: var(--fs-eyebrow);
-      font-weight: var(--fw-medium);
-      letter-spacing: var(--ls-eyebrow);
+      font-size: var(--blitzy-fs-eyebrow);
+      font-weight: var(--blitzy-fw-medium);
+      letter-spacing: var(--blitzy-ls-eyebrow);
       text-transform: uppercase;
       color: var(--blitzy-primary);
-      margin: 0 0 var(--space-sm) 0;
+      margin: 0 0 var(--blitzy-space-sm) 0;
     }
 
     /* ---- Accent bar (gradient) ----------------------------------------- */
     .accent-bar {
-      height: var(--bw-accent);
-      width: var(--size-accent-bar);
+      height: var(--blitzy-bw-accent);
+      width: var(--blitzy-size-accent-bar);
       background: var(--gradient-accent);
       border: 0;
-      border-radius: var(--radius-pill);
-      margin: var(--space-md) 0 0 0;
+      border-radius: var(--blitzy-radius-pill);
+      margin: var(--blitzy-space-md) 0 0 0;
     }
     .centered .accent-bar { margin-left: auto; margin-right: auto; }
 
     /* ---- Lists / bullets ----------------------------------------------- */
-    .reveal ul { list-style: none; margin: var(--space-sm) 0 0 0; padding: 0; }
+    .reveal ul { list-style: none; margin: var(--blitzy-space-sm) 0 0 0; padding: 0; }
     .reveal li {
       position: relative;
-      padding-left: var(--space-lg);
-      margin-bottom: var(--space-sm);
-      font-size: var(--fs-body);
-      line-height: var(--lh-snug);
+      padding-left: var(--blitzy-space-lg);
+      margin-bottom: var(--blitzy-space-sm);
+      font-size: var(--blitzy-fs-body);
+      line-height: var(--blitzy-lh-snug);
     }
     .reveal li::before {
       content: "";
       position: absolute;
       left: 0;
-      top: var(--space-2xs);
-      width: var(--size-bullet);
-      height: var(--size-bullet);
+      top: var(--blitzy-space-2xs);
+      width: var(--blitzy-size-bullet);
+      height: var(--blitzy-size-bullet);
       background: var(--gradient-accent);
-      border-radius: var(--radius-sm);
+      border-radius: var(--blitzy-radius-sm);
     }
 
     /* ---- Inline code (Fira Code) --------------------------------------- */
@@ -199,194 +221,194 @@
       font-family: var(--ff-mono);
       background: var(--blitzy-surface-2);
       color: var(--blitzy-primary-deep);
-      padding: var(--space-3xs) var(--space-2xs);
-      border-radius: var(--radius-sm);
-      font-size: 0.9em;
+      padding: var(--blitzy-space-3xs) var(--blitzy-space-2xs);
+      border-radius: var(--blitzy-radius-sm);
+      font-size: var(--blitzy-fs-code);
     }
 
     /* ---- Title slide ---------------------------------------------------- */
     section.slide-title { color: var(--blitzy-surface-0); }
-    section.slide-title h1 { color: var(--blitzy-surface-0); font-size: var(--fs-display); }
+    section.slide-title h1 { color: var(--blitzy-surface-0); font-size: var(--blitzy-fs-display); }
     section.slide-title .eyebrow { color: var(--blitzy-accent-teal); }
     section.slide-title .lead {
-      font-size: var(--fs-body-lg);
+      font-size: var(--blitzy-fs-body-lg);
       color: var(--blitzy-surface-0);
-      max-width: var(--maxw-content);
+      max-width: var(--blitzy-maxw-content);
       margin-left: auto;
       margin-right: auto;
     }
     section.slide-title .audience {
       font-family: var(--ff-mono);
-      font-size: var(--fs-small);
+      font-size: var(--blitzy-fs-small);
       color: var(--blitzy-accent-teal);
-      letter-spacing: var(--ls-wide);
+      letter-spacing: var(--blitzy-ls-wide);
     }
 
     /* ---- Divider slide -------------------------------------------------- */
     section.slide-divider { color: var(--blitzy-surface-0); }
-    section.slide-divider h2 { color: var(--blitzy-surface-0); font-size: var(--fs-divider); }
+    section.slide-divider h2 { color: var(--blitzy-surface-0); font-size: var(--blitzy-fs-divider); }
     section.slide-divider .eyebrow { color: var(--blitzy-accent-teal); }
-    section.slide-divider .lead { font-size: var(--fs-body-lg); color: var(--blitzy-surface-0); }
+    section.slide-divider .lead { font-size: var(--blitzy-fs-body-lg); color: var(--blitzy-surface-0); }
 
     /* ---- Closing slide -------------------------------------------------- */
     section.slide-closing { color: var(--blitzy-surface-0); }
-    section.slide-closing h2 { color: var(--blitzy-surface-0); font-size: var(--fs-h1); }
+    section.slide-closing h2 { color: var(--blitzy-surface-0); font-size: var(--blitzy-fs-h1); }
     section.slide-closing .eyebrow { color: var(--blitzy-accent-teal); }
     section.slide-closing li { color: var(--blitzy-surface-0); }
-    section.slide-closing code { background: color-mix(in srgb, var(--blitzy-surface-0) 16%, transparent); color: var(--blitzy-accent-teal); }
+    section.slide-closing code { background: var(--blitzy-overlay-code); color: var(--blitzy-accent-teal); }
 
     /* Code chips on dark slides */
     section.slide-divider code,
     section.slide-title code {
-      background: color-mix(in srgb, var(--blitzy-surface-0) 16%, transparent);
+      background: var(--blitzy-overlay-code);
       color: var(--blitzy-accent-teal);
     }
 
     /* ---- Hero / divider icons (Lucide) --------------------------------- */
-    .hero-icon { color: var(--blitzy-accent-teal); margin-bottom: var(--space-md); line-height: 0; }
-    .hero-icon svg { width: var(--size-hero-icon); height: var(--size-hero-icon); stroke-width: 1.5; }
-    .divider-icon { color: var(--blitzy-accent-teal); margin-bottom: var(--space-md); line-height: 0; }
-    .divider-icon svg { width: var(--size-divider-icon); height: var(--size-divider-icon); stroke-width: 1.5; }
+    .hero-icon { color: var(--blitzy-accent-teal); margin-bottom: var(--blitzy-space-md); line-height: 0; }
+    .hero-icon svg { width: var(--blitzy-size-hero-icon); height: var(--blitzy-size-hero-icon); stroke-width: var(--blitzy-icon-stroke); }
+    .divider-icon { color: var(--blitzy-accent-teal); margin-bottom: var(--blitzy-space-md); line-height: 0; }
+    .divider-icon svg { width: var(--blitzy-size-divider-icon); height: var(--blitzy-size-divider-icon); stroke-width: var(--blitzy-icon-stroke); }
 
     /* ---- KPI grid ------------------------------------------------------- */
     .kpi-grid {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: var(--space-lg);
-      margin-top: var(--space-lg);
+      grid-template-columns: var(--blitzy-grid-4);
+      gap: var(--blitzy-space-lg);
+      margin-top: var(--blitzy-space-lg);
     }
-    .kpi-grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
+    .kpi-grid.cols-3 { grid-template-columns: var(--blitzy-grid-3); }
     .kpi-card {
       display: flex;
       flex-direction: column;
-      gap: var(--space-2xs);
+      gap: var(--blitzy-space-2xs);
       background: var(--blitzy-surface-0);
-      border: var(--bw-thin) solid var(--blitzy-border);
-      border-top: var(--bw-thick) solid var(--blitzy-primary);
-      border-radius: var(--radius-lg);
-      padding: var(--space-lg);
-      box-shadow: var(--shadow-card);
+      border: var(--blitzy-bw-thin) solid var(--blitzy-border);
+      border-top: var(--blitzy-bw-thick) solid var(--blitzy-primary);
+      border-radius: var(--blitzy-radius-lg);
+      padding: var(--blitzy-space-lg);
+      box-shadow: var(--blitzy-shadow-card);
       text-align: left;
     }
-    .kpi-icon { color: var(--blitzy-primary); line-height: 0; margin-bottom: var(--space-2xs); }
-    .kpi-icon svg { width: var(--size-kpi-icon); height: var(--size-kpi-icon); stroke-width: 1.75; }
+    .kpi-icon { color: var(--blitzy-primary); line-height: 0; margin-bottom: var(--blitzy-space-2xs); }
+    .kpi-icon svg { width: var(--blitzy-size-kpi-icon); height: var(--blitzy-size-kpi-icon); stroke-width: var(--blitzy-icon-stroke-strong); }
     .kpi-value {
       font-family: var(--ff-display);
-      font-size: var(--fs-kpi);
-      font-weight: var(--fw-bold);
+      font-size: var(--blitzy-fs-kpi);
+      font-weight: var(--blitzy-fw-bold);
       color: var(--blitzy-primary-deep);
-      line-height: var(--lh-tight);
+      line-height: var(--blitzy-lh-tight);
     }
-    .kpi-label { font-size: var(--fs-small); color: var(--blitzy-text-muted); font-weight: var(--fw-medium); }
+    .kpi-label { font-size: var(--blitzy-fs-small); color: var(--blitzy-text-muted); font-weight: var(--blitzy-fw-medium); }
 
     /* ---- Icon row ------------------------------------------------------- */
-    .icon-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-lg); margin-top: var(--space-lg); }
+    .icon-row { display: grid; grid-template-columns: var(--blitzy-grid-3); gap: var(--blitzy-space-lg); margin-top: var(--blitzy-space-lg); }
     .icon-item {
       background: var(--blitzy-surface-0);
-      border: var(--bw-thin) solid var(--blitzy-border);
-      border-radius: var(--radius-lg);
-      padding: var(--space-lg);
-      box-shadow: var(--shadow-soft);
+      border: var(--blitzy-bw-thin) solid var(--blitzy-border);
+      border-radius: var(--blitzy-radius-lg);
+      padding: var(--blitzy-space-lg);
+      box-shadow: var(--blitzy-shadow-soft);
     }
     .icon-item .icon-badge {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: var(--space-3xl);
-      height: var(--space-3xl);
-      border-radius: var(--radius-md);
+      width: var(--blitzy-space-3xl);
+      height: var(--blitzy-space-3xl);
+      border-radius: var(--blitzy-radius-md);
       background: var(--blitzy-surface-2);
       color: var(--blitzy-primary);
-      margin-bottom: var(--space-sm);
+      margin-bottom: var(--blitzy-space-sm);
       line-height: 0;
     }
-    .icon-item .icon-badge svg { width: var(--size-icon); height: var(--size-icon); stroke-width: 1.75; }
-    .icon-item h3 { font-size: var(--fs-h3); margin-bottom: var(--space-2xs); }
-    .icon-item p { font-size: var(--fs-small); color: var(--blitzy-text); margin: 0; line-height: var(--lh-snug); }
+    .icon-item .icon-badge svg { width: var(--blitzy-size-icon); height: var(--blitzy-size-icon); stroke-width: var(--blitzy-icon-stroke-strong); }
+    .icon-item h3 { font-size: var(--blitzy-fs-h3); margin-bottom: var(--blitzy-space-2xs); }
+    .icon-item p { font-size: var(--blitzy-fs-small); color: var(--blitzy-text); margin: 0; line-height: var(--blitzy-lh-snug); }
 
     /* ---- Command chips -------------------------------------------------- */
-    .chip-row { display: flex; flex-wrap: wrap; gap: var(--space-sm); margin-top: var(--space-lg); }
+    .chip-row { display: flex; flex-wrap: wrap; gap: var(--blitzy-space-sm); margin-top: var(--blitzy-space-lg); }
     .chip {
       display: inline-flex;
       align-items: center;
-      gap: var(--space-2xs);
+      gap: var(--blitzy-space-2xs);
       background: var(--blitzy-surface-0);
-      border: var(--bw-thin) solid var(--blitzy-border);
-      border-left: var(--bw-thick) solid var(--blitzy-primary);
-      border-radius: var(--radius-md);
-      padding: var(--space-xs) var(--space-sm);
-      box-shadow: var(--shadow-soft);
+      border: var(--blitzy-bw-thin) solid var(--blitzy-border);
+      border-left: var(--blitzy-bw-thick) solid var(--blitzy-primary);
+      border-radius: var(--blitzy-radius-md);
+      padding: var(--blitzy-space-xs) var(--blitzy-space-sm);
+      box-shadow: var(--blitzy-shadow-soft);
     }
-    .chip svg { width: var(--size-chip-icon); height: var(--size-chip-icon); color: var(--blitzy-primary); stroke-width: 1.75; }
-    .chip code { background: transparent; color: var(--blitzy-primary-deep); padding: 0; font-size: var(--fs-small); }
+    .chip svg { width: var(--blitzy-size-chip-icon); height: var(--blitzy-size-chip-icon); color: var(--blitzy-primary); stroke-width: var(--blitzy-icon-stroke-strong); }
+    .chip code { background: transparent; color: var(--blitzy-primary-deep); padding: 0; font-size: var(--blitzy-fs-small); }
 
     /* ---- Mapping table -------------------------------------------------- */
-    .map-table { width: 100%; border-collapse: collapse; margin-top: var(--space-lg); font-size: var(--fs-small); }
-    .map-table th, .map-table td { text-align: left; padding: var(--space-xs) var(--space-sm); }
+    .map-table { width: var(--blitzy-size-full); border-collapse: collapse; margin-top: var(--blitzy-space-lg); font-size: var(--blitzy-fs-small); }
+    .map-table th, .map-table td { text-align: left; padding: var(--blitzy-space-xs) var(--blitzy-space-sm); }
     .map-table thead th {
       background: var(--blitzy-primary-dark);
       color: var(--blitzy-surface-0);
       font-family: var(--ff-display);
-      font-weight: var(--fw-semibold);
+      font-weight: var(--blitzy-fw-semibold);
     }
-    .map-table thead th:first-child { border-top-left-radius: var(--radius-md); }
-    .map-table thead th:last-child { border-top-right-radius: var(--radius-md); }
-    .map-table tbody td { border-bottom: var(--bw-thin) solid var(--blitzy-border); }
+    .map-table thead th:first-child { border-top-left-radius: var(--blitzy-radius-md); }
+    .map-table thead th:last-child { border-top-right-radius: var(--blitzy-radius-md); }
+    .map-table tbody td { border-bottom: var(--blitzy-bw-thin) solid var(--blitzy-border); }
     .map-table tbody tr:nth-child(even) td { background: var(--blitzy-surface-1); }
     .map-table tbody tr:nth-child(odd) td { background: var(--blitzy-surface-0); }
-    .map-table .layer-cell { font-weight: var(--fw-semibold); color: var(--blitzy-primary-dark); white-space: nowrap; }
+    .map-table .layer-cell { font-weight: var(--blitzy-fw-semibold); color: var(--blitzy-primary-dark); white-space: nowrap; }
     .map-table .layer-cell svg {
-      width: var(--size-chip-icon);
-      height: var(--size-chip-icon);
-      stroke-width: 1.75;
+      width: var(--blitzy-size-chip-icon);
+      height: var(--blitzy-size-chip-icon);
+      stroke-width: var(--blitzy-icon-stroke-strong);
       vertical-align: middle;
-      margin-right: var(--space-2xs);
+      margin-right: var(--blitzy-space-2xs);
       color: var(--blitzy-primary);
     }
-    .map-table code { font-size: 0.95em; }
-    .map-table .icon-cell { color: var(--blitzy-primary); line-height: 0; width: var(--space-2xl); }
-    .map-table .icon-cell svg { width: var(--size-chip-icon); height: var(--size-chip-icon); stroke-width: 1.75; vertical-align: middle; }
+    .map-table code { font-size: var(--blitzy-fs-code-cell); }
+    .map-table .icon-cell { color: var(--blitzy-primary); line-height: 0; width: var(--blitzy-space-2xl); }
+    .map-table .icon-cell svg { width: var(--blitzy-size-chip-icon); height: var(--blitzy-size-chip-icon); stroke-width: var(--blitzy-icon-stroke-strong); vertical-align: middle; }
 
     /* ---- Two-column panels --------------------------------------------- */
-    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-xl); margin-top: var(--space-lg); }
+    .two-col { display: grid; grid-template-columns: var(--blitzy-grid-2); gap: var(--blitzy-space-xl); margin-top: var(--blitzy-space-lg); }
     .panel {
       background: var(--blitzy-surface-0);
-      border: var(--bw-thin) solid var(--blitzy-border);
-      border-radius: var(--radius-lg);
-      padding: var(--space-lg);
-      box-shadow: var(--shadow-soft);
+      border: var(--blitzy-bw-thin) solid var(--blitzy-border);
+      border-radius: var(--blitzy-radius-lg);
+      padding: var(--blitzy-space-lg);
+      box-shadow: var(--blitzy-shadow-soft);
     }
-    .panel.in-scope { border-top: var(--bw-thick) solid var(--blitzy-primary); }
-    .panel.out-scope { border-top: var(--bw-thick) solid var(--blitzy-text-muted); }
-    .panel .panel-head { display: flex; align-items: center; gap: var(--space-2xs); margin-bottom: var(--space-sm); }
-    .panel .panel-head svg { width: var(--size-icon); height: var(--size-icon); stroke-width: 1.75; }
+    .panel.in-scope { border-top: var(--blitzy-bw-thick) solid var(--blitzy-primary); }
+    .panel.out-scope { border-top: var(--blitzy-bw-thick) solid var(--blitzy-text-muted); }
+    .panel .panel-head { display: flex; align-items: center; gap: var(--blitzy-space-2xs); margin-bottom: var(--blitzy-space-sm); }
+    .panel .panel-head svg { width: var(--blitzy-size-icon); height: var(--blitzy-size-icon); stroke-width: var(--blitzy-icon-stroke-strong); }
     .panel.in-scope .panel-head { color: var(--blitzy-primary); }
     .panel.out-scope .panel-head { color: var(--blitzy-text-muted); }
     .panel .panel-head h3 { margin: 0; color: inherit; }
-    .panel li { font-size: var(--fs-small); margin-bottom: var(--space-xs); }
+    .panel li { font-size: var(--blitzy-fs-small); margin-bottom: var(--blitzy-space-xs); }
     .scope-note {
-      margin-top: var(--space-lg);
+      margin-top: var(--blitzy-space-lg);
       font-family: var(--ff-mono);
-      font-size: var(--fs-small);
+      font-size: var(--blitzy-fs-small);
       color: var(--blitzy-primary-dark);
-      letter-spacing: var(--ls-wide);
+      letter-spacing: var(--blitzy-ls-wide);
     }
 
     /* ---- Brand lockup (closing) ---------------------------------------- */
     .brand-lockup {
       display: inline-flex;
       align-items: center;
-      gap: var(--space-2xs);
+      gap: var(--blitzy-space-2xs);
       font-family: var(--ff-display);
-      font-weight: var(--fw-bold);
-      font-size: var(--fs-h3);
+      font-weight: var(--blitzy-fw-bold);
+      font-size: var(--blitzy-fs-h3);
       color: var(--blitzy-surface-0);
-      margin-top: var(--space-lg);
+      margin-top: var(--blitzy-space-lg);
     }
     .brand-lockup .brand-mark {
-      width: var(--size-mark);
-      height: var(--size-mark);
-      border-radius: var(--radius-sm);
+      width: var(--blitzy-size-mark);
+      height: var(--blitzy-size-mark);
+      border-radius: var(--blitzy-radius-sm);
       background: var(--gradient-accent);
       display: inline-block;
     }
@@ -397,11 +419,11 @@
       box-shadow: none;
       border: 0;
       text-align: center;
-      width: 100%;
-      margin-top: var(--space-md);
-      font-size: var(--fs-small);
+      width: var(--blitzy-size-full);
+      margin-top: var(--blitzy-space-md);
+      font-size: var(--blitzy-fs-small);
     }
-    .reveal pre.mermaid svg { max-width: 100%; height: auto; }
+    .reveal pre.mermaid svg { max-width: var(--blitzy-size-full); height: auto; }
     /* SVG foreignObject clips its content by default; mermaid occasionally sizes
        a label box a hair narrower than the rendered text, which would clip the
        last glyph. Allow overflow so full labels show (they remain within the
@@ -414,11 +436,11 @@
       text-align: left;
       margin-left: auto;
       margin-right: auto;
-      max-width: var(--maxw-content);
+      max-width: var(--blitzy-maxw-content);
     }
 
     /* ---- Slide header helper ------------------------------------------- */
-    .slide-head { margin-bottom: var(--space-sm); }
+    .slide-head { margin-bottom: var(--blitzy-space-sm); }
   </style>
 </head>
 <body>
@@ -427,7 +449,7 @@
       <!-- 1. Title -->
       <section class="slide-title" data-background-gradient="var(--gradient-hero)">
         <div class="slide-inner centered">
-          <span class="hero-icon"><i data-lucide="shield-check"></i></span>
+          <span class="hero-icon"><i data-lucide="shield-check" aria-hidden="true"></i></span>
           <span class="eyebrow">Executive Briefing</span>
           <h1>C-to-Rust Rewrite of zlib</h1>
           <p class="lead">Re-implementing the zlib 1.3.2.1 compression library in safe Rust — identical wire format, identical C ABI, memory-safe by construction.</p>
@@ -443,22 +465,22 @@
           <h2>What the migration delivers</h2>
           <div class="kpi-grid">
             <div class="kpi-card">
-              <span class="kpi-icon"><i data-lucide="shield-check"></i></span>
+              <span class="kpi-icon"><i data-lucide="shield-check" aria-hidden="true"></i></span>
               <span class="kpi-value">Memory-safe</span>
               <span class="kpi-label">No use-after-free or double-free</span>
             </div>
             <div class="kpi-card">
-              <span class="kpi-icon"><i data-lucide="badge-check"></i></span>
+              <span class="kpi-icon"><i data-lucide="badge-check" aria-hidden="true"></i></span>
               <span class="kpi-value">&gt;98%</span>
               <span class="kpi-label">Safe Rust by line count</span>
             </div>
             <div class="kpi-card">
-              <span class="kpi-icon"><i data-lucide="equal"></i></span>
+              <span class="kpi-icon"><i data-lucide="equal" aria-hidden="true"></i></span>
               <span class="kpi-value">Byte-exact</span>
               <span class="kpi-label">Output identical to C zlib</span>
             </div>
             <div class="kpi-card">
-              <span class="kpi-icon"><i data-lucide="plug"></i></span>
+              <span class="kpi-icon"><i data-lucide="plug" aria-hidden="true"></i></span>
               <span class="kpi-value">Drop-in</span>
               <span class="kpi-label">C ABI / FFI compatible</span>
             </div>
@@ -471,7 +493,7 @@
         <div class="slide-inner wide">
           <span class="eyebrow">Before and after</span>
           <h2>Six C layers map to Rust modules</h2>
-          <pre class="mermaid">
+          <pre class="mermaid" role="img" aria-label="Architecture mapping diagram. The six C baseline layers of zlib — Public API, Deflate, Inflate, Checksum, Gzip I/O, and Utilities — each map to a corresponding module in the Rust zlib_rs crate: the FFI and library root, deflate, inflate, checksum, gzip, and utility modules.">
 graph LR
   subgraph C["C baseline (libz 1.3.2.1)"]
     direction TB
@@ -504,7 +526,7 @@ graph LR
       <!-- 4. Divider: Why -->
       <section class="slide-divider" data-background-gradient="var(--gradient-divider)">
         <div class="slide-inner centered">
-          <span class="divider-icon"><i data-lucide="lightbulb"></i></span>
+          <span class="divider-icon"><i data-lucide="lightbulb" aria-hidden="true"></i></span>
           <span class="eyebrow">01 &middot; Rationale</span>
           <h2>Why</h2>
           <p class="lead">The case for moving a 30-year-old C codebase to Rust.</p>
@@ -518,17 +540,17 @@ graph LR
           <h2>Lower risk, same behavior</h2>
           <div class="icon-row">
             <div class="icon-item">
-              <span class="icon-badge"><i data-lucide="shield"></i></span>
+              <span class="icon-badge"><i data-lucide="shield" aria-hidden="true"></i></span>
               <h3>Risk reduction</h3>
               <p>Use-after-free, double-free, and buffer overruns become impossible at compile time.</p>
             </div>
             <div class="icon-item">
-              <span class="icon-badge"><i data-lucide="wrench"></i></span>
+              <span class="icon-badge"><i data-lucide="wrench" aria-hidden="true"></i></span>
               <h3>Maintainability</h3>
               <p>Ownership and enums replace manual allocation and integer state machines.</p>
             </div>
             <div class="icon-item">
-              <span class="icon-badge"><i data-lucide="plug"></i></span>
+              <span class="icon-badge"><i data-lucide="plug" aria-hidden="true"></i></span>
               <h3>Drop-in</h3>
               <p>Same C ABI and wire format — existing consumers link and run unchanged.</p>
             </div>
@@ -539,7 +561,7 @@ graph LR
       <!-- 6. Divider: What changed -->
       <section class="slide-divider" data-background-gradient="var(--gradient-divider)">
         <div class="slide-inner centered">
-          <span class="divider-icon"><i data-lucide="replace"></i></span>
+          <span class="divider-icon"><i data-lucide="replace" aria-hidden="true"></i></span>
           <span class="eyebrow">02 &middot; Transformation</span>
           <h2>What changed</h2>
           <p class="lead">From raw pointers and macros to ownership and types.</p>
@@ -557,32 +579,32 @@ graph LR
             </thead>
             <tbody>
               <tr>
-                <td class="layer-cell"><i data-lucide="layers"></i>Public API</td>
+                <td class="layer-cell"><i data-lucide="layers" aria-hidden="true"></i>Public API</td>
                 <td>zlib.h, zconf.h</td>
                 <td><code>src/ffi.rs</code> &middot; <code>lib.rs</code></td>
               </tr>
               <tr>
-                <td class="layer-cell"><i data-lucide="file-code"></i>Deflate</td>
+                <td class="layer-cell"><i data-lucide="file-code" aria-hidden="true"></i>Deflate</td>
                 <td>deflate.c, trees.c</td>
                 <td><code>src/deflate/*</code></td>
               </tr>
               <tr>
-                <td class="layer-cell"><i data-lucide="file-code"></i>Inflate</td>
+                <td class="layer-cell"><i data-lucide="file-code" aria-hidden="true"></i>Inflate</td>
                 <td>inflate.c, inffast.c, infback.c</td>
                 <td><code>src/inflate/*</code></td>
               </tr>
               <tr>
-                <td class="layer-cell"><i data-lucide="binary"></i>Checksum</td>
+                <td class="layer-cell"><i data-lucide="binary" aria-hidden="true"></i>Checksum</td>
                 <td>adler32.c, crc32.c</td>
                 <td><code>src/checksum/*</code></td>
               </tr>
               <tr>
-                <td class="layer-cell"><i data-lucide="hard-drive"></i>Gzip I/O</td>
+                <td class="layer-cell"><i data-lucide="hard-drive" aria-hidden="true"></i>Gzip I/O</td>
                 <td>gzlib.c, gzread.c, gzwrite.c</td>
                 <td><code>src/gz/*</code></td>
               </tr>
               <tr>
-                <td class="layer-cell"><i data-lucide="wrench"></i>Utilities</td>
+                <td class="layer-cell"><i data-lucide="wrench" aria-hidden="true"></i>Utilities</td>
                 <td>compress.c, uncompr.c, zutil.c</td>
                 <td><code>src/util/*</code></td>
               </tr>
@@ -596,7 +618,7 @@ graph LR
         <div class="slide-inner wide">
           <span class="eyebrow">Memory model</span>
           <h2>Ownership replaces manual memory</h2>
-          <pre class="mermaid">
+          <pre class="mermaid" role="img" aria-label="Memory ownership diagram. A ZStream owns an optional boxed compression State, which in turn owns the window buffer, the pending-output buffer, and the Huffman code table. When the ZStream is dropped, Rust frees all of them automatically — with no manual free call and no memory leak.">
 graph TD
   ZS["ZStream&amp;lt;A: Allocator&amp;gt;"] -->|owns| ST["Option&amp;lt;Box&amp;lt;State&amp;gt;&amp;gt;"]
   ST -->|owns| W["window: Vec&amp;lt;u8&amp;gt;"]
@@ -614,7 +636,7 @@ graph TD
       <!-- 9. Divider: Risk & mitigation -->
       <section class="slide-divider" data-background-gradient="var(--gradient-divider)">
         <div class="slide-inner centered">
-          <span class="divider-icon"><i data-lucide="shield-alert"></i></span>
+          <span class="divider-icon"><i data-lucide="shield-alert" aria-hidden="true"></i></span>
           <span class="eyebrow">03 &middot; Assurance</span>
           <h2>Risk &amp; mitigation</h2>
           <p class="lead">How we prove the rewrite is faithful and safe.</p>
@@ -628,19 +650,19 @@ graph TD
           <h2>Proven against the original</h2>
           <div class="icon-row">
             <div class="icon-item">
-              <span class="icon-badge"><i data-lucide="git-compare"></i></span>
+              <span class="icon-badge"><i data-lucide="git-compare" aria-hidden="true"></i></span>
               <h3>Byte-exact oracle</h3>
               <p>Output compared to canonical C zlib via <code>flate2</code>, byte-for-byte.</p>
             </div>
             <div class="icon-item">
-              <span class="icon-badge"><i data-lucide="lock"></i></span>
+              <span class="icon-badge"><i data-lucide="lock" aria-hidden="true"></i></span>
               <h3>Unsafe contained</h3>
               <p><code>unsafe</code> lives only in <code>src/ffi.rs</code> and <code>src/inflate/fast.rs</code>, each with a SAFETY note.</p>
             </div>
             <div class="icon-item">
-              <span class="icon-badge"><i data-lucide="list-checks"></i></span>
+              <span class="icon-badge"><i data-lucide="list-checks" aria-hidden="true"></i></span>
               <h3>Official vectors</h3>
-              <p>609 tests — ports of example.c, infcover, and minigzip — pass with zero failures.</p>
+              <p>Planned regression, coverage, interop, gzip, and checksum suites — ports of example.c, infcover, and minigzip — will gate every build against canonical C zlib.</p>
             </div>
           </div>
         </div>
@@ -653,22 +675,22 @@ graph TD
           <h2>Targets relative to C zlib</h2>
           <div class="kpi-grid">
             <div class="kpi-card">
-              <span class="kpi-icon"><i data-lucide="gauge"></i></span>
+              <span class="kpi-icon"><i data-lucide="gauge" aria-hidden="true"></i></span>
               <span class="kpi-value">&ge; 80%</span>
               <span class="kpi-label">Compression throughput vs C zlib</span>
             </div>
             <div class="kpi-card">
-              <span class="kpi-icon"><i data-lucide="zap"></i></span>
+              <span class="kpi-icon"><i data-lucide="zap" aria-hidden="true"></i></span>
               <span class="kpi-value">&ge; 1&times;</span>
               <span class="kpi-label">Decompression throughput (parity+)</span>
             </div>
             <div class="kpi-card">
-              <span class="kpi-icon"><i data-lucide="cpu"></i></span>
+              <span class="kpi-icon"><i data-lucide="cpu" aria-hidden="true"></i></span>
               <span class="kpi-value">&ge; 3&times;</span>
               <span class="kpi-label">SIMD CRC-32 vs scalar</span>
             </div>
             <div class="kpi-card">
-              <span class="kpi-icon"><i data-lucide="database"></i></span>
+              <span class="kpi-icon"><i data-lucide="database" aria-hidden="true"></i></span>
               <span class="kpi-value">&le; 1&times;</span>
               <span class="kpi-label">Memory footprint vs C zlib</span>
             </div>
@@ -679,7 +701,7 @@ graph TD
       <!-- 12. Divider: Onboarding -->
       <section class="slide-divider" data-background-gradient="var(--gradient-divider)">
         <div class="slide-inner centered">
-          <span class="divider-icon"><i data-lucide="rocket"></i></span>
+          <span class="divider-icon"><i data-lucide="rocket" aria-hidden="true"></i></span>
           <span class="eyebrow">04 &middot; Adoption</span>
           <h2>Onboarding &amp; development</h2>
           <p class="lead">One toolchain, one command set, enforced in CI.</p>
@@ -692,11 +714,11 @@ graph TD
           <span class="eyebrow">Developer workflow</span>
           <h2>Everything is one toolchain</h2>
           <div class="chip-row">
-            <span class="chip"><i data-lucide="package"></i><code>cargo build</code></span>
-            <span class="chip"><i data-lucide="check-check"></i><code>cargo test</code></span>
-            <span class="chip"><i data-lucide="gauge"></i><code>cargo bench</code></span>
-            <span class="chip"><i data-lucide="list-checks"></i><code>cargo clippy</code></span>
-            <span class="chip"><i data-lucide="align-left"></i><code>cargo fmt</code></span>
+            <span class="chip"><i data-lucide="package" aria-hidden="true"></i><code>cargo build</code></span>
+            <span class="chip"><i data-lucide="check-check" aria-hidden="true"></i><code>cargo test</code></span>
+            <span class="chip"><i data-lucide="gauge" aria-hidden="true"></i><code>cargo bench</code></span>
+            <span class="chip"><i data-lucide="list-checks" aria-hidden="true"></i><code>cargo clippy</code></span>
+            <span class="chip"><i data-lucide="align-left" aria-hidden="true"></i><code>cargo fmt</code></span>
           </div>
           <ul>
             <li>MSRV Rust 1.85 &middot; edition 2024 &middot; builds <code>rlib</code>, <code>cdylib</code>, and <code>staticlib</code>.</li>
@@ -712,32 +734,32 @@ graph TD
           <h2>Full format and option parity</h2>
           <div class="kpi-grid cols-3">
             <div class="kpi-card">
-              <span class="kpi-icon"><i data-lucide="file-text"></i></span>
+              <span class="kpi-icon"><i data-lucide="file-text" aria-hidden="true"></i></span>
               <span class="kpi-value">3</span>
               <span class="kpi-label">RFCs: 1950 zlib &middot; 1951 DEFLATE &middot; 1952 gzip</span>
             </div>
             <div class="kpi-card">
-              <span class="kpi-icon"><i data-lucide="gauge"></i></span>
+              <span class="kpi-icon"><i data-lucide="gauge" aria-hidden="true"></i></span>
               <span class="kpi-value">10</span>
               <span class="kpi-label">Compression levels (0&ndash;9 + default)</span>
             </div>
             <div class="kpi-card">
-              <span class="kpi-icon"><i data-lucide="shuffle"></i></span>
+              <span class="kpi-icon"><i data-lucide="shuffle" aria-hidden="true"></i></span>
               <span class="kpi-value">5</span>
               <span class="kpi-label">Strategies (default, filtered, Huffman, RLE, fixed)</span>
             </div>
             <div class="kpi-card">
-              <span class="kpi-icon"><i data-lucide="waypoints"></i></span>
+              <span class="kpi-icon"><i data-lucide="waypoints" aria-hidden="true"></i></span>
               <span class="kpi-value">7</span>
               <span class="kpi-label">Flush modes (NO_FLUSH &hellip; TREES)</span>
             </div>
             <div class="kpi-card">
-              <span class="kpi-icon"><i data-lucide="ruler"></i></span>
+              <span class="kpi-icon"><i data-lucide="ruler" aria-hidden="true"></i></span>
               <span class="kpi-value">8&ndash;47</span>
               <span class="kpi-label">windowBits overloading (zlib/raw/gzip/auto)</span>
             </div>
             <div class="kpi-card">
-              <span class="kpi-icon"><i data-lucide="book-open"></i></span>
+              <span class="kpi-icon"><i data-lucide="book-open" aria-hidden="true"></i></span>
               <span class="kpi-value">Preset</span>
               <span class="kpi-label">Dictionaries + inflateSync recovery</span>
             </div>
@@ -752,7 +774,7 @@ graph TD
           <h2>One phase, clear boundaries</h2>
           <div class="two-col">
             <div class="panel in-scope">
-              <div class="panel-head"><i data-lucide="circle-check"></i><h3>In scope</h3></div>
+              <div class="panel-head"><i data-lucide="circle-check" aria-hidden="true"></i><h3>In scope</h3></div>
               <ul>
                 <li>26 core C files ported to idiomatic Rust modules.</li>
                 <li>Full test suite, benchmarks, and C-ABI FFI shim.</li>
@@ -760,7 +782,7 @@ graph TD
               </ul>
             </div>
             <div class="panel out-scope">
-              <div class="panel-head"><i data-lucide="circle-slash"></i><h3>Out of scope</h3></div>
+              <div class="panel-head"><i data-lucide="circle-slash" aria-hidden="true"></i><h3>Out of scope</h3></div>
               <ul>
                 <li>bzip2, lzma, or new compression formats.</li>
                 <li>contrib bindings and example programs.</li>
@@ -775,7 +797,7 @@ graph TD
       <!-- 16. Closing -->
       <section class="slide-closing" data-background-color="var(--blitzy-primary-navy)">
         <div class="slide-inner centered">
-          <span class="hero-icon"><i data-lucide="rocket"></i></span>
+          <span class="hero-icon"><i data-lucide="rocket" aria-hidden="true"></i></span>
           <span class="eyebrow">Outcome</span>
           <h2>Safe. Compatible. Drop-in.</h2>
           <ul class="next-steps">

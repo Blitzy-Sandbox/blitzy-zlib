@@ -42,7 +42,13 @@ pub mod tables;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
-use crate::checksum::{adler32, crc32};
+use crate::checksum::adler32;
+// `crc32` backs the gzip-stream check value (CRC-32); the zlib path uses
+// Adler-32. Every `crc32` call site in this module is inside a
+// `#[cfg(feature = "gzip")]` block, so gate the import to match and keep the
+// `-D warnings` build clean when the `gzip` feature is disabled.
+#[cfg(feature = "gzip")]
+use crate::checksum::crc32;
 use crate::constants::*;
 use crate::error::ZlibError;
 #[cfg(feature = "gzip")]
@@ -158,6 +164,11 @@ fn make_data_type(mode: InflateMode, last: bool, bits: u32) -> i32 {
 /// satisfied and this returns `false` ("not bad"). The raw-pointer/allocator
 /// validation lives in `ffi.rs`. Returning a value keeps every API entry point
 /// structurally parallel to its C counterpart.
+// The sole caller of `state_check` is the raw-pointer/allocator validation in
+// the FFI shim (`src/ffi.rs`), which is materialized in a later checkpoint.
+// Permit the forward-declared entry point without tripping the `-D warnings`
+// dead-code gate at this checkpoint.
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn state_check(_state: &InflateState) -> bool {
     false
@@ -260,6 +271,11 @@ pub(crate) fn inflate_init2(window_bits: i32) -> Result<Box<InflateState>, i32> 
 
 /// C `inflateInit_` core — initialize with the default window size
 /// ([`DEF_WBITS`]).
+///
+/// Only the FFI `inflateInit_` shim (`src/ffi.rs`, a later checkpoint) calls
+/// this default-window convenience; the idiomatic [`Inflate`] wrapper calls
+/// [`inflate_init2`] directly. Permit the forward-declared definition here.
+#[allow(dead_code)]
 pub(crate) fn inflate_init() -> Result<Box<InflateState>, i32> {
     inflate_init2(DEF_WBITS)
 }
@@ -303,13 +319,13 @@ pub(crate) fn inflate_prime(state: &mut InflateState, bits_n: i32, value: i32) -
 /// unreachable — out-of-memory never silently corrupts state.)
 fn update_window(state: &mut InflateState, output: &[u8], end: usize, mut copy: usize) -> i32 {
     // Allocate the window on first use (matches the C `ZALLOC` lazy alloc).
-    // `Vec::new()` + `resize` avoids the `vec!` macro for `no_std` parity with
-    // `InflateState::new` and `crate::stream`.
+    // The fully-qualified `alloc::vec!` keeps the source identical under `std`
+    // and `no-std` (the bare `vec!` is not in the `core` prelude, and this
+    // module imports only the `Vec` type from `alloc`) while using the fast
+    // zero-initialization path.
     if state.window.is_empty() {
         let size = 1usize << state.wbits;
-        let mut w: Vec<u8> = Vec::new();
-        w.resize(size, 0u8);
-        state.window = w;
+        state.window = alloc::vec![0u8; size];
     }
 
     // Initialize the window occupancy the first time it is used.
@@ -1195,13 +1211,15 @@ pub(crate) fn inflate(
                 if state.offset as usize > copy {
                     // Distance reaches before this call's output → window copy.
                     copy = state.offset as usize - copy;
-                    if copy > state.whave as usize {
-                        if state.sane {
-                            msg = Some("invalid distance too far back");
-                            state.mode = InflateMode::Bad;
-                            continue 'inf;
-                        }
-                        // INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR is OFF — omit.
+                    // C rejects the stream when the distance reaches before the
+                    // start of the window (`copy > whave`) and validation is
+                    // enabled (`sane`). INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR
+                    // is OFF in this build, so the `!sane` path intentionally
+                    // does nothing — the over-far distance is tolerated.
+                    if copy > state.whave as usize && state.sane {
+                        msg = Some("invalid distance too far back");
+                        state.mode = InflateMode::Bad;
+                        continue 'inf;
                     }
                     if copy > state.wnext as usize {
                         copy -= state.wnext as usize;
@@ -1436,6 +1454,10 @@ pub(crate) fn inflate(
 /// Callers that hold the state behind a raw pointer (the FFI shim) call this to
 /// reclaim the box; the idiomatic [`Inflate`] wrapper relies on its own
 /// `Drop`. Always returns `Z_OK` at the FFI layer.
+///
+/// The sole caller (the FFI shim in `src/ffi.rs`) arrives in a later
+/// checkpoint, so permit the forward-declared definition here.
+#[allow(dead_code)]
 pub(crate) fn inflate_end(state: Box<InflateState>) {
     // Explicit drop documents the RAII teardown (runs `InflateState::drop`,
     // which frees the window and code table).
@@ -1671,6 +1693,10 @@ pub(crate) fn inflate_copy(source: &InflateState) -> InflateState {
 /// `INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR` **off** (the repo default), this
 /// is the no-op-but-error path: it forces `sane = true` (ignoring `subvert`)
 /// and returns `Z_DATA_ERROR`, exactly as the C `#else` branch does.
+///
+/// Exposed only through the FFI `inflateUndermine` shim (`src/ffi.rs`, a later
+/// checkpoint), so permit the forward-declared definition here.
+#[allow(dead_code)]
 pub(crate) fn inflate_undermine(state: &mut InflateState, _subvert: i32) -> i32 {
     state.sane = true;
     Z_DATA_ERROR

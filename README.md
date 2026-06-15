@@ -34,6 +34,16 @@ match `zlib-rs` and C zlib on either side of a compressed stream.
 > (with a hyphen), but the Rust import path uses an underscore — write
 > `use zlib_rs::...;` in your code.
 
+> **Checkpoint status:** this README documents the crate's full target design.
+> Available today are the foundation types, the Adler-32 / CRC-32 checksum
+> engine, the complete INFLATE (decompression) engine, and the Cargo + CI build
+> scaffolding (`cargo build`, the `--no-default-features` / `no-std` library
+> builds, `cargo clippy`, and `cargo fmt` all run). The DEFLATE (compression)
+> engine, the one-shot `compress`/`uncompress` helpers, the gzip **file** I/O
+> layer, and the C-ABI FFI drop-in (`src/ffi.rs`, behind the `capi` feature) are
+> delivered in subsequent checkpoints; sections and commands describing those
+> capabilities are marked accordingly.
+
 ---
 
 ## Contents
@@ -116,7 +126,9 @@ The minimum supported Rust version is **1.85.0** (the crate uses edition 2024).
 
 The simplest entry points compress or decompress an entire in-memory buffer in a
 single call. `compress` takes the data and a level (`0`–`9`, or `-1` for the
-default); `uncompress` takes the compressed data and a size hint for the output:
+default); `uncompress` takes the compressed data and a size hint for the output.
+(The one-shot `compress`/`uncompress` helpers ship with the DEFLATE-engine
+checkpoint; the example below shows their target shape.)
 
 ```rust
 use zlib_rs::{compress, uncompress};
@@ -211,8 +223,11 @@ A build script, `build.rs`, runs automatically and performs two jobs:
 1. it regenerates the CRC-32 lookup tables at build time (mirroring the way the
    upstream `crc32.h` tables are generated), so no large table file is checked
    in; and
-2. it invokes [`cbindgen`](https://crates.io/crates/cbindgen) to emit a C header
+2. once the C-ABI shim (`src/ffi.rs`) is present, it invokes
+   [`cbindgen`](https://crates.io/crates/cbindgen) to emit a C header
    (`include/zlib-rs.h`, guarded by `ZLIB_RS_H`) describing the exported C ABI.
+   Until that module exists this step is skipped automatically (it emits a
+   build warning and continues), so the library build is unaffected.
 
 ---
 
@@ -224,8 +239,15 @@ identically to the zlib C API (`deflate`, `inflate`, `deflateInit_`,
 family, and the rest of the symbol set), the generated `cdylib`/`staticlib`
 can replace the system `libz` at the binary level.
 
+> **Status:** `cargo build --release` already produces the `cdylib`/`staticlib`
+> today, but the exported C symbols come from the FFI shim (`src/ffi.rs`), which
+> is gated behind the non-default `capi` feature and delivered in a later
+> checkpoint. The linkage below — and the generated `include/zlib-rs.h` header —
+> therefore applies once the `capi` shim is built (`cargo build --release
+> --features capi`).
+
 ```sh
-cargo build --release
+cargo build --release --features capi
 # Link a C program against the generated artifacts and header:
 cc my_program.c -L target/release -I include -lzlib_rs -o my_program
 ```
@@ -269,16 +291,18 @@ guard that fires if both are enabled simultaneously.
 
 ### Tests
 
+Run the in-crate unit tests and documentation tests:
+
 ```sh
-# Run the full suite: unit tests + integration tests + doc tests
-cargo test
+cargo test          # runs the in-crate unit tests + doc tests
 ```
 
 The integration suite ports the C test programs and adds property-based and
-oracle tests:
+oracle tests. These targets are delivered with the `tests/*.rs` files in a
+later checkpoint; once present they run via:
 
 ```sh
-cargo test --test regression        # ported from test/example.c
+cargo test --test regression         # ported from test/example.c
 cargo test --test inflate_coverage   # ported from test/infcover.c
 cargo test --test round_trip         # quickcheck property round-trips
 cargo test --test interop            # byte-identical cross-check vs C zlib
@@ -300,8 +324,9 @@ cargo test --test checksum           # Adler-32 / CRC-32 known-answer tests
 
 ### Benchmarks
 
-The crate ships three [`criterion`](https://crates.io/crates/criterion)
-benchmark harnesses:
+Three [`criterion`](https://crates.io/crates/criterion) benchmark harnesses are
+delivered with the `benches/*.rs` files in a later checkpoint. Once present they
+run via:
 
 ```sh
 cargo bench                          # run all benchmarks
