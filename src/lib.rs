@@ -162,13 +162,14 @@ pub mod checksum;
 pub mod inflate;
 pub mod util;
 
-// The deflate engine is being built up from its foundation (the `state` and
-// `trees` submodules plus the shared `DeflateStatus`); the per-level strategy
-// functions and the public `deflate*` orchestration are layered on next. The
-// scoped `#[allow(dead_code)]` covers the foundation types that the (not-yet-
-// present) orchestration will consume, keeping the rest of the crate under the
-// strict `-D warnings` policy. The attribute on the module declaration
-// propagates to the whole `deflate` subtree.
+// The deflate engine: the `state`/`trees`/`strategy` foundation, the five
+// per-level strategy modules, and the public `deflate*` orchestration plus the
+// idiomatic `Deflate` wrapper (re-exported below). A few C-API entry points
+// (`deflate_init`, `deflate_copy`, `deflate_end`) are consumed only by the
+// (not-yet-present) `extern "C"` FFI shim rather than the idiomatic wrapper, so
+// the scoped `#[allow(dead_code)]` keeps them from tripping the strict
+// `-D warnings` policy until that shim lands. The attribute on the module
+// declaration propagates to the whole `deflate` subtree.
 #[allow(dead_code)]
 pub mod deflate;
 
@@ -201,7 +202,8 @@ pub use checksum::{
     crc32_z,
 };
 
-// The idiomatic streaming decompressor.
+// The idiomatic streaming compressor and decompressor.
+pub use deflate::{Deflate, DeflateOutcome};
 pub use inflate::{Inflate, InflateOutcome};
 
 // Version/diagnostic helpers.
