@@ -58,11 +58,16 @@ pub use compress::{compress, compress_bound, compress_to_buf, compress2, compres
 // Re-export the one-shot decompression API (`uncompr.c`'s `uncompress` /
 // `uncompress2`) so it resolves as `crate::util::uncompress` /
 // `crate::util::uncompress2` for both the idiomatic `src/lib.rs` re-export and
-// the `src/ffi.rs` C-ABI shim. The module `uncompress` and the re-exported
-// function `uncompress` share a name in different namespaces (type vs. value),
-// so both `crate::util::uncompress` (the function) and
-// `crate::util::uncompress::*` (the module) remain reachable.
-pub use uncompress::{uncompress, uncompress2};
+// the `src/ffi.rs` C-ABI shim. The C-semantics core `uncompress2_to_buf` is
+// re-exported alongside them (mirroring `compress_to_buf` / `compress2_to_buf`
+// above): all four C decompression entry points — `uncompress`, `uncompress_z`,
+// `uncompress2`, `uncompress2_z` — collapse onto that single core at the
+// `crate::ffi` boundary, which wraps it and maps the `Result` onto C integer
+// return codes. The module `uncompress` and the re-exported function
+// `uncompress` share a name in different namespaces (type vs. value), so both
+// `crate::util::uncompress` (the function) and `crate::util::uncompress::*` (the
+// module) remain reachable.
+pub use uncompress::{uncompress, uncompress2, uncompress2_to_buf};
 
 /// Operating-system code stored in the gzip header (RFC 1952), matching C
 /// `zutil.h`'s `#define OS_CODE 3` default (Unix).
@@ -85,6 +90,24 @@ mod tests {
     #[test]
     fn os_code_is_unix_default() {
         assert_eq!(OS_CODE, 3);
+    }
+
+    #[test]
+    fn compression_surface_round_trips() {
+        // Exercise the flat compression surface end-to-end through `super::`:
+        // `compress` (the re-exported one-shot compressor) and
+        // `uncompress2_to_buf` (the re-exported C-semantics decompression core
+        // that the `crate::ffi` shim builds on) must round-trip. This proves
+        // both halves of the flat `crate::util::*` surface — including the
+        // C-semantics cores `src/ffi.rs` reaches via `crate::util::...` — are
+        // wired and resolve to the functions (not the like-named submodules).
+        const ORIGINAL: &[u8] = b"abcabcabcabc";
+        let packed = super::compress(ORIGINAL).expect("compress should succeed");
+        let mut restored = [0u8; ORIGINAL.len()];
+        let (produced, _) = super::uncompress2_to_buf(&mut restored, &packed)
+            .expect("uncompress2_to_buf should succeed");
+        assert_eq!(produced, ORIGINAL.len());
+        assert_eq!(&restored[..produced], ORIGINAL);
     }
 
     #[test]
