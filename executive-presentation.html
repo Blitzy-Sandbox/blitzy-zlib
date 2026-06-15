@@ -1,0 +1,877 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>C-to-Rust Rewrite of zlib — Executive Briefing</title>
+  <!-- Inline empty favicon to avoid a spurious favicon.ico request (self-contained) -->
+  <link rel="icon" href="data:," />
+
+  <!-- Google Fonts: Inter (body), Space Grotesk (display), Fira Code (mono) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=Fira+Code:wght@400;500&display=swap" />
+
+  <!-- reveal.js 5.1.0 core stylesheet (NO theme CSS — the Blitzy theme is inlined below) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+
+  <!-- ===================================================================== -->
+  <!-- Blitzy reveal.js design system — embedded inline (canonical theme file -->
+  <!-- blitzy-deck/references/blitzy-reveal-theme.css is absent from the repo) -->
+  <!-- ===================================================================== -->
+  <style>
+    /* ---- Design tokens: brand palette + extended scale ------------------ */
+    :root {
+      /* Brand colors */
+      --blitzy-primary: #5B39F3;
+      --blitzy-primary-dark: #2D1C77;
+      --blitzy-primary-navy: #1A105F;
+      --blitzy-primary-light: #7A6DEC;
+      --blitzy-primary-deep: #4101DB;
+      --blitzy-accent-teal: #94FAD5;
+
+      /* Surfaces */
+      --blitzy-surface-0: #FFFFFF;
+      --blitzy-surface-1: #F4EFF6;
+      --blitzy-surface-2: #F2F0FE;
+      --blitzy-surface-3: #F5F5F5;
+
+      /* Border + text */
+      --blitzy-border: #D9D9D9;
+      --blitzy-text: #333333;
+      --blitzy-text-muted: #999999;
+
+      /* Typography families */
+      --ff-body: 'Inter', sans-serif;
+      --ff-display: 'Space Grotesk', sans-serif;
+      --ff-mono: 'Fira Code', monospace;
+
+      /* Gradients (colors sourced from brand tokens) */
+      --gradient-hero: linear-gradient(68deg, var(--blitzy-primary-light) 15.56%, var(--blitzy-primary) 62.74%, var(--blitzy-primary-deep) 84.44%);
+      --gradient-divider: linear-gradient(135deg, var(--blitzy-primary-dark) 0%, var(--blitzy-primary) 100%);
+      --gradient-accent: linear-gradient(90deg, var(--blitzy-primary) 0%, var(--blitzy-accent-teal) 100%);
+
+      /* Root font size (drives rem scale on the 1920x1080 canvas) */
+      --root-fs: 16px;
+
+      /* Spacing scale */
+      --space-3xs: 0.25rem;
+      --space-2xs: 0.5rem;
+      --space-xs: 0.75rem;
+      --space-sm: 1rem;
+      --space-md: 1.5rem;
+      --space-lg: 2rem;
+      --space-xl: 3rem;
+      --space-2xl: 4rem;
+      --space-3xl: 6rem;
+
+      /* Font-size scale */
+      --fs-eyebrow: 1.5rem;
+      --fs-small: 1.5rem;
+      --fs-body: 2rem;
+      --fs-body-lg: 2.3rem;
+      --fs-h3: 2.5rem;
+      --fs-h2: 3.5rem;
+      --fs-h1: 5rem;
+      --fs-display: 6.5rem;
+      --fs-kpi: 4rem;
+      --fs-divider: 6rem;
+
+      /* Radius / border widths / line heights / letter spacing */
+      --radius-sm: 6px;
+      --radius-md: 12px;
+      --radius-lg: 20px;
+      --radius-pill: 999px;
+      --bw-thin: 1px;
+      --bw-med: 2px;
+      --bw-thick: 4px;
+      --bw-accent: 8px;
+      --lh-tight: 1.1;
+      --lh-snug: 1.3;
+      --lh-body: 1.55;
+      --ls-eyebrow: 0.28em;
+      --ls-wide: 0.04em;
+
+      /* Sizes */
+      --size-hero-icon: 7rem;
+      --size-divider-icon: 5rem;
+      --size-kpi-icon: 3.2rem;
+      --size-icon: 2.8rem;
+      --size-chip-icon: 1.8rem;
+      --size-bullet: 0.85rem;
+      --size-mark: 2.2rem;
+      --size-accent-bar: 18rem;
+      --maxw-content: 84%;
+      --maxw-wide: 90%;
+
+      /* Shadows (tints derived from brand tokens via color-mix) */
+      --shadow-card: 0 10px 30px color-mix(in srgb, var(--blitzy-primary-navy) 16%, transparent);
+      --shadow-soft: 0 6px 18px color-mix(in srgb, var(--blitzy-primary-dark) 12%, transparent);
+
+      /* Font weights */
+      --fw-regular: 400;
+      --fw-medium: 500;
+      --fw-semibold: 600;
+      --fw-bold: 700;
+    }
+
+    :root { font-size: var(--root-fs); }
+
+    /* ---- Base ----------------------------------------------------------- */
+    .reveal {
+      font-family: var(--ff-body);
+      font-weight: var(--fw-regular);
+      color: var(--blitzy-text);
+      font-size: var(--fs-body);
+    }
+    .reveal-viewport { background-color: var(--blitzy-surface-2); }
+
+    .reveal h1, .reveal h2, .reveal h3 {
+      font-family: var(--ff-display);
+      color: var(--blitzy-primary-dark);
+      font-weight: var(--fw-bold);
+      line-height: var(--lh-tight);
+      letter-spacing: var(--ls-wide);
+      margin: 0 0 var(--space-md) 0;
+      text-transform: none;
+    }
+    .reveal h1 { font-size: var(--fs-h1); }
+    .reveal h2 { font-size: var(--fs-h2); }
+    .reveal h3 { font-size: var(--fs-h3); }
+    .reveal p { margin: 0 0 var(--space-sm) 0; line-height: var(--lh-body); }
+
+    /* Slide shell: an inner wrapper handles padding + max width */
+    .slide-inner {
+      width: 100%;
+      max-width: var(--maxw-content);
+      margin: 0 auto;
+      text-align: left;
+    }
+    .slide-inner.centered { text-align: center; }
+    .slide-inner.wide { max-width: var(--maxw-wide); }
+
+    /* ---- Eyebrow (Fira Code) ------------------------------------------- */
+    .eyebrow {
+      display: inline-block;
+      font-family: var(--ff-mono);
+      font-size: var(--fs-eyebrow);
+      font-weight: var(--fw-medium);
+      letter-spacing: var(--ls-eyebrow);
+      text-transform: uppercase;
+      color: var(--blitzy-primary);
+      margin: 0 0 var(--space-sm) 0;
+    }
+
+    /* ---- Accent bar (gradient) ----------------------------------------- */
+    .accent-bar {
+      height: var(--bw-accent);
+      width: var(--size-accent-bar);
+      background: var(--gradient-accent);
+      border: 0;
+      border-radius: var(--radius-pill);
+      margin: var(--space-md) 0 0 0;
+    }
+    .centered .accent-bar { margin-left: auto; margin-right: auto; }
+
+    /* ---- Lists / bullets ----------------------------------------------- */
+    .reveal ul { list-style: none; margin: var(--space-sm) 0 0 0; padding: 0; }
+    .reveal li {
+      position: relative;
+      padding-left: var(--space-lg);
+      margin-bottom: var(--space-sm);
+      font-size: var(--fs-body);
+      line-height: var(--lh-snug);
+    }
+    .reveal li::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: var(--space-2xs);
+      width: var(--size-bullet);
+      height: var(--size-bullet);
+      background: var(--gradient-accent);
+      border-radius: var(--radius-sm);
+    }
+
+    /* ---- Inline code (Fira Code) --------------------------------------- */
+    .reveal code {
+      font-family: var(--ff-mono);
+      background: var(--blitzy-surface-2);
+      color: var(--blitzy-primary-deep);
+      padding: var(--space-3xs) var(--space-2xs);
+      border-radius: var(--radius-sm);
+      font-size: 0.9em;
+    }
+
+    /* ---- Title slide ---------------------------------------------------- */
+    section.slide-title { color: var(--blitzy-surface-0); }
+    section.slide-title h1 { color: var(--blitzy-surface-0); font-size: var(--fs-display); }
+    section.slide-title .eyebrow { color: var(--blitzy-accent-teal); }
+    section.slide-title .lead {
+      font-size: var(--fs-body-lg);
+      color: var(--blitzy-surface-0);
+      max-width: var(--maxw-content);
+      margin-left: auto;
+      margin-right: auto;
+    }
+    section.slide-title .audience {
+      font-family: var(--ff-mono);
+      font-size: var(--fs-small);
+      color: var(--blitzy-accent-teal);
+      letter-spacing: var(--ls-wide);
+    }
+
+    /* ---- Divider slide -------------------------------------------------- */
+    section.slide-divider { color: var(--blitzy-surface-0); }
+    section.slide-divider h2 { color: var(--blitzy-surface-0); font-size: var(--fs-divider); }
+    section.slide-divider .eyebrow { color: var(--blitzy-accent-teal); }
+    section.slide-divider .lead { font-size: var(--fs-body-lg); color: var(--blitzy-surface-0); }
+
+    /* ---- Closing slide -------------------------------------------------- */
+    section.slide-closing { color: var(--blitzy-surface-0); }
+    section.slide-closing h2 { color: var(--blitzy-surface-0); font-size: var(--fs-h1); }
+    section.slide-closing .eyebrow { color: var(--blitzy-accent-teal); }
+    section.slide-closing li { color: var(--blitzy-surface-0); }
+    section.slide-closing code { background: color-mix(in srgb, var(--blitzy-surface-0) 16%, transparent); color: var(--blitzy-accent-teal); }
+
+    /* Code chips on dark slides */
+    section.slide-divider code,
+    section.slide-title code {
+      background: color-mix(in srgb, var(--blitzy-surface-0) 16%, transparent);
+      color: var(--blitzy-accent-teal);
+    }
+
+    /* ---- Hero / divider icons (Lucide) --------------------------------- */
+    .hero-icon { color: var(--blitzy-accent-teal); margin-bottom: var(--space-md); line-height: 0; }
+    .hero-icon svg { width: var(--size-hero-icon); height: var(--size-hero-icon); stroke-width: 1.5; }
+    .divider-icon { color: var(--blitzy-accent-teal); margin-bottom: var(--space-md); line-height: 0; }
+    .divider-icon svg { width: var(--size-divider-icon); height: var(--size-divider-icon); stroke-width: 1.5; }
+
+    /* ---- KPI grid ------------------------------------------------------- */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: var(--space-lg);
+      margin-top: var(--space-lg);
+    }
+    .kpi-grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
+    .kpi-card {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-2xs);
+      background: var(--blitzy-surface-0);
+      border: var(--bw-thin) solid var(--blitzy-border);
+      border-top: var(--bw-thick) solid var(--blitzy-primary);
+      border-radius: var(--radius-lg);
+      padding: var(--space-lg);
+      box-shadow: var(--shadow-card);
+      text-align: left;
+    }
+    .kpi-icon { color: var(--blitzy-primary); line-height: 0; margin-bottom: var(--space-2xs); }
+    .kpi-icon svg { width: var(--size-kpi-icon); height: var(--size-kpi-icon); stroke-width: 1.75; }
+    .kpi-value {
+      font-family: var(--ff-display);
+      font-size: var(--fs-kpi);
+      font-weight: var(--fw-bold);
+      color: var(--blitzy-primary-deep);
+      line-height: var(--lh-tight);
+    }
+    .kpi-label { font-size: var(--fs-small); color: var(--blitzy-text-muted); font-weight: var(--fw-medium); }
+
+    /* ---- Icon row ------------------------------------------------------- */
+    .icon-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-lg); margin-top: var(--space-lg); }
+    .icon-item {
+      background: var(--blitzy-surface-0);
+      border: var(--bw-thin) solid var(--blitzy-border);
+      border-radius: var(--radius-lg);
+      padding: var(--space-lg);
+      box-shadow: var(--shadow-soft);
+    }
+    .icon-item .icon-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: var(--space-3xl);
+      height: var(--space-3xl);
+      border-radius: var(--radius-md);
+      background: var(--blitzy-surface-2);
+      color: var(--blitzy-primary);
+      margin-bottom: var(--space-sm);
+      line-height: 0;
+    }
+    .icon-item .icon-badge svg { width: var(--size-icon); height: var(--size-icon); stroke-width: 1.75; }
+    .icon-item h3 { font-size: var(--fs-h3); margin-bottom: var(--space-2xs); }
+    .icon-item p { font-size: var(--fs-small); color: var(--blitzy-text); margin: 0; line-height: var(--lh-snug); }
+
+    /* ---- Command chips -------------------------------------------------- */
+    .chip-row { display: flex; flex-wrap: wrap; gap: var(--space-sm); margin-top: var(--space-lg); }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-2xs);
+      background: var(--blitzy-surface-0);
+      border: var(--bw-thin) solid var(--blitzy-border);
+      border-left: var(--bw-thick) solid var(--blitzy-primary);
+      border-radius: var(--radius-md);
+      padding: var(--space-xs) var(--space-sm);
+      box-shadow: var(--shadow-soft);
+    }
+    .chip svg { width: var(--size-chip-icon); height: var(--size-chip-icon); color: var(--blitzy-primary); stroke-width: 1.75; }
+    .chip code { background: transparent; color: var(--blitzy-primary-deep); padding: 0; font-size: var(--fs-small); }
+
+    /* ---- Mapping table -------------------------------------------------- */
+    .map-table { width: 100%; border-collapse: collapse; margin-top: var(--space-lg); font-size: var(--fs-small); }
+    .map-table th, .map-table td { text-align: left; padding: var(--space-xs) var(--space-sm); }
+    .map-table thead th {
+      background: var(--blitzy-primary-dark);
+      color: var(--blitzy-surface-0);
+      font-family: var(--ff-display);
+      font-weight: var(--fw-semibold);
+    }
+    .map-table thead th:first-child { border-top-left-radius: var(--radius-md); }
+    .map-table thead th:last-child { border-top-right-radius: var(--radius-md); }
+    .map-table tbody td { border-bottom: var(--bw-thin) solid var(--blitzy-border); }
+    .map-table tbody tr:nth-child(even) td { background: var(--blitzy-surface-1); }
+    .map-table tbody tr:nth-child(odd) td { background: var(--blitzy-surface-0); }
+    .map-table .layer-cell { font-weight: var(--fw-semibold); color: var(--blitzy-primary-dark); white-space: nowrap; }
+    .map-table .layer-cell svg {
+      width: var(--size-chip-icon);
+      height: var(--size-chip-icon);
+      stroke-width: 1.75;
+      vertical-align: middle;
+      margin-right: var(--space-2xs);
+      color: var(--blitzy-primary);
+    }
+    .map-table code { font-size: 0.95em; }
+    .map-table .icon-cell { color: var(--blitzy-primary); line-height: 0; width: var(--space-2xl); }
+    .map-table .icon-cell svg { width: var(--size-chip-icon); height: var(--size-chip-icon); stroke-width: 1.75; vertical-align: middle; }
+
+    /* ---- Two-column panels --------------------------------------------- */
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-xl); margin-top: var(--space-lg); }
+    .panel {
+      background: var(--blitzy-surface-0);
+      border: var(--bw-thin) solid var(--blitzy-border);
+      border-radius: var(--radius-lg);
+      padding: var(--space-lg);
+      box-shadow: var(--shadow-soft);
+    }
+    .panel.in-scope { border-top: var(--bw-thick) solid var(--blitzy-primary); }
+    .panel.out-scope { border-top: var(--bw-thick) solid var(--blitzy-text-muted); }
+    .panel .panel-head { display: flex; align-items: center; gap: var(--space-2xs); margin-bottom: var(--space-sm); }
+    .panel .panel-head svg { width: var(--size-icon); height: var(--size-icon); stroke-width: 1.75; }
+    .panel.in-scope .panel-head { color: var(--blitzy-primary); }
+    .panel.out-scope .panel-head { color: var(--blitzy-text-muted); }
+    .panel .panel-head h3 { margin: 0; color: inherit; }
+    .panel li { font-size: var(--fs-small); margin-bottom: var(--space-xs); }
+    .scope-note {
+      margin-top: var(--space-lg);
+      font-family: var(--ff-mono);
+      font-size: var(--fs-small);
+      color: var(--blitzy-primary-dark);
+      letter-spacing: var(--ls-wide);
+    }
+
+    /* ---- Brand lockup (closing) ---------------------------------------- */
+    .brand-lockup {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-2xs);
+      font-family: var(--ff-display);
+      font-weight: var(--fw-bold);
+      font-size: var(--fs-h3);
+      color: var(--blitzy-surface-0);
+      margin-top: var(--space-lg);
+    }
+    .brand-lockup .brand-mark {
+      width: var(--size-mark);
+      height: var(--size-mark);
+      border-radius: var(--radius-sm);
+      background: var(--gradient-accent);
+      display: inline-block;
+    }
+
+    /* ---- Mermaid container --------------------------------------------- */
+    .reveal pre.mermaid {
+      background: transparent;
+      box-shadow: none;
+      border: 0;
+      text-align: center;
+      width: 100%;
+      margin-top: var(--space-md);
+      font-size: var(--fs-small);
+    }
+    .reveal pre.mermaid svg { max-width: 100%; height: auto; }
+    /* SVG foreignObject clips its content by default; mermaid occasionally sizes
+       a label box a hair narrower than the rendered text, which would clip the
+       last glyph. Allow overflow so full labels show (they remain within the
+       wider node rectangle). */
+    .reveal pre.mermaid svg foreignObject { overflow: visible; }
+
+    /* ---- Closing next-steps list --------------------------------------- */
+    .next-steps {
+      display: inline-block;
+      text-align: left;
+      margin-left: auto;
+      margin-right: auto;
+      max-width: var(--maxw-content);
+    }
+
+    /* ---- Slide header helper ------------------------------------------- */
+    .slide-head { margin-bottom: var(--space-sm); }
+  </style>
+</head>
+<body>
+  <div class="reveal">
+    <div class="slides">
+      <!-- 1. Title -->
+      <section class="slide-title" data-background-gradient="var(--gradient-hero)">
+        <div class="slide-inner centered">
+          <span class="hero-icon"><i data-lucide="shield-check"></i></span>
+          <span class="eyebrow">Executive Briefing</span>
+          <h1>C-to-Rust Rewrite of zlib</h1>
+          <p class="lead">Re-implementing the zlib 1.3.2.1 compression library in safe Rust — identical wire format, identical C ABI, memory-safe by construction.</p>
+          <p class="audience">Scope: the core library &middot; Audience: engineering leadership</p>
+          <hr class="accent-bar" />
+        </div>
+      </section>
+
+      <!-- 2. Headline KPIs -->
+      <section>
+        <div class="slide-inner wide">
+          <span class="eyebrow">At a glance</span>
+          <h2>What the migration delivers</h2>
+          <div class="kpi-grid">
+            <div class="kpi-card">
+              <span class="kpi-icon"><i data-lucide="shield-check"></i></span>
+              <span class="kpi-value">Memory-safe</span>
+              <span class="kpi-label">No use-after-free or double-free</span>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-icon"><i data-lucide="badge-check"></i></span>
+              <span class="kpi-value">&gt;98%</span>
+              <span class="kpi-label">Safe Rust by line count</span>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-icon"><i data-lucide="equal"></i></span>
+              <span class="kpi-value">Byte-exact</span>
+              <span class="kpi-label">Output identical to C zlib</span>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-icon"><i data-lucide="plug"></i></span>
+              <span class="kpi-value">Drop-in</span>
+              <span class="kpi-label">C ABI / FFI compatible</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3. Before/after architecture -->
+      <section>
+        <div class="slide-inner wide">
+          <span class="eyebrow">Before and after</span>
+          <h2>Six C layers map to Rust modules</h2>
+          <pre class="mermaid">
+graph LR
+  subgraph C["C baseline (libz 1.3.2.1)"]
+    direction TB
+    C1["Public API<br/>zlib.h, zconf.h"]
+    C2["Deflate<br/>deflate.c, trees.c"]
+    C3["Inflate<br/>inflate.c, inffast.c<br/>inftrees.c, infback.c"]
+    C4["Checksum<br/>adler32.c, crc32.c"]
+    C5["Gzip I/O<br/>gzlib, gzread, gzwrite"]
+    C6["Utilities<br/>compress, uncompr, zutil"]
+  end
+  subgraph R["Rust crate (zlib_rs)"]
+    direction TB
+    R1["src/ffi.rs + lib.rs<br/>stream, constants, error"]
+    R2["src/deflate/*"]
+    R3["src/inflate/*"]
+    R4["src/checksum/*"]
+    R5["src/gz/*"]
+    R6["src/util/*"]
+  end
+  C1 --> R1
+  C2 --> R2
+  C3 --> R3
+  C4 --> R4
+  C5 --> R5
+  C6 --> R6
+          </pre>
+        </div>
+      </section>
+
+      <!-- 4. Divider: Why -->
+      <section class="slide-divider" data-background-gradient="var(--gradient-divider)">
+        <div class="slide-inner centered">
+          <span class="divider-icon"><i data-lucide="lightbulb"></i></span>
+          <span class="eyebrow">01 &middot; Rationale</span>
+          <h2>Why</h2>
+          <p class="lead">The case for moving a 30-year-old C codebase to Rust.</p>
+        </div>
+      </section>
+
+      <!-- 5. Business value -->
+      <section>
+        <div class="slide-inner wide">
+          <span class="eyebrow">Business value</span>
+          <h2>Lower risk, same behavior</h2>
+          <div class="icon-row">
+            <div class="icon-item">
+              <span class="icon-badge"><i data-lucide="shield"></i></span>
+              <h3>Risk reduction</h3>
+              <p>Use-after-free, double-free, and buffer overruns become impossible at compile time.</p>
+            </div>
+            <div class="icon-item">
+              <span class="icon-badge"><i data-lucide="wrench"></i></span>
+              <h3>Maintainability</h3>
+              <p>Ownership and enums replace manual allocation and integer state machines.</p>
+            </div>
+            <div class="icon-item">
+              <span class="icon-badge"><i data-lucide="plug"></i></span>
+              <h3>Drop-in</h3>
+              <p>Same C ABI and wire format — existing consumers link and run unchanged.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 6. Divider: What changed -->
+      <section class="slide-divider" data-background-gradient="var(--gradient-divider)">
+        <div class="slide-inner centered">
+          <span class="divider-icon"><i data-lucide="replace"></i></span>
+          <span class="eyebrow">02 &middot; Transformation</span>
+          <h2>What changed</h2>
+          <p class="lead">From raw pointers and macros to ownership and types.</p>
+        </div>
+      </section>
+
+      <!-- 7. Module mapping -->
+      <section>
+        <div class="slide-inner wide">
+          <span class="eyebrow">Module mapping</span>
+          <h2>The six-layer port</h2>
+          <table class="map-table">
+            <thead>
+              <tr><th>Layer</th><th>C sources</th><th>Rust module</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="layer-cell"><i data-lucide="layers"></i>Public API</td>
+                <td>zlib.h, zconf.h</td>
+                <td><code>src/ffi.rs</code> &middot; <code>lib.rs</code></td>
+              </tr>
+              <tr>
+                <td class="layer-cell"><i data-lucide="file-code"></i>Deflate</td>
+                <td>deflate.c, trees.c</td>
+                <td><code>src/deflate/*</code></td>
+              </tr>
+              <tr>
+                <td class="layer-cell"><i data-lucide="file-code"></i>Inflate</td>
+                <td>inflate.c, inffast.c, infback.c</td>
+                <td><code>src/inflate/*</code></td>
+              </tr>
+              <tr>
+                <td class="layer-cell"><i data-lucide="binary"></i>Checksum</td>
+                <td>adler32.c, crc32.c</td>
+                <td><code>src/checksum/*</code></td>
+              </tr>
+              <tr>
+                <td class="layer-cell"><i data-lucide="hard-drive"></i>Gzip I/O</td>
+                <td>gzlib.c, gzread.c, gzwrite.c</td>
+                <td><code>src/gz/*</code></td>
+              </tr>
+              <tr>
+                <td class="layer-cell"><i data-lucide="wrench"></i>Utilities</td>
+                <td>compress.c, uncompr.c, zutil.c</td>
+                <td><code>src/util/*</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 8. Ownership / memory model -->
+      <section>
+        <div class="slide-inner wide">
+          <span class="eyebrow">Memory model</span>
+          <h2>Ownership replaces manual memory</h2>
+          <pre class="mermaid">
+graph TD
+  ZS["ZStream&amp;lt;A: Allocator&amp;gt;"] -->|owns| ST["Option&amp;lt;Box&amp;lt;State&amp;gt;&amp;gt;"]
+  ST -->|owns| W["window: Vec&amp;lt;u8&amp;gt;"]
+  ST -->|owns| P["pending_buf: Vec&amp;lt;u8&amp;gt;"]
+  ST -->|owns| H["codes: Box&amp;lt;[Code]&amp;gt;"]
+  ZS -.->|Drop frees all| F["no zfree, no leak"]
+          </pre>
+          <ul>
+            <li>Raw <code>next_in</code> / <code>next_out</code> pointers become bounds-checked slices.</li>
+            <li><code>deflateEnd</code> / <code>inflateEnd</code> / <code>gzclose</code> become automatic <code>Drop</code>.</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- 9. Divider: Risk & mitigation -->
+      <section class="slide-divider" data-background-gradient="var(--gradient-divider)">
+        <div class="slide-inner centered">
+          <span class="divider-icon"><i data-lucide="shield-alert"></i></span>
+          <span class="eyebrow">03 &middot; Assurance</span>
+          <h2>Risk &amp; mitigation</h2>
+          <p class="lead">How we prove the rewrite is faithful and safe.</p>
+        </div>
+      </section>
+
+      <!-- 10. Correctness & safety -->
+      <section>
+        <div class="slide-inner wide">
+          <span class="eyebrow">Correctness &amp; safety</span>
+          <h2>Proven against the original</h2>
+          <div class="icon-row">
+            <div class="icon-item">
+              <span class="icon-badge"><i data-lucide="git-compare"></i></span>
+              <h3>Byte-exact oracle</h3>
+              <p>Output compared to canonical C zlib via <code>flate2</code>, byte-for-byte.</p>
+            </div>
+            <div class="icon-item">
+              <span class="icon-badge"><i data-lucide="lock"></i></span>
+              <h3>Unsafe contained</h3>
+              <p><code>unsafe</code> lives only in <code>src/ffi.rs</code> and <code>src/inflate/fast.rs</code>, each with a SAFETY note.</p>
+            </div>
+            <div class="icon-item">
+              <span class="icon-badge"><i data-lucide="list-checks"></i></span>
+              <h3>Official vectors</h3>
+              <p>609 tests — ports of example.c, infcover, and minigzip — pass with zero failures.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 11. Performance gates -->
+      <section>
+        <div class="slide-inner wide">
+          <span class="eyebrow">Performance gates</span>
+          <h2>Targets relative to C zlib</h2>
+          <div class="kpi-grid">
+            <div class="kpi-card">
+              <span class="kpi-icon"><i data-lucide="gauge"></i></span>
+              <span class="kpi-value">&ge; 80%</span>
+              <span class="kpi-label">Compression throughput vs C zlib</span>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-icon"><i data-lucide="zap"></i></span>
+              <span class="kpi-value">&ge; 1&times;</span>
+              <span class="kpi-label">Decompression throughput (parity+)</span>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-icon"><i data-lucide="cpu"></i></span>
+              <span class="kpi-value">&ge; 3&times;</span>
+              <span class="kpi-label">SIMD CRC-32 vs scalar</span>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-icon"><i data-lucide="database"></i></span>
+              <span class="kpi-value">&le; 1&times;</span>
+              <span class="kpi-label">Memory footprint vs C zlib</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 12. Divider: Onboarding -->
+      <section class="slide-divider" data-background-gradient="var(--gradient-divider)">
+        <div class="slide-inner centered">
+          <span class="divider-icon"><i data-lucide="rocket"></i></span>
+          <span class="eyebrow">04 &middot; Adoption</span>
+          <h2>Onboarding &amp; development</h2>
+          <p class="lead">One toolchain, one command set, enforced in CI.</p>
+        </div>
+      </section>
+
+      <!-- 13. Cargo workflow -->
+      <section>
+        <div class="slide-inner wide">
+          <span class="eyebrow">Developer workflow</span>
+          <h2>Everything is one toolchain</h2>
+          <div class="chip-row">
+            <span class="chip"><i data-lucide="package"></i><code>cargo build</code></span>
+            <span class="chip"><i data-lucide="check-check"></i><code>cargo test</code></span>
+            <span class="chip"><i data-lucide="gauge"></i><code>cargo bench</code></span>
+            <span class="chip"><i data-lucide="list-checks"></i><code>cargo clippy</code></span>
+            <span class="chip"><i data-lucide="align-left"></i><code>cargo fmt</code></span>
+          </div>
+          <ul>
+            <li>MSRV Rust 1.85 &middot; edition 2024 &middot; builds <code>rlib</code>, <code>cdylib</code>, and <code>staticlib</code>.</li>
+            <li>CI gates: <code>clippy -D warnings</code> and <code>fmt --check</code> must pass.</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- 14. Compatibility surface -->
+      <section>
+        <div class="slide-inner wide">
+          <span class="eyebrow">Compatibility surface</span>
+          <h2>Full format and option parity</h2>
+          <div class="kpi-grid cols-3">
+            <div class="kpi-card">
+              <span class="kpi-icon"><i data-lucide="file-text"></i></span>
+              <span class="kpi-value">3</span>
+              <span class="kpi-label">RFCs: 1950 zlib &middot; 1951 DEFLATE &middot; 1952 gzip</span>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-icon"><i data-lucide="gauge"></i></span>
+              <span class="kpi-value">10</span>
+              <span class="kpi-label">Compression levels (0&ndash;9 + default)</span>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-icon"><i data-lucide="shuffle"></i></span>
+              <span class="kpi-value">5</span>
+              <span class="kpi-label">Strategies (default, filtered, Huffman, RLE, fixed)</span>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-icon"><i data-lucide="waypoints"></i></span>
+              <span class="kpi-value">7</span>
+              <span class="kpi-label">Flush modes (NO_FLUSH &hellip; TREES)</span>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-icon"><i data-lucide="ruler"></i></span>
+              <span class="kpi-value">8&ndash;47</span>
+              <span class="kpi-label">windowBits overloading (zlib/raw/gzip/auto)</span>
+            </div>
+            <div class="kpi-card">
+              <span class="kpi-icon"><i data-lucide="book-open"></i></span>
+              <span class="kpi-value">Preset</span>
+              <span class="kpi-label">Dictionaries + inflateSync recovery</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 15. Delivery status / scope -->
+      <section>
+        <div class="slide-inner wide">
+          <span class="eyebrow">Delivery &amp; scope</span>
+          <h2>One phase, clear boundaries</h2>
+          <div class="two-col">
+            <div class="panel in-scope">
+              <div class="panel-head"><i data-lucide="circle-check"></i><h3>In scope</h3></div>
+              <ul>
+                <li>26 core C files ported to idiomatic Rust modules.</li>
+                <li>Full test suite, benchmarks, and C-ABI FFI shim.</li>
+                <li>Cargo crate: <code>rlib</code> + <code>cdylib</code> + <code>staticlib</code>.</li>
+              </ul>
+            </div>
+            <div class="panel out-scope">
+              <div class="panel-head"><i data-lucide="circle-slash"></i><h3>Out of scope</h3></div>
+              <ul>
+                <li>bzip2, lzma, or new compression formats.</li>
+                <li>contrib bindings and example programs.</li>
+                <li>Legacy platform dirs and the C build system.</li>
+              </ul>
+            </div>
+          </div>
+          <p class="scope-note">Executed as a single-phase migration — the crate builds and tests as one unit.</p>
+        </div>
+      </section>
+
+      <!-- 16. Closing -->
+      <section class="slide-closing" data-background-color="var(--blitzy-primary-navy)">
+        <div class="slide-inner centered">
+          <span class="hero-icon"><i data-lucide="rocket"></i></span>
+          <span class="eyebrow">Outcome</span>
+          <h2>Safe. Compatible. Drop-in.</h2>
+          <ul class="next-steps">
+            <li>Verify byte-exact output across all levels and strategies.</li>
+            <li>Benchmark against C zlib and wire up fuzzing.</li>
+            <li>Publish the crate and generated C header.</li>
+          </ul>
+          <div class="brand-lockup"><span class="brand-mark"></span><span>Blitzy</span></div>
+          <hr class="accent-bar" />
+        </div>
+      </section>
+
+    </div>
+  </div>
+
+  <!-- ===================================================================== -->
+  <!-- Runtime libraries (CDN, pinned) + initialization                      -->
+  <!-- ===================================================================== -->
+  <!-- reveal.js 5.1.0 (UMD -> window.Reveal) -->
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <!-- Mermaid 11.4.0 (UMD -> window.mermaid) -->
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.0/dist/mermaid.min.js"></script>
+  <!-- Lucide 0.460.0 (UMD -> window.lucide) -->
+  <script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+
+  <script>
+    // Mermaid: do not auto-run on load; we drive rendering from Reveal events
+    // so diagrams render correctly on the active (and every navigated) slide.
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: 'base',
+      // Measure and render diagram text with the same family the deck uses, so
+      // node boxes are sized to the actual rendered width (prevents clipping).
+      fontFamily: 'Inter, sans-serif',
+      themeVariables: {
+        primaryColor: '#F2F0FE',
+        primaryTextColor: '#333333',
+        primaryBorderColor: '#5B39F3',
+        lineColor: '#999999',
+        secondaryColor: '#F4EFF6'
+      }
+    });
+
+    // (Re)draw all Lucide icons — cheap and layout-independent, safe to call
+    // on every navigation so icons on newly revealed slides always appear.
+    function renderIcons() {
+      if (window.lucide && typeof window.lucide.createIcons === 'function') {
+        window.lucide.createIcons();
+      }
+    }
+
+    // Render Mermaid only within the currently visible slide. Mermaid cannot
+    // measure layout on hidden (display:none) slides, so we scope rendering to
+    // the active slide and let each diagram render the first time it is shown.
+    function renderMermaid(scope) {
+      if (!window.mermaid || typeof window.mermaid.run !== 'function') return;
+      var root = scope || document;
+      var pending = root.querySelectorAll('pre.mermaid:not([data-processed="true"])');
+      if (!pending.length) return;
+      // .catch keeps a transient render rejection from surfacing as an
+      // uncaught promise; the diagram retries when its slide is shown.
+      var run = function () {
+        window.mermaid.run({ nodes: pending }).catch(function () { /* retried on next view */ });
+      };
+      // Render only after web fonts are ready: mermaid sizes node boxes from
+      // measured text width, so measuring with the final fonts prevents the
+      // label clipping that occurs if a fallback font is used mid-load.
+      if (document.fonts && document.fonts.ready && typeof document.fonts.ready.then === 'function') {
+        document.fonts.ready.then(run);
+      } else {
+        run();
+      }
+    }
+
+    // Render Lucide icons globally and Mermaid diagrams for the active slide.
+    function renderVisuals(event) {
+      renderIcons();
+      var current = (event && event.currentSlide)
+        ? event.currentSlide
+        : document.querySelector('.reveal .slides section.present');
+      renderMermaid(current);
+    }
+
+    // Initialize reveal.js with the exact Blitzy deck configuration.
+    Reveal.initialize({
+      hash: true,
+      transition: 'slide',
+      controlsTutorial: false,
+      width: 1920,
+      height: 1080
+    });
+
+    // Render once the deck is ready, and again whenever the slide changes
+    // (so icons/diagrams on newly revealed slides are always drawn).
+    Reveal.on('ready', renderVisuals);
+    Reveal.on('slidechanged', renderVisuals);
+  </script>
+</body>
+</html>
