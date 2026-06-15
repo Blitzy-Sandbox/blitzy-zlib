@@ -173,6 +173,20 @@ pub mod util;
 #[allow(dead_code)]
 pub mod deflate;
 
+// The gzip FILE-I/O layer (`gzopen`/`gzread`/`gzwrite`/`gzclose`, ...). Gated by
+// the `gz-io` feature (implies `std` + `gzip`), mirroring the C
+// `#ifndef NO_GZCOMPRESS` / `NO_GZIP` build. So far only the `state` foundation
+// (`GzState` + the `Mode`/`How` sentinels + RAII `Drop`) is present; its
+// crate-internal API is consumed by the (not-yet-present) `open`/`read`/`write`/
+// `close` submodules and the `extern "C"` FFI shim rather than by any current
+// in-crate caller, so the scoped `#[allow(dead_code)]` keeps it from tripping
+// the strict `-D warnings` policy until those consumers land (the same rationale
+// as the `deflate` engine root above). The attribute propagates to the whole
+// `gz` subtree.
+#[cfg(feature = "gz-io")]
+#[allow(dead_code)]
+pub mod gz;
+
 // ---------------------------------------------------------------------------
 // Public re-exports — the flat API surface (mirrors zlib.h's namespace)
 // ---------------------------------------------------------------------------
