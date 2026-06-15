@@ -26,5 +26,6 @@
 //! * **100% safe Rust** — no `unsafe` (AAP §0.6.2); `unsafe` is confined to
 //!   `crate::ffi` and `crate::inflate::fast`.
 
+pub mod read;
 pub mod state;
 pub mod write;
