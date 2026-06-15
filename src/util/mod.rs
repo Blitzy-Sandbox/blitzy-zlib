@@ -10,6 +10,7 @@
 //! | Submodule           | C source     | Responsibility                                  |
 //! |---------------------|--------------|-------------------------------------------------|
 //! | [`mod@version`]     | `zutil.c`    | [`zlib_version`]/[`zlib_compile_flags`]/[`z_error`] |
+//! | [`mod@compress`]    | `compress.c` | one-shot [`compress`]/[`compress2`]/[`compress_bound`] |
 //! | [`mod@uncompress`]  | `uncompr.c`  | one-shot [`uncompress`]/[`uncompress2`]         |
 //!
 //! The one-shot `compress`/`uncompress` helpers (`compress.c` → `compress.rs`,
@@ -30,8 +31,9 @@
 
 pub mod version;
 
-// The one-shot DEFLATE convenience helpers (`uncompr.c` → `uncompress.rs`).
-// `compress.rs` joins this list as the compression half is completed.
+// The one-shot DEFLATE convenience helpers: `compress.c` → `compress.rs` (the
+// compression half) and `uncompr.c` → `uncompress.rs` (the decompression half).
+pub mod compress;
 pub mod uncompress;
 
 // Re-export the version/diagnostic surface from `zutil.c`. These mirror the
@@ -39,6 +41,19 @@ pub mod uncompress;
 // `zError`) so both the idiomatic Rust API (`src/lib.rs`) and the future C-ABI
 // shim (`src/ffi.rs`) can build on a single flat utility namespace.
 pub use version::{z_error, zlib_compile_flags, zlib_version, zlib_version_num};
+
+// Re-export the one-shot compression API (`compress.c`'s `compress` /
+// `compress2` / `compressBound`) so it resolves as `crate::util::compress` /
+// `crate::util::compress2` / `crate::util::compress_bound`. `src/lib.rs`
+// re-exports these as the crate's public `zlib_rs::{compress, compress2,
+// compress_bound}` surface; the C-semantics cores `compress_to_buf` /
+// `compress2_to_buf` are re-exported for the `src/ffi.rs` `extern "C"` shim,
+// which wraps them and maps the `Result` onto C integer return codes. As with
+// `uncompress` below, the module `compress` and the re-exported function
+// `compress` share a name in different namespaces (type vs. value), so both
+// `crate::util::compress` (the function) and `crate::util::compress::*` (the
+// module) remain reachable.
+pub use compress::{compress, compress_bound, compress_to_buf, compress2, compress2_to_buf};
 
 // Re-export the one-shot decompression API (`uncompr.c`'s `uncompress` /
 // `uncompress2`) so it resolves as `crate::util::uncompress` /
