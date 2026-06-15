@@ -10,6 +10,7 @@
 //! | Submodule           | C source     | Responsibility                                  |
 //! |---------------------|--------------|-------------------------------------------------|
 //! | [`mod@version`]     | `zutil.c`    | [`zlib_version`]/[`zlib_compile_flags`]/[`z_error`] |
+//! | [`mod@uncompress`]  | `uncompr.c`  | one-shot [`uncompress`]/[`uncompress2`]         |
 //!
 //! The one-shot `compress`/`uncompress` helpers (`compress.c` → `compress.rs`,
 //! `uncompr.c` → `uncompress.rs`, AAP §0.4.1) are layered on top of this root
@@ -29,11 +30,24 @@
 
 pub mod version;
 
+// The one-shot DEFLATE convenience helpers (`uncompr.c` → `uncompress.rs`).
+// `compress.rs` joins this list as the compression half is completed.
+pub mod uncompress;
+
 // Re-export the version/diagnostic surface from `zutil.c`. These mirror the
 // `zlib.h`-declared C entry points (`zlibVersion`, `zlibCompileFlags`,
 // `zError`) so both the idiomatic Rust API (`src/lib.rs`) and the future C-ABI
 // shim (`src/ffi.rs`) can build on a single flat utility namespace.
 pub use version::{z_error, zlib_compile_flags, zlib_version, zlib_version_num};
+
+// Re-export the one-shot decompression API (`uncompr.c`'s `uncompress` /
+// `uncompress2`) so it resolves as `crate::util::uncompress` /
+// `crate::util::uncompress2` for both the idiomatic `src/lib.rs` re-export and
+// the `src/ffi.rs` C-ABI shim. The module `uncompress` and the re-exported
+// function `uncompress` share a name in different namespaces (type vs. value),
+// so both `crate::util::uncompress` (the function) and
+// `crate::util::uncompress::*` (the module) remain reachable.
+pub use uncompress::{uncompress, uncompress2};
 
 /// Operating-system code stored in the gzip header (RFC 1952), matching C
 /// `zutil.h`'s `#define OS_CODE 3` default (Unix).
