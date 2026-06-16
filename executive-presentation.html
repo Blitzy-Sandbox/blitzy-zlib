@@ -662,7 +662,7 @@ graph TD
             <div class="icon-item">
               <span class="icon-badge"><i data-lucide="list-checks" aria-hidden="true"></i></span>
               <h3>Official vectors</h3>
-              <p>Planned regression, coverage, interop, gzip, and checksum suites — ports of example.c, infcover, and minigzip — will gate every build against canonical C zlib.</p>
+              <p>Delivered regression, coverage, interop, gzip, and checksum suites — ports of example.c, infcover, and minigzip — gate every build against canonical C zlib.</p>
             </div>
           </div>
         </div>
@@ -801,9 +801,9 @@ graph TD
           <span class="eyebrow">Outcome</span>
           <h2>Safe. Compatible. Drop-in.</h2>
           <ul class="next-steps">
-            <li>Verify byte-exact output across all levels and strategies.</li>
-            <li>Benchmark against C zlib and wire up fuzzing.</li>
-            <li>Publish the crate and generated C header.</li>
+            <li>Byte-exact output verified against canonical C zlib across levels, strategies, and framings.</li>
+            <li>Criterion benchmarks and quickcheck property suites gate every build.</li>
+            <li>Ships as lib + cdylib + staticlib with a cbindgen-generated C header — a binary drop-in for libz.</li>
           </ul>
           <div class="brand-lockup"><span class="brand-mark"></span><span>Blitzy</span></div>
           <hr class="accent-bar" />

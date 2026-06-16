@@ -33,7 +33,7 @@ use rand::{RngCore, SeedableRng};
 use std::hint::black_box;
 use std::io::Read;
 use zlib_rs::util::{compress2, uncompress};
-use zlib_rs::{Inflate, Z_NO_FLUSH, Z_STREAM_END};
+use zlib_rs::{Inflate, Z_NO_FLUSH, Z_OK, Z_STREAM_END};
 
 /// Fixed RNG seed -- keeps every corpus byte-for-byte reproducible across runs
 /// so successive benchmark measurements compare like with like.
@@ -90,11 +90,13 @@ fn incompressible(size: usize) -> Vec<u8> {
 }
 
 /// A prepared decode input: a human-readable corpus name, the *compressed*
-/// zlib stream (produced in untimed setup), and the original (decompressed)
-/// length the timed bodies decode back to.
+/// zlib stream (produced in untimed setup), the original (decompressed) bytes
+/// (the reference the timed streaming body asserts its output against), and
+/// their length.
 struct Corpus {
     name: &'static str,
     compressed: Vec<u8>,
+    original: Vec<u8>,
     original_len: usize,
 }
 
@@ -130,6 +132,7 @@ fn build_corpora() -> Vec<Corpus> {
             Corpus {
                 name,
                 compressed,
+                original,
                 original_len,
             }
         })
@@ -182,10 +185,18 @@ fn bench_uncompress(c: &mut Criterion) {
 ///
 /// A fresh `Inflate` is constructed per iteration, so this path intentionally
 /// includes state-machine init and teardown. The decode is wrapped in a cursor
-/// loop that advances the input/output offsets until `Z_STREAM_END`; for a
-/// known-good stream decoded into a buffer sized to the original length a
-/// single call completes, but the loop makes the harness robust to partial
-/// progress and guards against an unexpected stall.
+/// loop that advances the input/output offsets until `Z_STREAM_END`.
+///
+/// BENCHMARK INTEGRITY (release-mode): criterion runs the body optimized, where
+/// `debug_assert!` is compiled out. Every correctness check here is therefore a
+/// hard `assert!`/`assert_eq!` so that an error, a stall (no forward progress),
+/// or a partial/over-long decode FAILS the benchmark instead of being silently
+/// measured as a fast "success". Each nonterminal `inflate` call must return
+/// `Z_OK` and make progress; the loop terminates only on `Z_STREAM_END`; and
+/// after the loop the run must have consumed the whole compressed stream
+/// (`in_off == src.len()`), produced exactly the original length
+/// (`out_off == original_len`), and reproduced the original bytes
+/// (`dest == original`) before the result is handed to `black_box`.
 fn bench_inflate_stream(c: &mut Criterion) {
     let corpora = build_corpora();
     let mut group = c.benchmark_group("inflate_stream");
@@ -193,6 +204,9 @@ fn bench_inflate_stream(c: &mut Criterion) {
     for corpus in &corpora {
         let name = corpus.name;
         let original_len = corpus.original_len;
+        // The reference bytes the timed body asserts its decode against. Cloned
+        // once here (untimed); the comparison itself happens inside `b.iter`.
+        let original = corpus.original.clone();
         group.throughput(Throughput::Bytes(original_len as u64));
         group.bench_with_input(
             BenchmarkId::new("stream", name),
@@ -216,14 +230,30 @@ fn bench_inflate_stream(c: &mut Criterion) {
                         if code == Z_STREAM_END {
                             break;
                         }
-                        // Defensive: a known-good stream into a correctly sized
-                        // buffer reaches Z_STREAM_END; if a call makes no
-                        // progress at all, stop rather than spin forever.
-                        if consumed == 0 && produced == 0 {
-                            break;
-                        }
+                        // Hard (release-mode) gates: a nonterminal call MUST
+                        // return Z_OK and MUST make forward progress. An error
+                        // code or a stall fails the benchmark instead of being
+                        // measured as success or spinning forever.
+                        assert_eq!(
+                            code, Z_OK,
+                            "inflate_stream: nonterminal call returned {code}"
+                        );
+                        assert!(
+                            consumed != 0 || produced != 0,
+                            "inflate_stream stalled with no progress before Z_STREAM_END"
+                        );
                     }
-                    debug_assert_eq!(out_off, original_len, "stream decode length mismatch");
+                    // Hard (release-mode) correctness gates: the whole input was
+                    // consumed, exactly the original length was produced, and
+                    // the decoded bytes match the original. Without these a
+                    // broken/partial decode could be benchmarked as success.
+                    assert_eq!(
+                        in_off,
+                        src.len(),
+                        "inflate_stream did not consume all input"
+                    );
+                    assert_eq!(out_off, original_len, "inflate_stream length mismatch");
+                    assert!(dest == original, "inflate_stream content mismatch");
                     black_box(out_off)
                 });
             },

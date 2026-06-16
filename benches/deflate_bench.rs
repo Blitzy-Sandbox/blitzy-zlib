@@ -195,8 +195,10 @@ fn build_corpora() -> [(&'static str, Vec<u8>); 3] {
 /// is **defensive**: it keeps calling `compress` -- advancing the input/output
 /// cursors -- until [`ReturnCode::StreamEnd`], so the benchmark stays correct
 /// even if some future build chooses to buffer output internally and return
-/// `Ok` before finishing. The loop is bounded: it breaks if a call makes no
-/// forward progress (which a `compress_bound`-sized buffer makes unreachable).
+/// `Ok` before finishing. The loop is bounded by a hard progress assertion: a
+/// nonterminal call that makes no forward progress (unreachable with a
+/// `compress_bound`-sized buffer) fails the benchmark rather than silently
+/// returning a partial byte count.
 ///
 /// The [`Deflate`] handle is constructed inside this helper (and therefore
 /// inside the timed body when called from `b.iter`); its initialization and the
@@ -220,12 +222,15 @@ fn deflate_finish(input: &[u8], output: &mut [u8], strategy: Strategy) -> usize 
         if outcome.code == ReturnCode::StreamEnd {
             break;
         }
-        // No forward progress => a further call cannot progress either. With a
-        // `compress_bound`-sized `output` this is unreachable, but the guard
-        // bounds the loop regardless.
-        if outcome.consumed == 0 && outcome.produced == 0 {
-            break;
-        }
+        // Hard (release-mode) gate: a nonterminal Finish call MUST make forward
+        // progress. With a `compress_bound`-sized `output` a single Finish
+        // completes the stream, so a stall here is a bug. Assert rather than
+        // silently `break`-ing with a partial byte count that would then be
+        // benchmarked as a fast "success" in optimized criterion runs.
+        assert!(
+            outcome.consumed != 0 || outcome.produced != 0,
+            "deflate_finish stalled with no progress before StreamEnd"
+        );
     }
     produced
 }

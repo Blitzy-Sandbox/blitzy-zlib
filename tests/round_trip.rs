@@ -15,7 +15,8 @@
 //! * **One-shot path** — [`compress2`] → [`uncompress`], the in-memory
 //!   convenience API, across all ten levels plus `Z_DEFAULT_COMPRESSION`.
 //! * **Streaming path** — the [`Deflate`]/[`Inflate`] engines, across all five
-//!   [`Strategy`] values and both the zlib and raw framings.
+//!   [`Strategy`] values and all three framings (zlib, raw, and — under the
+//!   `gzip` feature — gzip), including a full strategy × framing matrix.
 //! * **Chunked feeding** — both engines fed in arbitrarily small slices, which
 //!   stresses the partial-progress (`consumed`/`produced`) bookkeeping.
 //! * **Determinism and the size bound** — identical input ⇒ identical output,
@@ -34,13 +35,17 @@
 //!
 //! # Window-framing coverage
 //!
-//! Only the zlib (positive `windowBits`, 8..=15) and raw (negative, -15..=-8)
-//! framings are exercised here, since both are available regardless of the
-//! crate's feature set. The gzip framing (`windowBits` 24..=31 / 40..=47)
-//! depends on the `gzip` feature and is covered by the gzip-focused suites
-//! (`tests/interop.rs`, `tests/gzip_compat.rs`), so it is intentionally left
-//! out of this file to keep it feature-independent (per the file's design
-//! note in AAP §0.4.1).
+//! All three stream framings are exercised. The zlib (positive `windowBits`,
+//! 8..=15) and raw (negative, -15..=-8) framings are available regardless of
+//! the crate's feature set, so their properties are unconditional. The gzip
+//! framing (`windowBits` = 31, i.e. 15 + 16) depends on the `gzip` feature, so
+//! its properties — the dedicated gzip window cases and the gzip column of the
+//! strategy × framing matrix — are gated behind `#[cfg(feature = "gzip")]`;
+//! under `--no-default-features` (gzip off) the file still compiles and its
+//! zlib/raw coverage runs, keeping the feature-independent core intact while
+//! adding the gzip coverage the final checkpoint requires (gzip is also
+//! cross-validated against canonical C zlib in `tests/interop.rs` and
+//! `tests/gzip_compat.rs`).
 //!
 //! [`tests/regression.rs`]: ./regression.rs
 
@@ -420,6 +425,78 @@ fn stream_roundtrip_window_raw15() {
 fn stream_roundtrip_window_raw9() {
     fn prop(data: Vec<u8>) -> bool {
         stream_roundtrip_ok(&data, 6, Strategy::Default, -9)
+    }
+    quickcheck(prop as fn(Vec<u8>) -> bool);
+}
+
+/// gzip framing (RFC 1952 wrapper) with the maximum 32 KiB window
+/// (`windowBits` = 31, i.e. 15 + 16 under the overloading convention). Gated on
+/// the `gzip` feature, which the gzip wrapper requires.
+#[cfg(feature = "gzip")]
+#[test]
+fn stream_roundtrip_window_gzip31() {
+    fn prop(data: Vec<u8>) -> bool {
+        stream_roundtrip_ok(&data, 6, Strategy::Default, 31)
+    }
+    quickcheck(prop as fn(Vec<u8>) -> bool);
+}
+
+/// gzip framing with a small 512-byte window (`windowBits` = 25, i.e. 9 + 16),
+/// mirroring the zlib-9 / raw-9 small-window cases for the gzip wrapper. Gated
+/// on the `gzip` feature.
+#[cfg(feature = "gzip")]
+#[test]
+fn stream_roundtrip_window_gzip25() {
+    fn prop(data: Vec<u8>) -> bool {
+        stream_roundtrip_ok(&data, 6, Strategy::Default, 25)
+    }
+    quickcheck(prop as fn(Vec<u8>) -> bool);
+}
+
+// ---------------------------------------------------------------------------
+// The full strategy × framing matrix the checkpoint requires.
+// ---------------------------------------------------------------------------
+//
+// The per-strategy and per-window tests above vary one axis at a time (all
+// strategies at the default zlib window; the window/framing variations at the
+// default strategy). This property crosses BOTH axes: every one of the five
+// `Strategy` values must round-trip under each of the three stream framings —
+// zlib (`windowBits` = 15), raw (`windowBits` = -15), and gzip
+// (`windowBits` = 31). A single quickcheck property exercises all cells for
+// every generated input, so a failure in any cell shrinks to a minimal witness.
+//
+// The gzip column is compiled in only under the `gzip` feature: with it enabled
+// the matrix is 5 strategies × 3 framings = 15 cells; without it, the
+// feature-independent zlib and raw columns give 5 × 2 = 10 cells.
+
+/// `Strategy` × framing round-trip matrix (zlib / raw always; gzip when the
+/// `gzip` feature is enabled).
+#[test]
+fn stream_roundtrip_strategy_window_matrix() {
+    fn prop(data: Vec<u8>) -> bool {
+        const STRATEGIES: [Strategy; 5] = [
+            Strategy::Default,
+            Strategy::Filtered,
+            Strategy::HuffmanOnly,
+            Strategy::Rle,
+            Strategy::Fixed,
+        ];
+
+        // zlib (15) and raw (-15) framings are available regardless of the
+        // feature set; the gzip framing (31) requires the `gzip` feature. Two
+        // mutually exclusive bindings (rather than a `mut` Vec that is only
+        // sometimes pushed to) keep the no-gzip build free of an `unused_mut`
+        // warning under `-D warnings`.
+        #[cfg(feature = "gzip")]
+        let framings: [i32; 3] = [15, -15, 31];
+        #[cfg(not(feature = "gzip"))]
+        let framings: [i32; 2] = [15, -15];
+
+        STRATEGIES.iter().all(|&strategy| {
+            framings
+                .iter()
+                .all(|&wb| stream_roundtrip_ok(&data, 6, strategy, wb))
+        })
     }
     quickcheck(prop as fn(Vec<u8>) -> bool);
 }

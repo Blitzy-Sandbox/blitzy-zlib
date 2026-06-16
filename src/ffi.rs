@@ -18,17 +18,31 @@
 //!
 //! # Feature gate
 //!
-//! The whole module is compiled only under the non-default **`capi`** feature
-//! (see the `#![cfg(feature = "capi")]` below and the matching
-//! `#[cfg(feature = "capi")] pub mod ffi;` in `src/lib.rs`). The reason is
-//! symbol-collision avoidance: these exports use the canonical zlib names
-//! (`deflate`, `inflate`, `crc32`, `adler32`, …), and the development-only
-//! `flate2` oracle links canonical C zlib via its `zlib` feature. Building the
-//! `cargo test` binary with this shim enabled would link both and fail with
-//! duplicate-symbol errors. Keeping `capi` out of `default` (hence out of
-//! `cargo test`) avoids that; the cdylib/staticlib drop-in build enables it
-//! explicitly. `capi` is declared in `Cargo.toml`, so this is the chosen gate
-//! (the fallback `#![cfg(not(test))]` is unnecessary here).
+//! The module is compiled under either of two configurations (see the
+//! `#![cfg(any(feature = "capi", all(feature = "no-std", not(test))))]` below
+//! and the matching `#[cfg(...)] pub mod ffi;` in `src/lib.rs`):
+//!
+//!   * **`capi`** — the C-ABI drop-in build. This is the primary trigger. The
+//!     reason `capi` is *non-default* (rather than always on) is symbol-collision
+//!     avoidance: these exports use the canonical zlib names (`deflate`,
+//!     `inflate`, `crc32`, `adler32`, …), and the development-only `flate2`
+//!     oracle links canonical C zlib via its `zlib` feature. Building the
+//!     `cargo test` binary with this shim enabled would link both and fail with
+//!     duplicate-symbol errors. Keeping `capi` out of `default` (hence out of
+//!     `cargo test`) avoids that; the cdylib/staticlib drop-in build enables it
+//!     explicitly.
+//!   * **`all(feature = "no-std", not(test))`** — the genuine bare-metal build
+//!     (`cargo build --no-default-features --features no-std`). That
+//!     `#![no_std]` artifact has no standard library and therefore needs the
+//!     [`no_std_runtime`] (`#[global_allocator]` + `#[panic_handler]`) defined
+//!     in this file — the C-runtime allocator/abort plumbing belongs in this
+//!     designated `unsafe` boundary, not in the safe engines or the crate root
+//!     (AAP §0.6.2). A `no_std` `cdylib`/`staticlib` drop-in also wants the
+//!     C-ABI symbols, and no `flate2` oracle exists in a non-test build, so the
+//!     collision concern above does not apply. The `not(test)` clause excludes
+//!     this file from the no-std build under `cargo test` (the harness links
+//!     `std`), so the only in-`test` trigger remains `capi` — preserving the
+//!     collision avoidance.
 //!
 //! # cbindgen
 //!
@@ -54,10 +68,23 @@
 //! common `Z_NULL` path (used by `flate2`, the C smoke tests, and typical C
 //! callers) are alike byte-for-byte faithful.
 
-// Chosen gate: `capi` is present in Cargo.toml. This inner `#![cfg]` makes the
-// file self-documenting and inert outside the C-ABI build even if `lib.rs` were
-// ever changed to declare the module unconditionally.
-#![cfg(feature = "capi")]
+// Module gate. This file is compiled in two configurations, mirrored by the
+// matching `#[cfg(...)] pub mod ffi;` in `src/lib.rs`:
+//   * `capi` — the C-ABI drop-in build that links the canonical zlib symbol
+//     names (the primary purpose of this shim); and
+//   * `all(feature = "no-std", not(test))` — the genuine bare-metal build,
+//     which needs the `no_std_runtime` (`#[global_allocator]` +
+//     `#[panic_handler]`) defined above. That build also (correctly) exports
+//     the C-ABI symbols, which is exactly what a `no_std` `cdylib`/`staticlib`
+//     drop-in wants; there is no `flate2` oracle in a non-test build, so the
+//     symbol-collision concern that keeps `capi` out of `default` does not
+//     apply. Under `cargo test` the `not(test)` clause excludes this file from
+//     the no-std build (the harness links `std`), leaving `capi` as the only
+//     in-test trigger — preserving the collision avoidance described below.
+// This inner `#![cfg]` makes the file self-documenting and inert outside those
+// two builds even if `lib.rs` were ever changed to declare the module
+// unconditionally.
+#![cfg(any(feature = "capi", all(feature = "no-std", not(test))))]
 // cbindgen requires the canonical zlib names verbatim; they are *intentionally*
 // not upper-camel-case types / not snake_case-only, so silence the lints for
 // the whole C-ABI surface rather than peppering attributes on every item.
@@ -89,6 +116,83 @@ use crate::util::version as ver;
 // owned `GzHeader` / `GzState`, which exist only under the respective features.
 #[cfg(feature = "gzip")]
 use crate::gz_header::GzHeader;
+
+// ===========================================================================
+// Bare-metal (`no_std`) C runtime
+// ===========================================================================
+//
+// The genuine bare-metal drop-in — `cargo build --no-default-features --features
+// no-std`, the `Z_SOLO`-equivalent build (AAP §0.5.2) — produces a `#![no_std]`
+// `cdylib`/`staticlib` that links no Rust standard library, so it must supply
+// its own `#[global_allocator]` and `#[panic_handler]`. This C-runtime plumbing
+// binds the linking C program's `malloc`/`free`/`abort` symbols directly and is
+// inherently `unsafe`, so it lives here in the crate's *designated* `unsafe` FFI
+// boundary (AAP §0.6.2) alongside the C-ABI shim — never in the 100%-safe
+// engine modules or the crate root. It is gated `all(feature = "no-std",
+// not(test))`: it is compiled ONLY for the real bare-metal artifact and is
+// absent from every `std`-linked build (default, `--no-default-features`, and
+// any `cargo test`/`cargo bench`, all of which inherit `std`'s allocator and
+// panic runtime). This gate matches the broadened module gate at the top of the
+// file, which admits this build in addition to `capi`.
+#[cfg(all(feature = "no-std", not(test)))]
+mod no_std_runtime {
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::ffi::c_void;
+
+    // Bind the C allocator and `abort` from the linking C runtime directly,
+    // rather than pulling in a `libc` crate dependency: the shipped library
+    // keeps a zero-C-dependency *Rust* surface, and these are link-time symbols
+    // resolved by the C program/loader, not a Rust crate.
+    unsafe extern "C" {
+        fn malloc(size: usize) -> *mut c_void;
+        fn free(ptr: *mut c_void);
+        fn abort() -> !;
+    }
+
+    /// Global allocator for the standalone `no_std` drop-in: routes Rust's
+    /// allocation requests to the C library's `malloc`/`free`.
+    struct CAllocator;
+
+    // The maximum alignment the C allocator guarantees (`max_align_t`): 16 on
+    // 64-bit targets, 8 on 32-bit. Every type this crate allocates (`u8`,
+    // `u16`, the `#[repr(C)] Code`, and the boxed engine-state structs) has an
+    // alignment of at most 8, so `malloc`'s guarantee always suffices.
+    const MAX_C_ALIGN: usize = core::mem::align_of::<usize>() * 2;
+
+    unsafe impl GlobalAlloc for CAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // The engines never request over-aligned allocations; assert it in
+            // debug builds so any future violation is caught rather than
+            // silently producing misaligned memory.
+            debug_assert!(layout.align() <= MAX_C_ALIGN);
+            // SAFETY: `malloc` is the libc allocator provided by the linking C
+            // runtime. It returns either null (which the `GlobalAlloc` contract
+            // requires callers to handle) or a pointer aligned to
+            // `max_align_t`, satisfying `layout.align()` (asserted above).
+            unsafe { malloc(layout.size()) as *mut u8 }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+            // SAFETY: `ptr` was returned by this allocator's `alloc` (hence by
+            // `malloc`), so handing it to the matching `free` is sound.
+            unsafe { free(ptr as *mut c_void) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CAllocator = CAllocator;
+
+    /// Panic handler for the standalone `no_std` drop-in. A C library cannot
+    /// unwind across the FFI boundary, so a panic — reachable only on an
+    /// internal invariant violation, since the engines return error codes for
+    /// malformed input rather than panicking — aborts the process.
+    #[panic_handler]
+    fn panic(_info: &core::panic::PanicInfo) -> ! {
+        // SAFETY: libc `abort` never returns and is always available in the
+        // hosted C runtime that links this drop-in artifact.
+        unsafe { abort() }
+    }
+}
 
 // ===========================================================================
 // Phase A — C type layout (must match zlib.h / zconf.h byte-for-byte)

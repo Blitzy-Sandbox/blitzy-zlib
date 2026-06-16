@@ -396,11 +396,12 @@ fn flush_then_sync_recovery() {
         if code == Z_STREAM_END {
             break;
         }
-        if code == Z_DATA_ERROR {
-            // C explicitly tolerates this (the recovered stream's check value
-            // no longer matches); the payload bytes are already produced.
-            break;
-        }
+        // The post-sync inflate MUST terminate with `Z_STREAM_END`, exactly as
+        // the authoritative `test/example.c` `test_sync` expects (it prints
+        // `hel%s` and exits 0). `inflateSync` clears the check-validation bit
+        // (`state.wrap &= !4`) so the recovered tail decodes cleanly without a
+        // trailing `Z_DATA_ERROR`; accepting `Z_DATA_ERROR` here would weaken
+        // the official vector and could mask a sync/check-state regression.
         assert_eq!(code, Z_OK, "inflate finish after sync");
         assert!(consumed != 0 || produced != 0, "inflate stalled after sync");
     }
@@ -480,8 +481,9 @@ fn dictionary_deflate_inflate() {
 /// `gzread`/`gzseek`/`gztell`/`gzgetc`/`gzungetc`/`gzgets` on read.
 ///
 /// Gated on the `gz-io` feature (the gzip file layer). A unique temp file is
-/// used (parallel-clone safe) and removed afterwards — C hardcodes `"foo.gz"`,
-/// which we avoid.
+/// used (parallel-clone safe) and removed by an RAII guard on every exit path,
+/// including an unwinding panic from a failed assertion — C hardcodes
+/// `"foo.gz"`, which we avoid.
 #[cfg(feature = "gz-io")]
 #[test]
 fn gzio_read_write() {
@@ -490,7 +492,23 @@ fn gzio_read_write() {
     use zlib_rs::gz::read::{gzgetc, gzgets, gzread, gzungetc};
     use zlib_rs::gz::write::{gzprintf, gzputc, gzputs};
 
-    // Unique temp path so parallel runs never collide; cleaned up at the end.
+    // RAII temp-file guard: removes the artifact on *every* exit path,
+    // including an unwinding panic from any failed assertion below. The
+    // libtest harness builds with `panic = "unwind"`, so `Drop` runs during
+    // unwind and the temp `.gz` never leaks — satisfying the checkpoint's
+    // temp-file hygiene requirement (an end-of-function `remove_file` would be
+    // skipped on panic).
+    struct TempFileGuard(std::path::PathBuf);
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            // Best-effort: ignore a missing file (e.g. if the test panicked
+            // before `gzopen` created it).
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    // Unique temp path so parallel runs never collide; the guard above removes
+    // it on scope exit (normal return or panic).
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -500,6 +518,7 @@ fn gzio_read_write() {
         std::process::id(),
         nanos
     ));
+    let _temp_guard = TempFileGuard(path.clone());
 
     // --- write side ---
     {
@@ -565,6 +584,7 @@ fn gzio_read_write() {
         assert_eq!(gzclose(Some(file)), Z_OK, "gzclose (read)");
     }
 
-    // Remove the temp artifact; never leave files behind.
-    let _ = std::fs::remove_file(&path);
+    // The temp artifact is removed by `_temp_guard`'s `Drop` on scope exit
+    // (here on normal return, or during unwind if any assertion above panics),
+    // so there is no manual cleanup to perform — and none to skip on panic.
 }
