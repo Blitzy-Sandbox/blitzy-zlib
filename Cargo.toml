@@ -211,6 +211,17 @@ rand = "0.9.0"
 # the `[profile.bench]` profile below are kept in place so the harnesses drop in
 # with `harness = false` (criterion supplies its own `main()`) once authored.
 
+# INFLATE decompression-throughput harness (AAP §0.7.3: decompression
+# throughput ≥ C zlib). `harness = false` cedes `main()` to criterion's
+# `criterion_main!` runner instead of libtest's, which is mandatory for a
+# criterion benchmark. Only `inflate_bench` is declared here because Cargo
+# validates every explicitly declared target's source file at manifest-parse
+# time; the sibling `deflate_bench`/`checksum_bench` declarations are introduced
+# alongside their own source files so that any cargo command still parses.
+[[bench]]
+name = "inflate_bench"
+harness = false
+
 # ----------------------------------------------------------------------------
 # [profile.*] — optimization profiles supporting the performance gates
 # (AAP §0.3.3: ≥80% compression throughput, ≥ decompression throughput,
