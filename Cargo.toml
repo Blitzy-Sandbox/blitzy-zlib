@@ -211,6 +211,18 @@ rand = "0.9.0"
 # the `[profile.bench]` profile below are kept in place so the harnesses drop in
 # with `harness = false` (criterion supplies its own `main()`) once authored.
 
+# The checksum benchmark harness (`benches/checksum_bench.rs`) is now authored,
+# so its target is declared here. `harness = false` hands the entry point to
+# criterion's `criterion_main!` (the built-in libtest bench harness is unstable
+# on stable Rust and cannot report `Throughput`). The `name` matches the file
+# stem, so Cargo resolves the conventional path `benches/checksum_bench.rs` and
+# this explicit declaration supersedes auto-discovery for that file. The sibling
+# `deflate_bench.rs` / `inflate_bench.rs` targets are declared by their own
+# checkpoints when those harnesses are authored.
+[[bench]]
+name = "checksum_bench"
+harness = false
+
 # ----------------------------------------------------------------------------
 # [profile.*] — optimization profiles supporting the performance gates
 # (AAP §0.3.3: ≥80% compression throughput, ≥ decompression throughput,
