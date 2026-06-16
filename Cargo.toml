@@ -222,6 +222,17 @@ rand = "0.9.0"
 name = "inflate_bench"
 harness = false
 
+# DEFLATE compression-throughput harness (AAP §0.3.1 / §0.4.1 / §0.7.3): sweeps
+# the compression levels and the five strategies over deterministic corpora and
+# compares against the flate2 (canonical C zlib) baseline so the ≥80% gate is
+# directly readable. `harness = false` because criterion supplies its own
+# `main()` (the default libtest harness would otherwise conflict with the
+# `criterion_main!` macro). Declared here, alongside its source file, exactly as
+# the note above prescribes.
+[[bench]]
+name = "deflate_bench"
+harness = false
+
 # ----------------------------------------------------------------------------
 # [profile.*] — optimization profiles supporting the performance gates
 # (AAP §0.3.3: ≥80% compression throughput, ≥ decompression throughput,
