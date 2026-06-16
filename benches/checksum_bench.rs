@@ -26,14 +26,23 @@
 //! that `simd_public` is at least 3× the bytes/s of `scalar_local`. On a noisy
 //! shared CI VM the absolute numbers vary, but the ratio is the gate.
 //!
-//! The harness contains no `unsafe`, no FFI, and no emoji; all correctness
+//! The throughput benchmarks contain no FFI and no emoji; all correctness
 //! assertions live in untimed setup so the timed closures measure only the
-//! checksum computation.
+//! checksum computation. The single use of `unsafe` is the AAP sec. 0.7.3
+//! **memory-footprint gate** (see the "Memory-footprint gate" section near the
+//! bottom of this file): a counting global allocator -- dormant during every
+//! timed measurement -- confirms at runtime that the public `crc32`/`adler32`
+//! paths allocate **zero** heap, so the `memory <= C zlib` gate holds trivially
+//! (canonical C zlib's `crc32`/`adler32` are likewise allocation-free, computing
+//! over the caller's buffer with only stack state). No C zlib is linked here, so
+//! unlike the deflate/inflate benches this gate needs no `extern "C"` probe.
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use zlib_rs::{adler32, crc32};
 
 // ---------------------------------------------------------------------------
@@ -244,5 +253,136 @@ fn bench_adler32(c: &mut Criterion) {
     group.finish();
 }
 
+// ===========================================================================
+// Memory-footprint gate (AAP sec. 0.7.3: "memory <= C zlib")
+// ===========================================================================
+//
+// AAP sec. 0.7.3 requires the crate's runtime memory footprint to be <= C
+// zlib's. For the checksum engines this is the simplest case: both the public
+// `zlib_rs::{crc32, adler32}` paths and canonical C zlib's `crc32`/`adler32`
+// compute over the caller's buffer with only stack/register state and **no heap
+// allocation at all**. This section proves the `zlib_rs` side empirically with
+// a counting global allocator (dormant during all timed criterion work, armed
+// only for one brief untimed window), so the gate `memory <= C zlib` reduces to
+// `0 <= 0`. No C zlib is linked into this bench, so -- unlike the deflate /
+// inflate benches -- no `extern "C"` probe is needed; the C side is allocation-
+// free by construction (`crc32.c` / `adler32.c` declare only locals).
+
+/// Live bytes (armed window only) and the high-water mark.
+static MEM_CUR: AtomicUsize = AtomicUsize::new(0);
+static MEM_PEAK: AtomicUsize = AtomicUsize::new(0);
+/// When `false`, [`CountingAlloc`] is a transparent pass-through (the default).
+static MEM_COUNT_ON: AtomicBool = AtomicBool::new(false);
+
+/// A `System`-backed global allocator that, only while armed via
+/// [`MEM_COUNT_ON`], tracks the live byte count and its peak. While disarmed it
+/// adds a single relaxed load per call and is otherwise identical to `System`,
+/// so it does not measurably affect the timed throughput benchmarks.
+struct CountingAlloc;
+
+// SAFETY: every method forwards to `System` (a correct `GlobalAlloc`) with the
+// caller's exact `Layout`; the accounting is side-band atomics that never alter
+// the returned pointer or the validity of the memory.
+unsafe impl GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: delegating to the System allocator with the same layout.
+        let p = unsafe { System.alloc(layout) };
+        if !p.is_null() && MEM_COUNT_ON.load(Ordering::Relaxed) {
+            let live = MEM_CUR.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+            MEM_PEAK.fetch_max(live, Ordering::Relaxed);
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if MEM_COUNT_ON.load(Ordering::Relaxed) {
+            MEM_CUR.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+        // SAFETY: `ptr` was returned by this allocator's `alloc` for `layout`.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: delegating to the System allocator with the same layout.
+        let p = unsafe { System.alloc_zeroed(layout) };
+        if !p.is_null() && MEM_COUNT_ON.load(Ordering::Relaxed) {
+            let live = MEM_CUR.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+            MEM_PEAK.fetch_max(live, Ordering::Relaxed);
+        }
+        p
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: delegating to the System allocator with the original layout
+        // and the requested new size (preserves System's efficient in-place
+        // growth so the disarmed path matches a plain System allocator).
+        let p = unsafe { System.realloc(ptr, layout, new_size) };
+        if !p.is_null() && MEM_COUNT_ON.load(Ordering::Relaxed) {
+            let old = layout.size();
+            if new_size >= old {
+                let live = MEM_CUR.fetch_add(new_size - old, Ordering::Relaxed) + (new_size - old);
+                MEM_PEAK.fetch_max(live, Ordering::Relaxed);
+            } else {
+                MEM_CUR.fetch_sub(old - new_size, Ordering::Relaxed);
+            }
+        }
+        p
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CountingAlloc = CountingAlloc;
+
+/// Run the AAP sec. 0.7.3 memory-footprint gate for the **checksum** engines:
+/// confirm at runtime that `zlib_rs::crc32` and `zlib_rs::adler32` allocate zero
+/// heap over a representative 1 MiB buffer, so `memory <= C zlib` holds (C's
+/// `crc32`/`adler32` are allocation-free as well). Prints a CI-readable report.
+/// Runs once, untimed, at startup (before any criterion measurement).
+fn run_memory_gate() {
+    let data = incompressible(1 << 20); // 1 MiB representative buffer (uncounted)
+
+    // Warm any one-time lazy initialization (e.g. crc32fast CPU-feature
+    // detection) OUTSIDE the armed window, so it is not miscounted as per-call
+    // heap. CPU detection uses atomics/`Once`, not the heap, but warming makes
+    // the measurement robust regardless.
+    black_box(crc32(0, &data));
+    black_box(adler32(1, &data));
+
+    MEM_CUR.store(0, Ordering::SeqCst);
+    MEM_PEAK.store(0, Ordering::SeqCst);
+    MEM_COUNT_ON.store(true, Ordering::SeqCst);
+
+    let crc = crc32(0, black_box(&data));
+    let adler = adler32(1, black_box(&data));
+    black_box((crc, adler));
+
+    let peak = MEM_PEAK.load(Ordering::SeqCst);
+    MEM_COUNT_ON.store(false, Ordering::SeqCst);
+
+    println!("=== AAP 0.7.3 memory-footprint gate: CHECKSUM engines (crc32 + adler32) ===");
+    println!("    zlib_rs crc32 + adler32 over 1 MiB : {peak} bytes heap allocated");
+    println!("    C zlib  crc32 + adler32            : 0 bytes (allocation-free by construction)");
+    assert_eq!(
+        peak, 0,
+        "MEMORY GATE FAILED: zlib_rs crc32/adler32 allocated {peak} B of heap \
+         (expected 0; C zlib's checksums are allocation-free, so the gate requires 0)"
+    );
+    println!("    RESULT                             : PASS (0 <= 0, zlib_rs <= C zlib)");
+}
+
+// ===========================================================================
+// Harness wiring (custom `main`; `harness = false` in Cargo.toml)
+// ===========================================================================
+
 criterion_group!(benches, bench_crc32, bench_adler32);
-criterion_main!(benches);
+
+/// Custom harness entry point. Runs the AAP sec. 0.7.3 memory-footprint gate
+/// first (untimed, at startup), then drives the criterion throughput suite
+/// exactly as the generated `criterion_main!(benches)` would. `cargo bench
+/// --no-run` compiles this without executing it; `cargo test` does not execute
+/// `harness = false` bench mains.
+fn main() {
+    run_memory_gate();
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}

@@ -118,6 +118,12 @@ zlib-rs = { version = "1.3.2", default-features = false, features = ["no-std"] }
 
 The minimum supported Rust version is **1.85.0** (the crate uses edition 2024).
 
+> **MSRV exception for the `capi` feature.** The optional, non-default `capi`
+> C-ABI drop-in build requires **Rust ≥ 1.88**, because its variadic `gzprintf`
+> export is implemented with a stable naked function (`#[unsafe(naked)]`,
+> stabilized in 1.88). The core crate and all default builds and tests remain on
+> MSRV 1.85.0; only `--features capi` raises the floor.
+
 ---
 
 ## Quick start

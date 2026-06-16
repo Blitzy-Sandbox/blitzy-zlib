@@ -255,10 +255,11 @@ jobs:
       - name: Build (release, capi)
         run: cargo build --release --locked --features capi
 
-      # Smoke-check the exported C symbols. The canonical zlib entry points MUST
-      # be present in both the cdylib and the staticlib; `gzprintf` MUST be
-      # absent (it is variadic and not in `zlib.map` — `gzvprintf` carries the
-      # `printf` formatting; see the FFI module-level divergence note).
+      # Smoke-check the exported C symbols. The canonical zlib entry points — now
+      # INCLUDING the C-variadic `gzprintf` (materialized as a naked tail-branch
+      # to a build.rs-compiled forwarder; see src/ffi.rs and build.rs "Phase D")
+      # alongside its `gzvprintf` sibling — MUST be present in BOTH the cdylib and
+      # the staticlib so the artifacts are a true binary drop-in for `libz`.
       - name: Export-symbol smoke check (nm)
         run: |
           set -euo pipefail
@@ -270,7 +271,7 @@ jobs:
           nm -g --defined-only "$AR" | awk '{print $NF}' | sort -u > ar_syms.txt
           required="deflate inflate deflateInit2_ inflateInit2_ deflateEnd \
                     inflateEnd crc32 adler32 compress2 uncompress compressBound \
-                    zlibVersion"
+                    zlibVersion gzopen gzclose gzvprintf gzprintf"
           rc=0
           for s in $required; do
             if grep -qx "$s" so_syms.txt; then
@@ -280,13 +281,41 @@ jobs:
             fi
             grep -qx "$s" ar_syms.txt || { echo "  MISSING from staticlib: $s"; rc=1; }
           done
-          if grep -qx "gzprintf" so_syms.txt; then
-            echo "  UNEXPECTED: gzprintf is exported (must be absent)"; rc=1
-          else
-            echo "  OK: gzprintf absent (intentional; gzvprintf carries formatting)"
-          fi
           if [ "$rc" -ne 0 ]; then echo "Export-symbol smoke check FAILED"; exit 1; fi
-          echo "Export-symbol smoke check PASSED"
+          echo "Export-symbol smoke check PASSED (gzprintf + gzvprintf exported)"
+
+      # C drop-in regression: compile + link + RUN a C translation unit that
+      # calls the variadic `gzprintf` against the generated header and the
+      # cdylib, then decompress the produced gzip stream and verify the formatted
+      # bytes. This is the concrete proof that `gzprintf` is a working binary
+      # drop-in for `libz` (the QA acceptance check) — not merely an exported
+      # symbol name. The expected output is 28 bytes:
+      # "Hello world #42 (3.14) 0xff\n".
+      - name: C gzprintf compile/link/run regression
+        run: |
+          set -euo pipefail
+          test -f include/zlib-rs.h || { echo "missing generated header include/zlib-rs.h"; exit 1; }
+          cat > gzprintf_capi_check.c <<'CSRC'
+          #include <stdio.h>
+          #include "zlib-rs.h"
+          int main(void) {
+              gzFile f = gzopen("gzprintf_capi_check.gz", "wb9");
+              if (!f) { fprintf(stderr, "gzopen failed\n"); return 2; }
+              int n = gzprintf(f, "Hello %s #%d (%.2f) 0x%lx\n", "world", 42, 3.14, 255L);
+              gzclose(f);
+              printf("gzprintf returned %d\n", n);
+              return n == 28 ? 0 : 1;
+          }
+          CSRC
+          cc -O2 -std=c11 -I include gzprintf_capi_check.c -o gzprintf_capi_check \
+             -L target/release -lzlib_rs -Wl,-rpath,"$PWD/target/release"
+          ./gzprintf_capi_check
+          out="$(gunzip -c gzprintf_capi_check.gz)"
+          expected="Hello world #42 (3.14) 0xff"
+          if [ "$out" != "$expected" ]; then
+            echo "MISMATCH: got [$out], expected [$expected]"; exit 1
+          fi
+          echo "C gzprintf drop-in regression PASSED: [$out]"
 
   # --------------------------------------------------------------------------
   # Performance gates (AAP §0.3.3) — OPTIONAL and NON-BLOCKING. Benchmark

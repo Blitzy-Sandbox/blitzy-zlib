@@ -128,6 +128,22 @@ parse_deps = false
 #                 particular covers any forward-declared opaque state type.
 item_types = ["constants", "globals", "enums", "structs", "unions", "typedefs", "opaque", "functions"]
 
+# `exclude` — items cbindgen must NOT emit (it would emit them incorrectly).
+#
+# `gzprintf` is the sole exclusion. It is exported from `src/ffi.rs` as a
+# C-*variadic* symbol (`int gzprintf(gzFile, const char *format, ...)`), but the
+# Rust side cannot express the trailing `...` in a stable `extern "C"` signature
+# (the `c_variadic` feature is unstable), so the export is a naked tail-branch
+# whose declared Rust signature is the non-variadic `(gzFile, *const c_char)`.
+# Left to its own devices cbindgen would therefore emit `int gzprintf(gzFile,
+# const char *);` — missing the `, ...` a C caller needs — and, because the
+# export is defined once per supported `target_arch`, could emit it more than
+# once. `build.rs` instead injects the single correct variadic declaration
+# immediately after `gzvprintf` during its header post-processing step, so the
+# header always carries the exact C prototype. Excluding it here makes that the
+# one deterministic source of the `gzprintf` declaration.
+exclude = ["gzprintf"]
+
 # `include` (force-emit specific items by name) is intentionally left empty.
 # cbindgen emits functions, constants, and globals wholesale, but emits *types*
 # only when they are reachable from an exported function/global/constant. Every

@@ -1,6 +1,6 @@
 //! Cargo build script for the `zlib-rs` crate.
 //!
-//! This script runs **before** the crate is compiled and has two distinct,
+//! This script runs **before** the crate is compiled and has three distinct,
 //! independent responsibilities (AAP §0.3.1, §0.4.1, §0.6.5):
 //!
 //! 1. **CRC-32 table generation (Phase A — mandatory).** It regenerates the
@@ -22,8 +22,25 @@
 //!    parse the crate, the script emits a `cargo:warning` and continues. The
 //!    library build never depends on the header existing.
 //!
-//! The script requires no network access and no external tooling beyond the
-//! `cbindgen` build-dependency declared in `Cargo.toml`.
+//! 3. **`gzprintf` C forwarder (Phase D — gated on `capi` + `gz-io`).** The
+//!    exported `gzprintf` symbol is C-variadic, which stable Rust cannot
+//!    *define* (`c_variadic` is unstable). `src/ffi.rs` therefore exports
+//!    `gzprintf` as a naked tail-branch into the C symbol
+//!    `rs_gzprintf_trampoline`; this phase compiles that 4-line `<stdarg.h>`
+//!    forwarder (which runs `va_start` and delegates to the Rust `gzvprintf`
+//!    export) and archives it so the cdylib/staticlib link resolves the symbol.
+//!    It runs **only** for the C-ABI drop-in build and is the reason the drop-in
+//!    is a true binary replacement for `libz` (AAP §0.1.1, §0.6.2).
+//!
+//! The script requires no network access. Phases A and B need no tooling beyond
+//! the `cbindgen` build-dependency declared in `Cargo.toml`. Phase D — and only
+//! the optional `capi` build that triggers it — additionally requires a host C
+//! compiler and archiver (`cc`/`ar`, overridable via the `CC`/`AR` environment
+//! variables); no `cc` *crate* is added, keeping the build-dependency set frozen
+//! to `cbindgen` (AAP §0.5.1). Because stable `#[unsafe(naked)]` (used by the
+//! `gzprintf` export in `src/ffi.rs`) requires rustc >= 1.88, the optional
+//! `capi` feature raises the effective MSRV to 1.88 for that build alone; the
+//! core crate keeps the AAP MSRV of 1.85.0.
 
 use std::env;
 use std::fmt::Write as _;
@@ -267,6 +284,11 @@ fn maybe_generate_header(manifest_dir: &Path, out_dir: &Path) {
                 }
             }
             bindings.write_to_file(out_dir.join("zlib-rs.h"));
+            // Restore the C-variadic `gzprintf` prototype that cbindgen cannot
+            // render (it is `exclude`d in cbindgen.toml). Applied to both header
+            // copies; a no-op on any copy that was not written.
+            inject_gzprintf_decl(&include_dir.join("zlib-rs.h"));
+            inject_gzprintf_decl(&out_dir.join("zlib-rs.h"));
             println!(
                 "zlib-rs build.rs: generated C header from {}.",
                 ffi_source.display()
@@ -279,6 +301,211 @@ fn maybe_generate_header(manifest_dir: &Path, out_dir: &Path) {
             );
         }
     }
+}
+
+/// Inject the C-variadic `gzprintf` prototype into a generated header.
+///
+/// `gzprintf` is `exclude`d in `cbindgen.toml` because cbindgen cannot render
+/// its trailing `...` (the Rust export is a naked branch with a non-variadic
+/// declared signature). This restores the exact C prototype immediately after
+/// the `gzvprintf` declaration. It is **idempotent** (a header that already
+/// declares `gzprintf` is left unchanged) and **best-effort** (a missing or
+/// unexpected header only logs and returns, never panicking).
+fn inject_gzprintf_decl(header: &Path) {
+    let Ok(contents) = fs::read_to_string(header) else {
+        // The header may legitimately not exist on this path (e.g. `include/`
+        // creation failed and only the OUT_DIR copy was written).
+        return;
+    };
+
+    // Detect an existing `gzprintf` *declaration* (a code line, not a comment
+    // that merely mentions the name) so re-runs never inject twice.
+    let already_declared = contents.lines().any(|l| {
+        let t = l.trim_start();
+        l.contains("gzprintf(")
+            && l.trim_end().ends_with(';')
+            && !t.starts_with("//")
+            && !t.starts_with('*')
+            && !t.starts_with("/*")
+    });
+    if already_declared {
+        return;
+    }
+
+    let decl = "\n/* gzprintf — C-variadic formatted gzip write (restored by zlib-rs\n * build.rs; cbindgen cannot render the `...`). Forwards to gzvprintf. */\nint gzprintf(gzFile file, const char *format, ...);\n";
+
+    let lines: Vec<&str> = contents.lines().collect();
+    // Anchor on the `gzvprintf` declaration line (code ending in `;`, not a
+    // doc-comment line that happens to mention the symbol).
+    let anchor = lines.iter().position(|l| {
+        let t = l.trim_start();
+        l.contains("gzvprintf(")
+            && l.trim_end().ends_with(';')
+            && !t.starts_with("//")
+            && !t.starts_with('*')
+            && !t.starts_with("/*")
+    });
+
+    let mut out = String::with_capacity(contents.len() + decl.len() + 16);
+    match anchor {
+        Some(idx) => {
+            for (i, l) in lines.iter().enumerate() {
+                out.push_str(l);
+                out.push('\n');
+                if i == idx {
+                    out.push_str(decl);
+                }
+            }
+        }
+        None => {
+            // `gzvprintf` not found (unexpected for a default-feature header).
+            // Fall back to inserting before the include-guard `#endif`.
+            println!(
+                "cargo:warning=zlib-rs: gzvprintf declaration not found in {}; \
+                 inserting gzprintf before the include-guard close.",
+                header.display()
+            );
+            match lines
+                .iter()
+                .rposition(|l| l.trim_start().starts_with("#endif"))
+            {
+                Some(idx) => {
+                    for (i, l) in lines.iter().enumerate() {
+                        if i == idx {
+                            out.push_str(decl);
+                            out.push('\n');
+                        }
+                        out.push_str(l);
+                        out.push('\n');
+                    }
+                }
+                None => {
+                    out.push_str(&contents);
+                    out.push_str(decl);
+                }
+            }
+        }
+    }
+
+    if let Err(err) = fs::write(header, &out) {
+        println!(
+            "cargo:warning=zlib-rs: could not write injected gzprintf into {} ({err}).",
+            header.display()
+        );
+    } else {
+        println!(
+            "zlib-rs build.rs: injected the C-variadic gzprintf prototype into {}.",
+            header.display()
+        );
+    }
+}
+
+// ===========================================================================
+// Phase D — `gzprintf` C variadic forwarder (gated: `capi` + `gz-io`)
+// ===========================================================================
+
+/// Compile and archive the tiny C `gzprintf` forwarder for the C-ABI drop-in.
+///
+/// `src/ffi.rs` exports `gzprintf` as a naked tail-branch into the C symbol
+/// `rs_gzprintf_trampoline`, which is **defined here**. The forwarder is the
+/// canonical zlib three-liner: it captures the caller's varargs with `va_start`,
+/// delegates to the Rust `gzvprintf` export (which performs the real `vsnprintf`
+/// formatting and the buffered gzip write), then `va_end`s. This is the only way
+/// to honor C varargs from a crate that cannot define a variadic `extern "C"`
+/// function on stable Rust.
+///
+/// Runs only when **both** `capi` and `gz-io` are active (the C-ABI gzip build).
+/// No `cc` build-dependency crate is used — the AAP freezes the build-deps to
+/// `cbindgen` (§0.5.1) — so the host `cc`/`ar` (overridable via `CC`/`AR`) are
+/// invoked directly. The symbol is required for the `capi` link to succeed, so a
+/// toolchain failure here is fatal (the `capi` feature inherently opts into a C
+/// toolchain).
+fn maybe_build_gzprintf_trampoline(out_dir: &Path) {
+    // Gate on the Cargo-provided feature env vars: only the C-ABI gzip drop-in
+    // needs (or can link) this forwarder.
+    if env::var_os("CARGO_FEATURE_CAPI").is_none() || env::var_os("CARGO_FEATURE_GZ_IO").is_none() {
+        return;
+    }
+
+    let csrc = out_dir.join("rs_gzprintf_trampoline.c");
+    let trampoline = "\
+/* Auto-generated by zlib-rs build.rs (Phase D). DO NOT EDIT.
+ *
+ * C variadic forwarder backing the exported `gzprintf` symbol. `src/ffi.rs`
+ * defines `gzprintf` as a naked tail-branch to `rs_gzprintf_trampoline`; this
+ * captures the caller's varargs with `va_start` and delegates to the Rust
+ * `gzvprintf` export, exactly like upstream zlib's `gzprintf` (gzwrite.c). */
+#include <stdarg.h>
+
+/* The Rust `#[no_mangle] extern \"C\"` gzvprintf export from src/ffi.rs (gz-io).
+ * On the SysV/AArch64 C ABIs a `va_list` is passed as a single pointer, so
+ * forwarding `&ap` is call-compatible. gzFile is `void *` at the ABI level. */
+extern int gzvprintf(void *file, const char *format, void *va);
+
+int rs_gzprintf_trampoline(void *file, const char *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    int ret = gzvprintf(file, format, (void *)&ap);
+    va_end(ap);
+    return ret;
+}
+";
+    if let Err(err) = fs::write(&csrc, trampoline) {
+        panic!(
+            "zlib-rs build.rs (Phase D): could not write {} ({err})",
+            csrc.display()
+        );
+    }
+
+    let obj = out_dir.join("rs_gzprintf_trampoline.o");
+    let cc = env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    match std::process::Command::new(&cc)
+        .args(["-O2", "-fPIC", "-std=c11", "-c"])
+        .arg(&csrc)
+        .arg("-o")
+        .arg(&obj)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        Ok(s) => panic!(
+            "zlib-rs build.rs (Phase D): `{cc}` failed to compile the gzprintf \
+             forwarder (exit {s}). A C toolchain is required for the `capi` drop-in."
+        ),
+        Err(err) => panic!(
+            "zlib-rs build.rs (Phase D): could not run the C compiler `{cc}` ({err}). \
+             Set CC, or install a C toolchain, to build the `capi` drop-in."
+        ),
+    }
+
+    let lib = out_dir.join("librs_gz_trampoline.a");
+    // Recreate from scratch so a stale member never lingers across rebuilds.
+    let _ = fs::remove_file(&lib);
+    let ar = env::var("AR").unwrap_or_else(|_| "ar".to_string());
+    match std::process::Command::new(&ar)
+        .arg("crs")
+        .arg(&lib)
+        .arg(&obj)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        Ok(s) => panic!(
+            "zlib-rs build.rs (Phase D): `{ar}` failed to archive the gzprintf \
+             forwarder (exit {s})."
+        ),
+        Err(err) => panic!(
+            "zlib-rs build.rs (Phase D): could not run the archiver `{ar}` ({err}). \
+             Set AR, or install binutils, to build the `capi` drop-in."
+        ),
+    }
+
+    // Link the static forwarder into the cdylib/staticlib so the naked
+    // `gzprintf` branch in `src/ffi.rs` resolves `rs_gzprintf_trampoline`.
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=rs_gz_trampoline");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CAPI");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_GZ_IO");
+    println!("cargo:rerun-if-env-changed=CC");
+    println!("cargo:rerun-if-env-changed=AR");
 }
 
 // ===========================================================================
@@ -307,4 +534,9 @@ fn main() {
 
     // Phase B / C — optionally emit the C header (best-effort, gated).
     maybe_generate_header(&manifest_dir, &out_dir);
+
+    // Phase D — when building the C-ABI drop-in (`capi` + `gz-io`), compile and
+    // archive the C variadic forwarder that backs the exported `gzprintf` symbol
+    // (see `src/ffi.rs`). No-op for ordinary library builds and tests.
+    maybe_build_gzprintf_trampoline(&out_dir);
 }

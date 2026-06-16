@@ -3302,31 +3302,106 @@ pub unsafe extern "C" fn gzfwrite(
     gz::gzfwrite(state, size, nitems, slice)
 }
 
-// `gzprintf` — INTENTIONALLY NOT EXPORTED as a C symbol.
-//
-// C's `gzprintf(gzFile, const char *format, ...)` is variadic, and a variadic
-// `extern "C"` function cannot be *defined* in stable Rust (the `c_variadic`
-// feature is unstable, and the AAP fixes the MSRV at 1.85.0 stable). The only
-// other ways to materialize the symbol — a `cc`-compiled C trampoline — are
-// ruled out by the AAP's "Zero C dependency in the shipping crate" constraint
-// (§0.7.2). Exporting a *non-variadic* stub that writes the format string
-// verbatim (no `%`-expansion) is silent data corruption and was explicitly
-// rejected in review, so the broken stub is removed rather than shipped.
-//
-// Omitting `gzprintf` does NOT violate the FFI symbol contract: the AAP grounds
-// the required export set in `zlib.map` (§0.6.2), and `gzprintf` is not listed
-// under any `global:` node there — only its `va_list` sibling `gzvprintf` is
-// (node `ZLIB_1.2.7.1`), and that IS exported below with full formatting. A C
-// consumer needing `gzprintf` writes the canonical three-line forwarder:
-//
-//     int gzprintf(gzFile f, const char *fmt, ...) {
-//         va_list va; va_start(va, fmt);
-//         int r = gzvprintf(f, fmt, va); va_end(va); return r;
-//     }
-//
-// Pure-Rust callers use the safe, fully-formatting
-// `zlib_rs::gz::gzprintf(file, format_args!(...))` (AAP §0.4.1), which is
-// retained unchanged.
+/// `gzprintf` — variadic `printf`-style formatted write to a gzip file
+/// (zlib.h L2040; the base-version sibling of [`gzvprintf`], present in every
+/// shipped `libz`). Exported here so the `cdylib`/`staticlib` are a true binary
+/// drop-in for `libz` — the prompt-mandated "exact C API" requirement (AAP
+/// §0.1.1, §0.6.2).
+///
+/// ## Why a naked trampoline
+///
+/// C's `gzprintf(gzFile, const char *format, ...)` is C-variadic, and a variadic
+/// `extern "C"` function cannot be *defined* in stable Rust (the `c_variadic`
+/// feature is still unstable). The symbol is therefore materialized as a tiny
+/// **naked** function whose entire body is a single tail `jmp`/`b` to the C
+/// forwarder `rs_gzprintf_trampoline` — a 4-line `<stdarg.h>` shim that
+/// `build.rs` compiles and archives ("Phase D") whenever the `capi` + `gz-io`
+/// features are active. Because the naked body is a *bare* branch, every
+/// argument register and stack slot is forwarded untouched — including, on
+/// x86-64, the `al` register that conveys the number of vector registers used by
+/// the varargs call — so the C variadic ABI is preserved exactly. The forwarder
+/// runs `va_start`, calls back into [`gzvprintf`] (which performs the real
+/// `vsnprintf` formatting and the buffered gzip write through the very same path
+/// C uses), then `va_end`s; the compressed gzip output is byte-identical to C
+/// zlib's `gzprintf`.
+///
+/// ## Why it must be a real Rust item
+///
+/// Declaring `gzprintf` as a genuine `#[unsafe(no_mangle)] extern "C"` item —
+/// rather than relying on the C symbol alone — is what makes the linker *export*
+/// it from the `cdylib`. rustc auto-generates a version script for every cdylib
+/// that lists its own tracked `#[no_mangle]` symbols as `global:` and localizes
+/// everything else (`local: *;`), so a C symbol pulled in only from a static
+/// archive would be demoted to a local symbol and vanish from `nm -D`. Anchoring
+/// the canonical name in a tracked Rust item places it in that `global:` set and
+/// keeps it past `--gc-sections`. The declared two-parameter signature is a
+/// formality consumed only by cbindgen (whose emitted declaration `build.rs`
+/// post-processes to restore the trailing `, ...`); the branch ignores the
+/// declared arity entirely.
+///
+/// ## MSRV
+///
+/// Stable `#[unsafe(naked)]` / `naked_asm!` require **rustc >= 1.88**. This
+/// affects only the *optional, non-default* `capi` build; the core crate retains
+/// the AAP MSRV of 1.85.0 (the `capi` feature is off by default, so default
+/// builds and `cargo test` never compile this item).
+///
+/// Pure-Rust callers should prefer the safe, fully-formatting
+/// `zlib_rs::gz::gzprintf(file, format_args!(...))` (AAP §0.4.1), which is
+/// retained unchanged.
+///
+/// # Safety
+///
+/// `file` must be NULL or a live `gzFile` opened for writing, and `format` must
+/// be a valid NUL-terminated C string whose conversion specifiers match the
+/// variadic arguments supplied by the caller — exactly the preconditions of C
+/// zlib's `gzprintf` and of [`gzvprintf`], to which this forwards.
+#[cfg(all(feature = "gz-io", target_arch = "x86_64"))]
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gzprintf(_file: gzFile, _format: *const c_char) -> c_int {
+    // Tail-jump to the `build.rs`-compiled C forwarder. A bare `jmp` preserves
+    // every argument register/stack slot (including `al`), so the caller's
+    // varargs reach the forwarder's `va_start` intact. `@PLT` routes the call
+    // through the procedure linkage table, correct for a position-independent
+    // `cdylib` and for the bundled `staticlib`. The declared `_file`/`_format`
+    // parameters are a cbindgen/ABI formality — a naked body may not reference
+    // parameters; the real arguments arrive in registers/stack per the C ABI.
+    // See the doc comment above and `build.rs` "Phase D".
+    core::arch::naked_asm!("jmp rs_gzprintf_trampoline@PLT")
+}
+
+/// `gzprintf` (AArch64). See the x86-64 definition above for the full rationale.
+///
+/// # Safety
+///
+/// Identical to the x86-64 definition: `file` must be NULL or a live writing
+/// `gzFile` and `format` a valid C format string matching the varargs.
+#[cfg(all(feature = "gz-io", target_arch = "aarch64"))]
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gzprintf(_file: gzFile, _format: *const c_char) -> c_int {
+    // AArch64 tail-branch to the C forwarder. `b` is a non-linking branch, so the
+    // caller's argument registers (x0-x7) and the stack are forwarded untouched;
+    // the linker inserts a PLT veneer when the target resolves outside range. A
+    // naked body may not reference the declared `_file`/`_format` parameters.
+    core::arch::naked_asm!("b rs_gzprintf_trampoline")
+}
+
+// On any other architecture the `capi` `gzprintf` export is not provided: its
+// naked tail-branch is target-specific assembly, and the only platforms the
+// C-ABI drop-in is built/validated for are x86-64 and AArch64 Linux. A `capi`
+// build on an unsupported architecture fails loudly here rather than silently
+// shipping a `libz` drop-in that is missing `gzprintf`.
+#[cfg(all(
+    feature = "gz-io",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+core::compile_error!(
+    "the `capi` C-ABI `gzprintf` export currently supports target_arch \
+     \"x86_64\" and \"aarch64\" only; build the drop-in on one of those targets, \
+     or call the exported `gzvprintf` from a C-side `gzprintf` forwarder"
+);
 
 /// `gzvprintf` — `va_list` formatted write (zlib.h L2047; exported in `zlib.map`
 /// node `ZLIB_1.2.7.1`).
