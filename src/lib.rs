@@ -14,7 +14,7 @@
 //!
 //! # One-shot compression
 //!
-//! The [`compress`] / [`uncompress`] helpers round-trip a whole buffer through
+//! The [`compress()`] / [`uncompress()`] helpers round-trip a whole buffer through
 //! the zlib (RFC 1950) wrapper format in a single call. `compress` emits a
 //! stream byte-identical to C zlib at the default level; `uncompress` decodes
 //! it back into a caller-provided buffer (sized to the known original length):

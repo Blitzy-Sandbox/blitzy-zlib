@@ -3,8 +3,8 @@
 //! This module is a safe-Rust port of the C file `inftrees.c` (and its header
 //! `inftrees.h`) from zlib 1.3.2.1. It is **foundational** for the entire
 //! inflate engine: it owns the canonical decode-table entry type [`Code`], the
-//! table builder [`inflate_table`], and the fixed-table installer
-//! [`inflate_fixed`].
+//! table builder `inflate_table`, and the fixed-table installer
+//! `inflate_fixed`.
 //!
 //! # Byte-identical construction
 //!
@@ -43,7 +43,7 @@
 /// } code;
 /// ```
 ///
-/// ## `op` value encoding (as set by [`inflate_table`])
+/// ## `op` value encoding (as set by `inflate_table`)
 ///
 /// | bit pattern | meaning |
 /// |-------------|---------|
@@ -96,7 +96,7 @@ pub const ENOUGH_DISTS: usize = 592;
 /// `codes` buffer in the inflate state is sized to hold this many entries.
 pub const ENOUGH: usize = ENOUGH_LENS + ENOUGH_DISTS;
 
-/// The kind of canonical Huffman code being built by [`inflate_table`].
+/// The kind of canonical Huffman code being built by `inflate_table`.
 ///
 /// Mirrors the C `codetype` enum (`CODES`, `LENS`, `DISTS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,10 +105,10 @@ pub enum CodeType {
     /// literal/length and distance code lengths). No base/extra tables apply.
     Codes,
     /// Literal/length codes (286-symbol alphabet). Uses the length base/extra
-    /// tables ([`LBASE`]/[`LEXT`]).
+    /// tables (`LBASE`/`LEXT`).
     Lens,
     /// Distance codes (30-symbol alphabet). Uses the distance base/extra tables
-    /// ([`DBASE`]/[`DEXT`]).
+    /// (`DBASE`/`DEXT`).
     Dists,
 }
 

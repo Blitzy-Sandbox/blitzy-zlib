@@ -33,7 +33,7 @@
 //!
 //! The C source notes (lines 7-10) that this code "is largely copied from
 //! `inflate.c`"; accordingly this port reuses the shared table builder
-//! ([`inflate_table`]) and the fixed-table installer ([`inflate_fixed`]) from
+//! (`inflate_table`) and the fixed-table installer (`inflate_fixed`) from
 //! [`crate::inflate::tables`], and the decode-state types from
 //! [`crate::inflate::state`].
 //!
@@ -73,7 +73,7 @@
 //! there are no raw-pointer dereferences and no bounds-check elision. Every
 //! window/output copy — including the overlapping LZ77 match copy — is performed
 //! with bounds-checked slice indexing. The performance-critical
-//! [`inflate_fast`](crate::inflate::fast::inflate_fast) routine is intentionally
+//! `inflate_fast` routine is intentionally
 //! **not** invoked here: in `inflateBack` the window and the output are the same
 //! buffer, which `inflate_fast`'s disjoint `window`/`output` slice signature
 //! cannot express without aliasing (forbidden by the borrow checker). The slow,
@@ -138,7 +138,7 @@ const DMAX: u32 = 1 << 15;
 /// This is the safe-Rust analogue of C's `in_func`. Each call to [`fill`] hands
 /// back the next chunk of compressed input; an **empty** slice signals "no more
 /// input is available", which causes [`inflate_back`] to stop with
-/// [`Z_BUF_ERROR`](crate::constants::Z_BUF_ERROR) — exactly as C returns
+/// [`Z_BUF_ERROR`] — exactly as C returns
 /// `Z_BUF_ERROR` when `in()` returns `0`.
 ///
 /// [`fill`]: BackInput::fill
@@ -159,7 +159,7 @@ const DMAX: u32 = 1 << 15;
 /// raw-pointer code lives, never here.
 pub trait BackInput<'a> {
     /// Returns the next chunk of input, or an empty slice to signal end of
-    /// input (which yields [`Z_BUF_ERROR`](crate::constants::Z_BUF_ERROR)).
+    /// input (which yields [`Z_BUF_ERROR`]).
     fn fill(&mut self) -> &'a [u8];
 }
 
@@ -168,7 +168,7 @@ pub trait BackInput<'a> {
 /// This is the safe-Rust analogue of C's `out_func`. [`write`] is handed each
 /// run of decoded bytes (a full window, or the final partial window on
 /// completion). It returns `true` to indicate a **write failure**, which causes
-/// [`inflate_back`] to stop with [`Z_BUF_ERROR`](crate::constants::Z_BUF_ERROR)
+/// [`inflate_back`] to stop with [`Z_BUF_ERROR`]
 /// — mirroring C's convention that `out()` returns non-zero on failure.
 ///
 /// [`write`]: BackOutput::write
@@ -177,7 +177,7 @@ pub trait BackInput<'a> {
 /// closure can be passed directly as the output sink.
 pub trait BackOutput {
     /// Consumes `buf`; returns `true` on write failure (yields
-    /// [`Z_BUF_ERROR`](crate::constants::Z_BUF_ERROR)), `false` on success.
+    /// [`Z_BUF_ERROR`]), `false` on success.
     fn write(&mut self, buf: &[u8]) -> bool;
 }
 
@@ -314,13 +314,13 @@ pub fn inflate_back_init(window_bits: i32) -> Result<InflateState, i32> {
 ///
 /// The C `int` status code:
 ///
-/// * [`Z_STREAM_END`](crate::constants::Z_STREAM_END) — the stream decoded
+/// * [`Z_STREAM_END`] — the stream decoded
 ///   successfully (a final block was seen and all output flushed);
-/// * [`Z_BUF_ERROR`](crate::constants::Z_BUF_ERROR) — [`input.fill`] returned an
+/// * [`Z_BUF_ERROR`] — [`input.fill`] returned an
 ///   empty slice mid-stream, or [`output.write`] reported failure;
-/// * [`Z_DATA_ERROR`](crate::constants::Z_DATA_ERROR) — the input is not a valid
+/// * [`Z_DATA_ERROR`] — the input is not a valid
 ///   DEFLATE stream;
-/// * [`Z_STREAM_ERROR`](crate::constants::Z_STREAM_ERROR) — `window` is smaller
+/// * [`Z_STREAM_ERROR`] — `window` is smaller
 ///   than `state.wsize` (a parameter error; C assumes the exact size and would
 ///   otherwise read/write out of bounds — this safe port rejects it instead).
 ///
@@ -330,7 +330,7 @@ pub fn inflate_back_init(window_bits: i32) -> Result<InflateState, i32> {
 /// # Determinism
 ///
 /// The decoded byte stream is **identical** to C `inflateBack` for any input:
-/// the same Huffman tables are built (via [`inflate_table`]/[`inflate_fixed`]),
+/// the same Huffman tables are built (via `inflate_table`/`inflate_fixed`),
 /// the same bit-accumulator cadence is used, and the same window-wrap match-copy
 /// arithmetic is performed. No checksum is computed (raw DEFLATE has no
 /// trailer).
@@ -894,7 +894,7 @@ where
 /// [`window`](InflateState::window) `Vec`) are freed automatically and
 /// leak-free by [`Drop`] (AAP §0.6.3). The user-supplied window/output buffer
 /// passed to [`inflate_back`] is **not** owned by the state and is therefore
-/// untouched. Always returns [`Z_OK`](crate::constants::Z_OK).
+/// untouched. Always returns [`Z_OK`].
 ///
 /// The C `Z_STREAM_ERROR` validation (null `strm`/`state`/`zfree`) guards
 /// against malformed C handles and is performed in the `crate::ffi` shim before

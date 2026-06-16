@@ -12,22 +12,22 @@
 //!
 //! | C (`gzwrite.c`)        | Rust (this file)                                  |
 //! |------------------------|---------------------------------------------------|
-//! | `gz_init`              | [`gz_init`] — lazy buffer/engine allocation       |
-//! | `gz_comp`              | [`gz_comp`] — the single output choke point       |
-//! | `gz_zero`              | [`gz_zero`] — compress a run of zero bytes        |
-//! | `gz_write`             | [`gz_write`] — buffer/compress a user slice       |
+//! | `gz_init`              | `gz_init` — lazy buffer/engine allocation       |
+//! | `gz_comp`              | `gz_comp` — the single output choke point       |
+//! | `gz_zero`              | `gz_zero` — compress a run of zero bytes        |
+//! | `gz_write`             | `gz_write` — buffer/compress a user slice       |
 //! | `gzwrite`              | [`gzwrite`]                                        |
 //! | `gzfwrite`             | [`gzfwrite`]                                       |
 //! | `gzputc`               | [`gzputc`]                                         |
 //! | `gzputs`               | [`gzputs`]                                         |
 //! | `gzvprintf`/`gzprintf` | [`gzprintf`] (safe `fmt::Arguments` core)         |
 //! | `gzflush`              | [`gzflush`]                                        |
-//! | `gzsetparams` body     | [`set_params`] (shared with `open.rs`)            |
-//! | `gzclose_w`            | [`gzclose_w`] / [`finish`]                         |
+//! | `gzsetparams` body     | `set_params` (shared with `open.rs`)            |
+//! | `gzclose_w`            | [`gzclose_w`] / `finish`                         |
 //!
 //! # Shared helpers
 //!
-//! [`gz_comp`], [`gz_zero`], [`gz_init`], [`set_params`], [`finish`], and
+//! `gz_comp`, `gz_zero`, `gz_init`, `set_params`, `finish`, and
 //! [`gzclose_w`] are `pub(crate)` so the sibling `open.rs` (`gzsetparams`),
 //! `close.rs` (`gzclose`), and the `state.rs` RAII path can reuse the
 //! deflate-driving logic without duplicating it (AAP §0.3.2, §0.6.3). `gz_comp`
@@ -39,7 +39,7 @@
 //!
 //! * The **input** buffer is sized `want << 1` (DOUBLE). The second half exists
 //!   so [`gzprintf`] can format up to `want` bytes after any currently buffered
-//!   input without overflowing — see [`gz_init`].
+//!   input without overflowing — see `gz_init`.
 //! * The **output** buffer is sized `want` (allocated only when compressing,
 //!   i.e. not a transparent `direct` write).
 //! * `size` is set to `want` once the buffers exist; `size == 0` is the
@@ -582,7 +582,7 @@ pub(crate) fn gz_write(state: &mut GzState, buf: &[u8]) -> usize {
 /// Write `buf` to the gzip file, returning the number of **uncompressed** bytes
 /// written — the safe-Rust port of C `gzwrite` (`gzwrite.c` L254-277).
 ///
-/// Returns `0` on error (with [`GzState::gz_error`] set) or if the handle is not
+/// Returns `0` on error (with `GzState::gz_error` set) or if the handle is not
 /// open for writing. Because the C return type is `int`, a length that does not
 /// fit in a positive `int` is rejected with [`Z_DATA_ERROR`], matching C.
 pub fn gzwrite(state: &mut GzState, buf: &[u8]) -> i32 {
@@ -637,8 +637,8 @@ pub fn gzfwrite(state: &mut GzState, item_size: usize, nitems: usize, buf: &[u8]
 /// (`gzwrite.c` L306-347).
 ///
 /// Reproduces C's fast path: when the input buffer is initialized and has room,
-/// the byte is appended directly and [`GzState::pos`] is bumped without invoking
-/// the full [`gz_write`] machinery.
+/// the byte is appended directly and `GzState::pos` is bumped without invoking
+/// the full `gz_write` machinery.
 pub fn gzputc(state: &mut GzState, c: i32) -> i32 {
     if !state.is_writing() || (state.err != Z_OK && !state.again) {
         return -1;
@@ -709,7 +709,7 @@ pub fn gzputs(state: &mut GzState, s: &str) -> i32 {
 /// second half of the doubled input buffer are reproduced at the `crate::ffi`
 /// boundary; this safe core accepts pre-built [`core::fmt::Arguments`] (e.g. from
 /// the standard [`format_args!`] macro). The doubled input buffer
-/// (`want << 1`, allocated by [`gz_init`]) exists precisely so a `want`-sized
+/// (`want << 1`, allocated by `gz_init`) exists precisely so a `want`-sized
 /// formatted result always fits; to preserve C's contract this function refuses
 /// (returns `0`) any result that would reach or exceed `want` bytes.
 ///
@@ -891,7 +891,7 @@ pub(crate) fn set_params(state: &mut GzState, level: i32, strategy: i32) -> i32 
 /// [`std::fs::File`], the engine state, and the working buffers are freed by
 /// ordinary ownership (the RAII replacement for the C `free`/`close` calls).
 ///
-/// The handle is marked [`finalized`](GzState::finalize) so the subsequent
+/// The handle is marked `finalized` so the subsequent
 /// [`Drop`] becomes a no-op (no double-finalize).
 ///
 /// This is exposed crate-wide so `close.rs::gzclose` can dispatch to it.
@@ -973,9 +973,9 @@ pub(crate) fn finish(state: &mut GzState) -> i32 {
 /// An idiomatic [`std::io::Write`] adapter over a gzip write [`GzState`]
 /// (AAP §0.3.2 — trait abstractions for the gzip layer).
 ///
-/// `GzWriter` owns the handle and maps [`Write::write`] onto [`gz_write`] and
-/// [`Write::flush`] onto a [`Z_SYNC_FLUSH`] [`gz_comp`] followed by a flush of
-/// the underlying file. On [`Drop`] it performs a best-effort [`finish`] so the
+/// `GzWriter` owns the handle and maps [`Write::write`] onto `gz_write` and
+/// [`Write::flush`] onto a [`Z_SYNC_FLUSH`] `gz_comp` followed by a flush of
+/// the underlying file. On [`Drop`] it performs a best-effort `finish` so the
 /// gzip trailer is always written even if the caller forgets to finish
 /// explicitly (mirroring `flate2`'s `GzEncoder`).
 ///

@@ -5,15 +5,15 @@
 //! object file so that a program linking it pulls in *only* the close path it
 //! actually uses; the read-side and write-side teardown bodies stay in
 //! `gzread.c` / `gzwrite.c`. This port keeps that exact split: the heavy
-//! teardown lives in [`crate::gz::read::gzclose_r`] and
+//! teardown lives in `crate::gz::read::gzclose_r` and
 //! [`crate::gz::write::gzclose_w`], and this file contributes *only* the thin
 //! top-level dispatcher.
 //!
 //! [`gzclose`] inspects the handle's access [`Mode`] and routes to:
 //!
-//! * [`gzclose_r`](crate::gz::read::gzclose_r) when the handle was opened for
+//! * `gzclose_r` when the handle was opened for
 //!   reading ([`Mode::Read`]), or
-//! * [`gzclose_w`](crate::gz::write::gzclose_w) for every other mode (the C
+//! * [`gzclose_w`] for every other mode (the C
 //!   ternary's "else" arm — a write handle, or the transient/degenerate
 //!   [`Mode::None`]/[`Mode::Append`] states, which `gzclose_w` itself rejects
 //!   with [`Z_STREAM_ERROR`]).
@@ -35,7 +35,7 @@
 //! the end of [`gzclose`]. The fallible *flush* on the write path (emitting the
 //! trailing deflate data + gzip trailer) is performed by `gzclose_w`, which
 //! returns a status the caller can observe. Both `gzclose_r` and `gzclose_w`
-//! call [`GzState::finalize`](crate::gz::state::GzState::finalize) once their
+//! call `GzState::finalize` once their
 //! work succeeds, so the subsequent `Drop` is a no-op under the at-most-once
 //! finalize guard — teardown therefore runs **exactly once**, whether the
 //! caller closes explicitly through this function or simply drops the handle.
@@ -87,8 +87,8 @@ use crate::gz::write::gzclose_w;
 /// * [`Z_STREAM_ERROR`] if `file` is `None`, or if the handle's mode is not a
 ///   valid open mode for the path taken (e.g. a non-write handle reaching
 ///   `gzclose_w`).
-/// * Otherwise the result of [`gzclose_r`](crate::gz::read::gzclose_r) (read
-///   handles) or [`gzclose_w`](crate::gz::write::gzclose_w) (all other modes):
+/// * Otherwise the result of `gzclose_r` (read
+///   handles) or [`gzclose_w`] (all other modes):
 ///   typically [`Z_OK`](crate::constants::Z_OK), or a buffered error such as
 ///   `Z_BUF_ERROR` (premature EOF on read) or an I/O error code surfaced while
 ///   flushing the final write.

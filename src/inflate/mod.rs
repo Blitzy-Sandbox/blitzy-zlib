@@ -25,7 +25,7 @@
 //!   (Adler-32) or `0` (CRC-32) directly; the [`crate::checksum`] functions are
 //!   only ever called with non-empty buffers.
 //! * **Zero `unsafe`.** Every copy here uses safe slice operations or
-//!   index loops; the sole core `unsafe` site is [`fast::inflate_fast`].
+//!   index loops; the sole core `unsafe` site is `fast::inflate_fast`.
 //! * **State machine.** C's integer `mode` + `switch` fall-through becomes the
 //!   exhaustive [`InflateMode`] enum + `match`; `goto inf_leave` becomes
 //!   `break 'inf`; intentional C fall-through becomes `state.mode = Next;
@@ -70,7 +70,7 @@ use tables::{inflate_fixed, inflate_table};
 // ===========================================================================
 
 /// Everything a caller (`ffi.rs` shim or the idiomatic [`Inflate`] wrapper)
-/// needs to reconcile its `z_stream`/state after one [`inflate`] call.
+/// needs to reconcile its `z_stream`/state after one `inflate` call.
 ///
 /// The core engine is lifetime-free and slice-based (it does not own a
 /// `ZStream`), so instead of mutating a stream struct it returns this outcome.
@@ -1933,7 +1933,7 @@ impl Inflate {
     }
 
     /// Skip invalid input and resynchronize at the next full flush point
-    /// (C `inflateSync`); see [`inflate_sync`]. Returns `(ret, consumed)` where
+    /// (C `inflateSync`); see `inflate_sync`. Returns `(ret, consumed)` where
     /// `ret` is `Z_OK` (resynchronized), `Z_DATA_ERROR` (marker not found), or
     /// `Z_BUF_ERROR` (no progress possible), and `consumed` is how many input
     /// bytes were scanned. Advances `total_in` by `consumed`.
@@ -1986,7 +1986,7 @@ impl Inflate {
     }
 
     /// Decompress from `input` into `output`, advancing the state machine
-    /// (the idiomatic front end over the core [`inflate`] function).
+    /// (the idiomatic front end over the core `inflate` function).
     ///
     /// Returns `(ret, in_consumed, out_produced)`:
     ///

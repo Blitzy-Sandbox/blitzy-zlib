@@ -55,12 +55,12 @@
 //!
 //! C `inflate_fast(z_streamp strm, unsigned start)` operates directly on the
 //! `z_stream`'s raw `next_in`/`next_out` pointers. This port uses the
-//! decoupled *slice + cursor* model described on [`inflate_fast`]: the input
+//! decoupled *slice + cursor* model described on `inflate_fast`: the input
 //! and output buffers are passed as slices with `usize` cursors, and the engine
 //! state is the safe [`InflateState`]. The one externally observable difference
 //! is error reporting: C writes `strm->msg` directly, whereas [`InflateState`]
 //! carries no message field, so this function **returns** the message (see
-//! [`inflate_fast`]).
+//! `inflate_fast`).
 
 // Only the decode-state machine and the resumable state struct are needed in
 // the production path: the table-entry type `Code` is inferred for the `here`

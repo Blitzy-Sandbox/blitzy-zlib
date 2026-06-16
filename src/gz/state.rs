@@ -157,12 +157,12 @@ pub enum How {
 /// This port replaces both raw pointers with **`usize` indices** into the owned
 /// [`Vec<u8>`] buffers, paired with length counters:
 ///
-/// * Output: [`next`](GzState::next) is the index of the next byte to deliver
-///   within [`out_buf`](GzState::out_buf); [`have`](GzState::have) is how many
+/// * Output: `next` is the index of the next byte to deliver
+///   within `out_buf`; `have` is how many
 ///   bytes remain available starting at that index. The delivered window is
-///   exactly `out_buf[next .. next + have]` (see [`out_slice`](GzState::out_slice)).
-/// * Input: [`in_next`](GzState::in_next) is the index of the next unread byte
-///   within [`in_buf`](GzState::in_buf); [`in_avail`](GzState::in_avail) is how
+///   exactly `out_buf[next .. next + have]` (see `out_slice`).
+/// * Input: `in_next` is the index of the next unread byte
+///   within `in_buf`; `in_avail` is how
 ///   many valid bytes remain there. (The engine's own `next_out`/`avail_out` are
 ///   not stored on the stream; `read.rs`/`write.rs` hand the engine a
 ///   `&mut [u8]` slice of `out_buf` per call.)
@@ -524,12 +524,12 @@ impl GzState {
 /// Dropping a `GzState` always releases every resource it owns and never
 /// unwinds:
 ///
-/// * the engine state inside [`strm`](GzState::strm) is freed when the
+/// * the engine state inside `strm` is freed when the
 ///   [`ZStream`] is dropped (the `inflateEnd`/`deflateEnd` equivalent — no
 ///   explicit action needed here);
-/// * the OS file in [`file`](GzState::file) is closed when the
+/// * the OS file in `file` is closed when the
 ///   [`Option<File>`](std::fs::File) is dropped;
-/// * the [`in_buf`](GzState::in_buf)/[`out_buf`](GzState::out_buf) buffers are
+/// * the `in_buf`/`out_buf` buffers are
 ///   freed when their [`Vec<u8>`] are dropped.
 ///
 /// All of that happens automatically *after* this method returns, when the
@@ -540,7 +540,7 @@ impl GzState {
 /// For a **write** handle, `Drop` additionally performs a *best-effort* finish
 /// — emitting the trailing compressed data and the gzip trailer and running the
 /// `deflateEnd` teardown — by delegating to
-/// [`crate::gz::write::finish`]. This makes the RAII path equivalent to
+/// `crate::gz::write::finish`. This makes the RAII path equivalent to
 /// `gzclose_w`, so a write handle returned by `gzopen`/`gzdopen` that is simply
 /// dropped (without an explicit `gzclose`) still produces a complete, valid,
 /// fully-recoverable gzip file (AAP §0.3.2: "RAII / `Drop` … replaces
@@ -553,10 +553,10 @@ impl GzState {
 /// path, which performs the identical flush but returns the status code. Either
 /// way the bytes are written; only the error *visibility* differs.
 ///
-/// [`finish`](crate::gz::write::finish) is idempotent and self-guarding: it does
+/// `finish` is idempotent and self-guarding: it does
 /// the flush only for an initialized write handle that has not yet been
 /// finalized (`is_writing() && size != 0`), and ends by running the at-most-once
-/// [`finalize`](GzState::finalize) guard. Consequently:
+/// `finalize` guard. Consequently:
 ///
 /// * a **read** handle, or an already-closed/finalized handle, takes no I/O path
 ///   — `finish` reduces to the bare `finalize()` guard (the prior behavior);

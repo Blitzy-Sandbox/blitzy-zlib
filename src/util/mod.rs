@@ -10,8 +10,8 @@
 //! | Submodule           | C source     | Responsibility                                  |
 //! |---------------------|--------------|-------------------------------------------------|
 //! | [`mod@version`]     | `zutil.c`    | [`zlib_version`]/[`zlib_compile_flags`]/[`z_error`] |
-//! | [`mod@compress`]    | `compress.c` | one-shot [`compress`]/[`compress2`]/[`compress_bound`] |
-//! | [`mod@uncompress`]  | `uncompr.c`  | one-shot [`uncompress`]/[`uncompress2`]         |
+//! | [`mod@compress`]    | `compress.c` | one-shot [`compress()`]/[`compress2`]/[`compress_bound`] |
+//! | [`mod@uncompress`]  | `uncompr.c`  | one-shot [`uncompress()`]/[`uncompress2`]         |
 //!
 //! The one-shot `compress`/`uncompress` helpers (`compress.c` → `compress.rs`,
 //! `uncompr.c` → `uncompress.rs`, AAP §0.4.1) are layered on top of this root

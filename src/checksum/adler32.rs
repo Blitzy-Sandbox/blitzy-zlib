@@ -9,7 +9,7 @@
 //! the C reference exactly, including the `*_combine` variants.
 //!
 //! The checksum is the concatenation of two 16-bit sums taken modulo
-//! [`BASE`] (65521, the largest prime below 2^16):
+//! `BASE` (65521, the largest prime below 2^16):
 //!
 //! * `s1` — the running sum of every input byte (seeded at 1).
 //! * `s2` — the running sum of every intermediate value of `s1`.

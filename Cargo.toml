@@ -202,22 +202,18 @@ rand = "0.9.0"
 # ----------------------------------------------------------------------------
 # [[bench]] — criterion harnesses (AAP §0.3.1, §0.4.1)
 # ----------------------------------------------------------------------------
-# The criterion benchmark harnesses live in `benches/{deflate,inflate,checksum}
-# _bench.rs`. Cargo validates every explicitly declared target's source file at
-# manifest-parse time, so the `[[bench]]` target declarations are introduced
-# together with those source files (in the benchmark checkpoint) — declaring
-# them before the files exist makes EVERY cargo command (build/clippy/test/
-# metadata) fail to even parse the manifest. The `criterion` dev-dependency and
-# the `[profile.bench]` profile below are kept in place so the harnesses drop in
-# with `harness = false` (criterion supplies its own `main()`) once authored.
+# The three criterion benchmark harnesses live in
+# `benches/{deflate,inflate,checksum}_bench.rs` and are all authored, so each is
+# declared as a `[[bench]]` target below. Cargo validates every explicitly
+# declared target's source file at manifest-parse time, so a target is declared
+# only once its source file exists (all three now do). Every harness uses
+# `harness = false` because criterion supplies its own `main()`; the `criterion`
+# dev-dependency and the `[profile.bench]` profile below back them.
 
 # INFLATE decompression-throughput harness (AAP §0.7.3: decompression
 # throughput ≥ C zlib). `harness = false` cedes `main()` to criterion's
 # `criterion_main!` runner instead of libtest's, which is mandatory for a
-# criterion benchmark. Only `inflate_bench` is declared here because Cargo
-# validates every explicitly declared target's source file at manifest-parse
-# time; the sibling `deflate_bench`/`checksum_bench` declarations are introduced
-# alongside their own source files so that any cargo command still parses.
+# criterion benchmark.
 [[bench]]
 name = "inflate_bench"
 harness = false
@@ -227,20 +223,17 @@ harness = false
 # compares against the flate2 (canonical C zlib) baseline so the ≥80% gate is
 # directly readable. `harness = false` because criterion supplies its own
 # `main()` (the default libtest harness would otherwise conflict with the
-# `criterion_main!` macro). Declared here, alongside its source file, exactly as
-# the note above prescribes.
+# `criterion_main!` macro).
 [[bench]]
 name = "deflate_bench"
 harness = false
 
-# The checksum benchmark harness (`benches/checksum_bench.rs`) is now authored,
-# so its target is declared here. `harness = false` hands the entry point to
-# criterion's `criterion_main!` (the built-in libtest bench harness is unstable
-# on stable Rust and cannot report `Throughput`). The `name` matches the file
-# stem, so Cargo resolves the conventional path `benches/checksum_bench.rs` and
-# this explicit declaration supersedes auto-discovery for that file. The sibling
-# `deflate_bench.rs` / `inflate_bench.rs` targets are declared by their own
-# checkpoints when those harnesses are authored.
+# CHECKSUM throughput harness (`benches/checksum_bench.rs`; AAP §0.7.3: CRC-32
+# SIMD ≥ 3× scalar). `harness = false` hands the entry point to criterion's
+# `criterion_main!` (the built-in libtest bench harness is unstable on stable
+# Rust and cannot report `Throughput`). The `name` matches the file stem, so
+# Cargo resolves the conventional path `benches/checksum_bench.rs` and this
+# explicit declaration supersedes auto-discovery for that file.
 [[bench]]
 name = "checksum_bench"
 harness = false

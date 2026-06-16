@@ -5,14 +5,14 @@
 //! (`crate::gz`). It owns:
 //!
 //! * **opening** a gzip file — [`gzopen`], [`gzopen64`], [`gzdopen`], and the
-//!   shared [`gz_open`] constructor with its character-for-character
+//!   shared `gz_open` constructor with its character-for-character
 //!   mode-string parser;
 //! * **buffer sizing** — [`gzbuffer`];
 //! * **positioning** — [`gzrewind`], [`gzseek`]/[`gzseek64`],
 //!   [`gztell`]/[`gztell64`], [`gzoffset`]/[`gzoffset64`];
 //! * **status** — [`gzeof`], [`gzerror`], [`gzclearerr`];
 //! * **parameter changes** — [`gzsetparams`] (a thin wrapper that delegates to
-//!   [`crate::gz::write::set_params`], whose source is `gzwrite.c` — this is why
+//!   `crate::gz::write::set_params`, whose source is `gzwrite.c` — this is why
 //!   `open.rs` lists both `gzlib.c` and `gzwrite.c` as its C sources, AAP
 //!   §0.4.1).
 //!
@@ -20,13 +20,13 @@
 //!
 //! `open.rs` never touches the deflate/inflate engine directly. Engine
 //! initialization is **lazy**: it happens on first use in
-//! [`crate::gz::write::gz_init`] (writing) or [`crate::gz::read::gz_look`]
+//! `crate::gz::write::gz_init` (writing) or `crate::gz::read::gz_look`
 //! (reading), both of which configure the engine with `windowBits = 31` (the
 //! gzip wrapper). `gz_open` only *records* the requested `level` / `strategy` /
 //! `mode` / `direct` and opens (or adopts) the OS file. Likewise [`gzseek`]
 //! only *computes* the target position and arms a pending skip
-//! ([`GzState::skip`]); the actual data skip is performed lazily on the next
-//! read/write by [`crate::gz::read::gz_skip`] / [`crate::gz::write::gz_zero`].
+//! (`GzState::skip`); the actual data skip is performed lazily on the next
+//! read/write by `crate::gz::read::gz_skip` / `crate::gz::write::gz_zero`.
 //! Preserving this deferral exactly is required for byte-for-byte parity with C
 //! zlib (AAP §0.6.1, §0.7.1).
 //!
@@ -45,7 +45,7 @@
 //!   [`std::path::Path`].
 //!
 //! The OS-level open flags `O_CLOEXEC` / `O_EXCL` / `O_NONBLOCK` are applied
-//! entirely through **safe** `std` facilities (see [`gz_open`]).
+//! entirely through **safe** `std` facilities (see `gz_open`).
 
 use crate::constants::*;
 use crate::gz::state::{GzState, How, Mode};
@@ -345,7 +345,7 @@ pub(crate) fn gz_open(source: GzSource<'_>, mode: &str) -> Option<Box<GzState>> 
 /// C `gzopen` (`gzlib.c` L287-290).
 ///
 /// `mode` follows the zlib convention (e.g. `"rb"`, `"wb9"`, `"wb1f"`,
-/// `"ab"`); see [`gz_open`] for the full character table. Returns the gzip
+/// `"ab"`); see `gz_open` for the full character table. Returns the gzip
 /// handle, or [`None`] if `mode` is invalid or the file cannot be opened.
 #[must_use]
 pub fn gzopen(path: &Path, mode: &str) -> Option<Box<GzState>> {
@@ -358,7 +358,7 @@ pub fn gzopen(path: &Path, mode: &str) -> Option<Box<GzState>> {
 /// This port represents all file positions and seek amounts with `i64`
 /// ([`z_off64_t`](crate::constants)) throughout, so the 32-bit `gzopen` and the
 /// 64-bit `gzopen64` are **identical**; this function exists for C API parity
-/// and simply forwards to the same [`gz_open`] constructor.
+/// and simply forwards to the same `gz_open` constructor.
 #[must_use]
 pub fn gzopen64(path: &Path, mode: &str) -> Option<Box<GzState>> {
     gz_open(GzSource::Path(path), mode)
@@ -386,10 +386,10 @@ pub fn gzdopen(file: File, mode: &str) -> Option<Box<GzState>> {
 ///
 /// Must be called **before** the first read or write (i.e. before the buffers
 /// are allocated). Returns `0` on success, or `-1` if the handle is invalid, the
-/// buffers are already allocated ([`size`](GzState::size) `!= 0`), or `size`
+/// buffers are already allocated (`size` `!= 0`), or `size`
 /// would overflow when doubled. A `size` below `8` is rounded up to `8` so the
 /// flushing logic behaves; the accepted value is stored in
-/// [`want`](GzState::want).
+/// `want`.
 pub fn gzbuffer(state: &mut GzState, size: u32) -> i32 {
     // Integrity check: must be a read or write handle.
     if state.mode != Mode::Read && state.mode != Mode::Write {
@@ -419,8 +419,8 @@ pub fn gzbuffer(state: &mut GzState, size: u32) -> i32 {
 ///
 /// Valid only for a read handle with no fatal error (only [`Z_OK`] or
 /// [`Z_BUF_ERROR`] are tolerated). Seeks the underlying file back to the saved
-/// [`start`](GzState::start) position and re-initializes the read state via
-/// [`gz_reset`] (which re-arms the gzip-header sniff). Returns `0` on success or
+/// `start` position and re-initializes the read state via
+/// `gz_reset` (which re-arms the gzip-header sniff). Returns `0` on success or
 /// `-1` on failure.
 pub fn gzrewind(state: &mut GzState) -> i32 {
     // Must be reading, and there must be no serious error.
@@ -456,9 +456,9 @@ pub fn gzrewind(state: &mut GzState) -> i32 {
 /// # Lazy skip (parity-critical)
 ///
 /// A forward seek does **not** perform any I/O here. It records the remaining
-/// distance in [`skip`](GzState::skip); the actual work happens on the next
-/// operation — [`crate::gz::read::gz_skip`] discards that many decompressed
-/// bytes when reading, and [`crate::gz::write::gz_zero`] writes that many zero
+/// distance in `skip`; the actual work happens on the next
+/// operation — `crate::gz::read::gz_skip` discards that many decompressed
+/// bytes when reading, and `crate::gz::write::gz_zero` writes that many zero
 /// bytes when writing. Three cases are handled directly, exactly as C does:
 ///
 /// * **Transparent read fast path** — when reading a non-gzip stream
@@ -603,7 +603,7 @@ pub fn gztell64(state: &GzState) -> i64 {
 ///
 /// This is the position within the underlying file (C `LSEEK(fd, 0, SEEK_CUR)`),
 /// minus, when reading, any input that has been buffered but not yet consumed
-/// ([`in_avail`](GzState::in_avail), the port of C `strm.avail_in`) so the
+/// (`in_avail`, the port of C `strm.avail_in`) so the
 /// reported offset reflects what has actually been processed. Returns `-1` for
 /// an invalid handle or on a seek error. The 32-/64-bit variants are unified.
 pub fn gzoffset(state: &mut GzState) -> i64 {
@@ -685,8 +685,8 @@ pub fn gzerror(state: &GzState) -> (i32, Option<&str>) {
 /// Clear the error and end-of-file state of a handle — the safe-Rust port of C
 /// `gzclearerr` (`gzlib.c` L530-547).
 ///
-/// For a read handle this also clears [`eof`](GzState::eof) and
-/// [`past`](GzState::past); for either mode it resets the error to [`Z_OK`] with
+/// For a read handle this also clears `eof` and
+/// `past`; for either mode it resets the error to [`Z_OK`] with
 /// no message. Matching C, the clear is *unconditional* (there is no
 /// error-code-dependent guard).
 pub fn gzclearerr(state: &mut GzState) {
@@ -708,7 +708,7 @@ pub fn gzclearerr(state: &mut GzState) {
 /// point for C `gzsetparams`.
 ///
 /// The C `gzsetparams` lives in `gzwrite.c`, and its deflate-driving body is
-/// ported in [`crate::gz::write::set_params`] (so the engine logic is not
+/// ported in `crate::gz::write::set_params` (so the engine logic is not
 /// duplicated). This function is the thin wrapper the AAP places in `open.rs`
 /// (which is why `open.rs` lists `gzwrite.c` among its sources, AAP §0.4.1): it
 /// forwards directly. `set_params` performs all the validation (write-mode,

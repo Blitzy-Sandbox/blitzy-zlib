@@ -34,16 +34,15 @@ match `zlib-rs` and C zlib on either side of a compressed stream.
 > (with a hyphen), but the Rust import path uses an underscore — write
 > `use zlib_rs::...;` in your code.
 
-> **Checkpoint status:** this README documents the crate's full target design.
-> Available today are the foundation types, the Adler-32 / CRC-32 checksum
-> engine, the complete INFLATE (decompression) and DEFLATE (compression)
-> engines, the one-shot `compress`/`uncompress` helpers, the gzip **file** I/O
-> layer, the C-ABI FFI drop-in (`src/ffi.rs`, behind the non-default `capi`
-> feature), and the Cargo + CI build (`cargo build`, the `--no-default-features`
-> / `no-std` library builds, `cargo build --features capi`, `cargo clippy`, and
-> `cargo fmt` all run). The remaining deliverables are the integration test
-> suite (`tests/`) and the criterion benchmarks (`benches/`), which arrive in the
-> final checkpoints.
+> **Project status:** this crate is feature-complete. It ships the foundation
+> types, the Adler-32 / CRC-32 checksum engine, the complete INFLATE
+> (decompression) and DEFLATE (compression) engines, the one-shot
+> `compress` / `compress2` / `uncompress` helpers, the gzip **file** I/O layer,
+> and the C-ABI FFI drop-in (`src/ffi.rs`, behind the non-default `capi`
+> feature). The full Cargo + CI workflow is in place: `cargo build`, the
+> `--no-default-features` / `no-std` library builds, `cargo build --features
+> capi`, `cargo clippy`, and `cargo fmt`, together with the integration test
+> suite (`tests/`) and the criterion benchmarks (`benches/`), all run and pass.
 
 ---
 
@@ -126,24 +125,26 @@ The minimum supported Rust version is **1.85.0** (the crate uses edition 2024).
 ### One-shot compression and decompression
 
 The simplest entry points compress or decompress an entire in-memory buffer in a
-single call. `compress` takes the data and a level (`0`–`9`, or `-1` for the
-default); `uncompress` takes the compressed data and a size hint for the output.
-(The one-shot `compress`/`uncompress` helpers ship with the DEFLATE-engine
-checkpoint; the example below shows their target shape.)
+single call. `compress2` takes the data and a level (`0`–`9`, or `-1` for the
+default), while the one-argument `compress` uses the default level. `uncompress`
+decodes the stream into a caller-provided output buffer sized to the known
+original length and returns the number of bytes written.
 
 ```rust
-use zlib_rs::{compress, uncompress};
+use zlib_rs::{compress2, uncompress};
 
 fn main() {
-    // One-call compression at level 6 (the default level).
+    // One-call compression at level 6 (the default level). The one-argument
+    // `compress(data)` is equivalent at the default level.
     let data = b"Hello, zlib-rs! This is a compression test.";
-    let compressed = compress(data, 6).expect("compression failed");
+    let compressed = compress2(data, 6).expect("compression failed");
 
-    // One-call decompression. The second argument is a size hint for the
-    // output buffer (here, the known original length).
-    let decompressed = uncompress(&compressed, data.len()).expect("decompression failed");
+    // One-call decompression into a caller-provided buffer sized to the known
+    // original length; `uncompress` returns the number of bytes written.
+    let mut decompressed = vec![0u8; data.len()];
+    let n = uncompress(&mut decompressed, &compressed).expect("decompression failed");
 
-    assert_eq!(data.as_slice(), decompressed.as_slice());
+    assert_eq!(data.as_slice(), &decompressed[..n]);
 }
 ```
 
@@ -176,25 +177,29 @@ fn main() {
 ### Streaming with `Read` / `Write`
 
 For data that does not fit in memory, the gzip layer (enabled by the default
-`gz-io` feature) implements the standard `std::io` traits. `GzFile` mirrors C
-zlib's `gzFile`, implementing `Read`, `Write`, and `Seek`, and finalizing the
-stream deterministically on `Drop` (replacing the explicit `gzclose` call). The
-exact wrapper API is documented on [docs.rs](https://docs.rs/zlib-rs); the shape
-is:
+`gz-io` feature) integrates with the standard `std::io` traits. The `gzopen`
+family returns a `GzFile` handle (an owned `Box<GzState>`) that mirrors C zlib's
+`gzFile` and finalizes the stream deterministically on `Drop` (replacing the
+explicit `gzclose` call). A read handle implements `Read`, `BufRead`, and
+`Seek`; for writing, wrap the handle in a `GzWriter`, which implements `Write`:
 
-```ignore
+```no_run
 use std::io::{Read, Write};
-use zlib_rs::gz::GzFile;
+use std::path::Path;
+use zlib_rs::gz::{gzopen, GzFile, GzWriter};
 
-// Compress while writing: any data written is deflated into a gzip member.
-let mut out = GzFile::create("example.txt.gz")?; // open for gzip writing
-out.write_all(b"streamed payload that is compressed on the fly ...")?;
-drop(out); // Drop flushes and finalizes the gzip stream (replaces gzclose)
+// Compress while writing: open for gzip writing and wrap the handle in a
+// `GzWriter` so any data written is deflated into a gzip member.
+let handle = gzopen(Path::new("example.txt.gz"), "wb").expect("open for gzip writing");
+let mut out = GzWriter::from(handle);
+out.write_all(b"streamed payload that is compressed on the fly ...").unwrap();
+out.finish(); // finalize the gzip stream (or just drop `out`)
 
-// Decompress while reading: bytes are inflated on demand.
-let mut input = GzFile::open("example.txt.gz")?; // open for gzip reading
+// Decompress while reading: `gzopen` returns an `Option<GzFile>`; the handle
+// inflates on demand through its `Read` implementation.
+let mut input: GzFile = gzopen(Path::new("example.txt.gz"), "rb").expect("open for gzip reading");
 let mut text = String::new();
-input.read_to_string(&mut text)?;
+input.read_to_string(&mut text).unwrap();
 ```
 
 ---
@@ -274,6 +279,7 @@ old CMake build options.
 | `gz-io`  | yes     | `#ifndef NO_GZCOMPRESS`   | gzip **file** I/O (`gzopen`/`gzread`/`gzwrite`/…). Implies `std` + `gzip`. |
 | `no-std` | no      | `Z_SOLO`                  | Bare-metal core (compress/decompress/checksums only). **Mutually exclusive with `std`.** |
 | `simd`   | yes     | hardware CRC paths        | SIMD-accelerated CRC-32 via the optional `crc32fast` dependency. |
+| `capi`   | no      | the C-ABI drop-in build   | Exports the `#[no_mangle] extern "C"` zlib-API symbols (`src/ffi.rs`) for the `cdylib`/`staticlib` and triggers the `cbindgen` C-header generation. |
 
 Build the bare-metal core with no standard library:
 
@@ -297,9 +303,8 @@ Run the in-crate unit tests and documentation tests:
 cargo test          # runs the in-crate unit tests + doc tests
 ```
 
-The integration suite ports the C test programs and adds property-based and
-oracle tests. These targets are delivered with the `tests/*.rs` files in a
-later checkpoint; once present they run via:
+The integration suite (in `tests/*.rs`) ports the C test programs and adds
+property-based and oracle tests. Each target runs via:
 
 ```sh
 cargo test --test regression         # ported from test/example.c
@@ -316,17 +321,18 @@ cargo test --test checksum           # Adler-32 / CRC-32 known-answer tests
 > output equality. `flate2` is a **dev-dependency only** — it is never linked
 > into the shipped library, which carries **zero C dependency**.
 
-> **Known caveat:** at present `cargo test --no-default-features` fails to
-> compile the *test code* (some test modules use `Vec`/`String`/`format!`
-> without `alloc` imports when `std` is disabled). The **library itself**
-> compiles cleanly under every feature configuration, including
-> `--no-default-features` and `--no-default-features --features no-std`.
+> **`--no-default-features` builds and tests:** `cargo test
+> --no-default-features` both compiles and passes. A bare
+> `--no-default-features` build (neither `std` nor `no-std` selected) is a
+> reduced but still **`std`-linked** profile, so the libtest harness links
+> normally; the genuine bare-metal artifact is built with
+> `--no-default-features --features no-std`. The **library itself** compiles
+> cleanly under every feature configuration.
 
 ### Benchmarks
 
-Three [`criterion`](https://crates.io/crates/criterion) benchmark harnesses are
-delivered with the `benches/*.rs` files in a later checkpoint. Once present they
-run via:
+Three [`criterion`](https://crates.io/crates/criterion) benchmark harnesses
+(in `benches/*.rs`) validate the performance gates. They run via:
 
 ```sh
 cargo bench                          # run all benchmarks

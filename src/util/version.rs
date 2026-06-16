@@ -133,7 +133,7 @@ pub fn z_error(err: i32) -> &'static str {
 /// C `uLong zlibCompileFlags(void)` (`zutil.c` L31-121).
 ///
 /// The low byte encodes the sizes of four C-ABI types as 2-bit fields (see
-/// [`size_code`]):
+/// `size_code`):
 ///
 /// | Bits    | C type    | Rust type modeled      |
 /// |---------|-----------|------------------------|

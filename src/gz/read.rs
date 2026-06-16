@@ -13,7 +13,7 @@
 //! # The LOOK / COPY / GZIP substate machine ([`How`])
 //!
 //! On the first read (and after every completed gzip member) the reader is in
-//! [`How::Look`]. [`gz_look`] inspects the first bytes of input:
+//! [`How::Look`]. `gz_look` inspects the first bytes of input:
 //!
 //! * if they are a gzip header (`1f 8b 08` with a valid flags byte), it switches
 //!   to [`How::Gzip`] and decompresses through inflate;
@@ -24,14 +24,14 @@
 //! On `Z_STREAM_END` the engine returns to [`How::Look`] so that **concatenated
 //! gzip members** are decompressed end-to-end, and trailing garbage after a
 //! complete member is tolerated via the `junk`-candidate flag (see
-//! [`gz_decomp`]).
+//! `gz_decomp`).
 //!
 //! # C pointers → safe Rust
 //!
 //! Following the [`GzState`] cursor model, the C raw pointers `strm.next_in` /
-//! `x.next` become `usize` indices ([`in_next`](GzState::in_next) /
-//! [`next`](GzState::next)) into the owned [`Vec<u8>`] buffers, paired with the
-//! length counters [`in_avail`](GzState::in_avail) / [`have`](GzState::have).
+//! `x.next` become `usize` indices (`in_next` /
+//! `next`) into the owned [`Vec<u8>`] buffers, paired with the
+//! length counters `in_avail` / `have`.
 //! The engine's `next_out`/`avail_out` are not stored on the stream; each
 //! inflate call is handed a fresh `&mut [u8]` slice of the destination buffer.
 //!
@@ -695,7 +695,7 @@ pub(crate) fn gz_read(state: &mut GzState, buf: &mut [u8]) -> usize {
 /// free of a serious prior error; because the C function returns an `int`, the
 /// request length must fit in an `i32` (the C `(int)len < 0` guard). A return of
 /// `0` means end of file *or* error; on a non-blocking stall that produced no
-/// output ([`again`](GzState::again)) a [`Z_ERRNO`] error is recorded and `-1`
+/// output (`again`) a [`Z_ERRNO`] error is recorded and `-1`
 /// returned so the caller can tell a stall from a true EOF.
 pub fn gzread(state: &mut GzState, buf: &mut [u8]) -> i32 {
     // Get internal structure and check that it's for reading.
@@ -783,7 +783,7 @@ pub fn gzfread(state: &mut GzState, size: usize, nitems: usize, buf: &mut [u8]) 
 /// the byte as `0..=255`, or `-1` at end of file or on error.
 ///
 /// Reproduces the C fast path: if a decompressed byte is already buffered it is
-/// returned directly (advancing the cursor); otherwise a one-byte [`gz_read`]
+/// returned directly (advancing the cursor); otherwise a one-byte `gz_read`
 /// is performed.
 pub fn gzgetc(state: &mut GzState) -> i32 {
     // Get internal structure and check that it's for reading.
@@ -839,7 +839,7 @@ pub fn gzgetc_(state: &mut GzState) -> i32 {
 /// * **room before the data** — if the data starts at index `0`, slide it to
 ///   the end first, then insert the byte just before it.
 ///
-/// If the handle was only just opened, [`gz_look`] is invoked first to allocate
+/// If the handle was only just opened, `gz_look` is invoked first to allocate
 /// the output buffer (so there is somewhere to push into).
 pub fn gzungetc(state: &mut GzState, c: i32) -> i32 {
     // Get internal structure and check that it's for reading.
@@ -987,7 +987,7 @@ pub fn gzgets(state: &mut GzState, buf: &mut [u8]) -> usize {
 /// stream (read verbatim), `0` if it is being decompressed.
 ///
 /// If the stream type is not yet known (right after open: still in
-/// [`How::Look`] with no buffered output) [`gz_look`] is run first so the answer
+/// [`How::Look`] with no buffered output) `gz_look` is run first so the answer
 /// is definitive.
 pub fn gzdirect(state: &mut GzState) -> i32 {
     // If the state is not known, but we can find out, then do so (this is mainly
@@ -1066,7 +1066,7 @@ impl Read for GzState {
     ///
     /// Error mapping (driven by [`gzread`]'s `-1` return):
     ///
-    /// * a non-blocking stall ([`again`](GzState::again)) surfaces as
+    /// * a non-blocking stall (`again`) surfaces as
     ///   [`io::ErrorKind::WouldBlock`];
     /// * a fatal stream error (e.g. [`Z_DATA_ERROR`]) surfaces as
     ///   [`io::ErrorKind::InvalidData`] carrying the recorded message;
@@ -1100,7 +1100,7 @@ impl Read for GzState {
 }
 
 impl BufRead for GzState {
-    /// Returns the buffered decompressed bytes, refilling via [`gz_fetch`] when
+    /// Returns the buffered decompressed bytes, refilling via `gz_fetch` when
     /// the output buffer is empty. An empty slice signals end of file.
     ///
     /// Consistent with [`Read::read`](Self::read): a non-blocking stall surfaces

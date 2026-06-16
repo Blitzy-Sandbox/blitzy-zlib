@@ -14,13 +14,13 @@
 //!
 //! Two interchangeable engines produce the identical IEEE CRC-32:
 //!
-//! * **Scalar slice-by-8** ([`crc32_scalar`]) — the portable fallback. It folds
+//! * **Scalar slice-by-8** (`crc32_scalar`) — the portable fallback. It folds
 //!   eight input bytes per iteration through the eight-row lookup table that
 //!   `build.rs` regenerates at build time (mirroring the 9,446-line upstream
 //!   `crc32.h`, which is therefore never hand-ported). The byte loads use
 //!   [`u32::from_le_bytes`], so the result is identical on little- and
 //!   big-endian targets (AAP §0.6.4).
-//! * **SIMD** ([`crc32_simd`]) — used when the `simd` feature is on. It delegates
+//! * **SIMD** (`crc32_simd`) — used when the `simd` feature is on. It delegates
 //!   to the [`crc32fast`] crate, which selects a hardware-accelerated
 //!   carry-less-multiply implementation at run time and computes the very same
 //!   IEEE CRC-32. The `simd` feature is the default and targets ≥3× the scalar
@@ -153,7 +153,7 @@ fn crc32_simd(crc: u32, buf: &[u8]) -> u32 {
 ///
 /// Dispatch is resolved at compile time by the `simd` feature: with `simd` on
 /// (the default) it uses the accelerated [`crc32fast`] backend, otherwise the
-/// portable slice-by-8 [`crc32_scalar`]. An empty `buf` returns `crc` unchanged,
+/// portable slice-by-8 `crc32_scalar`. An empty `buf` returns `crc` unchanged,
 /// so `crc32_z(0, b"") == 0`. (C returns `0` for a `Z_NULL` buffer; that
 /// pointer-specific fast path is handled at the FFI boundary in `ffi.rs`.)
 ///
@@ -333,7 +333,7 @@ pub fn crc32_combine_gen(len2: i64) -> u32 {
 /// for a valid (non-negative) length are always nonzero — `x^(8*len2) mod p(x)`
 /// can never be the zero polynomial because `x` and `p(x)` are coprime (the CRC
 /// polynomial has a nonzero constant term) — so this guard is a no-op for correct
-/// inputs. It exists only to keep [`multmodp`] (which requires a nonzero first
+/// inputs. It exists only to keep `multmodp` (which requires a nonzero first
 /// argument) from looping forever if misused; the C reference is undefined/hangs
 /// for `op == 0`.
 ///
@@ -412,9 +412,9 @@ pub fn crc32_combine(crc1: u32, crc2: u32, len2: i64) -> u32 {
 /// This is row 0 of the slice-by-8 table — the canonical `crc_table` from the
 /// upstream `crc32.h`, with `get_crc_table()[n]` equal to the CRC-32 of the
 /// single byte `n` (in the reflected representation). Some callers use it to
-/// drive their own byte-wise CRC loops. It references [`CRC_TABLE`] directly so
+/// drive their own byte-wise CRC loops. It references `CRC_TABLE` directly so
 /// the table stays live under every feature combination — including a `simd`
-/// build where [`crc32_scalar`] is compiled out.
+/// build where `crc32_scalar` is compiled out.
 ///
 /// # Examples
 ///

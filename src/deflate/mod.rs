@@ -6,7 +6,7 @@
 //! status sentinels of `deflate.h`. It wires up the foundation submodules
 //! (`state`, `trees`, `strategy`) and the five per-level strategy modules
 //! (`stored`/`fast`/`slow`/`rle`/`huff`), defines the header-emission state
-//! machine ([`DeflateStatus`]), the `flush_block` helpers the strategy files
+//! machine (`DeflateStatus`), the `flush_block` helpers the strategy files
 //! import, every public `deflate*` orchestration function, and the idiomatic
 //! [`Deflate`] wrapper re-exported by the crate root.
 //!
@@ -14,14 +14,14 @@
 //!
 //! | Submodule        | C source     | Responsibility                                          |
 //! |------------------|--------------|---------------------------------------------------------|
-//! | [`mod@state`]    | `deflate.h`  | [`DeflateState`] + LZ77 plumbing (window/hash/read_buf)  |
-//! | [`mod@strategy`] | `deflate.c`  | Per-level `CONFIG_TABLE` + strategy dispatch             |
-//! | [`mod@trees`]    | `trees.c`    | Huffman tree build/emit, static tables, bit output       |
-//! | [`mod@stored`]   | `deflate.c`  | `deflate_stored` — store-only inner loop (level 0)       |
-//! | [`mod@fast`]     | `deflate.c`  | `deflate_fast` — greedy matcher (levels 1–3)             |
-//! | [`mod@slow`]     | `deflate.c`  | `deflate_slow` — lazy matcher (levels 4–9)               |
-//! | [`mod@rle`]      | `deflate.c`  | `deflate_rle` — run-length-only (`Z_RLE`)                |
-//! | [`mod@huff`]     | `deflate.c`  | `deflate_huff` — Huffman-only (`Z_HUFFMAN_ONLY`)         |
+//! | `state`    | `deflate.h`  | `DeflateState` + LZ77 plumbing (window/hash/read_buf)  |
+//! | `strategy` | `deflate.c`  | Per-level `CONFIG_TABLE` + strategy dispatch             |
+//! | `trees`    | `trees.c`    | Huffman tree build/emit, static tables, bit output       |
+//! | `stored`   | `deflate.c`  | `deflate_stored` — store-only inner loop (level 0)       |
+//! | `fast`     | `deflate.c`  | `deflate_fast` — greedy matcher (levels 1–3)             |
+//! | `slow`     | `deflate.c`  | `deflate_slow` — lazy matcher (levels 4–9)               |
+//! | `rle`      | `deflate.c`  | `deflate_rle` — run-length-only (`Z_RLE`)                |
+//! | `huff`     | `deflate.c`  | `deflate_huff` — Huffman-only (`Z_HUFFMAN_ONLY`)         |
 //!
 //! # Byte-exact wire-format authority
 //!
@@ -1287,7 +1287,7 @@ pub(crate) fn deflate_end(s: &DeflateState) -> Result<ReturnCode, ZlibError> {
 /// A safe, owning DEFLATE compressor — the idiomatic Rust front door to the
 /// engine, re-exported at the crate root.
 ///
-/// `Deflate` owns its [`DeflateState`] (a heap-allocated `Box`) and exposes a
+/// `Deflate` owns its `DeflateState` (a heap-allocated `Box`) and exposes a
 /// `Result`/`Option`-based API in place of zlib's integer return codes. The
 /// underlying owned buffers are released automatically when the `Deflate` is
 /// dropped — there is no `deflateEnd` to remember to call (AAP §0.3.2,
@@ -1349,7 +1349,7 @@ impl Deflate {
     }
 
     /// Create a compressor with full control over the wrapper (`window_bits`),
-    /// memory level, and [`Strategy`]. See [`deflate_init2`] for the
+    /// memory level, and [`Strategy`]. See `deflate_init2` for the
     /// `window_bits` overloading convention (zlib / raw / gzip).
     ///
     /// # Errors
@@ -1375,7 +1375,7 @@ impl Deflate {
     ///
     /// # Errors
     ///
-    /// Propagates [`deflate`]'s errors ([`ZlibError::BufError`],
+    /// Propagates `deflate`'s errors ([`ZlibError::BufError`],
     /// [`ZlibError::StreamError`]).
     pub fn compress(
         &mut self,
@@ -1394,11 +1394,11 @@ impl Deflate {
 
     /// Change the compression `level` and `strategy` mid-stream, flushing the
     /// current block through `input`/`output` if a strategy switch requires it.
-    /// See [`deflate_params`].
+    /// See `deflate_params`.
     ///
     /// # Errors
     ///
-    /// Propagates [`deflate_params`]'s errors.
+    /// Propagates `deflate_params`'s errors.
     pub fn params(
         &mut self,
         input: &[u8],
@@ -1416,22 +1416,22 @@ impl Deflate {
     }
 
     /// Reset the compressor to its initial state, reusing the allocation. See
-    /// [`deflate_reset`].
+    /// `deflate_reset`.
     ///
     /// # Errors
     ///
-    /// Propagates [`deflate_reset`]'s errors (none in practice).
+    /// Propagates `deflate_reset`'s errors (none in practice).
     pub fn reset(&mut self) -> Result<(), ZlibError> {
         deflate_reset(&mut self.state)?;
         Ok(())
     }
 
     /// Set the compression dictionary (before the first [`compress`](Self::compress)).
-    /// See [`deflate_set_dictionary`].
+    /// See `deflate_set_dictionary`.
     ///
     /// # Errors
     ///
-    /// Propagates [`deflate_set_dictionary`]'s errors.
+    /// Propagates `deflate_set_dictionary`'s errors.
     pub fn set_dictionary(&mut self, dict: &[u8]) -> Result<(), ZlibError> {
         deflate_set_dictionary(&mut self.state, dict)?;
         Ok(())
@@ -1439,23 +1439,23 @@ impl Deflate {
 
     /// Copy up to `w_size` bytes of sliding-window history into `dict` (when
     /// supplied) and return the number of history bytes available. See
-    /// [`deflate_get_dictionary`].
+    /// `deflate_get_dictionary`.
     pub fn get_dictionary(&self, dict: Option<&mut [u8]>) -> usize {
         let (_, len) = deflate_get_dictionary(&self.state, dict);
         len
     }
 
     /// Return an upper bound on the compressed size of `source_len` input
-    /// bytes for this stream's configuration. See [`deflate_bound`].
+    /// bytes for this stream's configuration. See `deflate_bound`.
     pub fn bound(&self, source_len: u64) -> u64 {
         deflate_bound(Some(&self.state), source_len)
     }
 
-    /// Fine-tune the internal LZ77 match parameters. See [`deflate_tune`].
+    /// Fine-tune the internal LZ77 match parameters. See `deflate_tune`.
     ///
     /// # Errors
     ///
-    /// Propagates [`deflate_tune`]'s errors (none in practice).
+    /// Propagates `deflate_tune`'s errors (none in practice).
     pub fn tune(
         &mut self,
         good_length: i32,
@@ -1474,29 +1474,29 @@ impl Deflate {
     }
 
     /// Inject `bits` low-order bits of `value` into the output bit buffer. See
-    /// [`deflate_prime`].
+    /// `deflate_prime`.
     ///
     /// # Errors
     ///
-    /// Propagates [`deflate_prime`]'s errors.
+    /// Propagates `deflate_prime`'s errors.
     pub fn prime(&mut self, bits: i32, value: i32) -> Result<(), ZlibError> {
         deflate_prime(&mut self.state, bits, value)?;
         Ok(())
     }
 
     /// Return the number of pending output `(bytes, bits)` not yet flushed.
-    /// See [`deflate_pending`].
+    /// See `deflate_pending`.
     #[must_use]
     pub fn pending(&self) -> (u32, i32) {
         deflate_pending(&self.state)
     }
 
     /// Supply a gzip header for the stream (gzip-wrapped streams only). See
-    /// [`deflate_set_header`].
+    /// `deflate_set_header`.
     ///
     /// # Errors
     ///
-    /// Propagates [`deflate_set_header`]'s errors.
+    /// Propagates `deflate_set_header`'s errors.
     #[cfg(feature = "gzip")]
     pub fn set_header(&mut self, head: GzHeader) -> Result<(), ZlibError> {
         deflate_set_header(&mut self.state, head)?;
