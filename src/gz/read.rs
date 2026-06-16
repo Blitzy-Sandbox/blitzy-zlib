@@ -42,7 +42,7 @@
 //! `gzgets` NUL-termination, the `gzread` `void *` surface) is deferred to
 //! `crate::ffi`.
 
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead, Read, Seek, SeekFrom};
 
 use crate::constants::*;
 use crate::gz::state::{GzState, How, Mode};
@@ -1143,6 +1143,66 @@ impl BufRead for GzState {
         self.next += n;
         self.have -= n;
         self.pos += n as i64;
+    }
+}
+
+/// Idiomatic [`std::io::Seek`] over the gzip layer (AAP §0.3.2 — "impl
+/// Read/Write/BufRead/`Seek` for the gzip layer"), delegating to the C-faithful
+/// [`gzseek`](crate::gz::open::gzseek) so the two surfaces share one
+/// implementation and one set of semantics.
+///
+/// Supported origins, mirroring C `gzseek` (`gzlib.c`):
+///
+/// * [`SeekFrom::Start`] — absolute uncompressed offset (C `SEEK_SET`).
+/// * [`SeekFrom::Current`] — relative to the current uncompressed position
+///   (C `SEEK_CUR`); a **read** handle may seek backwards (rewind + skip
+///   forward), a write handle only forwards.
+///
+/// [`SeekFrom::End`] is intentionally **unsupported**: a gzip stream's
+/// uncompressed length is not known without decoding to the end, so C `gzseek`
+/// rejects `SEEK_END` and `flate2` likewise omits end-relative seeking. It
+/// returns [`io::ErrorKind::Unsupported`] rather than silently mis-seeking.
+///
+/// The returned value is the new uncompressed position from the start of the
+/// stream, exactly as [`std::io::Seek::seek`] requires (and as C `gzseek`
+/// returns). Like C, the seek is applied lazily — a forward skip is realized on
+/// the next read/write — but the reported position already reflects it. An
+/// invalid handle or a failed underlying file seek surfaces as an
+/// [`io::Error`].
+impl Seek for GzState {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(offset) => {
+                // C `gzseek` takes a signed `z_off64_t`; reject an offset that
+                // cannot be represented rather than wrapping it negative.
+                let offset = i64::try_from(offset).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "seek offset exceeds the addressable gzip range",
+                    )
+                })?;
+                crate::gz::open::gzseek(self, offset, SEEK_SET)
+            }
+            SeekFrom::Current(offset) => crate::gz::open::gzseek(self, offset, SEEK_CUR),
+            SeekFrom::End(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "gzip streams do not support SeekFrom::End (the uncompressed \
+                     length is unknown without decoding to the end); use \
+                     SeekFrom::Start or SeekFrom::Current",
+                ));
+            }
+        };
+
+        if new_pos < 0 {
+            // `gzseek` returns -1 for an invalid handle, a pending hard error,
+            // an out-of-range backward seek, or an underlying file-seek failure.
+            return Err(io::Error::other(
+                "gzip seek failed (invalid handle, out-of-range, or I/O error)",
+            ));
+        }
+        // `new_pos >= 0` here, so the cast is lossless.
+        Ok(new_pos as u64)
     }
 }
 

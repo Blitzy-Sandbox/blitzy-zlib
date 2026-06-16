@@ -60,12 +60,12 @@ use zlib_rs::gz::close::gzclose;
 use zlib_rs::gz::open::{gzbuffer, gzeof, gzerror, gzopen, gzseek, gztell};
 use zlib_rs::gz::read::{gzdirect, gzgetc, gzgets, gzread, gzungetc};
 use zlib_rs::gz::state::GzState;
-use zlib_rs::gz::write::{gzflush, gzprintf, gzputc, gzputs, gzwrite};
-use zlib_rs::{SEEK_CUR, SEEK_SET, Z_OK, Z_SYNC_FLUSH};
+use zlib_rs::gz::write::{GzWriter, gzflush, gzprintf, gzputc, gzputs, gzwrite};
+use zlib_rs::{SEEK_CUR, SEEK_SET, Z_DATA_ERROR, Z_OK, Z_SYNC_FLUSH};
 
 use std::env;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -867,5 +867,388 @@ fn gzerror_clean_on_success() {
         "read handle should report Z_OK after a clean read"
     );
     assert!(rmsg.is_none(), "read handle should have no error message");
+    assert_eq!(gzclose(Some(inp)), Z_OK, "read-side gzclose != Z_OK");
+}
+
+/// Regression test for **F2-CRIT-1**: dropping a write handle *without* an
+/// explicit `gzclose` must still flush all buffered deflate data and emit the
+/// gzip trailer (the RAII `Drop` path), producing a valid, fully-recoverable
+/// gzip file.
+///
+/// Before the fix, `GzState::Drop` ran only the at-most-once finalize guard and
+/// performed no I/O, so the documented RAII path —
+/// `gzopen("wb") -> gzwrite -> drop` (AAP §0.3.2: "RAII / `Drop` … replaces
+/// `gzclose`"; §0.6.3: "deterministic, leak-free teardown path") — closed the
+/// OS file at **0 bytes** and silently lost everything `gzwrite` had accepted.
+/// This exercises the exact reproduction from the QA report: write a payload,
+/// drop the bare `Box<GzState>` handle (no `gzclose`), then confirm the file is
+/// non-empty, carries a valid gzip header, and reopening it recovers every byte.
+#[test]
+fn drop_without_close_flushes_write_data() {
+    let tmp = TempPath::new("drop_flush");
+    let payload: &[u8] = b"F2-CRIT-1: a write handle dropped without gzclose must still \
+          flush its buffered deflate data and emit the gzip trailer so the file is \
+          a complete, fully-recoverable gzip member.";
+
+    // (1) Open for writing and write the payload; gzwrite reports full success.
+    {
+        let mut out = gzopen(tmp.path(), "wb").expect("gzopen for writing failed");
+        assert_eq!(
+            gzwrite(&mut out, payload),
+            payload.len() as i32,
+            "gzwrite should accept the whole payload"
+        );
+        // (2) Drop WITHOUT gzclose — the RAII path that previously lost data.
+        drop(out);
+    }
+
+    // (3) The dropped write handle must have flushed: the file is non-empty and
+    //     begins with the RFC 1952 gzip magic + deflate method (1f 8b 08).
+    let raw = std::fs::read(tmp.path()).expect("reading the .gz file back failed");
+    assert!(
+        !raw.is_empty(),
+        "RAII Drop produced a 0-byte file — F2-CRIT-1 data loss"
+    );
+    assert_eq!(
+        &raw[..3],
+        &[0x1f, 0x8b, 0x08],
+        "dropped write handle did not emit a valid gzip header"
+    );
+
+    // (4) Reopen and decompress: every written byte is recovered.
+    let mut inp = gzopen(tmp.path(), "rb").expect("gzopen for reading failed");
+    let got = read_all(&mut inp);
+    assert_eq!(
+        got.as_slice(),
+        payload,
+        "data recovered after drop-without-close does not match what was written"
+    );
+    assert_eq!(gzclose(Some(inp)), Z_OK, "read-side gzclose != Z_OK");
+}
+
+/// Companion to [`drop_without_close_flushes_write_data`]: the explicit
+/// `gzclose` path and the RAII `Drop` path must be **equivalent and must not
+/// stack**.
+///
+/// An explicit `gzclose` already finishes the stream and marks the handle
+/// finalized, so the subsequent `Drop` is a guaranteed no-op — it must NOT emit
+/// a second gzip trailer (the idempotency guard in `write::finish`). We verify
+/// by writing the same payload two ways — explicit close vs. drop — and
+/// asserting the produced files are byte-identical (one, and only one, gzip
+/// member + trailer). The default `gzopen("wb")` header carries `MTIME = 0`, so
+/// the deflate output is deterministic and byte-identity is the precise signal
+/// for "exactly one trailer".
+#[test]
+fn explicit_close_and_drop_produce_identical_single_member() {
+    let payload: &[u8] = b"explicit gzclose vs RAII drop must yield the same single-member stream";
+
+    // Path A: explicit gzclose (consumes the handle, no later Drop work).
+    let tmp_a = TempPath::new("close_vs_drop_a");
+    {
+        let mut out = gzopen(tmp_a.path(), "wb").expect("gzopen A failed");
+        assert_eq!(
+            gzwrite(&mut out, payload),
+            payload.len() as i32,
+            "gzwrite A short"
+        );
+        assert_eq!(gzclose(Some(out)), Z_OK, "explicit gzclose A != Z_OK");
+    }
+    let bytes_a = std::fs::read(tmp_a.path()).expect("read A");
+
+    // Path B: drop without close (RAII finish).
+    let tmp_b = TempPath::new("close_vs_drop_b");
+    {
+        let mut out = gzopen(tmp_b.path(), "wb").expect("gzopen B failed");
+        assert_eq!(
+            gzwrite(&mut out, payload),
+            payload.len() as i32,
+            "gzwrite B short"
+        );
+        drop(out);
+    }
+    let bytes_b = std::fs::read(tmp_b.path()).expect("read B");
+
+    // Byte-identical => same single gzip member + exactly one trailer.
+    assert_eq!(
+        bytes_a, bytes_b,
+        "explicit-close and drop must produce byte-identical single-member \
+         streams (a length difference would mean the drop path emitted a \
+         second trailer)"
+    );
+
+    // And the drop-path file decodes back to the payload exactly.
+    let mut inp = gzopen(tmp_b.path(), "rb").expect("gzopen read-back failed");
+    let got = read_all(&mut inp);
+    assert_eq!(got.as_slice(), payload, "drop-path round-trip mismatch");
+    assert_eq!(gzclose(Some(inp)), Z_OK, "read-side gzclose != Z_OK");
+}
+
+/// Deterministic, std-only pseudo-random fill (an LCG). Used to produce an
+/// *incompressible* payload so the gzip member is a STORED deflate block — that
+/// makes corruption near the block start fail (`invalid stored block lengths`)
+/// *before* any byte is decompressed, which is precisely the case the
+/// `junk`-tolerance below applies to.
+fn incompressible(n: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(n);
+    let mut s: u32 = 0x1234_5678;
+    for _ in 0..n {
+        s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        v.push((s >> 16) as u8);
+    }
+    v
+}
+
+/// **F2-MAJOR-4 — baseline-parity regression test (corrupt member body, no
+/// output produced yet).**
+///
+/// A gzip member whose body is corrupted *before any byte is decompressed*
+/// (header + trailer left intact) is read as a **clean, empty, error-free EOF**
+/// — NOT a `Z_DATA_ERROR`. This is the documented `junk`-candidate tolerance of
+/// the AAP-frozen baseline (the in-repo C source, zlib **1.3.2.1-motley**,
+/// `ZLIB_VERNUM 0x1321`): `gz_look` marks a freshly-detected member `junk = 1`
+/// and `gz_decomp` treats a `Z_DATA_ERROR` raised while `junk == 1` (i.e. before
+/// the first decompressed byte) as trailing garbage, ending the stream cleanly
+/// (`gzread.c`).
+///
+/// This behavior is REQUIRED by AAP §0.1.1 (baseline = the in-repo 1.3.2.1
+/// source) and §0.7.1 (behavior-preserving rewrite — "not a feature change").
+/// It was verified to be byte-for-byte identical between this crate and the
+/// in-repo C zlib built from the very `gzread.c` in this repository.
+///
+/// > Note: an OLDER zlib (e.g. system **1.3.1**) lacks this `junk` mechanism and
+/// > instead surfaces the error. That version difference must NOT be "fixed"
+/// > here: matching 1.3.1 would *break* parity with the 1.3.2.1 baseline the AAP
+/// > freezes. The narrow scope of the tolerance is locked in by
+/// > [`corrupt_crc_trailer_is_surfaced_as_data_error`], which proves a
+/// > corruption detected *after* output IS surfaced.
+#[test]
+fn corrupt_first_member_body_is_tolerated_like_in_repo_c_1_3_2_1() {
+    let tmp = TempPath::new("corrupt_body");
+    let payload = incompressible(163);
+
+    // Write a valid single-member gzip file.
+    {
+        let mut out = gzopen(tmp.path(), "wb").expect("gzopen wb failed");
+        assert_eq!(
+            gzwrite(&mut out, &payload),
+            payload.len() as i32,
+            "gzwrite short"
+        );
+        assert_eq!(gzclose(Some(out)), Z_OK, "gzclose wb != Z_OK");
+    }
+
+    // Corrupt the deflate body (offsets 12 .. len-8): the 10-byte gzip header
+    // and the 8-byte trailer stay intact, so `gz_look` still detects a member.
+    let mut raw = std::fs::read(tmp.path()).expect("read .gz");
+    assert!(raw.len() > 20, "stream unexpectedly small");
+    assert_eq!(&raw[..3], &[0x1f, 0x8b, 0x08], "not a gzip header");
+    let end = raw.len() - 8;
+    for b in &mut raw[12..end] {
+        *b ^= 0xFF;
+    }
+    std::fs::write(tmp.path(), &raw).expect("write corrupted .gz");
+
+    // Read it back: a clean, empty EOF — matching the in-repo C 1.3.2.1 baseline.
+    let mut inp = gzopen(tmp.path(), "rb").expect("gzopen rb failed");
+    let mut buf = [0u8; 512];
+    let first = gzread(&mut inp, &mut buf);
+    assert_eq!(
+        first, 0,
+        "corrupt-first-member-body should read as clean EOF (0 bytes), matching \
+         the in-repo C 1.3.2.1 junk-tolerance; got {first}"
+    );
+    assert!(gzeof(&inp), "should be at EOF");
+    let (code, msg) = gzerror(&inp);
+    assert_eq!(
+        code, Z_OK,
+        "no error must be surfaced for a corrupt-before-output member on the \
+         1.3.2.1 baseline (got code {code}, msg {msg:?})"
+    );
+    assert_eq!(gzclose(Some(inp)), Z_OK, "read-side gzclose != Z_OK");
+}
+
+/// **F2-MAJOR-4 companion — proves the `junk` tolerance is NARROW.**
+///
+/// When the deflate body is valid but the **CRC-32 trailer** is corrupted, the
+/// member decompresses fully (output IS produced, so `gz_decomp` clears
+/// `junk = 0`) and the trailing integrity check fails — which MUST surface as
+/// `Z_DATA_ERROR` ("incorrect data check"), exactly as the in-repo C 1.3.2.1
+/// baseline does. This guards against any future change widening the tolerance
+/// into swallowing genuine post-output corruption.
+#[test]
+fn corrupt_crc_trailer_is_surfaced_as_data_error() {
+    let tmp = TempPath::new("corrupt_crc");
+    let payload = incompressible(163);
+
+    {
+        let mut out = gzopen(tmp.path(), "wb").expect("gzopen wb failed");
+        assert_eq!(
+            gzwrite(&mut out, &payload),
+            payload.len() as i32,
+            "gzwrite short"
+        );
+        assert_eq!(gzclose(Some(out)), Z_OK, "gzclose wb != Z_OK");
+    }
+
+    // Corrupt ONLY the 4-byte CRC-32 field of the trailer (bytes len-8 .. len-4);
+    // the deflate body stays valid so output is produced before the check fails.
+    let mut raw = std::fs::read(tmp.path()).expect("read .gz");
+    let n = raw.len();
+    assert!(n > 8, "stream unexpectedly small");
+    for b in &mut raw[n - 8..n - 4] {
+        *b ^= 0xFF;
+    }
+    std::fs::write(tmp.path(), &raw).expect("write corrupted .gz");
+
+    // Read it back: the data is decompressed, then the bad CRC surfaces as an
+    // error (negative read + Z_DATA_ERROR), matching the in-repo C baseline.
+    let mut inp = gzopen(tmp.path(), "rb").expect("gzopen rb failed");
+    let mut buf = [0u8; 512];
+    let last = loop {
+        let n = gzread(&mut inp, &mut buf);
+        if n <= 0 {
+            break n;
+        }
+    };
+    assert!(
+        last < 0,
+        "a corrupted CRC trailer must surface as a negative gzread (got {last})"
+    );
+    let (code, _msg) = gzerror(&inp);
+    assert_eq!(
+        code, Z_DATA_ERROR,
+        "a corrupted CRC trailer must surface as Z_DATA_ERROR (got {code})"
+    );
+    // The data error is observed through gzread/gzerror above; gzclose_r itself
+    // returns Z_OK here (it only forwards a pending Z_BUF_ERROR), matching C.
+    let _ = gzclose(Some(inp));
+}
+
+/// **F2-MINOR-2 — `GzWriter` is publicly constructible** (AAP §0.3.2: idiomatic
+/// `impl Write` for the gzip layer).
+///
+/// External code obtains a write handle from the public `gzopen` and converts
+/// it into the idiomatic [`std::io::Write`] adapter via the `From<Box<GzState>>`
+/// conversion (`handle.into()`), writes through the `Write` trait, finishes
+/// explicitly, and the bytes round-trip through `gzread`.
+#[test]
+fn gz_writer_public_into_round_trips() {
+    let tmp = TempPath::new("gzwriter_into");
+    let payload: &[u8] = b"GzWriter built via the public From<Box<GzState>> constructor (.into())";
+
+    {
+        let handle = gzopen(tmp.path(), "wb").expect("gzopen wb failed");
+        // Public construction path #1: the `From`/`Into` conversion.
+        let mut writer: GzWriter = handle.into();
+        writer.write_all(payload).expect("Write::write_all failed");
+        // Optionally also exercise Write::flush (Z_SYNC_FLUSH).
+        writer.flush().expect("Write::flush failed");
+        assert_eq!(writer.finish(), Z_OK, "GzWriter::finish != Z_OK");
+        // Dropping `writer` here is a no-op finish (already finished).
+    }
+
+    let mut inp = gzopen(tmp.path(), "rb").expect("gzopen rb failed");
+    let got = read_all(&mut inp);
+    assert_eq!(
+        got.as_slice(),
+        payload,
+        "GzWriter (into) round-trip mismatch"
+    );
+    assert_eq!(gzclose(Some(inp)), Z_OK, "read-side gzclose != Z_OK");
+}
+
+/// **F2-MINOR-2 companion** — the explicit [`GzWriter::from_handle`] constructor,
+/// finished implicitly by `Drop` (no explicit `finish`), still produces a valid,
+/// fully-recoverable gzip file.
+#[test]
+fn gz_writer_from_handle_drop_finishes() {
+    let tmp = TempPath::new("gzwriter_from_handle");
+    let payload: &[u8] = b"GzWriter::from_handle finished via Drop must still write the trailer";
+
+    {
+        let handle = gzopen(tmp.path(), "wb").expect("gzopen wb failed");
+        // Public construction path #2: the inherent constructor.
+        let mut writer = GzWriter::from_handle(handle);
+        writer.write_all(payload).expect("Write::write_all failed");
+        // No explicit finish; the GzWriter Drop must finish the stream.
+    }
+
+    let raw = std::fs::read(tmp.path()).expect("read .gz");
+    assert!(!raw.is_empty(), "GzWriter Drop produced a 0-byte file");
+    assert_eq!(&raw[..3], &[0x1f, 0x8b, 0x08], "missing gzip header");
+
+    let mut inp = gzopen(tmp.path(), "rb").expect("gzopen rb failed");
+    let got = read_all(&mut inp);
+    assert_eq!(
+        got.as_slice(),
+        payload,
+        "GzWriter::from_handle drop-finish round-trip mismatch"
+    );
+    assert_eq!(gzclose(Some(inp)), Z_OK, "read-side gzclose != Z_OK");
+}
+
+/// **F2-MINOR-3 — idiomatic `impl std::io::Seek` for the gzip layer**
+/// (AAP §0.3.2). The `Seek` trait on the read handle delegates to the C-faithful
+/// `gzseek`, so `SeekFrom::Start` / `SeekFrom::Current` reposition the
+/// uncompressed stream and `SeekFrom::End` is reported as `Unsupported` (gzip
+/// cannot cheaply seek from the end; `flate2` likewise omits it).
+#[test]
+fn gz_reader_impl_seek_start_current_end() {
+    let tmp = TempPath::new("seek_trait");
+    // 200 bytes of an easily-checked pattern.
+    let payload: Vec<u8> = (0..200u32).map(|i| (i % 251) as u8).collect();
+
+    {
+        let mut out = gzopen(tmp.path(), "wb").expect("gzopen wb failed");
+        assert_eq!(
+            gzwrite(&mut out, &payload),
+            payload.len() as i32,
+            "gzwrite short"
+        );
+        assert_eq!(gzclose(Some(out)), Z_OK, "gzclose wb != Z_OK");
+    }
+
+    let mut inp = gzopen(tmp.path(), "rb").expect("gzopen rb failed");
+
+    // SeekFrom::Start(50): absolute reposition; the next read yields [50..60].
+    let pos = Seek::seek(&mut inp, SeekFrom::Start(50)).expect("Seek::Start failed");
+    assert_eq!(pos, 50, "Seek::Start returned the wrong position");
+    assert_eq!(gztell(&inp), 50, "gztell disagrees with the Seek position");
+    let mut buf = [0u8; 10];
+    assert_eq!(
+        gzread(&mut inp, &mut buf),
+        10,
+        "short read after Start seek"
+    );
+    assert_eq!(&buf[..], &payload[50..60], "data after Start seek mismatch");
+
+    // SeekFrom::Current(+30): from pos 60 -> 90; next read yields [90..100].
+    let pos = Seek::seek(&mut inp, SeekFrom::Current(30)).expect("Seek::Current failed");
+    assert_eq!(pos, 90, "Seek::Current returned the wrong position");
+    assert_eq!(
+        gzread(&mut inp, &mut buf),
+        10,
+        "short read after Current seek"
+    );
+    assert_eq!(
+        &buf[..],
+        &payload[90..100],
+        "data after Current seek mismatch"
+    );
+
+    // SeekFrom::End is intentionally unsupported.
+    let err = Seek::seek(&mut inp, SeekFrom::End(0)).expect_err("Seek::End should fail");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::Unsupported,
+        "Seek::End must report ErrorKind::Unsupported"
+    );
+
+    // SeekFrom::Start(0) rewinds; the next read yields the head of the stream.
+    let pos = Seek::seek(&mut inp, SeekFrom::Start(0)).expect("rewind via Start(0) failed");
+    assert_eq!(pos, 0, "rewind position");
+    assert_eq!(gzread(&mut inp, &mut buf), 10, "short read after rewind");
+    assert_eq!(&buf[..], &payload[0..10], "data after rewind mismatch");
+
     assert_eq!(gzclose(Some(inp)), Z_OK, "read-side gzclose != Z_OK");
 }

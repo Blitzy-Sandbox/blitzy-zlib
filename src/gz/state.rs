@@ -495,17 +495,20 @@ impl GzState {
     ///   the working buffers) happens automatically when the owned fields are
     ///   dropped — see [`Drop`].
     /// * **The write-side flush** (emitting the trailing deflate data, the gzip
-    ///   trailer, and `deflateEnd`) is the job of the explicit
-    ///   `close()`/`finish()` entry points in `crate::gz::write`/`crate::gz::close`,
-    ///   which return a status the caller can observe. Those entry points call
-    ///   `finalize()` after a successful flush so that the subsequent [`Drop`]
-    ///   becomes a no-op.
+    ///   trailer, and `deflateEnd`) is performed by the
+    ///   [`finish`](crate::gz::write::finish) routine in `crate::gz::write`. It
+    ///   runs on every close path — the explicit `gzclose`/`gzclose_w`
+    ///   entry points (which return a status the caller can observe) **and**
+    ///   the RAII [`Drop`] below (best-effort, error-discarding). Each of those
+    ///   paths calls `finalize()` after the flush so that any later [`Drop`]
+    ///   becomes a no-op (no double-finish, no double trailer).
     ///
-    /// Splitting it this way keeps the flush — which can fail with an I/O error
-    /// — on a path that returns a result, while [`Drop`] remains an
-    /// infallible, panic-free safety net. It also keeps this file within its
-    /// dependency boundary: the flush logic lives in sibling `gz` modules, and
-    /// `GzState` does not reach into them.
+    /// Splitting it this way keeps the *fallible* flush reachable on a path that
+    /// returns a result (explicit close) while still guaranteeing the bytes are
+    /// flushed on the *infallible* RAII path (`Drop`), so a write handle that is
+    /// simply dropped still produces a complete, valid gzip file (AAP §0.3.2 /
+    /// §0.6.3). `finalize()` itself stays I/O-free: it is purely the
+    /// at-most-once guard that both paths share.
     pub(crate) fn finalize(&mut self) -> bool {
         if self.finalized {
             return false;
@@ -530,32 +533,52 @@ impl GzState {
 ///   freed when their [`Vec<u8>`] are dropped.
 ///
 /// All of that happens automatically *after* this method returns, when the
-/// struct's fields are dropped in turn; this impl therefore only needs to run
-/// the at-most-once finalization guard.
+/// struct's fields are dropped in turn.
 ///
 /// # The flush contract
 ///
-/// `Drop` is a **safety net**, not the primary close path. For a write handle,
-/// the trailing compressed data and the gzip trailer are flushed by the
-/// explicit `close()`/`finish()` functions in `crate::gz::write` /
-/// `crate::gz::close`, which return a status so the caller can observe an I/O
-/// error on close (this mirrors `flate2`'s `GzEncoder::finish` + `Drop`). Those
-/// functions call [`finalize`](GzState::finalize) once their flush succeeds, so
-/// reaching `Drop` afterward is a no-op. A handle dropped *without* an explicit
-/// close is still torn down without leaking; callers that need to observe close
-/// errors (or guarantee the final bytes are flushed) must call the explicit
-/// close path.
+/// For a **write** handle, `Drop` additionally performs a *best-effort* finish
+/// — emitting the trailing compressed data and the gzip trailer and running the
+/// `deflateEnd` teardown — by delegating to
+/// [`crate::gz::write::finish`]. This makes the RAII path equivalent to
+/// `gzclose_w`, so a write handle returned by `gzopen`/`gzdopen` that is simply
+/// dropped (without an explicit `gzclose`) still produces a complete, valid,
+/// fully-recoverable gzip file (AAP §0.3.2: "RAII / `Drop` … replaces
+/// `gzclose`"; §0.6.3: "deterministic, leak-free teardown path"). This mirrors
+/// `flate2`'s `GzEncoder`, whose `Drop` likewise finishes the stream.
 ///
-/// `Drop` cannot return a `Result`, so any work it performs must be infallible;
-/// keeping the fallible flush on the explicit path is what lets this impl stay
-/// panic-free.
+/// The flush is **best-effort**: `Drop` cannot return a `Result`, so any I/O
+/// error during the trailing flush is discarded here. Callers that need to
+/// *observe* a close-time I/O error must use the explicit `gzclose`/`gzclose_w`
+/// path, which performs the identical flush but returns the status code. Either
+/// way the bytes are written; only the error *visibility* differs.
+///
+/// [`finish`](crate::gz::write::finish) is idempotent and self-guarding: it does
+/// the flush only for an initialized write handle that has not yet been
+/// finalized (`is_writing() && size != 0`), and ends by running the at-most-once
+/// [`finalize`](GzState::finalize) guard. Consequently:
+///
+/// * a **read** handle, or an already-closed/finalized handle, takes no I/O path
+///   — `finish` reduces to the bare `finalize()` guard (the prior behavior);
+/// * a handle closed explicitly via `gzclose`/`gzclose_w` (or finished via the
+///   [`GzWriter`](crate::gz::write::GzWriter) wrapper) has already set
+///   `size = 0` and finalized, so this `Drop` is a guaranteed no-op — no double
+///   finish and no second gzip trailer.
+///
+/// After this method returns, the owned fields (`strm`, `file`, `in_buf`,
+/// `out_buf`) are dropped in turn, releasing every resource — so the teardown
+/// remains leak-free regardless of which close path ran.
 impl Drop for GzState {
     fn drop(&mut self) {
-        // Run the at-most-once guard. If an explicit close()/finish() already
-        // finalized the handle, this returns false and we do nothing further.
-        // Either way, the owned fields (strm, file, in_buf, out_buf) are dropped
+        // Best-effort write-mode finish + at-most-once finalize. For a write
+        // handle that wrote data and was never explicitly closed, this emits the
+        // final deflate block and the gzip trailer (the RAII replacement for
+        // `gzclose_w`, AAP §0.3.2/§0.6.3); for a read handle or an
+        // already-finalized handle it is just the cheap finalize() guard. Any
+        // I/O error is intentionally discarded — a destructor cannot surface
+        // one. The owned fields (strm, file, in_buf, out_buf) are dropped
         // automatically once this method returns, releasing all resources.
-        let _ = self.finalize();
+        let _ = crate::gz::write::finish(self);
     }
 }
 

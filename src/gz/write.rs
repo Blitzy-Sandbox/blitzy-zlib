@@ -979,8 +979,25 @@ pub(crate) fn finish(state: &mut GzState) -> i32 {
 /// gzip trailer is always written even if the caller forgets to finish
 /// explicitly (mirroring `flate2`'s `GzEncoder`).
 ///
-/// The handle is constructed by the `open.rs` layer; tests build one directly
-/// from a [`GzState`].
+/// # Construction
+///
+/// Obtain a write handle from the `gzopen`-family entry points and convert it
+/// into a `GzWriter`, e.g.:
+///
+/// ```no_run
+/// use std::io::Write;
+/// use std::path::Path;
+/// use zlib_rs::gz::{gzopen, GzWriter};
+///
+/// let handle = gzopen(Path::new("out.gz"), "wb").expect("open for writing");
+/// let mut writer = GzWriter::from(handle); // or: handle.into()
+/// writer.write_all(b"hello, gzip").unwrap();
+/// writer.finish();                          // or just drop `writer`
+/// ```
+///
+/// The handle must be open for writing (a `"w"`/`"a"` mode); a read handle is
+/// accepted but inert (writes fail and the [`Drop`] finish is a no-op), matching
+/// the defensive behavior of the C `gzwrite` family.
 pub struct GzWriter {
     state: GzState,
 }
@@ -989,6 +1006,25 @@ impl GzWriter {
     /// Wrap an already-opened write-mode [`GzState`] in a [`GzWriter`].
     pub(crate) fn new(state: GzState) -> GzWriter {
         GzWriter { state }
+    }
+
+    /// Wrap a write-mode handle returned by the `gzopen`-family entry points
+    /// (a `Box<`[`GzState`]`>`) in an idiomatic [`std::io::Write`] adapter
+    /// (AAP §0.3.2 — "impl Read/Write/BufRead/Seek for the gzip layer").
+    ///
+    /// This is the public constructor for [`GzWriter`]: the C-style
+    /// [`gzopen`](crate::gz::open::gzopen) returns the opaque
+    /// `Box<`[`GzState`]`>` handle, and this converts it into the streaming
+    /// `Write` wrapper so external code can use it in any `std::io` pipeline
+    /// (`write!`, [`std::io::copy`], `BufWriter`, …). See also the
+    /// [`From<Box<GzState>>`](#impl-From%3CBox%3CGzState%3E%3E-for-GzWriter)
+    /// conversion (`handle.into()`).
+    ///
+    /// The handle should be open for writing; a read handle is accepted but
+    /// inert (see the type-level docs).
+    #[must_use]
+    pub fn from_handle(handle: Box<GzState>) -> GzWriter {
+        GzWriter { state: *handle }
     }
 
     /// Borrow the underlying [`GzState`].
@@ -1001,6 +1037,16 @@ impl GzWriter {
     /// alive (a subsequent [`Drop`] is a no-op).
     pub fn finish(&mut self) -> i32 {
         finish(&mut self.state)
+    }
+}
+
+/// Convert a `gzopen`-family write handle (`Box<`[`GzState`]`>`) into the
+/// idiomatic [`std::io::Write`] adapter, so `handle.into()` works alongside the
+/// explicit [`GzWriter::from_handle`] constructor (AAP §0.3.2). Equivalent to
+/// `GzWriter::from_handle(handle)`.
+impl From<Box<GzState>> for GzWriter {
+    fn from(handle: Box<GzState>) -> GzWriter {
+        GzWriter::from_handle(handle)
     }
 }
 
