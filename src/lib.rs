@@ -187,6 +187,18 @@ pub mod deflate;
 #[allow(dead_code)]
 pub mod gz;
 
+// The C-ABI drop-in shim: `#[no_mangle] extern "C"` functions whose names and
+// signatures match the zlib C API exactly, operating over `#[repr(C)]`
+// structures and delegating to the safe engines above. Gated by the non-default
+// `capi` feature so the canonical zlib symbol names (`deflate`, `inflate`,
+// `crc32`, ...) are NOT linked during `cargo test`, where the development-only
+// `flate2` oracle pulls in canonical C zlib and would otherwise collide
+// (duplicate symbols). The cdylib/staticlib drop-in build enables `capi`
+// explicitly. This is the crate's designated `unsafe` FFI boundary (AAP
+// §0.6.2); the compression engines remain 100% safe Rust.
+#[cfg(feature = "capi")]
+pub mod ffi;
+
 // ---------------------------------------------------------------------------
 // Public re-exports — the flat API surface (mirrors zlib.h's namespace)
 // ---------------------------------------------------------------------------
