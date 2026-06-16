@@ -656,9 +656,18 @@ pub fn gzeof(state: &GzState) -> bool {
 /// `"<path>: <message>"` text (or [`None`] when there is no message — the
 /// idiomatic equivalent of C's empty string). For [`Z_MEM_ERROR`] the literal
 /// `"out of memory"` is returned without consulting the (deliberately unset)
-/// stored message, matching C exactly. The `crate::ffi` shim writes the code
-/// through the C `int *errnum` out-parameter and returns the message as a
-/// `const char *`.
+/// stored message, matching C exactly.
+///
+/// **Error-disclosure policy (two surfaces):** this safe-Rust entry point
+/// returns the detailed `"<path>: <detail>"` message, which is idiomatic for an
+/// in-process Rust API (mirroring how `std::io::Error` embeds the offending
+/// path for its own caller). The FFI-visible `gzerror` shim does **not** expose
+/// it: it writes the exact code through the C `int *errnum` out-parameter and
+/// returns the fixed `'static` text for that code, so no path/OS/inflate detail
+/// crosses the C ABI. That satisfies the CP2 "fixed `z_errmsg` strings only"
+/// requirement at the external surface while the error *code* stays
+/// bit-identical to C. See the full rationale on `GzState::gz_error` and the
+/// module-level `gzerror` divergence note in `crate::ffi`.
 #[must_use]
 pub fn gzerror(state: &GzState) -> (i32, Option<&str>) {
     // Integrity check (C returns NULL here; unreachable for a well-formed

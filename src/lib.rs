@@ -184,23 +184,25 @@ pub mod util;
 // per-level strategy modules, and the public `deflate*` orchestration plus the
 // idiomatic `Deflate` wrapper (re-exported below). A few C-API entry points
 // (`deflate_init`, `deflate_copy`, `deflate_end`) are consumed only by the
-// (not-yet-present) `extern "C"` FFI shim rather than the idiomatic wrapper, so
-// the scoped `#[allow(dead_code)]` keeps them from tripping the strict
-// `-D warnings` policy until that shim lands. The attribute on the module
-// declaration propagates to the whole `deflate` subtree.
+// `capi`-gated `extern "C"` FFI shim (`crate::ffi`) rather than by the idiomatic
+// wrapper, so in the default build — where `capi` is off and the shim is not
+// compiled — they have no in-crate caller. The scoped `#[allow(dead_code)]`
+// keeps them from tripping the strict `-D warnings` policy in that
+// configuration. The attribute on the module declaration propagates to the
+// whole `deflate` subtree.
 #[allow(dead_code)]
 pub mod deflate;
 
 // The gzip FILE-I/O layer (`gzopen`/`gzread`/`gzwrite`/`gzclose`, ...). Gated by
 // the `gz-io` feature (implies `std` + `gzip`), mirroring the C
-// `#ifndef NO_GZCOMPRESS` / `NO_GZIP` build. So far only the `state` foundation
-// (`GzState` + the `Mode`/`How` sentinels + RAII `Drop`) is present; its
-// crate-internal API is consumed by the (not-yet-present) `open`/`read`/`write`/
-// `close` submodules and the `extern "C"` FFI shim rather than by any current
-// in-crate caller, so the scoped `#[allow(dead_code)]` keeps it from tripping
-// the strict `-D warnings` policy until those consumers land (the same rationale
-// as the `deflate` engine root above). The attribute propagates to the whole
-// `gz` subtree.
+// `#ifndef NO_GZCOMPRESS` / `NO_GZIP` build. The `state` foundation (`GzState` +
+// the `Mode`/`How` sentinels + RAII `Drop`) and the `open`/`read`/`write`/
+// `close` submodules are all present; their crate-internal API is consumed by
+// the `capi`-gated `extern "C"` FFI shim (`crate::ffi`) rather than by any
+// in-crate caller, so in the default build — where `capi` is off and the shim
+// is not compiled — the scoped `#[allow(dead_code)]` keeps them from tripping
+// the strict `-D warnings` policy (the same rationale as the `deflate` engine
+// root above). The attribute propagates to the whole `gz` subtree.
 #[cfg(feature = "gz-io")]
 #[allow(dead_code)]
 pub mod gz;

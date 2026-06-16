@@ -411,10 +411,19 @@ pub(crate) fn gz_decomp(state: &mut GzState, mut target: DecompTarget<'_>) -> i3
         // Decompress. `infl` (state.strm), `input` (state.in_buf), and the
         // output slice (state.out_buf or the user buffer) are disjoint borrows.
         let outcome = {
-            let infl = state
-                .strm
-                .state_as_mut::<InflateState>()
-                .expect("inflate state attached (guarded at function entry)");
+            // Defensive, non-panicking access. The inflate engine is attached at
+            // function entry for a decompressing stream, but a corrupted or
+            // partially-finalized `GzState` must yield a zlib error code — never
+            // a panic — matching C's `gz_decomp` recording the error and
+            // returning (this mirrors the `Z_STREAM_ERROR` handling below).
+            let Some(infl) = state.strm.state_as_mut::<InflateState>() else {
+                state.gz_error(
+                    Z_STREAM_ERROR,
+                    Some("internal error: inflate stream corrupt"),
+                );
+                ret = Z_STREAM_ERROR;
+                break;
+            };
             let input = &state.in_buf[state.in_next..state.in_next + state.in_avail];
             match &mut target {
                 DecompTarget::OutBuf => {
@@ -460,6 +469,13 @@ pub(crate) fn gz_decomp(state: &mut GzState, mut target: DecompTarget<'_>) -> i3
                 ret = Z_OK;
                 break;
             }
+            // C parity: the inflate engine's own diagnostic (`strm->msg`, e.g.
+            // "incorrect data check") is copied into the gz error exactly as C
+            // `gz_decomp` does (`gzread.c`). It is surfaced verbatim by the
+            // safe-Rust `gzerror`; the FFI-visible `gzerror` instead returns the
+            // fixed `'static` text for the code, so no path/inflate detail
+            // crosses the C ABI. See the error-disclosure note on
+            // `GzState::gz_error`.
             let msg = outcome.msg.unwrap_or("compressed data error");
             state.gz_error(Z_DATA_ERROR, Some(msg));
             break;

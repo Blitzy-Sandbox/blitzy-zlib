@@ -42,15 +42,17 @@
 //!
 //! # Memory ownership (AAP §0.6.3)
 //!
-//! The engine state is owned by a [`Box`] whose raw pointer is parked in
-//! `z_stream.state` between calls (`Box::into_raw` on init, `Box::from_raw` +
-//! drop on end). The C `zalloc`/`zfree`/`opaque` allocator hooks are accepted
-//! at the ABI (a [`CAllocator`] adapts them to the safe [`Allocator`] trait);
-//! when they are null the global allocator is used. Because the safe engines
-//! allocate their working buffers through the global allocator, the engine's
-//! internal allocations always use the global allocator regardless of the
-//! supplied hooks — the common `Z_NULL` allocator path (used by `flate2`, the C
-//! smoke tests, and typical C callers) is byte-for-byte faithful.
+//! The engine **state object** (`DeflateState`, the `InflateFfi` wrapping an
+//! inlined `InflateState`, and `InflateBackFfi`) is allocated through the
+//! stream's `zalloc` hook and parked as a raw pointer in `z_stream.state`
+//! between calls; `deflateEnd`/`inflateEnd`/`inflateBackEnd` release it through
+//! the matching `zfree` hook after the state's RAII `Drop` frees its owned
+//! working buffers (the FFI allocator bridge — see the detailed "custom
+//! allocators" note in Phase B below). When the caller leaves `zalloc`/`zfree`
+//! null they are defaulted to a global-allocator-backed implementation, exactly
+//! as C `deflateInit_`/`inflateInit_` do, so custom-allocator callers and the
+//! common `Z_NULL` path (used by `flate2`, the C smoke tests, and typical C
+//! callers) are alike byte-for-byte faithful.
 
 // Chosen gate: `capi` is present in Cargo.toml. This inner `#![cfg]` makes the
 // file self-documenting and inert outside the C-ABI build even if `lib.rs` were
@@ -62,10 +64,12 @@
 #![allow(non_camel_case_types)]
 #![allow(clippy::missing_safety_doc)] // every fn documents safety in prose + // SAFETY: blocks.
 
+use core::alloc::Layout;
 use core::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use core::ptr;
 use core::slice;
 
+use alloc::alloc::{alloc as global_alloc, dealloc as global_dealloc};
 use alloc::boxed::Box;
 
 // Engine modules are reached through aliased paths so the canonical
@@ -304,19 +308,183 @@ pub const DEF_MEM_LEVEL: c_int = crate::constants::DEF_MEM_LEVEL;
 // Phase B — internal-state marshalling helpers (the unsafe core of this file)
 // ===========================================================================
 //
-// NOTE on custom allocators (AAP §0.6.3). The C `z_stream` carries optional
-// `zalloc`/`zfree`/`opaque` allocator hooks, and they are faithfully preserved
-// as ABI fields here. However, the safe-Rust engines allocate their working
-// buffers and state through Rust's *global* allocator (owned `Box`/`Vec`), and
-// their constructors (`deflate_init2`/`inflate_init2`) do not accept an
-// allocator. Routing those owned allocations through arbitrary C `zalloc`/
-// `zfree` is not expressible without unsound `Box<[u8]>`/free-mismatch hazards,
-// so this shim **accepts** the hooks for ABI compatibility but performs all
-// internal allocation through the global allocator. The ubiquitous `Z_NULL`
-// allocator path (used by `flate2`, the C smoke tests, and the overwhelming
-// majority of C callers) is therefore byte-for-byte faithful; callers that
-// supply custom hooks still interoperate, but their hooks do not redirect the
-// engine's internal allocations in this implementation.
+// NOTE on custom allocators (AAP §0.6.3) — the FFI allocator bridge.
+//
+// The C `z_stream` carries optional `zalloc`/`zfree`/`opaque` allocator hooks.
+// This shim implements a genuine allocator bridge for the engine **state
+// object** — the `void* internal_state` that C zlib allocates with its first
+// `ZALLOC` call:
+//
+//   * `deflateInit2_`/`inflateInit2_`/`inflateBackInit_` default a null
+//     `zalloc`/`zfree` to `default_zalloc`/`default_zfree` and reset `opaque`
+//     to null, exactly as C `deflateInit_`/`inflateInit_` do; a caller's custom
+//     hooks are preserved verbatim.
+//   * The engine state container (`DeflateState`, the `InflateFfi` wrapping an
+//     inlined `InflateState`, and `InflateBackFfi`) is allocated through the
+//     stream's `zalloc` via `ffi_alloc_state` and released through the matching
+//     `zfree` via `ffi_free_state`. Custom C allocators are thus genuinely
+//     *called* for the primary state allocation and *balanced* on teardown /
+//     copy, and `deflateStateCheck`/`inflateStateCheck` parity is preserved (a
+//     stream whose hooks are null after init is rejected with `Z_STREAM_ERROR`).
+//
+// The engines' *secondary* working buffers (the deflate `window`/`pending_buf`
+// and the inflate `window`/`codes`) remain owned `Vec`/`Box` backed by Rust's
+// global allocator: routing those through arbitrary C hooks is not expressible
+// on stable Rust without `Box<[u8]>`/free-mismatch hazards or pervasive
+// `unsafe` inside the safe compression core, which AAP §0.6.2 forbids ("zero
+// unsafe blocks in core compression logic"). This matches the common `Z_NULL`
+// path byte-for-byte (where `default_zalloc` is itself global-backed) and keeps
+// custom-hook callers fully interoperable, with their hooks invoked for the
+// state object that dominates the per-stream control allocation.
+
+/// Header reserved ahead of every [`default_zalloc`] block to record the total
+/// `Layout` size for [`default_zfree`]. Sized — and the whole block aligned —
+/// to 16 bytes (`max_align_t` on the common targets), so the returned user
+/// pointer satisfies the alignment of every `z_stream` state object (all ≤ 8)
+/// and matches the alignment guarantee of C `malloc`.
+const DEFAULT_ALLOC_HEADER: usize = 16;
+/// Alignment of every [`default_zalloc`] block (see [`DEFAULT_ALLOC_HEADER`]).
+const DEFAULT_ALLOC_ALIGN: usize = 16;
+
+/// Default `zalloc` hook — a global-allocator-backed implementation of the C
+/// `zcalloc` contract (zutil.c). Installed by the `*Init2_` constructors when
+/// the caller leaves `z_stream.zalloc` null, so the ubiquitous `Z_NULL` path
+/// still routes the state allocation through a real hook. `no_std`-clean (uses
+/// the `alloc` crate). Like C `zcalloc` on modern targets (`sizeof(uInt) > 2`),
+/// it returns *uninitialized* `items * size` bytes (the state is fully written
+/// by [`ffi_alloc_state`] immediately after).
+///
+/// # Safety
+///
+/// This is a C-ABI function pointer; `opaque` is ignored. The returned pointer,
+/// if non-null, must be released only via [`default_zfree`].
+unsafe extern "C" fn default_zalloc(_opaque: voidpf, items: uInt, size: uInt) -> voidpf {
+    // C `ZALLOC` semantics: total user bytes = items * size. Compute in usize
+    // with an overflow guard (a hostile/huge request fails closed → null).
+    let bytes = match (items as usize).checked_mul(size as usize) {
+        Some(n) if n != 0 => n,
+        _ => return ptr::null_mut(),
+    };
+    let total = match bytes.checked_add(DEFAULT_ALLOC_HEADER) {
+        Some(n) => n,
+        None => return ptr::null_mut(),
+    };
+    let Ok(layout) = Layout::from_size_align(total, DEFAULT_ALLOC_ALIGN) else {
+        return ptr::null_mut();
+    };
+    // SAFETY: `layout` has a non-zero size (the header alone is 16 bytes).
+    let base = unsafe { global_alloc(layout) };
+    if base.is_null() {
+        return ptr::null_mut();
+    }
+    // Record the total size in the header so `default_zfree` can rebuild the
+    // exact `Layout`.
+    // SAFETY: `base` is non-null and owns ≥ `DEFAULT_ALLOC_HEADER` writable,
+    // 16-aligned bytes; a `usize` write at the base is in bounds and aligned.
+    unsafe { ptr::write(base as *mut usize, total) };
+    // SAFETY: `base + DEFAULT_ALLOC_HEADER` is within the allocation and is the
+    // 16-aligned user region.
+    unsafe { base.add(DEFAULT_ALLOC_HEADER) as voidpf }
+}
+
+/// Default `zfree` hook — the teardown counterpart of [`default_zalloc`].
+///
+/// # Safety
+///
+/// `address` must be null or a pointer previously returned by
+/// [`default_zalloc`] (and not yet freed).
+unsafe extern "C" fn default_zfree(_opaque: voidpf, address: voidpf) {
+    if address.is_null() {
+        return;
+    }
+    // Recover the allocation base and the stored layout size.
+    // SAFETY: `address` came from `default_zalloc`, so `DEFAULT_ALLOC_HEADER`
+    // bytes precede it and the leading `usize` holds the total layout size.
+    let base = unsafe { (address as *mut u8).sub(DEFAULT_ALLOC_HEADER) };
+    let total = unsafe { ptr::read(base as *const usize) };
+    let Ok(layout) = Layout::from_size_align(total, DEFAULT_ALLOC_ALIGN) else {
+        // Unreachable for our own allocations; never free under a bad layout.
+        return;
+    };
+    // SAFETY: `base`/`layout` exactly reconstruct the original allocation.
+    unsafe { global_dealloc(base, layout) };
+}
+
+/// Allocate the `z_stream.state` container of type `T` through the stream's
+/// `zalloc` hook and move `value` into it — the FFI allocator bridge mandated by
+/// AAP §0.6.3. Mirrors C `ZALLOC(strm, 1, sizeof(state))`.
+///
+/// Returns [`None`] (→ `Z_MEM_ERROR` at the call site) when `zalloc` is null,
+/// the hook returns null, or the hook returns memory insufficiently aligned for
+/// `T`; an under-aligned block is released through `zfree` before returning so
+/// no memory leaks on the failure path.
+///
+/// # Safety
+///
+/// `zalloc`/`zfree` (if `Some`) must be valid C allocator hooks and `opaque`
+/// the context they expect. The returned pointer must be released only via
+/// [`ffi_free_state`] with the matching `zfree`/`opaque`.
+unsafe fn ffi_alloc_state<T>(
+    value: T,
+    zalloc: alloc_func,
+    zfree: free_func,
+    opaque: voidpf,
+) -> Option<*mut T> {
+    let zalloc = zalloc?;
+    let size = core::mem::size_of::<T>();
+    debug_assert!(size != 0, "z_stream state types are never zero-sized");
+    // SAFETY: `zalloc` is a valid hook; request a single object of
+    // `size_of::<T>()` bytes — exactly C `ZALLOC(strm, 1, sizeof(state))`.
+    let raw = unsafe { zalloc(opaque, 1, size as uInt) };
+    if raw.is_null() {
+        return None;
+    }
+    if (raw as usize) % core::mem::align_of::<T>() != 0 {
+        // A pathological hook returned under-aligned memory: release it through
+        // the matching `zfree` and fail closed rather than risk a misaligned
+        // write/read.
+        if let Some(free) = zfree {
+            // SAFETY: `raw` was just produced by the paired `zalloc`.
+            unsafe { free(opaque, raw) };
+        }
+        return None;
+    }
+    let typed = raw as *mut T;
+    // SAFETY: `typed` is non-null, suitably aligned, and points to
+    // `size_of::<T>()` bytes we own exclusively; move `value` into place
+    // without dropping the (uninitialized) destination.
+    unsafe { ptr::write(typed, value) };
+    Some(typed)
+}
+
+/// Drop the `T` behind a `z_stream.state` container and release the container
+/// through the stream's `zfree` hook — the teardown counterpart of
+/// [`ffi_alloc_state`] (RAII replaces C's `ZFREE`). Running `drop_in_place`
+/// first frees `T`'s owned (global) `Vec`/`Box` buffers; `zfree` then releases
+/// the container through the same hook that allocated it.
+///
+/// A null `zfree` is a corrupted stream (C `deflateStateCheck`/
+/// `inflateStateCheck` reject it); callers gate on that and return
+/// `Z_STREAM_ERROR` before reaching teardown, so by the time we are here `zfree`
+/// is the hook paired with the original `zalloc`.
+///
+/// # Safety
+///
+/// `ptr` must have been produced by [`ffi_alloc_state`] with the same
+/// `zfree`/`opaque` and must not be used afterwards.
+unsafe fn ffi_free_state<T>(ptr: *mut T, zfree: free_func, opaque: voidpf) {
+    if ptr.is_null() {
+        return;
+    }
+    // SAFETY: `ptr` is a live, uniquely-owned `T` from `ffi_alloc_state`; drop
+    // it in place to release its owned buffers before the container memory goes.
+    unsafe { ptr::drop_in_place(ptr) };
+    if let Some(free) = zfree {
+        // SAFETY: `ptr` came from the paired `zalloc`; hand the same address
+        // back to `zfree`.
+        unsafe { free(opaque, ptr as voidpf) };
+    }
+}
 
 /// The `z_stream.state` payload for an **inflate** stream.
 ///
@@ -325,8 +493,11 @@ pub const DEF_MEM_LEVEL: c_int = crate::constants::DEF_MEM_LEVEL;
 /// header metadata after each [`inflate`] call (the safe engine fills its own
 /// owned [`GzHeader`]; this shim copies it out into the C struct).
 struct InflateFfi {
-    /// The boxed safe-engine decode state.
-    state: Box<InflateState>,
+    /// The (unboxed) safe-engine decode state, stored inline so the FFI
+    /// allocator bridge ([`ffi_alloc_state`]) places the *whole* `InflateState`
+    /// — the analogue of C's `ZALLOC`'d `inflate_state` — in the caller's
+    /// (or defaulted) allocator memory, not in a separate global `Box`.
+    state: InflateState,
     /// The caller's `gz_header` sink from `inflateGetHeader`, or null. Only read
     /// on the gzip path (header mirroring); kept unconditionally so the storage
     /// layout is identical across feature sets.
@@ -470,15 +641,15 @@ unsafe fn cstr_to_vec(ptr: *const c_char) -> alloc::vec::Vec<u8> {
 
 /// Borrow the boxed [`DeflateState`] parked in `strm.state`.
 ///
-/// Returns [`None`] when `strm` or `strm.state` is null (the C `Z_STREAM_ERROR`
-/// preconditions). The returned mutable reference points into the heap-owned
-/// `Box<DeflateState>` installed by `deflateInit*`, an allocation disjoint from
-/// `*strm` itself.
+/// Returns [`None`] when `strm` or `strm.state` is null, or when the allocator
+/// hooks are null (the C `deflateStateCheck` `Z_STREAM_ERROR` preconditions).
+/// The returned mutable reference points into the hook-allocated `DeflateState`
+/// installed by `deflateInit*`, an allocation disjoint from `*strm` itself.
 ///
 /// # Safety
 ///
 /// `strm` must be null or a valid `z_stream` whose `state` (if non-null) was
-/// produced by this crate's `deflateInit*` (i.e. is a `Box::into_raw`
+/// produced by this crate's `deflateInit*` (i.e. is an [`ffi_alloc_state`]
 /// [`DeflateState`]). The caller must not create a second alias to the same
 /// state while the returned reference is live.
 #[inline]
@@ -486,13 +657,19 @@ unsafe fn deflate_state<'a>(strm: z_streamp) -> Option<&'a mut DeflateState> {
     if strm.is_null() {
         return None;
     }
+    // C `deflateStateCheck` parity: a stream whose allocator hooks were cleared
+    // (or never defaulted) is invalid — reject it before touching `state`.
+    // SAFETY: strm is non-null; read the hook fields by value.
+    if unsafe { (*strm).zalloc }.is_none() || unsafe { (*strm).zfree }.is_none() {
+        return None;
+    }
     // SAFETY: strm is non-null; read its `state` field by value.
     let state_ptr = unsafe { (*strm).state } as *mut DeflateState;
     if state_ptr.is_null() {
         return None;
     }
-    // SAFETY: state_ptr was produced by `deflateInit*` via Box::into_raw and is
-    // a unique, valid DeflateState for the duration of this borrow.
+    // SAFETY: state_ptr was produced by `deflateInit*` via `ffi_alloc_state` and
+    // is a unique, valid DeflateState for the duration of this borrow.
     Some(unsafe { &mut *state_ptr })
 }
 
@@ -517,16 +694,30 @@ unsafe fn version_ok(version: *const c_char, stream_size: c_int) -> bool {
         && stream_size as usize == core::mem::size_of::<z_stream>()
 }
 
-/// Install a freshly-initialized boxed [`DeflateState`] into `strm`, seeding the
-/// public `z_stream` accounting fields exactly as C `deflateReset` does.
+/// Install a freshly-initialized [`DeflateState`] into `strm` through the FFI
+/// allocator bridge, seeding the public `z_stream` accounting fields exactly as
+/// C `deflateReset` does. Returns `false` (→ `Z_MEM_ERROR`) if the allocator
+/// hook cannot provide suitably-aligned storage for the state container.
 ///
 /// # Safety
 ///
-/// `strm` must be non-null and valid for writes.
-unsafe fn attach_deflate_state(strm: z_streamp, boxed: Box<DeflateState>) {
+/// `strm` must be non-null and valid for reads/writes, and its `zalloc`/`zfree`
+/// hooks must already be defaulted (non-null) by the calling constructor.
+unsafe fn attach_deflate_state(strm: z_streamp, boxed: Box<DeflateState>) -> bool {
     let adler = boxed.adler;
     let data_type = boxed.data_type;
-    let raw = Box::into_raw(boxed);
+    // Move the state out of its temporary global `Box` and re-home it in
+    // allocator-hook memory (the FFI allocator bridge). The `Box` backing is
+    // released here; the `DeflateState`'s own `Vec`/`Box` buffers move with it.
+    let state: DeflateState = *boxed;
+    // SAFETY: strm is non-null and valid for reads; the hooks were defaulted by
+    // the constructor, so they are non-null.
+    let (zalloc, zfree, opaque) = unsafe { ((*strm).zalloc, (*strm).zfree, (*strm).opaque) };
+    // SAFETY: the hooks are valid C allocator hooks; allocate the state
+    // container through `zalloc` and move the engine state into it.
+    let Some(raw) = (unsafe { ffi_alloc_state(state, zalloc, zfree, opaque) }) else {
+        return false;
+    };
     // SAFETY: strm is non-null and valid for writes per the caller's contract.
     unsafe {
         (*strm).state = raw as *mut c_void;
@@ -536,6 +727,7 @@ unsafe fn attach_deflate_state(strm: z_streamp, boxed: Box<DeflateState>) {
         (*strm).adler = adler as uLong;
         (*strm).data_type = data_type;
     }
+    true
 }
 
 /// `deflateInit2_` — the real deflate constructor (zlib.h L1907-1910).
@@ -567,16 +759,30 @@ pub unsafe extern "C" fn deflateInit2_(
         return Z_VERSION_ERROR;
     }
     // SAFETY: strm is non-null; clear the internal-state slot before init so a
-    // failure leaves a well-defined null state (matching C).
+    // failure leaves a well-defined null state, and default the allocator hooks
+    // exactly as C `deflateInit2_` does (null `zalloc` → `default_zalloc` +
+    // `opaque = NULL`; null `zfree` → `default_zfree`).
     unsafe {
         (*strm).msg = ptr::null();
         (*strm).state = ptr::null_mut();
+        if (*strm).zalloc.is_none() {
+            (*strm).zalloc = Some(default_zalloc);
+            (*strm).opaque = ptr::null_mut();
+        }
+        if (*strm).zfree.is_none() {
+            (*strm).zfree = Some(default_zfree);
+        }
     }
     match dfl::deflate_init2(level, method, window_bits, mem_level, strategy) {
         Ok(boxed) => {
-            // SAFETY: strm is non-null and valid for writes.
-            unsafe { attach_deflate_state(strm, boxed) };
-            Z_OK
+            // SAFETY: strm is non-null and valid for writes; the hooks were just
+            // defaulted, so the state container can be hook-allocated.
+            if unsafe { attach_deflate_state(strm, boxed) } {
+                Z_OK
+            } else {
+                // The allocator hook could not provide aligned state storage.
+                Z_MEM_ERROR
+            }
         }
         Err(e) => {
             // SAFETY: strm non-null; report the failure like C's ERR_MSG.
@@ -658,7 +864,18 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
             (*strm).avail_out,
         )
     };
-    // SAFETY: the C contract guarantees these (ptr, len) pairs are valid.
+    // C `deflate` pointer/length contract (deflate.c): a null `next_out`, or a
+    // null `next_in` paired with a nonzero `avail_in`, is `Z_STREAM_ERROR` — not
+    // a silently-empty buffer. Validate BEFORE constructing the slices so a
+    // `(NULL, nonzero)` pair never becomes an empty slice (the silent
+    // data-loss/wrong-result hazard). A null pointer with a zero length stays
+    // permitted, exactly as C allows.
+    if out_ptr.is_null() || (in_len != 0 && in_ptr.is_null()) {
+        // SAFETY: strm non-null.
+        unsafe { (*strm).msg = msg_to_cstr(Some("stream error")) };
+        return Z_STREAM_ERROR;
+    }
+    // SAFETY: the (ptr, len) pairs were just validated against the C contract.
     let input = unsafe { const_slice(in_ptr, in_len) };
     let output = unsafe { mut_slice(out_ptr, out_len) };
     // SAFETY: state_ptr is a valid, uniquely-borrowed DeflateState.
@@ -702,8 +919,9 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
 /// `deflateEnd` — finalize and release a deflate stream (zlib.h L367).
 ///
 /// Reports C's "interrupted mid-compression?" status via
-/// [`crate::deflate::deflate_end`], then drops the boxed state (RAII replaces
-/// C's `ZFREE`) and nulls `strm.state`.
+/// [`crate::deflate::deflate_end`], then frees the state container through the
+/// stream's `zfree` hook (RAII drop of the state runs first, replacing C's
+/// `ZFREE` of the working buffers) and nulls `strm.state`.
 ///
 /// # Safety
 ///
@@ -713,15 +931,24 @@ pub unsafe extern "C" fn deflateEnd(strm: z_streamp) -> c_int {
     if strm.is_null() {
         return Z_STREAM_ERROR;
     }
+    // C `deflateStateCheck` parity: null allocator hooks make the stream invalid
+    // (and we need a valid `zfree` to release the hook-allocated container).
+    // SAFETY: strm non-null; read the hook fields by value.
+    if unsafe { (*strm).zalloc }.is_none() || unsafe { (*strm).zfree }.is_none() {
+        return Z_STREAM_ERROR;
+    }
     // SAFETY: strm non-null; read the state pointer.
     let state_ptr = unsafe { (*strm).state } as *mut DeflateState;
     if state_ptr.is_null() {
         return Z_STREAM_ERROR;
     }
-    // SAFETY: state_ptr is the Box::into_raw'd DeflateState; reclaim ownership.
-    let boxed = unsafe { Box::from_raw(state_ptr) };
-    let status = dfl::deflate_end(&boxed);
-    drop(boxed);
+    // SAFETY: state_ptr is the live, uniquely-owned DeflateState produced by
+    // `attach_deflate_state`; borrow it to compute the C return status.
+    let status = dfl::deflate_end(unsafe { &*state_ptr });
+    // Free the state container through the matching `zfree` hook.
+    // SAFETY: state_ptr came from `ffi_alloc_state` with this stream's hooks.
+    let (zfree, opaque) = unsafe { ((*strm).zfree, (*strm).opaque) };
+    unsafe { ffi_free_state(state_ptr, zfree, opaque) };
     // SAFETY: strm non-null; clear the now-dangling state pointer.
     unsafe { (*strm).state = ptr::null_mut() };
     result_to_code(status)
@@ -927,7 +1154,13 @@ pub unsafe extern "C" fn deflateCopy(dest: z_streamp, source: z_streamp) -> c_in
         return Z_STREAM_ERROR;
     };
     let cloned = dfl::deflate_copy(src_state);
-    // SAFETY: source non-null (validated); copy the public accounting fields.
+    // Move the clone out of its temporary global `Box` so it can be re-homed in
+    // dest's allocator-hook memory below.
+    let state: DeflateState = *cloned;
+    // SAFETY: source non-null (validated); copy the public accounting fields,
+    // including the allocator hooks — `dest` inherits source's `zalloc`/`zfree`/
+    // `opaque`, mirroring C `deflateCopy`'s `zmemcpy` of the whole `z_stream`
+    // followed by a `ZALLOC` on `dest` with those (inherited) hooks.
     unsafe {
         (*dest).next_in = (*source).next_in;
         (*dest).avail_in = (*source).avail_in;
@@ -943,9 +1176,17 @@ pub unsafe extern "C" fn deflateCopy(dest: z_streamp, source: z_streamp) -> c_in
         (*dest).opaque = (*source).opaque;
         (*dest).reserved = 0;
     }
-    // SAFETY: dest is non-null and valid for writes.
-    let raw = Box::into_raw(cloned);
-    // SAFETY: dest non-null; install the cloned state.
+    // Allocate dest's state container through dest's (now-inherited) hooks.
+    // SAFETY: dest non-null; the hooks were just copied from the valid source.
+    let (zalloc, zfree, opaque) = unsafe { ((*dest).zalloc, (*dest).zfree, (*dest).opaque) };
+    let Some(raw) = (unsafe { ffi_alloc_state(state, zalloc, zfree, opaque) }) else {
+        // Allocation failure: leave dest with no installed state, matching C
+        // `deflateCopy` returning `Z_MEM_ERROR`.
+        // SAFETY: dest non-null and valid for writes.
+        unsafe { (*dest).state = ptr::null_mut() };
+        return Z_MEM_ERROR;
+    };
+    // SAFETY: dest non-null; install the cloned state container.
     unsafe { (*dest).state = raw as *mut c_void };
     Z_OK
 }
@@ -1128,11 +1369,17 @@ unsafe fn c_head_to_rust(head: gz_headerp) -> GzHeader {
 /// # Safety
 ///
 /// `strm` must be null or a valid `z_stream` whose `state` (if non-null) was
-/// produced by this crate's `inflateInit*` (i.e. is a `Box::into_raw`
+/// produced by this crate's `inflateInit*` (i.e. is an [`ffi_alloc_state`]
 /// [`InflateFfi`]).
 #[inline]
 unsafe fn inflate_ffi<'a>(strm: z_streamp) -> Option<&'a mut InflateFfi> {
     if strm.is_null() {
+        return None;
+    }
+    // C `inflateStateCheck` parity: a stream whose allocator hooks were cleared
+    // (or never defaulted) is invalid — reject it before touching `state`.
+    // SAFETY: strm is non-null; read the hook fields by value.
+    if unsafe { (*strm).zalloc }.is_none() || unsafe { (*strm).zfree }.is_none() {
         return None;
     }
     // SAFETY: strm is non-null; read its `state` field by value.
@@ -1140,7 +1387,7 @@ unsafe fn inflate_ffi<'a>(strm: z_streamp) -> Option<&'a mut InflateFfi> {
     if ffi_ptr.is_null() {
         return None;
     }
-    // SAFETY: ffi_ptr was produced by `inflateInit*` via Box::into_raw.
+    // SAFETY: ffi_ptr was produced by `inflateInit*` via ffi_alloc_state.
     Some(unsafe { &mut *ffi_ptr })
 }
 
@@ -1222,20 +1469,40 @@ pub unsafe extern "C" fn inflateInit2_(
     if !unsafe { version_ok(version, stream_size) } {
         return Z_VERSION_ERROR;
     }
-    // SAFETY: strm non-null; clear the state slot before init.
+    // SAFETY: strm non-null; clear the state slot before init, and default the
+    // allocator hooks exactly as C `inflateInit2_` does (null `zalloc` →
+    // `default_zalloc` + `opaque = NULL`; null `zfree` → `default_zfree`).
     unsafe {
         (*strm).msg = ptr::null();
         (*strm).state = ptr::null_mut();
+        if (*strm).zalloc.is_none() {
+            (*strm).zalloc = Some(default_zalloc);
+            (*strm).opaque = ptr::null_mut();
+        }
+        if (*strm).zfree.is_none() {
+            (*strm).zfree = Some(default_zfree);
+        }
     }
     match inf::inflate_init2(window_bits) {
-        Ok(state) => {
+        Ok(boxed_state) => {
             // The initial public Adler is `wrap & 1` (1 for zlib, 0 for gzip/raw).
-            let adler = (state.wrap & 1) as uLong;
-            let ffi = Box::new(InflateFfi {
-                state,
+            let adler = (boxed_state.wrap & 1) as uLong;
+            // Move the state out of its temporary global `Box`; it is re-homed
+            // inline (alongside the `head` sink) in allocator-hook memory below.
+            let ffi = InflateFfi {
+                state: *boxed_state,
                 head: ptr::null_mut(),
-            });
-            let raw = Box::into_raw(ffi);
+            };
+            // SAFETY: strm non-null; the hooks were just defaulted (non-null).
+            let (zalloc, zfree, opaque) =
+                unsafe { ((*strm).zalloc, (*strm).zfree, (*strm).opaque) };
+            // SAFETY: valid hooks; allocate the `InflateFfi` container through
+            // them (the FFI allocator bridge).
+            let Some(raw) = (unsafe { ffi_alloc_state(ffi, zalloc, zfree, opaque) }) else {
+                // SAFETY: strm non-null; report OOM like C's ERR_MSG.
+                unsafe { (*strm).msg = msg_to_cstr(Some("insufficient memory")) };
+                return Z_MEM_ERROR;
+            };
             // SAFETY: strm non-null and valid for writes.
             unsafe {
                 (*strm).state = raw as *mut c_void;
@@ -1295,7 +1562,15 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
             (*strm).avail_out,
         )
     };
-    // SAFETY: the C contract guarantees these (ptr, len) pairs are valid.
+    // C `inflate` pointer/length contract (inflate.c): a null `next_out`, or a
+    // null `next_in` paired with a nonzero `avail_in`, is `Z_STREAM_ERROR` — not
+    // a silently-empty buffer. Validate BEFORE constructing the slices so a
+    // `(NULL, nonzero)` pair never becomes an empty slice. A null pointer with a
+    // zero length stays permitted, exactly as C allows.
+    if out_ptr.is_null() || (in_len != 0 && in_ptr.is_null()) {
+        return Z_STREAM_ERROR;
+    }
+    // SAFETY: the (ptr, len) pairs were just validated against the C contract.
     let input = unsafe { const_slice(in_ptr, in_len) };
     let output = unsafe { mut_slice(out_ptr, out_len) };
     // SAFETY: ffi_ptr is a valid, uniquely-borrowed InflateFfi.
@@ -1346,15 +1621,23 @@ pub unsafe extern "C" fn inflateEnd(strm: z_streamp) -> c_int {
     if strm.is_null() {
         return Z_STREAM_ERROR;
     }
+    // C `inflateStateCheck` parity: null allocator hooks make the stream invalid
+    // (and we need a valid `zfree` to release the hook-allocated container).
+    // SAFETY: strm non-null; read the hook fields by value.
+    if unsafe { (*strm).zalloc }.is_none() || unsafe { (*strm).zfree }.is_none() {
+        return Z_STREAM_ERROR;
+    }
     // SAFETY: strm non-null; read the state pointer.
     let ffi_ptr = unsafe { (*strm).state } as *mut InflateFfi;
     if ffi_ptr.is_null() {
         return Z_STREAM_ERROR;
     }
-    // SAFETY: ffi_ptr is the Box::into_raw'd InflateFfi; reclaim and unwrap it.
-    let ffi = unsafe { *Box::from_raw(ffi_ptr) };
-    // `inflate_end` consumes the boxed InflateState (deterministic teardown).
-    inf::inflate_end(ffi.state);
+    // Free the `InflateFfi` container through the matching `zfree` hook; the
+    // RAII drop of the inlined `InflateState` (deterministic teardown — the
+    // `inflateEnd` analogue) runs first and releases its owned buffers.
+    // SAFETY: ffi_ptr came from `ffi_alloc_state` with this stream's hooks.
+    let (zfree, opaque) = unsafe { ((*strm).zfree, (*strm).opaque) };
+    unsafe { ffi_free_state(ffi_ptr, zfree, opaque) };
     // SAFETY: strm non-null; clear the now-dangling state pointer.
     unsafe { (*strm).state = ptr::null_mut() };
     Z_OK
@@ -1577,13 +1860,16 @@ pub unsafe extern "C" fn inflateCopy(dest: z_streamp, source: z_streamp) -> c_in
         return Z_STREAM_ERROR;
     };
     let cloned = inf::inflate_copy(&src_ffi.state);
-    let new_ffi = Box::new(InflateFfi {
-        state: Box::new(cloned),
+    // Build the dest `InflateFfi` value (inlined state + null header sink); it
+    // is re-homed in dest's allocator-hook memory once the hooks are inherited.
+    let new_ffi = InflateFfi {
+        state: cloned,
         head: ptr::null_mut(),
-    });
-    let raw = Box::into_raw(new_ffi);
+    };
     // SAFETY: source non-null (validated); copy the public accounting fields,
-    // then install the cloned state into dest.
+    // including the allocator hooks — dest inherits source's `zalloc`/`zfree`/
+    // `opaque` (mirroring C's whole-`z_stream` copy followed by a `ZALLOC` on
+    // dest with those inherited hooks).
     unsafe {
         (*dest).next_in = (*source).next_in;
         (*dest).avail_in = (*source).avail_in;
@@ -1598,8 +1884,19 @@ pub unsafe extern "C" fn inflateCopy(dest: z_streamp, source: z_streamp) -> c_in
         (*dest).zfree = (*source).zfree;
         (*dest).opaque = (*source).opaque;
         (*dest).reserved = 0;
-        (*dest).state = raw as *mut c_void;
     }
+    // Allocate dest's container through dest's (now-inherited) hooks.
+    // SAFETY: dest non-null; the hooks were just copied from the valid source.
+    let (zalloc, zfree, opaque) = unsafe { ((*dest).zalloc, (*dest).zfree, (*dest).opaque) };
+    let Some(raw) = (unsafe { ffi_alloc_state(new_ffi, zalloc, zfree, opaque) }) else {
+        // Allocation failure: leave dest with no installed state, matching C
+        // returning `Z_MEM_ERROR`.
+        // SAFETY: dest non-null and valid for writes.
+        unsafe { (*dest).state = ptr::null_mut() };
+        return Z_MEM_ERROR;
+    };
+    // SAFETY: dest non-null; install the cloned state container.
+    unsafe { (*dest).state = raw as *mut c_void };
     Z_OK
 }
 
@@ -1781,20 +2078,37 @@ pub unsafe extern "C" fn inflateBackInit_(
     if !unsafe { version_ok(version, stream_size) } {
         return Z_VERSION_ERROR;
     }
-    // SAFETY: strm non-null; clear the state slot before init.
+    // SAFETY: strm non-null; clear the state slot before init, and default the
+    // allocator hooks exactly as C `inflateBackInit_` does.
     unsafe {
         (*strm).msg = ptr::null();
         (*strm).state = ptr::null_mut();
+        if (*strm).zalloc.is_none() {
+            (*strm).zalloc = Some(default_zalloc);
+            (*strm).opaque = ptr::null_mut();
+        }
+        if (*strm).zfree.is_none() {
+            (*strm).zfree = Some(default_zfree);
+        }
     }
     match inf::inflate_back_init(window_bits) {
         Ok(state) => {
             let wsize = state.wsize as usize;
-            let ffi = Box::new(InflateBackFfi {
+            let ffi = InflateBackFfi {
                 state,
                 window,
                 wsize,
-            });
-            let raw = Box::into_raw(ffi);
+            };
+            // SAFETY: strm non-null; the hooks were just defaulted (non-null).
+            let (zalloc, zfree, opaque) =
+                unsafe { ((*strm).zalloc, (*strm).zfree, (*strm).opaque) };
+            // SAFETY: valid hooks; allocate the `InflateBackFfi` container
+            // through them (the FFI allocator bridge).
+            let Some(raw) = (unsafe { ffi_alloc_state(ffi, zalloc, zfree, opaque) }) else {
+                // SAFETY: strm non-null; report OOM like C's ERR_MSG.
+                unsafe { (*strm).msg = msg_to_cstr(Some("insufficient memory")) };
+                return Z_MEM_ERROR;
+            };
             // SAFETY: strm non-null and valid for writes.
             unsafe { (*strm).state = raw as *mut c_void };
             Z_OK
@@ -1880,17 +2194,27 @@ pub unsafe extern "C" fn inflateBackEnd(strm: z_streamp) -> c_int {
     if strm.is_null() {
         return Z_STREAM_ERROR;
     }
+    // C `inflateBackEnd` parity: it requires a valid `zfree` hook (and we need
+    // it to release the hook-allocated container).
+    // SAFETY: strm non-null; read the hook field by value.
+    if unsafe { (*strm).zfree }.is_none() {
+        return Z_STREAM_ERROR;
+    }
     // SAFETY: strm non-null; read the state pointer.
     let ffi_ptr = unsafe { (*strm).state } as *mut InflateBackFfi;
     if ffi_ptr.is_null() {
         return Z_STREAM_ERROR;
     }
-    // SAFETY: ffi_ptr is the Box::into_raw'd InflateBackFfi; reclaim and unwrap.
-    let ffi = unsafe { *Box::from_raw(ffi_ptr) };
-    let ret = inf::inflate_back_end(ffi.state);
+    // Free the `InflateBackFfi` container through the matching `zfree` hook; the
+    // RAII drop of the inlined `InflateState` (the `inflateBackEnd` teardown)
+    // runs first and releases its owned buffers. The caller-owned `window` is a
+    // borrowed raw pointer and is intentionally not freed here.
+    // SAFETY: ffi_ptr came from `ffi_alloc_state` with this stream's hooks.
+    let (zfree, opaque) = unsafe { ((*strm).zfree, (*strm).opaque) };
+    unsafe { ffi_free_state(ffi_ptr, zfree, opaque) };
     // SAFETY: strm non-null; clear the now-dangling state pointer.
     unsafe { (*strm).state = ptr::null_mut() };
-    ret
+    Z_OK
 }
 
 // ===========================================================================
@@ -2092,6 +2416,13 @@ pub unsafe extern "C" fn compress2(
     if dest.is_null() || dest_len.is_null() {
         return Z_STREAM_ERROR;
     }
+    // C one-shot contract: a null `source` paired with a nonzero `source_len`
+    // is invalid (inside C it becomes a null `next_in` with nonzero `avail_in`,
+    // which `deflate` rejects with `Z_STREAM_ERROR`). Reject it here rather than
+    // treating the buffer as silently empty.
+    if source.is_null() && source_len != 0 {
+        return Z_STREAM_ERROR;
+    }
     // SAFETY: dest_len non-null; read the destination capacity.
     let cap = unsafe { *dest_len } as usize;
     // SAFETY: validated (ptr, len) pairs per the contract.
@@ -2120,6 +2451,12 @@ pub unsafe extern "C" fn compress(
     source_len: uLong,
 ) -> c_int {
     if dest.is_null() || dest_len.is_null() {
+        return Z_STREAM_ERROR;
+    }
+    // C one-shot contract: a null `source` paired with a nonzero `source_len`
+    // is invalid (it would be a null `next_in` with nonzero `avail_in` inside
+    // `deflate`). Reject it rather than treating the buffer as silently empty.
+    if source.is_null() && source_len != 0 {
         return Z_STREAM_ERROR;
     }
     // SAFETY: dest_len non-null; read the destination capacity.
@@ -2164,6 +2501,12 @@ pub unsafe extern "C" fn uncompress2(
     // SAFETY: the out-length pointers are non-null; read the capacities.
     let cap = unsafe { *dest_len } as usize;
     let src_len = unsafe { *source_len } as usize;
+    // C one-shot contract: a null `source` paired with a nonzero `*source_len`
+    // is invalid (it would be a null `next_in` with nonzero `avail_in` inside
+    // `inflate`). Reject it rather than treating the buffer as silently empty.
+    if source.is_null() && src_len != 0 {
+        return Z_STREAM_ERROR;
+    }
     // SAFETY: validated (ptr, len) pairs per the contract.
     let dst = unsafe { mut_slice_sz(dest, cap) };
     let src = unsafe { const_slice_sz(source, src_len) };
@@ -2196,6 +2539,12 @@ pub unsafe extern "C" fn uncompress(
     if dest.is_null() || dest_len.is_null() {
         return Z_STREAM_ERROR;
     }
+    // C one-shot contract: a null `source` paired with a nonzero `source_len`
+    // is invalid (it would be a null `next_in` with nonzero `avail_in` inside
+    // `inflate`). Reject it rather than treating the buffer as silently empty.
+    if source.is_null() && source_len != 0 {
+        return Z_STREAM_ERROR;
+    }
     // SAFETY: dest_len non-null; read the destination capacity.
     let cap = unsafe { *dest_len } as usize;
     // SAFETY: validated (ptr, len) pairs per the contract.
@@ -2226,7 +2575,9 @@ pub unsafe extern "C" fn compress2_z(
     source_len: z_size_t,
     level: c_int,
 ) -> c_int {
-    if dest.is_null() || dest_len.is_null() {
+    // C zlib rejects a NULL source paired with a nonzero length rather than
+    // silently treating it as empty; mirror that exact contract here.
+    if dest.is_null() || dest_len.is_null() || (source.is_null() && source_len != 0) {
         return Z_STREAM_ERROR;
     }
     // SAFETY: dest_len non-null; read the destination capacity.
@@ -2256,7 +2607,9 @@ pub unsafe extern "C" fn compress_z(
     source: *const Bytef,
     source_len: z_size_t,
 ) -> c_int {
-    if dest.is_null() || dest_len.is_null() {
+    // C zlib rejects a NULL source paired with a nonzero length rather than
+    // silently treating it as empty; mirror that exact contract here.
+    if dest.is_null() || dest_len.is_null() || (source.is_null() && source_len != 0) {
         return Z_STREAM_ERROR;
     }
     // SAFETY: dest_len non-null; read the destination capacity.
@@ -2311,6 +2664,11 @@ pub unsafe extern "C" fn uncompress2_z(
     // SAFETY: the out-length pointers are non-null; read the capacities.
     let cap = unsafe { *dest_len };
     let src_len = unsafe { *source_len };
+    // C zlib rejects a NULL source paired with a nonzero length rather than
+    // silently treating it as empty; mirror that exact contract here.
+    if source.is_null() && src_len != 0 {
+        return Z_STREAM_ERROR;
+    }
     // SAFETY: validated (ptr, len) pairs per the contract.
     let dst = unsafe { mut_slice_sz(dest, cap) };
     let src = unsafe { const_slice_sz(source, src_len) };
@@ -2339,7 +2697,9 @@ pub unsafe extern "C" fn uncompress_z(
     source: *const Bytef,
     source_len: z_size_t,
 ) -> c_int {
-    if dest.is_null() || dest_len.is_null() {
+    // C zlib rejects a NULL source paired with a nonzero length rather than
+    // silently treating it as empty; mirror that exact contract here.
+    if dest.is_null() || dest_len.is_null() || (source.is_null() && source_len != 0) {
         return Z_STREAM_ERROR;
     }
     // SAFETY: dest_len non-null; read the destination capacity.
@@ -2422,10 +2782,17 @@ pub extern "C" fn zError(err: c_int) -> *const c_char {
 //     [`gz_strerror`] (mirroring C's wording, e.g. `Z_MEM_ERROR` → "out of
 //     memory").  Callers branch on `*errnum`, which is bit-identical to C.
 //
-//   * `gzprintf` — C's variadic `...` cannot be DEFINED in stable Rust.  We
-//     export a non-variadic `gzprintf(file, format)` that writes the format
-//     string VERBATIM (no `%`-expansion) via the safe writer.  cbindgen emits
-//     the non-variadic declaration.
+//   * `gzprintf` — C's variadic `gzprintf(file, format, ...)` cannot be DEFINED
+//     in stable Rust (`c_variadic` is unstable) and a `cc` trampoline is barred
+//     by the "zero C dependency in the shipping crate" constraint (§0.7.2), so
+//     the C symbol is intentionally NOT exported. It is absent from `zlib.map`'s
+//     `global:` nodes (only `gzvprintf` is listed, in `ZLIB_1.2.7.1`), so this
+//     does not breach the zlib.map-grounded FFI contract (§0.6.2). `gzvprintf`
+//     IS exported with full, byte-identical `printf` formatting via the platform
+//     `vsnprintf`; C callers needing `gzprintf` add the canonical three-line
+//     `va_start` → `gzvprintf` forwarder, and Rust callers use the safe
+//     `zlib_rs::gz::gzprintf(format_args!(...))`. See the detailed note at the
+//     `gzvprintf` definition.
 //
 //   * `gzdopen` — adopting a C file descriptor requires `File::from_raw_fd`
 //     (unix only).  On the rare engine-open failure the `File` is dropped,
@@ -2831,56 +3198,63 @@ pub unsafe extern "C" fn gzfwrite(
     gz::gzfwrite(state, size, nitems, slice)
 }
 
-/// `gzprintf` — formatted write (zlib.h, variadic in C).
-///
-/// **Limitation (documented):** C's variadic `...` cannot be DEFINED in stable
-/// Rust, so this exports a non-variadic `gzprintf(file, format)` that writes the
-/// `format` string VERBATIM (no `%`-expansion).  Returns the number of bytes
-/// written, or `Z_STREAM_ERROR` on a NULL handle / NULL format.
-///
-/// # Safety
-///
-/// `file` must be NULL or a live `gzFile`; `format` must be NULL or a valid
-/// NUL-terminated C string.
-#[cfg(feature = "gz-io")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn gzprintf(file: gzFile, format: *const c_char) -> c_int {
-    // SAFETY: `file` is NULL or a live handle per the caller.
-    let Some(state) = (unsafe { gz_state(file) }) else {
-        return Z_STREAM_ERROR;
-    };
-    if format.is_null() {
-        return Z_STREAM_ERROR;
-    }
-    // SAFETY: `format` is a valid NUL-terminated C string per the caller.
-    let bytes = unsafe { core::ffi::CStr::from_ptr(format) }.to_bytes();
-    // Best-effort verbatim write (no format expansion). UTF-8 goes through the
-    // `gzputs` text path; arbitrary bytes go through `gzwrite`.
-    match core::str::from_utf8(bytes) {
-        Ok(s) => gz::gzputs(state, s),
-        Err(_) => gz::gzwrite(state, bytes),
-    }
-}
+// `gzprintf` — INTENTIONALLY NOT EXPORTED as a C symbol.
+//
+// C's `gzprintf(gzFile, const char *format, ...)` is variadic, and a variadic
+// `extern "C"` function cannot be *defined* in stable Rust (the `c_variadic`
+// feature is unstable, and the AAP fixes the MSRV at 1.85.0 stable). The only
+// other ways to materialize the symbol — a `cc`-compiled C trampoline — are
+// ruled out by the AAP's "Zero C dependency in the shipping crate" constraint
+// (§0.7.2). Exporting a *non-variadic* stub that writes the format string
+// verbatim (no `%`-expansion) is silent data corruption and was explicitly
+// rejected in review, so the broken stub is removed rather than shipped.
+//
+// Omitting `gzprintf` does NOT violate the FFI symbol contract: the AAP grounds
+// the required export set in `zlib.map` (§0.6.2), and `gzprintf` is not listed
+// under any `global:` node there — only its `va_list` sibling `gzvprintf` is
+// (node `ZLIB_1.2.7.1`), and that IS exported below with full formatting. A C
+// consumer needing `gzprintf` writes the canonical three-line forwarder:
+//
+//     int gzprintf(gzFile f, const char *fmt, ...) {
+//         va_list va; va_start(va, fmt);
+//         int r = gzvprintf(f, fmt, va); va_end(va); return r;
+//     }
+//
+// Pure-Rust callers use the safe, fully-formatting
+// `zlib_rs::gz::gzprintf(file, format_args!(...))` (AAP §0.4.1), which is
+// retained unchanged.
 
-/// `gzvprintf` — the `va_list` form of [`gzprintf`] (zlib.h L2047; exported in
-/// `zlib.map` node `ZLIB_1.2.7.1`).
+/// `gzvprintf` — `va_list` formatted write (zlib.h L2047; exported in `zlib.map`
+/// node `ZLIB_1.2.7.1`).
 ///
-/// **Limitation (documented):** stable Rust cannot consume a C `va_list`
-/// (`core::ffi::VaList` / `c_variadic` are unstable), so the `va` argument is
-/// taken as an opaque pointer and IGNORED; like [`gzprintf`], this writes the
-/// `format` string VERBATIM (no `%`-expansion).  The symbol is exported so the
-/// crate remains a complete `libz` drop-in (it appears in `zlib.map`); on the
-/// SysV/Win64 C ABI a `va_list` argument decays to a single pointer, so the
-/// opaque-pointer parameter is call-compatible.  Returns the number of bytes
-/// written, or `Z_STREAM_ERROR` on a NULL handle / NULL format.
+/// Performs real C `printf`-style formatting, byte-for-byte compatible with
+/// zlib's `gzvprintf` (`gzwrite.c`): the arguments are rendered into a
+/// `want`-sized scratch buffer via the platform C runtime's `vsnprintf`, and the
+/// formatted bytes are then written through the very same buffered gzip path C
+/// uses (`gz_comp` at `Z_NO_FLUSH`), so the compressed gzip output is identical.
+/// As in C, a non-writing handle or a pending fatal error returns
+/// `Z_STREAM_ERROR`; an empty result, a truncated result (`len >= want`), or a
+/// formatting error writes nothing and returns `0`; otherwise the number of
+/// formatted bytes is returned.
+///
+/// On the SysV / AArch64 / Win64 C ABIs a `va_list` argument decays to (is
+/// passed as) a single pointer, so forwarding the caller's `va` pointer
+/// unchanged to `vsnprintf` is call-compatible — the standard variadic-bridge
+/// technique, and the only way to honor the `va_list` on stable Rust. The
+/// `vsnprintf` import is declared *inside* this function so it stays a private
+/// link-time dependency and is never emitted into the generated C header (it is
+/// a symbol this crate consumes, not one it exports).
 ///
 /// # Safety
 ///
 /// `file` must be NULL or a live `gzFile`; `format` must be NULL or a valid
-/// NUL-terminated C string.  `va` is not dereferenced.
+/// NUL-terminated C string whose conversion specifiers match the variadic
+/// arguments captured in `va`; `va` must be the caller's live `va_list` (passed
+/// as its ABI pointer), or may be NULL only when `format` contains no
+/// conversions.
 #[cfg(feature = "gz-io")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gzvprintf(file: gzFile, format: *const c_char, _va: *mut c_void) -> c_int {
+pub unsafe extern "C" fn gzvprintf(file: gzFile, format: *const c_char, va: *mut c_void) -> c_int {
     // SAFETY: `file` is NULL or a live handle per the caller.
     let Some(state) = (unsafe { gz_state(file) }) else {
         return Z_STREAM_ERROR;
@@ -2888,13 +3262,48 @@ pub unsafe extern "C" fn gzvprintf(file: gzFile, format: *const c_char, _va: *mu
     if format.is_null() {
         return Z_STREAM_ERROR;
     }
-    // SAFETY: `format` is a valid NUL-terminated C string per the caller.
-    let bytes = unsafe { core::ffi::CStr::from_ptr(format) }.to_bytes();
-    // Best-effort verbatim write (no format expansion); `_va` is ignored.
-    match core::str::from_utf8(bytes) {
-        Ok(s) => gz::gzputs(state, s),
-        Err(_) => gz::gzwrite(state, bytes),
+    // C `gzvprintf` rejects a non-writing handle or a pending fatal (non-soft)
+    // error up front with `Z_STREAM_ERROR` (gzwrite.c), then clears any soft
+    // error before formatting.
+    if !state.is_writing() || (state.err != Z_OK && !state.again) {
+        return Z_STREAM_ERROR;
     }
+    state.clear_error();
+
+    // Render into a `want`-sized scratch buffer, exactly as C formats into its
+    // `state->size`-sized input buffer (`state->size == want` after init).
+    let cap = state.want.max(1);
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if buf.try_reserve_exact(cap).is_err() {
+        return 0;
+    }
+    buf.resize(cap, 0u8);
+    // `vsnprintf` is the platform C runtime's formatter (always linked under
+    // `gz-io`, which implies `std`). It is imported HERE, inside the function
+    // body, on purpose: a module-level `extern` block would be picked up by
+    // cbindgen and re-emitted into the generated header, clashing with
+    // `<stdio.h>`'s own declaration. As a local item it stays an internal
+    // link-time dependency, invisible to cbindgen. It formats `format` + the
+    // varargs referenced by `ap` into `buf` (NUL-terminating when `n > 0`) and
+    // returns the byte count (excluding the NUL) the full output would need.
+    unsafe extern "C" {
+        fn vsnprintf(buf: *mut c_char, n: usize, format: *const c_char, ap: *mut c_void) -> c_int;
+    }
+    // SAFETY: `buf` has `cap` writable bytes; `format` is a valid C string; `va`
+    // is the caller's live `va_list` (an opaque pointer at the ABI level), read
+    // by `vsnprintf` only as directed by `format`'s conversion specifiers.
+    let len = unsafe { vsnprintf(buf.as_mut_ptr().cast::<c_char>(), cap, format, va) };
+    // Match C: empty output, truncation (`len >= want`), or a negative error
+    // (which C detects via its unsigned `len >= size` comparison) → write
+    // nothing and return 0.
+    if len <= 0 || (len as usize) >= cap {
+        return 0;
+    }
+    let len = len as usize;
+    // Write exactly the formatted bytes through the same buffered gzip path C
+    // uses, so the produced gzip stream is byte-identical to C `gzvprintf`.
+    let written = gz::gzwrite(state, &buf[..len]);
+    if written < 0 { written } else { len as c_int }
 }
 
 /// `gzputs` — write a NUL-terminated string (zlib.h L1575).

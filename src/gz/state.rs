@@ -418,6 +418,30 @@ impl GzState {
     ///    special-cases it to return the literal `"out of memory"`. Leaving
     ///    [`msg`](GzState::msg) as [`None`] reproduces that.
     /// 6. Otherwise format and store `"<path>: <message>"`.
+    ///
+    /// # Error-disclosure policy (two surfaces)
+    ///
+    /// This stored message mirrors C `gz_error`, which builds it as
+    /// `snprintf(..., "%s%s%s", state->path, ": ", msg)` (`gzlib.c` L583-588):
+    /// the gzip read path copies the engine's `strm->msg` into it (`gzread.c`),
+    /// and `gzopen`'s OS-failure path passes `zstrerror(errno)` as `msg`, so the
+    /// stored text is a detailed `"<path>: <detail>"` diagnostic. The two
+    /// surfaces that read it back differ **deliberately**:
+    ///
+    /// * The safe-Rust [`gzerror`](crate::gz::gzerror) returns this detailed
+    ///   string. That is idiomatic for an in-process Rust API — `std::io::Error`
+    ///   likewise embeds the offending path for its own caller — and is not a
+    ///   leak across a trust boundary.
+    /// * The FFI-visible `gzerror` (the `extern "C"` symbol) does **not** expose
+    ///   this string. It writes the exact `Z_*` code through `*errnum` and
+    ///   returns the fixed `'static`, NUL-terminated text for that code via
+    ///   `gz_strerror` (e.g. `Z_DATA_ERROR` → `"data error"`, `Z_MEM_ERROR` →
+    ///   `"out of memory"`). This is required for soundness — the Rust `String`
+    ///   built here is not NUL-terminated, so a pointer into it cannot be handed
+    ///   to C — and as a consequence no path/OS/inflate detail crosses the C
+    ///   ABI, which satisfies the CP2 "fixed `z_errmsg` strings only" requirement
+    ///   at the external surface while the error *code* stays bit-identical to C.
+    ///   See the module-level `gzerror` divergence note in `crate::ffi`.
     pub(crate) fn gz_error(&mut self, err: i32, msg: Option<&str>) {
         // (1) free/clear any previous message.
         self.msg = None;

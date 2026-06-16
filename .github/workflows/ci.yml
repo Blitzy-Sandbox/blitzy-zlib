@@ -21,15 +21,16 @@
 # Feature surface mirrors `Cargo.toml` exactly: `std`, `gzip`, `gz-io`,
 # `no-std`, `simd` (default = std, gzip, gz-io, simd).
 #
-# NOTE on the `capi` feature (intentionally absent): the manifest does NOT
-# declare a `capi` feature today — it is only a documented future contingency
-# for gating the `#[no_mangle] extern "C"` FFI exports should they ever collide
-# with the C-zlib symbols pulled in by the `flate2` dev-dependency. This
-# workflow therefore adds NO `--features capi` step (it would fail with
-# "unknown feature"). The plain `cargo build --release --locked` already builds
-# the cdylib/staticlib drop-in. IF a `capi` feature is later added to
-# `Cargo.toml`, add a `cargo build --release --locked --features capi` step to
-# validate the C-ABI drop-in with the FFI exports enabled.
+# NOTE on the `capi` feature: the manifest declares a non-default `capi` feature
+# that gates the `#[no_mangle] extern "C"` FFI exports in `src/ffi.rs` (the
+# C-ABI drop-in). It is kept OUT of the default feature set so the canonical
+# zlib symbol names (`deflate`, `inflate`, `crc32`, ...) are NOT linked during
+# `cargo test`, where the dev-only `flate2` oracle pulls in canonical C zlib via
+# `libz-sys` and would otherwise collide (duplicate symbols). The `build-test`
+# and `features` jobs therefore run WITHOUT `capi`; the dedicated `capi` job
+# below builds `--features capi` and runs an export-symbol smoke check (`nm`) to
+# prove the canonical C symbols are exported in the cdylib/staticlib drop-in
+# (and that the intentionally-absent `gzprintf` stays unexported).
 #
 # C-toolchain note (dev-only oracle): `tests/interop.rs` uses the dev-dependency
 # `flate2` with its `zlib` feature, which links canonical C zlib via
@@ -219,6 +220,73 @@ jobs:
 
       - name: Cargo ${{ matrix.cmd }} ${{ matrix.args }}
         run: cargo ${{ matrix.cmd }} --locked ${{ matrix.args }}
+
+  # --------------------------------------------------------------------------
+  # C-ABI drop-in (`capi`) — builds the `#[no_mangle] extern "C"` FFI shim and
+  # proves the canonical zlib C symbols are exported in the cdylib/staticlib.
+  # Kept SEPARATE from the default `build-test`/`features` jobs so `cargo test`
+  # never links `capi` alongside the `flate2` dev-oracle's C zlib (duplicate
+  # symbols). Linux-only: the `nm` export check and the `lib*.so` / `lib*.a`
+  # artifact names are platform-specific.
+  # --------------------------------------------------------------------------
+  capi:
+    name: C-ABI drop-in (capi)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch dependencies (locked)
+        run: cargo fetch --locked
+
+      # Lint the FFI shim (capi library) under the strict -D warnings policy.
+      - name: Clippy (capi library)
+        run: cargo clippy --lib --locked --features capi -- -D warnings
+
+      # Build the C-linkable drop-in with the FFI exports enabled.
+      - name: Build (release, capi)
+        run: cargo build --release --locked --features capi
+
+      # Smoke-check the exported C symbols. The canonical zlib entry points MUST
+      # be present in both the cdylib and the staticlib; `gzprintf` MUST be
+      # absent (it is variadic and not in `zlib.map` — `gzvprintf` carries the
+      # `printf` formatting; see the FFI module-level divergence note).
+      - name: Export-symbol smoke check (nm)
+        run: |
+          set -euo pipefail
+          SO=target/release/libzlib_rs.so
+          AR=target/release/libzlib_rs.a
+          test -f "$SO" || { echo "missing cdylib $SO"; exit 1; }
+          test -f "$AR" || { echo "missing staticlib $AR"; exit 1; }
+          nm -D --defined-only "$SO" | awk '{print $NF}' | sort -u > so_syms.txt
+          nm -g --defined-only "$AR" | awk '{print $NF}' | sort -u > ar_syms.txt
+          required="deflate inflate deflateInit2_ inflateInit2_ deflateEnd \
+                    inflateEnd crc32 adler32 compress2 uncompress compressBound \
+                    zlibVersion"
+          rc=0
+          for s in $required; do
+            if grep -qx "$s" so_syms.txt; then
+              echo "  cdylib exports: $s"
+            else
+              echo "  MISSING from cdylib: $s"; rc=1
+            fi
+            grep -qx "$s" ar_syms.txt || { echo "  MISSING from staticlib: $s"; rc=1; }
+          done
+          if grep -qx "gzprintf" so_syms.txt; then
+            echo "  UNEXPECTED: gzprintf is exported (must be absent)"; rc=1
+          else
+            echo "  OK: gzprintf absent (intentional; gzvprintf carries formatting)"
+          fi
+          if [ "$rc" -ne 0 ]; then echo "Export-symbol smoke check FAILED"; exit 1; fi
+          echo "Export-symbol smoke check PASSED"
 
   # --------------------------------------------------------------------------
   # Performance gates (AAP §0.3.3) — OPTIONAL and NON-BLOCKING. Benchmark

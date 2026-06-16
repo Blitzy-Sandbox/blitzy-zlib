@@ -297,6 +297,11 @@ pub(crate) fn gz_comp(state: &mut GzState, flush: i32) -> i32 {
                 None => Ok(()),
             };
             if let Err(err) = io_result {
+                // C parity: the OS error text becomes the `gz_error` message,
+                // exactly as C passes `zstrerror(errno)`. It is surfaced by the
+                // safe-Rust `gzerror`; the FFI-visible `gzerror` returns only the
+                // fixed `'static` text for the code, so no OS detail crosses the
+                // C ABI. See the error-disclosure note on `GzState::gz_error`.
                 let msg = err.to_string();
                 state.gz_error(Z_ERRNO, Some(&msg));
                 return -1;
@@ -326,29 +331,30 @@ pub(crate) fn gz_comp(state: &mut GzState, flush: i32) -> i32 {
     // NoFlush defensively for any unexpected value.
     let flush_mode = FlushMode::try_from(flush).unwrap_or(FlushMode::NoFlush);
 
-    // The engine must be present here (gz_init attached it for non-direct
-    // streams); guard defensively rather than panicking.
-    if state.strm.state_as_mut::<DeflateState>().is_none() {
-        state.gz_error(
-            Z_STREAM_ERROR,
-            Some("internal error: deflate stream corrupt"),
-        );
-        return -1;
-    }
-
     // Run the drain loop over the buffered input. The engine state, the input
     // window, the staging buffer, and the file are disjoint fields of `state`,
     // so they can be borrowed simultaneously.
     let drain_result = {
         let start = state.in_next;
         let end = start + state.in_avail;
-        let dstate = state
-            .strm
-            .state_as_mut::<DeflateState>()
-            .expect("engine present for non-direct write");
+        // Defensive, non-panicking access to the engine and file handle. Both
+        // are invariants for a non-direct writing stream (gz_init attached
+        // them), but a corrupted or partially-finalized `GzState` must yield a
+        // zlib error code — never a panic — matching C's `gz_comp` returning -1
+        // with the error recorded.
+        let Some(dstate) = state.strm.state_as_mut::<DeflateState>() else {
+            state.gz_error(
+                Z_STREAM_ERROR,
+                Some("internal error: deflate stream corrupt"),
+            );
+            return -1;
+        };
         let input = &state.in_buf[start..end];
         let out = state.out_buf.as_mut_slice();
-        let file = state.file.as_mut().expect("file present while writing");
+        let Some(file) = state.file.as_mut() else {
+            state.gz_error(Z_STREAM_ERROR, Some("internal error: file handle missing"));
+            return -1;
+        };
         drain_deflate(dstate, input, out, file, flush_mode)
     };
 
@@ -516,26 +522,35 @@ pub(crate) fn gz_write(state: &mut GzState, buf: &[u8]) -> usize {
                 None => Ok(()),
             };
             if let Err(err) = io_result {
+                // C parity: the OS error text becomes the `gz_error` message,
+                // exactly as C passes `zstrerror(errno)`. It is surfaced by the
+                // safe-Rust `gzerror`; the FFI-visible `gzerror` returns only the
+                // fixed `'static` text for the code, so no OS detail crosses the
+                // C ABI. See the error-disclosure note on `GzState::gz_error`.
                 let msg = err.to_string();
                 state.gz_error(Z_ERRNO, Some(&msg));
                 return 0;
             }
         } else {
             // Compress the user slice directly (no intermediate copy).
-            if state.strm.state_as_mut::<DeflateState>().is_none() {
-                state.gz_error(
-                    Z_STREAM_ERROR,
-                    Some("internal error: deflate stream corrupt"),
-                );
-                return 0;
-            }
+            // Defensive, non-panicking access: the engine and file handle are
+            // invariants for a non-direct writing stream (gz_init attached
+            // them), but a corrupted or partially-finalized `GzState` must yield
+            // a zlib error (here a 0-byte write) — never a panic — matching C's
+            // error-return contract.
             let drain_result = {
-                let dstate = state
-                    .strm
-                    .state_as_mut::<DeflateState>()
-                    .expect("engine present for non-direct write");
+                let Some(dstate) = state.strm.state_as_mut::<DeflateState>() else {
+                    state.gz_error(
+                        Z_STREAM_ERROR,
+                        Some("internal error: deflate stream corrupt"),
+                    );
+                    return 0;
+                };
                 let out = state.out_buf.as_mut_slice();
-                let file = state.file.as_mut().expect("file present while writing");
+                let Some(file) = state.file.as_mut() else {
+                    state.gz_error(Z_STREAM_ERROR, Some("internal error: file handle missing"));
+                    return 0;
+                };
                 drain_deflate(dstate, buf, out, file, FlushMode::NoFlush)
             };
             match drain_result {

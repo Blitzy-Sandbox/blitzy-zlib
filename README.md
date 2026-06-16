@@ -36,13 +36,14 @@ match `zlib-rs` and C zlib on either side of a compressed stream.
 
 > **Checkpoint status:** this README documents the crate's full target design.
 > Available today are the foundation types, the Adler-32 / CRC-32 checksum
-> engine, the complete INFLATE (decompression) engine, and the Cargo + CI build
-> scaffolding (`cargo build`, the `--no-default-features` / `no-std` library
-> builds, `cargo clippy`, and `cargo fmt` all run). The DEFLATE (compression)
-> engine, the one-shot `compress`/`uncompress` helpers, the gzip **file** I/O
-> layer, and the C-ABI FFI drop-in (`src/ffi.rs`, behind the `capi` feature) are
-> delivered in subsequent checkpoints; sections and commands describing those
-> capabilities are marked accordingly.
+> engine, the complete INFLATE (decompression) and DEFLATE (compression)
+> engines, the one-shot `compress`/`uncompress` helpers, the gzip **file** I/O
+> layer, the C-ABI FFI drop-in (`src/ffi.rs`, behind the non-default `capi`
+> feature), and the Cargo + CI build (`cargo build`, the `--no-default-features`
+> / `no-std` library builds, `cargo build --features capi`, `cargo clippy`, and
+> `cargo fmt` all run). The remaining deliverables are the integration test
+> suite (`tests/`) and the criterion benchmarks (`benches/`), which arrive in the
+> final checkpoints.
 
 ---
 
@@ -239,12 +240,11 @@ identically to the zlib C API (`deflate`, `inflate`, `deflateInit_`,
 family, and the rest of the symbol set), the generated `cdylib`/`staticlib`
 can replace the system `libz` at the binary level.
 
-> **Status:** `cargo build --release` already produces the `cdylib`/`staticlib`
-> today, but the exported C symbols come from the FFI shim (`src/ffi.rs`), which
-> is gated behind the non-default `capi` feature and delivered in a later
-> checkpoint. The linkage below — and the generated `include/zlib-rs.h` header —
-> therefore applies once the `capi` shim is built (`cargo build --release
-> --features capi`).
+> **Status:** `cargo build --release` produces the `cdylib`/`staticlib` today,
+> but the exported C symbols come from the FFI shim (`src/ffi.rs`), which is
+> gated behind the non-default `capi` feature. The linkage below — and the
+> generated `include/zlib-rs.h` header — therefore applies once the crate is
+> built with that feature enabled (`cargo build --release --features capi`).
 
 ```sh
 cargo build --release --features capi
