@@ -12,6 +12,24 @@
 //! owned `Vec`/`Box`, engine teardown is handled by `Drop` (no `deflateEnd`/
 //! `inflateEnd` leaks), and the LZ77/Huffman core is 100% safe Rust.
 //!
+//! # One-shot compression
+//!
+//! The [`compress`] / [`uncompress`] helpers round-trip a whole buffer through
+//! the zlib (RFC 1950) wrapper format in a single call. `compress` emits a
+//! stream byte-identical to C zlib at the default level; `uncompress` decodes
+//! it back into a caller-provided buffer (sized to the known original length):
+//!
+//! ```
+//! use zlib_rs::{compress, uncompress};
+//!
+//! let original = b"hello, hello, hello, world!";
+//! let packed = compress(original).unwrap();
+//!
+//! let mut restored = [0u8; 64];
+//! let n = uncompress(&mut restored, &packed).unwrap();
+//! assert_eq!(&restored[..n], original);
+//! ```
+//!
 //! # Checksums
 //!
 //! The checksum engines are bit-for-bit compatible with C zlib:
@@ -232,5 +250,33 @@ pub use checksum::{
 pub use deflate::{Deflate, DeflateOutcome};
 pub use inflate::{Inflate, InflateOutcome};
 
-// Version/diagnostic helpers.
-pub use util::version::{zlib_version, zlib_version_num};
+// The gzip FILE-I/O layer's idiomatic handles: `GzFile` (the owned
+// `Box<GzState>` produced by the `gzopen`-family entry points, implementing
+// `Read`/`BufRead`) and `GzWriter` (the streaming `Write` adapter). The full
+// C-faithful `gz*` free-function family (`gzopen`, `gzread`, `gzwrite`,
+// `gzclose`, …) stays reachable under the `zlib_rs::gz` module path — the form
+// the README documents. Gated by `gz-io` (which implies `std` + `gzip`),
+// mirroring the C `#ifndef NO_GZCOMPRESS` / `NO_GZIP` build.
+#[cfg(feature = "gz-io")]
+pub use gz::{GzFile, GzWriter};
+
+// One-shot whole-buffer helpers (`compress.c` / `uncompr.c`): the convenience
+// API the README documents as `use zlib_rs::{compress, uncompress};`.
+// `compress`/`compress2` emit a complete zlib stream, `compress_bound` sizes a
+// destination buffer up front, and `uncompress`/`uncompress2` decode a stream
+// back. The version/diagnostic helpers (`zutil.c`) round out the flat utility
+// surface; `zlib_version()` backs the C-ABI `zlibVersion()` shim.
+pub use util::{
+    compress, compress_bound, compress2, uncompress, uncompress2, zlib_version, zlib_version_num,
+};
+
+// ---------------------------------------------------------------------------
+// Crate-level version constants
+// ---------------------------------------------------------------------------
+
+/// The zlib version string this crate reproduces, `"1.3.2.1-motley"` — a
+/// convenience alias for [`ZLIB_VERSION`] (re-exported from [`constants`]).
+/// Both resolve to the same value; [`zlib_version`] returns it at run time for
+/// the C-ABI `zlibVersion()` entry point. The numeric form is [`ZLIB_VERNUM`]
+/// (`0x1321`).
+pub const VERSION: &str = constants::ZLIB_VERSION;
