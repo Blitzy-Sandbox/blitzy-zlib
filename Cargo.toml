@@ -1,61 +1,162 @@
-# Cargo manifest for the zlib-rs crate — a memory-safe Rust rewrite of zlib.
+# ============================================================================
+# Cargo manifest for `zlib-rs` — a memory-safe Rust rewrite of zlib.
+# ============================================================================
 #
-# NOTE (setup baseline): This manifest was authored by the environment-setup
-# step to (1) pin the toolchain/dependency contract from the Agent Action Plan
-# and (2) pre-fetch/warm the full dependency graph. The Rust source tree
-# (src/, tests/, benches/, build.rs) is created by the implementation step.
-# The `[[bench]]` target entries are intentionally omitted here because their
-# source files do not yet exist; they are added together with the bench
-# sources during implementation (see doc/project-guide.md §9.1).
+# This is the foundational manifest of the C→Rust rewrite of the zlib
+# general-purpose lossless data-compression library. Every other file in the
+# crate (src/*, tests/*, benches/*, build.rs) depends on the package name,
+# edition, feature set, and dependency graph declared here.
+#
+# Derived from the C baseline's build descriptors:
+#   * CMakeLists.txt — project name / version (1.3.2.1) / description /
+#     homepage, and the shared+static library build options that map to the
+#     `crate-type = ["lib", "cdylib", "staticlib"]` triple below.
+#   * zlib.h         — version constants (ZLIB_VERSION "1.3.2.1-motley",
+#     ZLIB_VERNUM 0x1321). NOTE: the FULL 4-part runtime version string and
+#     ZLIB_VERNUM are reported by the FFI `zlibVersion()` / `ZLIB_VERSION` in
+#     `src/` — Cargo SemVer cannot encode a 4-component version, so the crate
+#     `version` below is the 3-part `1.3.2` mirror.
+#
+# The crate is materialized in-tree at the repository root alongside (and
+# ultimately replacing) the C baseline (AAP §0.1.1, §0.3.1).
 
 [package]
 name = "zlib-rs"
-version = "0.1.0"
+# 3-part SemVer mirroring the C baseline `1.3.2.1`. The full runtime string
+# "1.3.2.1-motley" and ZLIB_VERNUM 0x1321 are surfaced by the FFI layer in src/,
+# not here (Cargo SemVer has no 4th component).
+version = "1.3.2"
 edition = "2024"
+# Rust 2024 edition was stabilized in Rust 1.85.0; that is the crate's MSRV
+# (AAP §0.3.3 / §0.5.1).
 rust-version = "1.85.0"
-license = "Zlib"
-description = "Memory-safe Rust rewrite of the zlib compression library (DEFLATE/zlib/gzip), byte-compatible with C zlib and exposing a C-ABI drop-in FFI."
+description = "A safe-Rust rewrite of the zlib general-purpose lossless data-compression library, byte-compatible with C zlib and exposing a drop-in C ABI."
+homepage = "https://zlib.net/"
 repository = "https://github.com/Blitzy-Sandbox/blitzy-zlib"
+# SPDX identifier for the zlib/libpng license carried verbatim in `LICENSE`.
+license = "Zlib"
+license-file = "LICENSE"
 readme = "README.md"
-keywords = ["zlib", "deflate", "gzip", "compression", "crc32"]
-categories = ["compression", "no-std::no-alloc", "encoding"]
+keywords = ["compression", "zlib", "deflate", "gzip", "crc32"]
+categories = ["compression", "no-std", "api-bindings"]
+# Build script generates the CRC-32 tables at build time (mirroring the
+# upstream generation of crc32.h) and invokes cbindgen to emit the C header.
+build = "build.rs"
+authors = [
+    "Jean-loup Gailly <jloup@gzip.org>",
+    "Mark Adler <madler@alumni.caltech.edu>",
+    "Blitzy <agent@blitzy.com>",
+]
+# Keep `cargo package` lean: drop the legacy C platform-packaging trees and
+# large binary docs that are not part of the Rust crate. Patterns are anchored
+# to the package root and only affect packaging/publishing (not builds).
+exclude = [
+    "/contrib",
+    "/win32",
+    "/amiga",
+    "/msdos",
+    "/os400",
+    "/qnx",
+    "/watcom",
+    "*.pdf",
+]
 
-# Produce the Rust rlib plus C-linkable cdylib/staticlib so the crate can serve
-# as a drop-in replacement for libz at the binary level (AAP §0.3.1, §0.5.1).
+# ----------------------------------------------------------------------------
+# [lib] — produce the Rust rlib PLUS the C-linkable cdylib/staticlib so the
+# crate is a binary-level drop-in for libz (AAP §0.3.1, §0.3.3, §0.5.1).
+# The cdylib (.so/.dylib/.dll) and staticlib (.a) carry the
+# `#[no_mangle] extern "C"` symbols defined in `src/ffi.rs`.
+# ----------------------------------------------------------------------------
 [lib]
 name = "zlib_rs"
 crate-type = ["lib", "cdylib", "staticlib"]
 
-# Cargo features replace the C preprocessor conditionals (AAP §0.5.2, project-guide §9.2).
+# ----------------------------------------------------------------------------
+# [features] — Cargo features replace the C preprocessor conditionals
+# (AAP §0.5.2). The `no-std` feature is MUTUALLY EXCLUSIVE with `std`; Cargo
+# cannot hard-enforce that, so `src/lib.rs` carries a `compile_error!` guard
+# when both are enabled.
+# ----------------------------------------------------------------------------
 [features]
 default = ["std", "gzip", "gz-io", "simd"]
-# default C build (heap + std::io)
+# Heap + `std::io`; the default C build.
 std = []
-# #ifdef GZIP — gzip format support in deflate/inflate
+# `#ifdef GZIP` — gzip wrapper-format support in deflate/inflate.
 gzip = []
-# gzip file I/O (implies std + gzip)
+# gzip FILE-I/O layer; implies `std` + `gzip`
+# (replaces `#ifndef NO_GZCOMPRESS` / `NO_GZIP`).
 gz-io = ["std", "gzip"]
-# Z_SOLO — bare-metal mode (mutually exclusive with std at the source level)
+# `Z_SOLO` bare-metal build — mutually exclusive with `std` (enforced in src/lib.rs).
 no-std = []
-# SIMD-accelerated CRC-32 via crc32fast
+# SIMD-accelerated CRC-32 via the optional `crc32fast` dependency.
 simd = ["dep:crc32fast"]
 
+# ----------------------------------------------------------------------------
+# [dependencies] — runtime. Kept deliberately MINIMAL: C zlib has zero external
+# dependencies, so the shipped crate must too. Only these two are permitted
+# (AAP §0.5.1, §0.5.2); the shipped artifact carries ZERO C dependency.
+# ----------------------------------------------------------------------------
 [dependencies]
-# Ergonomic cfg branching for feature/arch gates.
-cfg-if = "1.0"
-# SIMD-accelerated CRC-32 (IEEE); backs src/checksum/crc32.rs; gated by `simd`.
-crc32fast = { version = "1.5", optional = true }
+# SIMD-accelerated CRC-32 (IEEE) backing `src/checksum/crc32.rs`; `no_std`-capable
+# (hence `default-features = false`); pulled in only by the `simd` feature.
+crc32fast = { version = "1.5.0", optional = true, default-features = false }
+# Ergonomic `cfg` branching for feature/arch gates.
+cfg-if = "1.0.0"
 
+# ----------------------------------------------------------------------------
+# [build-dependencies] — build-time only; never linked into the shipped crate.
+# ----------------------------------------------------------------------------
 [build-dependencies]
-# Generates the C header (zlib.h-equivalent) from src/ffi.rs during build.rs.
-cbindgen = "0.28"
+# Invoked by `build.rs` to generate the C header (zlib.h-equivalent) from the
+# `#[no_mangle] extern "C"` signatures and `#[repr(C)]` types in `src/ffi.rs`.
+cbindgen = "0.28.0"
 
+# ----------------------------------------------------------------------------
+# [dev-dependencies] — test/bench only; never linked into the shipped artifact.
+# ----------------------------------------------------------------------------
 [dev-dependencies]
-# Statistical benchmarking harness for benches/*.
+# Statistical benchmarking harness for `benches/*` (performance gates AAP §0.3.3).
 criterion = "0.5.1"
-# Reference oracle linking canonical zlib for byte-identical interop validation.
-flate2 = "1.1.1"
+# Reference ORACLE: the `zlib` feature selects flate2's canonical C-zlib backend
+# (libz-sys), used by `tests/interop.rs` for byte-for-byte interop validation.
+# This is the ONLY place C zlib appears, and it is strictly DEV-ONLY.
+#
+# Symbol-collision note for the `src/ffi.rs` author: this backend exports the
+# canonical C symbols (`deflate`, `inflate`, `crc32`, …) which can clash at
+# test-link time with the crate's own `#[no_mangle]` exports. If a link
+# conflict arises, gate those exports behind an optional `capi` feature
+# (enabled for the cdylib/staticlib drop-in, disabled for `cargo test`) — add
+# it only if required; the five features above remain the primary surface.
+flate2 = { version = "1.1.1", features = ["zlib"] }
 # Property-based round-trip testing.
 quickcheck = "1.0.3"
 # Randomized test-data generation.
 rand = "0.9.0"
+
+# ----------------------------------------------------------------------------
+# [[bench]] — criterion harnesses (AAP §0.3.1, §0.4.1). `harness = false` is
+# required so criterion provides its own `main`. Sources live in `benches/`.
+# ----------------------------------------------------------------------------
+[[bench]]
+name = "deflate_bench"
+harness = false
+
+[[bench]]
+name = "inflate_bench"
+harness = false
+
+[[bench]]
+name = "checksum_bench"
+harness = false
+
+# ----------------------------------------------------------------------------
+# [profile.release] — tuned for throughput/footprint parity with C zlib
+# (performance gates AAP §0.3.3: ≥80% compression, ≥ decompression, ≤ memory).
+# `panic = "abort"` is appropriate for the cdylib drop-in; the test profile
+# keeps unwinding, and the `bench` profile inherits these release settings.
+# ----------------------------------------------------------------------------
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
