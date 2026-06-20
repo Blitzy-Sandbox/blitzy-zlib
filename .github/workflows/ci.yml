@@ -1,0 +1,259 @@
+# ============================================================================
+# Rust / Cargo Continuous Integration for the `zlib-rs` crate
+# ============================================================================
+#
+# This workflow validates the memory-safe Rust rewrite of zlib (crate
+# `zlib-rs`, library name `zlib_rs`). It is a NEW, standalone pipeline that
+# runs ALONGSIDE — and never replaces — the seven existing C workflows in this
+# directory (c-std.yml, cmake.yml, configure.yml, contribs.yml, fuzz.yml,
+# msys-cygwin.yml, others.yml). The crate manifest (Cargo.toml) and lockfile
+# (Cargo.lock) live at the repository ROOT, so every `cargo` command runs from
+# the default working directory.
+#
+# Structure (triggers, `fail-fast: false` matrices, action versions, the
+# `if: failure()` artifact upload) mirrors the C workflows so this file reads
+# as a natural sibling. The cargo command set is derived from Cargo.toml /
+# Cargo.lock and the `doc/project-guide.md` runbook.
+#
+# Conventions enforced here:
+#   * `--locked` on every cargo build/fetch/test/clippy/bench invocation,
+#     because Cargo.lock is committed; a `--locked` run must NOT need to update
+#     the lockfile. (`cargo fmt` takes no `--locked` — it does not read or
+#     write the lockfile.)
+#   * The MSRV (Rust 1.85.0, the edition-2024 floor) is exercised explicitly,
+#     since there is no rust-toolchain.toml in the repo.
+#   * Feature names match Cargo.toml `[features]` EXACTLY:
+#     std, gzip, gz-io, no-std, simd.
+#
+# Dev-only interop oracle: `tests/interop.rs` uses the dev-dependency `flate2`
+# with its `zlib` feature, which links canonical C zlib via `libz-sys`/`cc` for
+# byte-for-byte validation. GitHub-hosted runners already ship a C toolchain
+# (gcc/clang + make on Linux/macOS, MSVC on Windows), so no extra install step
+# is needed. `flate2` / C zlib are DEV-ONLY — the shipped crate has zero C
+# dependencies.
+#
+# `capi` note: the crate's plan was to gate the `#[no_mangle] extern "C"`
+# exports behind an OPTIONAL `capi` feature ONLY IF the canonical zlib symbol
+# names were to collide with flate2's C-zlib symbols at test-link time. The
+# FINAL Cargo.toml declares NO `capi` feature, so this workflow intentionally
+# adds no `--features capi` step (it would fail with "unknown feature"). The
+# plain `cargo build --release` already produces the cdylib/staticlib drop-in.
+# ============================================================================
+
+name: CI
+
+# Mirror the dominant trigger of the C workflows (push + pull_request), plus
+# the manual `workflow_dispatch` used by c-std.yml. `on:` is intentionally left
+# unquoted to match the repo's existing workflow style; GitHub's YAML 1.2
+# parser handles the bare `on:` key correctly.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Least-privilege token: this pipeline only needs to read the repository.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Lint — format + clippy gates. Run ONCE on ubuntu/stable so these checks do
+  # not run redundantly across the OS/toolchain matrix below.
+  # --------------------------------------------------------------------------
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (stable + clippy + rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch dependencies (locked)
+        run: cargo fetch --locked
+
+      # Format gate — must be clean (no `--locked`; fmt does not use the lockfile).
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # Lint gate (default features) — deny ALL warnings across every target.
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # Lint gate (no-std LIBRARY only). `--lib` keeps clippy from compiling the
+      # std-dependent test/bench targets under no-std (see the build-only note
+      # in the feature-matrix job).
+      - name: Clippy (no-std library)
+        run: cargo clippy --lib --locked --no-default-features --features no-std -- -D warnings
+
+  # --------------------------------------------------------------------------
+  # Build + Test — OS x toolchain matrix. Mirrors the cmake.yml/configure.yml
+  # `fail-fast: false` + `matrix.include` pattern. MUST cover stable AND the
+  # 1.85.0 MSRV; spans Linux/macOS/Windows like the C suite.
+  # --------------------------------------------------------------------------
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "Ubuntu / stable"
+            os: ubuntu-latest
+            rust: stable
+          - name: "Ubuntu / 1.85.0 (MSRV)"
+            os: ubuntu-latest
+            rust: "1.85.0"
+          - name: "macOS / stable"
+            os: macos-latest
+            rust: stable
+          - name: "Windows / stable"
+            os: windows-latest
+            rust: stable
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (${{ matrix.rust }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch dependencies (locked)
+        run: cargo fetch --locked
+
+      - name: Build (debug, default features)
+        run: cargo build --locked
+
+      # Release build validates the cdylib + staticlib drop-in artifacts
+      # (libzlib_rs.{so,dylib,dll,a}) emitted by
+      # crate-type = ["lib", "cdylib", "staticlib"].
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      # Default-feature test run: the six ported suites (regression,
+      # inflate_coverage, round_trip, interop, gzip_compat, checksum) plus the
+      # lib and doc tests.
+      - name: Test (default features)
+        run: cargo test --locked
+
+      # Compile the criterion benches (deflate_bench, inflate_bench,
+      # checksum_bench) WITHOUT running them — keeps CI fast while ensuring the
+      # bench harnesses stay buildable.
+      - name: Build benches (no run)
+        run: cargo bench --no-run --locked
+
+      # Diagnostics + artifact upload run ONLY on failure and never affect the
+      # gates above (mirrors the cmake.yml/configure.yml diagnostic pattern).
+      # `shell: bash` is isolated to this failure-only step so it cannot affect
+      # the primary build steps on Windows (which use the default shell).
+      - name: Collect diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "### rustc"
+            rustc -Vv || true
+            echo "### cargo"
+            cargo -Vv || true
+            echo "### dependency tree (locked)"
+            cargo tree --locked || true
+          } > cargo-ci-diagnostics.log 2>&1
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.name }} (cargo)
+          path: cargo-ci-diagnostics.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # --------------------------------------------------------------------------
+  # Feature matrix — replaces the C `#ifdef` / C-standards matrix. Validates
+  # each Cargo feature combination. Each cell carries `cmd` (build|test) +
+  # `args`, so the single run step is `cargo <cmd> --locked <args>`.
+  #
+  # CRITICAL: `no-std` is BUILD-ONLY. `cargo test --no-default-features`
+  # (with or without `no-std`) fails with ~129 errors in TEST code that uses
+  # Vec/format!/String without `alloc` imports when `std` is off — the LIBRARY
+  # itself compiles cleanly. So the no-std cells use `cargo build` (the Z_SOLO
+  # analog); there is deliberately NO `cargo test --no-default-features` here.
+  # `no-std` is never combined with `std` (they are mutually exclusive, and the
+  # crate enforces this with a compile_error! guard in src/lib.rs).
+  # --------------------------------------------------------------------------
+  features:
+    name: "Features (${{ matrix.cmd }} ${{ matrix.args }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cmd: test
+            args: "--no-default-features --features std"
+          - cmd: test
+            args: "--no-default-features --features std,gzip"
+          - cmd: test
+            args: "--no-default-features --features std,gzip,gz-io"
+          - cmd: test
+            args: "--no-default-features --features std,gzip,gz-io,simd"
+          - cmd: build
+            args: "--no-default-features --features no-std"
+          - cmd: build
+            args: "--no-default-features --features no-std,simd"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch dependencies (locked)
+        run: cargo fetch --locked
+
+      - name: Run cargo ${{ matrix.cmd }} (${{ matrix.args }})
+        run: cargo ${{ matrix.cmd }} --locked ${{ matrix.args }}
+
+  # --------------------------------------------------------------------------
+  # Performance gates (AAP §0.3.3) — OPTIONAL and NON-BLOCKING. Runs only on a
+  # manual `workflow_dispatch` and never fails the workflow (perf on shared
+  # runners is noisy). Targets: compression >= 80% of C zlib, decompression >=
+  # parity, CRC-32 SIMD >= 3x scalar, memory <= C zlib.
+  # --------------------------------------------------------------------------
+  bench:
+    name: Benchmarks (manual, non-blocking)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch dependencies (locked)
+        run: cargo fetch --locked
+
+      - name: Run benchmarks
+        run: cargo bench --locked
