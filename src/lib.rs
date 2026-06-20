@@ -93,15 +93,14 @@ pub mod gz_header;
 pub mod checksum;
 pub mod inflate;
 
-// The DEFLATE compression engine is delivered incrementally. This checkpoint
-// ships the *foundational preview* — the persistent `DeflateState`, the Huffman
-// `trees` builder, and the per-level `strategy` configuration table — which the
-// inflate engine, checksum engine and FFI shim are validated against. The
-// `deflate()` driver that actually exercises every preview helper (and the
-// `src/ffi.rs` shim that exposes them under their C names) lands in the next
-// checkpoint. Until that driver exists, several preview items are not yet
-// referenced from a live code path, so `dead_code` is allowed *only* for this
-// module subtree. The attribute is removed once the driver wires the preview in.
+// The DEFLATE compression engine. The module root (`deflate::mod`) provides the
+// `deflate()` driver, the full public `deflate*` API, and the idiomatic
+// [`Deflate`] wrapper over the persistent `DeflateState`, the Huffman `trees`
+// builder, the per-level `strategy` table, and the five strategy routines.
+// A handful of state/tree helpers exist purely to back the forthcoming
+// `src/ffi.rs` C-ABI shim (e.g. raw-status validation, MSB byte emission) and
+// are not yet reached from a live Rust path; `dead_code` is therefore allowed
+// *only* for this subtree until the FFI shim wires them in.
 #[allow(dead_code)]
 pub mod deflate;
 
@@ -131,6 +130,9 @@ pub use stream::{Allocator, GlobalAlloc, ZStream};
 
 // The idiomatic decompressor.
 pub use inflate::Inflate;
+
+// The idiomatic compressor and its per-call outcome.
+pub use deflate::{Deflate, DeflateOutcome};
 
 // All `Z_*` constants and the typed [`FlushMode`]/[`Strategy`]/[`DataType`]
 // enumerations are part of the public surface.
