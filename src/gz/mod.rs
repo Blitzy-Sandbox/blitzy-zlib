@@ -15,10 +15,12 @@
 //! |-------------|-----------------------|---------------------------------------------|
 //! | `gzguts.h`  | [`state`]             | `GzState` model + `Mode` / `How` sentinels  |
 //! | `gzread.c`  | [`read`]              | read path: LOOK/COPY/GZIP machine + `gzread*`|
+//! | `gzwrite.c` | [`write`]             | write path: `gzwrite*` + deflate driving    |
+//! | `gzlib.c`   | [`open`]              | open / mode-parse / `gzseek` / `gztell` / status |
 //!
-//! The remaining C translation units (`gzlib.c` → `open`, `gzwrite.c` →
-//! `write`, `gzclose.c` → `close`) are created by their own agents; this module
-//! root declares the submodules that exist so the layer compiles incrementally.
+//! The remaining C translation unit (`gzclose.c` → `close`) is created by its
+//! own agent; this module root declares the submodules that exist so the layer
+//! compiles incrementally.
 //!
 //! # Memory-ownership model (AAP §0.6.3)
 //!
@@ -59,3 +61,30 @@ pub mod write;
 // etc. The write-side close dispatcher (`gzclose_w`) is re-exported for the
 // `close.rs` dispatcher.
 pub use write::{gzclose_w, gzflush, gzfwrite, gzprintf, gzputc, gzputs, gzwrite};
+
+pub mod open;
+
+// -- open / positioning / status public API re-exports (ported from
+//    `gzlib.c`, plus `gzsetparams` whose body comes from `gzwrite.c`) --------
+//
+// Surface the faithful-C-name open/seek/status entry points at the
+// `crate::gz` level so the forthcoming `src/ffi.rs` C-ABI shim and the
+// idiomatic crate-root re-exports can reach them as `crate::gz::gzopen` etc.
+// [`GzSource`] is the safe `gz_open` input (the FFI layer constructs its
+// `File` variant from a raw fd inside its `unsafe` boundary).
+pub use open::{
+    GzSource, gzbuffer, gzclearerr, gzdopen, gzeof, gzerror, gzoffset, gzoffset64, gzopen,
+    gzopen64, gzrewind, gzseek, gzseek64, gzsetparams, gztell, gztell64,
+};
+
+pub mod close;
+
+// -- close-path public API re-export (ported from `gzclose.c`) --------------
+//
+// The top-level `gzclose` dispatcher inspects the handle's mode and routes to
+// `gzclose_r` (read) or `gzclose_w` (write); its body lives in `close.rs` and
+// the read/write teardown bodies stay in `read.rs` / `write.rs`. Surface the
+// dispatcher at the `crate::gz` level so the forthcoming `src/ffi.rs` C-ABI
+// shim and the idiomatic crate-root re-exports can reach it as
+// `crate::gz::gzclose`.
+pub use close::gzclose;
