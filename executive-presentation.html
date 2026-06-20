@@ -1,0 +1,1066 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="author" content="Blitzy" />
+  <meta name="description"
+        content="Executive briefing: the C-to-Rust rewrite of the zlib compression library &mdash; memory-safe, byte-identical, drop-in C ABI." />
+  <title>C-to-Rust Rewrite of zlib &mdash; Executive Briefing</title>
+
+  <!-- Inline favicon (empty transparent SVG) so the browser does not request /favicon.ico -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3C/svg%3E" />
+
+  <!-- Google Fonts: Inter (body), Space Grotesk (display), Fira Code (mono) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=Fira+Code:wght@400;500&display=swap" />
+
+  <!-- reveal.js 5.1.0 core stylesheet (NO theme CSS - the Blitzy theme is inlined below) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+
+  <style>
+    /* =====================================================================
+       BLITZY REVEAL.JS DESIGN SYSTEM - inlined theme (canonical
+       blitzy-deck/references/blitzy-reveal-theme.css is absent in-repo, so the
+       full theme is embedded here per AAP section 0.8.6). Every color/font/gradient
+       value resolves to a token below; translucent and shadow values are
+       derived with color-mix() over those tokens so no raw hex appears at any
+       usage site. Only 0/none/auto/inherit/currentColor/transparent literals
+       are used directly.
+       ===================================================================== */
+    :root {
+      /* ---- Brand colors ---- */
+      --blitzy-primary: #5B39F3;
+      --blitzy-primary-dark: #2D1C77;
+      --blitzy-primary-navy: #1A105F;
+      --blitzy-primary-light: #7A6DEC;
+      --blitzy-primary-deep: #4101DB;
+      --blitzy-accent-teal: #94FAD5;
+
+      /* ---- Surfaces ---- */
+      --blitzy-surface-0: #FFFFFF;
+      --blitzy-surface-1: #F4EFF6;
+      --blitzy-surface-2: #F2F0FE;
+      --blitzy-surface-3: #F5F5F5;
+
+      /* ---- Border & text ---- */
+      --blitzy-border: #D9D9D9;
+      --blitzy-text: #333333;
+      --blitzy-text-muted: #999999;
+
+      /* ---- Typography ---- */
+      --ff-body: 'Inter', sans-serif;
+      --ff-display: 'Space Grotesk', sans-serif;
+      --ff-mono: 'Fira Code', monospace;
+
+      /* ---- Gradients ---- */
+      --gradient-hero: linear-gradient(68deg, #7A6DEC 15.56%, #5B39F3 62.74%, #4101DB 84.44%);
+      --gradient-divider: linear-gradient(135deg, #2D1C77 0%, #5B39F3 100%);
+      --gradient-accent: linear-gradient(90deg, #5B39F3 0%, #94FAD5 100%);
+
+      /* ---- Derived translucent tints (color-mix over base tokens only) ---- */
+      --blitzy-primary-a08: color-mix(in srgb, var(--blitzy-primary) 8%, transparent);
+      --blitzy-primary-a14: color-mix(in srgb, var(--blitzy-primary) 14%, transparent);
+      --blitzy-primary-a30: color-mix(in srgb, var(--blitzy-primary) 30%, transparent);
+      --blitzy-teal-a18: color-mix(in srgb, var(--blitzy-accent-teal) 18%, transparent);
+      --blitzy-teal-a40: color-mix(in srgb, var(--blitzy-accent-teal) 40%, transparent);
+      --blitzy-white-a10: color-mix(in srgb, var(--blitzy-surface-0) 10%, transparent);
+      --blitzy-white-a16: color-mix(in srgb, var(--blitzy-surface-0) 16%, transparent);
+      --blitzy-white-a72: color-mix(in srgb, var(--blitzy-surface-0) 72%, transparent);
+      --blitzy-navy-a55: color-mix(in srgb, var(--blitzy-primary-navy) 55%, transparent);
+
+      /* ---- Elevation (shadows colored from brand tokens) ---- */
+      --blitzy-elev-1: 0 0.4rem 1.4rem color-mix(in srgb, var(--blitzy-primary-navy) 12%, transparent);
+      --blitzy-elev-2: 0 1rem 3rem color-mix(in srgb, var(--blitzy-primary-navy) 18%, transparent);
+      --blitzy-elev-glow: 0 0.6rem 2.4rem color-mix(in srgb, var(--blitzy-primary) 28%, transparent);
+    }
+
+    /* =====================================================================
+       BASE
+       ===================================================================== */
+    html, body { height: 100%; }
+
+    .reveal {
+      font-family: var(--ff-body);
+      font-weight: 400;
+      color: var(--blitzy-text);
+      font-size: 34px;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* Default content slides sit on a soft brand surface. */
+    .reveal .slides section {
+      background: var(--blitzy-surface-0);
+      text-align: left;
+      box-sizing: border-box;
+      height: 100%;
+      padding: 4.2rem 5rem;
+      top: 0 !important;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+
+    /* reveal.js assigns an inline `display: block` to the on-screen slide,
+       which would suppress the flex layout declared above (collapsing the
+       vertical centering and the divider/title alignment). Re-assert flex for
+       the present slide only; hidden slides keep their inline `display: none`
+       (they do not carry the `.present` class), so slide visibility is intact. */
+    .reveal .slides section.present { display: flex !important; }
+
+    .reveal .slides section > * { box-sizing: border-box; }
+
+    /* Headings */
+    .reveal h1, .reveal h2, .reveal h3 {
+      font-family: var(--ff-display);
+      color: var(--blitzy-primary-dark);
+      font-weight: 600;
+      line-height: 1.08;
+      letter-spacing: -0.01em;
+      margin: 0 0 1.4rem 0;
+      text-transform: none;
+    }
+    .reveal h1 { font-size: 3.1rem; }
+    .reveal h2 { font-size: 2.3rem; }
+    .reveal h3 { font-size: 1.35rem; color: var(--blitzy-primary); }
+
+    .reveal p { line-height: 1.45; margin: 0 0 1rem 0; }
+    .reveal strong { color: var(--blitzy-primary-deep); font-weight: 600; }
+    .reveal em { color: var(--blitzy-text-muted); font-style: normal; }
+
+    /* Links */
+    .reveal a { color: var(--blitzy-primary); text-decoration: none; }
+
+    /* =====================================================================
+       EYEBROW - Fira Code uppercase kicker
+       ===================================================================== */
+    .eyebrow {
+      font-family: var(--ff-mono);
+      font-size: 0.86rem;
+      font-weight: 500;
+      letter-spacing: 0.26em;
+      text-transform: uppercase;
+      color: var(--blitzy-primary);
+      margin: 0 0 1.1rem 0;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.6rem;
+    }
+
+    /* =====================================================================
+       ACCENT BAR - gradient rule
+       ===================================================================== */
+    .accent-bar {
+      width: 12rem;
+      height: 0.5rem;
+      border: 0;
+      border-radius: 999px;
+      background: var(--gradient-accent);
+      margin: 1.6rem 0 0 0;
+    }
+    .accent-bar.center { margin-left: auto; margin-right: auto; }
+
+    /* =====================================================================
+       SLIDE TYPE: TITLE - hero gradient, white text, teal eyebrow
+       ===================================================================== */
+    .reveal .slides section.slide-title {
+      background: var(--gradient-hero);
+      color: var(--blitzy-surface-0);
+      padding: 4.6rem 5.4rem;
+    }
+    .reveal section.slide-title h1 {
+      color: var(--blitzy-surface-0);
+      font-size: 3.7rem;
+      max-width: 26ch;
+    }
+    .reveal section.slide-title .eyebrow { color: var(--blitzy-accent-teal); }
+    .reveal section.slide-title .lead {
+      font-size: 1.4rem;
+      color: var(--blitzy-white-a72);
+      max-width: 44ch;
+      margin-top: 0.4rem;
+    }
+    .reveal section.slide-title .title-meta {
+      font-family: var(--ff-mono);
+      font-size: 0.82rem;
+      letter-spacing: 0.08em;
+      color: var(--blitzy-accent-teal);
+      margin-top: 1.8rem;
+      display: flex;
+      gap: 0.8rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .reveal section.slide-title .title-meta .dot {
+      width: 0.34rem; height: 0.34rem; border-radius: 999px;
+      background: var(--blitzy-accent-teal); display: inline-block;
+    }
+    .reveal section.slide-title .hero-icon {
+      color: var(--blitzy-accent-teal);
+      background: var(--blitzy-white-a10);
+      border: 1px solid var(--blitzy-white-a16);
+    }
+
+    /* =====================================================================
+       SLIDE TYPE: DIVIDER - gradient/dark purple, centered, hero icon
+       ===================================================================== */
+    .reveal .slides section.slide-divider {
+      background: var(--gradient-divider);
+      color: var(--blitzy-surface-0);
+      align-items: center;
+      text-align: center;
+    }
+    .reveal section.slide-divider .eyebrow { color: var(--blitzy-accent-teal); }
+    .reveal section.slide-divider h2 {
+      color: var(--blitzy-surface-0);
+      font-size: 3rem;
+      max-width: 22ch;
+    }
+    .reveal section.slide-divider .divider-sub {
+      color: var(--blitzy-white-a72);
+      font-size: 1.2rem;
+      max-width: 40ch;
+      margin: 0.2rem auto 0 auto;
+    }
+
+    /* HERO ICON - large circular Lucide badge for dividers/title */
+    .hero-icon {
+      width: 6.2rem;
+      height: 6.2rem;
+      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--blitzy-white-a10);
+      border: 1px solid var(--blitzy-white-a16);
+      color: var(--blitzy-accent-teal);
+      margin: 0 0 1.6rem 0;
+    }
+    .reveal section.slide-divider .hero-icon { margin-left: auto; margin-right: auto; }
+    .hero-icon svg { width: 3rem; height: 3rem; stroke-width: 1.6; }
+
+    /* =====================================================================
+       SLIDE TYPE: CLOSING - navy, takeaway, lockup, accent bar
+       ===================================================================== */
+    .reveal .slides section.slide-closing {
+      background: var(--blitzy-primary-navy);
+      color: var(--blitzy-surface-0);
+    }
+    .reveal section.slide-closing .eyebrow { color: var(--blitzy-accent-teal); }
+    .reveal section.slide-closing h2 {
+      color: var(--blitzy-surface-0);
+      font-size: 3.4rem;
+      max-width: 18ch;
+    }
+    .reveal section.slide-closing .closing-next {
+      list-style: none;
+      margin: 1.4rem 0 0 0;
+      padding: 0;
+      max-width: 50ch;
+    }
+    .reveal section.slide-closing .closing-next li {
+      color: var(--blitzy-white-a72);
+      font-size: 1.18rem;
+      padding: 0.5rem 0 0.5rem 2.2rem;
+      position: relative;
+    }
+    .reveal section.slide-closing .closing-next li svg {
+      position: absolute; left: 0; top: 0.6rem;
+      width: 1.4rem; height: 1.4rem; color: var(--blitzy-accent-teal);
+    }
+
+    /* BRAND LOCKUP - closing slide signature */
+    .brand-lockup {
+      display: flex;
+      align-items: center;
+      gap: 0.8rem;
+      margin-top: 2.2rem;
+      font-family: var(--ff-display);
+      font-weight: 600;
+      font-size: 1.15rem;
+      color: var(--blitzy-surface-0);
+    }
+    .brand-lockup .mark {
+      width: 2.1rem; height: 2.1rem; border-radius: 0.6rem;
+      background: var(--gradient-accent);
+      display: inline-flex; align-items: center; justify-content: center;
+      color: var(--blitzy-primary-navy);
+    }
+    .brand-lockup .mark svg { width: 1.2rem; height: 1.2rem; stroke-width: 2.4; }
+    .brand-lockup .sep { color: var(--blitzy-accent-teal); font-weight: 400; }
+    .brand-lockup .muted { color: var(--blitzy-white-a72); font-weight: 400; font-family: var(--ff-mono); font-size: 0.9rem; }
+
+    /* =====================================================================
+       KPI GRID + CARDS
+       ===================================================================== */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1.4rem;
+      margin-top: 0.6rem;
+    }
+    .kpi-grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
+    .kpi-card {
+      background: var(--blitzy-surface-2);
+      border: 1px solid var(--blitzy-border);
+      border-radius: 1.1rem;
+      padding: 1.6rem 1.5rem 1.5rem 1.5rem;
+      box-shadow: var(--blitzy-elev-1);
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      min-height: 0;
+    }
+    .kpi-icon {
+      width: 3rem; height: 3rem; border-radius: 0.8rem;
+      display: inline-flex; align-items: center; justify-content: center;
+      background: var(--gradient-hero);
+      color: var(--blitzy-surface-0);
+      margin-bottom: 0.4rem;
+    }
+    .kpi-icon svg { width: 1.6rem; height: 1.6rem; stroke-width: 2; }
+    .kpi-value {
+      font-family: var(--ff-display);
+      font-weight: 700;
+      font-size: 2.5rem;
+      line-height: 1;
+      color: var(--blitzy-primary-deep);
+    }
+    .kpi-label {
+      font-size: 0.98rem;
+      color: var(--blitzy-text);
+      line-height: 1.3;
+    }
+    .kpi-card .kpi-sub {
+      font-family: var(--ff-mono);
+      font-size: 0.78rem;
+      color: var(--blitzy-text-muted);
+      letter-spacing: 0.03em;
+    }
+
+    /* =====================================================================
+       ICON ROW - horizontal value items with Lucide badges
+       ===================================================================== */
+    .icon-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1.3rem;
+      margin-top: 0.8rem;
+    }
+    .icon-row.cols-3 { grid-template-columns: repeat(3, 1fr); }
+    .icon-row.cols-5 { grid-template-columns: repeat(5, 1fr); }
+    .icon-item {
+      background: var(--blitzy-surface-1);
+      border: 1px solid var(--blitzy-border);
+      border-radius: 1rem;
+      padding: 1.4rem 1.3rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+    }
+    .icon-badge {
+      width: 2.8rem; height: 2.8rem; border-radius: 0.7rem;
+      display: inline-flex; align-items: center; justify-content: center;
+      background: var(--blitzy-primary-a14);
+      color: var(--blitzy-primary-deep);
+    }
+    .icon-badge svg { width: 1.5rem; height: 1.5rem; stroke-width: 2; }
+    .icon-item .icon-title {
+      font-family: var(--ff-display);
+      font-weight: 600;
+      font-size: 1.06rem;
+      color: var(--blitzy-primary-dark);
+    }
+    .icon-item .icon-desc { font-size: 0.92rem; color: var(--blitzy-text); line-height: 1.34; }
+
+    /* =====================================================================
+       CONTENT BULLETS
+       ===================================================================== */
+    .reveal .feature-list { list-style: none; margin: 0.4rem 0 0 0; padding: 0; }
+    .reveal .feature-list li {
+      position: relative;
+      padding: 0.7rem 0 0.7rem 2.4rem;
+      font-size: 1.16rem;
+      color: var(--blitzy-text);
+      line-height: 1.4;
+      border-bottom: 1px solid var(--blitzy-surface-1);
+    }
+    .reveal .feature-list li:last-child { border-bottom: 0; }
+    .reveal .feature-list li svg {
+      position: absolute; left: 0; top: 0.78rem;
+      width: 1.5rem; height: 1.5rem; color: var(--blitzy-primary);
+      stroke-width: 2;
+    }
+    .reveal .feature-list li strong { color: var(--blitzy-primary-deep); }
+
+    .slide-caption {
+      margin-top: 1.3rem;
+      font-size: 0.96rem;
+      color: var(--blitzy-text-muted);
+      font-family: var(--ff-mono);
+      letter-spacing: 0.01em;
+    }
+
+    /* =====================================================================
+       MAPPING TABLE
+       ===================================================================== */
+    .map-table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      margin-top: 0.6rem;
+      font-size: 1.02rem;
+      overflow: hidden;
+      border-radius: 1rem;
+      border: 1px solid var(--blitzy-border);
+    }
+    .map-table thead th {
+      background: var(--blitzy-primary-dark);
+      color: var(--blitzy-surface-0);
+      font-family: var(--ff-mono);
+      font-weight: 500;
+      font-size: 0.82rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      text-align: left;
+      padding: 0.9rem 1.2rem;
+    }
+    .map-table tbody td {
+      padding: 0.82rem 1.2rem;
+      border-top: 1px solid var(--blitzy-border);
+      color: var(--blitzy-text);
+      vertical-align: middle;
+    }
+    .map-table tbody tr:nth-child(odd) td { background: var(--blitzy-surface-2); }
+    .map-table tbody tr:nth-child(even) td { background: var(--blitzy-surface-0); }
+    .map-table .layer-cell {
+      font-family: var(--ff-display);
+      font-weight: 600;
+      color: var(--blitzy-primary-dark);
+      white-space: nowrap;
+    }
+    .map-table .layer-cell .ic {
+      display: inline-flex; vertical-align: middle; margin-right: 0.6rem;
+      color: var(--blitzy-primary);
+    }
+    .map-table .layer-cell .ic svg { width: 1.2rem; height: 1.2rem; }
+    .map-table .arrow { color: var(--blitzy-primary); }
+
+    /* =====================================================================
+       SCOPE PANELS (two-column in/out)
+       ===================================================================== */
+    .panel-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.4rem; margin-top: 0.6rem; }
+    .panel {
+      border-radius: 1.1rem;
+      border: 1px solid var(--blitzy-border);
+      padding: 1.5rem 1.6rem;
+      background: var(--blitzy-surface-0);
+    }
+    .panel.in { background: var(--blitzy-surface-2); }
+    .panel.out { background: var(--blitzy-surface-3); }
+    .panel .panel-head {
+      display: flex; align-items: center; gap: 0.7rem;
+      font-family: var(--ff-display); font-weight: 600; font-size: 1.2rem;
+      color: var(--blitzy-primary-dark); margin-bottom: 0.9rem;
+    }
+    .panel .panel-head .ph-icon {
+      width: 2.2rem; height: 2.2rem; border-radius: 0.6rem;
+      display: inline-flex; align-items: center; justify-content: center;
+      color: var(--blitzy-surface-0);
+    }
+    .panel.in .panel-head .ph-icon { background: var(--blitzy-primary); }
+    .panel.out .panel-head .ph-icon { background: var(--blitzy-text-muted); }
+    .panel .ph-icon svg { width: 1.3rem; height: 1.3rem; }
+    .panel ul { list-style: none; margin: 0; padding: 0; }
+    .panel li {
+      font-size: 1rem; color: var(--blitzy-text); line-height: 1.35;
+      padding: 0.42rem 0 0.42rem 1.5rem; position: relative;
+    }
+    .panel li::before {
+      content: ""; position: absolute; left: 0; top: 0.95rem;
+      width: 0.5rem; height: 0.5rem; border-radius: 999px;
+      background: var(--blitzy-primary);
+    }
+    .panel.out li::before { background: var(--blitzy-text-muted); }
+
+    /* =====================================================================
+       INLINE CODE CHIPS (Fira Code) - short expressions only
+       ===================================================================== */
+    .reveal code, .reveal .chip {
+      font-family: var(--ff-mono);
+      font-size: 0.86em;
+      background: var(--blitzy-primary-a08);
+      color: var(--blitzy-primary-deep);
+      padding: 0.12em 0.45em;
+      border-radius: 0.4rem;
+      border: 1px solid var(--blitzy-primary-a14);
+    }
+    .chip-row { display: flex; flex-wrap: wrap; gap: 0.7rem; margin-top: 0.4rem; }
+    .chip-row .chip { font-size: 1rem; padding: 0.5rem 0.9rem; }
+
+    /* =====================================================================
+       MERMAID CONTAINER
+       ===================================================================== */
+    .reveal pre.mermaid {
+      background: var(--blitzy-surface-2);
+      border: 1px solid var(--blitzy-border);
+      border-radius: 1.1rem;
+      padding: 1.4rem;
+      /* Hug the rendered diagram and center it, rather than stretching a wide
+         empty surface panel around a narrower (portrait) flowchart. */
+      margin: 0.4rem auto 0 auto;
+      box-shadow: var(--blitzy-elev-1);
+      text-align: center;
+      box-sizing: border-box;
+      width: fit-content;
+      max-width: 100%;
+      overflow: hidden;
+    }
+    .reveal pre.mermaid svg { max-width: 100%; height: auto; }
+
+    /* =====================================================================
+       SLIDE HEADER (eyebrow + heading grouping) and layout helpers
+       ===================================================================== */
+    .slide-head { margin-bottom: 0.6rem; }
+    .two-col { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 2rem; align-items: center; }
+    .two-col .col-visual { display: flex; flex-direction: column; justify-content: center; }
+    .spacer-sm { height: 0.6rem; }
+
+    /* Slide number / progress styling tuned to brand */
+    .reveal .slide-number { background: var(--blitzy-primary-a30); font-family: var(--ff-mono); }
+    .reveal .progress { color: var(--blitzy-primary); height: 4px; }
+    .reveal .controls { color: var(--blitzy-primary); }
+
+    /* Footer brand tag shown on content slides */
+    .slide-foot {
+      position: absolute;
+      left: 5rem; bottom: 1.7rem;
+      font-family: var(--ff-mono);
+      font-size: 0.72rem;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--blitzy-text-muted);
+      display: flex; align-items: center; gap: 0.5rem;
+    }
+    .slide-foot .fdot { width: 0.3rem; height: 0.3rem; border-radius: 999px; background: var(--blitzy-primary); display: inline-block; }
+    .reveal section.slide-title .slide-foot,
+    .reveal section.slide-divider .slide-foot,
+    .reveal section.slide-closing .slide-foot { color: var(--blitzy-white-a72); }
+    .reveal section.slide-title .slide-foot .fdot,
+    .reveal section.slide-divider .slide-foot .fdot,
+    .reveal section.slide-closing .slide-foot .fdot { background: var(--blitzy-accent-teal); }
+  </style>
+</head>
+<body>
+  <div class="reveal">
+    <div class="slides">
+
+      <!-- ============================= SLIDE 1 - TITLE ============================= -->
+      <section class="slide-title">
+        <span class="hero-icon"><i data-lucide="boxes"></i></span>
+        <p class="eyebrow"><i data-lucide="shield-check"></i> Executive Briefing &middot; Memory-Safe Systems</p>
+        <h1>C-to-Rust Rewrite of zlib</h1>
+        <p class="lead">A behavior-preserving migration of the zlib compression library to memory-safe Rust &mdash; byte-identical output and a drop-in C ABI, with no change required from downstream consumers.</p>
+        <div class="title-meta">
+          <span>Prepared for technical leadership</span>
+          <span class="dot"></span>
+          <span>Baseline zlib 1.3.2.1-motley</span>
+          <span class="dot"></span>
+          <span>Target crate <code>zlib_rs</code></span>
+        </div>
+        <div class="accent-bar"></div>
+      </section>
+
+      <!-- ============================= SLIDE 2 - HEADLINE KPIs ============================= -->
+      <section>
+        <div class="slide-head">
+          <p class="eyebrow"><i data-lucide="gauge"></i> At a Glance</p>
+          <h2>What this migration delivers</h2>
+        </div>
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <span class="kpi-icon"><i data-lucide="shield-check"></i></span>
+            <span class="kpi-value">&gt;98%</span>
+            <span class="kpi-label">Safe Rust by line count</span>
+            <span class="kpi-sub">unsafe only at FFI &amp; inflate hot loop</span>
+          </div>
+          <div class="kpi-card">
+            <span class="kpi-icon"><i data-lucide="binary"></i></span>
+            <span class="kpi-value">1 : 1</span>
+            <span class="kpi-label">Byte-identical compressed output vs C zlib</span>
+            <span class="kpi-sub">same level &middot; strategy &middot; windowBits</span>
+          </div>
+          <div class="kpi-card">
+            <span class="kpi-icon"><i data-lucide="plug-zap"></i></span>
+            <span class="kpi-value">Drop-in</span>
+            <span class="kpi-label">C ABI / FFI replacement for libz</span>
+            <span class="kpi-sub">lib + cdylib + staticlib</span>
+          </div>
+          <div class="kpi-card">
+            <span class="kpi-icon"><i data-lucide="files"></i></span>
+            <span class="kpi-value">26 &rarr; 44</span>
+            <span class="kpi-label">C files ported to Rust modules</span>
+            <span class="kpi-sub">~23.1k C &rarr; ~33.7k Rust lines</span>
+          </div>
+        </div>
+        <p class="slide-caption">Single Cargo crate &middot; edition 2024 &middot; MSRV 1.85</p>
+        <div class="slide-foot"><span class="fdot"></span> zlib_rs &middot; C-to-Rust Migration</div>
+      </section>
+
+      <!-- ============================= SLIDE 3 - ARCHITECTURE (Mermaid) ============================= -->
+      <section>
+        <div class="slide-head">
+          <p class="eyebrow"><i data-lucide="workflow"></i> Architecture &middot; Before &amp; After</p>
+          <h2>Six C layers become safe Rust modules</h2>
+        </div>
+        <pre class="mermaid">
+graph LR
+  subgraph cb["C Baseline &mdash; libz 1.3.2.1"]
+    direction TB
+    C1["Public API &mdash; zlib.h / zconf.h"]
+    C2["Deflate &mdash; deflate.c / trees.c"]
+    C3["Inflate &mdash; inflate.c / inffast.c / inftrees.c"]
+    C4["Checksums &mdash; adler32.c / crc32.c"]
+    C5["Gzip I/O &mdash; gzlib.c / gzread.c / gzwrite.c"]
+    C6["Utilities &mdash; compress.c / uncompr.c / zutil.c"]
+  end
+  subgraph rt["Rust Target &mdash; crate zlib_rs"]
+    direction TB
+    R0["src/ffi.rs &mdash; C-ABI shim"]
+    R1["src/lib.rs &mdash; stream / constants / error"]
+    R2["src/deflate/*"]
+    R3["src/inflate/*"]
+    R4["src/checksum/*"]
+    R5["src/gz/*"]
+    R6["src/util/*"]
+  end
+  C1 --> R0
+  C1 --> R1
+  C2 --> R2
+  C3 --> R3
+  C4 --> R4
+  C5 --> R5
+  C6 --> R6
+        </pre>
+        <div class="slide-foot"><span class="fdot"></span> Wire format frozen &middot; C ABI preserved through ffi.rs</div>
+      </section>
+
+      <!-- ============================= SLIDE 4 - DIVIDER: WHY ============================= -->
+      <section class="slide-divider">
+        <span class="hero-icon"><i data-lucide="circle-help"></i></span>
+        <p class="eyebrow">Section 01</p>
+        <h2>Why migrate to Rust</h2>
+        <p class="divider-sub">Removing a class of memory-safety defects without touching the wire format or the public contract.</p>
+      </section>
+
+      <!-- ============================= SLIDE 5 - BUSINESS VALUE ============================= -->
+      <section>
+        <div class="slide-head">
+          <p class="eyebrow"><i data-lucide="target"></i> The Case for the Rewrite</p>
+          <h2>Memory safety without disruption</h2>
+        </div>
+        <div class="icon-row">
+          <div class="icon-item">
+            <span class="icon-badge"><i data-lucide="shield-check"></i></span>
+            <span class="icon-title">Defects eliminated</span>
+            <span class="icon-desc">Use-after-free and double-free are unrepresentable in the safe core &mdash; enforced by the borrow checker.</span>
+          </div>
+          <div class="icon-item">
+            <span class="icon-badge"><i data-lucide="git-branch"></i></span>
+            <span class="icon-title">Maintainability</span>
+            <span class="icon-desc">Exhaustive <code>enum</code> + <code>match</code> replace fragile integer state and <code>goto</code>.</span>
+          </div>
+          <div class="icon-item">
+            <span class="icon-badge"><i data-lucide="plug"></i></span>
+            <span class="icon-title">Drop-in compatibility</span>
+            <span class="icon-desc">Exported C symbols match exactly &mdash; existing callers relink with no code changes.</span>
+          </div>
+          <div class="icon-item">
+            <span class="icon-badge"><i data-lucide="lock"></i></span>
+            <span class="icon-title">Contract preserved</span>
+            <span class="icon-desc">Same RFC formats, same API surface, same compressed bytes.</span>
+          </div>
+        </div>
+        <p class="slide-caption">Behavior-preserving &middot; same repository &middot; zero C dependency in the shipped crate</p>
+        <div class="slide-foot"><span class="fdot"></span> zlib_rs &middot; Business Value</div>
+      </section>
+
+      <!-- ============================= SLIDE 6 - DIVIDER: WHAT CHANGED ============================= -->
+      <section class="slide-divider">
+        <span class="hero-icon"><i data-lucide="arrow-left-right"></i></span>
+        <p class="eyebrow">Section 02</p>
+        <h2>What changed</h2>
+        <p class="divider-sub">The language and memory model change; the observable byte stream and C ABI stay invariant.</p>
+      </section>
+
+      <!-- ============================= SLIDE 7 - MODULE MAPPING (table) ============================= -->
+      <section>
+        <div class="slide-head">
+          <p class="eyebrow"><i data-lucide="git-compare"></i> Module Mapping</p>
+          <h2>C sources map to Rust modules</h2>
+        </div>
+        <table class="map-table">
+          <thead>
+            <tr><th>Layer</th><th>C sources</th><th>Rust module</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="layer-cell"><span class="ic"><i data-lucide="file-code"></i></span>Public API</td>
+              <td>zlib.h &middot; zconf.h &middot; zlib.map</td>
+              <td><span class="arrow">&rarr;</span> <code>src/lib.rs</code> &middot; <code>ffi.rs</code> &middot; stream &middot; error</td>
+            </tr>
+            <tr>
+              <td class="layer-cell"><span class="ic"><i data-lucide="package"></i></span>Deflate</td>
+              <td>deflate.c &middot; trees.c</td>
+              <td><span class="arrow">&rarr;</span> <code>src/deflate/*</code></td>
+            </tr>
+            <tr>
+              <td class="layer-cell"><span class="ic"><i data-lucide="package-check"></i></span>Inflate</td>
+              <td>inflate.c &middot; inffast.c &middot; inftrees.c &middot; infback.c</td>
+              <td><span class="arrow">&rarr;</span> <code>src/inflate/*</code></td>
+            </tr>
+            <tr>
+              <td class="layer-cell"><span class="ic"><i data-lucide="binary"></i></span>Checksum</td>
+              <td>adler32.c &middot; crc32.c</td>
+              <td><span class="arrow">&rarr;</span> <code>src/checksum/*</code></td>
+            </tr>
+            <tr>
+              <td class="layer-cell"><span class="ic"><i data-lucide="file-text"></i></span>Gzip I/O</td>
+              <td>gzlib.c &middot; gzread.c &middot; gzwrite.c &middot; gzclose.c</td>
+              <td><span class="arrow">&rarr;</span> <code>src/gz/*</code></td>
+            </tr>
+            <tr>
+              <td class="layer-cell"><span class="ic"><i data-lucide="wrench"></i></span>Utilities</td>
+              <td>compress.c &middot; uncompr.c &middot; zutil.c</td>
+              <td><span class="arrow">&rarr;</span> <code>src/util/*</code></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="slide-foot"><span class="fdot"></span> 26 core C files &middot; six architectural layers</div>
+      </section>
+
+      <!-- ============================= SLIDE 8 - OWNERSHIP MODEL (Mermaid) ============================= -->
+      <section>
+        <div class="slide-head">
+          <p class="eyebrow"><i data-lucide="recycle"></i> Memory Model</p>
+          <h2>Manual allocation becomes ownership</h2>
+        </div>
+        <div class="two-col">
+          <div class="col-visual">
+            <pre class="mermaid">
+graph TD
+  A["ZStream (owned by caller)"]
+  A -->|Box| B["DeflateState"]
+  A -->|Box| C["InflateState"]
+  B -->|Vec u8| D["window"]
+  B -->|Vec u8| E["pending_buf"]
+  B -->|Box u16| F["head / prev"]
+  C -->|Vec u8| G["window"]
+  C -->|Box Code| H["codes"]
+  A -.->|Drop| I["frees all &mdash; no zfree, no leak"]
+            </pre>
+          </div>
+          <div>
+            <ul class="feature-list">
+              <li><i data-lucide="box"></i><strong>Ownership tree</strong> replaces <code>ZALLOC</code>/<code>ZFREE</code> hooks.</li>
+              <li><i data-lucide="layers"></i>Raw <code>next_in</code>/<code>next_out</code> pointers become <code>&amp;[u8]</code> slices.</li>
+              <li><i data-lucide="recycle"></i><code>Drop</code> replaces <code>deflateEnd</code>/<code>inflateEnd</code> &mdash; deterministic, leak-free.</li>
+            </ul>
+          </div>
+        </div>
+        <div class="slide-foot"><span class="fdot"></span> Allocator trait preserves custom zalloc / zfree for C callers</div>
+      </section>
+
+      <!-- ============================= SLIDE 9 - DIVIDER: RISK & MITIGATION ============================= -->
+      <section class="slide-divider">
+        <span class="hero-icon"><i data-lucide="shield-alert"></i></span>
+        <p class="eyebrow">Section 03</p>
+        <h2>Risk &amp; mitigation</h2>
+        <p class="divider-sub">Equivalence is proven, not assumed &mdash; and unsafe code is fenced into two audited sites.</p>
+      </section>
+
+      <!-- ============================= SLIDE 10 - CORRECTNESS ============================= -->
+      <section>
+        <div class="slide-head">
+          <p class="eyebrow"><i data-lucide="microscope"></i> Correctness &amp; Assurance</p>
+          <h2>Proving equivalence</h2>
+        </div>
+        <div class="icon-row cols-3">
+          <div class="icon-item">
+            <span class="icon-badge"><i data-lucide="equal"></i></span>
+            <span class="icon-title">Byte-for-byte oracle</span>
+            <span class="icon-desc">Interop tests compare output to <code>flate2</code> (canonical C zlib) byte-for-byte.</span>
+          </div>
+          <div class="icon-item">
+            <span class="icon-badge"><i data-lucide="lock-keyhole"></i></span>
+            <span class="icon-title">Unsafe confined</span>
+            <span class="icon-desc">All unsafe lives in <code>ffi.rs</code> + <code>inflate/fast.rs</code>; every block has a SAFETY note.</span>
+          </div>
+          <div class="icon-item">
+            <span class="icon-badge"><i data-lucide="list-checks"></i></span>
+            <span class="icon-title">Official vectors</span>
+            <span class="icon-desc">Ports of example.c, infcover.c and minigzip drive the test suite.</span>
+          </div>
+        </div>
+        <p class="slide-caption">Layered validation &middot; regression &middot; coverage &middot; property &middot; round-trip &middot; checksum</p>
+        <div class="slide-foot"><span class="fdot"></span> 47 unsafe occurrences across 9 files &middot; &gt;98% safe by line</div>
+      </section>
+
+      <!-- ============================= SLIDE 11 - PERFORMANCE GATES (KPI) ============================= -->
+      <section>
+        <div class="slide-head">
+          <p class="eyebrow"><i data-lucide="gauge"></i> Performance Gates</p>
+          <h2>Targets, measured against C zlib</h2>
+        </div>
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <span class="kpi-icon"><i data-lucide="gauge"></i></span>
+            <span class="kpi-value">&ge; 80%</span>
+            <span class="kpi-label">Compression throughput vs C zlib</span>
+            <span class="kpi-sub">equivalent levels</span>
+          </div>
+          <div class="kpi-card">
+            <span class="kpi-icon"><i data-lucide="zap"></i></span>
+            <span class="kpi-value">&ge; 1&times;</span>
+            <span class="kpi-label">Decompression throughput</span>
+            <span class="kpi-sub">parity or better</span>
+          </div>
+          <div class="kpi-card">
+            <span class="kpi-icon"><i data-lucide="cpu"></i></span>
+            <span class="kpi-value">&ge; 3&times;</span>
+            <span class="kpi-label">CRC-32 SIMD vs scalar</span>
+            <span class="kpi-sub">via crc32fast</span>
+          </div>
+          <div class="kpi-card">
+            <span class="kpi-icon"><i data-lucide="memory-stick"></i></span>
+            <span class="kpi-value">&le; 1&times;</span>
+            <span class="kpi-label">Memory footprint vs C zlib</span>
+            <span class="kpi-sub">same windowBits / memLevel</span>
+          </div>
+        </div>
+        <p class="slide-caption">Validated by criterion benchmarks &middot; gates enforced in CI</p>
+        <div class="slide-foot"><span class="fdot"></span> zlib_rs &middot; Performance</div>
+      </section>
+
+      <!-- ============================= SLIDE 12 - DIVIDER: ONBOARDING ============================= -->
+      <section class="slide-divider">
+        <span class="hero-icon"><i data-lucide="rocket"></i></span>
+        <p class="eyebrow">Section 04</p>
+        <h2>Onboarding &amp; continued development</h2>
+        <p class="divider-sub">One toolchain, standard commands, and automated quality gates from day one.</p>
+      </section>
+
+      <!-- ============================= SLIDE 13 - CARGO WORKFLOW ============================= -->
+      <section>
+        <div class="slide-head">
+          <p class="eyebrow"><i data-lucide="terminal"></i> Developer Workflow</p>
+          <h2>One toolchain, standard commands</h2>
+        </div>
+        <div class="chip-row">
+          <span class="chip">cargo build</span>
+          <span class="chip">cargo test</span>
+          <span class="chip">cargo bench</span>
+          <span class="chip">cargo clippy</span>
+          <span class="chip">cargo fmt</span>
+        </div>
+        <div class="spacer-sm"></div>
+        <div class="icon-row cols-3">
+          <div class="icon-item">
+            <span class="icon-badge"><i data-lucide="package"></i></span>
+            <span class="icon-title">Build &amp; test</span>
+            <span class="icon-desc">Cargo builds <code>lib</code>, <code>cdylib</code> and <code>staticlib</code>, then runs the full suite.</span>
+          </div>
+          <div class="icon-item">
+            <span class="icon-badge"><i data-lucide="git-pull-request"></i></span>
+            <span class="icon-title">CI gates</span>
+            <span class="icon-desc"><code>clippy -D warnings</code> and <code>fmt --check</code> block merges on any violation.</span>
+          </div>
+          <div class="icon-item">
+            <span class="icon-badge"><i data-lucide="shield-half"></i></span>
+            <span class="icon-title">MSRV pinned</span>
+            <span class="icon-desc">Edition 2024, minimum supported Rust 1.85 &mdash; reproducible everywhere.</span>
+          </div>
+        </div>
+        <div class="slide-foot"><span class="fdot"></span> Dependencies pre-resolved &middot; offline builds supported</div>
+      </section>
+
+      <!-- ============================= SLIDE 14 - COMPATIBILITY SURFACE ============================= -->
+      <section>
+        <div class="slide-head">
+          <p class="eyebrow"><i data-lucide="layers"></i> Compatibility Surface</p>
+          <h2>Full format &amp; API surface preserved</h2>
+        </div>
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <span class="kpi-icon"><i data-lucide="file-text"></i></span>
+            <span class="kpi-value">3 RFCs</span>
+            <span class="kpi-label">1950 zlib &middot; 1951 DEFLATE &middot; 1952 gzip</span>
+          </div>
+          <div class="kpi-card">
+            <span class="kpi-icon"><i data-lucide="sliders-horizontal"></i></span>
+            <span class="kpi-value">10</span>
+            <span class="kpi-label">Compression levels (0&ndash;9, default &rarr; 6)</span>
+          </div>
+          <div class="kpi-card">
+            <span class="kpi-icon"><i data-lucide="layers"></i></span>
+            <span class="kpi-value">5</span>
+            <span class="kpi-label">Strategies (default, filtered, Huffman, RLE, fixed)</span>
+          </div>
+          <div class="kpi-card">
+            <span class="kpi-icon"><i data-lucide="waves"></i></span>
+            <span class="kpi-value">7</span>
+            <span class="kpi-label">Flush modes (no-flush &hellip; block, trees)</span>
+          </div>
+        </div>
+        <p class="slide-caption">windowBits overloading 8&ndash;15 / &minus;8&hellip;&minus;15 / 24&ndash;31 / 40&ndash;47 &middot; preset dictionaries &middot; inflateSync recovery</p>
+        <div class="slide-foot"><span class="fdot"></span> zlib_rs &middot; Compatibility</div>
+      </section>
+
+      <!-- ============================= SLIDE 15 - DELIVERY STATUS / SCOPE ============================= -->
+      <section>
+        <div class="slide-head">
+          <p class="eyebrow"><i data-lucide="scroll-text"></i> Scope &amp; Delivery</p>
+          <h2>Focused scope, single-phase delivery</h2>
+        </div>
+        <div class="panel-grid">
+          <div class="panel in">
+            <div class="panel-head"><span class="ph-icon"><i data-lucide="circle-check"></i></span> In scope</div>
+            <ul>
+              <li>All 26 core C files &rarr; ~44 Rust modules</li>
+              <li>DEFLATE, INFLATE, checksum, gzip I/O, utilities</li>
+              <li>C-ABI FFI shim + generated C header</li>
+              <li>Full test suite + benchmarks + CI</li>
+            </ul>
+          </div>
+          <div class="panel out">
+            <div class="panel-head"><span class="ph-icon"><i data-lucide="package"></i></span> Out of scope</div>
+            <ul>
+              <li>bzip2, lzma or other formats</li>
+              <li>New compression algorithms</li>
+              <li>GUI or tooling beyond the library</li>
+              <li>C build system &amp; legacy platform dirs</li>
+            </ul>
+          </div>
+        </div>
+        <p class="slide-caption">Executed as one phase &mdash; the crate compiles, links and tests as a complete unit</p>
+        <div class="slide-foot"><span class="fdot"></span> zlib_rs &middot; Scope</div>
+      </section>
+
+      <!-- ============================= SLIDE 16 - CLOSING ============================= -->
+      <section class="slide-closing">
+        <p class="eyebrow"><i data-lucide="check-check"></i> The Bottom Line</p>
+        <h2>Safe. Compatible. Drop&#8209;in.</h2>
+        <ul class="closing-next">
+          <li><i data-lucide="binary"></i>Confirm byte-identical output across all levels &amp; strategies</li>
+          <li><i data-lucide="gauge"></i>Benchmark throughput vs C zlib and hold the &ge;80% gate</li>
+          <li><i data-lucide="package-check"></i>Publish the crate and generated C header for drop-in adoption</li>
+        </ul>
+        <div class="brand-lockup">
+          <span class="mark"><i data-lucide="boxes"></i></span>
+          Blitzy <span class="sep">/</span> <span class="muted">zlib_rs &middot; C-to-Rust Migration</span>
+        </div>
+        <div class="accent-bar"></div>
+      </section>
+
+    </div>
+  </div>
+
+  <!-- Runtime libraries (CDN, pinned exactly) -->
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.0/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+
+  <script>
+    // ---- Mermaid: do not auto-run; theme variables snapped to Blitzy tokens ----
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: 'base',
+      // Render flowchart labels as native SVG <text> rather than HTML in a
+      // <foreignObject>. Inside reveal.js the deck's large scaled base font
+      // cascades into foreignObject labels, but Mermaid measures label widths
+      // in a detached, body-context (small) font - so the fixed-width boxes end
+      // up too narrow and the rendered text is clipped. SVG text is measured and
+      // drawn in the same font context, so node boxes always fit their labels.
+      // useMaxWidth keeps each diagram responsive within its container.
+      htmlLabels: false,
+      flowchart: { htmlLabels: false, useMaxWidth: false },
+      themeVariables: {
+        primaryColor: '#F2F0FE',
+        primaryTextColor: '#333333',
+        primaryBorderColor: '#5B39F3',
+        lineColor: '#999999',
+        secondaryColor: '#F4EFF6'
+      }
+    });
+
+    // Render Mermaid diagrams lazily and safely.
+    //
+    // reveal.js hides off-screen slides with `display: none`, which collapses a
+    // diagram's (possibly nested) container to zero width; asking Mermaid to lay
+    // a flowchart out in that state can fail. So each diagram is rendered only
+    // once its slide is actually on-screen (it has a layout box). mermaid.run()
+    // returns a Promise, so it is awaited and its rejection caught here (an
+    // uncaught rejection would otherwise surface as a console error). A
+    // re-entrancy guard stops the ready and slidechanged handlers from launching
+    // overlapping runs, and only not-yet-processed diagrams are passed in - so
+    // invoking this on the Reveal 'ready' event and on every 'slidechanged'
+    // event is idempotent and race-free, and every diagram renders as its slide
+    // first appears.
+    var mermaidBusy = false;
+    async function renderDiagrams() {
+      if (mermaidBusy) { return; }
+      var nodes = Array.prototype.slice.call(
+        document.querySelectorAll('pre.mermaid:not([data-processed="true"])')
+      ).filter(function (n) {
+        return n.offsetParent !== null && n.getClientRects().length > 0;
+      });
+      if (!nodes.length) { return; }
+      mermaidBusy = true;
+      try {
+        // Mermaid measures label widths to size flowchart node boxes. If it
+        // measures while a fallback font is still active (web fonts not yet
+        // loaded), the boxes are sized too narrow and the final, wider text is
+        // clipped. Wait for the document's web fonts (Inter / Space Grotesk /
+        // Fira Code) to finish loading so measurement uses the real metrics.
+        if (document.fonts && document.fonts.ready) {
+          await document.fonts.ready;
+        }
+        await mermaid.run({ nodes: nodes });
+      } catch (e) {
+        console.error('Mermaid render error:', e);
+      } finally {
+        mermaidBusy = false;
+      }
+    }
+
+    // (Re)build Lucide icons; replaces <i data-lucide> with inline <svg>.
+    function renderIcons() {
+      if (window.lucide && typeof window.lucide.createIcons === 'function') {
+        window.lucide.createIcons();
+      }
+    }
+
+    // ---- reveal.js: exact configuration required by the design system ----
+    Reveal.initialize({
+      hash: true,
+      transition: 'slide',
+      controlsTutorial: false,
+      width: 1920,
+      height: 1080
+    });
+
+    // Initial render after reveal.js is ready, then keep visuals in sync as
+    // slides change (icons and diagrams are re-applied on every navigation).
+    Reveal.on('ready', function () {
+      renderIcons();
+      renderDiagrams();
+    });
+    Reveal.on('slidechanged', function () {
+      renderIcons();
+      renderDiagrams();
+    });
+  </script>
+</body>
+</html>
