@@ -347,6 +347,29 @@ pub trait StreamState {
     fn is_inflate(&self) -> bool {
         matches!(self.kind(), StreamKind::Inflate)
     }
+
+    /// Optional upcast to [`core::any::Any`] for concrete-type recovery.
+    ///
+    /// The stream layer deliberately keeps `StreamState` minimal and engine
+    /// agnostic, but a few consumers — notably the gzip file-I/O layer
+    /// (`crate::gz`) — drive the inflate engine through its *free functions*,
+    /// which operate on the concrete `InflateState`. Those consumers store the
+    /// engine inside a [`ZStream`] (as `Box<dyn StreamState>`) yet still need a
+    /// `&mut InflateState` to call `inflate` / `inflate_reset`.
+    ///
+    /// This hook is the safe, additive seam that makes that recovery possible
+    /// without leaking engine types into this module: an implementor that wants
+    /// to be recoverable overrides this to return `Some(self)`, and the caller
+    /// then performs a checked [`Any::downcast_mut`]. The default returns
+    /// `None`, so states that do not opt in (e.g. `DeflateState`) are entirely
+    /// unaffected and the trait stays object-safe.
+    ///
+    /// Returning `None` simply means "not recoverable to a concrete type via
+    /// this seam"; it is never an error.
+    #[inline]
+    fn as_any_mut(&mut self) -> Option<&mut dyn core::any::Any> {
+        None
+    }
 }
 
 // ===========================================================================

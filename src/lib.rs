@@ -106,6 +106,18 @@ pub mod deflate;
 
 pub mod util;
 
+// The gzip file-I/O layer: the `gz*` API (`gzopen`/`gzread`/`gzwrite`/`gzclose`
+// and friends) layered over an owned `std::fs::File` and the inflate/deflate
+// engines. Gated by `gz-io` (which implies `std` + `gzip`), mirroring the C
+// `#ifndef NO_GZCOMPRESS` / `NO_GZIP` conditional. As with `deflate`, a handful
+// of cross-module entry points (e.g. the read-side `gzclose_r`, reused by the
+// `close.rs` dispatcher) are not yet reached from a live path until every gz
+// submodule lands, so `dead_code` is allowed for this subtree until the full
+// `gz` API and the FFI shim wire them in.
+#[cfg(feature = "gz-io")]
+#[allow(dead_code)]
+pub mod gz;
+
 // ===========================================================================
 // Public re-exports — the idiomatic crate-root surface
 // ===========================================================================
@@ -133,6 +145,12 @@ pub use inflate::Inflate;
 
 // The idiomatic compressor and its per-call outcome.
 pub use deflate::{Deflate, DeflateOutcome};
+
+// The one-shot whole-buffer helpers from the `util` layer, lifted to the crate
+// root so callers can write `zlib_rs::compress(..)` / `zlib_rs::uncompress(..)`
+// directly, mirroring the C `compress` / `compress2` / `compressBound` /
+// `uncompress` / `uncompress2` entry points (`compress.c`, `uncompr.c`).
+pub use util::{compress, compress_bound, compress2, uncompress, uncompress2};
 
 // All `Z_*` constants and the typed [`FlushMode`]/[`Strategy`]/[`DataType`]
 // enumerations are part of the public surface.

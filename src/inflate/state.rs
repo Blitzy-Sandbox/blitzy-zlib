@@ -452,6 +452,20 @@ impl StreamState for InflateState {
         self.sane = true;
         self.back = -1;
     }
+
+    /// Opt in to concrete-type recovery from a `dyn StreamState`.
+    ///
+    /// The gzip read/write layer (`crate::gz`) stores this inflate engine inside
+    /// a [`ZStream`](crate::stream::ZStream) as a `Box<dyn StreamState>` but
+    /// drives it through the inflate *free functions* (`inflate`,
+    /// `inflate_reset`), which require a `&mut InflateState`. Returning
+    /// `Some(self)` here lets those callers recover the concrete reference via a
+    /// checked [`core::any::Any::downcast_mut`], keeping the engine types out of
+    /// the `stream` module entirely.
+    #[inline]
+    fn as_any_mut(&mut self) -> Option<&mut dyn core::any::Any> {
+        Some(self)
+    }
 }
 
 impl Drop for InflateState {

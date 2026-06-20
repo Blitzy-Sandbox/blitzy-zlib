@@ -364,6 +364,20 @@ pub struct GzState {
     /// (mirrors the engine's `avail_in`).
     pub(crate) in_avail: usize,
 
+    /// The owned **deflate** engine used by the write path (`write.rs`).
+    ///
+    /// The generic [`strm`](Self::strm) holds a `Box<dyn StreamState>`, which
+    /// cannot be recovered as a concrete `&mut DeflateState` (the
+    /// [`StreamState`](crate::stream::StreamState) trait exposes no downcast).
+    /// Because the gzip write path must call [`deflate`](crate::deflate::deflate)
+    /// — which operates on a concrete `DeflateState` — the engine is stored here
+    /// as an owned `Box<DeflateState>` (mirroring the canonical `Deflate`
+    /// consumer in `util/compress.rs`). It is `None` until the first write
+    /// lazily initializes it (C `gz_init`'s `deflateInit2`), and its own
+    /// [`Drop`] frees the deflate state when the `GzState` is dropped (RAII;
+    /// AAP §0.6.3). Read streams leave this `None` and use the generic engine.
+    pub(crate) deflate: Option<Box<crate::deflate::DeflateState>>,
+
     // --- teardown hook (no C analogue; realises the RAII Drop contract) ---
     /// Optional best-effort finalize routine installed by the write path; see
     /// [`FinalizeFn`]. `Some` for an active write stream, `None` otherwise and
@@ -424,6 +438,7 @@ impl GzState {
             strm: ZStream::new(),
             in_next: 0,
             in_avail: 0,
+            deflate: None,
             // teardown hook
             finalize: None,
         }
