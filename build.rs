@@ -322,22 +322,32 @@ fn generate_c_header(manifest_dir: &Path, out_dir: &Path) {
         .generate()
     {
         Ok(bindings) => {
-            // Stable, source-tree location for downstream C consumers. We
-            // create the directory ourselves (rather than relying on cbindgen's
-            // internal `create_dir_all`) so a directory failure is reported
-            // cleanly through `cargo:warning` instead of panicking inside the
-            // library.
+            // Render the generated header into an in-memory buffer ONCE, then
+            // write it out with explicit, fallible `fs::write` calls.
             //
-            // `Bindings::write_to_file` returns `false` when the target file is
-            // already byte-identical to the freshly generated content — it
-            // deliberately skips the write to preserve the file's mtime. Both
-            // `true` (written) and `false` (already current) are success, so the
-            // returned bool is intentionally discarded; only a genuine
-            // directory-creation failure is surfaced as a warning.
+            // We deliberately avoid `Bindings::write_to_file`: in cbindgen
+            // 0.28.0 that helper performs its directory creation and file write
+            // with internal `unwrap()`s, so any I/O failure (a read-only source
+            // tree, a permissions problem, a full disk) would PANIC and hard-
+            // fail the entire crate build. Header emission is required to
+            // degrade gracefully (AAP §0.3.1 robustness; the header must never
+            // be able to break the core library build), so instead we use the
+            // fallible `Bindings::write` to a `Vec<u8>` and surface every write
+            // failure through `cargo:warning=` without ever panicking.
+            let mut rendered: Vec<u8> = Vec::new();
+            bindings.write(&mut rendered);
+
+            // Stable, source-tree location for downstream C consumers.
             let include_dir = manifest_dir.join("include");
             match fs::create_dir_all(&include_dir) {
                 Ok(()) => {
-                    bindings.write_to_file(include_dir.join("zlib-rs.h"));
+                    let header_path = include_dir.join("zlib-rs.h");
+                    if let Err(e) = fs::write(&header_path, &rendered) {
+                        println!(
+                            "cargo:warning=zlib-rs: could not write {}: {e}.",
+                            header_path.display()
+                        );
+                    }
                 }
                 Err(e) => {
                     println!(
@@ -348,7 +358,13 @@ fn generate_c_header(manifest_dir: &Path, out_dir: &Path) {
             }
 
             // Mirror into OUT_DIR as well (always writable, under `target/`).
-            bindings.write_to_file(out_dir.join("zlib_rs.h"));
+            let out_header = out_dir.join("zlib_rs.h");
+            if let Err(e) = fs::write(&out_header, &rendered) {
+                println!(
+                    "cargo:warning=zlib-rs: could not write {}: {e}.",
+                    out_header.display()
+                );
+            }
         }
         Err(e) => {
             // The most common benign cause is `src/ffi.rs` not yet existing or

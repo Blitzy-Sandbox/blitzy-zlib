@@ -90,6 +90,20 @@ gz-io = ["std", "gzip"]
 no-std = []
 # SIMD-accelerated CRC-32 via the optional `crc32fast` dependency.
 simd = ["dep:crc32fast"]
+# Gates the `#[no_mangle] extern "C"` drop-in C-ABI surface (`src/ffi.rs`).
+#
+# When enabled, the crate exports the canonical zlib C symbols (`deflate`,
+# `inflate`, `crc32`, `adler32`, `compress2`, `uncompress`, …) so the
+# `cdylib`/`staticlib` artifacts act as a binary-level replacement for `libz`.
+# The `build.rs` script also keys cbindgen C-header generation off this feature
+# (it checks `CARGO_FEATURE_CAPI`). It is left OFF by default — and in
+# particular for `cargo test` — because those canonical symbol names would
+# otherwise collide at link time with the bundled C zlib pulled in by the
+# `flate2` dev-dependency's `zlib` backend. The FFI shim that consumes this
+# feature lands with the compression engine in the next checkpoint; declaring
+# the feature now fixes the gate so CI, cbindgen, and the future `src/ffi.rs`
+# can reference it consistently.
+capi = []
 
 # ----------------------------------------------------------------------------
 # [dependencies] — runtime. Kept deliberately MINIMAL: C zlib has zero external
@@ -123,10 +137,10 @@ criterion = "0.5.1"
 #
 # Symbol-collision note for the `src/ffi.rs` author: this backend exports the
 # canonical C symbols (`deflate`, `inflate`, `crc32`, …) which can clash at
-# test-link time with the crate's own `#[no_mangle]` exports. If a link
-# conflict arises, gate those exports behind an optional `capi` feature
-# (enabled for the cdylib/staticlib drop-in, disabled for `cargo test`) — add
-# it only if required; the five features above remain the primary surface.
+# test-link time with the crate's own `#[no_mangle]` exports. Those exports are
+# therefore gated behind the `capi` feature declared above (enabled for the
+# cdylib/staticlib drop-in, disabled for `cargo test`), so the default test
+# build links cleanly against this backend. `capi` is OFF by default.
 flate2 = { version = "1.1.1", features = ["zlib"] }
 # Property-based round-trip testing.
 quickcheck = "1.0.3"
@@ -136,18 +150,28 @@ rand = "0.9.0"
 # ----------------------------------------------------------------------------
 # [[bench]] — criterion harnesses (AAP §0.3.1, §0.4.1). `harness = false` is
 # required so criterion provides its own `main`. Sources live in `benches/`.
+#
+# CHECKPOINT NOTE: the benchmark sources (`benches/deflate_bench.rs`,
+# `benches/inflate_bench.rs`, `benches/checksum_bench.rs`) are produced together
+# with the compression engine in the next checkpoint. Cargo validates that every
+# declared target file exists while *parsing* the manifest, so declaring these
+# `[[bench]]` targets now — before their source files land — makes the manifest
+# unparseable and breaks `cargo build`, `cargo clippy --all-targets`, and
+# `cargo bench --no-run` for the whole crate. They are therefore commented out
+# until the bench sources exist, at which point the three blocks below are
+# re-enabled verbatim.
 # ----------------------------------------------------------------------------
-[[bench]]
-name = "deflate_bench"
-harness = false
-
-[[bench]]
-name = "inflate_bench"
-harness = false
-
-[[bench]]
-name = "checksum_bench"
-harness = false
+# [[bench]]
+# name = "deflate_bench"
+# harness = false
+#
+# [[bench]]
+# name = "inflate_bench"
+# harness = false
+#
+# [[bench]]
+# name = "checksum_bench"
+# harness = false
 
 # ----------------------------------------------------------------------------
 # [profile.release] — tuned for throughput/footprint parity with C zlib

@@ -24,11 +24,16 @@
     /* =====================================================================
        BLITZY REVEAL.JS DESIGN SYSTEM - inlined theme (canonical
        blitzy-deck/references/blitzy-reveal-theme.css is absent in-repo, so the
-       full theme is embedded here per AAP section 0.8.6). Every color/font/gradient
-       value resolves to a token below; translucent and shadow values are
-       derived with color-mix() over those tokens so no raw hex appears at any
-       usage site. Only 0/none/auto/inherit/currentColor/transparent literals
-       are used directly.
+       full theme is embedded here per AAP section 0.8.6). EVERY usage-site value
+       resolves to a token defined in :root - colors, fonts, gradients, and the
+       full dimensional scale (font sizes, line heights, letter spacing, font
+       weights, stroke widths, radii, border widths, measures, grid templates,
+       and the spacing/size scale). Translucent and shadow values are derived
+       with color-mix() over those tokens so no raw hex appears at any usage
+       site. The ONLY literals permitted at usage sites are
+       0/none/auto/inherit/currentColor/transparent; raw numbers appear solely
+       inside these :root token definitions and in @media feature thresholds
+       (which CSS cannot tokenize).
        ===================================================================== */
     :root {
       /* ---- Brand colors ---- */
@@ -58,7 +63,7 @@
       /* ---- Gradients ---- */
       --gradient-hero: linear-gradient(68deg, #7A6DEC 15.56%, #5B39F3 62.74%, #4101DB 84.44%);
       --gradient-divider: linear-gradient(135deg, #2D1C77 0%, #5B39F3 100%);
-      --gradient-accent: linear-gradient(90deg, #5B39F3 0%, #94FAD5 100%);
+      --gradient-accent: linear-gradient(90deg, var(--blitzy-primary) 0%, var(--blitzy-accent-teal) 100%);
 
       /* ---- Derived translucent tints (color-mix over base tokens only) ---- */
       --blitzy-primary-a08: color-mix(in srgb, var(--blitzy-primary) 8%, transparent);
@@ -75,18 +80,146 @@
       --blitzy-elev-1: 0 0.4rem 1.4rem color-mix(in srgb, var(--blitzy-primary-navy) 12%, transparent);
       --blitzy-elev-2: 0 1rem 3rem color-mix(in srgb, var(--blitzy-primary-navy) 18%, transparent);
       --blitzy-elev-glow: 0 0.6rem 2.4rem color-mix(in srgb, var(--blitzy-primary) 28%, transparent);
+
+      /* ---- Font-size scale ---- */
+      --fs-root: 34px;
+      --fs-3xl: 3.7rem;
+      --fs-2xl: 3.4rem;
+      --fs-xl: 3.1rem;
+      --fs-lg: 3rem;
+      --fs-kpi: 2.5rem;
+      --fs-h2: 2.3rem;
+      --fs-lead: 1.4rem;
+      --fs-h3: 1.35rem;
+      --fs-title-lg: 1.2rem;
+      --fs-li-lg: 1.18rem;
+      --fs-bullet: 1.16rem;
+      --fs-brand: 1.15rem;
+      --fs-icon-title: 1.06rem;
+      --fs-table: 1.02rem;
+      --fs-md: 1rem;
+      --fs-label: 0.98rem;
+      --fs-caption: 0.96rem;
+      --fs-desc: 0.92rem;
+      --fs-sm: 0.9rem;
+      --fs-eyebrow: 0.86rem;
+      --fs-code: 0.86em;
+      --fs-meta: 0.82rem;
+      --fs-xs: 0.78rem;
+      --fs-foot: 0.72rem;
+
+      /* ---- Line-height scale ---- */
+      --lh-1: 1;
+      --lh-heading: 1.08;
+      --lh-snug: 1.3;
+      --lh-desc: 1.34;
+      --lh-panel: 1.35;
+      --lh-bullet: 1.4;
+      --lh-body: 1.45;
+
+      /* ---- Letter-spacing scale ---- */
+      --ls-tight: -0.01em;
+      --ls-caption: 0.01em;
+      --ls-sub: 0.03em;
+      --ls-meta: 0.08em;
+      --ls-table: 0.12em;
+      --ls-foot: 0.16em;
+      --ls-eyebrow: 0.26em;
+
+      /* ---- Font weights ---- */
+      --fw-regular: 400;
+      --fw-medium: 500;
+      --fw-semibold: 600;
+      --fw-bold: 700;
+
+      /* ---- Stroke widths (Lucide SVG) ---- */
+      --sw-thin: 1.6;
+      --sw-regular: 2;
+      --sw-bold: 2.4;
+
+      /* ---- Border radii ---- */
+      --radius-sm: 0.4rem;
+      --radius-md: 0.6rem;
+      --radius-lg: 0.7rem;
+      --radius-xl: 0.8rem;
+      --radius-2xl: 1rem;
+      --radius-3xl: 1.1rem;
+      --radius-pill: 999px;
+
+      /* ---- Border width ---- */
+      --bw-hairline: 1px;
+
+      /* ---- Measures (max line width, ch) ---- */
+      --measure-closing-h: 18ch;
+      --measure-divider-h: 22ch;
+      --measure-title-h: 26ch;
+      --measure-divider-sub: 40ch;
+      --measure-lead: 44ch;
+      --measure-closing-list: 50ch;
+
+      /* ---- Grid templates ---- */
+      --grid-3: repeat(3, 1fr);
+      --grid-4: repeat(4, 1fr);
+      --grid-5: repeat(5, 1fr);
+      --grid-2: 1fr 1fr;
+      --grid-two-col: 1.05fr 0.95fr;
+
+      /* ---- Percentage length ---- */
+      --pct-100: 100%;
+
+      /* ---- Spacing / size scale ---- */
+      --space-0-2: 0.2rem;
+      --space-0-3: 0.3rem;
+      --space-0-34: 0.34rem;
+      --space-0-4: 0.4rem;
+      --space-0-42: 0.42rem;
+      --space-0-5: 0.5rem;
+      --space-0-6: 0.6rem;
+      --space-0-7: 0.7rem;
+      --space-0-78: 0.78rem;
+      --space-0-8: 0.8rem;
+      --space-0-82: 0.82rem;
+      --space-0-9: 0.9rem;
+      --space-0-95: 0.95rem;
+      --space-1: 1rem;
+      --space-1-1: 1.1rem;
+      --space-1-2: 1.2rem;
+      --space-1-3: 1.3rem;
+      --space-1-4: 1.4rem;
+      --space-1-5: 1.5rem;
+      --space-1-6: 1.6rem;
+      --space-1-7: 1.7rem;
+      --space-1-8: 1.8rem;
+      --space-2: 2rem;
+      --space-2-1: 2.1rem;
+      --space-2-2: 2.2rem;
+      --space-2-4: 2.4rem;
+      --space-2-8: 2.8rem;
+      --space-3: 3rem;
+      --space-4-2: 4.2rem;
+      --space-4-6: 4.6rem;
+      --space-5: 5rem;
+      --space-5-4: 5.4rem;
+      --space-6-2: 6.2rem;
+      --space-12: 12rem;
+      --space-code-y: 0.12em;
+      --space-code-x: 0.45em;
+      --size-progress: 4px;
+
+      /* ---- Responsive collapse column ---- */
+      --grid-1: 1fr;
     }
 
     /* =====================================================================
        BASE
        ===================================================================== */
-    html, body { height: 100%; }
+    html, body { height: var(--pct-100); }
 
     .reveal {
       font-family: var(--ff-body);
-      font-weight: 400;
+      font-weight: var(--fw-regular);
       color: var(--blitzy-text);
-      font-size: 34px;
+      font-size: var(--fs-root);
       -webkit-font-smoothing: antialiased;
     }
 
@@ -95,8 +228,8 @@
       background: var(--blitzy-surface-0);
       text-align: left;
       box-sizing: border-box;
-      height: 100%;
-      padding: 4.2rem 5rem;
+      height: var(--pct-100);
+      padding: var(--space-4-2) var(--space-5);
       top: 0 !important;
       display: flex;
       flex-direction: column;
@@ -116,18 +249,18 @@
     .reveal h1, .reveal h2, .reveal h3 {
       font-family: var(--ff-display);
       color: var(--blitzy-primary-dark);
-      font-weight: 600;
-      line-height: 1.08;
-      letter-spacing: -0.01em;
-      margin: 0 0 1.4rem 0;
+      font-weight: var(--fw-semibold);
+      line-height: var(--lh-heading);
+      letter-spacing: var(--ls-tight);
+      margin: 0 0 var(--space-1-4) 0;
       text-transform: none;
     }
-    .reveal h1 { font-size: 3.1rem; }
-    .reveal h2 { font-size: 2.3rem; }
-    .reveal h3 { font-size: 1.35rem; color: var(--blitzy-primary); }
+    .reveal h1 { font-size: var(--fs-xl); }
+    .reveal h2 { font-size: var(--fs-h2); }
+    .reveal h3 { font-size: var(--fs-h3); color: var(--blitzy-primary); }
 
-    .reveal p { line-height: 1.45; margin: 0 0 1rem 0; }
-    .reveal strong { color: var(--blitzy-primary-deep); font-weight: 600; }
+    .reveal p { line-height: var(--lh-body); margin: 0 0 var(--space-1) 0; }
+    .reveal strong { color: var(--blitzy-primary-deep); font-weight: var(--fw-semibold); }
     .reveal em { color: var(--blitzy-text-muted); font-style: normal; }
 
     /* Links */
@@ -138,27 +271,27 @@
        ===================================================================== */
     .eyebrow {
       font-family: var(--ff-mono);
-      font-size: 0.86rem;
-      font-weight: 500;
-      letter-spacing: 0.26em;
+      font-size: var(--fs-eyebrow);
+      font-weight: var(--fw-medium);
+      letter-spacing: var(--ls-eyebrow);
       text-transform: uppercase;
       color: var(--blitzy-primary);
-      margin: 0 0 1.1rem 0;
+      margin: 0 0 var(--space-1-1) 0;
       display: inline-flex;
       align-items: center;
-      gap: 0.6rem;
+      gap: var(--space-0-6);
     }
 
     /* =====================================================================
        ACCENT BAR - gradient rule
        ===================================================================== */
     .accent-bar {
-      width: 12rem;
-      height: 0.5rem;
+      width: var(--space-12);
+      height: var(--space-0-5);
       border: 0;
-      border-radius: 999px;
+      border-radius: var(--radius-pill);
       background: var(--gradient-accent);
-      margin: 1.6rem 0 0 0;
+      margin: var(--space-1-6) 0 0 0;
     }
     .accent-bar.center { margin-left: auto; margin-right: auto; }
 
@@ -168,39 +301,39 @@
     .reveal .slides section.slide-title {
       background: var(--gradient-hero);
       color: var(--blitzy-surface-0);
-      padding: 4.6rem 5.4rem;
+      padding: var(--space-4-6) var(--space-5-4);
     }
     .reveal section.slide-title h1 {
       color: var(--blitzy-surface-0);
-      font-size: 3.7rem;
-      max-width: 26ch;
+      font-size: var(--fs-3xl);
+      max-width: var(--measure-title-h);
     }
     .reveal section.slide-title .eyebrow { color: var(--blitzy-accent-teal); }
     .reveal section.slide-title .lead {
-      font-size: 1.4rem;
+      font-size: var(--fs-lead);
       color: var(--blitzy-white-a72);
-      max-width: 44ch;
-      margin-top: 0.4rem;
+      max-width: var(--measure-lead);
+      margin-top: var(--space-0-4);
     }
     .reveal section.slide-title .title-meta {
       font-family: var(--ff-mono);
-      font-size: 0.82rem;
-      letter-spacing: 0.08em;
+      font-size: var(--fs-meta);
+      letter-spacing: var(--ls-meta);
       color: var(--blitzy-accent-teal);
-      margin-top: 1.8rem;
+      margin-top: var(--space-1-8);
       display: flex;
-      gap: 0.8rem;
+      gap: var(--space-0-8);
       align-items: center;
       flex-wrap: wrap;
     }
     .reveal section.slide-title .title-meta .dot {
-      width: 0.34rem; height: 0.34rem; border-radius: 999px;
+      width: var(--space-0-34); height: var(--space-0-34); border-radius: var(--radius-pill);
       background: var(--blitzy-accent-teal); display: inline-block;
     }
     .reveal section.slide-title .hero-icon {
       color: var(--blitzy-accent-teal);
       background: var(--blitzy-white-a10);
-      border: 1px solid var(--blitzy-white-a16);
+      border: var(--bw-hairline) solid var(--blitzy-white-a16);
     }
 
     /* =====================================================================
@@ -215,31 +348,31 @@
     .reveal section.slide-divider .eyebrow { color: var(--blitzy-accent-teal); }
     .reveal section.slide-divider h2 {
       color: var(--blitzy-surface-0);
-      font-size: 3rem;
-      max-width: 22ch;
+      font-size: var(--fs-lg);
+      max-width: var(--measure-divider-h);
     }
     .reveal section.slide-divider .divider-sub {
       color: var(--blitzy-white-a72);
-      font-size: 1.2rem;
-      max-width: 40ch;
-      margin: 0.2rem auto 0 auto;
+      font-size: var(--fs-title-lg);
+      max-width: var(--measure-divider-sub);
+      margin: var(--space-0-2) auto 0 auto;
     }
 
     /* HERO ICON - large circular Lucide badge for dividers/title */
     .hero-icon {
-      width: 6.2rem;
-      height: 6.2rem;
-      border-radius: 999px;
+      width: var(--space-6-2);
+      height: var(--space-6-2);
+      border-radius: var(--radius-pill);
       display: inline-flex;
       align-items: center;
       justify-content: center;
       background: var(--blitzy-white-a10);
-      border: 1px solid var(--blitzy-white-a16);
+      border: var(--bw-hairline) solid var(--blitzy-white-a16);
       color: var(--blitzy-accent-teal);
-      margin: 0 0 1.6rem 0;
+      margin: 0 0 var(--space-1-6) 0;
     }
     .reveal section.slide-divider .hero-icon { margin-left: auto; margin-right: auto; }
-    .hero-icon svg { width: 3rem; height: 3rem; stroke-width: 1.6; }
+    .hero-icon svg { width: var(--space-3); height: var(--space-3); stroke-width: var(--sw-thin); }
 
     /* =====================================================================
        SLIDE TYPE: CLOSING - navy, takeaway, lockup, accent bar
@@ -251,93 +384,93 @@
     .reveal section.slide-closing .eyebrow { color: var(--blitzy-accent-teal); }
     .reveal section.slide-closing h2 {
       color: var(--blitzy-surface-0);
-      font-size: 3.4rem;
-      max-width: 18ch;
+      font-size: var(--fs-2xl);
+      max-width: var(--measure-closing-h);
     }
     .reveal section.slide-closing .closing-next {
       list-style: none;
-      margin: 1.4rem 0 0 0;
+      margin: var(--space-1-4) 0 0 0;
       padding: 0;
-      max-width: 50ch;
+      max-width: var(--measure-closing-list);
     }
     .reveal section.slide-closing .closing-next li {
       color: var(--blitzy-white-a72);
-      font-size: 1.18rem;
-      padding: 0.5rem 0 0.5rem 2.2rem;
+      font-size: var(--fs-li-lg);
+      padding: var(--space-0-5) 0 var(--space-0-5) var(--space-2-2);
       position: relative;
     }
     .reveal section.slide-closing .closing-next li svg {
-      position: absolute; left: 0; top: 0.6rem;
-      width: 1.4rem; height: 1.4rem; color: var(--blitzy-accent-teal);
+      position: absolute; left: 0; top: var(--space-0-6);
+      width: var(--space-1-4); height: var(--space-1-4); color: var(--blitzy-accent-teal);
     }
 
     /* BRAND LOCKUP - closing slide signature */
     .brand-lockup {
       display: flex;
       align-items: center;
-      gap: 0.8rem;
-      margin-top: 2.2rem;
+      gap: var(--space-0-8);
+      margin-top: var(--space-2-2);
       font-family: var(--ff-display);
-      font-weight: 600;
-      font-size: 1.15rem;
+      font-weight: var(--fw-semibold);
+      font-size: var(--fs-brand);
       color: var(--blitzy-surface-0);
     }
     .brand-lockup .mark {
-      width: 2.1rem; height: 2.1rem; border-radius: 0.6rem;
+      width: var(--space-2-1); height: var(--space-2-1); border-radius: var(--radius-md);
       background: var(--gradient-accent);
       display: inline-flex; align-items: center; justify-content: center;
       color: var(--blitzy-primary-navy);
     }
-    .brand-lockup .mark svg { width: 1.2rem; height: 1.2rem; stroke-width: 2.4; }
-    .brand-lockup .sep { color: var(--blitzy-accent-teal); font-weight: 400; }
-    .brand-lockup .muted { color: var(--blitzy-white-a72); font-weight: 400; font-family: var(--ff-mono); font-size: 0.9rem; }
+    .brand-lockup .mark svg { width: var(--space-1-2); height: var(--space-1-2); stroke-width: var(--sw-bold); }
+    .brand-lockup .sep { color: var(--blitzy-accent-teal); font-weight: var(--fw-regular); }
+    .brand-lockup .muted { color: var(--blitzy-white-a72); font-weight: var(--fw-regular); font-family: var(--ff-mono); font-size: var(--fs-sm); }
 
     /* =====================================================================
        KPI GRID + CARDS
        ===================================================================== */
     .kpi-grid {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 1.4rem;
-      margin-top: 0.6rem;
+      grid-template-columns: var(--grid-4);
+      gap: var(--space-1-4);
+      margin-top: var(--space-0-6);
     }
-    .kpi-grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
+    .kpi-grid.cols-3 { grid-template-columns: var(--grid-3); }
     .kpi-card {
       background: var(--blitzy-surface-2);
-      border: 1px solid var(--blitzy-border);
-      border-radius: 1.1rem;
-      padding: 1.6rem 1.5rem 1.5rem 1.5rem;
+      border: var(--bw-hairline) solid var(--blitzy-border);
+      border-radius: var(--radius-3xl);
+      padding: var(--space-1-6) var(--space-1-5) var(--space-1-5) var(--space-1-5);
       box-shadow: var(--blitzy-elev-1);
       display: flex;
       flex-direction: column;
-      gap: 0.5rem;
+      gap: var(--space-0-5);
       min-height: 0;
     }
     .kpi-icon {
-      width: 3rem; height: 3rem; border-radius: 0.8rem;
+      width: var(--space-3); height: var(--space-3); border-radius: var(--radius-xl);
       display: inline-flex; align-items: center; justify-content: center;
       background: var(--gradient-hero);
       color: var(--blitzy-surface-0);
-      margin-bottom: 0.4rem;
+      margin-bottom: var(--space-0-4);
     }
-    .kpi-icon svg { width: 1.6rem; height: 1.6rem; stroke-width: 2; }
+    .kpi-icon svg { width: var(--space-1-6); height: var(--space-1-6); stroke-width: var(--sw-regular); }
     .kpi-value {
       font-family: var(--ff-display);
-      font-weight: 700;
-      font-size: 2.5rem;
-      line-height: 1;
+      font-weight: var(--fw-bold);
+      font-size: var(--fs-kpi);
+      line-height: var(--lh-1);
       color: var(--blitzy-primary-deep);
     }
     .kpi-label {
-      font-size: 0.98rem;
+      font-size: var(--fs-label);
       color: var(--blitzy-text);
-      line-height: 1.3;
+      line-height: var(--lh-snug);
     }
     .kpi-card .kpi-sub {
       font-family: var(--ff-mono);
-      font-size: 0.78rem;
+      font-size: var(--fs-xs);
       color: var(--blitzy-text-muted);
-      letter-spacing: 0.03em;
+      letter-spacing: var(--ls-sub);
     }
 
     /* =====================================================================
@@ -345,91 +478,91 @@
        ===================================================================== */
     .icon-row {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 1.3rem;
-      margin-top: 0.8rem;
+      grid-template-columns: var(--grid-4);
+      gap: var(--space-1-3);
+      margin-top: var(--space-0-8);
     }
-    .icon-row.cols-3 { grid-template-columns: repeat(3, 1fr); }
-    .icon-row.cols-5 { grid-template-columns: repeat(5, 1fr); }
+    .icon-row.cols-3 { grid-template-columns: var(--grid-3); }
+    .icon-row.cols-5 { grid-template-columns: var(--grid-5); }
     .icon-item {
       background: var(--blitzy-surface-1);
-      border: 1px solid var(--blitzy-border);
-      border-radius: 1rem;
-      padding: 1.4rem 1.3rem;
+      border: var(--bw-hairline) solid var(--blitzy-border);
+      border-radius: var(--radius-2xl);
+      padding: var(--space-1-4) var(--space-1-3);
       display: flex;
       flex-direction: column;
-      gap: 0.6rem;
+      gap: var(--space-0-6);
     }
     .icon-badge {
-      width: 2.8rem; height: 2.8rem; border-radius: 0.7rem;
+      width: var(--space-2-8); height: var(--space-2-8); border-radius: var(--radius-lg);
       display: inline-flex; align-items: center; justify-content: center;
       background: var(--blitzy-primary-a14);
       color: var(--blitzy-primary-deep);
     }
-    .icon-badge svg { width: 1.5rem; height: 1.5rem; stroke-width: 2; }
+    .icon-badge svg { width: var(--space-1-5); height: var(--space-1-5); stroke-width: var(--sw-regular); }
     .icon-item .icon-title {
       font-family: var(--ff-display);
-      font-weight: 600;
-      font-size: 1.06rem;
+      font-weight: var(--fw-semibold);
+      font-size: var(--fs-icon-title);
       color: var(--blitzy-primary-dark);
     }
-    .icon-item .icon-desc { font-size: 0.92rem; color: var(--blitzy-text); line-height: 1.34; }
+    .icon-item .icon-desc { font-size: var(--fs-desc); color: var(--blitzy-text); line-height: var(--lh-desc); }
 
     /* =====================================================================
        CONTENT BULLETS
        ===================================================================== */
-    .reveal .feature-list { list-style: none; margin: 0.4rem 0 0 0; padding: 0; }
+    .reveal .feature-list { list-style: none; margin: var(--space-0-4) 0 0 0; padding: 0; }
     .reveal .feature-list li {
       position: relative;
-      padding: 0.7rem 0 0.7rem 2.4rem;
-      font-size: 1.16rem;
+      padding: var(--space-0-7) 0 var(--space-0-7) var(--space-2-4);
+      font-size: var(--fs-bullet);
       color: var(--blitzy-text);
-      line-height: 1.4;
-      border-bottom: 1px solid var(--blitzy-surface-1);
+      line-height: var(--lh-bullet);
+      border-bottom: var(--bw-hairline) solid var(--blitzy-surface-1);
     }
     .reveal .feature-list li:last-child { border-bottom: 0; }
     .reveal .feature-list li svg {
-      position: absolute; left: 0; top: 0.78rem;
-      width: 1.5rem; height: 1.5rem; color: var(--blitzy-primary);
-      stroke-width: 2;
+      position: absolute; left: 0; top: var(--space-0-78);
+      width: var(--space-1-5); height: var(--space-1-5); color: var(--blitzy-primary);
+      stroke-width: var(--sw-regular);
     }
     .reveal .feature-list li strong { color: var(--blitzy-primary-deep); }
 
     .slide-caption {
-      margin-top: 1.3rem;
-      font-size: 0.96rem;
+      margin-top: var(--space-1-3);
+      font-size: var(--fs-caption);
       color: var(--blitzy-text-muted);
       font-family: var(--ff-mono);
-      letter-spacing: 0.01em;
+      letter-spacing: var(--ls-caption);
     }
 
     /* =====================================================================
        MAPPING TABLE
        ===================================================================== */
     .map-table {
-      width: 100%;
+      width: var(--pct-100);
       border-collapse: separate;
       border-spacing: 0;
-      margin-top: 0.6rem;
-      font-size: 1.02rem;
+      margin-top: var(--space-0-6);
+      font-size: var(--fs-table);
       overflow: hidden;
-      border-radius: 1rem;
-      border: 1px solid var(--blitzy-border);
+      border-radius: var(--radius-2xl);
+      border: var(--bw-hairline) solid var(--blitzy-border);
     }
     .map-table thead th {
       background: var(--blitzy-primary-dark);
       color: var(--blitzy-surface-0);
       font-family: var(--ff-mono);
-      font-weight: 500;
-      font-size: 0.82rem;
-      letter-spacing: 0.12em;
+      font-weight: var(--fw-medium);
+      font-size: var(--fs-meta);
+      letter-spacing: var(--ls-table);
       text-transform: uppercase;
       text-align: left;
-      padding: 0.9rem 1.2rem;
+      padding: var(--space-0-9) var(--space-1-2);
     }
     .map-table tbody td {
-      padding: 0.82rem 1.2rem;
-      border-top: 1px solid var(--blitzy-border);
+      padding: var(--space-0-82) var(--space-1-2);
+      border-top: var(--bw-hairline) solid var(--blitzy-border);
       color: var(--blitzy-text);
       vertical-align: middle;
     }
@@ -437,50 +570,50 @@
     .map-table tbody tr:nth-child(even) td { background: var(--blitzy-surface-0); }
     .map-table .layer-cell {
       font-family: var(--ff-display);
-      font-weight: 600;
+      font-weight: var(--fw-semibold);
       color: var(--blitzy-primary-dark);
       white-space: nowrap;
     }
     .map-table .layer-cell .ic {
-      display: inline-flex; vertical-align: middle; margin-right: 0.6rem;
+      display: inline-flex; vertical-align: middle; margin-right: var(--space-0-6);
       color: var(--blitzy-primary);
     }
-    .map-table .layer-cell .ic svg { width: 1.2rem; height: 1.2rem; }
+    .map-table .layer-cell .ic svg { width: var(--space-1-2); height: var(--space-1-2); }
     .map-table .arrow { color: var(--blitzy-primary); }
 
     /* =====================================================================
        SCOPE PANELS (two-column in/out)
        ===================================================================== */
-    .panel-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.4rem; margin-top: 0.6rem; }
+    .panel-grid { display: grid; grid-template-columns: var(--grid-2); gap: var(--space-1-4); margin-top: var(--space-0-6); }
     .panel {
-      border-radius: 1.1rem;
-      border: 1px solid var(--blitzy-border);
-      padding: 1.5rem 1.6rem;
+      border-radius: var(--radius-3xl);
+      border: var(--bw-hairline) solid var(--blitzy-border);
+      padding: var(--space-1-5) var(--space-1-6);
       background: var(--blitzy-surface-0);
     }
     .panel.in { background: var(--blitzy-surface-2); }
     .panel.out { background: var(--blitzy-surface-3); }
     .panel .panel-head {
-      display: flex; align-items: center; gap: 0.7rem;
-      font-family: var(--ff-display); font-weight: 600; font-size: 1.2rem;
-      color: var(--blitzy-primary-dark); margin-bottom: 0.9rem;
+      display: flex; align-items: center; gap: var(--space-0-7);
+      font-family: var(--ff-display); font-weight: var(--fw-semibold); font-size: var(--fs-title-lg);
+      color: var(--blitzy-primary-dark); margin-bottom: var(--space-0-9);
     }
     .panel .panel-head .ph-icon {
-      width: 2.2rem; height: 2.2rem; border-radius: 0.6rem;
+      width: var(--space-2-2); height: var(--space-2-2); border-radius: var(--radius-md);
       display: inline-flex; align-items: center; justify-content: center;
       color: var(--blitzy-surface-0);
     }
     .panel.in .panel-head .ph-icon { background: var(--blitzy-primary); }
     .panel.out .panel-head .ph-icon { background: var(--blitzy-text-muted); }
-    .panel .ph-icon svg { width: 1.3rem; height: 1.3rem; }
+    .panel .ph-icon svg { width: var(--space-1-3); height: var(--space-1-3); }
     .panel ul { list-style: none; margin: 0; padding: 0; }
     .panel li {
-      font-size: 1rem; color: var(--blitzy-text); line-height: 1.35;
-      padding: 0.42rem 0 0.42rem 1.5rem; position: relative;
+      font-size: var(--fs-md); color: var(--blitzy-text); line-height: var(--lh-panel);
+      padding: var(--space-0-42) 0 var(--space-0-42) var(--space-1-5); position: relative;
     }
     .panel li::before {
-      content: ""; position: absolute; left: 0; top: 0.95rem;
-      width: 0.5rem; height: 0.5rem; border-radius: 999px;
+      content: ""; position: absolute; left: 0; top: var(--space-0-95);
+      width: var(--space-0-5); height: var(--space-0-5); border-radius: var(--radius-pill);
       background: var(--blitzy-primary);
     }
     .panel.out li::before { background: var(--blitzy-text-muted); }
@@ -490,68 +623,93 @@
        ===================================================================== */
     .reveal code, .reveal .chip {
       font-family: var(--ff-mono);
-      font-size: 0.86em;
+      font-size: var(--fs-code);
       background: var(--blitzy-primary-a08);
       color: var(--blitzy-primary-deep);
-      padding: 0.12em 0.45em;
-      border-radius: 0.4rem;
-      border: 1px solid var(--blitzy-primary-a14);
+      padding: var(--space-code-y) var(--space-code-x);
+      border-radius: var(--radius-sm);
+      border: var(--bw-hairline) solid var(--blitzy-primary-a14);
     }
-    .chip-row { display: flex; flex-wrap: wrap; gap: 0.7rem; margin-top: 0.4rem; }
-    .chip-row .chip { font-size: 1rem; padding: 0.5rem 0.9rem; }
+    .chip-row { display: flex; flex-wrap: wrap; gap: var(--space-0-7); margin-top: var(--space-0-4); }
+    .chip-row .chip { font-size: var(--fs-md); padding: var(--space-0-5) var(--space-0-9); }
 
     /* =====================================================================
        MERMAID CONTAINER
        ===================================================================== */
     .reveal pre.mermaid {
       background: var(--blitzy-surface-2);
-      border: 1px solid var(--blitzy-border);
-      border-radius: 1.1rem;
-      padding: 1.4rem;
+      border: var(--bw-hairline) solid var(--blitzy-border);
+      border-radius: var(--radius-3xl);
+      padding: var(--space-1-4);
       /* Hug the rendered diagram and center it, rather than stretching a wide
          empty surface panel around a narrower (portrait) flowchart. */
-      margin: 0.4rem auto 0 auto;
+      margin: var(--space-0-4) auto 0 auto;
       box-shadow: var(--blitzy-elev-1);
       text-align: center;
       box-sizing: border-box;
       width: fit-content;
-      max-width: 100%;
+      max-width: var(--pct-100);
       overflow: hidden;
     }
-    .reveal pre.mermaid svg { max-width: 100%; height: auto; }
+    .reveal pre.mermaid svg { max-width: var(--pct-100); height: auto; }
 
     /* =====================================================================
        SLIDE HEADER (eyebrow + heading grouping) and layout helpers
        ===================================================================== */
-    .slide-head { margin-bottom: 0.6rem; }
-    .two-col { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 2rem; align-items: center; }
+    .slide-head { margin-bottom: var(--space-0-6); }
+    .two-col { display: grid; grid-template-columns: var(--grid-two-col); gap: var(--space-2); align-items: center; }
     .two-col .col-visual { display: flex; flex-direction: column; justify-content: center; }
-    .spacer-sm { height: 0.6rem; }
+    .spacer-sm { height: var(--space-0-6); }
 
     /* Slide number / progress styling tuned to brand */
     .reveal .slide-number { background: var(--blitzy-primary-a30); font-family: var(--ff-mono); }
-    .reveal .progress { color: var(--blitzy-primary); height: 4px; }
+    .reveal .progress { color: var(--blitzy-primary); height: var(--size-progress); }
     .reveal .controls { color: var(--blitzy-primary); }
 
     /* Footer brand tag shown on content slides */
     .slide-foot {
       position: absolute;
-      left: 5rem; bottom: 1.7rem;
+      left: var(--space-5); bottom: var(--space-1-7);
       font-family: var(--ff-mono);
-      font-size: 0.72rem;
-      letter-spacing: 0.16em;
+      font-size: var(--fs-foot);
+      letter-spacing: var(--ls-foot);
       text-transform: uppercase;
       color: var(--blitzy-text-muted);
-      display: flex; align-items: center; gap: 0.5rem;
+      display: flex; align-items: center; gap: var(--space-0-5);
     }
-    .slide-foot .fdot { width: 0.3rem; height: 0.3rem; border-radius: 999px; background: var(--blitzy-primary); display: inline-block; }
+    .slide-foot .fdot { width: var(--space-0-3); height: var(--space-0-3); border-radius: var(--radius-pill); background: var(--blitzy-primary); display: inline-block; }
     .reveal section.slide-title .slide-foot,
     .reveal section.slide-divider .slide-foot,
     .reveal section.slide-closing .slide-foot { color: var(--blitzy-white-a72); }
     .reveal section.slide-title .slide-foot .fdot,
     .reveal section.slide-divider .slide-foot .fdot,
     .reveal section.slide-closing .slide-foot .fdot { background: var(--blitzy-accent-teal); }
-  </style>
+  
+
+    /* =====================================================================
+       RESPONSIVE VARIANTS (m4)
+       reveal.js pins the deck to a 1920x1080 canvas and scales the whole
+       slide uniformly to fit any viewport, so the deck stays legible at any
+       window size without media queries. The variants below add resilience
+       for unusually short or narrow rendering canvases (e.g. a docked
+       browser pane or a portrait projector) by relaxing the densest grids to
+       fewer columns and trimming slide padding. Every styled value resolves
+       to a design-system token; only media-feature thresholds (which CSS does
+       not allow to be tokenized) use literals.
+       ===================================================================== */
+    @media (max-aspect-ratio: 16/10) {
+      .reveal .slides section { padding: var(--space-4-2) var(--space-4-2); }
+    }
+    @media (max-width: 1280px) {
+      .kpi-grid { grid-template-columns: var(--grid-2); }
+      .icon-row, .icon-row.cols-3, .icon-row.cols-5 { grid-template-columns: var(--grid-2); }
+    }
+    @media (max-width: 820px) {
+      .kpi-grid, .kpi-grid.cols-3 { grid-template-columns: var(--grid-1); }
+      .icon-row, .icon-row.cols-3, .icon-row.cols-5 { grid-template-columns: var(--grid-1); }
+      .panel-grid, .two-col { grid-template-columns: var(--grid-1); }
+    }
+</style>
 </head>
 <body>
   <div class="reveal">
@@ -559,8 +717,8 @@
 
       <!-- ============================= SLIDE 1 - TITLE ============================= -->
       <section class="slide-title">
-        <span class="hero-icon"><i data-lucide="boxes"></i></span>
-        <p class="eyebrow"><i data-lucide="shield-check"></i> Executive Briefing &middot; Memory-Safe Systems</p>
+        <span class="hero-icon"><i aria-hidden="true" data-lucide="boxes"></i></span>
+        <p class="eyebrow"><i aria-hidden="true" data-lucide="shield-check"></i> Executive Briefing &middot; Memory-Safe Systems</p>
         <h1>C-to-Rust Rewrite of zlib</h1>
         <p class="lead">A behavior-preserving migration of the zlib compression library to memory-safe Rust &mdash; byte-identical output and a drop-in C ABI, with no change required from downstream consumers.</p>
         <div class="title-meta">
@@ -576,30 +734,30 @@
       <!-- ============================= SLIDE 2 - HEADLINE KPIs ============================= -->
       <section>
         <div class="slide-head">
-          <p class="eyebrow"><i data-lucide="gauge"></i> At a Glance</p>
+          <p class="eyebrow"><i aria-hidden="true" data-lucide="gauge"></i> At a Glance</p>
           <h2>What this migration delivers</h2>
         </div>
         <div class="kpi-grid">
           <div class="kpi-card">
-            <span class="kpi-icon"><i data-lucide="shield-check"></i></span>
+            <span class="kpi-icon"><i aria-hidden="true" data-lucide="shield-check"></i></span>
             <span class="kpi-value">&gt;98%</span>
             <span class="kpi-label">Safe Rust by line count</span>
             <span class="kpi-sub">unsafe only at FFI &amp; inflate hot loop</span>
           </div>
           <div class="kpi-card">
-            <span class="kpi-icon"><i data-lucide="binary"></i></span>
+            <span class="kpi-icon"><i aria-hidden="true" data-lucide="binary"></i></span>
             <span class="kpi-value">1 : 1</span>
             <span class="kpi-label">Byte-identical compressed output vs C zlib</span>
             <span class="kpi-sub">same level &middot; strategy &middot; windowBits</span>
           </div>
           <div class="kpi-card">
-            <span class="kpi-icon"><i data-lucide="plug-zap"></i></span>
+            <span class="kpi-icon"><i aria-hidden="true" data-lucide="plug-zap"></i></span>
             <span class="kpi-value">Drop-in</span>
             <span class="kpi-label">C ABI / FFI replacement for libz</span>
             <span class="kpi-sub">lib + cdylib + staticlib</span>
           </div>
           <div class="kpi-card">
-            <span class="kpi-icon"><i data-lucide="files"></i></span>
+            <span class="kpi-icon"><i aria-hidden="true" data-lucide="files"></i></span>
             <span class="kpi-value">26 &rarr; 44</span>
             <span class="kpi-label">C files ported to Rust modules</span>
             <span class="kpi-sub">~23.1k C &rarr; ~33.7k Rust lines</span>
@@ -612,7 +770,7 @@
       <!-- ============================= SLIDE 3 - ARCHITECTURE (Mermaid) ============================= -->
       <section>
         <div class="slide-head">
-          <p class="eyebrow"><i data-lucide="workflow"></i> Architecture &middot; Before &amp; After</p>
+          <p class="eyebrow"><i aria-hidden="true" data-lucide="workflow"></i> Architecture &middot; Before &amp; After</p>
           <h2>Six C layers become safe Rust modules</h2>
         </div>
         <pre class="mermaid">
@@ -649,7 +807,7 @@ graph LR
 
       <!-- ============================= SLIDE 4 - DIVIDER: WHY ============================= -->
       <section class="slide-divider">
-        <span class="hero-icon"><i data-lucide="circle-help"></i></span>
+        <span class="hero-icon"><i aria-hidden="true" data-lucide="circle-help"></i></span>
         <p class="eyebrow">Section 01</p>
         <h2>Why migrate to Rust</h2>
         <p class="divider-sub">Removing a class of memory-safety defects without touching the wire format or the public contract.</p>
@@ -658,27 +816,27 @@ graph LR
       <!-- ============================= SLIDE 5 - BUSINESS VALUE ============================= -->
       <section>
         <div class="slide-head">
-          <p class="eyebrow"><i data-lucide="target"></i> The Case for the Rewrite</p>
+          <p class="eyebrow"><i aria-hidden="true" data-lucide="target"></i> The Case for the Rewrite</p>
           <h2>Memory safety without disruption</h2>
         </div>
         <div class="icon-row">
           <div class="icon-item">
-            <span class="icon-badge"><i data-lucide="shield-check"></i></span>
+            <span class="icon-badge"><i aria-hidden="true" data-lucide="shield-check"></i></span>
             <span class="icon-title">Defects eliminated</span>
             <span class="icon-desc">Use-after-free and double-free are unrepresentable in the safe core &mdash; enforced by the borrow checker.</span>
           </div>
           <div class="icon-item">
-            <span class="icon-badge"><i data-lucide="git-branch"></i></span>
+            <span class="icon-badge"><i aria-hidden="true" data-lucide="git-branch"></i></span>
             <span class="icon-title">Maintainability</span>
             <span class="icon-desc">Exhaustive <code>enum</code> + <code>match</code> replace fragile integer state and <code>goto</code>.</span>
           </div>
           <div class="icon-item">
-            <span class="icon-badge"><i data-lucide="plug"></i></span>
+            <span class="icon-badge"><i aria-hidden="true" data-lucide="plug"></i></span>
             <span class="icon-title">Drop-in compatibility</span>
             <span class="icon-desc">Exported C symbols match exactly &mdash; existing callers relink with no code changes.</span>
           </div>
           <div class="icon-item">
-            <span class="icon-badge"><i data-lucide="lock"></i></span>
+            <span class="icon-badge"><i aria-hidden="true" data-lucide="lock"></i></span>
             <span class="icon-title">Contract preserved</span>
             <span class="icon-desc">Same RFC formats, same API surface, same compressed bytes.</span>
           </div>
@@ -689,7 +847,7 @@ graph LR
 
       <!-- ============================= SLIDE 6 - DIVIDER: WHAT CHANGED ============================= -->
       <section class="slide-divider">
-        <span class="hero-icon"><i data-lucide="arrow-left-right"></i></span>
+        <span class="hero-icon"><i aria-hidden="true" data-lucide="arrow-left-right"></i></span>
         <p class="eyebrow">Section 02</p>
         <h2>What changed</h2>
         <p class="divider-sub">The language and memory model change; the observable byte stream and C ABI stay invariant.</p>
@@ -698,7 +856,7 @@ graph LR
       <!-- ============================= SLIDE 7 - MODULE MAPPING (table) ============================= -->
       <section>
         <div class="slide-head">
-          <p class="eyebrow"><i data-lucide="git-compare"></i> Module Mapping</p>
+          <p class="eyebrow"><i aria-hidden="true" data-lucide="git-compare"></i> Module Mapping</p>
           <h2>C sources map to Rust modules</h2>
         </div>
         <table class="map-table">
@@ -707,32 +865,32 @@ graph LR
           </thead>
           <tbody>
             <tr>
-              <td class="layer-cell"><span class="ic"><i data-lucide="file-code"></i></span>Public API</td>
+              <td class="layer-cell"><span class="ic"><i aria-hidden="true" data-lucide="file-code"></i></span>Public API</td>
               <td>zlib.h &middot; zconf.h &middot; zlib.map</td>
               <td><span class="arrow">&rarr;</span> <code>src/lib.rs</code> &middot; <code>ffi.rs</code> &middot; stream &middot; error</td>
             </tr>
             <tr>
-              <td class="layer-cell"><span class="ic"><i data-lucide="package"></i></span>Deflate</td>
+              <td class="layer-cell"><span class="ic"><i aria-hidden="true" data-lucide="package"></i></span>Deflate</td>
               <td>deflate.c &middot; trees.c</td>
               <td><span class="arrow">&rarr;</span> <code>src/deflate/*</code></td>
             </tr>
             <tr>
-              <td class="layer-cell"><span class="ic"><i data-lucide="package-check"></i></span>Inflate</td>
+              <td class="layer-cell"><span class="ic"><i aria-hidden="true" data-lucide="package-check"></i></span>Inflate</td>
               <td>inflate.c &middot; inffast.c &middot; inftrees.c &middot; infback.c</td>
               <td><span class="arrow">&rarr;</span> <code>src/inflate/*</code></td>
             </tr>
             <tr>
-              <td class="layer-cell"><span class="ic"><i data-lucide="binary"></i></span>Checksum</td>
+              <td class="layer-cell"><span class="ic"><i aria-hidden="true" data-lucide="binary"></i></span>Checksum</td>
               <td>adler32.c &middot; crc32.c</td>
               <td><span class="arrow">&rarr;</span> <code>src/checksum/*</code></td>
             </tr>
             <tr>
-              <td class="layer-cell"><span class="ic"><i data-lucide="file-text"></i></span>Gzip I/O</td>
+              <td class="layer-cell"><span class="ic"><i aria-hidden="true" data-lucide="file-text"></i></span>Gzip I/O</td>
               <td>gzlib.c &middot; gzread.c &middot; gzwrite.c &middot; gzclose.c</td>
               <td><span class="arrow">&rarr;</span> <code>src/gz/*</code></td>
             </tr>
             <tr>
-              <td class="layer-cell"><span class="ic"><i data-lucide="wrench"></i></span>Utilities</td>
+              <td class="layer-cell"><span class="ic"><i aria-hidden="true" data-lucide="wrench"></i></span>Utilities</td>
               <td>compress.c &middot; uncompr.c &middot; zutil.c</td>
               <td><span class="arrow">&rarr;</span> <code>src/util/*</code></td>
             </tr>
@@ -744,7 +902,7 @@ graph LR
       <!-- ============================= SLIDE 8 - OWNERSHIP MODEL (Mermaid) ============================= -->
       <section>
         <div class="slide-head">
-          <p class="eyebrow"><i data-lucide="recycle"></i> Memory Model</p>
+          <p class="eyebrow"><i aria-hidden="true" data-lucide="recycle"></i> Memory Model</p>
           <h2>Manual allocation becomes ownership</h2>
         </div>
         <div class="two-col">
@@ -764,9 +922,9 @@ graph TD
           </div>
           <div>
             <ul class="feature-list">
-              <li><i data-lucide="box"></i><strong>Ownership tree</strong> replaces <code>ZALLOC</code>/<code>ZFREE</code> hooks.</li>
-              <li><i data-lucide="layers"></i>Raw <code>next_in</code>/<code>next_out</code> pointers become <code>&amp;[u8]</code> slices.</li>
-              <li><i data-lucide="recycle"></i><code>Drop</code> replaces <code>deflateEnd</code>/<code>inflateEnd</code> &mdash; deterministic, leak-free.</li>
+              <li><i aria-hidden="true" data-lucide="box"></i><strong>Ownership tree</strong> replaces <code>ZALLOC</code>/<code>ZFREE</code> hooks.</li>
+              <li><i aria-hidden="true" data-lucide="layers"></i>Raw <code>next_in</code>/<code>next_out</code> pointers become <code>&amp;[u8]</code> slices.</li>
+              <li><i aria-hidden="true" data-lucide="recycle"></i><code>Drop</code> replaces <code>deflateEnd</code>/<code>inflateEnd</code> &mdash; deterministic, leak-free.</li>
             </ul>
           </div>
         </div>
@@ -775,7 +933,7 @@ graph TD
 
       <!-- ============================= SLIDE 9 - DIVIDER: RISK & MITIGATION ============================= -->
       <section class="slide-divider">
-        <span class="hero-icon"><i data-lucide="shield-alert"></i></span>
+        <span class="hero-icon"><i aria-hidden="true" data-lucide="shield-alert"></i></span>
         <p class="eyebrow">Section 03</p>
         <h2>Risk &amp; mitigation</h2>
         <p class="divider-sub">Equivalence is proven, not assumed &mdash; and unsafe code is fenced into two audited sites.</p>
@@ -784,69 +942,69 @@ graph TD
       <!-- ============================= SLIDE 10 - CORRECTNESS ============================= -->
       <section>
         <div class="slide-head">
-          <p class="eyebrow"><i data-lucide="microscope"></i> Correctness &amp; Assurance</p>
+          <p class="eyebrow"><i aria-hidden="true" data-lucide="microscope"></i> Correctness &amp; Assurance</p>
           <h2>Proving equivalence</h2>
         </div>
         <div class="icon-row cols-3">
           <div class="icon-item">
-            <span class="icon-badge"><i data-lucide="equal"></i></span>
+            <span class="icon-badge"><i aria-hidden="true" data-lucide="equal"></i></span>
             <span class="icon-title">Byte-for-byte oracle</span>
-            <span class="icon-desc">Interop tests compare output to <code>flate2</code> (canonical C zlib) byte-for-byte.</span>
+            <span class="icon-desc">Interop tests will compare output to <code>flate2</code> (canonical C zlib) byte-for-byte.</span>
           </div>
           <div class="icon-item">
-            <span class="icon-badge"><i data-lucide="lock-keyhole"></i></span>
+            <span class="icon-badge"><i aria-hidden="true" data-lucide="lock-keyhole"></i></span>
             <span class="icon-title">Unsafe confined</span>
-            <span class="icon-desc">All unsafe lives in <code>ffi.rs</code> + <code>inflate/fast.rs</code>; every block has a SAFETY note.</span>
+            <span class="icon-desc">By design, unsafe is confined to <code>ffi.rs</code> and <code>inflate/fast.rs</code>; every block carries a SAFETY note.</span>
           </div>
           <div class="icon-item">
-            <span class="icon-badge"><i data-lucide="list-checks"></i></span>
+            <span class="icon-badge"><i aria-hidden="true" data-lucide="list-checks"></i></span>
             <span class="icon-title">Official vectors</span>
-            <span class="icon-desc">Ports of example.c, infcover.c and minigzip drive the test suite.</span>
+            <span class="icon-desc">Ports of example.c, infcover.c and minigzip will drive the test suite.</span>
           </div>
         </div>
-        <p class="slide-caption">Layered validation &middot; regression &middot; coverage &middot; property &middot; round-trip &middot; checksum</p>
-        <div class="slide-foot"><span class="fdot"></span> 47 unsafe occurrences across 9 files &middot; &gt;98% safe by line</div>
+        <p class="slide-caption">Planned layered validation &middot; regression &middot; coverage &middot; property &middot; round-trip &middot; checksum</p>
+        <div class="slide-foot"><span class="fdot"></span> Target &middot; 47 unsafe occurrences across 9 files &middot; &gt;98% safe by line</div>
       </section>
 
       <!-- ============================= SLIDE 11 - PERFORMANCE GATES (KPI) ============================= -->
       <section>
         <div class="slide-head">
-          <p class="eyebrow"><i data-lucide="gauge"></i> Performance Gates</p>
+          <p class="eyebrow"><i aria-hidden="true" data-lucide="gauge"></i> Performance Gates</p>
           <h2>Targets, measured against C zlib</h2>
         </div>
         <div class="kpi-grid">
           <div class="kpi-card">
-            <span class="kpi-icon"><i data-lucide="gauge"></i></span>
+            <span class="kpi-icon"><i aria-hidden="true" data-lucide="gauge"></i></span>
             <span class="kpi-value">&ge; 80%</span>
             <span class="kpi-label">Compression throughput vs C zlib</span>
             <span class="kpi-sub">equivalent levels</span>
           </div>
           <div class="kpi-card">
-            <span class="kpi-icon"><i data-lucide="zap"></i></span>
+            <span class="kpi-icon"><i aria-hidden="true" data-lucide="zap"></i></span>
             <span class="kpi-value">&ge; 1&times;</span>
             <span class="kpi-label">Decompression throughput</span>
             <span class="kpi-sub">parity or better</span>
           </div>
           <div class="kpi-card">
-            <span class="kpi-icon"><i data-lucide="cpu"></i></span>
+            <span class="kpi-icon"><i aria-hidden="true" data-lucide="cpu"></i></span>
             <span class="kpi-value">&ge; 3&times;</span>
             <span class="kpi-label">CRC-32 SIMD vs scalar</span>
             <span class="kpi-sub">via crc32fast</span>
           </div>
           <div class="kpi-card">
-            <span class="kpi-icon"><i data-lucide="memory-stick"></i></span>
+            <span class="kpi-icon"><i aria-hidden="true" data-lucide="memory-stick"></i></span>
             <span class="kpi-value">&le; 1&times;</span>
             <span class="kpi-label">Memory footprint vs C zlib</span>
             <span class="kpi-sub">same windowBits / memLevel</span>
           </div>
         </div>
-        <p class="slide-caption">Validated by criterion benchmarks &middot; gates enforced in CI</p>
+        <p class="slide-caption">To be validated by criterion benchmarks &middot; gates enforced in CI</p>
         <div class="slide-foot"><span class="fdot"></span> zlib_rs &middot; Performance</div>
       </section>
 
       <!-- ============================= SLIDE 12 - DIVIDER: ONBOARDING ============================= -->
       <section class="slide-divider">
-        <span class="hero-icon"><i data-lucide="rocket"></i></span>
+        <span class="hero-icon"><i aria-hidden="true" data-lucide="rocket"></i></span>
         <p class="eyebrow">Section 04</p>
         <h2>Onboarding &amp; continued development</h2>
         <p class="divider-sub">One toolchain, standard commands, and automated quality gates from day one.</p>
@@ -855,7 +1013,7 @@ graph TD
       <!-- ============================= SLIDE 13 - CARGO WORKFLOW ============================= -->
       <section>
         <div class="slide-head">
-          <p class="eyebrow"><i data-lucide="terminal"></i> Developer Workflow</p>
+          <p class="eyebrow"><i aria-hidden="true" data-lucide="terminal"></i> Developer Workflow</p>
           <h2>One toolchain, standard commands</h2>
         </div>
         <div class="chip-row">
@@ -868,17 +1026,17 @@ graph TD
         <div class="spacer-sm"></div>
         <div class="icon-row cols-3">
           <div class="icon-item">
-            <span class="icon-badge"><i data-lucide="package"></i></span>
+            <span class="icon-badge"><i aria-hidden="true" data-lucide="package"></i></span>
             <span class="icon-title">Build &amp; test</span>
-            <span class="icon-desc">Cargo builds <code>lib</code>, <code>cdylib</code> and <code>staticlib</code>, then runs the full suite.</span>
+            <span class="icon-desc">Cargo builds <code>lib</code>, <code>cdylib</code> and <code>staticlib</code>, then runs the test suite.</span>
           </div>
           <div class="icon-item">
-            <span class="icon-badge"><i data-lucide="git-pull-request"></i></span>
+            <span class="icon-badge"><i aria-hidden="true" data-lucide="git-pull-request"></i></span>
             <span class="icon-title">CI gates</span>
             <span class="icon-desc"><code>clippy -D warnings</code> and <code>fmt --check</code> block merges on any violation.</span>
           </div>
           <div class="icon-item">
-            <span class="icon-badge"><i data-lucide="shield-half"></i></span>
+            <span class="icon-badge"><i aria-hidden="true" data-lucide="shield-half"></i></span>
             <span class="icon-title">MSRV pinned</span>
             <span class="icon-desc">Edition 2024, minimum supported Rust 1.85 &mdash; reproducible everywhere.</span>
           </div>
@@ -889,27 +1047,27 @@ graph TD
       <!-- ============================= SLIDE 14 - COMPATIBILITY SURFACE ============================= -->
       <section>
         <div class="slide-head">
-          <p class="eyebrow"><i data-lucide="layers"></i> Compatibility Surface</p>
+          <p class="eyebrow"><i aria-hidden="true" data-lucide="layers"></i> Compatibility Surface</p>
           <h2>Full format &amp; API surface preserved</h2>
         </div>
         <div class="kpi-grid">
           <div class="kpi-card">
-            <span class="kpi-icon"><i data-lucide="file-text"></i></span>
+            <span class="kpi-icon"><i aria-hidden="true" data-lucide="file-text"></i></span>
             <span class="kpi-value">3 RFCs</span>
             <span class="kpi-label">1950 zlib &middot; 1951 DEFLATE &middot; 1952 gzip</span>
           </div>
           <div class="kpi-card">
-            <span class="kpi-icon"><i data-lucide="sliders-horizontal"></i></span>
+            <span class="kpi-icon"><i aria-hidden="true" data-lucide="sliders-horizontal"></i></span>
             <span class="kpi-value">10</span>
             <span class="kpi-label">Compression levels (0&ndash;9, default &rarr; 6)</span>
           </div>
           <div class="kpi-card">
-            <span class="kpi-icon"><i data-lucide="layers"></i></span>
+            <span class="kpi-icon"><i aria-hidden="true" data-lucide="layers"></i></span>
             <span class="kpi-value">5</span>
             <span class="kpi-label">Strategies (default, filtered, Huffman, RLE, fixed)</span>
           </div>
           <div class="kpi-card">
-            <span class="kpi-icon"><i data-lucide="waves"></i></span>
+            <span class="kpi-icon"><i aria-hidden="true" data-lucide="waves"></i></span>
             <span class="kpi-value">7</span>
             <span class="kpi-label">Flush modes (no-flush &hellip; block, trees)</span>
           </div>
@@ -921,12 +1079,12 @@ graph TD
       <!-- ============================= SLIDE 15 - DELIVERY STATUS / SCOPE ============================= -->
       <section>
         <div class="slide-head">
-          <p class="eyebrow"><i data-lucide="scroll-text"></i> Scope &amp; Delivery</p>
+          <p class="eyebrow"><i aria-hidden="true" data-lucide="scroll-text"></i> Scope &amp; Delivery</p>
           <h2>Focused scope, single-phase delivery</h2>
         </div>
         <div class="panel-grid">
           <div class="panel in">
-            <div class="panel-head"><span class="ph-icon"><i data-lucide="circle-check"></i></span> In scope</div>
+            <div class="panel-head"><span class="ph-icon"><i aria-hidden="true" data-lucide="circle-check"></i></span> In scope</div>
             <ul>
               <li>All 26 core C files &rarr; ~44 Rust modules</li>
               <li>DEFLATE, INFLATE, checksum, gzip I/O, utilities</li>
@@ -935,7 +1093,7 @@ graph TD
             </ul>
           </div>
           <div class="panel out">
-            <div class="panel-head"><span class="ph-icon"><i data-lucide="package"></i></span> Out of scope</div>
+            <div class="panel-head"><span class="ph-icon"><i aria-hidden="true" data-lucide="package"></i></span> Out of scope</div>
             <ul>
               <li>bzip2, lzma or other formats</li>
               <li>New compression algorithms</li>
@@ -944,21 +1102,21 @@ graph TD
             </ul>
           </div>
         </div>
-        <p class="slide-caption">Executed as one phase &mdash; the crate compiles, links and tests as a complete unit</p>
+        <p class="slide-caption">Planned as one phase &mdash; the crate will compile, link and test as a complete unit</p>
         <div class="slide-foot"><span class="fdot"></span> zlib_rs &middot; Scope</div>
       </section>
 
       <!-- ============================= SLIDE 16 - CLOSING ============================= -->
       <section class="slide-closing">
-        <p class="eyebrow"><i data-lucide="check-check"></i> The Bottom Line</p>
+        <p class="eyebrow"><i aria-hidden="true" data-lucide="check-check"></i> The Bottom Line</p>
         <h2>Safe. Compatible. Drop&#8209;in.</h2>
         <ul class="closing-next">
-          <li><i data-lucide="binary"></i>Confirm byte-identical output across all levels &amp; strategies</li>
-          <li><i data-lucide="gauge"></i>Benchmark throughput vs C zlib and hold the &ge;80% gate</li>
-          <li><i data-lucide="package-check"></i>Publish the crate and generated C header for drop-in adoption</li>
+          <li><i aria-hidden="true" data-lucide="binary"></i>Confirm byte-identical output across all levels &amp; strategies</li>
+          <li><i aria-hidden="true" data-lucide="gauge"></i>Benchmark throughput vs C zlib and hold the &ge;80% gate</li>
+          <li><i aria-hidden="true" data-lucide="package-check"></i>Publish the crate and generated C header for drop-in adoption</li>
         </ul>
         <div class="brand-lockup">
-          <span class="mark"><i data-lucide="boxes"></i></span>
+          <span class="mark"><i aria-hidden="true" data-lucide="boxes"></i></span>
           Blitzy <span class="sep">/</span> <span class="muted">zlib_rs &middot; C-to-Rust Migration</span>
         </div>
         <div class="accent-bar"></div>

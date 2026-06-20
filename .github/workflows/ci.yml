@@ -32,12 +32,15 @@
 # is needed. `flate2` / C zlib are DEV-ONLY — the shipped crate has zero C
 # dependencies.
 #
-# `capi` note: the crate's plan was to gate the `#[no_mangle] extern "C"`
-# exports behind an OPTIONAL `capi` feature ONLY IF the canonical zlib symbol
-# names were to collide with flate2's C-zlib symbols at test-link time. The
-# FINAL Cargo.toml declares NO `capi` feature, so this workflow intentionally
-# adds no `--features capi` step (it would fail with "unknown feature"). The
-# plain `cargo build --release` already produces the cdylib/staticlib drop-in.
+# `capi` note: Cargo.toml declares an OPTIONAL `capi` feature that gates the
+# `#[no_mangle] extern "C"` C-ABI exports (`src/ffi.rs`, delivered with the
+# compression engine). This workflow deliberately keeps `capi` OFF in its
+# default build/test steps: enabling it exports the canonical zlib symbol names
+# (`deflate`, `inflate`, `crc32`, …), which collide at test-link time with the
+# C zlib that the `flate2` dev-dependency bundles via `libz-sys`. The libz
+# drop-in is produced by enabling `capi` for the cdylib/staticlib (a release
+# `--features capi` build, once `src/ffi.rs` lands); `cargo build` / `cargo
+# test` here keep it off so the suite links cleanly.
 # ============================================================================
 
 name: CI
@@ -91,11 +94,17 @@ jobs:
       - name: Clippy (default features)
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      # Lint gate (no-std LIBRARY only). `--lib` keeps clippy from compiling the
-      # std-dependent test/bench targets under no-std (see the build-only note
-      # in the feature-matrix job).
-      - name: Clippy (no-std library)
-        run: cargo clippy --lib --locked --no-default-features --features no-std -- -D warnings
+      # No-std compile + lint gate (rlib only). The `lib` target also emits
+      # `cdylib`/`staticlib` for the libz C drop-in, and those final link
+      # artifacts require a global allocator + `#[panic_handler]` that a
+      # `#![no_std]` *library* must not provide — so `cargo build`/`check`/
+      # `clippy` on the lib all fail under `no-std`. We therefore override to the
+      # single `rlib` artifact via `cargo rustc --crate-type rlib` and deny all
+      # rustc warnings. Full clippy lint coverage of the shared source comes from
+      # the default-features clippy gate above (the no-std-only code is just cfg
+      # branches over that same source).
+      - name: Lint/compile (no-std rlib)
+        run: cargo rustc --lib --crate-type rlib --locked --no-default-features --features no-std -- -D warnings
 
   # --------------------------------------------------------------------------
   # Build + Test — OS x toolchain matrix. Mirrors the cmake.yml/configure.yml
@@ -188,11 +197,17 @@ jobs:
   # each Cargo feature combination. Each cell carries `cmd` (build|test) +
   # `args`, so the single run step is `cargo <cmd> --locked <args>`.
   #
-  # CRITICAL: `no-std` is BUILD-ONLY. `cargo test --no-default-features`
-  # (with or without `no-std`) fails with ~129 errors in TEST code that uses
-  # Vec/format!/String without `alloc` imports when `std` is off — the LIBRARY
-  # itself compiles cleanly. So the no-std cells use `cargo build` (the Z_SOLO
-  # analog); there is deliberately NO `cargo test --no-default-features` here.
+  # CRITICAL: `no-std` is COMPILE-ONLY, and only as an `rlib`. Two reasons:
+  #   1. `cargo test --no-default-features` (with or without `no-std`) fails in
+  #      TEST code that uses Vec/format!/String without `alloc` imports when
+  #      `std` is off — the LIBRARY itself compiles cleanly. So there is
+  #      deliberately NO `cargo test --no-default-features` here.
+  #   2. The `lib` target's `crate-type` includes `cdylib`/`staticlib` for the
+  #      libz C drop-in, and those FINAL link artifacts require a global
+  #      allocator + `#[panic_handler]` that a `#![no_std]` *library* must not
+  #      impose on its consumers. Hence plain `cargo build --lib` fails under
+  #      `no-std`; we override to the single `rlib` via
+  #      `cargo rustc --crate-type rlib` (the meaningful Z_SOLO artifact).
   # `no-std` is never combined with `std` (they are mutually exclusive, and the
   # crate enforces this with a compile_error! guard in src/lib.rs).
   # --------------------------------------------------------------------------
@@ -211,10 +226,15 @@ jobs:
             args: "--no-default-features --features std,gzip,gz-io"
           - cmd: test
             args: "--no-default-features --features std,gzip,gz-io,simd"
-          - cmd: build
-            args: "--no-default-features --features no-std"
-          - cmd: build
-            args: "--no-default-features --features no-std,simd"
+          # no-std cells compile the LIBRARY as an `rlib` only (see the CRITICAL
+          # note above): `cargo rustc --crate-type rlib` overrides the manifest's
+          # `cdylib`/`staticlib` crate-types, which cannot link under `#![no_std]`
+          # without an allocator/panic_handler the library deliberately omits.
+          # This matches the no-std rlib lint/compile gate in the Lint job.
+          - cmd: rustc
+            args: "--lib --crate-type rlib --no-default-features --features no-std"
+          - cmd: rustc
+            args: "--lib --crate-type rlib --no-default-features --features no-std,simd"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6

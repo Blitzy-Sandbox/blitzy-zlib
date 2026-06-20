@@ -153,6 +153,27 @@ pub const FNAME: u8 = 0x08;
 /// Set whenever [`GzHeader::comment`] is `Some`. See RFC 1952 §2.3.1.
 pub const FCOMMENT: u8 = 0x10;
 
+/// Default capture cap (in bytes) for the read-side `extra` / `name` / `comment`
+/// fields ([`GzHeader::extra_max`], [`GzHeader::name_max`],
+/// [`GzHeader::comm_max`]).
+///
+/// When `inflate` parses a gzip header into a [`GzHeader`], it stores at most
+/// this many bytes of each variable-length field, discarding the remainder
+/// while still consuming and checksumming every byte (so stream framing and the
+/// header CRC are unaffected). This bounds memory use against a hostile stream
+/// that declares (or, for the NUL-terminated `name`/`comment`, simply never
+/// terminates) an enormous field — see [CWE-400]. The value `65536` (64 KiB)
+/// comfortably accommodates any legitimate header: the gzip `XLEN` field is two
+/// bytes, so a well-formed *extra* field is at most `65535` bytes, and real file
+/// names and comments are far shorter. Callers needing a different bound can set
+/// the per-field caps explicitly (e.g.
+/// [`with_name_max`](GzHeader::with_name_max)); the analogous C control is the
+/// caller-supplied `extra_max` / `name_max` / `comm_max` capacity passed to
+/// `inflateGetHeader`.
+///
+/// [CWE-400]: https://cwe.mitre.org/data/definitions/400.html
+pub const DEFAULT_CAPTURE_MAX: usize = 65536;
+
 /// Owned, safe representation of gzip header metadata (RFC 1952).
 ///
 /// `GzHeader` is the idiomatic mirror of the C `gz_header` structure. It is the
@@ -196,21 +217,23 @@ pub struct GzHeader {
 
     /// Optional *extra* field bytes (gzip `FEXTRA`/`XLEN`), or `None` if absent.
     /// Replaces the C `extra` pointer together with `extra_len`: when `Some`,
-    /// the vector holds exactly the extra-field bytes and its length is the
-    /// `XLEN` written to / read from the stream. The C read-side `extra_max`
-    /// capacity has no analogue here (it lives only at the FFI boundary).
+    /// the vector holds the extra-field bytes (up to [`extra_max`](Self::extra_max)
+    /// when captured by `inflate`) and, on the write side, its length is the
+    /// `XLEN` written to the stream.
     pub extra: Option<Vec<u8>>,
 
     /// Optional original file *name* (gzip `FNAME`), or `None` if absent. Stored
     /// as raw bytes **without** the terminating NUL (gzip permits non-UTF-8
-    /// names; see [`name_str`](GzHeader::name_str) for a lossy text view). The
-    /// C read-side `name_max` capacity has no analogue here.
+    /// names; see [`name_str`](GzHeader::name_str) for a lossy text view). When
+    /// captured by `inflate`, at most [`name_max`](Self::name_max) bytes are
+    /// retained.
     pub name: Option<Vec<u8>>,
 
     /// Optional file *comment* (gzip `FCOMMENT`), or `None` if absent. Stored as
     /// raw bytes **without** the terminating NUL (see
-    /// [`comment_str`](GzHeader::comment_str) for a lossy text view). The C
-    /// read-side `comm_max` capacity has no analogue here.
+    /// [`comment_str`](GzHeader::comment_str) for a lossy text view). When
+    /// captured by `inflate`, at most [`comm_max`](Self::comm_max) bytes are
+    /// retained.
     pub comment: Option<Vec<u8>>,
 
     /// `true` if a header CRC-16 was (or is to be) present. Maps the C
@@ -226,6 +249,30 @@ pub struct GzHeader {
     /// populated; it is not represented by this field. Always `false` when
     /// writing.
     pub done: bool,
+
+    /// Read-side capture cap (in bytes) for [`extra`](Self::extra): when
+    /// `inflate` parses a gzip `FEXTRA` field into this header, at most this many
+    /// bytes are stored; any excess is consumed and checksummed but discarded.
+    /// Bounds memory against a hostile stream (see [`DEFAULT_CAPTURE_MAX`], the
+    /// default). Mirrors the C `gz_header.extra_max` capacity. Ignored when
+    /// writing.
+    pub extra_max: usize,
+
+    /// Read-side capture cap (in bytes) for [`name`](Self::name): when `inflate`
+    /// parses a gzip `FNAME` field, at most this many bytes are stored; the rest
+    /// (up to the terminating NUL) is consumed and checksummed but discarded.
+    /// Bounds memory against an unterminated/oversized name (see
+    /// [`DEFAULT_CAPTURE_MAX`], the default). Mirrors the C `gz_header.name_max`
+    /// capacity. Ignored when writing.
+    pub name_max: usize,
+
+    /// Read-side capture cap (in bytes) for [`comment`](Self::comment): when
+    /// `inflate` parses a gzip `FCOMMENT` field, at most this many bytes are
+    /// stored; the rest (up to the terminating NUL) is consumed and checksummed
+    /// but discarded. Bounds memory against an unterminated/oversized comment
+    /// (see [`DEFAULT_CAPTURE_MAX`], the default). Mirrors the C
+    /// `gz_header.comm_max` capacity. Ignored when writing.
+    pub comm_max: usize,
 }
 
 impl Default for GzHeader {
@@ -238,8 +285,9 @@ impl Default for GzHeader {
     /// supplied at all* case; a constructed `GzHeader` carries `255` until the
     /// caller sets it.)
     ///
-    /// Because `os` is non-zero, this implementation is intentionally **not**
-    /// `#[derive]`d.
+    /// Because `os` is non-zero (and the read-side capture caps default to
+    /// [`DEFAULT_CAPTURE_MAX`] rather than `0`), this implementation is
+    /// intentionally **not** `#[derive]`d.
     #[inline]
     fn default() -> Self {
         Self {
@@ -252,6 +300,9 @@ impl Default for GzHeader {
             comment: None,
             hcrc: false,
             done: false,
+            extra_max: DEFAULT_CAPTURE_MAX,
+            name_max: DEFAULT_CAPTURE_MAX,
+            comm_max: DEFAULT_CAPTURE_MAX,
         }
     }
 }
@@ -346,6 +397,33 @@ impl GzHeader {
     #[must_use]
     pub fn with_comment(mut self, comment: impl Into<Vec<u8>>) -> Self {
         self.comment = Some(comment.into());
+        self
+    }
+
+    /// Sets the read-side [`extra_max`](GzHeader::extra_max) capture cap and
+    /// returns the updated header. Only affects header *parsing* by `inflate`;
+    /// it has no effect when writing. See [`DEFAULT_CAPTURE_MAX`].
+    #[must_use]
+    pub fn with_extra_max(mut self, extra_max: usize) -> Self {
+        self.extra_max = extra_max;
+        self
+    }
+
+    /// Sets the read-side [`name_max`](GzHeader::name_max) capture cap and
+    /// returns the updated header. Only affects header *parsing* by `inflate`;
+    /// it has no effect when writing. See [`DEFAULT_CAPTURE_MAX`].
+    #[must_use]
+    pub fn with_name_max(mut self, name_max: usize) -> Self {
+        self.name_max = name_max;
+        self
+    }
+
+    /// Sets the read-side [`comm_max`](GzHeader::comm_max) capture cap and
+    /// returns the updated header. Only affects header *parsing* by `inflate`;
+    /// it has no effect when writing. See [`DEFAULT_CAPTURE_MAX`].
+    #[must_use]
+    pub fn with_comm_max(mut self, comm_max: usize) -> Self {
+        self.comm_max = comm_max;
         self
     }
 
@@ -480,6 +558,12 @@ mod tests {
         assert!(h.comment.is_none(), "comment defaults to None");
         assert!(!h.hcrc, "hcrc defaults to false");
         assert!(!h.done, "done defaults to false");
+        // Read-side capture caps default to DEFAULT_CAPTURE_MAX (M7: bounds
+        // memory against hostile gzip headers).
+        assert_eq!(h.extra_max, DEFAULT_CAPTURE_MAX);
+        assert_eq!(h.name_max, DEFAULT_CAPTURE_MAX);
+        assert_eq!(h.comm_max, DEFAULT_CAPTURE_MAX);
+        assert_eq!(DEFAULT_CAPTURE_MAX, 65536, "default cap is 64 KiB");
     }
 
     #[test]
@@ -506,7 +590,10 @@ mod tests {
             .with_hcrc(true)
             .with_extra(vec![1u8, 2, 3])
             .with_name(b"file.bin".to_vec())
-            .with_comment("note".as_bytes());
+            .with_comment("note".as_bytes())
+            .with_extra_max(16)
+            .with_name_max(32)
+            .with_comm_max(64);
 
         assert!(h.text);
         assert_eq!(h.time, 0x1234_5678);
@@ -515,6 +602,9 @@ mod tests {
         assert_eq!(h.extra.as_deref(), Some(&[1u8, 2, 3][..]));
         assert_eq!(h.name.as_deref(), Some(&b"file.bin"[..]));
         assert_eq!(h.comment.as_deref(), Some(&b"note"[..]));
+        assert_eq!(h.extra_max, 16);
+        assert_eq!(h.name_max, 32);
+        assert_eq!(h.comm_max, 64);
         // Fields that were not set keep their defaults.
         assert_eq!(h.xflags, 0);
         assert!(!h.done);

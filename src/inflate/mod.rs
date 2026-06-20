@@ -738,8 +738,21 @@ pub(crate) fn inflate(
                     }
                     if copy > 0 {
                         if let Some(head) = state.head.as_mut() {
+                            // M7 (CWE-400): store at most `extra_max` bytes of the
+                            // extra field into the owned Vec; bytes beyond the cap
+                            // are still consumed and checksummed below but dropped,
+                            // so a hostile XLEN cannot grow the buffer without
+                            // bound. `extra.len()` is the count already stored,
+                            // which equals C's write offset `extra_len - length`
+                            // until the cap is reached (matching C `inflate.c`,
+                            // which stops writing once that offset >= extra_max).
+                            let cap = head.extra_max;
                             if let Some(extra) = head.extra.as_mut() {
-                                extra.extend_from_slice(&input[next..next + copy]);
+                                let stored = extra.len();
+                                if stored < cap {
+                                    let take = (cap - stored).min(copy);
+                                    extra.extend_from_slice(&input[next..next + take]);
+                                }
                             }
                         }
                         if (state.flags & 0x0200) != 0 && (state.wrap & 4) != 0 {
@@ -764,16 +777,25 @@ pub(crate) fn inflate(
                         break 'inf;
                     }
                     // C do-while: read each byte, store non-NUL bytes into the
-                    // (unbounded) name Vec, continue while `len && copy < have`.
-                    // The terminating NUL is consumed (and CRC'd) but not stored
-                    // — the idiomatic GzHeader holds the name without a NUL.
+                    // name Vec, continue while `len && copy < have`. The
+                    // terminating NUL is consumed (and CRC'd) but not stored —
+                    // the idiomatic GzHeader holds the name without a NUL.
+                    // M7 (CWE-400): a non-NUL byte is stored only while fewer than
+                    // `name_max` bytes have been captured; beyond the cap every
+                    // byte is still consumed and CRC'd (below) but dropped, so an
+                    // unterminated/oversized FNAME cannot grow the buffer without
+                    // bound. This mirrors C `inflate.c` (`length < name_max`).
                     let mut copy = 0usize;
                     let last_byte = loop {
                         let b = input[next + copy];
                         copy += 1;
                         if b != 0 {
                             if let Some(head) = state.head.as_mut() {
-                                head.name.get_or_insert_with(Vec::new).push(b);
+                                let cap = head.name_max;
+                                let name = head.name.get_or_insert_with(Vec::new);
+                                if name.len() < cap {
+                                    name.push(b);
+                                }
                             }
                         }
                         if b == 0 || copy >= have {
@@ -802,13 +824,22 @@ pub(crate) fn inflate(
                         break 'inf;
                     }
                     // Same do-while structure as NAME, into the comment Vec.
+                    // M7 (CWE-400): a non-NUL byte is stored only while fewer than
+                    // `comm_max` bytes have been captured; beyond the cap every
+                    // byte is still consumed and CRC'd (below) but dropped,
+                    // bounding memory against an unterminated/oversized FCOMMENT.
+                    // Mirrors C `inflate.c` (`length < comm_max`).
                     let mut copy = 0usize;
                     let last_byte = loop {
                         let b = input[next + copy];
                         copy += 1;
                         if b != 0 {
                             if let Some(head) = state.head.as_mut() {
-                                head.comment.get_or_insert_with(Vec::new).push(b);
+                                let cap = head.comm_max;
+                                let comment = head.comment.get_or_insert_with(Vec::new);
+                                if comment.len() < cap {
+                                    comment.push(b);
+                                }
                             }
                         }
                         if b == 0 || copy >= have {
@@ -1150,7 +1181,7 @@ pub(crate) fn inflate(
                     // RESTORE the accumulator for the fast loop.
                     state.hold = hold;
                     state.bits = bits;
-                    fast::inflate_fast(input, &mut next, output, &mut put, state);
+                    let fast_bad = fast::inflate_fast(input, &mut next, output, &mut put, state);
                     // LOAD back.
                     hold = state.hold;
                     bits = state.bits;
@@ -1158,6 +1189,18 @@ pub(crate) fn inflate(
                     left = output.len() - put;
                     if state.mode == Type {
                         state.back = -1;
+                    } else if state.mode == Bad {
+                        // M6: `inflate_fast` cannot touch `msg` (its decoupled
+                        // slice signature omits stream access), so it returns the
+                        // specific `FastBad` reason instead. Assign the matching
+                        // fixed zlib message here so a malformed stream caught on
+                        // the fast path reports the SAME `Z_DATA_ERROR` text as
+                        // the slow path (C `inffast.c` writes `strm->msg` directly
+                        // at the equivalent sites). `fast_bad` is `Some` whenever
+                        // the fast path set `Bad`.
+                        if let Some(reason) = fast_bad {
+                            msg = Some(reason.message());
+                        }
                     }
                     continue 'inf;
                 }
@@ -1722,6 +1765,29 @@ fn to_err(code: i32) -> ZlibError {
 /// [`Inflate::new`] (zlib, default window) or [`Inflate::with_window_bits`]
 /// (selecting raw/zlib/gzip/auto per the `windowBits` convention), then drive
 /// decoding with [`Inflate::inflate`].
+///
+/// # Examples
+///
+/// Decompress a zlib (RFC 1950) stream produced by canonical C zlib:
+///
+/// ```
+/// use zlib_rs::{Inflate, Z_FINISH, Z_STREAM_END};
+///
+/// // A zlib stream emitted by C zlib at level 6 for the 39-byte message below.
+/// let stream: [u8; 44] = [
+///     0x78, 0x9c, 0xab, 0xca, 0xc9, 0x4c, 0xd2, 0x2d, 0x2a, 0x56, 0x48, 0x49,
+///     0x4d, 0xce, 0xcf, 0x2d, 0x28, 0x4a, 0x2d, 0x2e, 0x4e, 0x2d, 0x56, 0x28,
+///     0x4a, 0x4d, 0xcc, 0x51, 0xa8, 0x02, 0xca, 0x28, 0x14, 0x97, 0x00, 0xd9,
+///     0xb9, 0xc5, 0x7a, 0x00, 0x2b, 0x67, 0x0e, 0xd3,
+/// ];
+///
+/// let mut inflate = Inflate::new().expect("inflate init");
+/// let mut out = [0u8; 64];
+/// let (code, _consumed, produced) = inflate.inflate(&stream, &mut out, Z_FINISH);
+///
+/// assert_eq!(code, Z_STREAM_END);
+/// assert_eq!(&out[..produced], b"zlib-rs decompresses real zlib streams.");
+/// ```
 pub struct Inflate {
     state: Box<InflateState>,
     /// Total bytes consumed from input across all calls.
@@ -1911,5 +1977,124 @@ impl Inflate {
         self.msg = outcome.msg;
         self.data_type = outcome.data_type;
         (outcome.ret, outcome.in_consumed, outcome.out_produced)
+    }
+}
+
+// ===========================================================================
+// Tests — end-to-end gzip header-capture bounding (M7 / CWE-400).
+//
+// These exercise the full `inflate()` path through the public `Inflate`
+// wrapper, building gzip streams with the `flate2` dev-dependency (canonical
+// C zlib backend) as an independent oracle, exactly as `inflate/fast.rs` does
+// for raw DEFLATE. They require `std` (flate2) and `gzip` (header capture);
+// both are default features.
+// ===========================================================================
+#[cfg(all(test, feature = "std", feature = "gzip"))]
+mod tests {
+    use super::*;
+    use crate::constants::Z_NO_FLUSH;
+    use crate::gz_header::DEFAULT_CAPTURE_MAX;
+
+    /// Build a gzip stream (via flate2 / canonical C zlib) carrying the given
+    /// `FNAME` and payload.
+    fn gzip_with_name(name: &[u8], payload: &[u8]) -> Vec<u8> {
+        use flate2::{Compression, GzBuilder};
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut gz = GzBuilder::new()
+                .filename(name.to_vec())
+                .write(&mut buf, Compression::default());
+            gz.write_all(payload).expect("gz write payload");
+            gz.finish().expect("gz finish");
+        }
+        buf
+    }
+
+    /// Decode `stream` (gzip framing) in a single call, capturing the header.
+    fn inflate_gzip_capture(stream: &[u8], payload_len: usize) -> (i32, Vec<u8>, GzHeader) {
+        let mut inf = Inflate::with_window_bits(31).expect("gzip inflate init");
+        inf.get_header().expect("attach header sink");
+        let mut out = vec![0u8; payload_len + 16];
+        let (ret, _consumed, produced) = inf.inflate(stream, &mut out, Z_NO_FLUSH);
+        out.truncate(produced);
+        let head = inf.header().expect("header captured").clone();
+        (ret, out, head)
+    }
+
+    #[test]
+    fn gzip_oversized_name_is_capped_but_stream_still_valid() {
+        // M7: a gzip stream whose FNAME exceeds the default capture cap must
+        // (a) still inflate fully — proving every name byte was consumed and
+        // folded into the header bookkeeping so framing/trailer stay valid —
+        // while (b) the captured name is truncated to DEFAULT_CAPTURE_MAX,
+        // bounding memory against a hostile header (CWE-400).
+        let payload = b"the quick brown fox jumps over the lazy dog";
+        let long_name = vec![b'A'; DEFAULT_CAPTURE_MAX + 4096];
+        let stream = gzip_with_name(&long_name, payload);
+
+        let (ret, out, head) = inflate_gzip_capture(&stream, payload.len());
+
+        assert_eq!(
+            ret, Z_STREAM_END,
+            "stream must decode fully; the full (oversized) name must be consumed"
+        );
+        assert_eq!(out, payload, "payload must round-trip exactly");
+
+        let captured = head.name.as_ref().expect("name field present");
+        assert_eq!(
+            captured.len(),
+            DEFAULT_CAPTURE_MAX,
+            "captured name truncated to the default cap"
+        );
+        assert!(
+            captured.iter().all(|&b| b == b'A'),
+            "captured prefix is the real (capped) name bytes"
+        );
+    }
+
+    #[test]
+    fn gzip_name_within_cap_is_captured_in_full() {
+        // A name shorter than the cap is captured verbatim (no truncation).
+        let payload = b"hello world";
+        let name = b"original-file.bin";
+        let stream = gzip_with_name(name, payload);
+
+        let (ret, out, head) = inflate_gzip_capture(&stream, payload.len());
+
+        assert_eq!(ret, Z_STREAM_END);
+        assert_eq!(out, payload);
+        assert_eq!(
+            head.name.as_deref(),
+            Some(&name[..]),
+            "short name captured without truncation"
+        );
+    }
+
+    #[test]
+    fn gzip_custom_small_name_cap_truncates() {
+        // With an explicitly small cap, capture stops at the cap yet the stream
+        // still decodes (all name bytes consumed). Drives the low-level path so
+        // the cap can be set on the attached header before parsing.
+        let payload = b"payload-bytes";
+        let name = b"a-twelve-byte-name-and-more";
+        let stream = gzip_with_name(name, payload);
+
+        let mut state = inflate_init2(31).expect("gzip init");
+        assert_eq!(inflate_get_header(&mut state), Z_OK);
+        // Tighten the name cap to 4 bytes before any header byte is parsed.
+        state.head.as_mut().unwrap().name_max = 4;
+
+        let mut out = vec![0u8; payload.len() + 16];
+        let outcome = inflate(&mut state, &stream, &mut out, Z_NO_FLUSH);
+        assert_eq!(
+            outcome.ret, Z_STREAM_END,
+            "stream still decodes with a tight name cap"
+        );
+        assert_eq!(&out[..outcome.out_produced], payload);
+
+        let captured = state.head.as_ref().unwrap().name.as_ref().expect("name");
+        assert_eq!(captured.len(), 4, "name truncated to the 4-byte cap");
+        assert_eq!(&captured[..], &name[..4]);
     }
 }

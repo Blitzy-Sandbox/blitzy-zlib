@@ -122,6 +122,42 @@ fn copy_overlapping(output: &mut [u8], dst: usize, src: usize, len: usize) {
     }
 }
 
+/// The specific data-error condition detected on the [`inflate_fast`] hot path.
+///
+/// `inflate_fast` runs with no access to the stream's `msg` field (its
+/// decoupled slice signature deliberately omits it), so when it sets
+/// [`InflateMode::Bad`](crate::inflate::state::InflateMode::Bad) it returns one
+/// of these reasons instead of `()`. The caller (`inflate` in `mod.rs`) maps
+/// the reason to the corresponding fixed zlib message via [`FastBad::message`]
+/// before returning `Z_DATA_ERROR`, so a malformed stream decoded on the fast
+/// path receives exactly the same `msg` text as one decoded on the slow path
+/// (matching C `inffast.c`, which writes `strm->msg` directly at each site).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FastBad {
+    /// An invalid literal/length code was decoded (C `inffast.c`: "invalid
+    /// literal/length code").
+    InvalidLitLen,
+    /// An invalid distance code was decoded (C `inffast.c`: "invalid distance
+    /// code").
+    InvalidDist,
+    /// A match referenced a distance further back than the available history
+    /// (C `inffast.c`: "invalid distance too far back").
+    DistTooFar,
+}
+
+impl FastBad {
+    /// The fixed zlib `Z_DATA_ERROR` message text for this condition, identical
+    /// to the string C `inffast.c` assigns to `strm->msg` at the corresponding
+    /// site (and to the matching slow-path messages in `inflate/mod.rs`).
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            FastBad::InvalidLitLen => "invalid literal/length code",
+            FastBad::InvalidDist => "invalid distance code",
+            FastBad::DistTooFar => "invalid distance too far back",
+        }
+    }
+}
+
 /// Decode literals and length/distance matches until end-of-block or until
 /// fewer than 6 input bytes / 258 output bytes remain. Faithful port of C
 /// `inflate_fast` (`inffast.c`).
@@ -171,10 +207,14 @@ fn copy_overlapping(output: &mut [u8], dst: usize, src: usize, len: usize) {
 ///   invalid distance code, or distance too far back).
 ///
 /// This routine never returns a `Z_*` code; it only advances the cursors and
-/// sets `state.mode`, which the caller interprets. (On a [`Bad`](InflateMode::Bad)
-/// result the caller assigns the corresponding `Z_DATA_ERROR` message; the
-/// decoupled slice signature deliberately gives this routine no access to the
-/// stream's `msg` field.)
+/// sets `state.mode`, which the caller interprets. It returns
+/// [`Some`]`(`[`FastBad`]`)` **iff** it set [`Bad`](InflateMode::Bad), naming the
+/// specific data-error condition; the caller assigns the corresponding fixed
+/// `Z_DATA_ERROR` message ([`FastBad::message`]) before returning the error, so
+/// fast-path and slow-path malformed streams produce identical `msg` text. On
+/// any non-`Bad` exit it returns [`None`]. (The decoupled slice signature
+/// deliberately gives this routine no access to the stream's `msg` field, hence
+/// the returned reason rather than a direct `msg` write as in C `inffast.c`.)
 ///
 /// The caller recomputes `avail_in = input.len() - *in_pos` and
 /// `avail_out = output.len() - *out_pos`; these are equivalent to C's
@@ -189,7 +229,7 @@ pub(crate) fn inflate_fast(
     output: &mut [u8],
     out_pos: &mut usize,
     state: &mut InflateState,
-) {
+) -> Option<FastBad> {
     // ---- Entry preconditions (debug-only; the caller guarantees them). -------
     debug_assert_eq!(
         state.mode,
@@ -227,6 +267,9 @@ pub(crate) fn inflate_fast(
     // `state.mode` unchanged at `Len`; we mirror that by defaulting to `Len`
     // and overwriting only for end-of-block (`Type`) or a data error (`Bad`).
     let result_mode: InflateMode;
+    // The specific data-error reason, set iff `result_mode` becomes `Bad`. The
+    // caller turns this into the matching fixed zlib `msg` (see `FastBad`).
+    let bad_reason: Option<FastBad>;
 
     // Borrow the immutable decode inputs (root tables + window) for the loop.
     // These borrows end before `state` is written back below.
@@ -244,6 +287,9 @@ pub(crate) fn inflate_fast(
         let window: &[u8] = &state.window;
 
         let mut mode = InflateMode::Len;
+        // Tracks the data-error reason alongside `mode`; set only when `mode`
+        // is set to `Bad`, so the caller can assign the exact zlib message.
+        let mut bad: Option<FastBad> = None;
 
         // ---- Phase B: main decode loop (C `do { … } while (…)`). -------------
         'inflate_fast: loop {
@@ -345,6 +391,7 @@ pub(crate) fn inflate_fast(
                                     // INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR
                                     // fall-through is not compiled (AAP §0.6.7).
                                     if sane {
+                                        bad = Some(FastBad::DistTooFar);
                                         mode = InflateMode::Bad;
                                         break 'inflate_fast;
                                     }
@@ -459,6 +506,7 @@ pub(crate) fn inflate_fast(
                             continue 'dodist;
                         } else {
                             // Invalid distance code.
+                            bad = Some(FastBad::InvalidDist);
                             mode = InflateMode::Bad;
                             break 'inflate_fast;
                         }
@@ -474,6 +522,7 @@ pub(crate) fn inflate_fast(
                     break 'inflate_fast;
                 } else {
                     // Invalid literal/length code.
+                    bad = Some(FastBad::InvalidLitLen);
                     mode = InflateMode::Bad;
                     break 'inflate_fast;
                 }
@@ -488,6 +537,7 @@ pub(crate) fn inflate_fast(
         }
 
         result_mode = mode;
+        bad_reason = bad;
     }
 
     // ---- Phase F: return unused whole bytes to the input (C lines 290-303). --
@@ -503,6 +553,10 @@ pub(crate) fn inflate_fast(
     state.hold = hold;
     state.bits = bits;
     state.mode = result_mode;
+
+    // Return the data-error reason (if any) so the caller can assign the
+    // matching fixed zlib message before returning `Z_DATA_ERROR`.
+    bad_reason
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -1063,11 +1117,43 @@ mod tests {
             &dc,
             false,
         );
-        let (_out, mode) = run_fast(&mut state, &body, 0);
+        // Call `inflate_fast` directly (rather than via `run_fast`) so we can
+        // capture the returned `FastBad` reason. Pad the input to satisfy the
+        // entry precondition (avail_in >= 6) and the do-while margin, mirroring
+        // `run_fast`.
+        let mut input = body.clone();
+        while input.len() < body.len() + 16 {
+            input.push(0);
+        }
+        let mut output = vec![0u8; 512];
+        let mut in_pos = 0usize;
+        let mut out_pos = 0usize;
+        let bad = inflate_fast(&input, &mut in_pos, &mut output, &mut out_pos, &mut state);
         assert_eq!(
-            mode,
+            state.mode,
             InflateMode::Bad,
             "expected Bad on distance too far back"
+        );
+        // M6: the fast path must surface the *specific* reason so the caller in
+        // `inflate/mod.rs` can assign the matching fixed zlib `Z_DATA_ERROR`
+        // message (identical to the slow-path text).
+        assert_eq!(bad, Some(FastBad::DistTooFar));
+        assert_eq!(bad.unwrap().message(), "invalid distance too far back");
+    }
+
+    #[test]
+    fn fast_bad_messages_match_c_inffast() {
+        // M6: each `FastBad` variant maps to the exact fixed zlib message that C
+        // `inffast.c` writes to `strm->msg`, and that the slow path in
+        // `inflate/mod.rs` assigns for the same conditions.
+        assert_eq!(
+            FastBad::InvalidLitLen.message(),
+            "invalid literal/length code"
+        );
+        assert_eq!(FastBad::InvalidDist.message(), "invalid distance code");
+        assert_eq!(
+            FastBad::DistTooFar.message(),
+            "invalid distance too far back"
         );
     }
 
