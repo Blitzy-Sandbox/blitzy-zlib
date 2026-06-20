@@ -118,6 +118,17 @@ pub mod util;
 #[allow(dead_code)]
 pub mod gz;
 
+// The C-ABI drop-in shim: the `#[no_mangle] extern "C"` exports that make the
+// crate binary-compatible with `libz` (`deflate`, `inflate`, `crc32`, the
+// `gz*` family, …). This is one of the crate's two `unsafe` zones (the other is
+// the inflate fast path). It is gated behind the non-default `capi` feature so
+// the canonical C symbol names are present only in the `cdylib`/`staticlib`
+// drop-in artifacts and are kept OUT of `cargo test`, where they would
+// otherwise collide at link time with the `flate2` dev-dependency's bundled C
+// `zlib` (AAP §0.6.2). cbindgen parses this module to regenerate the C header.
+#[cfg(feature = "capi")]
+pub mod ffi;
+
 // ===========================================================================
 // Public re-exports — the idiomatic crate-root surface
 // ===========================================================================

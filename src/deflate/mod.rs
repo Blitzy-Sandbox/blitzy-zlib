@@ -770,7 +770,7 @@ pub(crate) fn deflate_init(level: i32) -> Result<Box<DeflateState>, ZlibError> {
 /// checksum seed is written as a **literal** (`1` for zlib/raw, `0` for gzip),
 /// reproducing C's `adler32(0L, Z_NULL, 0)` / `crc32(0L, Z_NULL, 0)` without
 /// calling the checksum routines over an empty slice (which would yield `0`).
-fn deflate_reset_keep(s: &mut DeflateState) {
+pub(crate) fn deflate_reset_keep(s: &mut DeflateState) {
     s.total_in = 0;
     s.total_out = 0;
     s.msg = None;
