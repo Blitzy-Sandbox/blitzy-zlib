@@ -1,0 +1,61 @@
+# Cargo manifest for the zlib-rs crate — a memory-safe Rust rewrite of zlib.
+#
+# NOTE (setup baseline): This manifest was authored by the environment-setup
+# step to (1) pin the toolchain/dependency contract from the Agent Action Plan
+# and (2) pre-fetch/warm the full dependency graph. The Rust source tree
+# (src/, tests/, benches/, build.rs) is created by the implementation step.
+# The `[[bench]]` target entries are intentionally omitted here because their
+# source files do not yet exist; they are added together with the bench
+# sources during implementation (see doc/project-guide.md §9.1).
+
+[package]
+name = "zlib-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+license = "Zlib"
+description = "Memory-safe Rust rewrite of the zlib compression library (DEFLATE/zlib/gzip), byte-compatible with C zlib and exposing a C-ABI drop-in FFI."
+repository = "https://github.com/Blitzy-Sandbox/blitzy-zlib"
+readme = "README.md"
+keywords = ["zlib", "deflate", "gzip", "compression", "crc32"]
+categories = ["compression", "no-std::no-alloc", "encoding"]
+
+# Produce the Rust rlib plus C-linkable cdylib/staticlib so the crate can serve
+# as a drop-in replacement for libz at the binary level (AAP §0.3.1, §0.5.1).
+[lib]
+name = "zlib_rs"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+# Cargo features replace the C preprocessor conditionals (AAP §0.5.2, project-guide §9.2).
+[features]
+default = ["std", "gzip", "gz-io", "simd"]
+# default C build (heap + std::io)
+std = []
+# #ifdef GZIP — gzip format support in deflate/inflate
+gzip = []
+# gzip file I/O (implies std + gzip)
+gz-io = ["std", "gzip"]
+# Z_SOLO — bare-metal mode (mutually exclusive with std at the source level)
+no-std = []
+# SIMD-accelerated CRC-32 via crc32fast
+simd = ["dep:crc32fast"]
+
+[dependencies]
+# Ergonomic cfg branching for feature/arch gates.
+cfg-if = "1.0"
+# SIMD-accelerated CRC-32 (IEEE); backs src/checksum/crc32.rs; gated by `simd`.
+crc32fast = { version = "1.5", optional = true }
+
+[build-dependencies]
+# Generates the C header (zlib.h-equivalent) from src/ffi.rs during build.rs.
+cbindgen = "0.28"
+
+[dev-dependencies]
+# Statistical benchmarking harness for benches/*.
+criterion = "0.5.1"
+# Reference oracle linking canonical zlib for byte-identical interop validation.
+flate2 = "1.1.1"
+# Property-based round-trip testing.
+quickcheck = "1.0.3"
+# Randomized test-data generation.
+rand = "0.9.0"

@@ -49,3 +49,9 @@ user.bazelrc
 # MODULE.bazel.lock is ignored for now as per this recommendation:
 # https://github.com/bazelbuild/bazel/issues/20369
 MODULE.bazel.lock
+
+# Rust / Cargo build artifacts (zlib-rs crate).
+# NOTE: Cargo.lock is intentionally NOT ignored — it is a committed deliverable
+# for this crate so the validated dependency graph is reproducible.
+/target
+**/*.rlib
