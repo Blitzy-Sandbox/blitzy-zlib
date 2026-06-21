@@ -104,12 +104,63 @@ include_version = true
 #     `zlibrs_gzprintf_write` callback (excluded from this header — see
 #     `[export].exclude`). The `va_list` form relies on the `<stdarg.h>`
 #     emitted by `sys_includes` above.
+#   * `ZLIB_VERSION` and the five header-only init convenience macros
+#     (`deflateInit` / `deflateInit2` / `inflateInit` / `inflateInit2` /
+#     `inflateBackInit`) cannot be emitted by cbindgen either: it does not
+#     render the `ZLIB_VERSION` `&str` constant as a C string `#define`, and it
+#     cannot synthesize a function-like macro from Rust. They are hand-ported
+#     here verbatim from the canonical `zlib.h` (the `#define ZLIB_VERSION` at
+#     L44 and the convenience macros at L1932-1944) so that ordinary libz
+#     client code — which overwhelmingly calls `deflateInit(&s, level)` /
+#     `inflateInit(&s)` rather than the `*Init_` long forms — compiles
+#     unchanged against this drop-in header (AAP §0.6.2 — exact C-API drop-in).
+#     Each macro expands to the already-declared `*Init_` / `*Init2_` function
+#     with `ZLIB_VERSION` and `(int)sizeof(z_stream)` appended, and is
+#     `#ifndef`-guarded for idempotency and to coexist with a real `zlib.h`
+#     (whose tokens are identical) without a redefinition diagnostic.
 #
 # A TOML *literal* multi-line string ('''…''') is mandatory here: the C line-
 # continuation backslash must be preserved verbatim, whereas a basic ("""…""")
 # string would consume `\<newline>` as a TOML line-ending escape and collapse
 # the macro onto one line.
 trailer = '''
+/* ZLIB_VERSION + init convenience macros — hand-ported to match zlib.h.
+ * cbindgen does not render the ZLIB_VERSION &str constant as a C string
+ * #define, and cannot synthesize a function-like macro from Rust, so these
+ * are ported verbatim from zlib.h (the #define at L44 and the convenience
+ * macros at L1932-1944). Each expands to the exported *Init_ / *Init2_
+ * function with ZLIB_VERSION and (int)sizeof(z_stream) appended, so ordinary
+ * libz client code using deflateInit(&s, level) / inflateInit(&s) compiles
+ * unchanged against this drop-in header (AAP §0.6.2). The underlying
+ * functions are declared above; the macros expand only at the call site,
+ * where the z_stream typedef is in scope. Every definition is #ifndef-guarded
+ * so the header is idempotent and coexists with a real zlib.h. */
+#ifndef ZLIB_VERSION
+#define ZLIB_VERSION "1.3.2.1-motley"
+#endif
+#ifndef deflateInit
+#define deflateInit(strm, level) \
+    deflateInit_((strm), (level), ZLIB_VERSION, (int)sizeof(z_stream))
+#endif
+#ifndef deflateInit2
+#define deflateInit2(strm, level, method, windowBits, memLevel, strategy) \
+    deflateInit2_((strm), (level), (method), (windowBits), (memLevel), \
+                  (strategy), ZLIB_VERSION, (int)sizeof(z_stream))
+#endif
+#ifndef inflateInit
+#define inflateInit(strm) \
+    inflateInit_((strm), ZLIB_VERSION, (int)sizeof(z_stream))
+#endif
+#ifndef inflateInit2
+#define inflateInit2(strm, windowBits) \
+    inflateInit2_((strm), (windowBits), ZLIB_VERSION, (int)sizeof(z_stream))
+#endif
+#ifndef inflateBackInit
+#define inflateBackInit(strm, windowBits, window) \
+    inflateBackInit_((strm), (windowBits), (window), ZLIB_VERSION, \
+                     (int)sizeof(z_stream))
+#endif
+
 /* gzgetc() — fast-path single-byte read macro, identical to zlib.h.
  * Reads directly from the macro-visible gzFile_s prefix (have/next/pos),
  * falling back to the gzgetc() function (parenthesized to suppress this
