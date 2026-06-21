@@ -25,7 +25,7 @@
 //!
 //! `ZStream` is the idiomatic *twin* of that structure. The **`#[repr(C)]`
 //! `z_stream`** with all fourteen raw fields — the actual ABI struct that the
-//! cbindgen-generated C header exposes — lives in [`crate::ffi`], not here.
+//! cbindgen-generated C header exposes — lives in `crate::ffi`, not here.
 //! This module documents the field-by-field correspondence so the FFI layer
 //! can marshal between the two:
 //!
@@ -100,7 +100,7 @@
 //!
 //! This module contains **no `unsafe` blocks**. The custom-allocator path that
 //! dereferences the C `zalloc`/`zfree` function pointers, and the `#[repr(C)]`
-//! pointer marshalling, are confined to [`crate::ffi`] — one of the two
+//! pointer marshalling, are confined to `crate::ffi` — one of the two
 //! sanctioned `unsafe` sites in the crate alongside the `inflate::fast` inner
 //! loop (AAP §0.6.2). The [`Allocator`] trait is a *safe* abstraction over
 //! those hooks: the default [`GlobalAlloc`] backs allocations with owned
@@ -171,14 +171,14 @@ use crate::error::ZlibError;
 /// working buffers are owned `Vec`/`Box` inside the engine state, reclaimed by
 /// RAII — so keeping the methods safe means this module, and the safe core,
 /// remain entirely free of `unsafe`. The only implementor that performs raw
-/// pointer work is the custom allocator in [`crate::ffi`], which wraps the C
+/// pointer work is the custom allocator in `crate::ffi`, which wraps the C
 /// `zalloc`/`zfree` function pointers and confines its `unsafe` blocks to that
 /// boundary.
 ///
 /// # Contract
 ///
 /// Implementors must honour the following so that callers (chiefly
-/// [`crate::ffi`]) can rely on the abstraction:
+/// `crate::ffi`) can rely on the abstraction:
 ///
 /// * [`allocate`](Allocator::allocate) returns either a non-null pointer to a
 ///   block of at least `count * size` bytes, or `None` if the request cannot be
@@ -187,7 +187,7 @@ use crate::error::ZlibError;
 ///   returned by **this same allocator's** [`allocate`](Allocator::allocate),
 ///   together with the *same* `count` and `size`, and that pointer must not
 ///   have been freed already. Violating this is a logic error; because the
-///   real raw-pointer implementor lives in [`crate::ffi`], the unsafety of the
+///   real raw-pointer implementor lives in `crate::ffi`, the unsafety of the
 ///   underlying free is encapsulated there rather than exposed in this
 ///   signature.
 ///
@@ -222,7 +222,7 @@ pub trait Allocator {
 /// — both `Box::into_raw` and [`NonNull::new`] are safe, so this file needs no
 /// `unsafe` block. Reclaiming such a raw block requires [`Box::from_raw`], an
 /// `unsafe` operation; per AAP §0.6.2 that operation is confined to
-/// [`crate::ffi`]. Accordingly [`deallocate`](GlobalAlloc::deallocate) here is a
+/// `crate::ffi`. Accordingly [`deallocate`](GlobalAlloc::deallocate) here is a
 /// **documented no-op**:
 ///
 /// * The pure-Rust core never routes buffer allocation through this allocator
@@ -231,7 +231,7 @@ pub trait Allocator {
 /// * When the FFI layer *does* obtain a raw block from
 ///   [`allocate`](GlobalAlloc::allocate) (e.g. to back a C caller that supplied
 ///   no custom allocator), it reclaims that block itself with the `unsafe`
-///   `Box::from_raw` in [`crate::ffi`], rather than through this no-op.
+///   `Box::from_raw` in `crate::ffi`, rather than through this no-op.
 ///
 /// # Examples
 ///
@@ -360,7 +360,7 @@ pub trait StreamState {
     /// This hook is the safe, additive seam that makes that recovery possible
     /// without leaking engine types into this module: an implementor that wants
     /// to be recoverable overrides this to return `Some(self)`, and the caller
-    /// then performs a checked [`Any::downcast_mut`]. The default returns
+    /// then performs a checked `Any::downcast_mut`. The default returns
     /// `None`, so states that do not opt in (e.g. `DeflateState`) are entirely
     /// unaffected and the trait stays object-safe.
     ///
@@ -482,7 +482,7 @@ impl ZStream<GlobalAlloc> {
     /// The returned stream is an empty carrier — the idiomatic equivalent of a
     /// zero-initialised C `z_stream`: all counters are `0`, [`msg`](ZStream::msg)
     /// is `None`, [`data_type`](ZStream::data_type) is
-    /// [`Z_BINARY`](crate::constants::Z_BINARY) (`0`), [`adler`](ZStream::adler)
+    /// [`Z_BINARY`] (`0`), [`adler`](ZStream::adler)
     /// is `0`, and no [`StreamState`] is installed
     /// ([`has_state`](ZStream::has_state) is `false`). The deflate / inflate
     /// initialisation routines later install the engine state and seed
@@ -523,7 +523,7 @@ impl<A: Allocator> ZStream<A> {
     /// All fields are initialised exactly as in [`ZStream::new`]; only the
     /// allocator differs. This is the constructor the FFI layer uses when a C
     /// caller supplies its own `zalloc`/`zfree`/`opaque` triple (wrapped as an
-    /// `Allocator` implementor in [`crate::ffi`]).
+    /// `Allocator` implementor in `crate::ffi`).
     ///
     /// # Examples
     ///

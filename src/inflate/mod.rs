@@ -15,7 +15,7 @@
 //! zlib can produce, plus the two checked framings layered on top of it:
 //! RFC 1950 (zlib, Adler-32 trailer) and RFC 1952 (gzip, CRC-32 + ISIZE
 //! trailer). The `windowBits` parameter selects among them exactly as in C
-//! (see [`inflate_reset2`]): 8..=15 zlib, -8..=-15 raw, 24..=31 gzip, and
+//! (see `inflate_reset2`): 8..=15 zlib, -8..=-15 raw, 24..=31 gzip, and
 //! 40..=47 automatic zlib/gzip detection.
 //!
 //! # Faithfulness invariants (locked design decisions)
@@ -63,7 +63,7 @@ use crate::error::ZlibError;
 // ---------------------------------------------------------------------------
 
 /// Huffman decode-table builder (`inftrees.c`): the canonical [`Code`] entry,
-/// the [`inflate_table`] constructor, the [`inflate_fixed`] installer, and the
+/// the `inflate_table` constructor, the `inflate_fixed` installer, and the
 /// `ENOUGH*` sizing constants.
 pub mod tables;
 
@@ -141,9 +141,9 @@ fn update_check(state: &InflateState, buf: &[u8]) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Everything the FFI shim / idiomatic wrapper needs to reconcile a
-/// [`ZStream`](crate::stream::ZStream) after a single [`inflate`] call.
+/// [`ZStream`](crate::stream::ZStream) after a single `inflate` call.
 ///
-/// The core [`inflate`] engine operates on borrowed `input` / `output` slices
+/// The core `inflate` engine operates on borrowed `input` / `output` slices
 /// and an owned [`InflateState`]; it cannot touch the caller's `z_stream`
 /// directly, so it reports its effects through this struct.
 ///

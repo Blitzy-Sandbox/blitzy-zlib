@@ -15,17 +15,17 @@
 //! CRC-32 reduces the message polynomial modulo the IEEE polynomial
 //! `x^32 + x^26 + x^23 + x^22 + x^16 + x^12 + x^11 + x^10 + x^8 + x^7 + x^5 +
 //! x^4 + x^2 + x + 1`, taken in *reflected* (LSB-first) bit order, which is the
-//! constant [`POLY`] = `0xEDB88320`. The register is pre- and post-conditioned
+//! constant `POLY` = `0xEDB88320`. The register is pre- and post-conditioned
 //! with `0xFFFF_FFFF` (expressed here as the bitwise complement `!`), matching
 //! the standard zlib convention where a fresh checksum is seeded with `0`.
 //!
 //! Two engines compute the identical value:
 //!
-//! * **Scalar slice-by-8** ([`crc32_scalar`]) — the portable fallback. It folds
+//! * **Scalar slice-by-8** (`crc32_scalar`) — the portable fallback. It folds
 //!   eight input bytes per iteration through the slice-by-8 lookup tables and
 //!   finishes any trailing bytes with the classic byte-at-a-time recurrence.
 //!   This is the engine compiled for the `no-std` / non-`simd` builds.
-//! * **SIMD** ([`crc32_simd`]) — delegates to the [`crc32fast`] crate, whose
+//! * **SIMD** (`crc32_simd`) — delegates to the [`crc32fast`] crate, whose
 //!   `unsafe` SIMD intrinsics are fully encapsulated. Enabled by the `simd`
 //!   feature. `crc32fast` computes the identical IEEE CRC-32, so the two engines
 //!   are interchangeable (proven by a parity unit test under `cfg(all(test,
@@ -40,10 +40,10 @@
 //! below. That generated file declares three `pub(crate) static` items:
 //!
 //! * `CRC_TABLE: [[u32; 256]; 8]` — the slice-by-8 acceleration tables; row 0
-//!   is the canonical byte-wise table. Consumed by [`crc32_scalar`] and
+//!   is the canonical byte-wise table. Consumed by `crc32_scalar` and
 //!   [`get_crc_table`].
 //! * `X2N_TABLE: [u32; 32]` — `x^(2^n) mod p(x)` powers, consumed by
-//!   [`x2nmodp`] to back the `crc32_combine*` family.
+//!   `x2nmodp` to back the `crc32_combine*` family.
 //! * `CRC_TABLE_0: [u32; 256]` — a flat alias of `CRC_TABLE[0]` (unused here;
 //!   the generated statics are `#[allow(dead_code)]`).
 //!
@@ -52,7 +52,7 @@
 //! > dependency of this file) already emits a bit-identical `X2N_TABLE` into the
 //! > included table file, so defining a second one here would be a duplicate
 //! > definition. This module therefore *consumes* the generated `X2N_TABLE` and
-//! > keeps only [`multmodp`] locally (still required at run time by [`x2nmodp`]
+//! > keeps only `multmodp` locally (still required at run time by `x2nmodp`
 //! > and [`crc32_combine_op`]).
 //!
 //! # Design notes
@@ -167,9 +167,9 @@ fn crc32_simd(crc: u32, buf: &[u8]) -> u32 {
 /// value back in as `crc` checksums a stream incrementally and yields the same
 /// result as a single call over the concatenated input.
 ///
-/// Exactly one engine is compiled in: the SIMD path ([`crc32_simd`]) when the
+/// Exactly one engine is compiled in: the SIMD path (`crc32_simd`) when the
 /// `simd` feature is enabled, otherwise the portable scalar path
-/// ([`crc32_scalar`]).
+/// (`crc32_scalar`).
 ///
 /// A Rust slice is never null, so an empty slice is the identity:
 /// `crc32_z(0, b"") == 0`. (The C `buf == Z_NULL` short-circuit is a
@@ -408,7 +408,7 @@ pub fn crc32_combine(crc1: u32, crc2: u32, len2: i64) -> u32 {
 /// The returned table is row 0 of the slice-by-8 tables — the CRC of every
 /// possible single byte. It is available under **all** feature combinations
 /// (the C `get_crc_table` is always present), and referencing it here keeps
-/// `CRC_TABLE` live even when the `simd` feature compiles [`crc32_scalar`] out.
+/// `CRC_TABLE` live even when the `simd` feature compiles `crc32_scalar` out.
 ///
 /// # Examples
 ///

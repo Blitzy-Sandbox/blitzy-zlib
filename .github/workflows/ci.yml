@@ -106,6 +106,25 @@ jobs:
       - name: Lint/compile (no-std rlib)
         run: cargo rustc --lib --crate-type rlib --locked --no-default-features --features no-std -- -D warnings
 
+      # Doc-link gate — the generated rustdoc API docs (AAP §0.7.2: idiomatic,
+      # well-documented public API) MUST build clean with no broken, private,
+      # ambiguous, or redundant intra-doc-link warnings. `RUSTDOCFLAGS=-D warnings`
+      # promotes every rustdoc warning to a hard error so dead doc links cannot
+      # regress. Both doc-clean configurations are covered: the default surface
+      # and the `capi` FFI surface. `--all-features` is intentionally NOT built
+      # here because `std` and `no-std` are mutually exclusive and that build
+      # fails by design (a `compile_error!`), which is verified by the no-std
+      # rlib step above and the dedicated `features` job below.
+      - name: Doc links (default features)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --locked
+
+      - name: Doc links (capi FFI surface)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --locked --features capi
+
   # --------------------------------------------------------------------------
   # Build + Test — OS x toolchain matrix. Mirrors the cmake.yml/configure.yml
   # `fail-fast: false` + `matrix.include` pattern. MUST cover stable AND the

@@ -38,7 +38,7 @@
 //! * Output side: [`have`](GzState) bytes of decompressed / to-be-written data
 //!   are available starting at index [`next`](GzState) within
 //!   [`out_buf`](GzState). The `gzgetc` fast path delivers `out_buf[next]`,
-//!   advancing `next` and decrementing `have` (see [`out_slice`](GzState::out_slice)).
+//!   advancing `next` and decrementing `have` (see `out_slice`).
 //! * Input side: [`in_avail`](GzState) unread input bytes begin at index
 //!   [`in_next`](GzState) within [`in_buf`](GzState). The compression /
 //!   decompression engine is handed a `&[u8]` slice of `in_buf` per call rather
@@ -76,8 +76,8 @@ use crate::stream::ZStream;
 /// The output buffer is double this when reading, and the input buffer is
 /// double this when writing — this value and twice this value must both fit in
 /// the buffer-size type. A caller may request a different size via `gzbuffer`
-/// before the first read/write (it lands in [`GzState::want`]); until the
-/// buffers are first allocated, [`GzState::size`] is `0`.
+/// before the first read/write (it lands in `GzState::want`); until the
+/// buffers are first allocated, `GzState::size` is `0`.
 pub const GZBUFSIZE: usize = 8192;
 
 // ===========================================================================
@@ -647,9 +647,9 @@ impl Drop for GzState {
     /// this function returns.
     ///
     /// On top of that guaranteed cleanup, an **initialized, non-transparent
-    /// write** stream ([`Mode::Write`], [`size`](GzState::size) `!= 0`,
-    /// [`direct`](GzState::direct) `== 0`) that has not already been finalized
-    /// gets a *best-effort* final flush via the [`FinalizeFn`] the write path
+    /// write** stream ([`Mode::Write`], `size` `!= 0`,
+    /// `direct` `== 0`) that has not already been finalized
+    /// gets a *best-effort* final flush via the `FinalizeFn` the write path
     /// installed (mirroring the `deflate(Z_FINISH)` + `deflateEnd` that
     /// `gzclose_w` performs). The returned `Z_*` code is discarded — a
     /// destructor cannot surface a result; callers who must observe close-time
@@ -659,8 +659,8 @@ impl Drop for GzState {
     /// split `flate2`'s `GzEncoder::finish` + `Drop` uses).
     ///
     /// The flush runs **at most once**: taking the hook here, and the explicit
-    /// close path's use of [`take_finalize`](GzState::take_finalize) /
-    /// [`mark_closed`](GzState::mark_closed), ensure a handle is never
+    /// close path's use of `take_finalize` /
+    /// `mark_closed`, ensure a handle is never
     /// finalized twice.
     fn drop(&mut self) {
         // Skip the optional flush for everything that does not need one: read

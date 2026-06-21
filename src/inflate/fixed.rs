@@ -8,9 +8,9 @@
 //! corrupt every fixed-block decode and break both RFC 1951 conformance and
 //! byte-identical interoperability with C zlib.
 //!
-//! [`LENFIX`] is the 512-entry literal/length table (indexed with 9 root bits)
-//! and [`DISTFIX`] is the 32-entry distance table (indexed with 5 root bits).
-//! [`crate::inflate::tables::inflate_fixed`] copies these into the shared
+//! [`LENFIX`](crate::inflate::fixed::LENFIX) is the 512-entry literal/length table (indexed with 9 root bits)
+//! and [`DISTFIX`](crate::inflate::fixed::DISTFIX) is the 32-entry distance table (indexed with 5 root bits).
+//! `crate::inflate::tables::inflate_fixed` copies these into the shared
 //! `codes` buffer for fixed blocks, setting `lenbits = 9` / `distbits = 5`
 //! accordingly; the main inflate state machine (`mod.rs`) and `inflateBack`
 //! (`back.rs`) then decode fixed blocks directly from them.
@@ -24,7 +24,7 @@
 //! These tables must never be edited by hand other than as a faithful
 //! transcription of `inffixed.h`. They were transcribed verbatim, entry for
 //! entry, from the C baseline and are continuously verified against the
-//! canonical builder: [`crate::inflate::tables::inflate_table`] rebuilds them
+//! canonical builder: `crate::inflate::tables::inflate_table` rebuilds them
 //! from the fixed code-length pattern and asserts byte-identity (see the
 //! cross-check tests in `tables.rs`).
 
@@ -34,7 +34,7 @@ use crate::inflate::tables::Code;
 /// bits (`512 == 1 << 9` entries).
 ///
 /// Ported verbatim from `inffixed.h` `lenfix[512]`. Installed by
-/// [`crate::inflate::tables::inflate_fixed`] at `codes[0..512]` to decode
+/// `crate::inflate::tables::inflate_fixed` at `codes[0..512]` to decode
 /// fixed-Huffman blocks.
 ///
 /// Each [`Code`] is `{ op, bits, val }`: `op == 0` marks a literal (`val` is the
@@ -178,7 +178,7 @@ pub const LENFIX: [Code; 512] = [
 /// (`32 == 1 << 5` entries).
 ///
 /// Ported verbatim from `inffixed.h` `distfix[32]`. Installed by
-/// [`crate::inflate::tables::inflate_fixed`] at `codes[512..544]`.
+/// `crate::inflate::tables::inflate_fixed` at `codes[512..544]`.
 ///
 /// Each entry's `op & 0x10` marks a distance base (`op & 0x0f` is the extra-bit
 /// count and `val` the base distance); `op == 64` (`0x40`) marks the two

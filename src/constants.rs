@@ -11,7 +11,7 @@
 //! (RFC 1950 / 1951 / 1952) and the C ABI both depend on these values being
 //! bit-for-bit identical to canonical zlib, so they must never be "modernized"
 //! or otherwise changed. The constants are declared as [`i32`] to mirror the C
-//! `int` type; the FFI shim ([`crate::ffi`]) casts them to
+//! `int` type; the FFI shim (`crate::ffi`) casts them to
 //! [`core::ffi::c_int`] at the boundary.
 //!
 //! In addition to the raw constants — which the FFI layer and any direct

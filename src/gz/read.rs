@@ -9,7 +9,7 @@
 //!
 //! # Substate machine ([`How`])
 //!
-//! Each call that needs more output runs [`gz_fetch`], which dispatches on the
+//! Each call that needs more output runs `gz_fetch`, which dispatches on the
 //! read substate (C `state->how`):
 //!
 //! * [`How::Look`] — examine the next bytes (allocating buffers and the inflate
@@ -38,7 +38,7 @@
 //! functions* over the concrete [`InflateState`]. The recovery from the trait
 //! object back to `&mut InflateState` goes through the additive
 //! [`StreamState::as_any_mut`](crate::stream::StreamState::as_any_mut) seam plus
-//! a checked [`Any::downcast_mut`](core::any::Any) — see [`inflate_engine`]. No
+//! a checked [`Any::downcast_mut`](core::any::Any) — see `inflate_engine`. No
 //! `unsafe` is involved anywhere in this module (AAP §0.6.2).
 //!
 //! # Cursors
@@ -801,7 +801,7 @@ pub fn gzfread(state: &mut GzState, size: usize, nitems: usize, buf: &mut [u8]) 
 ///
 /// Returns the byte (`0..=255`) or `-1` at EOF / on error. Takes the fast path
 /// straight off the output buffer when possible, otherwise falls back to a
-/// one-byte [`gz_read`].
+/// one-byte `gz_read`.
 pub fn gzgetc(state: &mut GzState) -> i32 {
     if !state.is_reading() {
         return -1;
@@ -970,7 +970,7 @@ pub fn gzgets(state: &mut GzState, buf: &mut [u8]) -> usize {
 /// `gzdirect` (`gzread.c` L627-642).
 ///
 /// Returns `1` for a transparent (non-gzip) read, `0` when decompressing. If
-/// the substate is still [`How::Look`] (nothing read yet), a [`gz_look`] is
+/// the substate is still [`How::Look`] (nothing read yet), a `gz_look` is
 /// forced first so the answer is meaningful right after `gzopen`.
 pub fn gzdirect(state: &mut GzState) -> i32 {
     // C: `if (mode == GZ_READ && how == LOOK && x.have == 0) gz_look(state);`
@@ -1078,7 +1078,7 @@ impl Read for GzReader<'_> {
 }
 
 impl BufRead for GzReader<'_> {
-    /// Return the buffered output, refilling it via [`gz_fetch`] when empty.
+    /// Return the buffered output, refilling it via `gz_fetch` when empty.
     ///
     /// The returned slice is exactly the available window
     /// `out_buf[next .. next + have]`; an empty slice signals EOF.

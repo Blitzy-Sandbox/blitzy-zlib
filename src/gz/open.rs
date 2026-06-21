@@ -5,7 +5,7 @@
 //! This module is the *policy and parsing* layer of the gzip file interface.
 //! It owns:
 //!
-//! * the shared [`gz_open`] constructor with its **mode-string parser**
+//! * the shared `gz_open` constructor with its **mode-string parser**
 //!   (`gzopen` / `gzopen64` / `gzdopen`);
 //! * buffer sizing ([`gzbuffer`]);
 //! * positioning ([`gzrewind`], [`gzseek`] / [`gzseek64`], [`gztell`] /
@@ -34,7 +34,7 @@
 //! # Mode-string contract (frozen — AAP §0.6.1, §0.7.1)
 //!
 //! Every character of the mode string is significant and is parsed exactly as
-//! C `gz_open` (`gzlib.c` L113-171) does — see [`gz_open`] for the full table.
+//! C `gz_open` (`gzlib.c` L113-171) does — see `gz_open` for the full table.
 //!
 //! # No `unsafe`
 //!
@@ -44,7 +44,7 @@
 //! `path` / `mode` arguments are the FFI layer's concern: `ffi.rs` performs the
 //! `unsafe { File::from_raw_fd(fd) }` and then calls the safe [`gzdopen`] here.
 //! The OS-level open flags `O_EXCL` / `O_NONBLOCK` are applied through the
-//! **safe** [`OpenOptions`] / [`OpenOptionsExt::custom_flags`] surface, and
+//! **safe** [`OpenOptions`] / [`OpenOptionsExt::custom_flags`](std::os::unix::fs::OpenOptionsExt::custom_flags) surface, and
 //! `O_CLOEXEC` ('e') is the Rust standard-library default for every opened file.
 //!
 //! # Feature gating
@@ -324,7 +324,7 @@ fn parse_mode(mode: &str) -> Option<ParsedMode> {
 /// invalid mode is rejected without ever adopting (and therefore without ever
 /// closing) the caller's descriptor — matching C `gz_open`, which never closes
 /// a provided `fd` on a mode-parse failure. Pure-Rust callers do not need it
-/// because they hand [`gz_open`] an owned [`File`]/path directly.
+/// because they hand `gz_open` an owned [`File`]/path directly.
 #[must_use]
 pub fn mode_is_valid(mode: &str) -> bool {
     parse_mode(mode).is_some()
@@ -488,7 +488,7 @@ fn fd_identifier(_file: &File) -> String {
 /// `gzopen` (`gzlib.c` L287-290).
 ///
 /// Returns the owned handle, or `None` if the mode string is invalid or the
-/// file cannot be opened. See [`gz_open`] for the full mode-string contract.
+/// file cannot be opened. See `gz_open` for the full mode-string contract.
 ///
 /// # Examples
 ///
@@ -527,7 +527,7 @@ pub fn gzopen64(path: &Path, mode: &str) -> Option<Box<GzState>> {
 /// entry point with the resulting owned [`File`].
 ///
 /// Returns the owned handle, or `None` if the mode string is invalid. See
-/// [`gz_open`] for the mode-string contract.
+/// `gz_open` for the mode-string contract.
 #[must_use]
 pub fn gzdopen(file: File, mode: &str) -> Option<Box<GzState>> {
     gz_open(GzSource::File(file), mode)
@@ -584,7 +584,7 @@ pub fn gzbuffer(state: &mut GzState, size: u32) -> i32 {
 ///
 /// Valid only for a read stream with no latched fatal error (`err` is `Z_OK`
 /// or `Z_BUF_ERROR`). Seeks the underlying file back to the recorded
-/// [`start`](crate::gz::state) offset and calls [`gz_reset`], which sets
+/// [`start`](crate::gz::state) offset and calls `gz_reset`, which sets
 /// `how = LOOK` so the next read re-sniffs the gzip header (the inflate engine
 /// is re-initialised lazily by `gz_look` — matching C, which performs no
 /// explicit `inflateReset` here).
@@ -892,7 +892,7 @@ pub fn gzclearerr(state: &mut GzState) {
 /// The actual work — validating the handle, flushing any pending input with the
 /// *old* parameters via `gz_comp(Z_BLOCK)`, and reconfiguring the deflate engine
 /// via `deflateParams` — drives the DEFLATE engine and therefore lives in
-/// [`crate::gz::write::set_params`]. This function is the thin wrapper that the
+/// `crate::gz::write::set_params`. This function is the thin wrapper that the
 /// `gzlib.c`-derived surface exposes; it adds no logic of its own (which is why
 /// `open.rs` lists *both* `gzlib.c` and `gzwrite.c` as its sources). Returns
 /// `Z_OK` on success or the relevant `Z_*` error code.

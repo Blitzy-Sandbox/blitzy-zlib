@@ -6,7 +6,7 @@
 //! `compress2`, `compress_z`, and `compress2_z` (`compress.c`, zlib
 //! `1.3.2.1-motley`), together with the `compressBound` / `compressBound_z`
 //! output-size estimator. They are the compression counterparts of the
-//! `uncompress` helpers in [`crate::util::uncompress`].
+//! `uncompress` helpers in [`crate::util::uncompress`](mod@crate::util::uncompress).
 //!
 //! # Public surface
 //!

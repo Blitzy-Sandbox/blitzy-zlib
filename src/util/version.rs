@@ -105,7 +105,7 @@ const fn size_code(size: usize) -> c_ulong {
 /// # Layout
 ///
 /// The low byte packs four 2-bit type-size fields, each produced by
-/// [`size_code`] from the size of the corresponding C-ABI type:
+/// `size_code` from the size of the corresponding C-ABI type:
 ///
 /// | Bits  | C type     | Rust type used                |
 /// |-------|------------|-------------------------------|

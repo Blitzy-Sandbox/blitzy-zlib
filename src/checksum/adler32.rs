@@ -8,7 +8,7 @@
 //! for every input — any deviation would break stream compatibility.
 //!
 //! The checksum is a 32-bit value composed of two 16-bit running sums computed
-//! modulo [`BASE`] (65521, the largest prime below 2¹⁶):
+//! modulo `BASE` (65521, the largest prime below 2¹⁶):
 //!
 //! * `s1` — the sum of every byte plus one, taken modulo `BASE`.
 //! * `s2` — the sum of every intermediate `s1` value, taken modulo `BASE`.

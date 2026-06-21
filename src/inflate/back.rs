@@ -16,8 +16,8 @@
 //!
 //! As the C header comment notes, "this code is largely copied from
 //! `inflate.c`": it reuses the same Huffman table builder
-//! ([`inflate_table`](crate::inflate::tables::inflate_table)), the same fixed
-//! tables ([`inflate_fixed`](crate::inflate::tables::inflate_fixed)), and the
+//! (`inflate_table`), the same fixed
+//! tables (`inflate_fixed`), and the
 //! same [`Code`](crate::inflate::tables::Code) decode-entry layout. Normally an
 //! application links *either*
 //! `inflate` *or* `inflateBack`, not both.
@@ -44,7 +44,7 @@
 //! byte-at-a-time loop, because the run may overlap). It is `no_std`-clean,
 //! using only `core`; it compiles under `--no-default-features --features
 //! no-std`. (See [the aliasing note](self#why-inflate_fast-is-not-reused) for
-//! why the [`inflate_fast`](crate::inflate::fast::inflate_fast) optimisation is
+//! why the `inflate_fast` optimisation is
 //! intentionally *not* used here.)
 //!
 //! # Control flow: `goto inf_leave` → labeled loop
@@ -62,7 +62,7 @@
 //!
 //! In C, `state->window` *is* the output buffer, so the hot loop
 //! `inflate_fast` copies LZ77 matches within that single aliased buffer. In
-//! this crate's safe model, [`inflate_fast`](crate::inflate::fast::inflate_fast)
+//! this crate's safe model, `inflate_fast`
 //! reads `state.window` as a buffer **separate** from its `output` slice;
 //! reusing it for `inflateBack` would require aliasing the window and the
 //! output, which the borrow checker forbids without `unsafe`. Per AAP §0.6.2
@@ -81,7 +81,7 @@ use crate::inflate::tables::{CodeType, inflate_fixed, inflate_table};
 /// This is the safe-trait replacement for zlib's `in_func` C function pointer.
 /// [`fill`](BackInput::fill) returns the next chunk of compressed input; an
 /// **empty** slice signals "no more input is available", which causes
-/// [`inflate_back`] to stop and return [`Z_BUF_ERROR`](crate::constants::Z_BUF_ERROR)
+/// [`inflate_back`] to stop and return [`Z_BUF_ERROR`]
 /// (mirroring C, where an `in()` return of `0` does the same).
 ///
 /// # Lifetime contract
@@ -104,7 +104,7 @@ pub trait BackInput {
 /// [`write`](BackOutput::write) is handed a slice of freshly produced output
 /// bytes and must consume all of them; it returns `true` on **failure**, which
 /// causes [`inflate_back`] to stop and return
-/// [`Z_BUF_ERROR`](crate::constants::Z_BUF_ERROR) (mirroring C, where a
+/// [`Z_BUF_ERROR`] (mirroring C, where a
 /// non-zero `out()` return means failure).
 pub trait BackOutput {
     /// Consume `buf` of decompressed output. Return `true` on failure.
@@ -195,7 +195,7 @@ impl BackInput for SliceInput<'_> {
 ///
 /// * `Ok(state)` — a fresh decode state configured for raw-DEFLATE callback
 ///   decompression, ready to pass to [`inflate_back`].
-/// * `Err(`[`Z_STREAM_ERROR`](crate::constants::Z_STREAM_ERROR)`)` — `window_bits`
+/// * `Err(`[`Z_STREAM_ERROR`]`)` — `window_bits`
 ///   is outside `8..=15`.
 ///
 /// # Window ownership
@@ -267,28 +267,28 @@ const ORDER: [usize; 19] = [
 ///   C lines 213-216, so a single state may drive successive streams.
 /// * `window` — the combined window/output buffer. Its length **must** equal
 ///   `state.wsize` (`1 << windowBits`); a shorter buffer yields
-///   [`Z_STREAM_ERROR`](crate::constants::Z_STREAM_ERROR).
+///   [`Z_STREAM_ERROR`].
 /// * `input` — the compressed-input source (see [`BackInput`]).
 /// * `output` — the decompressed-output sink (see [`BackOutput`]).
 ///
 /// # Returns (identical to C `inflateBack`)
 ///
-/// * [`Z_STREAM_END`](crate::constants::Z_STREAM_END) — the stream terminated
+/// * [`Z_STREAM_END`] — the stream terminated
 ///   correctly (final block decoded and all output flushed).
-/// * [`Z_BUF_ERROR`](crate::constants::Z_BUF_ERROR) — [`BackInput::fill`]
+/// * [`Z_BUF_ERROR`] — [`BackInput::fill`]
 ///   signalled end-of-input mid-stream, or [`BackOutput::write`] reported a
 ///   write failure.
-/// * [`Z_DATA_ERROR`](crate::constants::Z_DATA_ERROR) — the input is not a valid
+/// * [`Z_DATA_ERROR`] — the input is not a valid
 ///   DEFLATE stream (bad block type, bad stored-length complement, invalid
 ///   Huffman code, or a back-reference distance that points before the start of
 ///   the window).
-/// * [`Z_STREAM_ERROR`](crate::constants::Z_STREAM_ERROR) — the `window` buffer
+/// * [`Z_STREAM_ERROR`] — the `window` buffer
 ///   is the wrong size, or the state machine reached an impossible mode.
 ///
 /// # No `inflate_fast`, by design
 ///
 /// See [the module-level aliasing note](self#why-inflate_fast-is-not-reused):
-/// the optimised [`inflate_fast`](crate::inflate::fast::inflate_fast) is *not*
+/// the optimised `inflate_fast` is *not*
 /// invoked here. The per-symbol decode loop below handles every case and is
 /// byte-identical to C; it is the always-correct path.
 pub fn inflate_back<In, Out>(
@@ -815,7 +815,7 @@ where
 /// [`codes`](InflateState::codes) table (and any window backing) with no manual
 /// free and no `unsafe` (AAP §0.6.3).
 ///
-/// Always returns [`Z_OK`](crate::constants::Z_OK). The C function's
+/// Always returns [`Z_OK`]. The C function's
 /// `Z_STREAM_ERROR` path guards against null `strm`/`state`/`zfree`; those are
 /// FFI-level concerns handled in `src/ffi.rs` (where a `ZStream`-based entry
 /// would instead clear its `Option<Box<dyn StreamState>>` to `None`, triggering

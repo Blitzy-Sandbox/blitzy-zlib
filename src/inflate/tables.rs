@@ -5,8 +5,8 @@
 //! authoritative [`Code`] decode-table entry type (`#[repr(C)]`, indexed
 //! directly by the inflate fast loop, the main inflate state machine, and
 //! `inflateBack`, and exposed at the FFI boundary in `src/ffi.rs`), the
-//! [`inflate_table`] builder that constructs the two-level lookup tables for a
-//! canonical Huffman code, and the [`inflate_fixed`] helper that installs the
+//! `inflate_table` builder that constructs the two-level lookup tables for a
+//! canonical Huffman code, and the `inflate_fixed` helper that installs the
 //! fixed (static) Huffman tables.
 //!
 //! The construction is a faithful, behaviour-preserving port: the produced
@@ -27,10 +27,10 @@
 /// `#[repr(C)]` guarantees the layout matches the C `code` struct exactly
 /// (four bytes: `op`, `bits`, then a two-byte `val`), which is required both
 /// for the FFI boundary (`src/ffi.rs` references this type) and so that the
-/// tables constructed by [`inflate_table`] are bit-identical to those built by
+/// tables constructed by `inflate_table` are bit-identical to those built by
 /// C zlib.
 ///
-/// # `op` value encoding (as set by [`inflate_table`])
+/// # `op` value encoding (as set by `inflate_table`)
 ///
 /// The `op` byte is interpreted bitwise, exactly as documented in
 /// `inftrees.h`:
@@ -88,7 +88,7 @@ pub const ENOUGH_DISTS: usize = 592;
 /// Total size of the shared dynamic decode buffer: `ENOUGH_LENS + ENOUGH_DISTS`.
 pub const ENOUGH: usize = ENOUGH_LENS + ENOUGH_DISTS;
 
-/// The kind of canonical Huffman code [`inflate_table`] is asked to build.
+/// The kind of canonical Huffman code `inflate_table` is asked to build.
 ///
 /// Mirrors the C `codetype` enum (`CODES`, `LENS`, `DISTS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -378,7 +378,7 @@ pub(crate) fn inflate_table(
 }
 
 /// Index and bit parameters for the fixed Huffman decode tables, as produced
-/// by [`inflate_fixed`].
+/// by `inflate_fixed`.
 ///
 /// `lencode` / `distcode` are *indices* into the caller's `codes` buffer (the
 /// uniform index model used throughout this crate), and `lenbits` / `distbits`

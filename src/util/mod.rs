@@ -25,8 +25,8 @@
 //! | Submodule      | C source     | Responsibility                                |
 //! |----------------|--------------|-----------------------------------------------|
 //! | [`version`]    | `zutil.c`    | `zlibVersion` / `zError` / `zlibCompileFlags` |
-//! | [`compress`]   | `compress.c` | one-shot whole-buffer compression             |
-//! | [`uncompress`] | `uncompr.c`  | one-shot whole-buffer decompression           |
+//! | [`compress`](mod@compress)   | `compress.c` | one-shot whole-buffer compression             |
+//! | [`uncompress`](mod@uncompress) | `uncompr.c`  | one-shot whole-buffer decompression           |
 //!
 //! # Safety & `no_std`
 //!

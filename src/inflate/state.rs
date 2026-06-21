@@ -204,7 +204,7 @@ pub enum InflateMode {
 ///
 /// This is the safe-Rust port of the C `struct inflate_state` (`inflate.h`,
 /// lines 82–126). It is owned by a [`ZStream`](crate::stream::ZStream) as
-/// `Option<Box<dyn `[`StreamState`](crate::stream::StreamState)`>>`; the C
+/// `Option<Box<dyn `[`StreamState`]`>>`; the C
 /// `z_streamp strm` back-pointer is therefore **omitted** (see the
 /// [module docs](self#inverted-ownership--no-strm-back-pointer)).
 ///
@@ -460,7 +460,7 @@ impl StreamState for InflateState {
     /// drives it through the inflate *free functions* (`inflate`,
     /// `inflate_reset`), which require a `&mut InflateState`. Returning
     /// `Some(self)` here lets those callers recover the concrete reference via a
-    /// checked [`core::any::Any::downcast_mut`], keeping the engine types out of
+    /// checked `core::any::Any::downcast_mut`, keeping the engine types out of
     /// the `stream` module entirely.
     #[inline]
     fn as_any_mut(&mut self) -> Option<&mut dyn core::any::Any> {

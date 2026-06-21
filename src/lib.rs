@@ -21,7 +21,7 @@
 //! | [`error`] | [`ZlibError`] / [`ReturnCode`] and the `z_errmsg` table | `zutil.h` |
 //! | [`stream`] | [`ZStream`] and the [`Allocator`] abstraction | `zlib.h` |
 //! | [`gz_header`] | [`GzHeader`] gzip metadata (gated by `gzip`) | `zlib.h` |
-//! | [`checksum`] | [`adler32`] / [`crc32`] families | `adler32.c`, `crc32.c` |
+//! | [`checksum`] | [`adler32`](fn@adler32) / [`crc32`](fn@crc32) families | `adler32.c`, `crc32.c` |
 //! | [`inflate`] | The DEFLATE decompression engine | `inflate.c` and friends |
 //! | [`deflate`] | The DEFLATE compression engine | `deflate.c` and friends |
 //! | [`gz`] | The gzip `FILE`-I/O layer (gated by `gz-io`) | `gzlib.c`, `gzread.c`, `gzwrite.c`, `gzclose.c` |

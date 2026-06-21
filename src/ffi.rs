@@ -38,7 +38,7 @@
 //! `ZALLOC(strm, 1, sizeof(internal_state))` — is allocated through
 //! `zalloc(opaque, 1, size)` and released through `zfree(opaque, ptr)`, each
 //! handle recording its own provenance so `*End` frees it symmetrically (see
-//! the [`alloc_handle`] / [`reclaim_handle`] bridge). When the hooks are
+//! the `alloc_handle` / `reclaim_handle` bridge). When the hooks are
 //! `Z_NULL` the handle falls back to a global `Box`. A caller's counting or
 //! pool allocator therefore observes the state-object alloc/free pair balanced
 //! through its own hooks.
@@ -273,9 +273,9 @@ pub type gz_headerp = *mut gz_header;
 ///
 /// A C caller compiled against the canonical header therefore dereferences this
 /// exact layout. To remain a binary/header-compatible `libz` drop-in, the FFI
-/// handle ([`GzHandle`]) places a `gzFile_s` at offset 0 (`#[repr(C)]`) and
+/// handle (`GzHandle`) places a `gzFile_s` at offset 0 (`#[repr(C)]`) and
 /// keeps `have`/`next`/`pos` synchronized with the engine's read buffer around
-/// every gz entry point (see [`GzHandle::sync_in`] / [`GzHandle::sync_out`]),
+/// every gz entry point (see `GzHandle::sync_in` / `GzHandle::sync_out`),
 /// so the `gzgetc` macro fast-path and the `gzgetc_`/`gzread` functions observe
 /// one consistent stream position.
 #[repr(C)]

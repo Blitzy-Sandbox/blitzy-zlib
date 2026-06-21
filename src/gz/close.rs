@@ -8,9 +8,9 @@
 //! that split faithfully — it contains **only** the dispatcher and delegates
 //! the real teardown to its siblings:
 //!
-//! * [`gzclose_r`](crate::gz::read::gzclose_r) — the read-side close, in
+//! * `gzclose_r` — the read-side close, in
 //!   `read.rs` (frees the inflate engine and the read buffers);
-//! * [`gzclose_w`](crate::gz::write::gzclose_w) — the write-side close, in
+//! * [`gzclose_w`] — the write-side close, in
 //!   `write.rs` (flushes, finishes the gzip stream, frees the deflate engine
 //!   and the write buffers).
 //!
@@ -19,7 +19,7 @@
 //!
 //! # Behaviour
 //!
-//! [`gzclose`] inspects the handle's [`mode`](crate::gz::state::GzState::mode)
+//! [`gzclose`] inspects the handle's `mode`
 //! and routes to the matching close routine, exactly mirroring the C ternary
 //! `state->mode == GZ_READ ? gzclose_r(file) : gzclose_w(file)`. A `NULL`
 //! handle — here spelled [`None`] — yields [`Z_STREAM_ERROR`], as in C.
@@ -31,9 +31,9 @@
 //! (the Rust spelling of `gzFile`). The owned [`File`](std::fs::File), the I/O
 //! buffers, and the embedded compression engine are released deterministically
 //! when the box is dropped at the end of the call — the RAII replacement for
-//! the manual teardown. Because [`gzclose_r`](crate::gz::read::gzclose_r) /
-//! [`gzclose_w`](crate::gz::write::gzclose_w) each call
-//! [`mark_closed`](crate::gz::state::GzState::mark_closed) before returning, the
+//! the manual teardown. Because `gzclose_r` /
+//! [`gzclose_w`] each call
+//! `mark_closed` before returning, the
 //! box's [`Drop`] impl observes an already-finalized handle and does nothing —
 //! the **double-finalize guard** that guarantees exactly-once teardown whether
 //! the caller closes explicitly or simply drops the handle.
@@ -54,12 +54,12 @@ use crate::gz::write::gzclose_w;
 ///
 /// This is the safe-Rust port of zlib's `gzclose()` (`gzclose.c` L11-23) — the
 /// single top-level close entry point that dispatches on the handle's
-/// [`mode`](GzState::mode):
+/// `mode`:
 ///
-/// * [`Mode::Read`] → [`gzclose_r`](crate::gz::read::gzclose_r) (tears down the
+/// * [`Mode::Read`] → `gzclose_r` (tears down the
 ///   inflate engine and frees the read buffers);
 /// * anything else ([`Mode::Write`] / [`Mode::Append`] / [`Mode::None`]) →
-///   [`gzclose_w`](crate::gz::write::gzclose_w) (flushes and finishes the gzip
+///   [`gzclose_w`] (flushes and finishes the gzip
 ///   stream, then frees the deflate engine and write buffers).
 ///
 /// This binary split mirrors the C ternary exactly:
@@ -81,8 +81,8 @@ use crate::gz::write::gzclose_w;
 ///
 /// * [`Z_STREAM_ERROR`] if `file` is [`None`] (the C `file == NULL` case).
 /// * Otherwise the status code produced by
-///   [`gzclose_r`](crate::gz::read::gzclose_r) /
-///   [`gzclose_w`](crate::gz::write::gzclose_w) — [`Z_OK`](crate::constants::Z_OK)
+///   `gzclose_r` /
+///   [`gzclose_w`] — [`Z_OK`](crate::constants::Z_OK)
 ///   on success, or a latched `Z_*` error such as
 ///   [`Z_BUF_ERROR`](crate::constants::Z_BUF_ERROR) /
 ///   [`Z_ERRNO`](crate::constants::Z_ERRNO).

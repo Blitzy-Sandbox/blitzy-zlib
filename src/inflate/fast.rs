@@ -28,7 +28,7 @@
 //!   [`slice::copy_from_slice`] (the window and the output are disjoint
 //!   buffers, so the runs are provably non-overlapping).
 //!
-//! `unsafe` is confined to exactly **one** primitive — [`copy_overlapping`] —
+//! `unsafe` is confined to exactly **one** primitive — `copy_overlapping` —
 //! used for the LZ77 *overlapping* output run-copy (e.g. `dist == 1`, which
 //! repeats the previous byte). That copy must be byte-by-byte (a bulk copy
 //! would not reproduce the run-length semantics), and it is the hottest inner
@@ -602,7 +602,7 @@ mod tests {
     /// The canonical Huffman code (MSB-first `code`, bit-length `len`) for every
     /// symbol, derived from the per-symbol code lengths exactly per RFC 1951
     /// §3.2.2. This is the *same* canonical assignment that
-    /// [`inflate_table`] decodes, so a stream encoded with these codes is
+    /// `inflate_table` decodes, so a stream encoded with these codes is
     /// decoded correctly by tables built from the identical lengths.
     fn canonical_codes(lens: &[u16]) -> Vec<(u32, u32)> {
         const MAXBITS: usize = 15;
@@ -752,7 +752,7 @@ mod tests {
     }
 
     /// Build the literal/length and distance decode tables into `state.codes`
-    /// via the real [`inflate_table`], and configure the table indices/bit
+    /// via the real `inflate_table`, and configure the table indices/bit
     /// widths — the exact set-up the inflate engine performs before entering the
     /// fast loop.
     fn build_tables(state: &mut InflateState, litlen_lens: &[u16], dist_lens: &[u16]) {

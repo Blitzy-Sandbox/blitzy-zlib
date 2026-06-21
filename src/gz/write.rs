@@ -14,19 +14,19 @@
 //! return conventions (`gzwrite`/`gzfwrite`/`gzputc`/`gzputs`/`gzprintf`/
 //! `gzflush`/`gzclose_w`). The variadic `gzprintf` C-string / `va_list`
 //! marshalling is *not* done here — it belongs at the `ffi.rs` boundary; the
-//! safe core exposes a [`fmt::Arguments`]-based [`gzprintf`].
+//! safe core exposes a [`fmt::Arguments`](core::fmt::Arguments)-based [`gzprintf`].
 //!
 //! # Shared `pub(crate)` helpers
 //!
-//! [`gz_init`], [`gz_comp`], [`gz_zero`], [`set_params`], [`finish`] and
+//! `gz_init`, `gz_comp`, `gz_zero`, `set_params`, `finish` and
 //! [`gzclose_w`] are `pub(crate)` so that the sibling gz modules reuse the
 //! deflate-driving logic without duplicating it:
 //!
-//! * `open.rs::gzsetparams` is a thin wrapper over [`set_params`] (its body
+//! * `open.rs::gzsetparams` is a thin wrapper over `set_params` (its body
 //!   comes from `gzwrite.c`'s `gzsetparams`);
 //! * `close.rs::gzclose` dispatches the write side to [`gzclose_w`];
 //! * `state.rs`'s [`Drop`](crate::gz::state::GzState) safety net invokes
-//!   [`finish`] (installed as the [`FinalizeFn`](crate::gz::state::FinalizeFn)).
+//!   `finish` (installed as the `FinalizeFn`).
 //!
 //! # Memory model (AAP §0.6.3)
 //!
@@ -37,7 +37,7 @@
 //!
 //! ## The doubled input buffer
 //!
-//! [`gz_init`] allocates the input buffer at **`want << 1`** (double the nominal
+//! `gz_init` allocates the input buffer at **`want << 1`** (double the nominal
 //! size). C `gzprintf` formats up to `want` bytes into the *second half* of this
 //! buffer; the safe port formats into a temporary [`String`] instead, but the
 //! doubled allocation is preserved verbatim for byte-for-byte parity with C and
@@ -530,7 +530,7 @@ pub fn gzfwrite(state: &mut GzState, item_size: usize, nitems: usize, buf: &[u8]
 ///
 /// Returns the byte written (`c & 0xff`) or `-1` on error. Uses C's fast path:
 /// if the input buffer has room, the byte is appended directly without invoking
-/// the full [`gz_write`] machinery.
+/// the full `gz_write` machinery.
 pub fn gzputc(state: &mut GzState, c: i32) -> i32 {
     // check that we're writing and that there's no (serious) error
     if state.mode != Mode::Write || (state.err != Z_OK && !state.again) {
@@ -597,8 +597,8 @@ pub fn gzputs(state: &mut GzState, s: &[u8]) -> i32 {
 /// The C variadic `gzprintf(file, format, …)` marshals its `va_list` and runs
 /// `vsnprintf` into the *second half* of the doubled input buffer; that
 /// `unsafe`, `va_list`-dependent shim belongs in `ffi.rs`. Here the caller
-/// supplies the already-typed [`fmt::Arguments`] (e.g. via `format_args!`), which
-/// are rendered into a temporary [`String`] and pushed through [`gz_write`].
+/// supplies the already-typed [`fmt::Arguments`](core::fmt::Arguments) (e.g. via `format_args!`), which
+/// are rendered into a temporary [`String`] and pushed through `gz_write`.
 ///
 /// Returns the number of bytes written. Per C, a render that is empty or would
 /// not fit in `want` bytes (`len == 0 || len >= want`) yields `0`; any
@@ -627,7 +627,7 @@ pub fn gzprintf(state: &mut GzState, args: core::fmt::Arguments<'_>) -> i32 {
 /// the C shim at the FFI boundary (`csrc/gzprintf.c`) because stable Rust cannot
 /// read a C `va_list`; this safe core takes the finished bytes and is therefore
 /// byte-exact for any formatted output (including non-UTF-8 bytes that the
-/// [`fmt::Arguments`] entry point cannot represent). It is also the shared
+/// [`fmt::Arguments`](core::fmt::Arguments) entry point cannot represent). It is also the shared
 /// implementation that [`gzprintf`] delegates to after rendering.
 ///
 /// Returns the number of bytes written. Per C, input that is empty or would not
@@ -673,7 +673,7 @@ pub fn gzprintf_bytes(state: &mut GzState, bytes: &[u8]) -> i32 {
 /// (C `gzflush`, `gzwrite.c` L603-627).
 ///
 /// Validates `flush` is in `0..=Z_FINISH` (rejecting `Z_BLOCK`/`Z_TREES`, exactly
-/// like C), then drives [`gz_comp`]. Returns `Z_OK` on success or the recorded
+/// like C), then drives `gz_comp`. Returns `Z_OK` on success or the recorded
 /// error code.
 pub fn gzflush(state: &mut GzState, flush: i32) -> i32 {
     // check that we're writing and that there's no (serious) error

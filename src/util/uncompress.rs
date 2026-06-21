@@ -41,7 +41,7 @@
 //! | output buffer too small (input remaining)  | `Err(ZlibError::BufError)`   |
 //! | any other error code                       | passed through unchanged     |
 //!
-//! See [`map_result`] for the precise rules and how they correspond to the C
+//! See `map_result` for the precise rules and how they correspond to the C
 //! `len == 0` test (where `len` counts *unused* input).
 //!
 //! # Safety and `no_std`

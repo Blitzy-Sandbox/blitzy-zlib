@@ -16,7 +16,7 @@
 //!
 //! The idiomatic API therefore returns [`Result<ReturnCode>`](Result) (i.e.
 //! `core::result::Result<ReturnCode, ZlibError>`), and the FFI shim
-//! ([`crate::ffi`]) converts that back into the exact C `int` code via
+//! (`crate::ffi`) converts that back into the exact C `int` code via
 //! [`result_to_code`]. The inverse, [`code_to_result`], lets internal helpers
 //! that still speak in raw codes be lifted into the idiomatic world.
 //!
@@ -537,7 +537,7 @@ pub fn code_to_result(code: i32) -> Result<ReturnCode> {
 
 /// Convert an idiomatic [`Result`] back into the raw C `int` return code.
 ///
-/// This is the conversion the FFI shim ([`crate::ffi`]) uses to produce the C
+/// This is the conversion the FFI shim (`crate::ffi`) uses to produce the C
 /// return value: `Ok(rc)` becomes `rc.as_c_int()` and `Err(e)` becomes
 /// `e.as_c_int()`. It is the inverse of [`code_to_result`].
 ///

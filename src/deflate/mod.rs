@@ -3,13 +3,13 @@
 //! This module is the capstone of the `deflate` subtree. It is ported from
 //! `deflate.c` (the public `deflate*` API and the `deflate()` main loop) and
 //! `deflate.h` (the `FLUSH_BLOCK` / `RANK` macros and the `*_STATE` status
-//! sentinels). It ties together the persistent engine [`state`], the Huffman
-//! [`trees`] builder, the per-level [`strategy`] configuration table, and the
-//! five per-level compress routines ([`stored`], [`fast`], [`slow`], [`rle`],
-//! [`huff`]):
+//! sentinels). It ties together the persistent engine `state`, the Huffman
+//! `trees` builder, the per-level `strategy` configuration table, and the
+//! five per-level compress routines (`stored`, `fast`, `slow`, `rle`,
+//! `huff`):
 //!
-//! * It defines the header-emission state machine ([`DeflateStatus`]).
-//! * It defines the [`flush_block`] / [`flush_block_only`] helpers that the
+//! * It defines the header-emission state machine (`DeflateStatus`).
+//! * It defines the `flush_block` / `flush_block_only` helpers that the
 //!   five strategy modules import (the C `FLUSH_BLOCK*` macros lived in
 //!   `deflate.c` / `deflate.h`).
 //! * It implements every public `deflate*` entry point — initialization,
@@ -31,7 +31,7 @@
 //!
 //! C seeds its running checksum with `adler32(0L, Z_NULL, 0)` (== `1`) for the
 //! zlib/raw wrappers and `crc32(0L, Z_NULL, 0)` (== `0`) for gzip. The Rust
-//! [`adler32`] returns the *seed* for an empty non-null slice (so
+//! [`adler32`](fn@crate::checksum::adler32) returns the *seed* for an empty non-null slice (so
 //! `adler32(0, &[])` is `0`, **not** `1`). Therefore every such C
 //! initialization is replaced here with the literal `1u32` / `0u32`; the
 //! running checksum is only ever *updated* over non-empty input slices (in
@@ -1251,7 +1251,7 @@ pub struct DeflateOutcome {
 /// A safe, owning DEFLATE compressor — the idiomatic Rust front end to the
 /// engine (AAP §0.3.2).
 ///
-/// `Deflate` wraps the heap-allocated engine [`state`](DeflateState) and exposes
+/// `Deflate` wraps the heap-allocated engine `state` and exposes
 /// `Result`/`Option`-returning methods instead of C integer codes. Buffers are
 /// owned and freed automatically when the `Deflate` is dropped (RAII — there is
 /// no explicit "end" call to remember). The compressed output is byte-identical
@@ -1340,7 +1340,7 @@ impl Deflate {
 
     /// Set the compression dictionary (preset history). Must be called on a
     /// pristine stream before the first [`compress`](Self::compress). See
-    /// [`deflate_set_dictionary`] for the exact preconditions.
+    /// `deflate_set_dictionary` for the exact preconditions.
     pub fn set_dictionary(&mut self, dictionary: &[u8]) -> Result<(), ZlibError> {
         deflate_set_dictionary(&mut self.state, dictionary)?;
         Ok(())
