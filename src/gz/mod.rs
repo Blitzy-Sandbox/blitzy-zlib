@@ -129,7 +129,7 @@ pub use state::{GZBUFSIZE, GzState, How, Mode};
 // ---------------------------------------------------------------------------
 pub use open::{
     GzSource, gzbuffer, gzclearerr, gzdopen, gzeof, gzerror, gzoffset, gzoffset64, gzopen,
-    gzopen64, gzrewind, gzseek, gzseek64, gzsetparams, gztell, gztell64,
+    gzopen64, gzrewind, gzseek, gzseek64, gzsetparams, gztell, gztell64, mode_is_valid,
 };
 
 // ---------------------------------------------------------------------------
@@ -143,9 +143,10 @@ pub use read::{GzReader, gzdirect, gzfread, gzgetc, gzgetc_, gzgets, gzread, gzu
 // `write` re-exports — the write path (ported from `gzwrite.c`): the `gzwrite*`
 // entry points plus the write-side close dispatcher `gzclose_w`. The variadic
 // `gzprintf` is exposed here as a `core::fmt::Arguments`-based core; the C
-// variadic marshalling lives at the `src/ffi.rs` boundary.
+// variadic marshalling lives at the `src/ffi.rs` boundary, which formats into a
+// buffer and feeds the byte-oriented `gzprintf_bytes` core.
 // ---------------------------------------------------------------------------
-pub use write::{gzclose_w, gzflush, gzfwrite, gzprintf, gzputc, gzputs, gzwrite};
+pub use write::{gzclose_w, gzflush, gzfwrite, gzprintf, gzprintf_bytes, gzputc, gzputs, gzwrite};
 
 // ---------------------------------------------------------------------------
 // `close` re-export — the top-level [`gzclose`] dispatcher (ported from

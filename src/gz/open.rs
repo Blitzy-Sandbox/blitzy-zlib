@@ -216,8 +216,32 @@ pub(crate) fn gz_reset(state: &mut GzState) {
 /// applied lazily by the write/read engine initialisation (see the
 /// [module documentation](self)). This function only records `level` /
 /// `strategy` / `mode` / `direct` and opens the file.
-#[must_use]
-pub(crate) fn gz_open(source: GzSource<'_>, mode: &str) -> Option<Box<GzState>> {
+/// The result of parsing and validating a gz mode string — the `level` /
+/// `strategy` / `mode` / `direct` selections plus the `O_EXCL` / `O_NONBLOCK`
+/// open-flag requests. Produced by [`parse_mode`] and consumed by [`gz_open`].
+///
+/// Extracting this from [`gz_open`] lets the FFI layer validate the mode string
+/// **before** it adopts a caller-supplied file descriptor (see
+/// [`mode_is_valid`]): C `gz_open` never closes a provided `fd` on a parse
+/// failure, so the descriptor must not be wrapped in an owning [`File`] until
+/// the mode is known to be valid.
+struct ParsedMode {
+    want_mode: Mode,
+    level: i32,
+    strategy: i32,
+    direct: i32,
+    exclusive: bool,
+    nonblock: bool,
+}
+
+/// Parse and validate a gz mode string, returning `None` for any rejected
+/// combination exactly as C `gz_open` (`gzlib.c` L108-198) does. This is the
+/// single source of truth for the mode contract documented on [`gz_open`].
+///
+/// Returning `None` here corresponds to every C `free(state); return NULL;`
+/// parse-failure path; crucially it performs **no I/O and adopts no
+/// descriptor**, so a caller can probe mode validity without side effects.
+fn parse_mode(mode: &str) -> Option<ParsedMode> {
     // --- interpret mode (gzlib.c L108-171) ---
     let mut want_mode = Mode::None;
     let mut level = Z_DEFAULT_COMPRESSION;
@@ -283,6 +307,44 @@ pub(crate) fn gz_open(source: GzSource<'_>, mode: &str) -> Option<Box<GzState>> 
         // "G" has no meaning when writing -- disallow it
         return None;
     }
+
+    Some(ParsedMode {
+        want_mode,
+        level,
+        strategy,
+        direct,
+        exclusive,
+        nonblock,
+    })
+}
+
+/// Returns `true` if `mode` is a valid gz mode string.
+///
+/// The FFI `gzdopen` shim calls this **before** `File::from_raw_fd` so that an
+/// invalid mode is rejected without ever adopting (and therefore without ever
+/// closing) the caller's descriptor — matching C `gz_open`, which never closes
+/// a provided `fd` on a mode-parse failure. Pure-Rust callers do not need it
+/// because they hand [`gz_open`] an owned [`File`]/path directly.
+#[must_use]
+pub fn mode_is_valid(mode: &str) -> bool {
+    parse_mode(mode).is_some()
+}
+
+#[must_use]
+pub(crate) fn gz_open(source: GzSource<'_>, mode: &str) -> Option<Box<GzState>> {
+    // Parse and validate the mode string up front (the single source of truth
+    // is `parse_mode`). On any rejected combination this returns `None` having
+    // performed no I/O and — critically — without consuming `source`, so a
+    // caller-supplied descriptor inside `source` is never adopted/closed on a
+    // parse failure (matching C `gz_open`'s `free(state); return NULL;`).
+    let ParsedMode {
+        want_mode,
+        level,
+        strategy,
+        direct,
+        exclusive,
+        nonblock,
+    } = parse_mode(mode)?;
 
     // --- open the file (or adopt the supplied one) and record its identifier
     //     for error messages (gzlib.c L199-268) ---

@@ -81,6 +81,32 @@ use crate::stream::ZStream;
 pub const GZBUFSIZE: usize = 8192;
 
 // ===========================================================================
+// alloc_zeroed — fallible zero-filled allocation (the C `malloc` + NULL-check
+// analogue shared by the gzip read and write buffer setup).
+// ===========================================================================
+
+/// Allocate a zero-filled `Vec<u8>` of `len` bytes, returning `None` on an
+/// allocation failure instead of aborting.
+///
+/// This is the safe-Rust analogue of C `malloc` + an explicit `NULL` check (as
+/// used by `gz_init` in `gzwrite.c` and `gz_look` in `gzread.c`): `Vec`'s
+/// infallible `vec![0; len]` would abort the whole process on OOM, whereas
+/// [`Vec::try_reserve_exact`] surfaces the failure as a recoverable `None`, so
+/// the gz layer can report `Z_MEM_ERROR` exactly as the C port does. Shared by
+/// [`crate::gz::read`] and [`crate::gz::write`] so both buffer-allocation paths
+/// have identical, C-faithful out-of-memory behaviour.
+#[inline]
+#[must_use]
+pub(crate) fn alloc_zeroed(len: usize) -> Option<Vec<u8>> {
+    let mut v: Vec<u8> = Vec::new();
+    if v.try_reserve_exact(len).is_err() {
+        return None;
+    }
+    v.resize(len, 0);
+    Some(v)
+}
+
+// ===========================================================================
 // Mode — gzip stream modes (gzguts.h L159-162)
 // ===========================================================================
 //

@@ -31,14 +31,28 @@
 //! ## Allocator semantics (`zalloc` / `zfree` / `opaque`)
 //!
 //! The `zalloc`/`zfree`/`opaque` fields are preserved in the [`z_stream`]
-//! layout for ABI fidelity. The safe-Rust engines own and free all of their
-//! working memory through RAII (`Vec`/`Box`, reclaimed on `Drop`; AAP §0.6.3),
-//! so the default contract — *when `zalloc`/`zfree` are `Z_NULL`, the library
-//! uses its own heap* — is honoured exactly. A C caller that installs custom
-//! allocator hooks will still get correct compression/decompression; the
-//! engines simply source their internal buffers from the Rust global allocator
-//! rather than routing each block through the hooks. This is the documented
-//! consequence of replacing manual `ZALLOC`/`ZFREE` with ownership.
+//! layout for ABI fidelity, and the FFI honours them through an allocator
+//! bridge. When a C caller installs both hooks, the **FFI-created state
+//! object** — the `DeflateHandle`/`InflateHandle`/`InflateBackHandle` that
+//! `z_stream.state` points at, the direct analogue of C zlib's
+//! `ZALLOC(strm, 1, sizeof(internal_state))` — is allocated through
+//! `zalloc(opaque, 1, size)` and released through `zfree(opaque, ptr)`, each
+//! handle recording its own provenance so `*End` frees it symmetrically (see
+//! the [`alloc_handle`] / [`reclaim_handle`] bridge). When the hooks are
+//! `Z_NULL` the handle falls back to a global `Box`. A caller's counting or
+//! pool allocator therefore observes the state-object alloc/free pair balanced
+//! through its own hooks.
+//!
+//! The engines' large *internal* working buffers (the deflate window,
+//! `pending_buf`, `head`/`prev`, and the inflate code tables) remain owned
+//! `Vec`/`Box` reclaimed on `Drop`. The AAP fixes this boundary deliberately:
+//! the core is 100% safe Rust with `unsafe` confined to two zones (§0.6.2) and
+//! all working buffers are owned `Vec`/`Box` (§0.6.3), while stable Rust has no
+//! stable custom-allocator `Vec`/`Box` (the `allocator_api` is unstable) — so
+//! routing those buffers through the hooks is neither expressible on the stable
+//! MSRV nor compatible with the safe-core mandate. Hooks are thus *preserved at
+//! the FFI layer* exactly as §0.6.3 prescribes, and pure-Rust callers always
+//! use the Rust global allocator.
 //!
 //! ## Symbol gating
 //!
@@ -238,9 +252,64 @@ pub struct gz_header {
 /// C `gz_headerp` — a pointer to a [`gz_header`].
 pub type gz_headerp = *mut gz_header;
 
-/// C `gzFile` — an opaque handle to an open gzip file. Internally a
-/// `*mut GzState`; applications must treat it as opaque.
-pub type gzFile = *mut c_void;
+/// C `struct gzFile_s` — the **macro-visible prefix** of a gzip file handle,
+/// laid out to match `zlib.h` byte-for-byte:
+///
+/// ```c
+/// struct gzFile_s {
+///     unsigned have;
+///     unsigned char *next;
+///     z_off64_t pos;
+/// };
+/// ```
+///
+/// The canonical `zlib.h` defines `gzgetc` as a macro that reads and mutates
+/// these three fields directly:
+///
+/// ```c
+/// #define gzgetc(g) \
+///     ((g)->have ? ((g)->have--, (g)->pos++, *((g)->next)++) : (gzgetc)(g))
+/// ```
+///
+/// A C caller compiled against the canonical header therefore dereferences this
+/// exact layout. To remain a binary/header-compatible `libz` drop-in, the FFI
+/// handle ([`GzHandle`]) places a `gzFile_s` at offset 0 (`#[repr(C)]`) and
+/// keeps `have`/`next`/`pos` synchronized with the engine's read buffer around
+/// every gz entry point (see [`GzHandle::sync_in`] / [`GzHandle::sync_out`]),
+/// so the `gzgetc` macro fast-path and the `gzgetc_`/`gzread` functions observe
+/// one consistent stream position.
+#[repr(C)]
+pub struct gzFile_s {
+    /// Bytes immediately available in `next` (the macro decrements this).
+    pub have: c_uint,
+    /// Cursor into the engine's output buffer (the macro post-increments this).
+    pub next: *mut c_uchar,
+    /// Uncompressed stream position (the macro post-increments this).
+    pub pos: z_off64_t,
+}
+
+// Only the gzip FILE-I/O layer (`gz-io`) constructs handles, so `zeroed()` is
+// exercised exclusively under that feature; gate the impl to match and avoid a
+// dead-code warning in the (unusual) `capi`-without-`gz-io` configuration.
+#[cfg(feature = "gz-io")]
+impl gzFile_s {
+    /// The initial (pre-first-read) state: empty buffer, null cursor, position
+    /// zero — matching a freshly opened handle before any data is buffered.
+    #[inline]
+    const fn zeroed() -> Self {
+        gzFile_s {
+            have: 0,
+            next: core::ptr::null_mut(),
+            pos: 0,
+        }
+    }
+}
+
+/// C `gzFile` — a semi-opaque handle to an open gzip file: a pointer to a
+/// [`gzFile_s`] whose macro-visible prefix the FFI keeps in sync with the
+/// engine. Applications treat the pointee as opaque beyond the three exposed
+/// fields the `gzgetc` macro touches.
+pub type gzFile = *mut gzFile_s;
 
 // The decode-table entry (`#[repr(C)] struct code { op, bits, val }`). The
 // authoritative definition lives in `crate::inflate::tables`; it is re-exported
@@ -266,6 +335,9 @@ const ZLIB_VERSION_CSTR: &[u8] = b"1.3.2.1-motley\0";
 struct DeflateHandle {
     state: Box<deng::DeflateState>,
     msg: Vec<u8>,
+    /// How this handle's backing block was obtained (caller `zalloc` hook vs.
+    /// the global allocator), so `deflateEnd` frees it symmetrically.
+    alloc: HandleAlloc,
 }
 
 /// Boxed decompression state attached to `z_stream.state`.
@@ -279,6 +351,9 @@ struct InflateHandle {
     /// The `gz_header` registered by `inflateGetHeader`, or null.
     head: *mut gz_header,
     msg: Vec<u8>,
+    /// How this handle's backing block was obtained (caller `zalloc` hook vs.
+    /// the global allocator), so `inflateEnd` frees it symmetrically.
+    alloc: HandleAlloc,
 }
 
 /// Boxed `inflateBack` state attached to `z_stream.state`.
@@ -292,6 +367,167 @@ struct InflateBackHandle {
     window: *mut Bytef,
     /// Length of `window` in bytes.
     wsize: usize,
+    /// How this handle's backing block was obtained (caller `zalloc` hook vs.
+    /// the global allocator), so `inflateBackEnd` frees it symmetrically.
+    alloc: HandleAlloc,
+}
+
+// ===========================================================================
+// Allocator-hook bridge (AAP §0.6.2 / §0.6.3)
+// ===========================================================================
+//
+// zlib lets a C caller install custom `zalloc`/`zfree`/`opaque` hooks on the
+// `z_stream` so the library draws its heap from a caller-controlled pool. The
+// safe-Rust engines own their large working buffers (the deflate window,
+// `pending_buf`, `head`/`prev`, and the inflate code tables) as `Vec`/`Box`
+// reclaimed by `Drop`: the AAP mandates a 100% safe core with `unsafe` confined
+// to `inflate/fast.rs` and this module (§0.6.2), and stable Rust has no stable
+// custom-allocator `Vec`/`Box` (the `allocator_api` is unstable), so those
+// engine buffers necessarily use the Rust global allocator — exactly the
+// boundary §0.6.3 draws ("hooks preserved at the FFI layer … pure-Rust callers
+// use the global allocator").
+//
+// What this layer CAN and does route through the caller hooks is the
+// FFI-created *state object* itself — the `DeflateHandle` / `InflateHandle` /
+// `InflateBackHandle` that `z_stream.state` points at. That allocation is the
+// direct analogue of C zlib's `ZALLOC(strm, 1, sizeof(internal_state))`: when
+// the caller installs both hooks, the handle's backing block comes from
+// `zalloc(opaque, 1, size_of::<Handle>())` and is released through
+// `zfree(opaque, ptr)`; when either hook is null the handle uses an ordinary
+// `Box`. Each handle records its own provenance so `*End` frees it through the
+// same allocator that created it, independent of any later mutation of the
+// stream's hook fields. A caller's counting/pool allocator therefore observes
+// the state-object alloc/free pair balanced through its own hooks.
+
+/// How an FFI handle's backing allocation was obtained, recorded inside the
+/// handle so the matching deallocator can be chosen at `*End`.
+#[derive(Clone, Copy)]
+enum HandleAlloc {
+    /// Allocated with a Rust `Box` from the global allocator.
+    Global,
+    /// Allocated through the caller's `zalloc`; release via `zfree(opaque, …)`.
+    Hook {
+        zfree: unsafe extern "C" fn(voidpf, voidpf),
+        opaque: voidpf,
+    },
+}
+
+/// Lets the generic [`reclaim_handle`] read a handle's allocation provenance.
+trait FfiHandle {
+    fn alloc_kind(&self) -> HandleAlloc;
+}
+
+impl FfiHandle for DeflateHandle {
+    #[inline]
+    fn alloc_kind(&self) -> HandleAlloc {
+        self.alloc
+    }
+}
+
+impl FfiHandle for InflateHandle {
+    #[inline]
+    fn alloc_kind(&self) -> HandleAlloc {
+        self.alloc
+    }
+}
+
+impl FfiHandle for InflateBackHandle {
+    #[inline]
+    fn alloc_kind(&self) -> HandleAlloc {
+        self.alloc
+    }
+}
+
+/// Return the caller's allocator hooks iff BOTH `zalloc` and `zfree` are
+/// installed (non-null). zlib treats a half-installed pair as the default
+/// allocator, so the hooks are used only when the pair is complete; `opaque`
+/// is forwarded verbatim as the hooks' first argument.
+#[inline]
+fn caller_hooks(
+    strm: &z_stream,
+) -> Option<(
+    unsafe extern "C" fn(voidpf, uInt, uInt) -> voidpf,
+    unsafe extern "C" fn(voidpf, voidpf),
+    voidpf,
+)> {
+    match (strm.zalloc, strm.zfree) {
+        (Some(zalloc), Some(zfree)) => Some((zalloc, zfree, strm.opaque)),
+        _ => None,
+    }
+}
+
+/// Allocate and initialise an FFI handle `T`, routing the allocation through
+/// the caller's `zalloc` hook when installed (otherwise a global `Box`). The
+/// `make` closure receives the chosen [`HandleAlloc`] so the constructed value
+/// records its own provenance for symmetric release in [`reclaim_handle`].
+///
+/// Returns `None` (→ `Z_MEM_ERROR`) when the hook returns null or — defensively
+/// — yields a block too misaligned to hold `T` (zlib requires malloc-grade
+/// alignment, so a conforming hook never trips that check).
+fn alloc_handle<T: FfiHandle>(
+    strm: &z_stream,
+    make: impl FnOnce(HandleAlloc) -> T,
+) -> Option<*mut T> {
+    match caller_hooks(strm) {
+        None => Some(Box::into_raw(Box::new(make(HandleAlloc::Global)))),
+        Some((zalloc, zfree, opaque)) => {
+            let size = core::mem::size_of::<T>();
+            let align = core::mem::align_of::<T>();
+            // SAFETY: `zalloc` is a non-null C `alloc_func` (verified by
+            // `caller_hooks`); invoking it as `(opaque, 1, size)` matches the
+            // C contract `ZALLOC(strm, 1, sizeof(state))`.
+            let raw = unsafe { zalloc(opaque, 1, size as uInt) } as *mut T;
+            if raw.is_null() {
+                return None;
+            }
+            // `align` is a power of two (`align_of` guarantee), so `align - 1`
+            // is its alignment mask. A conforming malloc-grade hook satisfies
+            // this; if not, free the block and fail rather than risk UB.
+            if (raw as usize) & (align - 1) != 0 {
+                // SAFETY: `raw` came from `zalloc(opaque, …)`, so
+                // `zfree(opaque, raw)` is the matching deallocation.
+                unsafe { zfree(opaque, raw as voidpf) };
+                return None;
+            }
+            // SAFETY: `raw` is non-null and aligned for `T` and addresses
+            // `size_of::<T>()` writable bytes; `write` initialises them without
+            // reading/dropping the prior uninitialised contents.
+            unsafe { raw.write(make(HandleAlloc::Hook { zfree, opaque })) };
+            Some(raw)
+        }
+    }
+}
+
+/// Reclaim an FFI handle created by [`alloc_handle`]: move the `T` value out of
+/// its backing block, release that block through the allocator recorded inside
+/// the handle, and return the owned value so the caller can hand its engine
+/// `state` to the relevant `*_end`.
+///
+/// # Safety
+///
+/// `ptr` must be a live, uniquely-owned handle previously produced by
+/// [`alloc_handle`] (i.e. the current `z_stream.state`) that has not yet been
+/// reclaimed.
+unsafe fn reclaim_handle<T: FfiHandle>(ptr: *mut T) -> T {
+    // SAFETY: `ptr` is a live handle (caller precondition); read its provenance
+    // before disturbing the allocation.
+    let kind = unsafe { (*ptr).alloc_kind() };
+    match kind {
+        // The `Box` owns the global block; `*boxed` moves `T` out and frees it.
+        // SAFETY: in the `Global` arm `ptr` came from `Box::into_raw`.
+        HandleAlloc::Global => *unsafe { Box::from_raw(ptr) },
+        HandleAlloc::Hook { zfree, opaque } => {
+            // SAFETY: `ptr` is valid for reads of `T`; move the value out
+            // bitwise. The shell is freed below WITHOUT running `T`'s drop, so
+            // the inner `Box`/`Vec` fields end up owned solely by `value`.
+            let value = unsafe { core::ptr::read(ptr) };
+            // SAFETY: in the `Hook` arm `ptr` came from `zalloc(opaque, …)`, so
+            // `zfree(opaque, ptr)` is the matching deallocation; afterwards the
+            // shell is gone but `value` still owns the inner allocations.
+            unsafe { zfree(opaque, ptr as voidpf) };
+            value
+        }
+    }
 }
 
 /// Reconstruct the input slice from `next_in` / `avail_in`.
@@ -301,70 +537,88 @@ struct InflateBackHandle {
 /// # Safety
 ///
 /// `next_in` must be valid for reads of `avail_in` bytes, per the C contract.
+///
+/// Returns `None` for the invalid `(next_in == NULL && avail_in != 0)`
+/// combination so the caller can reject it with `Z_STREAM_ERROR`, mirroring C
+/// zlib's defensive `next_in == Z_NULL` checks. A null pointer with a zero
+/// length is legal and yields `Some(&[])`.
 #[inline]
-unsafe fn input_slice<'a>(next_in: *const Bytef, avail_in: uInt) -> &'a [u8] {
-    if next_in.is_null() || avail_in == 0 {
-        &[]
+unsafe fn input_slice<'a>(next_in: *const Bytef, avail_in: uInt) -> Option<&'a [u8]> {
+    if next_in.is_null() {
+        // A null pointer is only valid when the advertised length is zero;
+        // a non-zero length with a null pointer is a caller contract violation.
+        if avail_in != 0 { None } else { Some(&[]) }
     } else {
         // SAFETY: the caller guarantees `next_in` points to `avail_in` readable
         // bytes for the duration of the call (the zlib `next_in`/`avail_in`
-        // contract); the borrow does not outlive this call.
-        unsafe { core::slice::from_raw_parts(next_in, avail_in as usize) }
+        // contract); the borrow does not outlive this call. A non-null pointer
+        // with `avail_in == 0` is valid for `from_raw_parts` (empty slice).
+        Some(unsafe { core::slice::from_raw_parts(next_in, avail_in as usize) })
     }
 }
 
 /// Reconstruct the output slice from `next_out` / `avail_out`.
 ///
-/// A null `next_out` (legal when `avail_out == 0`) yields an empty slice.
+/// Returns `None` for the invalid `(next_out == NULL && avail_out != 0)`
+/// combination so the caller can reject it with `Z_STREAM_ERROR`. A null
+/// pointer with a zero length is legal and yields `Some(&mut [])`.
 ///
 /// # Safety
 ///
 /// `next_out` must be valid for writes of `avail_out` bytes, per the C
 /// contract, and not alias the input slice.
 #[inline]
-unsafe fn output_slice<'a>(next_out: *mut Bytef, avail_out: uInt) -> &'a mut [u8] {
-    if next_out.is_null() || avail_out == 0 {
-        &mut []
+unsafe fn output_slice<'a>(next_out: *mut Bytef, avail_out: uInt) -> Option<&'a mut [u8]> {
+    if next_out.is_null() {
+        // A null pointer is only valid when the advertised length is zero.
+        if avail_out != 0 { None } else { Some(&mut []) }
     } else {
         // SAFETY: the caller guarantees `next_out` points to `avail_out`
         // writable bytes for the duration of the call (the zlib
-        // `next_out`/`avail_out` contract); the borrow does not outlive it.
-        unsafe { core::slice::from_raw_parts_mut(next_out, avail_out as usize) }
+        // `next_out`/`avail_out` contract); the borrow does not outlive it. A
+        // non-null pointer with `avail_out == 0` is valid (empty slice).
+        Some(unsafe { core::slice::from_raw_parts_mut(next_out, avail_out as usize) })
     }
 }
 
 /// Reconstruct a `&[u8]` from a C buffer pointer and a `usize` length (the
 /// one-shot helpers carry `uLong`/`z_size_t` lengths, which can exceed `uInt`).
-/// A null pointer or zero length yields an empty slice.
+///
+/// Returns `None` for the invalid `(ptr == NULL && len != 0)` combination so the
+/// caller can reject it; a null pointer with a zero length yields `Some(&[])`.
 ///
 /// # Safety
 ///
 /// When non-null, `ptr` must point to at least `len` readable bytes that remain
 /// valid for the duration of the call.
 #[inline]
-unsafe fn const_buf<'a>(ptr: *const Bytef, len: usize) -> &'a [u8] {
-    if ptr.is_null() || len == 0 {
-        &[]
+unsafe fn const_buf<'a>(ptr: *const Bytef, len: usize) -> Option<&'a [u8]> {
+    if ptr.is_null() {
+        // A null pointer is only valid when the advertised length is zero.
+        if len != 0 { None } else { Some(&[]) }
     } else {
         // SAFETY: caller upholds the validity-for-`len`-bytes precondition.
-        unsafe { core::slice::from_raw_parts(ptr, len) }
+        Some(unsafe { core::slice::from_raw_parts(ptr, len) })
     }
 }
 
 /// Reconstruct a `&mut [u8]` from a C buffer pointer and a `usize` length.
-/// A null pointer or zero length yields an empty slice.
+///
+/// Returns `None` for the invalid `(ptr == NULL && len != 0)` combination so the
+/// caller can reject it; a null pointer with a zero length yields `Some(&mut [])`.
 ///
 /// # Safety
 ///
 /// When non-null, `ptr` must point to at least `len` writable bytes that remain
 /// valid for the duration of the call and are not aliased elsewhere.
 #[inline]
-unsafe fn mut_buf<'a>(ptr: *mut Bytef, len: usize) -> &'a mut [u8] {
-    if ptr.is_null() || len == 0 {
-        &mut []
+unsafe fn mut_buf<'a>(ptr: *mut Bytef, len: usize) -> Option<&'a mut [u8]> {
+    if ptr.is_null() {
+        // A null pointer is only valid when the advertised length is zero.
+        if len != 0 { None } else { Some(&mut []) }
     } else {
         // SAFETY: caller upholds the validity-for-`len`-bytes precondition.
-        unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+        Some(unsafe { core::slice::from_raw_parts_mut(ptr, len) })
     }
 }
 
@@ -431,19 +685,28 @@ fn guard_call<F: FnOnce() -> c_int>(f: F) -> c_int {
 
 /// Box a freshly initialised [`DeflateState`](crate::deflate::DeflateState),
 /// attach it to `strm.state`, and seed the public `z_stream` fields from it.
-fn attach_deflate(strm: &mut z_stream, state: Box<deng::DeflateState>) {
-    let handle = Box::new(DeflateHandle {
+fn attach_deflate(strm: &mut z_stream, state: Box<deng::DeflateState>) -> c_int {
+    // Seed the public scalar fields from the engine state while it is still
+    // owned here (before it is moved into the handle below).
+    strm.total_in = state.total_in as uLong;
+    strm.total_out = state.total_out as uLong;
+    strm.data_type = state.data_type;
+    strm.adler = state.adler as uLong;
+    strm.msg = core::ptr::null();
+    // Allocate the handle through the caller's `zalloc` hook when installed
+    // (else a global `Box`), recording the provenance so `deflateEnd` frees it
+    // through the same allocator. Hand ownership to the C `z_stream`.
+    match alloc_handle(strm, move |alloc| DeflateHandle {
         state,
         msg: Vec::new(),
-    });
-    strm.total_in = handle.state.total_in as uLong;
-    strm.total_out = handle.state.total_out as uLong;
-    strm.data_type = handle.state.data_type;
-    strm.adler = handle.state.adler as uLong;
-    strm.msg = core::ptr::null();
-    // Hand ownership of the heap state to the C `z_stream`; reclaimed by
-    // `deflateEnd`.
-    strm.state = Box::into_raw(handle) as *mut c_void;
+        alloc,
+    }) {
+        Some(handle) => {
+            strm.state = handle as *mut c_void;
+            Z_OK
+        }
+        None => Z_MEM_ERROR,
+    }
 }
 
 /// Borrow the [`DeflateHandle`] attached to `strm`, or `None` if `strm` or its
@@ -494,10 +757,7 @@ pub unsafe extern "C" fn deflateInit_(
     // SAFETY: caller guarantees `strm` points to a valid `z_stream`.
     let strm = unsafe { &mut *strm };
     match deng::deflate_init(level) {
-        Ok(state) => {
-            attach_deflate(strm, state);
-            Z_OK
-        }
+        Ok(state) => attach_deflate(strm, state),
         Err(e) => e.as_c_int(),
     }
 }
@@ -526,10 +786,7 @@ pub unsafe extern "C" fn deflateInit2_(
     // SAFETY: caller guarantees `strm` points to a valid `z_stream`.
     let strm = unsafe { &mut *strm };
     match deng::deflate_init2(level, method, windowBits, memLevel, strategy) {
-        Ok(state) => {
-            attach_deflate(strm, state);
-            Z_OK
-        }
+        Ok(state) => attach_deflate(strm, state),
         Err(e) => e.as_c_int(),
     }
 }
@@ -552,9 +809,15 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
         };
 
         // SAFETY: `next_in`/`avail_in` and `next_out`/`avail_out` describe the
-        // caller's buffers per the zlib contract.
-        let input = unsafe { input_slice(strm.next_in, strm.avail_in) };
-        let output = unsafe { output_slice(strm.next_out, strm.avail_out) };
+        // caller's buffers per the zlib contract. A null pointer paired with a
+        // non-zero length is an invalid argument and is rejected with
+        // `Z_STREAM_ERROR`, mirroring C zlib's defensive null checks.
+        let (Some(input), Some(output)) = (
+            unsafe { input_slice(strm.next_in, strm.avail_in) },
+            unsafe { output_slice(strm.next_out, strm.avail_out) },
+        ) else {
+            return Z_STREAM_ERROR;
+        };
 
         let mut stream = deng::state::DeflateStream {
             state: &mut handle.state,
@@ -594,8 +857,9 @@ pub unsafe extern "C" fn deflateEnd(strm: z_streamp) -> c_int {
     let Some((strm, _handle)) = (unsafe { deflate_handle(strm) }) else {
         return Z_STREAM_ERROR;
     };
-    // SAFETY: `state` is a live `Box::into_raw(DeflateHandle)`; reclaim it.
-    let handle = unsafe { Box::from_raw(strm.state as *mut DeflateHandle) };
+    // SAFETY: `state` is a live handle from `alloc_handle`; reclaim it through
+    // the same allocator (caller hook or global) that created it.
+    let handle = unsafe { reclaim_handle(strm.state as *mut DeflateHandle) };
     let status = deng::deflate_end(&handle.state);
     strm.state = core::ptr::null_mut();
     drop(handle);
@@ -644,9 +908,14 @@ pub unsafe extern "C" fn deflateParams(strm: z_streamp, level: c_int, strategy: 
     let Some((strm, handle)) = (unsafe { deflate_handle(strm) }) else {
         return Z_STREAM_ERROR;
     };
-    // SAFETY: the buffers are described by the zlib contract.
-    let input = unsafe { input_slice(strm.next_in, strm.avail_in) };
-    let output = unsafe { output_slice(strm.next_out, strm.avail_out) };
+    // SAFETY: the buffers are described by the zlib contract. A null pointer
+    // paired with a non-zero length is rejected with `Z_STREAM_ERROR`.
+    let (Some(input), Some(output)) = (
+        unsafe { input_slice(strm.next_in, strm.avail_in) },
+        unsafe { output_slice(strm.next_out, strm.avail_out) },
+    ) else {
+        return Z_STREAM_ERROR;
+    };
     let mut stream = deng::state::DeflateStream {
         state: &mut handle.state,
         input,
@@ -731,11 +1000,9 @@ pub unsafe extern "C" fn deflateCopy(dest: z_streamp, source: z_streamp) -> c_in
     // SAFETY: caller guarantees `dest` points to a valid `z_stream`.
     let dest_strm = unsafe { &mut *dest };
     let cloned = deng::deflate_copy(&src_handle.state);
-    let handle = Box::new(DeflateHandle {
-        state: cloned,
-        msg: Vec::new(),
-    });
-    // Mirror the public scalar fields from the source onto the destination.
+    // Mirror the public scalar fields AND the allocator hooks from the source
+    // onto the destination before allocating, so the clone's handle is drawn
+    // from — and later freed through — the same allocator as the source.
     dest_strm.total_in = src_strm.total_in;
     dest_strm.total_out = src_strm.total_out;
     dest_strm.adler = src_strm.adler;
@@ -744,8 +1011,17 @@ pub unsafe extern "C" fn deflateCopy(dest: z_streamp, source: z_streamp) -> c_in
     dest_strm.zalloc = src_strm.zalloc;
     dest_strm.zfree = src_strm.zfree;
     dest_strm.opaque = src_strm.opaque;
-    dest_strm.state = Box::into_raw(handle) as *mut c_void;
-    Z_OK
+    match alloc_handle(dest_strm, move |alloc| DeflateHandle {
+        state: cloned,
+        msg: Vec::new(),
+        alloc,
+    }) {
+        Some(handle) => {
+            dest_strm.state = handle as *mut c_void;
+            Z_OK
+        }
+        None => Z_MEM_ERROR,
+    }
 }
 
 /// C `deflateBound` — upper bound on the compressed size of `sourceLen` bytes
@@ -929,19 +1205,26 @@ pub unsafe extern "C" fn deflateSetHeader(strm: z_streamp, head: gz_headerp) -> 
 
 /// Box a freshly initialised [`InflateState`](crate::inflate::InflateState),
 /// attach it to `strm.state`, and seed the public `z_stream` fields.
-fn attach_inflate(strm: &mut z_stream, state: Box<ieng::InflateState>) {
-    let handle = Box::new(InflateHandle {
-        state,
-        head: core::ptr::null_mut(),
-        msg: Vec::new(),
-    });
+fn attach_inflate(strm: &mut z_stream, state: Box<ieng::InflateState>) -> c_int {
     strm.total_in = 0;
     strm.total_out = 0;
     strm.msg = core::ptr::null();
     strm.adler = 0;
-    // Hand ownership of the heap state to the C `z_stream`; reclaimed by
-    // `inflateEnd`.
-    strm.state = Box::into_raw(handle) as *mut c_void;
+    // Allocate the handle through the caller's `zalloc` hook when installed
+    // (else a global `Box`), recording the provenance so `inflateEnd` frees it
+    // through the same allocator. Hand ownership to the C `z_stream`.
+    match alloc_handle(strm, move |alloc| InflateHandle {
+        state,
+        head: core::ptr::null_mut(),
+        msg: Vec::new(),
+        alloc,
+    }) {
+        Some(handle) => {
+            strm.state = handle as *mut c_void;
+            Z_OK
+        }
+        None => Z_MEM_ERROR,
+    }
 }
 
 /// Borrow the [`InflateHandle`] attached to `strm`, or `None` if `strm` or its
@@ -986,10 +1269,7 @@ pub unsafe extern "C" fn inflateInit_(
     // SAFETY: caller guarantees `strm` points to a valid `z_stream`.
     let strm = unsafe { &mut *strm };
     match ieng::inflate_init() {
-        Ok(state) => {
-            attach_inflate(strm, state);
-            Z_OK
-        }
+        Ok(state) => attach_inflate(strm, state),
         Err(code) => code,
     }
 }
@@ -1014,10 +1294,7 @@ pub unsafe extern "C" fn inflateInit2_(
     // SAFETY: caller guarantees `strm` points to a valid `z_stream`.
     let strm = unsafe { &mut *strm };
     match ieng::inflate_init2(windowBits) {
-        Ok(state) => {
-            attach_inflate(strm, state);
-            Z_OK
-        }
+        Ok(state) => attach_inflate(strm, state),
         Err(code) => code,
     }
 }
@@ -1036,9 +1313,14 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
         };
 
         // SAFETY: the buffers are described by `next_in`/`avail_in` and
-        // `next_out`/`avail_out` per the zlib contract.
-        let input = unsafe { input_slice(strm.next_in, strm.avail_in) };
-        let output = unsafe { output_slice(strm.next_out, strm.avail_out) };
+        // `next_out`/`avail_out` per the zlib contract. A null pointer paired
+        // with a non-zero length is rejected with `Z_STREAM_ERROR`.
+        let (Some(input), Some(output)) = (
+            unsafe { input_slice(strm.next_in, strm.avail_in) },
+            unsafe { output_slice(strm.next_out, strm.avail_out) },
+        ) else {
+            return Z_STREAM_ERROR;
+        };
 
         let outcome = ieng::inflate(&mut handle.state, input, output, flush);
 
@@ -1077,9 +1359,10 @@ pub unsafe extern "C" fn inflateEnd(strm: z_streamp) -> c_int {
     let Some((strm, _handle)) = (unsafe { inflate_handle(strm) }) else {
         return Z_STREAM_ERROR;
     };
-    // SAFETY: `state` is a live `Box::into_raw(InflateHandle)`; reclaim it and
-    // move the engine state out so `inflate_end` can consume it.
-    let handle = *unsafe { Box::from_raw(strm.state as *mut InflateHandle) };
+    // SAFETY: `state` is a live handle from `alloc_handle`; reclaim it through
+    // the same allocator (caller hook or global) that created it, moving the
+    // engine state out so `inflate_end` can consume it.
+    let handle = unsafe { reclaim_handle(strm.state as *mut InflateHandle) };
     let ret = ieng::inflate_end(handle.state);
     strm.state = core::ptr::null_mut();
     ret
@@ -1300,8 +1583,11 @@ pub unsafe extern "C" fn inflateSync(strm: z_streamp) -> c_int {
     let Some((strm, handle)) = (unsafe { inflate_handle(strm) }) else {
         return Z_STREAM_ERROR;
     };
-    // SAFETY: the input buffer is described by `next_in`/`avail_in`.
-    let input = unsafe { input_slice(strm.next_in, strm.avail_in) };
+    // SAFETY: the input buffer is described by `next_in`/`avail_in`. A null
+    // pointer paired with a non-zero length is rejected with `Z_STREAM_ERROR`.
+    let Some(input) = (unsafe { input_slice(strm.next_in, strm.avail_in) }) else {
+        return Z_STREAM_ERROR;
+    };
     let mut adler = strm.adler as u32;
     let (ret, consumed) = ieng::inflate_sync(&mut handle.state, input, &mut adler);
     strm.adler = adler as uLong;
@@ -1337,12 +1623,11 @@ pub unsafe extern "C" fn inflateCopy(dest: z_streamp, source: z_streamp) -> c_in
     // SAFETY: caller guarantees `dest` points to a valid `z_stream`.
     let dest_strm = unsafe { &mut *dest };
     let cloned = Box::new(ieng::inflate_copy(&src_handle.state));
-    let handle = Box::new(InflateHandle {
-        state: cloned,
-        // Mirror C, which copies the registered header pointer verbatim.
-        head: src_handle.head,
-        msg: Vec::new(),
-    });
+    // Mirror C, which copies the registered header pointer verbatim.
+    let head = src_handle.head;
+    // Mirror the public scalar fields AND the allocator hooks from the source
+    // onto the destination before allocating, so the clone's handle is drawn
+    // from — and later freed through — the same allocator as the source.
     dest_strm.total_in = src_strm.total_in;
     dest_strm.total_out = src_strm.total_out;
     dest_strm.adler = src_strm.adler;
@@ -1351,8 +1636,18 @@ pub unsafe extern "C" fn inflateCopy(dest: z_streamp, source: z_streamp) -> c_in
     dest_strm.zalloc = src_strm.zalloc;
     dest_strm.zfree = src_strm.zfree;
     dest_strm.opaque = src_strm.opaque;
-    dest_strm.state = Box::into_raw(handle) as *mut c_void;
-    Z_OK
+    match alloc_handle(dest_strm, move |alloc| InflateHandle {
+        state: cloned,
+        head,
+        msg: Vec::new(),
+        alloc,
+    }) {
+        Some(handle) => {
+            dest_strm.state = handle as *mut c_void;
+            Z_OK
+        }
+        None => Z_MEM_ERROR,
+    }
 }
 
 /// C `inflateMark` — encode decode progress (`back` bits in the high word, copy
@@ -1491,17 +1786,27 @@ pub unsafe extern "C" fn inflateBackInit_(
     match ieng::inflate_back_init(windowBits) {
         Ok(state) => {
             let wsize = state.wsize as usize;
-            let handle = Box::new(InflateBackHandle {
-                state: Box::new(state),
-                window: window as *mut Bytef,
-                wsize,
-            });
+            let state = Box::new(state);
+            let win = window as *mut Bytef;
             strm.total_in = 0;
             strm.total_out = 0;
             strm.msg = core::ptr::null();
             strm.adler = 0;
-            strm.state = Box::into_raw(handle) as *mut c_void;
-            Z_OK
+            // Allocate the handle through the caller's `zalloc` hook when
+            // installed (else a global `Box`), recording the provenance so
+            // `inflateBackEnd` frees it through the same allocator.
+            match alloc_handle(strm, move |alloc| InflateBackHandle {
+                state,
+                window: win,
+                wsize,
+                alloc,
+            }) {
+                Some(handle) => {
+                    strm.state = handle as *mut c_void;
+                    Z_OK
+                }
+                None => Z_MEM_ERROR,
+            }
         }
         Err(code) => code,
     }
@@ -1591,9 +1896,10 @@ pub unsafe extern "C" fn inflateBackEnd(strm: z_streamp) -> c_int {
     if strm.state.is_null() {
         return Z_STREAM_ERROR;
     }
-    // SAFETY: `state` is a live `Box::into_raw(InflateBackHandle)`; reclaim it
-    // and move the engine state out so `inflate_back_end` can consume it.
-    let handle = *unsafe { Box::from_raw(strm.state as *mut InflateBackHandle) };
+    // SAFETY: `state` is a live handle from `alloc_handle`; reclaim it through
+    // the same allocator (caller hook or global) that created it, moving the
+    // engine state out so `inflate_back_end` can consume it.
+    let handle = unsafe { reclaim_handle(strm.state as *mut InflateBackHandle) };
     let ret = ieng::inflate_back_end(*handle.state);
     strm.state = core::ptr::null_mut();
     ret
@@ -1726,9 +2032,13 @@ pub unsafe extern "C" fn compress2(
         // SAFETY: `destLen` is a valid in/out `uLong` per the contract.
         let cap = unsafe { *destLen } as usize;
         // SAFETY: `dest` is valid for `cap` bytes and `source` for `sourceLen`
-        // bytes per the contract; null buffers degrade to empty slices.
-        let dest_slice = unsafe { mut_buf(dest, cap) };
-        let src_slice = unsafe { const_buf(source, sourceLen as usize) };
+        // bytes per the contract. A null pointer paired with a non-zero length
+        // is rejected with `Z_STREAM_ERROR`, matching C zlib's argument checks.
+        let (Some(dest_slice), Some(src_slice)) = (unsafe { mut_buf(dest, cap) }, unsafe {
+            const_buf(source, sourceLen as usize)
+        }) else {
+            return Z_STREAM_ERROR;
+        };
         match ueng::compress2_to_buf(dest_slice, src_slice, level) {
             Ok(produced) => {
                 // SAFETY: `destLen` validated non-null above.
@@ -1755,9 +2065,12 @@ pub unsafe extern "C" fn compress(
         }
         // SAFETY: `destLen` is a valid in/out `uLong` per the contract.
         let cap = unsafe { *destLen } as usize;
-        // SAFETY: see `compress2`.
-        let dest_slice = unsafe { mut_buf(dest, cap) };
-        let src_slice = unsafe { const_buf(source, sourceLen as usize) };
+        // SAFETY: see `compress2`; null + non-zero length is rejected.
+        let (Some(dest_slice), Some(src_slice)) = (unsafe { mut_buf(dest, cap) }, unsafe {
+            const_buf(source, sourceLen as usize)
+        }) else {
+            return Z_STREAM_ERROR;
+        };
         match ueng::compress_to_buf(dest_slice, src_slice) {
             Ok(produced) => {
                 // SAFETY: `destLen` validated non-null above.
@@ -1792,9 +2105,12 @@ pub unsafe extern "C" fn uncompress(
         }
         // SAFETY: `destLen` is a valid in/out `uLong` per the contract.
         let cap = unsafe { *destLen } as usize;
-        // SAFETY: see `compress2`.
-        let dest_slice = unsafe { mut_buf(dest, cap) };
-        let src_slice = unsafe { const_buf(source, sourceLen as usize) };
+        // SAFETY: see `compress2`; null + non-zero length is rejected.
+        let (Some(dest_slice), Some(src_slice)) = (unsafe { mut_buf(dest, cap) }, unsafe {
+            const_buf(source, sourceLen as usize)
+        }) else {
+            return Z_STREAM_ERROR;
+        };
         match ueng::uncompress_to_buf(dest_slice, src_slice) {
             Ok((produced, _consumed)) => {
                 // SAFETY: `destLen` validated non-null above.
@@ -1824,9 +2140,12 @@ pub unsafe extern "C" fn uncompress2(
         // contract.
         let cap = unsafe { *destLen } as usize;
         let src_len = unsafe { *sourceLen } as usize;
-        // SAFETY: see `compress2`.
-        let dest_slice = unsafe { mut_buf(dest, cap) };
-        let src_slice = unsafe { const_buf(source, src_len) };
+        // SAFETY: see `compress2`; null + non-zero length is rejected.
+        let (Some(dest_slice), Some(src_slice)) = (unsafe { mut_buf(dest, cap) }, unsafe {
+            const_buf(source, src_len)
+        }) else {
+            return Z_STREAM_ERROR;
+        };
         match ueng::uncompress2_to_buf(dest_slice, src_slice) {
             Ok((produced, consumed)) => {
                 // SAFETY: both pointers validated non-null above.
@@ -2024,16 +2343,128 @@ pub unsafe extern "C" fn uncompress2_z(
 // `gzerror`.
 // ---------------------------------------------------------------------------
 
-/// FFI-side owner of a gzip file: the engine state plus a scratch buffer that
-/// backs the `*const c_char` returned by [`gzerror`] (kept alive until the next
-/// `gzerror` call on the same handle).
+/// FFI-side owner of a gzip file. Its **first field** is a [`gzFile_s`] laid out
+/// exactly as the public `zlib.h` struct so the C `gzgetc` macro can read/mutate
+/// `have`/`next`/`pos` directly at offset 0; behind it sit the engine state and
+/// a scratch buffer that backs the `*const c_char` returned by [`gzerror`].
+///
+/// `#[repr(C)]` pins the field order so `x` is guaranteed at offset 0. The
+/// struct never crosses the FFI boundary by value — only as `*mut gzFile_s`
+/// ([`gzFile`]) — so the `Box<GzState>` / `Vec<u8>` tail fields are immaterial to
+/// the C ABI and raise no `improper_ctypes` concern.
 #[cfg(feature = "gz-io")]
+#[repr(C)]
 struct GzHandle {
+    /// Macro-visible `gzFile_s` prefix — MUST remain the first field (offset 0).
+    x: gzFile_s,
+    /// The engine's gzip state (owned; freed on `gzclose`).
     state: Box<GzState>,
+    /// NUL-terminated scratch backing the string returned by [`gzerror`].
     err_cache: Vec<u8>,
 }
 
-/// Borrow the [`GzHandle`] behind a `gzFile`, or `None` if the handle is null.
+#[cfg(feature = "gz-io")]
+impl GzHandle {
+    /// Reconcile bytes the C `gzgetc` macro consumed **directly** from the
+    /// exposed `gzFile_s` buffer back into the engine state, before any FFI
+    /// function operates on the stream (`x` → engine; read mode only).
+    ///
+    /// The macro `((g)->have--, (g)->pos++, *((g)->next)++)` decrements `x.have`
+    /// (and advances `x.next`/`x.pos`) for every byte it reads without calling
+    /// into the library. Since [`sync_out`](Self::sync_out) last published
+    /// `x.have == state.have`, the gap `state.have - x.have` is exactly the
+    /// number of bytes consumed by the macro; replaying that consumption
+    /// (`next += consumed; have = x.have; pos = x.pos`) leaves the engine in the
+    /// identical state it would hold had `gzread`/`gzgetc_` consumed those bytes
+    /// itself — so a subsequent refill picks up from the correct position.
+    #[inline]
+    fn sync_in(&mut self) {
+        if self.state.is_reading() {
+            let engine_have = self.state.have;
+            let macro_have = self.x.have as usize;
+            // `macro_have <= engine_have` always holds in correct usage (the
+            // macro only ever consumes from what we published); guard against a
+            // malformed prefix to keep the engine state authoritative.
+            if macro_have <= engine_have {
+                let consumed = engine_have - macro_have;
+                self.state.next += consumed;
+                self.state.have = macro_have;
+                self.state.pos = self.x.pos;
+            }
+        }
+    }
+
+    /// Publish the engine's current read buffer into the exposed `gzFile_s`
+    /// prefix so the C `gzgetc` macro can consume bytes directly (engine → `x`).
+    ///
+    /// Runs after every FFI entry point via [`GzAccess`]'s `Drop`. When reading
+    /// with buffered data, it points `x.next` at `out_buf[next]` and sets
+    /// `x.have` to the available count; otherwise it clears the prefix so the
+    /// macro falls back to the `(gzgetc)(g)` function call. `x.pos` always
+    /// tracks the engine position so `gztell`/the macro stay consistent.
+    #[inline]
+    fn sync_out(&mut self) {
+        self.x.pos = self.state.pos;
+        if self.state.is_reading() && self.state.have > 0 {
+            // Read the scalar cursors first, then borrow `out_buf` mutably for
+            // its base pointer (avoids overlapping borrows of `self.state`).
+            let have = self.state.have;
+            let next_idx = self.state.next;
+            let base = self.state.out_buf.as_mut_ptr();
+            self.x.have = have as c_uint;
+            // `next_idx <= out_buf.len()` by the engine's window invariant
+            // (`out_buf[next..next+have]` is the live span), so this is an
+            // in-bounds (or one-past) pointer that the macro reads `have` times.
+            self.x.next = base.wrapping_add(next_idx);
+        } else {
+            self.x.have = 0;
+            self.x.next = core::ptr::null_mut();
+        }
+    }
+}
+
+/// RAII access guard returned by [`gz_handle`]. On creation it has already
+/// reconciled any `gzgetc`-macro consumption into the engine
+/// ([`GzHandle::sync_in`]); on drop it republishes the engine's buffer into the
+/// macro-visible prefix ([`GzHandle::sync_out`]). It derefs to [`GzHandle`] so
+/// existing `handle.state` / `handle.err_cache` access sites are unchanged.
+#[cfg(feature = "gz-io")]
+struct GzAccess<'a> {
+    handle: &'a mut GzHandle,
+}
+
+#[cfg(feature = "gz-io")]
+impl core::ops::Deref for GzAccess<'_> {
+    type Target = GzHandle;
+    #[inline]
+    fn deref(&self) -> &GzHandle {
+        self.handle
+    }
+}
+
+#[cfg(feature = "gz-io")]
+impl core::ops::DerefMut for GzAccess<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut GzHandle {
+        self.handle
+    }
+}
+
+#[cfg(feature = "gz-io")]
+impl Drop for GzAccess<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.handle.sync_out();
+    }
+}
+
+/// Borrow the [`GzHandle`] behind a `gzFile` as a [`GzAccess`] guard, or `None`
+/// if the handle is null.
+///
+/// The returned guard reconciles any `gzgetc`-macro consumption into the engine
+/// up front ([`GzHandle::sync_in`]) and republishes the engine buffer to the
+/// macro-visible prefix when it drops ([`GzHandle::sync_out`]). It derefs to
+/// [`GzHandle`], so callers keep using `handle.state` / `handle.err_cache`.
 ///
 /// # Safety
 ///
@@ -2041,13 +2472,17 @@ struct GzHandle {
 /// [`gzdopen`] and not yet closed.
 #[cfg(feature = "gz-io")]
 #[inline]
-unsafe fn gz_handle<'a>(file: gzFile) -> Option<&'a mut GzHandle> {
+unsafe fn gz_handle<'a>(file: gzFile) -> Option<GzAccess<'a>> {
     if file.is_null() {
         None
     } else {
         // SAFETY: a non-null `gzFile` was produced as `Box::into_raw(GzHandle)`
         // by an open call; nothing else aliases it for the call's duration.
-        Some(unsafe { &mut *(file as *mut GzHandle) })
+        let handle = unsafe { &mut *(file as *mut GzHandle) };
+        // Reconcile any bytes the C `gzgetc` macro consumed directly from the
+        // exposed prefix before the engine operates on the stream.
+        handle.sync_in();
+        Some(GzAccess { handle })
     }
 }
 
@@ -2076,6 +2511,9 @@ unsafe fn gz_open_path(path: *const c_char, mode: *const c_char, large: bool) ->
     };
     match opened {
         Some(state) => Box::into_raw(Box::new(GzHandle {
+            // Fresh handle: the macro-visible prefix starts empty (no buffered
+            // data) and is populated lazily by `sync_out` after the first read.
+            x: gzFile_s::zeroed(),
             state,
             err_cache: Vec::new(),
         })) as gzFile,
@@ -2105,6 +2543,17 @@ pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> g
 #[cfg(feature = "gz-io")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzdopen(fd: c_int, mode: *const c_char) -> gzFile {
+    // C `gzdopen` rejects `fd == -1` up front and, on any failure, returns NULL
+    // WITHOUT adopting or closing the descriptor. We reject every negative `fd`
+    // because `File::from_raw_fd` carries a safety precondition that the
+    // descriptor be valid (non-negative, owned); calling it with `-1` would be
+    // undefined behavior. This check must precede `from_raw_fd` so an invalid
+    // descriptor is never wrapped, and it preserves zlib's no-adopt/no-close
+    // contract for invalid input (we never construct a `File`, so nothing is
+    // closed on drop).
+    if fd < 0 {
+        return core::ptr::null_mut();
+    }
     if mode.is_null() {
         return core::ptr::null_mut();
     }
@@ -2112,14 +2561,31 @@ pub unsafe extern "C" fn gzdopen(fd: c_int, mode: *const c_char) -> gzFile {
     let Ok(m) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
         return core::ptr::null_mut();
     };
-    // SAFETY: the caller transfers ownership of `fd` to the new stream (the C
-    // `gzdopen` contract); `File` adopts it and closes it on teardown.
+    // Validate the mode string BEFORE adopting `fd`. C `gz_open` never closes a
+    // caller-supplied descriptor on a mode-parse failure (it only `free`s the
+    // partial state), so we must not wrap `fd` in an owning `File` — whose
+    // `Drop` would close it — until the mode is known to be valid. Rejecting an
+    // invalid mode here leaves `fd` entirely untouched, preserving zlib's
+    // no-adopt/no-close failure-path contract.
+    if !geng::mode_is_valid(m) {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: `fd` was validated as non-negative above, satisfying the
+    // `from_raw_fd` precondition. The caller transfers ownership of `fd` to the
+    // new stream (the C `gzdopen` contract); `File` adopts it and closes it on
+    // teardown.
     let file = unsafe { File::from_raw_fd(fd) };
     match geng::gzdopen(file, m) {
         Some(state) => Box::into_raw(Box::new(GzHandle {
+            // Fresh handle: the macro-visible prefix starts empty (see above).
+            x: gzFile_s::zeroed(),
             state,
             err_cache: Vec::new(),
         })) as gzFile,
+        // The mode was validated above, so for an adopted descriptor `gzdopen`
+        // does not fail here; this arm is defensive. (Were it reachable, the
+        // `File` would drop and close `fd` — acceptable only because a valid
+        // mode guarantees `Some`.)
         None => core::ptr::null_mut(),
     }
 }
@@ -2129,7 +2595,7 @@ pub unsafe extern "C" fn gzdopen(fd: c_int, mode: *const c_char) -> gzFile {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzbuffer(file: gzFile, size: c_uint) -> c_int {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return -1;
     };
     geng::gzbuffer(&mut handle.state, size as u32)
@@ -2140,7 +2606,7 @@ pub unsafe extern "C" fn gzbuffer(file: gzFile, size: c_uint) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzsetparams(file: gzFile, level: c_int, strategy: c_int) -> c_int {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return Z_STREAM_ERROR;
     };
     geng::gzsetparams(&mut handle.state, level, strategy)
@@ -2151,7 +2617,7 @@ pub unsafe extern "C" fn gzsetparams(file: gzFile, level: c_int, strategy: c_int
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzrewind(file: gzFile) -> c_int {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return -1;
     };
     geng::gzrewind(&mut handle.state)
@@ -2162,7 +2628,7 @@ pub unsafe extern "C" fn gzrewind(file: gzFile) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzseek(file: gzFile, offset: z_off_t, whence: c_int) -> z_off_t {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return -1;
     };
     geng::gzseek(&mut handle.state, offset as i64, whence) as z_off_t
@@ -2173,7 +2639,7 @@ pub unsafe extern "C" fn gzseek(file: gzFile, offset: z_off_t, whence: c_int) ->
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzseek64(file: gzFile, offset: z_off64_t, whence: c_int) -> z_off64_t {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return -1;
     };
     geng::gzseek64(&mut handle.state, offset, whence) as z_off64_t
@@ -2206,7 +2672,7 @@ pub unsafe extern "C" fn gztell64(file: gzFile) -> z_off64_t {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzoffset(file: gzFile) -> z_off_t {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return -1;
     };
     geng::gzoffset(&mut handle.state) as z_off_t
@@ -2217,7 +2683,7 @@ pub unsafe extern "C" fn gzoffset(file: gzFile) -> z_off_t {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzoffset64(file: gzFile) -> z_off64_t {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return -1;
     };
     geng::gzoffset64(&mut handle.state) as z_off64_t
@@ -2239,7 +2705,7 @@ pub unsafe extern "C" fn gzeof(file: gzFile) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzdirect(file: gzFile) -> c_int {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return 0;
     };
     geng::gzdirect(&mut handle.state)
@@ -2252,7 +2718,7 @@ pub unsafe extern "C" fn gzdirect(file: gzFile) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzerror(file: gzFile, errnum: *mut c_int) -> *const c_char {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return core::ptr::null();
     };
     let (code, msg) = geng::gzerror(&handle.state);
@@ -2275,7 +2741,7 @@ pub unsafe extern "C" fn gzerror(file: gzFile, errnum: *mut c_int) -> *const c_c
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzclearerr(file: gzFile) {
     // SAFETY: `gz_handle` performs the null check.
-    if let Some(handle) = unsafe { gz_handle(file) } {
+    if let Some(mut handle) = unsafe { gz_handle(file) } {
         geng::gzclearerr(&mut handle.state);
     }
 }
@@ -2288,11 +2754,15 @@ pub unsafe extern "C" fn gzclearerr(file: gzFile) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzread(file: gzFile, buf: voidp, len: c_uint) -> c_int {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return -1;
     };
-    // SAFETY: `buf` is valid for `len` bytes per the contract.
-    let data = unsafe { mut_buf(buf as *mut Bytef, len as usize) };
+    // SAFETY: `buf` is valid for `len` bytes per the contract. A null `buf`
+    // paired with a non-zero `len` is an invalid argument; C `gzread` returns
+    // `-1` for such errors.
+    let Some(data) = (unsafe { mut_buf(buf as *mut Bytef, len as usize) }) else {
+        return -1;
+    };
     geng::gzread(&mut handle.state, data)
 }
 
@@ -2307,12 +2777,15 @@ pub unsafe extern "C" fn gzfread(
     file: gzFile,
 ) -> z_size_t {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return 0;
     };
     let total = size.saturating_mul(nitems);
-    // SAFETY: `buf` is valid for `size * nitems` bytes per the contract.
-    let data = unsafe { mut_buf(buf as *mut Bytef, total) };
+    // SAFETY: `buf` is valid for `size * nitems` bytes per the contract. A null
+    // `buf` paired with a non-zero total is rejected (C `gzfread` returns `0`).
+    let Some(data) = (unsafe { mut_buf(buf as *mut Bytef, total) }) else {
+        return 0;
+    };
     geng::gzfread(&mut handle.state, size, nitems, data)
 }
 
@@ -2321,7 +2794,7 @@ pub unsafe extern "C" fn gzfread(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzgetc(file: gzFile) -> c_int {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return -1;
     };
     geng::gzgetc(&mut handle.state)
@@ -2332,7 +2805,7 @@ pub unsafe extern "C" fn gzgetc(file: gzFile) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzgetc_(file: gzFile) -> c_int {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return -1;
     };
     geng::gzgetc_(&mut handle.state)
@@ -2343,7 +2816,7 @@ pub unsafe extern "C" fn gzgetc_(file: gzFile) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return -1;
     };
     geng::gzungetc(c, &mut handle.state)
@@ -2358,14 +2831,18 @@ pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *
         return core::ptr::null_mut();
     }
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return core::ptr::null_mut();
     };
     // Reserve one byte for the terminating NUL (the engine writes raw bytes).
     let cap = (len - 1) as usize;
     // SAFETY: `buf` is valid for `len` bytes per the contract; we expose `cap`
-    // of them to the engine and reserve the last for the NUL.
-    let data = unsafe { mut_buf(buf as *mut Bytef, cap) };
+    // of them to the engine and reserve the last for the NUL. `buf` was already
+    // null-checked above, so this is always `Some`, but we reject defensively to
+    // match the validating helper contract.
+    let Some(data) = (unsafe { mut_buf(buf as *mut Bytef, cap) }) else {
+        return core::ptr::null_mut();
+    };
     let n = geng::gzgets(&mut handle.state, data);
     if n == 0 {
         return core::ptr::null_mut();
@@ -2383,11 +2860,14 @@ pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzwrite(file: gzFile, buf: voidpc, len: c_uint) -> c_int {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return 0;
     };
-    // SAFETY: `buf` is valid for `len` bytes per the contract.
-    let data = unsafe { const_buf(buf as *const Bytef, len as usize) };
+    // SAFETY: `buf` is valid for `len` bytes per the contract. A null `buf`
+    // paired with a non-zero `len` is invalid; C `gzwrite` returns `0` on error.
+    let Some(data) = (unsafe { const_buf(buf as *const Bytef, len as usize) }) else {
+        return 0;
+    };
     geng::gzwrite(&mut handle.state, data)
 }
 
@@ -2403,12 +2883,15 @@ pub unsafe extern "C" fn gzfwrite(
     file: gzFile,
 ) -> z_size_t {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return 0;
     };
     let total = size.saturating_mul(nitems);
-    // SAFETY: `buf` is valid for `size * nitems` bytes per the contract.
-    let data = unsafe { const_buf(buf as *const Bytef, total) };
+    // SAFETY: `buf` is valid for `size * nitems` bytes per the contract. A null
+    // `buf` paired with a non-zero total is rejected (C `gzfwrite` returns `0`).
+    let Some(data) = (unsafe { const_buf(buf as *const Bytef, total) }) else {
+        return 0;
+    };
     geng::gzfwrite(&mut handle.state, size, nitems, data)
 }
 
@@ -2418,7 +2901,7 @@ pub unsafe extern "C" fn gzfwrite(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return -1;
     };
     geng::gzputc(&mut handle.state, c)
@@ -2430,7 +2913,7 @@ pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzputs(file: gzFile, s: *const c_char) -> c_int {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return -1;
     };
     if s.is_null() {
@@ -2441,42 +2924,126 @@ pub unsafe extern "C" fn gzputs(file: gzFile, s: *const c_char) -> c_int {
     geng::gzputs(&mut handle.state, bytes)
 }
 
-/// C `gzprintf` — formatted write. C's variadic `...` is not expressible as a
-/// safe stable-Rust `extern "C"` signature, so this best-effort shim writes the
-/// `format` string verbatim (no `%`-substitution); the exported symbol and the
-/// fixed `(gzFile, const char *)` prefix match zlib so the drop-in links and
-/// the common no-argument case behaves identically.
+/// Internal write callback for the C `gzprintf`/`gzvprintf` shim
+/// (`csrc/gzprintf.c`).
+///
+/// C's variadic `...` / `va_list` cannot be read from stable Rust
+/// (`c_variadic` is unstable and would break the edition-2024 stable MSRV), so
+/// a tiny self-authored C shim owns the canonical `gzprintf`/`gzvprintf`
+/// symbols: it runs `vsnprintf` into a bounded buffer and then calls this
+/// function to perform the actual gzip write through the safe `gz` engine via
+/// [`gzprintf_bytes`](crate::gz::gzprintf_bytes) — the byte-oriented core of
+/// zlib's formatted write (`gzwrite.c`), which enforces the `want`-size limit
+/// and updates the checksum/position exactly as C does.
+///
+/// `buf` points at `len` already-formatted bytes. Returns the number of
+/// uncompressed bytes written (matching zlib's `gzprintf` return), `0` when the
+/// render is empty or would not fit in the stream's buffer (`want`), or a
+/// negative `Z_*` code (e.g. `Z_STREAM_ERROR` for a null/invalid handle). The
+/// `zlibrs_` prefix keeps this internal glue out of the canonical zlib symbol
+/// namespace; it is not part of the public zlib API and is excluded from the
+/// generated C header.
 #[cfg(feature = "gz-io")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gzprintf(file: gzFile, format: *const c_char) -> c_int {
-    // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
-        return -1;
+pub unsafe extern "C" fn zlibrs_gzprintf_write(
+    file: gzFile,
+    buf: *const c_uchar,
+    len: c_int,
+) -> c_int {
+    // SAFETY: `gz_handle` performs the null/validity check on the handle.
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
+        return Z_STREAM_ERROR;
     };
-    if format.is_null() {
-        return 0;
+    if len < 0 {
+        return Z_STREAM_ERROR;
     }
-    // SAFETY: `format` is a NUL-terminated C string per the contract.
-    let s = unsafe { CStr::from_ptr(format) }.to_string_lossy();
-    geng::gzprintf(&mut handle.state, format_args!("{s}"))
+    // SAFETY: the C shim guarantees `buf` is valid for `len` bytes (it points
+    // into the shim's formatting buffer); reject an invalid (null, non-zero)
+    // pair just like the crate's other FFI buffer entry points.
+    let Some(data) = (unsafe { const_buf(buf as *const Bytef, len as usize) }) else {
+        return Z_STREAM_ERROR;
+    };
+    geng::gzprintf_bytes(&mut handle.state, data)
 }
 
-/// C `gzvprintf` — the `va_list` form of [`gzprintf`]. The same stable-Rust
-/// variadic limitation applies: the `va_list` argument (typed as an opaque
-/// pointer) is ignored and `format` is written verbatim.
+// ---------------------------------------------------------------------------
+// Variadic `gzprintf` / `gzvprintf` — exported trampolines into the C shim.
+//
+// These two canonical zlib symbols are VARIADIC (`...` / `va_list`), which
+// stable Rust cannot express (`c_variadic` is unstable). The actual variadic
+// capture + `vsnprintf` formatting therefore lives in the C shim
+// `csrc/gzprintf.c` as `zlibrs_gzprintf_impl` / `zlibrs_gzvprintf_impl`.
+//
+// A C function cannot simply be named `gzprintf` and be done with it: rustc
+// builds the `cdylib`'s linker version script from the crate's Rust
+// `#[no_mangle]` items and localizes everything else (`local: *;`), so a
+// C-defined `gzprintf` would be present in the archive yet ABSENT from the
+// shared object's dynamic symbol table — not callable by a `dlopen`/link-time
+// C consumer. To make the canonical symbol a first-class export of BOTH the
+// `cdylib` and the `staticlib`, the public `gzprintf` / `gzvprintf` are defined
+// HERE as Rust `#[no_mangle]` symbols, so rustc adds them to the export set.
+//
+// Each is a `#[unsafe(naked)]` function whose entire body is a single tail
+// `jmp` to the C implementation. A naked tail-jump emits NO prologue/epilogue
+// and touches NO registers, so every argument register (the integer registers
+// `rdi, rsi, rdx, rcx, r8, r9`, the vector registers, the variadic count in
+// `al`, and any stack arguments) is forwarded to the C implementation exactly
+// as the caller set it — i.e. the variadic arguments pass through untouched —
+// and the C implementation's `ret` returns straight to the original caller.
+// The result is a zero-overhead, ABI-exact bridge: a true variadic `gzprintf`
+// that is also an exported symbol of the drop-in library.
+//
+// MSRV NOTE: naked functions (`#[unsafe(naked)]` / `core::arch::naked_asm!`)
+// were stabilized in Rust 1.88. They are used ONLY under the optional,
+// non-default `capi` drop-in feature; the default pure-Rust library keeps the
+// crate's declared 1.85 MSRV. The `capi` feature therefore requires Rust
+// >= 1.88 (and a C compiler for the shim) — see `Cargo.toml`.
+// ---------------------------------------------------------------------------
+
+// The C-shim implementations. Only their *addresses* are needed (taken via the
+// `sym` operand below), so they are declared as bare externs; the real C
+// signatures are variadic and live in `csrc/gzprintf.c`.
 #[cfg(feature = "gz-io")]
+unsafe extern "C" {
+    fn zlibrs_gzprintf_impl();
+    fn zlibrs_gzvprintf_impl();
+}
+
+/// C `gzprintf` — convert, format, compress, and write the variadic arguments
+/// under control of `format`, as in `fprintf` (zlib `gzprintf`). Returns the
+/// number of uncompressed bytes written, `0` if nothing fit in the stream
+/// buffer, or a negative `Z_*` code on error.
+///
+/// This is a naked tail-call trampoline into the C shim
+/// (`zlibrs_gzprintf_impl`) that performs the variadic formatting; see the
+/// module-level note above for why the canonical symbol is defined in Rust.
+#[cfg(feature = "gz-io")]
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gzvprintf(file: gzFile, format: *const c_char, _va: *mut c_void) -> c_int {
-    // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
-        return -1;
-    };
-    if format.is_null() {
-        return 0;
-    }
-    // SAFETY: `format` is a NUL-terminated C string per the contract.
-    let s = unsafe { CStr::from_ptr(format) }.to_string_lossy();
-    geng::gzprintf(&mut handle.state, format_args!("{s}"))
+pub unsafe extern "C" fn gzprintf(_file: gzFile, _format: *const c_char) -> c_int {
+    // SAFETY: a bare tail `jmp` to the C implementation. No registers are
+    // touched, so all (including variadic) arguments are forwarded verbatim and
+    // the callee's `ret` returns to our caller.
+    core::arch::naked_asm!("jmp {tgt}", tgt = sym zlibrs_gzprintf_impl)
+}
+
+/// C `gzvprintf` — the `va_list` form of [`gzprintf`] (zlib `gzvprintf`). Same
+/// return contract as `gzprintf`.
+///
+/// Naked tail-call trampoline into the C shim (`zlibrs_gzvprintf_impl`); the
+/// `va_list` and all other arguments are forwarded verbatim.
+#[cfg(feature = "gz-io")]
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gzvprintf(
+    _file: gzFile,
+    _format: *const c_char,
+    _va: *mut c_void,
+) -> c_int {
+    // SAFETY: a bare tail `jmp` to the C implementation; arguments (including
+    // the `va_list`) are forwarded verbatim and the callee's `ret` returns to
+    // our caller.
+    core::arch::naked_asm!("jmp {tgt}", tgt = sym zlibrs_gzvprintf_impl)
 }
 
 /// C `gzflush` — flush pending output with the given `flush` mode.
@@ -2484,7 +3051,7 @@ pub unsafe extern "C" fn gzvprintf(file: gzFile, format: *const c_char, _va: *mu
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzflush(file: gzFile, flush: c_int) -> c_int {
     // SAFETY: `gz_handle` performs the null check.
-    let Some(handle) = (unsafe { gz_handle(file) }) else {
+    let Some(mut handle) = (unsafe { gz_handle(file) }) else {
         return Z_STREAM_ERROR;
     };
     geng::gzflush(&mut handle.state, flush)

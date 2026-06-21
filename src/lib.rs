@@ -68,10 +68,23 @@
 //! assert_eq!(crc32(0, b"123456789"), 0xcbf4_3926);
 //! ```
 
-// Under every build except the default `std` build the crate is `#![no_std]`.
-// The `no-std` feature (the `Z_SOLO` analogue) and a bare `--no-default-features`
-// build both omit `std`, so the attribute keys off the *absence* of `std`.
-#![cfg_attr(not(feature = "std"), no_std)]
+// The crate drops `std` only for the explicit, self-consistent `no-std`
+// (Z_SOLO) build — i.e. when `no-std` is requested AND `std` is not. Keying
+// `#![no_std]` off the *presence* of `no-std` (rather than the *absence* of
+// `std`) means a bare `--no-default-features` build (which omits `std` but does
+// not request `no-std`) still links `std`, so it supplies the global allocator,
+// panic handler, and unwinding support that the `cdylib` / `staticlib`
+// crate-types require. Without this, `cargo build --no-default-features` failed
+// to produce the C-linkable artifacts ("no global memory allocator",
+// "#[panic_handler] required", "unwinding panics are not supported without
+// std"). The dedicated `no-std` rlib build (`--no-default-features --features
+// no-std`) is unaffected: it requests `no-std` without `std`, so `#![no_std]`
+// still applies there. The `not(feature = "std")` conjunct also keeps the
+// mutually-exclusive `std` + `no-std` misconfiguration failing cleanly with the
+// `compile_error!` below (rather than additionally tripping "cannot find crate
+// std" errors): in that contradictory case `std` stays linked and the guard is
+// the single, authoritative diagnostic.
+#![cfg_attr(all(feature = "no-std", not(feature = "std")), no_std)]
 // Deny a few correctness-critical lints crate-wide. Byte-identical output is the
 // project's central contract, so accidental truncation/wrap lints are surfaced.
 #![forbid(unsafe_op_in_unsafe_fn)]

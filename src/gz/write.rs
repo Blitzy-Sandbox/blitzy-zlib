@@ -52,27 +52,14 @@ use crate::constants::{
 use crate::deflate::state::DeflateStream;
 use crate::deflate::{deflate, deflate_end, deflate_init2, deflate_params, deflate_reset};
 use crate::error::ZlibError;
-use crate::gz::state::{GzState, Mode};
+// The fallible zero-filled allocation helper (the C `malloc` + NULL-check
+// analogue) is shared with the read path; it lives in `gz::state` so both
+// buffer-setup paths have identical out-of-memory behaviour.
+use crate::gz::state::{GzState, Mode, alloc_zeroed};
 
 // ===========================================================================
 // Private helpers
 // ===========================================================================
-
-/// Allocate a zero-filled `Vec<u8>` of `len` bytes, returning `None` on an
-/// allocation failure instead of aborting.
-///
-/// This is the safe-Rust analogue of C `malloc` + `NULL` check (`gz_init`):
-/// `Vec`'s infallible `vec![0; len]` would abort the process on OOM, so
-/// [`Vec::try_reserve_exact`] is used to surface the failure as a recoverable
-/// `Z_MEM_ERROR` exactly as the C port does.
-fn alloc_zeroed(len: usize) -> Option<Vec<u8>> {
-    let mut v: Vec<u8> = Vec::new();
-    if v.try_reserve_exact(len).is_err() {
-        return None;
-    }
-    v.resize(len, 0);
-    Some(v)
-}
 
 /// Write `out_buf[..len]` to the output file, mapping an I/O error to
 /// `gz_error(Z_ERRNO, …)`. Returns `0` on success, `-1` on error.
@@ -617,6 +604,36 @@ pub fn gzputs(state: &mut GzState, s: &[u8]) -> i32 {
 /// not fit in `want` bytes (`len == 0 || len >= want`) yields `0`; any
 /// `gz_write` error also surfaces as the recorded `state.err`.
 pub fn gzprintf(state: &mut GzState, args: core::fmt::Arguments<'_>) -> i32 {
+    // Render the typed arguments into a temporary buffer (the safe analogue of
+    // C formatting into the doubled input buffer's second half), then hand the
+    // finished bytes to the shared byte-oriented core. Rendering is a pure
+    // operation with no effect on `state`, so doing it before the write-mode
+    // check (which lives in `gzprintf_bytes`) does not change observable
+    // behaviour: a formatting failure (no C analogue) routes to the empty-input
+    // path, which returns `0` while writing and `Z_STREAM_ERROR` otherwise —
+    // exactly the codes C would yield.
+    let mut rendered = String::new();
+    if core::fmt::write(&mut rendered, args).is_err() {
+        return gzprintf_bytes(state, &[]);
+    }
+    gzprintf_bytes(state, rendered.as_bytes())
+}
+
+/// Byte-oriented core of C `gzvprintf`/`gzprintf` (`gzwrite.c` L403-495): write
+/// the already-formatted `bytes` to the gzip file, applying zlib's
+/// formatted-write semantics.
+///
+/// The variadic / `va_list` formatting that *produces* `bytes` is performed by
+/// the C shim at the FFI boundary (`csrc/gzprintf.c`) because stable Rust cannot
+/// read a C `va_list`; this safe core takes the finished bytes and is therefore
+/// byte-exact for any formatted output (including non-UTF-8 bytes that the
+/// [`fmt::Arguments`] entry point cannot represent). It is also the shared
+/// implementation that [`gzprintf`] delegates to after rendering.
+///
+/// Returns the number of bytes written. Per C, input that is empty or would not
+/// fit in `want` bytes (`len == 0 || len >= want`) yields `0`; any `gz_write`
+/// error surfaces as the recorded `state.err`.
+pub fn gzprintf_bytes(state: &mut GzState, bytes: &[u8]) -> i32 {
     // check that we're writing and that there's no (serious) error
     if state.mode != Mode::Write || (state.err != Z_OK && !state.again) {
         return Z_STREAM_ERROR;
@@ -637,13 +654,6 @@ pub fn gzprintf(state: &mut GzState, args: core::fmt::Arguments<'_>) -> i32 {
         }
     }
 
-    // render the arguments into a temporary buffer (the safe analogue of C
-    // formatting into the doubled input buffer's second half)
-    let mut rendered = String::new();
-    if core::fmt::write(&mut rendered, args).is_err() {
-        return 0;
-    }
-    let bytes = rendered.as_bytes();
     let len = bytes.len();
 
     // check that the formatted result fits (C: len == 0 || len >= size)

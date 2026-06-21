@@ -375,6 +375,72 @@ fn generate_c_header(manifest_dir: &Path, out_dir: &Path) {
 }
 
 // ===========================================================================
+// Phase D — variadic `gzprintf`/`gzvprintf` C shim (opt-in, capi + gz-io only)
+// ===========================================================================
+
+/// Decide whether the variadic `gzprintf`/`gzvprintf` C shim should be compiled
+/// and linked on this build.
+///
+/// The shim (`csrc/gzprintf.c`) supplies the two canonical *variadic* zlib
+/// symbols that stable Rust cannot express (`c_variadic` is unstable). It is
+/// only meaningful when BOTH:
+///
+/// * the `capi` feature is on — the `#[no_mangle] extern "C"` drop-in surface
+///   in `src/ffi.rs` (including the `zlibrs_gzprintf_write` callback the shim
+///   calls back into) is compiled and exported; and
+/// * the `gz-io` feature is on — the gzip FILE-I/O engine the callback drives
+///   (and hence the `zlibrs_gzprintf_write` symbol itself, which is
+///   `#[cfg(feature = "gz-io")]`) actually exists.
+///
+/// Cargo surfaces enabled features to the build script as `CARGO_FEATURE_<NAME>`
+/// environment variables (with `-` mapped to `_`). When either feature is
+/// absent the shim is skipped entirely, so the default pure-Rust build compiles
+/// and links NO C and the shipped crate keeps its zero-C-dependency guarantee
+/// (AAP §0.7.2).
+fn gzprintf_shim_requested() -> bool {
+    env::var_os("CARGO_FEATURE_CAPI").is_some() && env::var_os("CARGO_FEATURE_GZ_IO").is_some()
+}
+
+/// Compile `csrc/gzprintf.c` into a small static archive and link it into the
+/// crate.
+///
+/// The shim performs C variadic formatting (`vsnprintf` into a bounded buffer)
+/// under the internal symbols `zlibrs_gzprintf_impl` / `zlibrs_gzvprintf_impl`,
+/// and then calls the safe-Rust `zlibrs_gzprintf_write` callback exported by
+/// `src/ffi.rs` to perform the actual compressed write. The *public* `gzprintf`
+/// / `gzvprintf` symbols are the `#[unsafe(naked)]` Rust trampolines in
+/// `src/ffi.rs` that tail-`jmp` to these C implementations. `cc` drives the
+/// system C compiler (gcc/clang); it is a build-time tool only and is never
+/// linked into the library — only the resulting object code is.
+///
+/// A plain `cargo:rustc-link-lib=static=…` (emitted by `cc::Build::compile`) is
+/// sufficient: the Rust naked trampolines reference the C implementations via
+/// the assembler `sym` operand, so the linker pulls the shim object in to
+/// resolve those references, and `--gc-sections` keeps the implementations
+/// because they are reachable from the exported `gzprintf`/`gzvprintf` symbols.
+/// No `+whole-archive` or `--undefined` coaxing is required.
+fn compile_gzprintf_shim(manifest_dir: &Path) {
+    let shim = manifest_dir.join("csrc").join("gzprintf.c");
+    if !shim.exists() {
+        // Should never happen in a well-formed tree, but degrade loudly rather
+        // than emit a confusing linker error if the source is missing.
+        println!(
+            "cargo:warning=zlib-rs: gzprintf C shim requested but {} is absent; \
+             the variadic gzprintf/gzvprintf symbols will be unavailable.",
+            shim.display()
+        );
+        return;
+    }
+
+    cc::Build::new()
+        .file(&shim)
+        // Surface compiler diagnostics but do not fail the build on benign
+        // platform warnings; the shim itself is warning-clean under -Wall.
+        .warnings(true)
+        .compile("zlibrs_gzprintf_shim");
+}
+
+// ===========================================================================
 // Entry point
 // ===========================================================================
 
@@ -385,6 +451,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/ffi.rs");
     println!("cargo:rerun-if-changed=cbindgen.toml");
+    println!("cargo:rerun-if-changed=csrc/gzprintf.c");
     println!("cargo:rerun-if-env-changed=ZLIB_RS_GENERATE_HEADER");
 
     // Phase A is mandatory: the crate cannot compute correct checksums without
@@ -394,12 +461,23 @@ fn main() {
     );
     write_crc_tables(&out_dir);
 
+    // `CARGO_MANIFEST_DIR` is the crate root; both the (opt-in) header emission
+    // and the (opt-in) C-shim compilation are anchored to it.
+    let manifest_dir = PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR is always set by cargo for build scripts"),
+    );
+
     // Phase B/C is best-effort and opt-in.
     if header_generation_requested() {
-        let manifest_dir = PathBuf::from(
-            env::var_os("CARGO_MANIFEST_DIR")
-                .expect("CARGO_MANIFEST_DIR is always set by cargo for build scripts"),
-        );
         generate_c_header(&manifest_dir, &out_dir);
+    }
+
+    // Phase D is opt-in: only when the C-ABI drop-in (`capi`) AND the gzip
+    // FILE-I/O engine (`gz-io`) are both enabled does the variadic
+    // gzprintf/gzvprintf shim have both a reason to exist and a callback symbol
+    // to link against. The default pure-Rust build skips it entirely.
+    if gzprintf_shim_requested() {
+        compile_gzprintf_shim(&manifest_dir);
     }
 }

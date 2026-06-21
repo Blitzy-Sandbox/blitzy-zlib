@@ -34,8 +34,12 @@ description = "A safe-Rust rewrite of the zlib general-purpose lossless data-com
 homepage = "https://zlib.net/"
 repository = "https://github.com/Blitzy-Sandbox/blitzy-zlib"
 # SPDX identifier for the zlib/libpng license carried verbatim in `LICENSE`.
+# The zlib license is a standard SPDX expression, so the single `license` field
+# is sufficient and authoritative; `license-file` is intentionally omitted to
+# avoid Cargo's "only one of `license` or `license-file` is necessary" warning
+# (which otherwise prints on every cargo invocation). The verbatim `LICENSE`
+# file is still shipped in the package and remains the canonical license text.
 license = "Zlib"
-license-file = "LICENSE"
 readme = "README.md"
 keywords = ["compression", "zlib", "deflate", "gzip", "crc32"]
 categories = ["compression", "no-std", "api-bindings"]
@@ -99,10 +103,18 @@ simd = ["dep:crc32fast"]
 # (it checks `CARGO_FEATURE_CAPI`). It is left OFF by default — and in
 # particular for `cargo test` — because those canonical symbol names would
 # otherwise collide at link time with the bundled C zlib pulled in by the
-# `flate2` dev-dependency's `zlib` backend. The FFI shim that consumes this
-# feature lands with the compression engine in the next checkpoint; declaring
-# the feature now fixes the gate so CI, cbindgen, and the future `src/ffi.rs`
-# can reference it consistently.
+# `flate2` dev-dependency's `zlib` backend.
+#
+# MSRV / toolchain note: this OPTIONAL feature raises the build requirements
+# above the crate's default-feature MSRV (Rust 1.85). The variadic `gzprintf` /
+# `gzvprintf` drop-in symbols are exported as `#[unsafe(naked)]` trampolines
+# (stabilized in Rust 1.88) that tail-call a tiny C shim (`csrc/gzprintf.c`,
+# compiled by the `cc` build-dependency), because stable Rust cannot express C
+# variadics. Building with `--features capi` therefore requires Rust >= 1.88
+# and a C compiler. The default, pure-Rust library is unaffected and still
+# builds on Rust 1.85. (AAP §0.3.1 elevates the C-ABI drop-in to a prompt-
+# mandated, additive deliverable; AAP §0.7.2's "zero C dependency" applies to
+# the shipped pure-Rust artifact, not this opt-in C-ABI bridge.)
 capi = []
 
 # ----------------------------------------------------------------------------
@@ -124,6 +136,14 @@ cfg-if = "1.0.0"
 # Invoked by `build.rs` to generate the C header (zlib.h-equivalent) from the
 # `#[no_mangle] extern "C"` signatures and `#[repr(C)]` types in `src/ffi.rs`.
 cbindgen = "0.28.0"
+# Compiles the variadic `gzprintf`/`gzvprintf` C shim (`csrc/gzprintf.c`) into
+# the `cdylib`/`staticlib` drop-in. `build.rs` only invokes it when BOTH the
+# `capi` and `gz-io` features are active (checked at runtime via the
+# `CARGO_FEATURE_*` env vars), so the default pure-Rust build compiles and
+# links NO C — the shipped Rust crate stays free of any C dependency (AAP
+# §0.7.2). `cc` itself is a build-time tool (it merely drives the system
+# C compiler); it is never linked into the library artifact.
+cc = "1.2"
 
 # ----------------------------------------------------------------------------
 # [dev-dependencies] — test/bench only; never linked into the shipped artifact.

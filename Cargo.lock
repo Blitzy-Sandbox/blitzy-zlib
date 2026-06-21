@@ -1054,6 +1054,7 @@ name = "zlib-rs"
 version = "1.3.2"
 dependencies = [
  "cbindgen",
+ "cc",
  "cfg-if",
  "crc32fast",
  "criterion",

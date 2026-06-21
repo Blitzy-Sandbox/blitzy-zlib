@@ -55,7 +55,7 @@ use crate::constants::{
     MAX_WBITS, Z_BUF_ERROR, Z_DATA_ERROR, Z_ERRNO, Z_MEM_ERROR, Z_NEED_DICT, Z_NO_FLUSH, Z_OK,
     Z_STREAM_END, Z_STREAM_ERROR,
 };
-use crate::gz::state::{GzState, How};
+use crate::gz::state::{GzState, How, alloc_zeroed};
 use crate::inflate::{InflateState, inflate, inflate_init2, inflate_reset};
 use crate::stream::ZStream;
 
@@ -274,9 +274,32 @@ fn gz_avail(state: &mut GzState) -> i32 {
 fn gz_look(state: &mut GzState) -> i32 {
     // --- first-time allocation of buffers and the inflate engine ----------
     if state.size == 0 {
-        // C: `state->in = malloc(want); state->out = malloc(want << 1);`
-        state.in_buf = vec![0u8; state.want];
-        state.out_buf = vec![0u8; state.want << 1];
+        // C: `state->in = malloc(want); state->out = malloc(want << 1);
+        //     if (state->in == NULL || state->out == NULL) { free(state->out);
+        //     free(state->in); gz_error(state, Z_MEM_ERROR, "out of memory");
+        //     return -1; }`
+        //
+        // Use the fallible `alloc_zeroed` (try_reserve_exact) rather than the
+        // infallible `vec![0u8; ...]`, which would abort the whole process on
+        // OOM. On failure either allocation rolls both buffers back to empty,
+        // resets `size = 0`, records `Z_MEM_ERROR`, and returns `-1` — exactly
+        // the C checked-`malloc` contract (matching the write path's
+        // `gz_init`). Both buffers are allocated up front and only committed to
+        // `state` once both have succeeded, so a partial allocation never
+        // leaves the handle in a half-initialised state.
+        let (Some(in_buf), Some(out_buf)) =
+            (alloc_zeroed(state.want), alloc_zeroed(state.want << 1))
+        else {
+            // Roll back any buffer that did allocate (C frees both), keep
+            // `size == 0` so a later call retries, and surface out of memory.
+            state.in_buf = Vec::new();
+            state.out_buf = Vec::new();
+            state.size = 0;
+            state.gz_error(Z_MEM_ERROR, Some("out of memory"));
+            return -1;
+        };
+        state.in_buf = in_buf;
+        state.out_buf = out_buf;
         state.size = state.want;
 
         // C: `inflateInit2(&strm, 15 + 16)` -> gunzip (windowBits = 31).
