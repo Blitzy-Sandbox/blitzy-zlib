@@ -44,7 +44,13 @@
 //! The line citations in the implementation refer to the C `inflate.c` in the
 //! repository root that this module reproduces.
 
-use alloc::{boxed::Box, vec, vec::Vec};
+use alloc::{boxed::Box, vec};
+// `Vec` (the type) is now named only on gzip-gated header paths (`head.extra` /
+// `head.name` / `head.comment`); the core window path uses `Box`/`vec!` only.
+// Under `std` the prelude supplies `Vec`, so the explicit `alloc` import is
+// needed solely for a `no_std` + `gzip` build.
+#[cfg(all(not(feature = "std"), feature = "gzip"))]
+use alloc::vec::Vec;
 
 use crate::checksum::adler32;
 // `crc32` is only used along gzip-gated paths (the gzip header CRC, the gzip
@@ -301,7 +307,9 @@ pub(crate) fn inflate_reset2(
     // Free the window if a different size was previously configured (an empty
     // `Vec` is the "not yet allocated" sentinel, analogous to C `Z_NULL`).
     if !state.window.is_empty() && state.wbits != window_bits as u32 {
-        state.window = Vec::new();
+        // `Box<[u8]>` "not yet allocated" sentinel: an empty boxed slice owns no
+        // heap allocation (matching the freed-window state).
+        state.window = Box::default();
     }
 
     state.wrap = wrap;
@@ -377,7 +385,10 @@ pub(crate) fn inflate_prime(state: &mut InflateState, bits: i32, value: i32) -> 
 fn update_window(state: &mut InflateState, output: &[u8], end: usize, mut copy: usize) -> i32 {
     // Allocate the window on first use (C: `ZALLOC(1U << wbits)`).
     if state.window.is_empty() {
-        state.window = vec![0u8; 1usize << state.wbits];
+        // Size the window exactly once and store it as an owned boxed slice; the
+        // window never grows after this point, so a `Vec`'s extra capacity word
+        // is pure overhead against the AAP "memory footprint <= C zlib" gate.
+        state.window = vec![0u8; 1usize << state.wbits].into_boxed_slice();
     }
 
     // Initialise the window bookkeeping if not yet in use.
@@ -1589,7 +1600,9 @@ pub(crate) fn inflate_get_header(state: &mut InflateState) -> i32 {
         return Z_STREAM_ERROR;
     }
     // `GzHeader::default()` has `done == false` (matching C `head->done = 0`).
-    state.head = Some(GzHeader::default());
+    // Boxed so `InflateState` stores an 8-byte pointer rather than the full
+    // header inline (AAP "memory footprint <= C zlib").
+    state.head = Some(Box::new(GzHeader::default()));
     Z_OK
 }
 
@@ -1905,7 +1918,9 @@ impl Inflate {
     /// [`Inflate::get_header`] and has begun/finished parsing.
     #[cfg(feature = "gzip")]
     pub fn header(&self) -> Option<&GzHeader> {
-        self.state.head.as_ref()
+        // `head` is `Option<Box<GzHeader>>`; `as_deref` yields `Option<&GzHeader>`
+        // so the public signature is unchanged by the boxing optimization.
+        self.state.head.as_deref()
     }
 
     /// Scans `input` for the next flush marker to recover from corrupt data,

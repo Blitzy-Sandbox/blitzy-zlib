@@ -46,7 +46,7 @@
 // under `no-std` we pull them from `alloc`. Only `core::` and `alloc::` are
 // ever used in this module — never `std::`.
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, vec, vec::Vec};
+use alloc::{boxed::Box, vec};
 
 use crate::checksum::{adler32, crc32};
 use crate::constants::Z_UNKNOWN;
@@ -222,12 +222,17 @@ pub(crate) struct DeflateState {
 
     // -- Pending output buffer -------------------------------------------
     /// Output still pending (owned). Size is `lit_bufsize * LIT_BUFS`.
-    pub(crate) pending_buf: Vec<u8>,
+    ///
+    /// Stored as a `Box<[u8]>` (16-byte fat pointer) rather than a `Vec<u8>`:
+    /// it is sized once at construction and never grown, so a `Vec`'s extra
+    /// capacity word would be redundant overhead against the AAP §0.7.3
+    /// memory-footprint gate.
+    pub(crate) pending_buf: Box<[u8]>,
     /// Size of `pending_buf` in bytes (`lit_bufsize * LIT_BUFS`).
-    pub(crate) pending_buf_size: usize,
+    pub(crate) pending_buf_size: u32,
     /// Index into `pending_buf` of the next pending output byte (replaces the
     /// C `pending_out` pointer).
-    pub(crate) pending_out: usize,
+    pub(crate) pending_out: u32,
     /// Number of bytes in `pending_buf` not yet flushed to the output.
     pub(crate) pending: usize,
 
@@ -236,11 +241,15 @@ pub(crate) struct DeflateState {
     /// `deflate()` once the trailer has been written).
     pub(crate) wrap: i32,
     /// Optional gzip header supplied by the caller (gzip builds only).
+    ///
+    /// Boxed so `DeflateState` stores an 8-byte pointer rather than the whole
+    /// header inline; this mirrors C's `gz_headerp` (a pointer) and keeps the
+    /// engine footprint at or below C zlib (AAP §0.7.3 memory-footprint gate).
     #[cfg(feature = "gzip")]
-    pub(crate) gzhead: Option<crate::gz_header::GzHeader>,
+    pub(crate) gzhead: Option<Box<crate::gz_header::GzHeader>>,
     /// Cursor into the gzip header's extra/name/comment field during emission.
     #[cfg(feature = "gzip")]
-    pub(crate) gzindex: usize,
+    pub(crate) gzindex: u32,
     /// Compression method; always `Z_DEFLATED` (8).
     pub(crate) method: u8,
     /// `flush` argument value of the previous `deflate()` call (init `-2`).
@@ -255,7 +264,12 @@ pub(crate) struct DeflateState {
     pub(crate) w_mask: usize,
     /// Sliding window, `2 * w_size` bytes (owned). The first half holds the
     /// already-output data used as the dictionary; matches are sought here.
-    pub(crate) window: Vec<u8>,
+    ///
+    /// Stored as a `Box<[u8]>` (16-byte fat pointer) rather than a `Vec<u8>`:
+    /// the window is allocated once at `2 * w_size` and never grown, so a
+    /// `Vec`'s capacity word would be redundant overhead against the AAP
+    /// §0.7.3 memory-footprint gate.
+    pub(crate) window: Box<[u8]>,
     /// Actual usable window size; set to `2 * w_size` by [`DeflateState::lm_init`].
     pub(crate) window_size: usize,
     /// Hash-chain links, `w_size` entries (owned). `prev[i & w_mask]` is the
@@ -266,12 +280,18 @@ pub(crate) struct DeflateState {
     pub(crate) head: Box<[Pos]>,
     /// Current hash value of the string being inserted.
     pub(crate) ins_h: usize,
-    /// Number of hash-head slots (`1 << hash_bits`).
-    pub(crate) hash_size: usize,
+    /// Number of hash-head slots (`1 << hash_bits`). Stored as `u32` to match
+    /// C's `uInt hash_size` and trim the engine footprint (AAP §0.7.3); the
+    /// hash table's length is carried by `head` itself, so this field is a
+    /// mirror of the C struct and is not read on the hot path.
+    pub(crate) hash_size: u32,
     /// `log2(hash_size)`.
     pub(crate) hash_bits: u32,
-    /// `hash_size - 1` (mask for hash values).
-    pub(crate) hash_mask: usize,
+    /// `hash_size - 1` (mask for hash values). Stored as `u32` to match C's
+    /// `uInt hash_mask` and trim the engine footprint (AAP §0.7.3). Masking a
+    /// hash value with it always yields a value `< hash_size` (`<= 15` bits),
+    /// so widening to `usize` at the single use site is byte-identical.
+    pub(crate) hash_mask: u32,
     /// Number of bits by which `ins_h` must be shifted at each input step so
     /// that, after `MIN_MATCH` steps, the oldest byte no longer influences the
     /// hash: `(hash_bits + MIN_MATCH - 1) / MIN_MATCH`.
@@ -308,7 +328,7 @@ pub(crate) struct DeflateState {
     pub(crate) prev_length: usize,
     /// To speed up deflation, hash chains are never searched beyond this many
     /// links. A higher limit improves compression at the cost of speed.
-    pub(crate) max_chain_length: usize,
+    pub(crate) max_chain_length: u32,
     /// Attempt to find a better match only when the current match is strictly
     /// shorter than this. Also used (under the `max_insert_length` alias in C)
     /// as the upper bound for inserting new strings into the hash table.
@@ -316,16 +336,16 @@ pub(crate) struct DeflateState {
     /// NOTE: C defines `#define max_insert_length max_lazy_match`
     /// (`deflate.h` L186) — there is deliberately **no** separate
     /// `max_insert_length` field; this one serves both roles.
-    pub(crate) max_lazy_match: usize,
+    pub(crate) max_lazy_match: u32,
     /// Compression level (0..=9).
     pub(crate) level: i32,
     /// Favor / force the Huffman coding strategy
     /// (`Z_DEFAULT_STRATEGY`/`FILTERED`/`HUFFMAN_ONLY`/`RLE`/`FIXED`).
     pub(crate) strategy: i32,
     /// Use a faster search when the previous match is at least this long.
-    pub(crate) good_match: usize,
+    pub(crate) good_match: u32,
     /// Stop searching when the current match is at least this long.
-    pub(crate) nice_match: usize,
+    pub(crate) nice_match: u32,
 
     // -- Huffman trees ----------------------------------------------------
     /// Literal and length tree.
@@ -340,9 +360,9 @@ pub(crate) struct DeflateState {
     /// `heap[2*n]` and `heap[2*n+1]`; `heap[0]` is unused.
     pub(crate) heap: [i32; 2 * L_CODES + 1],
     /// Number of elements currently in the heap.
-    pub(crate) heap_len: usize,
+    pub(crate) heap_len: u32,
     /// Element of largest frequency (top of the heap).
-    pub(crate) heap_max: usize,
+    pub(crate) heap_max: u32,
     /// Depth of each subtree, used to break ties between subtrees of equal
     /// frequency so that the shallower tree is preferred.
     pub(crate) depth: [u8; 2 * L_CODES + 1],
@@ -362,13 +382,13 @@ pub(crate) struct DeflateState {
     // `sym_write_raw` / `sym_read` helpers address that region directly.
     /// `1 << (memLevel + 6)`: governs the symbol-buffer capacity and the size
     /// of `pending_buf`.
-    pub(crate) lit_bufsize: usize,
+    pub(crate) lit_bufsize: u32,
     /// Byte offset of the next free symbol slot within the symbol region
     /// (advances by 3 per symbol).
-    pub(crate) sym_next: usize,
+    pub(crate) sym_next: u32,
     /// `(lit_bufsize - 1) * 3`: when `sym_next == sym_end`, the current block
     /// must be flushed.
-    pub(crate) sym_end: usize,
+    pub(crate) sym_end: u32,
 
     // -- Bit-length accounting + bit accumulator -------------------------
     /// Bit length of the current block with the optimal Huffman trees.
@@ -377,7 +397,7 @@ pub(crate) struct DeflateState {
     pub(crate) static_len: usize,
     /// Number of string matches in the current block. (Also reused by
     /// `deflate_stored` to track pending hash-slides.)
-    pub(crate) matches: usize,
+    pub(crate) matches: u32,
     /// Bytes at the end of the window left to be inserted into the hash table.
     pub(crate) insert: usize,
     /// Output bit accumulator (C `ush`).
@@ -434,7 +454,7 @@ impl DeflateState {
     /// `h = ((h << hash_shift) ^ c) & hash_mask`.
     #[inline]
     pub(crate) fn update_hash(&self, h: usize, c: u8) -> usize {
-        ((h << self.hash_shift) ^ (c as usize)) & self.hash_mask
+        ((h << self.hash_shift) ^ (c as usize)) & self.hash_mask as usize
     }
 
     /// Insert the string at window position `str` into the hash table and
@@ -484,7 +504,8 @@ impl DeflateState {
     /// This is the low-level byte accessor only; the frequency accounting
     /// (`_tr_tally` and friends) lives in trees.rs.
     pub(crate) fn sym_write_raw(&mut self, dist: u16, lc: u8) {
-        let base = self.lit_bufsize + self.sym_next;
+        // `lit_bufsize` / `sym_next` are `u32`; widen for the byte index.
+        let base = (self.lit_bufsize + self.sym_next) as usize;
         self.pending_buf[base] = (dist & 0xff) as u8;
         self.pending_buf[base + 1] = (dist >> 8) as u8;
         self.pending_buf[base + 2] = lc;
@@ -495,7 +516,7 @@ impl DeflateState {
     /// region, returning `(distance, literal_or_length)`. Inverse of
     /// [`DeflateState::sym_write_raw`].
     pub(crate) fn sym_read(&self, sx: usize) -> (u16, u8) {
-        let base = self.lit_bufsize + sx;
+        let base = self.lit_bufsize as usize + sx;
         let d = (self.pending_buf[base] as u16) | ((self.pending_buf[base + 1] as u16) << 8);
         let lc = self.pending_buf[base + 2];
         (d, lc)
@@ -522,10 +543,10 @@ impl DeflateState {
 
         // Set the default configuration parameters for the current level.
         let cfg = crate::deflate::strategy::CONFIG_TABLE[self.level as usize];
-        self.max_lazy_match = cfg.max_lazy as usize;
-        self.good_match = cfg.good_length as usize;
-        self.nice_match = cfg.nice_length as usize;
-        self.max_chain_length = cfg.max_chain as usize;
+        self.max_lazy_match = cfg.max_lazy as u32;
+        self.good_match = cfg.good_length as u32;
+        self.nice_match = cfg.nice_length as u32;
+        self.max_chain_length = cfg.max_chain as u32;
 
         self.strstart = 0;
         self.block_start = 0;
@@ -587,8 +608,8 @@ impl DeflateState {
             msg: None,
 
             // Pending output buffer.
-            pending_buf: vec![0u8; pending_buf_size],
-            pending_buf_size,
+            pending_buf: vec![0u8; pending_buf_size].into_boxed_slice(),
+            pending_buf_size: pending_buf_size as u32,
             pending_out: 0,
             pending: 0,
 
@@ -605,16 +626,16 @@ impl DeflateState {
             w_size,
             w_bits,
             w_mask,
-            window: vec![0u8; 2 * w_size],
+            window: vec![0u8; 2 * w_size].into_boxed_slice(),
             window_size: 0,
             // Element type `Pos` (= u16) is inferred from the `prev`/`head`
             // field types; no cast needed.
             prev: vec![0; w_size].into_boxed_slice(),
             head: vec![0; hash_size].into_boxed_slice(),
             ins_h: 0,
-            hash_size,
+            hash_size: hash_size as u32,
             hash_bits,
-            hash_mask,
+            hash_mask: hash_mask as u32,
             hash_shift,
 
             // LZ77 match state (configured by `lm_init` during reset).
@@ -647,9 +668,9 @@ impl DeflateState {
             bl_desc_max_code: 0,
 
             // Symbol buffer (overlaid in pending_buf).
-            lit_bufsize,
+            lit_bufsize: lit_bufsize as u32,
             sym_next: 0,
-            sym_end,
+            sym_end: sym_end as u32,
 
             // Bit-length accounting + bit accumulator.
             opt_len: 0,
@@ -811,12 +832,12 @@ impl<'a> DeflateStream<'a> {
             return;
         }
 
-        let po = self.state.pending_out;
+        let po = self.state.pending_out as usize;
         let on = self.out_next;
         self.output[on..on + len].copy_from_slice(&self.state.pending_buf[po..po + len]);
 
         self.out_next += len;
-        self.state.pending_out += len;
+        self.state.pending_out += len as u32;
         self.state.total_out += len as u64;
         self.state.pending -= len;
         if self.state.pending == 0 {
@@ -957,7 +978,8 @@ impl<'a> DeflateStream<'a> {
         let mut chain_length = s.max_chain_length; // max hash chain length
         let strstart = s.strstart;
         let mut best_len = s.prev_length; // best match length so far
-        let mut nice_match = s.nice_match; // stop if match long enough
+        // `nice_match` is stored as `u32`; widen to compare with `lookahead`/`len`.
+        let mut nice_match = s.nice_match as usize; // stop if match long enough
         let w_mask = s.w_mask;
 
         // Stop when `cur_match` becomes <= `limit`. To simplify the code we
@@ -975,7 +997,7 @@ impl<'a> DeflateStream<'a> {
         let mut scan_end = s.window[strstart + best_len];
 
         // Do not waste too much time if we already have a good match.
-        if s.prev_length >= s.good_match {
+        if s.prev_length >= s.good_match as usize {
             chain_length >>= 2;
         }
 
@@ -1118,3 +1140,74 @@ impl Drop for DeflateState {
 // the running checksum), `flush_pending` bumps `state.total_out`, and the
 // strategy / trees code reads and writes `state.data_type`.
 // ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AAP §0.7.3 / §0.8.3 memory-footprint gate for the **deflate** engine.
+    ///
+    /// The AAP requires the live per-stream allocation to be **<= C zlib**. The
+    /// deflate engine is the boxed [`DeflateState`] plus four working buffers
+    /// (`window`, `prev`, `head`, `pending_buf`). Those four buffers are sized
+    /// with the *identical* formulas C uses (see [`DeflateState::new_allocated`]),
+    /// so for any given configuration they are byte-for-byte the same number of
+    /// bytes as C's four `ZALLOC`s. The only term that can drift from C is
+    /// `size_of::<DeflateState>()` — the inline state record that C reaches
+    /// through `s->`. This test therefore pins the *total* default-config engine
+    /// footprint at or below the measured C reference, so any future widening of
+    /// a state field fails fast in CI instead of silently regressing the gate.
+    ///
+    /// Reference measurement — gcc + system libz 1.3.1, a counting `zalloc` hook
+    /// summing every block requested by `deflateInit2_` at the default
+    /// `level = 6` / `windowBits = 15` / `memLevel = 8`:
+    ///
+    /// ```text
+    /// c_deflate_engine_bytes after_init = 268096
+    /// ```
+    #[test]
+    fn memory_footprint_within_c_zlib_gate() {
+        // Engine bytes requested by C zlib (libz 1.3.1) for the default
+        // `level=6` / `windowBits=15` / `memLevel=8` deflate stream.
+        const C_ZLIB_DEFLATE_ENGINE_BYTES: usize = 268_096;
+
+        // Default configuration mirrored from `deflateInit2_`:
+        //   windowBits = 15  ->  w_size      = 1 << 15            = 32768
+        //   memLevel   = 8   ->  hash_bits   = memLevel + 7       = 15
+        //                        hash_size   = 1 << hash_bits     = 32768
+        //                        lit_bufsize = 1 << (memLevel + 6) = 16384
+        const W_BITS: usize = 15;
+        const MEM_LEVEL: usize = 8;
+        let w_size = 1usize << W_BITS;
+        let hash_size = 1usize << (MEM_LEVEL + 7);
+        let lit_bufsize = 1usize << (MEM_LEVEL + 6);
+
+        // The four working buffers, computed with the engine's own element
+        // widths so this stays correct if `Pos` / `LIT_BUFS` ever change.
+        let window_bytes = 2 * w_size; // `vec![0u8; 2 * w_size]`
+        let prev_bytes = w_size * core::mem::size_of::<Pos>(); // `vec![0; w_size]` of Pos
+        let head_bytes = hash_size * core::mem::size_of::<Pos>(); // `vec![0; hash_size]` of Pos
+        let pending_bytes = lit_bufsize * LIT_BUFS; // `vec![0u8; lit_bufsize * LIT_BUFS]`
+        let buffers = window_bytes + prev_bytes + head_bytes + pending_bytes;
+
+        let state_bytes = core::mem::size_of::<DeflateState>();
+        let engine = state_bytes + buffers;
+
+        assert!(
+            engine <= C_ZLIB_DEFLATE_ENGINE_BYTES,
+            "deflate engine footprint {engine} bytes (DeflateState {state_bytes} + buffers \
+             {buffers}) exceeds the C zlib reference {C_ZLIB_DEFLATE_ENGINE_BYTES}; a state \
+             field was widened — narrow it back or formally change the AAP gate",
+        );
+
+        // Lower sanity bound: the inline Huffman trees, heap and depth arrays
+        // alone occupy well over 5 KiB, so the struct can never legitimately
+        // shrink below this. Guards against an accidental field removal that
+        // would make the gate pass for the wrong reason.
+        assert!(
+            state_bytes >= 5_000,
+            "DeflateState shrank to {state_bytes} bytes (< 5000): a required field may have \
+             been removed",
+        );
+    }
+}

@@ -438,15 +438,17 @@ pub(crate) fn deflate(s: &mut DeflateStream, flush: FlushMode) -> Result<ReturnC
             let extra = s.state.gzhead.as_ref().and_then(|h| h.extra.clone());
             if let Some(extra) = extra {
                 let mut beg = s.state.pending;
-                let mut left = (extra.len() & 0xffff) - s.state.gzindex;
-                while s.state.pending + left > s.state.pending_buf_size {
-                    let copy = s.state.pending_buf_size - s.state.pending;
+                // `gzindex` / `pending_buf_size` are stored as `u32`; widen to
+                // `usize` for index/length math (values are unchanged).
+                let mut left = (extra.len() & 0xffff) - s.state.gzindex as usize;
+                while s.state.pending + left > s.state.pending_buf_size as usize {
+                    let copy = s.state.pending_buf_size as usize - s.state.pending;
                     let p = s.state.pending;
-                    let gi = s.state.gzindex;
+                    let gi = s.state.gzindex as usize;
                     s.state.pending_buf[p..p + copy].copy_from_slice(&extra[gi..gi + copy]);
-                    s.state.pending = s.state.pending_buf_size;
+                    s.state.pending = s.state.pending_buf_size as usize;
                     hcrc_update(s.state, beg);
-                    s.state.gzindex += copy;
+                    s.state.gzindex += copy as u32;
                     s.flush_pending();
                     if s.state.pending != 0 {
                         s.state.last_flush = -1;
@@ -456,7 +458,7 @@ pub(crate) fn deflate(s: &mut DeflateStream, flush: FlushMode) -> Result<ReturnC
                     left -= copy;
                 }
                 let p = s.state.pending;
-                let gi = s.state.gzindex;
+                let gi = s.state.gzindex as usize;
                 s.state.pending_buf[p..p + left].copy_from_slice(&extra[gi..gi + left]);
                 s.state.pending += left;
                 hcrc_update(s.state, beg);
@@ -473,7 +475,7 @@ pub(crate) fn deflate(s: &mut DeflateStream, flush: FlushMode) -> Result<ReturnC
             if let Some(name) = name {
                 let mut beg = s.state.pending;
                 loop {
-                    if s.state.pending == s.state.pending_buf_size {
+                    if s.state.pending == s.state.pending_buf_size as usize {
                         hcrc_update(s.state, beg);
                         s.flush_pending();
                         if s.state.pending != 0 {
@@ -482,7 +484,7 @@ pub(crate) fn deflate(s: &mut DeflateStream, flush: FlushMode) -> Result<ReturnC
                         }
                         beg = 0;
                     }
-                    let gi = s.state.gzindex;
+                    let gi = s.state.gzindex as usize;
                     let val = if gi < name.len() { name[gi] } else { 0 };
                     s.state.gzindex += 1;
                     s.state.put_byte(val);
@@ -502,7 +504,7 @@ pub(crate) fn deflate(s: &mut DeflateStream, flush: FlushMode) -> Result<ReturnC
             if let Some(comment) = comment {
                 let mut beg = s.state.pending;
                 loop {
-                    if s.state.pending == s.state.pending_buf_size {
+                    if s.state.pending == s.state.pending_buf_size as usize {
                         hcrc_update(s.state, beg);
                         s.flush_pending();
                         if s.state.pending != 0 {
@@ -511,7 +513,7 @@ pub(crate) fn deflate(s: &mut DeflateStream, flush: FlushMode) -> Result<ReturnC
                         }
                         beg = 0;
                     }
-                    let gi = s.state.gzindex;
+                    let gi = s.state.gzindex as usize;
                     let val = if gi < comment.len() { comment[gi] } else { 0 };
                     s.state.gzindex += 1;
                     s.state.put_byte(val);
@@ -528,7 +530,7 @@ pub(crate) fn deflate(s: &mut DeflateStream, flush: FlushMode) -> Result<ReturnC
         if s.state.status == DeflateStatus::Hcrc {
             let hcrc = s.state.gzhead.as_ref().is_some_and(|h| h.hcrc);
             if hcrc {
-                if s.state.pending + 2 > s.state.pending_buf_size {
+                if s.state.pending + 2 > s.state.pending_buf_size as usize {
                     s.flush_pending();
                     if s.state.pending != 0 {
                         s.state.last_flush = -1;
@@ -997,10 +999,10 @@ pub(crate) fn deflate_params(
         }
         s.state.level = level;
         let cfg = strategy::CONFIG_TABLE[level as usize];
-        s.state.max_lazy_match = cfg.max_lazy as usize;
-        s.state.good_match = cfg.good_length as usize;
-        s.state.nice_match = cfg.nice_length as usize;
-        s.state.max_chain_length = cfg.max_chain as usize;
+        s.state.max_lazy_match = cfg.max_lazy as u32;
+        s.state.good_match = cfg.good_length as u32;
+        s.state.nice_match = cfg.nice_length as u32;
+        s.state.max_chain_length = cfg.max_chain as u32;
     }
     s.state.strategy = strategy;
     Ok(ReturnCode::Ok)
@@ -1018,10 +1020,10 @@ pub(crate) fn deflate_tune(
     nice_length: i32,
     max_chain: i32,
 ) -> Result<ReturnCode, ZlibError> {
-    s.good_match = good_length as usize;
-    s.max_lazy_match = max_lazy as usize;
-    s.nice_match = nice_length as usize;
-    s.max_chain_length = max_chain as usize;
+    s.good_match = good_length as u32;
+    s.max_lazy_match = max_lazy as u32;
+    s.nice_match = nice_length as u32;
+    s.max_chain_length = max_chain as u32;
     Ok(ReturnCode::Ok)
 }
 
@@ -1060,8 +1062,8 @@ pub(crate) fn deflate_prime(
     // The symbol region begins at offset `lit_bufsize` in `pending_buf`; the
     // bit-flush below writes at `pending`, and must keep clear of it. C compares
     // the `sym_buf` pointer to `pending_out + ((Buf_size + 7) >> 3)`.
-    let guard = s.pending_out + ((BUF_SIZE + 7) >> 3) as usize;
-    if !(0..=16).contains(&bits) || s.lit_bufsize < guard {
+    let guard = s.pending_out as usize + ((BUF_SIZE + 7) >> 3) as usize;
+    if !(0..=16).contains(&bits) || (s.lit_bufsize as usize) < guard {
         return Err(ZlibError::BufError);
     }
     loop {
@@ -1194,7 +1196,9 @@ pub(crate) fn deflate_set_header(
     if s.wrap != 2 {
         return Err(ZlibError::StreamError);
     }
-    s.gzhead = Some(head);
+    // Boxed: `gzhead` is `Option<Box<GzHeader>>` so the header lives behind an
+    // 8-byte pointer (C `gz_headerp`) rather than inline in `DeflateState`.
+    s.gzhead = Some(Box::new(head));
     Ok(ReturnCode::Ok)
 }
 

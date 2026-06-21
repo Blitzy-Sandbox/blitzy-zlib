@@ -934,9 +934,9 @@ fn pqdownheap(s: &mut DeflateState, kind: TreeKind, k: usize) {
     let v = s.heap[k];
     let mut k = k;
     let mut j = k << 1; // left son of k
-    while j <= s.heap_len {
+    while j <= s.heap_len as usize {
         // Pick the smaller of the two sons.
-        if j < s.heap_len && smaller(s, kind, s.heap[j + 1] as usize, s.heap[j] as usize) {
+        if j < s.heap_len as usize && smaller(s, kind, s.heap[j + 1] as usize, s.heap[j] as usize) {
             j += 1;
         }
         // Stop if v is smaller than both sons.
@@ -974,11 +974,11 @@ fn gen_bitlen(s: &mut DeflateState, kind: TreeKind) {
 
     // First pass: compute optimal bit lengths (which may overflow for the
     // bit-length tree). The root of the heap gets length 0.
-    let root = s.heap[s.heap_max] as usize;
+    let root = s.heap[s.heap_max as usize] as usize;
     set_len(s, kind, root, 0);
 
     let mut overflow: i32 = 0;
-    for h in (s.heap_max + 1)..HEAP_SIZE {
+    for h in (s.heap_max as usize + 1)..HEAP_SIZE {
         let n = s.heap[h];
         let dad = tree_node(s, kind, n as usize).dad() as usize;
         let mut bits = tree_node(s, kind, dad).len() as usize + 1;
@@ -1061,12 +1061,12 @@ fn build_tree(s: &mut DeflateState, kind: TreeKind) {
     // Build the initial heap from the non-zero-frequency elements; zero-freq
     // elements get length 0.
     s.heap_len = 0;
-    s.heap_max = HEAP_SIZE;
+    s.heap_max = HEAP_SIZE as u32;
 
     for n in 0..elems {
         if tree_node(s, kind, n).freq() != 0 {
             s.heap_len += 1;
-            s.heap[s.heap_len] = n as i32;
+            s.heap[s.heap_len as usize] = n as i32;
             max_code = n as i32;
             s.depth[n] = 0;
         } else {
@@ -1084,7 +1084,7 @@ fn build_tree(s: &mut DeflateState, kind: TreeKind) {
             0
         };
         s.heap_len += 1;
-        s.heap[s.heap_len] = new_node;
+        s.heap[s.heap_len as usize] = new_node;
         set_freq(s, kind, new_node as usize, 1);
         s.depth[new_node as usize] = 0;
         s.opt_len = s.opt_len.wrapping_sub(1);
@@ -1097,7 +1097,7 @@ fn build_tree(s: &mut DeflateState, kind: TreeKind) {
     set_max_code(s, kind, max_code);
 
     // Establish sub-heaps of increasing lengths.
-    for k in (1..=(s.heap_len / 2)).rev() {
+    for k in (1..=(s.heap_len as usize / 2)).rev() {
         pqdownheap(s, kind, k);
     }
 
@@ -1106,7 +1106,7 @@ fn build_tree(s: &mut DeflateState, kind: TreeKind) {
     loop {
         // pqremove: pop the least-frequent node `n`.
         let n_node = s.heap[SMALLEST];
-        s.heap[SMALLEST] = s.heap[s.heap_len];
+        s.heap[SMALLEST] = s.heap[s.heap_len as usize];
         s.heap_len -= 1;
         pqdownheap(s, kind, SMALLEST);
 
@@ -1114,9 +1114,9 @@ fn build_tree(s: &mut DeflateState, kind: TreeKind) {
 
         // Keep the two nodes sorted by frequency at the top of the heap array.
         s.heap_max -= 1;
-        s.heap[s.heap_max] = n_node;
+        s.heap[s.heap_max as usize] = n_node;
         s.heap_max -= 1;
-        s.heap[s.heap_max] = m_node;
+        s.heap[s.heap_max as usize] = m_node;
 
         // Create their parent node.
         let fn_ = tree_node(s, kind, n_node as usize).freq();
@@ -1139,7 +1139,7 @@ fn build_tree(s: &mut DeflateState, kind: TreeKind) {
     }
 
     s.heap_max -= 1;
-    s.heap[s.heap_max] = s.heap[SMALLEST];
+    s.heap[s.heap_max as usize] = s.heap[SMALLEST];
 
     // Now the freq and dad fields are set; generate bit lengths, then codes.
     gen_bitlen(s, kind);
@@ -1405,7 +1405,7 @@ fn compress_block(s: &mut DeflateState, dynamic: bool) {
                     send_bits(s, dist2, extra);
                 }
             }
-            if sx >= s.sym_next {
+            if sx >= s.sym_next as usize {
                 break;
             }
         }

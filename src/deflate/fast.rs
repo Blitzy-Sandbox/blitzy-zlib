@@ -109,7 +109,9 @@ pub(crate) fn deflate_fast(s: &mut DeflateStream, flush: FlushMode) -> BlockStat
             // Insert new strings in the hash table only if the match length is
             // not too large. This saves time but degrades compression.
             // (`max_lazy_match` doubles as C's `max_insert_length`.)
-            if s.state.match_length <= s.state.max_lazy_match && s.state.lookahead >= MIN_MATCH {
+            if s.state.match_length <= s.state.max_lazy_match as usize
+                && s.state.lookahead >= MIN_MATCH
+            {
                 s.state.match_length -= 1; // string at strstart already in table
                 // C `do { strstart++; INSERT_STRING(...); } while(--match_length)`:
                 // decrement happens before the zero test, so this runs the body

@@ -204,8 +204,8 @@ impl BackInput for SliceInput<'_> {
 /// sliding window**. In C, `inflateBackInit_` stores the caller's `window`
 /// pointer in `state->window`; here the window is instead supplied as a
 /// `&mut [u8]` argument to [`inflate_back`] on every call. The
-/// [`window`](InflateState::window) `Vec` of the returned state is therefore
-/// left empty and unused — the wrapper/checksum fields
+/// [`window`](InflateState::window) boxed slice of the returned state is
+/// therefore left empty and unused — the wrapper/checksum fields
 /// ([`wrap`](InflateState::wrap) / [`flags`](InflateState::flags)) are likewise
 /// irrelevant because this is a *raw* stream. Only the decode tables
 /// ([`codes`](InflateState::codes), allocated to length

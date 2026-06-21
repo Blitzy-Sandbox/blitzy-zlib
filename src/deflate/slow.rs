@@ -120,7 +120,7 @@ pub(crate) fn deflate_slow(s: &mut DeflateStream<'_>, flush: FlushMode) -> Block
         s.state.match_length = MIN_MATCH - 1;
 
         if hash_head != NIL
-            && s.state.prev_length < s.state.max_lazy_match
+            && s.state.prev_length < s.state.max_lazy_match as usize
             && s.state.strstart - (hash_head as usize) <= s.state.w_size - MIN_LOOKAHEAD
         {
             // To simplify the code, we prevent matches with the string of

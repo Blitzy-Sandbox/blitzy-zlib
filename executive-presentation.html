@@ -205,6 +205,9 @@
       --space-code-y: 0.12em;
       --space-code-x: 0.45em;
       --size-progress: 4px;
+      --size-control: 44px;
+      --size-control-icon: 20px;
+      --focus-ring: 3px;
 
       /* ---- Responsive collapse column ---- */
       --grid-1: 1fr;
@@ -665,6 +668,28 @@
     .reveal .slide-number { background: var(--blitzy-primary-a30); font-family: var(--ff-mono); }
     .reveal .progress { color: var(--blitzy-primary); height: var(--size-progress); }
     .reveal .controls { color: var(--blitzy-primary); }
+    /* F2 a11y: enlarge navigation controls to a >=44x44 touch/click target
+       (WCAG 2.5.5) while keeping the brand-colored arrow glyph proportionate. */
+    .reveal .controls button {
+      width: var(--size-control);
+      height: var(--size-control);
+      border-radius: var(--radius-md);
+    }
+    .reveal .controls .controls-arrow {
+      border-width: var(--size-control-icon);
+    }
+    /* F2 a11y: a clearly visible keyboard focus indicator using brand tokens,
+       shown only for keyboard navigation (:focus-visible). Applies to the deck
+       controls, focusable slide sections, links and in-slide buttons. */
+    .reveal .controls button:focus-visible,
+    .reveal .slides section:focus-visible,
+    .reveal a:focus-visible,
+    .reveal button:focus-visible {
+      outline: var(--focus-ring) solid var(--blitzy-primary);
+      outline-offset: var(--space-0-3);
+      border-radius: var(--radius-md);
+      box-shadow: 0 0 0 var(--focus-ring) var(--blitzy-teal-a40);
+    }
 
     /* Footer brand tag shown on content slides */
     .slide-foot {
@@ -709,9 +734,42 @@
       .icon-row, .icon-row.cols-3, .icon-row.cols-5 { grid-template-columns: var(--grid-1); }
       .panel-grid, .two-col { grid-template-columns: var(--grid-1); }
     }
+    /* F2 a11y/responsive: this leadership deck targets the AAP-mandated fixed
+       1920x1080 canvas, which reveal.js scales uniformly to fit the viewport.
+       On very narrow portrait screens the uniformly-scaled 16:9 slide becomes
+       too small to read comfortably, so an accessible note documents the
+       intended landscape / desktop viewing context. Hidden by default; shown
+       only on narrow portrait viewports. Every value resolves to a token. */
+    .mobile-hint { display: none; }
+    @media (max-width: 700px) and (orientation: portrait) {
+      .mobile-hint {
+        display: flex;
+        align-items: center;
+        gap: var(--space-0-5);
+        position: fixed;
+        left: var(--space-1); right: var(--space-1); top: var(--space-1);
+        z-index: 60;
+        padding: var(--space-0-6) var(--space-1);
+        background: var(--blitzy-primary-navy);
+        color: var(--blitzy-surface-0);
+        font-family: var(--ff-mono);
+        font-size: var(--fs-sm);
+        border-radius: var(--radius-md);
+        box-shadow: var(--blitzy-elev-2);
+      }
+      .mobile-hint svg { flex: 0 0 auto; }
+    }
+
 </style>
 </head>
 <body>
+  <!-- F2 a11y/responsive: accessible note documenting the intended landscape /
+       desktop viewing context for this fixed-canvas leadership deck. Shown only
+       on narrow portrait viewports via the .mobile-hint media query. -->
+  <div class="mobile-hint" role="note" aria-live="polite">
+    <i aria-hidden="true" data-lucide="rotate-ccw"></i>
+    <span>Best viewed full-screen in landscape on a desktop or projector.</span>
+  </div>
   <div class="reveal">
     <div class="slides">
 
@@ -995,10 +1053,10 @@ graph TD
             <span class="kpi-icon"><i aria-hidden="true" data-lucide="memory-stick"></i></span>
             <span class="kpi-value">&le; 1&times;</span>
             <span class="kpi-label">Memory footprint vs C zlib</span>
-            <span class="kpi-sub">same windowBits / memLevel</span>
+            <span class="kpi-sub">measured at parity &middot; same windowBits / memLevel</span>
           </div>
         </div>
-        <p class="slide-caption">Validated by criterion benchmarks &middot; gates enforced in CI</p>
+        <p class="slide-caption">All four gates pass and are enforced on every CI run &middot; throughput via Criterion benchmarks, memory via a deterministic allocation test</p>
         <div class="slide-foot"><span class="fdot"></span> zlib_rs &middot; Performance</div>
       </section>
 

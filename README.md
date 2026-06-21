@@ -349,19 +349,23 @@ cargo bench --bench inflate_bench    # decompression throughput (vs. C zlib orac
 cargo bench --bench checksum_bench   # CRC-32 SIMD vs. scalar, and Adler-32
 ```
 
-The benchmarks gate the project against these targets, relative to C zlib, and the CI
-`perf` job runs them and **fails the build** if any gate is missed:
+These targets gate the project relative to C zlib; the CI `perf` job enforces all four
+and **fails the build** if any gate is missed:
 
 | Operation                | Target relative to C zlib       | Measured (reference host) |
 |--------------------------|---------------------------------|---------------------------|
 | Compression throughput   | ≥ 80% of C zlib                 | ≥ 0.86× (≥ 1.2× at low levels) |
 | Decompression throughput | ≥ C zlib (parity or better)     | ≥ 1.02× (parity or better) |
 | CRC-32 (SIMD path)       | ≥ 3× the scalar implementation  | ≈ 55× the scalar baseline |
-| Memory footprint         | ≤ C zlib                        | ≤ C zlib                  |
+| Memory footprint         | ≤ C zlib                        | ≤ C zlib (deflate at parity, 268096 B; inflate 7152 B, −8 B) |
 
 > Throughput ratios are hardware- and load-dependent; the figures above were measured on
-> the reference CI host and comfortably clear the gates. The CI `perf` job parses the
-> Criterion `estimates.json` output and enforces the gate thresholds on every run.
+> the reference CI host and comfortably clear the gates. The CI `perf` job enforces all
+> four gates on every run: it parses the Criterion `estimates.json` output for the three
+> throughput gates, and — since Criterion measures time rather than memory — runs the
+> deterministic `tests/memory_footprint.rs` allocation test (a counting global allocator
+> that measures the bytes the public `Deflate` / `Inflate` engines retain at the default
+> `level=6` / `windowBits=15` / `memLevel=8` configuration) for the memory-footprint gate.
 
 ## Development workflow
 

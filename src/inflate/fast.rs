@@ -937,7 +937,7 @@ mod tests {
         // Match references the window only; wnext == 0 (very common case).
         let mut state = fixed_state();
         state.wsize = 8;
-        state.window = b"01234567".to_vec();
+        state.window = b"01234567".to_vec().into_boxed_slice();
         state.whave = 8;
         state.wnext = 0;
 
@@ -962,7 +962,7 @@ mod tests {
         state.wsize = 16;
         let mut window = vec![0u8; 16];
         window[..8].copy_from_slice(b"ABCDEFGH");
-        state.window = window;
+        state.window = window.into_boxed_slice();
         state.whave = 8;
         state.wnext = 8;
 
@@ -989,7 +989,7 @@ mod tests {
         window[8..16].copy_from_slice(b"ABCDEFGH"); // oldest valid bytes
         window[0] = b'I';
         window[1] = b'J'; // newest valid bytes (wnext = 2)
-        state.window = window;
+        state.window = window.into_boxed_slice();
         state.whave = 10;
         state.wnext = 2;
 
@@ -1013,7 +1013,7 @@ mod tests {
         // (exercises the `from_window == false` tail with an overlapping run).
         let mut state = fixed_state();
         state.wsize = 8;
-        state.window = b"01234567".to_vec();
+        state.window = b"01234567".to_vec().into_boxed_slice();
         state.whave = 8;
         state.wnext = 0;
 

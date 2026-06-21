@@ -274,19 +274,36 @@ jobs:
         run: cargo ${{ matrix.cmd }} --locked ${{ matrix.args }}
 
   # --------------------------------------------------------------------------
-  # Performance gates (AAP §0.3.3) — RUN, REPORT, and ENFORCE the throughput
-  # gates on every push / pull request (and on manual dispatch). The three
-  # criterion benches are executed and the mean times in their
-  # `target/criterion/**/new/estimates.json` are parsed into matched-pair
-  # throughput ratios (each matched pair measures an identical byte count, so a
-  # throughput ratio is simply the inverse of the criterion mean-time ratio):
+  # Performance gates (AAP §0.3.3) — RUN, REPORT, and ENFORCE all FOUR gates on
+  # every push / pull request (and on manual dispatch).
+  #
+  # Three are THROUGHPUT gates: the criterion benches are executed and the mean
+  # times in their `target/criterion/**/new/estimates.json` are parsed into
+  # matched-pair throughput ratios (each matched pair measures an identical byte
+  # count, so a throughput ratio is simply the inverse of the criterion
+  # mean-time ratio):
   #   * CRC-32 SIMD       >= 3.0x scalar   (crc32: simd_public vs scalar_local)
   #   * DEFLATE compress  >= 0.80x C zlib  (deflate_levels: <c>_L<l> vs czlib_<c>_L<l>)
   #   * INFLATE decompress>= 1.0x C zlib   (inflate: zlibrs_<c> vs czlib_<c>)
-  # The job FAILS the workflow if any gate is missed (beyond a small, documented
-  # shared-runner noise tolerance) and ALWAYS uploads the full criterion report
-  # as a build artifact for inspection. Runs on Linux only (one consistent
-  # reference host); the cross-platform matrix above still compiles the benches.
+  #
+  # The fourth is a MEMORY-FOOTPRINT gate (criterion measures time, not memory,
+  # so this gate is enforced by a deterministic allocation test rather than by
+  # parsing estimates.json):
+  #   * Memory footprint  <= C zlib        (tests/memory_footprint.rs: a counting
+  #                                          global allocator measures the bytes
+  #                                          the public `Deflate`/`Inflate` engines
+  #                                          retain at the default level=6 /
+  #                                          windowBits=15 / memLevel=8 config and
+  #                                          asserts deflate <= 268096 and inflate
+  #                                          <= 7160; the `size_of`-based unit gates
+  #                                          `*::tests::memory_footprint_within_c_zlib_gate`
+  #                                          pin the structural footprint exactly).
+  #
+  # The job FAILS the workflow if ANY of the four gates is missed (the throughput
+  # gates allow a small, documented shared-runner noise tolerance; the memory
+  # gate is exact) and ALWAYS uploads the full criterion report as a build
+  # artifact for inspection. Runs on Linux only (one consistent reference host);
+  # the cross-platform matrix above still compiles the benches.
   # --------------------------------------------------------------------------
   perf:
     name: Performance gates (run + enforce)
@@ -406,13 +423,29 @@ jobs:
 
           if failures:
               print("")
-              print("PERFORMANCE GATES FAILED:")
+              print("THROUGHPUT PERFORMANCE GATES FAILED:")
               for f in failures:
                   print("  - " + f)
               sys.exit(1)
           print("")
-          print("All performance gates PASS.")
+          print("All THREE throughput performance gates PASS "
+                "(the fourth gate, memory footprint, is enforced in the next step).")
           PERF_GATES_EOF
+
+      # Fourth AAP §0.3.3 gate: MEMORY FOOTPRINT <= C zlib. criterion measures
+      # time, not memory, so this gate is enforced by deterministic allocation
+      # tests rather than by parsing estimates.json. `tests/memory_footprint.rs`
+      # installs a counting global allocator and asserts the bytes the public
+      # `Deflate`/`Inflate` engines retain at the default level=6 / windowBits=15
+      # / memLevel=8 config are <= the measured C zlib reference (deflate 268096,
+      # inflate 7160); the `size_of`-based unit gates pin the structural
+      # footprint exactly. `--nocapture` surfaces the measured byte counts in the
+      # CI log for auditability. Any field-width regression that pushes a struct
+      # over the C reference fails these tests and therefore FAILS the job.
+      - name: Enforce memory-footprint gate
+        run: |
+          cargo test --locked --test memory_footprint -- --nocapture
+          cargo test --locked --lib memory_footprint_within_c_zlib_gate
 
       # Always publish the criterion report (HTML + raw estimates) so the
       # measured numbers behind the gate decision are auditable.

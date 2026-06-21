@@ -67,7 +67,7 @@ pub(crate) fn deflate_stored(s: &mut DeflateStream, flush: FlushMode) -> BlockSt
     // default this is 32K; it can be as small as 507 bytes for memLevel == 1,
     // and grows toward MAX_STORED for large input/output buffers
     // (`deflate.c` L1669-1673).
-    let mut min_block = core::cmp::min(s.state.pending_buf_size - 5, s.state.w_size);
+    let mut min_block = core::cmp::min(s.state.pending_buf_size as usize - 5, s.state.w_size);
 
     // Whether the last (final) block has been emitted to the output.
     let mut last = false;
@@ -277,7 +277,7 @@ pub(crate) fn deflate_stored(s: &mut DeflateStream, flush: FlushMode) -> BlockSt
     // worthy block, or if flushing and the remaining input fits as a stored
     // block in the pending buffer.
     let mut have = ((s.state.bi_valid as usize) + 42) >> 3; // header bytes
-    have = core::cmp::min(s.state.pending_buf_size - have, MAX_STORED);
+    have = core::cmp::min(s.state.pending_buf_size as usize - have, MAX_STORED);
     min_block = core::cmp::min(have, s.state.w_size);
     let left = (s.state.strstart as isize - s.state.block_start) as usize;
     if left >= min_block
@@ -292,7 +292,7 @@ pub(crate) fn deflate_stored(s: &mut DeflateStream, flush: FlushMode) -> BlockSt
         // C passes `s->window + s->block_start` as the source buffer, which
         // aliases the state. Since `tr_stored_block` copies that slice into
         // `pending_buf` and never reads `s.window`, temporarily move the window
-        // out (an allocation-free `mem::take` that leaves an empty `Vec`), hand
+        // out (an allocation-free `mem::take` that leaves an empty boxed slice), hand
         // the borrow checker a disjoint slice, then put the window back. This
         // is behavior-identical to the C aliasing copy.
         let bs = s.state.block_start as usize;

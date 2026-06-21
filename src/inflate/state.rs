@@ -16,7 +16,7 @@
 //! |--------------------------------------|------------------------------------------------------|
 //! | `z_streamp strm` (back-pointer)      | **omitted** — ownership is inverted (see below)      |
 //! | `inflate_mode mode` (`int`-valued)   | [`InflateMode`] enum + exhaustive `match`            |
-//! | `unsigned char FAR *window`          | owned [`Vec`]`<u8>` (lazily grown by `updatewindow`) |
+//! | `unsigned char FAR *window`          | owned [`Box`]`<[`[`u8`]`]>` (lazily sized by `updatewindow`) |
 //! | `code FAR *lencode` / `*distcode`    | [`usize`] **index** into [`codes`](InflateState::codes) |
 //! | `code FAR *next`                     | [`usize`] **index** into [`codes`](InflateState::codes) |
 //! | `code codes[ENOUGH]`                 | owned [`Box`]`<[`[`Code`]`]>` of length `ENOUGH`     |
@@ -86,7 +86,7 @@
 //! ```
 
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, vec, vec::Vec};
+use alloc::{boxed::Box, vec};
 
 use crate::inflate::tables::{Code, ENOUGH};
 use crate::stream::{StreamKind, StreamState};
@@ -256,7 +256,7 @@ pub struct InflateState {
     /// header-parse states fill its fields. Entirely gated behind the `gzip`
     /// feature, mirroring the C `#ifdef GUNZIP` build.
     #[cfg(feature = "gzip")]
-    pub head: Option<crate::gz_header::GzHeader>,
+    pub head: Option<Box<crate::gz_header::GzHeader>>,
 
     // ----- sliding window -------------------------------------------------
     /// Base-2 logarithm of the requested window size (`8..=15`).
@@ -270,7 +270,15 @@ pub struct InflateState {
     /// The sliding window. Allocated **lazily** by `updatewindow` (in
     /// `crate::inflate`) to `1 << wbits` bytes; it starts empty and stays empty
     /// while unused, replacing the C `unsigned char FAR *window` heap block.
-    pub window: Vec<u8>,
+    ///
+    /// Stored as an owned `Box<[u8]>` rather than a [`Vec<u8>`] so the struct
+    /// footprint matches C: the boxed slice is a 16-byte fat pointer (ptr+len)
+    /// whereas a `Vec` would carry a redundant 8-byte capacity that duplicates
+    /// [`wsize`](InflateState::wsize). The window is sized exactly once on first
+    /// use and never grown, so the lost `Vec` growth API is never needed (the
+    /// boxed slice's `len()` IS its capacity). This keeps the live inflate
+    /// engine allocation at or below C zlib (AAP §0.7.3 memory-footprint gate).
+    pub window: Box<[u8]>,
 
     // ----- bit accumulator ------------------------------------------------
     /// Input bit accumulator.
@@ -373,7 +381,10 @@ impl InflateState {
             wsize: 0,
             whave: 0,
             wnext: 0,
-            window: Vec::new(),
+            // Empty boxed slice: a dangling pointer with length 0, performs NO
+            // heap allocation until the window is sized on first use (matches
+            // C's lazily-allocated `state->window`).
+            window: Box::default(),
             hold: 0,
             bits: 0,
             length: 0,
@@ -474,7 +485,7 @@ impl Drop for InflateState {
     ///
     /// Every owned resource frees itself automatically: the
     /// [`codes`](InflateState::codes) [`Box`] and the
-    /// [`window`](InflateState::window) [`Vec`] (and, under the `gzip` feature,
+    /// [`window`](InflateState::window) [`Box`] (and, under the `gzip` feature,
     /// the captured [`head`](InflateState::head)) run their own destructors when
     /// this value is dropped. There is therefore **no manual free and no
     /// `unsafe`** here; double-free and use-after-free are unrepresentable
@@ -590,8 +601,8 @@ mod tests {
         // transient decode state.
         s.wbits = 15;
         s.wrap = 2; // gzip
-        s.window = vec![0xAB; 1 << 15];
-        let window_cap = s.window.capacity();
+        s.window = vec![0xAB; 1 << 15].into_boxed_slice();
+        let window_cap = s.window.len();
         s.wsize = 1 << 15;
         s.whave = 100;
         s.wnext = 50;
@@ -636,7 +647,7 @@ mod tests {
         // Buffers retained, NOT reallocated:
         assert_eq!(s.codes.len(), ENOUGH);
         assert_eq!(s.codes.as_ptr(), codes_ptr);
-        assert_eq!(s.window.capacity(), window_cap);
+        assert_eq!(s.window.len(), window_cap);
     }
 
     #[cfg(feature = "gzip")]
@@ -644,19 +655,44 @@ mod tests {
     fn gzip_head_starts_none_and_reset_clears_it() {
         let mut s = InflateState::new();
         assert!(s.head.is_none());
-        s.head = Some(crate::gz_header::GzHeader::new());
+        s.head = Some(Box::new(crate::gz_header::GzHeader::new()));
         s.reset();
         assert!(s.head.is_none());
     }
 
     #[test]
-    fn size_of_is_reasonable() {
-        // Sanity bound only (not an exact ABI assertion): the struct holds the
-        // two fixed scratch arrays (320 + 288 `u16` = 1216 bytes) plus assorted
-        // scalars and three pointer-sized owned handles. It must comfortably
-        // exceed the arrays and stay well under the C "approximately 7K" note.
-        let sz = core::mem::size_of::<InflateState>();
-        assert!(sz >= 1216, "unexpectedly small: {sz}");
-        assert!(sz <= 8192, "unexpectedly large: {sz}");
+    fn memory_footprint_within_c_zlib_gate() {
+        // AAP §0.7.3 / §0.8.3 memory-footprint gate: the live inflate engine
+        // allocation must be **<= C zlib**. For inflate the engine consists of
+        //   * `Box<InflateState>`              = size_of::<InflateState>()
+        //   * the decode-table buffer `codes`  = ENOUGH * size_of::<Code>()
+        //     (a separate `Box<[Code]>`, allocated at init exactly like C's
+        //      inline `code codes[ENOUGH]`)
+        //   * the sliding window               = allocated lazily, identical to
+        //     C's lazily-allocated `state->window`, so it does not affect this
+        //     init-time comparison.
+        // C zlib (system reference 1.3.1, windowBits=15) requests exactly
+        // `sizeof(struct inflate_state)` = 7160 bytes at `inflateInit2`, which
+        // already INCLUDES its inline `codes[ENOUGH]`. The Rust engine must not
+        // exceed that total.
+        //
+        // Reference measurement (gcc + system libz, counting zalloc):
+        //   c_inflate_engine_bytes after_init = 7160
+        const C_ZLIB_INFLATE_ENGINE_BYTES: usize = 7160;
+        let codes_bytes = ENOUGH * core::mem::size_of::<Code>();
+        let engine_bytes = core::mem::size_of::<InflateState>() + codes_bytes;
+        assert!(
+            engine_bytes <= C_ZLIB_INFLATE_ENGINE_BYTES,
+            "inflate engine footprint {engine_bytes} bytes \
+             (InflateState {} + codes {codes_bytes}) exceeds C zlib {C_ZLIB_INFLATE_ENGINE_BYTES}",
+            core::mem::size_of::<InflateState>(),
+        );
+        // Lower sanity bound: the two fixed scratch arrays (320 + 288 u16 =
+        // 1216 bytes) plus scalars must still be present.
+        assert!(
+            core::mem::size_of::<InflateState>() >= 1216,
+            "InflateState unexpectedly small: {}",
+            core::mem::size_of::<InflateState>(),
+        );
     }
 }
