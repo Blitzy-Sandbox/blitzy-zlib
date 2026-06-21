@@ -171,27 +171,21 @@ rand = "0.9.0"
 # [[bench]] — criterion harnesses (AAP §0.3.1, §0.4.1). `harness = false` is
 # required so criterion provides its own `main`. Sources live in `benches/`.
 #
-# CHECKPOINT NOTE: the benchmark sources (`benches/deflate_bench.rs`,
-# `benches/inflate_bench.rs`, `benches/checksum_bench.rs`) are produced together
-# with the compression engine in the next checkpoint. Cargo validates that every
-# declared target file exists while *parsing* the manifest, so declaring these
-# `[[bench]]` targets now — before their source files land — makes the manifest
-# unparseable and breaks `cargo build`, `cargo clippy --all-targets`, and
-# `cargo bench --no-run` for the whole crate. They are therefore commented out
-# until the bench sources exist, at which point the three blocks below are
-# re-enabled verbatim.
+# All three benchmark sources now exist under `benches/`, so the three
+# `[[bench]]` targets below are enabled. `harness = false` lets criterion
+# supply its own `main`.
 # ----------------------------------------------------------------------------
-# [[bench]]
-# name = "deflate_bench"
-# harness = false
-#
-# [[bench]]
-# name = "inflate_bench"
-# harness = false
-#
-# [[bench]]
-# name = "checksum_bench"
-# harness = false
+[[bench]]
+name = "deflate_bench"
+harness = false
+
+[[bench]]
+name = "inflate_bench"
+harness = false
+
+[[bench]]
+name = "checksum_bench"
+harness = false
 
 # ----------------------------------------------------------------------------
 # [profile.release] — tuned for throughput/footprint parity with C zlib

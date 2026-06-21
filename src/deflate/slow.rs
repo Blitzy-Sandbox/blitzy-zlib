@@ -116,7 +116,7 @@ pub(crate) fn deflate_slow(s: &mut DeflateStream<'_>, flush: FlushMode) -> Block
         // the previous match and reset the current match length to the
         // "no match" sentinel.
         s.state.prev_length = s.state.match_length;
-        s.state.prev_match = s.state.match_start as u16;
+        s.state.prev_match = s.state.match_start;
         s.state.match_length = MIN_MATCH - 1;
 
         if hash_head != NIL
@@ -156,10 +156,18 @@ pub(crate) fn deflate_slow(s: &mut DeflateStream<'_>, flush: FlushMode) -> Block
             // compiles to nothing in release builds; it emits no output bytes
             // and is intentionally omitted from this port.
 
-            // Tally the previous match. `prev_match` is stored as a `u16`
-            // window position, so the distance is `strstart - 1 - prev_match`
-            // and the transmitted length code is `prev_length - MIN_MATCH`.
-            let dist = s.state.strstart - 1 - (s.state.prev_match as usize);
+            // Tally the previous match: the distance is `strstart - 1 -
+            // prev_match` and the transmitted length code is `prev_length -
+            // MIN_MATCH`. `wrapping_sub` mirrors C's unsigned `uInt` arithmetic
+            // so that, when `fill_window` has just slid the window (decrementing
+            // both `strstart` and `prev_match` by `w_size`, with `prev_match`
+            // possibly wrapping), the modular subtraction still yields the exact
+            // true distance — byte-identical to canonical zlib.
+            let dist = s
+                .state
+                .strstart
+                .wrapping_sub(1)
+                .wrapping_sub(s.state.prev_match);
             let len = (s.state.prev_length - MIN_MATCH) as u8;
             let bflush = trees::tr_tally_dist(s.state, dist, len);
 

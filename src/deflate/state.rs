@@ -283,9 +283,19 @@ pub(crate) struct DeflateState {
     pub(crate) block_start: isize,
     /// Length of the best match for the current string.
     pub(crate) match_length: usize,
-    /// Previous match (the hash head that started the previous longest-match
-    /// search).
-    pub(crate) prev_match: Pos,
+    /// Previous match (the window position of the start of the best match
+    /// found for the previous string, saved by the lazy-matching logic).
+    ///
+    /// Stored as `usize` — the same width as [`strstart`](Self::strstart) and
+    /// [`match_start`](Self::match_start) — so the window-slide adjustment in
+    /// [`fill_window`](Self::fill_window) (`match_start -= w_size`, mirroring C
+    /// `deflate.c`'s `s->match_start -= wsize`) composes correctly with the
+    /// `strstart - 1 - prev_match` distance computation in `deflate_slow`. In C
+    /// every position is a `uInt`, so the slide's unsigned wrap-around cancels
+    /// in that subtraction; keeping `prev_match` the same width reproduces that
+    /// modular arithmetic exactly (a narrower type would truncate the wrapped
+    /// value and corrupt the emitted distance).
+    pub(crate) prev_match: usize,
     /// True if there is a deferred (lazy) match awaiting emission.
     pub(crate) match_available: bool,
     /// Start of the string to be matched in the window.
@@ -836,7 +846,17 @@ impl<'a> DeflateStream<'a> {
                 self.state
                     .window
                     .copy_within(wsize..wsize + (wsize - more), 0);
-                self.state.match_start -= wsize;
+                // C `deflate.c` does `s->match_start -= wsize;` where
+                // `match_start` is an unsigned `uInt`; when `match_start <
+                // wsize` this intentionally wraps around. The wrapped value is
+                // never used as an index — it is overwritten by `longest_match`
+                // before the next emission, or (in `deflate_slow`) recovered
+                // via the modular `strstart - 1 - prev_match` subtraction. Use
+                // `wrapping_sub` to reproduce that semantics exactly rather than
+                // panicking on a debug-mode overflow.
+                self.state.match_start = self.state.match_start.wrapping_sub(wsize);
+                // The loop guard `strstart >= wsize + max_dist(wsize)` ensures
+                // `strstart > wsize` here, so this subtraction never underflows.
                 self.state.strstart -= wsize;
                 self.state.block_start -= wsize as isize;
                 if self.state.insert > self.state.strstart {
