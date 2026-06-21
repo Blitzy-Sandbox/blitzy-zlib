@@ -10,7 +10,7 @@
 //! transparently, raw) data. The idiomatic streaming adapter
 //! [`GzReader`] implements the standard library's [`Read`](std::io::Read) /
 //! [`BufRead`](std::io::BufRead) / [`Seek`](std::io::Seek) traits, and the
-//! write path mirrors [`Write`](std::io::Write) semantics.
+//! write-side [`GzWriter`] implements [`Write`](std::io::Write).
 //!
 //! # Layout — C translation unit → Rust submodule (AAP §0.3.1, §0.4.1)
 //!
@@ -141,12 +141,16 @@ pub use read::{GzReader, gzdirect, gzfread, gzgetc, gzgetc_, gzgets, gzread, gzu
 
 // ---------------------------------------------------------------------------
 // `write` re-exports — the write path (ported from `gzwrite.c`): the `gzwrite*`
-// entry points plus the write-side close dispatcher `gzclose_w`. The variadic
-// `gzprintf` is exposed here as a `core::fmt::Arguments`-based core; the C
-// variadic marshalling lives at the `src/ffi.rs` boundary, which formats into a
-// buffer and feeds the byte-oriented `gzprintf_bytes` core.
+// entry points plus the write-side close dispatcher `gzclose_w`, and the
+// idiomatic [`GzWriter`] adapter, which implements [`Write`](std::io::Write)
+// over a borrowed [`GzState`] (the write-side twin of [`GzReader`]). The
+// variadic `gzprintf` is exposed here as a `core::fmt::Arguments`-based core;
+// the C variadic marshalling lives at the `src/ffi.rs` boundary, which formats
+// into a buffer and feeds the byte-oriented `gzprintf_bytes` core.
 // ---------------------------------------------------------------------------
-pub use write::{gzclose_w, gzflush, gzfwrite, gzprintf, gzprintf_bytes, gzputc, gzputs, gzwrite};
+pub use write::{
+    GzWriter, gzclose_w, gzflush, gzfwrite, gzprintf, gzprintf_bytes, gzputc, gzputs, gzwrite,
+};
 
 // ---------------------------------------------------------------------------
 // `close` re-export — the top-level [`gzclose`] dispatcher (ported from

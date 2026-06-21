@@ -230,22 +230,20 @@ item_types = ["functions", "structs", "enums", "typedefs", "constants"]
 #     shim calls it to perform the actual compressed write); it is not part of
 #     the zlib C API and its `zlibrs_` prefix keeps it out of the canonical
 #     namespace.
-#   * `gzprintf` and `gzvprintf` are exported from `src/ffi.rs` as
-#     `#[unsafe(naked)]` trampolines with NON-variadic Rust signatures (stable
-#     Rust cannot spell `...`/`va_list`). If cbindgen emitted prototypes from
-#     those Rust signatures they would be non-variadic and would CONFLICT with
-#     the correct, variadic `gzprintf`/`gzvprintf` declarations supplied by the
-#     trailer above. They are therefore excluded here so ONLY the trailer's
-#     faithful `zlib.h`-matching variadic prototypes appear in the header.
-#   * `zlibrs_gzprintf_impl` / `zlibrs_gzvprintf_impl` are the C-shim
-#     implementations, declared in `src/ffi.rs` only as bare `extern` symbols so
-#     the naked trampolines can `jmp` to them. They are internal glue, not part
-#     of the zlib C API, so they are excluded as well.
+#   * `gzprintf` and `gzvprintf` are the canonical *variadic* entry points,
+#     DEFINED directly in the `csrc/gzprintf.c` shim (stable Rust cannot spell
+#     `...`/`va_list`). `src/ffi.rs` only *declares* them — in a bare `extern`
+#     block whose `#[used]` anchor pins the shim object into the link — and a
+#     foreign declaration like that has no Rust body for cbindgen to translate.
+#     They are nonetheless excluded explicitly so that, even if cbindgen's
+#     handling of foreign items changes, it can never emit a non-variadic
+#     prototype that would CONFLICT with the correct, variadic
+#     `gzprintf`/`gzvprintf` declarations supplied by the trailer above. The
+#     result: ONLY the trailer's faithful `zlib.h`-matching variadic prototypes
+#     appear in the header.
 include = []
 exclude = [
     "zlibrs_gzprintf_write",
-    "zlibrs_gzprintf_impl",
-    "zlibrs_gzvprintf_impl",
     "gzprintf",
     "gzvprintf",
 ]

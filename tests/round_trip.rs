@@ -3,7 +3,8 @@
 //! This integration test suite verifies the central correctness contract of the
 //! library: **anything `zlib-rs` compresses, `zlib-rs` decompresses back to the
 //! exact original bytes** — across randomized inputs, every compression level,
-//! every strategy, and the zlib and raw window framings.
+//! every strategy, and the zlib, raw, and (under the `gzip` feature) gzip window
+//! framings.
 //!
 //! # Provenance
 //!
@@ -25,7 +26,9 @@
 //!   clamped level.
 //! * **B — streaming identity:** the [`Deflate`] → [`Inflate`] streaming path
 //!   round-trips across all five [`Strategy`] values and the zlib (`15`, `9`) and
-//!   raw (`-15`, `-9`) window-bit framings.
+//!   raw (`-15`, `-9`) window-bit framings. Under the `gzip` feature it also
+//!   covers the gzip (`31`) framing — including auto-detect (`47`) decode and a
+//!   chunked variant — matching the zlib/raw property quality.
 //! * **C — chunked invariance:** feeding either side in arbitrarily small chunks
 //!   yields the same result, validating the `consumed`/`produced` bookkeeping.
 //! * **D — determinism & bounds:** the same input/level always yields identical
@@ -47,11 +50,15 @@
 //!
 //! # Framing scope
 //!
-//! Only the always-available zlib (`windowBits` 8..=15) and raw (`-8..=-15`)
-//! framings are exercised here. The gzip framing (`24..=31`, `40..=47`) requires
-//! the `gzip` feature and is covered by `tests/gzip_compat.rs`, so it is
-//! intentionally out of scope for this file (keeping every property unconditional
-//! and free of `#[cfg(feature = ...)]` gating).
+//! The always-available zlib (`windowBits` 8..=15) and raw (`-8..=-15`) framings
+//! are exercised unconditionally. The gzip framing (`24..=31` produce/decode and
+//! `40..=47` auto-detect decode) requires the `gzip` Cargo feature, so its
+//! round-trip properties below are gated with `#[cfg(feature = "gzip")]`; they
+//! run under the default feature set (where `gzip` is on) and are compiled out of
+//! a `--no-default-features` / `no-std` build. The gzip *file*-format layer
+//! (`gzopen`/`gzread`/`gzwrite`) is exercised separately in
+//! `tests/gzip_compat.rs`; here we exercise the raw gzip *stream* framing through
+//! the streaming `Deflate`/`Inflate` engines, mirroring the zlib/raw properties.
 
 use quickcheck::{TestResult, quickcheck};
 use rand::Rng;
@@ -370,6 +377,70 @@ fn stream_roundtrip_window_raw9() {
         stream_roundtrip(&data, 6, Strategy::Default, -9) == data
     }
     quickcheck(prop as fn(Vec<u8>) -> bool);
+}
+
+// ---------------------------------------------------------------------------
+// Property B (gzip) — gzip-framed streaming identity (feature-gated).
+//
+// Mirrors the zlib/raw per-window properties above for the gzip wrapper
+// (`windowBits = 31`), which RFC 1952 frames with a 10-byte header and an 8-byte
+// CRC-32 + ISIZE trailer. Gated on the `gzip` feature (on by default); compiled
+// out of a `--no-default-features` build where the gzip wrapper is unavailable.
+// ---------------------------------------------------------------------------
+
+/// Gzip framing, produced and decoded explicitly at `windowBits = 31`
+/// (level 6, default strategy) — the gzip analogue of
+/// [`stream_roundtrip_window_zlib15`].
+#[cfg(feature = "gzip")]
+#[test]
+fn stream_roundtrip_window_gzip31() {
+    fn prop(data: Vec<u8>) -> bool {
+        stream_roundtrip(&data, 6, Strategy::Default, 31) == data
+    }
+    quickcheck(prop as fn(Vec<u8>) -> bool);
+}
+
+/// Gzip framing produced at `windowBits = 31` and decoded with the
+/// **auto-detecting** `windowBits = 47` (`32 + 15`), which sniffs the gzip vs
+/// zlib header — proving auto-detect decode accepts our gzip output.
+#[cfg(feature = "gzip")]
+#[test]
+fn stream_roundtrip_gzip_autodetect47() {
+    fn prop(data: Vec<u8>) -> bool {
+        let out_cap = compress_bound(data.len()) + 64;
+        let compressed = deflate_stream(&data, 6, 31, Strategy::Default, usize::MAX, out_cap);
+        let decoded = inflate_stream(
+            &compressed,
+            47,
+            data.len(),
+            usize::MAX,
+            data.len().max(1) + 64,
+        );
+        decoded == data
+    }
+    quickcheck(prop as fn(Vec<u8>) -> bool);
+}
+
+/// Chunked gzip round-trip: deflate the input in small chunks at
+/// `windowBits = 31`, then inflate the whole stream in one pass — the gzip
+/// analogue of [`chunked_deflate`], stressing the incremental
+/// `consumed`/`produced` bookkeeping across the gzip header/trailer boundaries.
+#[cfg(feature = "gzip")]
+#[test]
+fn chunked_gzip31() {
+    fn prop(data: Vec<u8>, chunk: u8) -> bool {
+        let in_chunk = usize::from(chunk) + 1;
+        let compressed = deflate_stream(&data, 6, 31, Strategy::Default, in_chunk, 64);
+        let decoded = inflate_stream(
+            &compressed,
+            31,
+            data.len(),
+            usize::MAX,
+            data.len().max(1) + 64,
+        );
+        decoded == data
+    }
+    quickcheck(prop as fn(Vec<u8>, u8) -> bool);
 }
 
 // ===========================================================================

@@ -53,8 +53,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use zlib_rs::gz::state::GzState;
 use zlib_rs::gz::{
-    gzbuffer, gzclose, gzdirect, gzeof, gzerror, gzflush, gzgetc, gzgets, gzopen, gzprintf, gzputc,
-    gzputs, gzread, gzseek, gztell, gzungetc, gzwrite,
+    GzReader, GzWriter, gzbuffer, gzclose, gzdirect, gzeof, gzerror, gzflush, gzgetc, gzgets,
+    gzopen, gzprintf, gzputc, gzputs, gzread, gzseek, gztell, gzungetc, gzwrite,
 };
 use zlib_rs::{SEEK_CUR, SEEK_SET, Z_OK, Z_SYNC_FLUSH};
 
@@ -786,4 +786,155 @@ fn gzerror_clean_on_success() {
     assert_eq!(code, Z_OK, "no error code after a clean read");
     assert!(msg.is_none(), "no error message after a clean read");
     assert_eq!(gzclose(Some(reader)), Z_OK);
+}
+
+// ===========================================================================
+// GzWriter — the idiomatic `impl std::io::Write` gzip adapter (AAP §0.3.2)
+// ===========================================================================
+//
+// These exercise the write-side counterpart of `GzReader`: data written through
+// the standard-library `Write` ecosystem (`write_all`, `io::copy`, `write!`,
+// `flush`) must produce a valid gzip member that reads back byte-for-byte. As
+// elsewhere in this file the read-back uses *our own* gzip layer (the
+// `gz_uncompress` helper or `GzReader`), never `flate2`.
+
+/// `GzWriter::write_all` + `flush` must produce a gzip file that decompresses
+/// back to the original payload.
+#[test]
+fn gz_writer_write_all_round_trip() {
+    let payload = make_payload(40_000);
+    let gz = TempPath::new("gzwriter_write_all");
+
+    {
+        let mut handle = gzopen(gz.path(), "wb").expect("gzopen for writing");
+        {
+            let mut writer = GzWriter::new(&mut handle);
+            writer
+                .write_all(&payload)
+                .expect("GzWriter::write_all must succeed");
+            // Exercise Write::flush → gzflush(Z_SYNC_FLUSH): forces buffered
+            // input out to the file while keeping the stream open.
+            writer.flush().expect("GzWriter::flush must succeed");
+        } // `writer` dropped here, releasing the borrow on `handle`.
+        // Finalise the gzip member (Z_FINISH + CRC-32/ISIZE trailer).
+        assert_eq!(
+            gzclose(Some(handle)),
+            Z_OK,
+            "gzclose after GzWriter must report Z_OK"
+        );
+    }
+
+    let mut readback = Vec::new();
+    let inp = gzopen(gz.path(), "rb").expect("gzopen for reading");
+    assert_eq!(gz_uncompress(inp, &mut readback), Z_OK);
+    assert_eq!(readback, payload, "GzWriter output must round-trip exactly");
+}
+
+/// `std::io::copy` into a `GzWriter` (which drives `Write::write` in a loop)
+/// must round-trip, and the result must be readable back through the idiomatic
+/// `GzReader` — proving the two `std::io` adapters interoperate.
+#[test]
+fn gz_writer_io_copy_round_trips_through_gzreader() {
+    let payload = make_payload(33_000);
+    let gz = TempPath::new("gzwriter_io_copy");
+
+    {
+        let mut handle = gzopen(gz.path(), "wb").expect("gzopen for writing");
+        {
+            let mut writer = GzWriter::new(&mut handle);
+            let mut src = Cursor::new(&payload[..]);
+            let copied = std::io::copy(&mut src, &mut writer).expect("io::copy into GzWriter");
+            assert_eq!(
+                copied as usize,
+                payload.len(),
+                "io::copy must report the full payload length"
+            );
+        }
+        assert_eq!(gzclose(Some(handle)), Z_OK);
+    }
+
+    // Read the whole stream back through the idiomatic GzReader (impl Read).
+    let mut readback = Vec::new();
+    {
+        let mut handle = gzopen(gz.path(), "rb").expect("gzopen for reading");
+        {
+            let mut reader = GzReader::new(&mut handle);
+            reader
+                .read_to_end(&mut readback)
+                .expect("GzReader::read_to_end must succeed");
+        }
+        assert_eq!(gzclose(Some(handle)), Z_OK);
+    }
+    assert_eq!(
+        readback, payload,
+        "GzWriter→GzReader round-trip must be exact"
+    );
+}
+
+/// Multiple `write_all` chunks with an intermediate `flush` must still produce
+/// one coherent gzip member that decompresses to the concatenation of chunks.
+#[test]
+fn gz_writer_chunked_writes_with_flush() {
+    let part_a = make_payload(5_000);
+    let part_b = make_payload(7_000);
+    let gz = TempPath::new("gzwriter_chunked");
+
+    {
+        let mut handle = gzopen(gz.path(), "wb").expect("gzopen for writing");
+        {
+            let mut writer = GzWriter::new(&mut handle);
+            writer.write_all(&part_a).expect("first chunk");
+            // Flush mid-stream (Z_SYNC_FLUSH) — the stream stays open.
+            writer.flush().expect("mid-stream flush");
+            writer.write_all(&part_b).expect("second chunk");
+        }
+        assert_eq!(gzclose(Some(handle)), Z_OK);
+    }
+
+    let mut expected = part_a.clone();
+    expected.extend_from_slice(&part_b);
+
+    let mut readback = Vec::new();
+    let inp = gzopen(gz.path(), "rb").expect("gzopen for reading");
+    assert_eq!(gz_uncompress(inp, &mut readback), Z_OK);
+    assert_eq!(
+        readback, expected,
+        "chunked GzWriter output must round-trip to the concatenated input"
+    );
+}
+
+/// `GzWriter::get_ref` / `get_mut` expose the underlying state; an empty
+/// `write` is `Ok(0)`; and after a clean write `gzerror` (via `get_ref`)
+/// reports no error.
+#[test]
+fn gz_writer_get_ref_get_mut_and_empty_write() {
+    let gz = TempPath::new("gzwriter_accessors");
+
+    let mut handle = gzopen(gz.path(), "wb").expect("gzopen for writing");
+    {
+        let mut writer = GzWriter::new(&mut handle);
+
+        // An empty write must be a no-op success, never an error.
+        assert_eq!(writer.write(&[]).expect("empty write is Ok"), 0);
+
+        // Drive a small write through the byte-oriented core via get_mut().
+        let n = gzwrite(writer.get_mut(), b"accessor check ");
+        assert_eq!(n, "accessor check ".len() as i32);
+
+        // And a normal Write::write.
+        let m = writer.write(b"payload tail").expect("write returns bytes");
+        assert_eq!(m, "payload tail".len());
+
+        // get_ref() yields &GzState: a clean stream reports Z_OK / no message.
+        let (code, msg) = gzerror(writer.get_ref());
+        assert_eq!(code, Z_OK, "no error after clean writes");
+        assert!(msg.is_none(), "no error message after clean writes");
+    }
+    assert_eq!(gzclose(Some(handle)), Z_OK);
+
+    // Sanity: the bytes we wrote round-trip.
+    let mut readback = Vec::new();
+    let inp = gzopen(gz.path(), "rb").expect("gzopen for reading");
+    assert_eq!(gz_uncompress(inp, &mut readback), Z_OK);
+    assert_eq!(readback, b"accessor check payload tail");
 }

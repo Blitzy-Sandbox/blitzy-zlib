@@ -69,7 +69,18 @@ exclude = [
 # [lib] — produce the Rust rlib PLUS the C-linkable cdylib/staticlib so the
 # crate is a binary-level drop-in for libz (AAP §0.3.1, §0.3.3, §0.5.1).
 # The cdylib (.so/.dylib/.dll) and staticlib (.a) carry the
-# `#[no_mangle] extern "C"` symbols defined in `src/ffi.rs`.
+# `#[no_mangle] extern "C"` symbols defined in `src/ffi.rs` (under `capi`).
+#
+# no-std note: the `cdylib`/`staticlib` FINAL link artifacts require a global
+# allocator + `#[panic_handler]` that a `#![no_std]` *library* must not impose
+# on its consumers, so a plain `cargo build --no-default-features --features
+# no-std` (which tries to link all three crate-types) cannot succeed. The
+# supported `no-std` (`Z_SOLO`) artifact is therefore the single Rust `rlib`,
+# built/linted by overriding the crate-type for that one invocation:
+#   cargo rustc --lib --crate-type rlib --no-default-features --features no-std
+# README.md and .github/workflows/ci.yml use exactly this invocation; the
+# extra crate-types here are intentional and only affect the default (std)
+# C-drop-in build, not the rlib-only no-std path.
 # ----------------------------------------------------------------------------
 [lib]
 name = "zlib_rs"
@@ -105,16 +116,18 @@ simd = ["dep:crc32fast"]
 # otherwise collide at link time with the bundled C zlib pulled in by the
 # `flate2` dev-dependency's `zlib` backend.
 #
-# MSRV / toolchain note: this OPTIONAL feature raises the build requirements
-# above the crate's default-feature MSRV (Rust 1.85). The variadic `gzprintf` /
-# `gzvprintf` drop-in symbols are exported as `#[unsafe(naked)]` trampolines
-# (stabilized in Rust 1.88) that tail-call a tiny C shim (`csrc/gzprintf.c`,
-# compiled by the `cc` build-dependency), because stable Rust cannot express C
-# variadics. Building with `--features capi` therefore requires Rust >= 1.88
-# and a C compiler. The default, pure-Rust library is unaffected and still
-# builds on Rust 1.85. (AAP §0.3.1 elevates the C-ABI drop-in to a prompt-
-# mandated, additive deliverable; AAP §0.7.2's "zero C dependency" applies to
-# the shipped pure-Rust artifact, not this opt-in C-ABI bridge.)
+# MSRV / toolchain note: this OPTIONAL feature builds on the SAME Rust 1.85
+# MSRV as the default library. The only canonical symbols stable Rust cannot
+# express are the C *variadics* `gzprintf` / `gzvprintf` (`...` / `va_list`);
+# these are DEFINED directly in a tiny C shim (`csrc/gzprintf.c`, compiled by
+# the `cc` build-dependency) under their real names, and `build.rs` exports them
+# from the `cdylib`. This deliberately avoids `#[unsafe(naked)]` trampolines
+# (whose `naked_asm!` was only stabilized in Rust 1.88), so `--features capi`
+# requires only Rust 1.85 plus a C compiler for the shim — no newer toolchain.
+# (AAP §0.3.1 elevates the C-ABI drop-in to a prompt-mandated, additive
+# deliverable; AAP §0.7.2's "zero C dependency" applies to the shipped pure-Rust
+# artifact, not this opt-in C-ABI bridge, whose only C is this crate's own
+# self-authored variadic shim.)
 capi = []
 
 # ----------------------------------------------------------------------------

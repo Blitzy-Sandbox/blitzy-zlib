@@ -1,7 +1,7 @@
 //! Cargo build script for the `zlib-rs` crate.
 //!
 //! This script runs once, on the host, *before* the crate itself is compiled.
-//! It has two clearly separated responsibilities, mirroring the way upstream
+//! It has three clearly separated responsibilities, mirroring the way upstream
 //! C zlib bootstraps itself:
 //!
 //! 1. **CRC-32 table generation (Phase A).** Upstream zlib ships a 9 446-line
@@ -26,8 +26,23 @@
 //!    never aborts the crate build (the library does not depend on the header
 //!    existing), degrading to a `cargo:warning` on any problem.
 //!
-//! The script is plain, dependency-light Rust. The only build-dependency it
-//! uses is `cbindgen` (declared under `[build-dependencies]` in `Cargo.toml`);
+//! 3. **Variadic `gzprintf` C shim (Phase D).** zlib's `gzprintf`/`gzvprintf`
+//!    are C *variadic* functions, which stable Rust can neither define nor read
+//!    (`c_variadic` is unstable and would break the crate's Rust 1.85 MSRV).
+//!    When — and only when — the optional `capi` and `gz-io` features are both
+//!    enabled, this script compiles the self-authored shim `csrc/gzprintf.c`
+//!    (which defines those two canonical symbols directly in C and calls back
+//!    into the safe-Rust engine) and arranges for the symbols to be exported
+//!    from the `cdylib` drop-in. The default pure-Rust build compiles and links
+//!    no C whatsoever, preserving the crate's zero-C-dependency guarantee
+//!    (AAP §0.7.2). Defining these symbols in C — rather than via a
+//!    `#[unsafe(naked)]` Rust trampoline, whose `naked_asm!` was only
+//!    stabilized in Rust 1.88 — is what keeps the `capi` drop-in buildable on
+//!    the declared 1.85 MSRV (AAP §0.3.3, §0.7.2).
+//!
+//! The script is plain, dependency-light Rust. The only build-dependencies it
+//! uses are `cbindgen` (header emission) and `cc` (compiling the optional
+//! `gzprintf` shim), both declared under `[build-dependencies]` in `Cargo.toml`;
 //! the CRC table generation relies solely on the standard library and a handful
 //! of integer operations, so it is fast, deterministic, and free of any
 //! network or external-tool requirement.
@@ -401,25 +416,38 @@ fn gzprintf_shim_requested() -> bool {
     env::var_os("CARGO_FEATURE_CAPI").is_some() && env::var_os("CARGO_FEATURE_GZ_IO").is_some()
 }
 
-/// Compile `csrc/gzprintf.c` into a small static archive and link it into the
-/// crate.
+/// The two canonical variadic symbols supplied by the C shim. Kept in one place
+/// so the link-time export logic and the documentation cannot drift apart.
+const GZPRINTF_SHIM_SYMBOLS: [&str; 2] = ["gzprintf", "gzvprintf"];
+
+/// Compile `csrc/gzprintf.c` into a small static archive, link it into the
+/// crate, and export its two canonical symbols from the `cdylib` drop-in.
 ///
 /// The shim performs C variadic formatting (`vsnprintf` into a bounded buffer)
-/// under the internal symbols `zlibrs_gzprintf_impl` / `zlibrs_gzvprintf_impl`,
-/// and then calls the safe-Rust `zlibrs_gzprintf_write` callback exported by
-/// `src/ffi.rs` to perform the actual compressed write. The *public* `gzprintf`
-/// / `gzvprintf` symbols are the `#[unsafe(naked)]` Rust trampolines in
-/// `src/ffi.rs` that tail-`jmp` to these C implementations. `cc` drives the
-/// system C compiler (gcc/clang); it is a build-time tool only and is never
-/// linked into the library — only the resulting object code is.
+/// and DEFINES the canonical zlib symbols `gzprintf` / `gzvprintf` directly in
+/// C (under their real names — not internal `_impl` helpers), then calls the
+/// safe-Rust `zlibrs_gzprintf_write` callback exported by `src/ffi.rs` to
+/// perform the actual compressed write. Defining the variadic entry points in C
+/// avoids any `#[unsafe(naked)]` Rust trampoline (whose `naked_asm!` is Rust
+/// 1.88+), which is what keeps the `capi` drop-in buildable on the crate's 1.85
+/// MSRV. `cc` drives the system C compiler (gcc/clang/cl); it is a build-time
+/// tool only and is never linked into the library — only the resulting object
+/// code is.
 ///
-/// A plain `cargo:rustc-link-lib=static=…` (emitted by `cc::Build::compile`) is
-/// sufficient: the Rust naked trampolines reference the C implementations via
-/// the assembler `sym` operand, so the linker pulls the shim object in to
-/// resolve those references, and `--gc-sections` keeps the implementations
-/// because they are reachable from the exported `gzprintf`/`gzvprintf` symbols.
-/// No `+whole-archive` or `--undefined` coaxing is required.
-fn compile_gzprintf_shim(manifest_dir: &Path) {
+/// Two distinct link-time concerns are handled separately:
+///
+/// * **Pull + keep (portable).** Nothing in the Rust core *calls* `gzprintf` /
+///   `gzvprintf`, so without a reference the linker would neither pull the shim
+///   object out of its static archive nor keep it under `--gc-sections`. A
+///   `#[used]` address-holding anchor in `src/ffi.rs` creates that reference on
+///   EVERY target with no linker-flag dependency.
+/// * **Dynamic export (per-target).** A `cdylib` exports only the symbols rustc
+///   lists (its own `#[no_mangle]` Rust items); rustc localizes every other
+///   symbol, so the C-defined names would otherwise be absent from the shared
+///   object's dynamic symbol table. [`export_gzprintf_symbols`] adds them back
+///   with the appropriate linker flag for the target. A `staticlib` archives
+///   every object, so it carries the symbols unconditionally and needs no flag.
+fn compile_gzprintf_shim(manifest_dir: &Path, out_dir: &Path) {
     let shim = manifest_dir.join("csrc").join("gzprintf.c");
     if !shim.exists() {
         // Should never happen in a well-formed tree, but degrade loudly rather
@@ -438,6 +466,106 @@ fn compile_gzprintf_shim(manifest_dir: &Path) {
         // platform warnings; the shim itself is warning-clean under -Wall.
         .warnings(true)
         .compile("zlibrs_gzprintf_shim");
+
+    // Make the C-defined canonical symbols first-class exports of the cdylib.
+    export_gzprintf_symbols(out_dir);
+}
+
+/// Emit the per-target linker flags that export the C shim's `gzprintf` /
+/// `gzvprintf` symbols from the `cdylib` artifact.
+///
+/// `cargo:rustc-link-arg-cdylib=…` directives apply ONLY to the `cdylib` link,
+/// never to the `rlib`, `staticlib`, integration tests, or benches — so the
+/// default pure-Rust build and the test/bench builds are entirely unaffected.
+///
+/// Platform coverage:
+///
+/// * **ELF (Linux, *BSD, …) via GNU ld / lld — validated.** A generated
+///   `--version-script` lists the two names under `global:`; because an
+///   explicit (non-wildcard) match outranks rustc's own `local: *;` wildcard,
+///   the symbols become exported while every Rust `#[no_mangle]` export is
+///   preserved. `--undefined` additionally roots each symbol so it survives
+///   `--gc-sections`.
+/// * **mach-o (macOS, iOS, …) — best-effort.** ld64 takes the UNION of every
+///   `-exported_symbols_list`, so an additional list (mach-o names carry a
+///   leading underscore) adds the two symbols alongside rustc's own export
+///   list; `-u` roots them.
+/// * **Windows MSVC — best-effort.** `/EXPORT:` adds each symbol to the DLL
+///   export table additively (it does not displace the `dllexport`-ed Rust
+///   symbols); `/INCLUDE:` roots them against dead-stripping.
+/// * **Windows GNU (MinGW) — best-effort.** `--undefined` roots each symbol;
+///   full dynamic export on this target may additionally require a `.def` file,
+///   which is left to downstream packaging.
+///
+/// Only the ELF path is exercised by this project's CI; the others are
+/// additive, do-no-harm flags provided so the drop-in has the best chance of
+/// exporting the canonical symbols on those targets as well.
+fn export_gzprintf_symbols(out_dir: &Path) {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+
+    match target_os.as_str() {
+        "macos" | "ios" | "tvos" | "watchos" | "visionos" => {
+            // mach-o symbols are prefixed with an underscore.
+            let list = out_dir.join("gzprintf_exports.exp");
+            let body: String = GZPRINTF_SHIM_SYMBOLS
+                .iter()
+                .map(|s| format!("_{s}\n"))
+                .collect();
+            if let Err(e) = fs::write(&list, body) {
+                println!(
+                    "cargo:warning=zlib-rs: could not write mach-o export list {}: {e}; \
+                     gzprintf/gzvprintf may not be exported from the cdylib.",
+                    list.display()
+                );
+                return;
+            }
+            println!(
+                "cargo:rustc-link-arg-cdylib=-Wl,-exported_symbols_list,{}",
+                list.display()
+            );
+            for sym in GZPRINTF_SHIM_SYMBOLS {
+                println!("cargo:rustc-link-arg-cdylib=-Wl,-u,_{sym}");
+            }
+        }
+        "windows" if target_env == "msvc" => {
+            for sym in GZPRINTF_SHIM_SYMBOLS {
+                println!("cargo:rustc-link-arg-cdylib=/EXPORT:{sym}");
+                println!("cargo:rustc-link-arg-cdylib=/INCLUDE:{sym}");
+            }
+        }
+        "windows" => {
+            // windows-gnu (MinGW): root the symbols; broader export may need a
+            // `.def` file at packaging time.
+            for sym in GZPRINTF_SHIM_SYMBOLS {
+                println!("cargo:rustc-link-arg-cdylib=-Wl,--undefined={sym}");
+            }
+        }
+        _ => {
+            // ELF targets (Linux, *BSD, etc.) — the validated path.
+            let version_script = out_dir.join("gzprintf_version_script.map");
+            let mut body = String::from("{\n  global:\n");
+            for sym in GZPRINTF_SHIM_SYMBOLS {
+                let _ = writeln!(body, "    {sym};");
+            }
+            body.push_str("};\n");
+            if let Err(e) = fs::write(&version_script, &body) {
+                println!(
+                    "cargo:warning=zlib-rs: could not write ELF version script {}: {e}; \
+                     gzprintf/gzvprintf may not be exported from the cdylib.",
+                    version_script.display()
+                );
+                return;
+            }
+            println!(
+                "cargo:rustc-link-arg-cdylib=-Wl,--version-script={}",
+                version_script.display()
+            );
+            for sym in GZPRINTF_SHIM_SYMBOLS {
+                println!("cargo:rustc-link-arg-cdylib=-Wl,--undefined={sym}");
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -478,6 +606,6 @@ fn main() {
     // gzprintf/gzvprintf shim have both a reason to exist and a callback symbol
     // to link against. The default pure-Rust build skips it entirely.
     if gzprintf_shim_requested() {
-        compile_gzprintf_shim(&manifest_dir);
+        compile_gzprintf_shim(&manifest_dir, &out_dir);
     }
 }

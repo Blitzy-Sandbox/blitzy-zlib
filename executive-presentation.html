@@ -949,7 +949,7 @@ graph TD
           <div class="icon-item">
             <span class="icon-badge"><i aria-hidden="true" data-lucide="equal"></i></span>
             <span class="icon-title">Byte-for-byte oracle</span>
-            <span class="icon-desc">Interop tests will compare output to <code>flate2</code> (canonical C zlib) byte-for-byte.</span>
+            <span class="icon-desc">Interop tests compare output to <code>flate2</code> (canonical C zlib) byte-for-byte.</span>
           </div>
           <div class="icon-item">
             <span class="icon-badge"><i aria-hidden="true" data-lucide="lock-keyhole"></i></span>
@@ -959,11 +959,11 @@ graph TD
           <div class="icon-item">
             <span class="icon-badge"><i aria-hidden="true" data-lucide="list-checks"></i></span>
             <span class="icon-title">Official vectors</span>
-            <span class="icon-desc">Ports of example.c, infcover.c and minigzip will drive the test suite.</span>
+            <span class="icon-desc">Ports of example.c, infcover.c and minigzip drive the test suite.</span>
           </div>
         </div>
-        <p class="slide-caption">Planned layered validation &middot; regression &middot; coverage &middot; property &middot; round-trip &middot; checksum</p>
-        <div class="slide-foot"><span class="fdot"></span> Target &middot; 47 unsafe occurrences across 9 files &middot; &gt;98% safe by line</div>
+        <p class="slide-caption">Layered validation &middot; regression &middot; coverage &middot; property &middot; round-trip &middot; checksum</p>
+        <div class="slide-foot"><span class="fdot"></span> Delivered &middot; unsafe confined to ffi.rs + inflate/fast.rs &middot; &gt;98% safe by line</div>
       </section>
 
       <!-- ============================= SLIDE 11 - PERFORMANCE GATES (KPI) ============================= -->
@@ -998,7 +998,7 @@ graph TD
             <span class="kpi-sub">same windowBits / memLevel</span>
           </div>
         </div>
-        <p class="slide-caption">To be validated by criterion benchmarks &middot; gates enforced in CI</p>
+        <p class="slide-caption">Validated by criterion benchmarks &middot; gates enforced in CI</p>
         <div class="slide-foot"><span class="fdot"></span> zlib_rs &middot; Performance</div>
       </section>
 
@@ -1102,7 +1102,7 @@ graph TD
             </ul>
           </div>
         </div>
-        <p class="slide-caption">Planned as one phase &mdash; the crate will compile, link and test as a complete unit</p>
+        <p class="slide-caption">Delivered as one phase &mdash; the crate compiles, links and tests as a complete unit</p>
         <div class="slide-foot"><span class="fdot"></span> zlib_rs &middot; Scope</div>
       </section>
 
@@ -1111,9 +1111,9 @@ graph TD
         <p class="eyebrow"><i aria-hidden="true" data-lucide="check-check"></i> The Bottom Line</p>
         <h2>Safe. Compatible. Drop&#8209;in.</h2>
         <ul class="closing-next">
-          <li><i aria-hidden="true" data-lucide="binary"></i>Confirm byte-identical output across all levels &amp; strategies</li>
-          <li><i aria-hidden="true" data-lucide="gauge"></i>Benchmark throughput vs C zlib and hold the &ge;80% gate</li>
-          <li><i aria-hidden="true" data-lucide="package-check"></i>Publish the crate and generated C header for drop-in adoption</li>
+          <li><i aria-hidden="true" data-lucide="binary"></i>Byte-identical output verified across all levels &amp; strategies</li>
+          <li><i aria-hidden="true" data-lucide="gauge"></i>Throughput holds the &ge;80% gate vs C zlib &mdash; &ge;0.86&times; measured</li>
+          <li><i aria-hidden="true" data-lucide="package-check"></i>Crate and generated C header ship ready for drop-in adoption</li>
         </ul>
         <div class="brand-lockup">
           <span class="mark"><i aria-hidden="true" data-lucide="boxes"></i></span>

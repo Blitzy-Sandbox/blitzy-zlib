@@ -43,11 +43,11 @@
 //! doubled allocation is preserved verbatim for byte-for-byte parity with C and
 //! so a future `ffi.rs` direct-format path can rely on it.
 
-use std::io::Write;
+use std::io::{self, Write};
 
 use crate::constants::{
     DEF_MEM_LEVEL, FlushMode, MAX_WBITS, Z_BLOCK, Z_DATA_ERROR, Z_DEFLATED, Z_ERRNO, Z_FINISH,
-    Z_MEM_ERROR, Z_NO_FLUSH, Z_OK, Z_STREAM_ERROR,
+    Z_MEM_ERROR, Z_NO_FLUSH, Z_OK, Z_STREAM_ERROR, Z_SYNC_FLUSH,
 };
 use crate::deflate::state::DeflateStream;
 use crate::deflate::{deflate, deflate_end, deflate_init2, deflate_params, deflate_reset};
@@ -861,6 +861,90 @@ pub fn gzclose_w(state: &mut GzState) -> i32 {
     // mark closed so a subsequent Drop early-returns without re-finalizing
     state.mark_closed();
     ret
+}
+
+// ===========================================================================
+// Idiomatic adapter — `impl std::io::Write` for the gzip write side
+// ===========================================================================
+
+/// An idiomatic [`Write`] adapter over a write-mode [`GzState`].
+///
+/// This realises the "`impl Write` for the gzip layer" goal (AAP §0.3.2): it
+/// lets a gzip file be produced with the full standard-library writer ecosystem
+/// (`write!`, `write_all`, `io::copy`, …) while delegating all gzip framing and
+/// DEFLATE compression to the faithful `gz_*` port above. It is the write-side
+/// counterpart to [`GzReader`](crate::gz::read::GzReader).
+///
+/// It borrows the state mutably for its lifetime; construct one with
+/// [`GzWriter::new`] from a `&mut GzState` obtained from a write-mode `gzopen`
+/// path. Dropping the `GzWriter` does **not** finalise the gzip stream — the
+/// owning [`GzState`] still owns the file and emits the trailer on `gzclose_w`
+/// / its `Drop` safety net — so callers should `gzclose` (or `flush`) to commit
+/// pending output, exactly as with the C API.
+pub struct GzWriter<'a> {
+    state: &'a mut GzState,
+}
+
+impl<'a> GzWriter<'a> {
+    /// Wrap a mutable [`GzState`] as a [`Write`] adapter.
+    #[inline]
+    #[must_use]
+    pub fn new(state: &'a mut GzState) -> Self {
+        GzWriter { state }
+    }
+
+    /// Borrow the underlying [`GzState`].
+    #[inline]
+    #[must_use]
+    pub fn get_ref(&self) -> &GzState {
+        self.state
+    }
+
+    /// Mutably borrow the underlying [`GzState`].
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut GzState {
+        self.state
+    }
+}
+
+impl Write for GzWriter<'_> {
+    /// Compress and write `buf`, delegating to [`gzwrite`].
+    ///
+    /// [`gzwrite`] buffers/compresses the whole slice and returns the number of
+    /// uncompressed bytes accepted (always `buf.len()` on success) or `0` on
+    /// error. This maps onto [`io::Result`]: an empty input is `Ok(0)`; a `0`
+    /// return for a non-empty input is a latched stream error and becomes an
+    /// [`io::Error`]; otherwise the accepted count is returned (matching the
+    /// [`Write`] contract, which permits a partial count even though `gzwrite`
+    /// always accepts the entire slice).
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let n = gzwrite(self.state, buf);
+        if n == 0 {
+            // For a non-empty buffer, `gzwrite` returns 0 only on error.
+            return Err(io::Error::other(self.state.error_message().to_string()));
+        }
+        Ok(n as usize)
+    }
+
+    /// Flush pending compressed output to the underlying file via [`gzflush`]
+    /// with `Z_SYNC_FLUSH`.
+    ///
+    /// `Z_SYNC_FLUSH` forces all buffered input through the deflate engine and
+    /// out to the file while keeping the stream open for further writes — the
+    /// natural mapping of the [`Write::flush`] contract onto the gzip writer.
+    /// (Finalising the gzip member — the `Z_FINISH` flush plus the CRC-32 +
+    /// ISIZE trailer — happens on `gzclose_w`, not here.) A non-`Z_OK` result
+    /// is surfaced as an [`io::Error`].
+    fn flush(&mut self) -> io::Result<()> {
+        let rc = gzflush(self.state, Z_SYNC_FLUSH);
+        if rc != Z_OK {
+            return Err(io::Error::other(self.state.error_message().to_string()));
+        }
+        Ok(())
+    }
 }
 
 // ===========================================================================

@@ -2178,19 +2178,17 @@ pub unsafe extern "C" fn compress2_z(
         }
         // SAFETY: `destLen` is a valid in/out `z_size_t` per the contract.
         let cap = unsafe { *destLen };
-        let dest_slice = if dest.is_null() {
-            &mut [][..]
-        } else {
-            // SAFETY: `dest` is valid for `cap` bytes per the C contract; a null
-            // pointer is handled above by degrading to an empty slice.
-            unsafe { core::slice::from_raw_parts_mut(dest, cap) }
-        };
-        let src_slice = if source.is_null() {
-            &[][..]
-        } else {
-            // SAFETY: `source` is valid for `sourceLen` bytes per the C
-            // contract; a null pointer degrades to an empty slice above.
-            unsafe { core::slice::from_raw_parts(source, sourceLen) }
+        // Validate the buffers with the same null+length rule as the `uLong`-typed
+        // `compress2` (via `mut_buf`/`const_buf`): a null pointer is valid ONLY
+        // with a zero length, so `(*destLen > 0 && dest == NULL)` and
+        // `(sourceLen > 0 && source == NULL)` are rejected with `Z_STREAM_ERROR`,
+        // matching C zlib instead of silently treating the input as empty.
+        // SAFETY: when non-null, each pointer is valid for its advertised length
+        // per the C contract.
+        let (Some(dest_slice), Some(src_slice)) = (unsafe { mut_buf(dest, cap) }, unsafe {
+            const_buf(source, sourceLen)
+        }) else {
+            return Z_STREAM_ERROR;
         };
         match ueng::compress2_to_buf(dest_slice, src_slice, level) {
             Ok(produced) => {
@@ -2218,19 +2216,17 @@ pub unsafe extern "C" fn compress_z(
         }
         // SAFETY: `destLen` is a valid in/out `z_size_t` per the contract.
         let cap = unsafe { *destLen };
-        let dest_slice = if dest.is_null() {
-            &mut [][..]
-        } else {
-            // SAFETY: `dest` is valid for `cap` bytes per the C contract; a null
-            // pointer is handled above by degrading to an empty slice.
-            unsafe { core::slice::from_raw_parts_mut(dest, cap) }
-        };
-        let src_slice = if source.is_null() {
-            &[][..]
-        } else {
-            // SAFETY: `source` is valid for `sourceLen` bytes per the C
-            // contract; a null pointer degrades to an empty slice above.
-            unsafe { core::slice::from_raw_parts(source, sourceLen) }
+        // Validate the buffers with the same null+length rule as the `uLong`-typed
+        // `compress` path (via `mut_buf`/`const_buf`): a null pointer is valid ONLY
+        // with a zero length, so `(*destLen > 0 && dest == NULL)` and
+        // `(sourceLen > 0 && source == NULL)` are rejected with `Z_STREAM_ERROR`,
+        // matching C zlib instead of silently treating the input as empty.
+        // SAFETY: when non-null, each pointer is valid for its advertised length
+        // per the C contract.
+        let (Some(dest_slice), Some(src_slice)) = (unsafe { mut_buf(dest, cap) }, unsafe {
+            const_buf(source, sourceLen)
+        }) else {
+            return Z_STREAM_ERROR;
         };
         match ueng::compress_to_buf(dest_slice, src_slice) {
             Ok(produced) => {
@@ -2264,19 +2260,17 @@ pub unsafe extern "C" fn uncompress_z(
         }
         // SAFETY: `destLen` is a valid in/out `z_size_t` per the contract.
         let cap = unsafe { *destLen };
-        let dest_slice = if dest.is_null() {
-            &mut [][..]
-        } else {
-            // SAFETY: `dest` is valid for `cap` bytes per the C contract; a null
-            // pointer is handled above by degrading to an empty slice.
-            unsafe { core::slice::from_raw_parts_mut(dest, cap) }
-        };
-        let src_slice = if source.is_null() {
-            &[][..]
-        } else {
-            // SAFETY: `source` is valid for `sourceLen` bytes per the C
-            // contract; a null pointer degrades to an empty slice above.
-            unsafe { core::slice::from_raw_parts(source, sourceLen) }
+        // Validate the buffers with the same null+length rule as the `uLong`-typed
+        // `uncompress` (via `mut_buf`/`const_buf`): a null pointer is valid ONLY
+        // with a zero length, so `(*destLen > 0 && dest == NULL)` and
+        // `(sourceLen > 0 && source == NULL)` are rejected with `Z_STREAM_ERROR`,
+        // matching C zlib instead of silently treating the input as empty.
+        // SAFETY: when non-null, each pointer is valid for its advertised length
+        // per the C contract.
+        let (Some(dest_slice), Some(src_slice)) = (unsafe { mut_buf(dest, cap) }, unsafe {
+            const_buf(source, sourceLen)
+        }) else {
+            return Z_STREAM_ERROR;
         };
         match ueng::uncompress_to_buf(dest_slice, src_slice) {
             Ok((produced, _consumed)) => {
@@ -2306,19 +2300,17 @@ pub unsafe extern "C" fn uncompress2_z(
         // contract.
         let cap = unsafe { *destLen };
         let src_len = unsafe { *sourceLen };
-        let dest_slice = if dest.is_null() {
-            &mut [][..]
-        } else {
-            // SAFETY: `dest` is valid for `cap` bytes per the C contract; a null
-            // pointer is handled above by degrading to an empty slice.
-            unsafe { core::slice::from_raw_parts_mut(dest, cap) }
-        };
-        let src_slice = if source.is_null() {
-            &[][..]
-        } else {
-            // SAFETY: `source` is valid for `src_len` bytes per the C contract;
-            // a null pointer degrades to an empty slice above.
-            unsafe { core::slice::from_raw_parts(source, src_len) }
+        // Validate the buffers with the same null+length rule as the `uLong`-typed
+        // `uncompress2` (via `mut_buf`/`const_buf`): a null pointer is valid ONLY
+        // with a zero length, so `(*destLen > 0 && dest == NULL)` and
+        // `(*sourceLen > 0 && source == NULL)` are rejected with `Z_STREAM_ERROR`,
+        // matching C zlib instead of silently treating the input as empty.
+        // SAFETY: when non-null, each pointer is valid for its advertised length
+        // per the C contract.
+        let (Some(dest_slice), Some(src_slice)) = (unsafe { mut_buf(dest, cap) }, unsafe {
+            const_buf(source, src_len)
+        }) else {
+            return Z_STREAM_ERROR;
         };
         match ueng::uncompress2_to_buf(dest_slice, src_slice) {
             Ok((produced, consumed)) => {
@@ -2967,84 +2959,70 @@ pub unsafe extern "C" fn zlibrs_gzprintf_write(
 }
 
 // ---------------------------------------------------------------------------
-// Variadic `gzprintf` / `gzvprintf` — exported trampolines into the C shim.
+// Variadic `gzprintf` / `gzvprintf` — defined directly in the C shim.
 //
 // These two canonical zlib symbols are VARIADIC (`...` / `va_list`), which
-// stable Rust cannot express (`c_variadic` is unstable). The actual variadic
-// capture + `vsnprintf` formatting therefore lives in the C shim
-// `csrc/gzprintf.c` as `zlibrs_gzprintf_impl` / `zlibrs_gzvprintf_impl`.
+// stable Rust can neither DEFINE nor read (`c_variadic` is unstable and would
+// break the crate's edition-2024 stable 1.85 MSRV). They are therefore defined
+// in the self-authored C shim `csrc/gzprintf.c` — under their real, canonical
+// names `gzprintf` / `gzvprintf` — which captures the variadic arguments with
+// genuine C `va_start` / `vsnprintf`, formats into a bounded buffer, and then
+// calls back into the safe-Rust engine via `zlibrs_gzprintf_write` (above) to
+// perform the compressed write. The C shim is compiled and linked by `build.rs`
+// only under the `capi` + `gz-io` features.
 //
-// A C function cannot simply be named `gzprintf` and be done with it: rustc
-// builds the `cdylib`'s linker version script from the crate's Rust
-// `#[no_mangle]` items and localizes everything else (`local: *;`), so a
-// C-defined `gzprintf` would be present in the archive yet ABSENT from the
-// shared object's dynamic symbol table — not callable by a `dlopen`/link-time
-// C consumer. To make the canonical symbol a first-class export of BOTH the
-// `cdylib` and the `staticlib`, the public `gzprintf` / `gzvprintf` are defined
-// HERE as Rust `#[no_mangle]` symbols, so rustc adds them to the export set.
+// EXPORT NOTE (cdylib): a `staticlib` (`.a`) archives the shim object, so the
+// symbols are present in the static drop-in automatically. A `cdylib`, however,
+// only exports the items rustc places in its generated export list (the crate's
+// own `#[no_mangle]` Rust items); everything else is localized by `local: *;`.
+// `build.rs` therefore force-exports `gzprintf` / `gzvprintf` from the cdylib
+// (an `--undefined` root plus a generated `--version-script` on ELF targets,
+// with the equivalent additive linker flags on mach-o / MSVC), so both
+// canonical symbols are first-class exports of the `cdylib` and `staticlib`
+// drop-in alike. See `compile_gzprintf_shim` in `build.rs`.
 //
-// Each is a `#[unsafe(naked)]` function whose entire body is a single tail
-// `jmp` to the C implementation. A naked tail-jump emits NO prologue/epilogue
-// and touches NO registers, so every argument register (the integer registers
-// `rdi, rsi, rdx, rcx, r8, r9`, the vector registers, the variadic count in
-// `al`, and any stack arguments) is forwarded to the C implementation exactly
-// as the caller set it — i.e. the variadic arguments pass through untouched —
-// and the C implementation's `ret` returns straight to the original caller.
-// The result is a zero-overhead, ABI-exact bridge: a true variadic `gzprintf`
-// that is also an exported symbol of the drop-in library.
+// MSRV NOTE: defining these in C (rather than via a `#[unsafe(naked)]` Rust
+// trampoline, whose `naked_asm!` was only stabilized in Rust 1.88) is what
+// keeps the optional `capi` drop-in buildable on the crate's declared Rust
+// 1.85 MSRV. The only extra build requirement for `capi` is a C compiler for
+// the shim — see `Cargo.toml`.
 //
-// MSRV NOTE: naked functions (`#[unsafe(naked)]` / `core::arch::naked_asm!`)
-// were stabilized in Rust 1.88. They are used ONLY under the optional,
-// non-default `capi` drop-in feature; the default pure-Rust library keeps the
-// crate's declared 1.85 MSRV. The `capi` feature therefore requires Rust
-// >= 1.88 (and a C compiler for the shim) — see `Cargo.toml`.
+// The Rust side exposes ONLY the non-variadic byte-writer
+// `zlibrs_gzprintf_write` (above); there is intentionally no Rust definition of
+// `gzprintf` / `gzvprintf` here.
 // ---------------------------------------------------------------------------
 
-// The C-shim implementations. Only their *addresses* are needed (taken via the
-// `sym` operand below), so they are declared as bare externs; the real C
-// signatures are variadic and live in `csrc/gzprintf.c`.
-#[cfg(feature = "gz-io")]
+// The canonical variadic symbols live in `csrc/gzprintf.c` and are compiled in
+// only under `capi` + `gz-io` (see `gzprintf_shim_requested` in `build.rs`).
+// Because no Rust code *calls* them, the linker has no reference that would pull
+// the shim object out of its static archive or keep it under `--gc-sections`.
+// The declarations + `#[used]` anchor below create exactly that reference, on
+// EVERY target, with no linker-flag dependency — separating the portable
+// "pull + keep" concern from the per-target "dynamic export" concern that
+// `build.rs` handles. The gate matches the shim's compile condition precisely,
+// so the default pure-Rust build (which does not compile the shim) never refers
+// to these symbols.
+#[cfg(all(feature = "capi", feature = "gz-io"))]
 unsafe extern "C" {
-    fn zlibrs_gzprintf_impl();
-    fn zlibrs_gzvprintf_impl();
+    /// Canonical variadic `gzprintf`, defined in `csrc/gzprintf.c`. Declared
+    /// here only so its address can anchor the shim object into the link; it is
+    /// never called from Rust (Rust cannot express the C variadic call).
+    fn gzprintf();
+    /// Canonical `gzvprintf` (`va_list` form), defined in `csrc/gzprintf.c`.
+    /// Declared here only to anchor the shim object; never called from Rust.
+    fn gzvprintf();
 }
 
-/// C `gzprintf` — convert, format, compress, and write the variadic arguments
-/// under control of `format`, as in `fprintf` (zlib `gzprintf`). Returns the
-/// number of uncompressed bytes written, `0` if nothing fit in the stream
-/// buffer, or a negative `Z_*` code on error.
-///
-/// This is a naked tail-call trampoline into the C shim
-/// (`zlibrs_gzprintf_impl`) that performs the variadic formatting; see the
-/// module-level note above for why the canonical symbol is defined in Rust.
-#[cfg(feature = "gz-io")]
-#[unsafe(naked)]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn gzprintf(_file: gzFile, _format: *const c_char) -> c_int {
-    // SAFETY: a bare tail `jmp` to the C implementation. No registers are
-    // touched, so all (including variadic) arguments are forwarded verbatim and
-    // the callee's `ret` returns to our caller.
-    core::arch::naked_asm!("jmp {tgt}", tgt = sym zlibrs_gzprintf_impl)
-}
-
-/// C `gzvprintf` — the `va_list` form of [`gzprintf`] (zlib `gzvprintf`). Same
-/// return contract as `gzprintf`.
-///
-/// Naked tail-call trampoline into the C shim (`zlibrs_gzvprintf_impl`); the
-/// `va_list` and all other arguments are forwarded verbatim.
-#[cfg(feature = "gz-io")]
-#[unsafe(naked)]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn gzvprintf(
-    _file: gzFile,
-    _format: *const c_char,
-    _va: *mut c_void,
-) -> c_int {
-    // SAFETY: a bare tail `jmp` to the C implementation; arguments (including
-    // the `va_list`) are forwarded verbatim and the callee's `ret` returns to
-    // our caller.
-    core::arch::naked_asm!("jmp {tgt}", tgt = sym zlibrs_gzvprintf_impl)
-}
+/// Address-holding anchor that forces the `csrc/gzprintf.c` object to be linked
+/// (so the canonical `gzprintf` / `gzvprintf` symbols are present in the
+/// resulting `cdylib`/`staticlib`) and prevents the linker from
+/// garbage-collecting it. `#[used]` keeps the static even though it is never
+/// read; the function pointers it holds are the references the linker resolves
+/// against the C shim archive. This is the portable half of the export story
+/// (the per-target *dynamic export* flags are emitted by `build.rs`).
+#[cfg(all(feature = "capi", feature = "gz-io"))]
+#[used]
+static GZPRINTF_SHIM_ANCHOR: [unsafe extern "C" fn(); 2] = [gzprintf, gzvprintf];
 
 /// C `gzflush` — flush pending output with the given `flush` mode.
 #[cfg(feature = "gz-io")]
@@ -3170,4 +3148,327 @@ pub unsafe extern "C" fn zError(err: c_int) -> *const c_char {
         (2 - err) as usize
     };
     Z_ERRMSG_CSTR[index].as_ptr() as *const c_char
+}
+
+// ===========================================================================
+// Unit tests — null-pointer contract for the one-shot `_z` entry points
+// ===========================================================================
+//
+// These tests pin the canonical C-zlib pointer/length contract for the
+// `z_size_t`-typed one-shot functions (`compress2_z`, `compress_z`,
+// `uncompress_z`, `uncompress2_z`): a NULL buffer pointer is valid ONLY with a
+// zero length. The invalid `(len > 0 && ptr == NULL)` combination MUST be
+// rejected with `Z_STREAM_ERROR` rather than silently treated as an empty
+// buffer (which could mis-report success or compress an empty stream).
+//
+// The whole `ffi` module is `#![cfg(feature = "capi")]`, so these run in the
+// lib-test binary with the `capi` symbols present. Unlike `tests/interop.rs`,
+// the lib-test binary does NOT link the `flate2`/`libz-sys` dev backend, so the
+// canonical `#[no_mangle]` names do not collide. Invoke them with:
+//
+//     cargo test --lib --features capi
+#[cfg(test)]
+mod ffi_z_null_contract_tests {
+    use super::*;
+
+    /// Plain-text fixture compressed/decompressed by the happy-path assertions.
+    const FIXTURE: &[u8] = b"zlib-rs FFI _z null-contract fixture: the quick brown fox \
+                             jumps over the lazy dog, 0123456789, repeated payload.";
+
+    /// Compress [`FIXTURE`] with `compress2_z` and return the trimmed stream.
+    /// Doubles as the `compress2_z` happy-path check.
+    fn fixture_stream() -> Vec<u8> {
+        let mut out = vec![0u8; ueng::compress_bound(FIXTURE.len()) as usize + 16];
+        let mut out_len: z_size_t = out.len();
+        // SAFETY: `out`/`FIXTURE` are valid for their lengths and `out_len` is a
+        // valid in/out pointer.
+        let rc = unsafe {
+            compress2_z(
+                out.as_mut_ptr(),
+                &mut out_len as *mut z_size_t,
+                FIXTURE.as_ptr(),
+                FIXTURE.len(),
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(rc, Z_OK, "fixture compression must succeed");
+        assert!(out_len > 0, "fixture compression must produce output");
+        out.truncate(out_len);
+        out
+    }
+
+    // --- compress2_z --------------------------------------------------------
+
+    #[test]
+    fn compress2_z_rejects_null_source_with_nonzero_len() {
+        let mut dest = [0u8; 64];
+        let mut dest_len: z_size_t = dest.len();
+        // SAFETY: dest valid; source NULL with non-zero length is the invalid
+        // combination under test.
+        let rc = unsafe {
+            compress2_z(
+                dest.as_mut_ptr(),
+                &mut dest_len as *mut z_size_t,
+                core::ptr::null(),
+                8,
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(
+            rc, Z_STREAM_ERROR,
+            "null source + non-zero len must be rejected"
+        );
+    }
+
+    #[test]
+    fn compress2_z_rejects_null_dest_with_nonzero_len() {
+        let src = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        // Advertises capacity 64 while the destination pointer is NULL.
+        let mut dest_len: z_size_t = 64;
+        // SAFETY: source valid; dest NULL with non-zero capacity is the invalid
+        // combination under test.
+        let rc = unsafe {
+            compress2_z(
+                core::ptr::null_mut(),
+                &mut dest_len as *mut z_size_t,
+                src.as_ptr(),
+                src.len(),
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(
+            rc, Z_STREAM_ERROR,
+            "null dest + non-zero cap must be rejected"
+        );
+    }
+
+    #[test]
+    fn compress2_z_rejects_null_dest_len_pointer() {
+        let src = [1u8, 2, 3, 4];
+        let mut dest = [0u8; 64];
+        // SAFETY: buffers valid; the `destLen` out-pointer itself is NULL.
+        let rc = unsafe {
+            compress2_z(
+                dest.as_mut_ptr(),
+                core::ptr::null_mut(),
+                src.as_ptr(),
+                src.len(),
+                Z_DEFAULT_COMPRESSION,
+            )
+        };
+        assert_eq!(rc, Z_STREAM_ERROR, "null destLen pointer must be rejected");
+    }
+
+    #[test]
+    fn compress2_z_accepts_valid_buffers() {
+        // `fixture_stream` performs and asserts a real `compress2_z` success.
+        assert!(!fixture_stream().is_empty());
+    }
+
+    // --- compress_z ---------------------------------------------------------
+
+    #[test]
+    fn compress_z_rejects_null_source_with_nonzero_len() {
+        let mut dest = [0u8; 64];
+        let mut dest_len: z_size_t = dest.len();
+        // SAFETY: dest valid; source NULL with non-zero length under test.
+        let rc = unsafe {
+            compress_z(
+                dest.as_mut_ptr(),
+                &mut dest_len as *mut z_size_t,
+                core::ptr::null(),
+                8,
+            )
+        };
+        assert_eq!(
+            rc, Z_STREAM_ERROR,
+            "null source + non-zero len must be rejected"
+        );
+    }
+
+    #[test]
+    fn compress_z_rejects_null_dest_with_nonzero_len() {
+        let src = [9u8, 8, 7, 6, 5, 4, 3, 2, 1];
+        let mut dest_len: z_size_t = 64;
+        // SAFETY: source valid; dest NULL with non-zero capacity under test.
+        let rc = unsafe {
+            compress_z(
+                core::ptr::null_mut(),
+                &mut dest_len as *mut z_size_t,
+                src.as_ptr(),
+                src.len(),
+            )
+        };
+        assert_eq!(
+            rc, Z_STREAM_ERROR,
+            "null dest + non-zero cap must be rejected"
+        );
+    }
+
+    #[test]
+    fn compress_z_accepts_valid_buffers() {
+        let mut out = vec![0u8; ueng::compress_bound(FIXTURE.len()) as usize + 16];
+        let mut out_len: z_size_t = out.len();
+        // SAFETY: buffers and out-pointer valid.
+        let rc = unsafe {
+            compress_z(
+                out.as_mut_ptr(),
+                &mut out_len as *mut z_size_t,
+                FIXTURE.as_ptr(),
+                FIXTURE.len(),
+            )
+        };
+        assert_eq!(rc, Z_OK, "valid compress_z must succeed");
+        assert!(out_len > 0);
+    }
+
+    // --- uncompress_z -------------------------------------------------------
+
+    #[test]
+    fn uncompress_z_rejects_null_source_with_nonzero_len() {
+        let mut dest = [0u8; 256];
+        let mut dest_len: z_size_t = dest.len();
+        // SAFETY: dest valid; source NULL with non-zero length under test.
+        let rc = unsafe {
+            uncompress_z(
+                dest.as_mut_ptr(),
+                &mut dest_len as *mut z_size_t,
+                core::ptr::null(),
+                16,
+            )
+        };
+        assert_eq!(
+            rc, Z_STREAM_ERROR,
+            "null source + non-zero len must be rejected"
+        );
+    }
+
+    #[test]
+    fn uncompress_z_rejects_null_dest_with_nonzero_len() {
+        let stream = fixture_stream();
+        let mut dest_len: z_size_t = 256;
+        // SAFETY: source valid; dest NULL with non-zero capacity under test.
+        let rc = unsafe {
+            uncompress_z(
+                core::ptr::null_mut(),
+                &mut dest_len as *mut z_size_t,
+                stream.as_ptr(),
+                stream.len(),
+            )
+        };
+        assert_eq!(
+            rc, Z_STREAM_ERROR,
+            "null dest + non-zero cap must be rejected"
+        );
+    }
+
+    #[test]
+    fn uncompress_z_round_trips_valid_buffers() {
+        let stream = fixture_stream();
+        let mut dest = vec![0u8; FIXTURE.len() + 16];
+        let mut dest_len: z_size_t = dest.len();
+        // SAFETY: all buffers/pointers valid.
+        let rc = unsafe {
+            uncompress_z(
+                dest.as_mut_ptr(),
+                &mut dest_len as *mut z_size_t,
+                stream.as_ptr(),
+                stream.len(),
+            )
+        };
+        assert_eq!(rc, Z_OK, "valid uncompress_z must succeed");
+        assert_eq!(
+            &dest[..dest_len],
+            FIXTURE,
+            "decompressed bytes must match input"
+        );
+    }
+
+    // --- uncompress2_z ------------------------------------------------------
+
+    #[test]
+    fn uncompress2_z_rejects_null_source_with_nonzero_len() {
+        let mut dest = [0u8; 256];
+        let mut dest_len: z_size_t = dest.len();
+        let mut src_len: z_size_t = 16; // non-zero, but source is NULL
+        // SAFETY: dest + both out-pointers valid; source NULL with non-zero
+        // length is the invalid combination under test.
+        let rc = unsafe {
+            uncompress2_z(
+                dest.as_mut_ptr(),
+                &mut dest_len as *mut z_size_t,
+                core::ptr::null(),
+                &mut src_len as *mut z_size_t,
+            )
+        };
+        assert_eq!(
+            rc, Z_STREAM_ERROR,
+            "null source + non-zero len must be rejected"
+        );
+    }
+
+    #[test]
+    fn uncompress2_z_rejects_null_dest_with_nonzero_len() {
+        let stream = fixture_stream();
+        let mut dest_len: z_size_t = 256;
+        let mut src_len: z_size_t = stream.len();
+        // SAFETY: source + both out-pointers valid; dest NULL with non-zero
+        // capacity is the invalid combination under test.
+        let rc = unsafe {
+            uncompress2_z(
+                core::ptr::null_mut(),
+                &mut dest_len as *mut z_size_t,
+                stream.as_ptr(),
+                &mut src_len as *mut z_size_t,
+            )
+        };
+        assert_eq!(
+            rc, Z_STREAM_ERROR,
+            "null dest + non-zero cap must be rejected"
+        );
+    }
+
+    #[test]
+    fn uncompress2_z_rejects_null_source_len_pointer() {
+        let stream = fixture_stream();
+        let mut dest = vec![0u8; FIXTURE.len() + 16];
+        let mut dest_len: z_size_t = dest.len();
+        // SAFETY: dest + source valid; the `sourceLen` out-pointer is NULL.
+        let rc = unsafe {
+            uncompress2_z(
+                dest.as_mut_ptr(),
+                &mut dest_len as *mut z_size_t,
+                stream.as_ptr(),
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(
+            rc, Z_STREAM_ERROR,
+            "null sourceLen pointer must be rejected"
+        );
+    }
+
+    #[test]
+    fn uncompress2_z_round_trips_valid_buffers() {
+        let stream = fixture_stream();
+        let mut dest = vec![0u8; FIXTURE.len() + 16];
+        let mut dest_len: z_size_t = dest.len();
+        let mut src_len: z_size_t = stream.len();
+        // SAFETY: all buffers/pointers valid.
+        let rc = unsafe {
+            uncompress2_z(
+                dest.as_mut_ptr(),
+                &mut dest_len as *mut z_size_t,
+                stream.as_ptr(),
+                &mut src_len as *mut z_size_t,
+            )
+        };
+        assert_eq!(rc, Z_OK, "valid uncompress2_z must succeed");
+        assert_eq!(
+            &dest[..dest_len],
+            FIXTURE,
+            "decompressed bytes must match input"
+        );
+        assert_eq!(src_len, stream.len(), "all input must be consumed");
+    }
 }

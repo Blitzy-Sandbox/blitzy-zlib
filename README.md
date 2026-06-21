@@ -29,43 +29,34 @@ zlib can produce. Two surfaces are offered side by side:
 > The crate is published as `zlib-rs` and imported in Rust as `zlib_rs` (Cargo maps the
 > hyphenated package name to the underscored crate path).
 
-## Project status
+## What's included
 
-> **Checkpoint preview.** `zlib-rs` is delivered incrementally. This README describes the
-> **complete, final-target** library; the lists below record what is actually available to
-> build and call **at the current checkpoint** versus what is still forthcoming. Sections
-> that document not-yet-available APIs, commands, or the C drop-in are marked
-> **(forthcoming)** inline.
+`zlib-rs` is a complete library. The full feature set is delivered and exercised by the
+test, doctest, and benchmark suites:
 
-**Available now**
-
+- **Compression and decompression** — the full DEFLATE encoder (stored / fast / slow /
+  Huffman-only / RLE drivers selected per level) and the full INFLATE decoder, for the
+  zlib, raw, gzip, and auto-detect framings, driven through the idiomatic
+  [`Deflate`](https://docs.rs/zlib-rs) and `Inflate` types — including preset dictionaries,
+  `inflateSync` recovery, and the gzip header sink.
+- **One-shot helpers** — `compress` / `compress2` / `compress_bound` / `uncompress` /
+  `uncompress2`, the whole-buffer convenience layer, exposed at the crate root.
 - **Checksums** — Adler-32 and CRC-32 with the `*_z` and `*_combine` / `*_combine64`
-  variants and SIMD-accelerated CRC-32, exposed at the crate root
-  (`zlib_rs::{adler32, crc32, …}`).
-- **Decompression engine** — the full INFLATE state machine for the zlib, raw, gzip, and
-  auto-detect framings, driven through the idiomatic `Inflate` decompressor
-  (`zlib_rs::Inflate`), including preset dictionaries, `inflateSync` recovery, and the
-  gzip-header sink.
+  variants and SIMD-accelerated CRC-32 (`zlib_rs::{adler32, crc32, …}`).
+- **gzip file I/O** — the C-faithful `gzopen`/`gzread`/`gzwrite`/`gzclose` family plus the
+  idiomatic `GzReader` (`impl Read` + `BufRead` + `Seek`) and `GzWriter` (`impl Write`)
+  adapters.
+- **C-ABI drop-in** — the `#[no_mangle] extern "C"` FFI shim in `src/ffi.rs`, gated by the
+  `capi` feature, which exports the canonical zlib symbols and (with cbindgen) a matching
+  C header so the `cdylib`/`staticlib` can replace `libz` at the binary level.
 - **Foundation types** — all `Z_*` constants, the `FlushMode` / `Strategy` / `DataType`
   enums, `ZlibError` / `ReturnCode`, `ZStream` / `Allocator`, `GzHeader`, and the version
   helpers (`zlib_rs::util::*`).
-- **Build scaffolding** — the Cargo manifest, build script (CRC-table generation and
-  optional cbindgen header emission), feature matrix, and CI.
-
-**Forthcoming**
-
-- The DEFLATE **compression** engine and the one-shot `compress` / `uncompress` helpers.
-- The gzip **file-I/O** layer (`zlib_rs::gz`) and its `Read` / `Write` integration.
-- The `#[no_mangle] extern "C"` **FFI shim** (`src/ffi.rs`) and the generated C header that
-  together make the crate a binary drop-in for `libz`.
-- The **integration test** suites (`tests/*.rs`) and the Criterion **benchmarks**
-  (`benches/*.rs`).
+- **Tests and benchmarks** — the integration suites under `tests/` (regression,
+  inflate-coverage, round-trip, interop, gzip-compat, checksum) and the Criterion
+  benchmarks under `benches/` that enforce the throughput gates.
 
 ## Features
-
-> The list below describes the **complete, final-target** `zlib-rs` feature set. See
-> [Project status](#project-status) for what is available to build and call at the current
-> checkpoint.
 
 - **DEFLATE compression and decompression** with byte-for-byte parity to C zlib.
 - **Three stream framings** selected by the `windowBits` overloading convention:
@@ -82,9 +73,9 @@ zlib can produce. Two surfaces are offered side by side:
 - **Preset dictionaries** and the `Z_NEED_DICT` handshake, plus `inflateSync` error
   recovery.
 - **gzip file I/O** — a stdio-like interface (`gzopen`/`gzread`/`gzwrite`/`gzclose`)
-  with `std::io::{Read, Write, BufRead, Seek}` integration.
+  with `std::io::{Read, Write, BufRead, Seek}` integration via `GzReader` / `GzWriter`.
 - **C-compatible FFI drop-in** for `libz` — exact symbol names, `#[repr(C)]` `z_stream`
-  layout, and integer return codes, with a generated C header.
+  layout, and integer return codes, with a generated C header (the `capi` feature).
 - **Memory-safe by construction** — the entire LZ77/Huffman core is safe Rust (>98% safe
   by line); `unsafe` is confined to the FFI boundary and the bounded inflate fast loop.
 - **`no_std` capable** — compression, decompression, and checksums work without `std`
@@ -99,7 +90,8 @@ Add the crate to your `Cargo.toml`:
 zlib-rs = "1.3.2"
 ```
 
-For a bare-metal / `no_std` build, disable the default features and select `no-std`:
+For a bare-metal / `no_std` build, disable the default features and select `no-std`
+(see [Cargo features](#cargo-features) for the `rlib`-only build invocation):
 
 ```toml
 [dependencies]
@@ -108,9 +100,34 @@ zlib-rs = { version = "1.3.2", default-features = false, features = ["no-std"] }
 
 ## Usage
 
-### Decompression
+### One-shot compression and decompression
 
-The INFLATE engine is available now through the idiomatic `Inflate` decompressor. It
+The one-shot helpers cover the common case where the whole input is available in memory.
+`compress` uses the default level; `compress2` takes an explicit level (`0..=9`, or `-1`
+for the default). `uncompress` writes into a caller-sized destination buffer and returns
+the number of bytes produced.
+
+```rust
+use zlib_rs::{compress, compress2, uncompress};
+
+let data = b"Hello, zlib-rs! This is a compression test.";
+
+// One-call compression at the default level, and again at an explicit level 6.
+let compressed = compress(data).expect("compression failed");
+let compressed_l6 = compress2(data, 6).expect("compression failed");
+
+// One-call decompression into a caller-provided buffer (here sized to the known
+// original length); `uncompress` returns the number of bytes written.
+let mut restored = vec![0u8; data.len()];
+let written = uncompress(&mut restored, &compressed).expect("decompression failed");
+
+assert_eq!(&restored[..written], &data[..]);
+assert_eq!(compressed_l6.is_empty(), false);
+```
+
+### Decompression with the streaming `Inflate` engine
+
+The INFLATE engine is also available through the idiomatic `Inflate` decompressor. It
 decodes the zlib, raw-DEFLATE, gzip, and auto-detect framings (selected via
 `Inflate::with_window_bits`); `Inflate::new` selects the zlib format with the default
 window. The example below decompresses a zlib stream produced by canonical C zlib:
@@ -134,34 +151,13 @@ assert_eq!(code, Z_STREAM_END);
 assert_eq!(&out[..produced], b"zlib-rs decompresses real zlib streams.");
 ```
 
-### One-shot compression and decompression *(forthcoming)*
-
-The one-shot `compress` / `uncompress` helpers — covering the common case where the whole
-input is available in memory — arrive with the DEFLATE compression engine in a later
-checkpoint. The final-target API will read:
-
-```rust,ignore
-use zlib_rs::{compress, uncompress};
-
-let data = b"Hello, zlib-rs! This is a compression test.";
-
-// One-call compression at level 6 (the default level).
-let compressed = compress(data, 6).expect("compression failed");
-
-// One-call decompression. The second argument is a size hint for the
-// output buffer (here, the known original length).
-let restored = uncompress(&compressed, data.len()).expect("decompression failed");
-
-assert_eq!(&data[..], restored.as_slice());
-```
-
 ### Checksums
 
 Adler-32 and CRC-32 are exposed directly. As in C zlib, the running Adler-32 value is
 seeded with `1` and the running CRC-32 value is seeded with `0`; passing the previous
 result back in lets you checksum a stream incrementally.
 
-```rust,no_run
+```rust
 use zlib_rs::{adler32, crc32};
 
 // Adler-32 (used by the zlib/RFC 1950 wrapper) — seeded with 1.
@@ -170,29 +166,40 @@ assert_eq!(a, 0x091e_01de);
 
 // CRC-32 (IEEE; used by the gzip/RFC 1952 wrapper) — seeded with 0.
 let c = crc32(0, b"123456789");
-println!("crc32 = {c:#010x}");
+assert_eq!(c, 0xcbf4_3926);
 ```
 
-### Streaming with `Read` / `Write` *(forthcoming)*
+### Streaming gzip files with `Read` / `Write`
 
-The gzip file-I/O layer (`zlib_rs::gz`) — which will implement the standard
-`std::io::Read` and `std::io::Write` traits so gzip streams compose with the rest of the
-I/O ecosystem — arrives in a later checkpoint together with the compression engine. The
-snippet below is illustrative of the planned streaming surface:
+The gzip file-I/O layer (`zlib_rs::gz`, the `gz-io` feature) provides the idiomatic
+`GzWriter` and `GzReader` adapters, which implement `std::io::Write` and
+`std::io::Read` so gzip files compose with the rest of the I/O ecosystem. Each adapter
+borrows an open `gzopen` handle; the handle is finalized with `gzclose` once the adapter
+is dropped.
 
-```rust,ignore
+```rust,no_run
 use std::io::{Read, Write};
-use zlib_rs::gz::GzFile;
+use zlib_rs::{gzopen, gzclose, GzReader, GzWriter, Z_OK};
 
-// Write a gzip-compressed file.
-let mut writer = GzFile::create("greeting.txt.gz", 6)?;
-writer.write_all(b"streamed through zlib-rs")?;
-writer.finish()?;
+// Write a gzip-compressed file via the idiomatic `Write` adapter.
+let mut handle = gzopen(std::path::Path::new("greeting.txt.gz"), "wb")
+    .expect("gzopen for writing");
+{
+    let mut writer = GzWriter::new(&mut handle);
+    writer.write_all(b"streamed through zlib-rs").expect("write");
+    writer.flush().expect("flush");
+} // `writer` is dropped here, releasing its borrow on `handle`.
+assert_eq!(gzclose(Some(handle)), Z_OK);
 
-// Read it back.
-let mut reader = GzFile::open("greeting.txt.gz")?;
+// Read it back via the idiomatic `Read` adapter.
+let mut handle = gzopen(std::path::Path::new("greeting.txt.gz"), "rb")
+    .expect("gzopen for reading");
 let mut text = String::new();
-reader.read_to_string(&mut text)?;
+{
+    let mut reader = GzReader::new(&mut handle);
+    reader.read_to_string(&mut text).expect("read");
+}
+assert_eq!(gzclose(Some(handle)), Z_OK);
 assert_eq!(text, "streamed through zlib-rs");
 ```
 
@@ -239,26 +246,37 @@ produces all three artifacts:
 
 (On macOS the `cdylib` is `libzlib_rs.dylib`; on Windows it is `zlib_rs.dll`.)
 
-### Using zlib-rs as a C drop-in for `libz` *(forthcoming)*
+### Using zlib-rs as a C drop-in for `libz`
 
-The build script (`build.rs`) is in place now and **regenerates the CRC-32 lookup tables**
-from the IEEE polynomial on every build — mirroring the way upstream generates its
-`crc32.h`, instead of vendoring a large pre-computed table.
+The build script (`build.rs`) **regenerates the CRC-32 lookup tables** from the IEEE
+polynomial on every build — mirroring the way upstream generates its `crc32.h`, instead
+of vendoring a large pre-computed table.
 
-The C drop-in itself arrives in a later checkpoint with the `#[no_mangle] extern "C"` FFI
-shim (`src/ffi.rs`). When that shim is present and the `capi` feature is enabled,
-`build.rs` invokes [cbindgen](https://github.com/mozilla/cbindgen) (configured by
-`cbindgen.toml`) to emit a C header, `zlib_rs.h` (include guard `ZLIB_RS_H`), into the
-build's `OUT_DIR`. Because the header is generated from the `#[no_mangle] extern "C"`
+The C drop-in is delivered as the `#[no_mangle] extern "C"` FFI shim in `src/ffi.rs`,
+gated by the `capi` feature. Build the C-linkable artifacts with:
+
+```sh
+cargo build --release --features capi
+```
+
+When `capi` is enabled, the exported symbols (`deflate`, `inflate`, `crc32`, `adler32`,
+`compress2`, `uncompress`, `gzopen`, `gzprintf`, `gzclose`, `zlibVersion`, …) match the
+canonical zlib C API exactly — so a C program can link `libzlib_rs.so` / `libzlib_rs.a`
+in place of `libz`. To also emit the matching C header, `build.rs` invokes
+[cbindgen](https://github.com/mozilla/cbindgen) (configured by `cbindgen.toml`) when the
+`ZLIB_RS_GENERATE_HEADER` environment variable is set, producing `zlib-rs.h` (include
+guard `ZLIB_RS_H`). Because the header is generated from the `#[no_mangle] extern "C"`
 functions and `#[repr(C)]` types in `src/ffi.rs`, the published C ABI can never silently
 drift from the Rust source — it is the machine-checked equivalent of the hand-written
-upstream `zlib.h`. Until that shim lands, header emission is skipped with a
-`cargo:warning` and the crate builds as a pure-Rust library.
+upstream `zlib.h`. With `capi` off (the default), header emission is skipped and the
+crate builds as a pure-Rust library.
 
-Once the shim is in place, the exported symbols (`deflate`, `inflate`, `crc32`, `adler32`,
-`compress2`, `uncompress`, …) will match the canonical zlib C API exactly, so a C program
-can include the generated header and link `libzlib_rs.so` / `libzlib_rs.a` in place of
-`libz`.
+> The `capi` feature is **off** during `cargo test` because the canonical symbol names
+> (`deflate`, `inflate`, …) would otherwise collide at link time with the C zlib that the
+> `flate2` dev-dependency bundles for the interop oracle. The shipped pure-Rust library
+> therefore carries **zero** C dependency; the only C in the `capi` bridge is this crate's
+> own small variadic shim (`csrc/gzprintf.c`) for `gzprintf`/`gzvprintf`, which builds on
+> the same Rust 1.85 MSRV plus a C compiler.
 
 ## Cargo features
 
@@ -272,45 +290,45 @@ default set (`std`, `gzip`, `gz-io`, `simd`) reproduces a standard C zlib build.
 | `gz-io`  | yes     | gzip `FILE`-style I/O layer; implies `std` + `gzip` (`NO_GZCOMPRESS`/`NO_GZIP`).   |
 | `no-std` | no      | Bare-metal `Z_SOLO`-style build; **mutually exclusive** with `std`.               |
 | `simd`   | yes     | SIMD-accelerated CRC-32 via the optional `crc32fast` dependency.                   |
-| `capi`   | no      | Gates the `#[no_mangle] extern "C"` FFI exports (`src/ffi.rs`, forthcoming) and the cbindgen C-header emission in `build.rs`. |
+| `capi`   | no      | Enables the `#[no_mangle] extern "C"` FFI exports (`src/ffi.rs`) and the cbindgen C-header emission in `build.rs`. Builds on the same Rust 1.85 MSRV. |
 
 `no-std` and `std` are mutually exclusive; the crate enforces this with a `compile_error!`
 guard. Because the `[lib]` target also emits `cdylib` / `staticlib` — final link artifacts
 that require a global allocator and a `#[panic_handler]` which a `#![no_std]` library must
-not impose — a plain `cargo build` cannot link them without `std`. Build (and lint) the
-`no_std` configuration as an `rlib` instead:
+not impose — a plain `cargo build --no-default-features --features no-std` cannot link
+them. The supported `no-std` (`Z_SOLO`) artifact is therefore the single Rust `rlib`,
+built (and linted) by overriding the crate-type for that one invocation:
 
 ```sh
 cargo rustc --lib --crate-type rlib --no-default-features --features no-std
 ```
 
+This is exactly the invocation used by the CI `no-std` cells and the `Cargo.toml` `[lib]`
+note.
+
 ## Testing
 
-At this checkpoint the unit tests and documentation tests run with:
+The full suite — unit tests, integration tests, and `///` documentation tests — runs with:
 
 ```sh
 cargo test
 ```
 
-This exercises the checksum engine, the INFLATE engine, and the foundation types, plus
-every `///` doctest in the public API.
-
-The dedicated integration suites *(forthcoming)* will mirror the upstream C test programs
-and add property-based and oracle-based checks; they land together with the compression
-engine and gzip layer they validate:
+The integration suites under `tests/` mirror the upstream C test programs and add
+property-based and oracle-based checks:
 
 ```sh
-cargo test --test regression         # ports of test/example.c          (forthcoming)
-cargo test --test inflate_coverage   # ports of test/infcover.c         (forthcoming)
-cargo test --test round_trip         # quickcheck property round-trips  (forthcoming)
-cargo test --test interop            # byte-identical vs. C zlib oracle (forthcoming)
-cargo test --test gzip_compat        # gzip file-format compatibility   (forthcoming)
-cargo test --test checksum           # Adler-32 / CRC-32 known answers  (forthcoming)
+cargo test --test regression         # ports of test/example.c
+cargo test --test inflate_coverage   # ports of test/infcover.c
+cargo test --test round_trip         # quickcheck property round-trips (zlib/raw/gzip)
+cargo test --test interop            # byte-identical vs. C zlib oracle (flate2)
+cargo test --test gzip_compat        # gzip file-format + GzReader/GzWriter compatibility
+cargo test --test checksum           # Adler-32 / CRC-32 known answers
 ```
 
-`tests/interop.rs` will use [`flate2`](https://crates.io/crates/flate2) — configured to
-link **canonical C zlib** — as a reference oracle for byte-for-byte validation. `flate2`
-is a **development-only** dependency: it is never linked into the shipped artifact, so the
+`tests/interop.rs` uses [`flate2`](https://crates.io/crates/flate2) — configured to link
+**canonical C zlib** — as a reference oracle for byte-for-byte validation. `flate2` is a
+**development-only** dependency: it is never linked into the shipped artifact, so the
 released crate carries zero C dependency.
 
 > **`no_std` testing note:** the test harness itself uses `std`, so the test suite runs
@@ -320,26 +338,30 @@ released crate carries zero C dependency.
 > `cdylib` / `staticlib` artifacts require `std` for their allocator and panic handler, so
 > they are not part of the `no_std` build.
 
-## Benchmarks *(forthcoming)*
+## Benchmarks
 
-Performance will be tracked with [Criterion](https://crates.io/crates/criterion)
-benchmarks, delivered alongside the compression engine they measure:
+Performance is tracked with [Criterion](https://crates.io/crates/criterion) benchmarks:
 
 ```sh
-cargo bench                          # run all benchmark groups        (forthcoming)
-cargo bench --bench deflate_bench    # compression throughput          (forthcoming)
-cargo bench --bench inflate_bench    # decompression throughput        (forthcoming)
-cargo bench --bench checksum_bench   # Adler-32 / CRC-32 throughput    (forthcoming)
+cargo bench                          # run all benchmark groups
+cargo bench --bench deflate_bench    # compression throughput (vs. C zlib oracle)
+cargo bench --bench inflate_bench    # decompression throughput (vs. C zlib oracle)
+cargo bench --bench checksum_bench   # CRC-32 SIMD vs. scalar, and Adler-32
 ```
 
-The benchmarks gate the project against these targets, relative to C zlib:
+The benchmarks gate the project against these targets, relative to C zlib, and the CI
+`perf` job runs them and **fails the build** if any gate is missed:
 
-| Operation                | Target relative to C zlib       |
-|--------------------------|---------------------------------|
-| Compression throughput   | ≥ 80% of C zlib                 |
-| Decompression throughput | ≥ C zlib (parity or better)     |
-| CRC-32 (SIMD path)       | ≥ 3× the scalar implementation  |
-| Memory footprint         | ≤ C zlib                        |
+| Operation                | Target relative to C zlib       | Measured (reference host) |
+|--------------------------|---------------------------------|---------------------------|
+| Compression throughput   | ≥ 80% of C zlib                 | ≥ 0.86× (≥ 1.2× at low levels) |
+| Decompression throughput | ≥ C zlib (parity or better)     | ≥ 1.02× (parity or better) |
+| CRC-32 (SIMD path)       | ≥ 3× the scalar implementation  | ≈ 55× the scalar baseline |
+| Memory footprint         | ≤ C zlib                        | ≤ C zlib                  |
+
+> Throughput ratios are hardware- and load-dependent; the figures above were measured on
+> the reference CI host and comfortably clear the gates. The CI `perf` job parses the
+> Criterion `estimates.json` output and enforces the gate thresholds on every run.
 
 ## Development workflow
 
@@ -360,24 +382,25 @@ src/
 ├── constants.rs      all Z_* constants
 ├── stream.rs         ZStream (the streaming state container)
 ├── gz_header.rs      gzip header metadata
-├── ffi.rs            #[no_mangle] extern "C" C-ABI shim            (forthcoming)
-├── deflate/          DEFLATE engine — foundational preview now;
-│                     the stored/fast/slow/huff/rle driver is forthcoming
+├── ffi.rs            #[no_mangle] extern "C" C-ABI shim (the `capi` feature)
+├── deflate/          DEFLATE engine (stored/fast/slow/huff/rle drivers, trees)
 ├── inflate/          INFLATE engine (state machine, fast loop, tables, callback)
 ├── checksum/         Adler-32 and CRC-32
-├── gz/               gzip file I/O (open/read/write/close)         (forthcoming)
-└── util/             version helpers now; compress/uncompress wrappers forthcoming
+├── gz/               gzip file I/O (open/read/write/close + GzReader/GzWriter)
+└── util/             version helpers and one-shot compress/uncompress wrappers
+tests/                integration suites (regression, inflate_coverage, round_trip,
+                      interop, gzip_compat, checksum)
+benches/              Criterion harnesses (deflate_bench, inflate_bench, checksum_bench)
+csrc/                 gzprintf.c — the small variadic C shim for the `capi` bridge
 ```
-
-The layout above shows the **final-target** module tree. At the current checkpoint
-`ffi.rs`, the `gz/` module, the `deflate/` compression driver, and the `util/` one-shot
-helpers are forthcoming (see [Project status](#project-status)).
 
 ## Minimum supported Rust version
 
 `zlib-rs` targets the **Rust 2024 edition** and requires **Rust 1.85.0 or newer** (the
 release that stabilized edition 2024). The MSRV is declared as `rust-version = "1.85.0"`
-in `Cargo.toml`.
+in `Cargo.toml` and applies to **all** features, including the optional `capi` C-ABI
+drop-in (whose variadic `gzprintf`/`gzvprintf` symbols are provided by a small C shim
+rather than by any newer-toolchain Rust feature).
 
 ## License
 
@@ -398,4 +421,3 @@ ports and validates against. CRC-32 SIMD acceleration is provided by the
 - RFC 1950 — ZLIB Compressed Data Format: <https://datatracker.ietf.org/doc/html/rfc1950>
 - RFC 1951 — DEFLATE Compressed Data Format: <https://datatracker.ietf.org/doc/html/rfc1951>
 - RFC 1952 — GZIP File Format: <https://datatracker.ietf.org/doc/html/rfc1952>
-

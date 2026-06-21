@@ -201,17 +201,17 @@ pub use deflate::{Deflate, DeflateOutcome};
 pub use util::{compress, compress_bound, compress2, uncompress, uncompress2};
 
 // The gzip FILE-I/O layer: the owned [`GzFile`] handle, the idiomatic
-// [`GzReader`] adapter (which implements the `std::io` traits), and the
-// C-faithful `gz*` entry points (`gzopen`/`gzread`/`gzwrite`/`gzclose` and
-// friends), lifted to the crate root so the `gzip_compat` integration tests and
-// downstream callers can drive gzip files via `zlib_rs::gzopen(..)`. Gated by
-// `gz-io` (which implies `std` + `gzip`), so this block is compiled out of the
-// `no-std` build automatically.
+// [`GzReader`] / [`GzWriter`] adapters (which implement the `std::io` traits),
+// and the C-faithful `gz*` entry points (`gzopen`/`gzread`/`gzwrite`/`gzclose`
+// and friends), lifted to the crate root so the `gzip_compat` integration tests
+// and downstream callers can drive gzip files via `zlib_rs::gzopen(..)`. Gated
+// by `gz-io` (which implies `std` + `gzip`), so this block is compiled out of
+// the `no-std` build automatically.
 #[cfg(feature = "gz-io")]
 pub use gz::{
-    GzFile, GzReader, gzbuffer, gzclearerr, gzclose, gzdirect, gzdopen, gzeof, gzerror, gzflush,
-    gzgetc, gzgets, gzoffset, gzopen, gzputc, gzputs, gzread, gzrewind, gzseek, gzsetparams,
-    gztell, gzungetc, gzwrite,
+    GzFile, GzReader, GzWriter, gzbuffer, gzclearerr, gzclose, gzdirect, gzdopen, gzeof, gzerror,
+    gzflush, gzgetc, gzgets, gzoffset, gzopen, gzputc, gzputs, gzread, gzrewind, gzseek,
+    gzsetparams, gztell, gzungetc, gzwrite,
 };
 
 // All `Z_*` constants and the typed [`FlushMode`]/[`Strategy`]/[`DataType`]
