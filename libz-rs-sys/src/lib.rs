@@ -2116,7 +2116,7 @@ pub unsafe extern "C" fn gzclearerr(file: gzFile) {
 /// Renders `format` + the variadic arguments into the gz stream's CURRENT
 /// state-sized scratch buffer (honoring any caller `gzbuffer()` resize) and
 /// writes the result, routing through the shared
-/// [`zlib_rs::gz::gz_printf_into`] so the exact C `gzvprintf` overflow and
+/// [`zlib_rs::gz::gz_printf_into`] so the exact C vprintf-style overflow and
 /// accounting discipline is reused rather than re-implemented. Per C zlib,
 /// output that is empty, `size`-or-larger, or whose trailing NUL sentinel was
 /// overwritten is REJECTED: nothing is written and `0` is returned (it is never

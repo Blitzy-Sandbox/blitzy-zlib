@@ -23,6 +23,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <sys/types.h>
 
 /* ----- Items cbindgen cannot synthesize from #[no_mangle] functions ----- */
 /* Library version, mirrored byte-for-byte from canonical zlib.h.           */
@@ -52,15 +53,75 @@
         inflateBackInit_((strm), (windowBits), (window), \
                          ZLIB_VERSION, (int)sizeof(z_stream))
 
-/*
- `Z_ASCII` is the historical alias of [`Z_TEXT`].
- */
-#define Z_ASCII Z_TEXT
+/* ----- Scalar type system (canonical zlib `zconf.h` spellings) ----------- */
+/* These public aliases let existing zlib C consumers that use the documented
+   `uLong`/`Bytef`/`uInt`/... type names compile unchanged against this drop-in
+   header. cbindgen RESOLVES the transparent `pub type` aliases in `zstream.rs`
+   (`Bytef = u8`, `uLong = c_ulong`, ...) down to their underlying C types
+   (`uint8_t`, `unsigned long`, `void *`, `size_t`, `off_t`) in the prototypes
+   below, so these typedefs are purely additive and ABI-identical to that
+   resolution. `z_crc_t` and `z_off64_t` are emitted by cbindgen itself (they
+   alias fixed-width Rust primitives) and are intentionally NOT redefined here. */
+typedef unsigned char Byte;
+typedef Byte Bytef;
+typedef unsigned int uInt;
+typedef uInt uIntf;
+typedef unsigned long uLong;
+typedef uLong uLongf;
+typedef void *voidp;
+typedef const void *voidpc;
+typedef void *voidpf;
+typedef size_t z_size_t;
+typedef off_t z_off_t;
 
-/*
- The numeric ABI version, `0x1321` (the canonical `#define ZLIB_VERNUM`).
- */
-#define ZLIB_VERNUM 4897
+/* ----- Public Z_* constants (mirrored byte-for-byte from canonical zlib.h) - */
+/* These are modeled in `src/lib.rs` as `pub const` whose initializers are enum
+   methods (`Flush::NoFlush.as_i32()`, ...) and cross-crate paths
+   (`zlib_rs::constants::Z_DEFLATED`) that cbindgen CANNOT const-evaluate (it
+   does not run `const fn`s, and `[parse] parse_deps = false` hides the core
+   crate). They are therefore injected here as `#define`s (matching zlib's
+   constant style) and suppressed from cbindgen emission via `[export].exclude`
+   so no dangling/duplicate definition is produced. Values are verbatim from the
+   canonical root `zlib.h` (the REFERENCE ABI contract). */
+/* Allowed flush values. */
+#define Z_NO_FLUSH      0
+#define Z_PARTIAL_FLUSH 1
+#define Z_SYNC_FLUSH    2
+#define Z_FULL_FLUSH    3
+#define Z_FINISH        4
+#define Z_BLOCK         5
+#define Z_TREES         6
+/* Return codes for the compression/decompression functions. Negative values are
+   errors, positive values are used for special but normal events. */
+#define Z_OK            0
+#define Z_STREAM_END    1
+#define Z_NEED_DICT     2
+#define Z_ERRNO        (-1)
+#define Z_STREAM_ERROR (-2)
+#define Z_DATA_ERROR   (-3)
+#define Z_MEM_ERROR    (-4)
+#define Z_BUF_ERROR    (-5)
+#define Z_VERSION_ERROR (-6)
+/* Compression levels. */
+#define Z_NO_COMPRESSION         0
+#define Z_BEST_SPEED             1
+#define Z_BEST_COMPRESSION       9
+#define Z_DEFAULT_COMPRESSION  (-1)
+/* Compression strategies; see deflateInit2() for details. */
+#define Z_FILTERED            1
+#define Z_HUFFMAN_ONLY        2
+#define Z_RLE                 3
+#define Z_FIXED               4
+#define Z_DEFAULT_STRATEGY    0
+/* Possible values of the data_type field for deflate(). */
+#define Z_BINARY   0
+#define Z_TEXT     1
+#define Z_ASCII    Z_TEXT
+#define Z_UNKNOWN  2
+/* The deflate compression method (the only one supported in this version). */
+#define Z_DEFLATED   8
+/* Null sentinel for initializing zalloc, zfree, opaque. */
+#define Z_NULL  0
 
 /*
  Opaque counterpart of the C `struct internal_state;` forward declaration.
@@ -890,7 +951,7 @@ void gzclearerr(gzFile file);
  Renders `format` + the variadic arguments into the gz stream's CURRENT
  state-sized scratch buffer (honoring any caller `gzbuffer()` resize) and
  writes the result, routing through the shared
- [`zlib_rs::gz::gz_printf_into`] so the exact C `gzvprintf` overflow and
+ [`zlib_rs::gz::gz_printf_into`] so the exact C vprintf-style overflow and
  accounting discipline is reused rather than re-implemented. Per C zlib,
  output that is empty, `size`-or-larger, or whose trailing NUL sentinel was
  overwritten is REJECTED: nothing is written and `0` is returned (it is never
