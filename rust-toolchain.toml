@@ -1,0 +1,18 @@
+# Workspace toolchain pin.
+#
+# This project's C-ABI drop-in member (`libz-rs-sys-cdylib`) must export the
+# full 73-symbol `zlib.h` surface (AAP §0.4.1, goal G4), INCLUDING the
+# C-variadic `int gzprintf(gzFile, const char *, ...)`. Defining a C-variadic
+# `extern "C"` function in Rust requires the unstable `#![feature(c_variadic)]`,
+# which is available only on the nightly channel; on a stable toolchain the
+# feature attribute is a hard error (E0554). We therefore pin nightly so the
+# default workspace build produces a true drop-in `libz.so` / `libz.a`.
+#
+# The pure-Rust core (`zlib-rs`) keeps `#![forbid(unsafe_code)]` and compiles
+# unchanged on this toolchain; nightly is required ONLY to *define* the variadic
+# `gzprintf` export in the thin `libz-rs-sys` shim. A consumer who does not need
+# that symbol can build `libz-rs-sys` / `libz-rs-sys-cdylib` with
+# `--no-default-features` (or just `zlib-rs`) on stable.
+[toolchain]
+channel = "nightly"
+components = ["rustfmt", "clippy"]

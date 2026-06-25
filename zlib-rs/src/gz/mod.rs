@@ -399,6 +399,31 @@ pub fn gzvprintf(file: &mut GzFile, args: core::fmt::Arguments<'_>) -> i32 {
     write::gzvprintf(&mut file.0, args)
 }
 
+/// Formatter-agnostic core of `gzprintf` / `gzvprintf`, exposed for the C-ABI
+/// shim (`libz-rs-sys`).
+///
+/// Both [`gzprintf`] and [`gzvprintf`] format through Rust's [`core::fmt`] and
+/// so cannot serve the C-variadic `int gzprintf(gzFile, const char *, ...)`
+/// symbol, which must format with `vsnprintf`. Rather than duplicate the C
+/// `gzvprintf` overflow/accounting discipline in the (unsafe) shim, this
+/// function exposes that single faithful copy: the shim supplies a `render`
+/// closure that runs `vsnprintf` into the provided **state-sized** scratch
+/// region and reports whether the result fit, and all the state gating,
+/// `gz_vacate` book-ending, scratch sizing, the `len == 0 || len >= size`
+/// rejection, and the byte accounting happen here, identically to the safe path.
+///
+/// `render` is handed the scratch slice (length exactly the current
+/// `gzbuffer()` size) and returns `Some(len)` with the formatted byte count, or
+/// `None` if the output did not fit / the formatter errored. See
+/// [`write::gz_printf_into`] for the precise contract. Returns the number of
+/// bytes written, `0` if the output did not fit, or a negative `Z_*` code.
+pub fn gz_printf_into<F>(file: &mut GzFile, render: F) -> i32
+where
+    F: FnOnce(&mut [u8]) -> Option<usize>,
+{
+    write::gz_printf_into(&mut file.0, render)
+}
+
 /// Flush buffered compressed output using the given zlib flush mode
 /// (C `gzflush`).
 pub fn gzflush(file: &mut GzFile, flush: i32) -> i32 {

@@ -2076,33 +2076,43 @@ pub unsafe extern "C" fn gzclearerr(file: gzFile) {
 //
 // `int gzprintf(gzFile, const char *format, ...)` is genuinely C-variadic.
 // Rust can *call* C-variadic functions on stable, but *defining* one requires
-// the unstable `#![feature(c_variadic)]` (nightly only). The AAP pins a STABLE
-// toolchain (edition 2024, MSRV 1.85) and forbids a C dependency, so on the
-// default build this is THE one `zlib.h` symbol we cannot express — it is
-// gated behind the (nightly-only) `c-variadic` feature and OMITTED from the
-// default stable build. The other 72 symbols are fully functional on stable.
+// the unstable `#![feature(c_variadic)]` (nightly only). It is therefore gated
+// behind the `c-variadic` feature.
 //
-// This mirrors the real-world `zlib-rs`/Trifecta project's state of the art.
+// For a true `zlib.h` DROP-IN (AAP G4 — all 73 symbols, INCLUDING `gzprintf`),
+// the `c-variadic` feature MUST be enabled. The `libz-rs-sys-cdylib` drop-in
+// member enables it BY DEFAULT, so the shipped `libz.so` / `libz.a` export the
+// full 73-symbol surface; the workspace pins a nightly toolchain
+// (`rust-toolchain.toml`) so that build succeeds. This thin `libz-rs-sys` crate
+// keeps the feature OFF by default so a consumer who does not need the C
+// `gzprintf` symbol (or cannot use nightly) still gets the other 72 symbols on
+// stable.
+//
 // We deliberately do NOT fake a non-variadic `gzprintf` with a different
-// signature — that would break ABI/header parity. Honest omission behind a
-// documented feature is the correct choice. Enabling `c-variadic` on a stable
-// toolchain fails to compile (the `feature(c_variadic)` attribute is rejected
-// by stable rustc); that compile error is the intended guard.
+// signature — that would break ABI/header parity. Enabling `c-variadic` on a
+// stable toolchain fails to compile (the `feature(c_variadic)` attribute is
+// rejected by stable rustc); that compile error is the intended guard.
 //
 // NOTE (build matrix):
-//   * default (stable):           72 symbols, `gzprintf` ABSENT.
-//   * `--features c-variadic` on nightly: 73 symbols, `gzprintf` PRESENT.
+//   * `libz-rs-sys` default (stable):                  72 symbols, ABSENT.
+//   * `libz-rs-sys --features c-variadic` (nightly):   73 symbols, PRESENT.
+//   * `libz-rs-sys-cdylib` default (nightly):          73 symbols, PRESENT
+//                                                       (the shipped drop-in).
 
 /// C `gzprintf` — `printf`-style formatted write to a gz file.
 ///
-/// Renders `format` + the variadic arguments into a bounded, state-sized buffer
-/// (mirroring C zlib, whose `gzprintf` likewise formats into a fixed internal
-/// buffer and writes the result) and forwards the rendered bytes to the core's
-/// `gzwrite`. Returns the number of *uncompressed* bytes written, or a negative
-/// zlib error code.
+/// Renders `format` + the variadic arguments into the gz stream's CURRENT
+/// state-sized scratch buffer (honoring any caller `gzbuffer()` resize) and
+/// writes the result, routing through the shared
+/// [`zlib_rs::gz::gz_printf_into`] so the exact C `gzvprintf` overflow and
+/// accounting discipline is reused rather than re-implemented. Per C zlib,
+/// output that is empty, `size`-or-larger, or whose trailing NUL sentinel was
+/// overwritten is REJECTED: nothing is written and `0` is returned (it is never
+/// silently truncated). Returns the number of *uncompressed* bytes written, or
+/// a negative zlib error code.
 ///
 /// Available only under the nightly-only `c-variadic` feature (see the module
-/// note above).
+/// note above); the `libz-rs-sys-cdylib` drop-in enables it by default.
 #[cfg(all(feature = "gz-io", feature = "c-variadic"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gzprintf(file: gzFile, format: *const c_char, args: ...) -> c_int {
@@ -2121,19 +2131,36 @@ pub unsafe extern "C" fn gzprintf(file: gzFile, format: *const c_char, args: ...
         Some(s) => s,
         None => return Z_STREAM_ERROR,
     };
-    let mut buf = vec![0u8; zlib_rs::gz::GZBUFSIZE];
-    // SAFETY: the caller guarantees `format` is a valid printf-style string whose
-    // conversion specifiers match the variadic `args` (the C `gzprintf`
-    // contract); `vsnprintf` renders into `buf`, writing at most `buf.len()`
-    // bytes including the trailing NUL.
-    let n = unsafe { vsnprintf(buf.as_mut_ptr() as *mut c_char, buf.len(), format, args) };
-    if n < 0 {
-        return Z_STREAM_ERROR;
-    }
-    // `vsnprintf` returns the length it WOULD have written; clamp to what fit
-    // (C zlib's gzprintf is likewise bounded by its internal buffer size).
-    let len = core::cmp::min(n as usize, buf.len() - 1);
-    zlib_rs::gz::gzwrite(&mut shim.inner, &buf[..len])
+    // Route through the shared core discipline: it hands the closure the
+    // stream's state-sized scratch `region` (length == the current `gzbuffer()`
+    // size) and applies the C `gzvprintf` book-ending (`gz_vacate`, byte
+    // accounting) plus the `len == 0 || len >= size` rejection. The closure
+    // performs only the `vsnprintf` render and reproduces C zlib's NUL-sentinel
+    // overflow check exactly (gzwrite.c L452, L470-471).
+    zlib_rs::gz::gz_printf_into(&mut shim.inner, |region| {
+        let size = region.len();
+        // C: `next[state->size - 1] = 0` — pre-set the last byte so an exactly-
+        // filling or overrunning render is detectable afterwards.
+        region[size - 1] = 0;
+        // SAFETY: the caller guarantees `format` is a valid printf-style string
+        // whose conversion specifiers match the variadic `args` (the C
+        // `gzprintf` contract); `vsnprintf` renders into `region`, writing at
+        // most `size` bytes including the trailing NUL.
+        let n = unsafe { vsnprintf(region.as_mut_ptr() as *mut c_char, size, format, args) };
+        if n < 0 {
+            // Encoding error → write nothing (C treats a non-positive len as 0).
+            return None;
+        }
+        let len = n as usize;
+        // C (gzwrite.c L470-471): reject empty, `size`-or-larger, or a clobbered
+        // NUL sentinel — exactly the overflow guard C `gzvprintf` applies before
+        // committing the formatted bytes.
+        if len == 0 || len >= size || region[size - 1] != 0 {
+            None
+        } else {
+            Some(len)
+        }
+    })
 }
 
 // ===========================================================================
@@ -2361,5 +2388,306 @@ mod tests {
             )
         };
         assert_eq!(rc, Z_VERSION_ERROR);
+    }
+
+    /// Helper: one-shot FFI deflate of `src` at the default level, returning the
+    /// compressed bytes. Used by the streaming-totals tests below.
+    fn ffi_deflate(src: &[u8]) -> Vec<u8> {
+        let stream_size = core::mem::size_of::<z_stream>() as c_int;
+        let mut comp = vec![0u8; src.len() + 256];
+        let mut strm = z_stream {
+            next_in: src.as_ptr(),
+            avail_in: src.len() as c_uint,
+            next_out: comp.as_mut_ptr(),
+            avail_out: comp.len() as c_uint,
+            ..Default::default()
+        };
+        // SAFETY: `strm` is fully initialized; version/size match the ABI.
+        unsafe {
+            assert_eq!(
+                deflateInit_(&mut strm, Z_DEFAULT_COMPRESSION, zlibVersion(), stream_size),
+                Z_OK
+            );
+            assert_eq!(deflate(&mut strm, Z_FINISH), Z_STREAM_END);
+        }
+        let comp_len = strm.total_out as usize;
+        // SAFETY: `strm` is an initialized deflate stream.
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+        comp.truncate(comp_len);
+        comp
+    }
+
+    /// Regression for the CP3 FFI `inflate()` streaming-totals finding: driving
+    /// `inflate()` across MANY productive calls with a tiny **output** window must
+    /// leave `total_in == compressed_len` and `total_out == original_len` — i.e.
+    /// the cumulative counters must NOT double-count per-call deltas. The smoke
+    /// test elsewhere only checks bytes (and uses `truncate`, which cannot grow),
+    /// so it could not catch a doubled `total_out`; these assertions can.
+    #[test]
+    fn ffi_inflate_streaming_totals_small_output() {
+        let src = b"streaming totals: small output window stresses many calls. ".repeat(64);
+        let comp = ffi_deflate(&src);
+        let stream_size = core::mem::size_of::<z_stream>() as c_int;
+
+        let mut deco = vec![0u8; src.len() + 64];
+        let mut istrm = z_stream {
+            next_in: comp.as_ptr(),
+            avail_in: comp.len() as c_uint,
+            next_out: deco.as_mut_ptr(),
+            avail_out: 0,
+            ..Default::default()
+        };
+        // SAFETY: `istrm` is valid; version/size match the ABI.
+        assert_eq!(
+            unsafe { inflateInit_(&mut istrm, zlibVersion(), stream_size) },
+            Z_OK
+        );
+
+        let mut produced = 0usize;
+        let mut calls = 0usize;
+        loop {
+            // Hand the engine a fresh 13-byte output window each call.
+            // SAFETY: `produced <= deco.len()`, so the offset is in-bounds.
+            istrm.next_out = unsafe { deco.as_mut_ptr().add(produced) };
+            istrm.avail_out = core::cmp::min(13, deco.len() - produced) as c_uint;
+            let before = istrm.avail_out;
+            // SAFETY: `istrm` is an initialized inflate stream with valid buffers.
+            let rc = unsafe { inflate(&mut istrm, Z_NO_FLUSH) };
+            produced += (before - istrm.avail_out) as usize;
+            calls += 1;
+            if rc == Z_STREAM_END {
+                break;
+            }
+            assert_eq!(rc, Z_OK, "unexpected inflate rc {rc} at call {calls}");
+            assert!(calls < 100_000, "inflate loop failed to terminate");
+        }
+
+        // The decisive assertions: cumulative totals must be exact, not doubled.
+        assert_eq!(
+            istrm.total_in as usize,
+            comp.len(),
+            "total_in must equal compressed length across multi-call inflate"
+        );
+        assert_eq!(
+            istrm.total_out as usize,
+            src.len(),
+            "total_out must equal original length (no double-count) across multi-call inflate"
+        );
+        // SAFETY: `istrm` is an initialized inflate stream.
+        assert_eq!(unsafe { inflateEnd(&mut istrm) }, Z_OK);
+        assert_eq!(&deco[..produced], &src[..]);
+        assert!(calls > 1, "test must exercise multiple productive calls");
+    }
+
+    /// Companion to the above: stream the **input** in tiny `avail_in` chunks
+    /// (ample output) and assert the cumulative totals are still exact. This
+    /// exercises the other productive-call shape (many partial-input calls).
+    #[test]
+    fn ffi_inflate_streaming_totals_small_input() {
+        let src = b"small-input chunks across the FFI inflate boundary. ".repeat(64);
+        let comp = ffi_deflate(&src);
+        let stream_size = core::mem::size_of::<z_stream>() as c_int;
+
+        let mut deco = vec![0u8; src.len() + 64];
+        let mut istrm = z_stream {
+            next_in: comp.as_ptr(),
+            avail_in: 0,
+            next_out: deco.as_mut_ptr(),
+            avail_out: deco.len() as c_uint,
+            ..Default::default()
+        };
+        // SAFETY: `istrm` is valid; version/size match the ABI.
+        assert_eq!(
+            unsafe { inflateInit_(&mut istrm, zlibVersion(), stream_size) },
+            Z_OK
+        );
+
+        let mut fed = 0usize;
+        let mut calls = 0usize;
+        loop {
+            // Feed at most 7 more input bytes each call.
+            if fed < comp.len() {
+                let grant = core::cmp::min(7, comp.len() - fed);
+                // SAFETY: `fed <= comp.len()`, so the offset is in-bounds.
+                istrm.next_in = unsafe { comp.as_ptr().add(fed) };
+                istrm.avail_in = grant as c_uint;
+                fed += grant;
+            }
+            // SAFETY: `istrm` is an initialized inflate stream with valid buffers.
+            let rc = unsafe { inflate(&mut istrm, Z_NO_FLUSH) };
+            calls += 1;
+            if rc == Z_STREAM_END {
+                break;
+            }
+            assert!(
+                rc == Z_OK || rc == Z_BUF_ERROR,
+                "unexpected inflate rc {rc} at call {calls}"
+            );
+            assert!(calls < 100_000, "inflate loop failed to terminate");
+        }
+
+        assert_eq!(
+            istrm.total_in as usize,
+            comp.len(),
+            "total_in must equal compressed length across small-input inflate"
+        );
+        assert_eq!(
+            istrm.total_out as usize,
+            src.len(),
+            "total_out must equal original length across small-input inflate"
+        );
+        // SAFETY: `istrm` is an initialized inflate stream.
+        assert_eq!(unsafe { inflateEnd(&mut istrm) }, Z_OK);
+        assert_eq!(&deco[..src.len()], &src[..]);
+        assert!(calls > 1, "test must exercise multiple productive calls");
+    }
+
+    /// Deflate-path regression guard: the deflate write-back still accumulates
+    /// per-call deltas, so multi-call deflate with a tiny **output** window must
+    /// still report `total_in == original_len` and `total_out == compressed_len`.
+    /// (Confirms the inflate-specific write-back split did not perturb deflate.)
+    #[test]
+    fn ffi_deflate_streaming_totals_small_output() {
+        let src = b"deflate streaming totals across small output windows. ".repeat(64);
+        let stream_size = core::mem::size_of::<z_stream>() as c_int;
+
+        let mut comp = vec![0u8; src.len() + 256];
+        let mut strm = z_stream {
+            next_in: src.as_ptr(),
+            avail_in: src.len() as c_uint,
+            next_out: comp.as_mut_ptr(),
+            avail_out: 0,
+            ..Default::default()
+        };
+        // SAFETY: `strm` is valid; version/size match the ABI.
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, Z_DEFAULT_COMPRESSION, zlibVersion(), stream_size) },
+            Z_OK
+        );
+
+        let mut produced = 0usize;
+        let mut calls = 0usize;
+        loop {
+            // SAFETY: `produced <= comp.len()`, so the offset is in-bounds.
+            strm.next_out = unsafe { comp.as_mut_ptr().add(produced) };
+            strm.avail_out = core::cmp::min(11, comp.len() - produced) as c_uint;
+            let before = strm.avail_out;
+            // SAFETY: `strm` is an initialized deflate stream with valid buffers.
+            let rc = unsafe { deflate(&mut strm, Z_FINISH) };
+            produced += (before - strm.avail_out) as usize;
+            calls += 1;
+            if rc == Z_STREAM_END {
+                break;
+            }
+            assert!(
+                rc == Z_OK || rc == Z_BUF_ERROR,
+                "unexpected deflate rc {rc} at call {calls}"
+            );
+            assert!(calls < 100_000, "deflate loop failed to terminate");
+        }
+
+        assert_eq!(
+            strm.total_in as usize,
+            src.len(),
+            "deflate total_in must equal original length across multi-call deflate"
+        );
+        assert_eq!(
+            strm.total_out as usize, produced,
+            "deflate total_out must equal the produced compressed length"
+        );
+        // SAFETY: `strm` is an initialized deflate stream.
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+        assert!(calls > 1, "test must exercise multiple productive calls");
+    }
+
+    /// End-to-end exercise of the C-variadic `gzprintf` (the 73rd drop-in
+    /// symbol): write a formatted record to a gz file through the FFI, then read
+    /// it back through the FFI and confirm the bytes round-trip. Proves the
+    /// symbol is not merely present but functional.
+    #[cfg(feature = "c-variadic")]
+    #[test]
+    fn ffi_gzprintf_round_trip() {
+        use std::ffi::CString;
+
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "libz_rs_sys_ffi_gzprintf_rt_{}.gz",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        let path = CString::new(p.to_string_lossy().as_bytes()).unwrap();
+        let expected = "value=42 str=hi end";
+
+        // SAFETY: `path` / mode are valid NUL-terminated C strings.
+        let f = unsafe { gzopen(path.as_ptr(), c"wb".as_ptr()) };
+        assert!(!f.is_null(), "gzopen(wb) failed");
+        // SAFETY: `f` is an open write handle; the format's `%d` / `%s` match the
+        // `c_int` / C-string variadic arguments.
+        let n = unsafe {
+            gzprintf(
+                f,
+                c"value=%d str=%s end".as_ptr(),
+                42 as c_int,
+                c"hi".as_ptr(),
+            )
+        };
+        assert_eq!(n, expected.len() as c_int, "gzprintf returned wrong length");
+        // SAFETY: `f` is an open handle.
+        assert_eq!(unsafe { gzclose(f) }, Z_OK);
+
+        // SAFETY: `path` / mode are valid C strings.
+        let g = unsafe { gzopen(path.as_ptr(), c"rb".as_ptr()) };
+        assert!(!g.is_null(), "gzopen(rb) failed");
+        let mut buf = [0u8; 128];
+        // SAFETY: `g` is open for read; `buf` is valid for `buf.len()` bytes.
+        let got = unsafe { gzread(g, buf.as_mut_ptr() as *mut c_void, buf.len() as c_uint) };
+        assert_eq!(got, expected.len() as c_int, "gzread returned wrong length");
+        assert_eq!(&buf[..got as usize], expected.as_bytes());
+        // SAFETY: `g` is an open handle.
+        assert_eq!(unsafe { gzclose(g) }, Z_OK);
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The CP3 A2 regression: the C-variadic `gzprintf` must reproduce C zlib's
+    /// overflow rule — output that does not fit the stream's CURRENT
+    /// `gzbuffer()`-sized scratch is REJECTED (`return 0`, nothing written),
+    /// never silently truncated, and the buffer size honored is the caller's,
+    /// not a fixed `GZBUFSIZE`.
+    #[cfg(feature = "c-variadic")]
+    #[test]
+    fn ffi_gzprintf_rejects_overflow_honoring_gzbuffer() {
+        use std::ffi::CString;
+
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "libz_rs_sys_ffi_gzprintf_ovf_{}.gz",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        let path = CString::new(p.to_string_lossy().as_bytes()).unwrap();
+
+        // SAFETY: valid path / mode C strings.
+        let f = unsafe { gzopen(path.as_ptr(), c"wb".as_ptr()) };
+        assert!(!f.is_null(), "gzopen(wb) failed");
+        // Shrink the buffer to its minimum (8) BEFORE the first write; a fresh
+        // `GZBUFSIZE` buffer (the old bug) would be 8 KiB and accept the string.
+        // SAFETY: `f` is open and its buffers are not yet allocated.
+        assert_eq!(unsafe { gzbuffer(f, 8) }, 0);
+
+        // A formatted output >= 8 bytes must be rejected with 0 (no truncation).
+        // SAFETY: `f` open; `%s` matches the C-string argument.
+        let n = unsafe { gzprintf(f, c"%s".as_ptr(), c"definitely longer than eight".as_ptr()) };
+        assert_eq!(n, 0, "oversize gzprintf must return 0, never a truncation");
+
+        // A 1-byte output still fits in the 8-byte buffer and succeeds, proving
+        // the stream remains usable after the rejection.
+        // SAFETY: `f` open; `%d` matches the `c_int` argument.
+        let n2 = unsafe { gzprintf(f, c"%d".as_ptr(), 7 as c_int) };
+        assert_eq!(n2, 1, "1-byte output must fit the 8-byte buffer");
+
+        // SAFETY: `f` is an open handle.
+        assert_eq!(unsafe { gzclose(f) }, Z_OK);
+        let _ = std::fs::remove_file(&p);
     }
 }

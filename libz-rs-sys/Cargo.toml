@@ -46,7 +46,9 @@ c-variadic = []
 [dependencies]
 # C scalar types (`c_int`, `c_uint`, `c_ulong`, `size_t`, `off_t`, ...) used at
 # the `extern "C"` boundary and by the `#[repr(C)]` ABI structs in `zstream`.
-libc = "0.2"
+# Inherited from `[workspace.dependencies]` (pinned `=0.2.186`) so the exact,
+# validated version is enforced here rather than a local caret requirement.
+libc = { workspace = true }
 # The safe core. The shim re-exposes its API through the C ABI; at the current
 # foundation milestone it is used to anchor `zlibCompileFlags` to this crate's
 # `z_off_t` (== `libc::off_t`) definition. This is an internal workspace path

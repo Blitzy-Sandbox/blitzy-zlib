@@ -418,11 +418,18 @@ pub(crate) unsafe fn check_version(
 // each destructuring site. The write-back itself is identical and is factored
 // into the shared `write_back` helper.
 
-/// Shared step 4: write per-call results back into the C `z_stream`.
+/// Shared step 4 (cursors + scalars): advance `next_in` / `next_out`, decrement
+/// `avail_in` / `avail_out`, and publish `adler`, `data_type`, and `msg`.
 ///
-/// `consumed` / `produced` are the byte counts the engine reports; `adler` and
-/// `data_type` are the post-call engine scalars (already converted to their C
-/// widths by the caller); `result` selects the `msg` pointer.
+/// This helper deliberately does **not** touch `total_in` / `total_out`: the two
+/// engines account for the lifetime totals differently, so each engine-specific
+/// write-back ([`write_back`] for deflate, [`write_back_inflate`] for inflate)
+/// applies the totals itself and then calls this for the common cursor/scalar
+/// work. `consumed` / `produced` are the per-call byte counts the engine reports
+/// (always the per-call deltas, never cumulative — they drive the cursor
+/// advance and `avail_*` decrement); `adler` and `data_type` are the post-call
+/// engine scalars (already converted to their C widths by the caller); `result`
+/// selects the `msg` pointer.
 ///
 /// # Safety
 ///
@@ -430,7 +437,7 @@ pub(crate) unsafe fn check_version(
 /// counts. The engine guarantees `consumed ≤` the pre-call `avail_in` and
 /// `produced ≤` the pre-call `avail_out`, so the pointer advances and the
 /// `avail_*` decrements stay within the caller's buffers.
-unsafe fn write_back(
+unsafe fn write_back_common(
     strm: z_streamp,
     consumed: usize,
     produced: usize,
@@ -449,13 +456,11 @@ unsafe fn write_back(
             s.next_in = s.next_in.add(consumed);
         }
         s.avail_in -= consumed as c_uint;
-        s.total_in = s.total_in.wrapping_add(consumed as c_ulong);
 
         if produced != 0 {
             s.next_out = s.next_out.add(produced);
         }
         s.avail_out -= produced as c_uint;
-        s.total_out = s.total_out.wrapping_add(produced as c_ulong);
 
         s.adler = adler;
         s.data_type = data_type;
@@ -468,6 +473,77 @@ unsafe fn write_back(
             Err(err) => z_error_cstr(err.as_i32()),
         };
     }
+}
+
+/// Deflate step 4: accumulate `total_in` / `total_out` by the per-call deltas,
+/// then apply the shared cursor/scalar write-back.
+///
+/// This preserves the historical, validated deflate accounting unchanged: the
+/// C `z_stream` totals are advanced by `consumed` / `produced` each call. The
+/// deflate engine's own cumulative counters (mirrored onto the owned `ZStream`)
+/// agree with this running sum, so the observable totals are identical to what C
+/// zlib reports for a deflate stream.
+///
+/// # Safety
+///
+/// Same contract as [`write_back_common`].
+unsafe fn write_back(
+    strm: z_streamp,
+    consumed: usize,
+    produced: usize,
+    adler: c_ulong,
+    data_type: c_int,
+    result: Result<ReturnCode, ZlibError>,
+) {
+    // SAFETY: `strm` is valid and non-null (caller's invariant).
+    unsafe {
+        let s = &mut *strm;
+        s.total_in = s.total_in.wrapping_add(consumed as c_ulong);
+        s.total_out = s.total_out.wrapping_add(produced as c_ulong);
+    }
+    // SAFETY: same `strm` invariant; the prior `&mut *strm` borrow above has
+    // already ended, so this re-borrow inside the helper does not alias.
+    unsafe { write_back_common(strm, consumed, produced, adler, data_type, result) };
+}
+
+/// Inflate step 4: **set** `total_in` / `total_out` to the engine's own
+/// cumulative lifetime counters (which the core inflate wrapper mirrors onto the
+/// owned `ZStream` from `InflateState`), then apply the shared cursor/scalar
+/// write-back.
+///
+/// The inflate engine is the single source of truth for its lifetime totals, so
+/// the C `z_stream` is published directly from those cumulative values rather
+/// than re-accumulating per-call deltas onto the separate C-struct counter. This
+/// matches C zlib — where `strm->total_in` / `strm->total_out` *are* the engine's
+/// own counters — and makes double-counting across successive productive
+/// `inflate()` calls structurally impossible: the published totals can only ever
+/// equal the engine's cumulative count, never a re-summed delta. (`consumed` /
+/// `produced` are still the per-call deltas used by [`write_back_common`] for the
+/// cursor advance and `avail_*` decrement.)
+///
+/// # Safety
+///
+/// Same contract as [`write_back_common`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn write_back_inflate(
+    strm: z_streamp,
+    consumed: usize,
+    produced: usize,
+    total_in: c_ulong,
+    total_out: c_ulong,
+    adler: c_ulong,
+    data_type: c_int,
+    result: Result<ReturnCode, ZlibError>,
+) {
+    // SAFETY: `strm` is valid and non-null (caller's invariant).
+    unsafe {
+        let s = &mut *strm;
+        s.total_in = total_in;
+        s.total_out = total_out;
+    }
+    // SAFETY: same `strm` invariant; the prior `&mut *strm` borrow above has
+    // already ended, so this re-borrow inside the helper does not alias.
+    unsafe { write_back_common(strm, consumed, produced, adler, data_type, result) };
 }
 
 /// Drives one `deflate` call: validate, slice, delegate, write back, convert.
@@ -561,14 +637,27 @@ pub(crate) unsafe fn run_inflate(strm: z_streamp, flush: c_int) -> c_int {
     // └──────────────────────────────────────────────────────────────────────┘
     let (consumed, produced, result) = zlib_rs::inflate::inflate(zstream, input, output, flush);
 
-    // Capture the post-call engine scalars (both `Copy`) before the write-back.
+    // Capture the post-call engine scalars (all `Copy`) before the write-back.
+    // `total_in` / `total_out` are the engine's CUMULATIVE lifetime counters
+    // (the core inflate wrapper mirrors `InflateState`'s counters onto the owned
+    // `ZStream`). We publish them verbatim via `write_back_inflate` rather than
+    // re-accumulating per-call deltas onto the separate C-struct counter, so the
+    // C `z_stream` totals always equal the engine's own count — matching C zlib
+    // and making cross-call double-counting impossible.
+    let total_in = zstream.total_in as c_ulong;
+    let total_out = zstream.total_out as c_ulong;
     let adler = zstream.adler as c_ulong;
     let data_type = zstream.data_type as c_int;
 
-    // 4. write the per-call results back into the C struct.
+    // 4. write the per-call cursor advance + cumulative totals back into the C
+    //    struct.
     // SAFETY: `strm` is valid (we recovered its state above); the counts honor
     // the engine's `consumed ≤ avail_in` / `produced ≤ avail_out` guarantee.
-    unsafe { write_back(strm, consumed, produced, adler, data_type, result) };
+    unsafe {
+        write_back_inflate(
+            strm, consumed, produced, total_in, total_out, adler, data_type, result,
+        )
+    };
 
     // 5. convert the outcome to the C status code.
     to_c_int(result)

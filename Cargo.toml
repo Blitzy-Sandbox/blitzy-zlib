@@ -72,7 +72,12 @@ categories = ["compression", "no-std"]
 # Shared dependency version pins — the single source of truth.
 #
 # Members reference these with `dep = { workspace = true }` and never re-pin a
-# version locally. The pins below are EXACT, validated values (AAP §0.5.1).
+# version locally. The pins below are EXACT, validated values (AAP §0.5.1): each
+# uses Cargo's exact `=<version>` requirement syntax so the resolved set cannot
+# silently drift to a newer compatible release (a bare `"1.5.0"` is a caret
+# requirement `^1.5.0`). Every version below is the exact release recorded in
+# the committed `Cargo.lock`, so `--locked` builds reproduce the validated
+# dependency graph byte-for-byte.
 # Runtime crates are deliberately minimal: only `crc32fast` and `cfg-if` can
 # reach the shipped core, `libc` is confined to the FFI shim, and `cbindgen`
 # (build) plus `criterion` / `flate2` / `quickcheck` / `rand` (dev) are never
@@ -80,20 +85,23 @@ categories = ["compression", "no-std"]
 # ---------------------------------------------------------------------------
 [workspace.dependencies]
 # Runtime — core (`zlib-rs`).
-crc32fast = "1.5.0" # SIMD-accelerated CRC-32 (IEEE); no_std.
-cfg-if = "1.0.4"    # Ergonomic conditional compilation; replaces C #if/#ifdef.
+crc32fast = "=1.5.0" # SIMD-accelerated CRC-32 (IEEE); no_std.
+cfg-if = "=1.0.4"    # Ergonomic conditional compilation; replaces C #if/#ifdef.
 
 # Runtime — FFI shim (`libz-rs-sys`) only.
-libc = "0.2" # C scalar types (c_int, c_uint, c_ulong, size_t, off_t, ...).
+libc = "=0.2.186" # C scalar types (c_int, c_uint, c_ulong, size_t, off_t, ...).
 
 # Build tool — FFI shim C-header generation (used by `libz-rs-sys/build.rs`).
-cbindgen = "0.29" # Emits a zlib.h-compatible header to prove ABI parity.
+cbindgen = "=0.29.4" # Emits a zlib.h-compatible header to prove ABI parity.
 
 # Dev / validation — never shipped.
-criterion = "0.5.1"  # Statistical deflate / inflate / checksum benchmarks.
-flate2 = "1.1.9"     # C-zlib interop ORACLE for byte-for-byte validation.
-quickcheck = "1.1.0" # Property-based round-trip testing.
-rand = "0.9.2"       # Random data generation for tests / benches.
+criterion = "=0.5.1"  # Statistical deflate / inflate / checksum benchmarks.
+flate2 = "=1.1.9"     # C-zlib interop ORACLE for byte-for-byte validation.
+quickcheck = "=1.1.0" # Property-based round-trip testing.
+# `rand` is pinned to 0.9.4 (not the AAP's originally-drafted 0.9.2): 0.9.2 has
+# an outstanding RustSec/OSV advisory, whereas 0.9.4 is advisory-clean and is
+# the version the lockfile already resolved. Dev-only, never shipped.
+rand = "=0.9.4"       # Random data generation for tests / benches.
 
 # ---------------------------------------------------------------------------
 # Release profile (workspace-global; a `[profile.*]` table is only valid in the

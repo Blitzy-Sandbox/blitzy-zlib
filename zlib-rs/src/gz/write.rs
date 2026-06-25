@@ -566,18 +566,38 @@ pub(crate) fn gzputs(state: &mut GzState, s: &[u8]) -> i32 {
     if len != 0 && put == 0 { -1 } else { put as i32 }
 }
 
-/// Formatted write into the gzip stream — the [`core::fmt`] analogue of C
-/// `gzvprintf` (`gzwrite.c` lines 403-498).
+/// Shared, formatter-agnostic core of C `gzvprintf` (`gzwrite.c` lines 403-498).
 ///
-/// There is no `va_list` in Rust: callers build [`core::fmt::Arguments`] with
-/// the standard [`format_args!`] macro. The arguments are formatted into the
-/// upper (scratch) half of the double-sized input buffer — which is exactly why
-/// [`GzState::gz_init`] allocates `want << 1` bytes — then compressed via the
-/// [`gz_vacate`](GzState::gz_vacate) discipline.
+/// This encapsulates the exact C `gzvprintf` *discipline* — write-mode and error
+/// gating, first-use allocation, pending-seek handling, the
+/// [`gz_vacate`](GzState::gz_vacate) book-ending, the state-sized scratch region,
+/// the overflow/empty rejection, and the byte accounting — while delegating only
+/// the *formatting* step to the caller-supplied `render` closure. Both the safe
+/// [`core::fmt`]-based [`gzvprintf`] and the C-ABI variadic `gzprintf` in the
+/// `libz-rs-sys` shim route through this single function, so they share one
+/// faithful copy of the overflow semantics rather than re-implementing them.
 ///
-/// Returns the number of bytes written, `0` if the formatted output did not fit
-/// in `size` bytes, or a negative `Z_*` code on error.
-pub(crate) fn gzvprintf(state: &mut GzState, args: core::fmt::Arguments<'_>) -> i32 {
+/// `render` receives the **state-sized** scratch region `in_buf[have .. have +
+/// size]` (length exactly `state.size`, the buffer the caller can resize via
+/// `gzbuffer()`), formats into it, and returns:
+///
+/// * `Some(len)` — formatting succeeded and produced `len` bytes; or
+/// * `None` — the formatted output did **not** fit (or the formatter errored),
+///   in which case this returns `0` and writes nothing, exactly as C `gzvprintf`
+///   does when `vsnprintf` reports overflow.
+///
+/// The closure is responsible for detecting *its own* overflow (a bounded
+/// [`core::fmt`] sink reports it via a flag; C `vsnprintf` reports it via a
+/// `>= size` return value plus a NUL sentinel). This function then applies the
+/// common C rejection rule `len == 0 || len >= size → 0` to the reported length,
+/// leaving at most `size - 1` usable bytes just as C does.
+///
+/// Returns the number of bytes written, `0` if the output did not fit in `size`
+/// bytes, or a negative `Z_*` code on error.
+pub(crate) fn gz_printf_into<F>(state: &mut GzState, render: F) -> i32
+where
+    F: FnOnce(&mut [u8]) -> Option<usize>,
+{
     // Writable stream with no serious error? (C lines 422-423.)
     if state.mode != GzMode::Write || (state.err != Z_OK && !state.again) {
         return Z_STREAM_ERROR;
@@ -604,22 +624,14 @@ pub(crate) fn gzvprintf(state: &mut GzState, args: core::fmt::Arguments<'_>) -> 
 
     // Format directly into `in_buf[have .. have + size]`. After `gz_vacate`,
     // `have <= size`, so this scratch slice stays within the double-sized
-    // buffer (C lines 450-453).
+    // buffer (C lines 450-453). The region length is exactly `state.size`.
     let have = state.have;
     let size = state.size;
-    let len = {
-        let region = &mut state.in_buf[have..have + size];
-        let mut writer = BufWriter {
-            buf: region,
-            pos: 0,
-            overflow: false,
-        };
-        let _ = core::fmt::write(&mut writer, args);
-        if writer.overflow {
-            // Truncated: the formatted output did not fit (C `len >= size`).
-            return 0;
-        }
-        writer.pos
+    let len = match render(&mut state.in_buf[have..have + size]) {
+        Some(len) => len,
+        // Truncated / errored: the formatted output did not fit (C `len >=
+        // size`, or `vsnprintf` returned negative / failed the NUL sentinel).
+        None => return 0,
     };
 
     // Check that the result fits (C lines 470-471): reject empty or
@@ -638,6 +650,37 @@ pub(crate) fn gzvprintf(state: &mut GzState, args: core::fmt::Arguments<'_>) -> 
         return state.err;
     }
     len as i32
+}
+
+/// Formatted write into the gzip stream — the [`core::fmt`] analogue of C
+/// `gzvprintf` (`gzwrite.c` lines 403-498).
+///
+/// There is no `va_list` in Rust: callers build [`core::fmt::Arguments`] with
+/// the standard [`format_args!`] macro. The arguments are formatted into the
+/// upper (scratch) half of the double-sized input buffer — which is exactly why
+/// [`GzState::gz_init`] allocates `want << 1` bytes — then compressed via the
+/// [`gz_vacate`](GzState::gz_vacate) discipline. The whole overflow / accounting
+/// dance lives in the shared [`gz_printf_into`]; this wrapper supplies only the
+/// bounded [`core::fmt`] sink ([`BufWriter`]) used to render the arguments.
+///
+/// Returns the number of bytes written, `0` if the formatted output did not fit
+/// in `size` bytes, or a negative `Z_*` code on error.
+pub(crate) fn gzvprintf(state: &mut GzState, args: core::fmt::Arguments<'_>) -> i32 {
+    gz_printf_into(state, |region| {
+        let mut writer = BufWriter {
+            buf: region,
+            pos: 0,
+            overflow: false,
+        };
+        let _ = core::fmt::write(&mut writer, args);
+        if writer.overflow {
+            // The formatted output overran the `size`-byte region: report "did
+            // not fit" so `gz_printf_into` writes nothing and returns 0.
+            None
+        } else {
+            Some(writer.pos)
+        }
+    })
 }
 
 /// Formatted write into the gzip stream. Port of C `gzprintf` (`gzwrite.c`
@@ -985,5 +1028,89 @@ mod tests {
         }
         let bytes = std::fs::read(tf.path()).expect("read back");
         assert_gzip_of(&bytes, &data);
+    }
+
+    /// `gz_printf_into` accepts a fitting render: it writes the formatted bytes
+    /// into the state-sized scratch, accounts for them, and produces a valid
+    /// gzip stream. This is the shared discipline the FFI C-variadic `gzprintf`
+    /// also routes through, so the safe and unsafe paths share one faithful copy
+    /// of the C `gzvprintf` overflow/accounting semantics.
+    #[test]
+    fn gz_printf_into_writes_fitting_output() {
+        let tf = TempFile::new("printf_into_fit");
+        let payload = b"hello via the shared render closure";
+        {
+            let mut state = GzState::new(tf.open_rw(), tf.path_string(), GzMode::Write);
+            let n = gz_printf_into(&mut state, |region| {
+                // The region is the state-sized scratch; the payload fits.
+                assert!(region.len() >= payload.len());
+                region[..payload.len()].copy_from_slice(payload);
+                Some(payload.len())
+            });
+            assert_eq!(n, payload.len() as i32);
+            assert_eq!(state.have, payload.len());
+            assert_eq!(&state.in_buf[..payload.len()], payload);
+            assert_eq!(state.finish_write(), Z_OK);
+        }
+        let bytes = std::fs::read(tf.path()).expect("read back");
+        assert_gzip_of(&bytes, payload);
+    }
+
+    /// `gz_printf_into` reproduces C `gzvprintf`'s rejection rule
+    /// (`len == 0 || len >= size → 0`, writing nothing) for empty and
+    /// size-or-larger reported lengths, plus the `None` overflow/error report.
+    /// Each rejection must leave `have` untouched.
+    #[test]
+    fn gz_printf_into_rejects_empty_oversize_and_overflow() {
+        let tf = TempFile::new("printf_into_reject");
+        let mut state = GzState::new(tf.open_rw(), tf.path_string(), GzMode::Write);
+        state.want = 64;
+
+        // Empty output (len == 0) → 0, nothing accounted. This first call also
+        // initializes the buffers, so `state.size` becomes `want` afterwards.
+        assert_eq!(gz_printf_into(&mut state, |_| Some(0)), 0);
+        assert_eq!(state.have, 0, "empty output must not advance `have`");
+        let size = state.size;
+        assert_eq!(size, 64, "first call initializes the scratch to `want`");
+
+        // Exactly `size` (len >= size) → 0: C leaves at most `size - 1` usable.
+        assert_eq!(
+            gz_printf_into(&mut state, |region| {
+                assert_eq!(region.len(), size, "render gets the state-sized scratch");
+                Some(size)
+            }),
+            0
+        );
+        assert_eq!(state.have, 0);
+
+        // Larger than `size` (a `vsnprintf`-style would-be length) → 0.
+        assert_eq!(gz_printf_into(&mut state, |_| Some(size + 7)), 0);
+        assert_eq!(state.have, 0);
+
+        // The formatter reported overflow / error (`None`) → 0, nothing written.
+        assert_eq!(gz_printf_into(&mut state, |_| None), 0);
+        assert_eq!(state.have, 0);
+    }
+
+    /// `gz_printf_into` honors a caller-adjusted `gzbuffer()` size: the render
+    /// closure receives a scratch region sized to the *current* buffer, not a
+    /// fixed `GZBUFSIZE`. (The FFI C-variadic `gzprintf` thus respects
+    /// `gzbuffer()` instead of silently using a fresh 8 KiB buffer.)
+    #[test]
+    fn gz_printf_into_uses_current_buffer_size() {
+        let tf = TempFile::new("printf_into_bufsize");
+        let mut state = GzState::new(tf.open_rw(), tf.path_string(), GzMode::Write);
+        state.want = 200;
+        let mut observed = 0usize;
+        let n = gz_printf_into(&mut state, |region| {
+            observed = region.len();
+            region[0] = b'x';
+            Some(1)
+        });
+        assert_eq!(n, 1);
+        assert_eq!(
+            observed, 200,
+            "scratch region must equal the current buffer size"
+        );
     }
 }

@@ -81,8 +81,12 @@
 //!   is wired.
 //! * **`simd`** *(default)* — the hardware-accelerated CRC-32 path via the
 //!   `crc32fast` crate. Disabling it selects the always-correct scalar table.
-//! * **`capi`** — gates the C-ABI layer build in the sibling crates; the pure
-//!   core can be built and tested without ever pulling in the FFI surface.
+//!
+//! The C-ABI / drop-in layer is **not** a feature of this crate. It lives
+//! entirely in the sibling members (`libz-rs-sys` and `libz-rs-sys-cdylib`) and
+//! is gated by *their* features (e.g. `gz-io` / `c-variadic` on `libz-rs-sys`),
+//! so this pure-Rust core can always be built and tested without ever pulling in
+//! the FFI surface.
 
 // AAP §0.2.2 / §0.6.2 — zero `unsafe` anywhere in the safe core. This is a hard
 // compile-time guarantee: any `unsafe` block (including in `inflate/fast.rs`)

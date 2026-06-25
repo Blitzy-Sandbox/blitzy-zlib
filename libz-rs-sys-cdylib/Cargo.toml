@@ -2,9 +2,9 @@
 #
 # Builds the `libz-rs-sys` C-ABI shim into a C-consumable `cdylib` (`libz.so`)
 # and `staticlib` (`libz.a`), so existing C programs can relink against the Rust
-# implementation without source changes (AAP §0.3.1). The full `#[no_mangle]`
-# export surface is provided by `libz-rs-sys` in a subsequent milestone; this
-# member establishes the artifact and its link to the shim.
+# implementation without source changes (AAP §0.3.1). It re-exports the shim's
+# full `#[unsafe(no_mangle)]` export surface so the emitted artifacts carry the
+# complete `zlib.h` C symbol table.
 [package]
 name = "libz-rs-sys-cdylib"
 version = "0.1.0"
@@ -18,6 +18,22 @@ description = "Drop-in cdylib/staticlib (libz.so / libz.a) built from the libz-r
 [lib]
 name = "z"
 crate-type = ["cdylib", "staticlib"]
+
+# ---------------------------------------------------------------------------
+# Features.
+#
+# A genuine `zlib.h` drop-in (AAP G4) must export ALL 73 public symbols,
+# INCLUDING the C-variadic `gzprintf`. Defining a C-variadic `extern "C"` fn
+# requires the unstable `feature(c_variadic)` (nightly), so `gzprintf` lives
+# behind `libz-rs-sys`'s `c-variadic` feature. The drop-in artifact therefore
+# enables it BY DEFAULT — the workspace pins a nightly toolchain
+# (`rust-toolchain.toml`) so this builds — yielding the full 73-symbol
+# `libz.so` / `libz.a`. Build with `--no-default-features` to drop `gzprintf`
+# (72 symbols) on a toolchain without `c_variadic`.
+# ---------------------------------------------------------------------------
+[features]
+default = ["c-variadic"]
+c-variadic = ["libz-rs-sys/c-variadic"]
 
 [dependencies]
 libz-rs-sys = { path = "../libz-rs-sys" }
