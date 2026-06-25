@@ -28,9 +28,20 @@ keywords = ["zlib", "ffi", "deflate", "gzip"]
 #   enables the `#[cfg(feature = "gz-io")]` gz file-I/O conversion helpers in
 #   `translate.rs`. Those helpers are generic over the concrete gz state type, so
 #   enabling this feature does not require the core `gz` module to be present.
-default = ["std"]
+#   gz-io is ON by default so the drop-in artifact exposes the full `gz*` file
+#   API family (26 symbols) that `zlib.h` declares — a true zlib drop-in must
+#   provide them. `--no-default-features` yields the core-only 47-symbol surface.
+# * `c-variadic` — OFF by default; enables the genuinely C-variadic `gzprintf`
+#   (`int gzprintf(gzFile, const char *, ...)`). DEFINING a C-variadic `extern
+#   "C"` fn requires the unstable `#![feature(c_variadic)]`, so this feature is
+#   NIGHTLY-ONLY: enabling it on a stable toolchain is rejected by rustc (the
+#   intended compile-time guard). On the default stable build `gzprintf` is the
+#   single `zlib.h` symbol that is omitted (documented in `lib.rs`); the other 72
+#   symbols are fully functional. This mirrors the upstream `zlib-rs` project.
+default = ["std", "gz-io"]
 std = ["zlib-rs/std"]
 gz-io = ["std", "zlib-rs/gz-io"]
+c-variadic = []
 
 [dependencies]
 # C scalar types (`c_int`, `c_uint`, `c_ulong`, `size_t`, `off_t`, ...) used at
