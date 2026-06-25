@@ -14,9 +14,13 @@
 //!   `inflate_state` struct.
 //! * [`fast`] — the hot-path inner decode loop ([`fast::inflate_fast`]), the
 //!   safe-Rust counterpart of C `inflate_fast` (`inffast.c`).
+//! * [`back`] — the callback-driven raw-DEFLATE decoder
+//!   ([`back::inflate_back`] and friends), the safe-Rust counterpart of C
+//!   `infback.c`. It layers on top of [`state`], [`tables`], [`fixed`], so it
+//!   is declared after them.
 //!
-//! The remaining inflate driver entry points (`inflate`, `inflateBack`) layer on
-//! top of these types in a subsequent milestone.
+//! The remaining `inflate` streaming driver entry point layers on top of these
+//! types in a subsequent milestone.
 
 pub mod tables;
 
@@ -24,3 +28,5 @@ pub mod fixed;
 pub mod state;
 
 pub mod fast;
+
+pub mod back;
