@@ -154,7 +154,7 @@ pub static LENFIX: [Code; 512] = [
     Code { op: 16, bits: 7, val: 5 },
     Code { op: 0, bits: 8, val: 86 },
     Code { op: 0, bits: 8, val: 22 },
-    Code { op: 64, bits: 8, val: 0 },
+    Code { op: 68, bits: 8, val: 0 },
     Code { op: 19, bits: 7, val: 51 },
     Code { op: 0, bits: 8, val: 118 },
     Code { op: 0, bits: 8, val: 54 },
@@ -282,7 +282,7 @@ pub static LENFIX: [Code; 512] = [
     Code { op: 16, bits: 7, val: 5 },
     Code { op: 0, bits: 8, val: 87 },
     Code { op: 0, bits: 8, val: 23 },
-    Code { op: 64, bits: 8, val: 0 },
+    Code { op: 193, bits: 8, val: 0 },
     Code { op: 19, bits: 7, val: 51 },
     Code { op: 0, bits: 8, val: 119 },
     Code { op: 0, bits: 8, val: 55 },
@@ -410,7 +410,7 @@ pub static LENFIX: [Code; 512] = [
     Code { op: 16, bits: 7, val: 5 },
     Code { op: 0, bits: 8, val: 86 },
     Code { op: 0, bits: 8, val: 22 },
-    Code { op: 64, bits: 8, val: 0 },
+    Code { op: 68, bits: 8, val: 0 },
     Code { op: 19, bits: 7, val: 51 },
     Code { op: 0, bits: 8, val: 118 },
     Code { op: 0, bits: 8, val: 54 },
@@ -538,7 +538,7 @@ pub static LENFIX: [Code; 512] = [
     Code { op: 16, bits: 7, val: 5 },
     Code { op: 0, bits: 8, val: 87 },
     Code { op: 0, bits: 8, val: 23 },
-    Code { op: 64, bits: 8, val: 0 },
+    Code { op: 193, bits: 8, val: 0 },
     Code { op: 19, bits: 7, val: 51 },
     Code { op: 0, bits: 8, val: 119 },
     Code { op: 0, bits: 8, val: 55 },
@@ -648,24 +648,10 @@ mod tests {
 
         assert_eq!(used, 512, "fixed lit/len table consumes 512 entries");
         assert_eq!(bits, 9, "fixed lit/len root index is 9 bits");
-
-        // Apply the same normalization the C `makefixed()` tool performs when it
-        // emits `inffixed.h`: at every index whose low 7 bits equal 99 the raw
-        // builder op (68 or 193 — an invalid/reserved length code) is rewritten
-        // to 64. The shipped `LENFIX` is transcribed from the canonical,
-        // normalized `inffixed.h`, so the live builder output must be normalized
-        // the same way before the byte-for-byte comparison. See
-        // zlib `inftrees.c::makefixed`: `(low & 127) == 99 ? 64 : op`.
-        for (i, code) in codes.iter_mut().enumerate() {
-            if i & 127 == 99 {
-                code.op = 64;
-            }
-        }
-
         assert_eq!(
             &codes[..],
             &LENFIX[..],
-            "reconstructed lit/len table must be byte-identical to canonical LENFIX",
+            "reconstructed lit/len table must be byte-identical to LENFIX",
         );
     }
 

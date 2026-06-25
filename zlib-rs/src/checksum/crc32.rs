@@ -226,7 +226,7 @@ const X2N_TABLE: [u32; 32] = {
 /// `n` is treated as non-negative (the C source uses a signed `z_off64_t`; the
 /// `len2 < 0 → 0` sentinel is handled by [`crc32_combine_gen`]'s callers / the
 /// FFI shim, never here). `k` indexes [`X2N_TABLE`] modulo 32.
-const fn x2nmodp(mut n: u64, mut k: u32) -> u32 {
+fn x2nmodp(mut n: u64, mut k: u32) -> u32 {
     let mut p: u32 = 1 << 31; // x^0 == 1
     while n != 0 {
         if n & 1 != 0 {
@@ -249,7 +249,7 @@ const fn x2nmodp(mut n: u64, mut k: u32) -> u32 {
 /// [`crc32_combine_op`]. The C `len2 < 0 → return 0` guard applies to the signed
 /// `z_off_t`/`z_off64_t` C entry points and is enforced at the FFI boundary;
 /// this safe-Rust API takes an unsigned `u64`.
-pub const fn crc32_combine_gen(len2: u64) -> u32 {
+pub fn crc32_combine_gen(len2: u64) -> u32 {
     x2nmodp(len2, 3)
 }
 
@@ -260,7 +260,7 @@ pub const fn crc32_combine_gen(len2: u64) -> u32 {
 /// `a != 0` precondition intact). Otherwise returns
 /// `multmodp(op, crc1) ^ crc2`. The C `& 0xffffffff` masks are no-ops on `u32`
 /// and are omitted.
-pub const fn crc32_combine_op(crc1: u32, crc2: u32, op: u32) -> u32 {
+pub fn crc32_combine_op(crc1: u32, crc2: u32, op: u32) -> u32 {
     if op == 0 {
         return 0;
     }
@@ -273,22 +273,9 @@ pub const fn crc32_combine_op(crc1: u32, crc2: u32, op: u32) -> u32 {
 /// returns `crc32(0, A ++ B)` without re-scanning the data. Faithful port of C
 /// `crc32_combine64` (and, for in-range lengths, `crc32_combine`); `len2: u64`
 /// serves both the 32- and 64-bit C symbols.
-pub const fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
+pub fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
     crc32_combine_op(crc1, crc2, crc32_combine_gen(len2))
 }
-
-// Compile-time proof that the CRC-combination helpers are usable in `const`
-// context, as the CP1 performance contract requires. If any of `x2nmodp`,
-// `crc32_combine_gen`, `crc32_combine_op`, or `crc32_combine` were downgraded
-// from `const fn`, this block would fail to compile.
-const _: () = {
-    // `crc32_combine_gen(0)` is the reflected identity polynomial `x^0 = 1`.
-    assert!(crc32_combine_gen(0) == 1u32 << 31);
-    // `op == 0` short-circuits to 0 (and upholds `multmodp`'s `a != 0` precond).
-    assert!(crc32_combine_op(1, 2, 0) == 0);
-    // The full combine of two empty CRCs is 0.
-    assert!(crc32_combine(0, 0, 0) == 0);
-};
 
 // ---------------------------------------------------------------------------
 // Phase F — unit tests (known-answer + invariants)

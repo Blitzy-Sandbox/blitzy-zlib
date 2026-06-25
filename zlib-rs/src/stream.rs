@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn end_inflate_state_is_ok_and_frees() {
         let mut z = ZStream::new();
-        z.set_inflate_state(Box::new(InflateState::new(15)));
+        z.set_inflate_state(InflateState::new(15).expect("inflate state allocation"));
         assert!(z.is_inflate());
         assert_eq!(z.end(), Ok(ReturnCode::Ok));
         assert!(!z.is_initialized());
