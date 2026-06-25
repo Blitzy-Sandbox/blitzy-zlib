@@ -480,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "libz-rs-sys-cdylib"
-version = "0.1.0"
+version = "1.3.2"
 dependencies = [
  "libz-rs-sys",
 ]

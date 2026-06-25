@@ -1,39 +1,137 @@
-# The drop-in shared/static library member.
+# ===========================================================================
+# `libz-rs-sys-cdylib` — drop-in shared/static library artifact crate
+# (workspace member #3, the leaf).
 #
-# Builds the `libz-rs-sys` C-ABI shim into a C-consumable `cdylib` (`libz.so`)
-# and `staticlib` (`libz.a`), so existing C programs can relink against the Rust
-# implementation without source changes (AAP §0.3.1). It re-exports the shim's
-# full `#[unsafe(no_mangle)]` export surface so the emitted artifacts carry the
-# complete `zlib.h` C symbol table.
+# Emits the native C artifacts `libz.so` (cdylib) and `libz.a` (staticlib) as
+# genuine binary replacements for C zlib's `libz`, so existing C programs relink
+# against the Rust implementation with `-lz` and zero source changes
+# (AAP §0.2.1 / §0.3.1 / §0.4.1, goal G4). It wraps the `libz-rs-sys` C-ABI
+# shim, which wraps the safe `zlib-rs` core:
+#
+#     libz-rs-sys-cdylib  ->  libz-rs-sys  ->  zlib-rs
+#
+# This manifest REPLACES the C build (CMakeLists.txt) that produced the
+# shared/static `libz` libraries — it is NOT a 1:1 CMake port.
+#
+# Every exported C symbol (the deflate / inflate / gz* / checksum / version
+# families) comes ENTIRELY from `libz-rs-sys`; this crate declares NO zlib
+# symbols. `src/lib.rs` does `pub use libz_rs_sys::*;` so the linker retains the
+# full set in the produced libraries (an unreferenced `#[unsafe(no_mangle)]`
+# export can otherwise be dead-stripped from a cdylib/staticlib).
+#
+# As a workspace MEMBER it INHERITS shared metadata (version / edition /
+# rust-version / license / …) from the workspace root `Cargo.toml`. It declares
+# NO `[profile.*]` table and NO `panic` setting — profiles are workspace-global
+# (valid only in the root manifest) and the root deliberately keeps unwinding
+# enabled so the `zlib-rs` tests/benches can unwind. It re-pins NO dependency
+# versions locally.
+# ===========================================================================
+
 [package]
 name = "libz-rs-sys-cdylib"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
-license = "Zlib"
-description = "Drop-in cdylib/staticlib (libz.so / libz.a) built from the libz-rs-sys C-ABI shim."
+# Inherited from `[workspace.package]` — the single source of truth. `version`
+# resolves to the workspace SemVer `1.3.2`. NOTE: the runtime `ZLIB_VERSION`
+# string `"1.3.2.1-motley"` that `zlibVersion()` returns is a SEPARATE constant
+# living in the `zlib-rs` core and re-exposed through `libz-rs-sys`; it is
+# deliberately NOT the Cargo `version` (Cargo rejects a 4-part `1.3.2.1`).
+version.workspace = true
+edition.workspace = true      # resolves to 2024
+rust-version.workspace = true # resolves to the 1.85 MSRV
+license.workspace = true      # resolves to SPDX `Zlib`
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+# A crate-specific description distinguishes the drop-in artifact from the core
+# and the FFI shim (inheriting `description.workspace = true` would also be
+# acceptable per the AAP; a crate-specific string is preferred).
+description = "A drop-in replacement for the zlib C library (libz.so / libz.a), backed by the safe-Rust zlib-rs core via the libz-rs-sys C-ABI shim."
+# Points at the sibling build script that OPTIONALLY wires `../zlib.map` as a
+# GNU ld `--version-script` (gated by the `version-script` feature; see below).
+# Cargo also auto-detects `build.rs`; declaring it explicitly is clearer.
+build = "build.rs"
 
-# Naming the library target `z` makes the emitted artifacts `libz.so` / `libz.a`,
-# the conventional zlib shared/static library names for a true drop-in.
 [lib]
+# Base name `z` makes the emitted artifacts `libz.so` / `libz.a` (Cargo prefixes
+# `lib` and appends the platform extension: `.so`/`.dylib`/`.dll` for the
+# cdylib, `.a`/`.lib` for the staticlib). This matches CMakeLists.txt, which
+# sets `OUTPUT_NAME z` for BOTH the shared (`zlib`) and static (`zlibstatic`)
+# targets, so existing C consumers can link `-lz` unchanged.
 name = "z"
+# Exactly these two artifact kinds (AAP §0.3.1 / §0.4.1): `cdylib` -> `libz.so`,
+# `staticlib` -> `libz.a`. Declaring `crate-type` in the manifest (never via a
+# `cargo rustc --crate-type` override) is what lets Cargo build the `libz-rs-sys`
+# dependency in the right format. `rlib` is intentionally NOT added: this crate
+# has no in-tree tests (the suite lives in `zlib-rs`).
 crate-type = ["cdylib", "staticlib"]
 
 # ---------------------------------------------------------------------------
-# Features.
+# Dependencies.
 #
-# A genuine `zlib.h` drop-in (AAP G4) must export ALL 73 public symbols,
-# INCLUDING the C-variadic `gzprintf`. Defining a C-variadic `extern "C"` fn
-# requires the unstable `feature(c_variadic)` (nightly), so `gzprintf` lives
-# behind `libz-rs-sys`'s `c-variadic` feature. The drop-in artifact therefore
-# enables it BY DEFAULT — the workspace pins a nightly toolchain
-# (`rust-toolchain.toml`) so this builds — yielding the full 73-symbol
-# `libz.so` / `libz.a`. Build with `--no-default-features` to drop `gzprintf`
-# (72 symbols) on a toolchain without `c_variadic`.
+# `libz-rs-sys` is the ONLY dependency: the C-ABI shim that defines every
+# `#[unsafe(no_mangle)] extern "C"` zlib symbol. The deeper crates (`zlib-rs`,
+# and `libc` / `crc32fast` / `cfg-if`) flow in transitively — none are declared
+# here, and there are NO `[build-dependencies]` (the version-script wiring in
+# `build.rs` uses only `std`).
+#
+# `default-features = false` hands feature control to THIS crate's `[features]`
+# table below. It is REQUIRED for correct minimal builds: with it,
+# `cargo build -p libz-rs-sys-cdylib --no-default-features` genuinely turns the
+# shim's `std` / `gzip` / `gz-io` / `simd` OFF (otherwise the shim's own
+# defaults would stay on and `--no-default-features` could not drop the `gz*`
+# symbols).
+# ---------------------------------------------------------------------------
+[dependencies]
+libz-rs-sys = { path = "../libz-rs-sys", default-features = false }
+
+# ---------------------------------------------------------------------------
+# Feature flags (AAP §0.5.4).
+#
+# Each feature (except the local `version-script` marker) FORWARDS to the same
+# feature on `libz-rs-sys`, which in turn forwards to `zlib-rs`. Because the
+# dependency above is taken with `default-features = false`, these forwards are
+# the ONLY thing that toggles the shim's (and the core's) facilities.
+#
+# The default set reproduces a typical native build of C zlib AND a TRUE
+# `zlib.h` drop-in:
+#   * `gz-io`      is load-bearing — it gates the 26 `gz*` C symbols in
+#                  `libz-rs-sys` (`#[cfg(feature = "gz-io")]`); dropping it
+#                  silently removes them from `libz.so` / `libz.a`.
+#   * `c-variadic` is load-bearing for FULL 73-symbol parity (AAP §0.4.1, G4):
+#                  it gates the single genuinely C-variadic export `gzprintf`
+#                  (`#[cfg(all(feature = "gz-io", feature = "c-variadic"))]` in
+#                  the shim), whose definition needs the unstable
+#                  `#![feature(c_variadic)]`. The workspace pins a nightly
+#                  toolchain (`rust-toolchain.toml`) expressly so this default
+#                  build emits the complete 73-symbol drop-in. Omitting it would
+#                  yield a 72-symbol library and make the nightly pin pointless.
+#   * `simd`       forwards the hardware-accelerated CRC-32 path. It MUST be
+#                  listed explicitly here: because `libz-rs-sys` takes `zlib-rs`
+#                  with `default-features = false`, SIMD is NOT enabled
+#                  transitively, so a drop-in that omitted this forward would
+#                  fall back to scalar CRC-32 (correct, but below the §0.7.2
+#                  throughput target). It is a valid forward — `libz-rs-sys`
+#                  declares a `simd` feature — so no "undefined feature" risk.
+#   * `capi`       is the MARKER feature used by `cargo-c` and the C-ABI build
+#                  to identify this crate (a no-op inside the shim).
+#
+# `cargo build -p libz-rs-sys-cdylib --no-default-features` builds the minimal
+# `no_std`, gz-off library (the `gz*` symbols are then intentionally absent).
 # ---------------------------------------------------------------------------
 [features]
-default = ["c-variadic"]
+default = ["std", "gzip", "gz-io", "simd", "capi", "c-variadic"]
+std = ["libz-rs-sys/std"]
+gzip = ["libz-rs-sys/gzip"]
+gz-io = ["libz-rs-sys/gz-io"]
+simd = ["libz-rs-sys/simd"]
+capi = ["libz-rs-sys/capi"]
 c-variadic = ["libz-rs-sys/c-variadic"]
-
-[dependencies]
-libz-rs-sys = { path = "../libz-rs-sys" }
+# Opt-in (OFF by default): wire `../zlib.map` as a GNU ld `--version-script` for
+# a versioned `.so`, mirroring the C build (CMakeLists.txt links the shared
+# library with `-Wl,--version-script,zlib.map`). OFF by default because several
+# `zlib.map` symbols (64-bit `*64` variants, internal locals, `*_z` aliases) are
+# NOT in the Rust shim's exported set, and a strict linker
+# (`--no-undefined-version`, the modern GNU ld default) would error. `build.rs`
+# reads `CARGO_FEATURE_VERSION_SCRIPT`, links the script best-effort on
+# GNU-ld UNIX targets (adding `--undefined-version` to tolerate the gaps), and
+# warns + skips elsewhere. Empty payload: it forwards to no other feature.
+version-script = []
