@@ -24,3 +24,60 @@ members = [
     "libz-rs-sys",
     "libz-rs-sys-cdylib",
 ]
+
+# ---------------------------------------------------------------------------
+# Shared package metadata.
+#
+# Members opt in field-by-field with `field.workspace = true`, keeping a single
+# source of truth for the version, edition, MSRV, and licensing of the whole
+# tree. The crate `version` is a valid 3-part SemVer (`1.3.2`); it tracks the C
+# baseline `1.3.2.1-motley` but does NOT encode the `-motley` build tag, which
+# Cargo would reject. The runtime `ZLIB_VERSION` string returned by
+# `zlibVersion()` is a separate constant handled inside the crates.
+# ---------------------------------------------------------------------------
+[workspace.package]
+version = "1.3.2"
+edition = "2024"
+rust-version = "1.85"
+license = "Zlib"
+homepage = "https://zlib.net"
+repository = "https://github.com/madler/zlib"
+description = "A safe, idiomatic, pure-Rust rewrite of the zlib compression library (DEFLATE / zlib / gzip) with a C-ABI drop-in shim."
+authors = ["Jean-loup Gailly", "Mark Adler"]
+keywords = ["zlib", "deflate", "compression", "gzip", "inflate"]
+categories = ["compression", "no-std"]
+
+# ---------------------------------------------------------------------------
+# Shared dependency version pins (the single source of truth).
+#
+# Members reference these with `dep = { workspace = true }` and never re-pin a
+# version locally. Runtime crates are deliberately minimal — only `crc32fast`
+# and `cfg-if` reach the shipped core; `libc` is confined to the FFI shim; and
+# `cbindgen` (build), `criterion` / `flate2` / `quickcheck` / `rand` (dev) are
+# never linked into a shipped artifact.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+# Runtime — core (`zlib-rs`)
+crc32fast = "1.5.0"
+cfg-if = "1.0.4"
+# Runtime — FFI shim (`libz-rs-sys`) only
+libc = "0.2"
+# Build tool — FFI shim header generation
+cbindgen = "0.29"
+# Dev / validation — benchmarks, the C-zlib oracle, property tests, RNG
+criterion = "0.5.1"
+flate2 = "1.1.9"
+quickcheck = "1.1.0"
+rand = "0.9.2"
+
+# ---------------------------------------------------------------------------
+# Release profile (workspace-global; only valid in the root manifest).
+#
+# Maximizes the optimizer and enables full LTO with a single codegen unit so
+# the compression hot loops match the performance targets in the technical
+# specification. Members must NOT declare their own `[profile.*]` tables.
+# ---------------------------------------------------------------------------
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

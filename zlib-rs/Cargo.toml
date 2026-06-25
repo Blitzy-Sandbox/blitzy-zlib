@@ -1,59 +1,127 @@
-# The safe, pure-Rust core of the zlib port.
+# `zlib-rs` — the safe, pure-Rust CORE crate of the zlib → Rust workspace.
 #
-# Behavioral contract (AAP §0.2.2, §0.6.2): the entire crate is built under
-# `#![forbid(unsafe_code)]` and is `no_std`-capable. It carries the deliberately
-# minimal runtime-dependency footprint of the C baseline — only `cfg-if` (always)
-# and `crc32fast` (optional, behind the `simd` feature).
+# This is workspace member #1 and the foundation of the tree: `libz-rs-sys`
+# (the C-ABI shim) depends on it, and `libz-rs-sys-cdylib` depends on it
+# transitively. It replaces `CMakeLists.txt` / `configure` / Bazel for this
+# crate's dependency and build management — it is NOT a 1:1 port of CMake logic.
+#
+# Behavioral contract (AAP §0.2.2, §0.6.2): the whole crate is compiled under
+# `#![forbid(unsafe_code)]` and is `no_std`-capable. It preserves the C
+# library's near-zero-dependency profile — only `cfg-if` (always) and
+# `crc32fast` (optional, behind the `simd` feature) reach the shipped artifact.
+#
+# All shared metadata, dependency version pins, and the release profile are
+# inherited from the workspace root `Cargo.toml`; this member never re-pins a
+# version locally and never declares a `[profile.*]` table.
+
 [package]
 name = "zlib-rs"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
-license = "Zlib"
-description = "Idiomatic, memory-safe pure-Rust port of the zlib compression library (DEFLATE / zlib / gzip), with bit-identical output as the goal."
+# Inherited from `[workspace.package]` (single source of truth).
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+# A crate-specific description distinguishes the safe core from the workspace
+# and the FFI shim crates.
+description = "Safe, pure-Rust core of the zlib compression library rewrite (DEFLATE / zlib / gzip), bit-identical to C zlib."
+keywords = ["zlib", "deflate", "compression", "gzip", "inflate"]
 categories = ["compression", "no-std"]
-keywords = ["zlib", "deflate", "gzip", "compression", "inflate"]
-
-# `build.rs` generates the 256-entry byte-wise CRC-32 table into `OUT_DIR`,
-# replacing the precomputed C `crc_table[]`. `crc32.rs` pulls it in with
-# `include!(concat!(env!("OUT_DIR"), "/crc32_table.rs"))`, so the build script is
-# required on every build (SIMD and scalar paths alike).
+readme = "README.md"
+# `build.rs` generates the 256-entry byte-wise CRC-32 table into `OUT_DIR`; the
+# scalar checksum path includes it, so the build script runs on every build.
 build = "build.rs"
 
+[lib]
+# Declared explicitly for clarity: integration tests, benches, and the
+# `libz-rs-sys` shim import the crate as `use zlib_rs::...` (underscore). Cargo
+# already derives `zlib_rs` from the package name `zlib-rs`, but pinning it
+# guards against accidental drift. The default `rlib` crate-type is correct —
+# the `cdylib` / `staticlib` artifacts come from the `libz-rs-sys-cdylib`
+# member, never from here.
+name = "zlib_rs"
+path = "src/lib.rs"
+
+# ---------------------------------------------------------------------------
+# Feature flags — mirror the C library's compile-time configuration.
+#
+# `simd` is the only feature that pulls a dependency: `dep:crc32fast` is added
+# ONLY when `simd` is enabled, so a `--no-default-features` build links no
+# `crc32fast` at all and `src/checksum/crc32.rs` falls back to the scalar,
+# build-script-generated CRC-32 table.
+#
+# std vs no-std: the crate root is `#![cfg_attr(not(feature = "std"), no_std)]`,
+# so disabling the (default) `std` feature — i.e. `--no-default-features` —
+# yields a `core` + `alloc` build mirroring C `Z_SOLO`. The separate `no-std`
+# feature is only a NAMED marker for parity/discoverability; it does NOT, by
+# itself, remove `std` (the single "std present?" question is keyed off `std`).
+# ---------------------------------------------------------------------------
 [features]
-# Default to the standard library plus the hardware-accelerated checksum path,
-# matching a typical native build of C zlib.
-default = ["std", "simd"]
-
-# `std` enables the standard library (the `gz*` file-I/O layer, the
-# `std::error::Error` impl, etc.). When `std` is OFF the crate is `#![no_std]`
-# and uses only `core` + `alloc`. The weak `crc32fast?/std` propagation gives
-# `crc32fast` its runtime SIMD detection only when both `std` and `simd` are on.
-std = ["crc32fast?/std"]
-
-# gzip container support (mirrors the C `GZIP` define).
+# Standard library + hardware-accelerated checksum + full gzip support, i.e. a
+# typical native build of C zlib.
+default = ["std", "gzip", "gz-io", "simd"]
+# Enables `std`-backed facilities (the `gz*` file-I/O layer via `std::fs` /
+# `std::io`, the `std::error::Error` impl, run-time SIMD detection in
+# `crc32fast`, …). With it OFF the crate is `#![no_std]` (core + alloc).
+std = []
+# gzip CONTAINER support in deflate/inflate (mirrors the C `GZIP` define).
 gzip = []
-
-# gzip file I/O (mirrors the C `#ifndef NO_GZCOMPRESS`); requires the std layer.
+# gzip FILE I/O — the buffered `gz*` API (gzopen/gzread/gzwrite/…). Mirrors the
+# C `#ifndef NO_GZCOMPRESS`; requires both `std` and `gzip`.
 gz-io = ["std", "gzip"]
-
-# Explicit marker mirroring the C `Z_SOLO` configuration. The actual `no_std`
-# switch is the *absence* of `std`; this alias exists for parity/discoverability.
+# Z_SOLO-parity marker (compression/decompression/checksums only, no file I/O).
+# NOTE: this is a NAMED alias for API/config parity — the actual `#![no_std]`
+# switch is keyed off `not(feature = "std")`, NOT off this flag, so enabling
+# `no-std` does not by itself disable `std`.
 no-std = []
-
-# Hardware-accelerated CRC-32 via the `crc32fast` crate. Disabling it
-# (`--no-default-features`) selects the always-correct scalar table fallback.
+# Hardware-accelerated CRC-32 via `crc32fast`. Disabling it (e.g.
+# `--no-default-features`) selects the always-correct scalar table fallback.
 simd = ["dep:crc32fast"]
 
-# Gates the C-ABI layer build (the `libz-rs-sys` shim / cdylib). The pure-Rust
-# core can be built and tested without ever pulling in the FFI surface.
-capi = []
-
+# ---------------------------------------------------------------------------
+# Runtime dependencies (core only) — versions inherited from the workspace.
+#
+# Deliberately minimal (AAP §0.5.1 / §0.7.2: the pure-Rust artifact carries no
+# C dependency). Only two crates, and `crc32fast` is optional / `simd`-gated so
+# the scalar / `no_std` path builds without it.
+# ---------------------------------------------------------------------------
 [dependencies]
-# Ergonomic conditional compilation, replacing the C `#if`/`#ifdef` chains.
-cfg-if = "1.0.4"
+# Ergonomic conditional compilation, replacing the C `#if` / `#ifdef` chains.
+cfg-if = { workspace = true }
+# SIMD-accelerated CRC-32 (IEEE), `no_std`-friendly. Optional and pulled in only
+# under the `simd` feature (see `[features]` above).
+crc32fast = { workspace = true, optional = true }
 
-# SIMD-accelerated CRC-32 (IEEE). Optional and `no_std`-friendly: built with
-# `default-features = false` so it never forces `std`; the `std` feature above
-# re-enables its runtime detection when appropriate.
-crc32fast = { version = "1.5.0", optional = true, default-features = false }
+# ---------------------------------------------------------------------------
+# Dev-dependencies — validation & benchmarking only; never shipped.
+# ---------------------------------------------------------------------------
+[dev-dependencies]
+# Statistical benchmarks (used by `benches/*.rs`).
+criterion = { workspace = true }
+# The C-zlib interop ORACLE for byte-for-byte validation (`tests/interop.rs`).
+# This is the ONLY place the C zlib backend appears, and it is dev-only.
+flate2 = { workspace = true }
+# Property-based round-trip testing (`tests/round_trip.rs`).
+quickcheck = { workspace = true }
+# Random data generation for tests/benches.
+rand = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Benchmarks — criterion requires the default libtest harness to be disabled.
+# Auto-discovery would attach the libtest harness and break `cargo bench`, so
+# every bench target is declared explicitly with `harness = false`. The names
+# match `benches/<name>.rs`.
+# ---------------------------------------------------------------------------
+[[bench]]
+name = "deflate_bench"
+harness = false
+
+[[bench]]
+name = "inflate_bench"
+harness = false
+
+[[bench]]
+name = "checksum_bench"
+harness = false
