@@ -141,3 +141,92 @@ pub use back::{InflateBackResult, inflate_back, inflate_back_end, inflate_back_i
 // reachable at their submodule paths (e.g. `crate::inflate::tables::inflate_table`)
 // for in-crate use and the FFI shim, but are not part of the idiomatic public
 // decompressor API.
+
+// ---------------------------------------------------------------------------
+// `ZStream`-threaded decompression entry point (C-style free function)
+// ---------------------------------------------------------------------------
+//
+// These imports back the single free `inflate` function below — the only item
+// in this root that operates on a [`ZStream`] rather than re-exporting a
+// submodule symbol. They mirror the import set used by the sibling
+// `crate::deflate::deflate` free function for cross-module consistency.
+use crate::constants::Flush;
+use crate::error::{Result, ReturnCode, ZlibError};
+use crate::stream::ZStream;
+
+/// One decompression step over a caller-owned [`ZStream`] — the free-function
+/// counterpart to C `inflate(z_streamp strm, int flush)` and the direct sibling
+/// of [`crate::deflate::deflate`].
+///
+/// The idiomatic core keeps the decompressor as inherent methods on an owned
+/// [`InflateState`] (see the C-symbol map in the module docs). This thin wrapper
+/// bridges that method-based engine to the [`ZStream`] container that the
+/// `libz-rs-sys` FFI shim threads through every `inflate*` call: it borrows the
+/// stream's inflate state, runs exactly one [`InflateState::inflate`] step over
+/// the borrowed `input` / `output` slices, then **publishes** the engine's
+/// post-step scalars back onto the public stream so a C caller observing the
+/// `z_stream` fields sees the same values C zlib would write:
+///
+/// * `strm.adler`     ← `state.check` (the running Adler-32 for zlib streams or
+///   CRC-32 for gzip streams, exactly as C surfaces `strm->adler`),
+/// * `strm.total_in`  ← `state.total_in`  (lifetime input bytes consumed),
+/// * `strm.total_out` ← `state.total_out` (lifetime output bytes produced),
+/// * `strm.data_type` ← `state.data_type` (block-type / bit-position bits),
+/// * `strm.msg`       ← `state.msg`        (static diagnostic message, if any).
+///
+/// The engine maintains its lifetime totals cumulatively on the owned state
+/// (via `wrapping_add`, matching C unsigned-counter semantics), so the wrapper
+/// **copies** the current cumulative values out rather than accumulating again —
+/// adding here would double-count across successive calls.
+///
+/// # Return value
+///
+/// `(consumed, produced, result)` — input bytes consumed, output bytes produced,
+/// and the typed engine status. **The tuple order is `(usize, usize, Result)`,
+/// the reverse of [`crate::deflate::deflate`]'s `(Result, usize, usize)`.** The
+/// `libz-rs-sys` translation shim (`run_inflate`) destructures this exact order;
+/// do not reorder it.
+///
+/// If `strm` is not a currently-initialized inflate stream (no inflate state is
+/// installed), this performs no work and returns
+/// `(0, 0, Err(ZlibError::StreamError))`, matching C `inflate`'s
+/// `inflateStateCheck` failure path which yields `Z_STREAM_ERROR`.
+pub fn inflate(
+    strm: &mut ZStream,
+    input: &[u8],
+    output: &mut [u8],
+    flush: Flush,
+) -> (usize, usize, Result<ReturnCode>) {
+    // Capture every value we must publish *inside* the `Some` arm: the mutable
+    // borrow of `strm` (held via `state`) must end before we can write the
+    // `strm.*` mirror fields, so we read the engine's scalars into locals first
+    // and let the borrow drop at the arm's end.
+    let (consumed, produced, result, check, total_in, total_out, data_type, msg) =
+        match strm.inflate_state_mut() {
+            Some(state) => {
+                let r = state.inflate(input, output, flush);
+                (
+                    r.consumed,
+                    r.produced,
+                    r.status,
+                    state.check,
+                    state.total_in,
+                    state.total_out,
+                    state.data_type,
+                    state.msg,
+                )
+            }
+            // C `inflateStateCheck` failure → Z_STREAM_ERROR, no progress.
+            None => (0, 0, Err(ZlibError::StreamError), 0, 0, 0, 0, None),
+        };
+
+    // Publish the engine's post-step scalars onto the public stream, mirroring
+    // C `inflate`, which writes these straight into the caller's `z_stream`.
+    strm.adler = check;
+    strm.total_in = total_in;
+    strm.total_out = total_out;
+    strm.data_type = data_type;
+    strm.msg = msg;
+
+    (consumed, produced, result)
+}

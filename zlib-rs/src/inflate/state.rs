@@ -58,11 +58,12 @@
 //!
 //! zlib invokes the `inflate_fast()` inner loop (the sibling `fast.rs` module)
 //! from the `LEN` state when `have >= 6 && left >= 258`. That routine is a pure
-//! *performance* optimization: it and the per-code slow path that lives here
-//! produce byte-identical output. Because `fast.rs` is not one of this file's
-//! declared dependencies, this module implements the complete, self-contained
-//! slow per-code decode for every length/literal/distance symbol. Output remains
-//! bit-exact with C zlib; only peak throughput differs.
+//! *performance* optimization: it and the per-code slow path that also lives
+//! here produce byte-identical output. The `LEN` arm wires this in exactly as C
+//! does — calling [`crate::inflate::fast::inflate_fast`] under those entry
+//! conditions and falling back to the complete, self-contained slow per-code
+//! decode whenever input or output is too small for the fast loop. Output is
+//! bit-exact with C zlib either way; only peak throughput differs.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -72,6 +73,7 @@ use crate::checksum::adler32;
 use crate::checksum::crc32;
 use crate::constants::{DEF_WBITS, Flush, Z_DEFLATED};
 use crate::error::{Result, ReturnCode, ZlibError};
+use crate::inflate::fast::inflate_fast;
 use crate::inflate::fixed::{DISTFIX, LENFIX};
 use crate::inflate::tables::{Code, CodeType, ENOUGH, inflate_table};
 
@@ -696,9 +698,10 @@ impl InflateState {
 //
 // NOTE ON THE FAST PATH: the C engine calls `inflate_fast` whenever
 // `have >= 6 && left >= 258`. That routine is a pure throughput optimization
-// that produces byte-identical output to the per-code "slow" path. It is not
-// part of this file's verified dependency set, so this port always runs the
-// safe per-code decode below. Output is bit-exact with C zlib.
+// that produces byte-identical output to the per-code "slow" path. The `Len`
+// arm below wires it in under exactly those entry conditions (matching C
+// `case LEN`), then falls back to the safe per-code decode when the buffers
+// are too small. Output is bit-exact with C zlib either way.
 // ===========================================================================
 
 impl InflateState {
@@ -815,9 +818,13 @@ impl InflateState {
                             if self.wbits == 0 {
                                 self.wbits = 15;
                             }
-                            let c0 = crc32(0, &[]);
+                            // C seeds the gzip header CRC-32 with the literal
+                            // initial value 0 (`crc32(0L, Z_NULL, 0)`), then
+                            // folds in the two magic bytes via the `CRC2` macro.
+                            // Use the literal 0 directly per the CP2
+                            // checksum-init rule (review finding #6).
                             let hb = (hold as u32).to_le_bytes();
-                            self.check = crc32(c0, &hb[..2]);
+                            self.check = crc32(0, &hb[..2]);
                             init_bits!();
                             self.mode = InflateMode::Flags;
                             continue 'inf;
@@ -1052,8 +1059,10 @@ impl InflateState {
                         head.hcrc = ((fl >> 9) & 1) != 0;
                         head.done = true;
                     }
-                    // gzip running check restarts for the data CRC-32.
-                    self.check = crc32(0, &[]);
+                    // gzip running check restarts for the data CRC-32, seeded
+                    // with the literal CRC-32 initial value 0 per the CP2
+                    // checksum-init rule (`crc32(0L, Z_NULL, 0)`, finding #6).
+                    self.check = 0;
                     self.mode = InflateMode::Type;
                 }
                 // When the `gzip` feature is disabled the eight gzip-header
@@ -1373,6 +1382,44 @@ impl InflateState {
                     self.mode = InflateMode::Len;
                 }
                 InflateMode::Len => {
+                    // Fast path (inflate.c `case LEN`): when at least 6 input
+                    // bytes and 258 output bytes are buffered, hand control to
+                    // the `inflate_fast` inner loop. It decodes whole
+                    // literal/length/distance runs with minimal per-symbol
+                    // overhead and produces byte-identical output to the
+                    // per-code slow path below (review finding #1; this is the
+                    // required hot-path architecture of AAP §0.6.4 / Rule 13).
+                    if have >= 6 && left >= 258 {
+                        // Sync the local bit accumulator into the state, since
+                        // `inflate_fast` works on `self.hold`/`self.bits`.
+                        self.hold = hold;
+                        self.bits = bits;
+                        // `start == out0` (avail_out at this call's entry) makes
+                        // `inflate_fast`'s `beg == 0` — the output index where
+                        // this call began writing (`put` starts at 0) — so a
+                        // distance reaching no farther than the bytes produced
+                        // this call is copied from `output`, and a deeper one
+                        // from the (pre-call) sliding window. This mirrors C
+                        // `inflate_fast(strm, out)`.
+                        inflate_fast(self, input, &mut next, output, &mut put, out0);
+                        // Reload the locals: `inflate_fast` advanced `next`/`put`
+                        // (through the `&mut` cursors) and wrote back
+                        // `self.hold`/`self.bits`. Recompute `have`/`left` from
+                        // the updated cursors.
+                        hold = self.hold;
+                        bits = self.bits;
+                        have = input.len() - next;
+                        left = output.len() - put;
+                        // C: a clean end-of-block leaves mode TYPE; record
+                        // `back = -1` (not mid-code). When the fast path instead
+                        // ran out of input/output, mode is still Len and the
+                        // re-dispatch falls through to the slow path (now with
+                        // `have < 6` or `left < 258`); on a bad code mode is Bad.
+                        if self.mode == InflateMode::Type {
+                            self.back = -1;
+                        }
+                        continue 'inf;
+                    }
                     self.back = 0;
                     let mut here = loop {
                         let h = self.codes[self.lencode + bits_val!(self.lenbits) as usize];
@@ -1556,8 +1603,11 @@ impl InflateState {
                     if self.wrap != 0 {
                         need_bits!('inf, 32);
                         let produced = out_mark - left;
-                        self.total_out += produced as u64;
-                        self.total += produced as u64;
+                        // C unsigned-counter parity: `total_out`/`total` are
+                        // unsigned and wrap on overflow; `wrapping_add` matches
+                        // that and avoids a debug overflow panic (finding #13).
+                        self.total_out = self.total_out.wrapping_add(produced as u64);
+                        self.total = self.total.wrapping_add(produced as u64);
                         if (self.wrap & 4) != 0 && produced != 0 {
                             let c = self.update_check(&output[put - produced..put]);
                             self.check = c;
@@ -1651,9 +1701,10 @@ impl InflateState {
 
         // Account consumed input and produced output (matching C exactly).
         let consumed = in0 - have;
-        self.total_in += consumed as u64;
-        self.total_out += copy as u64;
-        self.total += copy as u64;
+        // C unsigned-counter parity: total_in/total_out/total wrap on overflow.
+        self.total_in = self.total_in.wrapping_add(consumed as u64);
+        self.total_out = self.total_out.wrapping_add(copy as u64);
+        self.total = self.total.wrapping_add(copy as u64);
         if (self.wrap & 4) != 0 && copy != 0 {
             let c = self.update_check(&output[put - copy..put]);
             self.check = c;
@@ -1765,7 +1816,14 @@ impl InflateState {
         }
         // Verify the dictionary identifier against the stored check value.
         if self.mode == InflateMode::Dict {
-            let dictid = adler32(adler32(0, &[]), dictionary);
+            // C `inflateSetDictionary` computes the identifier as
+            // `adler32(adler32(0L, Z_NULL, 0), dictionary, dictLength)`, and
+            // `adler32(0L, Z_NULL, 0)` returns the Adler-32 *initial* value `1`
+            // (not 0). In this core `adler32(0, &[])` returns 0, so seeding the
+            // running check with the literal `1` is required to match the value
+            // the deflate side stored — otherwise valid preset-dictionary
+            // streams are wrongly rejected (review finding #3).
+            let dictid = adler32(1, dictionary);
             if dictid != self.check {
                 return Err(ZlibError::DataError);
             }
@@ -1846,7 +1904,8 @@ impl InflateState {
 
         // Search the available input for the remainder of the marker.
         let len = syncsearch(&mut self.have, input);
-        self.total_in += len as u64;
+        // C unsigned-counter parity: `total_in` wraps on overflow.
+        self.total_in = self.total_in.wrapping_add(len as u64);
 
         // No marker found yet.
         if self.have != 4 {
@@ -2160,5 +2219,50 @@ mod tests {
         let cloned = st.copy();
         assert_eq!(cloned.total_out, st.total_out);
         assert_eq!(cloned.check, st.check);
+    }
+
+    #[test]
+    fn preset_dictionary_round_trip_is_accepted() {
+        // Regression test for the preset-dictionary Adler seed (finding #3).
+        // `deflateSetDictionary` stores the dictionary identifier as
+        // `adler32(1, dict)` (C seeds with `adler32(0L, Z_NULL, 0) == 1`), so
+        // `inflateSetDictionary` must verify against the same seed. Before the
+        // fix the inflate side checked `adler32(0, dict)` and wrongly rejected a
+        // valid preset-dictionary stream with `Z_DATA_ERROR`.
+        use crate::deflate::{deflate, deflate_init, deflate_set_dictionary};
+        use crate::stream::ZStream;
+
+        let dictionary = b"the quick brown fox jumps over the lazy dog";
+        let data = MSG;
+
+        // Compress with a preset dictionary (zlib wrapper -> FDICT set).
+        let mut strm = ZStream::default();
+        deflate_init(&mut strm, 6).expect("deflate_init");
+        deflate_set_dictionary(&mut strm, dictionary).expect("deflate_set_dictionary");
+        // The deflate side seeds the dictionary id with 1.
+        assert_eq!(strm.adler, crate::checksum::adler32(1, dictionary));
+
+        let mut compressed = alloc::vec![0u8; 4096];
+        let (res, consumed, produced) = deflate(&mut strm, data, &mut compressed, Flush::Finish);
+        assert_eq!(res, Ok(ReturnCode::StreamEnd));
+        assert_eq!(consumed, data.len());
+        compressed.truncate(produced);
+
+        // Decompress: the header requests a dictionary, which must now be
+        // accepted (this was `Err(ZlibError::DataError)` before the fix).
+        let mut st = InflateState::new(15).expect("init");
+        let mut out = alloc::vec![0u8; 4096];
+        let r1 = st.inflate(&compressed, &mut out, Flush::NoFlush);
+        assert_eq!(r1.status, Ok(ReturnCode::NeedDict));
+        st.set_dictionary(dictionary)
+            .expect("valid preset dictionary must be accepted");
+        let r2 = st.inflate(
+            &compressed[r1.consumed..],
+            &mut out[r1.produced..],
+            Flush::Finish,
+        );
+        assert_eq!(r2.status, Ok(ReturnCode::StreamEnd));
+        let total = r1.produced + r2.produced;
+        assert_eq!(&out[..total], data);
     }
 }

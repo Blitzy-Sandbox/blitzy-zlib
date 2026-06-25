@@ -64,3 +64,9 @@ pub mod checksum;
 pub mod deflate;
 pub mod inflate;
 pub mod util;
+
+// Buffered gzip file I/O (`gz*` API). It depends on `std::fs::File` / `std::io`
+// for real file handling, so it is gated behind `gz-io` (which implies `std` +
+// `gzip`); the pure-`no_std` engine build never pulls it in.
+#[cfg(feature = "gz-io")]
+pub mod gz;

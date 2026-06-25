@@ -465,6 +465,282 @@ pub fn inflate_fast(
     state.bits = bits;
 }
 
+/// The `inflateBack` fast inner decode loop — the window-as-output sibling of
+/// [`inflate_fast`].
+///
+/// C zlib uses the *same* `inflate_fast()` for both drivers: `infback.c` calls
+/// `inflate_fast(strm, state->wsize)` with `strm->next_out` pointing **into the
+/// window** (infback.c L424-L428). [`inflate_fast`] cannot serve that role under
+/// `#![forbid(unsafe_code)]` because it takes the output and the history window
+/// as two *disjoint* `&mut` borrows, whereas in `inflateBack` they are the same
+/// buffer ([`InflateState::window`]) — an impossible double mutable borrow. This
+/// routine resolves that by writing into, and reading match history from, the
+/// single `state.window` buffer, so it needs only one mutable borrow of `state`.
+///
+/// It is otherwise a faithful, bit-identical translation of `inflate_fast`,
+/// specialized to the `inflateBack` window model:
+///
+/// * **`beg == 0`.** C passes `start = wsize`, so `beg = out - (start - avail_out)`
+///   resolves to the window base; "bytes produced this call" is therefore the
+///   absolute window index `out_idx` (= the C `put` offset).
+/// * **`wnext == 0` always.** `inflateBack`'s window never advances circularly:
+///   the `ROOM()` flush resets `put` to `0` and leaves `wnext == 0` (infback.c
+///   L151-L162), so only the very-common `wnext == 0` window-history branch of
+///   [`inflate_fast`] is reachable here. This is asserted in debug builds.
+/// * **`end = wsize - 257`.** The loop runs while `out_idx < end`, i.e. while at
+///   least 258 bytes of window space remain — the caller upholds `left >= 258`
+///   on entry, exactly as for [`inflate_fast`]. The fast loop therefore never
+///   fills the window (never needs `ROOM()`); when it stops with the window
+///   nearly full, the per-code slow path takes over and flushes via `ROOM()`.
+///
+/// # Entry conditions (upheld by the caller, the `inflateBack` `LEN` arm)
+///
+/// * `state.mode == Len`, `state.wnext == 0`.
+/// * At least 6 input bytes remain (`input.len() - *in_pos >= 6`).
+/// * At least 258 bytes of window space remain (`state.wsize - *out_pos >= 258`).
+///
+/// `state.hold`/`state.bits` carry the bit accumulator in and out (the caller
+/// syncs its loop locals through `state` around the call, mirroring the C
+/// `RESTORE()`/`LOAD()`).
+///
+/// # Exit `state.mode`
+///
+/// * [`InflateMode::Len`] — ran out of enough input or window space; the caller
+///   resumes with the per-code path.
+/// * [`InflateMode::Type`] — reached an end-of-block code.
+/// * [`InflateMode::Bad`] — a data error was found (`state.msg` is set).
+///
+/// `*out_pos` is the updated window write index (`put`); the caller derives
+/// `left = wsize - *out_pos`.
+#[allow(clippy::explicit_counter_loop)]
+pub fn inflate_fast_back(
+    state: &mut InflateState,
+    input: &[u8],
+    in_pos: &mut usize,
+    out_pos: &mut usize,
+) {
+    // --- Entry assumptions (infback.c L424; inffast.c L23-L29). -----------
+    debug_assert_eq!(
+        state.mode,
+        InflateMode::Len,
+        "inflate_fast_back entry: mode == LEN"
+    );
+    debug_assert_eq!(
+        state.wnext, 0,
+        "inflate_fast_back entry: inflateBack window never wraps (wnext == 0)"
+    );
+    debug_assert!(
+        input.len() - *in_pos >= 6,
+        "inflate_fast_back entry: avail_in >= 6"
+    );
+    debug_assert!(
+        state.wsize - *out_pos >= 258,
+        "inflate_fast_back entry: window space >= 258"
+    );
+
+    // --- Copy state to local variables (inffast.c L77-L96). ---------------
+    // The window itself stays as `state.window` (matches read freshly written
+    // bytes for RLE, so it must be the live buffer). Every copy reads one byte
+    // into a temporary first — `let b = state.window[f]; state.window[o] = b;` —
+    // so the immutable read borrow ends before the mutable write borrow begins,
+    // which is exactly why a single shared buffer is expressible in safe Rust.
+    let mut in_idx = *in_pos;
+    let mut out_idx = *out_pos;
+
+    let wsize = state.wsize;
+    // `last`/`end` translate the C pointer math; `beg == 0` for the back model,
+    // so "bytes produced this call" is simply `out_idx`.
+    let last = input.len() - 5;
+    let end = wsize - 257;
+    let whave = state.whave;
+    let mut hold = state.hold;
+    let mut bits = state.bits;
+    let lencode = state.lencode;
+    let distcode = state.distcode;
+    let lmask = (1u64 << state.lenbits) - 1;
+    let dmask = (1u64 << state.distbits) - 1;
+    let sane = state.sane;
+
+    'main: loop {
+        // Refill: ensure >= 15 bits buffered for the length code.
+        if bits < 15 {
+            hold += (input[in_idx] as u64) << bits;
+            in_idx += 1;
+            bits += 8;
+            hold += (input[in_idx] as u64) << bits;
+            in_idx += 1;
+            bits += 8;
+        }
+
+        let mut here = state.codes[lencode + (hold & lmask) as usize];
+        'dolen: loop {
+            let mut op = here.bits as u32;
+            hold >>= op;
+            bits -= op;
+            op = here.op as u32;
+
+            if op == 0 {
+                // Literal -> straight into the window.
+                state.window[out_idx] = here.val as u8;
+                out_idx += 1;
+                break 'dolen;
+            } else if op & 16 != 0 {
+                // Length base + extra bits.
+                let mut len = here.val as usize;
+                op &= 15;
+                if op != 0 {
+                    if bits < op {
+                        hold += (input[in_idx] as u64) << bits;
+                        in_idx += 1;
+                        bits += 8;
+                    }
+                    len += (hold & ((1u64 << op) - 1)) as usize;
+                    hold >>= op;
+                    bits -= op;
+                }
+
+                // Refill for the distance code.
+                if bits < 15 {
+                    hold += (input[in_idx] as u64) << bits;
+                    in_idx += 1;
+                    bits += 8;
+                    hold += (input[in_idx] as u64) << bits;
+                    in_idx += 1;
+                    bits += 8;
+                }
+
+                let mut dhere = state.codes[distcode + (hold & dmask) as usize];
+                'dodist: loop {
+                    let mut dop = dhere.bits as u32;
+                    hold >>= dop;
+                    bits -= dop;
+                    dop = dhere.op as u32;
+
+                    if dop & 16 != 0 {
+                        // Distance base + extra bits (up to 13 -> two pulls).
+                        let mut dist = dhere.val as usize;
+                        dop &= 15;
+                        if bits < dop {
+                            hold += (input[in_idx] as u64) << bits;
+                            in_idx += 1;
+                            bits += 8;
+                            if bits < dop {
+                                hold += (input[in_idx] as u64) << bits;
+                                in_idx += 1;
+                                bits += 8;
+                            }
+                        }
+                        dist += (hold & ((1u64 << dop) - 1)) as usize;
+                        hold >>= dop;
+                        bits -= dop;
+
+                        // `beg == 0`, so bytes produced this call == `out_idx`.
+                        if dist > out_idx {
+                            // Copy (partly) from the window history tail. With
+                            // `wnext == 0` this is the only reachable window
+                            // branch (inffast.c L198-L207).
+                            let op_w = dist - out_idx; // distance back in window
+                            if op_w > whave && sane {
+                                // Reaches before available history (before the
+                                // window has been filled, `whave == 0`, so any
+                                // such reference is rejected — matching the
+                                // slow path's `offset > wsize - left` guard).
+                                state.msg = Some("invalid distance too far back");
+                                state.mode = InflateMode::Bad;
+                                break 'main;
+                            }
+                            let wf = wsize - op_w;
+                            if op_w < len {
+                                // Some bytes from the window tail, the remainder
+                                // from `out - dist` (which, the window being the
+                                // output, lands back at the window start).
+                                len -= op_w;
+                                let mut f = wf;
+                                for _ in 0..op_w {
+                                    let b = state.window[f];
+                                    state.window[out_idx] = b;
+                                    out_idx += 1;
+                                    f += 1;
+                                }
+                                let mut g = out_idx - dist; // == 0 here
+                                for _ in 0..len {
+                                    let b = state.window[g];
+                                    state.window[out_idx] = b;
+                                    out_idx += 1;
+                                    g += 1;
+                                }
+                            } else {
+                                // Whole match lies in the window tail.
+                                let mut f = wf;
+                                for _ in 0..len {
+                                    let b = state.window[f];
+                                    state.window[out_idx] = b;
+                                    out_idx += 1;
+                                    f += 1;
+                                }
+                            }
+                        } else {
+                            // Copy directly from the output (= window); may
+                            // overlap when `dist < len` (RLE). A forward
+                            // byte-by-byte loop reproduces the C `*put++ =
+                            // *from++` overlap semantics exactly.
+                            let mut f = out_idx - dist;
+                            for _ in 0..len {
+                                let b = state.window[f];
+                                state.window[out_idx] = b;
+                                out_idx += 1;
+                                f += 1;
+                            }
+                        }
+                        break 'dodist;
+                    } else if dop & 64 == 0 {
+                        // Second-level distance code: re-index the sub-table.
+                        dhere = state.codes
+                            [distcode + dhere.val as usize + (hold & ((1u64 << dop) - 1)) as usize];
+                        continue 'dodist;
+                    } else {
+                        state.msg = Some("invalid distance code");
+                        state.mode = InflateMode::Bad;
+                        break 'main;
+                    }
+                }
+
+                break 'dolen;
+            } else if op & 64 == 0 {
+                // Second-level length code: re-index the sub-table.
+                here =
+                    state.codes[lencode + here.val as usize + (hold & ((1u64 << op) - 1)) as usize];
+                continue 'dolen;
+            } else if op & 32 != 0 {
+                // End of block -> hand back to the block dispatcher.
+                state.mode = InflateMode::Type;
+                break 'main;
+            } else {
+                state.msg = Some("invalid literal/length code");
+                state.mode = InflateMode::Bad;
+                break 'main;
+            }
+        }
+
+        // C `do { … } while (in < last && out < end);`. Exiting here leaves
+        // `state.mode == Len` (ran out of input or window space).
+        if !(in_idx < last && out_idx < end) {
+            break 'main;
+        }
+    }
+
+    // Return whole buffered bytes to the input (inffast.c L290-L304).
+    let bytes = bits >> 3;
+    in_idx -= bytes as usize;
+    bits -= bytes << 3;
+    hold &= (1u64 << bits) - 1;
+
+    *in_pos = in_idx;
+    *out_pos = out_idx;
+    state.hold = hold;
+    state.bits = bits;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

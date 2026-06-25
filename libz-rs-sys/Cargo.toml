@@ -16,6 +16,22 @@ description = "C-ABI (extern \"C\") drop-in shim exposing the zlib API on top of
 categories = ["compression", "external-ffi-bindings"]
 keywords = ["zlib", "ffi", "deflate", "gzip"]
 
+[features]
+# Mirror the core `zlib-rs` feature axes across the C-ABI boundary so a consumer
+# selecting features on the shim transparently propagates them to the core.
+#
+# * `std`  — forwards to `zlib-rs/std`. With `std` ON (the default) the shim's
+#   raw-pointer translation helpers obtain `Box` from the prelude; only a
+#   `--no-default-features` build activates the `#[cfg(not(feature = "std"))]`
+#   `alloc` import in `translate.rs`.
+# * `gz-io` — forwards to `zlib-rs/gz-io` (which itself pulls `std` + `gzip`) and
+#   enables the `#[cfg(feature = "gz-io")]` gz file-I/O conversion helpers in
+#   `translate.rs`. Those helpers are generic over the concrete gz state type, so
+#   enabling this feature does not require the core `gz` module to be present.
+default = ["std"]
+std = ["zlib-rs/std"]
+gz-io = ["std", "zlib-rs/gz-io"]
+
 [dependencies]
 # C scalar types (`c_int`, `c_uint`, `c_ulong`, `size_t`, `off_t`, ...) used at
 # the `extern "C"` boundary and by the `#[repr(C)]` ABI structs in `zstream`.

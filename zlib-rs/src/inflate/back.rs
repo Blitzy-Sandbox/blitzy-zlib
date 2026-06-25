@@ -25,27 +25,29 @@
 //!   (the C `in()` / `PULL()`); whenever the window is full or decoding
 //!   finishes, output is pushed through the `write` callback (the C `out()`).
 //!
-//! # Why this port does **not** call [`crate::inflate::fast::inflate_fast`]
+//! # The fast path ([`crate::inflate::fast::inflate_fast_back`])
 //!
-//! The C source keeps the `inffast.c` interface so an optimized `inflate_fast`
-//! can serve both drivers. This safe-Rust port deliberately uses the per-code
-//! "slow" decode instead, for three independent reasons:
+//! C zlib keeps the `inffast.c` interface so the optimized `inflate_fast` serves
+//! both drivers: `infback.c` calls `inflate_fast(strm, state->wsize)` from its
+//! `LEN` state whenever at least 6 input bytes and 258 bytes of window space are
+//! buffered (infback.c L422-L429). This port reproduces that hot-path
+//! architecture (required by CP2 — AAP §0.6.4, Rule 13) with the dedicated
+//! [`crate::inflate::fast::inflate_fast_back`] routine, wired into the `Len`
+//! arm under the identical entry conditions.
 //!
-//! 1. **Borrow safety.** Under the crate-wide `#![forbid(unsafe_code)]`,
-//!    `inflate_fast(state, .., output, .., ..)` requires `state` and `output`
-//!    as *disjoint* mutable borrows. In `inflateBack` the output *is*
-//!    `state.window`, so passing it as both is an impossible double mutable
-//!    borrow — it cannot be expressed without `unsafe`.
-//! 2. **Window model.** [`crate::inflate::fast::inflate_fast`] resolves match
-//!    history through the *circular* `wnext`/`whave` window of `inflate()`,
-//!    whereas `inflateBack` uses the *linear* window-as-output model. Reusing
-//!    it would decode against the wrong addressing scheme.
-//! 3. **Parity with the sibling driver.** [`InflateState::inflate`] itself runs
-//!    the per-code path exclusively (its own docs note the fast path "produces
-//!    byte-identical output" and is "not part of this file's verified
-//!    dependency set"). The per-code path here is byte-identical to C zlib for
-//!    every well-formed stream, satisfying the bit-exactness contract
-//!    (AAP §0.6.4).
+//! A *dedicated* routine is used rather than [`crate::inflate::fast::inflate_fast`]
+//! for one structural reason: under the crate-wide `#![forbid(unsafe_code)]`,
+//! [`crate::inflate::fast::inflate_fast`] takes the output buffer and the history
+//! window as two *disjoint* `&mut` borrows, but in `inflateBack` they are the
+//! **same** buffer ([`InflateState::window`]) — an impossible double mutable
+//! borrow. [`crate::inflate::fast::inflate_fast_back`] resolves this by reading
+//! match history from, and writing output into, that single `state.window`
+//! buffer (one mutable borrow), specialized to the window-as-output model
+//! (`beg == 0`, `wnext == 0`). It is otherwise a bit-identical translation of
+//! `inflate_fast`, so its output equals the per-code "slow" path below for every
+//! well-formed stream, satisfying the bit-exactness contract (AAP §0.6.4). The
+//! per-code path remains as the fallback for the buffer-too-small tail, exactly
+//! as in C.
 //!
 //! # `no_std`
 //!
@@ -58,6 +60,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::{Result, ReturnCode, ZlibError};
+use crate::inflate::fast::inflate_fast_back;
 use crate::inflate::fixed::{DISTFIX, LENFIX};
 use crate::inflate::state::{InflateMode, InflateState};
 use crate::inflate::tables::{CodeType, inflate_table};
@@ -560,12 +563,45 @@ where
             // Length / literal / distance / match decode (infback.c L422-L543).
             //
             // The whole length+distance+match sequence runs in this one arm,
-            // matching the C `case LEN`. (The C fast path is intentionally not
-            // used — see the module docs.) `pull_byte!`/`need_bits!` refetch
-            // input on demand, so unlike `inflate()` there is no need to split
-            // this into resumable sub-states.
+            // matching the C `case LEN`. `pull_byte!`/`need_bits!` refetch input
+            // on demand, so unlike `inflate()` there is no need to split this
+            // into resumable sub-states.
             // ---------------------------------------------------------------
             InflateMode::Len => {
+                // Fast path (infback.c L422-L429): with at least 6 input bytes
+                // buffered and 258 bytes of window space, hand control to the
+                // window-as-output fast loop. It decodes whole literal/length/
+                // distance runs with minimal per-symbol overhead and produces
+                // byte-identical output to the per-code path below — this is the
+                // hot-path architecture CP2 requires for `inflateBack`
+                // (review finding #2; AAP §0.6.4 / §0.7.x, Rule 13). C calls the
+                // shared `inflate_fast(strm, wsize)`; we call the safe
+                // window-as-output sibling [`inflate_fast_back`] (see its docs
+                // for why a dedicated routine is needed under
+                // `#![forbid(unsafe_code)]`).
+                if have >= 6 && left >= 258 {
+                    // RESTORE(): publish the bit accumulator the fast loop reads
+                    // and writes back. The input cursor is threaded through a
+                    // local `&mut` (the fast loop consumes from `cur[next..]`);
+                    // the window write cursor `put` is updated in place.
+                    state.hold = hold;
+                    state.bits = bits;
+                    let mut in_idx = next;
+                    inflate_fast_back(state, cur, &mut in_idx, &mut put);
+                    // LOAD(): reload the locals the fast loop advanced. `beg`
+                    // was the window base, so `put` is the absolute write index
+                    // and `left = wsize - put`.
+                    next = in_idx;
+                    have = cur.len() - next;
+                    left = state.wsize - put;
+                    hold = state.hold;
+                    bits = state.bits;
+                    // C `break;`: re-dispatch on the (possibly updated) mode —
+                    // `Type` (end of block), `Bad` (data error), or `Len` (ran
+                    // out of input/window, now decoded by the slow path below).
+                    continue 'inf;
+                }
+
                 // Decode a length / literal / end-of-block code.
                 let mut here = loop {
                     let h = state.codes[state.lencode + bits_val!(state.lenbits) as usize];

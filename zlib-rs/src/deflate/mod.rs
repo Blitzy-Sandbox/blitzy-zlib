@@ -229,7 +229,11 @@ impl DeflateContext<'_> {
             _ => {}
         }
         self.next_in += len;
-        *self.total_in += len as u64;
+        // C unsigned-counter parity: `strm->total_in` is an unsigned `uLong`
+        // that wraps on overflow. `wrapping_add` reproduces that exactly and
+        // avoids a debug-build overflow panic on a hypothetical lifetime total
+        // exceeding `u64::MAX` (review finding #13).
+        *self.total_in = (*self.total_in).wrapping_add(len as u64);
         len
     }
 
@@ -249,7 +253,8 @@ impl DeflateContext<'_> {
             _ => {}
         }
         self.next_in += len;
-        *self.total_in += len as u64;
+        // C unsigned-counter parity (see `read_buf`): wrap rather than panic.
+        *self.total_in = (*self.total_in).wrapping_add(len as u64);
         len
     }
 
@@ -276,7 +281,8 @@ impl DeflateContext<'_> {
         self.output[no..no + len].copy_from_slice(&self.state.pending_buf[po..po + len]);
         self.next_out += len;
         self.state.pending_out += len;
-        *self.total_out += len as u64;
+        // C unsigned-counter parity: `strm->total_out` wraps on overflow.
+        *self.total_out = (*self.total_out).wrapping_add(len as u64);
         self.state.pending -= len;
         if self.state.pending == 0 {
             self.state.pending_out = 0;

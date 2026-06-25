@@ -178,6 +178,35 @@ pub(crate) struct GzState {
     /// `gzungetc` pushback slide and leftover copied bytes). Named `out_buf` to
     /// parallel `in_buf`.
     pub(crate) out_buf: Vec<u8>,
+
+    // -- C `z_stream` data cursors, re-expressed as plain offsets --
+    //
+    // The C `gz_state` lets the embedded `z_stream` retain the input/output
+    // data pointers (`next_in`/`avail_in`, `next_out`/`avail_out`) and the
+    // file-write mark (`x.next`) across calls. The safe-core [`ZStream`] does
+    // **not** retain data between calls — every `deflate`/`inflate` step takes a
+    // borrowed slice and returns the bytes consumed/produced — so the gz layer
+    // tracks those positions itself, as `usize` offsets into [`in_buf`] /
+    // [`out_buf`], with no raw pointers. They are written/read by the gz read
+    // and write layers (`gz/write.rs`'s `gz_comp`/`gz_zero`/`gz_init`, and the
+    // future read layer); the open layer reads [`in_have`] in `gzoffset64`.
+    /// Offset in [`in_buf`](Self::in_buf) of the next unconsumed input byte
+    /// (C `strm.next_in - state->in`).
+    pub(crate) in_next: usize,
+    /// Count of unconsumed bytes staged in [`in_buf`](Self::in_buf)
+    /// (C `strm.avail_in`). It is the amount the compressor/decompressor has yet
+    /// to read; the write layer fills it before driving `deflate`, and
+    /// `gzoffset64` subtracts it when **reading** so the reported compressed
+    /// offset excludes input buffered but not yet consumed.
+    pub(crate) in_have: usize,
+    /// Fill level of [`out_buf`](Self::out_buf): the offset where `deflate`
+    /// writes next (C `strm.next_out - state->out`); the remaining output space
+    /// is `size - out_pos` (C `strm.avail_out`).
+    pub(crate) out_pos: usize,
+    /// Count of [`out_buf`](Self::out_buf) bytes already written to the file
+    /// (C `state->x.next - state->out`); the bytes in
+    /// `out_buf[out_written..out_pos]` are compressed-but-not-yet-flushed.
+    pub(crate) out_written: usize,
     /// Transparent-vs-gzip tri-state (C `direct`). Its meaning differs by mode:
     /// when **reading** it starts at `1` (auto-detect, assume transparent for an
     /// empty file), is `-1` if the caller forced gzip-only (`'G'`), and becomes
@@ -279,6 +308,10 @@ impl GzState {
             want: GZBUFSIZE,
             in_buf: Vec::new(),
             out_buf: Vec::new(),
+            in_next: 0,
+            in_have: 0,
+            out_pos: 0,
+            out_written: 0,
             direct: 0,
             // just for reading (finalized by `reset` for read mode)
             junk: 0,
@@ -318,11 +351,11 @@ impl GzState {
     /// exactly as in C where `gz_reset` is paired with `inflateReset` /
     /// `deflateReset`.
     ///
-    /// The C line `state->strm.avail_in = 0` ("no input data yet") has no
-    /// counterpart here: in this design the embedded [`ZStream`] retains no input
-    /// between calls (per-call input is a borrowed slice), so "no pending input"
-    /// is the natural post-reset state and there is nothing to clear on the
-    /// stream.
+    /// The C line `state->strm.avail_in = 0` ("no input data yet") is honored by
+    /// clearing the gz layer's own input cursors ([`in_have`](Self::in_have) /
+    /// [`in_next`](Self::in_next)): the embedded [`ZStream`] retains no input
+    /// between calls (per-call input is a borrowed slice), so those offsets — not
+    /// a stream field — carry the "no pending input" state.
     pub(crate) fn reset(&mut self) {
         self.have = 0; // no output data available
         if self.mode == GzMode::Read {
@@ -337,7 +370,14 @@ impl GzState {
         self.skip = 0; // no seek request pending
         self.clear_error(); // clear error (err = Z_OK, msg = None)
         self.pos = 0; // no uncompressed data yet
-        // `self.strm`: no retained input to clear (see the doc comment above).
+        // C `state->strm.avail_in = 0` ("no input data yet"). The embedded
+        // [`ZStream`] retains no input between calls, so the gz layer's own
+        // input cursors carry that state and are what must be cleared here. The
+        // output cursors (`out_pos`/`out_written`) are intentionally left alone,
+        // mirroring C `gz_reset`, which does not touch `next_out`/`x.next`; they
+        // are (re)initialized by `gz_init` for a write stream.
+        self.in_have = 0;
+        self.in_next = 0;
     }
 
     /// Return the slice of decompressed/copied output bytes currently available

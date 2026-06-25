@@ -519,13 +519,13 @@ pub(crate) fn gztell(state: &GzState) -> i64 {
 ///
 /// In C, when reading, the count of bytes buffered-but-not-yet-consumed by the
 /// decompressor (`state->strm.avail_in`) is subtracted so the result reflects
-/// the logical compressed position. In this port the embedded [`ZStream`]
-/// retains no input between calls (per-call input is a borrowed slice owned by
-/// the read layer) and [`GzState`] exposes no pending-input counter, so there
-/// is no stream-side `avail_in` to discount at a `gzoffset` call boundary: the
-/// OS file position is returned directly. This is a documented, minor
-/// divergence that does not affect the gzip wire format or the ported test
-/// suites.
+/// the logical compressed position. This port tracks that same count in
+/// [`GzState::in_have`] — the safe-core [`ZStream`] retains no input between
+/// calls, so the gz layer owns the pending-compressed-input cursor — and
+/// subtracts it in read mode exactly as C does. (Until the read layer is wired
+/// in a later checkpoint, [`in_have`](GzState::in_have) stays `0` in read mode,
+/// so the subtraction is currently a no-op; it becomes load-bearing once reads
+/// buffer compressed input.)
 pub(crate) fn gzoffset64(state: &mut GzState) -> i64 {
     if state.mode != GzMode::Read && state.mode != GzMode::Write {
         return -1;
@@ -534,10 +534,19 @@ pub(crate) fn gzoffset64(state: &mut GzState) -> i64 {
     // Compute the effective offset in the file (the current OS position).
     // `stream_position()` is the idiomatic spelling of C's
     // `LSEEK(state->fd, 0, SEEK_CUR)`.
-    match state.file.stream_position() {
+    let mut offset = match state.file.stream_position() {
         Ok(offset) => offset as i64,
-        Err(_) => -1,
+        Err(_) => return -1,
+    };
+
+    // When reading, discount the compressed input read from the file into the
+    // gz buffer but not yet consumed by the decompressor, so the result is the
+    // logical compressed position. C: `if (state->mode == GZ_READ) offset -=
+    // state->strm.avail_in;`.
+    if state.mode == GzMode::Read {
+        offset -= state.in_have as i64;
     }
+    offset
 }
 
 /// Platform `z_off_t`-width form of [`gzoffset64`] (C `gzoffset`, `gzlib.c`
@@ -637,9 +646,11 @@ pub(crate) fn gzclearerr(state: &mut GzState) {
 ///   succeed as a no-op when there is no pending input, which lets this code
 ///   call it unconditionally: the safe-core [`ZStream`] does not expose the C
 ///   `strm->avail_in` pending-input count that C tests before the call.
-/// * [`crate::deflate::deflateParams`] — the deflate engine's parameter-change
-///   routine (C-style camelCase, per the deflate module's naming). Its return
-///   value is intentionally ignored, exactly as C ignores it here.
+/// * [`crate::deflate::deflate_params`] — the deflate engine's parameter-change
+///   routine. Its return code is intentionally ignored, exactly as C ignores
+///   the `deflateParams` return here; any bytes it emits while flushing the
+///   current block under the *old* parameters are appended to the output buffer
+///   (advancing [`GzState::out_pos`]) for the next `gz_comp` to drain.
 pub(crate) fn gzsetparams(state: &mut GzState, level: i32, strategy: i32) -> i32 {
     // Check that we're compressing and that there's no (serious) error. A
     // non-zero `direct` means transparent passthrough, for which deflate
@@ -668,9 +679,24 @@ pub(crate) fn gzsetparams(state: &mut GzState, level: i32, strategy: i32) -> i32
         if state.gz_comp(Flush::Block) == -1 {
             return state.err;
         }
-        // Apply the new parameters to the engine. As in C, the return value is
-        // not inspected here.
-        let _ = crate::deflate::deflateParams(&mut state.strm, level, strategy);
+        // Apply the new parameters to the engine. As in C, the return code is
+        // not inspected. The safe-core `deflate_params` takes explicit
+        // input/output slices (the streaming core retains no buffers between
+        // calls): input is empty (only parameters change, no new data), and any
+        // bytes emitted while flushing the current block under the old
+        // parameters are written into the free tail of the output buffer and
+        // accounted for by advancing `out_pos` so the next `gz_comp` drains
+        // them. The preceding `gz_comp(Z_BLOCK)` already flushed to a block
+        // boundary, so this residual is small and always fits.
+        let out_start = state.out_pos;
+        let (_ret, _consumed, produced) = crate::deflate::deflate_params(
+            &mut state.strm,
+            level,
+            Strategy::try_from_i32(strategy).unwrap_or(Strategy::Default),
+            &[],
+            &mut state.out_buf[out_start..state.size],
+        );
+        state.out_pos += produced;
     }
 
     state.level = level;

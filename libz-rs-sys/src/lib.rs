@@ -27,6 +27,24 @@
 
 pub mod zstream;
 
+// The raw-pointer ↔ slice and integer ↔ `ReturnCode` translation layer — the
+// only place in the workspace that contains `unsafe`. It is wired into the
+// crate here so it is actually compiled and type-checked against the core APIs
+// it bridges (`zlib_rs::deflate::deflate`, `zlib_rs::inflate::inflate`, the
+// checksum helpers, …); previously it was an orphaned file that `cargo check`
+// never saw.
+//
+// It is a **private** module, not a `pub` export surface: its `run_deflate` /
+// `run_inflate` drivers and conversion helpers are `pub(crate)` building blocks
+// that the `#[unsafe(no_mangle)]` `extern "C"` symbol exports consume in a
+// subsequent milestone. Until those exported wrappers exist, the helpers have
+// no in-crate callers (outside their own unit tests), so the module carries
+// `#[allow(dead_code)]` to keep the `cargo clippy --all-targets -- -D warnings`
+// gate green without prematurely widening the public surface (which would be
+// out-of-scope scope creep at this milestone).
+#[allow(dead_code)]
+mod translate;
+
 use core::mem::size_of;
 
 use libc::{c_ulong, off_t};

@@ -11,32 +11,35 @@
 //!
 //! # Provenance and bit-exactness
 //!
-//! These tables are *exactly* what zlib's `inflate_table()` produces for the
-//! fixed literal/length and distance codes — i.e. what a `BUILDFIXED` zlib build
-//! computes at run time. zlib's `makefixed()` generated the checked-in
-//! `inffixed.h` from that same builder; the two agree at every entry except the
-//! four reserved-symbol slots discussed below. The
-//! [`crate::inflate::tables::inflate_table`] builder is reproduced step-for-step
-//! by `tables.rs`, so the unit tests below reconstruct both tables with that
-//! builder and assert byte-for-byte equality with the constants here. A single
-//! wrong entry would silently corrupt decoding of every fixed-Huffman stream, so
-//! that reconstruction test is the canonical correctness proof.
+//! These tables are copied *verbatim* from the checked-in `inffixed.h`, which
+//! zlib's `makefixed()` emitted from its `inflate_table()` builder. They are
+//! therefore byte-for-byte identical to the canonical C header (the CP2
+//! static-table-fidelity requirement). The live
+//! [`crate::inflate::tables::inflate_table`] builder is reproduced
+//! step-for-step by `tables.rs`, so the unit tests below reconstruct both
+//! tables with that builder and assert byte-for-byte equality with the
+//! constants here — agreeing at every entry except the four reserved-symbol
+//! slots discussed below, which the test canonicalizes before comparing. A
+//! single wrong entry would silently corrupt decoding of every fixed-Huffman
+//! stream, so that reconstruction test is the canonical correctness proof.
 //!
 //! ## Note on the four reserved-symbol entries
 //!
-//! [`LENFIX`] matches the live `inflate_table()` output at all 512 indices. At
-//! the four positions whose index satisfies `index & 127 == 99` (indices 99,
+//! At the four positions whose index satisfies `index & 127 == 99` (indices 99,
 //! 227, 355 and 483) the table decodes the reserved literal/length symbols 286
-//! and 287, which RFC 1951 forbids from ever appearing in a valid stream. There
-//! the builder stores the over-length sentinels taken from this build's
-//! `lext[29] = 68` / `lext[30] = 193`, whereas the checked-in `inffixed.h` text
-//! (produced by `makefixed()`, which overrides the op byte to `64`) shows
-//! `{64, 8, 0}`. All three op bytes (64, 68, 193) set the `0x40` "invalid code"
-//! bit and clear the `0x10` length and `0x20` end-of-block bits, so every one of
-//! them rejects symbols 286/287 identically; the decoder's observable behavior —
-//! and therefore wire-format compatibility — is unaffected by the choice. The
-//! builder output is shipped here so that this table stays bit-identical to
-//! `crate::inflate::tables::inflate_table`, which the tests below verify.
+//! and 287, which RFC 1951 forbids from ever appearing in a valid stream.
+//! [`LENFIX`] stores the canonical `{64, 8, 0}` invalid-code marker there,
+//! copied verbatim from the checked-in `inffixed.h` (which `makefixed()`
+//! produced by overriding the op byte to `64`). The live `inflate_table()`
+//! builder instead writes this build's over-length sentinels `lext[29] = 68` /
+//! `lext[30] = 193` at those slots. All three op bytes (64, 68, 193) set the
+//! `0x40` "invalid code" bit and clear the `0x10` length and `0x20`
+//! end-of-block bits, so every one of them rejects symbols 286/287 identically;
+//! the decoder's observable behavior — and therefore wire-format compatibility —
+//! is unaffected by the choice. Because `LENFIX` is kept byte-for-byte identical
+//! to `inffixed.h`, the reconstruction test below normalizes the builder's
+//! terminal-invalid markers to `64` before its byte-for-byte comparison, so it
+//! still verifies fidelity at all 512 indices.
 //!
 //! # Safety
 //!
@@ -154,7 +157,7 @@ pub static LENFIX: [Code; 512] = [
     Code { op: 16, bits: 7, val: 5 },
     Code { op: 0, bits: 8, val: 86 },
     Code { op: 0, bits: 8, val: 22 },
-    Code { op: 68, bits: 8, val: 0 },
+    Code { op: 64, bits: 8, val: 0 },
     Code { op: 19, bits: 7, val: 51 },
     Code { op: 0, bits: 8, val: 118 },
     Code { op: 0, bits: 8, val: 54 },
@@ -282,7 +285,7 @@ pub static LENFIX: [Code; 512] = [
     Code { op: 16, bits: 7, val: 5 },
     Code { op: 0, bits: 8, val: 87 },
     Code { op: 0, bits: 8, val: 23 },
-    Code { op: 193, bits: 8, val: 0 },
+    Code { op: 64, bits: 8, val: 0 },
     Code { op: 19, bits: 7, val: 51 },
     Code { op: 0, bits: 8, val: 119 },
     Code { op: 0, bits: 8, val: 55 },
@@ -410,7 +413,7 @@ pub static LENFIX: [Code; 512] = [
     Code { op: 16, bits: 7, val: 5 },
     Code { op: 0, bits: 8, val: 86 },
     Code { op: 0, bits: 8, val: 22 },
-    Code { op: 68, bits: 8, val: 0 },
+    Code { op: 64, bits: 8, val: 0 },
     Code { op: 19, bits: 7, val: 51 },
     Code { op: 0, bits: 8, val: 118 },
     Code { op: 0, bits: 8, val: 54 },
@@ -538,7 +541,7 @@ pub static LENFIX: [Code; 512] = [
     Code { op: 16, bits: 7, val: 5 },
     Code { op: 0, bits: 8, val: 87 },
     Code { op: 0, bits: 8, val: 23 },
-    Code { op: 193, bits: 8, val: 0 },
+    Code { op: 64, bits: 8, val: 0 },
     Code { op: 19, bits: 7, val: 51 },
     Code { op: 0, bits: 8, val: 119 },
     Code { op: 0, bits: 8, val: 55 },
@@ -648,10 +651,32 @@ mod tests {
 
         assert_eq!(used, 512, "fixed lit/len table consumes 512 entries");
         assert_eq!(bits, 9, "fixed lit/len root index is 9 bits");
+
+        // Canonicalize the four reserved symbol-286/287 slots before comparing.
+        //
+        // The live `inflate_table` builder writes this build's `lext[29] = 68`
+        // and `lext[30] = 193` over-length sentinels into those slots (indices
+        // 99, 227, 355, 483), whereas the verbatim `inffixed.h` table — which
+        // `LENFIX` now reproduces exactly — stores the canonical `op = 64`
+        // invalid-code marker that zlib's `makefixed()` writes. All three op
+        // bytes set the `0x40` "invalid code" bit and clear the `0x10` length and
+        // `0x20` end-of-block bits, so they reject the reserved symbols
+        // identically. Normalizing every such terminal-invalid marker to 64
+        // tolerates only this benign, behavior-equivalent op-byte difference
+        // while still proving byte-for-byte fidelity at every other index (any
+        // genuinely wrong op — e.g. a literal or length marker — is not collapsed
+        // and would still fail the comparison).
+        for c in codes.iter_mut() {
+            if c.op & 0x40 != 0 && c.op & 0x30 == 0 {
+                c.op = 64;
+            }
+        }
+
         assert_eq!(
             &codes[..],
             &LENFIX[..],
-            "reconstructed lit/len table must be byte-identical to LENFIX",
+            "reconstructed lit/len table must be byte-identical to LENFIX \
+             (reserved-symbol invalid markers normalized to op = 64)",
         );
     }
 
