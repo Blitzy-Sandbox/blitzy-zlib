@@ -1,24 +1,41 @@
-# Workspace root for the zlib → Rust migration.
+# ===========================================================================
+# Workspace root manifest — zlib C → Rust migration.
 #
-# This is a *virtual* manifest (it defines no package of its own); it only ties
-# the three workspace members together so the whole tree builds and tests as one
-# self-consistent unit, as mandated by the Agent Action Plan's single-phase
-# execution model:
+# This is the VIRTUAL Cargo workspace root for the in-place rewrite of the zlib
+# compression library (AAP §0.2.1, §0.3.1, §0.4.1). It supersedes
+# `CMakeLists.txt` / `configure` / Bazel for the Rust build's dependency and
+# build management ONLY — it is NOT a 1:1 port of the CMake logic. The C
+# baseline remains untouched in-tree as both the transformation source and the
+# byte-for-byte interop oracle.
 #
-#   * `zlib-rs`            — the safe, pure-Rust core (`#![forbid(unsafe_code)]`,
-#                            `no_std`-capable). Implements the DEFLATE/zlib/gzip
-#                            algorithms and checksums.
-#   * `libz-rs-sys`        — the thin `extern "C"` / `#[repr(C)]` ABI shim. The
-#                            ONLY crate permitted to contain `unsafe`.
+# It is a VIRTUAL manifest: it deliberately declares NO `[package]` of its own.
+# Its sole responsibility is to tie the three workspace members together and to
+# provide a single source of truth for shared metadata, dependency version
+# pins, and the release profile, so the whole tree builds and tests as one
+# self-consistent unit (the AAP single-phase execution model, §0.4.4).
+#
+# Members and their dependency chain (core ← shim ← cdylib):
+#
+#   * `zlib-rs`            — the safe, pure-Rust CORE (`#![forbid(unsafe_code)]`,
+#                            `no_std`-capable). Implements DEFLATE / zlib / gzip
+#                            and the Adler-32 / CRC-32 checksums.
+#   * `libz-rs-sys`        — the thin `extern "C"` / `#[repr(C)]` C-ABI shim; the
+#                            ONLY member permitted to contain `unsafe`. Depends
+#                            on `zlib-rs`.
 #   * `libz-rs-sys-cdylib` — the drop-in shared/static library member that emits
-#                            `libz.so` / `libz.a` on top of the shim.
+#                            `libz.so` / `libz.a`. Depends on `libz-rs-sys`.
 #
-# Dependency chain: libz-rs-sys-cdylib -> libz-rs-sys -> zlib-rs.
-#
-# `resolver = "2"` is declared explicitly: virtual workspaces otherwise default
-# to the legacy resolver, which is incompatible with the edition-2024 members.
+# Resolved chain: libz-rs-sys-cdylib → libz-rs-sys → zlib-rs.
+# ===========================================================================
+
 [workspace]
+# `resolver = "2"` is declared explicitly. A virtual workspace would otherwise
+# fall back to the legacy resolver "1", which is incompatible with the
+# edition-2024 members. (Resolver "3" — the edition-2024, MSRV-aware resolver —
+# is also valid here; "2" is chosen for the broadest compatibility.)
 resolver = "2"
+
+# EXACT member folder names, declared in dependency order (core, shim, cdylib).
 members = [
     "zlib-rs",
     "libz-rs-sys",
@@ -26,56 +43,67 @@ members = [
 ]
 
 # ---------------------------------------------------------------------------
-# Shared package metadata.
+# Shared package metadata — the single source of truth.
 #
-# Members opt in field-by-field with `field.workspace = true`, keeping a single
-# source of truth for the version, edition, MSRV, and licensing of the whole
-# tree. The crate `version` is a valid 3-part SemVer (`1.3.2`); it tracks the C
-# baseline `1.3.2.1-motley` but does NOT encode the `-motley` build tag, which
-# Cargo would reject. The runtime `ZLIB_VERSION` string returned by
-# `zlibVersion()` is a separate constant handled inside the crates.
+# Members opt in field-by-field with `field.workspace = true`; e.g. `zlib-rs`
+# inherits version / edition / rust-version / license / repository / homepage /
+# authors from here. Centralizing these keeps version, edition, MSRV, and
+# licensing consistent across the whole tree.
 # ---------------------------------------------------------------------------
 [workspace.package]
+# Cargo requires a valid 3-part SemVer. The C baseline is `1.3.2.1-motley`
+# (CMake `project(... VERSION 1.3.2.1)` permits a 4-part version; Cargo rejects
+# `1.3.2.1` with "unexpected character '.' after patch version number"). We
+# therefore track the baseline as the closest valid SemVer, `1.3.2`. The exact
+# runtime string `"1.3.2.1-motley"` that `zlibVersion()` must return is a
+# separate constant handled INSIDE `libz-rs-sys`, not encoded in this manifest.
 version = "1.3.2"
 edition = "2024"
 rust-version = "1.85"
 license = "Zlib"
-homepage = "https://zlib.net"
+homepage = "https://zlib.net/"
 repository = "https://github.com/madler/zlib"
-description = "A safe, idiomatic, pure-Rust rewrite of the zlib compression library (DEFLATE / zlib / gzip) with a C-ABI drop-in shim."
+description = "A safe Rust rewrite of the zlib compression library"
 authors = ["Jean-loup Gailly", "Mark Adler"]
 keywords = ["zlib", "deflate", "compression", "gzip", "inflate"]
 categories = ["compression", "no-std"]
 
 # ---------------------------------------------------------------------------
-# Shared dependency version pins (the single source of truth).
+# Shared dependency version pins — the single source of truth.
 #
 # Members reference these with `dep = { workspace = true }` and never re-pin a
-# version locally. Runtime crates are deliberately minimal — only `crc32fast`
-# and `cfg-if` reach the shipped core; `libc` is confined to the FFI shim; and
-# `cbindgen` (build), `criterion` / `flate2` / `quickcheck` / `rand` (dev) are
-# never linked into a shipped artifact.
+# version locally. The pins below are EXACT, validated values (AAP §0.5.1).
+# Runtime crates are deliberately minimal: only `crc32fast` and `cfg-if` can
+# reach the shipped core, `libc` is confined to the FFI shim, and `cbindgen`
+# (build) plus `criterion` / `flate2` / `quickcheck` / `rand` (dev) are never
+# linked into a shipped artifact.
 # ---------------------------------------------------------------------------
 [workspace.dependencies]
-# Runtime — core (`zlib-rs`)
-crc32fast = "1.5.0"
-cfg-if = "1.0.4"
-# Runtime — FFI shim (`libz-rs-sys`) only
-libc = "0.2"
-# Build tool — FFI shim header generation
-cbindgen = "0.29"
-# Dev / validation — benchmarks, the C-zlib oracle, property tests, RNG
-criterion = "0.5.1"
-flate2 = "1.1.9"
-quickcheck = "1.1.0"
-rand = "0.9.2"
+# Runtime — core (`zlib-rs`).
+crc32fast = "1.5.0" # SIMD-accelerated CRC-32 (IEEE); no_std.
+cfg-if = "1.0.4"    # Ergonomic conditional compilation; replaces C #if/#ifdef.
+
+# Runtime — FFI shim (`libz-rs-sys`) only.
+libc = "0.2" # C scalar types (c_int, c_uint, c_ulong, size_t, off_t, ...).
+
+# Build tool — FFI shim C-header generation (used by `libz-rs-sys/build.rs`).
+cbindgen = "0.29" # Emits a zlib.h-compatible header to prove ABI parity.
+
+# Dev / validation — never shipped.
+criterion = "0.5.1"  # Statistical deflate / inflate / checksum benchmarks.
+flate2 = "1.1.9"     # C-zlib interop ORACLE for byte-for-byte validation.
+quickcheck = "1.1.0" # Property-based round-trip testing.
+rand = "0.9.2"       # Random data generation for tests / benches.
 
 # ---------------------------------------------------------------------------
-# Release profile (workspace-global; only valid in the root manifest).
+# Release profile (workspace-global; a `[profile.*]` table is only valid in the
+# root manifest, never in a member). Maximizes the optimizer and enables full
+# LTO with a single codegen unit so the compression hot loops meet the ≥80%
+# C-zlib throughput target (AAP §0.7.2).
 #
-# Maximizes the optimizer and enables full LTO with a single codegen unit so
-# the compression hot loops match the performance targets in the technical
-# specification. Members must NOT declare their own `[profile.*]` tables.
+# `panic = "abort"` is deliberately NOT set: the test and benchmark harnesses
+# require stack unwinding. The benchmark profile inherits this profile by
+# default, so no explicit `[profile.bench]` table is required.
 # ---------------------------------------------------------------------------
 [profile.release]
 opt-level = 3
