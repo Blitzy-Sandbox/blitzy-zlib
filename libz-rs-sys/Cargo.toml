@@ -1,68 +1,160 @@
-# The thin C-ABI shim crate.
+# ===========================================================================
+# `libz-rs-sys` — the thin, UNSAFE C-ABI shim crate (workspace member #2).
 #
-# This is the ONLY workspace member permitted to contain `unsafe` (AAP §0.6.2):
-# it re-exposes the safe `zlib-rs` core through `#[repr(C)]` structs and an
-# `extern "C"` / `#[unsafe(no_mangle)]` export surface that matches `zlib.h`
-# byte-for-byte. At the current foundation milestone it carries the ABI *type*
-# definitions ([`zstream`]); the full export surface is added in a subsequent
-# milestone.
+# This manifest replaces `CMakeLists.txt` / `configure` for THIS crate's
+# dependency and build management (AAP §0.2.1, §0.3.1, §0.4.1); it is NOT a 1:1
+# port of the CMake logic. `libz-rs-sys` is the ONLY workspace member permitted
+# to contain `unsafe` (AAP §0.2.2 / §0.6.2): it re-exposes the exact `zlib.h`
+# C ABI — the `#[repr(C)]` `z_stream` / `gz_header` types plus an `extern "C"` /
+# `#[unsafe(no_mangle)]` export surface (73 symbols, AAP §0.4.1) — layered over
+# the safe, `#![forbid(unsafe_code)]` `zlib-rs` core.
+#
+# Dependency chain (core <- shim <- cdylib):
+#
+#   libz-rs-sys-cdylib  ->  libz-rs-sys  ->  zlib-rs
+#
+# This crate is the MIDDLE link: it wraps the safe core and is itself wrapped by
+# the `libz-rs-sys-cdylib` member, which sets `crate-type = ["cdylib",
+# "staticlib"]` to emit the drop-in `libz.so` / `libz.a`. Keeping THIS crate a
+# plain `rlib` is essential — the native artifacts come only from that member,
+# which re-exports this crate's `#[unsafe(no_mangle)]` symbols verbatim.
+#
+# All shared metadata, dependency version pins, and the release profile are
+# inherited from the workspace root `Cargo.toml`; this member never re-pins a
+# dependency version locally and never declares a `[profile.*]` table (a
+# `[profile.*]` table is only valid in the workspace root).
+# ===========================================================================
+
 [package]
 name = "libz-rs-sys"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
-license = "Zlib"
-description = "C-ABI (extern \"C\") drop-in shim exposing the zlib API on top of the safe zlib-rs core."
-categories = ["compression", "external-ffi-bindings"]
-keywords = ["zlib", "ffi", "deflate", "gzip"]
+# Inherited from `[workspace.package]` (the single source of truth). The crate
+# `version` resolves to the workspace SemVer (`1.3.2`). NOTE: the runtime
+# `ZLIB_VERSION` string `"1.3.2.1-motley"` that `zlibVersion()` must return is a
+# SEPARATE constant, sourced from the `zlib-rs` core and re-exposed by this shim;
+# it is deliberately NOT encoded in this Cargo `version` field (Cargo rejects a
+# 4-part `1.3.2.1` / `-motley` version).
+version.workspace = true
+edition.workspace = true      # resolves to 2024
+rust-version.workspace = true # resolves to the 1.85 MSRV
+license.workspace = true      # resolves to SPDX `Zlib`
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+# A crate-specific description distinguishes the FFI shim from the safe core and
+# the workspace root (inheriting `description.workspace = true` would also be
+# acceptable per the AAP).
+description = "A drop-in compatible C-ABI (libz / zlib.h) shim over the safe zlib-rs core, exposing the exact zlib symbol set."
+keywords = ["zlib", "ffi", "libz", "compression", "deflate"]
+categories = ["compression", "external-ffi-bindings", "api-bindings"]
+# `build.rs` runs `cbindgen` over this crate's `extern "C"` surface to (re)
+# generate the committed C header `include/zlib.h` and diff it against the
+# canonical root `zlib.h` for signature parity (AAP §0.4.1, goal G4). Declared
+# explicitly for intent (Cargo would also auto-detect the sibling `build.rs`).
+build = "build.rs"
 
-[features]
-# Mirror the core `zlib-rs` feature axes across the C-ABI boundary so a consumer
-# selecting features on the shim transparently propagates them to the core.
+[lib]
+# Declared explicitly for clarity and stability. `libz-rs-sys-cdylib` re-exports
+# this crate with `pub use libz_rs_sys::*;`, so the underscore crate name must
+# not drift. Cargo already derives `libz_rs_sys` from the package name
+# `libz-rs-sys`; pinning it here guards against accidental drift.
 #
-# * `std`  — forwards to `zlib-rs/std`. With `std` ON (the default) the shim's
-#   raw-pointer translation helpers obtain `Box` from the prelude; only a
-#   `--no-default-features` build activates the `#[cfg(not(feature = "std"))]`
-#   `alloc` import in `translate.rs`.
-# * `gz-io` — forwards to `zlib-rs/gz-io` (which itself pulls `std` + `gzip`) and
-#   enables the `#[cfg(feature = "gz-io")]` gz file-I/O conversion helpers in
-#   `translate.rs`. Those helpers are generic over the concrete gz state type, so
-#   enabling this feature does not require the core `gz` module to be present.
-#   gz-io is ON by default so the drop-in artifact exposes the full `gz*` file
-#   API family (26 symbols) that `zlib.h` declares — a true zlib drop-in must
-#   provide them. `--no-default-features` yields the core-only 47-symbol surface.
-# * `c-variadic` — OFF by default; enables the genuinely C-variadic `gzprintf`
-#   (`int gzprintf(gzFile, const char *, ...)`). DEFINING a C-variadic `extern
-#   "C"` fn requires the unstable `#![feature(c_variadic)]`, so this feature is
-#   NIGHTLY-ONLY: enabling it on a stable toolchain is rejected by rustc (the
-#   intended compile-time guard). On the default stable build `gzprintf` is the
-#   single `zlib.h` symbol that is omitted (documented in `lib.rs`); the other 72
-#   symbols are fully functional. This mirrors the upstream `zlib-rs` project.
-default = ["std", "gz-io"]
+# The DEFAULT `rlib` crate-type is intentional and correct — the `cdylib` /
+# `staticlib` artifacts (`libz.so` / `libz.a`) come from the
+# `libz-rs-sys-cdylib` member, NEVER from here. `crate-type` is therefore NOT
+# set, and neither is `links` (native-library linkage belongs to the cdylib
+# member).
+name = "libz_rs_sys"
+path = "src/lib.rs"
+
+# ---------------------------------------------------------------------------
+# Feature flags (AAP §0.5.4).
+#
+# Most features FORWARD to the corresponding `zlib-rs` core feature so a consumer
+# selecting features on this shim transparently configures the core. Because the
+# `zlib-rs` dependency is taken with `default-features = false` (see
+# `[dependencies]` below), these forwards are what actually toggle the core's
+# facilities — e.g. `cargo build -p libz-rs-sys --no-default-features` yields a
+# `no_std`, gz-file-I/O-off core. The two NON-forwarding features are:
+#
+#   * `capi`       — a net-new MARKER feature (AAP §0.5.4) that identifies the
+#                    C-ABI build for the `libz-rs-sys-cdylib` member and for
+#                    `cargo-c` tooling. It is a NO-OP inside THIS crate: the
+#                    `extern "C"` symbols are ALWAYS compiled, so do not expect
+#                    `capi` to gate any code here.
+#   * `c-variadic` — gates the single genuinely C-variadic export, `gzprintf`,
+#                    whose definition needs the unstable `#![feature(
+#                    c_variadic)]` (nightly only). It is OFF by default so a
+#                    plain `cargo build -p libz-rs-sys` builds the 72-symbol
+#                    surface on stable; the `libz-rs-sys-cdylib` drop-in enables
+#                    it (under the workspace's pinned nightly toolchain) to emit
+#                    the full 73-symbol `libz.so` / `libz.a`. This feature is
+#                    REQUIRED by the shim source (`src/lib.rs`) and by the cdylib
+#                    member (`c-variadic = ["libz-rs-sys/c-variadic"]`).
+# ---------------------------------------------------------------------------
+[features]
+# Standard library + full gzip container & file I/O + hardware-accelerated
+# checksum, i.e. a typical native build of C zlib. `c-variadic` is deliberately
+# NOT in the default set (see the table comment above).
+default = ["std", "gzip", "gz-io", "simd"]
+# Forward the core `std` facilities (the `gz*` file-I/O layer via `std::fs` /
+# `std::io`, the `std::error::Error` impl, run-time SIMD detection in
+# `crc32fast`, …). With it OFF, this crate compiles as `#![no_std]`.
 std = ["zlib-rs/std"]
-gz-io = ["std", "zlib-rs/gz-io"]
+# Forward gzip CONTAINER support in deflate/inflate (mirrors the C `GZIP` define).
+gzip = ["zlib-rs/gzip"]
+# Forward gzip FILE I/O — the buffered `gz*` API (gzopen/gzread/gzwrite/…).
+# Requires `std` + `gzip`, and also enables the `#[cfg(feature = "gz-io")]`
+# C-ABI `gz*` exports in `src/lib.rs`.
+gz-io = ["zlib-rs/gz-io", "std", "gzip"]
+# Forward the hardware-accelerated CRC-32 path (`crc32fast`). Kept in `default`
+# to match the core's own default; turning it off selects the always-correct
+# scalar CRC-32 table fallback in the core.
+simd = ["zlib-rs/simd"]
+# Net-new C-ABI build MARKER (AAP §0.5.4) — a no-op within this crate; consumed
+# by the cdylib member and `cargo-c`. See the table comment above.
+capi = []
+# Nightly-only gate for the C-variadic `gzprintf` export — see the table
+# comment above. Empty payload: it only toggles the unstable language feature
+# and the `gzprintf` definition in `src/lib.rs`.
 c-variadic = []
 
+# ---------------------------------------------------------------------------
+# Runtime dependencies — deliberately minimal (AAP §0.5.1 / §0.7.2: the
+# pure-Rust artifact carries no external C dependency).
+#
+#   * `zlib-rs` — the safe, pure-Rust CORE this shim wraps; an INTERNAL
+#                 workspace path dependency (so the "no external C dependency"
+#                 rule still holds). Taken with `default-features = false` so
+#                 THIS crate's feature forwards (above) fully control the core's
+#                 feature set; a default build re-enables the core's full
+#                 default (`std`, `gzip`, `gz-io`, `simd`).
+#   * `libc`    — present SOLELY because of the user-mandated C-ABI boundary
+#                 (AAP §0.5.2). It supplies the C scalar types (`c_int`,
+#                 `c_uint`, `c_ulong`, `c_char`, `size_t`, `off_t`, `c_void`)
+#                 used by the `extern "C"` signatures and the `#[repr(C)]` ABI
+#                 structs in `src/zstream.rs`. Mapping `uLong` to `c_ulong` (NOT
+#                 a fixed-width `u32`/`u64`) is what makes the `z_stream` /
+#                 checksum signatures byte-for-byte ABI-correct across both LP64
+#                 and LLP64 targets.
+#
+# The core's own runtime deps (`crc32fast` / `cfg-if`) are intentionally NOT
+# repeated here. Versions are inherited from `[workspace.dependencies]`.
+# ---------------------------------------------------------------------------
 [dependencies]
-# C scalar types (`c_int`, `c_uint`, `c_ulong`, `size_t`, `off_t`, ...) used at
-# the `extern "C"` boundary and by the `#[repr(C)]` ABI structs in `zstream`.
-# Inherited from `[workspace.dependencies]` (pinned `=0.2.186`) so the exact,
-# validated version is enforced here rather than a local caret requirement.
+zlib-rs = { path = "../zlib-rs", default-features = false }
 libc = { workspace = true }
-# The safe core. The shim re-exposes its API through the C ABI; at the current
-# foundation milestone it is used to anchor `zlibCompileFlags` to this crate's
-# `z_off_t` (== `libc::off_t`) definition. This is an internal workspace path
-# dependency, so the "minimal external dependencies" rule (FFI: `libc` only)
-# still holds.
-zlib-rs = { path = "../zlib-rs" }
 
+# ---------------------------------------------------------------------------
+# Build dependencies.
+#
+# `cbindgen` is run by `build.rs` to (re)generate the committed `include/zlib.h`
+# from this crate's `#[repr(C)]` types and `extern "C"` surface and to diff it
+# against the canonical root `zlib.h` for ABI/signature parity (AAP §0.4.1, goal
+# G4). It is a build-time / developer tool ONLY — never linked into the shipped
+# artifact — and `build.rs` keeps every cbindgen failure non-fatal (a
+# `cargo:warning`, never a panic) so the crate still builds in restricted
+# environments (docs.rs, packaged crates, read-only source trees). Version
+# inherited from `[workspace.dependencies]` (`=0.29.4`).
+# ---------------------------------------------------------------------------
 [build-dependencies]
-# `cbindgen` is run by `build.rs` to (re)generate the committed C header
-# `include/zlib.h` from this crate's `#[repr(C)]` types and (in a subsequent
-# milestone) its `extern "C"` / `#[unsafe(no_mangle)]` export surface, and to
-# diff that header against the canonical root `zlib.h` to prove ABI/signature
-# parity (AAP §0.4.1, G4). It is a *build-time / developer* tool only: it never
-# becomes part of the shipped artifact, and `build.rs` keeps every cbindgen
-# failure non-fatal (a `cargo:warning`, never a panic) so the crate still builds
-# in restricted environments (docs.rs, packaged crates, read-only source trees).
-cbindgen = "0.29"
+cbindgen = { workspace = true }

@@ -1193,20 +1193,32 @@ pub unsafe extern "C" fn inflateGetHeader(strm: z_streamp, head: gz_headerp) -> 
         Some(s) => s,
         None => return Z_STREAM_ERROR,
     };
-    // Enable capture in the core; it returns Err(StreamError) unless the stream
-    // is gzip-wrapped (wrap & 2), exactly as C `inflateGetHeader` does.
-    match s.get_header(GzHeader::new()) {
-        Ok(_) => {
-            // Record the caller's C `gz_header` so `inflate` can write the parsed
-            // fields back into it (std-only; under no_std the core still captures
-            // the header but the C write-back is skipped).
-            #[cfg(feature = "std")]
-            header_reg::register(strm, head);
-            #[cfg(not(feature = "std"))]
-            let _ = head;
-            Z_OK
+    // Gzip-header capture exists in the core only under the `gzip` feature
+    // (`InflateState::get_header` is `#[cfg(feature = "gzip")]`). With `gzip`
+    // disabled no inflate stream can be gzip-wrapped, so — exactly as C
+    // `inflateGetHeader` reports for a non-gzip stream — return `Z_STREAM_ERROR`.
+    #[cfg(feature = "gzip")]
+    {
+        // Enable capture in the core; it returns Err(StreamError) unless the
+        // stream is gzip-wrapped (wrap & 2), exactly as C `inflateGetHeader` does.
+        match s.get_header(GzHeader::new()) {
+            Ok(_) => {
+                // Record the caller's C `gz_header` so `inflate` can write the
+                // parsed fields back into it (std-only; under no_std the core
+                // still captures the header but the C write-back is skipped).
+                #[cfg(feature = "std")]
+                header_reg::register(strm, head);
+                #[cfg(not(feature = "std"))]
+                let _ = head;
+                Z_OK
+            }
+            Err(e) => e.as_i32(),
         }
-        Err(e) => e.as_i32(),
+    }
+    #[cfg(not(feature = "gzip"))]
+    {
+        let _ = (s, head);
+        Z_STREAM_ERROR
     }
 }
 
