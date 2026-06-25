@@ -156,7 +156,7 @@ pub(crate) fn deflate_rle(cx: &mut DeflateContext, flush: Flush) -> BlockState {
         // clamps its result to the available lookahead. When there is no run it
         // returns 0, matching the C code's `s->match_length = 0;` default.
         // C: lines 2104-2128.
-        cx.state.match_length = longest_run(&cx.state);
+        cx.state.match_length = longest_run(cx.state);
 
         // Emit a match if we have a run of MIN_MATCH or longer, otherwise emit a
         // single literal byte. C: lines 2130-2139.

@@ -64,8 +64,9 @@
 // contributor; the `#[cfg(test)]` suite below exercises the entire surface.
 #![allow(dead_code)]
 
-use super::state::{BlockState, DeflateState, MIN_LOOKAHEAD, Pos, WIN_INIT};
-use crate::constants::{Flush, MAX_MATCH, MIN_MATCH};
+use super::state::{BlockState, DeflateState, MIN_LOOKAHEAD, Pos};
+use super::{DeflateContext, fill_window, flush_block, update_hash};
+use crate::constants::{Flush, MIN_MATCH};
 
 /// The empty / "no position" sentinel for the hash tables (C `NIL`).
 ///
@@ -74,311 +75,7 @@ use crate::constants::{Flush, MAX_MATCH, MIN_MATCH};
 /// out of the chains so that the value can double as the terminator.
 const NIL: usize = 0;
 
-/// Advance the rolling hash by one byte (C macro `UPDATE_HASH`).
-///
-/// Computes `h = ((h << hash_shift) ^ c) & hash_mask`. After `MIN_MATCH`
-/// successive calls the contribution of the oldest byte has been shifted out, so
-/// `ins_h` always reflects exactly the `MIN_MATCH`-byte string about to be
-/// inserted. Keeping this identical to C is essential: a different hash sends
-/// strings to different chains and diverges the match decisions (and therefore
-/// the output) immediately.
-#[inline]
-fn update_hash(hash_shift: u32, hash_mask: usize, h: usize, c: u8) -> usize {
-    ((h << hash_shift) ^ (c as usize)) & hash_mask
-}
-
-/// Borrowed input/output/stream cursor threaded through the compression engine.
-///
-/// This is the safe-Rust counterpart of the handful of `z_stream` fields the C
-/// compressor reads and writes while running a block producer — `next_in` /
-/// `avail_in`, `next_out` / `avail_out`, and the `total_in` / `total_out`
-/// counters. Design decision D1 (documented in `state.rs`) keeps these on the
-/// engine context rather than on [`DeflateState`], so the owned state stays a
-/// pure data model and the borrowed I/O slices never alias it.
-///
-/// The lifetime `'a` ties the context to the borrowed state and buffers for the
-/// duration of a single `deflate` call; nothing here is owned, mirroring the C
-/// `next_in`/`next_out` discipline without raw pointers.
-pub(crate) struct DeflateContext<'a> {
-    /// The owned compressor state (window, hash tables, trees, pending buffer).
-    pub(crate) state: &'a mut DeflateState,
-    /// Remaining input. `input[next_in..]` is the unread portion (C `next_in` /
-    /// `avail_in`).
-    pub(crate) input: &'a [u8],
-    /// Read cursor into [`input`](Self::input).
-    pub(crate) next_in: usize,
-    /// Output buffer. `output[next_out..]` is the free space (C `next_out` /
-    /// `avail_out`).
-    pub(crate) output: &'a mut [u8],
-    /// Write cursor into [`output`](Self::output).
-    pub(crate) next_out: usize,
-    /// Total bytes consumed from input so far (C `strm->total_in`).
-    pub(crate) total_in: u64,
-    /// Total bytes written to output so far (C `strm->total_out`).
-    pub(crate) total_out: u64,
-}
-
-impl<'a> DeflateContext<'a> {
-    /// Build a fresh context around a compressor state and a pair of I/O
-    /// buffers, with both cursors and both totals at zero.
-    pub(crate) fn new(state: &'a mut DeflateState, input: &'a [u8], output: &'a mut [u8]) -> Self {
-        Self {
-            state,
-            input,
-            next_in: 0,
-            output,
-            next_out: 0,
-            total_in: 0,
-            total_out: 0,
-        }
-    }
-
-    /// Bytes of input still available (C `strm->avail_in`).
-    #[inline]
-    fn avail_in(&self) -> usize {
-        self.input.len() - self.next_in
-    }
-
-    /// Free space remaining in the output buffer (C `strm->avail_out`).
-    #[inline]
-    fn avail_out(&self) -> usize {
-        self.output.len() - self.next_out
-    }
-
-    /// Copy up to `size` bytes of input into `window[buf_start..]` and report how
-    /// many were moved (C `read_buf`, `deflate.c` lines 219-240).
-    ///
-    /// The C routine also folds the bytes into the running Adler-32 (`wrap == 1`)
-    /// or CRC-32 (`wrap == 2`). Those checksums belong to the zlib/gzip *wrapper*
-    /// and are produced by the stream layer in `mod.rs`; the DEFLATE block body
-    /// emitted by `deflate_fast` is wrapper-independent, so this self-contained
-    /// engine omits the checksum fold and feeds the window only. (The bit-exact
-    /// comparison in the test suite uses raw DEFLATE, `wrap == 0`, where C's
-    /// `read_buf` likewise touches no checksum.)
-    fn read_buf(&mut self, buf_start: usize, size: usize) -> usize {
-        let len = core::cmp::min(self.avail_in(), size);
-        if len == 0 {
-            return 0;
-        }
-        let ni = self.next_in;
-        // Disjoint borrows: `output`/`window` (via `state`) and `input` are
-        // distinct fields, so the bounds-checked copy needs no temporary.
-        self.state.window[buf_start..buf_start + len].copy_from_slice(&self.input[ni..ni + len]);
-        self.next_in += len;
-        self.total_in += len as u64;
-        len
-    }
-
-    /// Refill the sliding window when the lookahead becomes insufficient
-    /// (C `fill_window`, `deflate.c` lines ~252-340).
-    ///
-    /// Reads input into the window, sliding the window's upper half down to the
-    /// lower half when it fills up (and sliding the hash tables to match), then
-    /// re-seeds `ins_h` and inserts any `insert` strings that were carried over a
-    /// block/dictionary boundary. The trailing high-water bookkeeping keeps the
-    /// bytes the match scanner may speculatively read initialized to zero, which
-    /// under `#![forbid(unsafe_code)]` is also what guarantees those reads are
-    /// in-bounds and well-defined.
-    fn fill_window(&mut self) {
-        let wsize = self.state.w_size;
-
-        loop {
-            // Free space at the end of the window before this iteration.
-            let mut more = self.state.window_size - self.state.lookahead - self.state.strstart;
-
-            // Slide the window down once the current position has advanced a
-            // full window past the start, freeing the upper half for new input.
-            if self.state.strstart >= wsize + self.state.max_dist() {
-                // Move the upper `wsize - more` valid bytes down to offset 0.
-                let copy_len = wsize - more;
-                self.state.window.copy_within(wsize..wsize + copy_len, 0);
-                // `match_start` is stale here (only meaningful right after a
-                // successful match, when `longest_match` overwrites it); C lets
-                // the unsigned subtraction wrap, so `wrapping_sub` reproduces it
-                // without a debug-build panic.
-                self.state.match_start = self.state.match_start.wrapping_sub(wsize);
-                self.state.strstart -= wsize;
-                self.state.block_start -= wsize as isize;
-                if self.state.insert > self.state.strstart {
-                    self.state.insert = self.state.strstart;
-                }
-                self.state.slide_hash();
-                more += wsize;
-            }
-
-            // No more input to pull in this round.
-            if self.avail_in() == 0 {
-                break;
-            }
-
-            let buf_start = self.state.strstart + self.state.lookahead;
-            let n = self.read_buf(buf_start, more);
-            self.state.lookahead += n;
-
-            // Initialize the hash value now that we have at least MIN_MATCH bytes
-            // (counting any `insert` carried over). Mirrors C `deflate.c`
-            // lines ~318-336 exactly, including inserting the carried strings.
-            if self.state.lookahead + self.state.insert >= MIN_MATCH {
-                let mut str_pos = self.state.strstart - self.state.insert;
-                self.state.ins_h = self.state.window[str_pos] as usize;
-                let next = self.state.window[str_pos + 1];
-                self.state.ins_h = update_hash(
-                    self.state.hash_shift,
-                    self.state.hash_mask,
-                    self.state.ins_h,
-                    next,
-                );
-                while self.state.insert != 0 {
-                    let c = self.state.window[str_pos + MIN_MATCH - 1];
-                    self.state.ins_h = update_hash(
-                        self.state.hash_shift,
-                        self.state.hash_mask,
-                        self.state.ins_h,
-                        c,
-                    );
-                    let h = self.state.ins_h;
-                    self.state.prev[str_pos & self.state.w_mask] = self.state.head[h];
-                    self.state.head[h] = str_pos as Pos;
-                    str_pos += 1;
-                    self.state.insert -= 1;
-                    if self.state.lookahead + self.state.insert < MIN_MATCH {
-                        break;
-                    }
-                }
-            }
-
-            // C loop condition: `lookahead < MIN_LOOKAHEAD && avail_in != 0`.
-            if self.state.lookahead >= MIN_LOOKAHEAD || self.avail_in() == 0 {
-                break;
-            }
-        }
-
-        // High-water handling (C `deflate.c` lines ~342-372): zero the window
-        // region the match scanner may speculatively read past the data end.
-        if self.state.high_water < self.state.window_size {
-            let curr = self.state.strstart + self.state.lookahead;
-            if self.state.high_water < curr {
-                let mut init = self.state.window_size - curr;
-                if init > WIN_INIT {
-                    init = WIN_INIT;
-                }
-                for b in &mut self.state.window[curr..curr + init] {
-                    *b = 0;
-                }
-                self.state.high_water = curr + init;
-            } else if self.state.high_water < curr + WIN_INIT {
-                let mut init = curr + WIN_INIT - self.state.high_water;
-                if init > self.state.window_size - self.state.high_water {
-                    init = self.state.window_size - self.state.high_water;
-                }
-                let hw = self.state.high_water;
-                for b in &mut self.state.window[hw..hw + init] {
-                    *b = 0;
-                }
-                self.state.high_water += init;
-            }
-        }
-    }
-
-    /// Flush as much of the pending buffer to the output as will fit
-    /// (C `flush_pending`, `deflate.c` lines ~950-970).
-    ///
-    /// First drains any whole bytes still held in the bit accumulator
-    /// (`tr_flush_bits`), then copies `min(pending, avail_out)` bytes from
-    /// `pending_buf[pending_out..]` to `output[next_out..]`, advancing both
-    /// cursors and resetting `pending_out` to the buffer start once fully
-    /// drained.
-    fn flush_pending(&mut self) {
-        self.state.tr_flush_bits();
-
-        let len = core::cmp::min(self.state.pending, self.avail_out());
-        if len == 0 {
-            return;
-        }
-
-        let po = self.state.pending_out;
-        let no = self.next_out;
-        self.output[no..no + len].copy_from_slice(&self.state.pending_buf[po..po + len]);
-
-        self.next_out += len;
-        self.state.pending_out += len;
-        self.total_out += len as u64;
-        self.state.pending -= len;
-        if self.state.pending == 0 {
-            self.state.pending_out = 0;
-        }
-    }
-
-    /// Emit the current block and flush it (C macros `FLUSH_BLOCK_ONLY` /
-    /// `FLUSH_BLOCK`, `deflate.c` lines ~1630-1645).
-    ///
-    /// Calls [`DeflateState::tr_flush_block`] on the window slice
-    /// `window[block_start..strstart]` (the bytes of this block), advances
-    /// `block_start`, then drains the pending buffer. Returns `Some(state)` to be
-    /// propagated out of the producer when the output buffer is exhausted — the
-    /// C macro's `if (avail_out == 0) return (last) ? finish_started : need_more;`
-    /// — and `None` otherwise.
-    fn flush_block(&mut self, last: bool) -> Option<BlockState> {
-        let block_start = self.state.block_start;
-        // `(long)strstart - block_start`; `block_start` may be negative after a
-        // window slide, in which case the block length still comes out positive.
-        let stored_len = (self.state.strstart as isize - block_start) as usize;
-
-        // `tr_flush_block` needs `buf` as `Option<&[u8]>` pointing into the
-        // window, but it also takes `&mut self` (the state). It never reads
-        // `self.window` internally (stored blocks copy the passed `buf`;
-        // compressed blocks read `sym_buf`), so move the window out, borrow the
-        // block slice from the moved-out `Vec`, and put it back afterwards. This
-        // is a zero-copy way to satisfy the borrow checker without `unsafe`.
-        let window = core::mem::take(&mut self.state.window);
-        if block_start >= 0 {
-            let bs = block_start as usize;
-            self.state
-                .tr_flush_block(Some(&window[bs..bs + stored_len]), stored_len, last);
-        } else {
-            self.state.tr_flush_block(None, stored_len, last);
-        }
-        self.state.window = window;
-
-        self.state.block_start = self.state.strstart as isize;
-        self.flush_pending();
-
-        if self.avail_out() == 0 {
-            Some(if last {
-                BlockState::FinishStarted
-            } else {
-                BlockState::NeedMore
-            })
-        } else {
-            None
-        }
-    }
-}
-
 impl DeflateState {
-    /// Slide the hash tables by one window when the window itself slides
-    /// (C `slide_hash`, `deflate.c` lines ~190-210).
-    ///
-    /// Every entry of `head` (all `hash_size` slots) and of `prev` (all `w_size`
-    /// slots) is decremented by `w_size`, clamping to `NIL` for entries that
-    /// would go negative. This keeps stored positions consistent after the
-    /// window's upper half is copied down to the lower half. We slide even at
-    /// level 0 (where matching is unused) to stay consistent with C.
-    fn slide_hash(&mut self) {
-        // `w_size <= 32768` so it always fits in a `Pos` (`u16`).
-        let wsize = self.w_size as Pos;
-        // `saturating_sub` is exactly C's `m >= wsize ? m - wsize : 0` clamp: the
-        // entry is shifted down by one window, and any position that would become
-        // negative is reset to `NIL` (0).
-        for m in self.head.iter_mut() {
-            *m = m.saturating_sub(wsize);
-        }
-        // `prev` has exactly `w_size` entries, so this slides all of it.
-        for m in self.prev.iter_mut() {
-            *m = m.saturating_sub(wsize);
-        }
-    }
-
     /// Insert the `MIN_MATCH`-byte string starting at `str_pos` into the hash
     /// table and return the previous head of its chain (C `INSERT_STRING`).
     ///
@@ -399,102 +96,6 @@ impl DeflateState {
         self.prev[str_pos & self.w_mask] = hash_head;
         self.head[self.ins_h] = str_pos as Pos;
         hash_head as usize
-    }
-
-    /// Find the longest match for the string at `strstart`, starting the search
-    /// at chain head `cur_match`, and return its length (C `longest_match`,
-    /// `deflate.c` lines 1390-1530).
-    ///
-    /// Sets [`match_start`](DeflateState::match_start) to the position of the
-    /// best match found. Matches no longer than
-    /// [`prev_length`](DeflateState::prev_length) are discarded (the result then
-    /// equals `prev_length` and `match_start` is left as-is, matching C's
-    /// "garbage" contract). The returned length never exceeds
-    /// [`lookahead`](DeflateState::lookahead).
-    ///
-    /// C's inner loop uses a `scan_end`/`scan_end1` shortcut to skip candidates
-    /// that cannot beat the current best before doing the full byte compare. That
-    /// shortcut is a pure performance optimization: any candidate it skips has a
-    /// match length `<= best_len` and so could never have updated `best_len` or
-    /// `match_start` anyway. This translation therefore performs a
-    /// straightforward longest-common-prefix scan, which is far cleaner under
-    /// bounds-checked indexing and yields **bit-identical** `best_len` /
-    /// `match_start` results.
-    fn longest_match(&mut self, cur_match: usize) -> usize {
-        let mut cur_match = cur_match;
-        let mut chain_length = self.max_chain_length;
-        let strstart = self.strstart;
-        let mut best_len = self.prev_length;
-        let lookahead = self.lookahead;
-        let wmask = self.w_mask;
-
-        // `nice_match` is always >= 0 here; clamp it to the available lookahead
-        // so the search stops at the end of the input (keeps deflate
-        // deterministic). C: `if ((uInt)nice_match > s->lookahead) nice_match = lookahead;`
-        let mut nice_match = self.nice_match as usize;
-        if nice_match > lookahead {
-            nice_match = lookahead;
-        }
-
-        // Stop when the chain reaches positions older than `limit` (the furthest
-        // back a match may start), and never match the string at window index 0.
-        let max_dist = self.max_dist();
-        let limit = if strstart > max_dist {
-            strstart - max_dist
-        } else {
-            NIL
-        };
-
-        // Don't waste time on long chains once we already hold a good match.
-        if best_len >= self.good_match as usize {
-            chain_length >>= 2;
-        }
-
-        let window = &self.window;
-        let mut match_start = self.match_start;
-
-        loop {
-            // Longest common prefix of the current string and the candidate,
-            // capped at MAX_MATCH and at the window bounds (the bounds cap is a
-            // safety net; in correct operation `cur_match < strstart` and
-            // `strstart + MAX_MATCH <= window.len()`, so it equals MAX_MATCH and
-            // matches C, which scans up to `window + strstart + MAX_MATCH`).
-            let span = core::cmp::min(
-                MAX_MATCH,
-                core::cmp::min(window.len() - strstart, window.len() - cur_match),
-            );
-            let mut len = 0usize;
-            while len < span && window[strstart + len] == window[cur_match + len] {
-                len += 1;
-            }
-
-            if len > best_len {
-                match_start = cur_match;
-                best_len = len;
-                if len >= nice_match {
-                    break;
-                }
-            }
-
-            // Advance to the next older position on this hash chain.
-            cur_match = self.prev[cur_match & wmask] as usize;
-            if cur_match <= limit {
-                break;
-            }
-            chain_length -= 1;
-            if chain_length == 0 {
-                break;
-            }
-        }
-
-        self.match_start = match_start;
-
-        // OUT assertion: the match length is never greater than the lookahead.
-        if best_len <= lookahead {
-            best_len
-        } else {
-            lookahead
-        }
     }
 }
 
@@ -520,7 +121,7 @@ pub(crate) fn deflate_fast(cx: &mut DeflateContext, flush: Flush) -> BlockState 
         // Make sure we have MIN_LOOKAHEAD (262) bytes for the next match, except
         // at the end of the input.
         if cx.state.lookahead < MIN_LOOKAHEAD {
-            cx.fill_window();
+            fill_window(cx);
             if cx.state.lookahead < MIN_LOOKAHEAD && flush == Flush::NoFlush {
                 return BlockState::NeedMore;
             }
@@ -599,7 +200,7 @@ pub(crate) fn deflate_fast(cx: &mut DeflateContext, flush: Flush) -> BlockState 
         };
 
         if bflush {
-            if let Some(early) = cx.flush_block(false) {
+            if let Some(early) = flush_block(cx, false) {
                 return early;
             }
         }
@@ -612,13 +213,13 @@ pub(crate) fn deflate_fast(cx: &mut DeflateContext, flush: Flush) -> BlockState 
         MIN_MATCH - 1
     };
     if flush == Flush::Finish {
-        if let Some(early) = cx.flush_block(true) {
+        if let Some(early) = flush_block(cx, true) {
             return early;
         }
         return BlockState::FinishDone;
     }
     if cx.state.sym_next != 0 {
-        if let Some(early) = cx.flush_block(false) {
+        if let Some(early) = flush_block(cx, false) {
             return early;
         }
     }
@@ -705,8 +306,26 @@ mod tests {
         // test input, so `deflate_fast(Finish)` never returns early for want of
         // output room.
         let mut out = vec![0u8; input.len() + input.len() / 2 + 1024];
+        // The canonical `DeflateContext` (defined in `mod.rs`) carries the
+        // running totals/check value by mutable reference, so provide local
+        // scalars to borrow. This harness exercises raw DEFLATE (`wrap == 0`),
+        // so `adler` is never touched; `data_type` starts at `Unknown` (2).
+        let mut total_in: u64 = 0;
+        let mut total_out: u64 = 0;
+        let mut adler: u32 = 0;
+        let mut data_type: i32 = 2;
         let produced = {
-            let mut cx = DeflateContext::new(&mut state, input, &mut out);
+            let mut cx = DeflateContext {
+                state: &mut state,
+                input,
+                next_in: 0,
+                output: &mut out,
+                next_out: 0,
+                total_in: &mut total_in,
+                total_out: &mut total_out,
+                adler: &mut adler,
+                data_type: &mut data_type,
+            };
             let rc = deflate_fast(&mut cx, Flush::Finish);
             assert_eq!(
                 rc,

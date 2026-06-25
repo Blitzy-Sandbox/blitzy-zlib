@@ -1376,6 +1376,13 @@ impl DeflateState {
     /// an unmatched literal `lc`, otherwise records a match of length
     /// `lc + MIN_MATCH` at distance `dist`. Returns `true` when the symbol
     /// buffer is full.
+    ///
+    /// In the reference C library `_tr_tally` is only invoked when `ZLIB_DEBUG`
+    /// is defined; the optimized build (and this port's block producers) use the
+    /// split [`tr_tally_lit`](Self::tr_tally_lit) / [`tr_tally_dist`](Self::tr_tally_dist)
+    /// fast paths instead. It is retained here as the faithful function-form
+    /// counterpart of the C macro for API parity, hence `allow(dead_code)`.
+    #[allow(dead_code)]
     pub(crate) fn tr_tally(&mut self, dist: u16, lc: u8) -> bool {
         self.sym_buf[self.sym_next] = (dist & 0xff) as u8;
         self.sym_buf[self.sym_next + 1] = (dist >> 8) as u8;
