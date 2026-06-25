@@ -12,11 +12,15 @@
 //! * [`state`] — the owned decompressor state ([`state::InflateState`]) and its
 //!   [`state::InflateMode`] machine, the safe-Rust counterpart of the C
 //!   `inflate_state` struct.
+//! * [`fast`] — the hot-path inner decode loop ([`fast::inflate_fast`]), the
+//!   safe-Rust counterpart of C `inflate_fast` (`inffast.c`).
 //!
-//! The inflate driver loop and the fast inner loop (`inflate`, `inflate_fast`,
-//! `inflateBack`) layer on top of these types in a subsequent milestone.
+//! The remaining inflate driver entry points (`inflate`, `inflateBack`) layer on
+//! top of these types in a subsequent milestone.
 
 pub mod tables;
 
 pub mod fixed;
 pub mod state;
+
+pub mod fast;
