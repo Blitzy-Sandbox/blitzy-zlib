@@ -43,8 +43,11 @@
 //!   is a no-op. The compression-finish loop is intentionally not duplicated
 //!   here — it is owned by the `write` module and orchestrated by the `close`
 //!   module — keeping this module decoupled and `unsafe`-free.
-//! * [`Drop`] is a best-effort safety net that calls [`GzState::finalize`]
-//!   again; after an explicit `gzclose` it is a no-op.
+//! * [`Drop`] is a best-effort safety net: for a write stream dropped without
+//!   an explicit `gzclose*` it runs the idempotent
+//!   [`finish_write`](GzState::finish_write) so the gzip trailer is still
+//!   emitted, then calls [`GzState::finalize`]. After an explicit `gzclose*`
+//!   the stream is already finalized ([`GzMode::None`]), so it is a no-op.
 
 use alloc::format;
 use alloc::string::String;
@@ -506,16 +509,32 @@ impl GzState {
 }
 
 impl Drop for GzState {
-    /// Best-effort safety net: finalize the stream on scope exit.
+    /// Best-effort safety net on scope exit.
     ///
-    /// After an explicit `gzclose` the stream is already finalized (its
-    /// [`mode`](Self::mode) is [`GzMode::None`]), so this call is a no-op. The
-    /// owned [`File`](std::fs::File) and [`ZStream`] (and thus the boxed
-    /// deflate/inflate engine) are released by their own `Drop` implementations
-    /// immediately afterward. The returned error code is intentionally ignored
-    /// because `Drop` cannot propagate it — callers that need it must use
-    /// `gzclose`.
+    /// For a **write** stream dropped *without* an explicit `gzclose*`, this
+    /// runs [`finish_write`](Self::finish_write) so the closing deflate block
+    /// and the gzip CRC-32/ISIZE trailer are still emitted — a dropped writer
+    /// therefore still produces a complete, valid gzip file, the central
+    /// guarantee of the RAII model. The finish is **idempotent** (guarded by
+    /// `finish_write`'s own `reset && have == 0` check), and after an explicit
+    /// `gzclose*` the stream is already closed (its [`mode`](Self::mode) is
+    /// [`GzMode::None`]), so no second gzip trailer is ever emitted. A read
+    /// stream needs no finish step — its inflate engine and buffers are simply
+    /// released below.
+    ///
+    /// [`finalize`](Self::finalize) then records the closure, after which the
+    /// owned [`File`](std::fs::File), [`ZStream`] (and thus the boxed
+    /// deflate/inflate engine) and the `Vec` buffers are released by their own
+    /// `Drop` implementations. Any error from `finish_write` is intentionally
+    /// ignored because `Drop` cannot propagate it — callers that need the close
+    /// status must use the explicit `gzclose*` functions.
     fn drop(&mut self) {
+        // Finish a write stream the caller forgot to close, so the gzip trailer
+        // is always present. `GzMode::Append` is converted to `GzMode::Write` in
+        // `gz_open`, so `Write` is the only live compressing mode reachable here.
+        if self.mode == GzMode::Write {
+            let _ = self.finish_write();
+        }
         let _ = self.finalize();
     }
 }

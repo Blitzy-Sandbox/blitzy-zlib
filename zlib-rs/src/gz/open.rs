@@ -913,6 +913,13 @@ mod tests {
         // Simulate buffers already allocated.
         state.size = 100;
         assert_eq!(gzbuffer(&mut state, 4096), -1);
+        // This state is deliberately inconsistent (`size` is set without any
+        // matching buffer allocation) purely to exercise gzbuffer's
+        // post-allocation rejection. Finalize it before it drops so the RAII
+        // safety net in `GzState::Drop` — which finishes a *write* stream by
+        // running `finish_write` — does not operate on this artificial state
+        // (which `gz_open` would never produce).
+        let _ = state.finalize();
     }
 
     #[test]

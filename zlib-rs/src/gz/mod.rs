@@ -10,12 +10,15 @@
 //! |------------------|---------------|-----------------------------------------------|
 //! | [`state`]        | `gzguts.h`    | The owned [`GzState`](state::GzState) struct  |
 //! | [`open`]         | `gzlib.c`     | open / buffer / seek / position / error API   |
+//! | [`read`]         | `gzread.c`    | the decompression engine + read API           |
 //! | [`write`]        | `gzwrite.c`   | the compression engine (`gz_init`/`gz_comp`/`gz_zero`) |
+//! | [`close`]        | `gzclose.c`   | close dispatch (`gzclose`/`gzclose_r`/`gzclose_w`) |
 //!
-//! The read (`gzread.c`) and close (`gzclose.c`) layers, and the public
-//! `GzFile` handle plus the `gz*` entry points, are introduced in a later
-//! checkpoint; this module currently wires the foundation (state + open +
-//! write-engine) into the crate so those files are compiled and tested.
+//! The state, open, read, write, and close layers together form the complete
+//! buffered engine. The public `GzFile` handle and the `gz*` C entry points
+//! that drive these `pub(crate)` items are reconstructed in the `libz-rs-sys`
+//! FFI shim (a later checkpoint); until then the only callers are this module's
+//! own `#[cfg(test)]` suites.
 //!
 //! # Availability
 //!
@@ -47,6 +50,7 @@
 // functions in.
 #![allow(dead_code)]
 
+pub(crate) mod close;
 pub(crate) mod open;
 pub(crate) mod read;
 pub(crate) mod state;
