@@ -209,6 +209,16 @@ pub(crate) struct GzState {
     /// Count of [`out_buf`](Self::out_buf) bytes already written to the file
     /// (C `state->x.next - state->out`); the bytes in
     /// `out_buf[out_written..out_pos]` are compressed-but-not-yet-flushed.
+    ///
+    /// Retained for one-to-one fidelity with the C `gz_state` struct, but never
+    /// read by the safe-Rust write engine: [`gz_comp`](crate::gz::write) treats
+    /// [`out_buf`](Self::out_buf) as per-call scratch and tracks the
+    /// produced/flushed split with local cursors (it fully drains the buffer to
+    /// the blocking [`File`](std::fs::File) within each call), so no persistent
+    /// "written" cursor is needed. The crate-wide `#![forbid(unsafe_code)]` core
+    /// is built under `-D warnings`, so this otherwise-`dead_code` field carries
+    /// a targeted allow rather than masking the whole module.
+    #[allow(dead_code)]
     pub(crate) out_written: usize,
     /// Transparent-vs-gzip tri-state (C `direct`). Its meaning differs by mode:
     /// when **reading** it starts at `1` (auto-detect, assume transparent for an
