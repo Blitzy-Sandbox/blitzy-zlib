@@ -1,0 +1,23 @@
+# The drop-in shared/static library member.
+#
+# Builds the `libz-rs-sys` C-ABI shim into a C-consumable `cdylib` (`libz.so`)
+# and `staticlib` (`libz.a`), so existing C programs can relink against the Rust
+# implementation without source changes (AAP §0.3.1). The full `#[no_mangle]`
+# export surface is provided by `libz-rs-sys` in a subsequent milestone; this
+# member establishes the artifact and its link to the shim.
+[package]
+name = "libz-rs-sys-cdylib"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Zlib"
+description = "Drop-in cdylib/staticlib (libz.so / libz.a) built from the libz-rs-sys C-ABI shim."
+
+# Naming the library target `z` makes the emitted artifacts `libz.so` / `libz.a`,
+# the conventional zlib shared/static library names for a true drop-in.
+[lib]
+name = "z"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+libz-rs-sys = { path = "../libz-rs-sys" }

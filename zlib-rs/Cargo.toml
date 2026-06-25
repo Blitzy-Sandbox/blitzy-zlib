@@ -1,0 +1,59 @@
+# The safe, pure-Rust core of the zlib port.
+#
+# Behavioral contract (AAP §0.2.2, §0.6.2): the entire crate is built under
+# `#![forbid(unsafe_code)]` and is `no_std`-capable. It carries the deliberately
+# minimal runtime-dependency footprint of the C baseline — only `cfg-if` (always)
+# and `crc32fast` (optional, behind the `simd` feature).
+[package]
+name = "zlib-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Zlib"
+description = "Idiomatic, memory-safe pure-Rust port of the zlib compression library (DEFLATE / zlib / gzip), with bit-identical output as the goal."
+categories = ["compression", "no-std"]
+keywords = ["zlib", "deflate", "gzip", "compression", "inflate"]
+
+# `build.rs` generates the 256-entry byte-wise CRC-32 table into `OUT_DIR`,
+# replacing the precomputed C `crc_table[]`. `crc32.rs` pulls it in with
+# `include!(concat!(env!("OUT_DIR"), "/crc32_table.rs"))`, so the build script is
+# required on every build (SIMD and scalar paths alike).
+build = "build.rs"
+
+[features]
+# Default to the standard library plus the hardware-accelerated checksum path,
+# matching a typical native build of C zlib.
+default = ["std", "simd"]
+
+# `std` enables the standard library (the `gz*` file-I/O layer, the
+# `std::error::Error` impl, etc.). When `std` is OFF the crate is `#![no_std]`
+# and uses only `core` + `alloc`. The weak `crc32fast?/std` propagation gives
+# `crc32fast` its runtime SIMD detection only when both `std` and `simd` are on.
+std = ["crc32fast?/std"]
+
+# gzip container support (mirrors the C `GZIP` define).
+gzip = []
+
+# gzip file I/O (mirrors the C `#ifndef NO_GZCOMPRESS`); requires the std layer.
+gz-io = ["std", "gzip"]
+
+# Explicit marker mirroring the C `Z_SOLO` configuration. The actual `no_std`
+# switch is the *absence* of `std`; this alias exists for parity/discoverability.
+no-std = []
+
+# Hardware-accelerated CRC-32 via the `crc32fast` crate. Disabling it
+# (`--no-default-features`) selects the always-correct scalar table fallback.
+simd = ["dep:crc32fast"]
+
+# Gates the C-ABI layer build (the `libz-rs-sys` shim / cdylib). The pure-Rust
+# core can be built and tested without ever pulling in the FFI surface.
+capi = []
+
+[dependencies]
+# Ergonomic conditional compilation, replacing the C `#if`/`#ifdef` chains.
+cfg-if = "1.0.4"
+
+# SIMD-accelerated CRC-32 (IEEE). Optional and `no_std`-friendly: built with
+# `default-features = false` so it never forces `std`; the `std` feature above
+# re-enables its runtime detection when appropriate.
+crc32fast = { version = "1.5.0", optional = true, default-features = false }

@@ -49,3 +49,8 @@ user.bazelrc
 # MODULE.bazel.lock is ignored for now as per this recommendation:
 # https://github.com/bazelbuild/bazel/issues/20369
 MODULE.bazel.lock
+
+# Rust / Cargo (zlib-rs workspace) build artifacts
+/target
+**/*.rs.bk
+*.pdb

@@ -45,7 +45,7 @@
 
 use alloc::vec::Vec;
 
-use crate::constants::{MAX_MATCH, MIN_MATCH, Strategy as CompressionStrategy};
+use crate::constants::{MAX_MATCH, MIN_MATCH, Strategy as CompressionStrategy, Z_DEFLATED};
 use crate::error::{Result, ZlibError};
 use crate::gz_header::GzHeader;
 
@@ -472,15 +472,23 @@ impl DeflateState {
     ///
     /// # Division of labor (binding)
     ///
-    /// This constructor is responsible **only** for allocation and data-model
-    /// initialization. It deliberately does *not* perform parameter validation
-    /// or `windowBits` overloading: `mod.rs`'s `deflateInit2_` equivalent does
-    /// all of that first — rejecting bad arguments, resolving
-    /// `Z_DEFAULT_COMPRESSION` to level `6`, mapping a negative `windowBits` to a
-    /// raw stream (`wrap = 0`), a `windowBits > 15` to a gzip stream
-    /// (`wrap = 2`), and `windowBits == 8` to `9` — and then calls this function
-    /// with an already-normalized `window_bits` in `8..=15` and the computed
-    /// `wrap`.
+    /// This constructor is responsible for allocation and data-model
+    /// initialization. The full `windowBits` *overloading* and argument
+    /// *normalization* still belong to `mod.rs`'s `deflateInit2_` equivalent,
+    /// which runs first — resolving `Z_DEFAULT_COMPRESSION` to level `6`,
+    /// mapping a negative `windowBits` to a raw stream (`wrap = 0`), a
+    /// `windowBits > 15` to a gzip stream (`wrap = 2`), and `windowBits == 8`
+    /// to `9` — and then calls this function with an already-normalized
+    /// `window_bits` in `8..=15` and the computed `wrap`.
+    ///
+    /// Because `new` is a *public* constructor, however, it does not trust its
+    /// caller blindly: it performs a defensive bounds check on every numeric
+    /// argument up front (mirroring the C `deflateInit2_` guard) and returns
+    /// [`ZlibError::StreamError`] for any out-of-range value *before* the shift
+    /// and size arithmetic below — so an invalid `window_bits` or `mem_level`
+    /// can never panic or trigger an impossible allocation. The `strategy`
+    /// argument needs no such check: it is a `CompressionStrategy` enum and is
+    /// in range by construction.
     ///
     /// Two groups of fields are left for `mod.rs`/`trees.rs` to populate, exactly
     /// as the C code defers them out of `deflateInit2_`:
@@ -508,9 +516,15 @@ impl DeflateState {
     ///
     /// # Errors
     ///
+    /// Returns [`ZlibError::StreamError`] (the C `Z_STREAM_ERROR`) if any
+    /// argument is out of range: `level` outside `0..=9`, `method` other than
+    /// `Z_DEFLATED`, `window_bits` outside `8..=15`, `mem_level` outside
+    /// `1..=9`, or `wrap` outside `0..=2`.
+    ///
     /// Returns [`ZlibError::MemError`] if any buffer allocation cannot be
     /// satisfied, mirroring the C `Z_MEM_ERROR` path. Allocation is fallible, so
-    /// this constructor never panics on an out-of-memory condition.
+    /// this constructor never panics — neither on invalid arguments nor on an
+    /// out-of-memory condition.
     pub fn new(
         level: i32,
         method: u8,
@@ -519,6 +533,27 @@ impl DeflateState {
         strategy: CompressionStrategy,
         wrap: i32,
     ) -> Result<Self> {
+        // --- Defensive parameter validation (CP1 robustness hardening) ---
+        //
+        // `new` is a *public* constructor, so it must never be reachable with
+        // arguments that would panic in the shift/size arithmetic below — a
+        // negative `mem_level` casts to a huge `u32`, and an oversized
+        // `window_bits` overflows `1usize << w_bits` — or that would attempt an
+        // impossible allocation. Mirroring the C `deflateInit2_` guard
+        // (`deflate.c` lines 405-413), reject every out-of-range argument up
+        // front with `Z_STREAM_ERROR`, *before* any arithmetic. `strategy`
+        // needs no check: it is a `CompressionStrategy` enum, hence always in
+        // range by construction (the type-state pattern subsumes the C
+        // `strategy < 0 || strategy > Z_FIXED` test).
+        if !(0..=9).contains(&level)
+            || method != Z_DEFLATED as u8
+            || !(8..=15).contains(&window_bits)
+            || !(1..=9).contains(&mem_level)
+            || !(0..=2).contains(&wrap)
+        {
+            return Err(ZlibError::StreamError);
+        }
+
         // --- Window geometry (deflate.c lines 446-450) ---
         let w_bits = window_bits;
         let w_size = 1usize << w_bits;
@@ -655,6 +690,12 @@ impl DeflateState {
     /// pending_buf`. The caller must ensure `pending < pending_buf_size`; a
     /// violation triggers the standard slice bounds check (a panic) rather than
     /// the silent out-of-bounds write the C macro would perform.
+    ///
+    /// Foundation helper: consumed by the deflate block-emission engine in a
+    /// subsequent milestone. The targeted `dead_code` allow keeps the strict
+    /// `-D warnings` gate green until that caller exists, without masking
+    /// dead code elsewhere.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn put_byte(&mut self, b: u8) {
         self.pending_buf[self.pending] = b;
@@ -665,6 +706,12 @@ impl DeflateState {
     ///
     /// Match distances are limited to `w_size - MIN_LOOKAHEAD` to keep the window
     /// bookkeeping simple, as in the C implementation.
+    ///
+    /// Foundation helper: consumed by the deflate match-search engine in a
+    /// subsequent milestone. The targeted `dead_code` allow keeps the strict
+    /// `-D warnings` gate green until that caller exists, without masking
+    /// dead code elsewhere.
+    #[allow(dead_code)]
     #[inline]
     #[must_use]
     pub(crate) fn max_dist(&self) -> usize {
@@ -684,4 +731,113 @@ fn try_alloc<T: Clone>(len: usize, fill: T) -> Result<Vec<T>> {
     v.try_reserve_exact(len).map_err(|_| ZlibError::MemError)?;
     v.resize(len, fill);
     Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::DEF_MEM_LEVEL;
+
+    // Build a `DeflateState` from a baseline-valid argument tuple, overriding
+    // only the fields a given test probes. Keeps each assertion focused on the
+    // single parameter under test.
+    fn make(
+        level: i32,
+        method: u8,
+        window_bits: u32,
+        mem_level: i32,
+        wrap: i32,
+    ) -> Result<DeflateState> {
+        DeflateState::new(
+            level,
+            method,
+            window_bits,
+            mem_level,
+            CompressionStrategy::Default,
+            wrap,
+        )
+    }
+
+    #[test]
+    fn new_accepts_valid_and_boundary_arguments() {
+        // Canonical valid zlib stream starts in `Init`.
+        assert_eq!(
+            make(6, Z_DEFLATED as u8, 15, DEF_MEM_LEVEL, 1)
+                .expect("valid zlib args")
+                .status,
+            DeflateStatus::Init
+        );
+        // A gzip wrapper starts in `Gzip`.
+        assert_eq!(
+            make(9, Z_DEFLATED as u8, 15, DEF_MEM_LEVEL, 2)
+                .expect("valid gzip args")
+                .status,
+            DeflateStatus::Gzip
+        );
+        // Every in-range boundary constructs without panicking.
+        for level in [0, 9] {
+            for wbits in [8u32, 15u32] {
+                for mem in [1i32, 9i32] {
+                    assert!(
+                        make(level, Z_DEFLATED as u8, wbits, mem, 1).is_ok(),
+                        "level={level} wbits={wbits} mem={mem} should be valid"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn new_rejects_out_of_range_window_bits() {
+        // Below 8, above 15, and values large enough to overflow the
+        // `1usize << w_bits` shift were validation skipped.
+        for bad in [0u32, 7, 16, 31, 64, u32::MAX] {
+            assert_eq!(
+                make(6, Z_DEFLATED as u8, bad, DEF_MEM_LEVEL, 1).err(),
+                Some(ZlibError::StreamError),
+                "window_bits={bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn new_rejects_out_of_range_mem_level() {
+        // Negative (would cast to a huge u32 and overflow the hash/lit shifts),
+        // zero, and above 9.
+        for bad in [i32::MIN, -1, 0, 10, i32::MAX] {
+            assert_eq!(
+                make(6, Z_DEFLATED as u8, 15, bad, 1).err(),
+                Some(ZlibError::StreamError),
+                "mem_level={bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn new_rejects_bad_level_method_and_wrap() {
+        // `level` outside 0..=9.
+        for bad in [i32::MIN, -1, 10, i32::MAX] {
+            assert_eq!(
+                make(bad, Z_DEFLATED as u8, 15, DEF_MEM_LEVEL, 1).err(),
+                Some(ZlibError::StreamError),
+                "level={bad} must be rejected"
+            );
+        }
+        // `method` other than Z_DEFLATED (8).
+        for bad in [0u8, 1, 7, 9, 255] {
+            assert_eq!(
+                make(6, bad, 15, DEF_MEM_LEVEL, 1).err(),
+                Some(ZlibError::StreamError),
+                "method={bad} must be rejected"
+            );
+        }
+        // `wrap` outside 0..=2.
+        for bad in [i32::MIN, -1, 3, i32::MAX] {
+            assert_eq!(
+                make(6, Z_DEFLATED as u8, 15, DEF_MEM_LEVEL, bad).err(),
+                Some(ZlibError::StreamError),
+                "wrap={bad} must be rejected"
+            );
+        }
+    }
 }

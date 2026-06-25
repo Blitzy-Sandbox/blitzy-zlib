@@ -1,0 +1,26 @@
+# Workspace root for the zlib → Rust migration.
+#
+# This is a *virtual* manifest (it defines no package of its own); it only ties
+# the three workspace members together so the whole tree builds and tests as one
+# self-consistent unit, as mandated by the Agent Action Plan's single-phase
+# execution model:
+#
+#   * `zlib-rs`            — the safe, pure-Rust core (`#![forbid(unsafe_code)]`,
+#                            `no_std`-capable). Implements the DEFLATE/zlib/gzip
+#                            algorithms and checksums.
+#   * `libz-rs-sys`        — the thin `extern "C"` / `#[repr(C)]` ABI shim. The
+#                            ONLY crate permitted to contain `unsafe`.
+#   * `libz-rs-sys-cdylib` — the drop-in shared/static library member that emits
+#                            `libz.so` / `libz.a` on top of the shim.
+#
+# Dependency chain: libz-rs-sys-cdylib -> libz-rs-sys -> zlib-rs.
+#
+# `resolver = "2"` is declared explicitly: virtual workspaces otherwise default
+# to the legacy resolver, which is incompatible with the edition-2024 members.
+[workspace]
+resolver = "2"
+members = [
+    "zlib-rs",
+    "libz-rs-sys",
+    "libz-rs-sys-cdylib",
+]

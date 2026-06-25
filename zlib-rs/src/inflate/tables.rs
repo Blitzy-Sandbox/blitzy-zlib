@@ -174,8 +174,39 @@ pub fn inflate_table(
     bits: &mut usize,
     work: &mut [u16],
 ) -> Result<usize, InflateTableError> {
-    // Accumulate a count of codes of each length (assumes lens[] all in
-    // 0..=MAXBITS, which the caller guarantees).
+    // --- Defensive input validation (security hardening) ---
+    //
+    // `inflate_table` is a public, safe function and is ultimately reachable
+    // with attacker-controlled code lengths (the dynamic-Huffman header of a
+    // compressed stream). It must therefore reject every malformed input by
+    // *returning* an error rather than panicking on a bounds-checked index or
+    // an arithmetic overflow — either of which would be a remote
+    // denial-of-service. The C routine documents these as caller preconditions
+    // and never checks them; we validate them up front, before any indexing or
+    // arithmetic.
+    //
+    // The per-type symbol-count ceiling matches the DEFLATE alphabets: 19
+    // code-length symbols, up to 288 literal/length symbols (286 used plus the
+    // two reserved 286/287 that the fixed table includes), and up to 32 distance
+    // symbols (30 used plus two reserved). Bounding `codes` also keeps the
+    // per-length `count` tallies within `u16`.
+    let max_codes = match code_type {
+        CodeType::Codes => 19,
+        CodeType::Lens => 288,
+        CodeType::Dists => 32,
+    };
+    if codes > max_codes || codes > lens.len() || work.len() < codes {
+        return Err(InflateTableError::Invalid);
+    }
+    // Every supplied code length must be in `0..=MAXBITS`; a longer length would
+    // index past the `count` / `offs` arrays below.
+    if lens[..codes].iter().any(|&len| len as usize > MAXBITS) {
+        return Err(InflateTableError::Invalid);
+    }
+
+    // Accumulate a count of codes of each length. Both preconditions the C code
+    // merely assumes — `len <= MAXBITS` and `codes <= lens.len()` — are enforced
+    // above, so the indexing here cannot panic.
     let mut count = [0u16; MAXBITS + 1];
     for &len_val in &lens[..codes] {
         count[len_val as usize] += 1;
@@ -195,6 +226,9 @@ pub fn inflate_table(
         // No symbols to code at all: build a two-entry table whose entries force
         // an "invalid code" error, but wait for decoding to report it. This
         // mirrors the empty-code special case in the C source.
+        if table.len() < 2 {
+            return Err(InflateTableError::NotEnough);
+        }
         let here = Code {
             op: 64, // invalid code marker
             bits: 1,
@@ -266,9 +300,12 @@ pub fn inflate_table(
     let mut used = 1usize << root; // root table entries consumed so far
     let mask: u32 = (used - 1) as u32; // mask for comparing the low root bits
 
-    // Check available table space against the ENOUGH budget for this type.
+    // Check available table space against the ENOUGH budget for this type, and
+    // against the actual capacity of the caller-supplied `table`. The latter
+    // guards every `table[..]` write below: all of them use an index `< used`.
     if (code_type == CodeType::Lens && used > ENOUGH_LENS)
         || (code_type == CodeType::Dists && used > ENOUGH_DISTS)
+        || used > table.len()
     {
         return Err(InflateTableError::NotEnough);
     }
@@ -351,10 +388,13 @@ pub fn inflate_table(
                 left <<= 1;
             }
 
-            // Check that the growing table still fits the ENOUGH budget.
+            // Check that the growing table still fits the ENOUGH budget and the
+            // caller-supplied `table` capacity (sub-table writes also index
+            // `< used`).
             used += 1usize << curr;
             if (code_type == CodeType::Lens && used > ENOUGH_LENS)
                 || (code_type == CodeType::Dists && used > ENOUGH_DISTS)
+                || used > table.len()
             {
                 return Err(InflateTableError::NotEnough);
             }
@@ -1119,5 +1159,85 @@ mod tests {
         assert_eq!(bits, 1);
         assert_eq!(table[0], c(64, 1, 0));
         assert_eq!(table[1], c(64, 1, 0));
+    }
+
+    // ----- Malformed-input robustness (security hardening, finding #11) -----
+    //
+    // Each of the following exercises an input that, before validation was
+    // added, would panic via a bounds-checked index or an arithmetic overflow.
+    // Every one must now return an `InflateTableError` instead.
+
+    #[test]
+    fn codes_exceeding_lens_len_is_invalid() {
+        // `codes` larger than the supplied `lens` slice must not panic on
+        // `lens[..codes]`; it returns Invalid instead.
+        let lens = [2u16; 4];
+        let mut table = [Code::default(); ENOUGH];
+        let mut work = [0u16; 19];
+        let mut bits = 7usize;
+        let res = inflate_table(CodeType::Codes, &lens, 5, &mut table, &mut bits, &mut work);
+        assert_eq!(res, Err(InflateTableError::Invalid));
+    }
+
+    #[test]
+    fn work_smaller_than_codes_is_invalid() {
+        // `work` must have room for at least `codes` entries (the sort step
+        // indexes it up to the number of present symbols).
+        let mut lens = [0u16; 19];
+        lens[0..4].fill(2);
+        let mut table = [Code::default(); ENOUGH];
+        let mut work = [0u16; 3]; // too small for codes == 19
+        let mut bits = 7usize;
+        let res = inflate_table(CodeType::Codes, &lens, 19, &mut table, &mut bits, &mut work);
+        assert_eq!(res, Err(InflateTableError::Invalid));
+    }
+
+    #[test]
+    fn length_above_maxbits_is_invalid() {
+        // A code length greater than MAXBITS (15) would index past `count`; it
+        // is rejected rather than panicking.
+        let mut lens = [0u16; 19];
+        lens[0] = (MAXBITS + 1) as u16; // 16
+        let mut table = [Code::default(); ENOUGH];
+        let mut work = [0u16; 19];
+        let mut bits = 7usize;
+        let res = inflate_table(CodeType::Codes, &lens, 19, &mut table, &mut bits, &mut work);
+        assert_eq!(res, Err(InflateTableError::Invalid));
+    }
+
+    #[test]
+    fn codes_beyond_type_maximum_is_invalid() {
+        // CODES has only 19 symbols; a larger `codes` is rejected up front (this
+        // also caps the per-length `count` tallies well within `u16`).
+        let lens = [0u16; 64];
+        let mut table = [Code::default(); ENOUGH];
+        let mut work = [0u16; 64];
+        let mut bits = 7usize;
+        let res = inflate_table(CodeType::Codes, &lens, 20, &mut table, &mut bits, &mut work);
+        assert_eq!(res, Err(InflateTableError::Invalid));
+    }
+
+    #[test]
+    fn table_too_small_is_not_enough() {
+        // A valid complete code whose decode table does not fit the caller's
+        // buffer must return NotEnough rather than panicking on a table write.
+        let lens = fixed_litlen_lengths();
+        let mut table = [Code::default(); 16]; // far smaller than the 512 needed
+        let mut work = [0u16; 288];
+        let mut bits = 9usize;
+        let res = inflate_table(CodeType::Lens, &lens, 288, &mut table, &mut bits, &mut work);
+        assert_eq!(res, Err(InflateTableError::NotEnough));
+    }
+
+    #[test]
+    fn empty_table_too_small_is_not_enough() {
+        // The forced-error empty table needs two entries; a one-entry buffer is
+        // NotEnough, not a panic.
+        let lens = [0u16; 19];
+        let mut table = [Code::default(); 1];
+        let mut work = [0u16; 19];
+        let mut bits = 7usize;
+        let res = inflate_table(CodeType::Codes, &lens, 19, &mut table, &mut bits, &mut work);
+        assert_eq!(res, Err(InflateTableError::NotEnough));
     }
 }

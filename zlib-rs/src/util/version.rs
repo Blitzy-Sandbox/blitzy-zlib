@@ -68,20 +68,30 @@ pub fn z_error(code: i32) -> &'static str {
     err_msg(code)
 }
 
-/// Returns a bitmask describing compile-time configuration, mirroring C
-/// `zlibCompileFlags()`.
+/// Returns the `zlibCompileFlags()` bitmask for a given `z_off_t` size.
 ///
 /// The low eight bits encode the sizes of the C scalar types used at the FFI
-/// boundary, two bits per type, so that C callers (via `libz-rs-sys`) observe
-/// flags consistent with the target platform's data model. The remaining
-/// documented bits describe optional compile-time features; none are enabled in
-/// this standard, safe-Rust build, so they are all zero.
+/// boundary, two bits per type, so that C callers observe flags consistent with
+/// the target platform's data model. The first three fields — `uInt` (bits
+/// 0-1), `uLong` (bits 2-3), and `voidpf` (bits 4-5) — are intrinsic to the Rust
+/// target and are read directly from [`c_uint`], [`c_ulong`], and a raw pointer.
+/// The fourth field, `z_off_t` (bits 6-7), is an *ABI choice* owned by the layer
+/// that defines `z_off_t`, so it is supplied by the caller as `z_off_t_size`.
 ///
-/// The size fields are computed dynamically with [`core::mem::size_of`], so the
-/// result is platform-dependent — for example a 64-bit Unix (LP64) build yields
-/// `0xA9`, whereas a 64-bit Windows (LLP64) build yields `0x65`.
+/// This parameterization is what keeps `zlibCompileFlags` correct across data
+/// models: the C ABI shim (`libz-rs-sys`) maps `z_off_t` to `libc::off_t` and
+/// therefore calls this with `size_of::<off_t>()`, whereas the pure-Rust
+/// [`zlib_compile_flags`] uses the C `long` width that zlib's `z_off_t` typedef
+/// defaults to. On platforms where `off_t` and `long` differ (notably 64-bit
+/// Windows / LLP64 and 32-bit large-file builds) the two reports differ exactly
+/// as they should. Keeping the parameter here also lets the core stay `no_std`
+/// and free of any `libc` dependency.
+///
+/// The remaining documented bits describe optional compile-time features; none
+/// are enabled in this standard, safe-Rust build, so they are all zero. The
+/// function is `const`, so callers may evaluate it at compile time.
 #[must_use]
-pub fn zlib_compile_flags() -> u32 {
+pub const fn zlib_compile_flags_for(z_off_t_size: usize) -> u32 {
     /// Encodes a C type size into the 2-bit code used by `zlibCompileFlags`:
     /// `2 -> 0`, `4 -> 1`, `8 -> 2`, and any other size `-> 3`. This reproduces
     /// the C `switch ((int)sizeof(...))` ladder exactly.
@@ -102,8 +112,9 @@ pub fn zlib_compile_flags() -> u32 {
     flags |= size_code(core::mem::size_of::<c_ulong>()) << 2;
     // bits 4-5: sizeof(voidpf) == sizeof(*const c_void)
     flags |= size_code(core::mem::size_of::<*const c_void>()) << 4;
-    // bits 6-7: sizeof(z_off_t); zlib's z_off_t defaults to the C `long` type.
-    flags |= size_code(core::mem::size_of::<c_long>()) << 6;
+    // bits 6-7: sizeof(z_off_t), supplied by the caller because the C ABI layer
+    // maps `z_off_t` to `libc::off_t`, which need not equal the C `long`.
+    flags |= size_code(z_off_t_size) << 6;
 
     // The remaining flag bits describe optional compile-time features. None are
     // active in this standard, safe-Rust build, so each contributes 0:
@@ -122,6 +133,22 @@ pub fn zlib_compile_flags() -> u32 {
     //           corresponds to the C "STDC defined and vsnprintf available"
     //           case, so none of bits 24-27 are set.
     flags
+}
+
+/// Returns a bitmask describing compile-time configuration, mirroring C
+/// `zlibCompileFlags()`, for the pure-Rust build.
+///
+/// This is [`zlib_compile_flags_for`] evaluated with the C `long` width, which
+/// is the type zlib's `z_off_t` typedef defaults to when large-file support is
+/// not requested. The C ABI shim (`libz-rs-sys`) instead reports
+/// `size_of::<libc::off_t>()` so the exported `zlibCompileFlags` symbol matches
+/// the `z_off_t` it actually uses.
+///
+/// For example a 64-bit Unix (LP64) build yields `0xA9`, whereas a 64-bit
+/// Windows (LLP64) build yields `0x65`.
+#[must_use]
+pub fn zlib_compile_flags() -> u32 {
+    zlib_compile_flags_for(core::mem::size_of::<c_long>())
 }
 
 #[cfg(test)]
@@ -187,5 +214,31 @@ mod tests {
         // No optional compile-time features are enabled, so every bit from bit 8
         // upward must be zero in this standard build.
         assert_eq!(zlib_compile_flags() & 0xFFFF_FF00, 0);
+    }
+
+    #[test]
+    fn compile_flags_for_encodes_z_off_t_size_in_bits_6_7() {
+        // The z_off_t size field is bits 6-7, encoded 2->0, 4->1, 8->2, else 3.
+        assert_eq!((zlib_compile_flags_for(2) >> 6) & 0b11, 0);
+        assert_eq!((zlib_compile_flags_for(4) >> 6) & 0b11, 1);
+        assert_eq!((zlib_compile_flags_for(8) >> 6) & 0b11, 2);
+        assert_eq!((zlib_compile_flags_for(16) >> 6) & 0b11, 3);
+        // Every other field is independent of the z_off_t parameter: masking off
+        // bits 6-7 leaves an identical result for a 4-byte and an 8-byte z_off_t.
+        let mask = !(0b11u32 << 6);
+        assert_eq!(
+            zlib_compile_flags_for(4) & mask,
+            zlib_compile_flags_for(8) & mask
+        );
+    }
+
+    #[test]
+    fn compile_flags_default_uses_c_long_for_z_off_t() {
+        // The parameterless helper reports the C `long` width for z_off_t; the
+        // FFI shim overrides this with `libc::off_t`.
+        assert_eq!(
+            zlib_compile_flags(),
+            zlib_compile_flags_for(core::mem::size_of::<c_long>())
+        );
     }
 }

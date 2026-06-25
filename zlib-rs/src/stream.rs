@@ -52,7 +52,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::constants::DataType;
-use crate::deflate::state::DeflateState;
+use crate::deflate::state::{DeflateState, DeflateStatus};
 use crate::error::{Result, ReturnCode, ZlibError};
 use crate::inflate::state::InflateState;
 
@@ -325,8 +325,15 @@ impl ZStream {
     /// state (and all its buffers) is dropped, and the stream returns to the
     /// uninitialized [`StreamState::None`]. Ending a stream that has no engine
     /// installed is a [`ZlibError::StreamError`] (the C `Z_STREAM_ERROR`),
-    /// matching how `deflateEnd` rejects a `Z_NULL` state. On success it yields
-    /// [`ReturnCode::Ok`].
+    /// matching how `deflateEnd` rejects a `Z_NULL` state.
+    ///
+    /// For a DEFLATE engine this also reproduces `deflateEnd`'s *data-error*
+    /// signal: if the compressor is still mid-stream — its status is
+    /// [`DeflateStatus::Busy`], the C `BUSY_STATE` — the resources are freed
+    /// just the same, but the call reports [`ZlibError::DataError`] (the C
+    /// `Z_DATA_ERROR`, per `status == BUSY_STATE ? Z_DATA_ERROR : Z_OK`)
+    /// rather than success. An INFLATE engine has no `BUSY_STATE` analogue and
+    /// always yields [`ReturnCode::Ok`] once valid.
     ///
     /// Note that this is *optional*: simply dropping the `ZStream` frees the
     /// same memory. `end` exists to expose the return-code semantics callers
@@ -334,7 +341,25 @@ impl ZStream {
     pub fn end(&mut self) -> Result<ReturnCode> {
         match core::mem::take(&mut self.state) {
             StreamState::None => Err(ZlibError::StreamError),
-            _ => Ok(ReturnCode::Ok),
+            StreamState::Deflate(state) => {
+                // Mirror C `deflateEnd`: the owned `Box<DeflateState>` (and every
+                // buffer it owns) is dropped at the end of this arm regardless of
+                // outcome, so resources are *always* freed. The reported status,
+                // however, is `Z_DATA_ERROR` when the compressor was caught
+                // mid-stream (`BUSY_STATE`), exactly as the C implementation
+                // returns `status == BUSY_STATE ? Z_DATA_ERROR : Z_OK`.
+                if state.status == DeflateStatus::Busy {
+                    Err(ZlibError::DataError)
+                } else {
+                    Ok(ReturnCode::Ok)
+                }
+            }
+            StreamState::Inflate(_state) => {
+                // `inflateEnd` has no `BUSY_STATE` analogue: once the state is
+                // valid it always returns `Z_OK`. Dropping the owned `Box` frees
+                // the sliding window and decode tables.
+                Ok(ReturnCode::Ok)
+            }
         }
     }
 
@@ -474,6 +499,56 @@ mod tests {
         assert!(matches!(z.state, StreamState::None));
         // A second teardown now reports the stream error.
         assert_eq!(z.end(), Err(ZlibError::StreamError));
+    }
+
+    /// Ending a DEFLATE engine that is still mid-stream (`BUSY_STATE`) mirrors
+    /// C `deflateEnd`: the owned resources are freed (the stream returns to
+    /// [`StreamState::None`]) but the reported status is `Z_DATA_ERROR`, not
+    /// `Z_OK`.
+    #[test]
+    fn end_busy_deflate_reports_data_error_but_frees() {
+        let mut z = ZStream::new();
+        let mut state =
+            DeflateState::new(6, Z_DEFLATED as u8, 15, DEF_MEM_LEVEL, Strategy::Default, 1)
+                .expect("deflate state allocation should succeed");
+        // Simulate a compressor caught mid-stream.
+        state.status = DeflateStatus::Busy;
+        z.set_deflate_state(Box::new(state));
+        assert!(z.is_deflate());
+
+        // C `deflateEnd` returns Z_DATA_ERROR for BUSY_STATE while still freeing.
+        assert_eq!(z.end(), Err(ZlibError::DataError));
+        // Resources were freed regardless: the stream is back to the empty state.
+        assert!(!z.is_initialized());
+        assert!(matches!(z.state, StreamState::None));
+        // A subsequent teardown reports the stream error (nothing installed).
+        assert_eq!(z.end(), Err(ZlibError::StreamError));
+    }
+
+    /// A non-busy DEFLATE status (here `Finish`) ends cleanly with `Z_OK`,
+    /// proving only `Busy` triggers the data-error path.
+    #[test]
+    fn end_non_busy_deflate_is_ok() {
+        let mut z = ZStream::new();
+        let mut state =
+            DeflateState::new(6, Z_DEFLATED as u8, 15, DEF_MEM_LEVEL, Strategy::Default, 1)
+                .expect("deflate state allocation should succeed");
+        state.status = DeflateStatus::Finish;
+        z.set_deflate_state(Box::new(state));
+        assert_eq!(z.end(), Ok(ReturnCode::Ok));
+        assert!(matches!(z.state, StreamState::None));
+    }
+
+    /// Ending an INFLATE engine always succeeds (no `BUSY_STATE` analogue) and
+    /// frees the owned window via RAII.
+    #[test]
+    fn end_inflate_state_is_ok_and_frees() {
+        let mut z = ZStream::new();
+        z.set_inflate_state(Box::new(InflateState::new(15)));
+        assert!(z.is_inflate());
+        assert_eq!(z.end(), Ok(ReturnCode::Ok));
+        assert!(!z.is_initialized());
+        assert!(matches!(z.state, StreamState::None));
     }
 
     /// Installing a second engine drops the first (no leak, no double free —

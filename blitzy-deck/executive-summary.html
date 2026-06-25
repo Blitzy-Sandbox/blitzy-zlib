@@ -25,6 +25,7 @@
       --blitzy-grad-start: #7A6DEC;
       --blitzy-grad-end: #4101DB;
       --n-333: #333333;
+      --n-666: #666666;
       --n-999: #999999;
       --n-d9: #D9D9D9;
       --n-f4: #F4EFF6;
@@ -87,7 +88,7 @@
     .kpi-icon { color: var(--blitzy-primary); margin-bottom: 8px; }
     .kpi-icon svg { width: 40px; height: 40px; stroke-width: 1.8; }
     .kpi-value { font-family: var(--font-display); font-size: 2.0em; font-weight: 700; color: var(--blitzy-dark); line-height: 1; }
-    .kpi-label { font-size: 0.62em; color: var(--n-999); margin-top: 6px; }
+    .kpi-label { font-size: 0.62em; color: var(--n-666); margin-top: 6px; }
 
     /* Icon row */
     .icon-row { display: flex; gap: 40px; margin-top: 0.5em; flex-wrap: wrap; }
@@ -114,45 +115,45 @@
   <div class="reveal">
     <div class="slides">
 
-      <!-- 1. TITLE -->
+      <!-- TITLE -->
       <section class="slide-title" data-background-color="#5B39F3">
-        <span class="hero-icon"><i data-lucide="package"></i></span>
+        <span class="hero-icon"><i data-lucide="package" aria-hidden="true"></i></span>
         <span class="eyebrow">C to Rust Migration</span>
         <h1>zlib, Reimagined in Safe Rust</h1>
         <div class="accent-bar"></div>
-        <p>A memory-safe, drop-in compatible rewrite of the zlib compression library.</p>
+        <p>A memory-safe rewrite of the zlib compression library, targeting drop-in C-ABI compatibility.</p>
         <p class="brand-lockup">Blitzy</p>
       </section>
 
-      <!-- 2. HEADLINE / KPI -->
+      <!-- HEADLINE / KPI -->
       <section>
         <span class="eyebrow">At a Glance</span>
         <h2>Migration by the Numbers</h2>
         <div class="kpi-grid">
           <div class="kpi-card">
-            <span class="kpi-icon"><i data-lucide="code"></i></span>
+            <span class="kpi-icon"><i data-lucide="code" aria-hidden="true"></i></span>
             <div class="kpi-value">~9,700</div>
-            <div class="kpi-label">lines of core C rewritten in safe Rust</div>
+            <div class="kpi-label">lines of core C targeted for safe-Rust rewrite</div>
           </div>
           <div class="kpi-card">
-            <span class="kpi-icon"><i data-lucide="boxes"></i></span>
+            <span class="kpi-icon"><i data-lucide="boxes" aria-hidden="true"></i></span>
             <div class="kpi-value">3</div>
             <div class="kpi-label">Cargo workspace members</div>
           </div>
           <div class="kpi-card">
-            <span class="kpi-icon"><i data-lucide="shield-check"></i></span>
+            <span class="kpi-icon"><i data-lucide="shield-check" aria-hidden="true"></i></span>
             <div class="kpi-value">0</div>
             <div class="kpi-label">unsafe blocks in the compression core</div>
           </div>
           <div class="kpi-card">
-            <span class="kpi-icon"><i data-lucide="equal"></i></span>
+            <span class="kpi-icon"><i data-lucide="equal" aria-hidden="true"></i></span>
             <div class="kpi-value">Bit-identical</div>
-            <div class="kpi-label">output versus C zlib, every level</div>
+            <div class="kpi-label">output vs C zlib at every level — the migration goal</div>
           </div>
         </div>
       </section>
 
-      <!-- 3. ARCHITECTURE OVERVIEW -->
+      <!-- ARCHITECTURE OVERVIEW -->
       <section>
         <span class="eyebrow">Architecture</span>
         <h2>From One C Library to a Layered Rust Workspace</h2>
@@ -172,21 +173,21 @@ graph LR
         </pre>
       </section>
 
-      <!-- 4. DIVIDER: WHY -->
+      <!-- DIVIDER: WHY -->
       <section class="slide-divider" data-background-color="#1A105F">
-        <span class="divider-icon"><i data-lucide="target"></i></span>
+        <span class="divider-icon"><i data-lucide="target" aria-hidden="true"></i></span>
         <span class="eyebrow">01 / Business Value</span>
         <h2>Why We Migrated</h2>
         <div class="accent-bar"></div>
       </section>
 
-      <!-- 5. CONTENT: BUSINESS VALUE -->
+      <!-- CONTENT: BUSINESS VALUE -->
       <section>
         <span class="eyebrow">Business Value</span>
         <h2>Safer, Compatible, Future-Ready</h2>
         <div class="icon-row">
-          <div class="item"><i data-lucide="shield-check"></i><span>Eliminates memory-safety defect classes</span></div>
-          <div class="item"><i data-lucide="plug-zap"></i><span>Drop-in: relink without code changes</span></div>
+          <div class="item"><i data-lucide="shield-check" aria-hidden="true"></i><span>Eliminates memory-safety defect classes</span></div>
+          <div class="item"><i data-lucide="plug-zap" aria-hidden="true"></i><span>Drop-in goal: relink without code changes</span></div>
         </div>
         <ul>
           <li>Minimal dependencies, no C runtime required</li>
@@ -194,15 +195,15 @@ graph LR
         </ul>
       </section>
 
-      <!-- 6. DIVIDER: WHAT WAS DONE -->
+      <!-- DIVIDER: WHAT WAS DONE -->
       <section class="slide-divider" data-background-color="#1A105F">
-        <span class="divider-icon"><i data-lucide="package-check"></i></span>
+        <span class="divider-icon"><i data-lucide="package-check" aria-hidden="true"></i></span>
         <span class="eyebrow">02 / Scope and Deliverables</span>
         <h2>What Was Delivered</h2>
         <div class="accent-bar"></div>
       </section>
 
-      <!-- 7. CONTENT: SCOPE / DELIVERABLES -->
+      <!-- CONTENT: SCOPE / DELIVERABLES -->
       <section>
         <span class="eyebrow">Deliverables</span>
         <h2>Three-Member Cargo Workspace</h2>
@@ -210,21 +211,21 @@ graph LR
           <thead><tr><th>Member</th><th>Role</th></tr></thead>
           <tbody>
             <tr><td>zlib-rs</td><td>Safe pure-Rust core, forbids unsafe</td></tr>
-            <tr><td>libz-rs-sys</td><td>Thin C-ABI shim, exact zlib symbols</td></tr>
-            <tr><td>libz-rs-sys-cdylib</td><td>Drop-in libz.so / libz.a artifact</td></tr>
+            <tr><td>libz-rs-sys</td><td>Thin C-ABI shim; ABI struct types defined</td></tr>
+            <tr><td>libz-rs-sys-cdylib</td><td>Builds libz.so / libz.a; symbol exports planned</td></tr>
           </tbody>
         </table>
       </section>
 
-      <!-- 8. DIVIDER: ARCHITECTURE -->
+      <!-- DIVIDER: ARCHITECTURE -->
       <section class="slide-divider" data-background-color="#1A105F">
-        <span class="divider-icon"><i data-lucide="git-compare"></i></span>
+        <span class="divider-icon"><i data-lucide="git-compare" aria-hidden="true"></i></span>
         <span class="eyebrow">03 / Architecture</span>
         <h2>How the Code Changed</h2>
         <div class="accent-bar"></div>
       </section>
 
-      <!-- 9. CONTENT: TRANSFORMATION MAPPING -->
+      <!-- CONTENT: TRANSFORMATION MAPPING -->
       <section>
         <span class="eyebrow">Layer Mapping</span>
         <h2>Every C Unit Maps to a Rust Module</h2>
@@ -239,7 +240,15 @@ graph LR
         </pre>
       </section>
 
-      <!-- 10. CONTENT: SAFETY MODEL -->
+      <!-- DIVIDER: SAFETY MODEL -->
+      <section class="slide-divider" data-background-color="#1A105F">
+        <span class="divider-icon"><i data-lucide="lock" aria-hidden="true"></i></span>
+        <span class="eyebrow">04 / Safety Model</span>
+        <h2>A Provably Safe Core</h2>
+        <div class="accent-bar"></div>
+      </section>
+
+      <!-- CONTENT: SAFETY MODEL -->
       <section>
         <span class="eyebrow">Safety Model</span>
         <h2>All Unsafe Confined to a Thin Shim</h2>
@@ -251,71 +260,79 @@ graph TD
         </pre>
       </section>
 
-      <!-- 11. DIVIDER: RISKS -->
+      <!-- DIVIDER: RISKS -->
       <section class="slide-divider" data-background-color="#1A105F">
-        <span class="divider-icon"><i data-lucide="shield-alert"></i></span>
-        <span class="eyebrow">04 / Risk Management</span>
+        <span class="divider-icon"><i data-lucide="shield-alert" aria-hidden="true"></i></span>
+        <span class="eyebrow">05 / Risk Management</span>
         <h2>Risks and Mitigations</h2>
         <div class="accent-bar"></div>
       </section>
 
-      <!-- 12. CONTENT: RISKS -->
+      <!-- CONTENT: RISKS -->
       <section>
         <span class="eyebrow">Risk Management</span>
-        <h2>Top Risks, Actively Mitigated</h2>
+        <h2>Top Risks and Mitigation Plan</h2>
         <table>
           <thead><tr><th>Risk</th><th>Mitigation</th></tr></thead>
           <tbody>
-            <tr><td>Bit-exact output</td><td>Byte-for-byte flate2 oracle tests</td></tr>
-            <tr><td>Unsafe soundness</td><td>Core forbids unsafe; shim audited</td></tr>
+            <tr><td>Bit-exact output</td><td>Planned byte-for-byte flate2 oracle tests</td></tr>
+            <tr><td>Unsafe soundness</td><td>Core forbids unsafe; shim audit planned</td></tr>
             <tr><td>Performance</td><td>Profile hot paths; SIMD CRC-32</td></tr>
           </tbody>
         </table>
       </section>
 
-      <!-- 13. DIVIDER: VALIDATION -->
+      <!-- DIVIDER: VALIDATION -->
       <section class="slide-divider" data-background-color="#1A105F">
-        <span class="divider-icon"><i data-lucide="check-check"></i></span>
-        <span class="eyebrow">05 / Quality</span>
+        <span class="divider-icon"><i data-lucide="check-check" aria-hidden="true"></i></span>
+        <span class="eyebrow">06 / Quality</span>
         <h2>Validation and Quality Gates</h2>
         <div class="accent-bar"></div>
       </section>
 
-      <!-- 14. CONTENT: TESTING -->
+      <!-- CONTENT: TESTING -->
       <section>
         <span class="eyebrow">Test Strategy</span>
-        <h2>Multi-Layered Conformance Testing</h2>
+        <h2>A Multi-Layered Conformance Plan</h2>
         <table>
           <thead><tr><th>Suite</th><th>Purpose</th></tr></thead>
           <tbody>
-            <tr><td>regression / coverage</td><td>Ported C test programs</td></tr>
+            <tr><td>regression / coverage</td><td>Port the canonical C test programs</td></tr>
             <tr><td>interop</td><td>Byte-for-byte vs C zlib (flate2)</td></tr>
             <tr><td>round_trip / checksum</td><td>Property and known-answer vectors</td></tr>
           </tbody>
         </table>
       </section>
 
-      <!-- 15. CONTENT: ONBOARDING -->
+      <!-- DIVIDER: ONBOARDING -->
+      <section class="slide-divider" data-background-color="#1A105F">
+        <span class="divider-icon"><i data-lucide="book-open" aria-hidden="true"></i></span>
+        <span class="eyebrow">07 / Onboarding</span>
+        <h2>Onboarding the Team</h2>
+        <div class="accent-bar"></div>
+      </section>
+
+      <!-- CONTENT: ONBOARDING -->
       <section>
         <span class="eyebrow">Onboarding</span>
         <h2>Getting Started and Next Steps</h2>
         <div class="icon-row">
-          <div class="item"><i data-lucide="wrench"></i><span>Rust 1.85+, edition 2024</span></div>
-          <div class="item"><i data-lucide="terminal"></i><span>cargo build / test / clippy / fmt</span></div>
+          <div class="item"><i data-lucide="wrench" aria-hidden="true"></i><span>Rust 1.85+, edition 2024</span></div>
+          <div class="item"><i data-lucide="terminal" aria-hidden="true"></i><span>cargo build / test / clippy / fmt</span></div>
         </div>
         <ul>
-          <li>Features: std, gzip, no-std, simd, capi</li>
+          <li>Features: std, gzip, gz-io, no-std, simd, capi</li>
           <li>Continuous integration via GitHub Actions</li>
         </ul>
       </section>
 
-      <!-- 16. CLOSING -->
+      <!-- CLOSING -->
       <section class="slide-closing" data-background-color="#2D1C77">
-        <span class="hero-icon"><i data-lucide="rocket"></i></span>
+        <span class="hero-icon"><i data-lucide="rocket" aria-hidden="true"></i></span>
         <span class="eyebrow">Thank You</span>
         <h2>A Safe Foundation for Compression</h2>
         <div class="accent-bar"></div>
-        <p>Bit-compatible. Memory-safe. Drop-in ready.</p>
+        <p>Memory-safe foundation today. Bit-compatible, drop-in ready on the roadmap.</p>
         <p class="brand-lockup">Blitzy</p>
       </section>
 
