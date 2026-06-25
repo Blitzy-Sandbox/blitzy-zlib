@@ -1,0 +1,87 @@
+# Build & Test — the primary Rust continuous-integration workflow for the
+# zlib -> Rust migration workspace.
+#
+# History / consolidation
+# -----------------------
+# This workflow is the rename-successor of the former C build/test CI and also
+# absorbs the cross-platform coverage that the C era spread across several
+# separate pipelines (a native autotools matrix, a Windows emulation matrix and
+# a BSD / Solaris virtual-machine matrix). All of that is collapsed into three
+# first-class, native Cargo runners (Linux, macOS, Windows): the Rust toolchain
+# ships native Windows and macOS support out of the box, so no third-party
+# emulation layer is required.
+#
+# What it exercises
+# -----------------
+# The three-member Cargo workspace — zlib-rs (the safe core), libz-rs-sys (the
+# FFI C-ABI shim) and libz-rs-sys-cdylib (the drop-in) — built with the default
+# feature set (std, gzip, gz-io, simd). The preserved C sources are linked only
+# indirectly, as an interop reference, through the flate2 dev-dependency that is
+# pulled in by `cargo test` (the interop.rs suite); there is no C build step.
+#
+# Sibling workflows (kept deliberately separate)
+# ----------------------------------------------
+#   * lint.yml   — cargo clippy, cargo fmt and `cargo bench --no-run` gates.
+#   * cdylib.yml — the cdylib drop-in (shared / static library) gate.
+#   * fuzz.yml   — the preserved OSS-Fuzz integration.
+name: Build & Test
+
+on: [push, pull_request]
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Primary gate: build (debug + release) and run the full test suite on each of
+  # the three supported host operating systems using the stable toolchain.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # A failure on one operating system must not cancel the others; we want
+      # the complete cross-OS signal on every run.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace (debug)
+        run: cargo build --workspace --verbose
+
+      - name: Build workspace (release)
+        run: cargo build --workspace --release --verbose
+
+      - name: Run workspace test suite
+        run: cargo test --workspace --verbose
+
+  # ---------------------------------------------------------------------------
+  # Minimum-Supported-Rust-Version gate. Build-only on purpose: `cargo build`
+  # does not pull the dev-dependencies (criterion / flate2 / quickcheck / rand)
+  # whose own minimum versions can exceed 1.85, so this isolates the *library*
+  # MSRV guarantee from dev-tool requirements. Running the test suite here would
+  # defeat that isolation, hence there is no `cargo test` step below.
+  # ---------------------------------------------------------------------------
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.85.0 (workspace MSRV)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85.0"
+
+      - name: Cache Cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace (MSRV verification)
+        run: cargo build --workspace --verbose

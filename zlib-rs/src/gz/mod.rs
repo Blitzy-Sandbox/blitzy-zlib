@@ -95,6 +95,16 @@ use std::path::Path;
 /// re-exported here — there is no second definition.
 pub use state::{GZBUFSIZE, GzHow, GzMode};
 
+/// `SEEK_SET` (`0`) — the [`gzseek`] origin meaning "relative to the start of
+/// the stream", matching the C `<stdio.h>` constant. Exposed here so callers
+/// (and the `libz-rs-sys` FFI shim) can pass a documented origin to [`gzseek`].
+pub const SEEK_SET: i32 = 0;
+
+/// `SEEK_CUR` (`1`) — the [`gzseek`] origin meaning "relative to the current
+/// position", matching the C `<stdio.h>` constant. (`SEEK_END` is intentionally
+/// unsupported by [`gzseek`], mirroring C zlib.)
+pub const SEEK_CUR: i32 = 1;
+
 // ---------------------------------------------------------------------------
 // The public `GzFile` handle
 // ---------------------------------------------------------------------------

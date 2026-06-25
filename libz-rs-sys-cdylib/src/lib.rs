@@ -1,15 +1,26 @@
-//! `libz-rs-sys-cdylib` — the drop-in `libz.so` / `libz.a` artifact.
+//! `libz-rs-sys-cdylib`: the C drop-in artifact for `zlib-rs`.
 //!
-//! This member compiles the [`libz_rs_sys`] C-ABI shim into a `cdylib` and
-//! `staticlib` so C programs can link against the Rust implementation as a
-//! drop-in replacement for the system zlib (AAP §0.3.1).
+//! This crate is built as a `cdylib` + `staticlib` (library base name `z`),
+//! producing `libz.so` / `libz.a` so existing C programs can link against it as
+//! a drop-in replacement for the system `libz` without source changes.
 //!
-//! At the current foundation milestone the shim exposes the `#[repr(C)]` ABI
-//! type definitions; the `extern "C"` / `#[unsafe(no_mangle)]` function exports
-//! that materialize the C symbol table are added in a subsequent milestone.
-//! Re-exporting the shim here keeps it linked into the artifact and gives the
-//! member a single, stable dependency edge onto `libz-rs-sys`.
-
-#![allow(non_camel_case_types)]
+//! Its sole responsibility is to re-export the entire `libz_rs_sys` C-ABI
+//! surface. A `#[no_mangle] extern "C"` function that nothing references can be
+//! dead-stripped from a `cdylib`/`staticlib`; the glob re-export below keeps
+//! every zlib symbol reachable so it is emitted into the produced artifacts —
+//! the `deflate*`, `inflate*`, `gz*`, `adler32*`, `crc32*`, `compress*`,
+//! `uncompress*`, `zlibVersion`, `zlibCompileFlags`, `zError`, and
+//! `get_crc_table` families, together with the `#[repr(C)]` `z_stream` /
+//! `gz_header` / `gzFile` types and the C scalar typedefs.
+//!
+//! The implementation lives entirely in `libz_rs_sys` (the thin `unsafe` C-ABI
+//! shim) layered over the safe, `#![forbid(unsafe_code)]` `zlib-rs` core; the
+//! workspace dependency chain is
+//! `libz-rs-sys-cdylib` -> `libz-rs-sys` -> `zlib-rs`. This member declares no
+//! symbols of its own: every `extern "C"` function, every `unsafe` block, and
+//! every `#[repr(C)]` type definition belongs to `libz-rs-sys`. The re-export
+//! also transparently mirrors whichever symbols the shim compiles under the
+//! active Cargo features (such as `gz-io`, which governs the `gz*` family), so
+//! no per-feature code is needed here.
 
 pub use libz_rs_sys::*;

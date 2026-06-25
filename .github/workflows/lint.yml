@@ -1,0 +1,70 @@
+# Lint — Rust quality gates for the zlib -> Rust workspace.
+#
+# This workflow is the Rust-native successor to the former C-language standards
+# CI job. That job existed for one reason: to fail the build on ANY compiler
+# warning across every supported C language standard and toolchain combination.
+# In a Cargo workspace that exact "warnings are errors" guarantee is expressed
+# by two idiomatic gates, with a third gate that keeps the benchmarks building:
+#
+#   * cargo clippy --all-targets -- -D warnings
+#       Escalates every lint warning to a hard error across all workspace
+#       members and all of their targets. This is the direct Rust equivalent of
+#       the old "treat warnings as errors" policy.
+#   * cargo fmt --all -- --check
+#       Enforces canonical formatting across every workspace member without
+#       rewriting any files; CI fails on deviation instead of editing in place.
+#   * cargo bench --workspace --no-run
+#       Compiles the criterion benchmarks WITHOUT executing them, so the bench
+#       targets are guaranteed to keep building while the slow, statistically
+#       noisy timing runs stay out of CI.
+#
+# Clippy and rustfmt deliberately run on the STABLE toolchain only: lint sets and
+# formatting rules track stable, so pinning a single channel avoids the spurious
+# failures that beta/nightly would introduce. Minimum-supported-Rust-version
+# build verification is handled separately in the build workflow, not here.
+
+name: Lint
+
+# Run on every push and pull request, plus allow on-demand manual runs from the
+# Actions tab. The manual-dispatch trigger is intentionally preserved from the
+# workflow this one replaces.
+on: [push, pull_request, workflow_dispatch]
+
+# Principle of least privilege: the gates below only read the repository, so the
+# job is granted read-only access to repository contents and nothing else.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Format, Clippy & Bench-Compile
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Check out the repository at the commit that triggered the run.
+      - uses: actions/checkout@v4
+
+      # 2. Install the stable Rust toolchain together with the two components the
+      #    gates below require: rustfmt (for the format check) and clippy (for
+      #    the lint pass). Both components are mandatory.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # 3. Cache the Cargo registry, git sources and the target directory so that
+      #    repeat runs reuse previously built dependencies and artifacts.
+      - uses: Swatinem/rust-cache@v2
+
+      # Gate 1 — Formatting. `--all` reaches every workspace member; `--check`
+      # fails the job on any deviation rather than reformatting files in place.
+      - run: cargo fmt --all -- --check
+
+      # Gate 2 — Lints. At the virtual workspace root this lints every member and
+      # every target, and `-D warnings` turns each remaining warning into a build
+      # failure (the Rust expression of the old "warnings are errors" intent).
+      - run: cargo clippy --all-targets -- -D warnings
+
+      # Gate 3 — Bench compile-only. `--no-run` builds the criterion benches
+      # (deflate_bench, inflate_bench, checksum_bench) to prove they keep
+      # compiling, while skipping the slow statistical timing run. `--workspace`
+      # ensures every member's bench targets are compiled.
+      - run: cargo bench --workspace --no-run

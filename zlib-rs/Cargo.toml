@@ -102,7 +102,14 @@ crc32fast = { workspace = true, optional = true }
 criterion = { workspace = true }
 # The C-zlib interop ORACLE for byte-for-byte validation (`tests/interop.rs`).
 # This is the ONLY place the C zlib backend appears, and it is dev-only.
-flate2 = { workspace = true }
+# `flate2`'s DEFAULT backend is the pure-Rust `miniz_oxide`, which is NOT
+# byte-identical to canonical C zlib at every compression level; the byte-for-
+# byte assertions are therefore only valid against a *C-zlib* backend.
+# `default-features = false` drops the `miniz_oxide` default and `features =
+# ["zlib"]` routes `flate2` through `libz-sys` to the system zlib — exactly the
+# canonical implementation the port must match (see the `REQUIRES:` note atop
+# `tests/interop.rs`). Version is pinned to the workspace value `=1.1.9`.
+flate2 = { version = "1.1.9", default-features = false, features = ["zlib"] }
 # Property-based round-trip testing (`tests/round_trip.rs`).
 quickcheck = { workspace = true }
 # Random data generation for tests/benches.
