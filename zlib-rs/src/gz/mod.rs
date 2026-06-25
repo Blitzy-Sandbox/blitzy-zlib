@@ -48,5 +48,6 @@
 #![allow(dead_code)]
 
 pub(crate) mod open;
+pub(crate) mod read;
 pub(crate) mod state;
 pub(crate) mod write;
