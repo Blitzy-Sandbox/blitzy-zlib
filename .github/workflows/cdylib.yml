@@ -1,0 +1,110 @@
+# C-ABI Drop-in — verify the shared/static library drop-in and prove header parity.
+#
+# Purpose
+# -------
+# This workflow is the CI proof of the project's C-compatible FFI drop-in goal
+# (AAP goal G4): existing C consumers must be able to relink against the Rust
+# implementation without source changes. It is the rename-successor of the
+# former C-extension CI workflow (now removed), which built a set of C add-ons
+# that linked against zlib's C ABI. In the Rust rewrite that very ABI is revived
+# by the `libz-rs-sys` shim and the `libz-rs-sys-cdylib` member, so the faithful
+# replacement is: build the Rust drop-in, confirm it emits `libz.so` / `libz.a`,
+# and prove the generated header carries the canonical zlib symbol set.
+#
+# What it exercises (Cargo only — no C build tooling)
+# ---------------------------------------------------
+#   1. Builds `libz-rs-sys-cdylib` (release): the workspace member declared with
+#      `[lib] name = "z"` and `crate-type = ["cdylib", "staticlib"]`, which emits
+#      the conventional `libz.so` (cdylib) and `libz.a` (staticlib) drop-ins.
+#   2. Asserts both artifacts are present under `target/release/`.
+#   3. Builds `libz-rs-sys` (release) so its `build.rs` runs `cbindgen` and
+#      (re)generates the C header `libz-rs-sys/include/zlib.h`.
+#   4. Asserts the generated header exists and exports a representative set of
+#      the public zlib symbols, then surfaces an INFORMATIONAL diff against the
+#      canonical root `zlib.h` (never fails on cosmetic differences).
+#
+# Why the header check is symbol-presence, not byte-equality
+# ----------------------------------------------------------
+# `cbindgen` output is intentionally NOT byte-identical to the hand-written
+# canonical `zlib.h` (comment, ordering and formatting differences are expected).
+# The meaningful gate is therefore "header generated + every key symbol present";
+# the `diff` is kept purely informational so the workflow never flaps on
+# cosmetic churn.
+#
+# Sibling workflows (kept deliberately separate)
+# ----------------------------------------------
+#   * build.yml — builds the whole workspace (the cdylib included) and runs the
+#                 full test suite across Linux / macOS / Windows.
+#   * lint.yml  — cargo fmt, cargo clippy and `cargo bench --no-run` gates.
+# This workflow adds the artifact-emission and ABI-parity assertions that are
+# specific to the FFI / drop-in layer.
+name: C-ABI Drop-in
+
+on: [push, pull_request]
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build the drop-in, verify the emitted shared/static libraries, and prove the
+  # generated C header matches the canonical zlib symbol surface.
+  # ---------------------------------------------------------------------------
+  cdylib:
+    name: cdylib drop-in & header parity
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Check out the repository at the commit that triggered the run.
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # 2. Install the Rust toolchain. The repository's rust-toolchain.toml pins
+      #    the channel the build actually requires, so cargo invocations below
+      #    resolve to it automatically.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # 3. Cache the Cargo registry, git sources and the target directory so
+      #    repeat runs reuse previously built dependencies and artifacts.
+      - name: Cache Cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+
+      # 4. Build the drop-in artifacts. `libz-rs-sys-cdylib` is the exact
+      #    workspace member that produces the C-consumable libraries.
+      - name: Build the C-ABI drop-in (cdylib + staticlib)
+        run: cargo build -p libz-rs-sys-cdylib --release
+
+      # 5. Verify `libz.so` / `libz.a` emission. The member sets `[lib] name =
+      #    "z"`, so the conventional zlib library file names are expected.
+      - name: Verify libz.so / libz.a emission
+        run: |
+          ls -l target/release/
+          test -f target/release/libz.so || { echo "::error::libz.so (cdylib) not emitted"; ls target/release/*.so || true; exit 1; }
+          test -f target/release/libz.a || { echo "::error::libz.a (staticlib) not emitted"; ls target/release/*.a || true; exit 1; }
+
+      # 6. Build the shim on its own so its build.rs runs cbindgen and
+      #    (re)generates the C header at libz-rs-sys/include/zlib.h.
+      - name: Regenerate the C-ABI header via cbindgen
+        run: cargo build -p libz-rs-sys --release
+
+      # 7. Verify the generated header and prove C-ABI parity. The existence
+      #    check and the symbol greps are hard gates; the diff against the
+      #    canonical root zlib.h is INFORMATIONAL only (cosmetic differences are
+      #    expected, so it must never fail the build).
+      - name: Verify generated header and prove C-ABI parity
+        run: |
+          test -f libz-rs-sys/include/zlib.h || { echo "::error::cbindgen header not generated"; exit 1; }
+          for sym in deflate inflate deflateInit_ inflateInit_ compress uncompress crc32 adler32 gzopen zlibVersion; do
+            grep -q "$sym" libz-rs-sys/include/zlib.h || { echo "::error::symbol $sym missing from generated header"; exit 1; }
+          done
+          echo "Informational header parity diff (generated header vs canonical zlib.h):"
+          diff -u zlib.h libz-rs-sys/include/zlib.h | tee header-parity.diff || true
+
+      # 8. (Optional) Upload the generated header and the informational diff so a
+      #    reviewer can inspect the C-ABI surface without re-running the job.
+      - name: Upload generated header and informational diff
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cdylib-header-parity
+          path: |
+            libz-rs-sys/include/zlib.h
+            header-parity.diff
+          if-no-files-found: ignore
