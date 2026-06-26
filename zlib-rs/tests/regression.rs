@@ -650,6 +650,116 @@ fn test_sync() {
     );
 }
 
+/// Behavioral validation of `Z_PARTIAL_FLUSH` — the seventh DEFLATE flush mode
+/// (AAP G2 lists "7 flush modes"). The other six (`NoFlush`, `SyncFlush`,
+/// `FullFlush`, `Finish`, `Block`, `Trees`) are exercised behaviorally across
+/// the inline and integration suites; this test closes the coverage gap for
+/// `PartialFlush`, whose only other coverage is the `constants.rs` discriminant
+/// assertion (`Flush::PartialFlush as i32 == 1`).
+///
+/// Per the zlib manual, `Z_PARTIAL_FLUSH` flushes all pending output and makes
+/// *all of the input data so far available to the decompressor* (as for
+/// `Z_SYNC_FLUSH`): it completes the current block and follows it with an empty
+/// fixed-codes block, assuring that enough bytes are emitted for the
+/// decompressor to finish the data block. In `zlib-rs` this is the
+/// `deflate/mod.rs` `tr_align()` path taken when `flush == Flush::PartialFlush`.
+/// The assertions below prove that contract end-to-end:
+///
+/// 1. `deflate(chunk1, Z_PARTIAL_FLUSH)` consumes all of `chunk1` and *emits*
+///    output — the pending bytes are flushed, not merely buffered (this is what
+///    distinguishes a partial flush from `Z_NO_FLUSH`).
+/// 2. Decompressing *only* that partial-flush output recovers **all** of
+///    `chunk1`. `inflate` returns `Z_OK` (not `Z_STREAM_END`) because the stream
+///    is not finished — exactly the "input so far is available" guarantee.
+/// 3. `deflate(chunk2, Z_FINISH)` reports `Z_STREAM_END`, and the complete
+///    stream round-trips byte-for-byte.
+#[test]
+fn test_partial_flush() {
+    const CHUNK1: &[u8] = b"partial flush, part one: hello, hello, hello world!\n";
+    const CHUNK2: &[u8] = b"partial flush, part two: goodbye, goodbye world!\n";
+
+    let mut strm = ZStream::new();
+    deflate_init(&mut strm, Z_DEFAULT_COMPRESSION).expect("deflateInit");
+
+    let mut compr = vec![0u8; COMPR_LEN];
+
+    // (1) Partial-flush the first chunk: it must be consumed in full and must
+    //     produce flushed output rather than being buffered internally.
+    let (result, consumed, produced) =
+        deflate(&mut strm, CHUNK1, &mut compr[..], Flush::PartialFlush);
+    result.expect("deflate (Z_PARTIAL_FLUSH)");
+    assert_eq!(
+        consumed,
+        CHUNK1.len(),
+        "Z_PARTIAL_FLUSH should consume all provided input"
+    );
+    assert!(
+        produced > 0,
+        "Z_PARTIAL_FLUSH must flush pending output, not buffer it"
+    );
+    let partial_len = produced;
+
+    // (2) The data so far must already be decodable. Inflate ONLY the
+    //     partial-flush output and confirm all of CHUNK1 is recovered. The
+    //     result is Z_OK (the stream is not finished); `.expect` only guards
+    //     against an actual error, which would mean the partial output was not
+    //     self-decodable — the very failure this mode must prevent.
+    {
+        let mut din = ZStream::new();
+        din.set_inflate_state(InflateState::new_default().expect("inflateInit"));
+        let mut recovered = vec![0u8; UNCOMPR_LEN];
+        let (_consumed, produced, result) = inflate(
+            &mut din,
+            &compr[..partial_len],
+            &mut recovered,
+            Flush::NoFlush,
+        );
+        result.expect("inflate (partial-flush prefix)");
+        assert_eq!(
+            &recovered[..produced],
+            CHUNK1,
+            "Z_PARTIAL_FLUSH must make all input so far available to the decompressor"
+        );
+        din.end().expect("inflateEnd");
+    }
+
+    // (3) Finish the stream with the second chunk.
+    let (result, consumed, produced) =
+        deflate(&mut strm, CHUNK2, &mut compr[partial_len..], Flush::Finish);
+    assert_eq!(
+        result.expect("deflate (Z_FINISH)"),
+        ReturnCode::StreamEnd,
+        "deflate should report Z_STREAM_END"
+    );
+    assert_eq!(
+        consumed,
+        CHUNK2.len(),
+        "Z_FINISH should consume the remaining input"
+    );
+    let total = partial_len + produced;
+    deflate_end(&mut strm).expect("deflateEnd");
+
+    // The complete partial-flush + finish stream must round-trip byte-for-byte.
+    let mut din = ZStream::new();
+    din.set_inflate_state(InflateState::new_default().expect("inflateInit"));
+    let mut recovered = vec![0u8; UNCOMPR_LEN];
+    let (_consumed, produced, result) =
+        inflate(&mut din, &compr[..total], &mut recovered, Flush::Finish);
+    assert_eq!(
+        result.expect("inflate (Z_FINISH)"),
+        ReturnCode::StreamEnd,
+        "inflate should report Z_STREAM_END"
+    );
+    din.end().expect("inflateEnd");
+
+    let expected = [CHUNK1, CHUNK2].concat();
+    assert_eq!(
+        &recovered[..produced],
+        expected.as_slice(),
+        "the Z_PARTIAL_FLUSH stream must round-trip byte-for-byte"
+    );
+}
+
 // ===========================================================================
 // Phase F — test_dict_deflate + test_dict_inflate: preset dictionary
 //                                                          [example.c L414-491]

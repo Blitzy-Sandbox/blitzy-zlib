@@ -747,6 +747,15 @@ mod tests {
     use crate::constants::Flush;
     use crate::error::ReturnCode;
     use crate::inflate::tables::{CodeType, inflate_table};
+    // The crate is `#![no_std]` whenever the default `std` feature is disabled,
+    // so `Vec`, `Box`, and the `vec!` macro are not in the `core` prelude and
+    // must be pulled in explicitly from `alloc` for the unit tests to compile
+    // (and run) under `--no-default-features`. This mirrors the sibling test
+    // modules (`deflate/fast.rs`, `inflate/back.rs`) and keeps the whole
+    // `zlib-rs` unit-test binary buildable in the `Z_SOLO`/`no_std` config.
+    use alloc::boxed::Box;
+    use alloc::vec;
+    use alloc::vec::Vec;
 
     // ---------------------------------------------------------------------
     // DEFLATE bit-stream construction
