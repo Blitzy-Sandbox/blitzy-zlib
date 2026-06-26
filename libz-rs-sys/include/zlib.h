@@ -123,6 +123,36 @@ typedef off_t z_off_t;
 /* Null sentinel for initializing zalloc, zfree, opaque. */
 #define Z_NULL  0
 
+/* ----- gzip file-I/O API gating (READ THIS if you compile against this  ----
+   ----- generated header directly) ---------------------------------------- */
+/* The gzip file-I/O family (gzopen, gzdopen, gzbuffer, gzsetparams, gzread,
+   gzfread, gzwrite, gzfwrite, gzprintf, gzputs, gzputc, gzgets, gzgetc,
+   gzungetc, gzflush, gzseek, gzrewind, gztell, gzoffset, gzeof, gzdirect,
+   gzclose, gzclose_r, gzclose_w, gzerror, gzclearerr) is declared further
+   below inside `#if defined(WITH_GZFILEOP) ... #endif`. To use those
+   prototypes when compiling against THIS generated header, define the macro:
+
+       cc -DWITH_GZFILEOP your_app.c -lz
+
+   Without -DWITH_GZFILEOP the gz prototypes stay hidden and a modern C
+   compiler rejects gz* calls with an implicit-declaration error.
+
+   This is the one intentional polarity difference from the canonical zlib.h,
+   which exposes the gz section by DEFAULT under `#ifndef Z_SOLO` (opt-OUT).
+   This header is opt-IN (`#if defined(WITH_GZFILEOP)`) because cbindgen derives
+   `#if defined(X)` from the positive Cargo cfg `feature = "gz-io"` and cannot
+   emit an `#ifndef Z_SOLO` guard.
+
+   IMPORTANT: this gating affects ONLY direct consumers of this generated
+   header. It does NOT affect:
+     * the true drop-in RELINK path -- existing programs built against the
+       canonical system zlib.h get the gz API by default and link this Rust
+       libz.so / libz.a unchanged (all 26 gz symbols are always exported);
+     * symbol export -- every gz symbol is present in libz.so / libz.a
+       regardless of this macro;
+     * signature / ABI parity -- the gz prototypes themselves are correct and
+       identical to canonical zlib. */
+
 /*
  Opaque counterpart of the C `struct internal_state;` forward declaration.
 

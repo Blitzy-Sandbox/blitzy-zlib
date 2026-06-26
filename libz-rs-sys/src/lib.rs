@@ -99,6 +99,12 @@ use libc::{c_ulong, off_t, size_t};
 extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
+// `Vec` is in the prelude under `std`; under `no_std` it comes from `alloc`. It
+// is named only by the gzip header-capture helper (`gzheader_capture_from_c`),
+// so the import is additionally gated on `gzip` to avoid an unused-import lint
+// in a `no_std` build without the gzip feature.
+#[cfg(all(not(feature = "std"), feature = "gzip"))]
+use alloc::vec::Vec;
 // `Rc` carries the C-allocator adapter into the inflate state (which must stay
 // `Clone` for `inflateCopy`); see `inflateInit2_`. It lives in `std::rc` under
 // `std` and in `alloc::rc` under `no_std`.
@@ -478,6 +484,50 @@ unsafe fn gzheader_from_c(head: *const gz_header) -> GzHeader {
 
         gh
     }
+}
+
+/// Build a core [`GzHeader`] configured to *capture* the gzip-header fields a
+/// caller requested via `inflateGetHeader`.
+///
+/// In the C ABI a caller opts into capturing a variable-length field by setting
+/// the corresponding `gz_header` buffer pointer (`name` / `comment` / `extra`)
+/// to a non-null address with a positive capacity (`name_max` / `comm_max` /
+/// `extra_max`); a null pointer means "do not capture this field" and `inflate`
+/// then consumes and discards those header bytes. The safe core models that
+/// opt-in as `Option<Vec<u8>>`: a `Some(_)` buffer is captured into, a `None`
+/// field is parsed-and-discarded. This helper bridges the two representations,
+/// allocating a capture buffer pre-sized to the caller's `*_max` for each field
+/// the caller asked for and leaving the rest `None`.
+///
+/// The owned `Vec`s grow as `inflate` parses (the core is unaware of `*_max`);
+/// the per-field `*_max` clamp and NUL-termination are applied later, when
+/// [`HeaderSnapshot::write_to`] copies the captured bytes back into the caller's
+/// fixed C buffers. Pre-sizing with `with_capacity(*_max)` simply avoids
+/// reallocation for the common case where the field fits.
+///
+/// # Safety
+///
+/// `head` must be a valid, readable `gz_header`.
+#[cfg(feature = "gzip")]
+unsafe fn gzheader_capture_from_c(head: *const gz_header) -> GzHeader {
+    let mut gh = GzHeader::new();
+    // SAFETY: `head` is a valid, readable `gz_header` (caller contract); each
+    // field read is in-bounds for that struct. The buffer pointers are only
+    // tested for null and their `*_max` capacities read here — never
+    // dereferenced — so an opt-in `Some(Vec)` is created without touching the
+    // caller's (possibly uninitialized) buffer memory.
+    unsafe {
+        if !(*head).extra.is_null() && (*head).extra_max > 0 {
+            gh.extra = Some(Vec::with_capacity((*head).extra_max as usize));
+        }
+        if !(*head).name.is_null() && (*head).name_max > 0 {
+            gh.name = Some(Vec::with_capacity((*head).name_max as usize));
+        }
+        if !(*head).comment.is_null() && (*head).comm_max > 0 {
+            gh.comment = Some(Vec::with_capacity((*head).comm_max as usize));
+        }
+    }
+    gh
 }
 
 /// Copy the public `z_stream` scalar fields from `source` to `dest` (for
@@ -1227,17 +1277,37 @@ pub unsafe extern "C" fn inflateGetHeader(strm: z_streamp, head: gz_headerp) -> 
     // `inflateGetHeader` reports for a non-gzip stream — return `Z_STREAM_ERROR`.
     #[cfg(feature = "gzip")]
     {
+        // Build a capture-enabled core header from the caller's `gz_header`.
+        // CRITICAL: the core only stores parsed name/comment/extra bytes into
+        // fields that are `Some(_)`; a plain `GzHeader::new()` (all `None`) makes
+        // `inflate` consume and DISCARD those header bytes, leaving the caller's
+        // buffers empty (the defect this fixes). `gzheader_capture_from_c`
+        // therefore opts each field into capture exactly when the caller supplied
+        // a non-null buffer with positive capacity, mirroring the C contract.
+        let core_head = if head.is_null() {
+            GzHeader::new()
+        } else {
+            // SAFETY: `head` is non-null and, per the C `inflateGetHeader`
+            // contract, a valid readable `gz_header`.
+            unsafe { gzheader_capture_from_c(head) }
+        };
         // Enable capture in the core; it returns Err(StreamError) unless the
         // stream is gzip-wrapped (wrap & 2), exactly as C `inflateGetHeader` does.
-        match s.get_header(GzHeader::new()) {
+        match s.get_header(core_head) {
             Ok(_) => {
+                if !head.is_null() {
+                    // Mirror C `inflateGetHeader`, which sets `head->done = 0`
+                    // immediately on success so a caller inspecting `done` before
+                    // the first `inflate` observes the not-yet-complete state.
+                    // SAFETY: `head` is non-null and a valid `gz_header`; `done`
+                    // is an in-bounds field write.
+                    unsafe { (*head).done = 0 };
+                }
                 // Record the caller's C `gz_header` so `inflate` can write the
                 // parsed fields back into it (std-only; under no_std the core
                 // still captures the header but the C write-back is skipped).
                 #[cfg(feature = "std")]
                 header_reg::register(strm, head);
-                #[cfg(not(feature = "std"))]
-                let _ = head;
                 Z_OK
             }
             Err(e) => e.as_i32(),
@@ -2410,6 +2480,139 @@ mod tests {
         deco.truncate(deco_len);
 
         assert_eq!(deco, src);
+    }
+
+    /// Regression for the FINAL-checkpoint MAJOR finding: `inflateGetHeader`
+    /// must POPULATE the caller's `gz_header` `name` / `comment` / `extra`
+    /// buffers, not silently discard the parsed bytes. Drives a full gzip
+    /// round-trip through the C ABI — `deflateInit2_(windowBits = 31)` +
+    /// `deflateSetHeader` + `deflate(Z_FINISH)`, then `inflateInit2_(31)` +
+    /// `inflateGetHeader` + `inflate(Z_FINISH)` — and asserts every header
+    /// field is recovered, mirroring the QA reproduction (`gzhdr_full.c`).
+    ///
+    /// Before the fix, `inflateGetHeader` handed the core an all-`None`
+    /// `GzHeader`, so `inflate` consumed and dropped the name/comment/extra
+    /// bytes, leaving these caller buffers empty (and `extra_len == 0`).
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn gzip_header_round_trip_recovers_name_comment_extra() {
+        let stream_size = core::mem::size_of::<z_stream>() as c_int;
+        let payload = b"data-payload for the gzip header capture regression test";
+
+        // ---- deflate a gzip member carrying name/comment/extra + scalars ----
+        // `deflateSetHeader` reads `name`/`comment` as NUL-terminated C strings
+        // and `extra` for `extra_len` bytes, so the inputs are shaped to match.
+        let mut name_in = *b"file.txt\0";
+        let mut comment_in = *b"a comment\0";
+        let mut extra_in = [1u8, 2, 3, 4, 5];
+
+        let mut comp = vec![0u8; 4096];
+        let mut dstrm = z_stream {
+            next_in: payload.as_ptr(),
+            avail_in: payload.len() as c_uint,
+            next_out: comp.as_mut_ptr(),
+            avail_out: comp.len() as c_uint,
+            ..Default::default()
+        };
+        // SAFETY: `dstrm` is valid; windowBits 31 selects gzip; version/size match.
+        let rc = unsafe {
+            deflateInit2_(
+                &mut dstrm,
+                Z_DEFAULT_COMPRESSION,
+                Z_DEFLATED,
+                31,
+                8,
+                Z_DEFAULT_STRATEGY,
+                zlibVersion(),
+                stream_size,
+            )
+        };
+        assert_eq!(rc, Z_OK);
+
+        let mut dhead = gz_header {
+            text: 1,
+            time: 0x1122_3344,
+            os: 3,
+            extra: extra_in.as_mut_ptr(),
+            extra_len: extra_in.len() as c_uint,
+            name: name_in.as_mut_ptr(),
+            comment: comment_in.as_mut_ptr(),
+            ..Default::default()
+        };
+        // SAFETY: `dstrm` is an initialized gzip deflate stream; `dhead`'s
+        // buffers are valid for the lengths advertised above.
+        assert_eq!(unsafe { deflateSetHeader(&mut dstrm, &mut dhead) }, Z_OK);
+        // SAFETY: initialized deflate stream with valid in/out buffers.
+        assert_eq!(unsafe { deflate(&mut dstrm, Z_FINISH) }, Z_STREAM_END);
+        let comp_len = dstrm.total_out as usize;
+        // SAFETY: initialized deflate stream.
+        assert_eq!(unsafe { deflateEnd(&mut dstrm) }, Z_OK);
+        comp.truncate(comp_len);
+
+        // ---- inflate and capture the header back into the caller buffers ----
+        let mut name_out = [0u8; 64];
+        let mut comment_out = [0u8; 64];
+        let mut extra_out = [0u8; 64];
+        let mut ihead = gz_header {
+            name: name_out.as_mut_ptr(),
+            name_max: name_out.len() as c_uint,
+            comment: comment_out.as_mut_ptr(),
+            comm_max: comment_out.len() as c_uint,
+            extra: extra_out.as_mut_ptr(),
+            extra_max: extra_out.len() as c_uint,
+            ..Default::default()
+        };
+
+        let mut deco = vec![0u8; payload.len() + 64];
+        let mut istrm = z_stream {
+            next_in: comp.as_ptr(),
+            avail_in: comp.len() as c_uint,
+            next_out: deco.as_mut_ptr(),
+            avail_out: deco.len() as c_uint,
+            ..Default::default()
+        };
+        // SAFETY: `istrm` is valid; windowBits 31 selects gzip; version/size match.
+        assert_eq!(
+            unsafe { inflateInit2_(&mut istrm, 31, zlibVersion(), stream_size) },
+            Z_OK
+        );
+        // SAFETY: `istrm` is initialized; `ihead`'s buffers are valid for the
+        // `*_max` capacities advertised above. This is the call the fix repairs.
+        assert_eq!(unsafe { inflateGetHeader(&mut istrm, &mut ihead) }, Z_OK);
+        // SAFETY: initialized inflate stream with valid buffers.
+        assert_eq!(unsafe { inflate(&mut istrm, Z_FINISH) }, Z_STREAM_END);
+        let deco_len = istrm.total_out as usize;
+        // SAFETY: initialized inflate stream.
+        assert_eq!(unsafe { inflateEnd(&mut istrm) }, Z_OK);
+
+        // The header must be fully parsed and every field recovered.
+        assert_eq!(ihead.done, 1, "header parsing should be marked done");
+        assert_eq!(ihead.text, 1, "FTEXT flag should round-trip");
+        assert_eq!(ihead.time, 0x1122_3344, "MTIME should round-trip");
+        assert_eq!(ihead.os, 3, "OS code should round-trip");
+
+        // name / comment are written back NUL-terminated (the regression target).
+        // SAFETY: `ihead.name` points to our valid, NUL-terminated 64-byte buffer.
+        let got_name = unsafe { core::ffi::CStr::from_ptr(ihead.name as *const c_char) };
+        assert_eq!(got_name.to_bytes(), b"file.txt", "name must be recovered");
+        // SAFETY: `ihead.comment` points to our valid, NUL-terminated buffer.
+        let got_comment = unsafe { core::ffi::CStr::from_ptr(ihead.comment as *const c_char) };
+        assert_eq!(
+            got_comment.to_bytes(),
+            b"a comment",
+            "comment must be recovered"
+        );
+
+        // extra reports its true on-wire length and exact bytes.
+        assert_eq!(ihead.extra_len, 5, "extra_len must be the on-wire XLEN");
+        assert_eq!(
+            &extra_out[..5],
+            &[1u8, 2, 3, 4, 5],
+            "extra bytes must be recovered"
+        );
+
+        // The compressed payload itself must still round-trip intact.
+        assert_eq!(&deco[..deco_len], &payload[..]);
     }
 
     /// A mismatched version string must yield `Z_VERSION_ERROR` (the init guard).
