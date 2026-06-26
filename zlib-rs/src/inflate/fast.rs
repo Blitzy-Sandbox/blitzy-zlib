@@ -47,6 +47,71 @@
 
 use crate::inflate::state::{InflateMode, InflateState};
 
+/// Minimum match length at which a *long overlapping* direct-output
+/// back-reference (`dist < len`, i.e. a run-length / RLE match) is diverted from
+/// the per-byte forward loop in [`inflate_fast`] to the bulk `copy_within`
+/// [`copy_long_match`].
+///
+/// Below this length the byte loop wins (the compiler keeps it tight and there
+/// is no copy-routine call/setup cost); at and above it the bulk doubling wins
+/// decisively — e.g. the `repetitive` profile's distance-8, length-258 matches,
+/// which a byte loop must propagate one bounds-checked byte at a time. Short
+/// matches and all *non-overlapping* matches (`dist >= len`, the per-symbol-bound
+/// `binary` profile's common case) keep the original byte loop, executing exactly
+/// the same copy code as before.
+const INFLATE_RLE_BULK_THRESHOLD: usize = 32;
+
+/// Copy a long *overlapping* LZ77 back-reference (`dist < len`) that lies
+/// entirely within already-produced `output` (the C `else` branch of
+/// `inffast.c` L249-L262) using bulk `copy_within`, returning the advanced
+/// output cursor (`out_idx + len`).
+///
+/// Produces `output[out_idx..out_idx + len]` from the `dist`-byte pattern based
+/// at the back-reference source `src = out_idx - dist`, replicated forward in
+/// non-overlapping chunks that double each step — the run-length / RLE case a
+/// byte loop would propagate one bounds-checked byte at a time. (The doubling is
+/// written generally and stays correct for `dist >= len` too — where it collapses
+/// to a single `copy_within` — but the call site only routes overlapping long
+/// matches here, leaving non-overlapping matches on the byte loop.)
+///
+/// # Out-of-line and `#[cold]`
+///
+/// This is deliberately `#[cold]` + `#[inline(never)]`. [`inflate_fast`]'s inner
+/// loop is acutely codegen-sensitive: the per-symbol-bound `binary` profile is
+/// measurably slowed if this copy code is *inlined* into the loop body, even on
+/// a branch binary never takes, because the extra live values raise register
+/// pressure across the literal-decode / bit-accumulator hot path. Keeping the
+/// body out-of-line leaves that loop byte-for-byte as it was with a bare byte
+/// loop, while long overlapping matches still get the fast path. Such matches
+/// are comparatively few, so the call overhead is negligible.
+///
+/// # Bit-exactness (AAP §0.7.1 / §0.6.4)
+///
+/// The first `dist` bytes (`output[src..src + dist]`, already produced) are the
+/// pattern. Each [`slice::copy_within`] sets `output[src + filled + j] =
+/// output[src + j]`; `filled` starts at `dist` and stays a multiple of `dist`
+/// except on the final partial chunk, so `(filled + j) % dist == j % dist` — the
+/// value already present. The written range `output[src + dist..src + dist +
+/// len] == output[out_idx..out_idx + len]` is therefore byte-identical to the C
+/// `*out++ = *from++` forward loop (true for the non-overlapping single-chunk
+/// case as well, where `filled == dist` and `chunk == len`).
+///
+/// [`slice::copy_within`] is a *safe* std method (its `unsafe` lives in `core`,
+/// not this crate), preserving the crate-wide `#![forbid(unsafe_code)]`.
+#[cold]
+#[inline(never)]
+fn copy_long_match(output: &mut [u8], out_idx: usize, dist: usize, len: usize) -> usize {
+    let src = out_idx - dist;
+    let target = dist + len;
+    let mut filled = dist;
+    while filled < target {
+        let chunk = core::cmp::min(filled, target - filled);
+        output.copy_within(src..src + chunk, src + filled);
+        filled += chunk;
+    }
+    out_idx + len
+}
+
 /// Decode literal, length, and distance codes and write the resulting literal
 /// and match bytes until either not enough input or output remains, an
 /// end-of-block code is reached, or a data error is encountered.
@@ -386,13 +451,32 @@ pub fn inflate_fast(
                                     f += 1;
                                 }
                             }
+                        } else if dist < len && len > INFLATE_RLE_BULK_THRESHOLD {
+                            // Long *overlapping* run-length match (`dist < len`) — the
+                            // documented Issue 2 hot spot. Because the destination
+                            // overlaps the source it cannot use a single `memcpy`, and
+                            // a byte-by-byte forward loop must propagate every byte
+                            // with its own bounds check (the `repetitive` worst case:
+                            // dist 8, len 258, ~1.45× slower than C). Delegate to the
+                            // out-of-line, `#[cold]` [`copy_long_match`], whose bulk
+                            // `copy_within` does one bounds check per (growing) chunk
+                            // instead of per byte.
+                            //
+                            // This branch is the *only* change to the direct-output
+                            // copy: every **non-overlapping** match (`dist >= len`,
+                            // the entire `binary`/`text`/`random` common case) and
+                            // every short match still runs the byte loop below,
+                            // byte-for-byte the original code. Keeping the bulk body
+                            // out-of-line leaves that loop's codegen undisturbed.
+                            out_idx = copy_long_match(output, out_idx, dist, len);
                         } else {
                             // Copy directly from output (L249-L262). This is the
-                            // LZ77 match and may **overlap** when `dist < len`
-                            // (run-length / RLE). A forward byte-by-byte loop
-                            // reproduces the C `*out++ = *from++` overlap
-                            // semantics exactly; `copy_within` must NOT be used
-                            // here (it is a non-overlapping memmove).
+                            // LZ77 match and may still **overlap** when `dist < len`
+                            // for *short* matches (`len <= INFLATE_RLE_BULK_THRESHOLD`,
+                            // where the byte loop beats any copy-routine setup). A
+                            // forward byte-by-byte loop reproduces the C `*out++ =
+                            // *from++` overlap semantics exactly; a bulk `copy_within`
+                            // must NOT be used here (it is a non-overlapping memmove).
                             let mut f = out_idx - dist;
                             for _ in 0..len {
                                 let b = output[f];

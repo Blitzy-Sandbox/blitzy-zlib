@@ -353,7 +353,6 @@ impl DeflateState {
         let strstart = self.strstart;
         let mut best_len = self.prev_length;
         let lookahead = self.lookahead;
-        let wmask = self.w_mask;
 
         // Clamp `nice_match` to the available lookahead so the search stops at
         // the end of the input (C: `if (nice_match > lookahead) nice_match =
@@ -379,33 +378,129 @@ impl DeflateState {
         }
 
         let window = &self.window;
+        let wlen = window.len();
         let mut match_start = self.match_start;
 
-        loop {
-            // Longest common prefix of the current string and the candidate,
-            // capped at MAX_MATCH and at the window bounds (the bounds cap is a
-            // safety net; in correct operation `cur_match < strstart` and
-            // `strstart + MAX_MATCH <= window.len()`, so it equals MAX_MATCH and
-            // matches C, which scans up to `window + strstart + MAX_MATCH`).
-            let span = core::cmp::min(
-                MAX_MATCH,
-                core::cmp::min(window.len() - strstart, window.len() - cur_match),
-            );
-            let mut len = 0usize;
-            while len < span && window[strstart + len] == window[cur_match + len] {
-                len += 1;
-            }
+        // Bind the hash chain locally and derive its index mask from the slice
+        // length. `self.prev` has exactly `w_size` entries and `self.w_mask ==
+        // w_size - 1`, so `mask == prev.len() - 1` and `cur_match & mask <=
+        // prev.len() - 1 < prev.len()`. Phrasing the mask as `prev.len() - 1` lets
+        // the optimizer prove that bound and drop the per-candidate bounds check on
+        // the chain hop — the single array access that scales with chain length and
+        // dominates the search on long collision chains (the `binary` profile).
+        let prev = &self.prev;
+        let wmask = prev.len() - 1;
 
-            if len > best_len {
-                match_start = cur_match;
-                best_len = len;
-                if len >= nice_match {
-                    break;
+        // Upper bound on the comparable match length, taken from the lookahead
+        // (scan) side. It is independent of `cur_match`, so it is loop-invariant.
+        // In correct operation `strstart + MAX_MATCH <= window.len()`, so this
+        // equals MAX_MATCH and matches C (which scans up to `window + strstart +
+        // MAX_MATCH`); the `wlen - strstart` cap is the safety net that keeps the
+        // scan-side slice in range under `#![forbid(unsafe_code)]`.
+        let smax = core::cmp::min(MAX_MATCH, wlen - strstart);
+
+        // No candidate reachable from here can yield a match longer than `smax`
+        // (every candidate starts strictly before `strstart`, so its comparable
+        // length is also bounded by `smax`). If we already hold a match at least
+        // that long, the search cannot improve it: return immediately. This is
+        // bit-identical to running the loop to exhaustion (which would perform no
+        // update), and it also establishes `best_len < smax` for the cached
+        // scan-end reads below, keeping every window index provably in range.
+        if best_len >= smax {
+            self.match_start = match_start;
+            return core::cmp::min(best_len, lookahead);
+        }
+
+        // Loop-invariant lookahead-side slice (C's `scan` pointer): the bytes at
+        // `window[strstart .. strstart + smax]`. `smax <= wlen - strstart` so the
+        // upper bound is `<= wlen` and the slice never panics; indexing it by any
+        // value `< smax` is then provably in range and bounds-check-free. Reading
+        // the four scan-side probe bytes (`scan[0]`, `scan[1]`, and the cached
+        // `best_len`-relative pair below) out of this single slice is what keeps
+        // every scan-side access safe under `#![forbid(unsafe_code)]`.
+        let scan = &window[strstart..strstart + smax];
+
+        // Cached scan-end bytes, mirroring C's `scan_end` / `scan_end1`. C reads
+        // `scan[best_len]` and `scan[best_len - 1]` once and only refreshes them
+        // when `best_len` grows; doing the same here means each hash-chain candidate
+        // pays just four byte comparisons against cached values instead of
+        // re-deriving the scan-side bytes every iteration — which is what recovers
+        // C's throughput on the deep collision chains of the `binary` profile.
+        //
+        // These are only consulted on the `best_len >= 2` fast path (below), where
+        // `2 <= best_len < smax == scan.len()` makes both indices in range. In the
+        // degenerate `best_len < 2` transient (possible in this port because
+        // `deflate_slow` decrements `prev_length` to 0 while inserting a match) the
+        // filter is bypassed in favour of a full scan, so the placeholder is unused.
+        let mut scan_end = 0u8;
+        let mut scan_end1 = 0u8;
+        if best_len >= 2 {
+            scan_end = scan[best_len];
+            scan_end1 = scan[best_len - 1];
+        }
+
+        loop {
+            // Candidate slice of exactly `smax` bytes. Every hash-chain position is
+            // strictly older than `strstart` (`cur_match < strstart`) and
+            // `strstart + smax <= wlen`, so `cur_match + smax < wlen`: this slice
+            // never panics. Binding it as a length-`smax` slice lets the optimizer
+            // drop the bounds check on each `cand[..]` access below, since every
+            // index used is `< smax == cand.len()`.
+            let cand = &window[cur_match..cur_match + smax];
+
+            // C `longest_match`'s `scan_end` / `scan_end1` early-skip filter
+            // (`deflate.c`). A candidate can only *improve* on `best_len` if it
+            // matches at offsets `best_len`, `best_len - 1`, `0`, and `1`; probing
+            // those four cheap positions first skips the full longest-common-prefix
+            // scan for the overwhelming majority of candidates. This is a pure
+            // performance filter and does NOT change the result: every candidate it
+            // skips has a common-prefix length `<= best_len` and so could never have
+            // updated `best_len` or `match_start`.
+            let do_scan = if best_len >= 2 {
+                // `2 <= best_len < smax == cand.len() == scan.len()`, so all four
+                // indices are in range and the bounds checks are elided. `scan[0]`
+                // and `scan[1]` are loop-invariant (the optimizer hoists them).
+                cand[best_len] == scan_end
+                    && cand[best_len - 1] == scan_end1
+                    && cand[0] == scan[0]
+                    && cand[1] == scan[1]
+            } else {
+                // `best_len < 2`: no valid `scan_end` probe exists, so fall back to
+                // the unconditional full scan (the reference byte-by-byte behavior).
+                true
+            };
+
+            if do_scan {
+                // Compute the exact common-prefix length over the full `smax` span.
+                // The chunked helper returns the exact value, so `len` is
+                // bit-identical to a plain byte-by-byte scan.
+                let len = common_prefix_len(scan, cand);
+
+                if len > best_len {
+                    match_start = cur_match;
+                    best_len = len;
+                    if best_len >= nice_match {
+                        break;
+                    }
+                    // `best_len` reached the comparable cap: no candidate can beat it,
+                    // so stop (bit-identical to looping with no further update) and,
+                    // critically, avoid the out-of-range `scan[best_len]` read that
+                    // refreshing the cache would otherwise perform.
+                    if best_len >= smax {
+                        break;
+                    }
+                    // Refresh the cached scan-end bytes for the new, larger `best_len`
+                    // (exactly as C does). After an update `best_len == len >= 1`, and
+                    // `best_len < smax == scan.len()`, so both indices are in range.
+                    if best_len >= 2 {
+                        scan_end = scan[best_len];
+                        scan_end1 = scan[best_len - 1];
+                    }
                 }
             }
 
             // Advance to the next older position on this hash chain.
-            cur_match = self.prev[cur_match & wmask] as usize;
+            cur_match = prev[cur_match & wmask] as usize;
             if cur_match <= limit {
                 break;
             }
@@ -424,6 +519,51 @@ impl DeflateState {
             lookahead
         }
     }
+}
+
+/// Length of the common byte prefix of `a` and `b` (the index of the first
+/// differing byte, or `min(a.len(), b.len())` if one is a prefix of the other).
+///
+/// This is the longest-common-prefix primitive behind
+/// [`DeflateState::longest_match`]. It compares eight bytes at a time so the
+/// match scan issues one bounds-checked load per eight bytes instead of one per
+/// byte; that is what recovers the throughput C zlib gets from its
+/// pointer-arithmetic inner loop — entirely within `#![forbid(unsafe_code)]`.
+/// Because it returns the *exact* common-prefix length, callers observe behavior
+/// bit-identical to a plain byte-by-byte scan (so the emitted DEFLATE stream is
+/// unchanged).
+#[inline]
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    let n = core::cmp::min(a.len(), b.len());
+    let mut i = 0;
+
+    // Eight-byte stride. Calling `try_into()` on an `[i..i + 8]` subslice yields a
+    // fixed-size `[u8; 8]` whose bound the optimizer proves once for the whole
+    // word, so each load is free of per-byte bounds checks.
+    while i + 8 <= n {
+        let x = u64::from_ne_bytes(a[i..i + 8].try_into().unwrap());
+        let y = u64::from_ne_bytes(b[i..i + 8].try_into().unwrap());
+        let diff = x ^ y;
+        if diff != 0 {
+            // Locate the first differing byte within this eight-byte word. The
+            // bytes were loaded in native order, so on a little-endian target the
+            // first byte is the least-significant (found by `trailing_zeros`) and
+            // on a big-endian target it is the most-significant (`leading_zeros`).
+            let byte = if cfg!(target_endian = "little") {
+                diff.trailing_zeros() / 8
+            } else {
+                diff.leading_zeros() / 8
+            };
+            return i + byte as usize;
+        }
+        i += 8;
+    }
+
+    // Remaining tail (fewer than eight bytes).
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
 }
 
 // ---------------------------------------------------------------------------

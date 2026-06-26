@@ -103,9 +103,16 @@ fn insert_string(state: &mut DeflateState, str_pos: usize) -> Pos {
     state.ins_h = ((state.ins_h << state.hash_shift) ^ byte) & state.hash_mask;
 
     // match_head = s->prev[str & s->w_mask] = s->head[s->ins_h]
-    let hash_index = state.ins_h;
+    //
+    // `ins_h <= hash_mask == head.len() - 1` and `head.len()` is a power of two
+    // (`hash_size = 1 << hash_bits`), so re-masking by `head.len() - 1` is a no-op on
+    // the value but lets the optimizer prove the index is in range and drop the
+    // bounds check — this helper runs once per input byte, so the saved checks reduce
+    // the per-position cost. Likewise `w_mask == prev.len() - 1`. Indices (hence the
+    // emitted stream) are unchanged.
+    let hash_index = state.ins_h & (state.head.len() - 1);
     let head = state.head[hash_index];
-    let prev_index = str_pos & state.w_mask;
+    let prev_index = str_pos & (state.prev.len() - 1);
     state.prev[prev_index] = head;
 
     // s->head[s->ins_h] = (Pos)str

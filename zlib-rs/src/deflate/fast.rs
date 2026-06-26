@@ -78,9 +78,17 @@ impl DeflateState {
     fn insert_string(&mut self, str_pos: usize) -> usize {
         let c = self.window[str_pos + MIN_MATCH - 1];
         self.ins_h = update_hash(self.hash_shift, self.hash_mask, self.ins_h, c);
-        let hash_head = self.head[self.ins_h];
-        self.prev[str_pos & self.w_mask] = hash_head;
-        self.head[self.ins_h] = str_pos as Pos;
+        // `ins_h <= hash_mask == head.len() - 1` and `head.len()` is a power of two
+        // (`hash_size = 1 << hash_bits`), so re-masking by `head.len() - 1` leaves the
+        // value unchanged yet lets the optimizer prove the index is in range and drop
+        // the bounds check — `insert_string` runs once per input byte, so eliding
+        // these checks matters for the per-position cost. Likewise `w_mask ==
+        // prev.len() - 1`. The emitted stream is unaffected (the indices are identical).
+        let h = self.ins_h & (self.head.len() - 1);
+        let p = str_pos & (self.prev.len() - 1);
+        let hash_head = self.head[h];
+        self.prev[p] = hash_head;
+        self.head[h] = str_pos as Pos;
         hash_head as usize
     }
 }
