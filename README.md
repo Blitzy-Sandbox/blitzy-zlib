@@ -34,7 +34,10 @@ described by the following RFCs:
 
 ## Workspace layout
 
-The project is a three-member Cargo workspace (Rust **edition 2024**, **MSRV 1.85**). The dependency
+The project is a three-member Cargo workspace (Rust **edition 2024**). **MSRV 1.85** applies to the
+stable-buildable members — the pure-Rust core (`zlib-rs`) and the default 72-symbol C-ABI shim
+(`libz-rs-sys`); the **full workspace** and the **`libz-rs-sys-cdylib`** drop-in require a **nightly**
+toolchain (see [Building](#building)). The dependency
 chain is `libz-rs-sys-cdylib → libz-rs-sys → zlib-rs`: the drop-in member wraps the C-ABI shim, and
 the shim wraps the safe core.
 
@@ -63,6 +66,23 @@ cargo build --workspace
 cargo build --release
 ```
 
+### Toolchain: stable vs nightly
+
+The pure-Rust core (`zlib-rs`) and the default **72-symbol** C-ABI shim (`libz-rs-sys`) build on
+**stable Rust (MSRV 1.85)**:
+
+```sh
+cargo build -p zlib-rs       # safe pure-Rust core
+cargo build -p libz-rs-sys   # C-ABI shim (72 symbols; the variadic gzprintf is off)
+```
+
+The **full workspace** (`cargo build --workspace`) and the **`libz-rs-sys-cdylib` drop-in** (below)
+additionally require a **nightly** toolchain: they export the C-variadic `gzprintf` — the 73rd
+`zlib.h` symbol — whose definition needs the unstable `c_variadic` language feature (nightly-only),
+enabled via the `c-variadic` feature. The repository's `rust-toolchain.toml` pins nightly, so the
+default `cargo build --workspace` works out of the box; on a stable toolchain it fails with
+`error[E0554]` until the build is scoped to the stable members shown above.
+
 ## Testing
 
 ```sh
@@ -79,7 +99,11 @@ The test suite is organized into the following layers:
   `test/infcover.c`, including the allocation-failure harness.
 - **`gzip_compat`** — gzip wire-format tests ported from `test/minigzip.c`.
 - **`interop`** — byte-for-byte comparison of compressed output against the
-  [`flate2`](https://crates.io/crates/flate2) C-zlib oracle (the strongest correctness assertion).
+  [`flate2`](https://crates.io/crates/flate2) C-zlib oracle for the default strategy (the strongest
+  correctness assertion).
+- **`interop_oracle`** — an all-tuple byte-for-byte oracle against C zlib for every
+  `(level, strategy, windowBits)` combination; it calls [`libz-sys`](https://crates.io/crates/libz-sys)
+  directly to select the deflate strategy that `flate2`'s high-level API cannot.
 - **`round_trip`** — property-based compress → decompress round-trip tests via
   [`quickcheck`](https://crates.io/crates/quickcheck).
 - **`checksum`** — Adler-32 and CRC-32 known-answer vectors.
@@ -96,7 +120,8 @@ cargo bench                                 # criterion throughput benchmarks
 
 ## C-ABI drop-in usage
 
-Build the drop-in shared and static libraries:
+Build the drop-in shared and static libraries (**requires nightly** — see
+[Toolchain](#toolchain-stable-vs-nightly)):
 
 ```sh
 cargo build -p libz-rs-sys-cdylib --release
@@ -155,14 +180,21 @@ the workspace:
 - **`simd`** *(default)* — hardware-accelerated CRC-32 via
   [`crc32fast`](https://crates.io/crates/crc32fast). Disabling it selects the always-correct
   scalar-table fallback.
-- **`gzip`** — gzip container support (mirrors the C `GZIP` define).
-- **`gz-io`** — gzip file I/O (mirrors C `#ifndef NO_GZCOMPRESS`); implies `std` + `gzip`.
+- **`gzip`** *(default)* — gzip container support (mirrors the C `GZIP` define).
+- **`gz-io`** *(default)* — gzip file I/O (mirrors C `#ifndef NO_GZCOMPRESS`); implies `std` + `gzip`.
 - **`no-std`** — an explicit marker mirroring the C `Z_SOLO` configuration; the actual `no_std`
   switch is the *absence* of the `std` feature.
 - **`capi`** — a build **marker** for the C-ABI layer, consumed by the `libz-rs-sys-cdylib` member
   and `cargo-c` tooling. It does **not** gate compilation of the FFI layer — the `extern "C"`
   symbols in `libz-rs-sys` are always compiled. (To build/test just the pure-Rust core standalone,
   build `-p zlib-rs`; there is no need to toggle this flag.)
+- **`c-variadic`** *(C-ABI layer; nightly only)* — enables the single C-variadic export, `gzprintf`,
+  completing the full **73-symbol** `zlib.h` surface. It lives on `libz-rs-sys` /
+  `libz-rs-sys-cdylib` (not the `zlib-rs` core); its definition needs the unstable `c_variadic`
+  language feature, so it **requires a nightly toolchain**. It is therefore **off** in
+  `libz-rs-sys`'s defaults (yielding the 72-symbol shim on stable) but **on** in the
+  `libz-rs-sys-cdylib` drop-in's defaults, which build under the pinned nightly (see
+  [Building](#building)).
 
 For a pure-Rust `no_std` build of just the core:
 

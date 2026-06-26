@@ -36,8 +36,10 @@ on top of it for drop-in use from existing C programs (see
 
 ## Installation
 
-`zlib-rs` requires a Rust toolchain of **1.85 or newer** (MSRV 1.85) and is
-written for Rust **edition 2024**.
+`zlib-rs` — the safe core — requires a Rust toolchain of **1.85 or newer** (MSRV 1.85) and is
+written for Rust **edition 2024**. The core builds on **stable**; only the sibling C-ABI drop-in
+(`libz-rs-sys-cdylib`) additionally needs **nightly**, for the C-variadic `gzprintf` export (see the
+workspace root [`README.md`](../README.md)).
 
 While the crate is part of this workspace (and pending a crates.io release),
 depend on it by path or git:
@@ -64,8 +66,16 @@ it ports; the runtime `zlibVersion()` string reports the fuller `1.3.2.1-motley`
 
 The idiomatic API is grouped into modules and re-exported from `src/lib.rs`;
 the lib name is `zlib_rs` (the package name `zlib-rs` with the conventional
-dash-to-underscore conversion). See the full reference on
-[docs.rs](https://docs.rs/zlib-rs).
+dash-to-underscore conversion). Until this crate is published (see
+[Installation](#installation)), generate the full API reference locally:
+
+```sh
+cargo doc -p zlib-rs --no-deps --open
+```
+
+> **Note:** the crates.io name `zlib-rs` and `https://docs.rs/zlib-rs` currently resolve to an
+> unrelated, identically named project (a different `zlib-rs`), **not** this workspace's crate. Use
+> the locally generated docs above until a `1.3.2` release is published under this name.
 
 ### One-shot compress / uncompress
 
@@ -156,13 +166,14 @@ cargo build -p zlib-rs --release
 cargo test -p zlib-rs
 ```
 
-The crate ships six integration suites under `tests/`:
+The crate ships seven integration suites under `tests/`:
 
 | Suite              | What it covers |
 |--------------------|----------------|
 | `regression`       | Port of C `test/example.c` — the canonical regression driver. |
 | `inflate_coverage` | Port of C `test/infcover.c` — inflate state-machine coverage plus the allocation-failure harness. |
-| `interop`          | Byte-for-byte comparison against the `flate2` / C-zlib oracle. |
+| `interop`          | Byte-for-byte comparison against the `flate2` / C-zlib oracle (default strategy). |
+| `interop_oracle`   | All-tuple byte-for-byte oracle vs C zlib for every `(level, strategy, windowBits)`; calls `libz-sys` directly to set the deflate strategy `flate2` cannot. |
 | `round_trip`       | `quickcheck` property-based compress&rarr;decompress round-trips. |
 | `gzip_compat`      | Port of C `test/minigzip.c` — gzip wire-format compatibility. |
 | `checksum`         | Adler-32 / CRC-32 known-answer vectors. |
@@ -192,8 +203,11 @@ If you need an ABI-compatible drop-in for existing C programs — `libz.so` /
 `libz.a` exporting the exact `zlib.h` symbol set — use the sibling
 **`libz-rs-sys`** crate (the `extern "C"` / `#[repr(C)]` shim) together with the
 **`libz-rs-sys-cdylib`** workspace member that emits the shared and static
-libraries. That layer is gated by the `capi` feature and is documented in the
-**workspace root `README.md`**; it is intentionally not reproduced here.
+libraries. The `capi` feature is a build **marker** for that layer (consumed by the
+`libz-rs-sys-cdylib` member and `cargo-c`); it does **not** gate compilation of the FFI symbols,
+which are always compiled. Building the full `libz-rs-sys-cdylib` drop-in additionally requires a
+**nightly** toolchain (for the C-variadic `gzprintf`). That layer is documented in the **workspace
+root [`README.md`](../README.md)**; it is intentionally not reproduced here.
 
 ## License
 
