@@ -52,7 +52,8 @@ pub const OS_UNKNOWN: i32 = 255;
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
+/// use zlib_rs::GzHeader;
 /// let header = GzHeader::new()
 ///     .with_name(b"archive.tar".to_vec())
 ///     .with_time(1_700_000_000)

@@ -20,7 +20,7 @@
 //! | [`state`] | `gzguts.h`   | the owned [`GzState`](state::GzState) data model + [`GZBUFSIZE`] / [`GzMode`] / [`GzHow`] |
 //! | [`open`]  | `gzlib.c`    | open / buffer / seek / position / error API          |
 //! | [`read`]  | `gzread.c`   | the decompression engine + read API                  |
-//! | [`write`] | `gzwrite.c`  | the compression engine + write API                   |
+//! | [`mod@write`] | `gzwrite.c`  | the compression engine + write API               |
 //! | [`close`] | `gzclose.c`  | close dispatch (`gzclose` / `gzclose_r` / `gzclose_w`)|
 //!
 //! # Public API shape
@@ -54,7 +54,7 @@
 //!
 //! Like the rest of the core, every file here is compiled under the crate-wide
 //! `#![forbid(unsafe_code)]`: the C `int fd` becomes an owned
-//! [`File`](std::fs::File), the `malloc`/`free` buffers become owned `Vec<u8>`,
+//! [`File`], the `malloc`/`free` buffers become owned `Vec<u8>`,
 //! and the raw `z_stream` data pointers become plain `usize` offsets. No raw
 //! pointers and no `unsafe` appear anywhere in the `gz` subsystem; the
 //! raw-pointer `gzFile` ABI is reconstructed exclusively in the `libz-rs-sys`

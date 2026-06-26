@@ -15,7 +15,7 @@
 //! `state->out`. The safe core cannot alias buffers with raw pointers, so the
 //! translation is:
 //!
-//! * **Input window.** The embedded [`ZStream`] in this design does *not* store
+//! * **Input window.** The embedded [`ZStream`](crate::ZStream) in this design does *not* store
 //!   `next_in` / `avail_in`. Instead the unconsumed compressed bytes are tracked
 //!   on [`GzState`] itself via the [`in_next`](GzState::in_next) offset and
 //!   [`in_have`](GzState::in_have) length: the live window is

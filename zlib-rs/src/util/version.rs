@@ -42,7 +42,7 @@ pub use crate::constants::{
 ///
 /// This mirrors the C `zlibVersion()` function, which simply returns the
 /// compile-time `ZLIB_VERSION` macro. Applications compare the returned string
-/// against the [`ZLIB_VERSION`](crate::constants::ZLIB_VERSION) value they were
+/// against the [`ZLIB_VERSION`] value they were
 /// built with to detect a mismatched shared library at run time.
 #[must_use]
 pub const fn zlib_version() -> &'static str {

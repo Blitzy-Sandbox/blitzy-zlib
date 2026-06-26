@@ -22,7 +22,7 @@
 //! **zero `unsafe`**. The C representation is re-expressed with ownership:
 //!
 //! * the C `int fd` and the `open()` / `lseek()` system calls become an owned
-//!   [`File`](std::fs::File) opened through [`OpenOptions`] and repositioned
+//!   [`File`] opened through [`OpenOptions`] and repositioned
 //!   through [`Seek`] / [`SeekFrom`];
 //! * the opaque `gzFile` pointer (a `gz_state *` in C) becomes an owned
 //!   `Box<GzState>` — every public constructor here returns

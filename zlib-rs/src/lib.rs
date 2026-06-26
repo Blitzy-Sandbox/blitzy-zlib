@@ -92,6 +92,16 @@
 // compile-time guarantee: any `unsafe` block (including in `inflate/fast.rs`)
 // fails the build. All `unsafe` lives exclusively in the `libz-rs-sys` shim.
 #![forbid(unsafe_code)]
+// The module/algorithm documentation deliberately cross-references private
+// implementation items (e.g. the internal `BASE` / `NMAX` checksum constants,
+// the `StreamState` ownership enum, the `DeflateContext` worker) from the docs
+// of public items, so that a `--document-private-items` developer build renders
+// those links and the prose stays precise. In a public-only `cargo doc` build
+// those targets are not published, which rustdoc would otherwise flag. The
+// links are intentional, so allow them crate-wide rather than degrading the
+// internal documentation; this keeps `cargo doc` (and a `-D warnings` doc build)
+// clean without losing the cross-references.
+#![allow(rustdoc::private_intra_doc_links)]
 // The crate is `no_std` whenever the `std` feature is absent. NOTE: the switch
 // is deliberately keyed off `not(feature = "std")` and **not** off the `no-std`
 // marker feature — `no-std` is only a `Z_SOLO`-parity alias and does not, by

@@ -102,6 +102,15 @@ pub(crate) const MAX_BITS: usize = 15;
 /// This equals the bit width of `u16`, which is precisely why `bi_buf` must be a
 /// `u16`: a wider accumulator would change `send_bits` overflow timing and
 /// corrupt the bitstream.
+//
+// `#[allow(dead_code)]`: this constant documents the accumulator width and is
+// consumed by the `const _: () = assert!(BUF_SIZE == 16);` compile-time
+// guarantee below. The MSRV toolchain (rustc 1.85.0) does not count a use
+// inside a `const _` item as a real use and would otherwise raise a spurious
+// `dead_code` warning; newer toolchains count it correctly. The attribute keeps
+// the build warning-free across the whole supported toolchain range without
+// dropping the documented constant or its assertion.
+#[allow(dead_code)]
 pub(crate) const BUF_SIZE: usize = 16;
 
 // Compile-time guarantees for the binding array dimensions (agent prompt,

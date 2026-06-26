@@ -1,7 +1,7 @@
 //! Integrity checksums for the zlib/gzip wire formats.
 //!
-//! - [`adler32`]: Adler-32 running checksum (RFC 1950 / zlib container).
-//! - [`crc32`]: CRC-32 (IEEE 802.3, reflected polynomial `0xedb88320`; RFC 1952 / gzip container).
+//! - [`adler32()`]: Adler-32 running checksum (RFC 1950 / zlib container).
+//! - [`crc32()`]: CRC-32 (IEEE 802.3, reflected polynomial `0xedb88320`; RFC 1952 / gzip container).
 //!
 //! This is the foundational leaf module of the `zlib-rs` core: it depends on nothing
 //! else in `src/`, is entirely safe (crate-level `#![forbid(unsafe_code)]`), and is

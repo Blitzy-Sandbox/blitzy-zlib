@@ -259,7 +259,7 @@ pub struct InflateState {
     /// Protected copy of the total output count, used for the gzip ISIZE check
     /// (C `state->total`).
     pub total: u64,
-    /// Captured gzip header being populated, when [`inflate_get_header`] has
+    /// Captured gzip header being populated, when `inflate_get_header` has
     /// been called (C `state->head`). `None` means "do not capture".
     #[cfg(feature = "gzip")]
     pub head: Option<GzHeader>,

@@ -17,14 +17,14 @@
 //! stream-level scalars and the input/output buffers through an *engine
 //! context* rather than storing a back-pointer on the state. That engine
 //! context — named `DeflateContext` here — together with the [`fill_window`]
-//! and [`flush_block`] helpers is owned by the deflate engine module
+//! and `flush_block` helpers is owned by the deflate engine module
 //! ([`super`]). This file consumes that contract; it never defines it.
 //!
 //! The mapping of the C control-flow macros onto the engine helpers is:
 //!
 //! * `fill_window(s)` → [`fill_window`]`(cx)` — refills the sliding window from
 //!   the stream's input.
-//! * `FLUSH_BLOCK(s, last)` → [`flush_block`]`(cx, last)` — flushes the current
+//! * `FLUSH_BLOCK(s, last)` → `flush_block(cx, last)` — flushes the current
 //!   block. The C macro can early-`return` `need_more`/`finish_started` when the
 //!   output buffer is full; the Rust helper signals that by returning
 //!   `Some(BlockState)`, which this function propagates as its own return value.

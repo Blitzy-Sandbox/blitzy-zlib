@@ -60,6 +60,15 @@
 // standard convention for a `*-sys` ABI shim. The internal `// SAFETY:` blocks
 // (enforced by `unsafe_op_in_unsafe_fn`) remain the per-operation justification.
 #![allow(clippy::missing_safety_doc)]
+// The crate/module prose intentionally cross-references private shim internals
+// (the `zstream` ABI-type module, `translate::VERSION_CSTR`, the
+// `gzheader_from_c` converter, …) from the docs of public `extern "C"` exports,
+// so a `--document-private-items` developer build renders those links. In a
+// public-only `cargo doc` build those targets are not published, which rustdoc
+// would otherwise flag. The links are intentional, so allow them crate-wide
+// rather than dropping the cross-references; this keeps a `-D warnings` doc
+// build clean.
+#![allow(rustdoc::private_intra_doc_links)]
 
 // ===========================================================================
 // Modules

@@ -81,11 +81,10 @@ fn accumulate(mut adler: u32, mut sum2: u32, buf: &[u8]) -> (u32, u32) {
 /// # Examples
 ///
 /// The running checksum is associative: feeding two slices sequentially yields
-/// the same result as feeding their concatenation in one call. (Shown as a
-/// non-compiled example because the public re-export path is defined by the
-/// crate's module wiring.)
+/// the same result as feeding their concatenation in one call.
 ///
-/// ```ignore
+/// ```
+/// use zlib_rs::adler32_z;
 /// let whole = adler32_z(1, b"hello, world");
 /// let split = adler32_z(adler32_z(1, b"hello, "), b"world");
 /// assert_eq!(whole, split);
@@ -159,10 +158,10 @@ pub fn adler32(adler: u32, buf: &[u8]) -> u32 {
 /// # Examples
 ///
 /// Combining the checksums of two slices equals the checksum of their
-/// concatenation. (Shown as a non-compiled example because the public
-/// re-export path is defined by the crate's module wiring.)
+/// concatenation.
 ///
-/// ```ignore
+/// ```
+/// use zlib_rs::{adler32, adler32_combine};
 /// let a = adler32(1, b"hello, ");
 /// let b = adler32(1, b"world");
 /// let combined = adler32_combine(a, b, b"world".len() as u64);

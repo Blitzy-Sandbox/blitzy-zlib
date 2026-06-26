@@ -25,7 +25,7 @@
 //! The C reference performs raw `memcpy` and pointer arithmetic against
 //! `s->strm->next_out` / `next_in` and `s->window`. Here every transfer is a
 //! bounds-checked slice copy routed through the engine I/O context
-//! ([`DeflateContext`](super::DeflateContext)); there is **no `unsafe`** and the
+//! ([`DeflateContext`]); there is **no `unsafe`** and the
 //! module compiles under the crate-wide `#![forbid(unsafe_code)]`. Only `core`
 //! and `alloc` are used, so the crate's `no_std` build path is preserved.
 //!

@@ -18,7 +18,7 @@
 //! file** — is compiled under `#![forbid(unsafe_code)]`. This is *stricter* than
 //! upstream's blueprint, which permitted `unsafe` here. We therefore keep the
 //! same loop structure but index through safe, bounds-checked slices
-//! ([`output`], [`InflateState::window`], `input`) and accept the residual
+//! (`output`, [`InflateState::window`], `input`) and accept the residual
 //! bounds-check cost. The entry guarantees still hold, so for any well-formed
 //! stream the indices are always in range and the checks never fail; a *corrupt*
 //! stream simply lands in [`InflateMode::Bad`] (it can never provoke

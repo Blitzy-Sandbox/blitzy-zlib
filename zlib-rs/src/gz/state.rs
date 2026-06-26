@@ -18,7 +18,7 @@
 //! The whole crate carries `#![forbid(unsafe_code)]`, so this module contains
 //! **zero `unsafe`**. The C representation is re-expressed with ownership:
 //!
-//! * the C `int fd` file descriptor becomes an owned [`File`](std::fs::File)
+//! * the C `int fd` file descriptor becomes an owned [`File`]
 //!   (which is `Read + Write + Seek`);
 //! * the `malloc`/`free`-managed `in` / `out` buffers become owned `Vec<u8>`
 //!   buffers (`in_buf` / `out_buf`);

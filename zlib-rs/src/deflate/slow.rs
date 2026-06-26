@@ -35,7 +35,7 @@
 //! Following design D1, the per-call *engine I/O context* — the bundle of the
 //! owned [`DeflateState`] together with the borrowed input/output slices and
 //! the `z_stream` scalars (`total_in`/`total_out`/`adler`) — is the
-//! [`DeflateContext`](super::DeflateContext) defined in the module root. The C
+//! [`DeflateContext`] defined in the module root. The C
 //! `deflate_state *s` parameter (which carries a `strm` back-pointer) becomes
 //! `cx: &mut DeflateContext`, and the C `s->field` accesses become
 //! `cx.state.field`. This strategy relies on the following items provided by
@@ -43,12 +43,12 @@
 //! by every strategy and therefore live with the driver rather than being
 //! duplicated here:
 //!
-//! * [`fill_window`](super::fill_window) — refill the sliding window from the
+//! * [`fill_window`] — refill the sliding window from the
 //!   input slice (C `fill_window`).
-//! * [`longest_match`](super::longest_match) — find the longest hash-chain
+//! * [`longest_match`] — find the longest hash-chain
 //!   match for the current string and set `cx.state.match_start` (C
 //!   `longest_match`). Shared with [`deflate_fast`](super::fast).
-//! * [`flush_block_only`](super::flush_block_only) — emit the current block via
+//! * [`flush_block_only`] — emit the current block via
 //!   [`DeflateState::tr_flush_block`], advance `block_start`, and flush pending
 //!   output to the output slice (the C `FLUSH_BLOCK_ONLY` macro). It lives in
 //!   the root because emitting the block borrows `state.window` while the tally
