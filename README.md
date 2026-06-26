@@ -148,26 +148,36 @@ build**. In ordinary local and downstream builds the check is best-effort and re
 `cargo:warning` (so packaging, docs.rs, and read-only source trees never break); set
 `LIBZ_RS_SYS_STRICT_HEADER=1` locally to opt into the same hard gate.
 
-### Using the generated `include/zlib.h` directly (`-DWITH_GZFILEOP`)
+### Using the generated `include/zlib.h` directly (`-DZ_SOLO` opts out of `gz*`)
 
 The **true drop-in relink path above needs no special flags** — existing programs that include the
 canonical system `zlib.h` get the gzip file-I/O API by default and link the Rust `libz.so`/`libz.a`
 unchanged (all 26 `gz*` symbols are always exported, regardless of any macro).
 
-If instead you compile a program against the **cbindgen-generated** `libz-rs-sys/include/zlib.h`, the
-gzip file-I/O prototypes (`gzopen`, `gzread`, `gzwrite`, `gzprintf`, `gzclose`, …) are gated behind
-`#if defined(WITH_GZFILEOP)` and are **off by default**. Define the macro to expose them:
+The same holds when you compile a program against the **cbindgen-generated**
+`libz-rs-sys/include/zlib.h`: the gzip file-I/O prototypes (`gzopen`, `gzread`, `gzwrite`,
+`gzprintf`, `gzclose`, …) are declared inside `#ifndef Z_SOLO … #endif`, **exactly matching canonical
+`zlib.h`**, so they are visible **by default** and need no special flag:
 
 ```sh
-cc -DWITH_GZFILEOP your_app.c -L target/release -lz
+cc your_app.c -L target/release -lz
 ```
 
-Without `-DWITH_GZFILEOP` a modern C compiler rejects `gz*` calls with an implicit-declaration error.
-This opt-in polarity is the one intentional difference from canonical `zlib.h` (which exposes the gz
-section by default under `#ifndef Z_SOLO`): `cbindgen` derives `#if defined(WITH_GZFILEOP)` from the
-positive `feature = "gz-io"` cfg and cannot emit an `#ifndef Z_SOLO` guard. It affects **only** direct
-consumers of the generated header — symbol export, signature/ABI parity, and the relink/`LD_PRELOAD`
-drop-in path are all unaffected. The generated header itself carries this same note inline.
+To opt **out** of the gz file-I/O section — mirroring zlib's compression-only `Z_SOLO` build — define
+`-DZ_SOLO`; a program that then calls `gz*` is rejected with an implicit-declaration error, exactly as
+canonical `zlib.h` behaves:
+
+```sh
+cc -DZ_SOLO your_app.c -L target/release -lz   # gz* prototypes hidden
+```
+
+Under the hood, `cbindgen` can only derive a *positive* `#if defined(WITH_GZFILEOP)` guard from the
+positive `feature = "gz-io"` cfg and cannot itself emit an `#ifndef` guard, so the shim's `build.rs`
+rewrites that guard to the canonical `#ifndef Z_SOLO` after generation — the `WITH_GZFILEOP` macro is
+therefore a harmless no-op in the shipped header. This gating affects **only** the prototypes a direct
+consumer of the generated header sees — symbol export, signature/ABI parity, and the
+relink/`LD_PRELOAD` drop-in path are all unaffected. The generated header itself carries this same
+note inline.
 
 ## Feature flags
 
