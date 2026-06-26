@@ -123,35 +123,28 @@ typedef off_t z_off_t;
 /* Null sentinel for initializing zalloc, zfree, opaque. */
 #define Z_NULL  0
 
-/* ----- gzip file-I/O API gating (READ THIS if you compile against this  ----
-   ----- generated header directly) ---------------------------------------- */
+/* ----- gzip file-I/O API gating ------------------------------------------ */
 /* The gzip file-I/O family (gzopen, gzdopen, gzbuffer, gzsetparams, gzread,
    gzfread, gzwrite, gzfwrite, gzprintf, gzputs, gzputc, gzgets, gzgetc,
    gzungetc, gzflush, gzseek, gzrewind, gztell, gzoffset, gzeof, gzdirect,
    gzclose, gzclose_r, gzclose_w, gzerror, gzclearerr) is declared further
-   below inside `#if defined(WITH_GZFILEOP) ... #endif`. To use those
-   prototypes when compiling against THIS generated header, define the macro:
+   below inside `#ifndef Z_SOLO ... #endif`, EXACTLY matching canonical zlib.h:
+   the gz prototypes are visible by DEFAULT. A caller opts OUT only by defining
+   Z_SOLO (zlib's compression-only configuration), e.g.:
 
-       cc -DWITH_GZFILEOP your_app.c -lz
+       cc -DZ_SOLO your_app.c -lz
 
-   Without -DWITH_GZFILEOP the gz prototypes stay hidden and a modern C
-   compiler rejects gz* calls with an implicit-declaration error.
-
-   This is the one intentional polarity difference from the canonical zlib.h,
-   which exposes the gz section by DEFAULT under `#ifndef Z_SOLO` (opt-OUT).
-   This header is opt-IN (`#if defined(WITH_GZFILEOP)`) because cbindgen derives
-   `#if defined(X)` from the positive Cargo cfg `feature = "gz-io"` and cannot
-   emit an `#ifndef Z_SOLO` guard.
-
-   IMPORTANT: this gating affects ONLY direct consumers of this generated
-   header. It does NOT affect:
-     * the true drop-in RELINK path -- existing programs built against the
-       canonical system zlib.h get the gz API by default and link this Rust
-       libz.so / libz.a unchanged (all 26 gz symbols are always exported);
-     * symbol export -- every gz symbol is present in libz.so / libz.a
-       regardless of this macro;
-     * signature / ABI parity -- the gz prototypes themselves are correct and
-       identical to canonical zlib. */
+   Implementation note: cbindgen derives a POSITIVE `#if defined(WITH_GZFILEOP)`
+   guard from the positive Cargo cfg `feature = "gz-io"` and cannot itself emit
+   an `#ifndef` guard, so `build.rs` rewrites that guard to the canonical
+   `#ifndef Z_SOLO` after generation. This gating affects ONLY the C
+   declarations a direct consumer of this header sees; it does NOT affect:
+     * the drop-in RELINK path -- programs built against the canonical system
+       zlib.h get the gz API by default and link this Rust libz.so / libz.a
+       unchanged (all 26 gz symbols are always exported);
+     * symbol export -- every gz symbol is present in libz.so / libz.a;
+     * signature / ABI parity -- the gz prototypes are identical to canonical
+       zlib. */
 
 /*
  Opaque counterpart of the C `struct internal_state;` forward declaration.
@@ -781,7 +774,7 @@ unsigned long zlibCompileFlags(void);
  */
 const char *zError(int err);
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzopen` — open `path` for gzip reading/writing per `mode` (e.g. `"rb"`,
  `"wb9"`). Returns NULL on failure.
@@ -789,7 +782,7 @@ const char *zError(int err);
 gzFile gzopen(const char *path, const char *mode);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzdopen` — wrap an already-open OS file descriptor `fd` (ownership is
  transferred, as in C) for gzip I/O per `mode`. Returns NULL on failure.
@@ -797,7 +790,7 @@ gzFile gzopen(const char *path, const char *mode);
 gzFile gzdopen(int fd, const char *mode);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzbuffer` — set the internal buffer size for `file` (before the first
  read/write). Returns 0 on success, -1 on error.
@@ -805,14 +798,14 @@ gzFile gzdopen(int fd, const char *mode);
 int gzbuffer(gzFile file, unsigned int size);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzsetparams` — change the compression `level`/`strategy` mid-stream.
  */
 int gzsetparams(gzFile file, int level, int strategy);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzread` — read up to `len` uncompressed bytes into `buf`. Returns the
  number of bytes read (0 at EOF) or -1 on error.
@@ -820,7 +813,7 @@ int gzsetparams(gzFile file, int level, int strategy);
 int gzread(gzFile file, void *buf, unsigned int len);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzfread` — read `nitems` items of `size` bytes each into `buf`. Returns
  the number of full items read. Guards against `size * nitems` overflow
@@ -829,7 +822,7 @@ int gzread(gzFile file, void *buf, unsigned int len);
 size_t gzfread(void *buf, size_t size, size_t nitems, gzFile file);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzwrite` — write `len` uncompressed bytes from `buf`. Returns the number
  of bytes written, or 0 on error.
@@ -837,7 +830,7 @@ size_t gzfread(void *buf, size_t size, size_t nitems, gzFile file);
 int gzwrite(gzFile file, const void *buf, unsigned int len);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzfwrite` — write `nitems` items of `size` bytes each from `buf`. Returns
  the number of full items written. Guards against `size * nitems` overflow.
@@ -845,7 +838,7 @@ int gzwrite(gzFile file, const void *buf, unsigned int len);
 size_t gzfwrite(const void *buf, size_t size, size_t nitems, gzFile file);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzputs` — write the NUL-terminated string `s` (without its NUL). Returns
  the number of bytes written, or -1 on error.
@@ -853,14 +846,14 @@ size_t gzfwrite(const void *buf, size_t size, size_t nitems, gzFile file);
 int gzputs(gzFile file, const char *s);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzputc` — write one byte `c`. Returns the byte written, or -1 on error.
  */
 int gzputc(gzFile file, int c);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzgets` — read a line (up to `len - 1` bytes, plus a NUL) into `buf`.
  Returns `buf` on success, or NULL at EOF/on error.
@@ -868,7 +861,7 @@ int gzputc(gzFile file, int c);
 char *gzgets(gzFile file, char *buf, int len);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzgetc` — read one byte. Returns the byte (0..=255) or -1 at EOF/error.
  This is the function the generated `gzgetc` macro falls back to (we keep the
@@ -877,7 +870,7 @@ char *gzgets(gzFile file, char *buf, int len);
 int gzgetc(gzFile file);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzungetc` — push byte `c` back so the next read returns it. Returns `c`,
  or -1 on error.
@@ -885,14 +878,14 @@ int gzgetc(gzFile file);
 int gzungetc(int c, gzFile file);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzflush` — flush pending output with the given `flush` mode.
  */
 int gzflush(gzFile file, int flush);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzseek` — reposition `file` to `offset` per `whence` (`SEEK_SET`/
  `SEEK_CUR`). Returns the resulting uncompressed offset, or -1 on error.
@@ -900,35 +893,35 @@ int gzflush(gzFile file, int flush);
 off_t gzseek(gzFile file, off_t offset, int whence);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzrewind` — reset `file` to the beginning (read mode only).
  */
 int gzrewind(gzFile file);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gztell` — return the current uncompressed offset, or -1 on error.
  */
 off_t gztell(gzFile file);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzoffset` — return the current compressed-file offset, or -1 on error.
  */
 off_t gzoffset(gzFile file);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzeof` — return non-zero once the read end-of-file has been reached.
  */
 int gzeof(gzFile file);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzdirect` — return non-zero if `file` is being read transparently (i.e.
  the input is not actually gzip-compressed).
@@ -936,7 +929,7 @@ int gzeof(gzFile file);
 int gzdirect(gzFile file);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzclose` — flush (write mode), close, and free `file`. Consumes the
  handle (reconstructs the owning box and drops it = RAII close).
@@ -944,21 +937,21 @@ int gzdirect(gzFile file);
 int gzclose(gzFile file);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzclose_r` — the read-mode specialization of `gzclose`.
  */
 int gzclose_r(gzFile file);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzclose_w` — the write-mode specialization of `gzclose` (flushes output).
  */
 int gzclose_w(gzFile file);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzerror` — return the last error message for `file` and (if `errnum` is
  non-null) write the numeric code through it. The returned pointer stays
@@ -967,14 +960,14 @@ int gzclose_w(gzFile file);
 const char *gzerror(gzFile file, int *errnum);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzclearerr` — clear the error and end-of-file flags for `file`. (void.)
  */
 void gzclearerr(gzFile file);
 #endif
 
-#if defined(WITH_GZFILEOP)
+#ifndef Z_SOLO
 /*
  C `gzprintf` — `printf`-style formatted write to a gz file.
 

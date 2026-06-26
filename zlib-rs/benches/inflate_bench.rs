@@ -12,6 +12,16 @@
 //!   (`InflateState::new(-15)`). Corpora are produced by `flate2`'s raw
 //!   [`flate2::write::DeflateEncoder`], giving an independent producer so the
 //!   bench doubles as a cross-implementation decode check.
+//! * **C-zlib baseline** (`bench_decode_vs_czlib`) — the head-to-head axis that
+//!   makes the AAP "decompression parity or better" target directly measurable.
+//!   For each source buffer it decodes the **same** zlib (RFC 1950) corpus with
+//!   the Rust one-shot [`uncompress2`] (`rust/<label>`) and with canonical C
+//!   zlib (`c-zlib/<label>`), under identical [`Throughput`] keyed on the
+//!   decompressed length, so the ratio of the two reported throughputs is the
+//!   target metric. The C side uses `flate2`'s low-level [`flate2::Decompress`]
+//!   — reached through the `["zlib"]` backend, i.e. the system C zlib via
+//!   `libz-sys` — decoding into a caller-sized buffer in a single `Finish`
+//!   pass, the direct analog of the Rust `uncompress2` call.
 //!
 //! Each case is benched over two input densities so decode is observed across
 //! realistic stream shapes: a *compressible* text-like buffer (rich in LZ77
@@ -39,6 +49,10 @@ use std::io::Write;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use flate2::Compression;
 use flate2::write::DeflateEncoder;
+// C-zlib decode baseline (Issue 7): `flate2`'s low-level `Decompress` reaches
+// the canonical C zlib through the `["zlib"]` backend (`libz-sys`), decoding
+// into a caller-provided buffer — the direct analog of the Rust `uncompress2`.
+use flate2::{Decompress, FlushDecompress, Status};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -269,6 +283,67 @@ fn bench_raw_decode(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// C-zlib baseline (decode throughput parity, the "parity or better" target)
+// ---------------------------------------------------------------------------
+
+/// Decode a complete **zlib** (RFC 1950) stream `compressed` into `out` using
+/// canonical **C zlib** (via `flate2`'s `["zlib"]` backend), returning the
+/// number of decompressed bytes written.
+///
+/// This is the direct analog of the Rust one-shot [`uncompress2`]: a freshly
+/// initialised decompressor (`zlib_header = true`), a single `Finish` pass into
+/// a buffer already sized to the known decompressed length, and the total bytes
+/// produced. The input is the very stream [`deflate_zlib`] feeds to the Rust
+/// side, so the two paths decode identical bytes.
+fn czlib_inflate_zlib(compressed: &[u8], out: &mut [u8]) -> usize {
+    let mut dec = Decompress::new(true);
+    let status = dec
+        .decompress(compressed, out, FlushDecompress::Finish)
+        .expect("flate2 (C zlib) decompress failed");
+    // `out` is sized to the original length, so one Finish pass always completes.
+    assert_eq!(
+        status,
+        Status::StreamEnd,
+        "flate2 (C zlib) did not finish decoding in one pass (output too small?)"
+    );
+    dec.total_out() as usize
+}
+
+/// Head-to-head decode throughput: Rust [`uncompress2`] versus canonical C zlib
+/// over the **same** zlib corpus. The two reported throughputs share a group and
+/// `Throughput` (keyed on the decompressed length), so their ratio is the AAP
+/// "decompression parity or better" metric.
+fn bench_decode_vs_czlib(c: &mut Criterion) {
+    let mut group = c.benchmark_group("inflate_vs_czlib");
+    for (label, original) in source_buffers() {
+        // Setup (outside timing): one shared zlib corpus decoded by both sides.
+        let compressed = deflate_zlib(&original, CORPUS_LEVEL);
+        let original_len = original.len();
+        group.throughput(Throughput::Bytes(original_len as u64));
+
+        // Rust one-shot uncompress2.
+        group.bench_with_input(BenchmarkId::new("rust", label), &compressed, |b, comp| {
+            let mut out = vec![0u8; original_len];
+            b.iter(|| {
+                let (produced, _consumed) =
+                    uncompress2(&mut out, black_box(comp.as_slice())).expect("uncompress2 failed");
+                black_box(produced);
+            });
+        });
+
+        // Canonical C zlib (flate2 `["zlib"]` backend).
+        group.bench_with_input(BenchmarkId::new("c-zlib", label), &compressed, |b, comp| {
+            let mut out = vec![0u8; original_len];
+            b.iter(|| {
+                let produced = czlib_inflate_zlib(black_box(comp.as_slice()), &mut out);
+                black_box(produced);
+            });
+        });
+    }
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Harness wiring (mandatory: this bench is `harness = false`)
 // ---------------------------------------------------------------------------
 //
@@ -279,5 +354,10 @@ fn bench_raw_decode(c: &mut Criterion) {
 // rejects the gzip `windowBits` range (>= 24). The zlib and raw-DEFLATE paths
 // above are fully available under default features and cover decode throughput.
 // A gzip decode bench can be added once it is exercised under `--features gzip`.
-criterion_group!(benches, bench_zlib_decode, bench_raw_decode);
+criterion_group!(
+    benches,
+    bench_zlib_decode,
+    bench_raw_decode,
+    bench_decode_vs_czlib
+);
 criterion_main!(benches);

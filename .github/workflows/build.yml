@@ -75,6 +75,57 @@ jobs:
         run: cargo test --workspace --verbose
 
   # ---------------------------------------------------------------------------
+  # Feature-matrix gate: the workspace must BUILD and TEST under each supported
+  # non-default Cargo feature combination — not only the default set exercised by
+  # the `build` job above. This guards the independent feature flags the AAP
+  # declares (`std`, `gzip`, `gz-io`, `simd`, `no-std`) against regressions where
+  # one feature's code path references another feature's API.
+  #
+  # The `--no-default-features --features std` variant is a first-class
+  # acceptance requirement: a std-only build must NOT reference any gzip-gated
+  # state (for example the FFI shim's inflate gz-header write-back, which is
+  # gated on `all(feature = "std", feature = "gzip")`). It is pinned explicitly
+  # in the matrix so the std-only regression that previously broke the build can
+  # never silently return.
+  #
+  # NOTE: LIBZ_RS_SYS_STRICT_HEADER is deliberately NOT set here. These reduced
+  # feature sets intentionally omit symbols (for example the gz file-I/O family
+  # when `gz-io` is off), so the generated header legitimately differs from the
+  # canonical zlib.h and the strict-parity panic would be a false failure. Strict
+  # header parity remains gated by the full-feature `build` job above.
+  feature-matrix:
+    name: Feature matrix (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Surface every failing feature combination on a single run.
+      fail-fast: false
+      matrix:
+        include:
+          - name: "no-default (no_std core)"
+            flags: "--no-default-features"
+          - name: "std only"
+            flags: "--no-default-features --features std"
+          - name: "gzip only"
+            flags: "--no-default-features --features gzip"
+          - name: "std + gzip"
+            flags: "--no-default-features --features std,gzip"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust (nightly — matches rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace (${{ matrix.name }})
+        run: cargo build --workspace ${{ matrix.flags }} --verbose
+
+      - name: Test workspace (${{ matrix.name }})
+        run: cargo test --workspace ${{ matrix.flags }} --verbose
+
+  # ---------------------------------------------------------------------------
   # Minimum-Supported-Rust-Version gate (stable 1.85). Build-only on purpose:
   # `cargo build` does not pull the dev-dependencies (criterion / flate2 /
   # quickcheck / rand) whose own minimum versions can exceed 1.85, so this

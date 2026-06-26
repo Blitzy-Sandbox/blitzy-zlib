@@ -248,35 +248,28 @@ typedef off_t z_off_t;
 /* Null sentinel for initializing zalloc, zfree, opaque. */
 #define Z_NULL  0
 
-/* ----- gzip file-I/O API gating (READ THIS if you compile against this  ----
-   ----- generated header directly) ---------------------------------------- */
+/* ----- gzip file-I/O API gating ------------------------------------------ */
 /* The gzip file-I/O family (gzopen, gzdopen, gzbuffer, gzsetparams, gzread,
    gzfread, gzwrite, gzfwrite, gzprintf, gzputs, gzputc, gzgets, gzgetc,
    gzungetc, gzflush, gzseek, gzrewind, gztell, gzoffset, gzeof, gzdirect,
    gzclose, gzclose_r, gzclose_w, gzerror, gzclearerr) is declared further
-   below inside `#if defined(WITH_GZFILEOP) ... #endif`. To use those
-   prototypes when compiling against THIS generated header, define the macro:
+   below inside `#ifndef Z_SOLO ... #endif`, EXACTLY matching canonical zlib.h:
+   the gz prototypes are visible by DEFAULT. A caller opts OUT only by defining
+   Z_SOLO (zlib's compression-only configuration), e.g.:
 
-       cc -DWITH_GZFILEOP your_app.c -lz
+       cc -DZ_SOLO your_app.c -lz
 
-   Without -DWITH_GZFILEOP the gz prototypes stay hidden and a modern C
-   compiler rejects gz* calls with an implicit-declaration error.
-
-   This is the one intentional polarity difference from the canonical zlib.h,
-   which exposes the gz section by DEFAULT under `#ifndef Z_SOLO` (opt-OUT).
-   This header is opt-IN (`#if defined(WITH_GZFILEOP)`) because cbindgen derives
-   `#if defined(X)` from the positive Cargo cfg `feature = "gz-io"` and cannot
-   emit an `#ifndef Z_SOLO` guard.
-
-   IMPORTANT: this gating affects ONLY direct consumers of this generated
-   header. It does NOT affect:
-     * the true drop-in RELINK path -- existing programs built against the
-       canonical system zlib.h get the gz API by default and link this Rust
-       libz.so / libz.a unchanged (all 26 gz symbols are always exported);
-     * symbol export -- every gz symbol is present in libz.so / libz.a
-       regardless of this macro;
-     * signature / ABI parity -- the gz prototypes themselves are correct and
-       identical to canonical zlib. */'''
+   Implementation note: cbindgen derives a POSITIVE `#if defined(WITH_GZFILEOP)`
+   guard from the positive Cargo cfg `feature = "gz-io"` and cannot itself emit
+   an `#ifndef` guard, so `build.rs` rewrites that guard to the canonical
+   `#ifndef Z_SOLO` after generation. This gating affects ONLY the C
+   declarations a direct consumer of this header sees; it does NOT affect:
+     * the drop-in RELINK path -- programs built against the canonical system
+       zlib.h get the gz API by default and link this Rust libz.so / libz.a
+       unchanged (all 26 gz symbols are always exported);
+     * symbol export -- every gz symbol is present in libz.so / libz.a;
+     * signature / ABI parity -- the gz prototypes are identical to canonical
+       zlib. */'''
 
 # ---------------------------------------------------------------------------
 # Phase 3 — [export]: what to emit and how it is named
@@ -393,8 +386,11 @@ exclude = []
 # ---------------------------------------------------------------------------
 [defines]
 # Items gated in Rust by `#[cfg(feature = "gz-io")]` (the gz file-I/O API:
-# `gzopen`, `gzread`, `gzprintf`, `gzclose`, …) are wrapped in the generated
-# header by `#if defined(WITH_GZFILEOP) … #endif`. This mirrors canonical
-# zlib.h's `#ifndef Z_SOLO` gating of the gz section and keeps the generated
-# header consistent with how `src/lib.rs` conditionally exports those symbols.
+# `gzopen`, `gzread`, `gzprintf`, `gzclose`, …) are emitted by cbindgen wrapped
+# in `#if defined(WITH_GZFILEOP) … #endif`. `build.rs` then rewrites that guard
+# to canonical zlib.h's opt-OUT `#ifndef Z_SOLO … #endif` (cbindgen can only
+# derive a positive `#if defined(X)` from a positive Cargo cfg and cannot emit
+# an `#ifndef`), so the generated header exposes the gz section by DEFAULT,
+# exactly like canonical zlib.h. The macro name below is what cbindgen emits
+# pre-rewrite; the final header contains `Z_SOLO`, not `WITH_GZFILEOP`.
 "feature = gz-io" = "WITH_GZFILEOP"

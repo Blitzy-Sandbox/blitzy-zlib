@@ -258,7 +258,55 @@ fn generate_header(crate_dir: &Path) -> Option<String> {
     // `Bindings::write_to_file`, which `.unwrap()`s its filesystem I/O.
     let mut buffer: Vec<u8> = Vec::new();
     bindings.write(&mut buffer);
-    Some(String::from_utf8_lossy(&buffer).into_owned())
+    let rendered = String::from_utf8_lossy(&buffer).into_owned();
+
+    // Post-process: rewrite cbindgen's positive gz file-I/O guard
+    // (`#if defined(WITH_GZFILEOP)`) into canonical zlib's opt-OUT
+    // `#ifndef Z_SOLO`, so a direct consumer of this generated header sees the
+    // gz file-I/O prototypes by DEFAULT — byte-for-byte matching the drop-in
+    // contract of canonical zlib.h — and opts out only via `-DZ_SOLO`.
+    Some(canonicalize_gz_guard(&rendered))
+}
+
+/// Rewrite cbindgen's positive gz file-I/O guard into canonical zlib polarity.
+///
+/// cbindgen can only derive a *positive* `#if defined(WITH_GZFILEOP)` guard from
+/// the positive Cargo cfg `feature = "gz-io"`; it cannot emit an `#ifndef`.
+/// Canonical `zlib.h`, however, exposes the gz file-I/O section by DEFAULT and
+/// lets a caller opt OUT with `-DZ_SOLO` (zlib's compression-only build). To
+/// honour that drop-in contract exactly, every standalone
+/// `#if defined(WITH_GZFILEOP)` directive line is rewritten to `#ifndef Z_SOLO`.
+/// The paired `#endif` tokens are generic and already correct, so they are left
+/// untouched.
+///
+/// The match is anchored to a *whole directive line* (after trimming), so the
+/// explanatory `after_includes` comment — which mentions the macro inside
+/// backticks on a prose line — is never rewritten.
+fn canonicalize_gz_guard(header: &str) -> String {
+    const FROM: &str = "#if defined(WITH_GZFILEOP)";
+    const TO: &str = "#ifndef Z_SOLO";
+
+    let mut out = String::with_capacity(header.len());
+    for (index, line) in header.lines().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        if line.trim() == FROM {
+            // Preserve any leading indentation (cbindgen emits directives at
+            // column 0, but stay defensive against future formatting changes).
+            let indent_len = line.len() - line.trim_start().len();
+            out.push_str(&line[..indent_len]);
+            out.push_str(TO);
+        } else {
+            out.push_str(line);
+        }
+    }
+    // `str::lines()` discards a single trailing newline; restore it so the
+    // emitted header keeps the exact trailing-newline shape cbindgen produced.
+    if header.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 /// Phase 2 (cont.) — persist the generated header to `include/zlib.h`,

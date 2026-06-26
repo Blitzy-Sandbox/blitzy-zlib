@@ -250,7 +250,12 @@ pub fn zlib_compile_flags() -> c_ulong {
 // could ever be recycled, so there is no ABA hazard. Under `no_std` (where no
 // registry is available) `inflateGetHeader` still enables core capture but
 // performs no C-struct write-back (documented limitation).
-#[cfg(feature = "std")]
+//
+// Gated on BOTH `std` (the registry needs `std::sync`) AND `gzip` (there is no
+// gzip header to write back without the core's gzip-capture path). A std-only
+// build — `--no-default-features --features std` — therefore omits this module
+// entirely instead of referencing the gzip-gated `InflateState::header()`.
+#[cfg(all(feature = "std", feature = "gzip"))]
 mod header_reg {
     use super::{gz_header, z_streamp};
     use std::collections::HashMap;
@@ -283,7 +288,10 @@ mod header_reg {
 /// An owned snapshot of a captured [`GzHeader`], used to write the parsed gzip
 /// header back into a caller-supplied C `gz_header` without holding a borrow of
 /// the inflate state across the raw-pointer writes.
-#[cfg(feature = "std")]
+///
+/// Requires both `std` (owned `Vec` copies) and `gzip` (the captured
+/// [`GzHeader`] only exists under the core's gzip feature).
+#[cfg(all(feature = "std", feature = "gzip"))]
 struct HeaderSnapshot {
     text: c_int,
     time: c_ulong,
@@ -296,7 +304,7 @@ struct HeaderSnapshot {
     comment: Option<Vec<u8>>,
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "gzip"))]
 impl HeaderSnapshot {
     /// Capture the relevant fields of `h` into owned copies.
     fn capture(h: &GzHeader) -> Self {
@@ -967,7 +975,10 @@ pub unsafe extern "C" fn deflatePending(
 /// std-only: the registry that maps `z_stream*` → `gz_header*` requires
 /// `std::sync`. Under `no_std` the core still captures the header internally,
 /// but it cannot be written back through the C struct (documented limitation).
-#[cfg(feature = "std")]
+///
+/// Requires both `std` (the registry) and `gzip` (the core's captured header,
+/// `InflateState::header()`); a std-only build omits this function entirely.
+#[cfg(all(feature = "std", feature = "gzip"))]
 unsafe fn write_back_inflate_header(strm: z_streamp) {
     // Look up the caller's registered `gz_header` for this stream; absent (or
     // null) registration means there is nothing to write back.
@@ -1060,7 +1071,11 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
     // forms the input/output slices from `next_in`/`next_out`, writing back the
     // consumed/produced cursors, totals, adler, msg and data_type.
     let rc = unsafe { translate::run_inflate(strm, flush) };
-    #[cfg(feature = "std")]
+    // The gzip-header write-back exists only when both `std` (the registry) and
+    // `gzip` (the core's header capture) are present; std-only / no_std builds
+    // skip it (the core still decodes correctly, it just cannot fill a C
+    // `gz_header`).
+    #[cfg(all(feature = "std", feature = "gzip"))]
     {
         // SAFETY: `strm` is the same pointer just driven by `run_inflate`.
         unsafe { write_back_inflate_header(strm) };
@@ -1086,7 +1101,8 @@ pub unsafe extern "C" fn inflateEnd(strm: z_streamp) -> c_int {
     // (RAII == C `inflateEnd`).
     // SAFETY: `strm` owns the outer box; `drop_state` reconstructs/drops once.
     unsafe { translate::drop_state(strm) };
-    #[cfg(feature = "std")]
+    // Drop any gzip-header registration (present only under `std` + `gzip`).
+    #[cfg(all(feature = "std", feature = "gzip"))]
     header_reg::unregister(strm);
     Z_OK
 }
@@ -1520,6 +1536,17 @@ pub unsafe extern "C" fn compress2(
     }
     // SAFETY: `destLen` is non-null (checked); it is the in/out capacity word.
     let cap = unsafe { translate::read_dest_len(destLen) };
+    // Canonical-zlib argument validation (compress.c `compress2_z`): a NULL
+    // source with a positive length, or a NULL destination with a positive
+    // capacity, is a usage error and MUST return Z_STREAM_ERROR — exactly as C
+    // zlib does (its inner `deflate` rejects `next_in == NULL && avail_in != 0`
+    // / `next_out == NULL`). Without this guard the shim would turn the NULL
+    // pointer into an empty slice and silently succeed (produce an 8-byte empty
+    // zlib stream), masking the caller's bug. A NULL pointer paired with a zero
+    // length stays legal (it becomes an empty slice below).
+    if (sourceLen > 0 && source.is_null()) || (cap > 0 && dest.is_null()) {
+        return Z_STREAM_ERROR;
+    }
     // SAFETY: `dest` is valid for `cap` bytes (its declared capacity) or null
     // (then an empty slice), and `source` is valid for `sourceLen` bytes or null.
     let dst = unsafe { translate::output_slice_sz(dest, cap as size_t) };
@@ -1567,6 +1594,13 @@ pub unsafe extern "C" fn uncompress(
     }
     // SAFETY: `destLen` is non-null (checked); the in/out capacity word.
     let cap = unsafe { translate::read_dest_len(destLen) };
+    // Canonical-zlib argument validation (uncompr.c): reject a NULL source with
+    // a positive length or a NULL destination with a positive capacity with
+    // Z_STREAM_ERROR, matching C zlib's inner `inflate` NULL guards. (A NULL
+    // pointer with a zero length remains legal — an empty slice below.)
+    if (sourceLen > 0 && source.is_null()) || (cap > 0 && dest.is_null()) {
+        return Z_STREAM_ERROR;
+    }
     // SAFETY: `dest` valid for `cap` bytes or null; `source` valid for
     // `sourceLen` bytes or null (both yield empty slices when null).
     let dst = unsafe { translate::output_slice_sz(dest, cap as size_t) };
@@ -1598,6 +1632,14 @@ pub unsafe extern "C" fn uncompress2(
     let cap = unsafe { translate::read_dest_len(destLen) };
     // SAFETY: `sourceLen` is non-null (checked); read the available source size.
     let src_len = unsafe { *sourceLen as size_t };
+    // Canonical-zlib argument validation (uncompr.c `uncompress2_z`): a NULL
+    // source with a positive `*sourceLen`, or a NULL destination with a positive
+    // capacity, is Z_STREAM_ERROR (the NULL `sourceLen`/`destLen` cases are
+    // already handled above). Matches C zlib exactly. (NULL + zero length stays
+    // legal — an empty slice below.)
+    if (src_len > 0 && source.is_null()) || (cap > 0 && dest.is_null()) {
+        return Z_STREAM_ERROR;
+    }
     // SAFETY: `dest` valid for `cap` bytes or null; `source` valid for `src_len`
     // bytes or null.
     let dst = unsafe { translate::output_slice_sz(dest, cap as size_t) };

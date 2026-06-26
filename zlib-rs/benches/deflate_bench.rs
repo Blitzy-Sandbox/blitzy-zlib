@@ -14,6 +14,21 @@
 //!   text profile. (Had the streaming API not been part of the stable public
 //!   surface, this axis would have been deferred — the one-shot `compress2`
 //!   path takes only a level, not a strategy.)
+//! * **C-zlib baseline** (`bench_compress_vs_czlib`) — the head-to-head axis
+//!   that makes the AAP "compression throughput >= 80% of C zlib" target
+//!   directly measurable. For each profile at level 6 it benchmarks the Rust
+//!   one-shot `compress2` (`rust/<profile>`) against canonical C zlib
+//!   (`c-zlib/<profile>`) on **identical** input, with identical
+//!   [`Throughput`], so the ratio of the two reported throughputs is the target
+//!   metric. The C side is reached through `flate2` configured with
+//!   `default-features = false, features = ["zlib"]`, which routes to the
+//!   system C zlib via `libz-sys` — the very implementation the port must
+//!   match. `flate2`'s low-level [`Compress`] compresses into a caller-provided,
+//!   `compress_bound`-sized buffer in a single `Finish` pass, the direct analog
+//!   of the Rust `compress2` call, so the comparison is apples-to-apples (the
+//!   thin `flate2` wrapper over the C `z_stream` adds negligible per-call
+//!   overhead). Because the port is byte-identical to C zlib at level 6, both
+//!   sides also emit the same number of compressed bytes (reported alongside).
 //!
 //! # Harness
 //!
@@ -31,6 +46,13 @@
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+
+// C-zlib baseline (Issue 7). `flate2` is configured in `[dev-dependencies]` with
+// `default-features = false, features = ["zlib"]`, so it links the canonical C
+// zlib through `libz-sys`. The low-level `Compress` type compresses into a
+// caller-provided buffer (the direct analog of the Rust one-shot `compress2`),
+// giving a fair, allocation-free-in-the-hot-loop throughput comparison.
+use flate2::{Compress, Compression, FlushCompress, Status};
 
 // One-shot compression surface (`compress.c` port). These live under the
 // `util` module of the core crate; that is the stable, verified path (the
@@ -250,5 +272,81 @@ fn bench_strategies(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_levels, bench_strategies);
+// ---------------------------------------------------------------------------
+// C-zlib baseline (compression throughput parity, the >= 80% target)
+// ---------------------------------------------------------------------------
+
+/// Compress `src` into `dst` using canonical **C zlib** (via `flate2`'s
+/// `["zlib"]` backend), returning the number of bytes written.
+///
+/// This is the direct analog of the Rust one-shot [`compress2`]: a freshly
+/// initialised compressor (matching `compress2`, which sets up state per call),
+/// a single `Finish` pass into a `compress_bound`-sized output buffer, and the
+/// total bytes produced. `zlib_header = true` selects the zlib container so the
+/// produced stream matches the Rust `compress2` wire format byte-for-byte.
+fn czlib_compress(dst: &mut [u8], src: &[u8], level: u32) -> usize {
+    let mut comp = Compress::new(Compression::new(level), true);
+    let status = comp
+        .compress(src, dst, FlushCompress::Finish)
+        .expect("flate2 (C zlib) compress failed");
+    // `dst` is `compress_bound`-sized, so a single Finish pass always completes.
+    assert_eq!(
+        status,
+        Status::StreamEnd,
+        "flate2 (C zlib) did not finish in one pass (destination too small?)"
+    );
+    comp.total_out() as usize
+}
+
+/// Head-to-head compression throughput: Rust `compress2` versus canonical C
+/// zlib over identical inputs at level 6. The two reported throughputs share a
+/// group and `Throughput`, so their ratio is the AAP ">= 80% of C zlib" metric.
+fn bench_compress_vs_czlib(c: &mut Criterion) {
+    let mut group = c.benchmark_group("deflate_vs_czlib");
+    let level = 6i32;
+
+    for (name, input) in profiles() {
+        group.throughput(Throughput::Bytes(input.len() as u64));
+        let bound = compress_bound(input.len());
+
+        // Report both sides' compressed sizes outside the timed region. At level
+        // 6 the port is byte-identical to C zlib, so these should agree.
+        let mut probe_rust = vec![0u8; bound];
+        let rust_bytes =
+            compress2(&mut probe_rust, &input, level).expect("rust compress2 probe failed");
+        let mut probe_czlib = vec![0u8; bound];
+        let czlib_bytes = czlib_compress(&mut probe_czlib, &input, level as u32);
+        println!(
+            "[deflate] axis=vs_czlib profile={name} level={level} \
+             rust_bytes={rust_bytes} czlib_bytes={czlib_bytes}"
+        );
+
+        // Rust one-shot compress2.
+        group.bench_with_input(BenchmarkId::new("rust", name), &input, |b, input| {
+            let mut dst = vec![0u8; bound];
+            b.iter(|| {
+                let n = compress2(&mut dst, black_box(input), level).unwrap();
+                black_box(n);
+            });
+        });
+
+        // Canonical C zlib (flate2 `["zlib"]` backend).
+        group.bench_with_input(BenchmarkId::new("c-zlib", name), &input, |b, input| {
+            let mut dst = vec![0u8; bound];
+            b.iter(|| {
+                let n = czlib_compress(&mut dst, black_box(input), level as u32);
+                black_box(n);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_levels,
+    bench_strategies,
+    bench_compress_vs_czlib
+);
 criterion_main!(benches);

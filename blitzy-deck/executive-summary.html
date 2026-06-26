@@ -37,6 +37,12 @@
       --hero-gradient: linear-gradient(68deg, #7A6DEC 15.56%, #5B39F3 62.74%, #4101DB 84.44%);
     }
 
+    /* Mobile-safety guard: never allow the fixed-size (1920x1080) reveal deck to
+       produce a horizontal scrollbar on narrow viewports. Paired with the
+       Reveal.initialize minScale below, this keeps the 375px breakpoint free of
+       the ~4px horizontal overflow without affecting the desktop presentation. */
+    html, body { max-width: 100%; overflow-x: hidden; }
+
     .reveal { font-family: var(--font-body); font-size: 30px; color: var(--n-333); }
     .reveal h1, .reveal h2, .reveal h3 { font-family: var(--font-display); color: var(--blitzy-dark); font-weight: 700; text-transform: none; letter-spacing: -0.01em; }
     .reveal h1 { font-size: 2.4em; line-height: 1.05; }
@@ -282,32 +288,10 @@ graph TD
         </table>
       </section>
 
-      <!-- DIVIDER: VALIDATION -->
-      <section class="slide-divider" data-background-color="#1A105F">
-        <span class="divider-icon"><i data-lucide="check-check" aria-hidden="true"></i></span>
-        <span class="eyebrow">06 / Quality</span>
-        <h2>Validation and Quality Gates</h2>
-        <div class="accent-bar"></div>
-      </section>
-
-      <!-- CONTENT: TESTING -->
-      <section>
-        <span class="eyebrow">Test Strategy</span>
-        <h2>A Multi-Layered Conformance Plan</h2>
-        <table>
-          <thead><tr><th>Suite</th><th>Purpose</th></tr></thead>
-          <tbody>
-            <tr><td>regression / coverage</td><td>Port the canonical C test programs</td></tr>
-            <tr><td>interop</td><td>Byte-for-byte vs C zlib (flate2)</td></tr>
-            <tr><td>round_trip / checksum</td><td>Property and known-answer vectors</td></tr>
-          </tbody>
-        </table>
-      </section>
-
       <!-- DIVIDER: ONBOARDING -->
       <section class="slide-divider" data-background-color="#1A105F">
         <span class="divider-icon"><i data-lucide="book-open" aria-hidden="true"></i></span>
-        <span class="eyebrow">07 / Onboarding</span>
+        <span class="eyebrow">06 / Onboarding</span>
         <h2>Onboarding the Team</h2>
         <div class="accent-bar"></div>
       </section>
@@ -368,7 +352,15 @@ graph TD
       controlsTutorial: false,
       width: 1920,
       height: 1080,
-      margin: 0.06
+      margin: 0.06,
+      // Allow the 1920x1080 deck to scale far enough DOWN to fit narrow mobile
+      // viewports. reveal.js' default minScale of 0.2 floors the scaled width at
+      // 0.2 * 1920 = 384px, which exceeds a 375px phone and causes ~4px of
+      // horizontal overflow; 0.1 (-> 192px floor) removes that overflow while
+      // keeping the desktop presentation untouched. maxScale stays at the
+      // default 2.0 so large displays still render crisply.
+      minScale: 0.1,
+      maxScale: 2.0
     });
 
     // Cache each diagram's original Mermaid source. Mermaid replaces the <pre> content with

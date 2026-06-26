@@ -103,10 +103,15 @@ flate2 = "=1.1.9"     # C-zlib interop ORACLE for byte-for-byte validation.
 # lockfile transitively (via `flate2`'s `zlib` backend); pinned exactly here.
 libz-sys = "=1.1.29"  # Raw C-zlib FFI for the strategy/windowBits oracle (dev).
 quickcheck = "=1.1.0" # Property-based round-trip testing.
-# `rand` is pinned to 0.9.4 (not the AAP's originally-drafted 0.9.2): 0.9.2 has
-# an outstanding RustSec/OSV advisory, whereas 0.9.4 is advisory-clean and is
-# the version the lockfile already resolved. Dev-only, never shipped.
-rand = "=0.9.4"       # Random data generation for tests / benches.
+# CHANGE NOTE — intentional, security-positive divergence from the AAP table.
+# The AAP §0.5.1 dependency catalog drafted `rand = 0.9.2`. That exact version
+# carries an OUTSTANDING advisory — RUSTSEC-2026-0097 / GHSA-cq8v-f236-94qc —
+# which is fixed in 0.9.3. We therefore pin the advisory-clean `=0.9.4` (the
+# version the lockfile already resolved) rather than the vulnerable 0.9.2.
+# `rand` is dev/test/bench-only and is NEVER part of the shipped artifact, so
+# this divergence has zero ABI / wire-format / runtime impact on consumers; it
+# is purely a supply-chain hygiene decision. Do NOT downgrade to 0.9.2.
+rand = "=0.9.4"       # Random data generation for tests / benches (dev-only).
 
 # ---------------------------------------------------------------------------
 # Release profile (workspace-global; a `[profile.*]` table is only valid in the
