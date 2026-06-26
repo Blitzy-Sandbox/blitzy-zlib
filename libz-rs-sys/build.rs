@@ -20,11 +20,15 @@
 //! writable, it emits a `cargo:warning=...` and continues rather than panicking.
 //! `cargo build -p libz-rs-sys` must always stay green.
 //!
-//! The one *opt-in* exception is a strict CI gate: setting the environment
+//! The one *opt-in* exception is a strict parity gate: setting the environment
 //! variable [`STRICT_ENV`] (`LIBZ_RS_SYS_STRICT_HEADER`) to any value promotes
-//! detected signature drift to a hard `panic!`. This is intended for use *after*
-//! the full export surface exists, to fail CI if the C header ever diverges from
-//! canonical `zlib.h`. It is deliberately OFF by default.
+//! detected signature drift to a hard `panic!`. This repository's CI ENABLES it
+//! (`LIBZ_RS_SYS_STRICT_HEADER=1` in the `build`, `lint` and `cdylib` workflows),
+//! so generated-vs-canonical `zlib.h` signature drift FAILS CI as a hard delivery
+//! gate (AAP §0.4.1, goal G4). It remains OFF by default for *local* and
+//! *downstream* builds, which therefore stay green — drift there is reported as a
+//! `cargo:warning`. This preserves the robustness contract above while still
+//! enforcing zero drift where it matters: the repository's own CI/delivery.
 //!
 //! # Why generate unconditionally
 //!
@@ -52,8 +56,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Environment variable that, when present (any value), promotes header-parity
-/// drift from a non-fatal `cargo:warning` to a hard `panic!`. Intended for CI use
-/// once the full C-ABI export surface exists; OFF by default.
+/// drift from a non-fatal `cargo:warning` to a hard `panic!`. This repository's
+/// CI sets it (`=1`) in the build/lint/cdylib workflows so signature drift fails
+/// CI as a delivery gate; it stays OFF for local and downstream builds, which
+/// keep the non-fatal warning behaviour.
 const STRICT_ENV: &str = "LIBZ_RS_SYS_STRICT_HEADER";
 
 /// File name of the committed, generated C header (under `include/`).
@@ -65,11 +71,11 @@ const HEADER_NAME: &str = "zlib.h";
 /// and (where present in both) that its argument *arity* matches canonical
 /// `zlib.h`.
 ///
-/// At early milestones, where `src/lib.rs` has not yet layered the
-/// `#[unsafe(no_mangle)]` wrappers over the safe core, most of these will be
-/// reported as "not yet exported" — that is expected and non-fatal. The fix for a
-/// genuinely missing symbol is always in `src/lib.rs` / `src/zstream.rs` (make the
-/// item `pub`, `#[unsafe(no_mangle)] extern "C"`, named exactly), never here.
+/// At final delivery the shim exports the complete surface, so the strict gate
+/// (below) passes with zero drift. The fix for a genuinely missing or mismatched
+/// symbol is always in `src/lib.rs` / `src/zstream.rs` (make the item `pub`,
+/// `#[unsafe(no_mangle)] extern "C"`, named exactly, with matching arity), never
+/// here.
 const EXPECTED_SYMBOLS: &[&str] = &[
     // ---- deflate family (14) -------------------------------------------------
     "deflateInit_",
@@ -305,10 +311,11 @@ fn persist_header(crate_dir: &Path, generated: &str) {
 /// 3. **Struct field layout** — the ordered field names of [`EXPECTED_STRUCTS`]
 ///    must agree (best-effort; skipped silently if unparseable).
 ///
-/// All findings are emitted as `cargo:warning`. If [`STRICT_ENV`] is set and any
-/// drift was found, the script `panic!`s (CI gate). If the canonical header is
-/// absent (e.g. a consumer building only the packaged crate), the check is skipped
-/// silently.
+/// All findings are emitted as `cargo:warning`. If [`STRICT_ENV`] is set — which
+/// this repository's CI does (`LIBZ_RS_SYS_STRICT_HEADER=1` in the build/lint/
+/// cdylib workflows) — and any drift was found, the script `panic!`s, failing the
+/// build as a hard parity gate. If the canonical header is absent (e.g. a consumer
+/// building only the packaged crate), the check is skipped silently.
 fn check_parity(crate_dir: &Path, generated: &str) {
     let canonical_path = crate_dir.join("..").join("zlib.h");
     if !canonical_path.is_file() {

@@ -53,8 +53,12 @@
 // gate the entire test crate on `std` so `--no-default-features` builds compile
 // (as an empty crate) rather than failing to resolve `flate2`/`std::io`.
 #![cfg(feature = "std")]
-// Binding convention for the whole `tests/` folder: these are safe-Rust
-// integration tests that touch only the public API — never any `unsafe`.
+// Binding convention for the `tests/` folder: integration tests are safe-Rust
+// that touch only the public API and carry `#![forbid(unsafe_code)]` (this file
+// included). The sole, documented exception is `interop_oracle.rs`, whose only
+// `unsafe` is the unavoidable low-level C-zlib (`deflateInit2_`) FFI it uses as
+// a byte-for-byte oracle for the full `(level, strategy, windowBits)` matrix
+// that `flate2`'s high-level API cannot drive.
 #![forbid(unsafe_code)]
 
 use std::io::Read;
@@ -692,7 +696,9 @@ fn bytewise_gzip_payload_and_trailer() {
 /// Instead, for each strategy, prove that the `zlib-rs` output is a *valid*
 /// RFC 1950 / 1951 stream by having the C-zlib oracle decode it back to the
 /// input. Byte-exactness vs C zlib for the *default* strategy is separately
-/// proven by the level matrix (Phase D) and the known-answer vectors (Phase B).
+/// proven by the level matrix (Phase D) and the known-answer vectors (Phase B);
+/// byte-exactness for *every* strategy (and `windowBits`) is proven by the
+/// low-level C `deflateInit2_` oracle in `tests/interop_oracle.rs`.
 #[test]
 fn strategy_outputs_are_valid() {
     let strategies = [
@@ -720,7 +726,8 @@ fn strategy_outputs_are_valid() {
 /// For zlib `windowBits` 9..=15, a `zlib-rs`-compressed stream must round-trip
 /// through both `flate2` (which reads the window size from the CMF byte) and
 /// `zlib-rs` itself. Uses the repetitive input so smaller windows meaningfully
-/// constrain match distances.
+/// constrain match distances. (Exact byte-for-byte equality vs C zlib across
+/// the full `windowBits` range is proven separately in `tests/interop_oracle.rs`.)
 #[test]
 fn windowbits_cross_decode() {
     let data = repetitive_buffer();

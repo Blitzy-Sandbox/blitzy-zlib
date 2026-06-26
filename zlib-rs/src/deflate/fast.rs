@@ -30,39 +30,25 @@
 //!
 //! # Relationship to the rest of `crate::deflate`
 //!
-//! The agent action plan places the shared compression *engine* — the
-//! `DeflateContext` I/O cursor plus `fill_window` / `longest_match` /
-//! `FLUSH_BLOCK` — in `deflate::mod`, shared between `deflate_fast` and
-//! `deflate_slow`. At this foundation milestone `mod.rs` is still the data-model
-//! wiring stub and that engine does not yet exist on disk, while this file's
-//! declared dependencies are strictly [`super::state`], [`super::trees`] and
-//! [`crate::constants`]. To deliver a *self-contained, compilable and
-//! bit-exactness-verifiable* unit rather than a fragment that cannot be built,
-//! the engine pieces `deflate_fast` requires are provided here:
+//! The shared compression *engine* — the [`DeflateContext`] I/O cursor plus
+//! [`fill_window`], [`flush_block()`] and the rolling-hash helper [`update_hash`]
+//! — lives in [`deflate::mod`](super) and is shared between `deflate_fast` and
+//! `deflate_slow`. This module consumes that engine directly: the imports below
+//! pull [`DeflateContext`], [`fill_window`], [`flush_block()`] and [`update_hash`]
+//! from [`super`], while the per-position primitives `insert_string` /
+//! `longest_match` / `slide_hash` are [`DeflateState`] methods (the established
+//! convention in `state.rs`/`trees.rs`, where engine operations are
+//! `impl DeflateState` methods spread across the module's files).
 //!
-//! * [`DeflateContext`] — the borrowed input/output/stream cursor that threads
-//!   the data C keeps on `z_stream` (design decision D1, see `state.rs`), and
-//! * `fill_window` / `read_buf` / `flush_pending` / `flush_block` on it, plus
-//!   `insert_string` / `longest_match` / `slide_hash` as [`DeflateState`]
-//!   methods (mirroring the established convention in `state.rs`/`trees.rs`,
-//!   where engine operations are `impl DeflateState` methods spread across the
-//!   module's files).
-//!
-//! When the `deflate::mod` driver lands it consumes [`deflate_fast`] (and the
-//! sibling strategy producers) through exactly this surface.
+//! In the other direction, the integrated `deflate::mod` driver dispatches to
+//! [`deflate_fast`] for compression levels 1-3 through the
+//! [`BlockProducer::Fast`](super::strategy::BlockProducer::Fast) arm of
+//! `deflate::strategy`, so this strategy producer is a live part of the
+//! compressor rather than a standalone fragment.
 //!
 //! The module carries `#![forbid(unsafe_code)]` from the crate root: every
 //! window read and hash write goes through bounds-checked slice indexing, and
 //! no raw pointers are used.
-
-// The engine surface in this module (the strategy entry point `deflate_fast`
-// and its supporting `DeflateContext` / `DeflateState` helpers) is consumed by
-// the `deflate::mod` driver, which is a separate file landing in a later step
-// of this single-phase, parallel build. Until that caller exists in the tree,
-// the non-test library build sees these `pub(crate)` items as unreferenced.
-// `allow(dead_code)` keeps this in-construction module a warning-clean
-// contributor; the `#[cfg(test)]` suite below exercises the entire surface.
-#![allow(dead_code)]
 
 use super::state::{BlockState, DeflateState, MIN_LOOKAHEAD, Pos};
 use super::{DeflateContext, fill_window, flush_block, update_hash};
@@ -244,9 +230,12 @@ mod tests {
     //! produced by `deflate_fast` from the zlib/gzip wrapper bytes and trailer
     //! checksum (which the stream layer in `mod.rs` owns), so these tests pin the
     //! greedy-match strategy itself. Because the output is byte-identical to C
-    //! zlib, it is by construction valid DEFLATE that decodes back to the input;
-    //! the golden vectors are therefore a strictly stronger assertion than a
-    //! round trip through a decompressor (which does not yet exist in the crate).
+    //! zlib, it is by construction valid DEFLATE that decodes back to the input.
+    //! The golden vectors remain a strictly stronger assertion than a round trip
+    //! through this crate's own [`crate::inflate`] decompressor: a self round
+    //! trip only proves the encoder and decoder agree with *each other*, whereas
+    //! matching the external C-zlib bytes proves `deflate_fast` reproduces the
+    //! reference encoder's exact match and Huffman decisions.
     //!
     //! Two coverage tiers are used:
     //! * **Full-hex golden vectors** for small, diverse inputs (empty, text,

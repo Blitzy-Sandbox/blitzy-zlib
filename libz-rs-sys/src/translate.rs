@@ -53,7 +53,7 @@ use libc::{c_char, c_int, c_uint, c_ulong, off_t, size_t};
 // symbols actually used here so the crate stays free of unused-import warnings
 // under `-D warnings`. The `gz`-only types are imported inside the
 // `#[cfg(feature = "gz-io")]` block further below.
-use crate::zstream::{internal_state, z_crc_t, z_stream, z_streamp};
+use crate::zstream::{alloc_func, free_func, internal_state, voidpf, z_crc_t, z_stream, z_streamp};
 
 // The gz C-ABI types (`gzFile`, `gzFile_s`) are always *defined* in `zstream.rs`
 // but are referenced here only by the `gz`-feature helpers in Phase 8. Gating
@@ -66,7 +66,12 @@ use crate::zstream::{gzFile, gzFile_s};
 // `constants` enums model the C `flush`/`strategy`/level inputs.
 use zlib_rs::constants::{Flush, Level, Strategy, ZLIB_VERSION};
 use zlib_rs::error::{ReturnCode, ZlibError};
-use zlib_rs::stream::ZStream;
+use zlib_rs::stream::{Allocator, ZStream};
+
+// `Vec` is used by the C-allocator adapter below. Under `std` it comes from the
+// prelude; under `no_std` the crate root declares `extern crate alloc;`.
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 // ===========================================================================
 // Phase 1 — Slice-formation helpers (raw ptr + len → borrowed slice)
@@ -1065,6 +1070,159 @@ where
         return ZlibError::StreamError.as_i32();
     }
     sink(rendered.as_bytes())
+}
+
+// ===========================================================================
+// Phase 9 — C-allocator adapter (`zalloc`/`zfree`/`opaque` → core `Allocator`)
+// ===========================================================================
+//
+// The C `z_stream` lets a caller override allocation with two raw function
+// pointers and an opaque cookie: `alloc_func zalloc(opaque, items, size)` and
+// `free_func zfree(opaque, address)` (`zlib.h` lines 85-86). The safe core
+// instead vends owned `Vec` buffers through the [`Allocator`] trait. This
+// adapter bridges the two so that a C caller's custom or memory-limiting
+// allocator is genuinely honored end-to-end and its failures surface as
+// `Z_MEM_ERROR`, exactly like stock zlib.
+//
+// ## Why a *shadow* allocation
+//
+// The core's buffers are owned `Vec`s, and reconstituting a `Vec` from a
+// C-`malloc`'d block (`Vec::from_raw_parts`) would be unsound — the global
+// allocator, not the caller's `zfree`, frees a `Vec`. So for each request the
+// adapter performs a **shadow allocation** through the caller's `zalloc` purely
+// for accounting/limit/failure parity, and returns a *separate* owned `Vec` for
+// the actual storage. The C-side accounting is therefore byte-for-byte what
+// stock zlib would request (the shadow block stays outstanding until teardown),
+// so a memory-limiting allocator fails at exactly the same point as C; the
+// extra owned `Vec` is invisible to the caller's allocator. Every shadow block
+// is released through `zfree` when the adapter is dropped (RAII — the analogue
+// of `deflateEnd`/`inflateEnd` freeing each `zalloc`'d block).
+//
+// All `unsafe` here is the unavoidable invocation of caller-supplied C function
+// pointers; each call carries a `// SAFETY:` note.
+
+/// Adapts a C `z_stream`'s `zalloc`/`zfree`/`opaque` callbacks to the core
+/// [`Allocator`] trait. Installed on the core `ZStream` (deflate) or the
+/// `InflateState` (inflate) so the safe engine allocates through the caller's
+/// hooks.
+pub(crate) struct CAllocator {
+    /// Caller `zalloc` (guaranteed `Some` for an installed adapter).
+    zalloc: alloc_func,
+    /// Caller `zfree`; if `None`, shadow blocks are simply leaked back to the
+    /// caller's allocator (matching zlib, which requires both or neither).
+    zfree: free_func,
+    /// Caller opaque cookie passed verbatim to every `zalloc`/`zfree` call.
+    opaque: voidpf,
+    /// Outstanding shadow blocks obtained from `zalloc`, freed on `Drop`.
+    blocks: core::cell::RefCell<Vec<voidpf>>,
+}
+
+impl CAllocator {
+    /// Builds an adapter from a stream's callbacks, or `None` when the caller
+    /// did not install a custom `zalloc` (the default-allocator case, in which
+    /// the core simply uses the global allocator).
+    ///
+    /// Mirrors zlib's rule that a custom allocator is in effect only when
+    /// `zalloc` is non-null; `zfree` is expected to accompany it.
+    pub(crate) fn from_callbacks(
+        zalloc: alloc_func,
+        zfree: free_func,
+        opaque: voidpf,
+    ) -> Option<Self> {
+        zalloc.map(|f| CAllocator {
+            zalloc: Some(f),
+            zfree,
+            opaque,
+            blocks: core::cell::RefCell::new(Vec::new()),
+        })
+    }
+
+    /// Shadow-allocates `count * elem_size` bytes through the caller's
+    /// `zalloc`, recording the block for teardown. Returns the raw pointer, or
+    /// `None` if `zalloc` reports failure (null) or the request cannot be
+    /// expressed in the C `uInt` item/size ABI.
+    fn shadow_alloc(&self, count: usize, elem_size: c_uint) -> Option<voidpf> {
+        // The C ABI passes `items`/`size` as `uInt` (c_uint). Refuse requests
+        // that cannot be represented rather than silently truncating.
+        let items = c_uint::try_from(count).ok()?;
+        let zalloc = self.zalloc?;
+        // SAFETY: `zalloc` is the caller-provided `alloc_func` from their
+        // `z_stream`; `opaque` is their matching cookie. We pass `items`/`size`
+        // within the documented `uInt` ABI. A null return means allocation
+        // failure, handled below.
+        let ptr = unsafe { zalloc(self.opaque, items, elem_size) };
+        if ptr.is_null() {
+            return None;
+        }
+        self.blocks.borrow_mut().push(ptr);
+        Some(ptr)
+    }
+
+    /// Backs out the most recently recorded shadow block (used when the owned
+    /// `Vec` allocation fails *after* a successful shadow allocation, so the
+    /// caller's allocator is left balanced).
+    fn unwind_last_block(&self, ptr: voidpf) {
+        let mut blocks = self.blocks.borrow_mut();
+        if blocks.last() == Some(&ptr) {
+            blocks.pop();
+        }
+        if let Some(zfree) = self.zfree {
+            // SAFETY: `ptr` was just returned by the caller's `zalloc` with the
+            // same `opaque`; freeing it exactly once here balances that call.
+            unsafe { zfree(self.opaque, ptr) };
+        }
+    }
+}
+
+impl Allocator for CAllocator {
+    fn allocate_bytes(&self, len: usize) -> Option<Vec<u8>> {
+        let block = self.shadow_alloc(len, 1)?;
+        let mut storage = Vec::new();
+        if storage.try_reserve_exact(len).is_err() {
+            self.unwind_last_block(block);
+            return None;
+        }
+        storage.resize(len, 0u8);
+        Some(storage)
+    }
+
+    fn allocate_u16(&self, len: usize) -> Option<Vec<u16>> {
+        // 16-bit elements: mirror zlib's `ZALLOC(strm, len, sizeof(Pos))`.
+        let block = self.shadow_alloc(len, 2)?;
+        let mut storage = Vec::new();
+        if storage.try_reserve_exact(len).is_err() {
+            self.unwind_last_block(block);
+            return None;
+        }
+        storage.resize(len, 0u16);
+        Some(storage)
+    }
+
+    // `deallocate_*` drops the owned `Vec` (freeing the storage). The matching
+    // shadow block stays outstanding until `Drop`, mirroring zlib's "free every
+    // `zalloc`'d block at `inflateEnd`/`deflateEnd`" lifetime — the core never
+    // reallocates these buffers, so blocks do not accumulate unbounded.
+    fn deallocate_bytes(&self, buffer: Vec<u8>) {
+        drop(buffer);
+    }
+
+    fn deallocate_u16(&self, buffer: Vec<u16>) {
+        drop(buffer);
+    }
+}
+
+impl Drop for CAllocator {
+    fn drop(&mut self) {
+        if let Some(zfree) = self.zfree {
+            for ptr in self.blocks.borrow().iter() {
+                // SAFETY: each `ptr` was produced by the caller's `zalloc` with
+                // this `opaque` and is freed exactly once here (the adapter is
+                // dropped once, at `deflateEnd`/`inflateEnd`). This is the RAII
+                // analogue of zlib freeing every `zalloc`'d block at teardown.
+                unsafe { zfree(self.opaque, *ptr) };
+            }
+        }
+    }
 }
 
 // ===========================================================================

@@ -48,6 +48,11 @@ use alloc::vec::Vec;
 use crate::constants::{MAX_MATCH, MIN_MATCH, Strategy as CompressionStrategy};
 use crate::error::{Result, ZlibError};
 use crate::gz_header::GzHeader;
+// The custom-allocation extension point. `deflateInit2_` routes every working
+// buffer through the caller-installed [`Allocator`] (falling back to the global
+// allocator via [`DefaultAllocator`]), mirroring the C `zalloc`/`zfree` hooks
+// and preserving the fallible `Z_MEM_ERROR` path.
+use crate::stream::{Allocator, DefaultAllocator};
 
 // `CtData` and `StaticTreeDesc` are defined in the sibling `trees.rs` module.
 // The `self` import also brings the `trees` module path into scope so the
@@ -511,6 +516,14 @@ impl DeflateState {
     /// Returns [`ZlibError::MemError`] if any buffer allocation cannot be
     /// satisfied, mirroring the C `Z_MEM_ERROR` path. Allocation is fallible, so
     /// this constructor never panics on an out-of-memory condition.
+    ///
+    /// # Allocator
+    ///
+    /// This convenience constructor allocates every working buffer through the
+    /// global allocator ([`DefaultAllocator`]). To route the buffers through a
+    /// caller-supplied allocator (the safe analogue of the C `zalloc`/`zfree`
+    /// callbacks), use [`DeflateState::new_in`]; `deflateInit2_` calls
+    /// `new_in` with the [`Allocator`] installed on the `ZStream`.
     pub fn new(
         level: i32,
         method: u8,
@@ -518,6 +531,44 @@ impl DeflateState {
         mem_level: i32,
         strategy: CompressionStrategy,
         wrap: i32,
+    ) -> Result<Self> {
+        Self::new_in(
+            level,
+            method,
+            window_bits,
+            mem_level,
+            strategy,
+            wrap,
+            &DefaultAllocator,
+        )
+    }
+
+    /// Construct a [`DeflateState`], allocating every working buffer through the
+    /// supplied [`Allocator`].
+    ///
+    /// This is the real constructor behind [`DeflateState::new`]; it threads the
+    /// caller-installed allocator (the safe analogue of the C `zalloc`/`zfree`
+    /// callbacks) through the five working-buffer allocations — `window`,
+    /// `prev`, `head`, `pending_buf`, and `sym_buf` — so a custom or
+    /// memory-limiting allocator is genuinely consulted and its failures are
+    /// observable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZlibError::MemError`] if the allocator cannot satisfy any of
+    /// the five buffer requests (the allocator returns `None`), mirroring the C
+    /// `Z_MEM_ERROR` path. The allocator is consulted only at construction; the
+    /// resulting buffers are owned `Vec`s freed by `Drop`, so this constructor
+    /// borrows the allocator rather than storing it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_in(
+        level: i32,
+        method: u8,
+        window_bits: u32,
+        mem_level: i32,
+        strategy: CompressionStrategy,
+        wrap: i32,
+        alloc: &dyn Allocator,
     ) -> Result<Self> {
         // --- Window geometry (deflate.c lines 446-450) ---
         let w_bits = window_bits;
@@ -544,13 +595,23 @@ impl DeflateState {
         let pending_buf_size = lit_bufsize * 4;
         let sym_end = (lit_bufsize - 1) * 3;
 
-        // --- Owned buffers, allocated fallibly (mirrors the C Z_MEM_ERROR
-        //     path; `vec!`-style infallible allocation would abort instead). ---
-        let window = try_alloc(2 * w_size, 0u8)?;
-        let prev = try_alloc(w_size, 0u16)?;
-        let head = try_alloc(hash_size, 0u16)?;
-        let pending_buf = try_alloc(pending_buf_size, 0u8)?;
-        let sym_buf = try_alloc(lit_bufsize * 3, 0u8)?;
+        // --- Owned buffers, allocated through the caller-installed allocator
+        //     (mirrors the C `ZALLOC` calls in `deflateInit2_`). Each request is
+        //     fallible: the allocator returns `None` when it cannot satisfy the
+        //     request — including a memory-limiting custom allocator — which we
+        //     map to `Z_MEM_ERROR` exactly as C does, rather than aborting the
+        //     way an infallible `vec!`/`Vec::resize` would. ---
+        let window = alloc
+            .allocate_bytes(2 * w_size)
+            .ok_or(ZlibError::MemError)?;
+        let prev = alloc.allocate_u16(w_size).ok_or(ZlibError::MemError)?;
+        let head = alloc.allocate_u16(hash_size).ok_or(ZlibError::MemError)?;
+        let pending_buf = alloc
+            .allocate_bytes(pending_buf_size)
+            .ok_or(ZlibError::MemError)?;
+        let sym_buf = alloc
+            .allocate_bytes(lit_bufsize * 3)
+            .ok_or(ZlibError::MemError)?;
 
         // Initial status mirrors `deflateResetKeep` (deflate.c lines 661-666):
         // a gzip wrapper starts in `Gzip`, everything else in `Init`.
@@ -672,16 +733,125 @@ impl DeflateState {
     }
 }
 
-/// Fallibly allocate a `Vec<T>` of `len` elements, each initialized to `fill`.
-///
-/// This is the safe-Rust counterpart of the C `ZALLOC` calls in `deflateInit2_`:
-/// it returns [`ZlibError::MemError`] when the allocation cannot be satisfied
-/// instead of aborting the process the way the infallible `vec!`/`Vec::resize`
-/// path would. `try_reserve_exact` requests exactly `len` capacity up front, so
-/// the subsequent `resize` cannot reallocate and therefore cannot panic.
-fn try_alloc<T: Clone>(len: usize, fill: T) -> Result<Vec<T>> {
-    let mut v: Vec<T> = Vec::new();
-    v.try_reserve_exact(len).map_err(|_| ZlibError::MemError)?;
-    v.resize(len, fill);
-    Ok(v)
+// The former file-local `try_alloc` helper was removed: its fallible
+// `try_reserve_exact` + `resize` logic now lives in the [`Allocator`] trait's
+// default methods (`allocate_bytes`/`allocate_u16`), so every working buffer is
+// obtained through the caller-installed allocator in `new_in`. This keeps the
+// `Z_MEM_ERROR` semantics identical while making custom allocation observable.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::Z_DEFLATED;
+    use core::cell::Cell;
+
+    /// A custom [`Allocator`] that permits exactly `budget` successful
+    /// allocations (of either flavor) and then denies the rest by returning
+    /// `None`. It also counts how many requests it served, so a test can assert
+    /// that every working buffer is genuinely routed through the allocator.
+    struct BudgetAllocator {
+        remaining: Cell<usize>,
+        served: Cell<usize>,
+    }
+
+    impl BudgetAllocator {
+        fn new(budget: usize) -> Self {
+            Self {
+                remaining: Cell::new(budget),
+                served: Cell::new(0),
+            }
+        }
+
+        /// Decrement the budget; `true` if this request is permitted.
+        fn admit(&self) -> bool {
+            self.served.set(self.served.get() + 1);
+            let left = self.remaining.get();
+            if left == 0 {
+                return false;
+            }
+            self.remaining.set(left - 1);
+            true
+        }
+    }
+
+    impl Allocator for BudgetAllocator {
+        fn allocate_bytes(&self, len: usize) -> Option<Vec<u8>> {
+            if self.admit() {
+                DefaultAllocator.allocate_bytes(len)
+            } else {
+                None
+            }
+        }
+
+        fn allocate_u16(&self, len: usize) -> Option<Vec<u16>> {
+            if self.admit() {
+                DefaultAllocator.allocate_u16(len)
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Typical valid initialization parameters (level 6, zlib wrapper).
+    fn try_new_with(alloc: &dyn Allocator) -> Result<DeflateState> {
+        DeflateState::new_in(
+            6,
+            Z_DEFLATED as u8,
+            15,
+            8,
+            CompressionStrategy::Default,
+            1,
+            alloc,
+        )
+    }
+
+    /// `new_in` with the global allocator succeeds and sizes the five working
+    /// buffers exactly as the geometry dictates.
+    #[test]
+    fn new_in_default_allocator_sizes_buffers() {
+        let state = try_new_with(&DefaultAllocator).expect("init should succeed");
+        // window = 2*w_size; w_size = 1<<15.
+        assert_eq!(state.window.len(), 2 * (1 << 15));
+        assert_eq!(state.prev.len(), 1 << 15);
+        // head = hash_size = 1 << (mem_level + 7) = 1 << 15.
+        assert_eq!(state.head.len(), 1 << 15);
+        // pending_buf = lit_bufsize * 4; lit_bufsize = 1 << (mem_level + 6).
+        assert_eq!(state.pending_buf.len(), (1 << 14) * 4);
+        assert_eq!(state.sym_buf.len(), (1 << 14) * 3);
+    }
+
+    /// An allocator that refuses every request makes `new_in` fail with
+    /// `Z_MEM_ERROR` rather than aborting — the C `Z_MEM_ERROR` path, now
+    /// observable through the safe core.
+    #[test]
+    fn new_in_denying_allocator_reports_mem_error() {
+        let alloc = BudgetAllocator::new(0);
+        // `DeflateState` is intentionally neither `Debug` nor `PartialEq`, so
+        // assert on the error variant with `matches!`.
+        assert!(matches!(try_new_with(&alloc), Err(ZlibError::MemError)));
+        // The very first buffer request reached the allocator.
+        assert_eq!(alloc.served.get(), 1);
+    }
+
+    /// Each of the five working buffers is routed through the allocator: a
+    /// budget that runs out partway through initialization fails, and the
+    /// served-request count proves the allocator was consulted for every
+    /// buffer up to the failure point.
+    #[test]
+    fn new_in_routes_every_buffer_through_allocator() {
+        // Budget of 4 permits the first four buffers and denies the fifth
+        // (`sym_buf`), so initialization fails at the last allocation.
+        let alloc = BudgetAllocator::new(4);
+        assert!(matches!(try_new_with(&alloc), Err(ZlibError::MemError)));
+        assert_eq!(
+            alloc.served.get(),
+            5,
+            "all five buffers consult the allocator"
+        );
+
+        // A budget of exactly five succeeds.
+        let alloc = BudgetAllocator::new(5);
+        assert!(try_new_with(&alloc).is_ok());
+        assert_eq!(alloc.served.get(), 5);
+    }
 }

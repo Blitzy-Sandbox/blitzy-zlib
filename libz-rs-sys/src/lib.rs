@@ -99,6 +99,13 @@ use libc::{c_ulong, off_t, size_t};
 extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
+// `Rc` carries the C-allocator adapter into the inflate state (which must stay
+// `Clone` for `inflateCopy`); see `inflateInit2_`. It lives in `std::rc` under
+// `std` and in `alloc::rc` under `no_std`.
+#[cfg(not(feature = "std"))]
+use alloc::rc::Rc;
+#[cfg(feature = "std")]
+use std::rc::Rc;
 
 // Safe-core types consumed by the exports.
 use zlib_rs::{DataType, Flush, GzHeader, ReturnCode, Strategy, ZStream, ZlibError};
@@ -532,6 +539,17 @@ pub unsafe extern "C" fn deflateInit2_(
         None => return Z_STREAM_ERROR,
     };
     let mut state = Box::new(ZStream::new());
+    // Honor caller-installed custom allocation: if the C `z_stream` carries a
+    // non-null `zalloc`, build an adapter that routes the core's buffer
+    // allocations through `zalloc`/`zfree`/`opaque` (and maps a failed
+    // allocation to `Z_MEM_ERROR`). With no custom `zalloc`, the core uses the
+    // global allocator.
+    // SAFETY: `strm` is non-null (checked above); reading the C-ABI
+    // `zalloc`/`zfree`/`opaque` fields is valid per the `z_stream` contract.
+    let (zalloc, zfree, opaque) = unsafe { ((*strm).zalloc, (*strm).zfree, (*strm).opaque) };
+    if let Some(adapter) = translate::CAllocator::from_callbacks(zalloc, zfree, opaque) {
+        state.set_allocator(Box::new(adapter));
+    }
     match zlib_rs::deflate::deflate_init2(&mut state, level, method, windowBits, memLevel, strategy)
     {
         Ok(_) => {
@@ -939,7 +957,17 @@ pub unsafe extern "C" fn inflateInit2_(
     if strm.is_null() {
         return Z_STREAM_ERROR;
     }
-    match zlib_rs::inflate::InflateState::new(windowBits) {
+    // Honor caller-installed custom allocation: a non-null `zalloc` builds an
+    // adapter (shared via `Rc` so the state stays `Clone` for `inflateCopy`)
+    // that routes the lazily-allocated sliding window through
+    // `zalloc`/`zfree`/`opaque`; a window allocation failure then surfaces as
+    // `Z_MEM_ERROR`, exactly like C `updatewindow`.
+    // SAFETY: `strm` is non-null (checked above); reading the C-ABI
+    // `zalloc`/`zfree`/`opaque` fields is valid per the `z_stream` contract.
+    let (zalloc, zfree, opaque) = unsafe { ((*strm).zalloc, (*strm).zfree, (*strm).opaque) };
+    let allocator = translate::CAllocator::from_callbacks(zalloc, zfree, opaque)
+        .map(|adapter| Rc::new(adapter) as Rc<dyn zlib_rs::stream::Allocator>);
+    match zlib_rs::inflate::InflateState::new_in(windowBits, allocator) {
         Ok(inner) => {
             // Capture the post-reset wrap so we can publish the initial adler,
             // mirroring C `inflateInit -> inflateReset: strm->adler = wrap & 1`.
@@ -2701,5 +2729,206 @@ mod tests {
         // SAFETY: `f` is an open handle.
         assert_eq!(unsafe { gzclose(f) }, Z_OK);
         let _ = std::fs::remove_file(&p);
+    }
+
+    // -----------------------------------------------------------------------
+    // Custom allocator (`zalloc`/`zfree`/`opaque`) — end-to-end FFI behavior.
+    //
+    // These tests exercise the C allocation-callback path that the safe core
+    // alone cannot reach. A `MemZone` cookie (the analogue of `infcover.c`'s
+    // `mem_zone`) records outstanding bytes and enforces an optional limit, so
+    // we can prove (a) the caller's `zalloc`/`zfree` are genuinely invoked and
+    // balanced, and (b) a `zalloc` failure (NULL) surfaces as `Z_MEM_ERROR` —
+    // the very behaviors the ported `infcover` mem-zone cases assert.
+    // -----------------------------------------------------------------------
+
+    /// A memory-accounting cookie reached through `z_stream.opaque`, mirroring
+    /// `infcover.c`'s `mem_zone`: it tracks live bytes, enforces an optional
+    /// byte `limit` (`0` = unlimited), and counts successful allocations.
+    struct MemZone {
+        limit: usize,
+        total: usize,
+        allocs: usize,
+        blocks: Vec<(*mut c_void, usize)>,
+    }
+
+    impl MemZone {
+        fn new(limit: usize) -> Self {
+            Self {
+                limit,
+                total: 0,
+                allocs: 0,
+                blocks: Vec::new(),
+            }
+        }
+    }
+
+    /// `alloc_func` honoring the zone's limit, backed by `libc::malloc` so the
+    /// returned block is genuinely caller-owned (freed via `mem_free`).
+    unsafe extern "C" fn mem_alloc(
+        opaque: *mut c_void,
+        items: c_uint,
+        size: c_uint,
+    ) -> *mut c_void {
+        // SAFETY: `opaque` is the `&mut MemZone` we install on the stream.
+        let zone = unsafe { &mut *(opaque as *mut MemZone) };
+        let len = items as usize * size as usize;
+        if zone.limit != 0 && zone.total + len > zone.limit {
+            return ptr::null_mut();
+        }
+        // SAFETY: a positive size is requested from the C allocator.
+        let buf = unsafe { libc::malloc(len.max(1)) };
+        if buf.is_null() {
+            return buf;
+        }
+        zone.total += len;
+        zone.allocs += 1;
+        zone.blocks.push((buf, len));
+        buf
+    }
+
+    /// `free_func` matching [`mem_alloc`]: decrements the live-byte count and
+    /// returns the block to `libc::free`.
+    unsafe extern "C" fn mem_free(opaque: *mut c_void, address: *mut c_void) {
+        // SAFETY: `opaque` is the `&mut MemZone` we install on the stream.
+        let zone = unsafe { &mut *(opaque as *mut MemZone) };
+        if let Some(pos) = zone.blocks.iter().position(|&(p, _)| p == address) {
+            let (_, len) = zone.blocks.remove(pos);
+            zone.total -= len;
+        }
+        // SAFETY: `address` was returned by `mem_alloc`'s `libc::malloc`.
+        unsafe { libc::free(address) };
+    }
+
+    /// The caller's `zalloc`/`zfree` are genuinely invoked by `deflateInit2_`
+    /// and fully balanced by `deflateEnd` (no leak) — proving the custom
+    /// allocation extension point is wired end-to-end, not merely stored.
+    #[test]
+    fn ffi_custom_allocator_is_invoked_and_balanced() {
+        let mut zone = MemZone::new(0); // unlimited
+        let src = b"the quick brown fox jumps over the lazy dog".repeat(8);
+        let mut comp = vec![0u8; 8192];
+        let stream_size = core::mem::size_of::<z_stream>() as c_int;
+
+        let mut strm = z_stream {
+            next_in: src.as_ptr(),
+            avail_in: src.len() as c_uint,
+            next_out: comp.as_mut_ptr(),
+            avail_out: comp.len() as c_uint,
+            zalloc: Some(mem_alloc),
+            zfree: Some(mem_free),
+            opaque: (&mut zone as *mut MemZone).cast(),
+            ..Default::default()
+        };
+
+        // SAFETY: `strm` is fully initialized with valid custom callbacks.
+        let rc = unsafe {
+            deflateInit2_(
+                &mut strm,
+                Z_DEFAULT_COMPRESSION,
+                Z_DEFLATED,
+                15,
+                8,
+                Z_DEFAULT_STRATEGY,
+                zlibVersion(),
+                stream_size,
+            )
+        };
+        assert_eq!(rc, Z_OK);
+        assert!(zone.allocs > 0, "custom zalloc must be invoked at init");
+        assert!(zone.total > 0, "buffers must be outstanding while live");
+
+        // SAFETY: initialized deflate stream.
+        assert_eq!(unsafe { deflate(&mut strm, Z_FINISH) }, Z_STREAM_END);
+        // SAFETY: initialized deflate stream.
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+
+        // Every `zalloc`'d block was returned through `zfree` at teardown.
+        assert_eq!(zone.total, 0, "custom zfree must balance every allocation");
+        assert!(zone.blocks.is_empty(), "no block may leak past deflateEnd");
+    }
+
+    /// A `zalloc` that fails (returns NULL) makes `deflateInit2_` report
+    /// `Z_MEM_ERROR` instead of aborting — the C `Z_MEM_ERROR` init path, now
+    /// honored through the FFI allocator adapter.
+    #[test]
+    fn ffi_deflate_init_failing_allocator_is_mem_error() {
+        let mut zone = MemZone::new(1); // any real allocation exceeds 1 byte
+        let stream_size = core::mem::size_of::<z_stream>() as c_int;
+        let mut strm = z_stream {
+            zalloc: Some(mem_alloc),
+            zfree: Some(mem_free),
+            opaque: (&mut zone as *mut MemZone).cast(),
+            ..Default::default()
+        };
+        // SAFETY: `strm` is valid; the failing allocator forces `Z_MEM_ERROR`.
+        let rc = unsafe {
+            deflateInit2_(
+                &mut strm,
+                Z_DEFAULT_COMPRESSION,
+                Z_DEFLATED,
+                15,
+                8,
+                Z_DEFAULT_STRATEGY,
+                zlibVersion(),
+                stream_size,
+            )
+        };
+        assert_eq!(
+            rc, Z_MEM_ERROR,
+            "failing zalloc at init must be Z_MEM_ERROR"
+        );
+        assert_eq!(
+            zone.total, 0,
+            "no block should remain outstanding on failure"
+        );
+    }
+
+    /// The C `inflate` window-allocation failure path: a raw stream whose
+    /// decode forces a sliding-window allocation, driven with a `zalloc` that
+    /// fails, must return `Z_MEM_ERROR`. This is the FFI realization of the
+    /// `infcover` mem-zone case that the safe-core port documents as exercised
+    /// here (it cannot fail through the global allocator).
+    #[test]
+    fn ffi_inflate_window_alloc_failure_is_mem_error() {
+        // The `infcover.c` "force window allocation" fixture: a 1-byte raw
+        // DEFLATE output that must be saved into the window.
+        let input = [0x63u8, 0x00u8];
+        let mut out = [0u8; 1];
+        let mut zone = MemZone::new(1); // refuse the window allocation
+        let stream_size = core::mem::size_of::<z_stream>() as c_int;
+
+        let mut strm = z_stream {
+            next_in: input.as_ptr(),
+            avail_in: input.len() as c_uint,
+            next_out: out.as_mut_ptr(),
+            avail_out: out.len() as c_uint,
+            zalloc: Some(mem_alloc),
+            zfree: Some(mem_free),
+            opaque: (&mut zone as *mut MemZone).cast(),
+            ..Default::default()
+        };
+
+        // Raw inflate (windowBits = -15). Init does not allocate the window
+        // (it is lazy), so it succeeds even under the 1-byte limit.
+        // SAFETY: `strm` is valid; raw windowBits with a failing allocator.
+        let rc = unsafe { inflateInit2_(&mut strm, -15, zlibVersion(), stream_size) };
+        assert_eq!(rc, Z_OK, "inflateInit2_ does not allocate the window");
+
+        // The decode produces output that must be windowed; the window
+        // allocation is refused, so inflate reports Z_MEM_ERROR.
+        // SAFETY: initialized inflate stream.
+        let rc = unsafe { inflate(&mut strm, Z_NO_FLUSH) };
+        assert_eq!(
+            rc, Z_MEM_ERROR,
+            "refused window allocation must be Z_MEM_ERROR"
+        );
+
+        // SAFETY: initialized inflate stream; teardown frees any live blocks.
+        let _ = unsafe { inflateEnd(&mut strm) };
+        assert_eq!(
+            zone.total, 0,
+            "no block should remain outstanding on failure"
+        );
     }
 }

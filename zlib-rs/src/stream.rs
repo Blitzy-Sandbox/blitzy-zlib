@@ -78,28 +78,68 @@ use crate::inflate::state::InflateState;
 /// extension point only** — it is what idiomatic Rust callers and the shim's
 /// safe adapter use to influence how the core obtains scratch memory.
 ///
-/// Both methods have default implementations backed by the global allocator,
-/// so the common case ([`DefaultAllocator`]) needs no code at all.
+/// All methods have default implementations backed by the global allocator
+/// (through the *fallible* [`Vec::try_reserve_exact`]), so the common case
+/// ([`DefaultAllocator`]) needs no code at all.
+///
+/// # Fallible allocation
+///
+/// Allocation is **fallible**: the `allocate_*` methods return `None` when the
+/// request cannot be satisfied, mirroring the C `Z_MEM_ERROR` path. The engine
+/// threads this through `deflateInit`/`inflate`/`inflateSetDictionary` and
+/// surfaces a `None` as [`ReturnCode`]'s `Z_MEM_ERROR` rather than aborting the
+/// process the way an infallible `vec!`/`Vec::resize` would. This is what makes
+/// a memory-limiting custom allocator (and the ported `infcover` mem-zone
+/// allocation-failure cases) observable through the safe core.
 pub trait Allocator {
-    /// Allocate a zero-initialized byte buffer of exactly `len` bytes.
+    /// Allocate a zero-initialized byte buffer of exactly `len` bytes, or
+    /// `None` if the allocation cannot be satisfied.
     ///
-    /// The default implementation returns a freshly allocated, zeroed
-    /// [`Vec<u8>`]. Zeroing is a safe superset of the C `zcalloc` behavior
-    /// (which uses `malloc` and does not zero): callers that relied on
-    /// uninitialized memory still observe valid, in-bounds bytes.
+    /// The default implementation requests exactly `len` bytes up front with
+    /// [`Vec::try_reserve_exact`] (so the subsequent fill cannot reallocate)
+    /// and returns `None` on failure instead of aborting. Zeroing is a safe
+    /// superset of the C `zcalloc` behavior (which uses `malloc` and does not
+    /// zero): callers that relied on uninitialized memory still observe valid,
+    /// in-bounds bytes.
     #[must_use]
-    fn alloc_bytes(&self, len: usize) -> Vec<u8> {
-        alloc::vec![0u8; len]
+    fn allocate_bytes(&self, len: usize) -> Option<Vec<u8>> {
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(len).ok()?;
+        buffer.resize(len, 0u8);
+        Some(buffer)
     }
 
-    /// Release a buffer previously produced by [`alloc_bytes`](Allocator::alloc_bytes).
+    /// Allocate a zero-initialized `u16` buffer of exactly `len` elements, or
+    /// `None` if the allocation cannot be satisfied.
+    ///
+    /// This mirrors [`allocate_bytes`](Allocator::allocate_bytes) for the
+    /// `Pos`-typed tables the deflate engine sizes in 16-bit elements (the
+    /// `prev` and `head` hash chains), keeping the same fallible contract.
+    #[must_use]
+    fn allocate_u16(&self, len: usize) -> Option<Vec<u16>> {
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(len).ok()?;
+        buffer.resize(len, 0u16);
+        Some(buffer)
+    }
+
+    /// Release a byte buffer previously produced by
+    /// [`allocate_bytes`](Allocator::allocate_bytes).
     ///
     /// Taking the buffer *by value* is the safe analogue of passing an address
     /// to the C `zfree` callback: ownership transfers in, and the default
     /// implementation drops it, letting Rust free the backing storage. A
     /// custom allocator that pools memory can override this to recycle the
     /// buffer instead.
-    fn free_bytes(&self, buffer: Vec<u8>) {
+    fn deallocate_bytes(&self, buffer: Vec<u8>) {
+        drop(buffer);
+    }
+
+    /// Release a `u16` buffer previously produced by
+    /// [`allocate_u16`](Allocator::allocate_u16).
+    ///
+    /// The `u16` analogue of [`deallocate_bytes`](Allocator::deallocate_bytes).
+    fn deallocate_u16(&self, buffer: Vec<u16>) {
         drop(buffer);
     }
 }
@@ -590,16 +630,32 @@ mod tests {
     }
 
     /// The default allocator vends zero-initialized buffers of the requested
-    /// length, and accepts them back.
+    /// length (both byte and `u16` flavors), and accepts them back.
     #[test]
     fn default_allocator_vends_zeroed_buffers() {
         let allocator = DefaultAllocator;
-        let buffer = allocator.alloc_bytes(8);
+        let buffer = allocator
+            .allocate_bytes(8)
+            .expect("8-byte allocation should succeed");
         assert_eq!(buffer.len(), 8);
         assert!(buffer.iter().all(|&b| b == 0));
         // Zero-length allocation is valid and yields an empty buffer.
-        assert_eq!(allocator.alloc_bytes(0).len(), 0);
-        allocator.free_bytes(buffer);
+        assert_eq!(
+            allocator
+                .allocate_bytes(0)
+                .expect("zero-length allocation should succeed")
+                .len(),
+            0
+        );
+        allocator.deallocate_bytes(buffer);
+
+        // The `u16` flavor used by the deflate hash tables behaves identically.
+        let words = allocator
+            .allocate_u16(4)
+            .expect("4-element u16 allocation should succeed");
+        assert_eq!(words.len(), 4);
+        assert!(words.iter().all(|&w| w == 0));
+        allocator.deallocate_u16(words);
     }
 
     /// A custom allocator handle round-trips through the stream and is usable.
@@ -609,9 +665,39 @@ mod tests {
         assert!(z.allocator().is_none());
         z.set_allocator(Box::new(DefaultAllocator));
         let allocator = z.allocator().expect("allocator should be installed");
-        let buffer = allocator.alloc_bytes(4);
+        let buffer = allocator
+            .allocate_bytes(4)
+            .expect("4-byte allocation should succeed");
         assert_eq!(buffer.len(), 4);
         assert!(buffer.iter().all(|&b| b == 0));
+    }
+
+    /// A custom allocator that refuses every request causes the fallible
+    /// `allocate_*` methods to return `None` — the hook the engine maps to
+    /// `Z_MEM_ERROR`. This proves the extension point can *observe and inject*
+    /// allocation failure, not merely round-trip a handle.
+    #[test]
+    fn failing_allocator_reports_none() {
+        /// An [`Allocator`] that denies every allocation request.
+        struct DenyingAllocator;
+        impl Allocator for DenyingAllocator {
+            fn allocate_bytes(&self, _len: usize) -> Option<Vec<u8>> {
+                None
+            }
+            fn allocate_u16(&self, _len: usize) -> Option<Vec<u16>> {
+                None
+            }
+        }
+
+        let allocator = DenyingAllocator;
+        assert!(allocator.allocate_bytes(8).is_none());
+        assert!(allocator.allocate_u16(8).is_none());
+
+        // It installs and round-trips through the stream like any other handle.
+        let mut z = ZStream::new();
+        z.set_allocator(Box::new(DenyingAllocator));
+        let installed = z.allocator().expect("allocator should be installed");
+        assert!(installed.allocate_bytes(1).is_none());
     }
 
     /// The typed `data_type` accessor maps raw values and rejects out-of-range.

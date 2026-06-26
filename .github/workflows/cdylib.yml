@@ -17,19 +17,24 @@
 #      `[lib] name = "z"` and `crate-type = ["cdylib", "staticlib"]`, which emits
 #      the conventional `libz.so` (cdylib) and `libz.a` (staticlib) drop-ins.
 #   2. Asserts both artifacts are present under `target/release/`.
-#   3. Builds `libz-rs-sys` (release) so its `build.rs` runs `cbindgen` and
-#      (re)generates the C header `libz-rs-sys/include/zlib.h`.
-#   4. Asserts the generated header exists and exports a representative set of
-#      the public zlib symbols, then surfaces an INFORMATIONAL diff against the
-#      canonical root `zlib.h` (never fails on cosmetic differences).
+#   3. Rebuilds `libz-rs-sys` with the variadic `gzprintf` export enabled
+#      (`--features c-variadic`) so its `build.rs` runs `cbindgen` and
+#      (re)generates the FULL 73-symbol C header `libz-rs-sys/include/zlib.h`.
+#   4. Proves C-ABI parity as a HARD gate: with `LIBZ_RS_SYS_STRICT_HEADER=1`
+#      (set at the job level) build.rs PANICS — failing CI — on ANY signature
+#      drift vs canonical zlib.h (a missing symbol, an argument-arity mismatch,
+#      or a `#[repr(C)]` struct-layout change), across all 73 symbols. An
+#      informational full diff is uploaded as an artifact for human inspection.
 #
-# Why the header check is symbol-presence, not byte-equality
-# ----------------------------------------------------------
+# Why the gate is signature/arity/struct parity, not a byte diff
+# --------------------------------------------------------------
 # `cbindgen` output is intentionally NOT byte-identical to the hand-written
-# canonical `zlib.h` (comment, ordering and formatting differences are expected).
-# The meaningful gate is therefore "header generated + every key symbol present";
-# the `diff` is kept purely informational so the workflow never flaps on
-# cosmetic churn.
+# canonical `zlib.h` (comment, ordering and formatting differences are expected),
+# so a raw byte diff would flap on cosmetic churn. The authoritative gate is
+# therefore build.rs's strict check: every one of the 73 expected symbols must be
+# present with matching argument arity, and the `#[repr(C)]` structs must match
+# canonical field layout. Drift FAILS the build; the uploaded `diff` is purely
+# informational.
 #
 # Sibling workflows (kept deliberately separate)
 # ----------------------------------------------
@@ -50,16 +55,28 @@ jobs:
   cdylib:
     name: cdylib drop-in & header parity
     runs-on: ubuntu-latest
+    # Promote C-ABI header/signature parity to a HARD gate: libz-rs-sys/build.rs
+    # PANICS on any drift vs canonical zlib.h (missing symbol / arity mismatch /
+    # repr(C) layout change) instead of merely warning. This is the authoritative
+    # full-73-symbol parity check for the drop-in.
+    env:
+      LIBZ_RS_SYS_STRICT_HEADER: "1"
     steps:
       # 1. Check out the repository at the commit that triggered the run.
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # 2. Install the Rust toolchain. The repository's rust-toolchain.toml pins
-      #    the channel the build actually requires, so cargo invocations below
-      #    resolve to it automatically.
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # 2. Install the workspace-pinned NIGHTLY toolchain (matching
+      #    rust-toolchain.toml). Nightly is REQUIRED here: the cdylib drop-in
+      #    enables the `c-variadic` feature for the variadic `gzprintf` export,
+      #    whose definition needs the unstable `#![feature(c_variadic)]`.
+      #    Installing nightly explicitly makes the CI toolchain match the one
+      #    cargo resolves from rust-toolchain.toml, instead of installing stable
+      #    and silently relying on the file to switch channels.
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
 
       # 3. Cache the Cargo registry, git sources and the target directory so
       #    repeat runs reuse previously built dependencies and artifacts.
@@ -79,21 +96,30 @@ jobs:
           test -f target/release/libz.so || { echo "::error::libz.so (cdylib) not emitted"; ls target/release/*.so || true; exit 1; }
           test -f target/release/libz.a || { echo "::error::libz.a (staticlib) not emitted"; ls target/release/*.a || true; exit 1; }
 
-      # 6. Build the shim on its own so its build.rs runs cbindgen and
-      #    (re)generates the C header at libz-rs-sys/include/zlib.h.
-      - name: Regenerate the C-ABI header via cbindgen
-        run: cargo build -p libz-rs-sys --release
+      # 6. Prove FULL C-ABI header/signature parity as a HARD gate. Force
+      #    build.rs to re-run (touch) so cbindgen regenerates the header and the
+      #    strict parity check executes deterministically rather than from cache.
+      #    `--features c-variadic` makes the generated header carry the full
+      #    73-symbol surface (including the variadic `gzprintf`). With the
+      #    job-level LIBZ_RS_SYS_STRICT_HEADER=1, build.rs PANICS — failing CI —
+      #    on ANY drift vs canonical zlib.h: a missing symbol, an argument-arity
+      #    mismatch, or a `#[repr(C)]` struct field-layout change. This replaces
+      #    the former representative 10-symbol grep with the complete check that
+      #    build.rs already implements over all 73 EXPECTED_SYMBOLS + the
+      #    repr(C) structs.
+      - name: Prove full C-ABI header/signature parity (hard gate)
+        run: |
+          touch libz-rs-sys/build.rs
+          cargo build -p libz-rs-sys --features c-variadic --release
 
-      # 7. Verify the generated header and prove C-ABI parity. The existence
-      #    check and the symbol greps are hard gates; the diff against the
-      #    canonical root zlib.h is INFORMATIONAL only (cosmetic differences are
-      #    expected, so it must never fail the build).
-      - name: Verify generated header and prove C-ABI parity
+      # 7. Sanity-check the regenerated header exists and capture a COMPLETE diff
+      #    against canonical zlib.h for human inspection. This diff is purely
+      #    INFORMATIONAL (cbindgen has its own house style, so cosmetic
+      #    differences are expected); the authoritative gate is step 6 above, so
+      #    the `|| true` here keeps the informational capture from ever failing CI.
+      - name: Capture informational header diff
         run: |
           test -f libz-rs-sys/include/zlib.h || { echo "::error::cbindgen header not generated"; exit 1; }
-          for sym in deflate inflate deflateInit_ inflateInit_ compress uncompress crc32 adler32 gzopen zlibVersion; do
-            grep -q "$sym" libz-rs-sys/include/zlib.h || { echo "::error::symbol $sym missing from generated header"; exit 1; }
-          done
           echo "Informational header parity diff (generated header vs canonical zlib.h):"
           diff -u zlib.h libz-rs-sys/include/zlib.h | tee header-parity.diff || true
 

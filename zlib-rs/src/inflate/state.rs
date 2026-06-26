@@ -66,6 +66,7 @@
 //! bit-exact with C zlib either way; only peak throughput differs.
 
 use alloc::boxed::Box;
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 
 use crate::checksum::adler32;
@@ -76,6 +77,7 @@ use crate::error::{Result, ReturnCode, ZlibError};
 use crate::inflate::fast::inflate_fast;
 use crate::inflate::fixed::{DISTFIX, LENFIX};
 use crate::inflate::tables::{Code, CodeType, ENOUGH, inflate_table};
+use crate::stream::Allocator;
 
 #[cfg(feature = "gzip")]
 use crate::gz_header::GzHeader;
@@ -329,6 +331,19 @@ pub struct InflateState {
     pub back: i32,
     /// Initial length of the current match (C `state->was`).
     pub was: u32,
+
+    // ---- custom allocation extension point ---------------------------------
+    /// Optional caller-installed [`Allocator`] used to obtain the sliding
+    /// [`window`](Self::window) (the only heap buffer `inflate` allocates,
+    /// lazily, in [`update_window`](Self::update_window)). `None` selects the
+    /// global allocator via a fallible `try_reserve_exact`.
+    ///
+    /// This is the safe-core analogue of the C `zalloc`/`zfree` callbacks: a
+    /// memory-limiting or pooling allocator is genuinely consulted, and its
+    /// failure surfaces as `Z_MEM_ERROR` (the C `updatewindow` failure path).
+    /// An [`Rc`] is used (rather than [`Box`]) so the state stays [`Clone`] for
+    /// `inflateCopy` — the clone shares the same allocator handle.
+    pub(crate) allocator: Option<Rc<dyn Allocator>>,
 }
 
 impl Default for InflateState {
@@ -377,6 +392,7 @@ impl Default for InflateState {
             sane: true,
             back: -1,
             was: 0,
+            allocator: None,
         }
     }
 }
@@ -423,6 +439,26 @@ impl InflateState {
     /// ([`DEF_WBITS`] == 15, a 32 KiB zlib window).
     pub fn new_default() -> Result<Box<InflateState>> {
         Self::new(DEF_WBITS)
+    }
+
+    /// Like [`InflateState::new`], but installs a caller-supplied
+    /// [`Allocator`] used for the lazily-allocated sliding window.
+    ///
+    /// This is the safe-core analogue of `inflateInit2_` with custom
+    /// `zalloc`/`zfree` callbacks: the FFI shim (`libz-rs-sys`) builds an
+    /// allocator that forwards to the C callbacks and passes it here, so a
+    /// memory-limiting or pooling allocator is genuinely consulted when the
+    /// window is allocated, and an allocation failure surfaces as
+    /// `Z_MEM_ERROR`. Passing `None` is equivalent to [`InflateState::new`]
+    /// (the global allocator). The allocator handle is shared (cloned) by
+    /// `inflateCopy`.
+    pub fn new_in(
+        window_bits: i32,
+        allocator: Option<Rc<dyn Allocator>>,
+    ) -> Result<Box<InflateState>> {
+        let mut state = Self::new(window_bits)?;
+        state.allocator = allocator;
+        Ok(state)
     }
 
     /// Port of C `inflateResetKeep` (inflate.c L120 region / the
@@ -596,14 +632,33 @@ impl InflateState {
     /// output position, i.e. the tail of `buf` — into the circular sliding
     /// window, lazily allocating the window on first use.
     ///
-    /// Unlike C, this cannot fail with an allocation error: the owned
-    /// `Vec<u8>` window either succeeds or the global allocator aborts, so
-    /// there is no `Z_MEM_ERROR` return path here (the C alloc-failure branch
-    /// is unreachable under safe-Rust ownership).
-    fn update_window(&mut self, buf: &[u8], copy: usize) {
-        // Lazily allocate the window, sized exactly `1 << wbits`, on first use.
+    /// # Errors
+    ///
+    /// Returns `Err(())` if the sliding window cannot be allocated, faithfully
+    /// reproducing the C `updatewindow` allocation-failure path (`state->mode =
+    /// MEM; return Z_MEM_ERROR`). The window is obtained through the
+    /// caller-installed [`Allocator`] when one is present (so a memory-limiting
+    /// or pooling custom allocator is genuinely consulted), and otherwise
+    /// through the global allocator via the fallible [`Vec::try_reserve_exact`]
+    /// — so a true out-of-memory condition surfaces as `Z_MEM_ERROR` rather
+    /// than aborting the process. Each caller maps `Err(())` to
+    /// [`InflateMode::Mem`] and [`ZlibError::MemError`].
+    fn update_window(&mut self, buf: &[u8], copy: usize) -> core::result::Result<(), ()> {
+        // Lazily allocate the window, sized exactly `1 << wbits`, on first use,
+        // through the installed allocator (or the global allocator). A failed
+        // allocation is reported to the caller, which raises `Z_MEM_ERROR`.
         if self.window.is_empty() {
-            self.window.resize(1usize << self.wbits, 0);
+            let wsize = 1usize << self.wbits;
+            let window = match &self.allocator {
+                Some(allocator) => allocator.allocate_bytes(wsize).ok_or(())?,
+                None => {
+                    let mut window = Vec::new();
+                    window.try_reserve_exact(wsize).map_err(|_| ())?;
+                    window.resize(wsize, 0);
+                    window
+                }
+            };
+            self.window = window;
         }
         // First call after (re)initialization: record window geometry.
         if self.wsize == 0 {
@@ -649,6 +704,8 @@ impl InflateState {
                 }
             }
         }
+
+        Ok(())
     }
 }
 
@@ -1690,13 +1747,23 @@ impl InflateState {
         self.bits = bits;
 
         // Update the sliding window with the output produced since the marker.
+        // The guard is C `updatewindow`'s call condition (a window already
+        // exists, or there is fresh output to capture in a non-terminal mode);
+        // the `&&` short-circuits so `update_window` is invoked only when that
+        // guard holds, exactly as in C. C `updatewindow` can fail to allocate
+        // the window, in which case it sets `state->mode = MEM` and returns
+        // `Z_MEM_ERROR`; we reproduce that by transitioning to `Mem` and
+        // overriding the return code with `Z_MEM_ERROR` (the `BUF_ERROR` check
+        // below only fires when `ret == Ok`, so it never masks this).
         let copy = out_mark - left;
-        if self.wsize != 0
+        if (self.wsize != 0
             || (copy != 0
                 && self.mode < InflateMode::Bad
-                && (self.mode < InflateMode::Check || flush != Flush::Finish))
+                && (self.mode < InflateMode::Check || flush != Flush::Finish)))
+            && self.update_window(&output[..put], copy).is_err()
         {
-            self.update_window(&output[..put], copy);
+            self.mode = InflateMode::Mem;
+            ret = Err(ZlibError::MemError);
         }
 
         // Account consumed input and produced output (matching C exactly).
@@ -1830,8 +1897,13 @@ impl InflateState {
         }
         // Load the dictionary into the window (lazily allocating it). The last
         // `dictionary.len()` bytes ending at the dictionary's end are copied,
-        // i.e. the entire dictionary.
-        self.update_window(dictionary, dictionary.len());
+        // i.e. the entire dictionary. A window allocation failure here is the C
+        // `inflateSetDictionary` -> `updatewindow` -> `Z_MEM_ERROR` path: set
+        // `mode = MEM` and return `Z_MEM_ERROR`.
+        if self.update_window(dictionary, dictionary.len()).is_err() {
+            self.mode = InflateMode::Mem;
+            return Err(ZlibError::MemError);
+        }
         self.havedict = true;
         Ok(ReturnCode::Ok)
     }

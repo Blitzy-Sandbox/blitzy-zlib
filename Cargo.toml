@@ -97,6 +97,11 @@ cbindgen = "=0.29.4" # Emits a zlib.h-compatible header to prove ABI parity.
 # Dev / validation — never shipped.
 criterion = "=0.5.1"  # Statistical deflate / inflate / checksum benchmarks.
 flate2 = "=1.1.9"     # C-zlib interop ORACLE for byte-for-byte validation.
+# Low-level C-zlib bindings: the byte-for-byte oracle in `interop_oracle.rs`
+# uses `deflateInit2_` to set the EXACT (level, strategy, windowBits) tuple —
+# `flate2`'s high-level API cannot select a strategy. Already present in the
+# lockfile transitively (via `flate2`'s `zlib` backend); pinned exactly here.
+libz-sys = "=1.1.29"  # Raw C-zlib FFI for the strategy/windowBits oracle (dev).
 quickcheck = "=1.1.0" # Property-based round-trip testing.
 # `rand` is pinned to 0.9.4 (not the AAP's originally-drafted 0.9.2): 0.9.2 has
 # an outstanding RustSec/OSV advisory, whereas 0.9.4 is advisory-clean and is

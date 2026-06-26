@@ -31,11 +31,22 @@ on: [push, pull_request]
 jobs:
   # ---------------------------------------------------------------------------
   # Primary gate: build (debug + release) and run the full test suite on each of
-  # the three supported host operating systems using the stable toolchain.
+  # the three supported host operating systems using the workspace-pinned NIGHTLY
+  # toolchain (rust-toolchain.toml). Nightly is REQUIRED for the default workspace
+  # build because the `libz-rs-sys-cdylib` drop-in enables the `c-variadic`
+  # feature for the variadic `gzprintf` export, whose definition needs the
+  # unstable `#![feature(c_variadic)]`. Installing nightly here makes the CI
+  # toolchain match the one cargo actually resolves to from rust-toolchain.toml.
   # ---------------------------------------------------------------------------
   build:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Promote C-ABI header/signature parity to a HARD gate. The workspace build
+    # compiles the cdylib drop-in (c-variadic on), so cbindgen emits all 73
+    # symbols and libz-rs-sys/build.rs PANICS on any drift vs canonical zlib.h
+    # instead of merely warning (LIBZ_RS_SYS_STRICT_HEADER). See build.rs.
+    env:
+      LIBZ_RS_SYS_STRICT_HEADER: "1"
     strategy:
       # A failure on one operating system must not cancel the others; we want
       # the complete cross-OS signal on every run.
@@ -46,8 +57,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (nightly — matches rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
 
       - name: Cache Cargo registry and target directory
         uses: Swatinem/rust-cache@v2
@@ -62,15 +75,26 @@ jobs:
         run: cargo test --workspace --verbose
 
   # ---------------------------------------------------------------------------
-  # Minimum-Supported-Rust-Version gate. Build-only on purpose: `cargo build`
-  # does not pull the dev-dependencies (criterion / flate2 / quickcheck / rand)
-  # whose own minimum versions can exceed 1.85, so this isolates the *library*
-  # MSRV guarantee from dev-tool requirements. Running the test suite here would
-  # defeat that isolation, hence there is no `cargo test` step below.
+  # Minimum-Supported-Rust-Version gate (stable 1.85). Build-only on purpose:
+  # `cargo build` does not pull the dev-dependencies (criterion / flate2 /
+  # quickcheck / rand) whose own minimum versions can exceed 1.85, so this
+  # isolates the *library* MSRV guarantee from dev-tool requirements. Running the
+  # test suite here would defeat that isolation, hence there is no `cargo test`
+  # step below.
+  #
+  # Scope: only the members that compile on a STABLE toolchain — the `zlib-rs`
+  # core and the 72-symbol `libz-rs-sys` shim (`c-variadic` is OFF by default).
+  # The full 73-symbol drop-in (the cdylib's c-variadic `gzprintf`) needs the
+  # unstable `#![feature(c_variadic)]` and is therefore covered by the nightly
+  # `build` job above, not here. Because rust-toolchain.toml pins nightly, this
+  # job sets RUSTUP_TOOLCHAIN=1.85.0 (which takes precedence over the
+  # rust-toolchain.toml channel) so the gate genuinely runs on 1.85.0.
   # ---------------------------------------------------------------------------
   msrv:
-    name: MSRV (1.85)
+    name: MSRV (1.85, stable core + 72-symbol shim)
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.85.0"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -83,5 +107,8 @@ jobs:
       - name: Cache Cargo registry and target directory
         uses: Swatinem/rust-cache@v2
 
-      - name: Build workspace (MSRV verification)
-        run: cargo build --workspace --verbose
+      - name: Build stable core (zlib-rs)
+        run: cargo build -p zlib-rs --verbose
+
+      - name: Build 72-symbol FFI shim (libz-rs-sys, c-variadic off)
+        run: cargo build -p libz-rs-sys --verbose

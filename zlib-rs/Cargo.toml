@@ -108,8 +108,20 @@ criterion = { workspace = true }
 # `default-features = false` drops the `miniz_oxide` default and `features =
 # ["zlib"]` routes `flate2` through `libz-sys` to the system zlib — exactly the
 # canonical implementation the port must match (see the `REQUIRES:` note atop
-# `tests/interop.rs`). Version is pinned to the workspace value `=1.1.9`.
-flate2 = { version = "1.1.9", default-features = false, features = ["zlib"] }
+# `tests/interop.rs`). The version uses an EXPLICIT exact pin `=1.1.9` (matching
+# the `workspace.dependencies` pin): a bare `version = "1.1.9"` would resolve as
+# caret `^1.1.9` and drift off the pin. (`workspace = true` cannot be combined
+# with the local `default-features = false` override here, because the workspace
+# entry leaves `default-features` at its default of `true`, so the exact pin is
+# repeated explicitly instead.)
+flate2 = { version = "=1.1.9", default-features = false, features = ["zlib"] }
+# Low-level C-zlib FFI for the strategy/windowBits byte-for-byte oracle
+# (`tests/interop_oracle.rs`). `flate2`'s high-level API cannot select a deflate
+# strategy, so the oracle calls `deflateInit2_` directly to set the exact
+# (level, strategy, windowBits) tuple. Already in the lockfile transitively via
+# `flate2`'s `zlib` backend; the exact `=1.1.29` pin is inherited from the
+# workspace.
+libz-sys = { workspace = true }
 # Property-based round-trip testing (`tests/round_trip.rs`).
 quickcheck = { workspace = true }
 # Random data generation for tests/benches.

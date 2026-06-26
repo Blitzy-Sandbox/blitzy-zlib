@@ -18,10 +18,15 @@
 #       targets are guaranteed to keep building while the slow, statistically
 #       noisy timing runs stay out of CI.
 #
-# Clippy and rustfmt deliberately run on the STABLE toolchain only: lint sets and
-# formatting rules track stable, so pinning a single channel avoids the spurious
-# failures that beta/nightly would introduce. Minimum-supported-Rust-version
-# build verification is handled separately in the build workflow, not here.
+# Clippy, rustfmt and the bench-compile gate run on the workspace-pinned NIGHTLY
+# toolchain (rust-toolchain.toml). Nightly is REQUIRED because these gates touch
+# the WHOLE workspace: `cargo clippy --all-targets` and `cargo bench --no-run`
+# both build the `libz-rs-sys-cdylib` drop-in, which enables the `c-variadic`
+# feature (the variadic `gzprintf` export) whose definition needs the unstable
+# `#![feature(c_variadic)]`. Installing nightly here makes the lint toolchain
+# match the one cargo resolves from rust-toolchain.toml, so these gates validate
+# the SAME surface the default build ships. Minimum-supported-Rust-version build
+# verification is handled separately in the build workflow, not here.
 
 name: Lint
 
@@ -39,14 +44,22 @@ jobs:
   lint:
     name: Format, Clippy & Bench-Compile
     runs-on: ubuntu-latest
+    # The clippy and bench-compile gates build the cdylib drop-in (c-variadic on),
+    # so cbindgen emits all 73 symbols; enforce C-ABI header/signature parity as a
+    # HARD gate via libz-rs-sys/build.rs, which panics on any drift vs canonical
+    # zlib.h instead of merely warning (LIBZ_RS_SYS_STRICT_HEADER). See build.rs.
+    env:
+      LIBZ_RS_SYS_STRICT_HEADER: "1"
     steps:
       # 1. Check out the repository at the commit that triggered the run.
       - uses: actions/checkout@v4
 
-      # 2. Install the stable Rust toolchain together with the two components the
-      #    gates below require: rustfmt (for the format check) and clippy (for
-      #    the lint pass). Both components are mandatory.
-      - uses: dtolnay/rust-toolchain@stable
+      # 2. Install the workspace-pinned NIGHTLY toolchain (matching
+      #    rust-toolchain.toml) together with the two components the gates below
+      #    require: rustfmt (for the format check) and clippy (for the lint pass).
+      #    Both components are mandatory. Nightly is required because the gates
+      #    build the whole workspace, including the c-variadic cdylib drop-in.
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt, clippy
 

@@ -97,7 +97,7 @@ use crate::constants::{
 };
 use crate::error::{Result, ReturnCode, ZlibError};
 use crate::gz_header::GzHeader;
-use crate::stream::ZStream;
+use crate::stream::{Allocator, DefaultAllocator, ZStream};
 
 // `DeflateState` and `DeflateStatus` are brought into this module's scope by the
 // `pub use` re-export just below (a `pub use` is also a `use`), so they are not
@@ -1224,15 +1224,25 @@ pub fn deflate_init2(
         window_bits = 9;
     }
 
-    // Allocate the owned compressor state (fallibly — the C `Z_MEM_ERROR` path).
-    let state = DeflateState::new(
-        level,
-        method as u8,
-        window_bits as u32,
-        mem_level,
-        strategy,
-        wrap,
-    )?;
+    // Allocate the owned compressor state (fallibly — the C `Z_MEM_ERROR`
+    // path), routing every working buffer through the caller-installed
+    // allocator (the safe analogue of the C `zalloc`/`zfree` hooks) when one is
+    // present, and otherwise through the global allocator. The immutable borrow
+    // of `strm` for `allocator()` is confined to this block so it ends before
+    // the mutable `set_deflate_state` call below.
+    let state = {
+        let default_allocator = DefaultAllocator;
+        let allocator: &dyn Allocator = strm.allocator().unwrap_or(&default_allocator);
+        DeflateState::new_in(
+            level,
+            method as u8,
+            window_bits as u32,
+            mem_level,
+            strategy,
+            wrap,
+            allocator,
+        )?
+    };
     strm.set_deflate_state(Box::new(state));
 
     // C `deflateReset` finishes initialization: reset counters, status, the

@@ -54,11 +54,11 @@ Once published, the crates.io form is:
 
 ```toml
 [dependencies]
-zlib-rs = "0.1"
+zlib-rs = "1.3.2"
 ```
 
-The crate ports the zlib `1.3.2.1` algorithms; the `0.1` line tracks the Rust
-port's own version, independent of the upstream C release number.
+The crate version `1.3.2` mirrors the upstream zlib release line whose algorithms
+it ports; the runtime `zlibVersion()` string reports the fuller `1.3.2.1-motley`.
 
 ## Usage
 
@@ -122,21 +122,22 @@ assert_eq!(whole, streamed);
 ## Feature flags
 
 The crate's compile-time configurability mirrors C zlib's. The default build
-enables `std` and `simd`; all other features are opt-in.
+enables `std`, `gzip`, `gz-io`, and `simd` (a typical native zlib build); only
+`no-std` (an alias for disabling `std`) is opt-in.
 
 | Feature  | Default | Description |
 |----------|:-------:|-------------|
 | `std`    |   yes   | Standard-library support: the `gz*` file-I/O layer, the `std::error::Error` impl, and `crc32fast`'s runtime SIMD detection. With `std` **off**, the crate is `#![no_std]` (`core` + `alloc` only). |
 | `simd`   |   yes   | Hardware-accelerated CRC-32 via the [`crc32fast`](https://crates.io/crates/crc32fast) crate. Disable it (for example with `--no-default-features`) to select the always-correct scalar table fallback. |
-| `gzip`   |    no   | gzip **container** support in `deflate` / `inflate` (mirrors the C `GZIP` define). |
-| `gz-io`  |    no   | gzip **file I/O** (`gzopen` / `gzread` / `gzwrite` / …); implies `std` + `gzip`. |
+| `gzip`   |   yes   | gzip **container** support in `deflate` / `inflate` (mirrors the C `GZIP` define). |
+| `gz-io`  |   yes   | gzip **file I/O** (`gzopen` / `gzread` / `gzwrite` / …); implies `std` + `gzip`. |
 | `no-std` |    no   | Explicit marker mirroring the C `Z_SOLO` build (compression / decompression / checksums only). For a true `no_std` build, use `--no-default-features` — the `no-std` feature is a discoverability alias, since the actual switch is the **absence** of `std`. |
 
 For example, a minimal `no_std` build with the scalar CRC path:
 
 ```toml
 [dependencies]
-zlib-rs = { version = "0.1", default-features = false }
+zlib-rs = { version = "1.3.2", default-features = false }
 ```
 
 ## Building, testing, and benchmarking

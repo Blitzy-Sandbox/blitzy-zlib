@@ -8,23 +8,32 @@
 //! functions (`inflate_table`, `inflateUndermine`, direct `state->mode`
 //! mutation) to manufacture conditions that the public API alone cannot.
 //!
-//! This crate is built under `#![forbid(unsafe_code)]`, and the safe core
-//! exposes no way to poke private state or simulate allocator failure from an
-//! external integration test. The port therefore follows a strict **reframing
-//! policy**:
+//! This crate is built under `#![forbid(unsafe_code)]`. The safe core exposes
+//! no way to poke private `struct inflate_state` fields from an external
+//! integration test, but it **does** expose a fallible custom [`Allocator`]
+//! hook, so allocator-failure (`Z_MEM_ERROR`) *is* reproducible here by
+//! installing a memory-limiting allocator that returns `None`. The port
+//! therefore follows a strict **reframing policy**:
 //!
 //! * **PORT** every behavior reachable through the public, safe API — malformed
 //!   bodies → [`ZlibError::DataError`] with the exact `msg` string, zlib/gzip
 //!   header validation, the `Z_NEED_DICT` → `set_dictionary` handshake,
 //!   `inflate_sync` recovery, `copy`, `reset2`, header capture via
-//!   `get_header`, and the `inflate_back` family.
+//!   `get_header`, the `inflate_back` family, and — via the fallible
+//!   [`Allocator`] hook — the `mem_zone`/`mem_limit` allocation-failure paths
+//!   that surface `Z_MEM_ERROR` (see the "Allocation-failure coverage"
+//!   section).
 //! * **OMIT** — with an explicit `// PORT-NOTE:` — every behavior that is
-//!   structurally a C/FFI-layer concern and is therefore *unrepresentable* in
-//!   the safe core: null-pointer `Z_STREAM_ERROR` defenses, wrong-version
-//!   `Z_VERSION_ERROR` negotiation, direct internal-table (`inflate_table`)
-//!   calls, private `state->mode` mutation, and `Z_MEM_ERROR` simulation. Each
-//!   note records where the behavior *is* validated (the `libz-rs-sys` shim, or
-//!   a `src/inflate/*` unit test) so nothing is silently dropped.
+//!   structurally a C/FFI-layer or private-field concern and is therefore
+//!   *unrepresentable* in the safe core: null-pointer `Z_STREAM_ERROR`
+//!   defenses, wrong-version `Z_VERSION_ERROR` negotiation, direct
+//!   internal-table (`inflate_table`) calls, and private `state->mode`
+//!   mutation. The one residual allocation case left unmodeled — a failed
+//!   `inflateCopy` returning `Z_MEM_ERROR` — is noted at its site, because the
+//!   owned `copy()` clones through the global allocator (which aborts on true
+//!   OOM) by deliberate safe-ownership design. Each note records where the
+//!   behavior *is* validated (the `libz-rs-sys` shim, or a `src/inflate/*` unit
+//!   test) so nothing is silently dropped.
 //!
 //! # Why the API looks different from `infcover.c`
 //!
@@ -62,9 +71,19 @@
 
 #![forbid(unsafe_code)]
 
+use core::cell::Cell;
+
 use zlib_rs::constants::Flush;
 use zlib_rs::error::{ReturnCode, ZlibError};
 use zlib_rs::inflate::{InflateState, inflate_back, inflate_back_end, inflate_back_init};
+use zlib_rs::stream::Allocator;
+
+// The custom-allocator coverage cases install a memory-limiting [`Allocator`]
+// shared with the owned [`InflateState`]; `Rc` is the integration-test analogue
+// of the `mem_zone` cookie `infcover.c` threads through `zalloc`/`zfree`. The
+// libtest harness always links `std`, so `std::rc::Rc` is available even when
+// the `zlib-rs` crate itself is built `--no-default-features`.
+use std::rc::Rc;
 
 // `GzHeader` and the `get_header` capture API only exist with the `gzip`
 // feature; importing it unconditionally would be an unused import without it.
@@ -178,10 +197,15 @@ fn status_i32(status: Result<ReturnCode, ZlibError>) -> i32 {
 /// # Reframing
 ///
 /// The C `inf()` additionally exercises `Z_MEM_ERROR` by wrapping the stream in
-/// a limiting `mem_zone` allocator and pokes `state->mode = DICT` to recover;
-/// both are OMITTED here (see the `// PORT-NOTE:` in the `NEED_DICT` branch),
-/// because allocator-failure is unrepresentable through the safe `Allocator`
-/// hook and is validated in `libz-rs-sys` instead.
+/// a limiting `mem_zone` allocator and then pokes `state->mode = DICT` to
+/// recover. The allocation-failure half is now **PORTED** through the fallible
+/// [`Allocator`] hook in the dedicated "Allocation-failure coverage" section
+/// (`mem_window_allocation_failure_is_mem_error` and
+/// `mem_set_dictionary_allocation_failure_is_mem_error`); it is kept out of this
+/// shared `inf()` driver only because `inf()` deliberately runs on the default
+/// allocator so the success fixtures stay representative. The private
+/// `state->mode = DICT` poke remains OMITTED (it mutates a private field the
+/// safe API does not expose).
 fn inf(hex: &str, what: &str, step: usize, win: i32, len: usize, mut err: i32) {
     let input = h2b(hex);
     let total = input.len();
@@ -267,13 +291,15 @@ fn inf(hex: &str, what: &str, step: usize, win: i32, len: usize, mut err: i32) {
             );
             // PORT-NOTE: C then calls `mem_limit(&strm, 1)` and expects
             // `inflateSetDictionary(&strm, out, 0) == Z_MEM_ERROR`, then pokes
-            // `state->mode = DICT` to recover. OMITTED: the safe `Allocator`
-            // hook (`alloc_bytes -> Vec<u8>`) cannot signal failure, so
-            // `Z_MEM_ERROR` is unrepresentable here (it is covered in the
-            // `libz-rs-sys` shim, where raw allocation can fail); and with the
-            // MEM error gone the mode never leaves `DICT`, so the poke is moot.
-            // The empty dictionary has id `adler32(1, &[]) == 1`, which matches
-            // the "need dictionary" fixture's stored id, so this succeeds.
+            // `state->mode = DICT` to recover. The `set_dictionary` →
+            // `Z_MEM_ERROR` path is now PORTED by
+            // `mem_set_dictionary_allocation_failure_is_mem_error` (a denying
+            // `Allocator` makes the window allocation fail); it is exercised
+            // there rather than inline because this shared `inf()` driver runs
+            // on the default allocator. The private `state->mode = DICT` poke
+            // remains OMITTED (private-field mutation). The empty dictionary has
+            // id `adler32(1, &[]) == 1`, which matches the "need dictionary"
+            // fixture's stored id, so this succeeds.
             assert_eq!(
                 state.set_dictionary(&[]),
                 Ok(ReturnCode::Ok),
@@ -673,10 +699,13 @@ fn wrap_miscellaneous_reachable_paths() {
     let mut state = InflateState::new(-8).expect("init raw -8");
 
     // PORT-NOTE: C primes the raw stream and calls `inflate()` twice under
-    // `mem_limit(1)`, asserting `Z_MEM_ERROR` each time. OMITTED — the safe
-    // `Allocator` (`alloc_bytes -> Vec<u8>`) cannot signal allocation failure,
-    // so `Z_MEM_ERROR` is unrepresentable in the core; it is exercised in the
-    // `libz-rs-sys` shim where raw allocation can fail.
+    // `mem_limit(1)`, asserting `Z_MEM_ERROR` each time — the window allocation
+    // is refused. That window-allocation → `Z_MEM_ERROR` path is now PORTED by
+    // `mem_window_allocation_failure_is_mem_error` in the "Allocation-failure
+    // coverage" section, which installs a denying `Allocator` and asserts
+    // `inflate()` returns `ZlibError::MemError`. It lives in its own focused
+    // test rather than inline here so this driver keeps exercising the success
+    // paths on the default allocator.
 
     // On a raw stream (wrap == 0) a dictionary always loads -> Z_OK.
     let dict = [0u8; 257];
@@ -708,9 +737,14 @@ fn wrap_miscellaneous_reachable_paths() {
     // inflateSyncPoint is a callable observer.
     let _ = state.sync_point();
 
-    // PORT-NOTE: C's `inflateCopy(&copy, &strm) == Z_MEM_ERROR` here is OMITTED
-    // (mem-error path, as above). The *successful* `inflate_copy` path is
-    // covered by the `inf()` driver.
+    // PORT-NOTE: C's `inflateCopy(&copy, &strm) == Z_MEM_ERROR` here is the one
+    // residual allocation-failure case left unmodeled. Unlike the window
+    // allocation (now covered via the fallible `Allocator`), `copy()` is a
+    // `Clone` of the owned `Box<InflateState>`: it duplicates the window/codes
+    // through the *global* allocator, which aborts on true OOM rather than
+    // returning, by deliberate safe-ownership design. The *successful*
+    // `inflate_copy` path is covered by the `inf()` driver; the failing one is
+    // structurally non-representable without reintroducing fallible cloning.
 
     // inflateUndermine -> Z_DATA_ERROR (this build does not enable
     // INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR, exactly like stock zlib).
@@ -725,6 +759,200 @@ fn wrap_miscellaneous_reachable_paths() {
     let _ = state.codes_used();
 
     // drop(state) == inflateEnd
+}
+
+// ===========================================================================
+// Allocation-failure coverage  (port of `infcover.c`'s `mem_zone` / `mem_limit`)
+// ===========================================================================
+//
+// `infcover.c` installs a custom `zalloc`/`zfree` pair (`mem_alloc` /
+// `mem_free`) backed by a `mem_zone` cookie. `mem_limit(&strm, limit)` caps the
+// live byte total; once a request would overrun the cap, `mem_alloc` returns
+// `NULL`, which zlib reports as `Z_MEM_ERROR`. The C `inf()` and `cover_wrap`
+// drivers use this to force the sliding-window allocation (during `inflate()`
+// and during `inflateSetDictionary`) to fail and assert `Z_MEM_ERROR`.
+//
+// The safe core exposes the same extension point through the fallible
+// [`Allocator`] trait: returning `None` from an `allocate_*` method is the
+// safe-Rust spelling of `mem_alloc` returning `NULL`, and the core maps it to
+// [`ZlibError::MemError`] (`Z_MEM_ERROR`). The [`LimitedAllocator`] below is the
+// `mem_zone` analogue, shared with the owned [`InflateState`] through an [`Rc`]
+// (the analogue of the C `opaque` cookie). These tests therefore restore the
+// `infcover` allocation-failure coverage that earlier notes recorded as
+// omitted, directly against the safe core.
+
+/// A safe-Rust analogue of `infcover.c`'s `mem_zone` limiting allocator.
+///
+/// Tracks the live byte total and an optional ceiling (`limit`). An allocation
+/// request that would push the live total past `limit` is **refused** (returns
+/// `None`), exactly like `mem_alloc`'s `if (zone->total + len > zone->limit)
+/// return NULL;`. A `limit` of `0` denies every request — the analogue of
+/// `mem_limit(&strm, 1)` in the C suite, where any real allocation overruns a
+/// one-byte ceiling.
+///
+/// All counters use [`Cell`] for interior mutability because the [`Allocator`]
+/// methods take `&self` (the allocator is shared through an [`Rc`]).
+struct LimitedAllocator {
+    /// Maximum cumulative *live* bytes the allocator will hand out.
+    limit: usize,
+    /// Running total of live bytes currently handed out.
+    live: Cell<usize>,
+    /// Number of allocation requests granted — lets a test assert the window
+    /// allocation was genuinely routed through *this* allocator.
+    served: Cell<usize>,
+    /// Number of allocation requests refused for exceeding `limit`.
+    refused: Cell<usize>,
+}
+
+impl LimitedAllocator {
+    /// Build an allocator that permits up to `limit` cumulative live bytes.
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            live: Cell::new(0),
+            served: Cell::new(0),
+            refused: Cell::new(0),
+        }
+    }
+
+    /// Account `bytes` against the ceiling. Returns `None` (recording a refusal)
+    /// when granting the request would exceed `limit`, mirroring `mem_alloc`'s
+    /// `total + len > limit` guard; otherwise records the grant and succeeds.
+    fn account(&self, bytes: usize) -> Option<()> {
+        let live = self.live.get();
+        if live.saturating_add(bytes) > self.limit {
+            self.refused.set(self.refused.get() + 1);
+            return None;
+        }
+        self.live.set(live + bytes);
+        self.served.set(self.served.get() + 1);
+        Some(())
+    }
+
+    /// Return `bytes` to the live pool on deallocation, like the C `mem_free`
+    /// subtracting from the zone total.
+    fn release(&self, bytes: usize) {
+        self.live.set(self.live.get().saturating_sub(bytes));
+    }
+}
+
+impl Allocator for LimitedAllocator {
+    fn allocate_bytes(&self, len: usize) -> Option<Vec<u8>> {
+        self.account(len)?;
+        Some(vec![0u8; len])
+    }
+
+    fn allocate_u16(&self, len: usize) -> Option<Vec<u16>> {
+        // Each `u16` element costs two bytes against the ceiling.
+        self.account(len.saturating_mul(2))?;
+        Some(vec![0u16; len])
+    }
+
+    fn deallocate_bytes(&self, buffer: Vec<u8>) {
+        self.release(buffer.len());
+    }
+
+    fn deallocate_u16(&self, buffer: Vec<u16>) {
+        self.release(buffer.len().saturating_mul(2));
+    }
+}
+
+/// Port of the `mem_zone`/`mem_limit` allocation-failure behavior exercised by
+/// `cover_support`'s `inf("63 0", …)` fixture and `cover_wrap`'s primed-stream
+/// block: when the sliding window cannot be allocated, `inflate()` reports
+/// `Z_MEM_ERROR`.
+///
+/// `"63 0"` is the fixture `support_force_window_allocation` uses to *force* a
+/// window allocation. Here the shared [`LimitedAllocator`] denies every request
+/// (`limit == 0`, the analogue of `mem_limit(&strm, 1)`), so the lazy window
+/// allocation in `update_window` fails and surfaces as [`ZlibError::MemError`].
+/// Init itself succeeds because the window is allocated lazily — exactly as in
+/// stock zlib, where `inflateInit2` precedes the limited allocation.
+#[test]
+fn mem_window_allocation_failure_is_mem_error() {
+    let alloc = Rc::new(LimitedAllocator::new(0));
+    let shared: Rc<dyn Allocator> = alloc.clone();
+    let mut state = InflateState::new_in(-15, Some(shared)).expect("init raw -15 (window is lazy)");
+
+    let input = h2b("63 0");
+    let mut out = [0u8; 1];
+    let result = state.inflate(&input, &mut out, Flush::NoFlush);
+
+    assert_eq!(
+        result.status,
+        Err(ZlibError::MemError),
+        "a refused window allocation must surface as Z_MEM_ERROR"
+    );
+    assert!(
+        alloc.refused.get() >= 1,
+        "the custom allocator must have been consulted and refused the window"
+    );
+}
+
+/// Port of `cover_wrap`'s `inflateSetDictionary(...) == Z_MEM_ERROR` under
+/// `mem_limit`: loading a dictionary on a raw stream populates the sliding
+/// window, so a refused window allocation makes `set_dictionary` report
+/// `Z_MEM_ERROR`.
+///
+/// On a raw (`wrap == 0`) stream `set_dictionary` always proceeds (there is no
+/// dictionary-id handshake), and `wrap_miscellaneous_reachable_paths` shows the
+/// success path returns `Z_OK`. With the denying [`LimitedAllocator`] installed,
+/// the window allocation fails instead and is mapped to [`ZlibError::MemError`].
+#[test]
+fn mem_set_dictionary_allocation_failure_is_mem_error() {
+    let alloc = Rc::new(LimitedAllocator::new(0));
+    let shared: Rc<dyn Allocator> = alloc.clone();
+    let mut state = InflateState::new_in(-8, Some(shared)).expect("init raw -8 (window is lazy)");
+
+    // A 257-byte dictionary (the size `wrap_miscellaneous_reachable_paths` loads
+    // successfully under the default allocator) needs a window; the denying
+    // allocator refuses it.
+    let dict = [0u8; 257];
+    assert_eq!(
+        state.set_dictionary(&dict),
+        Err(ZlibError::MemError),
+        "a refused window allocation in set_dictionary must surface as Z_MEM_ERROR"
+    );
+    assert!(
+        alloc.refused.get() >= 1,
+        "the custom allocator must have been consulted and refused the window"
+    );
+}
+
+/// Positive control proving the window allocation is genuinely routed through
+/// the installed custom [`Allocator`] (not the global one): the same `"63 0"`
+/// fixture that fails under a denying allocator *succeeds* under a generous one,
+/// and the allocator records that it served at least one request and refused
+/// none.
+///
+/// Together with `mem_window_allocation_failure_is_mem_error` this shows the
+/// custom allocator fully governs the outcome — the core consults it for the
+/// window, honors a refusal as `Z_MEM_ERROR`, and uses the buffer it returns on
+/// success — the end-to-end behavior `mem_zone` verifies in C.
+#[test]
+fn mem_generous_allocator_permits_and_routes_window() {
+    let alloc = Rc::new(LimitedAllocator::new(usize::MAX));
+    let shared: Rc<dyn Allocator> = alloc.clone();
+    let mut state = InflateState::new_in(-15, Some(shared)).expect("init raw -15");
+
+    let input = h2b("63 0");
+    let mut out = [0u8; 1];
+    let result = state.inflate(&input, &mut out, Flush::NoFlush);
+
+    assert_eq!(
+        result.status,
+        Ok(ReturnCode::Ok),
+        "the fixture succeeds when the custom allocator permits the window"
+    );
+    assert!(
+        alloc.served.get() >= 1,
+        "the window allocation must have been served by the custom allocator"
+    );
+    assert_eq!(
+        alloc.refused.get(),
+        0,
+        "no request should have been refused"
+    );
 }
 
 // ===========================================================================

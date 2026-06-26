@@ -115,8 +115,13 @@ LD_PRELOAD=/path/to/target/release/libz.so ./your_existing_program
 ```
 
 To prove signature parity, the shim's build step generates `libz-rs-sys/include/zlib.h` with
-`cbindgen` and that header is diffed against the canonical `zlib.h`; any divergence in a symbol's
-signature is caught at build time.
+`cbindgen` and checks it against the canonical `zlib.h` — verifying that every one of the 73
+exported symbols is present with matching argument arity and that the `#[repr(C)]` structs match the
+canonical field layout. In **CI and delivery builds this check is a hard gate**: the `build`,
+`lint`, and `cdylib` workflows set `LIBZ_RS_SYS_STRICT_HEADER=1`, so any signature drift **fails the
+build**. In ordinary local and downstream builds the check is best-effort and reports drift as a
+`cargo:warning` (so packaging, docs.rs, and read-only source trees never break); set
+`LIBZ_RS_SYS_STRICT_HEADER=1` locally to opt into the same hard gate.
 
 ## Feature flags
 
@@ -133,8 +138,10 @@ the workspace:
 - **`gz-io`** — gzip file I/O (mirrors C `#ifndef NO_GZCOMPRESS`); implies `std` + `gzip`.
 - **`no-std`** — an explicit marker mirroring the C `Z_SOLO` configuration; the actual `no_std`
   switch is the *absence* of the `std` feature.
-- **`capi`** — gates the C-ABI layer (the `libz-rs-sys` shim and the cdylib) so the pure-Rust core
-  can be built and tested standalone.
+- **`capi`** — a build **marker** for the C-ABI layer, consumed by the `libz-rs-sys-cdylib` member
+  and `cargo-c` tooling. It does **not** gate compilation of the FFI layer — the `extern "C"`
+  symbols in `libz-rs-sys` are always compiled. (To build/test just the pure-Rust core standalone,
+  build `-p zlib-rs`; there is no need to toggle this flag.)
 
 For a pure-Rust `no_std` build of just the core:
 
