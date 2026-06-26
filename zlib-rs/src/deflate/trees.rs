@@ -922,9 +922,11 @@ impl DeflateState {
 
             bl_count[bits as usize] += 1;
             let mut xbits = 0i32;
-            if n as i32 >= base
-                && let Some(ex) = extra
-            {
+            // MSRV 1.85 has no `let`-chains (stabilized in Rust 1.88); fold the
+            // in-range guard into the `Option` with `filter` so `ex` is bound
+            // only when both `n >= base` and `extra` is `Some` hold. Mirrors C
+            // `gen_bitlen`: `xbits = 0; if (n >= base) xbits = extra[n - base];`.
+            if let Some(ex) = extra.filter(|_| n as i32 >= base) {
                 xbits = ex[(n as i32 - base) as usize];
             }
             let f = tree[n].freq() as usize;
@@ -1555,9 +1557,11 @@ impl DeflateState {
             static_lenb = stored_len + 5;
         }
 
-        if stored_len + 4 <= opt_lenb
-            && let Some(b) = buf
-        {
+        // MSRV 1.85 has no `let`-chains (stabilized in Rust 1.88); fold the size
+        // guard into the `Option` with `filter` so the `else if`/`else`
+        // fall-through is preserved when `buf` is `None`. Mirrors C
+        // `_tr_flush_block`: `if (stored_len + 4 <= opt_lenb && buf != NULL)`.
+        if let Some(b) = buf.filter(|_| stored_len + 4 <= opt_lenb) {
             // 4: two words for the lengths. The test buf != NULL is only
             // necessary if LIT_BUFSIZE > WSIZE; here it guards the Option.
             self.tr_stored_block(b, last);
