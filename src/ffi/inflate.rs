@@ -800,6 +800,10 @@ pub unsafe extern "C" fn inflateCopy(dest: z_streamp, source: z_streamp) -> c_in
 
         match copy_res {
             Ok(_) => {
+                // `handle` is mutated only under `gzip` (to carry the source's
+                // gzip header); when `gzip` is disabled the `mut` is genuinely
+                // unused, so suppress the lint in exactly that configuration.
+                #[cfg_attr(not(feature = "gzip"), allow(unused_mut))]
                 let mut handle = InflateHandle::new(dest_zs);
                 #[cfg(feature = "gzip")]
                 {
