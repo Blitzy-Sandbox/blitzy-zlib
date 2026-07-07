@@ -48,10 +48,15 @@
 //! Two complementary surfaces are provided:
 //!
 //! * A **first-class Rust API**: [`GzState`] implements [`std::io::Read`],
-//!   [`std::io::BufRead`], and [`std::io::Write`], and its [`Drop`] impl performs
-//!   the RAII flush-and-close, so an open file behaves like any other reader or
-//!   writer. Files are opened with [`gzopen`] / [`gzdopen`] and closed either by
-//!   dropping the handle or via [`gzclose`].
+//!   [`std::io::BufRead`], and [`std::io::Write`], so an open file behaves like
+//!   any other reader or writer, and is opened with [`gzopen`] / [`gzdopen`].
+//!   Its [`Drop`] impl only **releases resources** — it frees the I/O buffers,
+//!   ends the deflate/inflate stream, and closes the file descriptor — but it
+//!   deliberately does **not** finalize gzip output: it emits no `Z_FINISH`
+//!   flush and surfaces no deferred write error. Dropping a *writer* therefore
+//!   leaves a truncated, invalid member, so a write handle must be closed
+//!   explicitly with [`gzclose`] / [`gzclose_w`] to produce a complete, valid
+//!   gzip stream and to observe any pending write error.
 //! * A set of **C-compatible entry points** (`gzread`, `gzwrite`, `gzgetc`, …)
 //!   that mirror the exact zlib prototypes. These are re-exported publicly (and
 //!   are also what the FFI boundary consumes via `crate::gz::*`); for everyday
@@ -150,8 +155,11 @@ pub use read::{gzfread, gzgetc, gzgetc_, gzgets, gzread, gzungetc};
 pub use write::{gzflush, gzfwrite, gzprintf, gzputc, gzputs, gzvprintf, gzwrite};
 
 /// Close family, ported from `gzclose.c`. Explicit teardown mirroring
-/// `gzclose` / `gzclose_r` / `gzclose_w`; dropping a [`GzState`] performs the
-/// same flush-and-close via its [`Drop`] impl.
+/// `gzclose` / `gzclose_r` / `gzclose_w`. Only [`gzclose_w`] finalizes a write
+/// stream — it emits the `Z_FINISH` flush and the gzip trailer and surfaces any
+/// pending write error. Simply dropping a [`GzState`] releases its buffers,
+/// stream, and file descriptor but does **not** finalize gzip output, so a
+/// writer must be closed explicitly to produce a valid stream.
 pub use close::{gzclose, gzclose_r, gzclose_w};
 
 #[cfg(test)]

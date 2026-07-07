@@ -565,7 +565,17 @@ pub(crate) fn gz_read(state: &mut GzState, buf: &mut [u8]) -> usize {
             // Get more output for small reads or for a stream we have not yet
             // classified. This fills the output buffer, keeping gzgetc() fast
             // and guaranteeing room for one gzungetc() (C L355-365).
-            if gz_fetch(state).is_err() {
+            //
+            // A `gz_fetch` failure is treated as an immediate error only when it
+            // produced no output (`state.have == 0`). If bytes *were* buffered
+            // before the error, the error is deferred: the buffered bytes are
+            // delivered on the next loop iteration by the `state.have != 0`
+            // branch above, which then surfaces the recorded `state.err`. This
+            // mirrors C `if (gz_fetch(state) == -1 && state->x.have == 0)`
+            // (gzread.c L356-359) — "if state->x.have != 0, error will be caught
+            // after copy" — so a truncated/corrupt stream still returns the
+            // valid bytes read before the fault rather than dropping them.
+            if gz_fetch(state).is_err() && state.have == 0 {
                 err = true;
             }
             advanced = false;
@@ -663,10 +673,16 @@ pub fn gzread(state: &mut GzState, buf: &mut [u8]) -> i32 {
 /// Reads `size * nitems` bytes and returns the number of complete items read —
 /// the Rust port of C `gzfread` (`gzread.c` L439-465).
 ///
-/// `buf` must be able to hold `size * nitems` bytes. A `size * nitems` product
-/// that overflows [`usize`] is an error (returns `0`). If a partial item is read
-/// at end of file, its bytes are still delivered into `buf` but are not counted
-/// in the returned item total; the leftover can be recovered with [`gzgetc`].
+/// `buf` must be able to hold `size * nitems` bytes. This precondition is
+/// enforced: if `buf` is smaller than the requested `size * nitems`, the request
+/// is rejected with [`ReturnCode::StreamError`] and `0` is returned — the bytes
+/// are **not** silently truncated to `buf.len()`, so a caller-side sizing mistake
+/// surfaces as an error instead of being hidden (and the C-compatible request
+/// contract the FFI layer relies on is preserved). A `size * nitems` product
+/// that overflows [`usize`] is likewise an error (returns `0`). If a partial item
+/// is read at end of file, its bytes are still delivered into `buf` but are not
+/// counted in the returned item total; the leftover can be recovered with
+/// [`gzgetc`].
 pub fn gzfread(state: &mut GzState, buf: &mut [u8], size: usize, nitems: usize) -> usize {
     // The handle must be open for reading (C L446-447).
     if state.mode != GzMode::Read {
@@ -696,8 +712,22 @@ pub fn gzfread(state: &mut GzState, buf: &mut [u8], size: usize, nitems: usize) 
     if len == 0 {
         return 0;
     }
-    let want = len.min(buf.len());
-    gz_read(state, &mut buf[..want]) / size
+
+    // Enforce the documented `buf` >= `size * nitems` precondition. C uses a raw
+    // pointer and trusts the caller to have provided a large enough buffer; the
+    // safe-slice API instead surfaces an undersized buffer as a stream error and
+    // reads nothing, rather than silently clamping the request to `buf.len()`
+    // (which would hide the caller's mistake and make the returned item count
+    // diverge from the C `gz_read(state, buf, len) / size` contract).
+    if buf.len() < len {
+        state.error(
+            ReturnCode::StreamError,
+            Some("output buffer smaller than requested size * nitems"),
+        );
+        return 0;
+    }
+
+    gz_read(state, &mut buf[..len]) / size
 }
 
 /// Reads and returns a single byte (`0..=255`), or `-1` on end of file or error —

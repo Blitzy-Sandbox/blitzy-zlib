@@ -212,16 +212,40 @@ fn gz_deflate_loop(
 
         consumed += outcome.consumed;
 
-        // Flush the freshly produced bytes to the file (C L114-L124). For a
-        // blocking `File`, `write_all` loops over short writes internally.
+        // Flush the freshly produced bytes to the file (C L114-L124). Drain with
+        // an explicit, progress-preserving write loop — the same pattern as the
+        // transparent [`write_direct`] path and the C inner
+        // `while (strm->next_out > state->x.next)` loop (gzwrite.c L114-L124),
+        // which advances the output cursor by each successful `write()`.
+        //
+        // `write_all` is deliberately avoided here: it hides how many bytes were
+        // written before a later error, so a partial write followed by a fault
+        // (or a non-blocking / short-writing descriptor) could lose progress and
+        // corrupt the gzip output — or duplicate bytes on retry. Advancing `off`
+        // by each successful count keeps the exact write progress, retries a
+        // slice interrupted by a signal, and reports a non-blocking stall via
+        // [`GzState::again`](crate::gz::state::GzState), matching zlib.
         if outcome.produced > 0 {
-            state.again = false;
-            if let Err(e) = state.file.write_all(&state.out_buf[..outcome.produced]) {
-                if e.kind() == io::ErrorKind::WouldBlock {
-                    state.again = true;
+            let produced = outcome.produced;
+            let mut off = 0usize;
+            while off < produced {
+                state.again = false;
+                let end = off + core::cmp::min(WRITE_MAX, produced - off);
+                match state.file.write(&state.out_buf[off..end]) {
+                    // No progress possible on a real file with a non-empty slice.
+                    Ok(0) => break,
+                    Ok(written) => off += written,
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        state.again = true;
+                        state.error(ReturnCode::ErrNo, Some("write error"));
+                        return Err(ZlibError::ErrNo);
+                    }
+                    Err(_) => {
+                        state.error(ReturnCode::ErrNo, Some("write error"));
+                        return Err(ZlibError::ErrNo);
+                    }
                 }
-                state.error(ReturnCode::ErrNo, Some("write error"));
-                return Err(ZlibError::ErrNo);
             }
         }
 
@@ -487,10 +511,15 @@ pub fn gzwrite(state: &mut GzState, buf: &[u8]) -> i32 {
 /// Write `nitems` items of `size` bytes each to the gzip file — port of C
 /// `gzfwrite` (`gzwrite.c` L280-L304).
 ///
-/// `buf` must contain at least `size * nitems` bytes. Returns the number of
-/// full items written; `0` on error or overflow. The `size * nitems`
-/// multiplication is overflow-checked, matching the C guard that the request
-/// fits in a `size_t`.
+/// `buf` must contain at least `size * nitems` bytes. This precondition is
+/// enforced: if `buf` is smaller than the requested `size * nitems`, the request
+/// is rejected with [`ReturnCode::StreamError`] and `0` is returned — the write
+/// is **not** silently truncated to `buf.len()`, so a caller-side sizing mistake
+/// surfaces as an error instead of being hidden (and the C-compatible request
+/// contract the FFI layer relies on is preserved). Returns the number of full
+/// items written; `0` on error or overflow. The `size * nitems` multiplication
+/// is overflow-checked, matching the C guard that the request fits in a
+/// `size_t`.
 pub fn gzfwrite(state: &mut GzState, buf: &[u8], size: usize, nitems: usize) -> usize {
     // Check that we're writing and that there's no serious error (C L289-L292).
     if !write_ready(state) {
@@ -512,11 +541,24 @@ pub fn gzfwrite(state: &mut GzState, buf: &[u8], size: usize, nitems: usize) -> 
 
     // Write `len` bytes, returning the number of full items written (C L303).
     if len == 0 {
-        0
-    } else {
-        let to_write = core::cmp::min(len, buf.len());
-        gz_write(state, &buf[..to_write]) / size
+        return 0;
     }
+
+    // Enforce the documented `buf` >= `size * nitems` precondition. C uses a raw
+    // pointer and trusts the caller to have provided a large enough buffer; the
+    // safe-slice API instead surfaces an undersized buffer as a stream error and
+    // writes nothing, rather than silently clamping the write to `buf.len()`
+    // (which would hide the caller's mistake and let the returned item count
+    // diverge from the C `gz_write(state, buf, len) / size` contract).
+    if buf.len() < len {
+        state.error(
+            ReturnCode::StreamError,
+            Some("input buffer smaller than requested size * nitems"),
+        );
+        return 0;
+    }
+
+    gz_write(state, &buf[..len]) / size
 }
 
 /// Write one byte `c` (its low 8 bits) to the gzip file — port of C `gzputc`

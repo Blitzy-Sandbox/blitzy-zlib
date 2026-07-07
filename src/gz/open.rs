@@ -691,19 +691,40 @@ pub fn gzseek64(state: &mut GzState, mut offset: i64, whence: i32) -> i64 {
 
     // Normalize `offset` to a SEEK_CUR specification (C L388-393). For SEEK_CUR
     // any not-yet-applied forward skip is folded in (unless we have already read
-    // past EOF), then cleared.
+    // past EOF), then cleared. All signed offset arithmetic in this function is
+    // checked so an extreme `offset`/`pos`/`skip` combination returns the
+    // zlib-style `-1` error rather than panicking in debug builds or silently
+    // wrapping in release builds.
     if whence == SEEK_SET {
-        offset -= state.pos;
+        offset = match offset.checked_sub(state.pos) {
+            Some(v) => v,
+            None => return -1,
+        };
     } else {
-        offset += if state.past { 0 } else { state.skip };
+        let pending = if state.past { 0 } else { state.skip };
+        offset = match offset.checked_add(pending) {
+            Some(v) => v,
+            None => return -1,
+        };
         state.skip = 0;
     }
 
-    // If within the raw area while reading, just go there (C L396-410).
-    if state.mode == GzMode::Read && state.how == How::Copy && state.pos + offset >= 0 {
+    // If within the raw area while reading, just go there (C L396-410). The
+    // target position `pos + offset` is computed with a checked add; on overflow
+    // the fast-path guard is simply false, so control falls through to the
+    // general path below (which handles or rejects the seek). This mirrors C's
+    // `state->x.pos + offset >= 0` guard without ever wrapping.
+    if state.mode == GzMode::Read
+        && state.how == How::Copy
+        && let Some(target) = state.pos.checked_add(offset)
+        && target >= 0
+    {
         // Seek relative to the current file position, discounting the bytes
         // already sitting in the output buffer (C `offset - x.have`).
-        let delta = offset - state.have as i64;
+        let delta = match offset.checked_sub(state.have as i64) {
+            Some(d) => d,
+            None => return -1,
+        };
         if state.file.seek(SeekFrom::Current(delta)).is_err() {
             return -1;
         }
@@ -716,7 +737,7 @@ pub fn gzseek64(state: &mut GzState, mut offset: i64, whence: i32) -> i64 {
         // the C `state->strm.avail_in = 0;`).
         state.in_avail = 0;
         state.in_next = 0;
-        state.pos += offset;
+        state.pos = target;
         return state.pos;
     }
 
@@ -727,7 +748,12 @@ pub fn gzseek64(state: &mut GzState, mut offset: i64, whence: i32) -> i64 {
             // Writing: cannot go backwards.
             return -1;
         }
-        offset += state.pos;
+        // Fold the current position back in (C `offset += state->x.pos`) with a
+        // checked add; an out-of-range result is rejected rather than wrapping.
+        offset = match offset.checked_add(state.pos) {
+            Some(v) => v,
+            None => return -1,
+        };
         if offset < 0 {
             // Before the start of the file.
             return -1;
@@ -749,14 +775,21 @@ pub fn gzseek64(state: &mut GzState, mut offset: i64, whence: i32) -> i64 {
         };
         state.have -= n;
         state.next += n;
-        state.pos += n as i64;
+        // `n` is bounded by `min(have, offset)` (both non-negative here), so
+        // `pos + n` and `offset - n` cannot themselves overflow; the checked add
+        // keeps every offset computation panic-free and uniform.
+        state.pos = match state.pos.checked_add(n as i64) {
+            Some(v) => v,
+            None => return -1,
+        };
         offset -= n as i64;
     }
 
     // Request the (possibly zero) remaining skip and report where we will be
-    // once it is applied (C L433-434).
+    // once it is applied (C L433-434). The reported position uses a checked add
+    // so an out-of-range result is surfaced as `-1` instead of wrapping.
     state.skip = offset;
-    state.pos + offset
+    state.pos.checked_add(offset).unwrap_or(-1)
 }
 
 /// `z_off_t`-typed alias for [`gzseek64`] — the port of C `gzseek`
@@ -781,7 +814,10 @@ pub fn gztell64(state: &GzState) -> i64 {
     if state.mode != GzMode::Read && state.mode != GzMode::Write {
         return -1;
     }
-    state.pos + if state.past { 0 } else { state.skip }
+    // `pos + skip` with a checked add so a pending-seek total that would exceed
+    // the offset type is reported as `-1` rather than panicking/wrapping.
+    let pending = if state.past { 0 } else { state.skip };
+    state.pos.checked_add(pending).unwrap_or(-1)
 }
 
 /// `z_off_t`-typed alias for [`gztell64`] — the port of C `gztell`
@@ -816,8 +852,16 @@ pub fn gzoffset64(state: &mut GzState) -> i64 {
 
     if state.mode == GzMode::Read {
         // Don't count compressed input that is buffered but not yet consumed
-        // (C `offset -= state->strm.avail_in;`).
-        offset - state.in_avail as i64
+        // (C `offset -= state->strm.avail_in;`). The buffered count is converted
+        // and subtracted with checked operations so an out-of-range value yields
+        // `-1` instead of wrapping. In practice `in_avail` is bounded by the
+        // input buffer size and never exceeds `offset`, so this never triggers;
+        // the checks keep the offset arithmetic uniformly panic-free.
+        let buffered = match i64::try_from(state.in_avail) {
+            Ok(v) => v,
+            Err(_) => return -1,
+        };
+        offset.checked_sub(buffered).unwrap_or(-1)
     } else {
         offset
     }

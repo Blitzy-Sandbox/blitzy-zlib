@@ -52,23 +52,6 @@ use crate::gz::read::finish_read;
 use crate::gz::state::{GzMode, GzState};
 use crate::gz::write::{gz_comp, gz_zero};
 
-/// Best-effort detection of a file-close error, used to reproduce zlib's
-/// `ret = close(fd)` errno path in safe Rust.
-///
-/// Reference zlib inspects the return value of `close(2)` and reports a failure
-/// as [`Z_ERRNO`](ReturnCode::ErrNo). Rust's [`File`](std::fs::File) closes its
-/// descriptor in `Drop` and **cannot surface a `close(2)` error** to the
-/// caller. To approximate that behavior we force any buffered data and metadata
-/// to the storage device with [`File::sync_all`](std::fs::File::sync_all)
-/// immediately before the handle is dropped; a failure of that sync is the
-/// closest safe analogue of a failing `close(2)`.
-///
-/// Returns `true` if the sync failed (i.e. the caller should report
-/// [`ReturnCode::ErrNo`]), and `false` otherwise.
-fn sync_failed(file: &GzState) -> bool {
-    file.file.sync_all().is_err()
-}
-
 /// Finalizes and closes a gzip file opened for **writing** — port of C
 /// `gzclose_w` (`gzwrite.c` L667-L700).
 ///
@@ -89,9 +72,15 @@ fn sync_failed(file: &GzState) -> bool {
 /// * [`Z_STREAM_ERROR`](ReturnCode::StreamError) if the handle was not opened
 ///   for writing;
 /// * otherwise [`Z_OK`](ReturnCode::Ok) on success, or the stream's recorded
-///   error code if the pending-seek zero-fill or the `Z_FINISH` flush failed,
-///   or [`Z_ERRNO`](ReturnCode::ErrNo) if the final file sync failed (a later
-///   error in this sequence overrides an earlier one, matching C).
+///   error code if the pending-seek zero-fill or the `Z_FINISH` flush failed
+///   (a later error in this sequence overrides an earlier one, matching C).
+///
+/// Note: reference zlib additionally reports [`Z_ERRNO`](ReturnCode::ErrNo)
+/// when `close(fd)` itself fails. In this safe layer the descriptor is closed
+/// by [`File`](std::fs::File)'s [`Drop`], which cannot surface a `close(2)`
+/// error, so the exact `Z_ERRNO`-on-close path is deferred to the raw-descriptor
+/// FFI boundary (`src/ffi/gz.rs`). This function therefore returns the
+/// accumulated flush status, matching the C non-error close path.
 pub fn gzclose_w(mut file: Box<GzState>) -> i32 {
     // C L676-L677: reject a handle that is not open for writing.
     if file.mode != GzMode::Write {
@@ -116,15 +105,13 @@ pub fn gzclose_w(mut file: Box<GzState>) -> i32 {
         ret = file.err;
     }
 
-    // C L695-L696: `if (close(fd) == -1) ret = Z_ERRNO;`. Approximated by
-    // syncing before the descriptor is dropped (see [`sync_failed`]). This runs
-    // last, so a close-time failure overrides an earlier flush error.
-    if sync_failed(&file) {
-        ret = ReturnCode::ErrNo;
-    }
-
-    // C L698: `free(state)`. Dropping the box frees the buffers, ends the
-    // deflate stream, and closes the descriptor via RAII.
+    // C L695-L698: `if (close(fd) == -1) ret = Z_ERRNO; ... free(state);`.
+    // Dropping the box frees the I/O buffers, ends the deflate stream, and
+    // closes the descriptor via RAII. `File`'s `Drop` cannot surface a
+    // `close(2)` error to safe Rust, so we do not fabricate one here — the exact
+    // `Z_ERRNO`-on-close reporting is deferred to the raw-descriptor FFI
+    // boundary (`src/ffi/gz.rs`). We return the accumulated flush status, which
+    // matches the C result whenever `close(fd)` succeeds.
     drop(file);
 
     ret.as_c_int()
@@ -146,9 +133,14 @@ pub fn gzclose_w(mut file: Box<GzState>) -> i32 {
 ///   for reading;
 /// * [`Z_BUF_ERROR`](ReturnCode::BufError) if the stream's last recorded error
 ///   was a buffer error (C preserves this one code across close), otherwise
-///   [`Z_OK`](ReturnCode::Ok);
-/// * or [`Z_ERRNO`](ReturnCode::ErrNo) if the final file sync failed, which
-///   overrides the status above (C `return ret ? Z_ERRNO : err;`).
+///   [`Z_OK`](ReturnCode::Ok).
+///
+/// Note: reference zlib additionally reports [`Z_ERRNO`](ReturnCode::ErrNo)
+/// when `close(fd)` fails (C `return ret ? Z_ERRNO : err;`). In this safe layer
+/// the descriptor is closed by [`File`](std::fs::File)'s [`Drop`], which cannot
+/// surface a `close(2)` error, so the exact `Z_ERRNO`-on-close path is deferred
+/// to the raw-descriptor FFI boundary (`src/ffi/gz.rs`). This function returns
+/// the accumulated read status, matching the C non-error close path.
 pub fn gzclose_r(file: Box<GzState>) -> i32 {
     // C L650-L651: reject a handle that is not open for reading.
     if file.mode != GzMode::Read {
@@ -161,20 +153,16 @@ pub fn gzclose_r(file: Box<GzState>) -> i32 {
     // the read-specific finalization owned by `read.rs`.
     let status = finish_read(&file);
 
-    // C L665: `ret = close(state->fd);`. Capture the best-effort close result
-    // before the descriptor is dropped (see [`sync_failed`]).
-    let close_failed = sync_failed(&file);
-
-    // C L666: `free(state);`. RAII: end the inflate stream, free buffers, close
-    // the descriptor.
+    // C L665-L667: `ret = close(state->fd); free(state); return ret ? Z_ERRNO
+    // : err;`. Dropping the box ends the inflate stream, frees buffers, and
+    // closes the descriptor via RAII. `File`'s `Drop` cannot surface a
+    // `close(2)` error to safe Rust, so we do not fabricate one here — the exact
+    // `Z_ERRNO`-on-close reporting is deferred to the raw-descriptor FFI
+    // boundary (`src/ffi/gz.rs`). We return the accumulated read status, which
+    // matches the C result whenever `close(fd)` succeeds.
     drop(file);
 
-    // C L667: `return ret ? Z_ERRNO : err;`.
-    if close_failed {
-        ReturnCode::ErrNo.as_c_int()
-    } else {
-        status.as_c_int()
-    }
+    status.as_c_int()
 }
 
 /// Closes a gzip file, dispatching to the reader or writer finalizer — port of
