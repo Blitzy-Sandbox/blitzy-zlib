@@ -1,5 +1,6 @@
 docs_dir: doc
 site_name: 'blitzy-zlib'
+site_description: 'zlib-rs — a memory-safe, idiomatic Rust rewrite of the zlib 1.3.2.1 compression library with a C-compatible FFI drop-in layer'
 nav:
   - Home: index.md
   - Project Guide: project-guide.md
