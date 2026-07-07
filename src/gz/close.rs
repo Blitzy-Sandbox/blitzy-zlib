@@ -48,6 +48,7 @@
 
 use crate::constants::FlushMode;
 use crate::error::ReturnCode;
+use crate::gz::read::finish_read;
 use crate::gz::state::{GzMode, GzState};
 use crate::gz::write::{gz_comp, gz_zero};
 
@@ -155,11 +156,10 @@ pub fn gzclose_r(file: Box<GzState>) -> i32 {
     }
 
     // C L662: `err = state->err == Z_BUF_ERROR ? Z_BUF_ERROR : Z_OK;`.
-    let status = if file.err == ReturnCode::BufError {
-        ReturnCode::BufError
-    } else {
-        ReturnCode::Ok
-    };
+    // Delegated to the read side's [`finish_read`], which computes exactly this
+    // status (a pending `Z_BUF_ERROR` is preserved, otherwise `Z_OK`), keeping
+    // the read-specific finalization owned by `read.rs`.
+    let status = finish_read(&file);
 
     // C L665: `ret = close(state->fd);`. Capture the best-effort close result
     // before the descriptor is dropped (see [`sync_failed`]).

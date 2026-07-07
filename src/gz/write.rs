@@ -464,7 +464,7 @@ pub(crate) fn gz_write(state: &mut GzState, buf: &[u8]) -> usize {
 /// writable. Because the count is returned as an [`i32`], a length that does not
 /// fit in a positive [`i32`] is rejected with [`ReturnCode::DataError`], exactly
 /// as the C interface guards against its `unsigned`→`int` return.
-pub(crate) fn gzwrite(state: &mut GzState, buf: &[u8]) -> i32 {
+pub fn gzwrite(state: &mut GzState, buf: &[u8]) -> i32 {
     // Check that we're writing and that there's no serious error (C L263-L266).
     if !write_ready(state) {
         return 0;
@@ -491,7 +491,7 @@ pub(crate) fn gzwrite(state: &mut GzState, buf: &[u8]) -> i32 {
 /// full items written; `0` on error or overflow. The `size * nitems`
 /// multiplication is overflow-checked, matching the C guard that the request
 /// fits in a `size_t`.
-pub(crate) fn gzfwrite(state: &mut GzState, buf: &[u8], size: usize, nitems: usize) -> usize {
+pub fn gzfwrite(state: &mut GzState, buf: &[u8], size: usize, nitems: usize) -> usize {
     // Check that we're writing and that there's no serious error (C L289-L292).
     if !write_ready(state) {
         return 0;
@@ -525,7 +525,7 @@ pub(crate) fn gzfwrite(state: &mut GzState, buf: &[u8], size: usize, nitems: usi
 /// Returns the byte written (`c & 0xff`) on success, or `-1` on error. The fast
 /// path appends straight into the input buffer when there is room, avoiding a
 /// call into [`gz_write`].
-pub(crate) fn gzputc(state: &mut GzState, c: i32) -> i32 {
+pub fn gzputc(state: &mut GzState, c: i32) -> i32 {
     // Check that we're writing and that there's no serious error (C L318-L321).
     if !write_ready(state) {
         return -1;
@@ -562,7 +562,7 @@ pub(crate) fn gzputc(state: &mut GzState, c: i32) -> i32 {
 ///
 /// Returns the number of bytes written, or `-1` on error. Mirrors the C guard
 /// that the string length fits in an [`i32`].
-pub(crate) fn gzputs(state: &mut GzState, s: &str) -> i32 {
+pub fn gzputs(state: &mut GzState, s: &str) -> i32 {
     // Check that we're writing and that there's no serious error (C L358-L361).
     if !write_ready(state) {
         return -1;
@@ -629,7 +629,7 @@ fn gz_vacate(state: &mut GzState) -> bool {
 ///
 /// Returns the number of formatted bytes written, `0` if the result did not fit
 /// in the buffer, or a negative [`ReturnCode`] code on error.
-pub(crate) fn gzvprintf(state: &mut GzState, args: core::fmt::Arguments<'_>) -> i32 {
+pub fn gzvprintf(state: &mut GzState, args: core::fmt::Arguments<'_>) -> i32 {
     // Check that we're writing and that there's no serious error (C L436-L439).
     if !write_ready(state) {
         return ReturnCode::StreamError.as_c_int();
@@ -695,7 +695,7 @@ pub(crate) fn gzvprintf(state: &mut GzState, args: core::fmt::Arguments<'_>) -> 
 /// Rust callers pass the formatted text via [`format_args!`], e.g.
 /// `gzprintf(state, format_args!("{}", value))`.
 #[inline]
-pub(crate) fn gzprintf(state: &mut GzState, args: core::fmt::Arguments<'_>) -> i32 {
+pub fn gzprintf(state: &mut GzState, args: core::fmt::Arguments<'_>) -> i32 {
     gzvprintf(state, args)
 }
 
@@ -704,7 +704,7 @@ pub(crate) fn gzprintf(state: &mut GzState, args: core::fmt::Arguments<'_>) -> i
 ///
 /// Returns [`ReturnCode::Ok`] (`0`) on success or the appropriate negative code
 /// on error. `flush` must be in `0..=Z_FINISH`.
-pub(crate) fn gzflush(state: &mut GzState, flush: i32) -> i32 {
+pub fn gzflush(state: &mut GzState, flush: i32) -> i32 {
     // Check that we're writing and that there's no serious error (C L546-L549).
     if !write_ready(state) {
         return ReturnCode::StreamError.as_c_int();
@@ -731,12 +731,22 @@ pub(crate) fn gzflush(state: &mut GzState, flush: i32) -> i32 {
 /// Finalize a write stream by flushing with [`FlushMode::Finish`], returning the
 /// resulting [`ReturnCode`].
 ///
-/// This keeps the write-specific finalization logic in this module: `gzclose_w`
-/// (in `close.rs`) calls it to produce the final block and the gzip CRC-32 +
-/// ISIZE trailer (a `Z_FINISH`), after which the buffers, engine, and file are
-/// released by [`GzState`](crate::gz::state::GzState)'s `Drop` — the RAII
-/// replacement for the C `deflateEnd`/`free`/`close` tail of `gzclose_w`
-/// (`gzwrite.c` L667-L700).
+/// This keeps the write-specific finalization logic in this module: it produces
+/// the final block and the gzip CRC-32 + ISIZE trailer (a `Z_FINISH`), after
+/// which the buffers, engine, and file are released by
+/// [`GzState`](crate::gz::state::GzState)'s `Drop` — the RAII replacement for
+/// the C `deflateEnd`/`free`/`close` tail of `gzclose_w` (`gzwrite.c`
+/// L667-L700). It is exercised by this module's unit tests and reserved as the
+/// write-side finalizer.
+///
+/// `#[allow(dead_code)]`: `gzclose_w` (in `close.rs`) does **not** call this
+/// helper — it inlines a C-exact finalize because this function returns
+/// `state.err` on a *successful* flush, which would let a pre-existing non-fatal
+/// error (e.g. `Z_ERRNO`) override `gzclose_w`'s result even when the `Z_FINISH`
+/// itself succeeded, diverging from C's "only a failed finalize sets `ret`"
+/// contract. The function is therefore unused by the library target (only by
+/// tests) but is deliberately retained.
+#[allow(dead_code)]
 pub(crate) fn finish_write(state: &mut GzState) -> ReturnCode {
     match gz_comp(state, FlushMode::Finish) {
         Ok(()) => state.err,

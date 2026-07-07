@@ -619,7 +619,7 @@ pub(crate) fn gz_read(state: &mut GzState, buf: &mut [u8]) -> usize {
 /// Returns the number of bytes read (`0` at end of file), or `-1` on error. The
 /// handle must be open for reading and free of a serious error. Because the C
 /// API returns an `int`, a request larger than [`i32::MAX`] is itself an error.
-pub(crate) fn gzread(state: &mut GzState, buf: &mut [u8]) -> i32 {
+pub fn gzread(state: &mut GzState, buf: &mut [u8]) -> i32 {
     // The handle must be open for reading (C L403-404).
     if state.mode != GzMode::Read {
         return -1;
@@ -667,7 +667,7 @@ pub(crate) fn gzread(state: &mut GzState, buf: &mut [u8]) -> i32 {
 /// that overflows [`usize`] is an error (returns `0`). If a partial item is read
 /// at end of file, its bytes are still delivered into `buf` but are not counted
 /// in the returned item total; the leftover can be recovered with [`gzgetc`].
-pub(crate) fn gzfread(state: &mut GzState, buf: &mut [u8], size: usize, nitems: usize) -> usize {
+pub fn gzfread(state: &mut GzState, buf: &mut [u8], size: usize, nitems: usize) -> usize {
     // The handle must be open for reading (C L446-447).
     if state.mode != GzMode::Read {
         return 0;
@@ -705,7 +705,7 @@ pub(crate) fn gzfread(state: &mut GzState, buf: &mut [u8], size: usize, nitems: 
 ///
 /// A byte already in the output buffer is returned directly on the fast path;
 /// otherwise [`gz_read`] is used to obtain one.
-pub(crate) fn gzgetc(state: &mut GzState) -> i32 {
+pub fn gzgetc(state: &mut GzState) -> i32 {
     // The handle must be open for reading (C L480-481).
     if state.mode != GzMode::Read {
         return -1;
@@ -739,7 +739,7 @@ pub(crate) fn gzgetc(state: &mut GzState) -> i32 {
 ///
 /// Reference zlib exposes `gzgetc` as a performance macro whose out-of-line
 /// fallback is `gzgetc_`; both share the identical behaviour of [`gzgetc`].
-pub(crate) fn gzgetc_(state: &mut GzState) -> i32 {
+pub fn gzgetc_(state: &mut GzState) -> i32 {
     gzgetc(state)
 }
 
@@ -750,7 +750,7 @@ pub(crate) fn gzgetc_(state: &mut GzState) -> i32 {
 /// after a fresh open (the double-sized output buffer reserves room); further
 /// pushes succeed only while buffer space remains. `c` must be a valid byte
 /// (`>= 0`); pushing EOF is rejected.
-pub(crate) fn gzungetc(c: i32, state: &mut GzState) -> i32 {
+pub fn gzungetc(c: i32, state: &mut GzState) -> i32 {
     // The handle must be open for reading (C L512-513).
     if state.mode != GzMode::Read {
         return -1;
@@ -826,7 +826,7 @@ pub(crate) fn gzungetc(c: i32, state: &mut GzState) -> i32 {
 /// then NUL-terminates the result. Returns [`Some`] with the number of bytes
 /// written (excluding the terminator), or [`None`] if `buf` is empty, the handle
 /// is not readable, or nothing was read before end of file.
-pub(crate) fn gzgets(state: &mut GzState, buf: &mut [u8]) -> Option<usize> {
+pub fn gzgets(state: &mut GzState, buf: &mut [u8]) -> Option<usize> {
     // Check parameters: the buffer must have room for at least the terminator
     // (C L574-575).
     if buf.is_empty() {
