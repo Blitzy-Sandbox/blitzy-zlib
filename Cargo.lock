@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.1.0"
+version = "1.3.2"
 dependencies = [
  "cfg-if",
  "crc32fast",
