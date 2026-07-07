@@ -582,7 +582,7 @@
             <div class="kpi-label">C dependencies (pure Rust)</div>
           </div>
         </div>
-        <p class="caption">Replacing ~23,107 lines of C — a net reduction of 25,464 lines across 105 commits.</p>
+        <p class="caption">Replacing ~23,107 lines of C with 33,724 lines of idiomatic, memory-safe Rust.</p>
       </section>
 
       <!-- ============================================================
@@ -778,7 +778,7 @@ flowchart LR
   CZ["C zlib deflate"] -. same wire format .-> S
           </pre>
         </div>
-        <p class="caption">&gt;98% safe-by-line; zero unsafe in the compression core. Streams produced by C zlib also decode through zlib-rs.</p>
+        <p class="caption">&gt;98% safe-by-line, zero <code>unsafe</code> in the compression core. Its ~47 <code>unsafe</code> blocks — each with a <code>// SAFETY:</code> comment (43 total) — sit only at FFI and the inflate fast-path.</p>
       </section>
 
       <!-- ============================================================
