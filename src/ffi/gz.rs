@@ -78,10 +78,7 @@ use std::os::fd::FromRawFd;
 
 use crate::error::ReturnCode;
 use crate::ffi::types::*;
-use crate::gz::{
-    self,
-    state::{GzMode, GzState},
-};
+use crate::gz::{self, GzMode, GzState};
 
 // ===========================================================================
 // Return-code constants
@@ -215,7 +212,7 @@ pub unsafe extern "C" fn gzopen(path: *const c_char, mode: *const c_char) -> gzF
         let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
             return ptr::null_mut();
         };
-        box_state(gz::open::gzopen(pathbuf, mode_str))
+        box_state(gz::gzopen(pathbuf, mode_str))
     })
 }
 
@@ -238,7 +235,7 @@ pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> g
         let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
             return ptr::null_mut();
         };
-        box_state(gz::open::gzopen64(pathbuf, mode_str))
+        box_state(gz::gzopen64(pathbuf, mode_str))
     })
 }
 
@@ -268,7 +265,7 @@ pub unsafe extern "C" fn gzdopen(fd: c_int, mode: *const c_char) -> gzFile {
         // descriptor (negatives rejected above). The resulting `File` owns the
         // descriptor and closes it on drop or via `gzclose`.
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
-        box_state(gz::open::gzdopen(file, mode_str))
+        box_state(gz::gzdopen(file, mode_str))
     })
 }
 
@@ -297,7 +294,7 @@ pub unsafe extern "C" fn gzbuffer(file: gzFile, size: c_uint) -> c_int {
         }
         // SAFETY: non-null handle from `gzopen*`/`gzdopen`; borrowed, not owned.
         let state = unsafe { &mut *(file as *mut GzState) };
-        gz::open::gzbuffer(state, size)
+        gz::gzbuffer(state, size)
     })
 }
 
@@ -314,7 +311,7 @@ pub unsafe extern "C" fn gzsetparams(file: gzFile, level: c_int, strategy: c_int
         }
         // SAFETY: non-null handle; borrowed, not owned.
         let state = unsafe { &mut *(file as *mut GzState) };
-        gz::open::gzsetparams(state, level, strategy)
+        gz::gzsetparams(state, level, strategy)
     })
 }
 
@@ -337,7 +334,7 @@ pub unsafe extern "C" fn gzread(file: gzFile, buf: voidp, len: c_uint) -> c_int 
         // SAFETY: `buf` is non-null (checked) and, per the C contract, valid for
         // writes of `len` bytes.
         let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
-        gz::read::gzread(state, out)
+        gz::gzread(state, out)
     })
 }
 
@@ -363,13 +360,13 @@ pub unsafe extern "C" fn gzfread(
         let Some(len) = size.checked_mul(nitems) else {
             // Overflow: let the idiomatic layer record Z_STREAM_ERROR and
             // return 0 (an empty slice cannot itself trigger a read).
-            return gz::read::gzfread(state, &mut [], size, nitems);
+            return gz::gzfread(state, &mut [], size, nitems);
         };
         if len == 0 {
             // Zero-length request (size == 0 or nitems == 0): drive the
             // idiomatic checks with an empty slice; `buf` may legitimately be
             // null in this case.
-            return gz::read::gzfread(state, &mut [], size, nitems);
+            return gz::gzfread(state, &mut [], size, nitems);
         }
         if buf.is_null() {
             // Non-zero length with no destination: decline safely rather than
@@ -379,7 +376,7 @@ pub unsafe extern "C" fn gzfread(
         // SAFETY: `buf` is non-null (checked) and valid for `len` bytes;
         // `len == size * nitems` did not overflow.
         let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
-        gz::read::gzfread(state, out, size, nitems)
+        gz::gzfread(state, out, size, nitems)
     })
 }
 
@@ -396,7 +393,7 @@ pub unsafe extern "C" fn gzgetc(file: gzFile) -> c_int {
         }
         // SAFETY: non-null handle; borrowed, not owned.
         let state = unsafe { &mut *(file as *mut GzState) };
-        gz::read::gzgetc(state)
+        gz::gzgetc(state)
     })
 }
 
@@ -412,7 +409,7 @@ pub unsafe extern "C" fn gzgetc_(file: gzFile) -> c_int {
         }
         // SAFETY: non-null handle; borrowed, not owned.
         let state = unsafe { &mut *(file as *mut GzState) };
-        gz::read::gzgetc_(state)
+        gz::gzgetc_(state)
     })
 }
 
@@ -433,7 +430,7 @@ pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *
         // SAFETY: `buf` is non-null (checked) and valid for `len` bytes
         // (`len > 0` checked). The idiomatic writer NUL-terminates within it.
         let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
-        match gz::read::gzgets(state, out) {
+        match gz::gzgets(state, out) {
             Some(_) => buf,
             None => ptr::null_mut(),
         }
@@ -453,7 +450,7 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
         }
         // SAFETY: non-null handle; borrowed, not owned.
         let state = unsafe { &mut *(file as *mut GzState) };
-        gz::read::gzungetc(c, state)
+        gz::gzungetc(c, state)
     })
 }
 
@@ -486,7 +483,7 @@ pub unsafe extern "C" fn gzwrite(file: gzFile, buf: voidpc, len: c_uint) -> c_in
             // for reads of `len` bytes per the C contract.
             unsafe { slice::from_raw_parts(buf as *const u8, len as usize) }
         };
-        gz::write::gzwrite(state, input)
+        gz::gzwrite(state, input)
     })
 }
 
@@ -511,12 +508,12 @@ pub unsafe extern "C" fn gzfwrite(
         let state = unsafe { &mut *(file as *mut GzState) };
         let Some(len) = size.checked_mul(nitems) else {
             // Overflow: idiomatic layer records Z_STREAM_ERROR and returns 0.
-            return gz::write::gzfwrite(state, &[], size, nitems);
+            return gz::gzfwrite(state, &[], size, nitems);
         };
         if len == 0 {
             // Zero-length request: drive the idiomatic checks with an empty
             // slice; `buf` may legitimately be null.
-            return gz::write::gzfwrite(state, &[], size, nitems);
+            return gz::gzfwrite(state, &[], size, nitems);
         }
         if buf.is_null() {
             return 0;
@@ -524,7 +521,7 @@ pub unsafe extern "C" fn gzfwrite(
         // SAFETY: `buf` is non-null (checked) and valid for `len` bytes;
         // `len == size * nitems` did not overflow.
         let input = unsafe { slice::from_raw_parts(buf as *const u8, len) };
-        gz::write::gzfwrite(state, input, size, nitems)
+        gz::gzfwrite(state, input, size, nitems)
     })
 }
 
@@ -540,7 +537,7 @@ pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
         }
         // SAFETY: non-null handle; borrowed, not owned.
         let state = unsafe { &mut *(file as *mut GzState) };
-        gz::write::gzputc(state, c)
+        gz::gzputc(state, c)
     })
 }
 
@@ -563,11 +560,11 @@ pub unsafe extern "C" fn gzputs(file: gzFile, s: *const c_char) -> c_int {
         // SAFETY: `s` is non-null (checked) and a NUL-terminated C string.
         let bytes = unsafe { CStr::from_ptr(s) }.to_bytes();
         match core::str::from_utf8(bytes) {
-            Ok(text) => gz::write::gzputs(state, text),
+            Ok(text) => gz::gzputs(state, text),
             Err(_) => {
                 // Non-UTF-8: write raw bytes, preserving gzputs' -1-on-error
                 // contract (`gzwrite` returns 0 on error).
-                let n = gz::write::gzwrite(state, bytes);
+                let n = gz::gzwrite(state, bytes);
                 if n == 0 && !bytes.is_empty() { -1 } else { n }
             }
         }
@@ -586,7 +583,7 @@ pub unsafe extern "C" fn gzflush(file: gzFile, flush: c_int) -> c_int {
         }
         // SAFETY: non-null handle; borrowed, not owned.
         let state = unsafe { &mut *(file as *mut GzState) };
-        gz::write::gzflush(state, flush)
+        gz::gzflush(state, flush)
     })
 }
 
@@ -600,7 +597,7 @@ pub unsafe extern "C" fn gzflush(file: gzFile, flush: c_int) -> c_int {
 // On stable they are simply absent; every other `gz*` symbol is present. The
 // idiomatic writer accepts pre-formatted `core::fmt::Arguments`, so a faithful
 // nightly implementation would parse the C `printf` format string and forward
-// the rendered result to `gz::write::gzvprintf`. We deliberately do NOT ship an
+// the rendered result to `gz::gzvprintf`. We deliberately do NOT ship an
 // ABI-incompatible stub on stable — silently mismatching a variadic ABI would
 // corrupt callers.
 
@@ -654,7 +651,7 @@ pub unsafe extern "C" fn gzvprintf(
         // bytes actually stored (excluding the reserved NUL slot).
         let written = core::cmp::min(n as usize, cap - 1);
         let text = String::from_utf8_lossy(&buf[..written]);
-        gz::write::gzvprintf(state, format_args!("{text}"))
+        gz::gzvprintf(state, format_args!("{text}"))
     })
 }
 
@@ -693,7 +690,7 @@ pub unsafe extern "C" fn gzseek(file: gzFile, offset: z_off_t, whence: c_int) ->
         let state = unsafe { &mut *(file as *mut GzState) };
         // Widen the C `off_t` to the engine's 64-bit offset. On 32-bit targets
         // (`z_off_t == i32`) this is a real widening; on 64-bit it is a no-op.
-        gz::open::gzseek(state, offset as z_off64_t, whence)
+        gz::gzseek(state, offset as z_off64_t, whence)
     }) as z_off_t
 }
 
@@ -708,7 +705,7 @@ pub unsafe extern "C" fn gzseek64(file: gzFile, offset: z_off64_t, whence: c_int
         }
         // SAFETY: non-null handle; borrowed, not owned.
         let state = unsafe { &mut *(file as *mut GzState) };
-        gz::open::gzseek64(state, offset, whence)
+        gz::gzseek64(state, offset, whence)
     })
 }
 
@@ -724,7 +721,7 @@ pub unsafe extern "C" fn gzrewind(file: gzFile) -> c_int {
         }
         // SAFETY: non-null handle; borrowed, not owned.
         let state = unsafe { &mut *(file as *mut GzState) };
-        gz::open::gzrewind(state)
+        gz::gzrewind(state)
     })
 }
 
@@ -739,7 +736,7 @@ pub unsafe extern "C" fn gztell(file: gzFile) -> z_off_t {
         }
         // SAFETY: non-null handle; borrowed immutably.
         let state = unsafe { &*(file as *const GzState) };
-        gz::open::gztell(state)
+        gz::gztell(state)
     }) as z_off_t
 }
 
@@ -754,7 +751,7 @@ pub unsafe extern "C" fn gztell64(file: gzFile) -> z_off64_t {
         }
         // SAFETY: non-null handle; borrowed immutably.
         let state = unsafe { &*(file as *const GzState) };
-        gz::open::gztell64(state)
+        gz::gztell64(state)
     })
 }
 
@@ -770,7 +767,7 @@ pub unsafe extern "C" fn gzoffset(file: gzFile) -> z_off_t {
         }
         // SAFETY: non-null handle; borrowed, not owned.
         let state = unsafe { &mut *(file as *mut GzState) };
-        gz::open::gzoffset(state)
+        gz::gzoffset(state)
     }) as z_off_t
 }
 
@@ -785,7 +782,7 @@ pub unsafe extern "C" fn gzoffset64(file: gzFile) -> z_off64_t {
         }
         // SAFETY: non-null handle; borrowed, not owned.
         let state = unsafe { &mut *(file as *mut GzState) };
-        gz::open::gzoffset64(state)
+        gz::gzoffset64(state)
     })
 }
 
@@ -801,7 +798,7 @@ pub unsafe extern "C" fn gzeof(file: gzFile) -> c_int {
         }
         // SAFETY: non-null handle; borrowed immutably.
         let state = unsafe { &*(file as *const GzState) };
-        gz::open::gzeof(state)
+        gz::gzeof(state)
     })
 }
 
@@ -818,7 +815,7 @@ pub unsafe extern "C" fn gzdirect(file: gzFile) -> c_int {
         }
         // SAFETY: non-null handle; borrowed, not owned.
         let state = unsafe { &mut *(file as *mut GzState) };
-        gz::open::gzdirect(state)
+        gz::gzdirect(state)
     })
 }
 
@@ -870,7 +867,7 @@ pub unsafe extern "C" fn gzclearerr(file: gzFile) {
         }
         // SAFETY: non-null handle; borrowed, not owned.
         let state = unsafe { &mut *(file as *mut GzState) };
-        gz::open::gzclearerr(state);
+        gz::gzclearerr(state);
     });
 }
 
@@ -890,7 +887,7 @@ pub unsafe extern "C" fn gzclose(file: gzFile) -> c_int {
         // take ownership, then hand it to the idiomatic close (which dispatches
         // on read/write mode).
         let state = unsafe { Box::from_raw(file as *mut GzState) };
-        gz::close::gzclose(state)
+        gz::gzclose(state)
     })
 }
 
@@ -907,7 +904,7 @@ pub unsafe extern "C" fn gzclose_r(file: gzFile) -> c_int {
         // SAFETY: `file` was produced as `Box::into_raw(Box<GzState>)`;
         // reconstruct the owning box exactly once.
         let state = unsafe { Box::from_raw(file as *mut GzState) };
-        gz::close::gzclose_r(state)
+        gz::gzclose_r(state)
     })
 }
 
@@ -925,7 +922,7 @@ pub unsafe extern "C" fn gzclose_w(file: gzFile) -> c_int {
         // SAFETY: `file` was produced as `Box::into_raw(Box<GzState>)`;
         // reconstruct the owning box exactly once.
         let state = unsafe { Box::from_raw(file as *mut GzState) };
-        gz::close::gzclose_w(state)
+        gz::gzclose_w(state)
     })
 }
 
@@ -963,7 +960,7 @@ pub unsafe extern "C" fn gzopen_w(path: *const u16, mode: *const c_char) -> gzFi
         let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
             return ptr::null_mut();
         };
-        box_state(gz::open::gzopen(std::path::PathBuf::from(os), mode_str))
+        box_state(gz::gzopen(std::path::PathBuf::from(os), mode_str))
     })
 }
 

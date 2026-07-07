@@ -49,3 +49,10 @@ user.bazelrc
 # MODULE.bazel.lock is ignored for now as per this recommendation:
 # https://github.com/bazelbuild/bazel/issues/20369
 MODULE.bazel.lock
+
+# Rust / Cargo (zlib-rs migration)
+# Build output directory produced by `cargo build`/`cargo test` — never committed.
+/target
+# Cargo.lock IS tracked: the crate emits cdylib/staticlib distributable artifacts
+# and the migration pins exact resolved dependency versions for reproducible,
+# offline builds, so the lockfile is intentionally committed.

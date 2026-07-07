@@ -539,6 +539,11 @@ impl<A: Allocator> ZStream<A> {
     /// Used internally where a specific message is required that is not the
     /// canonical [`ReturnCode`] text (for example the deflate/inflate
     /// parameter-validation diagnostics).
+    // Reserved internal API: consumed by this module's unit tests and intended
+    // for the deflate/inflate parameter-validation diagnostics. Retained even in
+    // build configurations that wire up no production caller, so the dead-code
+    // lint is allowed narrowly here rather than dropping tested functionality.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn set_msg_str(&mut self, message: &'static str) {
         self.msg = Some(message);
@@ -558,6 +563,11 @@ impl<A: Allocator> ZStream<A> {
     /// resets its own internal fields (and sets `adler`/`data_type` to their
     /// wrapper-appropriate values), while these stream-level fields are cleared
     /// here.
+    // Reserved internal API: consumed by this module's unit tests and intended
+    // as the shared stream-level portion of deflateReset/inflateReset. Retained
+    // even in build configurations that wire up no production caller, so the
+    // dead-code lint is allowed narrowly here rather than dropping tested code.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn reset_bookkeeping(&mut self) {
         self.total_in = 0;
