@@ -213,6 +213,27 @@ pub struct GzState {
     /// [`have`](Self::have), so a retry can still make progress.
     pub(crate) again: bool,
 
+    /// Offset into [`in_buf`](Self::in_buf) of the next unconsumed *compressed*
+    /// input byte — the safe index form of the C `z_stream.next_in` pointer as
+    /// used by the read layer.
+    ///
+    /// In reference zlib the input-buffer cursor lives on the embedded
+    /// `z_stream` (`strm.next_in` / `strm.avail_in`). This crate's idiomatic
+    /// [`ZStream`] deliberately carries **no** `next_in`/`avail_in` fields —
+    /// input is handed to the engine as a slice on every call and progress is
+    /// reported back explicitly — so the read driver (`read.rs`) must itself
+    /// remember how much of [`in_buf`](Self::in_buf) is still unconsumed between
+    /// calls (compressed input frequently survives a call when the output buffer
+    /// fills before the input is exhausted). Together with
+    /// [`in_avail`](Self::in_avail) this describes the not-yet-decompressed input
+    /// as the slice `in_buf[in_next .. in_next + in_avail]`.
+    pub(crate) in_next: usize,
+
+    /// Number of unconsumed *compressed* input bytes available at
+    /// [`in_next`](Self::in_next) (C `z_stream.avail_in`, relocated onto the gz
+    /// state — see [`in_next`](Self::in_next) for why).
+    pub(crate) in_avail: usize,
+
     /// The file position where the gzip data started, used as the rewind anchor
     /// for `gzrewind`/`gzseek` (C `z_off64_t start`).
     pub(crate) start: i64,
@@ -403,6 +424,8 @@ mod tests {
             how: How::Look,
             junk: -1,
             again: false,
+            in_next: 0,
+            in_avail: 0,
             start: 0,
             eof: false,
             past: false,
