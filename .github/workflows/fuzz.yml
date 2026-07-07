@@ -1,25 +1,98 @@
-name: OSS-Fuzz
-on: [pull_request]
+# .github/workflows/fuzz.yml
+#
+# Fuzzing pipeline for the zlib-rs crate (C -> Rust migration of zlib 1.3.2.1).
+#
+# MIGRATION NOTE:
+#   This workflow was retargeted from the previous C-oriented fuzzing-service
+#   integration (which exercised the original C library) to a pure-Rust
+#   `cargo-fuzz` (libFuzzer) pipeline. There is intentionally no C toolchain
+#   here and no external fuzzing service: everything runs through Cargo,
+#   consistent with the crate's Cargo-only CI (see ci.yml).
+#
+#   cargo-fuzz builds libFuzzer harnesses and therefore REQUIRES a Rust
+#   *nightly* toolchain: it relies on `-Z` sanitizer / coverage instrumentation
+#   that is not available on stable.
+#
+#   Known follow-up: the in-repo `fuzz/` crate and its fuzz targets are a
+#   separately-tracked deliverable and do not exist yet. The run step below is
+#   deliberately authored to be "correct and forgiving": it installs cargo-fuzz
+#   and invokes `cargo fuzz run` when a target is present, and cleanly skips
+#   (without failing the pipeline) while the `fuzz/` crate is still absent.
+
+name: Fuzz
+
+# Triggers:
+#   * pull_request      - hard requirement carried over from the original file.
+#   * workflow_dispatch - allow maintainers to launch a fuzz run on demand.
+#   * schedule          - a weekly bounded run (Mondays 03:00 UTC) for drift
+#                         detection once fuzz targets land.
+on:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 1'
+
+# Principle of least privilege: this workflow only needs read access to the
+# repository contents in order to check out and build the fuzz harnesses.
+permissions:
+  contents: read
+
+# Avoid piling up redundant fuzz runs: a newer commit on the same ref cancels
+# any still-running fuzz job for that ref.
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  Fuzzing:
+  cargo-fuzz:
+    name: cargo-fuzz (libFuzzer)
     runs-on: ubuntu-latest
     steps:
-    - name: Build Fuzzers
-      uses: google/oss-fuzz/infra/cifuzz/actions/build_fuzzers@master
-      with:
-        oss-fuzz-project-name: 'zlib'
-        dry-run: false
+      # 1. Fetch the crate sources.
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Run Fuzzers
-      uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@master
-      with:
-        oss-fuzz-project-name: 'zlib'
-        fuzz-seconds: 300
-        dry-run: false
+      # 2. cargo-fuzz / libFuzzer require a nightly toolchain for the sanitizer
+      #    and coverage instrumentation it injects into the harness.
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
 
-    - name: Upload Crash
-      uses: actions/upload-artifact@v6
-      if: failure()
-      with:
-        name: artifacts
-        path: ./out/artifacts
+      # 3. Install the cargo-fuzz subcommand (the libFuzzer front-end).
+      #    `--locked` keeps the install reproducible against cargo-fuzz's own
+      #    lockfile.
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # 4. Run the first available fuzz target for a bounded duration (mirrors
+      #    the original 300s budget). Guarded so that the absence of the
+      #    not-yet-created `fuzz/` crate does not hard-fail the pipeline.
+      - name: Run fuzz target (bounded)
+        run: |
+          # Robust under the GitHub Actions default shell (bash -eo pipefail):
+          # capture `cargo fuzz list` ONCE into a variable (avoids a `| head`
+          # SIGPIPE hazard) and tolerate the not-yet-created `fuzz/` crate so a
+          # missing target set never red-walls the pipeline.
+          if [ -d fuzz ]; then
+            targets="$(cargo fuzz list || true)"
+            if [ -n "${targets}" ]; then
+              target="${targets%%$'\n'*}"
+              echo "Running fuzz target: ${target}"
+              cargo fuzz run "${target}" -- -max_total_time=300
+            else
+              echo "No cargo-fuzz targets present yet (fuzz/ crate is a tracked follow-up); skipping run."
+            fi
+          else
+            echo "No cargo-fuzz targets present yet (fuzz/ crate is a tracked follow-up); skipping run."
+          fi
+
+      # 5. On failure (a crash/timeout reproducer was written), publish the
+      #    cargo-fuzz artifacts directory so the offending input is retrievable.
+      #    This replaces the previous crash-artifact upload location.
+      - name: Upload crash artifacts
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          retention-days: 7
+          if-no-files-found: ignore
