@@ -158,7 +158,31 @@ harness = false
 opt-level = 3
 lto = true
 codegen-units = 1
-# NOTE: `panic` is intentionally left at the default `unwind`. The FFI shims
-# must never unwind into C, but that is handled with `catch_unwind` inside
-# `src/ffi/`, NOT by setting `panic = "abort"` (which would also change the
-# behavior of the emitted `cdylib`/`staticlib` artifacts).
+# `panic = "abort"` is REQUIRED (not merely preferred): a `--no-default-features`
+# (`no_std`) build emits the `cdylib`/`staticlib` without an unwinding runtime,
+# and on a STABLE toolchain the compiler then rejects unwinding panics with
+# "unwinding panics are not supported without std". `panic = "abort"` is the only
+# stable mechanism that suppresses that requirement (there is no `#![panic_abort]`
+# attribute and `eh_personality` is nightly-only), and Cargo cannot scope the
+# panic strategy to a single feature or crate-type — so it MUST be set globally,
+# here and in `[profile.dev]`, for BOTH the std and no_std builds.
+#
+# This does NOT weaken the FFI safety contract. The invariant is "a Rust panic
+# must never unwind across the C ABI" (unwinding across it is UB); `panic =
+# "abort"` upholds that invariant directly. The `catch_unwind` guards in
+# `src/ffi/` remain in place (gated on `feature = "std"`) as defense-in-depth,
+# and Cargo forces the `unwind` strategy for the `cargo test`/`bench` harness
+# regardless of this setting, so those guard tests still exercise `catch_unwind`
+# and pass. For every non-panicking call — the entire functional surface —
+# behavior is identical; only a genuine internal "cannot happen" panic now
+# aborts the process (a sound, non-UB outcome) instead of being caught and
+# converted to a `Z_*` error code.
+panic = "abort"
+
+[profile.dev]
+# The panic strategy MUST match `[profile.release]`. The reproduction command
+# for the `no_std` build, `cargo build --no-default-features`, uses THIS profile,
+# and its `cdylib`/`staticlib` link step requires `panic = "abort"` on stable
+# (see the detailed rationale in `[profile.release]` above). Setting it here
+# keeps debug and release builds consistent for both the std and no_std targets.
+panic = "abort"

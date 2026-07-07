@@ -38,8 +38,6 @@
 //! `deflate.c` / `trees.c` line-by-line.
 
 use alloc::boxed::Box;
-use alloc::vec;
-use alloc::vec::Vec;
 
 use crate::checksum::adler32;
 // `crc32` is only used for gzip (`wrap == 2`) framing, so gate its import to
@@ -50,6 +48,7 @@ use crate::constants::{DataType, MAX_MEM_LEVEL, Strategy, Z_DEFAULT_COMPRESSION,
 use crate::error::ZlibError;
 #[cfg(feature = "gzip")]
 use crate::gz_header::GzHeader;
+use crate::stream::{AllocBuffer, AllocHook};
 
 // ===========================================================================
 // Compile-time constants (ported from deflate.h / trees.h / trees.c / zutil.h)
@@ -493,7 +492,7 @@ pub struct DeflateState {
     /// Output staging buffer (C `pending_buf`). Bytes produced by the bit
     /// packer accumulate here before being copied to the caller's output by
     /// [`flush_pending`](Self::flush_pending). Sized `lit_bufsize * 4`.
-    pub pending_buf: Vec<u8>,
+    pub pending_buf: AllocBuffer<u8>,
 
     /// Size of [`pending_buf`](Self::pending_buf) in bytes (C
     /// `pending_buf_size`), equal to `lit_bufsize * 4`.
@@ -538,7 +537,7 @@ pub struct DeflateState {
 
     /// The sliding window (C `window`), of length `2 * w_size`. Input bytes are
     /// read into the upper half and shifted down to retain a dictionary.
-    pub window: Vec<u8>,
+    pub window: AllocBuffer<u8>,
 
     /// Actual usable window size, `2 * w_size` (C `window_size`).
     pub window_size: usize,
@@ -546,11 +545,11 @@ pub struct DeflateState {
     /// Hash-chain link table (C `prev`), length `w_size`. `prev[i]` links a
     /// window position to the previous position with the same hash. Entries are
     /// `Pos` (`u16`) window indices modulo `w_size`.
-    pub prev: Vec<u16>,
+    pub prev: AllocBuffer<u16>,
 
     /// Hash-chain heads (C `head`), length `hash_size`. `head[h]` is the most
     /// recent window position hashing to `h`, or [`NIL`].
-    pub head: Vec<u16>,
+    pub head: AllocBuffer<u16>,
 
     /// Running hash index of the string about to be inserted (C `ins_h`).
     pub ins_h: usize,
@@ -660,7 +659,7 @@ pub struct DeflateState {
     /// pointer aliasing. The overflow interaction with `pending_buf` is
     /// preserved because the symbol buffer is only consumed (by `compress_block`
     /// in `trees.rs`) at a flush, when `pending` has been drained.
-    pub sym_buf: Vec<u8>,
+    pub sym_buf: AllocBuffer<u8>,
 
     /// Size of the literal/length symbol buffer in symbols-worth of bytes
     /// (C `lit_bufsize`), equal to `1 << (mem_level + 6)`.
@@ -751,7 +750,41 @@ impl DeflateState {
     /// # Errors
     ///
     /// Returns [`ZlibError::StreamError`] if any parameter is invalid.
+    ///
+    /// # Allocator
+    ///
+    /// This convenience constructor uses the Rust global allocator for all
+    /// working buffers (equivalent to a C caller with null `zalloc`/`zfree`).
+    /// The FFI init path calls [`new_in`](Self::new_in) instead, passing the
+    /// caller's [`AllocHook`] so the buffers are routed through the caller's
+    /// `zalloc`/`zfree` (AAP §0.6.3).
+    #[inline]
     pub fn new(
+        level: i32,
+        method: i32,
+        window_bits: i32,
+        mem_level: i32,
+        strategy: Strategy,
+        wrap: i32,
+    ) -> Result<Box<DeflateState>, ZlibError> {
+        Self::new_in(
+            AllocHook::none(),
+            level,
+            method,
+            window_bits,
+            mem_level,
+            strategy,
+            wrap,
+        )
+    }
+
+    /// Builds a boxed [`DeflateState`], allocating every working buffer through
+    /// the supplied [`AllocHook`] (the caller's `zalloc`/`zfree` when active, or
+    /// the global allocator otherwise). See [`new`](Self::new) for the parameter
+    /// contract, I/O-side-reset note, and errors — this is the same constructor
+    /// with an explicit allocator hook (AAP §0.6.3 has-hook clause).
+    pub fn new_in(
+        hook: AllocHook,
         level: i32,
         method: i32,
         window_bits: i32,
@@ -801,7 +834,7 @@ impl DeflateState {
 
         let mut state = Box::new(DeflateState {
             status: DeflateStatus::Init,
-            pending_buf: vec![0u8; pending_buf_size],
+            pending_buf: AllocBuffer::zeroed(pending_buf_size, hook),
             pending_buf_size,
             pending_out: 0,
             pending: 0,
@@ -815,10 +848,10 @@ impl DeflateState {
             w_size,
             w_bits,
             w_mask,
-            window: vec![0u8; 2 * w_size],
+            window: AllocBuffer::zeroed(2 * w_size, hook),
             window_size: 2 * w_size,
-            prev: vec![0u16; w_size],
-            head: vec![0u16; hash_size],
+            prev: AllocBuffer::zeroed(w_size, hook),
+            head: AllocBuffer::zeroed(hash_size, hook),
             ins_h: 0,
             hash_size,
             hash_bits,
@@ -849,7 +882,7 @@ impl DeflateState {
             heap_len: 0,
             heap_max: 0,
             depth: [0u8; 2 * L_CODES + 1],
-            sym_buf: vec![0u8; lit_bufsize * 3],
+            sym_buf: AllocBuffer::zeroed(lit_bufsize * 3, hook),
             lit_bufsize,
             sym_next: 0,
             sym_end,
@@ -1659,9 +1692,32 @@ mod tests {
         // windowBits out of range.
         assert!(DeflateState::new(6, Z_DEFLATED, 16, 8, Strategy::Default, 1).is_err());
         assert!(DeflateState::new(6, Z_DEFLATED, 7, 8, Strategy::Default, 1).is_err());
-        // memLevel out of range.
-        assert!(DeflateState::new(6, Z_DEFLATED, 15, 9, Strategy::Default, 1).is_err());
+        // memLevel out of range: `0` (below the `1` minimum) and `10` (above
+        // MAX_MEM_LEVEL == 9) are rejected; the full `1..=9` range is accepted
+        // (see `new_accepts_max_mem_level`).
         assert!(DeflateState::new(6, Z_DEFLATED, 15, 0, Strategy::Default, 1).is_err());
+        assert!(DeflateState::new(6, Z_DEFLATED, 15, 10, Strategy::Default, 1).is_err());
+    }
+
+    /// `memLevel == MAX_MEM_LEVEL == 9` must be accepted, matching reference
+    /// zlib on modern (non-`MAXSEG_64K`) platforms (`deflate.c` L434). This is
+    /// the boundary that a stricter `MAX_MEM_LEVEL == 8` would wrongly reject.
+    #[test]
+    fn new_accepts_max_mem_level() {
+        // Every in-range memLevel (1..=9) constructs successfully.
+        for mem_level in 1..=MAX_MEM_LEVEL {
+            assert!(
+                DeflateState::new(6, Z_DEFLATED, 15, mem_level, Strategy::Default, 1).is_ok(),
+                "memLevel {mem_level} should be accepted"
+            );
+        }
+        // memLevel == 9 sizes the hash table with hash_bits == mem_level + 7 == 16.
+        let s = DeflateState::new(6, Z_DEFLATED, 15, 9, Strategy::Default, 1).unwrap();
+        assert_eq!(s.mem_level, 9);
+        assert_eq!(s.hash_bits, 16);
+        assert_eq!(s.hash_size, 1 << 16);
+        assert_eq!(s.head.len(), 1 << 16);
+        assert_eq!(s.lit_bufsize, 1 << 15);
     }
 
     /// `slide_hash` decrements entries by `w_size`, flooring at `NIL`.

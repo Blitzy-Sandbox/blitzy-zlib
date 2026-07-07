@@ -61,7 +61,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::gz_header::GzHeader;
-use crate::stream::{Allocator, DefaultAllocator, ZStream};
+use crate::stream::{AllocBuffer, AllocHook, Allocator, ZStream};
 
 // ===========================================================================
 // Phase 2 — C scalar type aliases (mirror `zconf.h`)
@@ -310,26 +310,31 @@ pub type gzFile = *mut gzFile_s;
 /// shims a *single* monomorphized handle type to box into
 /// [`z_stream::state`] regardless of whether the caller supplied hooks.
 ///
-/// # Known limitation (hooks vs. the `Vec`-based allocator)
+/// # Hook routing (AAP §0.6.3 "has-hook clause")
 ///
-/// The crate's realized [`Allocator`](crate::stream::Allocator) trait is
-/// **`Vec`-based and infallible**: `allocate_zeroed::<T>(count) -> Vec<T>` and
-/// `deallocate::<T>(Vec<T>)`. On stable Rust (MSRV 1.85) there is no stable
-/// `allocator_api`, so a `Vec` **cannot** be soundly backed by memory obtained
-/// from the caller's `zalloc` and later released through `zfree` (dropping the
-/// `Vec` would route through the *global* allocator, which is undefined
-/// behavior for foreign memory). The trait also has no channel to report a
-/// `zalloc` returning null (the C `Z_MEM_ERROR` case). Consequently
-/// [`CAllocator`] routes **buffer** allocation through the global allocator —
-/// exactly matching AAP §0.6.3 ("otherwise `std::alloc` is used") and the
-/// observation that the sibling engines allocate their working buffers
-/// (window, `pending_buf`, hash tables) directly via the global allocator.
+/// The crate's [`Allocator`](crate::stream::Allocator) trait returns an
+/// [`AllocBuffer`](crate::stream::AllocBuffer) — a smart owned region that is
+/// **either** a global-allocator [`Vec`] **or** a foreign region carved from a
+/// caller's `zalloc` and released through their `zfree` on [`Drop`]. This
+/// resolves the historical limitation (a `Vec` cannot be soundly reclaimed
+/// through a foreign `zfree` on stable Rust, which lacks a stable
+/// `allocator_api`): the foreign case is a dedicated variant that owns its raw
+/// pointer and hook, so its `Drop` calls the matching `zfree` — never the
+/// global allocator.
 ///
-/// The caller's hooks are nonetheless retained on this struct for ABI
-/// completeness and so a shim that performs a raw allocation of its own can
-/// consult them. The **ABI guarantee** this type upholds is unconditional:
-/// supplying `zalloc`/`zfree` never breaks the stream, and leaving them null
-/// works.
+/// [`CAllocator`] therefore forwards its captured triple as an
+/// [`AllocHook`](crate::stream::AllocHook) via [`Allocator::hook`], and its
+/// [`allocate_zeroed`](Allocator::allocate_zeroed) routes every working buffer
+/// (window, `pending_buf`, hash tables) through the caller's `zalloc` when
+/// **both** `zalloc` and `zfree` are supplied. When they are null (or `zalloc`
+/// reports OOM) it falls back to the global allocator, exactly matching AAP
+/// §0.6.3's "otherwise `std::alloc` is used" clause. The **ABI guarantee** is
+/// unconditional: supplying `zalloc`/`zfree` routes allocation through them and
+/// never breaks the stream, and leaving them null works identically to before.
+///
+/// The boxed engine *state* handle itself is still allocated through the global
+/// allocator (Rust `Box`); it is the working *buffers* — the bulk of a stream's
+/// footprint and precisely what AAP §0.6.3 enumerates — that honor the hook.
 #[derive(Clone, Copy)]
 pub struct CAllocator {
     /// The caller's allocation hook, or `None` (mirrors [`z_stream::zalloc`]).
@@ -363,23 +368,39 @@ impl CAllocator {
 }
 
 impl Allocator for CAllocator {
-    /// Allocates a zero-initialized buffer of `count` elements.
+    /// Allocates a zero-initialized buffer of `count` elements, **routing
+    /// through the caller's `zalloc` when supplied** (AAP §0.6.3, "has-hook
+    /// clause").
     ///
-    /// Per the [known limitation](CAllocator#known-limitation), this delegates
-    /// to the global allocator via [`DefaultAllocator`]; the caller's `zalloc`
-    /// hook is not used to back the returned [`Vec`] because a `Vec` cannot be
-    /// soundly reclaimed through a foreign `zfree` on stable Rust.
+    /// The returned [`AllocBuffer`] is a [`Foreign`](AllocBuffer::Foreign)
+    /// region carved from the caller's `zalloc` (and released through their
+    /// `zfree` on drop) whenever this [`CAllocator`] carries an active
+    /// [`hook`](Allocator::hook); otherwise — null hooks, an empty request, or a
+    /// `zalloc` reporting OOM — it falls back to a global-allocator
+    /// [`Vec`](AllocBuffer::Owned), matching AAP §0.6.3's "otherwise `std::alloc`
+    /// is used" clause. Soundness is preserved because the returned buffer knows
+    /// its own backing store and frees it the matching way on [`Drop`] — the
+    /// historical unsoundness of dropping a foreign-backed `Vec` through the
+    /// global allocator cannot occur.
     #[inline]
-    fn allocate_zeroed<T>(&self, count: usize) -> Vec<T>
+    fn allocate_zeroed<T>(&self, count: usize) -> AllocBuffer<T>
     where
         T: Copy + Default,
     {
-        DefaultAllocator.allocate_zeroed(count)
+        AllocBuffer::zeroed(count, self.hook())
     }
 
-    // `deallocate` intentionally uses the trait default (drops the `Vec` so the
-    // global allocator reclaims it). It must NOT route to the caller's `zfree`,
-    // because `allocate_zeroed` returned globally-allocated storage.
+    /// Exposes the caller's `zalloc`/`zfree`/`opaque` triple as an
+    /// [`AllocHook`], so buffers this allocator produces (directly, or lazily on
+    /// a state it initializes) are backed by the caller's allocator.
+    #[inline]
+    fn hook(&self) -> AllocHook {
+        AllocHook::new(self.zalloc, self.zfree, self.opaque)
+    }
+
+    // `deallocate` uses the trait default: dropping the `AllocBuffer` routes to
+    // the correct deallocator — the caller's `zfree` for a `Foreign` region, or
+    // the global allocator for an `Owned` fallback.
 }
 
 /// Builds an idiomatic [`ZStream<CAllocator>`](crate::stream::ZStream) whose
@@ -476,6 +497,146 @@ pub unsafe fn state_take<T>(strm: &mut z_stream) -> Option<Box<T>> {
         let b = unsafe { Box::from_raw(strm.state as *mut T) };
         strm.state = ptr::null_mut();
         Some(b)
+    }
+}
+
+// --- Type-tagged state handles (FINDING-6) ---------------------------------
+//
+// The C `deflateEnd`/`inflateEnd` contract lets a caller (incorrectly) pass a
+// stream that was initialized by the *other* engine. The deflate and inflate
+// handles are `Box`es of DIFFERENT concrete types — hence different sizes — so a
+// blind `Box::from_raw(state as *mut T)` inside the wrong `End` shim would
+// reconstitute (and drop) a `Box<T>` whose `Layout` does not match the original
+// allocation. That violates the `GlobalAlloc::dealloc` contract (the dealloc
+// `Layout` must equal the alloc `Layout`): undefined behavior, benign on glibc's
+// size-agnostic `free` but heap-corrupting under sized-dealloc allocators such
+// as jemalloc/mimalloc. Tagging each handle with a discriminant at offset 0 and
+// validating it BEFORE reconstituting the box makes the mismatch detectable, so
+// the shim returns `Z_STREAM_ERROR` without ever dropping a wrong-type box.
+
+/// Discriminant magic stored as the FIRST field (offset 0) of every boxed FFI
+/// engine handle installed in [`z_stream::state`].
+///
+/// Stored as a plain `u64` (via `#[repr(transparent)]`) so the tag can be read
+/// through [`HandleHeader`] with no enum-validity concern: every bit pattern is
+/// a valid `u64`, and only the published magics compare equal. The values have
+/// their high bits set so they can never collide with the small integer that
+/// leads an untagged engine state (e.g. the `inflateBack` `InflateState` mode).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct HandleKind(u64);
+
+impl HandleKind {
+    /// Tag identifying a boxed [`DeflateHandle`] (a `deflate*`-owned stream).
+    pub const DEFLATE: HandleKind = HandleKind(0xDEF1_A7E5_0DEF_0001);
+    /// Tag identifying a boxed inflate handle (an `inflate*`-owned stream).
+    pub const INFLATE: HandleKind = HandleKind(0x14F1_A7E5_0114_0002);
+}
+
+/// The common `#[repr(C)]` prefix shared by every tagged handle: a
+/// [`HandleKind`] at offset 0, readable regardless of the concrete handle type
+/// behind the opaque `state` pointer.
+#[repr(C)]
+struct HandleHeader {
+    kind: HandleKind,
+}
+
+/// The boxed deflate engine handle installed in [`z_stream::state`] by the
+/// `deflate*` FFI shims.
+///
+/// Wrapping [`ZStream<CAllocator>`](crate::stream::ZStream) behind a
+/// [`HandleKind`] tag lets [`deflate_take`]/[`deflate_state`] confirm the handle
+/// really is a deflate handle before reinterpreting the opaque pointer,
+/// preventing the layout-mismatched deallocation that a blind cast would cause
+/// on cross-type `End` misuse (FINDING-6). `#[repr(C)]` guarantees `kind` is at
+/// offset 0.
+#[repr(C)]
+pub struct DeflateHandle {
+    /// Discriminant tag; always [`HandleKind::DEFLATE`]. MUST be the first field.
+    kind: HandleKind,
+    /// The idiomatic deflate stream this handle owns.
+    pub zs: ZStream<CAllocator>,
+}
+
+impl DeflateHandle {
+    /// Wraps a freshly built deflate stream, tagging it as a deflate handle.
+    #[inline]
+    #[must_use]
+    pub fn new(zs: ZStream<CAllocator>) -> Self {
+        Self {
+            kind: HandleKind::DEFLATE,
+            zs,
+        }
+    }
+}
+
+/// Reads the [`HandleKind`] tag at offset 0 of the installed state handle, or
+/// [`None`] if no handle is installed.
+///
+/// # Safety
+///
+/// If [`z_stream::state`] is non-null it must point at a live boxed handle whose
+/// first field is a [`HandleKind`] (every FFI init shim boxes a `#[repr(C)]`
+/// type with a leading `HandleKind`), or — for the untagged `inflateBack`
+/// `InflateState` — at least a live allocation of ≥ 8 bytes whose leading `u64`
+/// is simply read and compared (no `InflateState` field ever equals a magic).
+#[inline]
+#[must_use]
+pub unsafe fn peek_handle_kind(strm: &z_stream) -> Option<HandleKind> {
+    if strm.state.is_null() {
+        None
+    } else {
+        // SAFETY: `state` is non-null and points at a live handle allocation of
+        // at least 8 bytes; reading the leading `HandleKind` (a `u64`) is valid
+        // for any such allocation and carries no enum-validity requirement.
+        Some(unsafe { (*(strm.state as *const HandleHeader)).kind })
+    }
+}
+
+/// Borrows the deflate engine behind the state handle, validating the handle
+/// kind first. Returns [`None`] when no handle is installed OR the installed
+/// handle is not a deflate handle, letting the caller return `Z_STREAM_ERROR`
+/// WITHOUT reinterpreting a wrong-type allocation.
+///
+/// # Safety
+///
+/// A non-null [`z_stream::state`] must point at a live handle installed by an
+/// FFI init shim (so its leading tag is readable).
+#[inline]
+pub unsafe fn deflate_state(strm: &mut z_stream) -> Option<&mut ZStream<CAllocator>> {
+    // SAFETY: delegated tag read; see `peek_handle_kind`.
+    match unsafe { peek_handle_kind(strm) } {
+        Some(kind) if kind == HandleKind::DEFLATE => {
+            // SAFETY: the tag confirms a live `DeflateHandle`; the borrow is tied
+            // to `strm`, so it cannot alias for its lifetime.
+            let handle = unsafe { &mut *(strm.state as *mut DeflateHandle) };
+            Some(&mut handle.zs)
+        }
+        _ => None,
+    }
+}
+
+/// Reclaims the boxed [`DeflateHandle`] from the state field, validating the
+/// kind first and nulling `state` on success. Returns [`None`] — leaving
+/// `state` untouched — when the handle is absent or not a deflate handle, so
+/// `deflateEnd` never drops a wrong-type box.
+///
+/// # Safety
+///
+/// A non-null [`z_stream::state`] must point at a live handle installed by an
+/// FFI init shim, not already reclaimed.
+#[inline]
+pub unsafe fn deflate_take(strm: &mut z_stream) -> Option<Box<DeflateHandle>> {
+    // SAFETY: delegated tag read; see `peek_handle_kind`.
+    match unsafe { peek_handle_kind(strm) } {
+        Some(kind) if kind == HandleKind::DEFLATE => {
+            // SAFETY: the tag confirms a live `Box<DeflateHandle>`; reconstitute
+            // exactly once and null the field to prevent a double free.
+            let boxed = unsafe { Box::from_raw(strm.state as *mut DeflateHandle) };
+            strm.state = ptr::null_mut();
+            Some(boxed)
+        }
+        _ => None,
     }
 }
 
@@ -968,19 +1129,72 @@ mod tests {
             opaque: ptr::null_mut(),
         };
 
-        let bytes: Vec<u8> = alloc.allocate_zeroed(8);
+        let bytes: AllocBuffer<u8> = alloc.allocate_zeroed(8);
         assert_eq!(bytes.len(), 8);
         assert!(bytes.iter().all(|&b| b == 0));
         alloc.deallocate(bytes);
 
-        let words: Vec<u32> = alloc.allocate_zeroed(4);
-        assert_eq!(words, alloc::vec![0u32; 4]);
+        let words: AllocBuffer<u32> = alloc.allocate_zeroed(4);
+        assert_eq!(&words[..], &[0u32; 4][..]);
         alloc.deallocate(words);
 
         // A zero-length request yields an empty buffer.
-        let empty: Vec<u16> = alloc.allocate_zeroed(0);
+        let empty: AllocBuffer<u16> = alloc.allocate_zeroed(0);
         assert!(empty.is_empty());
         alloc.deallocate(empty);
+    }
+
+    /// With active hooks, `CAllocator::allocate_zeroed` routes through the
+    /// caller's `zalloc` (a `Foreign` buffer, zero-filled and usable as a
+    /// slice) and releases it through the caller's `zfree` on drop — the
+    /// FINDING-3 has-hook clause. Invocation counts are recorded via a global
+    /// (`static`) counter because the C hooks receive only the `opaque` cookie.
+    #[test]
+    fn callocator_active_hooks_are_invoked_and_balanced() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+        static FREES: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn zalloc(
+            _opaque: *mut c_void,
+            items: c_uint,
+            size: c_uint,
+        ) -> *mut c_void {
+            ALLOCS.fetch_add(1, Ordering::SeqCst);
+            let bytes = (items as usize) * (size as usize);
+            // Delegate the actual bytes to the Rust global allocator; a
+            // `Vec<u8>` we forget and later reclaim in `zfree`.
+            let mut v = alloc::vec![0u8; bytes.max(1)];
+            let p = v.as_mut_ptr();
+            core::mem::forget(v);
+            p.cast()
+        }
+        unsafe extern "C" fn zfree(_opaque: *mut c_void, address: *mut c_void) {
+            FREES.fetch_add(1, Ordering::SeqCst);
+            // We cannot recover the exact length here, so this test backing
+            // store intentionally leaks the bytes (the process ends promptly);
+            // the assertion of interest is that `zfree` is invoked exactly once
+            // per `zalloc`. This keeps the test allocator trivially sound.
+            let _ = address;
+        }
+
+        let alloc = CAllocator {
+            zalloc: Some(zalloc),
+            zfree: Some(zfree),
+            opaque: ptr::null_mut(),
+        };
+        assert!(alloc.hook().is_active());
+
+        {
+            let buf: AllocBuffer<u16> = alloc.allocate_zeroed(32);
+            assert_eq!(buf.len(), 32);
+            // Foreign region is zero-filled and usable as a slice.
+            assert!(buf.iter().all(|&w| w == 0));
+        } // <- drop routes through the caller's `zfree`
+
+        assert_eq!(ALLOCS.load(Ordering::SeqCst), 1, "zalloc must be invoked");
+        assert_eq!(FREES.load(Ordering::SeqCst), 1, "zfree must balance zalloc");
     }
 
     /// `zstream_with_caller_alloc` produces a `ZStream<CAllocator>` carrying the

@@ -344,13 +344,31 @@ pub const MAX_WBITS: i32 = 15;
 /// for **decompression** when the caller does not specify one.
 pub const DEF_WBITS: i32 = MAX_WBITS;
 
-/// `MAX_MEM_LEVEL = 8` (`zconf.h` L273-L279, per AAP §0.6 verified contract):
-/// the maximum `memLevel` accepted by `deflateInit2()`.
+/// `MAX_MEM_LEVEL = 9` (`zconf.h` L273-L279): the maximum `memLevel` accepted
+/// by `deflateInit2()`.
 ///
-/// Note: a stock C build without `MAXSEG_64K` defines this as `9`; this crate
-/// follows the AAP-specified contract value of `8` so every module validates
-/// `memLevel` against one shared bound.
-pub const MAX_MEM_LEVEL: i32 = 8;
+/// The C header defines this conditionally:
+///
+/// ```text
+/// #ifndef MAX_MEM_LEVEL
+/// #  ifdef MAXSEG_64K
+/// #    define MAX_MEM_LEVEL 8
+/// #  else
+/// #    define MAX_MEM_LEVEL 9
+/// #  endif
+/// #endif
+/// ```
+///
+/// `MAXSEG_64K` is a 16-bit / segmented-memory (MS-DOS) build constraint whose
+/// platform support is explicitly **out of scope** for this migration (see AAP
+/// §0.2.2, which excludes `msdos/`, 16-bit, and Windows CE targets). On every
+/// in-scope modern platform the C library therefore defines `MAX_MEM_LEVEL` as
+/// `9`, and `deflateInit2()` accepts `memLevel` in `1..=9` (`deflate.c` L434:
+/// `if (memLevel < 1 || memLevel > MAX_MEM_LEVEL ...) return Z_STREAM_ERROR;`).
+/// This crate uses `9` so its accepted-`memLevel` range is byte-for-byte
+/// identical to the reference C build (the default remains
+/// [`DEF_MEM_LEVEL`] `= 8`).
+pub const MAX_MEM_LEVEL: i32 = 9;
 
 /// `DEF_MEM_LEVEL = 8` (`zutil.h` L81): the default `memLevel` — a good
 /// space/speed trade-off used when the caller does not specify one.
@@ -620,7 +638,7 @@ mod tests {
         assert_eq!(MAX_WBITS, 15);
         assert_eq!(DEF_WBITS, 15);
         assert_eq!(DEF_WBITS, MAX_WBITS);
-        assert_eq!(MAX_MEM_LEVEL, 8);
+        assert_eq!(MAX_MEM_LEVEL, 9);
         assert_eq!(DEF_MEM_LEVEL, 8);
         assert_eq!(GZIP_WRAP_OFFSET, 16);
         assert_eq!(AUTO_WRAP_OFFSET, 32);

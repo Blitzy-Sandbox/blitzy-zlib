@@ -53,6 +53,7 @@ use crate::error::ReturnCode;
 use crate::inflate::fixed::{DISTFIX, LENFIX};
 use crate::inflate::state::{InflateMode, InflateState, TableSource};
 use crate::inflate::tables::{Code, CodeType, inflate_table};
+use crate::stream::{AllocBuffer, AllocHook};
 
 /// Permutation of the 19 code-length code lengths, as read from a dynamic
 /// block header. Transcribed verbatim from `infback.c` L205-L206 (identical to
@@ -330,23 +331,46 @@ impl<I: InFunc, O: OutFunc> BackCtx<'_, I, O> {
 /// assert!(inflate_back_init(7).is_err());
 /// assert!(inflate_back_init(16).is_err());
 /// ```
+#[inline]
 pub fn inflate_back_init(window_bits: i32) -> Result<Box<InflateState>, ReturnCode> {
+    inflate_back_init_in(AllocHook::none(), window_bits)
+}
+
+/// Same as [`inflate_back_init`] but threads an explicit [`AllocHook`] so the
+/// owned back-inflate window is allocated through the caller's `zalloc`/`zfree`
+/// when one was installed via the FFI `z_stream` (AAP §0.6.3 has-hook clause;
+/// QA FINDING-3). In back-inflate the window *is* the output buffer, so unlike
+/// the streaming `inflate` path this allocation is eager (performed here rather
+/// than lazily in `updatewindow`); routing it through the hook means the
+/// output buffer honors a caller-supplied allocator exactly as reference zlib's
+/// `ZALLOC(strm, ...)` does.
+///
+/// # Errors
+///
+/// Returns [`ReturnCode::StreamError`] if `window_bits` is outside `8..=15`.
+pub fn inflate_back_init_in(
+    hook: AllocHook,
+    window_bits: i32,
+) -> Result<Box<InflateState>, ReturnCode> {
     // C L33-L35: reject windowBits outside the raw range 8..=15.
     if !(MIN_WBITS..=MAX_WBITS).contains(&window_bits) {
         return Err(ReturnCode::StreamError);
     }
 
-    // Raw stream: wrap = 0. `new` already sets dmax = 32768, sane = true.
-    let mut state = InflateState::new(0, window_bits as u32);
+    // Raw stream: wrap = 0. `new_in` already sets dmax = 32768, sane = true, and
+    // records `hook` so any window (re)allocation routes through it.
+    let mut state = InflateState::new_in(hook, 0, window_bits as u32);
 
-    // C L56-L62: set the window geometry and allocate the owned window.
+    // C L56-L62: set the window geometry and allocate the owned window through
+    // the caller's allocator hook (falling back to the global allocator when no
+    // hook is installed).
     state.dmax = 32768;
     state.wbits = window_bits as u32;
     state.wsize = 1u32 << window_bits;
     state.whave = 0;
     state.wnext = 0;
     state.sane = true;
-    state.window = alloc::vec![0u8; state.wsize as usize];
+    state.window = AllocBuffer::zeroed(state.wsize as usize, hook);
 
     Ok(state)
 }

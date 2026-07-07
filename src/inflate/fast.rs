@@ -443,6 +443,7 @@ mod tests {
     use super::*;
     use crate::inflate::fixed::{DISTFIX, LENFIX};
     use crate::inflate::state::{InflateMode, InflateState, TableSource};
+    use crate::stream::AllocBuffer;
     use alloc::vec::Vec;
 
     /// A minimal DEFLATE bit writer used to hand-craft fixed-Huffman blocks for
@@ -747,7 +748,7 @@ mod tests {
         for (i, b) in window.iter_mut().enumerate() {
             *b = i as u8;
         }
-        state.window = window;
+        state.window = AllocBuffer::from_vec(window);
         state.wsize = wsize as u32;
         state.whave = wsize as u32;
         state.wnext = 0;
@@ -771,7 +772,7 @@ mod tests {
         for (i, b) in window.iter_mut().enumerate() {
             *b = (100 + i) as u8;
         }
-        state.window = window;
+        state.window = AllocBuffer::from_vec(window);
         state.wsize = wsize as u32;
         state.whave = wsize as u32;
         state.wnext = 4;

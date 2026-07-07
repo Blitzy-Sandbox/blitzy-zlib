@@ -101,6 +101,174 @@
 extern crate alloc;
 
 // ===========================================================================
+// `no_std` runtime support — global allocator + panic handler
+//
+// A `#![no_std]` crate that still allocates (this one uses `Box`/`Vec`/`String`
+// via `alloc`) and is emitted as a `cdylib`/`staticlib` must SUPPLY its own
+// `#[global_allocator]` and `#[panic_handler]`: the standard library normally
+// provides both, and without `std` the final `cdylib`/`staticlib` link step
+// fails with "no global memory allocator found" and "`#[panic_handler]`
+// function required, but not found" (see QA finding on the `no-std` build).
+//
+// These items are compiled ONLY for a genuine freestanding library build —
+// `#[cfg(all(not(feature = "std"), not(test)))]`:
+//   * `not(feature = "std")`  — under the default (`std`) build the standard
+//     library already provides the global allocator and panic handler, and
+//     redefining them here would be a duplicate-lang-item error. The whole std
+//     surface therefore stays byte-for-byte unchanged.
+//   * `not(test)`             — the unit-test harness links `libtest`, which
+//     pulls in `std`; excluding the items from test builds avoids clashing with
+//     the std-provided ones.
+//
+// The allocator is a thin, faithful port of the standard library's Unix
+// `System` allocator: the platform `malloc`/`calloc`/`realloc`/`free` satisfy
+// the common (≤ `MIN_ALIGN`) case, and `posix_memalign` covers over-aligned
+// requests. Routing through the C runtime's `malloc` family is exactly what a
+// C consumer of the emitted `libzlib_rs.{so,a}` expects, and AAP §0.5.2
+// explicitly permits the platform `libc` already linked by any hosted artifact
+// (it introduces no *additional* C dependency and keeps the shipped Rust graph
+// pure). Per-`z_stream` `zalloc`/`zfree` caller hooks remain a separate concern
+// handled inside the FFI layer; this global allocator is only the fallback the
+// `alloc` crate requires.
+//
+// SAFETY: this module is crate-root C-ABI plumbing, analogous to the FFI
+// boundary carve-out in AAP §0.6.2 — it is NOT part of the compression core
+// (`src/deflate/**` remains 100% `unsafe`-free, honoring the "zero unsafe in
+// core compression logic" rule). Every `unsafe` operation is justified inline.
+#[cfg(all(not(feature = "std"), not(test)))]
+mod no_std_support {
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::ffi::c_void;
+
+    // Minimum alignment guaranteed by the platform `malloc` family: 16 bytes on
+    // 64-bit targets, 8 on 32-bit. This mirrors the constant the standard
+    // library's Unix allocator uses.
+    #[cfg(target_pointer_width = "64")]
+    const MIN_ALIGN: usize = 16;
+    #[cfg(not(target_pointer_width = "64"))]
+    const MIN_ALIGN: usize = 8;
+
+    // The C runtime allocation primitives. These are resolved against the
+    // platform `libc` that every hosted `cdylib`/`staticlib` links against, so
+    // declaring them here adds no new dependency to the shipped Rust graph.
+    unsafe extern "C" {
+        fn malloc(size: usize) -> *mut c_void;
+        fn calloc(nmemb: usize, size: usize) -> *mut c_void;
+        fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void;
+        fn free(ptr: *mut c_void);
+        fn posix_memalign(memptr: *mut *mut c_void, align: usize, size: usize) -> i32;
+        fn abort() -> !;
+    }
+
+    /// A `GlobalAlloc` implementation backed by the platform `libc` allocator.
+    ///
+    /// This is a faithful port of the standard library's Unix `System`
+    /// allocator so that a `no_std` build behaves identically to the default
+    /// `std` build with respect to heap allocation.
+    struct LibcAllocator;
+
+    /// Allocate an over-aligned block via `posix_memalign`.
+    ///
+    /// # Safety
+    /// The caller must free the returned pointer (when non-null) with `free`,
+    /// and must not request a zero-sized layout (the `GlobalAlloc` contract
+    /// already guarantees `layout.size() > 0`).
+    unsafe fn aligned_malloc(layout: Layout) -> *mut u8 {
+        // `posix_memalign` requires the alignment to be a power of two and a
+        // multiple of `size_of::<*mut c_void>()`; clamp up to that minimum.
+        let align = layout.align().max(core::mem::size_of::<usize>());
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: `out` is a valid pointer to a `*mut c_void` slot; `align` is a
+        // power-of-two multiple of the pointer size as required.
+        let ret = unsafe { posix_memalign(&mut out, align, layout.size()) };
+        if ret != 0 {
+            core::ptr::null_mut()
+        } else {
+            out as *mut u8
+        }
+    }
+
+    // SAFETY: `LibcAllocator` forwards every request to the C runtime allocator,
+    // which upholds the `GlobalAlloc` contract (returns suitably aligned blocks
+    // or null, and `free`/`realloc` operate on pointers it previously handed
+    // out). Over-aligned requests are routed through `posix_memalign`, whose
+    // allocations are also freeable with `free`.
+    unsafe impl GlobalAlloc for LibcAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if layout.align() <= MIN_ALIGN && layout.align() <= layout.size() {
+                // SAFETY: `malloc` returns a `MIN_ALIGN`-aligned block that
+                // satisfies this layout, or null on failure.
+                unsafe { malloc(layout.size()) as *mut u8 }
+            } else {
+                // SAFETY: over-aligned path; `aligned_malloc` honors the layout.
+                unsafe { aligned_malloc(layout) }
+            }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            if layout.align() <= MIN_ALIGN && layout.align() <= layout.size() {
+                // SAFETY: `calloc` returns zeroed, `MIN_ALIGN`-aligned memory.
+                unsafe { calloc(layout.size(), 1) as *mut u8 }
+            } else {
+                // SAFETY: allocate over-aligned, then zero it explicitly.
+                let ptr = unsafe { aligned_malloc(layout) };
+                if !ptr.is_null() {
+                    // SAFETY: `ptr` points to `layout.size()` writable bytes.
+                    unsafe { core::ptr::write_bytes(ptr, 0, layout.size()) };
+                }
+                ptr
+            }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+            // SAFETY: `ptr` was returned by `alloc`/`alloc_zeroed`/`realloc`
+            // above (all backed by the `malloc` family), so `free` is valid.
+            unsafe { free(ptr as *mut c_void) };
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if layout.align() <= MIN_ALIGN && layout.align() <= new_size {
+                // SAFETY: the original block came from the `malloc` family with
+                // `MIN_ALIGN` alignment, so `realloc` preserves the layout.
+                unsafe { realloc(ptr as *mut c_void, new_size) as *mut u8 }
+            } else {
+                // Over-aligned: `realloc` cannot preserve the alignment, so
+                // allocate a fresh aligned block, copy, and free the old one.
+                // SAFETY: `new_size` and `layout.align()` form a valid layout.
+                let new_layout =
+                    unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+                // SAFETY: delegates to the checked `alloc` above.
+                let new_ptr = unsafe { self.alloc(new_layout) };
+                if !new_ptr.is_null() {
+                    let copy = core::cmp::min(layout.size(), new_size);
+                    // SAFETY: both regions are valid for `copy` bytes and do not
+                    // overlap (distinct allocations).
+                    unsafe { core::ptr::copy_nonoverlapping(ptr, new_ptr, copy) };
+                    // SAFETY: `ptr` is a live allocation from this allocator.
+                    unsafe { free(ptr as *mut c_void) };
+                }
+                new_ptr
+            }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: LibcAllocator = LibcAllocator;
+
+    // In a `no_std` build there is no unwinding runtime (the crate is compiled
+    // with `panic = "abort"`; see `Cargo.toml`), so the panic handler simply
+    // terminates the process via the C runtime's `abort()`. This matches the
+    // `panic = "abort"` strategy and upholds the crate-wide invariant that a
+    // Rust panic never unwinds across the C ABI.
+    #[panic_handler]
+    fn panic(_info: &core::panic::PanicInfo) -> ! {
+        // SAFETY: `abort` is the libc process-termination routine; it never
+        // returns and has no preconditions.
+        unsafe { abort() }
+    }
+}
+
+// ===========================================================================
 // Version macros (ported from `zlib.h` L44-L49)
 //
 // These mirror the C `ZLIB_VERSION`/`ZLIB_VERNUM` family exactly and are the

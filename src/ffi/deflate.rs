@@ -182,7 +182,7 @@ pub unsafe extern "C" fn deflateInit2_(
         // callers must not re-init without `deflateEnd` (documented contract).
         // SAFETY: transfers ownership of the box into the opaque `state` handle;
         // it is reclaimed exactly once by `deflateEnd` via `state_take`.
-        s.state = unsafe { state_ptr_from_box(Box::new(zs)) };
+        s.state = unsafe { state_ptr_from_box(Box::new(DeflateHandle::new(zs))) };
         s.total_in = 0;
         s.total_out = 0;
         set_msg(s, msg);
@@ -271,7 +271,7 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
         let (code, consumed, produced, adler, data_type, msg) = {
             // SAFETY: `state`, when non-null, was installed by `deflateInit*` as
             // a `Box<ZStream<CAllocator>>`.
-            let Some(zs) = (unsafe { state_ref::<ZStream<CAllocator>>(s) }) else {
+            let Some(zs) = (unsafe { deflate_state(s) }) else {
                 return Z_STREAM_ERROR;
             };
             let outcome = engine::deflate(zs, input, output, flush);
@@ -319,15 +319,19 @@ pub unsafe extern "C" fn deflateEnd(strm: z_streamp) -> c_int {
         }
         // SAFETY: `strm` is non-null and valid for this call.
         let s = unsafe { &mut *strm };
-        // SAFETY: `state`, when non-null, is the `Box<ZStream<CAllocator>>`
-        // installed by `deflateInit*`. `state_take` nulls `s.state` so the box
-        // is reclaimed exactly once (no double free).
-        let Some(mut boxed) = (unsafe { state_take::<ZStream<CAllocator>>(s) }) else {
+        // SAFETY: `deflate_take` validates the handle's `HandleKind` tag BEFORE
+        // reconstituting the box, so it returns the `Box<DeflateHandle>` only for
+        // a genuine deflate handle (nulling `s.state` for exactly-once reclaim)
+        // and `None` for a cross-type stream (e.g. one from `inflateInit*`) —
+        // yielding `Z_STREAM_ERROR` here WITHOUT a layout-mismatched free
+        // (FINDING-6). It matches C's `deflateEnd`, which rejects a non-deflate
+        // stream with `Z_STREAM_ERROR`.
+        let Some(mut boxed) = (unsafe { deflate_take(s) }) else {
             return Z_STREAM_ERROR;
         };
         // The engine computes the `Z_DATA_ERROR`-if-busy result and clears its
         // inner state; dropping `boxed` afterward frees the `ZStream`.
-        code_of(engine::deflate_end(&mut boxed))
+        code_of(engine::deflate_end(&mut boxed.zs))
     })
 }
 
@@ -351,7 +355,7 @@ pub unsafe extern "C" fn deflateReset(strm: z_streamp) -> c_int {
         let s = unsafe { &mut *strm };
         let (code, adler, data_type, msg) = {
             // SAFETY: installed engine state (see `deflate`).
-            let Some(zs) = (unsafe { state_ref::<ZStream<CAllocator>>(s) }) else {
+            let Some(zs) = (unsafe { deflate_state(s) }) else {
                 return Z_STREAM_ERROR;
             };
             let code = code_of(engine::deflate_reset(zs));
@@ -385,7 +389,7 @@ pub unsafe extern "C" fn deflateResetKeep(strm: z_streamp) -> c_int {
         let s = unsafe { &mut *strm };
         let (code, adler, data_type, msg) = {
             // SAFETY: installed engine state (see `deflate`).
-            let Some(zs) = (unsafe { state_ref::<ZStream<CAllocator>>(s) }) else {
+            let Some(zs) = (unsafe { deflate_state(s) }) else {
                 return Z_STREAM_ERROR;
             };
             let code = code_of(engine::deflate_reset_keep(zs));
@@ -437,7 +441,7 @@ pub unsafe extern "C" fn deflateParams(strm: z_streamp, level: c_int, strategy: 
 
         let (code, consumed, produced, adler, data_type, msg) = {
             // SAFETY: installed engine state (see `deflate`).
-            let Some(zs) = (unsafe { state_ref::<ZStream<CAllocator>>(s) }) else {
+            let Some(zs) = (unsafe { deflate_state(s) }) else {
                 return Z_STREAM_ERROR;
             };
             let outcome = engine::deflate_params(zs, input, output, level, strategy);
@@ -485,7 +489,7 @@ pub unsafe extern "C" fn deflateTune(
         // SAFETY: `strm` is non-null and valid for this call.
         let s = unsafe { &mut *strm };
         // SAFETY: installed engine state (see `deflate`).
-        let Some(zs) = (unsafe { state_ref::<ZStream<CAllocator>>(s) }) else {
+        let Some(zs) = (unsafe { deflate_state(s) }) else {
             return Z_STREAM_ERROR;
         };
         code_of(engine::deflate_tune(
@@ -519,7 +523,7 @@ pub unsafe extern "C" fn deflateBound(strm: z_streamp, source_len: uLong) -> uLo
             // SAFETY: `strm` is non-null and valid for this call.
             let s = unsafe { &mut *strm };
             // SAFETY: `state`, when non-null, is a `Box<ZStream<CAllocator>>`.
-            if let Some(zs) = unsafe { state_ref::<ZStream<CAllocator>>(s) } {
+            if let Some(zs) = unsafe { deflate_state(s) } {
                 return engine::deflate_bound(zs, source_len as usize) as uLong;
             }
         }
@@ -544,7 +548,7 @@ pub unsafe extern "C" fn deflateBound_z(strm: z_streamp, source_len: z_size_t) -
         // SAFETY: `strm` is non-null and valid for this call.
         let s = unsafe { &mut *strm };
         // SAFETY: `state`, when non-null, is a `Box<ZStream<CAllocator>>`.
-        if let Some(zs) = unsafe { state_ref::<ZStream<CAllocator>>(s) } {
+        if let Some(zs) = unsafe { deflate_state(s) } {
             return engine::deflate_bound_z(zs, source_len);
         }
     }
@@ -577,7 +581,7 @@ pub unsafe extern "C" fn deflatePending(
         let s = unsafe { &mut *strm };
         let (pending_val, bits_val) = {
             // SAFETY: installed engine state (see `deflate`).
-            let Some(zs) = (unsafe { state_ref::<ZStream<CAllocator>>(s) }) else {
+            let Some(zs) = (unsafe { deflate_state(s) }) else {
                 return Z_STREAM_ERROR;
             };
             match engine::deflate_pending(zs) {
@@ -624,7 +628,7 @@ pub unsafe extern "C" fn deflateUsed(strm: z_streamp, bits: *mut c_int) -> c_int
         let s = unsafe { &mut *strm };
         let bits_val = {
             // SAFETY: installed engine state (see `deflate`).
-            let Some(zs) = (unsafe { state_ref::<ZStream<CAllocator>>(s) }) else {
+            let Some(zs) = (unsafe { deflate_state(s) }) else {
                 return Z_STREAM_ERROR;
             };
             match engine::deflate_used(zs) {
@@ -657,7 +661,7 @@ pub unsafe extern "C" fn deflatePrime(strm: z_streamp, bits: c_int, value: c_int
         // SAFETY: `strm` is non-null and valid for this call.
         let s = unsafe { &mut *strm };
         // SAFETY: installed engine state (see `deflate`).
-        let Some(zs) = (unsafe { state_ref::<ZStream<CAllocator>>(s) }) else {
+        let Some(zs) = (unsafe { deflate_state(s) }) else {
             return Z_STREAM_ERROR;
         };
         code_of(engine::deflate_prime(zs, bits, value))
@@ -692,8 +696,17 @@ pub unsafe extern "C" fn deflateSetDictionary(
         // SAFETY: `strm` is non-null and valid for this call.
         let s = unsafe { &mut *strm };
 
-        // A null/empty dictionary is represented by an empty slice.
-        let dict: &[u8] = if dictionary.is_null() || dict_length == 0 {
+        // A null dictionary is a usage error: reference C's
+        // `deflateSetDictionary` returns `Z_STREAM_ERROR` for a `Z_NULL`
+        // dictionary regardless of length (FINDING-4), rather than silently
+        // treating it as empty — which would mask a caller bug, since the
+        // intended dictionary would never actually be set. Match C exactly.
+        if dictionary.is_null() {
+            return Z_STREAM_ERROR;
+        }
+        // A non-null dictionary of length 0 is a valid empty dictionary; view
+        // `dict_length` bytes at `dictionary` otherwise.
+        let dict: &[u8] = if dict_length == 0 {
             &[]
         } else {
             // SAFETY: the caller guarantees `dict_length` readable bytes at
@@ -703,7 +716,7 @@ pub unsafe extern "C" fn deflateSetDictionary(
 
         let (code, adler) = {
             // SAFETY: installed engine state (see `deflate`).
-            let Some(zs) = (unsafe { state_ref::<ZStream<CAllocator>>(s) }) else {
+            let Some(zs) = (unsafe { deflate_state(s) }) else {
                 return Z_STREAM_ERROR;
             };
             let code = code_of(engine::deflate_set_dictionary(zs, dict));
@@ -741,7 +754,7 @@ pub unsafe extern "C" fn deflateGetDictionary(
         // SAFETY: `strm` is non-null and valid for this call.
         let s = unsafe { &mut *strm };
         // SAFETY: installed engine state (see `deflate`).
-        let Some(zs) = (unsafe { state_ref::<ZStream<CAllocator>>(s) }) else {
+        let Some(zs) = (unsafe { deflate_state(s) }) else {
             return Z_STREAM_ERROR;
         };
 
@@ -796,7 +809,7 @@ pub unsafe extern "C" fn deflateSetHeader(strm: z_streamp, head: gz_headerp) -> 
             // Validate installed state before touching `head` (C order:
             // `deflateStateCheck` precedes the `wrap` test).
             // SAFETY: installed engine state (see `deflate`).
-            let Some(zs) = (unsafe { state_ref::<ZStream<CAllocator>>(s) }) else {
+            let Some(zs) = (unsafe { deflate_state(s) }) else {
                 return Z_STREAM_ERROR;
             };
             // SAFETY: `head` is null or points at a valid `gz_header` whose
@@ -848,7 +861,7 @@ pub unsafe extern "C" fn deflateCopy(dest: z_streamp, source: z_streamp) -> c_in
         let new_zs = {
             // SAFETY: `source.state`, when non-null, is a
             // `Box<ZStream<CAllocator>>`.
-            let Some(src_zs) = (unsafe { state_ref::<ZStream<CAllocator>>(src) }) else {
+            let Some(src_zs) = (unsafe { deflate_state(src) }) else {
                 return Z_STREAM_ERROR;
             };
             let mut new_zs = ZStream::with_allocator(*src_zs.allocator());
@@ -861,7 +874,7 @@ pub unsafe extern "C" fn deflateCopy(dest: z_streamp, source: z_streamp) -> c_in
         // Install the cloned state into `dest`.
         // SAFETY: transfers ownership into `dest.state`; reclaimed once by
         // `deflateEnd`.
-        d.state = unsafe { state_ptr_from_box(Box::new(new_zs)) };
+        d.state = unsafe { state_ptr_from_box(Box::new(DeflateHandle::new(new_zs))) };
 
         // Mirror the full observable `z_stream` (C copies the whole struct).
         d.next_in = src.next_in;

@@ -52,13 +52,14 @@ use alloc::boxed::Box;
 use crate::constants::DEF_WBITS;
 use crate::error::ReturnCode;
 use crate::ffi::types::{
-    Bytef, CAllocator, advance_input, advance_output, guard_int, guard_ulong, gz_headerp, in_func,
-    input_slice, out_func, output_slice, set_adler, set_data_type, set_msg, state_ptr_from_box,
-    state_ref, state_take, uInt, z_stream, z_streamp, zstream_with_caller_alloc,
+    Bytef, CAllocator, HandleKind, advance_input, advance_output, guard_int, guard_ulong,
+    gz_headerp, in_func, input_slice, out_func, output_slice, peek_handle_kind, set_adler,
+    set_data_type, set_msg, state_ptr_from_box, state_ref, state_take, uInt, z_stream, z_streamp,
+    zstream_with_caller_alloc,
 };
 use crate::inflate::back::{InFunc, OutFunc};
 use crate::inflate::state::InflateState;
-use crate::stream::ZStream;
+use crate::stream::{Allocator, ZStream};
 
 // `gz_header` (the `#[repr(C)]` mirror) and the header write-back helper are
 // only referenced by the gzip-only `inflateGetHeader` path and the header
@@ -168,12 +169,21 @@ fn msg_to_cstr(msg: Option<&str>) -> *const c_char {
 
 /// Owns the idiomatic decompression state behind a raw `z_stream.state`.
 ///
-/// Boxed and installed by [`inflateInit2_`]; borrowed via
-/// [`state_ref`](crate::ffi::types::state_ref) during operation; reclaimed and
-/// dropped by [`inflateEnd`]. Under the `gzip` feature it also records the raw
-/// pointer to the caller's `gz_header` (registered by [`inflateGetHeader`]) so
-/// the filled header can be written back after each [`inflate`] call.
+/// Boxed and installed by [`inflateInit2_`]; borrowed via [`inflate_handle`]
+/// during operation; reclaimed and dropped by [`inflateEnd`]. Under the `gzip`
+/// feature it also records the raw pointer to the caller's `gz_header`
+/// (registered by [`inflateGetHeader`]) so the filled header can be written back
+/// after each [`inflate`] call.
+///
+/// The leading [`HandleKind`] tag ([`HandleKind::INFLATE`]) lets the `End`/
+/// accessor shims verify the handle *kind* before reinterpreting the opaque
+/// `state` pointer, preventing the layout-mismatched deallocation that a blind
+/// `Box::from_raw` cast would cause on cross-type misuse (FINDING-6). `#[repr(C)]`
+/// guarantees `kind` sits at offset 0, matching [`DeflateHandle`].
+#[repr(C)]
 struct InflateHandle {
+    /// Discriminant tag; always [`HandleKind::INFLATE`]. MUST be the first field.
+    kind: HandleKind,
     /// The idiomatic stream carrying the boxed `InflateState` plus observable
     /// bookkeeping (`total_in`/`total_out`/`adler`/`data_type`/`msg`).
     zs: ZStream<CAllocator>,
@@ -184,13 +194,62 @@ struct InflateHandle {
 }
 
 impl InflateHandle {
-    /// Wraps a freshly initialized idiomatic stream, with no registered header.
+    /// Wraps a freshly initialized idiomatic stream, tagging it as an inflate
+    /// handle, with no registered header.
     fn new(zs: ZStream<CAllocator>) -> Self {
         Self {
+            kind: HandleKind::INFLATE,
             zs,
             #[cfg(feature = "gzip")]
             head: ptr::null_mut(),
         }
+    }
+}
+
+/// Borrows the [`InflateHandle`] behind the opaque `state` pointer, validating
+/// the [`HandleKind`] tag first. Returns [`None`] when no handle is installed OR
+/// the installed handle is not an inflate handle (cross-type misuse), so the
+/// caller can return `Z_STREAM_ERROR` WITHOUT reinterpreting a wrong-type
+/// allocation.
+///
+/// # Safety
+///
+/// A non-null `state` must point at a live handle installed by an FFI init shim
+/// (so its leading tag is readable).
+#[inline]
+unsafe fn inflate_handle(strm: &mut z_stream) -> Option<&mut InflateHandle> {
+    // SAFETY: delegated tag read; see `peek_handle_kind`.
+    match unsafe { peek_handle_kind(strm) } {
+        Some(kind) if kind == HandleKind::INFLATE => {
+            // SAFETY: the tag confirms a live `InflateHandle`; the borrow is tied
+            // to `strm`, so it cannot alias for its lifetime.
+            Some(unsafe { &mut *(strm.state as *mut InflateHandle) })
+        }
+        _ => None,
+    }
+}
+
+/// Reclaims the boxed [`InflateHandle`] from `state`, validating the
+/// [`HandleKind`] tag first and nulling `state` on success. Returns [`None`] —
+/// leaving `state` untouched — when the handle is absent or not an inflate
+/// handle, so [`inflateEnd`] never drops a wrong-type box (FINDING-6).
+///
+/// # Safety
+///
+/// A non-null `state` must point at a live handle installed by an FFI init shim,
+/// not already reclaimed.
+#[inline]
+unsafe fn inflate_take(strm: &mut z_stream) -> Option<Box<InflateHandle>> {
+    // SAFETY: delegated tag read; see `peek_handle_kind`.
+    match unsafe { peek_handle_kind(strm) } {
+        Some(kind) if kind == HandleKind::INFLATE => {
+            // SAFETY: the tag confirms a live `Box<InflateHandle>`; reconstitute
+            // exactly once and null the field to prevent a double free.
+            let boxed = unsafe { Box::from_raw(strm.state as *mut InflateHandle) };
+            strm.state = ptr::null_mut();
+            Some(boxed)
+        }
+        _ => None,
     }
 }
 
@@ -357,7 +416,10 @@ pub unsafe extern "C" fn inflateInit_(
 /// supplies the `1 << windowBits` byte sliding-window buffer; the realized
 /// [`crate::inflate::back`] engine instead allocates and owns its own window, so
 /// this shim validates `window` for ABI parity but does not use it as backing
-/// storage. (Documented deviation; behavior is unaffected.)
+/// storage. (Documented deviation; behavior is unaffected.) The owned window is
+/// nonetheless allocated through any caller-supplied `zalloc`/`zfree` captured
+/// from the `z_stream`, so a caller's custom allocator is still honored
+/// (AAP §0.6.3; QA FINDING-3).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn inflateBackInit_(
     strm: z_streamp,
@@ -379,7 +441,15 @@ pub unsafe extern "C" fn inflateBackInit_(
         }
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
-        match crate::inflate::back::inflate_back_init(window_bits) {
+        // Capture any caller-supplied zalloc/zfree/opaque so the owned window
+        // (which in back-inflate doubles as the output buffer) is routed through
+        // the caller's allocator, matching reference zlib's `ZALLOC(strm, ...)`
+        // (AAP §0.6.3; QA FINDING-3). Null hooks fall back to the global
+        // allocator inside `inflate_back_init_in`.
+        // SAFETY: `sref` is a valid `&z_stream`; `from_stream` only copies the
+        // plain `Copy` allocator fields and never dereferences the hooks.
+        let hook = unsafe { CAllocator::from_stream(sref) }.hook();
+        match crate::inflate::back::inflate_back_init_in(hook, window_bits) {
             Ok(state) => {
                 // SAFETY: transfers ownership of the `Box<InflateState>` into the
                 // opaque `state` slot; reclaimed and dropped by `inflateBackEnd`.
@@ -430,7 +500,7 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
 
         // SAFETY: `state`, if non-null, is the `Box<InflateHandle>` installed by
         // `inflateInit2_`.
-        let handle = match unsafe { state_ref::<InflateHandle>(sref) } {
+        let handle = match unsafe { inflate_handle(sref) } {
             Some(h) => h,
             None => return Z_STREAM_ERROR,
         };
@@ -490,9 +560,14 @@ pub unsafe extern "C" fn inflateEnd(strm: z_streamp) -> c_int {
         }
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
-        // SAFETY: `state`, if non-null, is the `Box<InflateHandle>` from
-        // `inflateInit2_`; `state_take` reclaims it and nulls `state`.
-        match unsafe { state_take::<InflateHandle>(sref) } {
+        // `inflate_take` validates the handle's `HandleKind` tag BEFORE
+        // reconstituting the box: it returns the `Box<InflateHandle>` only for a
+        // genuine inflate handle (nulling `state` for exactly-once reclaim) and
+        // `None` for a cross-type stream (e.g. one from `deflateInit*` or
+        // `inflateBackInit_`) — yielding `Z_STREAM_ERROR` WITHOUT a
+        // layout-mismatched free, and matching C, which returns `Z_STREAM_ERROR`
+        // for a non-inflate stream (FINDING-6).
+        match unsafe { inflate_take(sref) } {
             Some(boxed) => {
                 drop(boxed);
                 sref.msg = ptr::null_mut();
@@ -514,7 +589,7 @@ pub unsafe extern "C" fn inflateReset(strm: z_streamp) -> c_int {
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
         // SAFETY: `state`, if non-null, is the `Box<InflateHandle>`.
-        let handle = match unsafe { state_ref::<InflateHandle>(sref) } {
+        let handle = match unsafe { inflate_handle(sref) } {
             Some(h) => h,
             None => return Z_STREAM_ERROR,
         };
@@ -546,7 +621,7 @@ pub unsafe extern "C" fn inflateReset2(strm: z_streamp, window_bits: c_int) -> c
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
         // SAFETY: `state`, if non-null, is the `Box<InflateHandle>`.
-        let handle = match unsafe { state_ref::<InflateHandle>(sref) } {
+        let handle = match unsafe { inflate_handle(sref) } {
             Some(h) => h,
             None => return Z_STREAM_ERROR,
         };
@@ -578,7 +653,7 @@ pub unsafe extern "C" fn inflateResetKeep(strm: z_streamp) -> c_int {
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
         // SAFETY: `state`, if non-null, is the `Box<InflateHandle>`.
-        let handle = match unsafe { state_ref::<InflateHandle>(sref) } {
+        let handle = match unsafe { inflate_handle(sref) } {
             Some(h) => h,
             None => return Z_STREAM_ERROR,
         };
@@ -625,7 +700,7 @@ pub unsafe extern "C" fn inflateSetDictionary(
             unsafe { slice::from_raw_parts(dictionary, dict_length as usize) }
         };
         // SAFETY: `state`, if non-null, is the `Box<InflateHandle>`.
-        let handle = match unsafe { state_ref::<InflateHandle>(sref) } {
+        let handle = match unsafe { inflate_handle(sref) } {
             Some(h) => h,
             None => return Z_STREAM_ERROR,
         };
@@ -653,7 +728,7 @@ pub unsafe extern "C" fn inflateGetDictionary(
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
         // SAFETY: `state`, if non-null, is the `Box<InflateHandle>`.
-        let handle = match unsafe { state_ref::<InflateHandle>(sref) } {
+        let handle = match unsafe { inflate_handle(sref) } {
             Some(h) => h,
             None => return Z_STREAM_ERROR,
         };
@@ -701,7 +776,7 @@ pub unsafe extern "C" fn inflateSync(strm: z_streamp) -> c_int {
         // across the later `&mut` re-borrow for cursor advancement.
         let input: &[u8] = unsafe { input_slice(sref) };
         // SAFETY: `state`, if non-null, is the `Box<InflateHandle>`.
-        let handle = match unsafe { state_ref::<InflateHandle>(sref) } {
+        let handle = match unsafe { inflate_handle(sref) } {
             Some(h) => h,
             None => return Z_STREAM_ERROR,
         };
@@ -729,7 +804,7 @@ pub unsafe extern "C" fn inflateSyncPoint(strm: z_streamp) -> c_int {
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
         // SAFETY: `state`, if non-null, is the `Box<InflateHandle>`.
-        let handle = match unsafe { state_ref::<InflateHandle>(sref) } {
+        let handle = match unsafe { inflate_handle(sref) } {
             Some(h) => h,
             None => return Z_STREAM_ERROR,
         };
@@ -753,7 +828,7 @@ pub unsafe extern "C" fn inflatePrime(strm: z_streamp, bits: c_int, value: c_int
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
         // SAFETY: `state`, if non-null, is the `Box<InflateHandle>`.
-        let handle = match unsafe { state_ref::<InflateHandle>(sref) } {
+        let handle = match unsafe { inflate_handle(sref) } {
             Some(h) => h,
             None => return Z_STREAM_ERROR,
         };
@@ -788,7 +863,7 @@ pub unsafe extern "C" fn inflateCopy(dest: z_streamp, source: z_streamp) -> c_in
         // SAFETY: `source` is non-null and a valid `z_stream`.
         let src = unsafe { &mut *source };
         // SAFETY: `source.state`, if non-null, is the `Box<InflateHandle>`.
-        let src_handle = match unsafe { state_ref::<InflateHandle>(src) } {
+        let src_handle = match unsafe { inflate_handle(src) } {
             Some(h) => h,
             None => return Z_STREAM_ERROR,
         };
@@ -853,7 +928,7 @@ pub unsafe extern "C" fn inflateMark(strm: z_streamp) -> c_long {
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
         // SAFETY: `state`, if non-null, is the `Box<InflateHandle>`.
-        match unsafe { state_ref::<InflateHandle>(sref) } {
+        match unsafe { inflate_handle(sref) } {
             Some(h) => crate::inflate::inflate_mark(&h.zs) as c_long,
             None => INFLATE_MARK_ERR,
         }
@@ -871,7 +946,7 @@ pub unsafe extern "C" fn inflateValidate(strm: z_streamp, check: c_int) -> c_int
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
         // SAFETY: `state`, if non-null, is the `Box<InflateHandle>`.
-        let handle = match unsafe { state_ref::<InflateHandle>(sref) } {
+        let handle = match unsafe { inflate_handle(sref) } {
             Some(h) => h,
             None => return Z_STREAM_ERROR,
         };
@@ -894,7 +969,7 @@ pub unsafe extern "C" fn inflateUndermine(strm: z_streamp, subvert: c_int) -> c_
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
         // SAFETY: `state`, if non-null, is the `Box<InflateHandle>`.
-        let handle = match unsafe { state_ref::<InflateHandle>(sref) } {
+        let handle = match unsafe { inflate_handle(sref) } {
             Some(h) => h,
             None => return Z_STREAM_ERROR,
         };
@@ -917,7 +992,7 @@ pub unsafe extern "C" fn inflateCodesUsed(strm: z_streamp) -> c_ulong {
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
         // SAFETY: `state`, if non-null, is the `Box<InflateHandle>`.
-        match unsafe { state_ref::<InflateHandle>(sref) } {
+        match unsafe { inflate_handle(sref) } {
             Some(h) => match crate::inflate::inflate_codes_used(&h.zs) {
                 Some(n) => n as c_ulong,
                 None => c_ulong::MAX,
@@ -987,7 +1062,7 @@ pub unsafe extern "C" fn inflateGetHeader(strm: z_streamp, head: gz_headerp) -> 
         };
 
         // SAFETY: `state`, if non-null, is the `Box<InflateHandle>`.
-        let handle = match unsafe { state_ref::<InflateHandle>(sref) } {
+        let handle = match unsafe { inflate_handle(sref) } {
             Some(h) => h,
             None => return Z_STREAM_ERROR,
         };
@@ -1101,6 +1176,20 @@ pub unsafe extern "C" fn inflateBackEnd(strm: z_streamp) -> c_int {
         }
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
+        // Defense-in-depth against cross-type `End` misuse (same UB class as
+        // FINDING-6): the `inflateBack` handle is a bare `Box<InflateState>` with
+        // no `HandleKind` tag, so `state_take::<InflateState>` below is a blind
+        // cast. If the caller passed a stream owned by the *other* engines — a
+        // tagged `DeflateHandle`/`InflateHandle` — reconstituting it as
+        // `Box<InflateState>` would be a layout-mismatched free. Peek the tag
+        // first and reject those without taking/dropping anything. A genuine
+        // `inflateBack` state has no leading magic, so it proceeds normally.
+        // SAFETY: reads only the leading tag of the live `state` allocation.
+        if let Some(kind) = unsafe { peek_handle_kind(sref) } {
+            if kind == HandleKind::DEFLATE || kind == HandleKind::INFLATE {
+                return Z_STREAM_ERROR;
+            }
+        }
         // SAFETY: `state`, if non-null, is the `Box<InflateState>` from
         // `inflateBackInit_`; `state_take` reclaims it and nulls `state`.
         match unsafe { state_take::<InflateState>(sref) } {

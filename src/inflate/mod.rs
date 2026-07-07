@@ -69,7 +69,6 @@ pub use tables::{Code, ENOUGH, ENOUGH_DISTS, ENOUGH_LENS, MAXBITS, inflate_table
 // Imports.
 // ---------------------------------------------------------------------------
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 
 use crate::checksum::adler32;
 #[cfg(feature = "gzip")]
@@ -78,7 +77,7 @@ use crate::constants::{DEF_WBITS, MAX_WBITS, Z_BLOCK, Z_DEFLATED, Z_FINISH, Z_TR
 use crate::error::{ReturnCode, ZlibError};
 #[cfg(feature = "gzip")]
 use crate::gz_header::GzHeader;
-use crate::stream::{Allocator, StreamState, ZStream};
+use crate::stream::{AllocBuffer, Allocator, StreamState, ZStream};
 
 use crate::inflate::fast::inflate_fast;
 use crate::inflate::fixed::{DISTFIX, LENFIX};
@@ -334,14 +333,20 @@ fn fixedtables(state: &mut InflateState) {
 /// relies on identical `wsize`/`whave`/`wnext` bookkeeping when it copies match
 /// bytes out of the window.
 ///
-/// Unlike C — which returns `1` on `ZALLOC` failure — this never fails: the
-/// window is an owned [`Vec<u8>`] and Rust aborts on allocation failure rather
-/// than returning null. The C `MEM` mode is therefore unreachable through this
-/// path (it remains representable only for a custom-allocator FFI hook).
+/// The window is an owned [`AllocBuffer<u8>`]: when the owning stream carries a
+/// caller-supplied `zalloc`/`zfree` (installed through the FFI `z_stream`), the
+/// window is allocated through those hooks via the state's stored
+/// [`alloc_hook`](InflateState::alloc_hook) (AAP §0.6.3; QA FINDING-3);
+/// otherwise it uses the Rust global allocator. Either way this never returns
+/// C's `1`-on-`ZALLOC`-failure: a global allocation aborts on OOM, and a
+/// hook-backed allocation that returns null transparently falls back to the
+/// global allocator (see [`AllocBuffer::zeroed`]), so the C `MEM` mode is
+/// unreachable through this path.
 fn updatewindow(state: &mut InflateState, output: &[u8], end: usize, mut copy: usize) {
-    // If it hasn't been done already, allocate space for the window.
+    // If it hasn't been done already, allocate space for the window — routed
+    // through the caller's allocator hook when one was installed.
     if state.window.is_empty() {
-        state.window = alloc::vec![0u8; 1usize << state.wbits];
+        state.window = AllocBuffer::zeroed(1usize << state.wbits, state.alloc_hook);
     }
 
     // If the window is not in use yet, initialise its geometry.
@@ -509,8 +514,12 @@ pub fn inflate_reset2<A: Allocator>(strm: &mut ZStream<A>, window_bits: i32) -> 
         }
 
         // Free the window if the size changed, so it is re-sized on next use.
+        // Assigning an empty `AllocBuffer` drops the previous one, which routes
+        // through the caller's `zfree` when the window was hook-backed
+        // (AAP §0.6.3; QA FINDING-3). The stored `alloc_hook` is left intact so
+        // the re-allocation on next use goes through the same allocator.
         if !state.window.is_empty() && state.wbits != wb as u32 {
-            state.window = Vec::new();
+            state.window = AllocBuffer::default();
         }
 
         state.wrap = wrap;
@@ -535,8 +544,13 @@ pub fn inflate_reset2<A: Allocator>(strm: &mut ZStream<A>, window_bits: i32) -> 
 pub fn inflate_init2<A: Allocator>(strm: &mut ZStream<A>, window_bits: i32) -> InflateResult {
     strm.msg = None;
     // ZALLOC → Box::new. wrap/wbits are (re)assigned by inflate_reset2 below;
-    // `new` sets mode = Head so the state passes reset2's inflate-state guard.
-    strm.set_inflate_state(InflateState::new(0, 0));
+    // `new_in` sets mode = Head so the state passes reset2's inflate-state
+    // guard. The caller's allocator hook (the `zalloc`/`zfree` installed via the
+    // FFI `z_stream`, or a no-op under the global allocator) is threaded in so
+    // the lazily-allocated window is later routed through it (AAP §0.6.3; QA
+    // FINDING-3).
+    let hook = strm.allocator().hook();
+    strm.set_inflate_state(InflateState::new_in(hook, 0, 0));
     match inflate_reset2(strm, window_bits) {
         Ok(rc) => Ok(rc),
         Err(e) => {
@@ -1980,6 +1994,11 @@ fn clone_inflate_state(s: &InflateState) -> Box<InflateState> {
         sane: s.sane,
         back: s.back,
         was: s.was,
+        // Carry the caller's allocator hook into the clone so the copied
+        // window (already re-allocated through the same hook by
+        // `AllocBuffer::clone`) and any future re-allocation stay routed
+        // through the caller's `zalloc`/`zfree` (AAP §0.6.3; QA FINDING-3).
+        alloc_hook: s.alloc_hook,
     })
 }
 
@@ -2099,6 +2118,7 @@ pub fn inflate_end<A: Allocator>(strm: &mut ZStream<A>) -> InflateResult {
 mod tests {
     use super::*;
     use crate::constants::Z_NO_FLUSH;
+    use alloc::vec::Vec;
 
     /// The uncompressed reference message. It repeats "hello, " so the decoder
     /// exercises the length/distance/match copy path (back-references into the

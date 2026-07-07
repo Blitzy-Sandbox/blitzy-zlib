@@ -38,10 +38,10 @@
 //! `core`, `alloc`, and the crate's own safe modules.
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 
 use crate::gz_header::GzHeader;
 use crate::inflate::tables::{Code, ENOUGH};
+use crate::stream::{AllocBuffer, AllocHook};
 
 /// The possible inflate modes maintained between `inflate()` calls.
 ///
@@ -270,11 +270,16 @@ pub struct InflateState {
     pub wnext: u32,
     /// Owned sliding window, allocated on demand.
     ///
-    /// Starts empty ([`Vec::new`]) and is sized to `1 << wbits` on first use by
-    /// the driver's `updatewindow`, mirroring C's lazy `ZALLOC` of
-    /// `state->window`. Being owned, it is freed automatically on drop (C
-    /// `unsigned char FAR *window`).
-    pub window: Vec<u8>,
+    /// Starts empty ([`AllocBuffer::default`]) and is sized to `1 << wbits` on
+    /// first use by the driver's `updatewindow`, mirroring C's lazy `ZALLOC` of
+    /// `state->window`. When a caller installed `zalloc`/`zfree` through the FFI
+    /// `z_stream`, the window is routed through those hooks via the
+    /// [`alloc_hook`](InflateState::alloc_hook) stored at construction time
+    /// (AAP §0.6.3; QA FINDING-3); otherwise it is a plain global allocation.
+    /// Being owned, it is freed automatically on drop — through the caller's
+    /// `zfree` for a hook-backed buffer, or the global allocator otherwise —
+    /// subsuming C's `ZFREE(state->window)`.
+    pub window: AllocBuffer<u8>,
 
     // --- bit accumulator ---------------------------------------------------
     /// Input bit accumulator; only the low 32 bits are ever used (C
@@ -359,6 +364,18 @@ pub struct InflateState {
     /// Initial length of the match currently being processed (C
     /// `unsigned was`).
     pub was: u32,
+
+    /// Allocator hook threaded from the owning stream at construction time.
+    ///
+    /// The C `struct inflate_state` has no such field because the manual
+    /// `ZALLOC`/`ZFREE` calls read `strm->zalloc`/`strm->zfree` directly. Here
+    /// the state owns its [`window`](InflateState::window) rather than holding a
+    /// back-pointer to the stream, so the hook is captured once (by
+    /// [`new_in`](InflateState::new_in)) and consulted whenever the window is
+    /// lazily (re)allocated. It is [`AllocHook::none`] under the Rust global
+    /// allocator, or the caller's `zalloc`/`zfree`/`opaque` when one was
+    /// installed through the FFI `z_stream` (AAP §0.6.3; QA FINDING-3).
+    pub alloc_hook: AllocHook,
 }
 
 /// Default `dmax` value: the maximum back-reference distance for a 32 KiB
@@ -394,8 +411,33 @@ impl InflateState {
     /// it behind a [`Box`] matches the `Option<Box<InflateState>>` the owning
     /// [`crate::stream`] type holds, and avoids moving the arrays around by
     /// value.
+    ///
+    /// # Allocator
+    ///
+    /// This convenience constructor records [`AllocHook::none`], so the window
+    /// (when the driver later allocates it) uses the Rust global allocator —
+    /// equivalent to a C caller with null `zalloc`/`zfree`. The FFI init path
+    /// calls [`new_in`](Self::new_in) instead, passing the caller's
+    /// [`AllocHook`] so the window is routed through the caller's
+    /// `zalloc`/`zfree` (AAP §0.6.3).
+    #[inline]
     #[must_use]
     pub fn new(wrap: i32, wbits: u32) -> Box<InflateState> {
+        Self::new_in(AllocHook::none(), wrap, wbits)
+    }
+
+    /// Builds a boxed [`InflateState`], recording the supplied [`AllocHook`] so
+    /// the lazily-allocated [`window`](InflateState::window) is routed through
+    /// the caller's `zalloc`/`zfree` when active, or the global allocator
+    /// otherwise. See [`new`](Self::new) for the full field-initialization
+    /// contract; this is the same constructor with an explicit allocator hook
+    /// (AAP §0.6.3 has-hook clause; QA FINDING-3).
+    ///
+    /// The window is *not* allocated here — it is sized on demand by the
+    /// driver's `updatewindow`, which consults the stored
+    /// [`alloc_hook`](InflateState::alloc_hook) at that time.
+    #[must_use]
+    pub fn new_in(hook: AllocHook, wrap: i32, wbits: u32) -> Box<InflateState> {
         Box::new(InflateState {
             // reset-managed fields (see `reset_keep`)
             mode: InflateMode::Head,
@@ -422,7 +464,7 @@ impl InflateState {
             wsize: 0,
             whave: 0,
             wnext: 0,
-            window: Vec::new(),
+            window: AllocBuffer::default(),
             length: 0,
             offset: 0,
             extra: 0,
@@ -436,6 +478,7 @@ impl InflateState {
             work: [0; 288],
             codes: [Code::default(); ENOUGH],
             was: 0,
+            alloc_hook: hook,
         })
     }
 
@@ -560,10 +603,12 @@ impl InflateState {
 mod tests {
     use super::*;
 
-    /// Builds an owned window of `n` zero bytes using only `alloc` APIs, so the
-    /// helper is valid in both `no_std` + `alloc` and `std` test builds.
-    fn make_window(n: usize) -> Vec<u8> {
-        alloc::vec![0u8; n]
+    /// Builds an owned window of `n` zero bytes as an [`AllocBuffer`] (the
+    /// [`window`](InflateState::window) field type) using the global allocator,
+    /// so the helper is valid in both `no_std` + `alloc` and `std` test builds
+    /// and can be assigned directly to `state.window`.
+    fn make_window(n: usize) -> AllocBuffer<u8> {
+        AllocBuffer::zeroed(n, AllocHook::none())
     }
 
     #[test]

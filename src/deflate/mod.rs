@@ -328,9 +328,22 @@ pub fn deflate_init2<A: Allocator>(
         WrapMode::Auto => return Err(ZlibError::StreamError),
     };
 
-    // `DeflateState::new` performs the full deflateInit2_ validation, resolves
-    // the default level, and runs the state-side reset + lm_init.
-    let state = DeflateState::new(level, method, w_bits as i32, mem_level, strategy, wrap)?;
+    // `DeflateState::new_in` performs the full deflateInit2_ validation,
+    // resolves the default level, and runs the state-side reset + lm_init.
+    // The allocator hook (the caller's `zalloc`/`zfree` under the FFI
+    // `CAllocator`, or a no-op under the global allocator) is threaded through
+    // so every working buffer is routed through the caller's allocator when one
+    // is installed (AAP §0.6.3 has-hook clause; QA FINDING-3).
+    let hook = strm.allocator().hook();
+    let state = DeflateState::new_in(
+        hook,
+        level,
+        method,
+        w_bits as i32,
+        mem_level,
+        strategy,
+        wrap,
+    )?;
     strm.set_deflate_state(state);
 
     // Finish exactly as C does: `return deflateReset(strm);`.
