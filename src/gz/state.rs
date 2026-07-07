@@ -44,6 +44,7 @@
 //! all raw-fd, raw-pointer, and C-string handling for the FFI `gz*` entry points
 //! lives in `src/ffi/gz.rs`, not here.
 
+use std::ffi::CString;
 use std::fs::File;
 
 use crate::error::ReturnCode;
@@ -276,6 +277,22 @@ pub struct GzState {
     /// memory.
     pub(crate) msg: Option<String>,
 
+    /// A NUL-terminated C mirror of [`msg`](Self::msg), kept strictly in
+    /// lockstep with it by [`error`](Self::error).
+    ///
+    /// The idiomatic [`msg`](Self::msg) is a Rust [`String`] (not
+    /// NUL-terminated), but the C `gzerror` contract requires a stable
+    /// `*const c_char` that stays valid until the next `gz*` call on the handle.
+    /// Owning the [`CString`] here lets the FFI `gzerror` shim hand back a
+    /// pointer into this field with exactly that lifetime — the pointer is
+    /// invalidated only when the next recorded error replaces it, matching C.
+    ///
+    /// It is [`None`] in precisely the cases [`msg`](Self::msg) is [`None`]
+    /// (no error, [`ReturnCode::Ok`], a message-less error, or
+    /// [`ReturnCode::MemError`], for which the FFI synthesises the literal
+    /// `"out of memory"` without allocating).
+    pub(crate) msg_c: Option<CString>,
+
     /// The embedded (de)compression stream (C `z_stream strm`, stored in place —
     /// not a pointer).
     ///
@@ -351,7 +368,10 @@ impl GzState {
     ///   the code (as the C code does when passed a `NULL` message).
     pub(crate) fn error(&mut self, err: ReturnCode, msg: Option<&str>) {
         // 1. Drop any previously stored message (Rust frees the old `String`).
+        //    The FFI-facing NUL-terminated mirror is cleared in lockstep so a
+        //    stale detail pointer can never be handed back by `gzerror`.
         self.msg = None;
+        self.msg_c = None;
 
         // 2. If the error is fatal and we are not mid non-blocking retry, zero
         //    `have` so that the fast `gzgetc()` macro path fails and defers to
@@ -375,7 +395,15 @@ impl GzState {
         }
 
         // 6. Construct the "path: message" detail string.
-        self.msg = Some(format!("{}: {msg}", self.path));
+        let detail = format!("{}: {msg}", self.path);
+
+        // Keep the FFI-facing NUL-terminated mirror in lockstep with `msg`. The
+        // detail is `path` + `": "` + `msg`; a real gzip path and error detail
+        // contain no interior NUL, so `CString::new` succeeds. Were an interior
+        // NUL ever present, `.ok()` yields `None` and the FFI `gzerror` falls
+        // back to the empty string rather than exposing a truncated pointer.
+        self.msg_c = CString::new(detail.as_bytes()).ok();
+        self.msg = Some(detail);
     }
 
     /// Clears any recorded error, returning the file to the
@@ -435,6 +463,7 @@ mod tests {
             skip: 0,
             err: ReturnCode::Ok,
             msg: None,
+            msg_c: None,
             strm: ZStream::new(),
         }
     }

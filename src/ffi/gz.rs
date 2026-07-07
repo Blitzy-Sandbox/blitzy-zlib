@@ -52,9 +52,14 @@
 //!
 //! `gzerror` must return a `*const c_char` that stays valid until the next `gz*`
 //! call on the handle. The idiomatic error accessor yields a borrowed,
-//! non-NUL-terminated `&str`; to hand C a stable, NUL-terminated pointer this
-//! module maps the machine-readable error *code* to a `'static` C string (the
-//! `errnum` out-parameter carries the authoritative, exact code).
+//! non-NUL-terminated `&str`; to hand C a stable, NUL-terminated pointer the
+//! handle owns a `CString` mirror of its message (`GzState::msg_c`, kept in
+//! lockstep with `GzState::msg` by `GzState::error`). `gzerror` returns a
+//! pointer into that mirror — the specific `"{path}: {detail}"` text, matching
+//! reference zlib byte-for-byte — falling back to the literal `"out of memory"`
+//! for `Z_MEM_ERROR` (which stores no heap message) and to the empty string
+//! when there is no detail. The `errnum` out-parameter carries the
+//! authoritative, exact code.
 //!
 //! # Feature gating & safety
 //!
@@ -120,27 +125,6 @@ fn guard_const_ptr<T>(
     f: impl FnOnce() -> *const T + core::panic::UnwindSafe,
 ) -> *const T {
     std::panic::catch_unwind(f).unwrap_or(default)
-}
-
-/// Maps a [`ReturnCode`] to a stable, `'static`, NUL-terminated C string for
-/// [`gzerror`]. See the module docs ("`gzerror` message pointer") for why the
-/// generic per-code text is returned rather than a per-handle detail string.
-///
-/// The texts mirror C `gzerror`, which reports `"out of memory"` for
-/// `Z_MEM_ERROR` (as opposed to `zError`'s `"insufficient memory"`).
-#[inline]
-fn gzerror_message(code: ReturnCode) -> &'static CStr {
-    match code {
-        ReturnCode::Ok => c"",
-        ReturnCode::ErrNo => c"file error",
-        ReturnCode::StreamError => c"stream error",
-        ReturnCode::DataError => c"data error",
-        ReturnCode::MemError => c"out of memory",
-        ReturnCode::BufError => c"buffer error",
-        ReturnCode::VersionError => c"incompatible version",
-        ReturnCode::NeedDict => c"need dictionary",
-        ReturnCode::StreamEnd => c"stream end",
-    }
 }
 
 /// Converts a non-null C path string into an owned [`std::path::PathBuf`].
@@ -827,8 +811,12 @@ pub unsafe extern "C" fn gzdirect(file: gzFile) -> c_int {
 ///
 /// Returns a pointer to the current error message for `file` and, if `errnum`
 /// is non-null, writes the machine-readable error code there. The returned
-/// pointer is a `'static`, NUL-terminated string keyed by the error code (see
-/// the module docs); the `errnum` value is the authoritative signal.
+/// pointer is the handle's own NUL-terminated message mirror — the specific
+/// `"{path}: {detail}"` text (byte-for-byte matching reference zlib), the
+/// literal `"out of memory"` for `Z_MEM_ERROR`, or the empty string when there
+/// is no detail (see the module docs). It stays valid until the next `gz*` call
+/// records a new error on the handle; the `errnum` value is the authoritative
+/// code.
 ///
 /// Matches C by returning `NULL` for a null handle (and does not write
 /// `errnum`). A handle that is neither an open reader nor writer likewise
@@ -850,7 +838,22 @@ pub unsafe extern "C" fn gzerror(file: gzFile, errnum: *mut c_int) -> *const c_c
             // SAFETY: `errnum` is a non-null, caller-owned `int` slot.
             unsafe { *errnum = code.as_c_int() };
         }
-        gzerror_message(code).as_ptr()
+        // Return the same text the idiomatic `gz::gzerror` reports, but as a
+        // stable, NUL-terminated pointer (see the module docs). `Z_MEM_ERROR`
+        // deliberately stores no heap message, so synthesise the literal
+        // `"out of memory"` without allocating; otherwise hand back a pointer
+        // into the handle's owned `msg_c` mirror of `msg` — the specific
+        // `"{path}: {detail}"` string, or the empty string when no detail is
+        // present. The pointer stays valid until the next `gz*` call records a
+        // new error and replaces `msg_c`, exactly matching the C lifetime.
+        if code == ReturnCode::MemError {
+            c"out of memory".as_ptr()
+        } else {
+            match &state.msg_c {
+                Some(cs) => cs.as_ptr(),
+                None => c"".as_ptr(),
+            }
+        }
     })
 }
 

@@ -395,6 +395,7 @@ fn gz_open(path: &Path, file: Option<File>, mode: &str) -> Result<Box<GzState>, 
         skip: 0,
         err: ReturnCode::Ok,
         msg: None,
+        msg_c: None,
         strm: crate::stream::ZStream::new(),
     });
 
@@ -1056,6 +1057,7 @@ mod tests {
             skip: 0,
             err: ReturnCode::Ok,
             msg: None,
+            msg_c: None,
             strm: crate::stream::ZStream::new(),
         }
     }

@@ -259,6 +259,7 @@ mod tests {
             skip: 0,
             err: ReturnCode::Ok,
             msg: None,
+            msg_c: None,
             strm: ZStream::new(),
         })
     }
@@ -295,6 +296,7 @@ mod tests {
             skip: 0,
             err,
             msg: None,
+            msg_c: None,
             strm: ZStream::new(),
         })
     }
