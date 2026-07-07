@@ -30,506 +30,521 @@
        Design target: reveal.js 5.1.0 @ 1920x1080. Keep in lockstep with the
        canonical reference. Spec authority: AAP §0.7.3 / §0.8.
        ========================================================================== -->
-  <style>
-    /* ------------------------------------------------------------------
-       1. Design tokens — :root custom properties
-       ------------------------------------------------------------------ */
-    :root {
-      /* Brand palette */
-      --blitzy-primary: #5B39F3;
-      --blitzy-primary-dark: #2D1C77;
-      --blitzy-primary-navy: #1A105F;
-      --blitzy-primary-light: #7A6DEC;
-      --blitzy-primary-deep: #4101DB;
-      --blitzy-accent-teal: #94FAD5;
-
-      /* Neutrals — text */
-      --blitzy-text: #333333;
-      --blitzy-text-muted: #999999;
-      --blitzy-text-inverse: #FFFFFF;
-
-      /* Neutrals — border */
-      --blitzy-border: #D9D9D9;
-
-      /* Neutrals — surfaces */
-      --blitzy-surface: #FFFFFF;
-      --blitzy-surface-tint: #F4EFF6;
-      --blitzy-surface-alt: #F5F5F5;
-
-      /* Font stacks */
-      --ff-body: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      --ff-display: 'Space Grotesk', 'Inter', sans-serif;
-      --ff-mono: 'Fira Code', 'SF Mono', Consolas, monospace;
-
-      /* Gradients */
-      --gradient-hero: linear-gradient(68deg, #7A6DEC 15.56%, #5B39F3 62.74%, #4101DB 84.44%);
-      --gradient-divider: linear-gradient(135deg, #2D1C77 0%, #5B39F3 100%);
-      --gradient-accent-bar: linear-gradient(90deg, #5B39F3 0%, #94FAD5 100%);
-    }
-
-    /* ------------------------------------------------------------------
-       2. reveal.js base overrides + content-slide typography
-       Content (default) slides: white surface, dark text, left-aligned,
-       roomy. Sizes tuned for the 1920x1080 canvas.
-       ------------------------------------------------------------------ */
-    .reveal {
-      font-family: var(--ff-body);
-      font-size: 34px;
-      font-weight: 400;
-      color: var(--blitzy-text);
-      background-color: var(--blitzy-surface);
-      -webkit-font-smoothing: antialiased;
-      text-rendering: optimizeLegibility;
-    }
-
-    .reveal .slides {
-      text-align: left;
-    }
-
-    .reveal .slides > section,
-    .reveal .slides > section > section {
-      padding: 60px 90px;
-      background-color: var(--blitzy-surface);
-      box-sizing: border-box;
-      height: 100%;
-    }
-
-    /* Display headings -> Space Grotesk */
-    .reveal h1,
-    .reveal h2,
-    .reveal h3,
-    .reveal h4 {
-      font-family: var(--ff-display);
-      color: var(--blitzy-primary-dark);
-      font-weight: 600;
-      line-height: 1.1;
-      letter-spacing: -0.01em;
-      margin: 0 0 0.4em;
-      text-transform: none;
-    }
-
-    .reveal h1 { font-size: 2.2em; }
-    .reveal h2 { font-size: 1.6em; }
-    .reveal h3 { font-size: 1.25em; }
-
-    /* Body copy -> Inter */
-    .reveal p,
-    .reveal li {
-      font-family: var(--ff-body);
-      line-height: 1.45;
-    }
-
-    .reveal ul,
-    .reveal ol {
-      display: block;
-      margin-left: 1em;
-    }
-
-    .reveal li {
-      margin: 0.35em 0;
-    }
-
-    /* Accent color for emphasized inline text and list markers */
-    .reveal strong { color: var(--blitzy-primary-deep); font-weight: 600; }
-    .reveal ::marker { color: var(--blitzy-primary); }
-
-    /* Inline monospace tokens -> Fira Code */
-    .reveal code,
-    .reveal :not(pre) > code {
-      font-family: var(--ff-mono);
-      font-size: 0.9em;
-      background: var(--blitzy-surface-tint);
-      color: var(--blitzy-primary-deep);
-      padding: 0.08em 0.35em;
-      border-radius: 6px;
-      border: 1px solid var(--blitzy-border);
-    }
-
-    .reveal a {
-      color: var(--blitzy-primary);
-      text-decoration: none;
-    }
-
-    /* Brand-tinted reveal chrome (controls + progress bar) */
-    .reveal .controls { color: var(--blitzy-primary); }
-    .reveal .progress { color: var(--blitzy-primary); height: 6px; }
-    .reveal .progress span { background: var(--gradient-accent-bar); }
-
-    /* ------------------------------------------------------------------
-       3. Eyebrow — Fira Code, uppercase, tracked; teal on dark/hero
-       ------------------------------------------------------------------ */
-    .eyebrow {
-      font-family: var(--ff-mono);
-      font-weight: 500;
-      font-size: 0.55em;
-      text-transform: uppercase;
-      letter-spacing: 0.28em;
-      color: var(--blitzy-accent-teal);
-      display: inline-block;
-      margin-bottom: 0.9em;
-    }
-
-    /* On light content slides the eyebrow reads in primary purple */
-    .reveal .slides > section:not(.slide-title):not(.slide-divider):not(.slide-closing) .eyebrow {
-      color: var(--blitzy-primary);
-    }
-
-    /* ------------------------------------------------------------------
-       4. Slide-type classes
-       ------------------------------------------------------------------ */
-
-    /* 4.1 Title slide — hero gradient, white text, centered */
-    .reveal .slides section.slide-title {
-      background: var(--gradient-hero);
-      color: var(--blitzy-text-inverse);
-      text-align: center;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-    }
-
-    .reveal .slides section.slide-title h1 {
-      color: var(--blitzy-text-inverse);
-      font-size: 2.9em;
-      margin-bottom: 0.25em;
-    }
-
-    .reveal .slides section.slide-title .subtitle,
-    .reveal .slides section.slide-title p {
-      color: rgba(255, 255, 255, 0.9);
-      font-size: 0.9em;
-      max-width: 62%;
-      margin: 0 auto;
-    }
-
-    /* 4.2 Section divider — dark purple / gradient, white text, centered */
-    .reveal .slides section.slide-divider {
-      background: var(--blitzy-primary-dark);
-      background: var(--gradient-divider);
-      color: var(--blitzy-text-inverse);
-      text-align: center;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-    }
-
-    .reveal .slides section.slide-divider h2,
-    .reveal .slides section.slide-divider h1 {
-      color: var(--blitzy-text-inverse);
-      font-size: 2.4em;
-    }
-
-    .reveal .slides section.slide-divider [data-lucide] {
-      width: 96px;
-      height: 96px;
-      stroke: var(--blitzy-accent-teal);
-      margin-bottom: 0.5em;
-    }
-
-    /* 4.3 Closing slide — navy, white text, short takeaway, lockup, accent bar */
-    .reveal .slides section.slide-closing {
-      background: var(--blitzy-primary-navy);
-      color: var(--blitzy-text-inverse);
-      text-align: center;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-    }
-
-    .reveal .slides section.slide-closing h1,
-    .reveal .slides section.slide-closing h2 {
-      color: var(--blitzy-text-inverse);
-      font-size: 2.6em;
-    }
-
-    .reveal .slides section.slide-closing ul {
-      list-style: none;
-      margin: 0.6em 0;
-      padding: 0;
-    }
-
-    .reveal .slides section.slide-closing li {
-      color: rgba(255, 255, 255, 0.88);
-    }
-
-    .reveal .slides section.slide-closing [data-lucide] {
-      stroke: var(--blitzy-accent-teal);
-    }
-
-    /* ------------------------------------------------------------------
-       5. Component classes
-       ------------------------------------------------------------------ */
-
-    /* 5.1 KPI grid + cards */
-    .kpi-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-      gap: 32px;
-      margin: 0.6em 0;
-    }
-
-    .kpi-card {
-      background: var(--blitzy-surface-tint);
-      border: 1px solid var(--blitzy-border);
-      border-radius: 18px;
-      padding: 40px 36px;
-      text-align: center;
-      box-shadow: 0 8px 24px rgba(45, 28, 119, 0.08);
-    }
-
-    .kpi-icon {
-      color: var(--blitzy-primary);
-      margin-bottom: 0.4em;
-    }
-
-    .kpi-icon [data-lucide] {
-      width: 56px;
-      height: 56px;
-      stroke: var(--blitzy-primary);
-    }
-
-    .kpi-value {
-      font-family: var(--ff-display);
-      font-weight: 700;
-      font-size: 2.6em;
-      line-height: 1;
-      color: var(--blitzy-primary);
-    }
-
-    .kpi-label {
-      font-family: var(--ff-body);
-      font-size: 0.62em;
-      color: var(--blitzy-text-muted);
-      margin-top: 0.5em;
-    }
-
-    /* 5.2 Icon row — horizontal labeled Lucide icons (2-up grid on value slides) */
-    .icon-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 40px;
-      align-items: flex-start;
-      margin: 0.5em 0;
-    }
-
-    .icon-row > * {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-      flex: 1 1 42%;
-      max-width: 46%;
-    }
-
-    .icon-row [data-lucide] {
-      width: 44px;
-      height: 44px;
-      stroke: var(--blitzy-primary);
-      flex: 0 0 auto;
-    }
-
-    .icon-row .icon-label {
-      font-family: var(--ff-body);
-      font-size: 0.72em;
-      line-height: 1.35;
-    }
-
-    /* 5.3 Hero icon — large Lucide icon on the title slide */
-    .hero-icon {
-      margin-bottom: 0.5em;
-    }
-
-    .hero-icon [data-lucide] {
-      width: 120px;
-      height: 120px;
-      stroke: var(--blitzy-accent-teal);
-      stroke-width: 1.5;
-    }
-
-    /* 5.4 Accent bar — thin gradient bar (closing slide) */
-    .accent-bar {
-      height: 8px;
-      width: 220px;
-      border-radius: 999px;
-      background: var(--gradient-accent-bar);
-      margin: 1em auto 0;
-    }
-
-    /* 5.5 Brand lockup — "Blitzy" wordmark */
-    .brand-lockup {
-      font-family: var(--ff-display);
-      font-weight: 700;
-      letter-spacing: 0.02em;
-      font-size: 0.8em;
-      color: var(--blitzy-text-inverse);
-      display: inline-flex;
-      align-items: center;
-      gap: 12px;
-      margin-top: 1em;
-      opacity: 0.95;
-    }
-
-    .brand-lockup [data-lucide] {
-      width: 32px;
-      height: 32px;
-      stroke: var(--blitzy-accent-teal);
-    }
-
-    /* ------------------------------------------------------------------
-       6. Mermaid container — center + width-constrain for 1920x1080
-       ------------------------------------------------------------------ */
-    .mermaid-wrap {
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      width: 100%;
-      margin: 0.4em 0;
-    }
-
-    .reveal pre.mermaid,
-    .mermaid-wrap .mermaid {
-      background: transparent;
-      box-shadow: none;
-      width: 100%;
-      max-width: 1500px;
-      max-height: 720px;
-      margin: 0 auto;
-      text-align: center;
-      /* Match Mermaid's own text-measurement font-size (16px). Overriding this
-         to a larger value inflates the rendered labels beyond the box widths
-         Mermaid computed, clipping the text. The generated SVG is vector and
-         scales up losslessly to fill the slide via the max-width below. */
-      font-size: 16px;
-      line-height: 1.2;
-    }
-
-    .reveal pre.mermaid svg {
-      /* Scale each diagram to fit within the slide, preserving aspect ratio.
-         The height cap keeps the tall architecture diagram clear of the
-         caption; wide/short diagrams render at their natural size. */
-      max-width: 100%;
-      max-height: 640px;
-      width: auto;
-      height: auto;
-    }
-
-    /* ------------------------------------------------------------------
-       7. Styled table — module map, quality gates, risk tables
-       ------------------------------------------------------------------ */
-    .reveal table.blitzy-table {
-      width: 100%;
-      border-collapse: collapse;
-      font-family: var(--ff-body);
-      font-size: 0.62em;
-      margin: 0.4em 0;
-      box-shadow: 0 8px 24px rgba(45, 28, 119, 0.08);
-      border-radius: 12px;
-      overflow: hidden;
-    }
-
-    .reveal table.blitzy-table thead th {
-      background: var(--blitzy-primary);
-      color: var(--blitzy-text-inverse);
-      font-family: var(--ff-display);
-      font-weight: 600;
-      text-align: left;
-      padding: 18px 24px;
-    }
-
-    .reveal table.blitzy-table tbody td {
-      padding: 16px 24px;
-      border-bottom: 1px solid var(--blitzy-border);
-      color: var(--blitzy-text);
-      vertical-align: middle;
-    }
-
-    .reveal table.blitzy-table tbody tr:nth-child(even) {
-      background: var(--blitzy-surface-tint);
-    }
-
-    .reveal table.blitzy-table tbody tr:nth-child(odd) {
-      background: var(--blitzy-surface);
-    }
-
-    .reveal table.blitzy-table [data-lucide] {
-      width: 24px;
-      height: 24px;
-      stroke: var(--blitzy-primary);
-      vertical-align: middle;
-    }
-
-    .reveal table.blitzy-table code {
-      font-size: 0.95em;
-    }
-
-    /* ------------------------------------------------------------------
-       8. Deck-specific helpers (layout only — no new brand tokens)
-       ------------------------------------------------------------------ */
-    /* Status + severity affordances for the gate / risk tables */
-    .status-pass {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      font-weight: 600;
-      color: var(--blitzy-primary-deep);
-    }
-
-    .sev {
-      display: inline-block;
-      padding: 2px 12px;
-      border-radius: 999px;
-      font-family: var(--ff-mono);
-      font-size: 0.85em;
-      font-weight: 500;
-      line-height: 1.6;
-    }
-
-    .sev-high {
-      background: rgba(65, 1, 219, 0.10);
-      color: var(--blitzy-primary-deep);
-      border: 1px solid var(--blitzy-primary);
-    }
-
-    .sev-med {
-      background: var(--blitzy-surface-alt);
-      color: var(--blitzy-text);
-      border: 1px solid var(--blitzy-border);
-    }
-
-    /* Two-column layout (onboarding bullets + roadmap diagram) */
-    .two-col {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 56px;
-      align-items: center;
-    }
-
-    /* Small muted caption line under a diagram/table */
-    .caption {
-      font-size: 0.62em;
-      color: var(--blitzy-text-muted);
-      margin-top: 0.4em;
-    }
-
-    /* Divider eyebrow reads teal on the dark divider background */
-    .reveal .slides section.slide-divider .eyebrow {
-      color: var(--blitzy-accent-teal);
-    }
-
-    /* Closing-slide standalone icon (teal, sized between hero and inline) */
-    .reveal .slides section.slide-closing .close-icon {
-      margin-bottom: 0.3em;
-    }
-
-    .reveal .slides section.slide-closing .close-icon [data-lucide] {
-      width: 76px;
-      height: 76px;
-      stroke: var(--blitzy-accent-teal);
-      stroke-width: 1.6;
-    }
-  </style>
+  <style>/* ============================================================================
+   blitzy-reveal-theme.css
+   Canonical Blitzy reveal.js brand theme — SOURCE OF TRUTH for the executive
+   summary deck (blitzy-deck/executive-summary.html).
+
+   This file is consumed as a REFERENCE only. The deck embeds an inline copy of
+   this theme in a <style> block so it stays fully self-contained (it must NOT
+   <link> to this file at runtime). The deck's inline styles MUST remain in
+   lockstep with the tokens, gradients, slide-type classes, and component
+   classes defined here.
+
+   Design target: reveal.js 5.1.0 configured at width:1920, height:1080.
+   Fonts (loaded by the deck via Google Fonts): Inter, Space Grotesk, Fira Code.
+   Spec authority: AAP §0.7.3 (Executive Presentation Requirement) / §0.8.
+   ============================================================================ */
+
+/* ------------------------------------------------------------------
+   1. Design tokens — :root custom properties
+   ------------------------------------------------------------------ */
+:root {
+  /* Brand palette */
+  --blitzy-primary: #5B39F3;
+  --blitzy-primary-dark: #2D1C77;
+  --blitzy-primary-navy: #1A105F;
+  --blitzy-primary-light: #7A6DEC;
+  --blitzy-primary-deep: #4101DB;
+  --blitzy-accent-teal: #94FAD5;
+
+  /* Neutrals — text */
+  --blitzy-text: #333333;
+  --blitzy-text-muted: #999999;
+  --blitzy-text-inverse: #FFFFFF;
+
+  /* Neutrals — border */
+  --blitzy-border: #D9D9D9;
+
+  /* Neutrals — surfaces */
+  --blitzy-surface: #FFFFFF;
+  --blitzy-surface-tint: #F4EFF6;
+  --blitzy-surface-alt: #F5F5F5;
+
+  /* Font stacks */
+  --ff-body: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --ff-display: 'Space Grotesk', 'Inter', sans-serif;
+  --ff-mono: 'Fira Code', 'SF Mono', Consolas, monospace;
+
+  /* Gradients */
+  --gradient-hero: linear-gradient(68deg, #7A6DEC 15.56%, #5B39F3 62.74%, #4101DB 84.44%);
+  --gradient-divider: linear-gradient(135deg, #2D1C77 0%, #5B39F3 100%);
+  --gradient-accent-bar: linear-gradient(90deg, #5B39F3 0%, #94FAD5 100%);
+}
+
+/* ------------------------------------------------------------------
+   2. reveal.js base overrides + content-slide typography
+   Content (default) slides: white surface, dark text, left-aligned,
+   roomy. Sizes tuned for the 1920x1080 canvas.
+   ------------------------------------------------------------------ */
+.reveal {
+  font-family: var(--ff-body);
+  font-size: 34px;
+  font-weight: 400;
+  color: var(--blitzy-text);
+  background-color: var(--blitzy-surface);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.reveal .slides {
+  text-align: left;
+}
+
+.reveal .slides > section,
+.reveal .slides > section > section {
+  padding: 60px 90px;
+  background-color: var(--blitzy-surface);
+  box-sizing: border-box;
+  height: 100%;
+}
+
+/* Display headings -> Space Grotesk */
+.reveal h1,
+.reveal h2,
+.reveal h3,
+.reveal h4 {
+  font-family: var(--ff-display);
+  color: var(--blitzy-primary-dark);
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
+  margin: 0 0 0.4em;
+  text-transform: none;
+}
+
+.reveal h1 { font-size: 2.2em; }
+.reveal h2 { font-size: 1.6em; }
+.reveal h3 { font-size: 1.25em; }
+
+/* Body copy -> Inter */
+.reveal p,
+.reveal li {
+  font-family: var(--ff-body);
+  line-height: 1.45;
+}
+
+.reveal ul,
+.reveal ol {
+  display: block;
+  margin-left: 1em;
+}
+
+.reveal li {
+  margin: 0.35em 0;
+}
+
+/* Accent color for emphasized inline text and list markers */
+.reveal strong { color: var(--blitzy-primary-deep); font-weight: 600; }
+.reveal ::marker { color: var(--blitzy-primary); }
+
+/* Inline monospace tokens -> Fira Code */
+.reveal code,
+.reveal :not(pre) > code {
+  font-family: var(--ff-mono);
+  font-size: 0.9em;
+  background: var(--blitzy-surface-tint);
+  color: var(--blitzy-primary-deep);
+  padding: 0.08em 0.35em;
+  border-radius: 6px;
+  border: 1px solid var(--blitzy-border);
+}
+
+.reveal a {
+  color: var(--blitzy-primary);
+  text-decoration: none;
+}
+
+/* Brand-tinted reveal chrome (controls + progress bar) */
+.reveal .controls { color: var(--blitzy-primary); }
+.reveal .progress { color: var(--blitzy-primary); height: 6px; }
+.reveal .progress span { background: var(--gradient-accent-bar); }
+
+/* ------------------------------------------------------------------
+   3. Eyebrow — Fira Code, uppercase, tracked; teal on dark/hero
+   ------------------------------------------------------------------ */
+.eyebrow {
+  font-family: var(--ff-mono);
+  font-weight: 500;
+  font-size: 0.55em;
+  text-transform: uppercase;
+  letter-spacing: 0.28em;
+  color: var(--blitzy-accent-teal);
+  display: inline-block;
+  margin-bottom: 0.9em;
+}
+
+/* On light content slides the eyebrow reads in primary purple */
+.reveal .slides > section:not(.slide-title):not(.slide-divider):not(.slide-closing) .eyebrow {
+  color: var(--blitzy-primary);
+}
+
+/* ------------------------------------------------------------------
+   4. Slide-type classes
+   ------------------------------------------------------------------ */
+
+/* 4.1 Title slide — hero gradient, white text, centered */
+.reveal .slides section.slide-title {
+  background: var(--gradient-hero);
+  color: var(--blitzy-text-inverse);
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.reveal .slides section.slide-title h1 {
+  color: var(--blitzy-text-inverse);
+  font-size: 2.9em;
+  margin-bottom: 0.25em;
+}
+
+.reveal .slides section.slide-title .subtitle,
+.reveal .slides section.slide-title p {
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 0.9em;
+  max-width: 62%;
+  margin: 0 auto;
+}
+
+/* 4.2 Section divider — dark purple / gradient, white text, centered */
+.reveal .slides section.slide-divider {
+  background: var(--blitzy-primary-dark);
+  background: var(--gradient-divider);
+  color: var(--blitzy-text-inverse);
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.reveal .slides section.slide-divider h2,
+.reveal .slides section.slide-divider h1 {
+  color: var(--blitzy-text-inverse);
+  font-size: 2.4em;
+}
+
+.reveal .slides section.slide-divider [data-lucide] {
+  width: 96px;
+  height: 96px;
+  stroke: var(--blitzy-accent-teal);
+  margin-bottom: 0.5em;
+}
+
+/* 4.3 Closing slide — navy, white text, short takeaway, lockup, accent bar */
+.reveal .slides section.slide-closing {
+  background: var(--blitzy-primary-navy);
+  color: var(--blitzy-text-inverse);
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.reveal .slides section.slide-closing h1,
+.reveal .slides section.slide-closing h2 {
+  color: var(--blitzy-text-inverse);
+  font-size: 2.6em;
+}
+
+.reveal .slides section.slide-closing ul {
+  list-style: none;
+  margin: 0.6em 0;
+  padding: 0;
+}
+
+.reveal .slides section.slide-closing li {
+  color: rgba(255, 255, 255, 0.88);
+}
+
+.reveal .slides section.slide-closing [data-lucide] {
+  stroke: var(--blitzy-accent-teal);
+}
+
+/* ------------------------------------------------------------------
+   5. Component classes
+   ------------------------------------------------------------------ */
+
+/* 5.1 KPI grid + cards */
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 32px;
+  margin: 0.6em 0;
+}
+
+.kpi-card {
+  background: var(--blitzy-surface-tint);
+  border: 1px solid var(--blitzy-border);
+  border-radius: 18px;
+  padding: 40px 36px;
+  text-align: center;
+  box-shadow: 0 8px 24px rgba(45, 28, 119, 0.08);
+}
+
+.kpi-icon {
+  color: var(--blitzy-primary);
+  margin-bottom: 0.4em;
+}
+
+.kpi-icon [data-lucide] {
+  width: 56px;
+  height: 56px;
+  stroke: var(--blitzy-primary);
+}
+
+.kpi-value {
+  font-family: var(--ff-display);
+  font-weight: 700;
+  font-size: 2.6em;
+  line-height: 1;
+  color: var(--blitzy-primary);
+}
+
+.kpi-label {
+  font-family: var(--ff-body);
+  font-size: 0.62em;
+  color: var(--blitzy-text-muted);
+  margin-top: 0.5em;
+}
+
+/* 5.2 Icon row — horizontal labeled Lucide icons (2-up grid on value slides) */
+.icon-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 40px;
+  align-items: flex-start;
+  margin: 0.5em 0;
+}
+
+.icon-row > * {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex: 1 1 42%;
+  max-width: 46%;
+}
+
+.icon-row [data-lucide] {
+  width: 44px;
+  height: 44px;
+  stroke: var(--blitzy-primary);
+  flex: 0 0 auto;
+}
+
+.icon-row .icon-label {
+  font-family: var(--ff-body);
+  font-size: 0.72em;
+  line-height: 1.35;
+}
+
+/* 5.3 Hero icon — large Lucide icon on the title slide */
+.hero-icon {
+  margin-bottom: 0.5em;
+}
+
+.hero-icon [data-lucide] {
+  width: 120px;
+  height: 120px;
+  stroke: var(--blitzy-accent-teal);
+  stroke-width: 1.5;
+}
+
+/* 5.4 Accent bar — thin gradient bar (closing slide) */
+.accent-bar {
+  height: 8px;
+  width: 220px;
+  border-radius: 999px;
+  background: var(--gradient-accent-bar);
+  margin: 1em auto 0;
+}
+
+/* 5.5 Brand lockup — "Blitzy" wordmark */
+.brand-lockup {
+  font-family: var(--ff-display);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  font-size: 0.8em;
+  color: var(--blitzy-text-inverse);
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 1em;
+  opacity: 0.95;
+}
+
+.brand-lockup [data-lucide] {
+  width: 32px;
+  height: 32px;
+  stroke: var(--blitzy-accent-teal);
+}
+
+/* ------------------------------------------------------------------
+   6. Mermaid container — center + width-constrain for 1920x1080
+   ------------------------------------------------------------------ */
+.mermaid-wrap {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 100%;
+  margin: 0.4em 0;
+}
+
+.reveal pre.mermaid,
+.mermaid-wrap .mermaid {
+  background: transparent;
+  box-shadow: none;
+  width: 100%;
+  max-width: 1500px;
+  max-height: 720px;
+  margin: 0 auto;
+  text-align: center;
+  /* Match Mermaid's own text-measurement font-size (16px). Overriding this
+     to a larger value inflates the rendered labels beyond the box widths
+     Mermaid computed, clipping the text. The generated SVG is vector and
+     scales up losslessly to fill the slide via the max-width below. */
+  font-size: 16px;
+  line-height: 1.2;
+}
+
+.reveal pre.mermaid svg {
+  /* Scale each diagram to fit within the slide, preserving aspect ratio.
+     The height cap keeps the tall architecture diagram clear of the
+     caption; wide/short diagrams render at their natural size. */
+  max-width: 100%;
+  max-height: 640px;
+  width: auto;
+  height: auto;
+}
+
+/* ------------------------------------------------------------------
+   7. Styled table — module map, quality gates, risk tables
+   ------------------------------------------------------------------ */
+.reveal table.blitzy-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--ff-body);
+  font-size: 0.62em;
+  margin: 0.4em 0;
+  box-shadow: 0 8px 24px rgba(45, 28, 119, 0.08);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.reveal table.blitzy-table thead th {
+  background: var(--blitzy-primary);
+  color: var(--blitzy-text-inverse);
+  font-family: var(--ff-display);
+  font-weight: 600;
+  text-align: left;
+  padding: 18px 24px;
+}
+
+.reveal table.blitzy-table tbody td {
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--blitzy-border);
+  color: var(--blitzy-text);
+  vertical-align: middle;
+}
+
+.reveal table.blitzy-table tbody tr:nth-child(even) {
+  background: var(--blitzy-surface-tint);
+}
+
+.reveal table.blitzy-table tbody tr:nth-child(odd) {
+  background: var(--blitzy-surface);
+}
+
+.reveal table.blitzy-table [data-lucide] {
+  width: 24px;
+  height: 24px;
+  stroke: var(--blitzy-primary);
+  vertical-align: middle;
+}
+
+.reveal table.blitzy-table code {
+  font-size: 0.95em;
+}
+
+/* ------------------------------------------------------------------
+   8. Deck-specific helpers (layout only — no new brand tokens)
+   ------------------------------------------------------------------ */
+/* Status + severity affordances for the gate / risk tables */
+.status-pass {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  color: var(--blitzy-primary-deep);
+}
+
+.sev {
+  display: inline-block;
+  padding: 2px 12px;
+  border-radius: 999px;
+  font-family: var(--ff-mono);
+  font-size: 0.85em;
+  font-weight: 500;
+  line-height: 1.6;
+}
+
+.sev-high {
+  background: rgba(65, 1, 219, 0.10);
+  color: var(--blitzy-primary-deep);
+  border: 1px solid var(--blitzy-primary);
+}
+
+.sev-med {
+  background: var(--blitzy-surface-alt);
+  color: var(--blitzy-text);
+  border: 1px solid var(--blitzy-border);
+}
+
+/* Two-column layout (onboarding bullets + roadmap diagram) */
+.two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 56px;
+  align-items: center;
+}
+
+/* Small muted caption line under a diagram/table */
+.caption {
+  font-size: 0.62em;
+  color: var(--blitzy-text-muted);
+  margin-top: 0.4em;
+}
+
+/* Divider eyebrow reads teal on the dark divider background */
+.reveal .slides section.slide-divider .eyebrow {
+  color: var(--blitzy-accent-teal);
+}
+
+/* Closing-slide standalone icon (teal, sized between hero and inline) */
+.reveal .slides section.slide-closing .close-icon {
+  margin-bottom: 0.3em;
+}
+
+.reveal .slides section.slide-closing .close-icon [data-lucide] {
+  width: 76px;
+  height: 76px;
+  stroke: var(--blitzy-accent-teal);
+  stroke-width: 1.6;
+}
+</style>
 </head>
 <body>
   <div class="reveal">
@@ -539,14 +554,14 @@
            ============================================================ -->
       <section class="slide-title">
         <span class="eyebrow">Executive Summary</span>
-        <div class="hero-icon"><i data-lucide="shield-check"></i></div>
+        <div class="hero-icon"><i data-lucide="shield-check" aria-hidden="true"></i></div>
         <h1>A Memory-Safe zlib, Rebuilt in Rust</h1>
         <p class="subtitle">
           Complete C&rarr;Rust migration of the zlib 1.3.2.1 compression
           library — byte-identical output, C-compatible drop-in, zero C
           dependencies.
         </p>
-        <div class="brand-lockup"><i data-lucide="zap"></i> Blitzy</div>
+        <div class="brand-lockup"><i data-lucide="zap" aria-hidden="true"></i> Blitzy</div>
       </section>
 
       <!-- ============================================================
@@ -557,32 +572,32 @@
         <h2>Where We Stand</h2>
         <div class="kpi-grid">
           <div class="kpi-card">
-            <div class="kpi-icon"><i data-lucide="gauge"></i></div>
+            <div class="kpi-icon"><i data-lucide="gauge" aria-hidden="true"></i></div>
             <div class="kpi-value">85.1%</div>
-            <div class="kpi-label">Migration complete (240 of 282 hrs)</div>
+            <div class="kpi-label">Migration complete</div>
           </div>
           <div class="kpi-card">
-            <div class="kpi-icon"><i data-lucide="check-check"></i></div>
+            <div class="kpi-icon"><i data-lucide="check-check" aria-hidden="true"></i></div>
             <div class="kpi-value">609</div>
             <div class="kpi-label">Tests passing, 0 failures</div>
           </div>
           <div class="kpi-card">
-            <div class="kpi-icon"><i data-lucide="file-code"></i></div>
+            <div class="kpi-icon"><i data-lucide="file-code" aria-hidden="true"></i></div>
             <div class="kpi-value">33,724</div>
-            <div class="kpi-label">Lines of Rust across 43 files</div>
+            <div class="kpi-label">Lines of Rust · 43 files</div>
           </div>
           <div class="kpi-card">
-            <div class="kpi-icon"><i data-lucide="sparkles"></i></div>
+            <div class="kpi-icon"><i data-lucide="sparkles" aria-hidden="true"></i></div>
             <div class="kpi-value">0</div>
-            <div class="kpi-label">Clippy warnings; fully formatted</div>
+            <div class="kpi-label">Clippy warnings</div>
           </div>
           <div class="kpi-card">
-            <div class="kpi-icon"><i data-lucide="unplug"></i></div>
+            <div class="kpi-icon"><i data-lucide="unplug" aria-hidden="true"></i></div>
             <div class="kpi-value">Zero</div>
-            <div class="kpi-label">C dependencies (pure Rust)</div>
+            <div class="kpi-label">C dependencies</div>
           </div>
         </div>
-        <p class="caption">Replacing ~23,107 lines of C with 33,724 lines of idiomatic, memory-safe Rust.</p>
+        <p class="caption">~23,107 lines of C, now memory-safe Rust.</p>
       </section>
 
       <!-- ============================================================
@@ -594,16 +609,16 @@
         <div class="mermaid-wrap">
           <pre class="mermaid">
 graph LR
-  subgraph C["C Baseline (~23,107 lines)"]
+  subgraph C["C Baseline"]
     direction TB
-    A1["Public API — zlib.h"]
-    A2["Deflate — deflate.c / trees.c"]
-    A3["Inflate — inflate.c / inffast.c"]
-    A4["Checksums — adler32.c / crc32.c"]
-    A5["Gzip I/O — gzlib / gzread / gzwrite"]
-    A6["Utilities — compress / uncompr / zutil"]
+    A1["Public API"]
+    A2["Deflate"]
+    A3["Inflate"]
+    A4["Checksums"]
+    A5["Gzip I/O"]
+    A6["Utilities"]
   end
-  subgraph R["Rust Crate zlib-rs (33,724 lines)"]
+  subgraph R["Rust Crate zlib-rs"]
     direction TB
     B1["src/stream"]
     B2["src/deflate"]
@@ -611,7 +626,7 @@ graph LR
     B4["src/checksum"]
     B5["src/gz"]
     B6["src/util"]
-    B7["src/ffi — C drop-in"]
+    B7["src/ffi"]
   end
   A1 --> B1
   A2 --> B2
@@ -622,7 +637,7 @@ graph LR
   A1 --> B7
           </pre>
         </div>
-        <p class="caption">The natural six-layer structure is preserved; an isolated <code>src/ffi</code> boundary adds the C drop-in.</p>
+        <p class="caption">An isolated <code>src/ffi</code> boundary adds the C drop-in.</p>
       </section>
 
       <!-- ============================================================
@@ -630,7 +645,7 @@ graph LR
            ============================================================ -->
       <section class="slide-divider">
         <span class="eyebrow">Rationale</span>
-        <i data-lucide="shield"></i>
+        <i data-lucide="shield" aria-hidden="true"></i>
         <h2>Why Memory-Safe Matters</h2>
       </section>
 
@@ -642,19 +657,19 @@ graph LR
         <h2>Business Value</h2>
         <div class="icon-row">
           <div>
-            <i data-lucide="shield-check"></i>
+            <i data-lucide="shield-check" aria-hidden="true"></i>
             <span class="icon-label">Eliminates C memory-safety defect classes — buffer overflow, overread, use-after-free.</span>
           </div>
           <div>
-            <i data-lucide="git-compare"></i>
+            <i data-lucide="git-compare" aria-hidden="true"></i>
             <span class="icon-label">Byte-identical DEFLATE output — full interop with existing zlib data.</span>
           </div>
           <div>
-            <i data-lucide="plug"></i>
+            <i data-lucide="plug" aria-hidden="true"></i>
             <span class="icon-label">Exact C ABI drop-in — no downstream recompilation.</span>
           </div>
           <div>
-            <i data-lucide="package-check"></i>
+            <i data-lucide="package-check" aria-hidden="true"></i>
             <span class="icon-label">Pure-Rust build — zero C toolchain dependency.</span>
           </div>
         </div>
@@ -665,7 +680,7 @@ graph LR
            ============================================================ -->
       <section class="slide-divider">
         <span class="eyebrow">Deliverables</span>
-        <i data-lucide="layers"></i>
+        <i data-lucide="layers" aria-hidden="true"></i>
         <h2>What We Built</h2>
       </section>
 
@@ -677,19 +692,19 @@ graph LR
         <h2>Delivered Capabilities</h2>
         <div class="icon-row">
           <div>
-            <i data-lucide="archive"></i>
+            <i data-lucide="archive" aria-hidden="true"></i>
             <span class="icon-label">Full DEFLATE encoder — all five compression strategies.</span>
           </div>
           <div>
-            <i data-lucide="git-branch"></i>
+            <i data-lucide="git-branch" aria-hidden="true"></i>
             <span class="icon-label">Inflate decoder — 30+ mode state machine plus callback path.</span>
           </div>
           <div>
-            <i data-lucide="file-archive"></i>
+            <i data-lucide="file-archive" aria-hidden="true"></i>
             <span class="icon-label">Gzip file I/O — stdio-like interface.</span>
           </div>
           <div>
-            <i data-lucide="binary"></i>
+            <i data-lucide="binary" aria-hidden="true"></i>
             <span class="icon-label">Adler-32 &amp; CRC-32 checksums (SIMD) plus a C-compatible FFI layer.</span>
           </div>
         </div>
@@ -715,13 +730,13 @@ graph LR
               <td><code>src/deflate</code></td>
               <td>9</td>
               <td>8,434</td>
-              <td>5 strategies, state machine, Huffman trees</td>
+              <td>5 strategies · Huffman trees</td>
             </tr>
             <tr>
               <td><code>src/inflate</code></td>
               <td>6</td>
               <td>5,857</td>
-              <td>30+ mode decoder, fast path, callback</td>
+              <td>30+ mode decoder · fast path</td>
             </tr>
             <tr>
               <td><code>src/gz</code></td>
@@ -739,13 +754,13 @@ graph LR
               <td><code>src/util</code> + API types</td>
               <td>9</td>
               <td>&mdash;</td>
-              <td>one-call wrappers, stream, error, constants</td>
+              <td>Wrappers, stream, error, constants</td>
             </tr>
             <tr>
               <td><code>src/ffi</code></td>
               <td>6</td>
               <td>&mdash;</td>
-              <td><code>extern "C"</code> drop-in shims, <code>#[repr(C)]</code> mirrors</td>
+              <td><code>extern "C"</code> shims · <code>#[repr(C)]</code> mirrors</td>
             </tr>
           </tbody>
         </table>
@@ -756,7 +771,7 @@ graph LR
            ============================================================ -->
       <section class="slide-divider">
         <span class="eyebrow">Guarantees</span>
-        <i data-lucide="git-compare"></i>
+        <i data-lucide="git-compare" aria-hidden="true"></i>
         <h2>Compatibility &amp; Safety</h2>
       </section>
 
@@ -778,7 +793,7 @@ flowchart LR
   CZ["C zlib deflate"] -. same wire format .-> S
           </pre>
         </div>
-        <p class="caption">&gt;98% safe-by-line, zero <code>unsafe</code> in the compression core. Its ~47 <code>unsafe</code> blocks — each with a <code>// SAFETY:</code> comment (43 total) — sit only at FFI and the inflate fast-path.</p>
+        <p class="caption">&gt;98% safe by line; zero <code>unsafe</code> in the compression core. Every <code>unsafe</code> block carries a <code>// SAFETY:</code> note, confined to FFI and the inflate fast-path.</p>
       </section>
 
       <!-- ============================================================
@@ -798,33 +813,33 @@ flowchart LR
           <tbody>
             <tr>
               <td>Dependencies</td>
-              <td><span class="status-pass"><i data-lucide="check"></i> PASS</span></td>
+              <td><span class="status-pass"><i data-lucide="check" aria-hidden="true"></i> PASS</span></td>
               <td>105 packages resolved</td>
             </tr>
             <tr>
               <td>Compilation</td>
-              <td><span class="status-pass"><i data-lucide="check"></i> PASS</span></td>
-              <td>0 errors / 0 warnings (debug + release)</td>
+              <td><span class="status-pass"><i data-lucide="check" aria-hidden="true"></i> PASS</span></td>
+              <td>0 errors / 0 warnings</td>
             </tr>
             <tr>
               <td>Linting</td>
-              <td><span class="status-pass"><i data-lucide="check"></i> PASS</span></td>
+              <td><span class="status-pass"><i data-lucide="check" aria-hidden="true"></i> PASS</span></td>
               <td>0 clippy lints</td>
             </tr>
             <tr>
               <td>Formatting</td>
-              <td><span class="status-pass"><i data-lucide="check"></i> PASS</span></td>
+              <td><span class="status-pass"><i data-lucide="check" aria-hidden="true"></i> PASS</span></td>
               <td><code>cargo fmt</code> clean</td>
             </tr>
             <tr>
               <td>Tests</td>
-              <td><span class="status-pass"><i data-lucide="check"></i> PASS</span></td>
+              <td><span class="status-pass"><i data-lucide="check" aria-hidden="true"></i> PASS</span></td>
               <td>609 passed, 0 failed</td>
             </tr>
             <tr>
               <td>Runtime</td>
-              <td><span class="status-pass"><i data-lucide="check"></i> PASS</span></td>
-              <td>round-trip integration verified</td>
+              <td><span class="status-pass"><i data-lucide="check" aria-hidden="true"></i> PASS</span></td>
+              <td>round-trip verified</td>
             </tr>
           </tbody>
         </table>
@@ -835,7 +850,7 @@ flowchart LR
            ============================================================ -->
       <section class="slide-divider">
         <span class="eyebrow">Transparency</span>
-        <i data-lucide="alert-triangle"></i>
+        <i data-lucide="alert-triangle" aria-hidden="true"></i>
         <h2>Risks &amp; Mitigations</h2>
       </section>
 
@@ -855,14 +870,14 @@ flowchart LR
           </thead>
           <tbody>
             <tr>
-              <td><code>no_std</code> test compilation fails (129 errors, test code only; library compiles fine)</td>
+              <td><code>no_std</code> test build fails (129 errors; library builds fine)</td>
               <td><span class="sev sev-high">High</span></td>
-              <td>Add <code>alloc</code> imports / <code>cfg</code>-gate test modules (~3h)</td>
+              <td><code>cfg</code>-gate test modules (~3h)</td>
             </tr>
             <tr>
               <td>No <code>cargo-fuzz</code> targets yet</td>
               <td><span class="sev sev-med">Medium</span></td>
-              <td>Create fuzz targets for inflate / deflate / checksums (~3h)</td>
+              <td>Add inflate / deflate / checksum fuzz targets (~3h)</td>
             </tr>
             <tr>
               <td>Performance vs C not yet validated</td>
@@ -870,12 +885,13 @@ flowchart LR
               <td>Benchmark &amp; profile hot paths (~8h)</td>
             </tr>
             <tr>
-              <td>Byte-identity not fully verified across all levels / strategies</td>
+              <td>Byte-identity unverified across all levels / strategies</td>
               <td><span class="sev sev-med">Medium</span></td>
               <td>Systematic cross-validation (~6h)</td>
             </tr>
           </tbody>
         </table>
+        <p class="caption">Performance goals: &ge;80% C compression throughput; &ge;C decompression throughput &mdash; validation open.</p>
       </section>
 
       <!-- ============================================================
@@ -883,7 +899,7 @@ flowchart LR
            ============================================================ -->
       <section class="slide-divider">
         <span class="eyebrow">What's Next</span>
-        <i data-lucide="rocket"></i>
+        <i data-lucide="rocket" aria-hidden="true"></i>
         <h2>Onboarding &amp; Roadmap</h2>
       </section>
 
@@ -897,8 +913,8 @@ flowchart LR
           <div>
             <ul>
               <li>Rust <code>1.85.0+</code> (edition <code>2024</code>).</li>
-              <li>Build &amp; verify: <code>cargo build</code> · <code>cargo test</code> · <code>cargo clippy</code>.</li>
-              <li>Measure throughput with <code>cargo bench</code>.</li>
+              <li>Build &amp; verify: <code>cargo build</code> · <code>test</code> · <code>clippy</code>.</li>
+              <li>Benchmark: <code>cargo bench</code>.</li>
             </ul>
           </div>
           <div class="mermaid-wrap">
@@ -918,14 +934,14 @@ flowchart LR
            ============================================================ -->
       <section class="slide-closing">
         <span class="eyebrow">In Summary</span>
-        <div class="close-icon"><i data-lucide="shield-check"></i></div>
+        <div class="close-icon"><i data-lucide="shield-check" aria-hidden="true"></i></div>
         <h2>Safety Without Compromise</h2>
         <ul>
           <li>Memory-safe by construction.</li>
           <li>Byte-identical &amp; drop-in compatible.</li>
           <li>85.1% complete, on track.</li>
         </ul>
-        <div class="brand-lockup"><i data-lucide="zap"></i> Blitzy</div>
+        <div class="brand-lockup"><i data-lucide="zap" aria-hidden="true"></i> Blitzy</div>
         <div class="accent-bar"></div>
       </section>
 

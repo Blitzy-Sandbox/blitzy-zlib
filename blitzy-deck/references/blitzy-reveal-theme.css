@@ -14,9 +14,9 @@
    Spec authority: AAP §0.7.3 (Executive Presentation Requirement) / §0.8.
    ============================================================================ */
 
-/* ---------------------------------------------------------------------------
+/* ------------------------------------------------------------------
    1. Design tokens — :root custom properties
-   --------------------------------------------------------------------------- */
+   ------------------------------------------------------------------ */
 :root {
   /* Brand palette */
   --blitzy-primary: #5B39F3;
@@ -50,11 +50,11 @@
   --gradient-accent-bar: linear-gradient(90deg, #5B39F3 0%, #94FAD5 100%);
 }
 
-/* ---------------------------------------------------------------------------
+/* ------------------------------------------------------------------
    2. reveal.js base overrides + content-slide typography
-   Content (default) slides: white surface, dark text, left-aligned, roomy.
-   Sizes are tuned for the 1920x1080 canvas.
-   --------------------------------------------------------------------------- */
+   Content (default) slides: white surface, dark text, left-aligned,
+   roomy. Sizes tuned for the 1920x1080 canvas.
+   ------------------------------------------------------------------ */
 .reveal {
   font-family: var(--ff-body);
   font-size: 34px;
@@ -74,6 +74,7 @@
   padding: 60px 90px;
   background-color: var(--blitzy-surface);
   box-sizing: border-box;
+  height: 100%;
 }
 
 /* Display headings -> Space Grotesk */
@@ -132,9 +133,14 @@
   text-decoration: none;
 }
 
-/* ---------------------------------------------------------------------------
-   3. Eyebrow — Fira Code, uppercase, tracked; teal on dark/hero backgrounds
-   --------------------------------------------------------------------------- */
+/* Brand-tinted reveal chrome (controls + progress bar) */
+.reveal .controls { color: var(--blitzy-primary); }
+.reveal .progress { color: var(--blitzy-primary); height: 6px; }
+.reveal .progress span { background: var(--gradient-accent-bar); }
+
+/* ------------------------------------------------------------------
+   3. Eyebrow — Fira Code, uppercase, tracked; teal on dark/hero
+   ------------------------------------------------------------------ */
 .eyebrow {
   font-family: var(--ff-mono);
   font-weight: 500;
@@ -151,9 +157,9 @@
   color: var(--blitzy-primary);
 }
 
-/* ---------------------------------------------------------------------------
+/* ------------------------------------------------------------------
    4. Slide-type classes
-   --------------------------------------------------------------------------- */
+   ------------------------------------------------------------------ */
 
 /* 4.1 Title slide — hero gradient, white text, centered */
 .reveal .slides section.slide-title {
@@ -176,11 +182,11 @@
 .reveal .slides section.slide-title p {
   color: rgba(255, 255, 255, 0.9);
   font-size: 0.9em;
-  max-width: 60%;
+  max-width: 62%;
   margin: 0 auto;
 }
 
-/* 4.2 Section divider — dark purple / gradient, white text, centered heading */
+/* 4.2 Section divider — dark purple / gradient, white text, centered */
 .reveal .slides section.slide-divider {
   background: var(--blitzy-primary-dark);
   background: var(--gradient-divider);
@@ -232,9 +238,13 @@
   color: rgba(255, 255, 255, 0.88);
 }
 
-/* ---------------------------------------------------------------------------
+.reveal .slides section.slide-closing [data-lucide] {
+  stroke: var(--blitzy-accent-teal);
+}
+
+/* ------------------------------------------------------------------
    5. Component classes
-   --------------------------------------------------------------------------- */
+   ------------------------------------------------------------------ */
 
 /* 5.1 KPI grid + cards */
 .kpi-grid {
@@ -279,7 +289,7 @@
   margin-top: 0.5em;
 }
 
-/* 5.2 Icon row — horizontal labeled Lucide icons */
+/* 5.2 Icon row — horizontal labeled Lucide icons (2-up grid on value slides) */
 .icon-row {
   display: flex;
   flex-wrap: wrap;
@@ -292,6 +302,8 @@
   display: flex;
   align-items: center;
   gap: 16px;
+  flex: 1 1 42%;
+  max-width: 46%;
 }
 
 .icon-row [data-lucide] {
@@ -299,6 +311,12 @@
   height: 44px;
   stroke: var(--blitzy-primary);
   flex: 0 0 auto;
+}
+
+.icon-row .icon-label {
+  font-family: var(--ff-body);
+  font-size: 0.72em;
+  line-height: 1.35;
 }
 
 /* 5.3 Hero icon — large Lucide icon on the title slide */
@@ -342,9 +360,9 @@
   stroke: var(--blitzy-accent-teal);
 }
 
-/* ---------------------------------------------------------------------------
-   6. Mermaid container — center + width-constrain diagrams for 1920x1080
-   --------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------
+   6. Mermaid container — center + width-constrain for 1920x1080
+   ------------------------------------------------------------------ */
 .mermaid-wrap {
   display: flex;
   justify-content: center;
@@ -362,18 +380,27 @@
   max-height: 720px;
   margin: 0 auto;
   text-align: center;
-  font-size: 22px;
+  /* Match Mermaid's own text-measurement font-size (16px). Overriding this
+     to a larger value inflates the rendered labels beyond the box widths
+     Mermaid computed, clipping the text. The generated SVG is vector and
+     scales up losslessly to fill the slide via the max-width below. */
+  font-size: 16px;
   line-height: 1.2;
 }
 
 .reveal pre.mermaid svg {
+  /* Scale each diagram to fit within the slide, preserving aspect ratio.
+     The height cap keeps the tall architecture diagram clear of the
+     caption; wide/short diagrams render at their natural size. */
   max-width: 100%;
+  max-height: 640px;
+  width: auto;
   height: auto;
 }
 
-/* ---------------------------------------------------------------------------
+/* ------------------------------------------------------------------
    7. Styled table — module map, quality gates, risk tables
-   --------------------------------------------------------------------------- */
+   ------------------------------------------------------------------ */
 .reveal table.blitzy-table {
   width: 100%;
   border-collapse: collapse;
@@ -398,6 +425,7 @@
   padding: 16px 24px;
   border-bottom: 1px solid var(--blitzy-border);
   color: var(--blitzy-text);
+  vertical-align: middle;
 }
 
 .reveal table.blitzy-table tbody tr:nth-child(even) {
@@ -415,3 +443,72 @@
   vertical-align: middle;
 }
 
+.reveal table.blitzy-table code {
+  font-size: 0.95em;
+}
+
+/* ------------------------------------------------------------------
+   8. Deck-specific helpers (layout only — no new brand tokens)
+   ------------------------------------------------------------------ */
+/* Status + severity affordances for the gate / risk tables */
+.status-pass {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  color: var(--blitzy-primary-deep);
+}
+
+.sev {
+  display: inline-block;
+  padding: 2px 12px;
+  border-radius: 999px;
+  font-family: var(--ff-mono);
+  font-size: 0.85em;
+  font-weight: 500;
+  line-height: 1.6;
+}
+
+.sev-high {
+  background: rgba(65, 1, 219, 0.10);
+  color: var(--blitzy-primary-deep);
+  border: 1px solid var(--blitzy-primary);
+}
+
+.sev-med {
+  background: var(--blitzy-surface-alt);
+  color: var(--blitzy-text);
+  border: 1px solid var(--blitzy-border);
+}
+
+/* Two-column layout (onboarding bullets + roadmap diagram) */
+.two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 56px;
+  align-items: center;
+}
+
+/* Small muted caption line under a diagram/table */
+.caption {
+  font-size: 0.62em;
+  color: var(--blitzy-text-muted);
+  margin-top: 0.4em;
+}
+
+/* Divider eyebrow reads teal on the dark divider background */
+.reveal .slides section.slide-divider .eyebrow {
+  color: var(--blitzy-accent-teal);
+}
+
+/* Closing-slide standalone icon (teal, sized between hero and inline) */
+.reveal .slides section.slide-closing .close-icon {
+  margin-bottom: 0.3em;
+}
+
+.reveal .slides section.slide-closing .close-icon [data-lucide] {
+  width: 76px;
+  height: 76px;
+  stroke: var(--blitzy-accent-teal);
+  stroke-width: 1.6;
+}

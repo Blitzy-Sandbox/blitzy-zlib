@@ -22,11 +22,13 @@
 //!
 //! To keep the sums from overflowing a `u32`, the input is processed in blocks
 //! of at most [`NMAX`] bytes and both sums are reduced modulo [`BASE`] after
-//! each block. Because the arithmetic result is invariant to *where* the
-//! reductions are inserted (reducing `s1` by a multiple of `BASE` shifts every
-//! later `s2` increment by a multiple of `BASE`, leaving both halves unchanged
-//! modulo `BASE`), the loop structure here may differ from the C macro
-//! unrolling while remaining bit-exact.
+//! each block. Within a block the per-byte updates are unrolled in groups of
+//! sixteen, mirroring the reference C `DO16` macro in `adler32.c`. Because the
+//! arithmetic result is invariant to *where* the reductions are inserted
+//! (reducing `s1` by a multiple of `BASE` shifts every later `s2` increment by
+//! a multiple of `BASE`, leaving both halves unchanged modulo `BASE`), this
+//! unrolling is a pure throughput optimization and remains bit-exact with the
+//! plain byte-at-a-time formulation.
 
 /// Largest prime smaller than `65536`.
 ///
@@ -48,7 +50,9 @@ const NMAX: usize = 5552;
 ///
 /// An Adler-32 value is in the range of a 32-bit unsigned integer. A fresh
 /// checksum is started from the required initial value `1`; passing an empty
-/// slice leaves the running value unchanged, so `adler32(1, b"")` returns `1`.
+/// slice takes the same zero-length path as reference zlib, normalizing each
+/// 16-bit half modulo [`BASE`]. A valid running checksum (both halves already
+/// `< BASE`) is therefore returned unchanged, so `adler32(1, b"")` returns `1`.
 ///
 /// An Adler-32 checksum is almost as reliable as a CRC-32 but can be computed
 /// much faster.
@@ -56,7 +60,8 @@ const NMAX: usize = 5552;
 /// This mirrors the C `adler32(adler, buf, len)` entry point. The C contract of
 /// returning the initial value `1` for a `NULL` buffer is handled at the FFI
 /// boundary, where a null pointer can occur; in this idiomatic slice-based API
-/// there is no null, so an empty slice simply returns `adler` unchanged.
+/// there is no null, so an empty slice is treated exactly like C's non-null
+/// zero-length buffer.
 ///
 /// # Examples
 ///
@@ -83,11 +88,16 @@ pub fn adler32_z(adler: u32, buf: &[u8]) -> u32 {
     let mut sum2 = (adler >> 16) & 0xffff;
     let mut adler = adler & 0xffff;
 
-    // Empty input: the checksum is unchanged. This also yields the required
-    // initial value for `adler32(1, b"")`.
-    if buf.is_empty() {
-        return (sum2 << 16) | adler;
-    }
+    // NOTE: there is deliberately no early return for an empty slice. Reference
+    // zlib normalizes a non-null zero-length update through its `len < 16`
+    // path — it reduces `adler` with a single conditional subtraction and
+    // `sum2` modulo `BASE` — rather than echoing the packed seed back. The
+    // `buf.len() < 16` branch below runs its byte loop zero times and performs
+    // exactly that reduction, so `adler32(1, b"")` stays `1`, a valid running
+    // value is returned unchanged, and an arbitrary seed such as `0xffff_ffff`
+    // normalizes to `0x000e_000e` — matching zlib for every public seed. (The
+    // C `buf == Z_NULL` → `1` sentinel is a null-pointer concern handled at the
+    // FFI boundary; a slice is never null.)
 
     // Single-byte fast path: at most one conditional subtraction is needed for
     // each sum, so the more expensive modulo operations are avoided entirely.
@@ -118,12 +128,35 @@ pub fn adler32_z(adler: u32, buf: &[u8]) -> u32 {
         return adler | (sum2 << 16);
     }
 
-    // General case: process the input in blocks of at most `NMAX` bytes. The
-    // `NMAX` bound guarantees neither accumulator overflows a `u32` before the
-    // reduction at the end of each block, so plain (non-wrapping) arithmetic is
-    // panic-free.
-    for block in buf.chunks(NMAX) {
-        for &byte in block {
+    // General case: process the input in blocks of at most `NMAX` bytes so the
+    // per-byte updates accumulate without overflowing a `u32` before the
+    // reduction at the end of each block (`NMAX` is chosen precisely so plain,
+    // non-wrapping arithmetic never overflows and never panics). Within each
+    // full block the updates are unrolled sixteen at a time via [`do16`],
+    // mirroring the reference C `DO16` macro; `NMAX` is divisible by 16, so a
+    // full block is an exact number of 16-byte groups.
+    let mut rest = buf;
+    while rest.len() >= NMAX {
+        let (block, tail) = rest.split_at(NMAX);
+        for group in block.chunks_exact(16) {
+            do16(&mut adler, &mut sum2, group);
+        }
+        adler %= BASE;
+        sum2 %= BASE;
+        rest = tail;
+    }
+
+    // Remaining bytes (fewer than `NMAX`): the whole 16-byte groups are still
+    // unrolled through `DO16`, and the final short tail (fewer than 16 bytes)
+    // is folded one byte at a time. A single reduction of each sum then
+    // suffices; it is skipped entirely when nothing remains, mirroring the C
+    // `if (len)` guard that avoids a redundant modulo.
+    if !rest.is_empty() {
+        let mut groups = rest.chunks_exact(16);
+        for group in groups.by_ref() {
+            do16(&mut adler, &mut sum2, group);
+        }
+        for &byte in groups.remainder() {
             adler += u32::from(byte);
             sum2 += adler;
         }
@@ -186,6 +219,62 @@ pub fn adler32_combine(adler1: u32, adler2: u32, len2: i64) -> u32 {
     sum1 | (sum2 << 16)
 }
 
+/// Folds sixteen consecutive input bytes into the running Adler-32 component
+/// sums with the update sequence fully unrolled, mirroring the reference C
+/// `DO16` macro from `adler32.c` (which expands to `{ adler += buf[i]; sum2 +=
+/// adler; }` for `i` in `0..16`).
+///
+/// `chunk` is always a 16-byte group produced by `chunks_exact(16)`; binding it
+/// to a fixed-size array reference performs a single length check and then lets
+/// the compiler prove every index is in bounds, eliding the per-byte bounds
+/// checks on the hot path. This routine is pure integer arithmetic and contains
+/// no `unsafe`.
+#[inline(always)]
+fn do16(adler: &mut u32, sum2: &mut u32, chunk: &[u8]) {
+    let bytes: &[u8; 16] = chunk
+        .try_into()
+        .expect("adler32 DO16 group must be exactly 16 bytes");
+
+    // Accumulate through locals so the sixteen dependent updates stay in
+    // registers; the two out-parameters are written back once at the end.
+    let mut a = *adler;
+    let mut s = *sum2;
+    a += u32::from(bytes[0]);
+    s += a;
+    a += u32::from(bytes[1]);
+    s += a;
+    a += u32::from(bytes[2]);
+    s += a;
+    a += u32::from(bytes[3]);
+    s += a;
+    a += u32::from(bytes[4]);
+    s += a;
+    a += u32::from(bytes[5]);
+    s += a;
+    a += u32::from(bytes[6]);
+    s += a;
+    a += u32::from(bytes[7]);
+    s += a;
+    a += u32::from(bytes[8]);
+    s += a;
+    a += u32::from(bytes[9]);
+    s += a;
+    a += u32::from(bytes[10]);
+    s += a;
+    a += u32::from(bytes[11]);
+    s += a;
+    a += u32::from(bytes[12]);
+    s += a;
+    a += u32::from(bytes[13]);
+    s += a;
+    a += u32::from(bytes[14]);
+    s += a;
+    a += u32::from(bytes[15]);
+    s += a;
+    *adler = a;
+    *sum2 = s;
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BASE, NMAX, adler32, adler32_combine, adler32_z};
@@ -198,9 +287,24 @@ mod tests {
     fn empty_slice_returns_input_unchanged() {
         // The required initial value for a fresh checksum.
         assert_eq!(adler32(1, b""), 1);
-        // An empty update never alters a running value.
+        // A *valid* running value (both halves already < BASE) is returned
+        // unchanged by an empty update.
         assert_eq!(adler32(0xdead_beef, b""), 0xdead_beef);
         assert_eq!(adler32_z(0, b""), 0);
+    }
+
+    #[test]
+    fn empty_slice_normalizes_arbitrary_seed_like_zlib() {
+        // Regression test for the byte-exact parity fix: an empty (non-null)
+        // update must take reference zlib's zero-length path, which reduces
+        // each 16-bit half modulo BASE, rather than echoing an unreduced seed.
+        // Expected values are from reference zlib (`zlib.adler32(b"", seed)`).
+        assert_eq!(adler32(0xffff_ffff, b""), 0x000e_000e);
+        assert_eq!(adler32(0x0000_ffff, b""), 0x0000_000e);
+        assert_eq!(adler32(0xffff_0000, b""), 0x000e_0000);
+        assert_eq!(adler32_z(0xffff_ffff, b""), 0x000e_000e);
+        // Feeding an already-normalized value back is a fixed point.
+        assert_eq!(adler32(0x000e_000e, b""), 0x000e_000e);
     }
 
     #[test]
@@ -271,6 +375,39 @@ mod tests {
         // Crossing two block boundaries.
         let ff_two = [0xffu8; 2 * NMAX + 7];
         assert_eq!(adler32(1, &ff_two), 0x9d7b_3e1f);
+    }
+
+    #[test]
+    fn general_path_do16_matches_reference() {
+        // Directly exercises the DO16-unrolled general path at and around the
+        // NMAX block boundary: exactly NMAX (whole 16-groups, no tail), a short
+        // (<16) tail, one extra full group, a mid-size tail, exact multi-block,
+        // multi-block with a tail, and three full blocks. Expected values are
+        // reference zlib (`zlib.adler32`) for `((i*37+11) & 0xff)`.
+        fn pattern(n: usize) -> Vec<u8> {
+            (0..n).map(|i| ((i * 37 + 11) & 0xff) as u8).collect()
+        }
+        let cases: [(usize, u32); 7] = [
+            (NMAX, 0x6b2c_cc6f),         // exactly one block; no remainder
+            (NMAX + 15, 0xa4f9_d3d1),    // block + <16-byte tail
+            (NMAX + 16, 0x797f_d477),    // block + one extra whole group
+            (NMAX + 100, 0x6c4e_fee9),   // block + 6 groups + 4-byte tail
+            (2 * NMAX, 0xdcf9_9aec),     // exactly two blocks
+            (2 * NMAX + 9, 0x6546_9f63), // two blocks + short tail
+            (3 * NMAX, 0x5276_6869),     // three blocks
+        ];
+        for (n, expected) in cases {
+            let data = pattern(n);
+            assert_eq!(adler32(1, &data), expected, "bulk mismatch at n={n}");
+            // Self-consistency: folding the same bytes one at a time (the
+            // single-byte fast path) must compose to the unrolled bulk result,
+            // independent of any external reference.
+            let mut running = 1;
+            for &byte in &data {
+                running = adler32(running, &[byte]);
+            }
+            assert_eq!(running, expected, "byte-at-a-time mismatch at n={n}");
+        }
     }
 
     #[test]
