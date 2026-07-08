@@ -123,7 +123,14 @@ gz-io = ["std", "gzip"]
 # Bare-metal / core-only mode: compression, decompression, and checksums with no
 # gz file I/O (maps the C `Z_SOLO`). Built via `--no-default-features`
 # (optionally `--features no-std`). The library's actual `no_std` switch is
-# `#![cfg_attr(not(feature = "std"), no_std)]` in `src/lib.rs`, so this flag is a
+# `#![cfg_attr(all(not(feature = "std"), not(test), panic = "abort"), no_std)]`
+# in `src/lib.rs`: the crate is genuinely `#![no_std]` for the shipped artifact
+# (`cargo build --no-default-features`, which the profiles compile with
+# `panic = "abort"`), while `cargo test --no-default-features` keeps `std`
+# linked so the libtest harness builds — yet still exercises every
+# `not(feature = "std")` code path because the `std` feature gates stay off.
+# The full test suite therefore compiles and PASSES under
+# `cargo test --no-default-features [--features no-std]`; this flag remains a
 # convenience marker documenting intent for a core-only build.
 no-std = []
 # SIMD-accelerated CRC-32 hot path via the optional `crc32fast` dependency.

@@ -13,11 +13,13 @@
 #   *nightly* toolchain: it relies on `-Z` sanitizer / coverage instrumentation
 #   that is not available on stable.
 #
-#   Known follow-up: the in-repo `fuzz/` crate and its fuzz targets are a
-#   separately-tracked deliverable and do not exist yet. The run step below is
-#   deliberately authored to be "correct and forgiving": it installs cargo-fuzz
-#   and invokes `cargo fuzz run` when a target is present, and cleanly skips
-#   (without failing the pipeline) while the `fuzz/` crate is still absent.
+#   The in-repo `fuzz/` crate is a DETACHED workspace (it carries its own
+#   `[workspace]` table, so root `cargo build`/`test`/`clippy`/`fmt` never touch
+#   it). It ships five libFuzzer targets: `fuzz_inflate`,
+#   `fuzz_deflate_roundtrip`, `fuzz_gzip`, `fuzz_checksum`, and
+#   `fuzz_ffi_roundtrip`. The job below builds all of them and then fuzzes each
+#   for a bounded budget; a discovered crash/timeout writes a reproducer under
+#   `fuzz/artifacts` and fails the pipeline.
 
 name: Fuzz
 
@@ -25,7 +27,7 @@ name: Fuzz
 #   * pull_request      - hard requirement carried over from the original file.
 #   * workflow_dispatch - allow maintainers to launch a fuzz run on demand.
 #   * schedule          - a weekly bounded run (Mondays 03:00 UTC) for drift
-#                         detection once fuzz targets land.
+#                         detection across the fuzz targets.
 on:
   pull_request:
   workflow_dispatch:
@@ -63,31 +65,31 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
-      # 4. Run the first available fuzz target for a bounded duration (mirrors
-      #    the original 300s budget). Guarded so that the absence of the
-      #    not-yet-created `fuzz/` crate does not hard-fail the pipeline.
-      - name: Run fuzz target (bounded)
-        run: |
-          # Robust under the GitHub Actions default shell (bash -eo pipefail):
-          # capture `cargo fuzz list` ONCE into a variable (avoids a `| head`
-          # SIGPIPE hazard) and tolerate the not-yet-created `fuzz/` crate so a
-          # missing target set never red-walls the pipeline.
-          if [ -d fuzz ]; then
-            targets="$(cargo fuzz list || true)"
-            if [ -n "${targets}" ]; then
-              target="${targets%%$'\n'*}"
-              echo "Running fuzz target: ${target}"
-              cargo fuzz run "${target}" -- -max_total_time=300
-            else
-              echo "No cargo-fuzz targets present yet (fuzz/ crate is a tracked follow-up); skipping run."
-            fi
-          else
-            echo "No cargo-fuzz targets present yet (fuzz/ crate is a tracked follow-up); skipping run."
-          fi
+      # 4. Build every fuzz target first. This compiles all libFuzzer harnesses
+      #    and fails fast on any build error before fuzzing begins. cargo-fuzz
+      #    auto-detects the `fuzz/` crate at the repository root.
+      - name: Build fuzz targets
+        run: cargo fuzz build
 
-      # 5. On failure (a crash/timeout reproducer was written), publish the
+      # 5. Fuzz each target for a bounded budget. `cargo fuzz list` is captured
+      #    ONCE into a variable (avoids a `| head` SIGPIPE under the default
+      #    `bash -eo pipefail` shell). A crash/timeout writes a reproducer under
+      #    `fuzz/artifacts` and returns non-zero, failing the pipeline. The
+      #    budget is intentionally bounded (60s/target, capped input length and
+      #    RSS) so the scheduled/PR run stays fast and deterministic.
+      - name: Run bounded fuzzing (all targets)
+        run: |
+          targets="$(cargo fuzz list)"
+          echo "Fuzz targets: ${targets}"
+          for target in ${targets}; do
+            echo "::group::Fuzzing ${target}"
+            cargo fuzz run "${target}" -- \
+              -max_total_time=60 -max_len=65536 -rss_limit_mb=2048
+            echo "::endgroup::"
+          done
+
+      # 6. On failure (a crash/timeout reproducer was written), publish the
       #    cargo-fuzz artifacts directory so the offending input is retrievable.
-      #    This replaces the previous crash-artifact upload location.
       - name: Upload crash artifacts
         uses: actions/upload-artifact@v4
         if: failure()

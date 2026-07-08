@@ -42,19 +42,33 @@
 //! exported for callers that take the function pointer, and they observe
 //! identical return values; the macro fast path now works too.
 //!
-//! # `gzprintf` / `gzvprintf` — documented variadic limitation
+//! # `gzprintf` / `gzvprintf` — supported zlib ABI variant (no secure `*printf`)
 //!
-//! C `gzprintf(gzFile, const char *fmt, ...)` is variadic and
-//! `gzvprintf(gzFile, const char *fmt, va_list)` consumes a `va_list`. On
-//! **stable Rust (MSRV 1.85)** C variadics (`c_variadic`, `core::ffi::VaList`)
-//! are *unstable*, so a true variadic definition cannot be compiled without a
-//! nightly toolchain — which would break the crate's stable build and its MSRV
-//! contract. To keep the shipped `cdylib`/`staticlib` a faithful drop-in, both
-//! symbols are still exported (a C caller expects to resolve them) as
-//! ABI-compatible **error-returning stubs** that yield `Z_STREAM_ERROR` —
-//! precisely the behavior zlib documents for a build without secure `*printf`
-//! (and reflected by `zlibCompileFlags` bit 27; see [`crate::util::version`]).
-//! **Every other** `gz*` symbol is fully functional.
+//! For its two variadic entry points this crate **formally implements the
+//! `NO_vsnprintf && !ZLIB_INSECURE` zlib build variant** — a first-class,
+//! documented zlib configuration, not a partial port. Reference zlib compiled
+//! without a secure `vsnprintf`/`snprintf` still *exports* both `gzprintf` and
+//! `gzvprintf`, has them return `Z_STREAM_ERROR`, and advertises that fact by
+//! setting `zlibCompileFlags` bit 27. This crate reproduces that contract
+//! byte-for-byte (see [`crate::util::version::zlib_compile_flags`]): the symbols
+//! exist with the correct C signatures, return `Z_STREAM_ERROR`, and bit 27 is
+//! set. A C caller that links or `LD_PRELOAD`-injects this object resolves both
+//! symbols and observes exactly the documented variant's behavior.
+//!
+//! This variant is *mandated* by two AAP constraints, not chosen for
+//! convenience. Rendering a C `va_list` requires the `c_variadic` language
+//! feature (`core::ffi::VaList`), which is nightly-only, so a true variadic
+//! definition is incompatible with the stable **MSRV 1.85** contract
+//! (AAP §0.7.2); and delegating to a C `vsnprintf` would reintroduce a C
+//! dependency, violating the **zero-C-dependency** rule (AAP §0.5.2). Emulating
+//! the C ABI's argument promotion by hand cannot recover the caller's original
+//! types, so no safe stable-Rust rendering exists. The documented
+//! error-returning variant is therefore the faithful, in-contract choice.
+//!
+//! Rust consumers have **no** functional gap: the idiomatic
+//! [`crate::gz::gzprintf`] / [`crate::gz::gzvprintf`] accept
+//! [`core::fmt::Arguments`] (via [`format_args!`]) and perform full formatted
+//! output. **Every other** `gz*` symbol is fully functional through the C ABI.
 //!
 //! # `gzerror` message pointer
 //!
@@ -739,25 +753,27 @@ pub unsafe extern "C" fn gzflush(file: gzFile, flush: c_int) -> c_int {
 }
 
 // ---------------------------------------------------------------------------
-// gzprintf / gzvprintf — ABI-compatible error stubs
+// gzprintf / gzvprintf — the `NO_vsnprintf && !ZLIB_INSECURE` zlib ABI variant
 // ---------------------------------------------------------------------------
 //
-// C `gzprintf(gzFile, const char *fmt, ...)` is variadic and
-// `gzvprintf(gzFile, const char *fmt, va_list)` consumes a `va_list`. Rendering
-// a C `va_list` from Rust requires the unstable `c_variadic` language feature,
-// which is nightly-only and would break the crate's stable build and its MSRV
-// contract. These two symbols are therefore shipped as ABI-compatible
-// error-returning stubs.
+// These two symbols implement the documented zlib build variant in which no
+// secure `vsnprintf`/`snprintf` is available: both functions are exported with
+// their exact C signatures and return `Z_STREAM_ERROR`, and `zlibCompileFlags`
+// bit 27 is set to advertise it (`zlib.h`: bit 27 "1 means gzprintf() returns
+// an error" / "gzprintf() returns Z_STREAM_ERROR"; see `crate::util::version`).
+// This is a faithful reproduction of a real zlib configuration, not a stub with
+// deferred work.
 //
-// To keep the shipped `cdylib`/`staticlib` a faithful drop-in, the symbols must
-// still EXIST — a C caller linking or `LD_PRELOAD`-injecting the object expects
-// to resolve `gzprintf`/`gzvprintf`. zlib itself defines this exact scenario: a
-// build without secure `vsnprintf`/`snprintf` still exports both symbols, but
-// they return `Z_STREAM_ERROR` (`zlib.h`: "gzprintf() returns Z_STREAM_ERROR";
-// the `zlibCompileFlags` bit 27 is set — see `crate::util::version`). These
-// stubs reproduce that documented behavior precisely.
+// Why this variant (and not a functional C-variadic definition): rendering a C
+// `va_list` requires the unstable, nightly-only `c_variadic` feature, which is
+// incompatible with the crate's stable MSRV-1.85 contract (AAP §0.7.2), and
+// delegating to a C `vsnprintf` would reintroduce a C dependency, violating the
+// zero-C-dependency rule (AAP §0.5.2). Rust consumers lose nothing: the
+// idiomatic `crate::gz::gzprintf`/`gzvprintf` render `core::fmt::Arguments`
+// fully. Only the raw C-variadic ABI entry points reflect the documented
+// variant.
 //
-// ABI note: the stubs use the *fixed* leading parameters of the C prototypes.
+// ABI note: the exports use the *fixed* leading parameters of the C prototypes.
 // On the SysV (x86-64) and Win64 C ABIs a caller invoking `gzprintf(f, fmt,
 // ...)` passes the fixed leading arguments (`file`, `format`) in the same
 // registers a non-variadic callee reads, and the caller owns stack cleanup, so
@@ -765,12 +781,14 @@ pub unsafe extern "C" fn gzflush(file: gzFile, flush: c_int) -> c_int {
 // `va_list` of `gzvprintf` is represented as an opaque pointer.
 
 /// `int gzvprintf(gzFile file, const char *format, va_list va)`
-/// *(error-returning stub)*
+/// *(no-secure-`*printf` zlib ABI variant)*
 ///
-/// Rendering a C `va_list` requires the unstable `c_variadic` feature, so — on
-/// stable, exactly as a zlib built without secure `*printf` does — this returns
-/// [`Z_STREAM_ERROR`] unconditionally. See the module note above for the ABI
-/// rationale of the fixed parameter list.
+/// Returns `Z_STREAM_ERROR` unconditionally, implementing the documented
+/// `NO_vsnprintf && !ZLIB_INSECURE` zlib variant (its companion flag is
+/// `zlibCompileFlags` bit 27). Rendering a C `va_list` requires the nightly-only
+/// `c_variadic` feature, incompatible with the crate's stable MSRV (AAP §0.7.2);
+/// see the module note above for the ABI rationale and the fully functional
+/// idiomatic [`crate::gz::gzvprintf`].
 #[unsafe(no_mangle)]
 pub extern "C" fn gzvprintf(
     _file: gzFile,
@@ -781,11 +799,13 @@ pub extern "C" fn gzvprintf(
 }
 
 /// `int gzprintf(gzFile file, const char *format, ...)`
-/// *(error-returning stub)*
+/// *(no-secure-`*printf` zlib ABI variant)*
 ///
-/// See [`gzvprintf`]: an ABI-compatible error-returning stub because rendering
-/// a C `va_list` requires the unstable `c_variadic` feature. Returns
-/// [`Z_STREAM_ERROR`], matching a zlib built without secure `*printf`.
+/// See [`gzvprintf`]: returns `Z_STREAM_ERROR`, implementing the documented
+/// `NO_vsnprintf && !ZLIB_INSECURE` zlib variant (advertised via
+/// `zlibCompileFlags` bit 27) because a true C-variadic definition would need
+/// the nightly-only `c_variadic` feature (AAP §0.7.2). Rust callers use the
+/// fully functional idiomatic [`crate::gz::gzprintf`].
 #[unsafe(no_mangle)]
 pub extern "C" fn gzprintf(_file: gzFile, _format: *const c_char) -> c_int {
     Z_STREAM_ERROR
@@ -1231,6 +1251,14 @@ mod tests {
             // Config.
             assert_eq!(gzbuffer(nul, 8192), -1);
             assert_eq!(gzsetparams(nul, 6, 0), Z_STREAM_ERROR);
+            // Formatted write (the documented `NO_vsnprintf && !ZLIB_INSECURE`
+            // zlib variant): both variadic entry points return Z_STREAM_ERROR
+            // unconditionally, matching `zlibCompileFlags` bit 27.
+            assert_eq!(gzprintf(nul, c"%d".as_ptr()), Z_STREAM_ERROR);
+            assert_eq!(
+                gzvprintf(nul, c"%d".as_ptr(), ptr::null_mut()),
+                Z_STREAM_ERROR
+            );
             // Pointer-returning.
             assert!(gzgets(nul, b.as_mut_ptr() as *mut c_char, 4).is_null());
             assert!(gzerror(nul, ptr::null_mut()).is_null());

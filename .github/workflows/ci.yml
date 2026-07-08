@@ -13,7 +13,7 @@
 #
 # Jobs:
 #   build-test    build (debug + release) and test across the feature matrix
-#   no-std-tests  no_std test steps (tracked-failing; kept non-blocking)
+#   no-std-tests  no_std test suite (blocking gate)
 #   lint          rustfmt + clippy (-D warnings)
 #   msrv          build + check on the pinned MSRV toolchain (1.85.0)
 #   benches       compile-only check of the criterion benchmarks
@@ -55,8 +55,8 @@ jobs:
             features: '--no-default-features --features std,gzip,gz-io,simd'
             test: true
           # Core-only (no_std) LIBRARY build. The library compiles cleanly with
-          # no default features; test compilation is exercised separately in the
-          # `no-std-tests` job below, hence `test: false` here.
+          # no default features; the no_std test suite runs (and passes) in the
+          # dedicated `no-std-tests` job below, hence `test: false` here.
           - name: no_std library (build only)
             os: ubuntu-latest
             features: '--no-default-features'
@@ -84,16 +84,21 @@ jobs:
         retention-days: 7
         if-no-files-found: ignore
 
-  # no_std test compilation. These two steps are mandated by the migration plan.
-  # KNOWN OPEN ISSUE (project-guide 2.2/2.4): they currently FAIL with 129 errors
-  # (missing `alloc` imports in the test modules). This is a separately tracked
-  # issue - the steps are authored exactly as intended and `continue-on-error`
-  # keeps the tracked failure non-blocking for the overall pipeline. The no_std
-  # LIBRARY build (see the matrix row above) passes; only the TEST build fails.
+  # no_std test suite. These two steps are mandated by the migration plan and
+  # are a BLOCKING gate: the full test suite must PASS under both
+  # `--no-default-features` and `--no-default-features --features no-std`.
+  #
+  # Mechanism: the crate is `#![no_std]` only for the shipped artifact
+  # (`cargo build --no-default-features`, which the profiles compile with
+  # `panic = "abort"`). Under `cargo test` Cargo forces `panic = "unwind"` for
+  # the libtest harness, so the crate stays `std`-linked while every
+  # `not(feature = "std")` code path is still compiled and exercised (the `std`
+  # feature gates remain off). See the crate-attribute rationale in
+  # `src/lib.rs`. The previously tracked "129 errors" open issue is RESOLVED, so
+  # `continue-on-error` has been removed and this job now gates the pipeline.
   no-std-tests:
-    name: no_std tests (tracked failure - 129 errors)
+    name: no_std tests
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4

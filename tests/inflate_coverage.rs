@@ -16,18 +16,22 @@
 //! through the [`zlib_rs::ffi`] `extern "C"` shims. Every `unsafe` block is at
 //! that FFI boundary and carries a `// SAFETY:` note (AAP §0.6.2).
 //!
-//! ## Honestly-handled gaps (never faked)
+//! ## Forced `Z_MEM_ERROR` (reproduced via the FFI allocator hooks)
 //!
-//! Two `infcover.c` behaviours reach into private engine internals and are *not*
-//! reachable from an integration test over the public API. They are handled
-//! openly rather than by forging private access with `unsafe`:
+//! `infcover.c` forces `Z_MEM_ERROR` by installing a byte-capped allocator
+//! through the `z_stream` `zalloc`/`zfree` hooks. `zlib-rs` allocation is
+//! *fallible* at the FFI boundary (AAP §0.6.3): a caller hook that returns null
+//! propagates to `MemError` with **no** global-allocator fallback. That harness
+//! is reproduced here — see [`mem_limit_forces_mem_error`], which caps the byte
+//! budget below the inflate window size so the lazily-allocated window cannot be
+//! obtained and `inflate` returns `Z_MEM_ERROR`, exactly as in C.
 //!
-//! * **Forced `Z_MEM_ERROR`** — `infcover.c` installs a byte-capped allocator
-//!   through the `z_stream` `zalloc`/`zfree` hooks. In `zlib-rs` allocation is
-//!   infallible: when a caller hook returns null the allocator falls back to the
-//!   global allocator, so `MemError` cannot be forced via the idiomatic API or
-//!   the FFI hook. The corresponding steps are omitted (documented inline) and a
-//!   named, `#[ignore]`d test [`mem_limit_forces_mem_error`] records the gap.
+//! ## Honestly-handled gap (never faked)
+//!
+//! One `infcover.c` behaviour reaches into private engine internals and is *not*
+//! reachable from an integration test over the public API. It is handled openly
+//! rather than by forging private access with `unsafe`:
+//!
 //! * **Forced inflateBack mode error** — `infcover.c` makes its `pull` callback
 //!   poke `((inflate_state*)strm.state)->mode = SYNC`, an otherwise-impossible
 //!   internal state, to force `Z_STREAM_ERROR`. The idiomatic [`InFunc`] trait
@@ -37,7 +41,7 @@
 //! Gzip-framed cases are gated behind `#[cfg(feature = "gzip")]`; the file is
 //! authored for the default (std + gzip) feature set.
 
-use core::ffi::c_int;
+use core::ffi::{c_int, c_uint, c_void};
 use core::ptr;
 
 #[cfg(feature = "gzip")]
@@ -45,7 +49,7 @@ use zlib_rs::GzHeader;
 use zlib_rs::constants::{Z_NO_FLUSH, Z_TREES};
 use zlib_rs::ffi::{
     inflate as ffi_inflate, inflateBack, inflateBackEnd, inflateBackInit_, inflateCopy, inflateEnd,
-    inflateInit_, z_stream,
+    inflateInit_, inflateInit2_, z_stream,
 };
 use zlib_rs::inflate::back::{InFunc, OutFunc, inflate_back, inflate_back_end, inflate_back_init};
 #[cfg(feature = "gzip")]
@@ -247,9 +251,11 @@ fn inf(hex: &str, what: &str, step: usize, win: i32, len: usize, err: ReturnCode
 
         if outcome.code == ReturnCode::NeedDict {
             // Reachable portion of C's NEED_DICT coverage. (C additionally forces
-            // Z_MEM_ERROR under an allocation limit and then poke-restores
-            // state->mode = DICT; that MemError path is unreachable in this port,
-            // so only the publicly reachable steps are reproduced.)
+            // Z_MEM_ERROR under an allocation limit and then poke-restores the
+            // private `state->mode = DICT`; forcing `Z_MEM_ERROR` is covered
+            // separately by `mem_limit_forces_mem_error`, but the private-state
+            // poke that resumes decoding from it is not expressible over the
+            // public API, so only the publicly reachable steps are reproduced.)
             //
             // A dictionary whose Adler-32 mismatches the requested id → DataError.
             assert_eq!(
@@ -551,13 +557,14 @@ fn cover_wrap() {
     }
 
     // Miscellaneous API sequence. The C `mem_*` allocation-limit steps that force
-    // Z_MEM_ERROR (two inflate() calls, and the inflateCopy) are omitted:
-    // allocation is infallible in this port (see the module docs and the ignored
-    // `mem_limit_forces_mem_error` test), so Z_MEM_ERROR is unreachable. The
-    // remaining, publicly reachable steps are reproduced exactly.
+    // Z_MEM_ERROR (the capped inflate() calls and inflateCopy) are consolidated
+    // into the dedicated `mem_limit_forces_mem_error` test, which reproduces the
+    // forced-failure via the FFI `zalloc`/`zfree` hooks (allocation is fallible
+    // at the boundary — see the module docs). The remaining, publicly reachable
+    // steps of this sequence are reproduced exactly here.
     let mut strm = ZStream::new();
     assert_eq!(rc(inflate_init2(&mut strm, -8)), ReturnCode::Ok);
-    // (C forces Z_MEM_ERROR here twice under a 1-byte limit — omitted.)
+    // (C's 1-byte-limit Z_MEM_ERROR steps are covered by mem_limit_forces_mem_error.)
     let dict = [0u8; 257];
     assert_eq!(rc(inflate_set_dictionary(&mut strm, &dict)), ReturnCode::Ok);
     assert_eq!(rc(inflate_prime(&mut strm, 16, 0)), ReturnCode::Ok);
@@ -572,7 +579,9 @@ fn cover_wrap() {
     assert_eq!(sync2, ReturnCode::Ok);
     // inflateSyncPoint — return value unused (C casts to void).
     let _ = inflate_sync_point(&strm);
-    // (C expects Z_MEM_ERROR under a limit; unreachable here, so assert Ok.)
+    // C's inflateCopy runs under a byte cap to force Z_MEM_ERROR; that forced
+    // path is covered by mem_limit_forces_mem_error. Here the idiomatic API
+    // installs no cap, so the copy succeeds.
     let mut copy = ZStream::new();
     assert_eq!(rc(inflate_copy(&mut copy, &strm)), ReturnCode::Ok);
     assert_eq!(rc(inflate_end(&mut copy)), ReturnCode::Ok);
@@ -859,22 +868,129 @@ fn cover_fast() {
 }
 
 // ===========================================================================
-// Documented coverage gap — forced Z_MEM_ERROR (unreachable by design)
+// Forced Z_MEM_ERROR — a byte-capped allocator via the z_stream hooks
+// (faithful port of infcover.c's `mem_*` forced-allocation-failure steps)
 // ===========================================================================
 
-/// `infcover.c`'s `mem_*` harness forces `Z_MEM_ERROR` by installing a
-/// byte-capped allocator through the `z_stream` `zalloc`/`zfree` hooks. In
-/// `zlib-rs` allocation is infallible: when a caller-supplied hook returns null,
-/// the allocator falls back to the global allocator, so neither the idiomatic
-/// API nor the FFI hook can force `MemError` for inflate. This test records that
-/// coverage gap explicitly; it is `#[ignore]`d rather than faked. Resolving it
-/// requires a fallible-allocation path in `src/stream.rs` / `src/ffi` (tracked
-/// with those module owners).
+/// A byte-capped allocator, the Rust analogue of `infcover.c`'s `mem_*` harness.
+///
+/// It hands out memory from the global allocator until a fixed byte budget is
+/// exhausted, after which it returns null — exactly the failure `infcover.c`
+/// injects through the `z_stream` `zalloc`/`zfree` hooks to drive the inflate
+/// engine into `Z_MEM_ERROR`. `zlib-rs` allocation is *fallible* at the FFI
+/// boundary (AAP §0.6.3): a caller hook that returns null propagates to
+/// [`ReturnCode::MemError`] with **no** global-allocator fallback, so this hook
+/// forces the error just as in C.
+struct MemCap {
+    /// Remaining byte budget. Any single request larger than this fails.
+    budget: core::cell::Cell<usize>,
+}
+
+/// Every allocation is prefixed with a `usize` header recording its total size
+/// so [`cap_free`] can reconstruct the [`Layout`](core::alloc::Layout).
+const CAP_HEADER: usize = core::mem::size_of::<usize>();
+
+/// `zalloc` hook: allocate `items * size` bytes when within budget, else null.
+unsafe extern "C" fn cap_alloc(opaque: *mut c_void, items: c_uint, size: c_uint) -> *mut c_void {
+    // SAFETY: `opaque` is the `&MemCap` installed on the stream below, which
+    // outlives every inflate call in the test.
+    let cap = unsafe { &*(opaque as *const MemCap) };
+    let bytes = (items as usize).saturating_mul(size as usize);
+    if bytes == 0 || bytes > cap.budget.get() {
+        return ptr::null_mut();
+    }
+    let total = bytes + CAP_HEADER;
+    let layout = core::alloc::Layout::from_size_align(total, CAP_HEADER).expect("valid layout");
+    // SAFETY: `layout` has non-zero size.
+    let raw = unsafe { std::alloc::alloc(layout) };
+    if raw.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: `raw` owns `total` bytes aligned for `usize`; record the size in
+    // the header and hand back the pointer just past it.
+    unsafe { *(raw as *mut usize) = total };
+    cap.budget.set(cap.budget.get() - bytes);
+    // SAFETY: the returned pointer lies one header inside the allocation.
+    unsafe { raw.add(CAP_HEADER) as *mut c_void }
+}
+
+/// `zfree` hook: reconstruct the layout from the header, refund the budget, and
+/// release the block.
+unsafe extern "C" fn cap_free(opaque: *mut c_void, address: *mut c_void) {
+    if address.is_null() {
+        return;
+    }
+    // SAFETY: `address` was returned by `cap_alloc`, so its `usize` size header
+    // sits in the `CAP_HEADER` bytes immediately before it; stepping back by
+    // `CAP_HEADER` stays within that same allocation.
+    let raw = unsafe { (address as *mut u8).sub(CAP_HEADER) };
+    // SAFETY: `raw` points at the `usize` size header written by `cap_alloc`.
+    let total = unsafe { *(raw as *const usize) };
+    let layout = core::alloc::Layout::from_size_align(total, CAP_HEADER).expect("valid layout");
+    // SAFETY: `opaque` is the live `&MemCap` for the stream.
+    let cap = unsafe { &*(opaque as *const MemCap) };
+    cap.budget.set(cap.budget.get() + (total - CAP_HEADER));
+    // SAFETY: `raw`/`layout` match the original allocation from `cap_alloc`.
+    unsafe { std::alloc::dealloc(raw, layout) };
+}
+
+/// Port of the forced-`Z_MEM_ERROR` steps of `infcover.c`'s `mem_*` harness.
+///
+/// With a byte budget below the inflate window size, the lazily-allocated
+/// window (`1 << windowBits` bytes; 256 for `windowBits = -8`) cannot be
+/// obtained, so `inflate` reports `Z_MEM_ERROR` — the same outcome `infcover.c`
+/// pins under its 1-byte allocation limit. `inflateInit2_` itself makes no hook
+/// allocation (the window is lazy), so it still returns `Z_OK`, mirroring C.
 #[test]
-#[ignore = "MemError is unreachable: zlib-rs allocation falls back to the global \
-            allocator when a custom zalloc returns null, so the FFI zalloc/zfree \
-            hook cannot force Z_MEM_ERROR (see module docs)"]
 fn mem_limit_forces_mem_error() {
-    // Intentionally empty: see the #[ignore] reason above. Kept as a named,
-    // discoverable placeholder (`cargo test -- --ignored`) for the coverage gap.
+    let cap = MemCap {
+        // 200 < 256 = the raw 8-bit inflate window, so the window allocation
+        // fails while leaving room for any smaller incidental request.
+        budget: core::cell::Cell::new(200),
+    };
+
+    let mut strm = zeroed_stream();
+    strm.zalloc = Some(cap_alloc);
+    strm.zfree = Some(cap_free);
+    strm.opaque = (&cap as *const MemCap) as *mut c_void;
+
+    // SAFETY: `strm` is a valid, caller-owned `z_stream` with a live capped
+    // allocator installed; `c"1"` is a valid version whose first byte matches
+    // the library version, and the reported size is the true `sizeof(z_stream)`.
+    let init = unsafe {
+        inflateInit2_(
+            &mut strm,
+            -8,
+            c"1".as_ptr(),
+            core::mem::size_of::<z_stream>() as c_int,
+        )
+    };
+    assert_eq!(
+        init,
+        ReturnCode::Ok.as_c_int(),
+        "inflateInit2_ makes no hook allocation (the window is lazy) and must succeed",
+    );
+
+    // A minimal raw-DEFLATE fragment that drives the engine to grow its window
+    // (mirrors the `\x63\x00` feed in infcover.c's mem coverage).
+    let input = [0x63u8, 0x00];
+    let mut out = [0u8; 1];
+    strm.next_in = input.as_ptr();
+    strm.avail_in = input.len() as c_uint;
+    strm.next_out = out.as_mut_ptr();
+    strm.avail_out = out.len() as c_uint;
+
+    // SAFETY: `strm` holds a valid inflate state; `next_in`/`next_out` point at
+    // the live local buffers with matching `avail_*` counts.
+    let ret = unsafe { ffi_inflate(&mut strm, Z_NO_FLUSH) };
+    assert_eq!(
+        ret,
+        ReturnCode::MemError.as_c_int(),
+        "a budget below the window size must force Z_MEM_ERROR",
+    );
+
+    // SAFETY: `strm` was initialized by `inflateInit2_`; `inflateEnd` reclaims
+    // the state box (allocated globally, so it succeeds despite the cap).
+    let end = unsafe { inflateEnd(&mut strm) };
+    assert_eq!(end, ReturnCode::Ok.as_c_int(), "inflateEnd must succeed");
 }

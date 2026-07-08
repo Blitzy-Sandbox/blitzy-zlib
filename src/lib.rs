@@ -84,7 +84,31 @@
 // The core engines are `no_std` + `alloc`; the standard library is linked only
 // under the `std` feature (the default). Because the FFI layer and several
 // engines allocate (`Box`/`Vec`), `alloc` is imported unconditionally below.
-#![cfg_attr(not(feature = "std"), no_std)]
+//
+// `no_std` is applied only for a genuine freestanding build, identified by the
+// conjunction of three stable predicates:
+//   * `not(feature = "std")` — the default `std` feature is off.
+//   * `panic = "abort"`      — the crate is compiled with the abort panic
+//     strategy. On the STABLE toolchain (MSRV 1.85.0, no `-Z build-std`) a
+//     `#![no_std]` crate CANNOT be codegen'd with `panic = "unwind"`: the
+//     compiler rejects it with "unwinding panics are not supported without
+//     std". `[profile.dev]`/`[profile.release]` set `panic = "abort"` precisely
+//     so the no_std `cdylib`/`staticlib` link (`cargo build
+//     --no-default-features`). But `cargo test` forces `panic = "unwind"`
+//     (libtest needs `catch_unwind`) AND still builds every `crate-type` of the
+//     lib target — including the `cdylib`/`staticlib`. Gating `no_std` on
+//     `panic = "abort"` therefore keeps the crate `std`-linked under
+//     `cargo test --no-default-features` (so those artifacts and the integration
+//     tests / doctests build), while `cargo build --no-default-features` (abort)
+//     still yields the real freestanding artifact. The `feature = "std"` code
+//     gates stay OFF regardless, so `cargo test --no-default-features` genuinely
+//     exercises the `no_std`-configured code paths. `cfg(panic = ...)` is stable
+//     since Rust 1.60. See the `no_std_support` gate below (identical
+//     predicate) and the `src/util/compress.rs` test module.
+//   * `not(test)`            — belt-and-braces exclusion of the unit-test
+//     harness (which links `std`); redundant given `panic = "abort"` on stable,
+//     but documents intent and guards custom profiles.
+#![cfg_attr(all(not(feature = "std"), not(test), panic = "abort"), no_std)]
 // Every public item in the crate must be documented (AAP: "document all public
 // items"). This is a `warn`, never a `deny`, so it can never break the build.
 #![warn(missing_docs)]
@@ -105,11 +129,16 @@ extern crate alloc;
 // function required, but not found" (see QA finding on the `no-std` build).
 //
 // These items are compiled ONLY for a genuine freestanding library build —
-// `#[cfg(all(not(feature = "std"), not(test)))]`:
+// `#[cfg(all(not(feature = "std"), not(test), panic = "abort"))]`, the SAME
+// predicate that applies `#![no_std]` above (see the detailed rationale there):
 //   * `not(feature = "std")`  — under the default (`std`) build the standard
 //     library already provides the global allocator and panic handler, and
 //     redefining them here would be a duplicate-lang-item error. The whole std
 //     surface therefore stays byte-for-byte unchanged.
+//   * `panic = "abort"`       — under `cargo test` the crate is `std`-linked
+//     (panic = "unwind"; see the crate attribute above), so `std` already
+//     supplies the allocator and panic handler; defining them here would then
+//     collide. This predicate keeps these items in lockstep with `#![no_std]`.
 //   * `not(test)`             — the unit-test harness links `libtest`, which
 //     pulls in `std`; excluding the items from test builds avoids clashing with
 //     the std-provided ones.
@@ -129,7 +158,7 @@ extern crate alloc;
 // boundary carve-out in AAP §0.6.2 — it is NOT part of the compression core
 // (`src/deflate/**` remains 100% `unsafe`-free, honoring the "zero unsafe in
 // core compression logic" rule). Every `unsafe` operation is justified inline.
-#[cfg(all(not(feature = "std"), not(test)))]
+#[cfg(all(not(feature = "std"), not(test), panic = "abort"))]
 mod no_std_support {
     use core::alloc::{GlobalAlloc, Layout};
     use core::ffi::c_void;

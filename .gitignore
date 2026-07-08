@@ -56,3 +56,11 @@ MODULE.bazel.lock
 # Cargo.lock IS tracked: the crate emits cdylib/staticlib distributable artifacts
 # and the migration pins exact resolved dependency versions for reproducible,
 # offline builds, so the lockfile is intentionally committed.
+
+# cargo-fuzz (fuzz/ is a detached workspace; see .github/workflows/fuzz.yml).
+# Build output and fuzzer-generated data are never committed; the fuzz targets,
+# fuzz/Cargo.toml, and (once generated in CI) fuzz/Cargo.lock ARE tracked.
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage

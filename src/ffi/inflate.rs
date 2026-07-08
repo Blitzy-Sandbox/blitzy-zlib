@@ -1392,6 +1392,9 @@ mod tests {
         203, 72, 205, 201, 201, 215, 81, 200, 64, 161, 202, 243, 139, 114, 82, 20, 1,
     ];
     // gzip-wrapped (RFC 1952) stream for `MSG` (no name/comment).
+    // Only the gzip/auto-detect tests consume this vector, so it is gated on
+    // the `gzip` feature to stay dead-code-free under `--no-default-features`.
+    #[cfg(feature = "gzip")]
     const GZIP_STREAM: &[u8] = &[
         31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 203, 72, 205, 201, 201, 215, 81, 200, 64, 161, 202, 243,
         139, 114, 82, 20, 1, 131, 137, 31, 110, 27, 0, 0, 0,
