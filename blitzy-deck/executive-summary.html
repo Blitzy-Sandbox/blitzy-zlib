@@ -584,13 +584,13 @@
           </div>
           <div class="kpi-card">
             <div class="kpi-icon"><i data-lucide="check-check" aria-hidden="true"></i></div>
-            <div class="kpi-value">481</div>
-            <div class="kpi-label">Tests pass, 0 failures</div>
+            <div class="kpi-value">609</div>
+            <div class="kpi-label">Tests pass &middot; 0 failures</div>
           </div>
           <div class="kpi-card">
             <div class="kpi-icon"><i data-lucide="file-code" aria-hidden="true"></i></div>
-            <div class="kpi-value">32,235</div>
-            <div class="kpi-label">Lines of Rust · 40 src modules</div>
+            <div class="kpi-value">33,724</div>
+            <div class="kpi-label">Lines of Rust &middot; 43 files</div>
           </div>
           <div class="kpi-card">
             <div class="kpi-icon"><i data-lucide="sparkles" aria-hidden="true"></i></div>
@@ -598,12 +598,17 @@
             <div class="kpi-label">Clippy warnings</div>
           </div>
           <div class="kpi-card">
+            <div class="kpi-icon"><i data-lucide="gauge" aria-hidden="true"></i></div>
+            <div class="kpi-value">85.1%</div>
+            <div class="kpi-label">Planned scope complete</div>
+          </div>
+          <div class="kpi-card">
             <div class="kpi-icon"><i data-lucide="unplug" aria-hidden="true"></i></div>
             <div class="kpi-value">Zero</div>
             <div class="kpi-label">C dependencies</div>
           </div>
         </div>
-        <p class="caption">~23,107 lines of C, now memory-safe Rust. 481 tests pass by default &middot; 357 under <code>no_std</code> &middot; 0 failures.</p>
+        <p class="caption">~23,107 lines of C reborn as 33,724 lines of memory-safe Rust across 43 files. 609 tests pass, 0 clippy lints, zero C deps &mdash; 85.1% of planned scope complete.</p>
       </section>
 
       <!-- ============================================================
@@ -764,7 +769,7 @@ graph LR
             </tr>
             <tr>
               <td><code>src/ffi</code></td>
-              <td>6</td>
+              <td>7</td>
               <td>&mdash;</td>
               <td><code>extern "C"</code> shims · <code>#[repr(C)]</code> mirrors</td>
             </tr>
@@ -840,7 +845,7 @@ flowchart LR
             <tr>
               <td>Tests</td>
               <td><span class="status-pass"><i data-lucide="check" aria-hidden="true"></i> PASS</span></td>
-              <td>481 passed &middot; 357 under no_std &middot; 0 failed</td>
+              <td>609 passed &middot; 0 failed &middot; 1 ignored</td>
             </tr>
             <tr>
               <td>Runtime</td>
