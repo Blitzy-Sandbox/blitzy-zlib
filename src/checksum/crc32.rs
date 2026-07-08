@@ -75,7 +75,8 @@ const POLY: u32 = 0xedb8_8320;
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
+/// # use zlib_rs::checksum::crc32::crc32;
 /// let mut crc = crc32(0, b"");     // required initial value
 /// crc = crc32(crc, b"123456789");  // fold in more data
 /// assert_eq!(crc, 0xcbf4_3926);

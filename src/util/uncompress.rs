@@ -104,15 +104,23 @@ use crate::stream::ZStream;
 ///
 /// # Examples
 ///
-/// ```ignore
-/// // `zlib` is a valid zlib stream and `plain_len` its decompressed size.
+/// ```
+/// # use zlib_rs::{compress, compress_bound, uncompress2};
+/// // Build a valid zlib stream; `plain_len` is its decompressed size.
+/// let plain = b"the quick brown fox";
+/// let mut zlib = vec![0u8; compress_bound(plain.len())];
+/// let m = compress(&mut zlib, plain).unwrap();
+/// zlib.truncate(m);
+/// let plain_len = plain.len();
+///
 /// let mut out = vec![0u8; plain_len];
 /// let mut consumed = zlib.len();
 /// let mut produced = out.len();
-/// let n = uncompress2(&mut out, &zlib, &mut consumed, &mut produced)?;
+/// let n = uncompress2(&mut out, &zlib, &mut consumed, &mut produced).unwrap();
 /// assert_eq!(n, plain_len);
 /// assert_eq!(produced, plain_len);   // output count reported on all paths
 /// assert_eq!(consumed, zlib.len());  // whole stream read
+/// assert_eq!(&out[..], plain);
 /// ```
 pub fn uncompress2(
     dest: &mut [u8],
@@ -219,10 +227,18 @@ pub fn uncompress2(
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
+/// # use zlib_rs::{compress, compress_bound, uncompress};
+/// let plain = b"the quick brown fox";
+/// let mut zlib = vec![0u8; compress_bound(plain.len())];
+/// let m = compress(&mut zlib, plain).unwrap();
+/// zlib.truncate(m);
+/// let plain_len = plain.len();
+///
 /// let mut out = vec![0u8; plain_len];
-/// let n = uncompress(&mut out, &zlib)?;
+/// let n = uncompress(&mut out, &zlib).unwrap();
 /// assert_eq!(n, plain_len);
+/// assert_eq!(&out[..], plain);
 /// ```
 pub fn uncompress(dest: &mut [u8], source: &[u8]) -> Result<usize, ReturnCode> {
     // C `uncompress` seeds a local `used = sourceLen` and calls `uncompress2`,

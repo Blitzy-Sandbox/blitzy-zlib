@@ -631,7 +631,7 @@ impl fmt::Debug for StreamState {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// use zlib_rs::stream::ZStream;
 ///
 /// // A freshly created stream owns no engine yet.

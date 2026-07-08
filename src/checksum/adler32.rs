@@ -65,9 +65,11 @@ const NMAX: usize = 5552;
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
+/// # use zlib_rs::checksum::adler32::adler32;
 /// let mut sum = adler32(1, b"");     // required initial value
 /// sum = adler32(sum, b"123456789");  // fold in more data
+/// assert_eq!(sum, 0x091e_01de);      // canonical Adler-32 of "123456789"
 /// ```
 #[must_use]
 pub fn adler32(adler: u32, buf: &[u8]) -> u32 {

@@ -114,7 +114,7 @@ type DeflateResult = Result<ReturnCode, ZlibError>;
 /// [`DeflateConfig::new`]) and override individual fields with the chained
 /// setters, then hand it to [`DeflateConfig::init`].
 ///
-/// ```ignore
+/// ```
 /// use zlib_rs::deflate::DeflateConfig;
 /// use zlib_rs::constants::Strategy;
 /// let mut strm = zlib_rs::stream::ZStream::new();
