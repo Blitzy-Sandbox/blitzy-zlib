@@ -17,11 +17,11 @@
 //! Adler-32 maintains two 16-bit running sums, conventionally called `s1` and
 //! `s2`, packed into a single [`u32`] as `(s2 << 16) | s1`:
 //!
-//! * `s1` is `1` plus the sum of every input byte, taken modulo [`BASE`].
-//! * `s2` is the running sum of `s1` after each byte, taken modulo [`BASE`].
+//! * `s1` is `1` plus the sum of every input byte, taken modulo `BASE`.
+//! * `s2` is the running sum of `s1` after each byte, taken modulo `BASE`.
 //!
 //! To keep the sums from overflowing a `u32`, the input is processed in blocks
-//! of at most [`NMAX`] bytes and both sums are reduced modulo [`BASE`] after
+//! of at most `NMAX` bytes and both sums are reduced modulo `BASE` after
 //! each block. Within a block the per-byte updates are unrolled in groups of
 //! sixteen, mirroring the reference C `DO16` macro in `adler32.c`. Because the
 //! arithmetic result is invariant to *where* the reductions are inserted
@@ -51,7 +51,7 @@ const NMAX: usize = 5552;
 /// An Adler-32 value is in the range of a 32-bit unsigned integer. A fresh
 /// checksum is started from the required initial value `1`; passing an empty
 /// slice takes the same zero-length path as reference zlib, normalizing each
-/// 16-bit half modulo [`BASE`]. A valid running checksum (both halves already
+/// 16-bit half modulo `BASE`. A valid running checksum (both halves already
 /// `< BASE`) is therefore returned unchanged, so `adler32(1, b"")` returns `1`.
 ///
 /// An Adler-32 checksum is almost as reliable as a CRC-32 but can be computed

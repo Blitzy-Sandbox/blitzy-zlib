@@ -9,7 +9,7 @@
 //! * [`uncompress2`] — the primary entry point. It reports how many source
 //!   bytes were consumed through an out-parameter, mirroring C
 //!   `uncompress2`/`uncompress2_z` (`uncompr.c` L29-L90).
-//! * [`uncompress`] — the classic convenience form that ignores the
+//! * [`uncompress`](uncompress()) — the classic convenience form that ignores the
 //!   consumed-length report, mirroring C `uncompress` (`uncompr.c` L92-L101).
 //!
 //! # Relationship to the C original
@@ -19,7 +19,7 @@
 //! `sourceLen`-by-value shims `uncompress_z` / `uncompress`. In safe Rust a
 //! slice already carries its own length, so the `size_t`-vs-`uLong` distinction
 //! collapses: there is a single size-generic implementation ([`uncompress2`])
-//! and a single convenience wrapper ([`uncompress`]). The raw-pointer,
+//! and a single convenience wrapper ([`uncompress`](uncompress())). The raw-pointer,
 //! `z_size_t`/`uLong` FFI shims that reproduce the exact C ABI live in
 //! `src/ffi/util.rs` and are **not** part of this module.
 //!

@@ -308,13 +308,13 @@ impl Drop for GzState {
     ///
     /// The body is intentionally empty because release is fully handled by RAII:
     ///
-    /// * [`in_buf`](GzState::in_buf) / [`out_buf`](GzState::out_buf) (`Vec<u8>`)
+    /// * `in_buf` / `out_buf` (`Vec<u8>`)
     ///   free their backing storage — subsuming the C `free(state->in)` /
     ///   `free(state->out)`;
-    /// * [`strm`](GzState::strm) (`ZStream`) runs its own `Drop`, which performs
+    /// * `strm` (`ZStream`) runs its own `Drop`, which performs
     ///   the `inflateEnd`/`deflateEnd`-equivalent teardown of the engine state;
     ///   and
-    /// * [`file`](GzState::file) (`File`) closes the underlying descriptor —
+    /// * `file` (`File`) closes the underlying descriptor —
     ///   subsuming the C `close(fd)`.
     ///
     /// This explicit `Drop` therefore exists to *document* the RAII contract

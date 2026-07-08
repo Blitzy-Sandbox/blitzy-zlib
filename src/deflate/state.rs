@@ -729,7 +729,7 @@ impl DeflateState {
     /// Parameter validation mirrors zlib exactly and yields
     /// [`ZlibError::StreamError`] on any invalid combination:
     ///
-    /// * `mem_level` must be in `1..=`[`MAX_MEM_LEVEL`](crate::constants::MAX_MEM_LEVEL);
+    /// * `mem_level` must be in `1..=`[`MAX_MEM_LEVEL`];
     /// * `method` must equal [`Z_DEFLATED`];
     /// * `window_bits` must be in `8..=15` (and `8` requires `wrap == 1`);
     /// * `level` must be in `0..=9` after [`Z_DEFAULT_COMPRESSION`] is resolved
@@ -925,7 +925,7 @@ impl DeflateState {
     /// adler32(0, Z_NULL, 0)`.
     ///
     /// In C the `Z_NULL` sentinel makes `adler32(0, Z_NULL, 0)` return `1`.
-    /// This crate's slice-based [`adler32`](crate::checksum::adler32) has no
+    /// This crate's slice-based [`adler32`](crate::checksum::adler32()) has no
     /// null case, so the equivalent seed is obtained with `adler32(1, &[])`
     /// (which returns `1`); the gzip seed is `crc32(0, &[])` (which returns
     /// `0`). Both reproduce the C initial values exactly.
@@ -1007,7 +1007,7 @@ impl DeflateState {
     /// The caller-visible `total_in`/`total_out` are zeroed and `adler` is
     /// seeded with [`initial_adler`](Self::initial_adler). The tree-frequency
     /// initialization performed by C `_tr_init` is deferred to the `trees.rs`
-    /// driver (see [`reset_state`](Self::reset_state)).
+    /// driver (see `reset_state`).
     pub fn reset_keep(&mut self, io: &mut IoContext) {
         io.total_in = 0;
         io.total_out = 0;
@@ -1114,7 +1114,7 @@ impl DeflateState {
     /// with **two different destinations** without tripping the borrow checker:
     ///
     /// * window fills pass `dst = &mut self.window[..]` (see
-    ///   [`read_buf`](Self::read_buf) and [`fill_window`](Self::fill_window));
+    ///   `read_buf` and [`fill_window`](Self::fill_window));
     /// * the stored-block fast path (in `stored.rs`) passes
     ///   `dst = &mut io.output[..]` to copy input straight to output.
     ///

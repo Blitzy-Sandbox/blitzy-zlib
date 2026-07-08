@@ -126,10 +126,10 @@ type DeflateResult = Result<ReturnCode, ZlibError>;
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeflateConfig {
-    /// Compression level: `-1` ([`Z_DEFAULT_COMPRESSION`](crate::constants::Z_DEFAULT_COMPRESSION),
+    /// Compression level: `-1` ([`Z_DEFAULT_COMPRESSION`],
     /// resolved to `6`) or `0..=9`.
     pub level: i32,
-    /// Compression method — must be [`Z_DEFLATED`](crate::constants::Z_DEFLATED) (`8`).
+    /// Compression method — must be [`Z_DEFLATED`] (`8`).
     pub method: i32,
     /// The base-2 logarithm of the window size, overloaded to also select the
     /// wrapper: `8..=15` = zlib, `-8..=-15` = raw, `24..=31` = gzip.
@@ -168,7 +168,7 @@ impl DeflateConfig {
         self
     }
 
-    /// Sets the compression method (must be [`Z_DEFLATED`](crate::constants::Z_DEFLATED)).
+    /// Sets the compression method (must be [`Z_DEFLATED`]).
     #[must_use]
     pub fn method(mut self, method: i32) -> Self {
         self.method = method;
@@ -382,7 +382,7 @@ pub fn deflate_init<A: Allocator>(strm: &mut ZStream<A>, level: i32) -> DeflateR
 /// (`total_in`/`total_out = 0`, `adler` seeded) are delegated to
 /// [`DeflateState::reset_keep`]; because that method deliberately does **not**
 /// perform the tree-frequency initialization, this function invokes
-/// [`trees::_tr_init`] afterwards. Finally the caller-visible stream fields are
+/// `trees::_tr_init` afterwards. Finally the caller-visible stream fields are
 /// written back and the message is cleared.
 ///
 /// # Errors
@@ -1175,8 +1175,8 @@ fn deflate_run(s: &mut DeflateState, io: &mut IoContext, flush: i32) -> ReturnCo
 /// back to `strm` on every return path.
 ///
 /// `flush` is one of the raw flush constants
-/// [`Z_NO_FLUSH`](crate::constants::Z_NO_FLUSH) ..=
-/// [`Z_BLOCK`](crate::constants::Z_BLOCK); a value outside `0..=5` yields
+/// [`Z_NO_FLUSH`] ..=
+/// [`Z_BLOCK`]; a value outside `0..=5` yields
 /// [`ReturnCode::StreamError`].
 #[must_use]
 pub fn deflate<A: Allocator>(
@@ -1229,7 +1229,7 @@ pub fn deflate<A: Allocator>(
 /// Port of C `deflateParams` (`deflate.c` L774-L816). When the change would
 /// alter the active block producer and some data has already been processed
 /// (`last_flush != -2`), the pending block is first flushed via an internal
-/// [`deflate`] call with [`Z_BLOCK`](crate::constants::Z_BLOCK) — hence the
+/// [`deflate`] call with [`Z_BLOCK`] — hence the
 /// `input`/`output` buffers are required here too. If input remains, or the
 /// window still holds unflushed data after that flush, the switch cannot
 /// complete and [`ReturnCode::BufError`] is returned. Switching *away* from

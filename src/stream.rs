@@ -20,7 +20,7 @@
 //! * A manual `zcfree` that is forgotten (leak) or performed twice
 //!   (use-after-free / double-free).
 //!
-//! Here the engine state is owned through a [`StreamState`] enum that holds
+//! Here the engine state is owned through a `StreamState` enum that holds
 //! *at most one* boxed engine (`None`, `Deflate(Box<…>)`, or
 //! `Inflate(Box<…>)`), so "no state", "deflate state", and "inflate state" are
 //! distinct, checked cases (AAP §0.3.2 Type-State / Ownership). Because the box
@@ -36,11 +36,11 @@
 //! | `avail_in` / `avail_out`      | *not stored* — the length of those slices; reconstructed at the FFI boundary |
 //! | `total_in` / `total_out`      | [`total_in`](ZStream::total_in) / [`total_out`](ZStream::total_out) (`u64`) |
 //! | `msg`                         | [`msg`](ZStream::msg) (`Option<&'static str>`) |
-//! | `state`                       | [`state`](ZStream::state) ([`StreamState`], owned) |
-//! | `zalloc` / `zfree` / `opaque` | [`alloc`](ZStream::alloc) (`A: Allocator`) |
+//! | `state`                       | `state` (`StreamState`, owned) |
+//! | `zalloc` / `zfree` / `opaque` | `alloc` (`A: Allocator`) |
 //! | `data_type`                   | [`data_type`](ZStream::data_type) (`i32`) |
 //! | `adler`                       | [`adler`](ZStream::adler) (`u32`) |
-//! | `reserved`                    | [`reserved`](ZStream::reserved) (`u32`, parity only) |
+//! | `reserved`                    | `reserved` (`u32`, parity only) |
 //!
 //! The raw `next_in`/`avail_in`/`next_out`/`avail_out` cursor quadruple is
 //! **not** mirrored as fields: the idiomatic API accepts input and output as
@@ -75,7 +75,7 @@
 //! below). The raw-pointer work for a caller-`zalloc`'d region — invoking the C
 //! `zalloc`/`zfree` function pointers, materializing a slice over the returned
 //! memory, and freeing it on drop — is defined entirely in the sanctioned
-//! [`crate::ffi::alloc`] zone behind the safe [`ForeignBuffer`] trait (M6). The
+//! `crate::ffi::alloc` zone behind the safe [`ForeignBuffer`] trait (M6). The
 //! [`Foreign`](AllocBuffer::Foreign) arm holds a `Box<dyn ForeignBuffer<T>>` and
 //! delegates every access to that safe interface. Consequently the **core
 //! compression engine** (`src/deflate/**`) also contains **zero `unsafe`** (user
@@ -222,7 +222,7 @@ impl AllocHook {
 /// buffer **without any `unsafe`**.
 ///
 /// The sole implementor is `CForeignBuffer` in the sanctioned
-/// [`crate::ffi::alloc`] zone, which confines the raw-pointer hook invocation,
+/// `crate::ffi::alloc` zone, which confines the raw-pointer hook invocation,
 /// the slice materialization, and the `zfree`-on-drop (migration
 /// unsafe-isolation rule / AAP §0.6.2). [`AllocBuffer::Foreign`] holds one as a
 /// `Box<dyn ForeignBuffer<T>>` and delegates [`Deref`]/[`DerefMut`]/[`Clone`] to
@@ -260,7 +260,7 @@ pub trait ForeignBuffer<T: Copy + Default> {
 ///
 /// [`AllocBuffer::try_zeroed`] returns a [`Foreign`](Self::Foreign) region only
 /// when the [`AllocHook`] is [active](AllocHook::is_active) and the element count
-/// is non-zero; that region is produced by the sanctioned [`crate::ffi::alloc`]
+/// is non-zero; that region is produced by the sanctioned `crate::ffi::alloc`
 /// zone. With no hook (or an empty request) it is an [`Owned`](Self::Owned)
 /// [`Vec`], byte-for-byte reproducing the historical global-allocator behavior.
 ///
@@ -273,7 +273,7 @@ pub trait ForeignBuffer<T: Copy + Default> {
 ///
 /// # Zeroing and `unsafe` isolation
 ///
-/// A foreign region is zero-filled inside [`crate::ffi::alloc`], reproducing C
+/// A foreign region is zero-filled inside `crate::ffi::alloc`, reproducing C
 /// `zcalloc`'s post-`zalloc` `zmemzero`. `T` is bounded `Copy + Default`, and the
 /// element types the engines request (`u8`, `u16`, `u32`) all have an all-zero
 /// bit pattern equal to their [`Default`] value, so the zero-fill is a correct
@@ -285,7 +285,7 @@ pub enum AllocBuffer<T: Copy + Default> {
     Owned(Vec<T>),
     /// Caller-`zalloc`'d storage, accessed through the safe [`ForeignBuffer`]
     /// interface and released through the caller's `zfree` when the box drops.
-    /// The concrete implementor lives in the sanctioned [`crate::ffi::alloc`]
+    /// The concrete implementor lives in the sanctioned `crate::ffi::alloc`
     /// zone, so this module never touches the raw pointer.
     Foreign(Box<dyn ForeignBuffer<T>>),
 }
@@ -300,7 +300,7 @@ impl<T: Copy + Default> AllocBuffer<T> {
     /// propagate that as `Z_MEM_ERROR` (M7). The null-hook and empty-count paths
     /// always succeed via the global allocator, byte-for-byte reproducing the
     /// historical behavior. All raw-pointer work for the active-hook path is
-    /// confined to the sanctioned [`crate::ffi::alloc`] zone (M6), so this method
+    /// confined to the sanctioned `crate::ffi::alloc` zone (M6), so this method
     /// contains no `unsafe`.
     #[must_use]
     pub fn try_zeroed(count: usize, hook: AllocHook) -> Option<Self>
@@ -608,7 +608,7 @@ impl fmt::Debug for StreamState {
 /// The idiomatic streaming state, mirroring the C `z_stream`
 /// (`zlib.h` L88-L110).
 ///
-/// `ZStream` owns its engine state ([`StreamState`]) and its allocator (`A`),
+/// `ZStream` owns its engine state (`StreamState`) and its allocator (`A`),
 /// so dropping a `ZStream` releases everything: the boxed engine and all of the
 /// working buffers it owns. This is the direct replacement for C's
 /// `internal_state *` plus the `zcalloc`/`zcfree`/`deflateEnd`/`inflateEnd`
@@ -708,7 +708,7 @@ impl ZStream<DefaultAllocator> {
     ///
     /// All counters start at `0`, [`data_type`](ZStream::data_type) at
     /// `Z_BINARY`, [`adler`](ZStream::adler) at the Adler-32 seed
-    /// ([`ADLER32_INIT`]), and [`msg`](ZStream::msg) at [`None`]. This is the
+    /// (`ADLER32_INIT`), and [`msg`](ZStream::msg) at [`None`]. This is the
     /// idiomatic counterpart to a zeroed C `z_stream` prior to
     /// `deflateInit`/`inflateInit`.
     #[must_use]
@@ -932,7 +932,7 @@ impl<A: Allocator> ZStream<A> {
 impl<A: Allocator> fmt::Debug for ZStream<A> {
     /// Hand-written because neither the engine state nor an arbitrary allocator
     /// `A` is required to implement [`Debug`]: the state is rendered as its
-    /// variant name (see [`StreamState`]'s `Debug`) and the allocator as its
+    /// variant name (see `StreamState`'s `Debug`) and the allocator as its
     /// type name.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ZStream")

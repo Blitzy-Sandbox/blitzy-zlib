@@ -13,7 +13,7 @@
 //! The compression engine (`src/deflate/**`) contains **zero** `unsafe`. All
 //! raw-pointer handling lives here: every `unsafe` block carries a `// SAFETY:`
 //! justification, and every fallible body is wrapped in
-//! [`crate::ffi::types::guard_int`] / [`crate::ffi::types::guard_ulong`]
+//! `crate::ffi::types::guard_int` / `crate::ffi::types::guard_ulong`
 //! (`catch_unwind`) so that a Rust panic can never unwind across the C ABI.
 //!
 //! ## State-handle model
@@ -811,7 +811,7 @@ pub unsafe extern "C" fn deflateGetDictionary(
 /// Supplies the gzip header for a gzip-wrapped stream. Returns `Z_STREAM_ERROR`
 /// unless the stream is in gzip mode (`wrap == 2`), mirroring C. C stores the
 /// caller's pointer; this shim deep-copies the header fields into an owned
-/// [`GzHeader`], so no dangling pointer can be read during later `deflate`
+/// [`GzHeader`](crate::gz_header::GzHeader), so no dangling pointer can be read during later `deflate`
 /// calls. A `NULL` header clears any previously set header (restoring the
 /// default), exactly as passing `Z_NULL` does in C.
 ///

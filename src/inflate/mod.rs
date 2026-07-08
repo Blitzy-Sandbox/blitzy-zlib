@@ -556,7 +556,7 @@ pub fn inflate_reset2<A: Allocator>(strm: &mut ZStream<A>, window_bits: i32) -> 
 /// window is needed, so a null/failing `zalloc` fails the init with
 /// `Z_MEM_ERROR`. The idiomatic state here lives in a Rust [`Box`], but to
 /// preserve that observable contract this path *also* reserves the equivalent
-/// footprint through the caller's [`AllocHook`] (parked in
+/// footprint through the caller's [`AllocHook`](crate::stream::AllocHook) (parked in
 /// [`InflateState::state_alloc`]) whenever a hook is active. A hook whose
 /// `zalloc` reports out-of-memory therefore surfaces [`ZlibError::MemError`]
 /// here — matching C's allocation count (one at init for a single-shot inflate)
@@ -2087,7 +2087,7 @@ fn clone_inflate_state(s: &InflateState) -> Box<InflateState> {
 ///
 /// Unlike C — which must re-base the `lencode`/`distcode`/`next` pointers into
 /// the copied `codes` array — no fix-up is required here: those are `usize`
-/// offsets, so [`clone_inflate_state`] produces a correct clone directly.
+/// offsets, so `clone_inflate_state` produces a correct clone directly.
 ///
 /// # Errors
 /// Returns [`ZlibError::StreamError`] if `source` has no inflate state.

@@ -734,7 +734,7 @@ pub fn gzfread(state: &mut GzState, buf: &mut [u8], size: usize, nitems: usize) 
 /// the Rust port of C `gzgetc` (`gzread.c` L473-498).
 ///
 /// A byte already in the output buffer is returned directly on the fast path;
-/// otherwise [`gz_read`] is used to obtain one.
+/// otherwise `gz_read` is used to obtain one.
 pub fn gzgetc(state: &mut GzState) -> i32 {
     // The handle must be open for reading (C L480-481).
     if state.mode != GzMode::Read {
@@ -937,7 +937,7 @@ pub fn gzgets(state: &mut GzState, buf: &mut [u8]) -> Option<usize> {
 /// This is the first-class Rust API that sits alongside the C-compatible
 /// [`gzread`] family: it lets a [`GzState`] opened for reading be used with the
 /// standard [`Read`] combinators (`read_to_end`, `read_exact`, `io::copy`, …).
-/// Internally it delegates to [`gz_read`] and translates a recorded
+/// Internally it delegates to `gz_read` and translates a recorded
 /// [`ReturnCode`] error into an [`io::Error`]. End of file is reported as
 /// `Ok(0)`, matching the [`Read`] contract.
 impl Read for GzState {

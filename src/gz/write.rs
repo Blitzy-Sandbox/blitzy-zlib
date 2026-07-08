@@ -566,7 +566,7 @@ pub fn gzfwrite(state: &mut GzState, buf: &[u8], size: usize, nitems: usize) -> 
 ///
 /// Returns the byte written (`c & 0xff`) on success, or `-1` on error. The fast
 /// path appends straight into the input buffer when there is room, avoiding a
-/// call into [`gz_write`].
+/// call into `gz_write`.
 pub fn gzputc(state: &mut GzState, c: i32) -> i32 {
     // Check that we're writing and that there's no serious error (C L318-L321).
     if !write_ready(state) {
@@ -800,10 +800,10 @@ pub(crate) fn finish_write(state: &mut GzState) -> ReturnCode {
 /// callers can use `write!`, `writeln!`, and [`Write::write_all`] alongside the
 /// C-compatible `gz*` functions.
 ///
-/// [`Write::write`] delegates to [`gz_write`]; [`Write::flush`] delegates to
-/// [`gz_comp`] with [`FlushMode::SyncFlush`], which flushes all pending output
+/// [`Write::write`] delegates to `gz_write`; [`Write::flush`] delegates to
+/// `gz_comp` with [`FlushMode::SyncFlush`], which flushes all pending output
 /// to the underlying file and aligns to a byte boundary **without** ending the
-/// gzip member (finishing is reserved for `gzclose_w`/[`finish_write`]).
+/// gzip member (finishing is reserved for `gzclose_w`/`finish_write`).
 /// [`ZlibError`] is mapped to an [`io::Error`].
 impl Write for GzState {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {

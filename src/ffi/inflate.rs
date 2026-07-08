@@ -2,7 +2,7 @@
 //! and the raw-callback **`inflateBack`** API.
 //!
 //! This module is one half of the crate's FFI drop-in boundary (the other being
-//! [`crate::ffi::deflate`]). Each exported function reproduces the exact zlib C
+//! [`crate::ffi::deflate`](mod@crate::ffi::deflate)). Each exported function reproduces the exact zlib C
 //! signature (verified against `zlib.h` / `zlib.map` of `1.3.2.1-motley`), so a
 //! C consumer can link against the emitted `cdylib`/`staticlib` and call these
 //! symbols with no source changes.
@@ -23,7 +23,7 @@
 //!
 //! # State-handle model
 //!
-//! * Regular inflate path: the boxed [`InflateHandle`] (an idiomatic
+//! * Regular inflate path: the boxed `InflateHandle` (an idiomatic
 //!   [`ZStream`] plus a raw pointer to the caller's registered `gz_header`) is
 //!   stored in `z_stream.state`; [`inflateEnd`] reclaims and drops it (RAII
 //!   replaces the manual `inflateEnd` free).
@@ -33,7 +33,7 @@
 //! # `inflateBack` callback bridge
 //!
 //! zlib's `inflateBack` pulls input and pushes output through the C callbacks
-//! `in_func`/`out_func`. Those are wrapped into [`CInFunc`]/[`COutFunc`] which
+//! `in_func`/`out_func`. Those are wrapped into `CInFunc`/`COutFunc` which
 //! implement the engine's [`InFunc`]/[`OutFunc`] traits, so the safe engine
 //! drives decompression while the raw pointer dereferences stay isolated here.
 
@@ -684,7 +684,7 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
 // ===========================================================================
 
 /// C `inflateEnd` — free all state associated with the stream. The boxed
-/// [`InflateHandle`] is reclaimed and dropped, whose `Drop` frees the window and
+/// `InflateHandle` is reclaimed and dropped, whose `Drop` frees the window and
 /// tables (RAII replaces zlib's manual cleanup).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn inflateEnd(strm: z_streamp) -> c_int {
@@ -1241,7 +1241,7 @@ pub unsafe extern "C" fn inflateGetHeader(strm: z_streamp, head: gz_headerp) -> 
 /// `in` callback and pushing output via the `out` callback, using the window
 /// allocated by [`inflateBackInit_`].
 ///
-/// The C callbacks are wrapped into [`CInFunc`]/[`COutFunc`] and handed to the
+/// The C callbacks are wrapped into `CInFunc`/`COutFunc` and handed to the
 /// safe engine. Any already-buffered input in the stream (`next_in`/`avail_in`)
 /// is presented to the engine first, then the `in` callback is invoked for more.
 ///

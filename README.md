@@ -30,10 +30,12 @@ and consumed without the manual memory management of the original C code.
 - **Memory safety by construction.** Manual `zcalloc`/`zcfree` allocation is
   replaced by Rust ownership, borrowing, and `Drop`-based cleanup. The
   compression core (`src/deflate/`) contains **zero `unsafe`**.
-- **`unsafe` isolated to the boundary.** What little `unsafe` exists is confined
-  to the FFI layer (`src/ffi/`) and — at most — the inflate fast-path decode
-  loop (`src/inflate/fast.rs`), and every occurrence carries a `// SAFETY:`
-  justification.
+- **`unsafe` isolated to the boundary.** In the default `std` build, all
+  `unsafe` is confined to the FFI layer (`src/ffi/`). A `no_std` build adds one
+  more location — a small libc-backed `#[global_allocator]` and
+  `#[panic_handler]` in `src/lib.rs`. The compression core (`src/deflate/`) and
+  the inflate fast path (`src/inflate/fast.rs`) contain no `unsafe` at all, and
+  every occurrence carries a `// SAFETY:` justification.
 - **Zero C dependency in the shipped artifact.** The library links no C code:
   its only runtime dependencies (`crc32fast`, `cfg-if`) are pure Rust, so there
   is no C toolchain in the build.
@@ -145,7 +147,8 @@ cleanup is automatic via `Drop` (no explicit `deflateEnd` required, though it is
 available for parity).
 
 ```rust,ignore
-use zlib_rs::{ZStream, DeflateConfig, FlushMode, deflate, deflate_end};
+use zlib_rs::{ZStream, FlushMode};
+use zlib_rs::deflate::{DeflateConfig, deflate, deflate_end};
 
 // Configure: level 6, default method / window / memory / strategy.
 let mut strm = ZStream::new();
@@ -154,13 +157,14 @@ DeflateConfig::new()
     .init(&mut strm)
     .expect("deflateInit failed");
 
-// Attach input/output buffers to `strm`, then pump until `FlushMode::Finish`
-// reports the stream is complete:
+// `ZStream` carries no cursor fields, so each `deflate` call is handed the
+// input and output slices plus a raw flush code; drive it in a loop until the
+// returned `DeflateOutcome` reports `ReturnCode::StreamEnd`:
 //
 //     loop {
-//         let outcome = deflate(&mut strm, FlushMode::Finish)?;
-//         // drain produced output, refill input …
-//         if outcome.stream_end() { break; }
+//         let outcome = deflate(&mut strm, input, output, FlushMode::Finish.as_c_int());
+//         // advance the buffers by `outcome.consumed` / `outcome.produced` …
+//         if outcome.code == ReturnCode::StreamEnd { break; }
 //     }
 
 deflate_end(&mut strm).ok();
@@ -205,9 +209,9 @@ default `gz-io` feature.
 use zlib_rs::gz::{gzopen, gzwrite, gzclose};
 
 // Write a gzip-compressed file, then close to flush the trailer.
-let file = gzopen("hello.txt.gz", "wb").expect("gzopen failed");
-gzwrite(file, b"hello, gzip\n").expect("gzwrite failed");
-gzclose(file).expect("gzclose failed");
+let mut file = gzopen("hello.txt.gz", "wb").expect("gzopen failed");
+let _ = gzwrite(&mut file, b"hello, gzip\n");
+let _ = gzclose(file);
 ```
 
 ## Usage — C drop-in (FFI)
@@ -333,8 +337,8 @@ src/
 ├── checksum/         adler32, crc32 (SIMD hot path), combine ops
 ├── gz/               gzip file I/O: mod, state, open, read, write, close
 ├── util/             one-call wrappers, version reporting
-└── ffi/              extern "C" drop-in boundary: mod, types, deflate,
-                      inflate, gz, util
+└── ffi/              extern "C" drop-in boundary: mod, types, alloc,
+                      deflate, inflate, gz, util
 ```
 
 ## Compatibility and RFCs

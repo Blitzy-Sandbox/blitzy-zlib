@@ -413,7 +413,7 @@ fn gz_open(path: &Path, file: Option<File>, mode: &str) -> Result<Box<GzState>, 
 /// Opens the gzip (or transparent) file at `path` with the given mode string —
 /// the idiomatic port of C `gzopen` (`gzlib.c` L290-292).
 ///
-/// `mode` follows the zlib grammar accepted by [`parse_mode`], e.g. `"rb"` to
+/// `mode` follows the zlib grammar accepted by `parse_mode`, e.g. `"rb"` to
 /// read, `"wb9"` to write at maximum compression, `"ab"` to append, with
 /// optional strategy (`f`/`h`/`R`/`F`) and transparency (`T`/`G`) flags.
 ///
@@ -490,12 +490,12 @@ fn fd_path(_file: &File) -> String {
 ///
 /// Must be called after opening but **before** any read or write (i.e. before
 /// the buffers are lazily allocated); the requested `size` becomes the base
-/// buffer size [`want`](GzState::want) (the doubled buffer used on the read/write
+/// buffer size `want` (the doubled buffer used on the read/write
 /// hot paths is `size << 1`).
 ///
 /// Returns `0` on success and `-1` on failure, exactly matching the C contract.
 /// Failure occurs when the file is not a live reader/writer, when the buffers
-/// have already been allocated ([`size`](GzState::size) `!= 0`), or when `size`
+/// have already been allocated (`size` `!= 0`), or when `size`
 /// is so large it cannot be doubled without overflow. A `size` below `8` is
 /// raised to `8` (the minimum the algorithms require) rather than rejected.
 #[must_use]
@@ -536,8 +536,8 @@ pub fn gzbuffer(state: &mut GzState, mut size: u32) -> i32 {
 ///
 /// Although the C body lives in `gzwrite.c`, this configuration entry point is
 /// hosted in `open.rs` per the AAP's function-family reorganisation. It drives
-/// the write path's [`gz_comp`](crate::gz::write::gz_comp) /
-/// [`gz_zero`](crate::gz::write::gz_zero) helpers together with the engine's
+/// the write path's `gz_comp` /
+/// `gz_zero` helpers together with the engine's
 /// [`deflate_params`](crate::deflate::deflate_params).
 ///
 /// Returns `0` (`Z_OK`) on success, or a negative C return code on failure
@@ -550,7 +550,7 @@ pub fn gzbuffer(state: &mut GzState, mut size: u32) -> i32 {
 ///
 /// The reference C `gzsetparams` lets `deflateParams`' internal `Z_BLOCK` flush
 /// emit into the persistent output buffer, to be written by the *next*
-/// `gz_comp`. This port's [`gz_comp`](crate::gz::write::gz_comp) fully drains
+/// `gz_comp`. This port's `gz_comp` fully drains
 /// its output on every call and keeps no persistent output cursor, so — when the
 /// buffers are live — this function performs the block flush itself (via
 /// `gz_comp(Z_BLOCK)`) and drains it to the file *before* calling
@@ -634,7 +634,7 @@ const SEEK_CUR: i32 = 1;
 ///
 /// Only valid on a reader with no serious error. Seeks the underlying file back
 /// to the position captured when the file was opened
-/// ([`start`](GzState::start)) and resets the runtime state via [`gz_reset`], so
+/// (`start`) and resets the runtime state via `gz_reset`, so
 /// the next read restarts from the beginning of the gzip data.
 ///
 /// Returns `0` on success and `-1` on failure (wrong mode, a serious error, or a
@@ -909,7 +909,7 @@ pub fn gzeof(state: &GzState) -> i32 {
 ///
 /// Although the C body lives in `gzread.c`, this query is hosted in `open.rs`
 /// per the AAP's function-family reorganisation; it drives the read path's
-/// [`gz_look`](crate::gz::read::gz_look) look-ahead. If the transparency is not
+/// `gz_look` look-ahead. If the transparency is not
 /// yet known but can be determined — chiefly right after a
 /// [`gzopen`]/[`gzdopen`] on a reader — the look-ahead is run to resolve it.
 ///
@@ -968,7 +968,7 @@ pub fn gzerror<'a>(state: &'a GzState, errnum: Option<&mut i32>) -> &'a str {
 /// Clears the error and end-of-file state of the file — the port of C
 /// `gzclearerr` (`gzlib.c` L531-547).
 ///
-/// On a reader this also clears the [`eof`](GzState::eof)/[`past`](GzState::past)
+/// On a reader this also clears the `eof`/`past`
 /// flags so subsequent reads can proceed past a previously observed EOF; the
 /// stored error code and message are reset to the no-error state on both reader
 /// and writer.

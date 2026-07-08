@@ -15,7 +15,7 @@
 //! * `#[unsafe(no_mangle)] extern "C"` **shims** — one per public `zlib.h`
 //!   prototype — that validate raw C inputs, bridge to the safe engines, and
 //!   re-materialize zlib's integer return codes at the boundary. They are defined
-//!   in the submodules [`util`], [`deflate`], [`inflate`], and [`gz`].
+//!   in the submodules [`util`], [`deflate`](mod@deflate), [`inflate`](mod@inflate), and [`gz`].
 //! * `#[repr(C)]` **struct mirrors** ([`z_stream`], [`gz_header`], [`gzFile_s`])
 //!   whose field order and widths match `zlib.h` exactly, the C scalar aliases
 //!   ([`Bytef`], [`uInt`], [`uLong`], …), the C function-pointer typedefs
@@ -52,8 +52,8 @@
 //! |-------------|---------------------------------------------------------------|------------------------------------------------------------|
 //! | [`types`]   | `zlib.h`, `zconf.h`                                            | `#[repr(C)]` ABI mirrors, scalar aliases, allocator bridge |
 //! | [`util`]    | `compress.c`, `uncompr.c`, `adler32.c`, `crc32.c`, `zutil.c`   | one-call, checksum, and version/error shims                |
-//! | [`deflate`] | `deflate.c`, `zlib.h`                                          | `deflate*` compression shims                               |
-//! | [`inflate`] | `inflate.c`, `infback.c`, `zlib.h`                             | `inflate*` / `inflateBack*` decompression shims            |
+//! | [`deflate`](mod@deflate) | `deflate.c`, `zlib.h`                                          | `deflate*` compression shims                               |
+//! | [`inflate`](mod@inflate) | `inflate.c`, `infback.c`, `zlib.h`                             | `inflate*` / `inflateBack*` decompression shims            |
 //! | [`gz`]      | `gzlib.c`, `gzread.c`, `gzwrite.c`, `gzclose.c`, `gzguts.h`    | `gz*` file-I/O shims (Cargo feature `gz-io`)               |
 //!
 //! ## Feature gating
@@ -68,7 +68,7 @@
 //! `pub mod gz;` declaration below is kept consistent to avoid a module/`cfg`
 //! mismatch. A build **without** `gz-io` still links the complete set of core
 //! (`deflate`/`inflate`/`checksum`/one-call/version) symbols: [`types`],
-//! [`util`], [`deflate`], and [`inflate`] are always compiled so the core zlib
+//! [`util`], [`deflate`](mod@deflate), and [`inflate`](mod@inflate) are always compiled so the core zlib
 //! symbol table is always present for linkage.
 //!
 //! Within the `gz-io` layer, `gzprintf`/`gzvprintf` are always exported as

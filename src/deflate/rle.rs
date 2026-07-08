@@ -35,9 +35,9 @@
 //!
 //! Function and variable names track the C originals (converted to
 //! `snake_case`) so the port can be audited against `deflate.c` line-by-line.
-//! The two [`FLUSH_BLOCK`](flush_block) macros (`deflate.c` L1637-L1649) are
-//! reproduced by the private [`flush_block`] helper, and the run-scan bound
-//! (`deflate.c` L2103-L2120) is reproduced by [`rle_match_length`] with its
+//! The two `FLUSH_BLOCK` macros (`deflate.c` L1637-L1649) are
+//! reproduced by the private `flush_block` helper, and the run-scan bound
+//! (`deflate.c` L2103-L2120) is reproduced by `rle_match_length` with its
 //! off-by-one carefully preserved (see that function's documentation).
 
 use crate::constants::{Z_FINISH, Z_NO_FLUSH};
@@ -187,8 +187,8 @@ fn rle_match_length(window: &[u8], strstart: usize, lookahead: usize) -> usize {
 ///   input is pulled into the window via [`DeflateState::fill_window`] and
 ///   compressed output is drained via [`DeflateState::flush_pending`].
 /// * `flush` — the active flush mode (a `Z_*` code such as
-///   [`Z_NO_FLUSH`](crate::constants::Z_NO_FLUSH) or
-///   [`Z_FINISH`](crate::constants::Z_FINISH)); it controls whether the routine
+///   [`Z_NO_FLUSH`] or
+///   [`Z_FINISH`]); it controls whether the routine
 ///   may pause for more input and whether the final block is emitted.
 ///
 /// # Returns

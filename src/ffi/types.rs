@@ -19,11 +19,11 @@
 //!   `cdylib`/`staticlib` is byte-layout-compatible with `libz`.
 //! * **The caller-allocator bridge** [`CAllocator`], which lets a C caller's
 //!   `zalloc`/`zfree`/`opaque` triple ride inside the crate's own
-//!   [`Allocator`](crate::stream::Allocator) abstraction.
+//!   [`Allocator`] abstraction.
 //! * **Raw ↔ idiomatic conversion helpers** that the deflate/inflate/util shims
 //!   use to move between the raw [`z_stream`]/[`gz_header`] and the idiomatic
-//!   [`ZStream`](crate::stream::ZStream)/[`GzHeader`](crate::gz_header::GzHeader).
-//! * **Panic guards** ([`guard_int`], …) so a shim body can never unwind across
+//!   [`ZStream`]/[`GzHeader`].
+//! * **Panic guards** (`guard_int`, …) so a shim body can never unwind across
 //!   the C boundary.
 //!
 //! # Unsafe boundary
@@ -168,7 +168,7 @@ pub type out_func =
 /// LAYOUT: the field order and widths below are **byte-identical** to `zlib.h`
 /// and MUST NOT be reordered — the emitted `cdylib`/`staticlib` presents this
 /// exact layout to C consumers. A compile-time guard (below) and unit tests
-/// assert the offsets. The idiomatic [`ZStream`](crate::stream::ZStream) is a
+/// assert the offsets. The idiomatic [`ZStream`] is a
 /// separate, non-`repr(C)` type; all conversion between the two lives in this
 /// module.
 ///
@@ -224,7 +224,7 @@ pub type z_streamp = *mut z_stream;
 /// header exchanged with `deflateSetHeader`/`inflateGetHeader`.
 ///
 /// LAYOUT: field order/widths are byte-identical to `zlib.h`. The idiomatic,
-/// owned [`GzHeader`](crate::gz_header::GzHeader) is the safe counterpart;
+/// owned [`GzHeader`] is the safe counterpart;
 /// [`gz_header_to_idiomatic`] and [`write_gz_header_from_idiomatic`] convert
 /// between the two.
 #[repr(C)]
@@ -304,7 +304,7 @@ pub type gzFile = *mut gzFile_s;
 // ===========================================================================
 
 /// Bridges a C caller's `zalloc`/`zfree`/`opaque` triple into the crate's
-/// [`Allocator`](crate::stream::Allocator) abstraction (AAP §0.6.3).
+/// [`Allocator`] abstraction (AAP §0.6.3).
 ///
 /// The FFI layer always instantiates its streams as
 /// [`ZStream<CAllocator>`](crate::stream::ZStream), giving the deflate/inflate
@@ -313,8 +313,8 @@ pub type gzFile = *mut gzFile_s;
 ///
 /// # Hook routing (AAP §0.6.3 "has-hook clause")
 ///
-/// The crate's [`Allocator`](crate::stream::Allocator) trait returns an
-/// [`AllocBuffer`](crate::stream::AllocBuffer) — a smart owned region that is
+/// The crate's [`Allocator`] trait returns an
+/// [`AllocBuffer`] — a smart owned region that is
 /// **either** a global-allocator [`Vec`] **or** a foreign region carved from a
 /// caller's `zalloc` and released through their `zfree` on [`Drop`]. This
 /// resolves the historical limitation (a `Vec` cannot be soundly reclaimed
@@ -324,7 +324,7 @@ pub type gzFile = *mut gzFile_s;
 /// global allocator.
 ///
 /// [`CAllocator`] therefore forwards its captured triple as an
-/// [`AllocHook`](crate::stream::AllocHook) via [`Allocator::hook`], and its
+/// [`AllocHook`] via [`Allocator::hook`], and its
 /// [`allocate_zeroed`](Allocator::allocate_zeroed) routes every working buffer
 /// (window, `pending_buf`, hash tables) through the caller's `zalloc` when
 /// **both** `zalloc` and `zfree` are supplied. When they are null (or `zalloc`
@@ -519,7 +519,7 @@ pub unsafe fn state_take<T>(strm: &mut z_stream) -> Option<Box<T>> {
 /// engine handle installed in [`z_stream::state`].
 ///
 /// Stored as a plain `u64` (via `#[repr(transparent)]`) so the tag can be read
-/// through [`HandleHeader`] with no enum-validity concern: every bit pattern is
+/// through `HandleHeader` with no enum-validity concern: every bit pattern is
 /// a valid `u64`, and only the published magics compare equal. The values have
 /// their high bits set so they can never collide with the small integer that
 /// leads a bare engine state, providing defense-in-depth even though every FFI
@@ -837,7 +837,7 @@ unsafe fn write_cstr_bounded(dst: *mut c_uchar, src: &[u8], cap: usize) {
 }
 
 /// Converts a raw [`gz_header`] (as passed to `deflateSetHeader`) into the
-/// idiomatic [`GzHeader`](crate::gz_header::GzHeader), or [`None`] when `head`
+/// idiomatic [`GzHeader`], or [`None`] when `head`
 /// is null.
 ///
 /// The [`extra`](gz_header::extra) field is copied using its
@@ -898,7 +898,7 @@ pub unsafe fn gz_header_to_idiomatic(head: *const gz_header) -> Option<GzHeader>
     })
 }
 
-/// Writes an idiomatic [`GzHeader`](crate::gz_header::GzHeader) back into a
+/// Writes an idiomatic [`GzHeader`] back into a
 /// caller-provided raw [`gz_header`] (as used by `inflateGetHeader`), honoring
 /// the caller's `extra_max`/`name_max`/`comm_max` capacities and never
 /// overrunning the caller's buffers.

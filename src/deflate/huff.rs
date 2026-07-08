@@ -18,7 +18,7 @@
 //!
 //! The emitted token stream is identical to reference zlib for the same input:
 //! the engine tallies exactly one literal per input byte, in order, and defers
-//! every block-type and Huffman decision to [`trees::_tr_flush_block`], which is
+//! every block-type and Huffman decision to `trees::_tr_flush_block`, which is
 //! itself a faithful port. See AAP §0.6.4 (bit-exact wire-format).
 //!
 //! # `FLUSH_BLOCK` / `FLUSH_BLOCK_ONLY`
@@ -26,8 +26,8 @@
 //! The C macros `FLUSH_BLOCK_ONLY` and `FLUSH_BLOCK` (`deflate.c` L1630-L1645)
 //! fuse "emit the current block" with an *early return* when the caller's output
 //! buffer fills. Rust has no early-returning macro that reads naturally here, so
-//! the two macros are reproduced as the free functions [`flush_block_only`] and
-//! [`flush_block`]. [`flush_block`] returns `Option<BlockState>`: `Some(state)`
+//! the two macros are reproduced as the free functions `flush_block_only` and
+//! `flush_block`. `flush_block` returns `Option<BlockState>`: `Some(state)`
 //! means "the output buffer is full — return `state` to the driver
 //! immediately", and `None` means "there is room; continue". Each call site uses
 //! the `if let Some(rc) = flush_block(..) { return rc; }` idiom, which is the
@@ -118,8 +118,8 @@ fn flush_block(s: &mut DeflateState, io: &mut IoContext, last: bool) -> Option<B
 /// Faithful port of the C `deflate_huff` (`deflate.c` L2155-L2185). It repeatedly
 /// ensures a literal is available (refilling the window from `io` via
 /// [`DeflateState::fill_window`] when the lookahead is exhausted) and tallies
-/// that literal into the symbol buffer with [`trees::_tr_tally_lit`]. Whenever
-/// the symbol buffer fills, the current block is flushed. On [`Z_FINISH`] the
+/// that literal into the symbol buffer with `trees::_tr_tally_lit`. Whenever
+/// the symbol buffer fills, the current block is flushed. On `Z_FINISH` the
 /// final block is emitted and the stream is completed.
 ///
 /// # Parameters
@@ -128,8 +128,8 @@ fn flush_block(s: &mut DeflateState, io: &mut IoContext, last: bool) -> Option<B
 ///   `sym_next`, and tree-frequency counters are advanced in place.
 /// * `io` — the I/O context supplying input (for [`DeflateState::fill_window`])
 ///   and receiving compressed output (for [`DeflateState::flush_pending`]).
-/// * `flush` — the flush mode requested by the caller. Only [`Z_NO_FLUSH`] and
-///   [`Z_FINISH`] alter the control flow here; every other mode behaves like a
+/// * `flush` — the flush mode requested by the caller. Only `Z_NO_FLUSH` and
+///   `Z_FINISH` alter the control flow here; every other mode behaves like a
 ///   block-completing flush and yields [`BlockState::BlockDone`].
 ///
 /// # Returns

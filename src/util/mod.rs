@@ -10,9 +10,9 @@
 //! The concrete logic lives in three sibling submodules, all re-exported here:
 //!
 //! - One-call, whole-buffer compression wrappers ported from C `compress.c`
-//!   (`compress`, `compress2`, `compress_bound`), in [`compress`].
+//!   (`compress`, `compress2`, `compress_bound`), in [`compress`](mod@compress).
 //! - One-call, whole-buffer decompression wrappers ported from C `uncompr.c`
-//!   (`uncompress`, `uncompress2`), in [`uncompress`].
+//!   (`uncompress`, `uncompress2`), in [`uncompress`](mod@uncompress).
 //! - Version, compile-flag, and error-string reporting ported from C
 //!   `zutil.c` (`zlib_version`, `zlib_compile_flags`, `z_error`), in
 //!   [`version`].

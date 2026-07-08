@@ -26,7 +26,7 @@
 //! `unsafe`. All raw-pointer handling lives here: every `unsafe` block carries
 //! a `// SAFETY:` justification, and every body that dereferences caller
 //! pointers or drives the engines is wrapped in
-//! [`crate::ffi::types::guard_int`] / [`crate::ffi::types::guard_ulong`]
+//! `crate::ffi::types::guard_int` / `crate::ffi::types::guard_ulong`
 //! (`catch_unwind`) so a Rust panic can never unwind across the C ABI. The
 //! remaining shims are pure arithmetic or return `'static` pointers and are
 //! provably panic-free, so they run without a guard.

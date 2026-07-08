@@ -3,10 +3,10 @@
 //!
 //! This module provides the three "one-shot" entry points that compress a
 //! complete source buffer into a caller-provided destination buffer in a single
-//! call, without the caller having to drive the streaming [`deflate`] engine
+//! call, without the caller having to drive the streaming [`crate::deflate`] engine
 //! directly:
 //!
-//! * [`compress`] — compress at the library default level.
+//! * [`compress`](compress()) — compress at the library default level.
 //! * [`compress2`] — compress at a caller-chosen level.
 //! * [`compress_bound`] (and its C-named alias [`compressBound`]) — compute the
 //!   worst-case compressed size so callers can size the destination buffer.
@@ -25,8 +25,8 @@
 //!
 //! The compression loop in [`compress2`] is a faithful transcription of C
 //! `compress2_z` (`compress.c` L24-L66): input and output are offered to the
-//! engine in `u32::MAX`-sized chunks, [`FlushMode::NoFlush`] is used while input
-//! remains and [`FlushMode::Finish`] once every byte has been handed over, and
+//! engine in `u32::MAX`-sized chunks, [`crate::constants::FlushMode::NoFlush`] is used while input
+//! remains and [`crate::constants::FlushMode::Finish`] once every byte has been handed over, and
 //! the terminal `Z_STREAM_END` is remapped to success. Preserving this exact
 //! multi-call `deflate` sequence is what keeps the emitted stream byte-identical
 //! to reference zlib. [`compress_bound`] reproduces the sizing formula bit-for-
@@ -37,7 +37,7 @@
 //!
 //! There is **zero `unsafe`** in this module and no dependency on `std`: it
 //! operates purely over slices (`&[u8]` / `&mut [u8]`) and drives the safe
-//! [`deflate`] engine. It is `no_std` + `alloc` compatible (the engine performs
+//! [`crate::deflate`] engine. It is `no_std` + `alloc` compatible (the engine performs
 //! its own allocation through the stream's allocator). Targets Rust 2024
 //! edition, MSRV 1.85.0.
 

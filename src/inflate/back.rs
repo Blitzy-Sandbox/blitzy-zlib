@@ -317,7 +317,7 @@ impl<I: InFunc, O: OutFunc> BackCtx<'_, I, O> {
 ///
 /// Port of `inflateBackInit_` (`infback.c` L25-L64). `inflateBack` supports
 /// **raw** DEFLATE only, so `window_bits` must be in `8..=15`
-/// ([`MIN_WBITS`]..=[`MAX_WBITS`](crate::constants::MAX_WBITS)); any other value
+/// (`MIN_WBITS`..=[`MAX_WBITS`]); any other value
 /// yields [`ReturnCode::StreamError`], matching the C `Z_STREAM_ERROR` return.
 ///
 /// On success the returned boxed state owns a window of `1 << window_bits`

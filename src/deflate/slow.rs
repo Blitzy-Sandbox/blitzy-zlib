@@ -41,7 +41,7 @@
 //! This file contains **zero** `unsafe` code, enforced by the module-level
 //! `#![deny(unsafe_code)]` below. All window and buffer access uses safe slice
 //! indexing on the owned `Vec` buffers held by
-//! [`DeflateState`](crate::deflate::state::DeflateState), and match finding /
+//! [`DeflateState`], and match finding /
 //! bit output are delegated to the safe methods on that state.
 //!
 //! [`deflate_fast`]: crate::deflate::fast

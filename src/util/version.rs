@@ -23,7 +23,7 @@
 //! This module deliberately **bridges** rather than **duplicates**:
 //!
 //! * the version string is owned by the crate root ([`crate::ZLIB_VERSION`]);
-//! * the error-message table is owned by [`ReturnCode::message`], which
+//! * the error-message table is owned by [`ReturnCode::message`](crate::error::ReturnCode::message), which
 //!   already ports the C `z_errmsg` array.
 //!
 //! # `no_std`
