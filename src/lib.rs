@@ -112,6 +112,16 @@
 // Every public item in the crate must be documented (AAP: "document all public
 // items"). This is a `warn`, never a `deny`, so it can never break the build.
 #![warn(missing_docs)]
+// Every `unsafe` block in SHIPPED crate code must carry an immediately-adjacent
+// `// SAFETY:` justification (AAP §0.7.2 / user rule R3). Like `missing_docs`
+// this is a `warn` (never a `deny`) so it cannot break a plain build, but the
+// CI `-D warnings` gate promotes it to an error for the production library
+// target, preventing recurrence of the undocumented-`unsafe` finding across the
+// FFI boundary. The lint is relaxed to `allow` under `cfg(test)` so it governs
+// only the shipped `cdylib`/`staticlib`/`rlib` (whose `unsafe` lives in
+// `src/ffi/**`), not the crate's inline `#[cfg(test)]` unit tests.
+#![warn(clippy::undocumented_unsafe_blocks)]
+#![cfg_attr(test, allow(clippy::undocumented_unsafe_blocks))]
 
 // `Box`, `Vec`, and `String` are provided by `alloc` in both `std` and `no_std`
 // builds. Importing the crate here makes those types available crate-wide

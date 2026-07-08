@@ -137,12 +137,17 @@ pub unsafe extern "C" fn deflateInit2_(
     stream_size: c_int,
 ) -> c_int {
     guard_int(Z_STREAM_ERROR, || {
-        // SAFETY: `*version` is read only after the short-circuiting
-        // `version.is_null()` check proves the pointer is non-null; the caller
-        // guarantees it addresses a readable NUL-terminated C string, so the
+        // Reproduce C `deflateInit2_`'s version guard (deflate.c L392-396): a
+        // null `version`, a leading byte other than the major-version digit
+        // `'1'`, or a `z_stream` size mismatch each yield `Z_VERSION_ERROR`.
+        if version.is_null() {
+            return Z_VERSION_ERROR;
+        }
+        // SAFETY: `version` is non-null (checked immediately above); the caller
+        // guarantees it addresses a readable NUL-terminated C string, so its
         // first byte is valid to read.
-        if version.is_null()
-            || unsafe { *version } != b'1' as c_char
+        let version_major = unsafe { *version };
+        if version_major != b'1' as c_char
             || stream_size != core::mem::size_of::<z_stream>() as c_int
         {
             return Z_VERSION_ERROR;

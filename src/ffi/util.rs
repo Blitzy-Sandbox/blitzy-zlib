@@ -153,6 +153,8 @@ pub unsafe extern "C" fn compress2(
         // SAFETY: the pointer/length couplings were validated above, so both
         // slices are sound (empty when the corresponding length is zero).
         let src = unsafe { as_bytes(source, source_len as usize) };
+        // SAFETY: as established above, the dest pointer/length coupling was
+        // validated, so this mutable slice is sound (empty when `cap == 0`).
         let dst = unsafe { as_bytes_mut(dest, cap) };
         match util::compress2(dst, src, level) {
             Ok(produced) => {
@@ -194,6 +196,8 @@ pub unsafe extern "C" fn compress2_z(
         }
         // SAFETY: the pointer/length couplings were validated above.
         let src = unsafe { as_bytes(source, source_len) };
+        // SAFETY: as established above, the dest pointer/length coupling was
+        // validated, so this mutable slice is sound (empty when `cap == 0`).
         let dst = unsafe { as_bytes_mut(dest, cap) };
         match util::compress2(dst, src, level) {
             Ok(produced) => {

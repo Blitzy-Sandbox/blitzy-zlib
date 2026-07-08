@@ -694,13 +694,14 @@ pub unsafe extern "C" fn inflateEnd(strm: z_streamp) -> c_int {
         }
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
-        // `inflate_take` validates the handle's `HandleKind` tag BEFORE
-        // reconstituting the box: it returns the `Box<InflateHandle>` only for a
-        // genuine inflate handle (nulling `state` for exactly-once reclaim) and
-        // `None` for a cross-type stream (e.g. one from `deflateInit*` or
-        // `inflateBackInit_`) — yielding `Z_STREAM_ERROR` WITHOUT a
-        // layout-mismatched free, and matching C, which returns `Z_STREAM_ERROR`
-        // for a non-inflate stream (FINDING-6).
+        // SAFETY: `sref` is a valid, uniquely-borrowed `z_stream`, so
+        // `inflate_take` may inspect and clear its `state` slot. `inflate_take`
+        // validates the handle's `HandleKind` tag BEFORE reconstituting the box:
+        // it returns the `Box<InflateHandle>` only for a genuine inflate handle
+        // (nulling `state` for exactly-once reclaim) and `None` for a cross-type
+        // stream (e.g. one from `deflateInit*` or `inflateBackInit_`) — yielding
+        // `Z_STREAM_ERROR` WITHOUT a layout-mismatched free, and matching C,
+        // which returns `Z_STREAM_ERROR` for a non-inflate stream (FINDING-6).
         match unsafe { inflate_take(sref) } {
             Some(boxed) => {
                 drop(boxed);
