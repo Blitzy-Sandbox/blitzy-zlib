@@ -1,62 +1,114 @@
-//! Criterion throughput benchmark for the deflate (compression) engine.
+//! Criterion throughput benchmarks for the `zlib-rs` deflate (compression) engine.
 //!
-//! Measures whole-buffer `compress2` throughput across the fastest, default,
-//! and best compression levels. Uses the public `zlib_rs` one-call API only, so
-//! it exercises the same surface a downstream Rust consumer would.
+//! Exercises the one-call `compress2` API across all ten compression levels
+//! (`0..=9`) and across several input profiles (compressible text,
+//! incompressible high-entropy bytes, and highly repetitive data). Throughput
+//! is reported over the *uncompressed* input size, matching how the compression
+//! throughput goal is stated (>= 80% of C compression throughput, AAP 0.7.2).
 //!
-//! Run with: `cargo bench --bench deflate_bench`.
+//! Strategy note: the one-call `compress2` API selects only the compression
+//! *level*. Strategy selection (`Z_FILTERED`, `Z_HUFFMAN_ONLY`, `Z_RLE`,
+//! `Z_FIXED`) is reached through the streaming `ZStream` API; strategy-specific
+//! groups can be added here once that streaming surface is finalized. The
+//! distinct data profiles below already stress the match-finder behavior that
+//! the strategies target.
+//!
+//! Registered in `Cargo.toml` as `[[bench]] name = "deflate_bench"` with
+//! `harness = false`.
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use std::hint::black_box;
-use zlib_rs::{Z_BEST_COMPRESSION, Z_BEST_SPEED, Z_DEFAULT_COMPRESSION, compress_bound, compress2};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use zlib_rs::compress2;
+use zlib_rs::util::compress::compress_bound;
 
-/// Number of input bytes fed to each compression run.
-const INPUT_LEN: usize = 64 * 1024;
+/// Payload size used by the deflate benchmarks (64 KiB).
+const SIZE: usize = 64 * 1024;
 
-/// Builds `len` bytes of semi-compressible test data: a repeating English-text
-/// pattern lightly perturbed by a cheap LCG so the deflate engine finds real
-/// back-references without the input being trivially compressible.
-fn test_data(len: usize) -> Vec<u8> {
-    const PATTERN: &[u8] = b"the quick brown fox jumps over the lazy dog. ";
+/// Deterministic xorshift64 generator for incompressible, high-entropy input.
+fn xorshift_bytes(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
     let mut out = Vec::with_capacity(len);
-    let mut state: u32 = 0x1234_5678;
-    while out.len() < len {
-        for &byte in PATTERN {
-            if out.len() >= len {
-                break;
-            }
-            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            // ~1-in-16 bytes is perturbed; the rest reproduce the pattern.
-            let noise = if (state >> 28) == 0 {
-                (state & 0xff) as u8
-            } else {
-                0
-            };
-            out.push(byte ^ noise);
-        }
+    for _ in 0..len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.push((state >> 24) as u8);
     }
     out
 }
 
-/// Benchmarks `compress2` at three representative levels.
-fn bench_deflate(c: &mut Criterion) {
-    let input = test_data(INPUT_LEN);
-    let cap = compress_bound(input.len());
+/// Compressible, text-like data built by repeating an ASCII sentence.
+fn text_like_bytes(len: usize) -> Vec<u8> {
+    const SAMPLE: &[u8] = b"The quick brown fox jumps over the lazy dog. ";
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        let take = SAMPLE.len().min(len - out.len());
+        out.extend_from_slice(&SAMPLE[..take]);
+    }
+    out
+}
 
-    let mut group = c.benchmark_group("deflate");
-    group.throughput(Throughput::Bytes(input.len() as u64));
-    for level in [Z_BEST_SPEED, Z_DEFAULT_COMPRESSION, Z_BEST_COMPRESSION] {
+/// Highly repetitive data built from a short repeating cycle.
+fn repetitive_bytes(len: usize) -> Vec<u8> {
+    const CYCLE: &[u8] = b"ABCD";
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        let take = CYCLE.len().min(len - out.len());
+        out.extend_from_slice(&CYCLE[..take]);
+    }
+    out
+}
+
+/// Compression throughput across all ten levels (`0..=9`) on compressible text.
+fn bench_levels(c: &mut Criterion) {
+    let data = text_like_bytes(SIZE);
+    let bound = compress_bound(data.len());
+
+    let mut group = c.benchmark_group("deflate_levels");
+    group.throughput(Throughput::Bytes(data.len() as u64));
+    for level in 0..=9 {
         group.bench_with_input(BenchmarkId::from_parameter(level), &level, |b, &level| {
-            let mut dest = vec![0u8; cap];
+            let mut dest = vec![0u8; bound];
+            // Sanity: compression must succeed before we measure it.
+            assert!(
+                compress2(&mut dest, &data, level).is_ok(),
+                "compress2 failed at level {level}"
+            );
             b.iter(|| {
-                let written = compress2(black_box(&mut dest), black_box(&input), level)
-                    .expect("compress2 should succeed with a compress_bound-sized buffer");
-                black_box(written)
+                let written = compress2(&mut dest, &data, level).expect("compress2 failed");
+                black_box(written);
             });
         });
     }
     group.finish();
 }
 
-criterion_group!(benches, bench_deflate);
+/// Compression throughput across input profiles at the default level (6).
+fn bench_profiles(c: &mut Criterion) {
+    const LEVEL: i32 = 6;
+    let profiles: [(&str, Vec<u8>); 3] = [
+        ("text", text_like_bytes(SIZE)),
+        ("incompressible", xorshift_bytes(SIZE, 0xDEAD_BEEF)),
+        ("repetitive", repetitive_bytes(SIZE)),
+    ];
+
+    let mut group = c.benchmark_group("deflate_profiles");
+    for (name, data) in &profiles {
+        let bound = compress_bound(data.len());
+        group.throughput(Throughput::Bytes(data.len() as u64));
+        group.bench_with_input(BenchmarkId::new("level6", *name), data, |b, data| {
+            let mut dest = vec![0u8; bound];
+            assert!(
+                compress2(&mut dest, data, LEVEL).is_ok(),
+                "compress2 failed for profile {name}"
+            );
+            b.iter(|| {
+                let written = compress2(&mut dest, data, LEVEL).expect("compress2 failed");
+                black_box(written);
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_levels, bench_profiles);
 criterion_main!(benches);

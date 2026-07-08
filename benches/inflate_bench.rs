@@ -1,63 +1,113 @@
-//! Criterion throughput benchmark for the inflate (decompression) engine.
+//! Criterion throughput benchmarks for the `zlib-rs` inflate (decompression) engine.
 //!
-//! Pre-compresses a fixed buffer once, then measures whole-buffer `uncompress`
-//! throughput on the decode path. Uses the public `zlib_rs` one-call API only.
+//! Pre-compresses representative inputs with `compress2`, then measures
+//! `uncompress` throughput. Throughput is reported over the *decompressed*
+//! (original) size, matching the decompression throughput goal
+//! (>= C decompression throughput, AAP 0.7.2). Decompression cost can vary with
+//! how the source was compressed, so both the source level (1 / 6 / 9) and the
+//! input profile (text vs. incompressible) are varied. The larger,
+//! match-heavy inputs drive the `inflate_fast` hot path.
 //!
-//! Run with: `cargo bench --bench inflate_bench`.
+//! Registered in `Cargo.toml` as `[[bench]] name = "inflate_bench"` with
+//! `harness = false`.
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use std::hint::black_box;
-use zlib_rs::{Z_DEFAULT_COMPRESSION, compress_bound, compress2, uncompress};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use zlib_rs::util::compress::compress_bound;
+use zlib_rs::{compress2, uncompress};
 
-/// Number of uncompressed input bytes used to seed the decode benchmark.
-const INPUT_LEN: usize = 64 * 1024;
+/// Payload size used by the inflate benchmarks (64 KiB).
+const SIZE: usize = 64 * 1024;
 
-/// Builds `len` bytes of semi-compressible test data: a repeating English-text
-/// pattern lightly perturbed by a cheap LCG so the compressed stream fed to the
-/// decoder has realistic structure (both literals and back-references).
-fn test_data(len: usize) -> Vec<u8> {
-    const PATTERN: &[u8] = b"the quick brown fox jumps over the lazy dog. ";
+/// Deterministic xorshift64 generator for incompressible, high-entropy input.
+fn xorshift_bytes(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
     let mut out = Vec::with_capacity(len);
-    let mut state: u32 = 0x1234_5678;
-    while out.len() < len {
-        for &byte in PATTERN {
-            if out.len() >= len {
-                break;
-            }
-            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            let noise = if (state >> 28) == 0 {
-                (state & 0xff) as u8
-            } else {
-                0
-            };
-            out.push(byte ^ noise);
-        }
+    for _ in 0..len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.push((state >> 24) as u8);
     }
     out
 }
 
-/// Benchmarks `uncompress` on a pre-built compressed buffer.
-fn bench_inflate(c: &mut Criterion) {
-    let input = test_data(INPUT_LEN);
+/// Compressible, text-like data built by repeating an ASCII sentence.
+fn text_like_bytes(len: usize) -> Vec<u8> {
+    const SAMPLE: &[u8] = b"The quick brown fox jumps over the lazy dog. ";
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        let take = SAMPLE.len().min(len - out.len());
+        out.extend_from_slice(&SAMPLE[..take]);
+    }
+    out
+}
 
-    // Compress once up front; only the decode path is timed below.
-    let mut compressed = vec![0u8; compress_bound(input.len())];
-    let written = compress2(&mut compressed, &input, Z_DEFAULT_COMPRESSION)
-        .expect("compress2 should succeed with a compress_bound-sized buffer");
-    compressed.truncate(written);
+/// Compress `data` at `level` and return exactly the produced compressed bytes.
+fn deflate_to_vec(data: &[u8], level: i32) -> Vec<u8> {
+    let mut buf = vec![0u8; compress_bound(data.len())];
+    let n = compress2(&mut buf, data, level).expect("setup: compress2 failed");
+    buf.truncate(n);
+    buf
+}
 
-    let mut group = c.benchmark_group("inflate");
-    group.throughput(Throughput::Bytes(input.len() as u64));
-    group.bench_function("uncompress_64k", |b| {
-        let mut dest = vec![0u8; input.len()];
-        b.iter(|| {
-            let produced = uncompress(black_box(&mut dest), black_box(&compressed))
-                .expect("uncompress should succeed with an exactly-sized buffer");
-            black_box(produced)
-        });
-    });
+/// Decompression throughput as a function of the source compression level.
+fn bench_by_level(c: &mut Criterion) {
+    let original = text_like_bytes(SIZE);
+    let orig_len = original.len();
+
+    let mut group = c.benchmark_group("inflate_by_level");
+    group.throughput(Throughput::Bytes(orig_len as u64));
+    for level in [1i32, 6, 9] {
+        let compressed = deflate_to_vec(&original, level);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(level),
+            &compressed,
+            |b, compressed| {
+                let mut dest = vec![0u8; orig_len];
+                assert!(
+                    uncompress(&mut dest, compressed).is_ok(),
+                    "uncompress failed for source level {level}"
+                );
+                b.iter(|| {
+                    let produced = uncompress(&mut dest, compressed).expect("uncompress failed");
+                    black_box(produced);
+                });
+            },
+        );
+    }
     group.finish();
 }
 
-criterion_group!(benches, bench_inflate);
+/// Decompression throughput as a function of the input profile (source level 6).
+fn bench_by_profile(c: &mut Criterion) {
+    let profiles: [(&str, Vec<u8>); 2] = [
+        ("text", text_like_bytes(SIZE)),
+        ("incompressible", xorshift_bytes(SIZE, 0x1357_9BDF)),
+    ];
+
+    let mut group = c.benchmark_group("inflate_by_profile");
+    for (name, original) in &profiles {
+        let orig_len = original.len();
+        let compressed = deflate_to_vec(original, 6);
+        group.throughput(Throughput::Bytes(orig_len as u64));
+        group.bench_with_input(
+            BenchmarkId::new("level6", *name),
+            &compressed,
+            |b, compressed| {
+                let mut dest = vec![0u8; orig_len];
+                assert!(
+                    uncompress(&mut dest, compressed).is_ok(),
+                    "uncompress failed for profile {name}"
+                );
+                b.iter(|| {
+                    let produced = uncompress(&mut dest, compressed).expect("uncompress failed");
+                    black_box(produced);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_by_level, bench_by_profile);
 criterion_main!(benches);
