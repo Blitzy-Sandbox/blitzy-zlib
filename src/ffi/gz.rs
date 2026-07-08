@@ -9,31 +9,38 @@
 //!
 //! # Opaque handle model
 //!
-//! The public `gzFile` handle (`*mut gzFile_s`) is an *opaque* pointer. It is
-//! materialized by boxing an idiomatic [`GzState`]:
+//! The public `gzFile` handle (`*mut gzFile_s`) is an *opaque* pointer to a
+//! `#[repr(C)]` `GzHandle` whose FIRST field is a live C-layout `gzFile_s`
+//! `{ have, next, pos }` prefix; the idiomatic [`GzState`] lives in its own
+//! allocation behind the prefix. The handle is:
 //!
-//! * **open** — `Box::into_raw(Box::new(state)) as gzFile`.
-//! * **operations** — the pointer is *borrowed*, never owned:
-//!   `&mut *(file as *mut GzState)`. The box is not reconstructed.
-//! * **close** — the box is reconstructed *exactly once*
-//!   (`Box::from_raw(file as *mut GzState)`) and handed to the idiomatic close
-//!   routine, which flushes/finishes writers, emits the gzip trailer, frees
-//!   buffers, and drops the owned [`std::fs::File`].
+//! * **open** — `Box::into_raw(Box::new(GzHandle { prefix, state })) as gzFile`
+//!   (the prefix starts cleared).
+//! * **operations** — the handle is *borrowed*, never owned, through a
+//!   `GzBorrow` guard that reconciles the prefix on entry and re-syncs it on
+//!   exit (see below). The box is not reconstructed.
+//! * **close** — the `Box<GzHandle>` is reconstructed *exactly once*
+//!   (`Box::from_raw(file as *mut GzHandle)`) and its inner `Box<GzState>` is
+//!   handed to the idiomatic close routine, which flushes/finishes writers,
+//!   emits the gzip trailer, frees buffers, and drops the owned
+//!   [`std::fs::File`]; the prefix is dropped with the handle.
 //!
-//! This guarantees a sound lifecycle: one allocation on open, shared borrows on
+//! This guarantees a sound lifecycle: one allocation on open, guarded borrows on
 //! every operation, one deallocation on close — no double-free, no leak.
 //!
-//! # `gzgetc` / `gzgetc_` — documented macro-parity limitation
+//! # `gzgetc` / `gzgetc_` — live `gzFile_s` prefix (C2)
 //!
 //! In C, `gzgetc` is a *macro* that peeks the `{have, next, pos}` triple
 //! directly through the handle for a branch-free fast path, falling back to the
-//! real `gzgetc_` function only when the buffer is empty. That fast path
-//! requires the handle to *begin* with a live, C-layout `{have, next, pos}`
-//! prefix kept in sync with every read. The idiomatic [`GzState`] is **not**
-//! `#[repr(C)]`, so that in-place peek cannot be reproduced. Both `gzgetc` and
-//! `gzgetc_` are therefore exported as **real functions** (upstream zlib also
-//! ships `gzgetc` as a real function for exactly this reason); callers observe
-//! identical return values, only without the inlined macro peek.
+//! real `gzgetc_` function only when the buffer is empty. To make this
+//! macro-compatible, the opaque handle *begins* with a live `gzFile_s` prefix.
+//! Each shim borrows the handle through a `GzBorrow` guard that, on entry,
+//! **reconciles** any bytes the macro consumed straight from the prefix
+//! (advancing the idiomatic cursor to match) and, on exit, **re-syncs** the
+//! prefix to re-expose the current read buffer (`have`, a raw `next` pointer
+//! into `out_buf`, and `pos`). The real `gzgetc`/`gzgetc_` functions are still
+//! exported for callers that take the function pointer, and they observe
+//! identical return values; the macro fast path now works too.
 //!
 //! # `gzprintf` / `gzvprintf` — documented variadic limitation
 //!
@@ -161,12 +168,158 @@ unsafe fn cpath_to_pathbuf(path: *const c_char) -> Option<std::path::PathBuf> {
     cstr.to_str().ok().map(std::path::PathBuf::from)
 }
 
+// ---------------------------------------------------------------------------
+// C2 — live `gzFile_s` prefix for the `gzgetc(g)` macro fast-path
+// ---------------------------------------------------------------------------
+//
+// zlib's `gzgetc(g)` is a *macro* that reads the `{ have, next, pos }` prefix
+// directly through the `gzFile` pointer:
+//
+//   ((g)->have ? ((g)->have--, (g)->pos++, *((g)->next)++) : (gzgetc)(g))
+//
+// In C, `gz_statep` embeds `struct gzFile_s x` as its first member, so the macro
+// and every real `gz*` function share ONE storage for `have`/`next`/`pos`. Our
+// idiomatic [`GzState`] is not `#[repr(C)]` (it owns a `Vec`, `File`, `String`,
+// …) and tracks `next` as an *index*, so we cannot expose it directly. Instead
+// the opaque handle is a `#[repr(C)]` [`GzHandle`] whose FIRST field is a live
+// [`gzFile_s`] prefix. The prefix shadows the idiomatic cursor and is bridged
+// by [`GzHandle::reconcile`] (absorb macro-side consumption) on entry and
+// [`GzHandle::sync`] (re-expose the read buffer) on exit of every shim.
+
+/// The opaque `gzFile` handle: a `#[repr(C)]` wrapper whose leading
+/// [`gzFile_s`] prefix (offset 0) is what the C `gzgetc(g)` macro reads and
+/// mutates. The idiomatic [`GzState`] lives in its own allocation behind a
+/// `Box`; only the prefix is ABI-visible.
+#[repr(C)]
+struct GzHandle {
+    /// C `gzFile_s` prefix consumed by the `gzgetc(g)` macro fast-path. MUST be
+    /// the first field so `gzFile` (a `*mut gzFile_s`) aliases it at offset 0.
+    prefix: gzFile_s,
+    /// The idiomatic gz state (separate allocation; never inspected by C).
+    state: Box<GzState>,
+}
+
+impl GzHandle {
+    /// Absorbs any bytes the C `gzgetc(g)` macro consumed directly from the
+    /// prefix since the last [`sync`](Self::sync), advancing the idiomatic cursor
+    /// to match, then clears the prefix so `sync` fully re-derives it.
+    ///
+    /// The macro only runs in READ mode; in WRITE/NONE mode the prefix is always
+    /// cleared and this is a no-op beyond clearing.
+    #[inline]
+    fn reconcile(&mut self) {
+        if self.state.mode == GzMode::Read {
+            // The macro decrements `prefix.have` (and advances `next`/`pos`) once
+            // per byte it delivered; the delta is the count it consumed. Saturate
+            // defensively — `prefix.have <= state.have` always holds because
+            // `sync` sets them equal and only the macro (a decrement) runs in
+            // between.
+            let consumed = self.state.have.saturating_sub(self.prefix.have as usize);
+            self.state.next += consumed;
+            self.state.have -= consumed;
+            self.state.pos += consumed as i64;
+        }
+        self.prefix.have = 0;
+        self.prefix.next = ptr::null_mut();
+    }
+
+    /// Re-exposes the idiomatic read buffer through the `gzFile_s` prefix so the
+    /// C `gzgetc(g)` macro fast-path can consume it directly. In WRITE/NONE mode
+    /// (or when nothing is buffered) the prefix is cleared; `pos` always mirrors
+    /// the idiomatic position.
+    #[inline]
+    fn sync(&mut self) {
+        self.prefix.pos = self.state.pos;
+        if self.state.mode == GzMode::Read && self.state.have > 0 {
+            self.prefix.have = self.state.have as c_uint;
+            // SAFETY: the read driver maintains `next + have <= out_buf.len()`, so
+            // `&out_buf[next]` is in-bounds and `have` bytes are readable from it.
+            // The macro only ever READS through this pointer (`*next++`); no Rust
+            // code aliases the region while the macro owns it (the shim has
+            // returned and the `GzBorrow` has been dropped), so exposing it as a
+            // raw `*mut` is sound. It is recomputed on every `sync`, so a buffer
+            // reallocation between calls can never leave it dangling.
+            self.prefix.next =
+                unsafe { self.state.out_buf.as_ptr().add(self.state.next) } as *mut u8;
+        } else {
+            self.prefix.have = 0;
+            self.prefix.next = ptr::null_mut();
+        }
+    }
+}
+
+/// Borrows the [`GzHandle`] behind the opaque `file` pointer.
+///
+/// # Safety
+///
+/// `file` must be a non-null handle produced by [`box_state`] (i.e. by
+/// `gzopen*`/`gzdopen`) and not yet closed. Because [`gzFile_s`] is the first
+/// field of the `#[repr(C)]` [`GzHandle`], the `gzFile` pointer has the same
+/// address as the `GzHandle`.
+#[inline]
+unsafe fn gz_handle<'a>(file: gzFile) -> &'a mut GzHandle {
+    // SAFETY: per the contract `file` points at a live `GzHandle` (prefix at
+    // offset 0); the returned borrow is used only for the duration of one shim.
+    unsafe { &mut *(file as *mut GzHandle) }
+}
+
+/// RAII borrow of a [`GzHandle`]'s idiomatic [`GzState`] that keeps the C
+/// `gzFile_s` prefix consistent: it [`reconcile`](GzHandle::reconcile)s on
+/// creation (absorbing any `gzgetc` macro consumption) and
+/// [`sync`](GzHandle::sync)s on drop (re-exposing the read buffer). Dereferences
+/// to [`GzState`] so existing shim bodies are unchanged.
+struct GzBorrow<'a> {
+    handle: &'a mut GzHandle,
+}
+
+impl<'a> GzBorrow<'a> {
+    #[inline]
+    fn new(handle: &'a mut GzHandle) -> Self {
+        handle.reconcile();
+        Self { handle }
+    }
+}
+
+impl Drop for GzBorrow<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.handle.sync();
+    }
+}
+
+impl core::ops::Deref for GzBorrow<'_> {
+    type Target = GzState;
+    #[inline]
+    fn deref(&self) -> &GzState {
+        &self.handle.state
+    }
+}
+
+impl core::ops::DerefMut for GzBorrow<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut GzState {
+        &mut self.handle.state
+    }
+}
+
 /// Boxes an idiomatic open result into the opaque `gzFile` handle, translating
-/// failure into the C `NULL` sentinel.
+/// failure into the C `NULL` sentinel. The handle is a [`GzHandle`] whose
+/// leading [`gzFile_s`] prefix starts cleared (`have = 0`), so the `gzgetc`
+/// macro falls through to the real function until the first read populates it.
 #[inline]
 fn box_state(result: Result<Box<GzState>, ReturnCode>) -> gzFile {
     match result {
-        Ok(state) => Box::into_raw(state) as gzFile,
+        Ok(state) => {
+            let handle = Box::new(GzHandle {
+                prefix: gzFile_s {
+                    have: 0,
+                    next: ptr::null_mut(),
+                    pos: 0,
+                },
+                state,
+            });
+            Box::into_raw(handle) as gzFile
+        }
         Err(_) => ptr::null_mut(),
     }
 }
@@ -277,7 +430,8 @@ pub unsafe extern "C" fn gzbuffer(file: gzFile, size: c_uint) -> c_int {
             return -1;
         }
         // SAFETY: non-null handle from `gzopen*`/`gzdopen`; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         gz::gzbuffer(state, size)
     })
 }
@@ -294,7 +448,8 @@ pub unsafe extern "C" fn gzsetparams(file: gzFile, level: c_int, strategy: c_int
             return Z_STREAM_ERROR;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         gz::gzsetparams(state, level, strategy)
     })
 }
@@ -314,7 +469,8 @@ pub unsafe extern "C" fn gzread(file: gzFile, buf: voidp, len: c_uint) -> c_int 
             return -1;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         // SAFETY: `buf` is non-null (checked) and, per the C contract, valid for
         // writes of `len` bytes.
         let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
@@ -340,7 +496,8 @@ pub unsafe extern "C" fn gzfread(
             return 0;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         let Some(len) = size.checked_mul(nitems) else {
             // Overflow: let the idiomatic layer record Z_STREAM_ERROR and
             // return 0 (an empty slice cannot itself trigger a read).
@@ -376,7 +533,8 @@ pub unsafe extern "C" fn gzgetc(file: gzFile) -> c_int {
             return -1;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         gz::gzgetc(state)
     })
 }
@@ -392,7 +550,8 @@ pub unsafe extern "C" fn gzgetc_(file: gzFile) -> c_int {
             return -1;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         gz::gzgetc_(state)
     })
 }
@@ -410,7 +569,8 @@ pub unsafe extern "C" fn gzgets(file: gzFile, buf: *mut c_char, len: c_int) -> *
             return ptr::null_mut();
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         // SAFETY: `buf` is non-null (checked) and valid for `len` bytes
         // (`len > 0` checked). The idiomatic writer NUL-terminates within it.
         let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
@@ -433,7 +593,8 @@ pub unsafe extern "C" fn gzungetc(c: c_int, file: gzFile) -> c_int {
             return -1;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         gz::gzungetc(c, state)
     })
 }
@@ -458,7 +619,8 @@ pub unsafe extern "C" fn gzwrite(file: gzFile, buf: voidpc, len: c_uint) -> c_in
             return 0;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         let input = if len == 0 {
             // Empty write: avoid forming a slice over a possibly-null pointer.
             &[][..]
@@ -489,7 +651,8 @@ pub unsafe extern "C" fn gzfwrite(
             return 0;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         let Some(len) = size.checked_mul(nitems) else {
             // Overflow: idiomatic layer records Z_STREAM_ERROR and returns 0.
             return gz::gzfwrite(state, &[], size, nitems);
@@ -520,7 +683,8 @@ pub unsafe extern "C" fn gzputc(file: gzFile, c: c_int) -> c_int {
             return -1;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         gz::gzputc(state, c)
     })
 }
@@ -540,7 +704,8 @@ pub unsafe extern "C" fn gzputs(file: gzFile, s: *const c_char) -> c_int {
             return -1;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         // SAFETY: `s` is non-null (checked) and a NUL-terminated C string.
         let bytes = unsafe { CStr::from_ptr(s) }.to_bytes();
         match core::str::from_utf8(bytes) {
@@ -566,7 +731,8 @@ pub unsafe extern "C" fn gzflush(file: gzFile, flush: c_int) -> c_int {
             return Z_STREAM_ERROR;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         gz::gzflush(state, flush)
     })
 }
@@ -620,7 +786,8 @@ pub unsafe extern "C" fn gzvprintf(
             return Z_STREAM_ERROR;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         // A generously sized, bounded render buffer (zlib bounds its own render
         // to twice the stream buffer); the last byte is reserved for the NUL.
         let mut buf = std::vec![0u8; (crate::gz::GZBUFSIZE << 1) + 1];
@@ -651,6 +818,61 @@ pub unsafe extern "C" fn gzprintf(file: gzFile, format: *const c_char, mut args:
     unsafe { gzvprintf(file, format, args.as_va_list()) }
 }
 
+// ---------------------------------------------------------------------------
+// Default (stable) `gzprintf`/`gzvprintf` — ABI-compatible error stubs
+// ---------------------------------------------------------------------------
+//
+// Rust's C-variadic support (`...` / `VaList`) is unstable, so the fully
+// functional implementations above compile only under the nightly `c-variadic`
+// feature. To keep the shipped, stable `cdylib`/`staticlib` a faithful drop-in,
+// these symbols must still EXIST on the default build — a C caller linking or
+// `LD_PRELOAD`-injecting the object expects to resolve `gzprintf`/`gzvprintf`.
+//
+// zlib itself defines this exact scenario: a build without secure
+// `vsnprintf`/`snprintf` still exports `gzprintf`/`gzvprintf`, but they return
+// `Z_STREAM_ERROR` (`zlib.h`: "gzprintf() returns Z_STREAM_ERROR"; the
+// `zlibCompileFlags` bit 27 is set — see `crate::util::version`). These stubs
+// reproduce that behavior precisely and are mutually exclusive with the
+// variadic versions above (`c-variadic` on vs. off), so exactly one definition
+// of each symbol is emitted in any build configuration.
+//
+// ABI note: the stubs use the *fixed* leading parameters of the C prototypes.
+// On the SysV (x86-64) and Win64 C ABIs a caller invoking `gzprintf(f, fmt,
+// ...)` passes the fixed leading arguments (`file`, `format`) in the same
+// registers a non-variadic callee reads, and the caller owns stack cleanup, so
+// a non-variadic callee that ignores the trailing arguments is ABI-safe. The C
+// `va_list` of `gzvprintf` is represented as an opaque pointer.
+
+/// `int gzvprintf(gzFile file, const char *format, va_list va)`
+/// *(default build: error-returning stub)*
+///
+/// The stable artifact cannot render a C `va_list` (Rust C-variadics are
+/// unstable), so — exactly as a zlib built without secure `*printf` does — this
+/// returns [`Z_STREAM_ERROR`] unconditionally. The functional implementation is
+/// compiled instead under the nightly `c-variadic` feature. See the module note
+/// above for the ABI rationale of the fixed parameter list.
+#[cfg(not(feature = "c-variadic"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn gzvprintf(
+    _file: gzFile,
+    _format: *const c_char,
+    _va: *mut core::ffi::c_void,
+) -> c_int {
+    Z_STREAM_ERROR
+}
+
+/// `int gzprintf(gzFile file, const char *format, ...)`
+/// *(default build: error-returning stub)*
+///
+/// See [`gzvprintf`]: the stable artifact provides an ABI-compatible
+/// error-returning stub because Rust C-variadics are unstable. Returns
+/// [`Z_STREAM_ERROR`], matching a zlib built without secure `*printf`.
+#[cfg(not(feature = "c-variadic"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn gzprintf(_file: gzFile, _format: *const c_char) -> c_int {
+    Z_STREAM_ERROR
+}
+
 // ===========================================================================
 // Phase 4 — Seek / position / status shims  (<- gzlib.c)
 // ===========================================================================
@@ -671,7 +893,8 @@ pub unsafe extern "C" fn gzseek(file: gzFile, offset: z_off_t, whence: c_int) ->
             return -1;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         // Widen the C `off_t` to the engine's 64-bit offset. On 32-bit targets
         // (`z_off_t == i32`) this is a real widening; on 64-bit it is a no-op.
         gz::gzseek(state, offset as z_off64_t, whence)
@@ -688,7 +911,8 @@ pub unsafe extern "C" fn gzseek64(file: gzFile, offset: z_off64_t, whence: c_int
             return -1;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         gz::gzseek64(state, offset, whence)
     })
 }
@@ -704,7 +928,8 @@ pub unsafe extern "C" fn gzrewind(file: gzFile) -> c_int {
             return -1;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         gz::gzrewind(state)
     })
 }
@@ -719,7 +944,8 @@ pub unsafe extern "C" fn gztell(file: gzFile) -> z_off_t {
             return -1;
         }
         // SAFETY: non-null handle; borrowed immutably.
-        let state = unsafe { &*(file as *const GzState) };
+        let guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &*guard;
         gz::gztell(state)
     }) as z_off_t
 }
@@ -734,7 +960,8 @@ pub unsafe extern "C" fn gztell64(file: gzFile) -> z_off64_t {
             return -1;
         }
         // SAFETY: non-null handle; borrowed immutably.
-        let state = unsafe { &*(file as *const GzState) };
+        let guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &*guard;
         gz::gztell64(state)
     })
 }
@@ -750,7 +977,8 @@ pub unsafe extern "C" fn gzoffset(file: gzFile) -> z_off_t {
             return -1;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         gz::gzoffset(state)
     }) as z_off_t
 }
@@ -765,7 +993,8 @@ pub unsafe extern "C" fn gzoffset64(file: gzFile) -> z_off64_t {
             return -1;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         gz::gzoffset64(state)
     })
 }
@@ -781,7 +1010,8 @@ pub unsafe extern "C" fn gzeof(file: gzFile) -> c_int {
             return 0;
         }
         // SAFETY: non-null handle; borrowed immutably.
-        let state = unsafe { &*(file as *const GzState) };
+        let guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &*guard;
         gz::gzeof(state)
     })
 }
@@ -798,7 +1028,8 @@ pub unsafe extern "C" fn gzdirect(file: gzFile) -> c_int {
             return 0;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         gz::gzdirect(state)
     })
 }
@@ -828,7 +1059,8 @@ pub unsafe extern "C" fn gzerror(file: gzFile, errnum: *mut c_int) -> *const c_c
             return ptr::null();
         }
         // SAFETY: non-null handle; borrowed immutably.
-        let state = unsafe { &*(file as *const GzState) };
+        let guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &*guard;
         // Only a live reader/writer reports an error (matches C's mode check).
         if state.mode != GzMode::Read && state.mode != GzMode::Write {
             return ptr::null();
@@ -869,7 +1101,8 @@ pub unsafe extern "C" fn gzclearerr(file: gzFile) {
             return;
         }
         // SAFETY: non-null handle; borrowed, not owned.
-        let state = unsafe { &mut *(file as *mut GzState) };
+        let mut guard = GzBorrow::new(unsafe { gz_handle(file) });
+        let state = &mut *guard;
         gz::gzclearerr(state);
     });
 }
@@ -886,11 +1119,12 @@ pub unsafe extern "C" fn gzclose(file: gzFile) -> c_int {
             return Z_STREAM_ERROR;
         }
         // SAFETY: `file` was produced by `gzopen*`/`gzdopen` as
-        // `Box::into_raw(Box<GzState>)`; reconstruct the box exactly once to
-        // take ownership, then hand it to the idiomatic close (which dispatches
-        // on read/write mode).
-        let state = unsafe { Box::from_raw(file as *mut GzState) };
-        gz::gzclose(state)
+        // `Box::into_raw(Box<GzHandle>)`; reconstruct the box exactly once to
+        // take ownership, then hand its inner `Box<GzState>` to the idiomatic
+        // close (which dispatches on read/write mode). The `gzFile_s` prefix is
+        // dropped with the handle.
+        let handle = unsafe { Box::from_raw(file as *mut GzHandle) };
+        gz::gzclose(handle.state)
     })
 }
 
@@ -904,10 +1138,10 @@ pub unsafe extern "C" fn gzclose_r(file: gzFile) -> c_int {
         if file.is_null() {
             return Z_STREAM_ERROR;
         }
-        // SAFETY: `file` was produced as `Box::into_raw(Box<GzState>)`;
-        // reconstruct the owning box exactly once.
-        let state = unsafe { Box::from_raw(file as *mut GzState) };
-        gz::gzclose_r(state)
+        // SAFETY: `file` was produced as `Box::into_raw(Box<GzHandle>)`;
+        // reconstruct the owning box exactly once and hand off its inner state.
+        let handle = unsafe { Box::from_raw(file as *mut GzHandle) };
+        gz::gzclose_r(handle.state)
     })
 }
 
@@ -922,10 +1156,10 @@ pub unsafe extern "C" fn gzclose_w(file: gzFile) -> c_int {
         if file.is_null() {
             return Z_STREAM_ERROR;
         }
-        // SAFETY: `file` was produced as `Box::into_raw(Box<GzState>)`;
-        // reconstruct the owning box exactly once.
-        let state = unsafe { Box::from_raw(file as *mut GzState) };
-        gz::gzclose_w(state)
+        // SAFETY: `file` was produced as `Box::into_raw(Box<GzHandle>)`;
+        // reconstruct the owning box exactly once and hand off its inner state.
+        let handle = unsafe { Box::from_raw(file as *mut GzHandle) };
+        gz::gzclose_w(handle.state)
     })
 }
 
@@ -1134,6 +1368,73 @@ mod tests {
                 data.len() as c_int
             );
             assert_eq!(&buf[..], &data[..]);
+            assert_eq!(gzclose_r(rf), Z_OK);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// C2: the live `gzFile_s` prefix lets the C `gzgetc(g)` *macro* consume
+    /// buffered bytes directly through the handle pointer, and the next real
+    /// `gz*` call reconciles that consumption into the idiomatic cursor.
+    ///
+    /// This exercises the [`GzHandle`] prefix / [`GzBorrow`] reconcile-sync
+    /// bridge end to end: a real read populates the prefix, we mutate it exactly
+    /// as the C macro does (`have--, pos++, *next++`), then assert that a later
+    /// library call absorbs the delta and continues byte-exactly.
+    #[test]
+    fn gzgetc_macro_prefix_reconcile() {
+        let (path, cpath) = unique_path("c2prefix");
+        let data = b"ABCDEFGHIJ";
+        unsafe {
+            // Write known bytes and close.
+            let wf = gzopen(cpath.as_ptr(), c"wb".as_ptr());
+            assert!(!wf.is_null());
+            assert_eq!(
+                gzwrite(wf, data.as_ptr() as voidpc, data.len() as c_uint),
+                data.len() as c_int
+            );
+            assert_eq!(gzclose_w(wf), Z_OK);
+
+            // Open for read; the handle's prefix starts cleared (`have == 0`).
+            let rf = gzopen(cpath.as_ptr(), c"rb".as_ptr());
+            assert!(!rf.is_null());
+
+            // First real read returns 'A' and, on shim exit, syncs the prefix so
+            // the macro fast-path can take over the buffered remainder.
+            assert_eq!(gzgetc(rf), b'A' as c_int);
+
+            // Inspect the live `gzFile_s` prefix exactly as the C macro would.
+            let handle = &mut *(rf as *mut GzHandle);
+            assert!(
+                handle.prefix.have >= 1,
+                "prefix must expose buffered bytes after the first read"
+            );
+            assert!(!handle.prefix.next.is_null(), "prefix.next must be live");
+            assert_eq!(handle.prefix.pos, 1, "pos reflects the one byte read");
+
+            // Simulate the macro consuming ONE byte straight from the prefix:
+            //   ((g)->have ? ((g)->have--, (g)->pos++, *((g)->next)++) : ...)
+            let macro_byte = *handle.prefix.next;
+            assert_eq!(macro_byte, b'B', "macro reads the 2nd byte directly");
+            handle.prefix.have -= 1;
+            handle.prefix.next = handle.prefix.next.add(1);
+            handle.prefix.pos += 1;
+
+            // A subsequent library call reconciles the macro-side consumption:
+            // gztell reports the reconciled position (2 bytes consumed total).
+            assert_eq!(gztell(rf), 2, "gztell reconciles the macro-consumed byte");
+
+            // Reading continues byte-exactly from the 3rd byte onward.
+            assert_eq!(gzgetc(rf), b'C' as c_int);
+            assert_eq!(gzgetc(rf), b'D' as c_int);
+
+            let mut rest = [0u8; 6];
+            assert_eq!(
+                gzread(rf, rest.as_mut_ptr() as voidp, rest.len() as c_uint),
+                6
+            );
+            assert_eq!(&rest, b"EFGHIJ");
+            assert_eq!(gztell(rf), data.len() as z_off_t);
             assert_eq!(gzclose_r(rf), Z_OK);
         }
         let _ = std::fs::remove_file(&path);

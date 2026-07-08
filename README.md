@@ -76,7 +76,7 @@ or add it to your `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-zlib-rs = "0.1"
+zlib-rs = "1.3.2"
 ```
 
 The crate name on crates.io is `zlib-rs`; the importable module path is
@@ -214,6 +214,14 @@ provides `#[no_mangle] extern "C"` shims for every public zlib prototype and
 field order and type widths so the emitted object can substitute for `libz`
 without recompiling downstream code.
 
+> **Variadic `gzprintf`/`gzvprintf`.** Both symbols are **always exported** so
+> the default artifact presents the complete zlib symbol table. Genuine
+> C-variadic formatting depends on the unstable `c_variadic` language feature
+> (nightly only), so on a stable toolchain — the default — the two shims return
+> `Z_STREAM_ERROR` rather than formatting. Build with the nightly `c-variadic`
+> feature to enable the real implementations. Every other public prototype is
+> fully implemented on stable.
+
 Build the shared and static objects:
 
 ```sh
@@ -241,15 +249,19 @@ Feature flags map the C preprocessor conditionals (`GZIP`, `NO_GZCOMPRESS`,
 `Z_SOLO`, …) onto Cargo features. The names and defaults below are the
 authoritative contract and are kept in sync with `Cargo.toml`.
 
-| Feature  | Default | Description |
-|----------|:-------:|-------------|
-| `std`    | ✅ | Standard-library build (I/O, allocation, formatting). |
-| `gzip`   | ✅ | gzip framing within the deflate/inflate engines (maps C `#ifdef GZIP`). |
-| `gz-io`  | ✅ | gzip **file** I/O layer — the `gz*` functions (maps C `#ifndef NO_GZCOMPRESS`); implies `std` + `gzip`. |
-| `no-std` |    | Core-only, bare-metal build with no gz file I/O (maps C `Z_SOLO`). |
-| `simd`   | ✅ | SIMD-accelerated CRC-32 via [`crc32fast`](https://crates.io/crates/crc32fast). |
+| Feature          | Default | Description |
+|------------------|:-------:|-------------|
+| `std`            | ✅ | Standard-library build (I/O, allocation, formatting). |
+| `gzip`           | ✅ | gzip framing within the deflate/inflate engines (maps C `#ifdef GZIP`). |
+| `gz-io`          | ✅ | gzip **file** I/O layer — the `gz*` functions (maps C `#ifndef NO_GZCOMPRESS`); implies `std` + `gzip`. |
+| `no-std`         |    | Core-only, bare-metal build with no gz file I/O (maps C `Z_SOLO`). |
+| `simd`           | ✅ | SIMD-accelerated CRC-32 via [`crc32fast`](https://crates.io/crates/crc32fast). |
+| `c-variadic`     |    | Real variadic `gzprintf`/`gzvprintf` FFI shims. Relies on the unstable `c_variadic` language feature and therefore a **nightly** toolchain. When it is off (the default), both symbols are still exported for ABI completeness but return `Z_STREAM_ERROR` (see [Usage — C drop-in](#usage--c-drop-in-ffi)). |
+| `inflate_strict` |    | Stricter inflate distance validation (maps the C `INFLATE_STRICT` switch). Off by default so the default build stays byte-exact with reference zlib; enable only to reject out-of-window distances early. |
 
-The default feature set is `std`, `gzip`, `gz-io`, and `simd`. To build a
+The default feature set is `std`, `gzip`, `gz-io`, and `simd`. The two
+non-default features `c-variadic` and `inflate_strict` are optional opt-ins
+beyond that core set; neither is required for a complete drop-in ABI. To build a
 core-only, no-standard-library configuration, disable the defaults:
 
 ```sh

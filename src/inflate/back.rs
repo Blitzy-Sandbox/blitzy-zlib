@@ -96,6 +96,16 @@ const fn low_mask(n: u32) -> u32 {
 pub trait InFunc {
     /// Returns the next chunk of input bytes, or an empty slice at end-of-input.
     fn next_input(&mut self) -> &[u8];
+
+    /// Reports, once at the end of [`inflate_back`], how many bytes of the most
+    /// recently yielded chunk were left unconsumed by the engine.
+    ///
+    /// This mirrors C `infback.c`'s `inf_leave` writing `strm->avail_in = have`
+    /// (and `next` at the unconsumed offset): an FFI adapter overriding this can
+    /// restore the C `z_stream`'s `next_in`/`avail_in` cursors to point at the
+    /// unconsumed tail of the last provider buffer. The default is a no-op, so
+    /// pure-Rust callers that do not track raw cursors are unaffected.
+    fn set_unconsumed(&mut self, _unconsumed: usize) {}
 }
 
 /// Consumes output bytes produced by [`inflate_back`], replacing the C
@@ -362,15 +372,18 @@ pub fn inflate_back_init_in(
     let mut state = InflateState::new_in(hook, 0, window_bits as u32);
 
     // C L56-L62: set the window geometry and allocate the owned window through
-    // the caller's allocator hook (falling back to the global allocator when no
-    // hook is installed).
+    // the caller's allocator hook (or the global allocator when no hook is
+    // installed). An active-hook OOM surfaces as `Z_MEM_ERROR` (M7); C's
+    // `inflateBackInit_` likewise returns `Z_MEM_ERROR` when the window `ZALLOC`
+    // fails.
     state.dmax = 32768;
     state.wbits = window_bits as u32;
     state.wsize = 1u32 << window_bits;
     state.whave = 0;
     state.wnext = 0;
     state.sane = true;
-    state.window = AllocBuffer::zeroed(state.wsize as usize, hook);
+    state.window =
+        AllocBuffer::try_zeroed(state.wsize as usize, hook).ok_or(ReturnCode::MemError)?;
 
     Ok(state)
 }
@@ -912,6 +925,13 @@ pub fn inflate_back<I: InFunc, O: OutFunc>(
             break code;
         }
     };
+
+    // Report the unconsumed tail of the last provider chunk (C `have`) so an FFI
+    // adapter can restore `next_in`/`avail_in` exactly like C `inf_leave`
+    // (infback.c L561-L569 sets `strm->avail_in = have`). `next <= inb.len()`, so
+    // this is the number of bytes pulled but not yet consumed from that chunk.
+    let unconsumed = ctx.inb.len() - ctx.next;
+    ctx.src.set_unconsumed(unconsumed);
 
     // C L561-L569: flush the tail of the window and return.
     inf_leave(&mut ctx, state, ret)

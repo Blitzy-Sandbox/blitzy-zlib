@@ -832,9 +832,21 @@ impl DeflateState {
         // block considerations): sym_end = (lit_bufsize - 1) * 3.
         let sym_end = (lit_bufsize - 1) * 3;
 
+        // Allocate every working buffer up front, routed through the caller's
+        // allocator hook. When an active hook's `zalloc` reports out-of-memory,
+        // `try_zeroed` yields `None`, which we surface as `Z_MEM_ERROR` (M7);
+        // any buffers already allocated are released as the early return drops
+        // them. The null-hook (global) path never fails.
+        let pending_buf =
+            AllocBuffer::try_zeroed(pending_buf_size, hook).ok_or(ZlibError::MemError)?;
+        let window = AllocBuffer::try_zeroed(2 * w_size, hook).ok_or(ZlibError::MemError)?;
+        let prev = AllocBuffer::try_zeroed(w_size, hook).ok_or(ZlibError::MemError)?;
+        let head = AllocBuffer::try_zeroed(hash_size, hook).ok_or(ZlibError::MemError)?;
+        let sym_buf = AllocBuffer::try_zeroed(lit_bufsize * 3, hook).ok_or(ZlibError::MemError)?;
+
         let mut state = Box::new(DeflateState {
             status: DeflateStatus::Init,
-            pending_buf: AllocBuffer::zeroed(pending_buf_size, hook),
+            pending_buf,
             pending_buf_size,
             pending_out: 0,
             pending: 0,
@@ -848,10 +860,10 @@ impl DeflateState {
             w_size,
             w_bits,
             w_mask,
-            window: AllocBuffer::zeroed(2 * w_size, hook),
+            window,
             window_size: 2 * w_size,
-            prev: AllocBuffer::zeroed(w_size, hook),
-            head: AllocBuffer::zeroed(hash_size, hook),
+            prev,
+            head,
             ins_h: 0,
             hash_size,
             hash_bits,
@@ -882,7 +894,7 @@ impl DeflateState {
             heap_len: 0,
             heap_max: 0,
             depth: [0u8; 2 * L_CODES + 1],
-            sym_buf: AllocBuffer::zeroed(lit_bufsize * 3, hook),
+            sym_buf,
             lit_bufsize,
             sym_next: 0,
             sym_end,

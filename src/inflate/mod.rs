@@ -337,16 +337,28 @@ fn fixedtables(state: &mut InflateState) {
 /// caller-supplied `zalloc`/`zfree` (installed through the FFI `z_stream`), the
 /// window is allocated through those hooks via the state's stored
 /// [`alloc_hook`](InflateState::alloc_hook) (AAP §0.6.3; QA FINDING-3);
-/// otherwise it uses the Rust global allocator. Either way this never returns
-/// C's `1`-on-`ZALLOC`-failure: a global allocation aborts on OOM, and a
-/// hook-backed allocation that returns null transparently falls back to the
-/// global allocator (see [`AllocBuffer::zeroed`]), so the C `MEM` mode is
-/// unreachable through this path.
-fn updatewindow(state: &mut InflateState, output: &[u8], end: usize, mut copy: usize) {
+/// otherwise it uses the Rust global allocator.
+///
+/// # Errors
+///
+/// Returns [`ZlibError::MemError`] when the lazy window allocation is routed
+/// through an active caller hook whose `zalloc` reports out-of-memory. This is
+/// the faithful port of C `updatewindow` returning `1` on `ZALLOC` failure,
+/// which the callers translate into the `MEM` mode / `Z_MEM_ERROR` (M7). The
+/// global-allocator path is infallible (it aborts on OOM per Rust convention),
+/// so this only fails for a caller-installed bounded allocator.
+fn updatewindow(
+    state: &mut InflateState,
+    output: &[u8],
+    end: usize,
+    mut copy: usize,
+) -> Result<(), ZlibError> {
     // If it hasn't been done already, allocate space for the window — routed
-    // through the caller's allocator hook when one was installed.
+    // through the caller's allocator hook when one was installed. An active-hook
+    // OOM propagates as `Z_MEM_ERROR` (M7) rather than falling back to global.
     if state.window.is_empty() {
-        state.window = AllocBuffer::zeroed(1usize << state.wbits, state.alloc_hook);
+        state.window = AllocBuffer::try_zeroed(1usize << state.wbits, state.alloc_hook)
+            .ok_or(ZlibError::MemError)?;
     }
 
     // If the window is not in use yet, initialise its geometry.
@@ -389,6 +401,8 @@ fn updatewindow(state: &mut InflateState, output: &[u8], end: usize, mut copy: u
             }
         }
     }
+
+    Ok(())
 }
 
 /// Scans `buf` for the 4-byte flush marker `00 00 FF FF`, a faithful port of C
@@ -1672,18 +1686,33 @@ pub fn inflate<A: Allocator>(
 
     let produced_since_ck = outck - io.left();
 
+    let mode_u = state.mode as u16;
     // Update the sliding window with freshly produced output when the window is
     // already in use, or while more output is still expected (and this is not a
     // short read at the very end of a `Z_FINISH` request). Mirrors the C
     // condition at L1133-L1136 (using the enum discriminants for `< BAD` /
     // `< CHECK`, since `InflateMode` is ordered like the C `mode` values).
-    let mode_u = state.mode as u16;
-    if state.wsize != 0
+    let needs_window_update = state.wsize != 0
         || (produced_since_ck != 0
             && mode_u < InflateMode::Bad as u16
-            && (mode_u < InflateMode::Check as u16 || flush != Z_FINISH))
+            && (mode_u < InflateMode::Check as u16 || flush != Z_FINISH));
+    // `&&` short-circuits, so `updatewindow` runs (with its window side effect)
+    // exactly when the condition holds; the body runs only on an OOM failure.
+    if needs_window_update
+        && updatewindow(&mut state, &io.output[..], io.put, produced_since_ck).is_err()
     {
-        updatewindow(&mut state, &io.output[..], io.put, produced_since_ck);
+        // C `inf_leave`: `state->mode = MEM; return Z_MEM_ERROR;` — the lazy
+        // window allocation (routed through the caller's `zalloc`) reported OOM.
+        // Enter the permanent `MEM` error state and return `Z_MEM_ERROR` with no
+        // committed progress, matching both the C control flow and the
+        // `InflateMode::Mem` arm above (M7).
+        state.mode = InflateMode::Mem;
+        strm.set_inflate_state(state);
+        return InflateOutcome {
+            code: ReturnCode::MemError,
+            consumed: 0,
+            produced: 0,
+        };
     }
 
     let consumed = io.next;
@@ -1797,9 +1826,14 @@ pub fn inflate_set_dictionary<A: Allocator>(
         }
     }
     // Load the dictionary into the window (amending existing history). C treats
-    // `updatewindow` failure as `Z_MEM_ERROR`; here it is infallible.
+    // `updatewindow` failure as `Z_MEM_ERROR` (setting `mode = MEM`); reproduce
+    // that when the window allocation is routed through a caller hook that
+    // reports OOM (M7).
     let dict_len = dictionary.len();
-    updatewindow(state, dictionary, dict_len, dict_len);
+    if updatewindow(state, dictionary, dict_len, dict_len).is_err() {
+        state.mode = InflateMode::Mem;
+        return Err(ZlibError::MemError);
+    }
     state.havedict = true;
     Ok(ReturnCode::Ok)
 }

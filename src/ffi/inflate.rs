@@ -53,9 +53,9 @@ use crate::constants::DEF_WBITS;
 use crate::error::ReturnCode;
 use crate::ffi::types::{
     Bytef, CAllocator, HandleKind, advance_input, advance_output, guard_int, guard_ulong,
-    gz_headerp, in_func, input_slice, out_func, output_slice, peek_handle_kind, set_adler,
-    set_data_type, set_msg, state_ptr_from_box, state_ref, state_take, uInt, z_stream, z_streamp,
-    zstream_with_caller_alloc,
+    gz_headerp, in_func, input_ptr_valid, input_slice, out_func, output_slice, peek_handle_kind,
+    set_adler, set_data_type, set_msg, state_ptr_from_box, stream_buffers_valid, uInt, z_stream,
+    z_streamp, zstream_with_caller_alloc,
 };
 use crate::inflate::back::{InFunc, OutFunc};
 use crate::inflate::state::InflateState;
@@ -253,6 +253,86 @@ unsafe fn inflate_take(strm: &mut z_stream) -> Option<Box<InflateHandle>> {
     }
 }
 
+/// The boxed `inflateBack` engine handle installed in [`z_stream::state`] by
+/// [`inflateBackInit_`].
+///
+/// Unlike the streaming [`inflate`] path, `inflateBack` drives the raw engine
+/// directly with a caller-owned window (which doubles as the output buffer), so
+/// this handle owns the `Box<InflateState>` outright rather than an idiomatic
+/// [`ZStream`]. The leading [`HandleKind`] tag ([`HandleKind::INFLATE_BACK`])
+/// lets [`inflateBack`] and [`inflateBackEnd`] verify the handle *kind* before
+/// reinterpreting the opaque `state` pointer, closing the C4 UB where an
+/// untagged `Box<InflateState>` could be blindly reconstituted — or, worse, a
+/// tagged deflate/inflate handle freed through the wrong layout. `#[repr(C)]`
+/// guarantees `kind` sits at offset 0, matching every other tagged handle.
+#[repr(C)]
+struct InflateBackHandle {
+    /// Discriminant tag; always [`HandleKind::INFLATE_BACK`]. MUST be first.
+    kind: HandleKind,
+    /// The engine state whose owned window doubles as the sliding output buffer.
+    inner: Box<InflateState>,
+}
+
+impl InflateBackHandle {
+    /// Wraps a freshly built back-inflate state, tagging it as an `inflateBack`
+    /// handle.
+    #[inline]
+    fn new(inner: Box<InflateState>) -> Self {
+        Self {
+            kind: HandleKind::INFLATE_BACK,
+            inner,
+        }
+    }
+}
+
+/// Borrows the [`InflateBackHandle`] behind the opaque `state` pointer,
+/// validating the [`HandleKind`] tag first. Returns [`None`] when no handle is
+/// installed OR the installed handle is not an `inflateBack` handle (cross-type
+/// misuse), so the caller can return `Z_STREAM_ERROR` WITHOUT reinterpreting a
+/// wrong-type allocation.
+///
+/// # Safety
+///
+/// A non-null `state` must point at a live handle installed by an FFI init shim
+/// (so its leading tag is readable).
+#[inline]
+unsafe fn inflate_back_handle(strm: &mut z_stream) -> Option<&mut InflateBackHandle> {
+    // SAFETY: delegated tag read; see `peek_handle_kind`.
+    match unsafe { peek_handle_kind(strm) } {
+        Some(kind) if kind == HandleKind::INFLATE_BACK => {
+            // SAFETY: the tag confirms a live `InflateBackHandle`; the borrow is
+            // tied to `strm`, so it cannot alias for its lifetime.
+            Some(unsafe { &mut *(strm.state as *mut InflateBackHandle) })
+        }
+        _ => None,
+    }
+}
+
+/// Reclaims the boxed [`InflateBackHandle`] from `state`, validating the
+/// [`HandleKind`] tag first and nulling `state` on success. Returns [`None`] —
+/// leaving `state` untouched — when the handle is absent or not an `inflateBack`
+/// handle, so [`inflateBackEnd`] never drops a wrong-type box (C4).
+///
+/// # Safety
+///
+/// A non-null `state` must point at a live handle installed by an FFI init shim,
+/// not already reclaimed.
+#[inline]
+unsafe fn inflate_back_take(strm: &mut z_stream) -> Option<Box<InflateBackHandle>> {
+    // SAFETY: delegated tag read; see `peek_handle_kind`.
+    match unsafe { peek_handle_kind(strm) } {
+        Some(kind) if kind == HandleKind::INFLATE_BACK => {
+            // SAFETY: the tag confirms a live `Box<InflateBackHandle>`;
+            // reconstitute exactly once and null the field to prevent a double
+            // free.
+            let boxed = unsafe { Box::from_raw(strm.state as *mut InflateBackHandle) };
+            strm.state = ptr::null_mut();
+            Some(boxed)
+        }
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // C callback adapters for `inflateBack`
 // ---------------------------------------------------------------------------
@@ -262,11 +342,34 @@ unsafe fn inflate_take(strm: &mut z_stream) -> Option<Box<InflateHandle>> {
 /// On the first call it yields whatever input was already buffered in the
 /// stream (`next_in[..avail_in]`); thereafter it invokes the C callback, which
 /// returns a byte count and points `*buf` at that many readable input bytes.
+///
+/// It also records the provenance of the most recent chunk it hands to the
+/// engine (`last_ptr`/`last_len`), whether it has handed out any real input
+/// (`handed_out`), whether the most recent pull ran dry (`dry`), and the
+/// engine-reported unconsumed tail (`unconsumed`). After [`inflate_back`]
+/// returns, the shim uses these to restore the C `z_stream`'s `next_in`/
+/// `avail_in` exactly like C `infback.c`'s `inf_leave` (C3).
 struct CInFunc<'a> {
     in_fn: unsafe extern "C" fn(*mut c_void, *mut *const c_uchar) -> c_uint,
     in_desc: *mut c_void,
     initial: &'a [u8],
     initial_done: bool,
+    /// Base pointer of the most recent NON-EMPTY chunk handed to the engine
+    /// (the initial buffer first, then successive callback buffers). Defaults to
+    /// the initial buffer's base so a decode consuming only buffered input still
+    /// reconstructs a correct `next_in`.
+    last_ptr: *const c_uchar,
+    /// Length of that most-recent non-empty chunk.
+    last_len: usize,
+    /// Set once any non-empty chunk has been handed to the engine.
+    handed_out: bool,
+    /// Set when the MOST RECENT pull yielded an empty slice (the callback ran
+    /// dry). Mirrors C `PULL` returning 0, which sets `next = Z_NULL`/`have = 0`.
+    dry: bool,
+    /// Bytes of the last chunk left unconsumed at exit, reported by the engine
+    /// via [`InFunc::set_unconsumed`]. Combined with `last_ptr`/`last_len` to
+    /// reconstruct C's `next`/`have`.
+    unconsumed: usize,
 }
 
 impl InFunc for CInFunc<'_> {
@@ -274,6 +377,11 @@ impl InFunc for CInFunc<'_> {
         if !self.initial_done {
             self.initial_done = true;
             if !self.initial.is_empty() {
+                // Record the initial stream buffer as the current chunk.
+                self.last_ptr = self.initial.as_ptr();
+                self.last_len = self.initial.len();
+                self.handed_out = true;
+                self.dry = false;
                 return self.initial;
             }
         }
@@ -285,11 +393,22 @@ impl InFunc for CInFunc<'_> {
         // which is exactly the lifetime over which the engine uses the slice.
         let n = unsafe { (self.in_fn)(self.in_desc, &mut buf) };
         if n == 0 || buf.is_null() {
+            // Callback ran dry: mirror C `PULL` returning 0 (next = Z_NULL).
+            self.dry = true;
             &[]
         } else {
+            // Record this callback buffer as the current chunk.
+            self.last_ptr = buf;
+            self.last_len = n as usize;
+            self.handed_out = true;
+            self.dry = false;
             // SAFETY: the callback guaranteed `n` bytes are readable at `buf`.
             unsafe { slice::from_raw_parts(buf, n as usize) }
         }
+    }
+
+    fn set_unconsumed(&mut self, unconsumed: usize) {
+        self.unconsumed = unconsumed;
     }
 }
 
@@ -451,9 +570,15 @@ pub unsafe extern "C" fn inflateBackInit_(
         let hook = unsafe { CAllocator::from_stream(sref) }.hook();
         match crate::inflate::back::inflate_back_init_in(hook, window_bits) {
             Ok(state) => {
-                // SAFETY: transfers ownership of the `Box<InflateState>` into the
-                // opaque `state` slot; reclaimed and dropped by `inflateBackEnd`.
-                sref.state = unsafe { state_ptr_from_box(state) };
+                // Tag the state as an `inflateBack` handle before installing it,
+                // so `inflateBack`/`inflateBackEnd` can validate the kind and the
+                // regular `inflateEnd` rejects it (C4: no more blind casts of an
+                // untagged `Box<InflateState>`).
+                let handle = Box::new(InflateBackHandle::new(state));
+                // SAFETY: transfers ownership of the `Box<InflateBackHandle>`
+                // into the opaque `state` slot; reclaimed and dropped by
+                // `inflateBackEnd` after tag validation.
+                sref.state = unsafe { state_ptr_from_box(handle) };
                 sref.total_in = 0;
                 sref.total_out = 0;
                 sref.msg = ptr::null_mut();
@@ -485,6 +610,15 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
         }
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
+
+        // C `inflate` entry validation (`inflate.c` L474): reject a null
+        // `next_out`, or a null `next_in` paired with a positive `avail_in`,
+        // with `Z_STREAM_ERROR` — *before* bridging, so the programmer error is
+        // surfaced rather than masked into an empty slice by
+        // `input_slice`/`output_slice`.
+        if !stream_buffers_valid(sref) {
+            return Z_STREAM_ERROR;
+        }
 
         // Borrow the input/output windows. These helpers return slices with
         // *detached* lifetimes that point at the caller's external buffers, not
@@ -772,6 +906,15 @@ pub unsafe extern "C" fn inflateSync(strm: z_streamp) -> c_int {
         }
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
+        // Reject a null `next_in` paired with a positive `avail_in` before the
+        // input window is bridged. `inflateSync` has no output buffer, so only
+        // the input half of the entry contract applies. C `inflateSync` would
+        // instead dereference the null pointer (undefined behavior); returning
+        // `Z_STREAM_ERROR` is the strictly safer drop-in behavior and matches
+        // the "`next_in` non-null whenever `avail_in != 0`" rule.
+        if !input_ptr_valid(sref) {
+            return Z_STREAM_ERROR;
+        }
         // SAFETY: detached-lifetime input window (see `inflate`); valid to hold
         // across the later `&mut` re-borrow for cursor advancement.
         let input: &[u8] = unsafe { input_slice(sref) };
@@ -1131,35 +1274,59 @@ pub unsafe extern "C" fn inflateBack(
         let sref = unsafe { &mut *strm };
         // SAFETY: detached-lifetime input window (see `inflate`); it points at the
         // caller's external buffer, so it stays valid across the later `&mut`
-        // re-borrow of the stream for cursor advancement.
+        // re-borrow of the stream for cursor restoration.
         let initial: &[u8] = unsafe { input_slice(sref) };
-        let initial_len = initial.len();
 
-        // SAFETY: `state`, if non-null, is the `Box<InflateState>` installed by
-        // `inflateBackInit_`.
-        let state = match unsafe { state_ref::<InflateState>(sref) } {
-            Some(s) => s,
+        // C4: fetch the tagged `inflateBack` handle, validating the kind before
+        // touching the engine state. A missing handle, or one owned by the
+        // deflate/inflate engines, is rejected with `Z_STREAM_ERROR`.
+        // SAFETY: `state`, if non-null, is a live tagged handle from an init shim.
+        let handle = match unsafe { inflate_back_handle(sref) } {
+            Some(h) => h,
             None => return Z_STREAM_ERROR,
         };
+        let state = &mut *handle.inner;
 
         let mut src = CInFunc {
             in_fn,
             in_desc,
             initial,
             initial_done: false,
+            last_ptr: initial.as_ptr(),
+            last_len: initial.len(),
+            handed_out: false,
+            dry: false,
+            unconsumed: 0,
         };
         let mut sink = COutFunc { out_fn, out_desc };
 
         let code = crate::inflate::back::inflate_back(state, &mut src, &mut sink);
-        // `state`/`src` borrows end here.
+        // `state`/`handle` borrows of `sref` end here; `src` is a local that only
+        // borrows the detached-lifetime `initial`, so it stays readable below.
 
-        // Reflect consumption of the initially buffered input into the stream's
-        // observable cursors. Bytes obtained via the `in` callback are counted by
-        // the engine internally but are not part of `next_in`/`avail_in`, so
-        // `total_in` accounts only for the buffered portion here (documented
-        // limitation; `avail_in` is left consistent).
-        // SAFETY: `initial_len <= avail_in`.
-        unsafe { advance_input(sref, initial_len) };
+        // C3: restore `next_in`/`avail_in` exactly like C `infback.c`'s `inf_leave`
+        // (L561-L569 sets `strm->next_in = next; strm->avail_in = have;`), which
+        // does NOT touch `total_in`/`total_out`. `next`/`have` track the LAST
+        // buffer the engine pulled from — the initial stream buffer or a callback
+        // buffer — at the unconsumed offset. A callback that ran dry leaves
+        // `next = Z_NULL`/`have = 0` (the C `PULL`-returns-0 path).
+        if src.dry {
+            sref.next_in = ptr::null();
+            sref.avail_in = 0;
+        } else if src.handed_out {
+            // `unconsumed <= last_len` by construction; `consumed` is the offset
+            // of the unconsumed tail within the last chunk.
+            let consumed = src.last_len - src.unconsumed;
+            // SAFETY: `last_ptr` is the base of the last chunk of `last_len`
+            // readable bytes; `consumed <= last_len`, so the offset is in-bounds
+            // (one-past-the-end is permitted when fully consumed, matching C's
+            // `next` pointer).
+            sref.next_in = unsafe { src.last_ptr.add(consumed) };
+            sref.avail_in = src.unconsumed as c_uint;
+        }
+        // else: the engine never pulled any input (e.g. it rejected an invalid
+        // state before reading). C returns without loading `next`/`have`, so the
+        // caller's cursors are left untouched.
 
         code.as_c_int()
     })
@@ -1176,24 +1343,19 @@ pub unsafe extern "C" fn inflateBackEnd(strm: z_streamp) -> c_int {
         }
         // SAFETY: `strm` is non-null and a valid caller-owned `z_stream`.
         let sref = unsafe { &mut *strm };
-        // Defense-in-depth against cross-type `End` misuse (same UB class as
-        // FINDING-6): the `inflateBack` handle is a bare `Box<InflateState>` with
-        // no `HandleKind` tag, so `state_take::<InflateState>` below is a blind
-        // cast. If the caller passed a stream owned by the *other* engines — a
-        // tagged `DeflateHandle`/`InflateHandle` — reconstituting it as
-        // `Box<InflateState>` would be a layout-mismatched free. Peek the tag
-        // first and reject those without taking/dropping anything. A genuine
-        // `inflateBack` state has no leading magic, so it proceeds normally.
-        // SAFETY: reads only the leading tag of the live `state` allocation.
-        if let Some(kind) = unsafe { peek_handle_kind(sref) } {
-            if kind == HandleKind::DEFLATE || kind == HandleKind::INFLATE {
-                return Z_STREAM_ERROR;
+        // C4: validate the `INFLATE_BACK` tag before reclaiming. `inflate_back_take`
+        // reconstitutes the `Box<InflateBackHandle>` ONLY when the leading tag
+        // matches, so a stream owned by the other engines — a tagged
+        // `DeflateHandle`/`InflateHandle` — or an already-freed handle is rejected
+        // with `Z_STREAM_ERROR` and nothing is taken or dropped (no layout-
+        // mismatched free).
+        // SAFETY: `state`, if non-null, is a live tagged handle from an init shim.
+        match unsafe { inflate_back_take(sref) } {
+            Some(handle) => {
+                // Hand the owned engine state to the terminator (which validates
+                // it); RAII then frees the window when `handle`/`inner` drop.
+                crate::inflate::back::inflate_back_end(handle.inner).as_c_int()
             }
-        }
-        // SAFETY: `state`, if non-null, is the `Box<InflateState>` from
-        // `inflateBackInit_`; `state_take` reclaims it and nulls `state`.
-        match unsafe { state_take::<InflateState>(sref) } {
-            Some(boxed) => crate::inflate::back::inflate_back_end(boxed).as_c_int(),
             None => Z_STREAM_ERROR,
         }
     })
@@ -1355,6 +1517,68 @@ mod tests {
         );
         assert_eq!(unsafe { inflateEnd(ptr::null_mut()) }, Z_STREAM_ERROR);
         assert_eq!(unsafe { inflateReset(ptr::null_mut()) }, Z_STREAM_ERROR);
+    }
+
+    #[test]
+    fn inflate_rejects_invalid_raw_buffers() {
+        // C `inflate` entry validation (`inflate.c` L474): a null `next_out`
+        // (regardless of `avail_out`), or a positive `avail_in` paired with a
+        // null `next_in`, is `Z_STREAM_ERROR`. An *initialized* stream is used
+        // so the rejection is attributable to buffer validation, not the state
+        // check.
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    15,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+
+        let mut out = vec![0u8; 64];
+
+        // Null `next_out` with nonzero `avail_out` -> Z_STREAM_ERROR.
+        strm.next_in = ZLIB_STREAM.as_ptr();
+        strm.avail_in = ZLIB_STREAM.len() as c_uint;
+        strm.next_out = ptr::null_mut();
+        strm.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { inflate(&mut strm, Z_NO_FLUSH) }, Z_STREAM_ERROR);
+
+        // Nonzero `avail_in` with null `next_in` -> Z_STREAM_ERROR.
+        strm.next_in = ptr::null();
+        strm.avail_in = ZLIB_STREAM.len() as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+        assert_eq!(unsafe { inflate(&mut strm, Z_NO_FLUSH) }, Z_STREAM_ERROR);
+
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+    }
+
+    #[test]
+    fn inflate_sync_rejects_null_input_with_availability() {
+        // `inflateSync` has no output buffer, so only the input half of the
+        // entry contract applies: a positive `avail_in` with a null `next_in`
+        // is `Z_STREAM_ERROR` (C would instead dereference the null pointer).
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe {
+                inflateInit2_(
+                    &mut strm,
+                    15,
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        strm.next_in = ptr::null();
+        strm.avail_in = 8;
+        assert_eq!(unsafe { inflateSync(&mut strm) }, Z_STREAM_ERROR);
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
     }
 
     #[test]
@@ -1558,6 +1782,207 @@ mod tests {
         );
         let rc = unsafe { inflateBack(&mut strm, None, ptr::null_mut(), None, ptr::null_mut()) };
         assert_eq!(rc, Z_STREAM_ERROR);
+        assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
+    }
+
+    /// C3: `inflateBack` must restore `next_in`/`avail_in` to the unconsumed
+    /// tail of the input (C `infback.c` `inf_leave`), leaving trailing bytes that
+    /// are not part of the DEFLATE stream visible to the caller — and it must NOT
+    /// touch `total_in`/`total_out`.
+    #[test]
+    fn inflate_back_preserves_unconsumed_trailing_input() {
+        let mut strm = zeroed_stream();
+        let mut window = [0u8; 1 << 15];
+        assert_eq!(
+            unsafe {
+                inflateBackInit_(
+                    &mut strm,
+                    15,
+                    window.as_mut_ptr(),
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+
+        // Pre-buffer the complete raw stream followed by trailing bytes that are
+        // NOT part of the DEFLATE stream (as if the next record began there).
+        const TRAILING: &[u8] = &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22];
+        let mut buf = Vec::with_capacity(RAW_STREAM.len() + TRAILING.len());
+        buf.extend_from_slice(RAW_STREAM);
+        buf.extend_from_slice(TRAILING);
+        let base = buf.as_ptr();
+        strm.next_in = base;
+        strm.avail_in = buf.len() as c_uint;
+
+        // The callback signals EOF; it must not be needed since the whole stream
+        // is already buffered.
+        let mut in_state = BackIn {
+            data: &[],
+            given: true,
+        };
+        let mut out_state = BackOut {
+            collected: Vec::new(),
+        };
+
+        let rc = unsafe {
+            inflateBack(
+                &mut strm,
+                Some(back_in),
+                &mut in_state as *mut BackIn as *mut c_void,
+                Some(back_out),
+                &mut out_state as *mut BackOut as *mut c_void,
+            )
+        };
+        assert_eq!(rc, Z_STREAM_END);
+        assert_eq!(out_state.collected, MSG);
+
+        // C `inf_leave` does NOT modify total_in/total_out (the old FFI bug bumped
+        // total_in via `advance_input`).
+        assert_eq!(
+            strm.total_in, 0,
+            "inflateBack must not modify total_in (C inf_leave)"
+        );
+        assert_eq!(
+            strm.total_out, 0,
+            "inflateBack must not modify total_out (C inf_leave)"
+        );
+
+        // next_in/avail_in partition the buffer, and the unconsumed tail contains
+        // (at least) the trailing bytes — the old bug set avail_in=0.
+        assert!(strm.avail_in > 0, "trailing bytes must remain available");
+        let consumed = (strm.next_in as usize) - (base as usize);
+        assert_eq!(
+            consumed + strm.avail_in as usize,
+            buf.len(),
+            "next_in/avail_in must partition the input buffer"
+        );
+        // The engine consumes exactly the complete raw stream and leaves the
+        // trailing bytes intact — byte-for-byte parity with C `inflateBack`.
+        assert_eq!(
+            consumed,
+            RAW_STREAM.len(),
+            "exactly the raw stream must be consumed"
+        );
+        assert_eq!(
+            strm.avail_in as usize,
+            TRAILING.len(),
+            "avail_in must equal the trailing byte count"
+        );
+        // SAFETY: next_in/avail_in describe a live sub-slice of `buf`.
+        let tail = unsafe { slice::from_raw_parts(strm.next_in, strm.avail_in as usize) };
+        assert_eq!(
+            tail, TRAILING,
+            "the unconsumed tail must be exactly the trailing bytes"
+        );
+
+        assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
+    }
+
+    /// C3: when the `in` callback runs dry, `inflateBack` must null `next_in` and
+    /// zero `avail_in` (C `PULL` returning 0 sets `next = Z_NULL`, `have = 0`),
+    /// even though input was initially buffered.
+    #[test]
+    fn inflate_back_dry_callback_nulls_cursor() {
+        let mut strm = zeroed_stream();
+        let mut window = [0u8; 1 << 15];
+        assert_eq!(
+            unsafe {
+                inflateBackInit_(
+                    &mut strm,
+                    15,
+                    window.as_mut_ptr(),
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+
+        // Pre-buffer a truncated (incomplete) stream so the engine must ask the
+        // callback for more, which immediately reports EOF.
+        let truncated = &RAW_STREAM[..3];
+        strm.next_in = truncated.as_ptr();
+        strm.avail_in = truncated.len() as c_uint;
+
+        let mut in_state = BackIn {
+            data: &[],
+            given: true,
+        };
+        let mut out_state = BackOut {
+            collected: Vec::new(),
+        };
+
+        let rc = unsafe {
+            inflateBack(
+                &mut strm,
+                Some(back_in),
+                &mut in_state as *mut BackIn as *mut c_void,
+                Some(back_out),
+                &mut out_state as *mut BackOut as *mut c_void,
+            )
+        };
+        // Insufficient input → the callback ran dry → Z_BUF_ERROR.
+        assert_eq!(rc, ReturnCode::BufError.as_c_int());
+        // C `PULL` returning 0 sets next = Z_NULL / have = 0.
+        assert!(
+            strm.next_in.is_null(),
+            "dry callback must null next_in (C PULL)"
+        );
+        assert_eq!(strm.avail_in, 0, "dry callback must zero avail_in");
+        assert_eq!(strm.total_in, 0, "inflateBack must not modify total_in");
+
+        assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
+    }
+
+    /// C4: `inflateBackEnd` must reject a stream whose handle is NOT an
+    /// `inflateBack` handle (here a regular `inflate` handle) with
+    /// `Z_STREAM_ERROR`, WITHOUT freeing it (no layout-mismatched free); the
+    /// correct terminator then still succeeds.
+    #[test]
+    fn inflate_back_end_rejects_inflate_handle() {
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe { inflateInit_(&mut strm, VERSION.as_ptr(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+        // Wrong terminator: the handle tag is INFLATE, not INFLATE_BACK.
+        assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_STREAM_ERROR);
+        assert!(
+            !strm.state.is_null(),
+            "handle must not be freed on mismatch"
+        );
+        // The genuine terminator still works.
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_OK);
+    }
+
+    /// C4: `inflateEnd` must reject an `inflateBack` handle (tag INFLATE_BACK, not
+    /// INFLATE) with `Z_STREAM_ERROR`, WITHOUT freeing it; `inflateBackEnd` then
+    /// reclaims it correctly.
+    #[test]
+    fn inflate_end_rejects_inflate_back_handle() {
+        let mut strm = zeroed_stream();
+        let mut window = [0u8; 1 << 15];
+        assert_eq!(
+            unsafe {
+                inflateBackInit_(
+                    &mut strm,
+                    15,
+                    window.as_mut_ptr(),
+                    VERSION.as_ptr(),
+                    size_of::<z_stream>() as c_int,
+                )
+            },
+            Z_OK
+        );
+        // Wrong terminator: the handle tag is INFLATE_BACK, not INFLATE.
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, Z_STREAM_ERROR);
+        assert!(
+            !strm.state.is_null(),
+            "handle must not be freed on mismatch"
+        );
+        // The genuine terminator still works.
         assert_eq!(unsafe { inflateBackEnd(&mut strm) }, Z_OK);
     }
 }

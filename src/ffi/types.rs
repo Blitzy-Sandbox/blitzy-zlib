@@ -275,15 +275,16 @@ pub type gz_headerp = *mut gz_header;
 /// zlib exposes just this abbreviated prefix so the C `gzgetc(g)` *macro* can
 /// read `have`/`next`/`pos` directly through the [`gzFile`] pointer.
 ///
-/// # Documented limitation
+/// # Live prefix (C2)
 ///
 /// The crate's idiomatic gz state (`crate::gz::GzState`) is **not** `#[repr(C)]`,
-/// so `gz.rs` stores its opaque handle as `Box::into_raw(Box<GzState>) as
-/// gzFile` and exposes `gzgetc`/`gzgetc_` as **real functions** rather than
-/// relying on the macro's direct field access. Strict macro fast-path parity
-/// would require the opaque handle to *begin* with a live `{ have, next, pos }`
-/// prefix; that is intentionally not attempted. This struct is still defined
-/// here for header/ABI completeness.
+/// so `gz.rs` boxes its opaque handle as a `#[repr(C)]` `GzHandle` whose FIRST
+/// field is a live instance of this struct. The `gzFile` pointer therefore
+/// begins with a real `{ have, next, pos }` prefix at offset 0 that the C
+/// `gzgetc(g)` macro can read and advance directly; `gz.rs` reconciles the
+/// prefix with the idiomatic cursor on entry to every shim and re-syncs it on
+/// exit, giving true macro fast-path parity. `gzgetc`/`gzgetc_` remain exported
+/// as real functions for callers that take the function pointer.
 #[repr(C)]
 pub struct gzFile_s {
     /// Bytes currently available in [`next`](Self::next) (C `unsigned have`).
@@ -383,11 +384,11 @@ impl Allocator for CAllocator {
     /// historical unsoundness of dropping a foreign-backed `Vec` through the
     /// global allocator cannot occur.
     #[inline]
-    fn allocate_zeroed<T>(&self, count: usize) -> AllocBuffer<T>
+    fn allocate_zeroed<T>(&self, count: usize) -> Option<AllocBuffer<T>>
     where
-        T: Copy + Default,
+        T: Copy + Default + 'static,
     {
-        AllocBuffer::zeroed(count, self.hook())
+        AllocBuffer::try_zeroed(count, self.hook())
     }
 
     /// Exposes the caller's `zalloc`/`zfree`/`opaque` triple as an
@@ -521,7 +522,8 @@ pub unsafe fn state_take<T>(strm: &mut z_stream) -> Option<Box<T>> {
 /// through [`HandleHeader`] with no enum-validity concern: every bit pattern is
 /// a valid `u64`, and only the published magics compare equal. The values have
 /// their high bits set so they can never collide with the small integer that
-/// leads an untagged engine state (e.g. the `inflateBack` `InflateState` mode).
+/// leads a bare engine state, providing defense-in-depth even though every FFI
+/// init shim now installs a tagged `#[repr(C)]` handle.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(transparent)]
 pub struct HandleKind(u64);
@@ -531,6 +533,12 @@ impl HandleKind {
     pub const DEFLATE: HandleKind = HandleKind(0xDEF1_A7E5_0DEF_0001);
     /// Tag identifying a boxed inflate handle (an `inflate*`-owned stream).
     pub const INFLATE: HandleKind = HandleKind(0x14F1_A7E5_0114_0002);
+    /// Tag identifying a boxed `inflateBack` handle (an `inflateBack*`-owned
+    /// stream). Distinct from [`INFLATE`](Self::INFLATE) so the regular
+    /// `inflateEnd`/`inflateBackEnd` terminators can reject cross-type misuse
+    /// (freeing an `inflateBack` state as a plain inflate handle, or vice
+    /// versa, would be a layout-mismatched free — the same UB class as C4).
+    pub const INFLATE_BACK: HandleKind = HandleKind(0x14F1_A7E5_BAC6_0003);
 }
 
 /// The common `#[repr(C)]` prefix shared by every tagged handle: a
@@ -576,10 +584,10 @@ impl DeflateHandle {
 /// # Safety
 ///
 /// If [`z_stream::state`] is non-null it must point at a live boxed handle whose
-/// first field is a [`HandleKind`] (every FFI init shim boxes a `#[repr(C)]`
-/// type with a leading `HandleKind`), or — for the untagged `inflateBack`
-/// `InflateState` — at least a live allocation of ≥ 8 bytes whose leading `u64`
-/// is simply read and compared (no `InflateState` field ever equals a magic).
+/// first field is a [`HandleKind`]. Every FFI init shim — `deflateInit*`,
+/// `inflateInit*`, and `inflateBackInit_` — boxes a `#[repr(C)]` type with a
+/// leading `HandleKind`, so the tag is always present and simply read/compared
+/// (no enum-validity requirement).
 #[inline]
 #[must_use]
 pub unsafe fn peek_handle_kind(strm: &z_stream) -> Option<HandleKind> {
@@ -686,6 +694,43 @@ pub unsafe fn output_slice<'a>(strm: &z_stream) -> &'a mut [u8] {
         // non-null `next_out` and disjoint from the input region.
         unsafe { slice::from_raw_parts_mut(strm.next_out, strm.avail_out as usize) }
     }
+}
+
+/// Returns `true` when the input pointer is consistent with `avail_in`: a
+/// positive `avail_in` requires a non-null `next_in` (a null `next_in` is only
+/// permitted when `avail_in == 0`).
+///
+/// This is the input half of the entry-validation contract, factored out for
+/// the call sites that constrain only the input buffer — e.g. C `inflateSync`
+/// (`inflate.c`), which validates `next_in`/`avail_in` but has no output buffer
+/// to check.
+///
+/// It is a *pure* pointer/length consistency check performed **before** any
+/// bridging via [`input_slice`]: that primitive deliberately tolerates a
+/// null-and-empty input by yielding an empty slice, so the shims must reject
+/// the `avail_in != 0 && next_in == NULL` programmer error explicitly here
+/// rather than let it be silently masked into an empty read.
+#[inline]
+#[must_use]
+pub fn input_ptr_valid(strm: &z_stream) -> bool {
+    strm.avail_in == 0 || !strm.next_in.is_null()
+}
+
+/// Returns `true` when the stream's I/O buffers satisfy the entry-validation
+/// contract shared by C `deflate` and `inflate`: `next_out` must be non-null,
+/// and a positive `avail_in` requires a non-null `next_in`.
+///
+/// This mirrors the guards at the top of C `deflate` (`deflate.c` L981-L1010)
+/// and C `inflate` (`inflate.c` L474). A null `next_out` is rejected
+/// **unconditionally** — matching C, whose `next_out == Z_NULL` check carries
+/// no `avail_out` qualifier — because [`output_slice`] would otherwise mask a
+/// null-and-empty output buffer into an empty slice. Either violation is a
+/// programmer error the shims report as `Z_STREAM_ERROR` *before* any buffer is
+/// dereferenced.
+#[inline]
+#[must_use]
+pub fn stream_buffers_valid(strm: &z_stream) -> bool {
+    !strm.next_out.is_null() && input_ptr_valid(strm)
 }
 
 /// Advances the input cursor after `consumed` bytes were read: bumps
@@ -1030,6 +1075,62 @@ const _: () = {
     assert!(core::mem::size_of::<free_func>() == core::mem::size_of::<*const c_void>());
 };
 
+// Exact numeric ABI layout guard for the primary supported target family:
+// 64-bit **LP64** (Linux/macOS on `x86_64`/`aarch64`), where `c_ulong` (C
+// `uLong`) is 8 bytes. On this ABI the mirror structs must match `libz`'s
+// `z_stream`/`gz_header`/`gzFile_s` byte for byte, so every field offset and the
+// total size is pinned below; any drift fails the build (Min1 hardening).
+//
+// Windows x64 (LLP64, `c_ulong` = 4) and 32-bit targets carry a different
+// `uLong` width and therefore different offsets, so they are intentionally
+// excluded from these *exact* checks — the ABI-portable ordering/size tests in
+// the test module still apply to every target.
+#[cfg(all(target_pointer_width = "64", not(windows)))]
+const _: () = {
+    use core::mem::{offset_of, size_of};
+
+    // `z_stream` — 14 fields, 112 bytes total on LP64.
+    assert!(offset_of!(z_stream, next_in) == 0);
+    assert!(offset_of!(z_stream, avail_in) == 8);
+    assert!(offset_of!(z_stream, total_in) == 16);
+    assert!(offset_of!(z_stream, next_out) == 24);
+    assert!(offset_of!(z_stream, avail_out) == 32);
+    assert!(offset_of!(z_stream, total_out) == 40);
+    assert!(offset_of!(z_stream, msg) == 48);
+    assert!(offset_of!(z_stream, state) == 56);
+    assert!(offset_of!(z_stream, zalloc) == 64);
+    assert!(offset_of!(z_stream, zfree) == 72);
+    assert!(offset_of!(z_stream, opaque) == 80);
+    assert!(offset_of!(z_stream, data_type) == 88);
+    assert!(offset_of!(z_stream, adler) == 96);
+    assert!(offset_of!(z_stream, reserved) == 104);
+    assert!(size_of::<z_stream>() == 112);
+
+    // `gz_header` — 13 fields, 80 bytes total on LP64.
+    assert!(offset_of!(gz_header, text) == 0);
+    assert!(offset_of!(gz_header, time) == 8);
+    assert!(offset_of!(gz_header, xflags) == 16);
+    assert!(offset_of!(gz_header, os) == 20);
+    assert!(offset_of!(gz_header, extra) == 24);
+    assert!(offset_of!(gz_header, extra_len) == 32);
+    assert!(offset_of!(gz_header, extra_max) == 36);
+    assert!(offset_of!(gz_header, name) == 40);
+    assert!(offset_of!(gz_header, name_max) == 48);
+    assert!(offset_of!(gz_header, comment) == 56);
+    assert!(offset_of!(gz_header, comm_max) == 64);
+    assert!(offset_of!(gz_header, hcrc) == 68);
+    assert!(offset_of!(gz_header, done) == 72);
+    assert!(size_of::<gz_header>() == 80);
+
+    // `gzFile_s` — `{ have, next, pos }`, 24 bytes total on LP64. This is the
+    // live prefix the C `gzgetc(g)` macro dereferences (C2), so its exact shape
+    // matters for drop-in macro consumers.
+    assert!(offset_of!(gzFile_s, have) == 0);
+    assert!(offset_of!(gzFile_s, next) == 8);
+    assert!(offset_of!(gzFile_s, pos) == 16);
+    assert!(size_of::<gzFile_s>() == 24);
+};
+
 // ===========================================================================
 // Phase 11 — Tests
 // ===========================================================================
@@ -1119,6 +1220,55 @@ mod tests {
         assert!(size_of::<gzFile_s>() >= size_of::<*mut c_uchar>() + 8);
     }
 
+    /// Min1: **exact** numeric field offsets and total sizes on the supported
+    /// 64-bit LP64 ABI (Linux/macOS on `x86_64`/`aarch64`), pinning the mirror
+    /// structs to `libz`'s byte-for-byte layout. The compile-time `const _`
+    /// guard in the module enforces the identical values at build time; this
+    /// test surfaces them as visible coverage. Excluded on Windows LLP64
+    /// (`c_ulong` = 4) and 32-bit targets, whose `uLong` width shifts offsets.
+    #[cfg(all(target_pointer_width = "64", not(windows)))]
+    #[test]
+    fn abi_exact_field_offsets_lp64() {
+        // z_stream — 112 bytes.
+        assert_eq!(offset_of!(z_stream, next_in), 0);
+        assert_eq!(offset_of!(z_stream, avail_in), 8);
+        assert_eq!(offset_of!(z_stream, total_in), 16);
+        assert_eq!(offset_of!(z_stream, next_out), 24);
+        assert_eq!(offset_of!(z_stream, avail_out), 32);
+        assert_eq!(offset_of!(z_stream, total_out), 40);
+        assert_eq!(offset_of!(z_stream, msg), 48);
+        assert_eq!(offset_of!(z_stream, state), 56);
+        assert_eq!(offset_of!(z_stream, zalloc), 64);
+        assert_eq!(offset_of!(z_stream, zfree), 72);
+        assert_eq!(offset_of!(z_stream, opaque), 80);
+        assert_eq!(offset_of!(z_stream, data_type), 88);
+        assert_eq!(offset_of!(z_stream, adler), 96);
+        assert_eq!(offset_of!(z_stream, reserved), 104);
+        assert_eq!(size_of::<z_stream>(), 112);
+
+        // gz_header — 80 bytes.
+        assert_eq!(offset_of!(gz_header, text), 0);
+        assert_eq!(offset_of!(gz_header, time), 8);
+        assert_eq!(offset_of!(gz_header, xflags), 16);
+        assert_eq!(offset_of!(gz_header, os), 20);
+        assert_eq!(offset_of!(gz_header, extra), 24);
+        assert_eq!(offset_of!(gz_header, extra_len), 32);
+        assert_eq!(offset_of!(gz_header, extra_max), 36);
+        assert_eq!(offset_of!(gz_header, name), 40);
+        assert_eq!(offset_of!(gz_header, name_max), 48);
+        assert_eq!(offset_of!(gz_header, comment), 56);
+        assert_eq!(offset_of!(gz_header, comm_max), 64);
+        assert_eq!(offset_of!(gz_header, hcrc), 68);
+        assert_eq!(offset_of!(gz_header, done), 72);
+        assert_eq!(size_of::<gz_header>(), 80);
+
+        // gzFile_s — 24 bytes; the live `gzgetc` macro prefix (C2).
+        assert_eq!(offset_of!(gzFile_s, have), 0);
+        assert_eq!(offset_of!(gzFile_s, next), 8);
+        assert_eq!(offset_of!(gzFile_s, pos), 16);
+        assert_eq!(size_of::<gzFile_s>(), 24);
+    }
+
     /// With null hooks, `CAllocator` falls back to the global allocator and
     /// produces zeroed buffers that round-trip through `deallocate` without UB.
     #[test]
@@ -1129,17 +1279,23 @@ mod tests {
             opaque: ptr::null_mut(),
         };
 
-        let bytes: AllocBuffer<u8> = alloc.allocate_zeroed(8);
+        let bytes: AllocBuffer<u8> = alloc
+            .allocate_zeroed(8)
+            .expect("global allocation is infallible");
         assert_eq!(bytes.len(), 8);
         assert!(bytes.iter().all(|&b| b == 0));
         alloc.deallocate(bytes);
 
-        let words: AllocBuffer<u32> = alloc.allocate_zeroed(4);
+        let words: AllocBuffer<u32> = alloc
+            .allocate_zeroed(4)
+            .expect("global allocation is infallible");
         assert_eq!(&words[..], &[0u32; 4][..]);
         alloc.deallocate(words);
 
         // A zero-length request yields an empty buffer.
-        let empty: AllocBuffer<u16> = alloc.allocate_zeroed(0);
+        let empty: AllocBuffer<u16> = alloc
+            .allocate_zeroed(0)
+            .expect("global allocation is infallible");
         assert!(empty.is_empty());
         alloc.deallocate(empty);
     }
@@ -1187,7 +1343,9 @@ mod tests {
         assert!(alloc.hook().is_active());
 
         {
-            let buf: AllocBuffer<u16> = alloc.allocate_zeroed(32);
+            let buf: AllocBuffer<u16> = alloc
+                .allocate_zeroed(32)
+                .expect("active-hook zalloc returns non-null");
             assert_eq!(buf.len(), 32);
             // Foreign region is zero-filled and usable as a slice.
             assert!(buf.iter().all(|&w| w == 0));
@@ -1195,6 +1353,80 @@ mod tests {
 
         assert_eq!(ALLOCS.load(Ordering::SeqCst), 1, "zalloc must be invoked");
         assert_eq!(FREES.load(Ordering::SeqCst), 1, "zfree must balance zalloc");
+    }
+
+    /// M7 regression: an **active** allocator hook whose `zalloc` reports
+    /// out-of-memory (returns `NULL`) must make `allocate_zeroed` yield
+    /// [`None`] — surfaced as `Z_MEM_ERROR` at the engine init paths — rather
+    /// than silently falling back to the Rust global allocator. A zero-count
+    /// request still succeeds through the owned fast path (the hook is never
+    /// consulted).
+    #[test]
+    fn callocator_active_hook_oom_returns_none_no_global_fallback() {
+        unsafe extern "C" fn oom_zalloc(
+            _opaque: *mut c_void,
+            _items: c_uint,
+            _size: c_uint,
+        ) -> *mut c_void {
+            // Report out-of-memory unconditionally.
+            ptr::null_mut()
+        }
+        unsafe extern "C" fn noop_zfree(_opaque: *mut c_void, _address: *mut c_void) {}
+
+        let alloc = CAllocator {
+            zalloc: Some(oom_zalloc),
+            zfree: Some(noop_zfree),
+            opaque: ptr::null_mut(),
+        };
+        assert!(alloc.hook().is_active());
+
+        // A non-empty request through the OOM hook must fail with `None`; there
+        // is deliberately NO global-allocator fallback (M7).
+        let buf: Option<AllocBuffer<u8>> = alloc.allocate_zeroed(64);
+        assert!(
+            buf.is_none(),
+            "active-hook OOM must yield None (M7), not a global-allocator Vec"
+        );
+
+        // The zero-count fast path never consults the hook and still succeeds.
+        let empty: AllocBuffer<u8> = alloc
+            .allocate_zeroed(0)
+            .expect("empty request uses the owned fast path");
+        assert!(empty.is_empty());
+    }
+
+    /// M7 propagation: a real engine init (`DeflateState::new_in`) driven by an
+    /// active OOM hook surfaces [`ZlibError::MemError`] (→ `Z_MEM_ERROR`) instead
+    /// of panicking or silently succeeding on the global allocator. This proves
+    /// the `AllocBuffer::try_zeroed(..).ok_or(ZlibError::MemError)?` chain in
+    /// `new_in` is wired end to end.
+    #[test]
+    fn deflate_new_in_surfaces_mem_error_on_active_hook_oom() {
+        use crate::constants::{Strategy, Z_DEFLATED};
+        use crate::deflate::state::DeflateState;
+        use crate::error::ZlibError;
+
+        unsafe extern "C" fn oom_zalloc(
+            _opaque: *mut c_void,
+            _items: c_uint,
+            _size: c_uint,
+        ) -> *mut c_void {
+            ptr::null_mut()
+        }
+        unsafe extern "C" fn noop_zfree(_opaque: *mut c_void, _address: *mut c_void) {}
+
+        let hook = AllocHook::new(Some(oom_zalloc), Some(noop_zfree), ptr::null_mut());
+        assert!(hook.is_active());
+
+        // Valid parameters (level 6, deflate method, 15-bit window, mem level 8,
+        // default strategy, zlib wrap): the ONLY reason this can fail is the OOM
+        // hook, so a `MemError` proves the M7 propagation path.
+        let result = DeflateState::new_in(hook, 6, Z_DEFLATED, 15, 8, Strategy::Default, 1);
+        assert!(
+            matches!(result, Err(ZlibError::MemError)),
+            "active-hook OOM at init must surface Z_MEM_ERROR (M7), got {:?}",
+            result.as_ref().map(|_| "Ok(state)")
+        );
     }
 
     /// `zstream_with_caller_alloc` produces a `ZStream<CAllocator>` carrying the

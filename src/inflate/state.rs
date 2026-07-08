@@ -608,7 +608,9 @@ mod tests {
     /// so the helper is valid in both `no_std` + `alloc` and `std` test builds
     /// and can be assigned directly to `state.window`.
     fn make_window(n: usize) -> AllocBuffer<u8> {
-        AllocBuffer::zeroed(n, AllocHook::none())
+        // The null hook always yields an owned global-allocator buffer, so
+        // `try_zeroed` never returns `None` here.
+        AllocBuffer::try_zeroed(n, AllocHook::none()).expect("global allocation is infallible")
     }
 
     #[test]

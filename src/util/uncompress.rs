@@ -70,10 +70,15 @@ use crate::stream::ZStream;
 ///     consumed (C `*sourceLen -= len`). After a successful call,
 ///     `source[*source_len..]` is the first unused input byte onward — exactly
 ///     C's "`source + *sourceLen` points to the first unused input byte".
+/// * `dest_len` — an **out** parameter written with the number of output bytes
+///   actually produced (C `*destLen -= left`, i.e. `total_out`). Reproducing C
+///   `uncompress2_z`, this is written on **every** path that reaches the decode
+///   loop — success **and** failure — so a caller observing `Z_BUF_ERROR` (or
+///   any error) still learns how many bytes were written before the failure.
 ///
-/// The out-parameter is written on every path that reaches the decode loop
-/// (success *and* failure); it is left untouched only if engine initialization
-/// itself fails, matching C's early `return err;` after a failed
+/// Both out-parameters are written on every path that reaches the decode loop
+/// (success *and* failure); they are left untouched only if engine
+/// initialization itself fails, matching C's early `return err;` after a failed
 /// `inflateInit`.
 ///
 /// # Returns
@@ -103,14 +108,17 @@ use crate::stream::ZStream;
 /// // `zlib` is a valid zlib stream and `plain_len` its decompressed size.
 /// let mut out = vec![0u8; plain_len];
 /// let mut consumed = zlib.len();
-/// let n = uncompress2(&mut out, &zlib, &mut consumed)?;
+/// let mut produced = out.len();
+/// let n = uncompress2(&mut out, &zlib, &mut consumed, &mut produced)?;
 /// assert_eq!(n, plain_len);
-/// assert_eq!(consumed, zlib.len()); // whole stream read
+/// assert_eq!(produced, plain_len);   // output count reported on all paths
+/// assert_eq!(consumed, zlib.len());  // whole stream read
 /// ```
 pub fn uncompress2(
     dest: &mut [u8],
     source: &[u8],
     source_len: &mut usize,
+    dest_len: &mut usize,
 ) -> Result<usize, ReturnCode> {
     // Amount of input the engine is allowed to see. Honor the caller-declared
     // length (C `*sourceLen`) but never read past the end of the slice.
@@ -168,8 +176,13 @@ pub fn uncompress2(
 
     // C accounting (`uncompr.c` L69-L74): after the loop, `len` is the number of
     // input bytes NOT consumed and `*sourceLen` becomes the number that WAS.
+    // Both counts are published on every post-init path (success AND failure),
+    // exactly as C `uncompress2_z` computes `*sourceLen -= len` / `*destLen -=
+    // left` before `return err;`, so a caller that hit `Z_BUF_ERROR` still sees
+    // how many output bytes were produced before the buffer ran out.
     let leftover_in = available - in_pos;
     *source_len = in_pos;
+    *dest_len = out_pos;
 
     // Return mapping — reproduces `uncompr.c` L78-L81 exactly:
     //   Z_STREAM_END                              -> Ok(produced)
@@ -213,9 +226,11 @@ pub fn uncompress2(
 /// ```
 pub fn uncompress(dest: &mut [u8], source: &[u8]) -> Result<usize, ReturnCode> {
     // C `uncompress` seeds a local `used = sourceLen` and calls `uncompress2`,
-    // then throws the updated `used` away.
+    // then throws the updated `used` away. The produced-count out-parameter is
+    // likewise discarded here (the `Ok(produced)` return still carries it).
     let mut used = source.len();
-    uncompress2(dest, source, &mut used)
+    let mut produced = dest.len();
+    uncompress2(dest, source, &mut used, &mut produced)
 }
 
 #[cfg(test)]
@@ -357,9 +372,15 @@ mod tests {
     fn uncompress2_reports_consumed_length() {
         let mut out = [0u8; 32];
         let mut consumed = HELLO_ZLIB.len();
-        let n = uncompress2(&mut out, &HELLO_ZLIB, &mut consumed).expect("ok");
+        let mut produced = out.len();
+        let n = uncompress2(&mut out, &HELLO_ZLIB, &mut consumed, &mut produced).expect("ok");
         assert_eq!(n, HELLO_PLAIN.len());
         assert_eq!(consumed, HELLO_ZLIB.len(), "the entire stream is consumed");
+        assert_eq!(
+            produced,
+            HELLO_PLAIN.len(),
+            "the produced-count out-parameter matches the return value"
+        );
     }
 
     #[test]
@@ -370,13 +391,15 @@ mod tests {
         buf[..HELLO_ZLIB.len()].copy_from_slice(&HELLO_ZLIB);
         let mut out = [0u8; 32];
         let mut consumed = buf.len();
-        let n = uncompress2(&mut out, &buf, &mut consumed).expect("ok");
+        let mut produced = out.len();
+        let n = uncompress2(&mut out, &buf, &mut consumed, &mut produced).expect("ok");
         assert_eq!(n, HELLO_PLAIN.len());
         assert_eq!(
             consumed,
             HELLO_ZLIB.len(),
             "trailing bytes are not consumed"
         );
+        assert_eq!(produced, HELLO_PLAIN.len(), "produced count is reported");
         assert_eq!(&out[..n], HELLO_PLAIN);
     }
 
@@ -415,9 +438,11 @@ mod tests {
         // (zero) input "consumed" this is the truncated-stream branch.
         let mut out = [0u8; 32];
         let mut consumed = 0usize;
-        let err = uncompress2(&mut out, &HELLO_ZLIB, &mut consumed).unwrap_err();
+        let mut produced = out.len();
+        let err = uncompress2(&mut out, &HELLO_ZLIB, &mut consumed, &mut produced).unwrap_err();
         assert_eq!(err, ReturnCode::DataError);
         assert_eq!(consumed, 0);
+        assert_eq!(produced, 0, "no output is produced on this error path");
     }
 
     #[test]
@@ -426,8 +451,13 @@ mod tests {
         // engine from ever finishing, and the cap is never exceeded.
         let mut out = [0u8; 32];
         let mut consumed = 6usize; // Fewer than the 20-byte stream.
-        let result = uncompress2(&mut out, &HELLO_ZLIB, &mut consumed);
+        let mut produced = out.len();
+        let result = uncompress2(&mut out, &HELLO_ZLIB, &mut consumed, &mut produced);
         assert!(result.is_err(), "a capped, incomplete stream cannot finish");
         assert!(consumed <= 6, "never read past the declared cap");
+        assert!(
+            produced <= out.len(),
+            "produced count stays within the buffer"
+        );
     }
 }

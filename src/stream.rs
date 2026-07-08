@@ -64,32 +64,37 @@
 //! [`AllocBuffer`], a smart owned region that is **either** a global-allocator
 //! [`Vec`] (the null-hook default, byte-for-byte the historical behavior)
 //! **or** a foreign region obtained from the caller's `zalloc` and released
-//! through their `zfree` on [`Drop`]. The engines only ever see a slice
+//! through their `zfree` when the box drops. The engines only ever see a slice
 //! ([`Deref`]/[`DerefMut`]), so which backing store is in play is invisible to
 //! the compression/decompression logic and requires **no** `unsafe` on their
 //! side.
 //!
 //! # Safety, `no_std`
 //!
-//! The **only** `unsafe` in this module lives inside [`AllocBuffer`]: invoking
-//! the caller-supplied C `zalloc`/`zfree` function pointers and materializing a
-//! slice over the returned region. This is the safe-Rust equivalent of C's
-//! `ZALLOC`/`ZFREE` macros and is an allocator-plumbing boundary directly
-//! analogous to the crate-root libc `#[global_allocator]` (see `lib.rs`);
-//! each operation carries a `// SAFETY:` justification. Crucially, the **core
-//! compression engine** (`src/deflate/**`) still contains **zero `unsafe`**
-//! (user rule R3) — its buffer fields are [`AllocBuffer`]s accessed purely
-//! through safe slice operations, and the compression-logic files
-//! (`slow.rs`/`stored.rs`/`trees.rs`) remain under `#![deny(unsafe_code)]`. The
-//! module is `no_std` + `alloc` compatible: it references only `core`, `alloc`,
-//! and the crate's own modules.
+//! This module contains **zero `unsafe`** (enforced by `#![deny(unsafe_code)]`
+//! below). The raw-pointer work for a caller-`zalloc`'d region — invoking the C
+//! `zalloc`/`zfree` function pointers, materializing a slice over the returned
+//! memory, and freeing it on drop — is defined entirely in the sanctioned
+//! [`crate::ffi::alloc`] zone behind the safe [`ForeignBuffer`] trait (M6). The
+//! [`Foreign`](AllocBuffer::Foreign) arm holds a `Box<dyn ForeignBuffer<T>>` and
+//! delegates every access to that safe interface. Consequently the **core
+//! compression engine** (`src/deflate/**`) also contains **zero `unsafe`** (user
+//! rule R3) — its buffer fields are [`AllocBuffer`]s accessed purely through
+//! safe slice operations, and the compression-logic files
+//! (`slow.rs`/`stored.rs`/`trees.rs`) remain under `#![deny(unsafe_code)]`.
+//!
+//! Allocation is **fallible** at the boundary: when a caller installs a bounded
+//! allocator whose `zalloc` reports out-of-memory, buffer construction returns
+//! [`None`] and the init paths surface `Z_MEM_ERROR` (M7) rather than silently
+//! using the global allocator. The module is `no_std` + `alloc` compatible: it
+//! references only `core`, `alloc`, and the crate's own modules.
+#![deny(unsafe_code)]
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::{c_uint, c_void};
 use core::fmt;
 use core::ops::{Deref, DerefMut};
-use core::ptr::NonNull;
 
 use crate::constants::DataType;
 use crate::deflate::state::DeflateState;
@@ -169,6 +174,72 @@ impl AllocHook {
     pub const fn is_active(&self) -> bool {
         self.zalloc.is_some() && self.zfree.is_some()
     }
+
+    /// The caller's allocation hook, if present. Read by the sanctioned
+    /// [`crate::ffi::alloc`] bridge to invoke `zalloc`.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn zalloc(&self) -> Option<ZallocFn> {
+        self.zalloc
+    }
+
+    /// The caller's deallocation hook, if present. Read by the sanctioned
+    /// [`crate::ffi::alloc`] bridge to invoke `zfree` on drop.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn zfree(&self) -> Option<ZfreeFn> {
+        self.zfree
+    }
+
+    /// The caller's private cookie, forwarded verbatim to both hooks.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn opaque(&self) -> *mut c_void {
+        self.opaque
+    }
+
+    /// Allocates a zero-initialized foreign buffer of `count` elements through
+    /// this (active) hook, delegating to the sanctioned [`crate::ffi::alloc`]
+    /// zone where the raw-pointer `unsafe` is confined (M6).
+    ///
+    /// Returns [`None`] when the caller's `zalloc` reports out-of-memory (or the
+    /// size is unrepresentable); there is **no** global-allocator fallback, so
+    /// the init paths can surface `Z_MEM_ERROR` (M7).
+    #[inline]
+    pub(crate) fn try_alloc_zeroed<T: Copy + Default + 'static>(
+        &self,
+        count: usize,
+    ) -> Option<Box<dyn ForeignBuffer<T>>> {
+        crate::ffi::alloc::try_alloc_foreign::<T>(*self, count)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ForeignBuffer — the safe interface to a caller-`zalloc`'d region
+// ---------------------------------------------------------------------------
+
+/// The safe interface this module uses to access a caller-`zalloc`'d working
+/// buffer **without any `unsafe`**.
+///
+/// The sole implementor is `CForeignBuffer` in the sanctioned
+/// [`crate::ffi::alloc`] zone, which confines the raw-pointer hook invocation,
+/// the slice materialization, and the `zfree`-on-drop (migration
+/// unsafe-isolation rule / AAP §0.6.2). [`AllocBuffer::Foreign`] holds one as a
+/// `Box<dyn ForeignBuffer<T>>` and delegates [`Deref`]/[`DerefMut`]/[`Clone`] to
+/// these methods, so neither this module nor the compression engines contain any
+/// `unsafe` (M6).
+pub trait ForeignBuffer<T: Copy + Default> {
+    /// The buffer contents as a shared slice of `T`.
+    fn as_slice(&self) -> &[T];
+
+    /// The buffer contents as a unique (mutable) slice of `T`.
+    fn as_mut_slice(&mut self) -> &mut [T];
+
+    /// Deep-clones into a fresh foreign region allocated through the same hook
+    /// (matching C `deflateCopy`), or [`None`] if that allocation reports OOM —
+    /// in which case [`AllocBuffer::clone`] performs a sound global-allocator
+    /// copy so [`Clone`] remains infallible.
+    fn clone_foreign(&self) -> Option<Box<dyn ForeignBuffer<T>>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -187,89 +258,64 @@ impl AllocHook {
 ///
 /// # Backing-store selection
 ///
-/// [`AllocBuffer::zeroed`] returns a [`Foreign`](Self::Foreign) region only when
-/// the [`AllocHook`] is [active](AllocHook::is_active), the element count is
-/// non-zero, and the caller's `zalloc` returns non-null. In every other case —
-/// no hook, an empty request, an unrepresentable size, or a `zalloc` reporting
-/// out-of-memory — it falls back to an [`Owned`](Self::Owned) [`Vec`],
-/// preserving the infallible-allocation contract and byte-for-byte reproducing
-/// the historical behavior on the null-hook path.
+/// [`AllocBuffer::try_zeroed`] returns a [`Foreign`](Self::Foreign) region only
+/// when the [`AllocHook`] is [active](AllocHook::is_active) and the element count
+/// is non-zero; that region is produced by the sanctioned [`crate::ffi::alloc`]
+/// zone. With no hook (or an empty request) it is an [`Owned`](Self::Owned)
+/// [`Vec`], byte-for-byte reproducing the historical global-allocator behavior.
 ///
-/// # Zeroing
+/// When an active hook's `zalloc` reports out-of-memory (or the request is an
+/// unrepresentable size), [`try_zeroed`](Self::try_zeroed) returns [`None`]
+/// rather than silently falling back to the global allocator; callers propagate
+/// that as `Z_MEM_ERROR` (M7). The only place a foreign buffer degrades to an
+/// owned one is [`Clone`] under memory pressure (see its docs), which must stay
+/// infallible.
 ///
-/// A foreign region is zero-filled with [`core::ptr::write_bytes`], reproducing
-/// C `zcalloc`'s post-`zalloc` `zmemzero`. `T` is bounded `Copy + Default`, and
-/// the element types the engines request (`u8`, `u16`, `u32`) all have an
-/// all-zero bit pattern equal to their [`Default`] value, so the zero-fill is a
-/// correct initialization.
+/// # Zeroing and `unsafe` isolation
+///
+/// A foreign region is zero-filled inside [`crate::ffi::alloc`], reproducing C
+/// `zcalloc`'s post-`zalloc` `zmemzero`. `T` is bounded `Copy + Default`, and the
+/// element types the engines request (`u8`, `u16`, `u32`) all have an all-zero
+/// bit pattern equal to their [`Default`] value, so the zero-fill is a correct
+/// initialization. **This module contains no `unsafe`**: every raw-pointer
+/// operation for the [`Foreign`](Self::Foreign) arm is behind the safe
+/// [`ForeignBuffer`] interface (M6).
 pub enum AllocBuffer<T: Copy + Default> {
     /// Global-allocator storage (the default / null-hook path).
     Owned(Vec<T>),
-    /// Caller-`zalloc`'d storage, released through the caller's `zfree` on drop.
-    Foreign {
-        /// Non-null pointer to `len` initialized elements from the hook's
-        /// `zalloc`.
-        ptr: NonNull<T>,
-        /// Element count (not bytes).
-        len: usize,
-        /// The hook whose `zfree` releases `ptr` (via its `opaque`).
-        hook: AllocHook,
-    },
+    /// Caller-`zalloc`'d storage, accessed through the safe [`ForeignBuffer`]
+    /// interface and released through the caller's `zfree` when the box drops.
+    /// The concrete implementor lives in the sanctioned [`crate::ffi::alloc`]
+    /// zone, so this module never touches the raw pointer.
+    Foreign(Box<dyn ForeignBuffer<T>>),
 }
 
 impl<T: Copy + Default> AllocBuffer<T> {
     /// Allocates a zero-initialized buffer of `count` elements, routing through
     /// the caller's `zalloc` when `hook` is active (see the type-level
     /// [backing-store selection](AllocBuffer#backing-store-selection)).
+    ///
+    /// Returns [`None`] when an active hook's `zalloc` reports out-of-memory (or
+    /// the requested size is unrepresentable in the C `uInt` hook ABI); callers
+    /// propagate that as `Z_MEM_ERROR` (M7). The null-hook and empty-count paths
+    /// always succeed via the global allocator, byte-for-byte reproducing the
+    /// historical behavior. All raw-pointer work for the active-hook path is
+    /// confined to the sanctioned [`crate::ffi::alloc`] zone (M6), so this method
+    /// contains no `unsafe`.
     #[must_use]
-    pub fn zeroed(count: usize, hook: AllocHook) -> Self {
+    pub fn try_zeroed(count: usize, hook: AllocHook) -> Option<Self>
+    where
+        T: 'static,
+    {
         // Fast path / default: no custom allocator, or an empty request.
         // `vec![T::default(); count]` matches C `zcalloc`'s zero fill and is the
         // exact historical (global-allocator) behavior.
         if !hook.is_active() || count == 0 {
-            return AllocBuffer::Owned(alloc::vec![T::default(); count]);
+            return Some(AllocBuffer::Owned(alloc::vec![T::default(); count]));
         }
-        // The C hook takes `items: uInt` and `size: uInt` (both `c_uint`). Guard
-        // the width and the multiplication so we never pass a truncated size; on
-        // any overflow fall back to the global allocator rather than risk a
-        // short allocation.
-        let elem = core::mem::size_of::<T>();
-        let (Ok(items), Ok(size)) = (c_uint::try_from(count), c_uint::try_from(elem)) else {
-            return AllocBuffer::Owned(alloc::vec![T::default(); count]);
-        };
-        if u64::from(items).checked_mul(u64::from(size)).is_none() {
-            return AllocBuffer::Owned(alloc::vec![T::default(); count]);
-        }
-        // Both halves are guaranteed present by `is_active()`.
-        let Some(zalloc) = hook.zalloc else {
-            return AllocBuffer::Owned(alloc::vec![T::default(); count]);
-        };
-        // SAFETY: `zalloc` is a caller-supplied `alloc_func` taken from a valid
-        // `z_stream`; per the zlib contract it allocates `items * size` bytes
-        // suitably aligned for the element type (or returns null). `opaque` is
-        // the caller's cookie, forwarded verbatim. Only the returned pointer is
-        // inspected here — the hook is not dereferenced in any other way.
-        let raw = unsafe { zalloc(hook.opaque, items, size) } as *mut T;
-        match NonNull::new(raw) {
-            // `zalloc` reported OOM. Our trait is infallible, so fall back to the
-            // global allocator: the stream still receives valid, zeroed storage
-            // of the requested size.
-            None => AllocBuffer::Owned(alloc::vec![T::default(); count]),
-            Some(ptr) => {
-                // SAFETY: `zalloc` returned a non-null region of at least
-                // `count * size_of::<T>()` bytes (its documented contract), so
-                // zero-writing `count` elements is in-bounds. `T: Copy` has no
-                // drop glue (overwriting the uninitialized region is sound), and
-                // an all-zero bit pattern is a valid value for the integer
-                // element types the engines use.
-                unsafe { core::ptr::write_bytes(ptr.as_ptr(), 0u8, count) };
-                AllocBuffer::Foreign {
-                    ptr,
-                    len: count,
-                    hook,
-                }
-            }
-        }
+        // Active hook: delegate to the sanctioned `ffi` allocator zone. `None`
+        // (OOM / unrepresentable size) propagates — no global fallback (M7).
+        hook.try_alloc_zeroed::<T>(count).map(AllocBuffer::Foreign)
     }
 
     /// Wraps an existing [`Vec`] as an [`Owned`](Self::Owned) buffer (used by
@@ -287,7 +333,7 @@ impl<T: Copy + Default> AllocBuffer<T> {
     pub fn len(&self) -> usize {
         match self {
             AllocBuffer::Owned(v) => v.len(),
-            AllocBuffer::Foreign { len, .. } => *len,
+            AllocBuffer::Foreign(b) => b.as_slice().len(),
         }
     }
 
@@ -305,13 +351,9 @@ impl<T: Copy + Default> Deref for AllocBuffer<T> {
     fn deref(&self) -> &[T] {
         match self {
             AllocBuffer::Owned(v) => v.as_slice(),
-            // SAFETY: `ptr` points to `len` contiguous, initialized `T`s obtained
-            // from the hook's `zalloc` and zero-filled in `zeroed`; the region
-            // stays valid and exclusively owned until this `AllocBuffer` drops,
-            // so a shared slice for the `&self` borrow is sound.
-            AllocBuffer::Foreign { ptr, len, .. } => unsafe {
-                core::slice::from_raw_parts(ptr.as_ptr(), *len)
-            },
+            // Delegates to the safe `ForeignBuffer` interface; the raw-pointer
+            // slice materialization is confined to `crate::ffi::alloc` (M6).
+            AllocBuffer::Foreign(b) => b.as_slice(),
         }
     }
 }
@@ -321,31 +363,34 @@ impl<T: Copy + Default> DerefMut for AllocBuffer<T> {
     fn deref_mut(&mut self) -> &mut [T] {
         match self {
             AllocBuffer::Owned(v) => v.as_mut_slice(),
-            // SAFETY: as in `deref`, but `&mut self` guarantees exclusive access,
-            // so a unique slice over the owned region is sound.
-            AllocBuffer::Foreign { ptr, len, .. } => unsafe {
-                core::slice::from_raw_parts_mut(ptr.as_ptr(), *len)
-            },
+            // As in `deref`, delegating to the safe `ForeignBuffer` interface.
+            AllocBuffer::Foreign(b) => b.as_mut_slice(),
         }
     }
 }
 
 impl<T: Copy + Default> Clone for AllocBuffer<T> {
-    /// Deep-clones the buffer, preserving the backing store: an
-    /// [`Owned`](Self::Owned) buffer clones its [`Vec`], and a
-    /// [`Foreign`](Self::Foreign) buffer allocates a fresh region through the
-    /// same hook (re-invoking the caller's `zalloc`, matching C `deflateCopy`
-    /// which `ZALLOC`s new buffers) and copies the contents across.
+    /// Deep-clones the buffer. An [`Owned`](Self::Owned) buffer clones its
+    /// [`Vec`]; a [`Foreign`](Self::Foreign) buffer allocates a fresh region
+    /// through the same hook (re-invoking the caller's `zalloc`, matching C
+    /// `deflateCopy` which `ZALLOC`s new buffers) via
+    /// [`ForeignBuffer::clone_foreign`] and copies the contents across.
+    ///
+    /// [`Clone`] cannot fail, so if the caller's `zalloc` reports OOM during the
+    /// copy, this degrades to a **sound global-allocator copy** of the live
+    /// contents (the fresh buffer becomes [`Owned`](Self::Owned)). The data is
+    /// correct; only the backing allocator differs. This is the single
+    /// documented boundary where a foreign buffer may become owned — the fallible
+    /// INIT paths ([`try_zeroed`](Self::try_zeroed)) are the M7 target and still
+    /// surface `Z_MEM_ERROR`; only this infallible `deflateCopy`-style clone
+    /// tolerates the fallback.
     fn clone(&self) -> Self {
         match self {
             AllocBuffer::Owned(v) => AllocBuffer::Owned(v.clone()),
-            AllocBuffer::Foreign { len, hook, .. } => {
-                let mut copy = AllocBuffer::zeroed(*len, *hook);
-                // `copy` holds exactly `*len` elements (a fresh foreign region,
-                // or an owned fallback); copy the live contents in.
-                copy.copy_from_slice(self.deref());
-                copy
-            }
+            AllocBuffer::Foreign(b) => match b.clone_foreign() {
+                Some(fresh) => AllocBuffer::Foreign(fresh),
+                None => AllocBuffer::Owned(b.as_slice().to_vec()),
+            },
         }
     }
 }
@@ -359,20 +404,11 @@ impl<T: Copy + Default> Default for AllocBuffer<T> {
     }
 }
 
-impl<T: Copy + Default> Drop for AllocBuffer<T> {
-    fn drop(&mut self) {
-        if let AllocBuffer::Foreign { ptr, hook, .. } = self {
-            if let Some(zfree) = hook.zfree {
-                // SAFETY: `ptr` was returned by this same hook's `zalloc` and has
-                // not been freed before — this `AllocBuffer` is its unique owner
-                // and `Owned` fallbacks never reach this arm. `zfree` is the
-                // caller's matching deallocator and `opaque` its cookie, exactly
-                // as zlib's `ZFREE(strm, addr)` calls `(*zfree)(opaque, addr)`.
-                unsafe { zfree(hook.opaque, ptr.as_ptr() as *mut c_void) };
-            }
-        }
-    }
-}
+// NOTE: `AllocBuffer` needs no manual `Drop`. The `Owned` arm's `Vec` frees
+// itself through the global allocator, and the `Foreign` arm's
+// `Box<dyn ForeignBuffer<T>>` runs its implementor's `Drop` (in the sanctioned
+// `crate::ffi::alloc` zone), which calls the caller's `zfree`. Both release paths
+// are automatic, so no `unsafe` deallocation lives in this module (M6).
 
 /// Abstraction over the source of the library's heap buffers, replacing the C
 /// `alloc_func`/`free_func` pointers (`zlib.h` L85-L86).
@@ -413,9 +449,14 @@ pub trait Allocator {
     /// value without running arbitrary drop or clone logic; the buffer element
     /// types the engines request are the plain integer types `u8`, `u16`, and
     /// `u32`, all of whose `Default` is `0`.
-    fn allocate_zeroed<T>(&self, count: usize) -> AllocBuffer<T>
+    ///
+    /// Returns [`None`] when an active hook's `zalloc` reports out-of-memory;
+    /// callers translate that into `Z_MEM_ERROR` (M7). The global-allocator
+    /// default is infallible (it aborts on OOM, per Rust convention) and so
+    /// always returns [`Some`].
+    fn allocate_zeroed<T>(&self, count: usize) -> Option<AllocBuffer<T>>
     where
-        T: Copy + Default;
+        T: Copy + Default + 'static;
 
     /// Returns the caller-allocator [`AllocHook`] this allocator forwards to,
     /// or [`AllocHook::none`] (the default) when it uses the global allocator.
@@ -461,17 +502,15 @@ pub struct DefaultAllocator;
 
 impl Allocator for DefaultAllocator {
     #[inline]
-    fn allocate_zeroed<T>(&self, count: usize) -> AllocBuffer<T>
+    fn allocate_zeroed<T>(&self, count: usize) -> Option<AllocBuffer<T>>
     where
-        T: Copy + Default,
+        T: Copy + Default + 'static,
     {
         // The default allocator has no hook, so this is always an owned,
-        // global-allocator `Vec` (byte-for-byte the historical behavior).
-        // `vec![elem; n]` is the idiomatic, allocator-optimal way to build a
-        // zero/`Default`-filled buffer (it avoids the "slow vector
-        // initialization" pattern of `with_capacity` + `resize`). The fully
-        // qualified `alloc::vec!` keeps this valid under `no_std`.
-        AllocBuffer::Owned(alloc::vec![T::default(); count])
+        // global-allocator `Vec` (byte-for-byte the historical behavior) and
+        // therefore always `Some`. Routing through `try_zeroed` with the "none"
+        // hook keeps the single source of truth for buffer construction.
+        AllocBuffer::try_zeroed(count, AllocHook::none())
     }
 
     // `hook` uses the trait default (`AllocHook::none`): the global allocator.
@@ -953,15 +992,17 @@ mod tests {
     fn default_allocator_allocates_zeroed_buffers() {
         let alloc = DefaultAllocator;
 
-        let bytes: AllocBuffer<u8> = alloc.allocate_zeroed(4);
+        // The global-allocator default is infallible, so `allocate_zeroed`
+        // always returns `Some`.
+        let bytes: AllocBuffer<u8> = alloc.allocate_zeroed(4).expect("infallible");
         assert_eq!(&bytes[..], &[0u8; 4][..]);
         assert_eq!(bytes.len(), 4);
 
-        let words: AllocBuffer<u16> = alloc.allocate_zeroed(3);
+        let words: AllocBuffer<u16> = alloc.allocate_zeroed(3).expect("infallible");
         assert_eq!(&words[..], &[0u16; 3][..]);
 
         // A zero-length request yields an empty buffer.
-        let empty: AllocBuffer<u32> = alloc.allocate_zeroed(0);
+        let empty: AllocBuffer<u32> = alloc.allocate_zeroed(0).expect("infallible");
         assert!(empty.is_empty());
 
         // `deallocate` consumes the buffer (default path just drops it).
@@ -1083,11 +1124,11 @@ mod tests {
     }
 
     impl Allocator for CountingAllocator<'_> {
-        fn allocate_zeroed<T>(&self, count: usize) -> AllocBuffer<T>
+        fn allocate_zeroed<T>(&self, count: usize) -> Option<AllocBuffer<T>>
         where
-            T: Copy + Default,
+            T: Copy + Default + 'static,
         {
-            AllocBuffer::Owned(alloc::vec![T::default(); count])
+            Some(AllocBuffer::Owned(alloc::vec![T::default(); count]))
         }
     }
 
@@ -1113,7 +1154,7 @@ mod tests {
     fn custom_allocator_allocates_zeroed() {
         let drops = AtomicUsize::new(0);
         let alloc = CountingAllocator { drops: &drops };
-        let buf: AllocBuffer<u8> = alloc.allocate_zeroed(8);
+        let buf: AllocBuffer<u8> = alloc.allocate_zeroed(8).expect("infallible");
         assert_eq!(&buf[..], &[0u8; 8][..]);
     }
 

@@ -268,7 +268,13 @@ pub unsafe extern "C" fn compressBound_z(source_len: z_size_t) -> z_size_t {
 /// [`crate::util::uncompress2`] engine — which already reproduces the
 /// `uncompr.c` L78-L81 return-code mapping (`Z_STREAM_END`→`Ok`,
 /// `Z_NEED_DICT`→`Z_DATA_ERROR`, all-input-consumed `Z_BUF_ERROR`→
-/// `Z_DATA_ERROR`) — and reports `(consumed, Result<produced, code>)`.
+/// `Z_DATA_ERROR`) — and reports `(consumed, produced, Result<(), code>)`.
+///
+/// The `produced` count is authoritative on **every** path that reaches the
+/// decode loop (success *and* failure), so the FFI shims can publish
+/// `*destLen = total_out` on all paths exactly as C's `uncompress2_z` does
+/// (`uncompr.c`: `*destLen = stream.total_out;` runs before the error-mapping
+/// `return`). The trailing `Result` carries only the mapped return code.
 ///
 /// # Safety
 ///
@@ -281,7 +287,7 @@ unsafe fn uncompress2_engine(
     cap: usize,
     source: *const Bytef,
     avail: usize,
-) -> (usize, Result<usize, c_int>) {
+) -> (usize, usize, Result<(), c_int>) {
     // SAFETY: the caller guarantees each `(ptr, len)` pair is valid (or the
     // pointer is null with a zero length, which yields an empty slice).
     let src = unsafe { as_bytes(source, avail) };
@@ -291,11 +297,16 @@ unsafe fn uncompress2_engine(
     // engine caps its input at `avail`, then it is overwritten with the number
     // of bytes actually consumed (C `*sourceLen -= len`).
     let mut consumed = avail;
-    let result = match util::uncompress2(dst, src, &mut consumed) {
-        Ok(produced) => Ok(produced),
+    // `produced` is a pure out-parameter (seeded at zero, matching C's
+    // `*destLen = 0;` before the decode loop). `util::uncompress2` overwrites
+    // it on every path that reaches the decode loop, so it is correct on both
+    // the success and error arms below.
+    let mut produced = 0usize;
+    let result = match util::uncompress2(dst, src, &mut consumed, &mut produced) {
+        Ok(_) => Ok(()),
         Err(rc) => Err(rc.as_c_int()),
     };
-    (consumed, result)
+    (consumed, produced, result)
 }
 
 /// Decompresses the whole zlib stream in `source` into `dest`, writing the
@@ -326,24 +337,19 @@ pub unsafe extern "C" fn uncompress2(
             return Z_STREAM_ERROR;
         }
         // SAFETY: the pointer/length couplings were validated above.
-        let (consumed, result) = unsafe { uncompress2_engine(dest, cap, source, avail) };
-        // C always writes back the consumed count after the decode loop.
+        let (consumed, produced, result) = unsafe { uncompress2_engine(dest, cap, source, avail) };
+        // C writes back BOTH counts after the decode loop, on success *and* on
+        // error (`uncompr.c`: `*sourceLen -= len + stream.avail_in;` and
+        // `*destLen = stream.total_out;` both run before the error-mapping
+        // `return`). Publishing the produced count on the error path is the M2
+        // fix: callers relying on the partial output length now observe it.
         // SAFETY: `source_len` is non-null (checked above).
         unsafe { *source_len = consumed as uLong };
+        // SAFETY: `dest_len` is non-null (checked above).
+        unsafe { *dest_len = produced as uLongf };
         match result {
-            Ok(produced) => {
-                // SAFETY: `dest_len` is non-null (checked above).
-                unsafe { *dest_len = produced as uLongf };
-                Z_OK
-            }
-            Err(code) => {
-                // The safe engine does not surface the partial output count on
-                // error; report zero produced. (C would report the bytes filled
-                // before failure; callers must not rely on partial output.)
-                // SAFETY: `dest_len` is non-null (checked above).
-                unsafe { *dest_len = 0 };
-                code
-            }
+            Ok(()) => Z_OK,
+            Err(code) => code,
         }
     })
 }
@@ -368,20 +374,16 @@ pub unsafe extern "C" fn uncompress2_z(
             return Z_STREAM_ERROR;
         }
         // SAFETY: the pointer/length couplings were validated above.
-        let (consumed, result) = unsafe { uncompress2_engine(dest, cap, source, avail) };
+        let (consumed, produced, result) = unsafe { uncompress2_engine(dest, cap, source, avail) };
+        // As in [`uncompress2`], both counts are published on every path
+        // (success and error), matching C `uncompress2_z`.
         // SAFETY: `source_len` is non-null (checked above).
         unsafe { *source_len = consumed };
+        // SAFETY: `dest_len` is non-null (checked above).
+        unsafe { *dest_len = produced };
         match result {
-            Ok(produced) => {
-                // SAFETY: `dest_len` is non-null (checked above).
-                unsafe { *dest_len = produced };
-                Z_OK
-            }
-            Err(code) => {
-                // SAFETY: `dest_len` is non-null (checked above).
-                unsafe { *dest_len = 0 };
-                code
-            }
+            Ok(()) => Z_OK,
+            Err(code) => code,
         }
     })
 }
@@ -956,8 +958,76 @@ mod tests {
             )
         };
         assert_eq!(rc, Z_DATA_ERROR);
-        // On error the produced length is reported as zero.
+        // The corrupt byte 0xFF decodes to BFINAL=1, BTYPE=11 (an invalid,
+        // reserved block type), so decoding fails at the block-type check
+        // before emitting any output. Zero is therefore the *true* produced
+        // count here, not the old force-to-zero behavior; the general
+        // partial-output contract is verified by
+        // `uncompress2_reports_partial_output_on_error` below.
         assert_eq!(out_len, 0);
+    }
+
+    #[test]
+    fn uncompress2_reports_partial_output_on_error() {
+        // Regression guard for the M2 fix: on an error path that produces
+        // output before failing, `*destLen` must report the produced count
+        // (C `uncompress2_z` writes `*destLen = stream.total_out;` before the
+        // error-mapping `return`), not the old force-to-zero value.
+        //
+        // Build a fully valid zlib stream, then truncate its 4-byte Adler-32
+        // trailer. All deflate data is present, so inflate decodes the entire
+        // payload, but the stream never reaches `Z_STREAM_END` (the checksum is
+        // missing and input is exhausted). With output capacity still
+        // remaining, `uncompress2` maps this to `Z_DATA_ERROR` while having
+        // produced the full plaintext.
+        let plain: Vec<u8> = (0..200u32).map(|i| (i * 37 + 11) as u8).collect();
+
+        let bound = unsafe { compressBound(plain.len() as uLong) } as usize;
+        let mut comp = vec![0u8; bound];
+        let mut comp_len: uLongf = comp.len() as uLongf;
+        let rc = unsafe {
+            compress(
+                comp.as_mut_ptr(),
+                &mut comp_len,
+                plain.as_ptr(),
+                plain.len() as uLong,
+            )
+        };
+        assert_eq!(rc, Z_OK);
+        let comp_len = comp_len as usize;
+        assert!(
+            comp_len > 4,
+            "compressed stream includes the Adler-32 trailer"
+        );
+
+        // Drop the trailing 4-byte Adler-32 checksum.
+        let truncated = &comp[..comp_len - 4];
+
+        // Oversize the output buffer so leftover output capacity forces the
+        // truncated-stream branch to `Z_DATA_ERROR` rather than `Z_BUF_ERROR`.
+        let mut out = vec![0u8; plain.len() + 64];
+        let mut out_len: uLongf = out.len() as uLongf;
+        let mut src_len: uLong = truncated.len() as uLong;
+        let rc = unsafe {
+            uncompress2(
+                out.as_mut_ptr(),
+                &mut out_len,
+                truncated.as_ptr(),
+                &mut src_len,
+            )
+        };
+        assert_eq!(rc, Z_DATA_ERROR, "a truncated stream is a data error");
+        // The M2 assertion: the produced count is surfaced on the error path.
+        assert_eq!(
+            out_len as usize,
+            plain.len(),
+            "the full decoded length is reported despite the error"
+        );
+        assert_eq!(
+            &out[..out_len as usize],
+            &plain[..],
+            "output is the payload"
+        );
     }
 
     // ------------------------------------------------------------- version/err

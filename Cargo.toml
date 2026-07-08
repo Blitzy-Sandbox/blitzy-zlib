@@ -102,8 +102,9 @@ criterion = "0.5.1"
 flate2 = "1.1.9"
 # Property-based round-trip testing.
 quickcheck = "1.1.0"
-# Randomized test-data generation.
-rand = "0.9.2"
+# Randomized test-data generation. Pinned to >= 0.9.4 to stay above the patched
+# range for RustSec advisory RUSTSEC-2026-0097 (a dev-dependency-only advisory).
+rand = "0.9.4"
 
 [features]
 # The default build is a full, std-backed zlib replacement: gzip framing, the
@@ -127,6 +128,14 @@ gz-io = ["std", "gzip"]
 no-std = []
 # SIMD-accelerated CRC-32 hot path via the optional `crc32fast` dependency.
 simd = ["dep:crc32fast"]
+#
+# The two features below (`c-variadic`, `inflate_strict`) are intentional,
+# documented opt-in extras beyond the AAP core set (`std`/`gzip`/`gz-io`/
+# `no-std`/`simd`). Both default to OFF; neither is required for a complete
+# default drop-in ABI (the `gzprintf`/`gzvprintf` symbols are always exported —
+# as stable `Z_STREAM_ERROR` stubs unless `c-variadic` supplies the real
+# variadic impls). They are mirrored in the README feature table.
+#
 # C-variadic `gzprintf`/`gzvprintf` FFI shims. These rely on the unstable
 # `c_variadic` language feature and therefore a nightly toolchain, so the
 # feature is OFF by default and the crate builds on stable. Referenced by

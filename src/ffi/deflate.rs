@@ -257,6 +257,17 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
         // `z_stream` for the duration of this call.
         let s = unsafe { &mut *strm };
 
+        // C `deflate` entry validation (`deflate.c` L981-L1010): a null
+        // `next_out`, or a positive `avail_in` paired with a null `next_in`, is
+        // a `Z_STREAM_ERROR`. This must run *before* the buffers are bridged so
+        // the programmer error is surfaced rather than silently masked into an
+        // empty slice by `input_slice`/`output_slice`. (The remaining C guards
+        // — finish-state-with-wrong-flush and the `avail_out == 0` buffer error
+        // — are already enforced inside the engine's `deflate` driver.)
+        if !stream_buffers_valid(s) {
+            return Z_STREAM_ERROR;
+        }
+
         // Bridge the raw C buffers to slices. These carry detached lifetimes and
         // alias the caller's external buffers (never the `z_stream` struct), so
         // the subsequent `&mut` reborrow of `s` for `state_ref` is sound.
@@ -432,6 +443,20 @@ pub unsafe extern "C" fn deflateParams(strm: z_streamp, level: c_int, strategy: 
         let Some(strategy) = Strategy::from_c_int(strategy) else {
             return Z_STREAM_ERROR;
         };
+
+        // `deflateParams` may flush pending output through an internal
+        // `deflate(strm, Z_BLOCK)` (see `engine::deflate_params`), and that is
+        // precisely where C validates the raw buffers. Because the engine call
+        // receives already-bridged slices — with a null-and-nonempty buffer
+        // masked to empty by `input_slice`/`output_slice` — that masked case
+        // would otherwise degrade to `Z_BUF_ERROR` instead of C's
+        // `Z_STREAM_ERROR`. Surface the same entry check eagerly here (the zlib
+        // manual permits `Z_STREAM_ERROR` for an "inconsistent stream state"):
+        // reject a null `next_out`, or a positive `avail_in` with a null
+        // `next_in`, before any bridging.
+        if !stream_buffers_valid(s) {
+            return Z_STREAM_ERROR;
+        }
 
         // SAFETY: `next_in`/`avail_in` describe a readable input region.
         let input = unsafe { input_slice(s) };
@@ -1047,6 +1072,69 @@ mod tests {
         let mut strm = zeroed_stream();
         assert_eq!(unsafe { deflate(&mut strm, Z_NO_FLUSH) }, Z_STREAM_ERROR);
         assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_STREAM_ERROR);
+    }
+
+    #[test]
+    fn deflate_rejects_invalid_raw_buffers() {
+        // C `deflate` entry validation (`deflate.c` L981-L1010): a null
+        // `next_out`, or a positive `avail_in` paired with a null `next_in`, is
+        // `Z_STREAM_ERROR`. An *initialized* stream is used so the rejection is
+        // attributable to buffer validation rather than the state check.
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+
+        let input = b"payload for null-buffer validation";
+        let mut output = std::vec![0u8; 128];
+
+        // Null `next_out` with nonzero `avail_out` -> Z_STREAM_ERROR (C rejects a
+        // null output pointer unconditionally).
+        strm.next_in = input.as_ptr();
+        strm.avail_in = input.len() as c_uint;
+        strm.next_out = ptr::null_mut();
+        strm.avail_out = output.len() as c_uint;
+        assert_eq!(unsafe { deflate(&mut strm, Z_NO_FLUSH) }, Z_STREAM_ERROR);
+
+        // Nonzero `avail_in` with null `next_in` -> Z_STREAM_ERROR.
+        strm.next_in = ptr::null();
+        strm.avail_in = input.len() as c_uint;
+        strm.next_out = output.as_mut_ptr();
+        strm.avail_out = output.len() as c_uint;
+        assert_eq!(unsafe { deflate(&mut strm, Z_NO_FLUSH) }, Z_STREAM_ERROR);
+
+        // A fully valid buffer pair is accepted (proves the guard is not
+        // over-broad): the guard lets a normal call through.
+        strm.next_in = input.as_ptr();
+        strm.avail_in = input.len() as c_uint;
+        strm.next_out = output.as_mut_ptr();
+        strm.avail_out = output.len() as c_uint;
+        assert_eq!(unsafe { deflate(&mut strm, Z_FINISH) }, Z_STREAM_END);
+
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
+    }
+
+    #[test]
+    fn deflate_params_rejects_invalid_raw_buffers() {
+        // `deflateParams` surfaces the same entry validation as `deflate` (it may
+        // flush pending output through an internal `deflate(strm, Z_BLOCK)`); a
+        // null `next_out` is rejected with `Z_STREAM_ERROR`.
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            unsafe { deflateInit_(&mut strm, 6, ver(), size_of::<z_stream>() as c_int) },
+            Z_OK
+        );
+        let input = b"payload";
+        strm.next_in = input.as_ptr();
+        strm.avail_in = input.len() as c_uint;
+        strm.next_out = ptr::null_mut();
+        strm.avail_out = 128;
+        assert_eq!(
+            unsafe { deflateParams(&mut strm, 9, Z_DEFAULT_STRATEGY) },
+            Z_STREAM_ERROR
+        );
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, Z_OK);
     }
 
     #[test]

@@ -71,6 +71,15 @@
 //! [`util`], [`deflate`], and [`inflate`] are always compiled so the core zlib
 //! symbol table is always present for linkage.
 //!
+//! Within the `gz-io` layer, `gzprintf`/`gzvprintf` are always exported, but
+//! their bodies depend on the nightly `c-variadic` feature: the fully
+//! functional `vsnprintf`-backed implementations compile only under
+//! `c-variadic`, while the stable default artifact exports ABI-compatible
+//! **error-returning stubs** that yield `Z_STREAM_ERROR` — precisely the
+//! behavior zlib documents for a build without secure `*printf` (and reflected
+//! by `zlibCompileFlags` bit 27; see [`crate::util::version`]). Either way the
+//! two symbols resolve, so a C caller's link never fails.
+//!
 //! ## `zlib.map` symbol-versioning contract
 //!
 //! zlib ships a linker version script (`zlib.map`) that assigns each exported
@@ -139,6 +148,13 @@ pub mod deflate;
 pub mod inflate;
 pub mod types;
 pub mod util;
+
+// The caller-allocator (`zalloc`/`zfree`) buffer bridge. This is internal
+// plumbing (no `extern "C"` symbols), not part of the public C surface, so it is
+// `pub(crate)` rather than `pub` and is intentionally NOT glob-re-exported below.
+// It is the sanctioned home of the raw allocator-hook `unsafe`, which the safe
+// core (`src/stream.rs`) delegates to via `AllocHook::try_alloc_zeroed` (M6).
+pub(crate) mod alloc;
 
 #[cfg(feature = "gz-io")]
 pub mod gz;
@@ -226,5 +242,22 @@ mod tests {
         let _gzopen: unsafe extern "C" fn(*const c_char, *const c_char) -> gzFile =
             crate::ffi::gz::gzopen;
         let _ = _gzopen;
+    }
+
+    // On the stable default artifact (no `c-variadic`), `gzprintf`/`gzvprintf`
+    // are exported as error-returning stubs with these fixed signatures. This
+    // guard fails to compile if either symbol is dropped or its fixed leading
+    // parameters drift, catching the "missing default gzprintf/gzvprintf"
+    // regression at build time.
+    #[cfg(all(feature = "gz-io", not(feature = "c-variadic")))]
+    #[test]
+    fn default_gzprintf_stub_symbols_are_present() {
+        use crate::ffi::types::gzFile;
+        use core::ffi::{c_char, c_int, c_void};
+
+        let _gzprintf: extern "C" fn(gzFile, *const c_char) -> c_int = crate::ffi::gz::gzprintf;
+        let _gzvprintf: extern "C" fn(gzFile, *const c_char, *mut c_void) -> c_int =
+            crate::ffi::gz::gzvprintf;
+        let _ = (_gzprintf, _gzvprintf);
     }
 }
