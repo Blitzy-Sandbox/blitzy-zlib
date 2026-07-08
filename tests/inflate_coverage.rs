@@ -23,8 +23,11 @@
 //! *fallible* at the FFI boundary (AAP §0.6.3): a caller hook that returns null
 //! propagates to `MemError` with **no** global-allocator fallback. That harness
 //! is reproduced here — see [`mem_limit_forces_mem_error`], which caps the byte
-//! budget below the inflate window size so the lazily-allocated window cannot be
-//! obtained and `inflate` returns `Z_MEM_ERROR`, exactly as in C.
+//! budget to force `Z_MEM_ERROR` on **both** inflate allocations that C routes
+//! through the hook: the state struct reserved by `inflateInit2_` (a budget
+//! below the state size fails the init) and the lazily-allocated window (a
+//! budget covering the state but not the window fails the subsequent
+//! `inflate`), exactly as in C.
 //!
 //! ## Honestly-handled gap (never faked)
 //!
@@ -936,61 +939,116 @@ unsafe extern "C" fn cap_free(opaque: *mut c_void, address: *mut c_void) {
 
 /// Port of the forced-`Z_MEM_ERROR` steps of `infcover.c`'s `mem_*` harness.
 ///
-/// With a byte budget below the inflate window size, the lazily-allocated
-/// window (`1 << windowBits` bytes; 256 for `windowBits = -8`) cannot be
-/// obtained, so `inflate` reports `Z_MEM_ERROR` — the same outcome `infcover.c`
-/// pins under its 1-byte allocation limit. `inflateInit2_` itself makes no hook
-/// allocation (the window is lazy), so it still returns `Z_OK`, mirroring C.
+/// Reference zlib routes **both** inflate allocations through the caller's
+/// `zalloc`: `inflateInit2_` allocates the state struct
+/// (`ZALLOC(strm, 1, sizeof(struct inflate_state))`) up front, and the sliding
+/// window is allocated lazily on first use. `infcover.c` drives each into
+/// `Z_MEM_ERROR` by capping the allocator, so this test pins both:
+///
+/// 1. **State allocation fails at init.** With a budget below the state size,
+///    `inflateInit2_` cannot obtain the state reservation and returns
+///    `Z_MEM_ERROR` — matching C, and validating that the inflate *state*
+///    allocation is routed through the caller's hook (previously it bypassed
+///    the hook and wrongly succeeded).
+/// 2. **Window allocation fails after init.** With a budget large enough for the
+///    state but below the state + window size, `inflateInit2_` succeeds and the
+///    subsequent `inflate` fails when it tries to grow the lazily-allocated
+///    window — the outcome `infcover.c` pins under its tight allocation limit.
 #[test]
 fn mem_limit_forces_mem_error() {
-    let cap = MemCap {
-        // 200 < 256 = the raw 8-bit inflate window, so the window allocation
-        // fails while leaving room for any smaller incidental request.
-        budget: core::cell::Cell::new(200),
-    };
+    // Size of the inflate state, which reference zlib (and now zlib-rs) reserves
+    // through the caller's `zalloc` at `inflateInit2_`.
+    const STATE_SIZE: usize = core::mem::size_of::<zlib_rs::inflate::InflateState>();
+    // The raw 8-bit inflate window (`1 << 8`) allocated lazily by `inflate`.
+    const WINDOW_8: usize = 1 << 8;
 
-    let mut strm = zeroed_stream();
-    strm.zalloc = Some(cap_alloc);
-    strm.zfree = Some(cap_free);
-    strm.opaque = (&cap as *const MemCap) as *mut c_void;
+    // --- Scenario 1: budget below the state size => init fails ---------------
+    {
+        let cap = MemCap {
+            // Far below STATE_SIZE, so the state reservation itself cannot be
+            // obtained and `inflateInit2_` fails — exactly as C's state `ZALLOC`
+            // fails under a tight limit.
+            budget: core::cell::Cell::new(200),
+        };
 
-    // SAFETY: `strm` is a valid, caller-owned `z_stream` with a live capped
-    // allocator installed; `c"1"` is a valid version whose first byte matches
-    // the library version, and the reported size is the true `sizeof(z_stream)`.
-    let init = unsafe {
-        inflateInit2_(
-            &mut strm,
-            -8,
-            c"1".as_ptr(),
-            core::mem::size_of::<z_stream>() as c_int,
-        )
-    };
-    assert_eq!(
-        init,
-        ReturnCode::Ok.as_c_int(),
-        "inflateInit2_ makes no hook allocation (the window is lazy) and must succeed",
-    );
+        let mut strm = zeroed_stream();
+        strm.zalloc = Some(cap_alloc);
+        strm.zfree = Some(cap_free);
+        strm.opaque = (&cap as *const MemCap) as *mut c_void;
 
-    // A minimal raw-DEFLATE fragment that drives the engine to grow its window
-    // (mirrors the `\x63\x00` feed in infcover.c's mem coverage).
-    let input = [0x63u8, 0x00];
-    let mut out = [0u8; 1];
-    strm.next_in = input.as_ptr();
-    strm.avail_in = input.len() as c_uint;
-    strm.next_out = out.as_mut_ptr();
-    strm.avail_out = out.len() as c_uint;
+        // SAFETY: `strm` is a valid, caller-owned `z_stream` with a live capped
+        // allocator installed; `c"1"` is a valid version whose first byte
+        // matches the library version, and the reported size is the true
+        // `sizeof(z_stream)`.
+        let init = unsafe {
+            inflateInit2_(
+                &mut strm,
+                -8,
+                c"1".as_ptr(),
+                core::mem::size_of::<z_stream>() as c_int,
+            )
+        };
+        assert_eq!(
+            init,
+            ReturnCode::MemError.as_c_int(),
+            "a budget below the state size must fail inflateInit2_ with Z_MEM_ERROR \
+             (the inflate state allocation is routed through the caller's hook)",
+        );
+        // Init failed, so no state was installed and there is nothing to free.
+    }
 
-    // SAFETY: `strm` holds a valid inflate state; `next_in`/`next_out` point at
-    // the live local buffers with matching `avail_*` counts.
-    let ret = unsafe { ffi_inflate(&mut strm, Z_NO_FLUSH) };
-    assert_eq!(
-        ret,
-        ReturnCode::MemError.as_c_int(),
-        "a budget below the window size must force Z_MEM_ERROR",
-    );
+    // --- Scenario 2: budget fits the state but not the window ----------------
+    {
+        let cap = MemCap {
+            // Enough for the state reservation, but the remaining `WINDOW_8 - 1`
+            // bytes are one short of the window, so the lazy window allocation
+            // fails during `inflate`.
+            budget: core::cell::Cell::new(STATE_SIZE + WINDOW_8 - 1),
+        };
 
-    // SAFETY: `strm` was initialized by `inflateInit2_`; `inflateEnd` reclaims
-    // the state box (allocated globally, so it succeeds despite the cap).
-    let end = unsafe { inflateEnd(&mut strm) };
-    assert_eq!(end, ReturnCode::Ok.as_c_int(), "inflateEnd must succeed");
+        let mut strm = zeroed_stream();
+        strm.zalloc = Some(cap_alloc);
+        strm.zfree = Some(cap_free);
+        strm.opaque = (&cap as *const MemCap) as *mut c_void;
+
+        // SAFETY: as in scenario 1 — a valid caller-owned `z_stream` with a live
+        // capped allocator, a matching version byte, and the true stream size.
+        let init = unsafe {
+            inflateInit2_(
+                &mut strm,
+                -8,
+                c"1".as_ptr(),
+                core::mem::size_of::<z_stream>() as c_int,
+            )
+        };
+        assert_eq!(
+            init,
+            ReturnCode::Ok.as_c_int(),
+            "a budget covering the state (but not the window) must let inflateInit2_ succeed",
+        );
+
+        // A minimal raw-DEFLATE fragment that drives the engine to grow its
+        // window (mirrors the `\x63\x00` feed in infcover.c's mem coverage).
+        let input = [0x63u8, 0x00];
+        let mut out = [0u8; 1];
+        strm.next_in = input.as_ptr();
+        strm.avail_in = input.len() as c_uint;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as c_uint;
+
+        // SAFETY: `strm` holds a valid inflate state; `next_in`/`next_out` point
+        // at the live local buffers with matching `avail_*` counts.
+        let ret = unsafe { ffi_inflate(&mut strm, Z_NO_FLUSH) };
+        assert_eq!(
+            ret,
+            ReturnCode::MemError.as_c_int(),
+            "a budget below the state + window size must force Z_MEM_ERROR on the window",
+        );
+
+        // SAFETY: `strm` was initialized by `inflateInit2_`; `inflateEnd`
+        // reclaims the state box (allocated globally) and refunds the capped
+        // state reservation through `zfree`.
+        let end = unsafe { inflateEnd(&mut strm) };
+        assert_eq!(end, ReturnCode::Ok.as_c_int(), "inflateEnd must succeed");
+    }
 }

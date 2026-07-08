@@ -376,6 +376,39 @@ pub struct InflateState {
     /// allocator, or the caller's `zalloc`/`zfree`/`opaque` when one was
     /// installed through the FFI `z_stream` (AAP §0.6.3; QA FINDING-3).
     pub alloc_hook: AllocHook,
+
+    /// Hook-backed reservation mirroring reference zlib's allocation of the
+    /// inflate state struct itself — C `inflateInit2_` does
+    /// `ZALLOC(strm, 1, sizeof(struct inflate_state))` before any window is
+    /// needed.
+    ///
+    /// The idiomatic [`InflateState`] lives in a Rust [`Box`] on the global
+    /// allocator (safe, and matching how the deflate engine keeps its
+    /// `DeflateState` boxed while routing its *working buffers* through the
+    /// hook). To honour a caller-installed `zalloc`/`zfree` for the **state**
+    /// allocation as well — so that a limited or failing hook yields
+    /// `Z_MEM_ERROR` at `inflateInit2_`, *before* the window is ever needed,
+    /// exactly as C does — the regular inflate init path
+    /// ([`inflate_init2`](crate::inflate::inflate_init2)) reserves the
+    /// equivalent footprint through the caller's hook and parks it here. It is:
+    ///
+    /// * an active-hook [`Foreign`](AllocBuffer::Foreign) buffer of
+    ///   `size_of::<InflateState>()` bytes on the regular init path when a
+    ///   caller hook is installed (one `zalloc`, matching C's state `ZALLOC`);
+    /// * an empty [`AllocBuffer::default`] under the global allocator, so no
+    ///   extra allocation is made and the crate's ~7 KB inflate memory-bounds
+    ///   parity is preserved (AAP §0.7.1); and
+    /// * left empty for `inflateBack` — whose single hook allocation is its own
+    ///   window — because that path builds the state through
+    ///   [`new_in`](InflateState::new_in) directly (not the regular init path),
+    ///   keeping its one-allocation parity with C.
+    ///
+    /// Being an owned [`AllocBuffer`], it is released automatically on drop —
+    /// through the caller's `zfree` for a hook-backed reservation — subsuming
+    /// C's `ZFREE(strm, state)` at `inflateEnd` (AAP §0.6.3/§0.6.5). This closes
+    /// the QA finding that the inflate state allocation bypassed the caller's
+    /// allocator hook.
+    pub state_alloc: AllocBuffer<u8>,
 }
 
 /// Default `dmax` value: the maximum back-reference distance for a 32 KiB
@@ -479,6 +512,12 @@ impl InflateState {
             codes: [Code::default(); ENOUGH],
             was: 0,
             alloc_hook: hook,
+            // Left empty here: the state reservation is installed by the regular
+            // FFI init path (`inflate_init2`) only when a caller hook is active.
+            // Keeping `new_in` itself allocation-free is what lets the shared
+            // `inflateBack` constructor (`inflate_back_init_in`) retain its
+            // single-allocation (window-only) parity with C.
+            state_alloc: AllocBuffer::default(),
         })
     }
 

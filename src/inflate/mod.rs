@@ -547,28 +547,62 @@ pub fn inflate_reset2<A: Allocator>(strm: &mut ZStream<A>, window_bits: i32) -> 
 ///
 /// The version/`stream_size` compatibility check that C performs is a
 /// concern of the FFI boundary (where a real `z_stream` layout exists); this
-/// idiomatic entry point simply installs a fresh [`InflateState`] and delegates
-/// to [`inflate_reset2`]. Allocation uses [`Box::new`], which cannot return
-/// null — the C `Z_MEM_ERROR` path is therefore reachable only via a custom
-/// allocator hook at the FFI layer.
+/// idiomatic entry point installs a fresh [`InflateState`] and delegates to
+/// [`inflate_reset2`].
+///
+/// # Allocation and the caller's hook
+/// C `inflateInit2_` allocates the state struct through the caller's
+/// allocator (`ZALLOC(strm, 1, sizeof(struct inflate_state))`) before any
+/// window is needed, so a null/failing `zalloc` fails the init with
+/// `Z_MEM_ERROR`. The idiomatic state here lives in a Rust [`Box`], but to
+/// preserve that observable contract this path *also* reserves the equivalent
+/// footprint through the caller's [`AllocHook`] (parked in
+/// [`InflateState::state_alloc`]) whenever a hook is active. A hook whose
+/// `zalloc` reports out-of-memory therefore surfaces [`ZlibError::MemError`]
+/// here — matching C's allocation count (one at init for a single-shot inflate)
+/// and failure timing. Under the global allocator no extra allocation is made,
+/// keeping the crate's ~7 KB inflate memory-bounds parity (AAP §0.7.1). The
+/// `inflateBack` init path does not go through here, so its single
+/// (window-only) allocation is unaffected.
 ///
 /// # Errors
-/// Propagates [`ZlibError::StreamError`] from [`inflate_reset2`] for an invalid
+/// Returns [`ZlibError::MemError`] when an active caller hook's `zalloc` reports
+/// out-of-memory for the state reservation, and propagates
+/// [`ZlibError::StreamError`] from [`inflate_reset2`] for an invalid
 /// `window_bits`; the partially-installed state is torn down on error.
 pub fn inflate_init2<A: Allocator>(strm: &mut ZStream<A>, window_bits: i32) -> InflateResult {
     strm.msg = None;
-    // ZALLOC → Box::new. wrap/wbits are (re)assigned by inflate_reset2 below;
     // `new_in` sets mode = Head so the state passes reset2's inflate-state
-    // guard. The caller's allocator hook (the `zalloc`/`zfree` installed via the
-    // FFI `z_stream`, or a no-op under the global allocator) is threaded in so
-    // the lazily-allocated window is later routed through it (AAP §0.6.3; QA
-    // FINDING-3).
+    // guard; wrap/wbits are (re)assigned by inflate_reset2 below. The caller's
+    // allocator hook (the `zalloc`/`zfree` installed via the FFI `z_stream`, or
+    // a no-op under the global allocator) is threaded in so the lazily-allocated
+    // window is later routed through it (AAP §0.6.3; QA FINDING-3).
     let hook = strm.allocator().hook();
-    strm.set_inflate_state(InflateState::new_in(hook, 0, 0));
+    let mut state = InflateState::new_in(hook, 0, 0);
+    // Route the inflate *state* allocation through the caller's hook, mirroring
+    // C `inflateInit2_`'s `ZALLOC(strm, 1, sizeof(struct inflate_state))`. The
+    // idiomatic state lives in a global `Box`; this reserves the equivalent
+    // footprint through an active caller hook so a limited/failing `zalloc`
+    // surfaces `Z_MEM_ERROR` at init — before the window is needed — matching
+    // C's allocation count and failure timing (AAP §0.6.3/§0.6.5). Under the
+    // global allocator (`!hook.is_active()`) no extra allocation is made, so the
+    // ~7 KB inflate memory-bounds parity is preserved (AAP §0.7.1). This closes
+    // the QA finding that the inflate state allocation bypassed the hook.
+    if hook.is_active() {
+        match AllocBuffer::try_zeroed(core::mem::size_of::<InflateState>(), hook) {
+            Some(cell) => state.state_alloc = cell,
+            // The state was not installed on the stream yet, so nothing to tear
+            // down; report OOM exactly as C's failed state `ZALLOC` does.
+            None => return Err(ZlibError::MemError),
+        }
+    }
+    strm.set_inflate_state(state);
     match inflate_reset2(strm, window_bits) {
         Ok(rc) => Ok(rc),
         Err(e) => {
-            // Mirror C freeing the state and nulling strm->state on failure.
+            // Mirror C freeing the state and nulling strm->state on failure. The
+            // `state_alloc` reservation drops with the state, releasing it
+            // through the caller's `zfree`.
             strm.clear_state();
             Err(e)
         }
@@ -2033,6 +2067,13 @@ fn clone_inflate_state(s: &InflateState) -> Box<InflateState> {
         // `AllocBuffer::clone`) and any future re-allocation stay routed
         // through the caller's `zalloc`/`zfree` (AAP §0.6.3; QA FINDING-3).
         alloc_hook: s.alloc_hook,
+        // Give the copy its own state reservation, re-allocated through the same
+        // hook — mirroring C `inflateCopy`, which `ZALLOC`s a fresh state for the
+        // destination. It is empty when the source has none (global-allocator
+        // streams), so no-hook copies stay allocation-free. `AllocBuffer::clone`
+        // is infallible: it degrades to a sound global copy only if the hook
+        // reports OOM, which keeps this `deflateCopy`-style clone total.
+        state_alloc: s.state_alloc.clone(),
     })
 }
 
