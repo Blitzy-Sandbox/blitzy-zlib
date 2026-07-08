@@ -71,14 +71,13 @@
 //! [`util`], [`deflate`], and [`inflate`] are always compiled so the core zlib
 //! symbol table is always present for linkage.
 //!
-//! Within the `gz-io` layer, `gzprintf`/`gzvprintf` are always exported, but
-//! their bodies depend on the nightly `c-variadic` feature: the fully
-//! functional `vsnprintf`-backed implementations compile only under
-//! `c-variadic`, while the stable default artifact exports ABI-compatible
-//! **error-returning stubs** that yield `Z_STREAM_ERROR` — precisely the
-//! behavior zlib documents for a build without secure `*printf` (and reflected
-//! by `zlibCompileFlags` bit 27; see [`crate::util::version`]). Either way the
-//! two symbols resolve, so a C caller's link never fails.
+//! Within the `gz-io` layer, `gzprintf`/`gzvprintf` are always exported as
+//! ABI-compatible **error-returning stubs** that yield `Z_STREAM_ERROR`:
+//! rendering a C `va_list` from Rust requires the unstable (nightly-only)
+//! `c_variadic` feature, so — precisely as zlib documents for a build without
+//! secure `*printf` (and reflected by `zlibCompileFlags` bit 27; see
+//! [`crate::util::version`]) — the symbols exist but return an error. They
+//! always resolve, so a C caller's link never fails.
 //!
 //! ## `zlib.map` symbol-versioning contract
 //!
@@ -244,12 +243,11 @@ mod tests {
         let _ = _gzopen;
     }
 
-    // On the stable default artifact (no `c-variadic`), `gzprintf`/`gzvprintf`
-    // are exported as error-returning stubs with these fixed signatures. This
-    // guard fails to compile if either symbol is dropped or its fixed leading
-    // parameters drift, catching the "missing default gzprintf/gzvprintf"
-    // regression at build time.
-    #[cfg(all(feature = "gz-io", not(feature = "c-variadic")))]
+    // `gzprintf`/`gzvprintf` are exported as error-returning stubs with these
+    // fixed signatures. This guard fails to compile if either symbol is dropped
+    // or its fixed leading parameters drift, catching the "missing
+    // gzprintf/gzvprintf" regression at build time.
+    #[cfg(feature = "gz-io")]
     #[test]
     fn default_gzprintf_stub_symbols_are_present() {
         use crate::ffi::types::gzFile;

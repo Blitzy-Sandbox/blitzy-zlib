@@ -128,16 +128,15 @@ fn size_code(n: usize) -> u32 {
 /// | 8     | `ZLIB_DEBUG` (mirrors `debug_assertions`)            |
 /// | 16    | `NO_GZCOMPRESS` (set when the `gz-io` feature is off) |
 /// | 17    | `NO_GZIP` (set when the `gzip` feature is off)        |
-/// | 27    | `gzprintf()` returns an error (set unless `c-variadic`)|
+/// | 27    | `gzprintf()` returns an error (always set in this build)   |
 ///
 /// Bit 27 mirrors C `zutil.c`'s `flags += 1L << 27`, which C sets in the
 /// `NO_vsnprintf && !ZLIB_INSECURE` case — a build whose `gzprintf`/`gzvprintf`
 /// exist as symbols but return `Z_STREAM_ERROR` because no secure `*printf` was
-/// available (`zlib.h`: bit 27 "1 means gzprintf() returns an error"). Rust's
-/// C-variadic support is unstable, so the stable default artifact ships exactly
-/// that error-returning stub and sets this bit; the nightly `c-variadic`
-/// feature compiles the functional `vsnprintf`-backed implementation instead
-/// and clears it.
+/// available (`zlib.h`: bit 27 "1 means gzprintf() returns an error"). Rendering
+/// a C `va_list` from Rust requires the unstable (nightly-only) `c_variadic`
+/// feature, so this crate always ships exactly that error-returning stub for
+/// `gzprintf`/`gzvprintf` and therefore always sets this bit.
 ///
 /// Every other bit the C function can set (9-15, 18-26, and 28-31) is `0` in
 /// this build: there is no assembler variant, no Windows API, no runtime-built
@@ -178,13 +177,10 @@ pub fn zlib_compile_flags() -> u32 {
     // bit 27: gzprintf() returns an error. C sets `1L << 27` for a build with
     // no secure `vsnprintf`/`snprintf` (`NO_vsnprintf && !ZLIB_INSECURE`), i.e.
     // one whose `gzprintf`/`gzvprintf` are present as symbols but return
-    // `Z_STREAM_ERROR`. A functional `gzprintf` in this crate requires Rust's
-    // unstable C-variadic support, so absent the `c-variadic` feature we ship
-    // the documented error-returning stubs and set this bit to match C.
-    #[cfg(not(feature = "c-variadic"))]
-    {
-        flags |= 1 << 27;
-    }
+    // `Z_STREAM_ERROR`. A functional `gzprintf` in this crate would require
+    // Rust's unstable (nightly-only) C-variadic support, so this crate always
+    // ships the documented error-returning stubs and sets this bit to match C.
+    flags |= 1 << 27;
 
     // Bits 9-15, 18-26, and 28-31 are unconditionally 0 in this build (see the
     // function's doc comment for the rationale).
@@ -278,9 +274,10 @@ mod tests {
         assert_eq!((flags >> 16) & 1, u32::from(!cfg!(feature = "gz-io")));
         // bit 17: NO_GZIP is set iff the `gzip` feature is disabled.
         assert_eq!((flags >> 17) & 1, u32::from(!cfg!(feature = "gzip")));
-        // bit 27: gzprintf-returns-error is set iff `c-variadic` is disabled
-        // (no functional variadic gzprintf, so the error-returning stub ships).
-        assert_eq!((flags >> 27) & 1, u32::from(!cfg!(feature = "c-variadic")));
+        // bit 27: gzprintf-returns-error is always set — the crate ships the
+        // error-returning `gzprintf`/`gzvprintf` stubs (C-variadics are nightly
+        // only), matching a zlib built without a secure `*printf`.
+        assert_eq!((flags >> 27) & 1, 1);
     }
 
     #[test]

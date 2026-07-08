@@ -129,19 +129,20 @@ no-std = []
 # SIMD-accelerated CRC-32 hot path via the optional `crc32fast` dependency.
 simd = ["dep:crc32fast"]
 #
-# The two features below (`c-variadic`, `inflate_strict`) are intentional,
-# documented opt-in extras beyond the AAP core set (`std`/`gzip`/`gz-io`/
-# `no-std`/`simd`). Both default to OFF; neither is required for a complete
-# default drop-in ABI (the `gzprintf`/`gzvprintf` symbols are always exported —
-# as stable `Z_STREAM_ERROR` stubs unless `c-variadic` supplies the real
-# variadic impls). They are mirrored in the README feature table.
+# `inflate_strict` below is an intentional, documented opt-in extra beyond the
+# AAP core set (`std`/`gzip`/`gz-io`/`no-std`/`simd`). It defaults to OFF and is
+# fully stable-buildable, so `cargo build --all-features` succeeds on the stable
+# toolchain (and thus on the pinned MSRV). It is mirrored in the README feature
+# table.
 #
-# C-variadic `gzprintf`/`gzvprintf` FFI shims. These rely on the unstable
-# `c_variadic` language feature and therefore a nightly toolchain, so the
-# feature is OFF by default and the crate builds on stable. Referenced by
-# `src/lib.rs` (`#![cfg_attr(feature = "c-variadic", feature(c_variadic))]`) and
-# `src/ffi/gz.rs`.
-c-variadic = []
+# The `gzprintf`/`gzvprintf` FFI symbols are always exported for ABI
+# completeness, but — because rendering a C `va_list` requires the unstable
+# nightly-only `c_variadic` language feature, which would break the crate's
+# stable build and its MSRV contract — they are shipped as ABI-compatible
+# `Z_STREAM_ERROR` stubs, exactly matching a zlib built without a secure
+# `vsnprintf` (`zlibCompileFlags` bit 27 set). There is therefore no
+# `c-variadic` cargo feature.
+#
 # Optional stricter inflate distance validation (maps the C `INFLATE_STRICT`
 # compile-time switch). OFF by default so the default build stays byte-exact
 # with reference zlib; enable only to reject out-of-window distances early.

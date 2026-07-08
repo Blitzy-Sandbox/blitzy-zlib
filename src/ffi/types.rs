@@ -941,20 +941,24 @@ pub unsafe fn write_gz_header_from_idiomatic(head: *mut gz_header, src: &GzHeade
         // Report the full length even if the copy was truncated (C parity).
         h.extra_len = extra.len() as c_uint;
     }
-    if let Some(name) = &src.name
-        && !h.name.is_null()
-    {
-        // SAFETY: `h.name` has `name_max` writable bytes.
-        unsafe {
-            write_cstr_bounded(h.name, name, h.name_max as usize);
+    if let Some(name) = &src.name {
+        // Nested `if` rather than an `if let ... && ...` chain, which is
+        // unstable before Rust 1.88 (this crate's MSRV is 1.85).
+        if !h.name.is_null() {
+            // SAFETY: `h.name` has `name_max` writable bytes.
+            unsafe {
+                write_cstr_bounded(h.name, name, h.name_max as usize);
+            }
         }
     }
-    if let Some(comment) = &src.comment
-        && !h.comment.is_null()
-    {
-        // SAFETY: `h.comment` has `comm_max` writable bytes.
-        unsafe {
-            write_cstr_bounded(h.comment, comment, h.comm_max as usize);
+    if let Some(comment) = &src.comment {
+        // Nested `if` rather than an `if let ... && ...` chain, which is
+        // unstable before Rust 1.88 (this crate's MSRV is 1.85).
+        if !h.comment.is_null() {
+            // SAFETY: `h.comment` has `comm_max` writable bytes.
+            unsafe {
+                write_cstr_bounded(h.comment, comment, h.comm_max as usize);
+            }
         }
     }
 }

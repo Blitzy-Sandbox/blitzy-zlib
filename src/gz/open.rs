@@ -715,11 +715,16 @@ pub fn gzseek64(state: &mut GzState, mut offset: i64, whence: i32) -> i64 {
     // the fast-path guard is simply false, so control falls through to the
     // general path below (which handles or rejects the seek). This mirrors C's
     // `state->x.pos + offset >= 0` guard without ever wrapping.
-    if state.mode == GzMode::Read
-        && state.how == How::Copy
-        && let Some(target) = state.pos.checked_add(offset)
-        && target >= 0
-    {
+    let fast_target = if state.mode == GzMode::Read && state.how == How::Copy {
+        // A checked add avoids wrapping; `filter` drops a negative target so the
+        // guard matches C's `state->x.pos + offset >= 0`. Expressed as an
+        // `Option` rather than an `if let ... && ...` chain, which is unstable
+        // before Rust 1.88 (this crate's MSRV is 1.85).
+        state.pos.checked_add(offset).filter(|&t| t >= 0)
+    } else {
+        None
+    };
+    if let Some(target) = fast_target {
         // Seek relative to the current file position, discounting the bytes
         // already sitting in the output buffer (C `offset - x.have`).
         let delta = match offset.checked_sub(state.have as i64) {

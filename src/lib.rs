@@ -55,7 +55,6 @@
 //! | `gzip`           |   yes   | gzip framing within deflate/inflate (mirrors C `#ifdef GZIP`). |
 //! | `gz-io`          |   yes   | gzip file-I/O `gz*` API; implies `std` + `gzip`.             |
 //! | `simd`           |   yes   | SIMD-accelerated CRC-32 via the `crc32fast` crate.          |
-//! | `c-variadic`     |   no    | Variadic `gzprintf`/`gzvprintf` shims (requires nightly).   |
 //! | `inflate_strict` |   no    | Stricter inflate distance validation (mirrors C `INFLATE_STRICT`). |
 //!
 //! Building with `--no-default-features` yields the `no_std` compression and
@@ -86,11 +85,6 @@
 // under the `std` feature (the default). Because the FFI layer and several
 // engines allocate (`Box`/`Vec`), `alloc` is imported unconditionally below.
 #![cfg_attr(not(feature = "std"), no_std)]
-// The variadic gz shims (`gzprintf`/`gzvprintf`) rely on the unstable
-// `c_variadic` language feature; enabling the `c-variadic` Cargo feature
-// therefore also requires a nightly toolchain. On stable (the default) the
-// `c-variadic` feature is off and this attribute is inert.
-#![cfg_attr(feature = "c-variadic", feature(c_variadic))]
 // Every public item in the crate must be documented (AAP: "document all public
 // items"). This is a `warn`, never a `deny`, so it can never break the build.
 #![warn(missing_docs)]
