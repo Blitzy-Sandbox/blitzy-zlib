@@ -1,0 +1,72 @@
+# fuzz/Cargo.toml
+#
+# cargo-fuzz (libFuzzer) harness crate for zlib-rs — the C -> Rust migration of
+# zlib 1.3.2.1. This crate is a SEPARATE, DETACHED package: the empty
+# `[workspace]` table below makes `fuzz/` its own workspace root, so `cargo`
+# commands run in the repository root (build / test / clippy / fmt) never
+# compile these nightly-only libFuzzer harnesses. cargo-fuzz builds them with a
+# nightly toolchain (it injects `-Z` sanitizer / coverage instrumentation that
+# is unavailable on stable); see `.github/workflows/fuzz.yml`.
+
+[package]
+name = "zlib-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detach from the parent package: an empty workspace table here prevents the
+# fuzz crate from being pulled into (or affecting) the root crate's build graph.
+[workspace]
+
+[dependencies]
+# The libFuzzer front-end runtime and the `fuzz_target!` macro.
+libfuzzer-sys = "0.4"
+
+[dependencies.zlib-rs]
+# Fuzz the real crate through its public API and its C FFI boundary. Default
+# features (std + gzip + gz-io + simd) give the harnesses the full surface.
+path = ".."
+
+# libFuzzer wants line-level debug info in the optimized build for actionable
+# crash reports; overflow checks stay on so arithmetic mistakes surface as
+# reproducible findings rather than silently wrapping.
+[profile.release]
+debug = 1
+overflow-checks = true
+
+# --- Fuzz targets ----------------------------------------------------------
+# Each target is a standalone `#![no_main]` libFuzzer binary. `test`/`doc` are
+# disabled because these binaries are only ever driven by `cargo fuzz run`.
+
+[[bin]]
+name = "fuzz_inflate"
+path = "fuzz_targets/fuzz_inflate.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_deflate_roundtrip"
+path = "fuzz_targets/fuzz_deflate_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_gzip"
+path = "fuzz_targets/fuzz_gzip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_checksum"
+path = "fuzz_targets/fuzz_checksum.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ffi_roundtrip"
+path = "fuzz_targets/fuzz_ffi_roundtrip.rs"
+test = false
+doc = false

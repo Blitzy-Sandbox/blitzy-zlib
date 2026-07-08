@@ -1,0 +1,205 @@
+# Cargo manifest for `zlib-rs` — a memory-safe, idiomatic Rust rewrite of the
+# zlib compression library (`1.3.2.1-motley`) with a C-compatible FFI drop-in
+# layer.
+#
+# This manifest REPLACES the C project's CMake/autotools build. `CMakeLists.txt`
+# declared `project(zlib LANGUAGES C VERSION 1.3.2.1)`, built the `zlib` SHARED
+# and `zlibstatic` STATIC targets, and linked them with the `zlib.map` version
+# script. The crate below emits a Rust library plus `cdylib`/`staticlib`
+# artifacts so it can serve both Rust consumers and C consumers requiring a
+# drop-in shared or static object.
+#
+# This file is the single source of truth for the crate identity that
+# `src/lib.rs`, every `tests/*.rs`, and every `benches/*.rs` depend on: the
+# `[lib] name`, the `crate-type` triple, and the feature-flag names are all
+# contractual and must not drift.
+
+[package]
+name = "zlib-rs"
+# Cargo requires SemVer (MAJOR.MINOR.PATCH). Upstream zlib reports the
+# 4-component string `"1.3.2.1-motley"`, which is NOT valid SemVer, so the
+# package version is tracked as `1.3.2` here. The C-API `zlibVersion()` shim
+# (see `src/util/version.rs`) still returns the full `"1.3.2.1-motley"` string;
+# this manifest field is deliberately separate from that runtime version.
+version = "1.3.2"
+edition = "2024"
+# MSRV — Rust 1.85.0 is the release that stabilized the 2024 edition.
+rust-version = "1.85.0"
+# SPDX identifier for the zlib/libpng license carried forward in `LICENSE`.
+license = "Zlib"
+description = "A memory-safe, idiomatic Rust rewrite of the zlib 1.3.2.1 compression library with a C-compatible FFI drop-in layer"
+readme = "README.md"
+repository = "https://github.com/Blitzy-Sandbox/blitzy-zlib"
+homepage = "https://zlib.net/"
+# Original zlib authorship carried forward, plus the Blitzy C→Rust migration.
+authors = [
+    "Jean-loup Gailly",
+    "Mark Adler",
+    "Blitzy <agent@blitzy.com>",
+]
+# `keywords` is capped at 5 entries by crates.io.
+keywords = ["zlib", "deflate", "gzip", "compression", "codec"]
+categories = ["compression", "no-std", "encoding", "api-bindings"]
+# Explicitly declare the build script (Cargo also auto-detects `build.rs`).
+# `build.rs` regenerates the CRC-32 lookup tables into `OUT_DIR` at build time,
+# replacing the checked-in `crc32.h` tables from the C baseline.
+build = "build.rs"
+# The C baseline co-exists in this repository during the migration but must not
+# ship inside the published crate. Keep the C sources/headers, the contributed
+# subtrees, the legacy platform directories, and the C build/packaging files out
+# of the packaged `.crate`. (`exclude` only affects `cargo package`/`publish`;
+# it never affects `cargo build`/`test`/`bench` in the workspace.)
+exclude = [
+    "*.c",
+    "*.h",
+    "*.in",
+    "*.map",
+    "*.pc.in",
+    "contrib/**",
+    "examples/**",
+    "test/**",
+    "amiga/**",
+    "msdos/**",
+    "os400/**",
+    "qnx/**",
+    "watcom/**",
+    "win32/**",
+    "CMakeLists.txt",
+    "Makefile",
+    "Makefile.in",
+    "configure",
+    "make_vms.com",
+    "treebuild.xml",
+    "BUILD.bazel",
+    "MODULE.bazel",
+]
+
+[lib]
+# `zlib_rs` (hyphen → underscore) is the importable crate name and the linked
+# artifact stem (`libzlib_rs.{so,a}`). The integration tests and benches import
+# as `use zlib_rs::...;`, so this MUST remain `zlib_rs`.
+name = "zlib_rs"
+# `lib` (rlib) serves Rust consumers; `cdylib` + `staticlib` satisfy the C
+# drop-in requirement, mirroring the CMake SHARED + STATIC targets.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+# Ergonomic multi-branch conditional compilation — replaces the C `#if`/`#ifdef`
+# preprocessor nests. Pure Rust; adds no C dependency.
+cfg-if = "1.0.4"
+# SIMD-accelerated CRC-32 backing the `checksum::crc32` hot path. `optional` so
+# it is pulled in only by the `simd` feature; `default-features = false` keeps
+# it `no_std`-compatible when the crate's own `std` feature is disabled.
+crc32fast = { version = "1.5.0", optional = true, default-features = false }
+
+[dev-dependencies]
+# Statistical benchmarking harness driving `benches/*.rs`.
+criterion = "0.5.1"
+# Reference DEFLATE implementation for interop / round-trip cross-checks. Its
+# DEFAULT features select the pure-Rust `miniz_oxide` backend, so the test suite
+# requires NO C toolchain; the `zlib`/`zlib-ng` C backends are intentionally
+# left disabled.
+flate2 = "1.1.9"
+# Property-based round-trip testing.
+quickcheck = "1.1.0"
+# Randomized test-data generation. Pinned to >= 0.9.4 to stay above the patched
+# range for RustSec advisory RUSTSEC-2026-0097 (a dev-dependency-only advisory).
+rand = "0.9.4"
+
+[features]
+# The default build is a full, std-backed zlib replacement: gzip framing, the
+# gzip file-I/O layer, and the SIMD CRC-32 hot path.
+default = ["std", "gzip", "gz-io", "simd"]
+# Standard-library build: enables `std::io`/`std::fs` for the gz layer and the
+# `catch_unwind` panic guards at the FFI boundary. When this feature is OFF the
+# crate is `#![no_std]` + `alloc` (built via `--no-default-features`).
+std = []
+# gzip framing within deflate/inflate (maps the C `#ifdef GZIP`).
+gzip = []
+# gzip file-I/O layer (the `gz*` API; maps the C `#ifndef NO_GZCOMPRESS`).
+# Fundamentally needs the filesystem, so it implies `std`; it also implies
+# `gzip` since it emits and consumes gzip streams.
+gz-io = ["std", "gzip"]
+# Bare-metal / core-only mode: compression, decompression, and checksums with no
+# gz file I/O (maps the C `Z_SOLO`). Built via `--no-default-features`
+# (optionally `--features no-std`). The library's actual `no_std` switch is
+# `#![cfg_attr(all(not(feature = "std"), not(test), panic = "abort"), no_std)]`
+# in `src/lib.rs`: the crate is genuinely `#![no_std]` for the shipped artifact
+# (`cargo build --no-default-features`, which the profiles compile with
+# `panic = "abort"`), while `cargo test --no-default-features` keeps `std`
+# linked so the libtest harness builds — yet still exercises every
+# `not(feature = "std")` code path because the `std` feature gates stay off.
+# The full test suite therefore compiles and PASSES under
+# `cargo test --no-default-features [--features no-std]`; this flag remains a
+# convenience marker documenting intent for a core-only build.
+no-std = []
+# SIMD-accelerated CRC-32 hot path via the optional `crc32fast` dependency.
+simd = ["dep:crc32fast"]
+#
+# `inflate_strict` below is an intentional, documented opt-in extra beyond the
+# AAP core set (`std`/`gzip`/`gz-io`/`no-std`/`simd`). It defaults to OFF and is
+# fully stable-buildable, so `cargo build --all-features` succeeds on the stable
+# toolchain (and thus on the pinned MSRV). It is mirrored in the README feature
+# table.
+#
+# The `gzprintf`/`gzvprintf` FFI symbols are always exported for ABI
+# completeness, but — because rendering a C `va_list` requires the unstable
+# nightly-only `c_variadic` language feature, which would break the crate's
+# stable build and its MSRV contract — they are shipped as ABI-compatible
+# `Z_STREAM_ERROR` stubs, exactly matching a zlib built without a secure
+# `vsnprintf` (`zlibCompileFlags` bit 27 set). There is therefore no
+# `c-variadic` cargo feature.
+#
+# Optional stricter inflate distance validation (maps the C `INFLATE_STRICT`
+# compile-time switch). OFF by default so the default build stays byte-exact
+# with reference zlib; enable only to reject out-of-window distances early.
+# Referenced by `src/inflate/fast.rs`.
+inflate_strict = []
+
+# Three criterion benchmarks. Each disables the built-in libtest harness so that
+# criterion supplies its own `main` via `criterion_main!` (AAP §0.3.1 / §0.4.1).
+[[bench]]
+name = "deflate_bench"
+harness = false
+
+[[bench]]
+name = "inflate_bench"
+harness = false
+
+[[bench]]
+name = "checksum_bench"
+harness = false
+
+[profile.release]
+# The release build is optimized with LTO (project-guide §6.4).
+opt-level = 3
+lto = true
+codegen-units = 1
+# `panic = "abort"` is REQUIRED (not merely preferred): a `--no-default-features`
+# (`no_std`) build emits the `cdylib`/`staticlib` without an unwinding runtime,
+# and on a STABLE toolchain the compiler then rejects unwinding panics with
+# "unwinding panics are not supported without std". `panic = "abort"` is the only
+# stable mechanism that suppresses that requirement (there is no `#![panic_abort]`
+# attribute and `eh_personality` is nightly-only), and Cargo cannot scope the
+# panic strategy to a single feature or crate-type — so it MUST be set globally,
+# here and in `[profile.dev]`, for BOTH the std and no_std builds.
+#
+# This does NOT weaken the FFI safety contract. The invariant is "a Rust panic
+# must never unwind across the C ABI" (unwinding across it is UB); `panic =
+# "abort"` upholds that invariant directly. The `catch_unwind` guards in
+# `src/ffi/` remain in place (gated on `feature = "std"`) as defense-in-depth,
+# and Cargo forces the `unwind` strategy for the `cargo test`/`bench` harness
+# regardless of this setting, so those guard tests still exercise `catch_unwind`
+# and pass. For every non-panicking call — the entire functional surface —
+# behavior is identical; only a genuine internal "cannot happen" panic now
+# aborts the process (a sound, non-UB outcome) instead of being caught and
+# converted to a `Z_*` error code.
+panic = "abort"
+
+[profile.dev]
+# The panic strategy MUST match `[profile.release]`. The reproduction command
+# for the `no_std` build, `cargo build --no-default-features`, uses THIS profile,
+# and its `cdylib`/`staticlib` link step requires `panic = "abort"` on stable
+# (see the detailed rationale in `[profile.release]` above). Setting it here
+# keeps debug and release builds consistent for both the std and no_std targets.
+panic = "abort"

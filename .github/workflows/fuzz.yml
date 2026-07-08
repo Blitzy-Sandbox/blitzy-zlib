@@ -1,25 +1,100 @@
-name: OSS-Fuzz
-on: [pull_request]
+# .github/workflows/fuzz.yml
+#
+# Fuzzing pipeline for the zlib-rs crate (C -> Rust migration of zlib 1.3.2.1).
+#
+# MIGRATION NOTE:
+#   This workflow was retargeted from the previous C-oriented fuzzing-service
+#   integration (which exercised the original C library) to a pure-Rust
+#   `cargo-fuzz` (libFuzzer) pipeline. There is intentionally no C toolchain
+#   here and no external fuzzing service: everything runs through Cargo,
+#   consistent with the crate's Cargo-only CI (see ci.yml).
+#
+#   cargo-fuzz builds libFuzzer harnesses and therefore REQUIRES a Rust
+#   *nightly* toolchain: it relies on `-Z` sanitizer / coverage instrumentation
+#   that is not available on stable.
+#
+#   The in-repo `fuzz/` crate is a DETACHED workspace (it carries its own
+#   `[workspace]` table, so root `cargo build`/`test`/`clippy`/`fmt` never touch
+#   it). It ships five libFuzzer targets: `fuzz_inflate`,
+#   `fuzz_deflate_roundtrip`, `fuzz_gzip`, `fuzz_checksum`, and
+#   `fuzz_ffi_roundtrip`. The job below builds all of them and then fuzzes each
+#   for a bounded budget; a discovered crash/timeout writes a reproducer under
+#   `fuzz/artifacts` and fails the pipeline.
+
+name: Fuzz
+
+# Triggers:
+#   * pull_request      - hard requirement carried over from the original file.
+#   * workflow_dispatch - allow maintainers to launch a fuzz run on demand.
+#   * schedule          - a weekly bounded run (Mondays 03:00 UTC) for drift
+#                         detection across the fuzz targets.
+on:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 1'
+
+# Principle of least privilege: this workflow only needs read access to the
+# repository contents in order to check out and build the fuzz harnesses.
+permissions:
+  contents: read
+
+# Avoid piling up redundant fuzz runs: a newer commit on the same ref cancels
+# any still-running fuzz job for that ref.
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  Fuzzing:
+  cargo-fuzz:
+    name: cargo-fuzz (libFuzzer)
     runs-on: ubuntu-latest
     steps:
-    - name: Build Fuzzers
-      uses: google/oss-fuzz/infra/cifuzz/actions/build_fuzzers@master
-      with:
-        oss-fuzz-project-name: 'zlib'
-        dry-run: false
+      # 1. Fetch the crate sources.
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Run Fuzzers
-      uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@master
-      with:
-        oss-fuzz-project-name: 'zlib'
-        fuzz-seconds: 300
-        dry-run: false
+      # 2. cargo-fuzz / libFuzzer require a nightly toolchain for the sanitizer
+      #    and coverage instrumentation it injects into the harness.
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
 
-    - name: Upload Crash
-      uses: actions/upload-artifact@v6
-      if: failure()
-      with:
-        name: artifacts
-        path: ./out/artifacts
+      # 3. Install the cargo-fuzz subcommand (the libFuzzer front-end).
+      #    `--locked` keeps the install reproducible against cargo-fuzz's own
+      #    lockfile.
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # 4. Build every fuzz target first. This compiles all libFuzzer harnesses
+      #    and fails fast on any build error before fuzzing begins. cargo-fuzz
+      #    auto-detects the `fuzz/` crate at the repository root.
+      - name: Build fuzz targets
+        run: cargo fuzz build
+
+      # 5. Fuzz each target for a bounded budget. `cargo fuzz list` is captured
+      #    ONCE into a variable (avoids a `| head` SIGPIPE under the default
+      #    `bash -eo pipefail` shell). A crash/timeout writes a reproducer under
+      #    `fuzz/artifacts` and returns non-zero, failing the pipeline. The
+      #    budget is intentionally bounded (60s/target, capped input length and
+      #    RSS) so the scheduled/PR run stays fast and deterministic.
+      - name: Run bounded fuzzing (all targets)
+        run: |
+          targets="$(cargo fuzz list)"
+          echo "Fuzz targets: ${targets}"
+          for target in ${targets}; do
+            echo "::group::Fuzzing ${target}"
+            cargo fuzz run "${target}" -- \
+              -max_total_time=60 -max_len=65536 -rss_limit_mb=2048
+            echo "::endgroup::"
+          done
+
+      # 6. On failure (a crash/timeout reproducer was written), publish the
+      #    cargo-fuzz artifacts directory so the offending input is retrievable.
+      - name: Upload crash artifacts
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          retention-days: 7
+          if-no-files-found: ignore
