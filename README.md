@@ -68,8 +68,8 @@ performance has been measured and is reported in the [Roadmap](#roadmap).
   [`crc32fast`](https://crates.io/crates/crc32fast).
 - All seven flush modes, preset-dictionary support, and the exact
   `compressBound` sizing formula.
-- A C ABI (`#[no_mangle] extern "C"`) exposing the exact zlib symbol table with
-  `#[repr(C)]` mirrors of `z_stream` and `gz_header`.
+- A C ABI (`#[unsafe(no_mangle)] extern "C"`) exposing the exact zlib symbol
+  table with `#[repr(C)]` mirrors of `z_stream` and `gz_header`.
 
 ## Installation
 
@@ -218,8 +218,8 @@ let _ = gzclose(file);
 
 For existing C/C++ consumers, `zlib-rs` emits `cdylib` and `staticlib`
 artifacts that expose the **exact zlib C API**. The FFI layer in `src/ffi/`
-provides `#[no_mangle] extern "C"` shims for every public zlib prototype and
-`#[repr(C)]` mirror structs for `z_stream` and `gz_header`, reproducing the C
+provides `#[unsafe(no_mangle)] extern "C"` shims for every public zlib prototype
+and `#[repr(C)]` mirror structs for `z_stream` and `gz_header`, reproducing the C
 field order and type widths so the emitted object can substitute for `libz`
 without recompiling downstream code.
 
@@ -299,6 +299,9 @@ cargo build --release
 
 # Run the full test suite (unit, integration, and doc tests)
 cargo test
+
+# Run the same suite in the core-only (no_std) configuration
+cargo test --no-default-features
 
 # Lint with Clippy, treating warnings as errors
 cargo clippy --all-targets -- -D warnings

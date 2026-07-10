@@ -564,8 +564,9 @@
         <h1>A Memory-Safe zlib, Rebuilt in Rust</h1>
         <p class="subtitle">
           A full C&rarr;Rust migration of the zlib 1.3.2.1 compression
-          library — byte-identical output, C-compatible drop-in, zero C
-          dependencies.
+          library — byte-identical output and an exact C-ABI drop-in whose
+          <code>zlibVersion()</code> reports <code>1.3.2.1-motley</code>, with
+          zero C dependencies.
         </p>
         <div class="brand-lockup"><i data-lucide="zap" aria-hidden="true"></i> Blitzy</div>
       </section>
@@ -585,7 +586,7 @@
           <div class="kpi-card">
             <div class="kpi-icon"><i data-lucide="check-check" aria-hidden="true"></i></div>
             <div class="kpi-value">487</div>
-            <div class="kpi-label">Tests &middot; 0 failures</div>
+            <div class="kpi-label">tests pass &middot; 363/363 no_std</div>
           </div>
           <div class="kpi-card">
             <div class="kpi-icon"><i data-lucide="file-code" aria-hidden="true"></i></div>
@@ -608,7 +609,7 @@
             <div class="kpi-label">C dependencies</div>
           </div>
         </div>
-        <p class="caption">~23,107 lines of C reborn as 32,335 lines of memory-safe Rust across 40 files. 487 tests pass, 0 clippy lints, zero C deps &mdash; compression &asymp; 85% of C, decompression &ge; C.</p>
+        <p class="caption">~23,107 lines of C reborn as 32,335 lines of memory-safe Rust across 40 files. 487/487 tests pass (363/363 in <code>no_std</code>), 0 clippy lints, zero C deps &mdash; compression &asymp; 85% of C, decompression &ge; C.</p>
       </section>
 
       <!-- ============================================================
@@ -738,40 +739,40 @@ graph LR
           </thead>
           <tbody>
             <tr>
-              <td><code>src/deflate</code></td>
+              <td><i data-lucide="archive" aria-hidden="true"></i> <code>src/deflate</code></td>
               <td>9</td>
               <td>8,434</td>
               <td>5 strategies · Huffman trees</td>
             </tr>
             <tr>
-              <td><code>src/inflate</code></td>
+              <td><i data-lucide="git-branch" aria-hidden="true"></i> <code>src/inflate</code></td>
               <td>6</td>
               <td>5,857</td>
               <td>30+ mode decoder · fast path</td>
             </tr>
             <tr>
-              <td><code>src/gz</code></td>
+              <td><i data-lucide="file-archive" aria-hidden="true"></i> <code>src/gz</code></td>
               <td>6</td>
               <td>4,889</td>
               <td>gzip file I/O</td>
             </tr>
             <tr>
-              <td><code>src/checksum</code></td>
+              <td><i data-lucide="binary" aria-hidden="true"></i> <code>src/checksum</code></td>
               <td>3</td>
               <td>1,792</td>
               <td>Adler-32 + CRC-32 (+ combine)</td>
             </tr>
             <tr>
-              <td><code>src/util</code> + API types</td>
+              <td><i data-lucide="wrench" aria-hidden="true"></i> <code>src/util</code> + API types</td>
               <td>9</td>
               <td>&mdash;</td>
               <td>Wrappers, stream, error, constants</td>
             </tr>
             <tr>
-              <td><code>src/ffi</code></td>
+              <td><i data-lucide="plug" aria-hidden="true"></i> <code>src/ffi</code></td>
               <td>7</td>
               <td>&mdash;</td>
-              <td><code>extern "C"</code> shims · <code>#[repr(C)]</code> mirrors</td>
+              <td>106 <code>extern "C"</code> shims · <code>#[repr(C)]</code> mirrors</td>
             </tr>
           </tbody>
         </table>
@@ -804,7 +805,7 @@ flowchart LR
   CZ["C zlib deflate"] -. same wire format .-> S
           </pre>
         </div>
-        <p class="caption">Zero <code>unsafe</code> in the compression core; the remaining <code>unsafe</code> is confined to the FFI boundary, the optional <code>no_std</code> allocator, and the inflate fast-path &mdash; each with a <code>// SAFETY:</code> note.</p>
+        <p class="caption">Zero <code>unsafe</code> in the compression core; the remaining <code>unsafe</code> is confined to the FFI boundary, the optional <code>no_std</code> allocator, and the inflate fast-path &mdash; each with a <code>// SAFETY:</code> note. The exported C ABI matches the 47-symbol <code>zlib.map</code> version script.</p>
       </section>
 
       <!-- ============================================================
@@ -845,7 +846,12 @@ flowchart LR
             <tr>
               <td>Tests</td>
               <td><span class="status-pass"><i data-lucide="check" aria-hidden="true"></i> PASS</span></td>
-              <td>481 passed &middot; 0 failed &middot; 6 ignored</td>
+              <td>487/487 default &middot; 363/363 <code>no_std</code></td>
+            </tr>
+            <tr>
+              <td>Fuzzing</td>
+              <td><span class="status-pass"><i data-lucide="check" aria-hidden="true"></i> PASS</span></td>
+              <td>5 fuzz targets &middot; libFuzzer</td>
             </tr>
             <tr>
               <td>Runtime</td>
