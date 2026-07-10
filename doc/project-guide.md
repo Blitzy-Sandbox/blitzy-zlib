@@ -2,32 +2,33 @@
 
 ## 1. Executive Summary
 
-**Project:** Complete technology stack migration of the zlib compression library from ANSI C to Rust  
-**Branch:** `blitzy-20ada645-847a-4b3f-a714-0791be923d2c`  
-**Completion:** 240 hours completed out of 282 total hours = **85.1% complete**
+**Project:** Same-repository technology-stack migration of the zlib compression library from ANSI C to idiomatic, memory-safe Rust  
+**Status:** **Experimental — active migration** — functionally complete and validated; the primary remaining gate is formal human code review / sign-off  
+**Completion (effort-estimate snapshot):** 240 hours completed out of 282 total hours = **85.1% complete** (an original effort-estimate snapshot retained for planning history — see §4.1)
 
-The zlib-rs crate implements the complete zlib public API surface as an independent, zero-C-dependency Rust library conforming to RFC 1950 (zlib format), RFC 1951 (DEFLATE), and RFC 1952 (gzip format). All 46 target files specified in the Agent Action Plan have been created and implemented. The crate compiles cleanly (debug + release), passes 487 tests with 0 failures, has zero clippy warnings, and is fully formatted.
+The zlib-rs crate implements the complete zlib public API surface as an independent, zero-C-dependency Rust library conforming to RFC 1950 (zlib format), RFC 1951 (DEFLATE), and RFC 1952 (gzip format). This is a **same-repository** migration: the full Rust crate (`src/` — 40 `.rs` modules — plus `tests/`, `benches/`, `fuzz/`, `build.rs`, `Cargo.toml`/`Cargo.lock`, CI, and docs) was **added alongside** the upstream zlib C baseline, which is **retained in-repo as the behavioral/ABI reference oracle** (`Cargo.toml`'s `exclude` list keeps the C files out of the *published* crate only — it never affects `cargo build`/`test`/`bench`). The crate compiles cleanly (debug + release), passes the full default-configuration test suite (487 total: 481 passed, 6 ignored, 0 failed), has zero clippy warnings, and is fully formatted.
 
 **Key Achievements:**
-- 32,335 lines of Rust code across 40 `.rs` files replacing ~23,107 lines of C
+- 32,335 lines of Rust code across 40 `.rs` files, reimplementing the ~23,107-line C baseline that is retained in-repo as the reference oracle
 - Complete DEFLATE compression engine with all 5 strategies (stored, fast, slow, huff, rle)
 - Complete DEFLATE decompression engine with 30+ mode state machine
 - Adler-32 and CRC-32 checksum engines with combine operations
 - Gzip file I/O with stdio-like interface
 - 487 tests passing (399 unit + 68 integration + 20 doc tests)
-- CI/CD pipeline replacing 6 legacy C workflow files
-- Pure Rust — zero C dependencies
+- Cargo-based CI/CD pipeline (`.github/workflows/ci.yml` + `fuzz.yml`) added for the Rust crate
+- Pure Rust — zero C dependencies in the shipped artifact
 
 **Previously-Tracked Open Items (now resolved):**
 - `--no-default-features` test compilation is RESOLVED. The test suite now compiles and passes under both `--no-default-features` and `--no-default-features --features no-std` (357 passed, 6 ignored, 0 failed); the library itself compiles fine under all feature configurations.
 - cargo-fuzz targets are RESOLVED. Five targets exist under `fuzz/fuzz_targets/` (`fuzz_deflate_roundtrip`, `fuzz_inflate`, `fuzz_checksum`, `fuzz_gzip`, `fuzz_ffi_roundtrip`) with a `fuzz/Cargo.toml`, driven by the `fuzz.yml` workflow.
-- Performance vs C zlib has been benchmarked (tracked goal per AAP §0.6.7): compression measures ~85% of C throughput across the level sweep (L9 ≈ 85.1%), and decompression matches or exceeds C (107–127%). Meeting/exceeding the ≥80% compression target on the level sweep; worst-case incompressible input is a tracked, non-failing item.
+- Performance vs C zlib has been measured (per the ≥80%-of-C compression performance goal, AAP §0.6). Consistent with `README.md`: compression is ≈ **77–90%** of C (≈ 80% and above at levels 6–9 on compressible data; ≈ 77% at level 1 / incompressible input), decompression is ≈ **78–115%** of C (matching or exceeding C on incompressible and semi-structured data; ≈ 78% on highly compressible text where C's `inffast` has an edge), and CRC-32 runs at ≈ **1.6×** C via the SIMD-accelerated `crc32fast` hot path. Closing the remaining compression gap toward the ≥80% goal across *all* inputs is ongoing.
 
-**Recommended Next Steps:**
-1. Continue performance tuning of the deflate hot paths (hash-chain traversal, `longest_match` in `deflate_slow`) to raise worst-case incompressible-input throughput.
-2. Verify byte-identical compression output at all levels/strategies against C zlib (interop tests already assert this via `flate2`).
-3. Expand real-hardware `no_std` integration testing on an embedded target.
-4. Extend the cargo-fuzz corpus and integrate scheduled fuzzing runs in CI.
+**Recommended Next Steps:** the core codecs, byte-identity, `no_std`, and fuzzing gates are closed; the remaining work is hardening, performance, publication, and — the primary gate — human sign-off.
+1. **Formal human code review / sign-off** of the ~40k-line migration — the primary remaining gate before any production release — focusing on the `src/ffi/` `unsafe` boundary and its `// SAFETY:` justifications.
+2. Continue performance tuning of the deflate hot paths (hash-chain traversal, `longest_match` in `deflate_slow`) to close the remaining compression gap toward the ≥80%-of-C goal on worst-case incompressible input.
+3. Expand real-hardware `no_std` integration testing on an embedded target (the host-harness `no_std` configuration already passes as a blocking CI gate).
+4. Extend the `cargo-fuzz` corpus and integrate scheduled fuzzing runs in CI (the five targets already build and run via `.github/workflows/fuzz.yml`).
+5. Prepare crates.io publication: confirm the packaged file list via `cargo package --list`, then `cargo publish --dry-run`.
 
 ---
 
@@ -62,7 +63,7 @@ The Final Validator agent completed 1 commit (730a3ef) fixing 4 files:
 | Unit tests (lib) | 399 | Inline module tests across all source files |
 | tests/checksum.rs | 18 | Adler-32 and CRC-32 known-answer and combine tests |
 | tests/round_trip.rs | 12 | Property-based compression/decompression round-trip tests |
-| tests/interop.rs | 14 | Cross-validation against C zlib via flate2 |
+| tests/interop.rs | 14 | Byte-identity vs 300 baked C-zlib oracle vectors + bidirectional `flate2` (miniz_oxide) compat |
 | tests/gzip_compat.rs | 6 | Gzip file I/O validation |
 | tests/regression.rs | 11 | Port of C test/example.c regression driver |
 | tests/inflate_coverage.rs | 7 | Port of C test/infcover.c inflate coverage |
@@ -157,14 +158,14 @@ pie title Completed Work Distribution (240 hours)
 |---|------|-------------|-------------|-------|----------|----------|
 | 1 | (RESOLVED) no_std test compilation | Previously failed with 129 compilation errors under `--no-default-features` (test code used `Vec`, `format!`, `String` without `alloc` imports). Now resolved: test modules import from `alloc` (or are gated), and both `cargo test --no-default-features` and `--no-default-features --features no-std` compile and pass (357 passed, 6 ignored, 0 failed). | Complete — no further action required. | 0h (done) | — | Resolved |
 | 2 | Fix CI pipeline for no_std tests | ci.yml includes `cargo test --no-default-features` and `--no-default-features --features no-std` steps that currently fail | 1. After task #1 is complete, verify CI steps pass locally 2. If test gating approach is used, ensure CI exercises appropriate feature combos 3. Optionally add `cargo build --no-default-features` step to CI for library-only validation | 1h | High | High |
-| 3 | Performance benchmarking vs C zlib | AAP §0.8.3 requires compression within 80% of C zlib throughput; decompression must match or exceed C zlib | 1. Run `cargo bench` to get Rust throughput numbers 2. Build C zlib and run equivalent benchmarks 3. Compare at all compression levels (0-9) 4. If <80% compression throughput, profile with `perf`/`flamegraph` and optimize hot paths (likely hash chain traversal, longest_match in deflate_slow) 5. Document results | 8h | High | Medium |
-| 4 | Byte-identical compression verification | AAP §0.8.1 requires byte-identical output for same input/level/strategy/windowBits combination | 1. Write test harness that compresses data with both C zlib and zlib-rs at all 10 levels × 5 strategies 2. Compare compressed output byte-for-byte 3. If differences found, trace through LZ77 match decisions and Huffman code assignments 4. Fix any divergences in hash chain logic, match selection, or tree construction | 6h | High | Medium |
+| 3 | Performance tuning vs C zlib | The ≥80%-of-C compression performance goal (AAP §0.6 / §0.7.1) is already met at levels 6–9 (≈80–90% of C); worst-case level 1 / incompressible input (≈77%) sits just below the goal. Decompression is ≈78–115% of C and CRC-32 ≈1.6× C via the SIMD `crc32fast` hot path — see §1 and `README.md`. | 1. Re-run `cargo bench` for current throughput numbers 2. Profile the deflate hot paths with `perf`/`flamegraph` (hash-chain traversal, `longest_match` in `deflate_slow`) 3. Close the remaining compression gap on incompressible input 4. Document results | 8h | High | Medium |
+| 4 | (RESOLVED) Byte-identical compression verification | AAP §0.6.2 requires byte-identical output for the same input/level/strategy/framing. Validated **by default** (no C toolchain) in `tests/interop.rs` against 300 vectors baked from genuine C zlib 1.3.2.1-motley, spanning all levels, strategies, and zlib/raw/gzip/`windowBits` framings; the suite also round-trips against `flate2` (pure-Rust `miniz_oxide` backend) in both directions. | Complete — optional follow-up: extend the vector corpus as new edge cases surface. | 0h (done) | — | Resolved |
 | 5 | (RESOLVED) cargo-fuzz targets | Five fuzz targets now exist under `fuzz/fuzz_targets/` (`fuzz_deflate_roundtrip`, `fuzz_inflate`, `fuzz_checksum`, `fuzz_gzip`, `fuzz_ffi_roundtrip`) with a `fuzz/Cargo.toml`, driven by the `fuzz.yml` workflow. | Optional follow-up: extend the fuzzing corpus and schedule recurring runs in CI. | 0h (done) | Low | Resolved |
-| 6 | Unsafe code security audit | 432 unsafe blocks (+33 unsafe fns, 120 `extern "C"` fns) across 9 source files (FFI boundary + `lib.rs` no_std + `stream.rs`); `src/deflate/**` is unsafe-free. The security gate passed and clippy `undocumented_unsafe_blocks` is clean (all sites carry `// SAFETY:`). | 1. Periodically re-review `unsafe` sites in src/ files 2. Verify each SAFETY comment accurately describes the invariant 3. Add property tests for boundary conditions around unsafe code 4. Consider replacing any unsafe blocks with safe alternatives where possible without performance impact | 3h | Medium | Medium |
+| 6 | Unsafe code security audit | All `unsafe` is confined to **7 files**: 432 `unsafe` blocks + 33 `unsafe fn`s across the six `src/ffi/` modules that perform raw-pointer work (`deflate`, `inflate`, `gz`, `util`, `types`, `alloc`; `ffi/mod.rs` is a pure safe facade) plus the `no_std` `#[global_allocator]`/`#[panic_handler]` in `src/lib.rs`. The safe core (`deflate`/`inflate`/`checksum`/`gz`/`util`) is `unsafe`-free (`src/inflate/fast.rs` included), and `src/stream.rs` is `#![deny(unsafe_code)]` (it only declares the `unsafe extern "C"` allocator-hook function-pointer types). The security gate passed and clippy `undocumented_unsafe_blocks` is clean — all 284 sites carry a `// SAFETY:` comment. | 1. Periodically re-review the `unsafe` sites at the FFI boundary 2. Verify each `// SAFETY:` comment accurately describes the invariant 3. Add property tests for boundary conditions around the unsafe code 4. Replace `unsafe` with safe alternatives where possible without performance impact | 3h | Medium | Medium |
 | 7 | no_std integration testing | Verify the crate works correctly in an actual no_std context beyond just compilation | 1. Create a `#![no_std]` binary test crate that depends on `zlib-rs` with `default-features = false` 2. Test compression/decompression/checksums in no_std mode 3. Verify allocator integration works correctly 4. Test on an embedded target if available | 3h | Medium | Low |
 | 8 | Production edge-case hardening | Validate error recovery, boundary conditions, and memory allocation bounds | 1. Test `inflate_sync` error recovery on corrupted data streams 2. Verify `compress_bound` formula matches C zlib exactly for edge cases (0 bytes, MAX input) 3. Validate memory allocation bounds match C zlib (~256KB deflate, ~7KB inflate + window) 4. Test all 7 flush modes with minimal buffer sizes 5. Test preset dictionary edge cases | 4h | Medium | Medium |
 | 9 | Documentation refinement | Polish doc comments, add missing examples, verify all links | 1. Verify all `///` doc examples compile and run 2. Add advanced usage examples (streaming, dictionary, windowBits overloading) 3. Review README.md for accuracy against final implementation 4. Ensure docs.rs rendering is correct | 2h | Low | Low |
-| 10 | crates.io publication preparation | Prepare for crate publication | 1. Run `cargo package` and verify included files are correct (currently 68 files, some legacy files leak through) 2. Update `exclude` list in Cargo.toml to exclude remaining legacy files (doc/, msdos/, qnx/, etc.) 3. Run `cargo publish --dry-run` 4. Verify metadata (description, license, categories, keywords) | 2h | Low | Low |
+| 10 | crates.io publication preparation | Prepare for crate publication. `Cargo.toml`'s `exclude` list already keeps the retained C sources/headers (`*.c`/`*.h`/`*.map`/`*.in`), the platform directories, and the legacy C build files out of the packaged `.crate`. | 1. Confirm the packaged file list with `cargo package --list` (only crate files should appear) 2. Tighten the `exclude` list only if any non-crate file still leaks through 3. Run `cargo publish --dry-run` 4. Verify metadata (description, license, categories, keywords) | 2h | Low | Low |
 | 11 | Enterprise buffer (compliance + uncertainty) | Reserve hours for unforeseen issues, compliance requirements, and integration surprises | Applied as 1.10×1.10 multiplier on subtotal of tasks 1-10 (35h × 1.21 ≈ 42h total) | 7h | — | — |
 | | **Total Remaining Hours** | | | **42h** | | |
 
@@ -192,10 +193,10 @@ source "$HOME/.cargo/env"
 rustc --version    # Expected: rustc 1.85.0 or later
 cargo --version    # Expected: cargo 1.85.0 or later
 
-# 3. Clone repository and switch to branch
+# 3. Clone repository and switch to the migration branch
 git clone <repository-url>
 cd <repository-directory>
-git checkout blitzy-20ada645-847a-4b3f-a714-0791be923d2c
+git checkout <migration-branch>
 ```
 
 ### 6.3 Dependency Installation
@@ -279,7 +280,35 @@ cargo bench --bench inflate_bench
 cargo bench --bench checksum_bench
 ```
 
-### 6.8 Verification Steps
+### 6.8 Fuzzing
+
+The crate is fuzzed with [`cargo-fuzz`](https://crates.io/crates/cargo-fuzz) / libFuzzer. The `fuzz/` directory is a **detached** package — it carries its own `[workspace]` table, so the root `cargo build`/`test`/`clippy`/`fmt` never touch it — and is driven by [`libfuzzer-sys 0.4`](https://crates.io/crates/libfuzzer-sys). It ships **five** targets under `fuzz/fuzz_targets/`:
+
+| Target | Exercises |
+|--------|-----------|
+| `fuzz_inflate` | Decompression of arbitrary / malformed input (no panics, no UB) |
+| `fuzz_deflate_roundtrip` | compress → decompress round-trip identity across levels / strategies |
+| `fuzz_gzip` | gzip (RFC 1952) framing parse / round-trip |
+| `fuzz_checksum` | Adler-32 / CRC-32 chunked-vs-single and `*_combine` parity |
+| `fuzz_ffi_roundtrip` | The C-ABI boundary (`src/ffi/`) with raw pointers |
+
+libFuzzer requires a **nightly** toolchain (for the `-Z` sanitizer / coverage instrumentation):
+
+```bash
+# Install the tooling (once)
+rustup toolchain install nightly
+cargo install cargo-fuzz --locked
+
+# Build every target
+cd fuzz && cargo +nightly fuzz build
+
+# Run a single target (bounded run)
+cargo +nightly fuzz run fuzz_inflate -- -max_total_time=60
+```
+
+`.github/workflows/fuzz.yml` builds all five targets and runs each for a bounded time budget on a nightly toolchain (on `workflow_dispatch` and on a schedule), failing the pipeline on any crash and uploading the reproducer from `fuzz/artifacts`.
+
+### 6.9 Verification Steps
 
 After building and testing, verify the following:
 
@@ -289,7 +318,7 @@ After building and testing, verify the following:
 4. **Formatting:** `cargo fmt -- --check` produces no output
 5. **Benchmarks:** `cargo bench --no-run` compiles all 3 benchmark binaries
 
-### 6.9 Example Usage
+### 6.10 Example Usage
 
 ```rust
 use zlib_rs::{compress, uncompress};
@@ -309,13 +338,13 @@ fn main() {
 }
 ```
 
-### 6.10 Troubleshooting
+### 6.11 Troubleshooting
 
 | Issue | Cause | Resolution |
 |-------|-------|------------|
 | `cargo test --no-default-features` fails | (RESOLVED) previously missing `alloc` imports in test code | Fixed — test modules import from `alloc`; the suite compiles and passes under `--no-default-features` and `--no-default-features --features no-std` |
 | `cargo fuzz build` fails | (RESOLVED) previously no fuzz targets existed | Fixed — five targets exist under `fuzz/fuzz_targets/` with a `fuzz/Cargo.toml` |
-| Benchmark results below C zlib on incompressible input | Worst-case incompressible input only | Tracked, non-failing (see Section 1); level-sweep compression ≈ 85% of C, decompression ≥ C. Optionally profile/optimize deflate hot paths |
+| Benchmark results below C zlib on incompressible input | Worst-case level 1 / incompressible input only | Tracked, non-failing (see §1 and `README.md`): compression ≈ 77–90% of C (≈ 80%+ at levels 6–9; ≈ 77% at level 1 / incompressible), decompression ≈ 78–115% of C, CRC-32 ≈ 1.6× C. Optionally profile/optimize the deflate hot paths |
 
 ---
 
@@ -325,24 +354,24 @@ fn main() {
 
 | Risk | Severity | Likelihood | Impact | Mitigation |
 |------|----------|------------|--------|------------|
-| Compression output not byte-identical to C zlib | High | Medium | Interoperability failures with existing zlib-compressed data | Task #4: Systematic cross-validation at all levels/strategies; trace match decisions |
-| Performance below 80% of C zlib throughput | Medium | Medium | May not meet AAP §0.8.3 performance requirements | Task #3: Profile hot paths, optimize hash chain traversal and longest_match |
-| Unsafe code contains unsound invariants | High | Low | Memory safety violations defeating purpose of Rust rewrite | Task #6: Security audit of all 47 unsafe blocks; add property tests for boundary conditions |
-| no_std test failures block CI | Resolved | — | Previously failed 2 of 7 test configurations | RESOLVED — alloc imports fixed; `--no-default-features` and `--no-default-features --features no-std` compile and pass |
+| Compression output not byte-identical to C zlib | Resolved | — | Interoperability with existing zlib-compressed data | RESOLVED — byte-identity is validated **by default** in `tests/interop.rs` against 300 C-zlib oracle vectors across all levels/strategies/framings (AAP §0.6.2); no C toolchain required |
+| Performance below the ≥80%-of-C compression goal on incompressible input | Low | Medium | Falls short of the AAP §0.6 / §0.7.1 performance goal only on worst-case (level 1 / incompressible) input | Task #3: profile and tune the deflate hot paths (hash-chain traversal, `longest_match`); levels 6–9 already meet the goal |
+| Unsafe code contains unsound invariants | High | Low | Memory-safety violations defeating the purpose of the Rust rewrite | Task #6: audit the 432 `unsafe` blocks / 33 `unsafe fn`s at the `src/ffi/` boundary; all carry `// SAFETY:` and clippy `undocumented_unsafe_blocks` is clean; add property tests for boundary conditions |
+| no_std test failures block CI | Resolved | — | Previously failed the no-default-features test configurations | RESOLVED — alloc imports fixed; `--no-default-features` and `--no-default-features --features no-std` compile and pass |
 
 ### 7.2 Security Risks
 
 | Risk | Severity | Likelihood | Impact | Mitigation |
 |------|----------|------------|--------|------------|
 | No fuzz testing coverage | Resolved | — | Undiscovered crashes or panics on malformed input | RESOLVED — five cargo-fuzz targets exist (inflate, deflate round-trip, checksum, gzip, FFI round-trip); extend corpus and schedule CI runs |
-| inflate_fast unsafe inner loop | Medium | Low | Potential buffer overread on crafted input | Review SAFETY comments; add bounds-check assertions; fuzz testing |
-| Integer overflow in checksum combine | Low | Low | Incorrect checksum values | Covered by 48 checksum tests + combine verification |
+| FFI boundary `unsafe` — C caller passes an invalid pointer | Medium | Low | Undefined behavior if a C caller violates the documented contract | The `src/ffi/` shims null-check and validate handles; every block carries `// SAFETY:`; `fuzz_ffi_roundtrip` exercises the boundary. (Note: `src/inflate/fast.rs` is safe Rust with bounds-checked slice access — it contains no `unsafe`.) |
+| Integer overflow in checksum combine | Low | Low | Incorrect checksum values | Covered by the known-answer and `*_combine` parity tests (18 in `tests/checksum.rs` plus module unit tests) |
 
 ### 7.3 Operational Risks
 
 | Risk | Severity | Likelihood | Impact | Mitigation |
 |------|----------|------------|--------|------------|
-| Legacy files included in crate package | Low | High | Unnecessary bloat in published crate (26 legacy files) | Task #10: Update Cargo.toml exclude list |
+| Retained reference/C files included in the published crate | Low | Low | Unnecessary bloat in the packaged `.crate` | Mitigated — `Cargo.toml`'s `exclude` already covers the C sources/headers, platform dirs, and legacy C build files; verify with `cargo package --list` (Task #10) |
 | No published crate on crates.io | Low | Medium | Users cannot `cargo add zlib-rs` | Task #10: Validate and publish |
 | Missing changelog/release notes | Low | Medium | Users unaware of capabilities and limitations | Add CHANGELOG.md before publication |
 
@@ -360,12 +389,12 @@ fn main() {
 
 ### 8.1 Commit Summary
 
-- **Migration commits:** ~30 (by Blitzy Agent, atop inherited upstream zlib history)
-- **Branch:** `blitzy-20ada645-847a-4b3f-a714-0791be923d2c`
-- **Files changed:** 282 (47 added, 233 deleted, 2 modified)
-- **Lines added:** 35,271
-- **Lines removed:** 60,735
-- **Net change:** -25,464 lines (significant reduction due to deleting C source, contrib/, platform dirs)
+This is a **same-repository, additive** migration: the Rust crate was committed **alongside** the upstream zlib C baseline, which is **retained in the tree as the behavioral/ABI reference oracle**. The C sources were **not** mass-deleted — earlier "net reduction" framing was inaccurate.
+
+- **Migration commits:** authored by the Blitzy Agent (`agent@blitzy.com`), atop the inherited upstream zlib history.
+- **Added (the Rust crate):** `src/` (40 `.rs` modules, ~32,335 lines), `tests/` (6 integration suites, 4,142 lines), `benches/` (3 Criterion suites, 294 lines), `fuzz/` (5 libFuzzer targets + `fuzz/Cargo.toml`), `build.rs` (361 lines), `Cargo.toml`/`Cargo.lock`, the CI workflows (`.github/workflows/ci.yml`, `fuzz.yml`), and the documentation set (`README.md`, `doc/`, `mkdocs.yml`, `catalog-info.yaml`).
+- **Retained as reference (unchanged in the working tree):** the root C sources/headers (15 `*.c` + 11 `*.h`), `zlib.h` + `zlib.map` (the API/ABI contract), the legacy C build system (`CMakeLists.txt`, `Makefile.in`, `configure`, `treebuild.xml`, …), the platform directories (`amiga/`, `msdos/`, `os400/`, `qnx/`, `watcom/`, `win32/`), `contrib/`, `examples/`, and `test/`.
+- **Published-crate scope:** `Cargo.toml`'s `exclude` list keeps the retained C files, platform dirs, and legacy build files **out of the packaged `.crate` only** — it has no effect on `cargo build`/`test`/`bench` in the workspace.
 
 ### 8.2 Files Created
 
@@ -377,14 +406,20 @@ fn main() {
 | Configuration | 4 | Cargo.toml, Cargo.lock, build.rs, .github/workflows/ci.yml |
 | Documentation | 1 | README.md |
 
-### 8.3 Files Deleted
+### 8.3 C Baseline Retained as Reference (Not Deleted)
 
-- **C source files:** 15 (.c files: deflate.c, inflate.c, trees.c, crc32.c, adler32.c, compress.c, uncompr.c, gzlib.c, gzread.c, gzwrite.c, gzclose.c, infback.c, inffast.c, inftrees.c, zutil.c)
-- **C header files:** 11 (.h files: zlib.h, zconf.h, deflate.h, inflate.h, gzguts.h, zutil.h, trees.h, crc32.h, inffixed.h, inftrees.h, inffast.h)
-- **Build system:** CMakeLists.txt, Makefile, Makefile.in, .cmake-format.yaml, README-cmake.md
-- **Legacy platform dirs:** contrib/ (18 subdirs), amiga/, os400/, watcom/, win32/
-- **CI workflows:** 6 C-specific workflow files (c-std.yml, cmake.yml, configure.yml, contribs.yml, msys-cygwin.yml, others.yml)
-- **Metadata:** zlib.map, treebuild.xml
+> **Correction:** an earlier revision of this guide listed these files as "deleted." That was inaccurate. The upstream zlib C code is **retained in the repository as the migration's behavioral/ABI reference oracle** — it was **not** removed. `Cargo.toml`'s `exclude` list keeps these files out of the *published* `.crate` only; they remain fully present in the working tree for `cargo build`/`test`/`bench` and for byte-for-byte behavioral comparison against the Rust port.
+
+| Retained C artifact | Count / detail | Role in the migration |
+|---------------------|----------------|-----------------------|
+| C source files (`*.c`) | 15 — deflate.c, inflate.c, trees.c, crc32.c, adler32.c, compress.c, uncompr.c, gzlib.c, gzread.c, gzwrite.c, gzclose.c, infback.c, inffast.c, inftrees.c, zutil.c | Behavioral oracle for the Rust port |
+| C header files (`*.h`) | 11 — zlib.h, zconf.h, deflate.h, inflate.h, gzguts.h, zutil.h, trees.h, crc32.h, inffixed.h, inftrees.h, inffast.h | API surface + constant/table reference |
+| ABI contract | `zlib.h` (prototypes) + `zlib.map` (exported-symbol version script) | The contract the FFI layer mirrors |
+| Legacy C build system | CMakeLists.txt, Makefile.in, configure, make_vms.com, treebuild.xml | Reference only; superseded by Cargo |
+| Platform directories | amiga/, msdos/, os400/, qnx/, watcom/, win32/ | Out of scope for migration; retained, not migrated |
+| Contributed / example / test trees | contrib/, examples/, test/ | Reference; the C test drivers are reimplemented under `tests/` |
+
+Every entry above appears in `Cargo.toml`'s `exclude` array, so `cargo package`/`publish` ships only the Rust crate — none of these files are removed from the working tree.
 
 ### 8.4 Rust Code Metrics
 
@@ -396,7 +431,8 @@ fn main() {
 | Test lines (tests/) | 4,142 |
 | Benchmark lines (benches/) | 294 |
 | Build script lines (build.rs) | 361 |
-| Unsafe blocks / fns | 432 unsafe blocks + 33 unsafe fns (plus 120 `extern "C"` fns) across 9 source files (FFI boundary + `lib.rs` no_std support + `stream.rs`); `src/deflate/**` has zero unsafe |
+| Unsafe blocks / fns | 432 `unsafe` blocks + 33 `unsafe fn`s, confined to **7 files** — the six raw-pointer `src/ffi/` modules (`deflate`, `inflate`, `gz`, `util`, `types`, `alloc`; `ffi/mod.rs` is a pure safe facade) + the `no_std` `#[global_allocator]`/`#[panic_handler]` in `src/lib.rs`. Safe core (`deflate`/`inflate`/`checksum`/`gz`/`util`) has zero `unsafe`; `src/stream.rs` is `#![deny(unsafe_code)]` |
+| FFI exports | 106 `#[no_mangle] extern "C"` symbols (deflate 18, inflate 22, gz 34, util 25, + mod/types); `zlib.map` version script exports 47 `global:` symbols through the `ZLIB_1.2.12` node |
 | SAFETY comments | 284 (0 undocumented unsafe — clippy `undocumented_unsafe_blocks` clean) |
 | Unit tests | 399 |
 | Integration tests | 68 |
@@ -407,6 +443,8 @@ fn main() {
 ## 9. Module Architecture
 
 ### 9.1 Source Module Breakdown
+
+The Rust crate lives under `src/`. The upstream zlib C files at the repository root (`*.c`/`*.h`, `zlib.h`, `zlib.map`) are **retained alongside it as the behavioral/ABI reference oracle** — they are excluded from the published crate but remain in the working tree for `cargo build`/`test`/`bench` and for byte-for-byte comparison (see §8.1 / §8.3).
 
 ```
 src/                                  (40 files, 32,335 lines)
@@ -460,10 +498,24 @@ src/                                  (40 files, 32,335 lines)
 
 ### 9.2 Feature Flags
 
+Feature flags map the C preprocessor conditionals (`GZIP`, `NO_GZCOMPRESS`, `Z_SOLO`, `INFLATE_STRICT`) onto Cargo features. The names and defaults below are the authoritative contract and are kept in sync with `Cargo.toml` and the `README.md` feature table.
+
 | Feature | Default | Purpose |
 |---------|---------|---------|
-| `std` | yes | Enable std::io-based gzip file I/O |
-| `gzip` | yes | Enable gzip format support in deflate/inflate |
-| `gz-io` | yes | Enable gzip file I/O (implies std + gzip) |
-| `no-std` | no | Bare-metal mode: compression/decompression/checksums only |
-| `simd` | yes | SIMD-accelerated CRC-32 via crc32fast |
+| `std` | yes | Standard-library build — I/O, allocation, formatting, and the `catch_unwind` FFI panic guards |
+| `gzip` | yes | gzip framing within the deflate/inflate engines (maps C `#ifdef GZIP`) |
+| `gz-io` | yes | gzip **file** I/O layer — the `gz*` functions (maps C `#ifndef NO_GZCOMPRESS`); **implies `std` + `gzip`** |
+| `no-std` | no | Core-only, bare-metal build with no gz file I/O (maps C `Z_SOLO`); built via `--no-default-features` |
+| `simd` | yes | SIMD-accelerated CRC-32 via [`crc32fast`](https://crates.io/crates/crc32fast) (`= dep:crc32fast`); scalar fallback when off |
+| `inflate_strict` | no | Stricter inflate distance validation (maps C `INFLATE_STRICT`). Off by default so the default build stays byte-exact with reference zlib; enable only to reject out-of-window distances early |
+
+The default feature set is `["std", "gzip", "gz-io", "simd"]`. `inflate_strict` is an optional opt-in beyond that core set and is not required for a complete drop-in ABI.
+
+---
+
+## 10. Related Documentation
+
+- [Home](index.md) — project overview and documentation entry point.
+- [Technical Specifications](technical-specifications.md) — the detailed technical reference for the migration.
+- `README.md` (repository root) — the single source of truth for feature flags, project layout, build/test commands, and performance figures; this guide is kept in sync with it.
+- `Cargo.toml` (repository root) — authoritative for dependency versions, feature names/defaults, crate type, edition/MSRV, and build profiles.

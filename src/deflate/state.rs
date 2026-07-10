@@ -37,6 +37,8 @@
 //! `snake_case`) so that the port can be audited against `deflate.h` /
 //! `deflate.c` / `trees.c` line-by-line.
 
+#![deny(unsafe_code)]
+
 use alloc::boxed::Box;
 
 use crate::checksum::adler32;
