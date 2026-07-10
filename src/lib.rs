@@ -299,6 +299,33 @@ mod no_std_support {
         // returns and has no preconditions.
         unsafe { abort() }
     }
+
+    /// Supplies a no-op `rust_eh_personality` symbol for the freestanding
+    /// (`no_std`) `cdylib`/`staticlib` build so the emitted `libzlib_rs.{so,a}`
+    /// is self-contained and C-linkable on hosted GNU targets.
+    ///
+    /// The precompiled sysroot `alloc` crate — which this crate depends on for
+    /// `Box`/`Vec`/`String` — emits a `DW.ref.rust_eh_personality` relocation
+    /// that references the language runtime's exception-handling *personality*
+    /// routine. In the default `std` build the standard library's unwinding
+    /// runtime is statically linked into the artifact and defines that symbol,
+    /// so the relocation resolves internally. A `--no-default-features`
+    /// (`no_std`) build links no `std`, which would otherwise leave
+    /// `rust_eh_personality` **undefined** in `libzlib_rs.{so,a}`; a downstream
+    /// C consumer would then fail to link with
+    /// `undefined reference to 'rust_eh_personality'`.
+    ///
+    /// Because both build profiles set `panic = "abort"` (see `Cargo.toml`),
+    /// stack unwinding never occurs and this personality routine is **never
+    /// invoked** — the relocation is spurious. Defining an empty symbol
+    /// therefore makes the freestanding artifact self-contained without altering
+    /// any runtime behavior, exactly mirroring why this module already supplies
+    /// its own `#[global_allocator]` and `#[panic_handler]` for the same build.
+    /// On the stable toolchain the `#[lang = "eh_personality"]` item is
+    /// unavailable (nightly-only), so the symbol is provided by name via
+    /// `#[unsafe(no_mangle)]` — the same export form used throughout `src/ffi`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn rust_eh_personality() {}
 }
 
 // ===========================================================================
