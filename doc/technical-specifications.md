@@ -387,7 +387,7 @@ cargo fmt -- --check
 Correctness and byte-identical compatibility are the primary acceptance
 criteria, validated by a layered strategy:
 
-- **Integration tests** — 68 `#[test]` functions across six files in `tests/`.
+- **Integration tests** — 70 `#[test]` functions across six files in `tests/`.
 - **Unit tests and doctests** — colocated with the modules and re-exported API.
 - **Fuzzing** — a detached `cargo-fuzz` crate under `fuzz/` ships five libFuzzer
   targets (`fuzz_inflate`, `fuzz_deflate_roundtrip`, `fuzz_gzip`,
@@ -408,7 +408,7 @@ The integration suite breaks down as follows:
 | `tests/gzip_compat.rs` | 6 | gzip framing compatibility |
 
 Beyond the integration suite, the aggregate default-configuration run reports
-489/489 tests passing, and the `no_std` configuration reports 365/365 passing.
+493/493 tests passing, and the `no_std` configuration reports 365/365 passing.
 Continuous integration runs the build, test, and quality gates in
 `.github/workflows/ci.yml` (including the `no_std` suite as a blocking gate), and
 `.github/workflows/fuzz.yml` builds every fuzz target and runs each for a bounded

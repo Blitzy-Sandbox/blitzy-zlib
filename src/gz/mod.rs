@@ -133,6 +133,14 @@ pub use state::{GzMode, GzState};
 #[allow(unused_imports)]
 pub(crate) use state::How;
 
+/// Crate-internal mode-string validator ([`open::validate_mode`]) used by the
+/// raw-descriptor FFI shim (`src/ffi/gz.rs`) to validate a `gzdopen` mode string
+/// *before* it adopts the caller's file descriptor. It is intentionally
+/// `pub(crate)` — not part of the public `zlib_rs::gz` API — because it exists
+/// solely to preserve zlib's "`gzdopen` does not close fd if it fails" contract
+/// at the FFI boundary, mirroring the `pub(crate)` visibility of [`How`] above.
+pub(crate) use open::validate_mode;
+
 /// Open / configure / position / error-inspection family, ported from
 /// `gzlib.c`. Every function is part of the public zlib API and is re-exported
 /// publicly so callers use `zlib_rs::gz::gzopen(...)` and friends.

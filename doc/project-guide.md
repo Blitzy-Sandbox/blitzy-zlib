@@ -6,7 +6,7 @@
 **Status:** **Experimental — active migration** — functionally complete and validated; the primary remaining gate is formal human code review / sign-off  
 **Completion (effort-estimate snapshot):** 240 hours completed out of 282 total hours = **85.1% complete** (an original effort-estimate snapshot retained for planning history — see §4.1)
 
-The zlib-rs crate implements the complete zlib public API surface as an independent, zero-C-dependency Rust library conforming to RFC 1950 (zlib format), RFC 1951 (DEFLATE), and RFC 1952 (gzip format). This is a **same-repository** migration: the full Rust crate (`src/` — 40 `.rs` modules — plus `tests/`, `benches/`, `fuzz/`, `build.rs`, `Cargo.toml`/`Cargo.lock`, CI, and docs) was **added alongside** the upstream zlib C baseline, which is **retained in-repo as the behavioral/ABI reference oracle** (`Cargo.toml`'s `exclude` list keeps the C files out of the *published* crate only — it never affects `cargo build`/`test`/`bench`). The crate compiles cleanly (debug + release), passes the full default-configuration test suite (489 total: 489 passed, 0 ignored, 0 failed), has zero clippy warnings, and is fully formatted.
+The zlib-rs crate implements the complete zlib public API surface as an independent, zero-C-dependency Rust library conforming to RFC 1950 (zlib format), RFC 1951 (DEFLATE), and RFC 1952 (gzip format). This is a **same-repository** migration: the full Rust crate (`src/` — 40 `.rs` modules — plus `tests/`, `benches/`, `fuzz/`, `build.rs`, `Cargo.toml`/`Cargo.lock`, CI, and docs) was **added alongside** the upstream zlib C baseline, which is **retained in-repo as the behavioral/ABI reference oracle** (`Cargo.toml`'s `exclude` list keeps the C files out of the *published* crate only — it never affects `cargo build`/`test`/`bench`). The crate compiles cleanly (debug + release), passes the full default-configuration test suite (493 total: 493 passed, 0 ignored, 0 failed), has zero clippy warnings, and is fully formatted.
 
 **Key Achievements:**
 - 32,607 lines of Rust code across 40 `.rs` files, reimplementing the ~23,107-line C baseline that is retained in-repo as the reference oracle
@@ -14,7 +14,7 @@ The zlib-rs crate implements the complete zlib public API surface as an independ
 - Complete DEFLATE decompression engine with 30+ mode state machine
 - Adler-32 and CRC-32 checksum engines with combine operations
 - Gzip file I/O with stdio-like interface
-- 489 tests passing (399 unit + 70 integration + 20 doc tests)
+- 493 tests passing (403 unit + 70 integration + 20 doc tests)
 - Cargo-based CI/CD pipeline (`.github/workflows/ci.yml` + `fuzz.yml`) added for the Rust crate
 - Pure Rust — zero C dependencies in the shipped artifact
 
@@ -53,14 +53,14 @@ The Final Validator agent completed 1 commit (730a3ef) fixing 4 files:
 | **Compilation** | ✅ PASS | `cargo build` (debug) — 0 errors, 0 warnings; `cargo build --release` — success; `cargo bench --no-run` — 3 benchmark binaries compile |
 | **Linting** | ✅ PASS | `cargo clippy --all-targets -- -D warnings` — 0 lints |
 | **Formatting** | ✅ PASS | `cargo fmt -- --check` — all code formatted |
-| **Tests** | ✅ PASS | 489 passed, 0 failed, 0 ignored (489 total) |
+| **Tests** | ✅ PASS | 493 passed, 0 failed, 0 ignored (493 total) |
 | **Runtime** | ✅ PASS | Benchmarks compile and execute; all integration tests exercise real compression/decompression round-trips |
 
 ### 2.3 Test Results Breakdown
 
 | Test Suite | Tests Passed | Description |
 |-----------|-------------|-------------|
-| Unit tests (lib) | 399 | Inline module tests across all source files |
+| Unit tests (lib) | 403 | Inline module tests across all source files |
 | tests/checksum.rs | 18 | Adler-32 and CRC-32 known-answer and combine tests |
 | tests/round_trip.rs | 12 | Property-based compression/decompression round-trip tests |
 | tests/interop.rs | 14 | Byte-identity vs 300 baked C-zlib oracle vectors + bidirectional `flate2` (miniz_oxide) compat |
@@ -68,7 +68,7 @@ The Final Validator agent completed 1 commit (730a3ef) fixing 4 files:
 | tests/regression.rs | 13 | Port of C test/example.c regression driver |
 | tests/inflate_coverage.rs | 7 | Port of C test/infcover.c inflate coverage |
 | Doc tests | 20 (20 passed, 0 ignored) | All public API doc examples verified |
-| **Total** | **489 passed, 0 failed, 0 ignored (489 total)** | |
+| **Total** | **493 passed, 0 failed, 0 ignored (493 total)** | |
 
 ### 2.4 Build Status (no_std) — Resolved
 
@@ -232,15 +232,15 @@ cargo bench --no-run
 ```bash
 # Run all tests (unit + integration + doc tests)
 cargo test
-# Expected: 489 passed, 0 failed, 0 ignored (489 total)
+# Expected: 493 passed, 0 failed, 0 ignored (493 total)
 
 # Run only unit tests
 cargo test --lib
-# Expected: 399 passed
+# Expected: 403 passed
 
 # Run only integration tests
 cargo test --tests
-# Expected: 399 lib + 70 integration = 469 passed
+# Expected: 403 lib + 70 integration = 473 passed
 
 # Run only doc tests
 cargo test --doc
@@ -313,7 +313,7 @@ cargo +nightly fuzz run fuzz_inflate -- -max_total_time=60
 After building and testing, verify the following:
 
 1. **Compilation:** `cargo build` and `cargo build --release` both succeed with 0 errors, 0 warnings
-2. **Tests:** `cargo test` reports 489 passed, 0 failed, 0 ignored (489 total)
+2. **Tests:** `cargo test` reports 493 passed, 0 failed, 0 ignored (493 total)
 3. **Clippy:** `cargo clippy --all-targets -- -D warnings` reports 0 lints
 4. **Formatting:** `cargo fmt -- --check` produces no output
 5. **Benchmarks:** `cargo bench --no-run` compiles all 3 benchmark binaries
@@ -446,8 +446,8 @@ Every entry above appears in `Cargo.toml`'s `exclude` array, so `cargo package`/
 | Unsafe blocks / fns | 432 `unsafe` blocks + 33 `unsafe fn`s, confined to **7 files** — the six raw-pointer `src/ffi/` modules (`deflate`, `inflate`, `gz`, `util`, `types`, `alloc`; `ffi/mod.rs` is a pure safe facade) + the `no_std` `#[global_allocator]`/`#[panic_handler]` in `src/lib.rs`. Safe core (`deflate`/`inflate`/`checksum`/`gz`/`util`) has zero `unsafe`; `src/stream.rs` is `#![deny(unsafe_code)]` |
 | FFI exports | **98** `#[unsafe(no_mangle)] extern "C"` shim definitions (deflate 17, inflate 22, gz 34, util 25) compiling to **96 unique exported symbols** — `gzdopen` and `inflateGetHeader` each provide two `cfg`-gated variants of which exactly one is built per configuration. (A naive `grep -r no_mangle src/ffi` reports 106 because it also matches 8 mentions of the attribute inside doc-comments.) Separately, the `zlib.map` version script lists **54** `global:` symbols: the 47 canonical zlib symbols through the `ZLIB_1.2.12` node, plus `deflateUsed` (`ZLIB_1.3.1.2`) and six `_z*` aliases (`ZLIB_1.3.2`). |
 | SAFETY comments | 283 (0 undocumented unsafe — clippy `undocumented_unsafe_blocks` clean) |
-| Unit tests | 399 |
-| Integration tests | 68 |
+| Unit tests | 403 |
+| Integration tests | 70 |
 | Doc tests | 20 (20 passed, 0 ignored) |
 
 > **Reproducing these metrics.** Every count above is measured directly from the source tree and can be regenerated with:

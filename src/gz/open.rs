@@ -219,6 +219,26 @@ fn parse_mode(mode: &str) -> Result<ParsedMode, ReturnCode> {
     })
 }
 
+/// Validates a `gz*` mode string without performing any I/O, allocation, or
+/// file-descriptor adoption — the mode-only subset of [`gz_open`]'s checks.
+///
+/// This exists so the raw-descriptor FFI shim (the unix `gzdopen` in
+/// `src/ffi/gz.rs`) can reject an invalid mode **before** it adopts the caller's
+/// file descriptor. zlib's `gzdopen` "does not close fd if it fails" (see
+/// `zlib.h`), so the shim must not wrap the descriptor in an owned [`File`]
+/// (whose [`Drop`] would close it) until the mode is known to be valid.
+/// Delegating to [`parse_mode`] keeps a single source of truth for the C mode
+/// grammar and its rejections (`'+'`, no `'r'`/`'w'`/`'a'`, and the read-`'T'` /
+/// write-`'G'` conflicts).
+///
+/// # Errors
+///
+/// Returns the same [`ReturnCode::StreamError`] as [`parse_mode`] for any mode
+/// string the C `gz_open` would reject.
+pub(crate) fn validate_mode(mode: &str) -> Result<(), ReturnCode> {
+    parse_mode(mode).map(|_| ())
+}
+
 // ===========================================================================
 // Internal helpers: gz_reset (gzlib.c L68-89) and gz_open (gzlib.c L120-287).
 // ===========================================================================
