@@ -169,6 +169,15 @@
 .reveal .controls { color: var(--blitzy-primary); }
 .reveal .progress { color: var(--blitzy-primary); height: 6px; }
 .reveal .progress span { background: var(--gradient-accent-bar); }
+/* Keyboard-focus visibility for the navigation controls (WCAG 2.4.7).
+   Uses :focus-visible so the brand-colored ring appears only for keyboard
+   users and never on pointer interaction (which keeps its hover treatment). */
+.reveal .controls button:focus-visible {
+  outline: 3px solid var(--blitzy-primary);
+  outline-offset: 3px;
+  border-radius: 6px;
+  opacity: 1;
+}
 
 /* ------------------------------------------------------------------
    3. Eyebrow — Fira Code, uppercase, tracked; teal on dark/hero
@@ -449,6 +458,27 @@
   height: auto;
 }
 
+/* Visually-hidden text alternative (WCAG 1.1.1 / 4.1.2).
+   Each Mermaid diagram is marked aria-hidden so screen readers do not
+   announce the raw diagram source (and the CSS Mermaid injects during
+   rendering, which reveal.js would otherwise read into its aria-live
+   status region). A concise .visually-hidden summary carries the diagram's
+   meaning instead. The clip technique keeps the text in the accessibility
+   tree and in reveal.js getStatusText (which only skips display:none and
+   aria-hidden nodes), so it IS announced while remaining invisible. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 /* ------------------------------------------------------------------
    7. Styled table — module map, quality gates, risk tables
    ------------------------------------------------------------------ */
@@ -604,7 +634,7 @@
           </div>
           <div class="kpi-card">
             <div class="kpi-icon"><i data-lucide="check-check" aria-hidden="true"></i></div>
-            <div class="kpi-value">489</div>
+            <div class="kpi-value">493</div>
             <div class="kpi-label">tests pass &middot; 365/365 no_std</div>
           </div>
           <div class="kpi-card">
@@ -638,7 +668,8 @@
         <span class="eyebrow">Architecture</span>
         <h2>Six C Layers &rarr; Idiomatic Rust Modules</h2>
         <div class="mermaid-wrap">
-          <pre class="mermaid">
+          <p class="visually-hidden">Architecture mapping diagram. The six C&nbsp;baseline layers &mdash; public API, deflate, inflate, checksums, gzip&nbsp;I/O, and utilities &mdash; each map onto a Rust crate module: src/stream, src/deflate, src/inflate, src/checksum, src/gz, and src/util. An added src/ffi module provides the isolated C&nbsp;drop-in boundary.</p>
+          <pre class="mermaid" aria-hidden="true">
 graph LR
   subgraph C["C Baseline"]
     direction TB
@@ -819,7 +850,8 @@ graph LR
         <span class="eyebrow">Interop</span>
         <h2>Byte-Identical, Both Directions</h2>
         <div class="mermaid-wrap">
-          <pre class="mermaid">
+          <p class="visually-hidden">Interoperability flow diagram. Input data compressed by zlib-rs deflate produces a DEFLATE, zlib, or gzip stream (RFC&nbsp;1950, 1951, and 1952). That single wire format is decoded back to the identical original data by both zlib-rs inflate and the reference C&nbsp;zlib inflate, and reference C&nbsp;zlib deflate produces the same wire format.</p>
+          <pre class="mermaid" aria-hidden="true">
 flowchart LR
   I["Input data"] --> D["zlib-rs deflate"]
   D --> S["DEFLATE / zlib / gzip stream<br/>RFC 1950 / 1951 / 1952"]
@@ -830,7 +862,7 @@ flowchart LR
   CZ["C zlib deflate"] -. same wire format .-> S
           </pre>
         </div>
-        <p class="caption">Zero <code>unsafe</code> in the compression and decompression core; the remaining <code>unsafe</code> is confined to the FFI boundary, the optional <code>no_std</code> allocator &mdash; each with a <code>// SAFETY:</code> note. The exported C ABI matches the 47-symbol <code>zlib.map</code> version script.</p>
+        <p class="caption">Zero <code>unsafe</code> in the compression and decompression core; the remaining <code>unsafe</code> is confined to the FFI boundary, the optional <code>no_std</code> allocator &mdash; each with a <code>// SAFETY:</code> note. The exported C ABI matches the 54-symbol <code>zlib.map</code> version script.</p>
       </section>
 
       <!-- ============================================================
@@ -871,7 +903,7 @@ flowchart LR
             <tr>
               <td>Tests</td>
               <td><span class="status-pass"><i data-lucide="check" aria-hidden="true"></i> PASS</span></td>
-              <td>489 default &middot; 365 <code>no_std</code></td>
+              <td>493 default &middot; 365 <code>no_std</code></td>
             </tr>
             <tr>
               <td>Fuzzing</td>
@@ -989,7 +1021,8 @@ flowchart LR
             </ul>
           </div>
           <div class="mermaid-wrap">
-            <pre class="mermaid">
+            <p class="visually-hidden">Roadmap flow diagram. Four sequential next steps: tune deflate hot paths, broaden the benchmark matrix, run an extended fuzz soak, and publish to crates.io.</p>
+            <pre class="mermaid" aria-hidden="true">
 flowchart LR
   T1["Tune deflate hot paths"] --> T2["Broaden bench matrix"]
   T2 --> T3["Extended fuzz soak"]

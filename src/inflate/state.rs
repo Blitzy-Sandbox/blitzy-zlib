@@ -33,8 +33,9 @@
 //!
 //! # Safety
 //!
-//! This module contains **zero `unsafe`** (AAP §0.6.2 — only `fast.rs` may use
-//! `unsafe` in the inflate layer) and is `no_std`-compatible: it references only
+//! This module contains **zero `unsafe`** — as does the entire inflate layer,
+//! including `fast.rs` (AAP §0.6.1); all crate `unsafe` is confined to
+//! `src/ffi/`. It is `no_std`-compatible: it references only
 //! `core`, `alloc`, and the crate's own safe modules.
 
 use alloc::boxed::Box;

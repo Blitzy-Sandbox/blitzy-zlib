@@ -39,8 +39,10 @@
 //!
 //! # Safety and portability
 //!
-//! There is **zero `unsafe`** anywhere in this file (AAP §0.6.2 — `unsafe` in
-//! the inflate layer is confined to `fast.rs`). The module is `no_std` + `alloc`
+//! There is **zero `unsafe`** anywhere in this file — and, per AAP §0.6.1, in
+//! the entire inflate layer including the `fast.rs` fast path; all `unsafe` in
+//! the crate is confined to the `src/ffi/` C-ABI boundary. The module is
+//! `no_std` + `alloc`
 //! and targets the Rust 2024 edition (MSRV 1.85.0). All gzip-framing code is
 //! gated behind the `gzip` cargo feature; with gzip disabled, [`inflate`]
 //! still fully handles zlib and raw DEFLATE streams.
@@ -684,8 +686,8 @@ pub fn inflate_prime<A: Allocator>(strm: &mut ZStream<A>, bits: i32, value: i32)
 /// # Byte-exact fidelity
 /// Every state transition, bounds test, checksum fold, and diagnostic string is
 /// reproduced verbatim from `inflate.c`; the reported [`ZStream::data_type`]
-/// uses the exact C formula (L1147-L1149). The `unsafe`-free slow path here plus
-/// the single `unsafe` fast path in [`fast::inflate_fast`] together decode
+/// uses the exact C formula (L1147-L1149). The slow path here and the fast path
+/// in [`fast::inflate_fast`] are both entirely `unsafe`-free and together decode
 /// byte-identically to reference zlib.
 #[allow(clippy::too_many_lines)]
 pub fn inflate<A: Allocator>(
@@ -1390,8 +1392,8 @@ pub fn inflate<A: Allocator>(
             }
             InflateMode::Len => {
                 // Fast path: with at least 6 input bytes and 258 output bytes
-                // available, decode in bulk (this is the only place `unsafe`
-                // lives, inside `fast::inflate_fast`).
+                // available, decode in bulk via the safe, `unsafe`-free
+                // `fast::inflate_fast` routine.
                 if io.have() >= 6 && io.left() >= 258 {
                     // RESTORE the bit accumulator so the fast path can read it.
                     state.hold = io.hold;
