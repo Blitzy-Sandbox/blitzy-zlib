@@ -68,6 +68,20 @@ jobs:
       # 4. Build every fuzz target first. This compiles all libFuzzer harnesses
       #    and fails fast on any build error before fuzzing begins. cargo-fuzz
       #    auto-detects the `fuzz/` crate at the repository root.
+      #
+      #    REPRODUCIBILITY / `--locked`: the `fuzz/Cargo.lock` lockfile is
+      #    tracked so fuzz builds are reproducible. `--locked` is intentionally
+      #    NOT passed to `cargo fuzz build` (nor to `cargo fuzz run` below):
+      #    cargo-fuzz 0.13.x (the current release, installed by the `--locked`
+      #    step above) rejects the flag on its `build`/`run` subcommands
+      #    ("error: unexpected argument '--locked'"), and any args after the
+      #    `--` separator on `run` are forwarded to libFuzzer rather than to
+      #    cargo. cargo-fuzz drives cargo under the hood and cargo honors a
+      #    present, consistent lockfile by default, so the committed
+      #    `fuzz/Cargo.lock` is still used as-is here -- omitting the flag
+      #    forgoes only strict enforcement, never the pinned resolution. (If a
+      #    future cargo-fuzz gains `--locked` passthrough on its build/run
+      #    subcommands, the flag can simply be added to both commands here.)
       - name: Build fuzz targets
         run: cargo fuzz build
 
