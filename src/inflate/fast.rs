@@ -7,18 +7,18 @@
 //! buffers are supplied, more than 95% of `inflate()` execution time is spent
 //! here (see the C source header comment in `inffast.c`).
 //!
-//! # Unsafe policy
+//! # Safety: 100% safe Rust
 //!
-//! `src/inflate/fast.rs` is the *only* file in `src/inflate/` that is permitted
-//! to contain `unsafe`, and only for hot-path bounds-check elision. Per the
-//! project's "prefer a fully-safe implementation first" directive, this port is
-//! written entirely in **safe Rust**: it uses bounds-checked slice indexing
-//! throughout. The entry contract documented on [`inflate_fast`] guarantees
-//! that at most six input bytes and at most 258 output bytes are touched per
-//! loop iteration, so — for a well-formed stream honoring that contract — the
-//! bounds checks never fail. Should profiling ever justify unchecked indexing,
-//! this module is the designated (and sole) location for it, and every such
-//! block must carry a `// SAFETY:` justification. None is required today.
+//! Per AAP §0.6.1 and the `src/inflate/` folder invariant, this module — like
+//! every other file under `src/inflate/` — contains **zero `unsafe`** and is,
+//! and must remain, written entirely in **safe Rust**. Despite being the
+//! throughput-critical hot loop, it uses bounds-checked slice indexing
+//! throughout rather than unchecked access. The entry contract documented on
+//! [`inflate_fast`] guarantees that at most six input bytes and at most 258
+//! output bytes are touched per loop iteration, so — for a well-formed stream
+//! honoring that contract — those bounds checks are provably never triggered
+//! and the optimizer elides them on the hot path. No `unsafe`, `get_unchecked`,
+//! raw-pointer casting, or `transmute` is used or permitted here.
 //!
 //! # Byte-exact output
 //!
