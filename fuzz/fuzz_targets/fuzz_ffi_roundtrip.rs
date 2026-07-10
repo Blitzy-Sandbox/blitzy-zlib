@@ -47,12 +47,17 @@ fuzz_target!(|data: &[u8]| {
     let dret = unsafe { deflate(&mut ds, Z_FINISH) };
     let produced = comp.len() - ds.avail_out as usize;
     // SAFETY: `ds` was initialized above; reclaim its internal state.
-    unsafe {
-        deflateEnd(&mut ds);
-    }
-    if dret != Z_STREAM_END {
-        return; // did not finish in one shot (should not happen); not a bug.
-    }
+    let dend = unsafe { deflateEnd(&mut ds) };
+    // The output buffer is deliberately oversized (`data.len() + data.len() / 2
+    // + 128` comfortably exceeds the zlib deflate bound for any input), so a
+    // single `Z_FINISH` MUST finish the stream in one call. A non-`Z_STREAM_END`
+    // result — or a `deflateEnd` that does not return `Z_OK` — is therefore a
+    // genuine defect in the crate's OWN FFI deflate lifecycle/compression of
+    // self-produced data, not an artifact of untrusted fuzz input, so surface it
+    // to libFuzzer instead of swallowing it. (The only silent early return is
+    // the `deflateInit_` init/OOM failure above, where no live stream exists.)
+    assert_eq!(dret, Z_STREAM_END, "ffi deflate did not finish in one shot");
+    assert_eq!(dend, Z_OK, "ffi deflateEnd did not return Z_OK");
 
     // ---- Decompress through the C ABI inflate path. -----------------------
     // SAFETY: as above.

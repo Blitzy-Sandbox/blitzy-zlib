@@ -6,20 +6,20 @@
 **Status:** **Experimental — active migration** — functionally complete and validated; the primary remaining gate is formal human code review / sign-off  
 **Completion (effort-estimate snapshot):** 240 hours completed out of 282 total hours = **85.1% complete** (an original effort-estimate snapshot retained for planning history — see §4.1)
 
-The zlib-rs crate implements the complete zlib public API surface as an independent, zero-C-dependency Rust library conforming to RFC 1950 (zlib format), RFC 1951 (DEFLATE), and RFC 1952 (gzip format). This is a **same-repository** migration: the full Rust crate (`src/` — 40 `.rs` modules — plus `tests/`, `benches/`, `fuzz/`, `build.rs`, `Cargo.toml`/`Cargo.lock`, CI, and docs) was **added alongside** the upstream zlib C baseline, which is **retained in-repo as the behavioral/ABI reference oracle** (`Cargo.toml`'s `exclude` list keeps the C files out of the *published* crate only — it never affects `cargo build`/`test`/`bench`). The crate compiles cleanly (debug + release), passes the full default-configuration test suite (487 total: 487 passed, 0 ignored, 0 failed), has zero clippy warnings, and is fully formatted.
+The zlib-rs crate implements the complete zlib public API surface as an independent, zero-C-dependency Rust library conforming to RFC 1950 (zlib format), RFC 1951 (DEFLATE), and RFC 1952 (gzip format). This is a **same-repository** migration: the full Rust crate (`src/` — 40 `.rs` modules — plus `tests/`, `benches/`, `fuzz/`, `build.rs`, `Cargo.toml`/`Cargo.lock`, CI, and docs) was **added alongside** the upstream zlib C baseline, which is **retained in-repo as the behavioral/ABI reference oracle** (`Cargo.toml`'s `exclude` list keeps the C files out of the *published* crate only — it never affects `cargo build`/`test`/`bench`). The crate compiles cleanly (debug + release), passes the full default-configuration test suite (489 total: 489 passed, 0 ignored, 0 failed), has zero clippy warnings, and is fully formatted.
 
 **Key Achievements:**
-- 32,561 lines of Rust code across 40 `.rs` files, reimplementing the ~23,107-line C baseline that is retained in-repo as the reference oracle
+- 32,607 lines of Rust code across 40 `.rs` files, reimplementing the ~23,107-line C baseline that is retained in-repo as the reference oracle
 - Complete DEFLATE compression engine with all 5 strategies (stored, fast, slow, huff, rle)
 - Complete DEFLATE decompression engine with 30+ mode state machine
 - Adler-32 and CRC-32 checksum engines with combine operations
 - Gzip file I/O with stdio-like interface
-- 487 tests passing (399 unit + 68 integration + 20 doc tests)
+- 489 tests passing (399 unit + 70 integration + 20 doc tests)
 - Cargo-based CI/CD pipeline (`.github/workflows/ci.yml` + `fuzz.yml`) added for the Rust crate
 - Pure Rust — zero C dependencies in the shipped artifact
 
 **Previously-Tracked Open Items (now resolved):**
-- `--no-default-features` test compilation is RESOLVED. The test suite now compiles and passes under both `--no-default-features` and `--no-default-features --features no-std` (363 passed, 0 ignored, 0 failed); the library itself compiles fine under all feature configurations.
+- `--no-default-features` test compilation is RESOLVED. The test suite now compiles and passes under both `--no-default-features` and `--no-default-features --features no-std` (365 passed, 0 ignored, 0 failed); the library itself compiles fine under all feature configurations.
 - cargo-fuzz targets are RESOLVED. Five targets exist under `fuzz/fuzz_targets/` (`fuzz_deflate_roundtrip`, `fuzz_inflate`, `fuzz_checksum`, `fuzz_gzip`, `fuzz_ffi_roundtrip`) with a `fuzz/Cargo.toml`, driven by the `fuzz.yml` workflow.
 - Performance vs C zlib has been measured (per the ≥80%-of-C compression performance goal, AAP §0.6). Consistent with `README.md`: compression is ≈ **77–90%** of C (≈ 80% and above at levels 6–9 on compressible data; ≈ 77% at level 1 / incompressible input), decompression is ≈ **78–115%** of C (matching or exceeding C on incompressible and semi-structured data; ≈ 78% on highly compressible text where C's `inffast` has an edge), and CRC-32 runs at ≈ **1.6×** C via the SIMD-accelerated `crc32fast` hot path. Closing the remaining compression gap toward the ≥80% goal across *all* inputs is ongoing.
 
@@ -53,7 +53,7 @@ The Final Validator agent completed 1 commit (730a3ef) fixing 4 files:
 | **Compilation** | ✅ PASS | `cargo build` (debug) — 0 errors, 0 warnings; `cargo build --release` — success; `cargo bench --no-run` — 3 benchmark binaries compile |
 | **Linting** | ✅ PASS | `cargo clippy --all-targets -- -D warnings` — 0 lints |
 | **Formatting** | ✅ PASS | `cargo fmt -- --check` — all code formatted |
-| **Tests** | ✅ PASS | 487 passed, 0 failed, 0 ignored (487 total) |
+| **Tests** | ✅ PASS | 489 passed, 0 failed, 0 ignored (489 total) |
 | **Runtime** | ✅ PASS | Benchmarks compile and execute; all integration tests exercise real compression/decompression round-trips |
 
 ### 2.3 Test Results Breakdown
@@ -65,14 +65,14 @@ The Final Validator agent completed 1 commit (730a3ef) fixing 4 files:
 | tests/round_trip.rs | 12 | Property-based compression/decompression round-trip tests |
 | tests/interop.rs | 14 | Byte-identity vs 300 baked C-zlib oracle vectors + bidirectional `flate2` (miniz_oxide) compat |
 | tests/gzip_compat.rs | 6 | Gzip file I/O validation |
-| tests/regression.rs | 11 | Port of C test/example.c regression driver |
+| tests/regression.rs | 13 | Port of C test/example.c regression driver |
 | tests/inflate_coverage.rs | 7 | Port of C test/infcover.c inflate coverage |
 | Doc tests | 20 (20 passed, 0 ignored) | All public API doc examples verified |
-| **Total** | **487 passed, 0 failed, 0 ignored (487 total)** | |
+| **Total** | **489 passed, 0 failed, 0 ignored (489 total)** | |
 
 ### 2.4 Build Status (no_std) — Resolved
 
-**`cargo test --no-default-features` now compiles and passes.** The earlier failure (129 compilation errors from test modules using `Vec`, `format!`, and `String` without `alloc` imports when the `std` feature was disabled) has been resolved: the affected test modules now import from `alloc` (or are gated appropriately). Both `cargo test --no-default-features` and `cargo test --no-default-features --features no-std` compile and pass (363 passed, 0 ignored, 0 failed). The library compiles correctly under all feature configurations, and the CI pipeline (`ci.yml`) steps for these configurations pass.
+**`cargo test --no-default-features` now compiles and passes.** The earlier failure (129 compilation errors from test modules using `Vec`, `format!`, and `String` without `alloc` imports when the `std` feature was disabled) has been resolved: the affected test modules now import from `alloc` (or are gated appropriately). Both `cargo test --no-default-features` and `cargo test --no-default-features --features no-std` compile and pass (365 passed, 0 ignored, 0 failed). The library compiles correctly under all feature configurations, and the CI pipeline (`ci.yml`) steps for these configurations pass.
 
 ---
 
@@ -112,7 +112,7 @@ pie title Completed Work Distribution (240 hours)
 
 ### 4.1 Completed Hours Calculation
 
-> Note: The **Hours** column is the original effort-estimate snapshot (sums to 240h and is retained for planning history). The **Lines** column has been refreshed to current measured values, so the two columns reflect different points in the project timeline. The `src/` component rows sum exactly to 40 files / 32,561 lines; Test and Benchmark rows are separate (non-`src/`). See Section 8.4 for the authoritative code-metrics summary.
+> Note: The **Hours** column is the original effort-estimate snapshot (sums to 240h and is retained for planning history). The **Lines** column has been refreshed to current measured values, so the two columns reflect different points in the project timeline. The `src/` component rows sum exactly to 40 files / 32,607 lines; Test and Benchmark rows are separate (non-`src/`). See Section 8.4 for the authoritative code-metrics summary.
 
 | Component | Files | Lines | Hours | Rationale |
 |-----------|-------|-------|-------|-----------|
@@ -121,7 +121,7 @@ pie title Completed Work Distribution (240 hours)
 | Gzip File I/O | 6 files (src/gz/) | 5,317 | 32h | stdio-like interface: open/read/write/close/seek with LOOK/COPY/GZIP pipeline |
 | Test Suite | 6 files (tests/) | 4,142 | 28h | 6 integration test files porting C test/example.c, infcover.c + new property tests |
 | FFI Boundary | 7 files (src/ffi/) | 7,972 | — | `#[unsafe(no_mangle)] extern "C"` drop-in shims + `#[repr(C)]` mirrors (effort folded into Public API Types and Quality rows) |
-| Public API Types | 5 files (lib.rs, error.rs, constants.rs, stream.rs, gz_header.rs) | 3,462 | 20h | Foundational types, error handling, streaming interface, version constants |
+| Public API Types | 5 files (lib.rs, error.rs, constants.rs, stream.rs, gz_header.rs) | 3,508 | 20h | Foundational types, error handling, streaming interface, version constants |
 | Quality & Debugging | — | — | 16h | ~30 Blitzy Agent commits: formatting fixes, clippy compliance, safety comments, bug fixes |
 | Checksum Engines | 3 files (src/checksum/) | 874 | 12h | Adler-32 with combine, CRC-32 with combine/gen/op, build.rs table generation |
 | Architecture/Config | Cargo.toml, build.rs, .gitignore | 1,703 | 8h | Package manifest, CRC table generation, feature flags, profile config |
@@ -129,7 +129,7 @@ pie title Completed Work Distribution (240 hours)
 | Utilities | 4 files (src/util/) | 1,376 | 6h | compress/uncompress wrappers, version/compile_flags |
 | Documentation | README.md | 383 | 6h | Comprehensive crate docs with usage examples, feature flags, API overview |
 | CI/CD | ci.yml, fuzz.yml | ~135 | 1h | Rust CI pipeline, cargo-fuzz workflow |
-| **Total (src/ only)** | **40 .rs** | **32,561** | **240h** | Hours total spans all components; line total is `src/` only |
+| **Total (src/ only)** | **40 .rs** | **32,607** | **240h** | Hours total spans all components; line total is `src/` only |
 
 ### 4.2 Remaining Hours Calculation
 
@@ -156,8 +156,8 @@ pie title Completed Work Distribution (240 hours)
 
 | # | Task | Description | Action Steps | Hours | Priority | Severity |
 |---|------|-------------|-------------|-------|----------|----------|
-| 1 | (RESOLVED) no_std test compilation | Previously failed with 129 compilation errors under `--no-default-features` (test code used `Vec`, `format!`, `String` without `alloc` imports). Now resolved: test modules import from `alloc` (or are gated), and both `cargo test --no-default-features` and `--no-default-features --features no-std` compile and pass (363 passed, 0 ignored, 0 failed). | Complete — no further action required. | 0h (done) | — | Resolved |
-| 2 | (VERIFY) CI no_std gates remain green | ci.yml runs `cargo test --locked --no-default-features` and `--no-default-features --features no-std` as gating steps; both currently pass (363 passed, 0 failed, 0 ignored) following task #1. This row is verification-only — there is no outstanding failure. | 1. Periodically confirm the locked no-std CI steps still pass 2. Ensure the feature matrix continues to exercise `--no-default-features` and `--features no-std` 3. Keep the `cargo build --no-default-features` library-only check in CI | 1h | Low | Low |
+| 1 | (RESOLVED) no_std test compilation | Previously failed with 129 compilation errors under `--no-default-features` (test code used `Vec`, `format!`, `String` without `alloc` imports). Now resolved: test modules import from `alloc` (or are gated), and both `cargo test --no-default-features` and `--no-default-features --features no-std` compile and pass (365 passed, 0 ignored, 0 failed). | Complete — no further action required. | 0h (done) | — | Resolved |
+| 2 | (VERIFY) CI no_std gates remain green | ci.yml runs `cargo test --locked --no-default-features` and `--no-default-features --features no-std` as gating steps; both currently pass (365 passed, 0 failed, 0 ignored) following task #1. This row is verification-only — there is no outstanding failure. | 1. Periodically confirm the locked no-std CI steps still pass 2. Ensure the feature matrix continues to exercise `--no-default-features` and `--features no-std` 3. Keep the `cargo build --no-default-features` library-only check in CI | 1h | Low | Low |
 | 3 | Performance tuning vs C zlib | The ≥80%-of-C compression performance goal (AAP §0.6 / §0.7.1) is already met at levels 6–9 (≈80–90% of C); worst-case level 1 / incompressible input (≈77%) sits just below the goal. Decompression is ≈78–115% of C and CRC-32 ≈1.6× C via the SIMD `crc32fast` hot path — see §1 and `README.md`. | 1. Re-run `cargo bench` for current throughput numbers 2. Profile the deflate hot paths with `perf`/`flamegraph` (hash-chain traversal, `longest_match` in `deflate_slow`) 3. Close the remaining compression gap on incompressible input 4. Document results | 8h | High | Medium |
 | 4 | (RESOLVED) Byte-identical compression verification | AAP §0.6.2 requires byte-identical output for the same input/level/strategy/framing. Validated **by default** (no C toolchain) in `tests/interop.rs` against 300 vectors baked from genuine C zlib 1.3.2.1-motley, spanning all levels, strategies, and zlib/raw/gzip/`windowBits` framings; the suite also round-trips against `flate2` (pure-Rust `miniz_oxide` backend) in both directions. | Complete — optional follow-up: extend the vector corpus as new edge cases surface. | 0h (done) | — | Resolved |
 | 5 | (RESOLVED) cargo-fuzz targets | Five fuzz targets now exist under `fuzz/fuzz_targets/` (`fuzz_deflate_roundtrip`, `fuzz_inflate`, `fuzz_checksum`, `fuzz_gzip`, `fuzz_ffi_roundtrip`) with a `fuzz/Cargo.toml`, driven by the `fuzz.yml` workflow. | Optional follow-up: extend the fuzzing corpus and schedule recurring runs in CI. | 0h (done) | Low | Resolved |
@@ -232,7 +232,7 @@ cargo bench --no-run
 ```bash
 # Run all tests (unit + integration + doc tests)
 cargo test
-# Expected: 487 passed, 0 failed, 0 ignored (487 total)
+# Expected: 489 passed, 0 failed, 0 ignored (489 total)
 
 # Run only unit tests
 cargo test --lib
@@ -240,7 +240,7 @@ cargo test --lib
 
 # Run only integration tests
 cargo test --tests
-# Expected: 399 lib + 68 integration = 467 passed
+# Expected: 399 lib + 70 integration = 469 passed
 
 # Run only doc tests
 cargo test --doc
@@ -313,7 +313,7 @@ cargo +nightly fuzz run fuzz_inflate -- -max_total_time=60
 After building and testing, verify the following:
 
 1. **Compilation:** `cargo build` and `cargo build --release` both succeed with 0 errors, 0 warnings
-2. **Tests:** `cargo test` reports 487 passed, 0 failed, 0 ignored (487 total)
+2. **Tests:** `cargo test` reports 489 passed, 0 failed, 0 ignored (489 total)
 3. **Clippy:** `cargo clippy --all-targets -- -D warnings` reports 0 lints
 4. **Formatting:** `cargo fmt -- --check` produces no output
 5. **Benchmarks:** `cargo bench --no-run` compiles all 3 benchmark binaries
@@ -404,7 +404,7 @@ fn main() {
 This is a **same-repository, additive** migration: the Rust crate was committed **alongside** the upstream zlib C baseline, which is **retained in the tree as the behavioral/ABI reference oracle**. The C sources were **not** mass-deleted — earlier "net reduction" framing was inaccurate.
 
 - **Migration commits:** authored by the Blitzy Agent (`agent@blitzy.com`), atop the inherited upstream zlib history.
-- **Added (the Rust crate):** `src/` (40 `.rs` modules, ~32,561 lines), `tests/` (6 integration suites, 4,142 lines), `benches/` (3 Criterion suites, 294 lines), `fuzz/` (5 libFuzzer targets + `fuzz/Cargo.toml`), `build.rs` (361 lines), `Cargo.toml`/`Cargo.lock`, the CI workflows (`.github/workflows/ci.yml`, `fuzz.yml`), and the documentation set (`README.md`, `doc/`, `mkdocs.yml`, `catalog-info.yaml`).
+- **Added (the Rust crate):** `src/` (40 `.rs` modules, ~32,607 lines), `tests/` (6 integration suites, 4,142 lines), `benches/` (3 Criterion suites, 294 lines), `fuzz/` (5 libFuzzer targets + `fuzz/Cargo.toml`), `build.rs` (361 lines), `Cargo.toml`/`Cargo.lock`, the CI workflows (`.github/workflows/ci.yml`, `fuzz.yml`), and the documentation set (`README.md`, `doc/`, `mkdocs.yml`, `catalog-info.yaml`).
 - **Retained as reference (unchanged in the working tree):** the root C sources/headers (15 `*.c` + 11 `*.h`), `zlib.h` + `zlib.map` (the API/ABI contract), the legacy C build system (`CMakeLists.txt`, `Makefile.in`, `configure`, `treebuild.xml`, …), the platform directories (`amiga/`, `msdos/`, `os400/`, `qnx/`, `watcom/`, `win32/`), `contrib/`, `examples/`, and `test/`.
 - **Published-crate scope:** `Cargo.toml`'s `exclude` list keeps the retained C files, platform dirs, and legacy build files **out of the packaged `.crate` only** — it has no effect on `cargo build`/`test`/`bench` in the workspace.
 
@@ -439,7 +439,7 @@ Every entry above appears in `Cargo.toml`'s `exclude` array, so `cargo package`/
 |--------|-------|
 | Total Rust files | 50 (40 src + 6 tests + 3 benches + 1 build.rs) |
 | Total Rust lines | 37,358 |
-| Source lines (src/) | 32,561 |
+| Source lines (src/) | 32,607 |
 | Test lines (tests/) | 4,142 |
 | Benchmark lines (benches/) | 294 |
 | Build script lines (build.rs) | 361 |
@@ -457,7 +457,7 @@ Every entry above appears in `Cargo.toml`'s `exclude` array, so `cargo package`/
 > - `unsafe` blocks: `grep -rn 'unsafe {' src | wc -l`.
 > - FFI shim definitions: `grep -rnE '^\s*#\[\s*unsafe\(\s*no_mangle\s*\)' src/ffi | wc -l` (counts code attributes only, excluding doc-comment mentions of the attribute).
 >
-> The per-file line counts in §9.1 sum to their module subtotals, which in turn sum to the `src/` grand total of 32,561 lines (deflate 6,990 + inflate 6,570 + checksum 874 + gz 5,317 + util 1,376 + ffi 7,972 + the five root files 3,462).
+> The per-file line counts in §9.1 sum to their module subtotals, which in turn sum to the `src/` grand total of 32,607 lines (deflate 6,990 + inflate 6,570 + checksum 874 + gz 5,317 + util 1,376 + ffi 7,972 + the five root files 3,508).
 
 ---
 
@@ -468,7 +468,7 @@ Every entry above appears in `Cargo.toml`'s `exclude` array, so `cargo package`/
 The Rust crate lives under `src/`. The upstream zlib C files at the repository root (`*.c`/`*.h`, `zlib.h`, `zlib.map`) are **retained alongside it as the behavioral/ABI reference oracle** — they are excluded from the published crate but remain in the working tree for `cargo build`/`test`/`bench` and for byte-for-byte comparison (see §8.1 / §8.3).
 
 ```
-src/                                  (40 files, 32,561 lines)
+src/                                  (40 files, 32,607 lines)
 ├── lib.rs              (520 lines)  — Crate root, public re-exports, version constants
 ├── error.rs            (448 lines)  — ZlibError enum, ReturnCode enum, Result type alias
 ├── constants.rs        (729 lines)  — Flush modes, compression levels, strategies, limits

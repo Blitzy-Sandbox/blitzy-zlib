@@ -403,12 +403,12 @@ The integration suite breaks down as follows:
 | `tests/checksum.rs` | 18 | Adler-32 / CRC-32 known-answer tests and `*_combine` parity |
 | `tests/interop.rs` | 14 | Byte-identity vs the C oracle plus bidirectional `flate2` compatibility |
 | `tests/round_trip.rs` | 12 | Compress then decompress across levels and strategies |
-| `tests/regression.rs` | 11 | Regression guards |
+| `tests/regression.rs` | 13 | Regression guards |
 | `tests/inflate_coverage.rs` | 7 | Inflate edge-case coverage (from `infcover.c`) |
 | `tests/gzip_compat.rs` | 6 | gzip framing compatibility |
 
 Beyond the integration suite, the aggregate default-configuration run reports
-487/487 tests passing, and the `no_std` configuration reports 363/363 passing.
+489/489 tests passing, and the `no_std` configuration reports 365/365 passing.
 Continuous integration runs the build, test, and quality gates in
 `.github/workflows/ci.yml` (including the `no_std` suite as a blocking gate), and
 `.github/workflows/fuzz.yml` builds every fuzz target and runs each for a bounded
