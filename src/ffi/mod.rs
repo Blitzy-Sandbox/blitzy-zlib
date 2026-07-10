@@ -151,8 +151,12 @@ pub mod util;
 // The caller-allocator (`zalloc`/`zfree`) buffer bridge. This is internal
 // plumbing (no `extern "C"` symbols), not part of the public C surface, so it is
 // `pub(crate)` rather than `pub` and is intentionally NOT glob-re-exported below.
-// It is the sanctioned home of the raw allocator-hook `unsafe`, which the safe
-// core (`src/stream.rs`) delegates to via `AllocHook::try_alloc_zeroed` (M6).
+// It is the sanctioned home of the raw allocator-hook `unsafe`. Rather than the
+// safe core calling inward, this module *supplies* its `FOREIGN_VTABLE` to an
+// active `AllocHook` (via `AllocHook::with_vtable`); the core then reaches
+// foreign allocation only by invoking that table through
+// `AllocHook::try_alloc_zeroed`, so the safe-core → unsafe-boundary dependency
+// stays strictly one-way (M6; AAP §0.6.1).
 pub(crate) mod alloc;
 
 #[cfg(feature = "gz-io")]

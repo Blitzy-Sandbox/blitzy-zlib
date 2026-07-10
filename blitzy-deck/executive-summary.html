@@ -60,7 +60,7 @@
 
   /* Neutrals — text */
   --blitzy-text: #333333;
-  --blitzy-text-muted: #999999;
+  --blitzy-text-muted: #6F6F6F;
   --blitzy-text-inverse: #FFFFFF;
 
   /* Neutrals — border */
@@ -609,7 +609,7 @@
             <div class="kpi-label">C dependencies</div>
           </div>
         </div>
-        <p class="caption">~23,107 lines of C reborn as 32,335 lines of memory-safe Rust across 40 files. 487/487 tests pass (363/363 in <code>no_std</code>), 0 clippy lints, zero C deps &mdash; compression &asymp; 85% of C, decompression &ge; C.</p>
+        <p class="caption">Byte-identical DEFLATE output, validated against reference zlib.</p>
       </section>
 
       <!-- ============================================================
@@ -678,7 +678,7 @@ graph LR
           </div>
           <div>
             <i data-lucide="plug" aria-hidden="true"></i>
-            <span class="icon-label">Exact C ABI drop-in — no downstream recompilation.</span>
+            <span class="icon-label">Exact C ABI drop-in — no downstream source changes.</span>
           </div>
           <div>
             <i data-lucide="package-check" aria-hidden="true"></i>
@@ -731,10 +731,10 @@ graph LR
         <table class="blitzy-table">
           <thead>
             <tr>
-              <th>Module</th>
-              <th>Files</th>
-              <th>Lines</th>
-              <th>Responsibility</th>
+              <th scope="col">Module</th>
+              <th scope="col">Files</th>
+              <th scope="col">Lines</th>
+              <th scope="col">Responsibility</th>
             </tr>
           </thead>
           <tbody>
@@ -742,37 +742,37 @@ graph LR
               <td><i data-lucide="archive" aria-hidden="true"></i> <code>src/deflate</code></td>
               <td>9</td>
               <td>8,434</td>
-              <td>5 strategies · Huffman trees</td>
+              <td>5 strategies</td>
             </tr>
             <tr>
               <td><i data-lucide="git-branch" aria-hidden="true"></i> <code>src/inflate</code></td>
               <td>6</td>
               <td>5,857</td>
-              <td>30+ mode decoder · fast path</td>
+              <td>Streaming decoder</td>
             </tr>
             <tr>
               <td><i data-lucide="file-archive" aria-hidden="true"></i> <code>src/gz</code></td>
               <td>6</td>
               <td>4,889</td>
-              <td>gzip file I/O</td>
+              <td>gzip streams</td>
             </tr>
             <tr>
               <td><i data-lucide="binary" aria-hidden="true"></i> <code>src/checksum</code></td>
               <td>3</td>
               <td>1,792</td>
-              <td>Adler-32 + CRC-32 (+ combine)</td>
+              <td>Adler-32, CRC-32</td>
             </tr>
             <tr>
-              <td><i data-lucide="wrench" aria-hidden="true"></i> <code>src/util</code> + API types</td>
+              <td><i data-lucide="wrench" aria-hidden="true"></i> <code>src/util</code></td>
               <td>9</td>
               <td>&mdash;</td>
-              <td>Wrappers, stream, error, constants</td>
+              <td>API types</td>
             </tr>
             <tr>
               <td><i data-lucide="plug" aria-hidden="true"></i> <code>src/ffi</code></td>
               <td>7</td>
               <td>&mdash;</td>
-              <td>106 <code>extern "C"</code> shims · <code>#[repr(C)]</code> mirrors</td>
+              <td>106 C-ABI shims</td>
             </tr>
           </tbody>
         </table>
@@ -805,7 +805,7 @@ flowchart LR
   CZ["C zlib deflate"] -. same wire format .-> S
           </pre>
         </div>
-        <p class="caption">Zero <code>unsafe</code> in the compression core; the remaining <code>unsafe</code> is confined to the FFI boundary, the optional <code>no_std</code> allocator, and the inflate fast-path &mdash; each with a <code>// SAFETY:</code> note. The exported C ABI matches the 47-symbol <code>zlib.map</code> version script.</p>
+        <p class="caption">Zero <code>unsafe</code> in the compression and decompression core; the remaining <code>unsafe</code> is confined to the FFI boundary, the optional <code>no_std</code> allocator &mdash; each with a <code>// SAFETY:</code> note. The exported C ABI matches the 47-symbol <code>zlib.map</code> version script.</p>
       </section>
 
       <!-- ============================================================
@@ -817,16 +817,16 @@ flowchart LR
         <table class="blitzy-table">
           <thead>
             <tr>
-              <th>Gate</th>
-              <th>Status</th>
-              <th>Detail</th>
+              <th scope="col">Gate</th>
+              <th scope="col">Status</th>
+              <th scope="col">Detail</th>
             </tr>
           </thead>
           <tbody>
             <tr>
               <td>Dependencies</td>
               <td><span class="status-pass"><i data-lucide="check" aria-hidden="true"></i> PASS</span></td>
-              <td>89 packages resolved</td>
+              <td>89 packages</td>
             </tr>
             <tr>
               <td>Compilation</td>
@@ -846,12 +846,12 @@ flowchart LR
             <tr>
               <td>Tests</td>
               <td><span class="status-pass"><i data-lucide="check" aria-hidden="true"></i> PASS</span></td>
-              <td>487/487 default &middot; 363/363 <code>no_std</code></td>
+              <td>487 default &middot; 363 <code>no_std</code></td>
             </tr>
             <tr>
               <td>Fuzzing</td>
               <td><span class="status-pass"><i data-lucide="check" aria-hidden="true"></i> PASS</span></td>
-              <td>5 fuzz targets &middot; libFuzzer</td>
+              <td>5 libFuzzer targets</td>
             </tr>
             <tr>
               <td>Runtime</td>
@@ -880,39 +880,64 @@ flowchart LR
         <table class="blitzy-table">
           <thead>
             <tr>
-              <th>Risk</th>
-              <th>Severity</th>
-              <th>Mitigation</th>
+              <th scope="col">Risk</th>
+              <th scope="col">Severity</th>
+              <th scope="col">Mitigation</th>
             </tr>
           </thead>
           <tbody>
             <tr>
-              <td>Peak compression &asymp; 77&ndash;90% of C on some workloads (decompression meets or exceeds C)</td>
+              <td>Peak compression trails C</td>
               <td><span class="sev sev-med">Medium</span></td>
-              <td>Profile &amp; tune deflate match-finder hot paths</td>
+              <td>Tune deflate match-finder</td>
             </tr>
             <tr>
-              <td>Performance measured on a single host with synthetic inputs</td>
+              <td>Single-host synthetic benchmarks</td>
               <td><span class="sev sev-low">Low</span></td>
-              <td>Broaden benchmark matrix &amp; hardware coverage</td>
+              <td>Broaden benchmark matrix</td>
             </tr>
             <tr>
-              <td><code>gzprintf</code>/<code>gzvprintf</code> ship the no-<code>vsnprintf</code> variant (return <code>Z_STREAM_ERROR</code>)</td>
+              <td><code>gzprintf</code>/<code>gzvprintf</code>: no-<code>vsnprintf</code> variant</td>
               <td><span class="sev sev-low">Low</span></td>
-              <td>Optional nightly <code>c_variadic</code> path behind a feature</td>
+              <td>Optional nightly <code>c_variadic</code> path</td>
             </tr>
             <tr>
-              <td>Extend continuous fuzz soak time in scheduled CI</td>
+              <td>Extend fuzz soak time in CI</td>
               <td><span class="sev sev-low">Low</span></td>
-              <td>Raise <code>cargo-fuzz</code> time budget on nightly runs</td>
+              <td>Raise <code>cargo-fuzz</code> budget</td>
             </tr>
           </tbody>
         </table>
-        <p class="caption">Measured vs C zlib 1.3.2.1: compression &asymp; 77&ndash;90%, decompression &asymp; 78&ndash;115%, CRC-32 &asymp; 1.6&times; via SIMD &mdash; byte-identical in every case.</p>
       </section>
 
       <!-- ============================================================
-           Slide 14 — SECTION DIVIDER
+           Slide 14 — MEASURED PERFORMANCE (KPI cards)
+           ============================================================ -->
+      <section>
+        <span class="eyebrow">Performance</span>
+        <h2>Measured vs C zlib 1.3.2.1</h2>
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <div class="kpi-icon"><i data-lucide="gauge" aria-hidden="true"></i></div>
+            <div class="kpi-value">77&ndash;90%</div>
+            <div class="kpi-label">compression throughput vs C</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-icon"><i data-lucide="rabbit" aria-hidden="true"></i></div>
+            <div class="kpi-value">78&ndash;115%</div>
+            <div class="kpi-label">decompression throughput vs C</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-icon"><i data-lucide="zap" aria-hidden="true"></i></div>
+            <div class="kpi-value">1.6&times;</div>
+            <div class="kpi-label">CRC-32 throughput (SIMD)</div>
+          </div>
+        </div>
+        <p class="caption">Byte-identical DEFLATE output in every case.</p>
+      </section>
+
+      <!-- ============================================================
+           Slide 15 — SECTION DIVIDER
            ============================================================ -->
       <section class="slide-divider">
         <span class="eyebrow">What's Next</span>
@@ -921,7 +946,7 @@ flowchart LR
       </section>
 
       <!-- ============================================================
-           Slide 15 — ONBOARDING &amp; NEXT STEPS (bullets + Mermaid)
+           Slide 16 — ONBOARDING &amp; NEXT STEPS (bullets + Mermaid)
            ============================================================ -->
       <section>
         <span class="eyebrow">Getting Started</span>
@@ -946,7 +971,7 @@ flowchart LR
       </section>
 
       <!-- ============================================================
-           Slide 16 — CLOSING
+           Slide 17 — CLOSING
            ============================================================ -->
       <section class="slide-closing">
         <span class="eyebrow">In Summary</span>

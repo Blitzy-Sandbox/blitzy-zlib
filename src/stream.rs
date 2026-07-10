@@ -138,6 +138,15 @@ pub struct AllocHook {
     zfree: Option<ZfreeFn>,
     /// The caller's private cookie (`z_stream.opaque`), passed to both hooks.
     opaque: *mut c_void,
+    /// The foreign-buffer constructor table **supplied by the `ffi` layer**, or
+    /// `None` under the global allocator. This is the dependency-inversion seam
+    /// (AAP §0.6.1): the safe core defines the [`ForeignAllocVTable`] *type* and
+    /// invokes it through this field, but the raw-pointer constructors it points
+    /// at live entirely in the sanctioned `crate::ffi::alloc` zone. The core
+    /// therefore never names `crate::ffi` in any code path — the FFI boundary
+    /// installs the table via [`AllocHook::with_vtable`], keeping the
+    /// safe-core → unsafe-boundary dependency strictly one-way.
+    vtable: Option<&'static ForeignAllocVTable>,
 }
 
 impl AllocHook {
@@ -150,6 +159,7 @@ impl AllocHook {
             zalloc: None,
             zfree: None,
             opaque: core::ptr::null_mut(),
+            vtable: None,
         }
     }
 
@@ -165,7 +175,29 @@ impl AllocHook {
             zalloc,
             zfree,
             opaque,
+            // The `ffi` boundary attaches the constructor table via
+            // [`with_vtable`](Self::with_vtable) after building the triple, so a
+            // bare `new` (used only where no foreign allocation follows) carries
+            // none. The safe core never fabricates a table itself.
+            vtable: None,
         }
+    }
+
+    /// Installs the `ffi`-supplied foreign-buffer constructor table, returning
+    /// the updated hook.
+    ///
+    /// This is the **dependency-inversion install point** (AAP §0.6.1): the C
+    /// drop-in boundary (`crate::ffi`) owns the sole [`ForeignAllocVTable`]
+    /// instance — whose constructors are the raw-pointer `unsafe` in
+    /// `crate::ffi::alloc` — and hands it to an active hook here. The safe core
+    /// then reaches foreign allocation purely through this stored table (see
+    /// [`try_alloc_zeroed`](Self::try_alloc_zeroed)), so no core code path ever
+    /// names `crate::ffi`.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn with_vtable(mut self, vtable: &'static ForeignAllocVTable) -> Self {
+        self.vtable = Some(vtable);
+        self
     }
 
     /// Whether this hook can back a foreign allocation (both halves present).
@@ -198,19 +230,119 @@ impl AllocHook {
         self.opaque
     }
 
+    /// The `ffi`-installed foreign-buffer constructor table, if any.
+    ///
+    /// Present only on a hook the C drop-in boundary built via
+    /// [`with_vtable`](Self::with_vtable); [`None`] under the global allocator.
+    /// Read by [`try_alloc_zeroed`](Self::try_alloc_zeroed) to reach the
+    /// sanctioned `crate::ffi::alloc` constructors without the core ever naming
+    /// `crate::ffi`.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn vtable(&self) -> Option<&'static ForeignAllocVTable> {
+        self.vtable
+    }
+
     /// Allocates a zero-initialized foreign buffer of `count` elements through
-    /// this (active) hook, delegating to the sanctioned [`crate::ffi::alloc`]
-    /// zone where the raw-pointer `unsafe` is confined (M6).
+    /// this (active) hook.
+    ///
+    /// The raw-pointer `unsafe` is confined to the sanctioned `crate::ffi::alloc`
+    /// zone (M6); this method reaches it **through the `ffi`-supplied
+    /// [`ForeignAllocVTable`]** stored on the hook rather than by calling into
+    /// `crate::ffi` directly, so the safe-core → unsafe-boundary dependency stays
+    /// strictly one-way (AAP §0.6.1). The element type selects its constructor
+    /// from the table by pure static dispatch ([`ForeignElem::ctor`]).
     ///
     /// Returns [`None`] when the caller's `zalloc` reports out-of-memory (or the
-    /// size is unrepresentable); there is **no** global-allocator fallback, so
-    /// the init paths can surface `Z_MEM_ERROR` (M7).
+    /// size is unrepresentable — or, defensively, when no table was installed);
+    /// there is **no** global-allocator fallback, so the init paths can surface
+    /// `Z_MEM_ERROR` (M7).
     #[inline]
-    pub(crate) fn try_alloc_zeroed<T: Copy + Default + 'static>(
+    pub(crate) fn try_alloc_zeroed<T: ForeignElem>(
         &self,
         count: usize,
     ) -> Option<Box<dyn ForeignBuffer<T>>> {
-        crate::ffi::alloc::try_alloc_foreign::<T>(*self, count)
+        // Dependency inversion: invoke the constructor the `ffi` boundary
+        // installed for `T` (see `with_vtable`). No `crate::ffi` path is named
+        // here, so the safe core carries no inward dependency on the FFI tree.
+        let vtable = self.vtable()?;
+        (T::ctor(vtable))(*self, count)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Foreign-allocation vtable — the core-defined seam the `ffi` layer fills
+// ---------------------------------------------------------------------------
+
+/// A constructor that builds a zero-initialized [`ForeignBuffer`] of `T` from an
+/// (active) [`AllocHook`], or [`None`] on out-of-memory / an unrepresentable
+/// size.
+///
+/// This is a plain function-pointer type (no `unsafe` in its *signature*: the
+/// raw-pointer work is inside the pointee, which lives in `crate::ffi::alloc`).
+/// The FFI boundary supplies the concrete constructors; the safe core only ever
+/// *calls* one it was handed, never names the FFI module.
+pub type ForeignCtor<T> = fn(AllocHook, usize) -> Option<Box<dyn ForeignBuffer<T>>>;
+
+/// The table of foreign-buffer constructors the `ffi` layer installs on an
+/// active [`AllocHook`] (via [`AllocHook::with_vtable`]).
+///
+/// # Dependency inversion (AAP §0.6.1)
+///
+/// The safe core defines this *type* but never constructs an instance and never
+/// names `crate::ffi`. The sole instance lives in the sanctioned
+/// `crate::ffi::alloc` zone (`FOREIGN_VTABLE`), where each field points at the
+/// raw-pointer `zalloc`/zero-fill/`zfree`-on-drop constructor for one element
+/// type. The core reaches foreign allocation *only* by invoking a field of a
+/// table it was handed, so the safe-core → unsafe-boundary dependency stays
+/// strictly one-way (the FFI tree depends on the core, never the reverse).
+///
+/// One field per element type the compression/decompression engines allocate:
+/// the sliding window / `pending_buf` / `sym_buf` (`u8`), the `head`/`prev` hash
+/// chains (`u16`), and `u32` working buffers. A [`ForeignElem`] implementation
+/// maps each element type to its field by pure static dispatch — no `unsafe`,
+/// no `TypeId`, no run-time type test.
+pub struct ForeignAllocVTable {
+    /// Constructor for `u8` foreign buffers.
+    pub alloc_u8: ForeignCtor<u8>,
+    /// Constructor for `u16` foreign buffers.
+    pub alloc_u16: ForeignCtor<u16>,
+    /// Constructor for `u32` foreign buffers.
+    pub alloc_u32: ForeignCtor<u32>,
+}
+
+/// Element types the engines can route through a caller-supplied C allocator.
+///
+/// Implemented for exactly the integer element types the compression and
+/// decompression engines request from the [`Allocator`] (`u8`, `u16`, `u32`).
+/// Each implementation selects its constructor from a [`ForeignAllocVTable`] by
+/// pure static dispatch, which is how [`AllocBuffer::try_zeroed`] can build a
+/// foreign buffer for `T` without the safe core naming `crate::ffi` and without
+/// any `unsafe` type-erasure. The supertrait bounds (`Copy + Default + 'static`)
+/// are exactly what [`AllocBuffer`] and the zero-fill require.
+pub trait ForeignElem: Copy + Default + 'static {
+    /// Returns the constructor for `Self` from the `ffi`-supplied table.
+    fn ctor(vtable: &'static ForeignAllocVTable) -> ForeignCtor<Self>;
+}
+
+impl ForeignElem for u8 {
+    #[inline]
+    fn ctor(vtable: &'static ForeignAllocVTable) -> ForeignCtor<u8> {
+        vtable.alloc_u8
+    }
+}
+
+impl ForeignElem for u16 {
+    #[inline]
+    fn ctor(vtable: &'static ForeignAllocVTable) -> ForeignCtor<u16> {
+        vtable.alloc_u16
+    }
+}
+
+impl ForeignElem for u32 {
+    #[inline]
+    fn ctor(vtable: &'static ForeignAllocVTable) -> ForeignCtor<u32> {
+        vtable.alloc_u32
     }
 }
 
@@ -305,7 +437,7 @@ impl<T: Copy + Default> AllocBuffer<T> {
     #[must_use]
     pub fn try_zeroed(count: usize, hook: AllocHook) -> Option<Self>
     where
-        T: 'static,
+        T: ForeignElem,
     {
         // Fast path / default: no custom allocator, or an empty request.
         // `vec![T::default(); count]` matches C `zcalloc`'s zero fill and is the
@@ -313,8 +445,10 @@ impl<T: Copy + Default> AllocBuffer<T> {
         if !hook.is_active() || count == 0 {
             return Some(AllocBuffer::Owned(alloc::vec![T::default(); count]));
         }
-        // Active hook: delegate to the sanctioned `ffi` allocator zone. `None`
-        // (OOM / unrepresentable size) propagates — no global fallback (M7).
+        // Active hook: build a foreign buffer through the `ffi`-installed
+        // constructor table on the hook (dependency inversion — no `crate::ffi`
+        // path is named by the safe core). `None` (OOM / unrepresentable size)
+        // propagates — no global fallback (M7).
         hook.try_alloc_zeroed::<T>(count).map(AllocBuffer::Foreign)
     }
 
@@ -508,9 +642,13 @@ impl Allocator for DefaultAllocator {
     {
         // The default allocator has no hook, so this is always an owned,
         // global-allocator `Vec` (byte-for-byte the historical behavior) and
-        // therefore always `Some`. Routing through `try_zeroed` with the "none"
-        // hook keeps the single source of truth for buffer construction.
-        AllocBuffer::try_zeroed(count, AllocHook::none())
+        // therefore always `Some`. It is built directly as an `Owned` buffer —
+        // rather than through `AllocBuffer::try_zeroed` — so this global default
+        // path stays open to every `Copy + Default + 'static` element type,
+        // independent of the caller-allocator `ForeignElem` set. `try_zeroed`'s
+        // active (foreign) branch is only reachable for the `ForeignElem` types
+        // the engines actually route through a C `zalloc`.
+        Some(AllocBuffer::Owned(alloc::vec![T::default(); count]))
     }
 
     // `hook` uses the trait default (`AllocHook::none`): the global allocator.

@@ -30,7 +30,7 @@ use alloc::boxed::Box;
 use core::ffi::{c_uint, c_void};
 use core::ptr::{self, NonNull};
 
-use crate::stream::{AllocHook, ForeignBuffer};
+use crate::stream::{AllocHook, ForeignAllocVTable, ForeignBuffer};
 
 /// A working buffer backed by a caller-supplied C `zalloc`/`zfree` pair.
 ///
@@ -96,11 +96,14 @@ impl<T: Copy + Default> Drop for CForeignBuffer<T> {
 /// `zalloc` reporting out-of-memory).
 ///
 /// This is the sanctioned home of the raw allocator-hook invocation and the
-/// post-allocation zero fill (reproducing C `zcalloc`'s `zmemzero`).
-/// [`crate::stream::AllocBuffer::try_zeroed`] delegates here via
-/// [`AllocHook::try_alloc_zeroed`] so the safe core contains no `unsafe` (M6).
-/// Returning [`None`] on `zalloc` OOM — rather than silently using the global
-/// allocator — is what lets the init paths surface `Z_MEM_ERROR` (M7).
+/// post-allocation zero fill (reproducing C `zcalloc`'s `zmemzero`). The safe
+/// core reaches it *indirectly*: [`crate::stream::AllocBuffer::try_zeroed`] →
+/// [`AllocHook::try_alloc_zeroed`] invokes the constructor for the element type
+/// out of the [`FOREIGN_VTABLE`] this module installs on the hook, so the core
+/// contains no `unsafe` and names no `crate::ffi` path (M6; AAP §0.6.1 —
+/// dependency inversion). Returning [`None`] on `zalloc` OOM — rather than
+/// silently using the global allocator — is what lets the init paths surface
+/// `Z_MEM_ERROR` (M7).
 ///
 /// # Preconditions
 ///
@@ -151,3 +154,25 @@ pub(crate) fn try_alloc_foreign<T: Copy + Default + 'static>(
         hook,
     }))
 }
+
+/// The foreign-buffer constructor table the FFI boundary installs on an active
+/// [`AllocHook`] (via [`AllocHook::with_vtable`]).
+///
+/// This is the sole instance of [`ForeignAllocVTable`]. It lives here — the
+/// crate's SOLE `unsafe` tree — because each field points at
+/// [`try_alloc_foreign`], whose raw-pointer allocation is the confined `unsafe`.
+/// The safe core (`crate::stream`) defines the *type* and merely *invokes* the
+/// field selected for an element type by [`ForeignElem::ctor`](crate::stream::ForeignElem::ctor);
+/// it never names this module. That is the concrete realization of the AAP
+/// §0.6.1 dependency-inversion rule: the FFI tree depends on the safe core, and
+/// the safe core reaches foreign allocation only through this table it is
+/// handed — never the reverse.
+///
+/// One field per element type the compression/decompression engines allocate
+/// (`u8` windows/buffers, `u16` hash chains, `u32` working buffers), each a
+/// monomorphization of [`try_alloc_foreign`].
+pub(crate) static FOREIGN_VTABLE: ForeignAllocVTable = ForeignAllocVTable {
+    alloc_u8: try_alloc_foreign::<u8>,
+    alloc_u16: try_alloc_foreign::<u16>,
+    alloc_u32: try_alloc_foreign::<u32>,
+};

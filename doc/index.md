@@ -15,7 +15,7 @@ genuine C zlib `1.3.2.1-motley`.
   compression levels, 5 strategies, and 7 flush modes.
 - **C ABI drop-in** — builds `cdylib` and `staticlib` artifacts
   (`libzlib_rs.so` / `libzlib_rs.a`) exposing the zlib C API via
-  `#[no_mangle] extern "C"` shims, with all `unsafe` isolated to `src/ffi/`.
+  `#[unsafe(no_mangle)] extern "C"` shims, with all `unsafe` isolated to `src/ffi/`.
   The `gzprintf`/`gzvprintf` shims follow the documented no-`vsnprintf` zlib
   variant — they return `Z_STREAM_ERROR`, and `zlibCompileFlags` sets bit 27.
 - **`no_std`** — a core-only build (no gz file I/O) is available via a Cargo
