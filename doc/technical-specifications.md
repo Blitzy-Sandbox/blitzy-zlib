@@ -190,9 +190,11 @@ typed Rust errors back into classic zlib integer return codes.
   `deflate.rs` 17, `inflate.rs` 22, `gz.rs` 34, `util.rs` 25 (`mod.rs` and
   `types.rs` carry no exports — `mod.rs` is a pure re-export facade and
   `types.rs` only defines the `#[repr(C)]` mirrors). These 98 definitions
-  compile to **96 unique exported symbols** per build, because `gzdopen` and
+  compile to **95 unique exported symbols** on a non-Windows build (96
+  including the Windows-only `gzopen_w`), because `gzdopen` and
   `inflateGetHeader` each have two `cfg`-gated variants of which exactly one is
-  selected per configuration.
+  selected per configuration, and `gzopen_w` is `#[cfg(windows)]` so it is not
+  exported on Linux or macOS.
 - **`#[repr(C)]` mirrors.** `types.rs` defines layout-compatible mirrors of the
   C `z_stream` and `gz_header` structs, reproducing the C field order and type
   widths so the emitted object can substitute for `libz` without recompiling

@@ -119,7 +119,7 @@ pie title Completed Work Distribution (240 hours)
 | Deflate Engine | 9 files (src/deflate/) | 6,990 | 60h | 5 compression strategies, state machine, hash tables, Huffman trees — most complex module |
 | Inflate Engine | 6 files (src/inflate/) | 6,570 | 45h | 30+ mode state machine, fast-path decode loop, callback API, Huffman table builder |
 | Gzip File I/O | 6 files (src/gz/) | 5,317 | 32h | stdio-like interface: open/read/write/close/seek with LOOK/COPY/GZIP pipeline |
-| Test Suite | 6 files (tests/) | 4,142 | 28h | 6 integration test files porting C test/example.c, infcover.c + new property tests |
+| Test Suite | 6 files (tests/) | 4,292 | 28h | 6 integration test files porting C test/example.c, infcover.c + new property tests |
 | FFI Boundary | 7 files (src/ffi/) | 7,972 | — | `#[unsafe(no_mangle)] extern "C"` drop-in shims + `#[repr(C)]` mirrors (effort folded into Public API Types and Quality rows) |
 | Public API Types | 5 files (lib.rs, error.rs, constants.rs, stream.rs, gz_header.rs) | 3,508 | 20h | Foundational types, error handling, streaming interface, version constants |
 | Quality & Debugging | — | — | 16h | ~30 Blitzy Agent commits: formatting fixes, clippy compliance, safety comments, bug fixes |
@@ -127,7 +127,7 @@ pie title Completed Work Distribution (240 hours)
 | Architecture/Config | Cargo.toml, build.rs, .gitignore | 1,703 | 8h | Package manifest, CRC table generation, feature flags, profile config |
 | Benchmarks | 3 files (benches/) | 294 | 6h | Criterion-based deflate/inflate/checksum throughput benchmarks |
 | Utilities | 4 files (src/util/) | 1,376 | 6h | compress/uncompress wrappers, version/compile_flags |
-| Documentation | README.md | 383 | 6h | Comprehensive crate docs with usage examples, feature flags, API overview |
+| Documentation | README.md | 451 | 6h | Comprehensive crate docs with usage examples, feature flags, API overview |
 | CI/CD | ci.yml, fuzz.yml | ~135 | 1h | Rust CI pipeline, cargo-fuzz workflow |
 | **Total (src/ only)** | **40 .rs** | **32,607** | **240h** | Hours total spans all components; line total is `src/` only |
 
@@ -404,7 +404,7 @@ fn main() {
 This is a **same-repository, additive** migration: the Rust crate was committed **alongside** the upstream zlib C baseline, which is **retained in the tree as the behavioral/ABI reference oracle**. The C sources were **not** mass-deleted — earlier "net reduction" framing was inaccurate.
 
 - **Migration commits:** authored by the Blitzy Agent (`agent@blitzy.com`), atop the inherited upstream zlib history.
-- **Added (the Rust crate):** `src/` (40 `.rs` modules, ~32,607 lines), `tests/` (6 integration suites, 4,142 lines), `benches/` (3 Criterion suites, 294 lines), `fuzz/` (5 libFuzzer targets + `fuzz/Cargo.toml`), `build.rs` (361 lines), `Cargo.toml`/`Cargo.lock`, the CI workflows (`.github/workflows/ci.yml`, `fuzz.yml`), and the documentation set (`README.md`, `doc/`, `mkdocs.yml`, `catalog-info.yaml`).
+- **Added (the Rust crate):** `src/` (40 `.rs` modules, ~32,607 lines), `tests/` (6 integration suites, 4,292 lines), `benches/` (3 Criterion suites, 294 lines), `fuzz/` (5 libFuzzer targets + `fuzz/Cargo.toml`), `build.rs` (361 lines), `Cargo.toml`/`Cargo.lock`, the CI workflows (`.github/workflows/ci.yml`, `fuzz.yml`), and the documentation set (`README.md`, `doc/`, `mkdocs.yml`, `catalog-info.yaml`).
 - **Retained as reference (unchanged in the working tree):** the root C sources/headers (15 `*.c` + 11 `*.h`), `zlib.h` + `zlib.map` (the API/ABI contract), the legacy C build system (`CMakeLists.txt`, `Makefile.in`, `configure`, `treebuild.xml`, …), the platform directories (`amiga/`, `msdos/`, `os400/`, `qnx/`, `watcom/`, `win32/`), `contrib/`, `examples/`, and `test/`.
 - **Published-crate scope:** `Cargo.toml`'s `exclude` list keeps the retained C files, platform dirs, and legacy build files **out of the packaged `.crate` only** — it has no effect on `cargo build`/`test`/`bench` in the workspace.
 
@@ -438,13 +438,13 @@ Every entry above appears in `Cargo.toml`'s `exclude` array, so `cargo package`/
 | Metric | Value |
 |--------|-------|
 | Total Rust files | 50 (40 src + 6 tests + 3 benches + 1 build.rs) |
-| Total Rust lines | 37,358 |
+| Total Rust lines | 37,554 |
 | Source lines (src/) | 32,607 |
-| Test lines (tests/) | 4,142 |
+| Test lines (tests/) | 4,292 |
 | Benchmark lines (benches/) | 294 |
 | Build script lines (build.rs) | 361 |
 | Unsafe blocks / fns | 432 `unsafe` blocks + 33 `unsafe fn`s, confined to **7 files** — the six raw-pointer `src/ffi/` modules (`deflate`, `inflate`, `gz`, `util`, `types`, `alloc`; `ffi/mod.rs` is a pure safe facade) + the `no_std` `#[global_allocator]`/`#[panic_handler]` in `src/lib.rs`. Safe core (`deflate`/`inflate`/`checksum`/`gz`/`util`) has zero `unsafe`; `src/stream.rs` is `#![deny(unsafe_code)]` |
-| FFI exports | **98** `#[unsafe(no_mangle)] extern "C"` shim definitions (deflate 17, inflate 22, gz 34, util 25) compiling to **96 unique exported symbols** — `gzdopen` and `inflateGetHeader` each provide two `cfg`-gated variants of which exactly one is built per configuration. (A naive `grep -r no_mangle src/ffi` reports 106 because it also matches 8 mentions of the attribute inside doc-comments.) Separately, the `zlib.map` version script lists **54** `global:` symbols: the 47 canonical zlib symbols through the `ZLIB_1.2.12` node, plus `deflateUsed` (`ZLIB_1.3.1.2`) and six `_z*` aliases (`ZLIB_1.3.2`). |
+| FFI exports | **98** `#[unsafe(no_mangle)] extern "C"` shim definitions (deflate 17, inflate 22, gz 34, util 25) compiling to **95 unique exported symbols on a non-Windows build** (96 including the Windows-only `gzopen_w`) — `gzdopen` and `inflateGetHeader` each provide two `cfg`-gated variants of which exactly one is built per configuration, and `gzopen_w` is `#[cfg(windows)]` so it is not exported on Linux/macOS. (A naive `grep -r no_mangle src/ffi` reports 106 because it also matches 8 mentions of the attribute inside doc-comments.) Separately, the `zlib.map` version script lists **54** `global:` symbols: the 47 canonical zlib symbols through the `ZLIB_1.2.12` node, plus `deflateUsed` (`ZLIB_1.3.1.2`) and six `_z*` aliases (`ZLIB_1.3.2`). |
 | SAFETY comments | 283 (0 undocumented unsafe — clippy `undocumented_unsafe_blocks` clean) |
 | Unit tests | 403 |
 | Integration tests | 70 |

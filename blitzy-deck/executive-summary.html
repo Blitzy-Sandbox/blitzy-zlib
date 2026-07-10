@@ -230,6 +230,25 @@
   justify-content: center;
 }
 
+/*
+ * Divider content wrapper. reveal.js forces `display:block` (inline style) on
+ * the active `<section>`, which makes the `.slide-divider` flex-centering above
+ * inert — the bare inline eyebrow + icon then collapse onto one line (eyebrow
+ * drifts left, icon drifts right) and the group is top-weighted. Carrying the
+ * flex-column centering on this inner block wrapper (which reveal.js does not
+ * override) restores a robust, vertically- and horizontally-centered stack,
+ * independent of the section's display mode. Mirrors the block-wrapped icon
+ * pattern that keeps the title (.hero-icon) and closing (.close-icon) slides
+ * correctly centered.
+ */
+.reveal .slides section.slide-divider .divider-inner {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
 .reveal .slides section.slide-divider h2,
 .reveal .slides section.slide-divider h1 {
   color: var(--blitzy-text-inverse);
@@ -601,7 +620,7 @@
           <div class="kpi-card">
             <div class="kpi-icon"><i data-lucide="gauge" aria-hidden="true"></i></div>
             <div class="kpi-value">85.1%</div>
-            <div class="kpi-label">of C compression throughput</div>
+            <div class="kpi-label">Migration complete</div>
           </div>
           <div class="kpi-card">
             <div class="kpi-icon"><i data-lucide="unplug" aria-hidden="true"></i></div>
@@ -656,9 +675,11 @@ graph LR
            Slide 4 — SECTION DIVIDER
            ============================================================ -->
       <section class="slide-divider">
-        <span class="eyebrow">Rationale</span>
-        <i data-lucide="shield" aria-hidden="true"></i>
-        <h2>Why Memory-Safe Matters</h2>
+        <div class="divider-inner">
+          <span class="eyebrow">Rationale</span>
+          <i data-lucide="shield" aria-hidden="true"></i>
+          <h2>Why Memory-Safe Matters</h2>
+        </div>
       </section>
 
       <!-- ============================================================
@@ -691,9 +712,11 @@ graph LR
            Slide 6 — SECTION DIVIDER
            ============================================================ -->
       <section class="slide-divider">
-        <span class="eyebrow">Deliverables</span>
-        <i data-lucide="layers" aria-hidden="true"></i>
-        <h2>What We Built</h2>
+        <div class="divider-inner">
+          <span class="eyebrow">Deliverables</span>
+          <i data-lucide="layers" aria-hidden="true"></i>
+          <h2>What We Built</h2>
+        </div>
       </section>
 
       <!-- ============================================================
@@ -782,9 +805,11 @@ graph LR
            Slide 9 — SECTION DIVIDER
            ============================================================ -->
       <section class="slide-divider">
-        <span class="eyebrow">Guarantees</span>
-        <i data-lucide="git-compare" aria-hidden="true"></i>
-        <h2>Compatibility &amp; Safety</h2>
+        <div class="divider-inner">
+          <span class="eyebrow">Guarantees</span>
+          <i data-lucide="git-compare" aria-hidden="true"></i>
+          <h2>Compatibility &amp; Safety</h2>
+        </div>
       </section>
 
       <!-- ============================================================
@@ -866,9 +891,11 @@ flowchart LR
            Slide 12 — SECTION DIVIDER
            ============================================================ -->
       <section class="slide-divider">
-        <span class="eyebrow">Transparency</span>
-        <i data-lucide="alert-triangle" aria-hidden="true"></i>
-        <h2>Risks &amp; Mitigations</h2>
+        <div class="divider-inner">
+          <span class="eyebrow">Transparency</span>
+          <i data-lucide="alert-triangle" aria-hidden="true"></i>
+          <h2>Risks &amp; Mitigations</h2>
+        </div>
       </section>
 
       <!-- ============================================================
@@ -940,9 +967,11 @@ flowchart LR
            Slide 15 — SECTION DIVIDER
            ============================================================ -->
       <section class="slide-divider">
-        <span class="eyebrow">What's Next</span>
-        <i data-lucide="rocket" aria-hidden="true"></i>
-        <h2>Onboarding &amp; Roadmap</h2>
+        <div class="divider-inner">
+          <span class="eyebrow">What's Next</span>
+          <i data-lucide="rocket" aria-hidden="true"></i>
+          <h2>Onboarding &amp; Roadmap</h2>
+        </div>
       </section>
 
       <!-- ============================================================
