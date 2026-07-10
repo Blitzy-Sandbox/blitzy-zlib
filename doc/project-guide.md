@@ -9,7 +9,7 @@
 The zlib-rs crate implements the complete zlib public API surface as an independent, zero-C-dependency Rust library conforming to RFC 1950 (zlib format), RFC 1951 (DEFLATE), and RFC 1952 (gzip format). This is a **same-repository** migration: the full Rust crate (`src/` — 40 `.rs` modules — plus `tests/`, `benches/`, `fuzz/`, `build.rs`, `Cargo.toml`/`Cargo.lock`, CI, and docs) was **added alongside** the upstream zlib C baseline, which is **retained in-repo as the behavioral/ABI reference oracle** (`Cargo.toml`'s `exclude` list keeps the C files out of the *published* crate only — it never affects `cargo build`/`test`/`bench`). The crate compiles cleanly (debug + release), passes the full default-configuration test suite (493 total: 493 passed, 0 ignored, 0 failed), has zero clippy warnings, and is fully formatted.
 
 **Key Achievements:**
-- 32,607 lines of Rust code across 40 `.rs` files, reimplementing the ~23,107-line C baseline that is retained in-repo as the reference oracle
+- 32,758 lines of Rust code across 40 `.rs` files, reimplementing the ~23,107-line C baseline that is retained in-repo as the reference oracle
 - Complete DEFLATE compression engine with all 5 strategies (stored, fast, slow, huff, rle)
 - Complete DEFLATE decompression engine with 30+ mode state machine
 - Adler-32 and CRC-32 checksum engines with combine operations
@@ -112,15 +112,15 @@ pie title Completed Work Distribution (240 hours)
 
 ### 4.1 Completed Hours Calculation
 
-> Note: The **Hours** column is the original effort-estimate snapshot (sums to 240h and is retained for planning history). The **Lines** column has been refreshed to current measured values, so the two columns reflect different points in the project timeline. The `src/` component rows sum exactly to 40 files / 32,607 lines; Test and Benchmark rows are separate (non-`src/`). See Section 8.4 for the authoritative code-metrics summary.
+> Note: The **Hours** column is the original effort-estimate snapshot (sums to 240h and is retained for planning history). The **Lines** column has been refreshed to current measured values, so the two columns reflect different points in the project timeline. The `src/` component rows sum exactly to 40 files / 32,758 lines; Test and Benchmark rows are separate (non-`src/`). See Section 8.4 for the authoritative code-metrics summary.
 
 | Component | Files | Lines | Hours | Rationale |
 |-----------|-------|-------|-------|-----------|
 | Deflate Engine | 9 files (src/deflate/) | 6,990 | 60h | 5 compression strategies, state machine, hash tables, Huffman trees — most complex module |
-| Inflate Engine | 6 files (src/inflate/) | 6,570 | 45h | 30+ mode state machine, fast-path decode loop, callback API, Huffman table builder |
-| Gzip File I/O | 6 files (src/gz/) | 5,317 | 32h | stdio-like interface: open/read/write/close/seek with LOOK/COPY/GZIP pipeline |
+| Inflate Engine | 6 files (src/inflate/) | 6,573 | 45h | 30+ mode state machine, fast-path decode loop, callback API, Huffman table builder |
+| Gzip File I/O | 6 files (src/gz/) | 5,345 | 32h | stdio-like interface: open/read/write/close/seek with LOOK/COPY/GZIP pipeline |
 | Test Suite | 6 files (tests/) | 4,292 | 28h | 6 integration test files porting C test/example.c, infcover.c + new property tests |
-| FFI Boundary | 7 files (src/ffi/) | 7,972 | — | `#[unsafe(no_mangle)] extern "C"` drop-in shims + `#[repr(C)]` mirrors (effort folded into Public API Types and Quality rows) |
+| FFI Boundary | 7 files (src/ffi/) | 8,092 | — | `#[unsafe(no_mangle)] extern "C"` drop-in shims + `#[repr(C)]` mirrors (effort folded into Public API Types and Quality rows) |
 | Public API Types | 5 files (lib.rs, error.rs, constants.rs, stream.rs, gz_header.rs) | 3,508 | 20h | Foundational types, error handling, streaming interface, version constants |
 | Quality & Debugging | — | — | 16h | ~30 Blitzy Agent commits: formatting fixes, clippy compliance, safety comments, bug fixes |
 | Checksum Engines | 3 files (src/checksum/) | 874 | 12h | Adler-32 with combine, CRC-32 with combine/gen/op, build.rs table generation |
@@ -129,7 +129,7 @@ pie title Completed Work Distribution (240 hours)
 | Utilities | 4 files (src/util/) | 1,376 | 6h | compress/uncompress wrappers, version/compile_flags |
 | Documentation | README.md | 451 | 6h | Comprehensive crate docs with usage examples, feature flags, API overview |
 | CI/CD | ci.yml, fuzz.yml | ~135 | 1h | Rust CI pipeline, cargo-fuzz workflow |
-| **Total (src/ only)** | **40 .rs** | **32,607** | **240h** | Hours total spans all components; line total is `src/` only |
+| **Total (src/ only)** | **40 .rs** | **32,758** | **240h** | Hours total spans all components; line total is `src/` only |
 
 ### 4.2 Remaining Hours Calculation
 
@@ -404,7 +404,7 @@ fn main() {
 This is a **same-repository, additive** migration: the Rust crate was committed **alongside** the upstream zlib C baseline, which is **retained in the tree as the behavioral/ABI reference oracle**. The C sources were **not** mass-deleted — earlier "net reduction" framing was inaccurate.
 
 - **Migration commits:** authored by the Blitzy Agent (`agent@blitzy.com`), atop the inherited upstream zlib history.
-- **Added (the Rust crate):** `src/` (40 `.rs` modules, ~32,607 lines), `tests/` (6 integration suites, 4,292 lines), `benches/` (3 Criterion suites, 294 lines), `fuzz/` (5 libFuzzer targets + `fuzz/Cargo.toml`), `build.rs` (361 lines), `Cargo.toml`/`Cargo.lock`, the CI workflows (`.github/workflows/ci.yml`, `fuzz.yml`), and the documentation set (`README.md`, `doc/`, `mkdocs.yml`, `catalog-info.yaml`).
+- **Added (the Rust crate):** `src/` (40 `.rs` modules, ~32,758 lines), `tests/` (6 integration suites, 4,292 lines), `benches/` (3 Criterion suites, 294 lines), `fuzz/` (5 libFuzzer targets + `fuzz/Cargo.toml`), `build.rs` (361 lines), `Cargo.toml`/`Cargo.lock`, the CI workflows (`.github/workflows/ci.yml`, `fuzz.yml`), and the documentation set (`README.md`, `doc/`, `mkdocs.yml`, `catalog-info.yaml`).
 - **Retained as reference (unchanged in the working tree):** the root C sources/headers (15 `*.c` + 11 `*.h`), `zlib.h` + `zlib.map` (the API/ABI contract), the legacy C build system (`CMakeLists.txt`, `Makefile.in`, `configure`, `treebuild.xml`, …), the platform directories (`amiga/`, `msdos/`, `os400/`, `qnx/`, `watcom/`, `win32/`), `contrib/`, `examples/`, and `test/`.
 - **Published-crate scope:** `Cargo.toml`'s `exclude` list keeps the retained C files, platform dirs, and legacy build files **out of the packaged `.crate` only** — it has no effect on `cargo build`/`test`/`bench` in the workspace.
 
@@ -438,8 +438,8 @@ Every entry above appears in `Cargo.toml`'s `exclude` array, so `cargo package`/
 | Metric | Value |
 |--------|-------|
 | Total Rust files | 50 (40 src + 6 tests + 3 benches + 1 build.rs) |
-| Total Rust lines | 37,554 |
-| Source lines (src/) | 32,607 |
+| Total Rust lines | 37,705 |
+| Source lines (src/) | 32,758 |
 | Test lines (tests/) | 4,292 |
 | Benchmark lines (benches/) | 294 |
 | Build script lines (build.rs) | 361 |
@@ -457,7 +457,7 @@ Every entry above appears in `Cargo.toml`'s `exclude` array, so `cargo package`/
 > - `unsafe` blocks: `grep -rn 'unsafe {' src | wc -l`.
 > - FFI shim definitions: `grep -rnE '^\s*#\[\s*unsafe\(\s*no_mangle\s*\)' src/ffi | wc -l` (counts code attributes only, excluding doc-comment mentions of the attribute).
 >
-> The per-file line counts in §9.1 sum to their module subtotals, which in turn sum to the `src/` grand total of 32,607 lines (deflate 6,990 + inflate 6,570 + checksum 874 + gz 5,317 + util 1,376 + ffi 7,972 + the five root files 3,508).
+> The per-file line counts in §9.1 sum to their module subtotals, which in turn sum to the `src/` grand total of 32,758 lines (deflate 6,990 + inflate 6,573 + checksum 874 + gz 5,345 + util 1,376 + ffi 8,092 + the five root files 3,508).
 
 ---
 
@@ -468,8 +468,8 @@ Every entry above appears in `Cargo.toml`'s `exclude` array, so `cargo package`/
 The Rust crate lives under `src/`. The upstream zlib C files at the repository root (`*.c`/`*.h`, `zlib.h`, `zlib.map`) are **retained alongside it as the behavioral/ABI reference oracle** — they are excluded from the published crate but remain in the working tree for `cargo build`/`test`/`bench` and for byte-for-byte comparison (see §8.1 / §8.3).
 
 ```
-src/                                  (40 files, 32,607 lines)
-├── lib.rs              (520 lines)  — Crate root, public re-exports, version constants
+src/                                  (40 files, 32,758 lines)
+├── lib.rs              (566 lines)  — Crate root, public re-exports, version constants
 ├── error.rs            (448 lines)  — ZlibError enum, ReturnCode enum, Result type alias
 ├── constants.rs        (729 lines)  — Flush modes, compression levels, strategies, limits
 ├── stream.rs          (1,317 lines) — ZStream struct, buffer management
@@ -484,9 +484,9 @@ src/                                  (40 files, 32,607 lines)
 │   ├── stored.rs       (313 lines) — Level 0 pass-through
 │   ├── huff.rs         (196 lines) — Huffman-only (no LZ77)
 │   └── rle.rs          (459 lines) — Run-length encoding
-├── inflate/                          (6 files, 6,570 lines)
-│   ├── mod.rs        (2,401 lines) — Public inflate API, 30+ mode state machine
-│   ├── state.rs        (957 lines) — InflateState, InflateMode enum
+├── inflate/                          (6 files, 6,573 lines)
+│   ├── mod.rs        (2,403 lines) — Public inflate API, 30+ mode state machine
+│   ├── state.rs        (958 lines) — InflateState, InflateMode enum
 │   ├── fast.rs         (804 lines) — Fast-path bulk decode loop
 │   ├── tables.rs       (860 lines) — Huffman table builder
 │   ├── fixed.rs        (334 lines) — Pre-built fixed Huffman tables
@@ -495,10 +495,10 @@ src/                                  (40 files, 32,607 lines)
 │   ├── mod.rs           (13 lines) — Public checksum re-exports
 │   ├── adler32.rs      (458 lines) — Adler-32 with combine
 │   └── crc32.rs        (403 lines) — CRC-32 with combine/gen/op
-├── gz/                               (6 files, 5,317 lines)
-│   ├── mod.rs          (203 lines) — Public gzip I/O re-exports
+├── gz/                               (6 files, 5,345 lines)
+│   ├── mod.rs          (211 lines) — Public gzip I/O re-exports
 │   ├── state.rs        (574 lines) — GzState struct
-│   ├── open.rs       (1,511 lines) — gz_open, gz_seek, gz_tell, etc.
+│   ├── open.rs       (1,531 lines) — gz_open, gz_seek, gz_tell, etc.
 │   ├── read.rs       (1,371 lines) — gz_read, gz_fread, gz_getc, etc.
 │   ├── write.rs      (1,245 lines) — gz_write, gz_fwrite, gz_putc, etc.
 │   └── close.rs        (413 lines) — gz_close dispatcher
@@ -507,12 +507,12 @@ src/                                  (40 files, 32,607 lines)
 │   ├── compress.rs     (414 lines) — compress, compress2, compress_bound
 │   ├── uncompress.rs   (479 lines) — uncompress, uncompress2
 │   └── version.rs      (326 lines) — ZLIB_VERSION, compile_flags, error_message
-└── ffi/                              (7 files, 7,972 lines)
+└── ffi/                              (7 files, 8,092 lines)
     ├── mod.rs          (265 lines) — FFI module root, symbol re-exports
     ├── types.rs      (1,734 lines) — #[repr(C)] z_stream + gz_header mirrors
     ├── deflate.rs    (1,335 lines) — extern "C" deflate* shims
     ├── inflate.rs    (1,992 lines) — extern "C" inflate* / inflateBack* shims
-    ├── gz.rs         (1,388 lines) — extern "C" gz* shims
+    ├── gz.rs         (1,508 lines) — extern "C" gz* shims
     ├── util.rs       (1,080 lines) — extern "C" one-call, checksum, version shims
     └── alloc.rs        (178 lines) — Caller zalloc/zfree allocator-hook bridge
 ```
