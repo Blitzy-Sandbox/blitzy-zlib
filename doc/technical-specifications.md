@@ -80,14 +80,14 @@ the only place raw C pointers are handled is a single dedicated FFI tree.
 - **One-way dependency** — the dependency direction is strictly `ffi → core`;
   the safe core never imports from `ffi`. This keeps `unsafe` from leaking
   inward. Every `unsafe` operation in shipped code carries an adjacent
-  `// SAFETY:` justification (284 in total), and Clippy's
+  `// SAFETY:` justification (283 in total), and Clippy's
   `undocumented_unsafe_blocks` lint is clean.
 
 ```mermaid
 graph TD
     C[C or C++ consumer linking libzlib_rs so or a]
     subgraph FFI[src ffi - the sole unsafe boundary]
-        SHIMS[106 extern C shims - unsafe no_mangle]
+        SHIMS[98 extern C shims - unsafe no_mangle]
         TYPES[repr C mirrors - z_stream gz_header opaque internal_state]
         ALLOC[zalloc zfree caller-allocator bridge]
     end
@@ -183,12 +183,16 @@ the default build. It is a thin adapter: it validates and converts raw C
 pointers into safe Rust references, delegates to the safe core, and converts
 typed Rust errors back into classic zlib integer return codes.
 
-- **Exported shims.** There are **106** exported `extern "C"` functions, each
-  mirroring a `zlib.h` prototype. They are declared with the Rust 2024-edition
-  `#[unsafe(no_mangle)]` attribute (the edition-2024 form of `#[no_mangle]`) and
-  as `pub unsafe extern "C" fn`. The breakdown by file is: `deflate.rs` 18,
-  `inflate.rs` 22, `gz.rs` 34, `util.rs` 25, and a few more in `mod.rs` and
-  `types.rs`.
+- **Exported shims.** There are **98** `#[unsafe(no_mangle)] extern "C"` shim
+  definitions, each mirroring a `zlib.h` prototype. They are declared with the
+  Rust 2024-edition `#[unsafe(no_mangle)]` attribute (the edition-2024 form of
+  `#[no_mangle]`) and as `pub unsafe extern "C" fn`. The breakdown by file is:
+  `deflate.rs` 17, `inflate.rs` 22, `gz.rs` 34, `util.rs` 25 (`mod.rs` and
+  `types.rs` carry no exports — `mod.rs` is a pure re-export facade and
+  `types.rs` only defines the `#[repr(C)]` mirrors). These 98 definitions
+  compile to **96 unique exported symbols** per build, because `gzdopen` and
+  `inflateGetHeader` each have two `cfg`-gated variants of which exactly one is
+  selected per configuration.
 - **`#[repr(C)]` mirrors.** `types.rs` defines layout-compatible mirrors of the
   C `z_stream` and `gz_header` structs, reproducing the C field order and type
   widths so the emitted object can substitute for `libz` without recompiling
@@ -238,7 +242,7 @@ exported (`deflate_copyright`, `inflate_copyright`, `inflate_fast`,
 `inflate_table`, `zcalloc`, `zcfree`, and peers) are hidden behind the script's
 `local:` sections plus a `_*` catch-all.
 
-**Relationship to the FFI shims (do not conflate the two counts):** the 106
+**Relationship to the FFI shims (do not conflate the two counts):** the 98
 `#[unsafe(no_mangle)] extern "C"` shims in `src/ffi/` *implement* the `zlib.h`
 prototypes; `zlib.map` is the version script that *governs which symbols are
 exported* from the `cdylib` / `staticlib` and how they are version-tagged. The
