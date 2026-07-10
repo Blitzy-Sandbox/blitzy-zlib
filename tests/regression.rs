@@ -2,7 +2,7 @@
 //! the reference zlib exerciser shipped with the C library.
 //!
 //! This integration test operationalizes the "official zlib test vectors"
-//! conformance requirement (AAP §0.6.7 / §0.7.2). It reproduces the ten
+//! conformance requirement (AAP §0.6.4 / §0.7.1). It reproduces the ten
 //! `example.c` helper functions as independent `#[test]`s driving the public
 //! [`zlib_rs`] API:
 //!
@@ -20,6 +20,18 @@
 //! * [`test_dict_deflate`] / [`test_dict_inflate`] — preset-dictionary
 //!   handshake, verifying the dictionary Adler-32 id round-trips.
 //!
+//! Beyond the faithful `example.c` port, two regression guards derived from
+//! documented `deflate.c` / `inflate.c` behavior strengthen coverage (AAP
+//! §0.4.1 lists `inflate.c` / `deflate.c` as this file's regression sources):
+//!
+//! * [`test_deflate_bound_is_upper_bound`] — `deflateBound` must be a genuine
+//!   upper limit on the compressed size, even for incompressible input; a
+//!   single `Z_FINISH` pass into a buffer sized to exactly the bound must
+//!   finish without running out of space.
+//! * [`test_window_wrap_round_trip`] — data larger than the 32 KiB sliding
+//!   window must round-trip byte-for-byte, exercising the circular-window wrap
+//!   in both the deflate and inflate engines with small output windows.
+//!
 //! All ops bind to the idiomatic `zlib_rs` API (no FFI, no `unsafe`). The
 //! streaming API is slice-based: each `deflate`/`inflate` call takes an `input`
 //! and `output` slice and reports `consumed`/`produced`, while the running
@@ -29,7 +41,7 @@
 
 use zlib_rs::constants::{Z_FINISH, Z_FULL_FLUSH, Z_NO_FLUSH};
 use zlib_rs::deflate::{
-    deflate, deflate_end, deflate_init, deflate_params, deflate_set_dictionary,
+    deflate, deflate_bound, deflate_end, deflate_init, deflate_params, deflate_set_dictionary,
 };
 use zlib_rs::inflate::{inflate, inflate_end, inflate_init, inflate_set_dictionary, inflate_sync};
 use zlib_rs::{
@@ -503,6 +515,144 @@ fn test_dict_inflate() {
 
     inflate_end(&mut strm).expect("inflateEnd");
     assert_eq!(&uncompr[..out_off], HELLO, "bad inflate with dict");
+}
+
+// ===========================================================================
+// Additional regression guards — beyond the `example.c` port, derived from
+// documented `deflate.c` / `inflate.c` behavior (AAP §0.4.1). Both are
+// deterministic, dependency-free, and green in BOTH the default and
+// `--no-default-features` configurations.
+// ===========================================================================
+
+/// Regression guard derived from `deflate.c`'s `deflateBound`: the reported
+/// bound must be a *true* upper limit on the compressed size for any input,
+/// including incompressible data — an underestimated bound historically caused
+/// output-buffer overruns. A worst-case (deterministic pseudo-random) buffer is
+/// deflated in a single `Z_FINISH` pass into an output buffer sized to exactly
+/// [`deflate_bound`]; the stream must finish (`Z_STREAM_END`) without exhausting
+/// that space, and the result must round-trip back to the original bytes.
+///
+/// Uses only the safe streaming API and a deterministic input, so it is stable
+/// in both the default and `--no-default-features` configurations and needs no
+/// C toolchain.
+#[test]
+fn test_deflate_bound_is_upper_bound() {
+    // Deterministic, incompressible input via a xorshift PRNG (reproducible so
+    // the guard never flakes and needs no external entropy source).
+    let mut state: u32 = 0x1234_5678;
+    let mut data = vec![0u8; 8192];
+    for byte in data.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        *byte = (state >> 24) as u8;
+    }
+
+    let mut strm = ZStream::new();
+    deflate_init(&mut strm, Z_BEST_COMPRESSION).expect("deflateInit");
+
+    // Query `deflateBound` on the initialized stream, exactly as a C caller
+    // would before allocating its output buffer.
+    let bound = deflate_bound(&strm, data.len());
+    assert!(
+        bound >= data.len(),
+        "bound must cover at least the input length"
+    );
+
+    // Output buffer sized to EXACTLY the reported bound — no slack whatsoever.
+    let mut compr = vec![0u8; bound];
+    let outcome = deflate(&mut strm, &data, &mut compr, Z_FINISH);
+    assert_eq!(
+        outcome.code,
+        ReturnCode::StreamEnd,
+        "deflate must finish within exactly deflate_bound bytes"
+    );
+    assert_eq!(outcome.consumed, data.len(), "all input must be consumed");
+    assert!(
+        outcome.produced <= bound,
+        "produced ({}) must not exceed the bound ({bound})",
+        outcome.produced
+    );
+    deflate_end(&mut strm).expect("deflateEnd");
+
+    // The worst-case stream must decompress back to the exact input.
+    let mut back = vec![0u8; data.len()];
+    let recovered = uncompress(&mut back, &compr[..outcome.produced]).expect("uncompress");
+    assert_eq!(
+        &back[..recovered],
+        &data[..],
+        "worst-case round-trip mismatch"
+    );
+}
+
+/// Regression guard for the 32 KiB circular sliding window shared by `deflate.c`
+/// and `inflate.c`. Input larger than one window with long-range structure
+/// forces back-references whose distances approach and cross the window
+/// boundary; off-by-one errors in the wrap bookkeeping (a historical class of
+/// zlib bugs) corrupt the output. A 96 KiB (three-window) deterministic buffer
+/// is round-tripped through streaming deflate and streaming inflate — the latter
+/// with deliberately small (4 KiB) output windows to stress the window-copy
+/// paths — and must reproduce the input byte-for-byte.
+///
+/// Deterministic and dependency-free, so it is stable under both the default and
+/// `--no-default-features` configurations.
+#[test]
+fn test_window_wrap_round_trip() {
+    // 96 KiB == three full 32 KiB windows. The pattern is low-entropy yet
+    // non-trivial (a slow drift over a periodic base), so it yields long
+    // back-references that span multiple window widths.
+    const N: usize = 96 * 1024;
+    let mut data = vec![0u8; N];
+    for (i, byte) in data.iter_mut().enumerate() {
+        *byte = ((i / 61) as u8).wrapping_add((i % 251) as u8);
+    }
+
+    // ---- streaming deflate at the default level ----
+    let mut strm = ZStream::new();
+    deflate_init(&mut strm, Z_DEFAULT_COMPRESSION).expect("deflateInit");
+    let mut compr = vec![0u8; compress_bound(N)];
+    let out = deflate(&mut strm, &data, &mut compr, Z_FINISH);
+    assert_eq!(out.code, ReturnCode::StreamEnd, "deflate must finish");
+    assert_eq!(out.consumed, N, "all input must be consumed");
+    let compr_len = out.produced;
+    deflate_end(&mut strm).expect("deflateEnd");
+
+    // ---- streaming inflate with small output windows ----
+    // Small output windows force inflate to flush its output across the 32 KiB
+    // window boundary repeatedly, exercising the wrap-around copy logic.
+    let mut strm = ZStream::new();
+    inflate_init(&mut strm).expect("inflateInit");
+    let mut out_buf = vec![0u8; N];
+    let mut in_off = 0usize;
+    let mut out_off = 0usize;
+    loop {
+        let out_end = (out_off + 4096).min(out_buf.len());
+        let outcome = inflate(
+            &mut strm,
+            &compr[in_off..compr_len],
+            &mut out_buf[out_off..out_end],
+            Z_NO_FLUSH,
+        );
+        in_off += outcome.consumed;
+        out_off += outcome.produced;
+        if outcome.code == ReturnCode::StreamEnd {
+            break;
+        }
+        assert_eq!(outcome.code, ReturnCode::Ok, "inflate across window wrap");
+        // Guarantee forward progress so a stalled stream fails fast instead of
+        // spinning forever.
+        assert!(
+            outcome.consumed != 0 || outcome.produced != 0,
+            "inflate made no progress across the window boundary"
+        );
+    }
+    inflate_end(&mut strm).expect("inflateEnd");
+
+    assert_eq!(
+        out_off, N,
+        "decompressed length must equal the input length"
+    );
+    assert_eq!(out_buf, data, "window-wrap round-trip corrupted the data");
 }
 
 // ===========================================================================
