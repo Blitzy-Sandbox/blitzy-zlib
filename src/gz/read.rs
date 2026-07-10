@@ -36,7 +36,11 @@
 //! arguments (never as fields of the state), the output buffer is temporarily
 //! moved out of the state with [`std::mem::take`] while it is written, which lets
 //! the input buffer, the stream, and the output buffer be borrowed
-//! simultaneously without any raw pointers.
+//! simultaneously without any raw pointers. This zero-`unsafe` invariant is
+//! compile-enforced by the `#![deny(unsafe_code)]` attribute below (mirroring the
+//! sibling `gz` modules `open`, `write`, `close`, and `state`).
+
+#![deny(unsafe_code)]
 
 use crate::constants::Z_NO_FLUSH;
 use crate::error::{ReturnCode, ZlibError};
