@@ -44,6 +44,12 @@
 //! all raw-fd, raw-pointer, and C-string handling for the FFI `gz*` entry points
 //! lives in `src/ffi/gz.rs`, not here.
 
+// Compile-enforce the gz-layer unsafe policy: this module must contain zero
+// `unsafe`. All raw-fd / raw-pointer / C-string handling for the FFI `gz*`
+// entry points lives in `src/ffi/gz.rs`. Mirrors the sibling `open`/`write`/
+// `close` modules, which carry the same attribute.
+#![deny(unsafe_code)]
+
 use std::ffi::CString;
 use std::fs::File;
 

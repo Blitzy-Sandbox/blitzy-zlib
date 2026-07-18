@@ -299,6 +299,52 @@ mod no_std_support {
         // returns and has no preconditions.
         unsafe { abort() }
     }
+
+    // Supply a `rust_eh_personality` symbol for the freestanding (`no_std`)
+    // `cdylib`/`staticlib` build so the emitted `libzlib_rs.{so,a}` is
+    // self-contained and C-linkable on hosted GNU targets — WITHOUT leaking a
+    // non-zlib symbol into the exported C ABI.
+    //
+    // The precompiled sysroot `alloc` crate — which this crate depends on for
+    // `Box`/`Vec`/`String` — emits a `DW.ref.rust_eh_personality` relocation
+    // that references the language runtime's exception-handling *personality*
+    // routine. In the default `std` build the standard library's unwinding
+    // runtime is statically linked into the artifact and defines that symbol,
+    // so the relocation resolves internally. A `--no-default-features`
+    // (`no_std`) build links no `std`, which would otherwise leave
+    // `rust_eh_personality` **undefined** in `libzlib_rs.{so,a}`; a downstream
+    // C consumer would then fail to link with
+    // `undefined reference to 'rust_eh_personality'`.
+    //
+    // Because both build profiles set `panic = "abort"` (see `Cargo.toml`),
+    // stack unwinding never occurs and this personality routine is **never
+    // invoked** — the relocation is spurious. Defining the symbol therefore
+    // makes the freestanding artifact self-contained without altering any
+    // runtime behavior, exactly mirroring why this module already supplies its
+    // own `#[global_allocator]` and `#[panic_handler]` for the same build.
+    //
+    // The symbol is defined with **hidden** ELF visibility (`.hidden`) via
+    // `global_asm!` rather than as a `#[unsafe(no_mangle)] pub extern "C"` fn.
+    // A hidden *global* symbol still satisfies the internal `DW.ref.*`
+    // relocation at static-link time, yet it is NOT placed in the artifact's
+    // dynamic symbol table — so the exported surface stays exactly the zlib C
+    // ABI and keeps byte-for-byte parity with the `zlib.map` version script
+    // (AAP §0.6.1 / §0.7.1). A `#[unsafe(no_mangle)]` Rust fn, by contrast, is
+    // forced into the cdylib export list and would export `rust_eh_personality`
+    // as a public symbol; localizing it afterward with a version script then
+    // conflicts with that export list and emits a linker diagnostic. The
+    // `#[lang = "eh_personality"]` item is nightly-only, so the hidden symbol is
+    // emitted by name in assembly instead. The routine is never called
+    // (`panic = "abort"`); `ret` is a valid no-op return on the hosted GNU
+    // architectures this freestanding artifact targets. Only architecture-
+    // independent GNU-assembler directives are used (no `@`-prefixed operands,
+    // which are comment markers on some targets), so this assembles portably.
+    core::arch::global_asm!(
+        ".globl rust_eh_personality",
+        ".hidden rust_eh_personality",
+        "rust_eh_personality:",
+        "ret",
+    );
 }
 
 // ===========================================================================

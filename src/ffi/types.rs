@@ -388,15 +388,33 @@ impl Allocator for CAllocator {
     where
         T: Copy + Default + 'static,
     {
-        AllocBuffer::try_zeroed(count, self.hook())
+        let hook = self.hook();
+        // Null hooks / empty requests use the global allocator, matching AAP
+        // §0.6.3's "otherwise `std::alloc` is used" clause.
+        if !hook.is_active() || count == 0 {
+            return Some(AllocBuffer::Owned(alloc::vec![T::default(); count]));
+        }
+        // Active hook: build a foreign region through the sanctioned in-`ffi`
+        // allocator. This calls the confined raw-pointer bridge directly (a
+        // legal intra-`ffi` call) rather than routing back through the safe
+        // core's `AllocBuffer::try_zeroed`, so this shim serves every
+        // `Copy + Default + 'static` element type — not only the engine
+        // `ForeignElem` set — while all `unsafe` stays inside `crate::ffi`.
+        // `None` (OOM / unrepresentable size) propagates as `Z_MEM_ERROR` (M7).
+        super::alloc::try_alloc_foreign::<T>(hook, count).map(AllocBuffer::Foreign)
     }
 
     /// Exposes the caller's `zalloc`/`zfree`/`opaque` triple as an
     /// [`AllocHook`], so buffers this allocator produces (directly, or lazily on
     /// a state it initializes) are backed by the caller's allocator.
+    ///
+    /// The hook carries the `ffi`-owned [`FOREIGN_VTABLE`](super::alloc::FOREIGN_VTABLE)
+    /// so the safe core can build foreign buffers through it without ever naming
+    /// `crate::ffi` (AAP §0.6.1 dependency inversion).
     #[inline]
     fn hook(&self) -> AllocHook {
         AllocHook::new(self.zalloc, self.zfree, self.opaque)
+            .with_vtable(&super::alloc::FOREIGN_VTABLE)
     }
 
     // `deallocate` uses the trait default: dropping the `AllocBuffer` routes to
@@ -1419,7 +1437,17 @@ mod tests {
         }
         unsafe extern "C" fn noop_zfree(_opaque: *mut c_void, _address: *mut c_void) {}
 
-        let hook = AllocHook::new(Some(oom_zalloc), Some(noop_zfree), ptr::null_mut());
+        // Build the hook the way the production FFI path does — through
+        // `CAllocator::hook()` — so it carries the `ffi`-installed
+        // `FOREIGN_VTABLE`. This exercises the real dependency-inverted
+        // allocation path end to end: the active `zalloc` returning null is the
+        // ONLY reason the init can fail.
+        let alloc = CAllocator {
+            zalloc: Some(oom_zalloc),
+            zfree: Some(noop_zfree),
+            opaque: ptr::null_mut(),
+        };
+        let hook = alloc.hook();
         assert!(hook.is_active());
 
         // Valid parameters (level 6, deflate method, 15-bit window, mem level 8,

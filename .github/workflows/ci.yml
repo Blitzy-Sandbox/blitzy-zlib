@@ -69,12 +69,12 @@ jobs:
       with:
         components: clippy, rustfmt
     - name: Build (debug)
-      run: cargo build --verbose ${{ matrix.features }}
+      run: cargo build --locked --verbose ${{ matrix.features }}
     - name: Build (release)
-      run: cargo build --release --verbose ${{ matrix.features }}
+      run: cargo build --locked --release --verbose ${{ matrix.features }}
     - name: Test
       if: ${{ matrix.test }}
-      run: cargo test --verbose ${{ matrix.features }}
+      run: cargo test --locked --verbose ${{ matrix.features }}
     - name: Upload build logs
       uses: actions/upload-artifact@v4
       if: failure()
@@ -105,9 +105,9 @@ jobs:
     - name: Install Rust stable toolchain
       uses: dtolnay/rust-toolchain@stable
     - name: Test (no default features)
-      run: cargo test --no-default-features
+      run: cargo test --locked --no-default-features
     - name: Test (no-std feature)
-      run: cargo test --no-default-features --features no-std
+      run: cargo test --locked --no-default-features --features no-std
 
   # Formatting and linting. Clippy runs with warnings promoted to errors.
   lint:
@@ -123,7 +123,7 @@ jobs:
     - name: Format check
       run: cargo fmt --all -- --check
     - name: Clippy
-      run: cargo clippy --all-targets -- -D warnings
+      run: cargo clippy --locked --all-targets -- -D warnings
 
   # Minimum Supported Rust Version gate: pins the toolchain to 1.85.0 (the
   # release that stabilized the 2024 edition) and verifies the crate builds and
@@ -137,9 +137,9 @@ jobs:
     - name: Install Rust 1.85.0 toolchain
       uses: dtolnay/rust-toolchain@1.85.0
     - name: Build with MSRV
-      run: cargo build --verbose
+      run: cargo build --locked --verbose
     - name: Check all targets with MSRV
-      run: cargo check --verbose --all-targets
+      run: cargo check --locked --verbose --all-targets
 
   # Benchmark compile check: ensures the three criterion benches
   # (deflate_bench, inflate_bench, checksum_bench; all harness = false) compile
@@ -153,4 +153,4 @@ jobs:
     - name: Install Rust stable toolchain
       uses: dtolnay/rust-toolchain@stable
     - name: Compile benchmarks (no run)
-      run: cargo bench --no-run
+      run: cargo bench --locked --no-run

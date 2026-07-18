@@ -393,13 +393,19 @@ pub unsafe extern "C" fn gzopen64(path: *const c_char, mode: *const c_char) -> g
 
 /// `gzFile gzdopen(int fd, const char *mode)`  *(Unix)*
 ///
-/// Associates a `gz*` stream with an already-open file descriptor. Ownership of
-/// `fd` is **transferred** to the returned handle (Rust RAII): it is closed by
-/// [`gzclose`], or — should the open fail — closed when the transient [`File`]
-/// is dropped. This is a minor, documented divergence from C (which leaves the
-/// descriptor open on failure) sanctioned by the FFI ownership convention.
+/// Associates a `gz*` stream with an already-open file descriptor. On success,
+/// ownership of `fd` is **transferred** to the returned handle (Rust RAII): the
+/// descriptor is closed by [`gzclose`], mirroring how `fclose(fdopen(fd, mode))`
+/// closes `fd` in C.
 ///
-/// Returns `NULL` for a null `mode` or a negative `fd`.
+/// Returns `NULL` if `mode` is null, if `fd` is negative, or if `mode` is
+/// invalid (no `'r'`/`'w'`/`'a'` provided, or a `'+'` given). Matching zlib's
+/// documented contract — "`gzdopen` does not close fd if it fails" — the mode is
+/// fully validated **before** the descriptor is adopted, so a failed call leaves
+/// `fd` untouched and still owned by the caller. Per the same contract this shim
+/// does not probe whether a non-negative `fd` is actually valid: an invalid
+/// descriptor is not detected here but surfaces as an error on the next `gz*`
+/// read, write, seek, or close operation.
 ///
 /// [`File`]: std::fs::File
 #[cfg(unix)]
@@ -413,9 +419,23 @@ pub unsafe extern "C" fn gzdopen(fd: c_int, mode: *const c_char) -> gzFile {
         let Ok(mode_str) = (unsafe { CStr::from_ptr(mode) }).to_str() else {
             return ptr::null_mut();
         };
-        // SAFETY: the caller transfers ownership of `fd`, a valid open OS file
-        // descriptor (negatives rejected above). The resulting `File` owns the
-        // descriptor and closes it on drop or via `gzclose`.
+        // Validate the mode BEFORE adopting the descriptor. zlib's `gzdopen`
+        // "does not close fd if it fails", so we must not wrap `fd` in an owned
+        // `File` (whose `Drop` would close it) until the open is known to
+        // succeed. On an invalid mode we return NULL here, leaving `fd` entirely
+        // untouched and still owned by the caller.
+        if gz::validate_mode(mode_str).is_err() {
+            return ptr::null_mut();
+        }
+        // SAFETY: the mode is valid, so adopting `fd` now commits to an open that
+        // `gz::gzdopen` cannot fail — with an owned `File` in hand and a valid
+        // mode, the engine performs only best-effort positioning. Per the
+        // `gzdopen` contract the caller transfers ownership of `fd`, and its
+        // validity is the caller's responsibility (zlib does not probe a
+        // non-negative `fd`). The resulting `File` owns the descriptor — closed
+        // on drop or via `gzclose` — and any invalid-descriptor error surfaces
+        // through the safe `std::fs::File` I/O path on the next operation, never
+        // as undefined behavior.
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
         box_state(gz::gzdopen(file, mode_str))
     })
@@ -1315,6 +1335,106 @@ mod tests {
             );
             assert_eq!(&buf[..], &data[..]);
             assert_eq!(gzclose_r(rf), Z_OK);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// F1 regression: `gzdopen` rejects a negative descriptor with `NULL`,
+    /// matching zlib (which returns `NULL` when `fd` is `-1`). No descriptor is
+    /// adopted, so there is nothing to leak or double-close.
+    #[cfg(unix)]
+    #[test]
+    fn gzdopen_negative_fd_returns_null() {
+        unsafe {
+            assert!(gzdopen(-1, c"rb".as_ptr()).is_null());
+            assert!(gzdopen(-42, c"wb".as_ptr()).is_null());
+        }
+    }
+
+    /// F1 regression: an invalid mode containing `'+'` makes `gzdopen` return
+    /// `NULL` **without** adopting (and therefore without closing) the caller's
+    /// descriptor — zlib's documented "`gzdopen` does not close fd if it fails"
+    /// contract. We prove the descriptor survives by reconstructing a `File`
+    /// from it afterwards and writing through it successfully.
+    #[cfg(unix)]
+    #[test]
+    fn gzdopen_invalid_mode_preserves_fd() {
+        use std::io::Write;
+        use std::os::fd::IntoRawFd;
+        let (path, _cpath) = unique_path("dopen_plus");
+        // A writable descriptor whose ownership we hand off as a raw `int`.
+        let fd = std::fs::File::create(&path).unwrap().into_raw_fd();
+        unsafe {
+            // "wb+" is rejected by the zlib mode grammar (no simultaneous r/w).
+            assert!(
+                gzdopen(fd, c"wb+".as_ptr()).is_null(),
+                "an invalid mode must return NULL"
+            );
+            // The fd must still be open and owned by us: reconstruct and use it.
+            let mut file = std::fs::File::from_raw_fd(fd);
+            assert!(
+                file.write_all(b"still open").is_ok(),
+                "gzdopen must not close fd on an invalid mode"
+            );
+            // `file` drops here, closing the still-valid descriptor exactly once.
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// F1 regression: a mode string that omits `'r'`/`'w'`/`'a'` is invalid, so
+    /// `gzdopen` returns `NULL` and again leaves the descriptor untouched and
+    /// owned by the caller.
+    #[cfg(unix)]
+    #[test]
+    fn gzdopen_missing_direction_preserves_fd() {
+        use std::io::Write;
+        use std::os::fd::IntoRawFd;
+        let (path, _cpath) = unique_path("dopen_norwa");
+        let fd = std::fs::File::create(&path).unwrap().into_raw_fd();
+        unsafe {
+            // "b" alone specifies no read/write/append direction -> invalid.
+            assert!(gzdopen(fd, c"b".as_ptr()).is_null());
+            let mut file = std::fs::File::from_raw_fd(fd);
+            assert!(
+                file.write_all(b"survived").is_ok(),
+                "gzdopen must not close fd on a directionless mode"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// F1 regression: for a **valid** mode `gzdopen` adopts a non-negative
+    /// descriptor without probing its validity, returning a live handle — zlib's
+    /// "the file descriptor is not used until the next gz* operation, so gzdopen
+    /// will not detect if fd is invalid" contract. Here the descriptor is real
+    /// but read-only while the mode requests writing; `gzdopen` still succeeds
+    /// and the descriptor error is deferred to the finalizing `gzclose_w`.
+    #[cfg(unix)]
+    #[test]
+    fn gzdopen_defers_descriptor_errors() {
+        use std::os::fd::IntoRawFd;
+        let (path, _cpath) = unique_path("dopen_defer");
+        // Create the file, then reopen it read-only and hand off that fd.
+        std::fs::File::create(&path).unwrap();
+        let ro_fd = std::fs::File::open(&path).unwrap().into_raw_fd();
+        unsafe {
+            // Valid write mode + a real (but read-only) descriptor: gzdopen must
+            // succeed, deferring the descriptor error exactly like zlib.
+            let wf = gzdopen(ro_fd, c"wb".as_ptr());
+            assert!(
+                !wf.is_null(),
+                "gzdopen must not eagerly reject a non-negative fd for a valid mode"
+            );
+            // Buffer a little data; the write to the read-only descriptor is only
+            // attempted when the stream is finalized.
+            let _ = gzwrite(wf, b"x".as_ptr() as voidpc, 1);
+            // Finalizing flushes to the read-only fd, which fails -> non-Z_OK.
+            // `gzclose_w` also reclaims the handle and closes `ro_fd` (RAII).
+            assert_ne!(
+                gzclose_w(wf),
+                Z_OK,
+                "a write to a read-only descriptor must surface at close"
+            );
         }
         let _ = std::fs::remove_file(&path);
     }
