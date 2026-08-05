@@ -38,6 +38,18 @@ contrib/nuget/bin
 contrib/nuget/obj
 *.included
 
+# Rust / Cargo build artifacts
+#
+# Note: Cargo.lock is deliberately NOT ignored.  This tree builds a system
+# library, so the lock file is committed to keep builds reproducible.
+/target/
+**/target/
+fuzz/artifacts/
+fuzz/corpus/
+*.rs.bk
+# Header emitted by the cbindgen verification step (compared against zlib.h)
+/generated_zlib.h
+
 # Bazel directories
 /bazel-*
 /bazel-bin
