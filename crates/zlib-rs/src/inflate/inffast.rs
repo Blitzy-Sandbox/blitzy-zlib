@@ -70,10 +70,47 @@
 //! ## Because they are assumptions, this port does not rely on them
 //!
 //! Every buffer access here is bounds-checked whether or not the contract holds,
-//! and the contract is additionally `debug_assert`ed at entry. A violated
-//! assumption produces a clean early return, never a panic and never an
-//! out-of-bounds access. See [the no-panic section](#no-panics-ever) for the
-//! full argument.
+//! and the four assumptions the reference actually maintains are additionally
+//! `debug_assert`ed at entry. A violated assumption produces a clean early
+//! return, never a panic and never an out-of-bounds access. See
+//! [the no-panic section](#no-panics-ever) for the full argument.
+//!
+//! ## ★ `state->bits < 8` is an assumption the reference does **not** maintain
+//!
+//! The fifth assumption is different in kind from the other four, and it is the
+//! one place where taking `inffast.c` L29 at face value would be a defect rather
+//! than a hardening. It is **reachable for `bits` up to 14**, so it is documented
+//! here and deliberately *not* asserted.
+//!
+//! The reachable path is an out-of-input suspension inside the slow path's
+//! two-level literal/length lookup (`inflate.c` L924-L939). That loop is
+//!
+//! ```text
+//! for (;;) {
+//!     here = state->lencode[last.val + (BITS(last.bits + last.op) >> last.bits)];
+//!     if ((unsigned)(last.bits + here.bits) <= bits) break;
+//!     PULLBYTE();
+//! }
+//! ```
+//!
+//! and `PULLBYTE` performs `goto inf_leave` when the input is exhausted. Nothing
+//! has been dropped from the accumulator at that point, so the driver suspends
+//! with `state->mode == LEN` and `bits` anywhere below `last.bits + here.bits`,
+//! which `inftrees.c` caps at 15 -- that is, `bits <= 14`. The dispatch at
+//! `inflate.c` L915 (`if (have >= 6 && left >= 258)`) carries **no** `bits`
+//! guard, so the very next `inflate()` call that arrives with six input bytes and
+//! 258 output bytes enters this function with those leftover bits still held.
+//!
+//! This was verified against the in-tree reference, not merely reasoned about: a
+//! 94-byte stream fed at nine input bytes and 296 output bytes per call reaches
+//! `inflate_fast` with `bits == 8` and `hold == 0xf7` on its fifth call in both
+//! the C implementation and this port, and both then agree on the outcome
+//! (`Z_DATA_ERROR`, `"invalid distance too far back"`, 43 bytes in, 389 out).
+//!
+//! The assumption exists solely to justify the byte return at `inffast.c`
+//! L290-L293; see [the exit-fixup note](#returning-whole-bytes-to-the-input) for
+//! how this port makes that arithmetic total instead of assuming it cannot
+//! underflow.
 //!
 //! # Six raw pointers become integer cursors
 //!
@@ -215,6 +252,41 @@
 //! commented as such at its site. They exist so that the absence of a panic is a
 //! structural property of the code rather than a conclusion drawn from the
 //! surrounding argument.
+//!
+//! # Returning whole bytes to the input
+//!
+//! `inffast.c` L290-L293 pushes every whole byte still sitting in the accumulator
+//! back onto the input:
+//!
+//! ```text
+//! /* return unused bytes (on entry, bits < 8, so in won't go too far back) */
+//! len = bits >> 3;
+//! in -= len;
+//! bits -= len << 3;
+//! hold &= (1U << bits) - 1;
+//! ```
+//!
+//! The parenthetical is the reference's own justification, and it is the *only*
+//! thing the `state->bits < 8` assumption is used for. Writing `b` for the bits
+//! held on entry, `p` for the whole bytes this call pulled and `c` for the bits it
+//! consumed, the accumulator holds `b + 8p - c` bits at the exit, so
+//! `len <= p` -- the condition for `in` to stay inside the caller's buffer --
+//! holds exactly when `c >= b - 7`. With `b < 8` that is free, since `c >= 0`.
+//!
+//! Because `b` can in fact reach 14 (see
+//! [the assumption note](#-statebits--8-is-an-assumption-the-reference-does-not-maintain)),
+//! `c >= b - 7` is not free: a resume that consumes a single-bit code and then
+//! stops would leave `len == p + 1`, and C would move `next_in` one byte *before*
+//! the buffer its caller supplied -- reading memory it does not own. There is
+//! therefore no defined reference behaviour to reproduce in that case.
+//!
+//! This port makes the arithmetic total by returning `min(bits >> 3, p)` bytes.
+//! Whenever the reference's own assumption holds the clamp is inert, because
+//! `len <= p` already. When it does not, the clamp is not merely safe but exactly
+//! right: `p` bytes go back, `bits` settles at `b - c >= 8`, and the bits left in
+//! `hold` are precisely the ones that were already there before this call. The
+//! decoder's position in the bitstream is unchanged either way, so no byte is
+//! duplicated, dropped, or re-read.
 //!
 //! # The loop always terminates
 //!
@@ -693,10 +765,13 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
         Mode::Len,
         "inffast.c L25 requires state->mode == LEN on entry"
     );
-    debug_assert!(
-        state.bits < 8,
-        "inffast.c L29 requires state->bits < 8 on entry"
-    );
+    // ★ `inffast.c` L29's `state->bits < 8` is deliberately NOT asserted. It is
+    // reachable for `bits` up to 14 -- an out-of-input suspension inside the slow
+    // path's two-level lookup (`inflate.c` L924-L939) leaves `mode == LEN` with
+    // the accumulator untouched, and the dispatch at `inflate.c` L915 has no
+    // `bits` guard -- so asserting it would abort on input the reference accepts.
+    // The exit fixup below is total rather than assumption-dependent instead; see
+    // the module's "Returning whole bytes to the input" section.
 
     let avail_in = input.len().saturating_sub(*next_in);
     let avail_out = output.len().saturating_sub(*next_out);
@@ -730,6 +805,7 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
     //  Copy state to local variables (`inffast.c` L77-L96)
     // -------------------------------------------------------------------------
     let mut in_index = *next_in; // `in`   -- L79
+    let entry_in_index = in_index; // not in C; bounds the byte return at L292
     let last = in_index + (avail_in - IN_SLACK); // `last` -- L80
     let mut out_index = *next_out; // `out`  -- L81
     let beg = out_index.saturating_sub(start.saturating_sub(avail_out)); // `beg` -- L82
@@ -1102,10 +1178,19 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
     // -------------------------------------------------------------------------
     //  Return unused bytes (`inffast.c` L290-L294)
     //
-    //  On entry `bits < 8`, so `in` cannot go back past where it started: every
-    //  whole byte still in the accumulator was pulled by this call.
+    //  L290 justifies `in -= len` with "on entry, bits < 8, so in won't go too far
+    //  back". ★ That entry assumption is reachable at up to 14 bits (see the
+    //  module's assumption note), so the count is clamped to the bytes this call
+    //  actually pulled. The clamp is inert whenever L290's premise holds, and
+    //  where it does not it leaves the bitstream position exactly as it was rather
+    //  than reading before the caller's buffer as C would.
     // -------------------------------------------------------------------------
-    let whole = bits >> 3; // L291: `len = bits >> 3`
+    // `pulled` counts at most `avail_in` bytes, so the `u32::MAX` fallback is
+    // unreachable on every target where `usize` is 32 bits or wider.
+    let pulled = u32::try_from(in_index - entry_in_index).unwrap_or(u32::MAX);
+    // L291: `len = bits >> 3`, clamped. Both saturations below are provably inert:
+    // `whole <= pulled` bounds the first and `whole <= bits >> 3` the second.
+    let whole = (bits >> 3).min(pulled);
     in_index = in_index.saturating_sub(to_index(u64::from(whole))); // L292
     bits = bits.saturating_sub(whole << 3); // L293
     hold &= low_mask(bits); // L294
