@@ -1,0 +1,221 @@
+# crates/zlib-rs-differential/Cargo.toml
+#
+# `zlib-rs-differential` -- the DEV-ONLY differential oracle harness, and
+# workspace member 3 of 3.
+#
+# WHAT THIS CRATE IS FOR
+# ----------------------
+# Its `build.rs` compiles the fifteen in-tree C translation units (the authoritative
+# set is `Makefile.in`'s `OBJZ` + `OBJG` object lists: adler32, crc32, deflate,
+# infback, inffast, inflate, inftrees, trees, zutil, compress, uncompr, gzclose,
+# gzlib, gzread, gzwrite) into a test-only static archive, and `src/oracle.rs`
+# declares those symbols so a single process can run the Rust port and the C
+# reference implementation side by side and compare their output bytes. That is what
+# turns "compressed output is byte-identical to the reference" (AAP 0.7.1(c),
+# 0.6.4.1-0.6.4.2) from an assertion into a measured fact.
+#
+# THE ONE-WAY DEPENDENCY EDGE IS THE WHOLE POINT
+# ----------------------------------------------
+# This crate depends on the two shipped crates; NEITHER shipped crate may ever
+# depend on it. `crates/zlib-rs` has an empty `[dependencies]` table and
+# `crates/libz-rs-sys` depends only on `zlib-rs` (plus an optional pinned `libc`), so
+# `cargo build --release` for `libz.so`/`libz.a` never invokes a C compiler and never
+# links the oracle. That is the mechanical proof of AAP 0.8.1 directive 9 --
+# reference zlib is an ORACLE, not a build dependency -- and of the
+# dependency-minimalism bar in AAP 0.7.1(i). Verify with:
+#
+#     cargo tree -p zlib-rs     -e normal   # must not mention cc, criterion, or this crate
+#     cargo tree -p libz-rs-sys -e normal   # must not mention cc, criterion, or this crate
+#
+# VERIFICATION POSTURE (AAP 0.7.1(d)) -- DO NOT "FIX" THE MIRI EXCLUSION
+# ---------------------------------------------------------------------
+# This crate sits deliberately OUTSIDE the Miri gate: Miri interprets Rust MIR and
+# cannot execute the compiled C oracle, so the Miri job is scoped to the safe core
+# (`cargo +nightly miri test -p zlib-rs`). It sits deliberately INSIDE the nightly
+# AddressSanitizer gate, which is where the raw pointers of the FFI boundary and of
+# the C oracle actually live. Neither posture is expressible as a manifest key; both
+# are CI job scopes, recorded here so the exclusion is read as intentional rather
+# than as an oversight to be "corrected".
+#
+# UNSAFE (AAP 0.7.1(a))
+# ---------------------
+# No key below enables or excuses `unsafe`. All `unsafe` in this crate lives in
+# `src/oracle.rs`'s `extern "C"` declarations and their call sites, each carrying its
+# own `// SAFETY:` comment. Do NOT add `[lints.rust] unsafe_code = "forbid"` here --
+# it would make `src/oracle.rs` uncompilable. `#![forbid(unsafe_code)]` is a
+# crate-root attribute of `crates/zlib-rs` alone, and the facade's counterpart
+# `#![deny(unsafe_op_in_unsafe_fn)]` is a crate-root attribute of
+# `crates/libz-rs-sys`.
+#
+# BENCHMARK HOSTING
+# -----------------
+# The repository-root `Cargo.toml` is a virtual manifest and therefore cannot own
+# bench targets, so the three suites in `benches/` attach HERE through the
+# `[[bench]]` entries near the bottom of this file. This crate is the correct host
+# because all three suites measure against the C oracle that it builds.
+
+[package]
+name = "zlib-rs-differential"
+# Shared metadata is inherited from the root `[workspace.package]` so that it exists
+# in exactly one place. Only the four keys the root contractually supplies are
+# inherited: a `field.workspace = true` reference to a key the root does not declare
+# is a hard manifest error that would break the entire workspace, and `publish =
+# false` makes `repository`/`homepage` optional metadata here. `description` is
+# deliberately crate-local because a dev-only harness needs its own, not the
+# library's.
+version.workspace = true
+edition.workspace = true      # 2021 -- see rust-version
+rust-version.workspace = true # 1.80 (AAP 0.7.1(h)). Edition 2024 requires rustc
+                              # >= 1.85 and cargo rejects that pairing outright.
+license.workspace = true      # Zlib -- the SPDX id for the in-tree LICENSE, and an
+                              # allowed identifier in deny.toml.
+description = "Dev-only differential harness comparing the Rust zlib port against the in-tree C oracle"
+# Never publishable: this crate's build script compiles C, and its entire reason to
+# exist is local verification. `publish = false` also stops anyone from shipping it
+# by accident.
+publish = false
+# `build.rs` is picked up by Cargo's automatic detection, which is the standard and
+# preferred form; no explicit `build = "build.rs"` key is required. The script
+# compiles the C oracle with `-DZ_PREFIX`, so the oracle exports `z_*` names that
+# cannot collide with the Rust facade's unprefixed `#[no_mangle]` exports when both
+# are linked into one test binary.
+
+[features]
+# Nothing extra by default: the differential matrix and the benchmarks must exercise
+# the same configuration the shipped artifacts are built with.
+default = []
+
+# `simd` forwards to the checksum vectorization of both dev-dependencies. It is
+# default-OFF and OUTPUT-NEUTRAL: AAP 0.8.2 ambiguity 9 confines SIMD to CRC-32 and
+# Adler-32 precisely because a checksum yields one scalar regardless of computation
+# order, so vectorizing it cannot perturb the bitstream. Running the byte-identity
+# matrix with `--features simd` is how that neutrality is verified rather than
+# assumed. Two reasons the switch is declared here and not only on the dependencies:
+#   1. `benches/checksum_bench.rs` compares the scalar and SIMD backends (AAP
+#      0.4.1.5). The two-run procedure is:
+#          cargo bench -p zlib-rs-differential -- --save-baseline scalar
+#          cargo bench -p zlib-rs-differential --features simd -- --baseline scalar
+#   2. Since Rust 1.80 the `unexpected_cfgs` lint validates `cfg!(feature = "...")`
+#      against the manifest of the crate being compiled. Test and bench targets are
+#      compiled as part of THIS package, so `cfg!(feature = "simd")` inside them
+#      would warn -- and therefore fail under `cargo clippy --all-targets -- -D
+#      warnings` -- unless the feature is declared here.
+# The reference is `libz_rs_sys/simd`, not `libz-rs-sys/simd`: feature paths name the
+# dependency by its key in this manifest, which is the rename introduced below.
+simd = ["zlib-rs/simd", "libz_rs_sys/simd"]
+
+# Intentionally empty, and audited as such. `src/lib.rs` is a module holder for
+# `src/oracle.rs`, which contains only `extern "C"` declarations and type aliases, so
+# the non-test build of this crate needs no dependency whatsoever. Everything the
+# tests and benchmarks need is a dev-dependency, which is what keeps this crate out
+# of the shipped crates' graphs (AAP 0.6.4.1).
+[dependencies]
+
+# Third-party pins live in the root `[workspace.dependencies]` so that each version
+# is stated in exactly one place (AAP 0.7.1(i)); `{ workspace = true }` inherits
+# them. Should a root entry ever be removed, fall back to the exact AAP 0.5.1.3 pin
+# -- `zlib-rs = { path = "../zlib-rs" }`, `criterion = "0.8.2"`, `cc = "1.4.0"` --
+# and never to a wildcard: `deny.toml` sets `[bans] wildcards = "deny"`.
+[dev-dependencies]
+# The safe core, for tests and benchmarks that drive the typed Rust surface directly:
+# `rust-api` exposes the typed configuration surface used to enumerate the
+# differential matrix (level x windowBits x memLevel x strategy x flush), and `std`
+# is the feature the gz file-I/O paths are gated on. NOTE: the core has NO `gz`
+# feature -- its features are exactly `default`, `rust-api`, `simd`, `std` -- so
+# `zlib-rs/gz` would fail to resolve.
+zlib-rs = { workspace = true, features = ["rust-api", "std"] }
+
+# The C ABI facade: the artifact whose byte-identity actually matters. Its `rlib`
+# crate type exists precisely so this crate can import it, because AAP 0.6.4.1
+# requires both implementations to live in ONE process.
+#
+# IMPORT NAME -- DECIDED HERE, ADOPT IT EVERYWHERE. `crates/libz-rs-sys` sets
+# `[lib] name = "z"` so Cargo emits `libz.so`/`libz.a`; with a plain dependency key
+# Cargo would pass `--extern z=...` and the Rust path would be `z`. The
+# dependency-rename form below makes Cargo pass `--extern libz_rs_sys=...`, so
+# `src/**`, `tests/**` and the attached `benches/**` all write `use libz_rs_sys::...`
+# (verified by compiling a test target against a `[lib] name = "z"` dependency).
+# `libz-rs-sys` is a workspace member and is not listed in the root
+# `[workspace.dependencies]`, hence the path form rather than `workspace = true`.
+#
+# The committed `Cargo.lock` must carry this edge. Measured with `cargo
+# generate-lockfile`: adding it changes the lock by exactly one line -- an extra
+# `"libz-rs-sys"` entry under this package -- because `libz-rs-sys` is already a
+# workspace member that already depends on `zlib-rs`. No external package is added.
+libz_rs_sys = { package = "libz-rs-sys", path = "../libz-rs-sys" }
+
+# Benchmark harness for the three suites attached below (pinned to 0.8.2 in the root
+# `[workspace.dependencies]`; licensed "Apache-2.0 OR MIT", which deny.toml allows).
+#
+# NOTE FOR CI -- measured, not assumed: criterion 0.8.2 declares
+# `rust-version = "1.86"`, above this workspace's 1.80 MSRV, and its transitive graph
+# (clap 4.6) carries manifests that cargo 1.80 cannot even parse. `cargo +1.80
+# metadata` and `cargo +1.80 build -p zlib-rs-differential` both succeed, so the MSRV
+# claim of the shipped crates is untouched -- criterion is a dev-dependency of a
+# dev-only crate -- but an MSRV-floor job must NOT run `cargo test`, `cargo bench`, or
+# `--all-targets` for this package on 1.80.
+#
+# NOTE FOR THE `benches/*.rs` AUTHORS: criterion 0.8.2 DEPRECATES
+# `criterion::black_box`. Use `std::hint::black_box` (stable since 1.66, so
+# MSRV-safe); the deprecated path emits a warning and therefore fails
+# `cargo clippy --all-targets -- -D warnings`.
+criterion = { workspace = true }
+
+[build-dependencies]
+# The ONLY build dependency (AAP 0.4.1.4, 0.5.1.3): `cc` compiles the in-tree C
+# sources into the test-only oracle archive. Pinned to 1.4.0 in the root
+# `[workspace.dependencies]`; licensed "MIT OR Apache-2.0", which deny.toml allows.
+cc = { workspace = true }
+
+# ---------------------------------------------------------------------------------
+# Benchmark suites (AAP 0.3.1, 0.4.1.5)
+#
+# The three suites live at the REPOSITORY ROOT in `benches/`, outside any crate, and
+# are attached here by explicit path. Paths are relative to THIS manifest's
+# directory: `crates/zlib-rs-differential` -> `..` -> `../..` is the repository root.
+# `harness = false` is mandatory -- criterion supplies its own `main` through
+# `criterion_main!`, so libtest's harness must not also be linked.
+# Do NOT create, move, or delete `benches/*.rs`: those files are owned elsewhere and
+# are only attached from here. Cargo's `bench` profile inherits the root
+# `[profile.release]`, so the suites are measured against fat-LTO, single-codegen-unit,
+# opt-level-3 code (`panic = "abort"` is ignored for bench targets, which is
+# expected and harmless).
+# ---------------------------------------------------------------------------------
+
+[[bench]]
+name = "deflate_bench"
+path = "../../benches/deflate_bench.rs"
+harness = false
+
+[[bench]]
+name = "inflate_bench"
+path = "../../benches/inflate_bench.rs"
+harness = false
+
+[[bench]]
+name = "checksum_bench"
+path = "../../benches/checksum_bench.rs"
+harness = false
+
+# Opt into the root `[workspace.lints]` policy: `deny(clippy::all, clippy::pedantic)`
+# plus the panic-prone lint set (AAP 0.7.1(e) and (f)). This key is the ONLY
+# mechanism by which that policy reaches this crate's `build.rs`, `src/**`, `tests/**`
+# and the attached bench targets; omitting it would silently exempt the whole crate
+# from the lint gate. Requires cargo >= 1.74, which the 1.80 MSRV satisfies.
+[lints]
+workspace = true
+
+# DELIBERATELY ABSENT, all four for concrete reasons:
+#   * `[profile.*]` -- profiles are honoured only in the workspace root and Cargo
+#     warns "profiles for the non root package will be ignored" if a member declares
+#     one; a warning is a failure under the zero-warnings bar of AAP 0.7.1(e).
+#     `lto = "fat"`, `codegen-units = 1`, `opt-level = 3` and `panic = "abort"` all
+#     come from the root.
+#   * `[lib]` -- the default rlib target is exactly right. `cdylib`/`staticlib`
+#     belong to `crates/libz-rs-sys` alone, which is the single place the exported C
+#     surface is defined.
+#   * `[[bin]]` / `[[example]]` -- this crate is a library plus tests plus the three
+#     attached benches.
+#   * `[patch]` / `[replace]` / `[target.*]` / git or alternate-registry sources --
+#     AAP 0.8.1 directive 9 forbids submodules and vendoring, and the C oracle is
+#     already in-tree.

@@ -41,6 +41,14 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Third-party wildcard requirements stay banned, but the workspace's own internal
+# edges are path dependencies (`zlib-rs = { path = ... }`, `libz-rs-sys = { path =
+# ... }`), which carry no version requirement and therefore register as `*`.
+# Verified with cargo-deny 0.20.2: without this key `cargo deny check bans` fails
+# with `error[wildcard]` for every member that depends on a sibling.  The exemption
+# is narrow -- cargo-deny applies it only to path dependencies of crates that set
+# `publish = false`, and never to registry dependencies.
+allow-wildcard-paths = true
 # The core algorithm crate must stay dependency-free; anything that would pull a
 # runtime dependency into it is a policy violation caught by review plus the
 # empty [dependencies] table in crates/zlib-rs/Cargo.toml.

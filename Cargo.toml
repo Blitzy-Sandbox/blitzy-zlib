@@ -1,0 +1,423 @@
+# =============================================================================
+#  zlib — Cargo workspace root
+# =============================================================================
+#
+#  This is a VIRTUAL manifest: it declares no [package] of its own, owns no
+#  source file and no build target.  Its entire job is to define the workspace
+#  that the memory-safe Rust reimplementation of zlib is built from, and to hold
+#  the settings every member crate inherits so that they can never drift apart.
+#
+#  Layering:
+#
+#    crates/zlib-rs               The safe core.  Carries #![forbid(unsafe_code)]
+#                                 and #![no_std] + `extern crate alloc`, and has
+#                                 an EMPTY [dependencies] table.  Every piece of
+#                                 algorithmic logic lives here: deflate, trees
+#                                 (Huffman), inflate (with inftrees and inffast
+#                                 folded in), infback, adler32, crc32, the gzip
+#                                 file layer and the one-shot wrappers.
+#
+#    crates/libz-rs-sys           The C ABI facade.  The ONLY crate permitted to
+#                                 use `unsafe`, and the only crate that exports
+#                                 symbols.  `[lib] name = "z"` with
+#                                 crate-type = ["cdylib", "staticlib", "rlib"]
+#                                 produces target/<profile>/libz.so and libz.a,
+#                                 the drop-in replacements for the C build's
+#                                 artifacts.
+#
+#    crates/zlib-rs-differential  Dev-only oracle harness.  Its build script
+#                                 compiles the in-tree C translation units with
+#                                 `cc` into a test-only static archive so that
+#                                 the Rust encoder's output can be diffed
+#                                 byte-for-byte against the reference
+#                                 implementation in a single process.  It is
+#                                 never a dependency of either shipped crate,
+#                                 which is precisely what keeps
+#                                 `cargo build --release` free of any C compiler.
+#
+#  The C sources in this directory are RETAINED and UNMODIFIED; they serve only
+#  as the algorithmic oracle.  `zlib.h`, `zconf.h` and `zlib.map` are the
+#  immutable public contract and are never edited, generated or overwritten by
+#  the Rust build.
+#
+#  Build and verification entry points:
+#
+#    cargo build --release                                   # Rust crates
+#    cargo build --release --features libz-compat            # C-ABI library
+#    cargo test --workspace --release
+#    cargo clippy --workspace --all-targets -- -D warnings
+#    cargo fmt --check
+#    cargo deny check                                        # see deny.toml
+#
+#  Companion configuration, all of which lives beside this file and is expected
+#  to stay consistent with it: rust-toolchain.toml (channel), clippy.toml
+#  (`msrv` — must equal `rust-version` below), .rustfmt.toml (`edition` — must
+#  equal `edition` below), deny.toml (licence allow-list — must contain the
+#  `license` below) and cbindgen.toml (generates the header that CI diffs
+#  against zlib.h).
+#
+# =============================================================================
+
+[workspace]
+
+# A virtual manifest defaults to `resolver = "1"`, and cargo warns about that as
+# soon as any member is on edition 2021:
+#
+#   warning: virtual workspace defaulting to `resolver = "1"` despite one or more
+#            workspace members being on edition 2021 ...
+#
+# That single warning is enough to fail the zero-warnings quality gate, so the
+# key is stated explicitly rather than left to the default.
+resolver = "2"
+
+# Exactly the three crates of the port.  Deliberately NOT listed here:
+#   * `fuzz`     — excluded below; it is a cargo-fuzz crate with its own
+#                  dependencies and its own profile requirements.
+#   * `benches`  — a bare directory of bench sources, not a package.  A virtual
+#                  manifest cannot own bench targets, so the three suites at
+#                  benches/*.rs are hosted by crates/zlib-rs-differential, which
+#                  declares them as [[bench]] entries with
+#                  `path = "../../benches/<name>.rs"` and `harness = false` and
+#                  takes `criterion` as a dev-dependency.  That crate is the
+#                  correct host because all three benchmarks measure the Rust
+#                  implementation against the C oracle it builds.  Do not move
+#                  the benches/ directory and do not add a fourth member for it.
+members = [
+    "crates/zlib-rs",
+    "crates/libz-rs-sys",
+    "crates/zlib-rs-differential",
+]
+
+# `fuzz/` is a cargo-fuzz crate.  Excluding it keeps `libfuzzer-sys` and
+# `arbitrary` out of the shipped lock graph (they are fuzzing tooling, not
+# library dependencies) and stops `cargo build --workspace` from trying to build
+# fuzz targets, which only link against the libFuzzer runtime that
+# `cargo fuzz run` supplies.  Verified: neither crate appears in this
+# workspace's Cargo.lock, and `cargo build --workspace` compiles only the three
+# members above.
+#
+# One thing `exclude` does NOT do, and it matters when writing fuzz/Cargo.toml:
+# it keeps the package out of THIS workspace but does not stop cargo from
+# walking further up the directory tree looking for another one.  fuzz/Cargo.toml
+# must therefore carry its own (empty) `[workspace]` table so that it is a
+# workspace root in its own right; otherwise `cd fuzz && cargo ...` can be
+# adopted by whatever manifest happens to sit above the repository.  With that
+# table in place the fuzz crate resolves independently and keeps its own lock
+# file (verified: libfuzzer-sys 0.4.13 and arbitrary 1.4.2 resolve there and
+# nowhere else).
+exclude = ["fuzz"]
+
+# -----------------------------------------------------------------------------
+#  Shared package metadata
+# -----------------------------------------------------------------------------
+#  Member crates opt in per field with `<field>.workspace = true`.
+# -----------------------------------------------------------------------------
+
+[workspace.package]
+
+# ###########################################################################
+# #  THIS IS THE CARGO PACKAGE VERSION.  IT IS NOT THE zlib VERSION.        #
+# ###########################################################################
+#
+# `ZLIB_VERSION` is "1.3.2.1-motley" and `ZLIB_VERNUM` is 0x1321 (zlib.h L44-45).
+# Cargo cannot express that: a four-component version is not valid semver and
+# cargo rejects it outright —
+#
+#   error: unexpected character '.' after patch version number
+#
+# — so the closest valid semver, 1.3.2, is used here and the true C identity is
+# recorded verbatim in [workspace.metadata.zlib] below.
+#
+# CONSEQUENCE, AND IT IS A HARD RULE:
+#
+#   `zlibVersion()`, the `ZLIB_VERSION` string compared by `deflateInit_` and
+#   `inflateInit_`, and the shared-object file name MUST NEVER be derived from
+#   `CARGO_PKG_VERSION` or from any other Cargo-provided version.  Doing so
+#   would silently return "1.3.2" where the C library returns
+#   "1.3.2.1-motley", and every caller compiled against the real zlib.h would
+#   start getting `Z_VERSION_ERROR` from the init functions — a failure
+#   test/example.c triggers on its very first check.  The soname chain
+#   (libz.so.1.3.2.1-motley <- libz.so.1 <- libz.so) likewise comes from
+#   `configure`, which scrapes `ZLIB_VERSION` out of zlib.h; it does not come
+#   from Cargo either.
+#
+#   The single source of truth for all of that is zlib.h.  Read it there.
+version = "1.3.2"
+
+# From LICENSE: "(C) 1995-2026 Jean-loup Gailly and Mark Adler".
+authors = [
+    "Jean-loup Gailly <jloup@gzip.org>",
+    "Mark Adler <madler@alumni.caltech.edu>",
+]
+
+# Edition 2021 is not a preference, it is the only valid choice at this MSRV:
+# edition 2024 requires rustc >= 1.85 and cargo rejects the combination —
+#   error: rust-version 1.80 is incompatible with the version (1.85.0)
+#          required by the specified edition (2024)
+edition = "2021"
+
+# Keep in lockstep with `msrv` in clippy.toml, or clippy's version-aware lints
+# stop agreeing with the declared floor.
+rust-version = "1.80"
+
+# SPDX identifier for the zlib/libpng licence carried in LICENSE.  The same
+# identifier is used independently by BUILD.bazel
+# (@rules_license//licenses/spdx:Zlib) and by zlib.pc.in ("License: Zlib"), and
+# it must remain in the allow-list in deny.toml.
+license = "Zlib"
+
+description = "Memory-safe Rust reimplementation of the zlib compression library, ABI-compatible with libz"
+homepage = "https://zlib.net/"
+keywords = ["zlib", "deflate", "gzip", "compression", "ffi"]
+categories = ["compression", "no-std", "external-ffi-bindings", "api-bindings"]
+
+# These crates are components of the zlib source distribution; they are not
+# published to crates.io.  Inherited by members with `publish.workspace = true`.
+publish = false
+
+# -----------------------------------------------------------------------------
+#  C identity of the library being reimplemented
+# -----------------------------------------------------------------------------
+#  Cargo ignores [workspace.metadata]; it exists so that the facts Cargo's own
+#  fields cannot express are recorded in one machine-readable place instead of
+#  being re-derived (or, worse, guessed) by each build and CI step.
+#
+#  Every value below is transcribed from the in-tree C sources.  None of it may
+#  be inferred from this manifest's `version` field, and none of it is a
+#  substitute for reading the header: code that needs the version string reads
+#  zlib.h.
+# -----------------------------------------------------------------------------
+
+[workspace.metadata.zlib]
+# zlib.h L44-L49 — the verbatim public version identity.
+c_version = "1.3.2.1-motley"
+c_vernum = "0x1321"
+c_ver_major = 1
+c_ver_minor = 3
+c_ver_revision = 2
+c_ver_subrevision = 1
+c_version_source = "zlib.h"
+
+# CMakeLists.txt L6 records the same release as a four-component CMake version,
+# which is likewise not valid semver.
+cmake_project_version = "1.3.2.1"
+
+# Commit of the C implementation used as the algorithmic oracle.
+c_baseline_commit = "09a1572"
+
+# Artifact names the Rust build must reproduce so that existing consumers keep
+# linking and loading without being recompiled.  `configure` derives the
+# versioned name by scraping ZLIB_VERSION from zlib.h (Makefile.in L32-L34 holds
+# the pre-substitution defaults).  The symlink chain is mandatory: the SONAME is
+# libz.so.1, so a build that ships only libz.so makes the dynamic loader fall
+# back to the system libz.so.1 — drop-in tests then pass while silently
+# exercising the C library.
+shared_library = "libz.so.1.3.2.1-motley"
+soname = "libz.so.1"
+shared_library_symlinks = ["libz.so.1", "libz.so"]
+static_library = "libz.a"
+
+# The immutable contract.  zlib.map is consumed by the linker as
+# --version-script; it is never edited.
+public_headers = ["zlib.h", "zconf.h"]
+version_script = "zlib.map"
+
+# ABI parity baseline, measured from the reference shared library with
+# `nm -D --defined-only --extern-only`: 95 function symbols plus the 16 symbol
+# version nodes declared in zlib.map.
+exported_symbols = 111
+exported_functions = 95
+symbol_version_nodes = 16
+
+# -----------------------------------------------------------------------------
+#  Shared dependency versions
+# -----------------------------------------------------------------------------
+#  Declared here so member crates cannot drift; each member opts in with
+#  `<name> = { workspace = true }`.  Every requirement is an exact, registry-
+#  resolved version — no wildcards, no "latest", and no git or alternate-registry
+#  sources (deny.toml rejects both).
+#
+#  Note that NOTHING here is a runtime dependency of the shipped library:
+#  crates/zlib-rs keeps an empty [dependencies] table, which `cargo tree -p
+#  zlib-rs` demonstrates, and crates/libz-rs-sys depends only on zlib-rs.
+#
+#  Deliberately absent:
+#    * `libfuzzer-sys`, `arbitrary` — they belong to the excluded fuzz/ crate.
+#    * `cbindgen`, `cargo-fuzz`, `cargo-deny` — command-line tools, installed
+#      with `cargo install --locked`, never manifest dependencies.
+# -----------------------------------------------------------------------------
+
+[workspace.dependencies]
+# The safe core, consumed by the facade and by the differential harness.  Cargo
+# resolves it through `path`; the `version` key is carried alongside because
+# deny.toml sets `bans.wildcards = "deny"`, and cargo-deny classifies a path
+# dependency with no version requirement as a wildcard.  Keep it equal to
+# `workspace.package.version` above — cargo checks the two agree, so a drift is
+# caught at resolve time rather than silently.  Any member crate adding another
+# internal path dependency should pair it with a `version` key for the same
+# reason.
+zlib-rs = { path = "crates/zlib-rs", version = "1.3.2" }
+
+# Build-dependency of crates/zlib-rs-differential ONLY.  Compiles the in-tree C
+# translation units into the test-only oracle archive.  It must never appear in
+# the [dependencies] or [build-dependencies] of a shipped crate.
+cc = "1.4.0"
+
+# Dev-dependency of crates/zlib-rs-differential, backing the three criterion
+# suites in benches/.
+criterion = "0.8.2"
+
+# Optional, and for crates/libz-rs-sys only — used solely where a platform type
+# or a raw syscall in the gz layer cannot be expressed with std::fs / std::io.
+# The `0.2` requirement is deliberate: the newest thing published on this crate
+# is the pre-release 1.0.0-alpha.4, and a looser requirement risks resolving to
+# an incompatible line.
+#
+# `optional = true` CANNOT be set here — cargo rejects it with "libc is
+# optional, but workspace dependencies cannot be optional".  The consuming crate
+# writes `libc = { workspace = true, optional = true }` instead.
+libc = "0.2.189"
+
+# -----------------------------------------------------------------------------
+#  Lints
+# -----------------------------------------------------------------------------
+#  Member crates opt in with:
+#
+#      [lints]
+#      workspace = true
+#
+#  Workspace lint tables require cargo 1.74 or newer, which the 1.80 MSRV
+#  guarantees.  Everything is set to `deny` rather than `forbid` on purpose:
+#  `deny` can still be relaxed by a narrowly scoped `#[allow(...)]` — for
+#  example `#![allow(clippy::unwrap_used, clippy::indexing_slicing)]` inside a
+#  `#[cfg(test)]` module, or an `#[allow(clippy::cast_possible_truncation)]`
+#  carrying a comment that explains why a narrowing cast is correct — whereas
+#  `forbid` cannot be overridden anywhere and would make the port unwritable.
+#
+#  TWO LINTS ARE DELIBERATELY ABSENT FROM THIS TABLE.  Do not add them:
+#
+#    * `unsafe_code`.  Unsafe policy is per-crate, and it has to be, because the
+#      two crates need opposite settings: crates/zlib-rs carries
+#      #![forbid(unsafe_code)] in its own source, while crates/libz-rs-sys
+#      legitimately requires `unsafe` at the FFI boundary — validating raw
+#      `z_streamp` pointers, rebuilding the (next_in, avail_in) and
+#      (next_out, avail_out) slices, round-tripping the opaque `state` pointer,
+#      calling the caller-supplied zalloc/zfree, handling C strings and
+#      varargs, and writing through a caller's gz_header.  That crate instead
+#      carries #![deny(unsafe_op_in_unsafe_fn)] so every unsafe operation is
+#      individually scoped and individually justified by a `// SAFETY:` comment.
+#      A workspace-level forbid would break the facade outright.
+#
+#    * `missing_docs`.  It belongs on the idiomatic surface, so
+#      crates/zlib-rs carries #![deny(missing_docs)] in its own source.  Applied
+#      workspace-wide it would also fire across the facade's `#[no_mangle]`
+#      shims, whose documentation is zlib.h.
+# -----------------------------------------------------------------------------
+
+[workspace.lints.rust]
+# Every member of `future_incompatible` is already warn-or-higher by default
+# (checked against `rustc -W help`: the group promotes nothing), so declaring it
+# only makes the policy explicit and inheritable.  The negative priority lets a
+# member relax a single lint out of the group without switching the group off.
+future_incompatible = { level = "warn", priority = -1 }
+
+# The `unused` GROUP is deliberately NOT declared here, and this is not an
+# oversight.  Twenty-one of its twenty-three members (unused_imports,
+# unused_variables, unused_mut, dead_code, unreachable_code, unused_must_use,
+# path_statements, ...) are already warn-by-default and are therefore already
+# errors under `-D warnings`; declaring the group would add nothing except
+# promoting its only two allow-by-default members, `unused_extern_crates` and
+# `unused_macro_rules`.  Promoting `unused_extern_crates` is actively wrong for
+# this workspace: crates/zlib-rs is #![no_std] and reaches the allocator through
+# `extern crate alloc;`, which is the required spelling in edition 2021, and the
+# lint fires on exactly that declaration in any configuration whose feature set
+# happens not to touch an `alloc` item.  It is allow-by-default upstream for
+# that reason and is left alone.  The useful half of that promotion is taken
+# explicitly instead, below.
+unused_macro_rules = "warn"
+
+# Allow-by-default hygiene lints, each promoted on purpose.
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+
+# `unreachable_pub` was considered and rejected: it fires on the facade's
+# `#[no_mangle] pub extern "C" fn` exports, which live in private modules and
+# are reachable only through the dynamic symbol table, not through the crate
+# root.  The version script in zlib.map is what governs visibility there.
+
+[workspace.lints.clippy]
+# The two groups the quality bar names explicitly.  `priority = -1` makes them
+# rank below the individual entries below, which is what lets a specific lint be
+# tightened (or, in a member crate, relaxed) without fighting the group.
+#
+# Note that `clippy::pedantic` already denies the cast family
+# (cast_possible_truncation, cast_sign_loss, cast_precision_loss, ...).  That is
+# intentional and is left as-is: this port reproduces C integer arithmetic, so
+# each narrowing cast is a deliberate decision and deserves a local
+# `#[allow(...)]` with a comment stating why it is in range.  Blanket-allowing
+# the cast family here would erase exactly the review signal that matters most
+# in a C-to-Rust port.
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+# The panic family.  A compression library is linked into processes that must
+# not die on malformed input, and every exported entry point is `extern "C"`
+# (never `extern "C-unwind"`), so a panic that escaped would abort the caller's
+# process rather than unwind.  Library code therefore returns `ReturnCode`
+# instead of panicking, and these lints keep it that way.
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+exit = "deny"
+
+# `clippy::arithmetic_side_effects` is deliberately NOT enabled.  Every hash
+# update, window slide, bit-buffer accumulation and code-length computation in
+# the reference implementation is plain integer arithmetic; denying it would
+# require wrapping essentially the entire port in checked-arithmetic helpers and
+# would obscure rather than clarify the correspondence with the C source that
+# the byte-identical-output requirement depends on.
+
+# -----------------------------------------------------------------------------
+#  Profiles
+# -----------------------------------------------------------------------------
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# `panic = "abort"` is belt-and-braces for the shipped cdylib: unwinding must
+# never cross the FFI boundary into a C caller.
+#
+# Be aware of the nuance — cargo IGNORES `panic` for test and bench targets, so
+# `cargo test --workspace --release` still links an unwinding harness (verified:
+# rustc receives -C opt-level=3 -C lto=fat -C codegen-units=1 for bench targets
+# but no -C panic).  The real guarantee therefore rests on every exported
+# function being declared `extern "C"` and on
+# crates/libz-rs-sys/src/panic_guard.rs, not on this key.  Do not "fix" the
+# nuance by deleting this line, and do not try to add `panic` to [profile.test]
+# or [profile.bench] — cargo will not honour it there.
+panic = "abort"
+
+# Benchmarks must be measured against the same code generation as the shipped
+# library, otherwise the "within 10% of C zlib" throughput gates are measuring
+# the wrong binary.  Cargo's built-in `bench` profile already inherits
+# `release` (verified: the release settings above reach bench targets without
+# this table), so `inherits` is stated explicitly only to pin that relationship
+# in the manifest and to give bench-specific settings an obvious home.  `panic`
+# is deliberately absent, per the note above.
+[profile.bench]
+inherits = "release"
+
+# Note on codegen flags: `-Cllvm-args=-enable-dfa-jump-thread` measurably helps
+# small-chunk throughput and is output-neutral, but it is an LLVM-internal flag,
+# so it stays an opt-in RUSTFLAGS lever for performance runs rather than a
+# committed default that would break a non-LLVM toolchain.

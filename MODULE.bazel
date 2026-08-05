@@ -1,3 +1,15 @@
+# This Bazel module builds only the C reference implementation: the :z library
+# and its :zlib alias in BUILD.bazel.  Those C sources are retained unmodified
+# and act as the differential oracle for the memory-safe Rust reimplementation
+# of this library.
+#
+# The Rust port is a Cargo workspace rooted at Cargo.toml, with members
+# crates/zlib-rs, crates/libz-rs-sys and crates/zlib-rs-differential.  It is
+# built with `cargo build --release`, not with Bazel.  Rust is deliberately out
+# of Bazel scope here, so no Rust ruleset is added to the bazel_dep list below.
+#
+# Both implementations export the same byte-compatible C ABI, so
+# compatibility_level stays 1 and no Bazel consumer of this module is affected.
 module(
     name = "zlib",
     version = "0.0.0",

@@ -1,0 +1,60 @@
+# zlib-rs -- the safe, dependency-free algorithmic core of the zlib C -> Rust
+# port.  Every algorithm (DEFLATE, inflate, Huffman coding, Adler-32, CRC-32,
+# the gzip file layer and the one-shot wrappers) lives here; the raw pointers
+# and the exported C ABI live one layer up, in `libz-rs-sys`.
+#
+# `version`, `edition`, `rust-version` and `license` are inherited from the
+# workspace root so the MSRV contract (edition 2021 + rustc 1.80, mirrored by
+# `msrv` in clippy.toml) is stated in exactly one place.  Only keys the root
+# `[workspace.package]` is contracted to provide are inherited: inheriting a key
+# the root does not declare is a hard, workspace-wide manifest error, whereas
+# omitting optional publish metadata here costs nothing.
+
+[package]
+name = "zlib-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Set literally rather than inherited so the summary names this crate's role
+# precisely; a workspace-wide description covers the whole port.
+description = "Safe-Rust reimplementation of the zlib compression and decompression engine"
+
+[features]
+# Nothing is enabled by default: the default build is the portable, scalar,
+# `no_std` + `alloc` engine, which is exactly what the C ABI facade consumes.
+default = []
+
+# Idiomatic Rust surface -- typed configurations and slice-based helpers layered
+# over the engine.  Independent of the C ABI facade, which drives the engine
+# directly and does not need this.
+rust-api = []
+
+# Vectorised CRC-32 and Adler-32 backends, selected at build time and gated at
+# run time by target-feature detection.  Output-neutral by construction: a
+# checksum is one scalar however it is computed, so this changes throughput
+# only, never the emitted bytes.  Vectorised match finding is deliberately not
+# offered, because it would change the compressed output.
+simd = []
+
+# Opt the core into `std`.  The default build is `no_std` + `alloc`; only the
+# file-I/O portions of the `gz` layer need `std`.  The `gz` feature of
+# `libz-rs-sys` enables this feature transitively, so no separate `gz` feature
+# exists on this crate.
+std = []
+
+# Intentionally empty, and audited: the core algorithm crate carries no
+# third-party dependencies whatsoever -- see the `[bans]` section of deny.toml,
+# which names this table as the enforcement point.  `[dev-dependencies]` and
+# `[build-dependencies]` are absent for the same reason: the suites under
+# `tests/` use only the built-in `#[test]` harness over `core`/`alloc`/`std`,
+# and this crate has no build script.
+[dependencies]
+
+# Lint policy -- `deny(clippy::all, clippy::pedantic)` plus the panic-prone
+# lints -- is owned by the root `[workspace.lints]` and inherited wholesale, so
+# it cannot drift from clippy.toml's thresholds.  The crate-root attributes
+# `#![forbid(unsafe_code)]`, `#![no_std]` and `#![deny(missing_docs)]` are
+# asserted in src/lib.rs, not here.
+[lints]
+workspace = true
