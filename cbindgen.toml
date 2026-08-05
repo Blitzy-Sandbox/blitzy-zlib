@@ -1,0 +1,37 @@
+# cbindgen configuration for the C ABI facade crate (crates/libz-rs-sys).
+#
+# The generated header is NOT installed; it exists so that CI can diff it
+# against the in-tree, immutable zlib.h and fail the build if any exported
+# signature drifts:
+#
+#   cbindgen --config cbindgen.toml --crate libz-rs-sys --output generated_zlib.h
+#   diff -u zlib.h generated_zlib.h
+#
+# Keep this file free of decorative output (banners, autogen warnings) so the
+# diff shows only real signature differences.
+
+language = "C"
+include_guard = "ZLIB_H"
+style = "type"
+cpp_compat = true
+documentation = true
+documentation_style = "c"
+line_length = 80
+tab_width = 4
+no_includes = false
+sys_includes = ["stddef.h", "stdint.h"]
+
+[export]
+prefix = ""
+item_types = ["constants", "globals", "enums", "structs", "unions", "typedefs", "opaque", "functions"]
+
+[parse]
+parse_deps = false
+
+[fn]
+args = "auto"
+
+[enum]
+prefix_with_name = false
+
+[defines]

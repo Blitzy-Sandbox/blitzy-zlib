@@ -1,0 +1,15 @@
+# Rust toolchain pin for the zlib Rust workspace.
+#
+# Rationale:
+#   * The workspace targets stable Rust with edition 2021 and declares an MSRV of
+#     1.80 in the crate manifests, so "stable" tracks the newest compiler that
+#     still honours that contract.  (Edition 2024 would require rustc >= 1.85 and
+#     is therefore incompatible with the declared MSRV.)
+#   * Miri and -Zsanitizer=address are nightly-only.  Those jobs are run
+#     explicitly with `cargo +nightly ...`; a nightly toolchain with the `miri`
+#     and `rust-src` components is installed alongside stable in this
+#     environment and is NOT selected by default.
+[toolchain]
+channel = "stable"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

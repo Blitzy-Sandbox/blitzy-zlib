@@ -1,0 +1,13 @@
+# Formatting policy for the Rust workspace.
+#
+# `cargo fmt --check` is a CI gate, so only options accepted by stable rustfmt
+# are used here; nightly-only options would make the gate unusable on stable.
+edition = "2021"
+max_width = 100
+tab_spaces = 4
+hard_tabs = false
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true
+reorder_imports = true
+reorder_modules = true

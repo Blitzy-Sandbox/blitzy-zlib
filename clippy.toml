@@ -1,0 +1,42 @@
+# Clippy thresholds for the Rust workspace.
+#
+# The workspace is linted with `cargo clippy --all-targets --all-features -- -D
+# warnings` at clippy::all + clippy::pedantic.  The values below keep that gate
+# meaningful for a port of a C codebase whose algorithms are intentionally dense
+# (the DEFLATE match loops and the 31-state inflate machine are single functions
+# in the reference implementation and are ported shape-for-shape so that the
+# emitted bytes stay identical).
+msrv = "1.80"
+
+# This crate ships a stable C ABI; clippy must not suggest signature changes to
+# exported items.
+avoid-breaking-exported-api = true
+
+cognitive-complexity-threshold = 60
+too-many-arguments-threshold = 10
+too-many-lines-threshold = 400
+type-complexity-threshold = 500
+enum-variant-size-threshold = 512
+
+# ".." keeps clippy's built-in list and appends the domain vocabulary used
+# throughout the doc comments.
+doc-valid-idents = [
+    "..",
+    "zlib",
+    "zlib-ng",
+    "gzip",
+    "DEFLATE",
+    "LZ77",
+    "Huffman",
+    "Adler",
+    "CRC",
+    "SIMD",
+    "SSE",
+    "AVX",
+    "NEON",
+    "ASan",
+    "Miri",
+    "cbindgen",
+    "libFuzzer",
+    "Silesia",
+]

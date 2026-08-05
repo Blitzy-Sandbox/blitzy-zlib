@@ -1,0 +1,52 @@
+# cargo-deny policy for the Rust workspace.
+#
+# Run with:  cargo deny check
+#
+# The shipped crates (zlib-rs, libz-rs-sys) carry no third-party dependencies at
+# all; everything cargo-deny sees comes from dev-dependencies and
+# build-dependencies (cc, criterion, libfuzzer-sys, arbitrary).  The policy is
+# therefore deliberately strict: permissive licences only, no copyleft, no
+# unknown registries, no yanked crates.
+
+[graph]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+# zlib itself is distributed under the Zlib licence (see LICENSE); that licence
+# is carried forward into every crate manifest.  The remaining entries are the
+# permissive licences used by the dev/build tooling.  Copyleft licences
+# (GPL/LGPL/AGPL/MPL) are intentionally absent and therefore rejected.
+allow = [
+    "Zlib",
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "NCSA",
+    "Unicode-3.0",
+    "CC0-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The core algorithm crate must stay dependency-free; anything that would pull a
+# runtime dependency into it is a policy violation caught by review plus the
+# empty [dependencies] table in crates/zlib-rs/Cargo.toml.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
