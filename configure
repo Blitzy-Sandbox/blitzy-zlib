@@ -13,6 +13,16 @@
 # If you have problems, try without defining CC and CFLAGS before reporting
 # an error.
 
+# The Rust build is optional and is looked for the same way: cargo is taken
+# from the CARGO environment variable if it is set, and searched for on the
+# PATH otherwise.  To select a particular cargo, or to leave the Rust build
+# out even where one is installed, use for example:
+#    CARGO=/opt/rust/bin/cargo ./configure
+#    CARGO= ./configure
+# When no usable cargo is found, the make targets rust, rust-test and
+# rust-clean print a notice and succeed without doing anything; the C library
+# is built and tested exactly as it was before.
+
 # start off configure.log
 echo -------------------- >> configure.log
 echo $0 $* >> configure.log
@@ -67,6 +77,33 @@ if "${CROSS_PREFIX}nm" --version >/dev/null 2>/dev/null || test $? -lt 126; then
     test -n "${CROSS_PREFIX}" && echo Using ${NM} | tee -a configure.log
 else
     NM=${NM-"nm"}
+fi
+
+# look for cargo, which drives the optional Rust build
+#
+# Unlike ar, ranlib and nm above, cargo is deliberately not prefixed with
+# ${CROSS_PREFIX}: it is a host tool that cross compiles by itself, selecting
+# its target with --target rather than with a differently named executable.
+# Only the presence of cargo is checked here.  Which Rust version is required
+# is stated once, in rust-toolchain.toml and in the rust-version fields of the
+# crate manifests, and enforced by cargo itself.
+#
+# Not finding cargo is not an error.  CARGO is left empty, configure still
+# writes a complete Makefile, and the rust, rust-test and rust-clean targets
+# respond to an empty CARGO by printing a notice and succeeding.  Nothing in
+# the C build reads CARGO, so a machine with no Rust toolchain at all builds
+# and tests the C library, which is the reference the Rust port is compared
+# against, exactly as it did before.  For the same reason CARGO is emptied
+# rather than kept when a value that came in from the environment turns out
+# not to be runnable: an unusable cargo recorded in the Makefile would break
+# those targets instead of skipping them.
+CARGO=${CARGO-"cargo"}
+if "$CARGO" --version >/dev/null 2>/dev/null || test $? -lt 126; then
+    echo "Checking for cargo... Yes." | tee -a configure.log
+    test "$CARGO" = "cargo" || echo Using ${CARGO} | tee -a configure.log
+else
+    CARGO=""
+    echo "Checking for cargo... No (Rust build targets will be unavailable)." | tee -a configure.log
 fi
 
 # set defaults before processing command line options
@@ -984,6 +1021,7 @@ echo >> configure.log
 echo ALL = $ALL >> configure.log
 echo AR = $AR >> configure.log
 echo ARFLAGS = $ARFLAGS >> configure.log
+echo CARGO = $CARGO >> configure.log
 echo CC = $CC >> configure.log
 echo CFLAGS = $CFLAGS >> configure.log
 echo CPP = $CPP >> configure.log
@@ -1032,6 +1070,7 @@ sed < ${SRCDIR}Makefile.in "
 /^ARFLAGS *=/s#=.*#=$ARFLAGS#
 /^RANLIB *=/s#=.*#=$RANLIB#
 /^LDCONFIG *=/s#=.*#=$LDCONFIG#
+/^CARGO *=/s#=.*#=$CARGO#
 /^LDSHAREDLIBC *=/s#=.*#=$LDSHAREDLIBC#
 /^EXE *=/s#=.*#=$EXE#
 /^SRCDIR *=/s#=.*#=$SRCDIR#

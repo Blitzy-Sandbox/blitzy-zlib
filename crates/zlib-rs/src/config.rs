@@ -80,7 +80,7 @@
 //! # Layering and safety posture
 //!
 //! `no_std`, allocation-free, and dependency-free apart from
-//! [`ReturnCode`](crate::error::ReturnCode): it names only `core` and
+//! [`ReturnCode`]: it names only `core` and
 //! `crate::error`. Nothing here is `#[repr(C)]`, `#[no_mangle]` or `extern "C"`
 //! -- turning these types back into the C `int`s a caller passed is the business
 //! of the `libz-rs-sys` facade, which is the only crate in the workspace allowed
