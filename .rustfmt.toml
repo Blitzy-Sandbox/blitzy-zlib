@@ -1,13 +1,20 @@
-# Formatting policy for the Rust workspace.
+# Rust counterpart of .cmake-format.yaml: one explicit, machine-enforced, version-controlled
+# formatting policy instead of convention. Mirrored are that file's philosophy and the four
+# settings it states outright (line_width, tab_size, use_tabchars, line_ending) -- not its
+# verbosity, since rustfmt's remaining defaults are already the community standard.
 #
-# `cargo fmt --check` is a CI gate, so only options accepted by stable rustfmt
-# are used here; nightly-only options would make the gate unusable on stable.
-edition = "2021"
+# Enforced by `cargo fmt --check` in .github/workflows/rust.yml. ONLY STABLE OPTIONS MAY BE
+# ADDED -- rust-toolchain.toml pins channel = "stable", so a nightly-gated key (wrap_comments,
+# imports_granularity, group_imports, unstable_features, ...) makes rustfmt warn "unstable
+# features are only available in nightly channel" on every run and fail the zero-warnings gate;
+# check `rustfmt --help=config` first. `ignore` is absent too, so no .rs file drifts out of the
+# gate: the tables generated from crc32.h, trees.h and inffixed.h are reflowed like any other
+# array literal, and a module needing bespoke layout uses #[rustfmt::skip] in its own source.
+
+edition = "2021"                # must equal [workspace.package].edition in Cargo.toml
 max_width = 100
 tab_spaces = 4
 hard_tabs = false
-newline_style = "Unix"
+newline_style = "Unix"          # the repository is pure LF; "Auto" would follow the input
 use_field_init_shorthand = true
 use_try_shorthand = true
-reorder_imports = true
-reorder_modules = true

@@ -34,6 +34,33 @@
 #  standalone and requires a support library to be linked with it.  This
 #  support library is itself covered by the above license.
 
+# This BUILD file describes only the C reference implementation of zlib: the
+# `:z` library below and its `:zlib` alias, compiled from the 15 C translation
+# units in this directory.  Those sources are retained here unmodified on
+# purpose.  They are the differential oracle for the memory-safe Rust
+# reimplementation of this library -- the Rust encoder's output is compared
+# byte-for-byte against theirs -- so this build has to stay green: if it broke,
+# the port would lose the reference it is checked against.
+#
+# The Rust port is not built by Bazel.  It is a Cargo workspace rooted at
+# Cargo.toml with three members: crates/zlib-rs, the dependency-free safe core
+# holding all of the algorithmic logic; crates/libz-rs-sys, the C ABI facade
+# whose `z` library target produces the drop-in libz.so and libz.a; and
+# crates/zlib-rs-differential, the dev-only harness that compiles the C sources
+# above alongside the Rust ones so the two can be compared in one process.
+# Build it with `cargo build --release`.
+#
+# Rust is deliberately out of Bazel scope for this port.  No Rust ruleset is
+# loaded here and none is requested in MODULE.bazel, which carries only a
+# matching note.  Adding one would mean maintaining a second build description
+# of the same library by hand, in step with Cargo.toml, and no such ruleset is
+# among the dependencies this port takes on.
+#
+# None of this changes anything for a Bazel consumer.  Both implementations
+# export the same C ABI -- identical symbols, signatures and struct layouts,
+# all fixed by the immutable zlib.h and zconf.h -- so `:z` and `:zlib` keep
+# behaving exactly as they always have.  Depend on them as before, and do not
+# add Rust targets to this package.
 load("@rules_cc//cc:defs.bzl", "cc_library")
 load("@rules_license//rules:license.bzl", "license")
 
@@ -89,6 +116,11 @@ config_setting(
     visibility = [":__subpackages__"],
 )
 
+# The C oracle target.  This is the reference implementation the Rust port is
+# verified against, and it is what a Bazel consumer of `:z` or `:zlib` links.
+# The Rust-built equivalents of the artifacts produced here, libz.so and
+# libz.a with the same exported symbols, come from crates/libz-rs-sys via
+# `cargo build --release`.
 cc_library(
     name = "z",
     srcs = [

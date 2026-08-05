@@ -1,42 +1,74 @@
-# Clippy thresholds for the Rust workspace.
+# Clippy configuration -- zlib Rust workspace.
 #
-# The workspace is linted with `cargo clippy --all-targets --all-features -- -D
-# warnings` at clippy::all + clippy::pedantic.  The values below keep that gate
-# meaningful for a port of a C codebase whose algorithms are intentionally dense
-# (the DEFLATE match loops and the 31-state inflate machine are single functions
-# in the reference implementation and are ported shape-for-shape so that the
-# emitted bytes stay identical).
+# CONFIGURATION VALUES ONLY: lint *levels* cannot be set in a clippy.toml.  The
+# deny declarations -- clippy::all, clippy::pedantic and the panic family
+# (unwrap_used, expect_used, indexing_slicing, panic, ...) -- live in
+# Cargo.toml's [workspace.lints.clippy], inherited by every crate through
+# `[lints] workspace = true`.  An allow/deny/warn key here, or a lint name used
+# as a key, aborts the run with "unknown field".
+#
+# Each threshold lets a VERBATIM transcription of the C reference pass
+# `cargo clippy --workspace --all-targets -- -D warnings`; none excuses sloppy
+# code.  Eight encoder decision points determine byte-identical output and
+# reshaping any of them is prohibited, so a ported function may not be
+# restructured to please a lint.  Every number is measured from the C function
+# named beside it, counting code lines only (clippy ignores comments and
+# blanks).  Re-measure before tightening.
+
+# Lockstep with `rust-version` in Cargo.toml; if they diverge, clippy proposes
+# APIs that do not exist on the MSRV floor.
 msrv = "1.80"
 
-# This crate ships a stable C ABI; clippy must not suggest signature changes to
-# exported items.
+# zlib.h is the immutable contract: no exported signature may change to satisfy
+# a lint.  Also clippy's default, stated so the ABI intent survives an edit.
 avoid-breaking-exported-api = true
 
-cognitive-complexity-threshold = 60
-too-many-arguments-threshold = 10
-too-many-lines-threshold = 400
-type-complexity-threshold = 500
-enum-variant-size-threshold = 512
+# Paired one-for-one with the panic family denied in Cargo.toml.  Library paths
+# return ReturnCode and never panic, but the ported example.c / infcover.c
+# suites legitimately assert with unwrap/expect/panic and index fixtures
+# directly; without these keys those denials would make the tests unwritable.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
 
-# ".." keeps clippy's built-in list and appends the domain vocabulary used
-# throughout the doc comments.
-doc-valid-idents = [
-    "..",
-    "zlib",
-    "zlib-ng",
-    "gzip",
-    "DEFLATE",
-    "LZ77",
-    "Huffman",
-    "Adler",
-    "CRC",
-    "SIMD",
-    "SSE",
-    "AVX",
-    "NEON",
-    "ASan",
-    "Miri",
-    "cbindgen",
-    "libFuzzer",
-    "Silesia",
-]
+# deflateInit2_ (deflate.c L387) takes 8 args -- strm, level, method,
+# windowBits, memLevel, strategy, version, stream_size -- the widest of the 119
+# declarations in zlib.h and ABI-frozen.  Clippy's default 7 rejects it.
+# gzwrite.c L500 does declare a 22-argument gzprintf, but only inside
+# `#else /* !STDC && !Z_HAVE_STDARG_H */`; the port builds the default variadic
+# form at L487, so 8 remains the real ceiling -- do not raise this to 22.
+too-many-arguments-threshold = 8
+
+# inflateBack (infback.c L191-L570) is 329 code lines, the longest body after
+# the inflate driver; 400 allows for rustfmt's narrower wrapping.  The lone
+# outlier, the inflate driver (inflate.c L474-L1153, 640 code lines), takes a
+# targeted #[allow(clippy::too_many_lines)] at its own definition -- lifting
+# this past 640 would blind the lint for every other function here.
+too-many-lines-threshold = 400
+
+# deflate_stored (deflate.c L1668) and the deflate driver (deflate.c L981) nest
+# branches eight and nine deep; longest_match (deflate.c L1389) has a
+# four-condition rejection chain whose ordering is load-bearing.  NOTE:
+# cognitive_complexity is a `nursery` lint, so this key is inert under
+# deny(all, pedantic) -- verified; it is set so enabling nursery later does not
+# fail in bulk.
+cognitive-complexity-threshold = 60
+
+# doc_markdown (pedantic) flags a word only when it has >=2 uppercase AND >=1
+# lowercase letter.  Measured here: zlib, libz, gzip, DEFLATE, LZ77, PKZIP,
+# Huffman, Adler, CRC, RFC, SIMD, Miri, cbindgen, libFuzzer and Silesia never
+# fire, so they need no entry.  ".." keeps clippy's built-ins (GitHub, KiB,
+# NaN, MSVC, ...) and appends the tool names that do fire.  Identifiers such as
+# z_stream or DeflateState are absent on purpose: backtick those in the doc.
+doc-valid-idents = ["..", "ASan", "AddressSanitizer", "LibFuzzer", "PKZip"]
+
+# Evaluated and NOT set, so they are not re-added by habit: the ABI's widest
+# type (zalloc's `Option<unsafe extern "C" fn(...) -> *mut c_void>`) already
+# passes the default type-complexity-threshold of 250; the 32 inflate Mode
+# variants share no common affix, so enum_variant_names cannot fire and lifting
+# enum-variant-name-threshold above 32 would blind it for every enum; Mode is
+# fieldless and ReturnCode a newtype, so enum-variant-size-threshold is
+# unneeded.  Anything one function genuinely needs beyond the values above
+# belongs in a targeted #[allow(...)] at that function, not in a global
+# relaxation.

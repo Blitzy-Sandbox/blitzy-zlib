@@ -1,37 +1,680 @@
-# cbindgen configuration for the C ABI facade crate (crates/libz-rs-sys).
+# =============================================================================
+#  cbindgen configuration for the C ABI facade crate, `crates/libz-rs-sys`
+# =============================================================================
 #
-# The generated header is NOT installed; it exists so that CI can diff it
-# against the in-tree, immutable zlib.h and fail the build if any exported
-# signature drifts:
+#  WHAT THIS FILE IS FOR
+#  ---------------------
+#  `zlib.h` and `zconf.h` are the immutable public contract of this library.
+#  Every program that links `libz` was compiled against them, so a single
+#  changed signature, struct layout or constant silently breaks binaries that
+#  are never going to be recompiled.  Protecting that contract is not left to
+#  code review; it is enforced by four independent mechanical gates:
 #
-#   cbindgen --config cbindgen.toml --crate libz-rs-sys --output generated_zlib.h
-#   diff -u zlib.h generated_zlib.h
+#    1. compile-time layout assertions  crates/libz-rs-sys/src/layout_assertions.rs
+#    2. the cbindgen header diff        THIS FILE
+#    3. the `nm` symbol-parity diff     crates/libz-rs-sys/tests/symbol_parity.rs
+#    4. the C89 -> gnu2x compile sweep  .github/workflows/c-std.yml
 #
-# Keep this file free of decorative output (banners, autogen warnings) so the
-# diff shows only real signature differences.
+#  This file drives gate 2.  It tells cbindgen how to render the facade crate's
+#  exported surface as a C header so that header can be compared against the
+#  in-tree `zlib.h`.  The two exact commands, reproduced from the plan:
+#
+#    cbindgen --config cbindgen.toml --crate libz-rs-sys --output generated_zlib.h
+#    diff -u zlib.h generated_zlib.h
+#
+#  `generated_zlib.h` is scratch.  `.gitignore` has an anchored `/generated_zlib.h`
+#  rule precisely so it can never be committed: a second header sitting beside
+#  the real one would be indistinguishable from the public contract.
+#
+#  THE ONE THING THIS FILE MUST NEVER BE USED FOR
+#  ----------------------------------------------
+#  Regenerating `zlib.h`.  `zlib.h` is READ-ONLY.  It is not derived from the
+#  Rust sources, the Rust sources are validated against it.  Never point
+#  `--output` at `zlib.h`, `zconf.h`, `test/`, `examples/` or any install
+#  directory.  If the diff shows a difference, the Rust facade is what changes.
+#
+#  READ THIS BEFORE WRITING OR CHANGING THE CI GATE
+#  ------------------------------------------------
+#  A verbatim `diff -u zlib.h generated_zlib.h` is NOT empty and never will be.
+#  The gate is a SIGNATURE gate: it must fail on any divergence in a public
+#  signature -- a changed parameter type, a changed return type, a missing
+#  function, an extra function -- and must tolerate exactly the structural
+#  categories enumerated under "ACCEPTED DIVERGENCES" below, and nothing else.
+#
+#  Every category listed there was reproduced against cbindgen 0.29.4 with this
+#  configuration; none of them is speculative.  Anything you see in a diff hunk
+#  that is not on that list is a real defect: fix the facade, do not extend the
+#  list.
+#
+#  ACCEPTED DIVERGENCES  (structural; each one normalised away by the gate)
+#  -----------------------------------------------------------------------
+#  D1. Declaration decoration.  `zlib.h` writes every prototype as
+#        ZEXTERN <ret> ZEXPORT <name>(<args>);
+#      (and `ZEXPORTVA` for the variadic `gzvprintf`).  `ZEXTERN`, `ZEXPORT`,
+#      `ZEXPORTVA`, `FAR` and `z_const` are `zconf.h` macros.  cbindgen emits
+#      none of them: `[fn] prefix` could prepend `ZEXTERN`, but there is no
+#      hook for the `ZEXPORT` slot between the return type and the name, and
+#      prepending `ZEXTERN` alone would leave the artifact uncompilable unless
+#      it also included `zconf.h` -- which D3 shows it cannot.  The gate strips
+#      all five tokens from the reference side.
+#
+#  D2. Struct tag names.  `style = "type"` (mandated by the plan) emits
+#      `typedef struct { ... } z_stream;`, whereas `zlib.h` names the tags:
+#      `typedef struct z_stream_s { ... } z_stream;`, likewise `gz_header_s`.
+#      `struct gzFile_s` is the mirror image -- `zlib.h` declares it as a bare
+#      tag with no typedef, the generated header as a typedef.  Layout, field
+#      order and field types are identical in every case, and those are what
+#      `layout_assertions.rs` and `tests/abi_layout.rs` verify; the tag
+#      spellings carry no ABI weight.  The gate compares struct FIELDS, not the
+#      typedef/tag form.
+#
+#  D3. Includes.  `zlib.h` includes exactly one header, conditionally:
+#      `#ifdef ZLIB_BUILD` -> `<zconf.h>`, `#else` -> `"zconf.h"`.  cbindgen
+#      cannot express a conditional include, and -- verified, not assumed -- it
+#      MUST NOT emit that include at all:
+#        * the facade declares the portability aliases (`Byte`, `Bytef`, `uInt`,
+#          `uLong`, `voidpf`, `voidp`, `voidpc`, `z_crc_t`, `z_size_t`) so that
+#          signatures read in zlib's own spellings, and cbindgen therefore
+#          emits typedefs for them.  Those collide head-on with `zconf.h`:
+#          gcc reports `conflicting types for 'Byte'` because `zconf.h` says
+#          `unsigned char` where cbindgen says `uint8_t`.
+#        * worse, `z_off_t` and `z_off64_t` are `#define`s in `zconf.h`, not
+#          typedefs, so `typedef int64_t z_off_t;` macro-expands to
+#          `typedef int64_t long long;` -- `two or more data types in
+#          declaration specifiers`.
+#        * suppressing the typedefs with `[export] exclude` does not work
+#          either: cbindgen then cannot resolve the names it still has to
+#          reference and aborts with `Can't find uLong` and exit status 101.
+#      So the artifact is deliberately SELF-CONTAINED: `no_includes = true`
+#      plus the three system headers its own typedefs need.  The gate ignores
+#      `#include` lines and the portability typedef block.
+#
+#  D4. Preprocessor macros.  `zlib.h` carries `ZLIB_VERSION "1.3.2.1-motley"`,
+#      `ZLIB_VERNUM 0x1321`, `ZLIB_VER_MAJOR/MINOR/REVISION/SUBREVISION`, the
+#      flush and status constants, `Z_NULL`, the `deflateInit`/`inflateInit`
+#      convenience macros, the `gzgetc` macro and the `Z_PREFIX` / `Z_WANT64`
+#      renaming machinery.  A Rust `pub const` becomes a `#define`, so integer
+#      constants do come across, but function-like macros and the string
+#      version do not, and cbindgen has no way to reproduce the conditional
+#      `#define` blocks.  Those macros are C-side-only and cannot drift from
+#      the Rust implementation, so the gate excludes macro definitions from the
+#      comparison.  `zlibVersion()` returning `ZLIB_VERSION` verbatim is
+#      verified separately, by `test/example.c` and `tests/c_api_parity.rs`.
+#
+#  D5. Large-file duplicate declarations.  `zlib.h` declares `gzopen`,
+#      `gzseek`, `gztell`, `gzoffset`, `adler32_combine`, `crc32_combine` and
+#      `crc32_combine_gen` more than once, under `Z_LARGE64`, `Z_WANT64`,
+#      `!Z_LARGE64`, `Z_SOLO` and `Z_PREFIX_SET` -- 119 `ZEXTERN` occurrences
+#      collapsing to 96 distinct prototypes.  Which spelling a caller resolves
+#      depends on ITS OWN `_FILE_OFFSET_BITS` / `_LARGEFILE64_SOURCE`, so BOTH
+#      the plain and the `*64` families must be exported, and they are -- but
+#      cbindgen emits each `#[no_mangle]` function exactly once,
+#      unconditionally.
+#
+#      The trap here, and it is a real one: the duplicates are NOT textually
+#      identical, so "de-duplicate by name" is ambiguous and silently picks a
+#      winner.  `gzseek64` takes `z_off64_t` under `Z_LARGE64` but `z_off_t`
+#      under `Z_WANT64 && !Z_LARGE64`; likewise `gztell64` and `gzoffset64`.
+#      The gate must therefore RESOLVE the reference header under one declared
+#      configuration rather than de-duplicate textually.  The configuration to
+#      declare is the reference build's own: `-D_LARGEFILE64_SOURCE=1` and NOT
+#      `-D_FILE_OFFSET_BITS=64`, which yields `Z_LARGE64` defined, `Z_WANT64`
+#      undefined, and every one of the 14 large-file names declared exactly
+#      once -- 7 `*64` in terms of `z_off64_t` and 7 plain in terms of
+#      `z_off_t`.  Verified by preprocessing `zlib.h` with that single flag.
+#
+#  D6. Feature gating.  Items behind `#[cfg(feature = "...")]` are wrapped in
+#      `#if defined(...)` using the `[defines]` map at the bottom of this file.
+#      `zlib.h` gates the same functions differently -- the gz family sits
+#      inside `#ifndef Z_SOLO`, `gzvprintf` additionally inside
+#      `#if defined(STDC) || defined(Z_HAVE_STDARG_H)`, `gzopen_w` inside
+#      `#if defined(_WIN32) && !defined(Z_SOLO)`.  cbindgen can only emit
+#      positive `defined(X)` tests, so the conditions are spelled differently
+#      even where they mean the same thing.  Both the standalone compile check
+#      and the gate must therefore define the feature macros of the
+#      configuration the header was generated from; with the default feature
+#      set that is `-DZLIB_RS_LIBZ_COMPAT -DZLIB_RS_GZ`.
+#
+#  D7. Declaration order.  `sort_by = "Name"` alphabetises prototypes and
+#      constants.  `zlib.h` orders them thematically and interleaves deflate
+#      with inflate, which no module layout in the facade can reproduce.
+#      Sorting is chosen deliberately: it makes the artifact byte-stable under
+#      any future reorganisation of the facade's modules, so a diff hunk always
+#      means a real change.  The gate sorts both sides.
+#
+#  D8. Comment text.  `documentation = true` carries the facade's `///` doc
+#      comments across (see the "documented public API" requirement), rendered
+#      as `/* ... */`.  They are not, and are not meant to be, a transcription
+#      of `zlib.h`'s prose.  The gate strips comments before comparing.
+#
+#  D9. Trailing `#endif` labels.  cbindgen hard-codes `#endif  // __cplusplus`
+#      (clike.rs) where `zlib.h` writes a bare `#endif`, and writes
+#      `#endif  /* ZLIB_H */` with two spaces where `zlib.h` uses one.  The
+#      `//` form is not valid C89, so the standalone compile check needs
+#      `-Wno-endif-labels` at `-std=c89`; `-std=c99` and later are unaffected.
+#
+#  D10. `linkage` scaffolding.  cbindgen brackets the prototypes with
+#      `#ifdef __cplusplus` / `extern "C" {` / `}` in the same way `zlib.h`
+#      does, but around a different span (prototypes only, rather than the
+#      whole body).  The gate strips the `extern "C" {` and `}` tokens.
+#
+#  D11. `gzprintf` and `gzvprintf` are absent from the generated header, and
+#      that is a toolchain fact rather than a missing export.  `gzprintf` is C
+#      variadic (zlib.h L1549) and `gzvprintf` takes a `va_list`
+#      (zlib.h L2047).  Defining either in Rust needs `c_variadic`, which is
+#      UNSTABLE on the toolchain this workspace pins -- verified: rustc 1.97.1
+#      stable rejects a variadic `extern "C" fn` with E0658, and the feature
+#      only became stable on 1.99.0-nightly.  cbindgen can therefore see no
+#      Rust item to emit for them.  Their presence in the shipped library is
+#      verified by the `nm` symbol-parity gate instead, which is the gate that
+#      actually matters for them: a caller resolves `gzprintf` at link time
+#      against the .so, and the header only has to declare it, which the
+#      immutable `zlib.h` already does.  Both names are a DECLARED, ENUMERATED
+#      exception in the header gate -- and the exception list must be exactly
+#      these two, so that a genuinely missing export cannot hide behind it.
+#      When the pinned toolchain reaches a release with `c_variadic` stable,
+#      delete this entry and require them.
+#
+#  NORMALISATION RULES THE GATE MUST IMPLEMENT
+#  -------------------------------------------
+#  The following rule set was validated against this configuration and reduces
+#  the comparison to ZERO mismatches, ZERO missing and ZERO extra prototypes
+#  across the whole surface:
+#
+#    1. strip `/* ... */` and `//` comments                            (D8)
+#    2. resolve the preprocessor rather than deleting `#` lines by hand.
+#       Preprocess each side under its own DECLARED configuration:
+#         reference : -D_LARGEFILE64_SOURCE=1
+#         generated : -DZLIB_RS_LIBZ_COMPAT -DZLIB_RS_GZ
+#       That is what makes D5 unambiguous and D3/D4/D6/D9 disappear.
+#    3. drop the `extern "C" {` and `}` linkage tokens                 (D10)
+#    4. delete the tokens ZEXTERN, ZEXPORT, ZEXPORTVA, FAR, z_const    (D1)
+#    5. key each prototype by function name                            (D5,D7)
+#    6. drop parameter NAMES -- `zlib.h` omits them throughout the
+#       large-file block (`adler32_combine(uLong, uLong, z_off_t)`) and
+#       supplies them elsewhere, so they cannot be compared
+#    7. canonicalise bare `unsigned` to `unsigned int` and bare
+#       `signed` to `int` -- `zlib.h` writes `gzread(gzFile, voidp,
+#       unsigned)` where cbindgen writes `unsigned int`
+#    8. resolve the `zconf.h` typedef chain, so that alias-equivalent
+#       spellings compare equal.  This rule is NOT optional: `zlib.h`
+#       declares `inflateBackInit_`'s window as `unsigned char FAR *`
+#       while the facade spells the same type `Bytef *`, and without
+#       resolution that reads as a signature change.  The chain is
+#         Bytef -> Byte -> unsigned char      uIntf -> uInt -> unsigned int
+#         uLongf -> uLong -> unsigned long    z_crc_t -> Z_U4 (unsigned)
+#         z_size_t -> size_t                  charf -> char, intf -> int
+#         voidpf, voidp -> void *             voidpc -> const void *
+#         z_off_t, z_off64_t -> off_t, off64_t (both 64-bit under Z_LARGE64)
+#         z_streamp -> z_stream *             gz_headerp -> gz_header *
+#         gzFile -> struct gzFile_s *
+#    9. restrict the comparison to the zlib API name set.  Rule 2 has a
+#       side effect: `zconf.h` includes `<unistd.h>` when
+#       `Z_HAVE_UNISTD_H` is set, so preprocessing the reference header
+#       drags in roughly 119 libc prototypes (`read`, `write`, `lseek`,
+#       `getpid`, ...).  Filter both sides to the names `zlib.h` declares
+#       with `ZEXTERN` -- there are exactly 96 -- or equivalently to the
+#       `zlib.map` global set.
+#
+#  After rules 1-9, compare the two name -> normalised-signature maps.  A name
+#  present on one side only (D11 excepted), or mapped to different text, is a
+#  FAILURE.  Measured with this configuration against a facade mirroring all 96
+#  prototypes: 95 reference prototypes resolve on this platform (`gzopen_w` is
+#  `_WIN32`-only), 93 are generated, the 2-name difference is exactly D11, and
+#  there are no signature mismatches and no extra exports.
+#
+#  MAINTENANCE NOTES
+#  -----------------
+#  * Pinned tool: cbindgen 0.29.4.  Every key below was checked against that
+#    version's `Config` definition.  0.29.x sets `#[serde(deny_unknown_fields)]`
+#    on all of its config structs, so a misspelled key is a hard parse error
+#    rather than a silent no-op -- but a key that is merely WRONG still yields a
+#    plausible-looking, incorrect header, so change nothing here casually.
+#  * Bumping cbindgen may change the incidental formatting D2/D9/D10 describe.
+#    Re-verify those categories before accepting a new version.
+#  * The full inventory of decisions behind this file is in the plan; the
+#    authoritative surface is `zlib.h` itself.
+# =============================================================================
 
+
+# -----------------------------------------------------------------------------
+#  Output banner
+# -----------------------------------------------------------------------------
+#  cbindgen writes `header` verbatim BEFORE the include guard -- the same slot
+#  `zlib.h` uses for its licence block.  This banner is the only decoration the
+#  artifact carries, and it earns its place: `generated_zlib.h` is a header that
+#  looks exactly like a public contract, and the one thing that must never
+#  happen is for someone to install it, commit it, or edit it in the belief that
+#  it is one.  `autogen_warning` is deliberately NOT used -- it lands INSIDE the
+#  include guard, in the middle of the region the gate compares, whereas a
+#  banner ahead of the guard is a fixed prefix the gate skips trivially.
+# -----------------------------------------------------------------------------
+header = '''
+/* =========================================================================
+ * generated_zlib.h -- GENERATED VERIFICATION ARTIFACT.  DO NOT USE.
+ *
+ * Produced by cbindgen from crates/libz-rs-sys to be diffed against the
+ * immutable zlib.h.  It is NOT the public contract, it is NOT installed, it
+ * is NOT committed (see /generated_zlib.h in .gitignore) and it is NOT
+ * hand-edited.  zlib.h is read-only and is never regenerated from this.
+ *
+ * Regenerate with:
+ *   cbindgen --config cbindgen.toml --crate libz-rs-sys --output generated_zlib.h
+ *
+ * The header guard below is ZLIB_H on purpose, so that including this file
+ * and the real zlib.h in the same translation unit cannot double-declare the
+ * API.  That also means this file SHADOWS zlib.h: never place it on an
+ * include path that a real build searches.
+ * ========================================================================= */'''
+
+
+# -----------------------------------------------------------------------------
+#  Language and layout
+# -----------------------------------------------------------------------------
+
+# C, never C++.  The target is a header that has compiled as C89 since 1995.
 language = "C"
+
+# Reproduces `#ifndef ZLIB_H` / `#define ZLIB_H` / `#endif` exactly as zlib.h
+# L31-32 and its final line, so the artifact is guard-compatible with the real
+# header rather than co-includable with it.  See D9 for the `#endif` label.
 include_guard = "ZLIB_H"
-style = "type"
+
+# `#ifdef __cplusplus` / `extern "C" {` around the prototypes, matching
+# zlib.h L40-42.  Without it every C++ consumer of the generated header would
+# mangle the symbol names.  See D10 for the span difference.
 cpp_compat = true
-documentation = true
-documentation_style = "c"
+
+# Mandated by the plan.  Emits `typedef struct { ... } z_stream;` -- typedef
+# without a tag.  See D2: the ABI is identical, only the tag spelling is lost.
+style = "type"
+
+# Alphabetical, deterministic ordering.  See D7 for why this is a feature and
+# not a compromise.
+sort_by = "Name"
+
+# 80 columns and 4-space indentation, following zlib.h's own house style.
 line_length = 80
 tab_width = 4
-no_includes = false
-sys_includes = ["stddef.h", "stdint.h"]
+
+# LF only.  The C sources, `zlib.h` and every file in this workspace are LF;
+# a CRLF artifact would make the diff useless on the very first line.
+line_endings = "LF"
+
+# `struct z_stream {` rather than a brace on the following line -- zlib.h's
+# style, and the style the C sources use throughout.
+braces = "SameLine"
+
+
+# -----------------------------------------------------------------------------
+#  Integer model
+# -----------------------------------------------------------------------------
+#  Renders Rust `usize`/`isize` as `size_t`/`ptrdiff_t` instead of
+#  `uintptr_t`/`intptr_t`.  This is correct and required, because `z_size_t` is
+#  `size_t` on every STDC platform (zconf.h L265) and the `_z` entry points
+#  (`compressBound_z`, `deflateBound_z`, `compress_z`, `compress2_z`,
+#  `uncompress_z`, `uncompress2_z`) plus `adler32_z`, `crc32_z`, `gzfread` and
+#  `gzfwrite` are all declared in terms of it.  Left at the default the
+#  artifact would say `typedef uintptr_t z_size_t;` and diverge from zconf.h
+#  for no reason.
+#
+#  It does NOT, and cannot, affect `uLong`.  This matters enormously: `uLong`
+#  is `unsigned long` (zconf.h L406) -- 8 bytes on LP64 but 4 on LLP64 Windows
+#  -- and conflating it with `size_t` would corrupt `total_in`, `total_out`,
+#  `adler` and every checksum return value on one platform family or the other.
+#  Verified in cbindgen's own `ir/ty.rs`: this flag is consulted only for
+#  `IntKind::Size`, while `core::ffi::c_ulong` resolves to `IntKind::Long` and
+#  renders as `unsigned long` unconditionally.  The facade must accordingly
+#  spell `uLong` as `core::ffi::c_ulong` and never as `u64`, `usize` or any
+#  other fixed-width type; that requirement lives in the facade, and this flag
+#  neither helps nor hinders it.
+# -----------------------------------------------------------------------------
+usize_is_size_t = true
+
+
+# -----------------------------------------------------------------------------
+#  Includes
+# -----------------------------------------------------------------------------
+#  Suppress cbindgen's automatic include block and state the dependencies
+#  exactly.  See D3 for the full reasoning, including the two compile failures
+#  that rule out `includes = ["zconf.h"]` and the cbindgen abort that rules out
+#  working around them with `[export] exclude`.
+#
+#  Left on, the automatic block would add `<stdbool.h>` and `<stdlib.h>`, which
+#  nothing in the zlib surface needs, and would duplicate any entry repeated in
+#  `sys_includes`.
+#
+#  The three below are the complete set the artifact's own declarations require:
+#    stdarg.h  `va_list`, for gzvprintf (zlib.h L2047)
+#    stddef.h  `size_t`, reached through `usize_is_size_t` above
+#    stdint.h  `uint8_t`/`uint32_t`/`int64_t`, behind Bytef, z_crc_t, z_off64_t
+# -----------------------------------------------------------------------------
+no_includes = true
+sys_includes = ["stdarg.h", "stddef.h", "stdint.h"]
+
+
+# -----------------------------------------------------------------------------
+#  Documentation
+# -----------------------------------------------------------------------------
+#  The facade documents every public item, and the generated header is where
+#  that documentation becomes externally visible, so it is carried across in
+#  full.  `"c"` gives `/* ... */`, the only comment form valid in C89 and the
+#  form zlib.h uses; `"doxy"` would inject `\brief`-style markup that has no
+#  counterpart in the reference header.  The gate strips comments (D8), so this
+#  costs the comparison nothing.
+# -----------------------------------------------------------------------------
+documentation = true
+documentation_style = "c"
+documentation_length = "full"
+
+
+# -----------------------------------------------------------------------------
+#  Provenance noise, all suppressed
+# -----------------------------------------------------------------------------
+#  Each of these would inject a line that changes when nothing about the API
+#  changed -- a package version, a cbindgen version -- turning every routine
+#  version bump into a spurious diff hunk.  The banner in `header` already
+#  records what the artifact is, and it is fixed text.
+# -----------------------------------------------------------------------------
+package_version = false
+include_version = false
+
+# `#pragma once` is not C89 and not what zlib.h does; `include_guard` above is
+# the portable form and the one that matches.
+pragma_once = false
+
+
+# =============================================================================
+#  [export] -- which items are emitted, and under what names
+# =============================================================================
 
 [export]
+
+# No prefix.  Required: the exported names ARE the zlib names, and a prefix
+# would rename all 96 of them at once. `Z_PREFIX` renaming is a caller-side
+# `#define` game played inside zconf.h and must not be baked in here.
 prefix = ""
-item_types = ["constants", "globals", "enums", "structs", "unions", "typedefs", "opaque", "functions"]
+
+# Every item kind, stated explicitly rather than left to the default empty
+# filter, so that adding a kind to the facade can never silently drop it from
+# the artifact and thus from the gate.  `"opaque"` is cbindgen's spelling for
+# opaque items -- relevant to `struct internal_state`, which zlib.h L88
+# forward-declares as an incomplete type and never defines.
+item_types = [
+    "constants",
+    "globals",
+    "enums",
+    "structs",
+    "unions",
+    "typedefs",
+    "opaque",
+    "functions",
+]
+
+# -----------------------------------------------------------------------------
+#  [export.rename] -- canonicalise Rust item names to zlib's spellings
+# -----------------------------------------------------------------------------
+#  Understand the mechanism before adding an entry.  This table is an exact,
+#  case-sensitive lookup on an item's own name, applied to typedefs, structs,
+#  unions, enums, opaque items, constants and type references.  It is NOT
+#  applied to primitives: cbindgen resolves `c_uint` to `unsigned int`, `u8` to
+#  `uint8_t` and `c_ulong` to `unsigned long` before any renaming happens.  The
+#  mechanism that puts zlib's spellings into the artifact is therefore the
+#  facade's own aliases -- `pub type uInt = c_uint;` and friends in
+#  `crates/libz-rs-sys/src/types.rs` -- and this table is the safety net that
+#  keeps the artifact correct if any of those items is ever spelled
+#  idiomatically instead.
+#
+#  Why a safety net is warranted: the C spellings (`z_stream`, `gz_header`,
+#  `gzFile_s`, `uInt`, `uLong`, ...) are only legal Rust identifiers under the
+#  facade's `#![allow(non_camel_case_types)]`, which exists solely to permit
+#  them while the crate is built with `deny(clippy::all, clippy::pedantic)`.
+#  Remove that one attribute -- an entirely plausible future "cleanup" -- and
+#  rustc's own `non_camel_case_types` suggestion renames every ABI type to
+#  UpperCamelCase.  Every key below is exactly that suggestion, obtained by
+#  compiling the 26 C type names as Rust items and reading back the
+#  `help: convert the identifier to upper camel case` text, so the table is
+#  derived and reproducible rather than guessed.  Note what that exercise ruled
+#  out as well as in: the suggestion for `z_streamp` is `ZStreamp` and NOT
+#  `ZStreamP`, for `voidp` it is `Voidp` and NOT `VoidP`, and `Byte` and `Bytef`
+#  draw no warning at all, so no entry exists for them.
+#
+#  The `*_s` keys map to the TAG spellings `z_stream_s` and `gz_header_s`, not
+#  to the typedef names, so no two keys can ever produce the same C name.
+#
+#  An entry whose key matches no item is inert: the lookup simply misses, with
+#  no warning and no output change.  An entry that fires unexpectedly cannot
+#  hide, because two items renamed to one C name produce a duplicate typedef
+#  that the standalone compile check rejects.
+#
+#  Every value below is the spelling `zlib.h` or `zconf.h` requires, cited.
+# -----------------------------------------------------------------------------
+[export.rename]
+
+# zlib.h L90-110 / L112 -- the stream, its struct tag and its pointer alias.
+"ZStream" = "z_stream"
+"ZStreamS" = "z_stream_s"
+"ZStreamp" = "z_streamp"
+
+# zlib.h L88 / L100 -- the opaque state. `z_stream.state` is declared
+# `struct internal_state FAR *`, so this name is part of the struct's rendered
+# form even though the type itself is never defined.
+"InternalState" = "internal_state"
+
+# zlib.h L85-86 -- the caller-supplied allocator pair.
+"AllocFunc" = "alloc_func"
+"FreeFunc" = "free_func"
+
+# zlib.h L118-133 / L135 -- the gzip header, its tag and its pointer alias.
+"GzHeader" = "gz_header"
+"GzHeaderS" = "gz_header_s"
+"GzHeaderp" = "gz_headerp"
+
+# zlib.h L1354 / L1957-1961 -- the semi-opaque gzip file handle and the
+# abbreviated struct the `gzgetc` macro dereferences in CALLER code, which is
+# why its first three fields are ABI and not an implementation detail.
+"GzFile" = "gzFile"
+"GzFileS" = "gzFile_s"
+
+# zconf.h L403-427 -- the portability typedefs. `Byte` and `Bytef` are already
+# valid UpperCamelCase and so are never renamed; they need no entry.
+"UInt" = "uInt"
+"ULong" = "uLong"
+"UIntf" = "uIntf"
+"ULongf" = "uLongf"
+"Charf" = "charf"
+"Intf" = "intf"
+"Voidp" = "voidp"
+"Voidpc" = "voidpc"
+"Voidpf" = "voidpf"
+
+# zconf.h L255-267, L440-444, L495-531 -- width- and offset-dependent types.
+# `z_off_t` and `z_off64_t` are `#define`s on the C side, which is one of the
+# reasons the artifact cannot include zconf.h (D3).
+"ZCrcT" = "z_crc_t"
+"ZSizeT" = "z_size_t"
+"ZOffT" = "z_off_t"
+"ZOff64T" = "z_off64_t"
+
+# zlib.h L2042 -- `gzopen_w(const wchar_t *path, const char *mode)`. Rust has
+# no `wchar_t` primitive and cbindgen knows no such name, so the facade has to
+# declare the alias itself for the Windows-only entry point to render with the
+# spelling the contract uses; this entry keeps that alias correct if it is ever
+# named idiomatically.
+"WcharT" = "wchar_t"
+
+
+# =============================================================================
+#  [parse] -- what cbindgen reads
+# =============================================================================
 
 [parse]
+
+# The facade owns every `#[repr(C)]` ABI type in `src/types.rs`, and the only
+# other crate in its dependency graph is the `#![forbid(unsafe_code)]` core,
+# which by design exports no C types at all.  Parsing dependencies would
+# therefore add nothing and would risk dragging a core type into the public
+# header, so it stays off.  It also keeps the run fast and hermetic: no
+# `cargo metadata` walk, no network, no build of anything.
 parse_deps = false
 
+
+# =============================================================================
+#  [fn] -- prototype rendering
+# =============================================================================
+
 [fn]
-args = "auto"
+
+# One prototype per line, always.  With `"auto"` cbindgen wraps anything over
+# `line_length` into a vertical, paren-aligned block, which looks more like
+# zlib.h but forces the gate to reassemble multi-line declarations before it
+# can compare them.  Horizontal makes the artifact a flat list of one-line
+# prototypes -- the cleanest possible input for a normalised, sorted
+# comparison -- at the cost of some long lines in a file no human maintains.
+args = "horizontal"
+
+# Alphabetical, for the reasons in D7. Stated here as well as at the top level
+# because this is the setting that orders the function block itself.
+sort_by = "Name"
+
+# NOT set, deliberately:
+#   prefix / postfix  -- see D1. `prefix` would emit `ZEXTERN`, but there is no
+#                        hook for the `ZEXPORT` slot, and `ZEXTERN` is a
+#                        zconf.h macro that would be undefined in a
+#                        self-contained artifact (D3).  Half the decoration,
+#                        plus a header that will not compile, is strictly worse
+#                        than none.
+#   must_use / deprecated / deprecated_with_note / no_return
+#                     -- zlib.h annotates nothing. Adding attributes would
+#                        invent API surface the contract does not have.
+#   rename_args       -- parameter names are dropped by the gate (rule 6) and
+#                        renaming them would only obscure the facade's own
+#                        naming.
+#   swift_name_macro  -- not a Swift consumer.
+
+
+# =============================================================================
+#  [struct] / [enum] / [const] / [macro_expansion] -- keep C89 plain
+# =============================================================================
+#  zlib.h is a 1995-era C89 header. Every generator convenience below would add
+#  something it does not have, so all of them are pinned off rather than left
+#  to a default that a future cbindgen release might flip.
+# =============================================================================
+
+[struct]
+
+# No synthesised constructors or comparison operators. These are C++ emissions
+# and `language = "C"` already suppresses them; pinning them makes that
+# explicit for `z_stream`, `gz_header` and `gzFile_s`, whose exact rendered
+# field list is the thing being verified (D2).
+derive_constructor = false
+derive_eq = false
+derive_neq = false
+derive_lt = false
+derive_lte = false
+derive_gt = false
+derive_gte = false
+derive_ostream = false
 
 [enum]
+
+# The zlib surface has no C enums -- flush modes, status codes and strategies
+# are all `#define`d integers (zlib.h L172-L206). These settings therefore
+# describe a case that should not arise, and are pinned so that if a future
+# facade change does introduce an enum it cannot silently arrive decorated with
+# name-prefixed variants or a synthetic sentinel that the contract lacks.
 prefix_with_name = false
+add_sentinel = false
+derive_helper_methods = false
+enum_class = false
+
+[const]
+
+# Rust `pub const` items become plain `#define`s, which is exactly the form
+# zlib.h uses for `Z_NO_FLUSH`, `Z_OK`, `Z_DEFLATED`, `Z_NULL` and the rest
+# (D4). `static const` and `constexpr` are C++ forms and are refused.
+allow_static_const = false
+allow_constexpr = false
+sort_by = "Name"
+
+[macro_expansion]
+
+# No `bitflags!` expansion. Nothing in the facade uses it, and generated
+# flag-type scaffolding is precisely the sort of Rust idiom that has no place
+# in this header.
+bitflags = false
+
+
+# =============================================================================
+#  [defines] -- Rust `cfg` to C preprocessor mapping
+# =============================================================================
+#  Any item behind a `cfg` is emitted inside `#if defined(<value>)`. A `cfg`
+#  with no entry here makes cbindgen print
+#  `WARN: Missing [defines] entry for ...` and then drop the condition, so the
+#  item silently becomes unconditional -- a warning the zero-warning bar
+#  forbids and a behaviour the gate must not be exposed to. Every `cfg` the
+#  facade can plausibly carry is therefore mapped, including the ones that
+#  currently gate nothing.
+#
+#  Key grammar, from cbindgen's `DefineKey::load`: `"name = value"` for
+#  `#[cfg(name = "value")]` with the value UNQUOTED, or a bare `"name"` for
+#  `#[cfg(name)]`. Whitespace around `=` is trimmed.
+#
+#  Consequence for consumers of the artifact, restated because it is easy to
+#  trip over (D6): with the crate's default features the header must be
+#  preprocessed with `-DZLIB_RS_LIBZ_COMPAT -DZLIB_RS_GZ` or the gz family and,
+#  depending on how the facade gates its modules, the entire exported surface
+#  will be invisible -- and a gate that compares nothing passes.
+# =============================================================================
 
 [defines]
+
+# The four features declared by crates/libz-rs-sys/Cargo.toml. `libz-compat`
+# and `gz` are default-on; `simd` and `libc` are default-off and gate no
+# exported item today, but are mapped so that adding one cannot introduce a
+# warning.
+"feature = libz-compat" = "ZLIB_RS_LIBZ_COMPAT"
+"feature = gz" = "ZLIB_RS_GZ"
+"feature = simd" = "ZLIB_RS_SIMD"
+"feature = libc" = "ZLIB_RS_LIBC"
+
+# Windows-only items, chief among them `gzopen_w` (zlib.h L2042), which the
+# reference header gates on `#if defined(_WIN32) && !defined(Z_SOLO)`. All
+# three spellings a facade might write are mapped onto `_WIN32`, so the
+# generated condition agrees with the reference one on the half cbindgen is
+# able to express.
+"windows" = "_WIN32"
+"target_family = windows" = "_WIN32"
+"target_os = windows" = "_WIN32"
+
+
+# =============================================================================
+#  Deliberately absent -- do not add these
+# =============================================================================
+#
+#  language = "C++"        The contract is C. C++ consumers are served by
+#                          `cpp_compat` above, exactly as zlib.h serves them.
+#  namespace / namespaces / using_namespaces
+#                          C++-only, and namespacing the API would break every
+#                          existing caller. `[export] prefix` is empty for the
+#                          same reason.
+#  includes                See D3: emitting `#include "zconf.h"` makes the
+#                          artifact fail to compile.
+#  after_includes / trailer / autogen_warning
+#                          Free-text injected inside the region the gate
+#                          compares. The `header` banner sits outside it and
+#                          does the same job without the cost.
+#  [layout] packed / aligned_n
+#                          The ABI types are plain `#[repr(C)]`; no packing or
+#                          forced alignment exists to annotate, and inventing
+#                          an annotation would misdescribe the layout that
+#                          `layout_assertions.rs` pins.
+#  [ptr] non_null_attribute / nullable_attribute
+#                          zlib's contract is that a NULL stream returns
+#                          `Z_STREAM_ERROR` rather than being undefined, so
+#                          nullability annotations would contradict it.
+#  [parse] expand          Requires a nightly `rustc -Zunpretty=expanded` run.
+#                          The facade uses no macros that need expanding, and
+#                          the header gate must work on stable.
+#  [cython]                Not a Cython consumer.
+# =============================================================================

@@ -12,6 +12,20 @@
 # To install in $HOME instead of /usr/local, use:
 #    make install prefix=$HOME
 
+# To build the memory-safe Rust implementation of zlib together with the
+# drop-in C-ABI library it exports, type:
+#    make rust
+# To run the Rust test suites and then relink the unmodified test/example.c
+# and test/minigzip.c against that library instead of the C one, type:
+#    make rust-test
+# To remove everything those two targets produced, type:
+#    make rust-clean
+# Those three targets are standalone on purpose: no C target depends on
+# them, because the C library is the reference the Rust port is diffed
+# against and has to stay buildable and green on its own.  When no cargo is
+# available configure leaves CARGO empty and all three print a notice and
+# succeed without doing anything.  See rust/README.md for details.
+
 CC=cc
 GCOV=GCOV
 LLVM_GCOV_FLAG=LLMV_GCOV_FLAG
@@ -43,6 +57,46 @@ LDSHAREDLIBC=-lc
 TAR=tar
 SHELL=/bin/sh
 EXE=
+
+# Rust workspace.  The six variables below drive the `rust', `rust-test' and
+# `rust-clean' targets; no C target reads any of them.
+#
+# Only CARGO is substituted by configure, through a
+# /^CARGO *=/s#=.*#=$CARGO# rule, which is why it has to stay a plain
+# NAME=value line starting in column 0.  The other five are ordinary make
+# variables, need no configure counterpart, and can be overridden on the
+# command line, for example
+#    make rust CARGO_BUILD_FLAGS='--release --locked'
+#
+#   CARGO              The cargo executable, or EMPTY when configure found
+#                      no Rust toolchain.  Empty makes all three Rust
+#                      targets print a notice and succeed, so a machine
+#                      without cargo can still build and test the C library.
+#   CARGO_BUILD_FLAGS  Flags for `cargo build'.  These pick the profile, so
+#                      RUSTDIR below has to agree with them.
+#   CARGO_TEST_FLAGS   Flags for `cargo test'.
+#   RUSTTARGETDIR      Cargo's target directory, relative to the build
+#                      directory.  Exported as CARGO_TARGET_DIR so that an
+#                      out-of-source build keeps its artifacts out of
+#                      SRCDIR.
+#   RUSTDIR            Where cargo writes $(SHAREDLIB) and $(STATICLIB).
+#   RUSTLIBDIR         Staging directory for the drop-in library: a real
+#                      $(SHAREDLIBV) with $(SHAREDLIBM) and $(SHAREDLIB)
+#                      symlinked to it, the same topology the
+#                      $(SHAREDLIBV) rule gives the C library, plus the
+#                      relinked C drivers.  It is deliberately not
+#                      $(RUSTDIR), because cargo puts that directory first
+#                      on LD_LIBRARY_PATH when it runs tests and a
+#                      $(SHAREDLIBM) sitting there would be loaded by
+#                      unrelated processes; and deliberately not the build
+#                      directory, where libz.* belongs to the C build and
+#                      testshared searches for it.
+CARGO=cargo
+CARGO_BUILD_FLAGS=--release
+CARGO_TEST_FLAGS=--workspace --release
+RUSTTARGETDIR=target
+RUSTDIR=$(RUSTTARGETDIR)/release
+RUSTLIBDIR=$(RUSTTARGETDIR)/dropin
 
 prefix = /usr/local
 exec_prefix = ${prefix}
@@ -125,6 +179,128 @@ cover: infcover
 	rm -f *.gcda
 	${QEMU_RUN} ./infcover
 	${GCOV} ${LLVM_GCOV_FLAG} inf*.c -o ./infcover.gcda
+
+# The three targets below build and verify the Rust reimplementation of zlib.
+# They are standalone by design, for two independent reasons.  First, configure
+# rewrites the entire prerequisite list of `all' and of `test' (its sed script
+# contains /^all: */s#:.*#: $ALL# and /^test: */s#:.*#: $TEST#), so anything
+# appended to either line here would be discarded the next time configure ran.
+# Second, the C library is the reference implementation the Rust port is diffed
+# against, so `make' and `make test' have to keep working byte for byte as
+# before, on machines that have no Rust toolchain at all.  `distclean' rewrites
+# the placeholder Makefile with forwarding rules for all three, so they stay
+# reachable after a distclean too.
+
+# Build the Rust crates, then the C-ABI library, then stage the result under
+# $(RUSTLIBDIR) using the same three names and the same symlink topology the
+# $(SHAREDLIBV) rule gives the C library.  Those symlinks are not cosmetic: the
+# shared library's SONAME is $(SHAREDLIBM), so a consumer asks the dynamic
+# loader for that exact name, and when only $(SHAREDLIB) exists the loader
+# quietly falls back to the system $(SHAREDLIBM) -- the drop-in test would then
+# pass while exercising the wrong library.  When configure was run with
+# --static, $(SHAREDLIBV) is empty and only $(STATICLIB) is staged.
+rust:
+	@if test -z "$(CARGO)"; then \
+	  echo '		*** cargo not found: Rust build skipped ***'; \
+	  echo '		install a Rust toolchain and re-run ./configure'; \
+	  exit 0; \
+	fi; \
+	set -e; \
+	CARGO_TARGET_DIR=$(RUSTTARGETDIR); export CARGO_TARGET_DIR; \
+	echo "$(CARGO) build $(CARGO_BUILD_FLAGS)"; \
+	$(CARGO) build $(CARGO_BUILD_FLAGS) --manifest-path $(SRCDIR)Cargo.toml; \
+	echo "$(CARGO) build $(CARGO_BUILD_FLAGS) --features libz-compat"; \
+	$(CARGO) build $(CARGO_BUILD_FLAGS) --features libz-compat \
+	  --manifest-path $(SRCDIR)Cargo.toml; \
+	rm -rf $(RUSTLIBDIR); \
+	mkdir -p $(RUSTLIBDIR); \
+	if test -f $(RUSTDIR)/$(STATICLIB); then \
+	  cp -p $(RUSTDIR)/$(STATICLIB) $(RUSTLIBDIR)/$(STATICLIB); \
+	  echo "cp $(RUSTDIR)/$(STATICLIB) $(RUSTLIBDIR)/$(STATICLIB)"; \
+	fi; \
+	if test -n "$(SHAREDLIBV)" -a -f $(RUSTDIR)/$(SHAREDLIB); then \
+	  cp -p $(RUSTDIR)/$(SHAREDLIB) $(RUSTLIBDIR)/$(SHAREDLIBV); \
+	  echo "cp $(RUSTDIR)/$(SHAREDLIB) $(RUSTLIBDIR)/$(SHAREDLIBV)"; \
+	  ln -s $(SHAREDLIBV) $(RUSTLIBDIR)/$(SHAREDLIBM); \
+	  echo "ln -s $(SHAREDLIBV) $(RUSTLIBDIR)/$(SHAREDLIBM)"; \
+	  ln -s $(SHAREDLIBV) $(RUSTLIBDIR)/$(SHAREDLIB); \
+	  echo "ln -s $(SHAREDLIBV) $(RUSTLIBDIR)/$(SHAREDLIB)"; \
+	fi
+
+# Run the Rust test suites, then the check that actually proves drop-in
+# compatibility: compile the UNMODIFIED test/example.c and test/minigzip.c,
+# their #include "zlib.h" untouched, against the staged Rust library and run
+# them.  ldd then has to show the staged library bound rather than the system
+# one, which is the only way to tell the two apart.  The compiler runs before
+# LD_LIBRARY_PATH is redirected, so that $(CC) itself cannot end up loading the
+# library under test, and each loader search path is extended with ${...:+...}
+# so that no empty component is left behind -- a trailing colon would put the
+# build directory, where the C library's own libz.so.1 lives, on the path.
+# The verification sequence runs as a standalone subshell whose status is
+# captured, deliberately not as the condition of the `if' below: a shell
+# ignores `set -e' inside an `if' condition, so written that way a failing
+# cargo test or a failing compile would be reported as a pass.
+rust-test: rust
+	@if test -z "$(CARGO)"; then \
+	  echo '		*** cargo not found: Rust test skipped ***'; \
+	  exit 0; \
+	fi; \
+	RUSTLIB=`pwd`/$(RUSTLIBDIR); \
+	( set -e; \
+	  CARGO_TARGET_DIR=$(RUSTTARGETDIR); export CARGO_TARGET_DIR; \
+	  echo "$(CARGO) test $(CARGO_TEST_FLAGS)"; \
+	  $(CARGO) test $(CARGO_TEST_FLAGS) --manifest-path $(SRCDIR)Cargo.toml; \
+	  if test -n "$(SHAREDLIBV)" -a -f $(RUSTLIBDIR)/$(SHAREDLIBV); then \
+	    ZLINK="-L$$RUSTLIB -lz -Wl,-rpath,$$RUSTLIB"; DYNAMIC=1; \
+	  else \
+	    ZLINK="$(RUSTLIBDIR)/$(STATICLIB)"; DYNAMIC=0; \
+	  fi; \
+	  $(CC) $(CFLAGS) $(ZINCOUT) -o $(RUSTLIBDIR)/examplerust$(EXE) \
+	    $(SRCDIR)test/example.c $(LDFLAGS) $$ZLINK; \
+	  $(CC) $(CFLAGS) $(ZINCOUT) -o $(RUSTLIBDIR)/minigziprust$(EXE) \
+	    $(SRCDIR)test/minigzip.c $(LDFLAGS) $$ZLINK; \
+	  if test $$DYNAMIC -eq 1; then \
+	    LD_LIBRARY_PATH=$$RUSTLIB$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}; \
+	    export LD_LIBRARY_PATH; \
+	    DYLD_LIBRARY_PATH=$$RUSTLIB$${DYLD_LIBRARY_PATH:+:$$DYLD_LIBRARY_PATH}; \
+	    export DYLD_LIBRARY_PATH; \
+	    SHLIB_PATH=$$RUSTLIB$${SHLIB_PATH:+:$$SHLIB_PATH}; \
+	    export SHLIB_PATH; \
+	    if command -v ldd > /dev/null 2>&1; then \
+	      ldd $(RUSTLIBDIR)/examplerust$(EXE) > $(RUSTLIBDIR)/ldd.log 2>&1; \
+	      grep libz $(RUSTLIBDIR)/ldd.log || true; \
+	      grep -F -q "$$RUSTLIB/libz" $(RUSTLIBDIR)/ldd.log || { \
+	        echo "libz did not resolve to $$RUSTLIB"; \
+	        exit 1; \
+	      }; \
+	    else \
+	      echo 'warning: no ldd, cannot confirm which libz was bound'; \
+	    fi; \
+	  fi; \
+	  echo hello world | ${QEMU_RUN} $(RUSTLIBDIR)/minigziprust$(EXE) | \
+	    ${QEMU_RUN} $(RUSTLIBDIR)/minigziprust$(EXE) -d; \
+	  ${QEMU_RUN} $(RUSTLIBDIR)/examplerust$(EXE) $(RUSTLIBDIR)/tmprust.gz; \
+	  rm -f $(RUSTLIBDIR)/tmprust.gz; \
+	); rc=$$?; \
+	if test $$rc -eq 0; then \
+	  echo '		*** zlib Rust test OK ***'; \
+	else \
+	  echo '		*** zlib Rust test FAILED ***'; false; \
+	fi
+
+# Remove everything `rust' and `rust-test' produced: cargo's own output, the
+# staged symlink chain and relinked drivers under $(RUSTLIBDIR), and the scratch
+# files the generated-header and symbol-parity comparisons leave behind.  This
+# is deliberately not a prerequisite of `clean': `clean' is part of the C build
+# and runs from `distclean', where cargo may well be missing.
+rust-clean:
+	-@if test -n "$(CARGO)"; then \
+	  echo "$(CARGO) clean"; \
+	  CARGO_TARGET_DIR=$(RUSTTARGETDIR) \
+	    $(CARGO) clean --manifest-path $(SRCDIR)Cargo.toml; \
+	fi
+	rm -rf $(RUSTTARGETDIR)
+	rm -f generated_zlib.h rust.syms c.syms
 
 libz.a: $(OBJS)
 	$(AR) $(ARFLAGS) $@ $(OBJS)
@@ -390,12 +566,19 @@ clean: minizip-clean
 	rm -f contrib/infback9/*.gcda contrib/infback9/*.gcno contrib/infback9/*.gcov
 
 maintainer-clean: distclean
+# The printf sequence below regenerates the placeholder Makefile that tells
+# the user to run ./configure.  It has to stay byte-identical to the checked-in
+# Makefile, forwarding rules for rust, rust-test and rust-clean included, or
+# those targets would disappear after a distclean.
 distclean: clean zconf # zconf.h.cmakein
 	rm -f Makefile zlib.pc configure.log
 	-@rm -f .DS_Store
 	@if [ -f Makefile.in ]; then \
 	printf 'all:\n\t-@echo "Please use ./configure first.  Thank you."\n' > Makefile ; \
 	printf '\ndistclean:\n\tmake -f Makefile.in distclean\n' >> Makefile ; \
+	printf '\nrust:\n\tmake -f Makefile.in rust\n' >> Makefile ; \
+	printf '\nrust-test:\n\tmake -f Makefile.in rust-test\n' >> Makefile ; \
+	printf '\nrust-clean:\n\tmake -f Makefile.in rust-clean\n' >> Makefile ; \
 	touch -r $(SRCDIR)Makefile.in Makefile ; fi
 
 tags:
