@@ -1,3 +1,47 @@
+# ==========================================================================
+# zlib.pc.in -- pkg-config descriptor template for zlib
+# ==========================================================================
+#
+# configure rewrites this template into zlib.pc (the zlib.pc sed block near
+# the end of configure), win32/Makefile.gcc performs the equivalent
+# substitution at install time, and Makefile.in installs the result into
+# $(libdir)/pkgconfig.  The CMake build uses the parallel template
+# zlib.pc.cmakein rather than this file.
+#
+# This descriptor is deliberately implementation-agnostic: the flags below
+# describe the C implementation and the memory-safe Rust implementation
+# (crates/libz-rs-sys, built as a cdylib and a staticlib) equally well, so
+# no Rust-specific variant of this file is needed.  The Rust build
+# reproduces the C build's packaging exactly:
+#
+#   * the artifacts are named libz.so and libz.a, so -lz resolves to either;
+#   * the shared object carries SONAME libz.so.1 and ships the same
+#     libz.so -> libz.so.1 -> libz.so.1.3.2.1-motley symlink chain, so a
+#     program already linked against libz keeps loading it under the name
+#     recorded in its DT_NEEDED entry;
+#   * the exported symbol surface is identical -- 111 dynamic globals, being
+#     95 functions plus the 16 symbol-version nodes declared in zlib.map;
+#   * the installed zlib.h and generated zconf.h are byte-identical, because
+#     the Rust port modifies neither header.
+#
+# The public API and ABI are therefore unchanged: a consumer compiled and
+# linked against the C library runs against the Rust library without being
+# recompiled.  Libs: advertising -lz and Cflags: advertising the include
+# directory are part of that guarantee -- do not reword them, and do not add
+# Requires: entries, a Libs.private: line, -lm, -lpthread, or any
+# Rust-specific flag.  Like the C library, the Rust library links only the C
+# runtime, so its consumers need nothing extra.
+#
+# Two constraints the substitution passes impose on future edits: every
+# name=value line must begin in column 0, because configure's rules are
+# anchored (/^name *=/s#=.*#=$name#) and would silently skip an indented
+# line; and adding a substitutable variable also requires a matching rule in
+# configure's zlib.pc sed block -- a different block from the one that
+# rewrites Makefile.in -- plus a matching -e in win32/Makefile.gcc.  Prefer
+# not to add one.  Never spell a substitution placeholder literally in these
+# comments either: both passes substitute globally and would rewrite it here.
+# ==========================================================================
+
 prefix=@prefix@
 exec_prefix=@exec_prefix@
 libdir=@libdir@

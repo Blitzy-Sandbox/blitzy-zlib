@@ -1,14 +1,94 @@
-# Rust toolchain pin for the zlib Rust workspace.
+# Rust toolchain descriptor for the zlib Rust workspace.
 #
-# Rationale:
-#   * The workspace targets stable Rust with edition 2021 and declares an MSRV of
-#     1.80 in the crate manifests, so "stable" tracks the newest compiler that
-#     still honours that contract.  (Edition 2024 would require rustc >= 1.85 and
-#     is therefore incompatible with the declared MSRV.)
-#   * Miri and -Zsanitizer=address are nightly-only.  Those jobs are run
-#     explicitly with `cargo +nightly ...`; a nightly toolchain with the `miri`
-#     and `rust-src` components is installed alongside stable in this
-#     environment and is NOT selected by default.
+# rustup finds this file by walking up from the current directory, so it MUST
+# stay at the repository root, beside Cargo.toml.  Once it is here, every
+# cargo, rustc, rustfmt, and clippy invocation made anywhere inside the tree
+# resolves to the toolchain selected below, and rustup provisions that
+# toolchain -- with the components listed below -- on first use.
+#
+# --------------------------------------------------------------------------
+# channel = "stable"  --  a channel, deliberately NOT a version number
+# --------------------------------------------------------------------------
+# The requirement for this port is "Rust 1.80+ stable, edition 2021".  That is
+# a LOWER BOUND, and the C tree carries no Rust version signal of any kind:
+# neither `configure` nor CMakeLists.txt mentions cargo.  Tracking the `stable`
+# channel is therefore the faithful reading -- it always clears the floor while
+# picking up compiler and library fixes for free.
+#
+# Pinning an exact release such as "1.97.1" is deliberately avoided: it would
+# freeze the toolchain, hide upstream regressions behind a manual bump, and
+# generate CI churn for no benefit.  `beta` and `nightly` are equally wrong as
+# the default, because a system library on which every consumer of compressed
+# data depends must build with the compiler that distributions actually ship.
+#
+# --------------------------------------------------------------------------
+# The MSRV is NOT declared here -- it lives in Cargo.toml
+# --------------------------------------------------------------------------
+# These are two different contracts and must never be conflated:
+#
+#   * THIS file SELECTS the toolchain that runs in this working tree.
+#   * `rust-version = "1.80"` in Cargo.toml's [workspace.package] DECLARES the
+#     oldest compiler a consumer of these crates is permitted to need.  Cargo
+#     enforces that key, and clippy.toml mirrors it as `msrv = "1.80"` so lint
+#     suggestions stay reachable on the floor.
+#
+# `rust-version` is not a valid key in a toolchain file and must never appear
+# below.  The floor is exercised the same way the nightly jobs are, through an
+# explicit override -- `cargo +1.80 check` -- which this file does not obstruct.
+# Edition 2021 is what keeps 1.80 reachable at all: edition 2024 requires
+# rustc >= 1.85, and cargo rejects that combination outright.
+#
+# --------------------------------------------------------------------------
+# profile = "minimal", plus two mandatory components
+# --------------------------------------------------------------------------
+# `minimal` installs only rustc, cargo, and the standard library -- no offline
+# docs, no extra targets -- which keeps first-use downloads small in CI.
+# `components` is ADDITIVE to the profile, so the two entries below do not
+# conflict with it; together they are exactly equivalent to the provisioning
+# command this project is built with:
+#
+#     rustup toolchain install stable --profile minimal \
+#         --component rustfmt,clippy
+#
+# Both components are mandatory rather than convenient.  `cargo fmt --check`
+# and `cargo clippy -- -D warnings` are quality gates for this workspace, and a
+# toolchain missing either component fails those gates simply by being unable
+# to run them.
+#
+# --------------------------------------------------------------------------
+# Nightly is chosen per-invocation, never here
+# --------------------------------------------------------------------------
+# Miri and `-Zsanitizer=address` are nightly-only, and this port must be
+# Miri-clean over the safe core (crates/zlib-rs) and sanitizer-clean over the
+# C-ABI boundary layer (crates/libz-rs-sys).  Those jobs run as
+# `cargo +nightly miri test -p zlib-rs` and friends: an explicit `+toolchain`
+# argument on the command line OVERRIDES this file, and that override is
+# precisely the mechanism they depend on.  Nothing added here may fight it.
+#
+# The extra components that work needs -- `miri` and `rust-src` -- are
+# provisioned separately, against the nightly toolchain, and are deliberately
+# absent from the list below.  Naming them here would be actively harmful
+# rather than merely untidy: they are not published for the stable channel, so
+# rustup would fail to provision this toolchain and every build in the tree
+# would break.
+#
+# --------------------------------------------------------------------------
+# No `targets` list
+# --------------------------------------------------------------------------
+# The Rust build is scoped to Tier-1 targets, and the host target is installed
+# with the toolchain already.  Cross-compilation belongs in a CI matrix, where
+# a job can add exactly the target it needs; hard-coding a target list here
+# would force every developer to download standard libraries they never build
+# against.
+#
+# --------------------------------------------------------------------------
+# The C build is unaffected
+# --------------------------------------------------------------------------
+# This file takes effect only once cargo is invoked.  The C library keeps
+# building with `./configure && make` or with CMake on a machine that has no
+# Rust toolchain at all, which is what keeps the in-tree C sources usable as
+# the differential oracle for the Rust implementation.
+
 [toolchain]
 channel = "stable"
 profile = "minimal"
