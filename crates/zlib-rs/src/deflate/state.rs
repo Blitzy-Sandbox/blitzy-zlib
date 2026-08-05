@@ -188,11 +188,22 @@
 // same applies to the constants named after their C `#define`s.
 #![allow(clippy::module_name_repetitions)]
 
-use crate::allocate::{Allocator, Buffer};
-use crate::config::{DeflateConfig, Method, Strategy, ValidatedDeflateConfig, Wrap};
+// Re-export the allocator bound with the state it parameterizes. Deflate leaf modules are allowed
+// to depend on this foundational module without reaching through it to the allocation layer.
+pub(crate) use crate::allocate::Allocator;
+use crate::allocate::Buffer;
+pub(crate) use crate::config::{DeflateConfig, Method, Strategy};
+use crate::config::{ValidatedDeflateConfig, Wrap};
 use crate::error::ReturnCode;
 use crate::weak_slice::{HashChains, PendingBuf, Window};
 use core::fmt;
+
+// Test-only fixture inputs are re-exported for deflate leaf-module tests so those modules can keep
+// the same dependency boundary as their production code.
+#[cfg(test)]
+pub(crate) use crate::allocate::GlobalAllocator;
+#[cfg(test)]
+pub(crate) use crate::config::{DEF_MEM_LEVEL, MAX_MEM_LEVEL, MAX_WBITS, MIN_MEM_LEVEL};
 
 // Re-exported rather than redeclared, and usable both here and, through this
 // module, from `deflate/**` and `trees/**` -- which is where `deflate.h` and
