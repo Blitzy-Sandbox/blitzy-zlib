@@ -2741,6 +2741,12 @@ mod tests {
     };
     use crate::inflate::fixed_tables::{distfix, lenfix};
     use crate::inflate::inftrees::{Code, ENOUGH};
+    // Aliased so that `the_re_exported_fixed_tables_are_the_generated_ones` can name
+    // the module root's re-export without writing `super::lenfix`, which resolves to
+    // the same item already in scope and so trips `unused_qualifications`. Binding it
+    // here is also what makes that assertion load-bearing: deleting the `pub use` at
+    // the top of this module breaks this import, and therefore the build.
+    use crate::inflate::{distfix as re_exported_distfix, lenfix as re_exported_lenfix};
     use alloc::vec;
     use alloc::vec::Vec;
 
@@ -3107,9 +3113,13 @@ mod tests {
         assert_eq!(distfix[1], Code::new(23, 5, 257));
         assert_eq!(distfix[2], Code::new(19, 5, 17));
         assert_eq!(distfix[3], Code::new(27, 5, 4097));
-        // The re-export names the same constant, not a copy of it.
-        assert_eq!(super::lenfix, lenfix);
-        assert_eq!(super::distfix, distfix);
+        // The re-export names the same constant, not a copy of it. Writing `super::lenfix`
+        // here instead would trip `unused_qualifications`, precisely because rustc resolves
+        // that path and the `fixed_tables` import to one and the same item -- which is the
+        // fact these two lines exist to state. The aliased imports above are what keep the
+        // statement checkable without suppressing the lint.
+        assert_eq!(re_exported_lenfix, lenfix);
+        assert_eq!(re_exported_distfix, distfix);
     }
 
     #[test]
