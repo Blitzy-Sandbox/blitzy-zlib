@@ -193,11 +193,13 @@ fn as_int(offset: usize) -> i32 {
 /// Narrows one of C's `int` match lengths back to a window offset, or [`None`]
 /// when it is negative.
 ///
-/// Used wherever C indexes with `best_len` or `best_len - 1`
-/// (`deflate.c` L1413-L1414, L1482-L1483, L1521-L1522). A negative value cannot
-/// arise — the contract requires `prev_length >= 1` and `best_len` only ever
-/// grows — and [`None`] makes the read that would have used it fail rather than
-/// wrap.
+/// Used wherever C indexes with plain `best_len` (`deflate.c` L1414, L1482,
+/// L1522). A negative value cannot arise, because `best_len` is seeded from the
+/// unsigned `prev_length` and only ever grows; [`None`] would nonetheless make
+/// the read fail rather than wrap.
+///
+/// The `best_len - 1` reads deliberately do **not** go through here — that index
+/// legitimately reaches `-1` and is served by [`byte_below`] instead.
 #[inline]
 fn as_offset(len: i32) -> Option<usize> {
     usize::try_from(len).ok()
@@ -224,6 +226,42 @@ fn as_uint(value: i32) -> u32 {
 #[inline]
 fn byte_at(view: &[u8], offset: usize) -> Option<u8> {
     view.get(offset).copied()
+}
+
+/// The byte C addresses as `p[best_len - 1]`, where `p` is a window pointer
+/// sitting at absolute window index `base`.
+///
+/// ★ This cannot be a view-relative read, because `best_len` reaches **zero**
+/// and the index is then `-1`. The contract comment at `deflate.c` L1386 claims
+/// the IN assertion `prev_length >= 1`, but the shipped build violates it:
+/// `deflate_slow` leaves `prev_length` at exactly `0` after emitting a match —
+/// `s->prev_length -= 2;` followed by `while (--s->prev_length != 0);`
+/// (`deflate.c` L2028-L2033) — and `deflate_fast` never re-seeds `prev_length`
+/// at all. So a `deflateParams()` switch from a lazy level (4-9) to a greedy one
+/// (1-3) enters `longest_match` with `best_len == 0`, and C then reads and
+/// compares the byte one *below* the pointer, i.e. `window[base - 1]`.
+///
+/// That byte is a live participant in decision point #3, so it must be read the
+/// way C reads it. Treating the `-1` index as a failed read instead rejects
+/// **every** candidate on the chain, which costs real compression: the C oracle
+/// emits 96 bytes for a corpus where declining the read emits 1019.
+///
+/// [`None`] is returned only when `base == 0 && best_len == 0`, where C would
+/// read outside its own window allocation. That combination is unreachable —
+/// `cur_match` and `strstart` are both non-zero whenever the chain head is not
+/// `NIL` — so no reachable input reaches the fallback, and returning [`None`]
+/// rather than panicking honours the no-panic requirement.
+#[inline]
+fn byte_below<W>(window: &Window<W>, base: usize, best_len: i32) -> Option<u8>
+where
+    W: AsRef<[u8]> + AsMut<[u8]>,
+{
+    // `base + best_len - 1`, evaluated where the intermediate may legitimately
+    // be negative. `i64` holds every value exactly: `base` is a window offset
+    // below `2 * 32768` and `best_len` is at most `MAX_MATCH`.
+    let base = i64::try_from(base).ok()?;
+    let index = base.checked_add(i64::from(best_len))?.checked_sub(1)?;
+    window.byte(usize::try_from(index).ok()?)
 }
 
 /// Whether two window views agree at the given offsets, i.e. C's
@@ -261,6 +299,14 @@ fn bytes_match(scan: &[u8], scan_offset: usize, mat: &[u8], match_offset: usize)
 /// > `prev_length >= 1`.
 /// >
 /// > OUT assertion: the match length is not greater than `s->lookahead`.
+///
+/// ★ The `prev_length >= 1` half of that IN assertion is **not** honoured by the
+/// shipped build: `deflate_slow` drives `prev_length` to exactly `0`
+/// (`deflate.c` L2028-L2033) and `deflate_fast` never re-seeds it, so a
+/// `deflateParams()` switch from a lazy level to a greedy one calls this
+/// function with `prev_length == 0`. C copes by indexing one byte below its
+/// `scan` and `match` pointers; [`byte_below`] reproduces that, and the
+/// behaviour is required for byte-identical output.
 ///
 /// So `match_start` is a *side effect*, and reading it is only meaningful when
 /// the returned length exceeds `prev_length`. Both callers honour that:
@@ -393,14 +439,23 @@ where
         "need lookahead: strstart must leave MIN_LOOKAHEAD bytes (deflate.c L1431)"
     );
 
-    // Part of the IN assertion at L1386: `prev_length >= 1`. `lm_init` seeds it
-    // with `MIN_MATCH - 1` = 2 (L698), `deflate_slow` only ever assigns a
-    // previous `match_length` to it (L1985), and `deflate_fast` never touches
-    // it — so it is at least 2 in practice. `best_len` only grows from there,
-    // which is what makes the `best_len - 1` index below safe.
+    // ★ The IN assertion at `deflate.c` L1386 claims `prev_length >= 1`, and the
+    // shipped build DOES NOT HONOUR IT. `lm_init` seeds `prev_length` with
+    // `MIN_MATCH - 1` = 2 (L698) and `deflate_slow` assigns a previous
+    // `match_length` to it (L1985), but L2028-L2033 then drives it to exactly
+    // `0` — `s->prev_length -= 2;` followed by
+    // `while (--s->prev_length != 0);` — and `deflate_fast` never re-seeds it.
+    // A `deflateParams()` switch from a lazy level to a greedy one therefore
+    // arrives here with `best_len == 0`, which was confirmed against an
+    // instrumented build of the in-tree C oracle.
+    //
+    // So this must NOT be asserted: C reads `scan[-1]` and `match[-1]` in that
+    // case and compares them, and [`byte_below`] reproduces exactly that. What
+    // does hold unconditionally is that `best_len` is non-negative, since
+    // `prev_length` is unsigned in C and `best_len` only grows.
     debug_assert!(
-        best_len >= 1,
-        "prev_length must be >= 1 (IN assertion, deflate.c L1386)"
+        best_len >= 0,
+        "best_len is seeded from the unsigned prev_length and only grows"
     );
 
     let mut best_start: Option<usize> = None;
@@ -420,7 +475,9 @@ where
         let Some(best_offset) = as_offset(best_len) else {
             break 'search;
         };
-        let mut scan_end1 = byte_at(scan_init, best_offset.wrapping_sub(1)).unwrap_or(0);
+        // `scan[best_len - 1]` goes through `byte_below`, because `best_len` can
+        // be `0` and C then reads `window[strstart - 1]` — see [`byte_below`].
+        let mut scan_end1 = byte_below(window, strstart, best_len).unwrap_or(0);
         let mut scan_end = byte_at(scan_init, best_offset).unwrap_or(0);
 
         // `if (s->prev_length >= s->good_match) { chain_length >>= 2; }`
@@ -502,12 +559,13 @@ where
                 };
 
                 // `match[best_len]`, `match[best_len - 1]`, `*match`, `*++match`
-                // and, on the scan side, `*scan` and `scan[1]`. `best_len >= 1`
-                // (see above), so `wrapping_sub` never actually wraps; if it
-                // ever did, the read fails and the candidate is rejected rather
-                // than reading `match[-1]` as C would.
+                // and, on the scan side, `*scan` and `scan[1]`. The
+                // `best_len - 1` read goes through [`byte_below`] because
+                // `best_len` reaches `0` after a lazy-to-greedy
+                // `deflateParams()` switch, and C then compares
+                // `window[cur_match - 1]`.
                 if byte_at(mat, best_offset) != Some(scan_end)
-                    || byte_at(mat, best_offset.wrapping_sub(1)) != Some(scan_end1)
+                    || byte_below(window, candidate, best_len) != Some(scan_end1)
                     || byte_at(mat, 0) != byte_at(scan, 0)
                     || byte_at(mat, 1) != byte_at(scan, 1)
                 {
@@ -601,7 +659,7 @@ where
                     let Some(new_offset) = as_offset(best_len) else {
                         break 'candidate;
                     };
-                    scan_end1 = byte_at(scan, new_offset.wrapping_sub(1)).unwrap_or(scan_end1);
+                    scan_end1 = byte_below(window, strstart, best_len).unwrap_or(scan_end1);
                     scan_end = byte_at(scan, new_offset).unwrap_or(scan_end);
                 }
             }
