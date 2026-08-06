@@ -716,14 +716,25 @@ impl<'a, A: Allocator<'a>> fmt::Debug for GzEngine<'a, A> {
 /// * `zalloc`, `zfree` and `opaque` are absent because the `gzFile` layer always sets them to
 ///   `Z_NULL` (`gzread.c` L110-L112, `gzwrite.c` L32-L34) and never exposes them; the injected
 ///   [`Allocator`] on [`GzState`] takes their place.
-/// * `total_in` and `total_out` are absent because the layer never reads them. That is not an
-///   assumption: neither name occurs anywhere in `gzlib.c`,
-///   `gzread.c`, `gzwrite.c` or `gzclose.c`. The layer tracks position in `x.pos` instead.
-/// * `adler` and `data_type` are absent for the same reason -- the container checksum is the
-///   engine's business, and the `gzFile` layer never inspects either.
 ///
-/// What remains is the four cursor fields, the engine's message slot and the engine itself. The two
-/// pointer cursors become indices, for the reason this module's documentation gives.
+/// Everything else is reproduced, including the four scalars the layer itself never reads. That is
+/// deliberate and it is not redundancy: neither `total_in`, `total_out`, `adler` nor `data_type`
+/// occurs anywhere in `gzlib.c`, `gzread.c`, `gzwrite.c` or `gzclose.c` -- the layer tracks position
+/// in `x.pos` and leaves the container checksum to the engine -- but **the engines read and write
+/// them**. C does not notice, because `gz_state` embeds the whole `z_stream` and hands `deflate` and
+/// `inflate` its address, so the scalars simply live where the engines expect them. This port
+/// separates the compression state from the caller-visible scalars, so
+/// [`crate::deflate::DeflateStream`] and [`crate::inflate::InflateStream`] take them as in/out
+/// parameters and something has to carry them between calls. That something is this structure, which
+/// is also the most faithful place for them: they are members of the `z_stream` C embeds here.
+///
+/// `adler` is the one that matters. For a gzip stream it is the running CRC-32 that `deflate` folds
+/// each input byte into and then writes verbatim into the member trailer
+/// (`deflate.c` L667-L671 and L1272-L1283), and that `inflate` compares the trailer against. Losing
+/// it between calls would corrupt the trailer of every member that takes more than one call to write.
+///
+/// What remains is the four cursor fields, the four scalars, the engine's message slot and the engine
+/// itself. The two pointer cursors become indices, for the reason this module's documentation gives.
 pub struct GzStream<'a, A: Allocator<'a>> {
     /// Bytes of input still unconsumed: the port of `strm.avail_in`.
     ///
@@ -747,6 +758,25 @@ pub struct GzStream<'a, A: Allocator<'a>> {
     /// an argument in that case, and fact 2 in this module's documentation explains how the exposed
     /// prefix is kept coherent across it.
     pub next_out: usize,
+    /// Total input bytes the engine has consumed: the port of `strm.total_in`.
+    ///
+    /// Carried for the engine's benefit, not the layer's; see the type-level note.
+    pub total_in: u64,
+    /// Total output bytes the engine has produced: the port of `strm.total_out`.
+    ///
+    /// Carried for the engine's benefit, not the layer's; see the type-level note.
+    pub total_out: u64,
+    /// The running check value: the port of `strm.adler`.
+    ///
+    /// The CRC-32 of a gzip member or the Adler-32 of a zlib stream. **Must** survive from one
+    /// engine call to the next, for the reason the type-level note gives.
+    pub adler: u32,
+    /// The engine's data-type report: the port of `strm.data_type`.
+    ///
+    /// `Z_BINARY`, `Z_TEXT` or `Z_UNKNOWN` when compressing (`deflate.c` L1005-L1007); the
+    /// bit-accumulator state when decompressing (`inflate.c` L1147-L1149). Informational either way,
+    /// and carried only because the engines expect to find it.
+    pub data_type: i32,
     /// The engine's last message: the port of `strm.msg`.
     ///
     /// `gz_decomp` forwards it verbatim when inflate reports a data error, falling back to
@@ -762,7 +792,14 @@ impl<'a, A: Allocator<'a>> GzStream<'a, A> {
     ///
     /// `gz_open` does not touch `strm` beyond what `gz_reset` does, and `gz_reset` sets only
     /// `state->strm.avail_in = 0` (`gzlib.c` L83). The remaining members are established by
-    /// `gz_look` or `gz_init` when the buffers are allocated, so they start at zero here.
+    /// `gz_look` or `gz_init` when the buffers are allocated, so they start at zero here -- which is
+    /// also what a `z_stream` allocated as part of a `calloc`ed `gz_state` carries.
+    ///
+    /// Note that `adler` starting at zero is the correct seed for a **gzip** stream, which is the
+    /// only container this layer ever asks for (`gzwrite.c` L37, `gzread.c` L115): `crc32(0, Z_NULL,
+    /// 0)` is zero, whereas `adler32(0, Z_NULL, 0)` is one. Both engine initialisers report the right
+    /// seed as part of their reset, and their callers apply it, so nothing depends on the choice
+    /// here.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -770,6 +807,10 @@ impl<'a, A: Allocator<'a>> GzStream<'a, A> {
             next_in: 0,
             avail_out: 0,
             next_out: 0,
+            total_in: 0,
+            total_out: 0,
+            adler: 0,
+            data_type: 0,
             msg: None,
             engine: GzEngine::None,
         }
@@ -794,6 +835,10 @@ impl<'a, A: Allocator<'a>> fmt::Debug for GzStream<'a, A> {
             .field("next_in", &self.next_in)
             .field("avail_out", &self.avail_out)
             .field("next_out", &self.next_out)
+            .field("total_in", &self.total_in)
+            .field("total_out", &self.total_out)
+            .field("adler", &self.adler)
+            .field("data_type", &self.data_type)
             .field("msg", &self.msg)
             .field("engine", &self.engine)
             .finish()
