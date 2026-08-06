@@ -64,7 +64,7 @@
 //!
 //! # Two entry points, one algorithm
 //!
-//! [`adler32`] and [`adler32_z`] both exist, and [`adler32`] delegates. That mirrors the
+//! [`adler32()`] and [`adler32_z`] both exist, and [`adler32()`] delegates. That mirrors the
 //! reference sources exactly, where `adler32` (`adler32.c` L128-L130) is a one-line
 //! forwarder to `adler32_z` (`adler32.c` L61-L125) and the two differ only in the declared
 //! width of the length argument: `uInt` for one, `z_size_t` for the other

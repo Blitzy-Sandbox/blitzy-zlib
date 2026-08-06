@@ -591,6 +591,12 @@ pub(crate) fn fill_window<'a, A: Allocator<'a>>(
     clippy::too_many_lines
 )]
 mod tests {
+    // Imported rather than named as `alloc::vec::Vec` at each use site. The qualification is
+    // *required* in the default `no_std` build, where `Vec` is not in the prelude, but is
+    // redundant once the `std` feature is on -- and `unused_qualifications`, which the workspace
+    // promotes to `warn`, fires on exactly that configuration. One import satisfies both.
+    use alloc::vec::Vec;
+
     use super::{fill_window, insert_string_no_head, seed_hash, slide_hash};
     use crate::deflate::hash_chain::clear_hash;
     use crate::deflate::state::{
@@ -661,7 +667,7 @@ mod tests {
 
     /// Writes [`pattern`] over `window[0..len]`.
     fn plant<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>, len: usize) {
-        let bytes: alloc::vec::Vec<u8> = (0..len).map(pattern).collect();
+        let bytes: Vec<u8> = (0..len).map(pattern).collect();
         assert!(state.window.write_at(0, &bytes));
     }
 
@@ -682,7 +688,7 @@ mod tests {
         state: &DeflateState<'a, A>,
         start: usize,
         len: usize,
-    ) -> alloc::vec::Vec<u8> {
+    ) -> Vec<u8> {
         state.window.region(start, len).unwrap().to_vec()
     }
 
@@ -912,8 +918,8 @@ mod tests {
         block_start: isize,
         insert: usize,
         slid: bool,
-        first_bytes: alloc::vec::Vec<u8>,
-        expected_moved: alloc::vec::Vec<u8>,
+        first_bytes: Vec<u8>,
+        expected_moved: Vec<u8>,
     }
 
     fn run_slide(strstart: usize, insert: usize, block_start: isize) -> Slide {
@@ -1036,7 +1042,7 @@ mod tests {
         assert_eq!(slid.strstart, MAX_DIST, "the comment at deflate.c L289");
 
         let mut state = fixture();
-        let long_input: alloc::vec::Vec<u8> = (0..WINDOW_SIZE).map(pattern).collect();
+        let long_input: Vec<u8> = (0..WINDOW_SIZE).map(pattern).collect();
         fill(&mut state, &long_input);
         assert!(state.window.strstart <= bound);
         assert!(state.window.lookahead >= MIN_LOOKAHEAD);
@@ -1369,7 +1375,7 @@ mod tests {
         let more = WINDOW_SIZE - SLIDE_AT;
         let surviving = window_bytes(&state, W_SIZE, W_SIZE - more);
 
-        let fresh: alloc::vec::Vec<u8> = (0..400).map(|i| pattern(i + 7777)).collect();
+        let fresh: Vec<u8> = (0..400).map(|i| pattern(i + 7777)).collect();
         fill(&mut state, &fresh);
 
         // The slide fired ...

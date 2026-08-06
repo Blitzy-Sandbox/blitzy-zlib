@@ -1790,6 +1790,15 @@ impl BlockChoice {
 
     /// Which pair of trees the body of this block is coded with, or [`None`] for
     /// a stored block, whose body is not coded at all.
+    // Exercised by this module's test suite but not called from a library path,
+    // deliberately: `_tr_flush_block` in `trees/mod.rs` matches on the choice
+    // itself so that its three arms stay line-for-line with `trees.c`
+    // L1056-L1070, and folding the dispatch through this accessor would obscure
+    // exactly the correspondence the byte-identity requirement is verified
+    // against. Narrowly scoped rather than restructuring the emission code, and
+    // `#[allow]` rather than `#[expect]` because the latter needs rustc 1.81 and
+    // the MSRV is 1.80.
+    #[allow(dead_code)]
     #[must_use]
     pub(crate) const fn trees(self) -> Option<BlockTrees> {
         match self {
@@ -1931,6 +1940,12 @@ pub(crate) fn select_block_type(
 // reason, appears in `trees/bit_writer.rs`, `deflate/pending.rs` and `deflate/state.rs`.
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
+    // Imported rather than named as `alloc::vec::Vec` at each use site. The qualification is
+    // *required* in the default `no_std` build, where `Vec` is not in the prelude, but is
+    // redundant once the `std` feature is on -- and `unused_qualifications`, which the workspace
+    // promotes to `warn`, fires on exactly that configuration. One import satisfies both.
+    use alloc::vec::Vec;
+
     use super::{
         build_bl_tree, build_tree, compress_block, d_code, detect_data_type, gen_codes, init_block,
         pqdownheap, scan_tree, select_block_type, send_all_trees, send_tree, smaller, BlockChoice,
@@ -1996,7 +2011,7 @@ mod tests {
         state: &DeflateState<'static, GlobalAllocator>,
         kind: StaticTreeKind,
         max_code: i32,
-    ) -> alloc::vec::Vec<u16> {
+    ) -> Vec<u16> {
         (0..=max_code)
             .map(|node| state.tree_for(kind)[usize::try_from(node).unwrap()].len())
             .collect()
@@ -2007,7 +2022,7 @@ mod tests {
         state: &DeflateState<'static, GlobalAllocator>,
         kind: StaticTreeKind,
         max_code: i32,
-    ) -> alloc::vec::Vec<u16> {
+    ) -> Vec<u16> {
         (0..=max_code)
             .map(|node| state.tree_for(kind)[usize::try_from(node).unwrap()].code())
             .collect()
@@ -2017,8 +2032,8 @@ mod tests {
     ///
     /// Written out rather than tabulated so that the wrap of the 25th term -- 75025 does not fit in
     /// a `ush` -- happens here for the same reason it happens in the C oracle.
-    fn fibonacci_freqs(count: usize) -> alloc::vec::Vec<u16> {
-        let mut out = alloc::vec::Vec::with_capacity(count);
+    fn fibonacci_freqs(count: usize) -> Vec<u16> {
+        let mut out = Vec::with_capacity(count);
         let (mut a, mut b) = (1u16, 1u16);
         for _ in 0..count {
             out.push(a);
@@ -2253,7 +2268,7 @@ mod tests {
 
         // Prefix-freeness, checked independently of the construction: no code is a prefix of
         // another once each is read most-significant bit first.
-        let entries: alloc::vec::Vec<(u16, u16)> = (0..4)
+        let entries: Vec<(u16, u16)> = (0..4)
             .map(|node| {
                 let entry = state.dyn_dtree[node];
                 (bi_reverse(entry.code(), entry.len()), entry.len())
@@ -2553,7 +2568,7 @@ mod tests {
 
         scan_tree(&mut state, StaticTreeKind::Literal, max_code);
 
-        let freqs: alloc::vec::Vec<u16> = (0..BL_CODES)
+        let freqs: Vec<u16> = (0..BL_CODES)
             .map(|node| state.bl_tree[node].freq())
             .collect();
         assert_eq!(

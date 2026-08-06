@@ -2991,6 +2991,18 @@ mod tests {
         assert_eq!(deflate_end(state), ReturnCode::OK);
     }
 
+    // 3 window forms x 10 levels x 4 payloads, one of them 4 KiB, is 120 whole compressions.
+    // Miri interprets rather than executes, at roughly four orders of magnitude the cost, so this
+    // one test would dominate a Miri job several times over -- and it can contribute nothing to it:
+    // the crate carries `#![forbid(unsafe_code)]`, so the only faults Miri can surface here are
+    // integer overflow and an out-of-bounds index, and the compressors are walked end to end by
+    // the cheaper tests in this module which do run in full. Skipped under Miri only, following the
+    // convention `adler32/combine.rs` documents for its whole-corpus tests; nothing is skipped
+    // under a normal `cargo test`.
+    #[cfg_attr(
+        miri,
+        ignore = "120 whole compressions; bound agreement, no UB coverage"
+    )]
     #[test]
     fn a_one_call_finish_always_fits_inside_the_bound() {
         // The contract at `zlib.h` L338-L343: a single `Z_FINISH` call succeeds when the
@@ -3025,8 +3037,21 @@ mod tests {
     //  Round trips through crate::inflate
     // =====================================================================
 
+    #[cfg_attr(
+        miri,
+        ignore = "900 whole round trips; behavioural agreement, no UB coverage"
+    )]
     #[test]
     fn every_level_and_container_round_trips() {
+        // 6 window forms x 10 levels x 5 strategies x 3 memory levels over a 4 KiB payload is 900
+        // whole round trips. Under Miri -- which interprets rather than executes, at roughly four
+        // orders of magnitude the cost -- that is hours for a test that can surface nothing Miri
+        // looks for: the crate carries `#![forbid(unsafe_code)]`, so only integer overflow and an
+        // out-of-bounds index are reachable, and both are debug-profile panics that this same test
+        // catches under a normal `cargo test`. The compressors are still walked end to end under
+        // Miri by the cheaper cases in this module. Skipped under Miri only, following the
+        // convention `adler32/combine.rs` documents; nothing is skipped otherwise.
+        //
         // A payload with runs, text and a long-distance repeat, so that every strategy
         // function has something to find.
         let mut payload = Vec::new();

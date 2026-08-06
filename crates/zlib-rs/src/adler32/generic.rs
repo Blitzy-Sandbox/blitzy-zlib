@@ -676,6 +676,17 @@ mod tests {
         assert_eq!(Adler32Generic::checksum(1, b"Wikipedia"), 0x11e6_0398);
     }
 
+    // Miri interprets rather than executes, at roughly four orders of magnitude the cost, and
+    // this module has no `unsafe`, no raw pointer and no uninitialised memory for it to inspect:
+    // the only faults it can surface here are integer overflow and an out-of-bounds index, and
+    // both are reached by the cheap tests above, which run in full. Folding a 100 000-byte corpus
+    // ten different ways adds numeric confidence and no undefined-behaviour coverage, so it is
+    // skipped under Miri only -- exactly the trade `adler32/combine.rs` documents for its own
+    // whole-corpus tests. Nothing is skipped under a normal `cargo test`.
+    #[cfg_attr(
+        miri,
+        ignore = "folds a 100 000-byte corpus; numeric agreement, no UB coverage"
+    )]
     #[test]
     fn reduction_boundary_sweep() {
         let corpus = pattern_corpus(CORPUS_LEN);
@@ -685,6 +696,17 @@ mod tests {
         }
     }
 
+    // Miri interprets rather than executes, at roughly four orders of magnitude the cost, and
+    // this module has no `unsafe`, no raw pointer and no uninitialised memory for it to inspect:
+    // the only faults it can surface here are integer overflow and an out-of-bounds index, and
+    // both are reached by the cheap tests above, which run in full. Folding a 100 000-byte corpus
+    // ten different ways adds numeric confidence and no undefined-behaviour coverage, so it is
+    // skipped under Miri only -- exactly the trade `adler32/combine.rs` documents for its own
+    // whole-corpus tests. Nothing is skipped under a normal `cargo test`.
+    #[cfg_attr(
+        miri,
+        ignore = "folds a 100 000-byte corpus; numeric agreement, no UB coverage"
+    )]
     #[test]
     fn worst_case_accumulator_stress() {
         // Every byte 0xff maximises both accumulators. Two whole blocks, then a length
@@ -713,6 +735,17 @@ mod tests {
         );
     }
 
+    // Miri interprets rather than executes, at roughly four orders of magnitude the cost, and
+    // this module has no `unsafe`, no raw pointer and no uninitialised memory for it to inspect:
+    // the only faults it can surface here are integer overflow and an out-of-bounds index, and
+    // both are reached by the cheap tests above, which run in full. Folding a 100 000-byte corpus
+    // ten different ways adds numeric confidence and no undefined-behaviour coverage, so it is
+    // skipped under Miri only -- exactly the trade `adler32/combine.rs` documents for its own
+    // whole-corpus tests. Nothing is skipped under a normal `cargo test`.
+    #[cfg_attr(
+        miri,
+        ignore = "folds a 100 000-byte corpus; numeric agreement, no UB coverage"
+    )]
     #[test]
     fn chunked_feeding_matches_single_shot() {
         // `deflate` and `inflate` both accumulate the checksum incrementally, over
@@ -775,6 +808,17 @@ mod tests {
         }
     }
 
+    // Miri interprets rather than executes, at roughly four orders of magnitude the cost, and
+    // this module has no `unsafe`, no raw pointer and no uninitialised memory for it to inspect:
+    // the only faults it can surface here are integer overflow and an out-of-bounds index, and
+    // both are reached by the cheap tests above, which run in full. Folding a 100 000-byte corpus
+    // ten different ways adds numeric confidence and no undefined-behaviour coverage, so it is
+    // skipped under Miri only -- exactly the trade `adler32/combine.rs` documents for its own
+    // whole-corpus tests. Nothing is skipped under a normal `cargo test`.
+    #[cfg_attr(
+        miri,
+        ignore = "folds a 100 000-byte corpus; numeric agreement, no UB coverage"
+    )]
     #[test]
     fn matches_an_independent_rfc1950_model() {
         let corpus = pattern_corpus(CORPUS_LEN);

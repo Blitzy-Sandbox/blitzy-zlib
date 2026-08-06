@@ -40,7 +40,7 @@
 //!   window -- `read_buf` at `deflate.c` L219-L240, reached at L233 only when `wrap == 2`, whose
 //!   counterpart in this crate is `read_buf.rs` -- and writes the finished value into the gzip
 //!   trailer. That call site is the one that decides whether this port's gzip output is
-//!   byte-identical to the reference implementation's, which is why [`crc32`] carries exactly
+//!   byte-identical to the reference implementation's, which is why [`crc32()`] carries exactly
 //!   that name and that signature.
 //! * `inflate` recomputes it over the bytes it produces and compares the result against the
 //!   trailer it read. The reference sources reach the check value through the `UPDATE_CHECK`
@@ -50,7 +50,7 @@
 //!   for all bytes of the gzip header up to and not including the CRC16"
 //!   (`doc/rfc1952.txt` L325-L328). Both sides compute it over header bytes rather than over
 //!   payload: `deflate.c` L976 and L1111 run [`crc32_z`] across the pending buffer, and
-//!   `inflate.c` L314, L323 and L623-L667 run [`crc32`] across each header field as it is
+//!   `inflate.c` L314, L323 and L623-L667 run [`crc32()`] across each header field as it is
 //!   parsed.
 //! * The `gz*` file layer computes it for every member it writes and verifies it for every
 //!   member it reads, which is what makes a truncated or corrupted `.gz` file detectable.
@@ -85,7 +85,7 @@
 //!
 //! **This file is the only place in the subsystem where a complement is applied, and it applies
 //! each of them exactly once.** Every function in `generic`, `braid` and `simd` takes and returns
-//! an already pre-conditioned state and complements nothing, so [`crc32`] is precisely
+//! an already pre-conditioned state and complements nothing, so [`crc32()`] is precisely
 //! `crc32.c` L635 and L940 wrapped around a backend call:
 //!
 //! ```text
@@ -117,7 +117,7 @@
 //!
 //! # Three entry points, one algorithm
 //!
-//! [`crc32`], [`crc32_z`] and [`get_crc_table`] are the three functions `zlib.h` declares for
+//! [`crc32()`], [`crc32_z`] and [`get_crc_table`] are the three functions `zlib.h` declares for
 //! this family, and the first two are the same function. That mirrors the reference sources,
 //! where `crc32` (`crc32.c` L946-L951) is a one-line forwarder to `crc32_z`
 //! (`crc32.c` L626-L941) and the two differ only in the declared width of the length argument:
@@ -139,7 +139,7 @@
 //!
 //! # Backend selection is a throughput decision only
 //!
-//! [`crc32`] folds its input through one backend, chosen at build time by the crate's `simd`
+//! [`crc32()`] folds its input through one backend, chosen at build time by the crate's `simd`
 //! feature: `Simd` when it is on, [`Braid`] when it is off. Both are required to return the
 //! *identical* value for every input and every starting value, so the choice can never be
 //! observed in the output -- only in the time taken. [`Generic`] stays reachable as well, so that
