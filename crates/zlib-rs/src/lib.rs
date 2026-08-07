@@ -233,8 +233,10 @@
 //! strategy × flush matrix in Rust is what an idiomatic surface is for.
 //!
 //! One consequence to keep in mind when reading the examples below: `cargo test` runs doctests
-//! with default features, so every example in this documentation imports by module path. Add
-//! `--features rust-api` and the flattened names become available as well.
+//! with default features, so every example in this crate imports by module path -- the examples
+//! here and the ones in every module's own `//!` block alike, because `cargo test -p zlib-rs`
+//! compiles and runs all of them with `rust-api` off. Add `--features rust-api` and the flattened
+//! names become available as well.
 //!
 //! # Minimum supported Rust version, and version identity
 //!
@@ -489,9 +491,12 @@ pub mod gz;
 //  Adding a name here therefore has two obligations: it must already be public at
 //  its module path, and it must carry the `#[cfg(feature = "rust-api")]` line.  An
 //  ungated entry would put the item on the default surface and quietly dissolve
-//  the split again.  Doctests in this file's own documentation use MODULE PATHS for
-//  the same reason -- `cargo test` runs them with default features, where the
-//  flattened names do not exist.
+//  the split again.  Doctests ANYWHERE IN THIS CRATE -- this file's own
+//  documentation and every module's `//!` block alike -- use MODULE PATHS for the
+//  same reason: `cargo test -p zlib-rs` runs every one of them with default
+//  features, where the flattened names do not exist, so an example that imports
+//  `zlib_rs::ReturnCode` rather than `zlib_rs::error::ReturnCode` fails to compile
+//  and takes the whole test run down with it.
 //
 //  Two further rules keep the barrel honest.
 //

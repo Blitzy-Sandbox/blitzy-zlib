@@ -49,6 +49,22 @@
 //!   automatically" (`inflate.c` L152, `zlib.h` L890-L892). For deflate no such
 //!   mode exists.
 //!
+//! The first of those bullets has a caller-visible consequence it does not state
+//! on its own, and `zlib.h` L562-L568 is the reference's own warning about it: a
+//! `windowBits = 8` request reaches a live encoder as `9`, so the zlib header that
+//! encoder writes advertises `CINFO = 1`, a 512-byte window. A decoder initialised
+//! with `windowBits = 8` reads that back as `len = CINFO + 8 = 9`, finds
+//! `len > wbits`, and refuses to grow its window to fit the stream --
+//! [`ReturnCode::DATA_ERROR`] with the message "invalid window size" (`inflate.c`
+//! L539-L546). **Pairing `8` with `8` across a round trip therefore cannot work**,
+//! and the remedy `zlib.h` gives is to decode with `9`, or with `0` and let the
+//! header supply the size. Nothing here hides that: the promotion is silent in the
+//! reference and is silent in the port, deliberately, because reporting it would be
+//! an observable difference in `deflateInit2_`'s return value. The behaviour is the
+//! reference's contract rather than a defect, and the refusal that closes the loop
+//! is [`ValidatedInflateConfig::resolve_zlib_header_window_bits`], whose tests
+//! assert exactly this pairing.
+//!
 //! # What must not change, and why
 //!
 //! Every bound here is *observable*: a configuration the C library accepts must
@@ -117,7 +133,8 @@
 //!
 //! ```
 //! use zlib_rs::config::{decode_deflate_window_bits, decode_inflate_window_bits};
-//! use zlib_rs::{DeflateConfig, InflateWrap, Wrap, DEF_MEM_LEVEL, MAX_WBITS, Z_DEFAULT_COMPRESSION};
+//! use zlib_rs::config::{DeflateConfig, InflateWrap, Wrap};
+//! use zlib_rs::config::{DEF_MEM_LEVEL, MAX_WBITS, Z_DEFAULT_COMPRESSION};
 //!
 //! // The defaults `deflateInit` and `inflateInit` supply.
 //! let deflate = DeflateConfig::default();

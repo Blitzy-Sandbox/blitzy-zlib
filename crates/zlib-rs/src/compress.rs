@@ -140,7 +140,7 @@
 //!
 //! ```
 //! use zlib_rs::compress::{compress2_z, compress_bound_z};
-//! use zlib_rs::ReturnCode;
+//! use zlib_rs::error::ReturnCode;
 //!
 //! let plain = b"hello, hello!";
 //!

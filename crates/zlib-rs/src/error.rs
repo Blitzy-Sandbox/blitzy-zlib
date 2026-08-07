@@ -63,7 +63,7 @@
 //! # Examples
 //!
 //! ```
-//! use zlib_rs::{err_msg, ReturnCode};
+//! use zlib_rs::error::{err_msg, ReturnCode};
 //!
 //! // Status codes convert losslessly to and from the C `int` representation.
 //! let code = ReturnCode::BUF_ERROR;
