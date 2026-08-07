@@ -80,8 +80,8 @@
 //!
 //! ```
 //! use zlib_rs::compress::compress2_z;
-//! use zlib_rs::uncompress::uncompress2_z;
 //! use zlib_rs::error::ReturnCode;
+//! use zlib_rs::uncompress::uncompress2_z;
 //!
 //! // A zlib stream for `b"hello, hello!"`, followed by four unrelated bytes.
 //! let mut buffer = [0_u8; 64];

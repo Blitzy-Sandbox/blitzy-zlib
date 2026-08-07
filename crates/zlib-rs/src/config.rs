@@ -132,9 +132,10 @@
 //! # Examples
 //!
 //! ```
-//! use zlib_rs::config::{decode_deflate_window_bits, decode_inflate_window_bits};
-//! use zlib_rs::config::{DeflateConfig, InflateWrap, Wrap};
-//! use zlib_rs::config::{DEF_MEM_LEVEL, MAX_WBITS, Z_DEFAULT_COMPRESSION};
+//! use zlib_rs::config::{
+//!     decode_deflate_window_bits, decode_inflate_window_bits, DeflateConfig, InflateWrap, Wrap,
+//!     DEF_MEM_LEVEL, MAX_WBITS, Z_DEFAULT_COMPRESSION,
+//! };
 //!
 //! // The defaults `deflateInit` and `inflateInit` supply.
 //! let deflate = DeflateConfig::default();

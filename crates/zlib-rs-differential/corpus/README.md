@@ -122,6 +122,65 @@ SUB or ESC would otherwise return early from the block-list loop and leave the t
 unreachable. Widening the mask changes emitted `data_type` values and makes that fixture dead
 weight.
 
+## Provenance of the two `test/example.c` literals
+
+Both lengths are off-by-one traps, so they are pinned here precisely.
+
+### `minimal/hello.bin` — exactly 14 bytes
+
+Declared at [`test/example.c`](../../../test/example.c) L35:
+
+```c
+static z_const char hello[] = "hello, hello!";
+```
+
+- **Content:** the 13 characters `hello, hello!` followed by one NUL terminator.
+- **Length: 14 bytes, not 13.** Every site in the C suite that compresses this payload
+  passes `strlen(hello)+1` as the length — L69, L95, L175, L341 and L434 — so the trailing
+  NUL is part of the data being compressed, not merely part of the C string. `hello.bin`
+  must therefore be 14 bytes and must end in `0x00`.
+
+The original authors recorded why the payload repeats itself, in the comment at L36-38: a
+repeated `hello` "stresses the compression code better" than the more conventional
+non-repeating phrase would. That is the point of the fixture — 14 bytes containing a repeat
+is enough to produce a real length/distance pair rather than literals alone.
+
+### `minimal/dictionary.bin` — exactly 6 bytes
+
+Declared at [`test/example.c`](../../../test/example.c) L40:
+
+```c
+static const char dictionary[] = "hello";
+```
+
+- **Content:** the 5 characters `hello` followed by one NUL terminator.
+- **Length: 6 bytes, not 5.** Both dictionary calls in the C suite pass
+  `(int)sizeof(dictionary)`, which for a 6-element `char` array is 6 — at L426 for
+  `deflateSetDictionary` and at L477 for `inflateSetDictionary`. `dictionary.bin` must
+  therefore be 6 bytes and must end in `0x00`.
+
+**This is the single most likely error in this folder.** It matters because the dictionary
+identifier a decompressor is asked to match is the Adler-32 checksum of the dictionary
+bytes, and the two candidate lengths produce different checksums:
+
+| Dictionary bytes | Length | Adler-32 | Correct? |
+| --- | --- | --- | --- |
+| `hello\0` | 6 | `0x08410215` | **Yes** — this is the contract |
+| `hello` | 5 | `0x062c0215` | No — an off-by-one |
+
+`0x08410215` is therefore a self-check constant for this fixture. The C suite captures it at
+L429 into the `dictId` variable declared at L41 (`static uLong dictId;`, commented there as
+the Adler-32 value of the dictionary) and asserts it at L472 when `inflate` reports that a
+dictionary is needed. Reproduce it with:
+
+```sh
+python3 -c "import zlib; print('0x%08x' % zlib.adler32(open('minimal/dictionary.bin','rb').read()))"
+# expected: 0x08410215
+```
+
+Note that Python's `hex()` would print this as `0x8410215`, dropping the leading zero; the
+value is the same 32-bit quantity. Format with `%08x` to compare against the constant above.
+
 ## Licensing
 
 The fixtures in `minimal/` are all covered by this project's own licence — see
@@ -358,6 +417,30 @@ unpacked tree must contain nothing but regular files and directories, checked
 before anything is installed. A legitimate Silesia archive passes both; anything
 else is refused with the offending member named, and the destination is never
 created.
+
+### What is checked before anything is installed
+
+Everything the script consumes is either upstream-controlled or environment-controlled, so
+each of the following is a check on input it does not trust. All four are unconditional —
+there is no flag, and no environment variable, that waives any of them.
+
+- **The URL.** `ZLIB_RS_SILESIA_URL` must begin with `https://`, `http://` or `file://`, and
+  it is passed to `curl`/`wget` after a `--` operand terminator, so a value beginning with
+  `-` can never be read as a downloader option. (`file://` works with `curl` only; `wget`
+  rejects that scheme, and the script says so before it creates anything.)
+- **The bytes.** The download is verified against an expected SHA-256 before anything else
+  reads it, and a mismatch is fatal. Upstream publishes no digest, so the in-script constant
+  ships at the `UNPINNED` sentinel and the digest is a mandatory input you supply, with
+  `--sha256` or `ZLIB_RS_SILESIA_SHA256`; a fetch that supplies neither refuses to run — see
+  the CHECKSUM POLICY block at the top of the script.
+- **The member paths.** The archive is listed and inspected *before* extraction; an absolute
+  path, a `..` component, a symbolic link or a hard link causes it to be refused outright. A
+  digest proves *which* archive arrived, not that its member paths are safe to write. Both
+  supported extractors also sanitise such paths by default, but they do so *silently* and
+  still exit zero, so that default is treated as a second layer rather than as the check.
+- **The install.** Extraction goes into a staging directory beside the destination, and the
+  destination only ever comes into existence as a completed rename, so a run that fails at
+  any point installs nothing and leaves an existing corpus as it was.
 
 ### Manual invocation
 

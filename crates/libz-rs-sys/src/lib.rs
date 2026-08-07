@@ -25,9 +25,28 @@
 //! | `staticlib` | `libz.a` | `infcover` links it, and the shared object is *relinked* from it whenever `zlib.map` has to be applied |
 //! | `rlib` | — | lets `zlib-rs-differential`, the `fuzz/` targets and this crate's own `tests/` depend on it as an ordinary Rust library |
 //!
-//! Note the asymmetry: the *linker* artifact is `libz`, but the *Rust* import
-//! path is `libz_rs_sys`. Cargo maps the package name's hyphens to
-//! underscores, and `[lib] name` governs only the emitted file name.
+//! ★ Note the asymmetry, and note it precisely, because it is easy to get
+//! backwards. `[lib] name = "z"` renames the **library target**, and a library
+//! target's name is also its extern crate name — it does not merely set the
+//! emitted file name. So the *package* is `libz-rs-sys`, which is what a
+//! `Cargo.toml` dependency line and `cargo build -p` name, but the *extern
+//! crate* is `z`, which is what Rust code writes:
+//!
+//! ```text
+//! # Cargo.toml of a consumer
+//! libz-rs-sys = { path = "../libz-rs-sys" }
+//! ```
+//!
+//! ```text
+//! // Rust source of that consumer -- `z`, never `libz_rs_sys`
+//! use z::types::z_stream;
+//! ```
+//!
+//! This applies to every consumer without exception: the integration tests under
+//! `tests/`, the doctests in this crate, `zlib-rs-differential`, the `fuzz/`
+//! targets and `benches/`. Verified rather than assumed — `use libz_rs_sys::…`
+//! fails to compile with "unresolved module or unlinked crate `libz_rs_sys`",
+//! and `cargo test --doc` reports the suite as "Doc-tests z".
 //!
 //! The relink is not an implementation detail that can be optimised away. A
 //! version script cannot be attached to a rustc-built `cdylib`: rustc already
@@ -186,9 +205,15 @@
 //!   panic into an abort, or into the caller's documented failure value, and the
 //!   [`panic_guard::fallback`] constants that keep those values tied to what
 //!   `zlib.h` documents.
+//! * [`types`] — the `#[repr(C)]` ABI mirror layer: `z_stream`, `gz_header`,
+//!   `gzFile_s`, `code`, the `zconf.h` primitive aliases, the four nullable hook
+//!   types, the [`types::StreamAllocator`] that calls a caller's `zalloc` and
+//!   `zfree`, and the shared entry-point helpers that each hold one of the
+//!   unsafe categories above. Every other module depends on it.
 
 #![allow(non_camel_case_types)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
 pub mod panic_guard;
+pub mod types;

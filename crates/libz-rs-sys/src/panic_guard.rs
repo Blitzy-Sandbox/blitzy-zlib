@@ -503,7 +503,7 @@ pub mod fallback {
     /// [`CRC32_COMBINE_INVALID`].** `adler32_combine_` opens with
     ///
     /// ```c
-    /// /* for negative len, return invalid adler32 as a clue for debugging */
+    /// // for negative len, return invalid adler32 as a clue for debugging
     /// if (len2 < 0)
     ///     return 0xffffffffUL;
     /// ```
