@@ -1,5 +1,5 @@
 //! Huffman tree construction, tree transmission and block-body emission --
-//! the port of the algorithmic half of `trees.c`.
+//! the Rust counterpart of the algorithmic half of `trees.c`.
 //!
 //! An unqualified line reference in this file is a line of `trees.c`.
 //!
@@ -9,7 +9,7 @@
 //! |---|---|---|
 //! | `init_block` | 440-451 | [`init_block`] |
 //! | `gen_codes` | 203-232 | [`gen_codes`] |
-//! | `smaller` (macro) | 499-501 | [`smaller`] |
+//! | `smaller` (macro) | 499-501 | [`HeapView::smaller`] |
 //! | `pqremove` (macro) | 488-493 | [`pqremove`] |
 //! | `pqdownheap` | 509-528 | [`pqdownheap`] |
 //! | `gen_bitlen` | 540-613 | [`gen_bitlen`] |
@@ -34,7 +34,7 @@
 //! RFC 1951 constrains the *format* of a deflate stream, not the *choices* an
 //! encoder makes within it. Which of several equally short codes a symbol gets,
 //! how an equal-frequency tie is broken, and which of the three block types is
-//! cheapest are all left open by the specification, and this port must make the
+//! cheapest are all left open by the specification, and this implementation must make the
 //! same choices as the reference for the same input, byte for byte. A tidier or
 //! measurably better Huffman coder would still be wrong here. Every loop below
 //! therefore keeps the reference's shape, including the two `do`-`while` loops,
@@ -43,7 +43,7 @@
 //!
 //! Three of the encoder's decisions are made in this file and nowhere else:
 //!
-//! * **The `smaller` tie-break** ([`smaller`], L499-L501) compares depth with
+//! * **The `smaller` tie-break** ([`HeapView::smaller`], L499-L501) compares depth with
 //!   `<=`, not `<`. Reverse that and equal-frequency symbols swap places in the
 //!   heap, the code lengths change, and every emitted block changes with them.
 //! * **The forced-two-codes repair** ([`build_tree`], L655-L661) invents up to
@@ -71,24 +71,18 @@
 //! when it does. L607 wraps the other way, adding a difference that is negative
 //! whenever a code is being shortened.
 //!
-//! Measured on the reference implementation, for the literal tree of an empty
-//! block:
-//!
-//! ```text
-//! after the forced-two-codes repair: opt_len 18446744073709551615
-//!                                    static_len 18446744073709551608
-//! after gen_bitlen:                  opt_len 1  static_len 7
-//! ```
-//!
-//! -- that is, `u64::MAX` and `u64::MAX - 7`, cancelling to 1 and 7, which
-//! `select_block_type` then turns into `opt_lenb` 1 and `static_lenb` 2.
+//! For the literal tree of an empty block the repair leaves `opt_len` at the maximum
+//! value of its type and `static_len` at that maximum minus 7; `gen_bitlen` then adds
+//! back exactly enough to bring them to 1 and 7, which `select_block_type` turns into
+//! an `opt_lenb` of 1 and a `static_lenb` of 2. The intermediate values are whatever
+//! the field's width makes them, which is precisely why nothing may depend on them.
 //!
 //! Every arithmetic operation on these two fields therefore uses
 //! `wrapping_add`, `wrapping_sub` or `wrapping_mul`. A plain `-=` would abort a
 //! debug build, and both `cargo test` and Miri are debug builds -- so this is
-//! not a theoretical concern but the difference between a working port and one
+//! not a theoretical concern but the difference between a working implementation and one
 //! that cannot be tested at all. Because the wrap cancels, the final value does
-//! not depend on whether C's `ulg` is 32 or 64 bits wide, which is why the port
+//! not depend on whether C's `ulg` is 32 or 64 bits wide, which is why the implementation
 //! is correct on both LP64 and LLP64 targets.
 //!
 //! This path is not exotic. `init_block` always sets
@@ -135,20 +129,12 @@ use crate::trees::static_tables::{
 };
 use crate::trees::tree_desc::StaticTreeDesc;
 
-// -----------------------------------------------------------------------------
-//  Constants local to this translation unit
-// -----------------------------------------------------------------------------
-
 /// Index within the heap array of the least frequent node.
 ///
-/// Port of `#define SMALLEST 1` (L480-L481). `heap[0]` is never used, so the
+/// Mirrors `#define SMALLEST 1` (L480-L481). `heap[0]` is never used, so the
 /// heap's children relation is the textbook `2k` and `2k + 1` without an offset.
 const SMALLEST: i32 = 1;
 
-// -----------------------------------------------------------------------------
-//  Integer conversions
-// -----------------------------------------------------------------------------
-//
 // C moves freely between `int` node numbers, `ush` tree fields and array
 // indices. Each direction is written once here as a checked conversion with an
 // unreachable fallback, so that no conversion in the body of an algorithm needs
@@ -196,10 +182,6 @@ fn as_ush<T: TryInto<u16>>(value: T) -> u16 {
 fn as_ulg<T: TryInto<u64>>(value: T) -> u64 {
     value.try_into().unwrap_or(0)
 }
-
-// -----------------------------------------------------------------------------
-//  Tree, heap and depth accessors
-// -----------------------------------------------------------------------------
 
 /// One entry of the tree `kind` names, or a zero entry when `node` is out of
 /// range.
@@ -370,23 +352,10 @@ fn set_bl_count_at<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>, bits: 
     }
 }
 
-// -----------------------------------------------------------------------------
-//  init_block -- L440-L451
-// -----------------------------------------------------------------------------
-
 /// Initialises a new block: clears every frequency, then reinstates the single
 /// frequency a block always has.
 ///
-/// Port of `init_block` (L440-L451):
-///
-/// ```c
-/// for (n = 0; n < L_CODES;  n++) s->dyn_ltree[n].Freq = 0;
-/// for (n = 0; n < D_CODES;  n++) s->dyn_dtree[n].Freq = 0;
-/// for (n = 0; n < BL_CODES; n++) s->bl_tree[n].Freq = 0;
-/// s->dyn_ltree[END_BLOCK].Freq = 1;
-/// s->opt_len = s->static_len = 0L;
-/// s->sym_next = s->matches = 0;
-/// ```
+/// Mirrors `init_block` (L440-L451).
 ///
 /// Called from `_tr_init` for the first block of a stream (L477) and from
 /// `_tr_flush_block` for each block after one is emitted (L1079); both callers
@@ -434,13 +403,9 @@ pub(crate) fn init_block<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) 
     state.matches = 0;
 }
 
-// -----------------------------------------------------------------------------
-//  gen_codes -- L203-L232
-// -----------------------------------------------------------------------------
-
 /// Generates the bit string of every symbol from the bit-length counts.
 ///
-/// Port of `gen_codes` (L203-L232). C takes the tree, `max_code` and
+/// Mirrors `gen_codes` (L203-L232). C takes the tree, `max_code` and
 /// `s->bl_count`; here the tree is named by `kind` and the counts are read from
 /// the state, so the three arguments collapse to two.
 ///
@@ -512,71 +477,192 @@ pub(crate) fn gen_codes<'a, A: Allocator<'a>>(
     }
 }
 
-// -----------------------------------------------------------------------------
-//  smaller -- L495-L501  (byte-identity decision point)
-// -----------------------------------------------------------------------------
-
-/// Compares two subtrees, using tree depth as the tie-breaker when the two have
-/// equal frequency.
+/// The three arrays the heap algorithms touch, borrowed once.
 ///
-/// Port of the `smaller` macro (L499-L501):
+/// C's `pqdownheap(s, tree, k)` receives `tree` as a `ct_data *` and then indexes
+/// `tree[...]`, `s->heap[...]` and `s->depth[...]` directly. The accessor stack
+/// above reproduces each of those as `state.tree_for(kind)` -- a three-way match
+/// on the kind -- followed by a bounds-checked `get`, which is correct but pays
+/// the kind selection again for every one of the four array reads that a single
+/// `smaller` comparison performs, and `pqdownheap` performs up to two comparisons
+/// per level.
 ///
-/// ```c
-/// #define smaller(tree, n, m, depth) \
-///    (tree[n].Freq < tree[m].Freq || \
-///    (tree[n].Freq == tree[m].Freq && depth[n] <= depth[m]))
-/// ```
+/// This view resolves the kind **once**, when it is built, and then hands the
+/// descent three plain slices. It is the "specialised tree view with one-time
+/// validation" the review asks for, and it changes nothing about the algorithm:
+/// [`HeapView::smaller`] is the `smaller` macro transcribed unchanged, including
+/// the `<=` depth tie-breaker that decides which pair `build_tree` combines
+/// first, and [`HeapView::pqdownheap`] visits the same nodes in the same order as
+/// L509-L528.
 ///
-/// `n` and `m` are node numbers, not heap positions -- every call site passes
-/// `heap[...]` or a value taken from it.
-///
-/// # Why the `<=` matters
-///
-/// Preferring the *shallower* subtree on a tie is what "minimizes the worst case
-/// length" (L496-L497), and the comparison is not symmetric: with `<` instead of
-/// `<=` two equally frequent, equally deep symbols would compare as neither
-/// smaller than the other, `pqdownheap` would stop one level earlier, and the
-/// heap would pop them in the opposite order. That changes which pair
-/// `build_tree` combines first, which changes their code lengths, which changes
-/// every byte the encoder emits for that block. This is one of the encoder
-/// decisions RFC 1951 leaves open, so matching the reference here is the whole
-/// requirement -- see the module documentation.
-///
-/// The two-term short-circuit shape is kept: the depth comparison is reached
-/// only for equal frequencies.
-#[inline]
-fn smaller<'a, A: Allocator<'a>>(
-    state: &DeflateState<'a, A>,
-    kind: StaticTreeKind,
-    n: i32,
-    m: i32,
-) -> bool {
-    let freq_n = freq_at(state, kind, n);
-    let freq_m = freq_at(state, kind, m);
-
-    freq_n < freq_m || (freq_n == freq_m && depth_at(state, n) <= depth_at(state, m))
+/// The three borrows are disjoint fields of one [`DeflateState`], which is why
+/// [`HeapView::of`] destructures the state rather than calling its accessors: a
+/// method returning `&mut self.heap` and another returning `&self.dyn_ltree`
+/// could not both be live, whereas one destructuring gives independent borrows of
+/// each field.
+#[derive(Debug)]
+struct HeapView<'v> {
+    /// `s->heap` (`deflate.h` L262-L263). Written by the descent, hence `&mut`.
+    heap: &'v mut [i32],
+    /// `s->depth` (`deflate.h` L265-L268). Read only.
+    depth: &'v [u8],
+    /// `desc->dyn_tree` (`deflate.h` L91), already selected. Read only: the heap
+    /// algorithms never write a tree entry.
+    tree: &'v [CtData],
+    /// `s->heap_len` (`deflate.h` L264), copied because the descent only reads it.
+    heap_len: i32,
 }
 
-// -----------------------------------------------------------------------------
-//  pqdownheap -- L503-L528
-// -----------------------------------------------------------------------------
+impl<'v> HeapView<'v> {
+    /// Borrows `state`'s heap, depths and the tree that `kind` names.
+    fn of<'a, A: Allocator<'a>>(state: &'v mut DeflateState<'a, A>, kind: StaticTreeKind) -> Self {
+        // Destructuring is what makes the three borrows below independent; `..`
+        // covers every field the heap algorithms do not touch.
+        let DeflateState {
+            heap,
+            heap_len,
+            depth,
+            dyn_ltree,
+            dyn_dtree,
+            bl_tree,
+            ..
+        } = state;
+
+        // The one and only resolution of the tree kind. Same pairing as
+        // `DeflateState::tree_for`, which `_tr_init` establishes at
+        // `trees.c` L459-L466.
+        let tree: &[CtData] = match kind {
+            StaticTreeKind::Literal => dyn_ltree,
+            StaticTreeKind::Distance => dyn_dtree,
+            StaticTreeKind::BitLength => bl_tree,
+        };
+
+        Self {
+            heap,
+            depth,
+            tree,
+            heap_len: *heap_len,
+        }
+    }
+
+    /// `s->heap[position]`, or 0 when `position` is out of range.
+    #[inline]
+    fn heap_at(&self, position: i32) -> i32 {
+        self.heap
+            .get(as_index(position))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// `s->heap[position] = node`; a no-op when `position` is out of range.
+    #[inline]
+    fn set_heap_at(&mut self, position: i32, node: i32) {
+        if let Some(slot) = self.heap.get_mut(as_index(position)) {
+            *slot = node;
+        }
+    }
+
+    /// `tree[node].Freq` (`deflate.h` L83), or 0 when `node` is out of range.
+    #[inline]
+    fn freq_at(&self, node: i32) -> u16 {
+        self.tree
+            .get(as_index(node))
+            .copied()
+            .unwrap_or_default()
+            .freq()
+    }
+
+    /// `s->depth[node]`, or 0 when `node` is out of range.
+    #[inline]
+    fn depth_at(&self, node: i32) -> u8 {
+        self.depth.get(as_index(node)).copied().unwrap_or_default()
+    }
+
+    /// Compares two subtrees, using tree depth as the tie-breaker when the two
+    /// have equal frequency.
+    ///
+    /// Port of the `smaller` macro (L499-L501):
+    ///
+    /// ```c
+    /// #define smaller(tree, n, m, depth) \
+    ///    (tree[n].Freq < tree[m].Freq || \
+    ///    (tree[n].Freq == tree[m].Freq && depth[n] <= depth[m]))
+    /// ```
+    ///
+    /// `n` and `m` are node numbers, not heap positions -- every call site passes
+    /// `heap[...]` or a value taken from it.
+    ///
+    /// # Why the `<=` matters
+    ///
+    /// Preferring the *shallower* subtree on a tie is what "minimizes the worst
+    /// case length" (L496-L497), and the comparison is not symmetric: with `<`
+    /// instead of `<=` two equally frequent, equally deep symbols would compare
+    /// as neither smaller than the other, [`HeapView::pqdownheap`] would stop one
+    /// level earlier, and the heap would pop them in the opposite order. That
+    /// changes which pair `build_tree` combines first, which changes their code
+    /// lengths, which changes every byte the encoder emits for that block. This
+    /// is one of the encoder decisions RFC 1951 leaves open, so matching the
+    /// reference here is the whole requirement -- see the module documentation.
+    ///
+    /// The two-term short-circuit shape is kept: the depth comparison is reached
+    /// only for equal frequencies.
+    ///
+    /// # Why it is a method on the view
+    ///
+    /// This is the only comparison the heap algorithms make, and each call reads
+    /// four array elements -- two frequencies and two depths. Reaching them
+    /// through `DeflateState::tree_for` would re-resolve the tree kind for every
+    /// one of those reads, four times per comparison and up to eight times per
+    /// level of the descent. On the view they are three plain slices, resolved
+    /// once. See [`HeapView`].
+    #[inline]
+    fn smaller(&self, n: i32, m: i32) -> bool {
+        let freq_n = self.freq_at(n);
+        let freq_m = self.freq_at(m);
+
+        freq_n < freq_m || (freq_n == freq_m && self.depth_at(n) <= self.depth_at(m))
+    }
+
+    /// The body of [`pqdownheap`] (L509-L528).
+    fn pqdownheap(&mut self, k: i32) {
+        // `int v = s->heap[k];`
+        let v = self.heap_at(k);
+        let mut k = k;
+        // `int j = k << 1;` -- the left son of k.
+        let mut j = k << 1;
+
+        // `while (j <= s->heap_len)`
+        while j <= self.heap_len {
+            // `if (j < s->heap_len && smaller(tree, s->heap[j + 1], s->heap[j], s->depth)) j++;`
+            // -- set j to the smaller of the two sons.
+            if j < self.heap_len && self.smaller(self.heap_at(j + 1), self.heap_at(j)) {
+                j += 1;
+            }
+
+            // `if (smaller(tree, v, s->heap[j], s->depth)) break;` -- v is smaller
+            // than both sons, so the heap property holds from here down.
+            if self.smaller(v, self.heap_at(j)) {
+                break;
+            }
+
+            // `s->heap[k] = s->heap[j];  k = j;` -- exchange v with the smaller son.
+            let son = self.heap_at(j);
+            self.set_heap_at(k, son);
+            k = j;
+
+            // `j <<= 1;` -- continue down the tree.
+            j <<= 1;
+        }
+
+        // `s->heap[k] = v;`
+        self.set_heap_at(k, v);
+    }
+}
 
 /// Restores the heap property by moving node `k` down.
 ///
-/// Port of `pqdownheap` (L509-L528): exchange a node with the smaller of its two
+/// Mirrors `pqdownheap` (L509-L528): exchange a node with the smaller of its two
 /// sons until each father is smaller than both of its sons.
-///
-/// ```c
-/// int v = s->heap[k];
-/// int j = k << 1;
-/// while (j <= s->heap_len) {
-///     if (j < s->heap_len && smaller(tree, s->heap[j + 1], s->heap[j], s->depth)) j++;
-///     if (smaller(tree, v, s->heap[j], s->depth)) break;
-///     s->heap[k] = s->heap[j];  k = j;
-///     j <<= 1;
-/// }
-/// s->heap[k] = v;
-/// ```
 ///
 /// # Why no index can go out of range
 ///
@@ -588,51 +674,24 @@ fn smaller<'a, A: Allocator<'a>>(
 /// (L655-L661), and `heap` has `HEAP_SIZE` entries. The accessors are still
 /// bounds-checked -- a wrong index would read a default rather than abort -- but
 /// the argument above is why that fallback is unreachable.
+///
+/// # The view
+///
+/// The descent itself lives in [`HeapView::pqdownheap`]. This wrapper exists to
+/// resolve `kind` into a tree slice **once** per call, rather than once per array
+/// read inside every comparison; see [`HeapView`]. The signature is unchanged, so
+/// `pqremove` and `build_tree` call it exactly as before.
 pub(crate) fn pqdownheap<'a, A: Allocator<'a>>(
     state: &mut DeflateState<'a, A>,
     kind: StaticTreeKind,
     k: i32,
 ) {
-    // `int v = s->heap[k];`
-    let v = heap_at(state, k);
-    let mut k = k;
-    // `int j = k << 1;` -- the left son of k.
-    let mut j = k << 1;
-
-    // `while (j <= s->heap_len)`
-    while j <= state.heap_len {
-        // `if (j < s->heap_len && smaller(tree, s->heap[j + 1], s->heap[j], s->depth)) j++;`
-        // -- set j to the smaller of the two sons.
-        if j < state.heap_len && smaller(state, kind, heap_at(state, j + 1), heap_at(state, j)) {
-            j += 1;
-        }
-
-        // `if (smaller(tree, v, s->heap[j], s->depth)) break;` -- v is smaller
-        // than both sons, so the heap property holds from here down.
-        if smaller(state, kind, v, heap_at(state, j)) {
-            break;
-        }
-
-        // `s->heap[k] = s->heap[j];  k = j;` -- exchange v with the smaller son.
-        let son = heap_at(state, j);
-        set_heap_at(state, k, son);
-        k = j;
-
-        // `j <<= 1;` -- continue down the tree.
-        j <<= 1;
-    }
-
-    // `s->heap[k] = v;`
-    set_heap_at(state, k, v);
+    HeapView::of(state, kind).pqdownheap(k);
 }
-
-// -----------------------------------------------------------------------------
-//  pqremove -- L484-L493
-// -----------------------------------------------------------------------------
 
 /// Removes the smallest element from the heap and restores the heap property.
 ///
-/// Port of the `pqremove` macro (L488-L493):
+/// Mirrors the `pqremove` macro (L488-L493):
 ///
 /// ```c
 /// top = s->heap[SMALLEST];
@@ -649,28 +708,37 @@ pub(crate) fn pqdownheap<'a, A: Allocator<'a>>(
 /// runs while `heap_len >= 2` (L695) and the repair at L655-L661 guarantees the
 /// first iteration -- so the decrement cannot take it negative.
 fn pqremove<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>, kind: StaticTreeKind) -> i32 {
-    // `top = s->heap[SMALLEST];`
-    let top = heap_at(state, SMALLEST);
+    // One [`HeapView`] for the whole macro, rather than three trips through the
+    // free-standing accessors plus a fourth inside `pqdownheap`: this is the
+    // hottest of the heap routines, because `build_tree`'s combine loop calls it
+    // twice per internal node.
+    let mut view = HeapView::of(state, kind);
 
-    // `s->heap[SMALLEST] = s->heap[s->heap_len--];`
-    let last = heap_at(state, state.heap_len);
-    set_heap_at(state, SMALLEST, last);
-    state.heap_len -= 1;
+    // `top = s->heap[SMALLEST];`
+    let top = view.heap_at(SMALLEST);
+
+    // `s->heap[SMALLEST] = s->heap[s->heap_len--];` -- a *post*-decrement, so the
+    // value moved down is the one at the old `heap_len`.
+    let last = view.heap_at(view.heap_len);
+    view.set_heap_at(SMALLEST, last);
+    view.heap_len -= 1;
 
     // `pqdownheap(s, tree, SMALLEST);`
-    pqdownheap(state, kind, SMALLEST);
+    view.pqdownheap(SMALLEST);
+
+    // The view holds `heap_len` by value, so that the descent reads it from a
+    // register rather than through a borrow; the decrement above therefore has to
+    // be published back to the state before the borrow ends.
+    let heap_len = view.heap_len;
+    state.heap_len = heap_len;
 
     top
 }
 
-// -----------------------------------------------------------------------------
-//  gen_bitlen -- L530-L613
-// -----------------------------------------------------------------------------
-
 /// Computes the optimal bit length of every code in a tree and adds the block's
 /// bit cost to both length accumulators.
 ///
-/// Port of `gen_bitlen` (L540-L613).
+/// Mirrors `gen_bitlen` (L540-L613).
 ///
 /// IN assertion: `Freq` and `Dad` are set for every element, and
 /// `heap[heap_max]` upwards are the tree nodes sorted by increasing frequency
@@ -881,14 +949,10 @@ pub(crate) fn gen_bitlen<'a, A: Allocator<'a>>(
     }
 }
 
-// -----------------------------------------------------------------------------
-//  build_tree -- L619-L706  (byte-identity decision point)
-// -----------------------------------------------------------------------------
-
 /// Constructs one Huffman tree, assigns every code string and length, and adds
 /// the block's bit cost to both accumulators.
 ///
-/// Port of `build_tree` (L627-L706).
+/// Mirrors `build_tree` (L627-L706).
 ///
 /// IN assertion: `Freq` is set for every element (L622). OUT assertions: `Len`
 /// and `Code` are set to the optimal bit length and the corresponding code,
@@ -903,19 +967,17 @@ pub(crate) fn gen_bitlen<'a, A: Allocator<'a>>(
 /// repeatedly removes the two least frequent nodes, joins them under a new
 /// internal node numbered from `elems` upwards, and pushes that node back --
 /// which is Huffman's algorithm, with `depth` breaking frequency ties as
-/// [`smaller`] describes. The nodes are recorded from the top of `heap`
+/// [`HeapView::smaller`] describes. The nodes are recorded from the top of `heap`
 /// downwards as they are removed, so that `heap[heap_max..]` ends up sorted by
 /// increasing frequency, which is the order [`gen_bitlen`] needs.
 ///
 /// # The forced-two-codes repair (L650-L661)
 ///
+/// The symbol each forced code is given is the load-bearing part, because it decides which
+/// code the decoder will see (`trees.c` L651):
+///
 /// ```c
-/// while (s->heap_len < 2) {
-///     node = s->heap[++(s->heap_len)] = (max_code < 2 ? ++max_code : 0);
-///     tree[node].Freq = 1;
-///     s->depth[node] = 0;
-///     s->opt_len--; if (stree) s->static_len -= stree[node].Len;
-/// }
+/// node = s->heap[++(s->heap_len)] = (max_code < 2 ? ++max_code : 0);
 /// ```
 ///
 /// The reference's reason is quoted directly: "The pkzip format requires that at
@@ -1084,10 +1146,6 @@ pub(crate) fn build_tree<'a, A: Allocator<'a>>(
     gen_codes(state, kind, max_code);
 }
 
-// -----------------------------------------------------------------------------
-//  scan_tree and send_tree -- L708-L794
-// -----------------------------------------------------------------------------
-
 /// `s->bl_tree[code].Freq++`.
 ///
 /// Saturating rather than wrapping, matching `CtData::increment_freq`. The
@@ -1127,7 +1185,7 @@ fn send_bl_code<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>, code: usi
 /// Scans a literal or distance tree to accumulate the frequencies of the codes
 /// that will transmit its bit lengths.
 ///
-/// Port of `scan_tree` (L712-L747). It counts into `bl_tree` exactly what
+/// Mirrors `scan_tree` (L712-L747). It counts into `bl_tree` exactly what
 /// [`send_tree`] will later emit, so the two must agree run for run -- they share
 /// one control structure and are kept as two functions, as in the reference,
 /// because merging them would obscure the emission order that agreement depends
@@ -1158,7 +1216,7 @@ fn send_bl_code<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>, code: usi
 /// `max_code` is at most `D_CODES - 1` = 29; `bl_tree` holds 39 and its
 /// `max_code` is at most `BL_CODES - 1` = 18.
 // `needless_continue` wants the `continue` arm split off from the ladder that
-// follows it. That ladder is a verbatim port of L726-L737, where the `continue`
+// follows it. That ladder is a verbatim mirror of L726-L737, where the `continue`
 // is the first arm of one `if`/`else if` chain; splitting it would stop this
 // function and `send_tree` reading as the same code, which is the property their
 // run-for-run agreement rests on.
@@ -1237,7 +1295,7 @@ pub(crate) fn scan_tree<'a, A: Allocator<'a>>(
 /// Sends a literal or distance tree in compressed form, using the codes in
 /// `bl_tree`.
 ///
-/// Port of `send_tree` (L753-L794). The control structure is identical to
+/// Mirrors `send_tree` (L753-L794). The control structure is identical to
 /// [`scan_tree`]'s; every place that function increments a frequency, this one
 /// emits the corresponding code, so the bit-length tree it emits with is exactly
 /// the tree those frequencies produced.
@@ -1330,14 +1388,10 @@ pub(crate) fn send_tree<'a, A: Allocator<'a>>(
     }
 }
 
-// -----------------------------------------------------------------------------
-//  build_bl_tree -- L796-L826
-// -----------------------------------------------------------------------------
-
 /// Builds the Huffman tree for the bit lengths and returns the index in
 /// `bl_order` of the last bit-length code that has to be sent.
 ///
-/// Port of `build_bl_tree` (L800-L826). On return, `opt_len` "includes the length
+/// Mirrors `build_bl_tree` (L800-L826). On return, `opt_len` "includes the length
 /// of the tree representations, except the lengths of the bit lengths codes and
 /// the 5 + 5 + 4 bits for the counts" (L809-L811) -- and then L821 adds those too,
 /// so on return from *this* function `opt_len` is the complete cost of a dynamic
@@ -1397,14 +1451,10 @@ pub(crate) fn build_bl_tree<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A
     max_blindex
 }
 
-// -----------------------------------------------------------------------------
-//  send_all_trees -- L828-L855
-// -----------------------------------------------------------------------------
-
 /// Sends the header of a dynamic-Huffman block: the three counts, the lengths of
 /// the bit-length codes, then the literal tree and the distance tree.
 ///
-/// Port of `send_all_trees` (L833-L855).
+/// Mirrors `send_all_trees` (L833-L855).
 ///
 /// IN assertion: `lcodes >= 257`, `dcodes >= 1`, `blcodes >= 4` (L831), and each
 /// is bounded above by its alphabet size (L838-L839). Both are `Assert`s in the
@@ -1453,13 +1503,9 @@ pub(crate) fn send_all_trees<'a, A: Allocator<'a>>(
     send_tree(state, StaticTreeKind::Distance, dcodes - 1);
 }
 
-// -----------------------------------------------------------------------------
-//  d_code -- deflate.h L319-L324
-// -----------------------------------------------------------------------------
-
 /// Maps a match distance to its distance code.
 ///
-/// Port of the `d_code` macro (`deflate.h` L320-L321):
+/// Mirrors the `d_code` macro (`deflate.h` L320-L321):
 ///
 /// ```c
 /// #define d_code(dist) \
@@ -1481,13 +1527,18 @@ pub(crate) fn send_all_trees<'a, A: Allocator<'a>>(
 /// A `pub(crate)` function rather than a private one because `_tr_tally`
 /// (L1095-L1119, in `trees/mod.rs`) needs the same mapping when it tallies a
 /// match, and both sides must use the identical table lookup.
+/// The index is computed in `u32`, the width C's `unsigned dist` already has,
+/// rather than widened to `ulg` first. That keeps the conversion to an index
+/// infallible on every target with a 32-bit-or-wider `usize`, so nothing is
+/// branched on -- this runs twice per match, once in `_tr_tally` and once in
+/// `compress_block`.
 #[must_use]
 #[inline]
 pub(crate) fn d_code(dist: u32) -> usize {
     let index = if dist < 256 {
-        as_ulg(dist)
+        dist
     } else {
-        as_ulg(dist >> 7).wrapping_add(256)
+        (dist >> 7).wrapping_add(256)
     };
 
     usize::from(
@@ -1497,10 +1548,6 @@ pub(crate) fn d_code(dist: u32) -> usize {
             .unwrap_or(0),
     )
 }
-
-// -----------------------------------------------------------------------------
-//  compress_block -- L897-L951
-// -----------------------------------------------------------------------------
 
 /// Which pair of Huffman trees a block body is emitted with.
 ///
@@ -1525,40 +1572,53 @@ pub(crate) enum BlockTrees {
 /// The static table is a `const`, so it is independent of the state and
 /// `send_code` can take it directly. The dynamic tree is a field of the state, so
 /// its entry is copied out first.
-#[inline]
-fn send_literal_code<'a, A: Allocator<'a>>(
+///
+/// # Why the tree is a const generic and not a parameter
+///
+/// C chooses the two trees **once per block** -- `compress_block` takes them as
+/// two `const ct_data *` arguments (L900) and the only two calls there are pass
+/// either the static pair (L1060-L1061) or the dynamic pair (L1069-L1070). A
+/// runtime [`BlockTrees`] parameter turned that single choice into a branch per
+/// emitted symbol, which release codegen kept, along with a call it declined to
+/// inline. `USE_STATIC` restores C's shape: the two monomorphisations are
+/// generated separately, the `if` below is folded at compile time, and
+/// `#[inline(always)]` puts the body back at the call site the way C's
+/// `send_code` macro was expanded there.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn send_literal_code<'a, A: Allocator<'a>, const USE_STATIC: bool>(
     state: &mut DeflateState<'a, A>,
-    trees: BlockTrees,
     code: usize,
 ) {
-    match trees {
-        BlockTrees::Static => send_code(state, code, &static_ltree),
-        BlockTrees::Dynamic => {
-            let entry = state.dyn_ltree.get(code).copied().unwrap_or_default();
-            send_bits(state, entry.code(), i32::from(entry.len()));
-        }
+    if USE_STATIC {
+        send_code(state, code, &static_ltree);
+    } else {
+        let entry = state.dyn_ltree.get(code).copied().unwrap_or_default();
+        send_bits(state, entry.code(), i32::from(entry.len()));
     }
 }
 
 /// `send_code(s, code, dtree)` for whichever distance tree is in use.
-#[inline]
-fn send_distance_code<'a, A: Allocator<'a>>(
+///
+/// `USE_STATIC` and `#[inline(always)]` are there for the reason given on
+/// [`send_literal_code`].
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn send_distance_code<'a, A: Allocator<'a>, const USE_STATIC: bool>(
     state: &mut DeflateState<'a, A>,
-    trees: BlockTrees,
     code: usize,
 ) {
-    match trees {
-        BlockTrees::Static => send_code(state, code, &static_dtree),
-        BlockTrees::Dynamic => {
-            let entry = state.dyn_dtree.get(code).copied().unwrap_or_default();
-            send_bits(state, entry.code(), i32::from(entry.len()));
-        }
+    if USE_STATIC {
+        send_code(state, code, &static_dtree);
+    } else {
+        let entry = state.dyn_dtree.get(code).copied().unwrap_or_default();
+        send_bits(state, entry.code(), i32::from(entry.len()));
     }
 }
 
 /// Sends the body of a block: every tallied symbol, then the end-of-block code.
 ///
-/// Port of `compress_block` (L900-L951).
+/// Mirrors `compress_block` (L900-L951).
 ///
 /// # The symbol buffer
 ///
@@ -1573,9 +1633,17 @@ fn send_distance_code<'a, A: Allocator<'a>>(
 /// ```
 ///
 /// -- which is a little-endian distance followed by a length or literal.
-/// `PendingBuf::symbol_at` performs precisely that decode, so the three reads and
-/// the three increments of `sx` become one call and one `SYMBOL_BYTES` step. The
-/// `d_buf`/`l_buf` pair of the `LIT_MEM` build (L909-L911) is not implemented.
+/// `PendingBuf::decode_symbols` performs precisely that decode, so the three reads
+/// and the three increments of `sx` become one array slot and one `SYMBOL_BYTES`
+/// step. The `d_buf`/`l_buf` pair of the `LIT_MEM` build (L909-L911) is not
+/// implemented.
+///
+/// Symbols are decoded [`SYMBOL_BATCH`] at a time rather than one at a time. C
+/// reads its three bytes straight out of `sym_buf` with no bound to establish;
+/// safe Rust has to establish one, and doing it once per batch instead of once per
+/// symbol is what keeps that cost off the per-symbol path. See
+/// [`SYMBOL_BATCH`] for why reading a batch before emitting any of it cannot lose
+/// a symbol.
 ///
 /// A distance of zero marks a literal (L916-L917). Otherwise `lc` is the match
 /// length minus `MIN_MATCH`, and the pair is emitted as a length code with its
@@ -1597,80 +1665,125 @@ pub(crate) fn compress_block<'a, A: Allocator<'a>>(
     state: &mut DeflateState<'a, A>,
     trees: BlockTrees,
 ) {
+    // C's single choice of tree pair, made once per block (L1060-L1061 and
+    // L1069-L1070), expressed as the one place this port branches on it.
+    match trees {
+        BlockTrees::Static => compress_block_with::<A, true>(state),
+        BlockTrees::Dynamic => compress_block_with::<A, false>(state),
+    }
+}
+
+/// How many symbols one [`crate::weak_slice::PendingBuf::decode_symbols`] call
+/// establishes bounds for.
+///
+/// C decodes one symbol at a time straight out of `sym_buf` (L913-L915) with no
+/// bound to establish; safe Rust has to establish one, so it establishes it for a
+/// batch. Thirty-two symbols is 96 bytes of buffer described by one range check
+/// and 128 bytes of stack for the decoded pairs -- small enough to stay in
+/// registers-and-cache territory, large enough that the range work per symbol
+/// disappears.
+///
+/// # Why reading ahead cannot lose a symbol
+///
+/// The compressed output and the unread symbols share one allocation, and
+/// `Assert(s->pending < s->lit_bufsize + sx, "pendingBuf overflow")` (L945) is
+/// what keeps the write cursor behind the read cursor. Emitting the batch may
+/// therefore overwrite the very bytes the batch came from -- which the assertion
+/// permits, and which costs nothing here because those symbols have already been
+/// copied out. What the assertion also guarantees is that after the batch's last
+/// symbol the cursor is still below `lit_bufsize + sx`, and `sx` by then names the
+/// *end* of the batch, so the next batch's bytes have not been touched.
+const SYMBOL_BATCH: usize = 32;
+
+/// The body of [`compress_block`], monomorphised for one of the two tree pairs.
+///
+/// `USE_STATIC` selects `static_ltree`/`static_dtree` when true and
+/// `dyn_ltree`/`dyn_dtree` when false; see [`send_literal_code`] for why it is a
+/// const generic rather than a parameter.
+fn compress_block_with<'a, A: Allocator<'a>, const USE_STATIC: bool>(
+    state: &mut DeflateState<'a, A>,
+) {
     let sym_next = state.sym_next();
     // `unsigned sx = 0;` -- the running index in the symbol buffer.
     let mut sx: usize = 0;
+    let mut batch = [(0_u16, 0_u8); SYMBOL_BATCH];
 
     while sx < sym_next {
-        // The three-byte decode of L913-L915. `None` is unreachable: `sym_next`
-        // is a whole number of symbols within the buffer, which `push_symbol`
-        // maintains.
-        let Some((dist, len_or_lit)) = state.pending.symbol_at(sx) else {
+        // The three-byte decode of L913-L915, for up to `SYMBOL_BATCH` symbols
+        // under one range check. Zero is unreachable while `sx < sym_next`:
+        // `sym_next` is a whole number of symbols within the buffer, which
+        // `push_symbol` maintains.
+        let filled = state.pending.decode_symbols(sx, &mut batch);
+        if filled == 0 {
             break;
-        };
-        sx = sx.saturating_add(SYMBOL_BYTES);
-
-        // C's `unsigned dist` and `int lc`.
-        let mut dist = u32::from(dist);
-        let mut lc = i32::from(len_or_lit);
-
-        if dist == 0 {
-            // `send_code(s, lc, ltree);` -- a literal byte.
-            send_literal_code(state, trees, as_index(lc));
-        } else {
-            // Here `lc` is the match length minus `MIN_MATCH`.
-            // `code = _length_code[lc];`
-            let code = usize::from(_length_code.get(as_index(lc)).copied().unwrap_or(0));
-            // `send_code(s, code + LITERALS + 1, ltree);` -- the length code.
-            send_literal_code(
-                state,
-                trees,
-                code.saturating_add(LITERALS).saturating_add(1),
-            );
-            // `extra = extra_lbits[code]; if (extra != 0) { lc -= base_length[code]; send_bits(s, lc, extra); }`
-            let extra = extra_lbits.get(code).copied().unwrap_or(0);
-            if extra != 0 {
-                lc -= base_length.get(code).copied().unwrap_or(0);
-                send_bits(state, as_ush(lc), extra);
-            }
-
-            // `dist--;` -- dist is now the match distance minus one.
-            dist -= 1;
-            // `code = d_code(dist);`
-            let code = d_code(dist);
-            // `Assert (code < D_CODES, "bad d_code");`
-            debug_assert!(code < D_CODES, "bad d_code (trees.c L931)");
-
-            // `send_code(s, code, dtree);` -- the distance code.
-            send_distance_code(state, trees, code);
-            // `extra = extra_dbits[code]; if (extra != 0) { dist -= (unsigned)base_dist[code]; send_bits(s, (int)dist, extra); }`
-            let extra = extra_dbits.get(code).copied().unwrap_or(0);
-            if extra != 0 {
-                dist -= u32::try_from(base_dist.get(code).copied().unwrap_or(0)).unwrap_or(0);
-                send_bits(state, as_ush(dist), extra);
-            }
         }
 
-        // `Assert(s->pending < s->lit_bufsize + sx, "pendingBuf overflow");`
-        // (L945) -- the compressed output must not overtake the symbols it is
-        // still reading. Debug-only, as in the reference.
-        debug_assert!(
-            state.pending_bytes() < state.lit_bufsize().saturating_add(sx),
-            "pendingBuf overflow (trees.c L945)"
-        );
+        for &(symbol_dist, len_or_lit) in batch.iter().take(filled) {
+            sx = sx.saturating_add(SYMBOL_BYTES);
+
+            // C's `unsigned dist` and `int lc`. `len_or_lit` is a `u8`, so both
+            // conversions are infallible -- which is the point: `lc` indexes
+            // `_length_code`, whose 256 entries cover every value a byte can hold,
+            // so no fallible narrowing and no range fallback is needed on the
+            // per-symbol path.
+            let mut dist = u32::from(symbol_dist);
+            let lc = usize::from(len_or_lit);
+
+            if dist == 0 {
+                // `send_code(s, lc, ltree);` -- a literal byte.
+                send_literal_code::<A, USE_STATIC>(state, lc);
+            } else {
+                // Here `lc` is the match length minus `MIN_MATCH`.
+                // `code = _length_code[lc];`
+                let code = usize::from(_length_code.get(lc).copied().unwrap_or(0));
+                // `send_code(s, code + LITERALS + 1, ltree);` -- the length code.
+                send_literal_code::<A, USE_STATIC>(
+                    state,
+                    code.saturating_add(LITERALS).saturating_add(1),
+                );
+                // `extra = extra_lbits[code]; if (extra != 0) { lc -= base_length[code]; send_bits(s, lc, extra); }`
+                let extra = extra_lbits.get(code).copied().unwrap_or(0);
+                if extra != 0 {
+                    let residue = as_int(lc) - base_length.get(code).copied().unwrap_or(0);
+                    send_bits(state, as_ush(residue), extra);
+                }
+
+                // `dist--;` -- dist is now the match distance minus one.
+                dist -= 1;
+                // `code = d_code(dist);`
+                let code = d_code(dist);
+                // `Assert (code < D_CODES, "bad d_code");`
+                debug_assert!(code < D_CODES, "bad d_code (trees.c L931)");
+
+                // `send_code(s, code, dtree);` -- the distance code.
+                send_distance_code::<A, USE_STATIC>(state, code);
+                // `extra = extra_dbits[code]; if (extra != 0) { dist -= (unsigned)base_dist[code]; send_bits(s, (int)dist, extra); }`
+                let extra = extra_dbits.get(code).copied().unwrap_or(0);
+                if extra != 0 {
+                    dist -= u32::try_from(base_dist.get(code).copied().unwrap_or(0)).unwrap_or(0);
+                    send_bits(state, as_ush(dist), extra);
+                }
+            }
+
+            // `Assert(s->pending < s->lit_bufsize + sx, "pendingBuf overflow");`
+            // (L945) -- the compressed output must not overtake the symbols it is
+            // still reading. Debug-only, as in the reference, and checked per
+            // symbol exactly as C checks it, because it is what licenses the
+            // batching above.
+            debug_assert!(
+                state.pending_bytes() < state.lit_bufsize().saturating_add(sx),
+                "pendingBuf overflow (trees.c L945)"
+            );
+        }
     }
 
     // `send_code(s, END_BLOCK, ltree);`
-    send_literal_code(state, trees, END_BLOCK);
+    send_literal_code::<A, USE_STATIC>(state, END_BLOCK);
 }
-
-// -----------------------------------------------------------------------------
-//  detect_data_type -- L953-L991
-// -----------------------------------------------------------------------------
 
 /// Classifies the current block as text or binary from its literal frequencies.
 ///
-/// Port of `detect_data_type` (L966-L991), contributed by Cosmin Truta and
+/// Mirrors `detect_data_type` (L966-L991), contributed by Cosmin Truta and
 /// described in `doc/txtvsbin.txt`, which sorts the 256 byte values into three
 /// categories. The result becomes the caller-visible `z_stream.data_type`
 /// (`zlib.h` L107), so it is externally observable and must match the reference
@@ -1739,10 +1852,6 @@ pub(crate) fn detect_data_type<'a, A: Allocator<'a>>(state: &DeflateState<'a, A>
 fn literal_freq<'a, A: Allocator<'a>>(state: &DeflateState<'a, A>, byte: usize) -> u16 {
     state.dyn_ltree.get(byte).copied().map_or(0, CtData::freq)
 }
-
-// -----------------------------------------------------------------------------
-//  Block-type selection -- L1026-L1074  (byte-identity decision point)
-// -----------------------------------------------------------------------------
 
 /// Which of the three block encodings `_tr_flush_block` will emit.
 ///
@@ -1829,22 +1938,18 @@ pub(crate) struct BlockSelection {
 
 /// Determines the best encoding for the current block.
 ///
-/// Port of the decision half of `_tr_flush_block` (L1026-L1054): the arithmetic
+/// Mirrors the decision half of `_tr_flush_block` (L1026-L1054): the arithmetic
 /// at L1027-L1042 and the three predicates at L1044-L1074, without any of the
 /// emission. `trees/mod.rs` owns the orchestration -- deciding whether to build
 /// the trees at all, calling this, and then dispatching on the answer.
 ///
+/// The two costs are rounded to whole bytes by truncating integer arithmetic, and the
+/// comparison between them is what picks the block type (`trees.c` L1027-L1074):
+///
 /// ```c
 /// opt_lenb    = (s->opt_len    + 3 + 7) >> 3;
 /// static_lenb = (s->static_len + 3 + 7) >> 3;
-/// if (static_lenb <= opt_lenb || s->strategy == Z_FIXED)
-///     opt_lenb = static_lenb;
-/// ...
-/// else /* level == 0 */ { opt_lenb = static_lenb = stored_len + 5; }
-///
-/// if (stored_len + 4 <= opt_lenb && buf != (char*)0) { ... }
-/// else if (static_lenb == opt_lenb) { ... }
-/// else { ... }
+/// if (static_lenb <= opt_lenb || s->strategy == Z_FIXED) opt_lenb = static_lenb;
 /// ```
 ///
 /// # What must not be changed
@@ -1898,7 +2003,7 @@ pub(crate) fn select_block_type(
 
         // `if (static_lenb <= opt_lenb || s->strategy == Z_FIXED) opt_lenb = static_lenb;`
         // -- the `#ifndef FORCE_STATIC` guard at L1034 wraps only the condition,
-        // so the default build has the `if` and this port implements that.
+        // so the default build has the `if` and this implementation implements that.
         if static_lenb <= opt_lenb || strategy == Strategy::Fixed {
             opt_lenb = static_lenb;
         }
@@ -1929,10 +2034,6 @@ pub(crate) fn select_block_type(
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
 #[cfg(test)]
 // The workspace denies the panic-prone lints, which is right for library code and wrong for a
 // harness: a test asserts, and a failing assertion panics. Indexing is allowed because every index
@@ -1948,8 +2049,8 @@ mod tests {
 
     use super::{
         build_bl_tree, build_tree, compress_block, d_code, detect_data_type, gen_codes, init_block,
-        pqdownheap, scan_tree, select_block_type, send_all_trees, send_tree, smaller, BlockChoice,
-        BlockTrees,
+        pqdownheap, scan_tree, select_block_type, send_all_trees, send_tree, BlockChoice,
+        BlockTrees, HeapView,
     };
     use crate::config::{Z_BINARY, Z_TEXT};
     use crate::deflate::state::{
@@ -1960,10 +2061,6 @@ mod tests {
     use crate::trees::bit_writer::{bi_reverse, bi_windup};
     use crate::trees::static_tables::{bl_order, static_dtree, static_ltree, END_BLOCK};
     use crate::trees::tree_desc::StaticTreeDesc;
-
-    // -------------------------------------------------------------------------
-    //  Fixtures
-    // -------------------------------------------------------------------------
 
     /// The stream `deflateInit2_` produces for the default configuration -- level 6, `windowBits`
     /// 15, `memLevel` 8, [`Strategy::Default`] (`deflate.c` L387-L533), then wired up as `_tr_init`
@@ -2055,10 +2152,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  The tables this module consumes -- the cheapest, highest-signal check
-    // -------------------------------------------------------------------------
-
     #[test]
     fn the_consumed_static_tables_have_the_reference_shape() {
         use crate::trees::static_tables::{
@@ -2124,10 +2217,6 @@ mod tests {
         assert!(bit_length.static_tree.is_none());
     }
 
-    // -------------------------------------------------------------------------
-    //  init_block -- L440-L451
-    // -------------------------------------------------------------------------
-
     #[test]
     fn init_block_clears_the_alphabets_and_sets_end_of_block() {
         let mut state = fresh_state();
@@ -2185,17 +2274,14 @@ mod tests {
         assert_eq!(state.bl_tree[BL_CODES].freq(), 0x1234);
     }
 
-    // -------------------------------------------------------------------------
-    //  smaller -- L499-L501  (byte-identity decision point)
-    // -------------------------------------------------------------------------
-
     #[test]
     fn smaller_compares_frequencies_first() {
         let mut state = fresh_state();
         seed_freqs(&mut state, StaticTreeKind::Distance, &[3, 7]);
 
-        assert!(smaller(&state, StaticTreeKind::Distance, 0, 1));
-        assert!(!smaller(&state, StaticTreeKind::Distance, 1, 0));
+        let view = HeapView::of(&mut state, StaticTreeKind::Distance);
+        assert!(view.smaller(0, 1));
+        assert!(!view.smaller(1, 0));
     }
 
     #[test]
@@ -2209,16 +2295,42 @@ mod tests {
         state.depth[1] = 0;
         state.depth[2] = 3;
 
-        assert!(smaller(&state, StaticTreeKind::Distance, 0, 1));
-        assert!(smaller(&state, StaticTreeKind::Distance, 1, 0));
+        let view = HeapView::of(&mut state, StaticTreeKind::Distance);
+        assert!(view.smaller(0, 1));
+        assert!(view.smaller(1, 0));
         // A shallower subtree wins the tie; a deeper one loses it.
-        assert!(smaller(&state, StaticTreeKind::Distance, 0, 2));
-        assert!(!smaller(&state, StaticTreeKind::Distance, 2, 0));
+        assert!(view.smaller(0, 2));
+        assert!(!view.smaller(2, 0));
     }
 
-    // -------------------------------------------------------------------------
-    //  pqdownheap -- L509-L528
-    // -------------------------------------------------------------------------
+    #[test]
+    fn the_heap_view_reads_the_tree_that_its_kind_names() {
+        // The kind is resolved once, when the view is built, so the resolution has to be the same
+        // pairing `DeflateState::tree_for` performs (`trees.c` L459-L466). Distinct frequencies in
+        // the three trees make a mis-pairing visible.
+        let mut state = fresh_state();
+        seed_freqs(&mut state, StaticTreeKind::Literal, &[11]);
+        seed_freqs(&mut state, StaticTreeKind::Distance, &[22]);
+        seed_freqs(&mut state, StaticTreeKind::BitLength, &[33]);
+        state.heap[1] = 0;
+        state.heap_len = 1;
+
+        for (kind, freq) in [
+            (StaticTreeKind::Literal, 11),
+            (StaticTreeKind::Distance, 22),
+            (StaticTreeKind::BitLength, 33),
+        ] {
+            let view = HeapView::of(&mut state, kind);
+            assert_eq!(view.freq_at(0), freq, "{}", kind.c_name());
+            assert_eq!(view.heap_at(1), 0, "the heap is shared by every kind");
+            assert_eq!(view.heap_len, 1);
+            // Out-of-range indices read a default rather than panicking, as the free-standing
+            // accessors do.
+            assert_eq!(view.freq_at(-1), 0);
+            assert_eq!(view.heap_at(-1), 0);
+            assert_eq!(view.depth_at(-1), 0);
+        }
+    }
 
     #[test]
     fn pqdownheap_heapifies_exactly_as_the_reference_does() {
@@ -2242,10 +2354,6 @@ mod tests {
 
         assert_eq!(&state.heap[1..=6], &[3, 1, 5, 0, 4, 2]);
     }
-
-    // -------------------------------------------------------------------------
-    //  gen_codes -- L203-L232
-    // -------------------------------------------------------------------------
 
     #[test]
     fn gen_codes_produces_a_canonical_prefix_free_code() {
@@ -2305,10 +2413,6 @@ mod tests {
 
         assert_eq!(state.dyn_dtree[2].code(), 0xbeef);
     }
-
-    // -------------------------------------------------------------------------
-    //  build_tree -- L627-L706  (byte-identity decision point)
-    // -------------------------------------------------------------------------
 
     #[test]
     fn build_tree_matches_the_reference_on_a_hand_distribution() {
@@ -2534,10 +2638,6 @@ mod tests {
             .all(|&len| usize::from(len) <= MAX_BITS));
     }
 
-    // -------------------------------------------------------------------------
-    //  scan_tree and send_tree -- L712-L794
-    // -------------------------------------------------------------------------
-
     /// The mixed run pattern both tree-transmission tests use: long zero runs, a medium run of
     /// sevens, a short run of nines, and two singletons. It exercises every arm of the ladder --
     /// literal repeats, `REP_3_6`, `REPZ_3_10` and `REPZ_11_138`.
@@ -2677,10 +2777,6 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------------
-    //  build_bl_tree -- L800-L826
-    // -------------------------------------------------------------------------
-
     #[test]
     fn build_bl_tree_matches_the_reference_for_an_empty_block() {
         // Oracle: an empty block leaves opt_len at 89, static_len at 7 and max_blindex at 17.
@@ -2698,10 +2794,6 @@ mod tests {
         let code = usize::from(bl_order[usize::try_from(max_blindex).unwrap()]);
         assert_ne!(state.bl_tree[code].len(), 0);
     }
-
-    // -------------------------------------------------------------------------
-    //  d_code -- deflate.h L320-L321
-    // -------------------------------------------------------------------------
 
     #[test]
     fn d_code_matches_the_reference_across_both_halves_of_the_table() {
@@ -2735,10 +2827,6 @@ mod tests {
             assert!(d_code(dist) < D_CODES, "d_code({dist}) out of range");
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  compress_block -- L900-L951
-    // -------------------------------------------------------------------------
 
     #[test]
     fn compress_block_of_an_empty_symbol_buffer_emits_only_end_of_block() {
@@ -2838,10 +2926,6 @@ mod tests {
         assert_eq!(state.pending.written(), [0x26, 0x2e, 0x05]);
     }
 
-    // -------------------------------------------------------------------------
-    //  detect_data_type -- L966-L991
-    // -------------------------------------------------------------------------
-
     /// Makes `byte` the block's only literal, on top of the end-of-block frequency `init_block`
     /// always sets. `END_BLOCK` is 256 and the scans stop at `LITERALS` = 256, so it cannot affect
     /// the answer.
@@ -2931,10 +3015,6 @@ mod tests {
             assert_eq!(detect_data_type(&state), want, "byte {byte}");
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  Block-type selection -- L1027-L1074  (byte-identity decision point)
-    // -------------------------------------------------------------------------
 
     #[test]
     fn select_block_type_matches_the_reference_at_every_boundary() {

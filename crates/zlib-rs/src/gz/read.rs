@@ -1,17 +1,17 @@
-//! The read side of the `gzFile` layer: the port of `gzread.c` (668 lines) together with the
+//! The read side of the `gzFile` layer: the Rust counterpart of `gzread.c` (668 lines) together with the
 //! positioning entry points of `gzlib.c` (L346-L495).
 //!
 //! This module drives the inflate engine on behalf of `gzread`, `gzfread`, `gzgetc`, `gzungetc`,
 //! `gzgets`, `gzseek`, `gztell`, `gzoffset`, `gzrewind` and `gzclose_r`. It owns three things that
-//! live nowhere else in the port:
+//! live nowhere else in the implementation:
 //!
-//! 1. **The transparent-read decision.** [`gz_look`] inspects the first four bytes of a stream and
+//! 1. **The transparent-read decision.** `gz_look` inspects the first four bytes of a stream and
 //!    decides whether the file is a gzip member to be decompressed or arbitrary data to be copied
 //!    through unchanged. The answer is what `gzdirect` reports (`gzread.c` L93-L170).
 //! 2. **`Z_ERRNO`.** No other part of this library can produce it: the deflate and inflate engines
 //!    report only their own status codes, so every `Z_ERRNO` a caller ever sees was recorded here or
 //!    in the write half. Wherever C writes `zstrerror()` (`gzguts.h` L131-L133, i.e.
-//!    `strerror(errno)`) this module renders a [`GzIoError`] instead; see [`errno_message`].
+//!    `strerror(errno)`) this module renders a [`GzIoError`] instead; see `errno_message`.
 //! 3. **The multi-member and trailing-garbage rules.** `zlib.h` L1462-L1466 promises that any number
 //!    of concatenated gzip members are decompressed as one continuous stream, and that anything
 //!    other than a member found *after* a member is silently ignored. Both behaviours come out of
@@ -22,7 +22,7 @@
 //! It contains no decompression logic and no gzip-header decoding of its own. The engine is
 //! `crate::inflate`, initialised in gunzip mode exactly as `gz_look` initialises it with
 //! `inflateInit2(&(state->strm), 15 + 16)` (`gzread.c` L115), and the four-byte detection heuristic
-//! is [`looks_like_gzip`], which `crate::gz::header` owns. Header fields, the trailer, the CRC-32
+//! is `looks_like_gzip`, which `crate::gz::header` owns. Header fields, the trailer, the CRC-32
 //! and the length check are the engine's business (`inflate.c` L513-L671), so nothing about
 //! RFC 1952 is re-derived here.
 //!
@@ -34,11 +34,11 @@
 //! | Value | Meaning | Set by |
 //! |---|---|---|
 //! | -1 | nothing has been read yet; this is the first member | `gz_reset` (`gzlib.c` L75) |
-//! | 1 | a gzip header was seen but no byte has been decompressed from it yet | [`gz_look`] (`gzread.c` L156), and `junk != -1` at L130 |
-//! | 0 | this really is a gzip stream: either output was produced or a member completed | [`gz_decomp`] (`gzread.c` L203 and L233) |
+//! | 1 | a gzip header was seen but no byte has been decompressed from it yet | `gz_look` (`gzread.c` L156), and `junk != -1` at L130 |
+//! | 0 | this really is a gzip stream: either output was produced or a member completed | `gz_decomp` (`gzread.c` L203 and L233) |
 //!
 //! The value is what distinguishes "trailing garbage after a real member, which `zlib.h` L1465-L1466
-//! says to ignore" from "this was never gzip, which is a data error": [`gz_decomp`] accepts a
+//! says to ignore" from "this was never gzip, which is a data error": `gz_decomp` accepts a
 //! `Z_DATA_ERROR` silently when `junk == 1` and reports it when `junk == 0`
 //! (`gzread.c` L213-L224).
 //!
@@ -46,7 +46,7 @@
 //!
 //! `state->again` is set whenever a read fails with `EAGAIN` or `EWOULDBLOCK`
 //! (`gzread.c` L36-L40), and it is a first-class part of this layer's contract rather than an edge
-//! case. It threads through [`gz_load`], [`gz_avail`], [`gz_look`], [`gz_decomp`], [`gzread`] and
+//! case. It threads through `gz_load`, `gz_avail`, `gz_look`, `gz_decomp`, [`gzread`] and
 //! `gz_error` -- which declines to clear `x.have` for a merely stalled stream
 //! (`gzlib.c` L564-L565). The observable consequences are the ones `zlib.h` documents: `gzread`
 //! returns -1 rather than 0 so a stall is not mistaken for end of file (L1480-L1483), and `gzdirect`
@@ -75,7 +75,7 @@
 //! module calls [`GzState::resync_from_exposed`] on entry and [`GzState::refresh_exposed`] before it
 //! returns**, and the internal helpers work in terms of [`GzState::out_pos`] rather than the
 //! pointer. The two places where C's pointer transiently leaves the output buffer are handled as
-//! that module prescribes: [`gz_decomp`] reports its production count as a value instead of
+//! that module prescribes: `gz_decomp` reports its production count as a value instead of
 //! publishing a window into someone else's buffer, and `gzseek64`'s raw-area fast path clears the
 //! pair together with [`GzState::clear_have`].
 //!
@@ -92,13 +92,13 @@
 //! Two crate-internal helpers are used from the module root, which is where `gzlib.c`'s shared
 //! plumbing lives and where `crate::gz::open` already takes `gz_error` from:
 //!
-//! * `gz_error(state, code, message)` -- the port of `gz_error` (`gzlib.c` L555-L590). Recording a
+//! * `gz_error(state, code, message)` -- the Rust counterpart of `gz_error` (`gzlib.c` L555-L590). Recording a
 //!   [`ReturnCode`] with an optional byte-string message, which is prefixed with the path exactly as
 //!   [`GzState::try_set_prefixed_msg`] builds it, and which clears `x.have` for a fatal error unless
 //!   the stream is merely stalled.
-//! * `gt_off(value)` -- the port of the `GT_OFF` macro (`gzguts.h` L212-L216), true when an
+//! * `gt_off(value)` -- the Rust counterpart of the `GT_OFF` macro (`gzguts.h` L212-L216), true when an
 //!   `unsigned` cannot be compared against a `z_off64_t` without loss. It is false on every target
-//!   where `z_off64_t` is wider than `int`, which is every target this port supports, but the guard
+//!   where `z_off64_t` is wider than `int`, which is every target this implementation supports, but the guard
 //!   is preserved because the comparisons it protects are C's.
 //!
 //! # Panic and allocation posture
@@ -106,14 +106,11 @@
 //! No path here can panic: there is no indexing, no slicing syntax, no `unwrap`, no `expect` and no
 //! arithmetic that can overflow in a debug build. Every buffer access goes through a checked
 //! accessor, and the one place a message must be formatted uses a fixed-size stack buffer
-//! ([`ErrnoMessage`]) rather than a heap `String`, so that reporting an I/O error cannot itself fail.
+//! (`ErrnoMessage`) rather than a heap `String`, so that reporting an I/O error cannot itself fail.
 
 use core::ffi::{c_int, c_uint};
-use core::fmt::Write as _;
 
 use alloc::vec::Vec;
-
-use std::io;
 
 use crate::allocate::{Allocator, Buffer};
 use crate::config::{InflateConfig, Z_NO_FLUSH};
@@ -124,29 +121,18 @@ use crate::gz::state::{
     GzEngine, GzHandle, GzHow, GzIoError, GzSeekFrom, GzState, GzStream, ZOff64, COPY, GZIP,
     GZ_READ, GZ_WRITE, LOOK,
 };
-use crate::gz::{gt_off, gz_error};
+use crate::gz::{errno_message, gt_off, gz_error};
 use crate::inflate::{inflate, inflate_end, inflate_init2, inflate_reset, InflateStream};
-
-// -----------------------------------------------------------------------------
-//  Constants
-// -----------------------------------------------------------------------------
 
 /// The largest number of bytes one call to the handle may be asked for.
 ///
-/// The port of `gz_load`'s `unsigned get, max = ((unsigned)-1 >> 2) + 1` (`gzread.c` L21). The
+/// Implements `gz_load`'s `unsigned get, max = ((unsigned)-1 >> 2) + 1` (`gzread.c` L21). The
 /// expression is reproduced rather than replaced by a round number because it is the value the
 /// reference implementation uses: a quarter of the `unsigned` range plus one, which on a 32-bit
 /// `unsigned` is `0x4000_0000`. C needs the clamp because `read` returns an `int`, so a request larger
-/// than `INT_MAX` could not report its own result; this port keeps it so that the number of handle
+/// than `INT_MAX` could not report its own result; this implementation keeps it so that the number of handle
 /// calls, and therefore the number of underlying `read` syscalls, matches.
 const MAX_READ_CHUNK: c_uint = (c_uint::MAX >> 2) + 1;
-
-/// Capacity of the fixed-size buffer an `errno` message is rendered into.
-///
-/// `strerror` texts are short -- the longest on a current Linux is well under 60 bytes -- and this
-/// buffer only ever holds one of them. 128 bytes leaves ample headroom while keeping
-/// [`ErrnoMessage`] small enough to live on the stack of an error path.
-const ERRNO_MESSAGE_CAPACITY: usize = 128;
 
 /// The gzip-only `windowBits` request the read path initialises its engine with.
 ///
@@ -155,10 +141,6 @@ const ERRNO_MESSAGE_CAPACITY: usize = 128;
 /// gzip container rather than the zlib one. The sum is written the way C writes it so that the two
 /// halves of the request stay visible.
 const GUNZIP_WINDOW_BITS: i32 = 15 + 16;
-
-// -----------------------------------------------------------------------------
-//  Small conversions
-// -----------------------------------------------------------------------------
 
 /// Widens a C `unsigned` to a `usize`, saturating rather than wrapping.
 ///
@@ -217,104 +199,6 @@ fn clamp_to_have(have: c_uint, amount: ZOff64) -> c_uint {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Rendering `errno` without libc
-// -----------------------------------------------------------------------------
-
-/// A short, heap-free rendering of an operating-system error: this port of `zstrerror()`.
-///
-/// `gzguts.h` L131-L133 defines `zstrerror()` as `strerror(errno)`, and `gz_error` copies the result
-/// into an allocated, path-prefixed message (`gzlib.c` L576-L584). This crate has no `libc`
-/// dependency, so the text comes from [`io::Error`]'s own `Display`, which `std` produces from
-/// `strerror_r`.
-///
-/// The buffer is fixed-size and on the stack for a reason that matters on this particular path:
-/// `String::from` and `format!` abort the process if the global allocator is exhausted, and the one
-/// moment a library is most likely to be out of memory is while it is reporting a failure.
-/// [`core::fmt::Write`] into a fixed buffer cannot fail, so a truncated message is the worst
-/// outcome.
-///
-/// The text this produces contains `strerror`'s wording followed by `std`'s ` (os error N)` suffix,
-/// which is the one cosmetic divergence from C in this module: the numeric code is appended where C
-/// would stop. Nothing in the API contract or in `test/example.c`, `test/minigzip.c` or
-/// `test/infcover.c` inspects the wording -- `gzerror` returns it verbatim for a human to read, and
-/// the code a program acts on is the `Z_ERRNO` in `*errnum` plus the platform's own `errno`, which
-/// the underlying syscall has already set.
-#[derive(Debug)]
-struct ErrnoMessage {
-    /// The rendered bytes. Only the first [`ErrnoMessage::len`] of them are meaningful.
-    bytes: [u8; ERRNO_MESSAGE_CAPACITY],
-    /// How much of [`ErrnoMessage::bytes`] has been written.
-    len: usize,
-}
-
-impl ErrnoMessage {
-    /// An empty message.
-    const fn new() -> Self {
-        Self {
-            bytes: [0; ERRNO_MESSAGE_CAPACITY],
-            len: 0,
-        }
-    }
-
-    /// The rendered text, as the bytes `gz_error` expects.
-    fn as_bytes(&self) -> &[u8] {
-        self.bytes.get(..self.len).unwrap_or(&[])
-    }
-}
-
-impl core::fmt::Write for ErrnoMessage {
-    /// Appends as much of `text` as fits, and reports success either way.
-    ///
-    /// Truncation is silent and deliberate: the alternative is for the formatting machinery to
-    /// report an error that the caller would have to handle on a path whose whole purpose is to
-    /// report a different error. A partial write stops at a `char` boundary so that the result stays
-    /// valid UTF-8, which matters because the facade publishes it as a C string.
-    fn write_str(&mut self, text: &str) -> core::fmt::Result {
-        let room = ERRNO_MESSAGE_CAPACITY.saturating_sub(self.len);
-        // The largest prefix of `text` that fits without splitting a `char`.
-        let mut take = 0;
-        for (index, character) in text.char_indices() {
-            let end = index.saturating_add(character.len_utf8());
-            if end > room {
-                break;
-            }
-            take = end;
-        }
-        let Some(source) = text.as_bytes().get(..take) else {
-            return Ok(());
-        };
-        let end = self.len.saturating_add(take);
-        if let Some(destination) = self.bytes.get_mut(self.len..end) {
-            destination.copy_from_slice(source);
-            self.len = end;
-        }
-        Ok(())
-    }
-}
-
-/// Renders the message C would obtain from `zstrerror()`.
-///
-/// `error` is the failure just observed, when there is one. A [`GzIoError`] carrying a non-zero
-/// `errno` is rendered from that number, which is the most faithful and the most robust source: it
-/// is the value the failing call itself reported, whatever has happened to the thread's `errno`
-/// since.
-///
-/// With no error object -- `gzread`'s stall report at `gzread.c` L429, which C writes as a bare
-/// `zstrerror()` long after the read returned -- or with an `errno` the handle could not determine,
-/// the text comes from [`io::Error::last_os_error`]. That is precisely what C does at that line: it
-/// reads the thread's current `errno`, relying on nothing having overwritten it in between.
-fn errno_message(error: Option<GzIoError>) -> ErrnoMessage {
-    let source = match error {
-        Some(error) if error.errno != 0 => io::Error::from_raw_os_error(error.errno),
-        _ => io::Error::last_os_error(),
-    };
-    let mut message = ErrnoMessage::new();
-    // Cannot fail: `write_str` above always reports success.
-    let _ = write!(message, "{source}");
-    message
-}
-
 /// The message C reports for a structure whose `how` field holds no recognised value.
 ///
 /// `gz_fetch`'s `default:` arm (`gzread.c` L271-L273). This module reuses it for the handful of
@@ -352,9 +236,26 @@ const REQUEST_EXCEEDS_INT: &[u8] = b"request does not fit in an int";
 /// `gzfread`'s report for a `size * nitems` product that overflows (`gzread.c` L459).
 const REQUEST_EXCEEDS_SIZE_T: &[u8] = b"request does not fit in a size_t";
 
-// -----------------------------------------------------------------------------
-//  How the internal steps report themselves
-// -----------------------------------------------------------------------------
+/// The guard that replaces C's unchecked write past a caller's buffer in `gzfread`.
+///
+/// C computes `len = nitems * size` and hands `len` bytes at `buf` to `gz_read` with no way to know
+/// how long the caller's buffer really is. This port receives a slice, so a request longer than the
+/// slice is detectable -- and it is refused rather than silently shortened, because shortening it
+/// would answer a *different* question from the one the caller asked and the caller has no way to
+/// tell which happened: `gzfread` returns whole items, so a short answer is indistinguishable from
+/// end of file. `crate::gz::write` refuses the mirror-image request in `gzfwrite` with the same
+/// wording, so the two directions agree.
+const REQUEST_PAST_BUFFER: &[u8] = b"request does not fit in the supplied buffer";
+
+/// The message for a [`GzHandle`] that claims to have read more than it was offered.
+///
+/// C cannot detect this: `read(2)` is trusted to honour its `count` argument and `gz_load` adds the
+/// return value to `*have` unchecked (`gzread.c` L33). This port hands the handle a *slice*, so a
+/// count larger than that slice is a broken implementation of the trait -- the bytes it claims to
+/// have delivered cannot exist. Clamping the number was the alternative and it is unsafe in the
+/// meaningful sense: the layer would go on to treat uninitialised buffer bytes as data the handle
+/// supplied. Refusing turns a broken handle into a reported `Z_STREAM_ERROR` instead.
+const HANDLE_OVER_REPORTED: &[u8] = b"file handle reported more bytes than were requested";
 
 /// What one input or decompression step produced, and whether it failed.
 ///
@@ -366,7 +267,7 @@ const REQUEST_EXCEEDS_SIZE_T: &[u8] = b"request does not fit in a size_t";
 /// the count away on exactly that path, so it is kept as a struct.
 #[derive(Debug)]
 pub(crate) struct Progress {
-    /// Bytes obtained: C's `*have` for [`gz_load`], C's `had - strm->avail_out` for [`gz_decomp`].
+    /// Bytes obtained: C's `*have` for [`gz_load`], C's `had - strm->avail_out` for `gz_decomp`.
     pub(crate) count: c_uint,
     /// `Ok(())` for C's `0` return, `Err(code)` for C's `-1`.
     ///
@@ -375,7 +276,7 @@ pub(crate) struct Progress {
     pub(crate) result: Result<(), ReturnCode>,
 }
 
-/// Where [`gz_load`] puts the bytes it reads: the port of the three `buf` arguments C passes it.
+/// Where [`gz_load`] puts the bytes it reads: the Rust counterpart of the three `buf` arguments C passes it.
 ///
 /// The destination cannot simply be a `&mut [u8]`, because two of the three live inside the very
 /// [`GzState`] whose handle performs the read, and a single `&mut GzState` cannot yield both at once.
@@ -401,14 +302,14 @@ pub(crate) enum LoadTarget<'buf> {
     User(&'buf mut [u8]),
 }
 
-/// Where [`gz_decomp`] sends the bytes the engine produces.
+/// Where `gz_decomp` sends the bytes the engine produces.
 ///
 /// The two ways C points `strm->next_out` before calling it: at the layer's own output buffer, so
 /// that `gzgetc` can be served from it (`gzread.c` L266-L267), or straight at the caller's buffer for
 /// a request too large to be worth double-buffering (L373-L374).
 #[derive(Debug)]
 pub(crate) enum DecompTarget<'buf> {
-    /// The layer's own output buffer, whose delivered window [`gz_decomp`] publishes on return.
+    /// The layer's own output buffer, whose delivered window `gz_decomp` publishes on return.
     Internal,
     /// The caller's buffer. Nothing is published: the count comes back in [`Progress::count`],
     /// which is what C's caller reads out of `x.have` before immediately zeroing it
@@ -431,17 +332,19 @@ struct ReadOutcome {
     at_eof: bool,
     /// The failure to report as `Z_ERRNO`, if C would have reported one at L41.
     failure: Option<GzIoError>,
+    /// The handle reported a count larger than the window it was given.
+    ///
+    /// Has no C counterpart -- see [`HANDLE_OVER_REPORTED`] -- and is fatal rather than clamped,
+    /// which is why it travels separately from [`ReadOutcome::failure`]: it is a `Z_STREAM_ERROR`,
+    /// not a `Z_ERRNO`, because no operating-system error occurred.
+    over_reported: bool,
 }
-
-// -----------------------------------------------------------------------------
-//  gz_load -- `gzread.c` L18-L47
-// -----------------------------------------------------------------------------
 
 /// Resolves a [`LoadTarget`] into the byte window the handle should read into.
 ///
 /// Split out of [`gz_load`] so that the field borrows it needs are taken in one place. [`None`]
 /// means the requested window does not lie inside the buffer it names, which C cannot express and
-/// this port reports as a corrupt state rather than trusting.
+/// this implementation reports as a corrupt state rather than trusting.
 fn resolve_load_window<'buf, 'alloc>(
     target: LoadTarget<'buf>,
     input: &'buf mut Option<Buffer<'alloc, u8>>,
@@ -485,34 +388,38 @@ fn read_into(handle: &mut (dyn GzHandle + '_), buffer: &mut [u8]) -> ReadOutcome
     let mut have_stalled = false;
     let mut at_eof = false;
     let mut failure = None;
+    let mut over_reported = false;
 
     loop {
-        // L27-L29: `get = len - *have; if (get > max) get = max;`
         let get = len.saturating_sub(have).min(max);
         let end = have.saturating_add(get);
         let Some(window) = buffer.get_mut(have..end) else {
             break;
         };
 
-        // L30: `ret = (int)read(state->fd, buf + *have, get);`
         match handle.read(window) {
             // L31-L32 with `ret == 0`, resolved at L44-L45.
             Ok(0) => {
                 at_eof = true;
                 break;
             }
+            // A count larger than the window is impossible from a correct handle, so it is
+            // refused rather than clamped: the extra bytes do not exist, and adding them to `have`
+            // would publish uninitialised buffer as data. Nothing is added, so no cursor moves.
+            Ok(count) if count > get => {
+                over_reported = true;
+                break;
+            }
             Ok(count) => {
                 // L33: `*have += (unsigned)ret;`
-                have = have.saturating_add(count.min(get));
+                have = have.saturating_add(count);
                 // L34: `} while (*have < len);`
                 if have >= len {
                     break;
                 }
             }
-            // L35-L43.
             Err(error) => {
                 if error.would_block {
-                    // L36-L37.
                     have_stalled = true;
                     // L38-L39: partial progress on a stalled descriptor is success.
                     if have != 0 {
@@ -530,16 +437,17 @@ fn read_into(handle: &mut (dyn GzHandle + '_), buffer: &mut [u8]) -> ReadOutcome
         have_stalled,
         at_eof,
         failure,
+        over_reported,
     }
 }
 
 /// Reads into `target`, updating `eof`, `again` and the error state as C does.
 ///
-/// The port of `gz_load` (`gzread.c` L18-L47). C reports the count through `unsigned *have` and
+/// Implements `gz_load` (`gzread.c` L18-L47). C reports the count through `unsigned *have` and
 /// success through its return value; both come back in [`Progress`], and the count is meaningful even
 /// when the result is an error, because a read can fail after delivering bytes.
 ///
-/// `errno = 0` at L24 has no counterpart: this port never consults the thread's `errno` to decide
+/// `errno = 0` at L24 has no counterpart: this implementation never consults the thread's `errno` to decide
 /// anything, only to render a message, and it takes the value from the failure the handle reported.
 pub(crate) fn gz_load<'a, A: Allocator<'a>>(
     state: &mut GzState<'a, A>,
@@ -553,7 +461,7 @@ pub(crate) fn gz_load<'a, A: Allocator<'a>>(
             output,
             ..
         } = state;
-        match handle.as_deref_mut() {
+        match handle.handle_mut() {
             Some(handle) => {
                 resolve_load_window(target, input, output).map(|window| read_into(handle, window))
             }
@@ -577,8 +485,19 @@ pub(crate) fn gz_load<'a, A: Allocator<'a>>(
     state.set_again(outcome.have_stalled);
     let count = narrow(outcome.have).unwrap_or(c_uint::MAX);
 
+    // A handle that over-reported has told the layer nothing it can trust, so the whole call is
+    // discarded: zero bytes delivered, no cursor moved, and a `Z_STREAM_ERROR` recorded. Checked
+    // before the `Z_ERRNO` arm because it is the more serious of the two -- an `errno` describes a
+    // failed syscall, this describes a handle that cannot be relied on at all.
+    if outcome.over_reported {
+        gz_error(state, ReturnCode::STREAM_ERROR, Some(HANDLE_OVER_REPORTED));
+        return Progress {
+            count: 0,
+            result: Err(ReturnCode::STREAM_ERROR),
+        };
+    }
+
     if let Some(error) = outcome.failure {
-        // L41-L42.
         let message = errno_message(Some(error));
         gz_error(state, ReturnCode::ERRNO, Some(message.as_bytes()));
         return Progress {
@@ -587,7 +506,6 @@ pub(crate) fn gz_load<'a, A: Allocator<'a>>(
         };
     }
 
-    // L44-L45.
     if outcome.at_eof {
         state.set_eof(true);
     }
@@ -598,13 +516,9 @@ pub(crate) fn gz_load<'a, A: Allocator<'a>>(
     }
 }
 
-// -----------------------------------------------------------------------------
-//  gz_avail -- `gzread.c` L56-L82
-// -----------------------------------------------------------------------------
-
 /// Refills the input buffer, and records end of file when the handle runs out.
 ///
-/// The port of `gz_avail` (`gzread.c` L49-L82). Any input still unconsumed is first moved to the
+/// Implements `gz_avail` (`gzread.c` L49-L82). Any input still unconsumed is first moved to the
 /// front of the buffer and the free tail is then filled, so that the decoder always sees one
 /// contiguous run of bytes starting at index zero.
 ///
@@ -621,7 +535,6 @@ pub(crate) fn gz_load<'a, A: Allocator<'a>>(
 /// * [`ReturnCode::STREAM_ERROR`] if the unconsumed input does not lie inside the input buffer,
 ///   which C cannot express and no correct caller can produce.
 pub(crate) fn gz_avail<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> Result<(), ReturnCode> {
-    // L60-L61.
     if !err_permits_reading(state.err()) {
         return Err(state.err_code().unwrap_or(ReturnCode::STREAM_ERROR));
     }
@@ -666,20 +579,15 @@ pub(crate) fn gz_avail<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> Resu
     // accounted for -- the bytes are in the buffer but no one will look at them.
     progress.result?;
 
-    // L78-L79.
     let stream = state.stream_mut();
     stream.avail_in = avail_in.saturating_add(progress.count);
     stream.next_in = 0;
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-//  gz_look -- `gzread.c` L93-L170
-// -----------------------------------------------------------------------------
-
 /// Allocates the working buffers and the engine on first use.
 ///
-/// The port of `gz_look`'s opening block (`gzread.c` L97-L122), kept separate so that the decision
+/// Implements `gz_look`'s opening block (`gzread.c` L97-L122), kept separate so that the decision
 /// logic below reads as one piece. C's two `malloc` calls become
 /// [`GzState::allocate_read_buffers`], which requests `want` input bytes and `want << 1` output
 /// bytes from the **injected** allocator and unwinds a partial success in C's order (output first,
@@ -690,7 +598,7 @@ pub(crate) fn gz_avail<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> Resu
 /// retries the whole block rather than half of it.
 ///
 /// C also zeroes `strm->zalloc`, `strm->zfree` and `strm->opaque` here (L110-L112). Those fields do
-/// not exist in this port -- `crate::gz::state` records why -- but the two cursor assignments beside
+/// not exist in this implementation -- `crate::gz::state` records why -- but the two cursor assignments beside
 /// them (L113-L114) do, and are reproduced.
 ///
 /// # Errors
@@ -700,12 +608,10 @@ pub(crate) fn gz_avail<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> Resu
 fn gz_look_allocate<'a, A: Allocator<'a> + Copy>(
     state: &mut GzState<'a, A>,
 ) -> Result<(), ReturnCode> {
-    // L99-L106.
     if state.allocate_read_buffers().is_err() {
         gz_error(state, ReturnCode::MEM_ERROR, Some(OUT_OF_MEMORY));
         return Err(ReturnCode::MEM_ERROR);
     }
-    // L107.
     state.set_size(state.want());
 
     // L113-L114: no input has been examined yet.
@@ -718,7 +624,6 @@ fn gz_look_allocate<'a, A: Allocator<'a> + Copy>(
     let engine = inflate_init2(InflateConfig::new(GUNZIP_WINDOW_BITS), allocator)
         .and_then(|engine| state.install_inflate(engine));
     if engine.is_err() {
-        // L116-L120.
         state.release_buffers();
         state.set_size(0);
         gz_error(state, ReturnCode::MEM_ERROR, Some(OUT_OF_MEMORY));
@@ -729,9 +634,9 @@ fn gz_look_allocate<'a, A: Allocator<'a> + Copy>(
 
 /// Resets the decompressor so that it starts on a fresh gzip member.
 ///
-/// The port of the three `inflateReset(strm)` calls in `gz_look` (`gzread.c` L128 and L154). C
+/// Implements the three `inflateReset(strm)` calls in `gz_look` (`gzread.c` L128 and L154). C
 /// ignores the return value, because the only way `inflateReset` can fail is a state the stream
-/// cannot be in here; this port instead reports a missing engine, which is the same condition and is
+/// cannot be in here; this implementation instead reports a missing engine, which is the same condition and is
 /// equally unreachable.
 ///
 /// `inflateReset` also writes the `z_stream` half of the reset. Of those five fields this layer keeps
@@ -751,7 +656,7 @@ fn reset_engine<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> Result<(), 
 
 /// Decides whether the stream is a gzip member to decompress or data to copy through.
 ///
-/// The port of `gz_look` (`gzread.c` L84-L170), and the single most caller-visible function in this
+/// Implements `gz_look` (`gzread.c` L84-L170), and the single most caller-visible function in this
 /// module: what it decides is what `gzdirect` reports (`zlib.h` L1727-L1730), and whether a file is
 /// decompressed at all.
 ///
@@ -787,16 +692,13 @@ fn reset_engine<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> Result<(), 
 pub(crate) fn gz_look<'a, A: Allocator<'a> + Copy>(
     state: &mut GzState<'a, A>,
 ) -> Result<(), ReturnCode> {
-    // L97-L122.
     if state.size() == 0 {
         gz_look_allocate(state)?;
     }
 
-    // L124-L133.
     if state.direct() == -1 || state.junk() == 0 {
         reset_engine(state)?;
         state.set_how(GZIP);
-        // L130: `state->junk = state->junk != -1;`
         state.set_junk(i32::from(state.junk() != -1));
         state.set_direct(0);
         return Ok(());
@@ -805,7 +707,6 @@ pub(crate) fn gz_look<'a, A: Allocator<'a> + Copy>(
     // L139-L142: an empty input is not an error -- it is a transparent read of zero bytes.
     gz_avail(state)?;
 
-    // L143-L146.
     let avail_in = state.stream().avail_in;
     if avail_in == 0 || (state.again() && avail_in < 4) {
         return Ok(());
@@ -819,7 +720,6 @@ pub(crate) fn gz_look<'a, A: Allocator<'a> + Copy>(
         looks_like_gzip(buffer.get(start..end).unwrap_or(&[]))
     };
     if detected {
-        // L154-L158.
         reset_engine(state)?;
         state.set_how(GZIP);
         state.set_junk(1);
@@ -852,21 +752,16 @@ pub(crate) fn gz_look<'a, A: Allocator<'a> + Copy>(
     }
     // L164 and L166 together: the delivered window is the whole copy, starting at the front.
     state.set_output_window(0, avail_in)?;
-    // L167-L168.
     state.stream_mut().avail_in = 0;
     state.set_how(COPY);
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-//  gz_decomp -- `gzread.c` L180-L240
-// -----------------------------------------------------------------------------
-
 /// Runs the engine once over the buffered input, writing into `target`.
 ///
-/// The port of the single `inflate(strm, Z_NO_FLUSH)` call at `gzread.c` L200 together with the
+/// Implements the single `inflate(strm, Z_NO_FLUSH)` call at `gzread.c` L200 together with the
 /// cursor bookkeeping around it. C keeps the four cursors in the embedded `z_stream` and hands the
-/// decoder their addresses; this port keeps the same four values in [`GzStream`] and rebuilds the
+/// decoder their addresses; this implementation keeps the same four values in [`GzStream`] and rebuilds the
 /// slice pair for each call, because `crate::inflate` takes whole buffers plus cursors.
 ///
 /// The windows are sliced to exactly `next + avail`, which is what makes
@@ -953,7 +848,7 @@ fn inflate_step<'a, A: Allocator<'a> + Copy>(
 
 /// Decompresses into `target` until it is full or the member ends.
 ///
-/// The port of `gz_decomp` (`gzread.c` L172-L240). The caller sets `avail_out` and `next_out` first,
+/// Implements `gz_decomp` (`gzread.c` L172-L240). The caller sets `avail_out` and `next_out` first,
 /// exactly as `gz_fetch` (L266-L267) and `gz_read` (L373-L374) do, and passes the matching
 /// destination.
 ///
@@ -988,7 +883,6 @@ pub(crate) fn gz_decomp<'a, A: Allocator<'a> + Copy>(
     state: &mut GzState<'a, A>,
     mut target: DecompTarget<'_>,
 ) -> Progress {
-    // L181-L186.
     let mut ret = ReturnCode::OK;
     let had = state.stream().avail_out;
 
@@ -998,7 +892,6 @@ pub(crate) fn gz_decomp<'a, A: Allocator<'a> + Copy>(
             ret = state.err_code().unwrap_or(ReturnCode::STREAM_ERROR);
             break;
         }
-        // L193-L197.
         if state.stream().avail_in == 0 {
             if !state.again() {
                 gz_error(state, ReturnCode::BUF_ERROR, Some(UNEXPECTED_EOF));
@@ -1006,7 +899,6 @@ pub(crate) fn gz_decomp<'a, A: Allocator<'a> + Copy>(
             break;
         }
 
-        // L199-L200.
         match inflate_step(state, &mut target) {
             Ok(code) => ret = code,
             Err(code) => {
@@ -1021,17 +913,14 @@ pub(crate) fn gz_decomp<'a, A: Allocator<'a> + Copy>(
             state.set_junk(0);
         }
 
-        // L204-L208.
         if ret == ReturnCode::STREAM_ERROR || ret == ReturnCode::NEED_DICT {
             gz_error(state, ReturnCode::STREAM_ERROR, Some(INFLATE_CORRUPT));
             break;
         }
-        // L209-L212.
         if ret == ReturnCode::MEM_ERROR {
             gz_error(state, ReturnCode::MEM_ERROR, Some(OUT_OF_MEMORY));
             break;
         }
-        // L213-L224.
         if ret == ReturnCode::DATA_ERROR {
             if state.junk() == 1 {
                 // L214-L219: trailing garbage is ok.
@@ -1041,20 +930,17 @@ pub(crate) fn gz_decomp<'a, A: Allocator<'a> + Copy>(
                 ret = ReturnCode::OK;
                 break;
             }
-            // L221-L222.
             let text = state.stream().msg;
             let message = text.map_or(COMPRESSED_DATA_ERROR, str::as_bytes);
             gz_error(state, ReturnCode::DATA_ERROR, Some(message));
             break;
         }
 
-        // L225: `} while (strm->avail_out && ret != Z_STREAM_END);`
         if state.stream().avail_out == 0 || ret == ReturnCode::STREAM_END {
             break;
         }
     }
 
-    // L227-L229.
     let produced = had.saturating_sub(state.stream().avail_out);
     if matches!(target, DecompTarget::Internal) {
         let cursor = state.stream().next_out;
@@ -1068,7 +954,6 @@ pub(crate) fn gz_decomp<'a, A: Allocator<'a> + Copy>(
         }
     }
 
-    // L231-L236.
     if ret == ReturnCode::STREAM_END {
         state.set_junk(0);
         state.set_how(LOOK);
@@ -1078,7 +963,6 @@ pub(crate) fn gz_decomp<'a, A: Allocator<'a> + Copy>(
         };
     }
 
-    // L238-L239: `return ret != Z_OK ? -1 : 0;`
     let result = if ret == ReturnCode::OK {
         Ok(())
     } else {
@@ -1090,13 +974,9 @@ pub(crate) fn gz_decomp<'a, A: Allocator<'a> + Copy>(
     }
 }
 
-// -----------------------------------------------------------------------------
-//  gz_fetch -- `gzread.c` L248-L277
-// -----------------------------------------------------------------------------
-
 /// Fills the output buffer, looking for a header first if one is due.
 ///
-/// The port of `gz_fetch` (`gzread.c` L242-L277). `x.have` is zero on entry, and on return it is
+/// Implements `gz_fetch` (`gzread.c` L242-L277). `x.have` is zero on entry, and on return it is
 /// either non-zero or the input is exhausted in both the file and the buffer, which is the loop
 /// condition at L275.
 ///
@@ -1107,29 +987,35 @@ pub(crate) fn gz_decomp<'a, A: Allocator<'a> + Copy>(
 ///
 /// # Errors
 ///
-/// * Whatever [`gz_look`], [`gz_load`] or [`gz_decomp`] reports.
+/// * Whatever `gz_look`, [`gz_load`] or `gz_decomp` reports.
 /// * [`ReturnCode::STREAM_ERROR`] for an unrecognised `how`, or for a size that cannot be doubled
 ///   into a `c_uint`.
 ///
-/// One deliberate, documented divergence lives in the [`COPY`] arm. C assigns the byte count
-/// straight into `x.have` through `gz_load`'s out-parameter but sets `x.next = state->out` only after
-/// checking for failure (L260-L263), so a read that fails *after* delivering bytes leaves a count
-/// paired with a stale cursor -- and `gz_read`, which proceeds whenever `x.have != 0` (L359-L361),
-/// then hands the application bytes from the wrong place. This port publishes cursor and count
-/// together in both cases, so the delivered bytes are the ones that were just read.
+/// # A behaviour divergence in the [`COPY`] arm -- divergence 9 of the `gz/open.rs` inventory
+///
+/// C assigns the byte count straight into `x.have` through `gz_load`'s out-parameter but sets
+/// `x.next = state->out` only after checking for failure (L260-L263), so a read that fails *after*
+/// delivering bytes leaves a count paired with a stale cursor -- and `gz_read`, which proceeds
+/// whenever `x.have != 0` (L359-L361), then hands the application bytes from the wrong place. This
+/// port publishes cursor and count together in both cases, so the delivered bytes are the ones that
+/// were just read.
+///
+/// That is **not** presented as an improvement: it is an observable difference on the failing path,
+/// and behaviour preservation is this port's governing constraint. It is recorded as **forced and
+/// unresolved**, because reproducing C exactly would mean handing the application bytes from a
+/// stale cursor -- a read of memory the count does not describe. See the inventory in
+/// `gz/open.rs` for the full list and for what "forced, unresolved" means there.
 pub(crate) fn gz_fetch<'a, A: Allocator<'a> + Copy>(
     state: &mut GzState<'a, A>,
 ) -> Result<(), ReturnCode> {
     loop {
         match GzHow::from_raw(state.how()) {
-            // L253-L258: `-> LOOK, COPY (only if never GZIP), or GZIP`.
             Some(GzHow::Look) => {
                 gz_look(state)?;
                 if state.how() == LOOK {
                     return Ok(());
                 }
             }
-            // L259-L264: `-> COPY`.
             Some(GzHow::Copy) => {
                 let len = widen(state.size()).saturating_mul(2);
                 let progress = gz_load(state, LoadTarget::Output { len });
@@ -1137,7 +1023,6 @@ pub(crate) fn gz_fetch<'a, A: Allocator<'a> + Copy>(
                 progress.result?;
                 return Ok(());
             }
-            // L265-L270: `-> GZIP or LOOK (if end of gzip stream)`.
             Some(GzHow::Gzip) => {
                 let avail_out = narrow(widen(state.size()).saturating_mul(2))
                     .ok_or(ReturnCode::STREAM_ERROR)?;
@@ -1146,27 +1031,21 @@ pub(crate) fn gz_fetch<'a, A: Allocator<'a> + Copy>(
                 stream.next_out = 0;
                 gz_decomp(state, DecompTarget::Internal).result?;
             }
-            // L271-L273.
             None => {
                 gz_error(state, ReturnCode::STREAM_ERROR, Some(STATE_CORRUPT));
                 return Err(ReturnCode::STREAM_ERROR);
             }
         }
 
-        // L275: `} while (state->x.have == 0 && (!state->eof || strm->avail_in));`
         if state.have() != 0 || (state.eof() && state.stream().avail_in == 0) {
             return Ok(());
         }
     }
 }
 
-// -----------------------------------------------------------------------------
-//  gz_skip -- `gzread.c` L281-L309
-// -----------------------------------------------------------------------------
-
 /// Discards `skip` bytes of uncompressed output, or stops at end of file.
 ///
-/// The port of `gz_skip` (`gzread.c` L279-L309), which is how a deferred `gzseek` request is
+/// Implements `gz_skip` (`gzread.c` L279-L309), which is how a deferred `gzseek` request is
 /// eventually carried out: whatever is already in the output buffer is thrown away first, and the
 /// rest is produced and thrown away, because a gzip stream cannot be positioned any other way
 /// (`zlib.h` L1671-L1675 calls the emulation "extremely slow" for exactly this reason).
@@ -1184,7 +1063,6 @@ pub(crate) fn gz_skip<'a, A: Allocator<'a> + Copy>(
     // L284-L307: skip over `skip` bytes or reach end of file, whichever comes first.
     loop {
         if state.have() != 0 {
-            // L286-L295.
             let n = clamp_to_have(state.have(), state.skip());
             state.advance_out(widen(n))?;
             state.add_pos(ZOff64::from(n));
@@ -1193,11 +1071,9 @@ pub(crate) fn gz_skip<'a, A: Allocator<'a> + Copy>(
             // L297-L299: output buffer empty and the input is finished.
             break;
         } else {
-            // L301-L306.
             gz_fetch(state)?;
         }
 
-        // L307: `} while (state->skip);`
         if state.skip() == 0 {
             break;
         }
@@ -1205,13 +1081,9 @@ pub(crate) fn gz_skip<'a, A: Allocator<'a> + Copy>(
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-//  gz_read -- `gzread.c` L317-L393
-// -----------------------------------------------------------------------------
-
 /// Reads up to `buf.len()` uncompressed bytes into `buf`, and returns how many arrived.
 ///
-/// The port of `gz_read` (`gzread.c` L311-L393), the engine behind every public read entry point.
+/// Implements `gz_read` (`gzread.c` L311-L393), the engine behind every public read entry point.
 ///
 /// # The deferred-error contract
 ///
@@ -1228,7 +1100,7 @@ pub(crate) fn gz_skip<'a, A: Allocator<'a> + Copy>(
 /// `x.have` and `x.next` are populated, and therefore whether the caller's `gzgetc` **macro** can
 /// take its fast path at all. It also guarantees, as C's comment at L363-L364 says, that the copy
 /// above leaves space in the output buffer so at least one `gzungetc` can succeed. Changing the test
-/// changes behaviour in code this port cannot recompile.
+/// changes behaviour in code this implementation cannot recompile.
 ///
 /// A request at least as large as the whole output buffer skips the double-buffering and reads or
 /// decompresses straight into `buf` (L367-L378).
@@ -1236,7 +1108,6 @@ pub(crate) fn gz_read<'a, A: Allocator<'a> + Copy>(
     state: &mut GzState<'a, A>,
     buf: &mut [u8],
 ) -> usize {
-    // L322-L324.
     let mut len = buf.len();
     if len == 0 {
         return 0;
@@ -1247,7 +1118,6 @@ pub(crate) fn gz_read<'a, A: Allocator<'a> + Copy>(
         return 0;
     }
 
-    // L330-L332.
     let mut got = 0_usize;
     let mut failed = false;
     let mut offset = 0_usize;
@@ -1331,7 +1201,6 @@ pub(crate) fn gz_read<'a, A: Allocator<'a> + Copy>(
             state.add_pos(to_off(n));
         }
 
-        // L385: `} while (len && !err);`
         if len == 0 || failed {
             break;
         }
@@ -1342,13 +1211,8 @@ pub(crate) fn gz_read<'a, A: Allocator<'a> + Copy>(
         state.set_past(true);
     }
 
-    // L391-L392.
     got
 }
-
-// -----------------------------------------------------------------------------
-//  The public read drivers
-// -----------------------------------------------------------------------------
 
 /// The entry guard every public read driver applies: C's mode and error checks.
 ///
@@ -1379,7 +1243,7 @@ fn enter_read<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> bool {
 
 /// Reads and decompresses up to `buf.len()` bytes, returning the count or -1.
 ///
-/// The port of `gzread` (`gzread.c` L395-L436), declared at `zlib.h` L1456. `buf` is the caller's
+/// Implements `gzread` (`gzread.c` L395-L436), declared at `zlib.h` L1456. `buf` is the caller's
 /// `(buf, len)` pair; the facade rebuilds it as a slice, and its length is C's `unsigned len`.
 ///
 /// # The two failure reports
@@ -1394,24 +1258,21 @@ fn enter_read<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> bool {
 /// # What is deliberately *not* reported here
 ///
 /// An incomplete gzip stream. `zlib.h` L1474-L1478 is explicit: `gzread` does not return -1 for it.
-/// The `Z_BUF_ERROR` [`gz_decomp`] recorded stays recorded, `gzerror` can be consulted for it, and
+/// The `Z_BUF_ERROR` `gz_decomp` recorded stays recorded, `gzerror` can be consulted for it, and
 /// `gzclose` is what finally returns it.
 pub fn gzread<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, buf: &mut [u8]) -> c_int {
     if !enter_read(state) {
         return -1;
     }
 
-    // L411-L416.
     if !request_fits_in_int(buf.len()) {
         gz_error(state, ReturnCode::STREAM_ERROR, Some(REQUEST_EXCEEDS_INT));
         state.refresh_exposed();
         return -1;
     }
 
-    // L418-L419.
     let got = gz_read(state, buf);
 
-    // L421-L432.
     if got == 0 {
         if !err_permits_reading(state.err()) {
             state.refresh_exposed();
@@ -1432,7 +1293,7 @@ pub fn gzread<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, buf: &mut
 
 /// Reads and decompresses up to `nitems` items of `size` bytes, returning the count of full items.
 ///
-/// The port of `gzfread` (`gzread.c` L438-L465), declared at `zlib.h` L1492. It duplicates
+/// Implements `gzfread` (`gzread.c` L438-L465), declared at `zlib.h` L1492. It duplicates
 /// `fread`'s interface, so the product `size * nitems` is the byte count and the return value is
 /// whole items.
 ///
@@ -1444,6 +1305,16 @@ pub fn gzread<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, buf: &mut
 /// So the facade passes the `size` and `nitems` it was given, together with the largest buffer it
 /// could build for them -- `size.checked_mul(nitems)` bytes, or an empty slice when that product
 /// overflows, in which case this function rejects the request before looking at the buffer at all.
+///
+/// # And so does the buffer-length check
+///
+/// `buf` must be at least `size * nitems` bytes. A shorter slice is a `Z_STREAM_ERROR` and zero
+/// items, recorded through `gz_error` and leaving the stream position untouched -- **not** a read of
+/// whatever was offered. C has no way to detect the condition, so there is no C behaviour to match
+/// here; the choice is between refusing and silently answering a smaller question. Refusing is the
+/// only one a caller can act on, because `gzfread` reports whole items and a short count is exactly
+/// what end of file looks like. `gzfwrite` refuses the mirror-image request the same way
+/// (`crate::gz::write`), so a facade sees one rule in both directions.
 ///
 /// # The partial final item
 ///
@@ -1461,7 +1332,6 @@ pub fn gzfread<'a, A: Allocator<'a> + Copy>(
         return 0;
     }
 
-    // L456-L461.
     let Some(len) = nitems.checked_mul(size) else {
         gz_error(
             state,
@@ -1472,16 +1342,19 @@ pub fn gzfread<'a, A: Allocator<'a> + Copy>(
         return 0;
     };
 
-    // L463-L464: `return len ? gz_read(state, buf, len) / size : 0;`
     if len == 0 || size == 0 {
         state.refresh_exposed();
         return 0;
     }
-    let window = match buf.get_mut(..len) {
-        Some(window) => window,
-        // The facade could not offer the whole product; read what it did offer, which is the same
-        // request truncated, rather than reading past it.
-        None => buf,
+    // The buffer must hold the whole product. C cannot check this -- it has a bare pointer -- and
+    // this port can, so it does, *before* reading anything. Substituting the shorter slice was the
+    // alternative and it is worse than refusing: the read would succeed, the stream would advance,
+    // and the caller would receive an item count that is indistinguishable from end of file while
+    // the bytes it asked for were never delivered.
+    let Some(window) = buf.get_mut(..len) else {
+        gz_error(state, ReturnCode::STREAM_ERROR, Some(REQUEST_PAST_BUFFER));
+        state.refresh_exposed();
+        return 0;
     };
     let got = gz_read(state, window);
     state.refresh_exposed();
@@ -1490,7 +1363,7 @@ pub fn gzfread<'a, A: Allocator<'a> + Copy>(
 
 /// Reads and decompresses one byte, returning it or -1.
 ///
-/// The port of `gzgetc` (`gzread.c` L467-L498), declared at `zlib.h` L1613.
+/// Implements `gzgetc` (`gzread.c` L467-L498), declared at `zlib.h` L1613.
 ///
 /// Callers do not normally arrive here. `gzgetc` is also a macro (`zlib.h` L1967-L1968) whose fast
 /// path serves the byte out of the exposed prefix in the caller's own object code, and the function
@@ -1533,7 +1406,7 @@ pub fn gzgetc<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>) -> c_int 
 
 /// The plain function form of [`gzgetc`].
 ///
-/// The port of `gzgetc_` (`gzread.c` L500-L502). It exists because `gzgetc` is a macro: `zlib.h`
+/// Implements `gzgetc_` (`gzread.c` L500-L502). It exists because `gzgetc` is a macro: `zlib.h`
 /// L1961 declares this name so that a library built before the macro existed still links, and the
 /// macro's own fallback arm calls `(gzgetc)(g)`, which resolves to the exported function. It must
 /// remain reachable and must do nothing but delegate.
@@ -1543,7 +1416,7 @@ pub fn gzgetc_<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>) -> c_int
 
 /// Pushes one byte back so that it is read first next time, returning it or -1.
 ///
-/// The port of `gzungetc` (`gzread.c` L504-L563), declared at `zlib.h` L1630. At least one push is
+/// Implements `gzungetc` (`gzread.c` L504-L563), declared at `zlib.h` L1630. At least one push is
 /// always allowed, and immediately after opening the whole output buffer is available for pushing
 /// (`zlib.h` L1633-L1637), because the buffer is `2 * size` bytes and starts empty.
 ///
@@ -1557,7 +1430,7 @@ pub fn gzgetc_<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>) -> c_int
 ///
 /// # The five cases
 ///
-/// 1. Just opened with nothing buffered: [`gz_look`] runs first so the buffers exist (L515-L517).
+/// 1. Just opened with nothing buffered: `gz_look` runs first so the buffers exist (L515-L517).
 /// 2. Empty buffer: the byte is parked at `2 * size - 1`, the very last position, which "allows more
 ///    pushing" (L532-L540).
 /// 3. Completely full buffer: `Z_DATA_ERROR` "out of room to push characters" (L542-L546).
@@ -1568,7 +1441,6 @@ pub fn gzgetc_<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>) -> c_int
 /// In every accepting case `pos` moves back by one and `past` is cleared, so a push after end of file
 /// makes the stream readable again.
 pub fn gzungetc<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, c: c_int) -> c_int {
-    // L508-L513.
     if state.mode() != GZ_READ {
         return -1;
     }
@@ -1582,14 +1454,12 @@ pub fn gzungetc<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, c: c_in
         let _ = gz_look(state);
     }
 
-    // L519-L522.
     if !err_permits_reading(state.err()) && !state.again() {
         state.refresh_exposed();
         return -1;
     }
     gz_error(state, ReturnCode::OK, None);
 
-    // L524-L526.
     if state.skip() != 0 && gz_skip(state).is_err() {
         state.refresh_exposed();
         return -1;
@@ -1683,7 +1553,7 @@ pub fn gzungetc<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, c: c_in
 
 /// Reads one line into `buf`, stopping at a newline, at `buf.len() - 1` bytes, or at end of file.
 ///
-/// The port of `gzgets` (`gzread.c` L565-L624), declared at `zlib.h` L1588. `buf` is the caller's
+/// Implements `gzgets` (`gzread.c` L565-L624), declared at `zlib.h` L1588. `buf` is the caller's
 /// `(buf, len)` pair, so `buf.len()` is C's `len` and the terminating zero is written inside it.
 ///
 /// Returns the number of data bytes copied, with a zero byte written just past them, or [`None`] when
@@ -1699,7 +1569,7 @@ pub fn gzungetc<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, c: c_in
 /// * **`len == 1` returns [`None`].** C computes `left = len - 1`, skips its loop when `left` is
 ///   zero, and then returns `NULL` because nothing was written (L592-L621) -- so the terminating zero
 ///   is *not* written either. `zlib.h` L1592-L1593 reads as though it were; the implementation is the
-///   oracle, and this port matches the implementation.
+///   oracle, and this implementation matches the implementation.
 pub fn gzgets<'a, A: Allocator<'a> + Copy>(
     state: &mut GzState<'a, A>,
     buf: &mut [u8],
@@ -1712,19 +1582,15 @@ pub fn gzgets<'a, A: Allocator<'a> + Copy>(
         return None;
     }
 
-    // L585-L587.
     if state.skip() != 0 && gz_skip(state).is_err() {
         state.refresh_exposed();
         return None;
     }
 
-    // L589-L592.
     let mut written = 0_usize;
     let mut left = buf.len().saturating_sub(1);
 
-    // L593: `if (left) do { ... } while (left && eol == NULL);`
     while left != 0 {
-        // L594-L596.
         if state.have() == 0 && gz_fetch(state).is_err() {
             break;
         }
@@ -1769,7 +1635,6 @@ pub fn gzgets<'a, A: Allocator<'a> + Copy>(
         }
     }
 
-    // L617-L623.
     if written == 0 {
         state.refresh_exposed();
         return None;
@@ -1783,7 +1648,7 @@ pub fn gzgets<'a, A: Allocator<'a> + Copy>(
 
 /// Closes a read stream, releasing everything it owns.
 ///
-/// The port of `gzclose_r` (`gzread.c` L644-L667), declared at `zlib.h` L1763. The teardown order is
+/// Implements `gzclose_r` (`gzread.c` L644-L667), declared at `zlib.h` L1763. The teardown order is
 /// C's and is observable: `test/infcover.c`'s tracking allocator reports a release that is not
 /// last-in-first-out (L200-L234), so the engine goes first, then the output buffer, then the input
 /// buffer.
@@ -1801,7 +1666,6 @@ pub fn gzgets<'a, A: Allocator<'a> + Copy>(
 ///   truncated stream, and `gzclose` is where it finally surfaces.
 /// * [`ReturnCode::OK`] otherwise.
 pub fn gzclose_r<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>) -> ReturnCode {
-    // L649-L654.
     if state.mode() != GZ_READ {
         return ReturnCode::STREAM_ERROR;
     }
@@ -1823,19 +1687,15 @@ pub fn gzclose_r<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>) -> Ret
     } else {
         ReturnCode::OK
     };
-    // L663.
     gz_error(state, ReturnCode::OK, None);
-    // L664: `free(state->path)`.
     state.path = Vec::new();
 
-    // L665: `ret = close(state->fd);`
-    let closed = match state.take_handle() {
-        Some(mut handle) => handle.close().is_ok(),
-        // Already closed: C cannot reach this, since `gzclose` may not be called twice.
-        None => true,
-    };
+    // L665: `ret = close(state->fd);`. `GzFileSlot::close` reports the underlying handle's
+    // result unchanged, so a facade handle backed by a real `close(2)` answers `Z_ERRNO` exactly
+    // when C does. An empty slot reports success; C cannot reach that, since `gzclose` may not be
+    // called twice on one stream.
+    let closed = state.take_handle().close().is_ok();
 
-    // L667: `return ret ? Z_ERRNO : err;`
     if closed {
         err
     } else {
@@ -1843,13 +1703,9 @@ pub fn gzclose_r<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>) -> Ret
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Positioning -- `gzlib.c` L346-L495
-// -----------------------------------------------------------------------------
-
 /// Rewinds a read stream to where its gzip data started.
 ///
-/// The port of `gzrewind` (`gzlib.c` L345-L364), declared at `zlib.h` L1683, which documents it as
+/// Implements `gzrewind` (`gzlib.c` L345-L364), declared at `zlib.h` L1683, which documents it as
 /// equivalent to `(int)gzseek(file, 0L, SEEK_SET)`.
 ///
 /// Reading only, and only while the recorded error still permits it. The file is repositioned to
@@ -1860,7 +1716,6 @@ pub fn gzclose_r<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>) -> Ret
 ///
 /// Returns 0, or -1 if the mode, the error state or the seek forbids it.
 pub fn gzrewind<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> c_int {
-    // L349-L357.
     if state.mode() != GZ_READ || !err_permits_reading(state.err()) {
         return -1;
     }
@@ -1868,7 +1723,6 @@ pub fn gzrewind<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> c_int {
         return -1;
     }
 
-    // L359-L361.
     let start = state.start();
     let sought = match state.handle_mut() {
         Some(handle) => handle.seek(start, GzSeekFrom::Start).is_ok(),
@@ -1888,20 +1742,24 @@ pub fn gzrewind<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> c_int {
 
 /// Sets the position for the next read, in uncompressed bytes.
 ///
-/// The port of `gzseek64` (`gzlib.c` L366-L435), the 64-bit form behind both `gzseek` and `gzseek64`
+/// Implements `gzseek64` (`gzlib.c` L366-L435), the 64-bit form behind both `gzseek` and `gzseek64`
 /// (`zlib.h` L1663 and L2018). `whence` is the raw C argument: only `SEEK_SET` and `SEEK_CUR` are
 /// accepted, because the uncompressed length of a gzip stream is unknown without decompressing it, so
 /// `SEEK_END` "is not supported" (`zlib.h` L1668-L1669).
 ///
 /// Returns the resulting position, or -1 on error. Actual seeking is **deferred**: the request is
-/// recorded in `skip` and carried out by [`gz_skip`] at the next read (`zlib.h` L1674-L1675), which is
+/// recorded in `skip` and carried out by `gz_skip` at the next read (`zlib.h` L1674-L1675), which is
 /// why the returned value is `pos + offset` rather than something read back from the file.
 ///
 /// # The four paths, in C's order
 ///
 /// 1. **Normalisation** (L387-L393). `SEEK_SET` becomes `offset -= pos`. `SEEK_CUR` adds any pending
 ///    seek that has not yet run -- unless `past` is set, in which case the pending skip has already
-///    been clipped by end of file -- and then clears it.
+///    been clipped by end of file -- and then clears it. Both arithmetic steps are **checked**, and
+///    the absolute landing position is established as representable, before any field is written: a
+///    request that cannot be normalised is answered with -1 and leaves the stream byte for byte as
+///    it was, pending skip included. C wraps instead, which turns a `SEEK_SET` of `i64::MIN` into an
+///    eight-exabyte forward skip that `gz_skip` then attempts.
 /// 2. **The raw-area fast path** (L395-L409), taken only while reading a transparent stream. Here a
 ///    real seek is possible, so the file moves by `offset - have`, the buffered output and the flags
 ///    are discarded, and the new position is returned immediately.
@@ -1922,40 +1780,75 @@ pub fn gzseek64<'a, A: Allocator<'a>>(
 ) -> ZOff64 {
     let mut offset = offset;
 
-    // L372-L377.
     if state.mode() != GZ_READ && state.mode() != GZ_WRITE {
         return -1;
     }
     if state.resync_from_exposed().is_err() {
         return -1;
     }
-    // L379-L381.
     if !err_permits_reading(state.err()) {
         return -1;
     }
+    // L383-L393, normalisation. Every arithmetic step below is checked, and **all of it happens
+    // before a single field is written**, because the contract this function offers on failure is
+    // that the stream is left exactly as it was: a rejected `gzseek` must not have consumed the
+    // pending skip, discarded the output window, or moved the file.
+    //
+    // C's `offset -= state->x.pos` / `offset += state->skip` are signed additions on a
+    // caller-supplied `z_off64_t` and overflow them for extreme inputs -- undefined behaviour, which
+    // in practice wraps. Wrapping is the worst possible answer here, not merely an imprecise one: at
+    // `pos == 1`, `SEEK_SET` with `i64::MIN` wraps to `i64::MAX`, so "seek to the most negative
+    // position imaginable" becomes "skip forward eight exabytes", and `gz_skip` then sets about
+    // actually doing it, decompressing the whole stream to end of file. A request whose normalised
+    // form is not representable cannot be honoured at all, so it is refused with -1.
+    //
     // L383-L385: `SEEK_END` and anything unrecognised are refused.
-    match GzSeekFrom::from_raw(whence) {
-        Some(GzSeekFrom::Start) => {
-            // L387-L389.
-            offset = offset.wrapping_sub(state.pos());
-        }
+    let (normalised, consumes_pending_skip) = match GzSeekFrom::from_raw(whence) {
+        // L387-L389: `offset -= state->x.pos`.
+        Some(GzSeekFrom::Start) => (offset.checked_sub(state.pos()), false),
+        // L390-L393: `offset += state->past ? 0 : state->skip`, and then `state->skip = 0`. The
+        // clearing is deferred to after every check, which is why the two statements are separated
+        // here: a caller whose request is refused keeps the deferred seek it already had.
         Some(GzSeekFrom::Current) => {
-            // L390-L393.
             let pending = if state.past() { 0 } else { state.skip() };
-            offset = offset.wrapping_add(pending);
-            state.set_skip(0);
+            (offset.checked_add(pending), true)
         }
         Some(GzSeekFrom::End) | None => return -1,
+    };
+    let Some(normalised) = normalised else {
+        return -1;
+    };
+    offset = normalised;
+
+    // The absolute position this request will land on, computed once, here, while the stream is
+    // still untouched. `pos + offset` is **invariant** across everything that follows -- the raw
+    // fast path adds `offset` to `pos`, the backwards branch moves `pos` into `offset` and rewinds
+    // `pos` to zero, and the buffered-skip loop adds `n` to `pos` while subtracting it from
+    // `offset` -- so this single value is simultaneously C's `state->x.pos + offset` guard at L397,
+    // its `offset < 0` "before start of file" test at L416, and its return value at L434. Computing
+    // it up front is what makes an unrepresentable target refusable before any mutation, instead of
+    // discovered after the output window has already been thrown away.
+    let Some(landing) = state.pos().checked_add(offset) else {
+        return -1;
+    };
+
+    // The last of the normalisation, now that nothing can refuse the request on arithmetic grounds.
+    if consumes_pending_skip {
+        state.set_skip(0);
     }
 
-    // L395-L409: if within the raw area while reading, just go there.
-    let reachable = state
-        .pos()
-        .checked_add(offset)
-        .is_some_and(|position| position >= 0);
-    if state.mode() == GZ_READ && state.how() == COPY && reachable {
-        // L398: `LSEEK(state->fd, offset - (z_off64_t)state->x.have, SEEK_CUR)`.
-        let delta = offset.wrapping_sub(ZOff64::from(state.have()));
+    // L395-L409: if within the raw area while reading, just go there. C's `state->x.pos + offset >= 0`
+    // is exactly `landing >= 0`.
+    if state.mode() == GZ_READ && state.how() == COPY && landing >= 0 {
+        // L398: `LSEEK(state->fd, offset - (z_off64_t)state->x.have, SEEK_CUR)`. `have` is a
+        // `c_uint` widened to 64 bits, so this can only underflow when `offset` is already within
+        // `u32::MAX` of `i64::MIN`, which `landing >= 0` all but excludes. It is checked rather than
+        // assumed so that no input can produce a wrapped displacement, and the refusal happens
+        // before the window and the flags are discarded, so the stream is untouched.
+        let Some(delta) = offset.checked_sub(ZOff64::from(state.have())) else {
+            state.refresh_exposed();
+            return -1;
+        };
         let sought = match state.handle_mut() {
             Some(handle) => handle.seek(delta, GzSeekFrom::Current).is_ok(),
             None => false,
@@ -1974,7 +1867,6 @@ pub fn gzseek64<'a, A: Allocator<'a>>(
         state.stream_mut().avail_in = 0;
         state.add_pos(offset);
         state.refresh_exposed();
-        // L408.
         return state.pos();
     }
 
@@ -1985,13 +1877,14 @@ pub fn gzseek64<'a, A: Allocator<'a>>(
             state.refresh_exposed();
             return -1;
         }
-        offset = offset.wrapping_add(state.pos());
+        // L415: `offset += state->x.pos`, re-expressing the request from the start of the stream --
+        // which is precisely `landing`, already computed and already known to be representable.
+        offset = landing;
         // L416-L417: before the start of the file.
         if offset < 0 {
             state.refresh_exposed();
             return -1;
         }
-        // L418-L419.
         if gzrewind(state) == -1 {
             state.refresh_exposed();
             return -1;
@@ -2006,18 +1899,29 @@ pub fn gzseek64<'a, A: Allocator<'a>>(
             return -1;
         }
         state.add_pos(ZOff64::from(n));
-        offset = offset.wrapping_sub(ZOff64::from(n));
+        // L429: `offset -= n`. `clamp_to_have` never returns more than `offset` itself when `offset`
+        // is non-negative, and `offset >= 0` holds on every path that reaches here -- a negative one
+        // was either rejected above or turned into the non-negative `landing` -- so the subtraction
+        // cannot underflow. It is checked rather than wrapped so the guarantee is enforced instead of
+        // relied upon, and the invariant `pos + offset == landing` is preserved because the same `n`
+        // was just added to `pos`.
+        let Some(remaining) = offset.checked_sub(ZOff64::from(n)) else {
+            state.refresh_exposed();
+            return -1;
+        };
+        offset = remaining;
     }
 
-    // L432-L434: request the skip and report where it will land.
+    // L432-L434: request the skip and report where it will land. C computes `state->x.pos + offset`
+    // here; `landing` is that value, established as representable before anything was modified.
     state.set_skip(offset);
     state.refresh_exposed();
-    state.pos().saturating_add(offset)
+    landing
 }
 
 /// The position the next read or write will start at, in uncompressed bytes.
 ///
-/// The port of `gztell64` (`gzlib.c` L445-L458), the 64-bit form behind both `gztell` and `gztell64`
+/// Implements `gztell64` (`gzlib.c` L445-L458), the 64-bit form behind both `gztell` and `gztell64`
 /// (`zlib.h` L1691 and L2019). Any deferred seek is included, which is what makes the
 /// `gzungetc(-1, file)` idiom work: force the seek to run, then ask where it ended up
 /// (`zlib.h` L1641-L1644). A seek that has already been clipped by end of file sets `past`, and its
@@ -2033,18 +1937,16 @@ pub fn gzseek64<'a, A: Allocator<'a>>(
 /// which is also why an immutable borrow suffices.
 #[must_use]
 pub fn gztell64<'a, A: Allocator<'a>>(state: &GzState<'a, A>) -> ZOff64 {
-    // L449-L454.
     if state.mode() != GZ_READ && state.mode() != GZ_WRITE {
         return -1;
     }
-    // L456-L457.
     let pending = if state.past() { 0 } else { state.skip() };
     state.pos().saturating_add(pending)
 }
 
 /// The current offset in the compressed file, in actual bytes.
 ///
-/// The port of `gzoffset64` (`gzlib.c` L468-L487), the 64-bit form behind both `gzoffset` and
+/// Implements `gzoffset64` (`gzlib.c` L468-L487), the 64-bit form behind both `gzoffset` and
 /// `gzoffset64` (`zlib.h` L1702 and L2020). It includes any bytes that precede the gzip data, which
 /// is what makes it useful as a progress indicator when appending or when reading from a descriptor
 /// positioned part way into a file (`zlib.h` L1704-L1708).
@@ -2058,12 +1960,10 @@ pub fn gztell64<'a, A: Allocator<'a>>(state: &GzState<'a, A>) -> ZOff64 {
 /// so it neither resynchronises nor refreshes the exposed prefix. It cannot: an offset in the
 /// compressed file has nothing to do with the output cursor.
 pub fn gzoffset64<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> ZOff64 {
-    // L473-L478.
     if state.mode() != GZ_READ && state.mode() != GZ_WRITE {
         return -1;
     }
 
-    // L480-L483: `LSEEK(state->fd, 0, SEEK_CUR)`.
     let offset = match state.handle_mut() {
         Some(handle) => handle.seek(0, GzSeekFrom::Current),
         None => return -1,
@@ -2106,10 +2006,6 @@ fn request_fits_in_int(len: usize) -> bool {
     c_int::try_from(len).is_ok()
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     // The crate denies the panic-prone lints in library code, which is right there and wrong here:
@@ -2124,20 +2020,20 @@ mod tests {
 
     use super::{
         clamp_to_have, gz_fetch, gz_look, gzclose_r, gzgetc, gzgetc_, gzgets, gzread, gzrewind,
-        gzseek64, gztell64, gzungetc, narrow_offset, request_fits_in_int, ErrnoMessage,
-        MAX_READ_CHUNK,
+        gzseek64, gztell64, gzungetc, narrow_offset, request_fits_in_int, MAX_READ_CHUNK,
     };
     use crate::allocate::GlobalAllocator;
     use crate::error::ReturnCode;
+    use crate::gz::gzclearerr;
     use crate::gz::state::{
-        GzHandle, GzIoError, GzSeekFrom, GzState, ZOff64, COPY, GZIP, GZ_READ, GZ_WRITE, LOOK,
+        GzFileSlot, GzHandle, GzIoError, GzSeekFrom, GzState, ZOff64, COPY, GZIP, GZ_READ,
+        GZ_WRITE, LOOK,
     };
     use alloc::boxed::Box;
     use alloc::vec;
     use alloc::vec::Vec;
     use core::cell::Cell;
     use core::ffi::c_int;
-    use core::fmt::Write as _;
 
     /// `"hello, hello!\0"` as a gzip member, produced by zlib itself at the default level.
     ///
@@ -2283,8 +2179,10 @@ mod tests {
         state.set_direct(1);
         state.set_want(want);
         state.try_set_path(b"memory").unwrap();
-        let previous = state.set_handle(Some(Box::new(MemoryFile::new(data, behaviour, closes))));
-        assert!(previous.is_none());
+        let previous = state.set_handle(GzFileSlot::Boxed(Box::new(MemoryFile::new(
+            data, behaviour, closes,
+        ))));
+        assert!(!previous.is_installed(), "the slot was empty before");
         state
     }
 
@@ -2300,7 +2198,6 @@ mod tests {
 
     #[test]
     fn max_read_chunk_is_the_c_expression() {
-        // `gzread.c` L21: `((unsigned)-1 >> 2) + 1`.
         assert_eq!(MAX_READ_CHUNK, (u32::MAX >> 2) + 1);
         assert_eq!(MAX_READ_CHUNK, 0x4000_0000);
     }
@@ -2394,9 +2291,7 @@ mod tests {
         // A valid gzip header followed by nonsense. `junk` is 1 from the moment the header is
         // detected (`gzread.c` L156) and only becomes 0 once a byte has actually been decompressed
         // (L203), so a `Z_DATA_ERROR` here takes the trailing-garbage arm: no error is reported and
-        // the file is simply at its end.
-        //
-        // Verified against the C library built from this tree: `gzread=0 err=0 eof=1 direct=0`.
+        // the file is simply at its end. The assertions below are that outcome.
         let mut data = HELLO_GZ.to_vec();
         for byte in data.iter_mut().skip(10) {
             *byte = 0xff;
@@ -2444,11 +2339,9 @@ mod tests {
     fn a_gzip_only_stream_never_reads_transparently() {
         // `direct == -1` is the `G` mode letter (`gzlib.c` L157): detection is skipped and the
         // engine is used whatever the data looks like (`gzread.c` L127-L133).
+        // So non-gzip input is a `Z_DATA_ERROR` with "incorrect header check", not a transparent
+        // read, and `direct` is cleared on the way.
         let closes = Cell::new(0);
-        //
-        // Verified against the C library built from this tree, which reports
-        // `gzread=-1 err=-3 direct=0` with the message "incorrect header check" for this input in
-        // mode `"rbG"`.
         let mut state = reader(b"not gzip at all", 8192, Behaviour::Whole, &closes);
         state.set_direct(-1);
         let mut buf = [0_u8; 32];
@@ -2642,7 +2535,6 @@ mod tests {
 
     #[test]
     fn gzungetc_slides_the_window_when_the_cursor_is_at_the_front() {
-        // `gzread.c` L548-L556.
         let closes = Cell::new(0);
         let mut state = default_reader(&HELLO_GZ, &closes);
         gz_fetch(&mut state).unwrap();
@@ -2758,7 +2650,6 @@ mod tests {
 
     #[test]
     fn gzfread_rejects_an_overflowing_product() {
-        // `gzread.c` L456-L461.
         let closes = Cell::new(0);
         let mut state = default_reader(&HELLO_GZ, &closes);
         let mut buf = [0_u8; 8];
@@ -2768,6 +2659,124 @@ mod tests {
             "the product does not fit in a size_t"
         );
         assert_eq!(state.err(), ReturnCode::STREAM_ERROR.as_i32());
+    }
+
+    /// F13: a buffer too short for `size * nitems` is refused before anything is read.
+    ///
+    /// C cannot detect this -- it has a bare pointer -- so there is no C behaviour to reproduce; the
+    /// choice is between refusing and silently reading less. Refusing is the only answer a caller can
+    /// act on, because `gzfread` reports whole items and a short count is exactly what end of file
+    /// looks like.
+    #[test]
+    fn gzfread_refuses_a_buffer_too_short_for_the_product() {
+        let closes = Cell::new(0);
+        let mut state = default_reader(&HELLO_GZ, &closes);
+        let mut buf = [0_u8; 8];
+        // 4 items of 4 bytes is 16, and only 8 were offered.
+        assert_eq!(super::gzfread(&mut state, &mut buf, 4, 4), 0);
+        assert_eq!(state.err(), ReturnCode::STREAM_ERROR.as_i32());
+        assert_eq!(
+            gztell64(&state),
+            0,
+            "the stream position must not have moved"
+        );
+        assert_eq!(buf, [0_u8; 8], "and nothing may have been written");
+        // The refusal is recoverable: clearing it and asking for what fits works.
+        gzclearerr(Some(&mut state));
+        assert_eq!(super::gzfread(&mut state, &mut buf, 4, 2), 2);
+        assert_eq!(&buf[..8], &HELLO[..8]);
+    }
+
+    /// F13: exactly the product is accepted; the boundary is `<`, not `<=`.
+    #[test]
+    fn gzfread_accepts_a_buffer_exactly_the_size_of_the_product() {
+        let closes = Cell::new(0);
+        let mut state = default_reader(&HELLO_GZ, &closes);
+        let mut buf = [0_u8; 12];
+        assert_eq!(super::gzfread(&mut state, &mut buf, 4, 3), 3);
+        assert_eq!(state.err(), ReturnCode::OK.as_i32());
+        assert_eq!(&buf[..12], &HELLO[..12]);
+    }
+
+    /// A [`GzHandle`] that claims to have read more than it was offered.
+    ///
+    /// Not reachable through any real file; it exists because the trait's contract has to be
+    /// enforceable and enforcement has to be tested. See `HANDLE_OVER_REPORTED`.
+    struct OverReportingReader {
+        /// How much to add to the honest count.
+        excess: usize,
+    }
+
+    impl GzHandle for OverReportingReader {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, GzIoError> {
+            // Fill honestly, then lie about how much was filled.
+            buf.fill(b'Z');
+            Ok(buf.len().saturating_add(self.excess))
+        }
+
+        fn write(&mut self, _buf: &[u8]) -> Result<usize, GzIoError> {
+            Err(GzIoError::new(0, false))
+        }
+
+        fn seek(&mut self, _offset: ZOff64, _whence: GzSeekFrom) -> Result<ZOff64, GzIoError> {
+            Ok(0)
+        }
+
+        fn set_nonblocking(&mut self, _nonblocking: bool) -> Result<(), GzIoError> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), GzIoError> {
+            Ok(())
+        }
+    }
+
+    /// F14: a read count larger than the window offered is refused, not clamped.
+    ///
+    /// Clamping was the previous behaviour and it is the unsafe one in the meaningful sense: the layer
+    /// would go on treating buffer bytes the handle never wrote as data it had supplied.
+    #[test]
+    fn a_handle_that_over_reports_a_read_is_refused() {
+        let mut state: GzState<'static, GlobalAllocator> = GzState::new(GlobalAllocator);
+        state.set_mode(GZ_READ);
+        state.set_direct(1);
+        state.set_want(32);
+        let previous = state.set_handle(GzFileSlot::Boxed(Box::new(OverReportingReader {
+            excess: 1,
+        })));
+        assert!(!previous.is_installed());
+
+        let mut buf = [0_u8; 16];
+        assert_eq!(
+            gzread(&mut state, &mut buf),
+            -1,
+            "an over-reporting handle must not produce data"
+        );
+        assert_eq!(
+            state.err(),
+            ReturnCode::STREAM_ERROR.as_i32(),
+            "and it is a stream error, not an errno"
+        );
+        assert_eq!(state.have(), 0, "no cursor may have moved");
+        assert_eq!(gztell64(&state), 0);
+    }
+
+    /// F14 boundary: reporting exactly the window is honest and is accepted.
+    #[test]
+    fn a_handle_that_reports_exactly_the_window_is_accepted() {
+        let mut state: GzState<'static, GlobalAllocator> = GzState::new(GlobalAllocator);
+        state.set_mode(GZ_READ);
+        state.set_direct(1);
+        state.set_want(32);
+        let previous = state.set_handle(GzFileSlot::Boxed(Box::new(OverReportingReader {
+            excess: 0,
+        })));
+        assert!(!previous.is_installed());
+
+        let mut buf = [0_u8; 16];
+        assert_eq!(gzread(&mut state, &mut buf), 16);
+        assert_eq!(state.err(), ReturnCode::OK.as_i32());
+        assert_eq!(buf, [b'Z'; 16]);
     }
 
     #[test]
@@ -2800,7 +2809,6 @@ mod tests {
 
     #[test]
     fn a_large_request_reads_transparently_into_the_caller_buffer() {
-        // `gzread.c` L367-L369.
         let closes = Cell::new(0);
         let data = vec![b'q'; 200];
         let mut state = reader(&data, 8, Behaviour::Whole, &closes);
@@ -2886,6 +2894,71 @@ mod tests {
     }
 
     #[test]
+    fn gzseek64_refuses_an_offset_that_cannot_be_normalised() {
+        // The condition C's `offset -= state->x.pos` overflows on. At `pos == 1`, wrapping turns
+        // `i64::MIN` into `i64::MAX` and schedules an eight-exabyte forward skip; the checked form
+        // refuses the request and leaves the stream untouched.
+        let closes = Cell::new(0);
+        let mut state = default_reader(&HELLO_GZ, &closes);
+        let mut one = [0_u8; 1];
+        assert_eq!(gzread(&mut state, &mut one), 1);
+        assert_eq!(gztell64(&state), 1);
+
+        assert_eq!(
+            gzseek64(&mut state, ZOff64::MIN, GzSeekFrom::Start.as_raw()),
+            -1
+        );
+        // Nothing moved, and in particular no enormous skip was scheduled.
+        assert_eq!(state.skip(), 0);
+        assert_eq!(gztell64(&state), 1);
+        // The stream still reads correctly from where it was.
+        let mut rest = [0_u8; 32];
+        let got = count(gzread(&mut state, &mut rest));
+        assert_eq!(&rest[..got], &HELLO[1..]);
+    }
+
+    #[test]
+    fn gzseek64_overflow_leaves_a_pending_skip_intact() {
+        // `SEEK_CUR` normalisation is `offset += skip; skip = 0`. When the addition cannot be
+        // represented the request is refused *before* `skip` is cleared, so a deferred seek the
+        // caller already asked for is not silently discarded.
+        let closes = Cell::new(0);
+        let mut state = default_reader(&HELLO_GZ, &closes);
+        assert_eq!(gzseek64(&mut state, 7, GzSeekFrom::Start.as_raw()), 7);
+        assert_eq!(state.skip(), 7, "the forward seek is deferred");
+
+        assert_eq!(
+            gzseek64(&mut state, ZOff64::MAX, GzSeekFrom::Current.as_raw()),
+            -1
+        );
+        assert_eq!(state.skip(), 7, "the pending skip survives the refusal");
+        assert_eq!(gztell64(&state), 7);
+        let mut buf = [0_u8; 16];
+        let got = count(gzread(&mut state, &mut buf));
+        assert_eq!(&buf[..got], &HELLO[7..], "the deferred seek still runs");
+    }
+
+    #[test]
+    fn gzseek64_refuses_an_unrepresentable_landing_position() {
+        // `pos + offset` is what C returns; an unrepresentable sum is refused rather than wrapped
+        // into a negative "position". Exercised on the raw path, where `landing >= 0` is also the
+        // fast-path guard, and on the deferred path.
+        let closes = Cell::new(0);
+        let data: Vec<u8> = (0..=255_u8).collect();
+        let mut state = reader(&data, 64, Behaviour::Whole, &closes);
+        let mut buf = [0_u8; 4];
+        assert_eq!(gzread(&mut state, &mut buf), 4);
+        assert_eq!(state.how(), COPY);
+
+        assert_eq!(
+            gzseek64(&mut state, ZOff64::MAX, GzSeekFrom::Current.as_raw()),
+            -1
+        );
+        assert_eq!(state.skip(), 0);
+        assert_eq!(gztell64(&state), 4, "position unchanged");
+    }
+
+    #[test]
     fn gzoffset64_does_not_count_buffered_input() {
         let closes = Cell::new(0);
         let mut state = default_reader(&HELLO_GZ, &closes);
@@ -2902,22 +2975,6 @@ mod tests {
         assert_eq!(narrow_offset::<i32>(1234), Some(1234));
         assert_eq!(narrow_offset::<i32>(ZOff64::from(i32::MAX) + 1), None);
         assert_eq!(narrow_offset::<i64>(ZOff64::MAX), Some(ZOff64::MAX));
-    }
-
-    #[test]
-    fn the_message_buffer_truncates_instead_of_failing() {
-        let mut message = ErrnoMessage::new();
-        for _ in 0..40 {
-            write!(message, "0123456789").unwrap();
-        }
-        assert_eq!(message.as_bytes().len(), 128);
-        // A multi-byte character is never split.
-        let mut narrow = ErrnoMessage::new();
-        for _ in 0..100 {
-            write!(narrow, "é").unwrap();
-        }
-        assert_eq!(narrow.as_bytes().len() % 2, 0);
-        assert!(core::str::from_utf8(narrow.as_bytes()).is_ok());
     }
 
     #[test]

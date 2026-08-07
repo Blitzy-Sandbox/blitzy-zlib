@@ -1,6 +1,6 @@
 //! The sliding window and the hash tables that index it.
 //!
-//! Port of two functions from the reference implementation, and nothing else:
+//! Mirrors two functions from the reference implementation, and nothing else:
 //!
 //! | Here | There | Role |
 //! |---|---|---|
@@ -60,7 +60,7 @@
 //! bytes changes what the match routines compare against.
 //!
 //! In safe Rust the reason is if anything stronger. There is no way to observe uninitialized
-//! memory here — the buffer is an ordinary `&mut [u8]` — so the port cannot reproduce a read
+//! memory here — the buffer is an ordinary `&mut [u8]` — so the implementation cannot reproduce a read
 //! of *uninitialized* bytes even in principle; what it must reproduce is which bytes are
 //! *zero*. `test/infcover.c` fills every allocation with `0xa5` (L87) precisely to catch an
 //! implementation that assumes zeroed memory instead of doing this work, and
@@ -78,11 +78,11 @@
 //!   L170-L175) are [`crate::deflate::hash_chain`]. The priming loop below calls
 //!   [`seed_hash`] and [`insert_string_no_head`] rather than open-coding the four assignments,
 //!   so that the three places the reference expands `INSERT_STRING` cannot drift apart in this
-//!   port the way three macro expansions can.
-//! * **The `sizeof(int) <= 2` block** (`deflate.c` L262-L280) is not ported. It repairs two
+//!   implementation the way three macro expansions can.
+//! * **The `sizeof(int) <= 2` block** (`deflate.c` L262-L280) is not implemented. It repairs two
 //!   arithmetic accidents that only a 16-bit `int` produces: `more == 0` on a fresh window
 //!   whose `window_size` is exactly `UINT_MAX + 1`, and `more == (unsigned)(-1)` when
-//!   `strstart == 0 && lookahead == 1`. This port targets Tier-1 targets only, where `int` is
+//!   `strstart == 0 && lookahead == 1`. This implementation targets Tier-1 targets only, where `int` is
 //!   32 bits and both branches are unreachable; C keeps them because the guard is a runtime
 //!   `if` on a compile-time constant, which is also why the reference has to silence MSVC
 //!   warning 4127 around it. [`crate::weak_slice::Window::free_space`] saturates rather than
@@ -103,11 +103,11 @@
 //! slice projection goes through [`Option`], and the three `Assert(...)` calls the reference
 //! makes (`deflate.c` L257, L309, L374) are `debug_assert!` — those are `ZLIB_DEBUG`-only in C
 //! too (`zutil.h` L231 and L238 define `Assert` to nothing in a normal build), so promoting
-//! them to release-mode panics would make this port *less* faithful as well as less safe.
+//! them to release-mode panics would make this implementation *less* faithful as well as less safe.
 
 // `fill_window` ends with this module's name, which is what `module_name_repetitions` objects
 // to. The name is `fill_window` in `deflate.c` L252 and is what every caller in the reference
-// spells, so renaming it to please the lint would cost the correspondence this port is
+// spells, so renaming it to please the lint would cost the correspondence this implementation is
 // verified against. `state.rs` allows the same lint for the same reason.
 #![allow(clippy::module_name_repetitions)]
 
@@ -117,34 +117,7 @@ use crate::read_buf::{read_buf, InputCursor};
 
 /// Remaps both hash tables down by one window size, after the window has slid.
 ///
-/// Port of `slide_hash` (`deflate.c` L177-L210):
-///
-/// ```text
-/// local void slide_hash(deflate_state *s) {
-///     unsigned n, m;
-///     Posf *p;
-///     uInt wsize = s->w_size;
-///
-///     n = s->hash_size;
-///     p = &s->head[n];
-///     do {
-///         m = *--p;
-///         *p = (Pos)(m >= wsize ? m - wsize : NIL);
-///     } while (--n);
-/// #ifndef FASTEST
-///     n = wsize;
-///     p = &s->prev[n];
-///     do {
-///         m = *--p;
-///         *p = (Pos)(m >= wsize ? m - wsize : NIL);
-///         /* If n is not on any hash chain, prev[n] is garbage but
-///          * its value will never be used.
-///          */
-///     } while (--n);
-/// #endif
-///     s->slid = 1;
-/// }
-/// ```
+/// Mirrors `slide_hash` (`deflate.c` L177-L210).
 ///
 /// Both tables hold window offsets. Moving the window's upper half down to offset 0 subtracts
 /// `w_size` from every position, so an entry at or above `w_size` becomes `entry - w_size` and
@@ -154,7 +127,7 @@ use crate::read_buf::{read_buf, InputCursor};
 /// # Three details that are easy to get wrong
 ///
 /// * **The `prev` pass is part of the shipped build.** It is guarded by `#ifndef FASTEST`
-///   (`deflate.c` L198 and L208), and `FASTEST` is not defined in any build this port targets,
+///   (`deflate.c` L198 and L208), and `FASTEST` is not defined in any build this implementation targets,
 ///   so both `hash_size` `head` entries *and* `w_size` `prev` entries are remapped. Skipping
 ///   the second pass would leave every chain pointing into pre-slide coordinates.
 /// * **`slid` is set, and it is load-bearing for `deflateCopy`.** `deflate.c` L209 sets
@@ -186,7 +159,7 @@ use crate::read_buf::{read_buf, InputCursor};
 /// because it owns the two arrays; the per-entry rule is
 /// [`crate::weak_slice::Pos::slid_down`]. This function is the named entry point the reference
 /// has, and the composition is one line so that there is exactly one copy of the remapping in
-/// the port. Re-deriving it here would produce a second copy that could silently disagree.
+/// the implementation. Re-deriving it here would produce a second copy that could silently disagree.
 ///
 /// The C loops walk *downwards* from the end of each array; the delegate walks forwards. That
 /// cannot change the result: each entry is rewritten from its own previous value alone, with no
@@ -202,7 +175,7 @@ pub(crate) fn slide_hash<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) 
 /// Fills the window when the lookahead becomes insufficient, sliding it first if it is nearly
 /// full, and updates `strstart` and `lookahead`.
 ///
-/// Port of `fill_window` (`deflate.c` L242-L376), statement for statement and in the reference's
+/// Mirrors `fill_window` (`deflate.c` L242-L376), statement for statement and in the reference's
 /// order. Its own contract, quoted from `deflate.c` L243-L250:
 ///
 /// ```text
@@ -276,7 +249,7 @@ pub(crate) fn slide_hash<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) 
 /// are `debug_assert!`, so a state that violates the IN assertion, the `more >= 2` derivation or
 /// the OUT assertion fails loudly during testing — which is what `ZLIB_DEBUG` does in C.
 #[allow(
-    // `pedantic`'s `too_many_lines` counts the comments this port deliberately carries over
+    // `pedantic`'s `too_many_lines` counts the comments this implementation deliberately carries over
     // from `deflate.c`. The body is under thirty statements; splitting it to satisfy the lint
     // would break the one-to-one correspondence with L252-L376 that the byte-identical-output
     // requirement is verified against, which the agent brief rules out explicitly.
@@ -306,7 +279,7 @@ pub(crate) fn fill_window<'a, A: Allocator<'a>>(
     let wsize = state.w_size();
 
     // `(long) wsize` for the `block_start` adjustment at `deflate.c` L290, converted once.
-    // Exact for every window this port accepts: `w_bits <= MAX_WBITS` gives `wsize <= 32768`.
+    // Exact for every window this implementation accepts: `w_bits <= MAX_WBITS` gives `wsize <= 32768`.
     // The fallback is unreachable and is written rather than asserted so that this function has
     // no panicking path; saturating at `isize::MAX` would drive `block_start` to a value the
     // caller's `block_start >= 0` test rejects, which fails safe.
@@ -330,7 +303,7 @@ pub(crate) fn fill_window<'a, A: Allocator<'a>>(
         //                                                                (deflate.c L260)
         let mut more = state.window.free_space();
 
-        // `deflate.c` L262-L280, the `sizeof(int) <= 2` block, is deliberately not ported --
+        // `deflate.c` L262-L280, the `sizeof(int) <= 2` block, is deliberately not implemented --
         // see the module documentation. Nothing replaces it: on a 32-bit or 64-bit `int` both
         // of its branches are dead, and `free_space` saturates where C's `unsigned` subtraction
         // would wrap to `(unsigned)(-1)`.
@@ -573,10 +546,6 @@ pub(crate) fn fill_window<'a, A: Allocator<'a>>(
     );
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
 #[cfg(test)]
 #[allow(
     // Panicking and indexing are how a test reports a failure, and the fixtures below are
@@ -705,10 +674,6 @@ mod tests {
         (check, total_in)
     }
 
-    // -------------------------------------------------------------------------
-    //  slide_hash -- deflate.c L177-L210
-    // -------------------------------------------------------------------------
-
     /// Every entry of both tables becomes `m >= wsize ? m - wsize : NIL`
     /// (`deflate.c` L196 and L203), and `slid` becomes true (L209).
     ///
@@ -789,7 +754,7 @@ mod tests {
     /// This is the interaction `deflateCopy` depends on. It reads `ss->slid` to choose how much of
     /// `prev` to copy -- `(ss->slid || ss->strstart - ss->insert > ds->w_size ? ds->w_size :
     /// ss->strstart - ss->insert)` (`deflate.c` L1354-L1356) -- because once the tables have slid,
-    /// live entries exist across the whole array rather than only below `strstart`. A port that
+    /// live entries exist across the whole array rather than only below `strstart`. An implementation that
     /// set the flag but never cleared it, or cleared it but never set it, would make that copy
     /// either needlessly large or silently short.
     #[test]
@@ -809,10 +774,6 @@ mod tests {
         clear_hash(&mut state);
         assert!(!state.slid(), "CLEAR_HASH sets slid = 0 (deflate.c L174)");
     }
-
-    // -------------------------------------------------------------------------
-    //  fill_window -- the refill path
-    // -------------------------------------------------------------------------
 
     /// A buffer shorter than `MIN_LOOKAHEAD` is consumed whole, and the call returns with the
     /// input exhausted rather than spinning.
@@ -902,10 +863,6 @@ mod tests {
         assert_eq!(state.high_water(), WIN_INIT);
         assert!(window_bytes(&state, 0, WIN_INIT).iter().all(|&b| b == 0));
     }
-
-    // -------------------------------------------------------------------------
-    //  fill_window -- the slide, deflate.c L282-L295
-    // -------------------------------------------------------------------------
 
     /// Drives one `fill_window` call with `strstart` planted at `strstart`, no input, and
     /// recognisable values in the four cursors the slide adjusts.
@@ -1047,10 +1004,6 @@ mod tests {
         assert!(state.window.strstart <= bound);
         assert!(state.window.lookahead >= MIN_LOOKAHEAD);
     }
-
-    // -------------------------------------------------------------------------
-    //  fill_window -- high_water / WIN_INIT, deflate.c L340-L372
-    // -------------------------------------------------------------------------
 
     /// Case 1, `high_water < curr`: `WIN_INIT` bytes past the data are zeroed, or up to the end
     /// of the window, whichever is less (`deflate.c` L351-L360).
@@ -1196,10 +1149,6 @@ mod tests {
             .iter()
             .all(|&b| b == 0));
     }
-
-    // -------------------------------------------------------------------------
-    //  fill_window -- hash priming, deflate.c L313-L333
-    // -------------------------------------------------------------------------
 
     /// Priming `insert` positions is exactly `seed_hash` followed by `insert` calls to
     /// `insert_string_no_head`, and it drives `insert` to zero (`deflate.c` L316-L332).
@@ -1348,10 +1297,6 @@ mod tests {
         // No chain was touched, because the loop body never ran.
         assert_eq!(state.hash.head_entries(), before_head.as_slice());
     }
-
-    // -------------------------------------------------------------------------
-    //  The two together
-    // -------------------------------------------------------------------------
 
     /// A slide immediately followed by a refill leaves a coherent window: the history that
     /// survived is where the hash tables now say it is.

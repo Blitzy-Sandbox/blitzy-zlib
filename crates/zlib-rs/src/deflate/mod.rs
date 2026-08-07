@@ -1,7 +1,7 @@
 //! The DEFLATE compressor: the public half of `deflate.c`, and the root of the
 //! `deflate` module tree.
 //!
-//! This module is the port of the seventeen exported entry points of `deflate.c` --
+//! This module implements the seventeen exported entry points of `deflate.c` --
 //! `deflate` itself (L981-L1292) together with `deflateInit_`, `deflateInit2_`,
 //! `deflateEnd`, `deflateSetDictionary`, `deflateGetDictionary`, `deflateCopy`,
 //! `deflateReset`, `deflateResetKeep`, `deflateParams`, `deflateTune`, `deflateBound`,
@@ -15,8 +15,8 @@
 //! Nothing here is `#[no_mangle]`, `extern "C"` or `#[repr(C)]`, and nothing here
 //! touches a raw pointer. The crate root carries `#![forbid(unsafe_code)]`, which the
 //! compiler enforces. The exported C symbols live one layer up, in
-//! `crates/libz-rs-sys/src/deflate.rs`, which converts the caller's `z_stream` into the
-//! values these functions take and converts the [`ReturnCode`]s back into `int`s. Three
+//! the planned `crates/libz-rs-sys/src/deflate.rs`, which will convert the caller's `z_stream`
+//! into the values these functions take and convert the [`ReturnCode`]s back into `int`s. Three
 //! things C does inside these functions are therefore *not* done here, and each is
 //! called out where it belongs:
 //!
@@ -61,11 +61,18 @@
 //! There is no `unwrap()`, no `expect()` and no panicking index outside `#[cfg(test)]`.
 //! C's `Assert` becomes `debug_assert!` and C's `ERR_RETURN` becomes a [`ReturnCode`]
 //! return that records the message, through [`ReturnCode::record_msg`]. Where C relies on
-//! unsigned wraparound to make an expression well defined, this port uses a saturating
+//! unsigned wraparound to make an expression well defined, this implementation uses a saturating
 //! or checked operation that agrees with C on every reachable input and fails closed
 //! elsewhere; each such place says so.
+//!
+//! [`deflate_bound_z`]: crate::deflate::deflate_bound_z
 
-// Every item in this module is the port of a C function called `deflate*`, and the module
+// The definitions closing the module documentation above are link-reference definitions, not
+// prose: a module whose `mod` declaration carries an outer doc comment has its `//!` block
+// resolved in the scope of the DECLARING module, so an unqualified sibling name does not
+// resolve. See "Documentation lints" in `src/lib.rs` for the rule and the gate.
+
+// Every item in this module implements a C function called `deflate*`, and the module
 // is called `deflate`, so `clippy::module_name_repetitions` fires on nearly all of them.
 // The C names are the API contract -- `crates/libz-rs-sys` exports them verbatim -- so
 // the names are kept and the lint is relaxed for this file only, exactly as
@@ -74,11 +81,11 @@
 // The six `_tr_*` names are the C spellings of `deflate.h` L311-L318 and are kept for
 // oracle traceability, so calling them trips `clippy::used_underscore_items`. The same
 // relaxation, for the same reason, appears in `trees/mod.rs` and `deflate/algorithm.rs`.
-#![allow(clippy::used_underscore_items)]
-
-// -----------------------------------------------------------------------------
-//  Module wiring
-// -----------------------------------------------------------------------------
+// MSRV guard: `unknown_lints` comes first because `clippy::used_underscore_items` postdates the
+// declared 1.80 floor, where the lint NAME is itself an `unknown_lints` error under `-D warnings`.
+// Allowing `unknown_lints` in the same list makes the attribute inert on 1.80 and effective on
+// current stable. Do not drop it while the floor is 1.80.
+#![allow(unknown_lints, clippy::used_underscore_items)]
 
 // `deflate_state` itself is reachable from `trees/**`, which manipulates the same struct
 // in C (`trees.c`'s only `#include` is `"deflate.h"`), so this one submodule is `pub`.
@@ -100,11 +107,11 @@ pub(crate) mod window;
 
 // `crate::deflate::Flush` is the single canonical path to the flush enumeration: the
 // one-shot wrappers in `crate::compress`, the gzip write layer in `crate::gz::write` and
-// the facade in `crates/libz-rs-sys/src/deflate.rs` all reach it through here. There is
+// the facade planned for `crates/libz-rs-sys/src/deflate.rs` all reach it through here. There is
 // no second flush type in this module.
 pub use crate::deflate::algorithm::Flush;
 // `CONFIGURATION_TABLE` must keep exactly this identifier: `crate::lib` re-exports that
-// name, and `crates/zlib-rs-differential/tests/table_equality.rs` compares it
+// name, and the planned `crates/zlib-rs-differential/tests/table_equality.rs` will compare it
 // element-for-element against the C array.
 pub use crate::deflate::config_table::{Config, CONFIGURATION_TABLE};
 pub use crate::deflate::state::{DeflateState, Status};
@@ -131,13 +138,9 @@ use crate::error::ReturnCode;
 use crate::read_buf::{InputCursor, OutputCursor};
 use crate::trees::{_tr_align, _tr_flush_bits, _tr_init, _tr_stored_block};
 
-// -----------------------------------------------------------------------------
-//  OS_CODE -- zutil.h L98-L189
-// -----------------------------------------------------------------------------
-
 /// The `OS` byte of the gzip header: which operating system produced the stream.
 ///
-/// Port of `OS_CODE` (`zutil.h` L98-L189), which the reference implementation resolves
+/// Mirrors `OS_CODE` (`zutil.h` L98-L189), which the reference implementation resolves
 /// with a ladder of `#if`s over the *compiler's* platform macros and then defaults to
 /// `3`, "assume Unix" (L187-L189). `deflate.c` L1081 emits it verbatim for a gzip stream
 /// with no caller-supplied header; a caller that does supply one provides its own `os`
@@ -148,7 +151,7 @@ use crate::trees::{_tr_align, _tr_flush_bits, _tr_init, _tr_stored_block};
 /// emission site below.
 ///
 /// Only the values reachable on a Tier-1 Rust target are reproduced; the AAP places the
-/// Amiga, VMS, Atari, OS/2, classic MacOS, RISC OS, BeOS and OS/400 build scripts out of
+/// Amiga, VMS, Atari, OS/2, classic `MacOS`, RISC OS, `BeOS` and OS/400 build scripts out of
 /// scope, so their codes (1, 2, 5, 6, 7, 13, 16 and 18) have no `cfg` here. The value is
 /// **not** part of the byte-identity contract in the way the header layout is: a stream
 /// is compared against a C oracle built for the same target, and both then report the
@@ -168,10 +171,6 @@ pub const OS_CODE: u8 = 19;
 #[cfg(all(not(target_os = "windows"), not(target_vendor = "apple")))]
 pub const OS_CODE: u8 = 3;
 
-// -----------------------------------------------------------------------------
-//  The stand-in for the caller's z_stream
-// -----------------------------------------------------------------------------
-
 /// The parts of the caller's `z_stream` that the compressor reads and writes.
 ///
 /// C reaches all of this through `s->strm`, the back-pointer at `deflate.h` L105. A
@@ -182,14 +181,7 @@ pub const OS_CODE: u8 = 3;
 ///
 /// # The buffers are slices plus indices
 ///
-/// `z_stream` splits each buffer across two members (`zlib.h` L91-L95):
-///
-/// ```text
-/// z_const Bytef *next_in;  /* next input byte */
-/// uInt     avail_in;       /* number of bytes available at next_in */
-/// Bytef    *next_out;      /* next output byte will go here */
-/// uInt     avail_out;      /* remaining free space at next_out */
-/// ```
+/// `z_stream` splits each buffer across two members (`zlib.h` L91-L95).
 ///
 /// Here each becomes the *whole* buffer plus how far into it the stream has got.
 /// `avail_in` is [`Self::avail_in`] and `avail_out` is [`Self::avail_out`]. The whole
@@ -225,7 +217,7 @@ pub const OS_CODE: u8 = 3;
 /// addressable.
 ///
 /// One consequence is worth stating because it is a property of zlib and not of this
-/// port: when a mid-stream flush is pending, a caller offering only a handful of output
+/// implementation: when a mid-stream flush is pending, a caller offering only a handful of output
 /// bytes makes no forward progress -- `deflate` re-emits the flush marker on every call.
 /// `zlib.h` L326-L328 documents the contract that avoids it: keep calling with more
 /// output room until `avail_out` comes back non-zero, which is what tells the caller the
@@ -328,7 +320,7 @@ impl<'i, 'o> DeflateStream<'i, 'o> {
 /// The `z_stream` half of `deflateResetKeep` (`deflate.c` L651-L671).
 ///
 /// A reset touches both the compression state and the caller's stream. The state half is
-/// [`DeflateState::reset_keep`] plus [`lm_init`]; this carries the five stream fields out
+/// [`DeflateState::reset_keep`] plus `lm_init`; this carries the five stream fields out
 /// so that a caller which owns a `z_stream` -- or a [`DeflateStream`], through
 /// [`DeflateStream::apply_reset`] -- can apply them without this module needing the
 /// caller's buffers just to perform a reset.
@@ -347,10 +339,6 @@ pub struct DeflateReset {
     /// respectively, so a zlib stream reports `adler == 1` before a byte is compressed.
     pub adler: u32,
 }
-
-// -----------------------------------------------------------------------------
-//  deflateStateCheck -- deflate.c L535-L556
-// -----------------------------------------------------------------------------
 
 /// The status-validity half of `deflateStateCheck` (`deflate.c` L538-L556).
 ///
@@ -372,7 +360,7 @@ pub struct DeflateReset {
 /// that was never a stream at all -- is assigned to the facade by AAP §0.6.1 category 3:
 /// the opaque `state` pointer must be shown to have come from this library's own
 /// allocation path, by a tag check, before it is treated as state. **The check is not
-/// dropped; it moves.** `crates/libz-rs-sys/src/deflate.rs` owes the allocator-non-null
+/// dropped; it moves.** The planned `crates/libz-rs-sys/src/deflate.rs` owes the allocator-non-null
 /// and pointer-provenance halves, and this function is the rest.
 ///
 /// # Why the remaining half is trivially satisfied inside the library
@@ -389,10 +377,6 @@ pub struct DeflateReset {
 pub const fn deflate_state_check(status_raw: i32) -> bool {
     Status::from_raw(status_raw).is_none()
 }
-
-// -----------------------------------------------------------------------------
-//  Initialisation -- deflate.c L378-L533
-// -----------------------------------------------------------------------------
 
 /// Creates a compression state for a full parameter set, ready to compress.
 ///
@@ -457,7 +441,7 @@ pub fn deflate_init2<'a, A: Allocator<'a> + Copy>(
 
 /// Creates a compression state with the reference defaults.
 ///
-/// The port of `deflateInit_` (`deflate.c` L379-L384), declared at `zlib.h` L1907, which
+/// The Rust counterpart of `deflateInit_` (`deflate.c` L379-L384), declared at `zlib.h` L1907, which
 /// is [`deflate_init2`] with `method` = `Z_DEFLATED`, `windowBits` = `MAX_WBITS` (15),
 /// `memLevel` = `DEF_MEM_LEVEL` (8) and `strategy` = `Z_DEFAULT_STRATEGY` -- exactly the
 /// combination [`DeflateConfig::new`] builds.
@@ -474,13 +458,9 @@ pub fn deflate_init<'a, A: Allocator<'a> + Copy>(
     deflate_init2(DeflateConfig::new(level), allocator)
 }
 
-// -----------------------------------------------------------------------------
-//  Reset -- deflate.c L643-L711
-// -----------------------------------------------------------------------------
-
 /// Resets the stream without discarding the window's contents or the hash chains.
 ///
-/// The port of `deflateResetKeep` (`deflate.c` L644-L677), declared at `zlib.h` L730. In
+/// The Rust counterpart of `deflateResetKeep` (`deflate.c` L644-L677), declared at `zlib.h` L730. In
 /// C's order:
 ///
 /// | C | `deflate.c` | Here |
@@ -536,7 +516,7 @@ pub fn deflate_reset_keep<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>)
 
 /// Initialises the "longest match" routines for a new stream.
 ///
-/// The port of `lm_init` (`deflate.c` L682-L701), reached only from [`deflate_reset`].
+/// The Rust counterpart of `lm_init` (`deflate.c` L682-L701), reached only from [`deflate_reset`].
 ///
 /// `s->window_size = (ulg)2L * s->w_size;` (L683) has no assignment here: the window view
 /// derives its size from `w_bits` when it is constructed, so it is already `2 * w_size`
@@ -583,17 +563,10 @@ pub(crate) fn lm_init<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) {
 
 /// Resets the stream completely, discarding the window's history.
 ///
-/// The port of `deflateReset` (`deflate.c` L704-L711), declared at `zlib.h` L718:
-///
-/// ```c
-/// ret = deflateResetKeep(strm);
-/// if (ret == Z_OK)
-///     lm_init(strm->state);
-/// return ret;
-/// ```
+/// The Rust counterpart of `deflateReset` (`deflate.c` L704-L711), declared at `zlib.h` L718.
 ///
 /// C guards `lm_init` on the return value because `deflateResetKeep` can fail its state
-/// check; here it cannot, so [`lm_init`] runs unconditionally and there is nothing to
+/// check; here it cannot, so `lm_init` runs unconditionally and there is nothing to
 /// propagate but the [`DeflateReset`].
 pub fn deflate_reset<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) -> DeflateReset {
     let reset = deflate_reset_keep(state);
@@ -601,13 +574,9 @@ pub fn deflate_reset<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) -> D
     reset
 }
 
-// -----------------------------------------------------------------------------
-//  deflateSetHeader -- deflate.c L713-L719
-// -----------------------------------------------------------------------------
-
 /// Installs the gzip header the compressor will emit, or clears it.
 ///
-/// The port of `deflateSetHeader` (`deflate.c` L714-L719), declared at `zlib.h` L833. The
+/// The Rust counterpart of `deflateSetHeader` (`deflate.c` L714-L719), declared at `zlib.h` L833. The
 /// whole of its effect is `strm->state->gzhead = head;` (L717); the guard is
 /// `deflateStateCheck(strm) || strm->state->wrap != 2` (L715), whose state-check half is
 /// the facade's (see [`deflate_state_check`]) and whose `wrap` half is here.
@@ -636,11 +605,7 @@ pub fn deflate_set_header<'a, A: Allocator<'a>>(
     ReturnCode::OK
 }
 
-// -----------------------------------------------------------------------------
-//  deflateTune -- deflate.c L818-L830
-// -----------------------------------------------------------------------------
-
-/// C's `(uInt)` conversion of a possibly negative `int`, widened to the `usize` this port
+/// C's `(uInt)` conversion of a possibly negative `int`, widened to the `usize` this implementation
 /// stores such fields in.
 ///
 /// `deflateTune` casts each of its three unsigned arguments with `(uInt)` (`deflate.c`
@@ -656,14 +621,14 @@ const fn as_uint(value: i32) -> usize {
 
 /// Overrides the four match-finding tuning parameters.
 ///
-/// The port of `deflateTune` (`deflate.c` L819-L830), declared at `zlib.h` L751. All four
+/// The Rust counterpart of `deflateTune` (`deflate.c` L819-L830), declared at `zlib.h` L751. All four
 /// assignments are unconditional (L825-L828), and C validates **nothing**: `zlib.h`
 /// L756-L766 describes the function as being for "the most fanatic optimizer", and out of
 /// range values simply produce a poor or a very slow search. No validation is added here,
 /// because adding it would reject calls the reference accepts.
 ///
 /// `good_length`, `max_lazy` and `max_chain` go through C's `(uInt)` cast, reproduced by
-/// [`as_uint`]; `nice_length` is assigned to an `int` field with no cast at all (L827) and
+/// `as_uint`; `nice_length` is assigned to an `int` field with no cast at all (L827) and
 /// so passes straight through, negative values included.
 ///
 /// # Errors
@@ -688,13 +653,9 @@ pub fn deflate_tune<'a, A: Allocator<'a>>(
     ReturnCode::OK
 }
 
-// -----------------------------------------------------------------------------
-//  deflateParams -- deflate.c L773-L816
-// -----------------------------------------------------------------------------
-
 /// Changes the compression level and strategy of a live stream.
 ///
-/// The port of `deflateParams` (`deflate.c` L774-L816), declared at `zlib.h` L723. The
+/// The Rust counterpart of `deflateParams` (`deflate.c` L774-L816), declared at `zlib.h` L723. The
 /// order of its five steps is the contract, because step 3 can emit bytes:
 ///
 /// 1. `level == Z_DEFAULT_COMPRESSION` becomes 6, then `level < 0 || level > 9 ||
@@ -717,7 +678,7 @@ pub fn deflate_tune<'a, A: Allocator<'a>>(
 /// data, changing the output.
 ///
 /// ★ The `func != configuration_table[level].func` test at L791 compares two C function
-/// *addresses*. This port compares [`CompressFunc`] discriminants instead, which agrees
+/// *addresses*. This port compares `CompressFunc` discriminants instead, which agrees
 /// exactly because the table groups the levels the same way -- `Stored` at 0, `Fast` at 1
 /// to 3, `Slow` at 4 to 9. Getting that grouping wrong would make this function flush
 /// where C does not, or fail to flush where C does, and either changes the emitted bytes.
@@ -808,13 +769,9 @@ pub fn deflate_params<'a, A: Allocator<'a>>(
     ReturnCode::OK
 }
 
-// -----------------------------------------------------------------------------
-//  deflateSetDictionary -- deflate.c L558-L622
-// -----------------------------------------------------------------------------
-
 /// Primes the window and the hash chains from a preset dictionary.
 ///
-/// The port of `deflateSetDictionary` (`deflate.c` L559-L622), declared at `zlib.h` L618.
+/// The Rust counterpart of `deflateSetDictionary` (`deflate.c` L559-L622), declared at `zlib.h` L618.
 /// The eight steps run in exactly C's order, because several of them depend on the state
 /// a previous one left behind:
 ///
@@ -943,13 +900,9 @@ pub fn deflate_set_dictionary<'a, A: Allocator<'a>>(
     ReturnCode::OK
 }
 
-// -----------------------------------------------------------------------------
-//  deflateGetDictionary -- deflate.c L624-L641
-// -----------------------------------------------------------------------------
-
 /// Reads back the sliding dictionary the compressor is maintaining.
 ///
-/// The port of `deflateGetDictionary` (`deflate.c` L625-L641), declared at `zlib.h` L662.
+/// The Rust counterpart of `deflateGetDictionary` (`deflate.c` L625-L641), declared at `zlib.h` L662.
 /// `len = min(strstart + lookahead, w_size)` (L633-L635), and those `len` bytes are the
 /// window's newest history, taken from `window[strstart + lookahead - len ..]` (L637).
 ///
@@ -958,7 +911,7 @@ pub fn deflate_set_dictionary<'a, A: Allocator<'a>>(
 /// declines the copy when `len` is zero (L636), which is reproduced.
 ///
 /// C's `dictionary` has no length and `zlib.h` L666-L671 requires the caller to provide at
-/// least 32768 bytes. This port additionally clamps the copy to the slice it is handed, so
+/// least 32768 bytes. This implementation additionally clamps the copy to the slice it is handed, so
 /// a short buffer receives a prefix instead of overflowing; `dict_length` still reports the
 /// full `len`, as C does.
 ///
@@ -1002,10 +955,6 @@ pub fn deflate_get_dictionary<'a, A: Allocator<'a>>(
     ReturnCode::OK
 }
 
-// -----------------------------------------------------------------------------
-//  deflateBound and deflateBound_z -- deflate.c L832-L932
-// -----------------------------------------------------------------------------
-
 /// The length of a NUL-terminated field, **including** its terminator.
 ///
 /// Reproduces `str = ...; if (str != Z_NULL) do { wraplen++; } while (*str++);`
@@ -1026,7 +975,7 @@ fn c_string_len_with_nul(bytes: &[u8]) -> usize {
 
 /// An upper bound on the compressed size of `source_len` bytes, in `size_t` units.
 ///
-/// The port of `deflateBound_z` (`deflate.c` L856-L928), declared at `zlib.h` L769. C's
+/// The Rust counterpart of `deflateBound_z` (`deflate.c` L856-L928), declared at `zlib.h` L769. C's
 /// own explanation of the constants, from the comment block at L832-L855, applies verbatim
 /// and is reproduced because a future reader will need it:
 ///
@@ -1145,7 +1094,7 @@ pub fn deflate_bound_z<'a, A: Allocator<'a>>(
             }
             wraplen
         }
-        // "for compiler happiness" (L912-L913). Unreachable through this port, where
+        // "for compiler happiness" (L912-L913). Unreachable through this implementation, where
         // `wrap` only ever holds 0, 1, 2 or a negation of one of those, but reproduced so
         // that no input can select a different answer than C's would.
         _ => 18,
@@ -1183,12 +1132,7 @@ pub fn deflate_bound_z<'a, A: Allocator<'a>>(
 
 /// An upper bound on the compressed size of `source_len` bytes, in `uLong` units.
 ///
-/// The port of `deflateBound` (`deflate.c` L929-L932), declared at `zlib.h` L768:
-///
-/// ```c
-/// z_size_t bound = deflateBound_z(strm, sourceLen);
-/// return (uLong)bound != bound ? (uLong)-1 : (uLong)bound;
-/// ```
+/// The Rust counterpart of `deflateBound` (`deflate.c` L929-L932), declared at `zlib.h` L768.
 ///
 /// # Where the narrowing lives
 ///
@@ -1210,15 +1154,11 @@ pub fn deflate_bound<'a, A: Allocator<'a>>(
 ) -> u64 {
     // Only reachable on a target with a `usize` narrower than 64 bits, where a caller
     // cannot address `source_len` bytes in the first place; saturating gives the largest
-    // bound this port can express, which is the same direction C's `(uLong)-1` goes.
+    // bound this implementation can express, which is the same direction C's `(uLong)-1` goes.
     let requested = usize::try_from(source_len).unwrap_or(usize::MAX);
     let bound = deflate_bound_z(state, requested);
     u64::try_from(bound).unwrap_or(u64::MAX)
 }
-
-// -----------------------------------------------------------------------------
-//  Helpers for the driver -- deflate.c L944-L979
-// -----------------------------------------------------------------------------
 
 /// `usize` widened to the `u64` this module extracts header and trailer bytes from.
 ///
@@ -1243,14 +1183,8 @@ const fn byte_at(value: u64, shift: u32) -> u8 {
 
 /// The gzip `XFL` byte: how the data was compressed, per RFC 1952 §2.3.1.
 ///
-/// Port of the expression `deflate.c` writes twice, identically, at L1078-L1080 and
-/// L1102-L1104:
-///
-/// ```c
-/// put_byte(s, s->level == 9 ? 2 :
-///          (s->strategy >= Z_HUFFMAN_ONLY || s->level < 2 ?
-///           4 : 0));
-/// ```
+/// Mirrors the expression `deflate.c` writes twice, identically, at L1078-L1080 and
+/// L1102-L1104.
 ///
 /// RFC 1952 assigns 2 to "compressor used maximum compression, slowest algorithm" and 4 to
 /// "compressor used fastest algorithm"; every level in between reports 0. Extracted into
@@ -1268,22 +1202,13 @@ fn gzip_xfl<'a, A: Allocator<'a>>(state: &DeflateState<'a, A>) -> u8 {
 
 /// `HCRC_UPDATE(beg)` (`deflate.c` L970-L978).
 ///
-/// ```c
-/// #define HCRC_UPDATE(beg) \
-///     do { \
-///         if (s->gzhead->hcrc && s->pending > (beg)) \
-///             strm->adler = crc32_z(strm->adler, s->pending_buf + (beg), \
-///                                   s->pending - (beg)); \
-///     } while (0)
-/// ```
-///
 /// The header CRC covers the header bytes as they are produced, so it must be folded in
 /// *before* each flush moves them out of the pending buffer -- `beg` is where the
 /// unaccounted-for bytes start, and every call site resets it to 0 after a flush.
 ///
 /// C dereferences `s->gzhead` unconditionally here, which is sound only because the macro
 /// is expanded exclusively inside the four states that a caller-supplied header makes
-/// reachable. This port makes that structural by matching on the header's presence and
+/// reachable. This implementation makes that structural by matching on the header's presence and
 /// doing nothing when it is absent; no byte changes, because C would never have reached the
 /// macro in that case.
 fn hcrc_update<'a, A: Allocator<'a>>(state: &DeflateState<'a, A>, check: &mut u32, beg: usize) {
@@ -1303,15 +1228,7 @@ fn hcrc_update<'a, A: Allocator<'a>>(state: &DeflateState<'a, A>, check: &mut u3
 ///
 /// The pattern appears eight times in `deflate()` -- at L1059-L1063, L1085-L1089,
 /// L1128-L1132, L1151-L1155, L1173-L1177, L1190-L1194 and L1203-L1207 -- always spelled
-/// the same way:
-///
-/// ```c
-/// flush_pending(strm);
-/// if (s->pending != 0) {
-///     s->last_flush = -1;
-///     return Z_OK;
-/// }
-/// ```
+/// the same way.
 ///
 /// ★ This is what makes the header a *resumable* state machine rather than straight-line
 /// code. A caller with a one-byte output buffer still makes progress: each stage writes
@@ -1338,13 +1255,9 @@ fn flush_pending_and_yield<'a, A: Allocator<'a>>(
     true
 }
 
-// -----------------------------------------------------------------------------
-//  deflate -- deflate.c L980-L1290
-// -----------------------------------------------------------------------------
-
 /// Compresses as much as possible, and flushes according to `flush`.
 ///
-/// The port of `deflate` (`deflate.c` L981-L1290), declared at `zlib.h` L254 and documented
+/// The Rust counterpart of `deflate` (`deflate.c` L981-L1290), declared at `zlib.h` L254 and documented
 /// at L256-L363. It is written as one function, with C's fall-through
 /// `if (s->status == ...)` chain preserved verbatim, because **every header stage must be
 /// resumable**: a caller whose `avail_out` runs out mid-header re-enters at the state it
@@ -1395,7 +1308,7 @@ pub fn deflate<'a, A: Allocator<'a>>(
     flush: i32,
 ) -> ReturnCode {
     // A guard C has no way to express: it holds two pointers and two counts, whereas this
-    // port holds two slices and two offsets into them, and an offset past the end of its
+    // implementation holds two slices and two offsets into them, and an offset past the end of its
     // slice describes no stream at all. Rejecting it here is what lets every cursor
     // operation below be infallible.
     if stream.next_in > stream.input.len() || stream.next_out > stream.output.len() {
@@ -1454,14 +1367,6 @@ pub fn deflate<'a, A: Allocator<'a>>(
         };
 
         // The third disjunct of L990-L992; the two pointer tests are the facade's.
-        //
-        // ```c
-        // if (strm->next_out == Z_NULL ||
-        //     (strm->avail_in != 0 && strm->next_in == Z_NULL) ||
-        //     (s->status == FINISH_STATE && flush != Z_FINISH)) {
-        //     ERR_RETURN(strm, Z_STREAM_ERROR);
-        // }
-        // ```
         if state.status == Status::Finish && flush != Flush::Finish {
             break 'driver ReturnCode::STREAM_ERROR.record_msg(msg);
         }
@@ -1514,10 +1419,6 @@ pub fn deflate<'a, A: Allocator<'a>>(
         if state.status == Status::Finish && cursors.avail_in() != 0 {
             break 'driver ReturnCode::BUF_ERROR.record_msg(msg);
         }
-
-        // ------------------------------------------------------------------
-        //  The RFC 1950 zlib header -- L1028-L1064
-        // ------------------------------------------------------------------
 
         // A raw stream has no header at all, so it goes straight to work (L1029-L1030).
         if state.status == Status::Init && state.wrap == 0 {
@@ -1581,12 +1482,10 @@ pub fn deflate<'a, A: Allocator<'a>>(
             }
         }
 
-        // ------------------------------------------------------------------
         //  The RFC 1952 gzip header -- L1065-L1209
         //
         //  `GZIP` is defined unless `NO_GZIP` is (`deflate.h` L18-L24), so every stage
         //  below is in scope for the shipped configuration.
-        // ------------------------------------------------------------------
 
         if state.status == Status::GzipHeader {
             // `strm->adler = crc32(0L, Z_NULL, 0);`  (L1068) -- a gzip stream checks with
@@ -1844,10 +1743,6 @@ pub fn deflate<'a, A: Allocator<'a>>(
             }
         }
 
-        // ------------------------------------------------------------------
-        //  "Start a new block or continue the current one" -- L1211-L1261
-        // ------------------------------------------------------------------
-
         if cursors.avail_in() != 0
             || state.window.lookahead != 0
             || (flush != Flush::NoFlush && state.status != Status::Finish)
@@ -1918,10 +1813,6 @@ pub fn deflate<'a, A: Allocator<'a>>(
             }
         }
 
-        // ------------------------------------------------------------------
-        //  The trailer -- L1263-L1289
-        // ------------------------------------------------------------------
-
         // `if (flush != Z_FINISH) return Z_OK;`  (L1263)
         if flush != Flush::Finish {
             break 'driver ReturnCode::OK;
@@ -1988,13 +1879,9 @@ pub fn deflate<'a, A: Allocator<'a>>(
     ret
 }
 
-// -----------------------------------------------------------------------------
-//  deflateEnd -- deflate.c L1292-L1310
-// -----------------------------------------------------------------------------
-
 /// Releases everything the compression state owns, and reports whether it was mid-stream.
 ///
-/// The port of `deflateEnd` (`deflate.c` L1293-L1310), declared at `zlib.h` L367.
+/// The Rust counterpart of `deflateEnd` (`deflate.c` L1293-L1310), declared at `zlib.h` L367.
 ///
 /// ★ **The return value is a documented public contract**, not a formality: `zlib.h`
 /// L373-L377 promises `Z_DATA_ERROR` "if the stream was freed prematurely (some input or
@@ -2032,13 +1919,9 @@ pub fn deflate_end<'a, A: Allocator<'a>>(state: DeflateState<'a, A>) -> ReturnCo
     }
 }
 
-// -----------------------------------------------------------------------------
-//  deflateCopy -- deflate.c L1312-L1377
-// -----------------------------------------------------------------------------
-
 /// Duplicates a compression state, allocating the copy's buffers from `allocator`.
 ///
-/// The port of `deflateCopy` (`deflate.c` L1317-L1377), declared at `zlib.h` L684. C copies
+/// The Rust counterpart of `deflateCopy` (`deflate.c` L1317-L1377), declared at `zlib.h` L684. C copies
 /// the `z_stream` wholesale (L1333), allocates a fresh `deflate_state`, copies it bytewise
 /// (L1339), then re-allocates all four buffers and copies the live parts of each. The
 /// bytewise struct copy plus the four buffer copies are [`DeflateState::try_clone_in`]; the
@@ -2060,7 +1943,7 @@ pub fn deflate_end<'a, A: Allocator<'a>>(state: DeflateState<'a, A>) -> ReturnCo
 ///
 /// ★ C finishes by repairing three pointers -- `ds->l_desc.dyn_tree = ds->dyn_ltree` and
 /// its two siblings (L1371-L1373) -- because the bytewise copy left them aimed at the
-/// *source's* arrays. This port has no analogue and needs none: `deflate/state.rs` models a
+/// *source's* arrays. This implementation has no analogue and needs none: `deflate/state.rs` models a
 /// `TreeDesc` with a `StaticTreeKind` discriminant instead of a `dyn_tree` back-pointer, so
 /// there is no pointer to repair and no way for a copy to keep referring to its original.
 ///
@@ -2081,13 +1964,9 @@ where
     source.try_clone_in(allocator)
 }
 
-// -----------------------------------------------------------------------------
-//  deflatePrime -- deflate.c L744-L771
-// -----------------------------------------------------------------------------
-
 /// Inserts up to sixteen bits directly into the output bit stream.
 ///
-/// The port of `deflatePrime` (`deflate.c` L745-L771), declared at `zlib.h` L816. Its
+/// The Rust counterpart of `deflatePrime` (`deflate.c` L745-L771), declared at `zlib.h` L816. Its
 /// purpose, per `zlib.h` L820-L826, is "to start off the deflate output with the bits
 /// leftover from a previous deflate stream when appending to it", so it applies to raw
 /// deflate and must be used before the first [`deflate`] call after an initialisation or a
@@ -2162,13 +2041,9 @@ pub fn deflate_prime<'a, A: Allocator<'a>>(
     ReturnCode::OK
 }
 
-// -----------------------------------------------------------------------------
-//  deflatePending and deflateUsed -- deflate.c L721-L742
-// -----------------------------------------------------------------------------
-
 /// Reports the output that has been generated but not yet handed to the caller.
 ///
-/// The port of `deflatePending` (`deflate.c` L722-L734), declared at `zlib.h` L786. The
+/// The Rust counterpart of `deflatePending` (`deflate.c` L722-L734), declared at `zlib.h` L786. The
 /// three returned values are, in order, the pending **bytes**, the pending **bits** -- 0 to
 /// 7, awaiting more bits to complete a byte -- and the status.
 ///
@@ -2195,7 +2070,7 @@ pub fn deflate_pending<'a, A: Allocator<'a>>(
 
 /// Reports how many bits of the last byte were used at the most recent byte-boundary flush.
 ///
-/// The port of `deflateUsed` (`deflate.c` L737-L742), declared at `zlib.h` L804. The value
+/// The Rust counterpart of `deflateUsed` (`deflate.c` L737-L742), declared at `zlib.h` L804. The value
 /// is `bi_used`, which `bi_windup` maintains as `((s->bi_valid - 1) & 7) + 1` (`trees.c`
 /// L187); `zlib.h` L807-L810 documents the range as "1..8, or 0 if there has not yet been a
 /// flush" and explains its use -- it "helps determine the location of the last bit of a
@@ -2217,7 +2092,7 @@ mod tests {
     //! RFC 1952 gzip header, the flush-rank gate, the entry guards, the `deflateBound`
     //! arithmetic and the `deflateEnd` contract -- plus round trips through
     //! `crate::inflate`. They are deliberately *not* a substitute for
-    //! `crates/zlib-rs-differential/tests/byte_identical.rs`: only a comparison against the
+    //! the planned `crates/zlib-rs-differential/tests/byte_identical.rs`: only a comparison against the
     //! C oracle proves byte identity, and a round trip that merely decompresses proves
     //! nothing about it. What these do prove is that the specific constants and orderings
     //! this file is responsible for are the ones `deflate.c` computes.
@@ -2306,15 +2181,22 @@ mod tests {
         out
     }
 
-    // =====================================================================
-    //  The RFC 1950 header word (deflate.c L1021-L1036)
-    // =====================================================================
-
     #[test]
     fn zlib_header_word_matches_the_reference_for_every_level() {
-        // `CMF` is always 0x78 for `w_bits == 15`: `Z_DEFLATED + ((15 - 8) << 4)` = 0x78.
-        // `FLG` carries `level_flags` in bits 6-7 plus the mod-31 correction, so the two
-        // bytes are the well-known pairs every zlib stream in the world starts with.
+        // Scope of this test, stated precisely: `windowBits == 15` and NO preset dictionary.
+        // Under exactly those conditions `CMF` is 0x78, because it is
+        // `Z_DEFLATED + ((w_bits - 8) << 4)` = `8 + (7 << 4)` (`deflate.c` L1021-L1024), and
+        // `FLG` is `level_flags << 6` plus the mod-31 correction (L1026-L1035).
+        //
+        // Neither byte is fixed across configurations, so these pairs are NOT what every zlib
+        // stream begins with:
+        //   * `CMF` tracks the window size -- `windowBits == 9` gives `8 + (1 << 4)` = 0x18,
+        //     and every exponent in between gives its own value.
+        //   * `FLG` bit 5 is `FDICT`, set when `deflateSetDictionary` supplied a preset
+        //     dictionary (`deflate.c` L1030-L1031), which also changes the mod-31 correction
+        //     and appends the four-byte `DICTID`.
+        // The pairs below are therefore the well-known ones for the DEFAULT configuration, which
+        // is the configuration this test covers.
         for &(level, expected) in &[
             (1i32, [0x78u8, 0x01u8]),
             (2, [0x78, 0x5e]),
@@ -2432,10 +2314,8 @@ mod tests {
         );
     }
 
-    // =====================================================================
     //  The RFC 1952 gzip header with no installed gz_header
     //  (deflate.c L1053-L1075)
-    // =====================================================================
 
     #[test]
     fn gzip_header_without_a_header_struct_is_exactly_ten_bytes() {
@@ -2510,10 +2390,6 @@ mod tests {
             "the deflate data is identical"
         );
     }
-
-    // =====================================================================
-    //  Entry guards and the flush-rank gate (deflate.c L985-L1012)
-    // =====================================================================
 
     #[test]
     fn an_out_of_range_flush_is_rejected() {
@@ -2649,10 +2525,6 @@ mod tests {
         assert_eq!(deflate_end(state), ReturnCode::OK);
     }
 
-    // =====================================================================
-    //  deflate_state_check and the deflate_end contract
-    // =====================================================================
-
     #[test]
     fn state_check_accepts_exactly_the_eight_legal_status_values() {
         // The status half of `deflateStateCheck` (L546-L555). `deflate_state_check`
@@ -2740,10 +2612,6 @@ mod tests {
         assert_eq!(state.status, Status::Finish);
         assert_eq!(deflate_end(state), ReturnCode::OK, "Z_OK from FINISH_STATE");
     }
-
-    // =====================================================================
-    //  deflate_params (deflate.c L774-L816)
-    // =====================================================================
 
     /// Runs `deflate_params` on a state and reports whether the driver was re-entered with
     /// `Z_BLOCK`, which `last_flush` records exactly (L998).
@@ -2843,14 +2711,12 @@ mod tests {
         assert_eq!(deflate_end(state), ReturnCode::DATA_ERROR);
     }
 
-    // =====================================================================
     //  deflateBound / deflateBound_z (deflate.c L856-L937)
     //
     //  Every expectation below was hand-computed from the C arithmetic and then
     //  confirmed against the in-tree oracle, because a bound that is too small is a
     //  buffer overflow in CALLER code and one that is too large breaks callers that
     //  assert exact sizes.
-    // =====================================================================
 
     #[test]
     fn bound_uses_the_tight_default_formula_for_default_parameters() {
@@ -3032,10 +2898,6 @@ mod tests {
             }
         }
     }
-
-    // =====================================================================
-    //  Round trips through crate::inflate
-    // =====================================================================
 
     #[cfg_attr(
         miri,

@@ -1,4 +1,4 @@
-//! The resumable decompression state: the port of `struct inflate_state`
+//! The resumable decompression state: the Rust counterpart of `struct inflate_state`
 //! (`inflate.h` L82-L126).
 //!
 //! The reference header describes the object this module reproduces in two lines
@@ -22,7 +22,7 @@
 //!
 //! | # | `inflate.h` | C type | This module |
 //! |---|---|---|---|
-//! | 1 | `strm` (L83) | `z_streamp` | **replaced** by [`InflateState::allocator`] |
+//! | 1 | `strm` (L83) | `z_streamp` | **replaced** by `InflateState::allocator` |
 //! | 2 | `mode` (L84) | `inflate_mode` | [`Mode`] |
 //! | 3 | `last` (L85) | `int` | `bool` |
 //! | 4 | `wrap` (L86) | `int` | [`WrapFlags`] |
@@ -65,7 +65,7 @@
 //! carries no `#[repr(C)]`, no `#[no_mangle]` and no `extern "C"`, and the field
 //! types above were chosen for Rust rather than for byte-for-byte layout
 //! agreement. The `#[repr(C)]` mirrors of the genuinely public types --
-//! `z_stream`, `gz_header`, `struct gzFile_s` -- belong to
+//! `z_stream`, `gz_header`, `struct gzFile_s` -- belong to the planned
 //! `crates/libz-rs-sys/src/types.rs`.
 //!
 //! There is exactly one qualification to that, and it is worth stating loudly
@@ -77,7 +77,7 @@
 //! ```
 //!
 //! `mode` sits at offset 8 of the C struct, immediately after `strm`, and is a
-//! four-byte `int`. That write happens in *caller-compiled code* which this port
+//! four-byte `int`. That write happens in *caller-compiled code* which this implementation
 //! cannot change, so the facade -- not this module -- must present a synced
 //! `{ z_streamp strm; inflate_mode mode; }` prefix at the head of whatever block
 //! `z_stream.state` points at. [`InflateState::mode_tag`] and
@@ -85,7 +85,7 @@
 //! without reinterpreting memory: one reads the tag in the numbering C uses, the
 //! other installs a tag and rejects a value that names no state.
 //!
-//! ## Why `strm` is not ported
+//! ## Why `strm` is not implemented
 //!
 //! The back-pointer at `inflate.h` L83 exists for two reasons, and neither
 //! survives translation. It lets `inflateStateCheck` compare `state->strm ==
@@ -93,7 +93,7 @@
 //! belongs to `crates/libz-rs-sys`; and it lets the `ZALLOC`/`ZFREE` macros
 //! (`zutil.h` L252-L254) reach `strm->zalloc`, `strm->zfree` and `strm->opaque`,
 //! which here arrive by dependency injection instead. The slot is occupied by
-//! [`InflateState::allocator`], an injected [`Allocator`] -- AAP §0.3.3.6.
+//! `InflateState::allocator`, an injected [`Allocator`] -- AAP §0.3.3.6.
 //!
 //! The half of `inflateStateCheck` that *is* expressible in safe Rust is the
 //! range test `state->mode < HEAD || state->mode > SYNC` (`inflate.c` L95), and
@@ -109,7 +109,7 @@
 //! ```
 //!
 //! That budget is computed from the *C* header, so it is fixed at
-//! `2 * 7160 + 256` = 14576 bytes on this target no matter what this port does.
+//! `2 * 7160 + 256` = 14576 bytes on this target no matter what this implementation does.
 //! When the limit is installed, the stream already holds one state of `S` bytes
 //! plus a 256-byte window (the test initialises with `windowBits` of `-8`). The
 //! `inflateCopy` at L438 then asks for a second state and a second window, and
@@ -140,14 +140,14 @@
 //!
 //! The default allocator path is `malloc`, not `calloc`: `zcalloc` chooses
 //! between them on `sizeof(uInt) > 2` (`zutil.c` L299-L303) and `uInt` is four
-//! bytes on every target this port supports. A caller-supplied hook is under no
+//! bytes on every target this implementation supports. A caller-supplied hook is under no
 //! obligation to do better, and `test/infcover.c` L87 deliberately fills every
 //! block it hands out with `0xa5` so that any code assuming zeros produces wrong
 //! answers instead of passing by luck.
 //!
 //! The reference is written accordingly, and asymmetrically: `inflateInit2_`
 //! zeroes the *state struct* with `zmemzero` (`inflate.c` L199) and `inflateCopy`
-//! does the same (L1341), but the *window* is never zeroed. This port reproduces
+//! does the same (L1341), but the *window* is never zeroed. This implementation reproduces
 //! both facts. Every field of a freshly built state has a definite value, because
 //! Rust makes that the only option; and nothing ever reads a window byte on the
 //! strength of the allocator having cleared it. What bounds valid window content
@@ -188,15 +188,7 @@
 //! either the immutable fixed tables of `inffixed.h` or the stream's own
 //! `codes[ENOUGH]` arena, and the only way to tell which is to test the pointer
 //! against the arena's bounds -- which is what `inflateCopy` does so that it can
-//! rebase them into the copy (`inflate.c` L1356-L1360):
-//!
-//! ```c
-//! if (state->lencode >= state->codes &&
-//!     state->lencode <= state->codes + ENOUGH - 1) {
-//!     copy->lencode = copy->codes + (state->lencode - state->codes);
-//!     copy->distcode = copy->codes + (state->distcode - state->codes);
-//! }
-//! ```
+//! rebase them into the copy (`inflate.c` L1356-L1360).
 //!
 //! [`CodeTables`] names the two cases instead, and `next` becomes a plain index.
 //! An offset is as valid in a copy as in the original, so
@@ -250,10 +242,6 @@ use crate::inflate::fixed_tables::{distfix, lenfix};
 use crate::inflate::inftrees::{Code, CodeTableSource, CodeTables, ENOUGH};
 use crate::inflate::mode::Mode;
 
-// -----------------------------------------------------------------------------
-//  Sizes and sentinels
-// -----------------------------------------------------------------------------
-
 /// Length of the code-length scratch array, from `unsigned short lens[320]`
 /// (`inflate.h` L120).
 ///
@@ -267,7 +255,7 @@ pub const LENS_LEN: usize = 320;
 /// Length of the table-building work area, from `unsigned short work[288]`
 /// (`inflate.h` L121).
 ///
-/// [`crate::inflate::inftrees::inflate_table`] sorts symbols by code length into
+/// `inflate_table` sorts symbols by code length into
 /// this array. 288 is the size of the largest alphabet it is asked to sort, the
 /// 0..=287 literal/length alphabet of RFC 1951 §3.2.5.
 pub const WORK_LEN: usize = 288;
@@ -314,14 +302,10 @@ pub const MAX_PRIME_BITS: i32 = 16;
 /// four-byte field is being assembled. See the module documentation.
 pub const MAX_PRIME_HOLD_BITS: u32 = 32;
 
-// -----------------------------------------------------------------------------
-//  `int wrap` -- `inflate.h` L86-L87
-// -----------------------------------------------------------------------------
-
 /// The three-bit `wrap` field: which container is accepted, and whether the
 /// stream's check value is verified.
 ///
-/// Ported from `int wrap` (`inflate.h` L86-L87), whose comment defines the bits:
+/// Mirrors `int wrap` (`inflate.h` L86-L87), whose comment defines the bits:
 ///
 /// > bit 0 true for zlib, bit 1 true for gzip, bit 2 true to validate check value
 ///
@@ -481,10 +465,6 @@ impl From<InflateWrap> for WrapFlags {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  `gz_headerp head` -- `inflate.h` L94
-// -----------------------------------------------------------------------------
-
 /// The `done` value meaning "no gzip header has been read yet", from
 /// `head->done = 0` (`inflate.c` L1229).
 ///
@@ -508,10 +488,10 @@ pub const GZ_HEADER_COMPLETE: i32 = 1;
 ///
 /// The C field is a raw pointer to a caller-owned `gz_header` (`zlib.h`
 /// L118-L133), installed by `inflateGetHeader` (`inflate.c` L1218-L1230) and
-/// written through by the nine gzip header states. A raw pointer cannot live in
-/// this crate, so the facade converts the caller's structure into this view once,
-/// at the `inflateGetHeader` boundary, and the raw `gz_headerp` stays on the
-/// facade side.
+/// written through by the nine gzip header states. This crate never dereferences a
+/// pointer, so the facade performs that one dereference at the `inflateGetHeader`
+/// boundary, converts the caller's structure into this bounds-checked view, and
+/// keeps the raw `gz_headerp` on its own side.
 ///
 /// The scalar members are plain fields, written directly by
 /// `crates/zlib-rs/src/inflate/header.rs`; the three variable-length members are
@@ -522,15 +502,10 @@ pub const GZ_HEADER_COMPLETE: i32 = 1;
 ///
 /// This is the one design decision here that is not obvious, and it is forced by
 /// the test suite rather than chosen. `test/infcover.c` L307-L312 sets up a header
-/// like this:
+/// in which `extra`, `name` and `comment` are all given the same `out` buffer
+/// and the same `len`.
 ///
-/// ```c
-/// head.extra = out;    head.extra_max = len;
-/// head.name = out;     head.name_max = len;
-/// head.comment = out;  head.comm_max = len;
-/// ```
-///
-/// All three fields point at the *same* buffer. Holding them as three
+/// All three fields therefore point at the *same* buffer. Holding them as three
 /// `&mut [u8]` would therefore require the facade to produce three aliasing
 /// mutable borrows of one allocation, which is undefined behaviour and would be
 /// reported by Miri and by AddressSanitizer -- for a test that must pass
@@ -633,13 +608,24 @@ impl<'a> GzHeaderSink<'a> {
     /// `extra` with `extra_max`, `name` with `name_max`, `comment` with
     /// `comm_max`. Pass [`None`] where the caller passed `Z_NULL`.
     ///
-    /// Every scalar starts at the value C leaves it at. `inflateGetHeader` writes
-    /// only `head->done = 0` (L1229) and leaves the rest of the caller's structure
-    /// untouched, so the reference reads uninitialised header fields if a stream
-    /// turns out not to be gzip at all. This view cannot do that -- it starts the
-    /// scalars at their neutral values -- which is strictly better defined and
-    /// unobservable: a caller that inspects a header before `done` becomes
-    /// [`GZ_HEADER_COMPLETE`] is reading fields the format never supplied.
+    /// # KNOWN COMPATIBILITY GAP -- scalar initialisation differs from C
+    ///
+    /// `inflateGetHeader` writes **only** `head->done = 0` (`inflate.c` L1229) and leaves every
+    /// other field of the caller's structure exactly as the caller left it. This constructor
+    /// instead starts every scalar at a neutral value.
+    ///
+    /// That difference is **observable**, and it must not be described as an improvement, as
+    /// "strictly better defined", or as unobservable. A caller that pre-fills `head.text`,
+    /// `head.time`, `head.xflags` or `head.os` and then decodes a stream that turns out not to be
+    /// gzip sees its own values preserved under C and neutral values here. It is true that such a
+    /// caller is reading fields the format never supplied -- `done` is the flag that says whether
+    /// they mean anything -- but "the caller should not look" is not the same as "the caller cannot
+    /// tell", and behaviour preservation is the governing constraint for this port.
+    ///
+    /// The gap is therefore recorded as unresolved rather than justified, and it is closable at the
+    /// boundary: the facade's `inflateGetHeader` must write only `done = 0` into the caller's
+    /// `gz_header`, and on completion write back only the fields the parse actually supplied,
+    /// leaving the others at the caller's values. Whoever lands that entry point owns closing it.
     #[must_use]
     pub const fn new(
         extra: Option<&'a [Cell<u8>]>,
@@ -716,16 +702,7 @@ impl<'a> GzHeaderSink<'a> {
     /// Copies part of the extra field into the caller's buffer, clamped to
     /// `extra_max`.
     ///
-    /// A literal port of `inflate.c` L607-L613:
-    ///
-    /// ```c
-    /// if (state->head != Z_NULL && state->head->extra != Z_NULL &&
-    ///     (len = state->head->extra_len - state->length) < state->head->extra_max) {
-    ///     zmemcpy(state->head->extra + len, next,
-    ///             len + copy > state->head->extra_max ?
-    ///             state->head->extra_max - len : copy);
-    /// }
-    /// ```
+    /// Reproduces `inflate.c` L607-L613 exactly.
     ///
     /// `at` is C's `len`, the offset already reached in the extra field, which the
     /// caller computes as `extra_len - length`. Nothing is copied when there is no
@@ -764,15 +741,9 @@ impl<'a> GzHeaderSink<'a> {
 
     /// Stores one byte of the file name, reporting whether it was stored.
     ///
-    /// A literal port of `inflate.c` L624-L627:
+    /// Reproduces `inflate.c` L624-L627 exactly.
     ///
-    /// ```c
-    /// if (state->head != Z_NULL && state->head->name != Z_NULL &&
-    ///         state->length < state->head->name_max)
-    ///     state->head->name[state->length++] = (Bytef)len;
-    /// ```
-    ///
-    /// The `state->length++` is *inside* the condition, so the write cursor
+    /// In the reference the `state->length++` is *inside* the condition, so the write cursor
     /// advances only when a byte is actually stored -- and does not advance at all
     /// when no header is installed. Returning the outcome is what lets the caller
     /// reproduce that: advance `length` if and only if this returns `true`.
@@ -835,7 +806,7 @@ impl<'a> GzHeaderSink<'a> {
         self.comment_absent = true;
     }
 
-    /// Whether the port assigned `Z_NULL` to the caller's `extra` pointer.
+    /// Whether the implementation assigned `Z_NULL` to the caller's `extra` pointer.
     ///
     /// The facade uses this when it copies the view's results back: a `true` here
     /// means the stream had no extra field and the caller's pointer must be
@@ -845,13 +816,13 @@ impl<'a> GzHeaderSink<'a> {
         self.extra_absent
     }
 
-    /// Whether the port assigned `Z_NULL` to the caller's `name` pointer.
+    /// Whether the implementation assigned `Z_NULL` to the caller's `name` pointer.
     #[must_use]
     pub const fn name_is_absent(&self) -> bool {
         self.name_absent
     }
 
-    /// Whether the port assigned `Z_NULL` to the caller's `comment` pointer.
+    /// Whether the implementation assigned `Z_NULL` to the caller's `comment` pointer.
     #[must_use]
     pub const fn comment_is_absent(&self) -> bool {
         self.comment_absent
@@ -908,10 +879,6 @@ impl fmt::Debug for GzHeaderSink<'_> {
             .finish()
     }
 }
-
-// -----------------------------------------------------------------------------
-//  `unsigned char FAR *window` -- `inflate.h` L100
-// -----------------------------------------------------------------------------
 
 /// An allocator-owned window block that returns itself to its originating
 /// allocator.
@@ -1175,10 +1142,6 @@ impl<'a, A: Allocator<'a>> fmt::Debug for InflateWindow<'a, A> {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  The `z_stream` half of `inflateResetKeep`
-// -----------------------------------------------------------------------------
-
 /// Values the facade must write to `z_stream` after a state reset.
 ///
 /// `inflateResetKeep` changes both the private state and the public stream
@@ -1216,20 +1179,16 @@ impl StreamReset {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  The state -- `inflate.h` L82-L126
-// -----------------------------------------------------------------------------
-
 /// State maintained between `inflate()` calls -- approximately 7K bytes, not
 /// including the allocated sliding window, which is up to 32K bytes.
 ///
-/// This is the safe-Rust port of `struct inflate_state` (`inflate.h` L82-L126).
+/// This is the safe-Rust mirror of `struct inflate_state` (`inflate.h` L82-L126).
 /// Build it with [`InflateState::new`] for ordinary inflate or
 /// [`InflateState::with_borrowed_window`] for `inflateBack`; tear it down with
 /// [`InflateState::release`] or by dropping it.
 ///
 /// The scalar and inline-array fields follow the C declaration order. They are
-/// crate-visible because the decoder is a direct state machine port and writes
+/// crate-visible because the decoder is a direct state machine implementation and writes
 /// nearly every one; the pointer replacements stay behind checked accessors.
 ///
 /// `Mode::Mem` is sticky for the ordinary driver: `inflate()` returns
@@ -1244,141 +1203,149 @@ impl StreamReset {
 /// `z_stream` back-pointer.
 #[allow(clippy::struct_excessive_bools)]
 pub struct InflateState<'a, A: Allocator<'a>> {
-    /// Replacement for `z_streamp strm` -- "pointer back to this zlib stream"
-    /// (`inflate.h` L83).
-    ///
-    /// Raw stream identity remains a facade concern; this injected allocator is
-    /// the part of the back-pointer used by `ZALLOC`/`ZFREE`, per AAP
-    /// §0.3.3.6.
+    /// The allocator every window and table block in this state is obtained
+    /// from and must be returned to. It stands in for the reference's
+    /// `z_streamp strm` back-pointer (`inflate.h` L83), of which only the
+    /// `ZALLOC`/`ZFREE` hooks are needed here; stream identity stays a
+    /// boundary-layer concern (AAP §0.3.3.6).
     pub(crate) allocator: A,
 
-    /// `inflate_mode mode` -- "current inflate mode" (`inflate.h` L84).
+    /// The state the decoder is currently suspended in (`inflate.h` L84).
     pub(crate) mode: Mode,
 
-    /// `int last` -- "true if processing last block" (`inflate.h` L85).
+    /// Set once the block being decoded is the stream's last
+    /// (`inflate.h` L85).
     pub(crate) last: bool,
 
-    /// `int wrap` -- bit 0 zlib, bit 1 gzip, bit 2 validate
-    /// (`inflate.h` L86-L87).
+    /// Which container is expected and whether its check value is validated:
+    /// bit 0 zlib, bit 1 gzip, bit 2 validate (`inflate.h` L86-L87).
     pub(crate) wrap: WrapFlags,
 
-    /// `int havedict` -- "true if dictionary provided" (`inflate.h` L88).
+    /// Set once a preset dictionary has been installed (`inflate.h` L88).
     pub(crate) havedict: bool,
 
-    /// `int flags` -- gzip method/flags, zero for zlib, or `-1` for raw/no
-    /// header yet (`inflate.h` L89-L90).
+    /// The gzip method and flag bytes, `0` for a zlib stream, or `-1` while no
+    /// header has been read yet (`inflate.h` L89-L90). `-1` is a sentinel, not a
+    /// value: the trailer length check and the header callback both test for it
+    /// rather than for a flag bit.
     pub(crate) flags: i32,
 
-    /// `unsigned dmax` -- "zlib header max distance (`INFLATE_STRICT`)"
-    /// (`inflate.h` L91).
+    /// The largest match distance the zlib header permits (`inflate.h` L91).
+    /// Only an `INFLATE_STRICT` build enforces it; the shipped build records it
+    /// and never rejects on it.
     pub(crate) dmax: u32,
 
-    /// `unsigned long check` -- "protected copy of check value"
-    /// (`inflate.h` L92).
-    ///
-    /// Adler-32 and CRC-32 are exactly 32 bits; using `u32` keeps the algorithm
-    /// platform-independent rather than importing the facade's `c_ulong`.
+    /// The running check value, kept here rather than in the caller's stream so
+    /// that a caller cannot perturb it mid-stream (`inflate.h` L92). Adler-32
+    /// and CRC-32 are exactly 32 bits, so `u32` keeps the algorithm
+    /// platform-independent rather than importing the boundary layer's
+    /// `c_ulong`.
     pub(crate) check: u32,
 
-    /// `unsigned long total` -- "protected copy of output count"
-    /// (`inflate.h` L93).
-    ///
-    /// The trailer compares only its low 32 bits (`inflate.c` L1101), so `u32`
-    /// is the complete observable value in this internal state.
+    /// The running output count, kept out of the caller's stream for the same
+    /// reason as [`Self::check`] (`inflate.h` L93). The trailer compares only
+    /// its low 32 bits (`inflate.c` L1101), so `u32` is the complete observable
+    /// value.
     pub(crate) total: u32,
 
-    /// `gz_headerp head` -- "where to save gzip header information"
-    /// (`inflate.h` L94).
-    ///
-    /// The raw pointer stays in the facade; this optional borrowed view is its
-    /// bounds-checked replacement.
+    /// Where a decoded gzip header is delivered, when the caller asked for one
+    /// (`inflate.h` L94). Every write through it is clamped to the buffer
+    /// lengths the caller supplied, which is what makes the gzip-header write
+    /// path incapable of overrunning them.
     pub(crate) head: Option<GzHeaderSink<'a>>,
 
-    /// `unsigned wbits` -- "log base 2 of requested window size"
-    /// (`inflate.h` L96).
+    /// Base-2 logarithm of the requested window size (`inflate.h` L96).
     pub(crate) wbits: u32,
 
-    /// `unsigned wsize` -- "window size or zero if not using window"
+    /// The window's size in bytes, or zero while no window is in use
     /// (`inflate.h` L97).
     pub(crate) wsize: u32,
 
-    /// `unsigned whave` -- "valid bytes in the window" (`inflate.h` L98).
+    /// How many bytes of the window hold valid history (`inflate.h` L98). A
+    /// distance may only reach back this far; that check is what keeps a
+    /// malformed stream from copying uninitialised window bytes into the output.
     pub(crate) whave: u32,
 
-    /// `unsigned wnext` -- "window write index" (`inflate.h` L99).
+    /// The window's write cursor (`inflate.h` L99).
     pub(crate) wnext: u32,
 
-    /// `unsigned char FAR *window` -- "allocated sliding window, if needed"
-    /// (`inflate.h` L100).
+    /// The sliding window: allocated on demand, or borrowed for the duration of
+    /// an `inflateBack` call (`inflate.h` L100).
     pub(crate) window: InflateWindow<'a, A>,
 
-    /// `unsigned long hold` -- "input bit accumulator" (`inflate.h` L102).
-    ///
-    /// `NEEDBITS(32)` can leave 39 live bits, so this is `u64`.
+    /// The input bit accumulator (`inflate.h` L102). `NEEDBITS(32)` can leave
+    /// 39 live bits, so this is `u64` rather than the reference's
+    /// `unsigned long`.
     pub(crate) hold: u64,
 
-    /// `unsigned bits` -- "number of bits in hold" (`inflate.h` L103).
+    /// How many low bits of [`Self::hold`] are live (`inflate.h` L103).
     pub(crate) bits: u32,
 
-    /// `unsigned length` -- "literal or length of data to copy"
+    /// The literal just decoded, or the length of the match being copied
     /// (`inflate.h` L105).
     pub(crate) length: u32,
 
-    /// `unsigned offset` -- "distance back to copy string from"
+    /// How far back in the window the match being copied starts
     /// (`inflate.h` L106).
     pub(crate) offset: u32,
 
-    /// `unsigned extra` -- "extra bits needed" (`inflate.h` L108).
+    /// How many extra bits the current code still needs (`inflate.h` L108).
     pub(crate) extra: u32,
 
-    /// `lencode`, `distcode`, `lenbits`, and `distbits` -- the starting
-    /// literal/length and distance tables and their index widths
-    /// (`inflate.h` L110-L113).
+    /// The literal/length and distance decode tables in use, together with
+    /// their root index widths (`inflate.h` L110-L113).
     pub(crate) tables: CodeTables,
 
-    /// `unsigned ncode` -- "number of code length code lengths"
+    /// How many code-length code lengths the dynamic header announced
     /// (`inflate.h` L115).
     pub(crate) ncode: u32,
 
-    /// `unsigned nlen` -- "number of length code lengths" (`inflate.h` L116).
+    /// How many literal/length code lengths the dynamic header announced
+    /// (`inflate.h` L116).
     pub(crate) nlen: u32,
 
-    /// `unsigned ndist` -- "number of distance code lengths"
+    /// How many distance code lengths the dynamic header announced
     /// (`inflate.h` L117).
     pub(crate) ndist: u32,
 
-    /// `unsigned have` -- "number of code lengths in lens[]"
+    /// How many code lengths of [`Self::lens`] have been read so far
     /// (`inflate.h` L118).
     pub(crate) have: u32,
 
-    /// `code FAR *next` -- "next available space in codes[]"
-    /// (`inflate.h` L119), represented as an index into [`Self::codes`].
+    /// The next free slot in [`Self::codes`] (`inflate.h` L119) — an index
+    /// rather than the reference's `code FAR *next` pointer, so that table
+    /// construction cannot walk off the end of the array.
     pub(crate) next: usize,
 
-    /// `unsigned short lens[320]` -- "temporary storage for code lengths"
-    /// (`inflate.h` L120).
+    /// Code lengths as read from the dynamic header, before table construction
+    /// (`inflate.h` L120). [`LENS_LEN`] is 320, the largest total the header
+    /// can announce.
     pub(crate) lens: [u16; LENS_LEN],
 
-    /// `unsigned short work[288]` -- "work area for code table building"
-    /// (`inflate.h` L121).
+    /// Scratch space for table construction (`inflate.h` L121). [`WORK_LEN`] is
+    /// 288, one entry per literal/length symbol.
     pub(crate) work: [u16; WORK_LEN],
 
-    /// `code codes[ENOUGH]` -- "space for code tables" (`inflate.h` L122).
+    /// Storage both decode tables are carved out of (`inflate.h` L122).
+    /// [`ENOUGH`] is the proven upper bound on the entries any legal pair of
+    /// tables can need, which is why construction never has to allocate.
     pub(crate) codes: [Code; ENOUGH],
 
-    /// `int sane` -- "if false, allow invalid distance too far"
-    /// (`inflate.h` L123).
+    /// Whether an out-of-range distance is rejected (`inflate.h` L123).
     ///
     /// The shipped build forces this true and returns `Z_DATA_ERROR` from
     /// `inflateUndermine`; only upstream's compile-time `INFLATE_ALLOW_INVALID`
-    /// branch can make it false.
+    /// branch can clear it.
     pub(crate) sane: bool,
 
-    /// `int back` -- "bits back of last unprocessed length/lit"
-    /// (`inflate.h` L124), with `-1` meaning no pending code.
+    /// How many bits back the last unprocessed length/literal code began, or
+    /// `-1` when there is no pending code (`inflate.h` L124). `-1` is a sentinel
+    /// `inflateMark` reports to the caller, so it must stay distinguishable from
+    /// a real bit offset of zero.
     pub(crate) back: i32,
 
-    /// `unsigned was` -- "initial length of match" (`inflate.h` L125).
+    /// The length of the match in progress when output space ran out
+    /// (`inflate.h` L125).
     pub(crate) was: u32,
 }
 
@@ -1404,8 +1371,8 @@ impl<'a, A: Allocator<'a>> InflateState<'a, A> {
 
     /// Installs a mode from C's tag numbering.
     ///
-    /// Returns `false` and leaves the state untouched for a foreign, stale, or
-    /// otherwise invalid tag.
+    /// Returns `false` and leaves the state untouched for any value that does not
+    /// name a state.
     pub fn set_mode_tag(&mut self, raw: i32) -> bool {
         let Some(mode) = Mode::from_raw(raw) else {
             return false;
@@ -1454,10 +1421,6 @@ impl<'a, A: Allocator<'a>> InflateState<'a, A> {
     pub fn set_header_sink(&mut self, head: Option<GzHeaderSink<'a>>) {
         self.head = head;
     }
-
-    // ---------------------------------------------------------------------
-    //  Bit accumulator -- INITBITS/PULLBYTE/NEEDBITS/BITS/DROPBITS/BYTEBITS
-    // ---------------------------------------------------------------------
 
     /// `INITBITS`: clear the input accumulator (`inflate.c` L347-L351).
     pub(crate) fn init_bits(&mut self) {
@@ -1625,10 +1588,6 @@ impl<'a, A: Allocator<'a>> InflateState<'a, A> {
     pub(crate) fn hold_low32(&self) -> u32 {
         u32::try_from(self.hold & u64::from(u32::MAX)).unwrap_or(0)
     }
-
-    // ---------------------------------------------------------------------
-    //  Decode table source resolution
-    // ---------------------------------------------------------------------
 
     /// Selects the shared RFC 1951 fixed tables and their 9/5-bit roots.
     ///
@@ -2208,10 +2167,11 @@ mod tests {
         let shared_allocator = size_of::<InflateState<'static, &'static GlobalAllocator>>();
         let dynamic_allocator = size_of::<InflateState<'static, &'static dyn Allocator<'static>>>();
         // C is 7160 bytes on x86_64. test/infcover.c L428 requires this state
-        // to stay above 7032 bytes, while AAP §0.8.4 caps it at 115% (8234).
-        // Measured on the validation host: 7280 bytes with the zero-sized
-        // GlobalAllocator, 7296 with a shared concrete allocator, and 7312 with
-        // a shared trait-object allocator. The largest is only 2.12% above C.
+        // to stay above 7032 bytes, while AAP §0.8.4 caps it at 115% (8234), so
+        // the range assertions below are the contract. The three exact sizes are
+        // pinned on 64-bit targets so that a change in field layout, or in how
+        // much space an allocator handle occupies, has to be acknowledged here
+        // rather than silently drifting toward either bound.
         if cfg!(target_pointer_width = "64") {
             assert_eq!(measured, 7280);
             assert_eq!(shared_allocator, 7296);

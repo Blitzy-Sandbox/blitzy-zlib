@@ -1,35 +1,59 @@
-# ============================================================================
-# libz-rs-sys — the C ABI facade crate (workspace member 2 of 3)
-# ============================================================================
+# libz-rs-sys -- the C ABI facade crate (workspace member 2 of 3).
 #
-# This crate is the drop-in replacement for the C `libz`.  It is the ONLY crate
-# in the workspace permitted to use `unsafe`: every raw pointer that crosses the
-# C boundary is validated here and converted into a safe Rust slice exactly
-# once, before any call into the dependency-free `zlib-rs` core.
+# This crate is INTENDED to be the drop-in replacement for the C `libz`, and it is
+# the ONLY crate in the workspace permitted to use `unsafe`: every raw pointer
+# that crosses the C boundary is to be validated here and converted into a safe
+# Rust slice exactly once, before any call into the dependency-free `zlib-rs`
+# core.
 #
-# Five separate things in this repository resolve against this manifest by exact
-# name, so none of the names below are cosmetic:
+# STATE AT THIS CHECKPOINT.  This manifest, `build.rs` and `src/panic_guard.rs`
+# exist; the crate root `src/lib.rs` and the export modules do not.  So the crate
+# currently exports no symbol, `cargo metadata` cannot load the workspace at all
+# ("can't find library `z`, rename file to `src/lib.rs`"), and nothing below has
+# been exercised end to end.  Read every claim here as the contract this manifest
+# establishes, not as a description of a working library.
+#
+# Five separate things resolve against this manifest by exact name, so none of
+# the names below are cosmetic:
 #
 #   1. `cbindgen --config cbindgen.toml --crate libz-rs-sys` — the crate name is
 #      written verbatim into the committed `cbindgen.toml`.
-#   2. `cargo build --release --features libz-compat` — the feature name.
-#   3. the root `CMakeLists.txt` `ZLIB_BUILD_RUST` path — the artifact names.
-#   4. `Makefile.in`'s `rust` / `rust-test` / `rust-clean` targets.
+#   2. `cargo build --release -p libz-rs-sys --features libz-compat` — the
+#      feature name.  Keep the `-p`: with several packages selected cargo applies
+#      a bare `--features libz-compat` only to the ones that declare it and
+#      silently ignores it elsewhere, and with a single package selected that does
+#      not declare it the flag is a hard error.  Naming the package says what is
+#      meant in both cases.
+#   3. the artifact names, which the root `CMakeLists.txt` will consume once a
+#      `ZLIB_BUILD_RUST` path is added to it.  No such option exists in
+#      `CMakeLists.txt` or `README-cmake.md` today; that update is still to come.
+#   4. `Makefile.in`'s `rust` / `rust-test` / `rust-clean` targets, which do exist.
 #   5. `zlib.pc`'s `Libs: ... -lz` — which requires `libz.so` / `libz.a`.
 #
 # Related files, and the boundary of this manifest's responsibility:
-#   * `build.rs`    — emits `-Wl,-soname,libz.so.1`, applies `zlib.map` as a
-#                     `--version-script`, and creates the versioned symlink
-#                     chain.  Cargo only ever writes a bare `libz.so`, while the
-#                     SONAME is `libz.so.1`; without that symlink the dynamic
-#                     loader silently binds the *system* zlib instead of this
-#                     one.  That is build.rs's job, not this file's.  It is
-#                     picked up by Cargo's automatic sibling-`build.rs`
-#                     detection, so no explicit `build = "build.rs"` key is
-#                     needed (and omitting it degrades gracefully).
+#   * `build.rs`    — emits `-Wl,-soname,libz.so.1`, locates and validates
+#                     `zlib.map`, and validates the `ZLIB_RS_SIMD` request
+#                     against the resolved `simd` feature.  It creates and
+#                     deletes nothing.  It is picked up by Cargo's automatic
+#                     sibling-`build.rs` detection, so no explicit
+#                     `build = "build.rs"` key is needed (and omitting it
+#                     degrades gracefully).
+#   * `Makefile.in` — owns PACKAGING, and that is deliberate rather than
+#                     incidental.  Cargo only ever writes a bare `libz.so`,
+#                     while the SONAME is `libz.so.1`; without the versioned
+#                     symlink chain the dynamic loader silently binds the
+#                     *system* zlib instead of this one.  The chain is created
+#                     after the link, in an isolated staging directory, by the
+#                     `rust` target — never by `build.rs`, which runs BEFORE the
+#                     link and would therefore publish a loader-visible name for
+#                     a file that does not exist yet.  See the header comment of
+#                     `build.rs` under "WHAT THIS SCRIPT DELIBERATELY DOES NOT
+#                     DO".
 #   * `src/lib.rs`  — carries `#![deny(unsafe_op_in_unsafe_fn)]` and
 #                     `#![allow(non_camel_case_types)]`.  Those are source
-#                     attributes and deliberately do NOT appear here.
+#                     attributes and deliberately do NOT appear here.  The file
+#                     has not been written yet, which is what currently stops
+#                     the workspace from loading.
 
 [package]
 name = "libz-rs-sys"
@@ -40,8 +64,8 @@ name = "libz-rs-sys"
 #
 # `version` is plain three-component semver.  The library's *self-reported*
 # version string is `ZLIB_VERSION "1.3.2.1-motley"` (zlib.h), which has four
-# components and is therefore not valid Cargo semver — it lives as a literal in
-# `src/util.rs` and must never be derived from `env!("CARGO_PKG_VERSION")`.
+# components and is therefore not valid Cargo semver — it is to live as a literal
+# in `src/util.rs`, and must never be derived from `env!("CARGO_PKG_VERSION")`.
 #
 # `edition` is 2021 and `rust-version` is 1.80.  This pairing is mandatory, not
 # stylistic: edition 2024 requires rustc >= 1.85, and Cargo rejects the
@@ -52,21 +76,26 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# `publish = false` at the root is NOT inherited implicitly -- nothing about
+# `[workspace.package]` applies to a member unless the member asks for it by
+# name.  Without this line the crate is publishable by default, which matters
+# more here than for the core: this crate emits `libz.so` and claims the `-lz`
+# link name, so a stray `cargo publish` would offer a partial snapshot of a
+# system library's ABI to the world.  It is inherited rather than restated as a
+# local `publish = false` so that the policy has one home.
+publish.workspace = true
+
 # Set locally rather than inherited, so this manifest does not depend on the
 # root declaring optional `[workspace.package]` keys.  Both values trace to
 # `CMakeLists.txt` (`DESCRIPTION` and `HOMEPAGE_URL` on the `zlib` project).
 description = "C ABI compatible facade over zlib-rs: a drop-in libz replacement built on a safe-Rust core"
 homepage = "https://zlib.net/"
 
-# ============================================================================
-# [lib] — the artifact contract
-# ============================================================================
-#
 # `name = "z"` is what makes Cargo emit `libz.so` and `libz.a` instead of
 # `liblibz_rs_sys.so`.  It mirrors the C build exactly: `CMakeLists.txt` sets
 # `OUTPUT_NAME z` on both the shared and static targets, and `zlib.pc.in`
 # advertises `Libs: -L${libdir} -L${sharedlibdir} -lz`.  Consumers that link
-# `-lz` therefore keep working unchanged, which is the whole point of the port.
+# `-lz` therefore keep working unchanged, which is the whole point.
 #
 # Note the asymmetry: the *linker* artifact is `libz`, but the *Rust* import
 # path is `libz_rs_sys` (Cargo replaces hyphens with underscores in the package
@@ -75,47 +104,61 @@ homepage = "https://zlib.net/"
 #
 # All three crate types come from this one crate rather than from two or three
 # separate crates, so the exported C surface is defined in exactly one place:
-#   * `cdylib`    -> `libz.so`, the shared drop-in replacement.
-#   * `staticlib` -> `libz.a`, which `test/CMakeLists.txt` links `infcover`
-#                    against via `ZLIB::ZLIBSTATIC`.  It is also the artifact
-#                    the shared library is *relinked* from with `gcc` when the
-#                    `zlib.map` version script has to be applied, because a
-#                    version script cannot be attached to a rustc-built cdylib.
+#   * `cdylib`    -> `libz.so`, the intended shared drop-in replacement.
+#   * `staticlib` -> `libz.a`.  Two consumers: `test/CMakeLists.txt` links
+#                    `infcover` against a static zlib via `ZLIB::ZLIBSTATIC`,
+#                    and — the reason this crate type is mandatory rather than
+#                    convenient — it is the artifact the shared library must be
+#                    *relinked* from with `gcc` in order to apply the `zlib.map`
+#                    version script at all, because a version script cannot be
+#                    attached to a rustc-built cdylib.  `Makefile.in`'s `rust`
+#                    target performs that relink.
 #   * `rlib`      -> required so `zlib-rs-differential`, the `fuzz/` targets and
 #                    this crate's own `tests/*.rs` can depend on it as a normal
-#                    Rust library.  Omitting `rlib` silently breaks every
-#                    integration test in `tests/`.
+#                    Rust library.  Omitting `rlib` would silently break every
+#                    integration test in `tests/` — a directory that does not
+#                    exist yet.
 [lib]
 name = "z"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
-# ============================================================================
-# [features]
-# ============================================================================
-#
 # `--no-default-features` is a SUPPORTED configuration: it compiles cleanly and
 # yields a library whose `extern "C"` surface and gz layer are simply gated out.
-# It exists for feature-matrix checking, not for shipping, so `src/lib.rs` must
+# It exists for feature-matrix checking, not for shipping, so the crate root must
 # keep every export behind `libz-compat` rather than raising a `compile_error!`.
 [features]
 # Both are on by default so that a plain `cargo build --release` produces a
 # complete, immediately usable drop-in `libz`.
 default = ["libz-compat", "gz"]
 
-# Gates the exported `extern "C"` surface — the 95 unmangled symbols that make
-# this library ABI-compatible with the C original.  Named exactly as the
-# documented build command requires:
-#   cargo build --release --features libz-compat
+# Gates the exported `extern "C"` surface.  The target it exists to reach is the
+# 95 unmangled function symbols that make this library ABI-compatible with the C
+# original — those 95 plus zlib.map's 16 symbol-version nodes are the 111 dynamic
+# globals the reference `libz.so.1.3.2.1-motley` publishes, measured with
+# `nm -D --defined-only --extern-only`.  None of them is implemented yet, so
+# enabling this feature currently gates nothing.  Named exactly as the documented
+# build command requires:
+#   cargo build --release -p libz-rs-sys --features libz-compat
 libz-compat = []
 
 # Gates the `gzFile` layer (`gzopen`, `gzread`, `gzwrite`, `gzprintf`, …).  File
-# I/O is the only part of the port that needs `std`, so this forwards into the
+# I/O is the only part of the library that needs `std`, so this forwards into the
 # core's `std` feature; the core is otherwise `no_std` + `alloc`.
+#
+# This feature and `libz-compat` together are also what make `csrc/gzprintf_shim.c`
+# linkable: the two Rust adapters the shim calls live behind those same gates, so
+# a `--no-default-features` build must not have the shim linked in or the library
+# would carry two unresolved symbols.  The packaging layer that compiles the shim
+# builds with both features on, which is what keeps the pair consistent.
 gz = ["zlib-rs/std"]
 
 # Vectorised CRC-32 / Adler-32 backends, off by default.  A single pass-through
-# switch so that the `ZLIB_RS_SIMD=0|1` handling in `build.rs` and the
-# workspace-level `--features` plumbing have one place to point at.
+# switch to `zlib-rs/simd`, and THE ONLY WAY THE VECTORISED CODE IS COMPILED.
+#
+# Do not read `ZLIB_RS_SIMD=0|1` in `build.rs` as an alternative to it: a build
+# script cannot turn a Cargo feature on, so that variable only publishes a
+# `cfg(zlib_rs_simd)` that this crate's source can key off.  Selecting the
+# vectorised backends is this feature's job and nothing else's.
 #
 # SIMD is deliberately confined to the two checksums and is OUTPUT-NEUTRAL: a
 # checksum yields one scalar however it is computed, so vectorising it cannot
@@ -134,15 +177,11 @@ simd = ["zlib-rs/simd"]
 # would drag `libc` into every default build and break dependency minimalism.
 libc = ["dep:libc"]
 
-# ============================================================================
-# [dependencies]
-# ============================================================================
-#
 # This is the manifest the committed `deny.toml` `[bans]` rules are evaluated
 # against, and it sets `wildcards = "deny"` without `allow-wildcard-paths`.
 # A path dependency with no version requirement surfaces as `*` in the
-# dependency graph and is rejected by that gate — verified, not assumed — so
-# both entries below carry an explicit, non-wildcard version requirement.
+# dependency graph and is rejected by that gate, so both entries below carry an
+# explicit, non-wildcard version requirement.
 [dependencies]
 # The safe core: `#![forbid(unsafe_code)]`, `no_std` + `alloc`, zero third-party
 # dependencies.  Declared by path (the two crates always travel together in this
@@ -158,9 +197,36 @@ zlib-rs = { path = "../zlib-rs", version = "1.3.2" }
 # forbids wildcard requirements.
 #
 # To be used ONLY where a platform type or a raw file syscall is genuinely
-# unavoidable in the gz layer.  `std::fs` / `std::io` are preferred wherever
-# they suffice, which is very nearly everywhere — hence default-off.
+# unavoidable in the gz layer.  `std::fs` / `std::io` are preferred wherever they
+# suffice, which is very nearly everywhere — hence default-off.
 libc = { version = "0.2.189", optional = true }
+
+# ============================================================================
+# No [build-dependencies] — and no C compiler in a cargo build at all
+# ============================================================================
+#
+# `build.rs` emits link arguments and stages symlinks.  It never runs a C
+# compiler, so this manifest needs neither `cc` nor any other build dependency,
+# and `cargo build --release` for the shipped artifacts works on a machine that
+# has no C toolchain installed.  Two things follow, and both are deliberate:
+#
+#   * The AAP freezes the dependency inventory and records `cc` as a
+#     build-dependency of `crates/zlib-rs-differential` ONLY, "never a dependency
+#     of `zlib-rs` or `libz-rs-sys`", and requires that a shipped `cargo build`
+#     never touch a C compiler.  Keeping the one C translation unit this port
+#     owns — `csrc/gzprintf_shim.c` — out of `build.rs` is what makes that
+#     structural rather than a promise.
+#
+#   * The shim is compiled instead by the packaging layer, which already runs a
+#     C compiler to relink the static archive through `zlib.map` (a version
+#     script cannot be attached to a rustc-built cdylib).  It therefore rides
+#     along with a step that exists anyway, and `make rust-symbols` is what
+#     proves both symbols reached the staged library.
+#
+# `links` is likewise absent.  That key exists so two packages cannot claim the
+# same *system* library and so dependents can read `DEP_<LINKS>_*` metadata.
+# The shim is neither: it is this crate's own translation unit, bundled into this
+# crate's own artifacts, and no other package could link it.
 
 # ============================================================================
 # [lints]
@@ -179,10 +245,6 @@ libc = { version = "0.2.189", optional = true }
 [lints]
 workspace = true
 
-# ============================================================================
-# Deliberately absent sections — do not add them
-# ============================================================================
-#
 # * [profile.*]        — Cargo ignores profiles in non-root manifests and warns
 #                        "profiles for the non root package will be ignored,
 #                        specify profiles at the workspace root", which would
@@ -193,15 +255,24 @@ workspace = true
 #                        crossing the FFI edge into an abort instead of
 #                        undefined behaviour.  Restating it here would be
 #                        ignored *and* would falsely imply local control.
-# * [[bench]]          — the repo-root `benches/*.rs` attach to
+# * [[bench]]          — the repo-root `benches/*.rs` are to attach to
 #                        `zlib-rs-differential`, which owns the C oracle they
-#                        measure against.
+#                        measure against.  That directory does not exist yet.
 # * [[bin]]            — this crate is a library only.
-# * [dev-dependencies] — the integration tests (`abi_layout.rs`,
-#                        `symbol_parity.rs`, `c_api_parity.rs`) run on `std`
-#                        alone; `symbol_parity.rs` shells out to `nm` through
+# * [dev-dependencies] — the planned integration tests (`abi_layout.rs`,
+#                        `symbol_parity.rs`, `c_api_parity.rs`, none of them
+#                        written yet) are to run on `std` alone, with
+#                        `symbol_parity.rs` shelling out to `nm` through
 #                        `std::process::Command`.  Nothing to add.
-# * links              — this crate builds no native library of its own; its
-#                        `build.rs` only emits link arguments.
+# * links              — the `csrc/gzprintf_shim.c` archive is this crate's own
+#                        translation unit bundled into its own artifacts, not a
+#                        system library another package could also claim, and
+#                        nothing downstream reads `DEP_*` metadata from it.  See
+#                        the note above `[lints]` for the full reasoning.
+# * [build-dependencies]
+#                      — see the note above `[lints]`: `build.rs` compiles the
+#                        shim through `std::process::Command` rather than taking
+#                        `cc`, which keeps the AAP's frozen dependency inventory
+#                        exactly as written.
 # * rust-api           — that feature belongs to `zlib-rs`, which owns the
 #                        idiomatic Rust surface.  This crate exposes the C ABI.

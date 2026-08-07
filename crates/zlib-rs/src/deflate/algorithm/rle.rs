@@ -1,6 +1,6 @@
 //! The `Z_RLE` compressor: matches at distance one only, and no hash table.
 //!
-//! Port of `local block_state deflate_rle(deflate_state *s, int flush)`
+//! Mirrors `local block_state deflate_rle(deflate_state *s, int flush)`
 //! (`deflate.c` L2084-L2149), whose contract is its own comment (L2079-L2083):
 //!
 //! > For `Z_RLE`, simply look for runs of bytes, generate matches only of distance one. Do
@@ -24,7 +24,7 @@
 //! | **`rle`** | **`<= MAX_MATCH`** | **untouched** | **exactly 1** | **plain `0`** |
 //! | `huff` | `== 0` | untouched | none | plain `0` |
 //!
-//! The bold `rle` row is where this port is most exposed, and two of its entries in
+//! The bold `rle` row is where this implementation is most exposed, and two of its entries in
 //! particular, because both differ from the compressor a reader is most likely to have just
 //! finished reading:
 //!
@@ -82,12 +82,12 @@
 //! buffer is the single `sym_buf` of `LIT_BUFS == 4` and the `d_buf`/`l_buf` tally variants
 //! of `deflate.h` L338-L355 have no counterpart), `UNALIGNED_OK` word-at-a-time comparison,
 //! and `ZLIB_DEBUG`. With `ZLIB_DEBUG` undefined, `check_match` is `#define`d to nothing
-//! (`deflate.c` L1622-L1624) and `Tracevv` (L2134) compiles away, so both are ported as
+//! (`deflate.c` L1622-L1624) and `Tracevv` (L2134) compiles away, so both are implemented as
 //! nothing at all rather than as an approximation.
 //!
 //! # Safety and failure posture
 //!
-//! C walks the window with `Bytef *scan` and `*++scan` (L2105-L2114). This port has no raw
+//! C walks the window with `Bytef *scan` and `*++scan` (L2105-L2114). This implementation has no raw
 //! pointers: the walk is one bounds-checked window view plus an integer cursor, which the
 //! crate root's `#![forbid(unsafe_code)]` requires and the compiler enforces. There is no
 //! `unwrap()`, no `expect()` and no panicking index outside `#[cfg(test)]`; C's `Assert` is a
@@ -100,16 +100,16 @@
 // `_tr_tally` keeps the underscore-prefixed C spelling of `deflate.h` L311-L318 for oracle
 // traceability, which `clippy::pedantic` flags at the call site. The same relaxation, for the
 // same reason, appears in `deflate/mod.rs`, `deflate/algorithm.rs` and `trees/mod.rs`.
-#![allow(clippy::used_underscore_items)]
+// MSRV guard: `unknown_lints` comes first because `clippy::used_underscore_items` postdates the
+// declared 1.80 floor, where the lint NAME is itself an `unknown_lints` error under `-D warnings`.
+// Allowing `unknown_lints` in the same list makes the attribute inert on 1.80 and effective on
+// current stable. Do not drop it while the floor is 1.80.
+#![allow(unknown_lints, clippy::used_underscore_items)]
 
 use crate::deflate::algorithm::{flush_block, BlockState, Flush, StreamCursors};
 use crate::deflate::state::{Allocator, DeflateState, MAX_MATCH, MIN_MATCH};
 use crate::deflate::window::fill_window;
 use crate::trees::_tr_tally;
-
-// -----------------------------------------------------------------------------
-//  The constants the run length depends on -- deflate.c L2107-L2115
-// -----------------------------------------------------------------------------
 
 /// Byte comparisons per group of the unrolled scan.
 ///
@@ -188,10 +188,6 @@ const _: () = assert!(
      (deflate.c L2107 and L2124)"
 );
 
-// -----------------------------------------------------------------------------
-//  The run scan -- deflate.c L2105-L2117
-// -----------------------------------------------------------------------------
-
 /// What one run scan found.
 ///
 /// Both fields are needed, and the cursor cannot be inferred from the length or the other way
@@ -248,27 +244,13 @@ fn byte_matches(view: &[u8], offset: usize, prev: u8) -> bool {
 ///
 /// # The three parts, and why each is shaped the way it is
 ///
-/// ```text
-/// scan = s->window + s->strstart - 1;                          /* L2105 */
-/// prev = *scan;                                                /* L2106 */
-/// if (prev == *++scan && prev == *++scan && prev == *++scan) {  /* L2107 */
-///     strend = s->window + s->strstart + MAX_MATCH;             /* L2108 */
-///     do {
-///     } while (prev == *++scan && prev == *++scan &&             /* L2109-L2114 */
-///              prev == *++scan && prev == *++scan &&
-///              prev == *++scan && prev == *++scan &&
-///              prev == *++scan && prev == *++scan &&
-///              scan < strend);
-///     s->match_length = MAX_MATCH - (uInt)(strend - scan);      /* L2115 */
-/// ```
-///
 /// * **The prelude** is three comparisons and no more. Each advances the cursor before
 ///   comparing, and `&&` short-circuits, so a mismatch at the k-th leaves the remaining
 ///   increments undone -- which is exactly what [`RunScan::cursor`] has to report for the
 ///   `Assert` at L2119.
 /// * **The loop body is empty**, and the condition is nine terms: eight comparisons and then
 ///   `scan < strend`. `do {} while (c)` and `while c {}` are the same thing when the body is
-///   empty, so the port is a `loop` with the two exits in the reference's order. Checking the
+///   empty, so the implementation is a `loop` with the two exits in the reference's order. Checking the
 ///   bound *last* is the whole point: the cursor advances a full group between consultations,
 ///   which is what makes the final group finish precisely on `strend`.
 /// * **The length is a subtraction**, `MAX_MATCH - (strend - scan)`, not a running count. On
@@ -353,15 +335,11 @@ fn scan_run(view: &[u8]) -> RunScan {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  deflate_rle -- deflate.c L2084-L2149
-// -----------------------------------------------------------------------------
-
 /// Compresses with the `Z_RLE` strategy: runs of one byte, emitted at distance one.
 ///
-/// Port of `local block_state deflate_rle(deflate_state *s, int flush)`
+/// Mirrors `local block_state deflate_rle(deflate_state *s, int flush)`
 /// (`deflate.c` L2084-L2149), default compile-time configuration -- see the module
-/// documentation for the variants that are deliberately not ported.
+/// documentation for the variants that are deliberately not implemented.
 ///
 /// Called only through [`CompressFunc::call`](crate::deflate::algorithm::CompressFunc::call),
 /// which reaches it when `deflate()`'s dispatch chain finds a non-zero level and
@@ -506,7 +484,7 @@ pub(crate) fn deflate_rle<'a, A: Allocator<'a>>(
         let bflush = if state.match_length >= MIN_MATCH {
             // `check_match(s, s->strstart, s->strstart - 1, (int)s->match_length);` (L2125)
             // is `#define`d to nothing without `ZLIB_DEBUG` (L1622-L1624), so there is
-            // nothing to port. It would verify the match this code just constructed.
+            // nothing to implement. It would verify the match this code just constructed.
 
             // `_tr_tally_dist(s, 1, s->match_length - MIN_MATCH, bflush);` (L2127)
             //
@@ -598,10 +576,6 @@ pub(crate) fn deflate_rle<'a, A: Allocator<'a>>(
     BlockState::BlockDone
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
 #[cfg(test)]
 // The workspace denies the panic-prone lints, which is right for library code and wrong for a
 // harness: a test asserts, and a failing assertion panics. Indexing is allowed because every
@@ -609,7 +583,12 @@ pub(crate) fn deflate_rle<'a, A: Allocator<'a>>(
 // is allowed because these tests call `_tr_init` and `_tr_tally`, whose names are the C
 // spellings of `deflate.h` L311-L318. The same relaxations, for the same reasons, appear in
 // `deflate/algorithm.rs`, `deflate/window.rs` and `trees/mod.rs`.
+// MSRV guard: `unknown_lints` comes first because `clippy::used_underscore_items` postdates the
+// declared 1.80 floor, where the lint NAME is itself an `unknown_lints` error under `-D warnings`.
+// Allowing `unknown_lints` in the same list makes the attribute inert on 1.80 and effective on
+// current stable. Do not drop it while the floor is 1.80.
 #[allow(
+    unknown_lints,
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::panic,
@@ -632,10 +611,6 @@ mod tests {
 
     /// The largest normalised length a symbol can carry, `MAX_MATCH - MIN_MATCH` = 255.
     const FULL_LENGTH: u8 = 255;
-
-    // -------------------------------------------------------------------------
-    //  Fixtures
-    // -------------------------------------------------------------------------
 
     /// A stream configured as `deflateInit2(&strm, 6, Z_DEFLATED, -15, 8, Z_RLE)` and wired up
     /// by `_tr_init`, which is the state `deflate()` first enters a compressor with.
@@ -768,10 +743,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  The constants -- deflate.c L2107-L2115
-    // -------------------------------------------------------------------------
-
     /// The four scan constants against the C expressions they come from, by hand.
     #[test]
     fn the_scan_constants_match_the_reference_expressions() {
@@ -800,10 +771,6 @@ mod tests {
         assert_eq!((STREND_OFFSET - PRELUDE_COMPARISONS) % UNROLL, 0);
         assert_eq!((STREND_OFFSET - PRELUDE_COMPARISONS) / UNROLL, 32);
     }
-
-    // -------------------------------------------------------------------------
-    //  scan_run -- deflate.c L2105-L2115
-    // -------------------------------------------------------------------------
 
     /// A run shorter than `MIN_MATCH` fails the prelude, so no length is reported and the
     /// cursor stops on the byte that broke it.
@@ -875,10 +842,6 @@ mod tests {
         let short = vec![b'a'; PRELUDE_COMPARISONS + 4];
         assert_eq!(scan_run(&short).cursor, PRELUDE_COMPARISONS + 4);
     }
-
-    // -------------------------------------------------------------------------
-    //  deflate_rle -- the emitted symbols
-    // -------------------------------------------------------------------------
 
     /// The first byte of a stream is always a literal, because `s->strstart > 0` is false on
     /// the first pass through the loop (`deflate.c` L2104). The three that follow it then form
@@ -1028,10 +991,6 @@ mod tests {
         assert_eq!(split, whole.symbols);
         assert_eq!(state.window.lookahead, whole.lookahead);
     }
-
-    // -------------------------------------------------------------------------
-    //  deflate_rle -- the guards and the tail
-    // -------------------------------------------------------------------------
 
     /// `Z_NO_FLUSH` with less than `MAX_MATCH` of lookahead and no more input returns
     /// `need_more` without emitting anything (`deflate.c` L2096-L2098).

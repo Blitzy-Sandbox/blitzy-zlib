@@ -1,9 +1,9 @@
-//! Huffman decode-table construction: the Rust port of `inftrees.c` and `inftrees.h`.
+//! Huffman decode-table construction: the Rust mirror of `inftrees.c` and `inftrees.h`.
 //!
 //! A DEFLATE stream describes its Huffman codes by code *length* alone (RFC 1951
 //! §3.2.2). Before a single symbol can be decoded, those lengths have to be turned
 //! into a canonical code and then into a table the decoder can index with raw bits
-//! pulled from the stream. [`inflate_table`] is that transformation, and it is the
+//! pulled from the stream. `inflate_table` is that transformation, and it is the
 //! only place in the crate where a decode table is created.
 //!
 //! The module is folded into the `inflate` tree rather than standing on its own,
@@ -22,13 +22,13 @@
 //! * The private `LBASE`, `LEXT`, `DBASE` and `DEXT` tables are the four
 //!   `static const unsigned short` arrays at `inftrees.c` L69-L82, transcribed
 //!   element for element.
-//! * [`inflate_table`] is `inflate_table` from `inftrees.c` L46-L311.
-//! * [`inflate_fixed`] is `inflate_fixed` from `inftrees.c` L364-L372, in its
+//! * `inflate_table` is `inflate_table` from `inftrees.c` L46-L311.
+//! * `inflate_fixed` is `inflate_fixed` from `inftrees.c` L364-L372, in its
 //!   default (non-`BUILDFIXED`) form.
 //! * [`CodeTables`] holds the four fields of `struct inflate_state` at
 //!   `inflate.h` L110-L113 that name the tables currently in use.
 //!
-//! Two parts of `inftrees.c` are deliberately **not** ported. The `BUILDFIXED`
+//! Two parts of `inftrees.c` are deliberately **not** implemented. The `BUILDFIXED`
 //! block at L313-L352 builds the fixed tables lazily behind a `z_once_t`; the
 //! shipped configuration takes the other branch at L351 and `#include`s the
 //! committed tables from `inffixed.h`, so this module has no lazy initialisation of
@@ -39,7 +39,7 @@
 //!
 //! # Visibility
 //!
-//! [`inflate_table`] and [`inflate_fixed`] are `pub(crate)` and must stay that way.
+//! `inflate_table` and `inflate_fixed` are `pub(crate)` and must stay that way.
 //! Both are hidden symbols in the C shared library: the version script lists
 //! `inflate_table` in the `local:` block of `ZLIB_1.2.0` (`zlib.map` L13) and
 //! `inflate_fixed` in the `local:` block of `ZLIB_1.3.2` (`zlib.map` L115), so
@@ -51,6 +51,47 @@
 //! its arena from [`ENOUGH`], `inffast.rs` reads [`Code`]'s fields directly, and
 //! `fixed_tables.rs` is typed in terms of [`Code`].
 //!
+//! ## What the facade's `inflate_table` wrapper has to do
+//!
+//! Recorded here so the author of `crates/libz-rs-sys/src/inflate.rs` does not have
+//! to reconstruct it. The C declaration is fixed by `inftrees.h` L60-L62:
+//!
+//! ```c
+//! int inflate_table(codetype type, unsigned short FAR *lens, unsigned codes,
+//!                   code FAR * FAR *table, unsigned FAR *bits,
+//!                   unsigned short FAR *work);
+//! ```
+//!
+//! * **`type`** maps to [`CodeType`] by discriminant order -- `CODES`, `LENS`,
+//!   `DISTS` (`inftrees.h` L54-L58).
+//! * **`lens` and `work`** become `&[u16]` and `&mut [u16]` of exactly `codes`
+//!   elements. C passes no length; `codes` is the length, and this function checks
+//!   that both slices are long enough rather than trusting it.
+//! * **`table` is the in/out arena pointer.** `*table` is the base of the table
+//!   being built and is advanced past the entries the call consumed. The Rust form
+//!   takes the arena as `&mut [Code]` plus a `&mut usize` cursor, so the wrapper
+//!   passes a cursor of `0` for a slice starting at `*table` and then advances
+//!   `*table` by the cursor value the call leaves behind.
+//! * **The arena length the wrapper may claim is decided by `type`, not by the
+//!   caller.** C's own guarantee is the `ENOUGH_*` bound: a `LENS` or `CODES` build
+//!   consumes at most [`ENOUGH_LENS`] entries from the base it was given and a
+//!   `DISTS` build at most [`ENOUGH_DISTS`], because exceeding that is what
+//!   [`TABLE_NOT_ENOUGH`] reports. Those are the only lengths that are sound to
+//!   claim, and they are what every in-tree caller provides -- `inflate.c` hands over
+//!   what remains of a `codes[ENOUGH]` arena, and `infcover.c` passes a
+//!   `code table[ENOUGH_DISTS]` for its `DISTS` calls.
+//! * **`bits`** is in/out in both forms: the requested root width in, the actual
+//!   width out.
+//! * **The return value is the C tri-state unchanged** -- [`TABLE_OK`],
+//!   [`TABLE_INVALID_CODE`], [`TABLE_NOT_ENOUGH`], i.e. `0`, `-1`, `+1`. Return it
+//!   as-is; it is not a [`crate::error::ReturnCode`].
+//! * **[`Code`] is deliberately not `#[repr(C)]`**, so the wrapper must not cast the
+//!   caller's `code *` to a `*mut Code`. It writes entries and never reads them, so
+//!   the sound conversion is to build into a local `[Code]` buffer and copy the
+//!   `cursor` entries the call produced into the caller's array field by field.
+//!   Copying is complete: a table-link `val` is an offset relative to the base of the
+//!   table that holds the link, so it survives being moved as plain data.
+//!
 //! # The in/out table pointer becomes an index cursor
 //!
 //! C hands `inflate_table` a `code **table`: on entry it points at the next free
@@ -59,7 +100,7 @@
 //! *old* value as the base of the table just built -- that is precisely what
 //! `inflate.c` L889 and L898 do when they set `lencode` and `distcode`.
 //!
-//! This crate forbids `unsafe`, so there is no pointer to bump. [`inflate_table`]
+//! This crate forbids `unsafe`, so there is no pointer to bump. `inflate_table`
 //! takes the whole arena as a `&mut [Code]` plus a `&mut usize` cursor, and every
 //! position the C code expresses as a pointer becomes an offset from the start of
 //! that arena:
@@ -86,32 +127,39 @@
 //! rebases it into the copy only then. Safe Rust has no pointer to interrogate, so
 //! the distinction is made explicit instead -- [`CodeTableSource`] is either
 //! [`CodeTableSource::Fixed`] or a [`CodeTableSource::Dynamic`] offset into the
-//! arena. [`inflate_fixed`] selects the first; the `inflate_table` call sites select
+//! arena. `inflate_fixed` selects the first; the `inflate_table` call sites select
 //! the second. Copying a stream then needs no rebasing at all, because an offset
 //! means the same thing in the copy as it did in the original.
 //!
 //! # Panic and safety posture
 //!
-//! `lens` reaches [`inflate_table`] straight from the compressed stream (the
+//! `lens` reaches `inflate_table` straight from the compressed stream (the
 //! `CODELENS` state of `inflate()`), so every value in it is attacker controlled.
 //! The function is written to be total over that input: it contains no `unsafe`, no
 //! `unwrap`, no `expect` and no indexing operator, every table write goes through
 //! `get_mut`, every subtraction that is not provably non-negative goes through
 //! `checked_sub`, and every loop is bounded by [`MAXBITS`] or by the symbol count.
-//! A malformed length set is reported as [`TABLE_INVALID_CODE`] or
-//! [`TABLE_NOT_ENOUGH`]; it can neither panic nor loop forever.
+//! A malformed length set is reported as `TABLE_INVALID_CODE` or
+//! `TABLE_NOT_ENOUGH`; it can neither panic nor loop forever.
 //!
 //! `inftrees.c` L97-L100 records a precondition -- that every entry of `lens` is in
-//! `0..=MAXBITS` -- which the C code assumes but does not check. This port checks
+//! `0..=MAXBITS` -- which the C code assumes but does not check. This implementation checks
 //! it, because relying on a caller's promise for memory safety is exactly what the
 //! rewrite exists to eliminate. Honest callers are unaffected: the check is one
 //! comparison per symbol, on a path that already touches every symbol once.
 //!
 //! # Examples
 //!
-//! ```ignore
-//! // The 19-symbol code-length code of RFC 1951 §3.2.7, all lengths 4.
-//! let mut lens = [0u16; 19];
+//! Building the 19-symbol code-length code of RFC 1951 §3.2.7 looks like this.
+//! It is shown rather than compiled, because `inflate_table` and the three
+//! status constants it returns are crate-private — `zlib.map`'s `local:` block
+//! requires `inflate_table` to stay hidden, so no public path can reach it. The
+//! compiled form of this exact case is the
+//! `the_code_length_code_is_built_from_literals_only` test at the bottom of this
+//! file, which additionally checks every entry of the resulting table.
+//!
+//! ```text
+//! let mut lens = [0u16; 19];       // all lengths 4 for the first 16 symbols
 //! for len in lens.iter_mut().take(16) {
 //!     *len = 4;
 //! }
@@ -119,34 +167,30 @@
 //! let mut arena = [Code::ZERO; ENOUGH];
 //! let mut work = [0u16; 19];
 //! let mut cursor = 0;
-//! let mut bits = 7; // the root size `inflate.c` L812 asks for
+//! let mut bits = 7;                // the root size `inflate.c` L812 asks for
 //!
 //! let status = inflate_table(
 //!     CodeType::Codes, &lens, 19, &mut arena, &mut cursor, &mut bits, &mut work,
 //! );
 //!
 //! assert_eq!(status, TABLE_OK);
-//! assert_eq!(bits, 4); // clamped down: no code is longer than 4 bits
-//! assert_eq!(cursor, 16); // 2^4 entries consumed
+//! assert_eq!(bits, 4);             // clamped down: no code is longer than 4 bits
+//! assert_eq!(cursor, 16);          // 2^4 entries consumed
 //! ```
-
-// -----------------------------------------------------------------------------
-//  Limits
-// -----------------------------------------------------------------------------
 
 /// The longest code length a DEFLATE Huffman code may use.
 ///
 /// RFC 1951 §3.2.7 caps code lengths at 15 for both the literal/length and the
 /// distance alphabet, and the code-length alphabet that describes them is itself
 /// capped at 7. One bound therefore covers every alphabet, and it sizes the
-/// per-length bookkeeping arrays inside [`inflate_table`].
+/// per-length bookkeeping arrays inside `inflate_table`.
 ///
-/// Ported from `inftrees.c` L23 (`MAXBITS`).
+/// Mirrors `inftrees.c` L23 (`MAXBITS`).
 pub const MAXBITS: usize = 15;
 
 /// Maximum number of [`Code`] entries a literal/length table can occupy.
 ///
-/// Ported from `inftrees.h` L49 (`ENOUGH_LENS`).
+/// Mirrors `inftrees.h` L49 (`ENOUGH_LENS`).
 ///
 /// As `inftrees.h` L38-L48 explains, this is not a guess: it was found by
 /// exhaustive search with `examples/enough.c`, where `enough 286 9 15` reports 852.
@@ -158,7 +202,7 @@ pub const ENOUGH_LENS: usize = 852;
 
 /// Maximum number of [`Code`] entries a distance table can occupy.
 ///
-/// Ported from `inftrees.h` L50 (`ENOUGH_DISTS`).
+/// Mirrors `inftrees.h` L50 (`ENOUGH_DISTS`).
 ///
 /// The companion of [`ENOUGH_LENS`], found the same way: `enough 30 6 15` reports
 /// 592, where `6` is the root table size `inflate.c` L899 requests for a distance
@@ -168,22 +212,18 @@ pub const ENOUGH_DISTS: usize = 592;
 /// Size of the per-stream decode-table arena: one literal/length table plus one
 /// distance table, worst case.
 ///
-/// Ported from `inftrees.h` L51 (`ENOUGH`).
+/// Mirrors `inftrees.h` L51 (`ENOUGH`).
 ///
 /// This is the length of `codes[ENOUGH]` in `struct inflate_state`
 /// (`inflate.h` L122) and therefore the length of the arena passed to
-/// [`inflate_table`]. `test/infcover.c` includes `inftrees.h` directly and sizes a
+/// `inflate_table`. `test/infcover.c` includes `inftrees.h` directly and sizes a
 /// fixture from this value, so it must stay exactly 1444.
 pub const ENOUGH: usize = ENOUGH_LENS + ENOUGH_DISTS;
-
-// -----------------------------------------------------------------------------
-//  Table entries
-// -----------------------------------------------------------------------------
 
 /// One entry of a Huffman decode table: four bytes describing what to do with the
 /// code that indexed it.
 ///
-/// Ported from `inftrees.h` L24-L28 (`struct code`), with the explanation at
+/// Mirrors `inftrees.h` L24-L28 (`struct code`), with the explanation at
 /// `inftrees.h` L11-L23: each entry either carries the information needed to act on
 /// the code that selected it, or points at another table that indexes more bits of
 /// that code. For a table link, the low four bits of `op` are the index width of
@@ -233,7 +273,7 @@ impl Code {
     /// Useful for initialising an arena before it is filled, which is the only
     /// thing a zeroed entry means: read as a real entry it would decode as the
     /// literal `0` consuming no bits. C leaves `state->codes` uninitialised for the
-    /// same reason -- nothing may read an entry [`inflate_table`] has not written.
+    /// same reason -- nothing may read an entry `inflate_table` has not written.
     pub const ZERO: Self = Self::new(0, 0, 0);
 
     /// Assembles an entry from its three fields.
@@ -317,9 +357,9 @@ impl Code {
     }
 }
 
-/// Which of the three DEFLATE alphabets [`inflate_table`] is building a table for.
+/// Which of the three DEFLATE alphabets `inflate_table` is building a table for.
 ///
-/// Ported from `inftrees.h` L54-L58 (`codetype`), in declaration order.
+/// Mirrors `inftrees.h` L54-L58 (`codetype`), in declaration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeType {
     /// The code-length code: the 19-symbol alphabet of RFC 1951 §3.2.7 that
@@ -336,10 +376,6 @@ pub enum CodeType {
     Dists,
 }
 
-// -----------------------------------------------------------------------------
-//  Base and extra-bit tables (RFC 1951 §3.2.5)
-// -----------------------------------------------------------------------------
-//
 // The four arrays below are transcribed element for element from `inftrees.c`
 // L69-L82. Their lengths are load-bearing and their tail values are deliberate:
 // symbols 286 and 287 of the literal/length alphabet, and symbols 30 and 31 of the
@@ -353,7 +389,7 @@ pub enum CodeType {
 /// Base match length for each length code, i.e. symbols 257..=285 of the
 /// literal/length alphabet.
 ///
-/// Ported from `inftrees.c` L69-L71 (`lbase[31]`). Indexed by `symbol - 257`, so
+/// Mirrors `inftrees.c` L69-L71 (`lbase[31]`). Indexed by `symbol - 257`, so
 /// index 0 is code 257 (length 3) and index 28 is code 285 (length 258), matching
 /// the table at RFC 1951 §3.2.5. The two trailing zeros are placeholders for the
 /// never-occurring symbols 286 and 287.
@@ -364,7 +400,7 @@ const LBASE: [u16; 31] = [
 
 /// `op` value for each length code: `16 + extra_bits`, or an invalid-code marker.
 ///
-/// Ported from `inftrees.c` L72-L74 (`lext[31]`). Bit 4 (16) marks the entry as a
+/// Mirrors `inftrees.c` L72-L74 (`lext[31]`). Bit 4 (16) marks the entry as a
 /// length, and the low nibble carries the extra-bit count of RFC 1951 §3.2.5, so
 /// index 0 is `16` (code 257, no extra bits) and index 8 is `17` (code 265, one
 /// extra bit).
@@ -383,7 +419,7 @@ const LEXT: [u16; 31] = [
 /// Base match distance for each distance code, i.e. symbols 0..=29 of the distance
 /// alphabet.
 ///
-/// Ported from `inftrees.c` L75-L78 (`dbase[32]`). Indexed by the symbol itself, so
+/// Mirrors `inftrees.c` L75-L78 (`dbase[32]`). Indexed by the symbol itself, so
 /// index 0 is distance 1 and index 29 is distance 24577, matching the table at
 /// RFC 1951 §3.2.5. The two trailing zeros are placeholders for the never-occurring
 /// symbols 30 and 31.
@@ -394,7 +430,7 @@ const DBASE: [u16; 32] = [
 
 /// `op` value for each distance code: `16 + extra_bits`, or an invalid-code marker.
 ///
-/// Ported from `inftrees.c` L79-L82 (`dext[32]`). Same encoding as [`LEXT`], so
+/// Mirrors `inftrees.c` L79-L82 (`dext[32]`). Same encoding as [`LEXT`], so
 /// index 0 is `16` (distance 1, no extra bits) and index 29 is `29` (distances
 /// 24577..=32768, thirteen extra bits).
 ///
@@ -405,10 +441,6 @@ const DEXT: [u16; 32] = [
     27, 27, 28, 28, 29, 29, 64, 64,
 ];
 
-// -----------------------------------------------------------------------------
-//  Status codes
-// -----------------------------------------------------------------------------
-//
 // `inflate_table` reports a tri-state, described at `inftrees.c` L39-L41: "On
 // return, zero is success, -1 is an invalid code, and +1 means that ENOUGH isn't
 // enough." The numeric values are part of the contract because `inflate.c` and
@@ -416,39 +448,44 @@ const DEXT: [u16; 32] = [
 // deliberately NOT `crate::error::ReturnCode` values: -1 and +1 happen to coincide
 // with `Z_ERRNO` and `Z_STREAM_END` numerically while meaning something completely
 // different, and conflating the two would be a bug waiting to happen.
+//
+// All three are `#[doc(hidden)] pub` for the same reason [`inflate_table`] is: the
+// facade's `#[no_mangle] extern "C" fn inflate_table` returns this tri-state
+// verbatim, and naming the codes there is better than writing 0, -1 and 1 into the
+// ABI layer by hand. They are hidden from the rendered documentation because they
+// describe an internal seam, not the idiomatic Rust surface.
 
-/// [`inflate_table`] succeeded; the table is built and the cursor advanced.
+/// `inflate_table` succeeded; the table is built and the cursor advanced.
 ///
-/// Ported from the `return 0` at `inftrees.c` L133 and L310.
-pub(crate) const TABLE_OK: i32 = 0;
+/// Mirrors the `return 0` at `inftrees.c` L133 and L310.
+#[doc(hidden)]
+pub const TABLE_OK: i32 = 0;
 
-/// [`inflate_table`] rejected the code: the length set is over-subscribed, or it is
+/// `inflate_table` rejected the code: the length set is over-subscribed, or it is
 /// incomplete in a position where an incomplete code is not allowed.
 ///
-/// Ported from the `return -1` at `inftrees.c` L144 and L147. Both call sites in
+/// Mirrors the `return -1` at `inftrees.c` L144 and L147. Both call sites in
 /// `inflate.c` (L815, L893, L902) turn any non-zero status into a data error, so the
-/// distinction from [`TABLE_NOT_ENOUGH`] matters to diagnostics rather than to
+/// distinction from `TABLE_NOT_ENOUGH` matters to diagnostics rather than to
 /// control flow.
-pub(crate) const TABLE_INVALID_CODE: i32 = -1;
+#[doc(hidden)]
+pub const TABLE_INVALID_CODE: i32 = -1;
 
-/// [`inflate_table`] ran out of table space: the code needs more entries than
+/// `inflate_table` ran out of table space: the code needs more entries than
 /// [`ENOUGH_LENS`] or [`ENOUGH_DISTS`] allows.
 ///
-/// Ported from the `return 1` at `inftrees.c` L218 and L287. Real streams cannot
+/// Mirrors the `return 1` at `inftrees.c` L218 and L287. Real streams cannot
 /// provoke this, because the two maxima were computed to cover every code the format
 /// permits at the root sizes `inflate.c` uses; `test/infcover.c` `cover_trees()`
 /// (L618-L637) reaches it by calling `inflate_table` directly with a root of 15.
-pub(crate) const TABLE_NOT_ENOUGH: i32 = 1;
-
-// -----------------------------------------------------------------------------
-//  Decode-table construction
-// -----------------------------------------------------------------------------
+#[doc(hidden)]
+pub const TABLE_NOT_ENOUGH: i32 = 1;
 
 /// Reads one element of a fixed-length bookkeeping array without the possibility of
 /// a panic, treating an out-of-range index as the default value.
 ///
 /// Every index this is called with is provably in `0..=MAXBITS`, because
-/// [`inflate_table`] rejects a length outside that range before any of these arrays
+/// `inflate_table` rejects a length outside that range before any of these arrays
 /// is consulted. The fallback exists so that the compiler, and not a comment, is
 /// what rules out a panic: the workspace denies `clippy::indexing_slicing` precisely
 /// so that no bounds proof rests on review alone.
@@ -459,7 +496,7 @@ fn get_or_default<T: Copy + Default>(items: &[T], index: usize) -> T {
 
 /// Whether a table of `used` entries exceeds the space guaranteed for `code_type`.
 ///
-/// Ported from the two identical space checks at `inftrees.c` L216-L218 and
+/// Mirrors the two identical space checks at `inftrees.c` L216-L218 and
 /// L285-L287. [`CodeType::Codes`] deliberately has no bound, exactly as in C: the
 /// code-length code is built with a root of 7 (`inflate.c` L812) from lengths that
 /// are 3-bit values, so no code can exceed the root and no sub-table can ever be
@@ -476,7 +513,7 @@ const fn exceeds_enough(code_type: CodeType, used: usize) -> bool {
 
 /// Builds the decode tables for one canonical Huffman code.
 ///
-/// Ported from `inflate_table`, `inftrees.c` L46-L311.
+/// Mirrors `inflate_table`, `inftrees.c` L46-L311.
 ///
 /// The code is given by its lengths, `lens[0..codes]`, where a length of 0 means
 /// the symbol does not occur. The tables are written into `table` starting at
@@ -488,9 +525,9 @@ const fn exceeds_enough(code_type: CodeType, used: usize) -> bool {
 /// # Returns
 ///
 /// * [`TABLE_OK`] -- the table was built.
-/// * [`TABLE_INVALID_CODE`] -- the length set is over-subscribed, or incomplete
+/// * `TABLE_INVALID_CODE` -- the length set is over-subscribed, or incomplete
 ///   where an incomplete code is not permitted.
-/// * [`TABLE_NOT_ENOUGH`] -- the code needs more entries than [`ENOUGH_LENS`] or
+/// * `TABLE_NOT_ENOUGH` -- the code needs more entries than [`ENOUGH_LENS`] or
 ///   [`ENOUGH_DISTS`] allows.
 ///
 /// # How the code is constructed
@@ -539,12 +576,24 @@ const fn exceeds_enough(code_type: CodeType, used: usize) -> bool {
 /// `inftrees.c` L97-L100 states that the routine "assumes, but does not check, that
 /// all of the entries in `lens[]` are in the range `0..MAXBITS`", and that the
 /// caller must assure it. `inflate()` does: the `CODELENS` state can only produce
-/// lengths of 0..=15. This port nevertheless checks, because `lens` is filled from
+/// lengths of 0..=15. This implementation nevertheless checks, because `lens` is filled from
 /// the compressed stream and a safe-Rust core must not depend on a caller's promise
 /// to stay in bounds. A violated precondition -- an out-of-range length, a `lens` or
 /// `work` slice shorter than `codes`, or a `*table_index` past the end of `table` --
 /// is reported as an error rather than trusted, and no input of any shape can make
 /// this function panic or fail to terminate.
+///
+/// # Visibility
+///
+/// `#[doc(hidden)] pub` rather than `pub(crate)`, because `crates/libz-rs-sys` has to
+/// wrap this function in a `#[no_mangle] extern "C" fn inflate_table` so that the
+/// unmodified `test/infcover.c` -- which calls the C symbol directly at its L632 and
+/// L636 and links against the static archive -- resolves against `libz.a`. This Rust
+/// item is never `#[no_mangle]` and never `extern "C"`, so it contributes a mangled
+/// Rust symbol only; `zlib.map`'s `local:` block, applied when the shared library is
+/// linked, is what keeps the C name out of the `.so`'s dynamic table. The module
+/// documentation states the whole contract, including what the wrapper must do about
+/// the arena length and the [`Code`] layout.
 // Narrowing casts below are `as` rather than `try_from` because every one of them is
 // provably in range and the C original is an unchecked truncation in the same place:
 // `len`, `drop_bits`, `curr` and `root` are all bounded by MAXBITS (15); `LEXT` and
@@ -552,7 +601,8 @@ const fn exceeds_enough(code_type: CodeType, used: usize) -> bool {
 // literal came from a `u16`; and the sub-table offset is explicitly range-checked
 // against `u16::MAX` before it is cast.
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn inflate_table(
+#[doc(hidden)]
+pub fn inflate_table(
     code_type: CodeType,
     lens: &[u16],
     codes: usize,
@@ -680,10 +730,6 @@ pub(crate) fn inflate_table(
         };
         *next_position = position + 1;
     }
-
-    // -----------------------------------------------------------------------------
-    //  Create and fill in the decoding tables
-    // -----------------------------------------------------------------------------
 
     // Set up for the code type (`inftrees.c` L189-L202). Note that the `DISTS` arm
     // of C's switch has no `break` and never assigns `match`, so it falls out of the
@@ -879,19 +925,15 @@ pub(crate) fn inflate_table(
     TABLE_OK
 }
 
-// -----------------------------------------------------------------------------
-//  Which tables the decoder is currently using
-// -----------------------------------------------------------------------------
-
 /// Root index width of the fixed literal/length table.
 ///
-/// Ported from `state->lenbits = 9` at `inftrees.c` L369. It is also the exponent
+/// Mirrors `state->lenbits = 9` at `inftrees.c` L369. It is also the exponent
 /// behind the length of `lenfix[512]` at `inffixed.h` L10.
 pub const FIXED_LENBITS: usize = 9;
 
 /// Root index width of the fixed distance table.
 ///
-/// Ported from `state->distbits = 5` at `inftrees.c` L371. It is also the exponent
+/// Mirrors `state->distbits = 5` at `inftrees.c` L371. It is also the exponent
 /// behind the length of `distfix[32]` at `inffixed.h` L87.
 pub const FIXED_DISTBITS: usize = 5;
 
@@ -910,12 +952,12 @@ pub const FIXED_DISTBITS: usize = 5;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeTableSource {
     /// The immutable fixed tables of RFC 1951 §3.2.6, as committed in `inffixed.h`
-    /// and selected by [`inflate_fixed`]. Shared by every stream and never written.
+    /// and selected by `inflate_fixed`. Shared by every stream and never written.
     Fixed,
-    /// A table built by [`inflate_table`], starting at this offset into the
+    /// A table built by `inflate_table`, starting at this offset into the
     /// stream's own arena.
     ///
-    /// The offset is the value the cursor held when [`inflate_table`] was called,
+    /// The offset is the value the cursor held when `inflate_table` was called,
     /// which is exactly what `inflate.c` L889 and L898 record.
     Dynamic {
         /// Index of the table's first [`Code`] within the arena.
@@ -951,10 +993,10 @@ impl Default for CodeTableSource {
 /// The four fields of `struct inflate_state` that say which decode tables are in
 /// use and how wide their root indices are.
 ///
-/// Ported from `inflate.h` L110-L113 (`lencode`, `distcode`, `lenbits`,
+/// Mirrors `inflate.h` L110-L113 (`lencode`, `distcode`, `lenbits`,
 /// `distbits`). They are grouped into one type because they are always written
-/// together -- by [`inflate_fixed`] for a fixed block, and by the
-/// [`inflate_table`] call sites for a dynamic one -- and because grouping them
+/// together -- by `inflate_fixed` for a fixed block, and by the
+/// `inflate_table` call sites for a dynamic one -- and because grouping them
 /// keeps the bit width next to the table it belongs to.
 ///
 /// The C fields are `unsigned`; `usize` is used here because both values are shift
@@ -973,10 +1015,10 @@ pub struct CodeTables {
 }
 
 impl CodeTables {
-    /// The selection [`inflate_fixed`] installs: both fixed tables, with the root
+    /// The selection `inflate_fixed` installs: both fixed tables, with the root
     /// widths of RFC 1951 §3.2.6.
     ///
-    /// Ported from the body of `inflate_fixed`, `inftrees.c` L368-L371.
+    /// Mirrors the body of `inflate_fixed`, `inftrees.c` L368-L371.
     pub const FIXED: Self = Self {
         lencode: CodeTableSource::Fixed,
         lenbits: FIXED_LENBITS,
@@ -989,7 +1031,7 @@ impl CodeTables {
     ///
     /// Mirrors `inflate.c` L118, which points both tables at `state->codes` without
     /// touching `lenbits` or `distbits` -- they are always assigned immediately
-    /// before the [`inflate_table`] call that gives them meaning (`inflate.c` L812,
+    /// before the `inflate_table` call that gives them meaning (`inflate.c` L812,
     /// L890, L899).
     pub const RESET: Self = Self {
         lencode: CodeTableSource::Dynamic { offset: 0 },
@@ -1000,7 +1042,7 @@ impl CodeTables {
 
     /// Returns `true` when both tables are the shared fixed ones.
     ///
-    /// The two fields always agree in practice, because [`inflate_fixed`] is the
+    /// The two fields always agree in practice, because `inflate_fixed` is the
     /// only writer of [`CodeTableSource::Fixed`] and it writes both; the test is
     /// written over both so that a future partial update cannot be misread.
     #[must_use]
@@ -1020,12 +1062,12 @@ impl Default for CodeTables {
 /// Points the decoder at the fixed literal/length and distance tables of
 /// RFC 1951 §3.2.6.
 ///
-/// Ported from `inflate_fixed`, `inftrees.c` L364-L372. In the shipped
+/// Mirrors `inflate_fixed`, `inftrees.c` L364-L372. In the shipped
 /// configuration that function is four assignments, and so is this one: the tables
 /// themselves are compile-time constants (`inffixed.h`, included at `inftrees.c`
 /// L351), so there is nothing to build and nothing to synchronise. The
 /// `BUILDFIXED` variant at `inftrees.c` L313-L349, which constructs them on first
-/// use behind a `z_once_t`, is deliberately not ported -- see the module
+/// use behind a `z_once_t`, is deliberately not implemented -- see the module
 /// documentation.
 ///
 /// `inflate()` calls this from the fixed-block arm of its block-type switch
@@ -1033,10 +1075,6 @@ impl Default for CodeTables {
 pub(crate) fn inflate_fixed(tables: &mut CodeTables) {
     *tables = CodeTables::FIXED;
 }
-
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 // The workspace denies the panic family in library code, which is the whole point of
@@ -1061,7 +1099,7 @@ mod tests {
     /// `state->work[288]` at `inflate.h` L120-L121. 320 covers both.
     const SCRATCH: usize = 320;
 
-    /// Everything a call to [`inflate_table`] reports back, kept together so a test
+    /// Everything a call to `inflate_table` reports back, kept together so a test
     /// can assert on the table and on the in/out parameters at once.
     struct Built {
         status: i32,
@@ -1070,7 +1108,7 @@ mod tests {
         bits: usize,
     }
 
-    /// Runs [`inflate_table`] over a freshly zeroed arena with the cursor starting at
+    /// Runs `inflate_table` over a freshly zeroed arena with the cursor starting at
     /// `start`, taking `codes` from the length slice.
     fn build_from(
         code_type: CodeType,
@@ -1134,10 +1172,6 @@ mod tests {
         lens[15] = 15;
         lens
     }
-
-    // -------------------------------------------------------------------------
-    //  The ported types and tables
-    // -------------------------------------------------------------------------
 
     #[test]
     fn code_has_the_layout_of_the_c_struct() {
@@ -1262,10 +1296,6 @@ mod tests {
             assert!(!entry.is_table_link());
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  Reproducing the committed fixed tables
-    // -------------------------------------------------------------------------
 
     /// `lenfix[512]` exactly as committed at `inffixed.h` L10-L85, as
     /// `(op, bits, val)` triples in table order.
@@ -1899,10 +1929,6 @@ mod tests {
         assert!(built.arena[32..].iter().all(|&entry| entry == Code::ZERO));
     }
 
-    // -------------------------------------------------------------------------
-    //  The tri-state status contract
-    // -------------------------------------------------------------------------
-
     #[test]
     fn no_symbols_at_all_yields_two_invalid_entries() {
         // `inftrees.c` L126-L134: success, a root width of 1, and two identical
@@ -2164,10 +2190,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  Per-type behaviour
-    // -------------------------------------------------------------------------
-
     #[test]
     fn distance_tables_take_every_symbol_from_base_and_extra() {
         // C's `case DISTS:` falls out of the switch without assigning `match`
@@ -2300,10 +2322,6 @@ mod tests {
         assert!(!dynamic.is_fixed());
         assert_ne!(dynamic, CodeTables::FIXED);
     }
-
-    // -------------------------------------------------------------------------
-    //  Totality: broken preconditions and random input
-    // -------------------------------------------------------------------------
 
     #[test]
     fn broken_preconditions_are_reported_not_trusted() {
@@ -2550,7 +2568,7 @@ mod tests {
         // [`ENOUGH_LENS`] and [`ENOUGH_DISTS`] were found by exhaustive search over
         // exactly these two shapes -- at most 286 symbols at a root of 9, and at most
         // 30 symbols at a root of 6 (`inftrees.h` L38-L48). Sampling that space is
-        // the strongest cheap evidence that this port allocates entries the way C
+        // the strongest cheap evidence that this implementation allocates entries the way C
         // does: an implementation that sized sub-tables differently would either
         // exceed the bound and report a shortage, or refuse a valid code.
         let mut rng = Rng(0x0bad_c0de_dead_beef);

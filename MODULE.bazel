@@ -3,13 +3,18 @@
 # and act as the differential oracle for the memory-safe Rust reimplementation
 # of this library.
 #
-# The Rust port is a Cargo workspace rooted at Cargo.toml, with members
+# The Rust implementation is a Cargo workspace rooted at Cargo.toml, with members
 # crates/zlib-rs, crates/libz-rs-sys and crates/zlib-rs-differential.  It is
-# built with `cargo build --release`, not with Bazel.  Rust is deliberately out
-# of Bazel scope here, so no Rust ruleset is added to the bazel_dep list below.
+# built with `cargo build --release -p zlib-rs -p libz-rs-sys` -- the two crates
+# that ship, named explicitly so the build does not also select the differential
+# harness, which compiles C from its build script -- and not with Bazel.  Rust is
+# deliberately out of Bazel scope here, so no Rust ruleset is added to the
+# bazel_dep list below.
 #
-# Both implementations export the same byte-compatible C ABI, so
-# compatibility_level stays 1 and no Bazel consumer of this module is affected.
+# The Rust implementation is REQUIRED to export the same byte-compatible C ABI as
+# the C one, which is why compatibility_level stays 1: this module keeps building
+# and exporting the C library either way, so no Bazel consumer of it is affected
+# by the port regardless of how that requirement is progressing.
 module(
     name = "zlib",
     version = "0.0.0",

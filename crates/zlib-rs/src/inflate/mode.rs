@@ -1,12 +1,11 @@
-//! The inflate state tag: the Rust port of the C `inflate_mode` enum.
+//! The inflate state tag.
 //!
 //! `inflate()` is a *resumable* state machine. A caller may hand it a single
 //! byte of input at a time and offer a single byte of output space at a time,
 //! so every point at which the decoder can run out of either has to be a
-//! named, saveable state. The reference implementation names those states in
-//! the `inflate_mode` enum at `inflate.h` L20-L53 and records the legal
-//! transitions between them in the diagram at `inflate.h` L55-L78. [`Mode`]
-//! reproduces both: variant for variant, in order, and value for value.
+//! named, saveable state. [`Mode`] is that set of states, variant for variant
+//! and value for value with the `inflate_mode` enum at `inflate.h` L20-L53.
+//! The legal transitions between them are the diagram at `inflate.h` L55-L78.
 //!
 //! # Position in the crate
 //!
@@ -46,12 +45,22 @@
 //!    which streams get a window update on the way out.
 //! 3. **The discriminant values.** They run over the dense block
 //!    16180..=16211. The implausible base is not decoration: `inflateStateCheck`
-//!    (`inflate.c` L88-L98) validates a caller-supplied stream by testing
-//!    `state->mode < HEAD || state->mode > SYNC`, which is zlib's cheap way of
-//!    noticing that `z_stream.state` points at foreign, stale, or already-freed
-//!    memory rather than at an inflate state. [`Mode::from_raw`] and
-//!    [`Mode::is_valid_tag`] are that test, and they keep the base value so the
-//!    port fails on exactly the inputs the reference fails on.
+//!    (`inflate.c` L88-L98) tests `state->mode < HEAD || state->mode > SYNC`,
+//!    and [`Mode::from_raw`] and [`Mode::is_valid_tag`] are that test, keeping
+//!    the base value so this implementation accepts and rejects exactly the
+//!    values the reference does.
+//!
+//!    What that test can establish is narrower than it looks. Reading the tag
+//!    at all requires `z_stream.state` to be non-null, aligned, and safe to
+//!    dereference for the duration of the call — a precondition no value read
+//!    *through* that pointer can establish, and therefore one the boundary
+//!    layer discharges before any state reaches this crate. Given it, an
+//!    out-of-range tag shows that the live object behind the pointer is not one
+//!    of this library's inflate states: a stream that was never initialised, a
+//!    deflate state handed to an inflate entry point, or a state whose tag has
+//!    been overwritten. It does not detect a dangling or already-freed pointer.
+//!    Such a pointer may still hold its old tag, and dereferencing it is
+//!    undefined behaviour before the comparison ever runs.
 //!
 //! Note what is *not* claimed: none of this is ABI-visible. `inflate_state`
 //! lives behind the opaque `z_stream.state` pointer, so no caller can observe
@@ -67,9 +76,11 @@ use core::fmt;
 
 /// One of the 32 states `inflate()` can be suspended in.
 ///
-/// Ported from the `inflate_mode` enum at `inflate.h` L20-L53. Variant order
-/// and discriminant values are those of the reference implementation; see the
-/// module documentation for why both are contractual.
+/// Variant order and discriminant values are those of the `inflate_mode` enum
+/// at `inflate.h` L20-L53, whose declaration order the variants below follow
+/// exactly; see the module documentation for why both are contractual. Each
+/// variant names what the decoder is waiting for; [`Mode::c_name`] gives the
+/// reference spelling of any of them.
 ///
 /// # Naming
 ///
@@ -88,52 +99,12 @@ use core::fmt;
 /// maintainer diffing against the reference — or reading a trace next to
 /// `test/infcover.c` output — never has to guess.
 ///
-/// # Reading the variant documentation
-///
-/// Each variant carries the reference comment for its state. The `i:` / `o:` /
-/// `i/o:` prefixes are the reference's own annotations and mean: `i:` the state
-/// is waiting for *input* bits, `o:` it is waiting for *output* space, `i/o:`
-/// either can be the reason it suspended. Five states carry no prefix in the
-/// reference — [`Mode::Dict`], [`Mode::Done`], [`Mode::Bad`], [`Mode::Mem`] and
-/// [`Mode::Sync`], none of which is waiting on the stream — and none is
-/// invented for them here.
-///
-/// # Legal transitions
-///
-/// Transcribed from `inflate.h` L55-L78. The names are the C ones, so that the
-/// diagram can be diffed against the header directly:
-///
-/// ```text
-///     State transitions between above modes -
-///
-///     (most modes can go to BAD or MEM on error -- not shown for clarity)
-///
-///     Process header:
-///         HEAD -> (gzip) or (zlib) or (raw)
-///         (gzip) -> FLAGS -> TIME -> OS -> EXLEN -> EXTRA -> NAME -> COMMENT ->
-///                   HCRC -> TYPE
-///         (zlib) -> DICTID or TYPE
-///         DICTID -> DICT -> TYPE
-///         (raw) -> TYPEDO
-///     Read deflate blocks:
-///             TYPE -> TYPEDO -> STORED or TABLE or LEN_ or CHECK
-///             STORED -> COPY_ -> COPY -> TYPE
-///             TABLE -> LENLENS -> CODELENS -> LEN_
-///             LEN_ -> LEN
-///     Read deflate codes in fixed or dynamic block:
-///                 LEN -> LENEXT or LIT or TYPE
-///                 LENEXT -> DIST -> DISTEXT -> MATCH -> LEN
-///                 LIT -> LEN
-///     Process trailer:
-///         CHECK -> LENGTH -> DONE
-/// ```
-///
 /// # Examples
 ///
 /// The ordinal comparisons the driver's epilogue is built on:
 ///
 /// ```
-/// use zlib_rs::Mode;
+/// use zlib_rs::inflate::Mode;
 ///
 /// // `inflate.c` L1133: `state->mode < BAD` means "no error has been latched".
 /// assert!(Mode::Len.is_error_free());
@@ -150,7 +121,7 @@ use core::fmt;
 /// Validating an untrusted tag the way `inflateStateCheck` does:
 ///
 /// ```
-/// use zlib_rs::Mode;
+/// use zlib_rs::inflate::Mode;
 ///
 /// assert_eq!(Mode::from_raw(16180), Some(Mode::Head));
 /// assert_eq!(Mode::from_raw(0), None);
@@ -158,123 +129,103 @@ use core::fmt;
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Mode {
-    /// `i:` waiting for magic header. (C `HEAD`, `inflate.h` L21.)
+    /// Waiting for the magic header bytes.
     ///
     /// The reset state: `inflateResetKeep` assigns it at `inflate.c` L110 and
     /// `inflateInit2_` pre-seeds it at `inflate.c` L205 so that the freshly
     /// allocated state passes the tag check. It is the low end of the tag range
-    /// `inflateStateCheck` accepts.
+    /// [`Mode::is_valid_tag`] accepts.
     Head = 16180,
-    /// `i:` waiting for method and flags (gzip). (C `FLAGS`, `inflate.h` L22.)
+    /// Waiting for the gzip method and flag bytes.
     Flags,
-    /// `i:` waiting for modification time (gzip). (C `TIME`, `inflate.h` L23.)
+    /// Waiting for the gzip modification time.
     Time,
-    /// `i:` waiting for extra flags and operating system (gzip).
-    /// (C `OS`, `inflate.h` L24.)
+    /// Waiting for the gzip extra flags and operating-system bytes.
     Os,
-    /// `i:` waiting for extra length (gzip). (C `EXLEN`, `inflate.h` L25.)
+    /// Waiting for the gzip extra-field length.
     ExLen,
-    /// `i:` waiting for extra bytes (gzip). (C `EXTRA`, `inflate.h` L26.)
+    /// Waiting for the gzip extra-field bytes.
     Extra,
-    /// `i:` waiting for end of file name (gzip). (C `NAME`, `inflate.h` L27.)
+    /// Waiting for the end of the gzip file name.
     Name,
-    /// `i:` waiting for end of comment (gzip). (C `COMMENT`, `inflate.h` L28.)
+    /// Waiting for the end of the gzip comment.
     Comment,
-    /// `i:` waiting for header crc (gzip). (C `HCRC`, `inflate.h` L29.)
+    /// Waiting for the gzip header CRC.
     HCrc,
-    /// `i:` waiting for dictionary check value. (C `DICTID`, `inflate.h` L30.)
+    /// Waiting for the zlib dictionary check value.
     DictId,
-    /// Waiting for `inflateSetDictionary()` call. (C `DICT`, `inflate.h` L31.)
+    /// Waiting for an `inflateSetDictionary` call.
     ///
-    /// Carries no `i:` / `o:` prefix in the reference because it is waiting on
-    /// the *caller*, not on the stream: `inflate()` returns `Z_NEED_DICT` and
-    /// stays here until the dictionary arrives.
+    /// Waiting on the *caller* rather than on the stream: `inflate()` returns
+    /// `Z_NEED_DICT` and stays here until the dictionary arrives.
     Dict,
-    /// `i:` waiting for type bits, including last-flag bit.
-    /// (C `TYPE`, `inflate.h` L32.)
+    /// Waiting for the block type bits, including the last-block flag.
     ///
     /// Also reported to the caller: `inflate.c` L1148 adds 128 to
-    /// `strm.data_type` when the stream suspends in this state, and
-    /// `inffast.rs` returns to it at end-of-block.
+    /// `strm.data_type` when the stream suspends in this state, and the fast
+    /// decode loop returns to it at end-of-block.
     Type,
-    /// `i:` same, but skip check to exit inflate on new block.
-    /// (C `TYPEDO`, `inflate.h` L33.)
+    /// Waiting for the block type bits, skipping the check that exits
+    /// `inflate()` on a new block.
     TypeDo,
-    /// `i:` waiting for stored size (length and complement).
-    /// (C `STORED`, `inflate.h` L34.)
+    /// Waiting for a stored block's length and its complement.
     Stored,
-    /// `i/o:` same as [`Mode::Copy`] below, but only first time in.
-    /// (C `COPY_`, `inflate.h` L35.)
+    /// Waiting for input or output to copy a stored block, on first entry only.
     ///
-    /// **Renamed.** The reference name ends in an underscore, which is not
-    /// idiomatic in Rust and reads as a typo, so `COPY_` is spelled
-    /// `CopyBlock` here; [`Mode::c_name`] still reports `"COPY_"`.
-    /// `inflate.c` L1149 adds 256 to `strm.data_type` for this state.
+    /// **Renamed.** The reference name `COPY_` ends in an underscore, which is
+    /// not idiomatic in Rust and reads as a typo; [`Mode::c_name`] still reports
+    /// `"COPY_"`. `inflate.c` L1149 adds 256 to `strm.data_type` for this state.
     CopyBlock,
-    /// `i/o:` waiting for input or output to copy stored block.
-    /// (C `COPY`, `inflate.h` L36.)
+    /// Waiting for input or output to copy a stored block.
     Copy,
-    /// `i:` waiting for dynamic block table lengths.
-    /// (C `TABLE`, `inflate.h` L37.)
+    /// Waiting for a dynamic block's table lengths.
     Table,
-    /// `i:` waiting for code length code lengths.
-    /// (C `LENLENS`, `inflate.h` L38.)
+    /// Waiting for the code-length code lengths.
     LenLens,
-    /// `i:` waiting for length/lit and distance code lengths.
-    /// (C `CODELENS`, `inflate.h` L39.)
+    /// Waiting for the length/literal and distance code lengths.
     CodeLens,
-    /// `i:` same as [`Mode::Len`] below, but only first time in.
-    /// (C `LEN_`, `inflate.h` L40.)
+    /// Waiting for a length/literal/end-of-block code, on first entry only.
     ///
-    /// **Renamed.** As with [`Mode::CopyBlock`], the trailing underscore is
-    /// dropped: `LEN_` is spelled `LenFirst` here and [`Mode::c_name`] still
-    /// reports `"LEN_"`. `inflate.c` L1149 adds 256 to `strm.data_type` for
-    /// this state.
+    /// **Renamed.** As with [`Mode::CopyBlock`], the trailing underscore of
+    /// `LEN_` is dropped and [`Mode::c_name`] still reports `"LEN_"`.
+    /// `inflate.c` L1149 adds 256 to `strm.data_type` for this state.
     LenFirst,
-    /// `i:` waiting for length/lit/eob code. (C `LEN`, `inflate.h` L41.)
+    /// Waiting for a length/literal/end-of-block code.
     Len,
-    /// `i:` waiting for length extra bits. (C `LENEXT`, `inflate.h` L42.)
+    /// Waiting for a length's extra bits.
     LenExt,
-    /// `i:` waiting for distance code. (C `DIST`, `inflate.h` L43.)
+    /// Waiting for a distance code.
     Dist,
-    /// `i:` waiting for distance extra bits. (C `DISTEXT`, `inflate.h` L44.)
+    /// Waiting for a distance's extra bits.
     DistExt,
-    /// `o:` waiting for output space to copy string.
-    /// (C `MATCH`, `inflate.h` L45.)
+    /// Waiting for output space to copy a matched string.
     Match,
-    /// `o:` waiting for output space to write literal.
-    /// (C `LIT`, `inflate.h` L46.)
+    /// Waiting for output space to write a literal.
     Lit,
-    /// `i:` waiting for 32-bit check value. (C `CHECK`, `inflate.h` L47.)
+    /// Waiting for the 32-bit check value.
     ///
     /// The first trailer state, and therefore the threshold
     /// [`Mode::is_before_trailer`] compares against.
     Check,
-    /// `i:` waiting for 32-bit length (gzip). (C `LENGTH`, `inflate.h` L48.)
+    /// Waiting for the gzip 32-bit uncompressed length.
     Length,
-    /// Finished check, done -- remain here until reset.
-    /// (C `DONE`, `inflate.h` L49.)
+    /// The check value matched; remains here until the stream is reset.
     Done,
-    /// Got a data error -- remain here until reset.
-    /// (C `BAD`, `inflate.h` L50.)
+    /// A data error was found; remains here until the stream is reset.
     ///
     /// The first error state, and therefore the threshold
-    /// [`Mode::is_error_free`] compares against. It is the single most-assigned
-    /// state in the reference: 21 assignments in `inflate.c`, 12 in `infback.c`
-    /// and 4 in `inffast.c`.
+    /// [`Mode::is_error_free`] compares against.
     Bad,
-    /// Got an `inflate()` memory error -- remain here until reset.
-    /// (C `MEM`, `inflate.h` L51.)
+    /// An allocation failed inside `inflate()`; remains here until reset.
     ///
     /// Non-recoverable: the reference notes at `inflate.c` L1129 that a memory
     /// error from `inflate()` cannot be resumed from.
     Mem,
-    /// Looking for synchronization bytes to restart `inflate()`.
-    /// (C `SYNC`, `inflate.h` L52.)
+    /// Looking for synchronisation bytes so that `inflate()` can restart.
     ///
     /// Entered only by `inflateSync` (`inflate.c` L1277-L1278, which enters it at
     /// most once per synchronisation attempt), and the high end of the tag range
-    /// `inflateStateCheck` accepts.
+    /// [`Mode::is_valid_tag`] accepts.
     Sync,
 }
 
@@ -365,9 +316,13 @@ impl Mode {
     /// back to itself.
     ///
     /// This is the conversion `inflate/mod.rs` needs to reproduce
-    /// `inflateStateCheck` (`inflate.c` L88-L98): a tag read back out of a
-    /// caller-supplied stream is untrusted, and rejecting it is how the port
-    /// notices foreign, stale, or already-freed memory. See
+    /// `inflateStateCheck` (`inflate.c` L88-L98). The tag read out of a
+    /// caller-supplied stream is untrusted *as a value*, so it is checked rather
+    /// than assumed; the pointer it was read through is a separate matter, and
+    /// must already have been established as safe to dereference before this
+    /// function can be reached at all. Rejecting the value therefore shows that
+    /// the live object behind that pointer is not one of this library's inflate
+    /// states — not that the pointer itself was stale. See
     /// [`Mode::is_valid_tag`] for the predicate form and [`TryFrom`] for the
     /// fallible-conversion form.
     #[must_use]
@@ -455,7 +410,7 @@ impl Mode {
     /// `inflate.h` L21-L52 writes it.
     ///
     /// [`Debug`] prints the Rust name; this prints the C one. Both are wanted:
-    /// a maintainer comparing a trace from this port against a trace from the C
+    /// a maintainer comparing a trace from this crate against one from the C
     /// oracle — or against `test/infcover.c`, which includes `inflate.h`
     /// directly and drives the state machine hard — should not have to
     /// translate names by hand. It is also where the two renamed states

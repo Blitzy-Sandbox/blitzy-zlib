@@ -40,9 +40,9 @@
 # purpose.  They are the differential oracle for the memory-safe Rust
 # reimplementation of this library -- the Rust encoder's output is compared
 # byte-for-byte against theirs -- so this build has to stay green: if it broke,
-# the port would lose the reference it is checked against.
+# the Rust implementation would lose the reference it is checked against.
 #
-# The Rust port is not built by Bazel.  It is a Cargo workspace rooted at
+# The Rust implementation is not built by Bazel.  It is a Cargo workspace rooted at
 # Cargo.toml with three members: crates/zlib-rs, the dependency-free safe core
 # holding all of the algorithmic logic; crates/libz-rs-sys, the C ABI facade
 # whose `z` library target produces the drop-in libz.so and libz.a; and
@@ -50,11 +50,11 @@
 # above alongside the Rust ones so the two can be compared in one process.
 # Build it with `cargo build --release`.
 #
-# Rust is deliberately out of Bazel scope for this port.  No Rust ruleset is
-# loaded here and none is requested in MODULE.bazel, which carries only a
-# matching note.  Adding one would mean maintaining a second build description
-# of the same library by hand, in step with Cargo.toml, and no such ruleset is
-# among the dependencies this port takes on.
+# Rust is deliberately out of Bazel scope.  No Rust ruleset is loaded here and
+# none is requested in MODULE.bazel, which carries only a matching note.  Adding
+# one would mean maintaining a second build description of the same library by
+# hand, in step with Cargo.toml, and no such ruleset is among this module's
+# dependencies.
 #
 # None of this changes anything for a Bazel consumer.  Both implementations
 # export the same C ABI -- identical symbols, signatures and struct layouts,
@@ -117,10 +117,17 @@ config_setting(
 )
 
 # The C oracle target.  This is the reference implementation the Rust port is
-# verified against, and it is what a Bazel consumer of `:z` or `:zlib` links.
-# The Rust-built equivalents of the artifacts produced here, libz.so and
-# libz.a with the same exported symbols, come from crates/libz-rs-sys via
-# `cargo build --release`.
+# verified against, and it is what a Bazel consumer of `:z` or `:zlib` links --
+# now and after the port, because Rust is out of Bazel scope here.
+#
+# The Rust equivalents of the artifacts produced by this target, libz.so and
+# libz.a, are INTENDED to carry the same exported symbols and are built with
+# `cargo build --release -p zlib-rs -p libz-rs-sys` and packaged by
+# `make rust`.  Name the two packages explicitly: a bare `cargo build` at the
+# workspace root also reaches crates/zlib-rs-differential, whose build script
+# compiles the very C sources listed below.  Symbol parity is a requirement that
+# `make rust-test` checks with nm; it has not been demonstrated yet, because the
+# facade crate root crates/libz-rs-sys/src/lib.rs has not been written.
 cc_library(
     name = "z",
     srcs = [

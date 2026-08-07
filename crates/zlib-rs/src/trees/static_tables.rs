@@ -20,9 +20,18 @@
 //! -- commented out -- and L83 opens `#if defined(GEN_TREES_H) || !defined(STDC)`
 //! over the *mutable* declarations, closing at L113 with an `#else` whose only
 //! statement is `#include "trees.h"` (L114). With `STDC` defined and
-//! `GEN_TREES_H` undefined, a default build therefore takes the header branch,
-//! and the committed `trees.h` tables are the ones every existing zlib decodes
-//! and encodes against.
+//! `GEN_TREES_H` undefined, a **default** build therefore takes the header branch,
+//! and the committed `trees.h` tables are the ones such a build encodes and decodes
+//! against -- which is the configuration this port implements.
+//!
+//! The qualifier is load-bearing rather than pedantic. A build compiled with
+//! `-DGEN_TREES_H`, or one where `STDC` is not defined, takes the other branch and
+//! fills the mutable tables in at run time from `tr_static_init` instead; and
+//! `-DGEN_TREES_H` additionally compiles in `gen_trees_header` (`trees.c`
+//! L379-L435), whose whole purpose is to *rewrite* `trees.h`. The values that
+//! generator produces equal the committed ones, so this is a difference in
+//! initialisation strategy rather than in output -- but "every existing zlib build"
+//! would still be the wrong claim, because not every build reads this header.
 //!
 //! The generator that would fill the mutable form in, `tr_static_init`
 //! (`trees.c` L295-L374), is wrapped in that *same* conditional: its entire body
@@ -37,7 +46,7 @@
 //! file, so there is no first-use race to reason about and nothing for a
 //! run-time checker to observe. The companion generator `gen_trees_header`
 //! (`trees.c` L379-L435), which is what wrote `trees.h` in the first place, is
-//! likewise not ported: it exists to *produce* this data, and the data is
+//! likewise not implemented: it exists to *produce* this data, and the data is
 //! already here.
 //!
 //! # What the six generated tables are
@@ -78,8 +87,8 @@
 //!
 //! Every table keeps its C name, lowercase and unchanged, so that the
 //! element-for-element comparison in
-//! `crates/zlib-rs-differential/tests/table_equality.rs` reads as a direct diff
-//! against the header. That, and only that, is why each carries a narrowly
+//! the planned `crates/zlib-rs-differential/tests/table_equality.rs` will read as a
+//! direct diff against the header. That, and only that, is why each carries a narrowly
 //! scoped `#[allow(non_upper_case_globals)]`.
 //!
 //! The public/crate-private split mirrors the reference exactly.
@@ -96,7 +105,7 @@
 //!
 //! # Element types
 //!
-//! Each element type is the C type its consumer reads, so that the ported
+//! Each element type is the C type its consumer reads, so that the
 //! arithmetic needs no cast the reference does not also perform:
 //!
 //! | Table | C declaration | Rust element | Consumer that fixes it |
@@ -125,13 +134,9 @@ use crate::deflate::state::{
     CtData, BL_CODES, D_CODES, LENGTH_CODES, L_CODES, MAX_MATCH, MIN_MATCH,
 };
 
-// -----------------------------------------------------------------------------
-//  Constants local to trees.c -- `trees.c` L47-L59 and L81
-// -----------------------------------------------------------------------------
-
 /// Length of [`_dist_code`] -- 512.
 ///
-/// Port of `#define DIST_CODE_LEN 512` (`trees.c` L81). Two 256-entry halves,
+/// Mirrors `#define DIST_CODE_LEN 512` (`trees.c` L81). Two 256-entry halves,
 /// not one 512-entry range: the first half maps the distances 1 through 256
 /// directly, and the second maps the top eight bits of a distance above 256.
 /// The `d_code` macro (`deflate.h` L320-L321) is what selects between them.
@@ -142,7 +147,7 @@ pub(crate) const DIST_CODE_LEN: usize = 512;
 
 /// No code in the bit-length tree may be wider than this -- 7 bits.
 ///
-/// Port of `#define MAX_BL_BITS 7` (`trees.c` L47-L48). It is the `max_length`
+/// Mirrors `#define MAX_BL_BITS 7` (`trees.c` L47-L48). It is the `max_length`
 /// member of `static_bl_desc` (`trees.c` L138), where the literal and distance
 /// descriptors both carry `MAX_BITS` (`deflate.h` L52) of 15 instead, and it is
 /// what makes `gen_bitlen`'s overflow-repair loop (`trees.c` L577-L592)
@@ -156,7 +161,7 @@ pub(crate) const MAX_BL_BITS: usize = 7;
 
 /// The end-of-block symbol of the literal/length alphabet -- 256.
 ///
-/// Port of `#define END_BLOCK 256` (`trees.c` L50-L51). RFC 1951 3.2.5 reserves
+/// Mirrors `#define END_BLOCK 256` (`trees.c` L50-L51). RFC 1951 3.2.5 reserves
 /// value 256 to terminate a block, so `init_block` seeds its frequency at one
 /// (`trees.c` L448) -- the symbol is always sent -- and `compress_block` emits
 /// it as the last code of every compressed block (`trees.c` L949).
@@ -166,7 +171,7 @@ pub(crate) const END_BLOCK: usize = 256;
 
 /// Bit-length code 16 -- repeat the previous length 3 to 6 times.
 ///
-/// Port of `#define REP_3_6 16` (`trees.c` L53-L54). Followed by two bits of
+/// Mirrors `#define REP_3_6 16` (`trees.c` L53-L54). Followed by two bits of
 /// repeat count, biased by three; see RFC 1951 3.2.7. `scan_tree` counts it
 /// (`trees.c` L733) and `send_tree` emits it with `send_bits(s, count - 3, 2)`
 /// (`trees.c` L777).
@@ -176,7 +181,7 @@ pub(crate) const REP_3_6: usize = 16;
 
 /// Bit-length code 17 -- repeat a zero length 3 to 10 times.
 ///
-/// Port of `#define REPZ_3_10 17` (`trees.c` L56-L57). Followed by three bits
+/// Mirrors `#define REPZ_3_10 17` (`trees.c` L56-L57). Followed by three bits
 /// of repeat count, biased by three; see RFC 1951 3.2.7. Counted at `trees.c`
 /// L735 and emitted at `trees.c` L780.
 ///
@@ -185,21 +190,17 @@ pub(crate) const REPZ_3_10: usize = 17;
 
 /// Bit-length code 18 -- repeat a zero length 11 to 138 times.
 ///
-/// Port of `#define REPZ_11_138 18` (`trees.c` L59-L60). Followed by seven bits
+/// Mirrors `#define REPZ_11_138 18` (`trees.c` L59-L60). Followed by seven bits
 /// of repeat count, biased by eleven; see RFC 1951 3.2.7. Counted at `trees.c`
 /// L737 and emitted at `trees.c` L783.
 ///
 /// Declared `usize`: every use indexes `DeflateState::bl_tree`.
 pub(crate) const REPZ_11_138: usize = 18;
 
-// -----------------------------------------------------------------------------
-//  The generated static trees -- `trees.h` L3-L71
-// -----------------------------------------------------------------------------
-
 /// The static literal/length tree: `static_ltree[L_CODES+2]`, transcribed from
 /// `trees.h` L3-L62.
 ///
-/// Port of `local const ct_data static_ltree[L_CODES+2]`. Each entry is a bit
+/// Mirrors `local const ct_data static_ltree[L_CODES+2]`. Each entry is a bit
 /// string and its width, exactly as the header spells it -- `{{12},{8}}` is code
 /// 12 in 8 bits -- which is the `fc` then `dl` order of [`CtData::new`].
 ///
@@ -517,18 +518,11 @@ pub const static_ltree: [CtData; L_CODES + 2] = [
 /// The static distance tree: `static_dtree[D_CODES]`, transcribed from
 /// `trees.h` L64-L71.
 ///
-/// Port of `local const ct_data static_dtree[D_CODES]`. RFC 1951 3.2.6 gives
+/// Mirrors `local const ct_data static_dtree[D_CODES]`. RFC 1951 3.2.6 gives
 /// every distance code the same width, so this is the trivial tree: all thirty
 /// entries are 5 bits wide and entry `n` holds `n` with its low five bits
 /// reversed, which is precisely what `tr_static_init` writes at `trees.c`
-/// L364-L367:
-///
-/// ```c
-/// for (n = 0; n < D_CODES; n++) {
-///     static_dtree[n].Len = 5;
-///     static_dtree[n].Code = bi_reverse((unsigned)n, 5);
-/// }
-/// ```
+/// L364-L367.
 ///
 /// Both properties are re-derived by the tests below rather than eyeballed.
 ///
@@ -572,14 +566,10 @@ pub const static_dtree: [CtData; D_CODES] = [
     CtData::new(23, 5),
 ];
 
-// -----------------------------------------------------------------------------
-//  The generated code maps -- `trees.h` L73-L127
-// -----------------------------------------------------------------------------
-
 /// Distance to distance-code map: `_dist_code[DIST_CODE_LEN]`, transcribed from
 /// `trees.h` L73-L100.
 ///
-/// Port of `const uch ZLIB_INTERNAL _dist_code[DIST_CODE_LEN]`. Two 256-entry
+/// Mirrors `const uch ZLIB_INTERNAL _dist_code[DIST_CODE_LEN]`. Two 256-entry
 /// halves, selected by the `d_code` macro (`deflate.h` L320-L321):
 ///
 /// ```c
@@ -634,13 +624,13 @@ pub const _dist_code: [u8; DIST_CODE_LEN] = [
 /// Match length to length-code map: `_length_code[MAX_MATCH-MIN_MATCH+1]`,
 /// transcribed from `trees.h` L102-L116.
 ///
-/// Port of `const uch ZLIB_INTERNAL _length_code[MAX_MATCH-MIN_MATCH+1]`.
+/// Mirrors `const uch ZLIB_INTERNAL _length_code[MAX_MATCH-MIN_MATCH+1]`.
 /// Indexed by the *normalised* match length, `length - MIN_MATCH`, so index 0 is
 /// a match of 3 bytes and index 255 a match of 258; the value is the length code
 /// relative to the first of them, which the caller then offsets by
 /// `LITERALS + 1` to reach the literal/length alphabet (`trees.c` L925). The
 /// residue is `length - MIN_MATCH - base_length[code]`, sent in
-/// [`extra_lbits`]`[code]` bits.
+/// `extra_lbits``[code]` bits.
 ///
 /// # The last entry is 28, not 27
 ///
@@ -671,7 +661,7 @@ pub const _length_code: [u8; MAX_MATCH - MIN_MATCH + 1] = [
 /// First normalised length of each length code: `base_length[LENGTH_CODES]`,
 /// transcribed from `trees.h` L118-L121.
 ///
-/// Port of `local const int base_length[LENGTH_CODES]`. `compress_block`
+/// Mirrors `local const int base_length[LENGTH_CODES]`. `compress_block`
 /// subtracts it to obtain the residue a length code carries in its extra bits
 /// (`trees.c` L926): `lc -= base_length[code]`, where `lc` is the normalised
 /// length `length - MIN_MATCH`. Element `n` is therefore the smallest
@@ -686,7 +676,7 @@ pub const _length_code: [u8; MAX_MATCH - MIN_MATCH + 1] = [
 /// assigned and retains the zero of a zero-initialised `local` array. Nothing
 /// reads it: `compress_block` subtracts a base only when
 /// `extra_lbits[code] != 0` (`trees.c` L924-L928), and
-/// [`extra_lbits`]`[28]` is zero. The zero is transcribed exactly as the header
+/// `extra_lbits``[28]` is zero. The zero is transcribed exactly as the header
 /// holds it; the test below pins it.
 ///
 /// Element type `i32`, from C's `const int`, so the subtraction at `trees.c`
@@ -701,7 +691,7 @@ pub const base_length: [i32; LENGTH_CODES] = [
 /// First distance of each distance code: `base_dist[D_CODES]`, transcribed from
 /// `trees.h` L123-L127.
 ///
-/// Port of `local const int base_dist[D_CODES]`. `compress_block` subtracts it
+/// Mirrors `local const int base_dist[D_CODES]`. `compress_block` subtracts it
 /// to obtain the residue a distance code carries in its extra bits (`trees.c`
 /// L934): `dist -= (unsigned)base_dist[code]`, where `dist` is the match
 /// distance minus one. Element `n` is the smallest reduced distance that maps to
@@ -719,14 +709,10 @@ pub const base_dist: [i32; D_CODES] = [
     2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576,
 ];
 
-// -----------------------------------------------------------------------------
-//  The extra-bit and code-order tables -- `trees.c` L62-L72
-// -----------------------------------------------------------------------------
-
 /// Extra bits carried by each length code: `extra_lbits[LENGTH_CODES]`,
 /// transcribed from `trees.c` L62-L63.
 ///
-/// Port of `local const int extra_lbits[LENGTH_CODES]`, described there as
+/// Mirrors `local const int extra_lbits[LENGTH_CODES]`, described there as
 /// "extra bits for each length code". Read twice: `gen_bitlen` adds it to a code
 /// width when accumulating `opt_len` and `static_len` (`trees.c` L570-L574), and
 /// `compress_block` uses it to decide whether a residue follows the code at all
@@ -746,7 +732,7 @@ pub(crate) const extra_lbits: [i32; LENGTH_CODES] = [
 /// Extra bits carried by each distance code: `extra_dbits[D_CODES]`,
 /// transcribed from `trees.c` L65-L66.
 ///
-/// Port of `local const int extra_dbits[D_CODES]`, described there as "extra
+/// Mirrors `local const int extra_dbits[D_CODES]`, described there as "extra
 /// bits for each distance code". The `extra_bits` member of `static_d_desc`
 /// (`trees.c` L135), with an `extra_base` of 0 -- unlike the literal descriptor,
 /// every distance code is a leaf that may carry extra bits. It is also the run
@@ -755,7 +741,7 @@ pub(crate) const extra_lbits: [i32; LENGTH_CODES] = [
 /// `1 << (extra_dbits[code] - 7)` at or above it (`trees.c` L336 and L344),
 /// which is where the `>> 7` of the `d_code` macro comes from.
 ///
-/// Element type `i32`; see [`extra_lbits`].
+/// Element type `i32`; see `extra_lbits`.
 // The identifier is deliberately the C name `extra_dbits` from `trees.c` L65.
 #[allow(non_upper_case_globals)]
 pub(crate) const extra_dbits: [i32; D_CODES] = [
@@ -766,14 +752,14 @@ pub(crate) const extra_dbits: [i32; D_CODES] = [
 /// Extra bits carried by each bit-length code: `extra_blbits[BL_CODES]`,
 /// transcribed from `trees.c` L68-L69.
 ///
-/// Port of `local const int extra_blbits[BL_CODES]`, described there as "extra
+/// Mirrors `local const int extra_blbits[BL_CODES]`, described there as "extra
 /// bits for each bit length code". The `extra_bits` member of `static_bl_desc`
 /// (`trees.c` L138). Only the last three entries are non-zero, and they are the
 /// repeat counts of RFC 1951 3.2.7: 2 bits for [`REP_3_6`], 3 for
 /// [`REPZ_3_10`], 7 for [`REPZ_11_138`]. Codes 0 through 15 encode a literal
 /// code width and carry nothing.
 ///
-/// Element type `i32`; see [`extra_lbits`].
+/// Element type `i32`; see `extra_lbits`.
 // The identifier is deliberately the C name `extra_blbits` from `trees.c` L68.
 #[allow(non_upper_case_globals)]
 pub(crate) const extra_blbits: [i32; BL_CODES] =
@@ -782,7 +768,7 @@ pub(crate) const extra_blbits: [i32; BL_CODES] =
 /// Transmission order of the bit-length codes: `bl_order[BL_CODES]`,
 /// transcribed from `trees.c` L71-L72.
 ///
-/// Port of `local const uch bl_order[BL_CODES]`. `trees.c` L73-L75 gives the
+/// Mirrors `local const uch bl_order[BL_CODES]`. `trees.c` L73-L75 gives the
 /// reason: "The lengths of the bit length codes are sent in order of decreasing
 /// probability, to avoid transmitting the lengths for unused bit length codes."
 /// The three repeat codes come first, then 0, then the middle widths outward
@@ -803,10 +789,6 @@ pub(crate) const extra_blbits: [i32; BL_CODES] =
 pub(crate) const bl_order: [u8; BL_CODES] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
-
-// -----------------------------------------------------------------------------
-//  Declared lengths, pinned at compile time
-// -----------------------------------------------------------------------------
 
 // Each length above is written as the expression the C declaration uses, so that
 // it tracks the shared sizing constants rather than restating a number. These
@@ -846,6 +828,11 @@ const _: () = assert!(REPZ_3_10 + 1 == REPZ_11_138);
 const _: () = assert!(REPZ_11_138 + 1 == BL_CODES);
 const _: () = assert!(END_BLOCK == crate::deflate::state::LITERALS);
 
+// Fixture indexing: every index below is a literal into a fixture this module just built,
+// so each one is provably in range. `clippy::indexing_slicing` is denied workspace-wide and
+// is relaxed HERE ONLY, on the test module -- not through a clippy.toml key, which would be a
+// field the 1.80 floor does not recognise and would abort the whole lint run.
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::{
@@ -908,18 +895,9 @@ mod tests {
 
     /// Reverses the low `len` bits of `code`.
     ///
-    /// Port of `bi_reverse` (`trees.c` L154-L161), which `gen_codes` applies to
+    /// Mirrors `bi_reverse` (`trees.c` L154-L161), which `gen_codes` applies to
     /// every canonical code at `trees.c` L227. The C body is a `do`/`while` that
-    /// runs exactly `len` times:
-    ///
-    /// ```c
-    /// unsigned res = 0;
-    /// do {
-    ///     res |= code & 1;
-    ///     code >>= 1, res <<= 1;
-    /// } while (--len > 0);
-    /// return res >> 1;
-    /// ```
+    /// runs exactly `len` times.
     ///
     /// `u16` arithmetic cannot overflow here: after `k` iterations `res` is below
     /// `1 << k`, and `len` never exceeds `MAX_BITS` of 15.

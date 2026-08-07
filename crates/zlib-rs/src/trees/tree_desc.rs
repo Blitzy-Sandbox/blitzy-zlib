@@ -32,8 +32,8 @@
 //! # Relationship to the two C types with similar names
 //!
 //! `deflate.h` L88 is `typedef struct static_tree_desc_s static_tree_desc;` --
-//! an alias for the struct declared at L117-L123 of `trees.c` and ported here
-//! as [`StaticTreeDesc`].
+//! an alias for the struct declared at L117-L123 of `trees.c`, which is
+//! [`StaticTreeDesc`] here.
 //!
 //! `deflate.h` L90-L94 declares a **different** type, `tree_desc_s`, holding
 //! `dyn_tree`, `max_code` and `stat_desc`. That is the *mutable* half of a tree
@@ -60,17 +60,7 @@ use crate::trees::static_tables::{
 
 /// The constant description of one Huffman tree.
 ///
-/// Port of `struct static_tree_desc_s` (L117-L123):
-///
-/// ```c
-/// struct static_tree_desc_s {
-///     const ct_data *static_tree;  /* static tree or NULL */
-///     const intf *extra_bits;      /* extra bits for each code or NULL */
-///     int     extra_base;          /* base index for extra_bits */
-///     int     elems;               /* max number of elements in the tree */
-///     int     max_length;          /* max bit length for the codes */
-/// };
-/// ```
+/// Mirrors `struct static_tree_desc_s` (L117-L123).
 ///
 /// The three instances are [`STATIC_L_DESC`], [`STATIC_D_DESC`] and
 /// [`STATIC_BL_DESC`]; there are never any others, and none is ever mutated.
@@ -82,14 +72,12 @@ use crate::trees::static_tables::{
 /// `for (n = 0; n < elems; n++)` over a tree array (L641), `extra_base` is
 /// subtracted from a tree index to index [`Self::extra_bits`] (L572), and
 /// `max_length` indexes `DeflateState::bl_count` (L588) and is compared against
-/// a code width (L564). That also matches the widths the port already uses for
+/// a code width (L564). That also matches the widths the implementation already uses for
 /// [`MAX_BITS`] and [`MAX_BL_BITS`], so no descriptor field needs a cast the
 /// reference does not also perform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct StaticTreeDesc {
-    /// The fixed codes for this alphabet, or [`None`] when it has none --
-    /// `const ct_data *static_tree` (L118), whose comment is "static tree or
-    /// NULL".
+    /// The fixed codes for this alphabet, or [`None`] when it has none (L118).
     ///
     /// The null case is a live branch, not a defensive one, and it is the whole
     /// reason this is an [`Option`] rather than a slice. Two sites test it:
@@ -105,8 +93,8 @@ pub(crate) struct StaticTreeDesc {
     /// with static codes -- see [`STATIC_BL_DESC`].
     pub(crate) static_tree: Option<&'static [CtData]>,
 
-    /// How many extra bits each symbol of this alphabet carries --
-    /// `const intf *extra_bits` (L119). `intf` is `int` (`zconf.h` L415).
+    /// How many extra bits each symbol of this alphabet carries (L119). The element type
+    /// is `i32` because C's `intf` is `int` (`zconf.h` L415).
     ///
     /// Deliberately **not** an [`Option`], even though the C comment reads
     /// "extra bits for each code or NULL". All three descriptors supply a
@@ -121,8 +109,8 @@ pub(crate) struct StaticTreeDesc {
     /// `trees/static_tables.rs` gives them a common `i32` element type.
     pub(crate) extra_bits: &'static [i32],
 
-    /// The first symbol of this alphabet that can carry extra bits --
-    /// `int extra_base` (L120), "base index for `extra_bits`".
+    /// The first symbol of this alphabet that can carry extra bits (L120): the base index
+    /// `extra_bits` is offset by.
     ///
     /// `gen_bitlen` reads `extra_bits[n - extra_base]` for a symbol `n`, and
     /// only when `n >= extra_base` (L571-L572); a symbol below the base carries
@@ -131,8 +119,8 @@ pub(crate) struct StaticTreeDesc {
     /// 256 literals plus the end-of-block code and none of those is a length.
     pub(crate) extra_base: usize,
 
-    /// The number of symbols in this alphabet -- `int elems` (L121), "max
-    /// number of elements in the tree".
+    /// The number of symbols in this alphabet (L121), which is the most a tree over it can
+    /// hold.
     ///
     /// `build_tree` scans exactly this many entries of the dynamic tree for
     /// non-zero frequencies (L641) and starts numbering the internal nodes it
@@ -142,8 +130,7 @@ pub(crate) struct StaticTreeDesc {
     /// stored above the leaves.
     pub(crate) elems: usize,
 
-    /// The widest code this alphabet permits -- `int max_length` (L122), "max
-    /// bit length for the codes".
+    /// The widest code this alphabet permits, in bits (L122).
     ///
     /// `gen_bitlen` clamps any deeper code to this and counts the clamp as an
     /// overflow (L564); a non-zero overflow count then runs the repair loop at
@@ -162,7 +149,7 @@ impl StaticTreeDesc {
     /// L459-L466, where C stores `&static_l_desc`, `&static_d_desc` or
     /// `&static_bl_desc` into a tree's `stat_desc` member. [`TreeDesc`] records
     /// a [`StaticTreeKind`] instead of a pointer -- naming the descriptor rather
-    /// than pointing at it is what removes that aliasing from the port -- so
+    /// than pointing at it is what removes that aliasing from the implementation -- so
     /// this is the lookup that turns the recorded name back into the data.
     ///
     /// Returned by value: a descriptor is [`Copy`] and holds nothing but two
@@ -178,10 +165,6 @@ impl StaticTreeDesc {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  The three descriptors -- L131-L138
-// -----------------------------------------------------------------------------
-//
 // Every field is written as the expression the C initialiser uses -- `LITERALS +
 // 1` rather than 257, `L_CODES` rather than 286 -- so that a change to a shared
 // sizing constant propagates here exactly as the preprocessor propagates it
@@ -189,12 +172,9 @@ impl StaticTreeDesc {
 // from. The literal values those expressions evaluate to are pinned separately,
 // by the assertions further down.
 
-/// The literal/length tree -- port of `static_l_desc` (L131-L132):
-///
-/// ```c
-/// local TCONST static_tree_desc static_l_desc =
-/// {static_ltree, extra_lbits, LITERALS+1, L_CODES, MAX_BITS};
-/// ```
+/// The literal/length tree. Mirrors `static_l_desc` (L131-L132), whose five fields are
+/// `static_ltree`, `extra_lbits`, an `extra_base` of `LITERALS + 1`, `L_CODES` elements and a
+/// `max_length` of `MAX_BITS`.
 ///
 /// Describes the alphabet RFC 1951 3.2.5 tabulates: the 256 literal bytes, the
 /// end-of-block code, and the 29 length codes, for [`L_CODES`] = 286 symbols.
@@ -212,12 +192,8 @@ pub(crate) const STATIC_L_DESC: StaticTreeDesc = StaticTreeDesc {
     max_length: MAX_BITS,
 };
 
-/// The distance tree -- port of `static_d_desc` (L134-L135):
-///
-/// ```c
-/// local TCONST static_tree_desc static_d_desc =
-/// {static_dtree, extra_dbits, 0,          D_CODES, MAX_BITS};
-/// ```
+/// The distance tree. Mirrors `static_d_desc` (L134-L135): `static_dtree`, `extra_dbits`, an
+/// `extra_base` of `0`, `D_CODES` elements and a `max_length` of `MAX_BITS`.
 ///
 /// Describes the [`D_CODES`] = 30 distance codes. Its `extra_base` is zero
 /// because every symbol of this alphabet is a distance code and so may carry a
@@ -234,12 +210,9 @@ pub(crate) const STATIC_D_DESC: StaticTreeDesc = StaticTreeDesc {
     max_length: MAX_BITS,
 };
 
-/// The bit-length tree -- port of `static_bl_desc` (L137-L138):
-///
-/// ```c
-/// local TCONST static_tree_desc static_bl_desc =
-/// {(const ct_data *)0, extra_blbits, 0,   BL_CODES, MAX_BL_BITS};
-/// ```
+/// The bit-length tree. Mirrors `static_bl_desc` (L137-L138): a null static tree,
+/// `extra_blbits`, an `extra_base` of `0`, `BL_CODES` elements and a `max_length` of
+/// `MAX_BL_BITS`.
 ///
 /// Describes the [`BL_CODES`] = 19 codes used to *transmit* the widths of the
 /// other two trees: the sixteen literal widths 0 through 15 plus the three
@@ -269,10 +242,6 @@ pub(crate) const STATIC_BL_DESC: StaticTreeDesc = StaticTreeDesc {
     elems: BL_CODES,
     max_length: MAX_BL_BITS,
 };
-
-// -----------------------------------------------------------------------------
-//  The initialisers, pinned at compile time
-// -----------------------------------------------------------------------------
 
 // Each field above tracks a shared sizing constant; these assertions pin the
 // resulting values to the numbers `trees.c` L131-L138 and `deflate.h` L34-L52
@@ -305,7 +274,7 @@ const _: () = assert!(STATIC_BL_DESC.static_tree.is_none());
 
 // Every extra-bit table is exactly as long as the range of symbols that can
 // index it, which is what makes `gen_bitlen`'s `extra[n - base]` (L572) provably
-// in range and so lets the ported loop read the table without a fallible
+// in range and so lets the loop read the table without a fallible
 // accessor or a bounds check the reference does not have. The argument in full:
 // that read is guarded by `if (n >= base)` (L572), so the index is never
 // negative; and it is reached only after `if (n > max_code) continue;` (L568)

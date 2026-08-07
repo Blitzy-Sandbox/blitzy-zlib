@@ -1,14 +1,14 @@
-# zlib-rs -- the safe, dependency-free algorithmic core of the zlib C -> Rust
-# port.  Every algorithm (DEFLATE, inflate, Huffman coding, Adler-32, CRC-32,
-# the gzip file layer and the one-shot wrappers) lives here; the raw pointers
+# zlib-rs -- the safe, dependency-free algorithmic core of the Rust zlib
+# implementation.  Every algorithm (DEFLATE, inflate, Huffman coding, Adler-32,
+# CRC-32, the gzip file layer and the one-shot wrappers) lives here; raw pointers
 # and the exported C ABI live one layer up, in `libz-rs-sys`.
 #
-# `version`, `edition`, `rust-version` and `license` are inherited from the
-# workspace root so the MSRV contract (edition 2021 + rustc 1.80, mirrored by
-# `msrv` in clippy.toml) is stated in exactly one place.  Only keys the root
-# `[workspace.package]` is contracted to provide are inherited: inheriting a key
-# the root does not declare is a hard, workspace-wide manifest error, whereas
-# omitting optional publish metadata here costs nothing.
+# `version`, `edition`, `rust-version`, `license` and `publish` are inherited
+# from the workspace root so the MSRV contract (edition 2021 + rustc 1.80,
+# mirrored by `msrv` in clippy.toml) and the publishing policy are each stated in
+# exactly one place.  Only keys the root `[workspace.package]` is contracted to
+# provide are inherited: inheriting a key the root does not declare is a hard,
+# workspace-wide manifest error.
 
 [package]
 name = "zlib-rs"
@@ -16,39 +16,99 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+
+# `publish = false` at the root is NOT inherited implicitly -- nothing about
+# `[workspace.package]` applies to a member unless the member asks for it by
+# name.  Without this line the crate is publishable by default, so a stray
+# `cargo publish` in this directory would push a snapshot of an in-repository
+# library to crates.io under a name the project does not own there.  It is
+# inherited rather than restated as a local `publish = false` so that the policy
+# has one home; if the project ever does decide to publish, the root changes and
+# every member follows.
+publish.workspace = true
+
 # Set literally rather than inherited so the summary names this crate's role
-# precisely; a workspace-wide description covers the whole port.
+# precisely; the workspace-wide description covers the library as a whole.
 description = "Safe-Rust reimplementation of the zlib compression and decompression engine"
 
 [features]
-# Nothing is enabled by default: the default build is the portable, scalar,
-# `no_std` + `alloc` engine, which is exactly what the C ABI facade consumes.
+# Nothing is enabled by default: building THIS crate on its own gives the
+# portable, scalar, `no_std` + `alloc` engine.
+#
+# That is not, however, what the C ABI facade ends up with.  `libz-rs-sys`
+# enables `gz` by default and `gz = ["zlib-rs/std"]`, so a default build of the
+# facade turns `std` on here transitively and compiles the `gz` file layer in.
+# Reaching the genuinely `no_std` configuration through the facade takes
+# `--no-default-features` (optionally plus `--features libz-compat`).  Both
+# configurations are supported; do not describe either one as "what the facade
+# consumes" without saying which.
 default = []
 
-# Idiomatic Rust surface -- typed configurations and slice-based helpers layered
-# over the engine.  Independent of the C ABI facade, which drives the engine
-# directly and does not need this.
+# Idiomatic Rust surface -- the flat convenience layer at the crate root.
+#
+# What it gates, precisely: every `pub use crate::…` re-export in the "crate
+# root's re-exported surface" section of src/lib.rs (~80 names -- ReturnCode, the
+# Allocator contract types, DeflateConfig/Strategy/Flush and their bounds
+# constants, the checksum entry points, the state and stream types, the cursors,
+# the one-shot wrappers and the generated tables).  Each of those carries
+# `#[cfg(feature = "rust-api")]`.
+#
+# What it does NOT gate: the items themselves, or any module.  Every `pub mod` in
+# src/lib.rs is unconditional apart from `gz`, which is gated on `std`.  So with
+# this feature off the whole engine is still reachable by module path --
+# `config::DeflateConfig`, `error::ReturnCode`, `compress::compress2`,
+# `crc32::crc32` -- which is exactly how the C ABI facade consumes it.  That is
+# why `libz-rs-sys` deliberately does not enable this feature and is unaffected
+# by it.
+#
+# Being purely additive is a requirement, not an accident: Cargo unifies features
+# across a build, so a feature that could REMOVE a name would let one workspace
+# member break another simply by enabling it.  `zlib-rs-differential` and the
+# `fuzz/` targets both request `rust-api`; `libz-rs-sys` does not; all three are
+# built together by `cargo test --workspace`.
 rust-api = []
 
-# Vectorised CRC-32 and Adler-32 backends, selected at build time and gated at
-# run time by target-feature detection.  Output-neutral by construction: a
-# checksum is one scalar however it is computed, so this changes throughput
-# only, never the emitted bytes.  Vectorised match finding is deliberately not
-# offered, because it would change the compressed output.
+# Vectorised CRC-32 and Adler-32 backends.  THIS FEATURE IS THE ONLY THING THAT
+# SELECTS THEM: cargo resolves features before any build script runs, so
+# `ZLIB_RS_SIMD` in the facade's build script cannot turn this feature on -- a
+# build script publishes a `cfg`, it does not add a feature.  What that script does
+# instead is reconcile a caller's request against whatever this feature resolved to
+# and fail the build on a contradiction, rather than silently compiling the other
+# backend.
+#
+# CORRECTNESS NEVER DEPENDS ON A RUN-TIME PROBE.  Both backends are written in
+# portable, fixed-width integer arithmetic that LLVM is free to autovectorise,
+# with no architecture-specific intrinsic to guard, so an enabled build computes
+# the right answer on a machine with no vector unit at all.  What the two do
+# differ on, and the difference is worth knowing before editing either:
+#
+#   * CRC-32 (`src/crc32/simd.rs`) performs NO detection of any kind.  The
+#     backend is chosen at compile time and used unconditionally.
+#   * Adler-32 (`src/adler32/simd.rs`) exposes `is_supported()`, which
+#     `src/adler32/mod.rs` consults to pick between the lane arrangement and the
+#     scalar one.  It is a THROUGHPUT HINT, never a correctness guard: on x86
+#     with `std` it is a cached `is_x86_feature_detected!("sse2")` CPUID query,
+#     on x86 without `std` it is `cfg!(target_feature = "sse2")`, and elsewhere
+#     it is unconditionally true.  Either answer yields identical checksums.
+#
+# Output-neutral by construction: a checksum is one scalar however it is
+# computed, so this changes throughput only, never the emitted bytes.  Vectorised
+# match finding is deliberately not offered, because it would change the
+# compressed output.
 simd = []
 
-# Opt the core into `std`.  The default build is `no_std` + `alloc`; only the
-# file-I/O portions of the `gz` layer need `std`.  The `gz` feature of
-# `libz-rs-sys` enables this feature transitively, so no separate `gz` feature
-# exists on this crate.
+# Opt the core into `std`.  Building this crate alone defaults to `no_std` +
+# `alloc`; only the file-I/O portions of the `gz` layer need `std`, and the `gz`
+# module is gated on this feature.  `libz-rs-sys`'s default-on `gz` feature
+# forwards to it, which is why no separate `gz` feature exists on this crate.
 std = []
 
 # Intentionally empty, and audited: the core algorithm crate carries no
 # third-party dependencies whatsoever -- see the `[bans]` section of deny.toml,
 # which names this table as the enforcement point.  `[dev-dependencies]` and
-# `[build-dependencies]` are absent for the same reason: the suites under
-# `tests/` use only the built-in `#[test]` harness over `core`/`alloc`/`std`,
-# and this crate has no build script.
+# `[build-dependencies]` are absent for the same reason: the test modules use
+# only the built-in `#[test]` harness over `core`/`alloc`/`std`, and this crate
+# has no build script.
 [dependencies]
 
 # Lint policy -- `deny(clippy::all, clippy::pedantic)` plus the panic-prone

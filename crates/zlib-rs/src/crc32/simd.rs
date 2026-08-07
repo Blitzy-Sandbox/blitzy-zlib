@@ -9,15 +9,20 @@
 //! The crate-wide prohibition on unchecked operations rules out the standard
 //! architecture intrinsics, and stable Rust at the MSRV of 1.80 has no stable portable
 //! vector API. The useful option left is fixed-width, independent integer work that LLVM
-//! can autovectorize. Release builds reinforce that shape with `-C target-cpu`, fat LTO,
-//! and one code-generation unit. Table loads remain scalar because portable Rust has no
-//! gather operation; the gain comes from independent accumulators and from shortening the
-//! serial final combine and byte tail.
+//! can autovectorize. The workspace release profile helps that shape along with `lto = "fat"`,
+//! `codegen-units = 1` and `opt-level = 3` -- and **only** those. `-C target-cpu` is *not* set
+//! anywhere in this repository: there is no `.cargo/config.toml`, and neither `Cargo.toml` nor
+//! `rust-toolchain.toml` sets it, so builds target the default baseline for the triple unless the
+//! person building passes it themselves. Do not write code here that depends on a raised baseline.
+//! Table loads also remain scalar because portable Rust has no gather operation; the gain comes
+//! from independent accumulators and from shortening the serial final combine and byte tail.
 //!
-//! No run-time target-feature probe is needed. Every operation below is ordinary portable
-//! integer arithmetic, so the code remains valid when a machine has no vector unit at all.
-//! A `simd`-enabled binary therefore meets the runtime-compatibility requirement
-//! structurally: there is no target-specific instruction that can be absent.
+//! No run-time target-feature probe is performed here -- **none at all**, in contrast to
+//! `adler32/simd.rs`, which exposes an `is_supported()` its parent consults purely as a
+//! throughput hint. Every operation below is ordinary portable integer arithmetic, so the code
+//! remains valid when a machine has no vector unit whatsoever. A `simd`-enabled binary therefore
+//! meets the runtime-compatibility requirement structurally rather than by probing: there is no
+//! target-specific instruction that can be absent.
 //!
 //! # Output neutrality
 //!
@@ -26,17 +31,44 @@
 //! This backend may change throughput and must never change a checksum or any emitted byte.
 //! That is why checksum parallelism is allowed even though parallel match finding is not.
 //!
-//! `ZLIB_RS_SIMD=0/1` is the build-time switch consumed by
-//! `crates/libz-rs-sys/build.rs`; that script asks Cargo to rerun when the value changes and
-//! maps the setting to this crate feature. The S390X path in `contrib/crc32vx/` and the
-//! `ARMCRC32` assembly path at `crc32.c` L498-L599 are outside this port's scope. Omitting
-//! either can cost throughput only, never correctness.
+//! # How this backend is actually selected
 //!
-//! Benchmarks compare this function directly with `braid.rs`. If it ever ceases to win, the
-//! honest resolution is to simplify or remove this optimization, never to weaken bit-for-bit
-//! equality.
+//! **The Cargo feature `simd` on `crates/zlib-rs` is the only thing that compiles this module
+//! in** -- that is what the `#![cfg(feature = "simd")]` below says, and there is no other path.
+//!
+//! `ZLIB_RS_SIMD=0/1` is a related but *separate* mechanism, and it does not switch this feature
+//! on. It is read by `crates/libz-rs-sys/build.rs`, which asks Cargo to rerun when the value
+//! changes and then publishes the request as `cfg(zlib_rs_simd)` for the facade crate --
+//! because **a build script cannot enable a Cargo feature at all**, in this crate or any other.
+//! That `cfg` is not consulted anywhere under `crates/zlib-rs/src/`. So: to get this backend, pass
+//! `--features simd`; setting `ZLIB_RS_SIMD=1` on its own will not produce it.
+//!
+//! The S390X path in `contrib/crc32vx/` and the `ARMCRC32` assembly path at `crc32.c` L498-L599
+//! are outside this port's scope. Omitting either can cost throughput only, never correctness.
+//!
+//! # Throughput claims
+//!
+//! The design intent is that this backend beats `braid.rs` above its delegation threshold. That
+//! is intent, not a result: **no benchmark artifact is committed in this repository** -- the
+//! `benches/` directory does not exist -- so nothing here has been substantiated by a reproducible
+//! measurement. The planned `benches/checksum_bench.rs` is where the comparison belongs. If it
+//! turns out not to win, the honest resolution is to simplify or remove this optimization, never
+//! to weaken bit-for-bit equality.
 
-#![cfg(feature = "simd")]
+// There is deliberately no `#![cfg(feature = "simd")]` here.  `crc32/mod.rs` already declares this
+// module as `#[cfg(feature = "simd")] mod simd;`, so restating the condition inside the file
+// applies the same attribute twice -- `rustc`'s `duplicated_attributes` lint says so, and under
+// `-D warnings` on the 1.80 floor that is an error rather than a note.  One gate, at the module
+// declaration, is also where the sibling `adler32/simd.rs` keeps it.
+
+// Names that repeat their module's name are deliberate here: the C sources this module ports name
+// these entry points, and `crates/zlib-rs/src/lib.rs` re-exports several of them under exactly
+// these names, so renaming any of them to satisfy `clippy::module_name_repetitions` would cost the
+// traceability the port is judged on. The lint sits in `pedantic`, which this workspace denies, and
+// it fires on the declared 1.80 floor; upstream has since reclassified it, so the allowance is what
+// keeps the same lint gate passing on both toolchains. The same relaxation, for the same reason,
+// already appears in `config.rs`, `deflate/**`, `inflate/**` and `gz/**`.
+#![allow(clippy::module_name_repetitions)]
 
 use core::mem::size_of;
 
@@ -62,7 +94,7 @@ const BRAID_MIN_LEN: usize = CHUNK + W - 1;
 ///
 /// The alignment prefix consumes at most `W - 1` bytes. Starting with
 /// `CHUNK + 2 * W - 1` therefore leaves one full braided chunk and at least one full
-/// `W`-byte tail word. Shorter inputs retain the already tuned [`crc32_braid`] path.
+/// `W`-byte tail word. Shorter inputs retain the already tuned `crc32_braid` path.
 const MIN_SIMD_LEN: usize = CHUNK + 2 * W - 1;
 
 /// Polynomial representation of one in zlib's reflected modular arithmetic.
@@ -113,7 +145,7 @@ const fn x2nmodp(mut n: u64, mut k: u32) -> u32 {
 
 /// Generate the little-endian braid table for a byte distance of `stride`.
 ///
-/// This is a const-evaluated port of `braid()` at `crc32.c` L461-L473. The shipped table
+/// This is a const-evaluated mirror of `braid()` at `crc32.c` L461-L473. The shipped table
 /// is generated with `stride = N * W`; this module additionally generates `stride = W`,
 /// which is exactly the `#if N == 1` table already published in `crc32.h`.
 ///
@@ -266,13 +298,13 @@ fn fold_tail_words(mut crc: u32, tail: &[u8]) -> Option<(u32, &[u8])> {
 /// This is an output-neutral reformulation of the braided body in `crc32_z`
 /// (`crc32.c` L637-L920):
 ///
-/// 1. Inputs shorter than [`MIN_SIMD_LEN`] use [`crc32_braid`].
+/// 1. Inputs shorter than [`MIN_SIMD_LEN`] use `crc32_braid`.
 /// 2. A byte prefix reaches the next `W`-byte address boundary through
-///    [`crc32_generic`].
+///    `crc32_generic`.
 /// 3. Whole `N * W` chunks update the same five braid residues as `braid.rs`.
 /// 4. A stride-`W` table parallelizes each final word transform and consumes further
 ///    complete tail words.
-/// 5. Fewer than `W` remaining bytes return to [`crc32_generic`].
+/// 5. Fewer than `W` remaining bytes return to `crc32_generic`.
 ///
 /// The function uses one little-endian kernel on every target. `Word::from_le_bytes`
 /// performs the needed byte reversal on a big-endian machine, avoiding a hot-loop endian
@@ -316,7 +348,7 @@ pub fn crc32_simd(crc: u32, buf: &[u8]) -> u32 {
 
 /// The optional portable high-throughput CRC-32 backend.
 ///
-/// A zero-sized marker around [`crc32_simd`], used by the parent module's backend
+/// A zero-sized marker around `crc32_simd`, used by the parent module's backend
 /// selection and by checksum benchmarks. It takes and returns the same pre-conditioned
 /// state as the generic and braided backends.
 ///
@@ -329,7 +361,7 @@ impl Crc32Backend for Simd {
     /// Identifies this backend in diagnostics and benchmark labels.
     const NAME: &'static str = "simd";
 
-    /// Forward to [`crc32_simd`] without changing the state or buffer.
+    /// Forward to `crc32_simd` without changing the state or buffer.
     #[inline]
     fn update(crc: u32, buf: &[u8]) -> u32 {
         crc32_simd(crc, buf)

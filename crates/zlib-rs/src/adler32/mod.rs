@@ -2,7 +2,7 @@
 //! the dispatch between backends.
 //!
 //! This module is the public face of the Adler-32 implementation and, together with the
-//! three sibling modules it declares, the port of `adler32.c` -- 164 lines that remain in
+//! three sibling modules it declares, the mirror of `adler32.c` -- 164 lines that remain in
 //! the tree unmodified, serving as the differential oracle every value produced here is
 //! measured against. Not one sum is computed in this file: it owns the two constants the
 //! algorithm is defined by, the named initial value RFC 1950 mandates, the contract a
@@ -52,7 +52,7 @@
 //!
 //! # Module map
 //!
-//! | Module | Ported from | Role |
+//! | Module | Mirrors | Role |
 //! |---|---|---|
 //! | `generic` | `adler32.c` L61-L125 | The scalar reference: [`Adler32Generic`] |
 //! | `combine` | `adler32.c` L133-L164 | Concatenation: [`adler32_combine`] |
@@ -73,7 +73,7 @@
 //!
 //! Keeping both names is nonetheless deliberate. `libz-rs-sys` has to export both C
 //! symbols, and giving each one a same-named Rust function to call preserves the
-//! one-to-one correspondence with the C sources that the rest of this port is organised
+//! one-to-one correspondence with the C sources that the rest of this implementation is organised
 //! around. Note that the widths themselves are *not* modelled here: `uLong` is 64 bits on
 //! LP64 targets and 32 bits on LLP64 Windows, so substituting a fixed-width integer for it
 //! would silently corrupt values on one platform or the other. Reconciling the caller's
@@ -86,13 +86,21 @@
 //! *identical* value for every input and every starting value, so the choice can never be
 //! observed in the output -- only in the time taken.
 //!
+//! The run-time stage is specific to *this* checksum. [`mod@crate::crc32`] has no probe at all,
+//! because its wide backend is portable integer arithmetic with no architecture intrinsic
+//! to guard, whereas the arrangement here is worth taking only where a vector unit exists.
+//! Neither module is gated on an intrinsic, so a `simd` build is correct on every target.
+//! And the build-time stage has exactly one input, the `simd` feature: `ZLIB_RS_SIMD` in the
+//! facade's build script cannot enable a Cargo feature, so it reconciles a caller's request
+//! against the resolved feature set and fails the build on a contradiction.
+//!
 //! That this is permissible is specific to the checksum computation. For a fixed byte
 //! sequence, a vector backend can evaluate algebraically equivalent groups of the same
 //! recurrence while preserving every byte's positional weight, and modular integer
 //! arithmetic then produces the same scalar. It does **not** reorder the input bytes:
 //! Adler-32 remains order-sensitive. The same reasoning emphatically does not extend to the
 //! compressor, where the order in which match candidates are examined decides which match
-//! is emitted, so vectorised match finding is prohibited in this port while vectorised
+//! is emitted, so vectorised match finding is prohibited in this implementation while vectorised
 //! checksums are welcome. The two cases look alike and must not be conflated.
 //!
 //! Output neutrality is verified rather than assumed: the equivalence sweep in `simd`
@@ -135,7 +143,7 @@
 //! implementations. `adler32_z` tests `len == 1` at `adler32.c` L70, *before* it tests
 //! `buf == Z_NULL` at `adler32.c` L81 -- the comment at L80 calls the ordering a "deferred
 //! check for len == 1 speed". A call of `adler32(a, NULL, 1)` therefore dereferences a null
-//! pointer rather than returning 1. Rust cannot express that call at all, so the port
+//! pointer rather than returning 1. Rust cannot express that call at all, so the implementation
 //! removes the hazard without changing a single defined behaviour.
 //!
 //! # Layering and safety posture
@@ -154,7 +162,9 @@
 //!
 //! # Examples
 //!
-//! ```ignore
+//! ```
+//! use zlib_rs::adler32::{adler32, adler32_combine, ADLER32_INITIAL_VALUE};
+//!
 //! // Start from the value RFC 1950 mandates -- never from `adler32(0, &[])`.
 //! let mut adler = ADLER32_INITIAL_VALUE;
 //!
@@ -171,6 +181,30 @@
 //! let tail = adler32(ADLER32_INITIAL_VALUE, b"hello!");
 //! assert_eq!(adler32_combine(head, tail, 6), 0x2170_0496);
 //! ```
+//!
+//! # Provenance
+//!
+//! Adler-32: the checksum RFC 1950 puts in the zlib trailer.
+//!
+//! Ported from `adler32.c`, including the `NMAX` chunking schedule and `adler32_combine_`.
+//!
+//! [`ADLER32_INITIAL_VALUE`]: crate::adler32::ADLER32_INITIAL_VALUE
+//! [`Adler32Generic`]: crate::adler32::Adler32Generic
+//! [`BASE`]: crate::adler32::BASE
+
+// The definitions closing the module documentation above are link-reference definitions, not
+// prose: a module whose `mod` declaration carries an outer doc comment has its `//!` block
+// resolved in the scope of the DECLARING module, so an unqualified sibling name does not
+// resolve. See "Documentation lints" in `src/lib.rs` for the rule and the gate.
+
+// Names that repeat their module's name are deliberate here: the C sources this module ports name
+// these entry points, and `crates/zlib-rs/src/lib.rs` re-exports several of them under exactly
+// these names, so renaming any of them to satisfy `clippy::module_name_repetitions` would cost the
+// traceability the port is judged on. The lint sits in `pedantic`, which this workspace denies, and
+// it fires on the declared 1.80 floor; upstream has since reclassified it, so the allowance is what
+// keeps the same lint gate passing on both toolchains. The same relaxation, for the same reason,
+// already appears in `config.rs`, `deflate/**`, `inflate/**` and `gz/**`.
+#![allow(clippy::module_name_repetitions)]
 
 mod combine;
 mod generic;
@@ -195,14 +229,10 @@ pub use self::generic::Adler32Generic;
 #[cfg(feature = "simd")]
 pub use self::simd::Adler32Simd;
 
-// -----------------------------------------------------------------------------
-//  Constants
-// -----------------------------------------------------------------------------
-
 /// The modulus both component sums are taken over: 65521, the largest prime smaller than
 /// 65536.
 ///
-/// Port of `BASE` (`adler32.c` L10), and the value RFC 1950 fixes for the algorithm
+/// Mirrors `BASE` (`adler32.c` L10), and the value RFC 1950 fixes for the algorithm
 /// (`doc/rfc1950.txt` L326-L327). Being the largest prime below 65536 is what lets each
 /// residue occupy 16 bits, so that the two of them pack losslessly into one `u32`, while
 /// primality is what spreads the sums well.
@@ -214,7 +244,7 @@ pub const BASE: u32 = 65_521;
 
 /// The largest number of bytes that may be accumulated before the sums must be reduced.
 ///
-/// Port of `NMAX` (`adler32.c` L11), whose defining property the comment at
+/// Mirrors `NMAX` (`adler32.c` L11), whose defining property the comment at
 /// `adler32.c` L12 states: `NMAX` is the largest `n` such that
 /// `255n(n+1)/2 + (n+1)(BASE-1) <= 2^32-1`. In other words it is the point at which
 /// 32-bit accumulation stops being provably safe -- feeding a longer run of bytes into
@@ -279,10 +309,6 @@ const _: () = assert!(
     "RFC 1950 initializes s1 to 1 and s2 to zero"
 );
 
-// -----------------------------------------------------------------------------
-//  The backend contract
-// -----------------------------------------------------------------------------
-
 /// A swappable Adler-32 computation backend.
 ///
 /// The trait exists so that the scalar engine and the optional vectorised one are
@@ -323,13 +349,9 @@ pub trait Adler32Backend {
     fn checksum(adler: u32, buf: &[u8]) -> u32;
 }
 
-// -----------------------------------------------------------------------------
-//  Entry points
-// -----------------------------------------------------------------------------
-
 /// Update a running Adler-32 checksum with `buf` and return the updated checksum.
 ///
-/// Port of `adler32_z` (`adler32.c` L61-L125), and the primary entry point: everything
+/// Mirrors `adler32_z` (`adler32.c` L61-L125), and the primary entry point: everything
 /// else in this module either delegates to it or is consumed by it. The reference sources
 /// declare it with a `z_size_t` length (`zlib.h` L1829-L1830); a Rust slice carries its own
 /// length, so the declaration collapses to a slice here and [`adler32`] becomes an exact
@@ -361,9 +383,12 @@ pub trait Adler32Backend {
 ///   for no benefit, since the query is cheap and the standard library's own detection
 ///   macro already caches internally.
 ///
-/// The environment is never consulted. The facade crate translates its build-time toggle
-/// into this crate's `simd` feature; a library that inspected the environment on a hot path
-/// would be both slower and less predictable than one that did not.
+/// The environment is never consulted, at run time or at build time. The `simd` feature is
+/// the only thing that selects a backend: `ZLIB_RS_SIMD` in the facade's build script cannot
+/// enable it -- cargo resolves features before it runs a build script -- so that variable
+/// checks that the feature agrees with the caller's request and fails the build if it does
+/// not. A library that inspected the environment on a hot path would be both slower and less
+/// predictable than one that did not.
 #[inline]
 #[must_use]
 pub fn adler32_z(adler: u32, buf: &[u8]) -> u32 {
@@ -384,14 +409,14 @@ pub fn adler32_z(adler: u32, buf: &[u8]) -> u32 {
 
 /// Update a running Adler-32 checksum with `buf` and return the updated checksum.
 ///
-/// Port of `adler32` (`adler32.c` L128-L130), which is itself a one-line forwarder to
+/// Mirrors `adler32` (`adler32.c` L128-L130), which is itself a one-line forwarder to
 /// `adler32_z`. The two C declarations differ only in the width of the length argument --
 /// `uInt` here (`zlib.h` L1809), `z_size_t` there (`zlib.h` L1829) -- a distinction a Rust
 /// slice erases, so this function is an exact synonym for [`adler32_z`] and forwards to it
 /// unchanged.
 ///
 /// Both names are kept because `libz-rs-sys` must export both C symbols, and because this
-/// is the name the rest of the port uses: it is what `read_buf.rs` calls when a stream is
+/// is the name the rest of the implementation uses: it is what `read_buf.rs` calls when a stream is
 /// wrapped in the zlib container, mirroring `deflate.c` L229. See [`adler32_z`] for the
 /// semantics, the empty-slice contract and the backend dispatch, all of which apply here
 /// unchanged.
@@ -410,7 +435,7 @@ mod tests {
     use alloc::vec::Vec;
 
     #[cfg(feature = "simd")]
-    use super::Adler32Simd;
+    use super::{simd, Adler32Simd};
 
     /// Length of the deterministic corpus every long-input expectation is taken over.
     ///
@@ -499,7 +524,7 @@ mod tests {
     /// Every value here was read off `adler32.c` compiled with gcc, so these pin the
     /// *dispatcher* to the oracle rather than merely to the scalar backend beside it. The
     /// two unreduced starting values are included on purpose: they are where an
-    /// almost-right port diverges.
+    /// almost-right implementation diverges.
     const ORACLE_VECTORS: [(u32, usize, u32); 8] = [
         (0xffff_ffff, 0, 0x000e_000e),
         (0xffff_ffff, 1, 0x0023_0015),
@@ -826,6 +851,46 @@ mod tests {
                 assert_eq!(
                     dispatched, scalar,
                     "dispatch diverged at start {start:#010x}, len {len}"
+                );
+            }
+        }
+    }
+
+    /// The dispatcher routes to the backend the build actually compiled.
+    ///
+    /// The Adler-32 counterpart of `crc32`'s `backend_selection_follows_the_simd_feature`,
+    /// and the in-crate half of the `ZLIB_RS_SIMD` contract: `crates/libz-rs-sys/build.rs`
+    /// reconciles a caller's request against the resolved `simd` feature, refuses a build in
+    /// which the two disagree, and records the outcome as
+    /// `ZLIB_RS_CHECKSUM_BACKEND=simd|scalar`. That record is only worth anything if the
+    /// dispatcher then routes to the recorded backend, which is what this asserts -- through
+    /// both stages of the choice, the feature and, where the feature is on, the run-time
+    /// probe.
+    ///
+    /// It cannot fail while `both_backends_and_the_dispatcher_agree` passes, and that is the
+    /// point: the two backends are interchangeable, so nothing but an assertion on the route
+    /// itself can tell which one ran.
+    #[test]
+    fn backend_selection_follows_the_simd_feature() {
+        let corpus = pattern_corpus(CORPUS_LEN);
+
+        for start in START_VALUES {
+            for len in BOUNDARY_LENS {
+                let buf = prefix(&corpus, len);
+
+                #[cfg(feature = "simd")]
+                let expected = if simd::is_supported() {
+                    Adler32Simd::checksum(start, buf)
+                } else {
+                    Adler32Generic::checksum(start, buf)
+                };
+                #[cfg(not(feature = "simd"))]
+                let expected = Adler32Generic::checksum(start, buf);
+
+                assert_eq!(
+                    adler32(start, buf),
+                    expected,
+                    "dispatch took the wrong backend at start {start:#010x}, len {len}"
                 );
             }
         }

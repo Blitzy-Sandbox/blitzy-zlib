@@ -1,0 +1,205 @@
+# -----------------------------------------------------------------------------
+#  cargo-deny policy for the FUZZ dependency graph
+# -----------------------------------------------------------------------------
+#  Why this file exists as a second configuration rather than a section of the
+#  repository-root deny.toml:
+#
+#  fuzz/Cargo.toml carries its own (empty) `[workspace]` table and is also listed
+#  under `exclude` in the root Cargo.toml, so it is a workspace root in its own
+#  right.  Nothing it pulls in reaches the root audit, and cargo-deny audits one
+#  graph per invocation.  The root configuration therefore cannot cover this
+#  graph, and extending it to try would be wrong in the other direction too: the
+#  allowances this graph needs (see NCSA below) must NOT be granted to the
+#  shipped library, whose dependency set is deliberately empty.
+#
+#  Two graphs, two configurations, two invocations:
+#
+#      cargo deny --locked check                              # shipped crates
+#      cargo deny --locked --manifest-path fuzz/Cargo.toml \
+#                 --config fuzz/deny.toml check                # this graph
+#
+#  `--locked` on both is not decorative.  cargo-deny resolves the graph through
+#  cargo, so without it a stale or absent lockfile is silently re-resolved and
+#  the run audits versions that are not the ones anybody builds.  fuzz/Cargo.lock
+#  is committed for exactly this reason.
+#
+#  Written against cargo-deny 0.20.2, the version the toolchain installs, and
+#  only that schema's keys appear here.  0.20.2 removed the older spellings
+#  outright -- [licenses] unlicensed, copyleft, deny and allow-osi-fsf-free, and
+#  [advisories] vulnerability, unsound and severity-threshold are hard errors now
+#  -- and "deny anything not explicitly allowed" is built-in rather than
+#  configured.  The legacy `version = 2` shims are omitted for the same reason.
+#
+#  This graph is fuzzing tooling.  It is never linked into libz.so or libz.a, and
+#  that is the whole reason the allow list below may differ from the root's.  It
+#  is emphatically NOT a reason to audit it less carefully: these crates run with
+#  a sanitizer attached over attacker-shaped input, on developer and CI machines,
+#  and a compromised or abandoned dependency here is a supply-chain problem
+#  whatever it does or does not ship.  So every check the root turns up is turned
+#  up here too, and the only relaxation anywhere in this file is the pair of
+#  licence identifiers the libFuzzer and Unicode tooling genuinely require.
+# -----------------------------------------------------------------------------
+
+[graph]
+# No `targets` filter, matching the root configuration and for the same reason:
+# narrowing to one triple would hide crates that only build elsewhere.  This
+# graph has three such crates already -- find-msvc-tools reaches it through cc,
+# and r-efi and libc through getrandom -- and a problem in any of them is still a
+# problem for whoever fuzzes on that platform.
+#
+# Optional features on, so feature-gated edges are audited.  It matters more here
+# than in the root: fuzz/Cargo.toml deliberately keeps libz-rs-sys's default
+# features (`libz-compat`, `gz`) and enables arbitrary's `derive`, and the
+# non-default `simd` passthrough must not become somewhere an unaudited crate can
+# hide.
+all-features = true
+
+[advisories]
+# Identical to the root policy.  Vulnerability, unsoundness and notice advisories
+# are errors in 0.20.2 with no per-category switch left; the two keys below are
+# the ones whose defaults are weaker than this project wants.
+#
+# Widen unmaintained from the workspace's own dependencies to the whole graph.
+# This graph is mostly transitive tooling, so the narrow default would check
+# almost none of it.
+unmaintained = "all"
+# A yanked crate is a warning by default.  With a committed lockfile whose entire
+# purpose is reproducibility, it is an error.
+yanked = "deny"
+# Empty, and it stays empty.  A fuzzing dependency that earns an advisory should
+# be fixed or dropped, not parked here.  If one ever must be parked, it belongs
+# in this file rather than the root's -- keeping the shipped library's ignore list
+# empty is worth more than the convenience of one shared list.
+ignore = []
+
+[licenses]
+# Same threshold as the root.  Every crate in this graph declares an SPDX
+# expression in its metadata, so nothing here depends on cargo-deny inferring a
+# licence from file text, and a low-confidence textual match would be worth
+# investigating rather than accepting.
+confidence-threshold = 0.93
+# Audit development and build dependencies too.  cargo-deny skips
+# dev-dependencies by default.  Build dependencies are the load-bearing half in
+# this graph: cc, jobserver, shlex and find-msvc-tools all arrive as build
+# dependencies of zlib-rs-differential's oracle compilation, and skipping them
+# would leave most of the third-party surface unexamined.
+include-dev = true
+include-build = true
+# Exactly the identifiers this graph resolves to, and nothing more.  cargo-deny
+# reports an allowance that never matches as a warning, so speculative entries
+# are not free: every line below was added only after `cargo deny list` showed a
+# crate that genuinely needs it.
+#
+# Verified against the committed lockfile with
+# `cargo deny --manifest-path fuzz/Cargo.toml list`.
+allow = [
+    # The project's own licence, carried by LICENSE and by the three path
+    # crates in this graph -- zlib-rs, libz-rs-sys and zlib-rs-fuzz itself.
+    "Zlib",
+    # Covers the dual-licensed bulk of the graph.
+    "MIT",
+    # Required alongside MIT rather than instead of it: several crates offer
+    # "MIT OR Apache-2.0", and allowing only one of a pair that is always
+    # offered together would leave the other reported as an unused allowance.
+    "Apache-2.0",
+    # REQUIRED OUTRIGHT, and the reason this graph cannot be audited under the
+    # root configuration.  libfuzzer-sys 0.4.13 is
+    # "(MIT OR Apache-2.0) AND NCSA" -- it vendors a copy of LLVM's libFuzzer,
+    # which is NCSA-licensed.  Because that is an AND, the NCSA half cannot be
+    # satisfied by MIT or Apache-2.0; it has to be allowed on its own.  NCSA is
+    # deliberately absent from the root deny.toml: it appears nowhere in the
+    # shipped graph, and an allowance that never matches is itself a warning.
+    "NCSA",
+    # REQUIRED OUTRIGHT, for the same structural reason and easy to overlook:
+    # unicode-ident 1.0.24 is "(MIT OR Apache-2.0) AND Unicode-3.0", so the
+    # Unicode terms must be allowed alongside MIT.  It reaches this graph
+    # through syn <- derive_arbitrary <- arbitrary's `derive` feature.  The root
+    # configuration allows this identifier too, for the same crate.
+    "Unicode-3.0",
+]
+# NOT ALLOWED, recorded explicitly because the omission is the mechanism and a
+# future reader should not have to guess whether it was considered:
+#
+#   * LGPL-2.1-or-later.  `cargo deny list` reports it, which looks alarming
+#     until the expression is read: r-efi 6.0.0 is
+#     "MIT OR Apache-2.0 OR LGPL-2.1-or-later", a three-way OR, so MIT already
+#     satisfies it and the copyleft branch is never taken.  Adding it would
+#     weaken the policy to no purpose.
+#   * Any other GPL, LGPL, AGPL or MPL identifier.  As in the root file,
+#     copyleft is excluded the only way this schema permits -- by not appearing
+#     in the allow list, which turns any crate carrying one into a hard error.
+#     There is deliberately no such entry anywhere in this file.
+
+[bans]
+# A duplicate version here means a genuine resolution conflict, and today there
+# is none: all 18 locked dependencies resolve to exactly one version each
+# (verified against fuzz/Cargo.lock).  Keeping this at "deny" means a future
+# dependency bump that splits the graph has to be looked at rather than absorbed.
+#
+# `multiple-versions-include-dev` is left at its default of false, matching the
+# root file.
+multiple-versions = "deny"
+# Every registry version in fuzz/Cargo.toml is an exact `=` pin, so a `*`
+# requirement would be a mistake rather than a shortcut.
+wildcards = "deny"
+# The exemption this graph genuinely needs.  fuzz/Cargo.toml depends on zlib-rs,
+# libz-rs-sys and zlib-rs-differential by path with no version requirement, and a
+# path dependency with no version registers as a wildcard.  This key exempts path
+# dependencies of unpublished crates only -- never a registry dependency, which
+# is where the check earns its keep.
+allow-wildcard-paths = true
+# The same prohibitions the root file carries, and they matter MORE here rather
+# than less.  A fuzz target exists to exercise this port; a second DEFLATE
+# implementation or a C zlib in the graph could silently answer for it, and the
+# target would report coverage of code it never ran.  None of these is present
+# today (verified against the lockfile), so the list is preventive.
+#
+# Not banned, deliberately: `cc` compiles the in-tree C sources into
+# zlib-rs-differential's test-only oracle, which is exactly how fuzz_checksum
+# obtains a reference to differ against; `libc` arrives through getrandom and as
+# libz-rs-sys's optional feature.
+deny = [
+    # Bindings to a native compression library.  The C zlib in this tree is a
+    # differential oracle reached through zlib-rs-differential, which renames
+    # its symbols at compile time; linking any of these would put an
+    # unrenamed C implementation into the same binary as the port's
+    # `#[no_mangle]` exports.
+    { crate = "libz-sys", use-instead = "libz-rs-sys", reason = "links the C zlib; the in-tree C sources are a test oracle reached through zlib-rs-differential" },
+    { crate = "libz-ng-sys", use-instead = "libz-rs-sys", reason = "links zlib-ng, whose encoder does not emit byte-identical output" },
+    { crate = "cloudflare-zlib-sys", use-instead = "libz-rs-sys", reason = "links a forked C zlib" },
+    { crate = "libdeflate-sys", use-instead = "libz-rs-sys", reason = "links libdeflate, a separate C compressor" },
+    { crate = "libdeflater", use-instead = "libz-rs-sys", reason = "wraps libdeflate, a separate C compressor" },
+
+    # Third-party DEFLATE implementations.  A fuzz target that accidentally
+    # exercised one of these would be worse than no target at all.
+    { crate = "flate2", use-instead = "libz-rs-sys", reason = "third-party DEFLATE front end; the fuzz targets must drive the port itself" },
+    { crate = "miniz_oxide", use-instead = "zlib-rs", reason = "third-party Rust DEFLATE implementation" },
+    { crate = "deflate", use-instead = "zlib-rs", reason = "third-party Rust DEFLATE encoder" },
+    { crate = "inflate", use-instead = "zlib-rs", reason = "third-party Rust DEFLATE decoder" },
+    { crate = "zopfli", use-instead = "zlib-rs", reason = "alternative DEFLATE encoder; its output is not byte-identical to zlib's" },
+
+    # Other compression formats.  The port's capability surface is frozen at
+    # zlib, gzip and raw DEFLATE, so a new codec is a scope change rather than a
+    # dependency bump -- including in a fuzz target.
+    { crate = "zstd", reason = "no new compression formats" },
+    { crate = "zstd-sys", reason = "no new compression formats" },
+    { crate = "brotli", reason = "no new compression formats" },
+    { crate = "brotli-decompressor", reason = "no new compression formats" },
+    { crate = "bzip2", reason = "no new compression formats" },
+    { crate = "bzip2-sys", reason = "no new compression formats" },
+    { crate = "lzma-sys", reason = "no new compression formats" },
+    { crate = "xz2", reason = "no new compression formats" },
+    { crate = "snap", reason = "no new compression formats" },
+]
+
+[sources]
+# crates.io, and nothing else -- identical to the root policy.
+unknown-registry = "deny"
+# No git dependencies.  cargo-fuzz's own template is happy to point at a git
+# revision of libfuzzer-sys; this graph does not, because a git dependency has no
+# stable version to pin and would defeat the reproducibility fuzz/Cargo.lock
+# exists to provide.
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Empty on purpose -- see unknown-git above.
+allow-git = []

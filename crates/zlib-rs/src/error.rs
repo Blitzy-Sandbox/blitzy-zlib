@@ -1,10 +1,32 @@
 //! Return codes and the human-readable status messages that accompany them.
 //!
 //! This is the foundational module of the crate: every fallible operation in
-//! `zlib-rs` reports its outcome as a [`ReturnCode`], and every message a C
-//! caller can observe -- whether through the `msg` field of `z_stream` or through
-//! the exported `zError` entry point -- originates from the ten-element table
-//! defined here.
+//! `zlib-rs` reports its outcome as a [`ReturnCode`].
+//!
+//! The ten-element table defined here is the provenance of the **generic,
+//! per-code** messages -- the ones `zError` returns, one short phrase for each
+//! status value. It is deliberately **not** the provenance of every message a C
+//! caller can observe, and assuming otherwise would misread both this module and
+//! the reference implementation. Measured against the C sources:
+//!
+//! * `zError` (`zutil.c` L139-L141) is nothing but `ERR_MSG`, so it is served
+//!   entirely from this table.
+//! * `deflate.c` sets `strm->msg` from the table exactly once, at L511
+//!   (`ERR_MSG(Z_MEM_ERROR)`); otherwise it only clears it to `Z_NULL`.
+//! * The **inflate state machine constructs its own, far more specific
+//!   messages**: `inflate.c` performs 21 literal `strm->msg` assignments drawing
+//!   on 18 distinct strings -- "incorrect header check", "invalid stored block
+//!   lengths", "invalid distance too far back", "incorrect data check" and the
+//!   rest. None of them appears in `z_errmsg`, and a caller reading `strm->msg`
+//!   after a failed `inflate()` normally sees one of those, not "data error".
+//! * The **gzip layer constructs its own too**: `gz_error` (`gzlib.c`
+//!   L555-L588) allocates and formats `"<path>: <reason>"`, which is what
+//!   `gzerror` reports. That string is per-stream heap data, not a table entry.
+//!
+//! So: this table backs `zError` and the single `deflate.c` memory-error path.
+//! The specific diagnostics live with the code that detects the condition, which
+//! is where the reference implementation puts them and where this port keeps
+//! them.
 //!
 //! # Correspondence with the reference implementation
 //!
@@ -28,14 +50,21 @@
 //! escape hatches costs this module nothing. Turning these `&'static str`
 //! messages into NUL-terminated C strings, and exporting the `zError` symbol
 //! itself, are the business of the `libz-rs-sys` facade crate, which is the only
-//! crate in the workspace permitted to hold a raw pointer.
+//! crate in the workspace permitted to **use** `unsafe` -- and therefore the only
+//! one that can dereference a pointer or perform an FFI call. That is a narrower
+//! and more accurate statement than "the only crate that holds a raw pointer":
+//! this crate does hold two raw pointer values, `allocate::Opaque` and
+//! `gz::state::GzFileExposed::next`, neither of which it can ever read through.
+//! Neither appears in this module.
 //!
 //! The version script `zlib.map` lists `z_errmsg` in its `local:` block, so the
 //! raw table is deliberately crate-private and only the accessors are public.
 //!
 //! # Examples
 //!
-//! ```ignore
+//! ```
+//! use zlib_rs::{err_msg, ReturnCode};
+//!
 //! // Status codes convert losslessly to and from the C `int` representation.
 //! let code = ReturnCode::BUF_ERROR;
 //! assert_eq!(code.as_i32(), -5);
@@ -47,11 +76,15 @@
 //! // ... but `err_msg` still answers for any `int`, exactly as `zError` does.
 //! assert_eq!(err_msg(42), "");
 //! ```
+//!
+//! # Provenance
+//!
+//! Return codes and the messages that accompany them.
+//!
+//! Ported from the `Z_*` constants (`zlib.h` L181-L189) and the `z_errmsg[10]` table
+//! (`zutil.c` L13-L24). The raw table stays crate-private because `zlib.map` hides `z_errmsg`;
+//! only the accessors are public.
 
-// -----------------------------------------------------------------------------
-//  Raw `int` values of the documented return codes
-// -----------------------------------------------------------------------------
-//
 // These private constants are the single source of truth for the numeric values.
 // They are named exactly as `zlib.h` spells them so that a reviewer diffing this
 // module against the header can match them line for line, and they are reused
@@ -61,64 +94,60 @@
 
 /// `Z_OK` (0) -- the operation completed successfully.
 ///
-/// Ported from `zlib.h` L181.
+/// Mirrors `zlib.h` L181.
 const Z_OK: i32 = 0;
 
 /// `Z_STREAM_END` (1) -- the end of the compressed stream was reached.
 ///
-/// Ported from `zlib.h` L182.
+/// Mirrors `zlib.h` L182.
 const Z_STREAM_END: i32 = 1;
 
 /// `Z_NEED_DICT` (2) -- a preset dictionary is required before decompression can
 /// continue.
 ///
-/// Ported from `zlib.h` L183.
+/// Mirrors `zlib.h` L183.
 const Z_NEED_DICT: i32 = 2;
 
 /// `Z_ERRNO` (-1) -- an underlying file operation failed and the platform's
 /// `errno` holds the detail.
 ///
-/// Ported from `zlib.h` L184.
+/// Mirrors `zlib.h` L184.
 const Z_ERRNO: i32 = -1;
 
 /// `Z_STREAM_ERROR` (-2) -- the stream state is inconsistent, or a parameter was
 /// invalid.
 ///
-/// Ported from `zlib.h` L185.
+/// Mirrors `zlib.h` L185.
 const Z_STREAM_ERROR: i32 = -2;
 
 /// `Z_DATA_ERROR` (-3) -- the input data is corrupt, or is not in the format the
 /// stream was configured to read.
 ///
-/// Ported from `zlib.h` L186.
+/// Mirrors `zlib.h` L186.
 const Z_DATA_ERROR: i32 = -3;
 
 /// `Z_MEM_ERROR` (-4) -- an allocation failed.
 ///
-/// Ported from `zlib.h` L187.
+/// Mirrors `zlib.h` L187.
 const Z_MEM_ERROR: i32 = -4;
 
 /// `Z_BUF_ERROR` (-5) -- no progress was possible; more input, or more output
 /// room, is required.
 ///
-/// Ported from `zlib.h` L188.
+/// Mirrors `zlib.h` L188.
 const Z_BUF_ERROR: i32 = -5;
 
 /// `Z_VERSION_ERROR` (-6) -- the caller was compiled against an incompatible
 /// version of the library.
 ///
-/// Ported from `zlib.h` L189.
+/// Mirrors `zlib.h` L189.
 const Z_VERSION_ERROR: i32 = -6;
 
 /// Index of the trailing sentinel slot of `Z_ERRMSG`, which every code outside
 /// `Z_VERSION_ERROR ..= Z_NEED_DICT` maps to.
 ///
-/// Ported from the literal `9` in the `ERR_MSG` macro, `zutil.h` L65.
+/// Mirrors the literal `9` in the `ERR_MSG` macro, `zutil.h` L65.
 const OUT_OF_RANGE_INDEX: usize = 9;
-
-// -----------------------------------------------------------------------------
-//  The message table
-// -----------------------------------------------------------------------------
 
 /// The status-message table, indexed by `2 - code`.
 ///
@@ -140,7 +169,7 @@ const OUT_OF_RANGE_INDEX: usize = 9;
 /// exported; keeping the Rust item `pub(crate)` and unexported satisfies that by
 /// construction, and callers outside the crate use [`err_msg`] instead.
 ///
-/// Ported from `zutil.c` L13-L24 (`z_errmsg`).
+/// Mirrors `zutil.c` L13-L24 (`z_errmsg`).
 pub(crate) const Z_ERRMSG: [&str; 10] = [
     "need dictionary",      // Z_NEED_DICT       2
     "stream end",           // Z_STREAM_END      1
@@ -153,10 +182,6 @@ pub(crate) const Z_ERRMSG: [&str; 10] = [
     "incompatible version", // Z_VERSION_ERROR (-6)
     "",                     // out-of-range sentinel
 ];
-
-// -----------------------------------------------------------------------------
-//  The status type
-// -----------------------------------------------------------------------------
 
 /// A zlib status code: the value every entry point of the engine returns.
 ///
@@ -185,7 +210,7 @@ pub(crate) const Z_ERRMSG: [&str; 10] = [
 /// | [`BUF_ERROR`](ReturnCode::BUF_ERROR) | -5 | `"buffer error"` |
 /// | [`VERSION_ERROR`](ReturnCode::VERSION_ERROR) | -6 | `"incompatible version"` |
 ///
-/// Ported from `zlib.h` L181-L192 (the `Z_OK` .. `Z_VERSION_ERROR` return-code
+/// Mirrors `zlib.h` L181-L192 (the `Z_OK` .. `Z_VERSION_ERROR` return-code
 /// block and its explanatory comment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ReturnCode(i32);
@@ -193,20 +218,20 @@ pub struct ReturnCode(i32);
 impl ReturnCode {
     /// No error: the operation did exactly what was asked of it.
     ///
-    /// Ported from `Z_OK`, `zlib.h` L181.
+    /// Mirrors `Z_OK`, `zlib.h` L181.
     pub const OK: Self = Self(Z_OK);
 
     /// The end of the compressed stream was reached. Not an error: a caller that
     /// has finished a stream sees this rather than [`OK`](Self::OK).
     ///
-    /// Ported from `Z_STREAM_END`, `zlib.h` L182.
+    /// Mirrors `Z_STREAM_END`, `zlib.h` L182.
     pub const STREAM_END: Self = Self(Z_STREAM_END);
 
     /// Decompression needs the preset dictionary that the stream was compressed
     /// with; supply it and resume. Not an error, which is why the value is
     /// positive.
     ///
-    /// Ported from `Z_NEED_DICT`, `zlib.h` L183.
+    /// Mirrors `Z_NEED_DICT`, `zlib.h` L183.
     pub const NEED_DICT: Self = Self(Z_NEED_DICT);
 
     /// An underlying file operation failed; the platform's `errno` holds the
@@ -217,41 +242,73 @@ impl ReturnCode {
     /// engines never return it, because they operate purely on caller-supplied
     /// buffers and have no file descriptor to fail on.
     ///
-    /// Ported from `Z_ERRNO`, `zlib.h` L184.
+    /// Mirrors `Z_ERRNO`, `zlib.h` L184.
     pub const ERRNO: Self = Self(Z_ERRNO);
 
     /// The stream state is inconsistent, or an argument was invalid -- for
     /// instance a null stream, a stream that was never initialised, or a
     /// parameter outside its documented range.
     ///
-    /// Ported from `Z_STREAM_ERROR`, `zlib.h` L185.
+    /// Mirrors `Z_STREAM_ERROR`, `zlib.h` L185.
     pub const STREAM_ERROR: Self = Self(Z_STREAM_ERROR);
 
     /// The input is corrupt, or is not in the format this stream was configured
     /// to read: a bad header check, an invalid code, a failed checksum.
     ///
-    /// Ported from `Z_DATA_ERROR`, `zlib.h` L186.
+    /// Mirrors `Z_DATA_ERROR`, `zlib.h` L186.
     pub const DATA_ERROR: Self = Self(Z_DATA_ERROR);
 
-    /// An allocation failed. Allocation always runs through the caller-supplied
-    /// allocator, so this reports the caller's own allocator declining a
-    /// request, not a failure of the Rust global allocator.
+    /// An allocation failed.
     ///
-    /// Ported from `Z_MEM_ERROR`, `zlib.h` L187.
+    /// Which allocator failed depends on how the stream was created, and there are
+    /// two paths, mirroring the reference implementation's own two:
+    ///
+    /// * **Caller hooks.** When a `z_stream` arrives with non-null `zalloc`/`zfree`,
+    ///   the facade injects an allocator that calls them, so this status reports the
+    ///   *caller's* allocator declining a request. `test/infcover.c` drives exactly
+    ///   this path with its tracking allocator and `mem_limit` (L176-L181).
+    /// * **The default path.** When `zalloc`/`zfree` are `Z_NULL`, C substitutes
+    ///   `zcalloc`/`zcfree`, which are `malloc`/`free` (`zutil.c` L301). The port's
+    ///   counterpart is [`crate::allocate::GlobalAllocator`], which allocates from
+    ///   **Rust's global allocator**; the one-shot `compress`/`uncompress` wrappers,
+    ///   which have no stream to take hooks from, always use it. In that
+    ///   configuration this status does report a Rust global-allocation failure.
+    ///
+    /// Either way the failure is *reported*, never fatal: [`crate::allocate::Buffer`]
+    /// goes through `try_reserve_exact` rather than an infallible constructor, which
+    /// is what keeps this status reachable at all.
+    ///
+    /// Mirrors `Z_MEM_ERROR`, `zlib.h` L187.
     pub const MEM_ERROR: Self = Self(Z_MEM_ERROR);
 
     /// No progress was possible on this call: the operation needs more input, or
     /// more room in the output buffer, before it can do anything. Recoverable --
     /// provide more of either and call again.
     ///
-    /// Ported from `Z_BUF_ERROR`, `zlib.h` L188.
+    /// Mirrors `Z_BUF_ERROR`, `zlib.h` L188.
     pub const BUF_ERROR: Self = Self(Z_BUF_ERROR);
 
     /// The caller was compiled against an incompatible version of the library.
-    /// Returned by the initialisation entry points when the version string the
-    /// caller was built with disagrees with the library's own.
     ///
-    /// Ported from `Z_VERSION_ERROR`, `zlib.h` L189.
+    /// The comparison is narrower than "the version strings disagree", and the
+    /// facade must reproduce it exactly. `deflateInit_` (`deflate.c` L392-L397),
+    /// `inflateInit2_` (`inflate.c` L178-L180) and `inflateBackInit_`
+    /// (`infback.c` L30-L32) return this status when any of three conditions
+    /// holds:
+    ///
+    /// 1. the caller passed a null `version` pointer;
+    /// 2. `version[0] != ZLIB_VERSION[0]` -- **the first character only**, making
+    ///    it a major-version check rather than a full-string comparison, so a
+    ///    caller built against `"1.2.11"` is accepted and one built against
+    ///    `"2.0.0"` is not;
+    /// 3. the caller's `stream_size` differs from `sizeof(z_stream)`, which
+    ///    catches a caller compiled against a different `z_stream` layout.
+    ///
+    /// All three are evaluated *before* the stream pointer is checked, so a null
+    /// stream passed with a bad version yields this status and not
+    /// [`ReturnCode::STREAM_ERROR`].
+    ///
+    /// Mirrors `Z_VERSION_ERROR`, `zlib.h` L189.
     pub const VERSION_ERROR: Self = Self(Z_VERSION_ERROR);
 
     /// Returns the exact C `int` this status carries.
@@ -259,7 +316,7 @@ impl ReturnCode {
     /// This is the value that reaches a C caller verbatim, so it is fixed by the
     /// ABI: 0, 1, 2, -1, -2, -3, -4, -5 and -6 respectively.
     ///
-    /// Ported from `zlib.h` L181-L189.
+    /// Mirrors `zlib.h` L181-L189.
     #[must_use]
     pub const fn as_i32(self) -> i32 {
         self.0
@@ -276,7 +333,7 @@ impl ReturnCode {
     /// codes are rejected here instead. Use [`err_msg`] when a message is wanted
     /// for an arbitrary integer, as `zError` allows.
     ///
-    /// Ported from `zlib.h` L181-L189.
+    /// Mirrors `zlib.h` L181-L189.
     #[must_use]
     pub const fn from_i32(code: i32) -> Option<Self> {
         match code {
@@ -299,7 +356,7 @@ impl ReturnCode {
     /// be a documented code. [`OK`](Self::OK) maps to the empty string, exactly
     /// as slot 2 of the C table does.
     ///
-    /// Ported from `zutil.h` L65 (`ERR_MSG`) and `zutil.c` L13-L24
+    /// Mirrors `zutil.h` L65 (`ERR_MSG`) and `zutil.c` L13-L24
     /// (`z_errmsg`).
     #[must_use]
     pub fn msg(self) -> &'static str {
@@ -313,7 +370,7 @@ impl ReturnCode {
     /// [`STREAM_END`](Self::STREAM_END) and [`NEED_DICT`](Self::NEED_DICT) are
     /// **not** errors, and neither is [`OK`](Self::OK).
     ///
-    /// Ported from `zlib.h` L190-L192.
+    /// Mirrors `zlib.h` L190-L192.
     #[must_use]
     pub const fn is_error(self) -> bool {
         self.0 < Z_OK
@@ -339,7 +396,7 @@ impl ReturnCode {
     /// stream state is already known to be valid; a caller that has not yet
     /// validated the state has no slot it may legally write to.
     ///
-    /// Ported from `zutil.h` L67-L68 (`ERR_RETURN`).
+    /// Mirrors `zutil.h` L67-L68 (`ERR_RETURN`).
     #[must_use]
     pub fn record_msg(self, msg_slot: &mut Option<&'static str>) -> Self {
         err_return(msg_slot, self)
@@ -351,16 +408,12 @@ impl ReturnCode {
 /// The idiomatic counterpart of [`ReturnCode::as_i32`], which is the `const`
 /// form and the one the engine itself uses. Both are lossless and total.
 ///
-/// Ported from `zlib.h` L181-L189.
+/// Mirrors `zlib.h` L181-L189.
 impl From<ReturnCode> for i32 {
     fn from(code: ReturnCode) -> Self {
         code.as_i32()
     }
 }
-
-// -----------------------------------------------------------------------------
-//  Message lookup
-// -----------------------------------------------------------------------------
 
 /// Returns the status message for an arbitrary C `int`, mapping any value
 /// outside the documented range to the empty string.
@@ -382,7 +435,7 @@ impl From<ReturnCode> for i32 {
 /// naive `2 - code` of the C macro would overflow in Rust's checked arithmetic;
 /// see `err_msg_index` for how that is guaranteed.
 ///
-/// Ported from `zutil.h` L65 (`ERR_MSG`) and `zutil.c` L139-L141 (`zError`).
+/// Mirrors `zutil.h` L65 (`ERR_MSG`) and `zutil.c` L139-L141 (`zError`).
 #[must_use]
 pub fn err_msg(code: i32) -> &'static str {
     // `get` rather than `[]`: indexing is denied crate-wide, and an index that
@@ -414,7 +467,7 @@ pub fn err_msg(code: i32) -> &'static str {
 /// even if it had not, `checked_sub` would return [`None`] and the sentinel would
 /// be chosen anyway.
 ///
-/// Ported from `zutil.h` L65 (`ERR_MSG`).
+/// Mirrors `zutil.h` L65 (`ERR_MSG`).
 fn err_msg_index(code: i32) -> usize {
     match code {
         // In range: slot `2 - code`, running from 0 for `Z_NEED_DICT` (2) to 8
@@ -439,7 +492,7 @@ fn err_msg_index(code: i32) -> usize {
 /// ```
 ///
 /// The argument order matches the macro's -- slot first, code second -- so that
-/// a port of a C call site reads the same way as the original; `deflate.c`
+/// a Rust call site reads the same way as the original; `deflate.c`
 /// L993, L995, L1020 and L1025 are the call sites this exists for.
 /// [`ReturnCode::record_msg`] is the same operation in method form for callers
 /// who prefer it, and is what makes this helper reachable from outside the
@@ -449,16 +502,12 @@ fn err_msg_index(code: i32) -> usize {
 /// state is known to be valid": it writes to the stream's message slot, which
 /// presupposes that the stream has one.
 ///
-/// Ported from `zutil.h` L67-L68 (`ERR_RETURN`).
+/// Mirrors `zutil.h` L67-L68 (`ERR_RETURN`).
 #[must_use]
 pub(crate) fn err_return(msg_slot: &mut Option<&'static str>, code: ReturnCode) -> ReturnCode {
     *msg_slot = Some(code.msg());
     code
 }
-
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

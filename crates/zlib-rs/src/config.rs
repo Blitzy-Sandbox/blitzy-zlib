@@ -13,7 +13,7 @@
 //!
 //! # Correspondence with the reference implementation
 //!
-//! The module is a port of the *parameter handling* of five C functions, and of
+//! The module is a mirror of the *parameter handling* of five C functions, and of
 //! the constant blocks those functions test against:
 //!
 //! | Rust | C original |
@@ -31,9 +31,9 @@
 //!
 //! # Why the two directions are kept apart
 //!
-//! `windowBits` is the parameter most likely to be ported wrongly, because
+//! `windowBits` is the parameter most likely to be got wrong, because
 //! deflate and inflate do **not** agree on what it means. Reproducing one set of
-//! rules for both is the single most likely defect in a port of this module, so
+//! rules for both is the single most likely defect in this module, so
 //! the two decoders are separate functions with separate result types and
 //! separate tests:
 //!
@@ -68,33 +68,57 @@
 //!    `infback.rs`, `compress.rs` and `uncompress.rs` all reach their limits
 //!    through the functions here, so they agree by construction rather than by
 //!    review.
-//! 2. **Compile-time knobs are not parameters.** `FASTEST`, `LIT_MEM`,
-//!    `UNALIGNED_OK`, `FORCE_STATIC`, `FORCE_STORED`, `GEN_TREES_H` and
-//!    `DYNAMIC_CRC_TABLE` each change the bytes the encoder emits. The port
-//!    implements the default configuration of the reference build and nothing
-//!    else, so none of them appears here as a field, a feature or a runtime
-//!    switch. `GZIP` (`deflate.h` L22-L23) and `GUNZIP` (`inflate.h` L15-L16)
-//!    are the exception that proves the rule: both are defined by default, so
-//!    the gzip wrapper paths are ported unconditionally.
+//! 2. **Compile-time knobs are not parameters.** The port implements the default
+//!    configuration of the reference build and nothing else, so none of the
+//!    knobs below appears here as a field, a feature or a runtime switch. They
+//!    do not all do the same thing, though, and it is worth separating them
+//!    rather than asserting that each one moves a byte:
+//!
+//!    * **Output-changing.** `FASTEST` (a two-entry `configuration_table` plus a
+//!      cut-down `longest_match`, `deflate.c` L106-L110 and L1532-L1588),
+//!      `UNALIGNED_OK` (the alternative `longest_match` body, `deflate.c`
+//!      L1404-L1512) and `FORCE_STATIC` / `FORCE_STORED` (block-type overrides,
+//!      `trees.c` L1034 and L1044) each change what the encoder emits. These are
+//!      the ones byte-identity is directly sensitive to.
+//!    * **Output-neutral, and excluded for other reasons.** `LIT_MEM` moves the
+//!      symbol buffer and raises `LIT_BUFS` from 4 to 5 (`deflate.h` L224-L231),
+//!      but the block-flush threshold is the same symbol count either way
+//!      (`deflate.c` L515-L521), so emitted bytes do not move -- what moves is
+//!      per-stream memory. `GEN_TREES_H` computes the static trees at run time
+//!      instead of using the committed `trees.h` (`trees.c` L83, L296,
+//!      L370-L435); the values are identical. `DYNAMIC_CRC_TABLE` likewise
+//!      computes the CRC tables at run time rather than using the committed
+//!      `crc32.h` constants, which `crc32.c` itself generated, so **checksum
+//!      values and compressed output are unaffected**; it is excluded because it
+//!      flips `zlibCompileFlags()` bit 13 and because `crc32.c` L13-L17 records
+//!      that no mutex guards the construction.
+//!
+//!    `GZIP` (`deflate.h` L22-L23) and `GUNZIP` (`inflate.h` L15-L16) are the
+//!    exception that proves the rule: both are defined by default, so the gzip
+//!    wrapper paths are ported unconditionally.
 //!
 //! # Layering and safety posture
 //!
 //! `no_std`, allocation-free, and dependency-free apart from
 //! [`ReturnCode`]: it names only `core` and
-//! `crate::error`. Nothing here is `#[repr(C)]`, `#[no_mangle]` or `extern "C"`
-//! -- turning these types back into the C `int`s a caller passed is the business
-//! of the `libz-rs-sys` facade, which is the only crate in the workspace allowed
-//! to hold a raw pointer. Every conversion is total and fallible: no input,
+//! `crate::error`. Nothing here is `#[repr(C)]`, `#[no_mangle]` or `extern "C"`,
+//! and nothing here is a raw pointer -- turning these types back into the C
+//! `int`s a caller passed is the business of the `libz-rs-sys` facade, which is
+//! the only crate in the workspace allowed to **use** `unsafe`, and therefore the
+//! only one that can dereference a pointer or make an FFI call. (That is the
+//! accurate form of the claim. This crate does hold two raw pointer *values* --
+//! `allocate::Opaque` and `gz::state::GzFileExposed::next` -- neither of which it
+//! can read through, and neither of which is in this module.) Every conversion is
+//! total and fallible: no input,
 //! including [`i32::MIN`] and [`i32::MAX`], can make any function here panic,
 //! and every arithmetic step of the `windowBits` decode is checked.
 //!
 //! # Examples
 //!
-//! The examples are marked `ignore` because the crate root's re-export path for
-//! these items is fixed by `lib.rs`; the assertions themselves are all repeated
-//! in this module's test suite, where they run.
+//! ```
+//! use zlib_rs::config::{decode_deflate_window_bits, decode_inflate_window_bits};
+//! use zlib_rs::{DeflateConfig, InflateWrap, Wrap, DEF_MEM_LEVEL, MAX_WBITS, Z_DEFAULT_COMPRESSION};
 //!
-//! ```ignore
 //! // The defaults `deflateInit` and `inflateInit` supply.
 //! let deflate = DeflateConfig::default();
 //! assert_eq!(deflate.level, Z_DEFAULT_COMPRESSION);
@@ -102,10 +126,8 @@
 //! assert_eq!(deflate.mem_level, DEF_MEM_LEVEL);
 //!
 //! // A default-level zlib stream: level -1 resolves to 6, window bits stay 15.
-//! let validated = deflate.validate()?;
-//! assert_eq!(validated.level, 6);
-//! assert_eq!(validated.wrap, Wrap::Zlib);
-//! assert_eq!(validated.window_bits, 15);
+//! let validated = deflate.validate().map(|v| (v.level, v.wrap, v.window_bits));
+//! assert_eq!(validated, Ok((6, Wrap::Zlib, 15)));
 //!
 //! // Deflate promotes a 256-byte window request to 512 bytes ...
 //! assert_eq!(decode_deflate_window_bits(8), Ok((Wrap::Zlib, 9)));
@@ -115,6 +137,18 @@
 //! assert_eq!(decode_inflate_window_bits(0), Ok((InflateWrap::Zlib, 0)));
 //! assert!(decode_deflate_window_bits(0).is_err());
 //! ```
+//!
+//! [`decode_deflate_window_bits`]: crate::config::decode_deflate_window_bits
+//! [`decode_inflate_window_bits`]: crate::config::decode_inflate_window_bits
+//! [`validate_deflate_flush`]: crate::config::validate_deflate_flush
+//! [`validate_deflate_params`]: crate::config::validate_deflate_params
+//! [`validate_deflate_params_change`]: crate::config::validate_deflate_params_change
+//! [`validate_inflate_back_window_bits`]: crate::config::validate_inflate_back_window_bits
+
+// The definitions closing the module documentation above are link-reference definitions, not
+// prose: a module whose `mod` declaration carries an outer doc comment has its `//!` block
+// resolved in the scope of the DECLARING module, so an unqualified sibling name does not
+// resolve. See "Documentation lints" in `src/lib.rs` for the rule and the gate.
 
 // `DeflateConfig`, `InflateConfig`, `ValidatedDeflateConfig` and
 // `ValidatedInflateConfig` all end in the name of the module that holds them,
@@ -128,23 +162,19 @@
 
 use crate::error::ReturnCode;
 
-// -----------------------------------------------------------------------------
-//  Compression levels -- `zlib.h` L194-L197
-// -----------------------------------------------------------------------------
-
 /// `Z_NO_COMPRESSION` (0) -- store the input without compressing it.
 ///
-/// Ported from `zlib.h` L194.
+/// Mirrors `zlib.h` L194.
 pub const Z_NO_COMPRESSION: i32 = 0;
 
 /// `Z_BEST_SPEED` (1) -- the fastest of the ten levels, and the weakest.
 ///
-/// Ported from `zlib.h` L195.
+/// Mirrors `zlib.h` L195.
 pub const Z_BEST_SPEED: i32 = 1;
 
 /// `Z_BEST_COMPRESSION` (9) -- the slowest of the ten levels, and the strongest.
 ///
-/// Ported from `zlib.h` L196.
+/// Mirrors `zlib.h` L196.
 pub const Z_BEST_COMPRESSION: i32 = 9;
 
 /// `Z_DEFAULT_COMPRESSION` (-1) -- "use the library's default level", which is
@@ -154,7 +184,7 @@ pub const Z_BEST_COMPRESSION: i32 = 9;
 /// resolved to [`DEF_LEVEL`] *before* the range check rather than after, which is
 /// why `-1` is accepted while `-2` is not (`deflate.c` L419 then L435).
 ///
-/// Ported from `zlib.h` L197.
+/// Mirrors `zlib.h` L197.
 pub const Z_DEFAULT_COMPRESSION: i32 = -1;
 
 /// The level [`Z_DEFAULT_COMPRESSION`] resolves to: 6.
@@ -166,32 +196,28 @@ pub const Z_DEFAULT_COMPRESSION: i32 = -1;
 /// This is *not* the same thing as [`DEF_MEM_LEVEL`], and the two are easy to
 /// confuse because the reference has no name for this one.
 ///
-/// Ported from `deflate.c` L419.
+/// Mirrors `deflate.c` L419.
 pub const DEF_LEVEL: i32 = 6;
-
-// -----------------------------------------------------------------------------
-//  Compression strategies -- `zlib.h` L200-L204
-// -----------------------------------------------------------------------------
 
 /// `Z_DEFAULT_STRATEGY` (0) -- normal data; full string matching.
 ///
-/// Ported from `zlib.h` L204.
+/// Mirrors `zlib.h` L204.
 pub const Z_DEFAULT_STRATEGY: i32 = 0;
 
 /// `Z_FILTERED` (1) -- data produced by a filter or predictor, such as the PNG
 /// filters: more Huffman coding and less string matching than the default.
 ///
-/// Ported from `zlib.h` L200.
+/// Mirrors `zlib.h` L200.
 pub const Z_FILTERED: i32 = 1;
 
 /// `Z_HUFFMAN_ONLY` (2) -- Huffman coding only, with no string matching at all.
 ///
-/// Ported from `zlib.h` L201.
+/// Mirrors `zlib.h` L201.
 pub const Z_HUFFMAN_ONLY: i32 = 2;
 
 /// `Z_RLE` (3) -- limit match distances to one, which is run-length encoding.
 ///
-/// Ported from `zlib.h` L202.
+/// Mirrors `zlib.h` L202.
 pub const Z_RLE: i32 = 3;
 
 /// `Z_FIXED` (4) -- default string matching, but never dynamic Huffman codes.
@@ -199,21 +225,17 @@ pub const Z_RLE: i32 = 3;
 /// Also the upper bound of the `strategy` range check: the reference tests
 /// `strategy < 0 || strategy > Z_FIXED` (`deflate.c` L436).
 ///
-/// Ported from `zlib.h` L203.
+/// Mirrors `zlib.h` L203.
 pub const Z_FIXED: i32 = 4;
-
-// -----------------------------------------------------------------------------
-//  Data types -- `zlib.h` L207-L210
-// -----------------------------------------------------------------------------
 
 /// `Z_BINARY` (0) -- the `data_type` value for binary data.
 ///
-/// Ported from `zlib.h` L207.
+/// Mirrors `zlib.h` L207.
 pub const Z_BINARY: i32 = 0;
 
 /// `Z_TEXT` (1) -- the `data_type` value for text.
 ///
-/// Ported from `zlib.h` L208.
+/// Mirrors `zlib.h` L208.
 pub const Z_TEXT: i32 = 1;
 
 /// `Z_ASCII` (1) -- a deprecated alias of [`Z_TEXT`], kept because callers
@@ -222,17 +244,13 @@ pub const Z_TEXT: i32 = 1;
 /// The reference defines it as `#define Z_ASCII Z_TEXT`, so the two are the same
 /// value by construction here as well, rather than by coincidence.
 ///
-/// Ported from `zlib.h` L209.
+/// Mirrors `zlib.h` L209.
 pub const Z_ASCII: i32 = Z_TEXT;
 
 /// `Z_UNKNOWN` (2) -- the `data_type` value for data not yet classified.
 ///
-/// Ported from `zlib.h` L210.
+/// Mirrors `zlib.h` L210.
 pub const Z_UNKNOWN: i32 = 2;
-
-// -----------------------------------------------------------------------------
-//  Compression method -- `zlib.h` L213
-// -----------------------------------------------------------------------------
 
 /// `Z_DEFLATED` (8) -- the deflate compression method, and the only value the
 /// `method` parameter accepts (`deflate.c` L434).
@@ -242,38 +260,42 @@ pub const Z_UNKNOWN: i32 = 2;
 /// (`doc/rfc1952.txt`), which is why `inflate` compares against it when parsing
 /// a header (`inflate.c` L533 and L558) as well as when validating a parameter.
 ///
-/// Ported from `zlib.h` L213.
+/// Mirrors `zlib.h` L213.
 pub const Z_DEFLATED: i32 = 8;
-
-// -----------------------------------------------------------------------------
-//  Flush values -- `zlib.h` L172-L178
-// -----------------------------------------------------------------------------
 
 /// `Z_NO_FLUSH` (0) -- accumulate input and decide for yourself when to emit.
 ///
-/// Ported from `zlib.h` L172.
+/// Mirrors `zlib.h` L172.
 pub const Z_NO_FLUSH: i32 = 0;
 
-/// `Z_PARTIAL_FLUSH` (1) -- flush to a byte boundary without aligning.
+/// `Z_PARTIAL_FLUSH` (1) -- flush all pending output **without** byte alignment.
 ///
-/// Ported from `zlib.h` L173.
+/// `zlib.h` L300-L306 is explicit that "the output is **not** aligned to a byte
+/// boundary": the current deflate block is completed and followed by an empty
+/// *fixed-codes* block that is 10 bits long, which is what assures the
+/// decompressor receives enough bits to finish the real block. Contrast
+/// [`Z_SYNC_FLUSH`], which does align, using an empty *stored* block of three
+/// bits plus filler to the next byte followed by `00 00 ff ff` (`zlib.h`
+/// L296-L298).
+///
+/// Mirrors `zlib.h` L173.
 pub const Z_PARTIAL_FLUSH: i32 = 1;
 
 /// `Z_SYNC_FLUSH` (2) -- flush and align to a byte boundary with an empty stored
 /// block.
 ///
-/// Ported from `zlib.h` L174.
+/// Mirrors `zlib.h` L174.
 pub const Z_SYNC_FLUSH: i32 = 2;
 
 /// `Z_FULL_FLUSH` (3) -- as [`Z_SYNC_FLUSH`], and reset the compression state so
 /// that decompression can restart from this point.
 ///
-/// Ported from `zlib.h` L175.
+/// Mirrors `zlib.h` L175.
 pub const Z_FULL_FLUSH: i32 = 3;
 
 /// `Z_FINISH` (4) -- no more input is coming; finish the stream.
 ///
-/// Ported from `zlib.h` L176.
+/// Mirrors `zlib.h` L176.
 pub const Z_FINISH: i32 = 4;
 
 /// `Z_BLOCK` (5) -- stop at a block boundary.
@@ -281,17 +303,13 @@ pub const Z_FINISH: i32 = 4;
 /// Also the upper bound of `deflate`'s flush guard, which rejects anything above
 /// it (`deflate.c` L985); see [`Flush::is_valid_for_deflate`].
 ///
-/// Ported from `zlib.h` L177.
+/// Mirrors `zlib.h` L177.
 pub const Z_BLOCK: i32 = 5;
 
 /// `Z_TREES` (6) -- stop after the block header, for `inflate` only.
 ///
-/// Ported from `zlib.h` L178.
+/// Mirrors `zlib.h` L178.
 pub const Z_TREES: i32 = 6;
-
-// -----------------------------------------------------------------------------
-//  Window and memory bounds -- `zconf.h` L272-L288, `zutil.h` L72-L96
-// -----------------------------------------------------------------------------
 
 /// The smallest window exponent either direction documents: 8, a 256-byte
 /// window.
@@ -308,14 +326,14 @@ pub const Z_TREES: i32 = 6;
 /// window-buffer domain rather than to the signed C parameter domain. The two are
 /// deliberately different numbers and must not be substituted for one another.
 ///
-/// Ported from `zlib.h` L556-L557 and `deflate.c` L435.
+/// Mirrors `zlib.h` L556-L557 and `deflate.c` L435.
 pub const MIN_WBITS: i32 = 8;
 
 /// `MAX_WBITS` (15) -- the largest window exponent, a 32 KiB LZ77 window.
 ///
 /// `zconf.h` L281-L285 warns that reducing it makes `minigzip` unable to extract
 /// `.gz` files created by `gzip`, and `zutil.h` L72-L74 refuses to compile at all
-/// unless it lies in `9..=15`. The port implements the shipped value and offers
+/// unless it lies in `9..=15`. The implementation implements the shipped value and offers
 /// no way to change it, because a smaller window would change the bytes the
 /// encoder emits.
 ///
@@ -329,7 +347,7 @@ pub const MIN_WBITS: i32 = 8;
 /// where a request may still be negative or carry a `+16` offset, so the two are
 /// not interchangeable even though they agree numerically.
 ///
-/// Ported from `zconf.h` L286-L288.
+/// Mirrors `zconf.h` L286-L288.
 pub const MAX_WBITS: i32 = 15;
 
 /// `DEF_WBITS` (15) -- the default window exponent for **decompression**.
@@ -339,7 +357,7 @@ pub const MAX_WBITS: i32 = 15;
 /// defines one as the other. `inflateInit_` passes this value to
 /// `inflateInit2_` (`inflate.c` L216).
 ///
-/// Ported from `zutil.h` L75-L78.
+/// Mirrors `zutil.h` L75-L78.
 pub const DEF_WBITS: i32 = MAX_WBITS;
 
 /// The smallest `memLevel`: 1, minimum memory, slowest, worst ratio.
@@ -347,19 +365,19 @@ pub const DEF_WBITS: i32 = MAX_WBITS;
 /// The reference spells this bound as the literal `1` in `deflate.c` L434 and
 /// documents it at `zlib.h` L586-L590.
 ///
-/// Ported from `deflate.c` L434.
+/// Mirrors `deflate.c` L434.
 pub const MIN_MEM_LEVEL: i32 = 1;
 
 /// `MAX_MEM_LEVEL` (9) -- the largest `memLevel`, maximum memory and optimal
 /// speed.
 ///
 /// **Nine, not eight.** `zconf.h` L272-L279 defines it as 9 except under
-/// `MAXSEG_64K`, a 16-bit segmented-memory configuration the port does not
+/// `MAXSEG_64K`, a 16-bit segmented-memory configuration the implementation does not
 /// implement; [`DEF_MEM_LEVEL`] is the one that is 8. Conflating the two is an
 /// easy mistake with observable consequences: it would reject `memLevel = 9`,
 /// which the reference accepts.
 ///
-/// Ported from `zconf.h` L272-L279.
+/// Mirrors `zconf.h` L272-L279.
 pub const MAX_MEM_LEVEL: i32 = 9;
 
 /// `DEF_MEM_LEVEL` (8) -- the default `memLevel`, and the value `deflateInit_`
@@ -369,13 +387,11 @@ pub const MAX_MEM_LEVEL: i32 = 9;
 /// and as [`MAX_MEM_LEVEL`] otherwise; with the shipped `MAX_MEM_LEVEL` of 9 the
 /// first arm applies.
 ///
-/// Ported from `zutil.h` L80-L84.
+/// Mirrors `zutil.h` L80-L84.
 pub const DEF_MEM_LEVEL: i32 = 8;
 
-// -----------------------------------------------------------------------------
 //  Engine constants shared by the deflate and trees subsystems -- `zutil.h`
 //  L87-L96
-// -----------------------------------------------------------------------------
 
 /// `MIN_MATCH` (3) -- the shortest length an LZ77 match may have.
 ///
@@ -391,12 +407,12 @@ pub const DEF_MEM_LEVEL: i32 = 8;
 /// re-export the pair from one of them rather than glob both into the same
 /// namespace.
 ///
-/// Ported from `zutil.h` L92.
+/// Mirrors `zutil.h` L92.
 pub const MIN_MATCH: usize = 3;
 
 /// `MAX_MATCH` (258) -- the longest length an LZ77 match may have.
 ///
-/// Ported from `zutil.h` L93.
+/// Mirrors `zutil.h` L93.
 pub const MAX_MATCH: usize = 258;
 
 /// `PRESET_DICT` (0x20) -- the `FDICT` flag of the zlib header.
@@ -408,7 +424,7 @@ pub const MAX_MATCH: usize = 258;
 /// (`inflate.c` L551) -- so this constant belongs to the emit path and the
 /// decode path's shifted spelling is not interchangeable with it.
 ///
-/// Ported from `zutil.h` L96.
+/// Mirrors `zutil.h` L96.
 pub const PRESET_DICT: u32 = 0x20;
 
 /// `STORED_BLOCK` (0) -- the block type of an uncompressed stored block.
@@ -417,31 +433,27 @@ pub const PRESET_DICT: u32 = 0x20;
 /// `(tag << 1) + last` in a three-bit field (`trees.c` L862, L1059 and L1066),
 /// so they are `u8` here and widen losslessly wherever the bit writer wants them.
 ///
-/// Ported from `zutil.h` L87.
+/// Mirrors `zutil.h` L87.
 pub const STORED_BLOCK: u8 = 0;
 
 /// `STATIC_TREES` (1) -- the block type of a block coded with the fixed Huffman
 /// trees.
 ///
-/// Ported from `zutil.h` L88.
+/// Mirrors `zutil.h` L88.
 pub const STATIC_TREES: u8 = 1;
 
 /// `DYN_TREES` (2) -- the block type of a block coded with per-block dynamic
 /// Huffman trees.
 ///
-/// Ported from `zutil.h` L89.
+/// Mirrors `zutil.h` L89.
 pub const DYN_TREES: u8 = 2;
-
-// -----------------------------------------------------------------------------
-//  Bit meanings of the inflate `wrap` field -- `inflate.c` L513, L524, L679
-// -----------------------------------------------------------------------------
 
 /// Bit 0 of `inflate_state.wrap`: a zlib header is acceptable.
 ///
 /// `inflate.c` L524 tests `!(state->wrap & 1)` to decide whether the two bytes it
 /// is looking at may be read as a zlib header.
 ///
-/// Ported from `inflate.c` L524.
+/// Mirrors `inflate.c` L524.
 pub const INFLATE_WRAP_ZLIB_HEADER: i32 = 1;
 
 /// Bit 1 of `inflate_state.wrap`: a gzip header is acceptable.
@@ -450,7 +462,7 @@ pub const INFLATE_WRAP_ZLIB_HEADER: i32 = 1;
 /// gzip magic, and `inflateGetHeader` refuses outright when the bit is clear
 /// (`inflate.c` L1225).
 ///
-/// Ported from `inflate.c` L513.
+/// Mirrors `inflate.c` L513.
 pub const INFLATE_WRAP_GZIP_HEADER: i32 = 2;
 
 /// Bit 2 of `inflate_state.wrap`: the stream's check value is to be verified.
@@ -461,17 +473,13 @@ pub const INFLATE_WRAP_GZIP_HEADER: i32 = 2;
 /// state transition, not a configuration choice, so it is
 /// `inflate/state.rs`'s business rather than this module's.
 ///
-/// Ported from `inflate.c` L152 and L1390-L1393.
+/// Mirrors `inflate.c` L152 and L1390-L1393.
 pub const INFLATE_WRAP_VERIFY_CHECK: i32 = 4;
-
-// -----------------------------------------------------------------------------
-//  Private decode constants
-// -----------------------------------------------------------------------------
 
 /// The offset added to `windowBits` to ask deflate for a gzip wrapper, and
 /// subtracted again to recover the window exponent.
 ///
-/// Ported from `zlib.h` L574-L576 and `deflate.c` L431.
+/// Mirrors `zlib.h` L574-L576 and `deflate.c` L431.
 const GZIP_WRAP_OFFSET: i32 = 16;
 
 /// The mask that extracts the window exponent from a non-negative inflate
@@ -492,12 +500,12 @@ const INFLATE_WRAP_MASK_LIMIT: i32 = 48;
 
 /// `inflate_state.wrap` for a raw stream: no header, no trailer, no check value.
 ///
-/// Ported from `inflate.c` L148.
+/// Mirrors `inflate.c` L148.
 const INFLATE_WRAP_RAW: i32 = 0;
 
 /// `inflate_state.wrap` for a zlib stream: 5.
 ///
-/// Ported from `inflate.c` L152 with `windowBits` in `0..=15`.
+/// Mirrors `inflate.c` L152 with `windowBits` in `0..=15`.
 const INFLATE_WRAP_ZLIB_ONLY: i32 = INFLATE_WRAP_ZLIB_HEADER | INFLATE_WRAP_VERIFY_CHECK;
 
 /// The bias of `wrap = (windowBits >> 4) + 5`, which is exactly the zlib wrap
@@ -508,17 +516,17 @@ const INFLATE_WRAP_ZLIB_ONLY: i32 = INFLATE_WRAP_ZLIB_HEADER | INFLATE_WRAP_VERI
 /// three results are named individually below instead of being composed from the
 /// bit constants at the point of use.
 ///
-/// Ported from `inflate.c` L152.
+/// Mirrors `inflate.c` L152.
 const INFLATE_WRAP_BIAS: i32 = INFLATE_WRAP_ZLIB_ONLY;
 
 /// `inflate_state.wrap` for a gzip-only stream: 6.
 ///
-/// Ported from `inflate.c` L152 with `windowBits` in `16..=31`.
+/// Mirrors `inflate.c` L152 with `windowBits` in `16..=31`.
 const INFLATE_WRAP_GZIP_ONLY: i32 = INFLATE_WRAP_GZIP_HEADER | INFLATE_WRAP_VERIFY_CHECK;
 
 /// `inflate_state.wrap` for automatic zlib-or-gzip detection: 7.
 ///
-/// Ported from `inflate.c` L152 with `windowBits` in `32..=47`.
+/// Mirrors `inflate.c` L152 with `windowBits` in `32..=47`.
 const INFLATE_WRAP_AUTODETECT: i32 =
     INFLATE_WRAP_ZLIB_HEADER | INFLATE_WRAP_GZIP_HEADER | INFLATE_WRAP_VERIFY_CHECK;
 
@@ -531,10 +539,6 @@ const WINDOW_BITS_FROM_HEADER: i32 = 0;
 /// so that neither can drift.
 const MAX_WBITS_U8: u8 = 15;
 
-// -----------------------------------------------------------------------------
-//  Compression method
-// -----------------------------------------------------------------------------
-
 /// The compression method of a deflate stream.
 ///
 /// The `method` parameter of `deflateInit2_` is an `int` with exactly one legal
@@ -546,10 +550,10 @@ const MAX_WBITS_U8: u8 = 15;
 ///
 /// The enum is deliberately not `#[non_exhaustive]`. `zlib.h` L214 describes
 /// deflate as "the only one supported in this version", and adding a second
-/// compression method would be a new wire format, which is out of scope for this
-/// port by construction.
+/// compression method would be a new wire format, which the frozen capability surface
+/// excludes by construction.
 ///
-/// Ported from `zlib.h` L213-L214 and `deflate.c` L434.
+/// Mirrors `zlib.h` L213-L214 and `deflate.c` L434.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Method {
     /// The DEFLATE method of RFC 1951, `Z_DEFLATED` (8).
@@ -563,12 +567,12 @@ pub enum Method {
 impl Method {
     /// Every method this version of the library implements: just the one.
     ///
-    /// Ported from `zlib.h` L213-L214.
+    /// Mirrors `zlib.h` L213-L214.
     pub const ALL: [Self; 1] = [Self::Deflated];
 
     /// Returns the C `int` that names this method.
     ///
-    /// Ported from `zlib.h` L213.
+    /// Mirrors `zlib.h` L213.
     #[must_use]
     pub const fn as_raw(self) -> i32 {
         match self {
@@ -582,7 +586,7 @@ impl Method {
     /// Total over `i32`: every input, [`i32::MIN`] and [`i32::MAX`] included,
     /// either names [`Method::Deflated`] or is refused.
     ///
-    /// Ported from the `method != Z_DEFLATED` term of `deflate.c` L434.
+    /// Mirrors the `method != Z_DEFLATED` term of `deflate.c` L434.
     #[must_use]
     pub const fn from_raw(raw: i32) -> Option<Self> {
         match raw {
@@ -593,7 +597,7 @@ impl Method {
 
     /// The reference spelling of this method, for diagnostics.
     ///
-    /// Ported from `zlib.h` L213.
+    /// Mirrors `zlib.h` L213.
     #[must_use]
     pub const fn c_name(self) -> &'static str {
         match self {
@@ -621,10 +625,6 @@ impl TryFrom<i32> for Method {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Compression strategy
-// -----------------------------------------------------------------------------
-
 /// How the encoder should trade string matching against Huffman coding.
 ///
 /// The five values of the `strategy` parameter, in the order `zlib.h` L200-L204
@@ -642,7 +642,7 @@ impl TryFrom<i32> for Method {
 /// the ABI value goes through [`Strategy::as_raw`] and [`Strategy::from_raw`]
 /// rather than through a cast.
 ///
-/// Ported from `zlib.h` L200-L204.
+/// Mirrors `zlib.h` L200-L204.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Strategy {
     /// `Z_DEFAULT_STRATEGY` (0) -- normal data, full string matching.
@@ -665,7 +665,7 @@ impl Strategy {
     /// against every level, `windowBits` form, `memLevel` and flush mode, and an
     /// exhaustive list that lives beside the enum cannot fall out of step with it.
     ///
-    /// Ported from `zlib.h` L200-L204.
+    /// Mirrors `zlib.h` L200-L204.
     pub const ALL: [Self; 5] = [
         Self::Default,
         Self::Filtered,
@@ -676,7 +676,7 @@ impl Strategy {
 
     /// Returns the C `int` that names this strategy.
     ///
-    /// Ported from `zlib.h` L200-L204.
+    /// Mirrors `zlib.h` L200-L204.
     #[must_use]
     pub const fn as_raw(self) -> i32 {
         match self {
@@ -697,7 +697,7 @@ impl Strategy {
     /// declared values, which is the same predicate as the two comparisons
     /// because the values are contiguous from zero.
     ///
-    /// Ported from `deflate.c` L436 and L786.
+    /// Mirrors `deflate.c` L436 and L786.
     #[must_use]
     pub const fn from_raw(raw: i32) -> Option<Self> {
         match raw {
@@ -712,7 +712,7 @@ impl Strategy {
 
     /// The reference spelling of this strategy, for diagnostics.
     ///
-    /// Ported from `zlib.h` L200-L204.
+    /// Mirrors `zlib.h` L200-L204.
     #[must_use]
     pub const fn c_name(self) -> &'static str {
         match self {
@@ -744,10 +744,6 @@ impl TryFrom<i32> for Strategy {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Flush mode
-// -----------------------------------------------------------------------------
-
 /// A flush request: the second argument of `deflate` and `inflate`.
 ///
 /// The seven values of `zlib.h` L172-L178, complete and in order. The type lives
@@ -768,12 +764,12 @@ impl TryFrom<i32> for Strategy {
 ///   specific values it treats specially -- `flush == Z_BLOCK`,
 ///   `flush == Z_TREES` and `flush != Z_FINISH` -- so any other integer behaves
 ///   exactly like [`Z_NO_FLUSH`], including integers that name no flush mode.
-///   A port that rejected an unknown flush in `inflate` would refuse calls the
+///   Rejecting an unknown flush in `inflate` would refuse calls the
 ///   reference has always accepted, so `inflate` must **not** be given a
 ///   validating conversion; [`Flush::from_raw`] returning [`None`] means "not one
 ///   of the seven documented values", not "invalid input".
 ///
-/// Ported from `zlib.h` L172-L179.
+/// Mirrors `zlib.h` L172-L179.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Flush {
     /// `Z_NO_FLUSH` (0) -- accumulate input; emit when the encoder sees fit.
@@ -797,7 +793,7 @@ pub enum Flush {
 impl Flush {
     /// All seven flush values, in the order their C values run.
     ///
-    /// Ported from `zlib.h` L172-L178.
+    /// Mirrors `zlib.h` L172-L178.
     pub const ALL: [Self; 7] = [
         Self::NoFlush,
         Self::PartialFlush,
@@ -810,7 +806,7 @@ impl Flush {
 
     /// Returns the C `int` that names this flush mode.
     ///
-    /// Ported from `zlib.h` L172-L178.
+    /// Mirrors `zlib.h` L172-L178.
     #[must_use]
     pub const fn as_raw(self) -> i32 {
         match self {
@@ -830,7 +826,7 @@ impl Flush {
     /// Total over `i32`. See the type-level note on why [`None`] must not be
     /// treated as an error by `inflate`.
     ///
-    /// Ported from `zlib.h` L172-L178.
+    /// Mirrors `zlib.h` L172-L178.
     #[must_use]
     pub const fn from_raw(raw: i32) -> Option<Self> {
         match raw {
@@ -850,7 +846,7 @@ impl Flush {
     /// True for `Z_NO_FLUSH ..= Z_BLOCK` and false for [`Trees`](Self::Trees),
     /// reproducing the `flush > Z_BLOCK` half of the guard at `deflate.c` L985.
     ///
-    /// Ported from `deflate.c` L985.
+    /// Mirrors `deflate.c` L985.
     #[must_use]
     pub const fn is_valid_for_deflate(self) -> bool {
         self.as_raw() <= Z_BLOCK
@@ -858,7 +854,7 @@ impl Flush {
 
     /// The reference spelling of this flush mode, for diagnostics.
     ///
-    /// Ported from `zlib.h` L172-L178.
+    /// Mirrors `zlib.h` L172-L178.
     #[must_use]
     pub const fn c_name(self) -> &'static str {
         match self {
@@ -891,10 +887,6 @@ impl TryFrom<i32> for Flush {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Container format -- the deflate side
-// -----------------------------------------------------------------------------
-
 /// The container a compressed stream is wrapped in.
 ///
 /// This is the *classification* half of what a `windowBits` argument encodes; the
@@ -926,7 +918,7 @@ impl TryFrom<i32> for Flush {
 /// express "either header" and "verify the check value" -- so it has its own type,
 /// [`InflateWrap`]. The two must not be interchanged.
 ///
-/// Ported from `deflate.c` L391 (`int wrap = 1`), L422-L432 and L228-L232.
+/// Mirrors `deflate.c` L391 (`int wrap = 1`), L422-L432 and L228-L232.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wrap {
     /// Raw deflate: no header, no trailer and no check value, as RFC 1951
@@ -946,13 +938,13 @@ pub enum Wrap {
 impl Wrap {
     /// All three containers a deflate stream can be written in.
     ///
-    /// Ported from `deflate.c` L391, L423 and L430.
+    /// Mirrors `deflate.c` L391, L423 and L430.
     pub const ALL: [Self; 3] = [Self::None, Self::Zlib, Self::Gzip];
 
     /// Returns the integer `deflate_state.wrap` holds for this container: `0`
     /// raw, `1` zlib, `2` gzip.
     ///
-    /// Ported from `deflate.c` L391, L423 and L430.
+    /// Mirrors `deflate.c` L391, L423 and L430.
     #[must_use]
     pub const fn as_deflate_wrap(self) -> i32 {
         match self {
@@ -965,7 +957,7 @@ impl Wrap {
     /// Converts a raw `deflate_state.wrap` value back into a container,
     /// returning [`None`] for anything but `0`, `1` or `2`.
     ///
-    /// Ported from `deflate.c` L391, L423 and L430.
+    /// Mirrors `deflate.c` L391, L423 and L430.
     #[must_use]
     pub const fn from_deflate_wrap(raw: i32) -> Option<Self> {
         match raw {
@@ -981,7 +973,7 @@ impl Wrap {
     /// True for [`Zlib`](Self::Zlib) only, reproducing `wrap == 1` at
     /// `deflate.c` L228.
     ///
-    /// Ported from `deflate.c` L228.
+    /// Mirrors `deflate.c` L228.
     #[must_use]
     pub const fn computes_adler32(self) -> bool {
         matches!(self, Self::Zlib)
@@ -992,7 +984,7 @@ impl Wrap {
     /// True for [`Gzip`](Self::Gzip) only, reproducing `wrap == 2` at
     /// `deflate.c` L232.
     ///
-    /// Ported from `deflate.c` L232.
+    /// Mirrors `deflate.c` L232.
     #[must_use]
     pub const fn computes_crc32(self) -> bool {
         matches!(self, Self::Gzip)
@@ -1003,16 +995,12 @@ impl Wrap {
     /// False for [`None`](Self::None) only. `deflate.c` L1264 uses the equivalent
     /// test, `s->wrap <= 0`, to skip the trailer of a raw stream.
     ///
-    /// Ported from `deflate.c` L1264.
+    /// Mirrors `deflate.c` L1264.
     #[must_use]
     pub const fn is_wrapped(self) -> bool {
         !matches!(self, Self::None)
     }
 }
-
-// -----------------------------------------------------------------------------
-//  Container format -- the inflate side
-// -----------------------------------------------------------------------------
 
 /// Which containers a decompressor will accept.
 ///
@@ -1043,7 +1031,7 @@ impl Wrap {
 /// the field entirely when no header has been seen yet, treating the remainder as
 /// raw (`inflate.c` L1300-L1302).
 ///
-/// Ported from `inflate.c` L145-L157.
+/// Mirrors `inflate.c` L145-L157.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InflateWrap {
     /// Raw inflate: process deflate data with no header, no trailer and no check
@@ -1063,13 +1051,13 @@ pub enum InflateWrap {
 impl InflateWrap {
     /// Every wrap request a decompressor can be initialised with.
     ///
-    /// Ported from `inflate.c` L148 and L152.
+    /// Mirrors `inflate.c` L148 and L152.
     pub const ALL: [Self; 4] = [Self::None, Self::Zlib, Self::Gzip, Self::ZlibOrGzip];
 
     /// Returns the integer `inflate_state.wrap` holds for this request: `0`, `5`,
     /// `6` or `7`.
     ///
-    /// Ported from `inflate.c` L148 and L152.
+    /// Mirrors `inflate.c` L148 and L152.
     #[must_use]
     pub const fn as_inflate_wrap(self) -> i32 {
         match self {
@@ -1089,7 +1077,7 @@ impl InflateWrap {
     /// accepted here: this converts a configuration request, not an arbitrary
     /// snapshot of a running stream.
     ///
-    /// Ported from `inflate.c` L148 and L152.
+    /// Mirrors `inflate.c` L148 and L152.
     #[must_use]
     pub const fn from_inflate_wrap(raw: i32) -> Option<Self> {
         match raw {
@@ -1105,7 +1093,7 @@ impl InflateWrap {
     ///
     /// Reproduces `state->wrap & 1` at `inflate.c` L524.
     ///
-    /// Ported from `inflate.c` L524.
+    /// Mirrors `inflate.c` L524.
     #[must_use]
     pub const fn allows_zlib_header(self) -> bool {
         matches!(self, Self::Zlib | Self::ZlibOrGzip)
@@ -1117,7 +1105,7 @@ impl InflateWrap {
     /// `inflateGetHeader` applies before agreeing to fill a caller's `gz_header`
     /// (`inflate.c` L1225).
     ///
-    /// Ported from `inflate.c` L513.
+    /// Mirrors `inflate.c` L513.
     #[must_use]
     pub const fn allows_gzip_header(self) -> bool {
         matches!(self, Self::Gzip | Self::ZlibOrGzip)
@@ -1130,7 +1118,7 @@ impl InflateWrap {
     /// [`None`](Self::None). A later `inflateValidate(strm, 0)` can clear the bit
     /// on a live stream; that is `inflate/state.rs`'s concern.
     ///
-    /// Ported from `inflate.c` L152 and L1390-L1393.
+    /// Mirrors `inflate.c` L152 and L1390-L1393.
     #[must_use]
     pub const fn verifies_check_value(self) -> bool {
         !matches!(self, Self::None)
@@ -1154,22 +1142,18 @@ impl InflateWrap {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  The two `windowBits` decoders
-// -----------------------------------------------------------------------------
-
 /// Decodes a `deflateInit2_` `windowBits` argument into a container and a window
 /// exponent.
 ///
 /// This is the compression half of the parameter that means two things at once,
-/// and it is a literal port of `deflate.c` L422-L439 -- decode, then validate,
+/// and it is a literal mirror of `deflate.c` L422-L439 -- decode, then validate,
 /// then promote:
 ///
 /// | Argument | Result |
 /// |---|---|
 /// | `8` | `(Wrap::Zlib, 9)` -- promoted, see below |
 /// | `9 ..= 15` | `(Wrap::Zlib, 9 ..= 15)` |
-/// | `-9 ..= -15` | `(Wrap::None, 9 ..= 15)` |
+/// | `-15 ..= -9` | `(Wrap::None, 9 ..= 15)` |
 /// | `25 ..= 31` | `(Wrap::Gzip, 9 ..= 15)` |
 /// | anything else | `Err(Z_STREAM_ERROR)` |
 ///
@@ -1203,7 +1187,7 @@ impl InflateWrap {
 /// above, which is the single code `deflateInit2_` returns for a bad parameter
 /// (`deflate.c` L437).
 ///
-/// Ported from `deflate.c` L422-L439.
+/// Mirrors `deflate.c` L422-L439.
 pub fn decode_deflate_window_bits(window_bits: i32) -> Result<(Wrap, u8), ReturnCode> {
     let (wrap, exponent) = if window_bits < 0 {
         // `deflate.c` L422-L427: a negative request suppresses the zlib wrapper,
@@ -1257,7 +1241,7 @@ pub fn decode_deflate_window_bits(window_bits: i32) -> Result<(Wrap, u8), Return
 /// Decodes an `inflateInit2_` (or `inflateReset2`) `windowBits` argument into a
 /// wrap request and a window exponent.
 ///
-/// The decompression half of the parameter, and a literal port of `inflate.c`
+/// The decompression half of the parameter, and a literal mirror of `inflate.c`
 /// L145-L161. It is **not** the same function as
 /// [`decode_deflate_window_bits`]:
 ///
@@ -1265,7 +1249,7 @@ pub fn decode_deflate_window_bits(window_bits: i32) -> Result<(Wrap, u8), Return
 /// |---|---|
 /// | `0` | `(InflateWrap::Zlib, 0)` -- window size comes from the header |
 /// | `8 ..= 15` | `(InflateWrap::Zlib, 8 ..= 15)` |
-/// | `-8 ..= -15` | `(InflateWrap::None, 8 ..= 15)` |
+/// | `-15 ..= -8` | `(InflateWrap::None, 8 ..= 15)` |
 /// | `16` | `(InflateWrap::Gzip, 0)` |
 /// | `24 ..= 31` | `(InflateWrap::Gzip, 8 ..= 15)` |
 /// | `32` | `(InflateWrap::ZlibOrGzip, 0)` |
@@ -1298,7 +1282,7 @@ pub fn decode_deflate_window_bits(window_bits: i32) -> Result<(Wrap, u8), Return
 /// Returns [`ReturnCode::STREAM_ERROR`] for every argument outside the table
 /// above, which is the code `inflateReset2` returns (`inflate.c` L147 and L161).
 ///
-/// Ported from `inflate.c` L145-L161.
+/// Mirrors `inflate.c` L145-L161.
 pub fn decode_inflate_window_bits(window_bits: i32) -> Result<(InflateWrap, u8), ReturnCode> {
     let (wrap_request, exponent) = if window_bits < 0 {
         // `inflate.c` L145-L150. As on the deflate side, the sub-range check runs
@@ -1364,17 +1348,13 @@ pub fn decode_inflate_window_bits(window_bits: i32) -> Result<(InflateWrap, u8),
 /// Returns [`ReturnCode::STREAM_ERROR`] for any argument outside `8 ..= 15`,
 /// which is the code `inflateBackInit_` returns (`infback.c` L35).
 ///
-/// Ported from `infback.c` L33-L35.
+/// Mirrors `infback.c` L33-L35.
 pub fn validate_inflate_back_window_bits(window_bits: i32) -> Result<u8, ReturnCode> {
     if !(MIN_WBITS..=MAX_WBITS).contains(&window_bits) {
         return Err(ReturnCode::STREAM_ERROR);
     }
     u8::try_from(window_bits).map_err(|_| ReturnCode::STREAM_ERROR)
 }
-
-// -----------------------------------------------------------------------------
-//  The remaining scalar parameters
-// -----------------------------------------------------------------------------
 
 /// Resolves a `level` argument to the level the encoder will actually use.
 ///
@@ -1389,7 +1369,7 @@ pub fn validate_inflate_back_window_bits(window_bits: i32) -> Result<u8, ReturnC
 /// through, and `compress` passes `Z_DEFAULT_COMPRESSION` itself).
 ///
 /// The `FASTEST` build of the reference replaces step 1 with `if (level != 0)
-/// level = 1` (`deflate.c` L417), which changes the emitted bytes. The port
+/// level = 1` (`deflate.c` L417), which changes the emitted bytes. The implementation
 /// implements the default build only, so that variant is absent by design.
 ///
 /// # Errors
@@ -1398,7 +1378,7 @@ pub fn validate_inflate_back_window_bits(window_bits: i32) -> Result<u8, ReturnC
 /// `0 ..= 9` once the default has been resolved -- `-2` and `10` being the two
 /// nearest failures.
 ///
-/// Ported from `deflate.c` L419 and L435.
+/// Mirrors `deflate.c` L419 and L435.
 pub fn normalize_deflate_level(level: i32) -> Result<u8, ReturnCode> {
     // `deflate.c` L419.
     let resolved = if level == Z_DEFAULT_COMPRESSION {
@@ -1429,7 +1409,7 @@ pub fn normalize_deflate_level(level: i32) -> Result<u8, ReturnCode> {
 /// Returns [`ReturnCode::STREAM_ERROR`] for any value outside `1 ..= 9`, `0` and
 /// `10` being the two nearest failures.
 ///
-/// Ported from the `memLevel < 1 || memLevel > MAX_MEM_LEVEL` term of `deflate.c`
+/// Mirrors the `memLevel < 1 || memLevel > MAX_MEM_LEVEL` term of `deflate.c`
 /// L434.
 pub fn validate_mem_level(mem_level: i32) -> Result<u8, ReturnCode> {
     if !(MIN_MEM_LEVEL..=MAX_MEM_LEVEL).contains(&mem_level) {
@@ -1457,7 +1437,7 @@ pub fn validate_mem_level(mem_level: i32) -> Result<u8, ReturnCode> {
 /// [`Z_DEFAULT_COMPRESSION`] has been resolved, or the strategy names none of the
 /// five documented values.
 ///
-/// Ported from `deflate.c` L784-L788.
+/// Mirrors `deflate.c` L784-L788.
 pub fn validate_deflate_params_change(
     level: i32,
     strategy: i32,
@@ -1483,7 +1463,7 @@ pub fn validate_deflate_params_change(
 /// Returns [`ReturnCode::STREAM_ERROR`] for a negative argument, for anything
 /// above [`Z_BLOCK`], and for [`Z_TREES`] specifically.
 ///
-/// Ported from `deflate.c` L985.
+/// Mirrors `deflate.c` L985.
 pub fn validate_deflate_flush(flush: i32) -> Result<Flush, ReturnCode> {
     let flush = Flush::from_raw(flush).ok_or(ReturnCode::STREAM_ERROR)?;
     if !flush.is_valid_for_deflate() {
@@ -1491,10 +1471,6 @@ pub fn validate_deflate_flush(flush: i32) -> Result<Flush, ReturnCode> {
     }
     Ok(flush)
 }
-
-// -----------------------------------------------------------------------------
-//  Compression configuration
-// -----------------------------------------------------------------------------
 
 /// The five parameters of `deflateInit2_`, as requested by the caller.
 ///
@@ -1512,7 +1488,7 @@ pub fn validate_deflate_flush(flush: i32) -> Result<Flush, ReturnCode> {
 /// which is what makes it a faithful mirror of the C parameter list rather than a
 /// re-interpretation of it.
 ///
-/// Ported from `deflateInit2_`, `zlib.h` L1907-L1910 and `deflate.c` L387.
+/// Mirrors `deflateInit2_`, `zlib.h` L1907-L1910 and `deflate.c` L387.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeflateConfig {
     /// `0 ..= 9`, or [`Z_DEFAULT_COMPRESSION`] for [`DEF_LEVEL`].
@@ -1520,7 +1496,7 @@ pub struct DeflateConfig {
     /// The compression method; only [`Method::Deflated`] exists.
     pub method: Method,
     /// The window exponent, with the container encoded in it: `8 ..= 15` for
-    /// zlib, `-9 ..= -15` for raw, `25 ..= 31` for gzip. See
+    /// zlib, `-15 ..= -9` for raw, `25 ..= 31` for gzip. See
     /// [`decode_deflate_window_bits`] for the exact rules, including the
     /// promotion of `8` to `9`.
     pub window_bits: i32,
@@ -1589,7 +1565,7 @@ impl DeflateConfig {
     /// Returns [`ReturnCode::STREAM_ERROR`] if any parameter is out of range; see
     /// [`validate_deflate_params`], which this delegates to.
     ///
-    /// Ported from `deflate.c` L419-L439.
+    /// Mirrors `deflate.c` L419-L439.
     pub fn validate(self) -> Result<ValidatedDeflateConfig, ReturnCode> {
         validate_deflate_params(
             self.level,
@@ -1606,7 +1582,7 @@ impl Default for DeflateConfig {
     /// method [`Z_DEFLATED`], `windowBits` [`MAX_WBITS`], `memLevel`
     /// [`DEF_MEM_LEVEL`] and strategy [`Z_DEFAULT_STRATEGY`].
     ///
-    /// Ported from `deflate.c` L379-L383.
+    /// Mirrors `deflate.c` L379-L383.
     fn default() -> Self {
         Self::new(Z_DEFAULT_COMPRESSION)
     }
@@ -1619,10 +1595,38 @@ impl Default for DeflateConfig {
 /// point: `level` no longer carries the magic `-1`, `window_bits` no longer
 /// carries the container, and the container is a [`Wrap`] rather than a sign and
 /// an offset. [`validate_deflate_params`] and [`DeflateConfig::validate`] are the
-/// two functions that produce one, and they are the only places the ranges
-/// documented on the fields are established -- the fields themselves are public
-/// so that `deflate/state.rs` can read them without ceremony, which does mean a
-/// caller inside the crate could assemble one by hand and is trusted not to.
+/// two functions that *establish* the ranges documented on the fields below.
+///
+/// # The name is a provenance hint, not a proof -- read this before relying on it
+///
+/// **Every field is `pub`, and the type itself is `pub`, so any crate -- not just
+/// this one -- can assemble an instance by hand with arbitrary values and never go
+/// through validation at all.** The type is `Copy` with no private member, so
+/// there is no seal to defeat. Do not read "Validated" as a compiler-enforced
+/// invariant: it records where a value *normally* comes from, and nothing more.
+///
+/// The fields are public because `deflate/state.rs` reads them directly, which
+/// keeps `DeflateState::new` free of accessor noise. The cost of that choice is
+/// exactly the forgeability above, and it is stated here rather than glossed as
+/// "trusted not to".
+///
+/// What follows from it, concretely:
+///
+/// * [`DeflateState::new`](crate::deflate::state::DeflateState::new) is the one
+///   consumer that depends on these ranges -- it sizes the window, the hash
+///   chains and the pending buffer from `window_bits` and `mem_level`. Reaching it
+///   with a forged configuration is a caller error, not a memory-safety hole:
+///   `#![forbid(unsafe_code)]` still holds, so the worst outcome is a wrong-sized
+///   allocation, a rejected request, or a panic from a bounds check -- never
+///   undefined behaviour.
+/// * Anything that receives one of these from outside this crate should treat it
+///   as an ordinary struct of five numbers. If a future consumer needs a value it
+///   can actually trust, it must re-run [`validate_deflate_params`] itself.
+///
+/// Making the fields `pub(crate)` behind read-only accessors would convert the
+/// hint into a guarantee, and it is the better design. It is not done here because
+/// the C ABI facade that consumes this type has not landed yet, so narrowing the
+/// surface now could break a consumer that cannot be inspected.
 ///
 /// `deflate/state.rs` derives the rest of the state layout from these five
 /// numbers, in the order `deflate.c` L447-L456 and L528-L530 do. The formula for the total
@@ -1630,7 +1634,7 @@ impl Default for DeflateConfig {
 /// (memLevel + 9))` bytes, which is 128 KiB plus 128 KiB at the defaults, plus a
 /// few kilobytes of small objects.
 ///
-/// Ported from the fields `deflateInit2_` assigns at `deflate.c` L447-L456 and
+/// Mirrors the fields `deflateInit2_` assigns at `deflate.c` L447-L456 and
 /// L528-L530.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValidatedDeflateConfig {
@@ -1674,7 +1678,7 @@ pub struct ValidatedDeflateConfig {
 /// `0 ..= 4`, or a `windowBits` that names no window (see
 /// [`decode_deflate_window_bits`] for that table).
 ///
-/// Ported from `deflate.c` L419-L439.
+/// Mirrors `deflate.c` L419-L439.
 pub fn validate_deflate_params(
     level: i32,
     method: i32,
@@ -1698,21 +1702,17 @@ pub fn validate_deflate_params(
     })
 }
 
-// -----------------------------------------------------------------------------
-//  Decompression configuration
-// -----------------------------------------------------------------------------
-
 /// The single parameter of `inflateInit2_`, as requested by the caller.
 ///
 /// `window_bits` is held exactly as passed, container encoding and all; see
 /// [`decode_inflate_window_bits`] for what the encoding means and
 /// [`InflateConfig::validate`] for the checks.
 ///
-/// Ported from `inflateInit2_`, `zlib.h` L1911-L1912 and `inflate.c` L173.
+/// Mirrors `inflateInit2_`, `zlib.h` L1911-L1912 and `inflate.c` L173.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InflateConfig {
     /// The window exponent with the wrap request encoded in it: `8 ..= 15` for
-    /// zlib, `-8 ..= -15` for raw, `+16` for gzip only, `+32` for automatic
+    /// zlib, `-15 ..= -8` for raw, `+16` for gzip only, `+32` for automatic
     /// detection, and `0` for "take the window size from the stream header".
     pub window_bits: i32,
 }
@@ -1735,7 +1735,7 @@ impl InflateConfig {
     /// Returns [`ReturnCode::STREAM_ERROR`] for a `windowBits` that names no
     /// window; see [`decode_inflate_window_bits`].
     ///
-    /// Ported from `inflate.c` L145-L161.
+    /// Mirrors `inflate.c` L145-L161.
     pub fn validate(self) -> Result<ValidatedInflateConfig, ReturnCode> {
         let (wrap, window_bits) = decode_inflate_window_bits(self.window_bits)?;
         Ok(ValidatedInflateConfig { wrap, window_bits })
@@ -1749,7 +1749,7 @@ impl Default for InflateConfig {
     /// `uncompress` and `uncompress2` use this configuration, since both go
     /// through `inflateInit` (`uncompr.c` L51).
     ///
-    /// Ported from `inflate.c` L214-L217.
+    /// Mirrors `inflate.c` L214-L217.
     fn default() -> Self {
         Self::new(DEF_WBITS)
     }
@@ -1758,9 +1758,26 @@ impl Default for InflateConfig {
 /// A decompression configuration that has passed `inflateReset2`'s checks, with
 /// the wrap request separated from the window exponent.
 ///
-/// Construct one with [`InflateConfig::validate`]. `inflate/state.rs` stores
+/// [`InflateConfig::validate`] is what *establishes* the ranges documented on the
+/// two fields below. `inflate/state.rs` stores
 /// [`InflateWrap::as_inflate_wrap`] of the wrap in its `wrap` field and the
 /// exponent in `wbits`, as `inflate.c` L168-L169 does.
+///
+/// # The name is a provenance hint, not a proof
+///
+/// The same caveat that applies to [`ValidatedDeflateConfig`] applies here, for
+/// the same reason: **both fields are `pub` and the type is `Copy` with no private
+/// member, so any crate can build one by hand with arbitrary values without ever
+/// calling [`InflateConfig::validate`].** "Validated" records where a value
+/// normally comes from; it is not a compiler-enforced invariant.
+///
+/// [`InflateState::with_validated_config`](crate::inflate::state::InflateState::with_validated_config)
+/// is the consumer that depends on the ranges, and it is where a forged value
+/// would land. Because `#![forbid(unsafe_code)]` still holds, the worst outcome is
+/// a wrong-sized window or a panic from a bounds check -- never undefined
+/// behaviour. Any consumer outside this crate that needs a value it can trust must
+/// re-run [`InflateConfig::validate`] itself. See
+/// [`ValidatedDeflateConfig`] for why the fields are not `pub(crate)` today.
 ///
 /// Ported from `inflate.c` L145-L169.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1781,7 +1798,7 @@ impl ValidatedInflateConfig {
     /// True exactly when [`window_bits`](Self::window_bits) is zero, which is the
     /// state `inflate.c` L514 and L540 both test for before filling it in.
     ///
-    /// Ported from `inflate.c` L540.
+    /// Mirrors `inflate.c` L540.
     #[must_use]
     pub const fn window_size_from_header(self) -> bool {
         self.window_bits == 0
@@ -1812,7 +1829,7 @@ impl ValidatedInflateConfig {
     /// Returns [`ReturnCode::DATA_ERROR`] when the header advertises a window
     /// larger than [`MAX_WBITS`] or larger than the one requested.
     ///
-    /// Ported from `inflate.c` L539-L546.
+    /// Mirrors `inflate.c` L539-L546.
     pub fn resolve_zlib_header_window_bits(self, header_window_bits: u8) -> Result<u8, ReturnCode> {
         // `inflate.c` L540-L541.
         let effective = if self.window_size_from_header() {
@@ -1838,7 +1855,7 @@ impl ValidatedInflateConfig {
     /// largest one (`inflate.c` L514-L515). Infallible for that reason -- unlike
     /// the zlib case, there is no advertised size that could exceed the request.
     ///
-    /// Ported from `inflate.c` L514-L515.
+    /// Mirrors `inflate.c` L514-L515.
     #[must_use]
     pub const fn resolve_gzip_window_bits(self) -> u8 {
         if self.window_size_from_header() {
@@ -1848,10 +1865,6 @@ impl ValidatedInflateConfig {
         }
     }
 }
-
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1875,7 +1888,7 @@ mod tests {
 
     /// Integers that no parameter of any kind accepts, including both extremes of
     /// the type. `i32::MIN` is the input whose negation is not representable --
-    /// the one place a faithful port of `windowBits = -windowBits` could overflow
+    /// the one place a faithful mirror of `windowBits = -windowBits` could overflow
     /// -- and `i32::MAX` is the mirror image for the `- 16` and `>> 4` paths.
     const WILD: [i32; 8] = [
         i32::MIN,
@@ -1887,10 +1900,6 @@ mod tests {
         i32::MAX - 1,
         i32::MAX,
     ];
-
-    // -------------------------------------------------------------------------
-    //  Constants
-    // -------------------------------------------------------------------------
 
     #[test]
     fn public_constants_carry_the_header_values() {
@@ -1963,10 +1972,6 @@ mod tests {
         assert_eq!(INFLATE_WRAP_MASK_LIMIT, 48);
     }
 
-    // -------------------------------------------------------------------------
-    //  Method
-    // -------------------------------------------------------------------------
-
     #[test]
     fn method_accepts_only_deflated() {
         assert_eq!(Method::from_raw(Z_DEFLATED), Some(Method::Deflated));
@@ -1986,10 +1991,6 @@ mod tests {
             assert_eq!(Method::try_from(raw), Err(BAD_PARAM));
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  Strategy
-    // -------------------------------------------------------------------------
 
     /// The five strategies with the exact `int` `zlib.h` L200-L204 gives each and
     /// its reference spelling, in value order.
@@ -2039,10 +2040,6 @@ mod tests {
             assert_eq!(Strategy::try_from(raw), Err(BAD_PARAM));
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  Flush
-    // -------------------------------------------------------------------------
 
     /// The seven flush modes with their `int`s, their spellings, and whether
     /// `deflate` accepts them (`zlib.h` L172-L178, `deflate.c` L985).
@@ -2109,10 +2106,6 @@ mod tests {
         assert_eq!(Flush::Block.as_raw(), Z_BLOCK);
     }
 
-    // -------------------------------------------------------------------------
-    //  Level and memory level
-    // -------------------------------------------------------------------------
-
     #[test]
     fn level_boundaries_match_the_reference() {
         // `Z_DEFAULT_COMPRESSION` resolves to 6 rather than being refused, because
@@ -2162,10 +2155,6 @@ mod tests {
             assert_eq!(validate_mem_level(mem_level), Err(BAD_PARAM));
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  Wrap encodings
-    // -------------------------------------------------------------------------
 
     #[test]
     fn deflate_wrap_uses_the_zero_one_two_encoding() {
@@ -2252,10 +2241,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  The deflate `windowBits` decode
-    // -------------------------------------------------------------------------
-
     #[test]
     fn deflate_window_bits_accepts_the_three_containers() {
         // A zlib request is the exponent itself, 9..=15.
@@ -2336,10 +2321,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  The inflate `windowBits` decode
-    // -------------------------------------------------------------------------
-
     #[test]
     fn inflate_window_bits_accepts_four_wrap_requests() {
         // zlib: 8..=15, and note that 8 is *not* promoted.
@@ -2349,7 +2330,7 @@ mod tests {
                 Ok((InflateWrap::Zlib, exponent))
             );
         }
-        // raw: -8..=-15, and -8 is accepted where deflate refuses it.
+        // raw: -15..=-8, and -8 is accepted where deflate refuses it.
         for exponent in 8u8..=15 {
             assert_eq!(
                 decode_inflate_window_bits(-i32::from(exponent)),
@@ -2469,10 +2450,6 @@ mod tests {
         assert_eq!(decode_inflate_window_bits(24), Ok((InflateWrap::Gzip, 8)));
     }
 
-    // -------------------------------------------------------------------------
-    //  inflateBack
-    // -------------------------------------------------------------------------
-
     /// `inflateBackInit_` takes `8..=15` and nothing else: no container encoding,
     /// no zero, no negatives (`infback.c` L33-L35).
     #[test]
@@ -2502,10 +2479,6 @@ mod tests {
             );
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  Configurations
-    // -------------------------------------------------------------------------
 
     #[test]
     fn deflate_defaults_are_the_deflate_init_call() {
@@ -2710,10 +2683,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  Header window-size resolution
-    // -------------------------------------------------------------------------
-
     #[test]
     fn zlib_header_window_size_is_adopted_or_refused() {
         let from_header = ValidatedInflateConfig {
@@ -2800,10 +2769,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  Overflow safety
-    // -------------------------------------------------------------------------
-
     /// Every fallible entry point must refuse the extremes of `i32` rather than
     /// overflowing. `i32::MIN` is the interesting one: the reference's
     /// `windowBits = -windowBits` would be undefined behaviour for it in C and a
@@ -2837,10 +2802,6 @@ mod tests {
         assert_eq!(decode_inflate_window_bits(-15), Ok((InflateWrap::None, 15)));
         assert_eq!(decode_inflate_window_bits(-16), Err(BAD_PARAM));
     }
-
-    // -------------------------------------------------------------------------
-    //  Test-only helper
-    // -------------------------------------------------------------------------
 
     /// A fixed-capacity list of `i32`s, so the rejection tables can be assembled
     /// from ranges without an allocator: the crate is `no_std` and does not link

@@ -1,11 +1,11 @@
-//! The fixed Huffman decode tables, transcribed verbatim from `inffixed.h`.
+//! The fixed Huffman decode tables, transcribed value for value from `inffixed.h`.
 //!
 //! `inffixed.h` L1-L2 carries the banner "table for decoding fixed codes / Generated
 //! automatically by `makefixed()`", and L5-L8 warns that the file "should *not* be
 //! used by applications", that it is part of the implementation of this library, and
-//! that it is subject to change. Both statements carry over unchanged. Every value
-//! below is a transcription of that machine-written header, and none of it is part of
-//! the C ABI: a consumer reaches these tables only by decompressing a block that was
+//! that it is subject to change. Both statements carry over unchanged. Every
+//! entry below is an element-for-element transcription of that machine-written header,
+//! and none of it is part of the C ABI: a consumer reaches these tables only by decompressing a block that was
 //! encoded with the fixed codes.
 //!
 //! # What the two tables are
@@ -43,8 +43,13 @@
 //! header is **not** what `inflate_table` produces.
 //!
 //! Rebuilding [`lenfix`], whether at run time or in a `const` evaluation, would
-//! therefore yield a table that differs from the one every existing zlib build
-//! decodes with. The committed bytes are the contract: they are transcribed here, and
+//! therefore yield a table that differs from the committed one -- and the committed
+//! one is what a **default** zlib build decodes with. That qualifier matters: a
+//! build compiled with `-DBUILDFIXED` does not use `inffixed.h` at all, because
+//! `inftrees.c` L11 and L313-L365 make `inflate_fixed` construct the tables at run
+//! time instead, which is precisely the generated form that differs. So the claim is
+//! about the default configuration this port implements, not about every zlib build
+//! that exists. The committed bytes are the contract: they are transcribed here, and
 //! the substitution is pinned by the `makefixed_substituted_the_invalid_code_marker`
 //! test below, so that no later change can quietly turn this module into a generated
 //! one. `distfix` needs no such caveat -- `inftrees.c` L416 prints its `op`
@@ -55,7 +60,7 @@
 //! These tables are `const` data, materialised by the compiler. `inftrees.c`
 //! L313-L352 offers the alternative: a `BUILDFIXED` build that constructs them on
 //! first use behind the `z_once_t` at `inftrees.c` L325 and which, as `inftrees.c`
-//! L314-L319 warns, is not thread-safe when atomics are unavailable. This port
+//! L314-L319 warns, is not thread-safe when atomics are unavailable. This implementation
 //! implements the default configuration only, so there is no `static mut`, no
 //! `Once`, no `OnceLock`, no interior mutability and no `<stdatomic.h>` dependency to
 //! inherit. Two consequences are worth knowing:
@@ -70,20 +75,21 @@
 //!
 //! The two constants keep their C names, lowercase and unchanged, so that the
 //! element-for-element comparison in
-//! `crates/zlib-rs-differential/tests/table_equality.rs` reads as a direct diff
-//! against the header. That is the sole reason each carries a narrowly scoped
+//! the planned `crates/zlib-rs-differential/tests/table_equality.rs` will read as a
+//! direct diff against the header. That is the sole reason each carries a narrowly scoped
 //! `#[allow(non_upper_case_globals)]`.
 //!
 //! The header prints `lenfix` seven entries to a line and `distfix` six
 //! (`inftrees.c` L404 and L415). That grouping is deliberately not reproduced:
 //! `.rustfmt.toml` states the policy for exactly these tables -- they "are reflowed
 //! like any other array literal" -- and `cargo fmt` lays a `[Code; 512]` out one
-//! entry to a line. Fidelity is guaranteed mechanically instead of visually. The
-//! transcription was extracted from `inffixed.h` by script, and the tests below
-//! re-check the declared sizes, the endpoints, the first printed row of each table,
-//! the substituted entries, the legal shape of every `op` and `bits` field, the
-//! replication structure a root table must have, and the entry counts implied by
-//! RFC 1951 §3.2.6.
+//! entry to a line. The two files therefore do not agree character for character; they
+//! agree value for value, in the same order, and that is what is checked.
+//!
+//! The verification path is the test module at the foot of this file. It re-checks the
+//! declared sizes, the endpoints, the first printed row of each table, the substituted
+//! entries, the legal shape of every `op` and `bits` field, the replication structure a
+//! root table must have, and the entry counts implied by RFC 1951 §3.2.6.
 
 use super::inftrees::{Code, FIXED_DISTBITS, FIXED_LENBITS};
 
@@ -682,6 +688,11 @@ pub const distfix: [Code; 32] = [
 const _: () = assert!(lenfix.len() == 1 << FIXED_LENBITS);
 const _: () = assert!(distfix.len() == 1 << FIXED_DISTBITS);
 
+// Fixture indexing: every index below is a literal into a fixture this module just built,
+// so each one is provably in range. `clippy::indexing_slicing` is denied workspace-wide and
+// is relaxed HERE ONLY, on the test module -- not through a clippy.toml key, which would be a
+// field the 1.80 floor does not recognise and would abort the whole lint run.
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::{distfix, lenfix, Code, FIXED_DISTBITS, FIXED_LENBITS};

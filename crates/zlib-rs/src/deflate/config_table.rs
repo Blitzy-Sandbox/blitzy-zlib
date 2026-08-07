@@ -14,16 +14,9 @@
 //! ```
 //!
 //! and closes it with a caveat that is repeated on [`CONFIGURATION_TABLE`]
-//! itself (L127-L130):
+//! itself (L127-L130).
 //!
-//! ```text
-//! /* Note: the deflate() code requires max_lazy >= MIN_MATCH and max_chain >= 4
-//!  * For deflate_fast() (levels <= 3) good is ignored and lazy has a different
-//!  * meaning.
-//!  */
-//! ```
-//!
-//! # Why these forty numbers are the most load-bearing constants in the port
+//! # Why these forty numbers are the most load-bearing constants in the implementation
 //!
 //! RFC 1951 constrains the DEFLATE *format*; it says nothing about which of the
 //! several valid encodings of a given input an encoder should choose. Those
@@ -38,8 +31,9 @@
 //! for essentially every input. Since byte-identical output against the C
 //! reference is an acceptance criterion of this port, a "tuned", interpolated or
 //! formula-derived table is a defect even when it compresses better.
-//! `crates/zlib-rs-differential/tests/table_equality.rs` compares
-//! [`CONFIGURATION_TABLE`] against the C array element for element, and the
+//! The planned `crates/zlib-rs-differential/tests/table_equality.rs` will compare
+//! [`CONFIGURATION_TABLE`] against the C array element for element -- it has not landed, so
+//! nothing checks the transcription automatically today -- and the
 //! byte-identity matrix exercises all ten levels; the tests at the end of this
 //! file restate the forty numbers independently so that a transcription slip
 //! fails here, in the cheapest possible place, rather than in a compressed
@@ -73,11 +67,11 @@
 //! relaxation, for the same reason, that `deflate/algorithm.rs` records on its
 //! own `Flush` re-export.
 //!
-//! # `FASTEST` is deliberately not ported
+//! # `FASTEST` is deliberately not implemented
 //!
 //! `deflate.c` declares **two** tables. L107-L110, under `#ifdef FASTEST`, is a
 //! two-entry table; L112-L124, under the `#else`, is the ten-entry table this
-//! module carries. Only the second is ported, and `FASTEST` is not reachable as a
+//! module carries. Only the second is implemented, and `FASTEST` is not reachable as a
 //! runtime option, an environment variable or a Cargo feature.
 //!
 //! That is not a simplification, it is a correctness requirement. `FASTEST` is a
@@ -107,17 +101,7 @@ use crate::deflate::algorithm::CompressFunc::{Fast, Slow, Stored};
 /// One row of [`CONFIGURATION_TABLE`]: the tuning for a single compression
 /// level.
 ///
-/// Port of `struct config_s` (L98-L104):
-///
-/// ```c
-/// typedef struct config_s {
-///    ush good_length; /* reduce lazy search above this match length */
-///    ush max_lazy;    /* do not perform lazy search above this match length */
-///    ush nice_length; /* quit search above this match length */
-///    ush max_chain;
-///    compress_func func;
-/// } config;
-/// ```
+/// Mirrors `struct config_s` (L98-L104).
 ///
 /// The four numeric members keep C's field names exactly, and their type is
 /// [`u16`] because `ush` is `unsigned short` (`zutil.h` L45). They are declared
@@ -142,11 +126,9 @@ use crate::deflate::algorithm::CompressFunc::{Fast, Slow, Stored};
 /// which the tests use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
-    /// `ush good_length` -- "reduce lazy search above this match length"
-    /// (L99).
+    /// Above this previous-match length the lazy search is cut short (L99).
     ///
-    /// `s->good_match` (`deflate.h` L195-L196, "Use a faster search when the
-    /// previous match is longer than this"). Under the comment "Do not waste too
+    /// Loaded into `s->good_match` (`deflate.h` L195-L196). Under the comment "Do not waste too
     /// much time if we already have a good match", `longest_match` cuts its
     /// remaining chain budget to a quarter -- `chain_length >>= 2`, not a halving
     /// -- once the previous match already reached this length (L1422-L1425). It
@@ -157,13 +139,11 @@ pub struct Config {
     /// is transcribed rather than reconstructed.
     pub good_length: u16,
 
-    /// `ush max_lazy` -- "do not perform lazy search above this match length"
-    /// (L100).
+    /// The match length at or above which no lazy search is attempted (L100).
     ///
-    /// `s->max_lazy_match` (`deflate.h` L181-L185, "Attempt to find a better
-    /// match only when the current match is strictly smaller than this value.
-    /// This mechanism is used only for compression levels >= 4"), read by
-    /// `deflate_slow` at L1988.
+    /// Loaded into `s->max_lazy_match` (`deflate.h` L181-L185): a better match is sought
+    /// only while the current one is strictly shorter than this, which is the mechanism
+    /// levels 4 and above use. Read by `deflate_slow` at L1988.
     ///
     /// C gives the same field a second name for the other three levels --
     /// `#define max_insert_length max_lazy_match` (`deflate.h` L186-L190) --
@@ -173,10 +153,10 @@ pub struct Config {
     /// refers to.
     pub max_lazy: u16,
 
-    /// `ush nice_length` -- "quit search above this match length" (L101).
+    /// The match length at which the chain walk quits early (L101).
     ///
-    /// `s->nice_match` (`deflate.h` L198, "Stop searching when current match
-    /// exceeds this"). `longest_match` breaks out of the chain walk as soon as it
+    /// Loaded into `s->nice_match` (`deflate.h` L198). `longest_match` breaks out of the
+    /// chain walk as soon as it
     /// has a match this long -- `if (len >= nice_match) break;` (L1517) -- having
     /// first clamped the threshold down to the available lookahead, because not
     /// doing so would "make deflate deterministic" fail (L1426-L1429).
@@ -186,12 +166,12 @@ pub struct Config {
     /// so that the early exit only ever fires on a maximal match.
     pub nice_length: u16,
 
-    /// `ush max_chain` (L102) -- the field C leaves uncommented.
+    /// The hard limit on how far a hash chain is walked (L102) -- the one field the C
+    /// table leaves uncommented.
     ///
-    /// `s->max_chain_length` (`deflate.h` L175-L179, "To speed up deflation,
-    /// hash chains are never searched beyond this length. A higher limit
-    /// improves compression ratio but degrades the speed"), copied into
-    /// `longest_match`'s chain counter at L1390.
+    /// Loaded into `s->max_chain_length` (`deflate.h` L175-L179): a higher limit improves
+    /// the compression ratio and costs speed. Copied into `longest_match`'s chain counter
+    /// at L1390.
     ///
     /// It is the single strongest determinant of which match is found, because
     /// the hash chain is walked newest-first: truncating it earlier does not
@@ -202,7 +182,7 @@ pub struct Config {
 
     /// `compress_func func` (L103) -- which compressor this level runs.
     ///
-    /// C stores a function address; this port stores a `CompressFunc`
+    /// C stores a function address; this implementation stores a `CompressFunc`
     /// discriminant, because a compressor here is generic over the stream's
     /// allocator and no single monomorphic `fn` pointer can name one. That
     /// decision, and the two properties it has to preserve, are documented on
@@ -228,32 +208,9 @@ pub struct Config {
 
 /// The ten per-level tuning rows, transcribed digit for digit from L112-L124.
 ///
-/// Port of the `#else` branch of the two tables at L106-L125:
+/// Mirrors the `#else` branch of the two tables at L106-L125.
 ///
-/// ```c
-/// local const config configuration_table[10] = {
-/// /*      good lazy nice chain */
-/// /* 0 */ {0,    0,  0,    0, deflate_stored},  /* store only */
-/// /* 1 */ {4,    4,  8,    4, deflate_fast}, /* max speed, no lazy matches */
-/// /* 2 */ {4,    5, 16,    8, deflate_fast},
-/// /* 3 */ {4,    6, 32,   32, deflate_fast},
-///
-/// /* 4 */ {4,    4, 16,   16, deflate_slow},  /* lazy matches */
-/// /* 5 */ {8,   16, 32,   32, deflate_slow},
-/// /* 6 */ {8,   16, 128, 128, deflate_slow},
-/// /* 7 */ {8,   32, 128, 256, deflate_slow},
-/// /* 8 */ {32, 128, 258, 1024, deflate_slow},
-/// /* 9 */ {32, 258, 258, 4096, deflate_slow}}; /* max compression */
-/// ```
-///
-/// C's own caveat on these values, from L127-L130:
-///
-/// ```text
-/// /* Note: the deflate() code requires max_lazy >= MIN_MATCH and max_chain >= 4
-///  * For deflate_fast() (levels <= 3) good is ignored and lazy has a different
-///  * meaning.
-///  */
-/// ```
+/// C's own caveat on these values, from L127-L130.
 ///
 /// Read that caveat as scoped, not as an invariant of the table: levels 0 to 3
 /// carry `max_lazy` values of 0, 4, 5 and 6, three of which are below
@@ -268,7 +225,7 @@ pub struct Config {
 ///
 /// C indexes this array directly with `s->level` at all five of its read sites,
 /// which is safe there because `deflateInit2_` (L434-L438) and `deflateParams`
-/// (L786-L788) have already rejected anything outside `0..=9`. This port
+/// (L786-L788) have already rejected anything outside `0..=9`. This implementation
 /// establishes the same range in `crate::config::normalize_deflate_level`, and
 /// then reaches the row through `config_for_level` so that no library path can
 /// panic even if a future caller slipped past that check.
@@ -301,7 +258,7 @@ pub const CONFIGURATION_TABLE: [Config; 10] = [
 /// C writes `configuration_table[s->level]` at every one of its five read sites
 /// (L689-L692, L789, L791, L809-L812, L1220) and that is sound there, because
 /// `deflateInit2_` (L434-L438) and `deflateParams` (L786-L788) both reject a
-/// level outside `0..=9` before any of them runs -- in this port, through
+/// level outside `0..=9` before any of them runs -- in this implementation, through
 /// `crate::config::normalize_deflate_level`. This function preserves that
 /// behaviour for every level C accepts while removing the panic path that a raw
 /// `CONFIGURATION_TABLE[level]` would leave in a library that must not abort a
@@ -344,10 +301,11 @@ pub(crate) fn config_for_level(level: i32) -> &'static Config {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
+// Fixture indexing: every index below is a literal into a fixture this module just built,
+// so each one is provably in range. `clippy::indexing_slicing` is denied workspace-wide and
+// is relaxed HERE ONLY, on the test module -- not through a clippy.toml key, which would be a
+// field the 1.80 floor does not recognise and would abort the whole lint run.
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::{config_for_level, CompressFunc, Config, CONFIGURATION_TABLE};
@@ -377,10 +335,6 @@ mod tests {
     /// first level at which the `max_lazy >= MIN_MATCH` half of C's caveat at
     /// L127-L128 actually binds.
     const FIRST_LAZY_LEVEL: usize = 4;
-
-    // -------------------------------------------------------------------------
-    //  Transcription fidelity -- the whole point of this module
-    // -------------------------------------------------------------------------
 
     /// Every row of [`CONFIGURATION_TABLE`] equals the corresponding row of
     /// L112-L124, field for field.
@@ -412,10 +366,6 @@ mod tests {
         assert_eq!(CONFIGURATION_TABLE.len(), 10);
         assert_eq!(EXPECTED.len(), CONFIGURATION_TABLE.len());
     }
-
-    // -------------------------------------------------------------------------
-    //  The level-to-compressor grouping -- deflate.c L789-L792 depends on it
-    // -------------------------------------------------------------------------
 
     /// Level 0 stores, levels 1 to 3 run `deflate_fast`, levels 4 to 9 run
     /// `deflate_slow` -- exactly the three distinct function addresses
@@ -464,10 +414,6 @@ mod tests {
         assert_ne!(CONFIGURATION_TABLE[3].func, CONFIGURATION_TABLE[4].func);
         assert_ne!(CONFIGURATION_TABLE[0].func, CONFIGURATION_TABLE[9].func);
     }
-
-    // -------------------------------------------------------------------------
-    //  C's caveat at L127-L130, applied over exactly the levels it binds
-    // -------------------------------------------------------------------------
 
     /// "the `deflate()` code requires ... `max_chain` >= 4" (L127), over every
     /// level that searches the hash chain at all.
@@ -567,10 +513,6 @@ mod tests {
             assert!(nice >= 0, "level {level}");
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  config_for_level
-    // -------------------------------------------------------------------------
 
     /// For every level C accepts, the accessor returns exactly the row a direct
     /// index would.

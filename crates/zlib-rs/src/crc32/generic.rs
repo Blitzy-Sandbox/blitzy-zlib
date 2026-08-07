@@ -79,14 +79,29 @@
 //!
 //! # Examples
 //!
-//! ```ignore
+//! ```
+//! use zlib_rs::crc32::{Crc32Backend, Generic};
+//!
 //! // A whole buffer in one call, with the conditioning the parent module applies.
-//! let state = crc32_generic(!0u32, b"123456789");
+//! let state = Generic::update(!0u32, b"123456789");
 //! assert_eq!(state ^ 0xffff_ffff, 0xcbf4_3926);
 //!
 //! // Resumable: the state carries across calls, so any split gives the same answer.
-//! assert_eq!(crc32_generic(crc32_generic(!0u32, b"12345"), b"6789"), state);
+//! assert_eq!(Generic::update(Generic::update(!0u32, b"12345"), b"6789"), state);
 //! ```
+//!
+//! The examples name the [`Generic`](super::Generic) backend rather than `crc32_generic`
+//! itself, because the free function is crate-private and the backend forwards to it
+//! unchanged.
+
+// Names that repeat their module's name are deliberate here: the C sources this module ports name
+// these entry points, and `crates/zlib-rs/src/lib.rs` re-exports several of them under exactly
+// these names, so renaming any of them to satisfy `clippy::module_name_repetitions` would cost the
+// traceability the port is judged on. The lint sits in `pedantic`, which this workspace denies, and
+// it fires on the declared 1.80 floor; upstream has since reclassified it, so the allowance is what
+// keeps the same lint gate passing on both toolchains. The same relaxation, for the same reason,
+// already appears in `config.rs`, `deflate/**`, `inflate/**` and `gz/**`.
+#![allow(clippy::module_name_repetitions)]
 
 use super::tables::CRC_TABLE;
 
@@ -139,13 +154,18 @@ fn crc32_byte(crc: u32, byte: u8) -> u32 {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
+/// use zlib_rs::crc32::{Crc32Backend, Generic};
+///
 /// // The published CRC-32 check value, computed through the parent module's conditioning.
-/// assert_eq!(crc32_generic(!0u32, b"123456789") ^ 0xffff_ffff, 0xcbf4_3926);
+/// assert_eq!(Generic::update(!0u32, b"123456789") ^ 0xffff_ffff, 0xcbf4_3926);
 ///
 /// // An empty slice is the identity on the state, so a zero-length flush is free.
-/// assert_eq!(crc32_generic(0x1234_5678, &[]), 0x1234_5678);
+/// assert_eq!(Generic::update(0x1234_5678, &[]), 0x1234_5678);
 /// ```
+///
+/// [`Generic`](super::Generic) forwards to this function unchanged and is the reachable
+/// name for it outside the subsystem.
 #[must_use]
 #[inline]
 pub fn crc32_generic(mut crc: u32, buf: &[u8]) -> u32 {
@@ -172,7 +192,7 @@ pub fn crc32_generic(mut crc: u32, buf: &[u8]) -> u32 {
 
 /// The byte-at-a-time backend: `crc32.c` L922-L940 with no wide path underneath it.
 ///
-/// A zero-sized marker -- the work is [`crc32_generic`], which callers inside the crate may also
+/// A zero-sized marker -- the work is `crc32_generic`, which callers inside the crate may also
 /// invoke directly. It exists so that backend selection in the parent module can name this path
 /// the same way it names the braided and vectorised ones, and so benchmarks can label it.
 ///
@@ -186,7 +206,7 @@ impl super::Crc32Backend for Generic {
     const NAME: &'static str = "generic";
 
     /// Folds `buf` into the already pre-conditioned state `crc` by forwarding, unchanged, to
-    /// [`crc32_generic`].
+    /// `crc32_generic`.
     #[inline]
     fn update(crc: u32, buf: &[u8]) -> u32 {
         crc32_generic(crc, buf)
@@ -266,7 +286,7 @@ mod tests {
             .fold(crc, |state, &byte| bitwise_byte(state, byte))
     }
 
-    /// Wrap [`crc32_generic`] in the conditioning that `crc32_z` applies at `crc32.c` L635 and
+    /// Wrap `crc32_generic` in the conditioning that `crc32_z` applies at `crc32.c` L635 and
     /// L940, so that a result can be compared against a published CRC-32 value.
     fn conditioned(bytes: &[u8]) -> u32 {
         crc32_generic(!0, bytes) ^ 0xffff_ffff

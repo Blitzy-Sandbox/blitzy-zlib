@@ -1,5 +1,5 @@
 //! Raw-DEFLATE decompression driven by caller-supplied input and output
-//! callbacks: the port of `infback.c` (all 579 lines of it).
+//! callbacks: the Rust counterpart of `infback.c` (all 579 lines of it).
 //!
 //! This module implements the three entry points `inflateBackInit_`
 //! (`infback.c` L25-L64), `inflateBack` (L191-L570) and `inflateBackEnd`
@@ -13,10 +13,10 @@
 //! the two is linked into an application, and "the interface with inffast.c is
 //! retained so that optimized assembler-coded versions of `inflate_fast()` can
 //! be used with either". That is why this module shares
-//! [`InflateState`](crate::inflate::state::InflateState),
-//! [`Mode`](crate::inflate::mode::Mode),
-//! [`inflate_table`](crate::inflate::inftrees::inflate_table) and
-//! `inflate_fast` with the [`inflate`](crate::inflate) subtree instead of
+//! [`InflateState`],
+//! [`Mode`],
+//! `inflate_table` and
+//! `inflate_fast` with the [`crate::inflate`] subtree instead of
 //! defining its own, and why it lives beside that subtree rather than inside it:
 //! only its *public entry points* are distinct.
 //!
@@ -35,7 +35,7 @@
 //!
 //! `inflate()` allocates and owns its window lazily. `inflateBack` does not
 //! allocate one at all -- `inflateBackInit_` stores the caller's pointer
-//! (`infback.c` L59) -- so the Rust port borrows it:
+//! (`infback.c` L59) -- so the Rust implementation borrows it:
 //! [`inflate_back_init`] builds the state through
 //! [`InflateState::with_borrowed_window`], which records the window as
 //! [`InflateWindow`]`::borrowed` and truncates it to exactly `1 << window_bits`
@@ -64,28 +64,23 @@
 //!
 //! ## Commit `09a1572` -- do not "restore" the deleted lines
 //!
-//! The baseline of this port is commit `09a1572`, "Fix `inflateBack()` bug that
+//! The baseline of this implementation is commit `09a1572`, "Fix `inflateBack()` bug that
 //! would fail to detect a too far back", whose message continues: "The bug would
 //! pass off an invalid deflate stream as good, and copy uninitialized memory
 //! contents to the output." It **deletes** two lines from the fast-path
-//! dispatch inside `case LEN:`, between the state restore and the call:
+//! dispatch inside `case LEN:`, between the `RESTORE()` and the
+//! `inflate_fast()` call:
 //!
 //! ```text
-//!  if (have >= 6 && left >= 258) {
-//!      RESTORE();
 //! -    if (state->whave < state->wsize)
 //! -        state->whave = state->wsize - left;
-//!      inflate_fast(strm, state->wsize);
-//!      LOAD();
-//!      break;
-//!  }
 //! ```
 //!
 //! Widening `whave` there tells the decoder that window bytes nobody wrote are
 //! valid history, which both accepts invalid streams and leaks uninitialised
-//! memory into the output. [`Backer::fast`] therefore does nothing whatsoever
+//! memory into the output. `Backer::fast` therefore does nothing whatsoever
 //! between restoring the cursors and calling `inflate_fast`, and this module
-//! never assigns `whave` anywhere except in [`Backer::room`], which is C's
+//! never assigns `whave` anywhere except in `Backer::room`, which is C's
 //! `ROOM()`.
 //!
 //! # Callback polarity, which is inverted between the two directions
@@ -96,7 +91,7 @@
 //! `Z_BUF_ERROR`, and `strm->next_in` is how the caller tells the two apart --
 //! it is null only when `in()` failed (`zlib.h` L1196-L1202).
 //!
-//! This port expresses both directions so that the polarity cannot be misread,
+//! This implementation expresses both directions so that the polarity cannot be misread,
 //! and the facade translates:
 //!
 //! | C | Here | Facade adapter must |
@@ -147,26 +142,38 @@
 //!
 //! | C construct | Here |
 //! |---|---|
-//! | `LOAD` / `RESTORE` (L69-L88) | no counterpart: the cursors *are* [`Backer`]'s fields, so there is nothing to spill |
-//! | `INITBITS` (L91-L95) | [`InflateState::init_bits`] |
-//! | `PULL` (L99-L109) | [`Backer::pull`] |
-//! | `PULLBYTE` (L113-L119) | [`Backer::pull_byte`] |
-//! | `NEEDBITS` (L124-L128) | [`Backer::need_bits`] |
-//! | `BITS` (L131-L132) | [`low_bits`] -- deliberately *not* [`InflateState::low_bits`]; see its note |
-//! | `DROPBITS` (L135-L139) | [`drop_bits`] |
-//! | `BYTEBITS` (L142-L146) | [`InflateState::byte_bits`] |
-//! | `ROOM` (L151-L162) | [`Backer::room`] |
-//! | `goto inf_leave` | [`Step::Leave`], funnelled into the single [`Backer::finish`] call site |
-//! | `inf_leave:` (L560-L568) | [`Backer::finish`] |
+//! | `LOAD` / `RESTORE` (L69-L88) | no counterpart: the cursors *are* `Backer`'s fields, so there is nothing to spill |
+//! | `INITBITS` (L91-L95) | `InflateState::init_bits` |
+//! | `PULL` (L99-L109) | `Backer::pull` |
+//! | `PULLBYTE` (L113-L119) | `Backer::pull_byte` |
+//! | `NEEDBITS` (L124-L128) | `Backer::need_bits` |
+//! | `BITS` (L131-L132) | `low_bits` -- deliberately *not* `InflateState::low_bits`; see its note |
+//! | `DROPBITS` (L135-L139) | `drop_bits` |
+//! | `BYTEBITS` (L142-L146) | `InflateState::byte_bits` |
+//! | `ROOM` (L151-L162) | `Backer::room` |
+//! | `goto inf_leave` | `Step::Leave`, funnelled into the single `Backer::finish` call site |
+//! | `inf_leave:` (L560-L568) | `Backer::finish` |
 //!
 //! # Visibility
 //!
-//! The three entry points and the two callback traits are `pub`, because
-//! `crates/libz-rs-sys/src/infback.rs` builds `inflateBackInit_`, `inflateBack`
+//! The three entry points and the two callback traits are `pub`, because the planned
+//! `crates/libz-rs-sys/src/infback.rs` will build `inflateBackInit_`, `inflateBack`
 //! and `inflateBackEnd` on top of them. Everything else is private. Nothing here
 //! is `#[no_mangle]`, `extern "C"` or `#[repr(C)]`: `zlib.map` lists
 //! `inflate_fast`, `inflate_table` and `inflate_fixed` in its `local:` block, and
 //! the safe core exports no symbol at all.
+//!
+//! [`InflateBackResult::next_in`]: crate::infback::InflateBackResult::next_in
+//! [`InflateWindow`]: crate::inflate::state::InflateWindow
+//! [`InflateWindow::absent`]: crate::inflate::state::InflateWindow::absent
+//! [`OutputFailure`]: crate::infback::OutputFailure
+//! [`inflate_back`]: crate::infback::inflate_back
+//! [`inflate_back_init`]: crate::infback::inflate_back_init
+
+// The definitions closing the module documentation above are link-reference definitions, not
+// prose: a module whose `mod` declaration carries an outer doc comment has its `//!` block
+// resolved in the scope of the DECLARING module, so an unqualified sibling name does not
+// resolve. See "Documentation lints" in `src/lib.rs` for the rule and the gate.
 
 use crate::allocate::Allocator;
 use crate::error::ReturnCode;
@@ -183,10 +190,6 @@ use crate::inflate::{
     MSG_MISSING_END_OF_BLOCK, MSG_TOO_MANY_SYMBOLS,
 };
 
-// -----------------------------------------------------------------------------
-//  Constants
-// -----------------------------------------------------------------------------
-
 /// Permutation of the code-length code lengths, RFC 1951 §3.2.7.
 ///
 /// A private copy rather than a shared one on purpose: `infback.c` L205-L206
@@ -195,7 +198,7 @@ use crate::inflate::{
 /// same table. Keeping that shape means a reviewer diffing this file against the
 /// reference finds the array where the reference puts it.
 ///
-/// Ported from `infback.c` L205-L206.
+/// Mirrors `infback.c` L205-L206.
 const ORDER: [u16; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
@@ -211,7 +214,7 @@ const CODES_ROOT_BITS: usize = 7;
 /// ENOUGH constants, which depend on those values". `ENOUGH_LENS` (852) and
 /// `ENOUGH_DISTS` (592) are sized for exactly these two widths, so changing
 /// either would overflow the arena that
-/// [`InflateState`](crate::inflate::state::InflateState) reserves.
+/// [`InflateState`] reserves.
 const LENS_ROOT_BITS: usize = 9;
 
 /// Root index width requested for the distance alphabet (`infback.c` L410).
@@ -259,10 +262,6 @@ const REPEAT_PREVIOUS_SYMBOL: u16 = 16;
 /// (`infback.c` L360-L365).
 const REPEAT_SHORT_ZERO_SYMBOL: u16 = 17;
 
-// -----------------------------------------------------------------------------
-//  Narrowing and bit helpers
-// -----------------------------------------------------------------------------
-//
 // C narrows freely between `unsigned`, `unsigned long` and pointers. Every such
 // narrowing here goes through one of the helpers below, so that no conversion
 // can panic in a debug build and each saturating fallback has one place to be
@@ -336,7 +335,7 @@ fn drop_bits<'a, A: Allocator<'a>>(state: &mut InflateState<'a, A>, count: u32) 
 
 /// Copies `count` bytes forward inside one buffer, one byte at a time.
 ///
-/// The port of the inner `do { *put++ = *from++; } while (--copy);` of
+/// The Rust counterpart of the inner `do { *put++ = *from++; } while (--copy);` of
 /// `infback.c` L539-L541, and of the `zmemcpy`-free half of the match copy.
 ///
 /// # Byte-at-a-time is required, not a simplification
@@ -378,10 +377,6 @@ fn copy_forward(window: &mut [u8], from: usize, to: usize, count: usize) -> bool
     }
     true
 }
-
-// -----------------------------------------------------------------------------
-//  The callback pair
-// -----------------------------------------------------------------------------
 
 /// The output callback declined to accept the bytes it was handed.
 ///
@@ -489,17 +484,12 @@ where
     }
 }
 
-// -----------------------------------------------------------------------------
-//  The return value
-// -----------------------------------------------------------------------------
-
 /// Everything C writes back through `z_stream` on the way out of `inflateBack`
 /// (`infback.c` L565-L569), plus the message it may have set at L214.
 ///
 /// C reaches the caller's stream through the `z_streamp` it was handed and
-/// assigns three fields. This port has no `z_stream` -- raw pointers stop at
-/// `crates/libz-rs-sys` -- so the same three values come back here for the
-/// facade to install.
+/// assigns three fields. This implementation has no `z_stream` and dereferences no
+/// pointer, so the same three values come back here for the facade to install.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InflateBackResult<'i> {
     /// The status C returns: [`ReturnCode::STREAM_END`],
@@ -534,10 +524,6 @@ pub struct InflateBackResult<'i> {
     /// publishable as `const char *` with no allocation.
     pub msg: Option<&'static str>,
 }
-
-// -----------------------------------------------------------------------------
-//  How a state arm ends
-// -----------------------------------------------------------------------------
 
 /// The two ways an arm of C's `switch (state->mode)` can end.
 ///
@@ -655,10 +641,6 @@ fn store_length_at_have<'a, A: Allocator<'a>>(
     true
 }
 
-// -----------------------------------------------------------------------------
-//  inflateBackInit_ -- `infback.c` L25-L64
-// -----------------------------------------------------------------------------
-
 /// Creates the decoder state [`inflate_back`] needs, borrowing the caller's
 /// window.
 ///
@@ -700,18 +682,31 @@ pub fn inflate_back_init<'a, A: Allocator<'a>>(
     InflateState::with_borrowed_window(window_bits, window, allocator)
 }
 
-// -----------------------------------------------------------------------------
-//  inflateBackEnd -- `infback.c` L572-L579
-// -----------------------------------------------------------------------------
-
 /// Releases everything the decoder state owns.
 ///
-/// The port of `inflateBackEnd` (`infback.c` L572-L579), declared at `zlib.h`
-/// L1208. C frees the state through the caller's `zfree` and clears
-/// `strm->state`; here, taking the state by value and dropping it does the
-/// first, and clearing the facade's `z_stream.state` is the facade's step. The
-/// window is *not* freed, in C or here, because the caller owns it -- dropping a
-/// borrowed [`InflateWindow`] only ends the borrow.
+/// The port of `inflateBackEnd` (`infback.c` L572-L579), declared at `zlib.h` L1208.
+///
+/// # What is released here, and what is not
+///
+/// C does two things: it calls `ZFREE(strm, strm->state)` -- the *caller's* `zfree`, applied to
+/// the enclosing state allocation -- and it sets `strm->state = Z_NULL`. This function does
+/// neither of those two things, and saying that dropping the value performs C's `zfree` would be
+/// wrong. Precisely:
+///
+/// * **This function** takes the state by value and calls
+///   [`InflateState::release`](crate::inflate::state::InflateState::release), which returns every
+///   buffer the state *owns* to **the allocator the state was constructed with**. The mechanism is
+///   `WindowBlock`'s destructor, which calls `try_deallocate_bytes` on the `Allocator` value it
+///   stored at allocation time -- so a block obtained from a caller's `zalloc` goes back through
+///   that same caller's `zfree`, and never through Rust's global allocator. `Buffer` records its
+///   owner's `AllocatorId` for exactly that reason, and `Buffer::release_to` refuses a block
+///   offered to the wrong allocator rather than corrupting the caller's heap.
+/// * **The facade** still has to free the allocation that *contains* the state and then clear
+///   `z_stream.state`, both through the caller's hooks. That half of `inflateBackEnd` cannot
+///   happen here, because this crate never allocated the container and holds no pointer to it.
+///
+/// The window is *not* freed, in C or here, because the caller owns it -- dropping a borrowed
+/// [`InflateWindow`] only ends the borrow.
 ///
 /// Always [`ReturnCode::OK`]. C's three failure conditions at L573-L574 are all
 /// unrepresentable for an owned [`InflateState`]: a null `strm`, a null
@@ -724,14 +719,10 @@ pub fn inflate_back_end<'a, A: Allocator<'a>>(state: InflateState<'a, A>) -> Ret
     ReturnCode::OK
 }
 
-// -----------------------------------------------------------------------------
-//  inflateBack -- `infback.c` L191-L570
-// -----------------------------------------------------------------------------
-
 /// Decompresses one complete raw DEFLATE stream, pulling input from `input` and
 /// pushing finished output to `output`.
 ///
-/// The port of `inflateBack` (`infback.c` L191-L570), declared at `zlib.h`
+/// The Rust counterpart of `inflateBack` (`infback.c` L191-L570), declared at `zlib.h`
 /// L1138-L1140. A raw stream is one with no zlib or gzip header and no trailer
 /// (`zlib.h` L1155-L1162): this function decodes RFC 1951 block structure only,
 /// and verifies no check value, because there is none to verify.
@@ -899,10 +890,6 @@ where
         msg: backer.msg,
     }
 }
-
-// -----------------------------------------------------------------------------
-//  The engine
-// -----------------------------------------------------------------------------
 
 /// The locals of C's `inflateBack` that outlive a single state arm
 /// (`infback.c` L193-L204).
@@ -1135,10 +1122,6 @@ where
     }
 }
 
-// -----------------------------------------------------------------------------
-//  The dispatcher -- `infback.c` L226-L558
-// -----------------------------------------------------------------------------
-
 impl<'i, I, O> Backer<'i, '_, I, O>
 where
     I: InflateBackInput<'i>,
@@ -1220,10 +1203,6 @@ where
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  TYPE -- `infback.c` L228-L260
-    // -------------------------------------------------------------------------
-
     /// Determines and dispatches the next block type, RFC 1951 §3.2.3.
     ///
     /// Reads the three-bit block header: one `BFINAL` bit and two `BTYPE` bits.
@@ -1275,10 +1254,6 @@ where
         Step::Continue
     }
 
-    // -------------------------------------------------------------------------
-    //  STORED -- `infback.c` L262-L292
-    // -------------------------------------------------------------------------
-
     /// Copies a stored (uncompressed) block from input to output,
     /// RFC 1951 §3.2.4.
     ///
@@ -1287,7 +1262,7 @@ where
     ///
     /// ★ `NEEDBITS(32)` is why the accumulator must be wider than 32 bits. C's
     /// `hold` is an `unsigned long`, 64 bits wide on every LP64 target -- which is
-    /// what the reference build this port is measured against uses -- and
+    /// what the reference build this implementation is measured against uses -- and
     /// [`InflateState::hold`] is a `u64` for exactly that reason. A 32-bit
     /// accumulator would shift the length out of the top as the complement came
     /// in. `BYTEBITS()` at L264 leaves at most 32 bits live, so after the pull
@@ -1373,10 +1348,6 @@ where
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Huffman code lookup -- `infback.c` L337-L341, L432-L446 and L486-L500
-// -----------------------------------------------------------------------------
-
 impl<'i, I, O> Backer<'i, '_, I, O>
 where
     I: InflateBackInput<'i>,
@@ -1385,7 +1356,7 @@ where
     /// Locates one code in the root table, pulling input until the entry it
     /// selects says it has enough bits.
     ///
-    /// The port of the bare `for (;;)` loops at `infback.c` L337-L341, L432-L436
+    /// The Rust counterpart of the bare `for (;;)` loops at `infback.c` L337-L341, L432-L436
     /// and L486-L490. Nothing is dropped here: the caller decides what the code
     /// actually cost, because a first-level entry may turn out to be a link into a
     /// second-level table.
@@ -1418,7 +1389,7 @@ where
     /// Locates one code, descending into a second-level table when the root entry
     /// is a link.
     ///
-    /// The port of `infback.c` L432-L447 (literal/length) and L486-L501
+    /// The Rust counterpart of `infback.c` L432-L447 (literal/length) and L486-L501
     /// (distance), which differ in exactly one place, L437 versus L491:
     ///
     /// | Table | C test | Why |
@@ -1473,10 +1444,6 @@ where
         Lookup::Found(here)
     }
 }
-
-// -----------------------------------------------------------------------------
-//  TABLE -- `infback.c` L294-L419
-// -----------------------------------------------------------------------------
 
 impl<'i, I, O> Backer<'i, '_, I, O>
 where
@@ -1817,10 +1784,6 @@ struct Repeat {
     count: usize,
 }
 
-// -----------------------------------------------------------------------------
-//  LEN -- `infback.c` L422-L543
-// -----------------------------------------------------------------------------
-
 impl<'i, I, O> Backer<'i, '_, I, O>
 where
     I: InflateBackInput<'i>,
@@ -2088,16 +2051,16 @@ where
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
 #[cfg(test)]
 // The workspace denies the panic family in library code, which is the whole point
 // of a module that decodes untrusted input; a test that cannot assert is useless,
 // so the harness opts back in here only, which is exactly what clippy.toml's
-// `allow-unwrap-in-tests`, `allow-panic-in-tests` and
-// `allow-indexing-slicing-in-tests` keys are for.
+// `allow-unwrap-in-tests` and `allow-panic-in-tests` keys are for.
+// Fixture indexing: every index below is a literal into a fixture this module just built,
+// so each one is provably in range. `clippy::indexing_slicing` is denied workspace-wide and
+// is relaxed HERE ONLY, on the test module -- not through a clippy.toml key, which would be a
+// field the 1.80 floor does not recognise and would abort the whole lint run.
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{
         inflate_back, inflate_back_end, inflate_back_init, low_bits, InflateBackInput,
@@ -2118,10 +2081,6 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    // -------------------------------------------------------------------------
-    //  Fixtures produced by the reference implementation
-    // -------------------------------------------------------------------------
-    //
     // Every byte string below was emitted by, or verified against, the C zlib in
     // this repository (through `zlib.compressobj(level, DEFLATED, -15)` and
     // `zlib.decompressobj(-15)`, which are that library). Each malformed fixture
@@ -2191,10 +2150,6 @@ mod tests {
     /// A literal `b'a'` then a length-258 match at distance 1: the maximal
     /// self-overlapping run, which only a byte-at-a-time copy reproduces.
     const RLE_MAXIMAL: &[u8] = &[0x4b, 0x1c, 0x05, 0x00];
-
-    // -------------------------------------------------------------------------
-    //  Test doubles for the two callbacks
-    // -------------------------------------------------------------------------
 
     /// An input source that hands out fixed-size pieces of one buffer, then
     /// declines.
@@ -2348,10 +2303,6 @@ mod tests {
             assert_eq!(outcome.avail_in, Some(0), "piece = {piece:?}");
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  A minimal fixed-Huffman writer, for streams whose exact shape matters
-    // -------------------------------------------------------------------------
 
     /// Narrows a value that is already known to be one byte wide.
     ///
@@ -2543,10 +2494,6 @@ mod tests {
         assert_eq!(block.finish(), TOO_FAR_BACK);
     }
 
-    // -------------------------------------------------------------------------
-    //  Round trips
-    // -------------------------------------------------------------------------
-
     #[test]
     fn a_fixed_block_round_trips_however_the_input_arrives() {
         assert_decodes(HELLO_FIXED, MAX_WBITS, HELLO);
@@ -2629,10 +2576,6 @@ mod tests {
 
         assert_eq!(inflate_back_end(state), ReturnCode::OK);
     }
-
-    // -------------------------------------------------------------------------
-    //  Window mechanics
-    // -------------------------------------------------------------------------
 
     #[test]
     fn output_longer_than_the_window_is_flushed_a_window_at_a_time() {
@@ -2719,10 +2662,6 @@ mod tests {
         assert_ne!(corrupt & 0xffff, (corrupt >> 16) ^ 0xffff);
     }
 
-    // -------------------------------------------------------------------------
-    //  ★ The `09a1572` regression -- the most important tests in this file
-    // -------------------------------------------------------------------------
-
     #[test]
     fn a_distance_reaching_past_valid_history_is_rejected_on_the_slow_path() {
         // Four bytes of input, so `have` is below `MIN_AVAIL_IN` at the `LEN`
@@ -2776,10 +2715,6 @@ mod tests {
         assert_eq!(outcome.output, HELLO);
     }
 
-    // -------------------------------------------------------------------------
-    //  Overlapping copies
-    // -------------------------------------------------------------------------
-
     #[test]
     fn a_distance_of_one_repeats_the_previous_byte() {
         // Length 258 at distance 1: the maximal run RFC 1951 can code. Every byte
@@ -2804,10 +2739,6 @@ mod tests {
 
         assert_decodes(&stream, MAX_WBITS, b"xyzxyzxyzxyzx");
     }
-
-    // -------------------------------------------------------------------------
-    //  Callback failure, and telling the two directions apart
-    // -------------------------------------------------------------------------
 
     #[test]
     fn an_input_failure_nulls_the_reported_input() {
@@ -2896,10 +2827,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  Initialisation and teardown
-    // -------------------------------------------------------------------------
-
     #[test]
     fn only_window_bits_eight_through_fifteen_are_accepted() {
         // `infback.c` L33-L35: a plain `windowBits < 8 || windowBits > 15`. None of
@@ -2965,10 +2892,6 @@ mod tests {
         assert_eq!(inflate_back_end(state), ReturnCode::OK);
         assert!(window.iter().all(|&byte| byte == 0x11));
     }
-
-    // -------------------------------------------------------------------------
-    //  The malformed-input battery
-    // -------------------------------------------------------------------------
 
     #[test]
     fn every_malformed_stream_reports_the_reference_message() {
@@ -3116,10 +3039,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  Fast-path thresholds
-    // -------------------------------------------------------------------------
-
     #[test]
     fn the_output_room_threshold_decodes_identically_on_either_side() {
         // `infback.c` L424 hands the decode to `inflate_fast` only while
@@ -3173,10 +3092,6 @@ mod tests {
             assert_eq!(outcome.output, expected, "piece = {piece}");
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  The callback traits themselves
-    // -------------------------------------------------------------------------
 
     /// Takes one chunk through the trait, by value.
     ///

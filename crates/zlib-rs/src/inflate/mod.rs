@@ -1,6 +1,6 @@
 //! The DEFLATE decompressor: `inflate()` and its eighteen public entry points.
 //!
-//! This module is the safe-Rust port of `inflate.c` (1413 lines), the driver that
+//! This module is the safe-Rust mirror of `inflate.c` (1413 lines), the driver that
 //! turns a zlib, gzip or raw DEFLATE byte stream back into the data it was made
 //! from. It owns the resumable state machine, the block and trailer states, and
 //! every function `zlib.h` declares with an `inflate` prefix.
@@ -19,10 +19,10 @@
 //! |---|---|---|
 //! | [`mode`] | `inflate.h` L20-L53 | the 32-state `inflate_mode` enum |
 //! | [`state`] | `inflate.h` L82-L126 | `struct inflate_state`, the bit accumulator, the window |
-//! | [`window`] | `inflate.c` L252-L296 | `updatewindow` |
+//! | `window` | `inflate.c` L252-L296 | `updatewindow` |
 //! | [`header`] | `inflate.c` L506-L706 | the zlib, gzip and dictionary header states |
 //! | [`inftrees`] | `inftrees.c` | `inflate_table`, `inflate_fixed`, [`inftrees::Code`] |
-//! | [`inffast`] | `inffast.c` | `inflate_fast`, the unrolled decode loop |
+//! | `inffast` | `inffast.c` | `inflate_fast`, the unrolled decode loop |
 //! | [`fixed_tables`] | `inffixed.h` | the RFC 1951 §3.2.6 fixed decode tables |
 //! | this file | `inflate.c` | everything else |
 //!
@@ -33,27 +33,16 @@
 //! # The resumable-state-machine contract
 //!
 //! The substance of `inflate.c` L392-L472, which is the reference's own and best
-//! description of how this works, restated for the port:
+//! description of how this works, restated here:
 //!
 //! `inflate()` processes as much input and generates as much output as it can
-//! before returning. Its state machine is structured so that every state either
-//! makes progress or returns:
-//!
-//! ```text
-//! loop { match state.mode {
-//!     ...
-//!     Mode::StateN => {
-//!         if not enough input data or output space to make progress { return; }
-//!         ... make progress ...
-//!         state.mode = Mode::StateM;
-//!     }
-//!     ...
-//! } }
-//! ```
-//!
-//! so when `inflate()` is called again the same state is attempted again, and if the
+//! before returning. Its state machine is one `loop` over one exhaustive `match`
+//! on [`Mode`], and every arm either returns without changing the mode -- because
+//! there is not enough input or output space to make progress -- or makes
+//! progress and assigns the next mode. So when `inflate()` is called again the
+//! same state is attempted again, and if the
 //! appropriate resources are provided the machine proceeds to the next state. The
-//! `NEEDBITS(n)` step -- [`InflateState::need_bits`] here -- is usually how a state
+//! `NEEDBITS(n)` step -- `InflateState::need_bits` here -- is usually how a state
 //! decides whether it can proceed or must return. The typical use of the bit macros
 //! is
 //!
@@ -98,7 +87,7 @@
 //! C copies six values into registers on entry (`inflate.c` L328-L336) and writes
 //! them back on the way out (L339-L347): the output cursor `put`, the output space
 //! `left`, the input cursor `next`, the input count `have`, and the accumulator pair
-//! `hold`/`bits`. This port has neither macro, because it has nowhere to copy from
+//! `hold`/`bits`. This implementation has neither macro, because it has nowhere to copy from
 //! and to:
 //!
 //! * `hold` and `bits` are fields of [`InflateState`], and every accumulator step is
@@ -115,7 +104,7 @@
 //! `SYNC` arm consumes nothing at all -- both are the first thing the dispatcher sees
 //! and both return immediately -- so writing the cursors back unconditionally is
 //! observationally identical to C, and the `Z_NEED_DICT` exit needs exactly that
-//! write-back anyway. See [`Step::Return`].
+//! write-back anyway. See `Step::Return`.
 //!
 //! # Visibility
 //!
@@ -124,8 +113,18 @@
 //! additionally declares `updatewindow`, `syncsearch` and `inflateStateCheck`
 //! `local`, i.e. file-static, so they appear in no header at all. Every one of them
 //! is therefore `pub(crate)` in this port, and none may ever be `#[no_mangle]`. The
-//! [`inffast`] and [`window`] submodules are themselves crate-private for the same
+//! `inffast` and `window` submodules are themselves crate-private for the same
 //! reason: they contain nothing the outside world is allowed to name.
+//!
+//! [`inflate_table`] is the single
+//! deliberate exception, and it is an exception to the *Rust* visibility rule only.
+//! It is `#[doc(hidden)] pub` because the unmodified `test/infcover.c` calls the C
+//! symbol directly and links against `libz.a`, so `crates/libz-rs-sys` has to wrap
+//! it -- which it cannot do without being able to call it. The wrapper is the
+//! `#[no_mangle]` item; this crate's symbol stays mangled, and the version script
+//! keeps the C name out of the `.so`. The
+//! [`inftrees`] module documentation carries the full
+//! contract.
 //!
 //! Nothing in this module is feature-gated. In particular the gzip states are not
 //! optional: `inflate.h` L11-L17 defines `GUNZIP` unless `NO_GZIP` is defined, and
@@ -136,8 +135,8 @@
 //!
 //! This module decodes attacker-controlled bytes, so:
 //!
-//! * There is no `unsafe` here; the crate root forbids it. Raw pointers stop at
-//!   `crates/libz-rs-sys`.
+//! * There is no `unsafe` here; the crate root forbids it, so nothing in this module
+//!   dereferences a raw pointer or builds a slice from one.
 //! * There is no `unwrap()`, `expect()`, panicking index or overflowing arithmetic in
 //!   any path reachable from a stream. Malformed input reaches [`Mode::Bad`] and
 //!   becomes [`ReturnCode::DATA_ERROR`] with the same message C produces, at the same
@@ -148,8 +147,20 @@
 //!   data error rather than to a panic.
 //! * Every state either changes `state.mode`, consumes input, produces output, or
 //!   returns, so the dispatch loop cannot spin.
+//!
+//! [`fixed_tables`]: crate::inflate::fixed_tables
+//! [`header`]: crate::inflate::header
+//! [`inftrees`]: crate::inflate::inftrees
+//! [`inftrees::Code`]: crate::inflate::inftrees::Code
+//! [`mode`]: crate::inflate::mode
+//! [`state`]: crate::inflate::state
 
-// Items in this module are the ports of C functions named `inflate*`, and the module
+// The definitions closing the module documentation above are link-reference definitions, not
+// prose: a module whose `mod` declaration carries an outer doc comment has its `//!` block
+// resolved in the scope of the DECLARING module, so an unqualified sibling name does not
+// resolve. See "Documentation lints" in `src/lib.rs` for the rule and the gate.
+
+// Items in this module carry the names of the C functions spelled `inflate*`, and the
 // they live in is `inflate`, so `clippy::module_name_repetitions` fires on nearly all
 // of them. The C names are the API contract -- `crates/libz-rs-sys` exports them
 // verbatim -- so they are kept and the lint is relaxed for this file only, exactly as
@@ -187,15 +198,11 @@ pub use crate::inflate::header::inflate_get_header;
 pub use crate::inflate::mode::Mode;
 pub use crate::inflate::state::InflateState;
 
-// The two fixed decode tables keep their C spelling, because they are the names
-// `inffixed.h` generates and the names `zlib-rs-differential`'s table-equality test
-// diffs against. The `#[allow(non_upper_case_globals)]` that makes that legal lives
-// on the definitions themselves, in `fixed_tables`.
+// The two fixed decode tables keep their C spelling, because those are the names
+// `inffixed.h` generates and the names the tests in `fixed_tables` diff against. The
+// `#[allow(non_upper_case_globals)]` that makes that legal lives on the definitions
+// themselves, in `fixed_tables`.
 pub use crate::inflate::fixed_tables::{distfix, lenfix};
-
-// -----------------------------------------------------------------------------
-//  Constants
-// -----------------------------------------------------------------------------
 
 /// Permutation of the code-length code lengths, RFC 1951 §3.2.7.
 ///
@@ -245,10 +252,6 @@ const OP_EXTRA_BITS: u8 = 15;
 /// operation (`inflate.c` L929 and L981).
 const OP_KIND_MASK: u8 = 0xf0;
 
-// -----------------------------------------------------------------------------
-//  Error messages -- `strm->msg`, character for character
-// -----------------------------------------------------------------------------
-//
 // Each of these lands in the caller-visible `z_stream.msg` and is printed verbatim
 // by `test/example.c` and `test/infcover.c`, so the text, the punctuation and the
 // decision point are all part of the contract. The three messages that `inffast.c`
@@ -289,10 +292,6 @@ pub(crate) const MSG_INCORRECT_DATA_CHECK: &str = "incorrect data check";
 /// `inflate.c` L1101: a gzip member's `ISIZE` does not match the bytes produced.
 pub(crate) const MSG_INCORRECT_LENGTH_CHECK: &str = "incorrect length check";
 
-// -----------------------------------------------------------------------------
-//  Sentinel return values for the facade's failed state checks
-// -----------------------------------------------------------------------------
-
 /// What `inflateMark` returns for a stream that fails `inflateStateCheck`.
 ///
 /// `inflate.c` L1400-L1401 returns `-(1L << 16)`, i.e. "no bits back, and no match in
@@ -304,13 +303,9 @@ pub const INFLATE_MARK_BAD_STATE: i64 = -(1 << 16);
 /// What `inflateCodesUsed` returns for a stream that fails `inflateStateCheck`.
 ///
 /// `inflate.c` L1410 returns `(unsigned long)-1`, which is all ones in whatever width
-/// `unsigned long` has. Ported from `inflate.c` L1408-L1412.
+/// `unsigned long` has. Mirrors `inflate.c` L1408-L1412.
 pub const INFLATE_CODES_USED_BAD_STATE: u64 = u64::MAX;
 
-// -----------------------------------------------------------------------------
-//  Small total conversions
-// -----------------------------------------------------------------------------
-//
 // C truncates freely between `unsigned`, `unsigned long` and pointers. Every such
 // narrowing in this file goes through one of the four helpers below, so that no cast
 // can panic in a debug build and each one has a single place to justify its
@@ -384,16 +379,13 @@ fn drop_bits<'a, A: Allocator<'a>>(state: &mut InflateState<'a, A>, count: u32) 
     let _dropped = state.drop_bits(count);
 }
 
-// -----------------------------------------------------------------------------
-//  The caller-visible half of `z_stream`
-// -----------------------------------------------------------------------------
-
 /// The parts of `z_stream` that [`inflate`] reads and writes, in safe form.
 ///
-/// C reaches all of this through one `z_streamp` (`zlib.h` L90-L110). The safe core
-/// has no `z_stream`: raw pointers stop at `crates/libz-rs-sys`, which rebuilds the
-/// two pointer/length pairs as slices, copies the six scalars in, calls an entry point
-/// here, and copies the scalars back out.
+/// C reaches all of this through one `z_streamp` (`zlib.h` L90-L110). This crate has
+/// no `z_stream`, and it never dereferences a raw pointer or builds a slice from one:
+/// the facade crate does that once, rebuilding the two pointer/length pairs as slices,
+/// copying the six scalars in, calling an entry point here, and copying the scalars
+/// back out.
 ///
 /// # The two buffers
 ///
@@ -403,7 +395,7 @@ fn drop_bits<'a, A: Allocator<'a>>(state: &mut InflateState<'a, A>, count: u32) 
 /// * `avail_in` is `input.len() - next_in`, and
 /// * `avail_out` is `output.len() - next_out`.
 ///
-/// This is the convention [`header`] and [`inffast`] already use, and it is what lets
+/// This is the convention [`header`] and `inffast` already use, and it is what lets
 /// a match copy read bytes this call has itself written. C's `next_in == Z_NULL` with
 /// `avail_in == 0` is legal (`inflate.c` L495) and corresponds to an empty `input`
 /// slice, which is likewise not an error here; a null `next_in` with a non-zero
@@ -443,11 +435,25 @@ pub struct InflateStream<'a> {
 }
 
 impl<'a> InflateStream<'a> {
-    /// Builds a stream over `input` and `output` with both cursors at zero and every
-    /// scalar at the value a freshly initialised `z_stream` carries.
+    /// Builds a **pre-reset, zeroed** view over `input` and `output`: both cursors at zero and
+    /// every scalar at zero.
     ///
-    /// A caller that is resuming a stream must restore `total_in`, `total_out`,
-    /// `adler` and `data_type` itself; they are public fields for exactly that reason.
+    /// # This is not yet an initialised `z_stream` -- a reset must be applied
+    ///
+    /// Zeroed is deliberately not the same thing as initialised, and one field makes the
+    /// difference visible. `inflateReset` sets `strm->adler = state->wrap & 1`
+    /// (`inflate.c` L100-L109), so a freshly initialised **wrapped zlib** stream carries
+    /// `adler == 1` -- the Adler-32 seed -- and only a **raw** stream carries `adler == 0`.
+    /// This constructor sets `adler: 0` unconditionally, because it has no configuration to
+    /// consult and therefore cannot know the wrap mode.
+    ///
+    /// So: treat the result as the zeroed storage a reset is then applied to, exactly as C
+    /// treats the `z_stream` a caller hands to `inflateInit2_` before `inflateReset2` runs. The
+    /// reset is what makes the scalars correct for the configuration; skipping it leaves `adler`
+    /// wrong for every zlib and gzip stream.
+    ///
+    /// A caller that is resuming a stream must likewise restore `total_in`, `total_out`, `adler`
+    /// and `data_type` itself; they are public fields for exactly that reason.
     #[must_use]
     pub fn new(input: &'a [u8], output: &'a mut [u8]) -> Self {
         Self {
@@ -498,10 +504,6 @@ impl<'a> InflateStream<'a> {
         }
     }
 }
-
-// -----------------------------------------------------------------------------
-//  How a state arm ends
-// -----------------------------------------------------------------------------
 
 /// The four ways an arm of C's `switch (state->mode)` can end.
 ///
@@ -576,10 +578,6 @@ enum MatchSource {
     /// An index into output this call, or an earlier one, already wrote.
     Output(usize),
 }
-
-// -----------------------------------------------------------------------------
-//  The driver context
-// -----------------------------------------------------------------------------
 
 /// The locals of C's `inflate()` that outlive a single state arm.
 ///
@@ -744,14 +742,10 @@ impl Inflater<'_, '_> {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Block states -- `inflate.c` L708-L822
-// -----------------------------------------------------------------------------
-
 impl Inflater<'_, '_> {
     /// Reads the three-bit block header and selects the block's decoder.
     ///
-    /// The port of the `TYPEDO` arm (`inflate.c` L711-L746), which the `TYPE` arm
+    /// The Rust counterpart of the `TYPEDO` arm (`inflate.c` L711-L746), which the `TYPE` arm
     /// falls into. Four outcomes, matching RFC 1951 §3.2.3's `BTYPE`: `00` stored,
     /// `01` fixed Huffman codes, `10` dynamic Huffman codes, `11` reserved.
     ///
@@ -821,7 +815,7 @@ impl Inflater<'_, '_> {
 
     /// Reads a stored block's byte-aligned `LEN`/`NLEN` pair.
     ///
-    /// The port of the `STORED` arm (`inflate.c` L747-L761). RFC 1951 §3.2.4 puts
+    /// The Rust counterpart of the `STORED` arm (`inflate.c` L747-L761). RFC 1951 §3.2.4 puts
     /// `NLEN` immediately after `LEN` as its one's complement, so the two must satisfy
     /// `LEN == ~NLEN`; C tests that as `(hold & 0xffff) != ((hold >> 16) ^ 0xffff)`
     /// and the comparison is reproduced on the full 64-bit accumulator rather than on
@@ -859,7 +853,7 @@ impl Inflater<'_, '_> {
 
     /// Copies a stored block's bytes straight from input to output.
     ///
-    /// The port of the `COPY` arm (`inflate.c` L765-L781), which `COPY_` falls into
+    /// The Rust counterpart of the `COPY` arm (`inflate.c` L765-L781), which `COPY_` falls into
     /// after the one assignment at L763. The transfer is `min(length, avail_in,
     /// avail_out)` bytes and repeats across calls until `length` reaches zero; a
     /// `copy` of zero with `length` still positive is C's `goto inf_leave` at L770,
@@ -914,12 +908,12 @@ impl Inflater<'_, '_> {
 
     /// Reads a dynamic block's three alphabet sizes.
     ///
-    /// The port of the `TABLE` arm (`inflate.c` L782-L800): `HLIT`, `HDIST` and
+    /// The Rust counterpart of the `TABLE` arm (`inflate.c` L782-L800): `HLIT`, `HDIST` and
     /// `HCLEN` of RFC 1951 §3.2.7, biased by 257, 1 and 4 respectively.
     ///
     /// ★ The `nlen > 286 || ndist > 30` rejection at L791 is inside
     /// `#ifndef PKZIP_BUG_WORKAROUND`, and that macro is **not** defined in the
-    /// shipped build, so the check is active and is ported.
+    /// shipped build, so the check is active and is implemented.
     fn table<'a, A: Allocator<'a>>(&mut self, state: &mut InflateState<'a, A>) -> Step {
         // L783.
         if !self.need_bits(state, 14) {
@@ -948,7 +942,7 @@ impl Inflater<'_, '_> {
 
     /// Reads the code lengths of the code-length code and builds its table.
     ///
-    /// The port of the `LENLENS` arm (`inflate.c` L802-L822). `ncode` three-bit
+    /// The Rust counterpart of the `LENLENS` arm (`inflate.c` L802-L822). `ncode` three-bit
     /// lengths arrive in [`ORDER`]; the remaining slots up to nineteen are zeroed, and
     /// the resulting alphabet is handed to [`inflate_table`] with a root of
     /// [`CODES_ROOT_BITS`].
@@ -1051,15 +1045,11 @@ fn decode_table<'s, 'a, A: Allocator<'a>>(
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Huffman code lookup -- `inflate.c` L826-L830, L924-L939 and L976-L991
-// -----------------------------------------------------------------------------
-
 impl Inflater<'_, '_> {
     /// Locates one code in the root table, pulling input until the entry it selects
     /// says it has enough bits.
     ///
-    /// The port of the bare `for (;;)` loops at `inflate.c` L826-L830, L924-L928 and
+    /// The Rust counterpart of the bare `for (;;)` loops at `inflate.c` L826-L830, L924-L928 and
     /// L976-L980. Nothing is dropped: the caller decides how many bits the code
     /// actually cost, because a first-level entry may turn out to be a link to a
     /// second-level table.
@@ -1091,7 +1081,7 @@ impl Inflater<'_, '_> {
     /// Locates one code, descending into a second-level table when the root entry is a
     /// link.
     ///
-    /// The port of `inflate.c` L924-L939 (literal/length) and L976-L991 (distance),
+    /// The Rust counterpart of `inflate.c` L924-L939 (literal/length) and L976-L991 (distance),
     /// which differ in exactly one place, at L929 versus L981:
     ///
     /// | Table | C test | Why |
@@ -1146,14 +1136,10 @@ impl Inflater<'_, '_> {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  `CODELENS` -- `inflate.c` L824-L910
-// -----------------------------------------------------------------------------
-
 impl Inflater<'_, '_> {
     /// Decodes the literal/length and distance code lengths, then builds both tables.
     ///
-    /// The port of the `CODELENS` arm (`inflate.c` L824-L910), and the longest single
+    /// The Rust counterpart of the `CODELENS` arm (`inflate.c` L824-L910), and the longest single
     /// state in the decoder. `nlen + ndist` code lengths are read as code-length codes,
     /// where symbols 0..=15 are literal lengths and 16, 17 and 18 are the three repeat
     /// forms of RFC 1951 §3.2.7:
@@ -1235,7 +1221,7 @@ impl Inflater<'_, '_> {
 
     /// Decodes one repeat code and returns `(length, count)`.
     ///
-    /// The port of `inflate.c` L836-L862. Returns [`None`] for both of C's exits from
+    /// The Rust counterpart of `inflate.c` L836-L862. Returns [`None`] for both of C's exits from
     /// this stretch: out of input, where the state is unchanged and resumable, and the
     /// `have == 0` rejection at L839-L844, which is distinguished by [`Mode::Bad`]
     /// having been set.
@@ -1283,7 +1269,7 @@ impl Inflater<'_, '_> {
 
     /// Builds the literal/length and distance decode tables from `state.lens`.
     ///
-    /// The port of `inflate.c` L885-L910. ★ The two root widths are
+    /// The Rust counterpart of `inflate.c` L885-L910. ★ The two root widths are
     /// [`LENS_ROOT_BITS`] and [`DISTS_ROOT_BITS`]; the reference's own comment at
     /// L885-L887 warns against changing them without reading `inftrees.h`'s notes on
     /// the `ENOUGH` constants, which are derived from exactly these values.
@@ -1370,14 +1356,10 @@ fn store_length_at_have<'a, A: Allocator<'a>>(
     true
 }
 
-// -----------------------------------------------------------------------------
-//  Code states -- `inflate.c` L911-L1073
-// -----------------------------------------------------------------------------
-
 impl Inflater<'_, '_> {
     /// Decodes one literal/length code, or hands the whole block to the fast path.
     ///
-    /// The port of the `LEN` arm (`inflate.c` L914-L963), which `LEN_` falls into
+    /// The Rust counterpart of the `LEN` arm (`inflate.c` L914-L963), which `LEN_` falls into
     /// after the one assignment at L912.
     ///
     /// ★ The dispatch at L915-L922 is the decoder's hot path: when at least six input
@@ -1452,7 +1434,7 @@ impl Inflater<'_, '_> {
 
     /// Reads a length code's extra bits.
     ///
-    /// The port of the `LENEXT` arm (`inflate.c` L964-L974). RFC 1951 §3.2.5 gives
+    /// The Rust counterpart of the `LENEXT` arm (`inflate.c` L964-L974). RFC 1951 §3.2.5 gives
     /// symbols 265..=284 between one and five extra bits, which are added to the base
     /// length the table entry carried.
     ///
@@ -1483,7 +1465,7 @@ impl Inflater<'_, '_> {
 
     /// Decodes one distance code.
     ///
-    /// The port of the `DIST` arm (`inflate.c` L975-L1001). Structurally identical to
+    /// The Rust counterpart of the `DIST` arm (`inflate.c` L975-L1001). Structurally identical to
     /// the slow path of [`Inflater::len`], with the one link-test difference documented
     /// on [`Inflater::lookup_code`] and without the literal and end-of-block cases:
     /// the distance alphabet has neither.
@@ -1514,12 +1496,12 @@ impl Inflater<'_, '_> {
 
     /// Reads a distance code's extra bits.
     ///
-    /// The port of the `DISTEXT` arm (`inflate.c` L1003-L1019). RFC 1951 §3.2.5 gives
+    /// The Rust counterpart of the `DISTEXT` arm (`inflate.c` L1003-L1019). RFC 1951 §3.2.5 gives
     /// symbols 4..=29 between one and thirteen extra bits.
     ///
     /// The `state->offset > state->dmax` rejection at L1010-L1016 is inside
     /// `#ifdef INFLATE_STRICT`, which the shipped build does not define, so it is
-    /// deliberately **not** ported: a stream whose distances exceed the window size
+    /// deliberately **not** implemented: a stream whose distances exceed the window size
     /// advertised in its own header is still accepted here, exactly as by C, and the
     /// `MATCH` state's `copy > whave` test is what actually keeps every read in bounds.
     fn dist_ext<'a, A: Allocator<'a>>(&mut self, state: &mut InflateState<'a, A>) -> Step {
@@ -1545,7 +1527,7 @@ impl Inflater<'_, '_> {
 
     /// Copies a matching string from the window or from the output already written.
     ///
-    /// The port of the `MATCH` arm (`inflate.c` L1020-L1065), and the state where a
+    /// The Rust counterpart of the `MATCH` arm (`inflate.c` L1020-L1065), and the state where a
     /// malformed distance would become a read outside the buffer.
     ///
     /// C's `copy = out - left` is the number of bytes this call has written. A distance
@@ -1556,7 +1538,7 @@ impl Inflater<'_, '_> {
     ///
     /// ★ The `INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR` branch at L1032-L1044, which
     /// substitutes zero bytes for unavailable history, is `#ifdef`-gated out of the
-    /// shipped build and is not ported. `state.sane` is therefore always true here, and
+    /// shipped build and is not implemented. `state.sane` is therefore always true here, and
     /// `inflateUndermine` cannot change that.
     ///
     /// ★ The copy stays **forward and byte-at-a-time**, exactly as C's
@@ -1663,7 +1645,7 @@ impl Inflater<'_, '_> {
 
     /// Writes one decoded literal byte.
     ///
-    /// The port of the `LIT` arm (`inflate.c` L1066-L1071). `state.length` holds the
+    /// The Rust counterpart of the `LIT` arm (`inflate.c` L1066-L1071). `state.length` holds the
     /// literal, because the literal/length alphabet is merged and the table entry's
     /// `val` was stored there by [`Inflater::len`].
     fn lit<'a, A: Allocator<'a>>(&mut self, state: &mut InflateState<'a, A>) -> Step {
@@ -1681,14 +1663,10 @@ impl Inflater<'_, '_> {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Trailer states -- `inflate.c` L1072-L1108
-// -----------------------------------------------------------------------------
-
 impl Inflater<'_, '_> {
     /// Verifies the stream's 32-bit check value.
     ///
-    /// The port of the `CHECK` arm (`inflate.c` L1072-L1096). A raw stream has no
+    /// The Rust counterpart of the `CHECK` arm (`inflate.c` L1072-L1096). A raw stream has no
     /// trailer and passes straight through to [`Mode::Length`]; a zlib stream carries
     /// the Adler-32 of RFC 1950 §2.2 and a gzip stream the CRC-32 of RFC 1952 §2.3.1.
     ///
@@ -1719,7 +1697,7 @@ impl Inflater<'_, '_> {
             let written = self.output_start.saturating_sub(left);
             self.total_out = self.total_out.wrapping_add(to_wide(written));
             // C accumulates `state->total` in an `unsigned long` and masks it to 32
-            // bits at L1100; this port stores 32 bits and wraps, which is the same
+            // bits at L1100; this implementation stores 32 bits and wraps, which is the same
             // masked value for every stream length.
             state.total = state.total.wrapping_add(low_u32(to_wide(written)));
 
@@ -1758,7 +1736,7 @@ impl Inflater<'_, '_> {
 
     /// Verifies a gzip member's uncompressed length.
     ///
-    /// The port of the `LENGTH` arm (`inflate.c` L1097-L1108). RFC 1952 §2.3.1's
+    /// The Rust counterpart of the `LENGTH` arm (`inflate.c` L1097-L1108). RFC 1952 §2.3.1's
     /// `ISIZE` field holds the length of the uncompressed data modulo 2^32, and only a
     /// gzip stream has one -- hence the `state->flags` half of the guard at L1098.
     fn length<'a, A: Allocator<'a>>(&mut self, state: &mut InflateState<'a, A>) -> Step {
@@ -1783,14 +1761,10 @@ impl Inflater<'_, '_> {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  The `inf_leave` epilogue -- `inflate.c` L1131-L1152
-// -----------------------------------------------------------------------------
-
 impl Inflater<'_, '_> {
     /// Updates the window and the counters, then settles the return code.
     ///
-    /// The port of the `inf_leave` block (`inflate.c` L1131-L1152), reproduced
+    /// The Rust counterpart of the `inf_leave` block (`inflate.c` L1131-L1152), reproduced
     /// statement for statement. Reached from every [`Step::Leave`] and
     /// [`Step::LeaveWith`], and from none of the [`Step::Return`]s -- which is the
     /// distinction C draws by using `goto inf_leave` for the former and a bare `return`
@@ -1799,7 +1773,7 @@ impl Inflater<'_, '_> {
     /// Four things happen here, in this order:
     ///
     /// 1. **The window is brought up to date** (L1133-L1138). The condition is subtle
-    ///    and is ported exactly: the window is updated if one already exists, or if
+    ///    and is implemented exactly: the window is updated if one already exists, or if
     ///    output was written and the stream neither failed nor finished -- where
     ///    "finished" is qualified by `flush != Z_FINISH`, because a caller who has
     ///    declared there is no more input does not need history kept for a next call.
@@ -1861,14 +1835,10 @@ impl Inflater<'_, '_> {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  The dispatcher -- `inflate.c` L504-L1123
-// -----------------------------------------------------------------------------
-
 impl Inflater<'_, '_> {
     /// Dispatches on [`InflateState::mode`] until a state says to stop.
     ///
-    /// The port of C's `for (;;) switch (state->mode)` (`inflate.c` L504-L1123).
+    /// The Rust counterpart of C's `for (;;) switch (state->mode)` (`inflate.c` L504-L1123).
     ///
     /// ★ The `match` is **exhaustive over all thirty-two** [`Mode`] variants and has
     /// no `_ =>` arm, which is the point of modelling the mode as an enum at all
@@ -2019,13 +1989,9 @@ impl Inflater<'_, '_> {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  `inflate` -- `inflate.c` L474-L1153
-// -----------------------------------------------------------------------------
-
 /// Decompresses as much of `stream` as the available input and output space allow.
 ///
-/// The port of `inflate` (`inflate.c` L474-L1153), declared at `zlib.h` L405. See the
+/// The Rust counterpart of `inflate` (`inflate.c` L474-L1153), declared at `zlib.h` L405. See the
 /// [module documentation](self) for the resumable-state-machine contract this function
 /// implements, and for what `flush` does and does not affect.
 ///
@@ -2125,10 +2091,6 @@ where
     ret
 }
 
-// -----------------------------------------------------------------------------
-//  Lifecycle -- `inflate.c` L88-L236 and L1155-L1165
-// -----------------------------------------------------------------------------
-
 /// The mode-range half of `inflateStateCheck` (`inflate.c` L88-L98).
 ///
 /// C's function rejects a stream for any of five reasons:
@@ -2141,14 +2103,19 @@ where
 /// | `state->strm != strm` | the facade |
 /// | `state->mode < HEAD \|\| state->mode > SYNC` | **here** |
 ///
-/// The first four are about raw pointers and caller-supplied hooks, which exist only in
-/// `crates/libz-rs-sys` (AAP §0.6.1 category 3). The fifth is this function.
+/// The first four require dereferencing caller-supplied pointers and inspecting
+/// caller-supplied hooks, which only the facade crate does (AAP §0.6.1 category 3).
+/// The fifth is this function.
 ///
-/// ★ The tag range is why [`Mode::Head`] starts at 16180 rather than at zero: a
-/// `z_stream` handed to `inflate()` after `deflateInit`, or after being freed, or one
-/// that was never initialised at all, almost certainly does not contain a number in
-/// `16180..=16211` where the mode belongs, so the range test rejects it. It is a
-/// heuristic, and C says as much by pairing it with the owner-identity check.
+/// ★ The tag range is why [`Mode::Head`] starts at 16180 rather than at zero. The
+/// state must already be safe to read before the tag can be looked at, so what the
+/// range test adds is a check on the *object*, not on the pointer: a live state that
+/// came from `deflateInit`, one that was never initialised, or one whose tag has been
+/// overwritten is very unlikely to hold a number in `16180..=16211` where the mode
+/// belongs, and the test rejects it. It cannot notice a pointer that has been freed —
+/// such a pointer may still hold its old tag, and reading it is already undefined
+/// behaviour. It is a heuristic, and C says as much by pairing it with the
+/// owner-identity check.
 ///
 /// Returns `true` when the state must be **rejected**, matching the polarity of C's
 /// non-zero return so that the two read the same way side by side.
@@ -2207,7 +2174,7 @@ pub fn inflate_init2<'a, A: Allocator<'a>>(
 
 /// Creates a decoder state for a zlib stream with the largest window.
 ///
-/// The port of `inflateInit_` (`inflate.c` L214-L217), declared at `zlib.h` L237, which
+/// The Rust counterpart of `inflateInit_` (`inflate.c` L214-L217), declared at `zlib.h` L237, which
 /// is [`inflate_init2`] with `windowBits` = [`DEF_WBITS`].
 ///
 /// # Errors
@@ -2220,7 +2187,7 @@ pub fn inflate_init<'a, A: Allocator<'a>>(allocator: A) -> Result<InflateState<'
 
 /// Releases everything the decoder state owns.
 ///
-/// The port of `inflateEnd` (`inflate.c` L1155-L1165), declared at `zlib.h` L471. C
+/// The Rust counterpart of `inflateEnd` (`inflate.c` L1155-L1165), declared at `zlib.h` L471. C
 /// frees the window and then the state itself, through the same `zfree` they came from,
 /// and clears `strm->state`. Here, taking the state by value and dropping it does the
 /// first; clearing the facade's `z_stream.state` is the facade's step.
@@ -2232,13 +2199,9 @@ pub fn inflate_end<'a, A: Allocator<'a>>(state: InflateState<'a, A>) -> ReturnCo
     ReturnCode::OK
 }
 
-// -----------------------------------------------------------------------------
-//  Reset -- `inflate.c` L99-L171
-// -----------------------------------------------------------------------------
-
 /// Resets the stream without discarding the window's contents.
 ///
-/// The port of `inflateResetKeep` (`inflate.c` L99-L123), declared at `zlib.h` L490.
+/// The Rust counterpart of `inflateResetKeep` (`inflate.c` L99-L123), declared at `zlib.h` L490.
 /// The window, `wsize`, `whave` and `wnext` all survive, so a caller can restart
 /// decoding with the previous stream's history still available as a dictionary.
 ///
@@ -2255,7 +2218,7 @@ pub fn inflate_reset_keep<'a, A: Allocator<'a>>(state: &mut InflateState<'a, A>)
 
 /// Resets the stream and forgets the window's contents.
 ///
-/// The port of `inflateReset` (`inflate.c` L125-L134), declared at `zlib.h` L479. The
+/// The Rust counterpart of `inflateReset` (`inflate.c` L125-L134), declared at `zlib.h` L479. The
 /// three window cursors are cleared and then [`inflate_reset_keep`] does the rest; the
 /// allocation itself is kept, so no reset ever reallocates.
 pub fn inflate_reset<'a, A: Allocator<'a>>(state: &mut InflateState<'a, A>) -> StreamReset {
@@ -2264,7 +2227,7 @@ pub fn inflate_reset<'a, A: Allocator<'a>>(state: &mut InflateState<'a, A>) -> S
 
 /// Resets the stream and changes the container format or window size.
 ///
-/// The port of `inflateReset2` (`inflate.c` L136-L171), declared at `zlib.h` L500.
+/// The Rust counterpart of `inflateReset2` (`inflate.c` L136-L171), declared at `zlib.h` L500.
 ///
 /// ★ The `windowBits` decode -- the sign convention for raw streams, the `+16` and
 /// `+32` gzip requests, the `windowBits == 0` "take it from the header" case and the
@@ -2286,13 +2249,9 @@ pub fn inflate_reset2<'a, A: Allocator<'a>>(
     state.reset2(config)
 }
 
-// -----------------------------------------------------------------------------
-//  Introspection and tuning
-// -----------------------------------------------------------------------------
-
 /// Inserts bits into the accumulator ahead of the stream.
 ///
-/// The port of `inflatePrime` (`inflate.c` L219-L236), declared at `zlib.h` L1011. Used
+/// The Rust counterpart of `inflatePrime` (`inflate.c` L219-L236), declared at `zlib.h` L1011. Used
 /// to start decoding at a bit position that is not a byte boundary, which is what a
 /// caller resuming from an `inflateMark` position needs.
 ///
@@ -2309,7 +2268,7 @@ pub fn inflate_prime<'a, A: Allocator<'a>>(
 
 /// Returns how far into the current block decoding has got.
 ///
-/// The port of `inflateMark` (`inflate.c` L1397-L1406), declared at `zlib.h` L1042. The
+/// The Rust counterpart of `inflateMark` (`inflate.c` L1397-L1406), declared at `zlib.h` L1042. The
 /// result packs two numbers: the high bits are the number of unused bits of the last
 /// consumed byte, negated -- C's `state->back`, which is -1 when no code is pending --
 /// and the low sixteen bits are the progress through a copy:
@@ -2339,7 +2298,7 @@ pub fn inflate_mark<'a, A: Allocator<'a>>(state: &InflateState<'a, A>) -> i64 {
 
 /// Returns whether the stream is stopped at an empty stored block's length field.
 ///
-/// The port of `inflateSyncPoint` (`inflate.c` L1320-L1326), declared at `zlib.h` L1105.
+/// The Rust counterpart of `inflateSyncPoint` (`inflate.c` L1320-L1326), declared at `zlib.h` L1105.
 ///
 /// The reference's own explanation (L1312-L1319): this is true at the end of a block
 /// generated by `Z_SYNC_FLUSH` or `Z_FULL_FLUSH`, and one PPP implementation uses it as
@@ -2353,8 +2312,8 @@ pub fn inflate_sync_point<'a, A: Allocator<'a>>(state: &InflateState<'a, A>) -> 
 
 /// Returns how many decode-table entries the current block's tables occupy.
 ///
-/// The port of `inflateCodesUsed` (`inflate.c` L1408-L1413), declared at `zlib.h` L1122.
-/// C computes `state->next - state->codes`, a pointer difference; this port stores that
+/// The Rust counterpart of `inflateCodesUsed` (`inflate.c` L1408-L1413), declared at `zlib.h` L1122.
+/// C computes `state->next - state->codes`, a pointer difference; this implementation stores that
 /// cursor as an index, so it is read directly.
 ///
 /// A stream that fails `inflateStateCheck` gets [`INFLATE_CODES_USED_BAD_STATE`]
@@ -2368,7 +2327,7 @@ pub fn inflate_codes_used<'a, A: Allocator<'a>>(state: &InflateState<'a, A>) -> 
 
 /// Turns check-value verification on or off.
 ///
-/// The port of `inflateValidate` (`inflate.c` L1385-L1395), declared at `zlib.h` L1115.
+/// The Rust counterpart of `inflateValidate` (`inflate.c` L1385-L1395), declared at `zlib.h` L1115.
 /// Sets or clears bit 2 of `state->wrap`, which is the bit both the trailer comparison
 /// and the running check-value update consult. A raw stream is never promoted, because
 /// it has no check value to verify -- that is C's `if (check && state->wrap)` guard.
@@ -2382,7 +2341,7 @@ pub fn inflate_validate<'a, A: Allocator<'a>>(
 
 /// Refuses to allow matches that reach further back than the window holds.
 ///
-/// The port of `inflateUndermine` (`inflate.c` L1370-L1383), declared at `zlib.h` L2044.
+/// The Rust counterpart of `inflateUndermine` (`inflate.c` L1370-L1383), declared at `zlib.h` L2044.
 ///
 /// ★ In the shipped build this function **fails**: the permissive behaviour lives behind
 /// `INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR`, which is not defined, so C forces
@@ -2397,19 +2356,15 @@ pub fn inflate_undermine<'a, A: Allocator<'a>>(
     state.undermine(subvert)
 }
 
-// -----------------------------------------------------------------------------
-//  Copy -- `inflate.c` L1328-L1368
-// -----------------------------------------------------------------------------
-
 /// Duplicates a decoder state, so that decoding can be branched.
 ///
-/// The port of `inflateCopy` (`inflate.c` L1328-L1368), declared at `zlib.h` L970. The
+/// The Rust counterpart of `inflateCopy` (`inflate.c` L1328-L1368), declared at `zlib.h` L970. The
 /// use C documents is scanning ahead speculatively while keeping the ability to resume
 /// from where the scan began.
 ///
 /// ★ C has to repair pointers after the bulk copy: L1357-L1361 tests whether
 /// `state->lencode` points inside `state->codes` and, if so, rebases both table pointers
-/// onto the copy's own arena, and L1362 rebases the `next` cursor the same way. This port
+/// onto the copy's own arena, and L1362 rebases the `next` cursor the same way. This implementation
 /// needs none of it, because `crate::inflate::inftrees::CodeTableSource` holds an
 /// *offset* into the arena rather than a pointer into it -- and an offset is equally
 /// valid in a copy. The fixed tables are shared statics, so they need no fix-up either.
@@ -2435,13 +2390,9 @@ where
     source.try_clone_in(allocator)
 }
 
-// -----------------------------------------------------------------------------
-//  Dictionaries -- `inflate.c` L1167-L1217
-// -----------------------------------------------------------------------------
-
 /// Reads back the decoder's sliding window as a dictionary.
 ///
-/// The port of `inflateGetDictionary` (`inflate.c` L1167-L1185), declared at `zlib.h`
+/// The Rust counterpart of `inflateGetDictionary` (`inflate.c` L1167-L1185), declared at `zlib.h`
 /// L935. The window is circular, so the history is returned in two pieces: the older
 /// half at `window[wnext..whave]` first, then the newer half at `window[..wnext]`,
 /// which puts the bytes back in stream order.
@@ -2451,7 +2402,7 @@ where
 /// there is.
 ///
 /// C's `dictionary` has no length, and `zlib.h` L935-L941 requires the caller to provide
-/// at least 32768 bytes. This port additionally clamps to the slice it is handed, so a
+/// at least 32768 bytes. This implementation additionally clamps to the slice it is handed, so a
 /// short buffer receives a prefix instead of overflowing. `dict_length` still reports the
 /// full `whave`, as C does.
 pub fn inflate_get_dictionary<'a, A: Allocator<'a>>(
@@ -2502,7 +2453,7 @@ fn copy_history<'a, A: Allocator<'a>>(state: &InflateState<'a, A>, target: &mut 
 
 /// Supplies the preset dictionary a stream asked for.
 ///
-/// The port of `inflateSetDictionary` (`inflate.c` L1187-L1217), declared at `zlib.h`
+/// The Rust counterpart of `inflateSetDictionary` (`inflate.c` L1187-L1217), declared at `zlib.h`
 /// L913. Two quite different callers are supported, which is why the guard at L1196 is
 /// shaped the way it is:
 ///
@@ -2551,13 +2502,9 @@ where
     ReturnCode::OK
 }
 
-// -----------------------------------------------------------------------------
-//  Synchronisation -- `inflate.c` L1233-L1310
-// -----------------------------------------------------------------------------
-
 /// Searches `buf` for the four-byte pattern `00 00 ff ff`.
 ///
-/// The port of `syncsearch` (`inflate.c` L1244-L1262). Reproducing the reference's own
+/// The Rust counterpart of `syncsearch` (`inflate.c` L1244-L1262). Reproducing the reference's own
 /// description of the contract (L1233-L1243):
 ///
 /// > Search `buf[0..len-1]` for the pattern: 0, 0, 0xff, 0xff. Return when found or
@@ -2606,7 +2553,7 @@ pub(crate) fn syncsearch(have: &mut u32, buf: &[u8]) -> usize {
 
 /// Skips forward to the next possible full-flush point.
 ///
-/// The port of `inflateSync` (`inflate.c` L1264-L1310), declared at `zlib.h` L951. This
+/// The Rust counterpart of `inflateSync` (`inflate.c` L1264-L1310), declared at `zlib.h` L951. This
 /// is the recovery path: after a data error, it discards input up to and including the
 /// next `00 00 ff ff` and prepares the state to resume at the block that follows.
 ///
@@ -2698,10 +2645,6 @@ pub fn inflate_sync<'a, A: Allocator<'a>>(
     ReturnCode::OK
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
 #[cfg(test)]
 // The workspace denies the panic family in library code, which is what the decoder
 // above is built to honour. A test that cannot assert is useless, so the harness opts
@@ -2750,10 +2693,6 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    // -------------------------------------------------------------------------
-    //  Fixtures
-    // -------------------------------------------------------------------------
-    //
     // The compressed streams below are the ones `test/infcover.c` already uses, in the
     // same spelling, so that each expectation is one the reference is known to meet.
     // `try(...)` fixtures come from its `cover_inflate` (L580-L613) and `inf(...)`
@@ -2861,10 +2800,6 @@ mod tests {
         }
         plain
     }
-
-    // -------------------------------------------------------------------------
-    //  Harness
-    // -------------------------------------------------------------------------
 
     /// `test/infcover.c` L36-L59 `h2b`: space-separated hex byte values to bytes.
     ///
@@ -3093,10 +3028,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  Cheapest, highest-signal checks first (AAP §0.6.2.3)
-    // -------------------------------------------------------------------------
-
     #[test]
     fn the_re_exported_fixed_tables_are_the_generated_ones() {
         // `inffixed.h` L10-L12 and its distance block: the first entries of each table,
@@ -3146,10 +3077,6 @@ mod tests {
             assert!(!inflate_state_check(mode.as_raw()), "{mode:?}");
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  All three container formats, plus auto-detection
-    // -------------------------------------------------------------------------
 
     #[test]
     fn zlib_streams_decode() {
@@ -3252,10 +3179,6 @@ mod tests {
         assert_eq!(outcome.ret, ReturnCode::STREAM_END);
         assert_eq!(outcome.output, vec![b'Z'; 200]);
     }
-
-    // -------------------------------------------------------------------------
-    //  Resumability -- the single most valuable property of the state machine
-    // -------------------------------------------------------------------------
 
     #[test]
     fn one_byte_at_a_time_matches_a_single_shot_decode() {
@@ -3425,10 +3348,6 @@ mod tests {
         let call = first_call(&bytes, -15, 0, 258);
         assert_eq!(call.ret, ReturnCode::STREAM_END);
     }
-
-    // -------------------------------------------------------------------------
-    //  Flush modes
-    // -------------------------------------------------------------------------
 
     #[test]
     fn every_flush_mode_decodes_the_same_bytes() {
@@ -3644,10 +3563,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  Every error message this file owns, character for character
-    // -------------------------------------------------------------------------
-
     #[test]
     fn every_rejection_reports_the_reference_message() {
         // The `err != 0` fixtures of `test/infcover.c` `cover_inflate` (its L580-L602),
@@ -3750,7 +3665,7 @@ mod tests {
     fn a_reserved_block_type_still_consumes_its_bits() {
         // `inflate.c` L741-L745: the `default` arm falls out of the inner switch into the
         // shared `DROPBITS(2)`, so three bits are consumed even though the block is
-        // rejected. A port that returned early would leave two bits behind.
+        // rejected. An implementation that returned early would leave two bits behind.
         let bytes = h2b("6");
         let mut state = inflate_init2(InflateConfig::new(-15), GlobalAllocator).unwrap();
         let mut session = Session::new(&bytes);
@@ -3779,14 +3694,10 @@ mod tests {
         assert_eq!(inflate_end(state), ReturnCode::OK);
     }
 
-    // -------------------------------------------------------------------------
-    //  Trailer endianness -- the `ZSWAP32` asymmetry
-    // -------------------------------------------------------------------------
-
     #[test]
     fn a_zlib_trailer_is_big_endian() {
         // RFC 1950 §2.2 stores the Adler-32 most significant byte first, so reversing the
-        // four trailer bytes must be rejected -- and if the port had the branch the wrong
+        // four trailer bytes must be rejected -- and if the implementation had the branch the wrong
         // way round, the reversed stream would be the one it accepted.
         let mut swapped = HELLO_ZLIB.to_vec();
         let len = swapped.len();
@@ -3854,10 +3765,6 @@ mod tests {
         assert!(!state.wrap.verifies_check_value());
         assert_eq!(inflate_end(state), ReturnCode::OK);
     }
-
-    // -------------------------------------------------------------------------
-    //  Preset dictionaries
-    // -------------------------------------------------------------------------
 
     #[test]
     fn a_dictionary_stream_asks_for_its_dictionary_and_then_decodes() {
@@ -3977,7 +3884,7 @@ mod tests {
 
     #[test]
     fn get_dictionary_clamps_to_a_short_buffer() {
-        // C has no length for `dictionary` and requires 32768 bytes; this port truncates
+        // C has no length for `dictionary` and requires 32768 bytes; this implementation truncates
         // rather than overflowing, and still reports the full `whave`.
         let mut state = inflate_init2(InflateConfig::new(-15), GlobalAllocator).unwrap();
         assert_eq!(
@@ -3994,10 +3901,6 @@ mod tests {
         assert_eq!(history, &HELLO[..4]);
         assert_eq!(inflate_end(state), ReturnCode::OK);
     }
-
-    // -------------------------------------------------------------------------
-    //  Synchronisation
-    // -------------------------------------------------------------------------
 
     #[test]
     fn syncsearch_finds_the_pattern_and_remembers_partial_matches() {
@@ -4164,10 +4067,6 @@ mod tests {
         assert_eq!(inflate_end(state), ReturnCode::OK);
     }
 
-    // -------------------------------------------------------------------------
-    //  Copy
-    // -------------------------------------------------------------------------
-
     #[test]
     fn a_copied_state_decodes_the_rest_independently() {
         // `inflate.c` L1328-L1367, and the use `zlib.h` L970-L976 documents: scan ahead
@@ -4240,10 +4139,6 @@ mod tests {
         assert_eq!(inflate_end(copy), ReturnCode::OK);
         assert_eq!(inflate_end(state), ReturnCode::OK);
     }
-
-    // -------------------------------------------------------------------------
-    //  Priming, marking, and the remaining introspection
-    // -------------------------------------------------------------------------
 
     #[test]
     fn prime_accepts_and_refuses_exactly_what_the_reference_does() {
@@ -4369,10 +4264,6 @@ mod tests {
         assert_eq!(outcome.msg, Some(MSG_INVALID_DISTANCE_TOO_FAR_BACK));
     }
 
-    // -------------------------------------------------------------------------
-    //  Reset
-    // -------------------------------------------------------------------------
-
     #[test]
     fn reset_restores_the_documented_values() {
         // `inflate.c` L99-L134.
@@ -4457,10 +4348,6 @@ mod tests {
         assert_eq!(inflate_end(state), ReturnCode::OK);
     }
 
-    // -------------------------------------------------------------------------
-    //  The non-recoverable memory error
-    // -------------------------------------------------------------------------
-
     #[test]
     fn a_memory_error_is_sticky_and_skips_the_epilogue() {
         // ★ `test/infcover.c` L419-L423: with an allocator that cannot provide a window,
@@ -4517,10 +4404,6 @@ mod tests {
         assert!(!state.havedict);
         assert_eq!(inflate_end(state), ReturnCode::OK);
     }
-
-    // -------------------------------------------------------------------------
-    //  No panics, no hangs, on anything at all
-    // -------------------------------------------------------------------------
 
     #[test]
     fn arbitrary_bytes_never_panic_or_hang() {

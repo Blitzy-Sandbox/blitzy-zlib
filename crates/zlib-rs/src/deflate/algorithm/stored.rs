@@ -1,6 +1,6 @@
 //! `deflate_stored`: store the input without compressing it. The level-0 compressor.
 //!
-//! Port of `deflate_stored` (`deflate.c` L1668-L1848), the strategy `deflate()` selects
+//! Mirrors `deflate_stored` (`deflate.c` L1668-L1848), the strategy `deflate()` selects
 //! first, before the strategy is even consulted: `bstate = s->level == 0 ?
 //! deflate_stored(s, flush) : ...` (`deflate.c` L1217-L1220). It is also row 0 of
 //! `configuration_table`, `{0, 0, 0, 0, deflate_stored}` (`deflate.c` L114), which is
@@ -30,7 +30,7 @@
 //! Every other compressor in this directory finds matches: it calls `fill_window` when the
 //! lookahead runs short, walks the hash chains through `longest_match`, and tallies symbols
 //! for the Huffman coder. This one does none of that, and the omissions are the algorithm
-//! rather than an incomplete port:
+//! rather than an incomplete implementation:
 //!
 //! * **`fill_window`** (`deflate.c` L252) -- this function manages the window itself, with
 //!   two direct `read_buf` calls and four explicit copies. It never needs a lookahead,
@@ -96,7 +96,7 @@
 //! * `ZLIB_DEBUG` -- the `s->compressed_len += len << 3` and `s->bits_sent += len << 3`
 //!   counters at `deflate.c` L1724-L1728 have no counterpart, and neither does `Tracev`.
 //! * `FASTEST` (`deflate.c` L106) -- replaces `configuration_table` with two entries; this
-//!   port always has all ten levels, so level 0 always reaches this function.
+//!   implementation always has all ten levels, so level 0 always reaches this function.
 //! * `LIT_MEM` (`deflate.h` L28, commented out) -- would change `LIT_BUFS` from 4 to 5 and
 //!   split the symbol buffer in two. `crate::weak_slice::LIT_BUFS` is 4.
 //! * `FORCE_STORED` (`trees.c` L1044) -- overrides block-type selection in `_tr_flush_block`.
@@ -108,7 +108,7 @@ use core::mem::size_of;
 // Where each of these comes from, since none of it is a choice:
 //
 // * `BlockState`, `Flush`, `StreamCursors` and `MAX_STORED` are the shared dispatch
-//   vocabulary of the parent module, `deflate/algorithm.rs`. `StreamCursors` is this port's
+//   vocabulary of the parent module, `deflate/algorithm.rs`. `StreamCursors` is this implementation's
 //   stand-in for C's `s->strm` back-pointer, which a `&mut DeflateState` cannot hold without
 //   aliasing itself; see that module's documentation.
 // * `Allocator` and `DeflateState` cannot be named without each other:
@@ -118,7 +118,7 @@ use core::mem::size_of;
 //   importing -- see `deflate/pending.rs` for why.
 // * `read_buf` is `deflate.c` L1816, writing into the window; `read_buf_into_output` is the
 //   whole of `deflate.c` L1745-L1750, writing into the caller's output buffer. Both are the
-//   one shared port, so the wrap-dispatched check-value update happens identically at both
+//   one shared implementation, so the wrap-dispatched check-value update happens identically at both
 //   sites -- and for the bytes that go straight to `next_out` this is the *only* place their
 //   check value is ever accumulated, because they never enter the window.
 // * `_tr_stored_block` is `deflate.c` L1713 (the dummy header) and L1839 (the real block).
@@ -129,7 +129,7 @@ use crate::read_buf::{read_buf, read_buf_into_output};
 use crate::trees::{_tr_stored_block, flush_bits};
 
 /// This module converts byte counts to the `u64` that [`crate::trees::_tr_stored_block`]
-/// takes and that `total_out` is held in, and the port's standard forbids a cast that could
+/// takes and that `total_out` is held in, and this implementation's standard forbids a cast that could
 /// truncate.
 ///
 /// `crate::deflate::algorithm`, `crate::deflate::pending` and `crate::read_buf` assert the
@@ -185,7 +185,7 @@ const fn header_bytes(bi_valid: i32) -> usize {
 
 /// Copies the input to the output without compressing it, and reports the block state.
 ///
-/// Port of `local block_state deflate_stored(deflate_state *s, int flush)`
+/// Mirrors `local block_state deflate_stored(deflate_state *s, int flush)`
 /// (`deflate.c` L1668-L1848) -- the level-0, store-only compression strategy. `local` in C
 /// and `pub(crate)` here: it is an internal of the implementation, it does not appear in
 /// `zlib.map`, and it must never become an exported symbol.
@@ -193,7 +193,7 @@ const fn header_bytes(bi_valid: i32) -> usize {
 /// # Parameters
 ///
 /// `state` is C's `deflate_state *s`. `cursors` is everything C reaches through `s->strm`;
-/// this port has no such back-pointer, for the reason the parent module's documentation
+/// this implementation has no such back-pointer, for the reason the parent module's documentation
 /// gives. `flush` is C's `int flush`, already narrowed to the six values `deflate()` accepts
 /// (`Z_TREES` is rejected at `deflate.c` L985, before dispatch).
 ///
@@ -246,20 +246,17 @@ const fn header_bytes(bi_valid: i32) -> usize {
 // `cognitive-complexity-threshold` to 60 naming this function, so no restructuring is
 // required or wanted; the second relaxation below is belt and braces for a build whose
 // counted line total differs.
-#[allow(clippy::used_underscore_items, clippy::too_many_lines)]
+// MSRV guard: `unknown_lints` comes first because `clippy::used_underscore_items` postdates the
+// declared 1.80 floor, where the lint NAME is itself an `unknown_lints` error under `-D warnings`.
+// Allowing `unknown_lints` in the same list makes the attribute inert on 1.80 and effective on
+// current stable. Do not drop it while the floor is 1.80.
+#[allow(unknown_lints, clippy::used_underscore_items, clippy::too_many_lines)]
 pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
     state: &mut DeflateState<'a, A>,
     cursors: &mut StreamCursors<'_, '_>,
     flush: Flush,
 ) -> BlockState {
-    // ```c
-    // /* Smallest worthy block size when not flushing or finishing. By default
-    //  * this is 32K. This can be as small as 507 bytes for memLevel == 1. For
-    //  * large input and output buffers, the stored block size will be larger.
-    //  */
-    // unsigned min_block = (unsigned)(MIN(s->pending_buf_size - 5, s->w_size));
-    // ```
-    // -- `deflate.c` L1669-L1673. FIRST of the two `min_block` formulas; the second, at
+    // `deflate.c` L1669-L1673. FIRST of the two `min_block` formulas; the second, at
     // L1831, is a different expression for a different decision and is written out there.
     //
     // The `- 5` is the four `LEN`/`NLEN` bytes plus one for the byte holding the three
@@ -271,7 +268,7 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
     // `int last = 0;`  (`deflate.c` L1679)
     //
     // A `bool`: C only ever stores 0 or 1 in it and only ever tests it for truth, and
-    // `_tr_stored_block` takes the `BFINAL` bit as a `bool` in this port.
+    // `_tr_stored_block` takes the `BFINAL` bit as a `bool` in this implementation.
     let mut last = false;
 
     // `unsigned used = s->strm->avail_in;`  (`deflate.c` L1681)
@@ -289,7 +286,7 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
     let window_size = state.window_size();
 
     // `(long)s->w_size` for the `block_start` adjustment at `deflate.c` L1804, converted
-    // once. Exact for every window this port accepts: `w_bits <= MAX_WBITS` gives
+    // once. Exact for every window this implementation accepts: `w_bits <= MAX_WBITS` gives
     // `w_size <= 32768`. The fallback is unreachable, and is written rather than asserted so
     // that this function has no panicking path.
     let w_size_signed = isize::try_from(w_size).unwrap_or(isize::MAX);
@@ -306,14 +303,7 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
     // this function or anything it calls can reach.
     let wrap = state.wrap;
 
-    // ```c
-    // /* Copy as many min_block or larger stored blocks directly to next_out as
-    //  * possible. If flushing, copy the remaining available input to next_out as
-    //  * stored blocks, if there is enough space.
-    //  */
-    // do {
-    // ```
-    // -- `deflate.c` L1675-L1682. Rust has no `do`/`while`, so the continuation test is the
+    // `deflate.c` L1675-L1682. Rust has no `do`/`while`, so the continuation test is the
     // last statement of the body; the body therefore always runs at least once, as C's does.
     loop {
         // `len = MAX_STORED;  /* maximum deflate stored block length */`  (L1687)
@@ -328,22 +318,14 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
         // `have = ((unsigned)s->bi_valid + 42) >> 3;   /* bytes in header */`  (L1688)
         let header = header_bytes(state.bi_valid);
 
-        // ```c
-        // if (s->strm->avail_out < have)          /* need room for header */
-        //     break;
-        // ```
-        // -- L1689-L1690. Without room for the header there is no point computing anything
+        // L1689-L1690. Without room for the header there is no point computing anything
         // else; the tail of the function will write a block into `pending_buf` instead.
         if cursors.avail_out() < header {
             break;
         }
 
-        // ```c
-        //     /* maximum stored block length that will fit in avail_out: */
-        // have = s->strm->avail_out - have;
-        // ```
-        // -- L1691-L1692. `have` changes meaning here, from "header bytes" to "payload bytes
-        // that will fit"; the reference reuses the variable and so does this port, under a
+        // L1691-L1692. `have` changes meaning here, from "header bytes" to "payload bytes
+        // that will fit"; the reference reuses the variable and so does this implementation, under a
         // separate name so that both meanings are visible at once. Exact rather than merely
         // saturating: the test above established `avail_out >= header`.
         let have = cursors.avail_out().saturating_sub(header);
@@ -376,36 +358,17 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
         // emitted bytes are identical.
         let available = left.saturating_add(cursors.avail_in());
 
-        // ```c
-        // if (len > (ulg)left + s->strm->avail_in)
-        //     len = left + s->strm->avail_in;     /* limit len to the input */
-        // ```
-        // -- L1694-L1695.
+        // L1694-L1695.
         if len > available {
             len = available;
         }
 
-        // ```c
-        // if (len > have)
-        //     len = have;                         /* limit len to the output */
-        // ```
-        // -- L1696-L1697.
+        // L1696-L1697.
         if len > have {
             len = have;
         }
 
-        // ```c
-        // /* If the stored block would be less than min_block in length, or if
-        //  * unable to copy all of the available input when flushing, then try
-        //  * copying to the window and the pending buffer instead. Also don't
-        //  * write an empty block when flushing -- deflate() does that.
-        //  */
-        // if (len < min_block && ((len == 0 && flush != Z_FINISH) ||
-        //                         flush == Z_NO_FLUSH ||
-        //                         len != left + s->strm->avail_in))
-        //     break;
-        // ```
-        // -- L1699-L1707. A three-way disjunction inside a conjunction, and each part is
+        // L1699-L1707. A three-way disjunction inside a conjunction, and each part is
         // load-bearing, in the order the comment above explains them:
         //
         // * `len < min_block` gates the whole test: a block at least `min_block` long is
@@ -424,14 +387,7 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
             break;
         }
 
-        // ```c
-        // /* Make a dummy stored block in pending to get the header bytes,
-        //  * including any pending bits. This also updates the debugging counts.
-        //  */
-        // last = flush == Z_FINISH && len == left + s->strm->avail_in ? 1 : 0;
-        // _tr_stored_block(s, (char *)0, 0L, last);
-        // ```
-        // -- L1709-L1713. FIRST of the two `last` computations; the second, at L1837-L1838,
+        // L1709-L1713. FIRST of the two `last` computations; the second, at L1837-L1838,
         // adds `avail_in == 0` and compares against `left` rather than `available`.
         //
         // The call is the dummy: a null buffer and a zero length, purely so that the bit
@@ -444,14 +400,7 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
         last = flush == Flush::Finish && len == available;
         _tr_stored_block(state, None, 0, last);
 
-        // ```c
-        // /* Replace the lengths in the dummy stored block with len. */
-        // s->pending_buf[s->pending - 4] = (Bytef)len;
-        // s->pending_buf[s->pending - 3] = (Bytef)(len >> 8);
-        // s->pending_buf[s->pending - 2] = (Bytef)~len;
-        // s->pending_buf[s->pending - 1] = (Bytef)(~len >> 8);
-        // ```
-        // -- L1715-L1719, which is
+        // L1715-L1719, which is
         // [`crate::weak_slice::PendingBuf::patch_tail`]`(4, &[lo, hi, !lo, !hi])`: the four
         // bytes ending at the write cursor, bounds-checked against it rather than indexed
         // backwards from it.
@@ -493,22 +442,9 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
 
         // The `#ifdef ZLIB_DEBUG` counters at L1724-L1728 -- `s->compressed_len += len << 3`
         // and `s->bits_sent += len << 3` -- are debug-only accounting with no counterpart in
-        // this port, which carries neither field.
+        // this implementation, which carries neither field.
 
-        // ```c
-        // /* Copy uncompressed bytes from the window to next_out. */
-        // if (left) {
-        //     if (left > len)
-        //         left = len;
-        //     zmemcpy(s->strm->next_out, s->window + s->block_start, left);
-        //     s->strm->next_out += left;
-        //     s->strm->avail_out -= left;
-        //     s->strm->total_out += left;
-        //     s->block_start += left;
-        //     len -= left;
-        // }
-        // ```
-        // -- L1730-L1740. Note that `left` is *mutated* by the clamp before the copy and that
+        // L1730-L1740. Note that `left` is *mutated* by the clamp before the copy and that
         // `len` is reduced by it afterwards, so that the second copy below moves only the
         // remainder. Both matter: `left` is the block's window part and `len - left` is its
         // input part.
@@ -560,18 +496,7 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
             len = len.saturating_sub(copied);
         }
 
-        // ```c
-        // /* Copy uncompressed bytes directly from next_in to next_out, updating
-        //  * the check value.
-        //  */
-        // if (len) {
-        //     read_buf(s->strm, s->strm->next_out, len);
-        //     s->strm->next_out += len;
-        //     s->strm->avail_out -= len;
-        //     s->strm->total_out += len;
-        // }
-        // ```
-        // -- L1742-L1750, which is exactly [`read_buf_into_output`]; those five statements are
+        // L1742-L1750, which is exactly [`read_buf_into_output`]; those five statements are
         // pure cursor plumbing around one `read_buf`, and bundling them is what makes
         // "copy through `next_out` but forget to advance it" unrepresentable.
         //
@@ -605,16 +530,7 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
         }
     }
 
-    // ```c
-    // /* Update the sliding window with the last s->w_size bytes of the copied
-    //  * data, or append all of the copied data to the existing window if less
-    //  * than s->w_size bytes were copied. Also update the number of bytes to
-    //  * insert in the hash tables, in the event that deflateParams() switches to
-    //  * a non-zero compression level.
-    //  */
-    // used -= s->strm->avail_in;      /* number of input bytes directly copied */
-    // ```
-    // -- L1753-L1759. `used` was `avail_in` on entry, so this turns it into the number of
+    // L1753-L1759. `used` was `avail_in` on entry, so this turns it into the number of
     // bytes the loop above copied straight from `next_in` to `next_out`. Those bytes bypassed
     // the window entirely, and the window has to be brought up to date with them -- otherwise
     // a later `deflateParams` switch to a compressing level would match against stale history
@@ -623,24 +539,10 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
     // `saturating_sub` cannot saturate: `avail_in` only ever decreases here.
     used = used.saturating_sub(cursors.avail_in());
 
-    // ```c
-    // if (used) {
-    //     /* If any input was used, then no unused input remains in the window,
-    //      * therefore s->block_start == s->strstart.
-    //      */
-    // ```
-    // -- L1760-L1763.
+    // L1760-L1763.
     if used != 0 {
         if used >= w_size {
-            // ```c
-            // if (used >= s->w_size) {    /* supplant the previous history */
-            //     s->matches = 2;         /* clear hash */
-            //     zmemcpy(s->window, s->strm->next_in - s->w_size, s->w_size);
-            //     s->strstart = s->w_size;
-            //     s->insert = s->strstart;
-            // }
-            // ```
-            // -- L1764-L1769. A whole window's worth of input went past, so every byte of the
+            // L1764-L1769. A whole window's worth of input went past, so every byte of the
             // old history is now out of reach and the window is rebuilt from scratch out of
             // the last `w_size` bytes that were copied. Two or more slides is the same as a
             // clear, so `matches` goes straight to its maximum.
@@ -676,18 +578,7 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
             state.window.strstart = w_size;
             state.window.insert = state.window.strstart;
         } else {
-            // ```c
-            // if (s->window_size - s->strstart <= used) {
-            //     /* Slide the window down. */
-            //     s->strstart -= s->w_size;
-            //     zmemcpy(s->window, s->window + s->w_size, s->strstart);
-            //     if (s->matches < 2)
-            //         s->matches++;   /* add a pending slide_hash() */
-            //     if (s->insert > s->strstart)
-            //         s->insert = s->strstart;
-            // }
-            // ```
-            // -- L1771-L1779. Less than a window was copied, so the existing history is kept
+            // L1771-L1779. Less than a window was copied, so the existing history is kept
             // and the new bytes are appended to it -- after sliding the upper half down if
             // they would not otherwise fit.
             if window_size.saturating_sub(state.window.strstart) <= used {
@@ -767,14 +658,7 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
     // never-written bytes after a `deflateParams` switch.
     state.window.raise_high_water_to_strstart();
 
-    // ```c
-    // /* If the last block was written to next_out, then done. */
-    // if (last) {
-    //     s->bi_used = 8;
-    //     return finish_done;
-    // }
-    // ```
-    // -- L1789-L1793. `bi_used` is not optional: it is what `deflateUsed` reports
+    // L1789-L1793. `bi_used` is not optional: it is what `deflateUsed` reports
     // (`deflate.c` L737-L743), and a stored block always ends on a byte boundary, so all
     // eight bits of the last byte are used.
     if last {
@@ -782,13 +666,7 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
         return BlockState::FinishDone;
     }
 
-    // ```c
-    // /* If flushing and all input has been consumed, then done. */
-    // if (flush != Z_NO_FLUSH && flush != Z_FINISH &&
-    //     s->strm->avail_in == 0 && (long)s->strstart == s->block_start)
-    //     return block_done;
-    // ```
-    // -- L1795-L1798. All four conditions, and none is redundant: `Z_NO_FLUSH` has nothing to
+    // L1795-L1798. All four conditions, and none is redundant: `Z_NO_FLUSH` has nothing to
     // finish, `Z_FINISH` is handled by the `last` path above and by the tail below, unconsumed
     // input means there is more to do, and `strstart == block_start` is what "nothing is left
     // in the window" means. `bytes_since_block_start() == Some(0)` is the signed comparison
@@ -806,20 +684,7 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
     // `have = (unsigned)(s->window_size - s->strstart);`  (L1800-L1801)
     let mut have = window_size.saturating_sub(state.window.strstart);
 
-    // ```c
-    // if (s->strm->avail_in > have && s->block_start >= (long)s->w_size) {
-    //     /* Slide the window down. */
-    //     s->block_start -= s->w_size;
-    //     s->strstart -= s->w_size;
-    //     zmemcpy(s->window, s->window + s->w_size, s->strstart);
-    //     if (s->matches < 2)
-    //         s->matches++;           /* add a pending slide_hash() */
-    //     have += s->w_size;          /* more space now */
-    //     if (s->insert > s->strstart)
-    //         s->insert = s->strstart;
-    // }
-    // ```
-    // -- L1802-L1812. The second slide, and note the extra statement the first one does not
+    // L1802-L1812. The second slide, and note the extra statement the first one does not
     // have: `block_start` moves down too, because unlike at L1771 there may still be
     // unflushed window bytes belonging to the current block. The `block_start >= w_size` guard
     // is what keeps that subtraction from going negative.
@@ -851,24 +716,13 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
         state.window.clamp_insert_to_strstart();
     }
 
-    // ```c
-    // if (have > s->strm->avail_in)
-    //     have = s->strm->avail_in;
-    // ```
-    // -- L1813-L1814.
+    // L1813-L1814.
     if have > cursors.avail_in() {
         have = cursors.avail_in();
     }
 
-    // ```c
-    // if (have) {
-    //     read_buf(s->strm, s->window + s->strstart, have);
-    //     s->strstart += have;
-    //     s->insert += MIN(have, s->w_size - s->insert);
-    // }
-    // ```
-    // -- L1815-L1819. The second `read_buf` call, and the destination is the WINDOW this time,
-    // not the caller's output buffer as at L1746. Both go through the one shared port, so the
+    // L1815-L1819. The second `read_buf` call, and the destination is the WINDOW this time,
+    // not the caller's output buffer as at L1746. Both go through the one shared implementation, so the
     // wrap-dispatched check value is accumulated identically whichever way a byte travels --
     // which is what makes a level-0 stream's trailer independent of how the caller happened to
     // size its buffers.
@@ -905,19 +759,7 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
     // second raise; `strstart` has just advanced over freshly written window bytes.
     state.window.raise_high_water_to_strstart();
 
-    // ```c
-    // /* There was not enough avail_out to write a complete worthy or flushed
-    //  * stored block to next_out. Write a stored block to pending instead, if we
-    //  * have enough input for a worthy block, or if flushing and there is enough
-    //  * room for the remaining input as a stored block in the pending buffer.
-    //  */
-    // have = ((unsigned)s->bi_valid + 42) >> 3;   /* bytes in header */
-    //     /* maximum stored block length that will fit in pending: */
-    // have = (unsigned)MIN(s->pending_buf_size - have, MAX_STORED);
-    // min_block = MIN(have, s->w_size);
-    // left = (unsigned)(s->strstart - s->block_start);
-    // ```
-    // -- L1823-L1832.
+    // L1823-L1832.
     //
     // SECOND of the two `min_block` formulas, and it is a different expression from L1673's:
     // there `min_block` was `MIN(pending_buf_size - 5, w_size)`, sized against the caller's
@@ -931,12 +773,7 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
     min_block = min(have, w_size);
     let left = state.window.bytes_since_block_start().unwrap_or(0);
 
-    // ```c
-    // if (left >= min_block ||
-    //     ((left || flush == Z_FINISH) && flush != Z_NO_FLUSH &&
-    //      s->strm->avail_in == 0 && left <= have)) {
-    // ```
-    // -- L1833-L1835. A disjunction whose second arm is a four-way conjunction, reproduced
+    // L1833-L1835. A disjunction whose second arm is a four-way conjunction, reproduced
     // exactly:
     //
     // * `left >= min_block` -- a worthy block has accumulated in the window; write it whatever
@@ -954,11 +791,7 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
         // `len = MIN(left, have);`  (L1836)
         let len = min(left, have);
 
-        // ```c
-        // last = flush == Z_FINISH && s->strm->avail_in == 0 &&
-        //        len == left ? 1 : 0;
-        // ```
-        // -- L1837-L1838. SECOND of the two `last` computations, and deliberately not the
+        // L1837-L1838. SECOND of the two `last` computations, and deliberately not the
         // same test as L1712: it adds `avail_in == 0` and compares `len` against `left` rather
         // than against `left + avail_in`, because this block is drawn only from the window.
         last = flush == Flush::Finish && cursors.avail_in() == 0 && len == left;
@@ -992,13 +825,7 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
         );
     }
 
-    // ```c
-    // /* We've done all we can with the available input and output. */
-    // if (last)
-    //     s->bi_used = 8;
-    // return last ? finish_started : need_more;
-    // ```
-    // -- L1844-L1847. The second of the two `bi_used = 8` assignments; see the one at L1791.
+    // L1844-L1847. The second of the two `bi_used = 8` assignments; see the one at L1791.
     //
     // `finish_started` and not `finish_done`: the final block has been written, but it went
     // into `pending_buf` and may not have reached the caller in full, so `deflate()` must be
@@ -1015,15 +842,20 @@ pub(crate) fn deflate_stored<'a, A: Allocator<'a>>(
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
 #[cfg(test)]
-// `unwrap`, `panic` and indexing are already relaxed inside tests by `clippy.toml`;
+// `unwrap` and `panic` are already relaxed inside tests by `clippy.toml`;
 // `used_underscore_items` is not, and these tests call `_tr_init`, whose name is the C
 // spelling of `deflate.h` L311.
-#[allow(clippy::used_underscore_items)]
+// Fixture indexing: every index below is a literal into a fixture this module just built,
+// so each one is provably in range. `clippy::indexing_slicing` is denied workspace-wide and
+// is relaxed HERE ONLY, on the test module -- not through a clippy.toml key, which would be a
+// field the 1.80 floor does not recognise and would abort the whole lint run.
+#[allow(clippy::indexing_slicing)]
+// MSRV guard: `unknown_lints` comes first because `clippy::used_underscore_items` postdates the
+// declared 1.80 floor, where the lint NAME is itself an `unknown_lints` error under `-D warnings`.
+// Allowing `unknown_lints` in the same list makes the attribute inert on 1.80 and effective on
+// current stable. Do not drop it while the floor is 1.80.
+#[allow(unknown_lints, clippy::used_underscore_items)]
 mod tests {
     use super::{deflate_stored, header_bytes};
     use crate::deflate::algorithm::{BlockState, Flush, StreamCursors, MAX_STORED};
@@ -1035,10 +867,6 @@ mod tests {
     use crate::trees::_tr_init;
     use alloc::vec;
     use alloc::vec::Vec;
-
-    // -------------------------------------------------------------------------
-    //  Fixtures
-    // -------------------------------------------------------------------------
 
     /// Raw DEFLATE with the largest window: `windowBits = -15`, so `w_size` is 32768 and
     /// `window_size` is 65536, and nothing but the blocks themselves reaches the output.
@@ -1169,10 +997,6 @@ mod tests {
         (b << 16) | a
     }
 
-    // -------------------------------------------------------------------------
-    //  header_bytes -- deflate.c L1688 and L1828
-    // -------------------------------------------------------------------------
-
     /// `((unsigned)bi_valid + 42) >> 3` over the field's whole real domain, computed by hand.
     #[test]
     fn header_bytes_matches_the_c_expression() {
@@ -1186,10 +1010,6 @@ mod tests {
         assert_eq!(header_bytes(7), 6);
         assert_eq!(header_bytes(15), 7);
     }
-
-    // -------------------------------------------------------------------------
-    //  The direct-copy loop -- deflate.c L1682-L1751
-    // -------------------------------------------------------------------------
 
     /// An empty stream finished in one call: a single empty final stored block.
     ///
@@ -1389,10 +1209,6 @@ mod tests {
         assert_eq!(cursors.total_out, 18);
     }
 
-    // -------------------------------------------------------------------------
-    //  The two breaks out of the loop -- deflate.c L1689 and L1704
-    // -------------------------------------------------------------------------
-
     /// Too little output space for even a block header takes the `deflate.c` L1689 break, and
     /// the block is then written to `pending_buf` instead (`deflate.c` L1828-L1842).
     ///
@@ -1457,10 +1273,6 @@ mod tests {
         assert_eq!(&emitted[5..], &data[..600]);
     }
 
-    // -------------------------------------------------------------------------
-    //  min_block, both formulas -- deflate.c L1673 and L1831
-    // -------------------------------------------------------------------------
-
     /// `memLevel == 1` shrinks `min_block` from 32768 to 507, and that changes the emitted
     /// blocks for an input the default memory level would decline to copy directly.
     ///
@@ -1504,10 +1316,6 @@ mod tests {
         assert_eq!(state.pending_bytes(), 512);
         assert_eq!(state.window.block_start, 600 + 507);
     }
-
-    // -------------------------------------------------------------------------
-    //  The two window slides -- deflate.c L1771-L1779 and L1802-L1812
-    // -------------------------------------------------------------------------
 
     /// Copying input through when the window is nearly full slides the window down first
     /// (`deflate.c` L1771-L1779) and books one pending `slide_hash`.
@@ -1598,10 +1406,6 @@ mod tests {
         assert_eq!(state.pending_bytes(), 5 + 40_000 - 4);
         assert_eq!(state.window.block_start, 7232 + 40_000);
     }
-
-    // -------------------------------------------------------------------------
-    //  block_done -- deflate.c L1795-L1798
-    // -------------------------------------------------------------------------
 
     /// A flush that consumed everything and left nothing in the window reports
     /// [`BlockState::BlockDone`], so that `deflate()` goes on to emit its own flush marker.

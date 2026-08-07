@@ -3,7 +3,7 @@
 //!
 //! `gzlib.c`, `gzread.c`, `gzwrite.c` and `gzclose.c` -- the four translation units the `gzFile`
 //! layer is built from -- contain between them exactly **one** reference to a gzip header byte: the
-//! four-byte magic test at `gzread.c` L151-L153. This module is the port of that test plus the
+//! four-byte magic test at `gzread.c` L151-L153. This module implements that test plus the
 //! vocabulary that makes the rest of the layer legible. Everything else about the container is the
 //! business of the compression engines, and the next section says so precisely, because the most
 //! important property of this file is what it does *not* contain.
@@ -38,33 +38,11 @@
 //!
 //! # Member layout
 //!
-//! `doc/rfc1952.txt` L242-L277, reproduced so that the constants below can be read against it.
-//! Every multi-byte integer is little-endian, and the three optional strings and the extra field
-//! appear only when the corresponding `FLG` bit is set:
-//!
-//! ```text
-//!  +---+---+---+---+---+---+---+---+---+---+
-//!  |ID1|ID2|CM |FLG|     MTIME     |XFL|OS |            fixed, 10 bytes   (RFC L242-L244)
-//!  +---+---+---+---+---+---+---+---+---+---+
-//!  +---+---+=================================+
-//!  | XLEN  |...XLEN bytes of "extra field"...|  if FLG.FEXTRA               (RFC L248-L250)
-//!  +---+---+=================================+
-//!  +=========================================+
-//!  |...original file name, zero-terminated...|  if FLG.FNAME                (RFC L254-L256)
-//!  +=========================================+
-//!  +===================================+
-//!  |...file comment, zero-terminated...|        if FLG.FCOMMENT             (RFC L260-L262)
-//!  +===================================+
-//!  +---+---+
-//!  | CRC16 |                                    if FLG.FHCRC                (RFC L266-L268)
-//!  +---+---+
-//!  +=======================+
-//!  |...compressed blocks...|                                                (RFC L270-L272)
-//!  +=======================+
-//!  +---+---+---+---+---+---+---+---+
-//!  |     CRC32     |     ISIZE     |            trailer, 8 bytes  (RFC L274-L277)
-//!  +---+---+---+---+---+---+---+---+
-//! ```
+//! A member is a fixed 10-byte header -- `ID1`, `ID2`, `CM`, `FLG`, `MTIME`, `XFL`, `OS` -- then
+//! the optional `FEXTRA`, `FNAME`, `FCOMMENT` and `FHCRC` fields in that order, each present only
+//! when its `FLG` bit is set, then the compressed blocks, then an 8-byte trailer of `CRC32` and
+//! `ISIZE` (`doc/rfc1952.txt` L242-L277, the authority for the diagram and the field widths). Every
+//! multi-byte integer is little-endian.
 //!
 //! A `.gz` file is a sequence of such members, and both `gzread.c` and the reference `gzip`
 //! implementation read them one after another; `gz_look` is called again for each one, which is why
@@ -93,18 +71,14 @@
 //!
 //! # Compliance
 //!
-//! `doc/rfc1952.txt` L462-L480 splits the obligation in two, and this port is on both sides of it:
-//!
-//! * A compliant **compressor** must produce correct `ID1`, `ID2`, `CM`, `CRC32` and `ISIZE`, may
-//!   default everything else in the fixed header (255 for `OS`, 0 for the rest), and must set every
-//!   reserved bit to zero. Those five fields are emitted by `deflate`, at `deflate.c` L1069-L1071
-//!   and L1269-L1276; the defaults appear at `deflate.c` L1073-L1081.
-//! * A compliant **decompressor** must check `ID1`, `ID2` and `CM` and report an error if any is
-//!   wrong, must examine `FEXTRA`/`XLEN`, `FNAME`, `FCOMMENT` and `FHCRC` at least well enough to
-//!   skip them, need not look at anything else, and **must** report an error if any reserved bit is
-//!   set, "since such a bit could indicate the presence of a new field that would cause subsequent
-//!   data to be interpreted incorrectly" (RFC L477-L480). `inflate` performs all of that: the magic
-//!   word at `inflate.c` L513, the compression method at L562, and the reserved bits at L563.
+//! `doc/rfc1952.txt` L462-L480 splits the obligation between compressor and decompressor, and this
+//! implementation is on both sides of it. The compressor's five mandatory fields -- `ID1`, `ID2`,
+//! `CM`, `CRC32` and `ISIZE` -- are emitted by `deflate` (`deflate.c` L1069-L1071 and L1269-L1276),
+//! with the permitted defaults at L1073-L1081. The decompressor's mandatory checks are performed by
+//! `inflate`: the magic word at `inflate.c` L513, the compression method at L562, and the reserved
+//! bits at L563. The last of those is not optional — a set reserved bit may signal a new field that
+//! would make everything after it be read wrongly (RFC L477-L480) — which is why the predicate below
+//! tests it too rather than deferring it.
 //!
 //! # How this module reports failure
 //!
@@ -117,11 +91,9 @@
 //!
 //! # Environment
 //!
-//! `core` only. This module needs neither `alloc` nor `std`, even though
-//! `crates/zlib-rs/src/lib.rs` gates the whole `gz` module tree on the crate's `std` feature
-//! because its siblings perform file I/O. Keeping the vocabulary independent of that gate means it
-//! stays usable if the gating is ever revisited, and it is why no per-item `cfg` attribute appears
-//! below.
+//! `core` only: this module needs neither `alloc` nor `std`, even though the crate root gates the
+//! whole `gz` tree on the `std` feature because its siblings perform file I/O. That is why no
+//! per-item `cfg` attribute appears below.
 
 // `dead_code` is allowed for this module, and for this module alone, because a format vocabulary is
 // complete when it covers the format rather than when every entry happens to have a caller.
@@ -146,10 +118,6 @@
 
 use crate::crc32::crc32;
 
-// -----------------------------------------------------------------------------
-//  Field widths
-// -----------------------------------------------------------------------------
-
 /// Width in bytes of a little-endian 16-bit field of a gzip member.
 ///
 /// Three fields have this width: `XLEN` (`doc/rfc1952.txt` L248-L250 and L415-L417), the `LEN` of a
@@ -163,10 +131,6 @@ const U16_LEN: usize = 2;
 /// and `CRC32` and `ISIZE` in the trailer (L274-L277). Used by [`u32_le`] and [`write_u32_le`],
 /// which read and write exactly this many bytes.
 const U32_LEN: usize = 4;
-
-// -----------------------------------------------------------------------------
-//  Identification and compression method
-// -----------------------------------------------------------------------------
 
 /// First identification byte of a gzip member: `31`, that is `0x1f`.
 ///
@@ -195,10 +159,6 @@ pub(crate) const MAGIC_LE: u16 = 0x8b1f;
 /// -- `doc/rfc1952.txt` L294-L299. This is the only value this library writes (`deflate.c` L1071)
 /// or accepts (`inflate.c` L562, which rejects anything else with "unknown compression method").
 pub(crate) const CM_DEFLATE: u8 = 8;
-
-// -----------------------------------------------------------------------------
-//  FLG -- the flag byte
-// -----------------------------------------------------------------------------
 
 /// `FLG.FTEXT`, bit 0: the payload is probably ASCII text.
 ///
@@ -260,10 +220,6 @@ pub(crate) const FLG_RESERVED: u8 = 0xe0;
 /// [`FLG_RESERVED`] mask test for all 256 possible flag bytes.
 const FLG_RESERVED_FLOOR: u8 = 32;
 
-// -----------------------------------------------------------------------------
-//  MTIME, XFL and OS
-// -----------------------------------------------------------------------------
-
 /// The `MTIME` value that means "no timestamp is available": `0`.
 ///
 /// `MTIME` is a 32-bit little-endian count of seconds since the Unix epoch, and "MTIME = 0 means no
@@ -301,10 +257,6 @@ pub(crate) const XFL_FASTEST: u8 = 4;
 /// Unix, at L187-L188. A gzip member produced by `gzip(1)` on Linux likewise carries `3`. So this
 /// constant is the vocabulary for "unspecified", not a value to assert against a produced member.
 pub(crate) const OS_UNKNOWN: u8 = 255;
-
-// -----------------------------------------------------------------------------
-//  Lengths and offsets
-// -----------------------------------------------------------------------------
 
 /// Length in bytes of the fixed part of a member header: `10`.
 ///
@@ -357,10 +309,6 @@ pub(crate) const SUBFIELD_HEADER_LEN: usize = 4;
 /// what the invariant below states.
 pub(crate) const DETECT_PREFIX_LEN: usize = 4;
 
-// -----------------------------------------------------------------------------
-//  Invariants, pinned at compile time
-// -----------------------------------------------------------------------------
-//
 // Each block below states a relationship between two things that are separately transcribed from
 // `doc/rfc1952.txt` or from the C sources, so that a slip in either transcription is a build failure
 // rather than a wrong byte on the wire. They are `const _` items, so they are checked in every
@@ -382,6 +330,11 @@ const _: () = assert!(
 /// `doc/rfc1952.txt` L303-L310 assigns bits 0 to 4 and reserves bits 5 to 7. Checking the partition
 /// catches a duplicated or omitted bit value in the five constants above, which a hand-written
 /// [`FLG_KNOWN`] would not.
+// Compile-time contract, not a runtime check: `assert!` inside `const _: () = { ... }` is
+// evaluated by the compiler, so a violation is a build failure rather than a test failure. Every
+// operand is a `const`, which is the point; clippy 0.1.80's `assertions_on_constants` reads that
+// as a no-op assertion, so it is relaxed here. Current stable exempts const contexts already.
+#[allow(clippy::assertions_on_constants)]
 const _: () = {
     assert!(
         FLG_KNOWN == 0x1f,
@@ -423,6 +376,11 @@ const _: () = {
 /// `doc/rfc1952.txt` L242-L244. Written as a sum of the field widths so that [`HEADER_LEN`] cannot
 /// drift from the diagram, and so that the four-byte detection prefix is visibly the part of the
 /// header that precedes `MTIME` -- which is what `gzread.c` L151-L153 inspects.
+// Compile-time contract, not a runtime check: `assert!` inside `const _: () = { ... }` is
+// evaluated by the compiler, so a violation is a build failure rather than a test failure. Every
+// operand is a `const`, which is the point; clippy 0.1.80's `assertions_on_constants` reads that
+// as a no-op assertion, so it is relaxed here. Current stable exempts const contexts already.
+#[allow(clippy::assertions_on_constants)]
 const _: () = {
     assert!(
         HEADER_LEN == DETECT_PREFIX_LEN + U32_LEN + 1 + 1,
@@ -439,6 +397,11 @@ const _: () = {
 /// `doc/rfc1952.txt` L274-L277. Checking that the two offsets and the two widths tile
 /// [`TRAILER_LEN`] catches a swapped pair of offsets, which is the mistake that would otherwise be
 /// caught only by a reader rejecting the produced file.
+// Compile-time contract, not a runtime check: `assert!` inside `const _: () = { ... }` is
+// evaluated by the compiler, so a violation is a build failure rather than a test failure. Every
+// operand is a `const`, which is the point; clippy 0.1.80's `assertions_on_constants` reads that
+// as a no-op assertion, so it is relaxed here. Current stable exempts const contexts already.
+#[allow(clippy::assertions_on_constants)]
 const _: () = {
     assert!(
         TRAILER_CRC32_OFFSET == 0,
@@ -458,6 +421,11 @@ const _: () = {
 ///
 /// `doc/rfc1952.txt` L415-L417 for `XLEN` and L437-L439 with L459-L460 for the subfield header,
 /// whose four bytes are the two identifier bytes plus a 16-bit length.
+// Compile-time contract, not a runtime check: `assert!` inside `const _: () = { ... }` is
+// evaluated by the compiler, so a violation is a build failure rather than a test failure. Every
+// operand is a `const`, which is the point; clippy 0.1.80's `assertions_on_constants` reads that
+// as a no-op assertion, so it is relaxed here. Current stable exempts const contexts already.
+#[allow(clippy::assertions_on_constants)]
 const _: () = {
     assert!(
         XLEN_LEN == U16_LEN,
@@ -474,6 +442,11 @@ const _: () = {
 /// `doc/rfc1952.txt` L364-L372 for `MTIME`; L374-L381 and `deflate.c` L1078-L1080 for the three arms
 /// of the `XFL` conditional. `OS` is a single byte whose "unknown" value is the largest one it can
 /// hold, which is what makes `255` a safe sentinel (`doc/rfc1952.txt` L399-L413).
+// Compile-time contract, not a runtime check: `assert!` inside `const _: () = { ... }` is
+// evaluated by the compiler, so a violation is a build failure rather than a test failure. Every
+// operand is a `const`, which is the point; clippy 0.1.80's `assertions_on_constants` reads that
+// as a no-op assertion, so it is relaxed here. Current stable exempts const contexts already.
+#[allow(clippy::assertions_on_constants)]
 const _: () = {
     assert!(
         MTIME_NONE.to_le_bytes().len() == U32_LEN,
@@ -491,19 +464,10 @@ const _: () = {
     );
 };
 
-// -----------------------------------------------------------------------------
-//  The one predicate the file layer owns
-// -----------------------------------------------------------------------------
-
 /// Does `prefix` begin with four bytes consistent with a gzip member header?
 ///
-/// Port of the test at `gzread.c` L151-L153, reproduced term for term and in the same order:
-///
-/// ```text
-/// if (strm->avail_in > 3 &&
-///         strm->next_in[0] == 31 && strm->next_in[1] == 139 &&
-///         strm->next_in[2] == 8 && strm->next_in[3] < 32) {
-/// ```
+/// The test at `gzread.c` L151-L153, reproduced term for term and in the same order: more than
+/// three bytes available, then `31`, `139`, `8`, and a fourth byte below `32`.
 ///
 /// # What the caller does with the answer
 ///
@@ -538,11 +502,10 @@ const _: () = {
 /// # Short input is `false`, not an error
 ///
 /// Fewer than [`DETECT_PREFIX_LEN`] bytes answers `false`, mirroring the `strm->avail_in > 3` term.
-/// That is not the same as "this is not gzip": `gz_look` distinguishes the two cases *before* it
-/// reaches this test, returning early at `gzread.c` L143-L146 when a non-blocking read has stalled
-/// with fewer than four bytes so that a later call can try again with more. Deciding between "not
-/// gzip" and "come back later" needs the file state, which this function does not have and must not
-/// acquire; the caller keeps that decision.
+/// That is not the same as "this is not gzip", and the difference is the caller's to make: deciding
+/// between "not gzip" and "come back later" needs the file state, which this function does not have.
+/// `gz_look` separates the two before reaching here, returning early at `gzread.c` L143-L146 when a
+/// non-blocking read stalled with fewer than four bytes.
 #[must_use]
 pub(crate) fn looks_like_gzip(prefix: &[u8]) -> bool {
     // `gzread.c` L151's `strm->avail_in > 3`, spelled as a fallible fixed-size borrow so that the
@@ -557,10 +520,6 @@ pub(crate) fn looks_like_gzip(prefix: &[u8]) -> bool {
     // spelling; the exhaustive invariant above establishes that it is a reserved-bit test.
     id1 == ID1 && id2 == ID2 && cm == CM_DEFLATE && flg < FLG_RESERVED_FLOOR
 }
-
-// -----------------------------------------------------------------------------
-//  Little-endian field codecs
-// -----------------------------------------------------------------------------
 
 /// Read a little-endian 16-bit member field from the start of `bytes`.
 ///
@@ -613,10 +572,6 @@ pub(crate) fn write_u32_le(out: &mut [u8], value: u32) -> Option<()> {
     Some(())
 }
 
-// -----------------------------------------------------------------------------
-//  FHCRC
-// -----------------------------------------------------------------------------
-
 /// The `CRC16` value that `FLG.FHCRC` announces, computed over `header_bytes`.
 ///
 /// "If FHCRC is set, a CRC16 for the gzip header is present, immediately before the compressed data.
@@ -631,7 +586,7 @@ pub(crate) fn write_u32_le(out: &mut [u8], value: u32) -> Option<()> {
 ///
 /// # Fidelity
 ///
-/// The check value comes from [`crate::crc32::crc32`], the port of `crc32.c`, seeded with zero, which
+/// The check value comes from [`crate::crc32::crc32`], the Rust counterpart of `crc32.c`, seeded with zero, which
 /// is the same entry point and the same seed both C sides use: `deflate.c` L1110-L1112 runs
 /// `crc32_z` over the pending buffer once the header has been staged, and `inflate.c` accumulates
 /// over each field as it is parsed (L516 for the seed, then L517, L571, L580, L591, L602, L623, L645
@@ -651,6 +606,11 @@ pub(crate) fn header_crc16(header_bytes: &[u8]) -> u16 {
     u16::from_le_bytes([low, high])
 }
 
+// Fixture indexing: every index below is a literal into a fixture this module just built,
+// so each one is provably in range. `clippy::indexing_slicing` is denied workspace-wide and
+// is relaxed HERE ONLY, on the test module -- not through a clippy.toml key, which would be a
+// field the 1.80 floor does not recognise and would abort the whole lint run.
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::{
@@ -670,7 +630,7 @@ mod tests {
     /// A complete gzip member: the output of `printf 'hello' | gzip -c` on this machine.
     ///
     /// Captured with `od -An -tx1` and pinned here as a fixture, so the assertions below are made
-    /// against a member produced by `gzip(1)` itself rather than against this port's own output.
+    /// against a member produced by `gzip(1)` itself rather than against this implementation's own output.
     /// Its shape is the diagram in the module documentation: ten fixed header bytes with no optional
     /// fields (`FLG` is zero), seven bytes of compressed blocks, then the eight-byte trailer.
     ///
@@ -735,10 +695,6 @@ mod tests {
     fn fixed_header(flg: u8, os: u8) -> [u8; HEADER_LEN] {
         [ID1, ID2, CM_DEFLATE, flg, 0, 0, 0, 0, XFL_UNSPECIFIED, os]
     }
-
-    // -------------------------------------------------------------------------
-    //  Constants against the RFC and the C sources
-    // -------------------------------------------------------------------------
 
     /// `doc/rfc1952.txt` L291-L299 and `inflate.c` L513: the identification bytes and the method.
     #[test]
@@ -823,10 +779,6 @@ mod tests {
         assert_eq!(DETECT_PREFIX_LEN, 4);
         assert_eq!(DETECT_PREFIX_LEN, HEADER_LEN - U32_LEN - 2);
     }
-
-    // -------------------------------------------------------------------------
-    //  looks_like_gzip
-    // -------------------------------------------------------------------------
 
     /// The two prefixes at the extremes of the accepted flag range, per `gzread.c` L151-L153.
     #[test]
@@ -913,10 +865,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  Little-endian codecs
-    // -------------------------------------------------------------------------
-
     /// Reading takes the leading field, little-endian, and ignores the rest of the slice.
     #[test]
     fn codecs_read_the_leading_field_little_endian() {
@@ -1002,10 +950,6 @@ mod tests {
         assert_eq!(&buffer[..U32_LEN], &[0x78, 0x56, 0x34, 0x12]);
         assert!(buffer[U32_LEN..].iter().all(|&byte| byte == 0x5a));
     }
-
-    // -------------------------------------------------------------------------
-    //  The trailer, read and written at the documented offsets
-    // -------------------------------------------------------------------------
 
     /// The trailer of a member produced by `gzip(1)` decodes to the CRC-32 and length of `hello`.
     ///
@@ -1095,10 +1039,6 @@ mod tests {
         assert_eq!(field, [0; U32_LEN]);
     }
 
-    // -------------------------------------------------------------------------
-    //  The extra field
-    // -------------------------------------------------------------------------
-
     /// The `XLEN` and subfield constants suffice to walk an extra field to its exact end.
     ///
     /// `doc/rfc1952.txt` L431-L461. The walk lives in this test rather than in the module: parsing
@@ -1153,10 +1093,6 @@ mod tests {
             "the subfields must tile XLEN exactly"
         );
     }
-
-    // -------------------------------------------------------------------------
-    //  header_crc16
-    // -------------------------------------------------------------------------
 
     /// The `FHCRC` value is the low two bytes of the CRC-32 of the header bytes, and nothing else.
     ///

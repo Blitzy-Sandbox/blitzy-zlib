@@ -39,18 +39,17 @@
 //! * the portable `core::simd` API is nightly-only and this workspace pins stable;
 //! * reinterpreting `&[u8]` as wider lanes needs a transmute, a raw pointer or a union.
 //!
-//! What is left is the shape of the code itself, and that turns out to be sufficient. The
-//! loop below is written to be vectorisable rather than vectorised -- fixed-size accumulator
-//! arrays, a `const` offset table, straight-line arithmetic, no data-dependent branch in the
-//! hot path and no early exit -- and at `opt-level = 3`, the release profile this library
-//! ships with, that is enough: the emitted x86-64 code for this module contains packed
-//! `paddd` accumulation, `punpck` widening of bytes to 32-bit lanes and `pshufd` horizontal
-//! reductions. Verified by inspecting the generated assembly, not assumed.
+//! What is left is the shape of the code itself. The loop below is written to be
+//! vectorisable rather than vectorised -- fixed-size accumulator arrays, a `const` offset
+//! table, straight-line arithmetic, no data-dependent branch in the hot path and no early
+//! exit -- so that the autovectoriser has a form it can lift under the release profile's
+//! `opt-level = 3`. Whether it actually does so is a property of the toolchain and target,
+//! not a contract of this module, and nothing here depends on the answer.
 //!
-//! The corollary is a maintenance rule. If a future toolchain stops vectorising this, the
-//! symptom will be a throughput regression rather than a wrong answer, and the fix is to
-//! reshape the loop -- never to reach for an intrinsic, which would move the port's `unsafe`
-//! boundary into the algorithmic core and cost far more than the throughput is worth.
+//! The corollary is a maintenance rule. If a toolchain does not vectorise this, the symptom
+//! is a throughput difference rather than a wrong answer, and the fix is to reshape the loop
+//! -- never to reach for an intrinsic, which would move the `unsafe` boundary into the
+//! algorithmic core and cost far more than the throughput is worth.
 //!
 //! The upshot is worth stating plainly, because it is what makes this file safe by
 //! construction rather than by review: there is no architecture-specific instruction here
@@ -86,14 +85,18 @@
 //! `(sum1 + S, sum2 + n * sum1 + W)`, in which `sum1` is structurally the incoming value, so
 //! the ordering requirement cannot be violated by a later edit.
 //!
-//! # The lane decomposition, which is what makes it fast
+//! # The lane decomposition, which is what it is for
 //!
-//! Applying the closed form once per 16-byte sub-chunk would already be correct, but it
-//! would also be *slower than the scalar path* -- measured, not assumed: the two sums it
-//! needs are horizontal reductions, and paying for two of them every sixteen bytes costs
-//! more than the two dependent adds per byte it replaces. The arrangement below pays for
-//! them once per `NMAX` block instead, and that is the whole difference between this backend
-//! being worth compiling and being dead weight.
+//! Applying the closed form once per 16-byte sub-chunk would already be correct, but it would
+//! be expected to run *slower than the scalar path*: the two sums it needs are horizontal
+//! reductions, and paying for two of them every sixteen bytes should cost more than the two
+//! dependent adds per byte it replaces. The arrangement below pays for them once per `NMAX`
+//! block instead, which is the design reason this backend is worth compiling at all.
+//!
+//! **Read the throughput reasoning in this module as design intent, not as result.** No
+//! benchmark artifact is committed in this repository yet -- the `benches/` directory does not
+//! exist -- so nothing here has been substantiated by a reproducible measurement, and no claim
+//! below should be relied on as one.
 //!
 //! Number the whole sub-chunks of a block `t = 0 .. m-1` and the byte offsets within one
 //! sub-chunk `i = 0 .. k-1`, so byte `b_(t,i)` sits at position `j = k*t + i` of the
@@ -128,17 +131,26 @@
 //! What this buys is that the inner loop becomes `k` independent accumulator chains of plain
 //! adds -- no multiply, no reduction, no dependence between lanes -- which is what a
 //! vectoriser wants, and what an out-of-order core pipelines even when the vectoriser
-//! declines. Measured on this machine against the scalar backend on identical data: about
-//! `3.0x` from 4 KiB upwards, `2.5x` at 512 bytes and `1.9x` at 256. Below
-//! [`LANE_THRESHOLD_LEN`] the fixed cost is not recovered, so the call is handed to the scalar
-//! backend instead and this backend is never the slower of the two. A 32- and a 64-lane
-//! variant were also measured and were slower at *every* size, so the lane count is 16.
+//! declines. That is the whole of the throughput argument, and it is an argument rather than a
+//! number: **this module publishes no speed ratio, because none has been measured in a way this
+//! repository can reproduce.** Whoever lands `benches/checksum_bench.rs` should record the
+//! ratios there, per input size and per target, and may then cite them from here.
 //!
-//! Two implementation details are load-bearing for those numbers, and both are recorded where
-//! they appear: the lane state must not be merged into the running sums until the block is
-//! finished, and `accumulate_block` and `fold_lanes` must carry `#[inline(always)]` rather
-//! than the ordinary hint -- with a hint, the optimiser leaves the lane arrays behind a call
-//! boundary and the kernel measures about `0.8x`, slower than the code it replaces.
+//! The same caution applies to two design choices that would otherwise look empirical:
+//!
+//! * **The lane count is 16**, chosen because it divides `NMAX` exactly and matches one 128-bit
+//!   vector register (see [`SUB_CHUNK`]), not because wider variants were benchmarked and
+//!   rejected here.
+//! * **Below [`LANE_THRESHOLD_LEN`] the call is handed to the scalar backend**, on the reasoning
+//!   that the fixed per-block cost cannot be recovered over a short buffer. The intent is that
+//!   this backend should not be the slower of the two at any size; that is the goal the
+//!   threshold serves, and confirming it needs the benchmark.
+//!
+//! Two implementation details are load-bearing, and both are recorded where they appear: the
+//! lane state must not be merged into the running sums until the block is finished, and
+//! `accumulate_block` and `fold_lanes` must carry `#[inline(always)]` rather than the ordinary
+//! hint, because behind a call boundary the optimiser cannot keep the lane arrays in registers
+//! and the kernel degenerates to scalar work plus overhead.
 //!
 //! # Block structure and where the reductions happen
 //!
@@ -228,9 +240,10 @@
 //! }
 //! ```
 //!
-//! [`Adler32Simd`] is public, and deliberately so: the checksum benchmark measures the
-//! scalar and vectorised backends against each other from outside this crate, which it can
-//! only do if it can name both. Every kernel helper stays private.
+//! [`Adler32Simd`] is public, and deliberately so: the planned `benches/checksum_bench.rs` is to
+//! measure the scalar and vectorised backends against each other from outside this crate, which
+//! it can only do if it can name both. That benchmark has not landed yet, so the type is public
+//! for a consumer that does not exist here. Every kernel helper stays private.
 //!
 //! # Layering and safety posture
 //!
@@ -243,7 +256,9 @@
 //!
 //! # Examples
 //!
-//! ```ignore
+//! ```
+//! use zlib_rs::adler32::{Adler32Backend, Adler32Generic, Adler32Simd};
+//!
 //! // Interchangeable with the scalar backend, which is the whole point.
 //! assert_eq!(
 //!     Adler32Simd::checksum(1, b"hello, hello!"),
@@ -256,17 +271,22 @@
 //! // Resumable across arbitrary splits, because the running value is the whole state.
 //! let staged = Adler32Simd::checksum(Adler32Simd::checksum(1, b"hel"), b"lo");
 //! assert_eq!(staged, Adler32Simd::checksum(1, b"hello"));
-//!
-//! // A hint, never a gate: the answer below changes nothing about the values above.
-//! let _profitable: bool = is_supported();
 //! ```
+//!
+//! [`is_supported`] is crate-private and cannot appear above: it is a throughput hint the
+//! parent module consults, and no value in this example depends on what it answers.
+
+// Names that repeat their module's name are deliberate here: the C sources this module ports name
+// these entry points, and `crates/zlib-rs/src/lib.rs` re-exports several of them under exactly
+// these names, so renaming any of them to satisfy `clippy::module_name_repetitions` would cost the
+// traceability the port is judged on. The lint sits in `pedantic`, which this workspace denies, and
+// it fires on the declared 1.80 floor; upstream has since reclassified it, so the allowance is what
+// keeps the same lint gate passing on both toolchains. The same relaxation, for the same reason,
+// already appears in `config.rs`, `deflate/**`, `inflate/**` and `gz/**`.
+#![allow(clippy::module_name_repetitions)]
 
 use super::generic;
 use super::{Adler32Backend, BASE, NMAX};
-
-// -----------------------------------------------------------------------------
-//  Loop shape constants
-// -----------------------------------------------------------------------------
 
 /// Byte offset of each lane within a sub-chunk: `i` for `i` in `0..k`.
 ///
@@ -277,8 +297,8 @@ use super::{Adler32Backend, BASE, NMAX};
 /// Held as `const` data for two reasons. It lets the compiler materialise a constant vector
 /// instead of deriving `i` per element, and it removes the one narrowing conversion this
 /// kernel would otherwise need: `i` is naturally a `usize` index while the accumulators are
-/// `u32`, and a cast between them is exactly the kind of silent-truncation risk a port like
-/// this one has no reason to introduce.
+/// `u32`, and a cast between them is exactly the kind of silent-truncation risk this module
+/// has no reason to introduce.
 const POSITIONS: [u32; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 /// Number of bytes one vectorisable step of the block loop consumes -- the lane count `k`.
@@ -292,8 +312,10 @@ const POSITIONS: [u32; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 
 /// `adler32.c` L99. A full block is therefore an exact number of steps and leaves no tail,
 /// which is what keeps the tail handling confined to the final partial block. Sixteen bytes
 /// is also one 128-bit vector register, so the accumulation the compiler is being invited to
-/// widen is the natural width on every Tier-1 target -- and it measured fastest: 32 and 64
-/// lanes were both slower at every input size, as recorded in the module documentation.
+/// widen is the natural width on every Tier-1 target. Those two structural reasons -- exact
+/// divisibility and register width -- are the whole justification for the value. It is **not**
+/// backed by a committed benchmark comparing 16, 32 and 64 lanes; see the caution in the module
+/// documentation before treating any lane count here as empirically optimal.
 const SUB_CHUNK: usize = POSITIONS.len();
 
 /// [`SUB_CHUNK`] as the accumulators' own type: the `k` of the lane decomposition, both the
@@ -316,27 +338,25 @@ const SHORT_INPUT_LEN: usize = SUB_CHUNK;
 
 /// Length below which the whole call is handed to the scalar backend instead.
 ///
-/// The lane arrangement amortises three horizontal reductions and a multiply over a block, so
-/// on a very short input it pays that cost without recovering it. Measured on this machine,
-/// this backend against the scalar one on the same data:
+/// The lane arrangement amortises three horizontal reductions and a multiply over a block, so on
+/// a very short input it pays that cost without recovering it. Four sub-chunks -- 64 bytes -- is
+/// the length at which the amortised cost is expected to be recovered, and that expectation is
+/// the whole basis for the value.
 ///
-/// ```text
-/// bytes   16    32    48    64    96   128   256   512   1024   4096+
-/// ratio 0.44  0.68  0.85  1.03  1.34  1.51  1.95  2.47   2.73    3.00
-/// ```
+/// **This threshold is a design choice, not a measured crossover.** An earlier version of this
+/// comment published a per-size ratio table as though it had been measured; no benchmark artifact
+/// exists in this repository (`benches/` has not landed), so no such table can be substantiated
+/// and it has been removed rather than left to be read as evidence.
 ///
-/// Four sub-chunks is where the curve crosses one, so below that the call is delegated and
-/// this backend is never the slower of the two at any length -- which is what makes selecting
-/// it a free decision for the parent module rather than a trade-off.
+/// The *goal* the threshold serves is that this backend should not be the slower of the two at any
+/// length, which is what would make selecting it a free decision for the parent module rather than
+/// a trade-off. Establishing that -- and retuning the constant if it does not hold -- is work for
+/// `benches/checksum_bench.rs`, which should record its numbers where they can be reproduced.
 ///
 /// Delegation is not a behavioural fork: the two backends agree bit for bit on every input and
 /// every starting value, which is the property the equivalence sweep at the bottom of this file
 /// establishes for exactly the lengths that straddle this threshold.
 const LANE_THRESHOLD_LEN: usize = 4 * SUB_CHUNK;
-
-// -----------------------------------------------------------------------------
-//  Compile-time contract pins
-// -----------------------------------------------------------------------------
 
 /// The overflow argument in the module documentation is arithmetic about specific numbers,
 /// not a general property, so the numbers it assumes are pinned here. Changing either
@@ -378,10 +398,6 @@ const _: () = assert!(
     "SUB_CHUNK_WEIGHT must be the lane count, so the last lane offset is one below it"
 );
 
-// -----------------------------------------------------------------------------
-//  The vectorisable kernel
-// -----------------------------------------------------------------------------
-
 /// Fold a block's lane accumulators into the component sums, reducing neither.
 ///
 /// The closed form from the module documentation, evaluated once per block from the three
@@ -416,12 +432,14 @@ const _: () = assert!(
 ///
 /// `P <= (k - 1) * S` because each lane's offset is below `k`, and `(k - 1) * S < k * (C + S)`
 /// because `C` is non-negative, so the subtraction is always in range.
-// `#[inline(always)]` rather than the ordinary hint, and the difference is not cosmetic.
-// With `#[inline]` the optimiser declines to inline this, the lane arrays stay behind a call
-// boundary, the widening the loop shape was written for never happens, and the kernel measures
-// about 0.8x the scalar backend -- slower than the code it exists to replace. With the
-// directive it measures about 3x. Both numbers were taken on this machine against the scalar
-// backend on identical data; re-measure before weakening this to a hint.
+// `#[inline(always)]` rather than the ordinary hint, and the difference is not cosmetic. The
+// directive exists so the lane arrays stay in registers: behind a call boundary the optimiser
+// cannot widen the accumulation the loop shape was written for, and the backend would then be
+// doing the scalar work with extra bookkeeping -- i.e. slower than the code it exists to
+// replace. That is the design reason, and it is a prediction about codegen, not a measurement:
+// no benchmark artifact is committed in this repository yet (`benches/` does not exist). Do not
+// weaken this to a hint without measuring first, and record the numbers where they can be
+// reproduced rather than in prose.
 #[allow(clippy::inline_always)]
 #[inline(always)]
 #[must_use]
@@ -506,12 +524,14 @@ fn accumulate_bytes(mut sum1: u32, mut sum2: u32, bytes: &[u8]) -> (u32, u32) {
 ///
 /// `block` must be no longer than `NMAX` bytes. That is the entire reason the outer loop in
 /// `adler32_blocks` exists, and the overflow argument depends on it.
-// `#[inline(always)]` rather than the ordinary hint, and the difference is not cosmetic.
-// With `#[inline]` the optimiser declines to inline this, the lane arrays stay behind a call
-// boundary, the widening the loop shape was written for never happens, and the kernel measures
-// about 0.8x the scalar backend -- slower than the code it exists to replace. With the
-// directive it measures about 3x. Both numbers were taken on this machine against the scalar
-// backend on identical data; re-measure before weakening this to a hint.
+// `#[inline(always)]` rather than the ordinary hint, and the difference is not cosmetic. The
+// directive exists so the lane arrays stay in registers: behind a call boundary the optimiser
+// cannot widen the accumulation the loop shape was written for, and the backend would then be
+// doing the scalar work with extra bookkeeping -- i.e. slower than the code it exists to
+// replace. That is the design reason, and it is a prediction about codegen, not a measurement:
+// no benchmark artifact is committed in this repository yet (`benches/` does not exist). Do not
+// weaken this to a hint without measuring first, and record the numbers where they can be
+// reproduced rather than in prose.
 #[allow(clippy::inline_always)]
 #[inline(always)]
 #[must_use]
@@ -553,9 +573,9 @@ fn accumulate_block(sum1: u32, sum2: u32, block: &[u8]) -> (u32, u32) {
 }
 
 /// Update a checksum with a buffer of any length, as reached for inputs of at least
-/// [`LANE_THRESHOLD_LEN`] bytes.
+/// `LANE_THRESHOLD_LEN` bytes.
 ///
-/// Port of the block engine at `adler32.c` L97-L121: the `while (len >= NMAX)` loop that
+/// Mirrors the block engine at `adler32.c` L97-L121: the `while (len >= NMAX)` loop that
 /// consumes full blocks and the `if (len)` tail that consumes what remains, with both halves
 /// reduced after each.
 ///
@@ -572,7 +592,7 @@ fn accumulate_block(sum1: u32, sum2: u32, block: &[u8]) -> (u32, u32) {
 ///
 /// The reductions are `%`, matching the `MOD` macro in the shipped configuration
 /// (`adler32.c` L55-L57); the `NO_DIVIDE` variant at L36-L40 computes the same residues by
-/// shift and subtract and is not the configuration this port reproduces.
+/// shift and subtract and is not the configuration this implementation reproduces.
 #[must_use]
 fn adler32_blocks(adler: u32, buf: &[u8]) -> u32 {
     let (mut sum1, mut sum2) = generic::split(adler);
@@ -588,22 +608,17 @@ fn adler32_blocks(adler: u32, buf: &[u8]) -> u32 {
     generic::combine_halves(sum1, sum2)
 }
 
-// -----------------------------------------------------------------------------
-//  The backend
-// -----------------------------------------------------------------------------
-
 /// The vectorisation-friendly Adler-32 backend: the same checksum as the scalar path,
 /// arranged so that a compiler can compute sixteen bytes at a time.
 ///
 /// Available on every target -- it contains no architecture-specific instruction -- and
-/// selected by the parent module when [`is_supported`] reports that the arrangement is
+/// selected by the parent module when `is_supported` reports that the arrangement is
 /// likely to pay for itself. Substituting it for the scalar backend, or the scalar backend
 /// for it, cannot change any value this library produces.
 ///
-/// This type carries no state. It exists so that a backend can be named: by the dispatcher
-/// in the parent module, by the benchmark that compares scalar against vectorised
-/// throughput, and by the equivalence tests, which must be able to pin a computation to one
-/// specific implementation.
+/// This type carries no state. It exists so that a backend can be named: by the dispatcher in
+/// the parent module, and by any consumer -- a throughput comparison, or the equivalence tests
+/// below -- that must pin a computation to one specific implementation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Adler32Simd;
 
@@ -614,13 +629,13 @@ impl Adler32Backend for Adler32Simd {
     /// its paths do not reduce alike and the order is therefore behaviour rather than style.
     /// One path is added to the C source's three, and it is a throughput decision only:
     ///
-    /// 1. One byte -- delegated to the scalar module's port of the fast path at
+    /// 1. One byte -- delegated to the scalar module's mirror of the fast path at
     ///    `adler32.c` L70-L78, which reduces both halves by a single conditional
     ///    subtraction and can legitimately return a high half that is not fully reduced.
-    /// 2. Fewer than [`SHORT_INPUT_LEN`] bytes, the empty slice included -- delegated to the
+    /// 2. Fewer than `SHORT_INPUT_LEN` bytes, the empty slice included -- delegated to the
     ///    scalar module's port of `adler32.c` L85-L94, which reduces `sum1` by subtraction
     ///    but `sum2` by `%`.
-    /// 3. Fewer than [`LANE_THRESHOLD_LEN`] bytes -- the scalar backend's own block engine,
+    /// 3. Fewer than `LANE_THRESHOLD_LEN` bytes -- the scalar backend's own block engine,
     ///    because the lane arrangement does not recover its fixed cost on an input that
     ///    short. This is a throughput choice with no behavioural content: the two backends
     ///    agree bit for bit, as the sweep over every length either side of the threshold
@@ -633,8 +648,8 @@ impl Adler32Backend for Adler32Simd {
     /// backend to drift from the scalar one on some starting value nobody thought to try.
     ///
     /// Between paths 1 and 2 the C source tests `buf == Z_NULL` and returns `1L`
-    /// (`adler32.c` L81-L82). A `&[u8]` cannot be null, so there is nothing to port at that
-    /// position; the facade crate answers a null pointer with the initial value without ever
+    /// (`adler32.c` L81-L82). A `&[u8]` cannot be null, so that test has no counterpart
+    /// here; the facade crate answers a null pointer with the initial value without ever
     /// calling in here. An **empty slice is not `Z_NULL`** -- it takes path 2 and returns the
     /// incoming value normalised, so `checksum(0, &[])` is `0` and not `1`.
     #[inline]
@@ -660,10 +675,6 @@ impl Adler32Backend for Adler32Simd {
         adler32_blocks(adler, buf)
     }
 }
-
-// -----------------------------------------------------------------------------
-//  Backend selection
-// -----------------------------------------------------------------------------
 
 /// Report whether this backend is expected to be profitable on the running target.
 ///
@@ -699,10 +710,11 @@ impl Adler32Backend for Adler32Simd {
 ///
 /// # What this function deliberately does not do
 ///
-/// It does not read the environment. `ZLIB_RS_SIMD` is a build-time toggle consumed by the
-/// facade crate's build script; it reaches this module only by enabling or disabling the
-/// `simd` feature, and a library that inspected the environment on a hot path would be both
-/// slower and less predictable than one that did not.
+/// It does not read the environment. Which backend is compiled in is decided entirely by the
+/// `simd` Cargo feature; `ZLIB_RS_SIMD` is only a build-time cross-check in the facade crate's
+/// build script, which fails the build when that variable and the resolved feature set
+/// disagree. A library that inspected the environment on a hot path would be both slower and
+/// less predictable than one that did not.
 #[must_use]
 pub fn is_supported() -> bool {
     vector_unit_available()
@@ -896,7 +908,7 @@ mod tests {
     /// An independent model of RFC 1950 (`doc/rfc1950.txt` L325-L329), reducing both sums
     /// after every single byte.
     ///
-    /// Deliberately neither a port of `adler32.c` nor a copy of the kernel above: it is
+    /// Deliberately neither a mirror of `adler32.c` nor a copy of the kernel above: it is
     /// derived from the specification alone, so agreement with it is evidence about the
     /// algorithm rather than a restatement of the code under test. Reduction is a ring
     /// homomorphism, so reducing eagerly and reducing once per block yield the same residues;
@@ -947,8 +959,10 @@ mod tests {
 
     #[test]
     fn the_lane_threshold_delegates_without_changing_a_value() {
-        // Four sub-chunks, which is where the measured throughput curve in the constant's own
-        // documentation crosses one. Pinned so that a future retune is a deliberate edit.
+        // Four sub-chunks: the smallest block for which the per-block fixed cost is expected to
+        // be recovered, per the reasoning in the constant's own documentation. The value is a
+        // design choice, not a measured crossover -- see the module documentation. Pinned so that
+        // a future retune is a deliberate edit rather than a drift.
         assert_eq!(LANE_THRESHOLD_LEN, 4 * SUB_CHUNK);
         assert_eq!(LANE_THRESHOLD_LEN, 64);
         // That the threshold stays above the scalar short path -- otherwise the dispatch order
@@ -1479,7 +1493,7 @@ mod tests {
     #[test]
     fn the_backend_marker_carries_the_derives_its_consumers_need() {
         // Zero-sized, so naming a backend costs nothing at run time, and carrying every derive
-        // the dispatcher, the benchmark and the equivalence tests rely on.
+        // the dispatcher and the equivalence tests rely on.
         let backend: Adler32Simd = default_of();
         let cloned = clone_of(&backend);
         let copied = cloned;

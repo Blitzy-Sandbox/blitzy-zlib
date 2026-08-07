@@ -1,15 +1,8 @@
 //! The `Z_HUFFMAN_ONLY` compressor: every input byte becomes a Huffman literal.
 //!
-//! This is the port of `deflate_huff` (`deflate.c` L2155-L2185), the last function in the
+//! This implements `deflate_huff` (`deflate.c` L2155-L2185), the last function in the
 //! reference implementation's encoder and the simplest of its five compressors. The comment
-//! above it states the whole of its contract (L2151-L2154):
-//!
-//! ```text
-//! /* ===========================================================================
-//!  * For Z_HUFFMAN_ONLY, do not look for matches.  Do not maintain a hash table.
-//!  * (It will be regenerated if this run of deflate switches away from Huffman.)
-//!  */
-//! ```
+//! above it states the whole of its contract (L2151-L2154).
 //!
 //! No match finding, no hash-chain insertion, no lazy evaluation: the compressor walks the
 //! window one byte at a time and hands each byte to the literal tally, so the only
@@ -23,14 +16,7 @@
 //! Through the strategy, never through the level table.
 //! `configuration_table` (`deflate.c` L112-L124) names only `deflate_stored`,
 //! `deflate_fast` and `deflate_slow`, so `deflate/config_table.rs` cannot select this
-//! function. The dispatch chain in `deflate()` is what does (L1217-L1220):
-//!
-//! ```text
-//! bstate = s->level == 0 ? deflate_stored(s, flush) :
-//!          s->strategy == Z_HUFFMAN_ONLY ? deflate_huff(s, flush) :
-//!          s->strategy == Z_RLE ? deflate_rle(s, flush) :
-//!          (*(configuration_table[s->level].func))(s, flush);
-//! ```
+//! function. The dispatch chain in `deflate()` is what does (L1217-L1220).
 //!
 //! Level 0 is tested first, so `Z_HUFFMAN_ONLY` at level 0 stores rather than Huffman-codes;
 //! [`crate::deflate::algorithm::CompressFunc::select`] preserves that precedence.
@@ -56,7 +42,7 @@
 //!   on entry, so a stale value survives a strategy switch.
 //!
 //! The `Tracevv` at L2171 is `ZLIB_DEBUG`-only and has no counterpart here -- no logging, no
-//! tracing state. `FASTEST` and `LIT_MEM` are not ported and must never become Cargo
+//! tracing state. `FASTEST` and `LIT_MEM` are not implemented and must never become Cargo
 //! features of this crate: both change the compressed output, and a build knob that changes
 //! the output is indistinguishable from a bug in a library whose contract is byte-identical
 //! compression.
@@ -84,7 +70,7 @@
 //
 // * `BlockState`, `Flush`, `StreamCursors` and `flush_block!` are the shared dispatch
 //   vocabulary of `deflate/algorithm.rs`. `StreamCursors` stands in for `s->strm`, which
-//   this port cannot hold as a field, and `flush_block!` is `FLUSH_BLOCK` including the
+//   this implementation cannot hold as a field, and `flush_block!` is `FLUSH_BLOCK` including the
 //   early `return` that C's macro performs on behalf of its caller.
 // * `Allocator` and `DeflateState` come as a pair: `DeflateState<'a, A: Allocator<'a>>`
 //   cannot be named without the bound.
@@ -99,43 +85,9 @@ use crate::trees::_tr_tally;
 
 /// Compresses the available input as Huffman literals, one per byte.
 ///
-/// Port of `deflate_huff` (`deflate.c` L2155-L2185), the `Z_HUFFMAN_ONLY` strategy: no match
+/// Mirrors `deflate_huff` (`deflate.c` L2155-L2185), the `Z_HUFFMAN_ONLY` strategy: no match
 /// finding and no hash table, so every byte of the window is emitted as a literal and only
 /// the entropy coder compresses.
-///
-/// ```text
-/// local block_state deflate_huff(deflate_state *s, int flush) {
-///     int bflush;             /* set if current block must be flushed */
-///
-///     for (;;) {
-///         /* Make sure that we have a literal to write. */
-///         if (s->lookahead == 0) {
-///             fill_window(s);
-///             if (s->lookahead == 0) {
-///                 if (flush == Z_NO_FLUSH)
-///                     return need_more;
-///                 break;      /* flush the current block */
-///             }
-///         }
-///
-///         /* Output a literal byte */
-///         s->match_length = 0;
-///         Tracevv((stderr,"%c", s->window[s->strstart]));
-///         _tr_tally_lit(s, s->window[s->strstart], bflush);
-///         s->lookahead--;
-///         s->strstart++;
-///         if (bflush) FLUSH_BLOCK(s, 0);
-///     }
-///     s->insert = 0;
-///     if (flush == Z_FINISH) {
-///         FLUSH_BLOCK(s, 1);
-///         return finish_done;
-///     }
-///     if (s->sym_next)
-///         FLUSH_BLOCK(s, 0);
-///     return block_done;
-/// }
-/// ```
 ///
 /// # Arguments
 ///
@@ -165,11 +117,14 @@ use crate::trees::_tr_tally;
 /// Every iteration either consumes one byte of `lookahead` or leaves through the guard, and
 /// `fill_window` only ever adds bytes the caller supplied, so the loop runs at most once per
 /// input byte plus once. Nothing here can spin on an unchanged state.
-//
 // `_tr_tally` keeps the underscore-prefixed C spelling of `deflate.h` L312 for oracle
 // traceability, which `clippy::pedantic` flags at the call site. The same relaxation, for the
 // same reason, appears in `deflate/algorithm.rs` and `trees/mod.rs`.
-#[allow(clippy::used_underscore_items)]
+// MSRV guard: `unknown_lints` comes first because `clippy::used_underscore_items` postdates the
+// declared 1.80 floor, where the lint NAME is itself an `unknown_lints` error under `-D warnings`.
+// Allowing `unknown_lints` in the same list makes the attribute inert on 1.80 and effective on
+// current stable. Do not drop it while the floor is 1.80.
+#[allow(unknown_lints, clippy::used_underscore_items)]
 pub(crate) fn deflate_huff<'a, A: Allocator<'a>>(
     state: &mut DeflateState<'a, A>,
     cursors: &mut StreamCursors<'_, '_>,
@@ -241,22 +196,13 @@ pub(crate) fn deflate_huff<'a, A: Allocator<'a>>(
         // `_tr_tally_lit(s, s->window[s->strstart], bflush);`  (L2172)
         //
         // `LIT_MEM` is commented out at `deflate.h` L28, so the live macro is the `#else`
-        // branch at L357-L364:
-        //
-        // ```text
-        // { uch cc = (c);
-        //   s->sym_buf[s->sym_next++] = 0;
-        //   s->sym_buf[s->sym_next++] = 0;
-        //   s->sym_buf[s->sym_next++] = cc;
-        //   s->dyn_ltree[cc].Freq++;
-        //   flush = (s->sym_next == s->sym_end); }
-        // ```
+        // branch at L357-L364.
         //
         // A distance of zero is how the three-byte symbol record spells "literal", so
         // `_tr_tally(state, 0, literal)` performs precisely those five steps: the two zero
         // bytes and `cc` into `sym_buf`, `dyn_ltree[cc].Freq++`, and
         // `sym_next == sym_end` as the return value. The `LIT_MEM` variant at L339-L345,
-        // with its separate `d_buf` and `l_buf`, is not ported; neither is the `ZLIB_DEBUG`
+        // with its separate `d_buf` and `l_buf`, is not implemented; neither is the `ZLIB_DEBUG`
         // fallback at L378-L380, which routes to the same function anyway.
         let bflush = _tr_tally(state, 0, literal);
 
@@ -316,16 +262,21 @@ pub(crate) fn deflate_huff<'a, A: Allocator<'a>>(
     BlockState::BlockDone
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
 #[cfg(test)]
-// `unwrap`, `expect`, `panic` and indexing are already relaxed inside tests by `clippy.toml`;
+// `unwrap`, `expect` and `panic` are already relaxed inside tests by `clippy.toml`;
 // `used_underscore_items` is not, and these tests call `_tr_init`, whose name is the C
 // spelling of `deflate.h` L311. The same relaxation, for the same reason, appears in
 // `deflate/algorithm.rs` and `trees/mod.rs`.
-#[allow(clippy::used_underscore_items)]
+// Fixture indexing: every index below is a literal into a fixture this module just built,
+// so each one is provably in range. `clippy::indexing_slicing` is denied workspace-wide and
+// is relaxed HERE ONLY, on the test module -- not through a clippy.toml key, which would be a
+// field the 1.80 floor does not recognise and would abort the whole lint run.
+#[allow(clippy::indexing_slicing)]
+// MSRV guard: `unknown_lints` comes first because `clippy::used_underscore_items` postdates the
+// declared 1.80 floor, where the lint NAME is itself an `unknown_lints` error under `-D warnings`.
+// Allowing `unknown_lints` in the same list makes the attribute inert on 1.80 and effective on
+// current stable. Do not drop it while the floor is 1.80.
+#[allow(unknown_lints, clippy::used_underscore_items)]
 mod tests {
     use super::deflate_huff;
     use crate::config::Z_UNKNOWN;
@@ -336,10 +287,6 @@ mod tests {
     };
     use crate::read_buf::{InputCursor, OutputCursor};
     use crate::trees::_tr_init;
-
-    // -------------------------------------------------------------------------
-    //  Fixtures
-    // -------------------------------------------------------------------------
 
     /// A non-zero `insert` planted before each call, so that "the call set `insert` to zero"
     /// is distinguishable from "`insert` was zero all along".
@@ -400,20 +347,9 @@ mod tests {
         (bstate, cursors.output.written())
     }
 
-    // -------------------------------------------------------------------------
-    //  Byte identity against the C oracle
-    // -------------------------------------------------------------------------
-
     // The four vectors below were produced by the reference implementation in this tree,
     // built by the environment's oracle build (`-O3 -fPIC -D_LARGEFILE64_SOURCE=1
-    // -DHAVE_HIDDEN`), driven with exactly the call this test makes:
-    //
-    // ```text
-    // deflateInit2(&s, 6, Z_DEFLATED, -15, memLevel, Z_HUFFMAN_ONLY);
-    // s.next_in = input; s.avail_in = inlen;
-    // s.next_out = out;  s.avail_out = sizeof out;   /* never short */
-    // deflate(&s, Z_FINISH);                          /* returns Z_STREAM_END */
-    // ```
+    // -DHAVE_HIDDEN`), driven with exactly the call this test makes.
     //
     // A single call with ample output space makes `deflate()` a transparent wrapper around
     // `deflate_huff`: raw `windowBits` means no header and no trailer, and `finish_done`
@@ -526,10 +462,6 @@ mod tests {
             "output diverged from C zlib"
         );
     }
-
-    // -------------------------------------------------------------------------
-    //  The loop, the guard and the tail
-    // -------------------------------------------------------------------------
 
     /// `if (flush == Z_NO_FLUSH) return need_more;` (`deflate.c` L2163-L2164).
     ///

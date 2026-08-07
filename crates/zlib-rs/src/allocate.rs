@@ -1,19 +1,12 @@
 //! Working-memory acquisition and release: the one place `zlib-rs` obtains a
 //! byte of heap, and the one place it gives one back.
 //!
-//! # The contract being ported
+//! # The allocator contract
 //!
 //! In the reference implementation every buffer the library uses is obtained
 //! through three caller-supplied members of `z_stream` -- `zalloc`, `zfree` and
 //! `opaque` (`zlib.h` L102-L104) -- reached through three macros
 //! (`zutil.h` L252-L255):
-//!
-//! ```c
-//! #define ZALLOC(strm, items, size) \
-//!            (*((strm)->zalloc))((strm)->opaque, (items), (size))
-//! #define ZFREE(strm, addr)  (*((strm)->zfree))((strm)->opaque, (voidpf)(addr))
-//! #define TRY_FREE(s, p) {if (p) ZFREE(s, p);}
-//! ```
 //!
 //! The hooks themselves are `alloc_func` and `free_func` (`zlib.h` L85-L86), and
 //! the header states the contract normatively at `zlib.h` L144-L153: the
@@ -36,15 +29,7 @@
 //! This is the single most consequential fact in this module. The generic
 //! `zcalloc` (`zutil.c` L299-L303) reads:
 //!
-//! ```c
-//! voidpf ZLIB_INTERNAL zcalloc(voidpf opaque, unsigned items, unsigned size) {
-//!     (void)opaque;
-//!     return sizeof(uInt) > 2 ? (voidpf)malloc(items * size) :
-//!                               (voidpf)calloc(items, size);
-//! }
-//! ```
-//!
-//! `uInt` is four bytes wide on every target this port supports, so
+//! `uInt` is four bytes wide on every target this implementation supports, so
 //! `sizeof(uInt) > 2` is always true and the branch taken is always **`malloc`**,
 //! never `calloc`. Default-allocated blocks therefore hold whatever the platform
 //! allocator left behind, and a caller-supplied hook is under no obligation to do
@@ -171,6 +156,13 @@
 //! visibility (`zutil.h` L16-L20), and `zlib.map` lists both in its `local:`
 //! block. Nothing in this module is exported to C, given C-compatible linkage, or
 //! given a C-compatible layout; the names below are Rust API only.
+//!
+//! [`SENTINEL_FILL`]: crate::allocate::SENTINEL_FILL
+
+// The definitions closing the module documentation above are link-reference definitions, not
+// prose: a module whose `mod` declaration carries an outer doc comment has its `//!` block
+// resolved in the scope of the DECLARING module, so an unqualified sibling name does not
+// resolve. See "Documentation lints" in `src/lib.rs` for the rule and the gate.
 
 use core::ffi::c_void;
 use core::fmt;
@@ -216,7 +208,7 @@ impl Opaque {
     /// The null `opaque`, which is what an initialisation function installs when
     /// it substitutes the library's own allocation routines.
     ///
-    /// Ported from `strm->opaque = (voidpf)0`, `deflate.c` L406.
+    /// Mirrors `strm->opaque = (voidpf)0`, `deflate.c` L406.
     pub const NULL: Self = Self(core::ptr::null_mut());
 
     /// Wraps a caller-supplied `opaque` pointer.
@@ -267,10 +259,6 @@ impl Default for Opaque {
         Self::NULL
     }
 }
-
-// -----------------------------------------------------------------------------
-//  Allocator identity
-// -----------------------------------------------------------------------------
 
 /// The identity of one allocator, used to prove that a block is being returned to
 /// the allocator it came from.
@@ -354,10 +342,6 @@ impl AllocatorId {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  The `items * size` product
-// -----------------------------------------------------------------------------
-
 /// The size in bytes of an `items` by `size` allocation request, or [`None`] if
 /// that product does not fit in a `usize`.
 ///
@@ -367,7 +351,7 @@ impl AllocatorId {
 /// allocator widens first (`size_t len = count * (size_t)size`, L76). An
 /// unchecked product is the classic route from an allocation bug to a
 /// memory-safety bug -- it yields a block far smaller than the caller believes it
-/// asked for -- so this port computes it checked, in `usize`, and treats overflow
+/// asked for -- so this implementation computes it checked, in `usize`, and treats overflow
 /// as an allocation failure.
 ///
 /// This cannot change behaviour for any request the library actually makes: every
@@ -377,7 +361,9 @@ impl AllocatorId {
 /// multiplication before calling a caller's hook and should perform it the same
 /// way.
 ///
-/// ```ignore
+/// ```
+/// use zlib_rs::allocate::block_len;
+///
 /// assert_eq!(block_len(32768, 2), Some(65536)); // deflate.c L458
 /// assert_eq!(block_len(usize::MAX, 2), None);   // overflow, not a wrapped size
 /// ```
@@ -385,10 +371,6 @@ impl AllocatorId {
 pub const fn block_len(items: usize, size: usize) -> Option<usize> {
     items.checked_mul(size)
 }
-
-// -----------------------------------------------------------------------------
-//  Allocated blocks
-// -----------------------------------------------------------------------------
 
 /// Where a [`Buffer`]'s elements actually live.
 ///
@@ -513,6 +495,38 @@ impl<'a, T> Buffer<'a, T> {
     /// A `len` of zero yields an empty buffer. That is a valid, releasable buffer
     /// with no elements: [`Buffer::as_slice`] is empty, so there is nothing to
     /// read or write through and no dangling storage to misuse.
+    ///
+    /// # ★ Every element is written, and that has to be measured, not hidden
+    ///
+    /// `try_reserve_exact` obtains the capacity and `resize` then writes `len`
+    /// copies of `fill` into it. C's `zcalloc` (`zutil.c` L299-L308) is a plain
+    /// `malloc` and writes nothing. So a Rust stream is *born* having touched
+    /// every byte it owns, where a C stream is not: initialising a
+    /// default-configuration deflate state -- a 64 KiB window, a 64 KiB `prev`, a
+    /// 128 KiB `head` and a 64 KiB pending buffer -- means roughly a quarter of a
+    /// megabyte written before the first input byte arrives.
+    ///
+    /// This is deliberate and is not an algorithmic defect. A block handed out by
+    /// a caller's `zalloc` may contain anything at all --
+    /// `test/infcover.c` L87 fills every one with `0xa5` precisely to catch code
+    /// that assumes otherwise -- and safe Rust cannot hand out a partially
+    /// initialised slice, so the fill is what makes `Buffer::as_slice` a slice at
+    /// all. What it does mean is that **construction cost and steady-state
+    /// throughput must not be measured together**. Any benchmark of this library
+    /// is required to:
+    ///
+    /// * build and reset streams **outside** the timed region, so that a
+    ///   compression or decompression rate is a rate for the algorithm and not
+    ///   for `memset`;
+    /// * time initialisation and reset as their own measurements, since they are a
+    ///   real cost that a caller who opens many short-lived streams will pay; and
+    /// * report the initialised-allocation cost with the memory figures rather
+    ///   than folding it into the throughput ones, because it is the honest place
+    ///   for it.
+    ///
+    /// The ad-hoc probes used while this was being written follow exactly that
+    /// discipline, and `benches/**` must too when it lands: cost that is invisible
+    /// in a rate is cost that gets attributed to the wrong thing.
     #[must_use]
     pub fn try_global(len: usize, fill: T) -> Option<Self>
     where
@@ -606,11 +620,13 @@ impl<'a, T> Buffer<'a, T> {
     /// reliable: an implementation cannot accidentally compare against the wrong
     /// identity, because it has none to pass.
     ///
-    /// ```ignore
+    /// The three outcomes a call site must handle:
+    ///
+    /// ```text
     /// match buffer.release_to(self) {
     ///     Release::Handled => {}
-    ///     Release::Foreign(block) => /* call the caller's zfree on block */ (),
-    ///     Release::Refused(_) => /* not ours; releasing it would corrupt */ (),
+    ///     Release::Foreign(block) => call the caller's zfree on block,
+    ///     Release::Refused(_) => not ours; releasing it would corrupt,
     /// }
     /// ```
     #[must_use = "a refused release means the block was not freed"]
@@ -670,16 +686,12 @@ impl<T> fmt::Debug for Buffer<'_, T> {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  The injected allocator
-// -----------------------------------------------------------------------------
-
 /// The source of every buffer the library uses, injected into the state types
 /// that need one.
 ///
 /// This is the Rust form of the `(zalloc, zfree, opaque)` triple from `z_stream`
 /// (`zlib.h` L102-L104). Two implementations exist across the workspace:
-/// [`GlobalAllocator`] here, which is the port of `zcalloc`/`zcfree`
+/// [`GlobalAllocator`] here, which is the mirror of `zcalloc`/`zcfree`
 /// (`zutil.c` L299-L308) and is what an initialisation function substitutes when
 /// both caller hooks are `Z_NULL` (`deflate.c` L401-L414); and one in the
 /// `libz-rs-sys` facade, which calls the caller's hooks. The algorithms take
@@ -899,10 +911,6 @@ where
     }
 }
 
-// -----------------------------------------------------------------------------
-//  The default allocator
-// -----------------------------------------------------------------------------
-
 /// The byte a fresh block is filled with.
 ///
 /// [`SENTINEL_FILL`] in debug builds, so that a state constructor which
@@ -915,6 +923,12 @@ where
 /// a fresh buffer before writing it, so no fill value can reach the compressed
 /// output. Both cost one pass over the block, so the split is about test signal
 /// rather than speed.
+///
+/// ★ Because *both* values cost that pass, choosing zero in release builds does
+/// not make the fill free -- it only makes it plain. C's `zcalloc` writes nothing
+/// at all, so this pass has no counterpart in the reference and must be reported
+/// as an initialisation cost rather than absorbed into a throughput figure; see
+/// [`Buffer::try_global`] for the measurement obligation that follows.
 #[cfg(debug_assertions)]
 const FILL_BYTE: u8 = SENTINEL_FILL;
 
@@ -923,7 +937,7 @@ const FILL_BYTE: u8 = SENTINEL_FILL;
 #[cfg(not(debug_assertions))]
 const FILL_BYTE: u8 = 0;
 
-/// The library's own allocator: the port of `zcalloc` and `zcfree`.
+/// The library's own allocator: the mirror of `zcalloc` and `zcfree`.
 ///
 /// `zutil.c` L299-L308 defines the internal routines that an initialisation
 /// function installs when the caller leaves both hooks `Z_NULL`
@@ -975,7 +989,7 @@ impl<'a> Allocator<'a> for GlobalAllocator {
 
     /// Returns [`Opaque::NULL`].
     ///
-    /// Ported from `strm->opaque = (voidpf)0` at `deflate.c` L406: an
+    /// Mirrors `strm->opaque = (voidpf)0` at `deflate.c` L406: an
     /// initialisation function that installs the internal routines also clears
     /// `opaque`, because those routines ignore it (`zutil.c` L300 and L306 both
     /// discard it with `(void)opaque`).
@@ -987,16 +1001,22 @@ impl<'a> Allocator<'a> for GlobalAllocator {
     ///
     /// The product is computed with [`block_len`], so an overflow is reported as
     /// an allocation failure rather than silently wrapping to a short block. This
-    /// is the port of `malloc(items * size)` from `zutil.c` L301, with the
+    /// is the mirror of `malloc(items * size)` from `zutil.c` L301, with the
     /// multiplication checked and the failure reported instead of the process
     /// aborting.
+    ///
+    /// It also *writes* `items * size` bytes where `malloc` writes none, which is
+    /// a startup cost with no counterpart in the reference; see
+    /// [`Buffer::try_global`] for why that is unavoidable in safe Rust and how a
+    /// benchmark is required to account for it.
     fn allocate_bytes(&self, items: usize, size: usize) -> Option<Buffer<'a, u8>> {
         Buffer::try_global(block_len(items, size)?, FILL_BYTE)
     }
 
     /// Allocates `items` unsigned 16-bit values from Rust's global allocator.
     ///
-    /// The port of `ZALLOC(strm, items, sizeof(Pos))` (`deflate.c` L459-L460).
+    /// The Rust counterpart of `ZALLOC(strm, items, sizeof(Pos))` (`deflate.c` L459-L460),
+    /// which likewise initialises every element; see [`Buffer::try_global`].
     fn allocate_u16s(&self, items: usize) -> Option<Buffer<'a, u16>> {
         // The C call multiplies `items` by `sizeof(Pos)` before allocating, so
         // reject a byte size that cannot be represented for exactly the reason
@@ -1009,7 +1029,7 @@ impl<'a> Allocator<'a> for GlobalAllocator {
 
     /// Returns a byte block to Rust's global allocator.
     ///
-    /// The port of `free(ptr)` from `zutil.c` L307. The release goes through
+    /// The Rust counterpart of `free(ptr)` from `zutil.c` L307. The release goes through
     /// [`Buffer::release_to`], so a block belonging to some other allocator is
     /// refused rather than freed here; the refusal is safe in both directions,
     /// since a refused Rust allocation still runs its own destructor.
@@ -1024,10 +1044,6 @@ impl<'a> Allocator<'a> for GlobalAllocator {
         drop(buffer.release_to(self));
     }
 }
-
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

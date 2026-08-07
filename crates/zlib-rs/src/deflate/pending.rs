@@ -1,6 +1,6 @@
 //! The pending-output buffer: bytes the compressor has produced but not yet handed back.
 //!
-//! Six things the reference implementation keeps together around `pending_buf` are ported here:
+//! Six things the reference implementation keeps together around `pending_buf` are implemented here:
 //!
 //! | C item | C source | Here |
 //! |---|---|---|
@@ -30,7 +30,7 @@
 //! remain between the write cursor and the next unread symbol.
 //!
 //! Nothing in this module allocates, reallocates, resizes, re-boxes or replaces that buffer, and
-//! nothing may be added that does. Two pieces of code elsewhere in the port are statements about
+//! nothing may be added that does. Two pieces of code elsewhere in the implementation are statements about
 //! one address space and would be silently invalidated by a second allocation: `deflate_stored`
 //! patches the four length bytes of a dummy stored block in place, at the four indices ending at
 //! `pending` (`deflate.c` L1716-L1719), and `deflatePrime` refuses a stream whose pending output
@@ -87,7 +87,7 @@
 //! # Why the bit-flush step is injected rather than imported
 //!
 //! `_tr_flush_bits` is `trees.c`'s (L880-L882), and `trees` is a *sibling* of `deflate` in this
-//! port rather than something beneath it: `trees.c`'s only `#include` is `"deflate.h"`, so the
+//! implementation rather than something beneath it: `trees.c`'s only `#include` is `"deflate.h"`, so the
 //! Huffman coder mutates the same [`DeflateState`](crate::deflate::state::DeflateState) this
 //! module does. [`flush_pending`] therefore takes the step as a parameter and calls it first,
 //! inside itself. Two things follow, and both are the point:
@@ -107,7 +107,7 @@
 //!   here. It is declared in `trees.c`, not in `deflate.h`, and its callers are `send_bits`,
 //!   `bi_flush`, `bi_windup` and `_tr_stored_block` (`trees.c` L264, L279, L168, L183 and
 //!   L864-L865), so it belongs to `trees/bit_writer.rs` with them. Only
-//!   the MSB-first form, which is `deflate.c`'s own (L939-L942), is ported here, and no
+//!   the MSB-first form, which is `deflate.c`'s own (L939-L942), is implemented here, and no
 //!   `put_short_lsb` or `put_u32_le` convenience is offered: the little-endian fields of the gzip
 //!   header and trailer are written as explicit `put_byte` sequences in C
 //!   (`deflate.c` L1069-L1081, L1269-L1276) and stay explicit [`put_byte`] sequences in
@@ -146,7 +146,7 @@
 //! goes through a bounds-checked view. Nothing here can panic in a release build either. There is
 //! no `[]` indexing, no `unwrap`, no `expect` and no arithmetic that can overflow: the two
 //! additions use [`usize::saturating_add`] and [`u64::wrapping_add`], the latter because C's
-//! `total_out += len` on an unsigned type wraps and this port reproduces that rather than
+//! `total_out += len` on an unsigned type wraps and this implementation reproduces that rather than
 //! diverging from it.
 //!
 //! Two invariants that C states as IN assertions are re-checked with [`debug_assert!`] instead,
@@ -155,7 +155,7 @@
 //! (`deflate.h` L290-L292) and the agreement between the length [`flush_pending`] computes and
 //! the length actually copied.
 
-// The port of `flush_pending` and of `deflatePending`'s accounting must keep the names their C
+// The Rust counterpart of `flush_pending` and of `deflatePending`'s accounting must keep the names their C
 // originals have, and both end with this module's own name. That is a naming collision with the
 // C source's vocabulary, not a naming problem to solve: renaming either would break the
 // one-to-one correspondence with `deflate.c` that the byte-identical-output requirement is
@@ -168,7 +168,7 @@ use crate::deflate::state::{Allocator, DeflateState, BUF_SIZE};
 use crate::error::ReturnCode;
 use crate::read_buf::OutputCursor;
 
-/// [`flush_pending`] adds a byte count to a `u64` total, and the port's standard forbids a cast
+/// [`flush_pending`] adds a byte count to a `u64` total, and this implementation's standard forbids a cast
 /// that could truncate.
 ///
 /// [`crate::read_buf`] asserts the same relationship for the same reason, at the same cost of
@@ -183,7 +183,7 @@ const _: () = assert!(
 /// `(Buf_size + 7) >> 3` in `deflate.c` L757 -- the bit buffer rounded up to whole bytes.
 ///
 /// Written as the literal 2 and tied to `Buf_size` by the assertion below, rather than computed,
-/// because `Buf_size` is an `i32` in this port (it is `int` arithmetic against `bi_valid`
+/// because `Buf_size` is an `i32` in this implementation (it is `int` arithmetic against `bi_valid`
 /// everywhere else, per [`BUF_SIZE`]) and converting it here would introduce a cast into a
 /// constant whose value is settled at compile time anyway. See [`has_prime_room`].
 const PRIME_HEADROOM_BYTES: usize = 2;
@@ -197,13 +197,9 @@ const _: () = assert!(
     "PRIME_HEADROOM_BYTES is (Buf_size + 7) >> 3 from deflate.c L757"
 );
 
-// -----------------------------------------------------------------------------
-//  Writing into the pending buffer
-// -----------------------------------------------------------------------------
-
 /// Appends one byte of compressed output to the pending buffer.
 ///
-/// Port of `put_byte` (`deflate.h` L290-L293), which is a macro and not a function:
+/// Mirrors `put_byte` (`deflate.h` L290-L293), which is a macro and not a function:
 ///
 /// ```text
 /// /* Output a byte on the stream.
@@ -226,7 +222,7 @@ const _: () = assert!(
 /// writers, `deflate.c` L1144-L1186) or because the buffer is known to be empty at that point
 /// ("Compression must start with an empty pending buffer", L1058).
 ///
-/// This port keeps the obligation and removes the hazard. The [`debug_assert!`] states the
+/// This implementation keeps the obligation and removes the hazard. The [`debug_assert!`] states the
 /// assertion where a reader of `deflate.h` L291 will look for it, and the underlying
 /// [`crate::weak_slice::PendingBuf::put_byte`] is bounds-checked, so a violation in a release
 /// build declines the write and reports `false` instead of corrupting the symbol buffer or
@@ -254,19 +250,8 @@ pub(crate) fn put_byte<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>, by
 
 /// Appends a 16-bit value to the pending buffer, most significant byte first.
 ///
-/// Port of `putShortMSB` (`deflate.c` L934-L942):
-///
-/// ```text
-/// /* =========================================================================
-///  * Put a short in the pending buffer. The 16-bit value is put in MSB order.
-///  * IN assertion: the stream state is correct and there is enough room in
-///  * pending_buf.
-///  */
-/// local void putShortMSB(deflate_state *s, uInt b) {
-///     put_byte(s, (Byte)(b >> 8));
-///     put_byte(s, (Byte)(b & 0xff));
-/// }
-/// ```
+/// Mirrors `putShortMSB` (`deflate.c` L934-L942), whose own precondition is that the stream
+/// state is correct and `pending_buf` has room for both bytes.
 ///
 /// Three kinds of call site use it, and every one of them is big-endian by specification rather
 /// than by convention, so the order is not negotiable:
@@ -316,40 +301,59 @@ pub(crate) fn put_short_msb<'a, A: Allocator<'a>>(
     put_byte(state, high) && put_byte(state, low)
 }
 
-// -----------------------------------------------------------------------------
-//  Flushing the pending buffer to the caller
-// -----------------------------------------------------------------------------
-
-/// Copies as much pending output as the caller's buffer will take, and accounts for it.
+/// Appends a 16-bit value to the pending buffer, least significant byte first.
 ///
-/// Port of `flush_pending` (`deflate.c` L944-L968):
+/// Port of the `put_short` macro (`trees.c` L144-L147), whose comment is "Output a short LSB
+/// first on the stream", and the little-endian counterpart of [`put_short_msb`]:
 ///
 /// ```text
-/// local void flush_pending(z_streamp strm) {
-///     unsigned len;
-///     deflate_state *s = strm->state;
-///
-///     _tr_flush_bits(s);
-///     len = s->pending > strm->avail_out ? strm->avail_out :
-///                                          (unsigned)s->pending;
-///     if (len == 0) return;
-///
-///     zmemcpy(strm->next_out, s->pending_out, len);
-///     strm->next_out  += len;
-///     s->pending_out  += len;
-///     strm->total_out += len;
-///     strm->avail_out -= len;
-///     s->pending      -= len;
-///     if (s->pending == 0) {
-///         s->pending_out = s->pending_buf;
-///     }
+/// #define put_short(s, w) { \
+///     put_byte(s, (uch)((w) & 0xff)); \
+///     put_byte(s, (uch)((ush)(w) >> 8)); \
 /// }
 /// ```
+///
+/// This is the *bitstream* order -- RFC 1951 §3.1.1 packs the bit accumulator from the least
+/// significant bit upwards, so the low byte of a filled accumulator is the one that goes out
+/// first -- and it is the opposite of [`put_short_msb`]'s, which serves the RFC 1950 header and
+/// trailer. Confusing the two would corrupt every stored block and every check value.
+///
+/// # Why this is a function rather than two `put_byte` calls
+///
+/// It is the innermost write of the compressor: [`crate::trees::bit_writer::send_bits`] spills
+/// the accumulator through here whenever it fills, which for an incompressible block is roughly
+/// once per input byte. Two `put_byte` calls establish the same buffer bound twice; this
+/// establishes it once and writes both bytes together, which also makes the write
+/// all-or-nothing rather than leaving a lone low byte behind on a full buffer -- the same
+/// discipline [`crate::weak_slice::PendingBuf::put_short_msb`] already applies.
+///
+/// # Return value
+///
+/// `true` when both bytes were stored, `false` when fewer than two bytes remained, in which case
+/// nothing was written. As with [`put_byte`], the C macro's IN assertion makes `false`
+/// unreachable from a correct caller.
+#[inline]
+pub(crate) fn put_short_lsb<'a, A: Allocator<'a>>(
+    state: &mut DeflateState<'a, A>,
+    value: u16,
+) -> bool {
+    // The same "IN assertion: there is enough room in pending_buf" the `put_byte` macro carries
+    // (`deflate.h` L290-L292), stated for both bytes at once.
+    debug_assert!(
+        state.pending_bytes() + 2 <= state.pending_buf_size(),
+        "put_short with fewer than two free bytes in pending_buf (deflate.h L290-L292)"
+    );
+
+    state.pending.put_short_le(value)
+}
+/// Copies as much pending output as the caller's buffer will take, and accounts for it.
+///
+/// Mirrors `flush_pending` (`deflate.c` L944-L968).
 ///
 /// # Parameters, and how they map onto the C signature
 ///
 /// C takes only `z_streamp` and reaches everything else through it, including `strm->state`. This
-/// port has no `strm` back-pointer in the state (see `deflate/state.rs`), so everything the C
+/// implementation has no `strm` back-pointer in the state (see `deflate/state.rs`), so everything the C
 /// function reaches through the stream arrives as its own parameter:
 ///
 /// | Here | There |
@@ -359,7 +363,7 @@ pub(crate) fn put_short_msb<'a, A: Allocator<'a>>(
 /// | `total_out` | `strm->total_out` |
 /// | `flush_bits` | the call to `_tr_flush_bits` (`deflate.c` L954) |
 ///
-/// `deflate/mod.rs` supplies `trees`' `_tr_flush_bits` port as the last argument:
+/// `deflate/mod.rs` supplies `trees`' `_tr_flush_bits` implementation as the last argument:
 ///
 /// ```text
 /// flush_pending(state, output, total_out, crate::trees::flush_bits);
@@ -390,7 +394,7 @@ pub(crate) fn put_short_msb<'a, A: Allocator<'a>>(
 ///    allocation; a second flush after a partial one therefore delivers the *tail* of the pending
 ///    output rather than repeating its head.
 /// 5. **Advance the caller's cursor** -- `strm->next_out += len; strm->avail_out -= len;`
-///    (L960, L963), which this port holds as one number, so the intermediate state in which one
+///    (L960, L963), which this implementation holds as one number, so the intermediate state in which one
 ///    half has moved and the other has not is not expressible. Nothing between them reads either,
 ///    exactly as in [`crate::read_buf::read_buf`].
 /// 6. **Account for the flushed bytes** -- `s->pending_out += len; s->pending -= len;` and the
@@ -475,23 +479,11 @@ where
     copied
 }
 
-// -----------------------------------------------------------------------------
-//  Reporting the pending state -- `deflatePending` and `deflateUsed`
-// -----------------------------------------------------------------------------
-
 /// Narrows a pending-byte count to the `unsigned` that `deflatePending` writes through, reporting
 /// whether anything was lost.
 ///
 /// This is C's self-comparison, isolated so that it can be exercised directly
-/// (`deflate.c` L727-L731):
-///
-/// ```text
-/// *pending = (unsigned)strm->state->pending;
-/// if (*pending != strm->state->pending) {
-///     *pending = (unsigned)-1;
-///     return Z_BUF_ERROR;
-/// }
-/// ```
+/// (`deflate.c` L727-L731).
 ///
 /// # It is a portability probe, not dead code
 ///
@@ -503,10 +495,10 @@ where
 /// an unsigned." A 16-bit target with `memLevel` 9 has `pending_buf_size` of 131072, which a
 /// 16-bit `unsigned` cannot hold.
 ///
-/// The same narrowing exists in this port, because `pending` is a `usize` and the value reported
+/// The same narrowing exists in this implementation, because `pending` is a `usize` and the value reported
 /// is a `u32`, so the branch is reachable by type rather than merely retained for symmetry.
 /// **No live stream can take it**: `pending <= pending_buf_size = lit_bufsize * 4 <= 131072`
-/// (`deflate.c` L506 with `lit_bufsize <= 32768`), which fits a `u32` on every target this port
+/// (`deflate.c` L506 with `lit_bufsize <= 32768`), which fits a `u32` on every target this implementation
 /// builds for. It is kept anyway, exactly as C keeps it, so that a future target with a narrower
 /// count reports what `zlib.h` says it reports rather than silently handing back a wrong number.
 ///
@@ -522,23 +514,7 @@ fn narrow_pending(pending: usize) -> (u32, ReturnCode) {
 
 /// Reports the output that has been generated but not yet handed to the caller.
 ///
-/// Port of the body of `deflatePending` (`deflate.c` L722-L734):
-///
-/// ```text
-/// int ZEXPORT deflatePending(z_streamp strm, unsigned *pending, int *bits) {
-///     if (deflateStateCheck(strm)) return Z_STREAM_ERROR;
-///     if (bits != Z_NULL)
-///         *bits = strm->state->bi_valid;
-///     if (pending != Z_NULL) {
-///         *pending = (unsigned)strm->state->pending;
-///         if (*pending != strm->state->pending) {
-///             *pending = (unsigned)-1;
-///             return Z_BUF_ERROR;
-///         }
-///     }
-///     return Z_OK;
-/// }
-/// ```
+/// Mirrors the body of `deflatePending` (`deflate.c` L722-L734).
 ///
 /// `zlib.h` L790-L795 states what the two numbers mean: the bytes are output "generated, but not
 /// yet provided in the available output ... due to the available output space having being
@@ -583,16 +559,7 @@ pub(crate) fn deflate_pending<'a, A: Allocator<'a>>(
 
 /// Reports the number of bits used in the last byte at the most recent flush to a byte boundary.
 ///
-/// Port of the body of `deflateUsed` (`deflate.c` L737-L742):
-///
-/// ```text
-/// int ZEXPORT deflateUsed(z_streamp strm, int *bits) {
-///     if (deflateStateCheck(strm)) return Z_STREAM_ERROR;
-///     if (bits != Z_NULL)
-///         *bits = strm->state->bi_used;
-///     return Z_OK;
-/// }
-/// ```
+/// Mirrors the body of `deflateUsed` (`deflate.c` L737-L742).
 ///
 /// The value is `bi_used`, "last number of used bits when going to a byte boundary"
 /// (`deflate.h` L274-L276), which `bi_windup` maintains as `((s->bi_valid - 1) & 7) + 1`
@@ -612,14 +579,8 @@ pub(crate) fn deflate_used<'a, A: Allocator<'a>>(state: &DeflateState<'a, A>) ->
 
 /// Whether the pending output still leaves room ahead of it for `deflatePrime` to insert bits.
 ///
-/// Port of the pending-buffer half of `deflatePrime`'s guard, the shipped non-`LIT_MEM` branch
-/// (`deflate.c` L756-L758):
-///
-/// ```text
-/// if (bits < 0 || bits > 16 ||
-///     s->sym_buf < s->pending_out + ((Buf_size + 7) >> 3))
-///     return Z_BUF_ERROR;
-/// ```
+/// Mirrors the pending-buffer half of `deflatePrime`'s guard, the shipped non-`LIT_MEM` branch
+/// (`deflate.c` L756-L758).
 ///
 /// This function is the second disjunct, negated: it answers `true` when the stream may be primed
 /// and `false` when `deflatePrime` must return [`ReturnCode::BUF_ERROR`]. The `bits` range test is
@@ -662,10 +623,6 @@ pub(crate) fn has_prime_room<'a, A: Allocator<'a>>(state: &DeflateState<'a, A>) 
     // The negation of `s->sym_buf < barrier`.
     state.pending.sym_buf_offset() >= barrier
 }
-
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 // The workspace denies the panic-prone lints, which is right for library code and wrong for a

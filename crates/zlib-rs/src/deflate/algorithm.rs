@@ -34,12 +34,12 @@
 //! | `FLUSH_BLOCK_ONLY(s, last)` | L1630-L1640 | [`flush_block_only`] |
 //! | `FLUSH_BLOCK(s, last)` | L1642-L1646 | [`flush_block_exit`] and [`flush_block!`] |
 //! | `MAX_STORED` | L1647-L1648 | [`MAX_STORED`] |
-//! | `MIN(a, b)` | L1650-L1651 | not ported -- [`core::cmp::min`] |
+//! | `MIN(a, b)` | L1650-L1651 | not implemented -- [`core::cmp::min`] |
 //!
 //! # `s->strm` is a parameter here, not a field
 //!
 //! Every C compressor reaches the caller's buffers through `s->strm`, a back-pointer from
-//! the compression state to the `z_stream` that owns it. This port cannot hold one: a
+//! the compression state to the `z_stream` that owns it. This implementation cannot hold one: a
 //! `&mut z_stream` inside [`DeflateState`] would alias the `&mut DeflateState` that every
 //! function takes, which safe Rust rejects outright, and `deflate/state.rs` accordingly
 //! declares no `strm` field. Everything the C code reaches through it therefore travels as
@@ -68,7 +68,7 @@
 //!
 //! Only the default compile-time configuration, and none of these is offered as a runtime
 //! option or a Cargo feature. `FASTEST` (`deflate.c` L106 and L76) replaces the ten-entry
-//! configuration table with two entries and drops `deflate_slow` altogether; this port
+//! configuration table with two entries and drops `deflate_slow` altogether; this implementation
 //! always has all five compressors and all ten levels. `ZLIB_DEBUG` accounting -- the
 //! `Tracev((stderr,"[FLUSH]"))` at L1639 and the `compressed_len`/`bits_sent` counters --
 //! has no counterpart, so the reference's traces appear neither as output nor as state.
@@ -124,7 +124,7 @@ use crate::trees::{_tr_flush_block, flush_bits};
 ///
 /// `deflate/mod.rs` re-exports this again as `crate::deflate::Flush`, which is the path
 /// `crates/zlib-rs/src/compress.rs`, `crates/zlib-rs/src/gz/write.rs` and
-/// `crates/libz-rs-sys/src/deflate.rs` use. That second re-export is why this one is `pub`
+/// the planned `crates/libz-rs-sys/src/deflate.rs` use. That second re-export is why this one is `pub`
 /// and not `pub(crate)`: a `pub use` of a crate-public item is `E0365`, "`Flush` is only
 /// public within the crate, and cannot be re-exported outside". Nothing escapes as a result,
 /// because `deflate/mod.rs` declares this module itself as `pub(crate) mod algorithm;`.
@@ -140,7 +140,7 @@ pub(crate) use crate::deflate::algorithm::slow::deflate_slow;
 pub(crate) use crate::deflate::algorithm::stored::deflate_stored;
 
 /// [`flush_block_only`] converts a byte count to the `u64` that
-/// [`crate::trees::_tr_flush_block`] takes, and the port's standard forbids a cast that
+/// [`crate::trees::_tr_flush_block`] takes, and this implementation's standard forbids a cast that
 /// could truncate.
 ///
 /// `crate::deflate::pending` and `crate::read_buf` assert the same relationship for the same
@@ -160,16 +160,12 @@ const _: () = assert!(
 ///
 /// `usize` because C assigns it to `unsigned len` and then compares that against
 /// `avail_in`, `avail_out` and `strstart - block_start`, all of which are `usize` in this
-/// port; a narrower type would put a cast on every one of those comparisons.
+/// implementation; a narrower type would put a cast on every one of those comparisons.
 pub(crate) const MAX_STORED: usize = 65535;
-
-// -----------------------------------------------------------------------------
-//  block_state -- deflate.c L63-L68
-// -----------------------------------------------------------------------------
 
 /// How a compressor finished: the state of the block it was working on.
 ///
-/// Ported from `block_state` (`deflate.c` L63-L68), variant for variant and in the same
+/// Mirrors `block_state` (`deflate.c` L63-L68), variant for variant and in the same
 /// order. The four values are not interchangeable status codes -- each one is a specific
 /// instruction to `deflate()` about what to do next, and returning the wrong one at the
 /// wrong moment changes where block boundaries fall. See the section below for what the
@@ -201,7 +197,9 @@ pub(crate) const MAX_STORED: usize = 65535;
 ///
 /// The four values are exhaustive and disjoint, so a `match` over them is checked: adding a
 /// fifth outcome would turn every consumer into a compile error rather than a silent
-/// fall-through. That is the same reason `inflate`'s 31-state mode is an enum here.
+/// fall-through. That is the same reason `inflate`'s 32-state mode is an enum here -- 32 is the
+/// variant count of `inflate_mode` in `inflate.h`, reproduced exactly by
+/// [`crate::inflate::mode::Mode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockState {
     /// `need_more` -- "block not completed, need more input or more output"
@@ -218,10 +216,6 @@ pub(crate) enum BlockState {
     /// `finish_done` -- "finish done, accept no more input or output" (`deflate.c` L67).
     FinishDone,
 }
-
-// -----------------------------------------------------------------------------
-//  RANK -- deflate.c L132-L133
-// -----------------------------------------------------------------------------
 
 /// `RANK(f)` over a raw `int` flush value (`deflate.c` L132-L133).
 ///
@@ -262,7 +256,7 @@ pub(crate) enum BlockState {
 ///     ERR_RETURN(strm, Z_BUF_ERROR);
 /// ```
 ///
-/// -- `deflate.c` L1018-L1020, which in this port is
+/// -- `deflate.c` L1018-L1020, which in this implementation is
 /// `flush.rank() <= rank_of_i32(old_flush)`. The sentinels work because the arithmetic puts
 /// them below every real rank: `RANK(-1)` is `-2` and `RANK(-2)` is `-4`, so a call that
 /// follows an out-of-output return or a reset can never be mistaken for a repeat of the same
@@ -302,13 +296,9 @@ impl Flush {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  The stand-in for s->strm
-// -----------------------------------------------------------------------------
-
 /// The parts of the caller's `z_stream` that a compressor reads and writes.
 ///
-/// C's compressors reach all of this through `s->strm` (`deflate.h` L105). This port has no
+/// C's compressors reach all of this through `s->strm` (`deflate.h` L105). This implementation has no
 /// such back-pointer -- see the module documentation for why it cannot -- so the same six
 /// things travel as one value alongside the `&mut DeflateState`.
 ///
@@ -396,13 +386,9 @@ impl StreamCursors<'_, '_> {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  compress_func -- deflate.c L70-L71
-// -----------------------------------------------------------------------------
-
 /// Which of the five compressors to run.
 ///
-/// Ported from `compress_func` (`deflate.c` L70-L71):
+/// Mirrors `compress_func` (`deflate.c` L70-L71):
 ///
 /// ```text
 /// typedef block_state (*compress_func)(deflate_state *s, int flush);
@@ -430,16 +416,7 @@ impl StreamCursors<'_, '_> {
 ///   are reachable only through the strategy, in [`select`](Self::select).
 /// * **The equality test.** `deflateParams` decides whether a level change has to flush the
 ///   current block by comparing the two table entries *by identity*
-///   (`deflate.c` L789-L792):
-///
-///   ```text
-///   func = configuration_table[s->level].func;
-///
-///   if ((strategy != s->strategy || func != configuration_table[level].func) &&
-///       s->last_flush != -2) {
-///       /* Flush the last buffer: */
-///       int err = deflate(strm, Z_BLOCK);
-///   ```
+///   (`deflate.c` L789-L792).
 ///
 ///   Comparing addresses and comparing discriminants agree *because* the grouping above is
 ///   the same: two levels compare equal here precisely when they name the same C function.
@@ -466,14 +443,7 @@ pub(crate) enum CompressFunc {
 impl CompressFunc {
     /// The compressor `deflate()` runs for a given level, strategy and table entry.
     ///
-    /// Ported from the conditional chain at `deflate.c` L1217-L1220:
-    ///
-    /// ```text
-    /// bstate = s->level == 0 ? deflate_stored(s, flush) :
-    ///          s->strategy == Z_HUFFMAN_ONLY ? deflate_huff(s, flush) :
-    ///          s->strategy == Z_RLE ? deflate_rle(s, flush) :
-    ///          (*(configuration_table[s->level].func))(s, flush);
-    /// ```
+    /// Mirrors the conditional chain at `deflate.c` L1217-L1220.
     ///
     /// **The order is the contract.** Level 0 is tested *first*, so a level-0 stream stores
     /// its input even when the strategy is `Z_HUFFMAN_ONLY` or `Z_RLE`; only then does the
@@ -534,26 +504,9 @@ impl CompressFunc {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  FLUSH_BLOCK_ONLY and FLUSH_BLOCK -- deflate.c L1626-L1646
-// -----------------------------------------------------------------------------
-
 /// Flush the current block, with the given end-of-file flag.
 ///
-/// Ported from `FLUSH_BLOCK_ONLY` (`deflate.c` L1630-L1640):
-///
-/// ```text
-/// #define FLUSH_BLOCK_ONLY(s, last) { \
-///    _tr_flush_block(s, (s->block_start >= 0L ? \
-///                    (charf *)&s->window[(unsigned)s->block_start] : \
-///                    (charf *)Z_NULL), \
-///                 (ulg)((long)s->strstart - s->block_start), \
-///                 (last)); \
-///    s->block_start = s->strstart; \
-///    flush_pending(s->strm); \
-///    Tracev((stderr,"[FLUSH]")); \
-/// }
-/// ```
+/// Mirrors `FLUSH_BLOCK_ONLY` (`deflate.c` L1630-L1640).
 ///
 /// `IN assertion: strstart is set to the end of the current match` (L1628).
 ///
@@ -583,7 +536,11 @@ impl CompressFunc {
 // `_tr_flush_block` keeps the underscore-prefixed C spelling of `deflate.h` L313-L314 for
 // oracle traceability, which `clippy::pedantic` flags at the call site. The same relaxation,
 // for the same reason, appears in `trees/mod.rs`.
-#[allow(clippy::used_underscore_items)]
+// MSRV guard: `unknown_lints` comes first because `clippy::used_underscore_items` postdates the
+// declared 1.80 floor, where the lint NAME is itself an `unknown_lints` error under `-D warnings`.
+// Allowing `unknown_lints` in the same list makes the attribute inert on 1.80 and effective on
+// current stable. Do not drop it while the floor is 1.80.
+#[allow(unknown_lints, clippy::used_underscore_items)]
 #[inline]
 pub(crate) fn flush_block_only<'a, A: Allocator<'a>>(
     state: &mut DeflateState<'a, A>,
@@ -597,7 +554,7 @@ pub(crate) fn flush_block_only<'a, A: Allocator<'a>>(
     // `(ulg)((long)s->strstart - s->block_start)`  (L1634)
     //
     // C relies on the subtraction being non-negative; where it is not, the cast to `ulg`
-    // would produce an astronomically large length and read far past the window. This port
+    // would produce an astronomically large length and read far past the window. This implementation
     // declines the block instead: `bytes_since_block_start` reports [`None`] for exactly that
     // case, and a zero length emits an empty block, which is safe and observable rather than
     // undefined. The `debug_assert!` records that no caller is expected to get there --
@@ -644,7 +601,7 @@ pub(crate) fn flush_block_only<'a, A: Allocator<'a>>(
 
 /// [`flush_block_only`], then the premature-exit decision `FLUSH_BLOCK` adds.
 ///
-/// Ported from `FLUSH_BLOCK` (`deflate.c` L1642-L1646):
+/// Mirrors `FLUSH_BLOCK` (`deflate.c` L1642-L1646):
 ///
 /// ```text
 /// /* Same but force premature exit if necessary. */
@@ -663,17 +620,7 @@ pub(crate) fn flush_block_only<'a, A: Allocator<'a>>(
 /// # `FLUSH_BLOCK_ONLY` and `FLUSH_BLOCK` are not interchangeable
 ///
 /// `deflate_slow`'s literal branch (`deflate.c` L2040-L2051) deliberately uses the *plain*
-/// `FLUSH_BLOCK_ONLY`:
-///
-/// ```text
-/// _tr_tally_lit(s, s->window[s->strstart - 1], bflush);
-/// if (bflush) {
-///     FLUSH_BLOCK_ONLY(s, 0);
-/// }
-/// s->strstart++;
-/// s->lookahead--;
-/// if (s->strm->avail_out == 0) return need_more;
-/// ```
+/// `FLUSH_BLOCK_ONLY`.
 ///
 /// It flushes, *then* advances `strstart` and `lookahead`, and only then gives up on a full
 /// output buffer. Substituting `FLUSH_BLOCK` there would return before the two cursors moved,
@@ -722,8 +669,12 @@ pub(crate) fn flush_block_exit<'a, A: Allocator<'a>>(
 /// exactly once, so passing an expression with a side effect evaluates it once, as C's macro
 /// does not guarantee.
 ///
-/// ```ignore
-/// // `if (bflush) FLUSH_BLOCK(s, 0);`  (deflate.c L1930)
+/// The shape every call site takes, standing in for `if (bflush) FLUSH_BLOCK(s, 0);`
+/// (`deflate.c` L1930). It is shown rather than compiled because the macro is crate-private
+/// and is expanded only inside the five compressors, each of which already holds `state`,
+/// `cursors` and a `bflush` of its own:
+///
+/// ```text
 /// if bflush {
 ///     flush_block!(state, cursors, false);
 /// }
@@ -746,18 +697,18 @@ macro_rules! flush_block {
 // macro, and `FLUSH_BLOCK` is an implementation detail of `deflate.c`.
 pub(crate) use flush_block;
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
 #[cfg(test)]
-// `unwrap`, `expect`, `panic` and indexing are already relaxed inside tests by `clippy.toml`;
+// `unwrap`, `expect` and `panic` are already relaxed inside tests by `clippy.toml`;
 // `used_underscore_items` is not, and these tests call `_tr_init` and `_tr_tally`, whose names
 // are the C spellings of `deflate.h` L311-L317. `unused_qualifications` is relaxed because
 // `flush_block!` expands to a fully qualified `$crate::` path -- correct at every real call
 // site, where nothing is imported -- and this module imports the same item to test it
 // directly.
-#[allow(clippy::used_underscore_items, unused_qualifications)]
+// MSRV guard: `unknown_lints` comes first because `clippy::used_underscore_items` postdates the
+// declared 1.80 floor, where the lint NAME is itself an `unknown_lints` error under `-D warnings`.
+// Allowing `unknown_lints` in the same list makes the attribute inert on 1.80 and effective on
+// current stable. Do not drop it while the floor is 1.80.
+#[allow(unknown_lints, clippy::used_underscore_items, unused_qualifications)]
 mod tests {
     use super::{
         flush_block_exit, flush_block_only, rank_of_i32, BlockState, CompressFunc, Flush,
@@ -773,10 +724,6 @@ mod tests {
     use crate::error::ReturnCode;
     use crate::read_buf::{InputCursor, OutputCursor};
     use crate::trees::{_tr_init, _tr_tally};
-
-    // -------------------------------------------------------------------------
-    //  Fixtures
-    // -------------------------------------------------------------------------
 
     /// A stream configured as `deflateInit2(&strm, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY)`
     /// and wired up by `_tr_init`, which is the state a compressor is first entered with.
@@ -824,10 +771,6 @@ mod tests {
         state.window.strstart = bytes.len();
         state.window.block_start = 0;
     }
-
-    // -------------------------------------------------------------------------
-    //  RANK -- deflate.c L132-L133
-    // -------------------------------------------------------------------------
 
     /// Every flush value against `RANK(f) = ((f) * 2) - ((f) > 4 ? 9 : 0)`, computed by hand.
     #[test]
@@ -920,10 +863,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  The flush values deflate accepts -- deflate.c L985
-    // -------------------------------------------------------------------------
-
     /// `deflate()` accepts exactly `0 ..= 5`; `Z_TREES` and everything else is
     /// `Z_STREAM_ERROR` (`deflate.c` L985).
     ///
@@ -955,10 +894,6 @@ mod tests {
             );
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  BlockState -- deflate.c L63-L68 and L1222-L1260
-    // -------------------------------------------------------------------------
 
     /// The four variants are distinct, which is what makes the driver's three tests
     /// (`deflate.c` L1222, L1225, L1238) select disjoint work.
@@ -1009,10 +944,6 @@ mod tests {
             assert_ne!(state, BlockState::BlockDone);
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  CompressFunc::select -- deflate.c L1217-L1220
-    // -------------------------------------------------------------------------
 
     /// Level 0 is tested before the strategy, so a level-0 stream stores whatever the strategy
     /// says (`deflate.c` L1217).
@@ -1110,20 +1041,12 @@ mod tests {
         assert!(!TABLE.contains(&CompressFunc::Huff));
     }
 
-    // -------------------------------------------------------------------------
-    //  MAX_STORED -- deflate.c L1647-L1648
-    // -------------------------------------------------------------------------
-
     /// `MAX_STORED` is the largest length a stored block's 16-bit `LEN` field can hold.
     #[test]
     fn max_stored_is_the_sixteen_bit_limit() {
         assert_eq!(MAX_STORED, 65535);
         assert_eq!(MAX_STORED, usize::from(u16::MAX));
     }
-
-    // -------------------------------------------------------------------------
-    //  FLUSH_BLOCK_ONLY -- deflate.c L1630-L1640
-    // -------------------------------------------------------------------------
 
     /// The block moves on: `s->block_start = s->strstart` (L1637), and what was written lands
     /// in the caller's output buffer via `flush_pending` (L1638).
@@ -1184,10 +1107,6 @@ mod tests {
         assert_eq!(state.window.block_start, 0);
         assert!(cursors.output.written() > 0);
     }
-
-    // -------------------------------------------------------------------------
-    //  FLUSH_BLOCK -- deflate.c L1642-L1646
-    // -------------------------------------------------------------------------
 
     /// `if (s->strm->avail_out == 0) return (last) ? finish_started : need_more;` (L1644).
     #[test]

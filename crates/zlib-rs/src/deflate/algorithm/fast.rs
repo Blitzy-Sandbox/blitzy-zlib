@@ -1,6 +1,6 @@
 //! The greedy compressor: `deflate_fast`, the strategy for levels 1 to 3.
 //!
-//! Port of `deflate_fast` (`deflate.c` L1857-L1948), whose own header comment states the
+//! Mirrors `deflate_fast` (`deflate.c` L1857-L1948), whose own header comment states the
 //! contract (L1850-L1856):
 //!
 //! ```text
@@ -23,7 +23,7 @@
 //! # ⚠ THIS FILE IS PART OF THE OUTPUT CONTRACT -- DO NOT "IMPROVE" IT ⚠
 //!
 //! RFC 1951 constrains the *format* of a DEFLATE stream, not the *choices* an encoder makes
-//! within it, and this port is required to emit the same bytes as the reference for every
+//! within it, and this implementation is required to emit the same bytes as the reference for every
 //! configuration. Four of those choices are made here, and every one of them is observable in
 //! the compressed output:
 //!
@@ -55,7 +55,7 @@
 //! | candidate range test | L1886 | [`IPos::match_index`] plus `wrapping_sub` against `max_dist` |
 //! | `longest_match` | L1891 | [`longest_match`], which sets `match_start` itself |
 //! | `_tr_tally_dist` | L1897-L1898 | [`_tr_tally`] with a non-zero distance |
-//! | insert the matched span | L1905-L1917 | the `do`/`while` port, with `insert_string_no_head` |
+//! | insert the matched span | L1905-L1917 | the `do`/`while` implementation, with `insert_string_no_head` |
 //! | skip the matched span | L1919-L1930 | `strstart += match_length` plus [`seed_hash`] |
 //! | `_tr_tally_lit` | L1934 | [`_tr_tally`] with distance zero |
 //! | `FLUSH_BLOCK(s, 0)` | L1938 | [`flush_block!`] |
@@ -92,7 +92,7 @@
 //! The reference reads it as `max_lazy_match` for levels 4 and above ("Attempt to find a
 //! better match only when the current match is strictly smaller than this value", L182-L184)
 //! and as `max_insert_length` for levels 3 and below ("Insert new strings in the hash table
-//! only if the match length is not greater than this length", L187-L189). This port has one
+//! only if the match length is not greater than this length", L187-L189). This implementation has one
 //! field, `DeflateState::max_lazy_match`, and
 //! [`DeflateState::max_insert_length`](crate::deflate::state::DeflateState::max_insert_length)
 //! is the accessor that lets the code below be written the way the C is.
@@ -118,12 +118,12 @@
 //! * **`FASTEST`** (L106). It would replace the ten-entry configuration table with two, drop
 //!   `deflate_slow` entirely, use the chain-less `INSERT_STRING` of L155-L158 and the
 //!   alternative `longest_match` of L1537-L1586. Note that the `#ifndef FASTEST` at L1905 is
-//!   *inside* this function and is therefore the branch that **is** ported: it is the live
+//!   *inside* this function and is therefore the branch that **is** implemented: it is the live
 //!   default path.
 //! * **`LIT_MEM`** (`deflate.h` L28, commented out). The symbol buffer here is the single
 //!   `sym_buf` of `LIT_BUFS` 4, not the split `d_buf`/`l_buf` of `LIT_BUFS` 5.
 //! * **`UNALIGNED_OK`**, whose word-at-a-time comparison lives in `longest_match` and is not
-//!   part of this port either.
+//!   part of this implementation either.
 //! * **`ZLIB_DEBUG`**, so `check_match` (L1623) and every `Trace*` compile to nothing, and
 //!   the tally macros of `deflate.h` L357-L375 are the live definitions rather than the
 //!   function fallback at L378-L380.
@@ -137,12 +137,12 @@ use crate::trees::_tr_tally;
 
 /// Compresses as much as possible from `cursors.input`, returning the resulting block state.
 ///
-/// Port of `local block_state deflate_fast(deflate_state *s, int flush)`
+/// Mirrors `local block_state deflate_fast(deflate_state *s, int flush)`
 /// (`deflate.c` L1857-L1948): the greedy, non-lazy compressor used for levels 1 to 3. Every
 /// decision it makes is part of the compressed output; see this module's documentation for
 /// the four that matter and for why none of them may be changed.
 ///
-/// `cursors` stands in for C's `s->strm`, which this port cannot hold as a field --
+/// `cursors` stands in for C's `s->strm`, which this implementation cannot hold as a field --
 /// see [`StreamCursors`]. `flush` is never `Z_TREES`: `deflate()` rejects that before it
 /// dispatches (L985), and
 /// [`CompressFunc::call`](crate::deflate::algorithm::CompressFunc::call) asserts as much.
@@ -166,7 +166,11 @@ use crate::trees::_tr_tally;
 // `deflate/algorithm.rs`, `trees/mod.rs` and the test modules of `trees/build.rs` and
 // `deflate/window.rs` -- so that the relaxation does not depend on which clippy release is
 // running.
-#[allow(clippy::used_underscore_items)]
+// MSRV guard: `unknown_lints` comes first because `clippy::used_underscore_items` postdates the
+// declared 1.80 floor, where the lint NAME is itself an `unknown_lints` error under `-D warnings`.
+// Allowing `unknown_lints` in the same list makes the attribute inert on 1.80 and effective on
+// current stable. Do not drop it while the floor is 1.80.
+#[allow(unknown_lints, clippy::used_underscore_items)]
 pub(crate) fn deflate_fast<'a, A: Allocator<'a>>(
     state: &mut DeflateState<'a, A>,
     cursors: &mut StreamCursors<'_, '_>,
@@ -174,10 +178,6 @@ pub(crate) fn deflate_fast<'a, A: Allocator<'a>>(
 ) -> BlockState {
     // `for (;;) {`  (L1861)
     loop {
-        // ------------------------------------------------------------------
-        //  "Make sure that we always have enough lookahead" -- L1862-L1873
-        // ------------------------------------------------------------------
-        //
         // "We need MAX_MATCH bytes for the next match, plus MIN_MATCH bytes to insert the
         // string following the next match" (L1863-L1865), which is what `MIN_LOOKAHEAD`
         // (262) counts.
@@ -210,10 +210,6 @@ pub(crate) fn deflate_fast<'a, A: Allocator<'a>>(
             }
         }
 
-        // ------------------------------------------------------------------
-        //  INSERT_STRING -- L1875-L1881
-        // ------------------------------------------------------------------
-        //
         // "Insert the string window[strstart .. strstart + 2] in the dictionary, and set
         // hash_head to the head of the hash chain" (L1875-L1877).
         //
@@ -231,10 +227,6 @@ pub(crate) fn deflate_fast<'a, A: Allocator<'a>>(
             hash_head = insert_string(state, str_pos);
         }
 
-        // ------------------------------------------------------------------
-        //  "Find the longest match, discarding those <= prev_length" -- L1883-L1893
-        // ------------------------------------------------------------------
-        //
         // `if (hash_head != NIL && s->strstart - hash_head <= MAX_DIST(s))`  (L1886)
         //
         // Exactly two conditions -- `deflate_slow` has three (L1988-L1989) and the two tests
@@ -279,7 +271,7 @@ pub(crate) fn deflate_fast<'a, A: Allocator<'a>>(
         if state.match_length >= MIN_MATCH {
             // `check_match(s, s->strstart, s->match_start, (int)s->match_length);` (L1895)
             // is a `ZLIB_DEBUG`-only validation that L1623 defines away in the shipped
-            // build. Nothing to port.
+            // build. Nothing to implement.
 
             // `_tr_tally_dist(s, s->strstart - s->match_start,`
             // `               s->match_length - MIN_MATCH, bflush);`  (L1897-L1898)
@@ -333,13 +325,6 @@ pub(crate) fn deflate_fast<'a, A: Allocator<'a>>(
                 // `match_length >= MIN_MATCH`, so this cannot reach zero.
                 state.match_length = state.match_length.saturating_sub(1);
 
-                // ```text
-                // do {
-                //     s->strstart++;
-                //     INSERT_STRING(s, s->strstart, hash_head);
-                // } while (--s->match_length != 0);
-                // ```
-                //
                 // -- L1909-L1915, a `do`/`while`: the body runs first, then the decrement,
                 // then the test. Rust has no such loop, so it is a `loop` whose exit test is
                 // last, which is the same control flow.
@@ -396,7 +381,7 @@ pub(crate) fn deflate_fast<'a, A: Allocator<'a>>(
                 //
                 // The `#if MIN_MATCH != 3` block at L1924-L1926 is dead -- `MIN_MATCH` is 3
                 // (`zutil.h` L92) -- and contains deliberately non-compiling text, so nothing
-                // is ported for it.
+                // is implemented for it.
                 //
                 // "If lookahead < MIN_MATCH, ins_h is garbage, but it does not matter since
                 // it will be recomputed at next deflate call" (L1927-L1929): the read at
@@ -435,10 +420,6 @@ pub(crate) fn deflate_fast<'a, A: Allocator<'a>>(
         }
     }
 
-    // ------------------------------------------------------------------
-    //  Tail -- L1940-L1947
-    // ------------------------------------------------------------------
-
     // `s->insert = s->strstart < MIN_MATCH-1 ? s->strstart : MIN_MATCH-1;`  (L1940)
     //
     // The number of positions at the end of the window whose strings are not yet in the hash
@@ -462,10 +443,6 @@ pub(crate) fn deflate_fast<'a, A: Allocator<'a>>(
     // `return block_done;`  (L1947)
     BlockState::BlockDone
 }
-
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 // The panic-prone lints are relaxed because a test asserts, and an assertion panics; the
@@ -491,7 +468,8 @@ mod tests {
     //! the reference proves the requirement this file exists to satisfy: a round trip that
     //! merely decompresses proves nothing about byte identity, and RFC 1951 conformance is a
     //! far weaker property. These are a committed subset, not a substitute for
-    //! `crates/zlib-rs-differential/tests/byte_identical.rs`, which sweeps the whole matrix.
+    //! the planned `crates/zlib-rs-differential/tests/byte_identical.rs`, which is to sweep the
+    //! whole matrix and has not landed yet.
     //!
     //! **The individual decisions, observed directly.** A compressor called with `Z_NO_FLUSH`
     //! and a pre-loaded window returns [`BlockState::NeedMore`] *without* flushing, which
@@ -520,10 +498,6 @@ mod tests {
     const DEFLATED: i32 = 8;
     /// `Z_DEFAULT_STRATEGY` (`zlib.h` L196).
     const DEFAULT_STRATEGY: i32 = 0;
-
-    // -------------------------------------------------------------------------
-    //  Corpora
-    // -------------------------------------------------------------------------
 
     /// 300 copies of `b'a'`: one long run, so the first match saturates `MAX_MATCH` and the
     /// `max_insert_length` test at L1906 rejects it.
@@ -569,10 +543,6 @@ Pack my box with five dozen liquor jugs.";
         let block = incompressible(4096);
         (0..70_000).map(|i| block[i % block.len()]).collect()
     }
-
-    // -------------------------------------------------------------------------
-    //  Fixtures
-    // -------------------------------------------------------------------------
 
     /// A state configured as `deflateInit2(&strm, level, Z_DEFLATED, window_bits, mem_level,
     /// strategy)` and reset, which is the state `deflate()` first enters a compressor with.
@@ -663,10 +633,6 @@ Pack my box with five dozen liquor jugs.";
         out.truncate(produced);
         out
     }
-
-    // -------------------------------------------------------------------------
-    //  Byte identity against the C reference
-    // -------------------------------------------------------------------------
 
     /// Reference output of `deflate_fast` for `long_run()` at levels 1, 2 and 3, raw with
     /// `memLevel` 8. Two literals then one match of length 258 at distance 1, then a second
@@ -867,10 +833,6 @@ Pack my box with five dozen liquor jugs.";
             );
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  The decisions, observed directly
-    // -------------------------------------------------------------------------
 
     /// The first three symbols of a long run, and the state the skip path leaves behind.
     ///

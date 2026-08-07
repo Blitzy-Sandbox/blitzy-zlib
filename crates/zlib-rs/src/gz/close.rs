@@ -1,37 +1,23 @@
-//! The `gzclose` dispatch: the port of `gzclose.c` (23 lines, the smallest translation unit in the
-//! whole `gzFile` layer).
+//! The `gzclose` dispatch (`gzclose.c`, 23 lines).
 //!
 //! Exactly one function lives here, and it decides exactly one thing: whether the handle being
 //! closed is a read handle or a write handle. The teardown itself -- ending the engine, returning
 //! both working buffers to the allocator that produced them, clearing the error, releasing the path
 //! and closing the file -- belongs to [`gzclose_r`] and [`gzclose_w`], and **not one step of it is
-//! repeated below**. That division of labour is C's, and reproducing it is the entire purpose of
-//! this module.
+//! repeated below**.
 //!
 //! # Why a module of its own, for three lines of code
 //!
 //! `gzclose.c` L8-L10 answers this in its own words: `gzclose` "is in a separate file so that it is
-//! linked in only if it is used. That way the other gzclose functions can be used instead to avoid
-//! linking in unneeded compression or decompression routines." `zlib.h` L1766-L1772 states the
-//! consequence for the application: `gzclose_r` and `gzclose_w` exist so that a program which only
-//! reads, or only writes, can avoid pulling in the half it never calls, whereas "if `gzclose()` is
-//! used, then both compression and decompression code will be included the application when linking
-//! to a static zlib library."
+//! linked in only if it is used." That is a link-granularity optimisation, which Rust reaches through
+//! `--gc-sections` and the release profile's fat LTO instead. Keeping the dispatch separate preserves
+//! the 1:1 mapping to `gzclose.c` and keeps it out of either half it must stay independent of.
 //!
-//! The boundary is therefore a **link-granularity optimisation, not an algorithmic one**. In C the
-//! unit of linking is the translation unit, so isolating a three-line dispatch in its own object
-//! file is the only way to express "pay for this only if you call it". Rust has no equivalent
-//! granularity -- a crate is compiled as a whole -- and the same effect arrives from the linker and
-//! the optimiser instead: rustc already emits one section per function, so `--gc-sections` and
-//! link-time optimisation drop [`gzclose`], and with it whichever half it alone would have reached,
-//! out of any final program that never calls it. The workspace release profile asks for fat LTO with
-//! a single codegen unit precisely so that this is available.
+//! # The `NO_GZCOMPRESS` variant, and what this implementation reports for it
 //!
-//! Keeping the dispatch in a module of its own consequently preserves the *intent* and the 1:1
-//! mapping to the C source rather than the mechanism. A maintainer who finds three lines of code in
-//! a file of its own should read this section before folding it into `read.rs` or `write.rs`: doing
-//! so would lose the mapping to `gzclose.c`, and it would bury the dispatch inside one of the two
-//! halves it is specifically meant to be independent of.
+//! C compiles two different functions out of these 23 lines, selected by `#ifndef NO_GZCOMPRESS`
+//! (`gzclose.c` L12 and L20-L22); with it defined, the function collapses to a bare `gzclose_r`
+//! call and the null check of L15-L16 disappears along with it, since it sits inside the `#ifndef`.
 //!
 //! # The `NO_GZCOMPRESS` variant, and what this port reports for it
 //!
@@ -54,7 +40,8 @@
 //! below is the real, two-way one.** That determination has a machine-visible consequence one crate
 //! up, so it is recorded here rather than left to be re-derived: `zlibCompileFlags` sets bit 16 for
 //! `NO_GZCOMPRESS` (`zutil.c` L76-L78, `flags += 1L << 16`), and therefore
-//! `crates/libz-rs-sys/src/util.rs` **must report bit 16 CLEAR**. The same goes for the companion
+//! the planned `crates/libz-rs-sys/src/util.rs` **must report bit 16 CLEAR**. The same goes for
+//! the companion
 //! decision in the read half: nothing in this port is compiled out, so the capability surface is the
 //! full one.
 //!
@@ -69,7 +56,7 @@
 //! The test is *only* "is the mode `GZ_READ`?". C does **not** additionally confirm that the mode is
 //! `GZ_WRITE`, so a handle whose mode is `GZ_NONE`, or whose memory was never a `gzFile` at all,
 //! goes down the **write** path -- where [`gzclose_w`]'s own `state->mode != GZ_WRITE` guard
-//! (`gzwrite.c` L677-L678) is what rejects it. This port reproduces that exactly:
+//! (`gzwrite.c` L677-L678) is what rejects it. This implementation reproduces that exactly:
 //!
 //! | `state->mode` | Value | Branch taken | Outcome |
 //! |---|---|---|---|
@@ -80,54 +67,45 @@
 //! | anything else | -- | [`gzclose_w`] | rejected there with `Z_STREAM_ERROR` |
 //!
 //! Turning this into a tidy three-way check -- read here, write there, error otherwise -- is
-//! rejected on purpose, even though today it would return the same integer. Three reasons, in
-//! increasing order of importance:
+//! rejected on purpose, even though today it would return the same integer. It would duplicate the
+//! write path's precondition, which is stated once in [`gzclose_w`]; it would skip the rest of
+//! [`gzclose_w`]'s entry work, which also validates the exposed `gzFile` prefix; and a divergence
+//! that happens to agree today is the kind that stops agreeing the moment either half changes.
 //!
-//! 1. It would duplicate the write path's precondition. `Z_STREAM_ERROR` for a non-write handle is
-//!    stated once, in [`gzclose_w`]; a second copy here is a second thing that has to stay in
-//!    agreement with it.
-//! 2. It would skip [`gzclose_w`]'s other entry work. This port's write half also validates the
-//!    exposed `gzFile` prefix on the way in, and that check reports the same code for its own
-//!    reasons; short-circuiting the call would silently drop it.
-//! 3. Behavioural fidelity to the reference implementation is the governing constraint of this port,
-//!    and a divergence that "happens to agree today" is precisely the kind that stops agreeing the
-//!    moment one of the two halves changes. The oracle is the specification; tidiness is not.
-//!
-//! `GZ_APPEND` earns a row in the table even though no caller can observe it: `gz_open` sets it
-//! while opening an appended file and overwrites it with `GZ_WRITE` before returning
-//! (`gzlib.c` L269-L272). It is listed so that the fall-through is exhaustive on paper as well as in
-//! the code.
+//! `GZ_APPEND` earns a row even though no caller can observe it: `gz_open` sets it while opening an
+//! appended file and overwrites it with `GZ_WRITE` before returning (`gzlib.c` L269-L272).
 //!
 //! # What the return value means
 //!
-//! `zlib.h` L1758-L1760 documents five codes for `gzclose`, and every one of them can come out of
-//! this dispatch:
+//! Every one of the five codes `zlib.h` L1758-L1760 documents can come out of this dispatch:
 //!
-//! | Code | Meaning | Produced by |
-//! |---|---|---|
-//! | `Z_STREAM_ERROR` | the handle is not valid | this function, for an absent stream; otherwise the chosen half's mode guard |
-//! | `Z_ERRNO` | a file-operation error | either half, when closing the file fails (`gzread.c` L667, `gzwrite.c` L696-L697) |
-//! | `Z_MEM_ERROR` | out of memory | the write half, latched out of `state->err` while finishing the stream |
-//! | `Z_BUF_ERROR` | the last read ended in the middle of a gzip stream | the read half, at `gzread.c` L662 |
-//! | `Z_OK` | success | either half |
+//! | Code | Produced by |
+//! |---|---|
+//! | `Z_STREAM_ERROR` | this function, for an absent stream; otherwise the chosen half's mode guard |
+//! | `Z_ERRNO` | either half, when closing the file fails (`gzread.c` L667, `gzwrite.c` L696-L697) |
+//! | `Z_MEM_ERROR` | the write half, latched out of `state->err` while finishing the stream |
+//! | `Z_BUF_ERROR` | the read half, at `gzread.c` L662 |
+//! | `Z_OK` | either half |
 //!
-//! ★ **The `Z_BUF_ERROR` case is the one to be careful with, because `gzclose` is the only place a
-//! caller ever learns of it.** `zlib.h` L1474-L1478 records the design deliberately: `gzread` does
-//! *not* report a truncated member -- it returns the short count it managed to produce and says
-//! nothing -- and the report is deferred to close time. [`gzclose_r`] computes it at `gzread.c` L662,
-//! `err = state->err == Z_BUF_ERROR ? Z_BUF_ERROR : Z_OK`, and returns it unless closing the file
-//! failed as well. This function must therefore hand that status straight back, unaltered. A
-//! dispatch that flattened it -- to `Z_OK` because the teardown itself succeeded, say -- would
-//! destroy the only signal that the caller has just been handed truncated data.
+//! ★ **`Z_BUF_ERROR` is the one to be careful with, because `gzclose` is the only place a caller
+//! ever learns of it.** `gzread` deliberately does not report a truncated member (`zlib.h`
+//! L1474-L1478); the report is deferred to close time, where [`gzclose_r`] computes
+//! `err = state->err == Z_BUF_ERROR ? Z_BUF_ERROR : Z_OK` (`gzread.c` L662). This function hands
+//! that status straight back, unaltered. Flattening it to `Z_OK` because the teardown succeeded
+//! would destroy the only signal that the caller has just been handed truncated data.
 //!
 //! # The caller contract, and where each half of it is enforced
 //!
-//! `zlib.h` L1752-L1756 imposes two obligations, both about lifetime rather than about arguments:
+//! `zlib.h` L1752-L1756 imposes two lifetime obligations: `gzclose` must not be called twice on the
+//! same file, and `gzerror` must not be called with a closed one. In C both are undefined behaviour,
+//! because `gzread.c` L666 and `gzwrite.c` L698 end in `free(state)`.
 //!
-//! 1. **`gzclose` must not be called more than once on the same file**, "just as `free` must not be
-//!    called more than once on the same allocation".
-//! 2. **Once the file is closed, `gzerror` must not be called with it**, because its structures have
-//!    been deallocated.
+//! Here neither can happen. [`GzState`] is an owned Rust value, its `Drop` runs the same teardown,
+//! and the close paths leave nothing behind for that teardown to release a second time. A double
+//! close is never *undefined*: [`gzclose_w`] sets `mode` to `GZ_NONE` before returning, so a second
+//! call takes the write arm and comes straight back as `Z_STREAM_ERROR`, while a second call on a
+//! read handle finds every step already done and is idempotent. That is a stronger guarantee than
+//! `zlib.h` asks for, not a licence to rely on it.
 //!
 //! In C, violating either is undefined behaviour: `gzread.c` L666 and `gzwrite.c` L698 both end in
 //! `free(state)`, so every later access reads freed memory.
@@ -143,7 +121,8 @@
 //!
 //! What Rust's ownership cannot reach is the raw `gzFile` a C caller holds. That pointer may be
 //! null, may be stale, and may never have been a `gzFile` at all -- so the guard belongs at the
-//! boundary, and `crates/libz-rs-sys/src/gz.rs` owns it (AAP §0.6.1 unsafe-site category 3: the
+//! boundary, and the planned `crates/libz-rs-sys/src/gz.rs` will own it (AAP §0.6.1 unsafe-site
+//! category 3: the
 //! opaque state pointer is tag-validated before it is treated as state). This function's [`Option`]
 //! parameter is that guard's safe-core counterpart, and [`None`] *is* `file == NULL`.
 //!
@@ -151,36 +130,16 @@
 //!
 //! `zlib.h` L1763-L1764 declares `gzclose_r` and `gzclose_w` as exported functions in their own
 //! right, not as private helpers of `gzclose`, and the version script exports all three. Nothing
-//! here narrows them: [`gzclose_r`] remains a public entry point of `crate::gz::read` and
-//! [`gzclose_w`] a public entry point of `crate::gz::write`, so the facade can export the full trio
-//! and an application can keep taking `zlib.h`'s advice about linking only the half it uses.
+//! here narrows them, so the facade can export the full trio and an application can keep linking
+//! only the half it uses.
 //!
-//! # Feature gating
+//! # Feature gating, panics and allocation
 //!
 //! The crate root reaches this file through `#[cfg(feature = "std")] mod gz;`, so no per-item gate
-//! appears below and `--no-default-features` compiles the whole subtree out. Nothing in this module
-//! needs `std` itself -- the dispatch is an integer comparison -- but it lives with the layer it
-//! belongs to rather than being hoisted out to save one `cfg`.
-//!
-//! # Panic and allocation posture
-//!
-//! Nothing below panics and nothing below allocates. There is no indexing, no slicing, no
-//! arithmetic, no `unwrap` and no `expect`; the single fallible conversion,
-//! [`ReturnCode::from_i32`], is total, and its [`None`] arm is handled explicitly rather than
-//! asserted away.
+//! appears below and `--no-default-features` compiles the whole subtree out. Nothing below panics
+//! or allocates: there is no indexing, no arithmetic, no `unwrap` and no `expect`, and the one
+//! fallible conversion, [`ReturnCode::from_i32`], has its [`None`] arm handled explicitly.
 
-// Where each of these comes from, since none of it is a choice:
-//
-// * `Allocator` is not used directly; it is the bound without which `GzState<'a, A>` cannot be
-//   named. `crate::gz::state` declares the type as `GzState<'a, A: Allocator<'a>>` and both close
-//   halves require `A: Allocator<'a> + Copy`, so the signature below is unwriteable without it --
-//   which is why `gz/state.rs`, `gz/read.rs` and `gz/write.rs` all import it too.
-// * `ReturnCode` is the status this returns, and `ReturnCode::from_i32` is what turns `gzclose_w`'s
-//   raw C `int` back into one.
-// * `GzMode` is the exhaustive view over `state.mode()` that makes the dispatch a wildcard-free
-//   `match`; `gz/state.rs` owns it.
-// * `gzclose_r` and `gzclose_w` are the two halves being dispatched to, and they are the only
-//   functions this module calls at all.
 use crate::allocate::Allocator;
 use crate::error::ReturnCode;
 use crate::gz::read::gzclose_r;
@@ -189,9 +148,8 @@ use crate::gz::write::gzclose_w;
 
 /// Closes a `gzFile`, dispatching to whichever teardown its direction calls for.
 ///
-/// The port of `gzclose` (`gzclose.c` L11-L23), declared at `zlib.h` L1750 and specified at
-/// L1752-L1760: flush all pending output for the file if necessary, close the file, and deallocate
-/// the (de)compression state.
+/// Implements `gzclose` (`gzclose.c` L11-L23), declared at `zlib.h` L1750: flush any pending
+/// output, close the file, and deallocate the (de)compression state.
 ///
 /// All of that work is [`gzclose_r`]'s or [`gzclose_w`]'s; this function only chooses between them,
 /// and returns their answer unchanged. The module documentation covers why the choice is a module of
@@ -201,7 +159,7 @@ use crate::gz::write::gzclose_w;
 ///
 /// # The `state` argument
 ///
-/// [`None`] is this port's spelling of C's `file == NULL`, and is rejected with
+/// [`None`] is this implementation's spelling of C's `file == NULL`, and is rejected with
 /// [`ReturnCode::STREAM_ERROR`] exactly as `gzclose.c` L15-L16 rejects a null `gzFile`. The check
 /// belongs *here*, rather than being left to the caller, because it is genuinely part of the
 /// dispatch: `state->mode` cannot be read to choose a branch until the handle is known to exist.
@@ -209,13 +167,14 @@ use crate::gz::write::gzclose_w;
 /// test and the mode test are adjacent and the boundary layer can perform both.
 ///
 /// The facade holds a `*mut GzState` and produces this argument in one step with `as_mut`, which
-/// yields precisely this [`Option`]. Converting the raw pointer, and refusing one that is stale or
-/// foreign, stays the facade's job (AAP §0.6.1 unsafe-site categories 1 and 3).
+/// yields precisely this [`Option`]. Establishing that the pointer is safe to dereference in the
+/// first place — and, once it is, that the live object behind it is one of this library's — stays
+/// the facade's job (AAP §0.6.1 unsafe-site categories 1 and 3).
 ///
 /// # What is *not* done here
 ///
-/// C frees the structure as its very last act (`gzread.c` L666, `gzwrite.c` L698). This port cannot
-/// and must not: the structure was allocated by whoever owns it -- `crates/libz-rs-sys` -- and is
+/// C frees the structure as its very last act (`gzread.c` L666, `gzwrite.c` L698). This
+/// implementation cannot and must not: the structure was allocated by whoever owns it, and is
 /// released by dropping it once this has returned. By that point the chosen half has already ended
 /// the engine, returned both buffers, cleared the error and message, released the path and closed
 /// the file, so [`GzState`]'s own `Drop` finds nothing left and the two cannot double-release.
@@ -235,8 +194,6 @@ use crate::gz::write::gzclose_w;
 /// The status is `#[must_use]` because discarding it is almost always a defect: `gzclose` is where
 /// the write path's final flush, the file close and the deferred truncation report all surface, so a
 /// caller that ignores it cannot know whether the bytes it wrote actually reached the file.
-/// `test/minigzip.c` treats it that way already -- `if (gzclose(out) != Z_OK) error("failed
-/// gzclose");` at L360, L391 and L413.
 #[must_use]
 pub fn gzclose<'a, A: Allocator<'a> + Copy>(state: Option<&mut GzState<'a, A>>) -> ReturnCode {
     // `gzclose.c` L15-L16: `if (file == NULL) return Z_STREAM_ERROR;`. Nothing has been touched, so
@@ -245,7 +202,6 @@ pub fn gzclose<'a, A: Allocator<'a> + Copy>(state: Option<&mut GzState<'a, A>>) 
         return ReturnCode::STREAM_ERROR;
     };
 
-    // `gzclose.c` L19: `return state->mode == GZ_READ ? gzclose_r(file) : gzclose_w(file);`
     //
     // The match is written without a wildcard so that it is exhaustive over `Option<GzMode>` by
     // naming every inhabitant: adding a fifth direction to `GzMode` becomes a compile error here
@@ -275,10 +231,6 @@ pub fn gzclose<'a, A: Allocator<'a> + Copy>(state: Option<&mut GzState<'a, A>>) 
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     // The crate denies the panic-prone lints in library code, which is the right policy there and
@@ -294,7 +246,7 @@ mod tests {
     //   would hide which knob each one is.
     // * `crate::inflate` decodes the sealed member in [`gunzip`] **instead of** `gzread`, which is
     //   the stronger check: it proves the bytes are a well-formed RFC 1952 member rather than merely
-    //   something this port's own reader accepts. `gz/write.rs`'s tests take the same route for the
+    //   something this implementation's own reader accepts. `gz/write.rs`'s tests take the same route for the
     //   same reason.
     //
     // Only the library half above is held to the narrow import set; nothing here ships.
@@ -304,8 +256,8 @@ mod tests {
     use crate::error::ReturnCode;
     use crate::gz::read::gzread;
     use crate::gz::state::{
-        GzHandle, GzIoError, GzSeekFrom, GzState, ZOff64, GZBUFSIZE, GZ_APPEND, GZ_NONE, GZ_READ,
-        GZ_WRITE,
+        GzFileSlot, GzHandle, GzIoError, GzSeekFrom, GzState, ZOff64, GZBUFSIZE, GZ_APPEND,
+        GZ_NONE, GZ_READ, GZ_WRITE,
     };
     use crate::gz::write::gzwrite;
     use crate::inflate::{inflate, inflate_init2, inflate_reset, InflateStream};
@@ -416,14 +368,14 @@ mod tests {
         let closes = Rc::new(Cell::new(0));
         let mut state = GzState::new(GlobalAllocator);
         state.try_set_path(b"memory").unwrap();
-        let previous = state.set_handle(Some(Box::new(MemoryFile {
+        let previous = state.set_handle(GzFileSlot::Boxed(Box::new(MemoryFile {
             data: data.to_vec(),
             position: 0,
             sink: Rc::clone(&sink),
             closes: Rc::clone(&closes),
             close_fails,
         })));
-        assert!(previous.is_none());
+        assert!(!previous.is_installed(), "the slot was empty before");
         Fixture {
             state,
             sink,
@@ -460,7 +412,7 @@ mod tests {
     /// Decompresses a concatenation of gzip members by driving the inflate engine directly.
     ///
     /// Deliberately not routed through `gzread`: decoding with the engine proves the closed stream is
-    /// a well-formed RFC 1952 member rather than merely something this port's own reader accepts.
+    /// a well-formed RFC 1952 member rather than merely something this implementation's own reader accepts.
     /// Each member ends with `Z_STREAM_END`, after which `inflate_reset` starts the next one.
     fn gunzip(bytes: &[u8]) -> Vec<u8> {
         if bytes.is_empty() {
@@ -501,21 +453,13 @@ mod tests {
         out
     }
 
-    // -------------------------------------------------------------------------
-    //  The absent stream: `gzclose.c` L15-L16
-    // -------------------------------------------------------------------------
-
     #[test]
     fn a_missing_stream_is_rejected() {
-        // `gzclose.c` L15-L16: `if (file == NULL) return Z_STREAM_ERROR;`. `None` is this port's
+        // `gzclose.c` L15-L16: `if (file == NULL) return Z_STREAM_ERROR;`. `None` is this implementation's
         // spelling of that null, and it must be answered before any mode is read.
         let absent: Option<&mut GzState<'_, GlobalAllocator>> = None;
         assert_eq!(gzclose(absent), ReturnCode::STREAM_ERROR);
     }
-
-    // -------------------------------------------------------------------------
-    //  The read arm: `state->mode == GZ_READ`
-    // -------------------------------------------------------------------------
 
     #[test]
     fn closing_a_read_stream_returns_ok() {
@@ -593,10 +537,6 @@ mod tests {
         assert_eq!(fixture.closes.get(), 1);
     }
 
-    // -------------------------------------------------------------------------
-    //  The write arm: everything that is not `GZ_READ`
-    // -------------------------------------------------------------------------
-
     #[test]
     fn closing_a_write_stream_returns_ok_and_finalises_the_member() {
         let mut fixture = writer();
@@ -654,7 +594,6 @@ mod tests {
 
     #[test]
     fn a_write_stream_whose_file_close_fails_reports_errno() {
-        // `gzwrite.c` L696-L697: `if (close(state->fd) == -1) ret = Z_ERRNO;`
         let mut fixture = fixture(&[], true);
         fixture.state.set_mode(GZ_WRITE);
         fixture.state.set_want(GZBUFSIZE);
@@ -673,7 +612,7 @@ mod tests {
     #[test]
     fn a_second_close_of_a_write_stream_is_refused() {
         // `zlib.h` L1755-L1756 forbids a second close outright; C would free the structure twice.
-        // This port cannot, so the second call is merely rejected -- via the write arm again, because
+        // This implementation cannot, so the second call is merely rejected -- via the write arm again, because
         // `gzclose_w` left `mode` at `GZ_NONE`.
         let mut fixture = writer();
         assert_eq!(gzwrite(&mut fixture.state, HELLO), 14);
@@ -686,10 +625,6 @@ mod tests {
             "the file was not closed a second time"
         );
     }
-
-    // -------------------------------------------------------------------------
-    //  The fall-through: C tests only for `GZ_READ`
-    // -------------------------------------------------------------------------
 
     #[test]
     fn a_direction_less_state_takes_the_write_path_and_is_rejected_there() {

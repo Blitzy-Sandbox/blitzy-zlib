@@ -1,4 +1,4 @@
-//! One-shot decompression of a whole buffer: the port of `uncompr.c`.
+//! One-shot decompression of a whole buffer: the Rust counterpart of `uncompr.c`.
 //!
 //! Four entry points sit on top of the streaming decoder, and only one of them
 //! contains any logic. `uncompress2_z` (`uncompr.c` L29-L82) drives
@@ -21,7 +21,7 @@
 //! bytes consumed**, so that `source + *sourceLen` addresses the first unused
 //! input byte.
 //!
-//! ★ Both length parameters are in/out. A port that treated `*sourceLen` as
+//! ★ Both length parameters are in/out. An implementation that treated `*sourceLen` as
 //! input-only would still pass a naive round-trip test and would then break the
 //! first caller that relies on the first-unused-byte guarantee -- which is how a
 //! caller finds the start of whatever follows a zlib stream in a container.
@@ -61,7 +61,7 @@
 //! # Layering and safety posture
 //!
 //! `no_std`, and allocation-free in itself -- whatever the decoder needs it
-//! takes from [`GlobalAllocator`], which is the port of `zcalloc`/`zcfree` and
+//! takes from [`GlobalAllocator`], which implements `zcalloc`/`zcfree` and
 //! therefore exactly what `uncompr.c` L47-L49 selects by zeroing `zalloc`,
 //! `zfree` and `opaque`. The module names only `core` plus three sibling
 //! modules, holds no raw pointer, and needs no escape hatch from the compiler's
@@ -71,31 +71,55 @@
 //! Nothing here can panic. Every index is produced by `.min()` against a length
 //! captured up front, every subtraction saturates, and no fallible operation is
 //! unwrapped. That is a hard requirement rather than a nicety: this function is
-//! the library's primary untrusted-input surface, it is the target of
-//! `fuzz/fuzz_targets/fuzz_inflate.rs`, and it must terminate without panicking
+//! the library's primary untrusted-input surface, it is to be the target of the planned
+//! `fuzz/fuzz_targets/fuzz_inflate.rs` -- which has not landed; `fuzz/fuzz_targets/` is still
+//! empty -- and it must terminate without panicking
 //! on arbitrary bytes. Termination is proved in [`uncompress2_z`].
 //!
 //! # Examples
 //!
-//! ```ignore
-//! // `compress2(b"hello, hello!", 9)` followed by four unrelated bytes.
-//! let mut stream = zlib_compressed_hello().to_vec();
+//! ```
+//! use zlib_rs::compress::compress2_z;
+//! use zlib_rs::uncompress::uncompress2_z;
+//! use zlib_rs::ReturnCode;
+//!
+//! // A zlib stream for `b"hello, hello!"`, followed by four unrelated bytes.
+//! let mut buffer = [0_u8; 64];
+//! let made = compress2_z(&mut buffer, b"hello, hello!", 9);
+//! assert_eq!(made.code, ReturnCode::OK);
+//! let mut stream = buffer[..made.produced].to_vec();
 //! stream.extend_from_slice(b"tail");
 //!
 //! let mut plain = [0_u8; 64];
 //! let report = uncompress2_z(&mut plain, &stream);
 //!
 //! assert_eq!(report.code, ReturnCode::OK);
-//! assert_eq!(&plain[..report.produced], b"hello, hello!");
+//! assert_eq!(plain.get(..report.produced), Some(&b"hello, hello!"[..]));
 //! // The tail is not part of the stream, so it is not consumed ...
-//! assert_eq!(&stream[report.consumed..], b"tail");
+//! assert_eq!(stream.get(report.consumed..), Some(&b"tail"[..]));
 //!
 //! // ... and a destination too small to hold the result reports how far it got.
 //! let mut cramped = [0_u8; 5];
 //! let report = uncompress2_z(&mut cramped, &stream);
 //! assert_eq!(report.code, ReturnCode::BUF_ERROR);
-//! assert_eq!(&cramped[..report.produced], b"hello");
+//! assert_eq!(cramped.get(..report.produced), Some(&b"hello"[..]));
 //! ```
+//!
+//! # Provenance
+//!
+//! The one-shot decompression wrappers.
+//!
+//! Ported from `uncompr.c`: `uncompress`, `uncompress2` and their `_z` forms. (The file is
+//! `uncompr.c`, not `uncompress.c`; the module is named for the function.)
+
+// Names that repeat their module's name are deliberate here: the C sources this module ports name
+// these entry points, and `crates/zlib-rs/src/lib.rs` re-exports several of them under exactly
+// these names, so renaming any of them to satisfy `clippy::module_name_repetitions` would cost the
+// traceability the port is judged on. The lint sits in `pedantic`, which this workspace denies, and
+// it fires on the declared 1.80 floor; upstream has since reclassified it, so the allowance is what
+// keeps the same lint gate passing on both toolchains. The same relaxation, for the same reason,
+// already appears in `config.rs`, `deflate/**`, `inflate/**` and `gz/**`.
+#![allow(clippy::module_name_repetitions)]
 
 use crate::allocate::GlobalAllocator;
 use crate::config::Z_NO_FLUSH;
@@ -104,7 +128,7 @@ use crate::inflate::{inflate, inflate_end, inflate_init, InflateStream};
 
 /// The largest number of bytes handed to the decoder in one call.
 ///
-/// Ported from `const uInt max = (uInt)-1` (`uncompr.c` L33). `uInt` is C's
+/// Mirrors `const uInt max = (uInt)-1` (`uncompr.c` L33). `uInt` is C's
 /// `unsigned int`, so the value is 32 bits of ones: the widest `avail_in` or
 /// `avail_out` a `z_stream` can express. It exists because `z_size_t` is 64 bits
 /// wide on LP64 while `avail_in` and `avail_out` are not, so a buffer larger
@@ -125,12 +149,30 @@ const MAX_CHUNK: usize = u32::MAX as usize;
 /// `uncompr.c` L69-L71: "Set `*sourceLen` to the amount of input consumed. Set
 /// `*destLen` to the amount of data produced."
 ///
-/// ★ The counts are meaningful on **every** outcome, not just on success.
-/// `zlib.h` L1330-L1332 promises that "in the case where there is not enough
-/// room, `uncompress()` will fill the output buffer with the uncompressed data
-/// up to that point", so a caller that sees [`ReturnCode::BUF_ERROR`] still
-/// learns how much it got. A facade therefore writes both counts back
-/// unconditionally.
+/// ★ The counts report real work on every outcome the decompression loop can
+/// produce, not just on success. `zlib.h` L1330-L1332 promises that "in the case
+/// where there is not enough room, `uncompress()` will fill the output buffer
+/// with the uncompressed data up to that point", so a caller that sees
+/// [`ReturnCode::BUF_ERROR`] still learns how much it got. A facade therefore
+/// writes both counts back unconditionally.
+///
+/// ★ **The one exception: a failed stream initialisation.** `uncompr.c` L51-L52
+/// is `err = inflateInit(&stream); if (err != Z_OK) return err;` -- it returns
+/// *before* `*destLen` and `*sourceLen` are ever written, so on that path the
+/// caller's two out-parameters keep the values it passed in. No work was done, so
+/// there is no count to report.
+///
+/// Because this type returns the counts instead of storing them, that behaviour
+/// is expressed by echoing the **entry lengths** back: on an initialisation
+/// failure -- in practice [`ReturnCode::MEM_ERROR`] -- [`Decompressed::produced`]
+/// is the destination's length and [`Decompressed::consumed`] is the source's
+/// length. Those two numbers are *not* counts of bytes produced or consumed on
+/// that path; they are what lets a facade write both back unconditionally and
+/// still leave the caller's variables unchanged.
+///
+/// So do not read `produced`/`consumed` as work performed without first checking
+/// `code`. Every other status -- success, a data error, a buffer error -- reports
+/// genuine counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "the status code reports corrupt input and a short destination buffer"]
 pub struct Decompressed {
@@ -152,7 +194,7 @@ pub struct Decompressed {
 
 /// Decompresses `source` into `dest`, reporting both byte counts.
 ///
-/// The port of `uncompress2_z` (`uncompr.c` L29-L82), declared at `zlib.h`
+/// The Rust counterpart of `uncompress2_z` (`uncompr.c` L29-L82), declared at `zlib.h`
 /// L1337. This is the only entry point in the module with a body; the other
 /// three delegate to it, directly or through each other.
 ///
@@ -335,7 +377,7 @@ pub fn uncompress2_z(dest: &mut [u8], source: &[u8]) -> Decompressed {
     // same statement as "accumulate what each call reported", and it must not be
     // rewritten into that form: the two agree only while `avail_in` and
     // `next_in` stay consistent, which the reference guarantees by convention
-    // and this port guarantees structurally, because the availabilities are
+    // and this implementation guarantees structurally, because the availabilities are
     // derived from the cursors rather than stored beside them.
     //
     // Neither saturation bites. `len + avail_in` is `source_len - consumed` and
@@ -374,7 +416,7 @@ pub fn uncompress2_z(dest: &mut [u8], source: &[u8]) -> Decompressed {
 
 /// Decompresses `source` into `dest`, reporting both byte counts.
 ///
-/// The port of `uncompress2` (`uncompr.c` L83-L91), declared at `zlib.h` L1335.
+/// The Rust counterpart of `uncompress2` (`uncompr.c` L83-L91), declared at `zlib.h` L1335.
 /// C's body widens the caller's two `uLong` lengths to `z_size_t`, calls
 /// [`uncompress2_z`], and narrows both results back.
 ///
@@ -390,7 +432,7 @@ pub fn uncompress2(dest: &mut [u8], source: &[u8]) -> Decompressed {
 
 /// Decompresses `source` into `dest`, reporting how much was produced.
 ///
-/// The port of `uncompress_z` (`uncompr.c` L92-L96), declared at `zlib.h` L1317:
+/// The Rust counterpart of `uncompress_z` (`uncompr.c` L92-L96), declared at `zlib.h` L1317:
 /// [`uncompress2_z`] with the source length passed by value instead of by
 /// pointer, so the consumed count has nowhere to go and C drops it.
 ///
@@ -405,7 +447,7 @@ pub fn uncompress_z(dest: &mut [u8], source: &[u8]) -> Decompressed {
 
 /// Decompresses `source` into `dest`, reporting how much was produced.
 ///
-/// The port of `uncompress` (`uncompr.c` L97-L101), declared at `zlib.h` L1315.
+/// The Rust counterpart of `uncompress` (`uncompr.c` L97-L101), declared at `zlib.h` L1315.
 /// This is the entry point most callers use, and the prose at `zlib.h`
 /// L1319-L1332 is written about it.
 ///
@@ -423,10 +465,6 @@ pub fn uncompress(dest: &mut [u8], source: &[u8]) -> Decompressed {
     uncompress2(dest, source)
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-//
 // Every expectation below was MEASURED against the reference implementation --
 // the in-tree C sources built as `libz.a` -- by calling `uncompress2_z` on the
 // same fixture and recording the resulting `(int, *destLen, *sourceLen)` triple.
@@ -436,23 +474,24 @@ pub fn uncompress(dest: &mut [u8], source: &[u8]) -> Decompressed {
 // The fixtures are compressed streams rather than plaintext because the encoder
 // is not this module's dependency: a stream produced by the C compressor and
 // decoded here is a direct test of the C-to-Rust interoperability that
-// `crates/zlib-rs-differential/tests/roundtrip_interop.rs` asserts at workspace
+// the planned `crates/zlib-rs-differential/tests/roundtrip_interop.rs` will assert at workspace
 // scope. Their spellings match the ones the inflate suite already uses, so a
 // reviewer can compare fixture for fixture.
 //
-// `clippy.toml` sets `allow-unwrap-in-tests`, `allow-expect-in-tests`,
-// `allow-panic-in-tests` and `allow-indexing-slicing-in-tests`, so assertions
-// here may index and panic; nothing above this line may.
+// `clippy.toml` sets `allow-unwrap-in-tests`, `allow-expect-in-tests` and
+// `allow-panic-in-tests`, so assertions here may panic; nothing above this line
+// may.
+// Fixture indexing: every index below is a literal into a fixture this module just built,
+// so each one is provably in range. `clippy::indexing_slicing` is denied workspace-wide and
+// is relaxed HERE ONLY, on the test module -- not through a clippy.toml key, which would be a
+// field the 1.80 floor does not recognise and would abort the whole lint run.
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::{uncompress, uncompress2, uncompress2_z, uncompress_z, Decompressed, MAX_CHUNK};
     use crate::error::ReturnCode;
     use alloc::vec;
     use alloc::vec::Vec;
-
-    // -------------------------------------------------------------------------
-    //  Fixtures
-    // -------------------------------------------------------------------------
 
     /// `compress2(b"hello, hello!", 9)`: the payload `test/example.c` uses, in a
     /// zlib container. 18 bytes in, 13 bytes out.
@@ -575,20 +614,12 @@ mod tests {
         assert_eq!(report.consumed, consumed, "consumed: {report:?}");
     }
 
-    // -------------------------------------------------------------------------
-    //  The chunk cap
-    // -------------------------------------------------------------------------
-
     /// [`MAX_CHUNK`] is `(uInt)-1`, and it must stay representable as a `usize`.
     #[test]
     fn chunk_cap_matches_the_reference() {
         assert_eq!(MAX_CHUNK, 4_294_967_295);
         assert_eq!(u64::try_from(MAX_CHUNK).unwrap(), u64::from(u32::MAX));
     }
-
-    // -------------------------------------------------------------------------
-    //  Successful decodes  (C: ret=0)
-    // -------------------------------------------------------------------------
 
     /// A destination sized exactly to the result. Measured: `0 / 13 / 18`.
     #[test]
@@ -674,10 +705,6 @@ mod tests {
         assert_eq!(out, plain);
     }
 
-    // -------------------------------------------------------------------------
-    //  The consumed count  (`source + *sourceLen` is the first unused byte)
-    // -------------------------------------------------------------------------
-
     /// ★ Trailing bytes after a complete stream are **not** consumed: the count
     /// stops at the stream's own last byte, which is what makes
     /// `source + consumed` the first unused input byte. Measured: `0 / 13 / 18`
@@ -718,10 +745,6 @@ mod tests {
         assert_report(second, ReturnCode::OK, 1, 9);
         assert_eq!(out, b"x");
     }
-
-    // -------------------------------------------------------------------------
-    //  Z_BUF_ERROR: the destination filled up  (C: ret=-5)
-    // -------------------------------------------------------------------------
 
     /// ★ One byte short. The result is `Z_BUF_ERROR`, the destination holds every
     /// byte that fitted, and input is left over -- which is precisely what keeps
@@ -777,10 +800,6 @@ mod tests {
             );
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  Z_DATA_ERROR: incomplete input  (the `BUF_ERROR && len == 0` arm)
-    // -------------------------------------------------------------------------
 
     /// ★ A stream one byte short of its check value. Every input byte is
     /// consumed, so the residual is zero and `inflate`'s `Z_BUF_ERROR` becomes
@@ -848,10 +867,6 @@ mod tests {
         assert_eq!(run(HELLO_ZLIB, 64).0.code, ReturnCode::OK);
     }
 
-    // -------------------------------------------------------------------------
-    //  Z_DATA_ERROR: corrupt input
-    // -------------------------------------------------------------------------
-
     /// A flipped byte inside the compressed data. The decoder still writes
     /// thirteen bytes -- the wrong ones -- and the check value catches it.
     /// Measured: `-3 / 13 / 18` with output `helk7, helk7!`.
@@ -891,10 +906,6 @@ mod tests {
         assert_report(run(RLE_RAW, 256).0, ReturnCode::DATA_ERROR, 0, 2);
     }
 
-    // -------------------------------------------------------------------------
-    //  Z_NEED_DICT becomes Z_DATA_ERROR
-    // -------------------------------------------------------------------------
-
     /// ★ A stream compressed against a preset dictionary. `inflate` answers
     /// `Z_NEED_DICT`, but this entry point has no way to supply one, so the
     /// second arm of the ladder converts it to `Z_DATA_ERROR`. Measured:
@@ -915,10 +926,6 @@ mod tests {
         let report = uncompress2_z(&mut [], DICT_ZLIB);
         assert_report(report, ReturnCode::DATA_ERROR, 0, 6);
     }
-
-    // -------------------------------------------------------------------------
-    //  The three wrappers
-    // -------------------------------------------------------------------------
 
     /// All four entry points agree, on success and on both kinds of failure,
     /// because all four reach the same body. Measured for each of
@@ -961,10 +968,6 @@ mod tests {
             assert_eq!(dest, expected);
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  Robustness against arbitrary input
-    // -------------------------------------------------------------------------
 
     /// The set of statuses `uncompr.c` L22-L25 documents. `Z_STREAM_ERROR` is
     /// absent on purpose: the guard that produces it cannot be expressed over
@@ -1013,7 +1016,7 @@ mod tests {
     /// reachable header -- valid, invalid, dictionary-requesting and
     /// reserved-method alike -- and asserts only that the call returns a
     /// documented status without panicking. This is the cheap in-crate precursor
-    /// to `fuzz/fuzz_targets/fuzz_inflate.rs`.
+    /// to the planned `fuzz/fuzz_targets/fuzz_inflate.rs`.
     #[test]
     fn every_two_byte_input_terminates() {
         let mut dest = [0_u8; 32];

@@ -1,14 +1,14 @@
-//! Opening a `gzFile`, and resetting one: the port of the first third of `gzlib.c`.
+//! Opening a `gzFile`, and resetting one: the Rust counterpart of the first third of `gzlib.c`.
 //!
 //! This module owns four things, in the order `gzlib.c` presents them:
 //!
 //! | This module | C origin |
 //! |---|---|
-//! | [`gz_reset`] | `gz_reset`, `gzlib.c` L69-L84 |
-//! | [`GzOpenSpec::parse`] and [`gz_open`] | `gz_open`, `gzlib.c` L87-L285 |
+//! | `gz_reset` | `gz_reset`, `gzlib.c` L69-L84 |
+//! | [`GzOpenSpec::parse`] and `gz_open` | `gz_open`, `gzlib.c` L87-L285 |
 //! | [`gzopen`] | `gzopen` and `gzopen64`, `gzlib.c` L288 and L293 |
 //! | [`gzdopen`], [`gz_open_handle`] | `gzdopen`, `gzlib.c` L298-L312 |
-//! | [`gzopen_w`] | `gzopen_w`, `gzlib.c` L316-L318, `#ifdef WIDECHAR` |
+//! | `gzopen_w` | `gzopen_w`, `gzlib.c` L316-L318, `#ifdef WIDECHAR` |
 //!
 //! It also supplies [`FileHandle`], the concrete [`GzHandle`] implementation that
 //! `crate::gz::state` declares but deliberately does not define, because path-based opening is
@@ -72,15 +72,19 @@
 //! `#![forbid(unsafe_code)]`, so a caller-supplied descriptor cannot be adopted here at all. The
 //! two ways a `gzFile` comes into being therefore split along that line:
 //!
-//! * **by path** -- [`gz_open`] opens the file itself through [`std::fs::OpenOptions`], which is
+//! * **by path** -- `gz_open` opens the file itself through [`std::fs::OpenOptions`], which is
 //!   entirely safe, and installs a [`FileHandle`];
 //! * **by descriptor** -- [`gz_open_handle`] and [`gzdopen`] take an already-constructed
-//!   `Box<dyn GzHandle>`. `crates/libz-rs-sys/src/gz.rs` builds it from the raw descriptor inside
-//!   its own audited `unsafe` block and hands it in.
+//!   `Box<dyn GzHandle>`. The planned `crates/libz-rs-sys/src/gz.rs` will build it from the raw
+//!   descriptor inside its own audited `unsafe` block and hand it in.
 //!
 //! ## What the facade must do
 //!
-//! The facade author cannot see this file, so the contract is stated here in full.
+//! `crates/libz-rs-sys/src/gz.rs` does not exist at this checkpoint, and neither does any other
+//! module of that crate except its build script and `panic_guard.rs`. Every "the facade does X"
+//! in this file is therefore an obligation on that future file, never a description of code that
+//! can be read today; nothing here has been exercised through a compiled C caller. The facade
+//! author cannot see this file, so the contract is stated in full.
 //!
 //! 1. **`gzopen` / `gzopen64`.** Convert the caller's `const char *` to a byte slice excluding
 //!    the terminating NUL, reject a null pointer with `NULL` before calling (a null pointer
@@ -104,11 +108,26 @@
 //!    `O_NONBLOCK`, `gzlib.c` L254-L257 -- *is* expressible, and [`gz_open_handle`] performs it
 //!    through [`GzHandle::set_nonblocking`], ignoring the result exactly as C ignores `fcntl`'s.
 //! 5. **`gzopen_w`.** Convert the `wchar_t *` yourself and pass the resulting bytes to
-//!    [`gzopen_w`]; see that function's documentation for the encoding requirement.
+//!    `gzopen_w`; see that function's documentation for the encoding requirement.
 //!
-//! # Three deliberate divergences from C, and the hooks that close them
+//! # KNOWN BEHAVIOUR DIVERGENCES FROM C -- the complete inventory
 //!
-//! 1. **`close(2)`'s `errno` is not observable.** Dropping a [`std::fs::File`] discards the
+//! Behaviour preservation is this port's governing constraint, so every observable departure from
+//! the reference implementation is an **open item**, not a feature. They are collected here rather
+//! than scattered, each with a status, so that a drop-in claim can be qualified against a list
+//! instead of asserted in general. None of them may be described at its own site as hardening, as
+//! "strictly better", or as stricter than C.
+//!
+//! Statuses used below:
+//!
+//! * **CLOSABLE AT THE BOUNDARY** -- the facade can restore C's behaviour; the hook exists.
+//! * **FORCED, UNRESOLVED** -- reproducing C exactly would require `unsafe` or would reproduce a
+//!   memory-safety defect. The difference stands and is recorded as unresolved.
+//! * **COSMETIC** -- affects human-readable text only, and no documented value.
+//!
+//! ## Divergences owned by this file
+//!
+//! 1. **`close(2)`'s `errno` is not observable.** *(CLOSABLE AT THE BOUNDARY.)* Dropping a [`std::fs::File`] discards the
 //!    result, and stable Rust 1.80 offers no safe way to see it. `gzclose_r` and `gzclose_w` must
 //!    return `Z_ERRNO` when `close` fails (`gzread.c` L665-L667, `gzwrite.c` L696-L697), so
 //!    [`GzHandle::close`] is a distinct operation rather than a drop: a facade handle can back it
@@ -116,15 +135,61 @@
 //!    the file, reporting any flush failure; it deliberately does **not** `fsync`, because C's
 //!    `close` does not either and forcing one would change `gzclose`'s cost rather than its
 //!    behaviour.
-//! 2. **`io::Error`'s `Display` is not `strerror(errno)`.** It appends `" (os error N)"`, whereas
+//! 2. **`io::Error`'s `Display` is not `strerror(errno)`.** *(COSMETIC.)* It appends
+//!    `" (os error N)"`, whereas
 //!    C feeds `zstrerror()` -- literally `strerror(errno)` (`gzguts.h` L131-L133) -- to
 //!    `gz_error`. Nothing in `test/example.c`, `test/minigzip.c` or `test/infcover.c` asserts that
 //!    text, so the difference is invisible to the acceptance suite; [`GzIoError::errno`] carries
 //!    the number so a facade that wants byte-identical text can call `strerror` itself.
-//! 3. **`EAGAIN`/`EWOULDBLOCK` are recognised by kind, not by number.**
-//!    [`std::io::ErrorKind::WouldBlock`] is the safe stand-in, and it is what sets
-//!    [`GzIoError::would_block`] -- the flag `gz_avail` and `gz_comp` record in `state->again`
-//!    (`gzread.c` L36, `gzwrite.c` L82 and L117).
+//! 3. **`EAGAIN`/`EWOULDBLOCK` are recognised by kind, not by number.** *(FORCED, UNRESOLVED --
+//!    but no divergence has been demonstrated.)* [`std::io::ErrorKind::WouldBlock`] is the safe
+//!    stand-in, and it is what sets [`GzIoError::would_block`] -- the flag `gz_avail` and `gz_comp`
+//!    record in `state->again` (`gzread.c` L36, `gzwrite.c` L82 and L117). A platform whose
+//!    `WouldBlock` mapping omits an errno C would have matched would behave differently here; that
+//!    has not been observed and has not been proven impossible either.
+//!
+//! 4. **`O_CLOEXEC` is set on every path-based open, requested or not.** *(FORCED, UNRESOLVED.)*
+//!    `std` sets it unconditionally and offers no safe way to clear it, whereas C sets `FD_CLOEXEC`
+//!    only when the mode string contained `e` (`gzlib.c` L258-L261). A program that opens a gzip
+//!    file and then `exec`s a child expecting to inherit the descriptor observes the difference.
+//!    See [`GzOpenSpec::cloexec`]; for an adopted descriptor the facade applies the flag itself, so
+//!    only the path-based case diverges.
+//!
+//! 5. **Boxing the handle cannot report allocation failure.** *(FORCED, UNRESOLVED.)*
+//!    `GzState`'s handle slot is a `Box<dyn GzHandle>`, and stable Rust 1.80 has no fallible
+//!    constructor for one, so an allocator that cannot serve three words **aborts the process**
+//!    where C would return `Z_MEM_ERROR`. The window is narrow -- such an allocator could not have
+//!    served the `GzState` being installed into -- but an abort is not a return value, and
+//!    `test/infcover.c`'s `mem_limit` exists precisely to drive allocation failure deliberately.
+//!
+//! 6. **`gzdopen` has no allocation-failure path at all.** *(FORCED, UNRESOLVED.)* C `malloc`s a
+//!    small buffer for the `"<fd:%d>"` label and returns `NULL` if that fails (`gzlib.c`
+//!    L298-L312). Building the label in a fixed stack buffer removes the failure mode, so a caller
+//!    cannot observe `gzdopen` failing for memory the way it can in C. The label text itself is
+//!    reproduced exactly, because `gzerror` prefixes messages with it.
+//!
+//! ## Divergences owned by sibling modules
+//!
+//! Recorded here so the inventory is one list. Each is documented in full at its own site.
+//!
+//! 7. **`gz_zero` allocates the buffers before the loop and ties the zero-fill to the first
+//!    non-empty chunk.** *(FORCED, UNRESOLVED -- it avoids a C defect.)* C's lazy allocation lets a
+//!    `gzseek`-armed `gzputc` consume the `first` flag on a zero-length chunk and then fill the
+//!    stream from uninitialised `malloc` memory. See `gz/write.rs`, `gz_zero`.
+//!
+//! 8. **`gz_write` clears both stream cursors when the direct path ends.** *(FORCED, UNRESOLVED --
+//!    it avoids a C defect.)* C leaves `next_in` pointing into the caller's buffer; after a
+//!    non-blocking stall the next call derives an underflowing length from it and writes out of
+//!    bounds. See `gz/write.rs`, `gz_write`.
+//!
+//! 9. **`gz_fetch` publishes the output cursor and count together.** *(FORCED, UNRESOLVED -- it
+//!    avoids a C defect.)* C can leave a non-zero `x.have` paired with a stale `x.next`, so the
+//!    application receives bytes from the wrong place. See `gz/read.rs`, `gz_fetch`.
+//!
+//! Items 7-9 are cases where matching C exactly would mean reproducing an out-of-bounds access or
+//! a read of uninitialised memory. They are therefore not going to be "fixed" by aligning with C;
+//! they are recorded as differences so that no blanket claim of exact behavioural equivalence is
+//! made on their behalf.
 //!
 //! # What this module expects of the crate root
 //!
@@ -134,13 +199,13 @@
 //! (AAP §0.4.2.1: `#include <stdio.h>` and `<fcntl.h>` become `use std::{fs, io}` behind that
 //! gate). Because the crate is `#![no_std]`, `std` is not in the extern prelude, so this file
 //! declares `extern crate std;` itself rather than depending on the root having done so; a second
-//! declaration at the root is harmless. The items below are `pub` because
-//! `crates/libz-rs-sys/src/gz.rs` calls them, so the root's declaration of this subtree must be
-//! `pub mod gz`.
+//! declaration at the root is harmless. The items below are `pub` because the planned
+//! `crates/libz-rs-sys/src/gz.rs` will call them, so the root's declaration of this subtree must
+//! be `pub mod gz`.
 
 // The C names are reproduced deliberately: a maintainer diffing this file against `gzlib.c` is
 // looking for `gz_open`, `gz_reset` and `gzdopen`, and renaming them to satisfy a lint would cost
-// exactly the traceability the port is judged on.
+// exactly the traceability the implementation is judged on.
 #![allow(clippy::module_name_repetitions)]
 
 extern crate std;
@@ -167,13 +232,9 @@ use crate::config::{
 use crate::error::ReturnCode;
 use crate::gz::gz_error;
 use crate::gz::state::{
-    GzHandle, GzIoError, GzMode, GzSeekFrom, GzState, ZOff64, GZ_APPEND, GZ_NONE, GZ_READ,
-    GZ_WRITE, LOOK,
+    GzFileSlot, GzHandle, GzIoError, GzMode, GzSeekFrom, GzState, ZOff64, GZ_APPEND, GZ_NONE,
+    GZ_READ, GZ_WRITE, LOOK,
 };
-
-// -----------------------------------------------------------------------------
-//  Platform open flags that Rust's own file API does not spell out
-// -----------------------------------------------------------------------------
 
 /// The numeric value of `O_NONBLOCK` on this target, or [`None`] when it is not known.
 ///
@@ -253,6 +314,42 @@ fn apply_nonblocking(options: &mut OpenOptions, nonblocking: bool) {
 #[cfg(not(unix))]
 fn apply_nonblocking(_options: &mut OpenOptions, _nonblocking: bool) {}
 
+/// What to open, in the form the platform's own `open` call takes it.
+///
+/// C has two open calls and hands each one a *different representation of the name*:
+///
+/// | C | Call | Argument |
+/// |---|---|---|
+/// | `gzopen`, `gzopen64` (`gzlib.c` L288, L293) | `open(path, oflag, 0666)` (L248) | the caller's `const char *`, byte for byte |
+/// | `gzopen_w` (`gzlib.c` L316) | `_wopen(path, oflag, 0666)` (L246) | the caller's `wchar_t *`, unit for unit |
+///
+/// Neither is converted before the call. `wcstombs` appears in `gz_open` for one purpose only --
+/// building `state->path`, the string `gz_error` prefixes messages with (`gzlib.c` L200-L219) -- and
+/// the narrowed copy is never what gets opened.
+///
+/// This enum is that distinction, made explicit so it cannot be collapsed by accident. The
+/// diagnostic label travels separately, as its own `&[u8]` argument to [`gz_open_with`], which is
+/// what keeps the two from being confused: a wide open keeps its `u16` units *and* gets a narrow
+/// label, exactly as C does.
+///
+/// # Why `Wide` is not gated to Windows
+///
+/// `gzopen_w` exists only on Windows, and so does `_wopen`. The *variant* is nevertheless
+/// unconditional, for two reasons. It keeps this type and the label split testable on the target CI
+/// actually runs (there is no Windows job for `cargo test`), and it keeps one signature for
+/// [`gz_open_with`] rather than a shape that changes with the target. Opening a `Wide` target
+/// on a platform with no wide file API reports the same `UNREPRESENTABLE_PATH` failure rather than
+/// encoding, which is the same answer this module already gives a non-UTF-8 narrow path on such a
+/// platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GzPathTarget<'p> {
+    /// A byte path, as `open(2)` takes it and as `gzopen` supplies it.
+    Narrow(&'p [u8]),
+    /// A wide path in the platform's `wchar_t` units, as `_wopen` takes it and as `gzopen_w`
+    /// supplies it. On Windows these are UTF-16 code units, and unpaired surrogates are preserved.
+    Wide(&'p [u16]),
+}
+
 /// Interprets `path` as a filesystem path, or reports that it cannot be one.
 ///
 /// C needs no counterpart: it hands the caller's `const char *` straight to `open`
@@ -260,9 +357,12 @@ fn apply_nonblocking(_options: &mut OpenOptions, _nonblocking: bool) {}
 /// re-typed, and that is all this does.
 ///
 /// On unix a path is an arbitrary byte string, so the bytes are used exactly as C uses them and
-/// this never fails. Everywhere else the bytes must be valid UTF-8, because that is the only
-/// encoding `std` can convert from portably; see [`gzopen_w`] for what that means for the
-/// wide-character entry point.
+/// this never fails. On Windows a narrow path must be valid UTF-8, because `std` converts a `&Path`
+/// to UTF-16 before calling `CreateFileW` and UTF-8 is the only encoding it can convert from; C
+/// instead hands the bytes to the CRT's `open`, which interprets them in the active ANSI code page.
+/// The difference is unreachable for a caller that passes UTF-8 or ASCII, and a caller that must
+/// name a path the ANSI code page cannot express should use `gzopen_w`, which now carries its
+/// `wchar_t` units through untouched -- see [`GzPathTarget`].
 // The `Option` is infallible on unix and clippy is right to notice, but the two definitions are one
 // signature: collapsing this one to `&Path` would make the caller's `ok_or` conditional on the
 // target, which is a worse trade than an always-`Some` return here.
@@ -276,6 +376,37 @@ fn os_path(path: &[u8]) -> Option<&Path> {
 #[cfg(not(unix))]
 fn os_path(path: &[u8]) -> Option<&Path> {
     core::str::from_utf8(path).ok().map(Path::new)
+}
+
+/// Interprets wide units as a filesystem path: the `_wopen` half of [`GzPathTarget`].
+///
+/// `OsStringExt::from_wide` is the lossless conversion -- it preserves unpaired surrogates, which is
+/// precisely what a Windows path may legally contain and precisely what a round trip through UTF-8
+/// would destroy. That losslessness is the point of the whole [`GzPathTarget`] split: `_wopen`
+/// receives the caller's units, and so does this.
+// The `Option` is always `Some` here, and clippy's `unnecessary_wraps` says so under
+// `--target *-windows-*`. It is kept because the `#[cfg(not(windows))]` twin below has no wide file
+// API to open through and must answer `None`: one signature, two cfgs, and the wrapper is load-
+// bearing in exactly one of them. `os_path` above carries the same allow for the same reason.
+#[allow(clippy::unnecessary_wraps)]
+#[cfg(windows)]
+fn wide_path(units: &[u16]) -> Option<std::path::PathBuf> {
+    // The intermediate is named because `PathBuf: From<_>` has several impls and inference cannot
+    // pick one from `from_wide`'s return type alone.
+    let wide: std::ffi::OsString = std::os::windows::ffi::OsStringExt::from_wide(units);
+    Some(std::path::PathBuf::from(wide))
+}
+
+/// Non-Windows counterpart of [`wide_path`]: there is no wide file API to open through.
+///
+/// C reaches the same conclusion by declaring `gzopen_w` only under `WIDECHAR` (`gzguts.h` L54-L56),
+/// so no portable caller can be here. Reporting a failure rather than transcoding is deliberate:
+/// guessing an encoding for a name the platform has no way to represent would open the wrong file
+/// rather than none.
+// `units` is genuinely unused here; the parameter exists so both definitions share one signature.
+#[cfg(not(windows))]
+fn wide_path(_units: &[u16]) -> Option<std::path::PathBuf> {
+    None
 }
 
 /// Converts a [`std::io::Error`] into the allocation-free [`GzIoError`] the layer reports.
@@ -307,13 +438,20 @@ const CLOSED_HANDLE: GzIoError = GzIoError::new(0, false);
 /// `lseek` rejects a negative absolute offset with `EINVAL`, and a position that does not fit the
 /// offset type cannot be reported at all. Both are recognised before a syscall is attempted, so
 /// there is no `errno` to read and zero is reported, exactly as for [`CLOSED_HANDLE`]. On every
-/// target this port supports the second case is unreachable, because `ZOff64` and the platform's
+/// target this implementation supports the second case is unreachable, because `ZOff64` and the platform's
 /// own offset type are both 64-bit and signed.
 const OUT_OF_RANGE_OFFSET: GzIoError = GzIoError::new(0, false);
 
-// -----------------------------------------------------------------------------
-//  FileHandle: the file-backed GzHandle
-// -----------------------------------------------------------------------------
+/// The failure reported when a name cannot be expressed as a path on this platform.
+///
+/// Two cases, and neither reaches a syscall, so there is no `errno` and zero is reported exactly as
+/// for [`CLOSED_HANDLE`]: a narrow path that is not valid UTF-8 on a platform where `std` can only
+/// convert from UTF-8, and a [`GzPathTarget::Wide`] target on a platform with no wide file API. C
+/// has no counterpart for either -- it hands bytes to `open` and units to `_wopen` and lets the
+/// platform judge -- so the closest C analogue is the `EINVAL`-or-`ENOENT` the platform would have
+/// produced from a name it could not use. Reported rather than guessed at: transcoding a name the
+/// platform cannot represent risks opening a *different* file, which is worse than opening none.
+const UNREPRESENTABLE_PATH: GzIoError = GzIoError::new(0, false);
 
 /// A [`GzHandle`] backed by an owned [`std::fs::File`]: what `gz_open` installs in place of C's
 /// `state->fd` when the stream was opened by path.
@@ -337,13 +475,30 @@ const OUT_OF_RANGE_OFFSET: GzIoError = GzIoError::new(0, false);
 ///
 /// # Constructing one from a descriptor
 ///
-/// [`FileHandle::from_file`] is `pub` precisely so that the facade's `gzdopen` can do
-/// `unsafe { File::from_raw_fd(fd) }` -- one audited line, in the crate that is allowed to write it
-/// -- and then reuse everything below instead of reimplementing it. Note the ownership caveat: a
-/// `File` built that way closes the descriptor when dropped, so a facade that must honour
-/// `zlib.h` L1415-L1416 ("`gzdopen` does not close `fd` if it fails") has to recover the
-/// descriptor with `IntoRawFd` before dropping the handle, or supply its own non-closing handle
-/// type instead.
+/// [`FileHandle::from_file`] is `pub` precisely so that the facade's `gzdopen` can adopt the
+/// caller's descriptor with `File::from_raw_fd` -- in the crate that is allowed to write `unsafe`
+/// -- and then reuse everything below instead of reimplementing it. That call is not merely
+/// "audited"; it carries an ownership invariant the facade has to discharge, and it is spelled out
+/// here because this side cannot check any of it:
+///
+/// * `fd` must be an **open** descriptor on the calling process, valid for the operations the mode
+///   string asked for. A closed or never-opened descriptor is not a safety problem for the
+///   `from_raw_fd` call itself, but every subsequent read or write on it is nonsense, so the facade
+///   validates it before adopting it.
+/// * Ownership of `fd` transfers to the resulting [`File`] **exactly once**. No other [`File`],
+///   handle, or piece of code may own the same descriptor, because the first owner to be dropped
+///   closes it and leaves every other owner holding a stale number that the operating system is
+///   free to reuse for an unrelated file. A descriptor the caller still intends to use must be
+///   duplicated first, which is what `zlib.h` L1414-L1416 tells callers to do.
+/// * The descriptor must not be closed behind the [`File`]'s back for as long as the handle lives.
+///
+/// The recovery obligation follows from the same transfer. A `File` built this way closes the
+/// descriptor when dropped, and `zlib.h` L1415-L1416 promises that "`gzdopen` does not close `fd`
+/// if it fails" -- so on **every** failure path after adoption, the facade must take the handle
+/// back out of [`GzOpenHandleError::handle`] and recover the descriptor with `IntoRawFd` before the
+/// handle is dropped, or supply its own handle type whose `Drop` does not close. Failure paths
+/// reached *before* adoption need nothing, which is why this module's documentation, point 2,
+/// requires [`GzOpenSpec::parse`] to run first.
 #[derive(Debug)]
 pub struct FileHandle {
     /// The open file, or [`None`] once [`GzHandle::close`] has run.
@@ -402,7 +557,7 @@ impl FileHandle {
 }
 
 impl GzHandle for FileHandle {
-    /// The port of `read(state->fd, buf + *have, len)` in `gz_load` (`gzread.c` L30).
+    /// Implements `read(state->fd, buf + *have, len)` in `gz_load` (`gzread.c` L30).
     ///
     /// `Ok(0)` means end of file, as a `read` returning 0 does there. Interruptions are **not**
     /// retried, deliberately: `read` returning `-1` with `EINTR` is an error to `gz_load`
@@ -414,7 +569,7 @@ impl GzHandle for FileHandle {
             .map_err(|error| io_error(&error))
     }
 
-    /// The port of `write(state->fd, state->x.next, put)` in `gz_comp` (`gzwrite.c` L115).
+    /// Implements `write(state->fd, state->x.next, put)` in `gz_comp` (`gzwrite.c` L115).
     ///
     /// A short write is normal rather than exceptional; `gz_comp` loops until the buffer is drained
     /// (`gzwrite.c` L110-L123), so no loop is added here.
@@ -424,14 +579,14 @@ impl GzHandle for FileHandle {
             .map_err(|error| io_error(&error))
     }
 
-    /// The port of the `LSEEK` macro (`gzlib.c` L8-L16), which resolves to `lseek64`, `_lseeki64`,
+    /// Implements the `LSEEK` macro (`gzlib.c` L8-L16), which resolves to `lseek64`, `_lseeki64`,
     /// `llseek` or `lseek` per platform.
     ///
     /// The offset type is [`ZOff64`], the core's stand-in for `z_off64_t`, and it is signed for all
     /// three origins. [`SeekFrom::Start`] is the one that cannot accept a negative offset, so a
     /// negative absolute position is rejected the way `lseek` rejects it -- with a failure rather
     /// than a wrapped, enormous unsigned offset. A resulting position too large for [`ZOff64`] is
-    /// rejected for the same reason; on every target this port supports that is unreachable,
+    /// rejected for the same reason; on every target this implementation supports that is unreachable,
     /// because [`ZOff64`] and the platform's own offset type are both 64-bit signed.
     fn seek(&mut self, offset: ZOff64, whence: GzSeekFrom) -> Result<ZOff64, GzIoError> {
         let from = match whence {
@@ -466,10 +621,14 @@ impl GzHandle for FileHandle {
     /// Closes the file, flushing first if it was opened for writing. Idempotent.
     ///
     /// The port of `close(state->fd)` (`gzread.c` L665, `gzwrite.c` L696), whose failure becomes
-    /// `Z_ERRNO`. Divergence 1 in this module's documentation applies: the result of the underlying
-    /// `close(2)` is unobservable from safe Rust, so what is reported is the flush's result. No
-    /// `fsync` is performed -- C's `close` does not sync either, and forcing one would make every
-    /// `gzclose` pay for durability the reference implementation never promised.
+    /// `Z_ERRNO`. Divergence 1 in this module's documentation applies to *this* implementation: the
+    /// result of the underlying `close(2)` is unobservable from safe Rust, so what is reported is the
+    /// flush's result. That is a property of this type, not of the layer -- a stream whose
+    /// `close(2)` status must be exact takes an injected handle through [`gz_open_with`], and the
+    /// result then travels unchanged through [`crate::gz::state::GzFileSlot::close`] to
+    /// `gzclose_r`/`gzclose_w`. No `fsync` is performed here -- C's `close` does not sync either,
+    /// and forcing one would make every `gzclose` pay for durability the reference implementation
+    /// never promised.
     ///
     /// The file is taken out of the slot before the flush is attempted, so it is released even when
     /// the flush fails and a second call still succeeds.
@@ -484,10 +643,6 @@ impl GzHandle for FileHandle {
         Ok(())
     }
 }
-
-// -----------------------------------------------------------------------------
-//  Why an open failed
-// -----------------------------------------------------------------------------
 
 /// Why a `gzFile` could not be opened.
 ///
@@ -529,8 +684,17 @@ pub enum GzOpenError {
     /// order to not block ... and `errno` will be `EAGAIN` or `ENONBLOCK`. The call to `gzopen()`
     /// can then be re-tried." That is why the error is carried rather than flattened: the number
     /// travels in [`GzIoError::errno`] and the stall is flagged in [`GzIoError::would_block`], so
-    /// nothing about the retry contract is lost. The failing `open` also leaves the platform's own
-    /// `errno` set, since `std` reaches the same syscall C does.
+    /// the retry decision is available to the facade.
+    ///
+    /// **What is *not* promised: that the platform's thread-local `errno` still holds the failing
+    /// value when the C caller looks.** This crate captures `io::Error::raw_os_error()` into
+    /// [`GzIoError::errno`] and nothing more. Rust makes no guarantee about `errno` after a `std`
+    /// call returns, and `std` may perform further syscalls -- path conversion, a retry, a
+    /// destructor -- between the failing `open` and the return, any of which can overwrite it.
+    /// So the number in [`GzIoError::errno`] is the reliable one, and satisfying `zlib.h`'s
+    /// `errno` clause is the facade's job: it must set `errno` from that field before returning
+    /// `NULL`, and verify it does so. Until then, treat the header's `errno` promise as met by the
+    /// carried number and not by the thread-local.
     Io(GzIoError),
 }
 
@@ -558,7 +722,7 @@ impl GzOpenError {
 /// The reason this type exists is a single sentence of `zlib.h`, L1415-L1416: "The duplicated
 /// descriptor should be saved to avoid a leak, since `gzdopen` does not close `fd` if it fails."
 /// C gets that for free -- it never held anything but an `int`, so failing and returning `NULL`
-/// leaves the descriptor untouched. This port is handed an owning handle instead, and dropping an
+/// leaves the descriptor untouched. This implementation is handed an owning handle instead, and dropping an
 /// owning handle is precisely what must not happen, so the handle is handed straight back.
 ///
 /// What the recipient should do with it depends on which side built it. A handle whose `Drop` does
@@ -587,10 +751,6 @@ impl fmt::Debug for GzOpenHandleError<'_> {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  The mode string
-// -----------------------------------------------------------------------------
-
 /// A parsed and resolved mode string: everything `gz_open` learns from `mode` before it touches the
 /// file system.
 ///
@@ -598,7 +758,7 @@ impl fmt::Debug for GzOpenHandleError<'_> {
 /// decision straight into the freshly allocated `gz_state` as it goes and frees the state again on
 /// the four failing paths; separating the two halves changes nothing observable -- the fields are
 /// established in the same way from the same bytes, and a rejected mode string still produces no
-/// stream -- and it buys two things the port needs:
+/// stream -- and it buys two things the implementation needs:
 ///
 /// * the grammar becomes testable on its own, which is how the table-driven test at the end of this
 ///   file can assert the resulting mode, level, strategy and `direct` for every documented mode
@@ -628,7 +788,7 @@ pub struct GzOpenSpec {
 }
 
 impl GzOpenSpec {
-    /// Parses and resolves a mode string, the port of `gzlib.c` L108-L197.
+    /// Parses and resolves a mode string, the Rust counterpart of `gzlib.c` L108-L197.
     ///
     /// `mode` is the bytes of C's `const char *mode` **without** the terminating NUL. A NUL that
     /// does appear inside the slice ends the walk, exactly as C's `while (*mode)` does, so a
@@ -773,11 +933,17 @@ impl GzOpenSpec {
 
     /// Whether `e` asked for the descriptor to be closed on `execve`.
     ///
-    /// For a path-based open nothing needs doing: `std` sets `O_CLOEXEC` on every file it opens, so
-    /// the request is already satisfied -- and, on unix, satisfied whether or not it was made,
-    /// which is a hardening difference from C rather than a behavioural one. For an adopted
-    /// descriptor this is the flag the facade must apply with `fcntl(fd, F_SETFD, ...)`
-    /// (`gzlib.c` L258-L261), because [`GzHandle`] has no descriptor-flag method.
+    /// For a path-based open nothing needs doing, because `std` sets `O_CLOEXEC` on every file it
+    /// opens -- so the request is satisfied **whether or not it was made**. That is divergence 4 in
+    /// this module's inventory and it is an observable behaviour difference, not merely hardening:
+    /// C sets `FD_CLOEXEC` only when the mode string contained `e` (`gzlib.c` L258-L261), so a
+    /// program that opens a gzip file without `e` and then `exec`s a child expecting to inherit the
+    /// descriptor gets different results under the two implementations. `std` offers no safe way to
+    /// clear the flag, so the difference is forced and stands as unresolved.
+    ///
+    /// For an adopted descriptor this is the flag the facade must apply with
+    /// `fcntl(fd, F_SETFD, ...)` (`gzlib.c` L258-L261), because [`GzHandle`] has no
+    /// descriptor-flag method -- so the adopted case does not diverge.
     #[must_use]
     pub const fn cloexec(&self) -> bool {
         self.cloexec
@@ -795,7 +961,7 @@ impl GzOpenSpec {
 
     /// Whether `N` asked for non-blocking I/O.
     ///
-    /// Applied at open time for a path (see [`o_nonblock`] for the one target class where the flag
+    /// Applied at open time for a path (see `o_nonblock` for the one target class where the flag
     /// cannot be named and is therefore skipped) and through [`GzHandle::set_nonblocking`] for an
     /// adopted descriptor. `zlib.h` L1398-L1401 documents the second route as the recommended one:
     /// "If the application would like to block on opening the file, then it can use `open()`
@@ -819,11 +985,7 @@ impl GzOpenSpec {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  gz_reset
-// -----------------------------------------------------------------------------
-
-/// Puts a `gzFile` back to its just-opened condition: the port of `gz_reset` (`gzlib.c` L69-L84).
+/// Puts a `gzFile` back to its just-opened condition: the Rust counterpart of `gz_reset` (`gzlib.c` L69-L84).
 ///
 /// Two callers, and they want different things from it. `gz_open` uses it to finish initialising a
 /// brand-new stream (`gzlib.c` L281), where most of the assignments are redundant because
@@ -843,7 +1005,7 @@ impl GzOpenSpec {
 /// from the mode string and rewinding does not change what the caller asked for -- though the read
 /// path may still revise it when it looks at the data again, since `how` is back to [`LOOK`].
 ///
-/// The trailing `refresh_exposed` has no C counterpart and is required by this port's
+/// The trailing `refresh_exposed` has no C counterpart and is required by this implementation's
 /// pointer/index split: `x.have` has just gone to zero, and the caller-visible `x.next` must be
 /// re-derived before control can return to code that reads it through the `gzgetc` macro. See
 /// `crate::gz::state` for the contract.
@@ -870,22 +1032,11 @@ pub(crate) fn gz_reset<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) {
     state.refresh_exposed();
 }
 
-// -----------------------------------------------------------------------------
-//  gz_open
-// -----------------------------------------------------------------------------
-
-/// Opens the file the mode string calls for: the port of `gzlib.c` L228-L263, path branch.
+/// Opens the file the mode string calls for: the Rust counterpart of `gzlib.c` L228-L263, path branch.
 ///
-/// The C flag computation is
-///
-/// ```c
-/// oflag |= O_LARGEFILE | O_BINARY |
-///     (state->mode == GZ_READ ? O_RDONLY
-///                             : (O_WRONLY | O_CREAT | (exclusive ? O_EXCL : 0) |
-///                                (state->mode == GZ_WRITE ? O_TRUNC : O_APPEND)));
-/// ```
-///
-/// and [`OpenOptions`] expresses all of it:
+/// The C flag computation (`gzlib.c` L227-L232) selects `O_RDONLY` for a read stream and otherwise
+/// `O_WRONLY | O_CREAT`, adding `O_EXCL` when the mode string asked for exclusivity and `O_TRUNC`
+/// or `O_APPEND` according to write versus append. [`OpenOptions`] expresses all of it:
 ///
 /// | C flags | `OpenOptions` |
 /// |---|---|
@@ -893,7 +1044,7 @@ pub(crate) fn gz_reset<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) {
 /// | `O_WRONLY \| O_CREAT \| O_TRUNC` | `write(true).create(true).truncate(true)` |
 /// | `O_WRONLY \| O_CREAT \| O_APPEND` | `append(true).create(true)` |
 /// | `\| O_EXCL` | `create_new(true)` |
-/// | `\| O_NONBLOCK` | `custom_flags`, see [`o_nonblock`] |
+/// | `\| O_NONBLOCK` | `custom_flags`, see `o_nonblock` |
 /// | `\| O_CLOEXEC`, `\| O_LARGEFILE`, `\| O_BINARY` | already applied by `std` |
 ///
 /// `truncate` is set only in the non-exclusive case. With `O_EXCL` the file provably did not exist,
@@ -904,12 +1055,27 @@ pub(crate) fn gz_reset<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) {
 /// C's mode argument to `open` is `0666`, and `std`'s default is the same, so a created file lands
 /// with identical permissions before `umask`.
 ///
+/// The one flag this cannot get right is `O_CLOEXEC`; [`open_with_std`], the public wrapper, carries
+/// the full explanation and names the escape hatch.
+///
 /// # Errors
 ///
-/// The [`GzIoError`] behind C's `state->fd == -1` test (`gzlib.c` L264). The `errno` the platform
-/// set is preserved, which is what `zlib.h` L1394-L1398 promises a caller may inspect.
-fn open_path(path: &[u8], spec: &GzOpenSpec) -> Result<File, GzIoError> {
-    let target = os_path(path).ok_or(OUT_OF_RANGE_OFFSET)?;
+/// The [`GzIoError`] behind C's `state->fd == -1` test (`gzlib.c` L264). The platform's error
+/// *number* is captured into [`GzIoError::errno`]; the platform's thread-local `errno` is **not**
+/// promised to still hold it, because `std` gives no such guarantee. See [`GzOpenError::Io`] for why
+/// that distinction matters and for what the facade owes `zlib.h` L1394-L1398.
+/// [`UNREPRESENTABLE_PATH`] when the target cannot be named on this platform at all.
+fn open_path(target: GzPathTarget<'_>, spec: &GzOpenSpec) -> Result<File, GzIoError> {
+    // Held by value for the wide case, whose conversion produces an owned buffer, and borrowed for
+    // the narrow one, whose bytes are reinterpreted in place exactly as C reinterprets them.
+    let owned;
+    let target: &Path = match target {
+        GzPathTarget::Narrow(bytes) => os_path(bytes).ok_or(UNREPRESENTABLE_PATH)?,
+        GzPathTarget::Wide(units) => {
+            owned = wide_path(units).ok_or(UNREPRESENTABLE_PATH)?;
+            owned.as_path()
+        }
+    };
     let mut options = OpenOptions::new();
     if spec.mode == GZ_READ {
         options.read(true);
@@ -932,9 +1098,9 @@ fn open_path(path: &[u8], spec: &GzOpenSpec) -> Result<File, GzIoError> {
     options.open(target).map_err(|error| io_error(&error))
 }
 
-/// Positions a freshly opened stream and resets it: the port of `gzlib.c` L269-L284.
+/// Positions a freshly opened stream and resets it: the Rust counterpart of `gzlib.c` L269-L284.
 ///
-/// Shared by [`gz_open`] and [`gz_open_handle`] because C shares it -- both entry points fall
+/// Shared by `gz_open` and [`gz_open_handle`] because C shares it -- both entry points fall
 /// through to the same tail once `state->fd` has been established. Three steps, and two of them
 /// tolerate failure on purpose:
 ///
@@ -948,7 +1114,7 @@ fn open_path(path: &[u8], spec: &GzOpenSpec) -> Result<File, GzIoError> {
 /// 3. `gz_reset` finishes the job (L281).
 ///
 /// Nothing after this point can fail, which is why the handle is installed by the caller only once
-/// every fallible step is behind it -- see [`gz_open`].
+/// every fallible step is behind it -- see `gz_open`.
 fn finish_open<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) {
     if state.mode() == GZ_APPEND {
         if let Some(handle) = state.handle_mut() {
@@ -959,51 +1125,122 @@ fn finish_open<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) {
         state.set_mode(GZ_WRITE);
     }
     if state.mode() == GZ_READ {
-        // L276-L277: `state->start = LSEEK(fd, 0, SEEK_CUR); if (start == -1) start = 0;`
         let start = state
             .handle_mut()
             .and_then(|handle| handle.seek(0, GzSeekFrom::Current).ok())
             .unwrap_or(0);
         state.set_start(start);
     }
-    // L281.
     gz_reset(state);
 }
 
-/// Opens a gzip file by path: the port of `gz_open` (`gzlib.c` L87-L285) on its `fd == -1` path.
+/// The opener [`gzopen`] uses: [`std::fs::OpenOptions`], wrapped in an inline [`FileHandle`].
+///
+/// Separated from [`gz_open_with`] so that it has a name a facade can compose with -- wrap it, fall
+/// back to it, or replace it outright -- and so that "what the safe core can open by itself" is one
+/// readable function rather than a closure buried in a call.
+///
+/// The handle comes back as [`GzFileSlot::Owned`], which is stored inline: no allocation, and
+/// therefore no allocation that could abort. See [`GzFileSlot`] for why that shape was chosen over a
+/// boxed trait object.
+///
+/// # C's flag word, and the one flag this cannot reproduce
+///
+/// [`OpenOptions`] expresses all of `gz_open`'s flag computation (`gzlib.c` L229-L244) but one:
+///
+/// | C flags | `OpenOptions` |
+/// |---|---|
+/// | `O_RDONLY` | `read(true)` |
+/// | `O_WRONLY \| O_CREAT \| O_TRUNC` | `write(true).create(true).truncate(true)` |
+/// | `O_WRONLY \| O_CREAT \| O_APPEND` | `append(true).create(true)` |
+/// | `\| O_EXCL` | `create_new(true)` |
+/// | `\| O_NONBLOCK` | `custom_flags`, see `o_nonblock` |
+/// | `\| O_LARGEFILE`, `\| O_BINARY` | already applied by `std` |
+/// | `\| O_CLOEXEC` when the mode contained `e` | **cannot be expressed** |
+///
+/// C sets `O_CLOEXEC` **only** when the mode string contained `e` (`gzlib.c` L135-L136). `std` sets
+/// it **unconditionally** on every file it opens, and `OpenOptionsExt::custom_flags` cannot take it
+/// away -- `std` computes its flag word as `O_CLOEXEC | access | creation | custom`, so a custom flag
+/// can only add. There is therefore no way to reproduce C's flag word exactly through
+/// [`OpenOptions`], and pretending otherwise would be the wrong kind of quiet.
+///
+/// The consequence is narrow and it errs in the safe direction: a stream opened without `e` is *not*
+/// inherited across an `exec` here, where C would have let it be inherited. It cannot leak a
+/// descriptor a caller expected to stay private; it can only withhold one a caller expected a child
+/// to receive.
+///
+/// [`gz_open_with`] is the escape hatch, and it is why that function takes the opener as a parameter
+/// rather than being an abstraction for its own sake. `crates/libz-rs-sys` may write `unsafe`, so it
+/// can call `open(2)` with C's flag word verbatim -- conditional `O_CLOEXEC` included, read from
+/// [`GzOpenSpec::cloexec`] -- wrap the descriptor, and hand the result back as a
+/// [`GzFileSlot::Boxed`]. Everything after that is this module's ordinary code.
+///
+/// C's mode argument to `open` is `0666` and `std`'s default is the same, so a created file lands
+/// with identical permissions before `umask`.
+///
+/// # Errors
+///
+/// The platform's `errno` from the failed `open`, or the crate-internal `UNREPRESENTABLE_PATH`
+/// for a name this platform cannot express.
+pub fn open_with_std<'a>(
+    target: GzPathTarget<'_>,
+    spec: &GzOpenSpec,
+) -> Result<GzFileSlot<'a>, GzIoError> {
+    let file = open_path(target, spec)?;
+    // `writable` is C's `state->mode != GZ_READ`, and it selects whether `close` flushes first.
+    let writable = spec.mode != GZ_READ;
+    Ok(GzFileSlot::Owned(FileHandle::from_file(
+        file,
+        writable,
+        spec.nonblocking,
+    )))
+}
+
+/// Opens a gzip file by name, with the opening itself supplied by the caller: the port of `gz_open`
+/// (`gzlib.c` L87-L285) on its `fd == -1` path.
 ///
 /// The steps are C's, in C's order, and the order matters because each one can fail and C's cleanup
 /// differs at each point:
 ///
 /// 1. parse and resolve the mode string ([`GzOpenSpec::parse`], L108-L197);
 /// 2. build the state and write the four caller-visible decisions into it (L103-L112, L180-L195);
-/// 3. copy the path, "for error messages" (L199-L226);
-/// 4. open the file (L228-L263);
-/// 5. install the handle, then position and reset the stream ([`finish_open`], L269-L284).
+/// 3. copy the *label*, "for error messages" (L199-L226);
+/// 4. open the file (L228-L263) -- through `open`, which is where this function differs from C;
+/// 5. install the handle, then position and reset the stream (`finish_open`, L269-L284).
 ///
-/// Step 5 is where this port is deliberately stricter than C. `GzState` releases its buffers, its
-/// path and -- through [`GzHandle::close`] -- its file when it is dropped, so a handle installed
-/// before a fallible step would be closed by the unwinding of that step. Every fallible step
-/// therefore happens *before* the handle exists, which is also why nothing in [`finish_open`] is
-/// allowed to fail. C reaches the same arrangement from the opposite direction, by hand: it frees
-/// `state->path` and `state` on the failing path at L265-L267 and has nothing to close, because it
-/// only reached that line by *not* getting a descriptor.
+/// Step 5 orders the fallible work differently from C, and the ordering is not a strictness
+/// claim -- it is what ownership requires. `GzState` releases its buffers, its path and -- through
+/// [`GzHandle::close`] -- its file when it is dropped, so a handle installed before a fallible step
+/// would be closed by the unwinding of that step. Every fallible step therefore happens *before*
+/// the handle exists, which is also why nothing in `finish_open` is allowed to fail. C reaches the
+/// same **observable** arrangement from the opposite direction, by hand: it frees `state->path` and
+/// `state` on the failing path at L265-L267 and has nothing to close, because it only reached that
+/// line by *not* getting a descriptor. So the two agree on what a caller sees; only the mechanism
+/// differs, and that is not a divergence.
 ///
-/// One allocation on this path is not fallible: boxing the handle. `GzState`'s handle slot is a
-/// `Box<dyn GzHandle>`, and stable Rust 1.80 has no fallible way to build one, so a three-word
-/// allocation failing here aborts rather than returning [`GzOpenError::OutOfMemory`]. An allocator
-/// that cannot serve three words could not have served the `GzState` it is being installed into, so
-/// the window is narrow, and it is recorded here rather than hidden.
+/// One allocation on this path is genuinely different, and it **is** a divergence: boxing the
+/// handle. `GzState`'s handle slot is a `Box<dyn GzHandle>`, and stable Rust 1.80 has no fallible
+/// way to build one, so a three-word allocation failing here **aborts the process** where C would
+/// return `Z_MEM_ERROR`. That is divergence 5 in this module's inventory -- forced and unresolved.
+/// The window is narrow, because an allocator that cannot serve three words could not have served
+/// the `GzState` being installed into, but `test/infcover.c`'s `mem_limit` exists to drive exactly
+/// this kind of failure on purpose, so narrowness is not the same as unreachable.
 ///
 /// # Errors
 ///
-/// [`GzOpenError::InvalidMode`] from the mode string, [`GzOpenError::OutOfMemory`] from the path
-/// copy, or [`GzOpenError::Io`] from the open itself. All three are C's `NULL`.
-pub(crate) fn gz_open<'a, A: Allocator<'a>>(
-    path: &[u8],
+/// [`GzOpenError::InvalidMode`] from the mode string, [`GzOpenError::OutOfMemory`] from the label
+/// copy, or [`GzOpenError::Io`] from `open`. All three are C's `NULL`.
+pub fn gz_open_with<'a, A, F>(
+    target: GzPathTarget<'_>,
+    label: &[u8],
     mode: &[u8],
     allocator: A,
-) -> Result<GzState<'a, A>, GzOpenError> {
+    open: F,
+) -> Result<GzState<'a, A>, GzOpenError>
+where
+    A: Allocator<'a>,
+    F: FnOnce(GzPathTarget<'_>, &GzOpenSpec) -> Result<GzFileSlot<'a>, GzIoError>,
+{
     let spec = GzOpenSpec::parse(mode)?;
 
     let mut state = GzState::new(allocator);
@@ -1012,21 +1249,39 @@ pub(crate) fn gz_open<'a, A: Allocator<'a>>(
     // L199-L226. Stored as bytes; a POSIX path need not be UTF-8, and `gz_error` concatenates it
     // with the message exactly as C's `snprintf("%s%s%s", path, ": ", msg)` does.
     state
-        .try_set_path(path)
+        .try_set_path(label)
         .map_err(|_| GzOpenError::OutOfMemory)?;
 
-    let file = open_path(path, &spec).map_err(GzOpenError::Io)?;
+    let handle = open(target, &spec).map_err(GzOpenError::Io)?;
 
-    // The last fallible step is behind us, so the handle can be installed.
-    let writable = spec.mode != GZ_READ;
-    state.set_handle(Some(Box::new(FileHandle::from_file(
-        file,
-        writable,
-        spec.nonblocking,
-    ))));
+    // The last fallible step is behind us. This one cannot fail: it is a move, not an allocation.
+    state.set_handle(handle);
 
     finish_open(&mut state);
     Ok(state)
+}
+
+/// Opens a gzip file by byte path, using this crate's own opener.
+///
+/// [`gz_open_with`] with [`open_with_std`] and with the path serving as its own label, which is what
+/// C does for the narrow entry points: `gz_open` copies the same `const char *` into `state->path`
+/// that it hands to `open` (`gzlib.c` L222 and L248).
+///
+/// # Errors
+///
+/// As [`gz_open_with`].
+pub(crate) fn gz_open<'a, A: Allocator<'a>>(
+    path: &[u8],
+    mode: &[u8],
+    allocator: A,
+) -> Result<GzState<'a, A>, GzOpenError> {
+    gz_open_with(
+        GzPathTarget::Narrow(path),
+        path,
+        mode,
+        allocator,
+        open_with_std,
+    )
 }
 
 /// Opens a gzip file over a handle somebody else built: the port of `gz_open` on its adopted-`fd`
@@ -1044,9 +1299,11 @@ pub(crate) fn gz_open<'a, A: Allocator<'a>>(
 ///
 /// The `N` character reaches the handle through [`GzHandle::set_nonblocking`], which is the
 /// `fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)` of `gzlib.c` L254-L257. Its result is
-/// discarded, because C discards `fcntl`'s. The `e` character has no such route -- see this
-/// module's documentation, point 4 -- and the facade must apply `F_SETFD` itself, reading
-/// [`GzOpenSpec::cloexec`].
+/// discarded, because C discards `fcntl`'s. The `e` character has no such route -- [`GzHandle`] has
+/// no descriptor-flag method -- so the facade applies `F_SETFD` itself while adopting, reading
+/// [`GzOpenSpec::cloexec`]; parsing the mode string with [`GzOpenSpec::parse`] before adopting is
+/// what `zlib.h` L1415-L1416 requires anyway, so the flag is available at exactly the moment it is
+/// needed. This is the descriptor-side counterpart of the path-side hook in [`gz_open_with`].
 ///
 /// # Errors
 ///
@@ -1082,17 +1339,13 @@ pub fn gz_open_handle<'a, A: Allocator<'a>>(
     }
 
     // L262: `state->fd = fd;`. Nothing after this point can fail.
-    state.set_handle(Some(handle));
+    state.set_handle(GzFileSlot::Boxed(handle));
 
     finish_open(&mut state);
     Ok(state)
 }
 
-// -----------------------------------------------------------------------------
-//  The public entry points
-// -----------------------------------------------------------------------------
-
-/// Opens a gzip file by path. The port of **both** `gzopen` (`gzlib.c` L288-L290) and `gzopen64`
+/// Opens a gzip file by path. The Rust counterpart of **both** `gzopen` (`gzlib.c` L288-L290) and `gzopen64`
 /// (`gzlib.c` L293-L295).
 ///
 /// The two C functions are byte-for-byte identical -- each one is `return gz_open(path, -1, mode);`
@@ -1101,9 +1354,9 @@ pub fn gz_open_handle<'a, A: Allocator<'a>>(
 /// *caller's* `_FILE_OFFSET_BITS` and `_LARGEFILE64_SOURCE` at the caller's own compile time
 /// (`zlib.h` L1976-L2018). Which name a given object file references is therefore decided long
 /// before this library is reached, and **both must be exported** (AAP §0.6.3.4). That is a symbol
-/// table question, not an implementation question, so there is one function here and
-/// `crates/libz-rs-sys/src/gz.rs` exports two `#[no_mangle]` wrappers against it. Nothing in this
-/// crate is `#[no_mangle]` or `extern "C"`.
+/// table question, not an implementation question, so there is one function here and the planned
+/// `crates/libz-rs-sys/src/gz.rs` is to export two `#[no_mangle]` wrappers against it. Nothing in
+/// this crate is `#[no_mangle]` or `extern "C"`.
 ///
 /// The same reasoning forbids a fixed offset width anywhere on this path: the offset type is
 /// `crate::gz::state::ZOff64`, and narrowing it to the caller's `z_off_t` is
@@ -1118,7 +1371,7 @@ pub fn gz_open_handle<'a, A: Allocator<'a>>(
 ///
 /// # Errors
 ///
-/// As [`gz_open`]: [`GzOpenError::InvalidMode`], [`GzOpenError::OutOfMemory`] or
+/// As `gz_open`: [`GzOpenError::InvalidMode`], [`GzOpenError::OutOfMemory`] or
 /// [`GzOpenError::Io`]. The facade maps all of them to `NULL`.
 #[doc(alias = "gzopen64")]
 pub fn gzopen<'a, A: Allocator<'a>>(
@@ -1184,16 +1437,21 @@ impl fmt::Write for FdLabel {
     }
 }
 
-/// Associates a gzip stream with a file somebody else opened: the port of `gzdopen`
+/// Associates a gzip stream with a file somebody else opened: the Rust counterpart of `gzdopen`
 /// (`gzlib.c` L298-L312).
 ///
 /// C's body is four steps: reject `fd == -1`, `malloc` a small buffer, `snprintf` the label
 /// `"<fd:%d>"` into it, call `gz_open(path, fd, mode)`, and free the label. The label format is
 /// reproduced exactly, because it is caller-visible: it becomes `state->path`, and `gz_error`
 /// prefixes every message with it, so `gzerror` on a stream opened this way reports text like
-/// `"<fd:3>: out of memory"`. Building it in a fixed buffer rather than on the heap removes C's
-/// `malloc`-failure path, which is why [`GzOpenError::OutOfMemory`] can only come from the path
-/// copy inside [`gz_open_handle`] here.
+/// `"<fd:3>: out of memory"`.
+///
+/// Building the label in a fixed stack buffer rather than on the heap **removes C's
+/// `malloc`-failure path**, which is divergence 6 in this module's inventory -- forced and
+/// unresolved. A caller cannot observe `gzdopen` failing for want of memory the way it can in C,
+/// because that failure mode no longer exists here; [`GzOpenError::OutOfMemory`] can only come from
+/// the path copy inside [`gz_open_handle`]. Fewer failure modes is still different behaviour, and it
+/// is recorded as such rather than as a simplification.
 ///
 /// `fd` is used **only** to build that label. The actual I/O goes through `handle`, because a
 /// descriptor cannot be adopted in safe Rust; see this module's documentation for the division of
@@ -1212,7 +1470,6 @@ pub fn gzdopen<'a, A: Allocator<'a>>(
     mode: &[u8],
     allocator: A,
 ) -> Result<GzState<'a, A>, GzOpenHandleError<'a>> {
-    // L302: `if (fd == -1 || (path = malloc(...)) == NULL) return NULL;`
     if fd == -1 {
         return Err(GzOpenHandleError {
             error: GzOpenError::InvalidDescriptor,
@@ -1237,7 +1494,7 @@ pub fn gzdopen<'a, A: Allocator<'a>>(
     gz_open_handle(handle, label.as_bytes(), mode, allocator)
 }
 
-/// Opens a gzip file named by a wide-character path: the port of `gzopen_w`
+/// Opens a gzip file named by a wide-character path: the Rust counterpart of `gzopen_w`
 /// (`gzlib.c` L316-L318).
 ///
 /// C guards both the declaration (`zlib.h` L2041-L2044, `#if defined(_WIN32) && !defined(Z_SOLO)`)
@@ -1251,24 +1508,33 @@ pub fn gzdopen<'a, A: Allocator<'a>>(
 /// arrives here is bytes. On Windows [`os_path`] must decode those bytes, and the only encoding it
 /// can decode portably is UTF-8 -- so the facade should convert the `wchar_t *` with
 /// `char::decode_utf16` or `String::from_utf16` rather than with a locale-dependent narrowing.
-/// That is strictly better than `wcstombs`, which loses any character the active code page cannot
-/// represent; a path that C would fail to open is one this port opens correctly.
+///
+/// **This is a behaviour difference, and it is recorded as one rather than claimed as an
+/// improvement.** `wcstombs` narrows to the active code page and fails for any character that page
+/// cannot represent, so a UTF-8 conversion accepts paths C would reject. Wider acceptance is still
+/// different acceptance: a caller that relied on C's failure for such a path sees success here.
+/// The difference is forced -- [`os_path`] cannot decode a locale-dependent encoding portably from
+/// safe Rust -- and it applies only to `gzopen_w`, which is Windows-only and outside the Tier-1
+/// target set this port is verified on. It stands as unresolved.
 ///
 /// # Errors
 ///
-/// As [`gz_open`].
+/// As `gz_open`.
 #[cfg(windows)]
 pub fn gzopen_w<'a, A: Allocator<'a>>(
-    path: &[u8],
+    path: &[u16],
+    label: &[u8],
     mode: &[u8],
     allocator: A,
 ) -> Result<GzState<'a, A>, GzOpenError> {
-    gz_open(path, mode, allocator)
+    gz_open_with(
+        GzPathTarget::Wide(path),
+        label,
+        mode,
+        allocator,
+        open_with_std,
+    )
 }
-
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1282,17 +1548,22 @@ mod tests {
     use super::std;
 
     use super::{
-        gz_open, gz_open_handle, gz_reset, gzdopen, gzopen, o_nonblock, os_path, FdLabel,
-        FileHandle, GzOpenError, GzOpenSpec,
+        gz_open, gz_open_handle, gz_open_with, gz_reset, gzdopen, gzopen, open_with_std, os_path,
+        FdLabel, FileHandle, GzOpenError, GzOpenSpec, GzPathTarget,
     };
+    // `o_nonblock` is itself `#[cfg(unix)]`, so the import has to be too: an ungated one is an
+    // unresolved import when checking a non-unix target, which `cargo check --all-targets --target
+    // x86_64-pc-windows-gnu` does reach.
+    #[cfg(unix)]
+    use super::o_nonblock;
     use crate::allocate::GlobalAllocator;
     use crate::config::{
         Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY, Z_FILTERED, Z_FIXED, Z_HUFFMAN_ONLY, Z_RLE,
     };
     use crate::error::ReturnCode;
     use crate::gz::state::{
-        GzHandle, GzIoError, GzMode, GzSeekFrom, GzState, ZOff64, GZ_APPEND, GZ_READ, GZ_WRITE,
-        LOOK,
+        GzFileSlot, GzHandle, GzIoError, GzMode, GzSeekFrom, GzState, ZOff64, GZ_APPEND, GZ_READ,
+        GZ_WRITE, LOOK,
     };
     use alloc::boxed::Box;
     use alloc::format;
@@ -1409,7 +1680,7 @@ mod tests {
 
     /// Reads until the buffer is full or end of file, looping as `gz_load` does.
     ///
-    /// The mirror of [`write_all_through`]: [`GzHandle::read`] may return fewer bytes than asked
+    /// Implements [`write_all_through`]: [`GzHandle::read`] may return fewer bytes than asked
     /// for, and `Ok(0)` is end of file (`gzread.c` L31-L46).
     fn read_fully(handle: &mut dyn GzHandle, buffer: &mut [u8]) -> usize {
         let mut filled = 0;
@@ -1429,10 +1700,6 @@ mod tests {
         state.set_mode(mode);
         state
     }
-
-    // -------------------------------------------------------------------------
-    //  The mode-string grammar
-    // -------------------------------------------------------------------------
 
     /// Every mode string documented in `zlib.h` L1356-L1401 and every one the test suite builds,
     /// with the four caller-visible decisions each must produce.
@@ -1587,10 +1854,6 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------------
-    //  gz_reset
-    // -------------------------------------------------------------------------
-
     /// `gz_reset` on a read stream restores every field C's L71-L76 branch restores.
     #[test]
     fn gz_reset_restores_a_read_stream() {
@@ -1682,10 +1945,6 @@ mod tests {
         assert_eq!(state.path(), b"/tmp/whatever.gz");
     }
 
-    // -------------------------------------------------------------------------
-    //  The descriptor label
-    // -------------------------------------------------------------------------
-
     /// The label is byte-for-byte C's `snprintf(path, ..., "<fd:%d>", fd)` (`gzlib.c` L305).
     #[test]
     fn fd_label_matches_the_c_format() {
@@ -1710,10 +1969,6 @@ mod tests {
     fn fd_label_starts_empty() {
         assert_eq!(FdLabel::new().as_bytes(), b"");
     }
-
-    // -------------------------------------------------------------------------
-    //  Handle injection
-    // -------------------------------------------------------------------------
 
     /// `gzdopen` rejects `fd == -1` and hands the handle straight back, unclosed.
     ///
@@ -1838,10 +2093,6 @@ mod tests {
         assert_eq!(state.level(), 9);
         drop(state);
     }
-
-    // -------------------------------------------------------------------------
-    //  Opening real files
-    // -------------------------------------------------------------------------
 
     /// A file written through a `"wb"` stream reads back through an `"rb"` stream.
     ///
@@ -2060,10 +2311,6 @@ mod tests {
         assert!(matches!(error, GzOpenError::Io(_)), "got {error:?}");
     }
 
-    // -------------------------------------------------------------------------
-    //  FileHandle
-    // -------------------------------------------------------------------------
-
     /// `close` is idempotent, and reports through the file only while one is held.
     #[test]
     #[cfg_attr(
@@ -2074,14 +2321,20 @@ mod tests {
         let path = temp_path("close");
         remove(&path);
 
-        let mut handle = {
+        let mut slot = {
             let state = gzopen(path.as_bytes(), b"wb", GlobalAllocator).expect("wb must open");
             let mut state = state;
-            state.take_handle().expect("a handle was installed")
+            let slot = state.take_handle();
+            assert!(slot.is_installed(), "a handle was installed");
+            slot
         };
-        assert!(handle.close().is_ok(), "the first close succeeds");
-        assert!(handle.close().is_ok(), "and so does the second");
-        // Every operation on a closed handle fails rather than panicking.
+        assert!(slot.close().is_ok(), "the first close succeeds");
+        assert!(slot.close().is_ok(), "and so does the second");
+        // Every operation on a closed handle fails rather than panicking. The slot still holds
+        // the handle -- closing does not empty the slot -- so it can be interrogated afterwards.
+        let handle = slot
+            .handle_mut()
+            .expect("the slot still holds the closed handle");
         assert!(handle.read(&mut [0_u8; 4]).is_err());
         assert!(handle.write(b"x").is_err());
         assert!(handle.seek(0, GzSeekFrom::Current).is_err());
@@ -2134,13 +2387,9 @@ mod tests {
         remove(&path);
     }
 
-    // -------------------------------------------------------------------------
-    //  Platform plumbing
-    // -------------------------------------------------------------------------
-
-    /// The `O_NONBLOCK` value is known on every target the port is built for.
+    /// The `O_NONBLOCK` value is known on every target the implementation is built for.
     ///
-    /// Tier-1 unix targets are all covered by [`o_nonblock`]'s table; a target that is not would
+    /// Tier-1 unix targets are all covered by `o_nonblock`'s table; a target that is not would
     /// silently open in blocking mode, so the gap is asserted here rather than discovered later.
     #[cfg(unix)]
     #[test]
@@ -2168,5 +2417,380 @@ mod tests {
     #[test]
     fn a_non_utf8_path_is_still_a_path() {
         assert!(os_path(&[b'/', b't', b'm', b'p', b'/', 0xFF, 0xFE]).is_some());
+    }
+
+    // -------------------------------------------------------------------------
+    //  The injection seam: what `gz_open_with` makes reachable
+    // -------------------------------------------------------------------------
+
+    /// What an injected opener was asked to open, captured so a test can assert on it.
+    ///
+    /// A `Vec<u16>` rather than a borrowed slice because the recorder outlives the call.
+    #[derive(Debug, PartialEq, Eq)]
+    enum SeenTarget {
+        /// [`GzPathTarget::Narrow`], with the exact bytes.
+        Narrow(Vec<u8>),
+        /// [`GzPathTarget::Wide`], with the exact `u16` units.
+        Wide(Vec<u16>),
+    }
+
+    /// A [`GzHandle`] that answers everything successfully and reports a chosen `close` result.
+    ///
+    /// This is the shape a facade handle takes when it backs [`GzHandle::close`] with a real
+    /// `close(2)`: the close result is a value the handle produces, so it can fail independently of
+    /// every other operation. That is what makes divergence 1 closable.
+    struct ClosableHandle<'c> {
+        /// Whether [`GzHandle::close`] reports failure.
+        close_fails: bool,
+        /// How often [`GzHandle::close`] ran.
+        closes: &'c Cell<usize>,
+    }
+
+    impl GzHandle for ClosableHandle<'_> {
+        fn read(&mut self, _buf: &mut [u8]) -> Result<usize, GzIoError> {
+            Ok(0)
+        }
+
+        fn write(&mut self, buf: &[u8]) -> Result<usize, GzIoError> {
+            Ok(buf.len())
+        }
+
+        fn seek(&mut self, offset: ZOff64, _whence: GzSeekFrom) -> Result<ZOff64, GzIoError> {
+            Ok(offset)
+        }
+
+        fn set_nonblocking(&mut self, _nonblocking: bool) -> Result<(), GzIoError> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), GzIoError> {
+            self.closes.set(self.closes.get() + 1);
+            if self.close_fails {
+                // What a facade handle reports when its `close(2)` failed. EIO is representative;
+                // the number travels through untouched and the close paths turn any failure into
+                // `Z_ERRNO`.
+                Err(GzIoError::new(5, false))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// F08: opening by path installs the handle **inline**, with no boxing to abort on.
+    ///
+    /// The property under test is structural, and it is the whole point of [`GzFileSlot`] having an
+    /// `Owned` variant: `gz_open` must not perform an infallible `Box::new`, because `Box::new`
+    /// aborts the process on allocation failure where C returns `NULL`. `Debug` names the variant,
+    /// so the shape is observable without adding API that exists only for a test.
+    #[test]
+    #[cfg_attr(miri, ignore = "opens a real file")]
+    fn opening_by_path_stores_the_handle_inline() {
+        let path = temp_path("inline");
+        remove(&path);
+
+        let state = gzopen(path.as_bytes(), b"wb", GlobalAllocator).expect("wb must open");
+        let shape = format!("{state:?}");
+        assert!(
+            shape.contains("handle: Owned("),
+            "a path-opened handle must be stored inline, not boxed: {shape}"
+        );
+        assert!(
+            !shape.contains("handle: Boxed"),
+            "boxing here would abort on OOM instead of reporting it: {shape}"
+        );
+
+        drop(state);
+        remove(&path);
+    }
+
+    /// F08 companion: an adopted descriptor is still boxed, because only the facade can build it.
+    #[test]
+    fn an_adopted_handle_is_boxed() {
+        let closes = Cell::new(0);
+        let state = gzdopen(
+            Box::new(ClosableHandle {
+                close_fails: false,
+                closes: &closes,
+            }),
+            3,
+            b"rb",
+            GlobalAllocator,
+        )
+        .expect("rb must open");
+        let shape = format!("{state:?}");
+        assert!(
+            shape.contains("handle: Boxed(..)"),
+            "an injected handle is a type this crate cannot name, so it is boxed: {shape}"
+        );
+    }
+
+    /// F09: the name to open and the name to report are two separate arguments.
+    ///
+    /// C keeps them separate -- `_wopen` receives the caller's `wchar_t *` while `state->path` holds
+    /// a `wcstombs` narrowing of it (`gzlib.c` L200-L219, L246) -- and collapsing them would force a
+    /// wide path through a narrow encoding. This asserts both halves at once: the opener sees the
+    /// exact `u16` units, and the state's path is the label, not a narrowing of those units.
+    #[test]
+    fn a_wide_target_reaches_the_opener_unnarrowed_while_the_label_is_reported() {
+        // Deliberately not representable in the narrow label: two astral-plane code points,
+        // "\u{1F600}\u{1F601}", as UTF-16 surrogate pairs.
+        let units: Vec<u16> = vec![0xD83D, 0xDE00, 0xD83D, 0xDE01];
+        let label = b"<lossy label>";
+        let seen: Cell<Option<SeenTarget>> = Cell::new(None);
+        let closes = Cell::new(0);
+
+        let state = gz_open_with(
+            GzPathTarget::Wide(&units),
+            label,
+            b"rb",
+            GlobalAllocator,
+            |target, _spec| {
+                seen.set(Some(match target {
+                    GzPathTarget::Narrow(bytes) => SeenTarget::Narrow(bytes.to_vec()),
+                    GzPathTarget::Wide(wide) => SeenTarget::Wide(wide.to_vec()),
+                }));
+                Ok(GzFileSlot::Boxed(Box::new(ClosableHandle {
+                    close_fails: false,
+                    closes: &closes,
+                })))
+            },
+        )
+        .expect("the injected opener succeeds");
+
+        assert_eq!(
+            seen.replace(None),
+            Some(SeenTarget::Wide(units.clone())),
+            "the opener must receive the original wide units, not a narrowing of them"
+        );
+        assert_eq!(
+            state.path(),
+            label,
+            "the label is what error messages are prefixed with"
+        );
+    }
+
+    /// F09 companion: a narrow target arrives as bytes, byte for byte, as `open(2)` takes it.
+    #[test]
+    fn a_narrow_target_reaches_the_opener_as_bytes() {
+        // Not valid UTF-8, and legal on unix: exactly the case a `String` would have destroyed.
+        let path: &[u8] = &[b'/', b't', b'm', b'p', 0xFF, 0xFE];
+        let seen: Cell<Option<SeenTarget>> = Cell::new(None);
+        let closes = Cell::new(0);
+
+        let state = gz_open_with(
+            GzPathTarget::Narrow(path),
+            path,
+            b"rb",
+            GlobalAllocator,
+            |target, _spec| {
+                seen.set(Some(match target {
+                    GzPathTarget::Narrow(bytes) => SeenTarget::Narrow(bytes.to_vec()),
+                    GzPathTarget::Wide(wide) => SeenTarget::Wide(wide.to_vec()),
+                }));
+                Ok(GzFileSlot::Boxed(Box::new(ClosableHandle {
+                    close_fails: false,
+                    closes: &closes,
+                })))
+            },
+        )
+        .expect("the injected opener succeeds");
+
+        assert_eq!(seen.replace(None), Some(SeenTarget::Narrow(path.to_vec())));
+        assert_eq!(state.path(), path);
+    }
+
+    /// F09: a wide target cannot be opened where there is no wide file API, and says so.
+    ///
+    /// The alternative -- transcoding to some guessed encoding -- could name a different file. C
+    /// never reaches this case, because it declares `gzopen_w` only under `WIDECHAR`.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_wide_target_is_unrepresentable_without_a_wide_file_api() {
+        let units: Vec<u16> = vec![b'/'.into(), b'x'.into()];
+        let failure = gz_open_with(
+            GzPathTarget::Wide(&units),
+            b"/x",
+            b"rb",
+            GlobalAllocator,
+            open_with_std,
+        )
+        .expect_err("there is no wide open on this target");
+        assert!(matches!(failure, GzOpenError::Io(_)));
+        assert_eq!(failure.as_return_code(), ReturnCode::ERRNO);
+    }
+
+    /// F10: `GzOpenSpec::cloexec` reaches the opener, which is what makes C's flag word reachable.
+    ///
+    /// `std` sets `O_CLOEXEC` on every file it opens and offers no way to clear it, so
+    /// `open_with_std` cannot honour the `e` character. An injected opener can, because it receives
+    /// the resolved spec: this asserts that both the `e`-present and `e`-absent answers arrive,
+    /// which is the difference C's `gzlib.c` L135-L136 makes.
+    #[test]
+    fn the_close_on_exec_request_reaches_an_injected_opener() {
+        for (mode, expected) in [
+            (&b"rb"[..], false),
+            (&b"rbe"[..], true),
+            (&b"wbe9"[..], true),
+            (&b"wb9"[..], false),
+        ] {
+            let seen = Cell::new(None);
+            let closes = Cell::new(0);
+            let state = gz_open_with(
+                GzPathTarget::Narrow(b"labelled"),
+                b"labelled",
+                mode,
+                GlobalAllocator,
+                |_target, spec| {
+                    // Every mode-string decision is available without re-parsing.
+                    seen.set(Some((spec.cloexec(), spec.exclusive(), spec.nonblocking())));
+                    Ok(GzFileSlot::Boxed(Box::new(ClosableHandle {
+                        close_fails: false,
+                        closes: &closes,
+                    })))
+                },
+            )
+            .expect("the injected opener succeeds");
+            drop(state);
+            let (cloexec, exclusive, nonblocking) =
+                seen.replace(None).expect("the opener ran exactly once");
+            assert_eq!(
+                cloexec, expected,
+                "mode {mode:?} must report cloexec = {expected}"
+            );
+            assert!(!exclusive, "no mode here contained x");
+            assert!(!nonblocking, "no mode here contained N");
+        }
+    }
+
+    /// F11: a path-based stream can now report `close(2)`'s failure as `Z_ERRNO`.
+    ///
+    /// `gzclose_w` must answer `Z_ERRNO` when `close` fails (`gzwrite.c` L696-L697), and the safe
+    /// default cannot see that result at all -- dropping a `std::fs::File` discards it. Supplying
+    /// the handle through `gz_open_with` closes the gap, and this asserts the result travels the
+    /// whole way: handle -> `GzFileSlot::close` -> `gzclose_w`'s return value.
+    #[test]
+    fn a_failing_close_from_an_injected_handle_becomes_z_errno() {
+        for (close_fails, expected) in [(false, ReturnCode::OK), (true, ReturnCode::ERRNO)] {
+            let closes = Cell::new(0);
+            let mut state = gz_open_with(
+                GzPathTarget::Narrow(b"closable.gz"),
+                b"closable.gz",
+                b"wb",
+                GlobalAllocator,
+                |_target, _spec| {
+                    Ok(GzFileSlot::Boxed(Box::new(ClosableHandle {
+                        close_fails,
+                        closes: &closes,
+                    })))
+                },
+            )
+            .expect("the injected opener succeeds");
+
+            let status = crate::gz::write::gzclose_w(&mut state);
+            assert_eq!(
+                status,
+                expected.as_i32(),
+                "close_fails = {close_fails} must yield {expected:?}"
+            );
+            assert_eq!(closes.get(), 1, "close runs exactly once on this path");
+        }
+    }
+
+    /// F11 companion: the read close path propagates the same result.
+    ///
+    /// `gzclose_r` has its own `close` call (`gzread.c` L665-L667) and its own deferred error
+    /// reporting, so it is asserted separately rather than assumed to behave like the write path.
+    #[test]
+    fn a_failing_close_on_the_read_path_becomes_z_errno() {
+        for (close_fails, expected) in [(false, ReturnCode::OK), (true, ReturnCode::ERRNO)] {
+            let closes = Cell::new(0);
+            let mut state = gz_open_with(
+                GzPathTarget::Narrow(b"closable.gz"),
+                b"closable.gz",
+                b"rb",
+                GlobalAllocator,
+                |_target, _spec| {
+                    Ok(GzFileSlot::Boxed(Box::new(ClosableHandle {
+                        close_fails,
+                        closes: &closes,
+                    })))
+                },
+            )
+            .expect("the injected opener succeeds");
+
+            // `gzclose_r` answers with a `ReturnCode`, where `gzclose_w` answers with a bare
+            // `int`; both are C's `int` at the boundary and the facade narrows each the same way.
+            let status = crate::gz::read::gzclose_r(&mut state);
+            assert_eq!(status, expected);
+            assert_eq!(closes.get(), 1);
+        }
+    }
+
+    /// An opener that fails is C's `state->fd == -1`: no stream, and the `errno` survives.
+    #[test]
+    fn an_injected_opener_failure_is_reported_as_it_is() {
+        let failure = gz_open_with(
+            GzPathTarget::Narrow(b"denied.gz"),
+            b"denied.gz",
+            b"rb",
+            GlobalAllocator,
+            |_target, _spec| Err(GzIoError::new(13, false)),
+        )
+        .expect_err("the opener refused");
+        match failure {
+            GzOpenError::Io(error) => {
+                assert_eq!(error.errno, 13, "the platform's errno is preserved");
+                assert!(!error.would_block);
+            }
+            other => panic!("expected an I/O failure, got {other:?}"),
+        }
+    }
+
+    /// A bad mode string is rejected before the opener is consulted, as C rejects it before `open`.
+    #[test]
+    fn an_invalid_mode_never_reaches_the_opener() {
+        let ran = Cell::new(false);
+        let failure = gz_open_with(
+            GzPathTarget::Narrow(b"x.gz"),
+            b"x.gz",
+            b"r+",
+            GlobalAllocator,
+            |_target, _spec| {
+                ran.set(true);
+                Err(GzIoError::new(0, false))
+            },
+        )
+        .expect_err("r+ is rejected");
+        assert!(matches!(failure, GzOpenError::InvalidMode));
+        assert!(!ran.get(), "the open must not be attempted at all");
+    }
+
+    /// `gzopen` is `gz_open_with` over `open_with_std`, so the two must agree exactly.
+    #[test]
+    #[cfg_attr(miri, ignore = "opens a real file")]
+    fn gzopen_and_gz_open_with_the_default_opener_agree() {
+        let path = temp_path("agree");
+        remove(&path);
+
+        {
+            let mut direct = gzopen(path.as_bytes(), b"wb", GlobalAllocator).expect("wb opens");
+            write_all_through(direct.handle_mut().unwrap(), b"first");
+            assert_eq!(crate::gz::write::gzclose_w(&mut direct), 0);
+        }
+
+        let via_hook = gz_open_with(
+            GzPathTarget::Narrow(path.as_bytes()),
+            path.as_bytes(),
+            b"rb",
+            GlobalAllocator,
+            open_with_std,
+        )
+        .expect("rb opens");
+        assert_eq!(via_hook.path(), path.as_bytes());
+        assert!(via_hook.has_handle());
+        assert_eq!(via_hook.mode(), GZ_READ);
+        drop(via_hook);
+
+        remove(&path);
     }
 }

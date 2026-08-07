@@ -1,46 +1,44 @@
 # Rust toolchain descriptor for the zlib Rust workspace.
 #
-# rustup finds this file by walking up from the current directory, so it MUST
-# stay at the repository root, beside Cargo.toml.  Once it is here, every
-# cargo, rustc, rustfmt, and clippy invocation made anywhere inside the tree
-# resolves to the toolchain selected below, and rustup provisions that
-# toolchain -- with the components listed below -- on first use.
+# rustup finds this file by walking up from the current directory, so it must stay
+# at the repository root beside Cargo.toml.  Every cargo, rustc, rustfmt and clippy
+# invocation inside the tree then resolves to the toolchain selected below.
 #
-# --------------------------------------------------------------------------
-# channel = "stable"  --  a channel, deliberately NOT a version number
-# --------------------------------------------------------------------------
 # The requirement for this port is "Rust 1.80+ stable, edition 2021".  That is
-# a LOWER BOUND, and the C tree carries no Rust version signal of any kind:
-# neither `configure` nor CMakeLists.txt mentions cargo.  Tracking the `stable`
-# channel is therefore the faithful reading -- it always clears the floor while
-# picking up compiler and library fixes for free.
+# a LOWER BOUND, and the C tree carried no Rust version contract of any kind
+# before this port: nothing in it named a channel, a release or an MSRV, so
+# there was no existing signal to honour.  Tracking the `stable` channel is
+# therefore the faithful reading -- it always clears the floor while picking up
+# compiler and library fixes for free.
 #
-# Pinning an exact release such as "1.97.1" is deliberately avoided: it would
-# freeze the toolchain, hide upstream regressions behind a manual bump, and
-# generate CI churn for no benefit.  `beta` and `nightly` are equally wrong as
-# the default, because a system library on which every consumer of compressed
-# data depends must build with the compiler that distributions actually ship.
+# Note what `configure` now does and does not do.  It PROBES for cargo
+# (`configure` L82-L107: `CARGO=${CARGO-"cargo"}`, then a `--version` test that
+# empties CARGO when the tool is unusable) so that the `rust`, `rust-test` and
+# `rust-clean` targets can skip cleanly on a machine with no Rust toolchain.  It
+# deliberately does NOT check a version: which Rust release is required is stated
+# once, here and in the `rust-version` fields of the crate manifests, and is
+# enforced by cargo itself.  Keep it that way -- a second version check in a
+# shell script is a second thing to keep in step.
 #
-# --------------------------------------------------------------------------
-# The MSRV is NOT declared here -- it lives in Cargo.toml
-# --------------------------------------------------------------------------
-# These are two different contracts and must never be conflated:
+# The MSRV is a different contract and is NOT declared here: `rust-version` in
+# Cargo.toml's [workspace.package] declares the oldest compiler a consumer may
+# need, clippy.toml mirrors it as `msrv`, and `rust-version` is not a valid key in
+# a toolchain file.  The floor is exercised through an explicit override such as
+# `cargo +1.80 check`, which this file does not obstruct.
 #
-#   * THIS file SELECTS the toolchain that runs in this working tree.
-#   * `rust-version = "1.80"` in Cargo.toml's [workspace.package] DECLARES the
-#     oldest compiler a consumer of these crates is permitted to need.  Cargo
-#     enforces that key, and clippy.toml mirrors it as `msrv = "1.80"` so lint
-#     suggestions stay reachable on the floor.
+# `profile = "minimal"` installs only rustc, cargo and the standard library.
+# `components` is additive to it, and both entries are mandatory rather than
+# convenient: `cargo fmt --check` and `cargo clippy -- -D warnings` are quality
+# gates, and a toolchain missing either component cannot run them.
 #
-# `rust-version` is not a valid key in a toolchain file and must never appear
-# below.  The floor is exercised the same way the nightly jobs are, through an
-# explicit override -- `cargo +1.80 check` -- which this file does not obstruct.
-# Edition 2021 is what keeps 1.80 reachable at all: edition 2024 requires
-# rustc >= 1.85, and cargo rejects that combination outright.
+# `miri` and `rust-src` are deliberately absent.  Miri and `-Zsanitizer=address`
+# are nightly-only and are selected per invocation (`cargo +nightly miri test -p
+# zlib-rs`), which overrides this file.  Naming those components here would break
+# every build in the tree, because they are not published for the stable channel.
 #
-# --------------------------------------------------------------------------
-# profile = "minimal", plus two mandatory components
-# --------------------------------------------------------------------------
+# No `targets` list: the host target ships with the toolchain, and cross-compiled
+# targets belong to the CI job that needs them.
+#
 # `minimal` installs only rustc, cargo, and the standard library -- no offline
 # docs, no extra targets -- which keeps first-use downloads small in CI.
 # `components` is ADDITIVE to the profile, so the two entries below do not
@@ -55,9 +53,6 @@
 # toolchain missing either component fails those gates simply by being unable
 # to run them.
 #
-# --------------------------------------------------------------------------
-# Nightly is chosen per-invocation, never here
-# --------------------------------------------------------------------------
 # Miri and `-Zsanitizer=address` are nightly-only, and this port must be
 # Miri-clean over the safe core (crates/zlib-rs) and sanitizer-clean over the
 # C-ABI boundary layer (crates/libz-rs-sys).  Those jobs run as
@@ -72,18 +67,44 @@
 # rustup would fail to provision this toolchain and every build in the tree
 # would break.
 #
-# --------------------------------------------------------------------------
-# No `targets` list
-# --------------------------------------------------------------------------
-# The Rust build is scoped to Tier-1 targets, and the host target is installed
-# with the toolchain already.  Cross-compilation belongs in a CI matrix, where
-# a job can add exactly the target it needs; hard-coding a target list here
-# would force every developer to download standard libraries they never build
-# against.
+# The host target is installed with the toolchain already.  Cross-compilation
+# belongs in a CI matrix, where a job can add exactly the target it needs;
+# hard-coding a target list here would force every developer to download
+# standard libraries they never build against.
 #
-# --------------------------------------------------------------------------
-# The C build is unaffected
-# --------------------------------------------------------------------------
+# THE SUPPORTED TARGET MATRIX IS THIS, and it is stated here because "Tier-1"
+# on its own names a rustc platform tier rather than a commitment by this port:
+#
+#   VERIFIED        x86_64-unknown-linux-gnu.  The only target the port is
+#                   built, tested and measured on today.  Every measured claim
+#                   anywhere in this workspace -- struct sizes and offsets, the
+#                   95-function / 111-global symbol surface, `zlibCompileFlags`
+#                   returning 0xa9, the ELF soname and version-script handling --
+#                   was established on it and on no other.
+#
+#   INTENDED        The remaining 64-bit ELF Tier-1 GNU/Linux targets
+#                   (aarch64-unknown-linux-gnu) plus the Tier-1 macOS targets.
+#                   The source is written to build there: the soname/version
+#                   script logic in `crates/libz-rs-sys/build.rs` has an explicit
+#                   Mach-O branch, and nothing in the core is x86-specific.  None
+#                   of it is exercised yet, so treat any platform-specific number
+#                   as unverified there until a CI job produces it.
+#
+#   OUT OF SCOPE    Windows (`*-pc-windows-msvc`, `*-pc-windows-gnu`) and every
+#                   non-ELF, non-Mach-O target.  `build.rs` emits neither a
+#                   soname nor a version script for PE/COFF; the PE analogue of
+#                   `zlib.map` is `win32/zlib.def`, which this port does not wire
+#                   up.  Windows-only ITEMS still exist in the source --
+#                   `gzopen_w` behind `#[cfg(windows)]`, and the `_WIN32` entries
+#                   in `cbindgen.toml`'s `[defines]` -- so that the port stays
+#                   coherent if Windows is brought in scope later.  Their
+#                   presence is forward compatibility, NOT a claim that a Windows
+#                   build works or has been tried.
+#
+# Nothing in this file enforces the matrix; a `targets` list here could not, and
+# rustup would happily install any triple on request.  Enforcement is a CI
+# concern, and the matrix above is the contract a CI job should encode.
+#
 # This file takes effect only once cargo is invoked.  The C library keeps
 # building with `./configure && make` or with CMake on a machine that has no
 # Rust toolchain at all, which is what keeps the in-tree C sources usable as

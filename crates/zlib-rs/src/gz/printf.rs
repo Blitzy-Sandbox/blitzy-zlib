@@ -1,38 +1,85 @@
-//! The bounded-buffer half of `gzprintf`: the port of `gzvprintf` (`gzwrite.c` L403-L485).
+//! The bounded-buffer half of `gzprintf`: the Rust counterpart of `gzvprintf` (`gzwrite.c` L403-L485).
 //!
-//! `gzprintf` is the one entry point in the whole `gzFile` layer that cannot be ported in one
+//! `gzprintf` is the one entry point in the whole `gzFile` layer that cannot live in one
 //! piece. C's body does three things in sequence -- prepare a bounded scratch region inside the
 //! input buffer, run `vsnprintf` into it, then account for whatever came back -- and only the
 //! middle step needs a raw pointer and a `va_list`. This module owns the first and third steps,
-//! entirely in safe Rust; the facade owns the second.
+//! entirely in safe Rust; the variadic boundary owns the second.
 //!
 //! # Why the split is structural rather than stylistic
 //!
-//! The crate root carries `#![forbid(unsafe_code)]`, and `core::ffi::VaList` is unsafe to consume:
-//! `VaList::arg` is an `unsafe fn`, and so is any read through the `char *format` a caller hands
-//! in. Neither can appear anywhere in this crate, so formatting *must* happen one layer up in
-//! `libz-rs-sys`, which is the only crate permitted to hold a raw pointer. Keeping `va_list` there
-//! is therefore not a convenience -- it is the only arrangement the safety posture allows.
+//! The crate root carries `#![forbid(unsafe_code)]`, and consuming a C variadic argument list is
+//! unsafe, as is any read through the `char *format` a caller hands in. Neither can appear anywhere
+//! in this crate, so formatting *must* happen one layer up in `libz-rs-sys`, which is the only crate
+//! permitted to **use** `unsafe` and therefore the only one that can dereference such a pointer.
+//! Keeping the argument list there is not a convenience -- it is the only arrangement the safety
+//! posture allows.
+//!
+//! # UNRESOLVED: how the facade obtains the argument list at the declared MSRV
+//!
+//! The split above is settled. **The mechanism the facade uses for the middle step is not, and this
+//! module must not be read as promising one.**
+//!
+//! The obstacle is concrete. `core::ffi::VaList` and `VaListImpl` are unstable
+//! (`feature(c_variadic)`), so a `#[no_mangle] pub extern "C" fn gzvprintf(..., va: VaList)` cannot
+//! be written on stable Rust at all -- and this workspace declares `rust-version = "1.80"` with a
+//! stable toolchain, so nightly is not available to it. `gzprintf` is worse: it is genuinely
+//! variadic (`zlib.h` L1549), and stable Rust cannot *define* a variadic function in any form.
+//!
+//! What the code snippet below shows is the *shape* of the call, with `vsnprintf` and `va` standing
+//! in for whatever mechanism is chosen. It is not an implementation, and no such implementation
+//! exists in this repository yet.
+//!
+//! The candidate approaches, none of which has been built or call-tested here:
+//!
+//! 1. **A small C shim** compiled by `cc` and linked in, exporting `gzprintf`/`gzvprintf` and
+//!    forwarding the formatted result to this module's two halves. Works on stable, but reintroduces
+//!    a C translation unit into the shipped artifact, which cuts against the point of the port.
+//! 2. **Raise the toolchain for these two symbols only** and use `feature(c_variadic)`. Contradicts
+//!    the declared MSRV and the stable-channel requirement.
+//! 3. **Omit both symbols.** Not an option: they are part of the frozen 95-symbol surface, and
+//!    `nm` parity would fail.
+//!
+//! Note also what a symbol-level gate can and cannot establish: `nm` proves a symbol is *present*.
+//! It cannot prove the variadic calling convention is right, because that is only exercised by an
+//! actual C call with actual varargs. So the acceptance evidence for these two functions has to be
+//! a compiled C caller that passes real arguments and checks the bytes written -- not a symbol diff.
+//!
+//! **Status: unresolved architecture blocker.** Whoever lands `crates/libz-rs-sys/src/gz.rs` must
+//! choose among the options above, or record a fourth, and must add that C-call test. Until then
+//! `gzprintf` and `gzvprintf` are the two exports with no viable implementation path on the
+//! declared toolchain, and any statement that the port covers 100% of `zlib.h` should carry that
+//! qualification.
 //!
 //! What is left behind, and lives here, is the part that actually matters for correctness: the
 //! guard chain, the double-sized input buffer's geometry, the overflow sentinel, and the
 //! three-part rejection test that together make up C's entire defence against a formatter writing
-//! more than the buffer can hold.
+//! more than the buffer can hold. None of that is in the shim, so none of it is unverifiable.
 //!
 //! | C | `gzwrite.c` | Where it lives now |
 //! |---|---|---|
 //! | guards, `gz_init`, `gz_zero`, `gz_vacate`, sentinel plant | L416-L453 | [`printf_begin`] |
-//! | `vsnprintf(next, state->size, format, va)` | L455-L469 | the facade, inside its own `unsafe` |
+//! | `vsnprintf(next, state->size, format, va)` | L455-L469 | `csrc/gzprintf_shim.c` |
 //! | rejection test, accounting, second `gz_vacate` | L471-L483 | [`printf_commit`] |
-//! | `gzprintf`'s `va_start`/`va_end` wrapper | L487-L495 | the facade |
-//! | the `!STDC && !Z_HAVE_STDARG_H` `snprintf` twin | L499-L596 | not ported; see below |
+//! | `gzprintf`'s `va_start`/`va_end` wrapper | L487-L495 | `csrc/gzprintf_shim.c` |
+//! | the `NO_vsnprintf` refusal and `ZLIB_INSECURE` opt-in | L404-L409, L457-L462 | `csrc/gzprintf_shim.c` |
+//! | the `!STDC && !Z_HAVE_STDARG_H` `snprintf` twin | L499-L596 | not implemented; see below |
 //!
-//! # The interface contract, for the author of `crates/libz-rs-sys/src/gz.rs`
+//! # The interface contract, for the author of the planned `crates/libz-rs-sys/src/gz.rs`
 //!
-//! Everything needed to implement the exported `gzprintf` and `gzvprintf` against this module is
-//! stated here, so that file does not have to read this one's body.
+//! That file does not exist at this checkpoint, so everything below is an obligation on it rather
+//! than a description of code that can be read today. Everything needed to implement the exported
+//! `gzprintf` and `gzvprintf` against this module is stated here, so that file does not have to
+//! read this one's body.
 //!
-//! ```ignore
+//! The block below is fenced as `text`, not as ignored Rust: it names a `va_list` mechanism that
+//! stable Rust at this MSRV cannot spell, so it could never compile. An `ignore` fence would
+//! present it as a doctest that merely happens not to run, which is the misleading form this crate
+//! does not use anywhere -- there are no ignored doctests in it.
+//!
+//! ```text
+//! // ILLUSTRATIVE SHAPE ONLY -- see the unresolved-blocker note above. `va` stands for whatever
+//! // mechanism is chosen; stable Rust at this MSRV cannot name a `va_list` type.
 //! // Inside libz-rs-sys, where `unsafe` is permitted. The inner scope is what releases the
 //! // loan's borrow of `state` before the accounting needs the stream back.
 //! let reported = {
@@ -52,51 +99,98 @@
 //! }
 //! ```
 //!
-//! The five obligations that go with it:
+//! Why the region may safely be handed out as a raw pointer and reclaimed later: the shim calls
+//! `vsnprintf` and **nothing else** between the two helpers. `vsnprintf` never re-enters this
+//! library, so no second reference to the stream can exist while the region is outstanding, and the
+//! loan's borrow has already ended by the time `_zlib_rs_gzprintf_commit` takes the stream back.
+//! [`PrintfScratch::into_mut_slice`] exists for exactly this hand-off.
 //!
-//! 1. **The region is exactly `state->size` bytes.** Pass `region.len()` as `vsnprintf`'s size
-//!    argument; never a constant, and never `state->size` read separately. [`PrintfScratch::len`]
-//!    is the authoritative width.
+//! The six obligations that go with it:
+//!
+//! 1. **The region is exactly `state->size` bytes.** Report `region.len()` through the `size`
+//!    out-parameter and let the formatter use *that* as `vsnprintf`'s size argument; never a
+//!    constant, and never `state->size` read separately. [`PrintfScratch::len`] is the
+//!    authoritative width, and it is never zero.
 //! 2. **The last byte is pre-set to zero as an overflow sentinel** (C's
-//!    `next[state->size - 1] = 0`, L453). A bounded formatter overwrites it only when the result is
-//!    long enough to reach it, which is precisely the condition the sentinel exists to detect. The
-//!    formatter must **not** unconditionally clear or overwrite that byte, and no code between
-//!    [`printf_begin`] and [`printf_commit`] may touch the region other than by formatting into it.
+//!    `next[state->size - 1] = 0`, L453). It detects a formatter that wrote *past* its bound, and
+//!    nothing else. A conforming bounded formatter that truncates writes its terminating NUL at
+//!    index `size - 1`, which leaves the sentinel zero — so the sentinel cannot see truncation, and
+//!    is not what catches it; obligation 3's reported length is. What leaves a non-zero byte there
+//!    is a formatter that wrote `size` characters or more, i.e. one that ignored the size argument
+//!    entirely. That is a real configuration in the reference and not a hypothetical: under
+//!    `NO_vsnprintf` the formatter is the *unbounded* `vsprintf` (`gzwrite.c` L455-L458), and the
+//!    input buffer is deliberately allocated at twice `state->size` so an overrun of that kind
+//!    lands in slack space where the sentinel can notice it instead of corrupting the heap.
+//!    Accordingly the formatter must **not** unconditionally clear or overwrite that byte, and no
+//!    code between [`printf_begin`] and [`printf_commit`] may touch the region other than by
+//!    formatting into it.
 //! 3. **Report the length the formatter *returned*, not the length it wrote.** C's `vsnprintf`
 //!    returns the length it *would* have written, which may exceed the region; that value is what
-//!    the rejection test needs. A negative return (an encoding error) has no `usize`, so map it to
-//!    [`usize::MAX`]; that reproduces C's `(unsigned)len >= state->size` comparison on a negative
-//!    `int`, which is how C folds the same failure into "did not fit".
+//!    the rejection test needs. A negative return (an encoding error) has no `usize`, so the shim
+//!    passes `(size_t)-1`, which arrives here as [`usize::MAX`]; that reproduces C's
+//!    `(unsigned)len >= state->size` comparison on a negative `int`, which is how C folds the same
+//!    failure into "did not fit".
 //! 4. **NUL termination is the formatter's business, and must be left intact.** This module never
 //!    writes a terminator and never counts one: the accepted byte count excludes it, so the NUL
 //!    sits just past the newly buffered input where the next call overwrites it harmlessly.
-//! 5. **The facade owns `va_list` entirely** -- `va_start`, `va_copy`, `va_end`, and the null checks
-//!    on `file` and `format`. A `&mut GzState` cannot be null, so C's `if (file == NULL) return
-//!    Z_STREAM_ERROR` (L418-L419) has no analogue below; it is discharged by the facade's pointer
-//!    validation, and a structure that is not one of this library's is still rejected here, by the
-//!    mode check and by `GzState::resync_from_exposed`.
+//! 5. **The null checks on `file` and `format` are the shim's** (`gzwrite.c` L418-L419), and it
+//!    performs both before calling in. A `&mut GzState` cannot be null, so C's
+//!    `if (file == NULL) return Z_STREAM_ERROR` has no analogue below; a structure that is not one
+//!    of this library's is still rejected here, by the mode check and by
+//!    `GzState::resync_from_exposed`.
+//! 6. **Never substitute an unbounded formatter, and never reach for nightly.** The shim's
+//!    `vsnprintf` is the only formatting call in the port. There is no `ZLIB_INSECURE` equivalent,
+//!    no `VaList`, no hand-written format parser, and no guessed `va_list` layout; the shim's own
+//!    header records each of those as a closed door.
 //!
 //! [`printf_with`] wraps the pair for callers that can express formatting as a closure, and
 //! [`printf_bytes`] takes an already-formatted slice. Both go through exactly the same guards and
-//! accounting, so nothing is verified twice or skipped once.
+//! accounting, so nothing is verified twice or skipped once -- which is what makes this module's
+//! behaviour testable in safe Rust, without any FFI, and under Miri.
 //!
-//! Two symbol-level facts the facade must honour, both read straight out of `zlib.map`:
+//! ## Who compiles the shim
+//!
+//! Not cargo. `crates/libz-rs-sys/build.rs` is required to carry no `[build-dependencies]` and to
+//! never invoke a C compiler, so that `cargo build --release` for the shipped artifacts works on a
+//! machine without one (AAP §0.7.1 (i), and §0.6.4.1's rule that a C toolchain is the differential
+//! crate's business alone). The **packaging** layer compiles it, which is the same layer that
+//! already owns the `zlib.map` relink -- and it has to, because `--version-script` cannot be handed
+//! to rustc's own cdylib link at all, for the measured reasons `build.rs` documents above
+//! `emit_version_script`. `Makefile.in`'s `rust` target compiles the shim with `$(CC) $(SFLAGS)`,
+//! adds the object to the staged `libz.a`, and relinks the staged shared library from that archive
+//! with `$(LDSHARED)`, which `configure` already loads with
+//! `-Wl,-soname,libz.so.1,--version-script,${SRCDIR}zlib.map`. The CMake Rust path and the Rust CI
+//! workflow owe the same two steps.
+//!
+//! ## Symbol visibility -- verified, not assumed
+//!
+//! Three facts, all read straight out of `zlib.map` and all confirmed by linking the shim against
+//! it and reading `nm -D --defined-only --extern-only`:
 //!
 //! * **`gzvprintf` is a versioned export**, listed in the `ZLIB_1.2.7.1` node alongside
 //!   `inflateGetDictionary`. `gzprintf` predates the first node and is not named, so it takes the
-//!   default binding. Both must appear in the facade's exported surface; neither may be dropped
-//!   because this module happens to be the safe part of them.
+//!   base binding. The relinked library shows exactly `gzvprintf@@ZLIB_1.2.7.1` and a bare
+//!   `gzprintf`, which is symbol for symbol what the C library exports.
+//! * **`zlib.map` has no `local: *;` catch-all.** Its `ZLIB_1.2.0` node lists nine names plus the
+//!   pattern `_*`, and a symbol matched by nothing at all is assigned to the base version and stays
+//!   *exported*. That is why the two helpers above **must** be named `_zlib_rs_gzprintf_begin` and
+//!   `_zlib_rs_gzprintf_commit`: the leading underscore is what `_*` hides, and without it they
+//!   would appear in the dynamic table and break the 111-symbol parity target. This is the same
+//!   mechanism zlib itself uses for `_tr_init`, `_tr_tally` and the rest of the `_tr_*` family, so
+//!   the naming follows the reference implementation's own convention. Do not rename them, and do
+//!   not add them to `zlib.map` -- that file is immutable (AAP §0.8.1 directive 2).
+//!
+//! `make rust-symbols` is what proves both symbols actually reached the staged library.
 //! * **`gz_error`, which this module calls, is in the `local:` block of the `ZLIB_1.2.0` node** and
 //!   must stay hidden. It is `pub(crate)` in `gz/mod.rs` and is never re-exported from here, so the
 //!   version script and the Rust visibility agree by construction rather than by convention.
 //!
 //! # The return convention
 //!
-//! `zlib.h` L1553-L1556 documents `gzprintf` as returning "the number of uncompressed bytes
-//! actually written, or a negative zlib error code in case of error", with a third outcome at
-//! L1557-L1560: the output "is limited to 8191, or one less than the buffer size given to
-//! `gzbuffer()`", and exceeding it "will return an error (0) with nothing written". Three outcomes,
-//! two of them non-negative, so they are split by type rather than by sign:
+//! `zlib.h` L1553-L1560 documents three outcomes: the count of uncompressed bytes written, a
+//! negative zlib code, or -- when the result exceeds 8191 bytes, or one less than the size given to
+//! `gzbuffer` -- an "error (0) with nothing written". Two of the three are non-negative, so they are
+//! split by type rather than by sign:
 //!
 //! | This module | C | Meaning |
 //! |---|---|---|
@@ -104,8 +198,8 @@
 //! | `Ok(0)` | `return 0` | the result did not fit; **nothing** was written or counted |
 //! | `Err(code)` | `return state->err` or `Z_STREAM_ERROR` | the negative code C hands back |
 //!
-//! A facade that wants C's single `int` collapses them with `Ok(len) => len` and
-//! `Err(code) => code.as_i32()`.
+//! `_zlib_rs_gzprintf_commit` collapses them into C's single `int` with `Ok(len) => len` and
+//! `Err(code) => code.as_i32()`, and the shim returns that value unchanged.
 //!
 //! # The double-sized input buffer, and why `gz_vacate` is called twice
 //!
@@ -131,26 +225,20 @@
 //! `next[state->size - 1]` lands up to `size` bytes past the end of a `2 * size` allocation, and
 //! the formatter then writes there.
 //!
-//! This port keeps C's control flow and C's recorded error verbatim -- including the deliberate
-//! fall-through -- and replaces the unchecked pointer with a checked slice split. When the split
-//! fails, [`printf_begin`] returns `Err(Z_BUF_ERROR)` and nothing is formatted, which is exactly
-//! what `zlib.h` L1571-L1572 promises: "If a `Z_BUF_ERROR` is returned, then nothing was written
-//! due to a stall on the non-blocking write destination." The safe port therefore matches the
-//! documented contract more closely than the reference implementation's own code does.
+//! This implementation keeps C's control flow and C's recorded error verbatim -- including the
+//! deliberate fall-through -- and replaces the unchecked pointer with a checked slice split. When the
+//! split fails, [`printf_begin`] returns `Err(Z_BUF_ERROR)` and nothing is formatted, which is what
+//! `zlib.h` L1571-L1572 promises for a stall on a non-blocking write destination.
 //!
-//! # Fallback variants: documented, deliberately not implemented
+//! # Fallback variants: deliberately not implemented
 //!
-//! C carries four preprocessor variants of the formatting step and a fifth escape hatch:
-//! `NO_vsnprintf` crossed with `HAS_vsprintf_void` in the `stdarg` branch (L455-L469), the
-//! `snprintf`/`sprintf` twins of the same cross in the non-`stdarg` branch (L563-L582), and
-//! `ZLIB_INSECURE`, which re-enables the unbounded `vsprintf`/`sprintf` that the guard at L374-L376
-//! otherwise compiles `gzprintf` away to avoid. `gzguts.h` L59-L104 is the cascade that decides
-//! which one a given compiler gets.
-//!
-//! **Only the bounded path exists here.** Rust always has a bounded formatter, so there is no
-//! configuration in which an unbounded one would be needed, and none is provided: an unbounded
-//! variant would reintroduce precisely the overflow class this port exists to remove. There is no
-//! `ZLIB_INSECURE` equivalent and no build switch that could produce one.
+//! C carries four preprocessor variants of the formatting step -- `NO_vsnprintf` crossed with
+//! `HAS_vsprintf_void`, in both the `stdarg` (L455-L469) and non-`stdarg` (L563-L582) branches --
+//! plus `ZLIB_INSECURE`, which re-enables the unbounded `vsprintf`/`sprintf` that the guard at
+//! L374-L376 otherwise compiles `gzprintf` away to avoid. **Only the bounded path exists here**,
+//! because Rust always has a bounded formatter and an unbounded variant would reintroduce exactly
+//! the overflow class this implementation exists to remove. There is no `ZLIB_INSECURE` equivalent
+//! and no build switch that could produce one.
 //!
 //! Two consequences follow, and both are this module's determination to make:
 //!
@@ -158,26 +246,25 @@
 //!   `NO_vsnprintf` together with `ZLIB_INSECURE`, bit 27 for `NO_vsnprintf` without it, and bit 26
 //!   for the void-returning `HAS_vsprintf_void`/`HAS_vsnprintf_void` variants. This port has a
 //!   bounded formatter and no void-returning variant, so none of the three conditions holds.
-//!   `crates/libz-rs-sys/src/util.rs` must **compute** that answer rather than copy a measured
-//!   constant (AAP §0.6.3.5) and should cite this module as the authority for it. Bit 24, which
+//!   The planned `crates/libz-rs-sys/src/util.rs` must **compute** that answer rather than copy
+//!   a measured constant (AAP §0.6.3.5) and should cite this module as the authority for it. Bit 24, which
 //!   `zutil.c` L104 sets only in the non-`stdarg` branch, is likewise clear: the variadic entry
 //!   point the facade exports is the `stdarg` one.
 //! * **C's `#warning` stubs are unreachable here.** When no bounded formatter exists, C compiles
 //!   `gzvprintf` and `gzprintf` down to bodies that ignore their arguments and return
 //!   `Z_STREAM_ERROR` (L406-L412 and L505-L515), and `zlib.h` L1566-L1569 documents that a library
 //!   built that way reports it through `zlibCompileFlags`. No such build exists for this port, so
-//!   [`printf_begin`] never has a "formatting is unavailable" outcome and none is defined.
+//!   [`printf_begin`] never has a "formatting is unavailable" outcome and none is defined. The shim
+//!   makes that a build-time guarantee rather than a hope: a compiler that provably does not declare
+//!   `vsnprintf` -- a strict pre-C99 mode -- is refused with an `#error` naming the fix, instead of
+//!   silently degrading to the unbounded `vsprintf` that `ZLIB_INSECURE` selects or to a stub that
+//!   would fail `test/example.c`'s `gzprintf(file, ", %s!", "hello") == 8` assertion.
 //!
 //! # Feature gating and dependencies
 //!
 //! The crate root reaches this file through `#[cfg(feature = "std")] mod gz;`, so no per-item gate
-//! appears below and `--no-default-features` compiles the whole subtree out.
-//!
-//! Nothing here needs `std`, `alloc`, or any third-party crate. The whole dependency list is
-//! `core::ffi` for the two C integer widths, `crate::gz::state` for the stream, `crate::error` for
-//! the status type, `crate::allocate::Allocator` for the bound the stream is generic over, and four
-//! crate-private helpers: `gz_init`, `gz_zero` and `gz_vacate` from `gz/write.rs`, and `gz_error`
-//! from `gz/mod.rs`, which owns the whole error-recording policy.
+//! appears below and `--no-default-features` compiles the whole subtree out. Nothing here needs
+//! `std`, `alloc`, or any third-party crate.
 
 // Every public item below is named for the C function it serves, inside a module named after that
 // same function. The C names are what a maintainer diffing this file against `gzwrite.c` will
@@ -191,10 +278,6 @@ use crate::error::ReturnCode;
 use crate::gz::gz_error;
 use crate::gz::state::{GzState, ZOff64, GZ_WRITE};
 use crate::gz::write::{gz_init, gz_vacate, gz_zero};
-
-// -----------------------------------------------------------------------------
-//  Messages
-// -----------------------------------------------------------------------------
 
 /// `gz_error(state, Z_BUF_ERROR, "stalled write on gzprintf")` (`gzwrite.c` L445).
 ///
@@ -210,13 +293,9 @@ const STALLED_WRITE: &[u8] = b"stalled write on gzprintf";
 /// this library.
 const NO_SCRATCH_ROOM: &[u8] = b"no room to format into on gzprintf";
 
-// -----------------------------------------------------------------------------
-//  Width bridges
-// -----------------------------------------------------------------------------
-
 /// Widens a C `unsigned` count into a `usize` index.
 ///
-/// Every target this port supports has `usize` at least as wide as `c_uint`, so the conversion is
+/// Every target this implementation supports has `usize` at least as wide as `c_uint`, so the conversion is
 /// exact. Saturating rather than panicking on a hypothetical narrower target is the conservative
 /// choice: a saturated value can only make a bounds check stricter, never looser. `gz/write.rs`
 /// keeps a private twin of this for the same reason.
@@ -261,10 +340,6 @@ fn latched_or<'a, A: Allocator<'a>>(state: &GzState<'a, A>, fallback: ReturnCode
         _ => fallback,
     }
 }
-
-// -----------------------------------------------------------------------------
-//  The scratch loan
-// -----------------------------------------------------------------------------
 
 /// An exclusive loan of the region a formatter may write into: the safe form of C's `char *next`.
 ///
@@ -327,19 +402,17 @@ impl<'a> PrintfScratch<'a> {
 
     /// Consumes the loan and yields the region with the borrow's full lifetime.
     ///
-    /// The form a facade wants when it needs to hand the region's address to a C formatter and keep
-    /// it live across the call: `region.as_mut_ptr()` inside its own `unsafe` block, with the length
-    /// from `region.len()`. Consuming the loan ends this module's involvement, so the caller becomes
-    /// responsible for calling [`printf_commit`] afterwards.
+    /// The form `_zlib_rs_gzprintf_begin` needs: it reports `region.as_mut_ptr()` and
+    /// `region.len()` to `csrc/gzprintf_shim.c` through its two out-parameters, inside its own
+    /// `unsafe` block, and the shim then calls `vsnprintf` against exactly that pointer and length.
+    /// Consuming the loan ends this module's involvement and releases the borrow of the stream, so
+    /// the caller becomes responsible for calling [`printf_commit`] afterwards -- which the shim
+    /// does, unconditionally, as its very next statement.
     #[must_use]
     pub fn into_mut_slice(self) -> &'a mut [u8] {
         self.region
     }
 }
-
-// -----------------------------------------------------------------------------
-//  printf_begin -- gzwrite.c L416-L453
-// -----------------------------------------------------------------------------
 
 /// Prepares the stream for formatting and lends out the scratch region.
 ///
@@ -348,7 +421,7 @@ impl<'a> PrintfScratch<'a> {
 ///
 /// | Step | C | `gzwrite.c` |
 /// |---|---|---|
-/// | 1 | recover the flush cursor from the exposed prefix | -- (this port's contract) |
+/// | 1 | recover the flush cursor from the exposed prefix | -- (this implementation's contract) |
 /// | 2 | `if (state->mode != GZ_WRITE \|\| (state->err != Z_OK && !state->again)) return Z_STREAM_ERROR` | L421-L422 |
 /// | 3 | `gz_error(state, Z_OK, NULL)` | L423 |
 /// | 4 | `if (state->size == 0 && gz_init(state) == -1) return state->err` | L426-L427 |
@@ -371,8 +444,8 @@ impl<'a> PrintfScratch<'a> {
 /// reaches a checked slice split rather than C's overflow.
 ///
 /// C's `if (file == NULL) return Z_STREAM_ERROR` (L418-L419) has no counterpart: a `&mut GzState`
-/// cannot be null. The facade performs that check, and a structure that is not one of this
-/// library's is still rejected -- by step 1, which validates the exposed prefix against the output
+/// cannot be null. The shim performs that check, together with the `format == NULL` test C omits,
+/// and a structure that is not one of this library's is still rejected -- by step 1, which validates the exposed prefix against the output
 /// buffer, and by step 2's mode value, which `gzguts.h` L158 introduces as "a little integrity check
 /// on the passed structure".
 ///
@@ -454,7 +527,7 @@ pub fn printf_begin<'s, 'a, A: Allocator<'a> + Copy>(
         state.strm.next_in = 0;
     }
 
-    // Step 8 -- L452. C's `(strm->next_in - state->in)` is already an index in this port, so the
+    // Step 8 -- L452. C's `(strm->next_in - state->in)` is already an index in this implementation, so the
     // whole expression is `next_in + avail_in`.
     let size = to_index(state.size());
     let start = state
@@ -501,10 +574,6 @@ pub fn printf_begin<'s, 'a, A: Allocator<'a> + Copy>(
     Ok(PrintfScratch { region })
 }
 
-// -----------------------------------------------------------------------------
-//  printf_commit -- gzwrite.c L471-L483
-// -----------------------------------------------------------------------------
-
 /// Accounts for a formatted result and hands back the value the caller should report.
 ///
 /// The second half of `gzvprintf` (`gzwrite.c` L471-L483). `written` is the length the formatter
@@ -512,15 +581,11 @@ pub fn printf_begin<'s, 'a, A: Allocator<'a> + Copy>(
 /// the region; a negative C return arrives here as [`usize::MAX`], which the range test rejects for
 /// the same reason C's `(unsigned)len >= state->size` does.
 ///
+/// The rejection test itself is one predicate, and its three parts are the subject of the next
+/// section (`gzwrite.c` L471):
+///
 /// ```c
 /// if (len == 0 || (unsigned)len >= state->size || next[state->size - 1] != 0)
-///     return 0;
-/// strm->avail_in += (unsigned)len;
-/// state->x.pos += len;
-/// ret = gz_vacate(state);
-/// if (state->err && !state->again)
-///     return state->err;
-/// return len;
 /// ```
 ///
 /// # The three-part rejection test, and why all three parts are needed
@@ -531,10 +596,14 @@ pub fn printf_begin<'s, 'a, A: Allocator<'a> + Copy>(
 /// |---|---|
 /// | `written == 0` | the formatter failed, or produced nothing; either way there is nothing to buffer |
 /// | `written >= size` | the formatter *reported* that the result did not fit, having truncated it |
-/// | the sentinel is no longer zero | the formatter wrote past the end of its bound without saying so |
+/// | the sentinel is no longer zero | the formatter wrote `size` characters or more, ignoring its bound |
 ///
-/// The third is the one that makes the report untrusted rather than trusted: a formatter that
-/// overran its bound would otherwise have its length believed. Together they are C's complete
+/// The second is what catches truncation, and the third is emphatically **not**: a conforming
+/// bounded formatter puts its terminating NUL at index `size - 1` when it truncates, leaving the
+/// sentinel zero. What the third catches is a formatter that never respected the bound at all —
+/// the reference's `NO_vsnprintf` configuration calls the unbounded `vsprintf` (`gzwrite.c`
+/// L455-L458) — and it is what makes the *reported* length untrusted rather than trusted, since a
+/// formatter that overran would otherwise have its length believed. Together they are C's complete
 /// overflow defence, and all three yield `Ok(0)` -- **not** an error code, and with nothing appended
 /// to the buffered input and nothing added to the position. `zlib.h` L1557-L1560 documents that
 /// outcome: exceeding the limit "will return an error (0) with nothing written".
@@ -609,7 +678,6 @@ pub fn printf_commit<'a, A: Allocator<'a> + Copy>(
     // have moved the flush cursor as well.
     state.refresh_exposed();
 
-    // L481-L482
     if state.err() != ReturnCode::OK.as_i32() && !state.again() {
         return Err(latched_or(state, ReturnCode::STREAM_ERROR));
     }
@@ -618,10 +686,6 @@ pub fn printf_commit<'a, A: Allocator<'a> + Copy>(
     // any buffer size a `c_int` could describe, and exists only so this cannot panic.
     Ok(c_int::try_from(written).unwrap_or(c_int::MAX))
 }
-
-// -----------------------------------------------------------------------------
-//  Compositions
-// -----------------------------------------------------------------------------
 
 /// Runs a formatter against the scratch region, doing the whole of `gzvprintf` around it.
 ///
@@ -639,9 +703,11 @@ pub fn printf_commit<'a, A: Allocator<'a> + Copy>(
 ///   [`usize::MAX`] reproduces that comparison, which is why `None` yields `Ok(0)` rather than an
 ///   error.
 ///
-/// A facade that must call a C formatter cannot use this -- the call needs a raw pointer, so it
-/// belongs in a crate that may write `unsafe` -- and should use the [`printf_begin`] /
-/// [`printf_commit`] pair directly instead.
+/// The C variadic boundary cannot use this -- `vsnprintf` needs a raw pointer, and the closure
+/// would have to cross the FFI edge -- so `_zlib_rs_gzprintf_begin`/`_zlib_rs_gzprintf_commit` drive
+/// the [`printf_begin`] / [`printf_commit`] pair directly instead. This exists for Rust-side callers
+/// and for the tests below, which is what lets the guards, the sentinel and the rejection test be
+/// exercised without any FFI and under Miri.
 ///
 /// # Errors
 ///
@@ -663,8 +729,8 @@ where
 ///
 /// The path for callers that have the text in hand: the crate's own tests, and any Rust-side caller
 /// that has formatted with `core::fmt` and simply needs the result buffered. It goes through
-/// [`printf_with`], so the guards, the sentinel and the rejection test are the same ones the C
-/// facade meets -- which is what makes this module testable without any FFI.
+/// [`printf_with`], so the guards, the sentinel and the rejection test are the same ones the C shim
+/// meets -- which is what makes this module testable without any FFI.
 ///
 /// `formatted` is treated exactly as `vsnprintf` treats a rendered result:
 ///
@@ -699,10 +765,6 @@ pub fn printf_bytes<'a, A: Allocator<'a> + Copy>(
     })
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     // The crate denies the panic-prone lints in library code, which is the right policy there and
@@ -714,7 +776,8 @@ mod tests {
     use crate::allocate::GlobalAllocator;
     use crate::error::ReturnCode;
     use crate::gz::state::{
-        GzHandle, GzIoError, GzSeekFrom, GzState, ZOff64, GZBUFSIZE, GZ_NONE, GZ_READ, GZ_WRITE,
+        GzFileSlot, GzHandle, GzIoError, GzSeekFrom, GzState, ZOff64, GZBUFSIZE, GZ_NONE, GZ_READ,
+        GZ_WRITE,
     };
     use crate::gz::write::{gz_init, gzclose_w, gzputc, gzputs};
     use alloc::boxed::Box;
@@ -767,7 +830,7 @@ mod tests {
 
     /// A file that refuses every write with the non-blocking stall condition.
     ///
-    /// `GzIoError::would_block` is this port's spelling of `errno == EAGAIN || errno == EWOULDBLOCK`
+    /// `GzIoError::would_block` is this implementation's spelling of `errno == EAGAIN || errno == EWOULDBLOCK`
     /// (`gzwrite.c` L82 and L117), so this is what drives the `state->again` paths. 11 is Linux's
     /// `EAGAIN`; only the flag is consulted.
     struct StalledFile;
@@ -834,10 +897,10 @@ mod tests {
         state.set_mode(GZ_WRITE);
         state.set_want(want);
         state.set_direct(TRANSPARENT);
-        let previous = state.set_handle(Some(Box::new(MemoryFile {
+        let previous = state.set_handle(GzFileSlot::Boxed(Box::new(MemoryFile {
             sink: Rc::clone(&sink),
         })));
-        assert!(previous.is_none());
+        assert!(!previous.is_installed(), "the slot was empty before");
         (state, sink)
     }
 
@@ -847,8 +910,8 @@ mod tests {
         state.set_mode(GZ_WRITE);
         state.set_want(want);
         state.set_direct(TRANSPARENT);
-        let previous = state.set_handle(Some(Box::new(StalledFile)));
-        assert!(previous.is_none());
+        let previous = state.set_handle(GzFileSlot::Boxed(Box::new(StalledFile)));
+        assert!(!previous.is_installed(), "the slot was empty before");
         state
     }
 
@@ -858,10 +921,6 @@ mod tests {
         let end = start + to_index(state.stream().avail_in);
         &state.in_slice()[start..end]
     }
-
-    // -------------------------------------------------------------------------
-    //  The ordinary path
-    // -------------------------------------------------------------------------
 
     #[test]
     fn an_ordinary_result_reports_its_length_and_advances_the_position() {
@@ -905,10 +964,6 @@ mod tests {
         assert_eq!(state.stream().avail_in, 3);
         assert_eq!(state.in_slice()[3], 0);
     }
-
-    // -------------------------------------------------------------------------
-    //  The three-part rejection test -- gzwrite.c L471
-    // -------------------------------------------------------------------------
 
     #[test]
     fn a_result_of_exactly_size_minus_one_is_accepted() {
@@ -1020,10 +1075,6 @@ mod tests {
         assert!(over_sink.borrow().is_empty());
     }
 
-    // -------------------------------------------------------------------------
-    //  The entry guards -- gzwrite.c L421-L422
-    // -------------------------------------------------------------------------
-
     #[test]
     fn a_read_stream_is_rejected() {
         let (mut state, _sink) = writer(16);
@@ -1089,10 +1140,6 @@ mod tests {
         assert_eq!(printf_bytes(&mut state, b"ab"), Ok(2));
         assert_eq!(buffered(&state), b"ab");
     }
-
-    // -------------------------------------------------------------------------
-    //  gz_zero and gz_vacate -- gzwrite.c L430-L431 and L438
-    // -------------------------------------------------------------------------
 
     #[test]
     fn a_pending_skip_is_paid_for_before_formatting() {
@@ -1188,7 +1235,7 @@ mod tests {
         // is clear, so C returns `state->err` at L447-L448.
         let (mut state, _sink) = writer(16);
         gz_init(&mut state).unwrap();
-        let _previous = state.set_handle(Some(Box::new(BrokenFile)));
+        let _previous = state.set_handle(GzFileSlot::Boxed(Box::new(BrokenFile)));
 
         state.in_slice_mut()[..20].fill(b'z');
         state.stream_mut().next_in = 0;
@@ -1198,10 +1245,6 @@ mod tests {
         assert!(!state.again());
         assert_eq!(state.pos(), 0);
     }
-
-    // -------------------------------------------------------------------------
-    //  The begin/commit pair, used the way the facade uses it
-    // -------------------------------------------------------------------------
 
     #[test]
     fn the_loan_is_exactly_size_bytes_and_starts_after_the_buffered_input() {
@@ -1226,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn the_facade_sequence_begin_format_commit_works() {
+    fn the_shim_sequence_begin_format_commit_works() {
         let (mut state, _sink) = writer(16);
         assert_eq!(gzputs(&mut state, b"hello"), 5);
 
@@ -1267,10 +1310,6 @@ mod tests {
         assert!(printf_begin(&mut state).is_err());
         assert_eq!(state.size(), 0);
     }
-
-    // -------------------------------------------------------------------------
-    //  test/example.c
-    // -------------------------------------------------------------------------
 
     #[test]
     fn the_example_c_sequence_reports_eight_and_produces_hello_hello() {

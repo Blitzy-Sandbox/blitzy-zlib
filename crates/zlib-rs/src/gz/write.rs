@@ -1,7 +1,7 @@
-//! The write half of the `gzFile` layer: the port of `gzwrite.c` (700 lines).
+//! The write half of the `gzFile` layer: the Rust counterpart of `gzwrite.c` (700 lines).
 //!
 //! This module drives the compression engine on behalf of a `gzFile` opened for writing. It is
-//! where the gzip bytes this port produces are actually shaped -- not because it emits any of them
+//! where the gzip bytes this implementation produces are actually shaped -- not because it emits any of them
 //! itself, but because it chooses the parameters that do. `gz_init` asks for `MAX_WBITS + 16`, and
 //! that `+ 16` is what makes `crate::deflate` emit an RFC 1952 member rather than an RFC 1950
 //! stream (`gzwrite.c` L36-L37). Change `windowBits`, `memLevel` or a flush decision here and the
@@ -11,18 +11,18 @@
 //!
 //! | C function | `gzwrite.c` | Here |
 //! |---|---|---|
-//! | `gz_init` | L11-L57 | [`gz_init`] |
-//! | `gz_comp` | L65-L148 | [`gz_comp`] |
-//! | `gz_zero` | L154-L182 | [`gz_zero`] |
-//! | `gz_write` | L188-L252 | [`gz_write`] |
+//! | `gz_init` | L11-L57 | `gz_init` |
+//! | `gz_comp` | L65-L148 | `gz_comp` |
+//! | `gz_zero` | L154-L182 | `gz_zero` |
+//! | `gz_write` | L188-L252 | `gz_write` |
 //! | `gzwrite` | L255-L277 | [`gzwrite`] |
 //! | `gzfwrite` | L280-L304 | [`gzfwrite`] |
 //! | `gzputc` | L307-L347 | [`gzputc`] |
 //! | `gzputs` | L350-L372 | [`gzputs`] |
-//! | `gz_vacate` | L382-L396 | [`gz_vacate`] |
-//! | `gzvprintf`, `gzprintf` | L403-L495 | `printf.rs`, which calls [`gz_init`] and [`gz_vacate`] |
+//! | `gz_vacate` | L382-L396 | `gz_vacate` |
+//! | `gzvprintf`, `gzprintf` | L403-L495 | `printf.rs`, which calls `gz_init` and `gz_vacate` |
 //! | `gzflush` | L603-L627 | [`gzflush`] |
-//! | `gzsetparams` | L630-L664 | `mod.rs`, which calls [`gz_comp`] |
+//! | `gzsetparams` | L630-L664 | `mod.rs`, which calls `gz_comp` |
 //! | `gzclose_w` | L667-L700 | [`gzclose_w`] |
 //!
 //! No gzip header, trailer or CRC-32 is assembled anywhere below. That is the engine's business,
@@ -36,7 +36,7 @@
 //! doubling is on the **input** side here, and C's comment at L15 says exactly why: "double size
 //! for `gzprintf`". `gzprintf` formats straight into the input buffer after whatever is already
 //! buffered, so it needs `size` bytes of headroom past the current contents
-//! (`gzwrite.c` L435-L437). [`gz_vacate`] is what maintains that guarantee, which is why it is
+//! (`gzwrite.c` L435-L437). `gz_vacate` is what maintains that guarantee, which is why it is
 //! `pub(crate)` rather than private: `printf.rs` calls it before and after formatting.
 //!
 //! The read path doubles the *output* buffer instead (`gzread.c` L99-L100), because that is where
@@ -45,7 +45,7 @@
 //! Neither buffer arrives zeroed. C obtains both from plain `malloc`, and the engine's own blocks
 //! come from `zcalloc`, which is also `malloc` whenever `sizeof(uInt) > 2` (`zutil.c` L299-L303) --
 //! every target this port supports. `test/infcover.c` L84-L87 fills each block it hands out with
-//! `0xa5` precisely to catch code that assumes otherwise. [`gz_zero`] is the only routine below
+//! `0xa5` precisely to catch code that assumes otherwise. `gz_zero` is the only routine below
 //! that writes zeros, and it writes them deliberately.
 //!
 //! # The exposed prefix on a write stream
@@ -56,7 +56,7 @@
 //! * `x.next` is the **flush cursor**, not a delivery cursor. `gz_init` seeds it with
 //!   `state->x.next = strm->next_out` (`gzwrite.c` L54) and `gz_comp` drains the staged output with
 //!   `while (strm->next_out > state->x.next)`, advancing it by each `write` and resetting it to
-//!   `state->out` when the buffer is recycled (L110-L127). This port holds it as the index
+//!   `state->out` when the buffer is recycled (L110-L127). This implementation holds it as the index
 //!   `GzState::out_pos`, so the comparison is integer arithmetic over an owned slice and every
 //!   access through it is bounds checked (AAP §0.3.3.7).
 //! * `x.have` **stays zero for the entire life of a write stream**. No line of `gzwrite.c` assigns
@@ -64,8 +64,8 @@
 //!   handle: with `have` at zero the macro always calls the `gzgetc` function, which rejects a
 //!   write stream. Nothing below may "helpfully" populate `have`; doing so would make `gzgetc`
 //!   hand the caller bytes out of the compressor's staging buffer.
-//! * `x.pos` is the position in the **uncompressed** stream and is advanced by [`gz_write`],
-//!   [`gz_zero`], [`gzputc`] and `gzprintf`.
+//! * `x.pos` is the position in the **uncompressed** stream and is advanced by `gz_write`,
+//!   `gz_zero`, [`gzputc`] and `gzprintf`.
 //!
 //! Every public entry point below therefore calls `GzState::resync_from_exposed` on entry and
 //! `GzState::refresh_exposed` before returning, which is the contract `crate::gz::state` states.
@@ -75,21 +75,12 @@
 //!
 //! # The contract this module expects from `crate::gz`
 //!
-//! Two crate-private helpers are used from `mod.rs`, which owns the shared plumbing of `gzlib.c`:
+//! Two crate-private helpers are used from `mod.rs`, which owns the shared plumbing of `gzlib.c`.
 //!
-//! ```ignore
-//! pub(crate) fn gz_error<'a, A: Allocator<'a>>(
-//!     state: &mut GzState<'a, A>,
-//!     err: ReturnCode,
-//!     msg: Option<&[u8]>,
-//! );
-//! pub(crate) fn gt_off(value: c_uint) -> bool;
-//! ```
-//!
-//! `gz_error` is the port of `gzlib.c` L554-L589 and owns the whole error policy: releasing the
+//! `gz_error` implements `gzlib.c` L554-L589 and owns the whole error policy: releasing the
 //! previous message, clearing `x.have` when the error is fatal and the stream is not merely
 //! stalled, skipping the allocation for `Z_MEM_ERROR`, and prefixing the message with the path.
-//! `gt_off` is the port of the `GT_OFF` macro (`gzguts.h` L216), which is false on every target
+//! `gt_off` implements the `GT_OFF` macro (`gzguts.h` L216), which is false on every target
 //! where `sizeof(int) != sizeof(z_off64_t)` and exists only so that an `unsigned` may be compared
 //! against a signed `z_off64_t` without either one being misinterpreted.
 //!
@@ -100,7 +91,7 @@
 //! `std` directly: the file itself arrives injected as a `GzHandle`, and the non-blocking condition
 //! that C reads out of `errno` arrives as `GzIoError::would_block`.
 
-// Every item in a module named `write` that ports a C function named `gz_write`, `gzwrite` or
+// Every item in a module named `write` that implements a C function named `gz_write`, `gzwrite` or
 // `gz_vacate` necessarily repeats the module's name. The C names are the ones a maintainer
 // comparing this file against `gzwrite.c` will search for, so they are kept verbatim.
 #![allow(clippy::module_name_repetitions)]
@@ -115,12 +106,8 @@ use crate::deflate::{
     deflate, deflate_end, deflate_init2, deflate_reset, DeflateReset, DeflateStream, Flush,
 };
 use crate::error::ReturnCode;
-use crate::gz::state::{GzEngine, GzState, GzStream, ZOff64, GZ_NONE, GZ_WRITE};
-use crate::gz::{gt_off, gz_error};
-
-// -----------------------------------------------------------------------------
-//  The message table
-// -----------------------------------------------------------------------------
+use crate::gz::state::{GzEngine, GzIoError, GzState, GzStream, ZOff64, GZ_NONE, GZ_WRITE};
+use crate::gz::{errno_message, gt_off, gz_error};
 
 /// `gz_error(state, Z_MEM_ERROR, "out of memory")` (`gzwrite.c` L18, L28 and L41).
 const OUT_OF_MEMORY: &[u8] = b"out of memory";
@@ -138,32 +125,47 @@ const REQUEST_NOT_SIZE_T: &[u8] = b"request does not fit in a size_t";
 /// `gzputs`'s rejection of a string length that does not fit in an `int` (`gzwrite.c` L367).
 const STRING_NOT_INT: &[u8] = b"string length does not fit in int";
 
-/// The stand-in for `zstrerror()` (`gzguts.h` L129-L135).
+/// Reports a failed file operation the way `gz_comp` does: `gz_error(state, Z_ERRNO, zstrerror())`
+/// (`gzwrite.c` L83, L118).
 ///
-/// C renders the failure with `strerror(errno)`, or with `gz_strwinerror` under Windows CE. This
-/// crate has neither: the file arrives injected as a `GzHandle` and reports a [`GzIoError`] that
-/// carries an `errno` and nothing else, deliberately, so that no platform error-name set leaks
-/// into the safe core. The literal below is **zlib's own fallback** for exactly this situation --
-/// `gzguts.h` L135 defines `zstrerror()` as `"stdio error (consult errno)"` when `strerror` is not
-/// available -- so using it keeps the wording inside the reference implementation's own vocabulary
-/// rather than inventing a new one. A facade that wants the platform text may re-report through
-/// `gz_error` after the call returns.
-const IO_FAILURE: &[u8] = b"stdio error (consult errno)";
+/// `zstrerror()` is `strerror(errno)` (`gzguts.h` L131-L133), so the message a caller reads back from
+/// `gzerror` has to be the platform's own text for the number the failing call reported -- not a
+/// fixed string. `crate::gz::errno_message` produces exactly those bytes, from the `errno` the
+/// [`GzIoError`] carries when there is one and from the thread's current `errno` otherwise, which is
+/// the same distinction C makes between its two call sites.
+///
+/// Written as one helper rather than repeated at each of the six call sites so that the read path and
+/// the write path cannot drift apart in what they report; `crate::gz::read` renders through the same
+/// function.
+fn report_io_failure<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>, error: Option<GzIoError>) {
+    let message = errno_message(error);
+    gz_error(state, ReturnCode::ERRNO, Some(message.as_bytes()));
+}
 
 /// The guard that replaces C's unchecked read past a caller's buffer in `gzfwrite`.
 ///
 /// C computes `len = nitems * size` and hands `len` bytes at `buf` to `gz_write` without any way to
-/// know how long the caller's buffer really is. This port receives a slice, so a request longer
+/// know how long the caller's buffer really is. This implementation receives a slice, so a request longer
 /// than the slice is detectable, and is reported rather than read.
 const REQUEST_PAST_BUFFER: &[u8] = b"request does not fit in the supplied buffer";
 
-// -----------------------------------------------------------------------------
-//  Width bridges
-// -----------------------------------------------------------------------------
+/// The message for a [`GzHandle`] that claims to have written more than it was offered.
+///
+/// C cannot detect this: `write(2)` is trusted to honour its `count` argument and `gz_comp` advances
+/// `state->x.next` by the return value unchecked (`gzwrite.c` L122). This port hands the handle a
+/// *slice*, so a count larger than that slice is a broken implementation of the trait -- the bytes it
+/// claims to have written were never given to it. Clamping the number was the alternative and it
+/// hides the defect while leaving the stream's accounting wrong; refusing reports it as a
+/// `Z_STREAM_ERROR`, which is the right code because no operating-system error occurred.
+///
+/// `crate::gz::read` refuses the mirror-image over-report with the same reasoning, so a `GzHandle`
+/// implementation faces one rule in both directions -- stated on [`GzHandle::read`] and
+/// [`GzHandle::write`] themselves.
+const HANDLE_OVER_REPORTED: &[u8] = b"file handle reported more bytes than were requested";
 
 /// Widens a C `unsigned` count into a `usize` index.
 ///
-/// Every target this port supports has `usize` at least as wide as `c_uint`, so the conversion is
+/// Every target this implementation supports has `usize` at least as wide as `c_uint`, so the conversion is
 /// exact. Saturating rather than panicking on a hypothetical narrower target is the conservative
 /// choice: a saturated value can only make a bounds check stricter, never looser.
 fn to_index(value: c_uint) -> usize {
@@ -202,7 +204,7 @@ fn max_write_chunk() -> usize {
 ///
 /// `deflateReset` assigns `total_in`, `total_out`, `msg`, `data_type` and `adler` on the *caller's*
 /// `z_stream` (`deflate.c` L651-L671). C's `gz_state` embeds that `z_stream` outright
-/// (`gzguts.h` L202), so the assignments land in the state with nothing further to do. This port
+/// (`gzguts.h` L202), so the assignments land in the state with nothing further to do. This implementation
 /// splits the compression state from the caller-visible scalars, so [`crate::deflate::deflate_reset`]
 /// hands them back as a [`DeflateReset`] and they are stored here instead.
 ///
@@ -217,14 +219,10 @@ fn apply_reset<'a, A: Allocator<'a>>(strm: &mut GzStream<'a, A>, reset: DeflateR
     strm.adler = reset.adler;
 }
 
-// -----------------------------------------------------------------------------
-//  gz_init -- gzwrite.c L11-L57
-// -----------------------------------------------------------------------------
-
 /// Allocates the working buffers and the compression engine, and marks the state initialised.
 ///
 /// The port of `gz_init` (`gzwrite.c` L11-L57), which is `local` in C and is called lazily from
-/// [`gz_comp`], [`gz_write`] and `gzprintf` the first time a write stream needs a buffer. C's
+/// [`gz_comp`], `gz_write` and `gzprintf` the first time a write stream needs a buffer. C's
 /// header comment states the contract: "Mark initialization by setting `state->size` to non-zero."
 ///
 /// C's steps, in order:
@@ -292,7 +290,6 @@ pub(crate) fn gz_init<'a, A: Allocator<'a> + Copy>(
         // its own copy; the engine's blocks must come from the same allocator as the rest.
         let allocator = *state.allocator();
 
-        // L38-L43: `if (ret != Z_OK) { free(out); free(in); gz_error(Z_MEM_ERROR); return -1; }`.
         // The real code is discarded on purpose -- C reports `Z_MEM_ERROR` for a `Z_STREAM_ERROR`
         // from `deflateInit2` too, and a caller of `gzerror` sees that.
         let Ok(engine) = deflate_init2(config, allocator) else {
@@ -344,28 +341,15 @@ pub(crate) fn gz_init<'a, A: Allocator<'a> + Copy>(
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-//  gz_comp -- gzwrite.c L65-L148
-// -----------------------------------------------------------------------------
-
 /// Drains the staged output buffer to the file: the inner loop of `gz_comp` (`gzwrite.c` L110-L123).
-///
-/// ```c
-/// while (strm->next_out > state->x.next) {
-///     errno = 0;
-///     state->again = 0;
-///     put = strm->next_out - state->x.next > (int)max ? max
-///                                                     : (unsigned)(strm->next_out - state->x.next);
-///     writ = (int)write(state->fd, state->x.next, put);
-///     if (writ < 0) { ... return -1; }
-///     state->x.next += writ;
-/// }
-/// ```
 ///
 /// The pointer comparison becomes an index comparison between `strm.next_out`, where the engine has
 /// written to, and `GzState::out_pos`, how far the file has been given. A short write is normal
 /// rather than exceptional -- the loop exists for it -- so the cursor advances by exactly the count
-/// the handle reports.
+/// the handle reports, **once that count has been proved to be a count of bytes the handle was
+/// actually given**. C needs no such proof because `write(2)` cannot return more than `count`; here
+/// the file is an injected trait object and the count is untrusted input, so it is bounded by the
+/// length of the offered slice before any cursor moves. See [`WRITE_COUNT_TOO_LARGE`].
 ///
 /// # Errors
 ///
@@ -373,7 +357,9 @@ pub(crate) fn gz_init<'a, A: Allocator<'a> + Copy>(
 /// non-blocking `EAGAIN`/`EWOULDBLOCK` condition (L117-L118), so that `gz_error` leaves `x.have`
 /// alone for a stream that is merely stalled. Also [`ReturnCode::ERRNO`] when there is no file to
 /// write to or the staged range cannot be addressed, which C would reach only by dereferencing a
-/// null pointer, and [`ReturnCode::STREAM_ERROR`] if the flush cursor could not be advanced.
+/// null pointer; when the handle reports zero progress on a non-empty request; and when it reports
+/// having written **more** than it was offered. [`ReturnCode::STREAM_ERROR`] if the flush cursor
+/// could not be advanced.
 fn flush_out<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> Result<(), ReturnCode> {
     let max = max_write_chunk();
     while state.strm.next_out > state.out_pos() {
@@ -387,29 +373,45 @@ fn flush_out<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> Result<(), Ret
 
         // The staged bytes live in `state.output` and the file in `state.handle`. Borrowing the two
         // fields directly rather than through a method keeps the borrows disjoint, which is what
-        // lets both be held across the call.
+        // lets both be held across the call. `offered` is the exact length that went to the file,
+        // read back from the slice itself rather than recomputed, so the bound the reported count is
+        // checked against cannot disagree with the bytes that were actually presented.
+        let mut offered = 0_usize;
         let attempt = {
             let staged = state
                 .output
                 .as_ref()
                 .map(Buffer::as_slice)
                 .and_then(|slice| slice.get(begin..end));
-            let file = state.handle.as_deref_mut();
+            let file = state.handle.handle_mut();
             match (staged, file) {
-                (Some(chunk), Some(file)) => Some(file.write(chunk)),
+                (Some(chunk), Some(file)) => {
+                    offered = chunk.len();
+                    Some(file.write(chunk))
+                }
                 _ => None,
             }
         };
 
         let Some(result) = attempt else {
-            gz_error(state, ReturnCode::ERRNO, Some(IO_FAILURE));
+            // No error object: nothing was attempted, because the buffer or the handle was gone.
+            // C's bare `zstrerror()` reads the thread's current `errno`, and so does this.
+            report_io_failure(state, None);
             return Err(ReturnCode::ERRNO);
         };
 
         match result {
+            // A count larger than the chunk offered is impossible from a correct handle, so it is
+            // refused rather than clamped: nothing moves and the condition is reported. See
+            // [`HANDLE_OVER_REPORTED`]. The bound is `offered`, read back from the slice that
+            // actually reached the file, not the separately computed `put`.
+            Ok(written) if written > offered => {
+                gz_error(state, ReturnCode::STREAM_ERROR, Some(HANDLE_OVER_REPORTED));
+                return Err(ReturnCode::STREAM_ERROR);
+            }
             // `state->x.next += writ;` (L122)
             Ok(written) if written != 0 => {
-                let moved = begin.saturating_add(written).min(state.strm.next_out);
+                let moved = begin.saturating_add(written);
                 if state.set_output_window(moved, 0).is_err() {
                     gz_error(state, ReturnCode::STREAM_ERROR, Some(DEFLATE_CORRUPT));
                     return Err(ReturnCode::STREAM_ERROR);
@@ -420,7 +422,7 @@ fn flush_out<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> Result<(), Ret
             // the promise that this layer terminates. `GzHandle::write` documents a short write as
             // legal and zero as a contract violation.
             Ok(_) => {
-                gz_error(state, ReturnCode::ERRNO, Some(IO_FAILURE));
+                report_io_failure(state, None);
                 return Err(ReturnCode::ERRNO);
             }
             // L116-L121, including the `EAGAIN`/`EWOULDBLOCK` test that `GzIoError::would_block`
@@ -429,7 +431,7 @@ fn flush_out<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> Result<(), Ret
                 if error.would_block {
                     state.set_again(true);
                 }
-                gz_error(state, ReturnCode::ERRNO, Some(IO_FAILURE));
+                report_io_failure(state, Some(error));
                 return Err(ReturnCode::ERRNO);
             }
         }
@@ -438,22 +440,8 @@ fn flush_out<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> Result<(), Ret
 }
 
 /// Writes the pending input straight to the file, uncompressed: `gz_comp`'s transparent path
-/// (`gzwrite.c` L75-L91).
-///
-/// ```c
-/// if (state->direct) {
-///     while (strm->avail_in) {
-///         errno = 0;
-///         state->again = 0;
-///         put = strm->avail_in > max ? max : strm->avail_in;
-///         writ = (int)write(state->fd, strm->next_in, put);
-///         if (writ < 0) { ... return -1; }
-///         strm->avail_in -= (unsigned)writ;
-///         strm->next_in += writ;
-///     }
-///     return 0;
-/// }
-/// ```
+/// (`gzwrite.c` L75-L91): while input remains, hand the handle at most `max` bytes of it and
+/// advance by exactly the count reported, then return without touching the engine.
 ///
 /// `flush` is **ignored** on this path, exactly as C's header comment says: "If `gz->direct` is
 /// true, then simply write to the output file without compressing, and ignore flush." There is no
@@ -461,25 +449,31 @@ fn flush_out<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> Result<(), Ret
 /// `Z_NO_FLUSH`.
 ///
 /// `source` selects where `strm.next_in` indexes: `None` is the layer's own input buffer, and
-/// `Some(buffer)` is a caller's buffer that [`gz_write`] has pointed the stream at, which is C's
+/// `Some(buffer)` is a caller's buffer that `gz_write` has pointed the stream at, which is C's
 /// `state->strm.next_in = (z_const Bytef *)buf` (L234).
 ///
 /// # Errors
 ///
-/// [`ReturnCode::ERRNO`] on the same conditions [`flush_out`] reports it for.
+/// [`ReturnCode::ERRNO`] on the same conditions [`flush_out`] reports it for, including a handle
+/// that reports zero progress and one that reports having written more bytes than it was offered.
+/// The over-report check matters more here than there, because on the `Some(buffer)` path the bytes
+/// belong to the caller and the count feeds straight back into `gzwrite`'s return value.
 fn write_through<'a, A: Allocator<'a>>(
     state: &mut GzState<'a, A>,
     source: Option<&[u8]>,
 ) -> Result<(), ReturnCode> {
     let max = max_write_chunk();
     while state.strm.avail_in != 0 {
-        // L77-L78
         state.set_again(false);
 
         let begin = state.strm.next_in;
         let put = to_index(state.strm.avail_in).min(max);
         let end = begin.saturating_add(put);
 
+        // `offered` is read back from the slice that actually went to the file, for the reason
+        // `flush_out` records: the reported count is untrusted data and must be checked against the
+        // exact bytes presented, not against a separately recomputed length.
+        let mut offered = 0_usize;
         let attempt = {
             let pending = match source {
                 Some(buffer) => buffer.get(begin..end),
@@ -489,19 +483,30 @@ fn write_through<'a, A: Allocator<'a>>(
                     .map(Buffer::as_slice)
                     .and_then(|slice| slice.get(begin..end)),
             };
-            let file = state.handle.as_deref_mut();
+            let file = state.handle.handle_mut();
             match (pending, file) {
-                (Some(chunk), Some(file)) => Some(file.write(chunk)),
+                (Some(chunk), Some(file)) => {
+                    offered = chunk.len();
+                    Some(file.write(chunk))
+                }
                 _ => None,
             }
         };
 
         let Some(result) = attempt else {
-            gz_error(state, ReturnCode::ERRNO, Some(IO_FAILURE));
+            // No error object: nothing was attempted, because the buffer or the handle was gone.
+            // C's bare `zstrerror()` reads the thread's current `errno`, and so does this.
+            report_io_failure(state, None);
             return Err(ReturnCode::ERRNO);
         };
 
         match result {
+            // As in `flush_out`: an over-report is refused, not clamped, and checked against
+            // `offered` before the progress arm so that neither cursor moves.
+            Ok(written) if written > offered => {
+                gz_error(state, ReturnCode::STREAM_ERROR, Some(HANDLE_OVER_REPORTED));
+                return Err(ReturnCode::STREAM_ERROR);
+            }
             // L87-L88
             Ok(written) if written != 0 => {
                 state.strm.avail_in = state.strm.avail_in.saturating_sub(to_count(written));
@@ -509,15 +514,14 @@ fn write_through<'a, A: Allocator<'a>>(
             }
             // See the matching arm of `flush_out` for why zero progress is an error here.
             Ok(_) => {
-                gz_error(state, ReturnCode::ERRNO, Some(IO_FAILURE));
+                report_io_failure(state, None);
                 return Err(ReturnCode::ERRNO);
             }
-            // L81-L86
             Err(error) => {
                 if error.would_block {
                     state.set_again(true);
                 }
-                gz_error(state, ReturnCode::ERRNO, Some(IO_FAILURE));
+                report_io_failure(state, Some(error));
                 return Err(ReturnCode::ERRNO);
             }
         }
@@ -527,9 +531,9 @@ fn write_through<'a, A: Allocator<'a>>(
 
 /// One `deflate()` call, with the `z_stream` view rebuilt around the layer's own cursors.
 ///
-/// The port of `ret = deflate(strm, flush);` (`gzwrite.c` L133). C hands the compressor the address
+/// Implements `ret = deflate(strm, flush);` (`gzwrite.c` L133). C hands the compressor the address
 /// of the `z_stream` embedded in `gz_state`, so the cursors and the five scalars are already where
-/// `deflate` expects them. This port keeps the compression state and the caller-visible scalars
+/// `deflate` expects them. This implementation keeps the compression state and the caller-visible scalars
 /// apart, so the view is assembled here, handed over, and read back.
 ///
 /// Both windows are the **whole** buffer truncated to the end of the valid region, never re-sliced
@@ -631,7 +635,7 @@ fn deflate_once<'a, A: Allocator<'a>>(
 
 /// `deflateReset(strm)` on the installed compressor, plus the scalar half of the reset.
 ///
-/// The port of `gzwrite.c` L99, split out only so that the engine borrow ends before the scalars are
+/// Implements `gzwrite.c` L99, split out only so that the engine borrow ends before the scalars are
 /// written back.
 ///
 /// # Errors
@@ -652,7 +656,7 @@ fn reset_engine<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> Result<(), 
 
 /// Compresses whatever is at the input cursor and writes it to the file.
 ///
-/// The port of `gz_comp` (`gzwrite.c` L65-L148), `local` in C. `source` selects where
+/// Implements `gz_comp` (`gzwrite.c` L65-L148), `local` in C. `source` selects where
 /// `strm.next_in` indexes; [`gz_comp`] is the buffered form and is the one every other module calls.
 ///
 /// # Errors
@@ -751,7 +755,7 @@ fn gz_comp_source<'a, A: Allocator<'a> + Copy>(
 /// Compresses whatever is buffered at the input cursor and writes it to the file.
 ///
 /// The port of `gz_comp` (`gzwrite.c` L65-L148) over the layer's own input buffer, which is every
-/// caller except [`gz_write`]'s large-input path. C's header comment is the specification:
+/// caller except `gz_write`'s large-input path. C's header comment is the specification:
 ///
 /// > Compress whatever is at `avail_in` and `next_in` and write to the output file. Return -1 if
 /// > there is an error writing to the output file or if `gz_init()` fails to allocate memory,
@@ -765,7 +769,7 @@ fn gz_comp_source<'a, A: Allocator<'a> + Copy>(
 ///
 /// # Errors
 ///
-/// * [`ReturnCode::MEM_ERROR`] if the first call has to allocate and cannot ([`gz_init`]).
+/// * [`ReturnCode::MEM_ERROR`] if the first call has to allocate and cannot (`gz_init`).
 /// * [`ReturnCode::ERRNO`] if a write to the file failed. `GzState::again` distinguishes a
 ///   non-blocking stall, which callers use to decide whether a partial count may be reported.
 /// * [`ReturnCode::STREAM_ERROR`] if the compressor reported `Z_STREAM_ERROR`.
@@ -780,18 +784,9 @@ pub(crate) fn gz_comp<'a, A: Allocator<'a> + Copy>(
     gz_comp_source(state, flush, None)
 }
 
-// -----------------------------------------------------------------------------
-//  gz_zero -- gzwrite.c L154-L182
-// -----------------------------------------------------------------------------
-
 /// Compresses `GzState::skip` zero bytes, satisfying a forward seek on a write stream.
 ///
-/// The port of `gz_zero` (`gzwrite.c` L154-L182), `local` in C. Its header comment states the part
-/// callers depend on:
-///
-/// > Compress `state->skip` (> 0) zeros to output. Return -1 on a write error or memory allocation
-/// > failure by `gz_comp()`, or 0 on success. `state->skip` is updated with the number of
-/// > successfully written zeros, in case there is a stall on a non-blocking write destination.
+/// Implements `gz_zero` (`gzwrite.c` L154-L182), `local` in C.
 ///
 /// A forward `gzseek` on a write stream does not move a file pointer; it records the distance in
 /// `skip` (`gzlib.c` L432) and the next write operation pays for it by compressing that many zero
@@ -802,7 +797,11 @@ pub(crate) fn gz_comp<'a, A: Allocator<'a> + Copy>(
 /// sits after the three updates at L175-L177), so a stalled non-blocking destination leaves `skip`
 /// holding only what is still owed and the operation can be retried.
 ///
-/// # Two divergences, both forced by memory safety
+/// # Two behaviour divergences -- divergence 7 of the `gz/open.rs` inventory
+///
+/// Both are FORCED and remain UNRESOLVED with respect to exact behaviour preservation. Neither is
+/// claimed as an improvement, even though each avoids a defect in the reference implementation:
+/// matching C exactly here would mean compressing uninitialised heap memory.
 ///
 /// 1. **The buffers are allocated up front.** C allocates them lazily from inside the loop's first
 ///    `gz_comp` call. That is reachable: `gzseek` arms `skip` without allocating anything
@@ -821,11 +820,13 @@ pub(crate) fn gz_comp<'a, A: Allocator<'a> + Copy>(
 ///
 /// Neither divergence changes a byte for any stream C already handled correctly: when `size` is
 /// already non-zero, the first iteration's chunk is `min(skip, size)`, which is non-zero because
-/// `skip` is, and the two implementations agree step for step.
+/// `skip` is, and the two implementations agree step for step. The residue -- the case where C
+/// compresses uninitialised memory -- is where the outputs differ, and no claim of equivalence is
+/// made for it.
 ///
 /// # Errors
 ///
-/// * [`ReturnCode::MEM_ERROR`] if the buffers cannot be allocated ([`gz_init`]).
+/// * [`ReturnCode::MEM_ERROR`] if the buffers cannot be allocated (`gz_init`).
 /// * [`ReturnCode::ERRNO`] if a write failed; `GzState::again` reports a non-blocking stall.
 /// * [`ReturnCode::STREAM_ERROR`] if the compressor reported `Z_STREAM_ERROR`, or accepted a
 ///   non-empty input and then reported success without consuming any of it. The latter cannot
@@ -869,7 +870,6 @@ pub(crate) fn gz_zero<'a, A: Allocator<'a> + Copy>(
             first = false;
         }
 
-        // L172-L174
         state.strm.avail_in = chunk;
         state.strm.next_in = 0;
         let outcome = gz_comp(state, Flush::NoFlush);
@@ -879,7 +879,6 @@ pub(crate) fn gz_zero<'a, A: Allocator<'a> + Copy>(
         state.add_pos(to_offset(consumed));
         state.set_skip(state.skip().saturating_sub(to_offset(consumed)));
 
-        // L178-L179
         outcome?;
 
         // The termination guarantee C leaves implicit. A non-empty chunk that the compressor
@@ -896,18 +895,11 @@ pub(crate) fn gz_zero<'a, A: Allocator<'a> + Copy>(
     }
 }
 
-// -----------------------------------------------------------------------------
-//  gz_write -- gzwrite.c L188-L252
-// -----------------------------------------------------------------------------
-
 /// Compresses `buf` and writes it to the file, returning how many of its bytes were accepted.
 ///
-/// The port of `gz_write` (`gzwrite.c` L188-L252), `local` in C. Its header comment is the contract
-/// every public entry point below inherits:
-///
-/// > Write `len` bytes from `buf` to file. Return the number of bytes written. If the returned value
-/// > is less than `len`, then there was an error. If the error was a non-blocking stall, then the
-/// > number of bytes consumed is returned. For any other error, 0 is returned.
+/// Implements `gz_write` (`gzwrite.c` L188-L252), `local` in C. Its contract is the one every
+/// public entry point below inherits: the count returned is how many of `buf`'s bytes were accepted,
+/// a short count means an error, and a short *non-zero* count means a non-blocking stall.
 ///
 /// So a short return is **never** a partial success in the ordinary sense: it means an error
 /// occurred, and a *non-zero* short return additionally means the error was a stall and that many
@@ -921,11 +913,15 @@ pub(crate) fn gz_zero<'a, A: Allocator<'a> + Copy>(
 /// | otherwise | L228-L248 | drain the buffer, then point the compressor straight at `buf` |
 ///
 /// The second path is where C writes `state->strm.next_in = (z_const Bytef *)buf` (L234), moving the
-/// stream's input cursor out of the layer's own buffer and into the caller's. This port expresses
+/// stream's input cursor out of the layer's own buffer and into the caller's. This implementation expresses
 /// that by keeping the cursor as an index and changing which base it indexes, which is what
 /// `gz_comp_source`'s `source` argument selects.
 ///
-/// # A divergence forced by memory safety
+/// # A behaviour divergence -- divergence 8 of the `gz/open.rs` inventory
+///
+/// FORCED, and UNRESOLVED with respect to exact behaviour preservation. It is not an improvement:
+/// it is a difference this port cannot avoid, because matching C would mean reproducing an
+/// out-of-bounds write.
 ///
 /// C leaves `strm->next_in` pointing into the caller's buffer when the direct path ends. On the
 /// ordinary path `avail_in` is zero by then and the next call resets the cursor
@@ -934,7 +930,7 @@ pub(crate) fn gz_zero<'a, A: Allocator<'a> + Copy>(
 /// small `len` computes `have = (next_in + avail_in) - state->in` from a pointer into unrelated
 /// memory, derives `copy = state->size - have` from it -- an unsigned subtraction that underflows --
 /// and `memcpy`s into `state->in + have`. That is an out-of-bounds write, so it cannot be
-/// reproduced. This port instead clears both cursors when the direct path ends: nothing is lost,
+/// reproduced. This implementation instead clears both cursors when the direct path ends: nothing is lost,
 /// because the count returned already tells the caller exactly how many bytes were accepted, and
 /// the caller re-supplies the rest.
 ///
@@ -945,12 +941,10 @@ pub(crate) fn gz_write<'a, A: Allocator<'a> + Copy>(
 ) -> usize {
     let put = buf.len();
 
-    // L192-L194
     if put == 0 {
         return 0;
     }
 
-    // L196-L198
     if state.size() == 0 && gz_init(state).is_err() {
         return 0;
     }
@@ -967,7 +961,6 @@ pub(crate) fn gz_write<'a, A: Allocator<'a> + Copy>(
         // L205-L227: the buffered path.
         let mut taken = 0_usize;
         loop {
-            // L210-L211
             if state.strm.avail_in == 0 {
                 state.strm.next_in = 0;
             }
@@ -1005,18 +998,15 @@ pub(crate) fn gz_write<'a, A: Allocator<'a> + Copy>(
                 return 0;
             }
 
-            // L218-L221
             state.strm.avail_in = state.strm.avail_in.saturating_add(to_count(copy));
             state.add_pos(to_offset(copy));
             taken = source_end;
             len = len.saturating_sub(copy);
 
-            // L222-L223
             if len == 0 {
                 break;
             }
 
-            // L224-L225
             if gz_comp(state, Flush::NoFlush).is_err() {
                 return if state.again() {
                     put.saturating_sub(len)
@@ -1035,7 +1025,6 @@ pub(crate) fn gz_write<'a, A: Allocator<'a> + Copy>(
         // L234: `state->strm.next_in = (z_const Bytef *)buf;` -- the cursor now indexes `buf`.
         state.strm.next_in = 0;
 
-        // L235-L247
         let completed = loop {
             // L236-L240: one `unsigned`'s worth at a time, because `avail_in` is an `unsigned`.
             let chunk = to_index(c_uint::MAX).min(len);
@@ -1078,24 +1067,13 @@ pub(crate) fn gz_write<'a, A: Allocator<'a> + Copy>(
     put
 }
 
-// -----------------------------------------------------------------------------
-//  gz_vacate -- gzwrite.c L382-L396
-// -----------------------------------------------------------------------------
-
 /// Makes the second half of the input buffer available again, for `gzprintf`'s benefit.
 ///
-/// The port of `gz_vacate` (`gzwrite.c` L382-L396), `local` in C and wrapped there in the
+/// Implements `gz_vacate` (`gzwrite.c` L382-L396), `local` in C and wrapped there in the
 /// `NO_vsnprintf`/`NO_snprintf` preprocessor condition at L374-L376 because `gzprintf` is its only
-/// caller and `gzprintf` itself disappears under those macros. This port has no such condition --
+/// caller and `gzprintf` itself disappears under those macros. This implementation has no such condition --
 /// `printf.rs` is always compiled -- so the function is unconditionally available and `pub(crate)`
 /// so that `printf.rs` can reach it.
-///
-/// C's header comment:
-///
-/// > If the second half of the input buffer is occupied, write out the contents. If there is any
-/// > input remaining due to a non-blocking stall on write, move it to the start of the buffer. Return
-/// > true if this did not open up the second half of the buffer. `state->err` should be checked after
-/// > this to handle a `gz_comp()` error.
 ///
 /// The return value is therefore an occupancy report, not a status: `false` means the second half is
 /// free. `gz_comp`'s own result is deliberately discarded, exactly as C's `(void)gz_comp(...)`
@@ -1118,7 +1096,6 @@ pub(crate) fn gz_write<'a, A: Allocator<'a> + Copy>(
 pub(crate) fn gz_vacate<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>) -> bool {
     let size = to_index(state.size());
 
-    // L386-L387: `if (strm->next_in + strm->avail_in <= state->in + state->size) return 0;`
     let occupied = state
         .strm
         .next_in
@@ -1130,7 +1107,6 @@ pub(crate) fn gz_vacate<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>)
     // L388: the result is the caller's to read off `state.err`.
     let _ = gz_comp(state, Flush::NoFlush);
 
-    // L389-L392
     if state.strm.avail_in == 0 {
         state.strm.next_in = 0;
         return false;
@@ -1147,13 +1123,8 @@ pub(crate) fn gz_vacate<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>)
     }
     state.strm.next_in = 0;
 
-    // L395: `return strm->avail_in > state->size;`
     to_index(state.strm.avail_in) > size
 }
-
-// -----------------------------------------------------------------------------
-//  The public entry points
-// -----------------------------------------------------------------------------
 
 /// The entry guard every public write entry point shares (`gzwrite.c` L263-L266).
 ///
@@ -1195,13 +1166,7 @@ fn enter_write<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> bool {
 
 /// Compresses `buf` and writes it to the file.
 ///
-/// The port of `gzwrite` (`gzwrite.c` L255-L277), declared at `zlib.h` L1519 and documented at
-/// L1521-L1527:
-///
-/// > Compress and write the `len` uncompressed bytes at `buf` to file. `gzwrite` returns the number
-/// > of uncompressed bytes written, or 0 in case of error or if `len` is 0. If the write destination
-/// > is non-blocking, then `gzwrite()` may return a number of bytes written that is not 0 and less
-/// > than `len`. If `len` does not fit in an `int`, then 0 is returned and nothing is written.
+/// Implements `gzwrite` (`gzwrite.c` L255-L277), declared at `zlib.h` L1519.
 ///
 /// ★ The length rejection records **`Z_DATA_ERROR`** (L271), not the `Z_STREAM_ERROR` that `gzread`
 /// records for the same condition on its side (`gzread.c` L414). Both codes are visible to a caller
@@ -1213,19 +1178,16 @@ fn enter_write<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> bool {
 ///
 /// Returns the number of bytes written as C's `int`, so the facade forwards it unchanged.
 pub fn gzwrite<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, buf: &[u8]) -> i32 {
-    // L258-L266
     if !enter_write(state) {
         return 0;
     }
 
-    // L268-L273
     if i32::try_from(buf.len()).is_err() {
         gz_error(state, ReturnCode::DATA_ERROR, Some(LENGTH_NOT_INT));
         state.refresh_exposed();
         return 0;
     }
 
-    // L275-L276
     let written = gz_write(state, buf);
     state.refresh_exposed();
 
@@ -1235,8 +1197,7 @@ pub fn gzwrite<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, buf: &[u
 
 /// Compresses `nitems` items of `size` bytes each and writes them to the file.
 ///
-/// The port of `gzfwrite` (`gzwrite.c` L280-L304), declared at `zlib.h` L1529 and documented at
-/// L1531-L1545. It duplicates `fwrite`'s interface, so the count it returns is in **items**, not
+/// Implements `gzfwrite` (`gzwrite.c` L280-L304), declared at `zlib.h` L1529. It duplicates `fwrite`'s interface, so the count it returns is in **items**, not
 /// bytes: `gz_write(...) / size`, and zero when the product is zero (L303).
 ///
 /// The overflow test is C's, `size && len / size != nitems` (L297), expressed as a checked
@@ -1246,7 +1207,7 @@ pub fn gzwrite<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, buf: &[u
 ///
 /// `buf` must be at least `size * nitems` bytes long. C has no way to check that -- it receives a
 /// bare pointer -- so a shorter slice is a facade defect; it is reported as `Z_STREAM_ERROR` rather
-/// than read past, which is the one thing C would do here that a safe port must not.
+/// than read past, which is the one thing C would do here that a safe implementation must not.
 ///
 /// `zlib.h` L1543-L1545 warns that a partial item can be written on a non-blocking or concurrently
 /// read file with `size != 1`, with no way to learn how much of it was lost. That is a property of
@@ -1257,12 +1218,10 @@ pub fn gzfwrite<'a, A: Allocator<'a> + Copy>(
     size: usize,
     nitems: usize,
 ) -> usize {
-    // L285-L293
     if !enter_write(state) {
         return 0;
     }
 
-    // L295-L300
     let Some(len) = nitems.checked_mul(size) else {
         gz_error(state, ReturnCode::STREAM_ERROR, Some(REQUEST_NOT_SIZE_T));
         state.refresh_exposed();
@@ -1291,21 +1250,20 @@ pub fn gzfwrite<'a, A: Allocator<'a> + Copy>(
 
 /// Compresses one byte and writes it to the file.
 ///
-/// The port of `gzputc` (`gzwrite.c` L307-L347), declared at `zlib.h` L1607: "Compress and write
+/// Implements `gzputc` (`gzwrite.c` L307-L347), declared at `zlib.h` L1607: "Compress and write
 /// `c`, converted to an `unsigned char`, into file. `gzputc` returns the value that was written, or
 /// -1 in case of error."
 ///
 /// The fast path (L328-L340) writes straight into the input buffer without touching the compressor,
 /// which is what makes a byte-at-a-time writer usable. It applies only when the buffer exists --
-/// `state->size` is zero until [`gz_init`] has run -- and only while the first `size` bytes have room;
-/// otherwise the byte goes through a one-byte [`gz_write`], which allocates and compresses as needed.
+/// `state->size` is zero until `gz_init` has run -- and only while the first `size` bytes have room;
+/// otherwise the byte goes through a one-byte `gz_write`, which allocates and compresses as needed.
 ///
 /// ★ The `c & 0xff` masking appears on **both** return paths (L338 and L346) and is reproduced on
 /// both: `gzputc(file, -1)` returns 255, not -1, because -1 is a perfectly good byte and -1 is also
 /// the error code. Returning `c` unmasked would make a written `0xff` indistinguishable from a
 /// failure.
 pub fn gzputc<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, c: i32) -> i32 {
-    // L313-L322
     if !enter_write(state) {
         return -1;
     }
@@ -1323,7 +1281,6 @@ pub fn gzputc<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, c: i32) -
     let masked = c & 0xff;
     let byte = u8::try_from(masked).unwrap_or(0);
 
-    // L328-L340
     if state.size() != 0 {
         if state.strm.avail_in == 0 {
             state.strm.next_in = 0;
@@ -1360,7 +1317,7 @@ pub fn gzputc<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, c: i32) -
 
 /// Compresses a string and writes it to the file, excluding any terminating NUL.
 ///
-/// The port of `gzputs` (`gzwrite.c` L350-L372), declared at `zlib.h` L1575 and documented at
+/// Implements `gzputs` (`gzwrite.c` L350-L372), declared at `zlib.h` L1575 and documented at
 /// L1577-L1584: it returns the number of characters written, or -1 on error, and the count "may be
 /// less than the length of the string if the write destination is non-blocking".
 ///
@@ -1375,12 +1332,10 @@ pub fn gzputc<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, c: i32) -
 /// A non-empty string that produced nothing is an error, so `-1` is returned rather than `0`
 /// (L371) -- otherwise a caller could not tell a failure from a legitimately empty write.
 pub fn gzputs<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, s: &[u8]) -> i32 {
-    // L354-L362
     if !enter_write(state) {
         return -1;
     }
 
-    // L365-L369
     let len = s.len();
     if i32::try_from(len).is_err() || c_uint::try_from(len).is_err() {
         gz_error(state, ReturnCode::STREAM_ERROR, Some(STRING_NOT_INT));
@@ -1388,7 +1343,6 @@ pub fn gzputs<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, s: &[u8])
         return -1;
     }
 
-    // L370-L371
     let put = gz_write(state, s);
     state.refresh_exposed();
     if len != 0 && put == 0 {
@@ -1401,16 +1355,7 @@ pub fn gzputs<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, s: &[u8])
 
 /// Flushes all pending output to the file with the requested `deflate` flush mode.
 ///
-/// The port of `gzflush` (`gzwrite.c` L603-L627), declared at `zlib.h` L1647 and documented at
-/// L1649-L1660:
-///
-/// > Flush all pending output to file. The parameter `flush` is as in the `deflate()` function. The
-/// > return value is the zlib error number (see function `gzerror` below). `gzflush` is only
-/// > permitted when writing. If the `flush` parameter is `Z_FINISH`, the remaining data is written
-/// > and the gzip stream is completed in the output. If `gzwrite()` is called again, a new gzip
-/// > stream will be started in the output. `gzread()` is able to read such concatenated gzip
-/// > streams. `gzflush` should be called only when strictly necessary because it will degrade
-/// > compression if called too often.
+/// Implements `gzflush` (`gzwrite.c` L603-L627), declared at `zlib.h` L1647.
 ///
 /// ★ The accepted range is `Z_NO_FLUSH ..= Z_FINISH` (L617), which is **narrower than `deflate`'s**:
 /// `Z_BLOCK` and `Z_TREES` are rejected with `Z_STREAM_ERROR` even though `deflate` itself accepts
@@ -1427,7 +1372,6 @@ pub fn gzputs<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, s: &[u8])
 /// Returns `GzState::err` -- the recorded error number, exactly as C does at L626, so
 /// `gz_comp`'s own result is discarded.
 pub fn gzflush<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, flush: i32) -> i32 {
-    // L606-L614
     if !enter_write(state) {
         return ReturnCode::STREAM_ERROR.as_i32();
     }
@@ -1446,13 +1390,11 @@ pub fn gzflush<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, flush: i
         return ReturnCode::STREAM_ERROR.as_i32();
     };
 
-    // L620-L622
     if state.skip() != 0 && gz_zero(state).is_err() {
         state.refresh_exposed();
         return state.err();
     }
 
-    // L624-L626
     let _ = gz_comp(state, mode);
     state.refresh_exposed();
     state.err()
@@ -1460,7 +1402,7 @@ pub fn gzflush<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, flush: i
 
 /// Finishes the gzip stream, releases everything the state owns and closes the file.
 ///
-/// The port of `gzclose_w` (`gzwrite.c` L667-L700), declared at `zlib.h` L1759 and specified through
+/// Implements `gzclose_w` (`gzwrite.c` L667-L700), declared at `zlib.h` L1759 and specified through
 /// `gzclose` at L1751-L1757: it flushes, closes, and deallocates, returning `Z_STREAM_ERROR` for an
 /// invalid file, `Z_ERRNO` for a file-operation error, or `Z_OK`.
 ///
@@ -1485,11 +1427,11 @@ pub fn gzflush<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, flush: i
 ///
 /// C frees the structure at L698, so touching the `gzFile` again is undefined behaviour; `zlib.h`
 /// L1754-L1755 says as much ("`gzclose` must not be called more than once on the same file, just as
-/// `free` must not be called more than once on the same allocation"). This port cannot free the
+/// `free` must not be called more than once on the same allocation"). This implementation cannot free the
 /// structure -- the facade owns it -- so it leaves it in a state that refuses further work instead:
 ///
 /// * `size` goes back to zero, which it must: the buffers are gone, and `size` is the marker that
-///   says whether they exist. Leaving it set would make the next `gz_comp` skip [`gz_init`] and then
+///   says whether they exist. Leaving it set would make the next `gz_comp` skip `gz_init` and then
 ///   fail to find a buffer.
 /// * `mode` goes to [`GZ_NONE`], so a subsequent [`gzwrite`] returns 0 and a subsequent [`gzflush`]
 ///   or `gzclose_w` returns `Z_STREAM_ERROR` rather than quietly re-running the teardown.
@@ -1506,12 +1448,10 @@ pub fn gzclose_w<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>) -> i32
         return ReturnCode::STREAM_ERROR.as_i32();
     }
 
-    // L680-L682
     if state.skip() != 0 && gz_zero(state).is_err() {
         ret = state.err();
     }
 
-    // L684-L686
     if gz_comp(state, Flush::Finish).is_err() {
         ret = state.err();
     }
@@ -1530,17 +1470,14 @@ pub fn gzclose_w<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>) -> i32
         state.release_buffers();
     }
 
-    // L694
     gz_error(state, ReturnCode::OK, None);
 
-    // L695: `free(state->path)`.
     state.path = Vec::new();
 
-    // L696-L697
-    if let Some(mut file) = state.take_handle() {
-        if file.close().is_err() {
-            ret = ReturnCode::ERRNO.as_i32();
-        }
+    // L696-L697. `GzFileSlot::close` reports the handle's own result, so a facade handle backed
+    // by a real `close(2)` answers `Z_ERRNO` exactly when C does.
+    if state.take_handle().close().is_err() {
+        ret = ReturnCode::ERRNO.as_i32();
     }
 
     // The divergences; see this function's documentation.
@@ -1549,10 +1486,6 @@ pub fn gzclose_w<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>) -> i32
     state.refresh_exposed();
     ret
 }
-
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1573,7 +1506,8 @@ mod tests {
     use crate::deflate::Flush;
     use crate::error::ReturnCode;
     use crate::gz::state::{
-        GzHandle, GzIoError, GzSeekFrom, GzState, ZOff64, GZBUFSIZE, GZ_NONE, GZ_READ, GZ_WRITE,
+        GzFileSlot, GzHandle, GzIoError, GzSeekFrom, GzState, ZOff64, GZBUFSIZE, GZ_NONE, GZ_READ,
+        GZ_WRITE,
     };
     use crate::inflate::{inflate, inflate_init2, inflate_reset, InflateStream};
     use alloc::boxed::Box;
@@ -1631,7 +1565,7 @@ mod tests {
 
     /// A file that refuses every write with the non-blocking stall condition.
     ///
-    /// `GzIoError::would_block` is this port's spelling of `errno == EAGAIN || errno == EWOULDBLOCK`
+    /// `GzIoError::would_block` is this implementation's spelling of `errno == EAGAIN || errno == EWOULDBLOCK`
     /// (`gzwrite.c` L82 and L117), so this drives the `state->again` paths.
     struct StalledFile;
 
@@ -1642,6 +1576,43 @@ mod tests {
 
         fn write(&mut self, _buf: &[u8]) -> Result<usize, GzIoError> {
             Err(GzIoError::new(11, true))
+        }
+
+        fn seek(&mut self, offset: ZOff64, _whence: GzSeekFrom) -> Result<ZOff64, GzIoError> {
+            Ok(offset)
+        }
+
+        fn set_nonblocking(&mut self, _nonblocking: bool) -> Result<(), GzIoError> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), GzIoError> {
+            Ok(())
+        }
+    }
+
+    /// A [`GzHandle`] that claims to have written more bytes than it was given.
+    ///
+    /// `write(2)` cannot behave this way, so C never has to defend against it; an injected
+    /// trait object can, and believing it would advance the layer's cursor past bytes the file
+    /// never received. Not reachable through any real file; it exists because the trait's
+    /// contract has to be enforceable and enforcement has to be tested. See
+    /// `HANDLE_OVER_REPORTED`.
+    struct OverReportingFile {
+        /// Everything it was genuinely given, so a test can prove the bytes were not lost.
+        sink: Rc<RefCell<Vec<u8>>>,
+        /// How much to add to the honest count. `1` is the minimal violation.
+        excess: usize,
+    }
+
+    impl GzHandle for OverReportingFile {
+        fn read(&mut self, _buf: &mut [u8]) -> Result<usize, GzIoError> {
+            Ok(0)
+        }
+
+        fn write(&mut self, buf: &[u8]) -> Result<usize, GzIoError> {
+            self.sink.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len().saturating_add(self.excess))
         }
 
         fn seek(&mut self, offset: ZOff64, _whence: GzSeekFrom) -> Result<ZOff64, GzIoError> {
@@ -1678,12 +1649,12 @@ mod tests {
         state.set_level(level);
         state.set_strategy(Z_DEFAULT_STRATEGY);
         state.set_direct(direct);
-        let previous = state.set_handle(Some(Box::new(MemoryFile {
+        let previous = state.set_handle(GzFileSlot::Boxed(Box::new(MemoryFile {
             sink: Rc::clone(&sink),
             accept,
             closes: Rc::clone(&closes),
         })));
-        assert!(previous.is_none());
+        assert!(!previous.is_installed(), "the slot was empty before");
         Fixture {
             state,
             sink,
@@ -1700,7 +1671,7 @@ mod tests {
     ///
     /// `gz/read.rs` is the module that will do this for real; until it exists, the decoder is driven
     /// directly, which is a stronger check anyway: it proves the bytes are a well-formed RFC 1952
-    /// stream rather than merely something this port's own reader happens to accept. Each member
+    /// stream rather than merely something this implementation's own reader happens to accept. Each member
     /// ends with `Z_STREAM_END`, after which `inflate_reset` starts the next one -- which is exactly
     /// what `zlib.h` L1654-L1657 promises about a `gzflush(Z_FINISH)` followed by more writes.
     fn gunzip(bytes: &[u8]) -> Vec<u8> {
@@ -2052,7 +2023,7 @@ mod tests {
     fn a_seek_armed_before_any_buffer_exists_still_emits_zeros() {
         // The path that exposes C's defect: `gzseek` then `gzputc` reaches `gz_zero` with
         // `state->size == 0`, and C consumes its `first` flag on a zero-length pass, so the zeros
-        // are never written and uninitialised `malloc` memory is compressed instead. This port
+        // are never written and uninitialised `malloc` memory is compressed instead. This implementation
         // allocates first, so the bytes are genuinely zero.
         let mut fixture = fixture(32, 6, 0, None);
         assert_eq!(fixture.state.size(), 0, "no buffer yet");
@@ -2101,7 +2072,6 @@ mod tests {
 
     #[test]
     fn a_read_stream_is_refused_by_every_write_entry_point() {
-        // `gzwrite.c` L264: `state->mode != GZ_WRITE`.
         let mut fixture = plain();
         fixture.state.set_mode(GZ_READ);
         assert_eq!(gzwrite(&mut fixture.state, b"x"), 0);
@@ -2117,6 +2087,75 @@ mod tests {
             ReturnCode::STREAM_ERROR.as_i32()
         );
         assert!(fixture.sink.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_transparent_stream_rejects_an_over_reported_write_count() {
+        // `write_through` (`gzwrite.c` L75-L91) consumes input by the count the file reports. An
+        // over-reported count would consume bytes the file never received, so it is refused rather
+        // than clamped and reported as `Z_STREAM_ERROR`: no operating-system error occurred, and the
+        // read side refuses its mirror image with the same code.
+        //
+        // The payload is longer than the buffer on purpose: that takes `gz_write`'s large-request
+        // shortcut (`gzwrite.c` L228-L240), which points the stream straight at the caller's buffer,
+        // so the over-reported count would be handed back to the caller as bytes written.
+        let mut fixture = fixture(16, 6, 1, None);
+        let sink = Rc::new(RefCell::new(Vec::new()));
+        let previous = fixture
+            .state
+            .set_handle(GzFileSlot::Boxed(Box::new(OverReportingFile {
+                sink: Rc::clone(&sink),
+                excess: 1,
+            })));
+        assert!(previous.is_installed());
+
+        let payload = b"a payload comfortably longer than the sixteen-byte buffer";
+        assert_eq!(gz_write(&mut fixture.state, payload), 0);
+        assert_eq!(fixture.state.err(), ReturnCode::STREAM_ERROR.as_i32());
+        assert!(!fixture.state.again(), "this is not a stall");
+        // The honest bytes did reach the file; what was refused is the claim about how many. The
+        // first chunk is `max_write_chunk()`-bounded, so at least something was offered and kept.
+        assert!(!sink.borrow().is_empty());
+        assert!(payload.starts_with(sink.borrow().as_slice()));
+    }
+
+    #[test]
+    fn a_compressing_stream_rejects_an_over_reported_write_count() {
+        // The same defence on `flush_out`'s side of `gz_comp` (`gzwrite.c` L110-L123), where the
+        // over-reported count would advance the flush cursor past staged deflate output and silently
+        // truncate the member.
+        let mut fixture = plain();
+        let sink = Rc::new(RefCell::new(Vec::new()));
+        let previous = fixture
+            .state
+            .set_handle(GzFileSlot::Boxed(Box::new(OverReportingFile {
+                sink: Rc::clone(&sink),
+                excess: 4,
+            })));
+        assert!(previous.is_installed());
+
+        assert_eq!(gz_write(&mut fixture.state, b"hello, hello!"), 13);
+        // Nothing has reached the file yet: the buffer is nowhere near full.
+        assert!(sink.borrow().is_empty());
+        // The flush is what drives `flush_out`, and it must report the violation.
+        assert_eq!(
+            gzflush(&mut fixture.state, Z_FINISH),
+            ReturnCode::STREAM_ERROR.as_i32()
+        );
+        assert_eq!(fixture.state.err(), ReturnCode::STREAM_ERROR.as_i32());
+        assert!(!fixture.state.again());
+    }
+
+    #[test]
+    fn an_honest_short_write_is_still_accepted() {
+        // The complement of the two tests above: `written < offered` is legal and normal, and the
+        // guard must not have turned it into an error. `accept: Some(1)` forces `gz_comp`'s
+        // short-write loop to iterate once per byte.
+        let mut fixture = fixture(16, 6, 1, Some(1));
+        let payload = b"one byte at a time";
+        assert_eq!(gz_write(&mut fixture.state, payload), payload.len());
+        assert_eq!(gzclose_w(&mut fixture.state), ReturnCode::OK.as_i32());
+        assert_eq!(fixture.sink.borrow().as_slice(), payload);
     }
 
     #[test]
@@ -2149,8 +2188,10 @@ mod tests {
         // The non-blocking contract at `zlib.h` L1523-L1525: a non-zero short return names the
         // number of bytes consumed.
         let mut fixture = plain();
-        let previous = fixture.state.set_handle(Some(Box::new(StalledFile)));
-        assert!(previous.is_some());
+        let previous = fixture
+            .state
+            .set_handle(GzFileSlot::Boxed(Box::new(StalledFile)));
+        assert!(previous.is_installed(), "a handle was replaced");
         // Small enough to be buffered, so nothing is written and nothing stalls yet.
         assert_eq!(gzwrite(&mut fixture.state, b"buffered"), 8);
         assert_eq!(fixture.state.err(), ReturnCode::OK.as_i32());
@@ -2210,8 +2251,10 @@ mod tests {
         // path and not a contrivance.
         let mut fixture = fixture(64, 6, 1, None);
         gz_init(&mut fixture.state).unwrap();
-        let previous = fixture.state.set_handle(Some(Box::new(StalledFile)));
-        assert!(previous.is_some());
+        let previous = fixture
+            .state
+            .set_handle(GzFileSlot::Boxed(Box::new(StalledFile)));
+        assert!(previous.is_installed(), "a handle was replaced");
 
         let target = fixture.state.in_slice_mut();
         for (index, slot) in target.iter_mut().enumerate().take(100) {
@@ -2338,4 +2381,82 @@ mod tests {
     // * The `Ok(0)` arms of `flush_out` and `write_through` require a `GzHandle` that reports no
     //   progress on a non-empty buffer, which the trait documents as a contract violation. They
     //   exist so that a broken implementation cannot make this layer spin, not to be reachable.
+    /// F14: a write count larger than the chunk offered is refused, not clamped.
+    ///
+    /// Clamping was the previous behaviour: `flush_out` did `.min(state.strm.next_out)` and the
+    /// transparent path simply trusted the number. Either way the stream's accounting ended up wrong
+    /// and the broken handle went unreported.
+    #[test]
+    fn a_handle_that_over_reports_a_write_is_refused() {
+        let mut fixture = plain();
+        let previous = fixture
+            .state
+            .set_handle(GzFileSlot::Boxed(Box::new(OverReportingFile {
+                sink: Rc::new(RefCell::new(Vec::new())),
+                excess: 1,
+            })));
+        assert!(previous.is_installed(), "a handle was replaced");
+
+        // Buffered, so nothing reaches the file yet and nothing can go wrong yet.
+        assert_eq!(gzwrite(&mut fixture.state, b"buffered"), 8);
+        assert_eq!(fixture.state.err(), ReturnCode::OK.as_i32());
+
+        // A Z_FINISH has to reach the file, so this is where the over-report surfaces.
+        assert_eq!(
+            gzflush(&mut fixture.state, Z_FINISH),
+            ReturnCode::STREAM_ERROR.as_i32(),
+            "an over-reporting handle is a stream error, not an errno"
+        );
+        assert_eq!(
+            fixture.state.err(),
+            ReturnCode::STREAM_ERROR.as_i32(),
+            "and the code is latched for gzerror"
+        );
+    }
+
+    /// F14 on the transparent path, which has its own write call and its own cursors.
+    #[test]
+    fn a_transparent_stream_refuses_an_over_reported_write() {
+        let mut fixture = fixture(16, 6, 1, None);
+        let previous = fixture
+            .state
+            .set_handle(GzFileSlot::Boxed(Box::new(OverReportingFile {
+                sink: Rc::new(RefCell::new(Vec::new())),
+                excess: 4,
+            })));
+        assert!(previous.is_installed(), "a handle was replaced");
+
+        // Longer than the 16-byte buffer, so `gz_write` goes straight to the file rather than
+        // staging the bytes -- which is the only way to reach the handle from here, since a payload
+        // that fits is simply buffered and reported as accepted, exactly as C reports it.
+        let payload = b"a payload that does not fit in the sixteen byte buffer";
+        assert_eq!(
+            gz_write(&mut fixture.state, payload),
+            0,
+            "no bytes may be reported as written"
+        );
+        assert_eq!(fixture.state.err(), ReturnCode::STREAM_ERROR.as_i32());
+        assert_eq!(
+            fixture.state.stream().avail_in,
+            0,
+            "and the input cursor must not have advanced past what was staged"
+        );
+    }
+
+    /// F14 boundary: reporting exactly the chunk offered is honest and is accepted.
+    #[test]
+    fn a_handle_that_reports_exactly_the_chunk_is_accepted() {
+        let mut fixture = fixture(16, 6, 1, None);
+        let previous = fixture
+            .state
+            .set_handle(GzFileSlot::Boxed(Box::new(OverReportingFile {
+                sink: Rc::new(RefCell::new(Vec::new())),
+                excess: 0,
+            })));
+        assert!(previous.is_installed(), "a handle was replaced");
+
+        let payload = b"transparent writing adds no container at all";
+        assert_eq!(gz_write(&mut fixture.state, payload), payload.len());
+        assert_eq!(fixture.state.err(), ReturnCode::OK.as_i32());
+    }
 }

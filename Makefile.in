@@ -13,18 +13,39 @@
 #    make install prefix=$HOME
 
 # To build the memory-safe Rust implementation of zlib together with the
-# drop-in C-ABI library it exports, type:
+# C-ABI library it exports, type:
 #    make rust
-# To run the Rust test suites and then relink the unmodified test/example.c
-# and test/minigzip.c against that library instead of the C one, type:
+# To run the Rust test suites and then relink the unmodified test/example.c,
+# test/minigzip.c and test/infcover.c against that library instead of the C
+# one, and compare its exported symbols with the C library's, type:
 #    make rust-test
-# To remove everything those two targets produced, type:
+# To compare the exported symbols of that library against the C one, which
+# is the gate that proves an already-linked consumer can bind to it, type:
+#    make rust-symbols
+# To remove everything those targets produced, type:
 #    make rust-clean
+# See the comment above the `rust-test' rule for what those checks do and do
+# not establish; several verification gates named in the port's plan are not
+# among them.
 # Those three targets are standalone on purpose: no C target depends on
 # them, because the C library is the reference the Rust port is diffed
 # against and has to stay buildable and green on its own.  When no cargo is
-# available configure leaves CARGO empty and all three print a notice and
-# succeed without doing anything.  See rust/README.md for details.
+# available configure leaves CARGO empty; `rust' and `rust-test' then refuse and
+# exit nonzero, naming the remedy, because an explicit request to build or test
+# the Rust library must not be reported as done when it cannot be honoured.
+# `rust-clean' still succeeds, because removing the staged library needs no
+# cargo.
+#
+# To select the vectorised checksum backends, set ZLIB_RS_SIMD in the
+# environment (or on the command line) when running either Rust target:
+#    ZLIB_RS_SIMD=1 make rust
+# 1 adds the `simd' Cargo feature to every package the target builds, 0 (or
+# leaving it unset) builds the scalar backends, and anything else is an
+# error.  It has to be resolved here rather than inside a build script,
+# because Cargo settles the feature graph before any build script runs.  SIMD
+# is confined to CRC-32 and Adler-32 and is output neutral: a checksum yields
+# one scalar however it is computed, so it changes speed only, never a single
+# emitted byte.
 
 CC=cc
 GCOV=GCOV
@@ -48,6 +69,18 @@ SHAREDLIB=libz.so
 SHAREDLIBV=libz.so.1.3.2.1
 SHAREDLIBM=libz.so.1
 LIBS=$(STATICLIB) $(SHAREDLIBV)
+# configure substitutes SHAREDLIB, SHAREDLIBV and SHAREDLIBM from the
+# ZLIB_VERSION it reads out of zlib.h, so the values above are only the
+# defaults used when configure has not run.  SHAREDLIBV's default is stale --
+# zlib.h now says 1.3.2.1-motley, making the configured name
+# libz.so.1.3.2.1-motley -- and it is left as it is so that the C build's
+# unconfigured output keeps the name it has always had.  The Rust packaging
+# step in the `rust' target therefore does not trust it for the version: it
+# reads ZLIB_VERSION from $(SRCDIR)zlib.h itself, because a drop-in
+# replacement whose file name disagrees with the version it reports is not a
+# drop-in replacement.  SHAREDLIBV is still read there for the one thing it
+# alone records: emptied by configure --static, it means no shared library
+# was wanted.
 
 AR=ar
 ARFLAGS=rc
@@ -58,45 +91,154 @@ TAR=tar
 SHELL=/bin/sh
 EXE=
 
-# Rust workspace.  The six variables below drive the `rust', `rust-test' and
-# `rust-clean' targets; no C target reads any of them.
+# Rust workspace.  The variables below drive the `rust', `rust-test',
+# `rust-symbols' and `rust-clean' targets; no C target reads any of them.
 #
 # Only CARGO is substituted by configure, through a
 # /^CARGO *=/s#=.*#=$CARGO# rule, which is why it has to stay a plain
-# NAME=value line starting in column 0.  The other five are ordinary make
+# NAME=value line starting in column 0.  The rest are ordinary make
 # variables, need no configure counterpart, and can be overridden on the
 # command line, for example
 #    make rust CARGO_BUILD_FLAGS='--release --locked'
+#    make rust RUSTNM=aarch64-linux-gnu-nm RUSTOBJCOPY=aarch64-linux-gnu-objcopy
 #
 #   CARGO              The cargo executable, or EMPTY when configure found
-#                      no Rust toolchain.  Empty makes all three Rust
-#                      targets print a notice and succeed, so a machine
-#                      without cargo can still build and test the C library.
-#   CARGO_BUILD_FLAGS  Flags for `cargo build'.  These pick the profile, so
-#                      RUSTDIR below has to agree with them.
+#                      no Rust toolchain.  Empty makes every Rust target
+#                      print a notice and succeed, so a machine without
+#                      cargo can still build and test the C library.
+#   CARGO_BUILD_FLAGS  Flags for `cargo build'.  These pick the profile, and
+#                      RUSTDIR is derived from them, so the two cannot drift.
 #   CARGO_TEST_FLAGS   Flags for `cargo test'.
 #   RUSTTARGETDIR      Cargo's target directory, relative to the build
 #                      directory.  Exported as CARGO_TARGET_DIR so that an
 #                      out-of-source build keeps its artifacts out of
-#                      SRCDIR.
+#                      SRCDIR.  MUST be a relative path strictly beneath the
+#                      build directory -- see RUSTPATHGUARD below, which
+#                      refuses anything else before a recursive delete can
+#                      reach it.
 #   RUSTDIR            Where cargo writes $(SHAREDLIB) and $(STATICLIB).
-#   RUSTLIBDIR         Staging directory for the drop-in library: a real
-#                      $(SHAREDLIBV) with $(SHAREDLIBM) and $(SHAREDLIB)
-#                      symlinked to it, the same topology the
-#                      $(SHAREDLIBV) rule gives the C library, plus the
-#                      relinked C drivers.  It is deliberately not
-#                      $(RUSTDIR), because cargo puts that directory first
-#                      on LD_LIBRARY_PATH when it runs tests and a
+#                      EMPTY by default, which means "derive it": the `rust'
+#                      recipe reads --release, --profile and --target out of
+#                      $(CARGO_BUILD_FLAGS) and builds
+#                      $(RUSTTARGETDIR)[/<triple>]/<profile> from them, so a
+#                      profile or cross-target change needs no second edit.
+#                      Set it explicitly to override that.
+#   RUSTLIBDIR         Packaging directory for the drop-in library: a real
+#                      $(SHAREDLIBV), relinked from $(STATICLIB) through
+#                      $(LDSHARED) so that it carries the same SONAME and the
+#                      same $(SRCDIR)zlib.map version script as the C build,
+#                      with $(SHAREDLIBM) and $(SHAREDLIB) symlinked to it --
+#                      the same topology the $(SHAREDLIBV) rule gives the C
+#                      library -- plus the relinked C drivers and the symbol
+#                      lists the parity diff compares.  It is deliberately
+#                      not $(RUSTDIR), because cargo puts that directory
+#                      first on LD_LIBRARY_PATH when it runs tests and a
 #                      $(SHAREDLIBM) sitting there would be loaded by
 #                      unrelated processes; and deliberately not the build
 #                      directory, where libz.* belongs to the C build and
 #                      testshared searches for it.
+#   RUSTNM             Symbol reader for the ABI parity gate in `rust'.
+#   RUSTOBJCOPY        Object editor the same gate uses to give the
+#                      compiler-runtime globals a Rust static library carries
+#                      local binding, so that they cannot reach the shared
+#                      library's dynamic symbol table.  configure computes an
+#                      NM of its own but has no sed rule for it, so these two
+#                      are named apart from it to make plain that they are
+#                      not substituted; a cross build overrides them on the
+#                      command line as shown above.
+#
+#   RUSTSHIM           The one C file the Rust library contains: the C-ABI
+#                      varargs shim that implements gzprintf and gzvprintf,
+#                      which stable Rust cannot define.  Compiled by the
+#                      package recipe and archived into the staged
+#                      $(STATICLIB) so both symbols reach the relink.
+#   RUSTSHIMFLAGS      Position-independent-code flags for it.
+#   ZLIBREF            The C shared library `rust-symbols' compares against.
+#                      Defaults to the one this build produces.
 CARGO=cargo
-CARGO_BUILD_FLAGS=--release
-CARGO_TEST_FLAGS=--workspace --release
+CARGO_BUILD_FLAGS=--locked --release
+CARGO_TEST_FLAGS=--locked --workspace --release
 RUSTTARGETDIR=target
-RUSTDIR=$(RUSTTARGETDIR)/release
+RUSTDIR=
 RUSTLIBDIR=$(RUSTTARGETDIR)/dropin
+RUSTNM=nm
+RUSTOBJCOPY=objcopy
+RUSTSHIM=$(SRCDIR)crates/libz-rs-sys/csrc/gzprintf_shim.c
+RUSTSHIMFLAGS=-fPIC -DPIC
+ZLIBREF=$(SHAREDLIBV)
+
+# The variadic ABI boundary.  `gzprintf' is variadic and `gzvprintf' takes a
+# va_list, and stable Rust can define neither -- `c_variadic' and
+# `core::ffi::VaList' are both unstable, and guessing a va_list layout is
+# ABI-invalid across the Tier-1 targets.  So those two exports live in one C
+# translation unit that owns nothing but va_start/va_end and vsnprintf; every
+# guard, the overflow sentinel and all the accounting are in safe Rust, in
+# crates/zlib-rs/src/gz/printf.rs, which carries the whole contract.
+#
+# Cargo does NOT compile it: crates/libz-rs-sys has no [build-dependencies] and
+# `cargo build --release' must work with no C compiler present.  Compiling it and
+# getting it into both libraries is this file's job, which is the right place
+# because this is also where zlib.map is applied.
+# The GNU ld spellings for "take every member of this archive, including the
+# ones nothing references yet".  They are separate variables so that a platform
+# with a different linker can override them -- Mach-O's ld wants `-all_load' and
+# no closing flag:
+#    make rust RUSTWHOLEARCHIVE=-all_load RUSTNOWHOLEARCHIVE=
+# The Rust staticlib is the only source of the port's exported symbols, and a
+# shared library links nothing from an archive unless something asks for it, so
+# without this the relinked library would be empty.
+RUSTWHOLEARCHIVE=-Wl,--whole-archive
+RUSTNOWHOLEARCHIVE=-Wl,--no-whole-archive
+
+# The containment guard for the two directory variables that reach a recursive
+# delete.  RUSTTARGETDIR and RUSTLIBDIR are ordinary make variables and may be
+# overridden on the command line or from the environment, so an invocation such
+# as `make rust-clean RUSTTARGETDIR=..' or `RUSTLIBDIR=$HOME make rust' would
+# otherwise hand an arbitrary path to `rm -rf' with the build user's
+# permissions.  Every recipe below that removes, creates or writes under either
+# variable runs this first, and every operand in those recipes is quoted and
+# introduced with `--' so that a leading dash or an embedded space cannot be
+# read as an option or as a second word.
+#
+# The check is deliberately in two parts.  A lexical pass rejects the forms that
+# are wrong regardless of what is on disk: empty, absolute, tilde-prefixed, `.',
+# `..', anything containing a `..' path component, and anything outside a
+# conservative character set (which also removes every shell-metacharacter and
+# whitespace hazard).  A canonicalising pass then walks up to the nearest
+# existing ancestor, resolves it with `cd -P' and `pwd -P' so that a symlinked
+# component cannot smuggle the path elsewhere, and requires the result to be the
+# build directory or something strictly beneath it.  Neither pass alone is
+# sufficient: the first cannot see a symlink, and the second cannot judge a path
+# whose ancestors do not exist yet.
+RUSTPATHGUARD = \
+	zrs_reject() { \
+	  echo "$$1" >&2; \
+	  echo "	*** refusing to continue ***" >&2; \
+	  exit 1; \
+	}; \
+	zrs_guard_dir() { \
+	  zrs_v=$$1; zrs_n=$$2; zrs_root=`pwd -P`; \
+	  case "$$zrs_v" in \
+	    "") zrs_reject "$$zrs_n is empty" ;; \
+	    /*) zrs_reject "$$zrs_n=$$zrs_v is an absolute path; it must be relative to the build directory" ;; \
+	    "~"*) zrs_reject "$$zrs_n=$$zrs_v starts with a tilde" ;; \
+	    . | ..) zrs_reject "$$zrs_n=$$zrs_v names the build directory or its parent" ;; \
+	    ../* | */.. | */../*) zrs_reject "$$zrs_n=$$zrs_v contains a .. component" ;; \
+	    *[!A-Za-z0-9._/+-]*) zrs_reject "$$zrs_n=$$zrs_v contains a character outside A-Za-z0-9._+-/" ;; \
+	  esac; \
+	  zrs_p=$$zrs_v; \
+	  while test "$$zrs_p" != "." && test ! -d "$$zrs_p"; do \
+	    zrs_p=`dirname -- "$$zrs_p"`; \
+	  done; \
+	  zrs_abs=`cd -P -- "$$zrs_p" 2>/dev/null && pwd -P` || \
+	    zrs_reject "$$zrs_n=$$zrs_v: could not resolve $$zrs_p"; \
+	  case "$$zrs_abs" in \
+	    "$$zrs_root" | "$$zrs_root"/*) ;; \
+	    *) zrs_reject "$$zrs_n=$$zrs_v resolves to $$zrs_abs, outside the build directory $$zrs_root" ;; \
+	  esac; \
+	}; \
+	zrs_guard_dir "$(RUSTTARGETDIR)" RUSTTARGETDIR; \
+	zrs_guard_dir "$(RUSTLIBDIR)" RUSTLIBDIR
 
 prefix = /usr/local
 exec_prefix = ${prefix}
@@ -180,85 +322,457 @@ cover: infcover
 	${QEMU_RUN} ./infcover
 	${GCOV} ${LLVM_GCOV_FLAG} inf*.c -o ./infcover.gcda
 
-# The three targets below build and verify the Rust reimplementation of zlib.
+# The four targets below build and verify the Rust reimplementation of zlib.
 # They are standalone by design, for two independent reasons.  First, configure
 # rewrites the entire prerequisite list of `all' and of `test' (its sed script
 # contains /^all: */s#:.*#: $ALL# and /^test: */s#:.*#: $TEST#), so anything
 # appended to either line here would be discarded the next time configure ran.
-# Second, the C library is the reference implementation the Rust port is diffed
+# Second, the C library is the reference the Rust implementation is diffed
 # against, so `make' and `make test' have to keep working byte for byte as
 # before, on machines that have no Rust toolchain at all.  `distclean' rewrites
-# the placeholder Makefile with forwarding rules for all three, so they stay
+# the placeholder Makefile with forwarding rules for them, so they stay
 # reachable after a distclean too.
 
-# Build the Rust crates, then the C-ABI library, then stage the result under
-# $(RUSTLIBDIR) using the same three names and the same symlink topology the
-# $(SHAREDLIBV) rule gives the C library.  Those symlinks are not cosmetic: the
-# shared library's SONAME is $(SHAREDLIBM), so a consumer asks the dynamic
-# loader for that exact name, and when only $(SHAREDLIB) exists the loader
-# quietly falls back to the system $(SHAREDLIBM) -- the drop-in test would then
-# pass while exercising the wrong library.  When configure was run with
-# --static, $(SHAREDLIBV) is empty and only $(STATICLIB) is staged.
+# Build the Rust crates, then the C-ABI library, then package the result under
+# $(RUSTLIBDIR) with the same three names, the same SONAME and the same version
+# script the C build gives $(SHAREDLIBV).
+#
+# THE SHARED OBJECT IS RELINKED, NOT COPIED, and that is the whole point of this
+# recipe.  Cargo's cdylib link cannot be given $(SRCDIR)zlib.map: rustc supplies
+# a version script of its own, and a second one is either rejected outright
+# ("anonymous version tag cannot be combined with other version tags") or
+# silently produces a library with zero version nodes.  The long comment above
+# `emit_version_script` in crates/libz-rs-sys/build.rs records every spelling
+# that was tried.  So the shared object is relinked here from $(STATICLIB) --
+# which the same cargo build already produced -- through $(LDSHARED), the exact
+# variable the $(SHAREDLIBV) rule at the bottom of this file uses.  Whatever
+# soname and version script `configure' baked into it therefore apply to the
+# Rust library byte for byte, with no second place for them to drift.
+#
+# Verified on the reference archive: this recipe yields 16 `A' plus 95 `T'
+# dynamic globals -- 111 in total, matching the C library symbol for symbol --
+# and `SONAME libz.so.1'.  `rust-test' below re-checks that with `nm'.
+#
+# Packaging happens in $(RUSTLIBDIR), never in $(RUSTDIR): cargo puts its own
+# artifact directory first on LD_LIBRARY_PATH while it runs tests, and a
+# $(SHAREDLIBM) sitting there is loaded by every host tool that records
+# `DT_NEEDED libz.so.1' -- nm, readelf and ld.bfd all do -- which means the tools
+# inspecting the library would be running code from it.  The symlinks are not
+# cosmetic either: the SONAME is $(SHAREDLIBM), so a consumer asks the loader for
+# that exact name, and when only $(SHAREDLIB) exists the loader quietly falls
+# back to the system $(SHAREDLIBM) and the drop-in test passes while exercising
+# the wrong library.  When configure was run with --static, $(SHAREDLIBV) is
+# empty and only $(STATICLIB) is staged.
+#
+# Package selection is explicit.  `-p zlib-rs -p libz-rs-sys' names the two
+# crates that ship; the third workspace member, crates/zlib-rs-differential,
+# compiles the in-tree C sources from its build script and is deliberately not
+# built here.  `--features libz-compat' is likewise package-scoped: with several
+# packages selected cargo applies a bare feature name only to the ones that
+# declare it, so naming the crate is what makes the command say what it means.
 rust:
 	@if test -z "$(CARGO)"; then \
-	  echo '		*** cargo not found: Rust build skipped ***'; \
-	  echo '		install a Rust toolchain and re-run ./configure'; \
-	  exit 0; \
+	  echo 'make rust: no Rust toolchain -- $$(CARGO) is empty' >&2; \
+	  echo 'make rust: install cargo, then re-run ./configure, or name it:' >&2; \
+	  echo 'make rust:     make rust CARGO=cargo' >&2; \
+	  exit 1; \
 	fi; \
 	set -e; \
+	$(RUSTPATHGUARD); \
+	CORE_FEATURES=''; SYS_FEATURES='libz-compat'; \
+	case "$${ZLIB_RS_SIMD-}" in \
+	  '') ;; \
+	  0) case " $(CARGO_BUILD_FLAGS) $(CARGO_TEST_FLAGS) " in \
+	       *simd*) \
+	         echo 'ZLIB_RS_SIMD=0 contradicts the simd feature already requested through'; \
+	         echo 'CARGO_BUILD_FLAGS or CARGO_TEST_FLAGS.  Drop one of the two and re-run.'; \
+	         exit 1;; \
+	     esac;; \
+	  1) CORE_FEATURES='simd'; SYS_FEATURES='libz-compat,simd';; \
+	  *) echo "ZLIB_RS_SIMD must be 0 or 1, got \"$${ZLIB_RS_SIMD}\""; exit 1;; \
+	esac; \
+	if test -n "$$CORE_FEATURES"; then CORE_FEATURES="--features $$CORE_FEATURES"; fi; \
 	CARGO_TARGET_DIR=$(RUSTTARGETDIR); export CARGO_TARGET_DIR; \
-	echo "$(CARGO) build $(CARGO_BUILD_FLAGS)"; \
-	$(CARGO) build $(CARGO_BUILD_FLAGS) --manifest-path $(SRCDIR)Cargo.toml; \
-	echo "$(CARGO) build $(CARGO_BUILD_FLAGS) --features libz-compat"; \
-	$(CARGO) build $(CARGO_BUILD_FLAGS) --features libz-compat \
-	  --manifest-path $(SRCDIR)Cargo.toml; \
+	echo "$(CARGO) build $(CARGO_BUILD_FLAGS) -p zlib-rs $$CORE_FEATURES"; \
+	$(CARGO) build $(CARGO_BUILD_FLAGS) --manifest-path $(SRCDIR)Cargo.toml \
+	  -p zlib-rs $$CORE_FEATURES; \
+	echo "$(CARGO) build $(CARGO_BUILD_FLAGS) -p libz-rs-sys --features $$SYS_FEATURES"; \
+	$(CARGO) build $(CARGO_BUILD_FLAGS) --manifest-path $(SRCDIR)Cargo.toml \
+	  -p libz-rs-sys --features "$$SYS_FEATURES"
+	@test -n "$(CARGO)" || exit 0; \
+	set -e; \
+	LC_ALL=C; export LC_ALL; \
+	rustdir='$(RUSTDIR)'; \
+	if test -z "$$rustdir"; then \
+	  profile=debug; triple=; want=; \
+	  for arg in $(CARGO_BUILD_FLAGS); do \
+	    if test -n "$$want"; then \
+	      eval "$$want=\$$arg"; want=; continue; \
+	    fi; \
+	    case "$$arg" in \
+	      --release | -r) profile=release ;; \
+	      --profile) want=profile ;; \
+	      --profile=*) profile=`expr "$$arg" : '--profile=\(.*\)'` ;; \
+	      --target) want=triple ;; \
+	      --target=*) triple=`expr "$$arg" : '--target=\(.*\)'` ;; \
+	    esac; \
+	  done; \
+	  case "$$profile" in dev | test) profile=debug ;; bench) profile=release ;; esac; \
+	  rustdir='$(RUSTTARGETDIR)'; \
+	  test -z "$$triple" || rustdir="$$rustdir/$$triple"; \
+	  rustdir="$$rustdir/$$profile"; \
+	fi; \
+	if test ! -f "$$rustdir/$(STATICLIB)"; then \
+	  echo "make rust: $$rustdir/$(STATICLIB) was not produced" >&2; \
+	  echo "make rust: pass RUSTDIR=<dir> if cargo writes somewhere else" >&2; \
+	  exit 1; \
+	fi; \
+	echo "make rust: cargo artifacts read from $$rustdir"; \
 	rm -rf $(RUSTLIBDIR); \
 	mkdir -p $(RUSTLIBDIR); \
-	if test -f $(RUSTDIR)/$(STATICLIB); then \
-	  cp -p $(RUSTDIR)/$(STATICLIB) $(RUSTLIBDIR)/$(STATICLIB); \
-	  echo "cp $(RUSTDIR)/$(STATICLIB) $(RUSTLIBDIR)/$(STATICLIB)"; \
+	cp -p "$$rustdir/$(STATICLIB)" $(RUSTLIBDIR)/$(STATICLIB); \
+	echo "cp $$rustdir/$(STATICLIB) $(RUSTLIBDIR)/$(STATICLIB)"; \
+	echo "$(CC) $(SFLAGS) $(RUSTSHIMFLAGS) -c $(RUSTSHIM)"; \
+	$(CC) $(SFLAGS) $(RUSTSHIMFLAGS) $(ZINCOUT) -c \
+	  -o $(RUSTLIBDIR)/gzprintf_shim.o $(RUSTSHIM); \
+	$(AR) $(ARFLAGS) $(RUSTLIBDIR)/$(STATICLIB) \
+	  $(RUSTLIBDIR)/gzprintf_shim.o; \
+	rm -f $(RUSTLIBDIR)/gzprintf_shim.o; \
+	sed -n 's/^ *ZEXTERN[^(]*[ *]\([A-Za-z_][A-Za-z0-9_]*\) *(.*/\1/p' \
+	  $(SRCDIR)zlib.h | sort -u > $(RUSTLIBDIR)/public.syms; \
+	if test -z "$(SHAREDLIBV)"; then \
+	  echo '		configured --static: only $(STATICLIB) was staged'; \
+	  exit 0; \
 	fi; \
-	if test -n "$(SHAREDLIBV)" -a -f $(RUSTDIR)/$(SHAREDLIB); then \
-	  cp -p $(RUSTDIR)/$(SHAREDLIB) $(RUSTLIBDIR)/$(SHAREDLIBV); \
-	  echo "cp $(RUSTDIR)/$(SHAREDLIB) $(RUSTLIBDIR)/$(SHAREDLIBV)"; \
-	  ln -s $(SHAREDLIBV) $(RUSTLIBDIR)/$(SHAREDLIBM); \
-	  echo "ln -s $(SHAREDLIBV) $(RUSTLIBDIR)/$(SHAREDLIBM)"; \
-	  ln -s $(SHAREDLIBV) $(RUSTLIBDIR)/$(SHAREDLIB); \
-	  echo "ln -s $(SHAREDLIBV) $(RUSTLIBDIR)/$(SHAREDLIB)"; \
+	case "$(LDSHARED)" in \
+	  *version-script*) ;; \
+	  *) if test -f "$$rustdir/$(SHAREDLIB)"; then \
+	       cp -p "$$rustdir/$(SHAREDLIB)" $(RUSTLIBDIR)/$(SHAREDLIBV); \
+	       echo "cp $$rustdir/$(SHAREDLIB) $(RUSTLIBDIR)/$(SHAREDLIBV)"; \
+	       rm -f $(RUSTLIBDIR)/$(SHAREDLIB) $(RUSTLIBDIR)/$(SHAREDLIBM); \
+	       ln -s $(SHAREDLIBV) $(RUSTLIBDIR)/$(SHAREDLIBM); \
+	       ln -s $(SHAREDLIBV) $(RUSTLIBDIR)/$(SHAREDLIB); \
+	     fi; \
+	     echo '		LDSHARED carries no --version-script, as on this platform the C'; \
+	     echo '		build applies none either: cargo'\''s shared library was staged'; \
+	     echo '		unrelinked.  Run ./configure if that is unexpected.'; \
+	     exit 0;; \
+	esac; \
+	echo "$(CC) -r -nostdlib -o $(RUSTLIBDIR)/libz-whole.o $(RUSTWHOLEARCHIVE) $(RUSTLIBDIR)/$(STATICLIB) $(RUSTNOWHOLEARCHIVE)"; \
+	$(CC) -r -nostdlib -o $(RUSTLIBDIR)/libz-whole.o \
+	  $(RUSTWHOLEARCHIVE) $(RUSTLIBDIR)/$(STATICLIB) $(RUSTNOWHOLEARCHIVE); \
+	$(RUSTNM) --defined-only --extern-only --format=posix \
+	  $(RUSTLIBDIR)/libz-whole.o \
+	  | awk '$$2 ~ /^[TDBRGSi]$$/ { print $$1 }' | sed -n '/^_/!p' | sort -u \
+	  > $(RUSTLIBDIR)/whole.syms; \
+	comm -23 $(RUSTLIBDIR)/whole.syms $(RUSTLIBDIR)/public.syms \
+	  > $(RUSTLIBDIR)/hidden.syms; \
+	if test -s $(RUSTLIBDIR)/hidden.syms; then \
+	  echo "$(RUSTOBJCOPY) --localize-symbols=$(RUSTLIBDIR)/hidden.syms $(RUSTLIBDIR)/libz-whole.o"; \
+	  $(RUSTOBJCOPY) --localize-symbols=$(RUSTLIBDIR)/hidden.syms \
+	    $(RUSTLIBDIR)/libz-whole.o; \
+	fi; \
+	echo "$(LDSHARED) $(SFLAGS) -o $(RUSTLIBDIR)/$(SHAREDLIBV) $(RUSTLIBDIR)/libz-whole.o"; \
+	if $(LDSHARED) $(SFLAGS) -Wl,--undefined-version \
+	    -o $(RUSTLIBDIR)/$(SHAREDLIBV) $(RUSTLIBDIR)/libz-whole.o \
+	    $(LDSHAREDLIBC) $(LDFLAGS) 2> $(RUSTLIBDIR)/relink.log; then \
+	  :; \
+	elif $(LDSHARED) $(SFLAGS) -o $(RUSTLIBDIR)/$(SHAREDLIBV) \
+	    $(RUSTLIBDIR)/libz-whole.o $(LDSHAREDLIBC) $(LDFLAGS) \
+	    2>> $(RUSTLIBDIR)/relink.log; then \
+	  echo 'note: the linker rejected --undefined-version; relinked without it'; \
+	else \
+	  cat $(RUSTLIBDIR)/relink.log; \
+	  rm -f $(RUSTLIBDIR)/libz-whole.o $(RUSTLIBDIR)/relink.log; \
+	  echo '		*** relink of $(SHAREDLIBV) from $(STATICLIB) FAILED ***'; \
+	  exit 1; \
+	fi; \
+	rm -f $(RUSTLIBDIR)/relink.log; \
+	rm -f $(RUSTLIBDIR)/libz-whole.o; \
+	rm -f $(RUSTLIBDIR)/$(SHAREDLIB) $(RUSTLIBDIR)/$(SHAREDLIBM); \
+	ln -s $(SHAREDLIBV) $(RUSTLIBDIR)/$(SHAREDLIBM); \
+	echo "ln -s $(SHAREDLIBV) $(RUSTLIBDIR)/$(SHAREDLIBM)"; \
+	ln -s $(SHAREDLIBV) $(RUSTLIBDIR)/$(SHAREDLIB); \
+	echo "ln -s $(SHAREDLIBV) $(RUSTLIBDIR)/$(SHAREDLIB)"
+	@test -n "$(CARGO)" || exit 0; \
+	test -n "$(SHAREDLIBV)" || exit 0; \
+	test -f $(RUSTLIBDIR)/$(SHAREDLIBV) || exit 0; \
+	case "$(LDSHARED)" in \
+	  *version-script*) ;; \
+	  *) echo '		no version script was applied here, and the C build applies none on'; \
+	     echo '		this platform either, so there is no symbol version contract to'; \
+	     echo '		check: cargo'\''s own cdylib script already confines the exports'; \
+	     exit 0;; \
+	esac; \
+	set -e; \
+	LC_ALL=C; export LC_ALL; \
+	rc=0; \
+	$(RUSTNM) -D --defined-only --extern-only $(RUSTLIBDIR)/$(SHAREDLIBV) \
+	  > $(RUSTLIBDIR)/nm.out; \
+	awk '{ print $$3 }' $(RUSTLIBDIR)/nm.out | sort > $(RUSTLIBDIR)/rust.syms; \
+	awk '$$2 != "A" { sub(/@@.*/, "", $$3); print $$3 }' $(RUSTLIBDIR)/nm.out \
+	  | sort -u > $(RUSTLIBDIR)/exported.syms; \
+	awk '$$2 == "A" { print $$3 }' $(RUSTLIBDIR)/nm.out | sort -u \
+	  > $(RUSTLIBDIR)/so.nodes; \
+	comm -23 $(RUSTLIBDIR)/exported.syms $(RUSTLIBDIR)/public.syms \
+	  > $(RUSTLIBDIR)/extra.syms; \
+	if test -s $(RUSTLIBDIR)/extra.syms; then \
+	  echo '		exported, but not declared in $(SRCDIR)zlib.h:'; \
+	  sed 's/^/		  /' $(RUSTLIBDIR)/extra.syms; \
+	  rc=1; \
+	else \
+	  echo "		`wc -l < $(RUSTLIBDIR)/exported.syms` exported symbols, every one declared in $(SRCDIR)zlib.h"; \
+	fi; \
+	sed -n '/^ *local:/,/}/{ s/^ *\([A-Za-z_][A-Za-z0-9_]*\);.*/\1/p; }' \
+	  $(SRCDIR)zlib.map | sort -u > $(RUSTLIBDIR)/local.syms; \
+	comm -12 $(RUSTLIBDIR)/local.syms $(RUSTLIBDIR)/exported.syms \
+	  > $(RUSTLIBDIR)/leaked.syms; \
+	sed -n '/^_/p' $(RUSTLIBDIR)/exported.syms >> $(RUSTLIBDIR)/leaked.syms; \
+	if test -s $(RUSTLIBDIR)/leaked.syms; then \
+	  echo '		$(SRCDIR)zlib.map hides these, but they are exported:'; \
+	  sed 's/^/		  /' $(RUSTLIBDIR)/leaked.syms; \
+	  rc=1; \
+	else \
+	  echo "		all `wc -l < $(RUSTLIBDIR)/local.syms` $(SRCDIR)zlib.map local: names hidden, nothing matching _* exported"; \
+	fi; \
+	sed -n 's/^\([A-Za-z_][A-Za-z0-9_.]*\)[[:space:]]*{.*/\1/p' $(SRCDIR)zlib.map \
+	  | sort -u > $(RUSTLIBDIR)/map.nodes; \
+	if diff -u $(RUSTLIBDIR)/map.nodes $(RUSTLIBDIR)/so.nodes; then \
+	  echo "		`wc -l < $(RUSTLIBDIR)/so.nodes` symbol version nodes, exactly as $(SRCDIR)zlib.map declares"; \
+	else \
+	  echo '		symbol version nodes differ from $(SRCDIR)zlib.map, see the diff above'; \
+	  rc=1; \
+	fi; \
+	if command -v readelf > /dev/null 2>&1; then \
+	  if readelf -d $(RUSTLIBDIR)/$(SHAREDLIBV) | grep -q '\[$(SHAREDLIBM)\]'; then \
+	    echo '		SONAME is $(SHAREDLIBM)'; \
+	  else \
+	    echo '		SONAME is not $(SHAREDLIBM), so an already-linked consumer will not bind this library'; \
+	    rc=1; \
+	  fi; \
+	else \
+	  echo '		no readelf, cannot confirm the SONAME'; \
+	fi; \
+	if test -f $(SHAREDLIBV); then \
+	  $(RUSTNM) -D --defined-only --extern-only $(SHAREDLIBV) \
+	    | awk '{ print $$3 }' | sort > $(RUSTLIBDIR)/c.syms; \
+	  if diff -u $(RUSTLIBDIR)/c.syms $(RUSTLIBDIR)/rust.syms; then \
+	    echo "		`wc -l < $(RUSTLIBDIR)/rust.syms` symbols, identical to the C $(SHAREDLIBV)"; \
+	  else \
+	    echo '		ABI parity diff against the C $(SHAREDLIBV) shown above'; \
+	    rc=1; \
+	  fi; \
+	else \
+	  echo '		$(SHAREDLIBV) is not built here, so the C-versus-Rust symbol diff was'; \
+	  echo '		skipped: run make first for the complete parity check'; \
+	fi; \
+	if test $$rc -eq 0; then \
+	  echo '		*** zlib Rust ABI parity OK ***'; \
+	else \
+	  echo '		*** zlib Rust ABI parity FAILED ***'; false; \
 	fi
 
-# Run the Rust test suites, then the check that actually proves drop-in
-# compatibility: compile the UNMODIFIED test/example.c and test/minigzip.c,
-# their #include "zlib.h" untouched, against the staged Rust library and run
-# them.  ldd then has to show the staged library bound rather than the system
-# one, which is the only way to tell the two apart.  The compiler runs before
-# LD_LIBRARY_PATH is redirected, so that $(CC) itself cannot end up loading the
-# library under test, and each loader search path is extended with ${...:+...}
-# so that no empty component is left behind -- a trailing colon would put the
-# build directory, where the C library's own libz.so.1 lives, on the path.
+# Run the Rust test suites, then verify the exported ABI of the staged library,
+# then the check that actually proves drop-in compatibility: compile the
+# UNMODIFIED test/example.c and test/minigzip.c, their #include "zlib.h"
+# untouched, against the staged Rust library and run them.  ldd then has to
+# show the staged library bound rather than the system one, which is the only
+# way to tell the two apart.  The compiler runs before LD_LIBRARY_PATH is
+# redirected, so that $(CC) itself cannot end up loading the library under
+# test, and each loader search path is extended with ${...:+...} so that no
+# empty component is left behind -- a trailing colon would put the build
+# directory, where the C library's own libz.so.1 lives, on the path.
+#
+# The ABI verification is four comparisons against the two immutable contract
+# files, and it runs BEFORE the C drivers are linked so that an incomplete
+# library is diagnosed as a named list of missing exports rather than as a wall
+# of undefined references from the linker.  It lives in this target rather than
+# in a fourth one because the exported surface is a property of the staged
+# library, and a separate target could be forgotten.
+#
+# All four are ELF-only, and they are skipped out loud rather than silently on
+# other formats.  Each one reads a property that only exists because zlib.map
+# was applied, and zlib.map is applied only where the format supports a version
+# script -- on Mach-O neither this library nor the C one gets it, so there
+# would be nothing to compare against and a failure there would be measuring
+# the format rather than the port.
+#
+# $(LDSHARED) carries --version-script here, and zlib.map's `global:' blocks name
+# every public function.  Since binutils 2.37 the linker's default is
+# --no-undefined-version, so a name in the script that the object does not define
+# is a hard link error -- which is precisely the state the library is in until the
+# facade's export modules land.  The relink therefore tries --undefined-version
+# first and falls back to a plain link on a toolchain that rejects the option, so
+# that an incomplete export set is reported by the four comparisons below as a
+# named list of missing functions rather than as an opaque linker failure.  A
+# relink that fails for any other reason still stops the target, with the log.
+#
+# Everything below reads the STAGED library, never $(RUSTDIR).  The `cargo test'
+# above rebuilds the workspace with the test profile and default features, so
+# it can replace $(RUSTDIR)/$(STATICLIB) and $(RUSTDIR)/$(SHAREDLIB) while this
+# target runs.  `rust' copies the archive into place and relinks from that copy
+# for the same reason: what is verified here has to be the same bytes that get
+# installed, and only the staged copy is stable.
+#
+#   1. Every ZLIB_* symbol version node that $(SRCDIR)zlib.map defines is
+#      present, and no other one is.  This is the comparison a name-only check
+#      cannot make, and the reason `rust' relinks rather than staging cargo's
+#      cdylib: an unversioned library satisfies every other check here.
+#   2. None of the names in zlib.map's `local:' block is exported.
+#   3. Nothing whose name begins with _ is exported, which is the other half
+#      of that same `local:' block (it ends with `_*;').  Between them these
+#      two also confirm the version script was applied at all.
+#   4. The exported function set equals the set zlib.h declares.  That set is
+#      derived from the header rather than written down here, so it cannot go
+#      stale: it is every ZEXTERN...ZEXPORT[VA] name, less the five whose real
+#      entry point is the _-suffixed one the like-named macro expands to
+#      (deflateInit, deflateInit2, inflateInit, inflateInit2 and
+#      inflateBackInit), less gzopen_w off Windows, where zlib.h declares it
+#      only under _WIN32.  gzgetc is deliberately NOT in that exclusion list:
+#      it too is shadowed by a macro, but that macro's else branch calls the
+#      real function through (gzgetc)(g), so the symbol has to exist.
+#
+# One symbol is excluded from comparison 4: rust_eh_personality, the Rust
+# language runtime's unwinder personality routine.  libstd defines it inside
+# $(STATICLIB), it does not match zlib.map's `_*' pattern, and zlib.map is
+# immutable, so it cannot be hidden from here.  Hiding it with a second
+# version script would work but would add a seventeenth version node that this
+# library has never had, which is a worse outcome than the leak: consumers
+# resolve against node names, and inventing one is an ABI addition.  The
+# exclusion is a single enumerated name rather than a pattern precisely so
+# that a second leaked symbol cannot hide behind it.
 # The verification sequence runs as a standalone subshell whose status is
 # captured, deliberately not as the condition of the `if' below: a shell
 # ignores `set -e' inside an `if' condition, so written that way a failing
 # cargo test or a failing compile would be reported as a pass.
+#
+# ZLIB_RS_SIMD is honoured here too, so the suites exercise the same checksum
+# backends the staged library was built with; the tests are what would catch a
+# vectorised backend that failed to be output neutral.  This selection is
+# spelled with the `<package>/<feature>' form because CARGO_TEST_FLAGS is
+# --workspace, and the contradiction check lives in `rust', which make has
+# already run as a prerequisite by the time this recipe starts.
+#
+# WHAT THIS TARGET DOES AND DOES NOT ESTABLISH.  Passing it is necessary for the
+# drop-in claim and is not sufficient for it.  Beyond `cargo test' and the four
+# comparisons above it compiles and runs the UNMODIFIED test/example.c and
+# test/minigzip.c against the staged shared library -- their #include "zlib.h"
+# untouched, with `ldd' proving the staged library was the one bound rather than
+# the system one -- and the UNMODIFIED test/infcover.c against the staged
+# $(STATICLIB).  infcover is the most demanding of the three: its instrumented
+# allocator fills every block with 0xa5 rather than zero, so it catches any code
+# path that assumes zero-initialised memory, and its mem_done() detects leaks,
+# non-LIFO frees and rogue frees through the injected zalloc/zfree hooks.  It is
+# linked against the archive rather than the shared library on purpose, because it
+# includes inflate.h and inftrees.h and calls inflate_table() directly, so it
+# needs a symbol the version script keeps out of the shared library's exports.
+#
+# NOT COVERED HERE, and therefore still open: byte-identical compressed output
+# against the C encoder (the differential harness), Miri, the sanitizers, the
+# cbindgen header diff, the fuzz budget, and the throughput gates.  Do not read a
+# green `rust-test' as evidence for any of those.
 rust-test: rust
 	@if test -z "$(CARGO)"; then \
-	  echo '		*** cargo not found: Rust test skipped ***'; \
-	  exit 0; \
+	  echo 'make rust-test: no Rust toolchain -- $$(CARGO) is empty' >&2; \
+	  echo 'make rust-test: install cargo, then re-run ./configure, or name it:' >&2; \
+	  echo 'make rust-test:     make rust-test CARGO=cargo' >&2; \
+	  exit 1; \
 	fi; \
+	SRCROOT=`cd "$(SRCDIR)." && pwd`; \
 	RUSTLIB=`pwd`/$(RUSTLIBDIR); \
 	( set -e; \
-	  CARGO_TARGET_DIR=$(RUSTTARGETDIR); export CARGO_TARGET_DIR; \
-	  echo "$(CARGO) test $(CARGO_TEST_FLAGS)"; \
-	  $(CARGO) test $(CARGO_TEST_FLAGS) --manifest-path $(SRCDIR)Cargo.toml; \
-	  if test -n "$(SHAREDLIBV)" -a -f $(RUSTLIBDIR)/$(SHAREDLIBV); then \
+	  $(RUSTPATHGUARD); \
+	  TEST_FEATURES=''; \
+	  case "$${ZLIB_RS_SIMD-}" in \
+	    ''|0) ;; \
+	    1) TEST_FEATURES='--features zlib-rs/simd,libz-rs-sys/simd';; \
+	    *) echo "ZLIB_RS_SIMD must be 0 or 1, got \"$${ZLIB_RS_SIMD}\""; exit 1;; \
+	  esac; \
+	  CARGO_TARGET_DIR='$(RUSTTARGETDIR)'; export CARGO_TARGET_DIR; \
+	  echo "$(CARGO) test $(CARGO_TEST_FLAGS) $$TEST_FEATURES"; \
+	  $(CARGO) test $(CARGO_TEST_FLAGS) --manifest-path "$$SRCROOT/Cargo.toml" \
+	    $$TEST_FEATURES; \
+	  ZVER=`sed -n 's/^#define ZLIB_VERSION "\(.*\)"$$/\1/p' "$$SRCROOT/zlib.h"`; \
+	  case "$(SHAREDLIB)" in \
+	    *.dylib) SOV="libz.$$ZVER.dylib"; VERSIONED=0 ;; \
+	    *) SOV="$(SHAREDLIB).$$ZVER"; VERSIONED=1 ;; \
+	  esac; \
+	  if test -n "$(SHAREDLIBV)" && test -f "$$RUSTLIB/$$SOV"; then \
 	    ZLINK="-L$$RUSTLIB -lz -Wl,-rpath,$$RUSTLIB"; DYNAMIC=1; \
 	  else \
-	    ZLINK="$(RUSTLIBDIR)/$(STATICLIB)"; DYNAMIC=0; \
+	    ZLINK="$$RUSTLIB/$(STATICLIB)"; DYNAMIC=0; \
 	  fi; \
-	  $(CC) $(CFLAGS) $(ZINCOUT) -o $(RUSTLIBDIR)/examplerust$(EXE) \
-	    $(SRCDIR)test/example.c $(LDFLAGS) $$ZLINK; \
-	  $(CC) $(CFLAGS) $(ZINCOUT) -o $(RUSTLIBDIR)/minigziprust$(EXE) \
-	    $(SRCDIR)test/minigzip.c $(LDFLAGS) $$ZLINK; \
+	  if test $$DYNAMIC -eq 1 && test $$VERSIONED -eq 0; then \
+	    echo "make rust-test: $$SOV is not ELF, so zlib.map was not applied to"; \
+	    echo "make rust-test: it -- neither is it applied to the C library on"; \
+	    echo "make rust-test: this platform, where configure links with"; \
+	    echo "make rust-test: -install_name instead.  The four version-script"; \
+	    echo "make rust-test: comparisons are therefore skipped here; the"; \
+	    echo "make rust-test: drop-in link and run below still apply."; \
+	  fi; \
+	  if test $$DYNAMIC -eq 1 && test $$VERSIONED -eq 1 && \
+	     command -v nm > /dev/null 2>&1; then \
+	    WORK="$$RUSTLIB/abi"; rm -rf "$$WORK"; mkdir -p "$$WORK"; \
+	    nm -D --defined-only --extern-only "$$RUSTLIB/$$SOV" > "$$WORK/nm.txt"; \
+	    awk '$$2 == "A" { print $$3 }' "$$WORK/nm.txt" | sort -u > "$$WORK/have-nodes"; \
+	    sed -n 's/^\(ZLIB_[0-9.]*\)[[:space:]]*{.*/\1/p' "$$SRCROOT/zlib.map" \
+	      | sort -u > "$$WORK/want-nodes"; \
+	    if cmp -s "$$WORK/want-nodes" "$$WORK/have-nodes"; then \
+	      N=`wc -l < "$$WORK/want-nodes"`; \
+	      echo "make rust-test: $$N symbol version nodes match zlib.map"; \
+	    else \
+	      echo "make rust-test: symbol version nodes differ from zlib.map;" >&2; \
+	      echo "make rust-test: '-' wanted by zlib.map, '+' found in $$SOV:" >&2; \
+	      diff -u "$$WORK/want-nodes" "$$WORK/have-nodes" >&2 || true; \
+	      exit 1; \
+	    fi; \
+	    awk '$$2 != "A" { print $$3 }' "$$WORK/nm.txt" | sed 's/@@.*//' \
+	      | sort -u > "$$WORK/have-all"; \
+	    sed -n '/local:/,/};/p' "$$SRCROOT/zlib.map" \
+	      | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\);$$/\1/p' \
+	      | sort -u > "$$WORK/must-hide"; \
+	    LEAK=`comm -12 "$$WORK/must-hide" "$$WORK/have-all" | tr '\n' ' '`; \
+	    if test -n "$$LEAK"; then \
+	      echo "make rust-test: zlib.map hides these, but they are exported:" >&2; \
+	      echo "make rust-test:     $$LEAK" >&2; \
+	      exit 1; \
+	    fi; \
+	    LEAK=`grep '^_' "$$WORK/have-all" | tr '\n' ' ' || true`; \
+	    if test -n "$$LEAK"; then \
+	      echo "make rust-test: zlib.map hides _*, but these are exported:" >&2; \
+	      echo "make rust-test:     $$LEAK" >&2; \
+	      exit 1; \
+	    fi; \
+	    sed -n 's/^[[:space:]]*ZEXTERN.*ZEXPORT\(VA\)*[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*(.*/\2/p' \
+	      "$$SRCROOT/zlib.h" | sort -u > "$$WORK/declared"; \
+	    for M in deflateInit deflateInit2 inflateInit inflateInit2 inflateBackInit; \
+	      do echo "$$M"; done | sort -u > "$$WORK/macro-forms"; \
+	    comm -23 "$$WORK/declared" "$$WORK/macro-forms" > "$$WORK/want-funcs.all"; \
+	    if test -n "$(EXE)"; then \
+	      cp "$$WORK/want-funcs.all" "$$WORK/want-funcs"; \
+	    else \
+	      grep -v '^gzopen_w$$' "$$WORK/want-funcs.all" > "$$WORK/want-funcs" || true; \
+	    fi; \
+	    grep -v '^rust_eh_personality$$' "$$WORK/have-all" \
+	      > "$$WORK/have-funcs" || true; \
+	    if cmp -s "$$WORK/want-funcs" "$$WORK/have-funcs"; then \
+	      N=`wc -l < "$$WORK/want-funcs"`; \
+	      echo "make rust-test: $$N exported functions match zlib.h exactly"; \
+	    else \
+	      echo "make rust-test: the exported function set does not match the set" >&2; \
+	      echo "make rust-test: zlib.h declares.  '-' lines are declared in" >&2; \
+	      echo "make rust-test: zlib.h but not exported by $$SOV; '+' lines are" >&2; \
+	      echo "make rust-test: exported but not declared:" >&2; \
+	      diff -u "$$WORK/want-funcs" "$$WORK/have-funcs" >&2 || true; \
+	      exit 1; \
+	    fi; \
+	  fi; \
+	  $(CC) $(CFLAGS) $(ZINCOUT) -o "$$RUSTLIB/examplerust$(EXE)" \
+	    "$$SRCROOT/test/example.c" $(LDFLAGS) $$ZLINK; \
+	  $(CC) $(CFLAGS) $(ZINCOUT) -o "$$RUSTLIB/minigziprust$(EXE)" \
+	    "$$SRCROOT/test/minigzip.c" $(LDFLAGS) $$ZLINK; \
+	  $(CC) $(CFLAGS) $(ZINCOUT) -o "$$RUSTLIB/infcoverrust$(EXE)" \
+	    "$$SRCROOT/test/infcover.c" $(LDFLAGS) "$$RUSTLIB/$(STATICLIB)"; \
 	  if test $$DYNAMIC -eq 1; then \
 	    LD_LIBRARY_PATH=$$RUSTLIB$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}; \
 	    export LD_LIBRARY_PATH; \
@@ -267,20 +781,21 @@ rust-test: rust
 	    SHLIB_PATH=$$RUSTLIB$${SHLIB_PATH:+:$$SHLIB_PATH}; \
 	    export SHLIB_PATH; \
 	    if command -v ldd > /dev/null 2>&1; then \
-	      ldd $(RUSTLIBDIR)/examplerust$(EXE) > $(RUSTLIBDIR)/ldd.log 2>&1; \
-	      grep libz $(RUSTLIBDIR)/ldd.log || true; \
-	      grep -F -q "$$RUSTLIB/libz" $(RUSTLIBDIR)/ldd.log || { \
-	        echo "libz did not resolve to $$RUSTLIB"; \
+	      ldd "$$RUSTLIB/examplerust$(EXE)" > "$$RUSTLIB/ldd.log" 2>&1; \
+	      grep libz "$$RUSTLIB/ldd.log" || true; \
+	      grep -F -q "$$RUSTLIB/libz" "$$RUSTLIB/ldd.log" || { \
+	        echo "libz did not resolve to $$RUSTLIB" >&2; \
 	        exit 1; \
 	      }; \
 	    else \
 	      echo 'warning: no ldd, cannot confirm which libz was bound'; \
 	    fi; \
 	  fi; \
-	  echo hello world | ${QEMU_RUN} $(RUSTLIBDIR)/minigziprust$(EXE) | \
-	    ${QEMU_RUN} $(RUSTLIBDIR)/minigziprust$(EXE) -d; \
-	  ${QEMU_RUN} $(RUSTLIBDIR)/examplerust$(EXE) $(RUSTLIBDIR)/tmprust.gz; \
-	  rm -f $(RUSTLIBDIR)/tmprust.gz; \
+	  echo hello world | ${QEMU_RUN} "$$RUSTLIB/minigziprust$(EXE)" | \
+	    ${QEMU_RUN} "$$RUSTLIB/minigziprust$(EXE)" -d; \
+	  ${QEMU_RUN} "$$RUSTLIB/examplerust$(EXE)" "$$RUSTLIB/tmprust.gz"; \
+	  rm -f "$$RUSTLIB/tmprust.gz"; \
+	  ${QEMU_RUN} "$$RUSTLIB/infcoverrust$(EXE)"; \
 	); rc=$$?; \
 	if test $$rc -eq 0; then \
 	  echo '		*** zlib Rust test OK ***'; \
@@ -288,19 +803,126 @@ rust-test: rust
 	  echo '		*** zlib Rust test FAILED ***'; false; \
 	fi
 
-# Remove everything `rust' and `rust-test' produced: cargo's own output, the
-# staged symlink chain and relinked drivers under $(RUSTLIBDIR), and the scratch
-# files the generated-header and symbol-parity comparisons leave behind.  This
-# is deliberately not a prerequisite of `clean': `clean' is part of the C build
-# and runs from `distclean', where cargo may well be missing.
-rust-clean:
-	-@if test -n "$(CARGO)"; then \
-	  echo "$(CARGO) clean"; \
-	  CARGO_TARGET_DIR=$(RUSTTARGETDIR) \
-	    $(CARGO) clean --manifest-path $(SRCDIR)Cargo.toml; \
+# Compare the staged Rust library's exported symbol set against the C reference
+# library's, name for name, and print the difference in both directions.  This is
+# the coarse-grained counterpart to the four comparisons in `rust-test': it needs
+# a built C library to compare with ($(ZLIBREF), overridable), and in exchange it
+# reports missing and extra exports as two explicit lists.
+rust-symbols: rust
+	@if test -z "$(CARGO)"; then \
+	  echo '		*** cargo not found: Rust symbol comparison skipped ***'; \
+	  exit 0; \
+	fi; \
+	if test -z "$(SHAREDLIBV)"; then \
+	  echo '		*** static-only build: no shared library to compare ***'; \
+	  exit 0; \
+	fi; \
+	if ! command -v $(RUSTNM) > /dev/null 2>&1; then \
+	  echo "$(RUSTNM) is unavailable, so the symbol sets cannot be compared"; \
+	  exit 1; \
+	fi; \
+	if test ! -f $(ZLIBREF); then \
+	  echo "the C reference library $(ZLIBREF) does not exist."; \
+	  echo "Build it with 'make $(SHAREDLIBV)', or point ZLIBREF at a copy:"; \
+	  echo "    make rust-symbols ZLIBREF=/path/to/$(SHAREDLIBV)"; \
+	  exit 1; \
+	fi; \
+	set -e; \
+	$(RUSTNM) -D --defined-only --extern-only $(ZLIBREF) \
+	  | awk '{ print $$NF }' | sort > c.syms; \
+	$(RUSTNM) -D --defined-only --extern-only $(RUSTLIBDIR)/$(SHAREDLIBV) \
+	  | awk '{ print $$NF }' | sort > rust.syms; \
+	echo "C   $(ZLIBREF): `wc -l < c.syms` symbols"; \
+	echo "Rust $(RUSTLIBDIR)/$(SHAREDLIBV): `wc -l < rust.syms` symbols"; \
+	if diff -u c.syms rust.syms > /dev/null 2>&1; then \
+	  echo '		*** zlib Rust symbol parity OK ***'; \
+	else \
+	  comm -23 c.syms rust.syms > missing.syms; \
+	  comm -13 c.syms rust.syms > extra.syms; \
+	  if test -s missing.syms; then \
+	    echo "MISSING from the Rust library (`wc -l < missing.syms`):"; \
+	    sed 's/^/    /' missing.syms; \
+	  fi; \
+	  if test -s extra.syms; then \
+	    echo "EXTRA in the Rust library (`wc -l < extra.syms`):"; \
+	    sed 's/^/    /' extra.syms; \
+	  fi; \
+	  rm -f missing.syms extra.syms; \
+	  echo '		*** zlib Rust symbol parity FAILED ***'; \
+	  false; \
 	fi
-	rm -rf $(RUSTTARGETDIR)
-	rm -f generated_zlib.h rust.syms c.syms
+# Remove everything `rust' and `rust-test' produced: cargo's own output, and with
+# it the packaged library, the relinked drivers and the symbol lists that all live
+# under $(RUSTLIBDIR) inside $(RUSTTARGETDIR).  The names on the final `rm' are the
+# scratch files the by-hand generated-header and symbol-parity commands leave in
+# the build directory itself, which `.gitignore' also carries anchored rules for.
+# This is deliberately not a prerequisite of `clean': `clean' is part of the C
+# build and runs from `distclean', where cargo may well be missing.
+#
+# $(RUSTPATHGUARD) runs first and unconditionally.  $(RUSTTARGETDIR) is the
+# operand of the only recursive delete in this file, it is overrideable, and
+# `rm -rf' does not ask twice -- so the destination is proved to be a relative
+# path resolving strictly beneath the build directory before the command is
+# reached.  The guard is a separate recipe line so that it cannot be skipped by
+# the `-' prefix on the line below, which exists only so that a missing cargo
+# does not fail the target.
+#
+# Every directory this removes is checked first, because $(RUSTTARGETDIR) and
+# $(RUSTLIBDIR) are overridable on the command line and this recipe deletes
+# recursively.  A name is only accepted when it is relative, contains no `..'
+# component, and resolves -- symlinks included -- to a path strictly inside the
+# build directory.  Anything else is refused by name, with a nonzero status,
+# rather than removed or silently skipped: `make rust-clean RUSTTARGETDIR=/'
+# has to be an error, and a rust-clean that quietly cleaned nothing would leave
+# a stale library staged for the next drop-in test to bind.
+#
+# ALL of that validation happens in the first loop, before anything is run or
+# removed, and that ordering is the point.  `cargo clean' honours the same
+# overridable $(RUSTTARGETDIR) through CARGO_TARGET_DIR and deletes it just as
+# recursively as the `rm -rf' below does, so validating only immediately before
+# the `rm -rf' would leave cargo to act on a path this recipe had already
+# decided to refuse -- it would delete the directory and only then would the
+# refusal be printed.  Measured: with the checks inline in the removal loop,
+# `make rust-clean RUSTTARGETDIR=/tmp/somewhere/build' removed that directory
+# and *then* reported that it was refusing to remove it.  Validate everything
+# up front, act afterwards.
+rust-clean:
+	@set -e; \
+	srcroot=`cd "$(SRCDIR)." && pwd`; \
+	buildroot=`pwd -P`; \
+	for d in '$(RUSTTARGETDIR)' '$(RUSTLIBDIR)' '$(RUSTLIBDIR).new'; do \
+	  test -n "$$d" || continue; \
+	  case "$$d" in \
+	    /* | ../* | */../* | */.. | ..) \
+	      echo "make rust-clean: refusing to clean '$$d': it is not a plain" >&2; \
+	      echo "make rust-clean: relative path inside the build directory." >&2; \
+	      exit 1 ;; \
+	  esac; \
+	  test -e "$$d" || continue; \
+	  if test ! -d "$$d"; then \
+	    echo "make rust-clean: refusing to clean '$$d': not a directory" >&2; \
+	    exit 1; \
+	  fi; \
+	  resolved=`cd "$$d" && pwd -P`; \
+	  case "$$resolved" in \
+	    "$$buildroot"/?*) ;; \
+	    *) echo "make rust-clean: refusing to clean '$$d': it resolves to" >&2; \
+	       echo "make rust-clean: $$resolved, outside $$buildroot." >&2; \
+	       exit 1 ;; \
+	  esac; \
+	done; \
+	if test -n "$(CARGO)"; then \
+	  echo "$(CARGO) clean"; \
+	  CARGO_TARGET_DIR='$(RUSTTARGETDIR)' \
+	    $(CARGO) clean --manifest-path "$$srcroot/Cargo.toml" || true; \
+	fi; \
+	for d in '$(RUSTTARGETDIR)' '$(RUSTLIBDIR)' '$(RUSTLIBDIR).new'; do \
+	  test -n "$$d" || continue; \
+	  test -d "$$d" || continue; \
+	  echo "rm -rf $$d"; \
+	  rm -rf "$$d"; \
+	done; \
+	rm -f generated_zlib.h rust.syms c.syms missing.syms extra.syms
 
 libz.a: $(OBJS)
 	$(AR) $(ARFLAGS) $@ $(OBJS)
@@ -576,9 +1198,15 @@ distclean: clean zconf # zconf.h.cmakein
 	@if [ -f Makefile.in ]; then \
 	printf 'all:\n\t-@echo "Please use ./configure first.  Thank you."\n' > Makefile ; \
 	printf '\ndistclean:\n\tmake -f Makefile.in distclean\n' >> Makefile ; \
-	printf '\nrust:\n\tmake -f Makefile.in rust\n' >> Makefile ; \
-	printf '\nrust-test:\n\tmake -f Makefile.in rust-test\n' >> Makefile ; \
-	printf '\nrust-clean:\n\tmake -f Makefile.in rust-clean\n' >> Makefile ; \
+	printf '\n# The Rust targets work before ./configure has run, so they are forwarded\n' >> Makefile ; \
+	printf '# rather than refused.  They stage a library named from the ZLIB_VERSION in\n' >> Makefile ; \
+	printf "# zlib.h, not from Makefile.in's unconfigured SHAREDLIBV default, so the name\n" >> Makefile ; \
+	printf "# is right on this path too.  This file is regenerated by \`distclean'; keep it\n" >> Makefile ; \
+	printf '# and that recipe in step.\n' >> Makefile ; \
+	printf 'rust:\n\t$$(MAKE) -f Makefile.in rust\n' >> Makefile ; \
+	printf '\nrust-test:\n\t$$(MAKE) -f Makefile.in rust-test\n' >> Makefile ; \
+	printf '\nrust-symbols:\n\t$$(MAKE) -f Makefile.in rust-symbols\n' >> Makefile ; \
+	printf '\nrust-clean:\n\t$$(MAKE) -f Makefile.in rust-clean\n' >> Makefile ; \
 	touch -r $(SRCDIR)Makefile.in Makefile ; fi
 
 tags:

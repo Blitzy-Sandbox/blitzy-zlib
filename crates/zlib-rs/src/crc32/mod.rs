@@ -2,7 +2,7 @@
 //! backend, and the one place the one's-complement conditioning is applied.
 //!
 //! This module is the public face of the CRC-32 implementation and, together with the five
-//! sibling modules it declares, the port of `crc32.c` -- 983 lines that remain in the tree
+//! sibling modules it declares, the mirror of `crc32.c` -- 983 lines that remain in the tree
 //! unmodified, serving as the differential oracle every value produced here is measured against
 //! -- plus its generated companion `crc32.h`, 9,446 lines of tables. Not one table lookup
 //! happens in this file. It owns the three entry points the public header declares, the contract
@@ -34,12 +34,12 @@
 //! correctness is a wire-format property and not merely an implementation detail. RFC 1952 puts
 //! it in the four bytes immediately before `ISIZE` in a member trailer
 //! (`doc/rfc1952.txt` L276) and defines it over the *uncompressed* data
-//! (`doc/rfc1952.txt` L419-L426). Four call sites in this port therefore depend on this module:
+//! (`doc/rfc1952.txt` L419-L426). Four call sites in this implementation therefore depend on this module:
 //!
 //! * `deflate` accumulates it over the uncompressed input as that input is copied into the
 //!   window -- `read_buf` at `deflate.c` L219-L240, reached at L233 only when `wrap == 2`, whose
 //!   counterpart in this crate is `read_buf.rs` -- and writes the finished value into the gzip
-//!   trailer. That call site is the one that decides whether this port's gzip output is
+//!   trailer. That call site is the one that decides whether this implementation's gzip output is
 //!   byte-identical to the reference implementation's, which is why [`crc32()`] carries exactly
 //!   that name and that signature.
 //! * `inflate` recomputes it over the bytes it produces and compares the result against the
@@ -62,7 +62,7 @@
 //!
 //! # Module map
 //!
-//! | Module | Ported from | Role |
+//! | Module | Mirrors | Role |
 //! |---|---|---|
 //! | `tables` | `crc32.h` | The generated tables as `const` data: [`CRC_TABLE`] and friends |
 //! | `generic` | `crc32.c` L922-L937 | Byte-at-a-time reference path: [`Generic`] |
@@ -71,8 +71,9 @@
 //! | `simd` | -- | Optional, output-neutral throughput work; `simd` feature only |
 //!
 //! `tables` is the only one of the five that is `pub`, because
-//! `crates/zlib-rs-differential/tests/table_equality.rs` compares its arrays against `crc32.h`
-//! element for element -- the cheapest high-signal check in the whole port. The other four are
+//! the planned `crates/zlib-rs-differential/tests/table_equality.rs` will compare its arrays
+//! against `crc32.h` element for element -- the cheapest high-signal check in the whole port,
+//! though it has not landed yet. The other four are
 //! private, and the items this module re-exports from them are the entirety of their reachable
 //! surface: everything the C sources declare `local` -- `braid`, `crc_word`, `crc_word_big`,
 //! `byte_swap`, `multmodp`, `x2nmodp` -- stays inside the subsystem, exactly as it does in C.
@@ -128,7 +129,7 @@
 //! the reference implementation itself calls both from inside the library -- `crc32` over input
 //! bytes at `deflate.c` L233, `crc32_z` over the pending buffer at `deflate.c` L976 and L1111 --
 //! so giving each one a same-named Rust function preserves the one-to-one correspondence with the
-//! C sources that the rest of this port is organised around.
+//! C sources that the rest of this implementation is organised around.
 //!
 //! The combine family is re-exported here rather than reimplemented: [`crc32_combine`],
 //! [`crc32_combine64`], [`crc32_combine_gen`], [`crc32_combine_gen64`] and [`crc32_combine_op`]
@@ -155,15 +156,23 @@
 //! written in portable safe integer arithmetic with no architecture intrinsic to guard, so a
 //! `simd`-enabled build computes the right answer on a machine with no vector unit at all. That
 //! is why nothing in this module queries target features, and why nothing should be added that
-//! does. The `ZLIB_RS_SIMD` environment toggle is read once, at build time, by
-//! `crates/libz-rs-sys/build.rs`, which maps it onto the `simd` feature; a library that consulted
-//! the environment on a hot path would be both slower and less predictable than one that did not.
+//! does. **The CRC-32 side performs no detection of any kind** -- unlike `adler32/simd.rs`, which
+//! exposes an `is_supported()` that its parent module consults as a throughput hint only, never as
+//! a correctness guard.
+//!
+//! Selection is therefore entirely a build-time matter, and precisely: **the Cargo feature `simd`
+//! on this crate is the only thing that compiles the `Simd` backend in.** The `ZLIB_RS_SIMD` environment
+//! toggle is read once, at build time, by `crates/libz-rs-sys/build.rs`, which republishes it as
+//! `cfg(zlib_rs_simd)` for the *facade* crate -- a build script cannot enable a Cargo feature, so
+//! it does not and cannot map the variable onto `simd`, and nothing under `crates/zlib-rs/src/`
+//! reads that `cfg`. A library that consulted the environment on a hot path would be both slower
+//! and less predictable than one that did not, which is why neither mechanism is a run-time one.
 //!
 //! That vectorizing a check value is permissible at all is specific to checksums. A CRC-32 is a
 //! single scalar in `GF(2)` however its linear recurrence is evaluated, so independent partial
 //! remainders can be recombined exactly. The same reasoning emphatically does not extend to the
 //! compressor, where the order in which match candidates are examined decides which match is
-//! emitted; vectorised match finding is therefore prohibited in this port while vectorised
+//! emitted; vectorised match finding is therefore prohibited in this implementation while vectorised
 //! checksums are welcome. The two cases look alike and must not be conflated.
 //!
 //! # `Z_NULL`, and why an empty slice is not it
@@ -174,7 +183,7 @@
 //! the idiom callers are expected to write: `uLong crc = crc32(0L, Z_NULL, 0);`.
 //!
 //! A `&[u8]` cannot be null, so that case cannot arise in this crate at all; it is honoured one
-//! layer up, at the FFI boundary in `crates/libz-rs-sys/src/checksum.rs`, which must answer a
+//! layer up, at the FFI boundary in the planned `crates/libz-rs-sys/src/checksum.rs`, which must answer a
 //! null pointer with `0` *without* calling in here. The asymmetry is worth stating precisely,
 //! because it is the one place a faithful facade differs from a naive one: the C entry point
 //! returns the initial value regardless of the `crc` argument, so `crc32(5, Z_NULL, 0)` is `0`
@@ -210,8 +219,11 @@
 //! and every function in this module is safe to call from any thread at any time.
 //!
 //! One externally visible consequence follows: because this port has no dynamic CRC table, bit 13
-//! of `zlibCompileFlags()` -- `DYNAMIC_CRC_TABLE` -- is honestly reported CLEAR by
-//! `crates/libz-rs-sys/src/util.rs`.
+//! of `zlibCompileFlags()` -- `DYNAMIC_CRC_TABLE` -- must be reported CLEAR, which is the honest
+//! answer. The planned `crates/libz-rs-sys/src/util.rs` is where that bit is computed, so that is
+//! where the requirement lands; the file has not been written yet. Note that the bit is about the
+//! *initialisation strategy* only: a dynamic table holds the same values, so neither checksums nor
+//! compressed output differ between the two configurations.
 //!
 //! # Layering and safety posture
 //!
@@ -224,7 +236,7 @@
 //! this family -- `crc32`, `crc32_z`, `get_crc_table`, `crc32_combine`, `crc32_combine64`,
 //! `crc32_combine_gen`, `crc32_combine_gen64` and `crc32_combine_op`, all eight present in the
 //! reference library's dynamic symbol table -- are defined in
-//! `crates/libz-rs-sys/src/checksum.rs`, which calls into this module. The separation is absolute:
+//! the planned `crates/libz-rs-sys/src/checksum.rs`, which will call into this module. The separation is absolute:
 //! no item below may be given a stable exported symbol name, however convenient that might seem.
 //! Note that `zlib.map` does not hide any of the eight, since they are public API; the `local:`
 //! block at `zlib.map` L9-L19 hides internals of other subsystems. That is the facade's concern
@@ -236,7 +248,9 @@
 //!
 //! # Examples
 //!
-//! ```ignore
+//! ```
+//! use zlib_rs::crc32::{crc32, crc32_combine64, get_crc_table};
+//!
 //! // A fresh check value starts from zero -- the same value the C `Z_NULL` idiom returns.
 //! let mut crc = 0;
 //!
@@ -257,6 +271,32 @@
 //! assert_eq!(crc32(0, b"123456789"), 0xcbf4_3926);
 //! assert_eq!(get_crc_table()[1], 0x7707_3096);
 //! ```
+//!
+//! # Provenance
+//!
+//! CRC-32: the checksum RFC 1952 puts in the gzip trailer.
+//!
+//! Ported from `crc32.c` and `crc32.h`. The tables are `const`-evaluated rather than built at
+//! run time, which removes the reference's unsynchronised `DYNAMIC_CRC_TABLE` initialisation and
+//! its `<stdatomic.h>` dependency outright.
+//!
+//! [`Braid`]: crate::crc32::Braid
+//! [`Generic`]: crate::crc32::Generic
+//! [`tables::POLY`]: crate::crc32::tables::POLY
+
+// The definitions closing the module documentation above are link-reference definitions, not
+// prose: a module whose `mod` declaration carries an outer doc comment has its `//!` block
+// resolved in the scope of the DECLARING module, so an unqualified sibling name does not
+// resolve. See "Documentation lints" in `src/lib.rs` for the rule and the gate.
+
+// Names that repeat their module's name are deliberate here: the C sources this module ports name
+// these entry points, and `crates/zlib-rs/src/lib.rs` re-exports several of them under exactly
+// these names, so renaming any of them to satisfy `clippy::module_name_repetitions` would cost the
+// traceability the port is judged on. The lint sits in `pedantic`, which this workspace denies, and
+// it fires on the declared 1.80 floor; upstream has since reclassified it, so the allowance is what
+// keeps the same lint gate passing on both toolchains. The same relaxation, for the same reason,
+// already appears in `config.rs`, `deflate/**`, `inflate/**` and `gz/**`.
+#![allow(clippy::module_name_repetitions)]
 
 pub mod tables;
 
@@ -265,10 +305,6 @@ mod combine;
 mod generic;
 #[cfg(feature = "simd")]
 mod simd;
-
-// -----------------------------------------------------------------------------
-//  Re-exports: the whole CRC-32 surface reachable from one path
-// -----------------------------------------------------------------------------
 
 /// The braided word-at-a-time backend -- see [`braid::Braid`].
 ///
@@ -332,7 +368,8 @@ pub use self::simd::Simd;
 /// Word-sized big-endian CRC-32 table -- see [`tables::CRC_BIG_TABLE`].
 ///
 /// Re-exported so the whole subsystem is reachable from one path and so that
-/// `crates/zlib-rs-differential/tests/table_equality.rs` can compare it against `crc32.h`.
+/// the planned `crates/zlib-rs-differential/tests/table_equality.rs` will be able to compare it
+/// against `crc32.h`.
 pub use self::tables::CRC_BIG_TABLE;
 
 /// Braided big-endian CRC-32 tables -- see [`tables::CRC_BRAID_BIG_TABLE`].
@@ -359,10 +396,6 @@ pub use self::tables::CRC_TABLE;
 /// for the same reason as [`CRC_BIG_TABLE`].
 pub use self::tables::X2N_TABLE;
 
-// -----------------------------------------------------------------------------
-//  The backend contract
-// -----------------------------------------------------------------------------
-
 /// A swappable CRC-32 computation backend.
 ///
 /// The trait exists so that the byte-at-a-time engine, the braided engine and the optional
@@ -387,7 +420,7 @@ pub use self::tables::X2N_TABLE;
 /// wire format, so a backend that differed in one bit would produce members the reference
 /// implementation rejects. A backend may differ only in how long it takes.
 ///
-/// This clause is the whole reason vectorising a check value is permitted in this port at all. A
+/// This clause is the whole reason vectorising a check value is permitted in this implementation at all. A
 /// CRC-32 is one scalar in `GF(2)` however its recurrence is evaluated, so independent partial
 /// remainders recombine exactly; the trait boundary is the mechanism that keeps that guarantee
 /// checkable, and the tests at the foot of this file are where it is checked.
@@ -400,15 +433,11 @@ pub use self::tables::X2N_TABLE;
 /// library needs dynamic dispatch, and routing a check value through a vtable would defeat the
 /// inlining the throughput targets depend on.
 //
-// The name repeats the module name, which `clippy::module_name_repetitions` objects to. That lint
-// sits in the pedantic set this workspace denies at the declared MSRV of 1.80 and has since been
-// reclassified, so it does not fire on every toolchain -- but the allow is kept, because the name
-// is fixed regardless: the plan mandates it, `crates/zlib-rs/src/lib.rs` names it in its documented
-// re-export surface, and all three backend modules are already written against it, so renaming it
-// would break three implementations and the crate root at once. Scoped to this one item rather
-// than applied to the module, and matching how `config.rs`, `deflate/state.rs` and
-// `inflate/state.rs` handle the same collision.
-#[allow(clippy::module_name_repetitions)]
+// `Crc32Backend` repeats the module name, and so do six other items here, which is why the
+// allowance is stated once at the top of this file rather than seven times. The name is fixed
+// regardless of the lint: the plan mandates it, `crates/zlib-rs/src/lib.rs` names it in its
+// documented re-export surface, and all three backend modules are written against it, so renaming
+// it would break three implementations and the crate root at once.
 pub trait Crc32Backend {
     /// Short identifier for diagnostics and benchmark labels.
     ///
@@ -432,10 +461,6 @@ pub trait Crc32Backend {
     /// a plain `u32` rather than a fallible one.
     fn update(crc: u32, buf: &[u8]) -> u32;
 }
-
-// -----------------------------------------------------------------------------
-//  Invariants, pinned at compile time
-// -----------------------------------------------------------------------------
 
 /// The byte-wise table must have one entry per byte value.
 ///
@@ -466,10 +491,6 @@ const _: () = {
     assert!((!(wide as u32)) ^ 0xffff_ffff == wide as u32);
 };
 
-// -----------------------------------------------------------------------------
-//  Backend selection
-// -----------------------------------------------------------------------------
-
 /// The backend [`crc32`] folds its input through, chosen at build time.
 ///
 /// `Simd` when the crate's `simd` feature is enabled, [`Braid`] otherwise. The alias is private
@@ -480,8 +501,10 @@ const _: () = {
 /// Selection is output-neutral by contract -- see [`Crc32Backend`] -- so this alias can change
 /// which instructions run and how long they take, never which bytes a stream carries. It is also
 /// the *only* switch: there is no run-time probe, because the vectorization-friendly backend is
-/// portable integer arithmetic with no architecture intrinsic to guard, and `ZLIB_RS_SIMD` is read
-/// at build time by `crates/libz-rs-sys/build.rs`, never here.
+/// portable integer arithmetic with no architecture intrinsic to guard, and `ZLIB_RS_SIMD` is a
+/// build-time consistency check in `crates/libz-rs-sys/build.rs` rather than a second selector --
+/// it cannot enable a Cargo feature, so it verifies that the feature agrees with the request and
+/// fails the build if it does not.
 #[cfg(feature = "simd")]
 type Selected = Simd;
 
@@ -493,14 +516,10 @@ type Selected = Simd;
 #[cfg(not(feature = "simd"))]
 type Selected = Braid;
 
-// -----------------------------------------------------------------------------
-//  Entry points
-// -----------------------------------------------------------------------------
-
 /// Update a running CRC-32 with `buf` and return the updated check value.
 ///
-/// Port of `crc32` (`crc32.c` L946-L951) and of the body of `crc32_z` (`crc32.c` L626-L941) that
-/// it forwards to. This is the function the rest of the port calls: `read_buf.rs` uses it to
+/// Mirrors `crc32` (`crc32.c` L946-L951) and of the body of `crc32_z` (`crc32.c` L626-L941) that
+/// it forwards to. This is the function the rest of the implementation calls: `read_buf.rs` uses it to
 /// accumulate a gzip member's check value over uncompressed input when `wrap == 2`, mirroring
 /// `deflate.c` L233, and the header path mirrors `inflate.c` L314-L323 and L623-L667.
 ///
@@ -524,7 +543,7 @@ type Selected = Braid;
 /// C entry point additionally answers a *null* pointer with the initial value `0` regardless of
 /// its `crc` argument (`crc32.c` L627-L628, `zlib.h` L1851-L1852), so `crc32(5, Z_NULL, 0)` is `0`
 /// while `crc32(5, &[])` is `5`. A slice cannot be null, so that case belongs to
-/// `crates/libz-rs-sys/src/checksum.rs`; see the module documentation for the full table.
+/// the planned `crates/libz-rs-sys/src/checksum.rs`; see the module documentation for the full table.
 ///
 /// # Which backend runs
 ///
@@ -549,13 +568,13 @@ pub fn crc32(start: u32, buf: &[u8]) -> u32 {
 
 /// Update a running CRC-32 with `buf` and return the updated check value.
 ///
-/// Port of `crc32_z` (`crc32.c` L626-L941). The two C declarations differ only in the width of the
+/// Mirrors `crc32_z` (`crc32.c` L626-L941). The two C declarations differ only in the width of the
 /// length argument -- `uInt` for `crc32` (`zlib.h` L1848), `z_size_t` for `crc32_z`
 /// (`zlib.h` L1866-L1867), whose documentation says merely "Same as `crc32()`, but with a `size_t`
 /// length" -- and a Rust slice carries its own length, so that distinction disappears here. This
 /// function is an exact synonym for [`crc32`] and forwards to it unchanged.
 ///
-/// Both names are kept because `crates/libz-rs-sys/src/checksum.rs` must export both C symbols
+/// Both names are kept because the planned `crates/libz-rs-sys/src/checksum.rs` must export both C symbols
 /// from this one implementation, and because the reference sources call both from inside the
 /// library: `crc32` over input bytes at `deflate.c` L233, `crc32_z` over the pending buffer while
 /// computing a gzip header check at `deflate.c` L976 and L1111. Giving each C name a same-named
@@ -571,13 +590,13 @@ pub fn crc32_z(start: u32, buf: &[u8]) -> u32 {
 
 /// Return the byte-wise CRC-32 table: the check value of every possible eight-bit value.
 ///
-/// Port of `get_crc_table` (`crc32.c` L482-L487), declared among the undocumented functions at
+/// Mirrors `get_crc_table` (`crc32.c` L482-L487), declared among the undocumented functions at
 /// `zlib.h` L2034-L2035 as returning `const z_crc_t FAR *`. The comment at `crc32.c` L478-L481
 /// gives its two purposes: to let an assembler implementation of `crc32()` share the table, and
 /// "to force the generation of the CRC tables in a threaded application".
 ///
 /// The safe core deliberately hands back a reference to the data rather than a raw pointer;
-/// `crates/libz-rs-sys/src/checksum.rs` converts this reference into the `const z_crc_t *` the C
+/// the planned `crates/libz-rs-sys/src/checksum.rs` will convert this reference into the `const z_crc_t *` the C
 /// signature promises, which is the only place a pointer needs to exist. The returned reference is
 /// `'static` and stable across calls: it borrows one compiler-materialized copy of
 /// [`CRC_TABLE`], not a fresh temporary.
@@ -590,8 +609,8 @@ pub fn crc32_z(start: u32, buf: &[u8]) -> u32 {
 /// first-use generation of the crc tables", so such a build must call `get_crc_table()` before
 /// letting a second thread near `crc32()`. Here the tables are `const` data, so this accessor is
 /// always valid, always returns the same address, and is safe to call from any thread at any time
-/// -- and bit 13 of `zlibCompileFlags()`, `DYNAMIC_CRC_TABLE`, is honestly reported CLEAR by
-/// `crates/libz-rs-sys/src/util.rs` as a result.
+/// -- and bit 13 of `zlibCompileFlags()`, `DYNAMIC_CRC_TABLE`, must therefore be reported CLEAR by
+/// the planned `crates/libz-rs-sys/src/util.rs`, which is the honest answer for a `const` table.
 #[must_use]
 pub fn get_crc_table() -> &'static [u32; 256] {
     // `crc32.c` L486: `return (const z_crc_t FAR *)crc_table;`. Borrowing a `const` array promotes
@@ -832,7 +851,7 @@ mod tests {
 
     /// Every `(start, len)` triple measured against the in-tree C implementation.
     ///
-    /// This is the test that makes the port's agreement with the oracle a property of *this* file:
+    /// This is the test that makes this implementation's agreement with the oracle a property of *this* file:
     /// it exercises the pre-condition, the backend the build selected, and the post-condition
     /// together, at lengths on both sides of every threshold.
     #[test]
@@ -1048,7 +1067,7 @@ mod tests {
 
     /// The re-exported surface is reachable from this module and names the generated data.
     ///
-    /// `crates/zlib-rs-differential/tests/table_equality.rs` compares these arrays against
+    /// the planned `crates/zlib-rs-differential/tests/table_equality.rs` will compare these arrays against
     /// `crc32.h` element for element, and `crates/zlib-rs/src/lib.rs` re-exports [`CRC_TABLE`] from
     /// the crate root, so each name has to stay reachable here. Naming all five in one test makes a
     /// removal or a rename a compile error rather than a downstream surprise.

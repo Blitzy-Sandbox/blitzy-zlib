@@ -1,4 +1,4 @@
-//! The hot decode loop: the port of `inffast.c` L50-L305 (`inflate_fast`),
+//! The hot decode loop: the Rust counterpart of `inffast.c` L50-L305 (`inflate_fast`),
 //! folded into the `inflate` module tree.
 //!
 //! The reference file states this module's importance in its own header comment
@@ -67,7 +67,7 @@
 //! themselves: leaving that much slack is what preserves the guarantee for the
 //! *next* iteration.
 //!
-//! ## Because they are assumptions, this port does not rely on them
+//! ## Because they are assumptions, this implementation does not rely on them
 //!
 //! Every buffer access here is bounds-checked whether or not the contract holds,
 //! and the four assumptions the reference actually maintains are additionally
@@ -83,17 +83,14 @@
 //! here and deliberately *not* asserted.
 //!
 //! The reachable path is an out-of-input suspension inside the slow path's
-//! two-level literal/length lookup (`inflate.c` L924-L939). That loop is
+//! two-level literal/length lookup (`inflate.c` L924-L939), which pulls bytes
+//! until the second-level code fits in what is held:
 //!
 //! ```text
-//! for (;;) {
-//!     here = state->lencode[last.val + (BITS(last.bits + last.op) >> last.bits)];
-//!     if ((unsigned)(last.bits + here.bits) <= bits) break;
-//!     PULLBYTE();
-//! }
+//! if ((unsigned)(last.bits + here.bits) <= bits) break;
 //! ```
 //!
-//! and `PULLBYTE` performs `goto inf_leave` when the input is exhausted. Nothing
+//! and whose `PULLBYTE` performs `goto inf_leave` when the input is exhausted. Nothing
 //! has been dropped from the accumulator at that point, so the driver suspends
 //! with `state->mode == LEN` and `bits` anywhere below `last.bits + here.bits`,
 //! which `inftrees.c` caps at 15 -- that is, `bits <= 14`. The dispatch at
@@ -104,12 +101,12 @@
 //! This was verified against the in-tree reference, not merely reasoned about: a
 //! 94-byte stream fed at nine input bytes and 296 output bytes per call reaches
 //! `inflate_fast` with `bits == 8` and `hold == 0xf7` on its fifth call in both
-//! the C implementation and this port, and both then agree on the outcome
+//! the C implementation and this implementation, and both then agree on the outcome
 //! (`Z_DATA_ERROR`, `"invalid distance too far back"`, 43 bytes in, 389 out).
 //!
 //! The assumption exists solely to justify the byte return at `inffast.c`
 //! L290-L293; see [the exit-fixup note](#returning-whole-bytes-to-the-input) for
-//! how this port makes that arithmetic total instead of assuming it cannot
+//! how this implementation makes that arithmetic total instead of assuming it cannot
 //! underflow.
 //!
 //! # Six raw pointers become integer cursors
@@ -134,7 +131,7 @@
 //!
 //! ## `avail_in` and `avail_out` are derived, not stored
 //!
-//! In this port `input` and `output` are the caller's whole buffers and the two
+//! In this implementation `input` and `output` are the caller's whole buffers and the two
 //! cursors are indices into them, so
 //! `avail_in == input.len() - in_index` and
 //! `avail_out == output.len() - out_index` by construction. That is not an
@@ -156,7 +153,7 @@
 //!
 //! `inffast.c` L71-L72 documents the reuse in the declaration itself: "code
 //! bits, operation, extra bits, or window position, window bytes to copy". This
-//! port keeps the single variable, because splitting it would make the code stop
+//! implementation keeps the single variable, because splitting it would make the code stop
 //! reading like the source it must stay faithful to. Each reuse is commented at
 //! the point it happens:
 //!
@@ -167,9 +164,9 @@
 //! | number of extra bits | L121, L146 | `0 ..= 15` |
 //! | max distance in output, then window position and byte count | L167, L169, L210, L218 | up to `wsize` |
 //!
-//! # Compile-time knobs that are not ported
+//! # Compile-time knobs that are not implemented
 //!
-//! This port implements the **default** configuration, which is the one the
+//! This implementation implements the **default** configuration, which is the one the
 //! shipped library is built with (AAP §0.6.2.1). Three reference constructs are
 //! therefore deliberately absent:
 //!
@@ -225,16 +222,50 @@
 //! | `wnext < op` | `wsize + wnext - op ..= wsize - 1`, then `0 ..= wnext - 1` | `whave == wsize` | `op <= whave` and `op > wnext` rule out the pre-wrap `whave == wnext` |
 //! | `wnext >= op` | `wnext - op ..= wnext - 1` | `whave >= wnext` | true in both phases |
 //!
-//! # Matches copy forward, one byte at a time
+//! # Matches copy forward, and a self-overlapping match is a repeating run
 //!
 //! A match distance may be **smaller** than its length: `dist == 1` with
 //! `len == 258` is a legal, common and cheap way to encode a run of 258 equal
-//! bytes. The copy is therefore *intentionally self-overlapping* and must read
-//! bytes it has only just written. `copy_from_slice`, `slice::copy_within`,
-//! `memcpy` or any vectorised bulk move would read stale bytes and produce
-//! different output, so [`copy_match`] reads and writes strictly one byte at a
-//! time in forward order. The three-at-a-time unrolling of `inffast.c`
-//! L237-L242 and L251-L256 is byte-for-byte equivalent and is kept.
+//! bytes. Such a copy is *intentionally self-overlapping* -- it reads bytes it
+//! has only just written -- so a single `memcpy` or `memmove` over the whole
+//! span would read stale bytes and emit different output. That is a statement
+//! about the overlapping case only, and [`copy_match`] therefore splits on it:
+//!
+//! * **Distinct buffers.** [`MatchSource::Window`] reads the sliding window and
+//!   writes the output buffer, which are two different allocations -- the one
+//!   configuration where they coincide, `inflateBack()`, is routed through
+//!   [`MatchSource::Output`] instead by [`window_source`]. Overlap is therefore
+//!   structurally impossible and the segment is one `copy_from_slice`.
+//! * **Disjoint or backwards spans.** [`MatchSource::Output`] with
+//!   `src >= dst`, or with `dst - src >= len`, cannot read a byte the same copy
+//!   writes: in the second case the ranges do not meet at all, and in the first
+//!   every read at `src + i` happens at step `i` while the write that would
+//!   overwrite it happens at step `i + (src - dst) >= i`. Both are exactly
+//!   `slice::copy_within`, whose `memmove` semantics -- source read as it was
+//!   before the copy -- is precisely what the byte loop produces there.
+//! * **A repeating run.** [`MatchSource::Output`] with `0 < dst - src < len`
+//!   *is* the self-overlapping case. Writing `p` for `dst - src`, the byte loop
+//!   gives `out[dst + i] == out[src + (i mod p)]` for every `i`, by induction on
+//!   `i`: for `i < p` the source byte precedes `dst` and is untouched, and for
+//!   `i >= p` it is the byte written at step `i - p`. So the run is the periodic
+//!   repetition of the `p` bytes at `src`, and [`copy_match`] builds it by
+//!   seeding those `p` bytes and then doubling -- every doubling copies a
+//!   prefix whose length is a multiple of `p` to an offset that is also a
+//!   multiple of `p`, so the phase is preserved and the two ranges are disjoint.
+//!
+//! Every one of the three emits the identical bytes the reference emits, which
+//! is what makes the choice a memory-copy strategy rather than a behaviour
+//! change (AAP §0.8.4 admits exactly that lever), and
+//! `copy_match_within_the_output_reproduces_a_naive_byte_loop` asserts it
+//! against a naive byte-at-a-time reference loop for every short distance and
+//! every codeable length.
+//!
+//! The three-at-a-time unrolling of `inffast.c` L237-L242 and L251-L256 is not
+//! reproduced as a loop, because it does not need to be: together with its
+//! one-byte tail it copies exactly `len` bytes forward, so one whole-remainder
+//! copy is byte-for-byte equivalent. Expressing it per three bytes cost a call
+//! and a fresh range validation 86 times for a 258-byte match, which release
+//! codegen kept out of line, in the loop that dominates decompression.
 //!
 //! # No panics, ever
 //!
@@ -256,14 +287,12 @@
 //! # Returning whole bytes to the input
 //!
 //! `inffast.c` L290-L293 pushes every whole byte still sitting in the accumulator
-//! back onto the input:
+//! back onto the input, prefaced by the justification for doing so:
 //!
 //! ```text
 //! /* return unused bytes (on entry, bits < 8, so in won't go too far back) */
 //! len = bits >> 3;
 //! in -= len;
-//! bits -= len << 3;
-//! hold &= (1U << bits) - 1;
 //! ```
 //!
 //! The parenthetical is the reference's own justification, and it is the *only*
@@ -280,7 +309,7 @@
 //! the buffer its caller supplied -- reading memory it does not own. There is
 //! therefore no defined reference behaviour to reproduce in that case.
 //!
-//! This port makes the arithmetic total by returning `min(bits >> 3, p)` bytes.
+//! This implementation makes the arithmetic total by returning `min(bits >> 3, p)` bytes.
 //! Whenever the reference's own assumption holds the clamp is inert, because
 //! `len <= p` already. When it does not, the clamp is not merely safe but exactly
 //! right: `p` bytes go back, `bits` settles at `b - c >= 8`, and the bits left in
@@ -295,7 +324,10 @@
 //! * The **outer** loop (`inffast.c` L100-L288) makes progress on every
 //!   iteration: each one either writes at least one output byte or leaves via
 //!   `break`, and it re-tests `in_index < last && out_index < end`, both of
-//!   which are monotone.
+//!   which are monotone. A length/distance pair writes at least
+//!   [`MIN_CODEABLE_LEN`] bytes, because a shorter length is not something a
+//!   table can encode and is rejected as invalid table data rather than copied;
+//!   see the constant.
 //! * The **`dolen` / `dodist`** back-edges (`inffast.c` L276 and L266) follow a
 //!   table link, and a link always drops the current entry's `bits` from the
 //!   accumulator before the next lookup. Since `inflate_table` builds at most a
@@ -303,9 +335,9 @@
 //!   occur; a corrupt table cannot loop forever either, because `bits` is
 //!   saturating and a zero-`bits` entry that keeps linking would immediately
 //!   exhaust the accumulator and land on a bounds-checked lookup failure.
-//! * The **copy drains** (`inffast.c` L237-L242, L251-L256) decrement `len` by
-//!   three per iteration with a saturating subtraction, so `len` reaches its
-//!   exit condition even if a copy fails.
+//! * The **copy drains** (`inffast.c` L237-L242, L251-L256) are not loops here
+//!   at all: each segment is copied whole, in one bounded move, so there is no
+//!   drain left to terminate.
 //!
 //! # Speedups that turned out slower
 //!
@@ -362,10 +394,6 @@ use crate::inflate::inftrees::Code;
 use crate::inflate::mode::Mode;
 use crate::inflate::state::InflateState;
 
-// -----------------------------------------------------------------------------
-//  Contract constants
-// -----------------------------------------------------------------------------
-
 /// Smallest `avail_in` this function may be entered with (`inffast.c` L26).
 ///
 /// Six bytes hold the 48 bits of the longest possible length/distance pair, so
@@ -396,13 +424,30 @@ const OUT_SLACK: usize = MIN_AVAIL_OUT - 1;
 /// holds fifteen bits a whole code is guaranteed to be present.
 const REFILL_BITS: u32 = 15;
 
-/// Bytes copied per iteration of the unrolled drains (`inffast.c` L237-L242).
-const UNROLL: u32 = 3;
+// The three-bytes-per-iteration constant of `inffast.c`'s unrolled drains
+// (L237-L242 and L251-L256) has no counterpart here. That unrolling and its
+// one-or-two-byte tail copy exactly `len` bytes between them, so `copy_match` is
+// handed the whole remaining length once instead; see its documentation.
 
-// -----------------------------------------------------------------------------
-//  Error messages
-// -----------------------------------------------------------------------------
-//
+/// The shortest match length any Huffman table can encode.
+///
+/// `lbase[0]` is 3 (`inftrees.c` L61-L64) and `inflate_table` derives every
+/// length entry's `val` from that table (`inftrees.c` L288-L292), so no table it
+/// builds can ask for a shorter copy. `inffast.c` L251 states the same thing as a
+/// precondition -- "minimum length is three" -- and *depends* on it: its
+/// post-test drain copies three bytes before testing, so a length of zero, one or
+/// two made the following `len -= 3` wrap and the copy run away, which is the
+/// buffer overrun that shape cannot survive.
+///
+/// This port has no such shape to protect, but the guarantee is worth keeping for
+/// a second reason: it is what makes the outer loop's termination argument
+/// unconditional. A length/distance pair that copied nothing would leave both
+/// cursors where they were, and an entry whose `bits` were also zero would then
+/// spin. Treating a length below this as invalid table data closes that off
+/// structurally, and it cannot change the behaviour of any stream the reference
+/// accepts, because the reference cannot build such an entry either.
+const MIN_CODEABLE_LEN: u32 = 3;
+
 // These are the exact strings the reference stores in `z_stream.msg`, and
 // `test/infcover.c` prints them, so they are reproduced character for character
 // and at the same decision points. `inflate.c`'s slow path sets the same three
@@ -420,10 +465,6 @@ pub(crate) const MSG_INVALID_LITERAL_LENGTH_CODE: &str = "invalid literal/length
 /// `strm->msg` for a distance that reaches back beyond the valid window
 /// (`inffast.c` L172-L174, and `inflate.c` L1027-L1028 in the slow path).
 pub(crate) const MSG_INVALID_DISTANCE_TOO_FAR_BACK: &str = "invalid distance too far back";
-
-// -----------------------------------------------------------------------------
-//  Small total helpers
-// -----------------------------------------------------------------------------
 
 /// Narrows a 64-bit accumulator value to a slice index.
 ///
@@ -500,10 +541,6 @@ const fn drop_bits(hold: u64, n: u32) -> u64 {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  The match source
-// -----------------------------------------------------------------------------
-
 /// Where the next byte of a match copy comes from: the two things C's `from`
 /// pointer can address (`inffast.c` L75, "where to copy match from").
 ///
@@ -521,15 +558,11 @@ enum MatchSource {
     Output(usize),
 }
 
-// -----------------------------------------------------------------------------
-//  The return value
-// -----------------------------------------------------------------------------
-
 /// Everything C writes back through `z_stream` at `inffast.c` L296-L303 that is
 /// not already reachable through the state or the cursors.
 ///
 /// C is a `void` function that reaches its caller's stream through the
-/// `z_streamp` it was handed. This port has no stream: the cursors are `&mut`
+/// `z_streamp` it was handed. This implementation has no stream: the cursors are `&mut`
 /// parameters, `hold`, `bits` and `mode` are written into the
 /// [`InflateState`], and the remaining three values -- the resulting mode, the
 /// message and the two recomputed availabilities -- come back here.
@@ -559,31 +592,41 @@ pub(crate) struct FastExit {
     pub(crate) avail_out: usize,
 }
 
-// -----------------------------------------------------------------------------
-//  The match copy
-// -----------------------------------------------------------------------------
-
-/// Copies `len` match bytes forward, one byte at a time, and advances both
-/// cursors.
+/// Copies a whole `len`-byte match segment forward and advances both cursors.
 ///
 /// This is the body shared by all six copy loops of `inffast.c`
 /// (L202-L204, L213-L215, L220-L222, L231-L233, L237-L242, L251-L256). Returns
-/// `false` without completing if either range leaves its buffer, which the entry
-/// contract makes unreachable; see the module's no-panic section.
+/// `false` without copying or advancing anything if either range would leave its
+/// buffer, which the entry contract makes unreachable; see the module's no-panic
+/// section.
 ///
-/// # Byte-at-a-time is not a simplification
+/// # One range validation, then one bulk move
 ///
-/// When the source is [`MatchSource::Output`] the ranges may overlap, and are
-/// *meant* to: a match with `dist < len` encodes a repeating run, and each byte
-/// after the first `dist` of them is read back from what this loop just wrote.
-/// The read and the write of one byte are therefore strictly ordered, and no
-/// bulk copy may be substituted.
+/// Both ranges are established **once for the whole segment**. Nothing inside
+/// the copy re-derives an index or re-tests a bound, which is the point: a
+/// 258-byte match used to enter here 86 times in three-byte groups and pay a
+/// call plus a fresh validation plus two per-byte bounds branches every time,
+/// and release codegen -- `opt-level = 3`, one codegen unit, fat LTO -- kept the
+/// helper out of line at every call site.
 ///
-/// Ranges are validated once per segment rather than once per byte. That is the
-/// segment-level form of the per-byte gate `InflateState::valid_window_byte`
-/// applies, and it is what keeps a bounds check off the hot path without letting
-/// an out-of-range index through.
-#[inline]
+/// Which move is emitted depends on how the source and destination sit, and all
+/// three produce the bytes the reference's forward byte loop produces. The
+/// module's "Matches copy forward" section carries the proofs; in summary:
+///
+/// * [`MatchSource::Window`] reads `history`, a different allocation from
+///   `output`, so the copy cannot alias and is one `copy_from_slice`.
+/// * [`MatchSource::Output`] with a backwards or disjoint source is one
+///   `slice::copy_within`, whose `memmove` semantics agree with the byte loop
+///   exactly when the ranges do not meet or the source precedes the destination.
+/// * [`MatchSource::Output`] with `0 < dst - src < len` is a repeating run of
+///   period `dst - src`, built by seeding one period and doubling.
+///
+/// `#[inline(always)]` rather than `#[inline]`: the finding this function exists
+/// to fix was measured on release assembly in which `#[inline]` was declined at
+/// all seven call sites, and this is the innermost copy of the loop that
+/// `inffast.c` L19-L21 says holds "more than 95% of the inflate execution time".
+#[allow(clippy::inline_always)]
+#[inline(always)]
 fn copy_match(
     output: &mut [u8],
     out: &mut usize,
@@ -594,7 +637,8 @@ fn copy_match(
     let count = to_index(u64::from(len));
     let dst = *out;
 
-    // The destination range is shared by both source cases.
+    // The destination range is shared by both source cases, and this is the only
+    // place it is checked.
     let Some(dst_end) = dst.checked_add(count) else {
         return false;
     };
@@ -607,23 +651,19 @@ fn copy_match(
             let Some(src_end) = src.checked_add(count) else {
                 return false;
             };
-            if src_end > history.len() {
+            // `history` is `window[..whave]` and `output` is the caller's output
+            // buffer: two distinct allocations, because the one case in which the
+            // window *is* the output -- `inflateBack()` -- is handed to this
+            // function as `MatchSource::Output` by `window_source`. So the two
+            // slices below cannot overlap and the bulk copy is exact.
+            let Some(source) = history.get(src..src_end) else {
                 return false;
-            }
-            // `offset` walks both ranges together; both `src + offset` and
-            // `dst + offset` are bounded by the ends checked above, so neither
-            // addition can overflow and neither `get` can fail.
-            let mut offset = 0;
-            while offset < count {
-                let Some(&byte) = history.get(src + offset) else {
-                    return false;
-                };
-                let Some(slot) = output.get_mut(dst + offset) else {
-                    return false;
-                };
-                *slot = byte;
-                offset += 1;
-            }
+            };
+            let Some(target) = output.get_mut(dst..dst_end) else {
+                return false;
+            };
+            // Both slices are `count` bytes long by construction.
+            target.copy_from_slice(source);
             *from = MatchSource::Window(src_end);
         }
         MatchSource::Output(src) => {
@@ -633,19 +673,51 @@ fn copy_match(
             if src_end > output.len() {
                 return false;
             }
-            // Read then write, one byte per iteration, in ascending order: this
-            // is what makes a self-overlapping run reproduce the reference's
-            // bytes rather than stale ones.
-            let mut offset = 0;
-            while offset < count {
-                let Some(&byte) = output.get(src + offset) else {
-                    return false;
-                };
-                let Some(slot) = output.get_mut(dst + offset) else {
-                    return false;
-                };
-                *slot = byte;
-                offset += 1;
+            match dst.checked_sub(src) {
+                // `src > dst` (the `inflateBack()` window read, whose window and
+                // output indices coincide) or `src == dst` (a self-copy, which
+                // changes nothing). Ascending byte order reads every byte before
+                // the write that would overwrite it, so `memmove` semantics are
+                // exactly right. Both ranges were checked above, so neither of
+                // `copy_within`'s two panic conditions can hold.
+                None | Some(0) => output.copy_within(src..src_end, dst),
+                // Disjoint: the source ends at or before the destination starts.
+                Some(period) if period >= count => output.copy_within(src..src_end, dst),
+                // A repeating run of period `period`. `split_at_mut_checked`
+                // separates the seed -- which lies wholly below `dst` and is
+                // therefore never written by this copy -- from the region being
+                // filled, so the seed is read from an immutable borrow while the
+                // destination is written through a disjoint mutable one.
+                Some(period) => {
+                    let Some((head, tail)) = output.split_at_mut_checked(dst) else {
+                        return false;
+                    };
+                    // `head` is `output[..dst]`, so this is exactly the `period`
+                    // bytes at `src`, and `period < count <= tail.len()`.
+                    let Some(seed) = head.get(src..) else {
+                        return false;
+                    };
+                    let Some(target) = tail.get_mut(..count) else {
+                        return false;
+                    };
+                    let Some(slot) = target.get_mut(..period) else {
+                        return false;
+                    };
+                    slot.copy_from_slice(seed);
+
+                    // Doubling. `target[..written]` always holds a whole number
+                    // of periods, so copying its first `chunk` bytes to offset
+                    // `written` preserves the phase; and `chunk <= written`
+                    // keeps the two ranges disjoint. `written + chunk <= count`
+                    // keeps both inside `target`, so `copy_within` cannot panic.
+                    // At most eight iterations for the longest codeable match.
+                    let mut written = period;
+                    while written < count {
+                        let chunk = written.min(count - written);
+                        target.copy_within(..chunk, written);
+                        written += chunk;
+                    }
+                }
             }
             *from = MatchSource::Output(src_end);
         }
@@ -692,24 +764,16 @@ fn output_source(out: usize, dist: u32) -> MatchSource {
     MatchSource::Output(out.saturating_sub(to_index(u64::from(dist))))
 }
 
-// -----------------------------------------------------------------------------
-//  inflate_fast
-// -----------------------------------------------------------------------------
-
 /// Decodes literal, length and distance codes and writes out the resulting
 /// literal and match bytes until input runs short, output runs short, an
 /// end-of-block code is reached, or the block data is found to be invalid.
 ///
-/// The port of `inflate_fast` (`inffast.c` L50-L305), whose prototype is the
-/// single line of `inffast.h` (its L11):
-///
-/// ```c
-/// void ZLIB_INTERNAL inflate_fast(z_streamp strm, unsigned start);
-/// ```
+/// Implements `inflate_fast` (`inffast.c` L50-L305), declared as a single line at
+/// `inffast.h` L11.
 ///
 /// C reaches the input, the output, the cursors and the state through one
-/// `z_streamp`. This port takes them apart, because the safe core has no
-/// `z_stream`: raw pointers stop at the facade (AAP §0.6.1), and the two
+/// `z_streamp`. This implementation takes them apart, because the safe core has no
+/// `z_stream`, and it dereferences no pointer (AAP §0.6.1); the two
 /// pointer/length pairs arrive here as slices with separate cursors.
 ///
 /// # Parameters
@@ -757,9 +821,6 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
     next_out: &mut usize,
     start: usize,
 ) -> FastExit {
-    // -------------------------------------------------------------------------
-    //  Entry contract (`inffast.c` L23-L29)
-    // -------------------------------------------------------------------------
     debug_assert_eq!(
         state.mode,
         Mode::Len,
@@ -801,9 +862,6 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
         };
     }
 
-    // -------------------------------------------------------------------------
-    //  Copy state to local variables (`inffast.c` L77-L96)
-    // -------------------------------------------------------------------------
     let mut in_index = *next_in; // `in`   -- L79
     let entry_in_index = in_index; // not in C; bounds the byte return at L292
     let last = in_index + (avail_in - IN_SLACK); // `last` -- L80
@@ -811,7 +869,7 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
     let beg = out_index.saturating_sub(start.saturating_sub(avail_out)); // `beg` -- L82
     let end = out_index + (avail_out - OUT_SLACK); // `end`  -- L83
 
-    // L84-L86 read `dmax` under INFLATE_STRICT; not ported.
+    // L84-L86 read `dmax` under INFLATE_STRICT; not implemented.
 
     let wsize = state.wsize; // L87
     let whave = state.whave; // L88
@@ -843,10 +901,8 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
     let mut mode = Mode::Len;
     let mut msg: Option<&'static str> = None;
 
-    // -------------------------------------------------------------------------
     //  Decode literals and length/distances until end-of-block or not enough
     //  input data or output space (`inffast.c` L98-L288)
-    // -------------------------------------------------------------------------
     'outer: loop {
         // L101-L106. Two unconditional byte pushes rather than a loop: with
         // `avail_in >= 6` guaranteed, a `while` would test a condition that
@@ -916,6 +972,17 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
                     hold = drop_bits(hold, op);
                     bits = bits.saturating_sub(op);
                 }
+                // `len` is final here, and C's copy shapes take it from L251's
+                // "minimum length is three" without testing it. See
+                // `MIN_CODEABLE_LEN`: no table `inflate_table` builds can produce
+                // a shorter length, so this rejects corrupt table data only, and
+                // it is what keeps every iteration's output progress -- and with
+                // it the loop's termination -- unconditional.
+                if len < MIN_CODEABLE_LEN {
+                    msg = Some(MSG_INVALID_LITERAL_LENGTH_CODE);
+                    mode = Mode::Bad;
+                    break 'outer;
+                }
                 // L132-L137
                 if bits < REFILL_BITS {
                     let Some(&byte) = input.get(in_index) else {
@@ -975,7 +1042,7 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
                         dist = dist.wrapping_add(to_extra(hold & low_mask(op))); // L155
 
                         // L156-L163 rejects `dist > dmax` under INFLATE_STRICT;
-                        // not defined in the shipped build, so not ported.
+                        // not defined in the shipped build, so not implemented.
                         hold = drop_bits(hold, op); // L164
                         bits = bits.saturating_sub(op); // L165
 
@@ -998,7 +1065,7 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
                             // because the `!sane` arm's body -- the
                             // INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR block
                             // at L177-L195 -- is `#ifdef`-gated out of the
-                            // shipped build and is not ported, so both spellings
+                            // shipped build and is not implemented, so both spellings
                             // fall through identically. `sane` is nonetheless
                             // kept: it is the reference's decision point, and
                             // `inflateUndermine` cannot clear it here
@@ -1069,45 +1136,29 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
                                     from = output_source(out_index, dist);
                                 }
                             }
-                            // L237-L242. A pre-test loop: after a partial window
-                            // copy `len` may already be zero.
-                            while len > 2 {
-                                copied &=
-                                    copy_match(output, &mut out_index, history, &mut from, UNROLL);
-                                len -= UNROLL;
-                            }
-                            // L243-L247
-                            if len != 0 {
-                                copied &= copy_match(output, &mut out_index, history, &mut from, 1);
-                                if len > 1 {
-                                    copied &=
-                                        copy_match(output, &mut out_index, history, &mut from, 1);
-                                }
-                            }
+                            // L237-L247. C drains three bytes at a time and then
+                            // copies the one or two that are left; between them
+                            // that is exactly `len` bytes, forward, from wherever
+                            // `from` now points -- the window when the whole match
+                            // fitted in it, the output otherwise. One
+                            // whole-remainder copy emits the identical bytes.
+                            // `len` may already be zero after a partial window
+                            // copy, which C's pre-test `while` also handles.
+                            copied &= copy_match(output, &mut out_index, history, &mut from, len);
                         } else {
                             // copy direct from output -- L249-L250
                             let mut from = output_source(out_index, dist);
-                            // L251-L256. A post-test loop, because the minimum
-                            // codeable length is three and one pass is therefore
-                            // always warranted. The subtraction saturates so that
-                            // a corrupt table claiming a shorter length still
-                            // terminates instead of wrapping the way C would.
-                            loop {
-                                copied &=
-                                    copy_match(output, &mut out_index, history, &mut from, UNROLL);
-                                len = len.saturating_sub(UNROLL);
-                                if len <= 2 {
-                                    break;
-                                }
-                            }
-                            // L257-L261
-                            if len != 0 {
-                                copied &= copy_match(output, &mut out_index, history, &mut from, 1);
-                                if len > 1 {
-                                    copied &=
-                                        copy_match(output, &mut out_index, history, &mut from, 1);
-                                }
-                            }
+                            // L251-L261. C's post-test `do`-`while` plus its tail,
+                            // which together copy exactly `len` bytes: the loop is
+                            // post-test only because "minimum length is three"
+                            // (L251) guarantees one pass, so a single copy of the
+                            // whole length is equivalent and needs no such
+                            // guarantee. It is also better behaved on the corrupt
+                            // input C's shape cannot survive: a table claiming a
+                            // length below three made C copy three bytes and then
+                            // wrap `len` on the subtraction, whereas this copies
+                            // the length the entry actually asked for.
+                            copied &= copy_match(output, &mut out_index, history, &mut from, len);
                         }
 
                         if !copied {
@@ -1175,7 +1226,6 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
         }
     }
 
-    // -------------------------------------------------------------------------
     //  Return unused bytes (`inffast.c` L290-L294)
     //
     //  L290 justifies `in -= len` with "on entry, bits < 8, so in won't go too far
@@ -1184,7 +1234,6 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
     //  actually pulled. The clamp is inert whenever L290's premise holds, and
     //  where it does not it leaves the bitstream position exactly as it was rather
     //  than reading before the caller's buffer as C would.
-    // -------------------------------------------------------------------------
     // `pulled` counts at most `avail_in` bytes, so the `u32::MAX` fallback is
     // unreachable on every target where `usize` is 32 bits or wider.
     let pulled = u32::try_from(in_index - entry_in_index).unwrap_or(u32::MAX);
@@ -1195,9 +1244,6 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
     bits = bits.saturating_sub(whole << 3); // L293
     hold &= low_mask(bits); // L294
 
-    // -------------------------------------------------------------------------
-    //  Update state and return (`inffast.c` L296-L303)
-    // -------------------------------------------------------------------------
     *next_in = in_index; // L297
     *next_out = out_index; // L298
 
@@ -1236,10 +1282,6 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
 #[cfg(test)]
 // The workspace denies the panic family and slice indexing in library code,
 // which is exactly what this module is built to guarantee; a test that cannot
@@ -1254,7 +1296,7 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
 mod tests {
     use super::{
         copy_match, drop_bits, inflate_fast, low_mask, output_source, to_count, to_extra, to_index,
-        window_source, FastExit, MatchSource, MIN_AVAIL_IN, MIN_AVAIL_OUT,
+        window_source, FastExit, MatchSource, MIN_AVAIL_IN, MIN_AVAIL_OUT, MIN_CODEABLE_LEN,
         MSG_INVALID_DISTANCE_CODE, MSG_INVALID_DISTANCE_TOO_FAR_BACK,
         MSG_INVALID_LITERAL_LENGTH_CODE, NO_HISTORY,
     };
@@ -1395,16 +1437,12 @@ mod tests {
         (exit, next_in, next_out)
     }
 
-    // -------------------------------------------------------------------------
-    //  Total helpers
-    // -------------------------------------------------------------------------
-
     #[test]
     fn low_mask_matches_the_c_expression_and_is_total() {
         for n in 0..64_u32 {
             assert_eq!(low_mask(n), (1_u64 << n) - 1, "low_mask({n})");
         }
-        // C's `(1U << n) - 1` is undefined for n >= the type width; the port
+        // C's `(1U << n) - 1` is undefined for n >= the type width; the implementation
         // saturates to every bit rather than panicking.
         assert_eq!(low_mask(64), u64::MAX);
         assert_eq!(low_mask(u32::MAX), u64::MAX);
@@ -1444,10 +1482,6 @@ mod tests {
         assert_eq!(output_source(2, 9), MatchSource::Output(0));
     }
 
-    // -------------------------------------------------------------------------
-    //  copy_match
-    // -------------------------------------------------------------------------
-
     #[test]
     fn copy_match_from_the_window_advances_both_cursors() {
         let history = [10_u8, 11, 12, 13, 14];
@@ -1462,11 +1496,21 @@ mod tests {
 
     #[test]
     fn copy_match_within_the_output_reproduces_a_naive_byte_loop() {
-        // Distance one is the RLE case: every byte after the first is read back
-        // from what this copy just wrote. Any bulk move fails this.
-        for dist in 1..=4_usize {
-            for len in 1..=32_u32 {
-                let mut output = vec![0_u8; 128];
+        // The reference oracle for every output-sourced copy: `*out++ = *from++`
+        // in ascending order, which is what all three of `copy_match`'s moves
+        // have to agree with. Distance one is the RLE case, where every byte
+        // after the first is read back from what this copy just wrote; a single
+        // bulk move over the whole span fails it, and the periodic kernel is
+        // what makes it come out right.
+        //
+        // The distances cover a whole period (1), the short periods where the
+        // doubling runs the most rounds (2..=9), one that is not a power of two
+        // near the maximum length (100), and two that exceed every length here
+        // so the copy is disjoint (300, 512). The lengths cover the whole
+        // codeable range including both boundaries, `MIN_MATCH` and `MAX_MATCH`.
+        for dist in [1_usize, 2, 3, 4, 5, 6, 7, 8, 9, 100, 300, 512] {
+            for len in (1..=8_u32).chain([9, 16, 17, 63, 64, 127, 128, 255, 257, 258]) {
+                let mut output = vec![0_u8; dist + 512];
                 for (index, slot) in output.iter_mut().take(dist).enumerate() {
                     *slot = pattern(index);
                 }
@@ -1490,6 +1534,50 @@ mod tests {
                     "dist {dist}, len {len}"
                 );
                 assert_eq!(out, dist + usize::try_from(len).unwrap());
+                assert_eq!(from, MatchSource::Output(usize::try_from(len).unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn copy_match_within_the_output_handles_a_source_ahead_of_the_destination() {
+        // `inflateBack()`'s window *is* its output buffer, so `window_source`
+        // yields `MatchSource::Output` with an index that can sit *above* the
+        // write cursor -- `wsize - op` with `op` small is near the end of the
+        // window while `out` is near the start. Ascending byte order reads every
+        // such byte before the write that would overwrite it, so the result is
+        // the `memmove` answer, and it must match the naive loop for a source
+        // that both does and does not overlap the destination.
+        for src in [4_usize, 8, 12, 15] {
+            for len in 1..=12_u32 {
+                let mut output: Vec<u8> = (0..20).map(pattern).collect();
+                let count = usize::try_from(len).unwrap();
+                // Only the copies that stay inside the buffer are exercised here;
+                // the rest are the refusal cases the next test covers.
+                if src + count > output.len() {
+                    continue;
+                }
+
+                let naive = {
+                    let mut bytes = output.clone();
+                    for offset in 0..count {
+                        bytes[offset] = bytes[src + offset];
+                    }
+                    bytes
+                };
+
+                let mut out = 0;
+                let mut from = MatchSource::Output(src);
+                assert!(copy_match(
+                    &mut output,
+                    &mut out,
+                    NO_HISTORY,
+                    &mut from,
+                    len
+                ));
+                assert_eq!(output, naive, "src {src}, len {len}");
+                assert_eq!(out, count);
+                assert_eq!(from, MatchSource::Output(src + count));
             }
         }
     }
@@ -1524,10 +1612,6 @@ mod tests {
         let mut from = MatchSource::Window(usize::MAX);
         assert!(!copy_match(&mut output, &mut out, &history, &mut from, 1));
     }
-
-    // -------------------------------------------------------------------------
-    //  The decode loop
-    // -------------------------------------------------------------------------
 
     #[test]
     fn a_fixed_block_of_literals_decodes_byte_identically() {
@@ -1695,10 +1779,6 @@ mod tests {
             "invalid distance too far back"
         );
     }
-
-    // -------------------------------------------------------------------------
-    //  The window copy
-    // -------------------------------------------------------------------------
 
     /// Window size used by the window-case tests.
     ///
@@ -1940,10 +2020,6 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------------
-    //  Overlapping copies
-    // -------------------------------------------------------------------------
-
     #[test]
     fn overlapping_matches_reproduce_a_naive_byte_at_a_time_reference() {
         // Distances below the match length are legal and common. The reference
@@ -1971,10 +2047,6 @@ mod tests {
             assert_eq!(&output[..dist + 258], &expected[..], "dist {dist}");
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  The exit fixup
-    // -------------------------------------------------------------------------
 
     #[test]
     fn the_exit_fixup_reproduces_the_reference_availabilities() {
@@ -2081,10 +2153,6 @@ mod tests {
         assert_eq!(&output[..4], b"abcd", "earlier output is untouched");
     }
 
-    // -------------------------------------------------------------------------
-    //  The entry contract
-    // -------------------------------------------------------------------------
-
     #[test]
     #[cfg(not(debug_assertions))]
     fn a_violated_entry_contract_returns_without_decoding() {
@@ -2129,10 +2197,6 @@ mod tests {
         let mut output = vec![0_u8; MIN_AVAIL_OUT - 1];
         let _ = drive(&mut state, &input, &mut output, 0);
     }
-
-    // -------------------------------------------------------------------------
-    //  Termination and robustness
-    // -------------------------------------------------------------------------
 
     /// A deterministic xorshift64\* generator, so the smoke test below needs no
     /// external crate and reproduces exactly on every run.
@@ -2221,19 +2285,40 @@ mod tests {
 
     #[test]
     fn a_corrupt_zero_length_entry_terminates_instead_of_running_away() {
-        // `LBASE` never yields a length below three, so C's post-test drain is
-        // sound for every table `inflate_table` builds. A hand-corrupted entry
-        // claiming length zero would underflow C's `len -= 3`; here the
-        // subtraction saturates, so the drain stops after one pass.
+        // `LBASE` never yields a length below three, so C's post-test drain takes
+        // that as a precondition: a hand-corrupted entry claiming length zero
+        // would copy three bytes, underflow `len -= 3`, and run away. Here the
+        // entry is rejected as invalid table data, so nothing is copied, nothing
+        // is written, and the loop leaves at once -- which is also what keeps the
+        // outer loop's output progress unconditional. See `MIN_CODEABLE_LEN`.
+        for len in 0..MIN_CODEABLE_LEN {
+            let mut state = raw_state();
+            install_pair_tables(&mut state, u16::try_from(len).unwrap(), 1);
+            let input = [0_u8; MIN_AVAIL_IN];
+            let mut output = vec![0_u8; OUT_LEN];
+            output[0] = b'z';
+            let (exit, _, next_out) = drive(&mut state, &input, &mut output, 1);
+
+            assert_eq!(exit.mode, Mode::Bad, "len {len}");
+            assert_eq!(exit.msg, Some(MSG_INVALID_LITERAL_LENGTH_CODE), "len {len}");
+            assert_eq!(next_out, 1, "nothing is copied, so nothing is written");
+            assert_eq!(&output[..4], b"z\x00\x00\x00");
+        }
+    }
+
+    #[test]
+    fn the_shortest_codeable_length_is_still_accepted() {
+        // The boundary the rejection above must not overreach: `MIN_CODEABLE_LEN`
+        // itself is `lbase[0]`, the commonest match length there is.
         let mut state = raw_state();
-        install_pair_tables(&mut state, 0, 1);
+        install_pair_tables(&mut state, u16::try_from(MIN_CODEABLE_LEN).unwrap(), 1);
         let input = [0_u8; MIN_AVAIL_IN];
         let mut output = vec![0_u8; OUT_LEN];
         output[0] = b'z';
         let (exit, _, next_out) = drive(&mut state, &input, &mut output, 1);
 
-        assert_eq!(exit.mode, Mode::Len);
-        assert_eq!(next_out, 4, "one unrolled pass, then the loop ends");
+        assert_ne!(exit.mode, Mode::Bad);
+        assert!(next_out > 1, "a three-byte match copies three bytes");
         assert_eq!(&output[..4], b"zzzz");
     }
 }

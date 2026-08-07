@@ -1,6 +1,6 @@
 //! The hash-chain search that decides which match the compressor emits.
 //!
-//! This is the port of `longest_match` (`deflate.c` L1379-L1530), specifically
+//! This implements `longest_match` (`deflate.c` L1379-L1530), specifically
 //! the default variant: the one the shipped build compiles, with neither
 //! `FASTEST` nor `UNALIGNED_OK` defined.
 //!
@@ -9,7 +9,7 @@
 //! RFC 1951 constrains the *format* of a DEFLATE stream, not the *choices* an
 //! encoder makes within it. Which of several equally long matches is emitted,
 //! how far a hash chain is walked, and which candidates are rejected before
-//! they are ever compared are all implementation-defined — and this port is
+//! they are ever compared are all implementation-defined — and this implementation is
 //! required to reproduce the reference implementation's answers byte for byte.
 //! Two of the decision points that determine that, out of the eight in the
 //! whole encoder, are in this one function. Every one of the following is part
@@ -38,13 +38,13 @@
 //! because a checksum is one scalar however it is computed, whereas vectorised
 //! match finding would change the emitted bytes.
 //!
-//! # Variants that are deliberately not ported
+//! # Variants that are deliberately not implemented
 //!
 //! * `UNALIGNED_OK` (`deflate.c` L1404-L1410 and L1446-L1478) compares two
 //!   bytes at a time through `ush` loads, uses `strend = window + strstart +
 //!   MAX_MATCH - 1`, and finishes with `len = (MAX_MATCH - 1) - (strend -
 //!   scan)` plus a trailing single-byte fixup. It is a different code path with
-//!   different boundary behaviour, so porting it would be a silent behaviour
+//!   different boundary behaviour, so implementing it would be a silent behaviour
 //!   change.
 //! * `FASTEST` (`deflate.c` L1532-L1588) examines only the head of the chain
 //!   and belongs to a different encoder — a two-entry `configuration_table`
@@ -282,9 +282,9 @@ fn bytes_match(scan: &[u8], scan_offset: usize, mat: &[u8], match_offset: usize)
 /// Sets `match_start` to the longest match starting at the current string and
 /// returns its length.
 ///
-/// Port of `local uInt longest_match(deflate_state *s, IPos cur_match)`
+/// Mirrors `local uInt longest_match(deflate_state *s, IPos cur_match)`
 /// (`deflate.c` L1379-L1530), default configuration — see the module
-/// documentation for the two variants that are deliberately not ported.
+/// documentation for the two variants that are deliberately not implemented.
 ///
 /// The contract, quoted from `deflate.c` L1380-L1387 because callers depend on
 /// every clause of it:
@@ -313,7 +313,7 @@ fn bytes_match(scan: &[u8], scan_offset: usize, mat: &[u8], match_offset: usize)
 /// `deflate_fast` uses it only once `match_length >= MIN_MATCH`
 /// (`deflate.c` L1894-L1898) and `deflate_slow` notes that "If `prev_match` is
 /// also `MIN_MATCH`, `match_start` is garbage but we will ignore the current
-/// match anyway" (L2004-L2006). This port leaves the field untouched in that
+/// match anyway" (L2004-L2006). This implementation leaves the field untouched in that
 /// case, which is precisely what "garbage" means.
 ///
 /// `cur_match` must not be [`IPos::NIL`]. Both callers guarantee it — they test
@@ -367,14 +367,12 @@ where
     W: AsRef<[u8]> + AsMut<[u8]>,
     P: AsRef<[u16]> + AsMut<[u16]>,
 {
-    // =====================================================================
     //  DECISION POINT #2 — chain-walk initialization (`deflate.c` L1390-L1431)
     //
     //  Every value set up here changes which candidates are examined, in what
     //  order, and how many of them: the budget, the seed for `best_len`, the
     //  early-exit threshold, and the floor the walk stops at. Change any one of
     //  them and a different match is emitted.
-    // =====================================================================
 
     // `Bytef *scan = s->window + s->strstart;` (L1391) becomes the offset
     // `strstart`, from which the scan view below is taken.
@@ -465,7 +463,7 @@ where
         // The current string, as a view rather than a pointer. `strend` in C is
         // `s->window + s->strstart + MAX_MATCH` (L1412), i.e. offset
         // `MAX_MATCH` into this view; note the `UNALIGNED_OK` variant uses
-        // `MAX_MATCH - 1` there and is not what is ported.
+        // `MAX_MATCH - 1` there and is not what is implemented.
         let Some(scan_init) = window.region(strstart, VIEW_LEN) else {
             break 'search;
         };
@@ -524,7 +522,6 @@ where
             };
 
             'candidate: {
-                // =========================================================
                 //  DECISION POINT #3 — the early-rejection quartet
                 //  (`deflate.c` L1482-L1485)
                 //
@@ -553,7 +550,6 @@ where
                 //  Removing it changes which candidates survive to the full
                 //  comparison, and therefore which match wins. It is not an
                 //  optimization to be recovered later.
-                // =========================================================
                 let Some(best_offset) = as_offset(best_len) else {
                     break 'candidate;
                 };
@@ -712,7 +708,6 @@ where
     }
 }
 
-// -----------------------------------------------------------------------------
 //  Tests
 //
 //  These exercise `search` directly against a hand-built window and hand-built
@@ -723,13 +718,12 @@ where
 //  implementation detail.
 //
 //  Note that these tests can only prove the *local* behaviour of this function.
-//  The only proof of byte-identical output is
-//  `crates/zlib-rs-differential/tests/byte_identical.rs`, which diffs the whole
+//  The only proof of byte-identical output will be the planned
+//  `crates/zlib-rs-differential/tests/byte_identical.rs`, which is to diff the whole
 //  encoder against the C oracle across the level x windowBits x memLevel x
 //  strategy x flush x corpus matrix. Levels 1-3 (`deflate_fast`) and levels 4-9
 //  (`deflate_slow`) both route through here, so a defect in this file fails
 //  almost all of it.
-// -----------------------------------------------------------------------------
 #[cfg(test)]
 #[allow(
     // Panicking and indexing are how a test reports a failure, and the C source
@@ -920,11 +914,11 @@ mod tests {
     }
 
     /// An independent transcription of `longest_match` from `deflate.c`, written
-    /// with absolute window indices rather than the two bounded views the port
+    /// with absolute window indices rather than the two bounded views the implementation
     /// uses.
     ///
     /// The point of writing it a second time, and differently, is that the
-    /// port's translation of C's pointer arithmetic into offsets *within* a view
+    /// implementation's translation of C's pointer arithmetic into offsets *within* a view
     /// is exactly where an off-by-one would hide. This version keeps C's
     /// pointers as absolute `usize` indices into the whole window, so the two
     /// disagree if that translation is wrong anywhere. The eight-way unrolling
@@ -1014,10 +1008,6 @@ mod tests {
         };
         (len, match_start)
     }
-
-    // -------------------------------------------------------------------------
-    //  DECISION POINT #2 — the chain-walk limit
-    // -------------------------------------------------------------------------
 
     /// `limit = strstart - MAX_DIST(s)` when `strstart` exceeds it, and the walk
     /// stops at `cur_match <= limit` (`deflate.c` L1396-L1397, L1525).
@@ -1145,10 +1135,6 @@ mod tests {
         assert_eq!(unclamped.len, 100);
     }
 
-    // -------------------------------------------------------------------------
-    //  Chain order, the early exit and the budget
-    // -------------------------------------------------------------------------
-
     /// The first candidate to reach a given length keeps it
     /// (`deflate.c` L1514), and because chains run most recent first
     /// (`doc/algorithm.txt` §1) that is the nearest one.
@@ -1232,10 +1218,6 @@ mod tests {
         assert_eq!(sufficient.len, 40);
     }
 
-    // -------------------------------------------------------------------------
-    //  The unrolled comparison and the return
-    // -------------------------------------------------------------------------
-
     /// The OUT assertion: "the match length is not greater than `s->lookahead`"
     /// (`deflate.c` L1387, L1528-L1529).
     #[test]
@@ -1293,10 +1275,6 @@ mod tests {
         assert_eq!(outcome.len, MAX_MATCH - 1);
     }
 
-    // -------------------------------------------------------------------------
-    //  DECISION POINT #3 — the deliberately redundant test
-    // -------------------------------------------------------------------------
-
     /// The `match[best_len - 1] != scan_end1` test rejects a candidate that
     /// differs at offset 2 (`deflate.c` L1482-L1491).
     ///
@@ -1346,17 +1324,13 @@ mod tests {
         assert_eq!(outcome.len, MAX_MATCH);
     }
 
-    // -------------------------------------------------------------------------
-    //  The state-facing entry point and the "match_start is garbage" contract
-    // -------------------------------------------------------------------------
-
     /// [`longest_match`] writes `match_start` when a candidate improves on
     /// `prev_length` and leaves it alone when none does
     /// (`deflate.c` L1382-L1384, L1515).
     ///
     /// The second half is the contract's "`match_start` is garbage" clause. C
-    /// achieves it by simply not assigning; so does this port, and this test is
-    /// what pins that down — a port that wrote a sentinel, or wrote the last
+    /// achieves it by simply not assigning; so does this implementation, and this test is
+    /// what pins that down — an implementation that wrote a sentinel, or wrote the last
     /// candidate examined, would compile and pass every other test here while
     /// corrupting `deflate_slow`'s lazy-match bookkeeping.
     #[test]
@@ -1418,11 +1392,7 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------------
-    //  Differential test against an independent transcription
-    // -------------------------------------------------------------------------
-
-    /// The port agrees with an independent, absolute-index transcription of
+    /// The implementation agrees with an independent, absolute-index transcription of
     /// `deflate.c` L1389-L1529 over a randomised corpus, and every match it
     /// reports is a real match.
     ///

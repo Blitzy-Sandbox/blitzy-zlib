@@ -1,6 +1,6 @@
 //! `deflate_slow`: the lazy-matching compressor, used for levels 4 to 9.
 //!
-//! Port of `local block_state deflate_slow(deflate_state *s, int flush)`
+//! Mirrors `local block_state deflate_slow(deflate_state *s, int flush)`
 //! (`deflate.c` L1956-L2076), the `func` of rows 4 through 9 of
 //! `configuration_table` (L119-L124) and therefore the compressor behind
 //! **every default-level stream**, since `Z_DEFAULT_COMPRESSION` resolves to 6
@@ -50,8 +50,8 @@
 //! configuration table (L107-L110), its `INSERT_STRING` variant (L155-L158) and
 //! its alternative `longest_match` (L1537-L1588). `LIT_MEM` is commented out at
 //! `deflate.h` L28, so the symbol buffer is the single `sym_buf` of `LIT_BUFS` 4
-//! and the `d_buf`/`l_buf` tally macros at `deflate.h` L339-L355 are not ported.
-//! `UNALIGNED_OK` word-at-a-time comparison is not part of this port either.
+//! and the `d_buf`/`l_buf` tally macros at `deflate.h` L339-L355 are not implemented.
+//! `UNALIGNED_OK` word-at-a-time comparison is not part of this implementation either.
 //! `ZLIB_DEBUG` is undefined, which is what makes `check_match` (L2017) a no-op
 //! (L1623) and what turns `Assert` into [`debug_assert!`] and `Tracevv`
 //! (L2045, L2064) into nothing at all.
@@ -62,7 +62,11 @@
 // `deflate.h` L311-L317 for oracle traceability, which `clippy::pedantic` flags
 // at every call site. The same relaxation, for the same reason, appears in
 // `deflate/mod.rs` and `deflate/algorithm.rs`.
-#![allow(clippy::used_underscore_items)]
+// MSRV guard: `unknown_lints` comes first because `clippy::used_underscore_items` postdates the
+// declared 1.80 floor, where the lint NAME is itself an `unknown_lints` error under `-D warnings`.
+// Allowing `unknown_lints` in the same list makes the attribute inert on 1.80 and effective on
+// current stable. Do not drop it while the floor is 1.80.
+#![allow(unknown_lints, clippy::used_underscore_items)]
 
 // Everything here comes from the modules this file is allowed to depend on:
 //
@@ -70,7 +74,7 @@
 //   vocabulary: the return type, the flush selector, the stream cursors that
 //   stand in for C's `s->strm` back-pointer, and the two spellings of
 //   `FLUSH_BLOCK`. `flush_block_only` and `flush_block!` are **both** imported
-//   because this function is the one place in the port that needs both; see the
+//   because this function is the one place in the implementation that needs both; see the
 //   `match_available` branch.
 // * `deflate/hash_chain.rs` -- `INSERT_STRING` (`deflate.c` L160-L163).
 // * `deflate/longest_match.rs` -- `longest_match` (L1389).
@@ -86,18 +90,7 @@ use crate::deflate::state::{Allocator, DeflateState, IPos, Strategy, MIN_LOOKAHE
 use crate::deflate::window::fill_window;
 use crate::trees::_tr_tally;
 
-// -----------------------------------------------------------------------------
-//  TOO_FAR -- deflate.c L88-L91
-// -----------------------------------------------------------------------------
-
 /// Distance above which a three-byte match is discarded.
-///
-/// ```text
-/// #ifndef TOO_FAR
-/// #  define TOO_FAR 4096
-/// #endif
-/// /* Matches of length 3 are discarded if their distance exceeds TOO_FAR */
-/// ```
 ///
 /// `deflate.c` L88-L91. This constant is used at exactly one place in the whole
 /// reference implementation -- L2000, inside this function -- which is why it
@@ -112,17 +105,17 @@ use crate::trees::_tr_tally;
 /// is arbitrary, and reproducing it exactly is mandatory.
 ///
 /// `usize` because the operands are `strstart` and `match_start`, both `usize`
-/// in this port.
+/// in this implementation.
 const TOO_FAR: usize = 4096;
 
-/// The port of the `#if TOO_FAR <= 32767` guard at `deflate.c` L1998.
+/// The Rust counterpart of the `#if TOO_FAR <= 32767` guard at `deflate.c` L1998.
 ///
 /// In C that guard decides whether the distance half of the rejection at
 /// L1999-L2001 is *compiled at all*. It holds for the reference value, so the
 /// clause is live code and [`deflate_slow`] implements it unconditionally. Making
 /// it a `const` assertion rather than a runtime check reproduces the reference's
 /// build-time semantics exactly: were `TOO_FAR` ever raised past 32767, C would
-/// silently drop the clause while this port would keep applying it, and the two
+/// silently drop the clause while this implementation would keep applying it, and the two
 /// implementations would diverge. Here that divergence cannot compile.
 const _: () = assert!(
     TOO_FAR <= 32767,
@@ -136,10 +129,6 @@ const _: () = assert!(
 /// parentheses; the value carries no derivation and must not be tuned.
 const LAZY_REJECT_MAX_LENGTH: usize = 5;
 
-// -----------------------------------------------------------------------------
-//  Narrowing helpers -- the casts inside deflate.h's tally macros
-// -----------------------------------------------------------------------------
-
 /// C's `ush dist = (ush)(distance);` (`deflate.h` L367).
 ///
 /// The truncation *is* the operation: `_tr_tally_dist` narrows its distance
@@ -147,7 +136,7 @@ const LAZY_REJECT_MAX_LENGTH: usize = 5;
 /// records the low half and nothing else. For every real match the value is at
 /// most `MAX_DIST(s)`, one window less the lookahead and so below 32768, and the
 /// narrowing is lossless; it is spelled out here so that the unreachable case
-/// keeps C's behaviour rather than this port's opinion of it.
+/// keeps C's behaviour rather than this implementation's opinion of it.
 // The lint fires on precisely the conversion this function exists to perform.
 #[allow(clippy::cast_possible_truncation)]
 const fn as_ush(value: usize) -> u16 {
@@ -176,7 +165,7 @@ const fn as_uch(value: usize) -> u8 {
 /// `w_size + MAX_DIST(s)` (L289), which leaves it far above 1.
 ///
 /// C would read `s->window[(unsigned)-1]` if that reasoning were ever wrong --
-/// an out-of-bounds read, and undefined behaviour. This port cannot, so it
+/// an out-of-bounds read, and undefined behaviour. This implementation cannot, so it
 /// records the invariant as a [`debug_assert!`] and yields `0` for the
 /// unreachable case: a total function, and one byte of a wrong literal in a
 /// situation where the reference has no defined behaviour at all.
@@ -194,14 +183,10 @@ fn deferred_literal<'a, A: Allocator<'a>>(state: &DeflateState<'a, A>) -> u8 {
         .unwrap_or(0)
 }
 
-// -----------------------------------------------------------------------------
-//  deflate_slow -- deflate.c L1956-L2076
-// -----------------------------------------------------------------------------
-
 /// Compresses as much as possible from the input stream with lazy match
 /// evaluation, and returns the state of the block it was working on.
 ///
-/// Port of `local block_state deflate_slow(deflate_state *s, int flush)`
+/// Mirrors `local block_state deflate_slow(deflate_state *s, int flush)`
 /// (`deflate.c` L1956-L2076). The compressor for levels 4 to 9, and so for the
 /// default level 6.
 ///
@@ -224,7 +209,7 @@ fn deferred_literal<'a, A: Allocator<'a>>(state: &DeflateState<'a, A>) -> u8 {
 /// # Arguments
 ///
 /// `state` is C's `deflate_state *s`. `cursors` is everything the reference
-/// reaches through `s->strm`, which this port cannot hold as a field without
+/// reaches through `s->strm`, which this implementation cannot hold as a field without
 /// aliasing `state`; see the `deflate/algorithm.rs` module documentation.
 /// `flush` is the caller's flush selector, already narrowed by `deflate()` to
 /// the six values compression accepts (L985).
@@ -247,7 +232,7 @@ fn deferred_literal<'a, A: Allocator<'a>>(state: &DeflateState<'a, A>) -> u8 {
 /// [`debug_assert!`]s, which record invariants that callers establish rather
 /// than conditions this function has to defend against.
 #[allow(
-    // `pedantic`'s `too_many_lines` counts the comments this port carries over
+    // `pedantic`'s `too_many_lines` counts the comments this implementation carries over
     // from `deflate.c`. Splitting the body would break the line-for-line
     // correspondence with L1956-L2076 that the byte-identity requirement is
     // verified against, and the two decision points are precisely the code that
@@ -269,13 +254,11 @@ pub(crate) fn deflate_slow<'a, A: Allocator<'a>>(
     // `/* Process the input block. */`
     // `for (;;) {`  (L1960-L1961)
     loop {
-        // ---------------------------------------------------------------------
         //  Lookahead -- L1962-L1973
         //
         //  "Make sure that we always have enough lookahead, except at the end of
         //   the input file. We need MAX_MATCH bytes for the next match, plus
         //   MIN_MATCH bytes to insert the string following the next match."
-        // ---------------------------------------------------------------------
 
         // `if (s->lookahead < MIN_LOOKAHEAD) {`  (L1967)
         if state.window.lookahead < MIN_LOOKAHEAD {
@@ -306,20 +289,11 @@ pub(crate) fn deflate_slow<'a, A: Allocator<'a>>(
             }
         }
 
-        // ---------------------------------------------------------------------
         //  Hash insertion -- L1975-L1981
         //
         //  "Insert the string window[strstart .. strstart + 2] in the
         //   dictionary, and set hash_head to the head of the hash chain"
-        // ---------------------------------------------------------------------
 
-        // ```text
-        // hash_head = NIL;
-        // if (s->lookahead >= MIN_MATCH) {
-        //     INSERT_STRING(s, s->strstart, hash_head);
-        // }
-        // ```
-        //
         // The assignment and its conditional override are one expression here.
         // `insert_string` returns the head of the chain as it was *before* this
         // position was pushed onto it, which is what C's chained
@@ -331,11 +305,9 @@ pub(crate) fn deflate_slow<'a, A: Allocator<'a>>(
             IPos::NIL
         };
 
-        // ---------------------------------------------------------------------
         //  Save the previous match, then reset -- L1983-L1986
         //
         //  "Find the longest match, discarding those <= prev_length."
-        // ---------------------------------------------------------------------
 
         // ★ These three assignments, in this order, are what makes the
         // evaluation lazy. L1985 is a single C comma-expression --
@@ -356,10 +328,6 @@ pub(crate) fn deflate_slow<'a, A: Allocator<'a>>(
 
         // `s->match_length = MIN_MATCH-1;`  (L1986)
         state.match_length = MIN_MATCH - 1;
-
-        // ---------------------------------------------------------------------
-        //  The candidate guard -- L1988-L1994
-        // ---------------------------------------------------------------------
 
         // ★ THREE conditions, in this order. `deflate_fast` (L1886) has only the
         // first and the third; the middle one is the lazy-matching gate, and the
@@ -404,19 +372,7 @@ pub(crate) fn deflate_slow<'a, A: Allocator<'a>>(
             // assigned here.
             state.match_length = longest_match(state, hash_head);
 
-            // =================================================================
             //  ★ DECISION POINT #4 -- the TOO_FAR lazy rejection (L1997-L2008)
-            //
-            //  ```text
-            //  if (s->match_length <= 5 && (s->strategy == Z_FILTERED
-            //  #if TOO_FAR <= 32767
-            //      || (s->match_length == MIN_MATCH &&
-            //          s->strstart - s->match_start > TOO_FAR)
-            //  #endif
-            //      )) {
-            //      s->match_length = MIN_MATCH-1;
-            //  }
-            //  ```
             //
             //  A pure heuristic with no basis in RFC 1951, and one of the eight
             //  decisions that determine byte-identical output. Do not adjust the
@@ -438,7 +394,6 @@ pub(crate) fn deflate_slow<'a, A: Allocator<'a>>(
             //  `MIN_MATCH`. Two is what `lm_init` seeds `match_length` with
             //  (L698) and what L1986 resets it to, and it is below `MIN_MATCH`,
             //  so the emit test at L2013 treats it as "no match here".
-            // =================================================================
 
             // `s->strstart - s->match_start`  (L2000)
             //
@@ -462,7 +417,6 @@ pub(crate) fn deflate_slow<'a, A: Allocator<'a>>(
             }
         }
 
-        // =====================================================================
         //  ★ DECISION POINT #5 -- lazy emit, hash insertion and the two literal
         //  branches (L2010-L2060)
         //
@@ -479,7 +433,6 @@ pub(crate) fn deflate_slow<'a, A: Allocator<'a>>(
         //  `match_available` branch: it deliberately uses the non-returning
         //  spelling of `FLUSH_BLOCK`, and that is the single most likely subtle
         //  error in this file.
-        // =====================================================================
 
         // "If there was a match at the previous step and the current match is
         //  not better, output the previous match" (L2010-L2012).
@@ -515,7 +468,7 @@ pub(crate) fn deflate_slow<'a, A: Allocator<'a>>(
 
             // `check_match(s, s->strstart - 1, s->prev_match, (int)s->prev_length);`
             // (L2017) is `ZLIB_DEBUG`-only: L1623 defines it away in the shipped
-            // build. Nothing to port.
+            // build. Nothing to implement.
 
             // The distance and the length C hands to `_tr_tally_dist`, read
             // before the tally borrows the state.
@@ -590,13 +543,6 @@ pub(crate) fn deflate_slow<'a, A: Allocator<'a>>(
                  (deflate.c L2013 and L2028)"
             );
 
-            // ```text
-            // do {
-            //     if (++s->strstart <= max_insert) {
-            //         INSERT_STRING(s, s->strstart, hash_head);
-            //     }
-            // } while (--s->prev_length != 0);
-            // ```
             // (L2029-L2033)
             //
             // ★ Note the asymmetry: `++s->strstart` is evaluated *before* the
@@ -655,7 +601,7 @@ pub(crate) fn deflate_slow<'a, A: Allocator<'a>>(
             //  truncate the previous match to a single literal." (L2041-L2044)
 
             // `Tracevv((stderr,"%c", s->window[s->strstart - 1]));` (L2045) is
-            // `ZLIB_DEBUG`-only; nothing to port.
+            // `ZLIB_DEBUG`-only; nothing to implement.
 
             // `_tr_tally_lit(s, s->window[s->strstart - 1], bflush);`  (L2046)
             //
@@ -668,14 +614,6 @@ pub(crate) fn deflate_slow<'a, A: Allocator<'a>>(
             // ★★ `FLUSH_BLOCK_ONLY`, NOT `FLUSH_BLOCK`. This is the subtlest
             // point in the function.
             //
-            // ```text
-            // if (bflush) {
-            //     FLUSH_BLOCK_ONLY(s, 0);
-            // }
-            // s->strstart++;
-            // s->lookahead--;
-            // if (s->strm->avail_out == 0) return need_more;
-            // ```
             // (L2047-L2052)
             //
             // `FLUSH_BLOCK` (L1642-L1645) is `FLUSH_BLOCK_ONLY` *plus* an early
@@ -725,10 +663,6 @@ pub(crate) fn deflate_slow<'a, A: Allocator<'a>>(
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  The tail -- L2062-L2075
-    // -------------------------------------------------------------------------
-
     // `Assert (flush != Z_NO_FLUSH, "no flush?");`  (L2062)
     //
     // The loop above is left only by the `break` at L1972, which is reached when
@@ -738,13 +672,6 @@ pub(crate) fn deflate_slow<'a, A: Allocator<'a>>(
     // C, hence a `debug_assert!` and never a release panic.
     debug_assert!(flush != Flush::NoFlush, "no flush? (deflate.c L2062)");
 
-    // ```text
-    // if (s->match_available) {
-    //     Tracevv((stderr,"%c", s->window[s->strstart - 1]));
-    //     _tr_tally_lit(s, s->window[s->strstart - 1], bflush);
-    //     s->match_available = 0;
-    // }
-    // ```
     // (L2063-L2067)
     //
     // The literal the loop deferred and then ran out of input before deciding
@@ -773,12 +700,6 @@ pub(crate) fn deflate_slow<'a, A: Allocator<'a>>(
         MIN_MATCH - 1
     };
 
-    // ```text
-    // if (flush == Z_FINISH) {
-    //     FLUSH_BLOCK(s, 1);
-    //     return finish_done;
-    // }
-    // ```
     // (L2069-L2072)
     //
     // `flush_block!` returns `finish_started` from inside the macro when the
@@ -807,10 +728,6 @@ pub(crate) fn deflate_slow<'a, A: Allocator<'a>>(
     BlockState::BlockDone
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
 #[cfg(test)]
 // The workspace denies the panic-prone lints, which is right for library code and
 // wrong for a harness: a test asserts, and a failing assertion panics. Indexing is
@@ -819,7 +736,12 @@ pub(crate) fn deflate_slow<'a, A: Allocator<'a>>(
 // `_tr_init` and `_tr_tally`, whose names are the C spellings of `deflate.h`
 // L311-L317. The same relaxation, for the same reasons, appears in
 // `deflate/algorithm.rs`, `deflate/window.rs` and `trees/mod.rs`.
+// MSRV guard: `unknown_lints` comes first because `clippy::used_underscore_items` postdates the
+// declared 1.80 floor, where the lint NAME is itself an `unknown_lints` error under `-D warnings`.
+// Allowing `unknown_lints` in the same list makes the attribute inert on 1.80 and effective on
+// current stable. Do not drop it while the floor is 1.80.
 #[allow(
+    unknown_lints,
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::panic,
@@ -837,10 +759,6 @@ mod tests {
     use crate::read_buf::{InputCursor, OutputCursor};
     use crate::trees::{_tr_init, _tr_tally};
     use alloc::vec::Vec;
-
-    // -------------------------------------------------------------------------
-    //  Fixtures
-    // -------------------------------------------------------------------------
 
     /// A stream configured as
     /// `deflateInit2(&strm, level, Z_DEFLATED, -15, mem_level, strategy)`, which
@@ -1065,10 +983,6 @@ mod tests {
         state
     }
 
-    // -------------------------------------------------------------------------
-    //  ★ DECISION POINT #4 -- the TOO_FAR rejection (deflate.c L1997-L2008)
-    // -------------------------------------------------------------------------
-
     #[test]
     fn too_far_is_the_reference_value() {
         // `#define TOO_FAR 4096` (`deflate.c` L89), and the `#if TOO_FAR <= 32767`
@@ -1213,10 +1127,6 @@ mod tests {
             planted.distance
         );
     }
-
-    // -------------------------------------------------------------------------
-    //  ★ DECISION POINT #5 -- lazy emit and hash insertion (L2010-L2060)
-    // -------------------------------------------------------------------------
 
     #[test]
     fn adopting_a_match_drives_prev_length_to_zero() {
@@ -1426,10 +1336,6 @@ mod tests {
             "the literal branch does not clear match_available (deflate.c L2040-L2052)"
         );
     }
-
-    // -------------------------------------------------------------------------
-    //  The loop preamble and the tail -- L1961-L1973 and L2062-L2075
-    // -------------------------------------------------------------------------
 
     #[test]
     fn no_input_under_no_flush_asks_for_more() {

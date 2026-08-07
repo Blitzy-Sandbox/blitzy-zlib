@@ -1,4 +1,4 @@
-//! The sliding-window update: the safe port of `updatewindow`
+//! The sliding-window update: the safe mirror of `updatewindow`
 //! (`inflate.c` L252-L296).
 //!
 //! # What the reference says
@@ -44,12 +44,8 @@
 //!
 //! # C's `end` pointer becomes the tail of a slice
 //!
-//! The C signature takes a pointer *past the end* of the region to copy from and
-//! walks backwards from it:
-//!
-//! ```c
-//! local int updatewindow(z_streamp strm, const Bytef *end, unsigned copy);
-//! ```
+//! The C signature takes a pointer *past the end* of the region to copy from
+//! (`inflate.c` L241) and walks backwards from it.
 //!
 //! Pointer subtraction on a caller-supplied pointer is not expressible in safe
 //! Rust -- and would not be desirable if it were -- so the region arrives as a
@@ -99,7 +95,7 @@
 //! `whave` (how many window bytes are valid) and `wnext` (where the next byte
 //! goes) are the *only* things that bound valid window content. The window itself
 //! arrives uninitialised in C -- `zcalloc` selects `malloc` over `calloc` whenever
-//! `sizeof(uInt) > 2` (`zutil.c` L299-L303), which is every target this port
+//! `sizeof(uInt) > 2` (`zutil.c` L299-L303), which is every target this implementation
 //! supports -- and `test/infcover.c` fills every block it hands out with `0xa5`
 //! (its L87) precisely so that code which assumes zeros produces wrong answers
 //! instead of passing by luck.
@@ -159,7 +155,7 @@
 //!
 //! Nothing here is exported to C. `updatewindow` is a `local` (file-static)
 //! function in the reference: it appears in no header and in no block of
-//! `zlib.map`, so its port is `pub(crate)`, never `pub`, and carries no
+//! `zlib.map`, so its implementation is `pub(crate)`, never `pub`, and carries no
 //! `#[no_mangle]` and no `extern "C"`.
 
 use crate::allocate::Allocator;
@@ -169,7 +165,7 @@ use crate::inflate::state::InflateState;
 /// Copies the last `copy` bytes of `written` into the sliding window, creating
 /// the window if it does not exist yet.
 ///
-/// This is the port of `updatewindow` (`inflate.c` L252-L296); see the [module
+/// Implements `updatewindow` (`inflate.c` L252-L296); see the [module
 /// documentation](self) for the reference's own description of when it runs, for
 /// the correspondence between C's `end` pointer and the tail of `written`, and for
 /// why the `whave` arithmetic may not be rearranged.
@@ -193,7 +189,7 @@ use crate::inflate::state::InflateState;
 ///
 /// The C function reports failure as a bare `return 1`, which both call sites map
 /// to `state->mode = MEM; return Z_MEM_ERROR` (`inflate.c` L1136-L1138 and
-/// L1210-L1213). Callers of this port must treat **any** `Err` the same way --
+/// L1210-L1213). Callers of this implementation must treat **any** `Err` the same way --
 /// `InflateState::latch_memory_error` performs exactly that step -- and the
 /// distinction below exists for diagnosis, not for control flow:
 ///
@@ -357,10 +353,6 @@ where
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
 #[cfg(test)]
 #[allow(
     clippy::indexing_slicing,
@@ -495,7 +487,7 @@ mod tests {
         state
     }
 
-    /// The byte this port must find at absolute output position `index`.
+    /// The byte this implementation must find at absolute output position `index`.
     ///
     /// The period is 253 rather than 256 so that a byte which is one whole window
     /// out of date does *not* coincidentally carry the value expected at its slot;

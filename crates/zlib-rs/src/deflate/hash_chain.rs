@@ -1,6 +1,6 @@
 //! The rolling hash key and the `prev`/`head` chains it indexes.
 //!
-//! Port of `UPDATE_HASH` (`deflate.c` L135-L141), `INSERT_STRING` (L144-L164) and `CLEAR_HASH`
+//! Mirrors `UPDATE_HASH` (`deflate.c` L135-L141), `INSERT_STRING` (L144-L164) and `CLEAR_HASH`
 //! (L166-L175), together with the state members they operate on: `prev` (`deflate.h` L138-L142),
 //! `head` (L144), `ins_h`, `hash_size`, `hash_bits`, `hash_mask` (L146-L149), `hash_shift`
 //! (L151-L156) and `slid` (L285-L286).
@@ -61,7 +61,7 @@
 //! # Where the neighbouring halves live
 //!
 //! * The three chain assignments themselves belong to [`crate::weak_slice::HashChains`], whose
-//!   `insert_string` is "an exact port of `INSERT_STRING` minus the hash update"; this module owns
+//!   `insert_string` is "an exact mirror of `INSERT_STRING` minus the hash update"; this module owns
 //!   the hash update and the composition. `NIL`, [`Pos`](crate::weak_slice::Pos),
 //!   [`IPos`](crate::weak_slice::IPos) and [`MIN_MATCH`] are that module's too, and are imported
 //!   here rather than redeclared.
@@ -77,7 +77,7 @@
 //! * The `#ifdef FASTEST` variant of `INSERT_STRING` (`deflate.c` L154-L158) maintains **no**
 //!   chains at all: it writes `head` and never `prev`. `FASTEST` also forces the compression level
 //!   to 1 and swaps in a two-entry `configuration_table`, so it is a different encoder producing
-//!   different bytes. Only the shipped `#else` branch at L160-L163 is ported.
+//!   different bytes. Only the shipped `#else` branch at L160-L163 is implemented.
 //! * Nothing here is vectorised or widened. Reading two or four bytes at a time to compute a key
 //!   would change which positions collide, and therefore the emitted distances. The output-neutral
 //!   `simd` feature is confined to the checksum modules for exactly this reason.
@@ -92,7 +92,7 @@
 //! limit && --chain_length != 0)` (L1525). That is safe because `limit` and `chain_length` bound
 //! the walk, not because the value is meaningful.
 //!
-//! This port reproduces the tolerance without reproducing the hazard. Nothing here reads
+//! This implementation reproduces the tolerance without reproducing the hazard. Nothing here reads
 //! uninitialized memory: the buffers arrive from the caller's allocator holding *defined* bytes,
 //! [`crate::weak_slice::HashChains`] hands out `u16` values through bounds-checked accessors, and
 //! clearing `prev` would be a gratuitous deviation that costs time and changes nothing.
@@ -110,7 +110,7 @@
 use crate::deflate::state::{Allocator, DeflateState};
 use crate::weak_slice::{IPos, MIN_MATCH};
 
-/// The seed in [`seed_hash`] folds exactly `MIN_MATCH - 1` bytes, which is the port of the
+/// The seed in [`seed_hash`] folds exactly `MIN_MATCH - 1` bytes, which implements the
 /// compile-time guard the reference implementation places beside both of its seed sites:
 ///
 /// ```text
@@ -126,7 +126,7 @@ const _: () = assert!(MIN_MATCH == 3);
 
 /// Folds one input byte into the running hash key.
 ///
-/// Port of `UPDATE_HASH` (`deflate.c` L141):
+/// Mirrors `UPDATE_HASH` (`deflate.c` L141):
 ///
 /// ```text
 /// #define UPDATE_HASH(s,h,c) (h = (((h) << s->hash_shift) ^ (c)) & s->hash_mask)
@@ -143,7 +143,7 @@ const _: () = assert!(MIN_MATCH == 3);
 ///
 /// In C `h` is a `uInt`, so `h << hash_shift` discards whatever passes bit 31. Writing that as a
 /// plain `<<` on a `usize` would panic on overflow in a debug build and wrap silently in a release
-/// build — one expression with two behaviours, which a port that must reproduce compressed output
+/// build — one expression with two behaviours, which an implementation that must reproduce compressed output
 /// byte for byte cannot have. [`usize::wrapping_shl`] discards the high bits unconditionally
 /// instead, and the result is bit-identical to C's:
 ///
@@ -159,7 +159,10 @@ const _: () = assert!(MIN_MATCH == 3);
 /// The default configuration, `memLevel` 8, gives `hash_shift` 5 and `hash_mask` 0x7fff. Rolling
 /// the three bytes of `"abc"` through a zero key reproduces the values the C macro produces:
 ///
-/// ```ignore
+/// The values are shown rather than compiled because this function is crate-private; the same
+/// three assertions run in this module's test suite.
+///
+/// ```text
 /// let h = update_hash(5, 0x7fff, 0, b'a');
 /// assert_eq!(h, 0x0061);
 /// let h = update_hash(5, 0x7fff, h, b'b');
@@ -195,7 +198,7 @@ pub(crate) fn update_hash(hash_shift: usize, hash_mask: usize, h: usize, c: u8) 
 #[inline]
 fn debug_assert_hash_shift_invariant(hash_shift: usize, hash_bits: u32) {
     // `usize::try_from` cannot fail for the `hash_bits` of any live state (8..=16) on any target
-    // this port supports; the `usize::MAX` fallback would fail the assertion loudly rather than
+    // this implementation supports; the `usize::MAX` fallback would fail the assertion loudly rather than
     // pass it silently, which is the right way round for a check.
     let bits = usize::try_from(hash_bits).unwrap_or(usize::MAX);
 
@@ -207,7 +210,7 @@ fn debug_assert_hash_shift_invariant(hash_shift: usize, hash_bits: u32) {
 
 /// Restarts the running key from the first two bytes of the string at `str_pos`.
 ///
-/// Port of the seed pair that the reference implementation open-codes at both places where the
+/// Mirrors the seed pair that the reference implementation open-codes at both places where the
 /// chain of consecutive bytes is broken and a key must be built from nothing —
 /// `fill_window` once new input has arrived (`deflate.c` L317-L318):
 ///
@@ -254,14 +257,7 @@ pub(crate) fn seed_hash<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>, s
 /// Inserts the three-byte string at `str_pos` into the hash chains and returns the previous head
 /// of its chain.
 ///
-/// Port of the shipped `INSERT_STRING` (`deflate.c` L160-L163):
-///
-/// ```text
-/// #define INSERT_STRING(s, str, match_head) \
-///    (UPDATE_HASH(s, s->ins_h, s->window[(str) + (MIN_MATCH-1)]), \
-///     match_head = s->prev[(str) & s->w_mask] = s->head[s->ins_h], \
-///     s->head[s->ins_h] = (Pos)(str))
-/// ```
+/// Mirrors the shipped `INSERT_STRING` (`deflate.c` L160-L163).
 ///
 /// The order of the four steps is load-bearing and is reproduced exactly:
 ///
@@ -334,16 +330,9 @@ pub(crate) fn insert_string<'a, A: Allocator<'a>>(
 /// `match_head` argument to copy the head into: `fill_window`'s priming loop
 /// (`deflate.c` L322-L332) and `deflateSetDictionary`'s insertion loop (L600-L607). Both read
 ///
-/// ```text
-/// UPDATE_HASH(s, s->ins_h, s->window[str + MIN_MATCH-1]);
-/// s->prev[str & s->w_mask] = s->head[s->ins_h];
-/// s->head[s->ins_h] = (Pos)str;
-/// str++;
-/// ```
-///
 /// which is [`insert_string`] with the result dropped — the head is read either way, because
 /// `prev[str & w_mask]` is assigned from it. Defining this in terms of [`insert_string`] rather
-/// than beside it is the point: there is one copy of the arithmetic in this port, so the three call
+/// than beside it is the point: there is one copy of the arithmetic in this implementation, so the three call
 /// sites cannot drift apart the way three macro expansions can.
 #[inline]
 pub(crate) fn insert_string_no_head<'a, A: Allocator<'a>>(
@@ -355,16 +344,7 @@ pub(crate) fn insert_string_no_head<'a, A: Allocator<'a>>(
 
 /// Clears the hash heads and the slid flag.
 ///
-/// Port of `CLEAR_HASH` (`deflate.c` L170-L175), all three of its statements:
-///
-/// ```text
-/// #define CLEAR_HASH(s) \
-///     do { \
-///         s->head[s->hash_size - 1] = NIL; \
-///         zmemzero(s->head, (unsigned)(s->hash_size - 1)*sizeof(*s->head)); \
-///         s->slid = 0; \
-///     } while (0)
-/// ```
+/// Mirrors `CLEAR_HASH` (`deflate.c` L170-L175), all three of its statements.
 ///
 /// Zeroing the last entry separately and then the other `hash_size - 1` is a 16-bit-target
 /// workaround, not semantics: on such a target `hash_size * sizeof(Pos)` can be exactly 64 KiB and
@@ -389,10 +369,6 @@ pub(crate) fn insert_string_no_head<'a, A: Allocator<'a>>(
 pub(crate) fn clear_hash<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) {
     state.hash.clear();
 }
-
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 // The workspace denies the panic-prone lints, which is the right policy for library code and the
@@ -506,7 +482,7 @@ mod tests {
     fn update_hash_matches_the_c_macro_at_the_default_memory_level() {
         // Produced by running the real `UPDATE_HASH` macro (`deflate.c` L141) with `uInt` fields.
         // The `(0x4000, 0x01) -> 0x0001` row is the interesting one: the shift pushes the set bit
-        // clean out of the mask, which is why the port must mask rather than check.
+        // clean out of the mask, which is why the implementation must mask rather than check.
         const CASES: [(usize, u8, usize); 10] = [
             (0x0000, 0x00, 0x0000),
             (0x0000, 0x61, 0x0061),
@@ -567,7 +543,7 @@ mod tests {
 
     #[test]
     fn update_hash_agrees_with_32_bit_uint_arithmetic() {
-        // The claim the port rests on: computing the running key in a `usize` is bit-identical to
+        // The claim the implementation rests on: computing the running key in a `usize` is bit-identical to
         // computing it in C's `uInt`, because the mask keeps at most `hash_bits <= 16` bits.
         for hash_bits in MIN_HASH_BITS..=MAX_HASH_BITS {
             let bits = usize::try_from(hash_bits).unwrap();

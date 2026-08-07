@@ -1,4 +1,4 @@
-//! The compressor's working state: the port of C `deflate_state`.
+//! The compressor's working state: the Rust counterpart of C `deflate_state`.
 //!
 //! This is the Rust form of `struct internal_state` / `deflate_state`
 //! (`deflate.h` L104-L288) together with the constants that surround it
@@ -183,7 +183,7 @@
 //! `WIN_INIT` (L347-L372). `test/infcover.c` fills every block it hands out
 //! with `0xa5` (L87) precisely to catch an implementation that assumes zeros.
 
-// `DeflateState` "repeats" its module name because the module is the port of
+// `DeflateState` "repeats" its module name because the module implements
 // `deflate_state` (`deflate.h` L288) and the type must keep that name; the
 // same applies to the constants named after their C `#define`s.
 #![allow(clippy::module_name_repetitions)]
@@ -226,38 +226,34 @@ pub(crate) use crate::weak_slice::{
 #[allow(unused_imports)]
 pub(crate) use crate::config::{DYN_TREES, PRESET_DICT, STATIC_TREES, STORED_BLOCK};
 
-// -----------------------------------------------------------------------------
-//  Sizing constants -- `deflate.h` L34-L56
-// -----------------------------------------------------------------------------
-
 /// Number of length codes, not counting the special `END_BLOCK` code.
 ///
-/// Port of `#define LENGTH_CODES 29` (`deflate.h` L34-L35).
+/// Mirrors `#define LENGTH_CODES 29` (`deflate.h` L34-L35).
 pub const LENGTH_CODES: usize = 29;
 
 /// Number of literal bytes, `0` through `255`.
 ///
-/// Port of `#define LITERALS 256` (`deflate.h` L37-L38).
+/// Mirrors `#define LITERALS 256` (`deflate.h` L37-L38).
 pub const LITERALS: usize = 256;
 
 /// Number of literal-or-length codes, including the `END_BLOCK` code -- 286.
 ///
-/// Port of `#define L_CODES (LITERALS+1+LENGTH_CODES)` (`deflate.h` L40-L41).
+/// Mirrors `#define L_CODES (LITERALS+1+LENGTH_CODES)` (`deflate.h` L40-L41).
 pub const L_CODES: usize = LITERALS + 1 + LENGTH_CODES;
 
 /// Number of distance codes.
 ///
-/// Port of `#define D_CODES 30` (`deflate.h` L43-L44).
+/// Mirrors `#define D_CODES 30` (`deflate.h` L43-L44).
 pub const D_CODES: usize = 30;
 
 /// Number of codes used to transfer the bit lengths.
 ///
-/// Port of `#define BL_CODES 19` (`deflate.h` L46-L47).
+/// Mirrors `#define BL_CODES 19` (`deflate.h` L46-L47).
 pub const BL_CODES: usize = 19;
 
 /// Maximum heap size -- 573.
 ///
-/// Port of `#define HEAP_SIZE (2*L_CODES+1)` (`deflate.h` L49-L50). It is also
+/// Mirrors `#define HEAP_SIZE (2*L_CODES+1)` (`deflate.h` L49-L50). It is also
 /// the length of the `dyn_ltree` array (L202), which is deliberately larger
 /// than `L_CODES` because `build_tree` uses the upper half for the internal
 /// nodes it creates.
@@ -265,7 +261,7 @@ pub const HEAP_SIZE: usize = 2 * L_CODES + 1;
 
 /// No Huffman code may exceed this many bits.
 ///
-/// Port of `#define MAX_BITS 15` (`deflate.h` L52-L53). Declared `usize`
+/// Mirrors `#define MAX_BITS 15` (`deflate.h` L52-L53). Declared `usize`
 /// because it is both a loop bound and the index bound of
 /// `DeflateState::bl_count`. Note that the bit-length tree has its own,
 /// smaller bound, `MAX_BL_BITS` of 7, which belongs to `trees.c` (L45-L46) and
@@ -274,7 +270,7 @@ pub const MAX_BITS: usize = 15;
 
 /// Width in bits of the bit-accumulation buffer `DeflateState::bi_buf`.
 ///
-/// Port of `#define Buf_size 16` (`deflate.h` L55-L56). Declared `i32` rather
+/// Mirrors `#define Buf_size 16` (`deflate.h` L55-L56). Declared `i32` rather
 /// than `usize` because every use is arithmetic against
 /// `DeflateState::bi_valid`, which the reference declares `int`
 /// (`deflate.h` L270-L273): `put = Buf_size - s->bi_valid` in `deflatePrime`
@@ -302,13 +298,9 @@ pub const HEAP_ARRAY_LEN: usize = 2 * L_CODES + 1;
 /// Length of `DeflateState::depth` -- 573, from `deflate.h` L220.
 pub const DEPTH_ARRAY_LEN: usize = 2 * L_CODES + 1;
 
-// -----------------------------------------------------------------------------
-//  Stream status -- `deflate.h` L58-L68
-// -----------------------------------------------------------------------------
-
 /// Where a compression stream is in its lifecycle.
 ///
-/// Port of the eight `#define`s at `deflate.h` L58-L68, with the discriminants
+/// Mirrors the eight `#define`s at `deflate.h` L58-L68, with the discriminants
 /// preserved exactly. The values are not consecutive and are not arbitrary
 /// either: they are sparse on purpose, so that a `deflate_state` that has been
 /// freed, zeroed or never initialised is overwhelmingly unlikely to hold one of
@@ -359,7 +351,7 @@ pub enum Status {
 impl Status {
     /// Every status, in the order the `#define`s run.
     ///
-    /// Ported from `deflate.h` L58-L67.
+    /// Mirrors `deflate.h` L58-L67.
     pub const ALL: [Self; 8] = [
         Self::Init,
         Self::GzipHeader,
@@ -426,7 +418,7 @@ impl Status {
 
     /// The reference spelling of this status, for diagnostics.
     ///
-    /// Ported from `deflate.h` L58-L67.
+    /// Mirrors `deflate.h` L58-L67.
     #[must_use]
     pub const fn c_name(self) -> &'static str {
         match self {
@@ -442,25 +434,10 @@ impl Status {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Huffman tree entries -- `deflate.h` L71-L94
-// -----------------------------------------------------------------------------
-
 /// One entry of a Huffman tree: a value and its code string.
 ///
-/// Port of `ct_data` (`deflate.h` L71-L86), which is a pair of anonymous
-/// unions:
-///
-/// ```c
-/// typedef struct ct_data_s {
-///     union { ush freq; ush code; } fc;
-///     union { ush dad;  ush len;  } dl;
-/// } FAR ct_data;
-/// #define Freq fc.freq
-/// #define Code fc.code
-/// #define Dad  dl.dad
-/// #define Len  dl.len
-/// ```
+/// Mirrors `ct_data` (`deflate.h` L71-L86), which is a pair of anonymous
+/// unions.
 ///
 /// Each union is flattened into a single `u16` here, and the four C macro names
 /// become accessor pairs. That is exact rather than approximate because the two
@@ -582,15 +559,6 @@ impl CtData {
 /// This is the Rust stand-in for `const static_tree_desc *stat_desc`
 /// (`deflate.h` L93). The descriptors themselves --
 ///
-/// ```c
-/// local const static_tree_desc static_l_desc  =
-///     {static_ltree, extra_lbits, LITERALS+1, L_CODES, MAX_BITS};
-/// local const static_tree_desc static_d_desc  =
-///     {static_dtree, extra_dbits, 0,          D_CODES, MAX_BITS};
-/// local const static_tree_desc static_bl_desc =
-///     {(const ct_data *)0, extra_blbits, 0,   BL_CODES, MAX_BL_BITS};
-/// ```
-///
 /// (`trees.c` L116-L138) -- are built from the generated static tables and from
 /// `MAX_BL_BITS`, all of which belong to the `trees` module. So this enum names
 /// them and `trees/tree_desc.rs` supplies them: for each variant it must
@@ -598,7 +566,7 @@ impl CtData {
 /// `extra_base`, `elems` and `max_length`.
 ///
 /// Naming a descriptor instead of pointing at one is what removes an entire
-/// class of aliasing from the port; see [`TreeDesc`].
+/// class of aliasing from the implementation; see [`TreeDesc`].
 ///
 /// [`BitLength`]: StaticTreeKind::BitLength
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -622,7 +590,7 @@ impl StaticTreeKind {
 
     /// The reference spelling of this descriptor, for diagnostics.
     ///
-    /// Ported from `trees.c` L131-L138.
+    /// Mirrors `trees.c` L131-L138.
     #[must_use]
     pub const fn c_name(self) -> &'static str {
         match self {
@@ -635,15 +603,7 @@ impl StaticTreeKind {
 
 /// A dynamic Huffman tree under construction.
 ///
-/// Port of `tree_desc` (`deflate.h` L88-L94):
-///
-/// ```c
-/// typedef struct tree_desc_s {
-///     ct_data *dyn_tree;                  /* the dynamic tree */
-///     int     max_code;                   /* largest code with non zero frequency */
-///     const static_tree_desc *stat_desc;  /* the corresponding static tree */
-/// } FAR tree_desc;
-/// ```
+/// Mirrors `tree_desc` (`deflate.h` L88-L94).
 ///
 /// with `dyn_tree` **removed**. In C that member points *into the very same
 /// `deflate_state`* -- `_tr_init` sets `s->l_desc.dyn_tree = s->dyn_ltree`
@@ -659,12 +619,6 @@ impl StaticTreeKind {
 /// One concrete benefit: `deflateCopy` has to repair those three pointers after
 /// duplicating the state, because a bytewise copy leaves them pointing at the
 /// *source* --
-///
-/// ```c
-/// ds->l_desc.dyn_tree = ds->dyn_ltree;
-/// ds->d_desc.dyn_tree = ds->dyn_dtree;
-/// ds->bl_desc.dyn_tree = ds->bl_tree;
-/// ```
 ///
 /// (`deflate.c` L1371-L1373). [`DeflateState::try_clone_in`] needs no such
 /// fix-up, and cannot forget it.
@@ -696,13 +650,9 @@ impl TreeDesc {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  The caller's gzip header -- `deflate.h` L112 and `zlib.h` L118-L133
-// -----------------------------------------------------------------------------
-
 /// A read-only view of the caller's `gz_header`, as the compressor needs it.
 ///
-/// Port of `gz_headerp gzhead` (`deflate.h` L112). The `gz_header` struct
+/// Mirrors `gz_headerp gzhead` (`deflate.h` L112). The `gz_header` struct
 /// (`zlib.h` L118-L133) belongs to the *caller*: `deflateSetHeader` stores the
 /// pointer and nothing else (`deflate.c` L714-L719), and the compressor only
 /// ever reads through it, while the caller is required to keep it alive and
@@ -719,13 +669,7 @@ impl TreeDesc {
 /// # `name` and `comment` include their terminating zero
 ///
 /// This is the one non-obvious part of the contract. The reference writes those
-/// two fields with a loop that stops *after* emitting the terminator:
-///
-/// ```c
-/// val = s->gzhead->name[s->gzindex++];
-/// put_byte(s, val);
-/// } while (val != 0);
-/// ```
+/// two fields with a loop that stops *after* emitting the terminator.
 ///
 /// (`deflate.c` L1158-L1160, and identically for `comment` at L1180-L1182), so
 /// the zero byte is part of the gzip stream, as RFC 1952 requires. The facade
@@ -738,7 +682,7 @@ impl TreeDesc {
 /// length itself into the header).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GzHeaderView<'h> {
-    /// `int text` (`zlib.h` L119): true if the data is believed to be text.
+    /// True when the data is believed to be text (`zlib.h` L119).
     /// Contributes bit 0 of the gzip `FLG` byte (`deflate.c` L1092).
     pub text: bool,
     /// `uLong time` (`zlib.h` L120): the modification time, written as four
@@ -749,24 +693,24 @@ pub struct GzHeaderView<'h> {
     /// field back, so no wider value is observable. Zero means "no time
     /// available", per RFC 1952.
     pub time: u32,
-    /// `int os` (`zlib.h` L122): the operating-system code, written masked to
+    /// The operating-system code (`zlib.h` L122), written masked to
     /// eight bits (`deflate.c` L1105).
     pub os: i32,
-    /// `Bytef *extra` with `uInt extra_len` (`zlib.h` L123-L124), or [`None`]
-    /// for `Z_NULL`, which clears bit 2 of `FLG` (`deflate.c` L1094).
+    /// The extra field, or [`None`] for `Z_NULL`, which clears bit 2 of `FLG`
+    /// (`zlib.h` L123-L124; `deflate.c` L1094).
     ///
     /// The slice length *is* `extra_len`; see [`GzHeaderView::extra_len`] for
     /// the 16-bit clamp the reference applies when writing it.
     pub extra: Option<&'h [u8]>,
-    /// `Bytef *name` (`zlib.h` L126), or [`None`] for `Z_NULL`, which clears
+    /// The member name (`zlib.h` L126), or [`None`] for `Z_NULL`, which clears
     /// bit 3 of `FLG` (`deflate.c` L1095). **Includes the terminating zero
     /// byte** -- see the type-level documentation.
     pub name: Option<&'h [u8]>,
-    /// `Bytef *comment` (`zlib.h` L128), or [`None`] for `Z_NULL`, which clears
+    /// The member comment (`zlib.h` L128), or [`None`] for `Z_NULL`, which clears
     /// bit 4 of `FLG` (`deflate.c` L1096). **Includes the terminating zero
     /// byte** -- see the type-level documentation.
     pub comment: Option<&'h [u8]>,
-    /// `int hcrc` (`zlib.h` L130): true if a header CRC is to be written.
+    /// True when a header CRC is to be written (`zlib.h` L130).
     /// Contributes bit 1 of `FLG` (`deflate.c` L1093) and causes the two-byte
     /// CRC at `deflate.c` L1196-L1197.
     pub hcrc: bool,
@@ -779,7 +723,7 @@ impl GzHeaderView<'_> {
     /// length is written as two bytes (L1107-L1108), so only the low 16 bits are
     /// transmitted and only that many bytes are copied. A caller that sets a
     /// longer `extra_len` therefore has its field truncated rather than
-    /// mis-framed, and this port must truncate identically.
+    /// mis-framed, and this implementation must truncate identically.
     #[must_use]
     pub fn extra_len(self) -> usize {
         self.extra.map_or(0, |extra| extra.len() & 0xffff)
@@ -799,7 +743,7 @@ impl GzHeaderView<'_> {
     /// The byte at `index` of the file name, including its terminating zero, or
     /// [`None`] past the end of the slice.
     ///
-    /// The port of `s->gzhead->name[s->gzindex++]` (`deflate.c` L1158). A
+    /// The Rust counterpart of `s->gzhead->name[s->gzindex++]` (`deflate.c` L1158). A
     /// well-formed view always yields the terminator before running out, so
     /// [`None`] means the facade built a slice with no zero byte in it.
     #[must_use]
@@ -810,16 +754,12 @@ impl GzHeaderView<'_> {
     /// The byte at `index` of the comment, including its terminating zero, or
     /// [`None`] past the end of the slice.
     ///
-    /// The port of `s->gzhead->comment[s->gzindex++]` (`deflate.c` L1180).
+    /// The Rust counterpart of `s->gzhead->comment[s->gzindex++]` (`deflate.c` L1180).
     #[must_use]
     pub fn comment_at(self, index: usize) -> Option<u8> {
         self.comment?.get(index).copied()
     }
 }
-
-// -----------------------------------------------------------------------------
-//  Allocated blocks that release themselves
-// -----------------------------------------------------------------------------
 
 /// A byte block owned by a [`DeflateState`], released to the allocator that
 /// produced it when it is dropped.
@@ -1004,26 +944,21 @@ impl<'a, A: Allocator<'a>> fmt::Debug for PosBlock<'a, A> {
     }
 }
 
-/// The sliding window as [`DeflateState`] holds it: the port of `Bytef *window`
+/// The sliding window as [`DeflateState`] holds it: the Rust counterpart of `Bytef *window`
 /// plus `window_size` (`deflate.h` L123-L138).
 pub type DeflateWindow<'a, A> = Window<ByteBlock<'a, A>>;
 
-/// The hash chains as [`DeflateState`] holds them: the port of `Posf *prev` and
-/// `Posf *head` plus their sizes and the `slid` flag
-/// (`deflate.h` L138-L149, L285).
+/// The hash chains as [`DeflateState`] holds them: both chain arrays, their sizes and the
+/// slid flag in one owned type (`deflate.h` L138-L149, L285).
 pub type DeflateHashChains<'a, A> = HashChains<PosBlock<'a, A>>;
 
 /// The overlaid pending-output and symbol buffer as [`DeflateState`] holds it:
-/// the port of `pending_buf`, `pending_out`, `pending`, `pending_buf_size`,
+/// the Rust counterpart of `pending_buf`, `pending_out`, `pending`, `pending_buf_size`,
 /// `sym_buf`, `lit_bufsize`, `sym_next` and `sym_end`
 /// (`deflate.h` L107-L110, L230-L254).
 pub type DeflatePending<'a, A> = PendingBuf<ByteBlock<'a, A>>;
 
-// -----------------------------------------------------------------------------
-//  The state -- `deflate.h` L104-L288
-// -----------------------------------------------------------------------------
-
-/// The internal compression state: the port of `deflate_state`
+/// The internal compression state: the Rust counterpart of `deflate_state`
 /// (`deflate.h` L104-L288).
 ///
 /// Build one with [`DeflateState::new`], which reproduces `deflateInit2_`'s
@@ -1057,7 +992,6 @@ pub type DeflatePending<'a, A> = PendingBuf<ByteBlock<'a, A>>;
 /// one has been installed; `A` is the injected allocator, which every buffer is
 /// obtained from and returned to.
 pub struct DeflateState<'a, A: Allocator<'a>> {
-    // -------------------------------------------------------------------------
     //  The three buffer-owning views.
     //
     //  DECLARATION ORDER IS LOAD-BEARING. Rust drops fields in declaration
@@ -1068,17 +1002,14 @@ pub struct DeflateState<'a, A: Allocator<'a>> {
     //  `test/infcover.c` requires. Reordering these three fields changes the
     //  release order silently; the `release_order_matches_deflate_end` test
     //  exists to catch that.
-    // -------------------------------------------------------------------------
-    /// `Bytef *pending_buf`, `ulg pending_buf_size`, `Bytef *pending_out`,
-    /// `ulg pending` (`deflate.h` L107-L110) and `uchf *sym_buf`,
-    /// `uInt lit_bufsize`, `uInt sym_next`, `uInt sym_end`
-    /// (`deflate.h` L230-L254) -- one allocation, overlaid as the module
-    /// documentation describes. Released first (`deflate.c` L1301).
+    /// The pending output and the symbol buffer: one allocation, overlaid as the
+    /// module documentation describes, covering the four pending members
+    /// (`deflate.h` L107-L110) and the four symbol-buffer members
+    /// (`deflate.h` L230-L254). Released first (`deflate.c` L1301).
     pub(crate) pending: DeflatePending<'a, A>,
 
-    /// `Posf *head` and `Posf *prev` (`deflate.h` L138-L144) with
-    /// `uInt hash_size`, `uInt hash_bits`, `uInt hash_mask`
-    /// (L147-L149) and `int slid` (L285-L286).
+    /// The two chain arrays with their sizes, masks and slid flag
+    /// (`deflate.h` L138-L144, L147-L149, L285-L286).
     ///
     /// `head[h]` is the most recent position whose three-byte prefix hashed to
     /// `h`; `prev[p & w_mask]` is the next older position on that chain, with
@@ -1086,27 +1017,24 @@ pub struct DeflateState<'a, A: Allocator<'a>> {
     /// matching `deflate.c` L1302-L1303.
     pub(crate) hash: DeflateHashChains<'a, A>,
 
-    /// `Bytef *window` (`deflate.h` L123-L131) and `ulg window_size` (L133),
-    /// with the five cursors `uInt strstart`, `uInt match_start`,
-    /// `uInt lookahead`, `long block_start` and `uInt insert`
-    /// (L158-L168, L259) and `ulg high_water` (L278-L283).
+    /// The sliding window and its length (`deflate.h` L123-L133), together with the
+    /// five position cursors (L158-L168, L259) and the high-water mark
+    /// (L278-L283).
     ///
     /// `block_start` is `isize` there rather than `i64`, which is what C's
-    /// `long` actually is on the LP64 targets this port builds for, and is
+    /// `long` actually is on the LP64 targets this implementation builds for, and is
     /// signed for the reason `deflate.h` L159-L161 gives: it "gets negative when
     /// the window is moved backwards". Released last (`deflate.c` L1304).
     pub(crate) window: DeflateWindow<'a, A>,
 
-    // -------------------------------------------------------------------------
     //  Scalars, in `deflate.h` order. `z_streamp strm` (L105) is omitted; see
     //  the module documentation.
-    // -------------------------------------------------------------------------
-    /// `int status` -- "as the name implies" (`deflate.h` L106).
+    /// Where the stream is in its lifecycle (`deflate.h` L106).
     pub(crate) status: Status,
 
-    /// `int wrap` -- "bit 0 true for zlib, bit 1 true for gzip"
-    /// (`deflate.h` L111), so 0 raw, 1 zlib, 2 gzip
-    /// (`deflate.c` L391, L423, L430).
+    /// The container as a two-bit mask -- bit 0 for zlib, bit 1 for gzip -- so 0
+    /// is raw, 1 zlib and 2 gzip (`deflate.h` L111; `deflate.c` L391, L423,
+    /// L430).
     ///
     /// **Signed, and that is load-bearing.** `deflate()` negates it once the
     /// trailer has been written -- `if (s->wrap > 0) s->wrap = -s->wrap;`, "write
@@ -1124,7 +1052,8 @@ pub struct DeflateState<'a, A: Allocator<'a>> {
     /// `wrap == 2`.
     pub(crate) gzhead: Option<GzHeaderView<'a>>,
 
-    /// `ulg gzindex` -- "where in extra, name, or comment" (`deflate.h` L113).
+    /// How far the header writer has got through `extra`, `name` or `comment`
+    /// (`deflate.h` L113).
     ///
     /// The resumable cursor for the four gzip header states: the extra-field
     /// copy advances it and resets it to zero (`deflate.c` L1127, L1140), and the
@@ -1133,11 +1062,11 @@ pub struct DeflateState<'a, A: Allocator<'a>> {
     /// [`GzHeaderView`] slices.
     pub(crate) gzindex: usize,
 
-    /// `Byte method` -- "can only be DEFLATED" (`deflate.h` L114). A
-    /// [`Method`] rather than a byte, which makes that comment a type.
+    /// The compression method, which can only be DEFLATED (`deflate.h` L114). A
+    /// [`Method`] rather than a byte, which makes that constraint a type.
     pub(crate) method: Method,
 
-    /// `int last_flush` -- "value of flush param for previous deflate call"
+    /// The `flush` argument the previous `deflate()` call was given
     /// (`deflate.h` L115).
     ///
     /// Deliberately **not** a `Flush`, because it carries two out-of-band
@@ -1149,7 +1078,7 @@ pub struct DeflateState<'a, A: Allocator<'a>> {
     /// `deflateParams` (L792).
     pub(crate) last_flush: i32,
 
-    /// `uInt ins_h` -- "hash index of string to be inserted"
+    /// The rolling hash index of the string about to be inserted
     /// (`deflate.h` L146).
     ///
     /// Held as `usize` rather than `u32`: it is the running hash from
@@ -1160,8 +1089,8 @@ pub struct DeflateState<'a, A: Allocator<'a>> {
     /// a cast at every use.
     pub(crate) ins_h: usize,
 
-    /// `uInt hash_shift` -- the number of bits `ins_h` is shifted by at each
-    /// input step (`deflate.h` L151).
+    /// How many bits `ins_h` is shifted by at each input step
+    /// (`deflate.h` L151).
     ///
     /// The invariant, quoted from `deflate.h` L152-L155: "It must be such that
     /// after `MIN_MATCH` steps, the oldest byte no longer takes part in the hash
@@ -1171,7 +1100,7 @@ pub struct DeflateState<'a, A: Allocator<'a>> {
     /// `memLevel` 9. Held as `usize` for the same reason as `ins_h`.
     pub(crate) hash_shift: usize,
 
-    /// `uInt match_length` -- "length of best match" (`deflate.h` L163).
+    /// Length of the best match found at the current position (`deflate.h` L163).
     ///
     /// A byte count in the window, so `usize`, which is the type of the
     /// `lookahead` it is repeatedly clamped against
@@ -1179,28 +1108,26 @@ pub struct DeflateState<'a, A: Allocator<'a>> {
     /// (L698).
     pub(crate) match_length: usize,
 
-    /// `IPos prev_match` -- "previous match" (`deflate.h` L164), the candidate
+    /// The previous match (`deflate.h` L164): the candidate
     /// `deflate_slow` remembers across one position so that it can emit the
     /// earlier of two overlapping matches.
     pub(crate) prev_match: IPos,
 
-    /// `int match_available` -- "set if previous match exists"
+    /// True while a previous match is being held back for lazy evaluation
     /// (`deflate.h` L165).
     ///
     /// A `bool`: the reference only ever assigns 0 or 1 and only ever tests for
     /// truth, so nothing is lost.
     pub(crate) match_available: bool,
 
-    /// `uInt prev_length` -- "Length of the best match at previous step.
-    /// Matches not greater than this are discarded. This is used in the lazy
-    /// match evaluation." (`deflate.h` L170-L173). `usize`, like
-    /// `match_length`; `lm_init` starts it at `MIN_MATCH - 1`
-    /// (`deflate.c` L698).
+    /// Length of the best match at the previous step; matches no longer than this
+    /// are discarded, which is the whole of the lazy-match evaluation
+    /// (`deflate.h` L170-L173). `usize`, like `match_length`; `lm_init` starts it
+    /// at `MIN_MATCH - 1` (`deflate.c` L698).
     pub(crate) prev_length: usize,
 
-    /// `uInt max_chain_length` -- "To speed up deflation, hash chains are never
-    /// searched beyond this length. A higher limit improves compression ratio
-    /// but degrades the speed." (`deflate.h` L175-L179).
+    /// The hard limit on how far a hash chain is walked; a higher limit improves
+    /// the compression ratio and costs speed (`deflate.h` L175-L179).
     ///
     /// One of the four tuning parameters loaded from `configuration_table`
     /// (`deflate.c` L692); `longest_match` copies it into its chain counter
@@ -1208,9 +1135,9 @@ pub struct DeflateState<'a, A: Allocator<'a>> {
     /// examined and therefore which match is chosen.
     pub(crate) max_chain_length: usize,
 
-    /// `uInt max_lazy_match` -- "Attempt to find a better match only when the
-    /// current match is strictly smaller than this value. This mechanism is used
-    /// only for compression levels >= 4." (`deflate.h` L181-L185).
+    /// A better match is sought only while the current match is strictly shorter
+    /// than this, which is the mechanism levels 4 and above use
+    /// (`deflate.h` L181-L185).
     ///
     /// C also spells this field `max_insert_length`, via
     /// `#define max_insert_length max_lazy_match` (`deflate.h` L186): "Insert
@@ -1223,8 +1150,8 @@ pub struct DeflateState<'a, A: Allocator<'a>> {
     /// second spelling.
     pub(crate) max_lazy_match: usize,
 
-    /// `int level` -- "compression level (1..9)" (`deflate.h` L192), though 0 is
-    /// also valid and means "store only".
+    /// The compression level (`deflate.h` L192). `1 ..= 9` in the header's own
+    /// description, but 0 is equally valid and means "store only".
     ///
     /// `i32`, as in C, because it is compared against the literals the C code
     /// compares it against -- `s->level == 0` (`deflate.c` L801), `s->level == 9`
@@ -1232,7 +1159,7 @@ pub struct DeflateState<'a, A: Allocator<'a>> {
     /// `int` from the caller.
     pub(crate) level: i32,
 
-    /// `int strategy` -- "favor or force Huffman coding" (`deflate.h` L193).
+    /// How string matching is traded against Huffman coding (`deflate.h` L193).
     ///
     /// A [`Strategy`] rather than an `int`. The C code performs *ordered*
     /// comparisons on it -- `s->strategy >= Z_HUFFMAN_ONLY`
@@ -1243,13 +1170,12 @@ pub struct DeflateState<'a, A: Allocator<'a>> {
     /// [`DeflateState::favours_huffman_only`] is the ordered test itself.
     pub(crate) strategy: Strategy,
 
-    /// `uInt good_match` -- "Use a faster search when the previous match is
-    /// longer than this" (`deflate.h` L194-L195). Loaded from
+    /// Above this previous-match length the search switches to its faster form
+    /// (`deflate.h` L194-L195). Loaded from
     /// `configuration_table` (`deflate.c` L690) and tested at L1423.
     pub(crate) good_match: usize,
 
-    /// `int nice_match` -- "Stop searching when current match exceeds this"
-    /// (`deflate.h` L197).
+    /// The match length at which searching stops early (`deflate.h` L197).
     ///
     /// **Signed, and that is load-bearing.** `longest_match` copies it into an
     /// `int`, then clamps it with a round trip through unsigned and back:
@@ -1260,60 +1186,56 @@ pub struct DeflateState<'a, A: Allocator<'a>> {
     /// exactly.
     pub(crate) nice_match: i32,
 
-    /// `struct ct_data_s dyn_ltree[HEAP_SIZE]` -- "literal and length tree"
-    /// (`deflate.h` L202). Longer than `L_CODES` because `build_tree` builds its
-    /// internal nodes in the upper half.
+    /// The dynamic literal/length tree (`deflate.h` L202). Longer than `L_CODES`
+    /// because `build_tree` builds its internal nodes in the upper half.
     pub(crate) dyn_ltree: [CtData; DYN_LTREE_LEN],
 
-    /// `struct ct_data_s dyn_dtree[2*D_CODES+1]` -- "distance tree"
-    /// (`deflate.h` L203).
+    /// The dynamic distance tree (`deflate.h` L203).
     pub(crate) dyn_dtree: [CtData; DYN_DTREE_LEN],
 
-    /// `struct ct_data_s bl_tree[2*BL_CODES+1]` -- "Huffman tree for bit
-    /// lengths" (`deflate.h` L204), the tree that encodes the other two trees.
+    /// The Huffman tree for bit lengths (`deflate.h` L204): the tree that encodes
+    /// the other two trees.
     pub(crate) bl_tree: [CtData; BL_TREE_LEN],
 
-    /// `struct tree_desc_s l_desc` -- "desc. for literal tree"
-    /// (`deflate.h` L206), paired with `dyn_ltree`.
+    /// Descriptor for the literal tree (`deflate.h` L206), paired with
+    /// `dyn_ltree`.
     pub(crate) l_desc: TreeDesc,
 
-    /// `struct tree_desc_s d_desc` -- "desc. for distance tree"
-    /// (`deflate.h` L207), paired with `dyn_dtree`.
+    /// Descriptor for the distance tree (`deflate.h` L207), paired with
+    /// `dyn_dtree`.
     pub(crate) d_desc: TreeDesc,
 
-    /// `struct tree_desc_s bl_desc` -- "desc. for bit length tree"
-    /// (`deflate.h` L208), paired with `bl_tree`.
+    /// Descriptor for the bit-length tree (`deflate.h` L208), paired with
+    /// `bl_tree`.
     pub(crate) bl_desc: TreeDesc,
 
-    /// `ush bl_count[MAX_BITS+1]` -- "number of codes at each bit length for an
-    /// optimal tree" (`deflate.h` L210-L211). Filled by `gen_bitlen` and
+    /// How many codes an optimal tree has at each bit length
+    /// (`deflate.h` L210-L211). Filled by `gen_bitlen` and
     /// consumed by `gen_codes` (`trees.c` L540-L625, L203-L232).
     pub(crate) bl_count: [u16; BL_COUNT_LEN],
 
-    /// `int heap[2*L_CODES+1]` -- "heap used to build the Huffman trees"
-    /// (`deflate.h` L213). "The sons of `heap[n]` are `heap[2*n]` and
-    /// `heap[2*n+1]`. `heap[0]` is not used. The same heap array is used to
-    /// build all trees." (L216-L218).
+    /// The heap the Huffman trees are built in (`deflate.h` L213). The sons of
+    /// `heap[n]` are `heap[2*n]` and `heap[2*n+1]`, `heap[0]` is unused, and the
+    /// same array serves all three trees (L216-L218).
     pub(crate) heap: [i32; HEAP_ARRAY_LEN],
 
-    /// `int heap_len` -- "number of elements in the heap"
-    /// (`deflate.h` L214).
+    /// How many elements the heap currently holds (`deflate.h` L214).
     pub(crate) heap_len: i32,
 
-    /// `int heap_max` -- "element of largest frequency" (`deflate.h` L215).
-    /// Counts *down* from `HEAP_SIZE` as `build_tree` fills the array from the
-    /// top (`trees.c` L646).
+    /// Index of the element of largest frequency (`deflate.h` L215). Counts *down*
+    /// from `HEAP_SIZE` as `build_tree` fills the array from the top
+    /// (`trees.c` L646).
     pub(crate) heap_max: i32,
 
-    /// `uch depth[2*L_CODES+1]` -- "Depth of each subtree used as tie breaker
-    /// for trees of equal frequency" (`deflate.h` L220-L222).
+    /// Depth of each subtree, used as the tie breaker between trees of equal
+    /// frequency (`deflate.h` L220-L222).
     ///
     /// Byte-identity critical: the `smaller` macro breaks a frequency tie with
     /// `depth[n] <= depth[m]` (`trees.c` L499-L501), so these values decide the
     /// code lengths whenever two symbols occur equally often.
     pub(crate) depth: [u8; DEPTH_ARRAY_LEN],
 
-    /// `ulg opt_len` -- "bit length of current block with optimal trees"
+    /// Bit length of the current block encoded with optimal trees
     /// (`deflate.h` L256).
     ///
     /// `u64` because C's `ulg` is `unsigned long`, which is 64-bit on LP64 and
@@ -1322,29 +1244,28 @@ pub struct DeflateState<'a, A: Allocator<'a>> {
     /// block type (`trees.c` L1027-L1074) cannot truncate on any target.
     pub(crate) opt_len: u64,
 
-    /// `ulg static_len` -- "bit length of current block with static trees"
+    /// Bit length of the current block encoded with the static trees
     /// (`deflate.h` L257). The counterpart of `opt_len`; the smaller of the two,
     /// after both are rounded up to whole bytes, selects the block type.
     pub(crate) static_len: u64,
 
-    /// `uInt matches` -- "number of string matches in current block"
-    /// (`deflate.h` L258). Reset by `init_block` (`trees.c` L449) and read by
+    /// How many string matches the current block holds (`deflate.h` L258). Reset
+    /// by `init_block` (`trees.c` L449) and read by
     /// `deflateParams` to decide whether a level change needs a flush first
     /// (`deflate.c` L801-L806).
     pub(crate) matches: u32,
 
-    /// `ush bi_buf` -- "Output buffer. bits are inserted starting at the bottom
-    /// (least significant bits)." (`deflate.h` L266-L269). Its width is
-    /// [`BUF_SIZE`] bits.
+    /// The bit-emission buffer; bits are inserted starting at the least
+    /// significant end (`deflate.h` L266-L269). Its width is [`BUF_SIZE`] bits.
     pub(crate) bi_buf: u16,
 
-    /// `int bi_valid` -- "Number of valid bits in `bi_buf`. All bits above the
-    /// last valid bit are always zero." (`deflate.h` L270-L273). Reported to
+    /// How many bits of `bi_buf` are valid; every bit above the last valid one is
+    /// always zero (`deflate.h` L270-L273). Reported to
     /// callers by `deflatePending` (`deflate.c` L725).
     pub(crate) bi_valid: i32,
 
-    /// `int bi_used` -- "Last number of used bits when going to a byte
-    /// boundary." (`deflate.h` L274-L276).
+    /// How many bits were in use the last time output moved to a byte boundary
+    /// (`deflate.h` L274-L276).
     ///
     /// Maintained by `bi_windup` as `((s->bi_valid - 1) & 7) + 1`
     /// (`trees.c` L187) and forced to 8 where a stored block ends on a byte
@@ -1559,7 +1480,7 @@ impl<'a, A: Allocator<'a> + Copy> DeflateState<'a, A> {
 
     /// Duplicates the state into fresh buffers obtained from `allocator`.
     ///
-    /// The port of `deflateCopy` (`deflate.c` L1317-L1377), whose contract is to
+    /// The Rust counterpart of `deflateCopy` (`deflate.c` L1317-L1377), whose contract is to
     /// leave the source untouched and to produce a copy that can continue the
     /// same stream. The C function copies the whole struct bytewise (L1339) and
     /// then repairs it; this reproduces the observable result field by field,
@@ -1715,14 +1636,7 @@ impl<'a, A: Allocator<'a>> DeflateState<'a, A> {
     /// Releases the four buffers explicitly, in `deflateEnd`'s order.
     ///
     /// The memory half of `deflateEnd` (`deflate.c` L1300-L1304), spelled out so
-    /// that it reads like the C function:
-    ///
-    /// ```c
-    /// TRY_FREE(strm, strm->state->pending_buf);
-    /// TRY_FREE(strm, strm->state->head);
-    /// TRY_FREE(strm, strm->state->prev);
-    /// TRY_FREE(strm, strm->state->window);
-    /// ```
+    /// that it reads like the C function.
     ///
     /// Simply dropping the state does exactly the same thing in exactly the same
     /// order, because the three views are declared in that order and Rust drops
@@ -1809,12 +1723,7 @@ impl<'a, A: Allocator<'a>> DeflateState<'a, A> {
 
     /// How many `prev` entries [`DeflateState::try_clone_in`] copies.
     ///
-    /// The port of `deflateCopy`'s expression (`deflate.c` L1354-L1356):
-    ///
-    /// ```c
-    /// (ss->slid || ss->strstart - ss->insert > ds->w_size ? ds->w_size
-    ///                                                    : ss->strstart - ss->insert)
-    /// ```
+    /// The Rust counterpart of `deflateCopy`'s expression (`deflate.c` L1354-L1356).
     ///
     /// The hash tables have been slid, so any entry may be live and the whole
     /// array must come across; otherwise only the positions between `insert` and
@@ -1890,7 +1799,7 @@ impl<'a, A: Allocator<'a>> DeflateState<'a, A> {
 
     /// The largest match distance the compressor will emit.
     ///
-    /// Port of `#define MAX_DIST(s) ((s)->w_size-MIN_LOOKAHEAD)`
+    /// Mirrors `#define MAX_DIST(s) ((s)->w_size-MIN_LOOKAHEAD)`
     /// (`deflate.h` L301), which is a macro over the state rather than a
     /// constant because it depends on the window size. "In order to simplify the
     /// code, particularly on 16 bit machines, match distances are limited to
@@ -1941,43 +1850,44 @@ impl<'a, A: Allocator<'a>> DeflateState<'a, A> {
         self.strategy.as_raw() >= Strategy::HuffmanOnly.as_raw()
     }
 
-    /// `int status` (`deflate.h` L106).
+    /// Where the stream is in its lifecycle (`deflate.h` L106).
     #[must_use]
     #[inline]
     pub const fn status(&self) -> Status {
         self.status
     }
 
-    /// `int wrap` (`deflate.h` L111), sign included. See
-    /// [`DeflateState::container`].
+    /// The raw container mask, sign included (`deflate.h` L111). Use
+    /// [`DeflateState::container`] to recover the [`Wrap`] regardless of sign.
     #[must_use]
     #[inline]
     pub const fn wrap(&self) -> i32 {
         self.wrap
     }
 
-    /// `int level` (`deflate.h` L192).
+    /// The compression level, `0 ..= 9` (`deflate.h` L192).
     #[must_use]
     #[inline]
     pub const fn level(&self) -> i32 {
         self.level
     }
 
-    /// `int strategy` (`deflate.h` L193).
+    /// How string matching is traded against Huffman coding (`deflate.h` L193).
     #[must_use]
     #[inline]
     pub const fn strategy(&self) -> Strategy {
         self.strategy
     }
 
-    /// `Byte method` (`deflate.h` L114).
+    /// The compression method, which can only be DEFLATED (`deflate.h` L114).
     #[must_use]
     #[inline]
     pub const fn method(&self) -> Method {
         self.method
     }
 
-    /// `int last_flush` (`deflate.h` L115), sentinels included.
+    /// The `flush` argument of the previous `deflate()` call, out-of-band
+    /// sentinels included (`deflate.h` L115).
     #[must_use]
     #[inline]
     pub const fn last_flush(&self) -> i32 {
@@ -1991,86 +1901,88 @@ impl<'a, A: Allocator<'a>> DeflateState<'a, A> {
         self.gzhead
     }
 
-    /// `uInt w_bits` (`deflate.h` L120).
+    /// The window exponent, `9 ..= 15` (`deflate.h` L120).
     #[must_use]
     #[inline]
     pub const fn w_bits(&self) -> u32 {
         self.window.w_bits()
     }
 
-    /// `uInt w_size` (`deflate.h` L119), the LZ77 window size.
+    /// The LZ77 window size, `1 << w_bits` (`deflate.h` L119).
     #[must_use]
     #[inline]
     pub const fn w_size(&self) -> usize {
         self.window.w_size()
     }
 
-    /// `uInt w_mask` (`deflate.h` L121), which is `w_size - 1`.
+    /// The window index mask, `w_size - 1` (`deflate.h` L121).
     #[must_use]
     #[inline]
     pub const fn w_mask(&self) -> usize {
         self.window.w_mask()
     }
 
-    /// `ulg window_size` (`deflate.h` L133), which is `2 * w_size`.
+    /// The allocated window length, `2 * w_size` (`deflate.h` L133).
     #[must_use]
     #[inline]
     pub const fn window_size(&self) -> usize {
         self.window.window_size()
     }
 
-    /// `ulg high_water` (`deflate.h` L278).
+    /// How much of the window has ever been written, which bounds what may be
+    /// read back (`deflate.h` L278).
     #[must_use]
     #[inline]
     pub const fn high_water(&self) -> usize {
         self.window.high_water()
     }
 
-    /// `uInt hash_size` (`deflate.h` L147), the number of hash chains.
+    /// The number of hash chains, `1 << hash_bits` (`deflate.h` L147).
     #[must_use]
     #[inline]
     pub const fn hash_size(&self) -> usize {
         self.hash.hash_size()
     }
 
-    /// `uInt hash_bits` (`deflate.h` L148), which is `memLevel + 7`.
+    /// The hash-index width, `memLevel + 7` (`deflate.h` L148).
     #[must_use]
     #[inline]
     pub const fn hash_bits(&self) -> u32 {
         self.hash.hash_bits()
     }
 
-    /// `uInt hash_mask` (`deflate.h` L149), which is `hash_size - 1`.
+    /// The hash-index mask, `hash_size - 1` (`deflate.h` L149).
     #[must_use]
     #[inline]
     pub const fn hash_mask(&self) -> usize {
         self.hash.hash_mask()
     }
 
-    /// `int slid` (`deflate.h` L285): "True if the hash table has been slid
-    /// since it was cleared."
+    /// True once the hash table has been slid since it was last cleared
+    /// (`deflate.h` L285).
     #[must_use]
     #[inline]
     pub const fn slid(&self) -> bool {
         self.hash.slid()
     }
 
-    /// `uInt lit_bufsize` (`deflate.h` L233).
+    /// The symbol-buffer capacity in symbols, `1 << (memLevel + 6)`
+    /// (`deflate.h` L233).
     #[must_use]
     #[inline]
     pub const fn lit_bufsize(&self) -> usize {
         self.pending.lit_bufsize()
     }
 
-    /// `ulg pending_buf_size` (`deflate.h` L108), which is `lit_bufsize * 4`.
+    /// The pending buffer's total length, `lit_bufsize * 4` (`deflate.h` L108).
     #[must_use]
     #[inline]
     pub const fn pending_buf_size(&self) -> usize {
         self.pending.pending_buf_size()
     }
 
-    /// `ulg pending` (`deflate.h` L110), the bytes of compressed output waiting
-    /// to be flushed. This is what `deflatePending` reports
+    /// How many bytes of compressed output are waiting to be flushed
+    /// (`deflate.h` L110). This is what `deflatePending` reports
     /// (`deflate.c` L727).
     #[must_use]
     #[inline]
@@ -2078,16 +1990,15 @@ impl<'a, A: Allocator<'a>> DeflateState<'a, A> {
         self.pending.pending()
     }
 
-    /// `uInt sym_next` (`deflate.h` L253), the running byte offset within the
-    /// symbol buffer.
+    /// The running byte offset within the symbol buffer (`deflate.h` L253).
     #[must_use]
     #[inline]
     pub const fn sym_next(&self) -> usize {
         self.pending.sym_next()
     }
 
-    /// `uInt sym_end` (`deflate.h` L254): the symbol buffer is full when
-    /// `sym_next` reaches this.
+    /// The offset at which the symbol buffer is full: the block must be flushed
+    /// once `sym_next` reaches it (`deflate.h` L254).
     #[must_use]
     #[inline]
     pub const fn sym_end(&self) -> usize {
@@ -2132,10 +2043,6 @@ impl<'a, A: Allocator<'a>> fmt::Debug for DeflateState<'a, A> {
             .finish_non_exhaustive()
     }
 }
-
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 // The workspace denies the panic-prone lints in library code, which is the right

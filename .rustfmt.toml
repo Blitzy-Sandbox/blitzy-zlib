@@ -1,9 +1,11 @@
-# Rust counterpart of .cmake-format.yaml: one explicit, machine-enforced, version-controlled
-# formatting policy instead of convention. Mirrored are that file's philosophy and the four
-# settings it states outright (line_width, tab_size, use_tabchars, line_ending) -- not its
-# verbosity, since rustfmt's remaining defaults are already the community standard.
+# Formatting policy for the Rust workspace, stated explicitly so that it is
+# machine-enforced and version-controlled rather than conventional.  The four
+# settings .cmake-format.yaml states outright for the C tree (line width, tab size,
+# tab characters, line ending) have counterparts here; rustfmt's remaining defaults
+# are already the community standard and are left alone.
 #
-# Enforced by `cargo fmt --check` in .github/workflows/rust.yml. ONLY STABLE OPTIONS MAY BE
+# Applied by `cargo fmt`, which reads this file today; the CI job that will make it a gate,
+# `cargo fmt --check` in .github/workflows/rust.yml, has not been added yet. ONLY STABLE OPTIONS MAY BE
 # ADDED -- rust-toolchain.toml pins channel = "stable", so a nightly-gated key (wrap_comments,
 # imports_granularity, group_imports, unstable_features, ...) makes rustfmt warn "unstable
 # features are only available in nightly channel" on every run and fail the zero-warnings gate;

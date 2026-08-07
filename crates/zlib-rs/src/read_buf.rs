@@ -13,7 +13,7 @@
 //!
 //! Three things live here, and nothing else:
 //!
-//! | Item | Ported from | Role |
+//! | Item | Mirrors | Role |
 //! |---|---|---|
 //! | [`InputCursor`] | `next_in` / `avail_in` (`zlib.h` L91-L92) | The unconsumed input |
 //! | [`OutputCursor`] | `next_out` / `avail_out` (`zlib.h` L94-L95) | The unwritten output |
@@ -22,22 +22,13 @@
 //! # `read_buf` is the compressor's single input funnel
 //!
 //! The comment above the C function states the reason this small operation matters so much
-//! (`deflate.c` L212-L217):
-//!
-//! ```text
-//! Read a new buffer from the current input stream, update the adler32
-//! and total number of bytes read.  All deflate() input goes through
-//! this function so some applications may wish to modify it to avoid
-//! allocating a large strm->next_in buffer and copying from it.
-//! (See also flush_pending()).
-//! ```
-//!
-//! "All `deflate()` input goes through this function" makes it the **only** place the
-//! compression side advances `total_in` or folds a byte into `strm->adler`. Both are
+//! (`deflate.c` L212-L217): "All `deflate()` input goes through this function". That makes it
+//! the **only** place the compression side advances `total_in` or folds a byte into
+//! `strm->adler`. Both are
 //! caller-visible members of `z_stream`, both are printed and asserted on by
 //! `test/example.c`, and the finished check value is written verbatim into the zlib or gzip
 //! trailer. An arithmetic slip here is therefore not a local defect: it corrupts the trailer
-//! of every stream this port produces and shows up as a wrong total in the existing test
+//! of every stream this implementation produces and shows up as a wrong total in the existing test
 //! suite. That is why the operation below is a statement-for-statement transcription rather
 //! than a re-derivation.
 //!
@@ -94,8 +85,8 @@
 //! | The running check value | `u32` | Adler-32 and CRC-32 are both 32-bit quantities whatever `uLong` is |
 //! | `total_in` / `total_out` | `u64` | Wide enough for every target's `uLong`, so no accounting is lost before the facade sees it |
 //!
-//! **Reconciling these with the caller's `c_ulong` is `crates/libz-rs-sys/src/types.rs`'s
-//! job, and its alone.** On a 32-bit `uLong` target the facade's narrowing of a `u64` total
+//! **Reconciling these with the caller's `c_ulong` is the job of the planned
+//! `crates/libz-rs-sys/src/types.rs`, and its alone.** On a 32-bit `uLong` target the facade's narrowing of a `u64` total
 //! to `c_ulong` reproduces exactly the wraparound the C code gets from `total_in += len` on a
 //! 32-bit `unsigned long`, which is why the totals here use wrapping addition rather than a
 //! checked one: the arithmetic is faithful to C's unsigned overflow, not merely tolerant of
@@ -109,8 +100,8 @@
 //! A C caller may legitimately present `avail_in == 0` together with a **null** `next_in`,
 //! and `zlib.h` L1813-L1814 documents the same overload for the checksum entry points.
 //! Turning that pair into a zero-length slice is the facade's responsibility -- it is the one
-//! place raw pointers exist, and reconstructing the caller's buffers is the second of the six
-//! unsafe-site categories the port's plan enumerates.
+//! place a raw pointer may be dereferenced, and reconstructing the caller's two buffers from a
+//! pointer and a count is one of the six categories of unsafe operation the facade performs.
 //!
 //! This module's half of the contract is to **tolerate a zero-length slice everywhere**. A
 //! cursor over an empty slice is a valid cursor: it reports zero bytes remaining, hands out
@@ -120,13 +111,22 @@
 //!
 //! # Panic freedom
 //!
-//! The crate root asserts `#![forbid(unsafe_code)]`, so the absence of raw pointers here is
-//! compiler-enforced rather than claimed. Panic freedom is enforced structurally instead:
+//! The crate root asserts `#![forbid(unsafe_code)]`, so this module cannot dereference a
+//! pointer or read uninitialised memory however it is changed: that much is compiler-enforced
+//! rather than claimed. Panic freedom has no such backstop and is enforced structurally:
 //! every accessor either clamps its argument or returns [`Option`], no `[]` indexing appears
 //! anywhere in the module, and `read_buf` resolves both of its slice views *before* it
 //! mutates anything, so the impossible failure of a bound check it has already established
 //! leaves the stream untouched and reports zero bytes transferred -- which is exactly what
 //! the C function reports when it moves nothing.
+//!
+//! # Provenance
+//!
+//! Safe cursors over the caller's input and output buffers.
+//!
+//! Ported from `read_buf` (`deflate.c` L219-L250). Replaces the reference's pointer arithmetic
+//! with a slice plus an index, and folds the running Adler-32 or CRC-32 update into the copy
+//! exactly where C does.
 
 use core::mem::size_of;
 
@@ -135,7 +135,7 @@ use crate::crc32::crc32;
 
 /// `usize` is never wider than `u64` on any target this crate supports.
 ///
-/// [`read_buf`] converts a byte count into the `u64` it adds to a total, and the port's
+/// [`read_buf`] converts a byte count into the `u64` it adds to a total, and this implementation's
 /// standard forbids a cast that could truncate. Asserting the relationship at compile time
 /// turns "provably lossless" into a property the build checks rather than a comment a
 /// reviewer has to trust: on a hypothetical target with a wider `usize` this crate would
@@ -156,28 +156,21 @@ const WRAP_ZLIB: i32 = 1;
 ///
 /// `deflate.c` L232 tests `strm->state->wrap == 2` and folds the bytes just copied into
 /// `strm->adler` with `crc32` instead. **This arm is not optional.** It sits behind `#ifdef
-/// GZIP`, and `deflate.h` L21-L24 defines `GZIP` unless the build opts out with `NO_GZIP`:
-///
-/// ```text
-/// #ifndef NO_GZIP
-/// #  define GZIP
-/// #endif
-/// ```
-///
-/// The shipped configuration therefore compiles it in, and this port implements it
-/// unconditionally. A port that handled only [`WRAP_ZLIB`] would emit gzip members whose
-/// trailing CRC-32 was an Adler-32 -- a stream every conforming decoder rejects, and one no
-/// round-trip test that used this port on both sides would ever catch.
+/// GZIP`, and `deflate.h` L21-L24 defines `GZIP` unless the build opts out with `NO_GZIP`.
+/// The shipped configuration therefore compiles it in, and it is implemented here
+/// unconditionally. Handling only [`WRAP_ZLIB`] would emit gzip members whose trailing CRC-32
+/// was an Adler-32 -- a stream every conforming decoder rejects, and one no round-trip test
+/// that used this implementation on both sides would ever catch.
 const WRAP_GZIP: i32 = 2;
 
 /// The two named wrapper values are exactly `deflate.h`'s encoding.
 ///
 /// `deflate.h` L111 describes the field bitwise -- "bit 0 true for zlib, bit 1 true for gzip"
-/// -- so the numbers are not arbitrary labels this port is free to renumber: `deflateInit2_`
+/// -- so the numbers are not arbitrary labels this implementation is free to renumber: `deflateInit2_`
 /// derives them from the caller's `windowBits` (`deflate.c` L422-L432), `deflateBound`
 /// switches on them (`deflate.c` L883), and the trailer writer compares against `2`
 /// (`deflate.c` L1268). Pinning them here means a mistyped constant is a build failure rather
-/// than a stream whose check value silently uses the wrong algorithm -- a defect the port's
+/// than a stream whose check value silently uses the wrong algorithm -- a defect this implementation's
 /// own round-trip tests could not detect, because both sides would agree with each other and
 /// disagree only with the rest of the world.
 ///
@@ -195,12 +188,8 @@ const _: () = assert!(
 ///
 /// # What it models
 ///
-/// `z_stream` splits the unconsumed input across two members (`zlib.h` L91-L92):
-///
-/// ```text
-/// z_const Bytef *next_in;  /* next input byte */
-/// uInt     avail_in;       /* number of bytes available at next_in */
-/// ```
+/// `z_stream` splits the unconsumed input across two members, `next_in` and `avail_in`
+/// (`zlib.h` L91-L92).
 ///
 /// The reference implementation keeps them consistent by hand, adding to one wherever it
 /// subtracts from the other. Here they are a borrowed slice and one index into it, with the
@@ -373,12 +362,8 @@ impl<'a> InputCursor<'a> {
 ///
 /// # What it models
 ///
-/// `z_stream` splits the free output space across two members (`zlib.h` L94-L95):
-///
-/// ```text
-/// Bytef    *next_out; /* next output byte will go here */
-/// uInt     avail_out; /* remaining free space at next_out */
-/// ```
+/// `z_stream` splits the free output space across two members, `next_out` and `avail_out`
+/// (`zlib.h` L94-L95).
 ///
 /// As with [`InputCursor`], the two become a borrowed slice and one index, with the invariant
 /// `position <= capacity`. The borrow is exclusive because the buffer is written to, which is
@@ -566,35 +551,8 @@ impl<'a> OutputCursor<'a> {
 /// Copies up to `dest.len()` bytes of input into `dest`, folds them into the running check
 /// value and advances the input accounting. Returns the number of bytes transferred.
 ///
-/// Port of `read_buf` (`deflate.c` L219-L240), the function every byte the compressor
+/// Mirrors `read_buf` (`deflate.c` L219-L240), the function every byte the compressor
 /// consumes passes through.
-///
-/// # The reference implementation
-///
-/// ```text
-/// local unsigned read_buf(z_streamp strm, Bytef *buf, unsigned size) {
-///     unsigned len = strm->avail_in;
-///
-///     if (len > size) len = size;
-///     if (len == 0) return 0;
-///
-///     strm->avail_in  -= len;
-///
-///     zmemcpy(buf, strm->next_in, len);
-///     if (strm->state->wrap == 1) {
-///         strm->adler = adler32(strm->adler, buf, len);
-///     }
-/// #ifdef GZIP
-///     else if (strm->state->wrap == 2) {
-///         strm->adler = crc32(strm->adler, buf, len);
-///     }
-/// #endif
-///     strm->next_in  += len;
-///     strm->total_in += len;
-///
-///     return len;
-/// }
-/// ```
 ///
 /// # Parameters, and how they map onto the C signature
 ///
@@ -774,18 +732,9 @@ pub(crate) fn read_buf(
 /// Copies up to `size` bytes of input straight through to the output buffer, folding them
 /// into the check value and advancing both totals. Returns the number of bytes transferred.
 ///
-/// Port of the stored-block passthrough at `deflate.c` L1742-L1750, whose comment reads
+/// Mirrors the stored-block passthrough at `deflate.c` L1742-L1750, whose comment reads
 /// "Copy uncompressed bytes directly from `next_in` to `next_out`, updating the check
-/// value":
-///
-/// ```text
-/// if (len) {
-///     read_buf(s->strm, s->strm->next_out, len);
-///     s->strm->next_out += len;
-///     s->strm->avail_out -= len;
-///     s->strm->total_out += len;
-/// }
-/// ```
+/// value".
 ///
 /// # Why this composition lives here
 ///
@@ -797,8 +746,8 @@ pub(crate) fn read_buf(
 ///
 /// Everything that *is* a decision -- how `len` was arrived at, the `left` window copy that
 /// precedes it (`deflate.c` L1731-L1740), and the `do { } while (last == 0)` loop around the
-/// whole thing -- stays in `deflate/algorithm/stored.rs`, where `deflate_stored`
-/// (`deflate.c` L1668) is ported.
+/// whole thing -- stays in `deflate/algorithm/stored.rs`, which implements `deflate_stored`
+/// (`deflate.c` L1668).
 ///
 /// # Behaviour
 ///
@@ -949,10 +898,6 @@ mod tests {
         (transferred, check, total_in, storage)
     }
 
-    // ---------------------------------------------------------------------------------------
-    // Step 2 of the port: `if (len == 0) return 0;` (deflate.c L223), before anything else.
-    // ---------------------------------------------------------------------------------------
-
     /// Empty input transfers nothing and leaves the check value and the total untouched.
     ///
     /// The C function returns at L223, before `avail_in`, `adler`, `next_in` or `total_in` is
@@ -1046,10 +991,6 @@ mod tests {
         assert_eq!(total_in, SENTINEL_TOTAL);
     }
 
-    // ---------------------------------------------------------------------------------------
-    // Step 1 of the port: `len = min(avail_in, size)` (deflate.c L220-L222).
-    // ---------------------------------------------------------------------------------------
-
     /// A destination larger than the input transfers exactly the input length.
     #[test]
     fn destination_larger_than_input_transfers_all_of_it() {
@@ -1099,10 +1040,6 @@ mod tests {
         assert_eq!(total, HELLO_LEN as u64);
     }
 
-    // ---------------------------------------------------------------------------------------
-    // Step 4 of the port: the check value (deflate.c L228-L235).
-    // ---------------------------------------------------------------------------------------
-
     /// `wrap == 1` folds the copied bytes into an Adler-32 (`deflate.c` L229).
     #[test]
     fn wrap_zlib_accumulates_adler32() {
@@ -1121,9 +1058,9 @@ mod tests {
     /// `wrap == 2` folds the copied bytes into a CRC-32 (`deflate.c` L233).
     ///
     /// This arm sits behind `#ifdef GZIP`, which `deflate.h` L21-L24 defines by default, so it
-    /// is part of the shipped behaviour. A port that omitted it would emit gzip members whose
+    /// is part of the shipped behaviour. Omitting it would emit gzip members whose
     /// trailer held an Adler-32 -- rejected by every conforming decoder, and invisible to any
-    /// round-trip test that used this port on both sides.
+    /// round-trip test that used this implementation on both sides.
     #[test]
     fn wrap_gzip_accumulates_crc32() {
         let (n, check, _, _) = drive(WRAP_GZIP, 32, CRC_INIT, 0);
@@ -1199,10 +1136,8 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------------------------------
     // Accumulation across calls: the property `deflate` depends on, since a caller may
     // present its input in however many pieces it likes.
-    // ---------------------------------------------------------------------------------------
 
     /// Two partial reads leave the same check value and total as one combined read.
     ///
@@ -1325,7 +1260,7 @@ mod tests {
     /// A total at the very top of the range wraps, as the C unsigned type does.
     ///
     /// `strm->total_in` is a `uLong`, and unsigned overflow in C wraps rather than trapping.
-    /// Reproducing that keeps the port from panicking, or from diverging, on a stream no real
+    /// Reproducing that keeps the implementation from panicking, or from diverging, on a stream no real
     /// caller reaches.
     #[test]
     fn the_total_wraps_like_the_c_unsigned_type() {
@@ -1334,10 +1269,6 @@ mod tests {
         assert_eq!(n, HELLO_LEN);
         assert_eq!(total, start.wrapping_add(HELLO_LEN as u64));
     }
-
-    // ---------------------------------------------------------------------------------------
-    // InputCursor: the `next_in` / `avail_in` pair.
-    // ---------------------------------------------------------------------------------------
 
     /// A fresh cursor reports the whole buffer as unconsumed.
     #[test]
@@ -1483,10 +1414,6 @@ mod tests {
         assert_eq!(original.unconsumed(), HELLO);
     }
 
-    // ---------------------------------------------------------------------------------------
-    // OutputCursor: the `next_out` / `avail_out` pair.
-    // ---------------------------------------------------------------------------------------
-
     /// A fresh cursor reports the whole buffer as free.
     #[test]
     fn a_fresh_output_cursor_has_written_nothing() {
@@ -1617,10 +1544,6 @@ mod tests {
         );
         assert!(cursor.is_empty());
     }
-
-    // ---------------------------------------------------------------------------------------
-    // read_buf_into_output: the stored-block passthrough (deflate.c L1742-L1750).
-    // ---------------------------------------------------------------------------------------
 
     /// Input flows straight through to the output buffer, updating the check value and both
     /// totals.
@@ -1831,10 +1754,6 @@ mod tests {
             assert_eq!((total_in, total_out), (HELLO_LEN as u64, HELLO_LEN as u64));
         }
     }
-
-    // ---------------------------------------------------------------------------------------
-    // Overflow and saturation safety.
-    // ---------------------------------------------------------------------------------------
 
     /// A destination shaped like the whole address space is clamped, not wrapped.
     ///

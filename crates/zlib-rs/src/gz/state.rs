@@ -1,7 +1,7 @@
 //! The internal `gzFile` state, and the frozen memory layout its first 24 bytes owe to a macro
 //! compiled into somebody else's object code.
 //!
-//! This is the port of `gz_state` (`gzguts.h` L169-L204) together with the caller-visible
+//! Implements `gz_state` (`gzguts.h` L169-L204) together with the caller-visible
 //! `struct gzFile_s` prefix it embeds (`zlib.h` L1956-L1960). Every other module of the `gzFile`
 //! layer -- `open.rs`, `read.rs`, `write.rs`, `close.rs`, `printf.rs` and the shared plumbing in
 //! `mod.rs` -- operates on the [`GzState`] defined here, exactly as all four `gz*.c` translation
@@ -16,32 +16,29 @@
 //!       ((g)->have ? ((g)->have--, (g)->pos++, *((g)->next)++) : (gzgetc)(g))
 //! ```
 //!
-//! Read that carefully, because it is the single highest-risk constraint in this port. The
-//! expression loads `g->have`, decrements it, increments `g->pos`, dereferences `g->next` and
-//! post-increments it -- and all of that field arithmetic is compiled into the **caller's** object
-//! code, at the byte offsets that the caller's copy of `zlib.h` implied when the caller was built.
-//! This port cannot recompile those callers; that is the whole point of preserving the ABI. So the
-//! three fields must sit at exactly the offsets they have always sat at, at the very start of
-//! whatever `gzFile` points to.
+//! That is the single highest-risk constraint in this implementation. The expression loads
+//! `g->have`, decrements it, increments `g->pos`, dereferences `g->next` and post-increments it, and
+//! all of that field arithmetic is compiled into the **caller's** object code at the byte offsets
+//! the caller's copy of `zlib.h` implied when the caller was built. Those callers cannot be
+//! recompiled -- that is the point of preserving the ABI -- so the three fields must sit at exactly
+//! the offsets they have always sat at, at the very start of whatever `gzFile` points to.
 //!
 //! `gzguts.h` L170-L175 arranges for that by embedding `struct gzFile_s x;` as `gz_state`'s first
 //! member, under the comment "exposed contents for `gzgetc()` macro" and with `"x" for exposed`.
 //! [`GzState`] reproduces the arrangement: [`GzState`] itself is `#[repr(C)]`, its first declared
-//! field is [`GzState::x`], and that field's type [`GzFileExposed`] is `#[repr(C)]` as well.
+//! field is `GzState::x`, and that field's type [`GzFileExposed`] is `#[repr(C)]` as well.
 //!
-//! **Both attributes are load-bearing, and the outer one is the one that is easy to forget.** A
-//! `repr(Rust)` struct may reorder its fields however the compiler pleases, so a `repr(Rust)`
-//! [`GzState`] whose first *declared* field happened to be a `#[repr(C)]` prefix would guarantee
-//! nothing at all about where that prefix actually lands. The macro would then decrement some
-//! unrelated field as though it were `have`, and dereference some unrelated field as though it were
-//! a `*mut u8`. That is silent memory corruption in every caller that uses `gzgetc`, on a code path
-//! this crate never executes and therefore can never diagnose. The two attributes are one contract,
-//! and the assertions below hold the contract to its measured numbers.
+//! **Both attributes are load-bearing, and the outer one is the easy one to forget.** A
+//! `repr(Rust)` struct may reorder its fields, so a `repr(Rust)` [`GzState`] whose first *declared*
+//! field happened to be a `#[repr(C)]` prefix would guarantee nothing about where that prefix lands.
+//! The macro would then decrement some unrelated field as though it were `have` and dereference
+//! another as though it were a `*mut u8` -- silent memory corruption in every caller that uses
+//! `gzgetc`, on a code path this crate never executes and can never diagnose.
 //!
-//! Measured on `x86_64-unknown-linux-gnu` from the unmodified headers in this tree:
-//! `sizeof(struct gzFile_s)` is 24, with `have` at 0, `next` at 8 and `pos` at 16. The four-byte
-//! gap between `have` and `next` is ordinary alignment padding, not a field; it is reproduced by
-//! letting `repr(C)` apply C's alignment rules and never by declaring an explicit filler.
+//! The layout the assertions below enforce is `sizeof(struct gzFile_s) == 24` with `have` at 0,
+//! `next` at 8 and `pos` at 16. The four-byte gap between `have` and `next` is alignment padding,
+//! not a field: it comes from letting `repr(C)` apply C's alignment rules, never from an explicit
+//! filler.
 //!
 //! # The pointer/index split
 //!
@@ -62,14 +59,50 @@
 //! second, and the invariant they maintain is that `x.next` always equals
 //! `output.as_ptr() + out_pos`, or is null when there is no output buffer.
 //!
-//! ## The contract for callers
+//! ## The contract for callers -- and the exact set it applies to
 //!
-//! **Every public `gz*` entry point must call [`GzState::resync_from_exposed`] immediately on
-//! entry and [`GzState::refresh_exposed`] immediately before it returns.** The caller's macro
-//! mutates `have`, `pos` and `next` between our calls without telling us, so `out_pos` is stale on
-//! entry and `x.next` is stale on exit. Skipping either half is a correctness bug that only shows
-//! up in a program that mixes `gzgetc` with the other entry points -- which is exactly what
-//! `test/example.c` does.
+//! The rule is **not** "every public entry point", and stating it that way would be both wrong and
+//! unhelpful, because several entry points deliberately do neither and one of them physically
+//! cannot. What the caller's macro forces is narrower: an entry point that *derives* anything from
+//! `out_pos`, or that leaves `x.next` for the macro to dereference afterwards, must
+//! resynchronise on entry and refresh on exit. Skipping either half in that group is a correctness
+//! bug that only shows up in a program mixing `gzgetc` with the other entry points -- which is
+//! exactly what `test/example.c` does.
+//!
+//! The three groups below are the measured state of this crate, not an aspiration.
+//!
+//! **Group A -- resynchronise on entry, refresh before every return.** This is the group the rule
+//! governs:
+//!
+//! * Read side, through the shared `enter_read` helper: `gzread`, `gzfread`, `gzgetc`, `gzgets` --
+//!   and `gzgetc_`, which is a one-line forward to `gzgetc`.
+//! * Write side, through the shared `enter_write` helper: `gzwrite`, `gzfwrite`, `gzputc`,
+//!   `gzputs`, `gzflush`.
+//! * Directly, because each has its own entry sequence: `gzungetc`, `gzrewind`, `gzseek64` (which
+//!   additionally calls [`GzState::clear_have`]), `gzclose_w`, and `printf_begin`.
+//! * All six drivers in `gz/mod.rs`: `gzbuffer`, `gzeof`, `gzerror`, `gzclearerr`, `gzdirect`,
+//!   `gzsetparams`.
+//!
+//! **Group B -- nothing to resynchronise from.** `gzopen`, `gzdopen`, `gzopen_w` and
+//! `gz_open_handle` *construct* the state, so no caller has yet had the opportunity to move
+//! anything. They establish the invariant instead of restoring it.
+//!
+//! **Group C -- deliberately neither, with the reason recorded at each one.** These read no
+//! derived state, or are not the function the caller actually entered:
+//!
+//! * `gztell64` and `gzoffset64` compute a position from `pos`, `skip` and `avail_in` and never
+//!   touch the output buffer. `gztell64` takes `&GzState`, so it *cannot* resynchronise even in
+//!   principle -- resynchronising requires `&mut` -- which is why it is a shared reference in the
+//!   first place.
+//! * `gzclose` is a pure dispatcher to `gzclose_r`/`gzclose_w`; the callee does the work.
+//! * `gzclose_r` tears the state down and refreshes nothing on the way out because there is
+//!   nothing left for the macro to read.
+//! * `printf_commit`, `printf_with` and `printf_bytes` continue a sequence that `printf_begin`
+//!   already resynchronised; re-entering would not be a second entry from C.
+//! * `narrow_offset` is an arithmetic helper, not an entry point.
+//!
+//! If a new entry point is added, put it in Group A unless it belongs in B or C for one of the
+//! reasons above -- and say which, at the function.
 //!
 //! ## Four facts that make the split safe
 //!
@@ -82,7 +115,7 @@
 //!    (`gzread.c` L228-L229), and on the large-read path `next_out` is the *user's* buffer
 //!    (`gzread.c` L372-L377), so C's `x.next` legitimately points outside `out` for an instant.
 //!    `gz_read` then immediately consumes the count and clears the flag with `n = state->x.have;
-//!    state->x.have = 0;` (`gzread.c` L376-L377). This port models that instant with
+//!    state->x.have = 0;` (`gzread.c` L376-L377). This implementation models that instant with
 //!    [`GzState::clear_have`], which sets `have` to zero and nulls `next` together, so `x.next`
 //!    never has to denote a location outside the output buffer and
 //!    [`GzState::resync_from_exposed`] can treat an out-of-range pointer as corruption.
@@ -103,7 +136,7 @@
 //! The `gzFile` layer allocates with plain `malloc` in C (`gzlib.c` L100 and L206,
 //! `gzread.c` L99-L100, `gzwrite.c` L16 and L25) and the default `z_stream` hooks reduce to
 //! `malloc` as well, because `zcalloc` takes the `malloc` branch whenever `sizeof(uInt) > 2`
-//! (`zutil.c` L299-L303) -- which is every target this port supports. Nothing in this module may
+//! (`zutil.c` L299-L303) -- which is every target this implementation supports. Nothing in this module may
 //! assume `in` or `out` arrives zeroed. `test/infcover.c` L84-L87 fills every block it hands out
 //! with `0xa5` for exactly that reason, and its `mem_done` reports leaks, non-LIFO frees and rogue
 //! frees, so a teardown that returns memory to the wrong allocator or in the wrong order is
@@ -111,12 +144,15 @@
 //!
 //! # Coordination with the rest of the workspace
 //!
-//! * `crates/libz-rs-sys/src/types.rs` independently declares a `#[repr(C)] gzFile_s`, and
-//!   `crates/libz-rs-sys/src/layout_assertions.rs` asserts the same 24-byte size and the same
-//!   0/8/16 offsets. This module is the **core-side half of one shared contract**: the two
-//!   declarations describe the same 24 bytes and must agree exactly. If either side changes, both
-//!   sides' assertions must be revisited together.
-//! * For `crates/libz-rs-sys/src/gz.rs`: `gzFile` is an opaque `*mut GzState`. Obtain the state,
+//! * The planned `crates/libz-rs-sys/src/types.rs` is to declare a `#[repr(C)] gzFile_s`
+//!   independently, and the planned `crates/libz-rs-sys/src/layout_assertions.rs` is to assert the
+//!   same 24-byte size and the same 0/8/16 offsets. Neither file exists at this checkpoint, so the
+//!   agreement between the two sides is a requirement rather than a verified fact. This module is
+//!   the **core-side half of one shared contract**: the two declarations describe the same 24 bytes
+//!   and must agree exactly. If either side changes, both sides' assertions must be revisited
+//!   together.
+//! * For the planned `crates/libz-rs-sys/src/gz.rs`: `gzFile` is an opaque `*mut GzState`, and
+//!   every requirement in this bullet is an obligation on that future file. Obtain the state,
 //!   call [`GzState::resync_from_exposed`] before doing anything else, do the work, then call
 //!   [`GzState::refresh_exposed`] before handing control back to C. Nothing in this module is
 //!   `#[no_mangle]` or `extern "C"`; the exported surface belongs exclusively to that crate. The
@@ -128,9 +164,9 @@
 //! * This module is reached through `#[cfg(feature = "std")] mod gz;` in the crate root, so no
 //!   per-item feature gate appears below and `--no-default-features` compiles the whole subtree
 //!   out. It needs only `core` and `alloc`, never `std`: file access arrives injected through
-//!   [`GzHandle`], which is what keeps the crate's `std`-free default build honest.
+//!   [`GzHandle`].
 
-// `GzState`, `GzStream` and friends "repeat" this module's name because they are the ports of
+// `GzState`, `GzStream` and friends "repeat" this module's name because they carry the names of
 // `gz_state` and of the `z_stream` embedded in it, and those names are the ones a maintainer
 // comparing this file against `gzguts.h` will be looking for.
 #![allow(clippy::module_name_repetitions)]
@@ -146,18 +182,23 @@ use crate::config::{Strategy, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY};
 use crate::deflate::state::DeflateState;
 use crate::error::ReturnCode;
 use crate::inflate::InflateState;
+// The one name this module takes from its sibling, and it points the other way from every other
+// dependency in the subtree. [`GzFileSlot`] stores the path-opened handle inline so that installing
+// it cannot fail, and the handle's concrete type belongs in `open.rs`, which is where path-based
+// opening lives and the only place that may name `std::fs`. Declaring the slot here instead keeps
+// [`GzState`]'s field types with [`GzState`]; the alternative -- moving the slot to `open.rs` --
+// would put a field's type in a different module from the struct that owns it for no gain. The two
+// modules are siblings of one subsystem, exactly as `deflate` and `trees` are (AAP §0.4.2.1), so a
+// reference in each direction is the shape of the subsystem rather than a layering break.
+use crate::gz::open::FileHandle;
 
-// -----------------------------------------------------------------------------
-//  Offsets and sizes
-// -----------------------------------------------------------------------------
-
-/// The signed file offset type of the `gzFile` layer: this port's stand-in for `z_off64_t`.
+/// The signed file offset type of the `gzFile` layer: this implementation's stand-in for `z_off64_t`.
 ///
 /// `zconf.h` L522-L531 resolves `z_off64_t` differently per platform -- `off64_t` under
 /// `Z_LARGE64`, `long long` under MinGW, `__int64` under MSVC, `offset_t` under DJGPP, and
 /// otherwise whatever `z_off_t` resolved to, which itself defaults to `long long`
 /// (`zconf.h` L518-L520). Every one of those spellings is a signed 64-bit integer on every Tier-1
-/// target this port supports, which is why a fixed width is correct *here*, in the core, where no
+/// target this implementation supports, which is why a fixed width is correct *here*, in the core, where no
 /// C caller can see the choice.
 ///
 /// **No fixed width may ever be hardcoded for `z_off_t`, `z_off64_t` or `z_size_t` in
@@ -165,15 +206,15 @@ use crate::inflate::InflateState;
 /// narrowing between them is deliberate: `gzseek` returns `z_off_t` by calling `gzseek64` and
 /// checking `ret == (z_off_t)ret` before narrowing (`gzlib.c` L438-L442), and `gztell` and
 /// `gzoffset` do the same (`gzlib.c` L461-L465, L490-L495). That narrowing, and the exact
-/// platform types it narrows between, belong to `crates/libz-rs-sys/src/types.rs`, which owns
-/// `z_off_t`/`z_off64_t` and must `const`-assert
+/// platform types it narrows between, belong to the planned `crates/libz-rs-sys/src/types.rs`,
+/// which is to own `z_off_t`/`z_off64_t` and must `const`-assert
 /// `size_of::<z_off64_t>() == size_of::<ZOff64>()` so that a platform where the two disagree
 /// fails to build rather than silently truncating a file position.
 pub type ZOff64 = i64;
 
-/// The caller-visible prefix of the `gzFile` state: the port of `struct gzFile_s`.
+/// The caller-visible prefix of the `gzFile` state: the Rust counterpart of `struct gzFile_s`.
 ///
-/// Ported verbatim from `zlib.h` L1956-L1960:
+/// The declaration it must agree with, `zlib.h` L1956-L1960:
 ///
 /// ```c
 /// struct gzFile_s {
@@ -184,14 +225,39 @@ pub type ZOff64 = i64;
 /// ```
 ///
 /// The field order is the ABI and may not be changed. `core::ffi::c_uint` is the portable mirror
-/// of C's `unsigned` and `*mut u8` the mirror of `unsigned char *`; using either a fixed-width
+/// of C's `unsigned` and `*mut u8` the Rust counterpart of `unsigned char *`; using either a fixed-width
 /// integer for `have` or a slice for `next` would change the layout the `gzgetc` macro was
 /// compiled against. See this module's documentation for why that would corrupt caller memory
 /// rather than merely misbehave.
 ///
-/// `next` is *derived* state. Its only writers are [`GzState::refresh_exposed`], which recomputes
-/// it from [`GzState::out_pos`], and [`GzState::clear_have`], which nulls it. Read it freely;
-/// never assign to it directly, or the index and the pointer will disagree.
+/// `next` is *derived* state, and it has writers this crate does not control.
+///
+/// **Inside this crate** exactly two functions write it: [`GzState::refresh_exposed`], which
+/// recomputes it from [`GzState::out_pos`], and [`GzState::clear_have`], which nulls it. Read it
+/// freely; never assign to it directly, or the index and the pointer will disagree.
+///
+/// **Outside this crate the caller writes it too, and that is the whole reason this type exists.**
+/// The `gzgetc` macro at `zlib.h` L1966-L1968 expands, in *caller* object code this port cannot
+/// recompile, to:
+///
+/// ```text
+/// ((g)->have ? ((g)->have--, (g)->pos++, *((g)->next)++) : (gzgetc)(g))
+/// ```
+///
+/// So on its fast path a caller performs three mutations of this struct per byte, with no call
+/// into the library at all:
+///
+/// * `have--` -- decrements the count of deliverable bytes;
+/// * `pos++` -- advances the uncompressed-stream position;
+/// * `*((g)->next)++` -- reads through `next` and then **post-increments the pointer itself**.
+///
+/// `gzungetc` decrements `pos` from caller-visible state as well (`gzread.c` L537), and `gz_error`
+/// clears `have` to zero so the macro stops taking its fast path (`gzlib.c` L564-L565).
+///
+/// That is why `next` cannot be a slice or an index and why the layout is frozen: the increments
+/// are compiled into the caller. It is also why [`GzState::resync_from_exposed`] exists --
+/// `out_pos` is stale on entry to any Group A entry point, because the caller moved `next` behind
+/// the library's back. See this module's documentation for the exact group membership.
 #[derive(Debug)]
 #[repr(C)]
 pub struct GzFileExposed {
@@ -252,7 +318,7 @@ mod layout_64 {
     const _: () = assert!(core::mem::offset_of!(GzState<'static, GlobalAllocator>, x) == 0);
 }
 
-// The general case, asserted unconditionally so that a target this port has not been measured on
+// The general case, asserted unconditionally so that a target this implementation has not been measured on
 // still cannot silently reorder or shrink the prefix. These hold on any target `repr(C)` supports:
 // the first field starts at zero, each later field starts at or after the end of its predecessor,
 // and the whole prefix is at least as large as its last field's end.
@@ -266,13 +332,9 @@ const _: () = assert!(
     size_of::<GzFileExposed>() >= core::mem::offset_of!(GzFileExposed, pos) + size_of::<ZOff64>()
 );
 
-// -----------------------------------------------------------------------------
-//  Constants
-// -----------------------------------------------------------------------------
-
 /// Default size of each working buffer, in bytes.
 ///
-/// Ported from `gzguts.h` L156. The comment above it at `gzguts.h` L154-L155 states the constraint
+/// Mirrors `gzguts.h` L156. The comment above it at `gzguts.h` L154-L155 states the constraint
 /// that gives the value its shape: it is the "default i/o buffer size -- double this for output
 /// when reading (this and twice this must be able to fit in an unsigned type)". Both buffers are
 /// doubled somewhere -- the output buffer when reading (`gzread.c` L100) and the input buffer when
@@ -283,13 +345,13 @@ pub const GZBUFSIZE: c_uint = 8192;
 
 /// Mode value for a `gzFile` that has not yet been given a direction.
 ///
-/// Ported from `gzguts.h` L159. `gz_open` starts here (`gzlib.c` L109) and rejects the open if the
+/// Mirrors `gzguts.h` L159. `gz_open` starts here (`gzlib.c` L109) and rejects the open if the
 /// mode string never selected `r`, `w` or `a` (`gzlib.c` L174-L177).
 pub const GZ_NONE: i32 = 0;
 
 /// Mode value for a `gzFile` opened for reading.
 ///
-/// Ported from `gzguts.h` L160. The value is deliberately an arbitrary odd number rather than a
+/// Mirrors `gzguts.h` L160. The value is deliberately an arbitrary odd number rather than a
 /// small ordinal: `gzguts.h` L158 introduces the mode constants as "gzip modes, also provide a
 /// little integrity check on the passed structure", and every entry point tests
 /// `state->mode != GZ_READ && state->mode != GZ_WRITE` before trusting the pointer it was handed
@@ -298,12 +360,12 @@ pub const GZ_READ: i32 = 7247;
 
 /// Mode value for a `gzFile` opened for writing.
 ///
-/// Ported from `gzguts.h` L161. See [`GZ_READ`] for why the value is what it is.
+/// Mirrors `gzguts.h` L161. See [`GZ_READ`] for why the value is what it is.
 pub const GZ_WRITE: i32 = 31153;
 
 /// Transient mode value for a `gzFile` opened for appending.
 ///
-/// Ported from `gzguts.h` L162, whose comment records the lifetime of the value: "mode set to
+/// Mirrors `gzguts.h` L162, whose comment records the lifetime of the value: "mode set to
 /// `GZ_WRITE` after the file is opened". `gz_open` seeks to the end so that `gzoffset` is correct
 /// and then overwrites the mode with [`GZ_WRITE`] "to simplify later checks"
 /// (`gzlib.c` L269-L272), so this value is never observed by any entry point.
@@ -311,23 +373,19 @@ pub const GZ_APPEND: i32 = 1;
 
 /// Value of `how` meaning "a gzip header has not been looked for yet".
 ///
-/// Ported from `gzguts.h` L165. `gz_reset` installs it for a read stream (`gzlib.c` L74) and
+/// Mirrors `gzguts.h` L165. `gz_reset` installs it for a read stream (`gzlib.c` L74) and
 /// `gz_look` replaces it once it has decided between copying and decompressing.
 pub const LOOK: i32 = 0;
 
 /// Value of `how` meaning "copy the input through without decompressing".
 ///
-/// Ported from `gzguts.h` L166. This is the transparent path `gzdirect` reports.
+/// Mirrors `gzguts.h` L166. This is the transparent path `gzdirect` reports.
 pub const COPY: i32 = 1;
 
 /// Value of `how` meaning "decompress a gzip stream".
 ///
-/// Ported from `gzguts.h` L167.
+/// Mirrors `gzguts.h` L167.
 pub const GZIP: i32 = 2;
-
-// -----------------------------------------------------------------------------
-//  Typed views over the C integers
-// -----------------------------------------------------------------------------
 
 /// The direction a `gzFile` was opened in: an exhaustive view over [`GzState::mode`].
 ///
@@ -409,11 +467,7 @@ impl GzHow {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  The file handle: this port's replacement for `int fd`
-// -----------------------------------------------------------------------------
-
-/// Where a seek is measured from: the port of the `whence` argument.
+/// Where a seek is measured from: the Rust counterpart of the `whence` argument.
 ///
 /// `zconf.h` L513-L515 defines `SEEK_SET`, `SEEK_CUR` and `SEEK_END` as 0, 1 and 2 when the platform
 /// has not already, and those discriminants are reproduced here. `gzseek64` accepts only the first
@@ -475,7 +529,7 @@ pub struct GzIoError {
     pub errno: i32,
     /// True when the failure was `EAGAIN` or `EWOULDBLOCK` on a non-blocking descriptor.
     ///
-    /// Ported from the test at `gzwrite.c` L117-L118, which sets `state->again` on exactly this
+    /// Mirrors the test at `gzwrite.c` L117-L118, which sets `state->again` on exactly this
     /// condition.
     pub would_block: bool,
 }
@@ -491,7 +545,7 @@ impl GzIoError {
     }
 }
 
-/// The file a `gzFile` reads from or writes to: this port's replacement for `gz_state.fd`.
+/// The file a `gzFile` reads from or writes to: this implementation's replacement for `gz_state.fd`.
 ///
 /// C stores a bare descriptor (`gzguts.h` L178) and calls `read`, `write`, `lseek`, `close` and
 /// `fcntl` on it directly. A descriptor cannot be adopted in safe Rust -- `FromRawFd::from_raw_fd`
@@ -500,10 +554,10 @@ impl GzIoError {
 ///
 /// | C entry point | How the handle is produced |
 /// |---|---|
-/// | `gzopen`, `gzopen64`, `gzopen_w` (`gzlib.c` L288, L293 and L316) | opened by path inside the core, from `open.rs` |
+/// | `gzopen`, `gzopen64`, `gzopen_w` (`gzlib.c` L288, L293 and L316) | opened by path inside the core, from `open.rs` -- or by an opener the facade injects through `gz_open_with`, when C's exact `open(2)` flag word or an observable `close(2)` is required |
 /// | `gzdopen` (`gzlib.c` L298-L311) | adopted from a caller's descriptor, and therefore injected by `crates/libz-rs-sys` |
 ///
-/// This module declares only the slot ([`GzState::handle`]) and this trait. The concrete
+/// This module declares only the slot (`GzState::handle`) and this trait. The concrete
 /// implementation lives in `open.rs`, which is where path-based opening belongs and which is free
 /// to build it over `std::fs::OpenOptions`; the facade supplies its own implementation for the
 /// adopted-descriptor case. Neither one is named here, which is what lets this file stay free of
@@ -513,18 +567,30 @@ impl GzIoError {
 ///
 /// * Every method reports failure as [`GzIoError`], never by panicking. The `gzFile` layer converts
 ///   a failure into `Z_ERRNO` and keeps going; it never unwinds.
+/// * **A reported count must never exceed the slice that was offered.** This is the one requirement
+///   with no C counterpart, because C passes a pointer and a length and has no way to check the
+///   answer -- `gz_load` adds `read`'s return value to `*have` unchecked (`gzread.c` L33) and
+///   `gz_comp` advances `state->x.next` by `write`'s unchecked (`gzwrite.c` L122). A slice makes the
+///   violation detectable, and the layer refuses it: `Z_STREAM_ERROR` is recorded, no cursor moves,
+///   and the operation is discarded. It is not clamped, because clamping would leave the layer
+///   treating bytes the handle never supplied as data and would hide the defect. `Z_STREAM_ERROR`
+///   rather than `Z_ERRNO` is deliberate: no operating-system error occurred.
 /// * [`GzHandle::read`] returning `Ok(0)` means end of file, exactly as `read` returning 0 does in
 ///   `gz_load` (`gzread.c` L31-L46).
 /// * [`GzHandle::write`] may report a short write. `gz_comp` loops until the buffer is drained
-///   (`gzwrite.c` L110-L123), so a partial write is normal rather than exceptional.
+///   (`gzwrite.c` L110-L123), so a partial write is normal rather than exceptional. Zero bytes on a
+///   non-empty request is a violation, because C's loop would spin forever on it.
 /// * [`GzHandle::close`] must be idempotent, because `Drop` may run after an explicit close: both
 ///   `gzclose_r` and `gzclose_w` close the descriptor and then free the state
 ///   (`gzread.c` L663-L665, `gzwrite.c` L648-L650).
 pub trait GzHandle {
     /// Reads into `buf`, returning the number of bytes read, or zero at end of file.
     ///
-    /// The port of the `read(state->fd, buf + *have, len)` call in `gz_load`
+    /// Implements the `read(state->fd, buf + *have, len)` call in `gz_load`
     /// (`gzread.c` L30).
+    ///
+    /// The returned count **must not exceed `buf.len()`**; a larger one is a contract violation and
+    /// the layer answers it with `Z_STREAM_ERROR` and no progress, as described above.
     ///
     /// # Errors
     ///
@@ -534,8 +600,12 @@ pub trait GzHandle {
 
     /// Writes from `buf`, returning the number of bytes written, which may be fewer than requested.
     ///
-    /// The port of the `write(state->fd, state->x.next, put)` call in `gz_comp`
+    /// Implements the `write(state->fd, state->x.next, put)` call in `gz_comp`
     /// (`gzwrite.c` L115).
+    ///
+    /// Fewer is fine and is looped over. The returned count **must not exceed `buf.len()`**, and
+    /// must not be zero for a non-empty `buf`; either one is a contract violation and the layer
+    /// answers it with `Z_STREAM_ERROR` and no progress, as described above.
     ///
     /// # Errors
     ///
@@ -544,7 +614,7 @@ pub trait GzHandle {
 
     /// Repositions the file, returning the resulting absolute offset.
     ///
-    /// The port of the `LSEEK` macro (`gzlib.c` L8-L16), which selects `lseek64`, `_lseeki64`,
+    /// Implements the `LSEEK` macro (`gzlib.c` L8-L16), which selects `lseek64`, `_lseeki64`,
     /// `llseek` or `lseek` per platform. Used to record the starting position of a read stream
     /// (`gzlib.c` L276), to rewind (`gzlib.c` L360), to skip forward within raw data
     /// (`gzlib.c` L398) and to report the raw offset (`gzlib.c` L481).
@@ -558,7 +628,7 @@ pub trait GzHandle {
 
     /// Sets or clears the non-blocking flag.
     ///
-    /// The port of the `fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)` call that `gz_open`
+    /// Implements the `fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)` call that `gz_open`
     /// makes for an adopted descriptor when the mode string contained `N` (`gzlib.c` L255-L257).
     /// For a path-based open the flag is part of the `open` call instead (`gzlib.c` L160-L162), so
     /// an implementation that only ever opens by path may report success without doing anything.
@@ -570,7 +640,7 @@ pub trait GzHandle {
 
     /// Closes the file. Must be idempotent.
     ///
-    /// The port of `close(state->fd)` (`gzread.c` L665, `gzwrite.c` L696), whose result becomes
+    /// Implements `close(state->fd)` (`gzread.c` L665, `gzwrite.c` L696), whose result becomes
     /// `Z_ERRNO` when it fails.
     ///
     /// # Errors
@@ -579,9 +649,187 @@ pub trait GzHandle {
     fn close(&mut self) -> Result<(), GzIoError>;
 }
 
-// -----------------------------------------------------------------------------
-//  The compression engine, held behind an indirection
-// -----------------------------------------------------------------------------
+/// The slot that holds a stream's file: this port's replacement for the `int fd` field itself.
+///
+/// C stores one machine word, and storing it can never fail. Reproducing that property is the whole
+/// reason this is an enum rather than an `Option<Box<dyn GzHandle>>`, and the reason is worth
+/// stating plainly because the obvious shape is the wrong one.
+///
+/// # Why not `Option<Box<dyn GzHandle>>`
+///
+/// A trait object must be behind a pointer, and stable Rust at this crate's MSRV has no fallible way
+/// to heap-allocate a single value -- the same limitation [`EngineBox`] exists to work around.
+/// `Box::new` **aborts the process** when the allocation fails. For the engine that is tolerable
+/// only because [`EngineBox`] avoids `Box` entirely; for the file handle it was not tolerable at
+/// all, because `gz_open` would then abort where C returns `NULL`. `test/infcover.c` forces exactly
+/// that condition on purpose with `mem_limit` (L176-L181), and an aborting library turns a test for
+/// a recoverable error into a dead test process.
+///
+/// So the case the core itself produces is stored **inline**. Opening by path allocates nothing for
+/// the handle, which removes the failure mode rather than reporting it.
+///
+/// # Why the injected case is still boxed
+///
+/// [`GzFileSlot::Boxed`] exists because a caller's descriptor can only be adopted by
+/// `crates/libz-rs-sys` -- `FromRawFd::from_raw_fd` is `unsafe` and this crate forbids `unsafe` --
+/// so the concrete type is one this crate cannot name. That allocation is the facade's to make and
+/// the facade is free to make it fallibly; nothing here forces it.
+///
+/// The result is that each variant is the right shape for who produces it: the core builds the one
+/// it can build without allocating, the facade supplies the one only it can build.
+///
+/// | Variant | Produced by | C counterpart |
+/// |---|---|---|
+/// | [`GzFileSlot::Empty`] | a fresh state, and every path that has closed the file | `state->fd` before the open and after the close |
+/// | [`GzFileSlot::Owned`] | `open.rs`, opening by path | `state->fd = open(path, oflag, 0666)` (`gzlib.c` L248) |
+/// | [`GzFileSlot::Boxed`] | `crates/libz-rs-sys`, adopting a descriptor | `state->fd = fd` (`gzlib.c` L262) |
+pub enum GzFileSlot<'a> {
+    /// No file: a state that has not opened one, or one whose file has been taken for closing.
+    Empty,
+    /// A file this library opened by path, stored inline so that installing it cannot fail.
+    Owned(FileHandle),
+    /// A handle somebody else built, most importantly a descriptor adopted by the facade.
+    Boxed(Box<dyn GzHandle + 'a>),
+}
+
+impl<'a> GzFileSlot<'a> {
+    /// Whether a file is installed.
+    #[must_use]
+    pub const fn is_installed(&self) -> bool {
+        !matches!(self, Self::Empty)
+    }
+
+    /// Borrows the installed handle mutably, which is how every read, write, seek and close reaches
+    /// the file.
+    ///
+    /// [`None`] for [`GzFileSlot::Empty`], which is the state C would express as a closed
+    /// descriptor. Both variants answer through the same trait object, so no caller has to know
+    /// which one it got.
+    pub fn handle_mut(&mut self) -> Option<&mut (dyn GzHandle + 'a)> {
+        match self {
+            Self::Empty => None,
+            Self::Owned(handle) => Some(handle),
+            // Reborrow through the box so the caller gets the trait object, not the box.
+            Self::Boxed(handle) => Some(&mut **handle),
+        }
+    }
+
+    /// Closes the installed handle and reports its result; succeeds when the slot is empty.
+    ///
+    /// The port of `ret = close(state->fd)` (`gzread.c` L665, `gzwrite.c` L696), whose failure
+    /// becomes `Z_ERRNO`. An empty slot reports success because [`GzHandle::close`] is
+    /// contractually idempotent and because C cannot reach a double close -- `gzclose` may not be
+    /// called twice on one stream.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`GzHandle::close`] reports.
+    pub fn close(&mut self) -> Result<(), GzIoError> {
+        match self.handle_mut() {
+            Some(handle) => handle.close(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl fmt::Debug for GzFileSlot<'_> {
+    /// Names the variant without requiring [`Debug`] of the injected handle.
+    ///
+    /// A facade handle wraps a caller's descriptor and need not be printable, so this places no
+    /// bound on it -- the same reasoning that keeps `A: Allocator` out of [`GzState`]'s `Debug`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("Empty"),
+            Self::Owned(handle) => f.debug_tuple("Owned").field(handle).finish(),
+            Self::Boxed(_) => f.write_str("Boxed(..)"),
+        }
+    }
+}
+/// Delegates every [`GzHandle`] method to the single element of a one-element array.
+///
+/// This impl exists for exactly one reason: it is what makes [`try_box_handle`] possible without
+/// `unsafe` and without `Box::new`. A `Box<[H; 1]>` can be built from a fallibly reserved [`Vec`],
+/// and because `[H; 1]` is `Sized` and implements the trait, that box coerces to
+/// `Box<dyn GzHandle>`. `Box<[H]>` cannot, because Rust does not unsize an already-unsized pointee.
+///
+/// `[H; 1]` has exactly the size and alignment of `H`, so the indirection costs nothing at run time
+/// and the heap block is the same one `Box::new(handle)` would have produced.
+///
+/// Each method destructures the array with `let [inner] = self`, which is exhaustive for a
+/// fixed-length-one array: no bounds check, no index, and no path on which it could panic.
+impl<H: GzHandle> GzHandle for [H; 1] {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, GzIoError> {
+        let [inner] = self;
+        inner.read(buf)
+    }
+
+    fn write(&mut self, buf: &[u8]) -> Result<usize, GzIoError> {
+        let [inner] = self;
+        inner.write(buf)
+    }
+
+    fn seek(&mut self, offset: ZOff64, whence: GzSeekFrom) -> Result<ZOff64, GzIoError> {
+        let [inner] = self;
+        inner.seek(offset, whence)
+    }
+
+    fn set_nonblocking(&mut self, nonblocking: bool) -> Result<(), GzIoError> {
+        let [inner] = self;
+        inner.set_nonblocking(nonblocking)
+    }
+
+    fn close(&mut self) -> Result<(), GzIoError> {
+        let [inner] = self;
+        inner.close()
+    }
+}
+
+/// Moves `handle` onto the heap as a trait object, reporting exhaustion instead of aborting.
+///
+/// [`GzState`]'s handle slot is a `Box<dyn GzHandle>`, and `Box::new` is the one allocation
+/// primitive in the standard library with no fallible form: it calls `handle_alloc_error`, which
+/// aborts the process. Aborting is not an outcome a `gzFile` may produce. `gzopen` and `gzdopen`
+/// are documented to return `NULL` on failure (`zlib.h` L1400-L1401 and L1417-L1418), C's `gz_open`
+/// reaches that outcome from a failed `malloc` (`gzlib.c` L104-L106 and L200-L204), and
+/// `test/infcover.c` induces allocation failure deliberately with `mem_limit` (L176-L181) so that
+/// those paths actually run. A library that aborts instead has broken the contract its callers
+/// were written against.
+///
+/// So the allocation is made the same way [`EngineBox`] makes its own -- through
+/// [`Vec::try_reserve_exact`], which reports [`alloc::collections::TryReserveError`] rather than
+/// aborting -- and is then converted into a trait object without copying:
+///
+/// 1. reserve room for exactly one `H`, fallibly;
+/// 2. move `handle` into it, which cannot reallocate because the capacity is already there;
+/// 3. `into_boxed_slice`, which is a no-op reallocation-wise because `len == capacity`;
+/// 4. `Box<[H]>` into `Box<[H; 1]>`, a pointer-metadata change with no allocation;
+/// 5. return it as `Box<dyn GzHandle>`, which the impl above licenses.
+///
+/// # Errors
+///
+/// [`ReturnCode::MEM_ERROR`] when the one-element allocation cannot be made. Callers translate that
+/// into whatever their own entry point returns -- `open.rs` turns it into
+/// `GzOpenError::OutOfMemory`, which the facade turns into C's `NULL`. `handle` is dropped on that
+/// path, and because nothing has been installed anywhere there is nothing to unwind.
+///
+/// Note that step 4 cannot fail: the vector holds exactly one element. It is written as a
+/// `try_into` with an error branch anyway, because the alternative is an `expect`, and library code
+/// here does not panic. The branch reports [`ReturnCode::MEM_ERROR`] and drops the handle, which is
+/// the same conservative outcome as a genuine allocation failure.
+pub fn try_box_handle<'a, H: GzHandle + 'a>(
+    handle: H,
+) -> Result<Box<dyn GzHandle + 'a>, ReturnCode> {
+    let mut slot: Vec<H> = Vec::new();
+    // The fallible half.
+    slot.try_reserve_exact(1)
+        .map_err(|_| ReturnCode::MEM_ERROR)?;
+    // Capacity is already sufficient, so this cannot reallocate.
+    slot.push(handle);
+    // `len == capacity`, so the implied `shrink_to_fit` is a no-op and no reallocation happens.
+    let boxed: Box<[H]> = slot.into_boxed_slice();
+    let solo: Box<[H; 1]> = boxed.try_into().map_err(|_| ReturnCode::MEM_ERROR)?;
+    Ok(solo)
+}
 
 /// One heap-allocated value, obtained fallibly: this port's stand-in for `Box<T>`.
 ///
@@ -658,7 +906,7 @@ impl<T> EngineBox<T> {
     }
 }
 
-/// The engine a `gzFile` drives, or the absence of one: the port of `state->strm.state`.
+/// The engine a `gzFile` drives, or the absence of one: the Rust counterpart of `state->strm.state`.
 ///
 /// A `gzFile` holds at most one engine, and which one is fixed by the direction the file was opened
 /// in. C expresses that with an untyped `internal_state *` that `gz_look` initialises for inflate
@@ -708,7 +956,7 @@ impl<'a, A: Allocator<'a>> fmt::Debug for GzEngine<'a, A> {
     }
 }
 
-/// The `z_stream` a `gzFile` embeds: the port of `gz_state.strm` (`gzguts.h` L202).
+/// The `z_stream` a `gzFile` embeds: the Rust counterpart of `gz_state.strm` (`gzguts.h` L202).
 ///
 /// C embeds the whole `z_stream` "in-place (not a pointer)" and hands its address to `deflate` and
 /// `inflate`. Two of its members are not reproduced here at all, and that is deliberate:
@@ -722,7 +970,7 @@ impl<'a, A: Allocator<'a>> fmt::Debug for GzEngine<'a, A> {
 /// occurs anywhere in `gzlib.c`, `gzread.c`, `gzwrite.c` or `gzclose.c` -- the layer tracks position
 /// in `x.pos` and leaves the container checksum to the engine -- but **the engines read and write
 /// them**. C does not notice, because `gz_state` embeds the whole `z_stream` and hands `deflate` and
-/// `inflate` its address, so the scalars simply live where the engines expect them. This port
+/// `inflate` its address, so the scalars simply live where the engines expect them. This implementation
 /// separates the compression state from the caller-visible scalars, so
 /// [`crate::deflate::DeflateStream`] and [`crate::inflate::InflateStream`] take them as in/out
 /// parameters and something has to carry them between calls. That something is this structure, which
@@ -736,21 +984,21 @@ impl<'a, A: Allocator<'a>> fmt::Debug for GzEngine<'a, A> {
 /// What remains is the four cursor fields, the four scalars, the engine's message slot and the engine
 /// itself. The two pointer cursors become indices, for the reason this module's documentation gives.
 pub struct GzStream<'a, A: Allocator<'a>> {
-    /// Bytes of input still unconsumed: the port of `strm.avail_in`.
+    /// Bytes of input still unconsumed: the Rust counterpart of `strm.avail_in`.
     ///
     /// `gz_reset` clears it (`gzlib.c` L83), `gz_avail` refills it (`gzread.c` L56-L92), and
     /// `gzoffset64` subtracts it from the raw file offset so that buffered input is not counted
     /// (`gzlib.c` L484-L485).
     pub avail_in: c_uint,
-    /// Index of the next input byte within [`GzState::input`]: the port of `strm.next_in`.
+    /// Index of the next input byte within `GzState::input`: the port of `strm.next_in`.
     ///
     /// An index rather than a pointer. `gz_avail` slides the remaining input back to the start of
     /// the buffer before refilling (`gzread.c` L63-L71), which is the operation that requires the
     /// cursor to be expressed relative to the buffer in the first place.
     pub next_in: usize,
-    /// Space remaining in the output destination: the port of `strm.avail_out`.
+    /// Space remaining in the output destination: the Rust counterpart of `strm.avail_out`.
     pub avail_out: c_uint,
-    /// Index of the next output byte within [`GzState::output`]: the port of `strm.next_out`.
+    /// Index of the next output byte within `GzState::output`: the port of `strm.next_out`.
     ///
     /// Meaningful only while the engine is writing into the layer's own output buffer, which is the
     /// buffered path. On the large-read path `gz_read` points C's `next_out` at the *user's* buffer
@@ -758,26 +1006,26 @@ pub struct GzStream<'a, A: Allocator<'a>> {
     /// an argument in that case, and fact 2 in this module's documentation explains how the exposed
     /// prefix is kept coherent across it.
     pub next_out: usize,
-    /// Total input bytes the engine has consumed: the port of `strm.total_in`.
+    /// Total input bytes the engine has consumed: the Rust counterpart of `strm.total_in`.
     ///
     /// Carried for the engine's benefit, not the layer's; see the type-level note.
     pub total_in: u64,
-    /// Total output bytes the engine has produced: the port of `strm.total_out`.
+    /// Total output bytes the engine has produced: the Rust counterpart of `strm.total_out`.
     ///
     /// Carried for the engine's benefit, not the layer's; see the type-level note.
     pub total_out: u64,
-    /// The running check value: the port of `strm.adler`.
+    /// The running check value: the Rust counterpart of `strm.adler`.
     ///
     /// The CRC-32 of a gzip member or the Adler-32 of a zlib stream. **Must** survive from one
     /// engine call to the next, for the reason the type-level note gives.
     pub adler: u32,
-    /// The engine's data-type report: the port of `strm.data_type`.
+    /// The engine's data-type report: the Rust counterpart of `strm.data_type`.
     ///
     /// `Z_BINARY`, `Z_TEXT` or `Z_UNKNOWN` when compressing (`deflate.c` L1005-L1007); the
     /// bit-accumulator state when decompressing (`inflate.c` L1147-L1149). Informational either way,
     /// and carried only because the engines expect to find it.
     pub data_type: i32,
-    /// The engine's last message: the port of `strm.msg`.
+    /// The engine's last message: the Rust counterpart of `strm.msg`.
     ///
     /// `gz_decomp` forwards it verbatim when inflate reports a data error, falling back to
     /// `"compressed data error"` when it is null (`gzread.c` L221-L222). The shape matches
@@ -845,19 +1093,15 @@ impl<'a, A: Allocator<'a>> fmt::Debug for GzStream<'a, A> {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  The state
-// -----------------------------------------------------------------------------
-
-/// The internal `gzFile` state: the port of `gz_state` (`gzguts.h` L169-L204).
+/// The internal `gzFile` state: the Rust counterpart of `gz_state` (`gzguts.h` L169-L204).
 ///
 /// A `gzFile` is an opaque pointer to one of these. The C fields appear below in `gzguts.h`'s
-/// declaration order, each annotated with the line it comes from, followed by a clearly separated
-/// tail of members this port needs and C does not.
+/// declaration order, each citing the line it comes from, followed by a separated tail of members
+/// this implementation needs and C does not.
 ///
 /// # `#[repr(C)]` is mandatory here
 ///
-/// The attribute is not decoration and not an optimisation. [`GzState::x`] must begin at offset
+/// The attribute is not decoration and not an optimisation. `GzState::x` must begin at offset
 /// zero, because the `gzgetc` macro dereferences its three fields inside caller object code that
 /// cannot be recompiled, and only `#[repr(C)]` promises that the first declared field is the first
 /// field in memory. This module's documentation explains the consequences of getting it wrong, and
@@ -873,13 +1117,13 @@ impl<'a, A: Allocator<'a>> fmt::Debug for GzStream<'a, A> {
 /// (`gzlib.c` L100 and L206, `gzread.c` L99-L100, `gzwrite.c` L16 and L25). The allocator is stored
 /// by value so that teardown can return every block to the allocator that produced it.
 ///
-/// # Moving a `GzState` is safe
+/// # Moving a `GzState` is safe, and the exposed pointer is always freshly derived
 ///
-/// [`GzFileExposed::next`] points into the heap block behind [`GzState::output`], not into the
+/// [`GzFileExposed::next`] points into the heap block behind `GzState::output`, not into the
 /// `GzState` itself, and moving a `GzState` does not move that block. The pointer therefore survives
 /// the move the facade performs when it installs a freshly built state at the address it will hand
 /// to C. What does invalidate it is replacing the output buffer, which is why every routine below
-/// that touches [`GzState::output`] ends by calling [`GzState::refresh_exposed`].
+/// that touches `GzState::output` ends by calling [`GzState::refresh_exposed`].
 ///
 /// # Why `refresh_exposed` derives the pointer afresh every time
 ///
@@ -891,6 +1135,37 @@ impl<'a, A: Allocator<'a>> fmt::Debug for GzStream<'a, A> {
 /// most recently derived one, which is the strongest discipline available at an FFI edge and the
 /// reason the resync-on-entry / refresh-on-exit contract is stated as an obligation rather than an
 /// optimisation.
+///
+/// # ★ Two memory figures, and both must be reported
+///
+/// C's `gz_state` (`gzguts.h` L171-L203) is **248 bytes**. This struct is larger -- measured at
+/// **384 bytes** with [`crate::allocate::GlobalAllocator`] and **400** with a `&dyn Allocator` --
+/// because it carries members C does not: [`GzState::out_pos`], the allocator by value, an owned
+/// `Vec<u8>` path and message in place of C's fixed `char *`, and a boxed handle in place of an
+/// `int fd`. That is **+55% to +61% on the fixed state**, which is outside the 15% per-stream
+/// memory budget AAP §0.8.4 sets, and it must be reported as such rather than diluted.
+///
+/// It is also not the figure that governs a live stream. The moment `gz_look` or `gz_init`
+/// allocates, the working buffers dominate: a read stream takes `want` plus `2 * want` bytes
+/// (`gzread.c` L99-L100), a write stream `2 * want` plus `want` (`gzwrite.c` L15-L16, L24-L25), and
+/// on top of that sits a whole deflate or inflate state with its window. At the default
+/// [`GZBUFSIZE`] the 136 extra bytes are under half a percent of the total, comfortably inside the
+/// budget.
+///
+/// Both numbers are true and they answer different questions, so a memory report for this library
+/// is required to give both:
+///
+/// * **idle fixed state**, right after `gzopen` and before any buffer exists -- where the +55% to
+///   +61% is the honest answer, and where a caller that holds thousands of open-but-unread handles
+///   would actually feel it; and
+/// * **active-stream high water**, with buffers and engine state included -- the figure the ≤15%
+///   budget is about, measured the way `test/infcover.c`'s `mem_high` (its L166-L174) measures it,
+///   through an instrumented allocator rather than by summing declared sizes.
+///
+/// Folding the first into the second hides a real regression behind a large denominator; quoting
+/// only the first misrepresents what a stream costs. The same discipline applies to the deflate and
+/// inflate states, whose fixed overheads are far smaller (+1.7% to +4.3%) but are equally not the
+/// whole story.
 #[repr(C)]
 pub struct GzState<'a, A: Allocator<'a>> {
     /// The caller-visible prefix, at offset zero. `gzguts.h` L172.
@@ -909,9 +1184,11 @@ pub struct GzState<'a, A: Allocator<'a>> {
     pub(crate) mode: i32,
     /// The open file, replacing C's `int fd`. `gzguts.h` L178.
     ///
-    /// [`None`] before the file is opened and after it has been taken for closing. See [`GzHandle`]
-    /// for why a descriptor cannot be stored directly and which side supplies the implementation.
-    pub(crate) handle: Option<Box<dyn GzHandle + 'a>>,
+    /// [`GzFileSlot::Empty`] before the file is opened and after it has been taken for closing. See
+    /// [`GzHandle`] for why a descriptor cannot be stored directly and which side supplies the
+    /// implementation, and [`GzFileSlot`] for why the path-opened case is stored inline rather than
+    /// boxed -- installing it must not be able to fail, because C's `state->fd = ...` cannot.
+    pub(crate) handle: GzFileSlot<'a>,
     /// The path, or the `"<fd:N>"` stand-in for a descriptor, used only in error messages.
     /// `gzguts.h` L179.
     ///
@@ -1033,13 +1310,10 @@ pub struct GzState<'a, A: Allocator<'a>> {
     /// The embedded stream and its engine. `gzguts.h` L202.
     pub(crate) strm: GzStream<'a, A>,
 
-    // -------------------------------------------------------------------------
-    //  Members this port needs and C does not
-    // -------------------------------------------------------------------------
-    /// Index within [`GzState::output`] that [`GzFileExposed::next`] denotes.
+    /// Index within `GzState::output` that [`GzFileExposed::next`] denotes.
     ///
     /// The safe half of the pointer/index split described in this module's documentation. C keeps
-    /// only the pointer; this port keeps both and treats the index as authoritative, because an
+    /// only the pointer; this implementation keeps both and treats the index as authoritative, because an
     /// index can be bounds-checked and a pointer cannot be dereferenced from inside this crate.
     /// The invariant `x.next == output.as_ptr() + out_pos` is established by
     /// [`GzState::refresh_exposed`] and recovered by [`GzState::resync_from_exposed`].
@@ -1055,7 +1329,7 @@ pub struct GzState<'a, A: Allocator<'a>> {
 
 /// Widens a C `unsigned` to a `usize` without a lossy cast.
 ///
-/// Every target this port supports has `usize` at least as wide as `c_uint`, so the conversion
+/// Every target this implementation supports has `usize` at least as wide as `c_uint`, so the conversion
 /// always succeeds; saturating rather than panicking on a hypothetical narrower target is the
 /// conservative choice, because a saturated value can only make a bounds check stricter.
 fn widen(value: c_uint) -> usize {
@@ -1065,7 +1339,7 @@ fn widen(value: c_uint) -> usize {
 /// Narrows a `usize` to a C `unsigned`, or reports that it does not fit.
 ///
 /// The counterpart of [`widen`]. C performs this narrowing with an unchecked cast -- for instance
-/// `(unsigned)offset` at `gzlib.c` L425 -- guarded by a preceding range test; this port makes the
+/// `(unsigned)offset` at `gzlib.c` L425 -- guarded by a preceding range test; this implementation makes the
 /// test part of the conversion so the guard cannot be forgotten.
 fn narrow(value: usize) -> Option<c_uint> {
     c_uint::try_from(value).ok()
@@ -1105,7 +1379,7 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
         Self {
             x: GzFileExposed::EMPTY,
             mode: GZ_NONE,
-            handle: None,
+            handle: GzFileSlot::Empty,
             path: Vec::new(),
             size: 0,
             want: GZBUFSIZE,
@@ -1129,10 +1403,6 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
             allocator,
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  The exposed prefix
-    // -------------------------------------------------------------------------
 
     /// Recomputes [`GzFileExposed::next`] from [`GzState::out_pos`] and the output buffer.
     ///
@@ -1227,7 +1497,7 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
 
     /// Sets `x.have` without moving the output cursor.
     ///
-    /// The port of the bare assignments C makes to the field, such as `state->x.have =
+    /// Implements the bare assignments C makes to the field, such as `state->x.have =
     /// strm->avail_in` after copying leftover input into the output buffer (`gzread.c` L166). Use
     /// [`GzState::set_output_window`] instead when the cursor moves too, so that the pointer stays
     /// consistent with the index.
@@ -1246,7 +1516,7 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
     ///   `gzgetc()` macro fails" and drops into the function branch (`gzlib.c` L563-L565).
     ///
     /// Nulling `next` alongside `have` is what keeps [`GzState::resync_from_exposed`] able to treat
-    /// an out-of-range pointer as corruption: this port never leaves `next` denoting a location
+    /// an out-of-range pointer as corruption: this implementation never leaves `next` denoting a location
     /// outside the output buffer, which C transiently does.
     pub fn clear_have(&mut self) {
         self.x.have = 0;
@@ -1267,7 +1537,7 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
 
     /// Adds `delta` to `x.pos`, which may be negative.
     ///
-    /// The port of both directions C moves the position in: forwards after delivering bytes
+    /// Implements both directions C moves the position in: forwards after delivering bytes
     /// (`state->x.pos += n`, `gzread.c` L384) and backwards when `gzungetc` pushes one
     /// (`state->x.pos--`, `gzread.c` L537 and L560).
     ///
@@ -1312,7 +1582,7 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
 
     /// Consumes `n` delivered bytes: advances the cursor and reduces the count.
     ///
-    /// The port of the `state->x.next += n; state->x.have -= n;` pair that appears wherever the read
+    /// Implements the `state->x.next += n; state->x.have -= n;` pair that appears wherever the read
     /// path hands bytes to a caller -- `gzread` after its `memcpy` (`gzread.c` L343-L345), `gzgets`
     /// after finding a line (`gzread.c` L609-L611), and `gz_skip` when discarding buffered output
     /// (`gzread.c` L291-L292). The position is *not* moved: C updates `x.pos` separately, so use
@@ -1414,10 +1684,6 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
         self.output.as_ref().map_or(0, Buffer::len)
     }
 
-    // -------------------------------------------------------------------------
-    //  Direction, container handling and read-path flags
-    // -------------------------------------------------------------------------
-
     /// The raw mode value, one of [`GZ_NONE`], [`GZ_READ`], [`GZ_WRITE`] or [`GZ_APPEND`].
     #[must_use]
     pub const fn mode(&self) -> i32 {
@@ -1438,7 +1704,7 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
 
     /// Whether the mode is one of the two an entry point may act on.
     ///
-    /// The port of the integrity test every public `gzFile` function performs before doing anything
+    /// Implements the integrity test every public `gzFile` function performs before doing anything
     /// else -- `if (state->mode != GZ_READ && state->mode != GZ_WRITE) return -1;`
     /// (`gzlib.c` L335-L336, and the same two lines in `gzseek64`, `gztell64`, `gzoffset64`, `gzeof`,
     /// `gzerror` and `gzclearerr`).
@@ -1521,7 +1787,7 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
 
     /// Records, or clears, the non-blocking stall.
     ///
-    /// The port of `state->again = 0` before each write attempt and `state->again = 1` on
+    /// Implements `state->again = 0` before each write attempt and `state->again = 1` on
     /// `EAGAIN`/`EWOULDBLOCK` (`gzwrite.c` L112 and L118), and of `state->again = 0` in `gz_reset`
     /// (`gzlib.c` L79).
     pub fn set_again(&mut self, again: bool) {
@@ -1560,10 +1826,6 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
     pub fn set_past(&mut self, past: bool) {
         self.past = i32::from(past);
     }
-
-    // -------------------------------------------------------------------------
-    //  Write-path parameters
-    // -------------------------------------------------------------------------
 
     /// The requested compression level, possibly `Z_DEFAULT_COMPRESSION`.
     #[must_use]
@@ -1623,10 +1885,6 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
         self.skip = skip;
     }
 
-    // -------------------------------------------------------------------------
-    //  Buffer sizes
-    // -------------------------------------------------------------------------
-
     /// The working-buffer size, or zero when the buffers have not been allocated.
     #[must_use]
     pub const fn size(&self) -> c_uint {
@@ -1679,10 +1937,6 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
         self.input.as_mut().map_or(&mut [], Buffer::as_mut_slice)
     }
 
-    // -------------------------------------------------------------------------
-    //  Error state
-    // -------------------------------------------------------------------------
-
     /// The last error code as a raw `Z_*` value, which is what `gzerror` reports.
     #[must_use]
     pub const fn err(&self) -> i32 {
@@ -1720,7 +1974,7 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
 
     /// Releases the error message, leaving [`None`].
     ///
-    /// The port of the opening lines of `gz_error`, which free any previous message and null the
+    /// Implements the opening lines of `gz_error`, which free any previous message and null the
     /// field (`gzlib.c` L556-L561). C guards the release with `state->err != Z_MEM_ERROR` because a
     /// message recorded for an out-of-memory error was never allocated; here the distinction is
     /// carried by the [`Option`] itself, so no guard is needed.
@@ -1733,7 +1987,7 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
     /// The allocation-and-formatting step of `gz_error`, whose C form is a `malloc` of
     /// `strlen(state->path) + strlen(msg) + 3` bytes followed by
     /// `snprintf(state->msg, ..., "%s%s%s", state->path, ": ", msg)` (`gzlib.c` L576-L584). The
-    /// three extra bytes are the two of `": "` plus the terminating NUL; this port stores bytes with
+    /// three extra bytes are the two of `": "` plus the terminating NUL; this implementation stores bytes with
     /// a length instead of a NUL, so it reserves exactly two.
     ///
     /// Everything *around* the formatting stays with `gz_error` in `mod.rs`: which errors get a
@@ -1766,10 +2020,6 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
         Ok(())
     }
 
-    // -------------------------------------------------------------------------
-    //  Path and handle
-    // -------------------------------------------------------------------------
-
     /// The path, or `"<fd:N>"` stand-in, used to prefix error messages.
     #[must_use]
     pub fn path(&self) -> &[u8] {
@@ -1778,7 +2028,7 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
 
     /// Copies `path` into the state, replacing whatever was there.
     ///
-    /// The port of the path save at `gzlib.c` L199-L226, which allocates `len + 1` bytes and copies
+    /// Implements the path save at `gzlib.c` L199-L226, which allocates `len + 1` bytes and copies
     /// the caller's string in. Reported as a failure rather than aborting, because `gz_open` treats
     /// a failed path allocation as a failed open (`gzlib.c` L207-L209).
     ///
@@ -1798,26 +2048,25 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
     /// Whether a file handle is installed.
     #[must_use]
     pub const fn has_handle(&self) -> bool {
-        self.handle.is_some()
+        self.handle.is_installed()
     }
 
     /// Borrows the file handle mutably, which is how every read, write and seek reaches the file.
     ///
     /// [`None`] once the handle has been taken for closing, which is the state C would express as a
-    /// closed descriptor.
+    /// closed descriptor. Both slot variants answer through the same trait object, so no caller has
+    /// to know whether the file was opened by path or adopted from a descriptor.
     pub fn handle_mut(&mut self) -> Option<&mut (dyn GzHandle + 'a)> {
-        // Reborrow through the box so that callers get the trait object rather than the box.
-        self.handle.as_deref_mut()
+        self.handle.handle_mut()
     }
 
     /// Installs the file handle, returning whatever was there before.
     ///
     /// The port of the two assignments to `state->fd` -- the path-based `open` (`gzlib.c` L248) and
-    /// the adopted descriptor (`gzlib.c` L262).
-    pub fn set_handle(
-        &mut self,
-        handle: Option<Box<dyn GzHandle + 'a>>,
-    ) -> Option<Box<dyn GzHandle + 'a>> {
+    /// the adopted descriptor (`gzlib.c` L262). Like those assignments, and unlike a boxing
+    /// operation, this **cannot fail**: a [`GzFileSlot`] carrying a path-opened file needs no
+    /// allocation at all, so `gz_open` has no allocation left to abort on. See [`GzFileSlot`].
+    pub fn set_handle(&mut self, handle: GzFileSlot<'a>) -> GzFileSlot<'a> {
         core::mem::replace(&mut self.handle, handle)
     }
 
@@ -1825,15 +2074,11 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
     ///
     /// Both close paths need the outcome of `close` -- it becomes `Z_ERRNO` when it fails
     /// (`gzread.c` L665-L667, `gzwrite.c` L696-L697) -- so the handle is handed over rather than
-    /// dropped silently.
+    /// dropped silently. Call [`GzFileSlot::close`] on the result to close it and read that outcome.
     #[must_use]
-    pub fn take_handle(&mut self) -> Option<Box<dyn GzHandle + 'a>> {
-        self.handle.take()
+    pub fn take_handle(&mut self) -> GzFileSlot<'a> {
+        core::mem::replace(&mut self.handle, GzFileSlot::Empty)
     }
-
-    // -------------------------------------------------------------------------
-    //  The stream and its engine
-    // -------------------------------------------------------------------------
 
     /// Borrows the embedded stream.
     #[must_use]
@@ -1910,13 +2155,9 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
         &self.allocator
     }
 
-    // -------------------------------------------------------------------------
-    //  Buffer allocation and release
-    // -------------------------------------------------------------------------
-
     /// Allocates the read path's working buffers: `want` input bytes and `2 * want` output bytes.
     ///
-    /// The port of `gz_look`'s allocation block (`gzread.c` L97-L107). The output buffer is the
+    /// Implements `gz_look`'s allocation block (`gzread.c` L97-L107). The output buffer is the
     /// doubled one on this path, which is what gives `gzungetc` room to park pushed bytes at
     /// `2 * size - 1` (`gzread.c` L535).
     ///
@@ -1965,7 +2206,7 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
     /// Allocates the write path's working buffers: `2 * want` input bytes, plus `want` output bytes
     /// when actually compressing.
     ///
-    /// The port of `gz_init`'s allocation block (`gzwrite.c` L15-L30). The *input* buffer is the
+    /// Implements `gz_init`'s allocation block (`gzwrite.c` L15-L30). The *input* buffer is the
     /// doubled one on this path, for the reason its comment gives -- "double size for `gzprintf`"
     /// (`gzwrite.c` L15) -- and the output buffer is skipped entirely for a transparent stream,
     /// because `if (!state->direct)` guards it (`gzwrite.c` L23): with nothing to compress there is
@@ -2047,12 +2288,11 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
         self.err = ReturnCode::OK.as_i32();
         self.msg = None;
         self.path = Vec::new();
-        if let Some(mut handle) = self.handle.take() {
-            // The result cannot be reported from here; a close path that needs it calls
-            // `take_handle` and closes the handle itself. `GzHandle::close` is required to be
-            // idempotent, so doing it here as well is safe.
-            let _ = handle.close();
-        }
+        // The result cannot be reported from here; a close path that needs it calls `take_handle`
+        // and closes the slot itself. `GzHandle::close` is required to be idempotent, so doing it
+        // here as well is safe. The slot is emptied first so that a handle whose `close` somehow
+        // panicked could not be closed a third time by an outer unwind.
+        let _ = self.take_handle().close();
     }
 }
 
@@ -2080,7 +2320,7 @@ impl<'a, A: Allocator<'a>> fmt::Debug for GzState<'a, A> {
         f.debug_struct("GzState")
             .field("x", &self.x)
             .field("mode", &self.mode)
-            .field("handle", &self.handle.is_some())
+            .field("handle", &self.handle)
             .field("path_len", &self.path.len())
             .field("size", &self.size)
             .field("want", &self.want)
@@ -2105,10 +2345,6 @@ impl<'a, A: Allocator<'a>> fmt::Debug for GzState<'a, A> {
     }
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     // The crate denies the panic-prone lints in library code, which is the right policy there and
@@ -2117,9 +2353,9 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
     use super::{
-        narrow, widen, EngineBox, GzEngine, GzFileExposed, GzHandle, GzHow, GzIoError, GzMode,
-        GzSeekFrom, GzState, ZOff64, COPY, GZBUFSIZE, GZIP, GZ_APPEND, GZ_NONE, GZ_READ, GZ_WRITE,
-        LOOK,
+        narrow, try_box_handle, widen, EngineBox, GzEngine, GzFileExposed, GzFileSlot, GzHandle,
+        GzHow, GzIoError, GzMode, GzSeekFrom, GzState, ZOff64, COPY, GZBUFSIZE, GZIP, GZ_APPEND,
+        GZ_NONE, GZ_READ, GZ_WRITE, LOOK,
     };
     use crate::allocate::GlobalAllocator;
     use crate::config::{Strategy, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY};
@@ -2627,6 +2863,43 @@ mod tests {
     }
 
     #[test]
+    fn try_box_handle_produces_a_working_trait_object() {
+        // The fallible replacement for `Box::new`: `gz_open` must be able to report
+        // `GzOpenError::OutOfMemory` rather than abort, and the facade's `gzdopen` must be able to
+        // return C's documented `NULL`. What matters here is that the resulting box behaves exactly
+        // like a `Box::new` one -- every method reaches the wrapped handle, and dropping it closes.
+        let closes = Cell::new(0);
+        {
+            let mut boxed = try_box_handle(CountingHandle { closes: &closes }).unwrap();
+            assert_eq!(boxed.write(b"four").unwrap(), 4);
+            assert_eq!(boxed.read(&mut [0_u8; 4]).unwrap(), 0);
+            assert_eq!(boxed.seek(42, GzSeekFrom::Start).unwrap(), 42);
+            boxed.set_nonblocking(true).unwrap();
+            boxed.close().unwrap();
+        }
+        assert_eq!(closes.get(), 1);
+    }
+
+    #[test]
+    fn try_box_handle_installs_into_the_state_slot() {
+        // The box has to be usable as the `Option<Box<dyn GzHandle>>` slot's value, which is the
+        // whole reason the `[H; 1]` bridge exists: `Box<[H]>` would not coerce.
+        let closes = Cell::new(0);
+        let mut state = GzState::new(GlobalAllocator);
+        let handle = try_box_handle(CountingHandle { closes: &closes }).unwrap();
+        assert!(!state.set_handle(GzFileSlot::Boxed(handle)).is_installed());
+        assert!(state.has_handle());
+        assert_eq!(state.handle_mut().unwrap().write(b"xy").unwrap(), 2);
+        // Both close paths take the handle out and close it so they can observe the result
+        // (`gzread.c` L663-L665, `gzwrite.c` L648-L650); the bridge must not swallow that result.
+        let mut taken = state.take_handle();
+        assert!(taken.close().is_ok());
+        drop(taken);
+        assert_eq!(closes.get(), 1, "close reached the wrapped handle");
+        assert!(!state.has_handle());
+    }
+
+    #[test]
     fn engine_slots_are_direction_specific() {
         let mut state = fresh();
         assert!(state.deflate_state_mut().is_none());
@@ -2645,8 +2918,10 @@ mod tests {
         let mut state: GzState<'_, GlobalAllocator> = GzState::new(GlobalAllocator);
         assert!(!state.has_handle());
 
-        let previous = state.set_handle(Some(Box::new(CountingHandle { closes: &closes })));
-        assert!(previous.is_none());
+        let previous = state.set_handle(GzFileSlot::Boxed(Box::new(CountingHandle {
+            closes: &closes,
+        })));
+        assert!(!previous.is_installed(), "the slot was empty before");
         assert!(state.has_handle());
         assert_eq!(state.handle_mut().unwrap().write(b"abc").unwrap(), 3);
         assert_eq!(state.handle_mut().unwrap().read(&mut [0_u8; 4]).unwrap(), 0);
@@ -2660,11 +2935,12 @@ mod tests {
         );
         state.handle_mut().unwrap().set_nonblocking(true).unwrap();
 
-        let mut handle = state.take_handle().unwrap();
+        let mut slot = state.take_handle();
         assert!(!state.has_handle());
-        handle.close().unwrap();
+        assert!(slot.is_installed(), "the slot carries the handle away");
+        slot.close().unwrap();
         assert_eq!(closes.get(), 1);
-        drop(handle);
+        drop(slot);
         // The state no longer owns a handle, so teardown must not close anything again.
         state.teardown();
         assert_eq!(closes.get(), 1);
@@ -2681,7 +2957,9 @@ mod tests {
             state.try_set_path(b"file.gz").unwrap();
             state.set_err(ReturnCode::DATA_ERROR.as_i32());
             state.try_set_prefixed_msg(b"broken").unwrap();
-            state.set_handle(Some(Box::new(CountingHandle { closes: &closes })));
+            state.set_handle(GzFileSlot::Boxed(Box::new(CountingHandle {
+                closes: &closes,
+            })));
 
             state.teardown();
             assert!(state.out_slice().is_empty());
@@ -2708,7 +2986,9 @@ mod tests {
             state.set_want(16);
             state.allocate_read_buffers().unwrap();
             state.try_set_path(b"abandoned.gz").unwrap();
-            state.set_handle(Some(Box::new(CountingHandle { closes: &closes })));
+            state.set_handle(GzFileSlot::Boxed(Box::new(CountingHandle {
+                closes: &closes,
+            })));
             // No explicit teardown: this models `gz_open` failing after the path has been copied
             // (`gzlib.c` L207-L209).
         }

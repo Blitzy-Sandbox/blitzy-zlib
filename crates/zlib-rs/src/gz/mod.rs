@@ -1,13 +1,13 @@
 //! The `gzFile` layer: reading and writing gzip files through a `stdio`-like handle.
 //!
-//! This subtree is the port of the four C translation units that together implement zlib's file
+//! This subtree implements the four C translation units that together implement zlib's file
 //! interface, plus the private header they share:
 //!
 //! | C source | Lines | Rust module |
 //! |---|---|---|
 //! | `gzlib.c` | 609 | this file, [`open`] and [`state`] |
 //! | `gzread.c` | 668 | [`read`] |
-//! | `gzwrite.c` | 700 | [`write`] and [`printf`] |
+//! | `gzwrite.c` | 700 | [`mod@write`] and [`printf`] |
 //! | `gzclose.c` | 23 | [`close`] |
 //! | `gzguts.h` | 216 | [`state`] |
 //!
@@ -21,10 +21,11 @@
 //! Two things, mirroring the two roles `gzlib.c` plays in the C build:
 //!
 //! 1. **The barrel.** It declares the seven sibling modules and re-exports their public surface, so
-//!    that `crates/libz-rs-sys/src/gz.rs` has one import point (`zlib_rs::gz::*`) for all 32 of the
+//!    that the planned `crates/libz-rs-sys/src/gz.rs` will have one import point
+//!    (`zlib_rs::gz::*`) for all 32 of the
 //!    `gz*` entry points it exports rather than seven.
 //! 2. **The shared plumbing of `gzlib.c`** that every other module in the subtree reaches for:
-//!    [`gz_error`] (`gzlib.c` L555-L590), [`gz_intmax`] (L596-L609) and [`gt_off`]
+//!    `gz_error` (`gzlib.c` L555-L590), `gz_intmax` (L596-L609) and `gt_off`
 //!    (`gzguts.h` L216), together with the six public drivers that C also keeps outside the read and
 //!    write files -- [`gzbuffer`], [`gzeof`], [`gzerror`], [`gzclearerr`] -- plus [`gzdirect`]
 //!    (`gzread.c` L627-L642) and [`gzsetparams`] (`gzwrite.c` L630-L664), which C places with the
@@ -33,14 +34,10 @@
 //! # The exposed prefix, and the contract every entry point here honours
 //!
 //! `zlib.h` L1956-L1968 exposes the first three fields of the `gzFile` structure and then defines
-//! `gzgetc` as a **macro** over them:
+//! `gzgetc` as a **macro** that decrements `have`, increments `pos` and post-increments `next`
+//! (quoted in full at the head of [`state`], where the layout it constrains lives).
 //!
-//! ```c
-//! #define gzgetc(g) \
-//!       ((g)->have ? ((g)->have--, (g)->pos++, *((g)->next)++) : (gzgetc)(g))
-//! ```
-//!
-//! That arithmetic is compiled into *caller* object code, which this port cannot change, so
+//! That arithmetic is compiled into *caller* object code, which this implementation cannot change, so
 //! [`state::GzFileExposed`] reproduces the three fields at offset 0 and every entry point in this
 //! subtree begins with [`state::GzState::resync_from_exposed`] and ends with
 //! [`state::GzState::refresh_exposed`]. `state` documents the pointer/index split in full; the part
@@ -55,21 +52,20 @@
 //!
 //! # Feature gating
 //!
-//! `crates/zlib-rs/Cargo.toml` declares exactly four features -- `default`, `rust-api`, `simd` and
-//! `std` -- and **there is no `gz` feature on this crate**. The `gz` feature belongs to
-//! `crates/libz-rs-sys`, is on by default there, and switches on `zlib-rs/std`. The crate root
-//! therefore reaches this subtree through a single `#[cfg(feature = "std")] pub mod gz;`, which is
-//! why no per-item gate appears anywhere below: AAP §0.4.2.1 turns `#include <stdio.h>` and
-//! `<fcntl.h>` into `use std::{fs::File, io}` behind that one gate, and `cargo build -p zlib-rs
-//! --no-default-features` compiles the whole subtree out.
+//! There is **no `gz` feature on this crate**; the one of that name belongs to the facade crate and
+//! switches on `zlib-rs/std`. The crate root reaches this subtree through a single
+//! `#[cfg(feature = "std")] pub mod gz;`, so no per-item gate appears below and
+//! `--no-default-features` compiles the whole subtree out.
 //!
 //! ★ The crate root's re-export of [`GzState`] must carry the same `#[cfg(feature = "std")]` as the
-//! module declaration. An ungated `pub use gz::GzState;` refers to a module that does not exist in
-//! the default `no_std` build and fails it outright.
+//! module declaration. An ungated `pub use gz::GzState;` names a module that does not exist in the
+//! default `no_std` build and fails it outright.
 //!
-//! # Notes for `crates/libz-rs-sys/src/gz.rs`
+//! # Notes for the planned `crates/libz-rs-sys/src/gz.rs`
 //!
-//! The facade author cannot see this file, so the division of labour is recorded here.
+//! That file does not exist yet. The division of labour is recorded here so its author does not
+//! have to reconstruct it, and every "the facade does X" below is an obligation on that future file
+//! rather than a description of code that exists.
 //!
 //! * `gzFile` is an opaque `*mut GzState`. The facade must **resync the exposed prefix immediately
 //!   on entry and refresh it before returning to C** for every one of the 28 `gz*` exports plus
@@ -77,12 +73,34 @@
 //!   `gzgetc` macro mutates `have`, `pos` and `next` in caller object code. The six drivers in this
 //!   file do it themselves; the facade must still do it around the ones it composes.
 //! * The facade owns every raw pointer and every C string: NUL termination, the `gzopen` path, and
-//!   the `wchar_t` conversion for `gzopen_w` (AAP §0.6.1 unsafe-site category 5). It also owns
-//!   `va_list` handling for `gzprintf`/`gzvprintf` through `core::ffi::VaList`, which is why
-//!   [`printf`] exposes a bounded scratch buffer rather than a formatter.
-//! * The facade owns the tag-validation guard that rejects a foreign, stale or already-closed
-//!   `gzFile` (category 3). Every entry point here additionally re-checks the mode, which is the
-//!   weaker half of the same defence.
+//!   the `wchar_t` handling for `gzopen_w` (AAP §0.6.1 unsafe-site category 5). For `gzopen_w` that
+//!   means passing the caller's `wchar_t` units through **unconverted**, as
+//!   [`crate::gz::open::GzPathTarget::Wide`], and supplying the narrowed name separately as the
+//!   error label -- the split C draws between `_wopen`'s argument and `state->path`. Narrowing the
+//!   path and opening the narrowing would drop any character the target encoding cannot represent,
+//!   which names a different file or none.
+//! * Two C behaviours need a syscall safe Rust cannot make, and both are reachable through
+//!   [`crate::gz::open::gz_open_with`]: C's exact `open(2)` flag word, whose `O_CLOEXEC` is
+//!   conditional on the mode string while `std` sets it unconditionally and offers no way to clear
+//!   it; and a `close(2)` whose result is observable, which dropping a `std::fs::File` discards.
+//!   Supply an opener that performs both and returns a [`crate::gz::state::GzFileSlot::Boxed`];
+//!   [`crate::gz::open::open_with_std`] is the default to wrap or fall back to.
+//! * **`gzprintf` and `gzvprintf` are the one pair the facade does NOT define.** Stable Rust cannot
+//!   declare a C-variadic function or a `va_list` parameter -- rustc 1.97.1 rejects both with E0658
+//!   -- so those two symbols come from `crates/libz-rs-sys/csrc/gzprintf_shim.c`, the single C
+//!   translation unit the packaging step links in. The facade must define **only** the two hidden
+//!   helpers `_zlib_rs_gzprintf_begin` and `_zlib_rs_gzprintf_commit`; [`printf`] documents their
+//!   exact contract, and the leading underscore is what `zlib.map`'s `local: _*` pattern hides
+//!   them by. That is why [`printf`] exposes a bounded scratch buffer rather than a formatter.
+//! * The facade owns the pointer guard on `gzFile` (category 3), and the order of its two parts
+//!   matters. It must **first** establish that the pointer is non-null, aligned and safe to
+//!   dereference for the duration of the call; nothing read *through* the pointer can establish
+//!   that, so no tag can substitute for it. Only then does inspecting the state tell it anything,
+//!   and what it can then tell is that the *live object* is not one this library produced, or is
+//!   one that has already been closed. A pointer that has been freed is outside what any such check
+//!   reaches: it may still hold a plausible tag, and reading it is already undefined behaviour.
+//!   Every entry point here additionally re-checks the mode, which is the weaker half of the same
+//!   defence.
 //! * The facade owns the narrowing of each [`state::ZOff64`] result to the caller's `z_off_t`, using
 //!   C's own idiom `ret == (z_off_t)ret ? ret : -1` (`gzlib.c` L440-L441, L470-L471, L491-L492).
 //!   [`read::narrow_offset`] performs exactly that test.
@@ -94,11 +112,13 @@
 //!   references is not this library's choice. The core provides exactly one
 //!   [`state::ZOff64`]-based function per operation -- [`open::gzopen`], [`read::gzseek64`],
 //!   [`read::gztell64`], [`read::gzoffset64`] -- and both exported names delegate to it.
-//! * `crates/libz-rs-sys/src/layout_assertions.rs` asserts `sizeof(struct gzFile_s) == 24`;
+//! * The planned `crates/libz-rs-sys/src/layout_assertions.rs` is to assert
+//!   `sizeof(struct gzFile_s) == 24`;
 //!   [`state`] is the core-side half of that one contract and asserts the same numbers at compile
 //!   time.
 //! * Determinations this subtree makes for the **computed** `zlibCompileFlags`
-//!   (`crates/libz-rs-sys/src/util.rs`, AAP §0.6.3.5): bit 16 (`NO_GZCOMPRESS`) is **clear**,
+//!   (the planned `crates/libz-rs-sys/src/util.rs`, AAP §0.6.3.5): bit 16 (`NO_GZCOMPRESS`) must
+//!   be reported **clear**,
 //!   because both the read and the write half are implemented; bits 25, 26 and 27 -- the
 //!   `NO_snprintf`/`NO_vsnprintf`/`HAS_vsprintf_void` family -- are **clear**, because [`printf`]
 //!   always provides a bounded formatter and there is no void-returning variant.
@@ -108,16 +128,41 @@
 //! Each module in this subtree carries its own inline `#[cfg(test)] mod tests`. The integration
 //! suite for the layer as a whole lives under `crates/zlib-rs/tests/` and belongs to the crate
 //! root's agent; nothing in this subtree creates it.
+//!
+//! [`close`]: crate::gz::close
+//! [`gzbuffer`]: crate::gz::gzbuffer
+//! [`gzclearerr`]: crate::gz::gzclearerr
+//! [`gzdirect`]: crate::gz::gzdirect
+//! [`gzeof`]: crate::gz::gzeof
+//! [`gzerror`]: crate::gz::gzerror
+//! [`gzsetparams`]: crate::gz::gzsetparams
+//! [`open`]: crate::gz::open
+//! [`open::gzdopen`]: crate::gz::open::gzdopen
+//! [`open::gzopen`]: crate::gz::open::gzopen
+//! [`printf`]: crate::gz::printf
+//! [`read`]: crate::gz::read
+//! [`read::gzoffset64`]: crate::gz::read::gzoffset64
+//! [`read::gzseek64`]: crate::gz::read::gzseek64
+//! [`read::gztell64`]: crate::gz::read::gztell64
+//! [`read::narrow_offset`]: crate::gz::read::narrow_offset
+//! [`state`]: crate::gz::state
+//! [`state::GzFileExposed`]: crate::gz::state::GzFileExposed
+//! [`state::GzHandle`]: crate::gz::state::GzHandle
+//! [`state::GzState::refresh_exposed`]: crate::gz::state::GzState::refresh_exposed
+//! [`state::GzState::resync_from_exposed`]: crate::gz::state::GzState::resync_from_exposed
+//! [`state::ZOff64`]: crate::gz::state::ZOff64
+//! [`write`]: crate::gz::write
 
-// Every item in a module named `gz` that ports a C function named `gz_error`, `gz_intmax` or
+// The definitions closing the module documentation above are link-reference definitions, not
+// prose: a module whose `mod` declaration carries an outer doc comment has its `//!` block
+// resolved in the scope of the DECLARING module, so an unqualified sibling name does not
+// resolve. See "Documentation lints" in `src/lib.rs` for the rule and the gate.
+
+// Every item in a module named `gz` that implements a C function named `gz_error`, `gz_intmax` or
 // `gzbuffer` necessarily repeats the module's name. The C names are the ones a maintainer diffing
 // this file against `gzlib.c` will search for, and renaming them to satisfy a lint would cost
-// exactly the traceability the port is judged on.
+// exactly the traceability the implementation is judged on.
 #![allow(clippy::module_name_repetitions)]
-
-// -----------------------------------------------------------------------------
-//  The seven sibling modules
-// -----------------------------------------------------------------------------
 
 /// The `gz_state` structure and the constants that describe it (`gzguts.h`).
 pub mod state;
@@ -144,23 +189,32 @@ pub mod printf;
 /// The `gzclose` dispatch to `gzclose_r` or `gzclose_w` (`gzclose.c`).
 pub mod close;
 
-// -----------------------------------------------------------------------------
-//  The subtree's public surface, gathered into one import point
-// -----------------------------------------------------------------------------
-
 // The state, its constants and the traits a caller must implement or inspect. `GzState` keeps its
-// name exactly: the crate root re-exports it as `zlib_rs::GzState`, and the facade names it in the
-// signature of every `gz*` export.
+// name exactly: the facade names it in the signature of every `gz*` export, reaching it here as
+// `zlib_rs::gz::GzState`, and the crate root additionally flattens it to `zlib_rs::GzState` when
+// both `rust-api` and `std` are on.
+// `try_box_handle` is exported alongside them because the facade needs it: `gzdopen` builds a
+// handle over an adopted descriptor and must hand it to `gz_open_handle` already boxed, and
+// `Box::new` would abort the caller's process on a failed allocation rather than returning C's
+// documented `NULL`.
 pub use crate::gz::state::{
-    EngineBox, GzEngine, GzFileExposed, GzHandle, GzHow, GzIoError, GzMode, GzSeekFrom, GzState,
-    GzStream, ZOff64, COPY, GZBUFSIZE, GZIP, GZ_APPEND, GZ_NONE, GZ_READ, GZ_WRITE, LOOK,
+    try_box_handle, EngineBox, GzEngine, GzFileExposed, GzFileSlot, GzHandle, GzHow, GzIoError,
+    GzMode, GzSeekFrom, GzState, GzStream, ZOff64, COPY, GZBUFSIZE, GZIP, GZ_APPEND, GZ_NONE,
+    GZ_READ, GZ_WRITE, LOOK,
 };
 
 // The open family. There is deliberately no `gzopen64`: `gzopen` *is* the 64-bit core, exactly as
 // C's `gzopen64` is a one-line forward to the same `gz_open` (`gzlib.c` L300-L312 and L2042), so the
 // facade exports both names from this one function.
+//
+// `gz_open_with`, `open_with_std` and `GzPathTarget` are the path-side injection seam. The facade
+// needs all three whenever C's behaviour requires a syscall safe Rust cannot make -- C's exact
+// `open(2)` flag word, whose conditional `O_CLOEXEC` `std` cannot express, and a `close(2)` whose
+// result is observable, which dropping a `std::fs::File` discards. `open_with_std` is the default
+// opener, exported so a facade can wrap or fall back to it rather than reimplement it.
 pub use crate::gz::open::{
-    gz_open_handle, gzdopen, gzopen, FileHandle, GzOpenError, GzOpenHandleError, GzOpenSpec,
+    gz_open_handle, gz_open_with, gzdopen, gzopen, open_with_std, FileHandle, GzOpenError,
+    GzOpenHandleError, GzOpenSpec, GzPathTarget,
 };
 
 // `gzopen_w` exists on Windows only, and the gate is not this module's choice: C guards the
@@ -187,27 +241,28 @@ pub use crate::gz::write::{gzclose_w, gzflush, gzfwrite, gzputc, gzputs, gzwrite
 // The direction-agnostic close.
 pub use crate::gz::close::gzclose;
 
-// The formatting interface behind `gzprintf`. The facade formats into the scratch buffer this hands
-// it -- that is where its `VaList` handling ends -- and then commits the byte count.
+// The formatting interface behind `gzprintf`. The C shim in `crates/libz-rs-sys/csrc` formats into
+// the scratch region this hands it -- the one place a `va_list` is touched anywhere in the port --
+// and then commits the byte count through the facade's two hidden helpers.
 pub use crate::gz::printf::{
     printf_begin, printf_bytes, printf_commit, printf_with, PrintfScratch,
 };
 
-// -----------------------------------------------------------------------------
-//  Imports
-// -----------------------------------------------------------------------------
-
+// The `gz` subtree is the only part of `zlib-rs` permitted to name `std` (AAP §0.4.2.1), and the
+// crate is `#![no_std]`, so `std` is not in the extern prelude and each file in the subtree declares
+// it. This module needs it for `io::Error`, which is how the platform's own error text is obtained
+// in place of C's `strerror`.
+extern crate std;
 use core::ffi::{c_int, c_uint};
+use core::fmt::Write as _;
+
+use std::io;
 
 use crate::allocate::{Allocator, Buffer};
 use crate::deflate::{deflate_params, DeflateStream, Flush};
 use crate::error::ReturnCode;
 use crate::gz::read::gz_look;
 use crate::gz::write::{gz_comp, gz_zero};
-
-// -----------------------------------------------------------------------------
-//  Literals `gzerror` hands back
-// -----------------------------------------------------------------------------
 
 /// The message `gzerror` substitutes for `Z_MEM_ERROR` (`gzlib.c` L526).
 ///
@@ -222,13 +277,186 @@ const OUT_OF_MEMORY: &[u8] = b"out of memory";
 /// as the null pointer it returns for an unusable handle.
 const NO_MESSAGE: &[u8] = b"";
 
-// -----------------------------------------------------------------------------
-//  Integer conversions
-// -----------------------------------------------------------------------------
+/// Capacity of the fixed-size buffer an `errno` message is rendered into.
+///
+/// Sized so that no platform's error text can be truncated, because truncation would cut into the
+/// suffix [`errno_message`] has to remove. The longest glibc `strerror` string is under 60 bytes and
+/// the longest Windows `FormatMessage` text for a file-I/O error is around 120; 256 leaves room for
+/// the longest of those plus the ` (os error N)` suffix and still fits comfortably on the stack of
+/// an error path.
+const ERRNO_MESSAGE_CAPACITY: usize = 256;
+
+/// The literal `std` appends to an OS error's `Display`, up to the number.
+///
+/// `std` renders a raw-OS error as `"{error_string(code)} (os error {code})"`. Removing exactly this
+/// separator and everything after it therefore leaves `error_string(code)` -- which is what
+/// `strerror_r` produced -- and that is precisely `zstrerror()`.
+const OS_ERROR_SUFFIX: &[u8] = b" (os error ";
+
+/// The fallback text when the platform supplies none.
+///
+/// **zlib's own** fallback, not an invention: `gzguts.h` L135 defines `zstrerror()` as
+/// `"stdio error (consult errno)"` when `strerror` is unavailable. Reached only if the platform
+/// renders an empty string for the error number, which no supported target does.
+const NO_ERRNO_TEXT: &[u8] = b"stdio error (consult errno)";
+
+/// A short, heap-free rendering of an operating-system error: this port of `zstrerror()`.
+///
+/// `gzguts.h` L131-L133 defines `zstrerror()` as `strerror(errno)`, and `gz_error` copies the result
+/// into an allocated, path-prefixed message (`gzlib.c` L576-L584). This crate has no `libc`
+/// dependency, so the text comes from [`io::Error`]'s own `Display`, which `std` produces with
+/// `strerror_r` on unix and `FormatMessageW` on Windows.
+///
+/// # Why the buffer is fixed-size and on the stack
+///
+/// `String::from` and `format!` abort the process if the global allocator is exhausted, and the one
+/// moment a library is most likely to be out of memory is while it is reporting a failure.
+/// [`core::fmt::Write`] into a fixed buffer cannot fail, so a truncated message is the worst
+/// outcome -- and [`ERRNO_MESSAGE_CAPACITY`] is sized so that even that cannot happen for a real
+/// platform error string.
+///
+/// # Why the ` (os error N)` suffix is removed
+///
+/// `std` renders a raw-OS error as `error_string(code)` followed by `" (os error {code})"`, whereas
+/// C stops at `strerror(errno)`. Keeping the suffix would put text in `gzerror`'s return value that
+/// the reference implementation never puts there, and `gzerror`'s string is part of what a caller
+/// observes. So [`ErrnoMessage::strip_os_error_suffix`] takes it off again, leaving exactly the bytes
+/// `strerror` produced. This is a removal of *our own* addition, not a reinterpretation of the
+/// platform's text: `std` composes the two pieces itself and `error_string` is not separately
+/// exposed, so rendering-then-stripping is the only way to obtain the first piece alone.
+#[derive(Debug)]
+pub(crate) struct ErrnoMessage {
+    /// The rendered bytes. Only the first [`ErrnoMessage::len`] of them are meaningful.
+    bytes: [u8; ERRNO_MESSAGE_CAPACITY],
+    /// How much of [`ErrnoMessage::bytes`] has been written.
+    len: usize,
+}
+
+impl ErrnoMessage {
+    /// An empty message.
+    pub(crate) const fn new() -> Self {
+        Self {
+            bytes: [0; ERRNO_MESSAGE_CAPACITY],
+            len: 0,
+        }
+    }
+
+    /// The rendered text, as the bytes `gz_error` expects.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.bytes.get(..self.len).unwrap_or(&[])
+    }
+
+    /// Drops `std`'s ` (os error N)` suffix, leaving exactly what `strerror` returned.
+    ///
+    /// Two cases, and the second exists only for completeness:
+    ///
+    /// 1. the whole suffix is present, which is every real case, so the exact expected tail is
+    ///    matched and removed;
+    /// 2. the text was long enough to be truncated mid-suffix, in which case the last occurrence of
+    ///    [`OS_ERROR_SUFFIX`] is found and everything from it removed. Unreachable for any platform
+    ///    error string at [`ERRNO_MESSAGE_CAPACITY`], and handled anyway so that a partial
+    ///    ` (os erro` can never reach a caller.
+    ///
+    /// Leaves the message untouched when no suffix is present, which is what happens for an error
+    /// `std` synthesised rather than received from a syscall.
+    fn strip_os_error_suffix(&mut self, code: i32) {
+        // Case 1: the exact tail `std` would have appended.
+        let mut expected = Self::new();
+        // Cannot fail: `write_str` below always reports success, and the tail is far shorter than
+        // the buffer.
+        let _ = write!(expected, " (os error {code})");
+        let tail = expected.as_bytes();
+        if let Some(kept) = self.len.checked_sub(tail.len()) {
+            if self.bytes.get(kept..self.len) == Some(tail) {
+                self.len = kept;
+                return;
+            }
+        }
+
+        // Case 2: a truncated suffix. Search for the separator from the right.
+        let body = self.as_bytes();
+        let window = OS_ERROR_SUFFIX.len();
+        if let Some(limit) = body.len().checked_sub(window) {
+            for start in (0..=limit).rev() {
+                if body.get(start..start.saturating_add(window)) == Some(OS_ERROR_SUFFIX) {
+                    self.len = start;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+impl core::fmt::Write for ErrnoMessage {
+    /// Appends as much of `text` as fits, and reports success either way.
+    ///
+    /// Truncation is silent and deliberate: the alternative is for the formatting machinery to
+    /// report an error that the caller would have to handle on a path whose whole purpose is to
+    /// report a different error. A partial write stops at a `char` boundary so that the result stays
+    /// valid UTF-8, which matters because the facade publishes it as a C string.
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let room = ERRNO_MESSAGE_CAPACITY.saturating_sub(self.len);
+        // The largest prefix of `text` that fits without splitting a `char`.
+        let mut take = 0;
+        for (index, character) in text.char_indices() {
+            let end = index.saturating_add(character.len_utf8());
+            if end > room {
+                break;
+            }
+            take = end;
+        }
+        let Some(source) = text.as_bytes().get(..take) else {
+            return Ok(());
+        };
+        let end = self.len.saturating_add(take);
+        if let Some(destination) = self.bytes.get_mut(self.len..end) {
+            destination.copy_from_slice(source);
+            self.len = end;
+        }
+        Ok(())
+    }
+}
+
+/// Renders the message C would obtain from `zstrerror()`.
+///
+/// `error` is the failure just observed, when there is one. A [`GzIoError`] carrying a non-zero
+/// `errno` is rendered from that number, which is the most faithful and the most robust source: it
+/// is the value the failing call itself reported, whatever has happened to the thread's `errno`
+/// since.
+///
+/// With no error object -- `gzread`'s stall report at `gzread.c` L429, which C writes as a bare
+/// `zstrerror()` long after the read returned -- or with an `errno` the handle could not determine,
+/// the text comes from [`io::Error::last_os_error`]. That is precisely what C does at that line: it
+/// reads the thread's current `errno`, relying on nothing having overwritten it in between.
+///
+/// The result is `strerror`'s bytes and nothing else; see [`ErrnoMessage`] for why the suffix `std`
+/// adds is removed again. If the platform renders no text at all, [`NO_ERRNO_TEXT`] -- zlib's own
+/// `NO_STRERROR` fallback -- is substituted, so the message is never empty.
+pub(crate) fn errno_message(error: Option<GzIoError>) -> ErrnoMessage {
+    let source = match error {
+        Some(error) if error.errno != 0 => io::Error::from_raw_os_error(error.errno),
+        _ => io::Error::last_os_error(),
+    };
+    let mut message = ErrnoMessage::new();
+    // Cannot fail: `write_str` above always reports success.
+    let _ = write!(message, "{source}");
+    // `last_os_error` and `from_raw_os_error` both carry a number, so this is always `Some`; the
+    // `unwrap_or` covers a hypothetical error `std` synthesised, for which there is no suffix to
+    // remove and `strip_os_error_suffix` correctly finds none.
+    message.strip_os_error_suffix(source.raw_os_error().unwrap_or(0));
+    if message.len == 0 {
+        let fallback = NO_ERRNO_TEXT;
+        if let Some(destination) = message.bytes.get_mut(..fallback.len()) {
+            destination.copy_from_slice(fallback);
+            message.len = fallback.len();
+        }
+    }
+    message
+}
 
 /// Widens a C `unsigned` count into a `usize` index.
 ///
-/// Every target this port supports has `usize` at least as wide as `c_uint`, so the conversion is
+/// Every target this implementation supports has `usize` at least as wide as `c_uint`, so the conversion is
 /// exact. Saturating rather than panicking on a hypothetical narrower target is the conservative
 /// choice: a saturated value can only make a bounds check stricter, never looser. The same helper,
 /// with the same reasoning, appears in [`read`], [`write`] and [`state`].
@@ -245,19 +473,9 @@ fn to_count(value: usize) -> c_uint {
     c_uint::try_from(value).unwrap_or(c_uint::MAX)
 }
 
-// -----------------------------------------------------------------------------
-//  gz_error -- gzlib.c L549-L590
-// -----------------------------------------------------------------------------
-
 /// Records an error code and, optionally, a message; releases whatever was recorded before.
 ///
-/// The port of `gz_error` (`gzlib.c` L555-L590), whose own comment states the policy:
-///
-/// > Create an error message in allocated memory and set `state->err` and `state->msg` accordingly.
-/// > Free any previous error message already there. Do not try to free or allocate space if the
-/// > error is `Z_MEM_ERROR` (out of memory). Simply save the error message as a static string. If
-/// > there is an allocation failure constructing the error message, then convert the error to out of
-/// > memory.
+/// Implements `gz_error` (`gzlib.c` L555-L590), whose own comment states the policy.
 ///
 /// `ZLIB_INTERNAL` in C and listed in the `local:` block of `zlib.map` (L17), so it is `pub(crate)`
 /// here, is never `#[no_mangle]`, and is never re-exported from this module. The linker's
@@ -285,18 +503,15 @@ fn to_count(value: usize) -> c_uint {
 /// 5. **Build `"{path}: {msg}"`** (L575-L588). C allocates `strlen(path) + strlen(msg) + 3` bytes --
 ///    the two of `": "` plus the terminating NUL -- and formats `"%s%s%s"`.
 ///    [`GzState::try_set_prefixed_msg`] performs that concatenation, reserving exactly two extra
-///    bytes because this port carries a length rather than a NUL. A failed allocation becomes
+///    bytes because this implementation carries a length rather than a NUL. A failed allocation becomes
 ///    `Z_MEM_ERROR` with no message, which is C's L577-L580.
 ///
 /// # The one deviation from C's letter
 ///
-/// Step 1's guard cannot be reproduced, and does not need to be. C skips the `free` because a
-/// message recorded for `Z_MEM_ERROR` would be a static string rather than an allocation; this port
-/// stores an owned `Vec<u8>`, so releasing it is both correct and required, and the distinction is
-/// carried by the [`Option`] itself. [`GzState::clear_msg`] documents the same reasoning from the
-/// other side. The guard is unreachable in C in any case: step 4 is what would have stored a static
-/// string, and it stores nothing, so `err == Z_MEM_ERROR` together with a non-null `msg` never
-/// arises. The observable outcome -- no message, and the new code recorded -- is identical.
+/// Step 1's guard is not reproduced. C skips the `free` because a message recorded for
+/// `Z_MEM_ERROR` would be a static string rather than an allocation; here it is always an owned
+/// `Vec<u8>`, so releasing it is correct and required. The guard is unreachable in C in any case,
+/// since step 4 stores nothing, and the observable outcome is identical.
 ///
 /// # Allocation
 ///
@@ -345,22 +560,14 @@ pub(crate) fn gz_error<'a, A: Allocator<'a>>(
     }
 }
 
-// -----------------------------------------------------------------------------
-//  gz_intmax and GT_OFF -- gzlib.c L592-L609, gzguts.h L212-L216
-// -----------------------------------------------------------------------------
-
 /// The largest value a C `int` can hold.
 ///
-/// The port of `gz_intmax` (`gzlib.c` L596-L609), `ZLIB_INTERNAL` in C and listed in the `local:`
+/// Implements `gz_intmax` (`gzlib.c` L596-L609), `ZLIB_INTERNAL` in C and listed in the `local:`
 /// block of `zlib.map` (L18), hence `pub(crate)`.
 ///
-/// C returns `INT_MAX` when `<limits.h>` has provided it and otherwise computes it by doubling:
-///
-/// ```c
-/// unsigned p = 1, q;
-/// do { q = p; p <<= 1; p++; } while (p > q);
-/// return q >> 1;
-/// ```
+/// C returns `INT_MAX` when `<limits.h>` has provided it and otherwise computes the same value by
+/// doubling until it wraps (`gzlib.c` L600-L607). Rust guarantees `c_int::MAX`, so only the first
+/// branch has an analogue.
 ///
 /// Its comment explains why that loop exists rather than the obvious `((unsigned)-1) >> 1`: "we need
 /// to do this to cover cases where 2's complement not used, since C standard permits 1's complement
@@ -378,7 +585,7 @@ pub(crate) fn gz_intmax() -> c_uint {
 
 /// Whether an `unsigned` value is too large to be compared against a [`ZOff64`] safely.
 ///
-/// The port of the `GT_OFF` macro (`gzguts.h` L216):
+/// Implements the `GT_OFF` macro (`gzguts.h` L216):
 ///
 /// ```c
 /// #define GT_OFF(x) (sizeof(int) == sizeof(z_off64_t) && (x) > gz_intmax())
@@ -388,7 +595,7 @@ pub(crate) fn gz_intmax() -> c_uint {
 /// comparing unsigned to `z_off64_t`, which is signed (possible `z_off64_t` types `off_t`, `off64_t`,
 /// and `long` are all signed)".
 ///
-/// **On every target this port supports the first conjunct is false**, because [`ZOff64`] is 8 bytes
+/// **On every target this implementation supports the first conjunct is false**, because [`ZOff64`] is 8 bytes
 /// and a C `int` is 4, so the whole predicate is a compile-time constant `false` and the guard costs
 /// nothing. It is preserved rather than deleted because the comparisons it protects are C's: each of
 /// its three call sites -- [`read::gz_skip`], [`write::gz_zero`] and [`read::gzseek64`] -- writes
@@ -402,13 +609,9 @@ pub(crate) fn gt_off(value: c_uint) -> bool {
     size_of::<c_int>() == size_of::<ZOff64>() && value > gz_intmax()
 }
 
-// -----------------------------------------------------------------------------
-//  The public drivers
-// -----------------------------------------------------------------------------
-//
 //  Two conventions hold across all six, both following the precedent the sibling modules set:
 //
-//  * `Option<&mut GzState>` is this port's spelling of C's `gzFile file`, and [`None`] is
+//  * `Option<&mut GzState>` is this implementation's spelling of C's `gzFile file`, and [`None`] is
 //    `file == NULL`. The null test stays *here* rather than being left to the facade because each
 //    function has its own documented answer for it -- -1, 0, a null `const char *`, nothing at all,
 //    or `Z_STREAM_ERROR` -- and because a facade holding a `*mut GzState` produces exactly this
@@ -432,14 +635,7 @@ fn recorded_error<'a, A: Allocator<'a>>(state: &GzState<'a, A>) -> ReturnCode {
 
 /// Sets the size of the internal buffers, before any read or write allocates them.
 ///
-/// The port of `gzbuffer` (`gzlib.c` L322-L343), declared at `zlib.h` L1429 and documented at
-/// L1430-L1444:
-///
-/// > Set the internal buffer size used by this library's functions for file to size. The default
-/// > buffer size is 8192 bytes. This function must be called after `gzopen()` or `gzdopen()`, and
-/// > before any other calls that read or write the file. The buffer memory allocation is always
-/// > deferred to the first read or write. Three times that size in buffer space is allocated. [...]
-/// > The new buffer size also affects the maximum length for `gzprintf()`.
+/// Implements `gzbuffer` (`gzlib.c` L322-L343), declared at `zlib.h` L1429.
 ///
 /// "Three times that size" is the sum of the two allocations: the read path takes `want` for `in` and
 /// `want << 1` for `out`, and the write path takes `want << 1` for `in` and `want` for `out`
@@ -472,13 +668,11 @@ pub fn gzbuffer<'a, A: Allocator<'a>>(state: Option<&mut GzState<'a, A>>, size: 
         return -1;
     }
 
-    // L330-L331: `if (state->mode != GZ_READ && state->mode != GZ_WRITE) return -1;`
     if !state.has_valid_mode() {
         state.refresh_exposed();
         return -1;
     }
 
-    // L334-L335: `if (state->size != 0) return -1;`
     if state.size() != 0 {
         state.refresh_exposed();
         return -1;
@@ -492,10 +686,8 @@ pub fn gzbuffer<'a, A: Allocator<'a>>(state: Option<&mut GzState<'a, A>>, size: 
         return -1;
     }
 
-    // L340-L341: `if (size < 8) size = 8;`
     let size = size.max(8);
 
-    // L342-L343: `state->want = size; return 0;`
     state.set_want(size);
     state.refresh_exposed();
     0
@@ -503,16 +695,7 @@ pub fn gzbuffer<'a, A: Allocator<'a>>(state: Option<&mut GzState<'a, A>>, size: 
 
 /// Whether a read went past the end of the input and came up short.
 ///
-/// The port of `gzeof` (`gzlib.c` L498-L510), declared at `zlib.h` L1711 and documented at
-/// L1712-L1724:
-///
-/// > Return true (1) if the end-of-file indicator for file has been set while reading, false (0)
-/// > otherwise. Note that the end-of-file indicator is set only if the read tried to go past the end
-/// > of the input, but came up short. Therefore, just like `feof()`, `gzeof()` may return false even
-/// > if there is no more data to read, in the event that the last read request was for the exact
-/// > number of bytes remaining in the input file. [...] If `gzeof()` returns true, then the read
-/// > functions will return no more data, unless the end-of-file indicator is reset by `gzclearerr()`
-/// > and the input file has grown since the previous end of file was detected.
+/// Implements `gzeof` (`gzlib.c` L498-L510), declared at `zlib.h` L1711.
 ///
 /// So this reports `past`, not `eof`: `eof` records that the *file* ended, while `past` records that
 /// a caller's request could not be satisfied because of it (`gzread.c` L293-L294 and L347-L348).
@@ -535,7 +718,6 @@ pub fn gzeof<'a, A: Allocator<'a>>(state: Option<&mut GzState<'a, A>>) -> c_int 
         return 0;
     }
 
-    // L510: `return state->mode == GZ_READ ? state->past : 0;`
     let past = state.is_reading() && state.past();
     state.refresh_exposed();
     c_int::from(past)
@@ -543,15 +725,7 @@ pub fn gzeof<'a, A: Allocator<'a>>(state: Option<&mut GzState<'a, A>>) -> c_int 
 
 /// The message for the last error on this stream, and optionally its code.
 ///
-/// The port of `gzerror` (`gzlib.c` L513-L528), declared at `zlib.h` L1775 and documented at
-/// L1776-L1790:
-///
-/// > Return the error message for the last error which occurred on file. If `errnum` is not `NULL`,
-/// > `*errnum` is set to zlib error number. If an error occurred in the file system and not in the
-/// > compression library, `*errnum` is set to `Z_ERRNO` and the application may consult `errno` to
-/// > get the exact error code. [...] The application must not modify the returned string. Future
-/// > calls to this function may invalidate the previously returned string. If file is closed, then
-/// > the string previously returned by `gzerror` will no longer be available.
+/// Implements `gzerror` (`gzlib.c` L513-L528), declared at `zlib.h` L1775.
 ///
 /// # The three answers, all of which are distinct
 ///
@@ -581,19 +755,16 @@ pub fn gzerror<'s, 'a, A: Allocator<'a>>(
     state: Option<&'s mut GzState<'a, A>>,
     errnum: Option<&mut i32>,
 ) -> Option<&'s [u8]> {
-    // L517-L518: `if (file == NULL) return NULL;`
     let state = state?;
     if state.resync_from_exposed().is_err() {
         return None;
     }
 
-    // L520-L521: `if (state->mode != GZ_READ && state->mode != GZ_WRITE) return NULL;`
     if !state.has_valid_mode() {
         state.refresh_exposed();
         return None;
     }
 
-    // L524-L525: `if (errnum != NULL) *errnum = state->err;`
     if let Some(slot) = errnum {
         *slot = state.err();
     }
@@ -609,12 +780,7 @@ pub fn gzerror<'s, 'a, A: Allocator<'a>>(
 
 /// Clears the error and end-of-file indicators.
 ///
-/// The port of `gzclearerr` (`gzlib.c` L531-L547), declared at `zlib.h` L1792 and documented at
-/// L1793-L1797:
-///
-/// > Clear the error and end-of-file flags for file. This is analogous to the `clearerr()` function
-/// > in `stdio`. This is useful for continuing to read a gzip file that is being written
-/// > concurrently.
+/// Implements `gzclearerr` (`gzlib.c` L531-L547), declared at `zlib.h` L1792.
 ///
 /// `eof` and `past` are cleared only on a read stream (L544-L547), because neither means anything on
 /// a write stream; the error itself is cleared for both by `gz_error` with `Z_OK`, which also
@@ -635,30 +801,18 @@ pub fn gzclearerr<'a, A: Allocator<'a>>(state: Option<&mut GzState<'a, A>>) {
         return;
     }
 
-    // L543-L546: `if (state->mode == GZ_READ) { state->eof = 0; state->past = 0; }`
     if state.is_reading() {
         state.set_eof(false);
         state.set_past(false);
     }
 
-    // L547: `gz_error(state, Z_OK, NULL);`
     gz_error(state, ReturnCode::OK, None);
     state.refresh_exposed();
 }
 
 /// Whether the stream is being copied through untouched rather than decompressed.
 ///
-/// The port of `gzdirect` (`gzread.c` L627-L642), declared at `zlib.h` L1726 and documented at
-/// L1727-L1748:
-///
-/// > Return true (1) if file is being copied directly while reading, or false (0) if file is a gzip
-/// > stream being decompressed. If the input file is empty, `gzdirect()` will return true, since the
-/// > input does not contain a gzip stream. If `gzdirect()` is used immediately after `gzopen()` or
-/// > `gzdopen()` it will cause buffers to be allocated to allow reading the file to determine if it
-/// > is a gzip file. Therefore if `gzbuffer()` is used, it should be called before `gzdirect()`. If
-/// > the input is being written concurrently or the device is non-blocking, then `gzdirect()` may
-/// > give a different answer once four bytes of input have been accumulated, which is what is needed
-/// > to confirm or deny a gzip header. Before this, `gzdirect()` will return true (1).
+/// Implements `gzdirect` (`gzread.c` L627-L642), declared at `zlib.h` L1726.
 ///
 /// # ★ It has a side effect, and that is the point
 ///
@@ -686,7 +840,6 @@ pub fn gzclearerr<'a, A: Allocator<'a>>(state: Option<&mut GzState<'a, A>>) {
 /// dressed up as a question -- `gzbuffer` followed by a read is the way to do that deliberately.
 #[must_use]
 pub fn gzdirect<'a, A: Allocator<'a> + Copy>(state: Option<&mut GzState<'a, A>>) -> c_int {
-    // L631-L633: `if (file == NULL) return 0;`
     let Some(state) = state else {
         return 0;
     };
@@ -701,7 +854,6 @@ pub fn gzdirect<'a, A: Allocator<'a> + Copy>(state: Option<&mut GzState<'a, A>>)
         let _ = gz_look(state);
     }
 
-    // L641: `return state->direct == 1;`
     let direct = state.is_transparent();
     state.refresh_exposed();
     c_int::from(direct)
@@ -709,9 +861,9 @@ pub fn gzdirect<'a, A: Allocator<'a> + Copy>(state: Option<&mut GzState<'a, A>>)
 
 /// `deflateParams(strm, level, strategy)` with the `z_stream` view rebuilt around the layer's cursors.
 ///
-/// The port of `gzwrite.c` L659. C hands the compressor the address of the `z_stream` embedded in
+/// Implements `gzwrite.c` L659. C hands the compressor the address of the `z_stream` embedded in
 /// `gz_state` (`gzguts.h` L202), so the cursors and the five scalars are already where
-/// [`crate::deflate::deflate_params`] expects them; this port keeps the compression state and the
+/// [`crate::deflate::deflate_params`] expects them; this implementation keeps the compression state and the
 /// caller-visible scalars apart, so the view is assembled here, handed over and read back. The shape
 /// is [`write`]'s `deflate_once` deliberately: `deflateParams` can itself call `deflate(strm,
 /// Z_BLOCK)` to close an open block (`deflate.c` L791-L799), so it needs a real output window and a
@@ -805,14 +957,7 @@ fn params_once<'a, A: Allocator<'a>>(
 
 /// Changes the compression level and strategy for the input that follows.
 ///
-/// The port of `gzsetparams` (`gzwrite.c` L630-L664), declared at `zlib.h` L1445 and documented at
-/// L1446-L1454:
-///
-/// > Dynamically update the compression level and strategy for file. See the description of
-/// > `deflateInit2` for the meaning of these parameters. Previously provided data is flushed before
-/// > applying the parameter changes. `gzsetparams` returns `Z_OK` if success, `Z_STREAM_ERROR` if the
-/// > file was not opened for writing, `Z_ERRNO` if there is an error writing the flushed data, or
-/// > `Z_MEM_ERROR` if there is a memory allocation error.
+/// Implements `gzsetparams` (`gzwrite.c` L630-L664), declared at `zlib.h` L1445.
 ///
 /// # The six steps, in C's order
 ///
@@ -860,7 +1005,6 @@ pub fn gzsetparams<'a, A: Allocator<'a> + Copy>(
     level: i32,
     strategy: i32,
 ) -> ReturnCode {
-    // L636-L638: `if (file == NULL) return Z_STREAM_ERROR;`
     let Some(state) = state else {
         return ReturnCode::STREAM_ERROR;
     };
@@ -914,10 +1058,6 @@ pub fn gzsetparams<'a, A: Allocator<'a> + Copy>(
     ReturnCode::OK
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     // The crate denies the panic-prone lints in library code, which is the right policy there and
@@ -927,7 +1067,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
     use super::{
-        gt_off, gz_error, gz_intmax, gzbuffer, gzclearerr, gzdirect, gzeof, gzerror, gzsetparams,
+        errno_message, gt_off, gz_error, gz_intmax, gzbuffer, gzclearerr, gzdirect, gzeof, gzerror,
+        gzsetparams, ErrnoMessage, ERRNO_MESSAGE_CAPACITY, NO_ERRNO_TEXT, OS_ERROR_SUFFIX,
     };
     use crate::allocate::GlobalAllocator;
     use crate::config::{Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY, Z_FILTERED};
@@ -941,6 +1082,9 @@ mod tests {
     use alloc::vec::Vec;
     use core::cell::RefCell;
     use core::ffi::{c_int, c_uint};
+    // Needed for the `write!` calls that exercise `ErrnoMessage`; the parent's `use ... as _` is a
+    // private import and is not inherited by this module.
+    use core::fmt::Write as _;
 
     /// A file that lives in memory: reads from a fixed source, appends writes to a shared sink.
     ///
@@ -1032,10 +1176,6 @@ mod tests {
         state
     }
 
-    // -------------------------------------------------------------------------
-    //  gz_error
-    // -------------------------------------------------------------------------
-
     #[test]
     fn gz_error_prefixes_the_message_with_the_path() {
         let mut state = fresh();
@@ -1072,7 +1212,7 @@ mod tests {
     #[test]
     fn gz_error_clears_a_message_latched_with_an_out_of_memory_error() {
         // C's `if (state->err != Z_MEM_ERROR) free(state->msg);` skips the release for a message it
-        // believes to be a static string, then nulls the slot regardless. This port owns the
+        // believes to be a static string, then nulls the slot regardless. This implementation owns the
         // message, so the slot is emptied and the storage released together -- the observable
         // outcome, an empty slot and the new code recorded, is the same. The combination is
         // unreachable through `gz_error` itself (it stores nothing for `Z_MEM_ERROR`), so it is
@@ -1141,10 +1281,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  gz_intmax and gt_off
-    // -------------------------------------------------------------------------
-
     #[test]
     fn gz_intmax_is_the_c_int_maximum() {
         assert_eq!(gz_intmax(), c_uint::try_from(c_int::MAX).unwrap());
@@ -1159,10 +1295,6 @@ mod tests {
         assert!(!gt_off(gz_intmax()));
         assert!(!gt_off(c_uint::MAX));
     }
-
-    // -------------------------------------------------------------------------
-    //  gzbuffer
-    // -------------------------------------------------------------------------
 
     #[test]
     fn gzbuffer_rejects_a_missing_stream() {
@@ -1222,10 +1354,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  gzeof
-    // -------------------------------------------------------------------------
-
     #[test]
     fn gzeof_reports_past_on_a_read_stream() {
         let mut state = fresh();
@@ -1257,10 +1385,6 @@ mod tests {
         state.set_past(true);
         assert_eq!(gzeof(Some(&mut state)), 0);
     }
-
-    // -------------------------------------------------------------------------
-    //  gzerror and gzclearerr
-    // -------------------------------------------------------------------------
 
     #[test]
     fn gzerror_returns_the_stored_message_and_the_code() {
@@ -1346,10 +1470,6 @@ mod tests {
         assert_eq!(state.err(), ReturnCode::DATA_ERROR.as_i32());
     }
 
-    // -------------------------------------------------------------------------
-    //  gzdirect
-    // -------------------------------------------------------------------------
-
     #[test]
     fn gzdirect_reports_true_for_an_empty_input() {
         // "If the input file is empty, gzdirect() will return true, since the input does not contain
@@ -1401,10 +1521,6 @@ mod tests {
         state.set_direct(-1);
         assert_eq!(gzdirect(Some(&mut state)), 0);
     }
-
-    // -------------------------------------------------------------------------
-    //  gzsetparams
-    // -------------------------------------------------------------------------
 
     #[test]
     fn gzsetparams_rejects_anything_but_a_healthy_write_stream() {
@@ -1559,5 +1675,123 @@ mod tests {
         assert_eq!(state.strategy(), Z_FILTERED);
         assert_eq!(state.size(), 0);
         assert!(sink.borrow().is_empty());
+    }
+    // -------------------------------------------------------------------------
+    //  zstrerror(): the message a caller reads back must be the platform's own
+    // -------------------------------------------------------------------------
+
+    /// The rendered message is exactly `strerror`'s bytes, with no ` (os error N)` tail.
+    ///
+    /// C's `gz_error(state, Z_ERRNO, zstrerror())` stores `strerror(errno)` and nothing more
+    /// (`gzguts.h` L131-L133), and `gzerror` hands that string straight back to a caller. `std`
+    /// composes its `Display` as `error_string(code)` plus that suffix, so the suffix has to come
+    /// off again -- this asserts that it does, for a spread of real error numbers.
+    #[test]
+    fn the_errno_message_carries_no_os_error_suffix() {
+        // ENOENT, EACCES, EBADF, EINVAL, ENOSPC on unix; whatever the platform maps them to
+        // elsewhere. The point is not which text comes back but that no suffix is attached to it.
+        for errno in [1, 2, 5, 9, 13, 22, 28] {
+            let message = errno_message(Some(GzIoError::new(errno, false)));
+            let bytes = message.as_bytes();
+            assert!(
+                !bytes.is_empty(),
+                "errno {errno} must render some text, never an empty message"
+            );
+            assert!(
+                !contains(bytes, OS_ERROR_SUFFIX),
+                "errno {errno} rendered {:?}, which still carries std's suffix",
+                core::str::from_utf8(bytes)
+            );
+            // And what remains is the leading part of what std would have produced, so the wording
+            // is the platform's rather than something this crate invented.
+            let full = alloc::format!("{}", std::io::Error::from_raw_os_error(errno));
+            assert!(
+                full.as_bytes().starts_with(bytes),
+                "errno {errno}: {:?} is not a prefix of {full:?}",
+                core::str::from_utf8(bytes)
+            );
+        }
+    }
+
+    /// Whether `needle` occurs anywhere in `haystack`; `[u8]::contains` matches a single byte only.
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    /// With no error object the text comes from the thread's current `errno`, as C's bare
+    /// `zstrerror()` does (`gzread.c` L429).
+    #[test]
+    fn the_errno_message_falls_back_to_the_threads_errno() {
+        // Provoke a real failure so the thread's errno is set to something meaningful.
+        let _ = std::fs::File::open("/nonexistent/zlib-rs/errno/probe");
+        let message = errno_message(None);
+        assert!(!message.as_bytes().is_empty());
+        assert!(!contains(message.as_bytes(), OS_ERROR_SUFFIX));
+    }
+
+    /// An error number the platform has no text for still yields a message, never an empty one.
+    ///
+    /// zlib has the same requirement and the same answer: `gzguts.h` L135 defines `zstrerror()` as
+    /// `"stdio error (consult errno)"` when no `strerror` is available.
+    #[test]
+    fn an_unrenderable_errno_falls_back_to_zlibs_own_wording() {
+        let message = errno_message(Some(GzIoError::new(i32::MAX, false)));
+        let bytes = message.as_bytes();
+        assert!(!bytes.is_empty());
+        assert!(!contains(bytes, OS_ERROR_SUFFIX));
+        // Either the platform produced something, or the documented fallback was substituted.
+        let rendered = alloc::format!("{}", std::io::Error::from_raw_os_error(i32::MAX));
+        assert!(
+            rendered.as_bytes().starts_with(bytes) || bytes == NO_ERRNO_TEXT,
+            "unexpected text {:?}",
+            core::str::from_utf8(bytes)
+        );
+    }
+
+    /// The buffer truncates rather than failing, and never splits a `char`.
+    #[test]
+    fn the_message_buffer_truncates_instead_of_failing() {
+        let mut message = ErrnoMessage::new();
+        for _ in 0..(ERRNO_MESSAGE_CAPACITY / 10 + 4) {
+            write!(message, "0123456789").unwrap();
+        }
+        assert_eq!(message.as_bytes().len(), ERRNO_MESSAGE_CAPACITY);
+        // A multi-byte character is never split.
+        let mut narrow = ErrnoMessage::new();
+        for _ in 0..(ERRNO_MESSAGE_CAPACITY) {
+            write!(narrow, "é").unwrap();
+        }
+        assert_eq!(narrow.as_bytes().len() % 2, 0);
+        assert!(core::str::from_utf8(narrow.as_bytes()).is_ok());
+    }
+
+    /// A message truncated mid-suffix loses the whole partial suffix, not just part of it.
+    ///
+    /// Unreachable for a real platform string at this capacity, and asserted anyway so that a
+    /// dangling ` (os erro` can never reach `gzerror`.
+    #[test]
+    fn a_truncated_suffix_is_removed_whole() {
+        let mut message = ErrnoMessage::new();
+        let filler = ERRNO_MESSAGE_CAPACITY - OS_ERROR_SUFFIX.len() - 2;
+        for _ in 0..filler {
+            write!(message, "x").unwrap();
+        }
+        // Now write the suffix so that it is cut short by the capacity.
+        write!(message, " (os error 12345)").unwrap();
+        assert_eq!(message.as_bytes().len(), ERRNO_MESSAGE_CAPACITY);
+        message.strip_os_error_suffix(12_345);
+        assert_eq!(message.as_bytes().len(), filler);
+        assert!(!contains(message.as_bytes(), b" ("));
+    }
+
+    /// Text with no suffix at all is left exactly as it was.
+    #[test]
+    fn text_without_a_suffix_is_untouched() {
+        let mut message = ErrnoMessage::new();
+        write!(message, "plain failure").unwrap();
+        message.strip_os_error_suffix(7);
+        assert_eq!(message.as_bytes(), b"plain failure");
     }
 }

@@ -1,4 +1,4 @@
-//! One-shot compression of a whole buffer: the port of `compress.c`.
+//! One-shot compression of a whole buffer: the Rust counterpart of `compress.c`.
 //!
 //! Six entry points sit on top of the streaming encoder, and only one of them
 //! contains any logic. `compress2_z` (`compress.c` L24-L66) drives [`deflate`]
@@ -43,7 +43,7 @@
 //! is changed, then this function needs to be updated." Since every function
 //! here uses the `deflateInit` defaults, the formula is valid as written. That is
 //! also why [`compress2_z`] takes a level rather than a whole
-//! [`DeflateConfig`](crate::config::DeflateConfig): accepting one would let a
+//! [`crate::config::DeflateConfig`]: accepting one would let a
 //! caller pick a configuration the bound is not valid for, and the mismatch
 //! would surface as a silent overflow in *their* code.
 //!
@@ -87,7 +87,7 @@
 //!   saturation is the facade's.
 //! * `stream.zalloc`, `stream.zfree` and `stream.opaque` are zeroed at L38-L40,
 //!   which selects the library's internal allocator. That is
-//!   [`GlobalAllocator`], the port of `zcalloc`/`zcfree`, and it is wired in
+//!   [`GlobalAllocator`], the Rust counterpart of `zcalloc`/`zcfree`, and it is wired in
 //!   unconditionally: these six functions are not generic over the allocator
 //!   because the C functions they mirror offer callers no way to supply one.
 //!
@@ -107,10 +107,10 @@
 //! # The interface this module consumes
 //!
 //! Four items come from [`crate::deflate`], and they are the whole of this
-//! module's coupling to the encoder: [`deflate_init`] (the port of `deflateInit`,
+//! module's coupling to the encoder: [`deflate_init`] (the Rust counterpart of `deflateInit`,
 //! `deflate.c` L379-L384), [`DeflateStream`] (the caller-visible half of
 //! `z_stream`, the compression-side counterpart of
-//! [`InflateStream`](crate::inflate::InflateStream)), [`deflate`] (the driver,
+//! [`crate::inflate::InflateStream`]), [`deflate`] (the driver,
 //! `deflate.c` L981-L1292) and [`deflate_end`] (`deflate.c` L1293-L1310). They
 //! are used in exactly one function, [`compress2_z`], and in the same order C
 //! uses them.
@@ -129,7 +129,7 @@
 //! deflate_end(DeflateState<'_, A>) -> ReturnCode
 //! ```
 //!
-//! These mirror `inflate_init`, [`InflateStream`](crate::inflate::InflateStream),
+//! These mirror `inflate_init`, [`crate::inflate::InflateStream`],
 //! `inflate` and `inflate_end` one for one, which is deliberate: the two one-shot
 //! wrappers are read side by side, and the encoder's driver has to group the same
 //! nine pieces of caller state the decoder's does -- `clippy.toml` caps a function
@@ -138,16 +138,21 @@
 //!
 //! # Examples
 //!
-//! ```ignore
+//! ```
+//! use zlib_rs::compress::{compress2_z, compress_bound_z};
+//! use zlib_rs::ReturnCode;
+//!
 //! let plain = b"hello, hello!";
 //!
 //! // Size the destination the way `zlib.h` L1298-L1299 instructs.
-//! let mut buffer = vec![0_u8; compress_bound_z(plain.len())];
-//! let report = compress2_z(&mut buffer, plain, 9);
+//! let mut buffer = [0_u8; 64];
+//! let room = compress_bound_z(plain.len());
+//! assert!(room <= buffer.len());
+//! let report = compress2_z(&mut buffer[..room], plain, 9);
 //!
 //! assert_eq!(report.code, ReturnCode::OK);
 //! assert_eq!(report.produced, 18);
-//! assert!(report.produced <= compress_bound_z(plain.len()));
+//! assert!(report.produced <= room);
 //!
 //! // A destination one byte short of the whole stream still reports how far it
 //! // got, because the count is published before the status is translated.
@@ -156,6 +161,30 @@
 //! assert_eq!(report.code, ReturnCode::BUF_ERROR);
 //! assert_eq!(report.produced, 17);
 //! ```
+//!
+//! # Provenance
+//!
+//! The one-shot compression wrappers.
+//!
+//! Ported from `compress.c`: `compress`, `compress2`, `compressBound` and their `_z`
+//! `size_t`-aware forms, which are the primary implementations.
+//!
+//! [`deflate_end`]: crate::deflate::deflate_end
+//! [`deflate_init`]: crate::deflate::deflate_init
+
+// The definitions closing the module documentation above are link-reference definitions, not
+// prose: a module whose `mod` declaration carries an outer doc comment has its `//!` block
+// resolved in the scope of the DECLARING module, so an unqualified sibling name does not
+// resolve. See "Documentation lints" in `src/lib.rs` for the rule and the gate.
+
+// Names that repeat their module's name are deliberate here: the C sources this module ports name
+// these entry points, and `crates/zlib-rs/src/lib.rs` re-exports several of them under exactly
+// these names, so renaming any of them to satisfy `clippy::module_name_repetitions` would cost the
+// traceability the port is judged on. The lint sits in `pedantic`, which this workspace denies, and
+// it fires on the declared 1.80 floor; upstream has since reclassified it, so the allowance is what
+// keeps the same lint gate passing on both toolchains. The same relaxation, for the same reason,
+// already appears in `config.rs`, `deflate/**`, `inflate/**` and `gz/**`.
+#![allow(clippy::module_name_repetitions)]
 
 use crate::allocate::GlobalAllocator;
 use crate::config::{Flush, Z_DEFAULT_COMPRESSION};
@@ -177,7 +206,7 @@ const _: () = assert!(
 
 /// The largest number of bytes handed to the encoder in one call.
 ///
-/// Ported from `const uInt max = (uInt)-1` (`compress.c` L28). `uInt` is C's
+/// Mirrors `const uInt max = (uInt)-1` (`compress.c` L28). `uInt` is C's
 /// `unsigned int`, so the value is 32 bits of ones: the widest `avail_in` or
 /// `avail_out` a `z_stream` can express. It exists because `z_size_t` is 64 bits
 /// wide on LP64 while `avail_in` and `avail_out` are not, so a buffer larger than
@@ -219,7 +248,7 @@ pub struct Compressed {
 
 /// Compresses `source` into `dest` at `level`, reporting how much was produced.
 ///
-/// The port of `compress2_z` (`compress.c` L24-L66), declared at `zlib.h` L1291.
+/// The Rust counterpart of `compress2_z` (`compress.c` L24-L66), declared at `zlib.h` L1291.
 /// This is the only entry point in the module with a body; the other three
 /// delegate to it, directly or through each other.
 ///
@@ -286,7 +315,7 @@ pub struct Compressed {
 /// `deflateInit` runs, so a failure there leaves the caller's `*destLen` at zero.
 /// That is the opposite of [`uncompress2_z`](crate::uncompress::uncompress2_z),
 /// which returns its entry values on the same path, and the asymmetry is in the
-/// two C functions rather than in this port.
+/// two C functions rather than in this implementation.
 ///
 /// # The zero-length destination
 ///
@@ -295,7 +324,7 @@ pub struct Compressed {
 /// [`ReturnCode::BUF_ERROR`]. That holds even for an empty `source`, because the
 /// shortest zlib stream is still eight bytes long -- measured against the
 /// reference, which answers `Z_BUF_ERROR` for an empty source into a zero-length
-/// destination. A port that special-cased the empty source into
+/// destination. An implementation that special-cased the empty source into
 /// [`ReturnCode::OK`] would produce no stream and claim success.
 pub fn compress2_z(dest: &mut [u8], source: &[u8], level: i32) -> Compressed {
     // Captured before the first reborrow of `dest`, and the origin of every bound
@@ -421,7 +450,7 @@ pub fn compress2_z(dest: &mut [u8], source: &[u8], level: i32) -> Compressed {
             break err;
         }
 
-        // The termination invariant, in the debug-only form this port uses for
+        // The termination invariant, in the debug-only form this implementation uses for
         // C's `Assert`. An iteration that continues must have moved a cursor, or
         // else have run the output window dry -- in which case the next iteration
         // either takes a fresh chunk from `left` or meets `deflate`'s
@@ -466,7 +495,7 @@ pub fn compress2_z(dest: &mut [u8], source: &[u8], level: i32) -> Compressed {
 
 /// Compresses `source` into `dest` at `level`, reporting how much was produced.
 ///
-/// The port of `compress2` (`compress.c` L67-L74), declared at `zlib.h` L1288.
+/// The Rust counterpart of `compress2` (`compress.c` L67-L74), declared at `zlib.h` L1288.
 /// C's body widens the caller's `uLong` destination length to `z_size_t`, calls
 /// [`compress2_z`], and narrows the result back.
 ///
@@ -482,7 +511,7 @@ pub fn compress2(dest: &mut [u8], source: &[u8], level: i32) -> Compressed {
 
 /// Compresses `source` into `dest` at the default level.
 ///
-/// The port of `compress_z` (`compress.c` L77-L81), declared at `zlib.h` L1273:
+/// The Rust counterpart of `compress_z` (`compress.c` L77-L81), declared at `zlib.h` L1273:
 /// [`compress2_z`] with [`Z_DEFAULT_COMPRESSION`], which `deflateInit` resolves
 /// to level 6.
 pub fn compress_z(dest: &mut [u8], source: &[u8]) -> Compressed {
@@ -491,7 +520,7 @@ pub fn compress_z(dest: &mut [u8], source: &[u8]) -> Compressed {
 
 /// Compresses `source` into `dest` at the default level.
 ///
-/// The port of `compress` (`compress.c` L82-L85), declared at `zlib.h` L1271.
+/// The Rust counterpart of `compress` (`compress.c` L82-L85), declared at `zlib.h` L1271.
 /// This is the entry point most callers use -- `test/example.c` L71 among them --
 /// and the prose at `zlib.h` L1275-L1286 is written about it. `zlib.h` L1280-L1281
 /// states the equivalence this function implements: "`compress()` is equivalent
@@ -510,7 +539,7 @@ pub fn compress(dest: &mut [u8], source: &[u8]) -> Compressed {
 
 /// An upper bound on the compressed size of `source_len` bytes.
 ///
-/// The port of `compressBound_z` (`compress.c` L91-L95), declared at `zlib.h`
+/// The Rust counterpart of `compressBound_z` (`compress.c` L91-L95), declared at `zlib.h`
 /// L1308. `zlib.h` L1310-L1312: it "returns an upper bound on the compressed size
 /// after `compress()` or `compress2()` on `sourceLen` bytes. It would be used
 /// before a `compress()` or `compress2()` call to allocate the destination
@@ -559,7 +588,9 @@ pub fn compress(dest: &mut [u8], source: &[u8]) -> Compressed {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
+/// use zlib_rs::compress::compress_bound_z;
+///
 /// assert_eq!(compress_bound_z(0), 13);
 /// assert_eq!(compress_bound_z(4096), 4096 + 1 + 13);
 /// assert_eq!(compress_bound_z(usize::MAX), usize::MAX);
@@ -584,7 +615,7 @@ pub const fn compress_bound_z(source_len: usize) -> usize {
 
 /// An upper bound on the compressed size of `source_len` bytes.
 ///
-/// The port of `compressBound` (`compress.c` L96-L99), declared at `zlib.h`
+/// The Rust counterpart of `compressBound` (`compress.c` L96-L99), declared at `zlib.h`
 /// L1307. C's body computes the bound in the `z_size_t` domain and then narrows:
 ///
 /// ```text
@@ -598,7 +629,7 @@ pub const fn compress_bound_z(source_len: usize) -> usize {
 /// [`compress_bound_z`] under its other name. The saturation only has anything to
 /// do on a target where `uLong` is narrower than `z_size_t` -- LLP64 Windows,
 /// where `unsigned long` is 32 bits and `size_t` is 64 -- and there it is
-/// `crates/libz-rs-sys/src/compress.rs` that must convert the argument from
+/// the planned `crates/libz-rs-sys/src/compress.rs` that must convert the argument from
 /// `c_ulong`, call this function, and answer `c_ulong::MAX` when the result does
 /// not fit back. Hard-coding either width here would be wrong on the other one.
 ///
@@ -611,10 +642,6 @@ pub const fn compress_bound(source_len: usize) -> usize {
     compress_bound_z(source_len)
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-//
 // Every expectation below was MEASURED against the reference implementation --
 // the in-tree C sources built as `libz.a` -- by calling `compress2_z` or
 // `compressBound_z` on the same fixture and recording the resulting
@@ -627,16 +654,21 @@ pub const fn compress_bound(source_len: usize) -> usize {
 //
 // Byte-for-byte equality against the C encoder across the whole
 // level x windowBits x memLevel x strategy x flush matrix is
-// `crates/zlib-rs-differential/tests/byte_identical.rs`'s job. What this module
+// the planned `crates/zlib-rs-differential/tests/byte_identical.rs`'s job. What this module
 // owns is the wrapper: the bound arithmetic, the chunking loop's shape, the
 // accounting, and the four status outcomes. The fixtures here are exact output
 // bytes even so, because for the `deflateInit` defaults they cost nothing and
 // they catch a wrapper bug -- a dropped `adler`, a mis-ordered top-up, a wrong
 // flush selector -- immediately and locally.
 //
-// `clippy.toml` sets `allow-unwrap-in-tests`, `allow-expect-in-tests`,
-// `allow-panic-in-tests` and `allow-indexing-slicing-in-tests`, so assertions
-// here may index and panic; nothing above this line may.
+// `clippy.toml` sets `allow-unwrap-in-tests`, `allow-expect-in-tests` and
+// `allow-panic-in-tests`, so assertions here may panic; nothing above this line
+// may.
+// Fixture indexing: every index below is a literal into a fixture this module just built,
+// so each one is provably in range. `clippy::indexing_slicing` is denied workspace-wide and
+// is relaxed HERE ONLY, on the test module -- not through a clippy.toml key, which would be a
+// field the 1.80 floor does not recognise and would abort the whole lint run.
+#[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
     use super::{
@@ -651,10 +683,6 @@ mod tests {
     use crate::uncompress::uncompress2_z;
     use alloc::vec;
     use alloc::vec::Vec;
-
-    // -------------------------------------------------------------------------
-    //  Fixtures
-    // -------------------------------------------------------------------------
 
     /// The payload `test/example.c` L35 uses. "'hello world' would be more
     /// standard, but the repeated 'hello' exercises the compression code better",
@@ -809,20 +837,12 @@ mod tests {
         assert_eq!(&plain[..back.produced], source, "level {level}");
     }
 
-    // -------------------------------------------------------------------------
-    //  The chunk cap
-    // -------------------------------------------------------------------------
-
     /// [`MAX_CHUNK`] is `(uInt)-1`, and it must stay representable as a `usize`.
     #[test]
     fn chunk_cap_matches_the_reference() {
         assert_eq!(MAX_CHUNK, 4_294_967_295);
         assert_eq!(u64::try_from(MAX_CHUNK).unwrap(), u64::from(u32::MAX));
     }
-
-    // -------------------------------------------------------------------------
-    //  compressBound_z  --  measured, digit for digit
-    // -------------------------------------------------------------------------
 
     /// The reference's own answers for twenty lengths spanning every shift
     /// threshold. `13`, `4096`, `16384` and `1 << 25` are the points at which the
@@ -951,10 +971,6 @@ mod tests {
             assert_eq!(compress_bound(source_len), compress_bound_z(source_len));
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  Successful compressions  (C: ret = 0)
-    // -------------------------------------------------------------------------
 
     /// The four levels the agent brief names, byte for byte. Measured:
     /// `0 / 24`, `0 / 18`, `0 / 18`, `0 / 18`.
@@ -1093,10 +1109,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  The empty source
-    // -------------------------------------------------------------------------
-
     /// An empty source is a real corpus case, and it produces a real stream:
     /// eight bytes at the default level, eleven at level 0. Measured.
     #[test]
@@ -1125,15 +1137,11 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  Z_BUF_ERROR  (C: ret = -5)
-    // -------------------------------------------------------------------------
-
     /// ★ A destination one byte short of the whole stream reports
     /// [`ReturnCode::BUF_ERROR`] together with **every byte that did fit** --
     /// measured: `-5 / 17` for an 18-byte stream, not `-5 / 0`. `compress.c` L63
     /// assigns the count before L65 translates the status, so the count is
-    /// meaningful on failure; a port that reported zero here would look tidier and
+    /// meaningful on failure; an implementation that reported zero here would look tidier and
     /// would be wrong.
     #[test]
     fn destination_one_byte_short_reports_buf_error_with_the_partial_count() {
@@ -1183,10 +1191,6 @@ mod tests {
         assert_report(report, ReturnCode::BUF_ERROR, 0);
     }
 
-    // -------------------------------------------------------------------------
-    //  Z_STREAM_ERROR  (C: ret = -2)
-    // -------------------------------------------------------------------------
-
     /// An invalid level is rejected by `deflateInit` and forwarded verbatim, with
     /// a zero count because `compress.c` L36 clears the out-parameter first.
     /// Measured for -3, -2 and 10; extended here to the extremes of `i32`, which
@@ -1209,10 +1213,6 @@ mod tests {
             assert_eq!(report.code, ReturnCode::OK, "level {level}: {report:?}");
         }
     }
-
-    // -------------------------------------------------------------------------
-    //  Larger inputs: the loop, the window slide, and the carried check value
-    // -------------------------------------------------------------------------
 
     /// 1000 identical bytes, byte for byte at the three levels whose output was
     /// measured. A long run is the shortest input that forces a match longer than

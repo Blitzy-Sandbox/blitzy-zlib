@@ -38,12 +38,13 @@
 //!
 //! # About the name
 //!
-//! Despite the name inherited from the port's module plan, there is nothing "weak" or
+//! Despite the name inherited from this implementation's module plan, there is nothing "weak" or
 //! unchecked here. [`WeakSlice`] and [`WeakSliceMut`] are a *borrow plus an integer cursor* —
 //! never a pointer plus a length. Every accessor in this module is bounds checked, returns
 //! [`Option`] (or a `bool`) instead of panicking, and the module contains no `unsafe` code,
 //! no raw pointers and no unchecked indexing. The crate root asserts
-//! `#![forbid(unsafe_code)]`, so that is a compiler-enforced property rather than a claim.
+//! `#![forbid(unsafe_code)]` and the workspace lint table denies `clippy::indexing_slicing`,
+//! so the first and third of those are machine-enforced rather than claimed.
 //!
 //! # Buffer ownership
 //!
@@ -73,8 +74,38 @@
 //!   layouts changes the emitted bytes.
 //! * No two-bytes-at-a-time comparison helper is offered. Word-at-a-time `scan_end`
 //!   matching is the `#ifdef UNALIGNED_OK` variant (`deflate.c` L1446-L1478), a different
-//!   code path from the default byte-comparison branch at L1482-L1485 that this port
+//!   code path from the default byte-comparison branch at L1482-L1485 that this implementation
 //!   reproduces.
+//!
+//! # Provenance
+//!
+//! The sliding window, the hash chains and the pending buffer, as borrow-checked views.
+//!
+//! Ported from the `deflate_state` buffer members (`deflate.h`) and the pointer walks in
+//! `deflate.c`. The views hand out the disjoint sub-slices the match finder needs without
+//! reintroducing the aliasing that the raw-pointer original depends on.
+//!
+//! [`PendingBuf::split_at_symbol_cursor`]: crate::weak_slice::PendingBuf::split_at_symbol_cursor
+//! [`WeakSlice`]: crate::weak_slice::WeakSlice
+//! [`WeakSliceMut`]: crate::weak_slice::WeakSliceMut
+//! [`Window::free_space_mut`]: crate::weak_slice::Window::free_space_mut
+//! [`Window::initialize_win_init_tail`]: crate::weak_slice::Window::initialize_win_init_tail
+//! [`Window::scan_pair`]: crate::weak_slice::Window::scan_pair
+//! [`Window::slide_down`]: crate::weak_slice::Window::slide_down
+
+// The definitions closing the module documentation above are link-reference definitions, not
+// prose: a module whose `mod` declaration carries an outer doc comment has its `//!` block
+// resolved in the scope of the DECLARING module, so an unqualified sibling name does not
+// resolve. See "Documentation lints" in `src/lib.rs` for the rule and the gate.
+
+// Names that repeat their module's name are deliberate here: the C sources this module ports name
+// these entry points, and `crates/zlib-rs/src/lib.rs` re-exports several of them under exactly
+// these names, so renaming any of them to satisfy `clippy::module_name_repetitions` would cost the
+// traceability the port is judged on. The lint sits in `pedantic`, which this workspace denies, and
+// it fires on the declared 1.80 floor; upstream has since reclassified it, so the allowance is what
+// keeps the same lint gate passing on both toolchains. The same relaxation, for the same reason,
+// already appears in `config.rs`, `deflate/**`, `inflate/**` and `gz/**`.
+#![allow(clippy::module_name_repetitions)]
 
 /// Tail of the hash chains, and therefore also the "no match here" sentinel.
 ///
@@ -280,7 +311,7 @@ impl From<Pos> for usize {
 /// parameter passing" (`deflate.h` L100-L102). It is the type of `longest_match`'s
 /// `cur_match` argument (`deflate.c` L1389), of `hash_head` in `deflate_fast` and
 /// `deflate_slow`, and of `prev_match` (`deflate.h` L164). `unsigned` is 32 bits on every
-/// target this port supports, so the Rust mirror is a `u32`.
+/// target this implementation supports, so the Rust mirror is a `u32`.
 ///
 /// [`NIL`] means the same thing here as it does for [`Pos`], because an `IPos` is produced
 /// by reading a hash-chain entry.
@@ -490,12 +521,10 @@ impl<'a, T> WeakSlice<'a, T> {
     #[must_use]
     #[inline]
     pub fn remainder(&self) -> &'a [T] {
-        match self.items.get(self.offset..) {
-            Some(tail) => tail,
-            // Unreachable: every mutator rejects an offset past the end. Yielding an empty
-            // slice keeps this accessor total rather than introducing a panic path.
-            None => &[],
-        }
+        // The `None` arm is unreachable: every mutator rejects an offset past the end.
+        // `unwrap_or_default` yields an empty slice there, which keeps this accessor total
+        // rather than introducing a panic path.
+        self.items.get(self.offset..).unwrap_or_default()
     }
 
     /// `count` elements starting at the cursor, or [`None`] when fewer remain.
@@ -624,12 +653,10 @@ impl<'a, T> WeakSliceMut<'a, T> {
     /// The elements from the cursor to the end, for writing.
     #[inline]
     pub fn remainder_mut(&mut self) -> &mut [T] {
-        match self.items.get_mut(self.offset..) {
-            Some(tail) => tail,
-            // Unreachable: every mutator rejects an offset past the end. Yielding an empty
-            // slice keeps this accessor total rather than introducing a panic path.
-            None => &mut [],
-        }
+        // The `None` arm is unreachable: every mutator rejects an offset past the end.
+        // `unwrap_or_default` yields an empty slice there, which keeps this accessor total
+        // rather than introducing a panic path.
+        self.items.get_mut(self.offset..).unwrap_or_default()
     }
 
     /// Splits the borrowed slice at `mid`, or [`None`] when `mid` is past the end.
@@ -827,7 +854,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Window<S> {
     /// arithmetic on a bound established once, rather than re-checking every byte. Only the
     /// byte-at-a-time branch of the reference comparison (`deflate.c` L1482-L1485) is
     /// supported by design; the `UNALIGNED_OK` word-at-a-time variant (L1446-L1478) is a
-    /// different code path and is not part of this port.
+    /// different code path and is not part of this implementation.
     #[must_use]
     #[inline]
     pub fn scan_pair(&self, scan: usize, candidate: usize, len: usize) -> Option<(&[u8], &[u8])> {
@@ -841,7 +868,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Window<S> {
     /// `more = window_size - lookahead - strstart` (`deflate.c` L260).
     ///
     /// Saturates at zero instead of wrapping. The C code's `more == (unsigned)(-1)` special
-    /// case (`deflate.c` L274-L279) exists only for 16-bit `int` targets, which this port
+    /// case (`deflate.c` L274-L279) exists only for 16-bit `int` targets, which this implementation
     /// does not support, so the underflow it works around cannot arise here.
     #[must_use]
     #[inline]
@@ -990,7 +1017,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Window<S> {
 
     /// Zeroes the bytes past the end of the data that the match routines may read.
     ///
-    /// A faithful port of `fill_window`'s tail (`deflate.c` L347-L372), including both
+    /// A faithful a mirror of `fill_window`'s tail (`deflate.c` L347-L372), including both
     /// branches and the `window_size` clamp. Its purpose, per the comment at
     /// `deflate.c` L340-L346: the match routines "allow scanning to `strstart + MAX_MATCH`,
     /// ignoring lookahead", so [`WIN_INIT`] bytes past the data are zeroed to avoid reading
@@ -1234,7 +1261,7 @@ impl<S: AsRef<[u16]> + AsMut<[u16]>> HashChains<S> {
     /// Inserts `str_index` at the head of the chain for `hash` and returns the previous
     /// head.
     ///
-    /// An exact port of `INSERT_STRING` minus the hash update (`deflate.c` L160-L163):
+    /// An exact mirror of `INSERT_STRING` minus the hash update (`deflate.c` L160-L163):
     ///
     /// ```text
     /// match_head = s->prev[(str) & s->w_mask] = s->head[s->ins_h],
@@ -1260,7 +1287,7 @@ impl<S: AsRef<[u16]> + AsMut<[u16]>> HashChains<S> {
 
     /// Slides both tables down by the window size.
     ///
-    /// An exact port of `slide_hash` (`deflate.c` L187-L210): every entry of `head` and then
+    /// An exact mirror of `slide_hash` (`deflate.c` L187-L210): every entry of `head` and then
     /// every entry of `prev` becomes `m >= wsize ? m - wsize : NIL`, and `slid` is set
     /// (L209). The C loops walk downwards from the end of each array; the direction cannot
     /// matter because each entry is rewritten from its own old value alone, so iterating
@@ -1287,7 +1314,7 @@ impl<S: AsRef<[u16]> + AsMut<[u16]>> HashChains<S> {
 
     /// Clears the hash heads and the slid flag.
     ///
-    /// An exact port of `CLEAR_HASH` (`deflate.c` L170-L175): every `head` entry becomes
+    /// An exact mirror of `CLEAR_HASH` (`deflate.c` L170-L175): every `head` entry becomes
     /// [`NIL`] and `slid` becomes false. `prev` is deliberately left alone — "prev[] will be
     /// initialized on the fly" (`deflate.c` L168) — so its contents stay whatever the
     /// allocator produced, which is what the C code relies on too.
@@ -1503,12 +1530,16 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> PendingBuf<S> {
     ///
     /// The bounds-checked form of `#define put_byte(s, c)` (`deflate.h` L293), whose C
     /// contract is only an "IN assertion: there is enough room in `pending_buf`" (L291).
+    ///
+    /// The slice bound *is* the room check: [`PendingBuf::new`] accepts only a buffer of
+    /// exactly `LIT_BUFS * lit_bufsize` bytes, which is what
+    /// [`PendingBuf::pending_buf_size`] returns, so `index >= pending_buf_size()` and
+    /// `get_mut(index) == None` are the same condition. Testing it once rather than twice
+    /// matters because every byte of compressed output leaves through here, most of them
+    /// two at a time from [`PendingBuf::put_short_le`] inside the Huffman emission loop.
     #[inline]
     pub fn put_byte(&mut self, byte: u8) -> bool {
         let index = self.pending;
-        if index >= self.pending_buf_size() {
-            return false;
-        }
         let Some(slot) = self.buf.as_mut().get_mut(index) else {
             return false;
         };
@@ -1517,10 +1548,39 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> PendingBuf<S> {
         true
     }
 
+    /// Appends a 16-bit value least-significant byte first, returning `false` when fewer
+    /// than two bytes remain.
+    ///
+    /// A port of `#define put_short(s, w)` (`trees.c` L144-L147), whose comment is "Output a
+    /// short LSB first on the stream", and the counterpart of
+    /// [`PendingBuf::put_short_msb`]. C expands to two `put_byte`s under an "IN assertion:
+    /// there is enough room in `pending_buf`"; this checks that room **once** and then
+    /// writes both bytes, which is the same all-or-nothing discipline
+    /// [`PendingBuf::put_short_msb`] already applies and half the bounds work of two
+    /// separate appends.
+    ///
+    /// That halving is not incidental. `send_bits` spills through here every time the bit
+    /// accumulator fills, which for an incompressible block is roughly once per input byte,
+    /// so this is the innermost write of the compressor.
+    #[inline]
+    pub fn put_short_le(&mut self, value: u16) -> bool {
+        let start = self.pending;
+        let Some(end) = start.checked_add(2) else {
+            return false;
+        };
+        let Some(slot) = self.buf.as_mut().get_mut(start..end) else {
+            return false;
+        };
+        // Exactly two bytes on both sides, so this cannot panic.
+        slot.copy_from_slice(&value.to_le_bytes());
+        self.pending = end;
+        true
+    }
+
     /// Appends a 16-bit value in most-significant-byte-first order, returning `false` when
     /// fewer than two bytes remain.
     ///
-    /// A port of `putShortMSB` (`deflate.c` L939-L942), which is two `put_byte` calls with
+    /// A a mirror of `putShortMSB` (`deflate.c` L939-L942), which is two `put_byte` calls with
     /// `b >> 8` first. `u16::to_be_bytes` produces exactly that order. Room is checked once
     /// up front so the write is all-or-nothing, where the C version would have written one
     /// byte past the end.
@@ -1567,12 +1627,10 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> PendingBuf<S> {
     #[must_use]
     #[inline]
     pub fn written(&self) -> &[u8] {
-        match self.buf.as_ref().get(..self.pending) {
-            Some(bytes) => bytes,
-            // Unreachable: `pending <= pending_buf_size == buf.len()` is maintained by every
-            // mutator. An empty slice keeps this accessor total rather than panicking.
-            None => &[],
-        }
+        // The `None` arm is unreachable: `pending <= pending_buf_size == buf.len()` is
+        // maintained by every mutator. An empty slice keeps this accessor total rather than
+        // panicking.
+        self.buf.as_ref().get(..self.pending).unwrap_or_default()
     }
 
     /// Pending output from `beg` up to `pending`, or [`None`] when `beg` is past `pending`.
@@ -1634,12 +1692,12 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> PendingBuf<S> {
         let Some(end) = self.pending_out.checked_add(self.pending) else {
             return &[];
         };
-        match self.buf.as_ref().get(self.pending_out..end) {
-            Some(bytes) => bytes,
-            // Unreachable: `pending_out + pending <= buf.len()` is maintained by every
-            // mutator. An empty slice keeps this accessor total rather than panicking.
-            None => &[],
-        }
+        // The `None` arm is unreachable: `pending_out + pending <= buf.len()` is maintained by
+        // every mutator. An empty slice keeps this accessor total rather than panicking.
+        self.buf
+            .as_ref()
+            .get(self.pending_out..end)
+            .unwrap_or_default()
     }
 
     /// The bytes ready to be flushed and the symbols not yet emitted, at the same time.
@@ -1719,7 +1777,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> PendingBuf<S> {
 
     /// Appends one symbol and reports whether the symbol buffer is now full.
     ///
-    /// A port of the `_tr_tally_dist`/`_tr_tally_lit` macro pair (`deflate.h` L365-L375) and
+    /// A a mirror of the `_tr_tally_dist`/`_tr_tally_lit` macro pair (`deflate.h` L365-L375) and
     /// of `_tr_tally` itself (`trees.c` L1100-L1102): three bytes, the distance
     /// little-endian first and then the length-or-literal byte. A literal is a distance of
     /// zero, which the C code writes as two zero bytes (`deflate.h` L359-L361), so this one
@@ -1759,10 +1817,9 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> PendingBuf<S> {
     ///
     /// A distance of zero means `lc` is a literal, exactly as in C (`trees.c` L916-L917).
     ///
-    /// Copying the symbol out by value is the recommended way to port `compress_block`: it
-    /// leaves no borrow outstanding, so the same [`PendingBuf`] can be written through while
-    /// the block is emitted, and it sidesteps the overlay question entirely for three bytes
-    /// of copying.
+    /// Copying the symbol out by value leaves no borrow outstanding, so the same
+    /// [`PendingBuf`] can be written through while the block is emitted, and it sidesteps the
+    /// overlay question entirely for three bytes of copying.
     #[must_use]
     #[inline]
     pub fn symbol_at(&self, offset: usize) -> Option<(u16, u8)> {
@@ -1775,6 +1832,62 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> PendingBuf<S> {
         }
     }
 
+    /// Decodes up to `out.len()` consecutive symbols starting at byte offset `offset`,
+    /// returning how many were written into `out`.
+    ///
+    /// The batched form of [`PendingBuf::symbol_at`], and the shape `compress_block`
+    /// (`trees.c` L900-L951) should use. `symbol_at` establishes the symbol region's bounds
+    /// afresh for every three bytes; this establishes them **once for the whole batch** and
+    /// then walks it with [`slice::chunks_exact`], so the emission loop pays no range work
+    /// per symbol. Each decoded pair is `(distance, length_or_literal)`, with a distance of
+    /// zero marking a literal, exactly as in C (L913-L917).
+    ///
+    /// Reading a batch out before any of it is emitted is not merely allowed, it is safer
+    /// than what C does. The compressed output and the unread symbols share one allocation,
+    /// and `Assert(s->pending < s->lit_bufsize + sx, "pendingBuf overflow")` (L945) is what
+    /// keeps the write cursor behind the read cursor. Copying the batch out first means the
+    /// bytes this batch occupies may be overwritten while the batch is emitted -- which the
+    /// assertion permits -- without any symbol being lost, and the assertion still keeps the
+    /// cursor below `lit_bufsize + offset + 3 * filled`, so the *next* batch is untouched.
+    ///
+    /// Stops early at `sym_next`: a partial symbol at the end is not decoded, so the return
+    /// value is always a whole number of symbols and `offset + SYMBOL_BYTES * returned`
+    /// never exceeds `sym_next`.
+    #[inline]
+    pub fn decode_symbols(&self, offset: usize, out: &mut [(u16, u8)]) -> usize {
+        let Some(available) = self.sym_next.checked_sub(offset) else {
+            return 0;
+        };
+        let wanted = out.len().min(available / SYMBOL_BYTES);
+        let Some(span) = wanted.checked_mul(SYMBOL_BYTES) else {
+            return 0;
+        };
+        let Some(start) = self.lit_bufsize.checked_add(offset) else {
+            return 0;
+        };
+        let Some(end) = start.checked_add(span) else {
+            return 0;
+        };
+        // The one range check the whole batch pays. `None` is unreachable while `sym_next`
+        // is within `sym_end`, which `push_symbol` and `set_sym_next` both maintain.
+        let Some(bytes) = self.buf.as_ref().get(start..end) else {
+            return 0;
+        };
+
+        let mut filled = 0;
+        for (slot, symbol) in out.iter_mut().zip(bytes.chunks_exact(SYMBOL_BYTES)) {
+            match symbol {
+                [low, high, len_or_lit] => {
+                    *slot = (u16::from_le_bytes([*low, *high]), *len_or_lit);
+                    filled += 1;
+                }
+                // Unreachable: `chunks_exact` yields only full-length chunks.
+                _ => break,
+            }
+        }
+        filled
+    }
+
     /// The symbol bytes written so far, i.e. `sym_buf[0..sym_next]`.
     #[must_use]
     #[inline]
@@ -1782,11 +1895,12 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> PendingBuf<S> {
         let Some(end) = self.lit_bufsize.checked_add(self.sym_next) else {
             return &[];
         };
-        match self.buf.as_ref().get(self.lit_bufsize..end) {
-            Some(bytes) => bytes,
-            // Unreachable: `lit_bufsize + sym_next <= lit_bufsize + sym_end < buf.len()`.
-            None => &[],
-        }
+        // The `None` arm is unreachable: `lit_bufsize + sym_next <= lit_bufsize + sym_end <
+        // buf.len()`.
+        self.buf
+            .as_ref()
+            .get(self.lit_bufsize..end)
+            .unwrap_or_default()
     }
 
     /// A read cursor over [`PendingBuf::symbols`], for walking the buffer three bytes at a
@@ -1805,11 +1919,8 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> PendingBuf<S> {
         let Some(end) = start.checked_add(self.sym_next) else {
             return &mut [];
         };
-        match self.buf.as_mut().get_mut(start..end) {
-            Some(bytes) => bytes,
-            // Unreachable, as in `symbols`.
-            None => &mut [],
-        }
+        // The `None` arm is unreachable, as in `symbols`.
+        self.buf.as_mut().get_mut(start..end).unwrap_or_default()
     }
 
     /// Clears the symbol buffer, as `init_block` does with `s->sym_next = 0`.
@@ -1908,6 +2019,9 @@ mod tests {
         MAX_HASH_BITS, MAX_LIT_BUFSIZE, MAX_MATCH, MAX_WBITS, MIN_HASH_BITS, MIN_LIT_BUFSIZE,
         MIN_LOOKAHEAD, MIN_MATCH, MIN_WBITS, NIL, SYMBOL_BYTES, WIN_INIT,
     };
+
+    use alloc::vec;
+    use alloc::vec::Vec;
 
     /// `w_bits` for the window fixtures: the smallest a deflate stream can have, because
     /// `deflateInit2_` promotes 8 to 9 (`deflate.c` L439). Small enough for stack fixtures,
@@ -2884,6 +2998,85 @@ mod tests {
         );
         assert_eq!(buffer.symbol_at(usize::MAX), None);
         assert_eq!(buffer.symbol_at(buffer.pending_buf_size()), None);
+    }
+
+    #[test]
+    fn pending_buf_decode_symbols_agrees_with_symbol_at_everywhere() {
+        // The batched decoder is what `compress_block` walks the symbol buffer
+        // with, so it has to be indistinguishable from calling `symbol_at` for
+        // every offset -- including at the partial batch that ends the buffer, and
+        // including past `sym_next`, where it must stop rather than read ahead.
+        let mut buffer = garbage_pending();
+        let symbols: Vec<(u16, u8)> = (0..37_u8)
+            .map(|n| (u16::from(n).wrapping_mul(701), n.wrapping_mul(37)))
+            .collect();
+        for &(dist, len_or_lit) in &symbols {
+            assert_eq!(buffer.push_symbol(dist, len_or_lit), Some(false));
+        }
+
+        for capacity in [1_usize, 2, 8, 32, 64] {
+            let mut out = vec![(0_u16, 0_u8); capacity];
+            let mut offset = 0;
+            let mut seen: Vec<(u16, u8)> = Vec::new();
+            while offset < buffer.sym_next() {
+                let filled = buffer.decode_symbols(offset, &mut out);
+                assert!(filled > 0, "capacity {capacity} stalled at {offset}");
+                assert!(filled <= capacity);
+                for (index, symbol) in out.iter().enumerate().take(filled) {
+                    assert_eq!(
+                        *symbol,
+                        buffer.symbol_at(offset + index * SYMBOL_BYTES).unwrap(),
+                        "capacity {capacity}, offset {offset}, index {index}"
+                    );
+                }
+                seen.extend_from_slice(&out[..filled]);
+                offset += filled * SYMBOL_BYTES;
+            }
+            assert_eq!(
+                offset,
+                buffer.sym_next(),
+                "every symbol is consumed exactly once"
+            );
+            assert_eq!(seen, symbols, "capacity {capacity}");
+        }
+
+        // A whole batch of room at the very end yields only the symbols there are.
+        let mut out = [(0_u16, 0_u8); 8];
+        let tail = buffer.sym_next() - SYMBOL_BYTES;
+        assert_eq!(buffer.decode_symbols(tail, &mut out), 1);
+        // At and past `sym_next` there is nothing to decode.
+        assert_eq!(buffer.decode_symbols(buffer.sym_next(), &mut out), 0);
+        assert_eq!(buffer.decode_symbols(usize::MAX, &mut out), 0);
+        // A zero-length destination asks for nothing and gets nothing.
+        assert_eq!(buffer.decode_symbols(0, &mut []), 0);
+    }
+
+    #[test]
+    fn pending_buf_put_short_le_is_all_or_nothing() {
+        // The little-endian short is what the bit accumulator spills through, so
+        // its byte order is the bitstream's: low byte first (`trees.c` L144-L147).
+        let mut buffer = garbage_pending();
+        assert!(buffer.put_short_le(0x1234));
+        assert_eq!(buffer.written(), &[0x34, 0x12]);
+        assert_eq!(buffer.pending(), 2);
+
+        // Fill to one byte short of the end: the pair then does not fit, and
+        // neither byte is written, where two independent appends would have left
+        // the low byte behind.
+        let room = buffer.room() - 1;
+        for _ in 0..room {
+            assert!(buffer.put_byte(0xa5));
+        }
+        assert_eq!(buffer.room(), 1);
+        assert!(!buffer.put_short_le(0xbeef));
+        assert_eq!(buffer.room(), 1, "a refused short writes nothing");
+        assert!(
+            buffer.put_byte(0x5a),
+            "the single remaining byte still fits"
+        );
+        assert_eq!(buffer.room(), 0);
+        assert!(!buffer.put_byte(0x5a));
+        assert!(!buffer.put_short_le(0xbeef));
     }
 
     #[test]

@@ -11,34 +11,49 @@
 #
 # zlib is a system library: effectively every consumer of compressed data links
 # it, so whatever reaches this dependency graph reaches everything downstream.
-# The port is built on the rule that the algorithm carries no third-party code
-# at all -- crates/zlib-rs ships an empty [dependencies] table, and
-# crates/libz-rs-sys adds only an optional libc.  Everything else cargo-deny
-# can see is test and benchmark tooling that never ends up inside libz.so or
-# libz.a.  Review alone cannot keep that true across future changes, so this
-# file is the mechanical half: a regression fails CI instead of passing
-# unnoticed in a diff.
+# The algorithm carries no third-party code at all -- crates/zlib-rs has an empty
+# [dependencies] table, and crates/libz-rs-sys adds only an optional libc.
+# Everything else cargo-deny can see is test and benchmark tooling that never ends
+# up inside libz.so or libz.a.  This file is the mechanical half of keeping that
+# true: a regression fails the gate instead of passing unnoticed in a diff.
 #
 # LICENSING
 #
-# The project's own licence is the zlib licence, SPDX `Zlib`.  That is the
-# licence text in LICENSE, the identifier BUILD.bazel declares through
-# rules_license, and the value of `license` in Cargo.toml's
-# [workspace.package] -- three statements of the same thing, and the allow list
-# below is the fourth.  Copyleft licences are excluded the only way this schema
-# permits: by not appearing in that list, which turns any crate carrying one
-# into a hard error.  There is deliberately no GPL, LGPL, AGPL or MPL entry
-# anywhere in this file.
+# The project's own licence is the zlib licence, SPDX `Zlib`: the text in LICENSE,
+# the identifier BUILD.bazel declares through rules_license, the value of `license`
+# in Cargo.toml's [workspace.package], and the allow list below all state it.
+# Copyleft licences are excluded the only way this schema permits -- by not
+# appearing in that list, which turns any crate carrying one into a hard error.
+# There is deliberately no GPL, LGPL, AGPL or MPL entry anywhere in this file.
 #
 # One graph is deliberately not covered: fuzz/ declares its own [workspace] and
 # is listed under `exclude` in the root Cargo.toml, so nothing it pulls in
-# reaches the audit below.  Auditing it is a separate invocation --
-# `cargo deny --manifest-path fuzz/Cargo.toml check` -- and that run needs an
-# `NCSA` allowance, because libfuzzer-sys 0.4.13 is
-# "(MIT OR Apache-2.0) AND NCSA" and the NCSA half of that AND cannot be
-# satisfied by anything else.  NCSA is not added to the allow list here: it
-# appears nowhere in this workspace's graph, and cargo-deny reports an
-# allowance that never matches as a warning.
+# reaches the audit below.  It is audited separately, by its own configuration,
+# against its own committed lockfile:
+#
+#     cargo deny --locked check                                  # this file
+#     cargo deny --locked --manifest-path fuzz/Cargo.toml \
+#                --config fuzz/deny.toml check                   # fuzz/deny.toml
+#
+# `--locked` on both runs is required rather than tidy: cargo-deny resolves
+# through cargo, so without it an absent or stale lockfile is re-resolved
+# silently and the audit reports on versions nobody builds.
+#
+# That second configuration exists because this one cannot serve both graphs, in
+# both directions.  It needs two allowances this file must not grant, each an
+# SPDX `AND` that cannot be satisfied by any alternative:
+#
+#   * `NCSA` -- libfuzzer-sys 0.4.13 is "(MIT OR Apache-2.0) AND NCSA"; it
+#     vendors LLVM's NCSA-licensed libFuzzer.
+#   * `Unicode-3.0` -- unicode-ident 1.0.24 is
+#     "(MIT OR Apache-2.0) AND Unicode-3.0".  This one is already in the allow
+#     list below, because criterion's tree brings the same crate here.
+#
+# NCSA is deliberately absent from the allow list below: it appears nowhere in
+# this workspace's graph, and cargo-deny reports an allowance that never matches
+# as a warning.  Granting it here would also be the wrong shape -- it would
+# permit an NCSA-licensed crate to enter the SHIPPED graph, which is precisely
+# what this file is for preventing.
 #
 # SCHEMA
 #
@@ -48,99 +63,122 @@
 # unsound and severity-threshold are all hard errors now -- and "deny anything
 # not explicitly allowed" is its built-in behaviour rather than something to
 # configure.  The legacy `version = 2` shims are omitted for the same reason.
-# Every value below was checked against this workspace and reports zero errors
-# and zero warnings; a stale key or an allowance that never matches shows up as
-# a diagnostic and would break the project's zero-warning bar.
+# Every key below was checked against that schema, so none of them is a stale
+# spelling.
+#
+# WHAT HAS NOT BEEN CHECKED YET, AND WHY
+#
+# `cargo deny check` cannot run against this workspace at this checkpoint.  It
+# starts by asking cargo for the dependency graph, and `cargo metadata` fails
+# outright because the facade crate root `crates/libz-rs-sys/src/lib.rs` has not
+# been written yet:
+#
+#   can't find library `z`, rename file to `src/lib.rs` or specify lib.path
+#
+# so the tool exits 1 before it evaluates a single rule here.  The REQUIREMENT is
+# zero errors and zero warnings across all four gates -- an allowance that never
+# matches is reported as a diagnostic and would break the project's zero-warning
+# bar just as a real violation would.  That requirement has not been demonstrated
+# on the real graph and must not be described as though it had been.  Re-run
+# `cargo deny check` and record the outcome once the facade crate root lands.
 
 [graph]
 # No `targets` filter, on purpose.  Narrowing the graph to a single triple would
 # stop cargo-deny from ever looking at the crates that only build elsewhere --
-# winapi, windows-sys, js-sys and web-sys all arrive through the benchmark
-# harness -- and a licence or advisory problem in one of those is still a
-# problem for whoever builds this workspace on that platform.  Which targets the
-# port actually supports is a separate question, answered by the build
-# documentation, not by the audit configuration.
+# winapi, windows-sys, js-sys and web-sys all arrive through the benchmark harness
+# -- and a licence or advisory problem in one of those is still a problem for
+# whoever builds this workspace on that platform.  Which targets are supported is a
+# separate question, answered by the build documentation rather than by the audit
+# configuration.
 #
-# Optional features are switched on so that feature-gated dependencies are
-# audited too.  libz-rs-sys's `libc` feature is the only one today, and it must
-# not become a place where an unaudited crate can hide.
+# Optional features are switched on so that feature-gated dependencies are audited
+# too.  libz-rs-sys's `libc` feature is the only one, and it must not become a place
+# where an unaudited crate can hide.
 all-features = true
 
 [advisories]
-# Vulnerability, unsoundness and notice advisories are errors in cargo-deny
-# 0.20.2 and have no per-category switch left to turn them down -- the only
-# escape hatch is the `ignore` list, which is empty and stays empty.  The two
-# settings below are the ones whose defaults are weaker than this project wants.
+# Vulnerability, unsoundness and notice advisories are errors in cargo-deny 0.20.2
+# and have no per-category switch left to turn them down -- the only escape hatch is
+# the `ignore` list, which is empty and stays empty.  The two settings below are the
+# ones whose defaults are weaker than this workspace wants.
 #
-# Widen the unmaintained check from the workspace's own dependencies to the
-# whole graph, transitive tooling included.
+# Widen the unmaintained check from the workspace's own dependencies to the whole
+# graph, transitive tooling included.
 unmaintained = "all"
-# A yanked crate is only a warning by default.  For a library whose builds have
-# to be reproducible from a committed Cargo.lock, it is an error.
+# A yanked crate is only a warning by default.  For a library whose builds have to
+# be reproducible from a committed Cargo.lock, it is an error.
 yanked = "deny"
 # Empty, and it should stay that way.  With no third-party code in the shipped
 # crates there is very little surface for an advisory to land on, so an advisory
-# that does fire is signal rather than noise: fix or drop the dependency instead
-# of parking a RUSTSEC identifier here.
+# that does fire is signal rather than noise: fix or drop the dependency instead of
+# parking a RUSTSEC identifier here.
 ignore = []
 
 [licenses]
 # Well above the 0.8 default.  Nothing in this graph depends on cargo-deny
 # inferring a licence from the text of a LICENSE file -- every crate declares an
-# SPDX expression in its metadata -- so a low-confidence textual match would
-# itself be worth investigating rather than worth accepting.
+# SPDX expression in its metadata -- so a low-confidence textual match would itself
+# be worth investigating rather than worth accepting.
 confidence-threshold = 0.93
 # Audit development and build dependencies as well.  cargo-deny skips
 # dev-dependencies by default, which would leave the benchmark and
-# differential-test trees -- by far the largest part of this graph -- unchecked,
-# and would let a copyleft dev-dependency through without a word.
+# differential-test trees -- by far the largest part of this graph -- unchecked, and
+# would let a copyleft dev-dependency through without a word.
 include-dev = true
 include-build = true
 # Exactly the identifiers this workspace resolves to, and nothing more.  An
 # allowance that is never encountered is reported as a warning, so speculative
-# entries are not free: run `cargo deny list` and add an identifier only once
-# that output shows a crate which genuinely needs it.
+# entries are not free: run `cargo deny list` and add an identifier only once that
+# output shows a crate which genuinely needs it.
 allow = [
     # The project's own licence, carried by LICENSE and by all three crates.
     "Zlib",
-    # Covers the dual-licensed bulk of the tooling graph, and on its own
-    # satisfies the crates offered as "Unlicense OR MIT" (memchr, walkdir,
-    # same-file, winapi-util) and "BSD-2-Clause OR Apache-2.0 OR MIT"
-    # (zerocopy, zerocopy-derive).  That is why neither Unlicense nor
-    # BSD-2-Clause is listed: allowing an alternative that nothing ends up
-    # needing is itself a warning.
+    # Covers the dual-licensed bulk of the tooling graph, and on its own satisfies
+    # the crates offered as "Unlicense OR MIT" (memchr, walkdir, same-file,
+    # winapi-util) and "BSD-2-Clause OR Apache-2.0 OR MIT" (zerocopy,
+    # zerocopy-derive).  That is why neither Unlicense nor BSD-2-Clause is listed:
+    # allowing an alternative that nothing ends up needing is itself a warning.
     "MIT",
-    # Required outright -- the ciborium crates the benchmark harness pulls in
-    # are Apache-2.0 only, with no MIT alternative to fall back on.
+    # Required outright -- the ciborium crates the benchmark harness pulls in are
+    # Apache-2.0 only, with no MIT alternative to fall back on.
     "Apache-2.0",
-    # Required outright -- unicode-ident is
-    # "(MIT OR Apache-2.0) AND Unicode-3.0", so the Unicode terms have to be
-    # allowed alongside MIT rather than instead of it.
+    # Required outright -- unicode-ident is "(MIT OR Apache-2.0) AND Unicode-3.0",
+    # so the Unicode terms have to be allowed alongside MIT rather than instead of
+    # it.
     "Unicode-3.0",
 ]
 
 [bans]
-# A duplicate version in this graph means something went wrong: the shipped
-# crates have no third-party dependencies to disagree about in the first place.
+# A duplicate version in this graph means something went wrong: the shipped crates
+# have no third-party dependencies to disagree about in the first place.
 #
 # `multiple-versions-include-dev` is left at its default of false on purpose.
-# criterion's own tree currently resolves both syn 2 and syn 3, which is
-# internal to a benchmark harness that no shipped artifact links; turning that
-# key on would fail this workspace's build over somebody else's dependency
-# graph, and the alternative -- a skip entry for syn -- would blunt the check
-# permanently to work around something temporary.
+# criterion's own tree resolves two major versions of syn, which is internal to a
+# benchmark harness that no shipped artifact links; turning that key on would fail
+# this workspace over somebody else's dependency graph, and the alternative -- a
+# skip entry for syn -- would blunt the check permanently.
 multiple-versions = "deny"
 # Every version in this workspace was pinned against the registry deliberately,
 # so a `*` requirement is a mistake rather than a shortcut.
+#
+# This check is deliberately unconditional: there is no `allow-wildcard-paths`
+# exemption here, and none is needed.  A path dependency with no version
+# requirement registers in the dependency graph as `*`, and every internal path
+# edge in this workspace therefore carries an explicit version:
+#
+#   * root `[workspace.dependencies]`  -> zlib-rs   { path = …, version = "1.3.2" }
+#   * crates/libz-rs-sys               -> zlib-rs   { path = …, version = "1.3.2" }
+#   * crates/zlib-rs-differential      -> zlib-rs   via `workspace = true`
+#   * crates/zlib-rs-differential      -> libz_rs_sys { path = …, version = "1.3.2" }
+#
+# `allow-wildcard-paths` would have covered the last of those, but it is a
+# blanket rule rather than a targeted one: it excuses EVERY version-less path
+# edge of an unpublished crate, including ones nobody has written yet.  Pinning
+# the single edge that needed it keeps the gate at full strength and makes the
+# next omission a build failure instead of a silent pass.  Verified both ways --
+# with the version present, `cargo deny check bans` reports no wildcard; with it
+# removed, it fails with error[wildcard] on exactly that edge.
 wildcards = "deny"
-# The single exemption the workspace genuinely needs.
-# crates/zlib-rs-differential depends on libz-rs-sys by path with no version
-# requirement, and a path dependency with no version registers as a wildcard.
-# This key exempts path dependencies of unpublished crates only; it never
-# exempts a registry dependency, which is where the check actually earns its
-# keep.  Verified: without it, `cargo deny check bans` fails with
-# error[wildcard] on exactly that one edge.
-allow-wildcard-paths = true
 # Crates that must never appear in this graph.  None of them is present today,
 # and an entry that matches nothing costs nothing, so this list is preventive:
 # it turns three of the port's design decisions into build failures rather than
@@ -150,15 +188,15 @@ allow-wildcard-paths = true
 # crates/zlib-rs-differential, which compiles the in-tree C sources into the
 # test-only differential oracle (and is also a build-dependency of criterion's
 # alloca); `criterion` is a dev-dependency of that same crate, for the benchmark
-# suites; `libc` is an optional dependency of libz-rs-sys behind its `libc`
-# feature and a transitive dependency of criterion through page_size.  None of
-# the three reaches the shipped libz.so or libz.a -- two are dev/build-only, and
-# the `libc` feature is off by default.
+# suites; `libc` is an optional dependency of libz-rs-sys behind its `libc` feature
+# and a transitive dependency of criterion through page_size.  None of the three
+# reaches the shipped libz.so or libz.a -- two are dev/build-only, and the `libc`
+# feature is off by default.
 deny = [
     # Bindings to a native compression library.  The C zlib in this tree is a
     # differential-test oracle, never a build dependency: the shipped library
-    # contains no C implementation, and linking any of these would quietly put
-    # one back.
+    # contains no C implementation, and linking any of these would quietly put one
+    # back.
     { crate = "libz-sys", use-instead = "libz-rs-sys", reason = "links the C zlib; the in-tree C sources are a test oracle, not a dependency" },
     { crate = "libz-ng-sys", use-instead = "libz-rs-sys", reason = "links zlib-ng, whose encoder does not emit byte-identical output" },
     { crate = "cloudflare-zlib-sys", use-instead = "libz-rs-sys", reason = "links a forked C zlib" },
@@ -166,17 +204,17 @@ deny = [
     { crate = "libdeflater", use-instead = "libz-rs-sys", reason = "wraps libdeflate, a separate C compressor" },
 
     # Third-party DEFLATE implementations.  This workspace is the DEFLATE
-    # implementation; a second one in the graph would either shadow it or
-    # silently answer for it in a test that was meant to exercise the port.
-    { crate = "flate2", use-instead = "libz-rs-sys", reason = "third-party DEFLATE front end; the port is the implementation, not a consumer of one" },
+    # implementation; a second one in the graph would either shadow it or silently
+    # answer for it in a test that was meant to exercise this one.
+    { crate = "flate2", use-instead = "libz-rs-sys", reason = "third-party DEFLATE front end; this workspace is the implementation, not a consumer of one" },
     { crate = "miniz_oxide", use-instead = "zlib-rs", reason = "third-party Rust DEFLATE implementation" },
     { crate = "deflate", use-instead = "zlib-rs", reason = "third-party Rust DEFLATE encoder" },
     { crate = "inflate", use-instead = "zlib-rs", reason = "third-party Rust DEFLATE decoder" },
     { crate = "zopfli", use-instead = "zlib-rs", reason = "alternative DEFLATE encoder; its output is not byte-identical to zlib's" },
 
-    # Other compression formats.  The port's capability surface is frozen at
-    # zlib, gzip and raw DEFLATE, so pulling in another codec is a scope change
-    # rather than a dependency bump -- including in a benchmark.
+    # Other compression formats.  The capability surface is frozen at zlib, gzip
+    # and raw DEFLATE, so pulling in another codec is a scope change rather than a
+    # dependency bump -- including in a benchmark.
     { crate = "zstd", reason = "no new compression formats" },
     { crate = "zstd-sys", reason = "no new compression formats" },
     { crate = "brotli", reason = "no new compression formats" },
@@ -191,10 +229,9 @@ deny = [
 [sources]
 # crates.io, and nothing else.
 unknown-registry = "deny"
-# No git dependencies.  The reference implementation is already in this
-# repository, so there is nothing to vendor and no submodule to track; a git
-# dependency would be precisely the arrangement the port set out to avoid, and
-# it would also defeat the reproducibility the committed Cargo.lock buys.
+# No git dependencies.  The reference implementation is already in this repository,
+# so there is nothing to vendor and no submodule to track, and a git dependency
+# would also defeat the reproducibility the committed Cargo.lock buys.
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # Empty on purpose -- see unknown-git above.

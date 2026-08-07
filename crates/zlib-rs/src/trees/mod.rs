@@ -11,12 +11,12 @@
 //!
 //! | C function | L | Here |
 //! |---|---|---|
-//! | `_tr_init` | 456-478 | [`_tr_init`] |
-//! | `_tr_stored_block` | 860-875 | [`_tr_stored_block`] |
-//! | `_tr_flush_bits` | 880-882 | [`_tr_flush_bits`] |
-//! | `_tr_align` | 888-895 | [`_tr_align`] |
-//! | `_tr_flush_block` | 997-1089 | [`_tr_flush_block`] |
-//! | `_tr_tally` | 1095-1119 | [`_tr_tally`] |
+//! | `_tr_init` | 456-478 | `_tr_init` |
+//! | `_tr_stored_block` | 860-875 | `_tr_stored_block` |
+//! | `_tr_flush_bits` | 880-882 | `_tr_flush_bits` |
+//! | `_tr_align` | 888-895 | `_tr_align` |
+//! | `_tr_flush_block` | 997-1089 | `_tr_flush_block` |
+//! | `_tr_tally` | 1095-1119 | `_tr_tally` |
 //!
 //! The C names are kept verbatim so that the mapping to `deflate.h` L311-L318 is
 //! one to one and every reader can find the oracle. They are `pub(crate)`, never
@@ -30,10 +30,10 @@
 //!
 //! | Module | From | Owns |
 //! |---|---|---|
-//! | [`static_tables`] | `trees.h`, L47-L115 | the transcribed `const` tables and the six file-local constants |
-//! | [`tree_desc`] | L117-L138 | `static_tree_desc` and the three descriptors |
-//! | [`bit_writer`] | L140-L286 | `put_short`, `send_bits`, `send_code`, `bi_reverse`, `bi_flush`, `bi_windup` |
-//! | [`build`] | L203-L991, L1027-L1074 | tree construction, tree transmission, the block body, and the block-type decision |
+//! | `static_tables` | `trees.h`, L47-L115 | the transcribed `const` tables and the six file-local constants |
+//! | `tree_desc` | L117-L138 | `static_tree_desc` and the three descriptors |
+//! | `bit_writer` | L140-L286 | `put_short`, `send_bits`, `send_code`, `bi_reverse`, `bi_flush`, `bi_windup` |
+//! | `build` | L203-L991, L1027-L1074 | tree construction, tree transmission, the block body, and the block-type decision |
 //!
 //! # Why this is part of the deflate subsystem rather than a peer of it
 //!
@@ -41,30 +41,30 @@
 //! state of its own: every function below is an operation on
 //! [`DeflateState`], the same struct `deflate/**` mutates, and there is
 //! deliberately no parallel state type here. What C achieves by convention --
-//! two translation units agreeing to share one struct -- this port achieves with
+//! two translation units agreeing to share one struct -- this implementation achieves with
 //! `&mut DeflateState`, so the compiler enforces the aliasing discipline instead
 //! of trusting it.
 //!
 //! # Three decisions worth reading before the code
 //!
 //! **There is no static-table initialisation.** L457 calls `tr_static_init()`,
-//! and it is tempting to look for its port. There is none, because in the
+//! and it is tempting to look for its implementation. There is none, because in the
 //! configuration this library ships the function is *empty*: its entire body sits
 //! inside `#if defined(GEN_TREES_H) || !defined(STDC)` (L296-L373), L35 has
 //! `/* #define GEN_TREES_H */` commented out, and `STDC` is defined, so L113-L114
 //! takes the `#include "trees.h"` branch and the tables are compile-time data.
-//! In Rust they are `const` arrays in [`static_tables`], so there is nothing to
+//! In Rust they are `const` arrays in `static_tables`, so there is nothing to
 //! initialise and the call is omitted rather than ported as a stub.
 //!
 //! **`data_type` is threaded through the signature, not reached through a
 //! back-pointer.** L1006-L1007 reads and writes `s->strm->data_type`, which is a
 //! field of the *caller's* `z_stream` (`zlib.h` L106) and is observable by the
 //! caller after the call. C reaches it through `s->strm`, a back-pointer from the
-//! state to the stream that owns it. This port cannot hold one: a `&mut z_stream`
+//! state to the stream that owns it. This implementation cannot hold one: a `&mut z_stream`
 //! stored inside [`DeflateState`] would alias the `&mut DeflateState` every
 //! function here takes, which safe Rust rejects outright -- and
 //! `deflate/state.rs` accordingly declares neither a `strm` field nor a
-//! `data_type` field. [`_tr_flush_block`] therefore takes `data_type: &mut i32`
+//! `data_type` field. `_tr_flush_block` therefore takes `data_type: &mut i32`
 //! as its second argument, and the facade is what connects that borrow to the
 //! caller's struct. The value is not internal bookkeeping: `test/example.c` and
 //! the differential suite both read `z_stream.data_type` back.
@@ -75,10 +75,11 @@
 //! (`deflate.c` L1630-L1636), so the pointer is always a *window offset* and the
 //! null case is exactly a negative `block_start` -- which is a legitimate state,
 //! because `block_start` "gets negative when the window is moved backwards"
-//! (`deflate.h` L159-L161). The port carries the offset instead of the pointer,
-//! and the one expression that reproduces the conditional is
+//! (`deflate.h` L159-L161). The implementation carries the offset instead of the pointer,
+//! and the one expression that reproduces the conditional is shown rather than compiled,
+//! because the field it reads is crate-private:
 //!
-//! ```ignore
+//! ```text
 //! let buf: Option<usize> = usize::try_from(state.window.block_start).ok();
 //! ```
 //!
@@ -86,7 +87,7 @@
 //! that *is* the `block_start >= 0L` test, and there is no second spelling of it.
 //! `deflate/algorithm.rs`, which owns `flush_block_only`, is the caller that has
 //! to produce it; both functions below restate the requirement, and
-//! [`_tr_stored_block`] additionally asserts it, because whether `buf` is null
+//! `_tr_stored_block` additionally asserts it, because whether `buf` is null
 //! decides whether a stored block is eligible at all (L1047) and therefore
 //! decides the emitted block type. Handing in a `&[u8]` instead is not an option:
 //! it would borrow `state.window` for the duration of the call, and every
@@ -102,6 +103,14 @@
 //! `ZLIB_DEBUG`, so there is no `compressed_len` or `bits_sent` accounting and
 //! the reference's `Assert`s appear only as [`debug_assert!`]; `FORCE_STATIC`
 //! (L1034); `FORCE_STORED` (L1044); and `DUMP_BL_TREE`.
+//!
+//! # Provenance
+//!
+//! Huffman tree construction and bit emission.
+//!
+//! Ported from `trees.c` and `trees.h`. A sibling of [`crate::deflate`] rather than a layer of its
+//! own, because `trees.c` includes only `deflate.h`: the coder operates on `&mut DeflateState`, so
+//! the `_tr_*` entry points are crate-private and only the generated tables are public.
 
 pub(crate) mod static_tables;
 pub(crate) mod tree_desc;
@@ -110,8 +119,8 @@ pub(crate) mod bit_writer;
 pub(crate) mod build;
 
 // The six generated tables, re-exported as data so that `crates/zlib-rs/src/lib.rs`
-// can expose them and `crates/zlib-rs-differential/tests/table_equality.rs` can
-// compare them element for element against `trees.h`. That comparison is the
+// can expose them and the planned `crates/zlib-rs-differential/tests/table_equality.rs` will be
+// able to compare them element for element against `trees.h`. That comparison is the
 // cheapest high-signal check in the whole port, which is why these six -- and
 // only these six -- are `pub`. Everything else in this folder is `pub(crate)` or
 // private, mirroring the `local` linkage of the C sources and the `local:` block
@@ -142,22 +151,9 @@ use crate::trees::static_tables::END_BLOCK;
 #[allow(unused_imports)]
 pub(crate) use crate::trees::_tr_flush_bits as flush_bits;
 
-// -----------------------------------------------------------------------------
-//  _tr_init -- L453-L478
-// -----------------------------------------------------------------------------
-
 /// Initialises the tree data structures for a new zlib stream.
 ///
-/// Port of `_tr_init` (L456-L478):
-///
-/// ```c
-/// tr_static_init();
-/// s->l_desc.dyn_tree = s->dyn_ltree;   s->l_desc.stat_desc  = &static_l_desc;
-/// s->d_desc.dyn_tree = s->dyn_dtree;   s->d_desc.stat_desc  = &static_d_desc;
-/// s->bl_desc.dyn_tree = s->bl_tree;    s->bl_desc.stat_desc = &static_bl_desc;
-/// s->bi_buf = 0;  s->bi_valid = 0;  s->bi_used = 0;
-/// init_block(s);
-/// ```
+/// Mirrors `_tr_init` (L456-L478).
 ///
 /// # The three descriptor bindings
 ///
@@ -178,7 +174,7 @@ pub(crate) use crate::trees::_tr_flush_bits as flush_bits;
 ///
 /// # There is no `tr_static_init` call
 ///
-/// L457 calls it; this does not port it, because in this configuration the
+/// L457 calls it; this does not implementation it, because in this configuration the
 /// function has no body. See the module documentation.
 ///
 /// # `bi_used` is not optional
@@ -189,7 +185,7 @@ pub(crate) use crate::trees::_tr_flush_bits as flush_bits;
 /// is caller-visible state rather than bookkeeping that may be dropped.
 ///
 /// The `#ifdef ZLIB_DEBUG` initialisation of `compressed_len` and `bits_sent`
-/// (L471-L474) is not ported.
+/// (L471-L474) is not implemented.
 ///
 /// # Callers
 ///
@@ -218,24 +214,10 @@ pub(crate) fn _tr_init<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) {
     init_block(state);
 }
 
-// -----------------------------------------------------------------------------
-//  _tr_stored_block -- L857-L875
-// -----------------------------------------------------------------------------
-
 /// Sends a stored block: the three-bit header, then `LEN`, `NLEN` and the raw
 /// bytes.
 ///
-/// Port of `_tr_stored_block` (L860-L875):
-///
-/// ```c
-/// send_bits(s, (STORED_BLOCK<<1) + last, 3);   /* send block type */
-/// bi_windup(s);                                /* align on byte boundary */
-/// put_short(s, (ush)stored_len);
-/// put_short(s, (ush)~stored_len);
-/// if (stored_len)
-///     zmemcpy(s->pending_buf + s->pending, (Bytef *)buf, stored_len);
-/// s->pending += stored_len;
-/// ```
+/// Mirrors `_tr_stored_block` (L860-L875).
 ///
 /// This is the `BTYPE = 00` block of `doc/rfc1951.txt` 3.2.4: the header is
 /// followed by "any bits of input up to the next byte boundary are ignored", then
@@ -273,7 +255,7 @@ pub(crate) fn _tr_init<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) {
 /// the moment this function is chosen. [`_tr_flush_block`] calls
 /// [`build::init_block`] immediately afterwards in any case.
 ///
-/// The `#ifdef ZLIB_DEBUG` accounting at L869-L874 is not ported.
+/// The `#ifdef ZLIB_DEBUG` accounting at L869-L874 is not implemented.
 ///
 /// # Callers
 ///
@@ -289,7 +271,7 @@ pub(crate) fn _tr_stored_block<'a, A: Allocator<'a>>(
 ) {
     // Every C call site pairs a null `buf` with a zero `stored_len`; a null
     // pointer with a non-zero length would be an out-of-bounds read there. The
-    // port declines the copy instead, which is the assertion stated as code.
+    // implementation declines the copy instead, which is the assertion stated as code.
     debug_assert!(
         buf.is_some() || stored_len == 0,
         "_tr_stored_block with no buf and a non-empty block (trees.c L866-L867)"
@@ -357,13 +339,9 @@ pub(crate) fn _tr_stored_block<'a, A: Allocator<'a>>(
     }
 }
 
-// -----------------------------------------------------------------------------
-//  _tr_flush_bits -- L877-L882
-// -----------------------------------------------------------------------------
-
 /// Flushes the bit buffer to pending output, leaving at most seven bits behind.
 ///
-/// Port of `_tr_flush_bits` (L880-L882), whose entire body is `bi_flush(s)`. It
+/// Mirrors `_tr_flush_bits` (L880-L882), whose entire body is `bi_flush(s)`. It
 /// exists as a separate function because `bi_flush` is `local` to `trees.c`
 /// while `deflate.c` needs the operation, so this is the exported wrapper --
 /// which is exactly the shape kept here: the implementation is
@@ -385,13 +363,9 @@ pub(crate) fn _tr_flush_bits<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, 
     bi_flush(state);
 }
 
-// -----------------------------------------------------------------------------
-//  _tr_align -- L884-L895
-// -----------------------------------------------------------------------------
-
 /// Sends one empty static block, to give inflate enough lookahead.
 ///
-/// Port of `_tr_align` (L888-L895):
+/// Mirrors `_tr_align` (L888-L895):
 ///
 /// ```c
 /// send_bits(s, STATIC_TREES<<1, 3);
@@ -413,7 +387,7 @@ pub(crate) fn _tr_flush_bits<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, 
 /// `STATIC_TREES << 1`, which is what [`BlockChoice::header_bits`] would return
 /// for `last = false`; it is written as the reference writes it, at L889.
 ///
-/// The `#ifdef ZLIB_DEBUG` `compressed_len += 10` at L892 is not ported.
+/// The `#ifdef ZLIB_DEBUG` `compressed_len += 10` at L892 is not implemented.
 ///
 /// # Callers
 ///
@@ -432,13 +406,9 @@ pub(crate) fn _tr_align<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) {
     bi_flush(state);
 }
 
-// -----------------------------------------------------------------------------
-//  _tr_flush_block -- L993-L1089  (byte-identity critical)
-// -----------------------------------------------------------------------------
-
 /// Determines the best encoding for the current block and writes it out.
 ///
-/// Port of `_tr_flush_block` (L997-L1089). This function is *orchestration only*:
+/// Mirrors `_tr_flush_block` (L997-L1089). This function is *orchestration only*:
 /// `build.rs` owns the decision arithmetic and every helper, and this owns the
 /// order in which they run and the dispatch on the answer. The split is on
 /// purpose, and the seam is exact -- [`build::select_block_type`] is the whole of
@@ -486,23 +456,27 @@ pub(crate) fn _tr_align<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) {
 ///   `(ulg)((long)s->strstart - s->block_start)` (`deflate.c` L1634).
 /// * `last` -- C's `int last`, the `BFINAL` bit.
 ///
-/// # What is not ported
+/// # What is not implemented
 ///
 /// `Assert(s->compressed_len == s->bits_sent, "bad compressed size")` (L1075) and
 /// every `Tracev` are `ZLIB_DEBUG`-only, and the two counters they compare do not
-/// exist in this port. The `#ifdef ZLIB_DEBUG` additions to `compressed_len` at
+/// exist in this implementation. The `#ifdef ZLIB_DEBUG` additions to `compressed_len` at
 /// L1063, L1072 and L1084 are omitted for the same reason.
 ///
 /// # Callers
 ///
-/// `deflate/algorithm.rs`, from `flush_block_only` -- the port of
+/// `deflate/algorithm.rs`, from `flush_block_only` -- the Rust counterpart of
 /// `FLUSH_BLOCK_ONLY` (`deflate.c` L1630-L1640) -- which is what every one of the
 /// five compression strategies reaches it through.
 // The call to `_tr_stored_block` below names an underscore-prefixed item, which
 // `clippy::pedantic` flags. The six names in this module are the C spellings of
 // `deflate.h` L311-L318 and are kept for oracle traceability, so the call is
 // allowed here rather than the name changed.
-#[allow(clippy::used_underscore_items)]
+// MSRV guard: `unknown_lints` comes first because `clippy::used_underscore_items` postdates the
+// declared 1.80 floor, where the lint NAME is itself an `unknown_lints` error under `-D warnings`.
+// Allowing `unknown_lints` in the same list makes the attribute inert on 1.80 and effective on
+// current stable. Do not drop it while the floor is 1.80.
+#[allow(unknown_lints, clippy::used_underscore_items)]
 pub(crate) fn _tr_flush_block<'a, A: Allocator<'a>>(
     state: &mut DeflateState<'a, A>,
     data_type: &mut i32,
@@ -602,30 +576,11 @@ pub(crate) fn _tr_flush_block<'a, A: Allocator<'a>>(
     }
 }
 
-// -----------------------------------------------------------------------------
-//  _tr_tally -- L1091-L1119
-// -----------------------------------------------------------------------------
-
 /// Saves one literal or one match and tallies its frequency counts.
 ///
-/// Port of `_tr_tally` (L1095-L1119), whose contract is its own comment: "Save
+/// Mirrors `_tr_tally` (L1095-L1119), whose contract is its own comment: "Save
 /// the match info and tally the frequency counts. Return true if the current
 /// block must be flushed." (L1092-L1093).
-///
-/// ```c
-/// s->sym_buf[s->sym_next++] = (uch)dist;
-/// s->sym_buf[s->sym_next++] = (uch)(dist >> 8);
-/// s->sym_buf[s->sym_next++] = (uch)lc;
-/// if (dist == 0) {
-///     s->dyn_ltree[lc].Freq++;
-/// } else {
-///     s->matches++;
-///     dist--;
-///     s->dyn_ltree[_length_code[lc] + LITERALS + 1].Freq++;
-///     s->dyn_dtree[d_code(dist)].Freq++;
-/// }
-/// return (s->sym_next == s->sym_end);
-/// ```
 ///
 /// # Arguments and their widths
 ///
@@ -744,10 +699,6 @@ pub(crate) fn _tr_tally<'a, A: Allocator<'a>>(
     flush
 }
 
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
-
 #[cfg(test)]
 // The workspace denies the panic-prone lints, which is right for library code and wrong for a
 // harness: a test asserts, and a failing assertion panics. Indexing is allowed because every index
@@ -755,7 +706,12 @@ pub(crate) fn _tr_tally<'a, A: Allocator<'a>>(
 // because these tests call the six functions under test, whose names are the C spellings of
 // `deflate.h` L311-L318. The same relaxation, for the same reasons, appears in `trees/build.rs`,
 // `trees/bit_writer.rs`, `deflate/pending.rs` and `deflate/state.rs`.
+// MSRV guard: `unknown_lints` comes first because `clippy::used_underscore_items` postdates the
+// declared 1.80 floor, where the lint NAME is itself an `unknown_lints` error under `-D warnings`.
+// Allowing `unknown_lints` in the same list makes the attribute inert on 1.80 and effective on
+// current stable. Do not drop it while the floor is 1.80.
 #[allow(
+    unknown_lints,
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::panic,
@@ -771,10 +727,6 @@ mod tests {
         BL_CODES, DEF_MEM_LEVEL, D_CODES, LITERALS, L_CODES,
     };
     use crate::trees::static_tables::{_length_code, static_ltree, END_BLOCK};
-
-    // -------------------------------------------------------------------------
-    //  Fixtures
-    // -------------------------------------------------------------------------
 
     /// A stream configured as `deflateInit2(&strm, level, Z_DEFLATED, -15, 8, strategy)` and then
     /// wired up by [`_tr_init`], which is exactly the state the C oracle for these tests starts
@@ -864,10 +816,6 @@ mod tests {
         state.pending.written()[0] & 7
     }
 
-    // -------------------------------------------------------------------------
-    //  _tr_init -- L456-L478
-    // -------------------------------------------------------------------------
-
     /// Every field the folder later reads is established, even from poisoned memory.
     ///
     /// The expected values are the reference's, read out of a C `deflate_state` immediately after
@@ -938,10 +886,6 @@ mod tests {
         assert_eq!(once.d_desc, twice.d_desc);
         assert_eq!(once.bl_desc, twice.bl_desc);
     }
-
-    // -------------------------------------------------------------------------
-    //  _tr_tally -- L1095-L1119
-    // -------------------------------------------------------------------------
 
     /// A literal is stored as a zero distance and raises its own frequency.
     ///
@@ -1022,10 +966,6 @@ mod tests {
         assert_eq!(state.sym_next(), state.sym_end());
         assert_eq!(state.sym_next(), 49149);
     }
-
-    // -------------------------------------------------------------------------
-    //  _tr_align -- L888-L895, and _tr_flush_bits -- L880-L882
-    // -------------------------------------------------------------------------
 
     /// One empty static block is ten bits: three of header, then the seven-bit
     /// `static_ltree` code for `END_BLOCK`.
@@ -1130,10 +1070,6 @@ mod tests {
         assert_eq!(state.bi_valid, 6);
     }
 
-    // -------------------------------------------------------------------------
-    //  _tr_stored_block -- L860-L875
-    // -------------------------------------------------------------------------
-
     /// The header, the `LEN`/`NLEN` pair and the payload, in that order.
     ///
     /// Measured from the reference for `_tr_stored_block(s, s->window, 5, 0)` over the bytes
@@ -1188,10 +1124,6 @@ mod tests {
 
         assert_eq!(state.pending.written(), &[0x00, 0x00, 0x00, 0xff, 0xff]);
     }
-
-    // -------------------------------------------------------------------------
-    //  _tr_flush_block -- L997-L1089
-    // -------------------------------------------------------------------------
 
     /// An empty final block: the `Z_FINISH`-on-empty-input path.
     ///

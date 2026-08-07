@@ -1,6 +1,6 @@
 //! The bit-level output primitives -- every bit the compressor emits passes through here.
 //!
-//! Ports the six items `trees.c` keeps between L140 and L286: the `put_short` macro, the three
+//! Implements the six items `trees.c` keeps between L140 and L286: the `put_short` macro, the three
 //! bit-buffer routines `bi_reverse`, `bi_flush` and `bi_windup`, and the two macros `send_code`
 //! and `send_bits` that all Huffman output travels on.
 //!
@@ -19,15 +19,7 @@
 //! # The accumulator, and why its exact width is observable
 //!
 //! Three fields of [`DeflateState`] make up the accumulator, and all three are the reference's
-//! (`deflate.h` L266-L276):
-//!
-//! ```c
-//! ush bi_buf;   /* Output buffer. bits are inserted starting at the bottom
-//!                * (least significant bits). */
-//! int bi_valid; /* Number of valid bits in bi_buf.  All bits above the last
-//!                * valid bit are always zero. */
-//! int bi_used;  /* Last number of used bits when going to a byte boundary. */
-//! ```
+//! (`deflate.h` L266-L276).
 //!
 //! `bi_buf` is a `ush`, so it is **16 bits wide and nothing wider** -- [`BUF_SIZE`] is C's
 //! `Buf_size` of 16 (`deflate.h` L55-L56). Widening it to 32 or 64 bits would be a behaviour
@@ -35,7 +27,7 @@
 //! incoming value in at `bi_valid` and lets the high bits fall off the top of the `ush`
 //! (L263), then re-extracts exactly those discarded bits by shifting the *original* value right
 //! by `Buf_size - bi_valid` (L265). In a wider register the first step would keep bits the
-//! second step also produces, and every spilled short would carry duplicated bits. The port
+//! second step also produces, and every spilled short would carry duplicated bits. The implementation
 //! therefore keeps `u16` storage and reproduces C's cast semantics explicitly; see
 //! [`shifted_in`] and [`shifted_out`].
 //!
@@ -86,7 +78,7 @@
 //! * **`deflatePrime`** (`deflate.c` L745-L770) writes `bi_buf` and `bi_valid` itself instead of
 //!   going through [`send_bits`], because it inserts bits at a byte boundary the caller chooses.
 //!   It is `deflate/mod.rs`'s, and it is the reason [`BUF_SIZE`] is public to the crate.
-//! * **Everything under `ZLIB_DEBUG`** is not ported: the `send_bits` *function* form (L253-L271),
+//! * **Everything under `ZLIB_DEBUG`** is not implemented: the `send_bits` *function* form (L253-L271),
 //!   `bits_sent` (L190-L192, L256), `compressed_len`, `Assert`, `Tracevv` and the debug variant
 //!   of `send_code` (L242-L246). The default build uses the macro forms, and those are what the
 //!   byte-identical-output requirement is stated against.
@@ -108,27 +100,20 @@
 //! test build and cannot become a release-mode abort inside a library a C caller has linked --
 //! the same posture, for the same reason, as [`crate::deflate::pending`].
 
-use crate::deflate::pending::put_byte;
+use crate::deflate::pending::{put_byte, put_short_lsb};
 use crate::deflate::state::{Allocator, CtData, DeflateState, BUF_SIZE};
 
-// -----------------------------------------------------------------------------
-//  C cast reproduction
-// -----------------------------------------------------------------------------
-
-/// C's `(uch)((w) & 0xff)`: the low byte of a short (L145).
+/// C's `(Byte)s->bi_buf`, which `bi_flush` (L172) and `bi_windup` (L184) use to move the bottom
+/// eight bits of the accumulator into the pending buffer.
 ///
-/// Also C's `(Byte)s->bi_buf`, which `bi_flush` (L172) and `bi_windup` (L184) use to move the
-/// bottom eight bits of the accumulator into the pending buffer.
+/// The `put_short` macro's `(uch)((w) & 0xff)` and `(uch)((ush)(w) >> 8)` pair (L145-L146) is not
+/// spelled out here: [`put_short`] hands the whole short to
+/// [`crate::deflate::pending::put_short_lsb`], whose `u16::to_le_bytes` performs exactly those two
+/// truncations in exactly that order.
 #[inline]
 fn low_byte(value: u16) -> u8 {
     // The mask is the cast's own truncation, so nothing is lost that C keeps.
     (value & 0xff) as u8
-}
-
-/// C's `(uch)((ush)(w) >> 8)`: the high byte of a short (L146).
-#[inline]
-fn high_byte(value: u16) -> u8 {
-    (value >> 8) as u8
 }
 
 /// C's `(ush)value << bits`, truncated to the width `bi_buf` can hold.
@@ -169,32 +154,17 @@ fn shifted_out(value: u16, bits: i32) -> u16 {
     value.checked_shr(bits.unsigned_abs()).unwrap_or(0)
 }
 
-// -----------------------------------------------------------------------------
-//  Code reversal -- L149-L161
-// -----------------------------------------------------------------------------
-
 /// Reverses the low `len` bits of `code`.
 ///
-/// Port of `bi_reverse` (L154-L161), whose comment records both its contract and its rationale --
+/// Mirrors `bi_reverse` (L154-L161), whose comment records both its contract and its rationale --
 /// "Reverse the first len bits of a code, using straightforward code (a faster method would use a
-/// table)", `IN assertion: 1 <= len <= 15` (L149-L153):
-///
-/// ```c
-/// local unsigned bi_reverse(unsigned code, int len) {
-///     unsigned res = 0;
-///     do {
-///         res |= code & 1;
-///         code >>= 1, res <<= 1;
-///     } while (--len > 0);
-///     return res >> 1;
-/// }
-/// ```
+/// table)", `IN assertion: 1 <= len <= 15` (L149-L153).
 ///
 /// `gen_codes` is the only caller (L227). It reverses each canonical Huffman code once, as the
 /// code is assigned, because RFC 1951 requires a code to be transmitted most-significant bit
 /// first (`doc/rfc1951.txt` L299-L300) while [`send_bits`] emits least-significant bit first.
 ///
-/// # The loop shape is part of the port
+/// # The loop shape is part of the implementation
 ///
 /// C's body is a `do`/`while`, so it always runs at least once, and it shifts `res` left on
 /// *every* iteration including the last -- which the trailing `res >> 1` then undoes. Both
@@ -234,21 +204,10 @@ pub(crate) fn bi_reverse(code: u16, len: u16) -> u16 {
     res >> 1
 }
 
-// -----------------------------------------------------------------------------
-//  Writing a short -- L140-L147
-// -----------------------------------------------------------------------------
-
 /// Appends a 16-bit value to the pending buffer, **least** significant byte first.
 ///
-/// Port of the `put_short` macro (L144-L147), whose comment is "Output a short LSB first on the
-/// stream. IN assertion: there is enough room in pendingBuf." (L140-L143):
-///
-/// ```c
-/// #define put_short(s, w) { \
-///     put_byte(s, (uch)((w) & 0xff)); \
-///     put_byte(s, (uch)((ush)(w) >> 8)); \
-/// }
-/// ```
+/// Mirrors the `put_short` macro (L144-L147), whose comment is "Output a short LSB first on the
+/// stream. IN assertion: there is enough room in pendingBuf." (L140-L143).
 ///
 /// The order is not a convention that could be swapped. Two kinds of caller depend on it:
 ///
@@ -265,46 +224,30 @@ pub(crate) fn bi_reverse(code: u16, len: u16) -> u16 {
 /// # Return value
 ///
 /// `true` when both bytes were stored. `false` reports that the pending buffer filled, in which
-/// case the low byte may have been written and the high byte not -- the same partial write C's
-/// two-statement expansion performs, except that C would also write past the end of the
-/// allocation. Deliberately not `#[must_use]`, exactly as
-/// [`put_byte`] is not: every C caller has already discharged
-/// the IN assertion, so the four call sites in this file ignore the result as C's macro does.
+/// case nothing was written: the two bytes go out together, so a buffer with room for one of them
+/// and not the other stores neither, where C's two-statement expansion would store the low byte
+/// and then write the high byte past the end of the allocation. Deliberately not `#[must_use]`,
+/// exactly as [`put_byte`] is not: every C caller has already discharged the IN assertion, so the
+/// four call sites in this file ignore the result as C's macro does.
+///
+/// # One buffer bound, not two
+///
+/// Both bytes are handed to [`crate::deflate::pending::put_short_lsb`] together rather than
+/// appended one at a time, because this is the innermost write of the compressor: [`send_bits`]
+/// spills the accumulator through here whenever it fills, which for an incompressible block is
+/// roughly once per input byte. Two `put_byte` calls established the same buffer bound twice at
+/// that frequency.
 #[inline]
 pub(crate) fn put_short<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>, w: u16) -> bool {
-    // `put_byte(s, (uch)((w) & 0xff));`
-    let low = low_byte(w);
-    // `put_byte(s, (uch)((ush)(w) >> 8));`
-    let high = high_byte(w);
-
-    // `&&` short-circuits where C would perform the second write regardless. The outcome is the
-    // same either way -- a buffer with no room for the low byte has none for the high byte -- and
-    // stopping is what keeps the checked view from being asked for a slot it does not have.
-    put_byte(state, low) && put_byte(state, high)
+    // `put_byte(s, (uch)((w) & 0xff)); put_byte(s, (uch)((ush)(w) >> 8));` -- `to_le_bytes`
+    // inside `put_short_lsb` produces exactly that pair, in that order.
+    put_short_lsb(state, w)
 }
-
-// -----------------------------------------------------------------------------
-//  Draining the accumulator -- L163-L193
-// -----------------------------------------------------------------------------
 
 /// Moves whole bytes out of the bit buffer, keeping at most seven bits in it.
 ///
-/// Port of `bi_flush` (L166-L176), documented as "Flush the bit buffer, keeping at most 7 bits in
-/// it." (L163-L165):
-///
-/// ```c
-/// local void bi_flush(deflate_state *s) {
-///     if (s->bi_valid == 16) {
-///         put_short(s, s->bi_buf);
-///         s->bi_buf = 0;
-///         s->bi_valid = 0;
-///     } else if (s->bi_valid >= 8) {
-///         put_byte(s, (Byte)s->bi_buf);
-///         s->bi_buf >>= 8;
-///         s->bi_valid -= 8;
-///     }
-/// }
-/// ```
+/// Mirrors `bi_flush` (L166-L176), documented as "Flush the bit buffer, keeping at most 7 bits in
+/// it." (L163-L165).
 ///
 /// The three-way shape is exact and the thresholds differ from [`bi_windup`]'s: `== 16` first,
 /// then `>= 8`, then an implicit no-op. Nothing is emitted below eight valid bits, because a
@@ -347,21 +290,8 @@ pub(crate) fn bi_flush<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) {
 
 /// Flushes the bit buffer and aligns the output on a byte boundary.
 ///
-/// Port of `bi_windup` (L181-L193), documented as "Flush the bit buffer and align the output on a
-/// byte boundary" (L178-L180):
-///
-/// ```c
-/// local void bi_windup(deflate_state *s) {
-///     if (s->bi_valid > 8) {
-///         put_short(s, s->bi_buf);
-///     } else if (s->bi_valid > 0) {
-///         put_byte(s, (Byte)s->bi_buf);
-///     }
-///     s->bi_used = ((s->bi_valid - 1) & 7) + 1;
-///     s->bi_buf = 0;
-///     s->bi_valid = 0;
-/// }
-/// ```
+/// Mirrors `bi_windup` (L181-L193), documented as "Flush the bit buffer and align the output on a
+/// byte boundary" (L178-L180).
 ///
 /// Unlike [`bi_flush`] this emits a *partial* byte, padding it with the zeros above the last valid
 /// bit -- which is exactly what aligning means, and why the thresholds are `> 8` and `> 0` here
@@ -391,8 +321,8 @@ pub(crate) fn bi_flush<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) {
 ///
 /// `_tr_stored_block` calls this immediately after the three block-type bits, to align before the
 /// `LEN`/`NLEN` pair (L863), and `_tr_flush_block` calls it once the last block of the stream has
-/// been written (L1081-L1083). The `#ifdef ZLIB_DEBUG` rounding of `bits_sent` (L190-L192) is not
-/// ported.
+/// been written (L1081-L1083). The `#ifdef ZLIB_DEBUG` rounding of `bits_sent` (L190-L192) is
+/// not implemented.
 pub(crate) fn bi_windup<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) {
     if state.bi_valid > 8 {
         // `put_short(s, s->bi_buf);` -- more than a byte is pending, so both bytes go out; the
@@ -415,31 +345,11 @@ pub(crate) fn bi_windup<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) {
     state.bi_valid = 0;
 }
 
-// -----------------------------------------------------------------------------
-//  Sending bits -- L238-L286
-// -----------------------------------------------------------------------------
-
 /// Sends a value on a given number of bits.
 ///
-/// Port of the default, non-`ZLIB_DEBUG` `send_bits` macro (L274-L286). Its contract is stated
+/// Mirrors the default, non-`ZLIB_DEBUG` `send_bits` macro (L274-L286). Its contract is stated
 /// once above both forms -- "Send a value on a given number of bits. IN assertion: length <= 16 and
-/// value fits in length bits." (L248-L251) -- and the macro is:
-///
-/// ```c
-/// #define send_bits(s, value, length) \
-/// { int len = length;\
-///   if (s->bi_valid > (int)Buf_size - len) {\
-///     int val = (int)value;\
-///     s->bi_buf |= (ush)val << s->bi_valid;\
-///     put_short(s, s->bi_buf);\
-///     s->bi_buf = (ush)val >> (Buf_size - s->bi_valid);\
-///     s->bi_valid += len - Buf_size;\
-///   } else {\
-///     s->bi_buf |= (ush)(value) << s->bi_valid;\
-///     s->bi_valid += len;\
-///   }\
-/// }
-/// ```
+/// value fits in length bits." (L248-L251) -- and the macro is.
 ///
 /// Every bit of every compressed block reaches the output through this function: the three
 /// block-type bits (L862, L889, L1059, L1066), the three tree-size fields and the bit-length code
@@ -459,7 +369,7 @@ pub(crate) fn bi_windup<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) {
 ///    right by `Buf_size - bi_valid`, again using the pre-update `bi_valid` (see [`shifted_out`]);
 /// 4. only then is `bi_valid` advanced, by `length - Buf_size`.
 ///
-/// The port captures `bi_valid` in a local before step 1 so that steps 1 and 3 cannot see a
+/// The implementation captures `bi_valid` in a local before step 1 so that steps 1 and 3 cannot see a
 /// half-updated value. Getting the order wrong produces a stream that frequently still
 /// round-trips locally while differing from the reference, which is why the differential suite,
 /// not inspection, is the arbiter here.
@@ -481,6 +391,18 @@ pub(crate) fn bi_windup<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) {
 /// [`debug_assert!`]s. The `ZLIB_DEBUG` function form additionally asserts `length > 0 && length
 /// <= 15` (L255); that stricter bound is deliberately not enforced, because the contract the
 /// default build is written against is the comment's.
+///
+/// # Why `#[inline(always)]`
+///
+/// In the default build this is a **macro** in C (L263-L269), expanded at every one of its call
+/// sites, and the busiest of those sites is `compress_block`'s per-symbol emission (L900-L951) --
+/// two to four calls for every literal or match in a block. Release codegen at `opt-level = 3`
+/// with one codegen unit and fat LTO was measured declining a plain `#[inline]` there, which left
+/// a call, a register save/restore and a re-established buffer bound per symbol in the compressor's
+/// innermost loop. The body is a dozen instructions plus one bounded write, so forcing it costs
+/// little code and restores the macro's shape.
+#[allow(clippy::inline_always)]
+#[inline(always)]
 pub(crate) fn send_bits<'a, A: Allocator<'a>>(
     state: &mut DeflateState<'a, A>,
     value: u16,
@@ -529,7 +451,7 @@ pub(crate) fn send_bits<'a, A: Allocator<'a>>(
 
 /// Sends the code of a symbol from a given Huffman tree.
 ///
-/// Port of the default, non-`ZLIB_DEBUG` `send_code` macro (L238-L240), whose comment is "Send a
+/// Mirrors the default, non-`ZLIB_DEBUG` `send_code` macro (L238-L240), whose comment is "Send a
 /// code of the given tree. c and tree must not have side effects":
 ///
 /// ```c
@@ -556,16 +478,22 @@ pub(crate) fn send_bits<'a, A: Allocator<'a>>(
 /// passes a tree living *inside* the state -- `dyn_ltree`, `dyn_dtree` or `bl_tree`. That is the
 /// aliasing C performs freely through `const ct_data *` while `send_bits` mutates the same struct
 /// (L900-L949). A caller in that position copies the entry out first, which is two `u16`s, and
-/// emits it directly:
+/// emits it directly. The shape is shown rather than compiled, because both functions it names
+/// are crate-private:
 ///
-/// ```ignore
+/// ```text
 /// let entry = state.tree_for(kind).get(symbol).copied().unwrap_or_default();
 /// send_bits(state, entry.code(), i32::from(entry.len()));
 /// ```
 ///
 /// Passing one of the `'static` tables from [`crate::trees::static_tables`], as `_tr_align` does
 /// with `send_code(s, END_BLOCK, static_ltree)` (L890), needs no such treatment.
-#[inline]
+///
+/// `#[inline(always)]` for the reason given on [`send_bits`]: this too is a macro in C (L238-L240)
+/// and its busiest caller is `compress_block`'s per-symbol emission, where release codegen was
+/// measured declining a plain `#[inline]`. The body is one table read and one [`send_bits`].
+#[allow(clippy::inline_always)]
+#[inline(always)]
 pub(crate) fn send_code<'a, A: Allocator<'a>>(
     state: &mut DeflateState<'a, A>,
     code: usize,
@@ -580,10 +508,6 @@ pub(crate) fn send_code<'a, A: Allocator<'a>>(
     // `send_bits(s, tree[c].Code, tree[c].Len)`
     send_bits(state, entry.code(), i32::from(entry.len()));
 }
-
-// -----------------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 // The workspace denies the panic-prone lints, which is right for library code and wrong for a
@@ -692,10 +616,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  bi_reverse -- L154-L161
-    // -------------------------------------------------------------------------
-
     #[test]
     fn bi_reverse_matches_an_independent_reversal_exhaustively() {
         // The IN assertion is `1 <= len <= 15` (L152), and `MAX_BITS` is that upper bound. Every
@@ -729,7 +649,7 @@ mod tests {
         // C's `do`/`while` executes before it tests, so `len == 0` leaves `res` at `(code & 1) << 1`
         // and the trailing `>> 1` returns the low bit of `code`. A `while` or `for` loop would
         // return 0 instead. The value is outside the IN assertion; reproducing it is what proves
-        // the loop shape was ported rather than approximated.
+        // the loop shape is reproduced exactly rather than approximated.
         assert_eq!(bi_reverse(0, 0), 0);
         assert_eq!(bi_reverse(1, 0), 1);
         assert_eq!(bi_reverse(0xfffe, 0), 0);
@@ -799,10 +719,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  put_short -- L144-L147
-    // -------------------------------------------------------------------------
-
     #[test]
     fn put_short_writes_the_low_byte_first() {
         let mut state = default_state();
@@ -848,10 +764,6 @@ mod tests {
         assert_eq!(lsb.pending.written(), &[0x9c, 0x78]);
         assert_eq!(msb.pending.written(), &[0x78, 0x9c]);
     }
-
-    // -------------------------------------------------------------------------
-    //  send_bits -- L274-L286
-    // -------------------------------------------------------------------------
 
     #[test]
     fn send_bits_accumulates_without_emitting_below_the_boundary() {
@@ -1018,10 +930,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  bi_flush -- L166-L176
-    // -------------------------------------------------------------------------
-
     #[test]
     fn bi_flush_covers_every_threshold() {
         // The three-way structure at every interesting width, plus the post-condition that at most
@@ -1097,10 +1005,6 @@ mod tests {
         assert_eq!(state.bi_valid, 7);
     }
 
-    // -------------------------------------------------------------------------
-    //  bi_windup -- L181-L193
-    // -------------------------------------------------------------------------
-
     #[test]
     fn bi_windup_reports_bi_used_for_every_bit_count() {
         // `s->bi_used = ((s->bi_valid - 1) & 7) + 1;` in C's signed `int`, tabulated for every
@@ -1173,10 +1077,6 @@ mod tests {
         assert_eq!(state.bi_used, 3);
     }
 
-    // -------------------------------------------------------------------------
-    //  send_code -- L238-L240
-    // -------------------------------------------------------------------------
-
     #[test]
     fn send_code_sends_the_code_and_the_length_of_the_entry() {
         let mut state = default_state();
@@ -1223,10 +1123,6 @@ mod tests {
         assert_eq!(state.bi_valid, 2);
         assert!(state.pending.written().is_empty());
     }
-
-    // -------------------------------------------------------------------------
-    //  The primitives in concert
-    // -------------------------------------------------------------------------
 
     #[test]
     fn tr_align_emits_the_ten_bits_it_documents() {

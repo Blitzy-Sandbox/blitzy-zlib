@@ -2,14 +2,17 @@
 //  crates/libz-rs-sys/build.rs -- the linker and packaging build script
 // ============================================================================
 //
-// This script has exactly four jobs and deliberately does nothing else.  Every
+// This script has exactly three jobs and deliberately does nothing else.  Every
 // directive it emits traces back to `configure`, to `Makefile.in`, or to a
 // requirement of the port:
 //
 //   1. ZLIB_RS_SIMD -- the documented build-time toggle for the vectorised
-//      checksum backends, surfaced to the crate as `cfg(zlib_rs_simd)` and
-//      always paired with the `rustc-check-cfg` declaration that keeps the
-//      build warning-free on Rust 1.80 and later.
+//      checksum backends.  A build script cannot switch a Cargo feature on or
+//      off, so this script VALIDATES the variable against the resolved `simd`
+//      feature and refuses a request it cannot satisfy; the translation from
+//      variable to feature belongs to whatever invokes cargo, and
+//      `Makefile.in`'s `rust` target performs it.  See the long comment above
+//      `check_simd_request`.
 //
 //   2. SONAME -- `-Wl,-soname,libz.so.1` on ELF targets, byte for byte the
 //      argument `configure` bakes into LDSHARED (configure L334 for
@@ -23,10 +26,45 @@
 //      rustc's own cdylib link, and for the verified place it is applied
 //      instead.
 //
-//   4. The versioned symlink chain next to the cdylib, so the dynamic loader
-//      binds this artifact rather than quietly falling back to the system
-//      libz.  See the comment block above `install_soname_aliases`: this is
-//      the single most consequential thing this file does.
+// WHAT THIS SCRIPT DELIBERATELY DOES NOT DO: THE VERSIONED SYMLINK CHAIN
+//
+// A drop-in `libz` needs the chain `libz.so.<ZLIB_VERSION>` <- `libz.so.1` <-
+// `libz.so`, because the SONAME recorded in the object is `libz.so.1` and the
+// dynamic loader searches for a file with exactly that name.  When only a bare
+// `libz.so` is present the loader silently falls back to the SYSTEM libz --
+// observed directly, with `ldd` resolving to /lib/x86_64-linux-gnu/libz.so.1 and
+// the test program printing the system library's version.
+//
+// That chain is created by the PACKAGING step -- `Makefile.in`'s `rust` target,
+// which stages the relinked shared object into an isolated directory and creates
+// the whole chain there, atomically, after the link -- and it is emphatically
+// NOT created here.  Two reasons, and the first is a correctness bug rather
+// than a preference:
+//
+//   * A build script runs BEFORE the link.  Anything loader-visible it creates
+//     in `target/<profile>` therefore exists while the file it names does not,
+//     or still names the previous build's bytes.  `target/<profile>` is on the
+//     library search path of everything cargo itself launches -- build scripts
+//     of other crates, proc macros, `cargo test` binaries -- so a co-located
+//     process can resolve `libz.so.1` to a dangling link or to a stale library.
+//     Measured, not supposed: `cargo test` puts `target/<profile>` first on
+//     LD_LIBRARY_PATH, ahead of `target/<profile>/deps`, and `nm`, `readelf` and
+//     `ld.bfd` each carry `DT_NEEDED libz.so.1` with no RPATH of their own
+//     (`ld.so --list /usr/bin/nm`).  A `libz.so.1` sitting there is therefore
+//     loaded by the very host tools the verification steps invoke, against a
+//     library that may be half-built -- it surfaces as `nm: ...: no version
+//     information available`, and at worst the tools inspecting the artifact are
+//     running code out of it.  A packaging step has no such window: it runs after
+//     the link, from a directory nothing is searching yet.
+//
+//   * A build script cannot tell whether a cdylib is being produced at all.
+//     Reading `crate-type` out of the manifest, which is the only thing
+//     available here, says what the package CAN emit, not what this invocation
+//     WILL emit -- so `cargo check`, a `cargo test` that wants only the rlib,
+//     and a dependency build all got the aliases too.
+//
+// The consequence for anyone reading this file expecting to find that code:
+// it is gone on purpose, and `Makefile.in` is where it lives.
 //
 // Hard rules this file lives by:
 //
@@ -41,9 +79,11 @@
 //
 //   * It never touches the network.
 //
-//   * It writes nothing outside cargo's own artifact directory, which the root
-//     `.gitignore` already covers (`/target/` plus the pre-existing
-//     `**/libz.so*` rule), so the working tree stays clean.
+//   * It creates and deletes NOTHING.  It reads two contract files and prints
+//     directives; every path it names is a path it only ever read.  That is
+//     stronger than the older rule of "writes nothing outside `target/`", and it
+//     is what makes the pre-link window described above impossible to reopen by
+//     accident.
 //
 //   * It uses `std` only, and the modern `cargo::` directive prefix
 //     throughout -- never the legacy single-colon `cargo:` form.  The two are
@@ -63,9 +103,7 @@
 #![allow(clippy::panic)]
 
 use std::env;
-use std::ffi::OsStr;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -85,11 +123,13 @@ const VERSION_SCRIPT: &str = "zlib.map";
 // header so that the root search cannot mistake a subdirectory for the root.
 const WORKSPACE_MANIFEST: &str = "Cargo.toml";
 
-// The unversioned shared-library names.  ELF form from Makefile.in L47
-// (`SHAREDLIB=libz.so`); Mach-O form from configure L364
-// (`SHAREDLIB=libz$shared_ext` with `shared_ext='.dylib'`).
+// The unversioned ELF shared-library name, from Makefile.in L47
+// (`SHAREDLIB=libz.so`).  It is the stem the SONAME is built on.  The Mach-O
+// spelling is `libz.dylib` (configure L364, `SHAREDLIB=libz$shared_ext` with
+// `shared_ext='.dylib'`) and is written out at the one place it is needed,
+// because on that platform the version goes BEFORE the extension and the name
+// cannot be formed by suffixing this constant.
 const ELF_SHARED_LIB: &str = "libz.so";
-const MACHO_SHARED_LIB: &str = "libz.dylib";
 
 // How far above `CARGO_MANIFEST_DIR` the repository-root search may walk.  The
 // documented distance is exactly two (crates/libz-rs-sys -> crates -> root);
@@ -108,12 +148,25 @@ const ENV_SIMD: &str = "ZLIB_RS_SIMD";
 // the measured reasons documented above `emit_version_script`.
 const ENV_VERSION_SCRIPT: &str = "ZLIB_RS_VERSION_SCRIPT";
 
-// Opt-out for the versioned symlink chain.  On by default; see the comment
-// block above `install_soname_aliases` for the one situation that wants it off.
-const ENV_SONAME_LINKS: &str = "ZLIB_RS_SONAME_LINKS";
+// The Cargo feature `ZLIB_RS_SIMD` is an assertion about.  Cargo sets
+// CARGO_FEATURE_<NAME> with the name upper-cased and hyphens turned into
+// underscores, so the `simd` feature is `CARGO_FEATURE_SIMD`.
+const CARGO_FEATURE_SIMD: &str = "CARGO_FEATURE_SIMD";
 
-// The cfg that `ZLIB_RS_SIMD=1` turns on.
+// The cfg that records "the vectorised checksum backends are compiled into this
+// build".  Derived from the RESOLVED feature set, never from the environment
+// variable, so it cannot claim a backend that was not compiled.  Declared to
+// rustc unconditionally, because Rust 1.80 turned `unexpected_cfgs` on by
+// default and this port's bar is zero build warnings.
 const CFG_SIMD: &str = "zlib_rs_simd";
+
+// The environment variable that names the compiled backend, so a test or a
+// benchmark can assert which implementation it is measuring with `env!` rather
+// than inferring it.  The two values name `zlib_rs::adler32::Adler32Simd` /
+// `zlib_rs::crc32::Simd` and `Adler32Generic` / `Braid` respectively.
+const ENV_BACKEND: &str = "ZLIB_RS_CHECKSUM_BACKEND";
+const BACKEND_SIMD: &str = "simd";
+const BACKEND_SCALAR: &str = "scalar";
 
 fn main() {
     // Emitting any `rerun-if-changed` replaces cargo's default "re-run when
@@ -134,22 +187,24 @@ fn main() {
 
     require_version_script(&version_script);
 
+    // ZLIB_VERSION is read for its leading integer, which is the SONAME's major
+    // component.  The full four-component string is the *packaging* layer's
+    // input, not this script's; see the header comment on job 3.
     let version = zlib_version(&public_header);
     let major = major_version(&version, &public_header).to_owned();
     let target = TargetInfo::from_env();
 
-    configure_simd();
+    check_simd_request();
     emit_link_args(&target, &version_script, &major);
-    install_soname_aliases(&target, &version, &major);
 }
 
 // ---------------------------------------------------------------------------
 //  1. The ZLIB_RS_SIMD build-time toggle
 // ---------------------------------------------------------------------------
 //
-// `ZLIB_RS_SIMD` selects the vectorised CRC-32 and Adler-32 backends.  Two
-// properties of that choice are worth stating where the code lives, because
-// both constrain what this toggle is allowed to do:
+// `ZLIB_RS_SIMD=0|1` is the toggle the port documents for the vectorised
+// CRC-32 and Adler-32 backends.  Two properties of that choice constrain what
+// the toggle is allowed to do, and both are worth stating where the code lives:
 //
 //   * It is OUTPUT-NEUTRAL.  A checksum yields one scalar however it is
 //     computed, so vectorising it cannot perturb a single emitted byte -- it
@@ -157,32 +212,73 @@ fn main() {
 //     two checksums: vectorising match finding would change the compressed
 //     output and would break the byte-identical-output requirement outright.
 //
-//   * It is not a promise about the hardware.  Runtime target-feature
-//     detection still guards every vectorised path, so a SIMD-enabled build
-//     runs correctly on a machine that lacks the instructions; it simply takes
-//     the scalar path there.
+//   * It is not a promise about the hardware, but not because anything probes
+//     for one.  The vectorised backends contain no architecture-specific
+//     intrinsic at all: they are portable fixed-width integer arithmetic that
+//     LLVM is free to autovectorise, so a SIMD-enabled build computes the right
+//     answer on a machine with no vector unit.  Be precise about the two
+//     backends, because they differ.  `crates/zlib-rs/src/crc32/simd.rs`
+//     performs NO detection whatsoever.
+//     `crates/zlib-rs/src/adler32/simd.rs` exposes `is_supported()`, which the
+//     parent module consults as a THROUGHPUT HINT -- a cached
+//     `is_x86_feature_detected!("sse2")` query on x86 with `std`,
+//     `cfg!(target_feature = "sse2")` on x86 without it, and unconditionally
+//     true elsewhere -- and either answer yields identical checksums.  Nothing
+//     here guards correctness, so do not describe this toggle as gated at run
+//     time.
 //
-// A build script cannot switch a Cargo feature on, so this knob does what a
-// build script legitimately can: it publishes the request as a `cfg`, which
-// the crate root can key off.  The Cargo feature `simd` remains the way to
-// actually pull the vectorised backends in from the core crate.
-fn configure_simd() {
+// WHAT THIS FUNCTION DOES, AND WHY IT IS ONLY A CHECK
+//
+// A build script cannot switch a Cargo feature on, and it cannot switch one
+// off either.  Feature resolution happens before any build script runs, and
+// nothing a script prints can revise it.  So there are exactly two coherent
+// designs for an environment variable that names a feature, and this file
+// implements the second:
+//
+//   (a) the variable becomes a `cfg`, and the crate keys its own code off that
+//       cfg instead of off the feature.  For this crate that is a dead end: the
+//       vectorised backends live in `zlib-rs`, behind ITS `simd` feature, and no
+//       cfg emitted here can reach into a dependency's feature set.  A `cfg`
+//       that nothing can act on is worse than no cfg at all -- it makes
+//       `ZLIB_RS_SIMD=1` look like it did something when the build it produced
+//       is byte for byte the scalar one.
+//
+//   (b) the variable is an ASSERTION about the resolved feature set, and the
+//       translation from variable to feature is performed by whatever invokes
+//       cargo.  `Makefile.in`'s `rust` target does exactly that: it turns
+//       `ZLIB_RS_SIMD=1` into `--features libz-rs-sys/simd`.  A direct
+//       `cargo build` gets the assertion checked instead of silently ignored.
+//
+// So: `ZLIB_RS_SIMD=1` with the `simd` feature off is a hard error naming the
+// feature to pass, `ZLIB_RS_SIMD=0` with the feature on is a hard error naming
+// how to turn it off, agreement is silent, and unset means "no assertion, the
+// feature governs".  Nothing is emitted in any case, because there is nothing
+// honest to emit.
+fn check_simd_request() {
     // Without this, cargo caches the previous decision and flipping the
-    // variable appears to do nothing at all.
+    // variable appears to do nothing at all -- which for an assertion means a
+    // stale build passing a check it would now fail.
     println!("cargo::rerun-if-env-changed={ENV_SIMD}");
 
-    // The cfg is declared unconditionally, not only when it is set.  Rust 1.80
-    // turned `unexpected_cfgs` on by default, so a `#[cfg(zlib_rs_simd)]` in
-    // src/ that this script never declares is a warning -- and the quality bar
-    // for this port is zero build warnings.  Declaring it always also means
-    // the declaration does not appear and disappear with the environment,
-    // which would make the warning intermittent and hard to attribute.
+    // Declared whether or not it is set, so that the declaration does not appear
+    // and disappear with the environment -- which would make an
+    // `unexpected_cfgs` warning intermittent and hard to attribute.
     println!("cargo::rustc-check-cfg=cfg({CFG_SIMD})");
+
+    // What cargo actually resolved.  This is the single source of truth for both
+    // outputs below and for the assertion further down.
+    let feature_on = env::var_os(CARGO_FEATURE_SIMD).is_some();
+    if feature_on {
+        println!("cargo::rustc-cfg={CFG_SIMD}");
+        println!("cargo::rustc-env={ENV_BACKEND}={BACKEND_SIMD}");
+    } else {
+        println!("cargo::rustc-env={ENV_BACKEND}={BACKEND_SCALAR}");
+    }
 
     let requested = match env::var(ENV_SIMD) {
         Ok(value) => value,
-        // Unset is the normal case and means "leave the decision alone": the
-        // crate's own `simd` Cargo feature governs, and nothing is emitted.
+        // Unset is the normal case: no assertion is being made, and the crate's
+        // own `simd` Cargo feature governs.
         Err(env::VarError::NotPresent) => return,
         // A non-Unicode value cannot be a valid `0` or `1`, so it is handled
         // together with the other malformed values below.
@@ -192,24 +288,31 @@ fn configure_simd() {
         ),
     };
 
-    match requested.trim() {
-        "1" => println!("cargo::rustc-cfg={CFG_SIMD}"),
-        "0" => {
-            // Nothing to emit -- but say so if the request contradicts the
-            // resolved feature set, because a build script cannot turn a
-            // Cargo feature off and silently ignoring the conflict would be
-            // the confusing outcome.  This warning fires only when a caller
-            // has actually created the contradiction, so the ordinary build
-            // stays warning-free.
-            if env::var_os("CARGO_FEATURE_SIMD").is_some() {
-                println!(
-                    "cargo::warning={ENV_SIMD}=0 cannot switch off the `simd` Cargo feature, \
-                     which is enabled for this build. Rebuild without `--features simd` \
-                     (or with `--no-default-features`) to get the scalar checksum backends."
-                );
-            }
-        }
-        other => panic!(
+    match (requested.trim(), feature_on) {
+        // The assertion holds.  Nothing to say and nothing to emit.
+        ("1", true) | ("0", false) => {}
+
+        // Refused rather than warned about.  A warning here would leave the
+        // caller with a scalar library it believes is vectorised, and the two
+        // are indistinguishable from the outside: identical bytes out, identical
+        // exported symbols, only the throughput differs.  That is exactly the
+        // class of mistake a build knob must not be able to make.
+        ("1", false) => panic!(
+            "{ENV_SIMD}=1 asks for the vectorised checksum backends, but the `simd` Cargo \
+             feature is not enabled for this build, and a build script cannot enable one. \
+             Rebuild with `--features libz-rs-sys/simd` (from the workspace root) or \
+             `--features simd` (from this crate), which is the translation `Makefile.in`'s \
+             `rust` target performs for you. Unset {ENV_SIMD} to leave the decision to the \
+             feature alone."
+        ),
+        ("0", true) => panic!(
+            "{ENV_SIMD}=0 asks for the scalar checksum backends, but the `simd` Cargo feature \
+             IS enabled for this build, and a build script cannot disable one. Rebuild \
+             without `--features simd`, or with `--no-default-features` plus the features you \
+             do want. Unset {ENV_SIMD} to leave the decision to the feature alone."
+        ),
+
+        (other, _) => panic!(
             "{ENV_SIMD} must be `0` or `1`, got {other:?}. Unset it to leave the decision \
              to this crate's `simd` Cargo feature."
         ),
@@ -245,9 +348,13 @@ enum SharedObjectFormat {
     // PE/COFF, MSVC or MinGW.  Neither construct exists.  configure L341-L345
     // uses a plain `-shared` for MinGW.  The PE analogue of zlib.map is a
     // module-definition file, and `win32/zlib.def` does exist in this tree --
-    // but Windows is outside the port's Tier-1 target set, so nothing is
-    // emitted here.  Should a Windows target ever be brought in scope,
-    // `win32/zlib.def` is the file to wire up, as `/DEF:` on MSVC.
+    // but Windows is OUT OF SCOPE for this port, as the target matrix in
+    // `rust-toolchain.toml` states, so nothing is emitted here and no Windows
+    // build has been attempted or verified.  Should Windows ever be brought in
+    // scope, `win32/zlib.def` is the file to wire up, as `/DEF:` on MSVC.  The
+    // `#[cfg(windows)]` items that already exist in the source (`gzopen_w`, the
+    // `_WIN32` entries in cbindgen.toml's `[defines]`) are forward
+    // compatibility, not a claim that this branch works.
     Pe,
     // Everything else: wasm, emscripten, AIX, HP-UX, bare metal.  Emitting an
     // ELF-only argument here would break the link, so nothing is emitted.
@@ -290,15 +397,6 @@ impl TargetInfo {
         } else {
             format!("{}-{}", self.os, self.env)
         }
-    }
-
-    // The chain of versioned names only makes sense where a shared library is
-    // actually produced under a `libz.*` name.
-    fn is_elf(&self) -> bool {
-        matches!(
-            self.format,
-            SharedObjectFormat::Elf | SharedObjectFormat::ElfDashH
-        )
     }
 }
 
@@ -460,248 +558,6 @@ fn cdylib_link_arg(arg: &str) {
 }
 
 // ---------------------------------------------------------------------------
-//  4. The versioned symlink chain
-// ---------------------------------------------------------------------------
-//
-// READ THIS BEFORE CHANGING ANYTHING BELOW.  The direction of the links is
-// inverted relative to the C build, and the inversion is deliberate.
-//
-//   * In the C build the real file is `libz.so.1.3.2.1-motley`, and both
-//     `libz.so` and `libz.so.1` are symlinks pointing at it.  That is the
-//     `$(SHAREDLIBV)` recipe in Makefile.in: build the versioned file, then
-//     `rm -f $(SHAREDLIB) $(SHAREDLIBM)` and `ln -s $@` twice.
-//
-//   * Cargo emits the real file as a bare `libz.so`.  So this script creates
-//     `libz.so.1` and `libz.so.1.3.2.1-motley` as symlinks pointing *at*
-//     `libz.so`.  The net effect is identical -- all three names resolve to the
-//     same inode -- and that is the only thing the dynamic loader cares about.
-//
-// Why the chain is not optional, demonstrated rather than assumed.  The
-// library's SONAME is `libz.so.1`, so a consumer asks the loader for that exact
-// name.  Build the shared library, link a C probe against it with an rpath, and
-// leave `libz.so.1` uncreated: `ldd` resolves the dependency to
-// `/lib/x86_64-linux-gnu/libz.so.1` and the probe prints the *system* zlib's
-// version.  Create the link and `ldd` resolves to the local file and the probe
-// prints `1.3.2.1-motley`.  In other words, without this chain every "drop-in
-// replacement" test passes while silently exercising the C library -- the worst
-// possible failure mode, because it is invisible.  This was reproduced
-// directly, and it is why every drop-in validation must independently assert
-// via `ldd` which artifact actually got bound instead of trusting `-L`.
-//
-// A dangling link is deliberately fine.  A build script runs *before* the crate
-// is linked, so `libz.so` does not exist yet at this point.
-// `std::os::unix::fs::symlink` succeeds against a non-existent target and the
-// link starts resolving the moment the real file appears.  The link target is
-// kept RELATIVE (`libz.so`, never an absolute path) so the whole chain survives
-// being copied or installed elsewhere.  Verified: while the link dangles the
-// loader simply skips it and falls back to the system library, so an
-// interrupted build leaves nothing harmful behind.
-//
-// The one cost, and the reason for the opt-out.  `cargo test` puts the artifact
-// directory first on LD_LIBRARY_PATH (measured: `target/<profile>` then
-// `target/<profile>/deps`).  `nm`, `readelf` and `ld.bfd` all carry
-// `DT_NEEDED libz.so.1` with no RPATH of their own, so a `libz.so.1` sitting
-// there is bound by them too -- confirmed with `ld.so --list /usr/bin/nm`.
-// Once the facade is complete that is harmless, and is in fact the strongest
-// drop-in proof available; against a partially built library it shows up as
-// `nm: .../libz.so.1: no version information available`.  `ZLIB_RS_SONAME_LINKS=0`
-// exists for exactly that situation and for nothing else.  Note that the
-// `Makefile.in` `rust` target additionally stages the same three names into a
-// separate directory of its own; that is a complementary mechanism, not a
-// substitute, because a plain `cargo build` never runs it.
-fn install_soname_aliases(target: &TargetInfo, version: &str, major: &str) {
-    println!("cargo::rerun-if-env-changed={ENV_SONAME_LINKS}");
-
-    if !parse_bool_env(ENV_SONAME_LINKS, true) {
-        return;
-    }
-
-    // On an ELF target the chain is load-bearing, so any failure is loud.
-    // Elsewhere it is a convenience and a failure is reported and tolerated.
-    let required = target.is_elf();
-
-    let (real_name, aliases) = match target.format {
-        SharedObjectFormat::Elf | SharedObjectFormat::ElfDashH => {
-            (ELF_SHARED_LIB, elf_aliases(version, major))
-        }
-        SharedObjectFormat::MachO => (MACHO_SHARED_LIB, macho_aliases(version, major)),
-        // No `libz.so`/`libz.dylib` is produced for these, so there is nothing
-        // to alias and a chain would only be misleading.
-        SharedObjectFormat::Pe | SharedObjectFormat::Other => return,
-    };
-
-    // A build script is never told which crate types are being built, so the
-    // manifest is the only available source.  The focused parser below reads
-    // only `[lib].crate-type`, including multiline arrays and comments; that is
-    // enough to avoid false positives without adding a TOML build dependency.
-    // If the array omits `cdylib`, there is nothing to alias.
-    if !cdylib_declared() {
-        return;
-    }
-
-    let Some(artifact_dir) = cargo_artifact_dir() else {
-        report(
-            required,
-            &format!(
-                "could not locate cargo's artifact directory from OUT_DIR={}, so the \
-                 {real_name} version aliases were not created. Existing binaries that \
-                 record `DT_NEEDED {ELF_SHARED_LIB}.{major}` will bind the system zlib \
-                 instead of this library. Set {ENV_SONAME_LINKS}=0 to silence this and \
-                 stage the aliases from the build system instead.",
-                env::var("OUT_DIR").unwrap_or_default()
-            ),
-        );
-        return;
-    };
-
-    // Normally cargo has already created this; creating it is idempotent and
-    // keeps the script working when the aliases are wanted before the first
-    // artifact has ever been written there.
-    if let Err(error) = fs::create_dir_all(&artifact_dir) {
-        report(
-            required,
-            &format!(
-                "could not create the artifact directory {}: {error}",
-                artifact_dir.display()
-            ),
-        );
-        return;
-    }
-
-    for alias in &aliases {
-        if let Err(error) = link_alias(&artifact_dir, alias, real_name) {
-            report(
-                required,
-                &format!(
-                    "could not create the version alias {} -> {real_name} in {}: {error}. \
-                     Without it the dynamic loader falls back to the system zlib and \
-                     drop-in tests silently exercise the wrong library. Set \
-                     {ENV_SONAME_LINKS}=0 if this platform cannot support symlinks.",
-                    alias,
-                    artifact_dir.display()
-                ),
-            );
-            return;
-        }
-    }
-}
-
-// The ELF alias set, most significant first.
-//
-//   libz.so.1                 -- SHAREDLIBM, and the SONAME this library
-//                                records.  This is the one the loader looks
-//                                for; the rest are for humans and installers.
-//   libz.so.1.3.2.1-motley    -- SHAREDLIBV as `configure` L481 computes it,
-//                                `libz$shared_ext.$VER`, with VER scraped from
-//                                ZLIB_VERSION.  This is the form that actually
-//                                ships.
-//   libz.so.1.3.2.1           -- the same name without the release suffix.
-//                                Makefile.in L48 hardcodes `SHAREDLIBV=
-//                                libz.so.1.3.2.1` and CMakeLists.txt L6 sets
-//                                `VERSION 1.3.2.1`, so both of those disagree
-//                                with what configure derives.  configure is
-//                                what ships, so the suffixed name is the real
-//                                one; this extra alias is created so that a
-//                                consumer following either of the other two
-//                                spellings still resolves.  It is skipped when
-//                                ZLIB_VERSION carries no suffix and the two
-//                                names would collide.
-fn elf_aliases(version: &str, major: &str) -> Vec<String> {
-    let mut aliases = vec![
-        format!("{ELF_SHARED_LIB}.{major}"),
-        format!("{ELF_SHARED_LIB}.{version}"),
-    ];
-    if let Some(numeric) = numeric_version(version) {
-        aliases.push(format!("{ELF_SHARED_LIB}.{numeric}"));
-    }
-    aliases
-}
-
-// The Mach-O alias set.  configure L364-L366: SHAREDLIB is `libz.dylib`,
-// SHAREDLIBM is `libz.$VER1.dylib` and SHAREDLIBV is `libz.$VER.dylib` -- the
-// version goes before the extension on this platform, not after it.
-fn macho_aliases(version: &str, major: &str) -> Vec<String> {
-    let mut aliases = vec![
-        format!("libz.{major}.dylib"),
-        format!("libz.{version}.dylib"),
-    ];
-    if let Some(numeric) = numeric_version(version) {
-        aliases.push(format!("libz.{numeric}.dylib"));
-    }
-    aliases
-}
-
-// `1.3.2.1-motley` -> `Some("1.3.2.1")`; `1.3.2.1` -> `None`, because the
-// unsuffixed alias would then be the versioned name itself.
-fn numeric_version(version: &str) -> Option<&str> {
-    let (numeric, _suffix) = version.split_once('-')?;
-    if numeric.is_empty() || numeric == version {
-        None
-    } else {
-        Some(numeric)
-    }
-}
-
-// Creates one alias, idempotently.
-fn link_alias(dir: &Path, alias: &str, original: &str) -> io::Result<()> {
-    let link = dir.join(alias);
-    remove_existing(&link)?;
-
-    match create_symlink(original, &link) {
-        Ok(()) => Ok(()),
-        // Two cargo jobs can race here -- a workspace build and a
-        // `cargo test`, for instance, both running this script for different
-        // crate types.  Whoever lost the race still ends up with the link that
-        // was wanted, so this is a success, not a failure.
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-// Clears whatever currently occupies a link path.  `symlink_metadata` does not
-// follow links, so a dangling alias left by an earlier build is still seen here
-// and removed, which is what makes the whole step idempotent.  A real directory
-// in the way is removed non-recursively on purpose: if something has put a
-// populated directory where `libz.so.1` belongs, failing loudly is far better
-// than deleting it.
-fn remove_existing(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.is_dir() {
-                fs::remove_dir(path)
-            } else {
-                fs::remove_file(path)
-            }
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(unix)]
-fn create_symlink(original: &str, link: &Path) -> io::Result<()> {
-    std::os::unix::fs::symlink(original, link)
-}
-
-// Cross-compiling to a Unix target from a host without symlinks.  The error is
-// surfaced through `report`, which turns it into a warning on the non-required
-// platforms and a hard failure where the chain is load-bearing.
-#[cfg(not(unix))]
-fn create_symlink(_original: &str, _link: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "creating a symlink requires a Unix host",
-    ))
-}
-
-// Fails the build where the chain is load-bearing, reports and continues where
-// it is a convenience.
-fn report(required: bool, message: &str) {
-    assert!(!required, "{message}");
-    println!("cargo::warning={message}");
-}
-
-// ---------------------------------------------------------------------------
 //  Locating the repository and reading the contract
 // ---------------------------------------------------------------------------
 
@@ -827,137 +683,6 @@ fn major_version<'a>(version: &'a str, public_header: &Path) -> &'a str {
 // ---------------------------------------------------------------------------
 //  Cargo environment helpers
 // ---------------------------------------------------------------------------
-
-// Cargo's artifact directory -- `target/<profile>`, or
-// `target/<triple>/<profile>` when `--target` is in play -- which is where
-// cargo writes the cdylib and where the install rules and CI steps look for it.
-//
-// It is derived from OUT_DIR, whose layout is
-// `<artifact dir>/build/<pkg>-<hash>/out`.  Rather than assume a fixed depth,
-// which differs between host and `--target` builds and would silently produce a
-// wrong path if cargo ever changed it, this walks up to the first ancestor
-// actually named `build` and takes that directory's parent.  If no such
-// ancestor exists the derivation fails and says so, which is the whole point of
-// verifying instead of assuming.
-//
-// CARGO_TARGET_DIR plus PROFILE was considered and rejected: PROFILE only ever
-// reports `debug` or `release`, so it names the wrong directory for any custom
-// profile, and CARGO_TARGET_DIR is frequently unset.  OUT_DIR is always set for
-// a build script and always absolute.
-//
-// OUT_DIR itself is deliberately not used as the destination.  It is a
-// per-crate scratch directory that no loader ever searches and that nothing
-// downstream inspects.
-fn cargo_artifact_dir() -> Option<PathBuf> {
-    let out_dir = PathBuf::from(require_env("OUT_DIR"));
-    let mut cursor: &Path = out_dir.as_path();
-
-    while let Some(parent) = cursor.parent() {
-        if parent.file_name() == Some(OsStr::new("build")) {
-            return parent.parent().map(Path::to_path_buf);
-        }
-        cursor = parent;
-    }
-
-    None
-}
-
-// Whether this crate's manifest asks for a cdylib at all.
-fn cdylib_declared() -> bool {
-    let manifest = PathBuf::from(require_env("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-
-    match fs::read_to_string(&manifest) {
-        Ok(text) => manifest_declares_cdylib(&text),
-        // An unreadable manifest is not this script's problem to diagnose --
-        // cargo could not have got this far without parsing it -- so assume the
-        // normal case rather than skipping a step the build needs.
-        Err(_) => true,
-    }
-}
-
-// Finds `cdylib` specifically in the `[lib]` table's `crate-type` array.
-//
-// A whole-file substring search is not sufficient: package names, comments and
-// metadata are all allowed to contain the word `cdylib` without asking cargo to
-// produce one.  This deliberately small parser handles the one TOML construct
-// the build script needs, including a multiline array and comments, while
-// preserving the crate's zero-build-dependency contract.
-fn manifest_declares_cdylib(manifest: &str) -> bool {
-    let mut in_lib_table = false;
-    let mut collecting_crate_types = false;
-    let mut crate_types = String::new();
-
-    for raw_line in manifest.lines() {
-        let line = toml_line_without_comment(raw_line).trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        if line.starts_with('[') {
-            if collecting_crate_types {
-                break;
-            }
-            in_lib_table = line == "[lib]";
-            continue;
-        }
-
-        if !in_lib_table {
-            continue;
-        }
-
-        if collecting_crate_types {
-            crate_types.push(' ');
-            crate_types.push_str(line);
-        } else {
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            if key.trim() != "crate-type" {
-                continue;
-            }
-            collecting_crate_types = true;
-            crate_types.push_str(value.trim());
-        }
-
-        if crate_types.contains(']') {
-            break;
-        }
-    }
-
-    crate_types
-        .split(['[', ']', ','])
-        .map(str::trim)
-        .any(|crate_type| matches!(crate_type, "\"cdylib\"" | "'cdylib'"))
-}
-
-// Removes a TOML comment without mistaking a `#` inside a quoted string for
-// the start of one.  Escapes matter only in basic (`"..."`) strings; literal
-// (`'...'`) strings take every character verbatim.
-fn toml_line_without_comment(line: &str) -> &str {
-    let mut in_basic_string = false;
-    let mut in_literal_string = false;
-    let mut escaped = false;
-
-    for (index, character) in line.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-
-        match character {
-            '\\' if in_basic_string => escaped = true,
-            '"' if !in_literal_string => in_basic_string = !in_basic_string,
-            '\'' if !in_basic_string => in_literal_string = !in_literal_string,
-            '#' if !in_basic_string && !in_literal_string => {
-                return line.get(..index).unwrap_or(line);
-            }
-            _ => {}
-        }
-    }
-
-    line
-}
-
 // Reads one of this script's `0`/`1` knobs.  Unset means the documented
 // default; anything other than `0` or `1` is a malformed build knob, and
 // failing the build is the right answer for that.

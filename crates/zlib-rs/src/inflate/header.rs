@@ -1,4 +1,4 @@
-//! Container header parsing: the safe port of the eleven header states of
+//! Container header parsing: the safe mirror of the eleven header states of
 //! `inflate()` (`inflate.c` L506-L710) and of `inflateGetHeader`
 //! (`inflate.c` L1219-L1231).
 //!
@@ -10,24 +10,24 @@
 //!
 //! # The states, in the order the reference declares them
 //!
-//! Each handler below ports exactly one arm of `inflate()`'s `switch`, keeps the
-//! arm's name, and cites the lines it came from. The `Advance` outcome is C's
+//! Each handler below is exactly one arm of `inflate()`'s `switch`, keeps the
+//! arm's name, and cites the lines it implements. The `Advance` outcome is C's
 //! `break` *and* C's `/* fallthrough */`: both simply re-dispatch on
-//! [`InflateState::mode`], which the handler has already advanced.
+//! `InflateState::mode`, which the handler has already advanced.
 //!
 //! | State | Handler | `inflate.c` | Consumes |
 //! |---|---|---|---|
-//! | `HEAD` | [`head`] | L506-L553 | two bytes: gzip magic, or zlib `CMF`/`FLG` |
-//! | `FLAGS` | [`flags`] | L555-L573 | gzip `CM` and `FLG` |
-//! | `TIME` | [`time`] | L575-L581 | gzip `MTIME`, four bytes |
-//! | `OS` | [`os`] | L584-L592 | gzip `XFL` and `OS` |
-//! | `EXLEN` | [`ex_len`] | L595-L607 | gzip `XLEN`, two bytes, only if `FEXTRA` |
-//! | `EXTRA` | [`extra`] | L609-L629 | `XLEN` bytes of extra field, resumable |
-//! | `NAME` | [`name`] | L633-L651 | zero-terminated file name, resumable |
-//! | `COMMENT` | [`comment`] | L655-L673 | zero-terminated comment, resumable |
-//! | `HCRC` | [`hcrc`] | L676-L692 | gzip header CRC-16, only if `FHCRC` |
-//! | `DICTID` | [`dict_id`] | L694-L698 | zlib dictionary id, four bytes |
-//! | `DICT` | [`dict`] | L700-L706 | nothing; waits on the caller |
+//! | `HEAD` | `head` | L506-L553 | two bytes: gzip magic, or zlib `CMF`/`FLG` |
+//! | `FLAGS` | `flags` | L555-L573 | gzip `CM` and `FLG` |
+//! | `TIME` | `time` | L575-L581 | gzip `MTIME`, four bytes |
+//! | `OS` | `os` | L584-L592 | gzip `XFL` and `OS` |
+//! | `EXLEN` | `ex_len` | L595-L607 | gzip `XLEN`, two bytes, only if `FEXTRA` |
+//! | `EXTRA` | `extra` | L609-L629 | `XLEN` bytes of extra field, resumable |
+//! | `NAME` | `name` | L633-L651 | zero-terminated file name, resumable |
+//! | `COMMENT` | `comment` | L655-L673 | zero-terminated comment, resumable |
+//! | `HCRC` | `hcrc` | L676-L692 | gzip header CRC-16, only if `FHCRC` |
+//! | `DICTID` | `dict_id` | L694-L698 | zlib dictionary id, four bytes |
+//! | `DICT` | `dict` | L700-L706 | nothing; waits on the caller |
 //!
 //! The transition diagram at `inflate.h` L55-L78 is the authority on how they
 //! chain: `HEAD` splits three ways into gzip, zlib and raw; the gzip chain runs
@@ -46,35 +46,35 @@
 //! Three pieces of state carry the resume point, and all three live in
 //! `crates/zlib-rs/src/inflate/state.rs`:
 //!
-//! * [`InflateState::mode`] -- which state to re-enter,
+//! * `InflateState::mode` -- which state to re-enter,
 //! * `hold` and `bits` -- the partially filled accumulator, preserved by
-//!   [`InflateState::need_bits`] whether it succeeds or not,
+//!   `InflateState::need_bits` whether it succeeds or not,
 //! * `length` -- how much of the extra field is still outstanding, and the write
 //!   cursor into the caller's name and comment buffers.
 //!
 //! Nothing else is saved, and nothing is consumed that cannot be used: a handler
-//! that reports [`HeaderAction::NeedInput`] has advanced `next_in` only over
+//! that reports `HeaderAction::NeedInput` has advanced `next_in` only over
 //! bytes whose bits are now in the accumulator.
 //!
 //! One consequence is easy to overlook. `NEEDBITS(32)` pulls bytes while
 //! `bits < 32`, so a caller who primed the accumulator with
 //! `inflatePrime` can leave `bits` *above* 32 -- up to 39. That is why the
-//! accumulator is a `u64` in this port (see `state.rs`) and why every expression
+//! accumulator is a `u64` in this implementation (see `state.rs`) and why every expression
 //! below reads the accumulator at its full width instead of masking it to sixteen
 //! or thirty-two bits: the reference reads `unsigned long hold` the same way, and
 //! masking would change which streams are accepted.
 //!
 //! # How a handler talks to the driver
 //!
-//! C reaches its caller through one `z_streamp`. This port has no `z_stream`:
-//! raw pointers stop at the facade (AAP §0.6.1), so the input arrives as a slice
+//! C reaches its caller through one `z_streamp`. This implementation has no `z_stream`:
+//! no pointer is dereferenced in this crate (AAP §0.6.1), so the input arrives as a slice
 //! plus a cursor and everything the reference writes to the stream comes back in
-//! a [`HeaderExit`]:
+//! a `HeaderExit`:
 //!
 //! * `action` -- what the driver does next, one of the four things a C arm can do:
-//!   fall through or `break` ([`HeaderAction::Advance`]), `goto inf_leave`
-//!   ([`HeaderAction::NeedInput`]), enter `BAD` ([`HeaderAction::Bad`]), or
-//!   `RESTORE(); return Z_NEED_DICT;` ([`HeaderAction::NeedDict`]).
+//!   fall through or `break` (`HeaderAction::Advance`), `goto inf_leave`
+//!   (`HeaderAction::NeedInput`), enter `BAD` (`HeaderAction::Bad`), or
+//!   `RESTORE(); return Z_NEED_DICT;` (`HeaderAction::NeedDict`).
 //! * `adler` -- the value C assigns with `strm->adler = state->check = ...`, and
 //!   *only* at the four sites that do so (L550, L690, L696 and L705). The header
 //!   CRC accumulates into `state.check` at several other points without ever
@@ -91,15 +91,15 @@
 //! | Value | Meaning | Written at |
 //! |---|---|---|
 //! | `0` | no header read yet | [`inflate_get_header`], `inflate.c` L1229 |
-//! | `-1` | this stream carries no gzip header | [`head`], `inflate.c` L522-L523 |
-//! | `1` | the gzip header has been read in full | [`hcrc`], `inflate.c` L686-L689 |
+//! | `-1` | this stream carries no gzip header | `head`, `inflate.c` L522-L523 |
+//! | `1` | the gzip header has been read in full | `hcrc`, `inflate.c` L686-L689 |
 //!
 //! # ★ The bounded writes are a fixed vulnerability, not a nicety
 //!
 //! The three variable-length gzip fields are the historically most-exploited
 //! surface in this library, and the shape of the guard at `inflate.c` L613-L621 is
 //! the *fixed* form of a real overflow. It has three parts, all of which are
-//! reproduced in [`extra`]: a header must be installed, its `extra` pointer must
+//! reproduced in `extra`: a header must be installed, its `extra` pointer must
 //! be non-null, and the offset already reached must still be below the capacity
 //! the caller advertised in `extra_max`. Only then is anything copied, and even
 //! then the count is clamped to the space left. `name` and `comment` are guarded
@@ -114,7 +114,7 @@
 //!   bytes stored, which is exactly how a caller detects that its buffer was too
 //!   small.
 //!
-//! In this port the capacities cannot be circumvented even by a mistake here: the
+//! In this implementation the capacities cannot be circumvented even by a mistake here: the
 //! caller's three buffers arrive as slices whose lengths *are* `extra_max`,
 //! `name_max` and `comm_max`, and every write goes through the checked writers on
 //! [`GzHeaderSink`]. There is no pointer to advance and no length to get wrong.
@@ -127,7 +127,7 @@
 //! which is why every wrapped stream starts out validating, and `inflateValidate`
 //! can clear bit 2 afterwards (L1384-L1394). Every CRC step and the header CRC
 //! comparison in this module are gated on bit 2 -- with one deliberate exception,
-//! noted in [`head`], where the reference folds the gzip magic into the CRC
+//! noted in `head`, where the reference folds the gzip magic into the CRC
 //! unconditionally.
 //!
 //! `flags` is a tri-state plus a payload (`inflate.h` L89-L90): `-1` means "raw,
@@ -135,7 +135,7 @@
 //! is the gzip `CM`/`FLG` word itself. The distinction matters outside this
 //! module: `inflate()` picks CRC-32 over Adler-32 when `flags` is non-zero
 //! (L302-L303), and `inflateSync` treats a stream as raw when `flags` is still
-//! `-1` (L1299). So `flags = 0` in [`head`] and `flags = <FLG word>` in [`flags`]
+//! `-1` (L1299). So `flags = 0` in `head` and `flags = <FLG word>` in `flags`
 //! are two different, meaningful assignments and must not be collapsed.
 //!
 //! # Not gated behind a feature
@@ -176,11 +176,11 @@
 //! # What lives here, and what deliberately does not
 //!
 //! `DICTID` and `DICT` are header states in the reference's own layout, so they
-//! are ported here rather than in the driver, and [`inflate_get_header`] is
+//! are implemented here rather than in the driver, and [`inflate_get_header`] is
 //! likewise here because it exists only to install the sink these states fill.
 //! Neither is duplicated in `crates/zlib-rs/src/inflate/mod.rs`. What is *not*
 //! here: the `z_stream`-shaped mirror of `gz_header`, which is ABI-visible and
-//! therefore belongs to `crates/libz-rs-sys/src/types.rs`; the dictionary
+//! therefore belongs to the planned `crates/libz-rs-sys/src/types.rs`; the dictionary
 //! *content* check, which `inflateSetDictionary` performs (`inflate.c`
 //! L1200-L1205); and the trailer states `CHECK` and `LENGTH`, which validate the
 //! check value this module only ever initialises.
@@ -202,10 +202,6 @@ use crate::error::ReturnCode;
 use crate::inflate::mode::Mode;
 use crate::inflate::state::{GzHeaderSink, InflateState, DMAX_DEFAULT, GZ_HEADER_PENDING};
 
-// -----------------------------------------------------------------------------
-//  Error messages
-// -----------------------------------------------------------------------------
-//
 // Five texts across six decision points: the zlib and gzip paths reject an
 // unknown compression method with the *same* text at *different* sites, and both
 // sites are reproduced.
@@ -239,10 +235,6 @@ pub(crate) const MSG_UNKNOWN_HEADER_FLAGS_SET: &str = "unknown header flags set"
 /// `strm->msg` when the gzip header's own CRC-16 does not match
 /// (`inflate.c` L680).
 pub(crate) const MSG_HEADER_CRC_MISMATCH: &str = "header crc mismatch";
-
-// -----------------------------------------------------------------------------
-//  Format constants
-// -----------------------------------------------------------------------------
 
 /// The gzip magic `1f 8b` as the accumulator holds it (`inflate.c` L513).
 ///
@@ -320,10 +312,6 @@ const WBITS_BIAS: u32 = 8;
 /// (`inflate.c` L679).
 const CRC16_MASK: u32 = 0xffff;
 
-// -----------------------------------------------------------------------------
-//  Total narrowing helpers
-// -----------------------------------------------------------------------------
-
 /// The low 32 bits of an accumulator value.
 ///
 /// Every gzip and zlib header field is at most four bytes wide, so this loses
@@ -352,22 +340,9 @@ fn as_i32(value: u32) -> i32 {
     i32::from_ne_bytes(value.to_ne_bytes())
 }
 
-// -----------------------------------------------------------------------------
-//  Header CRC helpers -- `CRC2` and `CRC4` (`inflate.c` L308-L325)
-// -----------------------------------------------------------------------------
-
 /// Folds the low two bytes of `word`, least significant first, into `check`.
 ///
-/// The port of the `CRC2` macro (`inflate.c` L310-L315):
-///
-/// ```c
-/// #define CRC2(check, word) \
-///     do { \
-///         hbuf[0] = (unsigned char)(word); \
-///         hbuf[1] = (unsigned char)((word) >> 8); \
-///         check = crc32(check, hbuf, 2); \
-///     } while (0)
-/// ```
+/// The `CRC2` macro of `inflate.c` L310-L315.
 ///
 /// The byte order is the wire order: a gzip header CRC-16 covers the header bytes
 /// as they appear in the stream, and the accumulator filled from the low end, so
@@ -380,7 +355,7 @@ pub(crate) fn crc2(check: u32, word: u64) -> u32 {
 
 /// Folds all four low bytes of `word`, least significant first, into `check`.
 ///
-/// The port of the `CRC4` macro (`inflate.c` L317-L324), used for the four-byte
+/// The Rust counterpart of the `CRC4` macro (`inflate.c` L317-L324), used for the four-byte
 /// `MTIME` field and identical to [`crc2`] but for the width.
 #[must_use]
 pub(crate) fn crc4(check: u32, word: u64) -> u32 {
@@ -398,10 +373,6 @@ fn header_crc_enabled<'a, A: Allocator<'a>>(state: &InflateState<'a, A>) -> bool
     (state.flags & FHCRC) != 0 && state.wrap.verifies_check_value()
 }
 
-// -----------------------------------------------------------------------------
-//  The driver protocol
-// -----------------------------------------------------------------------------
-
 /// What the driver must do when a header state returns.
 ///
 /// The four possibilities are exactly the four ways an arm of `inflate()`'s
@@ -411,14 +382,14 @@ fn header_crc_enabled<'a, A: Allocator<'a>>(state: &InflateState<'a, A>) -> bool
 pub(crate) enum HeaderAction {
     /// C's `break` out of the `switch`, and equally C's `/* fallthrough */`.
     ///
-    /// The handler has already advanced [`InflateState::mode`], so the driver
+    /// The handler has already advanced `InflateState::mode`, so the driver
     /// simply dispatches again. The two C spellings differ only in whether the
     /// next arm is reached without re-testing the loop, which is unobservable.
     Advance,
 
     /// C's `goto inf_leave`: the field is incomplete and needs more input.
     ///
-    /// [`InflateState::mode`] is unchanged, the accumulator holds whatever bits
+    /// `InflateState::mode` is unchanged, the accumulator holds whatever bits
     /// were available, and `next_in` has advanced only over bytes that are now in
     /// the accumulator or already copied. The driver runs its epilogue and
     /// returns to the caller; the next call resumes in the same state.
@@ -433,7 +404,7 @@ pub(crate) enum HeaderAction {
 
     /// C's `RESTORE(); return Z_NEED_DICT;` (`inflate.c` L701-L704).
     ///
-    /// The stream needs a preset dictionary. [`InflateState::mode`] stays
+    /// The stream needs a preset dictionary. `InflateState::mode` stays
     /// [`Mode::Dict`], no further input is consumed, and the driver returns
     /// [`ReturnCode::NEED_DICT`] *without* running the ordinary epilogue -- which
     /// is what keeps the dictionary id this state published in `strm->adler`
@@ -463,7 +434,7 @@ pub(crate) struct HeaderExit {
     pub(crate) adler: Option<u32>,
 
     /// The text for `strm->msg`, [`Some`] exactly when `action` is
-    /// [`HeaderAction::Bad`].
+    /// `HeaderAction::Bad`.
     ///
     /// Always one of the five `MSG_*` constants in this module. C leaves `msg`
     /// untouched on a successful state, so [`None`] here means "do not write",
@@ -529,13 +500,9 @@ fn reject<'a, A: Allocator<'a>>(state: &mut InflateState<'a, A>, msg: &'static s
     }
 }
 
-// -----------------------------------------------------------------------------
-//  `HEAD` -- `inflate.c` L506-L553
-// -----------------------------------------------------------------------------
-
 /// Reads the first two bytes and decides what kind of stream this is.
 ///
-/// The port of the `HEAD` arm (`inflate.c` L506-L553), which is the only state
+/// The Rust counterpart of the `HEAD` arm (`inflate.c` L506-L553), which is the only state
 /// that can reach three different successors:
 ///
 /// * `wrap == 0` -- raw DEFLATE, so there is no header to read at all and the
@@ -670,13 +637,9 @@ pub(crate) fn head<'a, A: Allocator<'a>>(
     HeaderExit::advance_with_adler(state.check)
 }
 
-// -----------------------------------------------------------------------------
-//  `FLAGS` -- `inflate.c` L555-L573
-// -----------------------------------------------------------------------------
-
 /// Reads the gzip `CM` and `FLG` bytes.
 ///
-/// The port of the `FLAGS` arm (`inflate.c` L555-L573). The two bytes are stored
+/// The Rust counterpart of the `FLAGS` arm (`inflate.c` L555-L573). The two bytes are stored
 /// whole in `state.flags`, which is what makes the later states' `flags & 0x0400`
 /// style tests work, and what tells `inflate()` to use CRC-32 rather than
 /// Adler-32 for the body (L302-L303).
@@ -729,16 +692,12 @@ pub(crate) fn flags<'a, A: Allocator<'a>>(
     HeaderExit::advance()
 }
 
-// -----------------------------------------------------------------------------
-//  `TIME` -- `inflate.c` L575-L581
-// -----------------------------------------------------------------------------
-
 /// Reads the gzip `MTIME` field.
 ///
-/// The port of the `TIME` arm (`inflate.c` L575-L581). `MTIME` is the modification
+/// The Rust counterpart of the `TIME` arm (`inflate.c` L575-L581). `MTIME` is the modification
 /// time as a four-byte little-endian Unix timestamp (RFC 1952 §2.3.1), and this is
 /// one of the two `NEEDBITS(32)` sites in the header -- the other being
-/// [`dict_id`]. Both are why the accumulator is 64 bits wide in this port.
+/// `dict_id`. Both are why the accumulator is 64 bits wide in this port.
 pub(crate) fn time<'a, A: Allocator<'a>>(
     state: &mut InflateState<'a, A>,
     input: &[u8],
@@ -767,13 +726,9 @@ pub(crate) fn time<'a, A: Allocator<'a>>(
     HeaderExit::advance()
 }
 
-// -----------------------------------------------------------------------------
-//  `OS` -- `inflate.c` L584-L592
-// -----------------------------------------------------------------------------
-
 /// Reads the gzip `XFL` and `OS` bytes.
 ///
-/// The port of the `OS` arm (`inflate.c` L584-L592). `XFL` records the compressor
+/// The Rust counterpart of the `OS` arm (`inflate.c` L584-L592). `XFL` records the compressor
 /// setting and `OS` the filesystem the member was made on (RFC 1952 §2.3.1).
 ///
 /// Note that `os` is assigned from `hold >> 8` without a mask, exactly as at
@@ -809,17 +764,13 @@ pub(crate) fn os<'a, A: Allocator<'a>>(
     HeaderExit::advance()
 }
 
-// -----------------------------------------------------------------------------
-//  `EXLEN` -- `inflate.c` L595-L607
-// -----------------------------------------------------------------------------
-
 /// Reads the gzip `XLEN` field, or records that there is no extra field.
 ///
-/// The port of the `EXLEN` arm (`inflate.c` L595-L607). Two things happen here
+/// The Rust counterpart of the `EXLEN` arm (`inflate.c` L595-L607). Two things happen here
 /// that the next state depends on:
 ///
 /// * `state.length` is seeded with the advertised field length and becomes
-///   [`extra`]'s resume counter (L598),
+///   `extra`'s resume counter (L598),
 /// * `extra_len` is reported to the caller *unclamped* (L599-L600), which is how a
 ///   caller detects that its `extra_max` was too small.
 ///
@@ -864,39 +815,10 @@ pub(crate) fn ex_len<'a, A: Allocator<'a>>(
     HeaderExit::advance()
 }
 
-// -----------------------------------------------------------------------------
-//  `EXTRA` -- `inflate.c` L609-L629
-// -----------------------------------------------------------------------------
-
 /// Copies the gzip extra field into the caller's buffer, clamped, resumable.
 ///
-/// The port of the `EXTRA` arm (`inflate.c` L609-L629), which is the most
-/// security-sensitive state in the header:
-///
-/// ```c
-/// if (state->flags & 0x0400) {
-///     copy = state->length;
-///     if (copy > have) copy = have;
-///     if (copy) {
-///         if (state->head != Z_NULL &&
-///             state->head->extra != Z_NULL &&
-///             (len = state->head->extra_len - state->length) <
-///                 state->head->extra_max) {
-///             zmemcpy(state->head->extra + len, next,
-///                     len + copy > state->head->extra_max ?
-///                     state->head->extra_max - len : copy);
-///         }
-///         if ((state->flags & 0x0200) && (state->wrap & 4))
-///             state->check = crc32(state->check, next, copy);
-///         have -= copy;
-///         next += copy;
-///         state->length -= copy;
-///     }
-///     if (state->length) goto inf_leave;
-/// }
-/// state->length = 0;
-/// state->mode = NAME;
-/// ```
+/// The `EXTRA` arm of `inflate.c` L609-L629, which is the most
+/// security-sensitive state in the header.
 ///
 /// # ★ The three guards and the clamp
 ///
@@ -911,7 +833,7 @@ pub(crate) fn ex_len<'a, A: Allocator<'a>>(
 /// 4. the copy length is `min(copy, extra_max - offset)`.
 ///
 /// Guard 3 is what makes guard 4's subtraction non-negative, which is why they
-/// cannot be reordered. In this port both are enforced by
+/// cannot be reordered. In this implementation both are enforced by
 /// [`GzHeaderSink::write_extra`], where the destination slice's length *is*
 /// `extra_max`, so the clamp is a slice bound rather than an arithmetic promise.
 ///
@@ -965,7 +887,7 @@ pub(crate) fn extra<'a, A: Allocator<'a>>(
             }
 
             // L624-L626: `have -= copy; next += copy; state->length -= copy;`.
-            // `have` is not stored in this port -- it is derived from the slice and
+            // `have` is not stored in this implementation -- it is derived from the slice and
             // the cursor -- so advancing the cursor is the whole update.
             *next_in = next_in.saturating_add(count);
             state.length = outstanding.saturating_sub(u32::try_from(count).unwrap_or(u32::MAX));
@@ -983,10 +905,6 @@ pub(crate) fn extra<'a, A: Allocator<'a>>(
     state.mode = Mode::Name;
     HeaderExit::advance()
 }
-
-// -----------------------------------------------------------------------------
-//  `NAME` and `COMMENT` -- `inflate.c` L633-L651 and L655-L673
-// -----------------------------------------------------------------------------
 
 /// Which of the two zero-terminated gzip strings a pass of
 /// [`copy_string_field`] is reading.
@@ -1008,24 +926,7 @@ enum StringField {
 /// Consumes as much of a zero-terminated header string as the input holds.
 ///
 /// The shared body of the `NAME` and `COMMENT` arms (`inflate.c` L634-L648 and
-/// L656-L670):
-///
-/// ```c
-/// if (have == 0) goto inf_leave;
-/// copy = 0;
-/// do {
-///     len = (unsigned)(next[copy++]);
-///     if (state->head != Z_NULL &&
-///             state->head->name != Z_NULL &&
-///             state->length < state->head->name_max)
-///         state->head->name[state->length++] = (Bytef)len;
-/// } while (len && copy < have);
-/// if ((state->flags & 0x0200) && (state->wrap & 4))
-///     state->check = crc32(state->check, next, copy);
-/// have -= copy;
-/// next += copy;
-/// if (len) goto inf_leave;
-/// ```
+/// L656-L670).
 ///
 /// Returns `true` when the terminating zero was consumed, and `false` for C's two
 /// `goto inf_leave` exits -- no input at all, or input exhausted before the zero.
@@ -1040,7 +941,7 @@ enum StringField {
 ///   immediately rather than entering the loop on an empty chunk.
 /// * **The terminating zero is stored like any other byte**, because the loop
 ///   exits *after* the store. So a caller's buffer is zero-terminated only when the
-///   string fitted; when it was truncated there is no terminator, and this port
+///   string fitted; when it was truncated there is no terminator, and this implementation
 ///   must not helpfully add one. `zlib.h` L126 describes `name` as pointing to a
 ///   "zero-terminated file name", and that promise is conditional on `name_max`
 ///   being large enough -- which is precisely why `name_max` exists.
@@ -1104,11 +1005,11 @@ fn copy_string_field<'a, A: Allocator<'a>>(
 
 /// Reads the gzip file name, or records that there is none.
 ///
-/// The port of the `NAME` arm (`inflate.c` L633-L651). See [`copy_string_field`]
+/// The Rust counterpart of the `NAME` arm (`inflate.c` L633-L651). See [`copy_string_field`]
 /// for the loop, and note the `FNAME`-clear branch at L650-L651, which clears the
 /// caller's `name` pointer to `Z_NULL` rather than leaving it alone.
 ///
-/// `state.length` is reset on the way out (L652) so that [`comment`] starts its own
+/// `state.length` is reset on the way out (L652) so that `comment` starts its own
 /// write cursor at zero.
 pub(crate) fn name<'a, A: Allocator<'a>>(
     state: &mut InflateState<'a, A>,
@@ -1135,10 +1036,10 @@ pub(crate) fn name<'a, A: Allocator<'a>>(
 /// Reads the gzip comment, or records that there is none.
 ///
 /// The port of the `COMMENT` arm (`inflate.c` L655-L673): the same shape as
-/// [`name`] with `FCOMMENT` in place of `FNAME` and `comm_max` in place of
+/// `name` with `FCOMMENT` in place of `FNAME` and `comm_max` in place of
 /// `name_max`.
 ///
-/// ★ One asymmetry with [`name`] is deliberate and is C's, not this port's: the
+/// ★ One asymmetry with `name` is deliberate and is C's, not this port's: the
 /// `NAME` arm resets `state->length` on the way out (L652) and this one does not
 /// (L674), because the next state, `HCRC`, has no use for it. Reproducing the
 /// asymmetry costs nothing and keeps the two files diffable.
@@ -1163,17 +1064,13 @@ pub(crate) fn comment<'a, A: Allocator<'a>>(
     HeaderExit::advance()
 }
 
-// -----------------------------------------------------------------------------
-//  `HCRC` -- `inflate.c` L676-L692
-// -----------------------------------------------------------------------------
-
 /// Verifies the gzip header CRC-16, completes the header, and arms the body check.
 ///
-/// The port of the `HCRC` arm (`inflate.c` L676-L692). Three things happen, and the
+/// The Rust counterpart of the `HCRC` arm (`inflate.c` L676-L692). Three things happen, and the
 /// last is easy to miss:
 ///
 /// * if `FHCRC` was set, the two-byte CRC-16 is compared against the low sixteen
-///   bits of the header CRC accumulated by every state since [`head`] -- but only
+///   bits of the header CRC accumulated by every state since `head` -- but only
 ///   when `wrap & 4` says the caller wants check values validated (L679);
 /// * `hcrc` and `done = 1` are reported to the caller (L686-L689), which is how a
 ///   caller learns the header is complete;
@@ -1224,13 +1121,9 @@ pub(crate) fn hcrc<'a, A: Allocator<'a>>(
     HeaderExit::advance_with_adler(state.check)
 }
 
-// -----------------------------------------------------------------------------
-//  `DICTID` and `DICT` -- `inflate.c` L694-L706
-// -----------------------------------------------------------------------------
-
 /// Reads the four-byte Adler-32 of the preset dictionary a zlib stream requires.
 ///
-/// The port of the `DICTID` arm (`inflate.c` L694-L698). Reached only when `FDICT`
+/// The Rust counterpart of the `DICTID` arm (`inflate.c` L694-L698). Reached only when `FDICT`
 /// was set in the zlib header (RFC 1950 §2.2), and the second of the two
 /// `NEEDBITS(32)` sites.
 ///
@@ -1264,14 +1157,14 @@ pub(crate) fn dict_id<'a, A: Allocator<'a>>(
 
 /// Waits for `inflateSetDictionary`, then arms the zlib check value.
 ///
-/// The port of the `DICT` arm (`inflate.c` L700-L706). This is the one state in the
+/// The Rust counterpart of the `DICT` arm (`inflate.c` L700-L706). This is the one state in the
 /// header that consumes no input at all: it waits on the *caller*, which is why
-/// [`HeaderAction::NeedDict`] is a distinct outcome rather than a kind of error.
+/// `HeaderAction::NeedDict` is a distinct outcome rather than a kind of error.
 ///
 /// ★ Returning `Z_NEED_DICT` without consuming further input is a contract, not an
 /// implementation detail. C reaches it through `RESTORE(); return Z_NEED_DICT;`,
 /// which deliberately skips the `inf_leave` epilogue, so the dictionary id
-/// [`dict_id`] published in `strm->adler` survives for the caller to read and
+/// `dict_id` published in `strm->adler` survives for the caller to read and
 /// `inflateSetDictionary` can validate the dictionary it is then handed
 /// (`inflate.c` L1200-L1205). `test/example.c` exercises exactly this round trip,
 /// and `test/infcover.c` L321-L334 walks the failure branches of it.
@@ -1297,31 +1190,19 @@ pub(crate) fn dict<'a, A: Allocator<'a>>(state: &mut InflateState<'a, A>) -> Hea
     HeaderExit::advance_with_adler(state.check)
 }
 
-// -----------------------------------------------------------------------------
-//  `inflateGetHeader` -- `inflate.c` L1219-L1231
-// -----------------------------------------------------------------------------
-
 /// Installs a caller's `gz_header` so the states above fill it in.
 ///
-/// The port of `inflateGetHeader` (`inflate.c` L1219-L1231, declared at
-/// `zlib.h` L1070):
-///
-/// ```c
-/// if (inflateStateCheck(strm)) return Z_STREAM_ERROR;
-/// state = (struct inflate_state FAR *)strm->state;
-/// if ((state->wrap & 2) == 0) return Z_STREAM_ERROR;
-/// state->head = head;
-/// head->done = 0;
-/// return Z_OK;
-/// ```
+/// Implements `inflateGetHeader` (`inflate.c` L1219-L1231, declared at
+/// `zlib.h` L1070).
 ///
 /// # The two guards
 ///
-/// The first, `inflateStateCheck`, validates a caller-supplied `z_stream`: that it
-/// is non-null, that its allocation hooks are set, and that the opaque state
-/// pointer really addresses an inflate state (`inflate.c` L88-L98). None of that
+/// The first, `inflateStateCheck`, screens a caller-supplied `z_stream`: that it is
+/// non-null, that its allocation hooks are set, and — once the state pointer has been
+/// established as safe to dereference — that the tag behind it names a live inflate
+/// state (`inflate.c` L88-L98). None of that
 /// can be asked of a `&mut InflateState`, which is a valid state by construction,
-/// so the pointer half of the check stays in `crates/libz-rs-sys/src/inflate.rs`
+/// so the pointer half of the check belongs in the planned `crates/libz-rs-sys/src/inflate.rs`
 /// where the pointer is; `state.rs` exposes the tag half as `is_live_mode_tag`.
 ///
 /// ★ The second guard is reproduced here in full: `(wrap & 2) == 0` means the
@@ -1453,7 +1334,7 @@ mod tests {
     ///
     /// This is deliberately the shape `crates/zlib-rs/src/inflate/mod.rs` will
     /// have, so the tests exercise the real contract -- including the fact that
-    /// [`HeaderAction::Advance`] must always make progress, since a handler that
+    /// `HeaderAction::Advance` must always make progress, since a handler that
     /// returned it without advancing the mode would hang here rather than fail an
     /// assertion.
     fn drive(
@@ -1642,10 +1523,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  Raw streams
-    // -------------------------------------------------------------------------
-
     /// `inflate.c` L507-L510: a raw stream has no header, so `HEAD` reaches
     /// `TYPEDO` without looking at a single byte.
     #[test]
@@ -1664,10 +1541,6 @@ mod tests {
             "`flags` stays -1 for raw data"
         );
     }
-
-    // -------------------------------------------------------------------------
-    //  zlib headers
-    // -------------------------------------------------------------------------
 
     /// A valid zlib header is accepted for every window size the format allows,
     /// and leaves exactly the state `inflate.c` L547-L552 describes.
@@ -1862,10 +1735,6 @@ mod tests {
         assert_eq!(outcome, Outcome::Header);
         assert_eq!(state.wbits, 15);
     }
-
-    // -------------------------------------------------------------------------
-    //  gzip headers
-    // -------------------------------------------------------------------------
 
     /// A minimal gzip header is accepted, and `HCRC` re-arms the check value for
     /// the body (`inflate.c` L690).
@@ -2140,10 +2009,6 @@ mod tests {
         assert_eq!(next_in, input.len());
     }
 
-    // -------------------------------------------------------------------------
-    //  The bounded writes
-    // -------------------------------------------------------------------------
-
     /// ★ An extra field longer than `extra_max` stores exactly `extra_max` bytes,
     /// reports the true length, and folds *every* consumed byte into the header CRC
     /// (`inflate.c` L614-L623).
@@ -2393,10 +2258,6 @@ mod tests {
         assert_eq!(state.head.unwrap().done, GZ_HEADER_COMPLETE);
     }
 
-    // -------------------------------------------------------------------------
-    //  Resumability
-    // -------------------------------------------------------------------------
-
     /// Everything a caller can observe after a header run.
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct Snapshot {
@@ -2605,10 +2466,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  The `done` tri-state
-    // -------------------------------------------------------------------------
-
     /// `done` walks 0 -> -1 for a stream that is not gzip, and 0 -> 1 for one that
     /// is (`inflate.c` L1229, L523, L688).
     #[test]
@@ -2678,10 +2535,6 @@ mod tests {
         assert_eq!(state.head.unwrap().done, GZ_HEADER_ABSENT);
     }
 
-    // -------------------------------------------------------------------------
-    //  The header CRC
-    // -------------------------------------------------------------------------
-
     /// The header CRC covers exactly the header bytes as they appear on the wire,
     /// up to but not including the CRC-16 itself (RFC 1952 §2.3.1).
     ///
@@ -2739,10 +2592,6 @@ mod tests {
         // one field at a time.
         assert_eq!(crc2(crc2(0, 0x8b1f), 0x0208), crc32(0, &[0x1f, 0x8b, 8, 2]));
     }
-
-    // -------------------------------------------------------------------------
-    //  Preset dictionaries
-    // -------------------------------------------------------------------------
 
     /// `test/infcover.c` L410: `8 b8 0 0 0 1` asks for a dictionary.
     ///
@@ -2823,10 +2672,6 @@ mod tests {
         assert_eq!(outcome, Outcome::NeedDict);
         assert_eq!(adler, Some(0x1234_5678));
     }
-
-    // -------------------------------------------------------------------------
-    //  `inflateGetHeader`
-    // -------------------------------------------------------------------------
 
     /// ★ `inflateGetHeader` refuses a stream that was not configured for gzip
     /// (`inflate.c` L1225): it is a `Z_STREAM_ERROR`, not a silent no-op.
@@ -2923,10 +2768,6 @@ mod tests {
             "a wrapped offset must copy nothing"
         );
     }
-
-    // -------------------------------------------------------------------------
-    //  Reference vectors and robustness
-    // -------------------------------------------------------------------------
 
     /// The header cases of `test/infcover.c`'s `cover_wrap()` (its L399-L411),
     /// with the outcome each one asserts.

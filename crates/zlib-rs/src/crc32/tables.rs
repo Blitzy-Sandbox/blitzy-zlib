@@ -1,13 +1,22 @@
-//! Generated CRC-32 tables, transcribed verbatim from the in-tree C header
+//! Generated CRC-32 tables, transcribed value for value from the in-tree C header
 //! `crc32.h`.
 //!
 //! `crc32.h` carries the banner "Generated automatically by `crc32.c`": it is
-//! machine-written output rather than hand-maintained source, and every value
-//! in this module is a character-for-character transcription of it. The C
-//! header stays in the repository unmodified, so the two can be compared
-//! element for element at any time. That comparison is
-//! `crates/zlib-rs-differential/tests/table_equality.rs`, and it is why every
-//! table below is `pub` rather than crate-private.
+//! machine-written output rather than hand-maintained source, and every value in
+//! this module has **the same value, element for element**, as the corresponding
+//! entry of the header for this repository's default build configuration.
+//!
+//! Element-for-element is the precise claim, and character-for-character would be
+//! wrong: the C literals are written `0x00000000` and the Rust ones
+//! `0x0000_0000`, and the two are grouped and indented differently. What is
+//! preserved is the sequence of values and their order, which is the only thing
+//! the decoder depends on.
+//!
+//! The C header stays in the repository unmodified, so the two can be compared at
+//! any time. The planned `crates/zlib-rs-differential/tests/table_equality.rs`
+//! will be that comparison, and it is why every table below is `pub` rather than
+//! crate-private -- it has not landed yet, so nothing checks the transcription
+//! automatically today.
 //!
 //! The braided design these tables serve is due to Kadatch and Jenkins (2010),
 //! credited at `crc32.c` L5-L7; the paper is carried in this distribution at
@@ -23,13 +32,26 @@
 //! candidate pairs, of which exactly one is live. `crc32.c` picks it:
 //!
 //! * `N` is `5` unless the test-only `Z_TESTN` overrides it (`crc32.c`
-//!   L60-L68), and `crc32.c` L66-L68 restricts it to `1..=6`. This port
+//!   L60-L68), and `crc32.c` L66-L68 restricts it to `1..=6`. This implementation
 //!   implements the default configuration and does not expose `Z_TESTN`, so
 //!   `N` is fixed at `5` here and only the `N == 5` slice of `crc32.h`
 //!   (L6361-L7897) is transcribed.
-//! * `W` is `8` on 64-bit targets and `4` elsewhere (`crc32.c` L81-L106).
-//!   Both live widths are transcribed and selected with `cfg`, so the same
-//!   source serves every target.
+//! * `W` is selected differently here than in C, and the difference is
+//!   deliberate but worth knowing. `crc32.c` L88-L93 picks `W = 8` only when
+//!   `__x86_64__` or `__aarch64__` is defined, and L96-L106 then downgrades it
+//!   to `4` unless a 64-bit `Z_U8` exists; every other target, **including
+//!   64-bit ones such as `riscv64`, `powerpc64` and `s390x`, gets `W = 4`**.
+//!   This module instead keys on `target_pointer_width` (see [`Word`]), so those
+//!   targets get `W = 8` here where a C build of the same sources would use
+//!   `W = 4`.
+//!
+//!   That is output-neutral -- the braid width is an evaluation strategy and a
+//!   CRC-32 is the same scalar either way -- but it does mean the two builds
+//!   consult *different slices* of `crc32.h` on such a target, so a
+//!   table-equality check has to compare against the slice this port selects,
+//!   not against whatever the local C build happened to pick. Both live widths
+//!   are transcribed and chosen with `cfg`, so one source still serves every
+//!   target.
 //!
 //! `crc_table` (L5-L57) and `x2n_table` (L9439-L9446) sit outside every guard
 //! and are unconditional.
@@ -63,14 +85,17 @@
 //!
 //! One externally visible consequence follows, and this module is the
 //! authority for it: because the port has no dynamic CRC table, bit 13 of
-//! `zlibCompileFlags()` -- `DYNAMIC_CRC_TABLE` -- is honestly reported CLEAR
-//! by `crates/libz-rs-sys/src/util.rs`.
+//! `zlibCompileFlags()` -- `DYNAMIC_CRC_TABLE` -- must be reported CLEAR, which
+//! is the honest answer. The planned `crates/libz-rs-sys/src/util.rs` is where
+//! that bit will be computed. The bit describes the initialisation strategy and
+//! nothing else: a dynamically built table holds exactly these values, so no
+//! checksum and no compressed byte differs between the two configurations.
 
 /// Number of interleaved braids the CRC is computed over.
 ///
 /// Mirrors `N` in `crc32.c`, which defaults to `5` at L60-L68 and is
 /// constrained to `1..=6` at L66-L68. The test-only `Z_TESTN` override is
-/// deliberately not exposed: this port implements the default configuration,
+/// deliberately not exposed: this implementation implements the default configuration,
 /// and `N` selects which slice of `crc32.h` is compiled in, so it is fixed.
 ///
 /// `N` is output-neutral. It changes how the input is partitioned across
@@ -88,15 +113,22 @@ pub const POLY: u32 = 0xedb8_8320;
 
 /// The word type a braid step consumes, mirroring `z_word_t` in `crc32.c`.
 ///
-/// `crc32.c` L81-L106 keys this on the target: `W` is `8` when
-/// `__x86_64__` or `__aarch64__` is defined and a 64-bit `Z_U8` exists
-/// (`zutil.h` L49-L60), and is otherwise downgraded to `4` with `z_word_t` set
-/// to the 32-bit `Z_U4` (`zconf.h` L429-L444, the same type behind `z_crc_t`).
+/// `crc32.c` L81-L106 keys this on the target: `W` is `8` only when
+/// `__x86_64__` or `__aarch64__` is defined (L88-L93) **and** a 64-bit `Z_U8`
+/// exists (L97, `zutil.h` L49-L60), and is otherwise downgraded to `4` with
+/// `z_word_t` set to the 32-bit `Z_U4` (`zconf.h` L429-L444, the same type
+/// behind `z_crc_t`).
 ///
-/// Selection here is by pointer width rather than by an architecture
+/// Selection here is by pointer width rather than by that architecture
 /// allow-list, because the availability of a 64-bit word is what actually
-/// decides the question, and both Tier-1 64-bit targets land on `W = 8` either
-/// way.
+/// decides the question. On the two Tier-1 64-bit targets this port is aimed at,
+/// `x86_64` and `aarch64`, the two rules agree on `W = 8`.
+///
+/// They do **not** agree everywhere: a 64-bit target outside C's allow-list --
+/// `riscv64`, `powerpc64`, `s390x` -- takes `W = 4` in C and `W = 8` here. The
+/// checksum is unaffected, since braid width is an evaluation strategy rather
+/// than part of the definition, but the two builds then use different tables, so
+/// do not describe the widths as identical to C's on every target.
 #[cfg(target_pointer_width = "64")]
 pub type Word = u64;
 
@@ -7251,7 +7283,7 @@ mod tests {
         residue
     }
 
-    /// Port of `multmodp` (`crc32.c` L163-L178): return `a(x) * b(x) mod p(x)`
+    /// Mirrors `multmodp` (`crc32.c` L163-L178): return `a(x) * b(x) mod p(x)`
     /// over `GF(2)`, with the polynomials reflected.
     ///
     /// Test-only. The shipped code performs no modular arithmetic at all,
@@ -7280,7 +7312,7 @@ mod tests {
         p
     }
 
-    /// Port of `x2nmodp` (`crc32.c` L184-L195): return `x^(n * 2^k) mod p(x)`,
+    /// Mirrors `x2nmodp` (`crc32.c` L184-L195): return `x^(n * 2^k) mod p(x)`,
     /// reading the powers of `x` out of [`X2N_TABLE`].
     ///
     /// This reads the transcribed table, exactly as the C does, so

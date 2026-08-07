@@ -19,9 +19,14 @@
 # out even where one is installed, use for example:
 #    CARGO=/opt/rust/bin/cargo ./configure
 #    CARGO= ./configure
-# When no usable cargo is found, the make targets rust, rust-test and
-# rust-clean print a notice and succeed without doing anything; the C library
-# is built and tested exactly as it was before.
+# When no usable cargo is found, configure still succeeds and still writes a
+# complete Makefile: the C library is built and tested exactly as it was
+# before, because no C target reads CARGO.  Asking for the Rust build itself
+# then fails -- make rust and make rust-test report the missing toolchain and
+# exit nonzero rather than printing a notice and succeeding, since a caller
+# that believed a skip notice would go on to install, or to test against, some
+# other libz entirely.  make rust-clean still succeeds: removing staged files
+# needs no cargo.
 
 # start off configure.log
 echo -------------------- >> configure.log
@@ -88,15 +93,25 @@ fi
 # is stated once, in rust-toolchain.toml and in the rust-version fields of the
 # crate manifests, and enforced by cargo itself.
 #
-# Not finding cargo is not an error.  CARGO is left empty, configure still
-# writes a complete Makefile, and the rust, rust-test and rust-clean targets
-# respond to an empty CARGO by printing a notice and succeeding.  Nothing in
-# the C build reads CARGO, so a machine with no Rust toolchain at all builds
-# and tests the C library, which is the reference the Rust port is compared
-# against, exactly as it did before.  For the same reason CARGO is emptied
-# rather than kept when a value that came in from the environment turns out
-# not to be runnable: an unusable cargo recorded in the Makefile would break
-# those targets instead of skipping them.
+# Not finding cargo is not an error HERE.  CARGO is left empty and configure
+# still writes a complete Makefile, because nothing in the C build reads CARGO:
+# a machine with no Rust toolchain at all still builds and tests the C library,
+# which is the reference the Rust port is compared against, exactly as it did
+# before.
+#
+# What an empty CARGO does NOT do is make the Rust build targets succeed.  rust
+# and rust-test each refuse to run and exit nonzero, naming the remedy, because
+# those targets are an explicit request to build or test the Rust library and a
+# request that cannot be honoured must not be reported as done.  rust-clean is
+# the exception and still succeeds, because it can finish its job -- removing
+# the staged library -- without cargo.  The optionality lives in what depends
+# on what -- `all' and `test' depend on no Rust target -- not in whether an
+# explicit request can quietly do nothing.
+#
+# CARGO is emptied rather than kept when a value that came in from the
+# environment turns out not to be runnable, so that the failure names the
+# missing toolchain rather than surfacing as an exec error from inside a
+# recipe.
 CARGO=${CARGO-"cargo"}
 if "$CARGO" --version >/dev/null 2>/dev/null || test $? -lt 126; then
     echo "Checking for cargo... Yes." | tee -a configure.log
