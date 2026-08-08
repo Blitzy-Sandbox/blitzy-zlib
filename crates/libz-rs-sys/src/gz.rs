@@ -3169,7 +3169,7 @@ mod tests {
 
         let file = open(&path, "rb");
         let mut code: c_int = 0x5eed;
-        let message = unsafe { gzerror(file, &raw mut code) };
+        let message = unsafe { gzerror(file, core::ptr::addr_of_mut!(code)) };
         assert!(!message.is_null(), "a live handle must have a message");
         // No error yet: the empty string, which is not a null pointer.
         assert_eq!(unsafe { CStr::from_ptr(message) }.to_bytes(), b"");
@@ -3184,13 +3184,13 @@ mod tests {
         assert_eq!(unsafe { gzeof(file) }, 0);
         unsafe { gzclearerr(file) };
         let mut code: c_int = 0x5eed;
-        assert!(!unsafe { gzerror(file, &raw mut code) }.is_null());
+        assert!(!unsafe { gzerror(file, core::ptr::addr_of_mut!(code)) }.is_null());
         assert_eq!(code, Z_OK);
         assert_eq!(unsafe { gzclose(file) }, Z_OK);
 
         // ★ An unusable handle answers with NULL, exactly as `gzlib.c` L517-L521 does.
         let mut code: c_int = 0x5eed;
-        assert!(unsafe { gzerror(core::ptr::null_mut(), &raw mut code) }.is_null());
+        assert!(unsafe { gzerror(core::ptr::null_mut(), core::ptr::addr_of_mut!(code)) }.is_null());
         assert_eq!(code, 0x5eed, "errnum must not be written for a null handle");
         // `gzclearerr` on a null handle is a no-op rather than a crash.
         unsafe { gzclearerr(core::ptr::null_mut()) };
@@ -3229,7 +3229,7 @@ mod tests {
         let got = read_bytes(file, &mut buf);
         assert_eq!(got, 41, "the decompressed bytes are delivered first");
         let mut code: c_int = 0;
-        let message = unsafe { gzerror(file, &raw mut code) };
+        let message = unsafe { gzerror(file, core::ptr::addr_of_mut!(code)) };
         assert!(!message.is_null());
         // Z_DATA_ERROR.
         assert_eq!(code, -3, "a failed data check is a data error");
@@ -3273,7 +3273,7 @@ mod tests {
         let mut buf = [0_u8; 32];
         assert_eq!(read_bytes(file, &mut buf), 0);
         let mut code: c_int = 0x5eed;
-        let message = unsafe { gzerror(file, &raw mut code) };
+        let message = unsafe { gzerror(file, core::ptr::addr_of_mut!(code)) };
         assert!(!message.is_null());
         assert_eq!(code, Z_OK, "trailing garbage is not an error");
         assert_eq!(unsafe { CStr::from_ptr(message) }.to_bytes(), b"");
@@ -3292,7 +3292,13 @@ mod tests {
         let mut scratch_ptr: *mut u8 = core::ptr::null_mut();
         let mut size: usize = 0;
         assert_eq!(
-            unsafe { _zlib_rs_gzprintf_begin(file, &raw mut scratch_ptr, &raw mut size) },
+            unsafe {
+                _zlib_rs_gzprintf_begin(
+                    file,
+                    core::ptr::addr_of_mut!(scratch_ptr),
+                    core::ptr::addr_of_mut!(size),
+                )
+            },
             Z_OK
         );
         assert!(!scratch_ptr.is_null());
@@ -3326,7 +3332,13 @@ mod tests {
         let mut region: *mut u8 = core::ptr::null_mut();
         let mut size: usize = 0;
         assert_eq!(
-            unsafe { _zlib_rs_gzprintf_begin(file, &raw mut region, &raw mut size) },
+            unsafe {
+                _zlib_rs_gzprintf_begin(
+                    file,
+                    core::ptr::addr_of_mut!(region),
+                    core::ptr::addr_of_mut!(size),
+                )
+            },
             Z_OK
         );
         // `size - 1` characters is the documented cap; report exactly `size`, which is one
@@ -3334,7 +3346,13 @@ mod tests {
         assert_eq!(unsafe { _zlib_rs_gzprintf_commit(file, size) }, 0);
         // A formatter that failed reports `(size_t)-1`, which folds into "did not fit".
         assert_eq!(
-            unsafe { _zlib_rs_gzprintf_begin(file, &raw mut region, &raw mut size) },
+            unsafe {
+                _zlib_rs_gzprintf_begin(
+                    file,
+                    core::ptr::addr_of_mut!(region),
+                    core::ptr::addr_of_mut!(size),
+                )
+            },
             Z_OK
         );
         assert_eq!(unsafe { _zlib_rs_gzprintf_commit(file, usize::MAX) }, 0);
@@ -3350,7 +3368,11 @@ mod tests {
         let mut size: usize = 0xdead;
         assert_eq!(
             unsafe {
-                _zlib_rs_gzprintf_begin(core::ptr::null_mut(), &raw mut region, &raw mut size)
+                _zlib_rs_gzprintf_begin(
+                    core::ptr::null_mut(),
+                    core::ptr::addr_of_mut!(region),
+                    core::ptr::addr_of_mut!(size),
+                )
             },
             Z_STREAM_ERROR
         );
@@ -3365,16 +3387,30 @@ mod tests {
         write_file(&path, "wb", b"payload");
         let file = open(&path, "rb");
         assert_eq!(
-            unsafe { _zlib_rs_gzprintf_begin(file, core::ptr::null_mut(), &raw mut size) },
+            unsafe {
+                _zlib_rs_gzprintf_begin(file, core::ptr::null_mut(), core::ptr::addr_of_mut!(size))
+            },
             Z_STREAM_ERROR
         );
         assert_eq!(
-            unsafe { _zlib_rs_gzprintf_begin(file, &raw mut region, core::ptr::null_mut()) },
+            unsafe {
+                _zlib_rs_gzprintf_begin(
+                    file,
+                    core::ptr::addr_of_mut!(region),
+                    core::ptr::null_mut(),
+                )
+            },
             Z_STREAM_ERROR
         );
         // A read stream is not writable, so the core's own guard refuses it.
         assert_eq!(
-            unsafe { _zlib_rs_gzprintf_begin(file, &raw mut region, &raw mut size) },
+            unsafe {
+                _zlib_rs_gzprintf_begin(
+                    file,
+                    core::ptr::addr_of_mut!(region),
+                    core::ptr::addr_of_mut!(size),
+                )
+            },
             Z_STREAM_ERROR
         );
         assert_eq!(unsafe { gzclose(file) }, Z_OK);

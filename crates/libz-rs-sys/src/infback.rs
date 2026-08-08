@@ -2301,7 +2301,7 @@ mod tests {
         // owner-identity check meaningful.
         let prefix = strm.state.cast::<StatePrefix>();
         let owner = unsafe { core::ptr::addr_of!((*prefix).strm).read() };
-        assert!(core::ptr::eq(owner, &raw const strm));
+        assert!(core::ptr::eq(owner, core::ptr::addr_of!(strm)));
         // And a fresh state's tag names a real mode, so the block passes its own
         // validator from the moment it exists.
         assert!(Mode::from_raw(mode_tag(&strm)).is_some());
@@ -2329,7 +2329,14 @@ mod tests {
         // Distinctive values in every member `inflateBack` must leave alone.
         strm.total_in = 111;
         strm.total_out = 222;
-        strm.next_out = core::ptr::without_provenance_mut(0x1000);
+        // ★ A distinctive dangling sentinel, never dereferenced.
+        // `core::ptr::without_provenance_mut` and `<*mut T>::addr` are both
+        // `strict_provenance`, stabilised in Rust 1.84, and this workspace's floor is
+        // 1.80 -- so the sentinel is an ordinary integer-to-pointer cast, and the check
+        // further down compares the pointer itself, which is stricter than comparing
+        // addresses.
+        let sentinel = 0x1000_usize as *mut Bytef;
+        strm.next_out = sentinel;
         strm.avail_out = 333;
         strm.data_type = 444;
         strm.adler = 555;
@@ -2352,7 +2359,7 @@ mod tests {
         // descriptors are for.
         assert_eq!(strm.total_in, 111);
         assert_eq!(strm.total_out, 222);
-        assert_eq!(strm.next_out.addr(), 0x1000);
+        assert_eq!(strm.next_out, sentinel);
         assert_eq!(strm.avail_out, 333);
         assert_eq!(strm.data_type, 444);
         assert_eq!(strm.adler, 555);
