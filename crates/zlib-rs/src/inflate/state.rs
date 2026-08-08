@@ -1422,6 +1422,29 @@ impl<'a, A: Allocator<'a>> InflateState<'a, A> {
         self.head = head;
     }
 
+    /// Reads the gzip-header sink back out, or [`None`] when none is installed.
+    ///
+    /// The counterpart of [`InflateState::set_header_sink`], and the reason it
+    /// has to exist: C's header states write **through** `state->head` directly
+    /// into the caller's `gz_header` (`inflate.c` L566, L577, L586-L587, L596,
+    /// L601, L631, L666, L678, L687), whereas this crate parses into the sink and
+    /// therefore holds the scalars on its own side. Only the facade owns the raw
+    /// `gz_headerp`, so only the facade can publish them, and it needs a way to
+    /// read them. [`GzHeaderSink`] is [`Copy`], so this hands back a snapshot and
+    /// the state keeps its own.
+    ///
+    /// The three variable-length members need no such step: they are
+    /// `&[Cell<u8>]` views over the caller's own buffers, so a byte written by
+    /// the `EXTRA`, `NAME` or `COMMENT` state is already in the caller's memory.
+    /// What the facade takes from here is the seven scalars -- `text`, `time`,
+    /// `xflags`, `os`, `extra_len`, `hcrc`, `done` -- plus the three
+    /// `*_is_absent` answers that tell it to store `Z_NULL` back into the
+    /// caller's structure.
+    #[must_use]
+    pub const fn header_sink(&self) -> Option<GzHeaderSink<'a>> {
+        self.head
+    }
+
     /// `INITBITS`: clear the input accumulator (`inflate.c` L347-L351).
     pub(crate) fn init_bits(&mut self) {
         self.hold = 0;

@@ -781,13 +781,21 @@ pub extern "C" fn get_crc_table() -> *const z_crc_t {
 //   get_crc_table()    = [0] 0x00000000, [1] 0x77073096, [255] 0x2d02ef8d,
 //                        and the same pointer on every call
 //
-// Nothing here dereferences a raw pointer, so no test needs `unsafe` either. The
-// exported pointers are checked by identity against the constant they must address,
-// and that constant's contents are then read safely -- which proves exactly what a
-// raw read would, without weakening this module's "no unsafe anywhere" property. A C
-// caller genuinely reading through the pointers is exercised separately, by the
-// probe and by the unmodified `test/example.c` that `Makefile.in`'s `rust-test`
-// target compiles against the staged library.
+// Nothing here dereferences a raw pointer, so no test needs `unsafe` either. An
+// exported pointer is checked for non-nullness, for STABILITY ACROSS CALLS, and for
+// the contents of the constant it addresses -- read safely through that constant --
+// which proves what a raw read would without weakening this module's "no unsafe
+// anywhere" property. A C caller genuinely reading through the pointers is exercised
+// separately, by the probe and by the unmodified `test/example.c` that
+// `Makefile.in`'s `rust-test` target compiles against the staged library.
+//
+// One thing deliberately NOT asserted, because it is a build artefact rather than a
+// contract: identity between a pointer an export returned and `SOME_CONST.as_ptr()`
+// evaluated here. A `const` is inlined at every use site, so the two referents need
+// not be the same allocation -- measured under `-Zbuild-std -Zsanitizer=address`,
+// where they differ, against an ordinary build, where they are deduplicated and the
+// assertion passed by luck. Stability across repeated calls through one export is the
+// address property C really does imply, and that is what is checked instead.
 #[cfg(test)]
 mod tests {
     use super::{
@@ -836,10 +844,29 @@ mod tests {
     fn zlib_version_returns_that_literal_and_never_null() {
         let first = zlibVersion();
         assert!(!first.is_null());
-        // Identity against the constant, which the test above pins the contents of.
-        assert_eq!(first, ZLIB_VERSION.as_ptr());
-        // Stable across calls: one materialised constant, not a fresh temporary.
+        // Stable across calls: one materialised constant, not a fresh temporary. This is
+        // the address property the C contract does imply -- `zutil.c` L27-L29 returns the
+        // same string literal every time -- and it holds here because `zlibVersion`'s body
+        // holds a single use site of the constant.
         assert_eq!(first, zlibVersion());
+        // Identity against a SEPARATE use site of the constant, which is what
+        // `assert_eq!(first, ZLIB_VERSION.as_ptr())` would be, is deliberately not
+        // asserted. `ZLIB_VERSION` is a `const`, a `const` is inlined at every use site,
+        // and the referent this test would materialise therefore need not be the one the
+        // function body materialised. Measured, not supposed: under
+        // `-Zbuild-std -Zsanitizer=address` the two addresses genuinely differ, while an
+        // ordinary build happens to deduplicate them -- so the assertion described a
+        // build artefact, not the contract. `ZLIB_VERSION` cannot become a `static` to
+        // force one address either, because the compile-time guards near the top of this
+        // file read it in `const` context and a constant may not refer to a static.
+        //
+        // What a C caller actually depends on is the BYTES -- every
+        // `strcmp(zlibVersion(), ZLIB_VERSION)` check, `test/example.c` L502-L505
+        // included. Those are pinned by
+        // `the_version_string_is_the_header_literal_verbatim` above, and the end-to-end
+        // read through the raw pointer is exercised by the unmodified `test/example.c`
+        // that `Makefile.in`'s `rust-test` target links against the staged library.
+        assert_eq!(ZLIB_VERSION.to_bytes(), b"1.3.2.1-motley");
     }
 
     #[test]
@@ -1030,7 +1057,21 @@ mod tests {
         for code in OUT_OF_RANGE_CODES {
             let message = error_message(code);
             assert_eq!(message.to_bytes(), b"", "zError({code}) should be empty");
-            assert_eq!(message.as_ptr(), EMPTY_MESSAGE.as_ptr());
+            assert_eq!(
+                message.to_bytes_with_nul(),
+                EMPTY_MESSAGE.to_bytes_with_nul(),
+                "zError({code}) should be the empty-message constant"
+            );
+            // Stability of the address across calls is the property C's
+            // `z_errmsg[Z_NEED_DICT - err]` implies, and it holds because
+            // `error_message` contains a single use site of `EMPTY_MESSAGE`. Identity
+            // against a *separate* use site of that `const` -- which
+            // `assert_eq!(message.as_ptr(), EMPTY_MESSAGE.as_ptr())` would be -- is not
+            // asserted, for the reason spelled out at
+            // `zlib_version_returns_that_literal_and_never_null`: a `const` is inlined per
+            // use site, and under `-Zbuild-std -Zsanitizer=address` the two referents are
+            // measurably distinct allocations.
+            assert_eq!(message.as_ptr(), error_message(code).as_ptr());
             assert!(!zError(code).is_null());
         }
     }

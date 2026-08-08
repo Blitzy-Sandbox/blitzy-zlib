@@ -239,6 +239,19 @@
 //!   through the crate root. That is the arrangement the root manifest records
 //!   where it explains why `unreachable_pub` is not enabled, and it is why
 //!   `zlib.map` rather than Rust visibility governs what the library exports.
+//! * `deflate` — the seventeen exported `deflate*` entry points (`deflateInit_`,
+//!   `deflateInit2_`, `deflate`, `deflateEnd`, `deflateSetDictionary`,
+//!   `deflateGetDictionary`, `deflateCopy`, `deflateReset`, `deflateResetKeep`,
+//!   `deflateParams`, `deflateTune`, `deflateBound`, `deflateBound_z`,
+//!   `deflatePending`, `deflateUsed`, `deflatePrime`, `deflateSetHeader`) over
+//!   `deflate.c`. Pointer validation, allocator construction, slice
+//!   reconstruction, the opaque `state` round-trip and width mapping only; every
+//!   compression decision lives in `zlib_rs`. `deflateInit` and `deflateInit2` are
+//!   deliberately **absent**: `zlib.h` declares both, but both are macros over the
+//!   `_`-suffixed functions and neither is an exported symbol, so exporting them
+//!   would fail the 111-symbol parity diff. Gated on `libz-compat` and private,
+//!   for the same two reasons as `compress`, and named in a code span rather than
+//!   as an intra-doc link for the same reason too.
 //! * `util` — library introspection: `zlibVersion`, `zlibCompileFlags`, `zError`
 //!   and `get_crc_table`, four of the ninety-five exports. Also the home of the
 //!   version identity — `util::ZLIB_VERSION` and the `ZLIB_VER_*` numbers — which
@@ -280,8 +293,47 @@ pub mod checksum;
 #[cfg(feature = "libz-compat")]
 mod compress;
 
+// Exported `extern "C"` surface, private and `libz-compat`-gated for exactly the two reasons
+// given above `mod compress`.
+#[cfg(feature = "libz-compat")]
+mod deflate;
+
+// The decompression exports. Private for the same reason `compress` is: its
+// `#[no_mangle]` items are reached through the dynamic symbol table, so a `pub mod`
+// would add a second, Rust-side path to the same functions and put the crate root in
+// the business of deciding what is exported -- which is `zlib.map`'s job.
+//
+// ★ This module additionally exports `inflate_table`, which `zlib.map`'s `local:`
+// block hides from the shared library's dynamic table but which the unmodified
+// `test/infcover.c` calls directly and links from `libz.a`. See the module's own
+// documentation for why the two requirements are compatible rather than in conflict.
+#[cfg(feature = "libz-compat")]
+mod inflate;
+
 // Gated with the exported surface it belongs to: `libz-compat` is what turns the
 // unmangled C symbols on, so a `--no-default-features` build compiles this module
 // out along with the rest of them.
 #[cfg(feature = "libz-compat")]
 pub mod util;
+
+// The `gzFile` layer: thirty exported `gz*` symbols plus the two hidden helpers
+// `_zlib_rs_gzprintf_begin` and `_zlib_rs_gzprintf_commit` that `csrc/gzprintf_shim.c`
+// calls. Three properties, all deliberate:
+//
+//   * TWO features gate it, not one. `libz-compat` turns the unmangled C symbols on,
+//     as it does for every export module; `gz` additionally forwards into
+//     `zlib-rs/std`, because file I/O is the only part of the port that needs `std` in
+//     the core and `zlib-rs` declares its own `gz` subtree `#[cfg(feature = "std")]`.
+//     With either feature off the crate still compiles and simply exports no `gz*`
+//     symbols -- `--no-default-features` is a supported configuration and nothing here
+//     may raise a `compile_error!` for it.
+//   * The module is PRIVATE, for the same reason `compress` is: its `#[no_mangle]`
+//     items reach their consumers through the dynamic symbol table, so a `pub mod`
+//     would add a second, Rust-side path to the same functions and put the crate root
+//     in the business of deciding what is exported -- which is `zlib.map`'s job.
+//   * `gzprintf` and `gzvprintf` are NOT here. Stable Rust at the declared MSRV can
+//     neither define a C-variadic function nor name a `va_list`, so those two symbols
+//     come from the single C translation unit the packaging step links in; the module
+//     documentation records the full reasoning and the helper contract.
+#[cfg(all(feature = "libz-compat", feature = "gz"))]
+mod gz;
