@@ -683,7 +683,7 @@ fn narrow_check(value: uLong) -> u32 {
 /// [`MESSAGES`] and is checked against it by a test below. Should one ever be added
 /// without updating the table, the result is a null pointer rather than a wild one:
 /// reporting no message is a documented state, reporting a bad pointer is not.
-fn message_ptr(msg: Option<&'static str>) -> *const c_char {
+pub(crate) fn message_ptr(msg: Option<&'static str>) -> *const c_char {
     let Some(text) = msg else {
         return core::ptr::null();
     };
@@ -766,7 +766,10 @@ const MESSAGES: &[&core::ffi::CStr] = &[
 ///
 /// If `version` is non-null it must point at a readable NUL-terminated string;
 /// only its first byte is read, so a single readable byte suffices.
-unsafe fn version_error(version: *const c_char, stream_size: c_int) -> Option<ReturnCode> {
+pub(crate) unsafe fn version_error(
+    version: *const c_char,
+    stream_size: c_int,
+) -> Option<ReturnCode> {
     if version.is_null() {
         return Some(ReturnCode::VERSION_ERROR);
     }

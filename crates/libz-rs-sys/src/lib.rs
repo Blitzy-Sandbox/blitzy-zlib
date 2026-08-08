@@ -310,6 +310,18 @@ mod deflate;
 #[cfg(feature = "libz-compat")]
 mod inflate;
 
+// The three `inflateBack*` exports. Private and `libz-compat`-gated for the same
+// two reasons `compress` is.
+//
+// ★ It sits beside `inflate` rather than inside it because its public entry points
+// are distinct, which is exactly why `infback.c` is a separate translation unit
+// that shares `inflate.h`, `inftrees.h` and `inffast.h` with `inflate.c`. The two
+// modules likewise share one state representation and one message table: this one
+// reads `inflate`'s `version_error` and `message_ptr` rather than growing second
+// copies that could drift.
+#[cfg(feature = "libz-compat")]
+mod infback;
+
 // Gated with the exported surface it belongs to: `libz-compat` is what turns the
 // unmangled C symbols on, so a `--no-default-features` build compiles this module
 // out along with the rest of them.
