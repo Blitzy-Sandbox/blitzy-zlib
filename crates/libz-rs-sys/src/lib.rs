@@ -210,10 +210,78 @@
 //!   types, the [`types::StreamAllocator`] that calls a caller's `zalloc` and
 //!   `zfree`, and the shared entry-point helpers that each hold one of the
 //!   unsafe categories above. Every other module depends on it.
+//! * `layout_assertions` — the ABI gate. A private module of nothing but
+//!   `const _: () = assert!(…)` items pinning every struct size, field offset
+//!   and integer width `zlib.h`, `zconf.h` and `inftrees.h` fix, so that layout
+//!   drift is a build failure rather than silent memory corruption in every
+//!   program that links the result. It exports nothing — deliberately, since an
+//!   extra name in the dynamic symbol table would fail the 111-symbol parity
+//!   diff — and is the first of the four mechanisms that enforce header
+//!   immutability, alongside the cbindgen header diff, the `nm` symbol-parity
+//!   diff and the `c-std.yml` C89-through-gnu2x sweep.
+//! * `checksum` — the eleven exported Adler-32 and CRC-32 entry points:
+//!   `adler32`, `adler32_z`, `adler32_combine`, `adler32_combine64`, `crc32`,
+//!   `crc32_z`, `crc32_combine`, `crc32_combine64`, `crc32_combine_gen`,
+//!   `crc32_combine_gen64` and `crc32_combine_op`. Width conversion,
+//!   null-pointer handling and sentinel pass-through only; all arithmetic lives
+//!   in `zlib_rs`. `get_crc_table` belongs to the same C family but is exported
+//!   from the introspection module, not from here. Named in a code span rather
+//!   than as an intra-doc link for the same reason as `compress` and `util`: the
+//!   module is `cfg`-gated, so a link would be unresolvable — and therefore a
+//!   rustdoc error under `-D warnings` — in the `--no-default-features` build this
+//!   crate supports.
+//! * `compress` — the ten one-shot exports (`compress`, `compress_z`,
+//!   `compress2`, `compress2_z`, `compressBound`, `compressBound_z`,
+//!   `uncompress`, `uncompress_z`, `uncompress2`, `uncompress2_z`) over
+//!   `compress.c` and `uncompr.c`. Gated on `libz-compat`, because it is
+//!   exported surface rather than shared machinery, and **private**: an export
+//!   module reaches its consumers through the dynamic symbol table, never
+//!   through the crate root. That is the arrangement the root manifest records
+//!   where it explains why `unreachable_pub` is not enabled, and it is why
+//!   `zlib.map` rather than Rust visibility governs what the library exports.
+//! * `util` — library introspection: `zlibVersion`, `zlibCompileFlags`, `zError`
+//!   and `get_crc_table`, four of the ninety-five exports. Also the home of the
+//!   version identity — `util::ZLIB_VERSION` and the `ZLIB_VER_*` numbers — which
+//!   is why it is the module the init entry points take their comparison string
+//!   from. Gated behind `libz-compat`, like every module that contributes exported
+//!   symbols. Named in code spans rather than as intra-doc links on purpose: the
+//!   module is `cfg`-gated, so a link would be unresolvable — and therefore a
+//!   rustdoc error under `-D warnings` — in a `--no-default-features` build, which
+//!   this crate supports.
 
 #![allow(non_camel_case_types)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
+// Compile-time only, and intentionally not `pub`: the module declares no
+// nameable item, so there is nothing for a consumer to reach. Declaring it is
+// what makes its assertions run — a `const` item is evaluated because it exists,
+// not because something uses it.
+mod layout_assertions;
 pub mod panic_guard;
 pub mod types;
+
+// Gated at the crate root, as `Cargo.toml` requires of every export: a
+// `--no-default-features` build is supported and must simply have the exported
+// `extern "C"` surface absent, never raise a `compile_error!`.
+#[cfg(feature = "libz-compat")]
+pub mod checksum;
+
+// Exported `extern "C"` surface. Two properties, both deliberate:
+//
+//   * `libz-compat` gates it, as the feature table above describes: with the
+//     feature off the crate still compiles and still provides `types` and
+//     `panic_guard`, it simply exports no unmangled symbols.
+//   * The module is PRIVATE. Its `#[no_mangle]` items are reachable through the
+//     dynamic symbol table, so a `pub mod` would add a second, Rust-side path to
+//     the same functions and put the crate root in the business of deciding what
+//     is exported -- which is `zlib.map`'s job. The root manifest states this
+//     arrangement where it explains why `unreachable_pub` is switched off.
+#[cfg(feature = "libz-compat")]
+mod compress;
+
+// Gated with the exported surface it belongs to: `libz-compat` is what turns the
+// unmangled C symbols on, so a `--no-default-features` build compiles this module
+// out along with the rest of them.
+#[cfg(feature = "libz-compat")]
+pub mod util;

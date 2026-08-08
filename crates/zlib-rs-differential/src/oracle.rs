@@ -371,6 +371,14 @@ const _: () = assert!(size_of::<out_func>() == size_of::<voidpf>());
 
 /// True when the target uses the integer model the reference numbers were measured under: 64-bit
 /// pointers with a 64-bit `unsigned long`, i.e. LP64.
+//
+// `#[allow(dead_code)]` is required at the declared MSRV. Every use of this constant sits inside a
+// `const _: () = …` item, and rustc 1.80's dead-code pass does not traverse those bodies: it reports
+// "constant `IS_LP64` is never used". Verified — the warning appears under rustc 1.80.1 and is absent
+// under 1.97.1, and CI builds with `-D warnings`, so without this the crate fails to build on exactly
+// the compiler `rust-version = "1.80"` promises. The attribute is inert on newer toolchains.
+// `crates/libz-rs-sys/src/layout_assertions.rs` carries the same note against its own gate.
+#[allow(dead_code)]
 const IS_LP64: bool = size_of::<*const c_void>() == 8 && size_of::<c_ulong>() == 8;
 
 // The exact numbers measured from the C build on x86_64-unknown-linux-gnu, asserted only where the
