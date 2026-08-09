@@ -12,10 +12,12 @@ The qualifier "reads input bytes" is load-bearing, not hedging. Not every correc
 takes an input sample — see [Which gates read this folder, and which do
 not](#which-gates-read-this-folder-and-which-do-not) below.
 
-**Checkpoint state.** `crates/zlib-rs-differential/tests/` and the repository-root
-`benches/` do not exist yet, so no file reads this folder today. Every statement below about
-what a consumer does is a contract those consumers will be written to satisfy, not an
-observation of current behaviour.
+**Checkpoint state.** The tier-1 consumers exist: `tests/byte_identical.rs` and
+`tests/roundtrip_interop.rs` both read every fixture in `minimal/` on every run, and both
+fail outright when a filename is missing or a pinned length has drifted. The two Silesia
+consumers named below — `benches/deflate_bench.rs` and `benches/inflate_bench.rs` — do not
+exist yet, so the tier-2 path contract is still a contract those suites will be written to
+satisfy rather than an observation of current behaviour.
 
 Because the governing acceptance criterion is that compressed output be *byte-identical* to
 the C reference, this corpus defines the sample over which that claim is measured. The
@@ -48,7 +50,7 @@ whose result depends on what a remote server served that day.
 
 ### Which gates read this folder, and which do not
 
-| Planned gate | Reads `minimal/`? | Its input |
+| Gate | Reads `minimal/`? | Its input |
 | --- | --- | --- |
 | `tests/byte_identical.rs` | **Yes** | Every fixture, multiplied by the whole configuration matrix |
 | `tests/roundtrip_interop.rs` | **Yes** | Every fixture, compressed by one implementation and inflated by the other |
@@ -493,12 +495,12 @@ Adding a fixture is a contract change. Do all five steps in one commit.
    part of what the fixture tests, what code the fixture reaches, and the reference that
    justifies it. A fixture whose rationale cannot be written down is a fixture that is not
    needed.
-4. **Update every consumer.** The tests are to name fixtures individually, so a new file
-   will be read by nobody until it is added to `tests/byte_identical.rs` and, where
-   round-tripping is relevant, `tests/roundtrip_interop.rs`. Neither file exists, so this
-   step has nothing to act on and no fixture in this folder should be treated as covered by
-   a differential test. `tests/table_equality.rs` is never a consumer; it reads no fixtures
-   at all.
+4. **Update every consumer.** The tests name fixtures individually, so a new file will be
+   read by nobody until it is added to the `FIXTURES` table in `tests/byte_identical.rs` and
+   in `tests/roundtrip_interop.rs`. This is not optional: both files load the whole table and
+   **fail** when a name is missing or a pinned length has drifted, which is the consumer-side
+   half of the breaking-change rule above. `tests/table_equality.rs` is never a consumer; it
+   reads no fixtures at all.
 5. **Account for the cost.** Every fixture is multiplied by the whole differential matrix,
    which per AAP §0.6.4.4 spans compression levels 0-9, `windowBits` for all three container
    formats (raw, zlib and gzip), `memLevel` 1-9, five strategies, six flush modes, and both

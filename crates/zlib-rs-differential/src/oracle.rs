@@ -98,16 +98,17 @@
 //! src/oracle.rs  local #[repr(C)] mirrors + `extern "C"` c_/c_oracle_ declarations + safe slice
 //!                wrappers over the generated tables. Depends on nothing outside `core`/`std`.
 //! src/lib.rs     `pub mod oracle;` plus the crate-level documentation.
-//! tests/*.rs     NOT YET WRITTEN. The directory does not exist, so no differential,
-//!                interoperability or table-equality assertion runs anywhere today.
+//! tests/*.rs     The three differential gates: table_equality.rs compares the transcribed
+//!                constants, byte_identical.rs compares the encoder's output bytes, and
+//!                roundtrip_interop.rs crosses the two implementations in both directions.
 //! ```
 //!
-//! The split is a design decision about where such assertions *belong*, not a description of
-//! coverage that exists: a suite under `tests/` would import `zlib_rs_differential::oracle::*`
-//! (this lib) alongside `zlib_rs::*` and `libz_rs_sys::*`, which is the only place those
-//! dev-dependencies resolve. Until it is written, the only thing this crate executes is the
-//! deliberately minimal smoke module at the foot of this file, which proves that the archive links
-//! and that the renaming worked -- and nothing about either implementation's output.
+//! The split is a design decision about where such assertions *belong*: a suite under `tests/`
+//! imports `zlib_rs_differential::oracle::*` (this lib) alongside `zlib_rs::*` and
+//! `libz_rs_sys::*`, which is the only place those dev-dependencies resolve. Nothing in *this* file
+//! asserts anything about either implementation's output; the only thing it executes is the
+//! deliberately minimal smoke module at its foot, which proves that the archive links and that the
+//! renaming worked, and nothing more.
 
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]

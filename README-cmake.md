@@ -17,6 +17,30 @@ Every option is list below (excluding the cmake-standard options), they can be s
 
     ZLIB_BUILD_STATIC=ON -- Enable building zlib static library
 
+    ZLIB_BUILD_RUST=OFF -- Use the memory-safe Rust libz for the exported ZLIB::* targets
+
+With this option on, the exported ZLIB::ZLIB and ZLIB::ZLIBSTATIC targets are built by cargo from the
+Rust workspace at the top of this tree (crates/libz-rs-sys) instead of from the C sources. The libz.so
+and libz.a it stages present the same ABI as the C library, the shared one carrying the same SONAME
+libz.so.1 and the same 111 exported symbols at the same versions, so programs already linked against
+zlib keep working without being recompiled. cargo has to be reachable on PATH and configuration stops
+with a message telling you so when it is not, or -DZLIB_CARGO_EXECUTABLE=/path/to/cargo names a
+particular one. Building the workspace needs Rust 1.80 or newer, which cargo enforces itself from
+rust-toolchain.toml and the crate manifests. The C targets zlib and zlibstatic are still defined and
+still built, as they are the reference the Rust code is diffed against, so this option adds a library
+rather than taking one away. It is off by default, and while it is off no Rust tool is probed and
+everything here behaves exactly as it always has. The Rust library is supported on Rust's tier 1
+targets, and this option additionally wants a linker that accepts the -soname and --version-script
+flags, the same platform set that gets zlib.map for the C shared library.
+
+With ZLIB_INSTALL on as well, installing publishes the same names, the same SONAME and the same symlink
+topology the C build does: the real file libz.so.1.3.2.1-motley, named from ZLIB_VERSION in zlib.h, with
+libz.so.1, libz.so and the versioned name the C library itself publishes all pointing at it, and the
+static libz.a beside them. Those links are a correctness requirement rather than packaging polish, as
+libz.so.1 is the SONAME the loader searches for and a directory holding libz.so alone leaves it free to
+go on searching and bind the system libz instead, silently. README and rust/README.md cover the Rust
+build in full.
+
     ZLIB_BUILD_MINIZIP=ON -- Enable building libminizip contrib library
 
 If this option is turned on, additional options are available from minizip (see below)
@@ -77,3 +101,12 @@ When found the following targets are created for you:
 
     ZLIB::ZLIB and ZLIB::ZLIBSTATIC -- for zlib
     MINIZIP::minizip and MINIZIP::minizipstatic -- for minizip
+
+Those two zlib names are the whole consumption interface and they do not change with the implementation
+behind them: with ZLIB_BUILD_RUST=ON they resolve to the cargo-built libraries, with it off to the C
+ones. The find_package call above is written the same way either way, shared and static stay the only
+components, and there is deliberately no rust component to ask for, because which implementation was
+built is settled when zlib itself is configured and is not something a consumer selects or can see.
+That is also why the cases in test/ need no Rust-specific variants: example.c, minigzip.c and infcover.c
+link ZLIB::ZLIB or ZLIB::ZLIBSTATIC and are compiled from exactly the same unmodified sources whichever
+library is behind the name.
