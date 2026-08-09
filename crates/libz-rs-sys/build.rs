@@ -25,11 +25,18 @@
 //      own cdylib link is REFUSED with the measurements that show why it cannot
 //      work.  See the long comment above `reject_version_script_passthrough`.
 //
-//   4. The versioned aliases -- `libz.so.1` and `libz.so.<ZLIB_VERSION>` beside
-//      the cdylib in `target/<profile>`, as relative symlinks to it.  See the
-//      long comment above `stage_versioned_aliases`; the direction is inverted
-//      relative to the C build and the reason it exists at all is a failure that
-//      was reproduced, not a tidiness preference.
+//   4. Artifact-directory hygiene -- a plain-text notice next to cargo's
+//      artifacts saying what each one is and which command produces an
+//      installable library, plus removal of the `libz.so.1` /
+//      `libz.so.<ZLIB_VERSION>` symlinks an older revision of this script used to
+//      stage there.  It NO LONGER STAGES THE VERSIONED CHAIN: a build script runs
+//      before the link, so the links it creates can be left dangling by a
+//      `cargo check`, a failed build or a `cargo clean -p`, and cargo puts that
+//      same directory first on the library search path of every build script,
+//      which made the host build tools load the library under construction.  Both
+//      were measured; see the long comment above `tidy_artifact_dir`.  The chain
+//      belongs to the packaging step, which runs after the link and stages the
+//      library that can actually satisfy the names.
 //
 //   5. The C ABI shims -- `csrc/gzprintf_shim.c`, which defines the variadic
 //      `gzprintf` and `gzvprintf`, and `csrc/inftrees_shim.c`, which defines
@@ -43,8 +50,10 @@
 // WHAT A BARE `cargo build` PRODUCES, STATED PRECISELY
 //
 // After this script has run and the crate has been linked, `target/<profile>`
-// holds `libz.a`, `libz.so` with `SONAME libz.so.1`, and the two aliases job 4
-// creates.
+// holds `libz.a`, `libz.so` with `SONAME libz.so.1`, `libz.rlib`, and job 4's
+// `README-cargo-artifacts.txt` saying which of them may be installed.  It holds
+// NO `libz.so.1` and no `libz.so.<ZLIB_VERSION>`, deliberately: those names
+// belong to the packaged library that can satisfy them.
 //
 // `libz.a` IS COMPLETE: it defines all 95 functions `zlib.h` declares, plus
 // `inflate_table` as a hidden global, because job 5's objects are merged into it.
@@ -62,33 +71,54 @@
 //
 // The installable shared library is therefore produced by ONE further step --
 // `Makefile.in`'s `rust` target, or the CMake equivalent -- which relinks that
-// same complete archive through `zlib.map` and stages the versioned chain in an
-// isolated directory.  `crates/libz-rs-sys/src/lib.rs` carries the artifact matrix
-// that states this once; this script's job 4 is not a substitute for that step and
-// must not be described as one.
+// same complete archive through `zlib.map`, filters the compiler-runtime globals,
+// and stages the versioned chain in an isolated directory.
+// `crates/libz-rs-sys/src/lib.rs` carries the artifact matrix that states this
+// once; nothing this script does is a substitute for that step and none of it may
+// be described as one.
 //
-// WHY JOB 4 IS WORTH DOING ANYWAY, AND WHAT IT COSTS
+// WHY THE VERSIONED NAMES ARE NOT STAGED HERE
 //
-// Without `libz.so.1` beside it, a consumer linked against this artifact does
-// not fail -- it SILENTLY BINDS THE SYSTEM libz.  Reproduced during planning:
-// `ldd` resolved to /lib/x86_64-linux-gnu/libz.so.1 and the probe printed the
-// system library's version, so a "drop-in replacement" check passed while
-// exercising the C library.  With the alias present, the same consumer binds
-// this file and any incompleteness above surfaces as a diagnosable symbol or
-// version error.  Turning a silent wrong-library success into a visible failure
-// is the whole point, and it is why AAP §0.4.1.3 assigns the chain here.
+// The chain is mandatory where the library is installable, and for a precise
+// reason: the SONAME is `libz.so.1`, so that is the name the loader searches for,
+// and a directory holding only `libz.so` makes the loader keep searching and
+// SILENTLY BIND THE SYSTEM libz.  Reproduced during planning -- `ldd` resolved to
+// /lib/x86_64-linux-gnu/libz.so.1 and the probe printed the system version -- so
+// every drop-in validation asserts with `ldd` which file was bound.  That is the
+// packaging step's job, it stages the chain unconditionally every time it runs,
+// and it stages the relinked library that can honour the names.
 //
-// The cost is real and is mitigated rather than ignored.  `target/<profile>` is
-// on the library search path of everything cargo launches, and the host binutils
-// carry `DT_NEEDED libz.so.1` with no RPATH of their own (`ld.so --list
-// /usr/bin/nm`).  Measured: with the alias in place, the differential crate's
-// build script emitted 32 `no version information available` notices, because
-// its `nm`/`objcopy` calls loaded this unversioned library instead of the
-// system one.  The fix is at the caller: `crates/zlib-rs-differential/build.rs`
-// strips LD_LIBRARY_PATH and DYLD_LIBRARY_PATH from its own environment before
-// spawning any host tool, so its children resolve libz the way the system
-// intends.  Any future build script that shells out to a libz-linked tool needs
-// the same two lines.
+// Staging the same names HERE was measured to cause the very failures the chain
+// prevents, because a build script runs BEFORE the link and cannot know whether a
+// cdylib will appear at all:
+//
+//   * `cargo check`, any failed build, and `cargo clean -p libz-rs-sys --release`
+//     each left two DANGLING versioned links behind -- and a dangling `libz.so.1`
+//     on a loader path is treated as a miss, so the loader falls through to the
+//     system libz exactly as if the link had never been there.
+//   * `target/<profile>` is first on the library search path of every build script
+//     cargo launches, and the host binutils carry `DT_NEEDED libz.so.1` with no
+//     RPATH of their own (`ld.so --list /usr/bin/nm`).  With the alias present:
+//     six `no version information available` lines per rebuild in this script's
+//     own cargo-hidden stderr, 32 in one build of the differential crate, and --
+//     after a supported `--no-default-features` build left a zero-export
+//     `libz.so` -- `as: symbol lookup error: undefined symbol: deflate`, which
+//     wedged every subsequent build until the alias was deleted by hand.
+//   * Three files named exactly like an installable drop-in, all reporting
+//     `SONAME libz.so.1`, none of them installable, with nothing at the path to
+//     say so.
+//
+// So job 4 prunes those links and writes a notice instead, and this script strips
+// LD_LIBRARY_PATH / DYLD_LIBRARY_PATH from its own environment before spawning a
+// host tool (`sanitize_library_search_path`), which is the property rather than
+// the symptom: nothing on the search path handed to this script may influence the
+// tools it drives.  `crates/zlib-rs-differential/build.rs` carries the same call
+// for the same reason, and any future build script here that shells out to a
+// zlib-linked tool needs it too.
+//
+// AAP §0.4.1.3's build.rs row asks for the chain here, while §0.3.1.2 and §0.8.3
+// assign it to the packaging step; the two cannot both be honoured, and only the
+// packaging step's copy is a chain that resolves.
 //
 // Hard rules this file lives by:
 //
@@ -104,13 +134,16 @@
 //
 //   * It never touches the network.
 //
-//   * Outside `OUT_DIR`, the only things it creates are the two symlinks of job 4,
-//     and the only thing it deletes is a symlink it would otherwise replace at one
-//     of those two exact paths; it will not remove or overwrite a regular file even
-//     there.  Job 5's object files and their archive live in `OUT_DIR`, which is
-//     cargo's own scratch directory for exactly that purpose.  It writes nothing in
-//     the source tree, and in particular it never touches `libz.so`, `libz.a`, or
-//     anything else cargo owns.
+//   * Outside `OUT_DIR`, the only thing it creates is job 4's
+//     `README-cargo-artifacts.txt`, and the only thing it deletes is a symbolic
+//     link at one of the two versioned-alias paths whose link text is exactly the
+//     name cargo's own artifact has -- that is, precisely what an older revision of
+//     this script wrote there.  It will not remove or overwrite a regular file even
+//     at those paths, and it will not touch a link that points anywhere else.
+//     Job 5's object files and their archive live in `OUT_DIR`, which is cargo's own
+//     scratch directory for exactly that purpose.  It writes nothing in the source
+//     tree, and in particular it never touches `libz.so`, `libz.a`, or anything else
+//     cargo owns.
 //
 //   * It uses `std` only, and the modern `cargo::` directive prefix
 //     throughout -- never the legacy single-colon `cargo:` form.  The two are
@@ -170,6 +203,81 @@ const MACHO_SHARED_LIB: &str = "libz.dylib";
 // up is this one.  The derivation is VERIFIED against that shape rather than
 // assumed -- see `artifact_dir`.
 const CARGO_BUILD_DIR: &str = "build";
+
+// The notice job 4 writes beside cargo's artifacts, and the whole of its text.
+//
+// The NAME is chosen so that no linker and no loader can ever consider it: `-lz`
+// looks for `libz.so`/`libz.a` exactly, `ld.so` looks for the SONAME
+// `libz.so.1` exactly, and neither spelling can be reached by adding a suffix to
+// this one.  That is the entire point -- the finding this file answers is that
+// contract-SHAPED names in this directory are indistinguishable from an
+// installable library, so the replacement must not be another name of that shape.
+const ARTIFACT_NOTICE: &str = "README-cargo-artifacts.txt";
+
+// Kept in one place because it is written verbatim and compared verbatim: the
+// write is skipped when the file already holds exactly this, so an up-to-date
+// build directory is not touched and its mtimes do not churn.
+const ARTIFACT_NOTICE_TEXT: &str = "\
+This directory holds cargo's build output for crates/libz-rs-sys, and one of the
+files in it is NOT what its name suggests.  (A build script runs before the crate
+is linked, so after a `cargo check' this note is here and the artifacts it
+describes are not.)
+
+  libz.a    IS the installable static library.  It defines all 95 functions
+            zlib.h declares, because build.rs compiles csrc/gzprintf_shim.c and
+            csrc/inftrees_shim.c into it.  test/infcover.c links this file.
+
+  libz.so   is NOT the installable shared library.  rustc attaches its own
+            anonymous version script to every cdylib link, so zlib.map cannot be
+            layered on: this object carries 0 of the 16 ZLIB_1.2.* symbol-version
+            nodes, does not export gzprintf or gzvprintf (both variadic, so they
+            live in the C shim, whose objects a cdylib cannot re-export), and does
+            export three _zlib_rs_* internals that zlib.map hides.  Measured: 96
+            dynamic globals against the C library's 111.  No build-script
+            argument can change any of that.
+
+  libz.rlib is a Rust library, for Rust dependents.  It exports no C symbol.
+
+Note also that cargo's debug and release directories hold identically NAMED files
+-- there is no `libz.so' and `libz-debug.so' -- so the profile is carried by the
+path and by nothing else.  Packaging selects release deliberately and prints the
+directory it read.
+
+There is deliberately no libz.so.1 or libz.so.<version> here.  Those names belong
+to a library that can actually satisfy them, and staging them beside an
+incomplete one is worse than leaving them out: a consumer or CI job that finds
+them binds an object that fails to link every variadic-gz caller and warns on
+every load, and -- because cargo puts this directory first on the library search
+path of every build script it launches, while the host binutils record
+DT_NEEDED libz.so.1 -- the build tools themselves load it.  Both were measured.
+
+To obtain an installable drop-in libz, run from the repository root:
+
+    make rust           # relinks libz.a under zlib.map into target/dropin:
+                        # SONAME libz.so.1, 16 version nodes, 95 exported
+                        # functions, internals hidden, and the versioned
+                        # symlink chain the SONAME requires
+    make rust-test      # links the UNMODIFIED test/example.c, test/minigzip.c
+                        # and test/infcover.c against it and runs them
+    make rust-symbols   # diffs the staged symbol tables against a built C libz
+
+Install, and point any consumer, LD_LIBRARY_PATH or pkg-config path at what
+`make rust` stages -- never at this directory.  Measured, so that it is not a
+surprise: a C program linked -L against THIS directory builds, and then binds
+/lib/.../libz.so.1 at run time, because nothing here answers to the SONAME
+libz.so.1.  Against what `make rust` stages, the same program binds the staged
+library.  Check with `ldd`; never infer which library ran from a passing test.
+
+crates/libz-rs-sys/src/lib.rs carries the full artifact matrix.
+This file is regenerated by build.rs; editing it has no effect.
+";
+
+// The loader search paths cargo exports to a build script, and that this script
+// removes from its own process before it spawns a host tool.  See
+// `sanitize_library_search_path`.  `DYLD_LIBRARY_PATH` is the Mach-O spelling;
+// macOS strips it from system binaries under SIP, so it is belt and braces
+// rather than the load-bearing half.
+const CHILD_LIBRARY_PATH_VARS: [&str; 2] = ["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"];
 
 // How far above `CARGO_MANIFEST_DIR` the repository-root search may walk.  The
 // documented distance is exactly two (crates/libz-rs-sys -> crates -> root);
@@ -279,17 +387,26 @@ fn main() {
     require_version_script(&version_script);
 
     // ZLIB_VERSION supplies two names: its leading integer is the SONAME's major
-    // component, and the whole four-component string is the versioned alias job
-    // 4 stages.  Both are parsed from the header so neither can drift from it.
+    // component, and the whole four-component string is the versioned name job 4
+    // prunes.  Both are parsed from the header so neither can drift from it, and
+    // the second is why the prune recognises exactly the names an older revision
+    // of this script would have written rather than a pattern.
     let version = zlib_version(&public_header);
     let major = major_version(&version, &public_header).to_owned();
     let target = TargetInfo::from_env();
 
     check_simd_request();
+
+    // Before anything spawns a host tool.  `build_c_abi_shims` runs `cc` (which
+    // runs `as`) and `ar`, all of them linked against libz on a GNU host, and
+    // cargo has put the cargo artifact directory first on this process's library
+    // search path.  See `sanitize_library_search_path`.
+    sanitize_library_search_path();
+
     build_c_abi_shims(&repo_root);
     reject_version_script_passthrough(&version_script);
     emit_link_args(&target, &major);
-    stage_versioned_aliases(&target, &version, &major);
+    tidy_artifact_dir(&target, &version, &major);
 }
 
 // ---------------------------------------------------------------------------
@@ -455,21 +572,19 @@ enum SharedObjectFormat {
     Other,
 }
 
+// One field, because one question is asked of the target: which shared-object
+// format is being produced.  `CARGO_CFG_TARGET_ENV` is deliberately NOT carried
+// here -- `windows-gnu` and `windows-msvc` classify identically, and the one place
+// that does care reads the variable directly (`build_c_abi_shims`, for the MSVC
+// object and archive spellings).
 #[derive(Debug)]
 struct TargetInfo {
-    os: String,
-    env: String,
     format: SharedObjectFormat,
 }
 
 impl TargetInfo {
     fn from_env() -> Self {
-        let os = require_env("CARGO_CFG_TARGET_OS");
-        // CARGO_CFG_TARGET_ENV is legitimately empty for many targets, so its
-        // absence is normal and must not be treated as an error.
-        let env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-
-        let format = match os.as_str() {
+        let format = match require_env("CARGO_CFG_TARGET_OS").as_str() {
             "linux" | "android" | "freebsd" | "netbsd" | "openbsd" | "dragonfly" | "solaris"
             | "illumos" | "haiku" | "hurd" | "redox" | "fuchsia" => SharedObjectFormat::Elf,
             "nto" => SharedObjectFormat::ElfDashH,
@@ -478,19 +593,7 @@ impl TargetInfo {
             _ => SharedObjectFormat::Other,
         };
 
-        Self { os, env, format }
-    }
-
-    // Used only in diagnostics, which is the whole reason CARGO_CFG_TARGET_ENV
-    // is read: `windows-gnu` and `windows-msvc` behave identically here, but a
-    // message that cannot name which one it saw is a message that costs
-    // somebody an afternoon.
-    fn describe(&self) -> String {
-        if self.env.is_empty() {
-            self.os.clone()
-        } else {
-            format!("{}-{}", self.os, self.env)
-        }
+        Self { format }
     }
 }
 
@@ -559,6 +662,66 @@ impl TargetInfo {
 // `CC`/`CC_<target>`/`TARGET_CC` and `CFLAGS` cascade every C-building build script
 // honours, so a cross-compiling caller configures this one the way it already
 // configures the rest.
+//
+// ★ Note the plan divergence this creates, because it is real and it is small.
+// AAP §0.6.4.1 states that "`cargo build --release` for either shipped artifact
+// never touches a C compiler". That sentence is not literally satisfied: `cc`,
+// `as` and `ar` are invoked here, for these two translation units, whenever
+// `libz-compat` and `gz` are both on -- which is the default. The RULE behind the
+// sentence is satisfied exactly: the 15 retained C translation units of the
+// reference implementation are compiled by `crates/zlib-rs-differential`'s build
+// script and by nothing else, which `cargo build -vv` confirms for both shipped
+// crates (`-p zlib-rs` invokes no compiler at all). So a C toolchain is a
+// documented hard requirement of a C-ABI facade build rather than an accident, it
+// is named in this crate's manifest, and its absence names itself.
+
+/// Removes the dynamic-library search path from this process, so that every tool
+/// this script spawns resolves `libz` the way the system intends rather than out
+/// of the build directory.
+///
+/// # The problem, measured rather than supposed
+///
+/// Cargo puts `target/<profile>` and `target/<profile>/deps` FIRST on
+/// `LD_LIBRARY_PATH` for every build script it launches, and the host binutils are
+/// themselves linked against zlib: `ld.so --list` on `as`, `ar`, `ld`, `objcopy`
+/// and `nm` shows `DT_NEEDED libz.so.1` with no `RPATH` of their own, and `rustc`
+/// reaches it through libLLVM.  This script spawns `cc` (which spawns `as`) and
+/// `ar` to build the two `csrc/` shims.  So without this call, the tools that
+/// COMPILE the library can load the library -- while it is being built.
+///
+/// Measured, before job 4 stopped staging a `libz.so.1` alias in that directory:
+/// six `no version information available` lines per rebuild in this script's own
+/// stderr, which cargo hides on a successful build; and, after a
+/// `--no-default-features` build left a zero-export `libz.so` behind,
+/// `/usr/bin/x86_64-linux-gnu-as: symbol lookup error: undefined symbol: deflate`
+/// -- the assembler could not start, so the build failed and stayed failing while
+/// blaming `csrc/gzprintf_shim.c`.
+///
+/// # Why it stays even though job 4 removed the cause
+///
+/// Job 4 no longer creates the name that triggered it, and that is the primary
+/// fix; this is the property, stated once and enforced here: nothing on the
+/// library search path handed to this script may influence the tools it drives.
+/// It costs two lines, it holds regardless of what else a caller, a packaging
+/// step or a future revision leaves in that directory, and
+/// `crates/zlib-rs-differential/build.rs` carries the same call for the same
+/// reason -- it shells out to `cc`, `objcopy`, `ar` and `nm`.
+///
+/// Removing the variables from THIS process is what covers every child, including
+/// the `cc` invocation, which offers no hook for a child environment: children
+/// inherit the environment as modified.  Nothing in this script loads a dynamic
+/// library itself -- its own process is already loaded and everything after this
+/// point is either pure computation or a spawned system tool -- so there is
+/// nothing for the removal to break.
+///
+/// Any future build script in this workspace that shells out to a zlib-linked
+/// tool needs these same two lines.
+fn sanitize_library_search_path() {
+    for name in CHILD_LIBRARY_PATH_VARS {
+        env::remove_var(name);
+    }
+}
+
 fn build_c_abi_shims(repo_root: &Path) {
     // Declared whether or not it is set, so the declaration cannot appear and
     // disappear with the configuration -- an intermittent `unexpected_cfgs`
@@ -789,7 +952,27 @@ fn run_tool(command: &mut std::process::Command, tool: &str, action: &str, subje
 // `crate-type = ["cdylib", "staticlib", "rlib"]` crate builds clean, with zero
 // warnings, and `readelf -d` on the result reports `SONAME  libz.so.1` --
 // identical to the C build.  `cargo test` links and runs unaffected.
+//
+// ★ THE SONAME IS GATED ON `libz-compat`, and the gate is not tidiness.  A
+// SONAME is a PROMISE: it tells the loader "a binary that recorded
+// `DT_NEEDED libz.so.1` may bind to me", and it is what lets this file satisfy
+// such a lookup at all.  With `libz-compat` off, this crate exports NOTHING --
+// measured, `nm -D --defined-only --extern-only` reports 0 -- because the whole
+// `extern "C"` surface is behind that feature; the artifact is the `#[repr(C)]`
+// ABI mirrors and nothing else, which is what makes `--no-default-features`
+// useful for feature-matrix checking.  Stamping `libz.so.1` on that object made
+// it a silent trap: it would satisfy the loader's search, win over the real
+// library, and then fail every single symbol resolution at load time.  The
+// honest artifact for a build with no exported surface is an unversioned
+// `libz.so` that no `DT_NEEDED libz.so.1` can reach, so that is what is emitted.
+// Nothing is lost for the shipping configuration: `libz-compat` is in `default`,
+// so a plain `cargo build` and every documented build command still get the
+// SONAME, byte for byte as before.
 fn emit_link_args(target: &TargetInfo, major: &str) {
+    if env::var_os(CARGO_FEATURE_LIBZ_COMPAT).is_none() {
+        return;
+    }
+
     match target.format {
         SharedObjectFormat::Elf => {
             // configure L334/L336: `-Wl,-soname,libz.so.1`.  The name is built
@@ -939,121 +1122,117 @@ fn cdylib_link_arg(arg: &str) {
 }
 
 // ---------------------------------------------------------------------------
-//  4. The versioned aliases
+//  4. Artifact-directory hygiene
 // ---------------------------------------------------------------------------
 //
-// THE DIRECTION IS INVERTED RELATIVE TO THE C BUILD.  Read that first, because
-// getting it backwards produces a chain of links to nothing.
+// ★ THIS JOB USED TO STAGE THE VERSIONED SYMLINK CHAIN HERE, AND IT NO LONGER
+// DOES.  The reasoning is worth keeping in full, because the change looks like a
+// removal of a safety net and is the opposite of one.
 //
-//   * In the C build the REAL FILE is `libz.so.1.3.2.1-motley`, and `libz.so`
-//     and `libz.so.1` are symlinks pointing at it (`Makefile.in`'s
-//     `$(SHAREDLIBV)` recipe: `ln -s $@ $(SHAREDLIB)`, `ln -s $@
-//     $(SHAREDLIBM)`).
-//   * Cargo emits the REAL FILE as `libz.so`.  So the two versioned names are
-//     the symlinks here, and they point AT `libz.so`.
+// THE CHAIN ITSELF IS STILL MANDATORY.  The SONAME recorded in the shared object
+// is `libz.so.1`, so that is the name the dynamic loader searches for; ship only
+// a bare `libz.so` and the loader does not fail -- it keeps searching and
+// SILENTLY BINDS THE SYSTEM libz, so a "drop-in replacement" check passes while
+// exercising the C library.  Reproduced during planning, `ldd` resolving to
+// /lib/x86_64-linux-gnu/libz.so.1.  That is why `Makefile.in`'s `rust` target
+// stages `libz.so`, `libz.so.1` and `libz.so.<ZLIB_VERSION>` in `$(RUSTLIBDIR)`
+// every time it runs, and why every drop-in validation asserts with `ldd` which
+// file was bound instead of inferring it from a passing run.
 //
-// The net effect is the same and it is the only thing the loader cares about:
-// all three names resolve to one inode.  The link target is RELATIVE -- the
-// single component `libz.so`, never an absolute path -- so the set survives
-// being copied, moved or installed as a unit.
+// WHAT CHANGED IS WHERE, AND IT HAD TO.  Staging that chain HERE, in cargo's own
+// artifact directory, was measured to do three things, and each one of them is a
+// failure the chain exists to prevent:
 //
-// WHY IT EXISTS.  The SONAME recorded in the object is `libz.so.1`, so that is
-// the name the dynamic loader searches for.  With only a bare `libz.so` present
-// the loader does not fail: it keeps searching and SILENTLY BINDS THE SYSTEM
-// libz.  Reproduced during planning against the reference `.so` with an rpath
-// and no `libz.so.1` alias -- `ldd` resolved to /lib/x86_64-linux-gnu/libz.so.1
-// and the probe printed the system version; after `ln -s`, both pointed at the
-// local artifact.  Every drop-in validation must therefore assert with `ldd`
-// which file was bound, and never infer it from a passing run.
+//   * IT CANNOT BE MADE TO RESOLVE.  A build script runs BEFORE rustc links the
+//     crate, so at the moment `symlink(2)` is called the real file does not
+//     exist and there is no way to tell a `cargo check` (which never produces a
+//     cdylib) from a `cargo build` -- the manifest's `crate-type` says what the
+//     package CAN emit, not what this invocation WILL.  Measured: `cargo check`,
+//     any failed build, and `cargo clean -p libz-rs-sys --release` each leave two
+//     DANGLING versioned links in an otherwise artifact-free directory.  And a
+//     dangling `libz.so.1` on a loader path is not inert: the loader treats the
+//     unopenable candidate as a miss, keeps searching, and binds the system
+//     libz -- exactly the silent wrong-library success the chain was staged to
+//     turn into a visible failure.
 //
-// WHAT IT DOES NOT DO.  It does not make the cargo artifact a complete drop-in;
-// see the header comment for the three specific things that artifact still
-// lacks.  `Makefile.in`'s `rust` target is the drop-in contract.
+//   * IT MAKES THE BUILD NON-HERMETIC.  Cargo puts this directory FIRST on the
+//     library search path of every build script it launches, and the host
+//     binutils are themselves linked against zlib (`ld.so --list /usr/bin/nm`
+//     shows `DT_NEEDED libz.so.1`, no RPATH; `rustc` reaches it through
+//     libLLVM, `ar`/`ld`/`objcopy`/`nm`/`as` through libbfd).  So the alias made
+//     the tools that BUILD the library load the library, and because a
+//     rustc-linked cdylib carries no symbol-version nodes each bind printed
+//     `no version information available` -- 6 lines per rebuild into this
+//     script's stderr, which cargo hides on success, and 32 in one build of the
+//     differential crate.  Worse, the failure mode is not limited to warnings:
+//     after a `--no-default-features` build (a SUPPORTED configuration) the
+//     alias points at a library that exports nothing, and the next build that
+//     compiles the C shims dies with
+//     `/usr/bin/x86_64-linux-gnu-as: symbol lookup error: undefined symbol:
+//     deflate`, blaming `csrc/gzprintf_shim.c`.  Measured: the build then stays
+//     wedged -- even a plain default build fails -- until the alias is deleted by
+//     hand.  A truncated file at that path is equally fatal and reports itself as
+//     `failed to run rustc: ... file too short` attributed to an unrelated
+//     crate's build script.
 //
-// PROPERTIES THIS IMPLEMENTATION GUARANTEES, each for a reason:
+//   * IT PUT CONTRACT-SHAPED NAMES ON A LIBRARY THAT CANNOT HONOUR THEM.  The
+//     cdylib cargo emits is not installable and cannot be made installable from
+//     here (see the header comment: no version nodes, no `gzprintf`, three
+//     `_zlib_rs_*` internals exposed).  Three files named exactly like an
+//     installable drop-in, all reporting `SONAME libz.so.1`, with nothing at the
+//     path to signal the difference, is a trap for any consumer, CI job or
+//     `LD_LIBRARY_PATH` that guesses this directory.
 //
-//   * Dangling at creation is EXPECTED, not a bug.  A build script runs before
-//     the crate is linked, so `libz.so` does not exist yet; `symlink(2)` does
-//     not care, and the link resolves the moment the real file appears.  A
-//     `cargo check` (which never produces a cdylib) therefore leaves two
-//     dangling links behind, which is harmless: `dlopen`/`ld.so` treat an
-//     unopenable candidate as a miss and continue searching.  A build script
-//     cannot distinguish `check` from `build` -- the manifest's `crate-type`
-//     says what the package CAN emit, not what this invocation WILL -- so this
-//     is the honest trade, and it is why nothing here reports a stale or
-//     missing real file as an error.
+// So the chain lives in exactly one place -- the packaging step, which runs AFTER
+// the link, stages unconditionally, and stages the library that can actually
+// satisfy the names -- and this job does the two things a build script CAN do
+// correctly:
 //
-//   * Idempotent, and it never destroys anything.  An existing symlink that
-//     already points at the right name is left alone; one that points somewhere
-//     else is replaced.  A REGULAR FILE at either alias path is never removed --
-//     nothing in this workspace creates one, so it is somebody's staged library
-//     and the build fails naming it rather than deleting it.
+//   1. PRUNE.  Remove the versioned aliases a previous version of this script
+//      left behind, so an existing checkout heals itself on the next build
+//      rather than keeping the hazard forever.  Only a symlink whose link text is
+//      exactly the real cargo artifact name is removed -- that is precisely what
+//      was created -- so a regular file, or a link pointing anywhere else, is
+//      somebody else's staged library and is left strictly alone.
+//   2. EXPLAIN.  Write a plain-text notice next to the artifacts saying what each
+//      one is, that the versioned names are deliberately absent, and which command
+//      produces a library fit to install.  Its name cannot satisfy `-lz` or a
+//      `libz.so.1` lookup, which is the property the aliases lacked.
 //
-//   * Race-tolerant.  Two cargo invocations sharing a target directory can
-//     reach `symlink(2)` at the same moment; `AlreadyExists` means the other
-//     process won and the outcome is the one wanted.
-//
-//   * Restored on the next run of this script, but NOT on a build that has
-//     nothing to do.  Measured: delete `libz.so.1`, and an up-to-date
-//     `cargo build` finishes without re-running the build script, so the alias
-//     stays missing until something re-triggers it (`touch build.rs`, an edit to
-//     `zlib.h` or `zlib.map`, a `ZLIB_RS_SIMD` change, or `cargo clean`).
-//     Cargo offers no "always re-run" that does not also force a rebuild of the
-//     crate, and paying a full relink on every invocation to police two symlinks
-//     is the wrong trade.  This is another reason the packaging step, which
-//     stages its chain unconditionally every time it runs, is the drop-in
-//     contract.
-//
-//   * Loud where the chain is required, silent where it is meaningless.  On ELF
-//     and Mach-O targets a failure to stage is a build failure.  On PE there is
-//     no SONAME concept to mirror and nothing is attempted.  On a non-Unix HOST
-//     nothing is attempted either: the artifact is not loaded there, and
-//     whatever packages it on the target platform creates the chain.
-fn stage_versioned_aliases(target: &TargetInfo, version: &str, major: &str) {
-    let Some(layout) = AliasLayout::for_target(target, version, major) else {
-        // PE and anything unrecognised: no SONAME, nothing to mirror.
-        return;
-    };
-
-    // A Unix host is required to create a symlink at all.  Cross-compiling from
-    // a non-Unix host to a Unix target is supported; the aliases are simply left
-    // to the packaging step that runs where the library is used.
-    if !cfg!(unix) {
-        return;
-    }
-
+// AAP §0.4.1.3's build.rs row asks for the chain here; AAP §0.3.1.2 and §0.8.3
+// assign it to "the packaging step ... exactly as Makefile.in does".  The two
+// cannot both be honoured -- a build script cannot stage a link to a file that
+// does not exist yet -- and only the packaging step's copy is a chain that
+// resolves, so that is the one implemented.
+fn tidy_artifact_dir(target: &TargetInfo, version: &str, major: &str) {
     let Some(dir) = artifact_dir() else {
-        // The layout is not one this can recognise, so there is nowhere to stage
-        // the aliases that a loader would look in.  This is a *skip*, announced,
-        // rather than a failure: the aliases are a convenience for a consumer
-        // linking straight against the cargo artifact, and the supported drop-in
-        // path -- `make rust` -- stages the whole chain itself in `RUSTLIBDIR`.
-        // Aborting here would instead make the crate unbuildable under any tool
-        // that nests its build directory differently, `cargo miri` among them,
-        // which is the instrument the facade's own unsafe boundary is checked
-        // with.
-        println!(
-            "cargo::warning=libz-rs-sys: OUT_DIR has an unrecognised shape, so the \
-             versioned library aliases were not staged. Link through `make rust` \
-             (which stages libz.so, libz.so.1 and libz.so.<version> itself) rather \
-             than against the cargo artifact directly."
-        );
+        // An `OUT_DIR` shape this cannot recognise (`cargo miri` nests an extra
+        // component under `build`) means there is no directory to tidy.  Nothing
+        // is staged any more, so nothing can be stale: this is a silent skip
+        // rather than a `cargo::warning`, because a warning here would only
+        // report that an informational file was not written -- and this
+        // workspace's bar is zero build warnings.
         return;
     };
 
-    for alias in layout.aliases {
-        // `libz.so.1` and `libz.so.1.3.2.1-motley` are distinct at every real
-        // ZLIB_VERSION, but a single-component version string would collapse
-        // them onto one name, and staging the same path twice would be a
-        // needless remove-and-recreate.
-        if alias == layout.real {
-            continue;
+    // Only a Unix host could have created the symlinks being pruned.
+    if cfg!(unix) {
+        if let Some(layout) = AliasLayout::for_target(target, version, major) {
+            for alias in layout.aliases {
+                // A single-component ZLIB_VERSION would collapse the two
+                // versioned names onto the real one; never touch that.
+                if alias == layout.real {
+                    continue;
+                }
+                prune_retired_alias(&dir, &layout.real, &alias);
+            }
         }
-        stage_alias(&dir, &layout.real, &alias, target);
     }
+
+    write_artifact_notice(&dir);
 }
 
-// The real file cargo emits, and the versioned names that must resolve to it.
+// The real file cargo emits, and the versioned names that must NOT sit beside it.
 struct AliasLayout {
     real: String,
     aliases: Vec<String>,
@@ -1091,75 +1270,77 @@ impl AliasLayout {
     }
 }
 
-// Points one alias at the real library, in the cargo artifact directory.
-fn stage_alias(dir: &Path, real: &str, alias: &str, target: &TargetInfo) {
+// Removes one versioned alias a previous version of this script staged.
+//
+// The identification is deliberately narrow: the path must be a SYMBOLIC LINK
+// whose link text is exactly `real` -- the single relative component this script
+// used to write, `libz.so` or `libz.dylib` -- and nothing else qualifies.  So:
+//
+//   * a REGULAR FILE at that path is never removed.  Nothing in this workspace
+//     puts one there, so it is somebody's staged or hand-relinked library, and
+//     deleting a library because of its name would be the worse failure.  It is
+//     left in place and the build proceeds; it is not this script's to police.
+//   * a symlink pointing ANYWHERE ELSE is never removed either -- an absolute
+//     path, `../something`, an installed library -- because that is a deliberate
+//     arrangement by whoever made it.
+//   * a DANGLING link still counts, and this is the case that matters most:
+//     `symlink_metadata` does not follow the link and `read_link` reads the link
+//     text rather than the target, so the dangling links left by `cargo check`,
+//     by a failed build and by `cargo clean -p` are recognised and removed.
+//
+// A concurrent build removing the same link first produces exactly the wanted
+// state, so `NotFound` is not a failure.  Any other removal error IS one: leaving
+// a versioned alias next to a library that cannot satisfy it is the hazard this
+// whole job exists to end, and failing loudly with the path and the one-line
+// remedy beats proceeding while the trap is still armed.
+fn prune_retired_alias(dir: &Path, real: &str, alias: &str) {
     let link = dir.join(alias);
 
-    // `symlink_metadata` deliberately does NOT follow the link, so a dangling
-    // alias from a previous build is seen as the symlink it is rather than as a
-    // missing file.
     match fs::symlink_metadata(&link) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            if fs::read_link(&link).is_ok_and(|current| current == Path::new(real)) {
+            if !fs::read_link(&link).is_ok_and(|current| current == Path::new(real)) {
                 return;
             }
-
-            if let Err(error) = fs::remove_file(&link) {
-                // A concurrent build removing the same stale link first is the
-                // outcome wanted, so `NotFound` is the one acceptable failure.
-                assert!(
-                    error.kind() == std::io::ErrorKind::NotFound,
-                    "could not replace the stale symbolic link {}: {error}. It has to point at \
-                     {real} so that a consumer linked against this library binds to it instead \
-                     of falling back to the system libz.",
-                    link.display()
-                );
-            }
         }
-        Ok(_) => panic!(
-            "{} already exists and is not a symbolic link. Nothing in this workspace creates a \
-             regular file there -- cargo emits {real}, and the packaged drop-in is staged \
-             elsewhere -- so this build will not remove it. Move it aside and rebuild.",
-            link.display()
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => panic!(
-            "could not inspect {} while staging the versioned aliases: {error}",
-            link.display()
-        ),
+        // A regular file, a directory, or nothing at all: not ours.
+        Ok(_) | Err(_) => return,
     }
 
-    match create_symlink(real, &link) {
-        Ok(()) => {}
-        // Another cargo invocation sharing this target directory created it
-        // first, which produces exactly the state wanted.
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => panic!(
-            "could not create the symbolic link {} -> {real}: {error}. On {} the SONAME recorded \
-             in the shared object is a versioned name, so without this link a consumer does not \
-             fail -- it silently binds the SYSTEM libz, and every drop-in check then passes while \
-             exercising the wrong library.",
-            link.display(),
-            target.describe()
-        ),
+    if let Err(error) = fs::remove_file(&link) {
+        assert!(
+            error.kind() == std::io::ErrorKind::NotFound,
+            "could not remove {}: {error}. It is a versioned alias an older revision of this \
+             build script staged next to cargo's `{real}`, which is NOT an installable libz -- it \
+             carries none of zlib.map's 16 symbol-version nodes and does not export gzprintf or \
+             gzvprintf. Left in place it satisfies a `libz.so.1` lookup with that library, \
+             including for the host build tools cargo puts this directory on the library search \
+             path of. Remove it by hand and rebuild; the installable chain is staged by \
+             `make rust`.",
+            link.display()
+        );
     }
 }
 
-// The symlink primitive, isolated so the rest of the file is host-agnostic.
-#[cfg(unix)]
-fn create_symlink(original: &str, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(original, link)
-}
+// Writes the notice that explains the artifacts, next to them.
+//
+// Idempotent by comparison rather than by timestamp: when the file already holds
+// exactly `ARTIFACT_NOTICE_TEXT` nothing is written, so an up-to-date build
+// directory is not modified and no mtime changes.
+//
+// Failure to write is deliberately NOT a build failure.  The file is
+// informational -- everything it says is also in `crates/libz-rs-sys/src/lib.rs`,
+// the root `Cargo.toml` and the `README` -- and an unwritable or read-only build
+// directory is not a reason to refuse to produce a library.  This is the one
+// place in this script where an error is swallowed, and it is swallowed because
+// the alternative would fail a build over a comment.
+fn write_artifact_notice(dir: &Path) {
+    let notice = dir.join(ARTIFACT_NOTICE);
 
-// Never reached -- `stage_versioned_aliases` returns early on a non-Unix host --
-// but it has to COMPILE there, because `std::os::unix` does not exist on a
-// Windows host even when the target is Unix.
-#[cfg(not(unix))]
-fn create_symlink(_original: &str, _link: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "creating a symbolic link requires a Unix host",
-    ))
+    if fs::read_to_string(&notice).is_ok_and(|current| current == ARTIFACT_NOTICE_TEXT) {
+        return;
+    }
+
+    let _ = fs::write(&notice, ARTIFACT_NOTICE_TEXT);
 }
 
 // The directory cargo puts the library in: `target/[<triple>/]<profile>`.
@@ -1173,22 +1354,20 @@ fn create_symlink(_original: &str, _link: &Path) -> std::io::Result<()> {
 //     ^ this                        ^ CARGO_BUILD_DIR     ^ OUT_DIR
 //
 // The shape is VERIFIED rather than assumed: the component two levels up has to
-// be `build`.  A layout this cannot recognise yields `None`, and the caller
-// announces the skipped staging, instead of quietly staging aliases into a
-// directory nothing reads.  Deriving it from CARGO_TARGET_DIR + PROFILE would
-// not work: `PROFILE` is `debug` or `release` even under a custom profile whose
-// directory is named after the profile, and CARGO_TARGET_DIR is frequently
-// unset.
+// be `build`.  A layout this cannot recognise yields `None` and the caller does
+// nothing, rather than writing into a directory that is not cargo's artifact
+// directory at all.  Deriving it from CARGO_TARGET_DIR + PROFILE would not work:
+// `PROFILE` is `debug` or `release` even under a custom profile whose directory is
+// named after the profile, and CARGO_TARGET_DIR is frequently unset.
 fn artifact_dir() -> Option<PathBuf> {
     let out_dir = PathBuf::from(require_env("OUT_DIR"));
 
     // Two levels up from `.../build/<pkg>-<hash>/out` has to be `.../build`.
-    // Checking that first is what keeps aliases from being staged into a
-    // directory no loader searches: an unrecognised layout yields `None`, and the
-    // caller announces the skip.  `cargo miri` is a real example -- it nests an
-    // extra component under `build`, so the check genuinely fires -- and an
-    // ordinary `--target` build is not, because it only adds a component *above*
-    // the profile directory.
+    // Checking that first is what keeps job 4 from touching a directory that only
+    // resembles the artifact directory: an unrecognised layout yields `None`.
+    // `cargo miri` is a real example -- it nests an extra component under
+    // `build`, so the check genuinely fires -- and an ordinary `--target` build is
+    // not, because it only adds a component *above* the profile directory.
     let build_dir = out_dir.parent().and_then(Path::parent);
     if build_dir.and_then(Path::file_name) != Some(std::ffi::OsStr::new(CARGO_BUILD_DIR)) {
         return None;

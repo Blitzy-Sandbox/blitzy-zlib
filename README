@@ -31,23 +31,34 @@ exactly as before, on machines with no Rust toolchain at all.
 
 To build and check the Rust library:
 
-    ./configure
     make rust          # stage the drop-in libz under target/dropin/
     make rust-test     # link the unmodified C drivers against it and run them
     make rust-symbols  # print the staged symbol tables
 
-Note that "cargo build" alone does NOT produce an installable library, and the
-shortfall is measurable: the shared object cargo emits publishes 96 dynamic
-global symbols where the C library publishes 111.  It carries no zlib.map
-version script (rustc attaches one of its own, and a second cannot be added),
-it lacks gzprintf and gzvprintf (both variadic, so they come from the small C
-shim in crates/libz-rs-sys/csrc/), and it exports internals that zlib.map
-hides.  "make rust" is what relinks the complete library from libz.a plus that
-shim under zlib.map, creates the versioned symlink chain the SONAME libz.so.1
-requires, and then compares the result against the C library's own symbol
-table.  ./configure is a real prerequisite: unconfigured, the makefile has no
-platform flag with which to ask the linker for a shared object, so the Rust
-targets refuse to run rather than stage an incomplete library.
+Those three do not need ./configure.  They compose the shared-object link from
+Makefile.in's own defaults and name the staged library from ZLIB_VERSION in
+zlib.h, so they work on an unconfigured tree; what ./configure adds is the C
+library build that "make rust-symbols" can then diff against, and a $(CARGO)
+recorded for you (unconfigured, name it yourself with "make rust CARGO=cargo").
+
+Note that "cargo build" alone does NOT produce an installable shared library,
+and the shortfall is measurable: the shared object cargo emits publishes 96
+dynamic global symbols where the C library publishes 111.  It carries no
+zlib.map version script (rustc attaches one of its own, and a second cannot be
+added), it lacks gzprintf and gzvprintf (both variadic, so they come from the
+small C shim in crates/libz-rs-sys/csrc/), and it exports internals that
+zlib.map hides.  The static libz.a cargo builds IS complete -- the shim objects
+are archived into it -- and "make rust" is what relinks the shared library from
+that archive under zlib.map, creates the versioned symlink chain the SONAME
+libz.so.1 requires, and then compares the result against the C library's own
+symbol table.
+
+Link against what "make rust" stages, not against cargo's target/<profile>
+directory.  The versioned names are deliberately absent from the latter, so a
+program linked against it builds and then binds the SYSTEM libz at run time;
+cargo's build script leaves a README-cargo-artifacts.txt there saying so.  Use
+ldd to see which library was bound rather than inferring it from a test that
+passed -- that check is exactly what "make rust-test" performs.
 
 Building the Rust library needs Rust 1.80 or later and cargo.  Optional
 vectorised CRC-32 and Adler-32 backends are available behind the "simd" Cargo

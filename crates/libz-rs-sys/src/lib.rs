@@ -35,7 +35,31 @@
 //! | `libz.a` (`staticlib`) | `cargo build -p libz-rs-sys --features libz-compat` | **all 95** functions `zlib.h` declares, plus `inflate_table` as a hidden global | **YES** — this is the static library, and `infcover` links it |
 //! | `libz.so` (`cdylib`) | the same command | **93** of the 95, plus three internals; **no** version nodes | no — see below |
 //! | *(the `rlib`)* | the same command | nothing; it is a Rust library | n/a — `zlib-rs-differential`, `fuzz/` and `tests/` depend on it |
-//! | `libz.so.1.3.2.1-motley` | `make rust`, or the `CMake` equivalent, **relinked from `libz.a`** | **95** functions and the **16** `ZLIB_1.2.*` version nodes, internals hidden | **YES** — this is the shared library |
+//! | `libz.so.1.3.2.1-motley` | `make rust`, or the `CMake` equivalent, **relinked from `libz.a`** | **95** functions and the **16** `ZLIB_1.2.*` version nodes, internals hidden | **YES** — this is the shared library, and it is the only one |
+//!
+//! ★ Only the last row carries the versioned names `libz.so.1` and
+//! `libz.so.1.3.2.1-motley`, and that is deliberate. `build.rs` used to stage those
+//! two names beside cargo's `libz.so` so that a consumer linking against
+//! `target/<profile>` could not fall through to the system libz; it no longer does,
+//! because a build script runs BEFORE the link and therefore cannot tell a
+//! `cargo check` from a `cargo build` — `cargo check`, any failed build and
+//! `cargo clean -p` each left the two names behind as DANGLING links, which the
+//! loader skips exactly as if they were absent — and because cargo puts that
+//! directory first on the library search path of every build script it launches,
+//! which put this incomplete library under the `as`, `ar`, `nm` and `rustc` that
+//! were building it. Both were measured; the second reached a hard
+//! `as: symbol lookup error: undefined symbol: deflate` once a
+//! `--no-default-features` build had left a zero-export `libz.so` at the end of
+//! that link. So job 4 of `build.rs` now prunes those names and writes a
+//! `README-cargo-artifacts.txt` in their place, and the chain exists once, in what
+//! `make rust` stages.
+//!
+//! The consequence is worth stating plainly rather than discovering: a C program
+//! linked `-L target/release -lz` still builds, and then binds
+//! `/lib/…/libz.so.1` at run time, because nothing in that directory answers to
+//! the SONAME. Point consumers, `LD_LIBRARY_PATH` and `pkg-config` at what
+//! `make rust` stages, and check with `ldd` — `make rust-test` does exactly that
+//! and refuses to infer the binding from a passing run.
 //!
 //! The archive is complete because `build.rs` compiles this crate's two C
 //! translation units — `csrc/gzprintf_shim.c`, which defines the variadic
@@ -370,7 +394,7 @@
 //! | Feature | Default | What it does |
 //! |---|---|---|
 //! | `libz-compat` | on | Gates the exported `extern "C"` surface — the unmangled symbols that make this library ABI-compatible with the C original. |
-//! | `gz` | on | Gates the `gzFile` layer. File I/O is the only part of the port that needs `std` in the core, so this forwards into `zlib-rs/std`. |
+//! | `gz` | on | Gates the `gzFile` layer. File I/O is the only part of the port that needs `std` in the core, so this forwards into `zlib-rs/std`. **Implies `libz-compat`**: every item it turns on is an exported `extern "C"` entry point, so a gzFile layer outside the C ABI surface does not exist. |
 //! | `simd` | off | Pass-through to `zlib-rs/simd`: vectorised CRC-32 and Adler-32 backends. |
 //! | `libc` | off | Explicit opt-in for the optional pinned `libc` dependency, for the rare platform type or raw syscall that `std::fs` and `std::io` cannot express. |
 //!
@@ -391,6 +415,17 @@
 //! the feature matrix and for a consumer that wants those types without the
 //! symbols. It is not a shipping configuration: a `libz.so` with no exports
 //! replaces nothing. Nothing in this crate may raise a `compile_error!` for it.
+//!
+//! ★ Supported means supported **in both profiles**, and that has to be tested in
+//! both: every `#[cfg(feature = "libz-compat")]` item must carry the gate on each
+//! `debug_assertions` arm it splits into, or the configuration compiles in one
+//! profile and fails in the other. `types.rs`'s `FILL_BYTE` did exactly that — the
+//! release arm was missing the feature gate, so `--no-default-features` built in
+//! debug and failed in release, which is the profile that ships. A feature-matrix
+//! check that only builds debug cannot see it, so the release cell is the one that
+//! matters. `build.rs` observes the same rule from the other side: with
+//! `libz-compat` off it emits no SONAME, because an artifact that exports nothing
+//! must not present itself as `libz.so.1`.
 //!
 //! `simd` is confined to the two checksums and is **output-neutral**: a checksum
 //! is one scalar however it is computed, so vectorising it cannot perturb the

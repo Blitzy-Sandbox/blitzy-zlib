@@ -1060,6 +1060,19 @@ const FILL_BYTE: u8 = SENTINEL_FILL;
 ///
 /// See the debug-build definition above for the rationale. Zero is the plainest
 /// possible choice for a pass that has to happen anyway.
+///
+/// ★ BOTH arms carry `#[cfg(feature = "libz-compat")]`, and the pair has to be
+/// read as a unit. This constant exists only for the allocator adapter, which is
+/// part of the exported surface, and its body names [`SENTINEL_FILL`] — an import
+/// gated on that same feature further up this file. A release arm gated only on
+/// `#[cfg(not(debug_assertions))]` therefore compiled in a
+/// `--no-default-features` release build, where the import is absent, and failed
+/// with `error[E0425]: cannot find value SENTINEL_FILL in this scope`. That made
+/// the SHIPPING profile the only one that broke, because the debug arm was
+/// already gated correctly. `--no-default-features` is a supported
+/// configuration — `Cargo.toml` and the crate root both say so — so the gate
+/// belongs on every arm, not on the one that happened to be written first.
+#[cfg(feature = "libz-compat")]
 #[cfg(not(debug_assertions))]
 /// cbindgen:ignore
 const FILL_BYTE: u8 = {

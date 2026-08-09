@@ -947,28 +947,34 @@ fn main() {
 ///
 /// # The problem this solves, measured rather than supposed
 ///
-/// `crates/libz-rs-sys/build.rs` stages `libz.so.1` and `libz.so.<ZLIB_VERSION>` beside cargo's
-/// `libz.so` in `target/<profile>`, because without those names a consumer linked against the
-/// port does not fail -- it silently binds the SYSTEM libz, and every drop-in check then passes
-/// while exercising the C library.
+/// Cargo puts `target/<profile>` and `target/<profile>/deps` on `LD_LIBRARY_PATH` for every build
+/// script it launches, and the host binutils are themselves linked against zlib: `ld.so --list`
+/// on `nm`, `objcopy`, `ar`, `ld`, `as` and `ld.bfd` shows `DT_NEEDED libz.so.1` with no `RPATH`
+/// of their own. `target/<profile>` is where cargo writes this workspace's own `libz.so`. So any
+/// file there that satisfies a `libz.so.1` lookup makes the tools that INSPECT the artifact load
+/// the artifact.
 ///
-/// Cargo puts that same `target/<profile>` on `LD_LIBRARY_PATH` for build scripts, and the host
-/// binutils are themselves linked against zlib: `ld.so --list` on `nm`, `objcopy`, `ar`, `ld` and
-/// `ld.bfd` shows `DT_NEEDED libz.so.1` with no `RPATH` of their own. So the staged alias makes
-/// the tools that INSPECT the artifact load the artifact. Measured: 32 `no version information
-/// available` notices in one build of this crate, because the cargo-built library carries no
-/// symbol-version nodes (rustc supplies its own anonymous version script for a cdylib, so
-/// `zlib.map` cannot be layered on) while `nm` asks for versioned symbols. glibc warns and binds
-/// anyway, so nothing failed -- it just meant the verification tools were running code out of the
-/// library under verification, and it broke the zero-warnings bar.
+/// It used to be reachable and it was measured. `crates/libz-rs-sys/build.rs` staged `libz.so.1`
+/// and `libz.so.<ZLIB_VERSION>` beside cargo's `libz.so`, and one build of this crate then emitted
+/// 32 `no version information available` notices, because a rustc-linked cdylib carries no
+/// symbol-version nodes (rustc supplies its own anonymous version script, so `zlib.map` cannot be
+/// layered on) while `nm` asks for versioned symbols. glibc warns and binds anyway, so nothing
+/// failed -- it just meant the verification tools were running code out of the library under
+/// verification, and it broke the zero-warnings bar. Worse shapes existed: with a zero-export or
+/// truncated library at that name, `as` and `rustc` could not start at all.
 ///
-/// # Why removing it here is the right fix, and why it is safe
+/// # Why it stays now that nothing stages those names
 ///
-/// The fix belongs at the caller rather than in the staging step: the aliases are required, and
-/// every other consumer of `target/<profile>` wants them. This script needs none of it. It loads
-/// no dylib from the build directory -- its own process is already loaded, and everything it does
-/// afterwards is spawning `cc`, `objcopy`, `ar` and `nm`, all of them system tools with their own
-/// resolution rules.
+/// That staging is gone -- job 4 of `crates/libz-rs-sys/build.rs` prunes the names instead, for
+/// exactly the reasons above -- so on a clean tree there is currently nothing in
+/// `target/<profile>` for a `libz.so.1` lookup to find. This call is the property rather than the
+/// symptom, and the property is what has to hold: a script that verifies one zlib against another
+/// must not let either one under the tools doing the verifying. It costs two lines and it holds
+/// whatever a caller, a packaging step or a future revision leaves in that directory.
+///
+/// It is also safe unconditionally. This script loads no dylib from the build directory -- its own
+/// process is already loaded, and everything it does afterwards is spawning `cc`, `objcopy`, `ar`
+/// and `nm`, all of them system tools with their own resolution rules.
 ///
 /// Removing the variables from THIS process is what covers all four, including the `cc` crate's
 /// compiler invocation, which offers no hook for a child environment: children inherit the

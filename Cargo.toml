@@ -20,17 +20,27 @@
 #                                 symbols.  `[lib] name = "z"` with
 #                                 crate-type = ["cdylib", "staticlib", "rlib"]
 #                                 makes Cargo write target/<profile>/libz.so and
-#                                 libz.a, and its build script stages
-#                                 libz.so.1 and libz.so.1.3.2.1-motley beside
-#                                 them so that a consumer cannot silently bind
-#                                 the system libz instead.  Measured on those
-#                                 artifacts: SONAME libz.so.1 and 96 exported
-#                                 function symbols.  They are the BASE of the
-#                                 drop-in rather than the finished article --
+#                                 libz.a, and its build script writes a
+#                                 README-cargo-artifacts.txt beside them saying
+#                                 which of them may be installed.  Measured on
+#                                 those artifacts: SONAME libz.so.1 and 96
+#                                 exported function symbols.  They are the BASE of
+#                                 the drop-in rather than the finished article --
 #                                 the 16 symbol-version nodes and the two
 #                                 C-variadic gz entry points come from the
 #                                 packaging relink, `make rust`, for reasons
 #                                 set out in crates/libz-rs-sys/Cargo.toml.
+#                                 The versioned names libz.so.1 and
+#                                 libz.so.1.3.2.1-motley are deliberately NOT
+#                                 staged beside the cargo output: a build script
+#                                 runs before the link, so its copies were left
+#                                 dangling by `cargo check', by any failed build
+#                                 and by `cargo clean -p' -- and a dangling
+#                                 libz.so.1 on a loader path falls through to the
+#                                 system libz exactly as if it were absent, while
+#                                 its presence put this incomplete library under
+#                                 the as/ar/nm/rustc that were building it.  They
+#                                 exist once, in what `make rust' stages.
 #
 #   crates/zlib-rs-differential  Dev-only oracle harness.  Its build script
 #                                compiles the in-tree C translation units with `cc`
@@ -310,10 +320,14 @@ c_baseline_commit = "09a1572"
 # versioned name by scraping ZLIB_VERSION from zlib.h; Makefile.in L46-L49 holds
 # the pre-substitution defaults, and SHAREDLIBV's default there is stale, which
 # is why `Makefile.in`'s `rust` target scrapes zlib.h itself rather than
-# trusting it.  The symlink chain is mandatory: the SONAME is libz.so.1, so a
-# build that ships only libz.so makes the dynamic loader fall back to the
-# system libz.so.1 — drop-in tests then pass while silently exercising the C
-# library.
+# trusting it.  The symlink chain is mandatory WHERE THE LIBRARY IS INSTALLED: the
+# SONAME is libz.so.1, so a directory that holds only libz.so makes the dynamic
+# loader fall back to the system libz.so.1 — drop-in tests then pass while
+# silently exercising the C library.  `Makefile.in`'s `rust' target stages it, and
+# it is the only step that may: it runs AFTER the link, whereas a build script runs
+# before it and can only create links to a file that does not exist yet.  Hence
+# `make rust-test` asserting the binding with `ldd` rather than inferring it, and
+# hence the names below being the PACKAGED artifact's names, not cargo's.
 shared_library = "libz.so.1.3.2.1-motley"
 soname = "libz.so.1"
 shared_library_symlinks = ["libz.so.1", "libz.so"]

@@ -706,15 +706,24 @@ cover: infcover
 # `DT_NEEDED libz.so.1' -- nm, readelf and ld.bfd all do -- then resolves libz
 # out of the build directory.
 #
-# Note what does live in $(RUSTDIR): crates/libz-rs-sys/build.rs stages
-# $(SHAREDLIBM) and the versioned name there as symlinks to cargo's
-# $(SHAREDLIB), deliberately, so that a consumer of the CARGO output cannot
-# silently bind the system libz instead.  That is a smaller job than this one and
-# it comes with its own mitigation for the hazard above: build scripts that shell
-# out to a libz-linked tool strip LD_LIBRARY_PATH from the child environment
-# first, which crates/zlib-rs-differential/build.rs does.  The staged library
-# here remains the drop-in contract, because it is the only one of the two that
-# is relinked through zlib.map and carries the gzprintf shim.
+# Note what does NOT live in $(RUSTDIR), and that this recipe is the only reason
+# it does not have to.  crates/libz-rs-sys/build.rs used to stage $(SHAREDLIBM)
+# and the versioned name there as symlinks to cargo's $(SHAREDLIB), so that a
+# consumer of the CARGO output could not silently bind the system libz instead.
+# It no longer does, and both halves of the isolation argument above are why: a
+# build script runs before the link, so those symlinks were left dangling by
+# `cargo check', by any failed build and by `cargo clean -p', and a dangling
+# $(SHAREDLIBM) on a loader path falls through to the system libz exactly as if
+# it were absent; and the name being present is what put cargo's incomplete
+# cdylib under nm, ar, as and rustc themselves -- measured, up to 32 `no version
+# information available' notices in one build, and a hard `as: symbol lookup
+# error: undefined symbol: deflate' once a --no-default-features build had left a
+# zero-export library at that name.  Both build scripts additionally strip
+# LD_LIBRARY_PATH before spawning a libz-linked tool.  So $(RUSTDIR) holds
+# cargo's $(SHAREDLIB), $(STATICLIB), the rlib and a README naming which of them
+# may be installed, and the versioned chain exists in exactly one place: here,
+# staged by a step that runs AFTER the link, on the library that is relinked
+# through zlib.map and carries the gzprintf shim.
 #
 # The symlinks staged here are not cosmetic: the SONAME is $(SHAREDLIBM), so a
 # consumer asks the loader for that exact name, and when only $(SHAREDLIB)

@@ -118,6 +118,22 @@
 //! names this library as the origin of the abort, which a bare panic runtime
 //! message does not.
 //!
+//! ## What is still visible in the ELF, and why it is not a hole
+//!
+//! `-C panic=abort` is confirmed on the rustc invocation for the release cdylib,
+//! and yet `readelf` on that artifact still shows `NEEDED libgcc_s.so.1`, a
+//! `.gcc_except_table`, `rust_eh_personality` and `_Unwind_Resume@GCC_3.0` /
+//! `_Unwind_Backtrace`. That is expected and it is worth knowing where it comes
+//! from, because it looks like a contradiction. The debug artifact shows exactly
+//! the same set, which locates it in the PRE-COMPILED `std` — its panic runtime
+//! and backtrace machinery ship as objects built for unwinding, and the linker
+//! keeps their tables and the personality routine — rather than in any frame this
+//! crate compiles. No unwind can originate in this library's own code: every
+//! export is `extern "C"`, this profile aborts at the `panic!` site, and the
+//! guards in this module abort explicitly. The only real consequence is a runtime
+//! dependency the C library does not have, `libgcc_s.so.1`, which packaging
+//! carries and which `ldd` on the staged library lists alongside `libc`.
+//!
 //! # Defence in depth, not a licence to panic
 //!
 //! The engine is written so that a panic is **unreachable**, not merely
