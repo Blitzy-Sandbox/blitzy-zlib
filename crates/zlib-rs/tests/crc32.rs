@@ -374,8 +374,8 @@ fn capped(payload: &[u8]) -> &[u8] {
 /// only class large enough to do so. Truncating costs very little: every class is still exercised,
 /// with its own leading bytes and -- for the classes whose character is uniform, such as the long
 /// single-byte run and the ascending byte-value cycle -- its content character wholly intact. Only
-/// the tail of the window-crossing class goes unseen, and it is folded in full natively, in
-/// `cargo test` and in CI. The truncation is therefore for interpreter speed alone.
+/// the tail of the window-crossing class goes unseen, and it is folded in full under an ordinary
+/// native `cargo test`. The truncation is therefore for interpreter speed alone.
 #[cfg(miri)]
 fn capped(payload: &[u8]) -> &[u8] {
     /// Two `KiB` is more than fifty braided blocks past either possible value of
@@ -1191,10 +1191,10 @@ fn every_length_up_to_the_short_bound_matches_the_reference() {
 /// The sweep continued from [`SHORT_SWEEP_MAX`] to [`LONG_SWEEP_MAX`].
 ///
 /// Skipped under Miri **only** for interpreter speed: it folds about eight million bytes, which is
-/// seconds natively and minutes in the interpreter. Everything structural it covers -- every
+/// cheap natively and far from cheap interpreted. Everything structural it covers -- every
 /// prologue length, every remainder class, both thresholds -- is already covered by the
 /// unconditional short sweep above and by the boundary test below, both of which run under Miri.
-/// It still runs natively, in `cargo test` and in CI, where it adds coverage of long block runs
+/// It still runs under an ordinary native `cargo test`, where it adds coverage of long block runs
 /// and of lengths far beyond any threshold.
 #[test]
 #[cfg_attr(miri, ignore)]

@@ -21,8 +21,7 @@
 //! Two things, mirroring the two roles `gzlib.c` plays in the C build:
 //!
 //! 1. **The barrel.** It declares the seven sibling modules and re-exports their public surface, so
-//!    that the planned `crates/libz-rs-sys/src/gz.rs` will have one import point
-//!    (`zlib_rs::gz::*`) for all 32 of the
+//!    that `crates/libz-rs-sys/src/gz.rs` has one import point (`zlib_rs::gz::*`) for all 32 of the
 //!    `gz*` entry points it exports rather than seven.
 //! 2. **The shared plumbing of `gzlib.c`** that every other module in the subtree reaches for:
 //!    `gz_error` (`gzlib.c` L555-L590), `gz_intmax` (L596-L609) and `gt_off`
@@ -61,11 +60,11 @@
 //! module declaration. An ungated `pub use gz::GzState;` names a module that does not exist in the
 //! default `no_std` build and fails it outright.
 //!
-//! # Notes for the planned `crates/libz-rs-sys/src/gz.rs`
+//! # The division of labour with `crates/libz-rs-sys/src/gz.rs`
 //!
-//! That file does not exist yet. The division of labour is recorded here so its author does not
-//! have to reconstruct it, and every "the facade does X" below is an obligation on that future file
-//! rather than a description of code that exists.
+//! This is the contract between the two files, recorded on this side so that neither has to
+//! reconstruct it from the other. Each "the facade must X" is a requirement that file satisfies,
+//! and a requirement any replacement for it has to keep.
 //!
 //! * `gzFile` is an opaque `*mut GzState`. The facade must **resync the exposed prefix immediately
 //!   on entry and refresh it before returning to C** for every one of the 28 `gz*` exports plus
@@ -88,7 +87,8 @@
 //! * **`gzprintf` and `gzvprintf` are the one pair the facade does NOT define.** Stable Rust cannot
 //!   declare a C-variadic function or a `va_list` parameter -- rustc 1.97.1 rejects both with E0658
 //!   -- so those two symbols come from `crates/libz-rs-sys/csrc/gzprintf_shim.c`, the single C
-//!   translation unit the packaging step links in. The facade must define **only** the two hidden
+//!   translation unit that facade's `build.rs` compiles into every artifact it produces. The
+//!   facade must define **only** the two hidden
 //!   helpers `_zlib_rs_gzprintf_begin` and `_zlib_rs_gzprintf_commit`; [`printf`] documents their
 //!   exact contract, and the leading underscore is what `zlib.map`'s `local: _*` pattern hides
 //!   them by. That is why [`printf`] exposes a bounded scratch buffer rather than a formatter.
@@ -112,13 +112,11 @@
 //!   references is not this library's choice. The core provides exactly one
 //!   [`state::ZOff64`]-based function per operation -- [`open::gzopen`], [`read::gzseek64`],
 //!   [`read::gztell64`], [`read::gzoffset64`] -- and both exported names delegate to it.
-//! * The planned `crates/libz-rs-sys/src/layout_assertions.rs` is to assert
-//!   `sizeof(struct gzFile_s) == 24`;
-//!   [`state`] is the core-side half of that one contract and asserts the same numbers at compile
-//!   time.
-//! * Determinations this subtree makes for the **computed** `zlibCompileFlags`
-//!   (the planned `crates/libz-rs-sys/src/util.rs`, AAP §0.6.3.5): bit 16 (`NO_GZCOMPRESS`) must
-//!   be reported **clear**,
+//! * `crates/libz-rs-sys/src/layout_assertions.rs` asserts `sizeof(struct gzFile_s) == 24` on an
+//!   LP64 target; [`state`] is the core-side half of that one contract and asserts the same
+//!   numbers at compile time.
+//! * Determinations this subtree makes for the **computed** `zlibCompileFlags`, which
+//!   `crates/libz-rs-sys/src/util.rs` assembles: bit 16 (`NO_GZCOMPRESS`) is reported **clear**,
 //!   because both the read and the write half are implemented; bits 25, 26 and 27 -- the
 //!   `NO_snprintf`/`NO_vsnprintf`/`HAS_vsprintf_void` family -- are **clear**, because [`printf`]
 //!   always provides a bounded formatter and there is no void-returning variant.
@@ -198,9 +196,9 @@ pub mod close;
 // `Box::new` would abort the caller's process on a failed allocation rather than returning C's
 // documented `NULL`.
 pub use crate::gz::state::{
-    try_box_handle, EngineBox, GzEngine, GzFileExposed, GzFileSlot, GzHandle, GzHow, GzIoError,
-    GzMode, GzSeekFrom, GzState, GzStream, ZOff64, COPY, GZBUFSIZE, GZIP, GZ_APPEND, GZ_NONE,
-    GZ_READ, GZ_WRITE, LOOK,
+    try_box_handle, EngineBox, GzEngine, GzFileExposed, GzFileSlot, GzHandle, GzHandleRef, GzHow,
+    GzIoError, GzMode, GzSeekFrom, GzState, GzStream, ZOff64, COPY, GZBUFSIZE, GZIP, GZ_APPEND,
+    GZ_NONE, GZ_READ, GZ_WRITE, LOOK,
 };
 
 // The open family. There is deliberately no `gzopen64`: `gzopen` *is* the 64-bit core, exactly as
@@ -232,6 +230,11 @@ pub use crate::gz::read::{
     gzclose_r, gzfread, gzgetc, gzgetc_, gzgets, gzread, gzungetc, narrow_offset,
 };
 
+// The write-only destination forms of the three reads that fill a caller's buffer. A C caller's
+// `buf` is guaranteed writable and nothing more, so `crates/libz-rs-sys` reaches for these; the
+// slice forms above are the Rust API and forward to them unchanged.
+pub use crate::gz::read::{gzfread_into, gzgets_into, gzread_into};
+
 // The positioning family, all four in their `ZOff64` form; the facade narrows each result.
 pub use crate::gz::read::{gzoffset64, gzrewind, gzseek64, gztell64};
 
@@ -262,6 +265,7 @@ use crate::allocate::{Allocator, Buffer};
 use crate::deflate::{deflate_params, DeflateStream, Flush};
 use crate::error::ReturnCode;
 use crate::gz::read::gz_look;
+use crate::gz::state::split_buffers;
 use crate::gz::write::{gz_comp, gz_zero};
 
 /// The message `gzerror` substitutes for `Z_MEM_ERROR` (`gzlib.c` L526).
@@ -271,11 +275,17 @@ use crate::gz::write::{gz_comp, gz_zero};
 /// and an out-of-memory condition reports no text at all.
 const OUT_OF_MEMORY: &[u8] = b"out of memory";
 
+/// [`OUT_OF_MEMORY`] with the terminator [`gzerror_terminated`] promises.
+const OUT_OF_MEMORY_TERMINATED: &[u8] = b"out of memory\0";
+
 /// The message `gzerror` returns when there is none (`gzlib.c` L527).
 ///
 /// C's `state->msg == NULL ? "" : state->msg` -- an empty string, which is emphatically not the same
 /// as the null pointer it returns for an unusable handle.
 const NO_MESSAGE: &[u8] = b"";
+
+/// [`NO_MESSAGE`] with the terminator [`gzerror_terminated`] promises: a valid empty C string.
+const NO_MESSAGE_TERMINATED: &[u8] = b"\0";
 
 /// Capacity of the fixed-size buffer an `errno` message is rendered into.
 ///
@@ -459,7 +469,7 @@ pub(crate) fn errno_message(error: Option<GzIoError>) -> ErrnoMessage {
 /// Every target this implementation supports has `usize` at least as wide as `c_uint`, so the conversion is
 /// exact. Saturating rather than panicking on a hypothetical narrower target is the conservative
 /// choice: a saturated value can only make a bounds check stricter, never looser. The same helper,
-/// with the same reasoning, appears in [`read`], [`write`] and [`state`].
+/// with the same reasoning, appears in [`read`], [`mod@write`] and [`state`].
 fn to_index(value: c_uint) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
@@ -741,8 +751,9 @@ pub fn gzeof<'a, A: Allocator<'a>>(state: Option<&mut GzState<'a, A>>) -> c_int 
 ///
 /// The returned slice borrows the state, which is how Rust expresses the header's three warnings at
 /// once: it cannot be modified, it cannot outlive a later mutation of the stream, and it cannot
-/// outlive the handle. The facade turns it into the `const char *` C expects and is the layer that
-/// must supply the NUL terminator; nothing in this crate stores one.
+/// outlive the handle. This view excludes the terminating zero, because a Rust caller wants the
+/// text; [`gzerror_terminated`] is the view a C facade wants, and it is a view of the *same*
+/// storage rather than a copy of it.
 ///
 /// `errnum` is an `i32` rather than a `c_int` for the reason given above this group of functions: a
 /// zlib status is an `i32` everywhere in this crate, and the facade stores it into the caller's
@@ -754,6 +765,39 @@ pub fn gzeof<'a, A: Allocator<'a>>(state: Option<&mut GzState<'a, A>>) -> c_int 
 pub fn gzerror<'s, 'a, A: Allocator<'a>>(
     state: Option<&'s mut GzState<'a, A>>,
     errnum: Option<&mut i32>,
+) -> Option<&'s [u8]> {
+    error_text(state, errnum, false)
+}
+
+/// [`gzerror`] with the terminating zero included, for a caller that needs a C string.
+///
+/// ★ The entry point `crates/libz-rs-sys` uses, and the reason the stored message carries a
+/// terminator at all. `gzerror` returns a `const char *` whose contents belong to the stream and
+/// stay valid until the next call or the close (`zlib.h` L1783-L1786), which is exactly the
+/// lifetime of this borrow -- so the facade can publish the pointer directly. Without this the
+/// facade would have to keep a second, terminated copy beside every stream, and an error would
+/// cost two allocations where C's costs one.
+///
+/// Identical to [`gzerror`] in every other respect, including which streams answer [`None`] and
+/// which `errnum` values are written. The two static answers -- the `Z_MEM_ERROR` literal and the
+/// empty string -- come back terminated too, so the result is always a valid C string.
+#[must_use]
+pub fn gzerror_terminated<'s, 'a, A: Allocator<'a>>(
+    state: Option<&'s mut GzState<'a, A>>,
+    errnum: Option<&mut i32>,
+) -> Option<&'s [u8]> {
+    error_text(state, errnum, true)
+}
+
+/// The shared body of [`gzerror`] and [`gzerror_terminated`].
+///
+/// One implementation rather than two, because the difference between them is which *view* of one
+/// stored message is handed back -- never which stream is recognised, which code is reported, or
+/// when the exposed prefix is refreshed. Those are the parts that must not be allowed to drift.
+fn error_text<'s, 'a, A: Allocator<'a>>(
+    state: Option<&'s mut GzState<'a, A>>,
+    errnum: Option<&mut i32>,
+    terminated: bool,
 ) -> Option<&'s [u8]> {
     let state = state?;
     if state.resync_from_exposed().is_err() {
@@ -773,9 +817,22 @@ pub fn gzerror<'s, 'a, A: Allocator<'a>>(
     let mem_error = state.err() == ReturnCode::MEM_ERROR.as_i32();
     state.refresh_exposed();
     if mem_error {
-        return Some(OUT_OF_MEMORY);
+        return Some(if terminated {
+            OUT_OF_MEMORY_TERMINATED
+        } else {
+            OUT_OF_MEMORY
+        });
     }
-    Some(state.msg().unwrap_or(NO_MESSAGE))
+    let stored = if terminated {
+        state.msg_with_nul()
+    } else {
+        state.msg()
+    };
+    Some(stored.unwrap_or(if terminated {
+        NO_MESSAGE_TERMINATED
+    } else {
+        NO_MESSAGE
+    }))
 }
 
 /// Clears the error and end-of-file indicators.
@@ -865,7 +922,7 @@ pub fn gzdirect<'a, A: Allocator<'a> + Copy>(state: Option<&mut GzState<'a, A>>)
 /// `gz_state` (`gzguts.h` L202), so the cursors and the five scalars are already where
 /// [`crate::deflate::deflate_params`] expects them; this implementation keeps the compression state and the
 /// caller-visible scalars apart, so the view is assembled here, handed over and read back. The shape
-/// is [`write`]'s `deflate_once` deliberately: `deflateParams` can itself call `deflate(strm,
+/// is [`mod@write`]'s `deflate_once` deliberately: `deflateParams` can itself call `deflate(strm,
 /// Z_BLOCK)` to close an open block (`deflate.c` L791-L799), so it needs a real output window and a
 /// real input window, and whatever it produces must be accounted for afterwards.
 ///
@@ -896,19 +953,21 @@ fn params_once<'a, A: Allocator<'a>>(
     // `input` read-only, `output` mutably and `strm.engine` mutably. The paths are disjoint, so the
     // borrow checker admits all three at once.
     let (ret, new_next_in, new_avail_in, new_next_out, new_avail_out, scalars) = {
-        let base: &[u8] = state.input.as_ref().map_or(&[][..], Buffer::as_slice);
+        let GzState {
+            buffer_slot, strm, ..
+        } = state;
+        let (staged_in, staged_out) = split_buffers(buffer_slot);
+        let base: &[u8] = staged_in.map_or(&[][..], |buffer| buffer.as_slice());
         let Some(input) = base.get(..in_end) else {
             return ReturnCode::STREAM_ERROR;
         };
-        let Some(output) = state
-            .output
-            .as_mut()
+        let Some(output) = staged_out
             .map(Buffer::as_mut_slice)
             .and_then(|slice| slice.get_mut(..out_end))
         else {
             return ReturnCode::STREAM_ERROR;
         };
-        let GzEngine::Deflate(engine) = &mut state.strm.engine else {
+        let GzEngine::Deflate(engine) = &mut strm.engine else {
             return ReturnCode::STREAM_ERROR;
         };
         let Some(compressor) = engine.get_mut() else {
@@ -1220,7 +1279,7 @@ mod tests {
         let mut state = fresh();
         state.try_set_path(b"p").unwrap();
         state.set_err(ReturnCode::MEM_ERROR.as_i32());
-        state.set_msg(Some(b"stale".to_vec()));
+        state.try_set_prefixed_msg(b"stale").unwrap();
 
         gz_error(&mut state, ReturnCode::OK, None);
 

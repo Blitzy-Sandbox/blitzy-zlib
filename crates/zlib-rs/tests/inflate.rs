@@ -81,7 +81,8 @@
 //! proves nothing was written beyond it.
 //!
 //! Neither delegation is a licence to widen visibility in `src/**`: the hidden-symbol
-//! set is asserted by `crates/libz-rs-sys/tests/symbol_parity.rs`.
+//! set is what `zlib.map`'s `local:` block declares, and `Makefile.in`'s `rust-symbols`
+//! target is what checks the built library against it.
 //!
 //! # Two mechanical facts worth stating once
 //!
@@ -141,6 +142,7 @@ use zlib_rs::inflate::{
     inflate_sync_point, inflate_undermine, inflate_validate, lenfix, InflateState, InflateStream,
     Mode, INFLATE_CODES_USED_BAD_STATE, INFLATE_MARK_BAD_STATE,
 };
+use zlib_rs::read_buf::OutputRegion;
 
 // ---------------------------------------------------------------------------
 // Window-bits spellings, in the reference's own numbering (`zlib.h` L859-L888).
@@ -699,7 +701,9 @@ where
         stream.total_in = total_in;
         stream.total_out = total_out;
         stream.msg = msg;
-        stream.adler = adler;
+        // `adler` is deliberately not seeded: the facade hands the core `None` and
+        // adopts a value only where C assigns `strm->adler`, so the carried value
+        // below is the caller's own member rather than a round trip through the view.
         stream.data_type = data_type;
 
         let ret = inflate(state, &mut stream, flush);
@@ -711,7 +715,9 @@ where
         read_at = read_at.saturating_add(stream.next_in);
         total_in = stream.total_in;
         total_out = stream.total_out;
-        adler = stream.adler;
+        if let Some(value) = stream.adler {
+            adler = value;
+        }
         data_type = stream.data_type;
         msg = stream.msg;
         if first.is_none() {
@@ -775,7 +781,7 @@ fn decode_chunked(bytes: &[u8], window_bits: i32, step: usize, out_len: usize) -
         Z_NO_FLUSH,
         adler_seed(window_bits),
     );
-    assert_eq!(inflate_end(state), ReturnCode::OK, "inflateEnd");
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK, "inflateEnd");
     outcome
 }
 
@@ -821,7 +827,7 @@ fn try_raw(hex: &str, id: &'static str, err: i32) -> Outcome {
             Z_TREES,
             adler_seed(window_bits),
         );
-        assert_eq!(inflate_end(state), ReturnCode::OK, "{id}: inflateEnd");
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK, "{id}: inflateEnd");
         outcome
     };
     // `mem_done` (L546): no leak, no out-of-order release, no unrecognised release.
@@ -941,7 +947,9 @@ fn inf(vector: InfVector) -> Outcome {
         stream.total_in = total_in;
         stream.total_out = total_out;
         stream.msg = msg;
-        stream.adler = adler;
+        // `adler` is deliberately not seeded: the facade hands the core `None` and
+        // adopts a value only where C assigns `strm->adler`, so the carried value
+        // below is the caller's own member rather than a round trip through the view.
         stream.data_type = data_type;
 
         let mut ret = inflate(&mut state, &mut stream, Z_NO_FLUSH);
@@ -1004,7 +1012,9 @@ fn inf(vector: InfVector) -> Outcome {
         read_at = read_at.saturating_add(stream.next_in);
         total_in = stream.total_in;
         total_out = stream.total_out;
-        adler = stream.adler;
+        if let Some(value) = stream.adler {
+            adler = value;
+        }
         data_type = stream.data_type;
         msg = stream.msg;
         last = ret;
@@ -1014,8 +1024,12 @@ fn inf(vector: InfVector) -> Outcome {
         }
 
         // L335-L336: copy the live state and tear the copy down again, every iteration.
-        let copy = inflate_copy(&state, &tracker).expect("inflateCopy");
-        assert_eq!(inflate_end(copy), ReturnCode::OK, "{what}: copy inflateEnd");
+        let mut copy = inflate_copy(&state, &tracker).expect("inflateCopy");
+        assert_eq!(
+            inflate_end(&mut copy),
+            ReturnCode::OK,
+            "{what}: copy inflateEnd"
+        );
         copies = copies.saturating_add(1);
 
         // L338-L341 and the `while (strm.avail_in)` condition at L342.
@@ -1030,7 +1044,11 @@ fn inf(vector: InfVector) -> Outcome {
         inflate_reset2(&mut state, InflateConfig::new(RAW_SMALL)).is_ok(),
         "{what}: inflateReset2(-8)"
     );
-    assert_eq!(inflate_end(state), ReturnCode::OK, "{what}: inflateEnd");
+    assert_eq!(
+        inflate_end(&mut state),
+        ReturnCode::OK,
+        "{what}: inflateEnd"
+    );
 
     // L345: `mem_done`.
     tracker.assert_clean();
@@ -1085,9 +1103,9 @@ fn compress_with(
         // wrapper; the optional gzip fields are the caller's own bytes and are added
         // to whatever it reported.
         room = room
-            .saturating_add(view.extra.map_or(0, <[u8]>::len))
-            .saturating_add(view.name.map_or(0, <[u8]>::len))
-            .saturating_add(view.comment.map_or(0, <[u8]>::len));
+            .saturating_add(view.advertised_extra_len())
+            .saturating_add(view.name_bound_len())
+            .saturating_add(view.comment_bound_len());
     }
     room = room.saturating_add(4096);
 
@@ -1116,7 +1134,7 @@ fn compress_with(
         "deflate(Z_FINISH) should finish in one call"
     );
     let compressed = stream.written().to_vec();
-    assert_eq!(deflate_end(state), ReturnCode::OK, "deflateEnd");
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK, "deflateEnd");
     compressed
 }
 
@@ -1128,8 +1146,8 @@ fn compress_with(
 /// magnitude the cost. Two tests here -- [`every_container_round_trips`] and
 /// [`code_tables_never_exceed_the_enough_capacity`] -- move about 450 KiB of payload
 /// between them, including `common::corpus::window_crossing`'s 33 048 bytes at
-/// compression level 9, where `max_chain` is 4096. Natively that is seconds; under the
-/// interpreter it is hours, which would make the suite something nobody runs.
+/// compression level 9, where `max_chain` is 4096. Natively that is cheap; interpreted it
+/// is expensive enough that the suite would become something nobody runs.
 ///
 /// Capping the volume is sound because every assertion in this file is *structural*:
 /// which code path runs, which status comes back, which message is published, and
@@ -1369,7 +1387,6 @@ fn modes_while_feeding(bytes: &[u8], window_bits: i32) -> Vec<Mode> {
     let mut read_at = 0_usize;
     let mut total_in = 0_u64;
     let mut total_out = 0_u64;
-    let mut adler = adler_seed(window_bits);
 
     // The first call deliberately offers **no** input. That is the only way to observe
     // a state the decoder passes straight through given a single byte: `TYPEDO` needs
@@ -1384,13 +1401,11 @@ fn modes_while_feeding(bytes: &[u8], window_bits: i32) -> Vec<Mode> {
         let mut stream = InflateStream::new(&bytes[read_at..end], &mut buffer);
         stream.total_in = total_in;
         stream.total_out = total_out;
-        stream.adler = adler;
 
         let ret = inflate(&mut state, &mut stream, Z_NO_FLUSH);
         read_at = read_at.saturating_add(stream.next_in);
         total_in = stream.total_in;
         total_out = stream.total_out;
-        adler = stream.adler;
 
         let mode = Mode::from_raw(state.mode_tag()).expect("a live state tag");
         if seen.last() != Some(&mode) {
@@ -1408,7 +1423,7 @@ fn modes_while_feeding(bytes: &[u8], window_bits: i32) -> Vec<Mode> {
         }
     }
 
-    assert_eq!(inflate_end(state), ReturnCode::OK, "inflateEnd");
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK, "inflateEnd");
     seen
 }
 
@@ -1688,7 +1703,7 @@ fn every_raw_error_vector_reports_the_reference_message() {
             ReturnCode::DATA_ERROR,
             "{message}: a data error must be reported again"
         );
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 }
 
@@ -1876,7 +1891,7 @@ fn a_reset_stream_immediately_decodes_a_fresh_raw_stream() {
         "the fresh stream decodes"
     );
     assert_eq!(second.output, plain, "and decodes to the right bytes");
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 }
 
 #[test]
@@ -1906,12 +1921,12 @@ fn every_raw_vector_survives_a_mid_stream_copy_and_reset() {
                     !matches!(ret, ReturnCode::STREAM_ERROR | ReturnCode::MEM_ERROR),
                     "{hex}: unexpected {ret:?}"
                 );
-                (stream.next_in, stream.adler, stream.msg)
+                (stream.next_in, stream.adler.unwrap_or(0), stream.msg)
             };
 
-            let copy = inflate_copy(&state, &tracker).expect("inflateCopy");
+            let mut copy = inflate_copy(&state, &tracker).expect("inflateCopy");
             assert_eq!(
-                inflate_end(copy),
+                inflate_end(&mut copy),
                 ReturnCode::OK,
                 "{hex}: the copy must end cleanly on its own"
             );
@@ -1949,7 +1964,7 @@ fn every_raw_vector_survives_a_mid_stream_copy_and_reset() {
                 inflate_reset2(&mut state, InflateConfig::new(RAW_SMALL)).is_ok(),
                 "{hex}: inflateReset2(-8)"
             );
-            assert_eq!(inflate_end(state), ReturnCode::OK, "{hex}: inflateEnd");
+            assert_eq!(inflate_end(&mut state), ReturnCode::OK, "{hex}: inflateEnd");
         }
         tracker.assert_clean();
     }
@@ -2201,8 +2216,8 @@ fn a_distance_beyond_the_available_history_is_rejected() {
 
     // The same rejection reached from the other direction, and the reason this whole
     // class of assertion exists. `whave` -- how much of the window actually holds
-    // decoded history -- is security-load-bearing: HEAD commit `09a1572`, the exact
-    // baseline of this port, fixed a bug in which an inflated `whave` let the decoder
+    // decoded history -- is security-load-bearing: the reference implementation this port
+    // is taken from carries a fix for a defect in which an inflated `whave` let the decoder
     // copy *uninitialised* window bytes into the output and accept an invalid stream.
     // A raw stream compressed against a preset dictionary is the cleanest way to
     // produce a legitimate distance that reaches behind the start of the data: decoded
@@ -2257,7 +2272,7 @@ fn a_distance_beyond_the_available_history_is_rejected() {
         "status with the dictionary"
     );
     assert_eq!(with.output, payload, "recovered bytes with the dictionary");
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 }
 
 #[test]
@@ -2269,7 +2284,6 @@ fn no_progress_is_reported_rather_than_hung() {
     // so rather than the call spinning (`zlib.h` L440-L447).
     let mut room = vec![0_u8; 64];
     let mut stream = InflateStream::new(&[], &mut room);
-    stream.adler = adler_seed(ZLIB);
     assert_eq!(
         inflate(&mut state, &mut stream, Z_NO_FLUSH),
         ReturnCode::BUF_ERROR,
@@ -2289,7 +2303,6 @@ fn no_progress_is_reported_rather_than_hung() {
         );
         let mut empty: [u8; 0] = [];
         let mut stream = InflateStream::new(&compressed[consumed..], &mut empty);
-        stream.adler = adler_seed(ZLIB);
         let ret = inflate(&mut state, &mut stream, Z_NO_FLUSH);
         calls = calls.saturating_add(1);
         consumed = consumed.saturating_add(stream.next_in);
@@ -2306,14 +2319,13 @@ fn no_progress_is_reported_rather_than_hung() {
     // And the stream is still usable the moment a real buffer arrives.
     let mut room = vec![0_u8; 64];
     let mut stream = InflateStream::new(&compressed[consumed..], &mut room);
-    stream.adler = adler_seed(ZLIB);
     assert_eq!(
         inflate(&mut state, &mut stream, Z_FINISH),
         ReturnCode::STREAM_END,
         "the stalled stream resumes"
     );
     assert_eq!(stream.written(), HELLO, "and produces the payload");
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 }
 
 // ---------------------------------------------------------------------------
@@ -2387,13 +2399,17 @@ fn gzip_header_fields_are_clamped_to_the_callers_maxima() {
     const NAME_MAX: usize = 5;
     const COMMENT_MAX: usize = 3;
 
-    let extra: Vec<u8> = (0..200_u32)
-        .map(|index| u8::try_from(index % 251).expect("modulo 251 fits a byte"))
+    // `Cell` because a `GzHeaderView` field models storage the *application* owns and may
+    // write while the compressor holds the borrow; this test owns the fixtures outright.
+    let extra: Vec<Cell<u8>> = (0..200_u32)
+        .map(|index| Cell::new(u8::try_from(index % 251).expect("modulo 251 fits a byte")))
         .collect();
     let mut name = b"a-rather-long-member-name-that-will-not-fit".to_vec();
     name.push(0);
+    let name: Vec<Cell<u8>> = name.into_iter().map(Cell::new).collect();
     let mut comment = b"and a comment that is longer still, by some margin".to_vec();
     comment.push(0);
+    let comment: Vec<Cell<u8>> = comment.into_iter().map(Cell::new).collect();
 
     let mut config = DeflateConfig::new(9);
     config.window_bits = GZIP;
@@ -2401,15 +2417,15 @@ fn gzip_header_fields_are_clamped_to_the_callers_maxima() {
         HELLO,
         config,
         None,
-        Some(GzHeaderView {
-            text: true,
-            time: 0x5a5a_5a5a,
-            os: 3,
-            extra: Some(&extra),
-            name: Some(&name),
-            comment: Some(&comment),
-            hcrc: true,
-        }),
+        Some(GzHeaderView::new(
+            true,
+            0x5a5a_5a5a,
+            3,
+            true,
+            Some(&extra),
+            Some(&name),
+            Some(&comment),
+        )),
     );
 
     let extra_cells = vec![Cell::new(HEADER_GUARD); EXTRA_MAX + HEADER_GUARD_LEN];
@@ -2449,7 +2465,7 @@ fn gzip_header_fields_are_clamped_to_the_callers_maxima() {
         "decompression must still complete"
     );
     assert_eq!(outcome.output, HELLO, "and must recover the payload");
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
     let written = |cells: &[Cell<u8>], upto: usize| -> Vec<u8> {
         cells[..upto].iter().map(Cell::get).collect()
@@ -2458,13 +2474,17 @@ fn gzip_header_fields_are_clamped_to_the_callers_maxima() {
     // did fit are the leading bytes of what the stream carried.
     assert_eq!(
         written(&extra_cells, EXTRA_MAX),
-        extra[..EXTRA_MAX],
+        written(&extra, EXTRA_MAX),
         "extra field"
     );
-    assert_eq!(written(&name_cells, NAME_MAX), name[..NAME_MAX], "name");
+    assert_eq!(
+        written(&name_cells, NAME_MAX),
+        written(&name, NAME_MAX),
+        "name"
+    );
     assert_eq!(
         written(&comment_cells, COMMENT_MAX),
-        comment[..COMMENT_MAX],
+        written(&comment, COMMENT_MAX),
         "comment"
     );
     // (a) Nothing at all was written past any advertised maximum.
@@ -2603,7 +2623,7 @@ fn full_flush_stream_with_damage(plain: &[u8]) -> Vec<u8> {
         stream.next_out
     };
 
-    assert_eq!(deflate_end(state), ReturnCode::OK, "deflateEnd");
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK, "deflateEnd");
     out.truncate(head_len.saturating_add(tail_len));
     out
 }
@@ -2618,7 +2638,6 @@ fn sync_skips_a_damaged_block_like_the_reference_example() {
     // "just read the zlib header".
     let (total_in, total_out, adler, consumed) = {
         let mut stream = InflateStream::new(&damaged[..2], &mut room);
-        stream.adler = adler_seed(ZLIB);
         check_err(inflate(&mut state, &mut stream, Z_NO_FLUSH), "inflate");
         assert_eq!(stream.next_out, 0, "the header produces no output");
         (
@@ -2656,7 +2675,7 @@ fn sync_skips_a_damaged_block_like_the_reference_example() {
         &HELLO[3..],
         "everything after the flush point must be recovered"
     );
-    assert_eq!(inflate_end(state), ReturnCode::OK, "inflateEnd");
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK, "inflateEnd");
 }
 
 #[test]
@@ -2700,8 +2719,8 @@ fn sync_reports_the_reference_statuses() {
         "no input and fewer than eight buffered bits"
     );
 
-    assert_eq!(inflate_end(fresh), ReturnCode::OK);
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut fresh), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 }
 
 #[test]
@@ -2740,14 +2759,13 @@ fn sync_point_marks_an_empty_stored_block_boundary() {
         );
         stream.next_out
     };
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     out.truncate(head_len.saturating_add(tail_len));
 
     let saw_sync_point = |bytes: &[u8]| -> bool {
         let mut state = inflate_init(GlobalAllocator).expect("the default configuration");
         let mut seen = false;
         let mut read_at = 0_usize;
-        let mut adler = adler_seed(ZLIB);
         for call in 0..bytes.len().saturating_add(3) {
             let end = if call == 0 {
                 read_at
@@ -2756,16 +2774,14 @@ fn sync_point_marks_an_empty_stored_block_boundary() {
             };
             let mut room = [0_u8; 32];
             let mut stream = InflateStream::new(&bytes[read_at..end], &mut room);
-            stream.adler = adler;
             let ret = inflate(&mut state, &mut stream, Z_NO_FLUSH);
             read_at = read_at.saturating_add(stream.next_in);
-            adler = stream.adler;
             seen |= inflate_sync_point(&state);
             if matches!(ret, ReturnCode::STREAM_END | ReturnCode::DATA_ERROR) {
                 break;
             }
         }
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
         seen
     };
 
@@ -2790,13 +2806,16 @@ fn a_copy_decodes_the_remainder_independently() {
     let mut room = vec![0_u8; 512];
     let (prefix, consumed, adler) = {
         let mut stream = InflateStream::new(&compressed[..compressed.len() / 2], &mut room);
-        stream.adler = adler_seed(ZLIB);
         let ret = inflate(&mut state, &mut stream, Z_NO_FLUSH);
         assert!(
             matches!(ret, ReturnCode::OK | ReturnCode::BUF_ERROR),
             "a partial stream must suspend, got {ret:?}"
         );
-        (stream.written().to_vec(), stream.next_in, stream.adler)
+        (
+            stream.written().to_vec(),
+            stream.next_in,
+            stream.adler.unwrap_or(0),
+        )
     };
     assert!(!prefix.is_empty(), "the first half must produce output");
 
@@ -2836,7 +2855,7 @@ fn a_copy_decodes_the_remainder_independently() {
 
     // Ending the copy must leave the source alone: it is still resettable and still
     // decodes.
-    assert_eq!(inflate_end(copy), ReturnCode::OK, "copy inflateEnd");
+    assert_eq!(inflate_end(&mut copy), ReturnCode::OK, "copy inflateEnd");
     assert!(
         inflate_reset2(&mut state, InflateConfig::new(ZLIB)).is_ok(),
         "the source survives the copy's teardown"
@@ -2851,7 +2870,7 @@ fn a_copy_decodes_the_remainder_independently() {
     );
     assert_eq!(again.last, ReturnCode::STREAM_END);
     assert_eq!(again.output, plain);
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 }
 
 #[test]
@@ -2926,7 +2945,7 @@ fn reset_keep_preserves_the_window_and_reset_clears_it() {
     assert_eq!(again.output, fresh.output, "output");
     assert_eq!(again.adler, fresh.adler, "check value");
     assert_eq!(again.total_in, fresh.total_in, "total_in");
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 }
 
 #[test]
@@ -3007,7 +3026,7 @@ fn reset2_changes_the_container_mid_life() {
     );
     assert_eq!(outcome.last, ReturnCode::STREAM_END, "still usable");
     assert_eq!(outcome.output, plain);
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 }
 
 #[test]
@@ -3038,7 +3057,7 @@ fn prime_accepts_and_refuses_what_the_reference_does() {
         ReturnCode::STREAM_ERROR,
         "48 bits does not fit"
     );
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
     // The documented use: hand the decoder bits it will never see as input. Priming
     // with the stream's own first byte and then feeding the rest must decode it.
@@ -3060,7 +3079,7 @@ fn prime_accepts_and_refuses_what_the_reference_does() {
     );
     assert_eq!(outcome.last, ReturnCode::STREAM_END, "primed status");
     assert_eq!(outcome.output, HELLO, "primed output");
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 }
 
 #[test]
@@ -3079,7 +3098,6 @@ fn mark_reports_the_documented_accounting() {
     let compressed = compress(&plain, ZLIB);
     let mut marks = Vec::new();
     let mut read_at = 0_usize;
-    let mut adler = adler_seed(ZLIB);
     for call in 0..compressed.len().saturating_add(3) {
         let end = if call == 0 {
             read_at
@@ -3088,16 +3106,14 @@ fn mark_reports_the_documented_accounting() {
         };
         let mut room = [0_u8; 4];
         let mut stream = InflateStream::new(&compressed[read_at..end], &mut room);
-        stream.adler = adler;
         let ret = inflate(&mut state, &mut stream, Z_NO_FLUSH);
         read_at = read_at.saturating_add(stream.next_in);
-        adler = stream.adler;
         marks.push(inflate_mark(&state));
         if matches!(ret, ReturnCode::STREAM_END | ReturnCode::DATA_ERROR) {
             break;
         }
     }
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
     assert!(
         marks.iter().any(|mark| *mark != INFLATE_MARK_BAD_STATE),
@@ -3132,14 +3148,14 @@ fn a_dictionary_stream_is_recovered_like_the_reference_example() {
     let mut room = vec![0_u8; 64];
     let (consumed, adler) = {
         let mut stream = InflateStream::new(&compressed, &mut room);
-        stream.adler = adler_seed(ZLIB);
         assert_eq!(
             inflate(&mut state, &mut stream, Z_NO_FLUSH),
             ReturnCode::NEED_DICT,
             "the stream must ask for its dictionary"
         );
         assert_eq!(
-            stream.adler, dict_id,
+            stream.adler,
+            Some(dict_id),
             "and must publish the dictionary's Adler-32 as its id"
         );
         (stream.next_in, stream.adler)
@@ -3176,7 +3192,11 @@ fn a_dictionary_stream_is_recovered_like_the_reference_example() {
     let mut history = vec![0_u8; 1 << 15];
     let mut length = 0_u32;
     assert_eq!(
-        inflate_get_dictionary(&state, Some(&mut history), Some(&mut length)),
+        inflate_get_dictionary(
+            &state,
+            Some(&mut OutputRegion::init(&mut history)),
+            Some(&mut length)
+        ),
         ReturnCode::OK,
         "inflateGetDictionary"
     );
@@ -3186,7 +3206,7 @@ fn a_dictionary_stream_is_recovered_like_the_reference_example() {
         DICTIONARY,
         "a single-call decode leaves only the preset dictionary in the window"
     );
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
     // Decoded a few bytes at a time, the intermediate calls *do* update the window, so
     // the history then holds the dictionary followed by what has been decoded so far.
@@ -3194,13 +3214,12 @@ fn a_dictionary_stream_is_recovered_like_the_reference_example() {
     let mut room = vec![0_u8; 4];
     let (consumed, adler) = {
         let mut stream = InflateStream::new(&compressed, &mut room);
-        stream.adler = adler_seed(ZLIB);
         assert_eq!(
             inflate(&mut state, &mut stream, Z_NO_FLUSH),
             ReturnCode::NEED_DICT,
             "the stream must ask for its dictionary"
         );
-        (stream.next_in, stream.adler)
+        (stream.next_in, stream.adler.unwrap_or(0))
     };
     assert_eq!(
         inflate_set_dictionary(&mut state, DICTIONARY),
@@ -3213,7 +3232,11 @@ fn a_dictionary_stream_is_recovered_like_the_reference_example() {
     let mut history = vec![0_u8; 1 << 15];
     let mut length = 0_u32;
     assert_eq!(
-        inflate_get_dictionary(&state, Some(&mut history), Some(&mut length)),
+        inflate_get_dictionary(
+            &state,
+            Some(&mut OutputRegion::init(&mut history)),
+            Some(&mut length)
+        ),
         ReturnCode::OK,
         "inflateGetDictionary"
     );
@@ -3234,7 +3257,7 @@ fn a_dictionary_stream_is_recovered_like_the_reference_example() {
         HELLO.starts_with(&history[DICTIONARY.len()..length]),
         "and continue with the decoded payload in stream order"
     );
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 }
 
 #[test]
@@ -3253,7 +3276,7 @@ fn set_dictionary_refuses_a_stream_that_wants_none() {
         ReturnCode::STREAM_ERROR,
         "and so is a real one"
     );
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
     // `cover_wrap()` L425-L427: a *raw* stream accepts one at any time, and 257 zero
     // bytes is the length the C harness uses.
@@ -3265,7 +3288,7 @@ fn set_dictionary_refuses_a_stream_that_wants_none() {
         ReturnCode::OK,
         "a raw stream accepts a dictionary"
     );
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 }
 
 #[test]
@@ -3284,7 +3307,7 @@ fn undermine_is_refused_in_the_shipped_configuration() {
         ReturnCode::DATA_ERROR,
         "inflateUndermine(0)"
     );
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
     // And the refusal changes nothing: a good stream still decodes and a bad distance
     // is still an error.
@@ -3301,7 +3324,7 @@ fn undermine_is_refused_in_the_shipped_configuration() {
     );
     assert_eq!(outcome.last, ReturnCode::STREAM_END);
     assert_eq!(outcome.output, HELLO);
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
     let still_bad = try_raw("c c0 81 0 0 0 0 0 90 ff 6b 4 0", MSG_DISTANCE_TOO_FAR, 1);
     assert_eq!(still_bad.msg, Some(MSG_DISTANCE_TOO_FAR));
@@ -3372,7 +3395,7 @@ fn validation_can_be_turned_off_and_on() {
             ReturnCode::DATA_ERROR,
             "windowBits {window_bits}: validation on again"
         );
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 }
 
@@ -3404,7 +3427,7 @@ fn codes_used_reports_the_arena_occupancy() {
         0,
         "a fixed-code block builds no dynamic tables"
     );
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
     // A dynamic block does, and never more than the arena holds.
     let plain = capped(common::corpus::text());
@@ -3428,7 +3451,7 @@ fn codes_used_reports_the_arena_occupancy() {
         used, INFLATE_CODES_USED_BAD_STATE,
         "a live state must report a real count"
     );
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 }
 
 // ---------------------------------------------------------------------------
@@ -3490,7 +3513,7 @@ fn code_tables_never_exceed_the_enough_capacity() {
                 used <= enough,
                 "{name} with {strategy:?}: {used} entries exceeds ENOUGH ({enough})"
             );
-            assert_eq!(inflate_end(state), ReturnCode::OK);
+            assert_eq!(inflate_end(&mut state), ReturnCode::OK);
         }
     }
 
@@ -3520,7 +3543,7 @@ fn code_tables_never_exceed_the_enough_capacity() {
             inflate_codes_used(&state) <= enough,
             "{message}: the arena cursor must stay inside ENOUGH"
         );
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 }
 
@@ -3550,7 +3573,6 @@ fn data_type_reports_the_accumulator_and_the_block_flags() {
         inflate_init2(InflateConfig::new(ZLIB), GlobalAllocator).expect("zlib window bits");
     let mut room = vec![0_u8; 64];
     let mut stream = InflateStream::new(&compressed, &mut room);
-    stream.adler = adler_seed(ZLIB);
     let ret = inflate(&mut state, &mut stream, Z_BLOCK);
     assert!(
         matches!(ret, ReturnCode::OK | ReturnCode::STREAM_END),
@@ -3561,7 +3583,7 @@ fn data_type_reports_the_accumulator_and_the_block_flags() {
         "the accumulator can hold at most 32 bits, got {}",
         stream.data_type
     );
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 }
 
 // ---------------------------------------------------------------------------
@@ -3681,7 +3703,7 @@ fn the_cover_wrap_memory_sequence_reproduces_the_reference_statuses() {
             "inflateUndermine is refused in this configuration"
         );
         let _mark = inflate_mark(&state);
-        assert_eq!(inflate_end(state), ReturnCode::OK, "inflateEnd");
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK, "inflateEnd");
     }
     // L442: `mem_done`.
     tracker.assert_clean();
@@ -3699,7 +3721,6 @@ fn an_exhausted_allocator_reports_a_sticky_memory_error() {
         tracker.set_limit(1);
         for attempt in 0..2 {
             let mut stream = InflateStream::new(&compressed, &mut room);
-            stream.adler = adler_seed(ZLIB);
             assert_eq!(
                 inflate(&mut state, &mut stream, Z_NO_FLUSH),
                 ReturnCode::MEM_ERROR,
@@ -3712,7 +3733,6 @@ fn an_exhausted_allocator_reports_a_sticky_memory_error() {
         tracker.set_limit(0);
         {
             let mut stream = InflateStream::new(&compressed, &mut room);
-            stream.adler = adler_seed(ZLIB);
             assert_eq!(
                 inflate(&mut state, &mut stream, Z_NO_FLUSH),
                 ReturnCode::MEM_ERROR,
@@ -3734,7 +3754,7 @@ fn an_exhausted_allocator_reports_a_sticky_memory_error() {
         );
         assert_eq!(outcome.last, ReturnCode::STREAM_END, "usable after a reset");
         assert_eq!(outcome.output, HELLO, "and correct");
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
     // No leak, no out-of-order release and no unrecognised release, even across the
     // failures: a refused allocation must record nothing at all.
@@ -3765,7 +3785,7 @@ fn the_lazily_allocated_window_reports_a_memory_error_not_a_panic() {
                 ReturnCode::MEM_ERROR,
                 "windowBits {window_bits}: a window one byte too large must be refused"
             );
-            assert_eq!(inflate_end(state), ReturnCode::OK);
+            assert_eq!(inflate_end(&mut state), ReturnCode::OK);
         }
         tracker.assert_clean();
         assert_eq!(
@@ -3819,7 +3839,7 @@ fn a_sentinel_filling_allocator_still_decodes_correctly() {
                     outcome.output, plain,
                     "{name} at windowBits {window_bits}: output"
                 );
-                assert_eq!(inflate_end(state), ReturnCode::OK);
+                assert_eq!(inflate_end(&mut state), ReturnCode::OK);
             }
             tracker.assert_clean();
             // A payload that fits inside one output buffer never needs history, so the

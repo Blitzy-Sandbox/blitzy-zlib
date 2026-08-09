@@ -125,6 +125,7 @@ use crate::allocate::GlobalAllocator;
 use crate::config::Z_NO_FLUSH;
 use crate::error::ReturnCode;
 use crate::inflate::{inflate, inflate_end, inflate_init, InflateStream};
+use crate::read_buf::OutputRegion;
 
 /// The largest number of bytes handed to the decoder in one call.
 ///
@@ -264,6 +265,16 @@ pub struct Decompressed {
 /// place by aiming `next_out` at eight bytes of `z_stream` padding it never
 /// reads (L42-L43).
 pub fn uncompress2_z(dest: &mut [u8], source: &[u8]) -> Decompressed {
+    uncompress2_z_into(&mut OutputRegion::init(dest), source)
+}
+
+/// [`uncompress2_z`] over a destination that may be write-only storage.
+///
+/// The entry point `crates/libz-rs-sys` uses, because a C caller's `dest` is guaranteed
+/// writable and nothing more -- `zlib.h` L1319-L1327 asks for `*destLen` bytes of room and
+/// says nothing about their contents. Identical in behaviour to [`uncompress2_z`], which is a
+/// one-line forwarder to it over an [`OutputRegion::init`].
+pub fn uncompress2_z_into(dest: &mut OutputRegion<'_>, source: &[u8]) -> Decompressed {
     // Captured before the first reborrow of `dest`, and the origin of every
     // bound below. These are C's entry values of `*sourceLen` and `*destLen`.
     let source_len = source.len();
@@ -309,7 +320,11 @@ pub fn uncompress2_z(dest: &mut [u8], source: &[u8]) -> Decompressed {
     let mut total_in = 0_u64;
     let mut total_out = 0_u64;
     let mut msg = None;
-    let mut adler = 0_u32;
+    // `None`, not zero: C's `inflateResetKeep` writes `strm->adler` only for a wrapped
+    // stream (`inflate.c` L108-L109), and a raw one is left alone. Carrying the
+    // reference's "not assigned" state is what keeps a raw decode from inventing a
+    // check value it never had.
+    let mut adler = None;
     let mut data_type = 0_i32;
 
     // L57-L67.
@@ -333,11 +348,18 @@ pub fn uncompress2_z(dest: &mut [u8], source: &[u8]) -> Decompressed {
         let in_end = next_in.saturating_add(avail_in).min(source_len);
         let out_end = next_out.saturating_add(avail_out).min(dest_len);
         let (input, _unread) = source.split_at(in_end);
-        let (output, _unwritten) = dest.split_at_mut(out_end);
 
-        let mut stream = InflateStream::new(input, output);
+        // ★ The output window starts **at** `next_out` and the stream's own cursor starts at
+        // zero, rather than the window starting at the destination's base with the cursor
+        // pre-positioned. That is not merely tidier, it is what the decoder needs: the two
+        // places `inflate()` reads its own output back -- the check value at `inflate.c` L1080
+        // and the window update at L1136 -- are both over *this call's* output, which is
+        // exactly what the sub-window spans. It also keeps [`OutputRegion`]'s promise about
+        // its write-only variant exact, since every write lands at or after the sub-window's
+        // own base.
+        let mut window = dest.reborrow(next_out, out_end.saturating_sub(next_out));
+        let mut stream = InflateStream::with_region(input, window.reborrow(0, window.len()));
         stream.next_in = next_in;
-        stream.next_out = next_out;
         stream.total_in = total_in;
         stream.total_out = total_out;
         stream.msg = msg;
@@ -348,7 +370,7 @@ pub fn uncompress2_z(dest: &mut [u8], source: &[u8]) -> Decompressed {
         let err = inflate(&mut state, &mut stream, Z_NO_FLUSH);
 
         next_in = stream.next_in;
-        next_out = stream.next_out;
+        next_out = next_out.saturating_add(stream.next_out);
         avail_in = stream.avail_in();
         avail_out = stream.avail_out();
         total_in = stream.total_in;
@@ -391,7 +413,7 @@ pub fn uncompress2_z(dest: &mut [u8], source: &[u8]) -> Decompressed {
     // L77. Unconditional, and the result is discarded exactly as C discards it:
     // the only failure C's `inflateEnd` can report is a broken stream handle,
     // which an owned decoder state cannot be.
-    let _end = inflate_end(state);
+    let _end = inflate_end(&mut state);
 
     // L78-L81, arm for arm and in C's order.
     //

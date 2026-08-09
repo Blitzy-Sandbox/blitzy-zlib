@@ -37,7 +37,7 @@
 //!
 //! `deflate.h` L90-L94 declares a **different** type, `tree_desc_s`, holding
 //! `dyn_tree`, `max_code` and `stat_desc`. That is the *mutable* half of a tree
-//! and is owned by [`TreeDesc`] in `deflate/state.rs`, which the compressor
+//! and is owned by [`crate::deflate::state::TreeDesc`] in `deflate/state.rs`, which the compressor
 //! embeds three times as its `l_desc`, `d_desc` and `bl_desc` fields. It is not
 //! redefined here, and neither is [`CtData`]: this module contributes only the
 //! `'static` data.
@@ -147,7 +147,7 @@ impl StaticTreeDesc {
     ///
     /// This is the Rust form of the three assignments `_tr_init` makes at
     /// L459-L466, where C stores `&static_l_desc`, `&static_d_desc` or
-    /// `&static_bl_desc` into a tree's `stat_desc` member. [`TreeDesc`] records
+    /// `&static_bl_desc` into a tree's `stat_desc` member. [`crate::deflate::state::TreeDesc`] records
     /// a [`StaticTreeKind`] instead of a pointer -- naming the descriptor rather
     /// than pointing at it is what removes that aliasing from the implementation -- so
     /// this is the lookup that turns the recorded name back into the data.

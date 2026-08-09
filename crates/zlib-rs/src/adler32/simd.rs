@@ -356,7 +356,11 @@ const SHORT_INPUT_LEN: usize = SUB_CHUNK;
 /// Delegation is not a behavioural fork: the two backends agree bit for bit on every input and
 /// every starting value, which is the property the equivalence sweep at the bottom of this file
 /// establishes for exactly the lengths that straddle this threshold.
-const LANE_THRESHOLD_LEN: usize = 4 * SUB_CHUNK;
+///
+/// Visible to the parent module because the dispatcher tests it *before* asking
+/// [`is_supported`] anything: an input this backend would hand straight back is an input on which
+/// target-feature detection is pure overhead. See [`crate::adler32::adler32_z`].
+pub(crate) const LANE_THRESHOLD_LEN: usize = 4 * SUB_CHUNK;
 
 /// The overflow argument in the module documentation is arithmetic about specific numbers,
 /// not a general property, so the numbers it assumes are pinned here. Changing either

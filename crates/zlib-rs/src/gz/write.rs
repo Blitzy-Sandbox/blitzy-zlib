@@ -98,15 +98,15 @@
 
 use core::ffi::c_uint;
 
-use alloc::vec::Vec;
-
 use crate::allocate::{Allocator, Buffer};
 use crate::config::{DeflateConfig, Method, DEF_MEM_LEVEL, MAX_WBITS, Z_FINISH, Z_NO_FLUSH};
 use crate::deflate::{
     deflate, deflate_end, deflate_init2, deflate_reset, DeflateReset, DeflateStream, Flush,
 };
 use crate::error::ReturnCode;
-use crate::gz::state::{GzEngine, GzIoError, GzState, GzStream, ZOff64, GZ_NONE, GZ_WRITE};
+use crate::gz::state::{
+    split_buffers, GzEngine, GzHandle, GzIoError, GzState, GzStream, ZOff64, GZ_NONE, GZ_WRITE,
+};
 use crate::gz::{errno_message, gt_off, gz_error};
 
 /// `gz_error(state, Z_MEM_ERROR, "out of memory")` (`gzwrite.c` L18, L28 and L41).
@@ -149,7 +149,8 @@ fn report_io_failure<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>, error: Op
 /// than the slice is detectable, and is reported rather than read.
 const REQUEST_PAST_BUFFER: &[u8] = b"request does not fit in the supplied buffer";
 
-/// The message for a [`GzHandle`] that claims to have written more than it was offered.
+/// The message for a [`crate::gz::state::GzHandle`] that claims to have written more than it was
+/// offered.
 ///
 /// C cannot detect this: `write(2)` is trusted to honour its `count` argument and `gz_comp` advances
 /// `state->x.next` by the return value unchecked (`gzwrite.c` L122). This port hands the handle a
@@ -159,8 +160,8 @@ const REQUEST_PAST_BUFFER: &[u8] = b"request does not fit in the supplied buffer
 /// `Z_STREAM_ERROR`, which is the right code because no operating-system error occurred.
 ///
 /// `crate::gz::read` refuses the mirror-image over-report with the same reasoning, so a `GzHandle`
-/// implementation faces one rule in both directions -- stated on [`GzHandle::read`] and
-/// [`GzHandle::write`] themselves.
+/// implementation faces one rule in both directions -- stated on
+/// [`crate::gz::state::GzHandle::read`] and [`crate::gz::state::GzHandle::write`] themselves.
 const HANDLE_OVER_REPORTED: &[u8] = b"file handle reported more bytes than were requested";
 
 /// Widens a C `unsigned` count into a `usize` index.
@@ -349,7 +350,7 @@ pub(crate) fn gz_init<'a, A: Allocator<'a> + Copy>(
 /// the handle reports, **once that count has been proved to be a count of bytes the handle was
 /// actually given**. C needs no such proof because `write(2)` cannot return more than `count`; here
 /// the file is an injected trait object and the count is untrusted input, so it is bounded by the
-/// length of the offered slice before any cursor moves. See [`WRITE_COUNT_TOO_LARGE`].
+/// length of the offered slice before any cursor moves. See `HANDLE_OVER_REPORTED`.
 ///
 /// # Errors
 ///
@@ -378,14 +379,18 @@ fn flush_out<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> Result<(), Ret
         // checked against cannot disagree with the bytes that were actually presented.
         let mut offered = 0_usize;
         let attempt = {
-            let staged = state
-                .output
-                .as_ref()
-                .map(Buffer::as_slice)
+            let GzState {
+                buffer_slot,
+                handle,
+                ..
+            } = state;
+            let (_, staged_out) = split_buffers(buffer_slot);
+            let staged = staged_out
+                .map(|buffer| buffer.as_slice())
                 .and_then(|slice| slice.get(begin..end));
-            let file = state.handle.handle_mut();
+            let file = handle.handle_mut();
             match (staged, file) {
-                (Some(chunk), Some(file)) => {
+                (Some(chunk), Some(mut file)) => {
                     offered = chunk.len();
                     Some(file.write(chunk))
                 }
@@ -475,17 +480,21 @@ fn write_through<'a, A: Allocator<'a>>(
         // exact bytes presented, not against a separately recomputed length.
         let mut offered = 0_usize;
         let attempt = {
+            let GzState {
+                buffer_slot,
+                handle,
+                ..
+            } = state;
+            let (staged_in, _) = split_buffers(buffer_slot);
             let pending = match source {
                 Some(buffer) => buffer.get(begin..end),
-                None => state
-                    .input
-                    .as_ref()
-                    .map(Buffer::as_slice)
+                None => staged_in
+                    .map(|buffer| buffer.as_slice())
                     .and_then(|slice| slice.get(begin..end)),
             };
-            let file = state.handle.handle_mut();
+            let file = handle.handle_mut();
             match (pending, file) {
-                (Some(chunk), Some(file)) => {
+                (Some(chunk), Some(mut file)) => {
                     offered = chunk.len();
                     Some(file.write(chunk))
                 }
@@ -568,22 +577,24 @@ fn deflate_once<'a, A: Allocator<'a>>(
     // borrow checker admits all three at once -- which is the whole reason the buffers live in
     // separate fields rather than behind one accessor.
     let (ret, new_next_in, new_avail_in, new_next_out, new_avail_out, scalars) = {
+        let GzState {
+            buffer_slot, strm, ..
+        } = state;
+        let (staged_in, staged_out) = split_buffers(buffer_slot);
         let in_base: &[u8] = match source {
             Some(buffer) => buffer,
-            None => state.input.as_ref().map_or(&[][..], Buffer::as_slice),
+            None => staged_in.map_or(&[][..], |buffer| buffer.as_slice()),
         };
         let Some(input) = in_base.get(..in_end) else {
             return ReturnCode::STREAM_ERROR;
         };
-        let Some(output) = state
-            .output
-            .as_mut()
+        let Some(output) = staged_out
             .map(Buffer::as_mut_slice)
             .and_then(|slice| slice.get_mut(..out_end))
         else {
             return ReturnCode::STREAM_ERROR;
         };
-        let GzEngine::Deflate(engine) = &mut state.strm.engine else {
+        let GzEngine::Deflate(engine) = &mut strm.engine else {
             return ReturnCode::STREAM_ERROR;
         };
         let Some(compressor) = engine.get_mut() else {
@@ -980,11 +991,7 @@ pub(crate) fn gz_write<'a, A: Allocator<'a> + Copy>(
             // L217: `memcpy(state->in + have, buf, copy)`, bounds checked at both ends.
             let copied = {
                 let source = buf.get(taken..source_end);
-                let target = state
-                    .input
-                    .as_mut()
-                    .map(Buffer::as_mut_slice)
-                    .and_then(|slice| slice.get_mut(have..target_end));
+                let target = state.in_slice_mut().get_mut(have..target_end);
                 match (source, target) {
                     (Some(source), Some(target)) => {
                         target.copy_from_slice(source);
@@ -1116,10 +1123,9 @@ pub(crate) fn gz_vacate<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>)
     let start = state.strm.next_in;
     let count = to_index(state.strm.avail_in);
     let end = start.saturating_add(count);
-    if let Some(buffer) = state.input.as_mut().map(Buffer::as_mut_slice) {
-        if end <= buffer.len() {
-            buffer.copy_within(start..end, 0);
-        }
+    let buffer = state.in_slice_mut();
+    if end <= buffer.len() {
+        buffer.copy_within(start..end, 0);
     }
     state.strm.next_in = 0;
 
@@ -1154,10 +1160,12 @@ fn enter_write<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> bool {
     if state.resync_from_exposed().is_err() {
         return false;
     }
-    if state.mode() != GZ_WRITE {
-        return false;
-    }
-    if state.err() != ReturnCode::OK.as_i32() && !state.again() {
+    // The two remaining tests -- `state->mode != GZ_WRITE || state->err != Z_OK` -- live in
+    // `GzState::accepts_writes` rather than here, because the C ABI facade has to ask the
+    // same question one step earlier: C measures `gzputs`'s string only after them, so a
+    // facade that scanned the string first would read a pointer C never touches. One
+    // definition, two callers, no drift.
+    if !state.accepts_writes() {
         return false;
     }
     gz_error(state, ReturnCode::OK, None);
@@ -1290,11 +1298,7 @@ pub fn gzputc<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, c: i32) -
             .next_in
             .saturating_add(to_index(state.strm.avail_in));
         if have < to_index(state.size()) {
-            let stored = state
-                .input
-                .as_mut()
-                .map(Buffer::as_mut_slice)
-                .and_then(|slice| slice.get_mut(have));
+            let stored = state.in_slice_mut().get_mut(have);
             if let Some(slot) = stored {
                 *slot = byte;
                 state.strm.avail_in = state.strm.avail_in.saturating_add(1);
@@ -1462,8 +1466,8 @@ pub fn gzclose_w<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>) -> i32
     if state.size() != 0 {
         if state.direct() == 0 {
             if let GzEngine::Deflate(engine) = state.take_engine() {
-                if let Some(compressor) = engine.into_inner() {
-                    let _ = deflate_end(compressor);
+                if let Some(mut compressor) = engine.into_inner() {
+                    let _ = deflate_end(&mut compressor);
                 }
             }
         }
@@ -1472,7 +1476,7 @@ pub fn gzclose_w<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>) -> i32
 
     gz_error(state, ReturnCode::OK, None);
 
-    state.path = Vec::new();
+    state.clear_path();
 
     // L696-L697. `GzFileSlot::close` reports the handle's own result, so a facade handle backed
     // by a real `close(2)` answers `Z_ERRNO` exactly when C does.

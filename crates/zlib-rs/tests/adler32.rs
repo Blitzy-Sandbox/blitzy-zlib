@@ -623,8 +623,8 @@ fn clone_of<T: Clone>(value: &T) -> T {
 // raw pointers, no uninitialised memory -- so its useful yield is confined to arithmetic
 // overflow and out-of-bounds indexing, both of which the cheap cases reach. The two constants
 // below narrow the widest sweeps under `cfg(miri)` so that a checksum-agreement check does not
-// dominate a shared Miri job -- unnarrowed, this one test binary took just over ten minutes, and
-// there are a dozen suites planned. Nothing is narrowed under a normal `cargo test`, and no
+// dominate a Miri run shared with every other suite in the crate. Nothing is narrowed under a
+// normal `cargo test`, and no
 // structural coverage is lost either way: every path boundary is still crossed from both sides
 // under Miri as well, because each narrowed list keeps the entries that straddle a boundary and
 // drops only the ones that re-cross a boundary already covered.
@@ -1078,7 +1078,8 @@ fn every_single_byte_takes_the_c_fast_path() {
 
 /// The reduction schedule of all three paths must match `adler32.c` exactly.
 ///
-/// This is the test AAP §0.7.1(c) exists for. Every row of `ORACLE_ZERO_RUNS` is a run of
+/// This is the test that pins behavioural fidelity to the reference. Every row of
+/// `ORACLE_ZERO_RUNS` is a run of
 /// zero bytes fed from `0xffff_fff0`, so `s1` is pinned at `65_520` throughout and the table
 /// isolates `s2`. The discontinuities are the point: row 0 reduces with a modulo, row 1
 /// reduces with a *single* conditional subtraction and lands on `0xfffe` where a modulo would
@@ -1637,8 +1638,8 @@ fn the_length_is_reduced_modulo_base_at_full_width() {
 // ---------------------------------------------------------------------------------------
 // 3.6 -- output neutrality of the `simd` backend
 //
-// THE RULING THIS SECTION ENFORCES. The port's plan (AAP §0.8.2, ambiguity 9) permits
-// vectorisation for the two checksum modules and prohibits it everywhere else, and the
+// THE RULE THIS SECTION ENFORCES. Vectorisation is permitted for the two checksum modules and
+// prohibited everywhere else, and the
 // permission rests on one argument: a checksum collapses to a single scalar however it is
 // computed, so a vector arrangement can change how long the computation takes and nothing
 // else. Vectorised match finding is prohibited under the same argument read the other way --
@@ -1851,8 +1852,8 @@ fn both_backends_match_c_on_every_corpus_class() {
 // ---------------------------------------------------------------------------------------
 // 3.7 -- the shape of the backend trait
 //
-// AAP §0.3.3.5 makes the swappable-backend trait the mechanism that guarantees a vectorised
-// checksum is interchangeable with a scalar one. A trait only guarantees that if it is genuinely
+// The swappable-backend trait is the mechanism that guarantees a vectorised checksum is
+// interchangeable with a scalar one. A trait only guarantees that if it is genuinely
 // the interface -- if a caller can be written once, generically, and instantiated with either
 // backend. `via` is that caller, and these tests are what make the guarantee real rather than
 // asserted.
@@ -1949,5 +1950,72 @@ fn both_backends_are_substitutable_through_the_trait() {
                 "the two trait instantiations disagree at start {start:#010x}, len {len}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// 3.7 -- the dispatcher's entry decisions, at the exact lengths the review named
+//
+// These run in EVERY build, with and without the `simd` feature, which is the point: the
+// dispatcher tests the input's length before it asks the machine anything, so the value it
+// returns must not depend on which of those two questions was asked first, nor on whether the
+// second is asked at all. A `#[cfg(feature = "simd")]` gate here would leave the default build
+// -- the one almost every consumer gets -- asserting nothing about the reordering.
+// ---------------------------------------------------------------------------------------
+
+/// Six lengths that straddle every entry decision, plus the incremental case, through the
+/// dispatcher.
+///
+/// The lengths are the ones a review of this dispatch asked for -- 0, 1, 16, 63, 64, 65 -- and each
+/// is a boundary rather than a sample: 0 is the empty update, 1 is C's single-byte fast path
+/// (`adler32.c` L70), 16 is the sub-chunk width, 63 and 64 straddle the lane threshold below which
+/// the vectorised backend hands the input straight back, and 65 is the first length past it.
+///
+/// The dispatcher now tests the length before consulting target-feature detection, so 0 through 63
+/// reach the scalar backend without a detection call at all. That reordering is a throughput change
+/// and must be a value-preserving one, which is what this asserts: every length, against the
+/// independent reference, from every canonical starting value.
+///
+/// The one-byte incremental sweep is the case the reordering exists for. A caller feeding a stream a
+/// byte at a time makes one dispatch per byte -- `deflate` updates the checksum once per `read_buf`
+/// (`deflate.c` L229), so the frequency is the caller's chunk size, not the library's -- and it must
+/// arrive at exactly the value a single call over the whole buffer produces.
+#[test]
+fn the_dispatcher_is_value_preserving_at_every_entry_decision() {
+    let buf = corpus();
+
+    for &start in &CANONICAL_STARTS {
+        for len in [0_usize, 1, 16, 63, 64, 65] {
+            let chunk = prefix(&buf, len);
+            let expected = reference_adler32(start, chunk);
+            assert_eq!(
+                adler32_z(start, chunk),
+                expected,
+                "adler32_z differs from the reference at start {start:#010x}, len {len}"
+            );
+            assert_eq!(
+                adler32(start, chunk),
+                expected,
+                "adler32 differs from the reference at start {start:#010x}, len {len}"
+            );
+        }
+
+        // One byte at a time, across the lane threshold: 65 dispatches where a single call makes
+        // one. Each of those 65 is below the threshold, so none of them consults detection.
+        let whole = prefix(&buf, 65);
+        let mut running = start;
+        for &byte in whole {
+            running = adler32_z(running, &[byte]);
+        }
+        assert_eq!(
+            running,
+            adler32_z(start, whole),
+            "one byte at a time must equal one call at start {start:#010x}"
+        );
+        assert_eq!(
+            running,
+            reference_adler32(start, whole),
+            "and both must equal the reference at start {start:#010x}"
+        );
     }
 }

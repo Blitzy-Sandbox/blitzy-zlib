@@ -9,12 +9,18 @@
 //! It is a wrong *address*, computed inside caller object code this port cannot
 //! recompile, and it corrupts whatever happens to live there.
 //!
-//! `zlib.h` and `zconf.h` are immutable, and AAP §0.7.1 (b) names four
-//! mechanisms that enforce that mechanically rather than by review: these
-//! compile-time assertions, the cbindgen header diff, the `nm` symbol-parity
-//! diff against the 111-symbol reference surface, and the `c-std.yml` sweep
-//! proving the unchanged header still compiles from C89 through gnu2x. This
-//! module is the first of the four.
+//! `zlib.h` and `zconf.h` are immutable, and four mechanisms are meant to enforce
+//! that mechanically rather than by review: these compile-time assertions, a
+//! cbindgen header comparison, an `nm` symbol-parity diff against the 111-symbol
+//! reference surface, and the `c-std.yml` sweep proving the unchanged header still
+//! compiles from C89 through gnu2x. Two of the four run on their own: this module,
+//! because declaring it is what evaluates its `const` items, and `c-std.yml`,
+//! because it is an in-tree workflow. The other two do not. `cbindgen` generates a
+//! header but the normalised comparison `cbindgen.toml` specifies is not
+//! implemented anywhere, and the `nm` diff exists only as `Makefile.in`'s
+//! `rust-symbols` target, which nothing invokes automatically. So this module is
+//! the one mechanism a build cannot skip -- which is also why its coverage has to
+//! be exhaustive rather than representative.
 //!
 //! # ★ The two-tier scheme, and why the implications may not be "simplified"
 //!
@@ -25,11 +31,12 @@
 //! bug wearing the costume of a safety check: correct on the target it was
 //! measured on, and a hard build failure on a target where the layout is right.
 //!
-//! Every assertion below therefore belongs to exactly one of two tiers.
+//! Every assertion below therefore belongs to exactly one of three tiers.
 //!
 //! | Tier | Form | Checks on | Catches |
 //! |---|---|---|---|
-//! | **Absolute** | `!IS_LP64 \|\| <exact number>` | LP64 only | any drift at all |
+//! | **Absolute, LP64** | `!IS_LP64 \|\| <exact number>` | LP64 only | any drift at all |
+//! | **Absolute, LLP64** | `!IS_LLP64 \|\| <exact number>` | LLP64 only | any drift at all |
 //! | **Relational** | `<offset/size relationship>` | every target | reordered, inserted, removed or widened fields |
 //!
 //! The absolutes are written as implications — read `!IS_LP64 || X` as
@@ -40,19 +47,29 @@
 //! approximation and it is wrong precisely on LLP64, which is the case that
 //! matters.
 //!
-//! **Do not delete the `!IS_LP64 ||` guards to "tidy" the file**, and do not
-//! promote a relational assertion to an absolute one. The relational tier is
-//! deliberately self-sufficient rather than decorative: verified by
-//! cross-checking the crate against three real integer models rather than by
-//! assumption —
+//! **Both 64-bit models get exact numbers, and that is deliberate.** Gating the
+//! exact tier on LP64 alone would leave `x86_64` Windows — the other 64-bit target
+//! this contract has to hold on — checked only relationally, and a relational
+//! chain cannot see a narrowing re-type whose bytes padding absorbs (see "the one
+//! thing the relational tier cannot see", below). So `IS_LLP64` carries a second
+//! absolute tier: `z_stream` at 88 bytes, `gz_header` at 72, `struct gzFile_s`
+//! unchanged at 24. `IS_LLP64`'s own documentation states where those numbers come
+//! from and how they were confirmed. The two gates are mutually exclusive, so at
+//! most one absolute tier is ever live.
 //!
-//! | Target | Model | `IS_LP64` | Result |
+//! **Do not delete the `!IS_LP64 ||` or `!IS_LLP64 ||` guards to "tidy" the
+//! file**, and do not promote a relational assertion to an absolute one. The
+//! relational tier is deliberately self-sufficient rather than decorative on the
+//! targets neither absolute tier covers: verified by cross-checking the crate
+//! against three real integer models rather than by assumption —
+//!
+//! | Target | Model | Gate | Result |
 //! |---|---|---|---|
-//! | `x86_64-unknown-linux-gnu` | LP64 | true | both tiers check; clean |
-//! | `i686-unknown-linux-gnu` | ILP32 | false | relational tier only; clean |
-//! | `x86_64-pc-windows-gnu` | LLP64 | false | relational tier only; clean |
+//! | `x86_64-unknown-linux-gnu` | LP64 | `IS_LP64` | LP64 absolutes + relational; clean |
+//! | `x86_64-pc-windows-gnu` | LLP64 | `IS_LLP64` | LLP64 absolutes + relational; clean |
+//! | `i686-unknown-linux-gnu` | ILP32 | neither | relational tier only; clean |
 //!
-//! and, with the gate false, reordering two `z_stream` fields or widening one
+//! and, with both gates false, reordering two `z_stream` fields or widening one
 //! still fails the build, because both move a later offset.
 //!
 //! ## ★ The one thing the relational tier cannot see
@@ -66,9 +83,10 @@
 //!
 //! * On the measured target the absolute tier catches it immediately and loudly
 //!   — that exact `u8` substitution fires **14** of the assertions below.
-//! * On *any* target the cbindgen header diff catches it, because the generated
-//!   declaration would read `uint8_t total_in;` where `zlib.h` says
-//!   `uLong total_in;`.
+//! * On *any* target a cbindgen header comparison would catch it, because the
+//!   generated declaration reads `uint8_t total_in;` where `zlib.h` says
+//!   `uLong total_in;`. Generating and reading that header is a manual step today,
+//!   so this second net only catches the case when somebody runs it.
 //!
 //! # ★ MSRV: every `offset_of!` is exactly one field deep
 //!
@@ -130,9 +148,9 @@
 //! these items produce no code, and this is the module a reviewer is directed
 //! to when the question is "what pins the ABI?".
 //!
-//! # Conformance to the quality bar
+//! # Three properties of this file worth stating
 //!
-//! * **(a) Unsafe containment.** No `unsafe` block, no `unsafe fn` and no
+//! * **No `unsafe`.** No `unsafe` block, no `unsafe fn` and no
 //!   unsafe operation anywhere in this file, and none is needed: `size_of`,
 //!   `align_of` and `offset_of!` are all safe in const context. This crate is
 //!   the only one in the workspace permitted `unsafe` at all, and this module
@@ -145,13 +163,13 @@
 //!   and it is written that way on purpose, so that the assertion names exactly
 //!   the type sitting inside [`crate::types::alloc_func`] rather than a
 //!   look-alike.
-//! * **(f) No panics.** A failing `const _: () = assert!(…)` is a *compile*
+//! * **No panics.** A failing `const _: () = assert!(…)` is a *compile*
 //!   error — the const evaluator refuses to produce a value — so nothing here
 //!   can panic at run time. There is deliberately no `assert_eq!`, no
 //!   `debug_assert!` and no test-time check in this file; a runtime assertion
 //!   would let a broken library ship and fail in the field instead of on the
 //!   build machine.
-//! * **(i) Dependency minimalism.** `core` and [`crate::types`], plus two
+//! * **No added dependency.** `core` and [`crate::types`], plus two
 //!   items from [`zlib_rs`] — the first-party safe core that is already this
 //!   crate's sole dependency, so neither import adds one. Both exist to
 //!   discharge an agreement the core's own documentation delegates here: see §3
@@ -218,6 +236,51 @@ use zlib_rs::gz::state::ZOff64;
 #[allow(dead_code)]
 const IS_LP64: bool = size_of::<*const c_void>() == 8 && size_of::<c_ulong>() == 8;
 
+/// True when the target uses the *other* 64-bit integer model: LLP64 — 64-bit
+/// pointers with a **32-bit** `unsigned long`, which is `x86_64` Windows.
+///
+/// This gate exists because gating the exact numbers on LP64 alone left the
+/// second-most-important target in the world checked only relationally, and a
+/// relational tier cannot see a narrowing re-type that padding absorbs (the
+/// module documentation's "one thing the relational tier cannot see"). So the
+/// LLP64 numbers are pinned exactly too, in their own tier beside each LP64 one.
+///
+/// The two gates are mutually exclusive by construction — `c_ulong` cannot be
+/// both 4 and 8 bytes — so at most one absolute tier is ever live, and on ILP32
+/// neither is.
+///
+/// # Where the LLP64 numbers come from
+///
+/// They are *derived*, not measured on hardware, and derived is enough because
+/// `#[repr(C)]` placement is a function of nothing but field width and field
+/// alignment: each field goes at the next offset that satisfies its own
+/// alignment, and the struct is padded up to a multiple of its alignment. Feeding
+/// the `zlib.h` declarations through that rule with `unsigned long` at 4 bytes and
+/// pointers at 8 gives, for `z_stream`, size 88 and offsets
+/// 0, 8, 12, 16, 24, 28, 32, 40, 48, 56, 64, 72, 76, 80; for `gz_header`, size 72
+/// and offsets 0, 4, 8, 12, 16, 24, 28, 32, 40, 48, 56, 60, 64; and for
+/// `struct gzFile_s`, size 24 and offsets 0, 8, 16 — unchanged from LP64, because
+/// that struct contains no `unsigned long`.
+///
+/// Those numbers were confirmed by re-declaring all three structs on this LP64
+/// host with `unsigned long` substituted by `u32` and reading `size_of` and
+/// `offset_of!` back, which reproduces the LLP64 model exactly for layout
+/// purposes. If a real Windows build ever disagrees with one of them, the build
+/// fails here — which is the entire point, and is strictly better than the
+/// silence a gated-away assertion gives.
+///
+/// The same spelling is used by `crates/zlib-rs-differential/src/oracle.rs`.
+//
+// ★ `#[allow(dead_code)]` for the same measured reason as `IS_LP64` above: rustc
+// 1.80's dead-code pass does not traverse `const _: () = …` bodies, so without it
+// the declared MSRV fails under `-D warnings`.
+#[allow(dead_code)]
+const IS_LLP64: bool = size_of::<*const c_void>() == 8 && size_of::<c_ulong>() == 4;
+
+// The two models cannot both hold, and this is asserted rather than asserted-by-
+// comment so that a future third gate cannot be written in a way that overlaps.
+const _: () = assert!(!(IS_LP64 && IS_LLP64));
+
 // =============================================================================
 //  §1  `z_stream` — `zlib.h` L90-L110.  Measured: 112 bytes, align 8
 // =============================================================================
@@ -266,6 +329,40 @@ const _: () = assert!(!IS_LP64 || offset_of!(z_stream, opaque) == 80);
 const _: () = assert!(!IS_LP64 || offset_of!(z_stream, data_type) == 88);
 const _: () = assert!(!IS_LP64 || offset_of!(z_stream, adler) == 96);
 const _: () = assert!(!IS_LP64 || offset_of!(z_stream, reserved) == 104);
+
+// ---- Tier 1b: the derived LLP64 contract -----------------------------------
+//
+//  x86_64 Windows: 64-bit pointers, 32-bit `unsigned long`.  `avail_in` and
+//  `total_in` now pack into the 8 bytes that LP64 spends on `avail_in` alone, and
+//  the same happens again at `avail_out`/`total_out` and at
+//  `data_type`/`adler`/`reserved` — which is why the struct is 88 bytes rather
+//  than 112 and why `next_out` lands at 16 instead of 24.  See `IS_LLP64` for how
+//  these were derived and confirmed.
+
+const _: () = assert!(!IS_LLP64 || size_of::<z_stream>() == 88);
+const _: () = assert!(!IS_LLP64 || align_of::<z_stream>() == 8);
+
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, next_in) == 0);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, avail_in) == 8);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, total_in) == 12);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, next_out) == 16);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, avail_out) == 24);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, total_out) == 28);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, msg) == 32);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, state) == 40);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, zalloc) == 48);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, zfree) == 56);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, opaque) == 64);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, data_type) == 72);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, adler) == 76);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, reserved) == 80);
+
+// `reserved` ends at 84 and the struct is 88: four bytes of tail padding, for the
+// same reason `gz_header` has four on LP64 — an 8-aligned struct rounds up.
+const _: () = assert!(
+    !IS_LLP64
+        || size_of::<z_stream>() - (offset_of!(z_stream, reserved) + size_of::<c_ulong>()) == 4
+);
 
 // ---- Tier 2: the general case, on every target ------------------------------
 //
@@ -408,6 +505,37 @@ const _: () = assert!(
     !IS_LP64 || size_of::<gz_header>() - (offset_of!(gz_header, done) + size_of::<c_int>()) == 4
 );
 
+// ---- Tier 1b: the derived LLP64 contract -----------------------------------
+//
+//  The only `unsigned long` in this struct is `time`, so on LLP64 it shrinks to
+//  four bytes and sits at offset 4 immediately after `text` with no padding
+//  between them — where LP64 pads `text` out to 8.  Everything up to `extra`
+//  therefore moves down by 8, and `comment` still needs its 8-byte alignment, so
+//  the struct settles at 72 bytes.  See `IS_LLP64`.
+
+const _: () = assert!(!IS_LLP64 || size_of::<gz_header>() == 72);
+const _: () = assert!(!IS_LLP64 || align_of::<gz_header>() == 8);
+
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, text) == 0);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, time) == 4);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, xflags) == 8);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, os) == 12);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, extra) == 16);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, extra_len) == 24);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, extra_max) == 28);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, name) == 32);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, name_max) == 40);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, comment) == 48);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, comm_max) == 56);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, hcrc) == 60);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, done) == 64);
+
+// `done` ends at 68; the struct is 72.  The same four bytes of tail padding as on
+// LP64, arrived at from different field widths.
+const _: () = assert!(
+    !IS_LLP64 || size_of::<gz_header>() - (offset_of!(gz_header, done) + size_of::<c_int>()) == 4
+);
+
 // ---- Tier 2: the general case, on every target ------------------------------
 
 const _: () = assert!(offset_of!(gz_header, text) == 0);
@@ -514,6 +642,24 @@ const _: () = assert!(!IS_LP64 || align_of::<gzFile_s>() == 8);
 const _: () = assert!(!IS_LP64 || offset_of!(gzFile_s, have) == 0);
 const _: () = assert!(!IS_LP64 || offset_of!(gzFile_s, next) == 8);
 const _: () = assert!(!IS_LP64 || offset_of!(gzFile_s, pos) == 16);
+
+// ---- Tier 1b: the derived LLP64 contract -----------------------------------
+//
+//  IDENTICAL to LP64, and that is the finding rather than a copy-paste: this
+//  struct contains no `unsigned long`.  `have` is `unsigned`, `next` is a pointer
+//  and `pos` is `z_off64_t`, which is 64 bits on every target by construction (see
+//  §5), so the only model-dependent quantity is the pointer width — the same 8
+//  bytes on both 64-bit models.  Asserting it anyway is what makes the sameness
+//  checked: the `gzgetc` macro at `zlib.h` L1966-L1968 dereferences all three
+//  fields inside CALLER-compiled code, so a Windows-only shift here would corrupt
+//  memory in every program that uses the macro, with nothing in this library able
+//  to notice.
+
+const _: () = assert!(!IS_LLP64 || size_of::<gzFile_s>() == 24);
+const _: () = assert!(!IS_LLP64 || align_of::<gzFile_s>() == 8);
+const _: () = assert!(!IS_LLP64 || offset_of!(gzFile_s, have) == 0);
+const _: () = assert!(!IS_LLP64 || offset_of!(gzFile_s, next) == 8);
+const _: () = assert!(!IS_LLP64 || offset_of!(gzFile_s, pos) == 16);
 
 // ---- Tier 2: the general case, on every target ------------------------------
 //
@@ -866,8 +1012,9 @@ const _: () = assert!(
 //
 //  A Rust `InflateState` of 7032 bytes or fewer lets both of the copy's
 //  allocations through, `inflateCopy` returns `Z_OK`, and this assertion in an
-//  unmodified C test fails.  The upper bound is AAP §0.8.4's 115% per-stream
-//  memory gate: 8234 bytes.  So the state must land in `(7032, 8234]`.
+//  unmodified C test fails.  The upper bound is the port's per-stream memory
+//  budget, 115% of the C state: 8234 bytes.  So the state must land in
+//  `(7032, 8234]`.
 //
 //  This file cannot assert that: naming `zlib_rs::inflate::InflateState` here
 //  would pin a *core* invariant from the *facade*, in a module whose job is the C

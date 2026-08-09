@@ -159,9 +159,9 @@ static const char dictionary[] = "hello";
   `deflateSetDictionary` and at L477 for `inflateSetDictionary`. `dictionary.bin` must
   therefore be 6 bytes and must end in `0x00`.
 
-**This is the single most likely error in this folder.** It matters because the dictionary
-identifier a decompressor is asked to match is the Adler-32 checksum of the dictionary
-bytes, and the two candidate lengths produce different checksums:
+The length matters because the dictionary identifier a decompressor is asked to match is the
+Adler-32 checksum of the dictionary bytes, and the two candidate lengths produce different
+checksums:
 
 | Dictionary bytes | Length | Adler-32 | Correct? |
 | --- | --- | --- | --- |
@@ -173,8 +173,11 @@ L429 into the `dictId` variable declared at L41 (`static uLong dictId;`, comment
 the Adler-32 value of the dictionary) and asserts it at L472 when `inflate` reports that a
 dictionary is needed. Reproduce it with:
 
+Run this from the repository root, so the path does not depend on the current directory:
+
 ```sh
-python3 -c "import zlib; print('0x%08x' % zlib.adler32(open('minimal/dictionary.bin','rb').read()))"
+python3 -c "import zlib, sys; print('0x%08x' % zlib.adler32(open(sys.argv[1],'rb').read()))" \
+  crates/zlib-rs-differential/corpus/minimal/dictionary.bin
 # expected: 0x08410215
 ```
 
@@ -492,10 +495,10 @@ Adding a fixture is a contract change. Do all five steps in one commit.
    needed.
 4. **Update every consumer.** The tests are to name fixtures individually, so a new file
    will be read by nobody until it is added to `tests/byte_identical.rs` and, where
-   round-tripping is relevant, `tests/roundtrip_interop.rs`. Neither file exists yet, so at
-   this checkpoint step 4 is the step that will become actionable once they land — do not
-   treat a fixture as covered before then. `tests/table_equality.rs` is never a consumer; it
-   reads no fixtures at all.
+   round-tripping is relevant, `tests/roundtrip_interop.rs`. Neither file exists, so this
+   step has nothing to act on and no fixture in this folder should be treated as covered by
+   a differential test. `tests/table_equality.rs` is never a consumer; it reads no fixtures
+   at all.
 5. **Account for the cost.** Every fixture is multiplied by the whole differential matrix,
    which per AAP §0.6.4.4 spans compression levels 0-9, `windowBits` for all three container
    formats (raw, zlib and gzip), `memLevel` 1-9, five strategies, six flush modes, and both

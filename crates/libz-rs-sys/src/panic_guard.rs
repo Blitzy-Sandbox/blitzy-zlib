@@ -10,8 +10,10 @@
 //! anyone's data.
 //!
 //! The policy is recorded in this one file so that it can be audited by reading a
-//! single module rather than each of the ninety-five exported functions the crate is
-//! specified to reach -- none of which has landed at this checkpoint.
+//! single module rather than every exported function that routes through it. All of
+//! the exports have now landed, so that saving is real rather than prospective:
+//! ninety-one call sites across the seven export modules reach [`guard`] or
+//! [`guard_code`], and none of them restates the policy.
 //!
 //! # Two helpers, two different contracts
 //!
@@ -46,9 +48,10 @@
 //! `extern "C-unwind"` is the opposite choice: it deliberately *permits* the unwind
 //! to propagate into the caller, which is only sound when the caller is known to
 //! understand unwinding. It has been stable since Rust 1.71 and it is
-//! **categorically forbidden in this crate**. Every one of the ninety-five exports is
-//! to be declared `extern "C"`; that is a rule for the export modules as they land,
-//! not a description of code already present here.
+//! **categorically forbidden in this crate**. Every export in the seven export
+//! modules is declared `extern "C"`, and no occurrence of `extern "C-unwind"`
+//! exists anywhere in the workspace; a `grep` for it is the check, because no lint
+//! can express the rule.
 //!
 //! Ordinary, expected failures are a different matter entirely and are **not**
 //! panics: they are reported as a [`ReturnCode`] by the safe core and converted
@@ -143,23 +146,26 @@
 //! so.
 //!
 //! The exported surface of the built library is *intended* to be exactly the
-//! ninety-five functions of the C API. That target is measured, not assumed: the
-//! reference C shared library publishes 111 dynamic globals -- those ninety-five
-//! type-`T` function symbols plus sixteen type-`A` symbol-version nodes -- under the
-//! soname `libz.so.1`.
+//! ninety-five functions of the C API. The reference C shared library publishes 111
+//! dynamic globals -- those ninety-five type-`T` function symbols plus sixteen
+//! type-`A` symbol-version nodes -- under the soname `libz.so.1`, which is what the
+//! Rust artifact has to reproduce.
 //!
 //! That baseline is enforced today by `Makefile.in`'s `rust-test` target, which
 //! diffs `nm -D --defined-only --extern-only` over the built library against the
 //! reference library's symbols, checks the sixteen version nodes, checks that every
 //! name in `zlib.map`'s `local:` block stayed hidden, and confirms with `ldd` that
 //! the relinked C drivers bind the Rust artifact. One stray exported symbol from
-//! this module would fail that diff. The planned
+//! this module would fail that diff, and none does: measured on the staged library,
+//! ninety-five exported functions -- every one of them declared in `zlib.h` -- and
+//! one hundred and eleven dynamic symbols in total, identical to the C
+//! `libz.so.1.3.2.1-motley`, with all ten `zlib.map` `local:` names hidden and
+//! nothing matching `_*` exported. The planned
 //! `crates/libz-rs-sys/tests/symbol_parity.rs` will assert the same property from
-//! inside `cargo test`; **at this checkpoint neither the exports nor that test
-//! exists**, so for the exports the statement above is the contract this module is
-//! written to satisfy rather than a property of a built artifact. The items below are
-//! ordinary Rust functions and constants, reached through the module path and inlined
-//! away.
+//! inside `cargo test` and **does not exist yet**, so that one gate still runs from
+//! `make` rather than from `cargo test`; the property itself is measured either way.
+//! The items below are ordinary Rust functions and constants, reached through the
+//! module path and inlined away.
 //!
 //! # Feature configuration
 //!
@@ -247,6 +253,7 @@ use zlib_rs::error::ReturnCode;
 /// to abort. It names the library, the boundary and the disposition, because the panic
 /// runtime's own message says only that a thread panicked.
 #[cfg(feature = "gz")]
+/// cbindgen:ignore
 const ABORT_NOTE: &str = "libz-rs-sys: a Rust panic reached the C ABI boundary; \
                           aborting rather than unwinding into a non-Rust caller: ";
 
@@ -256,6 +263,7 @@ const ABORT_NOTE: &str = "libz-rs-sys: a Rust panic reached the C ABI boundary; 
 /// value the library never produces itself is still reported rather than
 /// silently dropped.
 #[cfg(feature = "gz")]
+/// cbindgen:ignore
 const OPAQUE_PAYLOAD: &str = "<panic payload was not a string>";
 
 /// The type each guard's panic arm coerces the caught payload to before handing it to
@@ -267,6 +275,7 @@ const OPAQUE_PAYLOAD: &str = "<panic payload was not a string>";
 /// therefore writes `let payload: &Payload = &*payload;` with this alias spelled
 /// out.
 #[cfg(feature = "gz")]
+/// cbindgen:ignore
 type Payload = dyn core::any::Any + Send;
 
 /// Writes `note`, then the panic payload, to standard error.
@@ -353,7 +362,7 @@ fn describe(payload: &Payload) -> &str {
 /// so the guard is legitimately used where `T` is `()`, and discarding the result is
 /// only ever correct because it *is* the body's own result.
 #[inline]
-pub fn guard<T, F>(body: F) -> T
+pub(crate) fn guard<T, F>(body: F) -> T
 where
     F: FnOnce() -> T,
 {
@@ -405,7 +414,7 @@ where
 /// ```
 #[inline]
 #[must_use]
-pub fn guard_code<F>(body: F) -> c_int
+pub(crate) fn guard_code<F>(body: F) -> c_int
 where
     F: FnOnce() -> ReturnCode,
 {
@@ -426,8 +435,28 @@ where
 /// directly. None of them is ever produced by a panic -- [`guard`] aborts instead,
 /// and there is deliberately no guard that hands one of these back in place of an
 /// unwind, because a caller cannot tell such a value apart from a genuine refusal.
-pub mod fallback {
-    use core::ffi::{c_char, c_int, c_ulong, CStr};
+///
+/// # Why the whole table is `#[allow(dead_code)]`
+///
+/// Completeness is the point of a lookup table: one entry per documented failure
+/// value, cited to `zlib.h`, so that a call site never invents a literal. Six of
+/// them -- `MEM_ERROR`, `MEM_ERROR_CODE`, `BOUND_Z`, `CRC32_COMBINE_INVALID`,
+/// `ADLER32_COMBINE_INVALID` and `GZ_TRUE` -- have no call site at present, because
+/// the entry points they document either reach their failure through
+/// [`guard_code`] and a [`ReturnCode`] the core already produced, or cannot fail at
+/// all. Deleting them would leave a table with gaps and would delete the `zlib.h`
+/// citation that makes the next call site's choice checkable, so the attribute is
+/// on the module rather than on six separate items. Nothing here is reachable from
+/// outside the crate either way: `panic_guard` is a private module and every item
+/// below is `pub(crate)`, so the table is spelled at exactly the visibility its one
+/// audience -- this crate's own export bodies -- needs.
+#[allow(dead_code)]
+pub(crate) mod fallback {
+    use core::ffi::{c_int, c_ulong};
+    // Only the four `gz` entries below name these two, and the `gzFile` layer they
+    // serve is compiled only with that feature on.
+    #[cfg(feature = "gz")]
+    use core::ffi::{c_char, CStr};
 
     use zlib_rs::error::ReturnCode;
 
@@ -436,14 +465,16 @@ pub mod fallback {
     /// point, and also of `gzsetparams`, `gzflush`, `gzclose`, `gzclose_r`,
     /// `gzclose_w` and `gzprintf`, which return "the zlib error number"
     /// (`zlib.h` L1650) or "a negative zlib error code" (L1556) rather than `-1`.
-    pub const STREAM_ERROR: c_int = ReturnCode::STREAM_ERROR.as_i32();
+    /// cbindgen:ignore
+    pub(crate) const STREAM_ERROR: c_int = ReturnCode::STREAM_ERROR.as_i32();
 
     /// `Z_MEM_ERROR` (`zlib.h` L187): an allocation failed. Used in place of
     /// [`STREAM_ERROR`] wherever the C implementation would have reached its own
     /// out-of-memory path, so that a caller inspecting the code -- `test/example.c`
     /// and `test/infcover.c` both do -- sees the same distinction the reference
     /// draws.
-    pub const MEM_ERROR: c_int = ReturnCode::MEM_ERROR.as_i32();
+    /// cbindgen:ignore
+    pub(crate) const MEM_ERROR: c_int = ReturnCode::MEM_ERROR.as_i32();
 
     /// [`STREAM_ERROR`] as a [`ReturnCode`], for bodies that yield a status
     /// rather than a raw `int`.
@@ -451,10 +482,12 @@ pub mod fallback {
     /// The same value at the type the safe core speaks, so that a body returning a
     /// [`ReturnCode`] and one returning a raw `int` through
     /// [`guard_code`](super::guard_code) cannot disagree about what the failure is.
-    pub const STREAM_ERROR_CODE: ReturnCode = ReturnCode::STREAM_ERROR;
+    /// cbindgen:ignore
+    pub(crate) const STREAM_ERROR_CODE: ReturnCode = ReturnCode::STREAM_ERROR;
 
     /// [`MEM_ERROR`] as a [`ReturnCode`].
-    pub const MEM_ERROR_CODE: ReturnCode = ReturnCode::MEM_ERROR;
+    /// cbindgen:ignore
+    pub(crate) const MEM_ERROR_CODE: ReturnCode = ReturnCode::MEM_ERROR;
 
     /// The bound `deflateBound` (`zlib.h` L768) and `compressBound` (L1307) report
     /// when it cannot be computed: the largest value the return type holds. Neither
@@ -462,11 +495,8 @@ pub mod fallback {
     /// they return, so the direction is not free -- too small is a heap overflow *in
     /// the caller's code*, too large only fails the caller's own allocation, which it
     /// must already handle.
-    pub const BOUND: c_ulong = c_ulong::MAX;
-
-    /// [`BOUND`] at the width of `z_size_t`, for `deflateBound_z` (`zlib.h` L769) and
-    /// `compressBound_z` (L1308).
-    pub const BOUND_Z: usize = usize::MAX;
+    /// cbindgen:ignore
+    pub(crate) const BOUND: c_ulong = c_ulong::MAX;
 
     /// `1`: what `adler32` and `adler32_z` return when given no data.
     /// `zlib.h` L1813-L1814 documents that a null buffer yields "the required initial
@@ -474,12 +504,14 @@ pub mod fallback {
     /// Adler-32 and impossible to mistake for a status code -- which matters, because
     /// the return type is `uLong` and a negative `int` through it is a plausible
     /// checksum.
-    pub const ADLER32_EMPTY: c_ulong = 1;
+    /// cbindgen:ignore
+    pub(crate) const ADLER32_EMPTY: c_ulong = 1;
 
     /// `0`: the CRC-32 counterpart of [`ADLER32_EMPTY`]; `zlib.h` L1852-L1853 gives
     /// the same rule, and the documented usage example seeds with
     /// `crc32(0L, Z_NULL, 0)`.
-    pub const CRC32_EMPTY: c_ulong = 0;
+    /// cbindgen:ignore
+    pub(crate) const CRC32_EMPTY: c_ulong = 0;
 
     /// The value the **CRC-32** combine family returns for an input it cannot
     /// use: 0.
@@ -494,7 +526,22 @@ pub mod fallback {
     /// `crc32_combine_gen64` and `crc32_combine_op`.
     ///
     /// Ported from `crc32_combine_gen64`, `crc32.c` L954-L956.
-    pub const CRC32_COMBINE_INVALID: c_ulong = 0;
+    //
+    // ★ `#[allow(dead_code)]` here and on `ADLER32_COMBINE_INVALID` is required at the
+    // declared MSRV and is not cosmetic. Both are used by the `const _: () = …` invariant
+    // block below, and **rustc 1.80's dead-code pass does not traverse those bodies** --
+    // verified, not assumed: `cargo +1.80 build -p libz-rs-sys --all-features` reports both
+    // as never used and 1.97.1 reports neither. It is the same quirk
+    // `crates/libz-rs-sys/src/layout_assertions.rs` documents for its `IS_LP64`. Since CI
+    // builds with `-D warnings`, the attribute is what keeps the MSRV build green.
+    //
+    // These two are also the only entries in this registry whose value the safe core
+    // produces rather than this crate, so no export body returns either one today; the
+    // invariant block and the tests at the foot of the file are their consumers. Scoped to
+    // the two items rather than to the module, so real dead code here is still reported.
+    #[allow(dead_code)]
+    /// cbindgen:ignore
+    pub(crate) const CRC32_COMBINE_INVALID: c_ulong = 0;
 
     /// The value the **Adler-32** combine family returns for a negative `len2`:
     /// `0xffff_ffff`.
@@ -530,7 +577,34 @@ pub mod fallback {
     /// it ever reaches the core -- cannot disagree with it.
     ///
     /// Ported from `adler32_combine_`, `adler32.c` L133-L140.
-    pub const ADLER32_COMBINE_INVALID: c_ulong = 0xffff_ffff;
+    // Invariant-block consumer only; see the note above `CRC32_COMBINE_INVALID`.
+    #[allow(dead_code)]
+    /// cbindgen:ignore
+    pub(crate) const ADLER32_COMBINE_INVALID: c_ulong = 0xffff_ffff;
+
+    // The three properties that make the pair above correct, pinned at compile time so
+    // that a future edit to either value is a build failure rather than a behavioural
+    // surprise in an error path no functional test reaches. The runtime tests at the foot
+    // of this file check the same properties against the C line references and against the
+    // safe core's own computation; these are the half that cannot be skipped.
+    //
+    // ★ The two entries are the only ones in this registry whose value the SAFE CORE
+    // produces rather than this crate -- `zlib_rs::adler32::adler32_combine` answers a
+    // negative length itself -- so no export body returns either of them today, and these
+    // assertions are what keep them from being dead weight as well as what pins them, and the
+    // `#[allow(dead_code)]` on each of the two is what covers the MSRV's inability to see a
+    // use that occurs only inside a `const _: () = …` body.
+    /// cbindgen:ignore
+    const _: () = {
+        // `adler32.c` L140 returns 0xffffffffUL and `crc32.c` L956 returns 0. Unifying the
+        // two would be wrong for whichever family lost its own value.
+        assert!(ADLER32_COMBINE_INVALID != CRC32_COMBINE_INVALID);
+        // The Adler sentinel must be unreachable as a genuine checksum: every half of a
+        // real Adler-32 is below BASE, so a half at or above it cannot be mistaken for
+        // one. Zero has no such property, which is why it may not stand in here.
+        assert!((ADLER32_COMBINE_INVALID & 0xffff) >= 65521);
+        assert!((ADLER32_COMBINE_INVALID >> 16) >= 65521);
+    };
 
     /// `-1`: the failure value of `gzread` (`zlib.h` L1486), `gzgetc` (L1615),
     /// `gzgetc_` (L1961), `gzungetc` (L1630), `gzputc` (L1610), `gzputs` (L1580),
@@ -538,27 +612,26 @@ pub mod fallback {
     /// `(int)gzseek(file, 0L, SEEK_SET)`. It is **not** the failure value of every
     /// `gz` function returning `int`: see [`GZ_NOTHING_WRITTEN`] and
     /// [`STREAM_ERROR`].
-    pub const GZ_ERROR: c_int = -1;
+    #[cfg(feature = "gz")]
+    /// cbindgen:ignore
+    pub(crate) const GZ_ERROR: c_int = -1;
 
     /// `0`: what `gzwrite` returns on error, a deliberate exception to [`GZ_ERROR`].
     /// `zlib.h` L1522-L1523 documents that it "returns the number of uncompressed
     /// bytes written, or 0 in case of error or if len is 0" -- the count is unsigned in
     /// spirit, so `-1` would tell a caller that a negative number of bytes was
     /// written.
-    pub const GZ_NOTHING_WRITTEN: c_int = 0;
+    #[cfg(feature = "gz")]
+    /// cbindgen:ignore
+    pub(crate) const GZ_NOTHING_WRITTEN: c_int = 0;
 
     /// `0`: the item count `gzfread` (`zlib.h` L1501) and `gzfwrite` (L1537) return on
     /// error. Both duplicate `fread`/`fwrite`, returning a `z_size_t` count of complete
     /// items, so zero is the only failure value the type admits; L1503 adds that
     /// `gzerror` must be consulted to distinguish it from end of file.
-    pub const GZ_NO_ITEMS: usize = 0;
-
-    /// `1`: the answer the `gz` predicates give when the truth is unknown. `gzeof`
-    /// (`zlib.h` L1711) and `gzdirect` (L1726) return a boolean and have no failure
-    /// value, so the choice is about behaviour: reporting end of file stops a read loop
-    /// rather than spinning it (L1721-L1722), and reporting direct copying is what
-    /// `gzdirect` already answers before four bytes have been seen (L1740).
-    pub const GZ_TRUE: c_int = 1;
+    #[cfg(feature = "gz")]
+    /// cbindgen:ignore
+    pub(crate) const GZ_NO_ITEMS: usize = 0;
 
     /// A valid, empty, NUL-terminated message for `gzerror` (`zlib.h` L1775).
     ///
@@ -569,7 +642,21 @@ pub mod fallback {
     /// with no message pending, so it is safe to print and already documented. Take the
     /// pointer with [`CStr::as_ptr`], which needs no `unsafe`, and the `'static`
     /// lifetime outlives any call.
-    pub const GZ_NO_MESSAGE: &CStr = c"";
+    /// cbindgen:ignore
+    #[cfg(feature = "gz")]
+    pub(crate) const GZ_NO_MESSAGE: &CStr = c"";
+
+    /// The literal `gzerror` returns for `Z_MEM_ERROR` (`gzlib.c` L522-L523).
+    ///
+    /// C answers an out-of-memory error with a static string rather than a stored
+    /// message, because `gz_error` deliberately declines to allocate one while reporting
+    /// that allocation failed (`gzlib.c` L571-L572). The two halves are a pair: without
+    /// this literal, the one condition a caller most needs explained would carry no text
+    /// at all. `zlib_rs::gz::gzerror` returns the same bytes for a Rust caller; this is
+    /// the NUL-terminated spelling a C caller can hand to `printf`.
+    #[cfg(feature = "gz")]
+    /// cbindgen:ignore
+    pub(crate) const GZ_OUT_OF_MEMORY: &CStr = c"out of memory";
 
     /// `Z_NULL` (`zlib.h` L216): the handle the `gzopen` family returns when it cannot
     /// open -- `gzopen` (L1357), `gzdopen` (L1404), `gzopen64` (L1978), `gzopen_w`
@@ -579,7 +666,8 @@ pub mod fallback {
     /// needs no `unsafe`; only dereferencing one would, and nothing here does.
     #[inline]
     #[must_use]
-    pub const fn null_handle<T>() -> *mut T {
+    #[cfg(feature = "gz")]
+    pub(crate) const fn null_handle<T>() -> *mut T {
         core::ptr::null_mut()
     }
 
@@ -590,7 +678,8 @@ pub mod fallback {
     /// rather than an opaque handle, so that a call site reads as the header does.
     #[inline]
     #[must_use]
-    pub const fn null_string() -> *mut c_char {
+    #[cfg(feature = "gz")]
+    pub(crate) const fn null_string() -> *mut c_char {
         null_handle()
     }
 
@@ -604,7 +693,8 @@ pub mod fallback {
     /// conversion from `i8` is exact on every one of them.
     #[inline]
     #[must_use]
-    pub fn offset_error<T: From<i8>>() -> T {
+    #[cfg(feature = "gz")]
+    pub(crate) fn offset_error<T: From<i8>>() -> T {
         T::from(-1)
     }
 }
@@ -673,12 +763,23 @@ mod tests {
         // the documented value from `fallback`, and the guard is not involved at
         // all. This is what replaces a recovering guard.
         assert_eq!(guard(|| fallback::STREAM_ERROR), fallback::STREAM_ERROR);
+        assert_eq!(
+            guard_code(|| ReturnCode::STREAM_ERROR),
+            fallback::STREAM_ERROR
+        );
+    }
+
+    /// The same shape for the `gz` family, whose refusal values exist only when the
+    /// `gzFile` layer is compiled.
+    #[cfg(feature = "gz")]
+    #[test]
+    fn a_gz_body_reports_its_own_refusal_value_the_same_way() {
         assert_eq!(guard(|| fallback::GZ_ERROR), fallback::GZ_ERROR);
         assert_eq!(
             guard(|| fallback::GZ_NOTHING_WRITTEN),
             fallback::GZ_NOTHING_WRITTEN
         );
-        assert_eq!(guard_code(|| ReturnCode::MEM_ERROR), fallback::MEM_ERROR);
+        assert_eq!(guard(|| fallback::GZ_NO_ITEMS), fallback::GZ_NO_ITEMS);
     }
 
     #[cfg(feature = "gz")]
@@ -713,25 +814,27 @@ mod tests {
             guard_code(|| ReturnCode::STREAM_ERROR),
             fallback::STREAM_ERROR
         );
-        assert_eq!(guard_code(|| ReturnCode::MEM_ERROR), fallback::MEM_ERROR);
+        assert_eq!(guard_code(|| ReturnCode::MEM_ERROR), -4);
     }
 
     #[test]
     fn the_int_returning_fallbacks_carry_the_documented_values() {
         assert_eq!(fallback::STREAM_ERROR, -2);
-        assert_eq!(fallback::MEM_ERROR, -4);
+    }
+
+    /// The `gz` family's documented values, gated with the layer that returns them.
+    #[cfg(feature = "gz")]
+    #[test]
+    fn the_gz_fallbacks_carry_the_documented_values() {
         assert_eq!(fallback::GZ_ERROR, -1);
         assert_eq!(fallback::GZ_NOTHING_WRITTEN, 0);
         assert_eq!(fallback::GZ_NO_ITEMS, 0);
-        assert_eq!(fallback::GZ_TRUE, 1);
     }
 
     #[test]
-    fn the_status_fallbacks_agree_with_their_int_forms() {
+    fn the_status_fallback_agrees_with_its_int_form() {
         assert_eq!(fallback::STREAM_ERROR_CODE.as_i32(), fallback::STREAM_ERROR);
-        assert_eq!(fallback::MEM_ERROR_CODE.as_i32(), fallback::MEM_ERROR);
         assert!(fallback::STREAM_ERROR_CODE.is_error());
-        assert!(fallback::MEM_ERROR_CODE.is_error());
     }
 
     #[test]
@@ -800,13 +903,12 @@ mod tests {
     #[test]
     fn the_bound_fallback_saturates_rather_than_truncating() {
         assert_eq!(fallback::BOUND, c_ulong::MAX);
-        assert_eq!(fallback::BOUND_Z, usize::MAX);
         // The dangerous direction is a bound that is too small: the caller sizes
         // its output buffer with it.
         assert_ne!(fallback::BOUND, 0);
-        assert_ne!(fallback::BOUND_Z, 0);
     }
 
+    #[cfg(feature = "gz")]
     #[test]
     fn the_pointer_fallbacks_are_null() {
         assert!(fallback::null_handle::<u8>().is_null());
@@ -814,6 +916,7 @@ mod tests {
         assert!(fallback::null_string().is_null());
     }
 
+    #[cfg(feature = "gz")]
     #[test]
     fn the_gzerror_fallback_is_a_printable_non_null_empty_string() {
         // Non-nullness needs no assertion: `CStr::as_ptr` cannot return null,
@@ -824,6 +927,7 @@ mod tests {
         assert_eq!(fallback::GZ_NO_MESSAGE.to_bytes_with_nul(), b"\0");
     }
 
+    #[cfg(feature = "gz")]
     #[test]
     fn the_offset_fallback_is_minus_one_at_every_signed_width() {
         assert_eq!(fallback::offset_error::<i32>(), -1);

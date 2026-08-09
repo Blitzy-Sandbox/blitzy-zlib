@@ -600,7 +600,6 @@ const fn exceeds_enough(code_type: CodeType, used: usize) -> bool {
 // `DEXT` hold no value above 193 (`inftrees.c` L74, L82); the symbol written as a
 // literal came from a `u16`; and the sub-table offset is explicitly range-checked
 // against `u16::MAX` before it is cast.
-#[allow(clippy::cast_possible_truncation)]
 #[doc(hidden)]
 pub fn inflate_table(
     code_type: CodeType,
@@ -610,6 +609,89 @@ pub fn inflate_table(
     table_index: &mut usize,
     bits: &mut usize,
     work: &mut [u16],
+) -> i32 {
+    inflate_table_build(code_type, lens, codes, table, table_index, bits, work).code
+}
+
+/// What a table build did: the status code, and how many entries of `table` it
+/// wrote.
+///
+/// The extent exists because C's `inflate_table` writes entries into the caller's
+/// array **as it builds**, so a table that runs out of space -- `inftrees.c` L218 and
+/// L287, the two `return 1` sites -- leaves every entry written before that point in
+/// the caller's memory, while `*table` and `*bits` stay exactly as they were passed
+/// in. A wrapper that builds into scratch space and copies out afterwards can only
+/// reproduce that if it is told how much was written, because the cursor is
+/// deliberately not advanced on a failure. `crates/libz-rs-sys`'s `inflate_table`
+/// export is that wrapper.
+///
+/// `touched` is one past the highest index written, counted from the base of `table`
+/// rather than from `*table_index`, so it can be used as a length directly. It is the
+/// exact number of entries written whenever the writes form a prefix, which is what
+/// they do for every failing input measured against the reference: the tables
+/// allocated before the failing one are complete, and the failing one is not written
+/// at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableBuild {
+    /// [`TABLE_OK`], [`TABLE_NOT_ENOUGH`] or [`TABLE_INVALID_CODE`] -- what C
+    /// returns.
+    pub code: i32,
+    /// One past the highest entry index written, or zero if none was.
+    pub touched: usize,
+}
+
+/// Records that entry `index` has been written.
+///
+/// A separate function so that every write site reads the same and none can forget
+/// the `+1`: the extent is a length, not an index.
+fn record(touched: &mut usize, index: usize) {
+    *touched = (*touched).max(index.saturating_add(1));
+}
+
+/// [`inflate_table`], additionally reporting how many entries were written.
+///
+/// The two share one body; see [`TableBuild`] for why the extent is needed and
+/// [`inflate_table`] for the algorithm, the parameters and the preconditions.
+#[allow(clippy::cast_possible_truncation)]
+#[doc(hidden)]
+pub fn inflate_table_build(
+    code_type: CodeType,
+    lens: &[u16],
+    codes: usize,
+    table: &mut [Code],
+    table_index: &mut usize,
+    bits: &mut usize,
+    work: &mut [u16],
+) -> TableBuild {
+    let mut touched = 0_usize;
+    let code = inflate_table_inner(
+        code_type,
+        lens,
+        codes,
+        table,
+        table_index,
+        bits,
+        work,
+        &mut touched,
+    );
+    TableBuild { code, touched }
+}
+
+// Eight parameters, one more than the lint permits, and the eighth is the whole
+// point: the write extent has to travel out of the body alongside the status. The
+// public entry points take seven, so this shape is confined to the private
+// implementation. Written as a comment rather than the lint's `reason` field, which
+// needs Rust 1.81 while this workspace declares `rust-version = "1.80"`.
+#[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
+fn inflate_table_inner(
+    code_type: CodeType,
+    lens: &[u16],
+    codes: usize,
+    table: &mut [Code],
+    table_index: &mut usize,
+    bits: &mut usize,
+    work: &mut [u16],
+    touched: &mut usize,
 ) -> i32 {
     // Defensive precondition checks. C states these as caller obligations; here they
     // are the reason every later index is provably in range. Once `entry_base` is
@@ -663,6 +745,7 @@ pub fn inflate_table(
                 return TABLE_NOT_ENOUGH;
             };
             *slot = marker;
+            record(touched, entry_base + offset);
         }
         *table_index = entry_base + 2;
         *bits = 1;
@@ -809,10 +892,12 @@ pub fn inflate_table(
                 return TABLE_INVALID_CODE;
             };
             fill = next_fill;
-            let Some(slot) = table.get_mut(next_base + (huff >> drop_bits) + fill) else {
+            let index = next_base + (huff >> drop_bits) + fill;
+            let Some(slot) = table.get_mut(index) else {
                 return TABLE_NOT_ENOUGH;
             };
             *slot = here;
+            record(touched, index);
             if fill == 0 {
                 break;
             }
@@ -905,6 +990,7 @@ pub fn inflate_table(
                 return TABLE_NOT_ENOUGH;
             };
             *slot = Code::new(curr as u8, root as u8, link_offset as u16);
+            record(touched, entry_base + low);
         }
     }
 
@@ -916,6 +1002,7 @@ pub fn inflate_table(
             return TABLE_NOT_ENOUGH;
         };
         *slot = Code::new(64, (len - drop_bits) as u8, 0);
+        record(touched, next_base + huff);
     }
 
     // Return parameters (`inftrees.c` L307-L310): advance the caller's cursor past

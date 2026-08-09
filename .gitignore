@@ -88,13 +88,23 @@ fuzz/corpus/
 # rustfmt backups.
 **/*.rs.bk
 # Scratch that the ABI verification steps write into the repository root: the
-# cbindgen-generated header that gets diffed against zlib.h, and the symbol
-# lists that `make rust-symbols' compares and reports from.  generated_zlib.h
-# especially must never be committed -- a second header sitting beside the
-# immutable zlib.h would be indistinguishable from the real public contract.
-# The recipe removes missing.syms and extra.syms itself; the rules cover an
-# interrupted run.
+# cbindgen-generated header that `make rust-header' regenerates and gates, and
+# the symbol lists that `make rust-symbols' compares and reports from.
+# generated_zlib.h especially must never be committed -- a second header sitting
+# beside the immutable zlib.h would be indistinguishable from the real public
+# contract.  Three of these survive a passing run on purpose, because they are
+# what the run produced: generated_zlib.h is the gated artifact itself, and
+# rust.syms/c.syms are the two sorted lists `rust-symbols' reports its verdict
+# from, so they stay readable afterwards.  The rest are transient -- a passing
+# run deletes them, a FAILING `rust-header' keeps them because they are its
+# evidence -- and `make rust-clean' removes all ten.  These rules cover the
+# interrupted run, where anything may be left behind.
 /generated_zlib.h
+/generated_zlib.h.warn
+/generated_zlib.h.log
+/generated_zlib.h.probe.c
+/generated_zlib.h.ref
+/generated_zlib.h.gen
 /rust.syms
 /c.syms
 /missing.syms

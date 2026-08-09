@@ -1,8 +1,15 @@
 //! Bindings to the C reference implementation, compiled as a test-only oracle.
 //!
-//! Everything in this module is a *declaration*. There is no logic here, and there are no safe
-//! wrappers: the point is to make the C implementation callable from Rust so that a test can run
-//! both implementations against the same input, in the same process, and compare the bytes.
+//! The point is to make the C implementation callable from Rust so that a test can run both
+//! implementations against the same input, in the same process, and compare the bytes.
+//!
+//! The module is in two parts, and they differ in what a caller has to prove. The bulk of it is
+//! `extern "C"` *declarations* -- no logic, and `unsafe` to call, because a declaration cannot
+//! discharge an FFI obligation on its caller's behalf. The exception is the block of safe wrappers
+//! over the generated tables (`oracle_crc_table` and its eight siblings), which are ordinary safe
+//! functions: each turns a table pointer and that table's own length accessor into a
+//! `&'static [T]`, so the unsafety is discharged once here rather than at every comparison. There
+//! is no other logic anywhere in the file.
 //!
 //! # Where the symbols come from
 //!
@@ -88,14 +95,16 @@
 //! src/oracle.rs  local #[repr(C)] mirrors + `extern "C"` c_/c_oracle_ declarations + safe slice
 //!                wrappers over the generated tables. Depends on nothing outside `core`/`std`.
 //! src/lib.rs     `pub mod oracle;` plus the crate-level documentation.
-//! tests/*.rs     import `zlib_rs_differential::oracle::*` (this lib) alongside `zlib_rs::*` and
-//!                `libz_rs_sys::*` (the dev-dependencies). EVERY differential, interoperability and
-//!                table-equality assertion lives there -- never here.
+//! tests/*.rs     NOT YET WRITTEN. The directory does not exist, so no differential,
+//!                interoperability or table-equality assertion runs anywhere today.
 //! ```
 //!
-//! The one exception to "no assertions here" is the deliberately minimal smoke module at the foot of
-//! this file. It exists to prove that the archive links and that the renaming worked at all, and it
-//! is documented as something that must not grow into a differential suite.
+//! The split is a design decision about where such assertions *belong*, not a description of
+//! coverage that exists: a suite under `tests/` would import `zlib_rs_differential::oracle::*`
+//! (this lib) alongside `zlib_rs::*` and `libz_rs_sys::*`, which is the only place those
+//! dev-dependencies resolve. Until it is written, the only thing this crate executes is the
+//! deliberately minimal smoke module at the foot of this file, which proves that the archive links
+//! and that the renaming worked -- and nothing about either implementation's output.
 
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
@@ -506,11 +515,37 @@ const _: () = assert!(size_of::<z_off64_t>() >= size_of::<z_off_t>());
 // `#[allow(dead_code)]` is required at the declared MSRV. Every use of this constant sits inside a
 // `const _: () = …` item, and rustc 1.80's dead-code pass does not traverse those bodies: it reports
 // "constant `IS_LP64` is never used". Verified — the warning appears under rustc 1.80.1 and is absent
-// under 1.97.1, and CI builds with `-D warnings`, so without this the crate fails to build on exactly
-// the compiler `rust-version = "1.80"` promises. The attribute is inert on newer toolchains.
+// under 1.97.1. Since the project's lint gate is `cargo clippy -- -D warnings`, the warning would be
+// an error on exactly the compiler `rust-version = "1.80"` promises, so without this the crate fails
+// to build there. The attribute is inert on newer toolchains.
 // `crates/libz-rs-sys/src/layout_assertions.rs` carries the same note against its own gate.
 #[allow(dead_code)]
 const IS_LP64: bool = size_of::<*const c_void>() == 8 && size_of::<c_ulong>() == 8;
+
+/// True when the target uses the other 64-bit model: 64-bit pointers with a **32-bit**
+/// `unsigned long`, i.e. LLP64, which is `x86_64` Windows.
+///
+/// The oracle's mirrors have to be pinned on that model too, and for a reason specific to this
+/// crate: a differential test compares BYTES between the C oracle and the Rust port through these
+/// declarations. If the mirror's idea of where `total_out` lives were wrong on a target, the harness
+/// would not report a layout bug — it would compare the wrong four bytes and report a *compression*
+/// bug, or worse, agree by accident. The relational assertions above cannot catch a narrowing
+/// re-type that padding absorbs, so the exact numbers are asserted on both 64-bit models.
+///
+/// The numbers are derived from the `#[repr(C)]` placement rule with `unsigned long` at 4 bytes and
+/// pointers at 8 — `z_stream` 88 bytes, `gz_header` 72, `struct gzFile_s` unchanged at 24 — and were
+/// confirmed by re-declaring all three structs on an LP64 host with `unsigned long` substituted by
+/// `u32` and reading `size_of`/`offset_of!` back.
+/// `crates/libz-rs-sys/src/layout_assertions.rs` carries the same gate, the same numbers and the
+/// full derivation; the facade mirror and this one are deliberately checked independently, so an
+/// edit to one is not silently blessed by the other.
+//
+// `#[allow(dead_code)]` for the same measured MSRV reason as `IS_LP64` above.
+#[allow(dead_code)]
+const IS_LLP64: bool = size_of::<*const c_void>() == 8 && size_of::<c_ulong>() == 4;
+
+// The two models are mutually exclusive: `c_ulong` cannot be both widths.
+const _: () = assert!(!(IS_LP64 && IS_LLP64));
 
 // The exact numbers measured from the C build on x86_64-unknown-linux-gnu, asserted only where the
 // integer model matches.
@@ -529,6 +564,27 @@ const _: () = assert!(!IS_LP64 || offset_of!(z_stream, opaque) == 80);
 const _: () = assert!(!IS_LP64 || offset_of!(z_stream, data_type) == 88);
 const _: () = assert!(!IS_LP64 || offset_of!(z_stream, adler) == 96);
 const _: () = assert!(!IS_LP64 || offset_of!(z_stream, reserved) == 104);
+
+// The same struct under LLP64. `avail_in`+`total_in` now share the eight bytes LP64 spends on
+// `avail_in` alone, and the same happens at `avail_out`/`total_out` and at
+// `data_type`/`adler`/`reserved`, so the struct is 88 bytes with four of tail padding.
+const _: () = assert!(!IS_LLP64 || size_of::<z_stream>() == 88);
+const _: () = assert!(!IS_LLP64 || align_of::<z_stream>() == 8);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, next_in) == 0);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, avail_in) == 8);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, total_in) == 12);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, next_out) == 16);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, avail_out) == 24);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, total_out) == 28);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, msg) == 32);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, state) == 40);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, zalloc) == 48);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, zfree) == 56);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, opaque) == 64);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, data_type) == 72);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, adler) == 76);
+const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, reserved) == 80);
+
 // `gz_header`, field by field. The absolute numbers matter here for the same reason they matter for
 // `z_stream`: `inflateGetHeader` writes through a caller-allocated one, so a single wrong offset
 // means the reference and the port disagree about where `extra_max` lives and the differential test
@@ -550,6 +606,25 @@ const _: () = assert!(!IS_LP64 || offset_of!(gz_header, comm_max) == 64);
 const _: () = assert!(!IS_LP64 || offset_of!(gz_header, hcrc) == 68);
 const _: () = assert!(!IS_LP64 || offset_of!(gz_header, done) == 72);
 
+// The same struct under LLP64. `time` is the only `unsigned long` here, so it shrinks to four bytes
+// and packs against `text` with no padding, moving everything up to `extra` down by eight and
+// settling the struct at 72 bytes.
+const _: () = assert!(!IS_LLP64 || size_of::<gz_header>() == 72);
+const _: () = assert!(!IS_LLP64 || align_of::<gz_header>() == 8);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, text) == 0);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, time) == 4);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, xflags) == 8);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, os) == 12);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, extra) == 16);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, extra_len) == 24);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, extra_max) == 28);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, name) == 32);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, name_max) == 40);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, comment) == 48);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, comm_max) == 56);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, hcrc) == 60);
+const _: () = assert!(!IS_LLP64 || offset_of!(gz_header, done) == 64);
+
 // `struct gzFile_s`, the single most load-bearing layout in the whole port: `zlib.h` defines
 // `gzgetc(g)` as a macro that decrements `g->have`, post-increments `g->next` and increments
 // `g->pos` inside *caller-compiled* object code, which this port cannot recompile. `gzguts.h` embeds
@@ -560,6 +635,15 @@ const _: () = assert!(!IS_LP64 || align_of::<gzFile_s>() == 8);
 const _: () = assert!(!IS_LP64 || offset_of!(gzFile_s, next) == 8);
 const _: () = assert!(!IS_LP64 || offset_of!(gzFile_s, pos) == 16);
 
+// Unchanged under LLP64, which is the finding rather than a duplicated line: this struct holds no
+// `unsigned long`, so the only model-dependent quantity is the pointer width and both 64-bit models
+// agree on it. Asserted anyway, because `gzgetc` does this arithmetic in caller-compiled code.
+const _: () = assert!(!IS_LLP64 || size_of::<gzFile_s>() == 24);
+const _: () = assert!(!IS_LLP64 || align_of::<gzFile_s>() == 8);
+const _: () = assert!(!IS_LLP64 || offset_of!(gzFile_s, have) == 0);
+const _: () = assert!(!IS_LLP64 || offset_of!(gzFile_s, next) == 8);
+const _: () = assert!(!IS_LLP64 || offset_of!(gzFile_s, pos) == 16);
+
 // The scalar widths measured from the C build, asserted only under the integer model they were
 // measured under. `uLong` is the one that matters most: it is `unsigned long`, so it is 8 bytes here
 // and 4 on LLP64 Windows, and it is the return type of every checksum entry point.
@@ -569,14 +653,32 @@ const _: () = assert!(!IS_LP64 || size_of::<voidpf>() == 8);
 const _: () = assert!(!IS_LP64 || size_of::<z_off_t>() == 8);
 const _: () = assert!(!IS_LP64 || size_of::<z_size_t>() == 8);
 
+// And under LLP64, where `uLong` is four bytes -- the difference that makes every checksum entry
+// point return a narrower value on Windows and the reason `uLong` must be `c_ulong` rather than a
+// fixed-width integer.
+//
+// `z_off_t` is asserted here as well, and the two declarations above are why it can be: on a
+// non-`unix` target this mirror declares it `i64`, matching the header's `long long` fallback at
+// `zconf.h` L518-L520 (`Z_HAVE_UNISTD_H` is never set on `_WIN32`). So on LLP64 it is eight bytes,
+// unlike `uLong`, and the pair of assertions records that the two types diverge there -- which is
+// the whole hazard the `*64` symbol family exists to manage.
+const _: () = assert!(!IS_LLP64 || size_of::<uInt>() == 4);
+const _: () = assert!(!IS_LLP64 || size_of::<uLong>() == 4);
+const _: () = assert!(!IS_LLP64 || size_of::<voidpf>() == 8);
+const _: () = assert!(!IS_LLP64 || size_of::<z_size_t>() == 8);
+const _: () = assert!(!IS_LLP64 || size_of::<z_off_t>() == 8);
+const _: () = assert!(!IS_LLP64 || size_of::<z_off64_t>() == 8);
+
 // =============================================================================
 //  The public zlib.h surface
 // =============================================================================
 //
-//  Every `ZEXTERN` declaration in `zlib.h` that corresponds to a real symbol: 96 prototypes, less
-//  `gzvprintf`, whose `va_list` parameter has no portable stable-Rust spelling (see the module
-//  docs).  Each doc line is the C prototype verbatim, so this block can be diffed against the
-//  header by eye.
+//  95 prototypes.  That figure is `zlib.h`'s 96 real entry points, less the two variadic ones --
+//  `gzprintf` and `gzvprintf`, whose `...` and `va_list` parameters have no portable stable-Rust
+//  spelling (see the module docs) -- plus one symbol that is not in `zlib.h` at all: the hidden
+//  `inflate_table`, declared here because `tests` of the ported decode-table builder need something
+//  to compare against.  Each doc line is the C prototype verbatim, so this block can be read
+//  against the header line by line.
 //
 //  Two entries deserve a note.  `gzopen_w` is declared only under `_WIN32` in `zlib.h` and is
 //  therefore compiled into the oracle only there, so its declaration is gated the same way.
@@ -595,7 +697,7 @@ const _: () = assert!(!IS_LP64 || size_of::<z_size_t>() == 8);
 // `uLong` follows `unsigned long` across integer models instead of being frozen at one width. And
 // the compile-time layout assertions above fail the build if any mirrored struct drifts.
 //
-// `extern "C"` is used throughout and never `extern "C-unwind"` (AAP 0.7.1(f)): the reference
+// `extern "C"` is used throughout and never `extern "C-unwind"`: the reference
 // implementation is C and does not unwind, and pinning the convention to the non-unwinding form
 // means a panic crossing this boundary aborts rather than becoming undefined behaviour.
 //
@@ -1044,9 +1146,12 @@ extern "C" {
 //  returns a null pointer and a zero length rather than failing to compile.  A caller must treat
 //  null as a legal answer meaning "this target has no braided table", not as an error.
 //
+//  One table is out of that shim's reach and is handled by a second generated file; see the
+//  configuration-table section further down.
+//
 //  Prefer the safe wrappers in the section after this one.  They pair each pointer with its own
-//  length accessor and hand back a `&'static [T]`, which is what keeps the bodies of
-//  `tests/table_equality.rs` free of `unsafe`.
+//  length accessor and hand back a `&'static [T]`, so a table comparison needs no `unsafe` of its
+//  own.  That is what the wrappers are for; no such comparison exists in the tree yet.
 
 // SAFETY: the signature-fidelity invariant again, against the generated shim in
 // `build.rs`'s `TABLE_SHIM_SOURCE` rather than against a checked-in header. Two properties of that
@@ -1164,13 +1269,90 @@ extern "C" {
 }
 
 // =============================================================================
+//  The generated deflate.c wrapper: configuration_table
+// =============================================================================
+//
+//  `configuration_table` -- the per-level tuning rows at `deflate.c` L112-L124 -- is `local` like
+//  the other generated tables, but unlike them it is declared in no header at all: it lives inside
+//  `deflate.c`.  So the table shim above cannot reach it, because there is nothing for it to
+//  include, and no `extern "C"` declaration can bind to it, because a `static` object has no
+//  symbol.  `build.rs` closes that gap with a second generated file, `zlib_c_oracle_deflate.c`,
+//  which `#include`s the authoritative `deflate.c` and appends the accessors below; that file is
+//  compiled *instead of* plain `deflate.c`, so the reference translation unit is still in the
+//  archive exactly once and the accessors sit in the same translation unit as the table.
+//
+//  Why this table is worth a whole second generated file: its four numbers per level decide which
+//  candidate matches `longest_match` examines and accepts, and therefore which literal, length and
+//  distance symbols reach the Huffman coder.  A single altered digit does not make the encoder
+//  better or worse in any way a decompressor could detect -- it makes it emit *different bytes*, at
+//  that level, for essentially every input.  It is the first of the byte-identity decision points,
+//  and the cheapest one to check.
+//
+//  The accessors are also why nothing here transcribes the forty numbers.  A shim that restated
+//  them would let a table-equality test compare one transcription against another, and a value
+//  copied wrongly would be copied wrongly into both sides.  These read the C object.
+//
+//  Prefer the safe wrappers in the section after the table views: [`oracle_config`] pairs a row
+//  with [`oracle_config_table_len`] and hands back an [`OracleConfig`], so a test never indexes
+//  past the end of a table whose length the C side owns.
+
+// SAFETY: the signature-fidelity invariant again, against `build.rs`'s `CONFIG_TU_SOURCE` rather
+// than against a checked-in header. Three properties of that generated file make these declarations
+// sound. Every accessor takes either nothing or one `unsigned` by value and returns `unsigned` or
+// `int`, so there are no pointers anywhere in this block and no argument-marshalling concerns at
+// all -- a wrong value can be a wrong answer but never a memory error. The row count is computed as
+// `sizeof(configuration_table) / sizeof(configuration_table[0])` in the same translation unit as the
+// table, so it cannot disagree with the array it describes. And every field accessor range-checks
+// its `level` against that same count before indexing, so no argument value can make the C side
+// read past the end of the table: an out-of-range level yields 0 from a field accessor and -2 from
+// `c_oracle_config_func`.
+extern "C" {
+    /// Returns the row count of `configuration_table` (`deflate.c` L112-L124).
+    ///
+    /// Ten in the default configuration. Two under `FASTEST`, which the oracle deliberately does
+    /// not define -- so a value other than ten means the oracle was built as a *different encoder*
+    /// and a byte-identity comparison against it would be meaningless.
+    pub fn c_oracle_config_table_len() -> c_uint;
+
+    /// Returns `sizeof` one numeric field of a `configuration_table` row, as the C compiler laid
+    /// it out.
+    ///
+    /// `struct config_s` declares all four as `ush` (`deflate.c` L99-L102), so this is the C
+    /// compiler's own answer for the width the port transcribes them at.
+    pub fn c_oracle_config_field_size() -> c_uint;
+
+    /// Returns `configuration_table[level].good_length`, or 0 when `level` is out of range.
+    pub fn c_oracle_config_good_length(level: c_uint) -> c_uint;
+
+    /// Returns `configuration_table[level].max_lazy`, or 0 when `level` is out of range.
+    pub fn c_oracle_config_max_lazy(level: c_uint) -> c_uint;
+
+    /// Returns `configuration_table[level].nice_length`, or 0 when `level` is out of range.
+    pub fn c_oracle_config_nice_length(level: c_uint) -> c_uint;
+
+    /// Returns `configuration_table[level].max_chain`, or 0 when `level` is out of range.
+    pub fn c_oracle_config_max_chain(level: c_uint) -> c_uint;
+
+    /// Returns which compressor `configuration_table[level].func` points at, as a discriminator.
+    ///
+    /// 0 `deflate_stored`, 1 `deflate_fast`, 2 `deflate_slow`, 3 `deflate_rle`, 4 `deflate_huff`;
+    /// -1 if the stored address matches none of the five, and -2 if `level` is out of range.
+    /// [`OracleCompressFunc`] is the safe reading of the result.
+    ///
+    /// The C side compares the function *address*, which is the same test `deflateParams` makes at
+    /// `deflate.c` L791 when it decides whether a level change must first flush the open block.
+    pub fn c_oracle_config_func(level: c_uint) -> c_int;
+}
+
+// =============================================================================
 //  Safe views over the generated tables
 // =============================================================================
 //
 //  One wrapper per table, each returning a `&'static [T]` built from the table's own pointer
 //  accessor and its own length accessor.  This is the only place in the crate where a raw pointer is
-//  turned into a slice, which is what lets `tests/table_equality.rs` compare the ported Rust `const`
-//  arrays against the C arrays without containing a single `unsafe` block of its own.
+//  turned into a slice, so a comparison of the ported Rust `const` arrays against the C arrays can
+//  be written without a single `unsafe` block of its own.  Only the shape checks in the smoke module
+//  call these today; the content comparison they were built for is not yet written.
 //
 //  Three properties make every one of these sound, and they are stated once here rather than
 //  repeated in nine near-identical comments:
@@ -1213,7 +1395,13 @@ unsafe fn table_slice<'a, T>(ptr: *const T, len: c_uint) -> &'a [T] {
     // at a `static` array of at least `len` initialised `T`s that outlives every possible `'a` and is
     // never mutated. `len as usize` cannot truncate, because a C `unsigned` is 32-bit on every
     // supported target and `usize` is at least that wide. The total size cannot overflow `isize`
-    // either: these are fixed-size generated tables, the largest of which is 2 KiB.
+    // either, and that holds without appealing to any particular table's measured size. Every call
+    // site derives `len` from the array's own `sizeof/sizeof`: directly for the one-dimensional
+    // tables, and as the product of the row and column counts -- each its own `sizeof/sizeof` -- for
+    // the two-dimensional braid table, which is the same element total. So `len * size_of::<T>()` is
+    // exactly that array's `sizeof`, a size the C implementation had already laid out, and therefore
+    // within `isize::MAX`. For scale, the largest of these tables is `crc_braid_table`, whose
+    // declared geometry of at most 8 rows of 256 `z_crc_t` is 8 KiB.
     unsafe { core::slice::from_raw_parts(ptr, len as usize) }
 }
 
@@ -1246,7 +1434,11 @@ pub fn oracle_crc_table() -> &'static [z_crc_t] {
 /// is what the combine family's correctness rests on.
 #[must_use]
 pub fn oracle_x2n_table() -> &'static [z_crc_t] {
-    // SAFETY: as `oracle_crc_table`, for `x2n_table` and its own length accessor.
+    // SAFETY: `c_oracle_x2n_table` returns `x2n_table`, a `static const z_crc_t` array in the
+    // oracle archive, paired with that same array's own `sizeof/sizeof` length. Static storage
+    // duration makes the `'static` the true lifetime, the data is read-only and never handed out
+    // as `&mut`, and `z_crc_t` is `u32` on both sides. Both accessors are niladic, so the calls
+    // themselves have no preconditions.
     unsafe { table_slice(c_oracle_x2n_table(), c_oracle_x2n_table_len()) }
 }
 
@@ -1316,7 +1508,12 @@ pub fn oracle_static_ltree() -> &'static [ct_data] {
 /// The reference's `static_dtree` from `trees.h`, `D_CODES` = 30 entries.
 #[must_use]
 pub fn oracle_static_dtree() -> &'static [ct_data] {
-    // SAFETY: as `oracle_static_ltree`, for `static_dtree` and its own length accessor.
+    // SAFETY: `c_oracle_static_dtree` returns `static_dtree`, a `static const ct_data` array in
+    // the oracle archive, paired with that same array's own `sizeof/sizeof` length. Static storage
+    // duration makes the `'static` the true lifetime, and the data is read-only. `ct_data` is
+    // layout-identical to the C type: both fields are `ush`, `size_of::<ct_data>() == 4` is
+    // asserted at compile time above, and `c_oracle_ct_data_size` reports the C compiler's own
+    // answer for cross-checking. Both accessors are niladic.
     unsafe { table_slice(c_oracle_static_dtree(), c_oracle_static_dtree_len()) }
 }
 
@@ -1334,7 +1531,10 @@ pub fn oracle_base_length() -> &'static [c_int] {
 /// The reference's `base_dist` from `trees.h`, `D_CODES` = 30 entries.
 #[must_use]
 pub fn oracle_base_dist() -> &'static [c_int] {
-    // SAFETY: as `oracle_base_length`, for `base_dist` and its own length accessor.
+    // SAFETY: `c_oracle_base_dist` returns `base_dist`, a `static const int` array in the oracle
+    // archive, paired with that same array's own `sizeof/sizeof` length. Static storage duration
+    // makes the `'static` the true lifetime, the data is read-only, and the element type is C
+    // `int`, spelled `c_int`. Both accessors are niladic.
     unsafe { table_slice(c_oracle_base_dist(), c_oracle_base_dist_len()) }
 }
 
@@ -1355,7 +1555,10 @@ pub fn oracle_dist_code() -> &'static [uch] {
 /// Maps a match length to its length code, the companion of [`oracle_dist_code`].
 #[must_use]
 pub fn oracle_length_code() -> &'static [uch] {
-    // SAFETY: as `oracle_dist_code`, for `_length_code` and its own length accessor.
+    // SAFETY: `c_oracle_length_code` returns `_length_code`, a `static const uch` array in the
+    // oracle archive, paired with that same array's own `sizeof/sizeof` length. Static storage
+    // duration makes the `'static` the true lifetime, the data is read-only, and `uch` is
+    // `unsigned char`, one byte, as asserted above. Both accessors are niladic.
     unsafe { table_slice(c_oracle_length_code(), c_oracle_length_code_len()) }
 }
 
@@ -1375,7 +1578,12 @@ pub fn oracle_lenfix() -> &'static [code] {
 /// The reference's `distfix` from `inffixed.h`, 32 [`code`] entries.
 #[must_use]
 pub fn oracle_distfix() -> &'static [code] {
-    // SAFETY: as `oracle_lenfix`, for `distfix` and its own length accessor.
+    // SAFETY: `c_oracle_distfix` returns `distfix`, a `static const code` array in the oracle
+    // archive, paired with that same array's own `sizeof/sizeof` length. Static storage duration
+    // makes the `'static` the true lifetime, and the data is read-only. `code` is layout-identical
+    // to the C struct: `size_of::<code>() == 4` with fields at 0, 1 and 2 is asserted at compile
+    // time above, and `c_oracle_code_size` reports the C compiler's own answer for cross-checking.
+    // Both accessors are niladic.
     unsafe { table_slice(c_oracle_distfix(), c_oracle_distfix_len()) }
 }
 
@@ -1392,6 +1600,183 @@ pub fn oracle_element_sizes() -> (c_uint, c_uint) {
 }
 
 // =============================================================================
+//  Safe view over configuration_table
+// =============================================================================
+//
+//  The other tables are arrays of one element type and are handed out as slices.  A
+//  `configuration_table` row cannot be, because its fifth member is a `compress_func` -- a function
+//  pointer whose *value* is meaningless across implementations and whose only useful property is
+//  which of the five compressors it names.  So a row is handed out as an [`OracleConfig`]: the four
+//  numbers read straight from the C object, and the compressor resolved to an
+//  [`OracleCompressFunc`] by the C side, which is the only side that can compare the address.
+
+/// Which of `deflate.c`'s five compressors a `configuration_table` row names.
+///
+/// The variants mirror the `local` functions of `deflate.c`: `deflate_stored` and `deflate_fast`
+/// (L73-L74), `deflate_slow` (L76), `deflate_rle` and `deflate_huff` (L78-L79).
+///
+/// # What the table actually holds, and why all five are represented
+///
+/// `configuration_table` names only the first three -- [`Self::Stored`] at level 0, [`Self::Fast`]
+/// at levels 1 to 3 and [`Self::Slow`] at levels 4 to 9. [`Self::Rle`] and [`Self::Huff`] are
+/// reachable through the *strategy* (`Z_RLE` and `Z_HUFFMAN_ONLY`) rather than through the level,
+/// so no row names them; they are represented anyway so that this enum describes the whole
+/// `compress_func` family and would still name the compressor if a future row ever held one.
+///
+/// # Why the grouping is byte-identity critical
+///
+/// `deflateParams` compares the current level's `func` against the requested level's **by
+/// identity** (`deflate.c` L791) to decide whether the level change must first flush the open
+/// block. Two levels therefore behave the same there precisely when they name the same compressor,
+/// which makes this grouping -- not the pointer value -- the property a port has to reproduce. Get
+/// it wrong and `deflateParams` flushes where C does not, or fails to where C does, and either
+/// changes the emitted bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OracleCompressFunc {
+    /// `deflate_stored` -- store only, level 0.
+    Stored,
+    /// `deflate_fast` -- no lazy matches, levels 1 to 3.
+    Fast,
+    /// `deflate_slow` -- lazy matching, levels 4 to 9.
+    Slow,
+    /// `deflate_rle` -- reachable through `Z_RLE`, never through a table row.
+    Rle,
+    /// `deflate_huff` -- reachable through `Z_HUFFMAN_ONLY`, never through a table row.
+    Huff,
+}
+
+impl OracleCompressFunc {
+    /// Reads a [`c_oracle_config_func`] discriminator.
+    ///
+    /// `None` covers both negative answers the C side can give: -1, meaning the stored address
+    /// matched none of the five compressors, which can only happen if `deflate.c` gained a sixth;
+    /// and -2, meaning the level was out of range, which [`oracle_config`] rules out before asking.
+    /// Anything else unrecognised is also `None` rather than a guess.
+    fn from_discriminator(discriminator: c_int) -> Option<Self> {
+        match discriminator {
+            0 => Some(Self::Stored),
+            1 => Some(Self::Fast),
+            2 => Some(Self::Slow),
+            3 => Some(Self::Rle),
+            4 => Some(Self::Huff),
+            _ => None,
+        }
+    }
+}
+
+/// One row of the reference's `configuration_table` (`deflate.c` L112-L124), read from the C object.
+///
+/// The field names are C's own, and the four numeric fields are widened to [`c_uint`] by the
+/// generated accessors rather than narrowed to `ush`: C declares them as `ush` (L99-L102), the
+/// widening is lossless for every value in the table, and it means the accessor cannot truncate if
+/// the reference ever declared them wider. [`oracle_config_field_size`] reports the width C
+/// actually used, so the port's own choice of a 16-bit field is checkable rather than assumed.
+///
+/// # Comparing this against the port
+///
+/// `zlib_rs::CONFIGURATION_TABLE` is the port's transcription of the same ten rows, and its
+/// `Config` rows carry `u16` fields, so each comparison widens the port's value:
+///
+/// ```text
+/// let rows = oracle_config_table_len();
+/// assert_eq!(rows as usize, zlib_rs::CONFIGURATION_TABLE.len());
+/// assert_eq!(oracle_config_field_size() as usize, size_of::<u16>());
+///
+/// for level in 0..rows {
+///     let c = oracle_config(level).expect("level is below the reported row count");
+///     let rust = zlib_rs::CONFIGURATION_TABLE[level as usize];
+///     assert_eq!(c.good_length, c_uint::from(rust.good_length));
+///     assert_eq!(c.max_lazy,    c_uint::from(rust.max_lazy));
+///     assert_eq!(c.nice_length, c_uint::from(rust.nice_length));
+///     assert_eq!(c.max_chain,   c_uint::from(rust.max_chain));
+/// }
+/// ```
+///
+/// The compressor is compared as the grouping rather than field-to-field, because the port's
+/// `Config::func` is deliberately crate-private -- it holds a `CompressFunc` discriminant, a type
+/// `zlib.map` does not export -- so the port's table is not asked to hand it out. What both sides
+/// must agree on is the grouping itself: [`OracleCompressFunc::Stored`] at level 0,
+/// [`OracleCompressFunc::Fast`] at levels 1 to 3 and [`OracleCompressFunc::Slow`] at 4 to 9, which
+/// is what `deflateParams`' identity test at `deflate.c` L791 observes.
+///
+/// The example is `text` rather than a doctest on purpose: `zlib_rs` is a dev-dependency of this
+/// crate, so it does not resolve from this module. That comparison belongs in
+/// `crates/zlib-rs-differential/tests/`, which is where the dev-dependencies exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OracleConfig {
+    /// `good_length` (L99) -- above this previous-match length the lazy search is cut short.
+    pub good_length: c_uint,
+    /// `max_lazy` (L100) -- the match length at or above which no lazy search is attempted.
+    pub max_lazy: c_uint,
+    /// `nice_length` (L101) -- the match length at which the chain walk quits early.
+    pub nice_length: c_uint,
+    /// `max_chain` (L102) -- the hard limit on how far a hash chain is walked.
+    pub max_chain: c_uint,
+    /// `func` (L103) -- which compressor the row names, or `None` if the C side did not recognise
+    /// the stored address as one of the five.
+    pub func: Option<OracleCompressFunc>,
+}
+
+/// The number of rows in the reference's `configuration_table`.
+///
+/// Reported by the C side, never hardcoded: `deflate.c` declares a ten-row table by default and a
+/// two-row one under `FASTEST` (L106-L124), and the row count is how a caller tells which encoder
+/// it is talking to. The oracle is built without `FASTEST`, so this is ten.
+#[must_use]
+pub fn oracle_config_table_len() -> c_uint {
+    // SAFETY: a niladic accessor returning `unsigned`; no pointers and no preconditions.
+    unsafe { c_oracle_config_table_len() }
+}
+
+/// `sizeof` one numeric field of a `configuration_table` row, as the C compiler laid it out.
+///
+/// The four fields are `ush` in C (`deflate.c` L99-L102), so this reports 2 on every supported
+/// target. It exists for the same reason [`oracle_element_sizes`] does: the port transcribes those
+/// fields at a chosen width, and this is the C compiler's own answer to compare that against
+/// instead of assuming the transcription was faithful.
+#[must_use]
+pub fn oracle_config_field_size() -> c_uint {
+    // SAFETY: a niladic accessor returning `unsigned`; no pointers and no preconditions.
+    unsafe { c_oracle_config_field_size() }
+}
+
+/// The reference's `configuration_table[level]`, or `None` when `level` is not a row of it.
+///
+/// `None` means exactly "the C table has no such row", tested against
+/// [`oracle_config_table_len`] before any accessor is called, so a caller iterating
+/// `0..oracle_config_table_len()` never sees it. The C accessors range-check independently as
+/// well -- they answer 0 and -2 for an out-of-range level rather than reading past the end -- so
+/// the bound is enforced on both sides of the boundary.
+#[must_use]
+pub fn oracle_config(level: c_uint) -> Option<OracleConfig> {
+    if level >= oracle_config_table_len() {
+        return None;
+    }
+
+    // SAFETY: five accessors taking one `unsigned` by value and returning `unsigned` or `int`. No
+    // pointer is involved, so nothing here can be a memory error. `level` is below the row count
+    // the C side itself reported immediately above, so each one indexes a row that exists; the C
+    // side range-checks it a second time regardless.
+    let (good_length, max_lazy, nice_length, max_chain, func) = unsafe {
+        (
+            c_oracle_config_good_length(level),
+            c_oracle_config_max_lazy(level),
+            c_oracle_config_nice_length(level),
+            c_oracle_config_max_chain(level),
+            c_oracle_config_func(level),
+        )
+    };
+
+    Some(OracleConfig {
+        good_length,
+        max_lazy,
+        nice_length,
+        max_chain,
+        func: OracleCompressFunc::from_discriminator(func),
+    })
+}
+
+// =============================================================================
 //  Smoke tests
 // =============================================================================
 //
@@ -1401,14 +1786,16 @@ pub fn oracle_element_sizes() -> (c_uint, c_uint) {
 //  produce callable functions?  That question cannot be answered by declarations alone -- an
 //  `extern` block that nothing calls emits no relocation, so the archive is never consulted and a
 //  wrong symbol name would go unnoticed until the first real test.  These calls are what force the
-//  linker to resolve the names, which is why the smoke module lives here rather than in `tests/`.
+//  linker to resolve the names, which is why the smoke module lives here rather than under
+//  `tests/`.
 //
-//  Everything that compares the two implementations belongs in `crates/zlib-rs-differential/tests/`:
-//  byte-identity in `byte_identical.rs`, stream interoperability in `roundtrip_interop.rs`, and the
-//  ported-table comparison in `table_equality.rs`.  Not one of them belongs here.  The rule of thumb
-//  is that a test in this module may reference the oracle and nothing else; the moment it needs
-//  `zlib_rs` or `libz_rs_sys` it is a differential test and it goes in `tests/`, which is also the
-//  only place those dev-dependencies resolve.
+//  It is also, today, the only thing this crate runs.  Nothing compares the two implementations:
+//  `crates/zlib-rs-differential/tests/` does not exist, so there is no byte-identity suite, no
+//  stream-interoperability suite and no ported-table comparison anywhere in the tree.  That work is
+//  where such assertions belong, and the rule of thumb for the boundary still holds -- a test in
+//  this module may reference the oracle and nothing else; the moment it needs `zlib_rs` or
+//  `libz_rs_sys` it is a differential test and belongs under `tests/`, which is also the only place
+//  those dev-dependencies resolve.
 //
 //  The expected values below are properties of the reference implementation, taken from the headers
 //  and from `test/example.c` rather than from a previous run of this code.
@@ -1600,7 +1987,9 @@ mod tests {
         let adler = unsafe { c_adler32(1, hello.as_ptr(), len) };
         assert_eq!(adler, 0x062c_0215);
 
-        // SAFETY: as above.
+        // SAFETY: `hello` is a `'static` slice of 5 readable bytes, `u8` needs no alignment
+        // beyond 1, and `len` is exactly that length, so the whole range C reads is in bounds.
+        // Nothing is written through the pointer and `c_crc32` does not retain it.
         let crc = unsafe { c_crc32(0, hello.as_ptr(), len) };
         assert_eq!(crc, 0x3610_a686);
 
@@ -1618,9 +2007,10 @@ mod tests {
 
     /// The generated-table accessors are wired up and the safe wrappers bound them correctly.
     ///
-    /// This checks *shape* only -- lengths, geometry and element sizes. Comparing the contents
-    /// against the port's `const` arrays is `tests/table_equality.rs`'s job, and duplicating it here
-    /// is exactly the growth this module must not undergo.
+    /// This checks *shape* only -- lengths, geometry and element sizes. Nothing compares the
+    /// contents against the port's `const` arrays: that belongs in a table-equality suite under
+    /// `tests/`, which has not been written, and reproducing it here is exactly the growth this
+    /// module must not undergo.
     #[test]
     fn table_accessors_report_the_expected_shapes() {
         assert_eq!(oracle_crc_table().len(), 256, "crc_table");
@@ -1685,6 +2075,71 @@ mod tests {
             // SAFETY: niladic accessor returning `unsigned`.
             assert_eq!(unsafe { c_oracle_word_size() }, rows);
         }
+    }
+
+    /// The configuration-table accessors are wired up and read the reference's own ten rows.
+    ///
+    /// This is the counterpart of the test above for the second generated file, and it is here for
+    /// the same reason: an `extern` block nothing calls emits no relocation, so a wrong symbol name
+    /// would go unnoticed until the first real test. Calling all seven forces the linker to resolve
+    /// them.
+    ///
+    /// The forty numbers below are `deflate.c` L112-L124 restated, which makes this a property of
+    /// the *reference* -- the same kind of assertion as `crc_table[1] == 0x77073096` above, and the
+    /// same kind of check that the accessors read the table they claim to. Comparing them against
+    /// `zlib_rs::CONFIGURATION_TABLE` is a differential assertion and belongs in
+    /// `crates/zlib-rs-differential/tests/`, not here.
+    #[test]
+    fn config_table_accessors_report_the_reference_rows() {
+        /// L112-L124 in C's column order: good, lazy, nice, chain, compressor.
+        ///
+        /// Ten rows, because the oracle is built without `FASTEST`; under `FASTEST` `deflate.c`
+        /// declares a two-row table instead and this test would fail, which is the point.
+        const EXPECTED: [(c_uint, c_uint, c_uint, c_uint, OracleCompressFunc); 10] = [
+            (0, 0, 0, 0, OracleCompressFunc::Stored),
+            (4, 4, 8, 4, OracleCompressFunc::Fast),
+            (4, 5, 16, 8, OracleCompressFunc::Fast),
+            (4, 6, 32, 32, OracleCompressFunc::Fast),
+            (4, 4, 16, 16, OracleCompressFunc::Slow),
+            (8, 16, 32, 32, OracleCompressFunc::Slow),
+            (8, 16, 128, 128, OracleCompressFunc::Slow),
+            (8, 32, 128, 256, OracleCompressFunc::Slow),
+            (32, 128, 258, 1024, OracleCompressFunc::Slow),
+            (32, 258, 258, 4096, OracleCompressFunc::Slow),
+        ];
+
+        let rows = oracle_config_table_len();
+        assert_eq!(
+            rows as usize,
+            EXPECTED.len(),
+            "the default configuration_table has ten rows; two would mean a FASTEST build"
+        );
+
+        // `ush` is `unsigned short`, so the C fields are two bytes wide. This is what makes the
+        // port's 16-bit transcription of them a checked fact rather than an assumption.
+        assert_eq!(
+            oracle_config_field_size() as usize,
+            size_of::<u16>(),
+            "struct config_s declares all four numeric fields as ush"
+        );
+
+        for (level, expected) in (0..rows).zip(EXPECTED) {
+            let (good_length, max_lazy, nice_length, max_chain, func) = expected;
+            assert_eq!(
+                oracle_config(level),
+                Some(OracleConfig {
+                    good_length,
+                    max_lazy,
+                    nice_length,
+                    max_chain,
+                    func: Some(func),
+                }),
+                "configuration_table[{level}]"
+            );
+        }
+
+        // A level the table does not have is reported as absent rather than read out of bounds.
+        assert_eq!(oracle_config(rows), None);
     }
 
     /// `zError` maps a status code to the reference's own message string.

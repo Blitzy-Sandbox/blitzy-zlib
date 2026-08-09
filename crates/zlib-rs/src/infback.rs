@@ -35,22 +35,27 @@
 //!
 //! `inflate()` allocates and owns its window lazily. `inflateBack` does not
 //! allocate one at all -- `inflateBackInit_` stores the caller's pointer
-//! (`infback.c` L59) -- so the Rust implementation borrows it:
-//! [`inflate_back_init`] builds the state through
-//! [`InflateState::with_borrowed_window`], which records the window as
-//! [`InflateWindow`]`::borrowed` and truncates it to exactly `1 << window_bits`
-//! bytes.
+//! (`infback.c` L59) and `inflateBackEnd` frees only the state (L572-L578).
 //!
-//! That creates the one problem safe Rust has here that C does not. C's `put`
-//! and `state->window` are two pointers to the same bytes; two live `&mut`
-//! references to one buffer are not expressible in Rust and never will be. So
-//! for the duration of [`inflate_back`] the window is *moved out* of the state
-//! (leaving [`InflateWindow::absent`] behind), used as the output buffer, and
-//! moved back before the function returns. `inflate_fast` is built for exactly
-//! this: an absent window slot is how it recognises the `inflateBack` caller,
-//! after which window offsets and output offsets name the same byte. Nothing
-//! observable changes -- the state's window slot is restored on every exit path,
-//! including error paths.
+//! ★ **The window is supplied to [`inflate_back`] once per call, and is not stored in
+//! the state at all.** C can keep the pointer for the state's whole life; a Rust
+//! `&mut [u8]` cannot, because holding one asserts *exclusive* access for as long as
+//! it is held, and `zlib.h` L1174-L1175 asks the application only not to change the
+//! window "until `inflateBack()` returns". Between calls, and after `inflateBackEnd`,
+//! the buffer is the caller's again -- to read, to reuse, or to free. A borrow retained
+//! across that boundary would be a claim the caller is entitled to violate and, worse,
+//! one that can outlive the memory it describes. [`inflate_back_init`] therefore
+//! records only the required extent, in `wsize`, and [`inflate_back`] refuses a window
+//! whose length disagrees with it.
+//!
+//! That also disposes of the one problem safe Rust has here that C does not. C's `put`
+//! and `state->window` are two pointers to the same bytes; two live `&mut` references
+//! to one buffer are not expressible in Rust and never will be. Because the window
+//! arrives as the *output buffer* and the state's own window slot stays
+//! [`InflateState`]-absent throughout, only one `&mut` ever exists. `inflate_fast` is
+//! built for exactly this: an absent window slot is how it recognises the
+//! `inflateBack` caller, after which window offsets and output offsets name the same
+//! byte.
 //!
 //! # ★ The window is *not* zero-initialised, and `whave` is the guard
 //!
@@ -156,8 +161,8 @@
 //!
 //! # Visibility
 //!
-//! The three entry points and the two callback traits are `pub`, because the planned
-//! `crates/libz-rs-sys/src/infback.rs` will build `inflateBackInit_`, `inflateBack`
+//! The three entry points and the two callback traits are `pub`, because
+//! `crates/libz-rs-sys/src/infback.rs` builds `inflateBackInit_`, `inflateBack`
 //! and `inflateBackEnd` on top of them. Everything else is private. Nothing here
 //! is `#[no_mangle]`, `extern "C"` or `#[repr(C)]`: `zlib.map` lists
 //! `inflate_fast`, `inflate_table` and `inflate_fixed` in its `local:` block, and
@@ -183,12 +188,13 @@ use crate::inflate::inffast::{
 };
 use crate::inflate::inftrees::{inflate_table, Code, CodeTableSource, CodeType, TABLE_OK};
 use crate::inflate::mode::Mode;
-use crate::inflate::state::{InflateState, InflateWindow};
+use crate::inflate::state::InflateState;
 use crate::inflate::{
     MSG_INVALID_BIT_LENGTH_REPEAT, MSG_INVALID_BLOCK_TYPE, MSG_INVALID_CODE_LENGTHS_SET,
     MSG_INVALID_DISTANCES_SET, MSG_INVALID_LITERAL_LENGTHS_SET, MSG_INVALID_STORED_BLOCK_LENGTHS,
     MSG_MISSING_END_OF_BLOCK, MSG_TOO_MANY_SYMBOLS,
 };
+use crate::read_buf::{OutputCursor, OutputRegion};
 
 /// Permutation of the code-length code lengths, RFC 1951 §3.2.7.
 ///
@@ -528,7 +534,7 @@ pub struct InflateBackResult<'i> {
 /// The two ways an arm of C's `switch (state->mode)` can end.
 ///
 /// Naming them is what replaces `goto inf_leave`: an arm says how it finished,
-/// and [`Backer::run`] acts on it, so the epilogue has exactly one call site
+/// and `Backer::run` acts on it, so the epilogue has exactly one call site
 /// instead of eight jump targets.
 ///
 /// There are only two variants, where the `inflate()` driver needs four, because
@@ -651,17 +657,21 @@ fn store_length_at_have<'a, A: Allocator<'a>>(
 /// |---|---|
 /// | L30-L32 `version`/`stream_size` check giving `Z_VERSION_ERROR` | the facade; `ZLIB_VERSION` is not this crate's business |
 /// | L33-L35 `strm` and `window` null checks | the facade for `strm`; a `&mut [u8]` cannot be null |
-/// | L33-L35 `windowBits < 8 \|\| windowBits > 15` | [`InflateState::with_borrowed_window`], through `crate::config::validate_inflate_back_window_bits` |
+/// | L33-L35 `windowBits < 8 \|\| windowBits > 15` | [`InflateState::for_inflate_back`], through `crate::config::validate_inflate_back_window_bits` |
 /// | L36 `strm->msg = Z_NULL` | the facade, which owns `z_stream` |
 /// | L37-L50 defaulting `zalloc`/`zfree` to `zcalloc`/`zcfree` | the facade, which owns the hook pointers |
 /// | L51-L53 `ZALLOC` of the state, `Z_MEM_ERROR` on failure | the facade, which boxes the returned value through the caller's `zalloc` |
 /// | L55 installing it into `strm->state` | the facade |
 /// | L56-L62 `dmax`, `wbits`, `wsize`, `window`, `wnext`, `whave`, `sane` | the returned value, fully initialised |
 ///
-/// `window` must hold at least `2**window_bits` bytes; a longer slice is accepted
-/// and only that prefix is borrowed, which matches C's implicit window extent.
-/// Its contents are irrelevant -- see the module documentation on why `whave`,
-/// rather than initialisation, is what makes the window safe to read from.
+/// ★ **The window is not an argument here, and that is the point.** C's L59 keeps the
+/// caller's pointer for the state's whole life; a `&mut [u8]` cannot, because it
+/// asserts exclusive access for as long as it is held while `zlib.h` L1174-L1175 asks
+/// the application only to leave the buffer alone "until `inflateBack()` returns". The
+/// window is therefore supplied to [`inflate_back`] once per call, and this
+/// constructor records only its required extent in `wsize`. Its contents are
+/// irrelevant -- see the module documentation on why `whave`, rather than
+/// initialisation, is what makes the window safe to read from.
 ///
 /// ★ C does **not** zero the freshly allocated state: there is no `zmemzero` at
 /// L51-L53, unlike `inflateInit2_`. It does not need to, because `inflateBack`
@@ -676,10 +686,9 @@ fn store_length_at_have<'a, A: Allocator<'a>>(
 /// representable -- the code C returns at L35.
 pub fn inflate_back_init<'a, A: Allocator<'a>>(
     window_bits: i32,
-    window: &'a mut [u8],
     allocator: A,
 ) -> Result<InflateState<'a, A>, ReturnCode> {
-    InflateState::with_borrowed_window(window_bits, window, allocator)
+    InflateState::for_inflate_back(window_bits, allocator)
 }
 
 /// Releases everything the decoder state owns.
@@ -705,16 +714,22 @@ pub fn inflate_back_init<'a, A: Allocator<'a>>(
 ///   `z_stream.state`, both through the caller's hooks. That half of `inflateBackEnd` cannot
 ///   happen here, because this crate never allocated the container and holds no pointer to it.
 ///
-/// The window is *not* freed, in C or here, because the caller owns it -- dropping a borrowed
-/// [`InflateWindow`] only ends the borrow.
+/// The window is *not* freed, in C or here, because the caller owns it -- and this state never
+/// held it in the first place: it arrives as an argument to [`inflate_back`] and the borrow ends
+/// when that call returns.
 ///
 /// Always [`ReturnCode::OK`]. C's three failure conditions at L573-L574 are all
 /// unrepresentable for an owned [`InflateState`]: a null `strm`, a null
 /// `strm->state` and a null `zfree` are the facade's to check, and
 /// `test/infcover.c` exercises exactly that with
 /// `inflateBackEnd(Z_NULL) == Z_STREAM_ERROR`.
+///
+/// ★ The state arrives by mutable reference for the reason
+/// [`crate::inflate::inflate_end`] gives: a state moved into a call carries its
+/// window's borrow in argument position, where freeing the window would be undefined
+/// behaviour.
 #[must_use]
-pub fn inflate_back_end<'a, A: Allocator<'a>>(state: InflateState<'a, A>) -> ReturnCode {
+pub fn inflate_back_end<'a, A: Allocator<'a>>(state: &mut InflateState<'a, A>) -> ReturnCode {
     state.release();
     ReturnCode::OK
 }
@@ -765,24 +780,30 @@ pub fn inflate_back_end<'a, A: Allocator<'a>>(state: InflateState<'a, A>) -> Ret
 /// Never [`ReturnCode::OK`]: `zlib.h` L1204 states outright that
 /// "`inflateBack()` cannot return `Z_OK`".
 ///
-/// # ★ The window is borrowed out of the state for the duration
+/// # ★ The window is an argument, borrowed for exactly this call
 ///
-/// C's `put` and `state->window` address the same bytes. Safe Rust cannot hold
-/// two `&mut` views of one buffer, so the window is moved out of
-/// `state.window` here, handed to the engine as *the output buffer*, and moved
-/// back before this function returns -- on every path, error paths included.
-/// Leaving the slot [`InflateWindow::absent`] while the engine runs is also
-/// exactly how `inflate_fast` recognises this caller and reads history from the
-/// output buffer instead of from a separate window.
+/// C's `put` and `state->window` address the same bytes. Safe Rust cannot hold two `&mut`
+/// views of one buffer, so there is only ever one: the window arrives here as
+/// *the output buffer*, and the state's own window slot stays absent throughout --
+/// permanently, for a state built by [`inflate_back_init`]. That is also exactly how
+/// `inflate_fast` recognises this caller and reads history from the output buffer
+/// instead of from a separate window.
+///
+/// Taking the window per call rather than storing it is what keeps the exclusive
+/// borrow honest: `zlib.h` L1174-L1175 asks the application not to change the window
+/// "until `inflateBack()` returns", and says nothing about the intervals in between --
+/// during which the buffer is the caller's to read, write or free. See
+/// [`InflateState::for_inflate_back`].
 ///
 /// C's guards at L209-L210 -- a null `strm` or a null `strm->state` -- are the
-/// facade's, because a `&mut InflateState` proves both. What is checked here
-/// instead is that the state really does carry an `inflateBack` window whose
-/// extent agrees with `wsize`; [`inflate_back_init`] guarantees it, and anything
-/// else is C's "the state was not initialized" case, [`ReturnCode::STREAM_ERROR`].
+/// facade's, because a `&mut InflateState` proves both. What is checked here instead
+/// is that `window` really can serve as this state's output buffer: at least `wsize`
+/// bytes, and a state that is not already carrying a window of its own. Anything else
+/// is C's "the state was not initialized" case, [`ReturnCode::STREAM_ERROR`].
 #[must_use]
 pub fn inflate_back<'a, 'i, A, I, O>(
     state: &mut InflateState<'a, A>,
+    window: &mut [u8],
     next_in: Option<&'i [u8]>,
     input: I,
     output: O,
@@ -792,48 +813,49 @@ where
     I: InflateBackInput<'i>,
     O: InflateBackOutput,
 {
-    // Borrow the window out of the state; see the note above. `slot` is restored
-    // unconditionally below, so this is invisible to every caller.
-    let mut slot = core::mem::replace(&mut state.window, InflateWindow::absent());
-    let result = match window_extent(&mut slot, state.wsize) {
-        Some(window) => run(state, window, next_in, input, output),
-        // C would proceed with `put == NULL` and `left == 0` here and loop
-        // forever inside `ROOM()`; refusing the call is the same "state was not
-        // properly initialized" outcome `zlib.h` L1203 describes, and it
-        // terminates.
-        None => InflateBackResult {
+    let Some(window) = window_prefix(state, window) else {
+        // C would proceed with `put == NULL` and `left == 0` here and loop forever
+        // inside `ROOM()`; refusing the call is the same "state was not properly
+        // initialized" outcome `zlib.h` L1203 describes, and it terminates.
+        return InflateBackResult {
             code: ReturnCode::STREAM_ERROR,
             next_in,
             msg: None,
-        },
+        };
     };
-    state.window = slot;
-    result
+    run(state, window, next_in, input, output)
 }
 
-/// Borrows the window out of `slot`, provided it is usable as an `inflateBack`
-/// output buffer.
+/// The exactly-`wsize`-byte prefix of `window` this state may use as its
+/// `inflateBack` output buffer.
 ///
-/// Yields [`None`] -- which becomes [`ReturnCode::STREAM_ERROR`] -- when the slot
-/// is C's null `state->window`, when the window is empty, or when its extent
-/// disagrees with `wsize`. [`inflate_back_init`] establishes all three, so this
-/// only ever rejects a state that was not built for `inflateBack`.
+/// [`None`] -- which becomes [`ReturnCode::STREAM_ERROR`] -- when `wsize` is zero or
+/// unrepresentable, when the window is shorter than `wsize`, or when the state already
+/// carries a window of its own. [`inflate_back_init`] establishes the first, so this
+/// only ever rejects a state that was not built for `inflateBack` or a caller that
+/// supplied too small a buffer.
 ///
-/// Requiring the two to agree is what lets the rest of the module use
-/// `window.len()` as C uses `state->wsize` and know the two are the same number:
-/// every bound below is then established against the slice that actually exists.
-fn window_extent<'w, 'a, A: Allocator<'a>>(
-    slot: &'w mut InflateWindow<'a, A>,
-    wsize: u32,
+/// ★ **A longer window is accepted and truncated, not refused.** C receives a bare
+/// `unsigned char *` and reads `state->wsize` bytes; it never learns how large the
+/// caller's buffer really was, so a generous caller is simply not C's problem
+/// (`zlib.h` L1163-L1166 states the minimum, not the exact size). Truncating here
+/// reproduces that, and it is also what lets the rest of the module use
+/// `window.len()` as C uses `state->wsize` and know the two are the same number: every
+/// bound is then established against the slice that actually exists.
+///
+/// The last test is the one with no C counterpart. An `inflateBack` state owns no
+/// window (`infback.c` L51 allocates only the state), so a state whose slot is
+/// occupied was not built by [`inflate_back_init`] -- and proceeding would mean two
+/// live views of two different buffers both claiming to be "the window".
+fn window_prefix<'w, 'a, A: Allocator<'a>>(
+    state: &InflateState<'a, A>,
+    window: &'w mut [u8],
 ) -> Option<&'w mut [u8]> {
-    let Ok(expected) = usize::try_from(wsize) else {
-        return None;
-    };
-    let window = slot.as_mut_slice()?;
-    if window.is_empty() || window.len() != expected {
+    let expected = usize::try_from(state.wsize).ok()?;
+    if expected == 0 || !state.window.is_absent() {
         return None;
     }
-    Some(window)
+    window.get_mut(..expected)
 }
 
 /// Resets the state, runs the state machine, and performs the `inf_leave`
@@ -842,7 +864,7 @@ fn window_extent<'w, 'a, A: Allocator<'a>>(
 /// This is `inflateBack`'s body from L214 onwards, with the window already
 /// borrowed. Splitting it out is what guarantees the property the reference gets
 /// from a label: the final flush at L562-L566 has **one** call site, and no
-/// early return can skip it, because [`Backer::run`] returns a value rather than
+/// early return can skip it, because `Backer::run` returns a value rather than
 /// jumping.
 fn run<'a, 'i, A, I, O>(
     state: &mut InflateState<'a, A>,
@@ -867,7 +889,7 @@ where
     // of `chunk`, so C's `have = next != Z_NULL ? strm->avail_in : 0` needs no
     // counterpart: `None` yields zero and `Some` yields the slice's length.
     // `left = state->wsize` is likewise implied by `put == 0` together with
-    // `window.len() == wsize`, which `window_extent` has just established.
+    // `window.len() == wsize`, which `window_prefix` has just established.
     let mut backer = Backer {
         chunk: next_in,
         consumed: 0,
@@ -981,18 +1003,26 @@ where
         if self.have() != 0 {
             return true;
         }
+
+        // ★ **Drop the exhausted chunk's borrow *before* the callback runs.** C's `in()`
+        // is documented to keep its bytes stable only "until in() is called again or
+        // until inflateBack() returns" (`infback.c` L172-L174), so refilling the same
+        // buffer on the next call is not merely permitted, it is the obvious
+        // implementation -- `test/infcover.c`'s `pull` hands back the *same* static
+        // array each time. A `&[u8]` still borrowing those bytes while the callback
+        // writes them would be undefined behaviour whether or not it is ever read
+        // again. Clearing first costs nothing: this line is reached only when the chunk
+        // is exhausted, and both outcomes below assign the field anyway.
+        self.chunk = None;
+        self.consumed = 0;
+
         match self.input.next_chunk() {
             Some(chunk) if !chunk.is_empty() => {
                 self.chunk = Some(chunk);
-                self.consumed = 0;
                 true
             }
-            _ => {
-                // L104-L106.
-                self.chunk = None;
-                self.consumed = 0;
-                false
-            }
+            // L104-L106: `next = Z_NULL`, which the cleared field above already is.
+            _ => false,
         }
     }
 
@@ -1053,7 +1083,7 @@ where
     ///
     /// Returns `false` when `out()` failed, which the caller turns into
     /// [`ReturnCode::BUF_ERROR`] (L158). On success the window always has at
-    /// least one free byte, because [`window_extent`] rejected an empty window;
+    /// least one free byte, because [`window_prefix`] rejected an empty window;
     /// that is what makes the copy loops below make progress.
     fn room<'a, A: Allocator<'a>>(&mut self, state: &mut InflateState<'a, A>) -> bool {
         if self.left() != 0 {
@@ -1883,10 +1913,17 @@ where
     /// # What replaces `RESTORE()` and `LOAD()`
     ///
     /// C spills six locals into `z_stream` (L80-L88), calls `inflate_fast`, then
-    /// reloads them (L69-L77). Here the input slice, the two cursors, the output
-    /// slice and the accumulator are passed directly -- the cursors as `&mut`, so
-    /// the callee updates them in place -- and `hold`, `bits` and `mode` already
-    /// live in the state. The spill and the reload therefore have nothing to do.
+    /// reloads them (L69-L77). Here the input slice, the input cursor and the output
+    /// cursor are passed directly -- the cursors as `&mut`, so the callee updates
+    /// them in place -- and `hold`, `bits` and `mode` already live in the state. The
+    /// spill and the reload therefore have nothing to do.
+    ///
+    /// The output cursor is built here, around the call, rather than held in this
+    /// structure: `inflateBack`'s output buffer is the window, which is a `&mut [u8]`
+    /// this crate has already initialised, so it is an [`OutputRegion::init`] and
+    /// reborrowing it for the duration of the call costs nothing. `put` is the
+    /// cursor's position on the way in and is taken back from it on the way out, so
+    /// there is never a second copy of the index to keep in step.
     ///
     /// # `start` is `wsize`, not `avail_out`
     ///
@@ -1901,16 +1938,11 @@ where
             // Unreachable: `have() >= 6` implies a chunk exists.
             return Step::Leave(ReturnCode::BUF_ERROR);
         };
-        // L426. Equal to `self.window.len()`, which `window_extent` established.
+        // L426. Equal to `self.window.len()`, which `window_prefix` established.
         let start = to_index(u64::from(state.wsize));
-        let exit = inflate_fast(
-            state,
-            chunk,
-            &mut self.consumed,
-            self.window,
-            &mut self.put,
-            start,
-        );
+        let mut output = OutputCursor::from_region(OutputRegion::init(&mut *self.window), self.put);
+        let exit = inflate_fast(state, chunk, &mut self.consumed, &mut output, start);
+        self.put = output.written();
         // C's `inflate_fast` writes `strm->msg` in place on its three error paths
         // and leaves it alone otherwise, so this assignment is conditional too.
         if let Some(msg) = exit.msg {
@@ -2248,8 +2280,8 @@ mod tests {
         // so that any byte the decoder emits without having written it first shows
         // up in the output as 0xa5.
         let mut window = vec![SENTINEL_FILL; size];
-        let mut state = inflate_back_init(window_bits, &mut window, GlobalAllocator)
-            .expect("the window and exponent are valid");
+        let mut state =
+            inflate_back_init(window_bits, GlobalAllocator).expect("the exponent is valid");
 
         let mut source = match piece {
             Some(size) => Pieces::new(stream, size),
@@ -2261,9 +2293,9 @@ mod tests {
         };
         let staged = if piece.is_some() { None } else { Some(stream) };
 
-        let result = inflate_back(&mut state, staged, &mut source, &mut sink);
+        let result = inflate_back(&mut state, &mut window, staged, &mut source, &mut sink);
         let outcome = summarise(&result, &source, sink);
-        assert_eq!(inflate_back_end(state), ReturnCode::OK);
+        assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
         outcome
     }
 
@@ -2563,18 +2595,23 @@ mod tests {
         // caller. Notably `whave` returns to zero, so the second stream cannot
         // reach back into the first one's history.
         let mut window = vec![SENTINEL_FILL; 1_usize << MAX_WBITS];
-        let mut state =
-            inflate_back_init(MAX_WBITS, &mut window, GlobalAllocator).expect("valid window");
+        let mut state = inflate_back_init(MAX_WBITS, GlobalAllocator).expect("valid exponent");
 
         for _ in 0..2 {
             let mut source = Pieces::exhausted();
             let mut sink = Sink::default();
-            let result = inflate_back(&mut state, Some(HELLO_FIXED), &mut source, &mut sink);
+            let result = inflate_back(
+                &mut state,
+                &mut window,
+                Some(HELLO_FIXED),
+                &mut source,
+                &mut sink,
+            );
             assert_eq!(result.code, ReturnCode::STREAM_END);
             assert_eq!(sink.written, HELLO);
         }
 
-        assert_eq!(inflate_back_end(state), ReturnCode::OK);
+        assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -2773,16 +2810,15 @@ mod tests {
         // C compares only the count `in()` returned against zero, so a callback
         // that hands back a valid pointer and no bytes has failed.
         let mut window = vec![SENTINEL_FILL; 1_usize << MAX_WBITS];
-        let mut state =
-            inflate_back_init(MAX_WBITS, &mut window, GlobalAllocator).expect("valid window");
+        let mut state = inflate_back_init(MAX_WBITS, GlobalAllocator).expect("valid exponent");
         let mut source = Pieces::yielding_nothing();
         let mut sink = Sink::default();
 
-        let result = inflate_back(&mut state, None, &mut source, &mut sink);
+        let result = inflate_back(&mut state, &mut window, None, &mut source, &mut sink);
         assert_eq!(result.code, ReturnCode::BUF_ERROR);
         assert_eq!(result.next_in, None);
         assert_eq!(source.calls, 1);
-        assert_eq!(inflate_back_end(state), ReturnCode::OK);
+        assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -2832,16 +2868,15 @@ mod tests {
         // `infback.c` L33-L35: a plain `windowBits < 8 || windowBits > 15`. None of
         // `inflateInit2_`'s conveniences apply -- no negative raw request, no +16
         // gzip request, no +32 automatic detection, no zero.
-        let mut window = vec![0_u8; 1_usize << MAX_WBITS];
         for exponent in [MIN_WBITS, 9, 12, MAX_WBITS] {
             assert!(
-                inflate_back_init(exponent, &mut window, GlobalAllocator).is_ok(),
+                inflate_back_init(exponent, GlobalAllocator).is_ok(),
                 "windowBits = {exponent} must be accepted"
             );
         }
         for exponent in [0, 1, 7, 16, 31, 32, 47, -1, -8, -15, i32::MIN, i32::MAX] {
             assert_eq!(
-                inflate_back_init(exponent, &mut window, GlobalAllocator).err(),
+                inflate_back_init(exponent, GlobalAllocator).err(),
                 Some(ReturnCode::STREAM_ERROR),
                 "windowBits = {exponent} must be rejected"
             );
@@ -2849,18 +2884,57 @@ mod tests {
     }
 
     #[test]
-    fn a_window_shorter_than_the_requested_size_is_rejected() {
-        let mut window = vec![0_u8; 255];
-        assert_eq!(
-            inflate_back_init(MIN_WBITS, &mut window, GlobalAllocator).err(),
-            Some(ReturnCode::STREAM_ERROR)
-        );
+    fn a_window_of_the_wrong_size_is_rejected_by_the_call_that_supplies_it() {
+        // The window is a per-call argument, so its extent is checked on the call
+        // rather than at initialisation -- which is where a caller could get it wrong
+        // more than once. `wsize` is the number it must match.
+        let mut state = inflate_back_init(MIN_WBITS, GlobalAllocator).expect("valid exponent");
 
-        // Exactly the requested size is accepted, and so is more than enough.
-        let mut exact = vec![0_u8; 256];
-        assert!(inflate_back_init(MIN_WBITS, &mut exact, GlobalAllocator).is_ok());
-        let mut generous = vec![0_u8; 1024];
-        assert!(inflate_back_init(MIN_WBITS, &mut generous, GlobalAllocator).is_ok());
+        for len in [0_usize, 1, 255] {
+            let mut window = vec![0_u8; len];
+            let mut source = Pieces::exhausted();
+            let mut sink = Sink::default();
+            let refused = inflate_back(
+                &mut state,
+                &mut window,
+                Some(HELLO_FIXED),
+                &mut source,
+                &mut sink,
+            );
+            assert_eq!(
+                refused.code,
+                ReturnCode::STREAM_ERROR,
+                "a {len}-byte window cannot serve windowBits = {MIN_WBITS}"
+            );
+            assert_eq!(sink.calls, 0, "the output callback is never reached");
+        }
+
+        // Exactly the requested size is accepted, and so is more than enough: C reads
+        // `wsize` bytes and never learns the buffer's real length, so a generous caller
+        // is not its problem either.
+        for len in [256_usize, 257, 1024] {
+            let mut window = vec![0_u8; len];
+            let mut source = Pieces::exhausted();
+            let mut sink = Sink::default();
+            let accepted = inflate_back(
+                &mut state,
+                &mut window,
+                Some(HELLO_FIXED),
+                &mut source,
+                &mut sink,
+            );
+            assert_eq!(
+                accepted.code,
+                ReturnCode::STREAM_END,
+                "a {len}-byte window must serve windowBits = {MIN_WBITS}"
+            );
+            assert_eq!(sink.written, HELLO);
+            assert!(
+                window[256..].iter().all(|&byte| byte == 0),
+                "bytes past 2**windowBits must be untouched"
+            );
+        }
+        assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -2869,17 +2943,26 @@ mod tests {
         // `ROOM()` forever. Refusing the call is `zlib.h` L1203's "the stream was
         // not properly initialized", and it terminates.
         let mut window = vec![0_u8; 1_usize << MIN_WBITS];
-        let mut state =
-            inflate_back_init(MIN_WBITS, &mut window, GlobalAllocator).expect("valid window");
-        state.discard_window();
+        let mut state = inflate_back_init(MIN_WBITS, GlobalAllocator).expect("valid exponent");
+        // An `inflateBack` state carries no window of its own, so occupying the slot is
+        // what makes it unusable: `inflate_back` refuses a state that already holds one,
+        // because proceeding would mean two buffers both claiming to be "the window".
+        state.window = crate::inflate::state::InflateWindow::borrowed(&mut window);
 
         let mut source = Pieces::exhausted();
         let mut sink = Sink::default();
-        let result = inflate_back(&mut state, Some(HELLO_FIXED), &mut source, &mut sink);
+        let mut output = vec![0_u8; 1_usize << MIN_WBITS];
+        let result = inflate_back(
+            &mut state,
+            &mut output,
+            Some(HELLO_FIXED),
+            &mut source,
+            &mut sink,
+        );
         assert_eq!(result.code, ReturnCode::STREAM_ERROR);
         assert_eq!(result.msg, None);
         assert_eq!(sink.calls, 0);
-        assert_eq!(inflate_back_end(state), ReturnCode::OK);
+        assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -2887,9 +2970,12 @@ mod tests {
         // `inflateBackEnd` frees the state, never the window: the caller owns that
         // buffer, and here the borrow simply ends. Reading the window afterwards
         // is proof that it survived.
-        let mut window = vec![0x11_u8; 1_usize << MIN_WBITS];
-        let state = inflate_back_init(MIN_WBITS, &mut window, GlobalAllocator).expect("valid");
-        assert_eq!(inflate_back_end(state), ReturnCode::OK);
+        let window = vec![0x11_u8; 1_usize << MIN_WBITS];
+        let mut state = inflate_back_init(MIN_WBITS, GlobalAllocator).expect("valid exponent");
+        // ★ The state arrives by mutable reference, so its buffers are released in
+        // place rather than in argument position; see `inflate_back_end`.
+        assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
+
         assert!(window.iter().all(|&byte| byte == 0x11));
     }
 

@@ -71,7 +71,9 @@
 
 use core::cell::RefCell;
 
-use zlib_rs::allocate::{block_len, Allocator, AllocatorId, Buffer, Opaque, SENTINEL_FILL};
+use zlib_rs::allocate::{
+    block_len, Allocator, AllocatorId, Buffer, ForeignBlock, Opaque, SENTINEL_FILL,
+};
 use zlib_rs::error::ReturnCode;
 
 /// Asserts that a status code reports success, panicking with `msg` if it does not.
@@ -453,6 +455,42 @@ impl MemReport {
 /// used and can be handed to the library as `&tracker` -- a shared reference to an
 /// allocator is itself an allocator, through the blanket implementation -- while the
 /// test keeps the original to interrogate.
+///
+/// # ★ What this tracker cannot see, and which instrument to use instead
+///
+/// Every figure here counts bytes the library requested **through this allocator**,
+/// and that is strictly narrower than what a stream costs a process. Four kinds of
+/// allocation are invisible to it, and mistaking a figure from here for a per-stream
+/// total would understate that total substantially:
+///
+/// * the facade's `GzBlock` and every `z_stream` state block, which come from the
+///   caller's `zalloc` or -- for a `gzFile`, which has no caller hooks at all -- from
+///   Rust's global allocator;
+/// * a `gzFile`'s path and error message, which are `Box<[u8]>` from the global
+///   allocator, exactly as C's are `malloc` (`gzlib.c` L200-L204 and L559-L563);
+/// * `EngineBox`, the fallible one-element `Vec` that carries a deflate or inflate
+///   state inside a `gzFile`; and
+/// * a boxed `GzHandle`, when a handle is injected rather than opened by path.
+///
+/// So this tracker answers "how many bytes did the algorithm ask *me* for", which is
+/// what `test/infcover.c`'s `mem_high` answers and what makes it the right instrument
+/// for leak, ordering, exhaustion and zero-dependence checking. It does **not** answer
+/// "what does one stream cost". For that figure -- AAP §0.8.4's ≤15% per-stream memory
+/// gate -- the instrument is a counting global allocator, and one exists:
+/// `crates/libz-rs-sys/tests/gz_memory.rs` installs a pass-through
+/// `#[global_allocator]` over `System` and reports idle and active high-water for a
+/// `gzFile` separately, against the C figures.
+///
+/// # ★ And why this tracker must not be used for throughput
+///
+/// [`SENTINEL_FILL`] is what makes the zero-dependence check above work, and it is
+/// also a full pass over every block handed out -- roughly 256 KiB for one default
+/// deflate initialisation. C's `malloc` writes none of it. Any timing taken through
+/// this allocator therefore measures the fill as well as the library, and a
+/// steady-state throughput number taken this way would be wrong in a direction that
+/// flatters nothing and explains nothing. Measure throughput through
+/// `GlobalAllocator`, or through the caller's own hooks, and keep this tracker for the
+/// correctness properties it was built for.
 #[derive(Debug, Default)]
 pub struct TrackingAllocator {
     /// The books. Private, and reachable only through the accessors below, so no
@@ -505,6 +543,11 @@ impl TrackingAllocator {
     /// release lowers [`TrackingAllocator::total`] but never this, which is what
     /// makes it a usable measure of a stream's peak working-set size after the
     /// stream has already been torn down.
+    ///
+    /// It is the peak *this allocator served*, not the peak the process reached: the
+    /// state block, a `gzFile`'s path and message, `EngineBox` and a boxed handle are
+    /// all outside it. See the type's documentation for the full list and for the
+    /// instrument that does measure a per-stream total.
     #[must_use]
     pub fn high_water(&self) -> usize {
         self.zone.borrow().high_water
@@ -685,10 +728,13 @@ impl<'a> Allocator<'a> for TrackingAllocator {
     /// `GlobalAllocator` exactly. C's unconditional trailing `free(ptr)` (L153) has
     /// no counterpart because a refused block here is never freed by the wrong
     /// allocator in the first place.
-    fn deallocate_bytes(&self, buffer: Buffer<'a, u8>) {
-        let address = Self::address_of(&buffer);
-        let length = buffer.len();
-        self.zone.borrow_mut().release(address, length);
+    fn deallocate_bytes(&self, slot: &mut Option<Buffer<'a, u8>>) {
+        if let Some(buffer) = slot.as_ref() {
+            let address = Self::address_of(buffer);
+            let length = buffer.len();
+            self.zone.borrow_mut().release(address, length);
+        }
+        let Some(buffer) = slot.take() else { return };
         drop(buffer.release_to(self));
     }
 
@@ -696,12 +742,23 @@ impl<'a> Allocator<'a> for TrackingAllocator {
     ///
     /// The [`Allocator::deallocate_bytes`] counterpart. `Buffer::len` counts
     /// elements, so it is scaled to bytes to match what was recorded on the way in.
-    fn deallocate_u16s(&self, buffer: Buffer<'a, u16>) {
-        let address = Self::address_of(&buffer);
-        let length = buffer.len() * size_of::<u16>();
-        self.zone.borrow_mut().release(address, length);
+    fn deallocate_u16s(&self, slot: &mut Option<Buffer<'a, u16>>) {
+        if let Some(buffer) = slot.as_ref() {
+            let address = Self::address_of(buffer);
+            let length = buffer.len() * size_of::<u16>();
+            self.zone.borrow_mut().release(address, length);
+        }
+        let Some(buffer) = slot.take() else { return };
         drop(buffer.release_to(self));
     }
+
+    /// Never reached: every block this allocator hands out is Rust-owned, so
+    /// `Buffer::release_to` reports it as handled and this method has nothing to do.
+    fn release_foreign_bytes(&self, _block: ForeignBlock<'a, u8>) {}
+
+    /// Never reached, for the reason [`TrackingAllocator::release_foreign_bytes`]
+    /// gives.
+    fn release_foreign_u16s(&self, _block: ForeignBlock<'a, u16>) {}
 }
 
 /// The committed deterministic corpus: one fixture per payload class the suites need
@@ -1086,7 +1143,6 @@ mod self_tests {
         let repetitive = corpus::repetitive(300);
         assert!(repetitive.iter().all(|&byte| byte == repetitive[0]));
 
-        // A few hundred bytes of prose, per the plan.
         assert!(corpus::text().len() > 256);
 
         // 256 values, four times over.
@@ -1260,7 +1316,7 @@ mod self_tests {
         assert_eq!(tracker.total(), 48);
         assert!(tracker.high_water() >= 48);
 
-        tracker.deallocate_bytes(buffer);
+        tracker.deallocate_bytes(&mut Some(buffer));
         tracker.assert_clean();
     }
 
@@ -1271,7 +1327,7 @@ mod self_tests {
         let buffer = tracker.allocate_bytes(32, 3).unwrap();
         assert_eq!(buffer.len(), 96);
         assert_eq!(tracker.total(), 96);
-        tracker.deallocate_bytes(buffer);
+        tracker.deallocate_bytes(&mut Some(buffer));
         tracker.assert_clean();
     }
 
@@ -1287,7 +1343,7 @@ mod self_tests {
         // Accounting is in bytes, matching mem_alloc's count * size.
         assert_eq!(tracker.total(), 128);
 
-        tracker.deallocate_u16s(buffer);
+        tracker.deallocate_u16s(&mut Some(buffer));
         assert_eq!(tracker.total(), 0);
         tracker.assert_clean();
     }
@@ -1299,7 +1355,7 @@ mod self_tests {
         assert_eq!(tracker.total(), 1024);
         assert_eq!(tracker.high_water(), 1024);
 
-        tracker.deallocate_bytes(buffer);
+        tracker.deallocate_bytes(&mut Some(buffer));
         assert_eq!(tracker.total(), 0);
         assert_eq!(
             tracker.high_water(),
@@ -1324,9 +1380,9 @@ mod self_tests {
         assert_eq!(tracker.total(), 48);
 
         // Last in, first out -- the order deflateEnd releases in.
-        tracker.deallocate_bytes(second);
+        tracker.deallocate_bytes(&mut Some(second));
         assert_eq!(tracker.not_lifo(), 0);
-        tracker.deallocate_bytes(first);
+        tracker.deallocate_bytes(&mut Some(first));
         assert_eq!(tracker.not_lifo(), 0);
 
         assert_eq!(tracker.total(), 0);
@@ -1342,12 +1398,12 @@ mod self_tests {
 
         // First in, first out: the block released is not the most recent one, which
         // is what mem_free counts at test/infcover.c L136.
-        tracker.deallocate_bytes(first);
+        tracker.deallocate_bytes(&mut Some(first));
         assert_eq!(tracker.not_lifo(), 1);
         assert_eq!(tracker.total(), 32);
 
         // The second release is now of the most recent block, so it is clean.
-        tracker.deallocate_bytes(second);
+        tracker.deallocate_bytes(&mut Some(second));
         assert_eq!(tracker.not_lifo(), 1);
         assert_eq!(tracker.total(), 0);
         assert_eq!(tracker.rogue(), 0);
@@ -1367,7 +1423,7 @@ mod self_tests {
         // recorded. It shares the tracker's identity, so it is genuinely released
         // rather than refused and nothing leaks.
         let stray: Buffer<'_, u8> = Buffer::try_global(24, 0).unwrap();
-        tracker.deallocate_bytes(stray);
+        tracker.deallocate_bytes(&mut Some(stray));
 
         assert_eq!(tracker.rogue(), 1);
         // A rogue release changes nothing else, per mem_free L149-L150.
@@ -1401,13 +1457,13 @@ mod self_tests {
         // A further byte would breach it, and the u16 shape is capped identically.
         assert!(tracker.allocate_bytes(1, 1).is_none());
         assert!(tracker.allocate_u16s(1).is_none());
-        tracker.deallocate_bytes(exact);
+        tracker.deallocate_bytes(&mut Some(exact));
 
         // Zero disarms, exactly as mem_limit(&strm, 0) does at L329.
         tracker.set_limit(0);
         let unlimited = tracker.allocate_bytes(4096, 1).unwrap();
         assert_eq!(tracker.total(), 4096);
-        tracker.deallocate_bytes(unlimited);
+        tracker.deallocate_bytes(&mut Some(unlimited));
 
         tracker.assert_clean();
         assert_eq!(tracker.high_water(), 4096);
@@ -1431,7 +1487,7 @@ mod self_tests {
         let borrowed: &TrackingAllocator = &tracker;
         let buffer = borrowed.allocate_bytes(8, 4).unwrap();
         assert_eq!(tracker.total(), 32);
-        borrowed.deallocate_bytes(buffer);
+        borrowed.deallocate_bytes(&mut Some(buffer));
         tracker.assert_clean();
     }
 
@@ -1445,10 +1501,10 @@ mod self_tests {
         let pending = tracker.allocate_bytes(256, 4).unwrap();
         assert_eq!(tracker.total(), 512 + 512 + 1024 + 1024);
 
-        tracker.deallocate_bytes(pending);
-        tracker.deallocate_u16s(head);
-        tracker.deallocate_u16s(prev);
-        tracker.deallocate_bytes(window);
+        tracker.deallocate_bytes(&mut Some(pending));
+        tracker.deallocate_u16s(&mut Some(head));
+        tracker.deallocate_u16s(&mut Some(prev));
+        tracker.deallocate_bytes(&mut Some(window));
 
         tracker.assert_clean();
     }
@@ -1471,8 +1527,8 @@ mod self_tests {
         let tracker = TrackingAllocator::new();
         let first = tracker.allocate_bytes(16, 1).unwrap();
         let second = tracker.allocate_bytes(16, 1).unwrap();
-        tracker.deallocate_bytes(first);
-        tracker.deallocate_bytes(second);
+        tracker.deallocate_bytes(&mut Some(first));
+        tracker.deallocate_bytes(&mut Some(second));
         tracker.assert_clean();
     }
 
@@ -1507,8 +1563,8 @@ mod self_tests {
         assert!(second.is_empty());
         assert_eq!(tracker.total(), 0);
 
-        tracker.deallocate_bytes(second);
-        tracker.deallocate_bytes(first);
+        tracker.deallocate_bytes(&mut Some(second));
+        tracker.deallocate_bytes(&mut Some(first));
 
         // Both were recognised: neither release was rogue, and neither was counted
         // out of order.

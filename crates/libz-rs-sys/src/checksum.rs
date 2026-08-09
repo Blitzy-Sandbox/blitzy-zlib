@@ -208,10 +208,18 @@ use crate::types::{uInt, uLong, widen, z_off64_t, z_off_t, z_size_t, Bytef};
 /// bare `as u32`, because the mask states the intent and mirrors the C source's own
 /// `crc1 & 0xffffffff`.
 ///
-/// The mask is also what keeps this lint-clean: with it, the value is provably in
-/// range and `clippy::cast_possible_truncation` does not fire; without it, it does.
+/// The mask is also what keeps this free of `clippy::cast_possible_truncation`: with
+/// it, the value is provably in range; without it, the lint fires.
+///
+/// ★ On i686 and on LLP64 Windows `uLong` is already `u32`, so the masked expression
+/// is `u32 as u32` and `trivial_numeric_casts` plus `clippy::unnecessary_cast` fire
+/// instead. No single spelling is clean on every supported target -- `u32::from` would
+/// be a `useless_conversion` there and `u32::try_from` an
+/// `unnecessary_fallible_conversion` -- so the two are allowed here, scoped to this
+/// one-line function exactly as `crate::deflate`'s width helpers scope theirs.
 #[inline]
 #[must_use]
+#[allow(trivial_numeric_casts, clippy::unnecessary_cast)]
 const fn narrow_checksum(value: uLong) -> u32 {
     (value & 0xffff_ffff) as u32
 }
@@ -409,9 +417,14 @@ pub unsafe extern "C" fn adler32(adler: uLong, buf: *const Bytef, len: uInt) -> 
 #[no_mangle]
 pub unsafe extern "C" fn adler32_z(adler: uLong, buf: *const Bytef, len: z_size_t) -> uLong {
     guard(|| {
-        // SAFETY: as `adler32`. `len` is already a `usize`, since `z_size_t` is
-        // `size_t` and `types.rs` asserts the equality at compile time, so there is
-        // no conversion to justify on this path.
+        // SAFETY: unsafe-site category 2 -- the obligation is this function's own and it
+        // reaches `adler32_update` unchanged: a non-zero `len` implies `buf` is non-null and
+        // readable for exactly that many bytes for the duration of the call, and `u8` has
+        // alignment 1 so any non-null `buf` is aligned. A null `buf` is not dereferenced at
+        // all -- `adler32_update` tests it and returns the seed -- so the null case carries no
+        // obligation. Nothing is written through the pointer and nothing retains it. `len`
+        // needs no conversion here: `z_size_t` is `size_t` and `types.rs` asserts its equality
+        // with `usize` at compile time.
         unsafe { adler32_update(adler, buf, len) }
     })
 }
@@ -522,8 +535,14 @@ pub unsafe extern "C" fn crc32(crc: uLong, buf: *const Bytef, len: uInt) -> uLon
 #[no_mangle]
 pub unsafe extern "C" fn crc32_z(crc: uLong, buf: *const Bytef, len: z_size_t) -> uLong {
     guard(|| {
-        // SAFETY: as `crc32`. `len` is already a `usize`, since `z_size_t` is
-        // `size_t` and `types.rs` asserts the equality at compile time.
+        // SAFETY: unsafe-site category 2 -- the obligation is this function's own and it
+        // reaches `crc32_update` unchanged: a non-zero `len` implies `buf` is non-null and
+        // readable for exactly that many bytes for the duration of the call, and `u8` has
+        // alignment 1 so any non-null `buf` is aligned. A null `buf` is not dereferenced at
+        // all -- `crc32_update` tests it and returns the initial value -- so the null case
+        // carries no obligation. Nothing is written through the pointer and nothing retains
+        // it. `len` needs no conversion here: `z_size_t` is `size_t` and `types.rs` asserts
+        // its equality with `usize` at compile time.
         unsafe { crc32_update(crc, buf, len) }
     })
 }
@@ -816,11 +835,20 @@ mod tests {
         assert_eq!(narrow_checksum(0), 0);
         assert_eq!(narrow_checksum(1), 1);
         assert_eq!(narrow_checksum(0xffff_ffff), 0xffff_ffff);
-        // Only exercisable where `uLong` is wider than 32 bits, which is every
-        // target but LLP64 Windows; on that one the mask is already the identity.
+        // Only exercisable where `uLong` is wider than 32 bits, which is every target
+        // but i686 and LLP64 Windows; on those the mask is already the identity.
+        //
+        // The 64-bit probe is assembled from two 32-bit halves rather than written as
+        // `0x1234_5678_9abc_def0`, because a literal that wide does not fit `uLong`
+        // where `uLong` is `u32` and `overflowing_literals` rejects it at compile time
+        // -- before this run-time guard can skip it. `wrapping_shl` rather than `<<`
+        // for the same reason: a shift of 32 is well defined for every width here and
+        // needs no second `cfg` arm. `widen_checksum` carries the one-target
+        // `useless_conversion` allowance, so neither half needs a cast.
         if !fits_in_32_bits(!0) {
             assert_eq!(narrow_checksum(!0), 0xffff_ffff);
-            assert_eq!(narrow_checksum(0x1234_5678_9abc_def0), 0x9abc_def0);
+            let probe = widen_checksum(0x1234_5678).wrapping_shl(32) | widen_checksum(0x9abc_def0);
+            assert_eq!(narrow_checksum(probe), 0x9abc_def0);
         }
     }
 
@@ -1274,7 +1302,9 @@ mod tests {
 
         // Accumulating the two halves in sequence is the other route to the same
         // value, and it must not disagree with the combine route.
-        // SAFETY: as above.
+        // SAFETY: `HELLO_HEAD` and `HELLO_TAIL` are `'static` byte strings, so both pointers
+        // are non-null, aligned for `u8` and readable for the whole of the program's life; 7
+        // and 6 are their exact lengths. Nothing is written through either pointer.
         unsafe {
             let running = adler32(1, HELLO_HEAD.as_ptr(), 7);
             assert_eq!(adler32(running, HELLO_TAIL.as_ptr(), 6), HELLO_ADLER);

@@ -152,8 +152,8 @@ const CORPUS_PREFIX_UNDER_MIRI: usize = 512;
 /// creation -- 3072 bytes for a compressor in the compact configuration and 512
 /// for a decompressor's window -- and Miri interprets each of those bytes
 /// individually. Visiting all eight classes through two allocators means
-/// thirty-two streams, which measured at roughly four seconds each: the sweep did
-/// not finish in ten minutes even with every payload truncated to 512 bytes.
+/// thirty-two streams, and interpreting that many buffer fills is expensive enough
+/// to dominate the run even with every payload truncated to 512 bytes.
 ///
 /// So the class list is bounded too, and these two are the ones chosen, because
 /// they are the classes whose encoder decisions no *other* ungated test in this
@@ -281,7 +281,7 @@ where
     // (`zlib.h` L373-L377); a finished stream must report `Z_OK`. `check_err` is
     // the `CHECK_ERR` macro of `test/example.c` L28-L33, which is how the C suite
     // spells this and which reports the numeric code a maintainer will look for.
-    check_err(deflate_end(state), "deflateEnd");
+    check_err(deflate_end(&mut state), "deflateEnd");
 
     packed.truncate(produced);
     packed
@@ -319,7 +319,7 @@ where
         stream.next_out
     };
 
-    check_err(inflate_end(state), "inflateEnd");
+    check_err(inflate_end(&mut state), "inflateEnd");
 
     plain.truncate(produced);
     plain
@@ -381,7 +381,7 @@ where
 fn a_compressor_returns_every_block_it_took() {
     let tracker = TrackingAllocator::new();
 
-    let state = deflate_init2(compact_config(), &tracker).expect("deflate_init2");
+    let mut state = deflate_init2(compact_config(), &tracker).expect("deflate_init2");
     // All four buffers exist at this point, and the figure is exact rather than
     // approximate: `w_size * 2` + `w_size * 2` + `hash_size * 2` +
     // `lit_bufsize * LIT_BUFS` for the compact configuration.
@@ -391,7 +391,7 @@ fn a_compressor_returns_every_block_it_took() {
         "deflateInit2 did not take the four buffers of deflate.c L458-L505"
     );
 
-    check_err(deflate_end(state), "deflateEnd");
+    check_err(deflate_end(&mut state), "deflateEnd");
 
     assert_eq!(tracker.total(), 0, "bytes outstanding after deflateEnd");
     assert_eq!(tracker.not_lifo(), 0, "releases not LIFO after deflateEnd");
@@ -434,7 +434,7 @@ fn a_decompressor_returns_its_lazily_allocated_window() {
         "the lazily allocated window is 1 << wbits bytes"
     );
 
-    check_err(inflate_end(state), "inflateEnd");
+    check_err(inflate_end(&mut state), "inflateEnd");
 
     assert_eq!(tracker.total(), 0, "bytes outstanding after inflateEnd");
     assert_eq!(tracker.not_lifo(), 0, "releases not LIFO after inflateEnd");
@@ -461,10 +461,11 @@ fn blocks_never_cross_between_two_independent_allocators() {
     let first = TrackingAllocator::new();
     let second = TrackingAllocator::new();
 
-    let first_state = deflate_init2(compact_config(), &first).expect("deflate_init2 on first");
+    let mut first_state = deflate_init2(compact_config(), &first).expect("deflate_init2 on first");
     // Interleaved deliberately: both allocators have live blocks here, so a
     // mismatched release has something wrong to reach for.
-    let second_state = deflate_init2(compact_config(), &second).expect("deflate_init2 on second");
+    let mut second_state =
+        deflate_init2(compact_config(), &second).expect("deflate_init2 on second");
 
     assert_eq!(first.total(), COMPACT_FOOTPRINT, "first allocator's blocks");
     assert_eq!(
@@ -475,14 +476,18 @@ fn blocks_never_cross_between_two_independent_allocators() {
 
     // Torn down in the opposite order to construction, so the release sequence is
     // not merely the mirror image of the allocation sequence.
-    assert_eq!(deflate_end(first_state), ReturnCode::OK, "first deflateEnd");
+    assert_eq!(
+        deflate_end(&mut first_state),
+        ReturnCode::OK,
+        "first deflateEnd"
+    );
     assert_eq!(
         second.total(),
         COMPACT_FOOTPRINT,
         "second untouched by first"
     );
     assert_eq!(
-        deflate_end(second_state),
+        deflate_end(&mut second_state),
         ReturnCode::OK,
         "second deflateEnd"
     );
@@ -513,7 +518,7 @@ fn the_high_water_mark_is_monotonic_and_survives_teardown() {
     let tracker = TrackingAllocator::new();
     assert_eq!(tracker.high_water(), 0, "a fresh tracker has no history");
 
-    let first = deflate_init2(compact_config(), &tracker).expect("first deflate_init2");
+    let mut first = deflate_init2(compact_config(), &tracker).expect("first deflate_init2");
     let after_one = tracker.high_water();
     assert_eq!(after_one, COMPACT_FOOTPRINT, "peak after one compressor");
     assert!(
@@ -522,7 +527,7 @@ fn the_high_water_mark_is_monotonic_and_survives_teardown() {
     );
 
     // A second live compressor doubles what is outstanding, so the peak must rise.
-    let second = deflate_init2(compact_config(), &tracker).expect("second deflate_init2");
+    let mut second = deflate_init2(compact_config(), &tracker).expect("second deflate_init2");
     let after_two = tracker.high_water();
     assert_eq!(
         after_two,
@@ -538,7 +543,11 @@ fn the_high_water_mark_is_monotonic_and_survives_teardown() {
     // non-LIFO -- correctly, but for a reason that has nothing to do with the
     // library. `test/infcover.c` never meets this because `mem_setup` gives every
     // stream its own zone (L158-L173).
-    assert_eq!(deflate_end(second), ReturnCode::OK, "second deflateEnd");
+    assert_eq!(
+        deflate_end(&mut second),
+        ReturnCode::OK,
+        "second deflateEnd"
+    );
     assert_eq!(
         tracker.total(),
         COMPACT_FOOTPRINT,
@@ -546,7 +555,7 @@ fn the_high_water_mark_is_monotonic_and_survives_teardown() {
     );
     assert_eq!(tracker.high_water(), after_two, "the peak fell on release");
 
-    assert_eq!(deflate_end(first), ReturnCode::OK, "first deflateEnd");
+    assert_eq!(deflate_end(&mut first), ReturnCode::OK, "first deflateEnd");
     assert_eq!(tracker.total(), 0, "bytes outstanding after both ended");
     assert_eq!(
         tracker.high_water(),
@@ -658,8 +667,8 @@ fn a_block_handed_out_by_the_tracker_is_filled_with_the_sentinel() {
     );
 
     // Released newest first, so the sequence is last-in-first-out.
-    tracker.deallocate_u16s(positions);
-    tracker.deallocate_bytes(bytes);
+    tracker.deallocate_u16s(&mut Some(positions));
+    tracker.deallocate_bytes(&mut Some(bytes));
     tracker.assert_clean();
 }
 
@@ -805,8 +814,8 @@ fn the_fill_byte_never_reaches_the_payload() {
 ///
 /// Ignored under Miri, and only under Miri. The default configuration asks for
 /// 262144 bytes of working memory against the compact configuration's 3072, and
-/// every byte of the fill is interpreted individually, which takes about thirty
-/// seconds where the rest of this file takes two. Nothing is lost by the gate:
+/// every byte of the fill is interpreted individually, so this one test would cost
+/// more than the whole of the rest of this file. Nothing is lost by the gate:
 /// the code path is identical to
 /// [`a_round_trip_over_sentinel_filled_memory_recovers_the_input`] and
 /// [`the_default_and_injected_paths_produce_identical_output`], neither of which
@@ -1045,7 +1054,7 @@ fn a_refused_window_allocation_makes_the_decompressor_report_a_memory_error() {
     // release of anything the tracker did not hand out.
     tracker.set_limit(0);
     assert_eq!(
-        inflate_end(state),
+        inflate_end(&mut state),
         ReturnCode::OK,
         "inflateEnd after Z_MEM_ERROR"
     );
@@ -1130,9 +1139,9 @@ fn every_prefix_of_the_allocation_sequence_rolls_back_cleanly() {
         if granted == COMPACT_FOOTPRINT {
             // The control: all four buffers fit exactly, so initialisation must
             // succeed and teardown must be clean.
-            let state = outcome.expect("initialisation with an exact-fit ceiling must succeed");
+            let mut state = outcome.expect("initialisation with an exact-fit ceiling must succeed");
             assert_eq!(tracker.total(), COMPACT_FOOTPRINT, "exact-fit footprint");
-            assert_eq!(deflate_end(state), ReturnCode::OK, "deflateEnd");
+            assert_eq!(deflate_end(&mut state), ReturnCode::OK, "deflateEnd");
         } else {
             let code = outcome
                 .map(|_| ())
@@ -1285,13 +1294,13 @@ fn the_infcover_copy_budget_forces_a_memory_error() {
     // tracker's LIFO verdict clean: the copy's block, then the window, then the
     // source's block.
     tracker.set_limit(0);
-    tracker.deallocate_bytes(copy_block);
+    tracker.deallocate_bytes(&mut Some(copy_block));
     assert_eq!(
-        inflate_end(state),
+        inflate_end(&mut state),
         ReturnCode::OK,
         "inflateEnd on the source"
     );
-    tracker.deallocate_bytes(state_block);
+    tracker.deallocate_bytes(&mut Some(state_block));
 
     assert_eq!(tracker.rogue(), 0, "a release was not recognised");
     assert_eq!(tracker.not_lifo(), 0, "a release was not LIFO");
@@ -1334,11 +1343,11 @@ fn a_ceiling_that_admits_only_the_state_block_fails_the_lazy_window() {
 
     // Teardown after the failure: no panic, no rogue release, nothing left.
     assert_eq!(
-        inflate_end(state),
+        inflate_end(&mut state),
         ReturnCode::OK,
         "inflateEnd after a refused window"
     );
-    tracker.deallocate_bytes(state_block);
+    tracker.deallocate_bytes(&mut Some(state_block));
 
     assert_eq!(tracker.total(), 0, "teardown after Z_MEM_ERROR leaked");
     assert_eq!(tracker.rogue(), 0, "teardown after Z_MEM_ERROR was rogue");
@@ -1419,8 +1428,8 @@ fn releasing_two_blocks_in_reverse_order_reports_no_anomaly() {
     assert_eq!(tracker.total(), 48, "both blocks are outstanding");
 
     // Newest first: `second` is the head of the list `mem_free` walks.
-    tracker.deallocate_bytes(second);
-    tracker.deallocate_bytes(first);
+    tracker.deallocate_bytes(&mut Some(second));
+    tracker.deallocate_bytes(&mut Some(first));
 
     assert_eq!(tracker.not_lifo(), 0, "a LIFO release was called non-LIFO");
     assert_eq!(tracker.rogue(), 0, "a known block was called unrecognised");
@@ -1448,7 +1457,7 @@ fn releasing_two_blocks_in_allocation_order_is_reported_as_not_lifo() {
     let second = tracker.allocate_bytes(1, 32).expect("second allocation");
 
     // Oldest first: `first` is behind `second` in the list, which is C's L136 path.
-    tracker.deallocate_bytes(first);
+    tracker.deallocate_bytes(&mut Some(first));
     assert_eq!(
         tracker.not_lifo(),
         1,
@@ -1456,7 +1465,7 @@ fn releasing_two_blocks_in_allocation_order_is_reported_as_not_lifo() {
     );
 
     // The second release is of the only remaining block, so it is in order.
-    tracker.deallocate_bytes(second);
+    tracker.deallocate_bytes(&mut Some(second));
     assert_eq!(
         tracker.not_lifo(),
         1,
@@ -1500,7 +1509,7 @@ fn releasing_a_block_the_tracker_never_produced_is_reported_as_rogue() {
         .allocate_bytes(1, 24)
         .expect("the default allocator must satisfy a 24-byte request");
 
-    tracker.deallocate_bytes(foreign);
+    tracker.deallocate_bytes(&mut Some(foreign));
 
     assert_eq!(
         tracker.rogue(),
@@ -1541,7 +1550,7 @@ fn a_block_that_is_never_released_is_reported_as_outstanding() {
     // Two blocks taken, one returned.
     let kept = tracker.allocate_bytes(1, 40).expect("first allocation");
     let returned = tracker.allocate_bytes(1, 8).expect("second allocation");
-    tracker.deallocate_bytes(returned);
+    tracker.deallocate_bytes(&mut Some(returned));
 
     assert_eq!(tracker.total(), 40, "the kept block is not outstanding");
 

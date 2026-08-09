@@ -362,7 +362,9 @@ where
 )]
 mod tests {
     use super::{split_tail, update_window, write_window};
-    use crate::allocate::{Allocator, AllocatorId, Buffer, GlobalAllocator, Opaque, SENTINEL_FILL};
+    use crate::allocate::{
+        Allocator, AllocatorId, Buffer, ForeignBlock, GlobalAllocator, Opaque, SENTINEL_FILL,
+    };
     // `InflateConfig` arrives through the dependency's own contract rather than as
     // a new dependency of this module: `InflateState::new` takes one, so there is
     // no way to build an ordinary inflate state without naming it. Nothing outside
@@ -464,18 +466,27 @@ mod tests {
             Some(buffer)
         }
 
-        fn deallocate_bytes(&self, buffer: Buffer<'a, u8>) {
-            self.total
-                .set(self.total.get().saturating_sub(buffer.len()));
-            self.frees.set(self.frees.get().saturating_add(1));
-            GlobalAllocator.deallocate_bytes(buffer);
+        // Never reached: the blocks come from `GlobalAllocator`, which handles them.
+        fn release_foreign_bytes(&self, _block: ForeignBlock<'a, u8>) {}
+
+        fn release_foreign_u16s(&self, _block: ForeignBlock<'a, u16>) {}
+
+        fn deallocate_bytes(&self, slot: &mut Option<Buffer<'a, u8>>) {
+            if let Some(buffer) = slot.as_ref() {
+                self.total
+                    .set(self.total.get().saturating_sub(buffer.len()));
+                self.frees.set(self.frees.get().saturating_add(1));
+            }
+            GlobalAllocator.deallocate_bytes(slot);
         }
 
-        fn deallocate_u16s(&self, buffer: Buffer<'a, u16>) {
-            let len = buffer.len().saturating_mul(size_of::<u16>());
-            self.total.set(self.total.get().saturating_sub(len));
-            self.frees.set(self.frees.get().saturating_add(1));
-            GlobalAllocator.deallocate_u16s(buffer);
+        fn deallocate_u16s(&self, slot: &mut Option<Buffer<'a, u16>>) {
+            if let Some(buffer) = slot.as_ref() {
+                let len = buffer.len().saturating_mul(size_of::<u16>());
+                self.total.set(self.total.get().saturating_sub(len));
+                self.frees.set(self.frees.get().saturating_add(1));
+            }
+            GlobalAllocator.deallocate_u16s(slot);
         }
     }
 

@@ -22,9 +22,10 @@
 #     packaging directory of its own rather than in cargo's output directory;
 #   * the exported symbol surface must match the C library's 111 dynamic
 #     globals, being 95 functions plus the 16 symbol-version nodes declared in
-#     zlib.map.  `make rust-test' diffs the two with nm.  Nothing has been
-#     measured on the Rust side yet -- the facade crate root is not written --
-#     so read this as the parity requirement, not as an achieved result;
+#     zlib.map.  `make rust-test' diffs the two with nm.  The Rust side now
+#     carries the whole exported surface, so that diff is runnable, but no
+#     in-tree automation runs it -- read this as the parity requirement, and run
+#     `make rust-test' before treating parity as an achieved result;
 #   * the installed zlib.h and generated zconf.h are byte-identical, because
 #     the Rust build modifies neither header.
 #

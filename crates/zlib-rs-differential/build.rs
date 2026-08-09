@@ -5,16 +5,19 @@
 //! Exactly one linkable artifact: the static archive `libzlib_c_oracle.a` in `OUT_DIR`,
 //! containing
 //!
-//! * the fifteen in-tree C translation units of the reference implementation, and
-//! * a generated C shim that hands out pointers to the reference implementation's generated
-//!   tables,
+//! * the fifteen in-tree C translation units of the reference implementation -- fourteen compiled
+//!   directly, and `deflate.c` compiled through the generated translation unit described below,
+//!   which includes it verbatim, and
+//! * two generated C files that expose the reference implementation's `static` tables: a shim
+//!   that hands out pointers to the tables the generated headers define, and the `deflate.c`
+//!   wrapper that reaches the one table no header defines,
 //!
 //! with **every** externally visible symbol renamed to carry a `c_` prefix. The prefix is what
 //! lets this workspace's Rust library and the C reference implementation be linked into one test
 //! binary and called alternately so their output buffers can be compared directly, which is how
 //! "compressed output is byte-identical to the reference" stops being an assertion and becomes a
-//! measured fact. The intermediate objects, generated shim source and `objcopy` map also remain
-//! in `OUT_DIR` as ordinary build intermediates; nothing is generated in the source tree.
+//! measured fact. The intermediate objects, both generated C sources and the `objcopy` map also
+//! remain in `OUT_DIR` as ordinary build intermediates; nothing is generated in the source tree.
 //!
 //! The archive is consumed only by this crate's tests and benches. It is never a dependency of
 //! `zlib-rs` or `libz-rs-sys`, so `cargo build --release` for `libz.so`/`libz.a` never invokes a
@@ -24,10 +27,14 @@
 //! # The C sources are read-only
 //!
 //! Every C file in the repository root is reference material: it is compiled, never edited,
-//! preprocessed in place, or regenerated. Objects, the generated shim and the archive are all
-//! written to `OUT_DIR` and nowhere else, so the C build stays green and keeps its standing as
+//! preprocessed in place, or regenerated. Objects, both generated C sources and the archive are
+//! all written to `OUT_DIR` and nowhere else, so the C build stays green and keeps its standing as
 //! the oracle. Nothing here touches the network, vendors a copy of anything, or needs a
 //! submodule -- the reference sources are already in the tree.
+//!
+//! `deflate.c` is read-only under that rule too, and the generated translation unit honours it by
+//! `#include`-ing it rather than copying it: the authoritative file is what the compiler reads,
+//! from its own location in the tree, so no copy of it can ever go stale or be edited by mistake.
 //!
 //! # The fifteen translation units
 //!
@@ -161,10 +168,12 @@
 //! is present once in `libz.a` and absent from all 111 dynamic globals of
 //! `libz.so.1.3.2.1-motley`.
 //!
-//! The Rust facade is *intended* to reproduce that same split, and the planned
-//! `crates/libz-rs-sys/tests/symbol_parity.rs` is the gate that will assert it; neither that test
-//! nor a Rust-built `libz.a`/`libz.so` exists at this checkpoint, so the split is an intended
-//! contract here rather than an observed one. Either way the consequence for *this* file is
+//! The Rust facade is *intended* to reproduce that same split, and it is built to: its `inflate`
+//! module exports `inflate_table` as a real symbol so `libz.a` keeps it reachable, while
+//! `zlib.map` -- applied by the packaging relink, not by rustc -- keeps it out of `libz.so`'s
+//! dynamic symbol table. Nothing asserts that inside `cargo test`, because the symbol-parity
+//! suite the plan calls for has no home in the tree; `Makefile.in`'s `rust-test` target is the
+//! only check that compares the two. Either way the consequence for *this* file is
 //! unconditional: a Rust `libz.a` that keeps `inflate_table` reachable and an un-renamed oracle
 //! archive would both define the name, and the test binary would not link.
 //!
@@ -172,13 +181,11 @@
 //! `ZLIB_1.3.2`) with the `_tr_*` / `_dist_code` / `_length_code` family that `zlib.map` covers
 //! there under its `_*` wildcard. That union is the specification the list is derived from, and
 //! it is intended to be exactly the set of defined external symbols that survives the
-//! preprocessor pass -- no more, no less. Confirming it end to end requires building this crate,
-//! which is not yet possible: `crates/zlib-rs-differential/src/lib.rs` has not landed, so the
-//! archive this script would produce cannot be linked and inspected here.
-//! `verify_every_export_is_prefixed()` below is the in-build check that covers one direction of
-//! that once it can run: it fails the build if *any* defined external symbol of the archive is
-//! left without the `c_` prefix. It deliberately does not police the other direction, so a name
-//! listed here that the C sources no longer define would go unnoticed rather than reported.
+//! preprocessor pass -- no more, no less. `verify_every_export_is_prefixed()` below is the
+//! in-build check that covers one direction of it, and it runs on every build of this crate: it
+//! fails the build if *any* defined external symbol of the archive is left without the `c_`
+//! prefix. It deliberately does not police the other direction, so a name listed here that the C
+//! sources no longer define would go unnoticed rather than reported.
 //!
 //! `objcopy` rewrites undefined references as well as definitions, so cross-translation-unit
 //! calls stay wired up: after the pass `deflate.o` refers to `c__tr_init`, not `_tr_init`. The
@@ -217,6 +224,49 @@
 //!   `crc_big_table` using `N`, `W` and `z_word_t`. The shim replicates `crc32.c`'s own
 //!   derivation of those three verbatim; deriving them any other way silently compiles the wrong
 //!   variant.
+//!
+//! # Why the configuration table needs a second, different generated file
+//!
+//! One generated table is out of even that shim's reach. `configuration_table` -- the per-level
+//! `{good_length, max_lazy, nice_length, max_chain, func}` rows at `deflate.c` L112-L124 -- is
+//! `local` like the others, but unlike the others it is not declared in any header: it lives
+//! inside `deflate.c`, so no file can include it. Including a header is what the table shim does,
+//! and there is no header to include.
+//!
+//! That table is not an incidental omission to leave for later. It is the *first* of the eight
+//! decision points that determine whether compressed output is byte-identical to the reference:
+//! its four numbers per level decide which candidate matches `longest_match` examines and accepts,
+//! and therefore which literal/length/distance symbols reach the Huffman coder. A single altered
+//! digit changes the emitted bytes at that level for essentially every input.
+//!
+//! The only code that can read a `static` object is code compiled into the same translation unit,
+//! so the fix is a second generated file -- `zlib_c_oracle_deflate.c` -- that `#include`s the
+//! authoritative `deflate.c` and appends the accessors after it. `build.rs` compiles that file
+//! *instead of* plain `deflate.c`, so the reference translation unit is in the archive exactly
+//! once, under exactly the same flags and the same 95 `-D` renames as before.
+//!
+//! Two properties of this arrangement are the whole point of doing it this way:
+//!
+//! * **It compares the C object, not a copy of it.** Transcribing the forty numbers into a
+//!   separate shim would produce a test that compares one transcription against another: if the
+//!   value was copied wrongly, it would be copied wrongly into both sides and the comparison
+//!   would agree. Reading the actual `configuration_table` is what makes the later
+//!   table-equality gate able to fail.
+//! * **The compressor is identified by function pointer.** Each row's fifth member is a
+//!   `compress_func`, and `deflateParams` compares two rows' `func` fields **by identity**
+//!   (`deflate.c` L791) to decide whether a level change must first flush the open block. The
+//!   accessor therefore compares the stored address against `deflate_stored`, `deflate_fast`,
+//!   `deflate_slow`, `deflate_rle` and `deflate_huff` -- all five `local` to `deflate.c`, and all
+//!   five reachable from the same vantage point the table is -- and reports a small stable
+//!   integer. That grouping is what the port has to reproduce, because getting it wrong makes
+//!   `deflateParams` flush where C does not, or not flush where C does, and either changes the
+//!   emitted bytes.
+//!
+//! `deflate.c` stays in `C_SOURCES`. That array is the authoritative fifteen-file set, and it is
+//! what drives both the `rerun-if-changed` list and the repository-root verification;
+//! [`compile_reference_sources`] is the single place that substitutes the generated file for it,
+//! and it fails the build unless the substitution matches exactly one entry -- no match would mean
+//! `deflate.c` is compiled twice, two would mean the source set is not what this file thinks.
 //!
 //! # Failure posture
 //!
@@ -290,6 +340,12 @@ const ARCHIVE_STEM: &str = "zlib_c_oracle";
 /// File name of the generated table-exposure shim inside `OUT_DIR`.
 const SHIM_FILE_NAME: &str = "zlib_c_oracle_tables.c";
 
+/// File name of the generated `deflate.c` wrapper inside `OUT_DIR`.
+///
+/// Deliberately not `deflate.c`: a distinct name keeps the two apart in build logs, in
+/// `OUT_DIR` listings and in any debugger, and makes it obvious which one a diagnostic refers to.
+const CONFIG_TU_FILE_NAME: &str = "zlib_c_oracle_deflate.c";
+
 /// File name of the `objcopy --redefine-syms` map inside `OUT_DIR`.
 const REDEFINE_MAP_FILE_NAME: &str = "zlib_c_oracle_redefine.map";
 
@@ -316,6 +372,16 @@ const C_SOURCES: [&str; 15] = [
     "gzread.c",
     "gzwrite.c",
 ];
+
+/// The one member of [`C_SOURCES`] that is compiled through a generated wrapper instead of
+/// directly.
+///
+/// `configuration_table` is `local` to `deflate.c` and declared in no header, so the only way to
+/// read it is from code compiled into that same translation unit. [`CONFIG_TU_SOURCE`] is that
+/// code, and [`compile_reference_sources`] substitutes it for this entry -- so `deflate.c` is
+/// still compiled exactly once, with the same flags and the same renames, and is still listed in
+/// [`C_SOURCES`] for the `rerun-if-changed` and repository-root checks.
+const CONFIG_TU_ORIGIN: &str = "deflate.c";
 
 /// Every header the oracle or the generated shim consumes, so that editing one rebuilds the
 /// archive. `zconf.h` is committed in the tree (it is a `configure`/`CMake` product, but the
@@ -518,6 +584,10 @@ const TABLE_SHIM_SOURCE: &str = r#"/*
  * that the differential table-equality suite can compare the Rust ports against the C arrays
  * element for element.
  *
+ * This covers every table a HEADER declares, which is every table but one: deflate.c's
+ * configuration_table is declared in no header, so it is reached by the sibling generated file
+ * zlib_c_oracle_deflate.c, which includes deflate.c itself.  Nothing about it belongs here.
+ *
  * Every array accessor is paired with a length accessor: the Rust side must never hardcode a
  * bound that the C headers own.
  */
@@ -667,6 +737,141 @@ unsigned c_oracle_ct_data_size(void) { return (unsigned)sizeof(ct_data); }
 unsigned c_oracle_code_size(void) { return (unsigned)sizeof(code); }
 "#;
 
+/// The generated `deflate.c` wrapper, written verbatim into `OUT_DIR`.
+///
+/// Like [`TABLE_SHIM_SOURCE`] this is one deterministic constant with no timestamp, host path or
+/// configuration-dependent content, so an unchanged build regenerates a byte-identical file.
+///
+/// It is a *wrapper*, not a copy. The `#include "deflate.c"` line reaches the authoritative file
+/// through the `-I<repo root>` search path [`reference_build`] already sets, which is what keeps
+/// the reference source read-only and keeps the forty numbers of `configuration_table` in exactly
+/// one place. The accessors then sit in the same translation unit as the table, which is the only
+/// vantage point from which a `static` object can be read at all.
+///
+/// The `unsigned` return type of the four field accessors is deliberate. C declares those fields
+/// as `ush` (`unsigned short`), and an accessor returning `unsigned short` would silently truncate
+/// if the reference ever widened them; `unsigned` cannot. `c_oracle_config_field_size` reports the
+/// C compiler's own `sizeof` of one of those fields alongside, so the Rust port's choice of `u16`
+/// is checked rather than assumed -- the same discipline `c_oracle_ct_data_size` and
+/// `c_oracle_code_size` apply to the two mirrored struct types.
+const CONFIG_TU_SOURCE: &str = r#"/*
+ * zlib_c_oracle_deflate.c -- GENERATED FILE. DO NOT EDIT.
+ *
+ * Written into OUT_DIR by crates/zlib-rs-differential/build.rs; edit that script instead.
+ *
+ * This file IS the reference deflate.c, plus accessors.  It includes the authoritative source
+ * verbatim -- through the -I<repo root> search path, so the file in the tree is what the compiler
+ * reads and nothing is copied -- and build.rs compiles this file INSTEAD of plain deflate.c, so
+ * the translation unit lands in the archive exactly once with the same flags and the same c_
+ * renames as every other reference source.
+ *
+ * Why an include and not a shim of its own: configuration_table (deflate.c L112-L124) is declared
+ * `local`, zutil.h defines `local` as `static`, and -- unlike crc_table, static_ltree or lenfix --
+ * it is declared in NO header.  There is nothing for a separate file to include and no symbol for
+ * a linker to bind, so the only code that can read the table is code compiled into deflate.c's own
+ * translation unit.  Transcribing the values into a shim instead would compare one transcription
+ * against another: a mistake would appear identically on both sides and the comparison would
+ * agree.  Reading the C object itself is what lets the table-equality suite fail.
+ *
+ * Why the table matters this much: it is the first of the eight decision points that determine
+ * byte-identical output.  Its four numbers per level decide which candidate matches longest_match
+ * examines and accepts, so one altered digit changes the emitted bytes at that level for
+ * essentially every input.  deflate.c reads it at five sites: lm_init L689-L692, deflateParams
+ * L789, L791 and L809-L812, and deflate L1220.
+ */
+
+#include "deflate.c"
+
+/* Row count of the table, taken from the table itself so no bound is ever hardcoded.  Ten in the
+ * default configuration; two under FASTEST (L106-L110), which this build deliberately does not
+ * define.  ORACLE_LEN is spelled out here rather than shared with the table shim because the two
+ * files are separate translation units. */
+#define ORACLE_CONFIG_LEN \
+    ((unsigned)(sizeof(configuration_table) / sizeof(configuration_table[0])))
+
+/* The discriminators c_oracle_config_func returns.  Macros rather than an enum so the return type
+ * stays a plain int and the Rust declaration needs no assumption about C enum width.
+ *
+ * ORACLE_CONFIG_FUNC_UNKNOWN can only happen if deflate.c gained a sixth compressor, and
+ * ORACLE_CONFIG_FUNC_RANGE only if a caller asked for a level the table does not have; both are
+ * negative so neither can be mistaken for one of the five families. */
+#define ORACLE_CONFIG_FUNC_STORED 0
+#define ORACLE_CONFIG_FUNC_FAST   1
+#define ORACLE_CONFIG_FUNC_SLOW   2
+#define ORACLE_CONFIG_FUNC_RLE    3
+#define ORACLE_CONFIG_FUNC_HUFF   4
+#define ORACLE_CONFIG_FUNC_UNKNOWN (-1)
+#define ORACLE_CONFIG_FUNC_RANGE   (-2)
+
+/* --- configuration_table, deflate.c L112-L124 ---------------------------------------------- */
+
+unsigned c_oracle_config_table_len(void) { return ORACLE_CONFIG_LEN; }
+
+/* sizeof of one numeric field, so the width the port transcribes them at is checked, not assumed.
+ * struct config_s declares all four as ush (L99-L102). */
+unsigned c_oracle_config_field_size(void)
+{
+    return (unsigned)sizeof(configuration_table[0].good_length);
+}
+
+/* The four numeric fields of one row.  A level at or above the row count answers 0 rather than
+ * reading past the end of the array; c_oracle_config_table_len is how a caller stays in range. */
+
+unsigned c_oracle_config_good_length(unsigned level)
+{
+    if (level >= ORACLE_CONFIG_LEN) return 0u;
+    return (unsigned)configuration_table[level].good_length;
+}
+
+unsigned c_oracle_config_max_lazy(unsigned level)
+{
+    if (level >= ORACLE_CONFIG_LEN) return 0u;
+    return (unsigned)configuration_table[level].max_lazy;
+}
+
+unsigned c_oracle_config_nice_length(unsigned level)
+{
+    if (level >= ORACLE_CONFIG_LEN) return 0u;
+    return (unsigned)configuration_table[level].nice_length;
+}
+
+unsigned c_oracle_config_max_chain(unsigned level)
+{
+    if (level >= ORACLE_CONFIG_LEN) return 0u;
+    return (unsigned)configuration_table[level].max_chain;
+}
+
+/* Which compressor the row names, as one of the discriminators above.
+ *
+ * The comparison is on the function ADDRESS, which is the same test deflateParams makes at L791 --
+ * `func != configuration_table[level].func` -- when it decides whether a level change must first
+ * flush the open block.  Reporting the address's identity therefore reports exactly the property
+ * that decides emitted bytes, rather than a re-derived guess at it.
+ *
+ * All five compressors are `local` to deflate.c and are named here for the same
+ * same-translation-unit reason the table is: deflate_stored and deflate_fast at L73-L74,
+ * deflate_slow at L76 behind #ifndef FASTEST, deflate_rle and deflate_huff at L78-L79.  The table
+ * itself holds only the first three; deflate_rle and deflate_huff are reachable through the
+ * strategy rather than the level, and are compared here so that the discriminator describes the
+ * whole compress_func family and stays stable if a future row ever named one. */
+int c_oracle_config_func(unsigned level)
+{
+    compress_func func;
+
+    if (level >= ORACLE_CONFIG_LEN) return ORACLE_CONFIG_FUNC_RANGE;
+
+    func = configuration_table[level].func;
+    if (func == deflate_stored) return ORACLE_CONFIG_FUNC_STORED;
+    if (func == deflate_fast) return ORACLE_CONFIG_FUNC_FAST;
+#ifndef FASTEST
+    if (func == deflate_slow) return ORACLE_CONFIG_FUNC_SLOW;
+#endif
+    if (func == deflate_rle) return ORACLE_CONFIG_FUNC_RLE;
+    if (func == deflate_huff) return ORACLE_CONFIG_FUNC_HUFF;
+    return ORACLE_CONFIG_FUNC_UNKNOWN;
+}
+"#;
+
 /// `PATH` names probed, in order, when `OBJCOPY` is unset or unusable.
 ///
 /// `gobjcopy` is the name GNU binutils takes on Homebrew, where the system `objcopy` may be
@@ -683,10 +888,37 @@ const SYSROOT_OBJCOPY_CANDIDATES: [&str; 2] = ["llvm-objcopy", "rust-objcopy"];
 /// Names asked of `xcrun`, which is the only tool locator a stock macOS install has.
 const XCRUN_OBJCOPY_CANDIDATES: [&str; 2] = ["llvm-objcopy", "objcopy"];
 
-/// Programs probed, in order, when `NM` is unset or unusable.
+/// Programs probed, in order, when `NM` is unset.
 const NM_CANDIDATES: [&str; 3] = ["nm", "llvm-nm", "gnm"];
 
+/// Argument spellings tried, in order, for the symbol listing -- see `nm_listing`.
+///
+/// All three produce POSIX format, whose first field is the symbol name and whose second is the
+/// type letter, which parses identically for objects and archives. They differ only in how much
+/// filtering they ask the tool to do, and `verify_every_export_is_prefixed` applies that filter
+/// itself in every case, so the three are interchangeable rather than degrees of coverage:
+///
+///   1. GNU and LLVM long options, which is what a Linux or `llvm-tools` host has.
+///   2. The short forms of the same three requests, which BSD-derived tools accept.
+///   3. POSIX format alone. Every `nm` worth the name accepts `-P`, and the defined-and-global
+///      filter is this script's own work regardless.
+const NM_ARGUMENT_LADDER: [&[&str]; 3] = [
+    &["--defined-only", "--extern-only", "--format=posix"],
+    &["-U", "-g", "-P"],
+    &["-P"],
+];
+
+/// The dynamic-library search paths removed from this process before any tool is spawned.
+///
+/// See `sanitize_library_search_path` for the measurement that makes this necessary. The ELF and
+/// Mach-O spellings are both listed so the behaviour does not depend on the host.
+const CHILD_LIBRARY_PATH_VARS: [&str; 2] = ["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"];
+
 fn main() {
+    // First, before anything is spawned. See the function's own comment: this has to precede the
+    // `cc` invocation as well as the binutils ones.
+    sanitize_library_search_path();
+
     let manifest_dir = required_env_path("CARGO_MANIFEST_DIR");
     let out_dir = required_env_path("OUT_DIR");
     let repo_root = locate_repo_root(&manifest_dir);
@@ -695,7 +927,8 @@ fn main() {
 
     // Everything generated goes to OUT_DIR. The repository working tree is never written to.
     let shim = write_table_shim(&out_dir);
-    let objects = compile_reference_sources(&repo_root, &shim);
+    let config_tu = write_config_tu(&out_dir);
+    let objects = compile_reference_sources(&repo_root, &config_tu, &shim);
 
     // Rename before archiving: the archive must never exist in a collidable state, not even
     // transiently, or a concurrent link could pick it up.
@@ -707,6 +940,47 @@ fn main() {
     verify_every_export_is_prefixed(&archive);
 
     emit_link_directives(&out_dir);
+}
+
+/// Removes the dynamic-library search path from this process, so that every tool this script
+/// spawns resolves `libz` the way the system intends rather than out of the build directory.
+///
+/// # The problem this solves, measured rather than supposed
+///
+/// `crates/libz-rs-sys/build.rs` stages `libz.so.1` and `libz.so.<ZLIB_VERSION>` beside cargo's
+/// `libz.so` in `target/<profile>`, because without those names a consumer linked against the
+/// port does not fail -- it silently binds the SYSTEM libz, and every drop-in check then passes
+/// while exercising the C library.
+///
+/// Cargo puts that same `target/<profile>` on `LD_LIBRARY_PATH` for build scripts, and the host
+/// binutils are themselves linked against zlib: `ld.so --list` on `nm`, `objcopy`, `ar`, `ld` and
+/// `ld.bfd` shows `DT_NEEDED libz.so.1` with no `RPATH` of their own. So the staged alias makes
+/// the tools that INSPECT the artifact load the artifact. Measured: 32 `no version information
+/// available` notices in one build of this crate, because the cargo-built library carries no
+/// symbol-version nodes (rustc supplies its own anonymous version script for a cdylib, so
+/// `zlib.map` cannot be layered on) while `nm` asks for versioned symbols. glibc warns and binds
+/// anyway, so nothing failed -- it just meant the verification tools were running code out of the
+/// library under verification, and it broke the zero-warnings bar.
+///
+/// # Why removing it here is the right fix, and why it is safe
+///
+/// The fix belongs at the caller rather than in the staging step: the aliases are required, and
+/// every other consumer of `target/<profile>` wants them. This script needs none of it. It loads
+/// no dylib from the build directory -- its own process is already loaded, and everything it does
+/// afterwards is spawning `cc`, `objcopy`, `ar` and `nm`, all of them system tools with their own
+/// resolution rules.
+///
+/// Removing the variables from THIS process is what covers all four, including the `cc` crate's
+/// compiler invocation, which offers no hook for a child environment: children inherit the
+/// environment as modified. `DYLD_LIBRARY_PATH` is included for the Mach-O equivalent; macOS
+/// strips it from system binaries under SIP, so removing it is belt and braces rather than the
+/// load-bearing half.
+///
+/// Any future build script that shells out to a zlib-linked tool needs these same two lines.
+fn sanitize_library_search_path() {
+    for name in CHILD_LIBRARY_PATH_VARS {
+        env::remove_var(name);
+    }
 }
 
 /// Aborts the build with `message`.
@@ -805,6 +1079,34 @@ fn write_table_shim(out_dir: &Path) -> PathBuf {
     path
 }
 
+/// Writes the generated `deflate.c` wrapper into `OUT_DIR` and returns its path.
+///
+/// The `#include` line is checked rather than trusted. [`CONFIG_TU_SOURCE`] names the reference
+/// file in its own text while [`CONFIG_TU_ORIGIN`] is what
+/// [`compile_reference_sources`] excludes from the direct source list, and the two have to agree:
+/// if they ever drifted apart, `deflate.c` would be compiled twice -- once directly and once
+/// through the include -- and the archive would carry two definitions of every symbol in it. The
+/// check turns that into a build failure here instead of a duplicate-symbol error much later.
+fn write_config_tu(out_dir: &Path) -> PathBuf {
+    let include = format!("#include \"{CONFIG_TU_ORIGIN}\"");
+    if !CONFIG_TU_SOURCE.contains(&include) {
+        fail(&format!(
+            "build.rs: CONFIG_TU_SOURCE does not contain `{include}`, so the generated wrapper \
+             would not compile the reference translation unit that CONFIG_TU_ORIGIN excludes from \
+             the direct source list. Keep the two constants in step."
+        ));
+    }
+
+    let path = out_dir.join(CONFIG_TU_FILE_NAME);
+    if let Err(error) = fs::write(&path, CONFIG_TU_SOURCE) {
+        fail(&format!(
+            "build.rs: could not write the generated `{CONFIG_TU_ORIGIN}` wrapper to `{}`: {error}",
+            path.display()
+        ));
+    }
+    path
+}
+
 /// The flags shared by the oracle and the shim, so the two can never drift apart.
 ///
 /// `opt_level` and `pic` are set explicitly rather than inherited from `OPT_LEVEL`, because the
@@ -827,19 +1129,45 @@ fn reference_build(repo_root: &Path) -> cc::Build {
     build
 }
 
-/// Compiles the fifteen reference translation units and the generated shim into `OUT_DIR`.
+/// Compiles the fifteen reference translation units and the generated table shim into `OUT_DIR`.
+///
+/// Fourteen of the fifteen are compiled from the repository root directly. [`CONFIG_TU_ORIGIN`] --
+/// `deflate.c` -- is compiled through `config_tu`, the generated wrapper that includes it and then
+/// exposes `configuration_table`, and it joins the *same* `cc::Build` as the other fourteen so
+/// that it is built with the identical flags and the identical 95 `-D` renames. Compiling it in
+/// the shim's build instead would leave every public name in `deflate.c` un-prefixed and the
+/// archive would collide with `libz-rs-sys`.
 ///
 /// `compile_intermediates` is used instead of `compile` on purpose: it stops after the objects and
 /// emits no link metadata, which leaves room for the `objcopy` pass before anything is archived.
 ///
-/// The two `cc::Build`s cannot collide in `OUT_DIR` even though the shim and `crc32.c` would both
+/// The `cc::Build`s cannot collide in `OUT_DIR` even though the shim and `crc32.c` would both
 /// like to be `crc32.o`-style names, because `cc` derives each object name from a hash of its
-/// source's *directory* and the two live in different directories.
-fn compile_reference_sources(repo_root: &Path, shim: &Path) -> Vec<PathBuf> {
+/// source's *directory* and the generated files live in `OUT_DIR` rather than the repository root.
+fn compile_reference_sources(repo_root: &Path, config_tu: &Path, shim: &Path) -> Vec<PathBuf> {
     let mut oracle = reference_build(repo_root);
+    let mut substituted = 0_usize;
     for name in C_SOURCES {
+        if name == CONFIG_TU_ORIGIN {
+            // Compiled through the generated wrapper, which includes it verbatim. Adding both
+            // would define every symbol in it twice.
+            substituted += 1;
+            continue;
+        }
         oracle.file(repo_root.join(name));
     }
+    oracle.file(config_tu);
+
+    if substituted != 1 {
+        fail(&format!(
+            "build.rs: CONFIG_TU_ORIGIN is `{CONFIG_TU_ORIGIN}`, which matches {substituted} of \
+             the {} entries in C_SOURCES instead of exactly one. The generated wrapper compiles \
+             that reference translation unit, so a mismatch means it is either compiled twice or \
+             not at all.",
+            C_SOURCES.len()
+        ));
+    }
+
     for name in PUBLIC_RENAMES {
         oracle.define(name, prefixed(name).as_str());
     }
@@ -855,9 +1183,10 @@ fn compile_reference_sources(repo_root: &Path, shim: &Path) -> Vec<PathBuf> {
     let expected = C_SOURCES.len() + 1;
     if objects.len() != expected {
         fail(&format!(
-            "build.rs: expected {expected} object files (fifteen reference translation units plus \
-             the generated table shim) but the C compiler produced {}. The oracle would be \
-             incomplete, so the build cannot continue.",
+            "build.rs: expected {expected} object files (fourteen reference translation units, the \
+             generated `{CONFIG_TU_ORIGIN}` wrapper that carries the fifteenth, and the generated \
+             table shim) but the C compiler produced {}. The oracle would be incomplete, so the \
+             build cannot continue.",
             objects.len()
         ));
     }
@@ -989,35 +1318,109 @@ fn locate_xcrun_objcopy() -> Option<OsString> {
     })
 }
 
-/// Finds an `nm`, honouring `$NM` first. `None` means the symbol audit has to be skipped.
-fn locate_nm() -> Option<OsString> {
-    if let Some(explicit) = env::var_os("NM").filter(|value| !value.is_empty()) {
-        if can_run(&explicit) {
-            return Some(explicit);
+/// Lists the archive's symbols, probing by RUNNING THE REAL INVOCATION rather than by asking a
+/// candidate for its version.
+///
+/// # Why the probe is the real command
+///
+/// The previous form of this code accepted a candidate only if `<nm> --version` exited zero, and
+/// that test answers the wrong question twice over. Apple's cctools `nm` does not implement
+/// `--version` -- it prints usage and exits nonzero -- so a perfectly usable tool was rejected and
+/// the audit was skipped on exactly the host where the fallback chain is thinnest. In the other
+/// direction, a program that answers `--version` says nothing about whether it accepts
+/// `--defined-only --extern-only --format=posix`, so a candidate could be accepted and then fail at
+/// the point of use.
+///
+/// So each candidate is tried with the invocation it will actually be used for, and the ARGUMENTS
+/// degrade rather than the check: [`NM_ARGUMENT_LADDER`] moves from the GNU/LLVM long options to the
+/// portable short ones to a bare `-P`, whose output this script filters itself. The first spelling
+/// that succeeds wins. Nothing is inferred; if none of them works, the caller has the complete list
+/// of what was tried.
+///
+/// # Honouring `$NM`
+///
+/// When `NM` is set it is the ONLY candidate. Falling back to a different tool after an explicit
+/// override fails would mean auditing with something the operator did not choose, and reporting
+/// success for it; the caller turns that case into a build failure naming the variable.
+fn nm_listing(archive: &Path) -> Result<(OsString, String), String> {
+    let explicit = env::var_os("NM").filter(|value| !value.is_empty());
+    let candidates: Vec<OsString> = match explicit {
+        Some(ref program) => vec![program.clone()],
+        None => NM_CANDIDATES.iter().map(OsString::from).collect(),
+    };
+
+    let mut attempts: Vec<String> = Vec::new();
+    for program in candidates {
+        for arguments in NM_ARGUMENT_LADDER {
+            match Command::new(&program).args(arguments).arg(archive).output() {
+                Ok(output) if output.status.success() => {
+                    let listing = String::from_utf8_lossy(&output.stdout).into_owned();
+                    // A zero exit with nothing to show is not an answer. Measured: `NM=/bin/true`
+                    // satisfied a status-only test and left the audit inspecting an empty listing,
+                    // which passes every check by having nothing to check.
+                    if listing_has_symbols(&listing) {
+                        return Ok((program, listing));
+                    }
+                    attempts.push(format!(
+                        "`{} {}` exited 0 but listed no symbols",
+                        Path::new(&program).display(),
+                        arguments.join(" ")
+                    ));
+                }
+                Ok(output) => attempts.push(format!(
+                    "`{} {}` exited with {}: {}",
+                    Path::new(&program).display(),
+                    arguments.join(" "),
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )),
+                Err(error) => {
+                    // The program itself cannot be run, so the remaining spellings cannot help.
+                    attempts.push(format!(
+                        "`{}` could not be executed: {error}",
+                        Path::new(&program).display()
+                    ));
+                    break;
+                }
+            }
         }
-        println!(
-            "cargo::warning=zlib-rs-differential: NM is set to `{}`, which could not be \
-             executed; probing for another nm instead.",
-            Path::new(&explicit).display()
-        );
     }
 
-    for candidate in NM_CANDIDATES {
-        let program = OsString::from(candidate);
-        if can_run(&program) {
-            return Some(program);
-        }
-    }
-
-    None
+    let attempts = attempts.join("\n  ");
+    Err(match explicit {
+        Some(program) => format!(
+            "NM is set to `{}` and no spelling of the symbol listing worked with it:\n  {attempts}",
+            Path::new(&program).display()
+        ),
+        None => format!(
+            "none of {} could list the symbols of `{}`:\n  {attempts}",
+            NM_CANDIDATES.join(", "),
+            archive.display()
+        ),
+    })
 }
 
-/// Reports whether `program` can be executed, without letting its output into the build log.
+/// Reports whether a symbol listing contains at least one symbol line.
+///
+/// POSIX format gives every symbol a name and a type letter, so two whitespace-separated fields are
+/// the minimum; archive member headers (`<archive>[<member>]:`) carry one. An archive built from the
+/// reference sources always has thousands of symbols, so an empty result means the tool did not
+/// understand what it was asked -- whatever it reported as its exit status.
+fn listing_has_symbols(listing: &str) -> bool {
+    listing
+        .lines()
+        .any(|line| line.split_whitespace().nth(1).is_some())
+}
+
+/// Reports whether `program` can be executed at all.
+///
+/// The exit STATUS is deliberately ignored: what a probe can establish is that the name resolves to
+/// something executable, and several real tools answer an unrecognised `--version` with usage text
+/// and a nonzero status (Apple's cctools tools among them). Whether the program accepts the
+/// arguments it will be given is settled where those arguments are used -- `apply_symbol_renames`
+/// checks `objcopy`'s exit status and aborts the build on failure -- rather than guessed here.
 fn can_run(program: &OsStr) -> bool {
-    Command::new(program)
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
+    Command::new(program).arg("--version").output().is_ok()
 }
 
 /// Writes the `objcopy --redefine-syms` map into `OUT_DIR` and returns its path.
@@ -1175,45 +1578,37 @@ fn remove_if_present(path: &Path) {
 /// hide behind the allowance, and anything that appears is surfaced as a warning rather than
 /// passed over in silence.
 ///
-/// A missing `nm` downgrades the check to a warning rather than failing the build: unlike
-/// `objcopy`, `nm` only *observes*, so its absence cannot produce a wrong archive.
+/// AN AUDIT THAT CANNOT RUN IS A BUILD FAILURE, not a warning.
+///
+/// It used to be a warning, on the reasoning that `nm` only observes and so its absence cannot
+/// produce a wrong archive. That reasoning is true of the ARCHIVE and false of the CRATE. This is a
+/// differential harness: its entire purpose is to hold the Rust implementation against the C one in
+/// a single process, which is possible only because every C symbol was renamed out of the way. If
+/// the rename is incomplete and nothing checks, the two definitions collide -- and the failure mode
+/// is not a link error but the linker silently binding one definition for both, at which point the
+/// tests compare an implementation against itself and pass. A harness that has verified nothing
+/// while reporting success is the worst outcome this crate can produce, so the check is mandatory
+/// and its absence stops the build with the complete list of what was tried.
 fn verify_every_export_is_prefixed(archive: &Path) {
     println!("cargo::rerun-if-env-changed=NM");
 
-    let Some(nm) = locate_nm() else {
-        println!(
-            "cargo::warning=zlib-rs-differential: no usable nm was found, so the oracle \
-             archive's exports could not be audited for the `{SYMBOL_PREFIX}` prefix. An \
-             incomplete rename will surface later as a duplicate-symbol link error."
-        );
-        return;
-    };
-
-    // POSIX format puts the symbol name first, which parses identically for objects and archives
-    // and is understood by both GNU nm and llvm-nm.
-    let listing = match Command::new(&nm)
-        .arg("--defined-only")
-        .arg("--extern-only")
-        .arg("--format=posix")
-        .arg(archive)
-        .output()
-    {
-        Ok(output) if output.status.success() => output.stdout,
-        Ok(output) => fail(&format!(
-            "build.rs: `{} --defined-only --extern-only --format=posix {}` exited with {}: {}",
-            Path::new(&nm).display(),
-            archive.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )),
-        Err(error) => fail(&format!(
-            "build.rs: could not execute `{}` to audit `{}`: {error}",
-            Path::new(&nm).display(),
-            archive.display()
+    let (nm, listing) = match nm_listing(archive) {
+        Ok(result) => result,
+        Err(reason) => fail(&format!(
+            "build.rs: the oracle archive's exports could not be audited for the \
+             `{SYMBOL_PREFIX}` prefix, so this build is stopped rather than shipping an \
+             unverified oracle: {reason}\n\
+             That audit is what keeps the two rename lists complete. Without it an unrenamed C \
+             symbol collides with the Rust definition of the same name, the linker binds one for \
+             both, and the differential tests compare an implementation against itself and pass. \
+             Install any of {}, or point NM at one:\n\
+             \x20   NM=llvm-nm cargo test\n\
+             `rustup component add llvm-tools` installs llvm-nm beside the toolchain on every \
+             supported host.",
+            NM_CANDIDATES.join(", ")
         )),
     };
 
-    let listing = String::from_utf8_lossy(&listing);
     let mut unprefixed: Vec<&str> = Vec::new();
     let mut toolchain: Vec<&str> = Vec::new();
     for line in listing.lines() {
@@ -1223,7 +1618,15 @@ fn verify_every_export_is_prefixed(archive: &Path) {
         };
         // POSIX output interleaves `<archive>[<member>]:` header lines, which carry a single
         // field; a real symbol line always has at least a name and a type.
-        if fields.next().is_none() || symbol.starts_with(SYMBOL_PREFIX) {
+        let Some(kind) = fields.next().and_then(|field| field.chars().next()) else {
+            continue;
+        };
+        // Defined and global, applied here rather than delegated, because the third rung of
+        // NM_ARGUMENT_LADDER asks the tool for no filtering at all. Uppercase is global and `U` is
+        // undefined; `u` is the one lowercase letter that means a defined global (GNU nm's unique
+        // global), while `v` and `w` are weak UNDEFINED and are correctly excluded.
+        let defined_global = (kind.is_ascii_uppercase() && kind != 'U') || kind == 'u';
+        if !defined_global || symbol.starts_with(SYMBOL_PREFIX) {
             continue;
         }
         if symbol.starts_with("__") {
@@ -1249,12 +1652,13 @@ fn verify_every_export_is_prefixed(archive: &Path) {
         unprefixed.sort_unstable();
         unprefixed.dedup();
         fail(&format!(
-            "build.rs: {} symbol(s) exported by `{}` do not carry the mandatory \
-             `{SYMBOL_PREFIX}` prefix: {}. Each one will collide with libz-rs-sys when both are \
-             linked into a test binary. Add every public name to PUBLIC_RENAMES and every \
+            "build.rs: {} symbol(s) exported by `{}`, as listed by `{}`, do not carry the \
+             mandatory `{SYMBOL_PREFIX}` prefix: {}. Each one will collide with libz-rs-sys when \
+             both are linked into a test binary. Add every public name to PUBLIC_RENAMES and every \
              ZLIB_INTERNAL name to INTERNAL_REDEFINES in this script.",
             unprefixed.len(),
             archive.display(),
+            Path::new(&nm).display(),
             join_names(&unprefixed)
         ));
     }

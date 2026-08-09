@@ -38,10 +38,10 @@
 //! **Cross-implementation interoperability is not this file's job.** Proving that a stream
 //! produced by the C library decodes here, and that a stream produced here decodes there,
 //! requires linking the C oracle -- which only `crates/zlib-rs-differential` can do. That
-//! comparison lives in `crates/zlib-rs-differential/tests/roundtrip_interop.rs`, together
-//! with the full byte-identity matrix in `byte_identical.rs`. This suite must not attempt
-//! it and must not duplicate it; the golden constants below are a deliberately small,
-//! committed sample rather than a second matrix.
+//! comparison, and the full byte-identity matrix beside it, belong to suites under that
+//! crate; **neither exists in the tree, so neither property has been demonstrated.** This
+//! suite must not attempt them and must not pre-empt them; the golden constants below are a
+//! deliberately small, committed sample rather than a second matrix.
 //!
 //! # Corpus policy
 //!
@@ -77,7 +77,8 @@
 //! 1. **A small unconditional core.** Every corpus class except the window-crossing one, all
 //!    three containers, both feeding styles, and the levels and shapes each test needs to make
 //!    its point -- twenty tests. Everything wider sits behind `#[cfg_attr(miri, ignore)]`,
-//!    twenty-two tests, each naming its reason and each running natively in CI.
+//!    twenty-two tests, each naming its reason and each running under an ordinary native
+//!    `cargo test`.
 //! 2. **Shorter payloads under the interpreter.** [`core_classes`] truncates the corpus to a few
 //!    hundred bytes when `cfg(miri)` holds. What these tests assert is a property of each
 //!    class's *shape*, and a shorter instance of a shape is still that shape.
@@ -496,7 +497,6 @@ impl Scalars {
     fn load_inflate(self, stream: &mut InflateStream<'_>) {
         stream.total_in = self.total_in;
         stream.total_out = self.total_out;
-        stream.adler = self.adler;
         stream.data_type = self.data_type;
         stream.msg = self.msg;
     }
@@ -505,7 +505,9 @@ impl Scalars {
     fn store_inflate(&mut self, stream: &InflateStream<'_>) {
         self.total_in = stream.total_in;
         self.total_out = stream.total_out;
-        self.adler = stream.adler;
+        if let Some(value) = stream.adler {
+            self.adler = value;
+        }
         self.data_type = stream.data_type;
         self.msg = stream.msg;
     }
@@ -607,7 +609,7 @@ where
     };
 
     assert_eq!(
-        deflate_end(state),
+        deflate_end(&mut state),
         ReturnCode::OK,
         "{params}: deflateEnd after Z_STREAM_END must report Z_OK",
     );
@@ -702,7 +704,7 @@ where
     }
 
     assert_eq!(
-        deflate_end(state),
+        deflate_end(&mut state),
         ReturnCode::OK,
         "{params} {chunk}: deflateEnd after Z_STREAM_END must report Z_OK",
     );
@@ -800,7 +802,7 @@ fn inflate_all(
     };
 
     assert_eq!(
-        inflate_end(state),
+        inflate_end(&mut state),
         ReturnCode::OK,
         "inflateEnd must always report Z_OK",
     );
@@ -1149,7 +1151,7 @@ fn the_core_matrix_round_trips_every_class_in_every_container() {
 #[test]
 #[cfg_attr(
     miri,
-    ignore = "11 levels x 7 classes x 3 containers: too slow to interpret, runs natively in CI"
+    ignore = "11 levels x 7 classes x 3 containers: too slow to interpret, runs under native `cargo test`"
 )]
 fn every_level_round_trips_every_class_in_every_container() {
     for (name, payload) in small_classes() {
@@ -1203,7 +1205,7 @@ fn the_documented_status_codes_are_reported() {
             stream.next_out
         };
         assert_eq!(
-            deflate_end(state),
+            deflate_end(&mut state),
             ReturnCode::OK,
             "{params}: deflateEnd must report Z_OK",
         );
@@ -1220,7 +1222,7 @@ fn the_documented_status_codes_are_reported() {
 #[test]
 #[cfg_attr(
     miri,
-    ignore = "5 strategies x 7 classes x 3 containers: too slow to interpret, runs in CI"
+    ignore = "5 strategies x 7 classes x 3 containers: too slow to interpret, runs under native `cargo test`"
 )]
 fn every_strategy_round_trips_in_every_container() {
     for (name, payload) in small_classes() {
@@ -1242,7 +1244,7 @@ fn every_strategy_round_trips_in_every_container() {
 #[test]
 #[cfg_attr(
     miri,
-    ignore = "9 memLevels x 7 classes x 3 containers: too slow to interpret, runs in CI"
+    ignore = "9 memLevels x 7 classes x 3 containers: too slow to interpret, runs under native `cargo test`"
 )]
 fn every_mem_level_round_trips_in_every_container() {
     for (name, payload) in small_classes() {
@@ -1263,7 +1265,7 @@ fn every_mem_level_round_trips_in_every_container() {
 #[test]
 #[cfg_attr(
     miri,
-    ignore = "7 window sizes over a 33 KiB payload: too slow to interpret, runs in CI"
+    ignore = "7 window sizes over a 33 KiB payload: too slow to interpret, runs under native `cargo test`"
 )]
 fn every_window_size_round_trips_across_the_window_boundary() {
     let payload = corpus::window_crossing();
@@ -1314,7 +1316,7 @@ fn the_gzip_container_carries_its_magic_and_crc_isize_trailer() {
 #[test]
 #[cfg_attr(
     miri,
-    ignore = "11 levels x 5 strategies of gzip headers; runs natively in CI"
+    ignore = "11 levels x 5 strategies of gzip headers; runs under native `cargo test`"
 )]
 fn the_gzip_xfl_byte_tracks_the_level_and_strategy() {
     for level in LEVELS {
@@ -1339,7 +1341,7 @@ fn the_gzip_xfl_byte_tracks_the_level_and_strategy() {
 #[test]
 #[cfg_attr(
     miri,
-    ignore = "compresses every class three ways at every level; runs natively in CI"
+    ignore = "compresses every class three ways at every level; runs under native `cargo test`"
 )]
 fn raw_is_exactly_what_the_wrappers_carry() {
     for (name, payload) in small_classes() {
@@ -1425,7 +1427,7 @@ fn one_byte_at_a_time_compression_is_byte_identical_to_single_shot() {
 #[cfg_attr(
     miri,
     ignore = "7 chunk sizes x 9 levels x 7 classes x 3 containers, chunk 1 being one call per \
-     byte: too slow to interpret, runs in CI"
+     byte: too slow to interpret, runs under native `cargo test`"
 )]
 fn no_chunk_size_changes_the_compressed_bytes() {
     for (name, payload) in small_classes() {
@@ -1450,7 +1452,7 @@ fn no_chunk_size_changes_the_compressed_bytes() {
 #[test]
 #[cfg_attr(
     miri,
-    ignore = "sweeps memLevel and windowBits against three chunk sizes; runs natively in CI"
+    ignore = "sweeps memLevel and windowBits against three chunk sizes; runs under native `cargo test`"
 )]
 fn no_chunk_size_changes_the_compressed_bytes_at_any_buffer_shape() {
     let payload = corpus::text();
@@ -1491,7 +1493,7 @@ fn no_chunk_size_changes_the_compressed_bytes_at_any_buffer_shape() {
 #[test]
 #[cfg_attr(
     miri,
-    ignore = "the second half drives a 33 KiB payload one byte at a time; runs natively in CI"
+    ignore = "the second half drives a 33 KiB payload one byte at a time; runs under native `cargo test`"
 )]
 fn level_zero_stored_blocks_follow_the_output_room() {
     // Short enough never to be split: identical bytes whatever the feeding style.
@@ -1545,7 +1547,7 @@ fn level_zero_stored_blocks_follow_the_output_room() {
 #[test]
 #[cfg_attr(
     miri,
-    ignore = "7 chunk sizes x 7 classes x 3 containers on the decode side; runs natively in CI"
+    ignore = "7 chunk sizes x 7 classes x 3 containers on the decode side; runs under native `cargo test`"
 )]
 fn no_chunk_size_changes_what_decompression_recovers() {
     for (name, payload) in small_classes() {
@@ -1658,7 +1660,7 @@ fn one_byte_at_a_time_decompression_either_progresses_or_reports_buf_error() {
         }
     };
 
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     assert_eq!(
         code,
         ReturnCode::STREAM_END,
@@ -1695,7 +1697,7 @@ fn compression_is_deterministic() {
 #[test]
 #[cfg_attr(
     miri,
-    ignore = "widens the determinism check to 3 containers x 2 levels; runs natively in CI"
+    ignore = "widens the determinism check to 3 containers x 2 levels; runs under native `cargo test`"
 )]
 fn compression_is_deterministic_in_every_container() {
     for (name, payload) in small_classes() {
@@ -1743,7 +1745,7 @@ fn compression_does_not_depend_on_the_allocator() {
 #[test]
 #[cfg_attr(
     miri,
-    ignore = "widens the allocator check to 3 containers x 2 levels; runs natively in CI"
+    ignore = "widens the allocator check to 3 containers x 2 levels; runs under native `cargo test`"
 )]
 fn compression_does_not_depend_on_the_allocator_in_any_container() {
     for (name, payload) in small_classes() {
@@ -1786,7 +1788,7 @@ fn assert_allocator_independent(name: &str, payload: &[u8], params: Params) {
 #[test]
 #[cfg_attr(
     miri,
-    ignore = "sweeps every level and strategy in both wrapped containers; runs natively in CI"
+    ignore = "sweeps every level and strategy in both wrapped containers; runs under native `cargo test`"
 )]
 fn the_container_markers_hold_across_the_matrix() {
     for (name, payload) in small_classes() {
@@ -1898,7 +1900,7 @@ fn compress_segmented(payload: &[u8], params: Params, flush: i32, segments: usiz
         check_err(code, "deflate(Z_FINISH)");
     }
 
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     out.truncate(next_out);
     Segmented {
         bytes: out,
@@ -2054,7 +2056,7 @@ fn the_example_c_flush_and_sync_sequence_recovers_after_corruption() {
         );
         stream.next_out
     };
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     compr.truncate(compressed_len);
 
     // --- test_sync ----------------------------------------------------------------------
@@ -2097,7 +2099,7 @@ fn the_example_c_flush_and_sync_sequence_recovers_after_corruption() {
         );
         stream.next_out
     };
-    assert_eq!(inflate_end(decoder), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut decoder), ReturnCode::OK);
     recovered.truncate(produced);
 
     assert_bytes_eq(
@@ -2156,7 +2158,7 @@ fn compress_with_dictionary(payload: &[u8], dictionary: &[u8], params: Params) -
         );
         stream.next_out
     };
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     out.truncate(produced);
     DictStream {
         bytes: out,
@@ -2198,7 +2200,8 @@ fn the_example_c_dictionary_pair_round_trips() {
             "a preset-dictionary stream must stop and ask for the dictionary",
         );
         assert_eq!(
-            stream.adler, compressed.dict_id,
+            stream.adler,
+            Some(compressed.dict_id),
             "and must publish the dictionary's Adler-32 while doing so",
         );
         scalars.store_inflate(&stream);
@@ -2227,7 +2230,7 @@ fn the_example_c_dictionary_pair_round_trips() {
         );
         stream.next_out
     };
-    assert_eq!(inflate_end(decoder), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut decoder), ReturnCode::OK);
     recovered.truncate(produced);
     assert_bytes_eq(&recovered, corpus::HELLO, "dictionary round trip");
 }
@@ -2329,7 +2332,7 @@ fn a_wrong_dictionary_is_rejected() {
         ReturnCode::DATA_ERROR,
         "a dictionary whose Adler-32 does not match must be refused",
     );
-    assert_eq!(inflate_end(decoder), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut decoder), ReturnCode::OK);
 }
 
 /// A raw stream can be primed with a dictionary too, and must be.
@@ -2369,7 +2372,7 @@ fn a_raw_stream_can_be_primed_with_a_dictionary() {
         );
         stream.next_out
     };
-    assert_eq!(inflate_end(decoder), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut decoder), ReturnCode::OK);
     recovered.truncate(produced);
     assert_bytes_eq(&recovered, corpus::HELLO, "raw dictionary round trip");
 
@@ -2414,7 +2417,7 @@ const ONE_SHOT_LEVELS: [i32; 4] = [
 #[cfg_attr(
     miri,
     ignore = "the one-shot wrappers are fixed to the reference buffer shape, which \
-     Params::core cannot shrink; runs natively in CI"
+     Params::core cannot shrink; runs under native `cargo test`"
 )]
 fn the_one_shot_wrappers_round_trip_every_class() {
     for (name, payload) in core_classes() {
@@ -2467,7 +2470,7 @@ fn the_one_shot_wrappers_round_trip_every_class() {
 #[test]
 #[cfg_attr(
     miri,
-    ignore = "compresses every class twice at four levels; runs natively in CI"
+    ignore = "compresses every class twice at four levels; runs under native `cargo test`"
 )]
 fn the_one_shot_path_emits_what_the_streaming_path_emits() {
     for (name, payload) in small_classes() {
@@ -2496,9 +2499,9 @@ fn the_one_shot_path_emits_what_the_streaming_path_emits() {
 // ---------------------------------------------------------------------------------------
 //
 // Cross-*implementation* interoperability -- a stream produced by the C library decoded here,
-// and one produced here decoded there -- is verified in
-// `crates/zlib-rs-differential/tests/roundtrip_interop.rs`, which can link the C oracle. This
-// suite must not attempt it and must not duplicate the differential matrix; what follows is
+// and one produced here decoded there -- needs the C oracle, so it belongs to a suite under
+// `crates/zlib-rs-differential`. No such suite is in the tree, so it is unverified. This
+// suite must not attempt it and must not pre-empt the differential matrix; what follows is
 // only about this implementation's own container discrimination.
 
 /// Adding 32 to `windowBits` is the decoder-only spelling that asks for automatic
@@ -2609,7 +2612,10 @@ fn the_auto_detect_configuration_decodes_both_wrapped_containers() {
 /// is that the decoder allocates whatever the header asks for rather than a fixed 32 `KiB` --
 /// so a decoder that quietly used the maximum would pass a single-size test.
 #[test]
-#[cfg_attr(miri, ignore = "sweeps seven window sizes; runs natively in CI")]
+#[cfg_attr(
+    miri,
+    ignore = "sweeps seven window sizes; runs under native `cargo test`"
+)]
 fn zero_window_bits_takes_the_window_size_from_the_zlib_header() {
     let payload = corpus::text();
     for magnitude in 9..=MAX_WBITS {
@@ -2673,7 +2679,7 @@ fn long_distance_payload(marker_len: usize, distance: usize, repeat: bool) -> Ve
 #[test]
 #[cfg_attr(
     miri,
-    ignore = "a 33 KiB payload at 11 levels in 3 containers; runs natively in CI"
+    ignore = "a 33 KiB payload at 11 levels in 3 containers; runs under native `cargo test`"
 )]
 fn the_window_crossing_class_round_trips_everywhere() {
     let payload = corpus::window_crossing();
@@ -2697,7 +2703,7 @@ fn the_window_crossing_class_round_trips_everywhere() {
 #[test]
 #[cfg_attr(
     miri,
-    ignore = "drives a 33 KiB payload through 512-byte to 2 KiB windows; runs natively in CI"
+    ignore = "drives a 33 KiB payload through 512-byte to 2 KiB windows; runs under native `cargo test`"
 )]
 fn a_small_window_slides_repeatedly_without_losing_a_byte() {
     let payload = corpus::window_crossing();
@@ -2720,7 +2726,7 @@ fn a_small_window_slides_repeatedly_without_losing_a_byte() {
 #[test]
 #[cfg_attr(
     miri,
-    ignore = "builds a 32 KiB payload to reach the maximum match distance; runs natively in CI"
+    ignore = "builds a 32 KiB payload to reach the maximum match distance; runs under native `cargo test`"
 )]
 fn a_match_at_nearly_the_full_window_distance_survives() {
     const MARKER: usize = 4096;
@@ -2764,7 +2770,10 @@ fn a_match_at_nearly_the_full_window_distance_survives() {
 /// `MAX_MATCH`, the copies also *overlap* their own source, which is the other half of the
 /// same code path.
 #[test]
-#[cfg_attr(miri, ignore = "5 KiB through a 512-byte window; runs natively in CI")]
+#[cfg_attr(
+    miri,
+    ignore = "5 KiB through a 512-byte window; runs under native `cargo test`"
+)]
 fn a_match_spanning_the_window_wrap_point_survives() {
     const PATTERN: usize = 100;
     const REPEATS: usize = 50;
@@ -2839,7 +2848,7 @@ fn a_match_spanning_the_window_wrap_point_survives() {
 #[test]
 #[cfg_attr(
     miri,
-    ignore = "50 KB through the compressor and back: too slow to interpret, runs in CI"
+    ignore = "50 KB through the compressor and back: too slow to interpret, runs under native `cargo test`"
 )]
 fn the_example_c_large_pair_round_trips() {
     const UNCOMPR_LEN: usize = 20_000;
@@ -2938,7 +2947,7 @@ fn the_example_c_large_pair_round_trips() {
         scalars.store_deflate(&stream);
         stream.next_out
     };
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     assert_eq!(
         scalars.total_in, EXPECTED_TOTAL,
         "three feeds of 20000, 10000 and 20000 bytes",
@@ -2967,7 +2976,7 @@ fn the_example_c_large_pair_round_trips() {
         }
         check_err(code, "large inflate");
     }
-    assert_eq!(inflate_end(decoder), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut decoder), ReturnCode::OK);
     assert_eq!(
         scalars.total_out, EXPECTED_TOTAL,
         "bad large inflate: the total must match everything that was fed",
@@ -2984,9 +2993,10 @@ fn the_example_c_large_pair_round_trips() {
 // `deflate(Z_FINISH)` call.
 //
 // These are a deliberately small committed sample, not a second differential matrix: the full
-// level x windowBits x memLevel x strategy x flush sweep against the C oracle belongs to
-// `crates/zlib-rs-differential/tests/byte_identical.rs`, which can link the oracle and compare
-// on the fly. What they buy here is twofold. They pin the emitted bytes without a C compiler,
+// level x windowBits x memLevel x strategy x flush sweep against the C oracle belongs to a suite
+// under `crates/zlib-rs-differential`, which can link the oracle and compare on the fly, and no
+// such suite is in the tree. What they buy here is twofold. They pin the emitted bytes without a
+// C compiler,
 // so a change in match selection or Huffman tie-breaking fails in this crate's own test run;
 // and because nothing in this file names a feature, they are the end-to-end proof that the
 // optional `simd` feature is output-neutral -- the same constants must match under

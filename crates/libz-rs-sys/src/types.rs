@@ -12,7 +12,7 @@
 //! declaration below cites the `zlib.h`, `zconf.h` or `inftrees.h` line it
 //! mirrors and every number was measured on the target rather than assumed.
 //!
-//! # The measured contract
+//! # The measured contract, and the platform it was measured on
 //!
 //! Produced with `gcc -I. -D_LARGEFILE64_SOURCE=1` over the real headers on
 //! `x86_64-unknown-linux-gnu`, reading `sizeof` and `offsetof` directly. The
@@ -20,12 +20,26 @@
 //! `layout_assertions.rs`; this module carries only the two *cross-crate
 //! agreement* assertions that no other module is in a position to make.
 //!
-//! | Type | Size | Align | Field offsets |
+//! ★ **Every absolute number in the table below is an LP64 measurement, not a
+//! portable fact.** `uLong`, `z_size_t`, `z_off_t` and pointers all change width
+//! between LP64, LLP64 and ILP32, so on another integer model the sizes and the
+//! offsets differ while the *structure* -- field order, which field each offset
+//! belongs to, and the relations between them -- does not. Quote these numbers
+//! only alongside the model they belong to, and derive anything a program depends
+//! on from `size_of` and `offset_of!` rather than from the table. The assertions
+//! in `layout_assertions.rs` are written the same way: the absolute values are
+//! gated on the LP64 predicate and the relations are asserted unconditionally.
+//!
+//! | Type | Size (LP64) | Align (LP64) | Field offsets (LP64) |
 //! |---|---|---|---|
 //! | [`z_stream`] | 112 | 8 | 0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104 |
 //! | [`gz_header`] | 80 | 8 | 0, 8, 16, 20, 24, 32, 36, 40, 48, 56, 64, 68, 72 |
 //! | [`gzFile_s`] | 24 | 8 | 0, 8, 16 |
 //! | [`code`] | 4 | 2 | 0, 1, 2 |
+//!
+//! [`code`] is the one row that is platform-independent: its three members are
+//! `unsigned char`, `unsigned char` and `unsigned short`, whose widths are fixed
+//! on every target this port supports.
 //!
 //! # ★ The `uLong` hazard: the single most consequential decision in this file
 //!
@@ -37,18 +51,27 @@
 //! `u32` does exactly the same damage on Linux. **Only [`core::ffi::c_ulong`] is
 //! correct.**
 //!
-//! The identical reasoning applies to [`z_size_t`], [`z_off_t`] and
-//! [`z_off64_t`]. `z_size_t` resolves to `size_t`, `unsigned long long` or
-//! `unsigned long` depending on the build (`zconf.h` L253-L270); `z_off_t` and
-//! `z_off64_t` resolve to `off_t`, `off64_t`, `__int64`, `offset_t` or
-//! `long long` depending on the platform and on the caller's own
-//! `_FILE_OFFSET_BITS` and `_LARGEFILE64_SOURCE` settings (`zconf.h` L494-L532).
+//! The identical reasoning applies to two more aliases, and to one that is
+//! deliberately different:
 //!
-//! **No future maintainer may "simplify" any of these five aliases to a
-//! fixed-width integer.** A fixed-width spelling compiles everywhere and is
-//! wrong on half of it. That is why the aliases below are written in terms of
-//! `core::ffi` types and `cfg`, and why the size relationships are asserted
-//! rather than assumed.
+//! * [`z_size_t`] resolves to `size_t`, `unsigned long long` or `unsigned long`
+//!   depending on the build (`zconf.h` L253-L270).
+//! * [`z_off_t`] resolves to `off_t`, `off64_t`, `__int64`, `offset_t` or
+//!   `long long` depending on the platform and on the caller's own
+//!   `_FILE_OFFSET_BITS` and `_LARGEFILE64_SOURCE` settings
+//!   (`zconf.h` L494-L532).
+//! * [`z_off64_t`] is the exception: it is **fixed at 64 bits by definition**, on
+//!   every target, which is the whole point of the `*64` API family. It is a
+//!   concrete `i64` here rather than a `core::ffi` alias, and that is correct --
+//!   it is not a platform-varying type and must not be turned into one.
+//!
+//! **No future maintainer may "simplify" [`uLong`], [`z_size_t`] or [`z_off_t`]
+//! to a fixed-width integer.** A fixed-width spelling compiles everywhere and is
+//! wrong on half of it. That is why those three are written in terms of types
+//! that track the target -- `c_ulong`, `usize`, `c_long` -- selected by `cfg`
+//! where the header itself branches, why [`z_off64_t`] is a concrete `i64`
+//! instead, and why the size relationships between all four are asserted rather
+//! than assumed.
 //!
 //! # The `Z_NULL` convention
 //!
@@ -98,8 +121,17 @@
 //! | Category | Provided by |
 //! |---|---|
 //! | 1 -- stream-pointer validation | [`stream_ref`], [`stream_mut`] |
-//! | 2 -- input/output slice reconstruction | [`input_slice`], [`output_slice_mut`] |
+//! | 2 -- input/output slice reconstruction | [`input_slice`], [`output_slots_mut`], [`output_region`] |
 //! | 3 -- the opaque `state` round-trip | [`StateBlock`], [`install_state`], [`checked_state`], [`checked_state_mut`], [`take_state`] |
+//!
+//! ★ **No constructor for a `&z_stream` or a `&mut z_stream` exists here, and
+//! none may be added.** Category 1 is discharged entirely through raw places:
+//! every helper above tests `strm` for null and alignment and then reads or
+//! writes one member at a time with [`core::ptr::addr_of!`] or
+//! [`core::ptr::addr_of_mut!`]. That is a soundness requirement rather than a
+//! style, for the reason the next paragraph records, and the absence of a
+//! borrowing constructor is what keeps a future entry point from reintroducing
+//! the problem by reaching for the convenient thing.
 //!
 //! ★ **Nothing in the state round-trip takes a `&mut z_stream`.** A mutable
 //! reborrow of the caller's stream invalidates the caller's own [`z_streamp`], and
@@ -107,7 +139,7 @@
 //! call compares against. The helpers therefore read and write
 //! [`z_stream::state`] through raw places and take [`z_streamp`] throughout;
 //! [`checked_state`] carries the full account, including the Miri diagnostic that
-//! caught an earlier draft getting it wrong.
+//! a `&mut z_stream` in that position produces.
 //! | 4 -- invoking `zalloc` and `zfree` | [`StreamAllocator`] |
 //!
 //! Categories 5 (C strings and varargs) and 6 (writing through a caller's
@@ -116,9 +148,13 @@
 //!
 //! # cbindgen
 //!
-//! The header gate runs `cbindgen --crate libz-rs-sys` and diffs the result
-//! against the immutable `zlib.h`, so the *spellings* in this module are part of
-//! the contract. Every ABI type uses its exact C name -- `z_stream`,
+//! `cbindgen --crate libz-rs-sys` renders this module's declarations as C, for
+//! comparison against the immutable `zlib.h`, so the *spellings* here are part of
+//! the contract. Generation runs; the comparison is not automated -- `cbindgen.toml`
+//! specifies a normalised signature-and-constant comparison and explains why a
+//! verbatim `diff` can never be empty, and nothing in the tree implements it yet.
+//! Treat the spelling rules below as obligations to honour by hand until it does.
+//! Every ABI type uses its exact C name -- `z_stream`,
 //! `gz_header`, `gzFile_s`, `uInt`, `uLong`, `voidpf` and the rest -- because
 //! cbindgen resolves `c_uint` to `unsigned int` and `c_ulong` to
 //! `unsigned long` *before* any renaming, which means the facade's own aliases
@@ -148,26 +184,51 @@
 //!   fence, as the note on [`StatePrefix`] does. Module-level `//!` documentation
 //!   is not emitted and is therefore unaffected.
 //!
-//! The generated artifact was verified to compile under
+//! Compiling the generated artifact is the check that catches a violation of the
+//! rule directly above, and it is worth re-running after any change to an exported
+//! item's documentation. It compiles under
 //! `gcc -std=c89 -pedantic -Wall -Wextra`, `-std=c99`, `-std=c17` and
 //! `g++ -std=c++17`, the last of which exercises the generator's `cpp_compat`
 //! setting.
 
-// ★ The extern crate name is `z`, not `libz_rs_sys`. `Cargo.toml` declares
-// `[lib] name = "z"` so that the build emits `libz.so` and `libz.a`, and a library
-// target's name is also its extern crate name. Every consumer of this module --
-// the integration tests, the doctests here, `zlib-rs-differential`, the fuzz
-// targets and the benches -- therefore writes `use z::types::…`. The package name
-// `libz-rs-sys` appears only in a dependency line or a `cargo -p` argument.
+// ★ This module is PRIVATE, and the ABI types it declares reach a Rust consumer
+// only through the crate root's `pub use` list -- which carries the C contract and
+// stops there, leaving `StreamAllocator`, the raw-slice constructors and the state
+// round-trip `pub(crate)`. So an outside consumer writes `z::z_stream`, never
+// `z::types::z_stream`, and cannot write the latter at all: the crate documentation
+// carries `compile_fail` examples that hold that line.
+//
+// The extern crate name in that path is `z`, not `libz_rs_sys`. `Cargo.toml`
+// declares `[lib] name = "z"` so that the build emits `libz.so` and `libz.a`, and a
+// library target's name is also its extern crate name, which is what this crate's
+// own integration tests and doctests link it under. `zlib-rs-differential`, the fuzz
+// targets and the benches rename the dependency and write `libz_rs_sys::…`; the
+// package name `libz-rs-sys` appears only in a dependency line or a `cargo -p`
+// argument.
 
 use core::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
 use core::mem::{align_of, size_of};
+// Only the write-only output model names it, and that model belongs to the exported
+// surface: the ABI mirrors are ordinary initialised structs.
+#[cfg(feature = "libz-compat")]
+use core::mem::MaybeUninit;
+
+// The boundary machinery below -- the allocator adapter, the raw-slice constructors
+// and the opaque-state round-trip -- serves the exported `extern "C"` surface and
+// nothing else, so it is gated on the feature that turns that surface on, and so are
+// the imports only it needs. The ABI mirrors are NOT gated: `--no-default-features`
+// is a supported configuration that yields exactly them, which is what makes it
+// useful to a consumer that wants `z_stream`'s layout without linking any symbol.
+#[cfg(feature = "libz-compat")]
 use core::ptr::NonNull;
 
+#[cfg(feature = "libz-compat")]
 use zlib_rs::allocate::{
-    block_len, Allocator, AllocatorId, Buffer, GlobalAllocator, Opaque, Release, SENTINEL_FILL,
+    block_len, Allocator, AllocatorId, Buffer, ForeignBlock, Opaque, SENTINEL_FILL,
 };
+#[cfg(feature = "libz-compat")]
 use zlib_rs::deflate::deflate_state_check;
+#[cfg(feature = "libz-compat")]
 use zlib_rs::error::ReturnCode;
 // Gated exactly as the core gates the module: `zlib_rs::gz` requires
 // `zlib-rs/std`, which this crate's `gz` feature turns on. The import serves only
@@ -176,8 +237,13 @@ use zlib_rs::error::ReturnCode;
 // carry it.
 #[cfg(feature = "gz")]
 use zlib_rs::gz::state::GzFileExposed;
+#[cfg(feature = "libz-compat")]
 use zlib_rs::inflate::inflate_state_check;
 use zlib_rs::inflate::inftrees::{Code, CodeType};
+// Both serve the write-only output model the exported entry points use, so they are
+// gated with that surface: with `libz-compat` off there is no `next_out` to describe.
+#[cfg(feature = "libz-compat")]
+use zlib_rs::read_buf::{InitView, OutputRegion};
 
 // ---------------------------------------------------------------------------
 // Primitive type aliases -- `zconf.h`
@@ -306,8 +372,8 @@ pub type z_off_t = core::ffi::c_long;
 /// Every branch of that block is 64 bits wide on a platform that has large-file
 /// support at all: `off64_t` on non-Windows with `Z_LARGE64`, `long long` on
 /// MinGW, `__int64` on MSVC, `offset_t` on DJGPP. Measured at 8 bytes here, and
-/// declared unconditionally so that it agrees with
-/// [`zlib_rs::gz::state::ZOff64`], which the core also fixes at 64 bits because
+/// declared unconditionally so that it agrees with the core's `ZOff64`
+/// (`zlib_rs::gz::state`), which the core also fixes at 64 bits because
 /// [`gzFile_s::pos`] is part of the caller-visible `gzgetc` prefix and cannot be
 /// allowed to vary.
 ///
@@ -321,11 +387,13 @@ pub type z_off64_t = i64;
 // relationship is a build-time guarantee rather than a hope. It holds on every
 // target Rust supports for this crate: `uInt` is `unsigned int` (4 bytes) and
 // `usize` is at least 4 bytes wherever `std` and a C ABI are available.
+/// cbindgen:ignore
 const _: () = assert!(size_of::<uInt>() <= size_of::<usize>());
 
 // `z_size_t` must be exactly `size_t`, because the `_z` entry points are
 // declared in terms of it and a narrower or wider spelling would change their
 // signatures rather than merely their range.
+/// cbindgen:ignore
 const _: () = assert!(size_of::<z_size_t>() == size_of::<usize>());
 
 // ---------------------------------------------------------------------------
@@ -339,11 +407,19 @@ const _: () = assert!(size_of::<z_size_t>() == size_of::<usize>());
 ///
 /// `zlib.h` L149 requires the hook to return `Z_NULL` when it cannot satisfy a
 /// request, which arrives here as a null return that
-/// [`StreamAllocator::allocate_bytes`] converts to [`None`] and the caller then
-/// reports as [`ReturnCode::MEM_ERROR`].
+/// `StreamAllocator::allocate_bytes` converts to [`None`] and the caller then
+/// reports as [`zlib_rs::error::ReturnCode::MEM_ERROR`].
 ///
 /// `unsafe` because invoking caller-supplied C code is unsafe, and `extern "C"`
 /// rather than `extern "C-unwind"` because an unwind must never cross this edge.
+//
+// The `ReturnCode` link above is spelled in full, and must stay that way. This
+// alias is an ABI mirror, so it is compiled in every configuration, whereas the
+// `ReturnCode` import is gated with the boundary machinery that uses it; a bare
+// `[ReturnCode::MEM_ERROR]` therefore fails to resolve in a
+// `--no-default-features` documentation build. Kept as a plain comment rather
+// than a doc comment so that the rustdoc mechanics do not reach the generated C
+// header, where they would mean nothing to a C reader.
 pub type alloc_func = Option<unsafe extern "C" fn(voidpf, uInt, uInt) -> voidpf>;
 
 /// `void (*free_func)(voidpf opaque, voidpf address)` -- `zlib.h` L86.
@@ -410,9 +486,13 @@ pub struct internal_state {
 
 /// The compression and decompression stream: `zlib.h` L90-L110.
 ///
-/// **Measured: 112 bytes, align 8**, with the field offsets given on each member
-/// below. Every field is `pub` and in the exact declaration order of the C
-/// struct; nothing may be reordered, added or removed.
+/// **Measured on LP64: 112 bytes, align 8**, with the field offsets given on each
+/// member below. Those absolute numbers belong to that integer model: `uLong` is
+/// 4 bytes on LLP64 and pointers are 4 bytes on ILP32, so both the size and the
+/// offsets shrink there. What holds on **every** target is the structure: every
+/// field is `pub`, in the exact declaration order of the C struct, and nothing may
+/// be reordered, added or removed. Derive any number a program depends on from
+/// `size_of::<z_stream>()` and `offset_of!`, never from the figures quoted here.
 ///
 /// # Who owns which field
 ///
@@ -442,7 +522,7 @@ pub struct z_stream {
     /// `const Bytef *`, and `const` is not part of the ABI either way.
     ///
     /// May be null while [`z_stream::avail_in`] is zero, which is why
-    /// [`input_slice`] branches on the length before forming a slice.
+    /// `input_slice` branches on the length before forming a slice.
     pub next_in: *const Bytef,
     /// Offset 8. `uInt avail_in` -- bytes available at [`z_stream::next_in`].
     ///
@@ -477,7 +557,7 @@ pub struct z_stream {
     ///
     /// `zlib.h` L100. Caller-visible but caller-opaque: it is read back and
     /// tag-validated on every entry, which is what
-    /// [`checked_state`]/[`checked_state_mut`] do and why `deflateStateCheck`
+    /// `checked_state`/`checked_state_mut` do and why `deflateStateCheck`
     /// (`deflate.c` L538) and `inflateStateCheck` (`inflate.c` L88) exist in C.
     pub state: *mut internal_state,
     /// Offset 64. `alloc_func zalloc` -- used to allocate the internal state.
@@ -514,8 +594,10 @@ pub struct z_stream {
 /// `z_stream FAR *` -- `zlib.h` L112.
 ///
 /// The parameter type of every stream entry point. Nullability is part of the
-/// published contract: a null stream yields `Z_STREAM_ERROR`, so [`stream_ref`]
-/// and [`stream_mut`] check before dereferencing.
+/// published contract: a null stream yields `Z_STREAM_ERROR`, so every helper in
+/// this module tests the pointer for null and alignment before it reads through
+/// it, and reads one member at a time through a raw place rather than forming a
+/// reference to the whole struct.
 pub type z_streamp = *mut z_stream;
 
 // ---------------------------------------------------------------------------
@@ -524,10 +606,13 @@ pub type z_streamp = *mut z_stream;
 
 /// gzip header information passed to and from the library: `zlib.h` L118-L133.
 ///
-/// **Measured: 80 bytes, align 8.** Note two layout facts that are easy to get
-/// wrong: `time` lands at offset **8, not 4**, because [`uLong`] needs 8-byte
-/// alignment after the leading `int text`; and the struct carries **4 bytes of
-/// tail padding** after `done`, which is why 80 rather than 76.
+/// **Measured on LP64: 80 bytes, align 8.** Note two layout facts that are easy
+/// to get wrong, both of which are consequences of [`uLong`]'s width and therefore
+/// LP64-specific: `time` lands at offset **8, not 4**, because an 8-byte `uLong`
+/// must be aligned after the leading `int text`; and the struct carries **4 bytes
+/// of tail padding** after `done`, which is why 80 rather than 76. Where `uLong`
+/// is 4 bytes wide neither adjustment applies and the struct is correspondingly
+/// smaller -- which is exactly why nothing may hard-code 80.
 ///
 /// `zlib.h` L115-L116 refers to RFC 1952 for the meaning of the fields.
 ///
@@ -620,7 +705,11 @@ pub type gz_headerp = *mut gz_header;
 /// };
 /// ```
 ///
-/// **Measured: 24 bytes**, `have` at 0, `next` at 8, `pos` at 16.
+/// **Measured on LP64: 24 bytes**, `have` at 0, `next` at 8, `pos` at 16. The
+/// field *order* is the ABI and holds everywhere; the three offsets follow from
+/// pointer width and [`z_off64_t`]'s fixed 64 bits, so on a 32-bit target they are
+/// 0, 4 and 8 and the struct is 16 bytes. A caller's `gzgetc` macro computes them
+/// with its own compiler, so agreement is what matters, not the specific values.
 ///
 /// # ★ Why this is the highest-risk layout in the entire port
 ///
@@ -650,8 +739,8 @@ pub type gz_headerp = *mut gz_header;
 ///
 /// # Agreement with the core
 ///
-/// [`zlib_rs::gz::state::GzFileExposed`] is the core's form of the same prefix
-/// and is what actually sits at the head of the allocated state. The two
+/// The core's `GzFileExposed` (`zlib_rs::gz::state`) is its form of the same
+/// prefix and is what actually sits at the head of the allocated state. The two
 /// declarations must agree exactly, which the assertions below make a build
 /// failure rather than a runtime surprise.
 #[repr(C)]
@@ -672,9 +761,9 @@ pub struct gzFile_s {
     /// allocated, which is harmless because [`gzFile_s::have`] is then zero and
     /// the macro takes its function branch.
     ///
-    /// Spelled `*mut u8` rather than `*mut Bytef` to match
-    /// [`zlib_rs::gz::state::GzFileExposed::next`] exactly; the two are the same
-    /// type, since [`Bytef`] is [`Byte`] is `u8`.
+    /// Spelled `*mut u8` rather than `*mut Bytef` to match the core's
+    /// `GzFileExposed::next` exactly; the two are the same type, since [`Bytef`]
+    /// is [`Byte`] is `u8`.
     pub next: *mut u8,
     /// Offset 16. `z_off64_t pos` -- the position in the *uncompressed* stream.
     ///
@@ -698,16 +787,21 @@ pub type gzFile = *mut gzFile_s;
 // declaration hold everywhere. No other module can make this assertion, because
 // no other module imports both declarations.
 #[cfg(feature = "gz")]
+/// cbindgen:ignore
 const _: () = assert!(size_of::<gzFile_s>() == size_of::<GzFileExposed>());
 #[cfg(feature = "gz")]
+/// cbindgen:ignore
 const _: () = assert!(align_of::<gzFile_s>() == align_of::<GzFileExposed>());
 #[cfg(feature = "gz")]
+/// cbindgen:ignore
 const _: () =
     assert!(core::mem::offset_of!(gzFile_s, have) == core::mem::offset_of!(GzFileExposed, have));
 #[cfg(feature = "gz")]
+/// cbindgen:ignore
 const _: () =
     assert!(core::mem::offset_of!(gzFile_s, next) == core::mem::offset_of!(GzFileExposed, next));
 #[cfg(feature = "gz")]
+/// cbindgen:ignore
 const _: () =
     assert!(core::mem::offset_of!(gzFile_s, pos) == core::mem::offset_of!(GzFileExposed, pos));
 
@@ -725,8 +819,10 @@ const _: () =
 /// } code;
 /// ```
 ///
-/// **Measured: 4 bytes, align 2**, `op` at 0, `bits` at 1, `val` at 2 --
-/// "Each entry is four bytes", as the comment at `inftrees.h` L23 says.
+/// **4 bytes, align 2**, `op` at 0, `bits` at 1, `val` at 2 -- "Each entry is four
+/// bytes", as the comment at `inftrees.h` L23 says. Unlike the other layouts in
+/// this module these numbers are platform-independent: all three members have
+/// fixed widths, so no integer model changes them.
 ///
 /// # Why an ABI mirror of a *private* header type exists here
 ///
@@ -777,7 +873,9 @@ pub struct code {
     pub val: u16,
 }
 
+/// cbindgen:ignore
 const _: () = assert!(size_of::<code>() == size_of::<Code>());
+/// cbindgen:ignore
 const _: () = assert!(align_of::<code>() == align_of::<Code>());
 
 impl From<Code> for code {
@@ -819,12 +917,36 @@ impl From<code> for Code {
 /// Typed [`c_uint`] because that is the arithmetic C performs on it:
 /// `inftrees.c` compares `used > ENOUGH_LENS` in `unsigned`. The core keeps a
 /// [`usize`] form, [`zlib_rs::inflate::inftrees::ENOUGH_LENS`], for indexing.
-pub const ENOUGH_LENS: c_uint = 852;
+//
+// ★ `#[allow(dead_code)]` on this constant and the two below is required at the
+// declared MSRV and is not cosmetic. All three are the ABI-side mirror of
+// `inftrees.h` L49-L51 and their consumer is `layout_assertions.rs`, which pins
+// each against the header's number; `inflate.rs` reaches for the core's `usize`
+// forms instead, because that is what it indexes with. Every use is therefore
+// inside a `const _: () = …` item, and **rustc 1.80's dead-code pass does not
+// traverse those bodies**: it reports `constant ENOUGH_LENS is never used`.
+// Verified here rather than assumed -- `cargo +1.80 build -p libz-rs-sys
+// --all-features` reports all three, and 1.97.1 reports none of them -- which is
+// the same quirk `layout_assertions.rs` documents for its own `IS_LP64` and
+// `crates/zlib-rs/src/gz/header.rs` for its nineteen field constants. Since CI
+// builds with `-D warnings`, without these attributes the crate would fail to
+// build on exactly the compiler `rust-version = "1.80"` promises to support.
+//
+// The attributes are inert on newer toolchains and are scoped to these three
+// items rather than to the module, so real dead code elsewhere in the file is
+// still reported. Remove them only when the MSRV rises past the version that
+// fixed the analysis, and re-verify with a build on the new floor first.
+/// cbindgen:ignore
+#[allow(dead_code)]
+pub(crate) const ENOUGH_LENS: c_uint = 852;
 
 /// Maximum number of table entries for the distance code: 592.
 ///
 /// `inftrees.h` L50, from `enough 30 6 15`.
-pub const ENOUGH_DISTS: c_uint = 592;
+// Const-assert-only consumer; see the note above `ENOUGH_LENS`.
+/// cbindgen:ignore
+#[allow(dead_code)]
+pub(crate) const ENOUGH_DISTS: c_uint = 592;
 
 /// Maximum size of the dynamic table: 1444 entries.
 ///
@@ -832,7 +954,10 @@ pub const ENOUGH_DISTS: c_uint = 592;
 /// budgets `4 * ENOUGH` bytes for its inline arena, and `test/infcover.c`
 /// accounts for that budget when it caps allocation, so the value is
 /// externally load-bearing rather than merely advisory.
-pub const ENOUGH: c_uint = ENOUGH_LENS + ENOUGH_DISTS;
+// Const-assert-only consumer; see the note above `ENOUGH_LENS`.
+/// cbindgen:ignore
+#[allow(dead_code)]
+pub(crate) const ENOUGH: c_uint = ENOUGH_LENS + ENOUGH_DISTS;
 
 /// `codetype` discriminant `CODES` -- `inftrees.h` L55.
 ///
@@ -846,17 +971,20 @@ pub const ENOUGH: c_uint = ENOUGH_LENS + ENOUGH_DISTS;
 /// by convention. A Rust `enum` parameter would make an out-of-range value
 /// instant undefined behaviour, so the exported signature takes [`c_int`] and
 /// validates it with [`code_type_from_raw`].
-pub const CODES: c_int = 0;
+/// cbindgen:ignore
+pub(crate) const CODES: c_int = 0;
 
 /// `codetype` discriminant `LENS` -- `inftrees.h` L56.
 ///
 /// The literal/length code: the merged 0..=285 alphabet of RFC 1951 §3.2.5.
-pub const LENS: c_int = 1;
+/// cbindgen:ignore
+pub(crate) const LENS: c_int = 1;
 
 /// `codetype` discriminant `DISTS` -- `inftrees.h` L57.
 ///
 /// The distance code: the 0..=29 alphabet of RFC 1951 §3.2.5.
-pub const DISTS: c_int = 2;
+/// cbindgen:ignore
+pub(crate) const DISTS: c_int = 2;
 
 /// Validates a raw `codetype` argument and maps it to the core's enum.
 ///
@@ -866,23 +994,19 @@ pub const DISTS: c_int = 2;
 /// anything else, which the caller reports as an error rather than treating as a
 /// valid alphabet.
 ///
-/// # Examples
+/// # The mapping, pinned
 ///
-/// The crate's `[lib] name` is `z`, so that is the extern crate name a consumer
-/// writes -- see the module documentation.
-///
-/// ```
-/// use z::types::{code_type_from_raw, CODES, DISTS, LENS};
-/// use zlib_rs::inflate::inftrees::CodeType;
-///
-/// assert_eq!(code_type_from_raw(CODES), Some(CodeType::Codes));
-/// assert_eq!(code_type_from_raw(LENS), Some(CodeType::Lens));
-/// assert_eq!(code_type_from_raw(DISTS), Some(CodeType::Dists));
-/// assert_eq!(code_type_from_raw(3), None);
-/// assert_eq!(code_type_from_raw(-1), None);
-/// ```
+/// The five cases below are the whole of the contract, and they are checked at
+/// compile time rather than in a doctest. Two reasons, and the first is decisive:
+/// this helper is `pub(crate)`, so no doctest -- which rustdoc compiles as a
+/// separate crate -- can name it, and it must stay that way, because a caller
+/// outside the boundary has nothing to validate a raw `codetype` *for*. The second
+/// is that a `const fn` needs no harness to be exercised, so the assertions cost
+/// nothing and cannot be skipped by a filtered test run. The same five, plus the
+/// two integer extremes, run again at run time in the test module at the bottom of
+/// this file, where a failure is reported rather than fatal.
 #[must_use]
-pub const fn code_type_from_raw(raw: c_int) -> Option<CodeType> {
+pub(crate) const fn code_type_from_raw(raw: c_int) -> Option<CodeType> {
     match raw {
         CODES => Some(CodeType::Codes),
         LENS => Some(CodeType::Lens),
@@ -891,10 +1015,23 @@ pub const fn code_type_from_raw(raw: c_int) -> Option<CodeType> {
     }
 }
 
+// The three accepted values are `inftrees.h` L54-L58 in declaration order; the two
+// rejected ones are the nearest integers on either side of the range, which is where
+// an off-by-one in the arms above would show itself.
+/// cbindgen:ignore
+const _: () = {
+    assert!(matches!(code_type_from_raw(CODES), Some(CodeType::Codes)));
+    assert!(matches!(code_type_from_raw(LENS), Some(CodeType::Lens)));
+    assert!(matches!(code_type_from_raw(DISTS), Some(CodeType::Dists)));
+    assert!(code_type_from_raw(3).is_none());
+    assert!(code_type_from_raw(-1).is_none());
+};
+
 // ---------------------------------------------------------------------------
 // The allocator hook -- unsafe-site category 4
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "libz-compat")]
 /// The byte a freshly acquired foreign block is filled with.
 ///
 /// [`SENTINEL_FILL`] -- `0xa5` -- in debug builds and zero in release, mirroring
@@ -914,6 +1051,7 @@ pub const fn code_type_from_raw(raw: c_int) -> Option<CodeType> {
 /// code isn't depending on zeros", so a state constructor that mistakenly assumes
 /// zeroed memory fails a Rust test rather than only the C coverage harness.
 #[cfg(debug_assertions)]
+/// cbindgen:ignore
 const FILL_BYTE: u8 = SENTINEL_FILL;
 
 /// The byte a freshly acquired foreign block is filled with in release builds.
@@ -921,6 +1059,7 @@ const FILL_BYTE: u8 = SENTINEL_FILL;
 /// See the debug-build definition above for the rationale. Zero is the plainest
 /// possible choice for a pass that has to happen anyway.
 #[cfg(not(debug_assertions))]
+/// cbindgen:ignore
 const FILL_BYTE: u8 = {
     // Referenced so that the import is used in both build configurations and the
     // two definitions cannot drift apart unnoticed.
@@ -928,45 +1067,172 @@ const FILL_BYTE: u8 = {
     0
 };
 
+#[cfg(feature = "libz-compat")]
+// ★ `#[allow(dead_code)]` for the reason `ENOUGH_LENS` above carries it: both uses of this
+// constant are inside `const _: () = assert!(…)` items, and rustc 1.80's dead-code pass
+// does not traverse those bodies -- `make rust-msrv` reports `constant FILL_U16 is never
+// used` there while current stable counts the uses. The byte pattern itself is what
+// `allocate_u16s` writes through the raw pointer; the assertions are what keep the two
+// spellings equivalent.
+#[allow(dead_code)]
 /// The 16-bit fill pattern, both of whose bytes are `FILL_BYTE`.
 ///
 /// Filling a `u16` block byte-for-byte the way a byte block is filled keeps the
 /// two shapes consistent: in a debug build a `u16` block reads back as `0xa5a5`,
 /// which is what the bytes `0xa5 0xa5` mean in either byte order. This is the
 /// same derivation the core uses for its own `u16` shape.
+/// cbindgen:ignore
 const FILL_U16: u16 = u16::from_ne_bytes([FILL_BYTE, FILL_BYTE]);
 
-/// Which pair of routines a [`StreamAllocator`] calls.
-///
-/// Private, and deliberately so: the two arms are not interchangeable, and
-/// keeping them in a closed enum nobody outside this module can construct means a
-/// caller's block can never be routed to the internal path or the reverse. The
-/// only ways in are [`StreamAllocator::internal`] and
-/// [`StreamAllocator::from_hooks`].
-#[derive(Debug, Clone, Copy)]
-enum Hooks {
-    /// Both caller hooks were `Z_NULL`, so the library's own routines apply.
+#[cfg(feature = "libz-compat")]
+// [`StreamAllocator::allocate_u16s`] fills its block one *byte* at a time, through
+// the raw pointer and before any `&mut [u16]` exists, because a reference may not
+// address indeterminate memory. That is only equivalent to filling each element
+// with [`FILL_U16`] while both of the pattern's bytes are `FILL_BYTE`, so the
+// equivalence is asserted rather than assumed: redefining `FILL_U16` to a pattern
+// with two different bytes fails the build here instead of silently changing what
+// a freshly allocated hash-chain array reads back as.
+/// cbindgen:ignore
+const _: () = assert!(FILL_U16.to_ne_bytes()[0] == FILL_BYTE);
+#[cfg(feature = "libz-compat")]
+/// cbindgen:ignore
+const _: () = assert!(FILL_U16.to_ne_bytes()[1] == FILL_BYTE);
+
+// ---------------------------------------------------------------------------
+// The library's own allocation routines -- `zutil.c` L299-L308
+// ---------------------------------------------------------------------------
+//
+// ★ These exist because C's substitution is OBSERVABLE. `deflate.c` L401-L414,
+// `inflate.c` L183-L195 and `infback.c` L37-L49 do not merely *decide* to use the
+// library's own routines when a hook is `Z_NULL`: they WRITE `zcalloc` and
+// `zcfree` into the caller's `z_stream`, and `zlib.h` L151-L153 documents that --
+// "If zalloc and zfree are set to Z_NULL, deflateInit updates them to use default
+// allocation functions". A caller may read those members afterwards, pass the
+// stream to `inflateCopy` (which copies all three verbatim), or -- as
+// `test/infcover.c` L502 does -- initialise a stream whose members `mem_done` has
+// just reset to `Z_NULL` and let the library fill them in again.
+//
+// Publishing a Rust closure or a mode flag cannot satisfy that: the member's type
+// is a C function pointer, so the substituted value has to BE one. Hence two
+// ordinary `extern "C"` functions with `zalloc`/`zfree`'s exact signatures.
+// Neither is `#[no_mangle]`: `zcalloc` and `zcfree` are in `zlib.map`'s `local:`
+// block, so the reference does not export them either, and these are reached only
+// through the function pointers the library publishes.
+//
+// They are `malloc`/`free`-backed for one decisive reason: `zcfree` receives a
+// pointer and nothing else, exactly as `free` does. Rust's global allocator needs
+// the original `Layout` to deallocate, which the C signature has no room to carry,
+// so a global-allocator-backed pair could not be published to a caller at all
+// without inventing a size prefix -- a layout the reference does not have and that
+// a caller mixing `strm->zfree` with `free` would corrupt.
+//
+// `malloc` and `free` are excluded from header generation in cbindgen.toml: they
+// are C-runtime functions this crate IMPORTS, so a rendered declaration would put
+// them in a file guarded by ZLIB_H, where they are no part of the contract.  A doc
+// comment cannot carry the annotation here, because rustdoc rejects one on an
+// extern block (`unused_doc_comments`, an error under -D warnings).
+extern "C" {
+    /// C's `malloc` -- the allocator `zcalloc` uses (`zutil.c` L301).
     ///
-    /// The substitution `zlib.h` L151-L153 promises and `deflate.c` L401-L414,
-    /// `inflate.c` L183-L195 and `infback.c` L37-L49 perform. Delegates to
-    /// [`GlobalAllocator`], which the core documents as the mirror of
-    /// `zcalloc`/`zcfree` (`zutil.c` L299-L308).
-    Internal,
-    /// The caller supplied both hooks; every request goes through them.
-    Caller {
-        /// The caller's `zalloc` (`zlib.h` L85), known non-null.
-        allocate: unsafe extern "C" fn(voidpf, uInt, uInt) -> voidpf,
-        /// The caller's `zfree` (`zlib.h` L86), known non-null.
-        deallocate: unsafe extern "C" fn(voidpf, voidpf),
-        /// The caller's `opaque` (`zlib.h` L104), passed back verbatim.
-        opaque: Opaque,
-    },
+    /// Declared rather than taken from a crate: `libc` is an optional,
+    /// default-off dependency of this crate (dependency minimalism, AAP §0.7.1
+    /// (i)), and the two signatures below are fixed by C89 7.20.3, so there is
+    /// nothing to discover. Every consumer of this library is a C ABI consumer and
+    /// therefore already links a C runtime.
+    fn malloc(size: z_size_t) -> *mut c_void;
+
+    /// C's `free` -- the routine `zcfree` calls (`zutil.c` L307).
+    fn free(address: *mut c_void);
+}
+
+#[cfg(feature = "libz-compat")]
+/// The library's own `zalloc`, published to the caller when it supplies none.
+///
+/// The mirror of `zcalloc` (`zutil.c` L299-L304), which on any target whose `uInt`
+/// is wider than two bytes -- every target this crate supports -- is
+/// `malloc(items * size)`.
+///
+/// One deliberate difference: the product is computed **checked**, in `usize`,
+/// rather than in C's `unsigned`. An unchecked product is the classic route from
+/// an allocation bug to a memory-safety bug, because it yields a block far smaller
+/// than the length the resulting slice would claim; a request that cannot be
+/// expressed becomes `Z_NULL`, which is `zalloc`'s documented failure answer
+/// (`zlib.h` L149) and which every caller of this library already handles as
+/// `Z_MEM_ERROR`. No request the library itself makes can reach that bound:
+/// `MAX_WBITS` (15) and `MAX_MEM_LEVEL` (9) cap the largest at 131072 bytes.
+///
+/// # Safety
+///
+/// This is an `extern "C"` function whose address is handed to C. It dereferences
+/// nothing: `opaque` is ignored, exactly as `zcalloc` ignores it, and the return
+/// value is the allocator's own. Every block it returns must be released through
+/// [`zlib_rs_zfree`] and through nothing else.
+/// cbindgen:ignore
+pub(crate) unsafe extern "C" fn zlib_rs_zalloc(_opaque: voidpf, items: uInt, size: uInt) -> voidpf {
+    let Some(bytes) = block_len(widen(items), widen(size)) else {
+        return core::ptr::null_mut();
+    };
+
+    // SAFETY: unsafe-site category 4, on the library's own side of it. `malloc` is
+    // the C runtime's, its single argument is a byte count that `block_len` has
+    // proven does not overflow, and a zero count -- which `malloc` may answer with
+    // either null or a unique pointer -- is not reachable here because `block_len`
+    // rejects it. The result is treated as an address only; nothing is read or
+    // written through it.
+    let block = unsafe { malloc(bytes) };
+    block.cast::<c_void>()
+}
+
+/// The library's own `zfree`, published alongside [`zlib_rs_zalloc`].
+///
+/// The mirror of `zcfree` (`zutil.c` L306-L308): `free(ptr)`, with `opaque`
+/// ignored.
+///
+/// # Safety
+///
+/// `address` must be null, or a pointer [`zlib_rs_zalloc`] returned and that has
+/// not been released yet. That is `free`'s own contract and `zfree`'s
+/// (`zlib.h` L86); this function adds nothing to it.
+/// cbindgen:ignore
+pub(crate) unsafe extern "C" fn zlib_rs_zfree(_opaque: voidpf, address: voidpf) {
+    // SAFETY: unsafe-site category 4. `free` accepts null and does nothing with
+    // it (C89 7.20.3.2), and by this function's contract any other value came from
+    // `zlib_rs_zalloc`, i.e. from `malloc`. Nothing is read through the pointer.
+    unsafe { free(address) };
+}
+
+#[cfg(feature = "libz-compat")]
+/// The pair of routines a [`StreamAllocator`] calls, with the `opaque` they take.
+///
+/// Private, and deliberately so: nobody outside this module can construct one, so
+/// a block obtained from one triple can never be routed to another. The only ways
+/// in are [`StreamAllocator::internal`] and [`StreamAllocator::from_hooks`].
+///
+/// ★ There is no "internal mode" variant. After C's substitution there is no such
+/// thing: `deflate.c` L403-L413 replaces a null `zalloc` with `zcalloc` and a null
+/// `zfree` with `zcfree` and then allocates through `strm->zalloc` like any other
+/// stream, and [`StreamAllocator::internal`] reproduces exactly that by carrying
+/// [`zlib_rs_zalloc`] and [`zlib_rs_zfree`] as an ordinary pair. Two consequences,
+/// both wanted: the library's own path and a caller's path are the same code, so
+/// neither can drift; and [`Allocator::id`] gives the same answer whether the
+/// allocator was built by `internal()` or read back from the hooks the library
+/// published, which is what lets `deflateEnd` release blocks `deflateInit2_`
+/// obtained.
+#[derive(Debug, Clone, Copy)]
+struct Hooks {
+    /// `zalloc` (`zlib.h` L85), known non-null.
+    allocate: unsafe extern "C" fn(voidpf, uInt, uInt) -> voidpf,
+    /// `zfree` (`zlib.h` L86), known non-null.
+    deallocate: unsafe extern "C" fn(voidpf, voidpf),
+    /// `opaque` (`zlib.h` L104), passed back to both routines verbatim.
+    opaque: Opaque,
 }
 
 /// The facade's [`Allocator`]: the raw-pointer half of the core's abstraction.
 ///
 /// [`zlib_rs::allocate`] defines the *shape* of allocation and supplies the
-/// implementation that needs no hooks ([`GlobalAllocator`]), but it cannot supply
+/// implementation that needs no hooks (`zlib_rs::allocate::GlobalAllocator`), but it
+/// cannot supply
 /// this one: calling a raw C function pointer requires the escape hatch that
 /// `#![forbid(unsafe_code)]` denies it. This type is that missing half, and it
 /// lives in this module because [`alloc_func`] and [`free_func`] do.
@@ -1009,8 +1275,8 @@ enum Hooks {
 /// convention: a [`Buffer`] keeps Rust-owned and foreign storage in separate
 /// variants of a private enum, and [`Buffer::release_to`] compares the
 /// [`AllocatorId`] recorded at handout against the allocator being released to,
-/// yielding [`Release::Refused`] on any mismatch. A refused release leaks the
-/// block -- safe and diagnosable -- rather than corrupting the heap.
+/// refusing the release on any mismatch. A refused release leaks the block -- safe
+/// and diagnosable -- rather than corrupting the heap.
 ///
 /// `test/infcover.c` polices exactly this: its `mem_free` counts frees of
 /// addresses it never handed out as *rogue*, and `mem_done` reports rogue frees,
@@ -1062,11 +1328,11 @@ enum Hooks {
 /// raw pointer instead, because rebuilding a slice from one requires the escape
 /// hatch it forbids.
 ///
-/// This is precisely why AAP §0.6.4.5 assigns the two tools as it does: **Miri
+/// This is precisely why the two tools divide the workspace as they do: **Miri
 /// covers `crates/zlib-rs`, the safe core, and AddressSanitizer covers
-/// `crates/libz-rs-sys`, the boundary layer "where raw pointers actually exist".**
-/// The plan's own reasoning is that "Miri can analyze the core exhaustively
-/// precisely because the core contains no FFI". Accordingly:
+/// `crates/libz-rs-sys`, the boundary layer where the raw pointers actually
+/// exist.** Miri can analyse the core exhaustively because the core contains no
+/// FFI; it cannot model this crate's whole job. Accordingly:
 ///
 /// * Every raw-pointer path in this module -- caller-hook allocation, slice
 ///   reconstruction, stream validation, and the full state round-trip including
@@ -1077,19 +1343,21 @@ enum Hooks {
 /// * A CI job that runs Miri over this crate must therefore skip the tests that
 ///   release a foreign block, and should cite this note rather than silence the
 ///   diagnostic.
+#[cfg(feature = "libz-compat")]
 #[derive(Debug, Clone, Copy)]
-pub struct StreamAllocator {
+pub(crate) struct StreamAllocator {
     /// Which routines to call. See [`Hooks`].
     hooks: Hooks,
 }
 
+#[cfg(feature = "libz-compat")]
 impl StreamAllocator {
-    /// The allocator the library substitutes when both caller hooks are `Z_NULL`.
+    /// The allocator the library substitutes when a caller hook is `Z_NULL`.
     ///
-    /// Mirrors the substitution at `deflate.c` L401-L414, `inflate.c` L183-L195
-    /// and `infback.c` L37-L49, which install `zcalloc`/`zcfree` and clear
-    /// `opaque`. Requests are served by [`GlobalAllocator`], which the core
-    /// documents as the mirror of those routines.
+    /// Carries `zlib_rs_zalloc` and `zlib_rs_zfree` with a null `opaque`,
+    /// which is the substitution `deflate.c` L401-L414, `inflate.c` L183-L195 and
+    /// `infback.c` L37-L49 perform with `zcalloc`/`zcfree` -- the same two
+    /// routines, reached the same way, through a function pointer.
     ///
     /// Also the right choice for buffers that are not reached through a
     /// [`z_stream`] at all -- the `gzFile` layer allocates its state, its path
@@ -1097,10 +1365,37 @@ impl StreamAllocator {
     /// (`gzlib.c` L100 and L206, `gzread.c` L99-L100, `gzwrite.c` L16 and L25),
     /// because a `gzFile` has no caller-supplied hooks to honour.
     #[must_use]
-    pub const fn internal() -> Self {
+    // Exercised by this module's tests; no entry point calls it, because `from_hooks`
+    // performs the same substitution inline while reading the caller's triple. Kept as
+    // the named form of "the library's own routines", which the doc comment above is
+    // about, and scoped so the allowance disappears in the build that does use it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn internal() -> Self {
         Self {
-            hooks: Hooks::Internal,
+            hooks: Hooks {
+                allocate: zlib_rs_zalloc,
+                deallocate: zlib_rs_zfree,
+                opaque: Opaque::NULL,
+            },
         }
+    }
+
+    /// The three values [`z_stream`]'s allocator members must hold after this
+    /// allocator has been installed -- `(zalloc, zfree, opaque)`.
+    ///
+    /// This is what makes C's substitution observable to the caller. An init entry
+    /// point reads the caller's three members, builds an allocator with
+    /// [`StreamAllocator::from_hooks`], and writes these three back; for a caller
+    /// that supplied both hooks they are the caller's own values unchanged, and for
+    /// each one it left null they are the library's own routine -- exactly the two
+    /// outcomes `zlib.h` L151-L153 documents.
+    #[must_use]
+    pub(crate) const fn published_hooks(&self) -> (alloc_func, free_func, voidpf) {
+        (
+            Some(self.hooks.allocate),
+            Some(self.hooks.deallocate),
+            self.hooks.opaque.as_ptr(),
+        )
     }
 
     /// Builds an allocator from a caller's `(zalloc, zfree, opaque)` triple.
@@ -1109,50 +1404,100 @@ impl StreamAllocator {
     /// [`z_stream::opaque`] read straight off the caller's stream; see
     /// [`StreamAllocator::from_stream`] for the reading half.
     ///
-    /// | `zalloc` | `zfree` | Result |
-    /// |---|---|---|
-    /// | [`None`] | [`None`] | [`StreamAllocator::internal`] |
-    /// | [`Some`] | [`Some`] | the caller's hooks |
-    /// | [`Some`] | [`None`] | [`None`] -- rejected |
-    /// | [`None`] | [`Some`] | [`None`] -- rejected |
+    /// | `zalloc` | `zfree` | `zalloc` used | `zfree` used | `opaque` used |
+    /// |---|---|---|---|---|
+    /// | [`None`] | [`None`] | `zlib_rs_zalloc` | `zlib_rs_zfree` | `Z_NULL` |
+    /// | [`Some`] | [`Some`] | the caller's | the caller's | the caller's |
+    /// | [`Some`] | [`None`] | the caller's | `zlib_rs_zfree` | the caller's |
+    /// | [`None`] | [`Some`] | `zlib_rs_zalloc` | the caller's | `Z_NULL` |
     ///
-    /// # ★ Why a half-supplied pair is refused
+    /// # ★ The two hooks default INDEPENDENTLY, exactly as C's do
     ///
-    /// C defaults the two hooks *independently*: `deflate.c` L401-L407 replaces a
-    /// null `zalloc` with `zcalloc`, and L410-L414 separately replaces a null
-    /// `zfree` with `zcfree`. A caller who supplies only `zalloc` therefore has
-    /// its blocks released by `free()` -- a genuine mismatched-allocator hazard
-    /// that happens to work only because both routines are `malloc`-backed. A
-    /// memory-safe port cannot reproduce a hazard, and it does not need to:
+    /// `deflate.c` L401-L407 replaces a null `zalloc` with `zcalloc` **and clears
+    /// `opaque`**, and L410-L414 separately replaces a null `zfree` with `zcfree`;
+    /// `inflate.c` L183-L195 and `infback.c` L37-L49 are the same two steps in the
+    /// same order. The four rows above are that behaviour, and every one of them is
+    /// reachable: a half-supplied pair is a C-valid stream, so this function
+    /// answers it rather than rejecting it.
     ///
-    /// * `zlib.h` L151-L153 documents the two as a *pair* -- "If `zalloc` and
-    ///   `zfree` are set to `Z_NULL`, `deflateInit` updates them to use default
-    ///   allocation functions" -- so treating them as a pair is the documented
-    ///   contract.
-    /// * C itself refuses the half-supplied case under `Z_SOLO`, returning
-    ///   `Z_STREAM_ERROR` at `deflate.c` L403 and L412, so the status a caller
-    ///   sees here is one C already produces in a supported configuration.
-    /// * No test in the suite exercises it. `test/example.c` leaves both
-    ///   `Z_NULL`; `test/infcover.c` sets both, in `mem_setup`; `test/minigzip.c`
-    ///   uses only the `gz*` layer, which has no hooks.
+    /// Two things make the mixed rows safe here, and they are the reason the
+    /// substitution can be reproduced faithfully instead of being refused:
     ///
-    /// A rejected triple must be reported as `Z_STREAM_ERROR` by the entry point,
-    /// which is the same status `inflateStateCheck` (`inflate.c` L88-L97) yields
-    /// for a stream whose `zalloc` or `zfree` is null.
+    /// * The library's own routines are `malloc`/`free`-backed
+    ///   (`zlib_rs_zalloc`, `zlib_rs_zfree`), which is what `zcalloc` and
+    ///   `zcfree` are (`zutil.c` L299-L308). A caller that supplies only `zalloc`
+    ///   therefore has its blocks released by `free`, which is precisely what the
+    ///   reference does with that stream -- no more and no less.
+    /// * Whichever pair results, it is recorded as one triple and
+    ///   [`Allocator::id`] is derived from all three values, so a block obtained
+    ///   from this allocator can only ever be returned to this allocator.
+    ///
+    /// `opaque` follows `zalloc`, not `zfree`, because that is where C clears it:
+    /// the `strm->opaque = (voidpf)0` assignment lives inside the `zalloc == NULL`
+    /// arm. A caller that supplies `zfree` alone keeps a null `opaque` and sees it
+    /// passed to its own `zfree`, which is what the reference passes.
+    ///
+    /// This constructor is for the three **init** entry points only, because they
+    /// are the only ones that substitute: every other entry point runs C's state
+    /// check first, which *rejects* a stream with a null hook rather than filling
+    /// one in. [`StreamAllocator::from_supplied_hooks`] is that path.
     #[must_use]
-    pub fn from_hooks(zalloc: alloc_func, zfree: free_func, opaque: voidpf) -> Option<Self> {
-        match (zalloc, zfree) {
-            (None, None) => Some(Self::internal()),
-            (Some(allocate), Some(deallocate)) => Some(Self {
-                hooks: Hooks::Caller {
-                    allocate,
-                    deallocate,
-                    opaque: Opaque::new(opaque),
-                },
-            }),
-            // Exactly one hook supplied: see the note above.
-            (Some(_), None) | (None, Some(_)) => None,
+    pub(crate) fn from_hooks(zalloc: alloc_func, zfree: free_func, opaque: voidpf) -> Self {
+        // `deflate.c` L403-L407: a null `zalloc` becomes the library's own and
+        // takes the `opaque` clear with it.
+        let (allocate, opaque) = match zalloc {
+            Some(allocate) => (allocate, Opaque::new(opaque)),
+            None => (
+                zlib_rs_zalloc as unsafe extern "C" fn(voidpf, uInt, uInt) -> voidpf,
+                Opaque::NULL,
+            ),
+        };
+        // `deflate.c` L410-L414: and then, separately, a null `zfree`.
+        let deallocate = zfree.unwrap_or(zlib_rs_zfree);
+
+        Self {
+            hooks: Hooks {
+                allocate,
+                deallocate,
+                opaque,
+            },
         }
+    }
+
+    /// Builds an allocator from a triple that must already be complete.
+    ///
+    /// The counterpart of [`StreamAllocator::from_hooks`] for every entry point
+    /// that is **not** an init: `deflateStateCheck` (`deflate.c` L536-L539) and
+    /// `inflateStateCheck` (`inflate.c` L88-L97) both begin
+    ///
+    /// ```c
+    /// if (strm == Z_NULL || strm->zalloc == (alloc_func)0 || strm->zfree == (free_func)0)
+    ///     return 1;
+    /// ```
+    ///
+    /// so a stream whose hooks are null is not substituted into working order at
+    /// that point -- it is refused with `Z_STREAM_ERROR`. Returns [`None`] for
+    /// exactly that case, which the entry point reports as
+    /// [`ReturnCode::STREAM_ERROR`].
+    ///
+    /// The case is reachable and is exercised by the suite:
+    /// `test/infcover.c`'s `mem_done` sets all three members back to `Z_NULL`
+    /// (L231-L233), and a stream in that state must be refused by anything other
+    /// than a fresh init.
+    #[must_use]
+    pub(crate) fn from_supplied_hooks(
+        zalloc: alloc_func,
+        zfree: free_func,
+        opaque: voidpf,
+    ) -> Option<Self> {
+        let (allocate, deallocate) = (zalloc?, zfree?);
+        Some(Self {
+            hooks: Hooks {
+                allocate,
+                deallocate,
+                opaque: Opaque::new(opaque),
+            },
+        })
     }
 
     /// Builds an allocator from a borrowed stream.
@@ -1166,11 +1511,17 @@ impl StreamAllocator {
     /// of the caller's raw pointer do not mix, for the reason
     /// [`checked_state`] documents at length.
     ///
-    /// Returns [`None`] for a half-supplied hook pair, for the reason
-    /// [`StreamAllocator::from_hooks`] documents.
+    /// Returns [`None`] when either hook is `Z_NULL`, which is the first half of
+    /// both C state checks -- see [`StreamAllocator::from_supplied_hooks`].
     #[must_use]
-    pub fn from_stream(strm: &z_stream) -> Option<Self> {
-        Self::from_hooks(strm.zalloc, strm.zfree, strm.opaque)
+    // Not currently called: every entry point reaches the hooks through
+    // `from_stream_ptr` instead, precisely because it forms no reference to the
+    // stream and so leaves the caller's pointer usable for the state round-trip.
+    // Kept as the safe-borrow counterpart, for a caller that already holds a
+    // validated `&z_stream` and is not going to touch `state`.
+    #[allow(dead_code)]
+    pub(crate) fn from_stream(strm: &z_stream) -> Option<Self> {
+        Self::from_supplied_hooks(strm.zalloc, strm.zfree, strm.opaque)
     }
 
     /// Builds an allocator by reading the three hook members through the caller's
@@ -1191,7 +1542,7 @@ impl StreamAllocator {
     /// If `strm` is non-null it must address a live [`z_stream`] that nothing else
     /// is concurrently writing.
     #[must_use]
-    pub unsafe fn from_stream_ptr(strm: z_streamp) -> Option<Self> {
+    pub(crate) unsafe fn from_stream_ptr(strm: z_streamp) -> Option<Self> {
         if strm.is_null() || !strm.is_aligned() {
             return None;
         }
@@ -1209,28 +1560,113 @@ impl StreamAllocator {
                 core::ptr::addr_of!((*strm).opaque).read(),
             )
         };
-        Self::from_hooks(zalloc, zfree, opaque)
+        Self::from_supplied_hooks(zalloc, zfree, opaque)
     }
 
-    /// Reports whether this allocator uses the library's internal routines.
+    /// Performs C's hook substitution on the caller's stream and publishes the
+    /// result -- the init-only counterpart of [`StreamAllocator::from_stream_ptr`].
     ///
-    /// Useful to an entry point that needs to know whether the caller's
-    /// `z_stream` still holds `Z_NULL` hooks, and to tests.
+    /// This is `deflate.c` L400-L414, `inflate.c` L182-L195 and `infback.c`
+    /// L36-L49 in one place, and it does all three things they do, in their order:
+    ///
+    /// 1. `strm->msg = Z_NULL` -- "in case we return an error";
+    /// 2. a null `zalloc` becomes the library's own **and** `opaque` is cleared;
+    /// 3. a null `zfree` becomes the library's own, decided independently.
+    ///
+    /// The three members are then written back, so a caller that passed `Z_NULL`
+    /// hooks finds working function pointers in its own structure afterwards --
+    /// which is what `zlib.h` L151-L153 promises and what makes the substitution
+    /// observable rather than internal.
+    ///
+    /// ★ It is called BEFORE parameter validation, exactly where C calls it: in
+    /// `deflateInit2_` the substitution at L401-L414 precedes the `windowBits` and
+    /// `memLevel` checks at L433-L437, so even an init that fails with
+    /// `Z_STREAM_ERROR` has already filled the hooks in. Reproducing that ordering
+    /// is why this is one operation and not two.
+    ///
+    /// Returns [`None`] only for a null or misaligned `strm`, which the entry point
+    /// reports as [`ReturnCode::STREAM_ERROR`]; the substitution itself cannot
+    /// fail.
+    ///
+    /// # Safety
+    ///
+    /// If `strm` is non-null it must address a live [`z_stream`] that nothing else
+    /// is concurrently reading or writing: this function WRITES four of its
+    /// members.
     #[must_use]
-    pub const fn is_internal(&self) -> bool {
-        matches!(self.hooks, Hooks::Internal)
+    pub(crate) unsafe fn adopt_hooks(strm: z_streamp) -> Option<Self> {
+        if strm.is_null() || !strm.is_aligned() {
+            return None;
+        }
+
+        // SAFETY: unsafe-site category 1 -- reading three members of the caller's
+        // stream through raw places, forming no reference, so `strm` stays usable
+        // for `install_state` afterwards. Non-null and aligned by the guard above,
+        // live by this function's contract; all three are plain `Copy` data and
+        // none is dereferenced.
+        let (zalloc, zfree, opaque) = unsafe {
+            (
+                core::ptr::addr_of!((*strm).zalloc).read(),
+                core::ptr::addr_of!((*strm).zfree).read(),
+                core::ptr::addr_of!((*strm).opaque).read(),
+            )
+        };
+
+        let allocator = Self::from_hooks(zalloc, zfree, opaque);
+        let (published_zalloc, published_zfree, published_opaque) = allocator.published_hooks();
+
+        // SAFETY: unsafe-site category 1 -- writing four members of the caller's
+        // stream through raw places. `strm` is non-null, aligned and live as
+        // established above, so each member is in bounds and writable; each value
+        // is plain `Copy` data and `z_stream` has no `Drop`, so overwriting drops
+        // nothing. The order is C's: `msg`, then `zalloc` with `opaque`, then
+        // `zfree`.
+        unsafe {
+            core::ptr::addr_of_mut!((*strm).msg).write(core::ptr::null());
+            core::ptr::addr_of_mut!((*strm).zalloc).write(published_zalloc);
+            core::ptr::addr_of_mut!((*strm).opaque).write(published_opaque);
+            core::ptr::addr_of_mut!((*strm).zfree).write(published_zfree);
+        }
+
+        Some(allocator)
+    }
+
+    /// Reports whether this allocator uses the library's own routines rather than
+    /// a caller's.
+    ///
+    /// True when `zalloc` is `zlib_rs_zalloc`, which is what
+    /// [`StreamAllocator::from_hooks`] substitutes for a `Z_NULL` hook. Compared
+    /// as function-pointer addresses because that is the only thing there is to
+    /// compare after the substitution: the library's routines are published to the
+    /// caller like any others, so "internal" is a statement about which function
+    /// the pointer names, not about a mode the allocator is in.
+    ///
+    /// Cast to `usize` rather than compared with `core::ptr::fn_addr_eq`, which is
+    /// stable only from Rust 1.85 and would break the declared 1.80 floor -- the
+    /// same cast [`Allocator::id`] uses for the same three values. Two distinct
+    /// functions may in principle share an address after the linker folds identical
+    /// bodies; nothing here depends on the answer for correctness, since every
+    /// allocation and release goes through the recorded triple either way.
+    #[must_use]
+    // As for `internal`: a test-facing question. Every allocation and release goes
+    // through the recorded triple, so no entry point needs to ask it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn is_internal(&self) -> bool {
+        self.hooks.allocate as usize
+            == zlib_rs_zalloc as unsafe extern "C" fn(voidpf, uInt, uInt) -> voidpf as usize
     }
 
     /// Returns the `opaque` value this allocator passes to its hooks.
     ///
-    /// [`Opaque::NULL`] in internal mode, mirroring `strm->opaque = (voidpf)0` at
-    /// `deflate.c` L406.
+    /// [`Opaque::NULL`] when `zalloc` was substituted, mirroring
+    /// `strm->opaque = (voidpf)0` at `deflate.c` L406.
     #[must_use]
-    pub const fn opaque_ptr(&self) -> voidpf {
-        match self.hooks {
-            Hooks::Internal => core::ptr::null_mut(),
-            Hooks::Caller { opaque, .. } => opaque.as_ptr(),
-        }
+    // Not currently called: the opaque cookie travels inside `Hooks` and is passed
+    // straight back to the caller's own routines, so nothing needs to read it out.
+    // Kept as the accessor that keeps `Hooks` private.
+    #[allow(dead_code)]
+    pub(crate) const fn opaque_ptr(&self) -> voidpf {
+        self.hooks.opaque.as_ptr()
     }
 
     /// Calls the caller's `zalloc` for `items * size` bytes and returns the base
@@ -1298,34 +1734,34 @@ impl StreamAllocator {
     }
 }
 
+#[cfg(feature = "libz-compat")]
 impl<'a> Allocator<'a> for StreamAllocator {
-    /// Returns [`AllocatorId::GLOBAL`] in internal mode and
-    /// [`AllocatorId::foreign`] in caller mode.
+    /// Returns [`AllocatorId::foreign`] built from the triple this allocator holds.
     ///
-    /// The foreign identity records what actually distinguishes two allocators --
-    /// the two hook addresses and the `opaque` value -- rather than a digest of
-    /// them, so two identities compare equal precisely when the allocators are
+    /// The identity records what actually distinguishes two allocators -- the two
+    /// hook addresses and the `opaque` value -- rather than a digest of them, so
+    /// two identities compare equal precisely when the allocators are
     /// interchangeable and there is no collision to worry about. The addresses are
     /// used for comparison only: nothing is ever called or read through the
     /// integers.
+    ///
+    /// ★ Note that the library's own routines get a foreign identity too, and that
+    /// is the point: an allocator built by [`StreamAllocator::internal`] and one
+    /// built by reading the hooks that same substitution published into the
+    /// caller's `z_stream` compare **equal**, so `deflateEnd` can release what
+    /// `deflateInit2_` allocated. It is never [`AllocatorId::GLOBAL`], because no
+    /// block this allocator hands out comes from Rust's global allocator.
     fn id(&self) -> AllocatorId {
-        match self.hooks {
-            Hooks::Internal => GlobalAllocator.id(),
-            Hooks::Caller {
-                allocate,
-                deallocate,
-                opaque,
-            } => AllocatorId::foreign(allocate as usize, deallocate as usize, opaque.addr()),
-        }
+        AllocatorId::foreign(
+            self.hooks.allocate as usize,
+            self.hooks.deallocate as usize,
+            self.hooks.opaque.addr(),
+        )
     }
 
-    /// Returns the `opaque` value the hooks receive, or [`Opaque::NULL`] in
-    /// internal mode.
+    /// Returns the `opaque` value the hooks receive.
     fn opaque(&self) -> Opaque {
-        match self.hooks {
-            Hooks::Internal => GlobalAllocator.opaque(),
-            Hooks::Caller { opaque, .. } => opaque,
-        }
+        self.hooks.opaque
     }
 
     /// Allocates `items * size` bytes.
@@ -1338,27 +1774,42 @@ impl<'a> Allocator<'a> for StreamAllocator {
     /// The block's contents are unspecified in the sense that matters: they are
     /// `FILL_BYTE`, not zero, and nothing may depend on either.
     fn allocate_bytes(&self, items: usize, size: usize) -> Option<Buffer<'a, u8>> {
-        match self.hooks {
-            Hooks::Internal => GlobalAllocator.allocate_bytes(items, size),
-            Hooks::Caller {
+        {
+            let Hooks {
                 allocate, opaque, ..
-            } => {
+            } = self.hooks;
+            {
                 let (base, len) = Self::call_zalloc(allocate, opaque, items, size)?;
 
-                // SAFETY: unsafe-site category 2 -- reconstructing a slice from a
-                // pointer/length pair. `base` is non-null (a `NonNull`) and
-                // trivially aligned for `u8`. `len` is the checked `items * size`
+                // ★ The fill happens through the RAW pointer, before any reference
+                // to the block exists. A caller's `zalloc` is a `malloc` -- it
+                // returns writable storage whose contents are indeterminate -- and
+                // `&mut [u8]` is not a legal shape for indeterminate bytes: every
+                // element a reference addresses must already hold a valid `u8`.
+                // Filling first and borrowing second is what makes the borrow
+                // sound; filling *through* the borrow would have required the
+                // very reference whose validity the fill establishes.
+                //
+                // SAFETY: unsafe-site category 4 -- writing the block a caller's
+                // hook just handed over. `base` is non-null (a `NonNull`) and
+                // trivially aligned for `u8`; `len` is the checked `items * size`
                 // product this very call passed to the hook, and `zlib.h` L149's
                 // contract is that a non-null return addresses that many writable
                 // bytes. The region is freshly allocated, so nothing else aliases
-                // it, and the borrow is produced exactly once and handed straight
-                // to `Buffer`, which owns it until `release_to` consumes it. The
-                // bytes are uninitialised at this instant and are written -- not
-                // read -- by the `fill` on the next line, which is what makes the
-                // slice sound to expose afterwards.
+                // it, and no reference to it exists yet.
+                unsafe {
+                    core::ptr::write_bytes(base.as_ptr(), FILL_BYTE, len);
+                }
+
+                // SAFETY: unsafe-site category 2 -- reconstructing a slice from a
+                // pointer/length pair. Non-null, aligned and `len` bytes writable
+                // as established above, unaliased because the block is fresh, and
+                // now fully initialised by the `write_bytes` on the line above --
+                // which is what makes `u8` a legal element type for it. The borrow
+                // is produced exactly once and handed straight to `Buffer`, which
+                // owns it until `release_to` consumes it.
                 let block: &'a mut [u8] =
                     unsafe { core::slice::from_raw_parts_mut(base.as_ptr(), len) };
-                block.fill(FILL_BYTE);
 
                 Some(Buffer::from_foreign(self, block))
             }
@@ -1377,13 +1828,13 @@ impl<'a> Allocator<'a> for StreamAllocator {
     /// contract. Returning it rather than merely declining matters: an abandoned
     /// block is a leak, and `test/infcover.c`'s `mem_done` reports leaks.
     fn allocate_u16s(&self, items: usize) -> Option<Buffer<'a, u16>> {
-        match self.hooks {
-            Hooks::Internal => GlobalAllocator.allocate_u16s(items),
-            Hooks::Caller {
+        {
+            let Hooks {
                 allocate,
                 deallocate,
                 opaque,
-            } => {
+            } = self.hooks;
+            {
                 let (base, _len) = Self::call_zalloc(allocate, opaque, items, size_of::<u16>())?;
 
                 // Tested on the byte address, before any narrowing, so that no
@@ -1400,78 +1851,80 @@ impl<'a> Allocator<'a> for StreamAllocator {
                 }
                 let elements = base.cast::<u16>().as_ptr();
 
+                // ★ Filled through the raw pointer before the borrow exists, for
+                // the reason [`StreamAllocator::allocate_bytes`] states at length:
+                // a hook returns writable storage, not initialised storage, and
+                // `&mut [u16]` may only address elements that already hold a valid
+                // `u16`. The byte fill is *exactly* the element fill it replaces,
+                // because [`FILL_U16`] is `u16::from_ne_bytes([FILL_BYTE; 2])` by
+                // construction -- both bytes of every element receive `FILL_BYTE`
+                // either way, in either byte order.
+                //
+                // SAFETY: unsafe-site category 4 -- writing the block a caller's
+                // hook just handed over. `base` is non-null (a `NonNull`), the
+                // hook was asked for `items * size_of::<u16>()` bytes and returned
+                // non-null so that many bytes are writable, and the product was
+                // computed checked inside `call_zalloc`. The region is fresh, so
+                // nothing aliases it, and no reference to it exists yet. The write
+                // goes through the byte pointer, whose alignment requirement is
+                // one, so it is independent of the `u16` test above.
+                unsafe {
+                    core::ptr::write_bytes(
+                        base.as_ptr(),
+                        FILL_BYTE,
+                        items.saturating_mul(size_of::<u16>()),
+                    );
+                }
+
                 // SAFETY: unsafe-site category 2 -- reconstructing a slice from a
                 // pointer/length pair. `elements` is non-null, derived from a
-                // `NonNull`, and has just been shown to be `u16`-aligned. The
-                // hook was asked for `items * size_of::<u16>()` bytes and
-                // returned non-null, so `items` `u16` values fit in the region it
-                // addresses; the product was computed checked inside
-                // `call_zalloc`. The region is fresh, so nothing aliases it, and
-                // the borrow is created once and handed to `Buffer`. The elements
-                // are uninitialised here and are written by the `fill` below
-                // before any read can occur.
+                // `NonNull`, and has just been shown to be `u16`-aligned. `items`
+                // `u16` values fit in the region, as established above; the region
+                // is fresh, so nothing aliases it; every element is initialised by
+                // the `write_bytes` above, which is what makes `u16` a legal
+                // element type for the borrow. It is created once and handed to
+                // `Buffer`.
                 let block: &'a mut [u16] =
                     unsafe { core::slice::from_raw_parts_mut(elements, items) };
-                block.fill(FILL_U16);
 
                 Some(Buffer::from_foreign(self, block))
             }
         }
     }
 
-    /// Releases a byte block obtained from this allocator.
+    /// Hands one byte block back to the caller's `zfree`.
     ///
-    /// `ZFREE(strm, addr)` from `zutil.h` L254. Routed through
-    /// [`Buffer::release_to`], which is what guarantees the identity check runs
-    /// and is also the only way to obtain the borrow to free.
-    fn deallocate_bytes(&self, buffer: Buffer<'a, u8>) {
-        match self.hooks {
-            Hooks::Internal => GlobalAllocator.deallocate_bytes(buffer),
-            Hooks::Caller {
-                deallocate, opaque, ..
-            } => match buffer.release_to(self) {
-                Release::Foreign(block) => {
-                    Self::call_zfree(deallocate, opaque, block.as_mut_ptr());
-                }
-                // Two distinct situations, one correct response: do nothing.
-                //
-                // `Handled` means the block was a Rust allocation that has already
-                // released itself, so no caller's `zfree` ever handed this memory
-                // out and calling one would be a rogue free. It cannot arise on
-                // this arm in any case, because caller mode never hands out
-                // Rust-owned storage.
-                //
-                // `Refused` means the block came from a *different* allocator and
-                // has not been released. Dropping the buffer leaks a foreign block
-                // -- safe, and visible in `test/infcover.c`'s leak report --
-                // whereas passing it to the wrong `zfree` would corrupt the heap. A
-                // Rust-owned block in that position still runs its own destructor
-                // as it drops, so nothing leaks in that direction.
-                Release::Handled | Release::Refused(_) => {}
-            },
-        }
+    /// This *is* `ZFREE(strm, addr)` (`zutil.h` L254). The block arrives as an
+    /// address and a length rather than as a borrow, and that is what makes the free
+    /// sound: a reference in argument position is protected for the whole call, and
+    /// freeing memory a protected reference covers is undefined behaviour. The
+    /// borrow was surrendered one frame earlier, inside `Buffer::release_to`, which
+    /// `Allocator::deallocate_bytes` calls before reaching this method -- see
+    /// `zlib_rs::allocate::ForeignBlock`, which records the whole rule and the Miri
+    /// diagnosis behind it.
+    ///
+    /// The identity check has already run there too, so a block from a different
+    /// allocator can never arrive here: it is refused and dropped instead, which
+    /// leaks a foreign block -- safe, and visible in `test/infcover.c`'s leak report
+    /// -- rather than corrupting a heap by passing it to the wrong `zfree`.
+    fn release_foreign_bytes(&self, block: ForeignBlock<'a, u8>) {
+        let Hooks {
+            deallocate, opaque, ..
+        } = self.hooks;
+        Self::call_zfree(deallocate, opaque, block.as_mut_ptr());
     }
 
-    /// Releases a `u16` block obtained from this allocator.
+    /// Hands one `u16` block back to the caller's `zfree`.
     ///
-    /// The [`Allocator::deallocate_bytes`] counterpart for the shape
-    /// [`Allocator::allocate_u16s`] produces; the base address handed to `zfree`
-    /// is the same one `zalloc` returned, because a [`Buffer`] never narrows the
-    /// block it holds.
-    fn deallocate_u16s(&self, buffer: Buffer<'a, u16>) {
-        match self.hooks {
-            Hooks::Internal => GlobalAllocator.deallocate_u16s(buffer),
-            Hooks::Caller {
-                deallocate, opaque, ..
-            } => match buffer.release_to(self) {
-                Release::Foreign(block) => {
-                    Self::call_zfree(deallocate, opaque, block.as_mut_ptr().cast::<u8>());
-                }
-                // As `deallocate_bytes`: two distinct situations, one correct
-                // response. See the comment there.
-                Release::Handled | Release::Refused(_) => {}
-            },
-        }
+    /// The [`StreamAllocator::release_foreign_bytes`] counterpart for the shape
+    /// `Allocator::allocate_u16s` produces, with the same contract. The base address
+    /// is the one `zalloc` returned, because a [`Buffer`] never narrows the block it
+    /// holds and `ForeignBlock` records the base rather than a cursor.
+    fn release_foreign_u16s(&self, block: ForeignBlock<'a, u16>) {
+        let Hooks {
+            deallocate, opaque, ..
+        } = self.hooks;
+        Self::call_zfree(deallocate, opaque, block.as_mut_ptr().cast::<u8>());
     }
 }
 
@@ -1479,6 +1932,7 @@ impl<'a> Allocator<'a> for StreamAllocator {
 // Single-value placement, shared by the state round-trip
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "libz-compat")]
 impl StreamAllocator {
     /// Allocates room for one `T` through this allocator and moves `value` into
     /// it.
@@ -1499,65 +1953,62 @@ impl StreamAllocator {
     /// and a successful result is a fully initialised `T` at a correctly aligned
     /// address. Recovering the value again is not safe, which is why
     /// [`StreamAllocator::displace`] carries the obligations.
+    ///
+    /// # ★ The move, and what it costs
+    ///
+    /// C initialises its state *in place*: `deflateInit2_` allocates `sizeof(deflate_state)` and
+    /// then assigns each field through `s->` (`deflate.c` L440-L505). This crate cannot, because the
+    /// core owns the state type and constructs it as a Rust value; that value is then moved here.
+    /// The state is 6144 bytes for deflate and 7296 for inflate, so the move is a copy of that much
+    /// -- one pass, once per stream, and it is the second half of the initialisation cost whose first
+    /// half is the buffer fill documented on `zlib_rs::allocate::Buffer::try_global`.
+    ///
+    /// Measured, the two together are 6.10 us per `deflateInit2_` + `deflateEnd` at the default
+    /// configuration against C's 1.40 us. The buffer fill dominates: a quarter of a megabyte against
+    /// six kilobytes, forty times the bytes. Constructing the state directly in the destination
+    /// storage would recover the smaller half, and it would require the core to hand out a
+    /// partially-initialised state -- which is exactly what `#![forbid(unsafe_code)]` prevents it
+    /// from doing, and what keeps every field's initialisation checkable by the compiler. The trade
+    /// is deliberate, the amortisation crossover is measured (a stream that compresses 64 KiB or more
+    /// is already faster end to end than C's), and the figure is reported rather than absorbed into a
+    /// throughput number.
     fn place<T>(&self, value: T) -> Option<NonNull<T>> {
-        // A zero-sized `T` has no valid allocation: `alloc` with a zero-size
-        // layout is undefined behaviour, and `malloc(0)` may legitimately return
-        // null. No state type is zero-sized -- `StateBlock` always carries its
-        // prefix -- so this is a guard rather than a case.
+        // A zero-sized `T` has no valid allocation: `malloc(0)` may legitimately
+        // return null, and a hook is entitled to do the same. No state type is
+        // zero-sized -- `StateBlock` always carries its prefix -- so this is a
+        // guard rather than a case.
         if size_of::<T>() == 0 {
             return None;
         }
 
-        match self.hooks {
-            Hooks::Internal => {
-                let layout = core::alloc::Layout::new::<T>();
-                // SAFETY: unsafe-site category 3 -- placing the object that
-                // `z_stream.state` will point at. `layout` has non-zero size, which is the single
-                // precondition of `alloc`; the branch above established it. The
-                // returned block is either null, handled by `NonNull::new`
-                // immediately below, or `layout.size()` writable bytes aligned to
-                // `layout.align()` -- i.e. correctly aligned for `T`.
-                let raw = unsafe { std::alloc::alloc(layout) }.cast::<T>();
-                let slot = NonNull::new(raw)?;
-                // SAFETY: unsafe-site category 3 -- moving the state into its
-                // block. `slot` is a fresh, correctly aligned, non-null
-                // allocation of exactly `size_of::<T>()` bytes that nothing else
-                // references, and its contents are uninitialised -- so writing
-                // rather than assigning is required, since assignment would drop
-                // whatever the uninitialised bytes were interpreted as.
-                unsafe { slot.as_ptr().write(value) };
-                Some(slot)
-            }
-            Hooks::Caller {
-                allocate,
-                deallocate,
-                opaque,
-            } => {
-                let (base, _len) = Self::call_zalloc(allocate, opaque, 1, size_of::<T>())?;
-                let slot = base.cast::<T>();
-                if !slot.as_ptr().is_aligned() {
-                    Self::call_zfree(deallocate, opaque, base.as_ptr());
-                    return None;
-                }
-                // SAFETY: unsafe-site category 3 -- moving the state into a block
-                // the caller's `zalloc` returned. `call_zalloc` was asked for
-                // `1 * size_of::<T>()` bytes
-                // and returned non-null, so by the `zlib.h` L149 contract the
-                // region holds that many writable bytes; the line above proved the
-                // address is aligned for `T`. The block is freshly allocated, so
-                // nothing else references it, and its contents are uninitialised,
-                // so it is written rather than assigned.
-                unsafe { slot.as_ptr().write(value) };
-                Some(slot)
-            }
+        let Hooks {
+            allocate,
+            deallocate,
+            opaque,
+        } = self.hooks;
+
+        let (base, _len) = Self::call_zalloc(allocate, opaque, 1, size_of::<T>())?;
+        let slot = base.cast::<T>();
+        if !slot.as_ptr().is_aligned() {
+            Self::call_zfree(deallocate, opaque, base.as_ptr());
+            return None;
         }
+        // SAFETY: unsafe-site category 3 -- moving the state into a block the
+        // stream's `zalloc` returned. `call_zalloc` was asked for
+        // `1 * size_of::<T>()` bytes and returned non-null, so by the `zlib.h` L149
+        // contract the region holds that many writable bytes; the line above proved
+        // the address is aligned for `T`. The block is freshly allocated, so nothing
+        // else references it, and its contents are uninitialised, so it is written
+        // rather than assigned.
+        unsafe { slot.as_ptr().write(value) };
+        Some(slot)
     }
 
     /// Moves the `T` at `slot` back out and returns its storage to this
     /// allocator.
     ///
     /// The exact inverse of [`StreamAllocator::place`]: `ZFREE(strm, s)` from
-    /// `deflate.c` L1305, or Rust's global deallocator in internal mode.
+    /// `deflate.c` L1305, through whichever `zfree` this allocator carries.
     ///
     /// # Safety
     ///
@@ -1576,27 +2027,120 @@ impl StreamAllocator {
         // is correct because ownership has transferred to the returned value.
         let value = unsafe { slot.as_ptr().read() };
 
-        match self.hooks {
-            Hooks::Internal => {
-                // SAFETY: unsafe-site category 3 -- releasing the state object's
-                // storage. By this function's contract `slot` came from
-                // `place::<T>` on an internal-mode allocator, which allocated it
-                // with exactly `Layout::new::<T>()` through the same global
-                // allocator. `dealloc` requires the identical layout, which is
-                // reconstructed here from the same type.
-                unsafe {
-                    std::alloc::dealloc(
-                        slot.as_ptr().cast::<u8>(),
-                        core::alloc::Layout::new::<T>(),
-                    );
-                }
-            }
-            Hooks::Caller {
-                deallocate, opaque, ..
-            } => Self::call_zfree(deallocate, opaque, slot.as_ptr().cast::<u8>()),
-        }
+        // SAFETY: unsafe-site category 4 -- the caller's `zfree`. `release`'s
+        // contract is satisfied by this function's: `slot` came from `place` or
+        // `reserve` on this triple, it has not been released before, nothing
+        // references it, and the value was moved out by the read above, so no
+        // destructor is owed.
+        unsafe { self.release(slot) };
 
         value
+    }
+
+    /// Requests room for one `T` without initialising it.
+    ///
+    /// [`StreamAllocator::place`] split at the seam: the allocation happens here
+    /// and the move happens in [`StreamAllocator::occupy`]. The split exists
+    /// because C makes the state request *before* the requests for the buffers the
+    /// state owns -- `ZALLOC(strm, 1, sizeof(deflate_state))` at `deflate.c` L440
+    /// precedes the window, `prev`, `head` and `pending_buf` requests at L468-L479
+    /// -- while a Rust state value cannot be built until the buffers it owns
+    /// exist. Reserving first and moving in afterwards reproduces C's order of
+    /// calls into the caller's `zalloc` exactly, which matters because
+    /// `test/infcover.c`'s tracking allocator records the order and reports any
+    /// non-last-in-first-out release against it.
+    ///
+    /// Returns [`None`] on the same three conditions as
+    /// [`StreamAllocator::place`]: a refused request, a block misaligned for `T`,
+    /// or a zero-sized `T`. A misaligned block is handed straight back rather than
+    /// abandoned, for the reason given there.
+    ///
+    /// The block is deliberately **not** filled with [`FILL_BYTE`]: unlike the
+    /// buffer path, every byte of it is written by [`StreamAllocator::occupy`]
+    /// before anything reads it, and C does not pre-fill this allocation either.
+    ///
+    /// A reservation is uninitialised storage that this allocator now expects
+    /// back. It must reach exactly one of [`StreamAllocator::occupy`] followed
+    /// eventually by [`StreamAllocator::displace`], or
+    /// [`StreamAllocator::release`] -- anything else leaks the block, and
+    /// `test/infcover.c`'s `mem_done` reports leaks as defects.
+    fn reserve<T>(&self) -> Option<NonNull<T>> {
+        // As `place`: a zero-sized `T` has no valid allocation.
+        if size_of::<T>() == 0 {
+            return None;
+        }
+
+        let Hooks {
+            allocate,
+            deallocate,
+            opaque,
+        } = self.hooks;
+
+        let (base, _len) = Self::call_zalloc(allocate, opaque, 1, size_of::<T>())?;
+        let slot = base.cast::<T>();
+        if !slot.as_ptr().is_aligned() {
+            Self::call_zfree(deallocate, opaque, base.as_ptr());
+            return None;
+        }
+        Some(slot)
+    }
+
+    /// Moves `value` into a block [`StreamAllocator::reserve`] produced.
+    ///
+    /// The second half of [`StreamAllocator::place`]. Afterwards `slot` addresses
+    /// an initialised `T` and is recoverable with
+    /// [`StreamAllocator::displace`], exactly as though `place` had produced it.
+    ///
+    /// # Safety
+    ///
+    /// * `slot` must have come from [`StreamAllocator::reserve`] on an allocator
+    ///   carrying the same `(zalloc, zfree, opaque)` triple, with the same `T`.
+    /// * The block must still be uninitialised -- that is, `slot` must not have
+    ///   been occupied already -- because the write does not drop what it
+    ///   overwrites.
+    // The receiver is not read, and is kept anyway: it is what names *which*
+    // allocator the block must have come from, both in the safety contract above and
+    // at every call site, and it keeps this method beside `reserve`, `release`,
+    // `place` and `displace` instead of turning one step of the sequence into a free
+    // function. Written as a comment rather than the lint's `reason` field, which
+    // needs Rust 1.81 and this workspace declares `rust-version = "1.80"`.
+    #[allow(clippy::unused_self)]
+    unsafe fn occupy<T>(&self, slot: NonNull<T>, value: T) {
+        // SAFETY: unsafe-site category 3 -- moving the state into a block the
+        // stream's `zalloc` returned. `reserve` asked for `1 * size_of::<T>()`
+        // bytes and returned non-null, so by the `zlib.h` L149 contract the region
+        // holds that many writable bytes, and it proved the address aligned for
+        // `T`. This function's contract makes the block still uninitialised and
+        // unreferenced, so it is written rather than assigned.
+        unsafe { slot.as_ptr().write(value) };
+    }
+
+    /// Returns a block's storage to this allocator without reading it.
+    ///
+    /// The counterpart of [`StreamAllocator::reserve`] for a reservation that was
+    /// never occupied -- the `ZFREE(strm, s)` C reaches when a later allocation
+    /// fails -- and the tail of [`StreamAllocator::displace`], which reads the
+    /// value out first and then releases the storage through this.
+    ///
+    /// Nothing is dropped, which is why it is sound for uninitialised storage and
+    /// why a caller holding an initialised block must take the value out first.
+    ///
+    /// # Safety
+    ///
+    /// * `slot` must have come from [`StreamAllocator::reserve`] or
+    ///   [`StreamAllocator::place`] on an allocator carrying the same
+    ///   `(zalloc, zfree, opaque)` triple. Returning a block to a different triple
+    ///   is the mismatched-allocator bug this crate exists to prevent, and what
+    ///   `test/infcover.c` counts as a *rogue* free.
+    /// * The block must not have been released already, and nothing may reference
+    ///   it afterwards.
+    /// * If the block was occupied, the value must already have been moved out:
+    ///   this runs no destructor, so anything the value owned would leak.
+    unsafe fn release<T>(&self, slot: NonNull<T>) {
+        let Hooks {
+            deallocate, opaque, ..
+        } = self.hooks;
+        Self::call_zfree(deallocate, opaque, slot.as_ptr().cast::<u8>());
     }
 }
 
@@ -1630,9 +2174,212 @@ impl StreamAllocator {
 // MSRV with "lint reasons are experimental" -- verified against 1.80.0 rather than
 // assumed.
 #[must_use]
+#[cfg(feature = "libz-compat")]
 #[allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
-pub const fn widen(count: uInt) -> usize {
+pub(crate) const fn widen(count: uInt) -> usize {
     count as usize
+}
+
+// ---------------------------------------------------------------------------
+// Byte-range disjointness -- the precondition every slice pair depends on
+// ---------------------------------------------------------------------------
+
+/// Reports whether the two byte ranges `(a, a_len)` and `(b, b_len)` share no byte.
+///
+/// ★ **This is the test that makes [`input_slice`] and the output helpers
+/// [`output_region`] and [`output_slots_mut`] sound when both are called for the
+/// same stream.** A `&[u8]` and a `&mut [u8]` may not
+/// alias, and it is undefined behaviour for them to do so *even if neither is
+/// dereferenced*. The C API, however, does not forbid a caller from pointing
+/// `next_in` and `next_out` into one buffer: `zlib.h` L138-L139 describes the two
+/// pairs independently and says nothing about them being distinct. So overlap is
+/// an input this library can receive, and it has to be rejected **before** the two
+/// borrows exist rather than tolerated afterwards.
+///
+/// Two ranges are disjoint when one ends at or before the other begins. A zero
+/// length is disjoint from everything, which is the right answer twice over: an
+/// empty slice borrows nothing, and the helpers above return an empty slice
+/// without calling [`core::slice::from_raw_parts`] at all in that case.
+///
+/// The addresses are compared as integers because that is the only way to express
+/// "these two ranges are disjoint". Nothing is dereferenced and no integer is
+/// turned back into a pointer, so no provenance is created or lost, and this
+/// function is safe to call with wild, dangling or null pointers -- which is
+/// exactly why it can run before validation rather than after.
+#[must_use]
+pub(crate) fn ranges_are_disjoint(
+    a: *const Bytef,
+    a_len: usize,
+    b: *const Bytef,
+    b_len: usize,
+) -> bool {
+    if a_len == 0 || b_len == 0 {
+        return true;
+    }
+    let a_start = a as usize;
+    let b_start = b as usize;
+    // `checked_add` rather than `+` or `saturating_add`, and the overflow arm answers
+    // "not disjoint". A caller's length is arbitrary, so a range whose end cannot be
+    // represented is an input this gate can receive -- and it describes no real
+    // allocation, because Rust and C both bound an object at `isize::MAX` bytes. A
+    // saturating end would be *wrong* rather than merely conservative here: the
+    // wrapped range covers low addresses, so the pair can genuinely overlap while the
+    // saturated comparison says otherwise. Refusing is the fail-closed answer.
+    let (Some(a_end), Some(b_end)) = (a_start.checked_add(a_len), b_start.checked_add(b_len))
+    else {
+        return false;
+    };
+    a_end <= b_start || b_end <= a_start
+}
+
+/// Reports whether two `T` pointers address regions that do not overlap at all.
+///
+/// `deflateCopy` and `inflateCopy` copy `sizeof(z_stream)` bytes from one stream to
+/// another (`deflate.c` L1333, `inflate.c` L1352), which is defined only for
+/// non-overlapping regions -- in C as much as in Rust, since `memcpy`'s own contract
+/// requires it. Two correctly aligned pointers can still overlap *partially*, at any
+/// multiple of the alignment below the struct size, so a plain equality test is not
+/// sufficient and the full range has to be compared.
+///
+/// Shares [`ranges_are_disjoint`]'s reasoning about provenance: this is arithmetic on
+/// addresses, not on pointers, and nothing is dereferenced.
+#[must_use]
+pub(crate) fn structs_are_disjoint<T>(first: *const T, second: *const T) -> bool {
+    (first as usize).abs_diff(second as usize) >= size_of::<T>()
+}
+
+/// Reports whether two whole [`z_stream`] structures are disjoint.
+///
+/// The [`structs_are_disjoint`] instantiation `deflateCopy` and `inflateCopy` need,
+/// named so that neither has to spell the type parameter and so that the two cannot
+/// drift apart.
+#[must_use]
+pub(crate) fn streams_are_disjoint(dest: z_streamp, source: z_streamp) -> bool {
+    structs_are_disjoint(dest.cast_const(), source.cast_const())
+}
+
+// ---------------------------------------------------------------------------
+// Alias-tolerant input capture -- unsafe-site category 2
+// ---------------------------------------------------------------------------
+
+/// An owned copy of a caller's input range, used when that range overlaps the
+/// caller's output range.
+///
+/// ★ **Why a copy, rather than a refusal.** [`ranges_are_disjoint`] can *detect* an
+/// overlapping `(next_in, avail_in)` / `(next_out, avail_out)` pair, and for a while the
+/// obvious response was to answer `Z_STREAM_ERROR`. That is wrong, and `test/example.c`
+/// proves it: `test_large_deflate` sets `next_out = compr`, deflates 40 000 bytes into it,
+/// and then at L275-L277 sets `next_in = compr` with `avail_in = uncomprLen/2` while
+/// `next_out` still points a few hundred bytes into that same `compr` — deliberately
+/// feeding already-compressed data back through the compressor. Reference zlib runs it,
+/// and `test_large_inflate` then asserts `total_out == 2*uncomprLen + uncomprLen/2`
+/// (L327), which only holds if all `uncomprLen/2` overlapping bytes were consumed by that
+/// one call. Refusing the pair fails the suite the port is required to pass unmodified,
+/// so shrinking a range, splitting the call, or returning an error are all ruled out: the
+/// call has to consume the whole input in one pass.
+///
+/// Copying the input is what makes that possible without aliasing. The snapshot is taken
+/// while no mutable borrow of the output exists, so the shared read is sound; afterwards
+/// the core is handed the snapshot plus a `&mut [u8]` over the caller's output, and those
+/// two never overlap. Consumption accounting is unaffected, because the snapshot is
+/// exactly `avail_in` bytes long and the caller's `next_in` is advanced by the count the
+/// core reports, not by anything derived from the snapshot's address.
+///
+/// The one observable difference from C is *which* bytes get compressed when the output
+/// actually catches up with the unread input: C reads whatever it has just written over,
+/// whereas this reads the values the buffer held when the call began. C's own answer there
+/// is unspecified — it depends on the interleaving of `read_buf` and `flush_pending` — so
+/// this is a divergence within the space C leaves undefined, and it is the more defined of
+/// the two. Every disjoint call, which is every call the differential corpus makes, is
+/// completely untouched by this path.
+///
+/// Allocation goes through Rust's allocator rather than the caller's `zalloc`, and
+/// deliberately: the buffer is internal, never observed by the caller, and never outlives
+/// the call, whereas routing it through `zalloc` would add an allocation that
+/// `test/infcover.c`'s tracking allocator would count and that its `mem_limit()` could
+/// fail. The reservation is fallible for the same reason a system library should not abort
+/// on a large `avail_in`: [`AliasScratch::capture`] reports `None` and the caller falls
+/// back to refusing the pair.
+///
+/// Gated on `libz-compat`, which is what turns on the two modules that use it. Every other
+/// helper in this module is `pub` and therefore exempt from `dead_code` by construction; this
+/// one is deliberately crate-private -- an internal scratch buffer has no business in the
+/// crate's Rust surface -- so the gate is what keeps a `--no-default-features` build free of
+/// `dead_code`, rather than an `allow` that would also hide a genuine future disuse.
+#[cfg(feature = "libz-compat")]
+pub(crate) struct AliasScratch {
+    /// The captured bytes. Exactly `avail_in` long once [`AliasScratch::capture`] returns.
+    bytes: Vec<u8>,
+}
+
+#[cfg(feature = "libz-compat")]
+impl AliasScratch {
+    /// Copies `len` bytes from `src`, or reports that the allocation failed.
+    ///
+    /// # Safety
+    ///
+    /// `src` and `len` must satisfy [`input_slice`]'s contract: either `len` is zero, or
+    /// `len` bytes are readable at `src` and nothing mutates them for the duration of this
+    /// call. No mutable borrow of any part of that region may exist, which is what makes
+    /// the shared read sound even when the region overlaps the caller's output.
+    pub(crate) unsafe fn capture(src: *const Bytef, len: uInt) -> Option<Self> {
+        let mut bytes = Vec::new();
+        // Fallible, so a caller's absurd `avail_in` produces a documented refusal rather
+        // than the process abort an infallible `to_vec` would give. Reserving exactly
+        // `len` also means the `extend_from_slice` below cannot reallocate.
+        bytes.try_reserve_exact(widen(len)).ok()?;
+        // SAFETY: unsafe-site category 2 -- one shared slice over the caller's input,
+        // formed under this function's contract, which is `input_slice`'s. It is the only
+        // borrow of that region in existence at this point: the mutable borrow of the
+        // output is created by the caller *after* this returns, precisely so that the two
+        // never coexist. The slice dies at the end of this statement.
+        let source = unsafe { input_slice(src, len) };
+        bytes.extend_from_slice(source);
+        Some(Self { bytes })
+    }
+
+    /// The captured bytes, with the `'static` lifetime the core's stream views require.
+    ///
+    /// # Safety
+    ///
+    /// The returned slice must not be used after `self` is dropped. Callers satisfy this
+    /// by keeping the [`AliasScratch`] alive in a binding that outlives the stream view
+    /// built from it -- the same discipline [`input_slice`] already relies on, and the
+    /// reason this returns `'static` at all: the core's stream types take owned lifetimes
+    /// that the raw C boundary cannot otherwise supply.
+    #[must_use]
+    pub(crate) unsafe fn view(&self) -> &'static [u8] {
+        // SAFETY: unsafe-site category 2 -- one shared slice over memory this value owns.
+        // `Vec::as_ptr` is non-null, aligned for `u8` and valid for `len` initialised
+        // bytes, so the slice is well formed; the `'static` lifetime is fabricated and is
+        // exactly what this function's contract makes the caller responsible for.
+        unsafe { core::slice::from_raw_parts(self.bytes.as_ptr(), self.bytes.len()) }
+    }
+}
+
+/// [`AliasScratch::view`] lifted over [`Option`], which is the shape every caller wants.
+///
+/// The overlap check yields an `Option<AliasScratch>` -- [`None`] on the ordinary disjoint
+/// path -- and the stream builders take an `Option<&'static [u8]>`, so every call site would
+/// otherwise spell the same three-line `map` with the same safety comment. Naming it once
+/// keeps the invariant in one place.
+///
+/// # Safety
+///
+/// The returned slice must not be used after `scratch` is dropped, exactly as
+/// [`AliasScratch::view`] requires. Callers satisfy this by passing a borrow of a binding
+/// that outlives the stream view built from the result.
+///
+/// Gated on `libz-compat` for the reason [`AliasScratch`] is.
+#[cfg(feature = "libz-compat")]
+#[must_use]
+pub(crate) unsafe fn scratch_view(scratch: Option<&AliasScratch>) -> Option<&'static [u8]> {
+    scratch.map(|scratch| {
+        // SAFETY: unsafe-site category 2 -- `AliasScratch::view`'s contract is this
+        // function's, and this only forwards it: the caller owns the requirement that the
+        // slice not outlive the scratch it borrows.
+        unsafe { scratch.view() }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1651,21 +2398,40 @@ pub const fn widen(count: uInt) -> usize {
 /// # What is and is not checked
 ///
 /// Checked: non-null, and aligned for [`z_stream`]. Not checkable from here:
-/// whether the caller really allocated 112 bytes of live `z_stream` at that
-/// address. No language construct can verify that, which is why it appears as a
-/// safety obligation below rather than as a runtime test -- and why the *state*
-/// carries a tag that [`checked_state`] validates, giving a second, independent
-/// chance to reject a stream that was never initialised.
+/// whether the caller really allocated a live `z_stream` at that address. No
+/// language construct can verify that, which is why it appears as a safety
+/// obligation below rather than as a runtime test -- and why the *state* carries a
+/// tag that [`checked_state`] validates, giving a second, independent chance to
+/// reject a stream that was never initialised.
 ///
 /// # Safety
 ///
-/// If `strm` is non-null it must address a caller-allocated [`z_stream`] --
-/// at least 112 bytes, aligned to 8 -- that stays live and unaliased for `'a`.
+/// If `strm` is non-null, all of the following must hold:
+///
+/// * it points at `size_of::<z_stream>()` bytes of caller-allocated storage,
+///   aligned to at least `align_of::<z_stream>()`, holding an initialised
+///   [`z_stream`]. Both quantities are the target's, not this machine's: they are
+///   112 and 8 on LP64, and smaller wherever `uLong` or a pointer is narrower;
+/// * that storage stays live for the whole of `'a`; and
+/// * no other reference to it, shared or mutable, is created for `'a` -- a shared
+///   borrow rules out concurrent mutation as well as a second `&mut`.
+///
 /// The returned borrow's lifetime is unconstrained by the argument, which is
 /// inherent to an FFI boundary: the caller of this function is responsible for
 /// not outliving the stream.
 #[must_use]
-pub unsafe fn stream_ref<'a>(strm: z_streamp) -> Option<&'a z_stream> {
+// Crate-private, and not currently called: no exported entry point needs a *shared*
+// borrow of the stream. Every one of them either updates it -- `next_in`,
+// `avail_in`, `total_in`, `msg` and `adler` are all library-written -- or reaches
+// its state through `checked_state`/`checked_state_mut`, which validate the owner
+// and the tag as well as the pointer and so subsume this check. It is kept because
+// it is the named discharge of unsafe-site category 1 that the export modules'
+// documentation refers to (`src/deflate.rs`, the four-category table), it is
+// ASan- and Miri-clean, and an entry point that only reads the stream would
+// otherwise hand-roll it. The attribute is scoped to this one item, in the same
+// narrow form `IS_LP64` uses in `src/layout_assertions.rs`.
+#[allow(dead_code)]
+pub(crate) unsafe fn stream_ref<'a>(strm: z_streamp) -> Option<&'a z_stream> {
     if strm.is_null() || !strm.is_aligned() {
         return None;
     }
@@ -1691,7 +2457,13 @@ pub unsafe fn stream_ref<'a>(strm: z_streamp) -> Option<&'a z_stream> {
 /// points (`deflateCopy`, `inflateCopy`) must additionally establish that their
 /// source and destination are distinct.
 #[must_use]
-pub unsafe fn stream_mut<'a>(strm: z_streamp) -> Option<&'a mut z_stream> {
+// Crate-private and not currently called, for the reason given above `stream_ref`:
+// an entry point that is going on to touch `z_stream::state` must not hold a
+// reference to the stream while it does, so the exports read the fields they need
+// through the caller's raw pointer -- `StreamAllocator::from_stream_ptr` -- and
+// take the state through `checked_state_mut`. Kept for the same reasons.
+#[allow(dead_code)]
+pub(crate) unsafe fn stream_mut<'a>(strm: z_streamp) -> Option<&'a mut z_stream> {
     if strm.is_null() || !strm.is_aligned() {
         return None;
     }
@@ -1728,8 +2500,9 @@ pub unsafe fn stream_mut<'a>(strm: z_streamp) -> Option<&'a mut z_stream> {
 /// If `avail_in` is non-zero, `next_in` must be non-null, aligned (trivially, for
 /// bytes) and readable for `avail_in` bytes, and that region must stay valid and
 /// unwritten by anything else for `'a`.
+#[cfg(feature = "libz-compat")]
 #[must_use]
-pub unsafe fn input_slice<'a>(next_in: *const Bytef, avail_in: uInt) -> &'a [u8] {
+pub(crate) unsafe fn input_slice<'a>(next_in: *const Bytef, avail_in: uInt) -> &'a [u8] {
     let len = widen(avail_in);
     if len == 0 || next_in.is_null() {
         // Either there is nothing to read, or there is nowhere to read it from --
@@ -1745,13 +2518,34 @@ pub unsafe fn input_slice<'a>(next_in: *const Bytef, avail_in: uInt) -> &'a [u8]
     unsafe { core::slice::from_raw_parts(next_in, len) }
 }
 
-/// Rebuilds the caller's output as a mutable slice from `(next_out, avail_out)`.
+/// Rebuilds the caller's output as **write-only** storage from `(next_out, avail_out)`.
 ///
 /// The [`input_slice`] counterpart, and the only place
 /// [`core::slice::from_raw_parts_mut`] is called for a caller's output buffer.
 /// The same zero-length rule applies and for the same reason: a stream with
 /// `avail_out == 0` and a null `next_out` must yield an empty slice, not
 /// undefined behaviour.
+///
+/// # ★ `MaybeUninit<u8>`, not `u8`, and this is not a formality
+///
+/// `zlib.h` L94-L95 promises `avail_out` bytes of *room* at `next_out` and says nothing
+/// whatever about their contents: `test/example.c` L86 passes a buffer straight from
+/// `malloc`, and every application that reuses a buffer passes one whose tail holds
+/// whatever the previous call left. Rust does not allow a `&mut [u8]` to address a byte
+/// that holds no value -- uninitialised memory is not a valid `u8` -- so presenting a
+/// caller's output buffer as a byte slice would be undefined behaviour on entirely
+/// ordinary, documented usage, however carefully the library then wrote to it.
+///
+/// The other route, initialising the buffer here so that the byte slice becomes legal,
+/// would add an `avail_out`-sized write to **every** call. On the decompression side that
+/// is a second pass over the whole output and is exactly the cost the AAP's ≤10%
+/// throughput budget (§0.8.4) has no room for.
+///
+/// So the buffer keeps the shape it actually has. `zlib_rs`'s [`OutputRegion`] writes
+/// through it without ever forming a byte reference to an unwritten slot, tracks how far
+/// it has written, and reinterprets only that prefix -- through [`init_view`] -- when the
+/// decoder needs to read its own output back. Nothing is initialised that the library was
+/// not going to write anyway.
 ///
 /// # Safety
 ///
@@ -1760,17 +2554,217 @@ pub unsafe fn input_slice<'a>(next_in: *const Bytef, avail_in: uInt) -> &'a [u8]
 /// including by the input slice -- for `'a`. Call this once on entry; two live
 /// mutable slices over the same output buffer would be undefined behaviour even
 /// if neither were written.
+#[cfg(feature = "libz-compat")]
 #[must_use]
-pub unsafe fn output_slice_mut<'a>(next_out: *mut Bytef, avail_out: uInt) -> &'a mut [u8] {
+pub(crate) unsafe fn output_slots_mut<'a>(
+    next_out: *mut Bytef,
+    avail_out: uInt,
+) -> &'a mut [MaybeUninit<u8>] {
     let len = widen(avail_out);
     if len == 0 || next_out.is_null() {
         return &mut [];
     }
     // SAFETY: unsafe-site category 2 -- slice reconstruction. `next_out` is
-    // non-null by the test above and trivially aligned for `u8`. `len` is
+    // non-null by the test above and trivially aligned for `u8`, which
+    // `MaybeUninit<u8>` shares because it is `repr(transparent)` over it. `len` is
     // `avail_out` widened without loss, and this function's contract makes those
-    // bytes writable, unaliased and stable for `'a`.
-    unsafe { core::slice::from_raw_parts_mut(next_out, len) }
+    // bytes writable, unaliased and stable for `'a`. No initialisation is required for
+    // this element type, which is the whole point of it.
+    unsafe { core::slice::from_raw_parts_mut(next_out.cast::<MaybeUninit<u8>>(), len) }
+}
+
+#[cfg(feature = "libz-compat")]
+/// Rebuilds the caller's output as the region the core writes through.
+///
+/// [`output_slots_mut`] plus the [`init_view`] the region needs, in the one shape every
+/// stream entry point wants. Kept as a separate function so that the pairing of a
+/// caller's buffer with *this crate's* view happens in exactly one place.
+///
+/// # Safety
+///
+/// [`output_slots_mut`]'s, unchanged.
+#[must_use]
+pub(crate) unsafe fn output_region<'a>(next_out: *mut Bytef, avail_out: uInt) -> OutputRegion<'a> {
+    // SAFETY: this function's contract is `output_slots_mut`'s contract.
+    let slots = unsafe { output_slots_mut(next_out, avail_out) };
+    OutputRegion::write_only(slots, init_view())
+}
+
+#[cfg(feature = "libz-compat")]
+/// Rebuilds `inflateBack`'s caller-supplied window as a mutable slice **without**
+/// initialising it.
+///
+/// The per-call counterpart of [`window_slice_mut`]. `inflateBackInit_` fills the window
+/// once, before any reference to it exists, and the state then keeps only the pointer and
+/// the extent; each `inflateBack` call rebuilds the slice for the duration of that one
+/// call. Filling again here would be worse than wasteful -- it would erase the decoded
+/// output the caller is invited to read between calls (`zlib.h` L1142-L1178) and the
+/// window history the next call decodes against.
+///
+/// # Safety
+///
+/// [`window_slice_mut`]'s contract, plus: every byte of the region must already hold a
+/// value, which for this library means that [`window_slice_mut`] has been called on it
+/// once, at `inflateBackInit_`. Only one slice may be live at a time; the previous call's
+/// was dropped before it returned.
+#[must_use]
+pub(crate) unsafe fn window_bytes_mut<'a>(window: *mut Bytef, extent: uInt) -> &'a mut [u8] {
+    let len = widen(extent);
+    if len == 0 || window.is_null() {
+        // `from_raw_parts_mut` may not be called with a null pointer even for a zero
+        // length; `inflateBackInit_` rejects both cases anyway.
+        return &mut [];
+    }
+    // SAFETY: unsafe-site category 2 -- slice reconstruction. `window` is non-null by the
+    // test above and trivially aligned for `u8`; `len` is the extent this stream was
+    // initialised with, which this function's contract makes writable, unaliased and
+    // already initialised for `'a`.
+    unsafe { core::slice::from_raw_parts_mut(window, len) }
+}
+
+/// Reinterprets written slots as the bytes they hold.
+///
+/// # ★ The one place `MaybeUninit<u8>` becomes `u8` in this crate
+///
+/// `zlib_rs` cannot perform this step: its crate root asserts
+/// `#![forbid(unsafe_code)]`, and no *safe* stable API turns `[MaybeUninit<u8>]` into
+/// `[u8]`. It also genuinely needs the step -- `inflate.c` L1080 folds the bytes just
+/// written into the check value, L1136 copies them into the sliding window -- so the
+/// operation is supplied from here, as a function pointer, and the unsafe reinterpretation
+/// stays inside the one crate the AAP permits it in.
+///
+/// The obligation this discharges is that every slot passed in has been written.
+/// [`OutputRegion`] discharges it structurally: it raises its own high-water mark in its
+/// write methods and nowhere else, and clamps every read to it, so this function is never
+/// reached with a slot the library has not stored a byte into. Its documentation carries
+/// the argument in full.
+#[must_use]
+#[cfg(feature = "libz-compat")]
+pub(crate) fn init_view() -> InitView {
+    InitView::new(view_written_slots, view_written_slots_mut)
+}
+
+/// The shared half of [`init_view`]. Separate so that the pointer taken is a plain `fn`
+/// item rather than a closure, which is what [`InitView`] holds.
+#[cfg(feature = "libz-compat")]
+fn view_written_slots(slots: &[MaybeUninit<u8>]) -> &[u8] {
+    // SAFETY: unsafe-site category 2 -- reinterpreting written output slots as the bytes
+    // they hold. `MaybeUninit<u8>` is `repr(transparent)` over `u8`, so the pointer cast
+    // changes neither the address, the length nor the alignment requirement, and the
+    // lifetime of the result is tied to the borrow it came from. The elements are
+    // initialised because `OutputRegion` calls this only on the prefix it has itself
+    // written -- the clamp against its high-water mark is what establishes that, and it is
+    // the reason this function is sound rather than merely conventional.
+    unsafe { core::slice::from_raw_parts(slots.as_ptr().cast::<u8>(), slots.len()) }
+}
+
+/// The exclusive half of [`init_view`], used only by `OutputRegion::writable_bytes` -- the
+/// gzip transparent read path, which needs somewhere the operating system may write.
+#[cfg(feature = "libz-compat")]
+fn view_written_slots_mut(slots: &mut [MaybeUninit<u8>]) -> &mut [u8] {
+    let len = slots.len();
+    // SAFETY: unsafe-site category 2 -- as `view_written_slots`, for an exclusive borrow.
+    // The cast is between `repr(transparent)` relatives, so address, length and alignment
+    // are unchanged, and the exclusive borrow it consumes guarantees no other view of the
+    // region exists. Every element is initialised: `OutputRegion::writable_bytes` writes
+    // the whole range before calling this and raises its high-water mark over it, which is
+    // what makes producing a `&mut [u8]` legal here.
+    unsafe { core::slice::from_raw_parts_mut(slots.as_mut_ptr().cast::<u8>(), len) }
+}
+
+#[cfg(feature = "libz-compat")]
+/// Rebuilds `inflateBack`'s caller-supplied window as a mutable slice, initialising
+/// it first.
+///
+/// # ★ Why this one is filled and the per-call output buffer is not
+///
+/// Both regions arrive as "writable", not as "initialised", and neither may be
+/// addressed by a `&mut [u8]` until every byte in it holds a value. The two answer
+/// that differently because they cost differently:
+///
+/// * The **output buffer** of `deflate`/`inflate` arrives afresh on *every* call, so
+///   filling it would add an `avail_out`-sized write to each one. It is therefore
+///   handed to the core as write-only storage instead.
+/// * The **`inflateBack` window** is installed exactly *once*, by `inflateBackInit_`,
+///   and is then borrowed for the whole life of the stream (`infback.c` L59). One
+///   pass over at most 32 KiB, once per stream, is the same cost the internally
+///   allocated `inflate` window already pays in
+///   [`StreamAllocator::allocate_bytes`], and paying it buys an ordinary initialised
+///   slice for a buffer that `inflateBack` uses as window *and* output at the same
+///   time (`infback.c` L143-L152).
+///
+/// The byte is `FILL_BYTE`, the same value a hook-allocated block receives, so the
+/// caller-supplied window and a library-allocated one are indistinguishable to the
+/// decoder -- including under `test/infcover.c`'s allocator, which fills with the
+/// identical `0xa5` (its L87).
+///
+/// # Safety
+///
+/// If `extent` is non-zero, `window` must be non-null and writable for `extent`
+/// bytes, and that region must stay valid and unaliased by anything else for `'a` --
+/// which for `inflateBack` means until `inflateBackEnd`. Call this **once** per
+/// window.
+#[must_use]
+pub(crate) unsafe fn window_slice_mut<'a>(window: *mut Bytef, extent: uInt) -> &'a mut [u8] {
+    let len = widen(extent);
+    if len == 0 || window.is_null() {
+        // Neither an error nor reachable from `inflateBackInit_`, which rejects a null
+        // window and a `windowBits` outside `8..=15`. Handled for the same reason
+        // every other reconstruction in this module handles it: `from_raw_parts_mut`
+        // may not be called with a null pointer even for a zero length.
+        return &mut [];
+    }
+    // SAFETY: unsafe-site category 4 -- writing the caller's window before any
+    // reference to it exists. `window` is non-null by the test above and writable for
+    // `len` bytes by this function's contract; `u8` needs no alignment beyond one.
+    // Called once, so nothing else holds a borrow that this write could disturb.
+    unsafe {
+        core::ptr::write_bytes(window, FILL_BYTE, len);
+    }
+    // SAFETY: unsafe-site category 2 -- slice reconstruction. Non-null, aligned,
+    // writable for `len` bytes and unaliased for `'a` by this function's contract,
+    // and every byte is initialised by the `write_bytes` above, which is what makes
+    // `u8` a legal element type for the borrow.
+    unsafe { core::slice::from_raw_parts_mut(window, len) }
+}
+
+/// Copies all `sizeof(z_stream)` bytes of one stream over another.
+///
+/// `zmemcpy(dest, source, sizeof(z_stream))` (`deflate.c` L1333, `inflate.c` L1352)
+/// exactly: a **byte** copy, not a typed one. The distinction matters and is not
+/// stylistic. [`z_stream::reserved`] (`zlib.h` L109) is a member the library never
+/// writes and a caller need never initialise, and `msg` may hold indeterminate bytes
+/// on a stream that has never reported an error, so reading the struct as a *value* --
+/// `let snapshot: z_stream = source.read()` -- would be reading uninitialised memory
+/// and interpreting it as a `c_ulong` and a pointer. That is undefined behaviour on a
+/// perfectly ordinary C caller. A byte copy carries whatever is there without
+/// interpreting any of it, which is what C does and what makes `dest` a complete copy
+/// including any `reserved` the caller had set.
+///
+/// Provided once here rather than in each of the two entry points, so that the one
+/// place the whole structure is duplicated can be audited in one place.
+///
+/// # Safety
+///
+/// Both pointers must be non-null, aligned, and address `size_of::<z_stream>()` bytes
+/// -- `source` readable, `dest` writable -- and the two regions must not overlap, which
+/// [`streams_are_disjoint`] establishes. Neither struct need be fully initialised.
+pub(crate) unsafe fn copy_stream(dest: z_streamp, source: z_streamp) {
+    // SAFETY: unsafe-site category 1 -- copying the caller's stream structure byte for
+    // byte. Both pointers are non-null, aligned and cover `size_of::<z_stream>()`
+    // readable or writable bytes by this function's contract, and the regions are
+    // disjoint, which is `copy_nonoverlapping`'s remaining requirement. The element
+    // type is `u8`, so the copy reinterprets nothing and requires no member to be
+    // initialised; and it is a raw-pointer copy, so no reference to either stream is
+    // formed and the caller's own pointers keep their provenance for the state install
+    // that follows.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            source.cast::<u8>(),
+            dest.cast::<u8>(),
+            size_of::<z_stream>(),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1782,18 +2776,34 @@ pub unsafe fn output_slice_mut<'a>(next_out: *mut Bytef, avail_out: uInt) -> &'a
 /// An enum rather than a function argument so that an entry point cannot pass the
 /// wrong predicate: there are exactly two, and the mapping to the core's
 /// [`deflate_state_check`] and [`inflate_state_check`] is fixed here.
+#[cfg(feature = "libz-compat")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum StateKind {
+pub(crate) enum StateKind {
     /// A compression state. Its tag is the `status` member of `deflate_state`,
     /// one of the eight values `deflateStateCheck` accepts (`deflate.c`
     /// L546-L555).
     Deflate,
-    /// A decompression state. Its tag is the `mode` member of `inflate_state`,
-    /// which must lie in `HEAD..=SYNC`, i.e. `16180..=16211`
+    /// A decompression state driven by `inflate()`. Its tag is the `mode` member
+    /// of `inflate_state`, which must lie in `HEAD..=SYNC`, i.e. `16180..=16211`
     /// (`inflate.c` L95).
     Inflate,
+    /// A decompression state driven by `inflateBack()`.
+    ///
+    /// ★ **A distinct kind even though it shares `inflate`'s tag range, and that
+    /// distinction is a soundness requirement rather than tidiness.** `inflateBack`
+    /// installs its own payload behind `z_stream::state` -- a window borrowed from
+    /// the caller rather than one the state owns -- so the block has a *different
+    /// Rust type* from an `inflate()` block while carrying an indistinguishable
+    /// `{strm, mode}` prefix. Without a separate kind, `inflate(strm, ...)` on an
+    /// `inflateBack` stream (or `inflateBackEnd` on an ordinary one) would pass
+    /// every one of C's checks, reinterpret the block at the wrong type and then
+    /// read fields -- or free storage -- at the wrong layout. C has the same hole
+    /// and gets away with it because both of its payloads really are
+    /// `struct inflate_state`; here they are not, so the hole has to be closed.
+    InflateBack,
 }
 
+#[cfg(feature = "libz-compat")]
 impl StateKind {
     /// Reports whether `tag` must be **rejected**.
     ///
@@ -1802,11 +2812,36 @@ impl StateKind {
     /// and C forms read the same way side by side. Routed through the core's own
     /// validators rather than reimplemented, which is what keeps the accepted set
     /// in one place.
+    ///
+    /// [`Self::InflateBack`] shares [`Self::Inflate`]'s predicate because it shares
+    /// the same `inflate_mode` tag space; the two are told apart by
+    /// `StateKind::cookie` (private), not by the tag.
     #[must_use]
-    pub const fn rejects(self, tag: c_int) -> bool {
+    pub(crate) const fn rejects(self, tag: c_int) -> bool {
         match self {
             Self::Deflate => deflate_state_check(tag),
-            Self::Inflate => inflate_state_check(tag),
+            Self::Inflate | Self::InflateBack => inflate_state_check(tag),
+        }
+    }
+
+    /// The exact payload discriminator stored in [`StatePrefix::flavor`].
+    ///
+    /// Three distinct, deliberately unlikely 32-bit values rather than `0`, `1`, `2`:
+    /// the field also has to reject *uninitialised* and *recycled* memory, and a small
+    /// integer is a value stale storage plausibly already holds. The high byte spells
+    /// `Z` and the low byte numbers the kind, so a hex dump of a live prefix is
+    /// readable while a random word almost never matches.
+    ///
+    /// The value is private to this crate in the sense that matters: nothing exports
+    /// it, no C header mentions it, and it occupies four bytes that lie **inside the
+    /// padding of `deflate_state`** and at `inflate_state`'s `int last` -- neither of
+    /// which `test/infcover.c` reads. See [`StatePrefix::flavor`].
+    #[must_use]
+    const fn cookie(self) -> u32 {
+        match self {
+            Self::Deflate => 0x5A_72_44_01,
+            Self::Inflate => 0x5A_72_49_02,
+            Self::InflateBack => 0x5A_72_42_03,
         }
     }
 }
@@ -1815,6 +2850,7 @@ impl StateKind {
 // both `std` and a C ABI, so the calls above need no conversion; the assertion
 // turns a hypothetical target where that fails into a build error rather than a
 // silent narrowing.
+/// cbindgen:ignore
 const _: () = assert!(size_of::<c_int>() == size_of::<i32>());
 
 /// The C-visible head of every block [`z_stream::state`] points at.
@@ -1858,23 +2894,101 @@ const _: () = assert!(size_of::<c_int>() == size_of::<i32>());
 /// unlikely to hold a number in the accepted range, so the test rejects the
 /// second and third. It is a heuristic and C says as much by pairing it with the
 /// owner-identity check, which [`checked_state`] also performs.
+#[cfg(feature = "libz-compat")]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct StatePrefix {
+pub(crate) struct StatePrefix {
     /// Offset 0. The stream that owns this state.
     ///
     /// `deflate.h` L105 and `inflate.h` L83, both `z_streamp strm`. C compares it
     /// against the incoming stream -- `state->strm != strm` at `inflate.c` L94 --
     /// to reject a state that belongs to a different stream, and
     /// [`checked_state`] performs the same comparison.
-    pub strm: z_streamp,
+    pub(crate) strm: z_streamp,
     /// Offset 8. The state's validity tag: `status` for deflate, `mode` for
     /// inflate.
     ///
     /// Four bytes wide, matching the C `int` and the C enum. See
     /// [`StateKind::rejects`] for the accepted ranges.
-    pub tag: c_int,
+    pub(crate) tag: c_int,
+    /// Offset 12. Which *Rust* payload follows the prefix: [`StateKind::cookie`].
+    ///
+    /// ★ **This field costs nothing and closes a type-confusion hole the tag cannot.**
+    /// [`StatePrefix::tag`] is four bytes at offset 8 inside a structure whose
+    /// alignment is 8, so offsets 12 to 15 were already *padding* -- adding this field
+    /// leaves `size_of::<StatePrefix>()` at 16, which `layout_assertions` asserts.
+    ///
+    /// Nothing in C looks here. `deflate_state` has `Bytef *pending_buf` next, which
+    /// the ABI places at offset 16, leaving 12 to 15 as padding; `inflate_state` has
+    /// `int last` at offset 12, and `test/infcover.c` -- the only consumer that
+    /// reaches through the opaque pointer at all -- touches nothing but `->mode`
+    /// (its L330 and L459). Both slots are therefore this port's to use.
+    ///
+    /// What it buys: [`StateKind::Inflate`] and [`StateKind::InflateBack`] put
+    /// *different Rust types* behind `z_stream::state` while presenting the same
+    /// prefix and the same tag range, so the four checks C performs cannot tell them
+    /// apart. Requiring an exact cookie match before the block is reinterpreted turns
+    /// "call `inflate()` on an `inflateBack` stream" from a wrong-layout read and a
+    /// wrong-layout `zfree` into a plain `Z_STREAM_ERROR`.
+    flavor: u32,
 }
+
+#[cfg(feature = "libz-compat")]
+// ★ The prefix must stay exactly `{ pointer, int, int }` with no member beyond the ABI's
+// own padding. That is what keeps `strm` at offset 0 and `tag` immediately after it --
+// the two positions `test/infcover.c` reaches through when it assigns `->mode` (its L330
+// and L459) -- and it is what bounds the flavor's cost.
+//
+// The cost is target-dependent and is stated rather than assumed. Where a pointer is
+// eight bytes, `{ pointer, int }` already carried four bytes of tail padding, so the
+// flavor is free and the prefix stays 16 bytes: the Rust payload does not move at all.
+// On a 32-bit target `{ pointer, int }` has no tail padding, so the prefix grows from 8
+// to 12 and the payload moves by four bytes -- invisible to C, which reads only offset 0
+// and offset `sizeof(z_streamp)`, and comfortably inside the window
+// `test/infcover.c` L428 leaves when it caps its zone at
+// `(sizeof(struct inflate_state) << 1) + 256` and requires `inflateCopy` to fail.
+//
+// Written relationally so the assertions hold on every target rather than only on the
+// verified one; the measured LP64 numbers are then pinned separately below. A future
+// edit that reorders the members, widens `tag` or inserts a field is a build failure.
+/// cbindgen:ignore
+const _: () = assert!(core::mem::offset_of!(StatePrefix, strm) == 0);
+#[cfg(feature = "libz-compat")]
+/// cbindgen:ignore
+const _: () = assert!(core::mem::offset_of!(StatePrefix, tag) == size_of::<z_streamp>());
+#[cfg(feature = "libz-compat")]
+/// cbindgen:ignore
+const _: () = assert!(
+    core::mem::offset_of!(StatePrefix, flavor) == size_of::<z_streamp>() + size_of::<c_int>()
+);
+#[cfg(feature = "libz-compat")]
+/// cbindgen:ignore
+const _: () = assert!(size_of::<StatePrefix>() == size_of::<z_streamp>() + 2 * size_of::<c_int>());
+#[cfg(feature = "libz-compat")]
+// The measured layout on the verified `x86_64-unknown-linux-gnu` target, and on LLP64
+// Windows, where the pointer is also eight bytes: `strm` 0, `tag` 8, `flavor` 12, size 16.
+#[cfg(target_pointer_width = "64")]
+/// cbindgen:ignore
+const _: () = assert!(size_of::<StatePrefix>() == 16);
+#[cfg(feature = "libz-compat")]
+#[cfg(target_pointer_width = "64")]
+/// cbindgen:ignore
+const _: () = assert!(core::mem::offset_of!(StatePrefix, tag) == 8);
+#[cfg(feature = "libz-compat")]
+#[cfg(target_pointer_width = "64")]
+/// cbindgen:ignore
+const _: () = assert!(core::mem::offset_of!(StatePrefix, flavor) == 12);
+#[cfg(feature = "libz-compat")]
+// The three cookies must stay pairwise distinct, or the check that tells an `inflate`
+// block from an `inflateBack` block would accept both.
+/// cbindgen:ignore
+const _: () = assert!(StateKind::Deflate.cookie() != StateKind::Inflate.cookie());
+#[cfg(feature = "libz-compat")]
+/// cbindgen:ignore
+const _: () = assert!(StateKind::Deflate.cookie() != StateKind::InflateBack.cookie());
+#[cfg(feature = "libz-compat")]
+/// cbindgen:ignore
+const _: () = assert!(StateKind::Inflate.cookie() != StateKind::InflateBack.cookie());
 
 /// A state object with the C-visible [`StatePrefix`] at offset 0.
 ///
@@ -1891,12 +3005,13 @@ pub struct StatePrefix {
 /// **C** header -- and then requires `inflateCopy` to fail. As
 /// [`zlib_rs::inflate::state`] works out, that puts a *floor* under the state
 /// size as well as a ceiling: below 7033 bytes both allocations succeed and the
-/// assertion fails. The core measures `InflateState` at 7296 bytes with a
-/// reference allocator, so the block lands at 7312 -- comfortably inside the
+/// assertion fails. The core measures `InflateState` at 7312 bytes with a
+/// reference allocator, so the block lands at 7328 -- comfortably inside the
 /// `7033..=8234` window the core documents, the upper bound coming from the 15%
 /// per-stream memory bar.
+#[cfg(feature = "libz-compat")]
 #[repr(C)]
-pub struct StateBlock<S> {
+pub(crate) struct StateBlock<S> {
     /// The C-visible prefix. Private so that only the accessors below can touch
     /// it, which keeps the tag's two roles from being confused with ordinary data.
     prefix: StatePrefix,
@@ -1904,6 +3019,7 @@ pub struct StateBlock<S> {
     state: S,
 }
 
+#[cfg(feature = "libz-compat")]
 impl<S> StateBlock<S> {
     /// Wraps a state with the prefix a given stream expects.
     ///
@@ -1912,17 +3028,33 @@ impl<S> StateBlock<S> {
     /// initial validity tag -- `INIT_STATE` for deflate, `HEAD` (16180) for
     /// inflate, mirroring `inflate.c` L205, which pre-seeds the mode precisely so
     /// that a freshly allocated state passes the tag check.
+    ///
+    /// `kind` records which Rust payload `S` is, as `StatePrefix`'s private `flavor`
+    /// member. It must
+    /// name the same kind every later [`checked_state`], [`checked_state_mut`] and
+    /// [`take_state`] call passes for this block, because that is the comparison that
+    /// keeps an `inflate` block and an `inflateBack` block from being mistaken for
+    /// each other.
     #[must_use]
-    pub const fn new(strm: z_streamp, tag: c_int, state: S) -> Self {
+    pub(crate) const fn new(strm: z_streamp, kind: StateKind, tag: c_int, state: S) -> Self {
         Self {
-            prefix: StatePrefix { strm, tag },
+            prefix: StatePrefix {
+                strm,
+                tag,
+                flavor: kind.cookie(),
+            },
             state,
         }
     }
 
     /// Returns the stream recorded in the prefix.
     #[must_use]
-    pub const fn owner(&self) -> z_streamp {
+    // Not currently called: `checked_state`/`checked_state_mut` compare the prefix
+    // against the incoming stream themselves, reading `prefix.strm` directly, so no
+    // export has to ask for it. Kept as the read counterpart of `set_owner` and the
+    // only way to observe the back-pointer without touching the private prefix.
+    #[allow(dead_code)]
+    pub(crate) const fn owner(&self) -> z_streamp {
         self.prefix.strm
     }
 
@@ -1932,7 +3064,13 @@ impl<S> StateBlock<S> {
     /// second stream and must then make the copy's back-pointer refer to *that*
     /// stream: `copy->strm = dest` at `inflate.c` L1349. Without this the copy
     /// would fail its own owner-identity check on the next call.
-    pub fn set_owner(&mut self, strm: z_streamp) {
+    // Not currently called: `deflateCopy` and `inflateCopy` build the duplicate
+    // with `StateBlock::new(dest, tag, state)`, which sets the back-pointer at
+    // construction, so there is no second stream to re-point afterwards. Kept for a
+    // future path that copies a block rather than rebuilding one -- `copy->strm =
+    // dest` at `inflate.c` L1349 is the operation it names.
+    #[allow(dead_code)]
+    pub(crate) fn set_owner(&mut self, strm: z_streamp) {
         self.prefix.strm = strm;
     }
 
@@ -1943,7 +3081,7 @@ impl<S> StateBlock<S> {
     /// caller code -- `test/infcover.c` L330 and L458 -- is honoured rather than
     /// silently discarded.
     #[must_use]
-    pub const fn tag(&self) -> c_int {
+    pub(crate) const fn tag(&self) -> c_int {
         self.prefix.tag
     }
 
@@ -1953,29 +3091,24 @@ impl<S> StateBlock<S> {
     /// [`zlib_rs::inflate::InflateState::mode_tag`], so that the C-visible slot
     /// always reflects the Rust state. The two are separate storage, so they stay
     /// in step only because every entry point syncs them.
-    pub fn set_tag(&mut self, tag: c_int) {
+    pub(crate) fn set_tag(&mut self, tag: c_int) {
         self.prefix.tag = tag;
     }
 
     /// Borrows the wrapped state.
     #[must_use]
-    pub const fn state(&self) -> &S {
+    pub(crate) const fn state(&self) -> &S {
         &self.state
     }
 
     /// Borrows the wrapped state mutably.
     #[must_use]
-    pub fn state_mut(&mut self) -> &mut S {
+    pub(crate) fn state_mut(&mut self) -> &mut S {
         &mut self.state
-    }
-
-    /// Unwraps the block, discarding the prefix.
-    #[must_use]
-    pub fn into_state(self) -> S {
-        self.state
     }
 }
 
+#[cfg(feature = "libz-compat")]
 impl<S> core::fmt::Debug for StateBlock<S> {
     /// Reports the prefix only, never the state.
     ///
@@ -1986,10 +3119,12 @@ impl<S> core::fmt::Debug for StateBlock<S> {
         f.debug_struct("StateBlock")
             .field("owner", &self.prefix.strm)
             .field("tag", &self.prefix.tag)
+            .field("flavor", &self.prefix.flavor)
             .finish_non_exhaustive()
     }
 }
 
+#[cfg(feature = "libz-compat")]
 /// Allocates a state block through `allocator`, moves `state` into it, and
 /// records its address in [`z_stream::state`].
 ///
@@ -2035,9 +3170,10 @@ impl<S> core::fmt::Debug for StateBlock<S> {
 /// concurrently writing. Any state already installed must have been taken with
 /// [`take_state`] first; overwriting a live [`z_stream::state`] leaks it, and
 /// `test/infcover.c`'s `mem_done` reports leaks.
-pub unsafe fn install_state<S>(
+pub(crate) unsafe fn install_state<S>(
     strm: z_streamp,
     allocator: &StreamAllocator,
+    kind: StateKind,
     tag: c_int,
     state: S,
 ) -> Result<NonNull<StateBlock<S>>, ReturnCode> {
@@ -2046,9 +3182,11 @@ pub unsafe fn install_state<S>(
     }
 
     // The prefix records the caller's pointer verbatim, which is what makes the
-    // owner-identity check in `checked_state` compare like with like.
+    // owner-identity check in `checked_state` compare like with like, and `kind`
+    // verbatim, which is what makes the flavor check able to tell this payload from
+    // the other two.
     let slot = allocator
-        .place(StateBlock::new(strm, tag, state))
+        .place(StateBlock::new(strm, kind, tag, state))
         .ok_or(ReturnCode::MEM_ERROR)?;
 
     // SAFETY: unsafe-site category 1 -- writing one member of the caller's stream.
@@ -2063,11 +3201,142 @@ pub unsafe fn install_state<S>(
     Ok(slot)
 }
 
+#[cfg(feature = "libz-compat")]
+/// Requests a state block through `allocator` without initialising it.
+///
+/// [`install_state`] performs three steps at once -- allocate, move the state in,
+/// record the address -- which is the right shape wherever the state value already
+/// exists. `deflateInit2_` is the case where it is not: C takes the state object
+/// *first* (`ZALLOC(strm, 1, sizeof(deflate_state))`, `deflate.c` L440) and the
+/// four buffers the state owns *after* it (L468-L479), then releases them in the
+/// exact reverse order (`deflateEnd`, L1300-L1306). A Rust state value cannot be
+/// built before the buffers it owns exist, so reproducing C's sequence of calls
+/// into the caller's `zalloc` means splitting the three steps: reserve here,
+/// publish with [`publish_state`], build the state, then move it in with
+/// [`commit_state`].
+///
+/// That sequence is observable. `test/infcover.c`'s tracking allocator records
+/// every block in allocation order and reports a release that is not
+/// last-in-first-out as a `notlifo` defect, so an implementation that asked for
+/// the state object last and returned it first would be visibly wrong even though
+/// it leaked nothing.
+///
+/// # Errors
+///
+/// [`ReturnCode::MEM_ERROR`] if the request is refused, if the block is misaligned
+/// for the block type, or if the block type is zero-sized -- which is C's
+/// `if (s == Z_NULL) return Z_MEM_ERROR;` (L443-L444).
+///
+/// A reservation is uninitialised storage the caller now owns. It must reach
+/// exactly one of [`commit_state`] or [`discard_reserved_state`]; anything else
+/// leaks the block.
+pub(crate) fn reserve_state<S>(
+    allocator: &StreamAllocator,
+) -> Result<NonNull<StateBlock<S>>, ReturnCode> {
+    allocator
+        .reserve::<StateBlock<S>>()
+        .ok_or(ReturnCode::MEM_ERROR)
+}
+
+#[cfg(feature = "libz-compat")]
+/// Records a reserved state block's address in [`z_stream::state`].
+///
+/// `strm->state = (struct internal_state FAR *)s;` on its own -- `deflate.c` L445,
+/// which C reaches *before* it allocates the state's buffers. Publishing at the
+/// same point means a caller's `zalloc`, called for those buffers, sees the same
+/// non-null `state` member it would see in C.
+///
+/// The block does not have to be initialised yet, and nothing in this library
+/// reads through the member until [`commit_state`] has run. Every subsequent
+/// recovery goes through [`checked_state`] or [`take_state`], which validate the
+/// tag and the owner first, so a stream published but never committed cannot be
+/// mistaken for a usable one -- but it must still be resolved: either
+/// [`commit_state`] initialises it or the member is cleared again on the failure
+/// path, exactly as C's `deflateEnd` clears it at L1307.
+///
+/// # Safety
+///
+/// `strm` must be non-null, aligned, and address a live [`z_stream`] with nothing
+/// else concurrently accessing it. `slot` must have come from [`reserve_state`].
+pub(crate) unsafe fn publish_state<S>(strm: z_streamp, slot: NonNull<StateBlock<S>>) {
+    // SAFETY: unsafe-site category 1 -- writing one member of the caller's stream.
+    // `strm` is non-null, aligned and live by this function's contract, so the
+    // `state` member is in bounds and writable. `addr_of_mut!` forms a raw place
+    // rather than a reference, so no `&mut z_stream` is materialised and the
+    // caller's own pointer keeps its provenance. The member may hold indeterminate
+    // bytes beforehand, which is sound because it is written, not read.
+    unsafe {
+        core::ptr::addr_of_mut!((*strm).state).write(slot.as_ptr().cast::<internal_state>());
+    }
+}
+
+#[cfg(feature = "libz-compat")]
+/// Moves a finished state into a block [`reserve_state`] produced.
+///
+/// The last of the three steps [`install_state`] performs together, and the point
+/// at which the block becomes a valid state: the prefix records `strm` as the
+/// owner and `tag` as the initial validity tag, so the block passes its own
+/// owner-identity and tag checks from this moment on. `s->strm = strm` and
+/// `s->status = INIT_STATE` at `deflate.c` L446-L447 are the same two
+/// assignments, and C's comment there says why the status is set so early: "to
+/// pass state test in `deflateReset()`".
+///
+/// # Safety
+///
+/// * `slot` must have come from [`reserve_state`] on an allocator carrying the
+///   same `(zalloc, zfree, opaque)` triple as the one that will eventually release
+///   it, and with the same `S`.
+/// * The block must not have been committed already: the write does not drop what
+///   it overwrites.
+pub(crate) unsafe fn commit_state<S>(
+    slot: NonNull<StateBlock<S>>,
+    allocator: &StreamAllocator,
+    strm: z_streamp,
+    kind: StateKind,
+    tag: c_int,
+    state: S,
+) {
+    // SAFETY: unsafe-site category 3 -- initialising the state block. `occupy`'s
+    // contract is this function's: `slot` came from `reserve` -- through
+    // `reserve_state` -- on this allocator's triple, and is still uninitialised.
+    // `kind` is stamped into the prefix exactly as `install_state` stamps it, so a
+    // block placed in two phases is indistinguishable from one placed in one and the
+    // flavor check in `checked_state` keeps working.
+    unsafe { allocator.occupy(slot, StateBlock::new(strm, kind, tag, state)) }
+}
+
+#[cfg(feature = "libz-compat")]
+/// Returns a reserved but uncommitted state block to `allocator`.
+///
+/// The `ZFREE(strm, s)` C performs when a later step fails -- `deflate.c` L509-L513
+/// reaches it through `deflateEnd`, `inflate.c` L212 spells it out -- for the case
+/// where the state value was never built, so there is nothing to drop and only the
+/// storage to give back.
+///
+/// # Safety
+///
+/// * `slot` must have come from [`reserve_state`] on an allocator carrying this
+///   same `(zalloc, zfree, opaque)` triple, and must not have been committed or
+///   released.
+/// * Nothing may reference the block afterwards, and any [`z_stream::state`]
+///   member that [`publish_state`] pointed at it must already have been cleared.
+pub(crate) unsafe fn discard_reserved_state<S>(
+    allocator: &StreamAllocator,
+    slot: NonNull<StateBlock<S>>,
+) {
+    // SAFETY: unsafe-site category 4 -- the caller's `zfree`. `release`'s contract
+    // is this function's: the block came from `reserve` on this triple, has not
+    // been released, is unreferenced, and holds no value that owes a destructor
+    // because it was never committed.
+    unsafe { allocator.release(slot) }
+}
+
+#[cfg(feature = "libz-compat")]
 /// Recovers a validated borrow of the state behind [`z_stream::state`].
 ///
 /// The read half of the round-trip, and the Rust form of the surviving parts of
 /// `deflateStateCheck` (`deflate.c` L538) and `inflateStateCheck`
-/// (`inflate.c` L88). Four things are established before any state field is
+/// (`inflate.c` L88). Five things are established before any state field is
 /// touched, in this order:
 ///
 /// 1. `strm` is non-null and aligned -- the `strm == Z_NULL` test.
@@ -2077,10 +3346,16 @@ pub unsafe fn install_state<S>(
 ///    `inflate.c` L94, which rejects a state belonging to another stream.
 /// 4. [`StatePrefix::tag`] is in the live range for `kind` -- the
 ///    `state->mode < HEAD || state->mode > SYNC` test at `inflate.c` L95.
+/// 5. `StatePrefix`'s private `flavor` member is exactly `kind`'s cookie. This one has **no C
+///    counterpart**, because C does not need one: its `inflate` and `inflateBack`
+///    payloads are the same `struct inflate_state`, while this port's are different
+///    Rust types behind an identical prefix and an identical tag range. It is what
+///    turns "an ordinary inflate call on an `inflateBack` stream" into
+///    `Z_STREAM_ERROR` instead of a wrong-layout access.
 ///
 /// [`None`] means the entry point must return `Z_STREAM_ERROR`.
 ///
-/// Steps 3 and 4 read the prefix through the raw pointer with
+/// Steps 3 to 5 read the prefix through the raw pointer with
 /// [`core::ptr::read`] rather than forming a reference first. That ordering is
 /// deliberate: forming `&StateBlock<S>` over memory that has not yet been shown
 /// to hold one would already be undefined behaviour, so the cheapest, most
@@ -2098,31 +3373,33 @@ pub unsafe fn install_state<S>(
 /// Creating a `&mut z_stream` from the caller's pointer **invalidates that
 /// pointer**: the mutable reborrow takes exclusive control of the stream, so every
 /// pointer derived earlier -- including the very one C handed in and the one this
-/// module records in [`StatePrefix::strm`] -- may no longer be used. An earlier
-/// draft of this module took `&mut z_stream` in [`install_state`], and Miri
-/// reported the consequence precisely: a later `checked_state` read of
-/// `z_stream::state` failed with "that tag does not exist in the borrow stack",
-/// pointing at the `&mut` as the invalidating retag. The addresses still compared
-/// equal, so the owner test still *passed* -- the defect was invisible to every
-/// functional test and visible only to an aliasing model.
+/// module records in [`StatePrefix::strm`] -- may no longer be used. Taking
+/// `&mut z_stream` in [`install_state`] produces exactly that failure: a later
+/// `checked_state` read of `z_stream::state` is rejected by Miri with "that tag
+/// does not exist in the borrow stack", naming the `&mut` as the invalidating
+/// retag. The addresses still compare equal, so the owner test still *passes* --
+/// which is why the defect is invisible to every functional test and visible only
+/// to an aliasing model, and why the rule above is stated as a requirement rather
+/// than left to judgement.
 ///
 /// Reading and writing a single member through a raw place has neither problem, and
 /// it is also a closer translation of the C it replaces, where every access is
 /// spelled `strm->state`. Entry points that additionally need the input or output
-/// buffers should reach them the same way, or take [`stream_ref`]/[`stream_mut`]
-/// and finish with the borrow *before* touching the state.
+/// buffers reach them the same way -- read `next_in`/`avail_in` through a raw place
+/// and hand the pair to [`input_slice`] -- which is why this module offers no
+/// borrowing constructor for a whole [`z_stream`] and why adding one would
+/// reintroduce exactly the defect above.
 ///
 /// # The remaining check, and where it lives
 ///
 /// C also rejects a stream whose `zalloc` or `zfree` is null. That test is
-/// [`StreamAllocator::from_stream_ptr`]'s: it returns [`None`] for a
-/// half-supplied pair. It cannot be performed here as C performs it, because this port leaves
-/// both hooks `Z_NULL` when the caller did -- C overwrites them with `zcalloc` and
-/// `zcfree` (`deflate.c` L401-L414) whereas [`StreamAllocator::internal`] needs no
-/// function pointers at all. The difference is unobservable to the suite:
-/// `test/example.c` either supplies both hooks or leaves both null, and
-/// `test/infcover.c` clears both only in `mem_done` (L231-L233), after the stream
-/// has already been ended.
+/// [`StreamAllocator::from_stream_ptr`]'s, which returns [`None`] for exactly that
+/// case, and it is the same test C performs -- not an approximation of it. The
+/// three init entry points substitute a null hook and write the substitution back
+/// into the caller's structure ([`StreamAllocator::adopt_hooks`], mirroring
+/// `deflate.c` L401-L414), so an initialised stream never has a null hook; a stream
+/// that arrives here with one was never initialised, or had its members cleared
+/// afterwards, which is what `test/infcover.c`'s `mem_done` does (L231-L233).
 ///
 /// # Safety
 ///
@@ -2135,7 +3412,10 @@ pub unsafe fn install_state<S>(
 /// the limitation C has, and why C pairs the tag test with the owner test too.
 /// No other borrow of the block may exist for `'a`.
 #[must_use]
-pub unsafe fn checked_state<'a, S>(strm: z_streamp, kind: StateKind) -> Option<&'a StateBlock<S>> {
+pub(crate) unsafe fn checked_state<'a, S>(
+    strm: z_streamp,
+    kind: StateKind,
+) -> Option<&'a StateBlock<S>> {
     // SAFETY: unsafe-site category 3 -- the opaque `state` round-trip.
     // `validated_state_ptr` performs steps 1 to 4 and returns a pointer
     // only when all four passed; this function's own contract supplies the
@@ -2143,11 +3423,18 @@ pub unsafe fn checked_state<'a, S>(strm: z_streamp, kind: StateKind) -> Option<&
     // from that pointer is therefore sound, and no other borrow exists for `'a` by
     // contract.
     let slot = unsafe { validated_state_ptr::<S>(strm, kind) }?;
-    // SAFETY: unsafe-site category 3, as above -- `slot` addresses an initialised
-    // `StateBlock<S>`.
+    // SAFETY: unsafe-site category 3 -- the opaque `state` round-trip. `slot` is
+    // non-null and aligned for `StateBlock<S>`, because `validated_state_ptr`
+    // returned `Some` only after testing both, and it addresses a fully initialised
+    // `StateBlock<S>` written by `install_state` for this same `S`, which the tag
+    // and owner tests just confirmed. This function's contract supplies the two
+    // facts no test can establish: that the block is still live rather than freed,
+    // and that no other borrow of it exists for `'a`. A shared reference is
+    // therefore sound and cannot alias a `&mut`.
     Some(unsafe { slot.as_ref() })
 }
 
+#[cfg(feature = "libz-compat")]
 /// Recovers a validated mutable borrow of the state behind [`z_stream::state`].
 ///
 /// The [`checked_state`] counterpart for the entry points that advance the state,
@@ -2159,18 +3446,26 @@ pub unsafe fn checked_state<'a, S>(strm: z_streamp, kind: StateKind) -> Option<&
 /// As [`checked_state`], and additionally: no other borrow of the block --
 /// shared or mutable -- may exist for `'a`. Recover the borrow once on entry.
 #[must_use]
-pub unsafe fn checked_state_mut<'a, S>(
+pub(crate) unsafe fn checked_state_mut<'a, S>(
     strm: z_streamp,
     kind: StateKind,
 ) -> Option<&'a mut StateBlock<S>> {
-    // SAFETY: unsafe-site category 3, as `checked_state`, with the caller
-    // additionally guaranteeing that
-    // this is the only live borrow of the block for `'a`.
+    // SAFETY: unsafe-site category 3 -- the opaque `state` round-trip. `strm` is
+    // null-and-alignment tested inside `validated_state_ptr` before any
+    // dereference, and this function's contract guarantees a non-null `strm`
+    // addresses a live `z_stream` whose `state`, if non-null, is a `StateBlock<S>`
+    // from `install_state`. The helper forms no reference to the block, so calling
+    // it cannot invalidate the caller's own pointer.
     let mut slot = unsafe { validated_state_ptr::<S>(strm, kind) }?;
-    // SAFETY: unsafe-site category 3, as above.
+    // SAFETY: unsafe-site category 3 -- `slot` is non-null, aligned for
+    // `StateBlock<S>` and addresses an initialised one, all established by the
+    // helper returning `Some`. This function's contract additionally guarantees the
+    // block is live and that **no** other borrow of it -- shared or mutable --
+    // exists for `'a`, which is what makes a unique reference sound here.
     Some(unsafe { slot.as_mut() })
 }
 
+#[cfg(feature = "libz-compat")]
 /// Takes the state back out of a stream and returns its storage to `allocator`.
 ///
 /// The teardown half of the round-trip: `ZFREE(strm, strm->state)` followed by
@@ -2190,7 +3485,7 @@ pub unsafe fn checked_state_mut<'a, S>(
 /// the matching [`install_state`] used -- ordinarily guaranteed because both are
 /// built by [`StreamAllocator::from_stream`] from the same stream, whose hooks
 /// `zlib.h` L140-L142 forbids the application from changing once initialised.
-pub unsafe fn take_state<S>(
+pub(crate) unsafe fn take_state<S>(
     strm: z_streamp,
     allocator: &StreamAllocator,
     kind: StateKind,
@@ -2220,6 +3515,89 @@ pub unsafe fn take_state<S>(
     Some(unsafe { allocator.displace(slot) })
 }
 
+#[cfg(feature = "libz-compat")]
+/// Recovers the state, hands it to `body`, and releases the block's own storage
+/// only after `body` returns.
+///
+/// [`take_state`] with the two release steps in C's order. It has to be a separate
+/// function rather than a flag, because the ordering follows from *where the value
+/// is dropped*: a function that returns the state cannot free the block first
+/// without freeing it before the value's own buffers are released, and cannot free
+/// it last without keeping the storage alive past its own return.
+///
+/// `deflateEnd` releases `pending_buf`, `head`, `prev` and `window` and *then* the
+/// state object (`deflate.c` L1300-L1306); `inflateEnd` releases the window and
+/// then the state (`inflate.c` L1281-L1287). In both the state block -- the first
+/// allocation made -- is the last one returned, so a caller's `zalloc`/`zfree` pair
+/// sees a strictly last-in-first-out sequence. `test/infcover.c`'s tracking
+/// allocator records that order and reports any departure from it as a `notlifo`
+/// defect, which is what makes this observable rather than cosmetic.
+///
+/// `body` receives the state **by mutable reference** and is expected to release its
+/// buffers explicitly -- typically `|block| core_deflate_end(&mut block.state_mut()
+/// .state)`, whose own return value is the status C reads at L1298, before the
+/// teardown. The value is then dropped here, in this frame, with every buffer slot
+/// already empty.
+///
+/// ★ The reference is not a convenience. A state moved into a call -- `body(block)`
+/// included -- carries its buffers' borrows in argument position, where they are
+/// protected for the whole call, and freeing memory a protected reference covers is
+/// undefined behaviour. Passing `&mut` retags only the state block, which is a
+/// different allocation from the buffers, so the frees inside `body` are sound.
+/// `zlib_rs::allocate::ForeignBlock` records the rule and the Miri diagnosis behind it.
+///
+/// Returns [`None`], having touched nothing, if the stream carries no state this
+/// library installed -- the same four validity checks [`take_state`] applies.
+///
+/// # Safety
+///
+/// As [`take_state`], plus one obligation on `body`: whatever it returns must not
+/// own storage obtained from `allocator`, because that storage would then be
+/// released after the state block rather than before it. A status code, which is
+/// what both `End` entry points return, satisfies that trivially.
+pub(crate) unsafe fn take_state_with<S, R>(
+    strm: z_streamp,
+    allocator: &StreamAllocator,
+    kind: StateKind,
+    body: impl FnOnce(&mut StateBlock<S>) -> R,
+) -> Option<R> {
+    // SAFETY: unsafe-site category 3 -- the opaque `state` round-trip. The four
+    // validity checks run inside, and this function's contract supplies the
+    // liveness and provenance requirements they cannot test.
+    let slot = unsafe { validated_state_ptr::<S>(strm, kind) }?;
+
+    // SAFETY: unsafe-site category 1 -- clearing one member of the caller's stream.
+    // `validated_state_ptr` returning `Some` established that `strm` is non-null
+    // and aligned, and this function's contract makes it a live `z_stream`. Written
+    // through a raw place, so no `&mut z_stream` is materialised and the caller's
+    // pointer keeps its provenance. Cleared before anything is released, so no path
+    // can leave the stream holding a dangling pointer.
+    unsafe {
+        core::ptr::addr_of_mut!((*strm).state).write(core::ptr::null_mut());
+    }
+
+    // SAFETY: unsafe-site category 3 -- recovering the state object. `slot`
+    // addresses an initialised, aligned `StateBlock<S>` that this library installed
+    // and that the clear above has just detached from the stream, so nothing else
+    // references it. The read moves the value out; the storage is released below
+    // without running a destructor on it, which is correct because ownership has
+    // transferred to `block`.
+    let mut block = unsafe { slot.as_ptr().read() };
+
+    // The state's buffers go back to the allocator here, inside `body`, which releases
+    // them through the borrow. `block` itself is dropped at the end of this frame --
+    // an in-place drop of a local, with every slot already empty.
+    let result = body(&mut block);
+
+    // SAFETY: unsafe-site category 4 -- the caller's `zfree`. `release`'s contract
+    // is satisfied by this function's: the block came from `install_state` on this
+    // triple, has not been released, is unreferenced now that the read above moved
+    // the value out, and owes no destructor for the same reason.
+    unsafe { allocator.release(slot) };
+
+    Some(result)
+}
+
 /// Runs the four validity checks and yields the state pointer, or [`None`].
 ///
 /// The single implementation behind [`checked_state`], [`checked_state_mut`] and
@@ -2231,6 +3609,7 @@ pub unsafe fn take_state<S>(
 /// As [`checked_state`]. This function forms no reference to the block; it reads
 /// only the plain-data [`StatePrefix`] at offset 0, which `#[repr(C)]`
 /// guarantees is where it lies.
+#[cfg(feature = "libz-compat")]
 unsafe fn validated_state_ptr<S>(
     strm: z_streamp,
     kind: StateKind,
@@ -2276,5 +3655,375 @@ unsafe fn validated_state_ptr<S>(
         return None;
     }
 
+    // Check 5: the exact payload flavor. ★ Not a C check, and it has no C
+    // counterpart to be faithful to: C's two decompression payloads are both
+    // `struct inflate_state`, whereas this port's `inflate` and `inflateBack` blocks
+    // are different Rust types behind an identical prefix and an identical tag
+    // range. Without this comparison, reinterpreting one as the other would read --
+    // and later free -- at the wrong layout. See `StatePrefix::flavor`.
+    if prefix.flavor != kind.cookie() {
+        return None;
+    }
+
     Some(slot)
+}
+
+#[cfg(test)]
+// Gated with the machinery it exercises. Every case below reaches for the allocator
+// adapter, the overlap predicates or the tagged state block, none of which is compiled
+// without `libz-compat`, so with the feature off there is nothing here to test rather
+// than something to skip. What the ABI mirrors themselves promise is asserted at
+// compile time in `layout_assertions.rs`, which is unconditional, so the layouts stay
+// verified in every configuration.
+#[cfg(feature = "libz-compat")]
+// The workspace denies the panic family and slice indexing everywhere, which is the
+// property this module exists to uphold at the boundary; a test that cannot assert is
+// useless, so the harness opts back in here only. `clippy.toml` permits exactly this
+// through its `allow-*-in-tests` keys.
+#[allow(clippy::panic, clippy::unwrap_used)]
+mod tests {
+    use super::{
+        ranges_are_disjoint, streams_are_disjoint, structs_are_disjoint, z_stream, z_streamp,
+        StateKind, StatePrefix,
+    };
+    use core::ffi::c_int;
+
+    /// A range shares no byte with itself when either side is empty.
+    ///
+    /// Both helpers that build slices return an empty slice for a zero length without
+    /// calling `from_raw_parts` at all, so a zero-length pair borrows nothing and can
+    /// never alias -- which is why the overlap gate must not refuse it.
+    #[test]
+    fn a_zero_length_range_is_disjoint_from_everything() {
+        let buffer = [0_u8; 16];
+        let base = buffer.as_ptr();
+        assert!(ranges_are_disjoint(base, 0, base, 16));
+        assert!(ranges_are_disjoint(base, 16, base, 0));
+        assert!(ranges_are_disjoint(base, 0, base, 0));
+        assert!(ranges_are_disjoint(core::ptr::null(), 0, base, 8));
+    }
+
+    /// Ranges that touch but do not share a byte are disjoint.
+    #[test]
+    fn adjacent_ranges_are_disjoint_and_touching_ones_are_not() {
+        let buffer = [0_u8; 16];
+        let base = buffer.as_ptr();
+        // SAFETY: both offsets are inside a 16-byte array, so the arithmetic stays in
+        // bounds of one allocation.
+        let middle = unsafe { base.add(8) };
+
+        // [0,8) and [8,16) share nothing.
+        assert!(ranges_are_disjoint(base, 8, middle, 8));
+        assert!(ranges_are_disjoint(middle, 8, base, 8));
+
+        // [0,9) and [8,16) share byte 8.
+        assert!(!ranges_are_disjoint(base, 9, middle, 8));
+        assert!(!ranges_are_disjoint(middle, 8, base, 9));
+
+        // A range always overlaps itself.
+        assert!(!ranges_are_disjoint(base, 1, base, 1));
+        assert!(!ranges_are_disjoint(base, 16, middle, 1));
+    }
+
+    /// A length that would run past the top of the address space is refused, not wrapped.
+    ///
+    /// `avail_in` and `avail_out` are caller-supplied, so a range whose end cannot be
+    /// represented is an input this gate can receive. Saturating means the end never
+    /// compares as "before the other start", so the pair is reported as overlapping and
+    /// the entry point refuses it -- fail-closed rather than accidentally accepted.
+    #[test]
+    fn a_range_that_would_wrap_the_address_space_is_reported_as_overlapping() {
+        let high = usize::MAX as *const u8;
+        let low = 1_usize as *const u8;
+        assert!(!ranges_are_disjoint(high, usize::MAX, low, 1));
+    }
+
+    /// Two structures overlap unless they are a whole `T` apart.
+    ///
+    /// Equality is not a sufficient test: `deflateCopy` and `inflateCopy` copy
+    /// `sizeof(z_stream)` bytes, so two distinct but *partially* overlapping streams
+    /// would still make the copy undefined.
+    #[test]
+    fn struct_disjointness_covers_partial_overlap_not_just_equality() {
+        // Backed by real `MaybeUninit<z_stream>` storage rather than a byte array, so the
+        // addresses below carry `z_stream`'s own alignment and no pointer cast widens an
+        // alignment. Nothing is ever read out of it.
+        let pair = [const { core::mem::MaybeUninit::<z_stream>::uninit() }; 4];
+        let base: *const z_stream = pair.as_ptr().cast();
+        // SAFETY: the array holds four `z_stream`s, so both derived addresses stay inside
+        // it; `byte_add(8)` keeps the 8-byte alignment because `z_stream`'s alignment is
+        // 8. Neither pointer is dereferenced -- only its address is read.
+        let (near, far) = unsafe { (base.byte_add(8), base.add(1)) };
+
+        assert!(!structs_are_disjoint(base, base));
+        assert!(!structs_are_disjoint(base, near));
+        assert!(structs_are_disjoint(base, far));
+        assert!(structs_are_disjoint(far, base));
+
+        // `streams_are_disjoint` is the same predicate, spelled for the one type both
+        // copy entry points need.
+        assert!(!streams_are_disjoint(
+            base.cast_mut(),
+            near.cast_mut().cast()
+        ));
+        assert!(streams_are_disjoint(base.cast_mut(), far.cast_mut()));
+    }
+
+    /// The private prefix keeps the layout `test/infcover.c` writes through.
+    ///
+    /// The harness casts `strm.state` to `struct inflate_state *` and assigns `->mode`
+    /// (its L330 and L459), so `strm` must stay at offset 0 and the tag immediately
+    /// after it -- offset 8 on a 64-bit target, offset 4 on a 32-bit one, exactly where
+    /// the C compiler puts `inflate_mode mode`. Asserted relationally for that reason,
+    /// with the measured 64-bit numbers pinned separately.
+    #[test]
+    fn the_prefix_layout_matches_the_c_visible_head() {
+        assert_eq!(core::mem::offset_of!(StatePrefix, strm), 0);
+        assert_eq!(
+            core::mem::offset_of!(StatePrefix, tag),
+            size_of::<z_streamp>()
+        );
+        assert_eq!(
+            core::mem::offset_of!(StatePrefix, flavor),
+            size_of::<z_streamp>() + size_of::<c_int>()
+        );
+        assert_eq!(
+            size_of::<StatePrefix>(),
+            size_of::<z_streamp>() + 2 * size_of::<c_int>()
+        );
+        assert_eq!(size_of::<c_int>(), 4);
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(size_of::<StatePrefix>(), 16);
+            assert_eq!(core::mem::offset_of!(StatePrefix, tag), 8);
+            assert_eq!(core::mem::offset_of!(StatePrefix, flavor), 12);
+        }
+    }
+
+    /// The three payload kinds carry three different cookies.
+    ///
+    /// This is the whole mechanism that stops an `inflateBack` block being reinterpreted
+    /// as an `inflate` block: the two share a tag range, so only the cookie separates
+    /// them.
+    #[test]
+    fn every_state_kind_has_its_own_cookie() {
+        let deflate = StateKind::Deflate.cookie();
+        let inflate = StateKind::Inflate.cookie();
+        let back = StateKind::InflateBack.cookie();
+        assert_ne!(deflate, inflate);
+        assert_ne!(deflate, back);
+        assert_ne!(inflate, back);
+        // A recycled or uninitialised word is very unlikely to match: none of the three
+        // is a small integer.
+        for cookie in [deflate, inflate, back] {
+            assert!(
+                cookie > 0x0100_0000,
+                "{cookie:#010x} is too small to screen"
+            );
+        }
+    }
+
+    /// `inflateBack` shares `inflate`'s tag predicate, and deflate has its own.
+    ///
+    /// The polarity is C's: a `true` return means *reject*, matching a non-zero return
+    /// from `deflateStateCheck`/`inflateStateCheck`.
+    #[test]
+    fn the_tag_predicate_follows_the_kind_and_inflate_back_shares_inflates() {
+        // `HEAD` is 16180 and `SYNC` is 16211 (`inflate.h` L20-L52).
+        for tag in [16180_i32, 16190, 16211] {
+            assert!(!StateKind::Inflate.rejects(tag));
+            assert!(!StateKind::InflateBack.rejects(tag));
+        }
+        for tag in [0_i32, 16179, 16212] {
+            assert!(StateKind::Inflate.rejects(tag));
+            assert!(StateKind::InflateBack.rejects(tag));
+        }
+        // `INIT_STATE` is 42 (`deflate.h` L58) and is not an inflate mode.
+        assert!(!StateKind::Deflate.rejects(42));
+        assert!(StateKind::Deflate.rejects(16180));
+    }
+
+    use super::{
+        alloc_func, free_func, uInt, voidpf, zlib_rs_zalloc, zlib_rs_zfree, StreamAllocator,
+    };
+    use core::ffi::c_void;
+    use zlib_rs::allocate::Allocator;
+
+    /// A caller hook that is never called: only its address matters here.
+    unsafe extern "C" fn stub_alloc(_opaque: voidpf, _items: uInt, _size: uInt) -> voidpf {
+        core::ptr::null_mut()
+    }
+
+    /// The `zfree` counterpart of [`stub_alloc`].
+    unsafe extern "C" fn stub_free(_opaque: voidpf, _address: voidpf) {}
+
+    fn opaque_marker() -> voidpf {
+        // A non-null value that is never dereferenced -- `zlib.h` L146-L147 says the
+        // library attaches no meaning to it, and this test holds it to that.
+        //
+        // Written as a cast rather than with `core::ptr::without_provenance_mut`, which is
+        // stable only from Rust 1.84 and would break the declared 1.80 floor: `make
+        // rust-msrv` reports E0658 for it. The cast yields the same address with no
+        // provenance, which is all a value that is only ever compared needs.
+        0x5a5a_5a5a_usize as *mut c_void
+    }
+
+    /// `deflate.c` L401-L414: each hook is defaulted on its own, and the `opaque`
+    /// clear belongs to the `zalloc` arm.
+    #[test]
+    fn each_hook_defaults_independently_and_opaque_follows_zalloc() {
+        let marker = opaque_marker();
+        let stub_a: alloc_func = Some(stub_alloc);
+        let stub_f: free_func = Some(stub_free);
+
+        // Both null: both substituted, `opaque` cleared.
+        let both = StreamAllocator::from_hooks(None, None, marker);
+        let (zalloc, zfree, opaque) = both.published_hooks();
+        assert!(zalloc.is_some() && zfree.is_some());
+        assert!(opaque.is_null(), "deflate.c L406 clears opaque");
+        assert!(both.is_internal());
+
+        // Both supplied: nothing substituted, `opaque` kept.
+        let caller = StreamAllocator::from_hooks(stub_a, stub_f, marker);
+        let (_, _, opaque) = caller.published_hooks();
+        assert_eq!(opaque, marker);
+        assert!(!caller.is_internal());
+
+        // `zalloc` only: `zfree` substituted, `opaque` kept, because C's clear lives
+        // in the other arm.
+        let alloc_only = StreamAllocator::from_hooks(stub_a, None, marker);
+        let (zalloc, zfree, opaque) = alloc_only.published_hooks();
+        assert_eq!(zalloc.map(|f| f as usize), stub_a.map(|f| f as usize));
+        assert_eq!(
+            zfree.map(|f| f as usize),
+            Some(zlib_rs_zfree as unsafe extern "C" fn(voidpf, voidpf) as usize)
+        );
+        assert_eq!(opaque, marker, "deflate.c L410-L414 does not touch opaque");
+        assert!(!alloc_only.is_internal());
+
+        // `zfree` only: `zalloc` substituted, and the clear comes with it.
+        let free_only = StreamAllocator::from_hooks(None, stub_f, marker);
+        let (zalloc, zfree, opaque) = free_only.published_hooks();
+        assert_eq!(
+            zalloc.map(|f| f as usize),
+            Some(zlib_rs_zalloc as unsafe extern "C" fn(voidpf, uInt, uInt) -> voidpf as usize)
+        );
+        assert_eq!(zfree.map(|f| f as usize), stub_f.map(|f| f as usize));
+        assert!(opaque.is_null());
+        assert!(free_only.is_internal());
+    }
+
+    /// The two state checks reject a stream with a null hook -- `deflate.c` L536-L539
+    /// and `inflate.c` L90-L92 -- which is the state `test/infcover.c`'s `mem_done`
+    /// leaves behind (L231-L233). Nothing is substituted on that path.
+    #[test]
+    fn a_null_hook_is_refused_outside_the_init_entry_points() {
+        let stub_a: alloc_func = Some(stub_alloc);
+        let stub_f: free_func = Some(stub_free);
+        let marker = opaque_marker();
+
+        assert!(StreamAllocator::from_supplied_hooks(None, None, marker).is_none());
+        assert!(StreamAllocator::from_supplied_hooks(stub_a, None, marker).is_none());
+        assert!(StreamAllocator::from_supplied_hooks(None, stub_f, marker).is_none());
+        assert!(StreamAllocator::from_supplied_hooks(stub_a, stub_f, marker).is_some());
+    }
+
+    /// An allocator built by `internal()` and one rebuilt from the hooks that same
+    /// substitution publishes are the SAME allocator. This is what lets `deflateEnd`
+    /// release blocks `deflateInit2_` obtained after the caller's stream has been
+    /// rewritten, and it is the property the old internal-mode design did not have.
+    #[test]
+    fn the_published_hooks_rebuild_an_identical_allocator() {
+        let internal = StreamAllocator::internal();
+        let (zalloc, zfree, opaque) = internal.published_hooks();
+        let rebuilt = StreamAllocator::from_supplied_hooks(zalloc, zfree, opaque)
+            .expect("both published hooks are non-null");
+        assert_eq!(internal.id(), rebuilt.id());
+        assert_eq!(internal.opaque_ptr(), rebuilt.opaque_ptr());
+    }
+
+    /// The published routines are real, callable C functions whose blocks release
+    /// through each other -- the property that makes publishing them safe at all.
+    /// `zcalloc`/`zcfree` are `malloc`/`free` (`zutil.c` L299-L308) and so are these.
+    #[test]
+    fn the_published_routines_allocate_and_release_through_each_other() {
+        let (zalloc, zfree, opaque) = StreamAllocator::internal().published_hooks();
+        let (zalloc, zfree) = (zalloc.unwrap(), zfree.unwrap());
+
+        // SAFETY: the two published hooks with the published `opaque`, called exactly
+        // as the library calls them. The request is 64 bytes, the block is written
+        // through its whole length before being released, and it is released once.
+        unsafe {
+            let block = zalloc(opaque, 16, 4);
+            assert!(!block.is_null(), "64 bytes is always available");
+            core::ptr::write_bytes(block.cast::<u8>(), 0x5a, 64);
+            assert_eq!(block.cast::<u8>().read(), 0x5a);
+            zfree(opaque, block);
+
+            // `zalloc`'s documented failure answer is `Z_NULL` (`zlib.h` L149): on a
+            // 32-bit target the product is unrepresentable and `block_len` refuses it
+            // without calling `malloc`, and on a 64-bit target the product is
+            // representable and `malloc` refuses it. Either way the answer is null.
+            //
+            // ★ `black_box` is load-bearing, not decoration. Measured on rustc 1.97.1
+            // at `opt-level = 3` -- the release profile `make rust-test` builds with:
+            // when the returned pointer is *only* null-tested and never otherwise
+            // used, LLVM removes the `malloc` call as a dead allocation and folds the
+            // comparison to `false`, so the assertion fires against a request that was
+            // never made. Observing the pointer keeps the call, and the answer is
+            // `Z_NULL` in both profiles. The library itself is unaffected: every block
+            // it obtains is written and released, so none is ever dead.
+            let huge = core::hint::black_box(zalloc(opaque, uInt::MAX, uInt::MAX));
+            assert!(
+                huge.is_null(),
+                "a product that cannot be honoured must answer Z_NULL"
+            );
+            // `zcfree` forwards to `free`, which accepts a null pointer.
+            zfree(opaque, core::ptr::null_mut());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `inflate_table` alphabet mapping -- tests
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "libz-compat")]
+#[cfg(test)]
+mod tests_config {
+    use core::ffi::c_int;
+
+    use zlib_rs::inflate::inftrees::CodeType;
+
+    use super::{code_type_from_raw, CODES, DISTS, LENS};
+
+    /// The three `inftrees.h` L54-L58 enumerators map to the core's `CodeType`, in
+    /// declaration order, and nothing else maps at all.
+    ///
+    /// This is the guard that makes taking a bare `c_int` at the boundary safe, so
+    /// the rejection half matters as much as the acceptance half: `inflate_table`
+    /// indexes its own tables by the alphabet it is handed, and `test/infcover.c`
+    /// L570-L573 calls the symbol directly, which is exactly the path a bad value
+    /// would arrive on.
+    #[test]
+    fn code_type_from_raw_accepts_the_three_alphabets_and_nothing_else() {
+        assert_eq!(code_type_from_raw(CODES), Some(CodeType::Codes));
+        assert_eq!(code_type_from_raw(LENS), Some(CodeType::Lens));
+        assert_eq!(code_type_from_raw(DISTS), Some(CodeType::Dists));
+
+        assert_eq!(code_type_from_raw(3), None);
+        assert_eq!(code_type_from_raw(-1), None);
+        assert_eq!(code_type_from_raw(c_int::MAX), None);
+        assert_eq!(code_type_from_raw(c_int::MIN), None);
+    }
+
+    /// The three constants carry the values `inftrees.h` gives them, which is what
+    /// lets a caller pass `CODES`/`LENS`/`DISTS` straight through to the C symbol.
+    #[test]
+    fn the_alphabet_constants_match_inftrees_h() {
+        assert_eq!(CODES, 0);
+        assert_eq!(LENS, 1);
+        assert_eq!(DISTS, 2);
+    }
 }

@@ -253,7 +253,7 @@ fn len_at<'a, A: Allocator<'a>>(
 /// `tree[node].Len = len`.
 ///
 /// Shares storage with `Dad`, which is why `gen_bitlen` can note that it
-/// "overwrite[s] `tree[n].Dad` which is no longer needed" (L566).
+/// overwrites `tree[n].Dad`, "which is no longer needed" (L566).
 #[inline]
 fn set_len_at<'a, A: Allocator<'a>>(
     state: &mut DeflateState<'a, A>,

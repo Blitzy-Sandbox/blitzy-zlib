@@ -193,6 +193,7 @@ use crate::inflate::inftrees::{
 };
 use crate::inflate::state::{is_live_mode_tag, StreamReset, BACK_UNKNOWN, FLAGS_NO_HEADER};
 use crate::inflate::window::update_window;
+use crate::read_buf::{OutputCursor, OutputRegion};
 
 pub use crate::inflate::header::inflate_get_header;
 pub use crate::inflate::mode::Mode;
@@ -417,7 +418,16 @@ pub struct InflateStream<'a> {
     /// How far into [`Self::input`] the stream has read. C's `next_in` advance.
     pub next_in: usize,
     /// The whole output buffer: `z_stream.next_out` addressed its `next_out`-th byte.
-    pub output: &'a mut [u8],
+    ///
+    /// An [`OutputRegion`] rather than a `&mut [u8]` because a C caller's `next_out` is only
+    /// guaranteed *writable*: `zlib.h` L94-L95 promises `avail_out` bytes of room and says
+    /// nothing about their contents, and Rust does not allow a byte slice to address a byte
+    /// that holds no value. [`OutputRegion::init`] is the shape a Rust caller has and is what
+    /// [`InflateStream::new`] builds; the facade supplies [`OutputRegion::write_only`] through
+    /// [`InflateStream::with_region`]. The decoder reads its own output back -- for the check
+    /// value (L1080), the window update (L1136) and a match copy (L1055) -- and the region is
+    /// what makes those three reads legal over either shape.
+    pub output: OutputRegion<'a>,
     /// How far into [`Self::output`] the stream has written. C's `next_out` advance.
     pub next_out: usize,
     /// `z_stream.total_in`: total bytes of input consumed so far (`zlib.h` L93).
@@ -427,8 +437,23 @@ pub struct InflateStream<'a> {
     /// `z_stream.msg`: the last error message, or [`None`] for C's `Z_NULL`
     /// (`zlib.h` L98).
     pub msg: Option<&'static str>,
-    /// `z_stream.adler`: the running or final check value (`zlib.h` L106).
-    pub adler: u32,
+    /// `z_stream.adler`: the running or final check value (`zlib.h` L106), or
+    /// [`None`] when no check value has been assigned.
+    ///
+    /// ★ **This is the one `z_stream` member the decoder writes only sometimes, so
+    /// it is the one member an [`Option`] has to model.** `inflateResetKeep` assigns
+    /// `strm->adler` under `if (state->wrap)` (`inflate.c` L108-L109) and the
+    /// epilogue under `if ((state->wrap & 4) && out)` (L1144-L1146); a **raw** stream
+    /// satisfies neither, so C never touches the member at all and whatever the
+    /// caller left there survives. [`None`] is that "left alone" state, and it is why
+    /// the facade need not -- and must not -- read the caller's member to build this
+    /// view: a freshly initialised raw stream's `adler` is *indeterminate*, and
+    /// reading it would be undefined behaviour.
+    ///
+    /// The decoder never consults the incoming value either way. It keeps the running
+    /// check in the state's own `check` field and publishes here, so [`None`] on the way in
+    /// costs nothing and [`Some`] on the way out means "C assigned at this point".
+    pub adler: Option<u32>,
     /// `z_stream.data_type`: bits left in the accumulator plus the three state flags
     /// (`zlib.h` L105 and `inflate.c` L1147-L1149).
     pub data_type: i32,
@@ -443,9 +468,10 @@ impl<'a> InflateStream<'a> {
     /// Zeroed is deliberately not the same thing as initialised, and one field makes the
     /// difference visible. `inflateReset` sets `strm->adler = state->wrap & 1`
     /// (`inflate.c` L100-L109), so a freshly initialised **wrapped zlib** stream carries
-    /// `adler == 1` -- the Adler-32 seed -- and only a **raw** stream carries `adler == 0`.
-    /// This constructor sets `adler: 0` unconditionally, because it has no configuration to
-    /// consult and therefore cannot know the wrap mode.
+    /// `adler == 1` -- the Adler-32 seed -- and a **raw** stream is left alone entirely.
+    /// This constructor sets [`Self::adler`] to [`None`], because it has no configuration
+    /// to consult and therefore cannot know the wrap mode: "no check value assigned" is
+    /// the only honest starting point.
     ///
     /// So: treat the result as the zeroed storage a reset is then applied to, exactly as C
     /// treats the `z_stream` a caller hands to `inflateInit2_` before `inflateReset2` runs. The
@@ -456,15 +482,26 @@ impl<'a> InflateStream<'a> {
     /// and `data_type` itself; they are public fields for exactly that reason.
     #[must_use]
     pub fn new(input: &'a [u8], output: &'a mut [u8]) -> Self {
+        Self::with_region(input, OutputRegion::init(output))
+    }
+
+    /// Builds a **pre-reset, zeroed** view over `input` and `region`.
+    ///
+    /// The entry point `crates/libz-rs-sys` uses, because the region it has is
+    /// [`OutputRegion::write_only`]: the `avail_out` bytes at a C caller's `next_out` are
+    /// writable but not initialised. Everything [`InflateStream::new`]'s documentation says
+    /// about the reset applies here unchanged.
+    #[must_use]
+    pub fn with_region(input: &'a [u8], region: OutputRegion<'a>) -> Self {
         Self {
             input,
             next_in: 0,
-            output,
+            output: region,
             next_out: 0,
             total_in: 0,
             total_out: 0,
             msg: None,
-            adler: 0,
+            adler: None,
             data_type: 0,
         }
     }
@@ -484,7 +521,7 @@ impl<'a> InflateStream<'a> {
     /// The output bytes this stream has produced, i.e. `output[..next_out]`.
     #[must_use]
     pub fn written(&self) -> &[u8] {
-        self.output.get(..self.next_out).unwrap_or(&[])
+        self.output.initialized(self.next_out)
     }
 
     /// Applies the public half of a state reset (`inflate.c` L104-L107).
@@ -500,7 +537,7 @@ impl<'a> InflateStream<'a> {
         self.msg = reset.msg;
         self.data_type = reset.data_type;
         if let Some(adler) = reset.adler {
-            self.adler = adler;
+            self.adler = Some(adler);
         }
     }
 }
@@ -590,10 +627,10 @@ struct Inflater<'i, 'o> {
     input: &'i [u8],
     /// C's `next` (L476), as an index.
     next_in: usize,
-    /// C's output buffer, whole. `put` is `output[next_out..]`.
-    output: &'o mut [u8],
-    /// C's `put` (L477), as an index.
-    next_out: usize,
+    /// C's output buffer and C's `put` (L477) as one value: the region plus the index into
+    /// it. The cursor owns the region for the duration of the call and gives both back to
+    /// [`InflateStream`] in the epilogue.
+    output: OutputCursor<'o>,
     /// The `flush` argument, kept as the raw C `int`.
     ///
     /// Deliberately **not** converted to a validated enum: `inflate()` has always
@@ -611,8 +648,12 @@ struct Inflater<'i, 'o> {
     total_out: u64,
     /// `strm->msg`.
     msg: Option<&'static str>,
-    /// `strm->adler`.
-    adler: u32,
+    /// `strm->adler`, or [`None`] while no check value has been assigned.
+    ///
+    /// Carries [`InflateStream::adler`]'s convention through the drive: the three
+    /// sites that assign it are the three places C writes `strm->adler`, and
+    /// anything this leaves as [`None`] is a member C never touched.
+    adler: Option<u32>,
     /// `strm->data_type`.
     data_type: i32,
 }
@@ -627,7 +668,13 @@ impl Inflater<'_, '_> {
     /// C's `left` (L478): output space still unwritten.
     #[inline]
     fn avail_out(&self) -> usize {
-        self.output.len().saturating_sub(self.next_out)
+        self.output.remaining()
+    }
+
+    /// C's `put` (L477) as an index: how far the output cursor has advanced.
+    #[inline]
+    fn next_out(&self) -> usize {
+        self.output.written()
     }
 
     /// `PULLBYTE()`: take one input byte into the accumulator (`inflate.c` L356-L362).
@@ -688,12 +735,7 @@ impl Inflater<'_, '_> {
     /// as "no space" keeps the state resumable either way.
     #[inline]
     fn write_byte(&mut self, byte: u8) -> bool {
-        let Some(slot) = self.output.get_mut(self.next_out) else {
-            return false;
-        };
-        *slot = byte;
-        self.next_out = self.next_out.saturating_add(1);
-        true
+        self.output.push_byte(byte)
     }
 
     /// `UPDATE_CHECK(check, buf, len)` over the last `count` bytes written
@@ -708,8 +750,7 @@ impl Inflater<'_, '_> {
         state: &InflateState<'a, A>,
         count: usize,
     ) -> Option<u32> {
-        let start = self.next_out.checked_sub(count)?;
-        let region = self.output.get(start..self.next_out)?;
+        let region = self.output.written_tail(count)?;
         Some(if state.flags == 0 {
             adler32(state.check, region)
         } else {
@@ -729,7 +770,7 @@ impl Inflater<'_, '_> {
     /// that into `Z_DATA_ERROR`, one dispatch later.
     fn apply_header(&mut self, exit: HeaderExit) -> Step {
         if let Some(adler) = exit.adler {
-            self.adler = adler;
+            self.adler = Some(adler);
         }
         if let Some(msg) = exit.msg {
             self.msg = Some(msg);
@@ -891,18 +932,13 @@ impl Inflater<'_, '_> {
         let Some(source) = input.get(self.next_in..input_end) else {
             return false;
         };
-        let output_end = self.next_out.saturating_add(copy);
-        let Some(target) = self.output.get_mut(self.next_out..output_end) else {
-            return false;
-        };
-        // Both slices came from `get`/`get_mut` with the same width, so this length
-        // test can only fail if `copy` overflowed above -- and then nothing is copied.
-        if target.len() != source.len() {
+        // `push_slice` copies what fits and advances by exactly that much, so the two
+        // cursor updates of L772-L775 cannot disagree. A short copy would mean `copy`
+        // exceeded `avail_out`, which the `min` at the call site rules out.
+        if self.output.push_slice(source) != source.len() {
             return false;
         }
-        target.copy_from_slice(source);
         self.next_in = input_end;
-        self.next_out = output_end;
         true
     }
 
@@ -1376,14 +1412,7 @@ impl Inflater<'_, '_> {
         if self.avail_in() >= MIN_AVAIL_IN && self.avail_out() >= MIN_AVAIL_OUT {
             let start = self.output_start;
             let input = self.input;
-            let exit = inflate_fast(
-                state,
-                input,
-                &mut self.next_in,
-                &mut *self.output,
-                &mut self.next_out,
-                start,
-            );
+            let exit = inflate_fast(state, input, &mut self.next_in, &mut self.output, start);
             if let Some(msg) = exit.msg {
                 self.msg = Some(msg);
             }
@@ -1582,7 +1611,7 @@ impl Inflater<'_, '_> {
         } else {
             // L1054-L1057: the match is entirely within this output buffer.
             (
-                MatchSource::Output(self.next_out.saturating_sub(offset)),
+                MatchSource::Output(self.next_out().saturating_sub(offset)),
                 length,
             )
         };
@@ -1621,26 +1650,29 @@ impl Inflater<'_, '_> {
         source: MatchSource,
         count: usize,
     ) -> bool {
-        let mut cursor = match source {
-            MatchSource::Window(index) | MatchSource::Output(index) => index,
-        };
-        for _ in 0..count {
-            let byte = match source {
-                MatchSource::Window(_) => match state.valid_window_byte(cursor) {
-                    Some(byte) => byte,
-                    None => return false,
-                },
-                MatchSource::Output(_) => match self.output.get(cursor).copied() {
-                    Some(byte) => byte,
-                    None => return false,
-                },
-            };
-            if !self.write_byte(byte) {
-                return false;
+        match source {
+            MatchSource::Window(index) => {
+                let mut cursor = index;
+                for _ in 0..count {
+                    let Some(byte) = state.valid_window_byte(cursor) else {
+                        return false;
+                    };
+                    if !self.write_byte(byte) {
+                        return false;
+                    }
+                    cursor = cursor.saturating_add(1);
+                }
+                true
             }
-            cursor = cursor.saturating_add(1);
+            // The source is output this call, or an earlier one, already wrote, so the copy
+            // is inside the cursor's own buffer. [`OutputCursor::duplicate_from`] performs it
+            // in ascending byte order and reproduces the reference's byte loop for an
+            // overlapping match as well as a disjoint one -- which is the one property that
+            // matters here, because `offset == 1` run-length encoding is legal and common.
+            // Expressing it as one call rather than a per-byte read is also what lets the
+            // decoder work over write-only output storage, which cannot be read byte by byte.
+            MatchSource::Output(index) => self.output.duplicate_from(index, count),
         }
-        true
     }
 
     /// Writes one decoded literal byte.
@@ -1707,7 +1739,7 @@ impl Inflater<'_, '_> {
                     return Step::Leave;
                 };
                 state.check = value;
-                self.adler = value;
+                self.adler = Some(value);
             }
 
             // L1081: move the checkpoint forward.
@@ -1804,7 +1836,7 @@ impl Inflater<'_, '_> {
             // C passes `strm->next_out`, the address one past the last byte written;
             // `update_window` takes the last `written` bytes of the region instead, so
             // the whole produced prefix is the natural argument.
-            let region = self.output.get(..self.next_out).unwrap_or(&[]);
+            let region = self.output.written_slice();
             if update_window(state, region, written).is_err() {
                 return state.latch_memory_error();
             }
@@ -1820,7 +1852,7 @@ impl Inflater<'_, '_> {
         if state.wrap.verifies_check_value() && written != 0 {
             if let Some(value) = self.update_check(state, written) {
                 state.check = value;
-                self.adler = value;
+                self.adler = Some(value);
             }
         }
 
@@ -2057,12 +2089,15 @@ where
         data_type,
     } = stream;
 
-    // L500-L502: `LOAD(); in = have; out = left;`.
+    // L500-L502: `LOAD(); in = have; out = left;`. The output cursor owns its region for
+    // the duration of the call -- a complete handle on the caller's buffer that hands out no
+    // view of it -- so the region is moved out of the stream here and moved back by the
+    // single write-back below.
+    let region = core::mem::replace(output, OutputRegion::empty());
     let mut engine = Inflater {
         input,
         next_in: *next_in,
-        output,
-        next_out: *next_out,
+        output: OutputCursor::from_region(region, *next_out),
         flush,
         input_start: 0,
         output_start: 0,
@@ -2080,8 +2115,10 @@ where
     // C's `RESTORE()` plus the direct writes through `strm`. Unconditional, because the
     // three bare-return paths either consume nothing at all or -- for `Z_NEED_DICT` --
     // call `RESTORE()` themselves; see the module documentation.
+    let (produced_region, produced) = engine.output.into_region();
+    *output = produced_region;
     *next_in = engine.next_in;
-    *next_out = engine.next_out;
+    *next_out = produced;
     *total_in = engine.total_in;
     *total_out = engine.total_out;
     *msg = engine.msg;
@@ -2189,12 +2226,18 @@ pub fn inflate_init<'a, A: Allocator<'a>>(allocator: A) -> Result<InflateState<'
 ///
 /// The Rust counterpart of `inflateEnd` (`inflate.c` L1155-L1165), declared at `zlib.h` L471. C
 /// frees the window and then the state itself, through the same `zfree` they came from,
-/// and clears `strm->state`. Here, taking the state by value and dropping it does the
-/// first; clearing the facade's `z_stream.state` is the facade's step.
+/// and clears `strm->state`. Here, releasing the window does the first; clearing the
+/// facade's `z_stream.state` is the facade's step.
+///
+/// ★ The state arrives by mutable reference, not by value: a state moved into this
+/// function would carry its window's borrow in argument position, where it is protected
+/// for the whole call, and freeing memory a protected reference covers is undefined
+/// behaviour. The caller keeps the state and drops it where it lives, its window slot
+/// already empty. `zlib_rs::allocate::ForeignBlock` records the rule.
 ///
 /// Always [`ReturnCode::OK`]: C's only failure is the `inflateStateCheck` at L1157,
 /// which cannot fail for an owned [`InflateState`].
-pub fn inflate_end<'a, A: Allocator<'a>>(state: InflateState<'a, A>) -> ReturnCode {
+pub fn inflate_end<'a, A: Allocator<'a>>(state: &mut InflateState<'a, A>) -> ReturnCode {
     state.release();
     ReturnCode::OK
 }
@@ -2407,7 +2450,7 @@ where
 /// full `whave`, as C does.
 pub fn inflate_get_dictionary<'a, A: Allocator<'a>>(
     state: &InflateState<'a, A>,
-    dictionary: Option<&mut [u8]>,
+    dictionary: Option<&mut OutputRegion<'_>>,
     dict_length: Option<&mut u32>,
 ) -> ReturnCode {
     // L1176-L1181.
@@ -2428,7 +2471,7 @@ pub fn inflate_get_dictionary<'a, A: Allocator<'a>>(
 /// `whave >= wnext` always holds -- while the window has not wrapped the two are equal,
 /// and once it has, `whave == wsize >= wnext` -- so the first piece is never empty when
 /// the second is non-empty, and the two together are exactly `whave` bytes.
-fn copy_history<'a, A: Allocator<'a>>(state: &InflateState<'a, A>, target: &mut [u8]) {
+fn copy_history<'a, A: Allocator<'a>>(state: &InflateState<'a, A>, target: &mut OutputRegion<'_>) {
     let Some(window) = state.window.as_slice() else {
         return;
     };
@@ -2440,13 +2483,12 @@ fn copy_history<'a, A: Allocator<'a>>(state: &InflateState<'a, A>, target: &mut 
     for piece in [older, newer] {
         let room = target.len().saturating_sub(written);
         let take = piece.len().min(room);
-        let (Some(chunk), Some(slot)) = (
-            piece.get(..take),
-            target.get_mut(written..written.saturating_add(take)),
-        ) else {
+        let Some(chunk) = piece.get(..take) else {
             return;
         };
-        slot.copy_from_slice(chunk);
+        if !target.write_slice_at(written, chunk) {
+            return;
+        }
         written = written.saturating_add(take);
     }
 }
@@ -2476,8 +2518,9 @@ pub fn inflate_set_dictionary<'a, A>(
 where
     A: Allocator<'a> + Copy,
 {
-    // L1196-L1197.
-    if !state.wrap.is_raw() && state.mode != Mode::Dict {
+    // L1196-L1197, through the predicate the facade also applies so that the two
+    // cannot answer differently -- see `InflateState::accepts_dictionary`.
+    if !state.accepts_dictionary() {
         return ReturnCode::STREAM_ERROR;
     }
 
@@ -2669,7 +2712,7 @@ mod tests {
         inflate_init, inflate_init2, inflate_mark, inflate_prime, inflate_reset, inflate_reset2,
         inflate_reset_keep, inflate_set_dictionary, inflate_state_check, inflate_sync,
         inflate_sync_point, inflate_undermine, inflate_validate, syncsearch, Allocator,
-        InflateState, InflateStream, Mode, ReturnCode, INFLATE_CODES_USED_BAD_STATE,
+        InflateState, InflateStream, Mode, OutputRegion, ReturnCode, INFLATE_CODES_USED_BAD_STATE,
         INFLATE_MARK_BAD_STATE, MSG_INCORRECT_DATA_CHECK, MSG_INCORRECT_LENGTH_CHECK,
         MSG_INVALID_BIT_LENGTH_REPEAT, MSG_INVALID_BLOCK_TYPE, MSG_INVALID_CODE_LENGTHS_SET,
         MSG_INVALID_DISTANCES_SET, MSG_INVALID_DISTANCE_CODE, MSG_INVALID_DISTANCE_TOO_FAR_BACK,
@@ -2677,7 +2720,7 @@ mod tests {
         MSG_INVALID_STORED_BLOCK_LENGTHS, MSG_MISSING_END_OF_BLOCK, MSG_TOO_MANY_SYMBOLS, ORDER,
     };
     use crate::adler32::adler32;
-    use crate::allocate::{AllocatorId, Buffer, GlobalAllocator, Opaque};
+    use crate::allocate::{AllocatorId, Buffer, ForeignBlock, GlobalAllocator, Opaque};
     use crate::config::{
         InflateConfig, Z_BLOCK, Z_FINISH, Z_FULL_FLUSH, Z_NO_FLUSH, Z_PARTIAL_FLUSH, Z_SYNC_FLUSH,
         Z_TREES,
@@ -2846,7 +2889,7 @@ mod tests {
         let mut state = inflate_init2(InflateConfig::new(window_bits), GlobalAllocator)
             .expect("windowBits should be accepted");
         let outcome = drive_state(&mut state, compressed, in_step, out_step, flush);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
         outcome
     }
 
@@ -2872,12 +2915,18 @@ mod tests {
         let mut msg = None;
         let mut total_in = 0_u64;
         let mut total_out = 0_u64;
-        // ★ `adler` does not start at zero. C's `inflateInit2_` reaches
-        // `inflateResetKeep`, which sets `strm->adler = wrap & 1` (`inflate.c` L108-L109),
-        // so a zlib or gzip stream reports 1 before any byte is decoded. Modelling the
-        // facade's init-time `apply_reset` here is what makes this harness agree with the
+        // ★ `adler` does not start at zero for every stream. C's `inflateInit2_` reaches
+        // `inflateResetKeep`, which sets `strm->adler = wrap & 1` (`inflate.c` L108-L109)
+        // *under `if (state->wrap)`*, so a zlib or gzip stream reports 1 before any byte
+        // is decoded and a raw stream keeps whatever the caller's `z_stream` held -- zero,
+        // for the zeroed struct this models. Reproducing the facade's init-time
+        // `apply_reset` here, guard included, is what makes this harness agree with the
         // reference on `adler` for streams that fail in the header and never produce output.
-        let mut adler = state.wrap.adler_seed();
+        let mut adler = if state.wrap.is_raw() {
+            0
+        } else {
+            state.wrap.adler_seed()
+        };
         let mut data_type = 0_i32;
         let mut idle = 0_u32;
         let mut calls = 0_u32;
@@ -2889,7 +2938,9 @@ mod tests {
             let mut stream = InflateStream::new(&compressed[consumed..end], &mut buffer);
             stream.total_in = total_in;
             stream.total_out = total_out;
-            stream.adler = adler;
+            // `adler` is deliberately *not* seeded: the facade hands the core `None` and
+            // writes the caller's member back only when the core assigned one, so the
+            // harness carries the value itself and adopts whatever came back.
             stream.data_type = data_type;
 
             ret = inflate(state, &mut stream, flush);
@@ -2900,7 +2951,9 @@ mod tests {
             consumed = consumed.saturating_add(stream.next_in);
             total_in = stream.total_in;
             total_out = stream.total_out;
-            adler = stream.adler;
+            if let Some(value) = stream.adler {
+                adler = value;
+            }
             data_type = stream.data_type;
             msg = stream.msg;
 
@@ -2990,7 +3043,7 @@ mod tests {
         };
         let mut session = Session::new(&compressed[..step]);
         let call = session.step(&mut state, out_len, Z_NO_FLUSH);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
         call
     }
 
@@ -3018,14 +3071,10 @@ mod tests {
             None
         }
 
-        fn deallocate_bytes(&self, buffer: Buffer<'a, u8>) {
-            // Unreachable: nothing is ever handed out, so nothing comes back.
-            drop(buffer);
-        }
+        // Unreachable: nothing is ever handed out, so nothing comes back.
+        fn release_foreign_bytes(&self, _block: ForeignBlock<'a, u8>) {}
 
-        fn deallocate_u16s(&self, buffer: Buffer<'a, u16>) {
-            drop(buffer);
-        }
+        fn release_foreign_u16s(&self, _block: ForeignBlock<'a, u16>) {}
     }
 
     #[test]
@@ -3382,7 +3431,7 @@ mod tests {
         // stream would stop at the same boundary for ever.
         let call = session.step(&mut state, 64, Z_BLOCK);
         assert_eq!(call.output, HELLO);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
         // Driven to completion, `Z_BLOCK` still yields the whole payload.
         let outcome = decode_with_flush(HELLO_ZLIB, 15, 0, 64, Z_BLOCK);
@@ -3416,7 +3465,7 @@ mod tests {
         let call = session.step(&mut state, 64, Z_TREES);
         assert_eq!(call.ret, ReturnCode::STREAM_END);
         assert!(call.output.is_empty());
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -3444,7 +3493,7 @@ mod tests {
             }
         }
         assert!(stopped, "Z_TREES did not stop at COPY_");
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -3472,7 +3521,7 @@ mod tests {
             }
         }
         assert!(stopped, "Z_TREES did not stop at LEN_");
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
         // And driven to completion it still produces every byte.
         let outcome = decode_with_flush(REPEAT_ZLIB, 15, 0, 4096, Z_TREES);
@@ -3494,7 +3543,7 @@ mod tests {
         let call = session.step(&mut state, 64, Z_FINISH);
         assert_eq!(call.ret, ReturnCode::STREAM_END);
         assert_eq!(call.output, &HELLO[4..]);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
         // With room from the start, `Z_FINISH` reaches the end in one call.
         let mut state = inflate_init2(InflateConfig::new(15), GlobalAllocator).unwrap();
@@ -3502,7 +3551,7 @@ mod tests {
         let call = session.step(&mut state, 64, Z_FINISH);
         assert_eq!(call.ret, ReturnCode::STREAM_END);
         assert_eq!(call.output, HELLO);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -3523,7 +3572,7 @@ mod tests {
         let call = session.step(&mut state, 0, Z_NO_FLUSH);
         assert_eq!(call.ret, ReturnCode::BUF_ERROR);
         assert_eq!(call.consumed, 0);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -3541,7 +3590,7 @@ mod tests {
         assert_eq!(call.data_type & 256, 0);
         // The low six bits are the accumulator occupancy, which cannot exceed 32.
         assert!((call.data_type & 63) <= 32, "{}", call.data_type);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
         // A non-final block leaves bit 6 clear: this stream's first block is not the last.
         let mut state = inflate_init2(InflateConfig::new(-15), GlobalAllocator).unwrap();
@@ -3549,7 +3598,7 @@ mod tests {
         let call = session.step(&mut state, 5, Z_BLOCK);
         assert_eq!(call.output, b"first");
         assert_eq!(call.data_type & 64, 0);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
         // The same three flags survive a chunked drive, because the epilogue recomposes
         // `data_type` from scratch on every call rather than accumulating into it.
@@ -3673,7 +3722,7 @@ mod tests {
         assert_eq!(call.ret, ReturnCode::DATA_ERROR);
         assert_eq!(call.msg, Some(MSG_INVALID_BLOCK_TYPE));
         assert_eq!(state.bits, 5, "8 pulled, 3 dropped");
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -3691,7 +3740,7 @@ mod tests {
         let reset = inflate_reset(&mut state);
         assert_eq!(reset.total_in, 0);
         assert_eq!(state.mode, Mode::Head);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -3749,7 +3798,7 @@ mod tests {
         let outcome = drive_state(&mut state, &swapped, 0, 64, Z_NO_FLUSH);
         assert_eq!(outcome.ret, ReturnCode::STREAM_END);
         assert_eq!(outcome.output, HELLO);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
         // Turned back on, the same stream is rejected again.
         let mut state = inflate_init2(InflateConfig::new(15), GlobalAllocator).unwrap();
@@ -3757,13 +3806,13 @@ mod tests {
         assert_eq!(inflate_validate(&mut state, true), ReturnCode::OK);
         let outcome = drive_state(&mut state, &swapped, 0, 64, Z_NO_FLUSH);
         assert_eq!(outcome.ret, ReturnCode::DATA_ERROR);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
         // A raw stream is never promoted, because it has no check value to verify.
         let mut state = inflate_init2(InflateConfig::new(-15), GlobalAllocator).unwrap();
         assert_eq!(inflate_validate(&mut state, true), ReturnCode::OK);
         assert!(!state.wrap.verifies_check_value());
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -3778,7 +3827,7 @@ mod tests {
         assert_eq!(state.mode, Mode::Dict);
         // L696 published the dictionary id, and that is how the caller knows which one to
         // supply (`zlib.h` L903-L906).
-        assert_eq!(stream.adler, adler32(1, DICTIONARY));
+        assert_eq!(stream.adler, Some(adler32(1, DICTIONARY)));
         // The bare return skipped the epilogue, so the totals were not credited.
         assert_eq!(stream.total_in, 0);
         assert_eq!(stream.total_out, 0);
@@ -3801,7 +3850,7 @@ mod tests {
         let outcome = drive_state(&mut state, &DICT_ZLIB[consumed..], 0, 64, Z_NO_FLUSH);
         assert_eq!(outcome.ret, ReturnCode::STREAM_END);
         assert_eq!(outcome.output, HELLO);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -3812,7 +3861,7 @@ mod tests {
             inflate_set_dictionary(&mut state, &[]),
             ReturnCode::STREAM_ERROR
         );
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
         // A raw stream accepts one at any time, with no id to check, and it becomes
         // history the first match can reach back into.
@@ -3822,7 +3871,7 @@ mod tests {
             ReturnCode::OK
         );
         assert_eq!(state.whave, DICTIONARY.len() as u32);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -3842,12 +3891,16 @@ mod tests {
         assert_eq!(outcome.ret, ReturnCode::STREAM_END);
         let mut history = vec![0_u8; 64];
         assert_eq!(
-            inflate_get_dictionary(&state, Some(&mut history), Some(&mut length)),
+            inflate_get_dictionary(
+                &state,
+                Some(&mut OutputRegion::init(&mut history)),
+                Some(&mut length)
+            ),
             ReturnCode::OK
         );
         assert_eq!(length as usize, HELLO.len());
         assert_eq!(&history[..HELLO.len()], HELLO);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -3871,7 +3924,11 @@ mod tests {
         let mut history = vec![0_u8; 512];
         let mut length = 0_u32;
         assert_eq!(
-            inflate_get_dictionary(&state, Some(&mut history), Some(&mut length)),
+            inflate_get_dictionary(
+                &state,
+                Some(&mut OutputRegion::init(&mut history)),
+                Some(&mut length)
+            ),
             ReturnCode::OK
         );
         assert_eq!(length, 256);
@@ -3879,7 +3936,7 @@ mod tests {
         // a splice in the wrong order would still be uniform, so also check the length.
         assert!(history[..256].iter().all(|&byte| byte == b'Z'));
         assert!(history[256..].iter().all(|&byte| byte == 0));
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -3894,12 +3951,16 @@ mod tests {
         let mut history = vec![0xff_u8; 4];
         let mut length = 0_u32;
         assert_eq!(
-            inflate_get_dictionary(&state, Some(&mut history), Some(&mut length)),
+            inflate_get_dictionary(
+                &state,
+                Some(&mut OutputRegion::init(&mut history)),
+                Some(&mut length)
+            ),
             ReturnCode::OK
         );
         assert_eq!(length as usize, HELLO.len());
         assert_eq!(history, &HELLO[..4]);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -3976,7 +4037,7 @@ mod tests {
         let outcome = drive_state(&mut state, &rest, 0, 64, Z_NO_FLUSH);
         assert_eq!(outcome.ret, ReturnCode::STREAM_END);
         assert_eq!(outcome.output, b"second");
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -3998,7 +4059,7 @@ mod tests {
         assert!(!state.wrap.is_raw(), "the zlib wrap bit survives");
         assert!(!state.wrap.verifies_check_value(), "validation is dropped");
         assert_eq!(state.flags, 0, "flags are restored after the reset");
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -4034,7 +4095,7 @@ mod tests {
         let mut buffer = vec![0_u8; 1];
         let mut stream = InflateStream::new(&pattern, &mut buffer);
         assert_eq!(inflate_sync(&mut state, &mut stream), ReturnCode::OK);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -4064,7 +4125,7 @@ mod tests {
         assert_eq!(outcome.ret, ReturnCode::STREAM_END);
         assert_eq!(outcome.output, b"second");
         assert!(!inflate_sync_point(&state));
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -4103,8 +4164,8 @@ mod tests {
             [first.output.as_slice(), from_copy.output.as_slice()].concat(),
             expected
         );
-        assert_eq!(inflate_end(state), ReturnCode::OK);
-        assert_eq!(inflate_end(copy), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut copy), ReturnCode::OK);
     }
 
     #[test]
@@ -4125,19 +4186,19 @@ mod tests {
         let again = drive_state(&mut state, HELLO_RAW, 0, 64, Z_NO_FLUSH);
         assert_eq!(again.ret, ReturnCode::STREAM_END);
         assert_eq!(again.output, HELLO);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
     fn a_copy_of_a_windowless_state_needs_no_window() {
         // `inflate.c` L1343-L1351: the window is allocated only if the source has one, so
         // copying a freshly initialised stream succeeds even under a refusing allocator.
-        let state = inflate_init(GlobalAllocator).unwrap();
-        let copy = inflate_copy(&state, NoMemory).unwrap();
+        let mut state = inflate_init(GlobalAllocator).unwrap();
+        let mut copy = inflate_copy(&state, NoMemory).unwrap();
         assert_eq!(copy.mode, Mode::Head);
         assert_eq!(copy.whave, 0);
-        assert_eq!(inflate_end(copy), ReturnCode::OK);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut copy), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -4176,7 +4237,7 @@ mod tests {
         // The value is masked to the requested width (L232).
         assert_eq!(inflate_prime(&mut state, 5, -1), ReturnCode::OK);
         assert_eq!(state.hold, 0x1f);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -4205,7 +4266,7 @@ mod tests {
         // And a negative `back` shifts as two's complement, exactly as C's cast pair does.
         state.back = -1;
         assert_eq!(inflate_mark(&state), -65_536);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -4219,7 +4280,7 @@ mod tests {
         let used = inflate_codes_used(&state);
         assert!(used > 0, "a dynamic block builds tables");
         assert!(used <= ENOUGH as u64, "{used} exceeds the arena");
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
         // ★ A fixed-code block uses the shared static tables and takes no arena entries.
         // `REPEAT_ZLIB` is one such stream even though it is 61 bytes of matches: byte 2 is
@@ -4237,7 +4298,7 @@ mod tests {
                 ReturnCode::STREAM_END
             );
             assert_eq!(inflate_codes_used(&state), 0);
-            assert_eq!(inflate_end(state), ReturnCode::OK);
+            assert_eq!(inflate_end(&mut state), ReturnCode::OK);
         }
 
         // The sentinel the facade reports for a stream that fails its own state check.
@@ -4255,7 +4316,7 @@ mod tests {
         assert!(state.sane, "sane cannot be cleared");
         assert_eq!(inflate_undermine(&mut state, false), ReturnCode::DATA_ERROR);
         assert!(state.sane);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
         // Which is why a too-far-back distance is always rejected.
         let bytes = h2b("c c0 81 0 0 0 0 0 90 ff 6b 4 0");
@@ -4310,7 +4371,7 @@ mod tests {
         let outcome = drive_state(&mut state, HELLO_ZLIB, 0, 64, Z_NO_FLUSH);
         assert_eq!(outcome.ret, ReturnCode::STREAM_END);
         assert_eq!(outcome.output, HELLO);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -4345,7 +4406,7 @@ mod tests {
             Some(ReturnCode::STREAM_ERROR)
         );
         assert!(state.wrap.allows_gzip_header(), "the old request survives");
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -4389,7 +4450,7 @@ mod tests {
         // Only a reset clears it.
         let _ = inflate_reset(&mut state);
         assert_eq!(state.mode, Mode::Head);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -4402,7 +4463,7 @@ mod tests {
         );
         assert_eq!(state.mode, Mode::Mem);
         assert!(!state.havedict);
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]

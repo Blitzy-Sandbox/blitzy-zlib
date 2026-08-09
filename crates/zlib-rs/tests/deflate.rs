@@ -33,10 +33,11 @@
 //! # Scope boundary: this is *self*-consistency, not cross-implementation identity
 //!
 //! **Byte-identity against the compiled C library is deliberately not this file's job.** The
-//! full level x `windowBits` x `memLevel` x strategy x flush x corpus matrix belongs to
-//! `crates/zlib-rs-differential/tests/byte_identical.rs`, which is the only crate that can link
-//! the C oracle and compare the two implementations directly. Reproducing even part of that
-//! matrix here would be duplication that drifts, and it would make Miri unusable.
+//! full level x `windowBits` x `memLevel` x strategy x flush x corpus matrix belongs to a
+//! differential suite under `crates/zlib-rs-differential`, the only crate that can link the C
+//! oracle and compare the two implementations directly. **No such suite exists in the tree, so
+//! cross-implementation byte-identity is currently unverified by anything** -- and reproducing
+//! even part of that matrix here would be duplication that drifts, and would make Miri unusable.
 //!
 //! What this file pins instead:
 //!
@@ -79,8 +80,8 @@
 //!   `pub(crate)`, mirroring `zlib.map`'s `local:` block. Direct coverage lives in the
 //!   `#[cfg(test)] mod tests` blocks of the modules that define them. **Widening a visibility to
 //!   make one of them testable from here is prohibited** -- the hidden-symbol set is a shipped
-//!   contract, checked by `crates/libz-rs-sys/tests/symbol_parity.rs` against the 111-symbol
-//!   baseline.
+//!   contract stated by `zlib.map`, and `Makefile.in`'s `rust-symbols` target is what compares the
+//!   built library against the 111-symbol baseline. No `cargo test` checks it.
 //! * `TOO_FAR` is a private constant in `src/deflate/algorithm/slow.rs`. Its value is pinned
 //!   behaviourally instead, at the exact 4096-byte boundary, which is a stronger check than
 //!   reading the constant back.
@@ -143,15 +144,15 @@ use zlib_rs::allocate::GlobalAllocator;
 use zlib_rs::config::{
     DeflateConfig, InflateConfig, Method, Strategy, DEF_MEM_LEVEL, DEF_WBITS, MAX_MEM_LEVEL,
     MAX_WBITS, MIN_MEM_LEVEL, MIN_WBITS, PRESET_DICT, Z_BEST_COMPRESSION, Z_BEST_SPEED,
-    Z_DEFAULT_COMPRESSION, Z_DEFLATED, Z_NO_COMPRESSION,
+    Z_DEFAULT_COMPRESSION, Z_DEFLATED, Z_NO_COMPRESSION, Z_UNKNOWN,
 };
 use zlib_rs::deflate::state::{GzHeaderView, BUF_SIZE, HEAP_SIZE, MAX_BITS};
 use zlib_rs::deflate::{
     deflate, deflate_bound, deflate_bound_z, deflate_copy, deflate_end, deflate_get_dictionary,
     deflate_init, deflate_init2, deflate_params, deflate_pending, deflate_prime, deflate_reset,
-    deflate_reset_keep, deflate_set_dictionary, deflate_set_header, deflate_state_check,
-    deflate_tune, deflate_used, DeflateReset, DeflateState, DeflateStream, Status,
-    CONFIGURATION_TABLE, OS_CODE,
+    deflate_reset_keep, deflate_reset_snapshot, deflate_set_dictionary, deflate_set_header,
+    deflate_state_check, deflate_tune, deflate_used, DeflateReset, DeflateState, DeflateStream,
+    Status, CONFIGURATION_TABLE, OS_CODE,
 };
 use zlib_rs::error::ReturnCode;
 use zlib_rs::inflate::state::GzHeaderSink;
@@ -159,6 +160,7 @@ use zlib_rs::inflate::{
     inflate, inflate_end, inflate_get_header, inflate_init2, inflate_reset, inflate_set_dictionary,
     inflate_sync, InflateStream,
 };
+use zlib_rs::read_buf::OutputRegion;
 use zlib_rs::weak_slice::{
     IPos, Pos, LIT_BUFS, MAX_MATCH, MIN_LOOKAHEAD, MIN_MATCH, NIL, WIN_INIT,
 };
@@ -277,6 +279,17 @@ const NARROW_WINDOW_SIZE: usize = 1 << NARROW_WINDOW_BITS;
 // the next: those five live on the stream rather than in the state, and dropping them between
 // calls would silently reset the running checksum.
 // ---------------------------------------------------------------------------------------------
+
+/// Wraps a byte literal as the shared-mutable slice a [`GzHeaderView`] field takes.
+///
+/// The view's `extra`, `name` and `comment` model storage the *application* owns and may
+/// write while the compressor holds the borrow, so their element type is
+/// [`core::cell::Cell`] rather than `u8`. A test owns its fixtures outright, so the
+/// conversion is a plain copy into an owned vector; the caller keeps it alive for as long
+/// as the view is used, which is what the borrow requires.
+fn cells(bytes: &[u8]) -> Vec<Cell<u8>> {
+    bytes.iter().copied().map(Cell::new).collect()
+}
 
 /// Builds a deflate state from raw `deflateInit2_` arguments and resets it.
 ///
@@ -422,8 +435,8 @@ impl Deflater {
 
     /// `deflateEnd`. Consuming `self` is the port's way of spelling the C contract that the state
     /// is unusable afterwards; the return code still follows `deflate.c` L1309 exactly.
-    fn end(self) -> ReturnCode {
-        deflate_end(self.state)
+    fn end(mut self) -> ReturnCode {
+        deflate_end(&mut self.state)
     }
 }
 
@@ -484,7 +497,7 @@ fn expand(input: &[u8], window_bits: i32, expected_len: usize) -> Vec<u8> {
         );
         stream.next_out
     };
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
     out.truncate(produced);
     out
 }
@@ -676,7 +689,7 @@ fn a_new_state_reports_the_geometry_its_arguments_imply() {
         .chain((MIN_MEM_LEVEL..=MAX_MEM_LEVEL).map(|mem_level| (MAX_WBITS, mem_level)));
 
     for (window_bits, mem_level) in configurations {
-        let (state, _) = open(6, window_bits, mem_level, Strategy::Default);
+        let (mut state, _) = open(6, window_bits, mem_level, Strategy::Default);
 
         let w_bits = u32::try_from(window_bits).unwrap();
         assert_eq!(
@@ -729,7 +742,7 @@ fn a_new_state_reports_the_geometry_its_arguments_imply() {
             "pending_buf_size is LIT_BUFS * lit_bufsize (deflate.h L225-L229)"
         );
 
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     }
 }
 
@@ -1050,14 +1063,15 @@ fn fixed_strategy_never_emits_a_dynamic_tree() {
 // change to the encoder would fail the pinned bytes *and* the argument, while a regression in the
 // heuristics fails the argument even if the bytes happened to survive.
 //
-// TO BE PLAIN ABOUT THE DIVISION OF LABOUR, so that the two suites do not drift into duplicating
-// each other: **cross-implementation byte-identity against the compiled C library is verified in
-// `crates/zlib-rs-differential/tests/byte_identical.rs`**, which is the only crate that links the
-// oracle and can therefore compare the two implementations directly, across the full
-// level x windowBits x memLevel x strategy x flush x corpus matrix. This section pins *self*
+// TO BE PLAIN ABOUT THE DIVISION OF LABOUR, so that this suite is not read as more than it is:
+// **cross-implementation byte-identity against the compiled C library belongs to a differential
+// suite under `crates/zlib-rs-differential`**, the only crate that links the oracle and can
+// therefore compare the two implementations directly, across the full
+// level x windowBits x memLevel x strategy x flush x corpus matrix. **No such suite is in the
+// tree, so that comparison has not been made.** This section pins *self*
 // consistency -- the same input giving the same bytes, and the bytes not depending on how the
-// caller chunked its buffers -- plus the specific heuristic behaviours above. Neither suite
-// substitutes for the other: the differential matrix would not notice that `TOO_FAR` is a
+// caller chunked its buffers -- plus the specific heuristic behaviours above. Neither would
+// substitute for the other: a differential matrix would not notice that `TOO_FAR` is a
 // heuristic rather than an optimisation, and this suite cannot prove the C library agrees.
 // =============================================================================================
 
@@ -1660,7 +1674,7 @@ fn the_hash_shift_invariant_holds_for_every_accepted_configuration() {
         .chain((MIN_MEM_LEVEL..=MAX_MEM_LEVEL).map(|mem_level| (MAX_WBITS, mem_level)));
 
     for (window_bits, mem_level) in configurations {
-        let (state, _) = open(6, window_bits, mem_level, Strategy::Default);
+        let (mut state, _) = open(6, window_bits, mem_level, Strategy::Default);
 
         let hash_bits = state.hash_bits();
         let hash_shift = usize::try_from(hash_bits).unwrap().div_ceil(MIN_MATCH);
@@ -1677,7 +1691,7 @@ fn the_hash_shift_invariant_holds_for_every_accepted_configuration() {
              would shift the key clean out of a {hash_bits}-bit hash"
         );
 
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     }
 }
 
@@ -1697,7 +1711,7 @@ fn the_hash_shift_invariant_holds_for_every_accepted_configuration() {
 #[test]
 fn a_fresh_state_reports_the_reference_starting_point() {
     for window_bits in [RAW, ZLIB, GZIP] {
-        let (state, reset) = open(6, window_bits, DEF_MEM_LEVEL, Strategy::Default);
+        let (mut state, reset) = open(6, window_bits, DEF_MEM_LEVEL, Strategy::Default);
 
         let expected_status = if window_bits == GZIP {
             Status::GzipHeader
@@ -1744,7 +1758,7 @@ fn a_fresh_state_reports_the_reference_starting_point() {
             "windowBits {window_bits} selects wrap {expected_wrap}"
         );
 
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     }
 }
 
@@ -1782,7 +1796,7 @@ fn deflate_init_is_deflate_init2_with_the_documented_defaults() {
         );
         stream.next_out
     };
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     out.truncate(produced);
 
     assert_eq!(
@@ -2016,7 +2030,7 @@ fn a_full_flush_boundary_survives_corruption_of_everything_before_it() {
         );
         next_out = stream.next_out;
     }
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
     // The C test prints "hel" itself and then the recovered tail, so the tail is what is left of
     // the payload once its first three bytes -- the ones inside the corrupted block -- are gone.
@@ -2240,7 +2254,7 @@ fn a_zero_length_output_buffer_is_a_buf_error() {
             "nothing can be consumed with nowhere to put it"
         );
     }
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
 }
 
 /// The whole flush enumeration, and which members `deflate` accepts.
@@ -2347,7 +2361,7 @@ fn reference_wraplen(window_bits: i32) -> usize {
 #[test]
 fn bound_is_exactly_the_reference_formula_for_default_parameters() {
     for window_bits in [RAW, ZLIB, GZIP] {
-        let (state, _) = open(6, window_bits, DEF_MEM_LEVEL, Strategy::Default);
+        let (mut state, _) = open(6, window_bits, DEF_MEM_LEVEL, Strategy::Default);
         assert_eq!(
             state.w_bits(),
             15,
@@ -2367,7 +2381,7 @@ fn bound_is_exactly_the_reference_formula_for_default_parameters() {
         // The three spot values worth naming, because they are the ones a reader can check
         // mentally: 13 bytes of overhead for zlib, 7 for raw, 25 for gzip.
         assert_eq!(deflate_bound_z(Some(&state), 0), 7 + wraplen);
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     }
 }
 
@@ -2385,34 +2399,34 @@ fn bound_falls_back_to_a_conservative_formula_off_the_default_path() {
     let storelen = source_len + (source_len >> 5) + (source_len >> 7) + (source_len >> 11) + 7;
 
     // memLevel 1: hash_bits 8 < w_bits 15, so the store bound.
-    let (narrow_hash, _) = open(6, ZLIB, MIN_MEM_LEVEL, Strategy::Default);
+    let (mut narrow_hash, _) = open(6, ZLIB, MIN_MEM_LEVEL, Strategy::Default);
     assert_eq!(narrow_hash.hash_bits(), 8);
     assert_eq!(
         deflate_bound_z(Some(&narrow_hash), source_len),
         storelen + reference_wraplen(ZLIB),
         "w_bits 15 > hash_bits 8 selects storelen (deflate.c L920-L921)"
     );
-    assert_eq!(deflate_end(narrow_hash), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut narrow_hash), ReturnCode::OK);
 
     // windowBits 9: w_bits 9 <= hash_bits 15 and the level is non-zero, so the fixed bound.
-    let (narrow_window, _) = open(6, 9, DEF_MEM_LEVEL, Strategy::Default);
+    let (mut narrow_window, _) = open(6, 9, DEF_MEM_LEVEL, Strategy::Default);
     assert_eq!(narrow_window.w_bits(), 9);
     assert_eq!(
         deflate_bound_z(Some(&narrow_window), source_len),
         fixedlen + reference_wraplen(ZLIB),
         "w_bits 9 <= hash_bits 15 with a non-zero level selects fixedlen"
     );
-    assert_eq!(deflate_end(narrow_window), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut narrow_window), ReturnCode::OK);
 
     // Level 0 off the default path takes the store branch whatever the widths, because `&& s->level`
     // is false: the encoder will be emitting stored blocks.
-    let (stored, _) = open(0, 9, DEF_MEM_LEVEL, Strategy::Default);
+    let (mut stored, _) = open(0, 9, DEF_MEM_LEVEL, Strategy::Default);
     assert_eq!(
         deflate_bound_z(Some(&stored), source_len),
         storelen + reference_wraplen(ZLIB),
         "level 0 selects storelen regardless of the widths (deflate.c L920)"
     );
-    assert_eq!(deflate_end(stored), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut stored), ReturnCode::OK);
 }
 
 /// With no state to consult, the bound is the larger of the two plus a full wrapper.
@@ -2442,7 +2456,7 @@ fn bound_without_a_state_returns_the_larger_bound_plus_a_full_wrapper() {
 #[test]
 fn bound_and_bound_z_agree() {
     for window_bits in [RAW, ZLIB, GZIP] {
-        let (state, _) = open(6, window_bits, DEF_MEM_LEVEL, Strategy::Default);
+        let (mut state, _) = open(6, window_bits, DEF_MEM_LEVEL, Strategy::Default);
         for source_len in [0usize, 1, 13, 100, 1024, 8192, 1_000_000] {
             let wide = deflate_bound(Some(&state), u64::try_from(source_len).unwrap());
             let sized = deflate_bound_z(Some(&state), source_len);
@@ -2452,7 +2466,7 @@ fn bound_and_bound_z_agree() {
                 "windowBits {window_bits}, sourceLen {source_len}: the two forms must agree"
             );
         }
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     }
 }
 
@@ -2463,7 +2477,7 @@ fn bound_and_bound_z_agree() {
 /// caller would allocate a small buffer for a huge input.
 #[test]
 fn bound_saturates_instead_of_wrapping() {
-    let (state, _) = open(6, ZLIB, DEF_MEM_LEVEL, Strategy::Default);
+    let (mut state, _) = open(6, ZLIB, DEF_MEM_LEVEL, Strategy::Default);
 
     assert_eq!(
         deflate_bound_z(Some(&state), usize::MAX),
@@ -2481,7 +2495,7 @@ fn bound_saturates_instead_of_wrapping() {
         "including the no-state path, whose `bound + 18` would wrap (deflate.c L880)"
     );
 
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
 }
 
 /// A user-supplied gzip header widens the bound by exactly what it will occupy.
@@ -2501,21 +2515,27 @@ fn bound_accounts_for_an_installed_gzip_header() {
     const NAME: &[u8] = b"payload.bin\0";
     const COMMENT: &[u8] = b"written by the deflate integration suite\0";
 
-    let header = GzHeaderView {
-        text: true,
-        time: 0x1234_5678,
-        os: 3,
-        extra: Some(EXTRA),
-        name: Some(NAME),
-        comment: Some(COMMENT),
-        hcrc: true,
-    };
+    // The three fields are `Cell` slices because the view models storage the *caller* owns
+    // and may write; see `GzHeaderView`. A test owns them outright, so a `Vec<Cell<u8>>`
+    // built from the literal is the shortest honest spelling.
+    let extra = cells(EXTRA);
+    let name = cells(NAME);
+    let comment = cells(COMMENT);
+    let header = GzHeaderView::new(
+        true,
+        0x1234_5678,
+        3,
+        true,
+        Some(&extra),
+        Some(&name),
+        Some(&comment),
+    );
 
     let payload = corpus::text();
 
-    let (bare, _) = open(6, GZIP, DEF_MEM_LEVEL, Strategy::Default);
+    let (mut bare, _) = open(6, GZIP, DEF_MEM_LEVEL, Strategy::Default);
     let bare_bound = deflate_bound_z(Some(&bare), payload.len());
-    assert_eq!(deflate_end(bare), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut bare), ReturnCode::OK);
 
     let (mut state, reset) = open(6, GZIP, DEF_MEM_LEVEL, Strategy::Default);
     assert_eq!(deflate_set_header(&mut state, Some(header)), ReturnCode::OK);
@@ -2539,7 +2559,7 @@ fn bound_accounts_for_an_installed_gzip_header() {
         );
         stream.next_out
     };
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     out.truncate(produced);
 
     assert!(
@@ -2559,9 +2579,9 @@ fn bound_accounts_for_an_installed_gzip_header() {
 fn bound_grows_by_four_once_a_dictionary_has_been_set() {
     let payload = corpus::HELLO;
 
-    let (bare, _) = open(9, ZLIB, DEF_MEM_LEVEL, Strategy::Default);
+    let (mut bare, _) = open(9, ZLIB, DEF_MEM_LEVEL, Strategy::Default);
     let bare_bound = deflate_bound_z(Some(&bare), payload.len());
-    assert_eq!(deflate_end(bare), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut bare), ReturnCode::OK);
 
     let (mut state, reset) = open(9, ZLIB, DEF_MEM_LEVEL, Strategy::Default);
     let mut adler = reset.adler;
@@ -2575,7 +2595,7 @@ fn bound_grows_by_four_once_a_dictionary_has_been_set() {
         bare_bound + 4,
         "a non-zero strstart adds the four DICTID bytes (deflate.c L885)"
     );
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
 }
 
 /// The bound covers the worst realistic case: incompressible data at level 0.
@@ -2594,9 +2614,9 @@ fn the_bound_covers_the_worst_realistic_expansion() {
             (GZIP, DEF_MEM_LEVEL),
             (ZLIB, MIN_MEM_LEVEL),
         ] {
-            let (state, _) = open(0, window_bits, mem_level, Strategy::Default);
+            let (mut state, _) = open(0, window_bits, mem_level, Strategy::Default);
             let bound = deflate_bound_z(Some(&state), source_len);
-            assert_eq!(deflate_end(state), ReturnCode::OK);
+            assert_eq!(deflate_end(&mut state), ReturnCode::OK);
 
             let actual = squeeze(&payload, 0, window_bits, mem_level, Strategy::Default).len();
             assert!(
@@ -2643,7 +2663,7 @@ fn a_single_finish_call_always_fits_inside_the_bound() {
                     );
                     stream.next_out
                 };
-                assert_eq!(deflate_end(state), ReturnCode::OK);
+                assert_eq!(deflate_end(&mut state), ReturnCode::OK);
                 assert!(produced <= bound);
 
                 out.truncate(produced);
@@ -2709,7 +2729,11 @@ fn the_example_c_dictionary_case_works_end_to_end() {
     let mut readback = [0u8; 64];
     let mut readback_len = 0u32;
     assert_eq!(
-        deflate_get_dictionary(&state, Some(&mut readback), Some(&mut readback_len)),
+        deflate_get_dictionary(
+            &state,
+            Some(&mut OutputRegion::init(&mut readback)),
+            Some(&mut readback_len)
+        ),
         ReturnCode::OK
     );
     assert_eq!(
@@ -2737,7 +2761,7 @@ fn the_example_c_dictionary_case_works_end_to_end() {
         );
         stream.next_out
     };
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     out.truncate(produced);
 
     // FDICT plus the four DICTID bytes, most significant first (`deflate.c` L1030, L1038-L1040).
@@ -2772,7 +2796,8 @@ fn the_example_c_dictionary_case_works_end_to_end() {
             "a stream compressed with a preset dictionary cannot be decoded without it"
         );
         assert_eq!(
-            stream.adler, dict_id,
+            stream.adler,
+            Some(dict_id),
             "Z_NEED_DICT reports which dictionary is wanted, by its Adler-32"
         );
         next_in = stream.next_in;
@@ -2792,7 +2817,7 @@ fn the_example_c_dictionary_case_works_end_to_end() {
         );
         next_out = stream.next_out;
     }
-    assert_eq!(inflate_end(inflater), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut inflater), ReturnCode::OK);
     assert_eq!(
         &recovered[..next_out],
         payload,
@@ -2830,7 +2855,7 @@ fn set_dictionary_is_refused_when_it_could_not_take_effect() {
         ReturnCode::STREAM_ERROR,
         "wrap == 2 has nowhere to record a preset dictionary (deflate.c L571)"
     );
-    assert_eq!(deflate_end(gzip), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut gzip), ReturnCode::OK);
 
     // A zlib stream that has already begun: refused because the header is written.
     let payload = corpus::text();
@@ -2900,7 +2925,7 @@ fn a_raw_stream_accepts_a_dictionary_and_uses_it() {
         );
         stream.next_out
     };
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     out.truncate(produced);
 
     assert!(
@@ -2928,7 +2953,7 @@ fn a_raw_stream_accepts_a_dictionary_and_uses_it() {
         );
         stream.next_out
     };
-    assert_eq!(inflate_end(inflater), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut inflater), ReturnCode::OK);
     assert_eq!(&recovered[..next_out], payload);
 }
 
@@ -2962,7 +2987,11 @@ fn get_dictionary_accepts_either_argument_alone() {
     // Bytes only.
     let mut buffer = vec![0u8; usize::try_from(length).unwrap()];
     assert_eq!(
-        deflate_get_dictionary(&deflater.state, Some(&mut buffer), None),
+        deflate_get_dictionary(
+            &deflater.state,
+            Some(&mut OutputRegion::init(&mut buffer)),
+            None
+        ),
         ReturnCode::OK
     );
     assert_eq!(buffer, payload, "the window holds the most recent input");
@@ -3191,6 +3220,59 @@ fn reset_returns_a_stream_to_its_initial_state() {
     assert_eq!(deflater.end(), ReturnCode::OK);
 }
 
+/// The reset snapshot reports exactly what a real reset would, for all three containers.
+///
+/// This is the invariant `deflateInit2_` depends on. The core's `deflate_init2` already performs a full
+/// `deflateReset` -- C's `return deflateReset(strm)` at `deflate.c` L532 -- but it cannot hand back the
+/// `z_stream` half, so the facade used to call `deflate_reset` a second time purely to obtain those five
+/// values. That repeated `_tr_init` and all of `lm_init`, whose `CLEAR_HASH` writes 64 KiB at the
+/// default `memLevel` and 128 KiB at `memLevel 9`, for values that were already in place. The facade now
+/// reads them with [`deflate_reset_snapshot`] instead, and the reset happens exactly once.
+///
+/// That substitution is only correct while the snapshot and the reset agree, and the seed is the field
+/// where they could diverge: it is `crc32(0, Z_NULL, 0)` -- zero -- for a gzip stream and
+/// `adler32(0, Z_NULL, 0)` -- **one**, not zero -- for zlib and raw (`deflate.c` L667-L671). All three
+/// containers are checked, in both orders: the snapshot before the reset, and again after it, since a
+/// caller reads it at the first of those points and `deflate_reset_keep` computes it at the second.
+///
+/// The assertion is whole-struct equality rather than field-by-field, so a member added to
+/// [`DeflateReset`] is covered the day it appears.
+#[test]
+fn the_reset_snapshot_matches_a_real_reset_for_every_container() {
+    for (bits, expected_seed, container) in [(RAW, 1, "raw"), (ZLIB, 1, "zlib"), (GZIP, 0, "gzip")]
+    {
+        let mut deflater = Deflater::new(6, bits, DEF_MEM_LEVEL, Strategy::Default, 512);
+
+        // What a facade reads immediately after `deflate_init2`, which is where the second reset used
+        // to be. Taken first, so it cannot be an artefact of the reset below.
+        let snapshot = deflate_reset_snapshot(&deflater.state);
+        assert_eq!(
+            snapshot.adler, expected_seed,
+            "{container}: the check seed after init"
+        );
+
+        let performed = deflate_reset(&mut deflater.state);
+        assert_eq!(
+            snapshot, performed,
+            "{container}: the snapshot must report what the reset performs"
+        );
+        assert_eq!(
+            deflate_reset_snapshot(&deflater.state),
+            performed,
+            "{container}: and it must still agree once the reset has run"
+        );
+
+        // The other four members are fixed, and stated here so that a change to any of them has to be
+        // acknowledged in a test rather than only in `write_reset`.
+        assert_eq!(snapshot.total_in, 0);
+        assert_eq!(snapshot.total_out, 0);
+        assert!(snapshot.msg.is_none());
+        assert_eq!(snapshot.data_type, Z_UNKNOWN);
+
+        assert_eq!(deflater.end(), ReturnCode::OK);
+    }
+}
+
 /// `deflateResetKeep` keeps the match state that `deflateReset` throws away.
 ///
 /// `deflate.c` L649-L677 and L681-L684: `deflateResetKeep` resets the stream bookkeeping -- the
@@ -3247,7 +3329,11 @@ fn reset_keep_preserves_the_window_that_reset_clears() {
         if keep {
             let mut window = vec![0u8; usize::try_from(length).unwrap()];
             assert_eq!(
-                deflate_get_dictionary(&deflater.state, Some(&mut window), None),
+                deflate_get_dictionary(
+                    &deflater.state,
+                    Some(&mut OutputRegion::init(&mut window)),
+                    None
+                ),
                 ReturnCode::OK
             );
             assert_eq!(
@@ -3422,7 +3508,7 @@ fn prime_inserts_bits_without_disturbing_the_rest_of_the_stream() {
     assert_eq!(status, ReturnCode::OK);
     assert_eq!(pending_bytes, 0, "five bits do not make a byte");
     assert_eq!(pending_bits, 5, "deflatePending reports bi_valid");
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
 
     // Eight bits is a whole byte, so the stream stays byte-aligned and is exactly comparable.
     let unprimed = squeeze(payload, 6, RAW, DEF_MEM_LEVEL, Strategy::Default);
@@ -3446,7 +3532,7 @@ fn prime_inserts_bits_without_disturbing_the_rest_of_the_stream() {
         );
         stream.next_out
     };
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     out.truncate(produced);
 
     assert_eq!(out[0], 0x5a, "the primed byte comes out first");
@@ -3490,7 +3576,7 @@ fn tune_stores_its_parameters_without_validating_them() {
             "deflateTune validates nothing beyond the state check (deflate.c L820)"
         );
     }
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
 
     // Tuning a level-1 stream up to level 9's parameters must actually change what it finds.
     let untuned = squeeze(&payload, 1, RAW, DEF_MEM_LEVEL, Strategy::Default);
@@ -3626,14 +3712,14 @@ fn end_reports_data_error_only_from_busy_state() {
     );
 
     // INIT_STATE: nothing happened, so nothing was lost.
-    let (untouched, _) = open(6, ZLIB, DEF_MEM_LEVEL, Strategy::Default);
+    let (mut untouched, _) = open(6, ZLIB, DEF_MEM_LEVEL, Strategy::Default);
     assert_eq!(untouched.status(), Status::Init);
-    assert_eq!(deflate_end(untouched), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut untouched), ReturnCode::OK);
 
     // GZIP_STATE: likewise nothing happened, and this is the gzip stream's starting status.
-    let (gzip, _) = open(6, GZIP, DEF_MEM_LEVEL, Strategy::Default);
+    let (mut gzip, _) = open(6, GZIP, DEF_MEM_LEVEL, Strategy::Default);
     assert_eq!(gzip.status(), Status::GzipHeader);
-    assert_eq!(deflate_end(gzip), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut gzip), ReturnCode::OK);
 
     // FINISH_STATE: the stream completed, so the caller discarded nothing.
     let mut finished = Deflater::bounded(6, ZLIB, DEF_MEM_LEVEL, Strategy::Default, payload.len());
@@ -3686,15 +3772,18 @@ fn set_header_emits_every_rfc_1952_field() {
     const FNAME: u8 = 0x08;
     const FCOMMENT: u8 = 0x10;
 
-    let header = GzHeaderView {
-        text: true,
-        time: MTIME,
-        os: OS_UNIX,
-        extra: Some(EXTRA),
-        name: Some(NAME),
-        comment: Some(COMMENT),
-        hcrc: true,
-    };
+    let extra = cells(EXTRA);
+    let name = cells(NAME);
+    let comment = cells(COMMENT);
+    let header = GzHeaderView::new(
+        true,
+        MTIME,
+        OS_UNIX,
+        true,
+        Some(&extra),
+        Some(&name),
+        Some(&comment),
+    );
 
     let payload = corpus::HELLO;
     let (mut state, reset) = open(6, GZIP, DEF_MEM_LEVEL, Strategy::Default);
@@ -3715,7 +3804,7 @@ fn set_header_emits_every_rfc_1952_field() {
         );
         stream.next_out
     };
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     out.truncate(produced);
 
     assert_eq!(&out[..3], &[0x1f, 0x8b, 0x08], "ID1, ID2 and CM = deflate");
@@ -3801,7 +3890,7 @@ fn set_header_emits_every_rfc_1952_field() {
         );
         stream.next_out
     };
-    assert_eq!(inflate_end(inflater), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut inflater), ReturnCode::OK);
     assert_eq!(&recovered[..next_out], payload);
 
     let read_back =
@@ -3882,14 +3971,14 @@ fn set_header_is_refused_on_a_non_gzip_stream() {
             ReturnCode::STREAM_ERROR,
             "windowBits {window_bits} gives wrap != 2, so deflateSetHeader is refused"
         );
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     }
 
     // And on a gzip stream it is accepted, including being cleared again with None.
     let (mut gzip, _) = open(6, GZIP, DEF_MEM_LEVEL, Strategy::Default);
     assert_eq!(deflate_set_header(&mut gzip, None), ReturnCode::OK);
     assert!(gzip.gzhead().is_none());
-    assert_eq!(deflate_end(gzip), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut gzip), ReturnCode::OK);
 }
 
 /// Out-of-range initialisation arguments are refused, and the in-range edge cases are not.
@@ -3934,16 +4023,16 @@ fn initialisation_validates_every_argument() {
     }
 
     // windowBits 8 is accepted and promoted to 9.
-    let (promoted, _) = open(6, 8, DEF_MEM_LEVEL, Strategy::Default);
+    let (mut promoted, _) = open(6, 8, DEF_MEM_LEVEL, Strategy::Default);
     assert_eq!(
         promoted.w_bits(),
         9,
         "deflate.c L438 promotes windowBits 8 to 9 rather than refusing it"
     );
-    assert_eq!(deflate_end(promoted), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut promoted), ReturnCode::OK);
 
     // Z_DEFAULT_COMPRESSION resolves to 6.
-    let (defaulted, _) = open(
+    let (mut defaulted, _) = open(
         Z_DEFAULT_COMPRESSION,
         ZLIB,
         DEF_MEM_LEVEL,
@@ -3954,32 +4043,32 @@ fn initialisation_validates_every_argument() {
         6,
         "deflate.c L432: Z_DEFAULT_COMPRESSION is level 6"
     );
-    assert_eq!(deflate_end(defaulted), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut defaulted), ReturnCode::OK);
 
     // Every level, every strategy and both memory-level endpoints are accepted -- swept
     // independently rather than as a cross product, for the reason given in
     // `a_new_state_reports_the_geometry_its_arguments_imply`.
     for level in 0..=9i32 {
-        let (state, _) = open(level, ZLIB, DEF_MEM_LEVEL, Strategy::Default);
+        let (mut state, _) = open(level, ZLIB, DEF_MEM_LEVEL, Strategy::Default);
         assert_eq!(
             state.level(),
             level,
             "level {level} must be accepted verbatim"
         );
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     }
     for strategy in Strategy::ALL {
-        let (state, _) = open(6, ZLIB, DEF_MEM_LEVEL, strategy);
+        let (mut state, _) = open(6, ZLIB, DEF_MEM_LEVEL, strategy);
         assert_eq!(
             state.strategy(),
             strategy,
             "{strategy:?} must be accepted verbatim"
         );
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     }
     for mem_level in [MIN_MEM_LEVEL, MAX_MEM_LEVEL] {
-        let (state, _) = open(6, ZLIB, mem_level, Strategy::Default);
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        let (mut state, _) = open(6, ZLIB, mem_level, Strategy::Default);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     }
 }
 
@@ -4021,7 +4110,7 @@ fn a_stream_with_impossible_cursors_is_refused() {
             "and neither does an output cursor past the end of its slice"
         );
     }
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
 }
 
 // =============================================================================================
@@ -4234,7 +4323,7 @@ fn a_stream_decodes_only_through_its_own_container() {
         );
         assert!(stream.msg.is_some(), "and the reason must be recorded");
     }
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
     // A gzip stream offered to a zlib decoder: also rejected, for the same reason.
     let mut state = inflate_init2(InflateConfig::new(ZLIB), GlobalAllocator).unwrap();
@@ -4248,7 +4337,7 @@ fn a_stream_decodes_only_through_its_own_container() {
             "1f 8b is not a valid zlib header word"
         );
     }
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
     // windowBits + 32 asks inflate to detect zlib or gzip automatically (`zlib.h` L878-L881), and
     // must accept the gzip stream a fixed gzip decoder accepts.
@@ -4447,7 +4536,7 @@ fn a_caller_supplied_allocator_is_used_and_balanced() {
             );
             stream.next_out
         };
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
         out.truncate(produced);
 
         assert_eq!(

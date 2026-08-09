@@ -86,8 +86,8 @@
 //! One externally visible consequence follows, and this module is the
 //! authority for it: because the port has no dynamic CRC table, bit 13 of
 //! `zlibCompileFlags()` -- `DYNAMIC_CRC_TABLE` -- must be reported CLEAR, which
-//! is the honest answer. The planned `crates/libz-rs-sys/src/util.rs` is where
-//! that bit will be computed. The bit describes the initialisation strategy and
+//! is the honest answer. `crates/libz-rs-sys/src/util.rs` computes that bit and
+//! reports it clear. The bit describes the initialisation strategy and
 //! nothing else: a dynamically built table holds exactly these values, so no
 //! checksum and no compressed byte differs between the two configurations.
 

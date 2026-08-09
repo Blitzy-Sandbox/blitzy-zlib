@@ -110,19 +110,18 @@
 
 use core::ffi::{c_int, c_uint};
 
-use alloc::vec::Vec;
-
 use crate::allocate::{Allocator, Buffer};
 use crate::config::{InflateConfig, Z_NO_FLUSH};
 use crate::error::ReturnCode;
 use crate::gz::header::looks_like_gzip;
 use crate::gz::open::gz_reset;
 use crate::gz::state::{
-    GzEngine, GzHandle, GzHow, GzIoError, GzSeekFrom, GzState, GzStream, ZOff64, COPY, GZIP,
-    GZ_READ, GZ_WRITE, LOOK,
+    split_buffers, GzEngine, GzHandle, GzHow, GzIoError, GzSeekFrom, GzState, GzStream, ZOff64,
+    COPY, GZIP, GZ_READ, GZ_WRITE, LOOK,
 };
 use crate::gz::{errno_message, gt_off, gz_error};
 use crate::inflate::{inflate, inflate_end, inflate_init2, inflate_reset, InflateStream};
+use crate::read_buf::OutputRegion;
 
 /// The largest number of bytes one call to the handle may be asked for.
 ///
@@ -299,7 +298,13 @@ pub(crate) enum LoadTarget<'buf> {
         len: usize,
     },
     /// The caller's own buffer: `gz_read`'s large-request transparent call (`gzread.c` L369).
-    User(&'buf mut [u8]),
+    ///
+    /// An [`OutputRegion`] rather than a `&mut [u8]`, because a C caller's buffer is
+    /// guaranteed writable and nothing more. This is the one destination in the module that
+    /// the operating system writes into rather than this crate, so it is also the one that
+    /// goes through [`OutputRegion::writable_bytes`]; that method documents the single extra
+    /// pass write-only storage costs here and why no other path pays it.
+    User(OutputRegion<'buf>),
 }
 
 /// Where `gz_decomp` sends the bytes the engine produces.
@@ -314,7 +319,11 @@ pub(crate) enum DecompTarget<'buf> {
     /// The caller's buffer. Nothing is published: the count comes back in [`Progress::count`],
     /// which is what C's caller reads out of `x.have` before immediately zeroing it
     /// (`gzread.c` L376-L377).
-    User(&'buf mut [u8]),
+    ///
+    /// An [`OutputRegion`] rather than a `&mut [u8]`, because a C caller's buffer is
+    /// guaranteed writable and nothing more; the decoder writes through it and reads back
+    /// only what it has written itself.
+    User(OutputRegion<'buf>),
 }
 
 /// What one call to the handle's `read` sequence observed.
@@ -346,23 +355,28 @@ struct ReadOutcome {
 /// means the requested window does not lie inside the buffer it names, which C cannot express and
 /// this implementation reports as a corrupt state rather than trusting.
 fn resolve_load_window<'buf, 'alloc>(
-    target: LoadTarget<'buf>,
-    input: &'buf mut Option<Buffer<'alloc, u8>>,
-    output: &'buf mut Option<Buffer<'alloc, u8>>,
+    target: &'buf mut LoadTarget<'_>,
+    input: Option<&'buf mut Buffer<'alloc, u8>>,
+    output: Option<&'buf mut Buffer<'alloc, u8>>,
 ) -> Option<&'buf mut [u8]> {
     match target {
         LoadTarget::Input { offset, len } => {
+            let (offset, len) = (*offset, *len);
             let end = offset.checked_add(len)?;
             input
-                .as_mut()
                 .map_or(&mut [][..], Buffer::as_mut_slice)
                 .get_mut(offset..end)
         }
         LoadTarget::Output { len } => output
-            .as_mut()
             .map_or(&mut [][..], Buffer::as_mut_slice)
-            .get_mut(..len),
-        LoadTarget::User(buffer) => Some(buffer),
+            .get_mut(..*len),
+        LoadTarget::User(region) => {
+            // The window *is* the sub-region `gz_read` carved out, so the whole of it is
+            // offered. For write-only storage this is where the range is initialised before
+            // the handle writes into it; see `OutputRegion::writable_bytes`.
+            let len = region.len();
+            region.writable_bytes(0, len)
+        }
     }
 }
 
@@ -380,8 +394,14 @@ fn resolve_load_window<'buf, 'alloc>(
 ///
 /// A handle that returns more bytes than the window it was given cannot move the cursor past the
 /// window: the count is clamped. C has no equivalent because `read` is trusted, but here the handle
-/// is an injected trait object and the clamp costs nothing.
-fn read_into(handle: &mut (dyn GzHandle + '_), buffer: &mut [u8]) -> ReadOutcome {
+/// may be an injected trait object and the clamp costs nothing.
+///
+/// Generic over the handle, and `?Sized` so that both a
+/// [`GzHandleRef`](crate::gz::state::GzHandleRef) -- which dispatches by variant -- and a bare
+/// `dyn GzHandle` are accepted. Taking `&mut dyn GzHandle` instead would force every caller back
+/// through a vtable, which is precisely what [`GzHandleRef`](crate::gz::state::GzHandleRef) exists
+/// to avoid.
+fn read_into<H: GzHandle + ?Sized>(handle: &mut H, buffer: &mut [u8]) -> ReadOutcome {
     let max = widen(MAX_READ_CHUNK);
     let len = buffer.len();
     let mut have = 0_usize;
@@ -451,20 +471,19 @@ fn read_into(handle: &mut (dyn GzHandle + '_), buffer: &mut [u8]) -> ReadOutcome
 /// anything, only to render a message, and it takes the value from the failure the handle reported.
 pub(crate) fn gz_load<'a, A: Allocator<'a>>(
     state: &mut GzState<'a, A>,
-    target: LoadTarget<'_>,
+    mut target: LoadTarget<'_>,
 ) -> Progress {
     let outcome = {
         // `handle`, `input` and `output` are distinct fields, so these borrows are disjoint.
         let GzState {
             handle,
-            input,
-            output,
+            buffer_slot,
             ..
         } = state;
+        let (input, output) = split_buffers(buffer_slot);
         match handle.handle_mut() {
-            Some(handle) => {
-                resolve_load_window(target, input, output).map(|window| read_into(handle, window))
-            }
+            Some(mut handle) => resolve_load_window(&mut target, input, output)
+                .map(|window| read_into(&mut handle, window)),
             None => None,
         }
     };
@@ -730,16 +749,14 @@ pub(crate) fn gz_look<'a, A: Allocator<'a> + Copy>(
     // L161-L166: copy the leftover input into the output buffer, which is the larger of the two.
     {
         let GzState {
-            input,
-            output,
-            strm,
-            ..
+            buffer_slot, strm, ..
         } = state;
+        let (input, output) = split_buffers(buffer_slot);
         let len = widen(strm.avail_in);
         let start = strm.next_in;
         let end = start.saturating_add(len);
-        let source = input.as_ref().map_or(&[][..], Buffer::as_slice);
-        let destination = output.as_mut().map_or(&mut [][..], Buffer::as_mut_slice);
+        let source = input.map_or(&[][..], |buffer| buffer.as_slice());
+        let destination = output.map_or(&mut [][..], Buffer::as_mut_slice);
         let (Some(source), Some(destination)) =
             (source.get(start..end), destination.get_mut(..len))
         else {
@@ -785,11 +802,9 @@ fn inflate_step<'a, A: Allocator<'a> + Copy>(
     target: &mut DecompTarget<'_>,
 ) -> Result<ReturnCode, ReturnCode> {
     let GzState {
-        input,
-        output,
-        strm,
-        ..
+        buffer_slot, strm, ..
     } = state;
+    let (input, output) = split_buffers(buffer_slot);
     let GzStream {
         avail_in,
         next_in,
@@ -810,34 +825,38 @@ fn inflate_step<'a, A: Allocator<'a> + Copy>(
 
     let in_end = next_in.saturating_add(widen(*avail_in));
     let Some(source) = input
-        .as_ref()
-        .map_or(&[][..], Buffer::as_slice)
+        .map_or(&[][..], |buffer| buffer.as_slice())
         .get(..in_end)
     else {
         return Err(ReturnCode::STREAM_ERROR);
     };
 
-    let out_end = next_out.saturating_add(widen(*avail_out));
+    // ★ The window starts **at** `next_out` and the stream's own cursor starts at zero, which
+    // is what C's advancing `strm->next_out` pointer amounts to. Two things follow, and both
+    // matter: the decoder's two read-backs of its own output -- the check value at
+    // `inflate.c` L1080 and the window update at L1136 -- span exactly this call's output,
+    // and every write a write-only sub-region receives lands at or after its own base, which
+    // is what keeps [`OutputRegion`]'s high-water promise exact.
+    let room = widen(*avail_out);
     let destination = match target {
         DecompTarget::Internal => output
-            .as_mut()
             .map_or(&mut [][..], Buffer::as_mut_slice)
-            .get_mut(..out_end),
-        DecompTarget::User(buffer) => buffer.get_mut(..out_end),
+            .get_mut(*next_out..next_out.saturating_add(room))
+            .map(OutputRegion::init),
+        DecompTarget::User(region) => Some(region.reborrow(*next_out, room)),
     };
     let Some(destination) = destination else {
         return Err(ReturnCode::STREAM_ERROR);
     };
 
-    let mut stream = InflateStream::new(source, destination);
+    let mut stream = InflateStream::with_region(source, destination);
     stream.next_in = *next_in;
-    stream.next_out = *next_out;
     stream.msg = *msg;
 
     let ret = inflate(engine, &mut stream, Z_NO_FLUSH);
 
     *next_in = stream.next_in;
-    *next_out = stream.next_out;
+    *next_out = next_out.saturating_add(stream.next_out);
     // Both counts shrank from values that already fitted in a `c_uint`, so neither narrowing can
     // fail; reporting beats silently substituting a different count.
     *avail_in = narrow(stream.avail_in()).ok_or(ReturnCode::STREAM_ERROR)?;
@@ -1106,9 +1125,9 @@ pub(crate) fn gz_skip<'a, A: Allocator<'a> + Copy>(
 /// decompresses straight into `buf` (L367-L378).
 pub(crate) fn gz_read<'a, A: Allocator<'a> + Copy>(
     state: &mut GzState<'a, A>,
-    buf: &mut [u8],
+    dest: &mut OutputRegion<'_>,
 ) -> usize {
-    let mut len = buf.len();
+    let mut len = dest.len();
     if len == 0 {
         return 0;
     }
@@ -1133,13 +1152,11 @@ pub(crate) fn gz_read<'a, A: Allocator<'a> + Copy>(
             // L339-L349: first just try copying data from the output buffer.
             n = n.min(widen(state.have()));
             let end = offset.saturating_add(n);
-            let copied = match (buf.get_mut(offset..end), state.available_out().get(..n)) {
-                (Some(destination), Some(source)) => {
-                    destination.copy_from_slice(source);
-                    true
-                }
-                _ => false,
+            let copied = match state.available_out().get(..n) {
+                Some(source) => dest.write_slice_at(offset, source),
+                None => false,
             };
+            let _ = end;
             if !copied || state.advance_out(n).is_err() {
                 // Unreachable: `n` is clamped to both `have` and the space left in `buf`.
                 break;
@@ -1161,10 +1178,10 @@ pub(crate) fn gz_read<'a, A: Allocator<'a> + Copy>(
             refilled = true;
         } else if state.how() == COPY {
             // L367-L369: large request, transparent stream -- read straight into the user buffer.
-            let end = offset.saturating_add(n);
-            let Some(window) = buf.get_mut(offset..end) else {
+            let window = dest.reborrow(offset, n);
+            if window.len() != n {
                 break;
-            };
+            }
             let progress = gz_load(state, LoadTarget::User(window));
             n = widen(progress.count);
             if progress.result.is_err() {
@@ -1178,10 +1195,10 @@ pub(crate) fn gz_read<'a, A: Allocator<'a> + Copy>(
             let stream = state.stream_mut();
             stream.avail_out = avail_out;
             stream.next_out = 0;
-            let end = offset.saturating_add(n);
-            let Some(window) = buf.get_mut(offset..end) else {
+            let window = dest.reborrow(offset, n);
+            if window.len() != n {
                 break;
-            };
+            }
             let progress = gz_decomp(state, DecompTarget::User(window));
             // L376-L377: `n = state->x.have; state->x.have = 0;`. The count comes back as a value
             // because nothing was published into the layer's own buffer; clearing the pair keeps the
@@ -1261,17 +1278,30 @@ fn enter_read<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> bool {
 /// The `Z_BUF_ERROR` `gz_decomp` recorded stays recorded, `gzerror` can be consulted for it, and
 /// `gzclose` is what finally returns it.
 pub fn gzread<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>, buf: &mut [u8]) -> c_int {
+    gzread_into(state, &mut OutputRegion::init(buf))
+}
+
+/// [`gzread`] over a destination that may be write-only storage.
+///
+/// The entry point `crates/libz-rs-sys` uses, because a C caller's `buf` is guaranteed
+/// writable and nothing more -- `zlib.h` L1456-L1463 asks for `len` bytes of room and says
+/// nothing about their contents. Identical in behaviour to [`gzread`], which is a one-line
+/// forwarder to it over an [`OutputRegion::init`].
+pub fn gzread_into<'a, A: Allocator<'a> + Copy>(
+    state: &mut GzState<'a, A>,
+    dest: &mut OutputRegion<'_>,
+) -> c_int {
     if !enter_read(state) {
         return -1;
     }
 
-    if !request_fits_in_int(buf.len()) {
+    if !request_fits_in_int(dest.len()) {
         gz_error(state, ReturnCode::STREAM_ERROR, Some(REQUEST_EXCEEDS_INT));
         state.refresh_exposed();
         return -1;
     }
 
-    let got = gz_read(state, buf);
+    let got = gz_read(state, dest);
 
     if got == 0 {
         if !err_permits_reading(state.err()) {
@@ -1328,6 +1358,19 @@ pub fn gzfread<'a, A: Allocator<'a> + Copy>(
     size: usize,
     nitems: usize,
 ) -> usize {
+    gzfread_into(state, &mut OutputRegion::init(buf), size, nitems)
+}
+
+/// [`gzfread`] over a destination that may be write-only storage.
+///
+/// The entry point `crates/libz-rs-sys` uses; see [`gzread_into`] for why the shape differs
+/// from the slice form, which forwards to this one unchanged.
+pub fn gzfread_into<'a, A: Allocator<'a> + Copy>(
+    state: &mut GzState<'a, A>,
+    dest: &mut OutputRegion<'_>,
+    size: usize,
+    nitems: usize,
+) -> usize {
     if !enter_read(state) {
         return 0;
     }
@@ -1351,12 +1394,13 @@ pub fn gzfread<'a, A: Allocator<'a> + Copy>(
     // alternative and it is worse than refusing: the read would succeed, the stream would advance,
     // and the caller would receive an item count that is indistinguishable from end of file while
     // the bytes it asked for were never delivered.
-    let Some(window) = buf.get_mut(..len) else {
+    let mut window = dest.reborrow(0, len);
+    if window.len() != len {
         gz_error(state, ReturnCode::STREAM_ERROR, Some(REQUEST_PAST_BUFFER));
         state.refresh_exposed();
         return 0;
-    };
-    let got = gz_read(state, window);
+    }
+    let got = gz_read(state, &mut window);
     state.refresh_exposed();
     got / size
 }
@@ -1396,7 +1440,7 @@ pub fn gzgetc<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>) -> c_int 
 
     // L496-L497: nothing there -- try `gz_read`.
     let mut buf = [0_u8; 1];
-    let got = gz_read(state, &mut buf);
+    let got = gz_read(state, &mut OutputRegion::init(&mut buf));
     state.refresh_exposed();
     match buf.first() {
         Some(&byte) if got >= 1 => c_int::from(byte),
@@ -1574,8 +1618,21 @@ pub fn gzgets<'a, A: Allocator<'a> + Copy>(
     state: &mut GzState<'a, A>,
     buf: &mut [u8],
 ) -> Option<usize> {
-    // L572-L578: C's `buf == NULL || len < 1`. An empty slice is both.
-    if buf.is_empty() {
+    gzgets_into(state, &mut OutputRegion::init(buf))
+}
+
+/// [`gzgets`] over a destination that may be write-only storage.
+///
+/// The entry point `crates/libz-rs-sys` uses; see [`gzread_into`] for why the shape differs
+/// from the slice form, which forwards to this one unchanged. Nothing here reads the
+/// destination back: the newline is looked for in the layer's own output buffer, exactly as
+/// `gzread.c` L602-L606 does, so the caller's bytes are only ever written.
+pub fn gzgets_into<'a, A: Allocator<'a> + Copy>(
+    state: &mut GzState<'a, A>,
+    dest: &mut OutputRegion<'_>,
+) -> Option<usize> {
+    // L572-L578: C's `buf == NULL || len < 1`. An empty region is both.
+    if dest.is_empty() {
         return None;
     }
     if !enter_read(state) {
@@ -1588,7 +1645,7 @@ pub fn gzgets<'a, A: Allocator<'a> + Copy>(
     }
 
     let mut written = 0_usize;
-    let mut left = buf.len().saturating_sub(1);
+    let mut left = dest.len().saturating_sub(1);
 
     while left != 0 {
         if state.have() == 0 && gz_fetch(state).is_err() {
@@ -1613,12 +1670,9 @@ pub fn gzgets<'a, A: Allocator<'a> + Copy>(
 
         // L608-L614: copy through the end of the line, or the whole window if there was none.
         let end = written.saturating_add(n);
-        let copied = match (buf.get_mut(written..end), state.available_out().get(..n)) {
-            (Some(destination), Some(source)) => {
-                destination.copy_from_slice(source);
-                true
-            }
-            _ => false,
+        let copied = match state.available_out().get(..n) {
+            Some(source) => dest.write_slice_at(written, source),
+            None => false,
         };
         if !copied || state.advance_out(n).is_err() {
             // Unreachable: `n` is at most `left`, which is what remains of `buf`, and at most
@@ -1639,9 +1693,8 @@ pub fn gzgets<'a, A: Allocator<'a> + Copy>(
         state.refresh_exposed();
         return None;
     }
-    if let Some(slot) = buf.get_mut(written) {
-        *slot = 0;
-    }
+    // L620: `buf[written] = 0;` -- the terminator, which is why `left` was `len - 1`.
+    dest.write_byte_at(written, 0);
     state.refresh_exposed();
     Some(written)
 }
@@ -1673,9 +1726,9 @@ pub fn gzclose_r<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>) -> Ret
     // L656-L661: free memory. `size != 0` is exactly "the buffers and the engine exist".
     if state.size() != 0 {
         if let GzEngine::Inflate(boxed) = state.take_engine() {
-            if let Some(engine) = boxed.into_inner() {
+            if let Some(mut engine) = boxed.into_inner() {
                 // `inflateEnd` cannot fail for an owned state; C ignores its result too.
-                let _ = inflate_end(engine);
+                let _ = inflate_end(&mut engine);
             }
         }
         state.release_buffers();
@@ -1688,7 +1741,7 @@ pub fn gzclose_r<'a, A: Allocator<'a> + Copy>(state: &mut GzState<'a, A>) -> Ret
         ReturnCode::OK
     };
     gz_error(state, ReturnCode::OK, None);
-    state.path = Vec::new();
+    state.clear_path();
 
     // L665: `ret = close(state->fd);`. `GzFileSlot::close` reports the underlying handle's
     // result unchanged, so a facade handle backed by a real `close(2)` answers `Z_ERRNO` exactly
@@ -1725,7 +1778,7 @@ pub fn gzrewind<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> c_int {
 
     let start = state.start();
     let sought = match state.handle_mut() {
-        Some(handle) => handle.seek(start, GzSeekFrom::Start).is_ok(),
+        Some(mut handle) => handle.seek(start, GzSeekFrom::Start).is_ok(),
         None => false,
     };
     if !sought {
@@ -1850,7 +1903,7 @@ pub fn gzseek64<'a, A: Allocator<'a>>(
             return -1;
         };
         let sought = match state.handle_mut() {
-            Some(handle) => handle.seek(delta, GzSeekFrom::Current).is_ok(),
+            Some(mut handle) => handle.seek(delta, GzSeekFrom::Current).is_ok(),
             None => false,
         };
         if !sought {
@@ -1965,7 +2018,7 @@ pub fn gzoffset64<'a, A: Allocator<'a>>(state: &mut GzState<'a, A>) -> ZOff64 {
     }
 
     let offset = match state.handle_mut() {
-        Some(handle) => handle.seek(0, GzSeekFrom::Current),
+        Some(mut handle) => handle.seek(0, GzSeekFrom::Current),
         None => return -1,
     };
     let Ok(offset) = offset else {

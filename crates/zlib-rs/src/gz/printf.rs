@@ -15,41 +15,67 @@
 //! Keeping the argument list there is not a convenience -- it is the only arrangement the safety
 //! posture allows.
 //!
-//! # UNRESOLVED: how the facade obtains the argument list at the declared MSRV
+//! # SETTLED: how the facade obtains the argument list at the declared MSRV
 //!
-//! The split above is settled. **The mechanism the facade uses for the middle step is not, and this
-//! module must not be read as promising one.**
+//! The split above is settled, and so is the mechanism for the middle step. It was an open question
+//! when this module was written; option 1 below was chosen, it is built, and it is call-tested.
+//! **Read the resolution at the end of this section together with the constraints, because the
+//! trade-off it accepts is real and is stated there.**
 //!
 //! The obstacle is concrete. `core::ffi::VaList` and `VaListImpl` are unstable
 //! (`feature(c_variadic)`), so a `#[no_mangle] pub extern "C" fn gzvprintf(..., va: VaList)` cannot
 //! be written on stable Rust at all -- and this workspace declares `rust-version = "1.80"` with a
 //! stable toolchain, so nightly is not available to it. `gzprintf` is worse: it is genuinely
 //! variadic (`zlib.h` L1549), and stable Rust cannot *define* a variadic function in any form.
+//! Guessing a `va_list` layout and forwarding it as an opaque pointer is not a way out either:
+//! the type is `__va_list_tag[1]` on x86-64 SysV, a by-value struct on AArch64 AAPCS64 and a
+//! `char *` on i386, so one Rust declaration cannot be correct on all three.
 //!
-//! What the code snippet below shows is the *shape* of the call, with `vsnprintf` and `va` standing
-//! in for whatever mechanism is chosen. It is not an implementation, and no such implementation
-//! exists in this repository yet.
+//! The code snippet below shows the *shape* of the call. The three candidate approaches were:
 //!
-//! The candidate approaches, none of which has been built or call-tested here:
-//!
-//! 1. **A small C shim** compiled by `cc` and linked in, exporting `gzprintf`/`gzvprintf` and
-//!    forwarding the formatted result to this module's two halves. Works on stable, but reintroduces
-//!    a C translation unit into the shipped artifact, which cuts against the point of the port.
+//! 1. **A small C shim** exporting `gzprintf`/`gzvprintf` and forwarding the formatted result to
+//!    this module's two halves. Works on stable, but adds a C translation unit to the library.
 //! 2. **Raise the toolchain for these two symbols only** and use `feature(c_variadic)`. Contradicts
 //!    the declared MSRV and the stable-channel requirement.
 //! 3. **Omit both symbols.** Not an option: they are part of the frozen 95-symbol surface, and
 //!    `nm` parity would fail.
 //!
-//! Note also what a symbol-level gate can and cannot establish: `nm` proves a symbol is *present*.
-//! It cannot prove the variadic calling convention is right, because that is only exercised by an
+//! Note what a symbol-level gate can and cannot establish: `nm` proves a symbol is *present*. It
+//! cannot prove the variadic calling convention is right, because that is only exercised by an
 //! actual C call with actual varargs. So the acceptance evidence for these two functions has to be
 //! a compiled C caller that passes real arguments and checks the bytes written -- not a symbol diff.
 //!
-//! **Status: unresolved architecture blocker.** Whoever lands `crates/libz-rs-sys/src/gz.rs` must
-//! choose among the options above, or record a fourth, and must add that C-call test. Until then
-//! `gzprintf` and `gzvprintf` are the two exports with no viable implementation path on the
-//! declared toolchain, and any statement that the port covers 100% of `zlib.h` should carry that
-//! qualification.
+//! **Resolution: option 1, with the C translation unit kept out of the CARGO build.**
+//! `crates/libz-rs-sys/csrc/gzprintf_shim.c` owns nothing but `va_start`/`va_end` and `vsnprintf`,
+//! and calls the two `pub(crate)` adapters in `crates/libz-rs-sys/src/gz.rs` that wrap this module.
+//! It is compiled by the PACKAGING layer -- `Makefile.in`'s `rust` target, which already runs a C
+//! compiler to relink the archive through `zlib.map` -- and never by `build.rs`, so
+//! `cargo build --release` still works on a machine with no C toolchain (AAP §0.6.4.1). That is how
+//! option 1's cost is bounded: the shipped *shared library* carries one C translation unit, and the
+//! Rust build of the crate carries none.
+//!
+//! What the shim is, precisely: it DEFINES `gzprintf` and `gzvprintf`, so `va_start`/`va_end` stay
+//! the C compiler's business and are correct by construction on every target, and it runs
+//! `vsnprintf` into a bounded region this module hands it. It carries no accounting, no allocation,
+//! no error policy and no format parsing of its own -- everything that could get zlib's semantics
+//! wrong is here, in safe Rust, under test. The two halves meet through [`printf_begin`] and
+//! [`printf_commit`], which the facade re-exports as the hidden helpers `_zlib_rs_gzprintf_begin`
+//! and `_zlib_rs_gzprintf_commit`.
+//!
+//! The acceptance evidence this section demanded exists and is the required kind -- an actual C
+//! caller with actual varargs, not a symbol diff. `test/example.c` L109 calls
+//! `gzprintf(file, ", %s!", "hello")` and requires the return to be exactly 8, and
+//! `make rust-test` compiles that UNMODIFIED driver against the staged Rust library and runs it.
+//! Measured on both the configured and the unconfigured paths: `ldd` binds the staged library and
+//! the driver passes.
+//!
+//! ONE QUALIFICATION REMAINS, and it is about the artifact rather than the mechanism: a bare
+//! `cargo build` produces a library WITHOUT these two symbols, because nothing in that build
+//! compiles the shim. A caller of `gzprintf` linked against the cargo output gets an undefined
+//! reference. `make rust` is the command that produces the complete library, and
+//! `crates/libz-rs-sys/Cargo.toml` states the same distinction where a reader of the manifest will
+//! meet it.
+
 //!
 //! What is left behind, and lives here, is the part that actually matters for correctness: the
 //! guard chain, the double-sized input buffer's geometry, the overflow sentinel, and the
@@ -65,12 +91,14 @@
 //! | the `NO_vsnprintf` refusal and `ZLIB_INSECURE` opt-in | L404-L409, L457-L462 | `csrc/gzprintf_shim.c` |
 //! | the `!STDC && !Z_HAVE_STDARG_H` `snprintf` twin | L499-L596 | not implemented; see below |
 //!
-//! # The interface contract, for the author of the planned `crates/libz-rs-sys/src/gz.rs`
+//! # The interface contract, as implemented by `crates/libz-rs-sys/src/gz.rs`
 //!
-//! That file does not exist at this checkpoint, so everything below is an obligation on it rather
-//! than a description of code that can be read today. Everything needed to implement the exported
-//! `gzprintf` and `gzvprintf` against this module is stated here, so that file does not have to
-//! read this one's body.
+//! That file and `csrc/gzprintf_shim.c` now exist and discharge every obligation below; the
+//! contract is kept stated here in full because it is what the two of them are checked *against*,
+//! and because everything needed to implement the exported `gzprintf` and `gzvprintf` against this
+//! module is on this page -- neither file has to read this one's body. The facade side is the pair
+//! `_zlib_rs_gzprintf_begin` / `_zlib_rs_gzprintf_commit`, which wrap [`printf_begin`] and
+//! [`printf_commit`]; the shim is the only caller of either.
 //!
 //! The block below is fenced as `text`, not as ignored Rust: it names a `va_list` mechanism that
 //! stable Rust at this MSRV cannot spell, so it could never compile. An `ignore` fence would
@@ -78,7 +106,7 @@
 //! does not use anywhere -- there are no ignored doctests in it.
 //!
 //! ```text
-//! // ILLUSTRATIVE SHAPE ONLY -- see the unresolved-blocker note above. `va` stands for whatever
+//! // ILLUSTRATIVE SHAPE ONLY -- the real caller is `csrc/gzprintf_shim.c`. `va` stands for whatever
 //! // mechanism is chosen; stable Rust at this MSRV cannot name a `va_list` type.
 //! // Inside libz-rs-sys, where `unsafe` is permitted. The inner scope is what releases the
 //! // loan's borrow of `state` before the accounting needs the stream back.
@@ -156,11 +184,15 @@
 //! crate's business alone). The **packaging** layer compiles it, which is the same layer that
 //! already owns the `zlib.map` relink -- and it has to, because `--version-script` cannot be handed
 //! to rustc's own cdylib link at all, for the measured reasons `build.rs` documents above
-//! `emit_version_script`. `Makefile.in`'s `rust` target compiles the shim with `$(CC) $(SFLAGS)`,
-//! adds the object to the staged `libz.a`, and relinks the staged shared library from that archive
-//! with `$(LDSHARED)`, which `configure` already loads with
-//! `-Wl,-soname,libz.so.1,--version-script,${SRCDIR}zlib.map`. The CMake Rust path and the Rust CI
-//! workflow owe the same two steps.
+//! `reject_version_script_passthrough` (which is why that environment override is refused outright
+//! rather than honoured). `Makefile.in`'s `rust` target compiles the shim with
+//! `$(CC) $(SFLAGS) $(RUSTSHIMFLAGS)`, adds the object to the staged `libz.a`, and relinks the
+//! staged shared library from that archive with `$(RUSTLDSHARED)`. It does **not** depend on
+//! `configure` having loaded `LDSHARED` with the soname and version-script arguments: it inspects
+//! the link command and supplies whichever of `$(RUSTSHAREDFLAG)`, `$(RUSTSONAMEFLAG)` and
+//! `$(RUSTVERSIONSCRIPTFLAG)$(RUSTVERSIONSCRIPT)` is absent, so the relink is correct on a
+//! configured tree, on an unconfigured one, and on a target whose linker spells those flags
+//! differently. The CMake Rust path and the Rust CI workflow owe the same two steps.
 //!
 //! ## Symbol visibility -- verified, not assumed
 //!
@@ -246,8 +278,8 @@
 //!   `NO_vsnprintf` together with `ZLIB_INSECURE`, bit 27 for `NO_vsnprintf` without it, and bit 26
 //!   for the void-returning `HAS_vsprintf_void`/`HAS_vsnprintf_void` variants. This port has a
 //!   bounded formatter and no void-returning variant, so none of the three conditions holds.
-//!   The planned `crates/libz-rs-sys/src/util.rs` must **compute** that answer rather than copy
-//!   a measured constant (AAP §0.6.3.5) and should cite this module as the authority for it. Bit 24, which
+//!   `crates/libz-rs-sys/src/util.rs` **computes** that answer rather than copying a measured
+//!   constant, and cites this module as the authority for it. Bit 24, which
 //!   `zutil.c` L104 sets only in the non-`stdarg` branch, is likewise clear: the variadic entry
 //!   point the facade exports is the `stdarg` one.
 //! * **C's `#warning` stubs are unreachable here.** When no bounded formatter exists, C compiles

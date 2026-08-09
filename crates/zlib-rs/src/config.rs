@@ -1643,8 +1643,9 @@ impl Default for DeflateConfig {
 ///
 /// Making the fields `pub(crate)` behind read-only accessors would convert the
 /// hint into a guarantee, and it is the better design. It is not done here because
-/// the C ABI facade that consumes this type has not landed yet, so narrowing the
-/// surface now could break a consumer that cannot be inspected.
+/// the fields are read directly across the crate boundary, so narrowing the surface
+/// is a change to this type's public API and has to be made together with every
+/// consumer of it rather than from this file alone.
 ///
 /// `deflate/state.rs` derives the rest of the state layout from these five
 /// numbers, in the order `deflate.c` L447-L456 and L528-L530 do. The formula for the total

@@ -183,8 +183,8 @@
 //! the idiom callers are expected to write: `uLong crc = crc32(0L, Z_NULL, 0);`.
 //!
 //! A `&[u8]` cannot be null, so that case cannot arise in this crate at all; it is honoured one
-//! layer up, at the FFI boundary in the planned `crates/libz-rs-sys/src/checksum.rs`, which must answer a
-//! null pointer with `0` *without* calling in here. The asymmetry is worth stating precisely,
+//! layer up, at the FFI boundary in `crates/libz-rs-sys/src/checksum.rs`, which answers a null
+//! pointer with `0` *without* calling in here. The asymmetry is worth stating precisely,
 //! because it is the one place a faithful facade differs from a naive one: the C entry point
 //! returns the initial value regardless of the `crc` argument, so `crc32(5, Z_NULL, 0)` is `0`
 //! and not `5`.
@@ -220,10 +220,10 @@
 //!
 //! One externally visible consequence follows: because this port has no dynamic CRC table, bit 13
 //! of `zlibCompileFlags()` -- `DYNAMIC_CRC_TABLE` -- must be reported CLEAR, which is the honest
-//! answer. The planned `crates/libz-rs-sys/src/util.rs` is where that bit is computed, so that is
-//! where the requirement lands; the file has not been written yet. Note that the bit is about the
-//! *initialisation strategy* only: a dynamic table holds the same values, so neither checksums nor
-//! compressed output differ between the two configurations.
+//! answer. `crates/libz-rs-sys/src/util.rs` computes that bit and reports it clear for exactly
+//! this reason. Note that the bit is about the *initialisation strategy* only: a dynamic table
+//! holds the same values, so neither checksums nor compressed output differ between the two
+//! configurations.
 //!
 //! # Layering and safety posture
 //!
@@ -236,8 +236,10 @@
 //! this family -- `crc32`, `crc32_z`, `get_crc_table`, `crc32_combine`, `crc32_combine64`,
 //! `crc32_combine_gen`, `crc32_combine_gen64` and `crc32_combine_op`, all eight present in the
 //! reference library's dynamic symbol table -- are defined in
-//! the planned `crates/libz-rs-sys/src/checksum.rs`, which will call into this module. The separation is absolute:
-//! no item below may be given a stable exported symbol name, however convenient that might seem.
+//! `crates/libz-rs-sys`, which calls into this module: seven of them in its `checksum.rs`, and
+//! `get_crc_table` in its `util.rs` alongside the other introspection entry points. The separation
+//! is absolute: no item below may be given a stable exported symbol name, however convenient that
+//! might seem.
 //! Note that `zlib.map` does not hide any of the eight, since they are public API; the `local:`
 //! block at `zlib.map` L9-L19 hides internals of other subsystems. That is the facade's concern
 //! either way, and the internals named in the module map above stay crate-private here
@@ -543,7 +545,7 @@ type Selected = Braid;
 /// C entry point additionally answers a *null* pointer with the initial value `0` regardless of
 /// its `crc` argument (`crc32.c` L627-L628, `zlib.h` L1851-L1852), so `crc32(5, Z_NULL, 0)` is `0`
 /// while `crc32(5, &[])` is `5`. A slice cannot be null, so that case belongs to
-/// the planned `crates/libz-rs-sys/src/checksum.rs`; see the module documentation for the full table.
+/// `crates/libz-rs-sys/src/checksum.rs`; see the module documentation for the full table.
 ///
 /// # Which backend runs
 ///
@@ -574,7 +576,7 @@ pub fn crc32(start: u32, buf: &[u8]) -> u32 {
 /// length" -- and a Rust slice carries its own length, so that distinction disappears here. This
 /// function is an exact synonym for [`crc32`] and forwards to it unchanged.
 ///
-/// Both names are kept because the planned `crates/libz-rs-sys/src/checksum.rs` must export both C symbols
+/// Both names are kept because `crates/libz-rs-sys/src/checksum.rs` exports both C symbols
 /// from this one implementation, and because the reference sources call both from inside the
 /// library: `crc32` over input bytes at `deflate.c` L233, `crc32_z` over the pending buffer while
 /// computing a gzip header check at `deflate.c` L976 and L1111. Giving each C name a same-named
@@ -596,7 +598,7 @@ pub fn crc32_z(start: u32, buf: &[u8]) -> u32 {
 /// "to force the generation of the CRC tables in a threaded application".
 ///
 /// The safe core deliberately hands back a reference to the data rather than a raw pointer;
-/// the planned `crates/libz-rs-sys/src/checksum.rs` will convert this reference into the `const z_crc_t *` the C
+/// `crates/libz-rs-sys/src/util.rs` converts this reference into the `const z_crc_t *` the C
 /// signature promises, which is the only place a pointer needs to exist. The returned reference is
 /// `'static` and stable across calls: it borrows one compiler-materialized copy of
 /// [`CRC_TABLE`], not a fresh temporary.
@@ -609,8 +611,8 @@ pub fn crc32_z(start: u32, buf: &[u8]) -> u32 {
 /// first-use generation of the crc tables", so such a build must call `get_crc_table()` before
 /// letting a second thread near `crc32()`. Here the tables are `const` data, so this accessor is
 /// always valid, always returns the same address, and is safe to call from any thread at any time
-/// -- and bit 13 of `zlibCompileFlags()`, `DYNAMIC_CRC_TABLE`, must therefore be reported CLEAR by
-/// the planned `crates/libz-rs-sys/src/util.rs`, which is the honest answer for a `const` table.
+/// -- and bit 13 of `zlibCompileFlags()`, `DYNAMIC_CRC_TABLE`, is therefore reported CLEAR by
+/// `crates/libz-rs-sys/src/util.rs`, which is the honest answer for a `const` table.
 #[must_use]
 pub fn get_crc_table() -> &'static [u32; 256] {
     // `crc32.c` L486: `return (const z_crc_t FAR *)crc_table;`. Borrowing a `const` array promotes
@@ -635,8 +637,9 @@ mod tests {
 
     /// Smallest input for which the braided path is entered, `crc32.c` L640.
     ///
-    /// 47 where `W` is 8 and 19 where it is 4. Computed from the sibling module's constants rather
-    /// than written out, so the boundary sweep below tracks the real threshold on either target.
+    /// With `N == 5`: 47 where `W` is 8, and 23 where it is 4. Computed from the sibling module's
+    /// constants rather than written out, so the boundary sweep below tracks the real threshold on
+    /// either target.
     const MIN_BRAID_LEN: usize = N * W + W - 1;
 
     /// The threshold really is the one `crc32.c` L640 computes, on either word width.
@@ -644,9 +647,13 @@ mod tests {
     /// Checked at compile time rather than inside a test body, because a runtime assertion over
     /// constants is dead weight the compiler folds away -- and because a wrong value here would
     /// silently move the boundary sweep off the boundary it exists to straddle.
+    ///
+    /// Both arms are spelled out rather than restating `N * W + W - 1`, which would make the
+    /// assertion a tautology. `W` is 8 only where the pointer width is 64
+    /// (`crate::crc32::tables`), so on a 32-bit target the answer is `5 * 4 + 4 - 1 == 23`.
     const _: () = assert!(
-        MIN_BRAID_LEN == 47 || MIN_BRAID_LEN == 19,
-        "crc32.c L640: N * W + W - 1 is 47 where W is 8 and 19 where W is 4"
+        MIN_BRAID_LEN == 47 || MIN_BRAID_LEN == 23,
+        "crc32.c L640: with N == 5, N * W + W - 1 is 47 where W is 8 and 23 where W is 4"
     );
 
     /// Length of the deterministic pattern fixture the sweeps run over.

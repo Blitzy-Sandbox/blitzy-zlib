@@ -2,8 +2,8 @@
 //! from `trees.c` and `trees.h`.
 //!
 //! This subsystem owns three of the eight decision points that determine whether the
-//! port's compressed output is byte-identical to the reference implementation's
-//! (AAP §0.6.2), so it is one of the highest-value suites in this folder:
+//! port's compressed output is byte-identical to the reference implementation's, so it is
+//! one of the highest-value suites in this folder:
 //!
 //! | # | Decision point | Oracle |
 //! |---|---|---|
@@ -38,10 +38,10 @@
 //! `pub(crate)` items are invisible to it.
 //!
 //! That visibility is not an oversight to be worked around. It mirrors the `local`
-//! linkage of the C sources and the `local:` block of `zlib.map`, and
-//! `crates/libz-rs-sys/tests/symbol_parity.rs` asserts the resulting export surface
-//! against the reference library's 111-symbol baseline. **Widening any of those items to
-//! `pub` in order to test it from here would break that contract.** Do not do it.
+//! linkage of the C sources and the `local:` block of `zlib.map`, and `Makefile.in`'s
+//! `rust-symbols` target compares the resulting export surface against the reference
+//! library's 111-symbol baseline. **Widening any of those items to `pub` in order to test
+//! it from here would break that contract.** Do not do it.
 //!
 //! The coverage is therefore split, deliberately, in two:
 //!
@@ -79,8 +79,9 @@
 //! # What this suite deliberately does not do
 //!
 //! Element-for-element comparison of the ported Rust tables against the C arrays
-//! themselves belongs to `crates/zlib-rs-differential/tests/table_equality.rs`, which can
-//! link the C oracle. It is not duplicated here. What is asserted instead is stronger in
+//! themselves belongs to a table-equality suite under `crates/zlib-rs-differential`, the
+//! crate that can link the C oracle; no such suite is in the tree, so that comparison has
+//! not been made. It is not duplicated here either. What is asserted instead is stronger in
 //! one respect and weaker in another: every claim below is derived from RFC 1951 §3.2.3
 //! to §3.2.6 or from `doc/txtvsbin.txt`, i.e. from a normative text rather than from a
 //! transcription, so a table that was transcribed wrongly *and* compared against the same
@@ -88,17 +89,17 @@
 //!
 //! # Constraints
 //!
-//! * No `unsafe` and no FFI. The crate under test carries `#![forbid(unsafe_code)]`
-//!   (AAP §0.7.1(a)); its tests hold to the same standard.
+//! * No `unsafe` and no FFI. The crate under test carries `#![forbid(unsafe_code)]`;
+//!   its tests hold to the same standard.
 //! * No third-party crates. `crates/zlib-rs/Cargo.toml` has an empty `[dependencies]`
 //!   and declares no `[dev-dependencies]`, and the `[bans]` section of `deny.toml` names
-//!   that table as the enforcement point (AAP §0.7.1(i)). Only `core`, `alloc`, `std`,
+//!   that table as the enforcement point. Only `core`, `alloc`, `std`,
 //!   `zlib_rs` and the shared [`common`] module are available; pseudo-random filler comes
 //!   from `common::lcg_fill` rather than from `rand`.
 //! * No `#![no_std]`. The library is `#![cfg_attr(not(feature = "std"), no_std)]`, but an
 //!   integration test is its own crate and links `std` unconditionally.
 //! * Every sweep is bounded, because this suite must also run under
-//!   `cargo +nightly miri test -p zlib-rs --test trees` (AAP §0.7.1(d)). The one
+//!   `cargo +nightly miri test -p zlib-rs --test trees`. The one
 //!   unbounded-in-spirit matrix is split into a small unconditional core and a
 //!   `#[cfg_attr(miri, ignore)]` full sweep; see the round-trip section.
 //! * Imports use **module paths**, never crate-root re-exports: `zlib-rs` declares
@@ -226,8 +227,8 @@ const GRAY_LIST: [u8; 6] = [7, 8, 11, 12, 26, 27];
 ///
 /// Long enough to carry a mixture of literals and matches through `_tr_tally` and to make
 /// `build_tree` construct a tree with real depth, short enough that a sweep of a hundred-odd
-/// configurations finishes in an interpreted run. AAP §0.7.1(d) requires every sweep here to
-/// be bounded, and together with [`small_raw_config`] this is what bounds them.
+/// configurations finishes in an interpreted run. Every sweep here has to be bounded so the
+/// suite stays Miri-runnable, and together with [`small_raw_config`] this is what bounds them.
 ///
 /// The larger payload classes are not lost -- they are covered by the tests marked
 /// `#[cfg_attr(miri, ignore)]`, each of which says so.
@@ -405,8 +406,8 @@ fn raw_config(level: i32, strategy: Strategy) -> DeflateConfig {
 /// back uninitialised memory. At this size the same state is under 4 `KiB`. Natively the
 /// difference is invisible; under Miri, where each of those bytes is interpreted and carries
 /// provenance, it is the difference between a suite that runs in seconds and one that does
-/// not finish. AAP §0.7.1(d) requires every sweep here to be bounded, and this is how the
-/// high-cardinality ones are bounded.
+/// not finish. Every sweep here has to be bounded so the suite stays Miri-runnable, and this
+/// is how the high-cardinality ones are bounded.
 fn small_raw_config(level: i32, strategy: Strategy) -> DeflateConfig {
     DeflateConfig {
         level,
@@ -463,7 +464,7 @@ fn compress_whole(input: &[u8], config: DeflateConfig) -> Compressed {
     // `Z_OK` rather than `Z_DATA_ERROR`, because `Z_FINISH` left the state in
     // `FINISH_STATE` and not `BUSY_STATE` (`deflate.c` L1309).
     assert_eq!(
-        deflate_end(state),
+        deflate_end(&mut state),
         ReturnCode::OK,
         "deflateEnd after Z_STREAM_END reports success"
     );
@@ -511,7 +512,7 @@ fn inflate_raw_with(stream: &[u8], expected_len: usize, window_bits: i32) -> Vec
         );
         view.next_out
     };
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
     out.truncate(produced);
     out
@@ -539,7 +540,7 @@ fn inflate_raw_fragment(fragment: &[u8], room: usize, window_bits: i32) -> Vec<u
         );
         view.next_out
     };
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
     out.truncate(produced);
     out
@@ -1002,12 +1003,12 @@ fn length_code_and_base_length_tile_the_normalised_length_range() {
 //     else if (static_lenb == opt_lenb)               -> STATIC_TREES
 //     else                                            -> DYN_TREES
 //
-// Those are integer-truncating comparisons on unsigned bit counts. AAP §0.6.2 #8 requires
-// identical integer arithmetic -- no floating point, no algebraic reordering -- so the
-// tests below assert the *outcome* on inputs chosen to land on each branch, which is the
-// only part of the computation an external caller can see. AAP §0.8.4 additionally
-// prohibits a "better" selection rule: if a future change makes any of these blocks
-// smaller by choosing differently, these assertions are what must fail.
+// Those are integer-truncating comparisons on unsigned bit counts. Reproducing the reference's
+// block-type choice requires identical integer arithmetic -- no floating point, no algebraic
+// reordering -- so the tests below assert the *outcome* on inputs chosen to land on each branch,
+// which is the only part of the computation an external caller can see. A "better" selection rule
+// is a defect here, not an improvement: if a future change makes any of these blocks smaller by
+// choosing differently, these assertions are what must fail.
 // =======================================================================================
 
 /// Incompressible input takes the stored branch, at every level.
@@ -1450,8 +1451,8 @@ fn huffman_only_and_rle_survive_an_empty_distance_alphabet() {
 /// the heap and never consults the window -- this is where that would show.
 ///
 /// **Ignored under Miri for interpreter speed only, never for correctness.** A state at the
-/// default size is roughly 256 `KiB`, every byte of which `GlobalAllocator` writes, so the
-/// 140-odd states this creates are minutes of native time and hours of interpreted time. The
+/// default size is roughly 256 `KiB`, every byte of which `GlobalAllocator` writes, and this
+/// test creates 140-odd of them -- affordable natively, far too expensive interpreted. The
 /// property itself is fully covered under Miri by the four tests above.
 #[test]
 #[cfg_attr(miri, ignore)]
@@ -1562,7 +1563,7 @@ fn inflate_byte_at_a_time(stream: &[u8], expected_len: usize, window_bits: i32) 
         );
         view.next_out
     };
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
     out.truncate(produced);
     out
@@ -2144,7 +2145,7 @@ fn compress_until_flush(input: &[u8], config: DeflateConfig, flush: i32) -> Vec<
         stream.next_out
     };
     assert_eq!(
-        deflate_end(state),
+        deflate_end(&mut state),
         ReturnCode::DATA_ERROR,
         "ending a BUSY stream reports Z_DATA_ERROR (deflate.c L1309)"
     );
@@ -2172,7 +2173,7 @@ fn compress_with_flush_then_finish(input: &[u8], flush: i32) -> (Vec<u8>, usize)
         );
         (mark, stream.next_out)
     };
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
 
     out.truncate(total);
     (out, mark)
@@ -2206,7 +2207,7 @@ fn compress_two_sections(whole: &[u8], split: usize, flush: i32) -> (Vec<u8>, us
         );
         (mark, stream.next_out)
     };
-    assert_eq!(deflate_end(state), ReturnCode::OK);
+    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
 
     out.truncate(total);
     (out, mark)
@@ -2247,9 +2248,9 @@ fn recover_after_sync(stream: &[u8], tail_len: usize) -> Vec<u8> {
             ReturnCode::STREAM_END,
             "the surviving section must decode to the end of the stream"
         );
-        view.output[resumed_at..view.next_out].to_vec()
+        view.written().get(resumed_at..).unwrap_or(&[]).to_vec()
     };
-    assert_eq!(inflate_end(state), ReturnCode::OK);
+    assert_eq!(inflate_end(&mut state), ReturnCode::OK);
 
     recovered
 }

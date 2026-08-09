@@ -629,7 +629,7 @@ Pack my box with five dozen liquor jugs.";
             );
             stream.next_out
         };
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
         out.truncate(produced);
         out
     }

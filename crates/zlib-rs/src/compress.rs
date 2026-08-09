@@ -190,6 +190,7 @@ use crate::allocate::GlobalAllocator;
 use crate::config::{Flush, Z_DEFAULT_COMPRESSION};
 use crate::deflate::{deflate, deflate_end, deflate_init, DeflateStream};
 use crate::error::ReturnCode;
+use crate::read_buf::OutputRegion;
 
 /// The bound arithmetic shifts a length right by 25 (`compress.c` L93), so
 /// `usize` has to be wide enough for that to be defined.
@@ -327,6 +328,16 @@ pub struct Compressed {
 /// destination. An implementation that special-cased the empty source into
 /// [`ReturnCode::OK`] would produce no stream and claim success.
 pub fn compress2_z(dest: &mut [u8], source: &[u8], level: i32) -> Compressed {
+    compress2_z_into(&mut OutputRegion::init(dest), source, level)
+}
+
+/// [`compress2_z`] over a destination that may be write-only storage.
+///
+/// The entry point `crates/libz-rs-sys` uses, because a C caller's `dest` is guaranteed
+/// writable and nothing more -- `zlib.h` L1281-L1289 asks for `*destLen` bytes of room and
+/// says nothing about their contents. Identical in behaviour to [`compress2_z`], which is a
+/// one-line forwarder to it over an [`OutputRegion::init`].
+pub fn compress2_z_into(dest: &mut OutputRegion<'_>, source: &[u8], level: i32) -> Compressed {
     // Captured before the first reborrow of `dest`, and the origin of every bound
     // below. These are C's entry values of `*destLen` and `sourceLen`.
     let dest_len = dest.len();
@@ -400,7 +411,7 @@ pub fn compress2_z(dest: &mut [u8], source: &[u8], level: i32) -> Compressed {
         // them, neither accessor can fail whatever the arithmetic above produced.
         let in_end = next_in.saturating_add(avail_in).min(source_len);
         let out_end = next_out.saturating_add(avail_out).min(dest_len);
-        let (Some(input), Some(output)) = (source.get(..in_end), dest.get_mut(..out_end)) else {
+        let Some(input) = source.get(..in_end) else {
             // Unreachable by the invariant just stated. Reported rather than
             // asserted so that this function stays panic-free on every path;
             // `Z_BUF_ERROR` is the honest status for "no window could be
@@ -409,9 +420,16 @@ pub fn compress2_z(dest: &mut [u8], source: &[u8], level: i32) -> Compressed {
             break ReturnCode::BUF_ERROR;
         };
 
-        let mut stream = DeflateStream::new(input, output);
+        // ★ The output window starts **at** `next_out` and the stream's own cursor starts at
+        // zero, rather than the window starting at the destination's base with the cursor
+        // pre-positioned. The two are equivalent for the compressor, which never reads its
+        // output back, and this shape is what keeps [`OutputRegion`]'s promise about its
+        // write-only variant exact: every write a sub-region performs is at or after its own
+        // base, so "everything below the high-water mark has been written" needs no appeal to
+        // what an earlier iteration did.
+        let mut window = dest.reborrow(next_out, out_end.saturating_sub(next_out));
+        let mut stream = DeflateStream::with_region(input, window.reborrow(0, window.len()));
         stream.next_in = next_in;
-        stream.next_out = next_out;
         stream.total_in = total_in;
         stream.total_out = total_out;
         stream.msg = msg;
@@ -433,10 +451,10 @@ pub fn compress2_z(dest: &mut [u8], source: &[u8], level: i32) -> Compressed {
 
         // Whether this call moved either cursor; only the termination assertion
         // below reads it.
-        let advanced = stream.next_in != next_in || stream.next_out != next_out;
+        let advanced = stream.next_in != next_in || stream.next_out != 0;
 
         next_in = stream.next_in;
-        next_out = stream.next_out;
+        next_out = next_out.saturating_add(stream.next_out);
         avail_in = stream.avail_in();
         avail_out = stream.avail_out();
         total_in = stream.total_in;
@@ -478,7 +496,7 @@ pub fn compress2_z(dest: &mut [u8], source: &[u8], level: i32) -> Compressed {
     // finished (`deflate.c` L1309), which is precisely the state a `Z_BUF_ERROR`
     // return leaves it in, and surfacing that would replace this function's own
     // documented status with one `zlib.h` L1302-L1304 does not list for it.
-    let _end = deflate_end(state);
+    let _end = deflate_end(&mut state);
 
     // L65: `return err == Z_STREAM_END ? Z_OK : err;`
     //
@@ -629,9 +647,10 @@ pub const fn compress_bound_z(source_len: usize) -> usize {
 /// [`compress_bound_z`] under its other name. The saturation only has anything to
 /// do on a target where `uLong` is narrower than `z_size_t` -- LLP64 Windows,
 /// where `unsigned long` is 32 bits and `size_t` is 64 -- and there it is
-/// the planned `crates/libz-rs-sys/src/compress.rs` that must convert the argument from
-/// `c_ulong`, call this function, and answer `c_ulong::MAX` when the result does
-/// not fit back. Hard-coding either width here would be wrong on the other one.
+/// `crates/libz-rs-sys/src/compress.rs`, in its `compressBound` export, that
+/// converts the argument from `c_ulong`, calls this function, and answers
+/// `c_ulong::MAX` when the result does not fit back. Hard-coding either width
+/// here would be wrong on the other one.
 ///
 /// Both spellings are kept so that each exported symbol has one core function
 /// behind it, and so that a facade author reading this module can see which of
@@ -844,12 +863,18 @@ mod tests {
         assert_eq!(u64::try_from(MAX_CHUNK).unwrap(), u64::from(u32::MAX));
     }
 
-    /// The reference's own answers for twenty lengths spanning every shift
+    /// The reference's own answers for nineteen lengths spanning every shift
     /// threshold. `13`, `4096`, `16384` and `1 << 25` are the points at which the
     /// constant and the three shifted terms first contribute.
+    ///
+    /// Every row here is representable at any pointer width. The one measurement that
+    /// is not -- 2^32, whose bound exceeds `usize::MAX` on a 32-bit target -- is
+    /// asserted separately below under `cfg`, because a literal wider than `usize` is
+    /// rejected by `overflowing_literals` at compile time and so cannot be skipped at
+    /// run time.
     #[test]
     fn bound_matches_the_reference_table() {
-        const TABLE: [(usize, usize); 20] = [
+        const TABLE: [(usize, usize); 19] = [
             (0, 13),
             (1, 14),
             (2, 15),
@@ -869,7 +894,6 @@ mod tests {
             (1_048_576, 1_048_909),
             (33_554_431, 33_564_682),
             (33_554_432, 33_564_686),
-            (4_294_967_296, 4_296_278_157),
         ];
 
         for (source_len, expected) in TABLE {
@@ -879,6 +903,15 @@ mod tests {
                 "compress_bound_z({source_len})"
             );
         }
+
+        // The twentieth measurement, 2^32, exercises a length above the `>> 25` term's
+        // own range. It exists only where `usize` can hold it.
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
+            compress_bound_z(4_294_967_296),
+            4_296_278_157,
+            "compress_bound_z(4294967296)"
+        );
     }
 
     /// The four terms, spelled out at the thresholds the table above pins down.
@@ -897,7 +930,10 @@ mod tests {
             (1 << 25) + (1 << 13) + (1 << 11) + 1 + 13
         );
         // 2^54 is far enough up that all three shifted terms are large, which is
-        // where a swapped pair of shift constants would finally show.
+        // where a swapped pair of shift constants would finally show. It needs a
+        // 64-bit `usize`; the 2^25 case above is the widest that fits a 32-bit one,
+        // and it already has all four terms contributing.
+        #[cfg(target_pointer_width = "64")]
         assert_eq!(
             compress_bound_z(1 << 54),
             (1 << 54) + (1 << 42) + (1 << 40) + (1 << 29) + 13
@@ -917,12 +953,12 @@ mod tests {
         // because the bound grows faster than the length. Either side of the
         // crossing must answer consistently: below it a real bound, above it the
         // sentinel, and never a value smaller than the length itself.
-        for &source_len in &[
-            usize::MAX / 2,
-            1_usize << 63,
-            (1_usize << 63) + 1,
-            usize::MAX - (1 << 20),
-        ] {
+        //
+        // `usize::BITS - 1` rather than a literal 63, so the top-bit case is the top
+        // bit at whatever width the target has; every entry is then representable and
+        // no shift exceeds the word.
+        let top_bit = 1_usize << (usize::BITS - 1);
+        for &source_len in &[usize::MAX / 2, top_bit, top_bit + 1, usize::MAX - (1 << 20)] {
             let bound = compress_bound_z(source_len);
             assert!(
                 bound == usize::MAX || bound > source_len,
@@ -930,10 +966,17 @@ mod tests {
             );
         }
 
-        // Measured values immediately below the crossing.
-        assert_eq!(compress_bound_z(usize::MAX / 2), 9_226_187_061_499_789_321);
-        assert_eq!(compress_bound_z(1_usize << 63), 9_226_187_061_499_789_325);
-        assert_eq!(compress_bound_z(1_usize << 54), 18_019_896_604_491_789);
+        // Measured values immediately below the crossing. These are readings from the
+        // reference LP64 build, so they are asserted only where `usize` is 64 bits --
+        // both the arguments and the answers exceed a 32-bit `usize`, and no 32-bit
+        // reference measurement exists in this repository to put in their place. The
+        // property assertions above hold at every width and are what covers the others.
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(compress_bound_z(usize::MAX / 2), 9_226_187_061_499_789_321);
+            assert_eq!(compress_bound_z(1_usize << 63), 9_226_187_061_499_789_325);
+            assert_eq!(compress_bound_z(1_usize << 54), 18_019_896_604_491_789);
+        }
     }
 
     /// The bound is never below its input plus the 13-byte constant, and it never

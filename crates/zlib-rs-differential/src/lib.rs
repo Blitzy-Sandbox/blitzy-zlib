@@ -24,8 +24,10 @@
 //!
 //! `build.rs` compiles the fifteen in-tree C translation units — `Makefile.in`'s `OBJZ` plus `OBJG`,
 //! verbatim — with the flags the in-tree `configure` applies (`-O3 -fPIC
-//! -D_LARGEFILE64_SOURCE=1 -DHAVE_HIDDEN`), together with a small generated shim that exposes the
-//! `static` tables no linker can otherwise reach. It renames every externally visible symbol in the
+//! -D_LARGEFILE64_SOURCE=1 -DHAVE_HIDDEN`), together with two small generated files that expose the
+//! `static` tables no linker can otherwise reach: a shim over the three generated-table headers,
+//! and a wrapper that includes `deflate.c` itself, because the per-level `configuration_table` lives
+//! inside that file and is declared in no header. It renames every externally visible symbol in the
 //! result to carry a `c_` prefix, archives the objects into `libzlib_c_oracle.a` in `OUT_DIR`, and
 //! audits the finished archive with `nm`, failing the build if any export was left unprefixed. The
 //! C sources themselves are read-only inputs; nothing is written into the working tree, nothing is

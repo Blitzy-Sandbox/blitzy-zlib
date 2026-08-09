@@ -12,9 +12,10 @@
 # zlib is a system library: effectively every consumer of compressed data links
 # it, so whatever reaches this dependency graph reaches everything downstream.
 # The algorithm carries no third-party code at all -- crates/zlib-rs has an empty
-# [dependencies] table, and crates/libz-rs-sys adds only an optional libc.
-# Everything else cargo-deny can see is test and benchmark tooling that never ends
-# up inside libz.so or libz.a.  This file is the mechanical half of keeping that
+# [dependencies] table, and crates/libz-rs-sys depends on nothing but that core.
+# Everything else cargo-deny can see is test and build tooling that never ends
+# up inside libz.so or libz.a: `cc`, and the two crates it pulls in, compiling the
+# in-tree C oracle for crates/zlib-rs-differential.  This file is the mechanical half of keeping that
 # true: a regression fails the gate instead of passing unnoticed in a diff.
 #
 # LICENSING
@@ -46,12 +47,13 @@
 #   * `NCSA` -- libfuzzer-sys 0.4.13 is "(MIT OR Apache-2.0) AND NCSA"; it
 #     vendors LLVM's NCSA-licensed libFuzzer.
 #   * `Unicode-3.0` -- unicode-ident 1.0.24 is
-#     "(MIT OR Apache-2.0) AND Unicode-3.0".  This one is already in the allow
-#     list below, because criterion's tree brings the same crate here.
+#     "(MIT OR Apache-2.0) AND Unicode-3.0".  It reached this workspace only
+#     through criterion, which is no longer a dependency, so the allowance is not
+#     in the list below either; the note there records when it comes back.
 #
-# NCSA is deliberately absent from the allow list below: it appears nowhere in
-# this workspace's graph, and cargo-deny reports an allowance that never matches
-# as a warning.  Granting it here would also be the wrong shape -- it would
+# NCSA and Unicode-3.0 are both deliberately absent from the allow list below:
+# neither appears anywhere in this workspace's graph, and cargo-deny reports an
+# allowance that never matches as a warning.  Granting it here would also be the wrong shape -- it would
 # permit an NCSA-licensed crate to enter the SHIPPED graph, which is precisely
 # what this file is for preventing.
 #
@@ -66,34 +68,43 @@
 # Every key below was checked against that schema, so none of them is a stale
 # spelling.
 #
-# WHAT HAS NOT BEEN CHECKED YET, AND WHY
+# WHAT HAS BEEN CHECKED, AND HOW
 #
-# `cargo deny check` cannot run against this workspace at this checkpoint.  It
-# starts by asking cargo for the dependency graph, and `cargo metadata` fails
-# outright because the facade crate root `crates/libz-rs-sys/src/lib.rs` has not
-# been written yet:
+# `cargo deny check` needs the dependency graph, so it could not run at all until
+# the facade crate root `crates/libz-rs-sys/src/lib.rs` existed -- before that
+# `cargo metadata` failed with "can't find library `z`, rename file to
+# src/lib.rs or specify lib.path" and the tool exited 1 without evaluating a single
+# rule here.  That root landed, and the gate has now been run for real:
 #
-#   can't find library `z`, rename file to `src/lib.rs` or specify lib.path
+#   cargo deny --all-features check   ->  advisories ok, bans ok, licenses ok,
+#                                         sources ok
 #
-# so the tool exits 1 before it evaluates a single rule here.  The REQUIREMENT is
-# zero errors and zero warnings across all four gates -- an allowance that never
-# matches is reported as a diagnostic and would break the project's zero-warning
-# bar just as a real violation would.  That requirement has not been demonstrated
-# on the real graph and must not be described as though it had been.  Re-run
-# `cargo deny check` and record the outcome once the facade crate root lands.
+# with no diagnostics of any kind.  The requirement is zero errors AND zero
+# warnings across all four gates, because an allowance that never matches is
+# reported as a diagnostic and would break the project's zero-warning bar just as
+# a real violation would -- which is exactly what removing the criterion edge made
+# possible: `unicode-ident` reached the graph only through that harness, so
+# `Unicode-3.0` became unmatched and was reported until it was taken out of the allow
+# list below.  The one third-party edge the shipped crates do keep, `libc` behind the
+# facade's `gz` feature, needs no new allowance: it is "MIT OR Apache-2.0", both of
+# which are already listed for the tooling graph.  Measured with `libc` resolved and
+# `--all-features`: advisories ok, bans ok, licenses ok, sources ok, no warnings.
+# Re-run the command above after any dependency change and keep this block truthful.
 
 [graph]
 # No `targets` filter, on purpose.  Narrowing the graph to a single triple would
 # stop cargo-deny from ever looking at the crates that only build elsewhere --
-# winapi, windows-sys, js-sys and web-sys all arrive through the benchmark harness
-# -- and a licence or advisory problem in one of those is still a problem for
-# whoever builds this workspace on that platform.  Which targets are supported is a
+# `find-msvc-tools`, which arrives through `cc`, is one today, and a benchmark or
+# fuzz harness would add more -- and a licence or advisory problem in one of those
+# is still a problem for whoever builds this workspace on that platform.  Which targets are supported is a
 # separate question, answered by the build documentation rather than by the audit
 # configuration.
 #
 # Optional features are switched on so that feature-gated dependencies are audited
-# too.  libz-rs-sys's `libc` feature is the only one, and it must not become a place
-# where an unaudited crate can hide.
+# too.  No feature in this workspace currently pulls in a crate -- `libz-compat`,
+# `gz`, `simd`, `std` and `rust-api` are all pure switches over in-tree code -- and
+# `all-features = true` is what keeps it that way: the day one of them grows a
+# `dep:` entry, that crate is audited rather than hidden behind a default-off flag.
 all-features = true
 
 [advisories]
@@ -133,30 +144,37 @@ include-build = true
 allow = [
     # The project's own licence, carried by LICENSE and by all three crates.
     "Zlib",
-    # Covers the dual-licensed bulk of the tooling graph, and on its own satisfies
-    # the crates offered as "Unlicense OR MIT" (memchr, walkdir, same-file,
-    # winapi-util) and "BSD-2-Clause OR Apache-2.0 OR MIT" (zerocopy,
-    # zerocopy-derive).  That is why neither Unlicense nor BSD-2-Clause is listed:
-    # allowing an alternative that nothing ends up needing is itself a warning.
+    # Covers the dual-licensed tooling graph: cc, find-msvc-tools and shlex are all
+    # offered as "MIT OR Apache-2.0".  It is also what would satisfy an
+    # "Unlicense OR MIT" or "BSD-2-Clause OR Apache-2.0 OR MIT" crate, which is why
+    # neither of those alternatives is listed: allowing an alternative that nothing
+    # ends up needing is itself a warning.
     "MIT",
-    # Required outright -- the ciborium crates the benchmark harness pulls in are
-    # Apache-2.0 only, with no MIT alternative to fall back on.
+    # The other half of every "MIT OR Apache-2.0" expression above.
     "Apache-2.0",
-    # Required outright -- unicode-ident is "(MIT OR Apache-2.0) AND Unicode-3.0",
-    # so the Unicode terms have to be allowed alongside MIT rather than instead of
-    # it.
-    "Unicode-3.0",
+    # NO "Unicode-3.0" ENTRY, deliberately.  It was here for unicode-ident, which is
+    # "(MIT OR Apache-2.0) AND Unicode-3.0" and reached this graph only through the
+    # criterion benchmark harness.  That edge is gone (see the criterion note in the
+    # root Cargo.toml), so the allowance matched nothing and cargo-deny reported it
+    # as an unmatched license allowance -- a warning, and the file's own rule above
+    # is that speculative entries are not free.  Restore this exact identifier when
+    # the benchmark suites bring criterion back; `cargo deny check licenses` will
+    # name unicode-ident the moment it is needed again.
 ]
 
 [bans]
 # A duplicate version in this graph means something went wrong: the shipped crates
 # have no third-party dependencies to disagree about in the first place.
 #
-# `multiple-versions-include-dev` is left at its default of false on purpose.
-# criterion's own tree resolves two major versions of syn, which is internal to a
-# benchmark harness that no shipped artifact links; turning that key on would fail
-# this workspace over somebody else's dependency graph, and the alternative -- a
-# skip entry for syn -- would blunt the check permanently.
+# `multiple-versions-include-dev` is left at its default of false on purpose, and
+# the reason is now precautionary rather than current.  The dev graph carries no
+# duplicate today -- criterion, which resolved two major versions of syn, is no
+# longer a dependency -- but the key stays off because the duplication belonged to
+# somebody else's tree and would come back with the benchmark harness.  Turning it
+# on would then fail this workspace over that graph, and the alternative -- a skip
+# entry for syn -- would blunt the check permanently.  The check that matters is
+# unconditional either way: the shipped crates have no third-party dependencies to
+# disagree about.
 multiple-versions = "deny"
 # Every version in this workspace was pinned against the registry deliberately,
 # so a `*` requirement is a mistake rather than a shortcut.
@@ -186,12 +204,13 @@ wildcards = "deny"
 #
 # Not banned, deliberately: `cc` is a build-dependency of
 # crates/zlib-rs-differential, which compiles the in-tree C sources into the
-# test-only differential oracle (and is also a build-dependency of criterion's
-# alloca); `criterion` is a dev-dependency of that same crate, for the benchmark
-# suites; `libc` is an optional dependency of libz-rs-sys behind its `libc` feature
-# and a transitive dependency of criterion through page_size.  None of the three
-# reaches the shipped libz.so or libz.a -- two are dev/build-only, and the `libc`
-# feature is off by default.
+# test-only differential oracle, and it brings `shlex` and `find-msvc-tools` with
+# it.  Those three are the whole third-party graph, none of them reaches the
+# shipped libz.so or libz.a, and `cc` in particular must never move into
+# crates/zlib-rs or crates/libz-rs-sys: a shipped `cargo build --release` may not
+# invoke a C compiler (AAP 0.6.4.1).  `criterion` will reappear as a
+# dev-dependency when the benchmark suites land; it is not banned either, for the
+# same dev-only reason.
 deny = [
     # Bindings to a native compression library.  The C zlib in this tree is a
     # differential-test oracle, never a build dependency: the shipped library

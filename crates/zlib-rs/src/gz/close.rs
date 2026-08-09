@@ -40,8 +40,7 @@
 //! below is the real, two-way one.** That determination has a machine-visible consequence one crate
 //! up, so it is recorded here rather than left to be re-derived: `zlibCompileFlags` sets bit 16 for
 //! `NO_GZCOMPRESS` (`zutil.c` L76-L78, `flags += 1L << 16`), and therefore
-//! the planned `crates/libz-rs-sys/src/util.rs` **must report bit 16 CLEAR**. The same goes for
-//! the companion
+//! `crates/libz-rs-sys/src/util.rs` **reports bit 16 CLEAR**. The same goes for the companion
 //! decision in the read half: nothing in this port is compiled out, so the capability surface is the
 //! full one.
 //!
@@ -121,9 +120,8 @@
 //!
 //! What Rust's ownership cannot reach is the raw `gzFile` a C caller holds. That pointer may be
 //! null, may be stale, and may never have been a `gzFile` at all -- so the guard belongs at the
-//! boundary, and the planned `crates/libz-rs-sys/src/gz.rs` will own it (AAP §0.6.1 unsafe-site
-//! category 3: the
-//! opaque state pointer is tag-validated before it is treated as state). This function's [`Option`]
+//! boundary, and `crates/libz-rs-sys/src/gz.rs` owns it: the opaque state pointer is
+//! tag-validated there before it is treated as state. This function's [`Option`]
 //! parameter is that guard's safe-core counterpart, and [`None`] *is* `file == NULL`.
 //!
 //! # Both halves stay public

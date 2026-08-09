@@ -312,7 +312,7 @@ fn deflate_config(
 /// sweeps below are leak-free under Miri.
 fn deflate_init_status(config: DeflateConfig) -> ReturnCode {
     match deflate_init2(config, GlobalAllocator) {
-        Ok(state) => deflate_end(state),
+        Ok(mut state) => deflate_end(&mut state),
         Err(code) => code,
     }
 }
@@ -327,7 +327,7 @@ fn deflate_init_status(config: DeflateConfig) -> ReturnCode {
 fn deflate_state_parameters(
     config: DeflateConfig,
 ) -> Result<(i32, Option<Wrap>, u32, u32, Strategy), ReturnCode> {
-    let state: DeflateState<'_, GlobalAllocator> = deflate_init2(config, GlobalAllocator)?;
+    let mut state: DeflateState<'_, GlobalAllocator> = deflate_init2(config, GlobalAllocator)?;
     let parameters = (
         state.level(),
         state.container(),
@@ -335,7 +335,10 @@ fn deflate_state_parameters(
         state.hash_bits() - 7,
         state.strategy(),
     );
-    common::check_err(deflate_end(state), "deflateEnd after parameter inspection");
+    common::check_err(
+        deflate_end(&mut state),
+        "deflateEnd after parameter inspection",
+    );
     Ok(parameters)
 }
 
@@ -346,7 +349,7 @@ fn deflate_state_parameters(
 /// teardown), so as on the deflate side one status describes the round trip.
 fn inflate_init_status(window_bits: i32) -> ReturnCode {
     match inflate_init2(InflateConfig::new(window_bits), GlobalAllocator) {
-        Ok(state) => inflate_end(state),
+        Ok(mut state) => inflate_end(&mut state),
         Err(code) => code,
     }
 }
@@ -373,7 +376,7 @@ fn inflate_reset2_status(window_bits: i32) -> ReturnCode {
         Err(code) => code,
     };
 
-    common::check_err(inflate_end(state), "inflateEnd after inflateReset2");
+    common::check_err(inflate_end(&mut state), "inflateEnd after inflateReset2");
     status
 }
 
@@ -935,7 +938,6 @@ fn every_level_outside_zero_to_nine_is_refused() {
 /// off-by-one without any further investigation.
 #[test]
 fn the_level_boundaries_are_adjacent_and_correct() {
-    // Below the range.
     assert!(normalize_deflate_level(-2).is_err(), "-2 is not a level");
     assert!(
         normalize_deflate_level(-1).is_ok(),
@@ -943,7 +945,6 @@ fn the_level_boundaries_are_adjacent_and_correct() {
     );
     assert!(normalize_deflate_level(0).is_ok(), "0 is a level");
 
-    // Above the range.
     assert!(normalize_deflate_level(9).is_ok(), "9 is a level");
     assert!(normalize_deflate_level(10).is_err(), "10 is not a level");
 }
@@ -1066,13 +1067,16 @@ fn the_only_accepted_method_is_deflated() {
         deflate_config(6, SMALL_WINDOW_BITS, MIN_MEM_LEVEL, Strategy::Default),
         GlobalAllocator,
     ) {
-        Ok(state) => {
+        Ok(mut state) => {
             assert_eq!(
                 state.method(),
                 Method::Deflated,
                 "the state must record the DEFLATE method"
             );
-            common::check_err(deflate_end(state), "deflateEnd after method inspection");
+            common::check_err(
+                deflate_end(&mut state),
+                "deflateEnd after method inspection",
+            );
         }
         Err(code) => assert_eq!(
             code,
@@ -1746,7 +1750,6 @@ fn inflate_back_window_bits_is_the_narrowest_rule() {
         "inflateBack has no automatic-detection mode"
     );
 
-    // And the boundary pair.
     assert!(validate_inflate_back_window_bits(7).is_err());
     assert!(validate_inflate_back_window_bits(8).is_ok());
     assert!(validate_inflate_back_window_bits(15).is_ok());

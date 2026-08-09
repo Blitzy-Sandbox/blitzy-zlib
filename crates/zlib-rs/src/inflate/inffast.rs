@@ -393,6 +393,7 @@ use crate::allocate::Allocator;
 use crate::inflate::inftrees::Code;
 use crate::inflate::mode::Mode;
 use crate::inflate::state::InflateState;
+use crate::read_buf::OutputCursor;
 
 /// Smallest `avail_in` this function may be entered with (`inffast.c` L26).
 ///
@@ -628,21 +629,18 @@ pub(crate) struct FastExit {
 #[allow(clippy::inline_always)]
 #[inline(always)]
 fn copy_match(
-    output: &mut [u8],
-    out: &mut usize,
+    output: &mut OutputCursor<'_>,
     history: &[u8],
     from: &mut MatchSource,
     len: u32,
 ) -> bool {
     let count = to_index(u64::from(len));
-    let dst = *out;
 
-    // The destination range is shared by both source cases, and this is the only
-    // place it is checked.
-    let Some(dst_end) = dst.checked_add(count) else {
-        return false;
-    };
-    if dst_end > output.len() {
+    // The destination range is shared by both source cases, and this is the only place it is
+    // checked. Checking it up front rather than letting a copy clamp is what keeps the
+    // operation all-or-nothing: a partial match copy would emit a truncated string and then
+    // report success.
+    if count > output.remaining() {
         return false;
     }
 
@@ -651,79 +649,37 @@ fn copy_match(
             let Some(src_end) = src.checked_add(count) else {
                 return false;
             };
-            // `history` is `window[..whave]` and `output` is the caller's output
+            // `history` is `window[..whave]` and the cursor holds the caller's output
             // buffer: two distinct allocations, because the one case in which the
             // window *is* the output -- `inflateBack()` -- is handed to this
-            // function as `MatchSource::Output` by `window_source`. So the two
-            // slices below cannot overlap and the bulk copy is exact.
+            // function as `MatchSource::Output` by `window_source`. So the source
+            // and the destination cannot overlap and the bulk copy is exact.
             let Some(source) = history.get(src..src_end) else {
                 return false;
             };
-            let Some(target) = output.get_mut(dst..dst_end) else {
+            // One bulk copy, and the cursor advances by exactly what it moved. A short
+            // copy would mean fewer than `count` bytes of room, which the entry
+            // contract's `avail_out >= 258` rules out.
+            if output.push_slice(source) != count {
                 return false;
-            };
-            // Both slices are `count` bytes long by construction.
-            target.copy_from_slice(source);
+            }
             *from = MatchSource::Window(src_end);
         }
         MatchSource::Output(src) => {
             let Some(src_end) = src.checked_add(count) else {
                 return false;
             };
-            if src_end > output.len() {
+            // One validated range, then one bulk move whose shape depends on how the
+            // source and the destination sit; `crate::read_buf::duplicate_forward`
+            // carries the proof that all three reproduce the reference's ascending
+            // byte loop, `inflateBack`'s window-is-output case included.
+            if !output.duplicate_from(src, count) {
                 return false;
-            }
-            match dst.checked_sub(src) {
-                // `src > dst` (the `inflateBack()` window read, whose window and
-                // output indices coincide) or `src == dst` (a self-copy, which
-                // changes nothing). Ascending byte order reads every byte before
-                // the write that would overwrite it, so `memmove` semantics are
-                // exactly right. Both ranges were checked above, so neither of
-                // `copy_within`'s two panic conditions can hold.
-                None | Some(0) => output.copy_within(src..src_end, dst),
-                // Disjoint: the source ends at or before the destination starts.
-                Some(period) if period >= count => output.copy_within(src..src_end, dst),
-                // A repeating run of period `period`. `split_at_mut_checked`
-                // separates the seed -- which lies wholly below `dst` and is
-                // therefore never written by this copy -- from the region being
-                // filled, so the seed is read from an immutable borrow while the
-                // destination is written through a disjoint mutable one.
-                Some(period) => {
-                    let Some((head, tail)) = output.split_at_mut_checked(dst) else {
-                        return false;
-                    };
-                    // `head` is `output[..dst]`, so this is exactly the `period`
-                    // bytes at `src`, and `period < count <= tail.len()`.
-                    let Some(seed) = head.get(src..) else {
-                        return false;
-                    };
-                    let Some(target) = tail.get_mut(..count) else {
-                        return false;
-                    };
-                    let Some(slot) = target.get_mut(..period) else {
-                        return false;
-                    };
-                    slot.copy_from_slice(seed);
-
-                    // Doubling. `target[..written]` always holds a whole number
-                    // of periods, so copying its first `chunk` bytes to offset
-                    // `written` preserves the phase; and `chunk <= written`
-                    // keeps the two ranges disjoint. `written + chunk <= count`
-                    // keeps both inside `target`, so `copy_within` cannot panic.
-                    // At most eight iterations for the longest codeable match.
-                    let mut written = period;
-                    while written < count {
-                        let chunk = written.min(count - written);
-                        target.copy_within(..chunk, written);
-                        written += chunk;
-                    }
-                }
             }
             *from = MatchSource::Output(src_end);
         }
     }
 
-    *out = dst_end;
     true
 }
 
@@ -817,8 +773,7 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
     state: &mut InflateState<'a, A>,
     input: &[u8],
     next_in: &mut usize,
-    output: &mut [u8],
-    next_out: &mut usize,
+    output: &mut OutputCursor<'_>,
     start: usize,
 ) -> FastExit {
     debug_assert_eq!(
@@ -835,7 +790,7 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
     // the module's "Returning whole bytes to the input" section.
 
     let avail_in = input.len().saturating_sub(*next_in);
-    let avail_out = output.len().saturating_sub(*next_out);
+    let avail_out = output.remaining();
     debug_assert!(
         avail_in >= MIN_AVAIL_IN,
         "inffast.c L26 requires avail_in >= 6 on entry"
@@ -865,9 +820,11 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
     let mut in_index = *next_in; // `in`   -- L79
     let entry_in_index = in_index; // not in C; bounds the byte return at L292
     let last = in_index + (avail_in - IN_SLACK); // `last` -- L80
-    let mut out_index = *next_out; // `out`  -- L81
-    let beg = out_index.saturating_sub(start.saturating_sub(avail_out)); // `beg` -- L82
-    let end = out_index + (avail_out - OUT_SLACK); // `end`  -- L83
+                                                 // `out` -- L81. The cursor's own position *is* C's `put`, so there is no separate index
+                                                 // to keep in step with it: every write below advances the one number.
+    let entry_out_index = output.written();
+    let beg = entry_out_index.saturating_sub(start.saturating_sub(avail_out)); // `beg` -- L82
+    let end = entry_out_index + (avail_out - OUT_SLACK); // `end`  -- L83
 
     // L84-L86 read `dmax` under INFLATE_STRICT; not implemented.
 
@@ -948,12 +905,11 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
                 // low byte only; destructuring `to_le_bytes` performs exactly
                 // that truncation without a lossy cast.
                 let [literal, _] = here.val.to_le_bytes();
-                let Some(slot) = output.get_mut(out_index) else {
-                    // Unreachable: `out_index < end` leaves at least 258 bytes.
+                if !output.push_byte(literal) {
+                    // Unreachable: the cursor is below `end`, which leaves at least 258
+                    // bytes of room.
                     break 'outer;
-                };
-                *slot = literal;
-                out_index += 1;
+                }
             } else if op & 16 != 0 {
                 // length base -- L119-L121
                 let mut len = u32::from(here.val);
@@ -1047,7 +1003,7 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
                         bits = bits.saturating_sub(op); // L165
 
                         // L167: `op` = max distance available in the output.
-                        op = to_count(out_index.saturating_sub(beg));
+                        op = to_count(output.written().saturating_sub(beg));
 
                         // Whether every segment copy below succeeded. They can
                         // only fail if the entry contract was violated, and a
@@ -1091,10 +1047,9 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
                                 if op < len {
                                     // some from window
                                     len -= op;
-                                    copied &=
-                                        copy_match(output, &mut out_index, history, &mut from, op);
+                                    copied &= copy_match(output, history, &mut from, op);
                                     // rest from output
-                                    from = output_source(out_index, dist);
+                                    from = output_source(output.written(), dist);
                                 }
                             } else if wnext < op {
                                 // wrap around window -- L208-L226
@@ -1106,22 +1061,15 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
                                 if op < len {
                                     // some from end of window
                                     len -= op;
-                                    copied &=
-                                        copy_match(output, &mut out_index, history, &mut from, op);
+                                    copied &= copy_match(output, history, &mut from, op);
                                     from = window_source(0, window_is_output);
                                     if wnext < len {
                                         // some from start of window
                                         op = wnext;
                                         len -= op;
-                                        copied &= copy_match(
-                                            output,
-                                            &mut out_index,
-                                            history,
-                                            &mut from,
-                                            op,
-                                        );
+                                        copied &= copy_match(output, history, &mut from, op);
                                         // rest from output
-                                        from = output_source(out_index, dist);
+                                        from = output_source(output.written(), dist);
                                     }
                                 }
                             } else {
@@ -1130,10 +1078,9 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
                                 if op < len {
                                     // some from window
                                     len -= op;
-                                    copied &=
-                                        copy_match(output, &mut out_index, history, &mut from, op);
+                                    copied &= copy_match(output, history, &mut from, op);
                                     // rest from output
-                                    from = output_source(out_index, dist);
+                                    from = output_source(output.written(), dist);
                                 }
                             }
                             // L237-L247. C drains three bytes at a time and then
@@ -1144,10 +1091,10 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
                             // whole-remainder copy emits the identical bytes.
                             // `len` may already be zero after a partial window
                             // copy, which C's pre-test `while` also handles.
-                            copied &= copy_match(output, &mut out_index, history, &mut from, len);
+                            copied &= copy_match(output, history, &mut from, len);
                         } else {
                             // copy direct from output -- L249-L250
-                            let mut from = output_source(out_index, dist);
+                            let mut from = output_source(output.written(), dist);
                             // L251-L261. C's post-test `do`-`while` plus its tail,
                             // which together copy exactly `len` bytes: the loop is
                             // post-test only because "minimum length is three"
@@ -1158,7 +1105,7 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
                             // length below three made C copy three bytes and then
                             // wrap `len` on the subtraction, whereas this copies
                             // the length the entry actually asked for.
-                            copied &= copy_match(output, &mut out_index, history, &mut from, len);
+                            copied &= copy_match(output, history, &mut from, len);
                         }
 
                         if !copied {
@@ -1221,7 +1168,7 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
         }
 
         // L288: `} while (in < last && out < end);`
-        if in_index >= last || out_index >= end {
+        if in_index >= last || output.written() >= end {
             break 'outer;
         }
     }
@@ -1245,7 +1192,10 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
     hold &= low_mask(bits); // L294
 
     *next_in = in_index; // L297
-    *next_out = out_index; // L298
+                         // L298: `strm->next_out = put;` needs no counterpart -- the cursor advanced itself as it
+                         // wrote, so its position already *is* `put`, and there is no second copy of the index
+                         // that could disagree with it.
+    let out_index = output.written();
 
     // L299 and L300-L301, evaluated exactly as written. Both conditionals
     // collapse algebraically to `buffer.len() - cursor`; see the module's
@@ -1267,7 +1217,7 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
     );
     debug_assert_eq!(
         avail_out,
-        output.len().saturating_sub(out_index),
+        output.remaining(),
         "inffast.c L300-L301 must agree with the cursor model"
     );
     state.hold = hold; // L302
@@ -1296,10 +1246,11 @@ pub(crate) fn inflate_fast<'a, A: Allocator<'a>>(
 mod tests {
     use super::{
         copy_match, drop_bits, inflate_fast, low_mask, output_source, to_count, to_extra, to_index,
-        window_source, FastExit, MatchSource, MIN_AVAIL_IN, MIN_AVAIL_OUT, MIN_CODEABLE_LEN,
-        MSG_INVALID_DISTANCE_CODE, MSG_INVALID_DISTANCE_TOO_FAR_BACK,
+        window_source, FastExit, MatchSource, OutputCursor, MIN_AVAIL_IN, MIN_AVAIL_OUT,
+        MIN_CODEABLE_LEN, MSG_INVALID_DISTANCE_CODE, MSG_INVALID_DISTANCE_TOO_FAR_BACK,
         MSG_INVALID_LITERAL_LENGTH_CODE, NO_HISTORY,
     };
+    use crate::read_buf::OutputRegion;
 
     use alloc::vec;
     use alloc::vec::Vec;
@@ -1312,6 +1263,14 @@ mod tests {
 
     /// The state type every test drives.
     type TestState<'a> = InflateState<'a, GlobalAllocator>;
+
+    /// Ends a cursor's borrow of the buffer behind it so the buffer can be inspected.
+    ///
+    /// `drop(cursor)` would say this more directly, but [`OutputCursor`] implements no
+    /// `Drop`, and `clippy::drop_non_drop` correctly points out that such a call only
+    /// extends the value's lifetimes. Moving the cursor into a function that does
+    /// nothing with it is the same operation under an honest name.
+    fn release(_cursor: OutputCursor<'_>) {}
 
     /// Output buffer large enough that `avail_out >= 258` still holds after a
     /// maximum-length match, so a test can decode several codes per call.
@@ -1431,9 +1390,10 @@ mod tests {
         out_at: usize,
     ) -> (FastExit, usize, usize) {
         let mut next_in = 0;
-        let mut next_out = out_at;
         let start = output.len();
-        let exit = inflate_fast(state, input, &mut next_in, output, &mut next_out, start);
+        let mut cursor = OutputCursor::from_region(OutputRegion::init(output), out_at);
+        let exit = inflate_fast(state, input, &mut next_in, &mut cursor, start);
+        let next_out = cursor.written();
         (exit, next_in, next_out)
     }
 
@@ -1486,12 +1446,13 @@ mod tests {
     fn copy_match_from_the_window_advances_both_cursors() {
         let history = [10_u8, 11, 12, 13, 14];
         let mut output = [0_u8; 8];
-        let mut out = 2;
+        let mut cursor = OutputCursor::from_region(OutputRegion::init(&mut output), 2);
         let mut from = MatchSource::Window(1);
-        assert!(copy_match(&mut output, &mut out, &history, &mut from, 3));
-        assert_eq!(&output[..], &[0, 0, 11, 12, 13, 0, 0, 0]);
-        assert_eq!(out, 5);
+        assert!(copy_match(&mut cursor, &history, &mut from, 3));
+        assert_eq!(cursor.written(), 5);
         assert_eq!(from, MatchSource::Window(4));
+        release(cursor);
+        assert_eq!(&output[..], &[0, 0, 11, 12, 13, 0, 0, 0]);
     }
 
     #[test]
@@ -1514,15 +1475,12 @@ mod tests {
                 for (index, slot) in output.iter_mut().take(dist).enumerate() {
                     *slot = pattern(index);
                 }
-                let mut out = dist;
+                let mut cursor = OutputCursor::from_region(OutputRegion::init(&mut output), dist);
                 let mut from = MatchSource::Output(0);
-                assert!(copy_match(
-                    &mut output,
-                    &mut out,
-                    NO_HISTORY,
-                    &mut from,
-                    len
-                ));
+                assert!(copy_match(&mut cursor, NO_HISTORY, &mut from, len));
+                assert_eq!(cursor.written(), dist + usize::try_from(len).unwrap());
+                assert_eq!(from, MatchSource::Output(usize::try_from(len).unwrap()));
+                release(cursor);
 
                 let mut expected: Vec<u8> = (0..dist).map(pattern).collect();
                 for _ in 0..len {
@@ -1533,8 +1491,6 @@ mod tests {
                     &expected[..],
                     "dist {dist}, len {len}"
                 );
-                assert_eq!(out, dist + usize::try_from(len).unwrap());
-                assert_eq!(from, MatchSource::Output(usize::try_from(len).unwrap()));
             }
         }
     }
@@ -1566,18 +1522,13 @@ mod tests {
                     bytes
                 };
 
-                let mut out = 0;
+                let mut cursor = OutputCursor::from_region(OutputRegion::init(&mut output), 0);
                 let mut from = MatchSource::Output(src);
-                assert!(copy_match(
-                    &mut output,
-                    &mut out,
-                    NO_HISTORY,
-                    &mut from,
-                    len
-                ));
-                assert_eq!(output, naive, "src {src}, len {len}");
-                assert_eq!(out, count);
+                assert!(copy_match(&mut cursor, NO_HISTORY, &mut from, len));
+                assert_eq!(cursor.written(), count);
                 assert_eq!(from, MatchSource::Output(src + count));
+                release(cursor);
+                assert_eq!(output, naive, "src {src}, len {len}");
             }
         }
     }
@@ -1588,29 +1539,37 @@ mod tests {
         let mut output = [0_u8; 4];
 
         // Destination overruns.
-        let mut out = 2;
-        let mut from = MatchSource::Window(0);
-        assert!(!copy_match(&mut output, &mut out, &history, &mut from, 3));
-        assert_eq!(out, 2, "a refused copy advances nothing");
+        {
+            let mut cursor = OutputCursor::from_region(OutputRegion::init(&mut output), 2);
+            let mut from = MatchSource::Window(0);
+            assert!(!copy_match(&mut cursor, &history, &mut from, 3));
+            assert_eq!(cursor.written(), 2, "a refused copy advances nothing");
+        }
         assert_eq!(output, [0; 4], "a refused copy writes nothing");
 
         // Source overruns the history.
-        let mut out = 0;
-        let mut from = MatchSource::Window(2);
-        assert!(!copy_match(&mut output, &mut out, &history, &mut from, 2));
-        assert_eq!(out, 0);
+        {
+            let mut cursor = OutputCursor::from_region(OutputRegion::init(&mut output), 0);
+            let mut from = MatchSource::Window(2);
+            assert!(!copy_match(&mut cursor, &history, &mut from, 2));
+            assert_eq!(cursor.written(), 0);
+        }
 
         // Source overruns the output.
-        let mut out = 0;
-        let mut from = MatchSource::Output(3);
-        assert!(!copy_match(&mut output, &mut out, &history, &mut from, 2));
-        assert_eq!(out, 0);
+        {
+            let mut cursor = OutputCursor::from_region(OutputRegion::init(&mut output), 0);
+            let mut from = MatchSource::Output(3);
+            assert!(!copy_match(&mut cursor, NO_HISTORY, &mut from, 2));
+            assert_eq!(cursor.written(), 0);
+        }
 
         // An index that saturated to `usize::MAX` fails its bounds check
         // instead of wrapping.
-        let mut out = 0;
-        let mut from = MatchSource::Window(usize::MAX);
-        assert!(!copy_match(&mut output, &mut out, &history, &mut from, 1));
+        {
+            let mut cursor = OutputCursor::from_region(OutputRegion::init(&mut output), 0);
+            let mut from = MatchSource::Window(usize::MAX);
+            assert!(!copy_match(&mut cursor, &history, &mut from, 1));
+        }
     }
 
     #[test]
@@ -1997,16 +1956,11 @@ mod tests {
 
         let input = [0_u8; MIN_AVAIL_IN];
         let mut next_in = 0;
-        let mut next_out = 0;
         let start = BACK_WSIZE; // `state->wsize`, not `avail_out`
-        let exit = inflate_fast(
-            &mut state,
-            &input,
-            &mut next_in,
-            &mut output,
-            &mut next_out,
-            start,
-        );
+        let mut cursor = OutputCursor::from_region(OutputRegion::init(&mut output), 0);
+        let exit = inflate_fast(&mut state, &input, &mut next_in, &mut cursor, start);
+        let next_out = cursor.written();
+        release(cursor);
 
         assert_eq!(exit.mode, Mode::Len);
         assert_eq!(exit.msg, None);
@@ -2128,19 +2082,14 @@ mod tests {
         let mut output = vec![0_u8; OUT_LEN];
         output[..4].copy_from_slice(b"abcd");
         let mut next_in = 0;
-        let mut next_out = 4;
         // `start` chosen so that `start - avail_out == 0`, i.e. `beg == out`:
         // nothing in this call's output is addressable, so a distance of two
         // must be served from the window.
-        let start = output.len() - next_out;
-        let exit = inflate_fast(
-            &mut state,
-            &input,
-            &mut next_in,
-            &mut output,
-            &mut next_out,
-            start,
-        );
+        let start = output.len() - 4;
+        let mut cursor = OutputCursor::from_region(OutputRegion::init(&mut output), 4);
+        let exit = inflate_fast(&mut state, &input, &mut next_in, &mut cursor, start);
+        let next_out = cursor.written();
+        release(cursor);
 
         assert_eq!(exit.mode, Mode::Len);
         assert_eq!(next_out, 7);
@@ -2257,16 +2206,11 @@ mod tests {
             state.mode = Mode::Len;
 
             let mut next_in = 0;
-            let mut next_out = 0;
             let start = output.len();
-            let exit = inflate_fast(
-                &mut state,
-                &input,
-                &mut next_in,
-                &mut output,
-                &mut next_out,
-                start,
-            );
+            let mut cursor = OutputCursor::from_region(OutputRegion::init(&mut output), 0);
+            let exit = inflate_fast(&mut state, &input, &mut next_in, &mut cursor, start);
+            let next_out = cursor.written();
+            release(cursor);
 
             assert!(
                 matches!(exit.mode, Mode::Len | Mode::Type | Mode::Bad),

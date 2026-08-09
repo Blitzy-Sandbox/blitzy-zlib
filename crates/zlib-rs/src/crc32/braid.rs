@@ -140,7 +140,7 @@
 //! assert_eq!(Braid::update(Braid::update(!0u32, head), tail), state);
 //! ```
 //!
-//! The examples name the [`Braid`](super::Braid) and [`Generic`](super::Generic) backends
+//! The examples name the [`Braid`] and [`Generic`](super::Generic) backends
 //! rather than the free functions, which are crate-private and which the backends forward
 //! to unchanged.
 
@@ -516,7 +516,7 @@ fn fold_blocks_big_endian(crc: u32, body: &[u8]) -> u32 {
 /// assert_eq!(Braid::update(0x1234_5678, &[]), 0x1234_5678);
 /// ```
 ///
-/// [`Braid`](super::Braid) forwards to this function unchanged and is the reachable name for
+/// [`Braid`] forwards to this function unchanged and is the reachable name for
 /// it outside the subsystem.
 #[must_use]
 pub fn crc32_braid(crc: u32, buf: &[u8]) -> u32 {
@@ -989,10 +989,11 @@ mod tests {
     fn the_two_endian_block_loops_agree_with_each_other_and_with_the_byte_path() {
         let fixture = pseudo_random();
 
-        // Executing the big-endian loop on a little-endian host is the point of this test: CI runs
-        // on x86_64, where the dispatcher in `crc32_braid` never selects it, so without calling it
-        // directly the whole of `crc32.c` L790-L912 -- the big braid tables, `crc_word_big`, and
-        // the `byte_swap` at each end -- would go untested until someone built for s390x.
+        // Executing the big-endian loop on a little-endian host is the point of this test: on the
+        // little-endian targets this port is developed and tested on, the dispatcher in
+        // `crc32_braid` never selects it, so without calling it directly the whole of `crc32.c`
+        // L790-L912 -- the big braid tables, `crc_word_big`, and the `byte_swap` at each end --
+        // would go untested until someone built for s390x.
         //
         // One block exercises the final combination with no sparse iterations at all (`blks == 1`,
         // where the C's `while (--blks)` body never runs); four exercise three of them.

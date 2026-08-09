@@ -15,8 +15,8 @@
 //! Nothing here is `#[no_mangle]`, `extern "C"` or `#[repr(C)]`, and nothing here
 //! touches a raw pointer. The crate root carries `#![forbid(unsafe_code)]`, which the
 //! compiler enforces. The exported C symbols live one layer up, in
-//! the planned `crates/libz-rs-sys/src/deflate.rs`, which will convert the caller's `z_stream`
-//! into the values these functions take and convert the [`ReturnCode`]s back into `int`s. Three
+//! `crates/libz-rs-sys/src/deflate.rs`, which converts the caller's `z_stream`
+//! into the values these functions take and converts the [`ReturnCode`]s back into `int`s. Three
 //! things C does inside these functions are therefore *not* done here, and each is
 //! called out where it belongs:
 //!
@@ -107,12 +107,12 @@ pub(crate) mod window;
 
 // `crate::deflate::Flush` is the single canonical path to the flush enumeration: the
 // one-shot wrappers in `crate::compress`, the gzip write layer in `crate::gz::write` and
-// the facade planned for `crates/libz-rs-sys/src/deflate.rs` all reach it through here. There is
+// the facade in `crates/libz-rs-sys/src/deflate.rs` all reach it through here. There is
 // no second flush type in this module.
 pub use crate::deflate::algorithm::Flush;
 // `CONFIGURATION_TABLE` must keep exactly this identifier: `crate::lib` re-exports that
-// name, and the planned `crates/zlib-rs-differential/tests/table_equality.rs` will compare it
-// element-for-element against the C array.
+// name, and a differential table-equality test would compare it element-for-element
+// against the C array. No such test is in the tree, so nothing checks it today.
 pub use crate::deflate::config_table::{Config, CONFIGURATION_TABLE};
 pub use crate::deflate::state::{DeflateState, Status};
 
@@ -135,7 +135,7 @@ use crate::deflate::pending::{
 use crate::deflate::state::{Allocator, GzHeaderView, BUF_SIZE, MIN_MATCH, PRESET_DICT};
 use crate::deflate::window::{fill_window, slide_hash};
 use crate::error::ReturnCode;
-use crate::read_buf::{InputCursor, OutputCursor};
+use crate::read_buf::{InputCursor, OutputCursor, OutputRegion};
 use crate::trees::{_tr_align, _tr_flush_bits, _tr_init, _tr_stored_block};
 
 /// The `OS` byte of the gzip header: which operating system produced the stream.
@@ -238,7 +238,15 @@ pub struct DeflateStream<'i, 'o> {
     /// How far into [`Self::input`] the stream has read. C's `next_in` advance.
     pub next_in: usize,
     /// The whole output buffer; `z_stream.next_out` addressed its `next_out`-th byte.
-    pub output: &'o mut [u8],
+    ///
+    /// An [`OutputRegion`] rather than a `&mut [u8]` because a C caller's `next_out` is
+    /// only guaranteed *writable*: `zlib.h` L94-L95 promises `avail_out` bytes of room and
+    /// says nothing about their contents, and Rust does not allow a byte slice to address a
+    /// byte that holds no value. [`OutputRegion::init`] is the shape a Rust caller has and
+    /// is what [`DeflateStream::new`] builds; the facade supplies
+    /// [`OutputRegion::write_only`] through [`DeflateStream::with_region`]. The compressor
+    /// itself never reads the output back, so the distinction costs it nothing.
+    pub output: OutputRegion<'o>,
     /// How far into [`Self::output`] the stream has written. C's `next_out` advance.
     pub next_out: usize,
     /// `z_stream.total_in`: total input bytes consumed so far (`zlib.h` L93).
@@ -270,10 +278,22 @@ impl<'i, 'o> DeflateStream<'i, 'o> {
     /// take its scalars from the [`DeflateReset`] that initialisation produced.
     #[must_use]
     pub fn new(input: &'i [u8], output: &'o mut [u8]) -> Self {
+        Self::with_region(input, OutputRegion::init(output))
+    }
+
+    /// Builds a stream whose output is `region`, with both cursors at zero and every scalar
+    /// at the value a freshly zeroed `z_stream` carries.
+    ///
+    /// The entry point `crates/libz-rs-sys` uses, because the region it has is
+    /// [`OutputRegion::write_only`]: the `avail_out` bytes at a C caller's `next_out` are
+    /// writable but not initialised. Everything [`DeflateStream::new`]'s documentation says
+    /// about restoring the scalars applies here unchanged.
+    #[must_use]
+    pub fn with_region(input: &'i [u8], region: OutputRegion<'o>) -> Self {
         Self {
             input,
             next_in: 0,
-            output,
+            output: region,
             next_out: 0,
             total_in: 0,
             total_out: 0,
@@ -298,7 +318,7 @@ impl<'i, 'o> DeflateStream<'i, 'o> {
     /// The output bytes this stream has produced, that is `output[..next_out]`.
     #[must_use]
     pub fn written(&self) -> &[u8] {
-        self.output.get(..self.next_out).unwrap_or(&[])
+        self.output.initialized(self.next_out)
     }
 
     /// Applies the `z_stream` half of a reset (`deflate.c` L651-L671).
@@ -360,7 +380,7 @@ pub struct DeflateReset {
 /// that was never a stream at all -- is assigned to the facade by AAP §0.6.1 category 3:
 /// the opaque `state` pointer must be shown to have come from this library's own
 /// allocation path, by a tag check, before it is treated as state. **The check is not
-/// dropped; it moves.** The planned `crates/libz-rs-sys/src/deflate.rs` owes the allocator-non-null
+/// dropped; it moves.** `crates/libz-rs-sys/src/deflate.rs` carries the allocator-non-null
 /// and pointer-provenance halves, and this function is the rest.
 ///
 /// # Why the remaining half is trivially satisfied inside the library
@@ -413,10 +433,14 @@ pub const fn deflate_state_check(status_raw: i32) -> bool {
 /// `test/example.c` observes.
 ///
 /// This returns only the state, matching [`crate::inflate::inflate_init2`]. A facade that
-/// owns a `z_stream` obtains the stream half by calling [`deflate_reset`] on the value
-/// returned here, mirroring C's own call chain. That is safe because [`deflate_reset`] is
-/// **idempotent**: every field it assigns already holds the assigned value on a state that
-/// has just come out of this function.
+/// owns a `z_stream` obtains the stream half by calling [`deflate_reset_snapshot`] on the
+/// value returned here, which computes those five fields and changes nothing.
+///
+/// Calling [`deflate_reset`] a second time would also produce them, and is sound -- the reset
+/// is idempotent on a state that has just come out of this function -- but it repeats
+/// `_tr_init` and the whole of `lm_init`, whose `CLEAR_HASH` writes 64 KiB at the default
+/// `memLevel` and 128 KiB at `memLevel 9`, to arrive at values that are already there. The
+/// snapshot exists so that the initialisation reset happens exactly once.
 ///
 /// # Errors
 ///
@@ -493,7 +517,42 @@ pub fn deflate_reset_keep<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>)
 
     // L651-L653 and L667-L671. `wrap` has already been un-negated above, so the choice of
     // check function sees the same value C's does -- the assignment at L667 follows the
-    // un-negation at L660 for exactly that reason.
+    // un-negation at L660 for exactly that reason, and taking the snapshot *here*, after
+    // `reset_keep`, is what preserves that order.
+    deflate_reset_snapshot(state)
+}
+
+/// The five `z_stream` values a completed reset leaves behind, computed without changing anything.
+///
+/// [`deflate_reset_keep`] ends by calling this, so there is exactly one definition of what a reset
+/// puts in a caller's stream and the two cannot drift apart.
+///
+/// # Why this exists separately
+///
+/// [`deflate_init2`] already performs a full [`deflate_reset`] -- it is C's `return deflateReset(strm)`
+/// at `deflate.c` L532 -- but it cannot return the stream half, because it has no `z_stream` to apply
+/// it to. A facade that owns one therefore needs the *value*, and the obvious way to get it is to call
+/// `deflate_reset` a second time.
+///
+/// That second call is not free. It repeats `_tr_init`, the pending-cursor and status assignments, and
+/// all of `lm_init` -- including `CLEAR_HASH`, which writes `hash_size` entries of two bytes each: at
+/// the default `memLevel` of 8 that is 64 KiB cleared twice for every `deflateInit_`, and `memLevel 9`
+/// makes it 128 KiB. None of it changes a single value, because a reset applied to a state that has
+/// just been reset is idempotent, so all of it is waste on a path callers measure.
+///
+/// This function is the alternative: it reads `state.wrap` to choose the check seed and touches
+/// nothing at all, so the initialisation reset happens exactly once.
+///
+/// # Note the ordering requirement
+///
+/// The seed depends on `wrap`, and `deflate` negates `wrap` after writing a trailer -- "write the
+/// trailer only once!" (L1288). So this must be called on a state whose `wrap` is already in its
+/// post-reset, un-negated form. That holds immediately after [`deflate_init2`], and it holds inside
+/// [`deflate_reset_keep`] because `reset_keep` un-negates first. It would **not** hold if this were
+/// called on a finished stream before its reset, which is why nothing here tries to be clever about
+/// the sign.
+#[must_use]
+pub fn deflate_reset_snapshot<'a, A: Allocator<'a>>(state: &DeflateState<'a, A>) -> DeflateReset {
     DeflateReset {
         total_in: 0,
         total_out: 0,
@@ -595,8 +654,11 @@ pub fn deflate_set_header<'a, A: Allocator<'a>>(
     state: &mut DeflateState<'a, A>,
     head: Option<GzHeaderView<'a>>,
 ) -> ReturnCode {
-    // `strm->state->wrap != 2`  (L715)
-    if state.wrap != 2 {
+    // `strm->state->wrap != 2`  (L715). Spelled through the state's own predicate so
+    // that the facade -- which must apply it *before* it reads the caller's
+    // `gz_header` at all -- and this entry point can never disagree about the
+    // condition.
+    if !state.accepts_gzip_header() {
         return ReturnCode::STREAM_ERROR;
     }
 
@@ -818,9 +880,12 @@ pub fn deflate_set_dictionary<'a, A: Allocator<'a>>(
     total_in: &mut u64,
     dictionary: &[u8],
 ) -> ReturnCode {
-    // 2. `wrap = s->wrap;` and the three rejections (L570-L572).
+    // 2. `wrap = s->wrap;` and the three rejections (L570-L572). The condition is the
+    // state's own predicate, because the facade has to apply it before it reconstructs
+    // the caller's dictionary as a slice; keeping one definition is what stops the two
+    // from drifting.
     let wrap = state.wrap;
-    if wrap == 2 || (wrap == 1 && state.status != Status::Init) || state.window.lookahead != 0 {
+    if !state.accepts_dictionary() {
         return ReturnCode::STREAM_ERROR;
     }
 
@@ -921,7 +986,7 @@ pub fn deflate_set_dictionary<'a, A: Allocator<'a>>(
 /// L630, whose remaining half cannot fail for a `&DeflateState`.
 pub fn deflate_get_dictionary<'a, A: Allocator<'a>>(
     state: &DeflateState<'a, A>,
-    dictionary: Option<&mut [u8]>,
+    dictionary: Option<&mut OutputRegion<'_>>,
     dict_length: Option<&mut u32>,
 ) -> ReturnCode {
     // `len = s->strstart + s->lookahead; if (len > s->w_size) len = s->w_size;`
@@ -936,10 +1001,15 @@ pub fn deflate_get_dictionary<'a, A: Allocator<'a>>(
             // `len <= filled`.
             let start = filled - len;
             let take = len.min(target.len());
-            if let Some(slot) = target.get_mut(..take) {
-                let copied = state.window.copy_out(start, slot);
+            if let Some(source) = state.window.region(start, take) {
+                let copied = target.write_slice_at(0, source);
                 debug_assert!(
                     copied,
+                    "deflateGetDictionary wrote outside the caller's buffer (deflate.c L637)"
+                );
+            } else {
+                debug_assert!(
+                    false,
                     "deflateGetDictionary read outside the window (deflate.c L637)"
                 );
             }
@@ -953,24 +1023,6 @@ pub fn deflate_get_dictionary<'a, A: Allocator<'a>>(
     }
 
     ReturnCode::OK
-}
-
-/// The length of a NUL-terminated field, **including** its terminator.
-///
-/// Reproduces `str = ...; if (str != Z_NULL) do { wraplen++; } while (*str++);`
-/// (`deflate.c` L897-L906): the loop increments once for every byte and once more for the
-/// terminating zero, because the post-increment tests the byte it has just passed.
-///
-/// `GzHeaderView`'s `name` and `comment` slices are contracted to include the terminator,
-/// so a well-formed field's answer is simply the slice length. Scanning for the first zero
-/// rather than trusting the length is what makes this agree with C for a slice that
-/// happens to carry trailing bytes after the terminator, and the fallback covers a slice
-/// with no terminator at all -- the case in which C reads past the end of the allocation.
-fn c_string_len_with_nul(bytes: &[u8]) -> usize {
-    match bytes.iter().position(|&byte| byte == 0) {
-        Some(index) => index + 1,
-        None => bytes.len(),
-    }
 }
 
 /// An upper bound on the compressed size of `source_len` bytes, in `size_t` units.
@@ -1077,15 +1129,18 @@ pub fn deflate_bound_z<'a, A: Allocator<'a>>(
                 // `wraplen += 2 + s->gzhead->extra_len;` (L895-L896). C reads the raw
                 // `extra_len` here, not the 16-bit-masked length it later transmits, so
                 // the slice length is the faithful value.
-                if let Some(extra) = head.extra {
-                    wraplen += 2 + extra.len();
+                if head.has_extra() {
+                    wraplen += 2 + head.advertised_extra_len();
                 }
-                // L897-L901 and L902-L906, both counting the terminator.
-                if let Some(name) = head.name {
-                    wraplen += c_string_len_with_nul(name);
+                // L897-L901 and L902-L906, both counting the terminator. The view scans
+                // its live borrow exactly as C scans the caller's string, and falls back
+                // to the length captured at `deflateSetHeader` time once the borrow has
+                // been released -- see `GzHeaderView::release_fields`.
+                if head.has_name() {
+                    wraplen += head.name_bound_len();
                 }
-                if let Some(comment) = head.comment {
-                    wraplen += c_string_len_with_nul(comment);
+                if head.has_comment() {
+                    wraplen += head.comment_bound_len();
                 }
                 // `if (s->gzhead->hcrc) wraplen += 2;`  (L907-L908)
                 if head.hcrc {
@@ -1338,9 +1393,12 @@ pub fn deflate<'a, A: Allocator<'a>>(
         let seeked_in = in_cursor.advance(*next_in);
         debug_assert!(seeked_in, "next_in is past the end of the input buffer");
 
-        let mut out_cursor = OutputCursor::new(output);
-        let seeked_out = out_cursor.advance(*next_out);
-        debug_assert!(seeked_out, "next_out is past the end of the output buffer");
+        // The cursor owns its region for the duration of the call -- a complete handle on
+        // the caller's buffer that hands out no view of it -- so the region is moved out of
+        // the stream here and moved back by the single write-back at the end. The guard
+        // above has already established that `next_out` is inside it.
+        let region = core::mem::replace(output, OutputRegion::empty());
+        let out_cursor = OutputCursor::from_region(region, *next_out);
 
         StreamCursors {
             input: in_cursor,
@@ -1524,9 +1582,9 @@ pub fn deflate<'a, A: Allocator<'a>>(
                     // is the same value an `|` would give.
                     let flg = u8::from(head.text)
                         + if head.hcrc { 2 } else { 0 }
-                        + if head.extra.is_none() { 0 } else { 4 }
-                        + if head.name.is_none() { 0 } else { 8 }
-                        + if head.comment.is_none() { 0 } else { 16 };
+                        + if head.has_extra() { 4 } else { 0 }
+                        + if head.has_name() { 8 } else { 0 }
+                        + if head.has_comment() { 16 } else { 0 };
                     put_byte(state, flg);
 
                     // `MTIME`, four bytes, least significant first (L1098-L1101).
@@ -1547,8 +1605,8 @@ pub fn deflate<'a, A: Allocator<'a>>(
                     // `XLEN`, two bytes, least significant first (L1106-L1109). C writes
                     // the raw `extra_len`; only its low 16 bits are transmitted, which is
                     // also the number of bytes the next stage copies (L1120).
-                    if let Some(extra) = head.extra {
-                        let extra_len = widen(extra.len());
+                    if head.has_extra() {
+                        let extra_len = widen(head.advertised_extra_len());
                         put_byte(state, byte_at(extra_len, 0));
                         put_byte(state, byte_at(extra_len, 8));
                     }
@@ -1573,11 +1631,11 @@ pub fn deflate<'a, A: Allocator<'a>>(
         // header makes that structural; a stream that somehow arrived here with no header
         // simply advances, which is what C would have done had it not faulted.
         if state.status == Status::Extra {
-            if let Some(extra) = state.gzhead.and_then(|head| {
-                // The transmitted field is the first `extra_len` bytes, i.e. at most
-                // 65535 of them (L1120).
-                head.extra.and_then(|extra| extra.get(..head.extra_len()))
-            }) {
+            // The transmitted field is the first `extra_len` bytes, i.e. at most 65535 of
+            // them (L1120). `extra_chunk(0)` is that span; the borrow is a `Cell` slice
+            // because the bytes are the caller's and the caller may write them -- see
+            // `GzHeaderView`.
+            if let Some(extra) = state.gzhead.and_then(|head| head.extra_chunk(0)) {
                 // `ulg beg = s->pending;` -- "start of bytes to update crc" (L1119)
                 let mut beg = state.pending_bytes();
 
@@ -1601,7 +1659,7 @@ pub fn deflate<'a, A: Allocator<'a>>(
                     // copy);` and `s->pending = s->pending_buf_size;`  (L1123-L1125)
                     let chunk = extra.get(state.gzindex..).unwrap_or(&[]);
                     let chunk = chunk.get(..copy).unwrap_or(chunk);
-                    let copied = state.pending.append(chunk);
+                    let copied = state.pending.append_cells(chunk);
                     debug_assert_eq!(
                         copied, copy,
                         "the extra-field chunk did not fill the pending buffer \
@@ -1627,7 +1685,7 @@ pub fn deflate<'a, A: Allocator<'a>>(
                 // The tail: `zmemcpy(..., left); s->pending += left;`  (L1136-L1138)
                 let chunk = extra.get(state.gzindex..).unwrap_or(&[]);
                 let chunk = chunk.get(..left).unwrap_or(chunk);
-                let copied = state.pending.append(chunk);
+                let copied = state.pending.append_cells(chunk);
                 debug_assert_eq!(
                     copied, left,
                     "the extra-field tail did not fit in the pending buffer \
@@ -1644,7 +1702,7 @@ pub fn deflate<'a, A: Allocator<'a>>(
         // `FNAME`, RFC 1952 §2.3.1.1 -- L1144-L1165. A NUL-terminated ISO 8859-1 string,
         // emitted one byte at a time so that it can resume anywhere.
         if state.status == Status::Name {
-            if let Some(head) = state.gzhead.filter(|head| head.name.is_some()) {
+            if let Some(head) = state.gzhead.filter(GzHeaderView::has_name) {
                 // `ulg beg = s->pending;`  (L1146)
                 let mut beg = state.pending_bytes();
 
@@ -1689,7 +1747,7 @@ pub fn deflate<'a, A: Allocator<'a>>(
         // `FCOMMENT`, RFC 1952 §2.3.1.1 -- L1166-L1186. Identical to `FNAME` except for the
         // missing `gzindex` rewind.
         if state.status == Status::Comment {
-            if let Some(head) = state.gzhead.filter(|head| head.comment.is_some()) {
+            if let Some(head) = state.gzhead.filter(GzHeaderView::has_comment) {
                 let mut beg = state.pending_bytes();
                 loop {
                     if state.pending_bytes() == state.pending_buf_size() {
@@ -1736,6 +1794,19 @@ pub fn deflate<'a, A: Allocator<'a>>(
                 cursors.check = crc32(0, &[]);
             }
             state.status = Status::Busy;
+
+            // ★ The gzip header is now entirely in the pending buffer, so the caller's
+            // `extra`, `name` and `comment` will never be read again -- and `zlib.h`
+            // L836-L852 asks the application to keep them available only until exactly this
+            // point. The borrows are dropped here rather than left to the state's own
+            // lifetime, so a caller that frees them next does not leave this crate holding
+            // dangling references. Every scalar and length survives, so `deflateBound` and
+            // the `FLG` byte are unaffected; see `DeflateState::release_gzhead_fields`.
+            //
+            // Placed *before* the flush below, because that flush can yield out of the
+            // driver: the status is already `BUSY_STATE`, so a resumed call re-enters past
+            // every header state and would never reach a release placed after it.
+            state.release_gzhead_fields();
 
             // "Compression must start with an empty pending buffer" (L1202-L1207).
             if flush_pending_and_yield(state, &mut cursors) {
@@ -1868,9 +1939,13 @@ pub fn deflate<'a, A: Allocator<'a>>(
         }
     };
 
-    // `RESTORE()`: the single write-back for all twelve of C's exit paths.
+    // `RESTORE()`: the single write-back for all twelve of C's exit paths. The output
+    // region returns to the stream here, which is the only place it can, because
+    // `cursors` is consumed by this destructuring.
+    let (region, produced) = cursors.output.into_region();
+    *output = region;
     *next_in = cursors.input.consumed();
-    *next_out = cursors.output.written();
+    *next_out = produced;
     *total_in = cursors.total_in;
     *total_out = cursors.total_out;
     *adler = cursors.check;
@@ -1899,12 +1974,19 @@ pub fn deflate<'a, A: Allocator<'a>>(
 /// a field the facade owns: `ZFREE(strm, strm->state)` (L1306) and
 /// `strm->state = Z_NULL` (L1307).
 ///
+/// ★ The state arrives by mutable reference, not by value, and that is a soundness
+/// requirement rather than a style choice: a state moved into this function would carry
+/// its buffers' borrows in argument position, where they are protected for the whole
+/// call, and freeing memory a protected reference covers is undefined behaviour. The
+/// caller keeps the state and drops it where it lives, with every buffer already
+/// released. `zlib_rs::allocate::ForeignBlock` records the rule in full.
+///
 /// # Errors
 ///
 /// [`ReturnCode::DATA_ERROR`] when the stream was in [`Status::Busy`], i.e. compression had
 /// begun and had not been finished. `deflateEnd` still frees everything in that case; the
 /// code is a report, not a refusal.
-pub fn deflate_end<'a, A: Allocator<'a>>(state: DeflateState<'a, A>) -> ReturnCode {
+pub fn deflate_end<'a, A: Allocator<'a>>(state: &mut DeflateState<'a, A>) -> ReturnCode {
     // `status = strm->state->status;`  (L1298) -- before the teardown.
     let status = state.status();
 
@@ -2157,7 +2239,7 @@ mod tests {
             );
             stream.next_out
         };
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
         out.truncate(produced);
         out
     }
@@ -2176,7 +2258,7 @@ mod tests {
             );
             stream.next_out
         };
-        assert_eq!(inflate_end(state), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut state), ReturnCode::OK);
         out.truncate(produced);
         out
     }
@@ -2296,7 +2378,7 @@ mod tests {
             );
             stream.next_out
         };
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
         out.truncate(produced);
 
         assert_ne!(out[1] & 0x20, 0, "FDICT must be set when strstart != 0");
@@ -2409,7 +2491,7 @@ mod tests {
                 // L986 returns before `msg` is touched, unlike the guards at L990-L995.
                 assert!(stream.msg.is_none(), "flush {flush} must not set msg");
             }
-            assert_eq!(deflate_end(state), ReturnCode::OK);
+            assert_eq!(deflate_end(&mut state), ReturnCode::OK);
         }
     }
 
@@ -2427,7 +2509,7 @@ mod tests {
             );
             assert!(stream.msg.is_some(), "ERR_RETURN sets msg");
         }
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -2464,7 +2546,7 @@ mod tests {
         }
         assert_eq!(cursor, after_first, "the rejected call must emit nothing");
         // Freed from BUSY_STATE, so Z_DATA_ERROR (L1309) -- verified against the oracle.
-        assert_eq!(deflate_end(state), ReturnCode::DATA_ERROR);
+        assert_eq!(deflate_end(&mut state), ReturnCode::DATA_ERROR);
 
         // Z_BLOCK after Z_NO_FLUSH is allowed, because RANK(Z_BLOCK) = 1 > 0 = RANK(Z_NO_FLUSH).
         let (mut state, reset) = open(6, 15, 8, 0);
@@ -2486,7 +2568,7 @@ mod tests {
                 "Z_BLOCK outranks Z_NO_FLUSH and must not be rejected"
             );
         }
-        assert_eq!(deflate_end(state), ReturnCode::DATA_ERROR);
+        assert_eq!(deflate_end(&mut state), ReturnCode::DATA_ERROR);
     }
 
     #[test]
@@ -2522,7 +2604,7 @@ mod tests {
                 ReturnCode::STREAM_ERROR
             );
         }
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -2574,14 +2656,22 @@ mod tests {
         // return code is this function's responsibility even though `Drop` owns the memory.
 
         // INIT_STATE: nothing has been compressed, so Z_OK.
-        let (state, _reset) = open(6, 15, 8, 0);
+        let (mut state, _reset) = open(6, 15, 8, 0);
         assert_eq!(state.status, Status::Init);
-        assert_eq!(deflate_end(state), ReturnCode::OK, "Z_OK from INIT_STATE");
+        assert_eq!(
+            deflate_end(&mut state),
+            ReturnCode::OK,
+            "Z_OK from INIT_STATE"
+        );
 
         // GZIP_STATE is likewise not BUSY.
-        let (state, _reset) = open(6, 31, 8, 0);
+        let (mut state, _reset) = open(6, 31, 8, 0);
         assert_eq!(state.status, Status::GzipHeader);
-        assert_eq!(deflate_end(state), ReturnCode::OK, "Z_OK from GZIP_STATE");
+        assert_eq!(
+            deflate_end(&mut state),
+            ReturnCode::OK,
+            "Z_OK from GZIP_STATE"
+        );
 
         // BUSY_STATE: a stream abandoned mid-compression. `test/infcover.c` exercises this.
         let (mut state, reset) = open(6, 15, 8, 0);
@@ -2593,7 +2683,7 @@ mod tests {
         }
         assert_eq!(state.status, Status::Busy);
         assert_eq!(
-            deflate_end(state),
+            deflate_end(&mut state),
             ReturnCode::DATA_ERROR,
             "Z_DATA_ERROR when a stream is freed from BUSY_STATE"
         );
@@ -2610,7 +2700,11 @@ mod tests {
             );
         }
         assert_eq!(state.status, Status::Finish);
-        assert_eq!(deflate_end(state), ReturnCode::OK, "Z_OK from FINISH_STATE");
+        assert_eq!(
+            deflate_end(&mut state),
+            ReturnCode::OK,
+            "Z_OK from FINISH_STATE"
+        );
     }
 
     /// Runs `deflate_params` on a state and reports whether the driver was re-entered with
@@ -2643,7 +2737,7 @@ mod tests {
         assert_eq!(code, ReturnCode::OK);
         assert!(!flushed, "no Z_BLOCK before the first deflate call");
         assert_eq!(written, 0, "and therefore nothing emitted");
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
 
         // A helper that compresses a first segment so that `last_flush == Z_NO_FLUSH`.
         let prime = |level: i32, strategy: i32| {
@@ -2670,7 +2764,7 @@ mod tests {
         assert!(written > at, "the Z_BLOCK must emit the pending block");
         // Every primed state below is still in BUSY_STATE, so `deflateEnd` reports
         // Z_DATA_ERROR (L1309); only the un-primed state in case (1) returns Z_OK.
-        assert_eq!(deflate_end(state), ReturnCode::DATA_ERROR);
+        assert_eq!(deflate_end(&mut state), ReturnCode::DATA_ERROR);
 
         // (3) Same function (levels 4-9 all map to deflate_slow) and same strategy, so no
         // re-entry: `func != configuration_table[level].func` is false.
@@ -2679,7 +2773,7 @@ mod tests {
         assert_eq!(code, ReturnCode::OK);
         assert!(!flushed, "level 6 -> 5 keeps deflate_slow, so no Z_BLOCK");
         assert_eq!(written, at, "and nothing is emitted");
-        assert_eq!(deflate_end(state), ReturnCode::DATA_ERROR);
+        assert_eq!(deflate_end(&mut state), ReturnCode::DATA_ERROR);
 
         // (4) A strategy change alone is enough, even with the function unchanged, because
         // the test is `strategy != s->strategy || func != ...`.
@@ -2687,7 +2781,7 @@ mod tests {
         let (code, flushed, _written) = params_flushed(&mut state, &mut out, at, 6, 1);
         assert_eq!(code, ReturnCode::OK);
         assert!(flushed, "a strategy change alone triggers Z_BLOCK");
-        assert_eq!(deflate_end(state), ReturnCode::DATA_ERROR);
+        assert_eq!(deflate_end(&mut state), ReturnCode::DATA_ERROR);
 
         // (5) Out-of-range arguments are rejected before anything else (L784-L788).
         let (mut state, mut out, at) = prime(6, 0);
@@ -2708,7 +2802,7 @@ mod tests {
             "Z_DEFAULT_COMPRESSION becomes level 6"
         );
         assert_eq!(state.level(), 6);
-        assert_eq!(deflate_end(state), ReturnCode::DATA_ERROR);
+        assert_eq!(deflate_end(&mut state), ReturnCode::DATA_ERROR);
     }
 
     //  deflateBound / deflateBound_z (deflate.c L856-L937)
@@ -2726,7 +2820,7 @@ mod tests {
         // with wraplen 6 for zlib, 0 for raw and 18 for gzip (L882-L913).
 
         // sourceLen 0: 0 + 0 + 0 + 0 + 13 - 6 + 6 = 13.
-        let (state, _r) = open(6, 15, 8, 0);
+        let (mut state, _r) = open(6, 15, 8, 0);
         assert_eq!(deflate_bound_z(Some(&state), 0), 13, "zlib, sourceLen 0");
         // 13 + 0 + 0 + 0 + 13 - 6 + 6 = 26.
         assert_eq!(deflate_bound_z(Some(&state), 13), 26, "zlib, sourceLen 13");
@@ -2736,17 +2830,17 @@ mod tests {
             1_000_318,
             "zlib, sourceLen 1000000"
         );
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
 
         // Raw: wraplen 0, so 0 + 13 - 6 + 0 = 7.
-        let (state, _r) = open(6, -15, 8, 0);
+        let (mut state, _r) = open(6, -15, 8, 0);
         assert_eq!(deflate_bound_z(Some(&state), 0), 7, "raw, sourceLen 0");
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
 
         // Gzip with no installed header: wraplen 18, so 0 + 13 - 6 + 18 = 25.
-        let (state, _r) = open(6, 31, 8, 0);
+        let (mut state, _r) = open(6, 31, 8, 0);
         assert_eq!(deflate_bound_z(Some(&state), 0), 25, "gzip, sourceLen 0");
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -2769,7 +2863,7 @@ mod tests {
             30,
             "after the dictionary: +4"
         );
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -2781,33 +2875,33 @@ mod tests {
 
         // memLevel 1 => hash_bits 8; `15 <= 8` is false, so storelen:
         //   1000 + 31 + 7 + 0 + 7 = 1045, plus wraplen 6 = 1051.
-        let (state, _r) = open(6, 15, 1, 0);
+        let (mut state, _r) = open(6, 15, 1, 0);
         assert_eq!(
             deflate_bound_z(Some(&state), 1000),
             1051,
             "memLevel 1 uses storelen"
         );
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
 
         // windowBits 9 with memLevel 8 => w_bits 9 <= hash_bits 15 and level != 0, so
         // fixedlen: 1000 + 125 + 3 + 1 + 4 = 1133, plus wraplen 6 = 1139.
-        let (state, _r) = open(6, 9, 8, 0);
+        let (mut state, _r) = open(6, 9, 8, 0);
         assert_eq!(
             deflate_bound_z(Some(&state), 1000),
             1139,
             "windowBits 9 uses fixedlen"
         );
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
 
         // ★ The same parameters at level 0 fall back to storelen, because the condition
         // includes `&& s->level`: 1045 + 6 = 1051.
-        let (state, _r) = open(0, 9, 8, 0);
+        let (mut state, _r) = open(0, 9, 8, 0);
         assert_eq!(
             deflate_bound_z(Some(&state), 1000),
             1051,
             "level 0 uses storelen"
         );
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
@@ -2829,23 +2923,23 @@ mod tests {
             usize::MAX,
             "invalid state saturates rather than wrapping"
         );
-        let (state, _r) = open(6, 15, 8, 0);
+        let (mut state, _r) = open(6, 15, 8, 0);
         assert_eq!(
             deflate_bound_z(Some(&state), usize::MAX),
             usize::MAX,
             "the tight default branch saturates too"
         );
         // And the conservative branch.
-        assert_eq!(deflate_end(state), ReturnCode::OK);
-        let (state, _r) = open(6, 15, 1, 0);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
+        let (mut state, _r) = open(6, 15, 1, 0);
         assert_eq!(deflate_bound_z(Some(&state), usize::MAX), usize::MAX);
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     }
 
     #[test]
     fn bound_and_bound_z_agree() {
         // `deflateBound` is `deflateBound_z` narrowed to `uLong` (L929-L932).
-        let (state, _r) = open(6, 15, 8, 0);
+        let (mut state, _r) = open(6, 15, 8, 0);
         for source_len in [0u64, 1, 13, 1000, 65_536, 1_000_000] {
             assert_eq!(
                 deflate_bound(Some(&state), source_len),
@@ -2854,7 +2948,7 @@ mod tests {
             );
         }
         assert_eq!(deflate_bound(Some(&state), 0), 13);
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
     }
 
     // 3 window forms x 10 levels x 4 payloads, one of them 4 KiB, is 120 whole compressions.
@@ -2884,9 +2978,9 @@ mod tests {
                     &b"hello, hello!"[..],
                     &[0x5au8; 4096][..],
                 ] {
-                    let (state, _r) = open(level, window_bits, 8, 0);
+                    let (mut state, _r) = open(level, window_bits, 8, 0);
                     let bound = deflate_bound_z(Some(&state), payload.len());
-                    assert_eq!(deflate_end(state), ReturnCode::OK);
+                    assert_eq!(deflate_end(&mut state), ReturnCode::OK);
                     let out = compress(payload, level, window_bits, 8, 0);
                     assert!(
                         out.len() <= bound,
@@ -2970,7 +3064,7 @@ mod tests {
             );
             stream.next_out
         };
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
         out.truncate(produced);
 
         // Now inflate it: the FDICT bit makes `inflate` stop with Z_NEED_DICT and report
@@ -2986,7 +3080,7 @@ mod tests {
                 ReturnCode::NEED_DICT,
                 "a preset-dictionary stream must ask for the dictionary"
             );
-            assert_eq!(stream.adler, dict_adler, "and report its Adler-32");
+            assert_eq!(stream.adler, Some(dict_adler), "and report its Adler-32");
             assert_eq!(
                 crate::inflate::inflate_set_dictionary(&mut istate, DICTIONARY),
                 ReturnCode::OK
@@ -2997,7 +3091,7 @@ mod tests {
             );
             stream.next_out
         };
-        assert_eq!(inflate_end(istate), ReturnCode::OK);
+        assert_eq!(inflate_end(&mut istate), ReturnCode::OK);
         restored.truncate(produced);
         assert_eq!(
             restored, HELLO,
@@ -3043,7 +3137,7 @@ mod tests {
             );
             stream.next_out
         };
-        assert_eq!(deflate_end(state), ReturnCode::OK);
+        assert_eq!(deflate_end(&mut state), ReturnCode::OK);
 
         let mut expected = Vec::from(&first[..]);
         expected.extend_from_slice(second);

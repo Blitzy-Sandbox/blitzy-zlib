@@ -98,10 +98,10 @@
 //!   on the checksum functions never terminating the process, so aborting a C caller that passed a
 //!   junk `uLong` would itself be a behaviour change -- and a worse one than a truncated result.
 //! * **Widen the return to `u64`** so the facade's `as c_ulong` reproduces both integer models
-//!   exactly. This is the technically complete fix and it is recorded here for whoever lands
-//!   `crates/libz-rs-sys/src/checksum.rs`: that file is the right place to decide it, because it
-//!   owns the `uLong` mapping. It is not done unilaterally from here because it changes a public
-//!   signature of this crate that the facade consumes, and the facade has not landed yet.
+//!   exactly. This is the technically complete fix, and the decision belongs to
+//!   `crates/libz-rs-sys/src/checksum.rs`, because that is the file that owns the `uLong`
+//!   mapping. It is not taken unilaterally from here: it changes a public signature of this
+//!   crate, so it has to change on both sides of the boundary at once.
 //!
 //! Widening the result back to `uLong` for the caller is the facade's responsibility either way.
 //!

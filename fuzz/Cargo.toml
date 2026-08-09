@@ -210,7 +210,7 @@ libz_rs_sys = { package = "libz-rs-sys", path = "../crates/libz-rs-sys" }
 #   3. Its lib target is to compile with zero regular dependencies — `src/lib.rs`
 #      is to be just `pub mod oracle;`, with `src/oracle.rs` declaring its own
 #      local `#[repr(C)]` mirrors — so a plain `[dependencies]` entry suffices
-#      even though zlib-rs, libz-rs-sys and criterion appear in its
+#      even though zlib-rs and libz-rs-sys appear in its
 #      dev-dependencies.  Neither of those two source files has been written yet.
 #   4. `exclude = ["fuzz"]` in the root manifest removes workspace MEMBERSHIP
 #      only; cross-workspace PATH dependencies remain perfectly legal in Cargo.

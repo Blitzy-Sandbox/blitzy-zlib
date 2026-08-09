@@ -63,7 +63,7 @@
 //! * The three chain assignments themselves belong to [`crate::weak_slice::HashChains`], whose
 //!   `insert_string` is "an exact mirror of `INSERT_STRING` minus the hash update"; this module owns
 //!   the hash update and the composition. `NIL`, [`Pos`](crate::weak_slice::Pos),
-//!   [`IPos`](crate::weak_slice::IPos) and [`MIN_MATCH`] are that module's too, and are imported
+//!   [`IPos`] and [`MIN_MATCH`] are that module's too, and are imported
 //!   here rather than redeclared.
 //! * `slide_hash` (`deflate.c` L177-L211) is deliberately **not** here. It belongs to the window
 //!   module, which slides the window and the tables together; it reaches the per-entry rule

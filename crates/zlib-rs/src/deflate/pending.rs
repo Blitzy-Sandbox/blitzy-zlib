@@ -88,7 +88,7 @@
 //!
 //! `_tr_flush_bits` is `trees.c`'s (L880-L882), and `trees` is a *sibling* of `deflate` in this
 //! implementation rather than something beneath it: `trees.c`'s only `#include` is `"deflate.h"`, so the
-//! Huffman coder mutates the same [`DeflateState`](crate::deflate::state::DeflateState) this
+//! Huffman coder mutates the same [`DeflateState`] this
 //! module does. [`flush_pending`] therefore takes the step as a parameter and calls it first,
 //! inside itself. Two things follow, and both are the point:
 //!

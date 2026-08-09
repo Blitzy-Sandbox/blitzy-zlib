@@ -5,23 +5,23 @@
 # Its `build.rs` compiles the fifteen in-tree C translation units (the authoritative
 # set is `Makefile.in`'s `OBJZ` + `OBJG` object lists: adler32, crc32, deflate,
 # infback, inffast, inflate, inftrees, trees, zutil, compress, uncompr, gzclose,
-# gzlib, gzread, gzwrite) into a test-only static archive. The planned `src/oracle.rs`
-# will declare those symbols so a single process can run the Rust port and the C
-# reference implementation side by side and compare their output bytes. That is what
-# will turn "compressed output is byte-identical to the reference" (AAP 0.7.1(c),
-# 0.6.4.1-0.6.4.2) from an assertion into a measured fact; until `src/oracle.rs` and
-# `tests/**` land, it remains an assertion.
+# gzlib, gzread, gzwrite) into a test-only static archive. `src/oracle.rs` declares
+# those symbols under a `c_` prefix so a single process can run the Rust port and the
+# C reference implementation side by side and compare their output bytes. The machinery
+# for that comparison is therefore in place; the comparison itself is not, because the
+# `tests/**` suites that would perform it are not in the tree. So "compressed output is
+# byte-identical to the reference" remains an unmeasured requirement, not a result.
 #
 # THE ONE-WAY DEPENDENCY EDGE IS THE WHOLE POINT
 # This crate depends on the two shipped crates; NEITHER shipped crate may ever
 # depend on it. `crates/zlib-rs` has an empty `[dependencies]` table and
-# `crates/libz-rs-sys` depends only on `zlib-rs` (plus an optional pinned `libc`), so
+# `crates/libz-rs-sys` depends on nothing but `zlib-rs`, so
 # `cargo build --release` for `libz.so`/`libz.a` never invokes a C compiler and never
 # links the oracle. That is the mechanical proof that the reference implementation is
 # an ORACLE and not a build dependency. Verify with:
 #
-#     cargo tree -p zlib-rs     -e normal   # must not mention cc, criterion, or this crate
-#     cargo tree -p libz-rs-sys -e normal   # must not mention cc, criterion, or this crate
+#     cargo tree -p zlib-rs     -e normal   # must not mention cc or this crate
+#     cargo tree -p libz-rs-sys -e normal   # must not mention cc or this crate
 #
 # VERIFICATION POSTURE -- DO NOT "FIX" THE MIRI EXCLUSION
 # This crate sits deliberately OUTSIDE the Miri gate: Miri interprets Rust MIR and
@@ -33,11 +33,10 @@
 # than as an oversight to be "corrected".
 #
 # UNSAFE (AAP 0.7.1(a))
-# No key below enables or excuses `unsafe`. All `unsafe` in this crate is to live in
+# No key below enables or excuses `unsafe`. All `unsafe` in this crate lives in
 # `src/oracle.rs`'s `extern "C"` declarations and their call sites, each carrying its
-# own `// SAFETY:` comment; that file has not landed yet, so the crate currently
-# contains none. Do NOT add `[lints.rust] unsafe_code = "forbid"` here -- it would
-# make `src/oracle.rs` uncompilable once it arrives. `#![forbid(unsafe_code)]` is a
+# own `// SAFETY:` comment. Do NOT add `[lints.rust] unsafe_code = "forbid"` here --
+# it would make `src/oracle.rs` uncompilable. `#![forbid(unsafe_code)]` is a
 # crate-root attribute of `crates/zlib-rs` alone, and the facade's counterpart
 # `#![deny(unsafe_op_in_unsafe_fn)]` is a crate-root attribute of
 # `crates/libz-rs-sys`.
@@ -49,16 +48,17 @@
 # host because all three suites are specified to measure against the C oracle that
 # it builds.
 #
-# CHECKPOINT STATE: `benches/` does not exist yet, so the `[[bench]]` entries are
-# NOT declared here yet either -- a bench entry naming a file that is absent makes
-# every Cargo invocation that enumerates targets (`--all-targets`, `cargo fmt
-# --all`) fail while resolving it, so the entries are added in the same change that
-# adds the files. Measured with the entries withheld: `cargo metadata` resolves the
-# workspace and reports no bench target for this crate.
+# `benches/` is absent, so the `[[bench]]` entries are NOT declared here either -- a
+# bench entry naming a file that is absent makes every Cargo invocation that
+# enumerates targets (`--all-targets`, `cargo fmt --all`) fail while resolving it, so
+# the entries belong in the same change that adds the files. Measured with the entries
+# withheld: `cargo metadata` resolves the workspace and reports no bench target for
+# this crate.
 #
-# `tests/` does not exist yet either, so every claim below about what the oracle
-# archive, the differential tests or the benchmarks establish is an intended
-# contract rather than an observed result.
+# `tests/` is absent too. So every claim below about what the differential tests or the
+# benchmarks establish describes an intended contract, never an observed result: the
+# oracle archive and its `src/oracle.rs` declarations are built and linkable, and
+# nothing yet compares the two implementations with them.
 
 [package]
 name = "zlib-rs-differential"
@@ -72,7 +72,17 @@ name = "zlib-rs-differential"
 version.workspace = true
 edition.workspace = true      # 2021 -- see rust-version
 rust-version.workspace = true # 1.80. Edition 2024 requires rustc >= 1.85 and cargo
-                              # rejects that pairing outright.
+                              # rejects that pairing outright.  Inheriting the floor
+                              # is honest again now that this package's dev graph no
+                              # longer carries criterion: `cargo +1.80 metadata
+                              # --locked` and `cargo +1.80 check --locked --workspace
+                              # --all-targets` both succeed.  Should the benchmark
+                              # suites be attached HERE rather than to a package of
+                              # their own, this line must be replaced by an explicit
+                              # `rust-version = "1.86"` -- criterion's own floor --
+                              # because a package cannot claim 1.80 and then require
+                              # a dev graph 1.80 cannot resolve.  See the criterion
+                              # note in the root `[workspace.dependencies]`.
 license.workspace = true      # Zlib -- the SPDX id for the in-tree LICENSE, and an
                               # allowed identifier in deny.toml.
 description = "Dev-only differential harness comparing the Rust zlib implementation against the in-tree C oracle"
@@ -110,19 +120,20 @@ default = []
 # dependency by its key in this manifest, which is the rename introduced below.
 simd = ["zlib-rs/simd", "libz_rs_sys/simd"]
 
-# Intentionally empty, and audited as such. `src/lib.rs` is to be a module holder for
-# `src/oracle.rs`, which will contain only `extern "C"` declarations and type aliases,
+# Intentionally empty, and audited as such. `src/lib.rs` is a module holder for
+# `src/oracle.rs`, which contains only `extern "C"` declarations, `#[repr(C)]`
+# mirrors, safe slice views over the generated tables and a minimal smoke module,
 # so the non-test build of this crate needs no dependency whatsoever. Everything the
 # tests and benchmarks need is a dev-dependency, which is what keeps this crate out
-# of the shipped crates' graphs (AAP 0.6.4.1). Neither file exists yet, so this table
-# is empty by design *and* by circumstance.
+# of the shipped crates' graphs.
 [dependencies]
 
 # Third-party pins live in the root `[workspace.dependencies]` so that each version
 # is stated in exactly one place; `{ workspace = true }` inherits them. Should a root
 # entry ever be removed, fall back to the exact pin -- `zlib-rs = { path =
-# "../zlib-rs" }`, `criterion = "0.8.2"`, `cc = "1.4.0"` -- and never to a wildcard:
-# `deny.toml` sets `[bans] wildcards = "deny"`.
+# "../zlib-rs" }`, `cc = "1.4.0"`, and `criterion = "0.8.2"` when the benchmark
+# suites bring it back -- and never to a wildcard: `deny.toml` sets `[bans]
+# wildcards = "deny"`.
 [dev-dependencies]
 # The safe core, for tests and benchmarks that drive the typed Rust surface directly:
 # `rust-api` exposes the typed configuration surface used to enumerate the
@@ -140,10 +151,7 @@ zlib-rs = { workspace = true, features = ["rust-api", "std"] }
 # `[lib] name = "z"` so Cargo emits `libz.so`/`libz.a`; with a plain dependency key
 # Cargo would pass `--extern z=...` and the Rust path would be `z`. The
 # dependency-rename form below makes Cargo pass `--extern libz_rs_sys=...`, so every
-# module, test and attached bench in this crate writes `use libz_rs_sys::...`. None of
-# those targets exists yet, so the rename was verified against a throwaway target
-# compiled against a `[lib] name = "z"` dependency rather than against this crate's
-# own sources.
+# module, test and attached bench in this crate writes `use libz_rs_sys::...`.
 # `libz-rs-sys` is a workspace member and is not listed in the root
 # `[workspace.dependencies]`, hence the path form rather than `workspace = true`.
 #
@@ -164,51 +172,60 @@ zlib-rs = { workspace = true, features = ["rust-api", "std"] }
 # resolution, so nothing is ever fetched from crates.io.
 libz_rs_sys = { package = "libz-rs-sys", path = "../libz-rs-sys", version = "1.3.2" }
 
-# Benchmark harness for the suites attached below (pinned to 0.8.2 in the root
-# `[workspace.dependencies]`; licensed "Apache-2.0 OR MIT", which deny.toml allows).
+# NO criterion EDGE HERE -- AND THIS IS THE REASON, because it is the one dependency
+# decision in this workspace that the declared MSRV depends on.
 #
-# NOTE FOR CI. Two facts here are measured; one earlier claim was not, and has been
-# corrected.
+# criterion 0.8.2 is the harness the AAP pins for the three benchmark suites, and it
+# was declared here ahead of them. Measured, on this tree: criterion 0.8.2 declares
+# `rust-version = "1.86"` (vendored `criterion-0.8.2/Cargo.toml` L14), and its graph
+# reaches `clap 4.6.5`, whose `clap_builder`/`clap_lex` declare `edition = "2024"`.
+# Cargo 1.80.1 cannot parse an edition-2024 manifest, so with that edge present
+# ANYTHING that resolves this package's dev graph failed on the declared floor:
 #
-# Measured: criterion 0.8.2 declares `rust-version = "1.86"`, above this workspace's
-# 1.80 MSRV (read from the vendored `criterion-0.8.2/Cargo.toml`, L14). Measured: its
-# transitive graph really is unparseable by cargo 1.80 -- `clap_builder 4.6.5`, pulled
-# in through `clap 4.6.5`, declares `edition = "2024"`, and cargo 1.80.1 rejects it
-# with "feature `edition2024` is required ... not stabilized in this version of Cargo".
+#   cargo +1.80 metadata --locked                     -> exit 101, `edition2024`
+#   cargo +1.80 check --locked --workspace --all-targets -> same
 #
-# NOT measured, and previously overstated: this file used to claim that
-# `cargo +1.80 metadata` and `cargo +1.80 build -p zlib-rs-differential` both succeed.
-# They do not demonstrate anything at this checkpoint. `cargo +1.80 metadata` exits
-# 101, and `cargo +1.80 build -p zlib-rs-differential` exits 0 only vacuously, because
-# this package currently exposes no lib or bin target for `build` to select -- only the
-# three unresolvable bench targets and the build script.
+# while this package went on inheriting `rust-version = "1.80"` from the root. A
+# package cannot both claim a floor and be unresolvable by it, and documenting the
+# contradiction is not the same as removing it. Since `benches/` does not exist, no
+# `[[bench]]` target is declared, and no source here names the crate, the edge gated
+# nothing -- so it is gone, and both commands above now succeed.
 #
-# The operational conclusion stands on the declared `rust-version` alone and does not
-# depend on either command: the MSRV claim of the SHIPPED crates is untouched, because
-# criterion is a dev-dependency of a dev-only crate, but an MSRV-floor job must NOT run
-# `cargo test`, `cargo bench`, or `--all-targets` for this package on 1.80.
+# WHEN THE SUITES LAND, the harness comes back with them, in a package that does not
+# inherit the 1.80 contract -- either this one with an explicit
+# `rust-version = "1.86"` in place of the inherited line above, or a package excluded
+# from the workspace with its own lock, as `fuzz/` already is. The root
+# `[workspace.dependencies]` note spells out both shapes. Two details worth carrying
+# forward when that happens:
 #
-# What that does and does not cost, measured on this tree:
+#   * `criterion = "0.8.2"`, licensed "Apache-2.0 OR MIT", which deny.toml allows;
+#     restore it to the root table so the version stays stated in one place.
+#   * criterion 0.8.2 DEPRECATES `criterion::black_box`; a suite must use
+#     `std::hint::black_box` (stable since 1.66), because the deprecated path warns
+#     and therefore fails `cargo clippy --all-targets -- -D warnings`.
 #
-#   cargo +1.80 clippy -p zlib-rs -p libz-rs-sys --all-features --all-targets
-#     -- succeeds. This is the MSRV gate, and it is the one that matters: 1.80 is a
-#     promise about the crates that ship, and criterion reaches neither of them.
-#   cargo +1.80 build -p zlib-rs-differential
-#     -- succeeds. A plain build needs no dev-dependency, so even this crate compiles
-#     on the floor.
-#   cargo +1.80 metadata, and anything that resolves the whole workspace graph
-#     -- FAILS on the clap download, because metadata resolves dev-dependencies too.
+# THE MSRV GATE, stated exactly, because the command matters. 1.80 is a promise that
+# the two crates that ship COMPILE on that compiler, so the gate names them and uses
+# the compiler rather than the linter:
 #
-# So an MSRV-floor job must name the shipped packages explicitly. It must not use
-# `--workspace`, and it must not run `cargo test`, `cargo bench`, `cargo metadata` or
-# `--all-targets` across the workspace on 1.80. Current stable has no such limitation
-# and is where the full-workspace gates run.
+#   cargo +1.80 check --locked -p zlib-rs -p libz-rs-sys --all-features --all-targets
+#   cargo +1.80 rustc --locked -p libz-rs-sys --all-features -- -D warnings
 #
-# criterion 0.8.2 DEPRECATES `criterion::black_box`; a benchmark uses
-# `std::hint::black_box` (stable since 1.66, so MSRV-safe), because the deprecated
-# path emits a warning and therefore fails `cargo clippy --all-targets -- -D
-# warnings`.
-criterion = { workspace = true }
+# Both are green on this tree. `cargo +1.80 metadata --locked` and
+# `cargo +1.80 check --locked --workspace --all-targets` are green too, now that the
+# criterion edge is gone.
+#
+# CLIPPY IS DELIBERATELY NOT PART OF THE MSRV GATE, and this is measured rather than
+# assumed: `cargo +1.80 clippy -p zlib-rs -p libz-rs-sys --all-features
+# --all-targets` reports 28 denials that current clippy does not, all of them
+# version drift in lints rather than anything about the code --
+# `clippy::assertions_on_constants` on the `assert!(A == B)` constant-parity checks
+# (23 of them), `clippy::const_is_empty` on `assert!(corpus::EMPTY.is_empty())`, and
+# `clippy::module_name_repetitions` (4). The same code is clean under clippy 1.97:
+# `cargo clippy --locked -p zlib-rs -p libz-rs-sys --all-features --all-targets --
+# -D warnings` exits 0. Silencing a lint that only an old linter emits would put
+# `#[allow]` attributes in the source for the benefit of a tool nobody runs, so the
+# lint gate stays on current stable and the MSRV gate stays on the compiler.
 
 [build-dependencies]
 # The ONLY build dependency: `cc` compiles the in-tree C sources into the test-only

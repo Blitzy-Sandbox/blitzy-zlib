@@ -108,9 +108,9 @@
 //! in allocation order would free them in precisely the wrong one. State modules
 //! must therefore either declare buffers in release order or release them
 //! explicitly. This module supports both: dropping a buffer works, and
-//! [`Allocator::deallocate_bytes`] with its [`Allocator::try_deallocate_bytes`]
-//! companion -- the `TRY_FREE` analogue from `zutil.h` L255 -- makes an explicit,
-//! ordered teardown read like the C original.
+//! [`Allocator::deallocate_bytes`] -- which takes a *slot* and so doubles as the
+//! `TRY_FREE` analogue from `zutil.h` L255 -- makes an explicit, ordered teardown
+//! read like the C original.
 //!
 //! # Shapes
 //!
@@ -166,6 +166,7 @@
 
 use core::ffi::c_void;
 use core::fmt;
+use core::marker::PhantomData;
 
 use alloc::vec::Vec;
 
@@ -437,9 +438,12 @@ pub enum Release<'a, T> {
     /// return it -- for a facade allocator, by calling the caller's `zfree` with
     /// the block's base address, exactly as `ZFREE` does.
     ///
-    /// The borrow arrives by value, so the previous holder can no longer reach the
-    /// memory.
-    Foreign(&'a mut [T]),
+    /// The borrow has already been given up: what arrives is a
+    /// [`ForeignBlock`] -- an address and a length -- so the previous holder can no
+    /// longer reach the memory *and* nothing holds a live reference to it while it
+    /// is being freed. See [`ForeignBlock`] for why that distinction is load-bearing
+    /// rather than stylistic.
+    Foreign(ForeignBlock<'a, T>),
     /// The block did **not** come from the allocator it was offered to, and has
     /// not been released. The buffer is handed back untouched.
     ///
@@ -450,6 +454,76 @@ pub enum Release<'a, T> {
     /// position is released by its own destructor when the returned value is
     /// dropped, so nothing leaks in that direction.
     Refused(Buffer<'a, T>),
+}
+
+/// A block whose borrow has been given up, ready to be handed to `zfree`.
+///
+/// ★ **Why this exists instead of passing the `&mut [T]` straight to the allocator.**
+/// A reference in *argument position* is protected for the whole of the call it is
+/// passed to, and deallocating memory that a protected reference covers is undefined
+/// behaviour -- Miri reports it as "deallocating while item \[Unique for \<tag\>\] is
+/// strongly protected". An earlier revision of this trait took the whole
+/// [`Buffer`] into the allocator's release method and called the caller's `zfree`
+/// inside it; that is exactly the forbidden shape, and it was reachable from any C
+/// caller that supplies its own `zalloc`/`zfree` -- which `test/infcover.c` does on
+/// every one of its streams.
+///
+/// The fix is structural rather than local: [`Buffer::release_to`] converts the
+/// borrow into this address-and-length pair *and returns*, so the frame that held the
+/// reference is gone before [`Allocator::release_foreign_bytes`] is entered. Nothing
+/// then protects the block and freeing it is sound. That is also why the release path
+/// is two calls rather than one, and why neither may be folded into the other.
+///
+/// The lifetime is carried but never used to reach the memory: it records that the
+/// block was valid for `'a`, which is what makes holding one past its allocator's
+/// life impossible in safe code.
+#[derive(Debug)]
+pub struct ForeignBlock<'a, T> {
+    /// The block's base address, as `zfree` needs it.
+    address: *mut T,
+    /// How many elements the block holds.
+    len: usize,
+    /// The borrow this block was detached from, recorded and never followed.
+    lifetime: PhantomData<&'a mut [T]>,
+}
+
+impl<'a, T> ForeignBlock<'a, T> {
+    /// Detaches `block` from its borrow.
+    ///
+    /// Taking the slice by value is what makes this a one-way door: the caller has
+    /// given up the only reference, so the address that comes out is not aliased by
+    /// anything the borrow checker can still see.
+    fn detach(block: &'a mut [T]) -> Self {
+        Self {
+            address: block.as_mut_ptr(),
+            len: block.len(),
+            lifetime: PhantomData,
+        }
+    }
+
+    /// The block's base address: the pointer to pass to `zfree`.
+    ///
+    /// Dereferencing it is the caller's business and needs `unsafe`; producing it
+    /// here does not.
+    #[must_use]
+    pub const fn as_mut_ptr(&self) -> *mut T {
+        self.address
+    }
+
+    /// How many elements the block holds.
+    ///
+    /// `zfree` does not need it -- C's `free` takes only an address -- but a Rust
+    /// allocator, and every tracking allocator, does.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the block holds no elements.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 impl<'a, T> Buffer<'a, T> {
@@ -527,6 +601,49 @@ impl<'a, T> Buffer<'a, T> {
     /// The ad-hoc probes used while this was being written follow exactly that
     /// discipline, and `benches/**` must too when it lands: cost that is invisible
     /// in a rate is cost that gets attributed to the wrong thing.
+    ///
+    /// # ★ What it actually costs, measured
+    ///
+    /// The obligation above has been discharged. Measured against the C library built from the
+    /// in-tree sources and called in the same process (release profile, fat LTO, trimmed mean of the
+    /// faster half of the samples), with initialisation timed on its own -- `deflateInit2_` followed
+    /// immediately by `deflateEnd`, compressing nothing:
+    ///
+    /// | configuration | this port | C | ratio |
+    /// |---|---|---|---|
+    /// | level 6, `memLevel` 8 | 6.10 us | 1.40 us | 4.35 |
+    /// | level 9, `memLevel` 9 | 9.06 us | 2.39 us | 3.79 |
+    /// | level 1, `memLevel` 8 | 6.10 us | 1.41 us | 4.34 |
+    ///
+    /// So the fill costs about 4.7 us per stream at the default configuration, which is what a
+    /// quarter-megabyte `memset` costs at this machine's memory bandwidth. It is a real cost and it is
+    /// stated as a multiple of C's, not hidden.
+    ///
+    /// What it is *not* is a throughput cost, and the same measurement shows where the crossover
+    /// falls. Timing a whole `deflateInit2_` + `deflate(Z_FINISH)` + `deflateEnd` at level 6:
+    ///
+    /// | payload | this port | C | ratio |
+    /// |---|---|---|---|
+    /// | 1 KiB | 14.9 us | 7.2 us | 2.09 |
+    /// | 8 KiB | 40.9 us | 30.4 us | 1.35 |
+    /// | 64 KiB | 247.8 us | 256.6 us | 0.97 |
+    /// | 1 MiB | 3.90 ms | 4.61 ms | 0.85 |
+    ///
+    /// A caller who opens a stream per one-kilobyte message pays roughly twice what C costs, and a
+    /// caller who compresses 64 KiB or more per stream pays less than C does. Both of those are true
+    /// at once; reporting only the second would be the dishonest half.
+    ///
+    /// # Why it cannot simply be removed
+    ///
+    /// The obvious answer -- hand out uninitialised storage and initialise each byte at its first
+    /// write -- works for a buffer written front to back, and the caller-facing output plumbing in
+    /// this crate does exactly that. It does not work for `prev` and `head`. Those are indexed by a
+    /// rolling hash, that is to say at effectively arbitrary positions, so there is no initialised
+    /// prefix to track and no ordering that guarantees a slot is written before it is read. Reading
+    /// one back would require turning `MaybeUninit` into an initialised value, and this crate carries
+    /// `#![forbid(unsafe_code)]`, which the compiler enforces. The fill is therefore the price of
+    /// that attribute on randomly indexed arrays, it is paid once per stream, and the honest thing to
+    /// do with it is to measure it -- which is what the tables above are.
     #[must_use]
     pub fn try_global(len: usize, fill: T) -> Option<Self>
     where
@@ -650,7 +767,10 @@ impl<'a, T> Buffer<'a, T> {
                 drop(items);
                 Release::Handled
             }
-            Storage::Foreign(items) => Release::Foreign(items),
+            // The borrow is given up *here*, inside this call, and only the address
+            // and length travel onward. That is what lets the allocator free the
+            // block: see `ForeignBlock` for why doing it one frame later matters.
+            Storage::Foreign(items) => Release::Foreign(ForeignBlock::detach(items)),
         }
     }
 }
@@ -798,39 +918,75 @@ pub trait Allocator<'a> {
     /// [`Allocator::allocate_bytes`].
     fn allocate_u16s(&self, items: usize) -> Option<Buffer<'a, u16>>;
 
-    /// Releases a byte block obtained from this allocator.
+    /// Returns a byte block this allocator handed out to whatever produced it.
     ///
-    /// This is `ZFREE(strm, addr)` (`zutil.h` L254). A block that did not come
-    /// from this allocator is *not* released: see [`Buffer::release_to`], through
-    /// which every implementation must route.
-    fn deallocate_bytes(&self, buffer: Buffer<'a, u8>);
+    /// This is the `ZFREE(strm, addr)` itself (`zutil.h` L254): for a facade
+    /// allocator, the call to the caller's `zfree` with the block's base address.
+    ///
+    /// # Never call this directly
+    ///
+    /// [`Allocator::deallocate_bytes`] is the entry point, and it is what
+    /// guarantees the two properties this method depends on: that
+    /// [`Buffer::release_to`] has confirmed the block is *this* allocator's, and
+    /// that the borrow has already been given up one frame earlier. Freeing a block
+    /// while a reference to it is still live in an enclosing call is undefined
+    /// behaviour; [`ForeignBlock`] records that reasoning in full.
+    ///
+    /// An allocator that only ever hands out Rust-owned storage can never reach
+    /// this method, because [`Buffer::release_to`] answers [`Release::Handled`] for
+    /// every block it produced. Such an implementation is still required to be
+    /// total, and does nothing.
+    fn release_foreign_bytes(&self, block: ForeignBlock<'a, u8>);
 
-    /// Releases a `u16` block obtained from this allocator.
+    /// Returns a `u16` block this allocator handed out.
     ///
-    /// The [`Allocator::deallocate_bytes`] counterpart for the shape
-    /// [`Allocator::allocate_u16s`] produces.
-    fn deallocate_u16s(&self, buffer: Buffer<'a, u16>);
+    /// The [`Allocator::release_foreign_bytes`] counterpart for the shape
+    /// [`Allocator::allocate_u16s`] produces, with the same contract.
+    fn release_foreign_u16s(&self, block: ForeignBlock<'a, u16>);
 
-    /// Releases a byte block if there is one, and does nothing if there is not.
+    /// Releases the byte block in `slot`, if there is one, leaving `slot` empty.
     ///
-    /// The `TRY_FREE(s, p)` analogue -- `{if (p) ZFREE(s, p);}` from `zutil.h`
-    /// L255 -- which `deflateEnd` uses for all four of its buffers because an
-    /// initialisation that failed part-way leaves some of them null
-    /// (`deflate.c` L1301-L1304, reached from the failure path at
-    /// `deflate.c` L508-L513).
-    fn try_deallocate_bytes(&self, buffer: Option<Buffer<'a, u8>>) {
-        if let Some(buffer) = buffer {
-            self.deallocate_bytes(buffer);
+    /// This is `TRY_FREE(s, p)` -- `{if (p) ZFREE(s, p);}` (`zutil.h` L255) -- the
+    /// form `deflateEnd` uses for all four of its buffers because an initialisation
+    /// that failed part-way leaves some of them null (`deflate.c` L1301-L1304,
+    /// reached from the failure path at L508-L513). A block is passed by slot rather
+    /// than by value for two reasons, and both matter:
+    ///
+    /// * an absent block is the common case during teardown, and a slot expresses it
+    ///   without a second method; and
+    /// * ★ the block's borrow must **not** be live in this frame. A reference in
+    ///   argument position is protected for the duration of the call, and freeing
+    ///   memory a protected reference covers is undefined behaviour. Taking
+    ///   `&mut Option<Buffer<'a, u8>>` retags only the slot -- which lives in the
+    ///   caller -- and never the block, and the borrow inside is surrendered by
+    ///   [`Buffer::release_to`] in a frame that has returned before
+    ///   [`Allocator::release_foreign_bytes`] is entered. See [`ForeignBlock`].
+    ///
+    /// A block belonging to a different allocator is refused and dropped rather than
+    /// freed: dropping leaks a foreign block, which is safe and shows up in a leak
+    /// report, whereas passing it to the wrong `zfree` would corrupt the heap.
+    fn deallocate_bytes(&self, slot: &mut Option<Buffer<'a, u8>>) {
+        let Some(buffer) = slot.take() else { return };
+        match buffer.release_to(self) {
+            Release::Foreign(block) => self.release_foreign_bytes(block),
+            // The block was Rust-owned and its destructor has already run.
+            Release::Handled => {}
+            // Not ours. Dropping it is the safe answer; see the method documentation.
+            Release::Refused(refused) => drop(refused),
         }
     }
 
-    /// Releases a `u16` block if there is one, and does nothing if there is not.
+    /// Releases the `u16` block in `slot`, if there is one, leaving `slot` empty.
     ///
-    /// The [`Allocator::try_deallocate_bytes`] counterpart for `u16` blocks;
-    /// `deflateEnd` needs it for `head` and `prev` (`deflate.c` L1302-L1303).
-    fn try_deallocate_u16s(&self, buffer: Option<Buffer<'a, u16>>) {
-        if let Some(buffer) = buffer {
-            self.deallocate_u16s(buffer);
+    /// The [`Allocator::deallocate_bytes`] counterpart for `u16` blocks, which
+    /// `deflateEnd` needs for `head` and `prev` (`deflate.c` L1302-L1303). The
+    /// contract, and the reason for the slot, are identical.
+    fn deallocate_u16s(&self, slot: &mut Option<Buffer<'a, u16>>) {
+        let Some(buffer) = slot.take() else { return };
+        match buffer.release_to(self) {
+            Release::Foreign(block) => self.release_foreign_u16s(block),
+            Release::Handled => {}
+            Release::Refused(refused) => drop(refused),
         }
     }
 
@@ -902,12 +1058,24 @@ where
         (**self).allocate_u16s(items)
     }
 
-    fn deallocate_bytes(&self, buffer: Buffer<'a, u8>) {
-        (**self).deallocate_bytes(buffer);
+    fn release_foreign_bytes(&self, block: ForeignBlock<'a, u8>) {
+        (**self).release_foreign_bytes(block);
     }
 
-    fn deallocate_u16s(&self, buffer: Buffer<'a, u16>) {
-        (**self).deallocate_u16s(buffer);
+    fn release_foreign_u16s(&self, block: ForeignBlock<'a, u16>) {
+        (**self).release_foreign_u16s(block);
+    }
+
+    // Both provided methods are forwarded rather than inherited: an allocator that
+    // overrides them -- a tracking one that has to see every release, not only the
+    // foreign ones -- would otherwise be bypassed the moment it were used by
+    // reference, and `&A` is how every state type holds its allocator.
+    fn deallocate_bytes(&self, slot: &mut Option<Buffer<'a, u8>>) {
+        (**self).deallocate_bytes(slot);
+    }
+
+    fn deallocate_u16s(&self, slot: &mut Option<Buffer<'a, u16>>) {
+        (**self).deallocate_u16s(slot);
     }
 }
 
@@ -1027,22 +1195,24 @@ impl<'a> Allocator<'a> for GlobalAllocator {
         Buffer::try_global(items, Self::FILL_U16)
     }
 
-    /// Returns a byte block to Rust's global allocator.
+    /// Unreachable: this allocator hands out nothing but Rust-owned storage.
     ///
-    /// The Rust counterpart of `free(ptr)` from `zutil.c` L307. The release goes through
-    /// [`Buffer::release_to`], so a block belonging to some other allocator is
-    /// refused rather than freed here; the refusal is safe in both directions,
-    /// since a refused Rust allocation still runs its own destructor.
-    fn deallocate_bytes(&self, buffer: Buffer<'a, u8>) {
-        drop(buffer.release_to(self));
-    }
+    /// The Rust counterpart of `free(ptr)` from `zutil.c` L307 is the `Vec`
+    /// destructor, which [`Buffer::release_to`] runs for every block this allocator
+    /// produced -- reporting [`Release::Handled`], the arm
+    /// [`Allocator::deallocate_bytes`] answers by doing nothing further. A block that
+    /// reached here would have to have been handed out by some *other* allocator
+    /// while carrying this one's identity, which [`Buffer::from_foreign`] makes
+    /// impossible.
+    ///
+    /// So there is nothing to free and nothing to report: the method is total
+    /// because the trait requires it to be, and empty because that is the whole of
+    /// the correct behaviour. It deliberately does not panic -- library code in this
+    /// crate never does.
+    fn release_foreign_bytes(&self, _block: ForeignBlock<'a, u8>) {}
 
-    /// Returns a `u16` block to Rust's global allocator.
-    ///
-    /// The [`Allocator::deallocate_bytes`] counterpart for `u16` blocks.
-    fn deallocate_u16s(&self, buffer: Buffer<'a, u16>) {
-        drop(buffer.release_to(self));
-    }
+    /// Unreachable for the same reason as [`Allocator::release_foreign_bytes`].
+    fn release_foreign_u16s(&self, _block: ForeignBlock<'a, u16>) {}
 }
 
 #[cfg(test)]
@@ -1054,7 +1224,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
     use super::{
-        block_len, Allocator, AllocatorId, Buffer, GlobalAllocator, Opaque, Release, SENTINEL_FILL,
+        block_len, Allocator, AllocatorId, Buffer, ForeignBlock, GlobalAllocator, Opaque, Release,
+        SENTINEL_FILL,
     };
     use crate::error::ReturnCode;
     use core::cell::Cell;
@@ -1106,22 +1277,25 @@ mod tests {
             }
         }
 
-        /// The shape of a facade deallocation, minus the call to `zfree`: match on
-        /// the release, and touch the block only in the arm that says it is ours.
-        fn record(&self, release: Release<'_, u8>) {
+        /// The shape of a facade deallocation, minus the call to `zfree`: record
+        /// the block the trait says is ours, address and length both.
+        fn record(&self, block: &ForeignBlock<'_, u8>) {
+            self.released
+                .set(Some((block.as_mut_ptr() as usize, block.len())));
+            self.note(block.len());
+        }
+
+        /// Counts one release that was refused, and one that needed nothing done.
+        fn record_outcome(&self, release: &Release<'_, u8>) {
             match release {
-                Release::Foreign(block) => {
-                    self.released
-                        .set(Some((block.as_ptr() as usize, block.len())));
-                    self.note(block.len());
-                }
+                Release::Foreign(_) => {}
                 Release::Refused(_) => self.refused.set(self.refused.get() + 1),
                 Release::Handled => self.released.set(None),
             }
         }
 
-        /// The `u16` counterpart of [`Recorder::record`].
-        fn record_u16s(&self, release: Release<'_, u16>) {
+        /// The `u16` counterpart of [`Recorder::record_outcome`].
+        fn record_outcome_u16s(&self, release: &Release<'_, u16>) {
             match release {
                 Release::Foreign(block) => self.note(block.len()),
                 Release::Refused(_) => self.refused.set(self.refused.get() + 1),
@@ -1147,12 +1321,30 @@ mod tests {
             None
         }
 
-        fn deallocate_bytes(&self, buffer: Buffer<'a, u8>) {
-            self.record(buffer.release_to(self));
+        fn release_foreign_bytes(&self, block: ForeignBlock<'a, u8>) {
+            self.record(&block);
         }
 
-        fn deallocate_u16s(&self, buffer: Buffer<'a, u16>) {
-            self.record_u16s(buffer.release_to(self));
+        fn release_foreign_u16s(&self, _block: ForeignBlock<'a, u16>) {
+            // Counted in `deallocate_u16s`, which sees the refused and handled
+            // outcomes this method never does.
+        }
+
+        // Overridden so that *every* outcome is counted, not only the foreign one:
+        // the release is performed in a call that returns before the block is
+        // touched, exactly as the provided implementation does.
+        fn deallocate_bytes(&self, slot: &mut Option<Buffer<'a, u8>>) {
+            let Some(buffer) = slot.take() else { return };
+            let release = buffer.release_to(self);
+            self.record_outcome(&release);
+            if let Release::Foreign(block) = release {
+                self.release_foreign_bytes(block);
+            }
+        }
+
+        fn deallocate_u16s(&self, slot: &mut Option<Buffer<'a, u16>>) {
+            let Some(buffer) = slot.take() else { return };
+            self.record_outcome_u16s(&buffer.release_to(self));
         }
     }
 
@@ -1211,17 +1403,17 @@ mod tests {
         // is no way to touch storage that was never handed out.
         assert_eq!(buffer.as_slice().iter().count(), 0);
         assert_eq!(buffer.owner(), AllocatorId::GLOBAL);
-        allocator.deallocate_bytes(buffer);
+        allocator.deallocate_bytes(&mut Some(buffer));
 
         // Zero items and a zero element size are both fine, and so is the u16
         // shape.
         let buffer = allocator.allocate_bytes(4, 0).unwrap();
         assert!(buffer.is_empty());
-        allocator.deallocate_bytes(buffer);
+        allocator.deallocate_bytes(&mut Some(buffer));
 
         let buffer = allocator.allocate_u16s(0).unwrap();
         assert!(buffer.is_empty());
-        allocator.deallocate_u16s(buffer);
+        allocator.deallocate_u16s(&mut Some(buffer));
     }
 
     #[test]
@@ -1241,7 +1433,7 @@ mod tests {
             .enumerate()
             .all(|(index, &byte)| byte == u8::try_from(index % 251).unwrap());
         assert!(readback_ok);
-        allocator.deallocate_bytes(window);
+        allocator.deallocate_bytes(&mut Some(window));
 
         // The deflate hash head array at memLevel 9: deflate.c L460.
         let mut head = allocator.allocate_u16s(65_536).unwrap();
@@ -1253,16 +1445,16 @@ mod tests {
         let last = head.len() - 1;
         head.as_mut_slice()[last] = 0x1234;
         assert_eq!(head.as_slice().get(last), Some(&0x1234));
-        allocator.deallocate_u16s(head);
+        allocator.deallocate_u16s(&mut Some(head));
 
         // The inflate scratch shapes, which live inline in the C state
         // (inflate.h L120-L121) but are the same u16 request here.
         let lens = allocator.allocate_u16s(320).unwrap();
         assert_eq!(lens.len(), 320);
-        allocator.deallocate_u16s(lens);
+        allocator.deallocate_u16s(&mut Some(lens));
         let work = allocator.allocate_u16s(288).unwrap();
         assert_eq!(work.len(), 288);
-        allocator.deallocate_u16s(work);
+        allocator.deallocate_u16s(&mut Some(work));
     }
 
     #[test]
@@ -1281,13 +1473,13 @@ mod tests {
         assert_eq!(buffer.as_slice().len(), 64);
         assert!(buffer.as_slice().last().is_some());
 
-        allocator.deallocate_bytes(buffer);
+        allocator.deallocate_bytes(&mut Some(buffer));
 
         let u16s = allocator.allocate_u16s(8).unwrap();
         if cfg!(debug_assertions) {
             assert!(u16s.as_slice().iter().all(|&value| value == 0xA5A5));
         }
-        allocator.deallocate_u16s(u16s);
+        allocator.deallocate_u16s(&mut Some(u16s));
     }
 
     #[test]
@@ -1296,10 +1488,10 @@ mod tests {
         // buffers because a part-way initialisation failure leaves some null
         // (deflate.c L1301-L1304).
         let allocator = GlobalAllocator;
-        allocator.try_deallocate_bytes(None);
-        allocator.try_deallocate_u16s(None);
-        allocator.try_deallocate_bytes(allocator.allocate_bytes(8, 2));
-        allocator.try_deallocate_u16s(allocator.allocate_u16s(8));
+        allocator.deallocate_bytes(&mut None);
+        allocator.deallocate_u16s(&mut None);
+        allocator.deallocate_bytes(&mut allocator.allocate_bytes(8, 2));
+        allocator.deallocate_u16s(&mut allocator.allocate_u16s(8));
     }
 
     #[test]
@@ -1330,13 +1522,13 @@ mod tests {
         let buffer = Buffer::from_foreign(&owner, &mut storage[..]);
         assert_eq!(buffer.owner(), owner.id());
         // Offered to the wrong allocator: refused, and nothing released.
-        other.deallocate_bytes(buffer);
+        other.deallocate_bytes(&mut Some(buffer));
         assert_eq!(other.refused.get(), 1);
         assert_eq!(other.released.get(), None);
 
         // Offered to its own allocator: surrendered, and it is the same block.
         let buffer = Buffer::from_foreign(&owner, &mut storage[..]);
-        owner.deallocate_bytes(buffer);
+        owner.deallocate_bytes(&mut Some(buffer));
         assert_eq!(owner.refused.get(), 0);
         assert_eq!(owner.released.get(), Some(expected));
 
@@ -1376,10 +1568,10 @@ mod tests {
                 // "Deallocate in reverse order of allocations", deflate.c L1300.
                 // `try_deallocate_*` is the TRY_FREE analogue, so a part-way
                 // initialisation that left a buffer absent tears down cleanly.
-                self.allocator.try_deallocate_bytes(self.pending_buf.take());
-                self.allocator.try_deallocate_u16s(self.head.take());
-                self.allocator.try_deallocate_u16s(self.prev.take());
-                self.allocator.try_deallocate_bytes(self.window.take());
+                self.allocator.deallocate_bytes(&mut self.pending_buf);
+                self.allocator.deallocate_u16s(&mut self.head);
+                self.allocator.deallocate_u16s(&mut self.prev);
+                self.allocator.deallocate_bytes(&mut self.window);
             }
         }
 
@@ -1475,7 +1667,7 @@ mod tests {
                 return 0;
             };
             let len = buffer.len();
-            allocator.deallocate_u16s(buffer);
+            allocator.deallocate_u16s(&mut Some(buffer));
             len
         }
 
@@ -1486,7 +1678,7 @@ mod tests {
         let buffer = dynamic.allocate_bytes(16, 2).unwrap();
         assert_eq!(buffer.len(), 32);
         assert_eq!(buffer.owner(), AllocatorId::GLOBAL);
-        dynamic.deallocate_bytes(buffer);
+        dynamic.deallocate_bytes(&mut Some(buffer));
 
         // All three forms satisfy `A: Allocator<'a>`: the value itself, a shared
         // reference to it through the blanket implementation, and the trait
@@ -1515,7 +1707,7 @@ mod tests {
         assert_eq!(total(&buffer), 0);
         buffer.as_mut()[0] = 5;
         assert_eq!(total(&buffer), 5);
-        allocator.deallocate_bytes(buffer);
+        allocator.deallocate_bytes(&mut Some(buffer));
     }
 
     #[test]
@@ -1525,14 +1717,14 @@ mod tests {
         assert!(buffer.is_ok());
         if let Ok(buffer) = buffer {
             assert_eq!(buffer.len(), 64);
-            allocator.deallocate_bytes(buffer);
+            allocator.deallocate_bytes(&mut Some(buffer));
         }
 
         let buffer = allocator.allocate_u16s_or_mem_error(16);
         assert!(buffer.is_ok());
         if let Ok(buffer) = buffer {
             assert_eq!(buffer.len(), 16);
-            allocator.deallocate_u16s(buffer);
+            allocator.deallocate_u16s(&mut Some(buffer));
         }
         assert_eq!(ReturnCode::MEM_ERROR.as_i32(), -4);
     }

@@ -19,6 +19,40 @@ well, "make install" should work for most flavors of Unix.  For Windows, use
 one of the special makefiles in win32/ or contrib/vstudio/ .  For VMS, use
 make_vms.com.
 
+The compression and decompression engine has also been reimplemented in Rust,
+in the Cargo workspace under crates/ .  It is a reimplementation and not a
+binding: crates/zlib-rs holds every algorithm under #![forbid(unsafe_code)]
+with an empty dependency list, and crates/libz-rs-sys is the only place raw
+pointers appear, exposing the same C ABI so that existing callers link against
+it unchanged.  zlib.h, zconf.h and zlib.map are unmodified; the C sources in
+this directory are retained and are the reference the Rust code is diffed
+against, so "./configure; make test" continues to build and test the C library
+exactly as before, on machines with no Rust toolchain at all.
+
+To build and check the Rust library:
+
+    ./configure
+    make rust          # stage the drop-in libz under target/dropin/
+    make rust-test     # link the unmodified C drivers against it and run them
+    make rust-symbols  # print the staged symbol tables
+
+Note that "cargo build" alone does NOT produce an installable library, and the
+shortfall is measurable: the shared object cargo emits publishes 96 dynamic
+global symbols where the C library publishes 111.  It carries no zlib.map
+version script (rustc attaches one of its own, and a second cannot be added),
+it lacks gzprintf and gzvprintf (both variadic, so they come from the small C
+shim in crates/libz-rs-sys/csrc/), and it exports internals that zlib.map
+hides.  "make rust" is what relinks the complete library from libz.a plus that
+shim under zlib.map, creates the versioned symlink chain the SONAME libz.so.1
+requires, and then compares the result against the C library's own symbol
+table.  ./configure is a real prerequisite: unconfigured, the makefile has no
+platform flag with which to ask the linker for a shared object, so the Rust
+targets refuse to run rather than stage an incomplete library.
+
+Building the Rust library needs Rust 1.80 or later and cargo.  Optional
+vectorised CRC-32 and Adler-32 backends are available behind the "simd" Cargo
+feature; they change speed only, never the compressed bytes.
+
 Questions about zlib should be sent to <zlib@gzip.org>, or to Gilles Vollant
 <info@winimage.com> for the Windows DLL version.  The zlib home page is
 https://zlib.net/ .  Before reporting a problem, please check this site to

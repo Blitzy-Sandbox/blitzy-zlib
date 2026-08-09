@@ -90,7 +90,7 @@
 //! assert_eq!(Generic::update(Generic::update(!0u32, b"12345"), b"6789"), state);
 //! ```
 //!
-//! The examples name the [`Generic`](super::Generic) backend rather than `crc32_generic`
+//! The examples name the [`Generic`] backend rather than `crc32_generic`
 //! itself, because the free function is crate-private and the backend forwards to it
 //! unchanged.
 
@@ -164,7 +164,7 @@ fn crc32_byte(crc: u32, byte: u8) -> u32 {
 /// assert_eq!(Generic::update(0x1234_5678, &[]), 0x1234_5678);
 /// ```
 ///
-/// [`Generic`](super::Generic) forwards to this function unchanged and is the reachable
+/// [`Generic`] forwards to this function unchanged and is the reachable
 /// name for it outside the subsystem.
 #[must_use]
 #[inline]

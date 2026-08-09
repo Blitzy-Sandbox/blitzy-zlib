@@ -180,7 +180,7 @@
 //! likewise here because it exists only to install the sink these states fill.
 //! Neither is duplicated in `crates/zlib-rs/src/inflate/mod.rs`. What is *not*
 //! here: the `z_stream`-shaped mirror of `gz_header`, which is ABI-visible and
-//! therefore belongs to the planned `crates/libz-rs-sys/src/types.rs`; the dictionary
+//! therefore belongs to `crates/libz-rs-sys/src/types.rs`; the dictionary
 //! *content* check, which `inflateSetDictionary` performs (`inflate.c`
 //! L1200-L1205); and the trailer states `CHECK` and `LENGTH`, which validate the
 //! check value this module only ever initialises.
@@ -200,7 +200,7 @@ use crate::allocate::Allocator;
 use crate::crc32::crc32;
 use crate::error::ReturnCode;
 use crate::inflate::mode::Mode;
-use crate::inflate::state::{GzHeaderSink, InflateState, DMAX_DEFAULT, GZ_HEADER_PENDING};
+use crate::inflate::state::{GzHeaderSink, InflateState, DMAX_DEFAULT};
 
 // Five texts across six decision points: the zlib and gzip paths reject an
 // unknown compression method with the *same* text at *different* sites, and both
@@ -677,7 +677,7 @@ pub(crate) fn flags<'a, A: Allocator<'a>>(
     // `FLG`, which is the high byte of this word.
     let text = ((word >> 8) & 1) != 0;
     if let Some(sink) = state.head.as_mut() {
-        sink.text = text;
+        sink.set_text(text);
     }
 
     // L570-L571: the first *gated* fold. `state.flags` has just been assigned, so
@@ -712,7 +712,7 @@ pub(crate) fn time<'a, A: Allocator<'a>>(
     // L577-L578: `state->head->time = hold`.
     let time = low_u32(word);
     if let Some(sink) = state.head.as_mut() {
-        sink.time = time;
+        sink.set_time(time);
     }
 
     // L579-L580: `CRC4(state->check, hold)` -- four bytes this time.
@@ -749,8 +749,8 @@ pub(crate) fn os<'a, A: Allocator<'a>>(
     let xflags = as_i32(low_u32(word & BYTE_MASK));
     let operating_system = as_i32(low_u32(word >> 8));
     if let Some(sink) = state.head.as_mut() {
-        sink.xflags = xflags;
-        sink.os = operating_system;
+        sink.set_xflags(xflags);
+        sink.set_os(operating_system);
     }
 
     // L590-L591.
@@ -795,7 +795,7 @@ pub(crate) fn ex_len<'a, A: Allocator<'a>>(
         let extra_len = low_u32(word);
         state.length = extra_len;
         if let Some(sink) = state.head.as_mut() {
-            sink.extra_len = extra_len;
+            sink.set_extra_len(extra_len);
         }
 
         // L601-L602.
@@ -877,7 +877,7 @@ pub(crate) fn extra<'a, A: Allocator<'a>>(
             // below advance by the full `count` either way, because the CRC and
             // the input must move over bytes the buffer had no room for.
             if let Some(sink) = state.head.as_mut() {
-                let offset = sink.extra_len.wrapping_sub(outstanding);
+                let offset = sink.extra_len().wrapping_sub(outstanding);
                 sink.write_extra(offset, chunk);
             }
 
@@ -1107,7 +1107,7 @@ pub(crate) fn hcrc<'a, A: Allocator<'a>>(
     // `FHCRC`, bit 1 of `FLG` -- and `head->done = 1`.
     let hcrc = ((state.flags >> 9) & 1) != 0;
     if let Some(sink) = state.head.as_mut() {
-        sink.hcrc = hcrc;
+        sink.set_hcrc(hcrc);
         sink.mark_complete();
     }
 
@@ -1202,7 +1202,7 @@ pub(crate) fn dict<'a, A: Allocator<'a>>(state: &mut InflateState<'a, A>) -> Hea
 /// established as safe to dereference — that the tag behind it names a live inflate
 /// state (`inflate.c` L88-L98). None of that
 /// can be asked of a `&mut InflateState`, which is a valid state by construction,
-/// so the pointer half of the check belongs in the planned `crates/libz-rs-sys/src/inflate.rs`
+/// so the pointer half of the check lives in `crates/libz-rs-sys/src/inflate.rs`
 /// where the pointer is; `state.rs` exposes the tag half as `is_live_mode_tag`.
 ///
 /// ★ The second guard is reproduced here in full: `(wrap & 2) == 0` means the
@@ -1230,13 +1230,15 @@ pub fn inflate_get_header<'a, A: Allocator<'a>>(
     state: &mut InflateState<'a, A>,
     mut head: GzHeaderSink<'a>,
 ) -> ReturnCode {
-    // L1225: `if ((state->wrap & 2) == 0) return Z_STREAM_ERROR;`.
-    if !state.wrap.allows_gzip_header() {
+    // L1225: `if ((state->wrap & 2) == 0) return Z_STREAM_ERROR;`, through the
+    // predicate the facade also applies before it reads a single member of the caller's
+    // `gz_header` -- see `InflateState::accepts_gzip_header`.
+    if !state.accepts_gzip_header() {
         return ReturnCode::STREAM_ERROR;
     }
 
     // L1228-L1230: `state->head = head; head->done = 0; return Z_OK;`.
-    head.done = GZ_HEADER_PENDING;
+    head.reset_done();
     state.set_header_sink(Some(head));
     ReturnCode::OK
 }
@@ -1874,15 +1876,15 @@ mod tests {
             assert_eq!(adler, Some(0));
 
             let sink = state.head.unwrap();
-            assert_eq!(sink.done, GZ_HEADER_COMPLETE, "FLG bits {bits:#04x}");
-            assert_eq!(sink.text, text, "FLG bits {bits:#04x}");
-            assert_eq!(sink.hcrc, hcrc, "FLG bits {bits:#04x}");
-            assert_eq!(sink.time, 0x1234_5678);
-            assert_eq!(sink.xflags, 2);
-            assert_eq!(sink.os, 3);
+            assert_eq!(sink.done(), GZ_HEADER_COMPLETE, "FLG bits {bits:#04x}");
+            assert_eq!(sink.text(), text, "FLG bits {bits:#04x}");
+            assert_eq!(sink.hcrc(), hcrc, "FLG bits {bits:#04x}");
+            assert_eq!(sink.time(), 0x1234_5678);
+            assert_eq!(sink.xflags(), 2);
+            assert_eq!(sink.os(), 3);
 
             if bits & 4 != 0 {
-                assert_eq!(sink.extra_len, 4, "FLG bits {bits:#04x}");
+                assert_eq!(sink.extra_len(), 4, "FLG bits {bits:#04x}");
                 assert!(!sink.extra_is_absent());
                 assert_eq!(&contents(&extra_out)[..4], &extra_field);
             } else {
@@ -1966,7 +1968,7 @@ mod tests {
 
         assert_eq!(outcome, Outcome::Bad(MSG_HEADER_CRC_MISMATCH));
         assert_eq!(
-            state.head.unwrap().done,
+            state.head.unwrap().done(),
             GZ_HEADER_PENDING,
             "a rejected header never reports itself complete"
         );
@@ -2052,7 +2054,8 @@ mod tests {
 
         let sink = state.head.unwrap();
         assert_eq!(
-            sink.extra_len, 8,
+            sink.extra_len(),
+            8,
             "the advertised length, not the stored count"
         );
         assert_eq!(sink.extra_max(), 3);
@@ -2085,7 +2088,7 @@ mod tests {
         let mut next_in = 0;
         assert_eq!(drive(&mut state, &input, &mut next_in).0, Outcome::Header);
         assert_eq!(next_in, input.len());
-        assert_eq!(state.head.unwrap().extra_len, 40);
+        assert_eq!(state.head.unwrap().extra_len(), 40);
         assert_eq!(
             contents(&name_out),
             vec![0xa5; 4],
@@ -2124,7 +2127,7 @@ mod tests {
         assert_eq!(next_in, 12, "ten header bytes plus a two-byte XLEN");
 
         let sink = state.head.unwrap();
-        assert_eq!(sink.extra_len, 0);
+        assert_eq!(sink.extra_len(), 0);
         assert!(
             !sink.extra_is_absent(),
             "an empty field is present, not absent"
@@ -2255,7 +2258,7 @@ mod tests {
             vec![b'c', b'm', 0, 0xa5],
             "the comment was written last"
         );
-        assert_eq!(state.head.unwrap().done, GZ_HEADER_COMPLETE);
+        assert_eq!(state.head.unwrap().done(), GZ_HEADER_COMPLETE);
     }
 
     /// Everything a caller can observe after a header run.
@@ -2314,13 +2317,13 @@ mod tests {
             check: state.check,
             flags: state.flags,
             wbits: state.wbits,
-            done: sink.map_or(GZ_HEADER_PENDING, |head| head.done),
-            text: sink.is_some_and(|head| head.text),
-            time: sink.map_or(0, |head| head.time),
-            xflags: sink.map_or(0, |head| head.xflags),
-            os: sink.map_or(0, |head| head.os),
-            extra_len: sink.map_or(0, |head| head.extra_len),
-            hcrc: sink.is_some_and(|head| head.hcrc),
+            done: sink.map_or(GZ_HEADER_PENDING, |head| head.done()),
+            text: sink.is_some_and(|head| head.text()),
+            time: sink.map_or(0, |head| head.time()),
+            xflags: sink.map_or(0, |head| head.xflags()),
+            os: sink.map_or(0, |head| head.os()),
+            extra_len: sink.map_or(0, |head| head.extra_len()),
+            hcrc: sink.is_some_and(|head| head.hcrc()),
             extra: contents(&extra_out),
             name: contents(&name_out),
             comment: contents(&comment_out),
@@ -2408,7 +2411,7 @@ mod tests {
         assert_eq!(outcome, Outcome::Header);
         assert_eq!(adler, Some(0));
         assert_eq!(
-            state.head.unwrap().time,
+            state.head.unwrap().time(),
             0x1234_5678,
             "no bit of MTIME may be lost across a resume"
         );
@@ -2480,14 +2483,14 @@ mod tests {
             ),
             ReturnCode::OK
         );
-        assert_eq!(state.head.unwrap().done, GZ_HEADER_PENDING);
+        assert_eq!(state.head.unwrap().done(), GZ_HEADER_PENDING);
 
         // A zlib stream is not a gzip stream.
         let header = zlib_header(15, false);
         let mut next_in = 0;
         assert_eq!(drive(&mut state, &header, &mut next_in).0, Outcome::Header);
         assert_eq!(
-            state.head.unwrap().done,
+            state.head.unwrap().done(),
             GZ_HEADER_ABSENT,
             "-1 means: this stream carries no gzip header"
         );
@@ -2509,7 +2512,7 @@ mod tests {
         .bytes();
         let mut next_in = 0;
         assert_eq!(drive(&mut state, &input, &mut next_in).0, Outcome::Header);
-        assert_eq!(state.head.unwrap().done, GZ_HEADER_COMPLETE);
+        assert_eq!(state.head.unwrap().done(), GZ_HEADER_COMPLETE);
     }
 
     /// `done` is set to `-1` even when the stream then turns out not to be valid
@@ -2532,7 +2535,7 @@ mod tests {
             drive(&mut state, &input, &mut next_in).0,
             Outcome::Bad(MSG_INCORRECT_HEADER_CHECK)
         );
-        assert_eq!(state.head.unwrap().done, GZ_HEADER_ABSENT);
+        assert_eq!(state.head.unwrap().done(), GZ_HEADER_ABSENT);
     }
 
     /// The header CRC covers exactly the header bytes as they appear on the wire,
@@ -2716,11 +2719,11 @@ mod tests {
         let out = buffer(4);
         let mut sink = GzHeaderSink::new(Some(out.as_slice()), None, None);
         sink.mark_complete();
-        assert_eq!(sink.done, GZ_HEADER_COMPLETE);
+        assert_eq!(sink.done(), GZ_HEADER_COMPLETE);
 
         let mut state = state_for(GZIP);
         assert_eq!(inflate_get_header(&mut state, sink), ReturnCode::OK);
-        assert_eq!(state.head.unwrap().done, GZ_HEADER_PENDING);
+        assert_eq!(state.head.unwrap().done(), GZ_HEADER_PENDING);
     }
 
     /// A header installed part-way through a stream cannot make the extra-field

@@ -1,8 +1,8 @@
 // THE FEATURE GATE. `crates/zlib-rs` has no `gz` feature: its manifest declares exactly `default`,
 // `rust-api`, `simd` and `std`, and `src/lib.rs` L450-L451 declares `pub mod gz` under
 // `#[cfg(feature = "std")]` because only the file-I/O half of the layer needs `std`. So this whole
-// binary compiles away without that feature, and the gate below is `std` rather than the `gz` named
-// in AAP 0.5.1.4 -- `gz` is `libz-rs-sys`'s feature, and it forwards to this one.
+// binary compiles away without that feature, and the gate below is `std` rather than `gz` -- `gz` is
+// `libz-rs-sys`'s feature, and it forwards to this one.
 //
 // A misspelled gate here is the single most likely way for this suite to fail silently: the file
 // would compile to an empty binary and every check would pass while asserting nothing. The gate is
@@ -44,9 +44,10 @@
 //! public drivers.
 //!
 //! The definitive `z_stream`, `gz_header` and `struct gzFile_s` layout assertions belong to the
-//! facade, in `crates/libz-rs-sys/tests/abi_layout.rs`, because only the facade knows how wide
-//! `z_off_t` and `uLong` are on the target. This file is the core-side half: it proves that the type
-//! the facade will hand to a caller has the shape `zlib.h` promises.
+//! facade, because only the facade knows how wide `z_off_t` and `uLong` are on the target; it makes
+//! them at compile time in `crates/libz-rs-sys/src/layout_assertions.rs`. This file is the
+//! core-side half: it proves that the type the facade hands to a caller has the shape `zlib.h`
+//! promises.
 //!
 //! # The oracle
 //!
@@ -121,9 +122,9 @@ use zlib_rs::gz::{
     gz_open_handle, gzbuffer, gzclearerr, gzclose, gzclose_r, gzclose_w, gzdirect, gzeof, gzerror,
     gzflush, gzfread, gzfwrite, gzgetc, gzgetc_, gzgets, gzoffset64, gzopen, gzputc, gzputs,
     gzread, gzrewind, gzseek64, gzsetparams, gztell64, gzungetc, gzwrite, narrow_offset,
-    printf_begin, printf_bytes, printf_commit, printf_with, GzFileExposed, GzHandle, GzHow,
-    GzIoError, GzMode, GzOpenError, GzOpenSpec, GzSeekFrom, GzState, ZOff64, COPY, GZBUFSIZE, GZIP,
-    GZ_APPEND, GZ_NONE, GZ_READ, GZ_WRITE, LOOK,
+    printf_begin, printf_bytes, printf_commit, printf_with, GzFileExposed, GzHandle, GzHandleRef,
+    GzHow, GzIoError, GzMode, GzOpenError, GzOpenSpec, GzSeekFrom, GzState, ZOff64, COPY,
+    GZBUFSIZE, GZIP, GZ_APPEND, GZ_NONE, GZ_READ, GZ_WRITE, LOOK,
 };
 
 use common::{check_err, corpus};
@@ -144,8 +145,7 @@ const HELLO: &[u8] = corpus::HELLO;
 ///
 /// Transcribed from the fixture the `src/gz/read.rs` unit tests already use, which is itself the
 /// output of the C implementation. Reading it proves the "produced by C zlib, consumed here"
-/// direction of AAP 0.8.1 directive 4 -- bidirectional stream interoperability -- on the exact
-/// payload `test/example.c` uses.
+/// direction of bidirectional stream interoperability, on the exact payload `test/example.c` uses.
 const HELLO_GZ: [u8; 31] = [
     0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0xd7,
     0x51, 0xc8, 0x00, 0x51, 0x8a, 0x0c, 0x00, 0x9d, 0x3f, 0x6c, 0xb5, 0x0e, 0x00, 0x00, 0x00,
@@ -287,6 +287,13 @@ struct MemoryFile {
     /// How many times the handle has been closed, shared so the teardown can be asserted after the
     /// state has consumed the handle.
     closes: Rc<Cell<usize>>,
+    /// How many `read` and `write` calls the layer has made, shared for the same reason as
+    /// [`MemoryFile::closes`].
+    ///
+    /// Separate from [`MemoryFile::operations`], which counts *attempts* including the ones
+    /// [`Failure`] refuses; this counts transfers that were actually served, which is the figure
+    /// [`the_smallest_legal_buffer_produces_identical_bytes`] compares across buffer sizes.
+    transfers: Rc<Cell<usize>>,
     /// Whether `close` should report `EIO`, which the layer must turn into `Z_ERRNO`.
     close_fails: bool,
 }
@@ -313,6 +320,7 @@ impl MemoryFile {
 impl GzHandle for MemoryFile {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, GzIoError> {
         let allowance = self.allowance(buf.len())?;
+        self.transfers.set(self.transfers.get().saturating_add(1));
         let data = self.data.borrow();
         let available = data.len().saturating_sub(self.position);
         let count = allowance.min(available);
@@ -326,6 +334,7 @@ impl GzHandle for MemoryFile {
 
     fn write(&mut self, buf: &[u8]) -> Result<usize, GzIoError> {
         let allowance = self.allowance(buf.len())?;
+        self.transfers.set(self.transfers.get().saturating_add(1));
         // A short write is normal, but a zero-byte write of a non-empty buffer is a contract
         // violation the layer answers with `Z_STREAM_ERROR`; a stall is reported as a stall.
         let count = allowance.max(usize::from(!buf.is_empty())).min(buf.len());
@@ -384,6 +393,8 @@ struct Sink {
     data: Rc<RefCell<Vec<u8>>>,
     /// How many times a handle over [`Sink::data`] has been closed.
     closes: Rc<Cell<usize>>,
+    /// How many `read` and `write` calls handles over [`Sink::data`] have served.
+    transfers: Rc<Cell<usize>>,
 }
 
 impl Sink {
@@ -392,6 +403,7 @@ impl Sink {
         Self {
             data: Rc::new(RefCell::new(Vec::new())),
             closes: Rc::new(Cell::new(0)),
+            transfers: Rc::new(Cell::new(0)),
         }
     }
 
@@ -417,6 +429,14 @@ impl Sink {
         self.closes.get()
     }
 
+    /// How many `read` and `write` calls handles over this file have served.
+    ///
+    /// This is the number of times the `gzFile` layer crossed the [`GzHandle`] boundary, which is
+    /// what a buffer size actually controls: one call per `want` bytes rather than per byte.
+    fn transfers(&self) -> usize {
+        self.transfers.get()
+    }
+
     /// An ordinary blocking handle over this file, positioned at the start.
     fn handle(&self) -> MemoryFile {
         MemoryFile {
@@ -426,6 +446,7 @@ impl Sink {
             failure: Failure::None,
             operations: 0,
             closes: Rc::clone(&self.closes),
+            transfers: Rc::clone(&self.transfers),
             close_fails: false,
         }
     }
@@ -668,13 +689,13 @@ impl Drop for TempPath {
 /// visibility; it is asserted at compile time instead, inside `src/gz/state.rs`'s `mod layout_64`,
 /// where the field is in scope. What is checkable from out here -- that the state is at least as
 /// large as the prefix and at least as strictly aligned -- is checked below, and the definitive
-/// caller-facing assertions live in `crates/libz-rs-sys/tests/abi_layout.rs`, which is the only
-/// place that knows how wide `z_off64_t` is on the target.
+/// caller-facing assertions live in `crates/libz-rs-sys/src/layout_assertions.rs`, which is the
+/// only place that knows how wide `z_off64_t` is on the target.
 ///
 /// # Portability
 ///
-/// The absolute numbers hold on LP64, which is the model every measurement in AAP 0.6.3.1 was taken
-/// under, so they are asserted only where a pointer is eight bytes wide. The **relations** are
+/// The absolute numbers hold on LP64, the model the reference measurements were taken under, so they
+/// are asserted only where a pointer is eight bytes wide. The **relations** are
 /// asserted unconditionally, because they are what `#[repr(C)]` guarantees on every target and they
 /// are enough to catch a reordering or a shrink: on a 32-bit target the same struct is `have` at 0,
 /// `next` at 4 and `pos` at 8 for sixteen bytes total, with no padding after `have`. Note the
@@ -718,7 +739,7 @@ fn exposed_prefix_is_the_frozen_gzgetc_abi() {
         "`z_off64_t`'s alignment is what puts the padding after `have` on LP64"
     );
 
-    // The measured LP64 layout of AAP 0.6.3.1: 24 bytes, offsets 0 / 8 / 16.
+    // The measured LP64 layout of `struct gzFile_s`: 24 bytes, offsets 0 / 8 / 16.
     #[cfg(target_pointer_width = "64")]
     {
         assert_eq!(
@@ -1333,7 +1354,7 @@ fn produced_member_is_valid_rfc1952() {
 /// so it carries an `FNAME` field, and its `MTIME` is a real timestamp rather than zero. Reading it
 /// exercises the optional-field skipping of `doc/rfc1952.txt` 2.3.1.1 on bytes no part of this port
 /// wrote, which is the "streams produced by C zlib must decompress identically in the port" half of
-/// AAP 0.8.1 directive 4.
+/// bidirectional interoperability.
 ///
 /// No file I/O, so this runs under Miri.
 #[test]
@@ -3783,11 +3804,10 @@ fn short_transfers_are_looped_over() {
 // has a member in it, and the bytes that end up on disk. None of that can be observed through an
 // injected handle.
 //
-// Each one therefore carries `#[cfg_attr(miri, ignore)]`. The reason is the same in every case and is
-// restated at each test rather than assumed: **Miri cannot perform file I/O**, so under Miri these are
-// skipped and the layout, constant, grammar and behaviour tests above still run; natively -- which is
-// how CI runs them -- they execute in full. Cleanup is the `Drop` impl on `TempPath`, which runs on the
-// panicking path too, so a failing test leaves nothing behind.
+// Each one therefore carries `#[cfg_attr(miri, ignore)]`, for one reason: **Miri cannot perform file
+// I/O**. Under Miri these are skipped and the layout, constant, grammar and behaviour tests above
+// still run; under an ordinary native `cargo test` they execute in full. Cleanup is the `Drop` impl
+// on `TempPath`, which runs on the panicking path too, so a failing test leaves nothing behind.
 
 /// The whole of `test_gzio` again, this time against a real file opened by path.
 ///
@@ -3799,8 +3819,6 @@ fn short_transfers_are_looped_over() {
 ///
 /// The file on disk is checked as a gzip file too, header and trailer, because that is what a
 /// consumer such as `gzip(1)` would see.
-///
-/// Miri cannot perform file I/O, so this test is skipped under Miri and runs natively.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn filesystem_round_trip_reproduces_test_gzio() {
@@ -3876,8 +3894,6 @@ fn filesystem_round_trip_reproduces_test_gzio() {
 /// Nothing is left behind on the failing path: `gz_open_with` opens the file only after the mode
 /// string and the label allocation have both succeeded, so a refused open has created no state and no
 /// file. The absence of the file is asserted directly.
-///
-/// Miri cannot perform file I/O, so this test is skipped under Miri and runs natively.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn opening_a_missing_file_for_reading_fails_cleanly() {
@@ -3921,8 +3937,6 @@ fn opening_a_missing_file_for_reading_fails_cleanly() {
 /// [`GzOpenSpec::parse`] accepts `"wx"` and reports `exclusive()` -- and only the `open(2)` refuses.
 /// Both halves are asserted, and so is the fact that the existing file is left untouched: an
 /// exclusive create that failed must not have truncated anything.
-///
-/// Miri cannot perform file I/O, so this test is skipped under Miri and runs natively.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn exclusive_create_fails_when_the_file_exists() {
@@ -3972,8 +3986,6 @@ fn exclusive_create_fails_when_the_file_exists() {
 /// The result is a file with two members in it, which `doc/rfc1952.txt` 2.2 permits and which
 /// [`concatenated_members_read_as_one_stream`] proves the reader handles. Appending is the natural way
 /// such a file arises, so the two tests are two halves of one property.
-///
-/// Miri cannot perform file I/O, so this test is skipped under Miri and runs natively.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn append_mode_produces_a_multi_member_file() {
@@ -4035,8 +4047,6 @@ fn append_mode_produces_a_multi_member_file() {
 ///   header at all (`gzwrite.c` L23-L30 allocates no output buffer and no engine for a transparent
 ///   stream);
 /// * an unknown character is ignored rather than refused, so `"wbQ"` behaves exactly as `"wb"`.
-///
-/// Miri cannot perform file I/O, so this test is skipped under Miri and runs natively.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn mode_characters_reach_the_file() {
@@ -4125,9 +4135,7 @@ fn mode_characters_reach_the_file() {
 /// reference zlib produced ([`HELLO_GZ`]) and one the system `gzip(1)` produced
 /// ([`GZIP_CLI_NAMED`]), written to a real file and read back through [`gzopen`]. Together with
 /// [`produced_member_is_valid_rfc1952`], which checks the header and trailer of what this
-/// implementation writes, that is the bidirectional interoperability AAP 0.8.1 directive 4 requires.
-///
-/// Miri cannot perform file I/O, so this test is skipped under Miri and runs natively.
+/// implementation writes, that is bidirectional interoperability in both directions.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn foreign_members_read_from_a_real_file() {
@@ -4184,8 +4192,6 @@ fn foreign_members_read_from_a_real_file() {
 ///
 /// Both paths are asserted. The panicking one goes through [`std::panic::catch_unwind`], which is what
 /// a failing `#[test]` does, so this checks the guard under exactly the conditions that matter.
-///
-/// Miri cannot perform file I/O, so this test is skipped under Miri and runs natively.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn the_temporary_file_guard_cleans_up() {
@@ -4226,4 +4232,167 @@ fn the_temporary_file_guard_cleans_up() {
         second.path(),
         "the per-process counter must keep concurrent reservations apart"
     );
+}
+
+/// The file this library opens for itself reaches its `read` and `write` without a vtable.
+///
+/// `gz_load` fills the input buffer with one [`GzHandle::read`] (`gzread.c` L30) and `gz_comp`
+/// drains the output buffer with one [`GzHandle::write`] (`gzwrite.c` L115), so every byte a
+/// `gzFile` moves crosses that boundary once per underlying transfer. Erasing the handle to
+/// `dyn GzHandle` put an indirect call on that path -- unmeasurable behind an 8 KiB buffer and a
+/// syscall, but not behind `gzbuffer(8)`, whose floor is a single byte (`gzlib.c` L337-L340), and not
+/// behind a handle backed by memory rather than by a descriptor. Worse than the call itself, it
+/// stopped the optimizer from inlining [`FileHandle`]'s method and folding away its `Option` check.
+///
+/// [`GzHandleRef`] is the fix, and this is the assertion that keeps it: the variant a path-opened
+/// stream produces must be the statically dispatched one. A future change that boxed the built-in
+/// handle for convenience would still pass every behavioural test in this file, and would fail here.
+///
+/// The injected case is asserted alongside it, because retaining it is half the design: the facade
+/// adopts a caller's descriptor with a type this crate cannot name, so that case must stay a trait
+/// object -- and both cases must answer the identical [`GzHandle`] surface, which the shared helpers
+/// below check by driving each through the same generic function.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn the_built_in_handle_dispatches_without_a_vtable() {
+    let path = TempPath::new("dispatch");
+
+    // Opening by path: the case `gzopen` produces, and the common one.
+    let mut writer = gzopen(path.as_bytes(), b"wb", GlobalAllocator).expect("gzopen for writing");
+    assert!(
+        matches!(writer.handle_mut(), Some(GzHandleRef::Owned(_))),
+        "a path-opened stream must reach its file directly, not through a vtable"
+    );
+    // The same handle still answers the whole trait surface.
+    assert_eq!(
+        writer.handle_mut().unwrap().write(b"direct").unwrap(),
+        6,
+        "the statically dispatched write must still write"
+    );
+    assert_eq!(gzclose(Some(&mut writer)), ReturnCode::OK);
+
+    // An injected handle: what the facade supplies for an adopted descriptor.
+    let sink = Sink::new();
+    let mut injected = open_memory(sink.handle(), b"wb");
+    assert!(
+        matches!(injected.handle_mut(), Some(GzHandleRef::Boxed(_))),
+        "an injected handle must remain a trait object -- the facade's type cannot be named here"
+    );
+    assert_eq!(
+        injected.handle_mut().unwrap().write(b"boxed").unwrap(),
+        5,
+        "and it must answer the identical surface"
+    );
+    assert_eq!(gzclose(Some(&mut injected)), ReturnCode::OK);
+
+    // An empty slot answers `None` from both, which is C's closed descriptor.
+    let mut closed = gzopen(path.as_bytes(), b"rb", GlobalAllocator).expect("gzopen for reading");
+    let _ = closed.take_handle();
+    assert!(
+        closed.handle_mut().is_none(),
+        "a taken handle leaves nothing to dispatch to"
+    );
+}
+
+/// A one-byte buffer is the configuration that makes the per-transfer call path visible, and it must
+/// still produce byte-identical output.
+///
+/// `gzbuffer` floors `want` at 8 "to behave well with flushing" (`gzlib.c` L337-L340), so eight bytes
+/// is the smallest a stream can legally be configured to use. At that size `gz_comp`'s write loop and
+/// `gz_load`'s read loop run once per eight bytes rather than once per eight kilobytes, which is
+/// where [`GzHandleRef`]'s static dispatch is worth having -- and, more importantly for correctness,
+/// where any buffering mistake shows up immediately.
+///
+/// The assertion is that the *bytes* do not change: the same payload written through an 8-byte buffer
+/// and through the default [`GZBUFSIZE`] must produce the identical gzip member, because buffer size
+/// is an I/O-scheduling choice and not a compression parameter. AAP §0.6.2 forbids anything that
+/// perturbs emitted bytes, and this is the cheapest place that could have.
+///
+/// The handle-crossing count is measured alongside the bytes, because it is the figure that decides
+/// whether dispatch cost is visible at all. It is reported rather than merely bounded: a wall-clock
+/// benchmark of one indirect call is not reproducible in CI, but the number of calls is exact, and it
+/// is precisely what the cost of an indirect call would be multiplied by.
+///
+/// No file I/O, so this runs under Miri.
+#[test]
+fn the_smallest_legal_buffer_produces_identical_bytes() {
+    let payload = corpus::text();
+
+    let tiny_sink = Sink::new();
+    let tiny = {
+        let mut state = open_memory(tiny_sink.handle(), b"wb");
+        assert_eq!(
+            gzbuffer(Some(&mut state), 8),
+            0,
+            "8 is the documented floor"
+        );
+        assert_eq!(
+            usize::try_from(gzwrite(&mut state, &payload)).unwrap(),
+            payload.len()
+        );
+        check_err(
+            gzclose(Some(&mut state)),
+            "gzclose after the tiny-buffer write",
+        );
+        tiny_sink.bytes()
+    };
+
+    let default_sink = Sink::new();
+    let default = {
+        let mut state = open_memory(default_sink.handle(), b"wb");
+        assert_eq!(
+            usize::try_from(gzwrite(&mut state, &payload)).unwrap(),
+            payload.len()
+        );
+        check_err(
+            gzclose(Some(&mut state)),
+            "gzclose after the default-buffer write",
+        );
+        default_sink.bytes()
+    };
+
+    assert_eq!(
+        tiny, default,
+        "buffer size schedules I/O; it must not change a single emitted byte"
+    );
+    assert_eq!(
+        default,
+        compress_to_memory(&payload, b"wb"),
+        "and the locally opened default stream agrees with the shared helper"
+    );
+
+    // The exposure a small buffer buys, measured: at the 8-byte floor the layer crosses the handle
+    // boundary once per eight bytes of compressed output, and at `GZBUFSIZE` once per 8192. Every
+    // crossing was an indirect call before `GzHandleRef`, and this ratio is the multiplier that made
+    // removing it worthwhile for the handle this library opens itself.
+    let tiny_transfers = tiny_sink.transfers();
+    let default_transfers = default_sink.transfers();
+    println!(
+        "gz write transfers: {tiny_transfers} at gzbuffer(8) vs {default_transfers} at GZBUFSIZE, \
+         for {} compressed bytes",
+        default.len()
+    );
+    assert!(
+        default_transfers >= 1,
+        "the default stream must have reached the file at least once"
+    );
+    assert!(
+        tiny_transfers > default_transfers * 8,
+        "an 8-byte buffer must cross the handle boundary far more often ({tiny_transfers} vs \
+         {default_transfers}); if it does not, this test no longer measures what it claims"
+    );
+
+    // And the tiny buffer reads its own output back, one 8-byte transfer at a time.
+    let sink = Sink::with_contents(&tiny);
+    let mut reader = open_memory(sink.handle(), b"rb");
+    assert_eq!(gzbuffer(Some(&mut reader), 8), 0);
+    let mut readback = vec![0_u8; payload.len()];
+    let mut filled = 0;
+    while filled < readback.len() {
+        let read = gzread(&mut reader, &mut readback[filled..]);
+        assert!(read > 0, "the read must make progress");
+        filled += usize::try_from(read).unwrap();
+    }
+    assert_eq!(readback, payload, "and it must read back byte for byte");
+    assert_eq!(gzclose(Some(&mut reader)), ReturnCode::OK);
 }

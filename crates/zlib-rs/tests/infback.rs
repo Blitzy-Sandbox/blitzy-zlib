@@ -47,13 +47,13 @@
 //!
 //! # ★ Why this module gets a suite of its own
 //!
-//! `inflateBack` and the `gz*` family were the last pieces needed for full
-//! compatibility with the zlib public API, so this is deliberately a first-class
-//! suite rather than a corner of `tests/inflate.rs`.
+//! `inflateBack` is a distinct public entry point with its own callback protocol and
+//! its own window discipline, so it gets a first-class suite rather than a corner of
+//! `tests/inflate.rs`.
 //!
-//! And there is a second, sharper reason. The baseline commit of this entire port
-//! is `09a1572`, whose subject line is *"Fix `inflateBack()` bug that would fail
-//! to detect a too far back."* -- a bug that "would pass off an invalid deflate
+//! And there is a second, sharper reason. The reference implementation this port is
+//! taken from carries a fix for an `inflateBack()` defect that failed to detect a
+//! distance reaching too far back -- one that "would pass off an invalid deflate
 //! stream as good, and copy uninitialized memory contents to the output". The
 //! `invalid distance too far back` vector exercised by
 //! [`the_invalid_distance_too_far_back_vector_is_rejected`] is therefore not one
@@ -275,7 +275,7 @@ const RAW_VECTORS: &[Vector] = &[
         id: "invalid distance code",
         fails: true,
     },
-    // ★ The `09a1572` regression vector. See TOO_FAR_BACK below, which names the
+    // ★ The too-far-back regression vector. See TOO_FAR_BACK below, which names the
     // same stream so that the dedicated test can reach it without an index.
     Vector {
         hex: TOO_FAR_BACK_HEX,
@@ -329,8 +329,8 @@ const WRAPPED_VECTORS: &[&str] = &[
 /// (`test/infcover.c` L598).
 ///
 /// A dynamic block whose first symbol is a length/distance pair reaching back
-/// past anything that has been written. This is the stream that commit
-/// `09a1572` -- the baseline of this port -- restored the rejection of.
+/// past anything that has been written. This is the stream whose rejection the
+/// reference implementation's `inflateBack` too-far-back fix restored.
 const TOO_FAR_BACK_HEX: &str = "c c0 81 0 0 0 0 0 90 ff 6b 4 0";
 
 /// The message the reference sets for [`TOO_FAR_BACK_HEX`] (`infback.c` L519).
@@ -750,14 +750,16 @@ fn sentinel_window(len: usize) -> Vec<u8> {
 /// If `inflate_back_init` rejects `window_bits` or `window`, which for every call
 /// site below would mean the fixture is wrong rather than the decoder.
 fn decode(window: &mut [u8], window_bits: i32, staged: &[u8]) -> Outcome {
-    let mut state = inflate_back_init(window_bits, window, GlobalAllocator)
-        .expect("inflate_back_init rejected a window this test built for it");
+    let mut state = inflate_back_init(window_bits, GlobalAllocator)
+        .expect("inflate_back_init rejected a windowBits this test built for it");
     let mut sink = Collector::default();
     let mut source = Declining::default();
-    let result = inflate_back(&mut state, Some(staged), &mut source, &mut sink);
+    // The window is a per-call argument, because the exclusive borrow is only true
+    // for the duration of the call; see `inflate_back_init`.
+    let result = inflate_back(&mut state, window, Some(staged), &mut source, &mut sink);
     let (code, msg, unused) = (result.code, result.msg, result.next_in.map(<[u8]>::len));
     let mode = Mode::from_raw(state.mode_tag());
-    let end = inflate_back_end(state);
+    let end = inflate_back_end(&mut state);
     Outcome {
         code,
         msg,
@@ -1136,8 +1138,8 @@ fn first_block_header(stream: &[u8]) -> (bool, u8) {
 ///    exactly the kind of non-normative choice this port has to reproduce. Writing
 ///    the sequence the reference chose has to give the twelve bytes it produced.
 /// 3. **A back-reference reaching too far.** One literal then a length-3 match at
-///    distance 5 is `4b 04 12 00`, the invalid stream whose rejection commit
-///    `09a1572` restored. Reproducing it byte for byte is what lets
+///    distance 5 is `4b 04 12 00`, the invalid stream whose rejection the reference's
+///    too-far-back fix restored. Reproducing it byte for byte is what lets
 ///    [`a_hand_written_reference_reaching_past_the_written_window_is_rejected`]
 ///    claim to be testing that specific check.
 ///
@@ -1260,7 +1262,6 @@ fn every_window_bits_from_eight_through_fifteen_is_accepted() {
 /// rejected set.
 #[test]
 fn window_bits_outside_eight_through_fifteen_is_a_stream_error() {
-    let mut window = sentinel_window(HARNESS_WINDOW_LEN);
     for bits in [
         7_i32,
         16,
@@ -1276,7 +1277,7 @@ fn window_bits_outside_eight_through_fifteen_is_a_stream_error() {
         i32::MIN,
         i32::MAX,
     ] {
-        let rejected = inflate_back_init(bits, &mut window, GlobalAllocator);
+        let rejected = inflate_back_init(bits, GlobalAllocator);
         assert_eq!(
             rejected.err(),
             Some(ReturnCode::STREAM_ERROR),
@@ -1301,7 +1302,6 @@ fn window_bits_outside_eight_through_fifteen_is_a_stream_error() {
 /// ever drifts towards the other.
 #[test]
 fn inflate_back_init_accepts_no_container_request_unlike_inflate_init2() {
-    let mut window = sentinel_window(HARNESS_WINDOW_LEN);
     for bits in [-15_i32, -12, -8, 16 + 15, 32 + 15, 0] {
         let forward: Result<InflateState<'_, GlobalAllocator>, ReturnCode> =
             InflateState::new(InflateConfig::new(bits), GlobalAllocator);
@@ -1311,7 +1311,7 @@ fn inflate_back_init_accepts_no_container_request_unlike_inflate_init2() {
         );
         drop(forward);
 
-        let backward = inflate_back_init(bits, &mut window, GlobalAllocator);
+        let backward = inflate_back_init(bits, GlobalAllocator);
         assert_eq!(
             backward.err(),
             Some(ReturnCode::STREAM_ERROR),
@@ -1320,7 +1320,8 @@ fn inflate_back_init_accepts_no_container_request_unlike_inflate_init2() {
     }
 }
 
-/// A window shorter than `2**windowBits` is rejected.
+/// A window shorter than `2**windowBits` is rejected -- by `inflate_back`, which is
+/// where the window now arrives.
 ///
 /// The window's length is part of this interface's contract in a way it is not
 /// for `inflate()`, which allocates its own. C cannot check it -- it receives a
@@ -1328,25 +1329,53 @@ fn inflate_back_init_accepts_no_container_request_unlike_inflate_init2() {
 /// which is why `zlib.h` L1163-L1166 makes it the caller's stated obligation. A
 /// `&mut [u8]` carries its length, so the port checks what C can only document,
 /// and reports the same `Z_STREAM_ERROR` the rest of L33-L35 reports.
+///
+/// ★ The check moved from `inflate_back_init` to `inflate_back` when the window
+/// became a per-call argument, and it is *stronger* there: C validates nothing at
+/// either point, and a caller that shrinks or swaps its buffer between calls is now
+/// caught on the call that does it rather than never.
 #[test]
 fn a_window_shorter_than_the_requested_size_is_rejected() {
     for bits in MIN_BACK_WINDOW_BITS..=MAX_BACK_WINDOW_BITS {
         let short = (1_usize << bits) - 1;
         let mut window = sentinel_window(short);
-        let rejected = inflate_back_init(bits, &mut window, GlobalAllocator);
+        let mut state = inflate_back_init(bits, GlobalAllocator).expect("init");
+        let mut sink = Collector::default();
+        let mut source = Declining::default();
+        let refused = inflate_back(
+            &mut state,
+            &mut window,
+            Some(HELLO_FIXED),
+            &mut source,
+            &mut sink,
+        );
         assert_eq!(
-            rejected.err(),
-            Some(ReturnCode::STREAM_ERROR),
+            refused.code,
+            ReturnCode::STREAM_ERROR,
             "windowBits {bits} with a {short}-byte window must be rejected"
         );
+        assert_eq!(sink.calls, 0, "the output callback is never reached");
+        assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
     }
+
     // An empty window is the degenerate case of the same rule.
     let mut nothing: Vec<u8> = Vec::new();
+    let mut state = inflate_back_init(MIN_BACK_WINDOW_BITS, GlobalAllocator).expect("init");
+    let mut sink = Collector::default();
+    let mut source = Declining::default();
     assert_eq!(
-        inflate_back_init(MIN_BACK_WINDOW_BITS, &mut nothing, GlobalAllocator).err(),
-        Some(ReturnCode::STREAM_ERROR),
+        inflate_back(
+            &mut state,
+            &mut nothing,
+            Some(HELLO_FIXED),
+            &mut source,
+            &mut sink
+        )
+        .code,
+        ReturnCode::STREAM_ERROR,
         "an empty window must be rejected"
     );
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
 }
 
 /// A window longer than `2**windowBits` is accepted, and only that prefix is
@@ -1363,10 +1392,15 @@ fn a_window_longer_than_the_requested_size_is_truncated_to_it() {
     const REQUESTED: usize = 1 << BITS;
     let mut window = sentinel_window(REQUESTED + 500);
 
-    let state = inflate_back_init(BITS, &mut window, GlobalAllocator).expect("init");
+    let mut state = inflate_back_init(BITS, GlobalAllocator).expect("init");
+
     assert_eq!(debug_scalar(&state, "wsize"), REQUESTED.to_string());
     assert_eq!(debug_scalar(&state, "wbits"), BITS.to_string());
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
+    // Retire the state so its borrow on the caller's window ends. An ended
+    // `inflateBack` state owns no allocation -- the window was the caller's and the
+    // slot is already empty -- so this frees nothing.
+    drop(state);
 
     let outcome = decode(&mut window, BITS, HELLO_FIXED);
     assert_eq!(outcome.code, ReturnCode::STREAM_END);
@@ -1393,8 +1427,8 @@ fn a_window_longer_than_the_requested_size_is_truncated_to_it() {
 fn dmax_is_fixed_at_thirty_two_kibibytes_for_every_window_size() {
     assert_eq!(DMAX_DEFAULT, 32768, "infback.c L56");
     for bits in MIN_BACK_WINDOW_BITS..=MAX_BACK_WINDOW_BITS {
-        let mut window = sentinel_window(1_usize << bits);
-        let state = inflate_back_init(bits, &mut window, GlobalAllocator).expect("init");
+        let mut state = inflate_back_init(bits, GlobalAllocator).expect("init");
+
         assert_eq!(
             debug_scalar(&state, "dmax"),
             DMAX_DEFAULT.to_string(),
@@ -1405,7 +1439,7 @@ fn dmax_is_fixed_at_thirty_two_kibibytes_for_every_window_size() {
             (1_usize << bits).to_string(),
             "wsize must follow windowBits {bits}"
         );
-        assert_eq!(inflate_back_end(state), ReturnCode::OK);
+        assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
     }
 }
 
@@ -1416,15 +1450,15 @@ fn dmax_is_fixed_at_thirty_two_kibibytes_for_every_window_size() {
 /// therefore what the too-far-back check at L516-L521 tests against. A state that
 /// started life claiming history it does not have would accept invalid streams and
 /// emit whatever the caller's buffer happened to contain -- which is precisely the
-/// defect commit `09a1572` fixed.
+/// defect the reference's too-far-back fix addressed.
 #[test]
 fn a_fresh_state_claims_no_window_history() {
-    let mut window = sentinel_window(HARNESS_WINDOW_LEN);
-    let state = inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
+
     assert_eq!(debug_scalar(&state, "whave"), "0", "infback.c L61");
     assert_eq!(debug_scalar(&state, "wnext"), "0", "infback.c L60");
     assert_eq!(debug_scalar(&state, "sane"), "true", "infback.c L62");
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
 }
 
 /// Ending a freshly initialised state reports `Z_OK` and hands the window back
@@ -1438,8 +1472,8 @@ fn a_fresh_state_claims_no_window_history() {
 #[test]
 fn ending_a_freshly_initialised_state_reports_ok_and_returns_the_window() {
     let mut window = sentinel_window(HARNESS_WINDOW_LEN);
-    let state = inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
 
     assert!(
         window.iter().all(|&byte| byte == WINDOW_SENTINEL),
@@ -1456,8 +1490,8 @@ fn ending_a_freshly_initialised_state_reports_ok_and_returns_the_window() {
 /// `inflateBack(Z_NULL, ..)` and `inflateBackEnd(Z_NULL)` all report
 /// `Z_STREAM_ERROR`. A null `z_streamp` is unrepresentable in the safe core --
 /// `&mut InflateState` proves non-nullness by existing -- so those exact three
-/// calls are the facade's to make, and `crates/libz-rs-sys/tests` is where they
-/// belong.
+/// calls are the facade's to make. It refuses all three, and asserts so in the
+/// `#[cfg(test)]` module of `crates/libz-rs-sys/src/infback.rs`.
 ///
 /// What *is* reachable, and is the same failure in substance, is handing
 /// `inflate_back` a state that carries no `inflateBack` window: one built by
@@ -1476,7 +1510,17 @@ fn a_state_not_built_for_inflate_back_is_a_stream_error() {
             .expect("inflate_init2");
     let mut sink = Collector::default();
     let mut source = Declining::default();
-    let result = inflate_back(&mut state, Some(EMPTY_FIXED), &mut source, &mut sink);
+    // The window is the right size, so the refusal can only be about the state: an
+    // `inflate()` state's `wsize` is zero until its window is allocated, and it is the
+    // disagreement with the window's length that `inflate_back` refuses.
+    let mut window = sentinel_window(HARNESS_WINDOW_LEN);
+    let result = inflate_back(
+        &mut state,
+        &mut window,
+        Some(EMPTY_FIXED),
+        &mut source,
+        &mut sink,
+    );
 
     assert_eq!(result.code, ReturnCode::STREAM_ERROR);
     assert_eq!(result.msg, None, "a stream error sets no message");
@@ -1521,11 +1565,16 @@ fn a_state_not_built_for_inflate_back_is_a_stream_error() {
 #[test]
 fn staged_input_is_consumed_before_the_callback_is_asked() {
     let mut window = sentinel_window(HARNESS_WINDOW_LEN);
-    let mut state =
-        inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
     let mut sink = Collector::default();
     let mut source = Declining::default();
-    let result = inflate_back(&mut state, Some(HELLO_FIXED), &mut source, &mut sink);
+    let result = inflate_back(
+        &mut state,
+        &mut window,
+        Some(HELLO_FIXED),
+        &mut source,
+        &mut sink,
+    );
 
     assert_eq!(result.code, ReturnCode::STREAM_END);
     assert_eq!(sink.written, HELLO);
@@ -1533,7 +1582,7 @@ fn staged_input_is_consumed_before_the_callback_is_asked() {
         source.calls, 0,
         "a complete staged stream must never reach in()"
     );
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
 }
 
 /// An input callback that declines *after* a complete stream reports
@@ -1546,11 +1595,10 @@ fn staged_input_is_consumed_before_the_callback_is_asked() {
 #[test]
 fn an_input_callback_that_declines_after_a_complete_stream_reports_stream_end() {
     let mut window = sentinel_window(HARNESS_WINDOW_LEN);
-    let mut state =
-        inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
     let mut sink = Collector::default();
     let mut source = Pieces::new(HELLO_FIXED, 4);
-    let result = inflate_back(&mut state, None, &mut source, &mut sink);
+    let result = inflate_back(&mut state, &mut window, None, &mut source, &mut sink);
 
     assert_eq!(result.code, ReturnCode::STREAM_END);
     assert_eq!(sink.written, HELLO);
@@ -1558,7 +1606,7 @@ fn an_input_callback_that_declines_after_a_complete_stream_reports_stream_end() 
         source.calls >= 1,
         "with nothing staged the callback must be asked at least once"
     );
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
 }
 
 /// An input callback that declines *before* the stream ends reports
@@ -1575,18 +1623,17 @@ fn an_input_callback_that_declines_after_a_complete_stream_reports_stream_end() 
 fn an_input_callback_that_declines_after_a_truncated_stream_is_a_buffer_error() {
     let truncated = &HELLO_FIXED[..HELLO_FIXED.len() - 1];
     let mut window = sentinel_window(HARNESS_WINDOW_LEN);
-    let mut state =
-        inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
     let mut sink = Collector::default();
     let mut source = Pieces::new(truncated, 4);
-    let result = inflate_back(&mut state, None, &mut source, &mut sink);
+    let result = inflate_back(&mut state, &mut window, None, &mut source, &mut sink);
 
     assert_eq!(result.code, ReturnCode::BUF_ERROR);
     assert_eq!(
         result.next_in, None,
         "an input failure nulls next_in (zlib.h L1199-L1202)"
     );
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
 }
 
 /// An input callback that declines immediately, with nothing staged, is a
@@ -1603,11 +1650,10 @@ fn an_input_callback_that_declines_after_a_truncated_stream_is_a_buffer_error() 
 #[test]
 fn an_input_callback_that_declines_immediately_is_a_buffer_error() {
     let mut window = sentinel_window(HARNESS_WINDOW_LEN);
-    let mut state =
-        inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
     let mut sink = Collector::default();
     let mut source = Declining::default();
-    let result = inflate_back(&mut state, None, &mut source, &mut sink);
+    let result = inflate_back(&mut state, &mut window, None, &mut source, &mut sink);
 
     assert_eq!(result.code, ReturnCode::BUF_ERROR);
     assert_eq!(result.next_in, None);
@@ -1618,7 +1664,7 @@ fn an_input_callback_that_declines_immediately_is_a_buffer_error() {
         Some(Mode::Type),
         "infback.c L215 left the state in TYPE"
     );
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
 }
 
 /// An input callback that yields an **empty** chunk has failed, exactly as one
@@ -1638,24 +1684,26 @@ fn an_input_callback_that_declines_immediately_is_a_buffer_error() {
 fn an_input_callback_yielding_an_empty_chunk_is_the_same_as_declining() {
     let mut window = sentinel_window(HARNESS_WINDOW_LEN);
 
-    let mut state =
-        inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
     let mut sink = Collector::default();
     let mut source = Pieces::yielding_nothing();
-    let from_callback = inflate_back(&mut state, None, &mut source, &mut sink);
+    let from_callback = inflate_back(&mut state, &mut window, None, &mut source, &mut sink);
     assert_eq!(from_callback.code, ReturnCode::BUF_ERROR);
     assert_eq!(from_callback.next_in, None);
     assert_eq!(source.calls, 1, "an empty answer ends the conversation");
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
+    // Retire the state so its borrow on the caller's window ends. An ended
+    // `inflateBack` state owns no allocation -- the window was the caller's and the
+    // slot is already empty -- so this frees nothing.
+    drop(state);
 
-    let mut state =
-        inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
     let mut sink = Collector::default();
     let mut source = Declining::default();
-    let from_staged = inflate_back(&mut state, Some(&[]), &mut source, &mut sink);
+    let from_staged = inflate_back(&mut state, &mut window, Some(&[]), &mut source, &mut sink);
     assert_eq!(from_staged.code, ReturnCode::BUF_ERROR);
     assert_eq!(from_staged.next_in, None);
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
 }
 
 /// ★ An output callback that **fails** is a `Z_BUF_ERROR`, and `next_in` survives.
@@ -1673,12 +1721,12 @@ fn an_input_callback_yielding_an_empty_chunk_is_the_same_as_declining() {
 #[test]
 fn an_output_callback_that_fails_is_a_buffer_error() {
     let mut window = sentinel_window(HARNESS_WINDOW_LEN);
-    let mut state =
-        inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
     let mut sink = Refusing::immediately();
     let mut source = Declining::default();
     let result = inflate_back(
         &mut state,
+        &mut window,
         Some(ONE_ZERO_BYTE_FIXED),
         &mut source,
         &mut sink,
@@ -1692,7 +1740,7 @@ fn an_output_callback_that_fails_is_a_buffer_error() {
     );
     assert_eq!(sink.calls, 1, "out() ran and refused");
     assert!(sink.written.is_empty(), "a refusal accepts nothing");
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
 }
 
 /// ★ A failing epilogue flush downgrades success and nothing else.
@@ -1729,11 +1777,16 @@ fn a_failing_epilogue_flush_downgrades_success_and_nothing_else() {
 
     // A data error with output pending, and a refusing sink: the data error wins.
     let invalid = hand_written_too_far_back();
-    let mut state =
-        inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
     let mut sink = Refusing::immediately();
     let mut source = Declining::default();
-    let result = inflate_back(&mut state, Some(&invalid), &mut source, &mut sink);
+    let result = inflate_back(
+        &mut state,
+        &mut window,
+        Some(&invalid),
+        &mut source,
+        &mut sink,
+    );
     assert_eq!(
         result.code,
         ReturnCode::DATA_ERROR,
@@ -1745,14 +1798,23 @@ fn a_failing_epilogue_flush_downgrades_success_and_nothing_else() {
         "and must keep its message"
     );
     assert_eq!(sink.calls, 1, "out() is still called on the error path");
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
+    // Retire the state so its borrow on the caller's window ends. An ended
+    // `inflateBack` state owns no allocation -- the window was the caller's and the
+    // slot is already empty -- so this frees nothing.
+    drop(state);
 
     // The same refusal against a valid stream: success is downgraded.
-    let mut state =
-        inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
     let mut sink = Refusing::immediately();
     let mut source = Declining::default();
-    let result = inflate_back(&mut state, Some(HELLO_FIXED), &mut source, &mut sink);
+    let result = inflate_back(
+        &mut state,
+        &mut window,
+        Some(HELLO_FIXED),
+        &mut source,
+        &mut sink,
+    );
     assert_eq!(
         result.code,
         ReturnCode::BUF_ERROR,
@@ -1760,7 +1822,7 @@ fn a_failing_epilogue_flush_downgrades_success_and_nothing_else() {
     );
     assert_eq!(result.msg, None);
     assert_eq!(sink.calls, 1);
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
 }
 
 /// ★ An output callback that **succeeds** lets the same stream decode.
@@ -1807,8 +1869,7 @@ fn the_two_callback_polarities_are_opposite() {
 
     for input_fails in [false, true] {
         for output_fails in [false, true] {
-            let mut state =
-                inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
+            let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
 
             // The input side spells "trouble" as an empty queue: nothing to
             // yield, which is C's `in()` returning zero.
@@ -1826,7 +1887,7 @@ fn the_two_callback_polarities_are_opposite() {
                 Refusing::after(usize::MAX)
             };
 
-            let result = inflate_back(&mut state, None, &mut source, &mut sink);
+            let result = inflate_back(&mut state, &mut window, None, &mut source, &mut sink);
             let expected = if input_fails || output_fails {
                 ReturnCode::BUF_ERROR
             } else {
@@ -1842,7 +1903,7 @@ fn the_two_callback_polarities_are_opposite() {
                 "next_in is null exactly when in() failed \
                  (in() fails: {input_fails}, out() fails: {output_fails})"
             );
-            assert_eq!(inflate_back_end(state), ReturnCode::OK);
+            assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
         }
     }
 }
@@ -1866,11 +1927,10 @@ fn the_two_callback_polarities_are_opposite() {
 fn an_input_callback_handing_over_one_byte_at_a_time_still_decodes() {
     let mut window = sentinel_window(HARNESS_WINDOW_LEN);
 
-    let mut state =
-        inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
     let mut sink = Collector::default();
     let mut source = Pieces::new(HELLO_FIXED, 1);
-    let result = inflate_back(&mut state, None, &mut source, &mut sink);
+    let result = inflate_back(&mut state, &mut window, None, &mut source, &mut sink);
     assert_eq!(result.code, ReturnCode::STREAM_END);
     assert_eq!(
         sink.written, HELLO,
@@ -1881,14 +1941,17 @@ fn an_input_callback_handing_over_one_byte_at_a_time_still_decodes() {
         HELLO_FIXED.len(),
         "one call per byte, and the stream ended before a refusal was needed"
     );
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
+    // Retire the state so its borrow on the caller's window ends. An ended
+    // `inflateBack` state owns no allocation -- the window was the caller's and the
+    // slot is already empty -- so this frees nothing.
+    drop(state);
 
     // C's own `dat[]`, driven the way C drives it.
-    let mut state =
-        inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
     let mut sink = Collector::default();
     let mut source = Pieces::new(PULL_DAT, 1);
-    let result = inflate_back(&mut state, None, &mut source, &mut sink);
+    let result = inflate_back(&mut state, &mut window, None, &mut source, &mut sink);
     assert_eq!(result.code, ReturnCode::STREAM_END);
     assert_eq!(
         sink.written,
@@ -1896,7 +1959,7 @@ fn an_input_callback_handing_over_one_byte_at_a_time_still_decodes() {
         "pull()'s dat[] is a fixed block of four zero bytes"
     );
     assert_eq!(source.calls, PULL_DAT.len());
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
 }
 
 /// ★ Both sides of the fast-path threshold decode identically.
@@ -1963,11 +2026,10 @@ fn both_sides_of_the_fast_path_threshold_decode_identically() {
     // stream staged at once.
     let mut window = sentinel_window(HARNESS_WINDOW_LEN);
     for piece in [1_usize, 5, 6, 7, stream.len()] {
-        let mut state =
-            inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
+        let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
         let mut sink = Collector::default();
         let mut source = Pieces::new(&stream, piece);
-        let result = inflate_back(&mut state, None, &mut source, &mut sink);
+        let result = inflate_back(&mut state, &mut window, None, &mut source, &mut sink);
         assert_eq!(
             result.code,
             ReturnCode::STREAM_END,
@@ -1977,7 +2039,7 @@ fn both_sides_of_the_fast_path_threshold_decode_identically() {
             sink.written, expected,
             "pieces of {piece} byte(s) must decode to the same bytes"
         );
-        assert_eq!(inflate_back_end(state), ReturnCode::OK);
+        assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
     }
 
     // The `left >= 258` axis: 256 bytes of window, where the condition can never
@@ -2015,10 +2077,16 @@ fn a_mid_stream_output_failure_stops_the_decode() {
     let stream = fixed_literal_stream(&payload);
     let mut window = sentinel_window(WINDOW);
 
-    let mut state = inflate_back_init(BITS, &mut window, GlobalAllocator).expect("init");
+    let mut state = inflate_back_init(BITS, GlobalAllocator).expect("init");
     let mut sink = Refusing::after(1);
     let mut source = Declining::default();
-    let result = inflate_back(&mut state, Some(&stream), &mut source, &mut sink);
+    let result = inflate_back(
+        &mut state,
+        &mut window,
+        Some(&stream),
+        &mut source,
+        &mut sink,
+    );
 
     assert_eq!(result.code, ReturnCode::BUF_ERROR);
     assert!(
@@ -2035,7 +2103,7 @@ fn a_mid_stream_output_failure_stops_the_decode() {
         result.next_in.map_or(0, <[u8]>::len) > 0,
         "the decode stopped with input still unread"
     );
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
 }
 
 // ===========================================================================
@@ -2129,12 +2197,12 @@ fn every_raw_vector_from_the_c_harness_behaves_as_the_reference_does() {
 }
 
 /// ★ The `invalid distance too far back` vector is rejected -- the direct
-/// regression guard for this port's own baseline commit.
+/// regression guard for the reference's own `inflateBack` too-far-back fix.
 ///
-/// HEAD `09a1572` is titled *"Fix `inflateBack()` bug that would fail to detect a
-/// too far back"*, and its message continues: "The bug would pass off an invalid
+/// That fix is described as "Fix `inflateBack()` bug that would fail to detect a
+/// too far back", and it continues: "The bug would pass off an invalid
 /// deflate stream as good, and copy uninitialized memory contents to the output."
-/// The fix **deletes** two lines from the fast-path dispatch inside `case LEN:`,
+/// It **deletes** two lines from the fast-path dispatch inside `case LEN:`,
 /// between `RESTORE()` and the `inflate_fast()` call:
 ///
 /// ```text
@@ -2195,7 +2263,7 @@ fn the_invalid_distance_too_far_back_vector_is_rejected() {
 ///
 /// With `whave < wsize`, `wsize - left` is exactly how many bytes have been put into
 /// the window, which is one. A distance of five is greater, so the stream is invalid.
-/// The two lines commit `09a1572` deleted would have raised `whave` to
+/// The two lines that fix deleted would have raised `whave` to
 /// `wsize - left` before the fast path ran, making that comparison always pass.
 ///
 /// ★ The assertion that catches the original bug is the one about the output. The
@@ -2685,8 +2753,7 @@ fn a_stream_mixing_all_three_block_types_decodes() {
 #[test]
 fn a_mode_forced_before_the_call_is_discarded_by_the_entry_reset() {
     let mut window = sentinel_window(HARNESS_WINDOW_LEN);
-    let mut state =
-        inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
 
     for forced in Mode::ALL {
         assert!(
@@ -2696,7 +2763,13 @@ fn a_mode_forced_before_the_call_is_discarded_by_the_entry_reset() {
         );
         let mut sink = Collector::default();
         let mut source = Declining::default();
-        let result = inflate_back(&mut state, Some(HELLO_FIXED), &mut source, &mut sink);
+        let result = inflate_back(
+            &mut state,
+            &mut window,
+            Some(HELLO_FIXED),
+            &mut source,
+            &mut sink,
+        );
         assert_eq!(
             result.code,
             ReturnCode::STREAM_END,
@@ -2710,7 +2783,7 @@ fn a_mode_forced_before_the_call_is_discarded_by_the_entry_reset() {
     // state cannot be corrupted through this door at all.
     assert!(!state.set_mode_tag(-1), "-1 names no state");
     assert!(!state.set_mode_tag(i32::MAX), "i32::MAX names no state");
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
 }
 
 // ===========================================================================
@@ -2748,13 +2821,18 @@ fn one_window_serves_two_successive_decodes() {
     let dynamic = common::h2b(DYNAMIC_LONG_DISTANCE.hex);
     let dynamic_expected = vec![0_u8; DYNAMIC_LONG_DISTANCE.decoded_len];
     let mut window = sentinel_window(HARNESS_WINDOW_LEN);
-    let mut state =
-        inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
 
     for round in 0..2 {
         let mut sink = Collector::default();
         let mut source = Declining::default();
-        let first = inflate_back(&mut state, Some(HELLO_FIXED), &mut source, &mut sink);
+        let first = inflate_back(
+            &mut state,
+            &mut window,
+            Some(HELLO_FIXED),
+            &mut source,
+            &mut sink,
+        );
         assert_eq!(
             first.code,
             ReturnCode::STREAM_END,
@@ -2764,7 +2842,13 @@ fn one_window_serves_two_successive_decodes() {
 
         let mut sink = Collector::default();
         let mut source = Declining::default();
-        let second = inflate_back(&mut state, Some(&dynamic), &mut source, &mut sink);
+        let second = inflate_back(
+            &mut state,
+            &mut window,
+            Some(&dynamic),
+            &mut source,
+            &mut sink,
+        );
         assert_eq!(
             second.code,
             ReturnCode::STREAM_END,
@@ -2773,7 +2857,7 @@ fn one_window_serves_two_successive_decodes() {
         assert_eq!(sink.written, dynamic_expected, "round {round}, stream 2");
     }
 
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
 }
 
 /// ★ A window pre-filled with `0xa5` still decodes correctly.
@@ -2985,13 +3069,22 @@ fn a_match_reaching_back_further_than_one_flush_uses_the_window() {
 #[test]
 fn the_caller_may_read_and_write_its_window_after_the_state_ends() {
     let mut window = sentinel_window(HARNESS_WINDOW_LEN);
-    let mut state =
-        inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
     let mut sink = Collector::default();
     let mut source = Declining::default();
-    let result = inflate_back(&mut state, Some(HELLO_FIXED), &mut source, &mut sink);
+    let result = inflate_back(
+        &mut state,
+        &mut window,
+        Some(HELLO_FIXED),
+        &mut source,
+        &mut sink,
+    );
     assert_eq!(result.code, ReturnCode::STREAM_END);
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
+    // Retire the state so its borrow on the caller's window ends. An ended
+    // `inflateBack` state owns no allocation -- the window was the caller's and the
+    // slot is already empty -- so this frees nothing.
+    drop(state);
 
     assert_eq!(
         &window[..HELLO.len()],
@@ -3041,16 +3134,16 @@ fn the_caller_may_read_and_write_its_window_after_the_state_ends() {
 #[test]
 fn initialisation_and_teardown_are_free_of_allocator_traffic() {
     let tracker = common::TrackingAllocator::new();
-    let mut window = sentinel_window(HARNESS_WINDOW_LEN);
 
-    let state = inflate_back_init(HARNESS_WINDOW_BITS, &mut window, &tracker).expect("init");
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, &tracker).expect("init");
+
     assert_eq!(
         tracker.total(),
         0,
         "the core allocates no state container -- see the facade"
     );
     assert_eq!(tracker.high_water(), 0, "and never has");
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
 
     assert_eq!(tracker.total(), 0, "nothing outstanding");
     assert_eq!(tracker.not_lifo(), 0, "mem_done L223-L224");
@@ -3082,11 +3175,17 @@ fn an_allocation_ceiling_does_not_prevent_initialisation() {
     tracker.set_limit(1);
     let mut window = sentinel_window(HARNESS_WINDOW_LEN);
 
-    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, &mut window, &tracker)
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, &tracker)
         .expect("the core allocates nothing, so a ceiling cannot stop it");
     let mut sink = Collector::default();
     let mut source = Declining::default();
-    let result = inflate_back(&mut state, Some(HELLO_FIXED), &mut source, &mut sink);
+    let result = inflate_back(
+        &mut state,
+        &mut window,
+        Some(HELLO_FIXED),
+        &mut source,
+        &mut sink,
+    );
     assert_eq!(result.code, ReturnCode::STREAM_END);
     assert_ne!(
         result.code,
@@ -3094,7 +3193,7 @@ fn an_allocation_ceiling_does_not_prevent_initialisation() {
         "no allocation means no memory error"
     );
     assert_eq!(sink.written, HELLO);
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
 
     tracker.assert_clean();
 }
@@ -3120,7 +3219,7 @@ fn a_whole_decode_through_the_tracking_allocator_is_clean() {
     let tracker = common::TrackingAllocator::new();
     let mut window = sentinel_window(HARNESS_WINDOW_LEN);
 
-    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, &mut window, &tracker).expect("init");
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, &tracker).expect("init");
     for (label, stream, expected) in [
         ("fixed", HELLO_FIXED, HELLO),
         ("stored", stored.as_slice(), prose.as_slice()),
@@ -3128,11 +3227,17 @@ fn a_whole_decode_through_the_tracking_allocator_is_clean() {
     ] {
         let mut sink = Collector::default();
         let mut source = Declining::default();
-        let result = inflate_back(&mut state, Some(stream), &mut source, &mut sink);
+        let result = inflate_back(
+            &mut state,
+            &mut window,
+            Some(stream),
+            &mut source,
+            &mut sink,
+        );
         assert_eq!(result.code, ReturnCode::STREAM_END, "{label}");
         assert_eq!(sink.written, expected, "{label}");
     }
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
     tracker.assert_clean();
 }
 
@@ -3157,8 +3262,8 @@ fn a_whole_decode_through_the_tracking_allocator_is_clean() {
 fn the_built_in_allocator_round_trips() {
     let mut window = sentinel_window(HARNESS_WINDOW_LEN);
 
-    let state = inflate_back_init(HARNESS_WINDOW_BITS, &mut window, GlobalAllocator).expect("init");
-    assert_eq!(inflate_back_end(state), ReturnCode::OK);
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
 
     let outcome = decode(&mut window, HARNESS_WINDOW_BITS, HELLO_FIXED);
     assert_eq!(outcome.code, ReturnCode::STREAM_END);
@@ -3429,7 +3534,8 @@ fn every_corpus_class_round_trips_through_the_callback_interface() {
 /// **Step 1 is delegated** because `inflateBackInit_`'s version check (`infback.c`
 /// L30-L32) compares the caller's compile-time `ZLIB_VERSION` and `sizeof(z_stream)`
 /// against the library's, and neither is this crate's business -- the core has no
-/// version parameter at all. `crates/libz-rs-sys/tests` owns it.
+/// version parameter at all. The facade owns it, and asserts it in the
+/// `#[cfg(test)]` module of `crates/libz-rs-sys/src/infback.rs`.
 ///
 /// **Steps 2, 3 and 4's null-pointer halves are delegated** for the same class of
 /// reason: `Z_NULL` is not representable where a `&mut` is required. What *is*
@@ -3465,7 +3571,7 @@ fn the_cover_back_sequence_from_the_c_harness_reproduces_step_for_step() {
     // the null `strm`, but `windowBits = 0` in the same call would fail it just as
     // surely (`infback.c` L33-L35), and that half is reachable.
     assert_eq!(
-        inflate_back_init(0, &mut win, GlobalAllocator).err(),
+        inflate_back_init(0, GlobalAllocator).err(),
         Some(ReturnCode::STREAM_ERROR),
         "step 2: windowBits 0 is out of the 8..15 range"
     );
@@ -3479,7 +3585,7 @@ fn the_cover_back_sequence_from_the_c_harness_reproduces_step_for_step() {
                 .expect("inflate_init2");
         let mut sink = Collector::default();
         let mut source = Declining::default();
-        let refused = inflate_back(&mut foreign, None, &mut source, &mut sink);
+        let refused = inflate_back(&mut foreign, &mut win, None, &mut source, &mut sink);
         assert_eq!(
             refused.code,
             ReturnCode::STREAM_ERROR,
@@ -3494,7 +3600,7 @@ fn the_cover_back_sequence_from_the_c_harness_reproduces_step_for_step() {
     //
     // C: `mem_setup(&strm); inflateBackInit(&strm, 15, win);`
     let tracker = common::TrackingAllocator::new();
-    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, &mut win, &tracker)
+    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, &tracker)
         .expect("step 5: inflateBackInit(&strm, 15, win) == Z_OK");
 
     // Step 5 -- `strm.avail_in = 2; strm.next_in = "\x03";
@@ -3505,7 +3611,13 @@ fn the_cover_back_sequence_from_the_c_harness_reproduces_step_for_step() {
     {
         let mut sink = Refusing::after(usize::MAX);
         let mut source = Declining::default();
-        let ended = inflate_back(&mut state, Some(EMPTY_FIXED), &mut source, &mut sink);
+        let ended = inflate_back(
+            &mut state,
+            &mut win,
+            Some(EMPTY_FIXED),
+            &mut source,
+            &mut sink,
+        );
         assert_eq!(ended.code, ReturnCode::STREAM_END, "step 5");
         assert_eq!(source.calls, 0, "step 5: the staged bytes were enough");
         assert_eq!(
@@ -3524,6 +3636,7 @@ fn the_cover_back_sequence_from_the_c_harness_reproduces_step_for_step() {
         let mut source = Declining::default();
         let refused = inflate_back(
             &mut state,
+            &mut win,
             Some(ONE_ZERO_BYTE_FIXED),
             &mut source,
             &mut sink,
@@ -3544,7 +3657,13 @@ fn the_cover_back_sequence_from_the_c_harness_reproduces_step_for_step() {
     {
         let mut sink = Collector::default();
         let mut source = Declining::default();
-        let recovered = inflate_back(&mut state, Some(HELLO_FIXED), &mut source, &mut sink);
+        let recovered = inflate_back(
+            &mut state,
+            &mut win,
+            Some(HELLO_FIXED),
+            &mut source,
+            &mut sink,
+        );
         assert_eq!(
             recovered.code,
             ReturnCode::STREAM_END,
@@ -3555,17 +3674,21 @@ fn the_cover_back_sequence_from_the_c_harness_reproduces_step_for_step() {
 
     // Step 8 -- `inflateBackEnd(&strm) == Z_OK; mem_done(&strm, "inflateBack bad
     // state");`
-    assert_eq!(inflate_back_end(state), ReturnCode::OK, "step 8");
+    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK, "step 8");
+    // Retire the state so its borrow on the caller's window ends. An ended
+    // `inflateBack` state owns no allocation -- the window was the caller's and the
+    // slot is already empty -- so this frees nothing.
+    drop(state);
     tracker.assert_clean();
 
     // ---- Step 9: the built-in memory routines (L502-L504) -------------------
     //
     // C: `inflateBackInit(&strm, 15, win) == Z_OK; inflateBackEnd(&strm) == Z_OK;`
     // with no `mem_setup` in force, so `zcalloc`/`zcfree` are defaulted in.
-    let builtin = inflate_back_init(HARNESS_WINDOW_BITS, &mut win, GlobalAllocator)
+    let mut builtin = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator)
         .expect("step 9: init with the built-in allocator");
     assert_eq!(
-        inflate_back_end(builtin),
+        inflate_back_end(&mut builtin),
         ReturnCode::OK,
         "step 9: end with the built-in allocator"
     );

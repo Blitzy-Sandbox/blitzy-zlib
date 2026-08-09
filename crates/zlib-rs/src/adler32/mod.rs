@@ -377,11 +377,22 @@ pub trait Adler32Backend {
 /// * At build time, by the crate's `simd` feature. With the feature off -- the default --
 ///   the conditional block vanishes entirely at compile time, leaving a direct call into
 ///   the scalar backend with no runtime test and no dead code to skip.
-/// * At run time, by target-feature detection, so that one binary built once still makes
-///   the right choice on each machine it lands on. Detection is deliberately not cached in
-///   a `static`: that would require interior mutability and, in a `no_std` build, atomics,
-///   for no benefit, since the query is cheap and the standard library's own detection
-///   macro already caches internally.
+/// * At run time, by the input's length **and then** by target-feature detection, so that one
+///   binary built once still makes the right choice on each machine it lands on. Detection is
+///   deliberately not cached in a `static`: that would require interior mutability and, in a
+///   `no_std` build, atomics, for no benefit, since the query is cheap and the standard library's
+///   own detection macro already caches internally.
+///
+/// ★ **The length is tested first, and the order is the point.** The vectorised backend hands every
+/// input below the vectorised backend's own lane threshold -- 64 bytes -- straight back to the
+/// scalar one, because
+/// the lane arrangement cannot amortise its reductions over a shorter block. Asking whether the
+/// machine has a vector unit before discovering that no vector code will run is work with no
+/// possible payoff, and it lands on the inputs least able to absorb it: `deflate` and `inflate`
+/// update the checksum once per `read_buf`, which for a caller feeding a stream in small chunks is
+/// once per chunk, and a caller may legitimately feed one byte at a time (`adler32.c` L70 exists
+/// for exactly that caller). Cheap is not free at that frequency. Testing the length first costs a
+/// comparison against a constant and removes the detection call from every one of those calls.
 ///
 /// The environment is never consulted, at run time or at build time. The `simd` feature is
 /// the only thing that selects a backend: `ZLIB_RS_SIMD` in the facade's build script cannot
@@ -396,14 +407,23 @@ pub fn adler32_z(adler: u32, buf: &[u8]) -> u32 {
     // the whole of this function.
     #[cfg(feature = "simd")]
     {
-        // A hint about throughput, never about correctness: the vectorised backend is
-        // portable safe Rust and computes the right answer on any target, so a wrong
-        // answer here would cost speed and nothing else.
-        if simd::is_supported() {
+        // The length test comes first so that a short update never pays for detection; the
+        // vectorised backend would only delegate straight back. See this function's documentation.
+        //
+        // `is_supported` is a hint about throughput, never about correctness: the vectorised
+        // backend is portable safe Rust and computes the right answer on any target, so a wrong
+        // answer here would cost speed and nothing else -- which is also why the two tests may be
+        // reordered at all.
+        if buf.len() >= simd::LANE_THRESHOLD_LEN && simd::is_supported() {
             return Adler32Simd::checksum(adler, buf);
         }
     }
 
+    // Every input the block above declined, plus every input at all without the feature. The
+    // scalar backend carries the same four-path structure C's `adler32_z` does -- the single byte
+    // at L70, the short-length loop at L85, the block engine at L97 -- so a delegated short input
+    // takes the identical path it would have taken through the vectorised backend, and returns the
+    // identical value.
     Adler32Generic::checksum(adler, buf)
 }
 

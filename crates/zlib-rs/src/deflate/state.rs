@@ -196,6 +196,7 @@ pub(crate) use crate::config::{DeflateConfig, Method, Strategy};
 use crate::config::{ValidatedDeflateConfig, Wrap};
 use crate::error::ReturnCode;
 use crate::weak_slice::{HashChains, PendingBuf, Window};
+use core::cell::Cell;
 use core::fmt;
 
 // Test-only fixture inputs are re-exported for deflate leaf-module tests so those modules can keep
@@ -680,7 +681,7 @@ impl TreeDesc {
 /// `extra` is different: it is a counted field, so its slice is exactly
 /// `extra_len` bytes and holds no terminator (`deflate.c` L1106-L1108 writes the
 /// length itself into the header).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GzHeaderView<'h> {
     /// True when the data is believed to be text (`zlib.h` L119).
     /// Contributes bit 0 of the gzip `FLG` byte (`deflate.c` L1092).
@@ -696,27 +697,122 @@ pub struct GzHeaderView<'h> {
     /// The operating-system code (`zlib.h` L122), written masked to
     /// eight bits (`deflate.c` L1105).
     pub os: i32,
-    /// The extra field, or [`None`] for `Z_NULL`, which clears bit 2 of `FLG`
-    /// (`zlib.h` L123-L124; `deflate.c` L1094).
-    ///
-    /// The slice length *is* `extra_len`; see [`GzHeaderView::extra_len`] for
-    /// the 16-bit clamp the reference applies when writing it.
-    pub extra: Option<&'h [u8]>,
-    /// The member name (`zlib.h` L126), or [`None`] for `Z_NULL`, which clears
-    /// bit 3 of `FLG` (`deflate.c` L1095). **Includes the terminating zero
-    /// byte** -- see the type-level documentation.
-    pub name: Option<&'h [u8]>,
-    /// The member comment (`zlib.h` L128), or [`None`] for `Z_NULL`, which clears
-    /// bit 4 of `FLG` (`deflate.c` L1096). **Includes the terminating zero
-    /// byte** -- see the type-level documentation.
-    pub comment: Option<&'h [u8]>,
     /// True when a header CRC is to be written (`zlib.h` L130).
     /// Contributes bit 1 of `FLG` (`deflate.c` L1093) and causes the two-byte
     /// CRC at `deflate.c` L1196-L1197.
     pub hcrc: bool,
+
+    /// The extra field, or [`None`] once [`GzHeaderView::release_fields`] has run.
+    ///
+    /// `Cell` rather than a plain byte, and that is a soundness requirement rather
+    /// than a style: the bytes belong to the *caller*, who may write them while this
+    /// view is alive, and a `&[u8]` promises the opposite. See the type-level note.
+    extra: Option<&'h [Cell<u8>]>,
+    /// The member name, including its terminating zero, or [`None`] after release.
+    name: Option<&'h [Cell<u8>]>,
+    /// The member comment, including its terminating zero, or [`None`] after release.
+    comment: Option<&'h [Cell<u8>]>,
+
+    /// `Some(len)` exactly when the caller's `extra` was non-null, carrying the
+    /// `extra_len` captured at `deflateSetHeader` time.
+    ///
+    /// Retained past [`GzHeaderView::release_fields`] for two reasons. It is the
+    /// *presence* answer the `FEXTRA` bit of `FLG` is built from (`deflate.c` L1094),
+    /// which must not change just because the borrow has ended; and `deflateBound`
+    /// adds `2 + extra_len` for a header that has already been written
+    /// (`deflate.c` L895-L896 does not consult the status), so dropping the number
+    /// would change a bound a caller may still ask for.
+    extra_len: Option<usize>,
+    /// The same for `name`: `Some(len)` when the pointer was non-null, the length
+    /// including the terminator.
+    name_len: Option<usize>,
+    /// The same for `comment`.
+    comment_len: Option<usize>,
 }
 
-impl GzHeaderView<'_> {
+impl<'h> GzHeaderView<'h> {
+    /// Builds the view `deflateSetHeader` installs (`deflate.c` L714-L719).
+    ///
+    /// Each of the three optional fields is the caller's pointer paired with its
+    /// length: `extra` with `extra_len`, `name` and `comment` with a length that
+    /// **includes the terminating zero**. Pass [`None`] where the caller passed
+    /// `Z_NULL`; that is what clears the matching `FLG` bit.
+    ///
+    /// The lengths are taken from the slices, so a caller cannot describe a field as
+    /// longer than the borrow it supplied.
+    #[must_use]
+    pub fn new(
+        text: bool,
+        time: u32,
+        os: i32,
+        hcrc: bool,
+        extra: Option<&'h [Cell<u8>]>,
+        name: Option<&'h [Cell<u8>]>,
+        comment: Option<&'h [Cell<u8>]>,
+    ) -> Self {
+        Self {
+            text,
+            time,
+            os,
+            hcrc,
+            extra,
+            name,
+            comment,
+            extra_len: extra.map(<[Cell<u8>]>::len),
+            name_len: name.map(<[Cell<u8>]>::len),
+            comment_len: comment.map(<[Cell<u8>]>::len),
+        }
+    }
+
+    /// Drops the three borrows of the caller's buffers, keeping every scalar.
+    ///
+    /// ★ **Called the instant the gzip header has been handed to the pending buffer,
+    /// and that timing is the point.** `zlib.h` L836-L852 requires the `gz_header`
+    /// and the strings it points at to be available while the header is being
+    /// written; it does not require them to outlive that. So a conforming caller may
+    /// free or reuse `extra`, `name` and `comment` as soon as the header is out, and a
+    /// view that kept borrowing them would then hold dangling references -- undefined
+    /// behaviour in Rust whether or not they are ever read again. C is unaffected
+    /// because it holds a raw `gz_headerp` and simply never looks at it again.
+    ///
+    /// Nothing observable changes: `has_extra`, `extra_len`, `name_len` and
+    /// `comment_len` all keep answering from the retained metadata, so `deflateBound`
+    /// and the `FLG` bits are unaffected, and no state past `HCRC_STATE` reads a field
+    /// byte.
+    pub fn release_fields(&mut self) {
+        self.extra = None;
+        self.name = None;
+        self.comment = None;
+    }
+
+    /// Whether `extra` was a non-null pointer: the `FEXTRA` bit (`deflate.c` L1094).
+    #[must_use]
+    pub const fn has_extra(&self) -> bool {
+        self.extra_len.is_some()
+    }
+
+    /// Whether `name` was a non-null pointer: the `FNAME` bit (`deflate.c` L1095).
+    #[must_use]
+    pub const fn has_name(&self) -> bool {
+        self.name_len.is_some()
+    }
+
+    /// Whether `comment` was a non-null pointer: the `FCOMMENT` bit
+    /// (`deflate.c` L1096).
+    #[must_use]
+    pub const fn has_comment(&self) -> bool {
+        self.comment_len.is_some()
+    }
+
+    /// The `extra_len` the caller advertised, unclamped: `s->gzhead->extra_len`.
+    ///
+    /// What `XLEN` is written from (`deflate.c` L1107-L1108) and what `deflateBound`
+    /// adds (L895-L896). Zero when the field is absent.
+    #[must_use]
+    pub fn advertised_extra_len(&self) -> usize {
+        self.extra_len.unwrap_or(0)
+    }
+
     /// The number of extra-field bytes the header will actually carry.
     ///
     /// Reproduces `(s->gzhead->extra_len & 0xffff)` (`deflate.c` L1120): the
@@ -725,8 +821,22 @@ impl GzHeaderView<'_> {
     /// longer `extra_len` therefore has its field truncated rather than
     /// mis-framed, and this implementation must truncate identically.
     #[must_use]
-    pub fn extra_len(self) -> usize {
-        self.extra.map_or(0, |extra| extra.len() & 0xffff)
+    pub fn extra_len(&self) -> usize {
+        self.advertised_extra_len() & 0xffff
+    }
+
+    /// The transmitted span of `extra`, as the bulk copy needs it.
+    ///
+    /// `zmemcpy(s->pending_buf + s->pending, s->gzhead->extra + s->gzindex, copy)`
+    /// (`deflate.c` L1123-L1125) operates on a run of bytes rather than one at a time,
+    /// so the copy needs a slice and not an index. `from` is `s->gzindex`.
+    ///
+    /// [`None`] means the field is absent or the borrow has been released; an empty
+    /// slice means the cursor has reached the end of the transmitted span.
+    #[must_use]
+    pub fn extra_chunk(&self, from: usize) -> Option<&'h [Cell<u8>]> {
+        let extra = self.extra?.get(..self.extra_len())?;
+        Some(extra.get(from..).unwrap_or(&[]))
     }
 
     /// The byte at `index` of the extra field, or [`None`] past its end.
@@ -736,8 +846,8 @@ impl GzHeaderView<'_> {
     /// where `DeflateState::gzindex` records how far the copy got before the
     /// pending buffer filled.
     #[must_use]
-    pub fn extra_at(self, index: usize) -> Option<u8> {
-        self.extra?.get(..self.extra_len())?.get(index).copied()
+    pub fn extra_at(&self, index: usize) -> Option<u8> {
+        Some(self.extra?.get(..self.extra_len())?.get(index)?.get())
     }
 
     /// The byte at `index` of the file name, including its terminating zero, or
@@ -745,10 +855,12 @@ impl GzHeaderView<'_> {
     ///
     /// The Rust counterpart of `s->gzhead->name[s->gzindex++]` (`deflate.c` L1158). A
     /// well-formed view always yields the terminator before running out, so
-    /// [`None`] means the facade built a slice with no zero byte in it.
+    /// [`None`] means the facade built a slice with no zero byte in it -- or that the
+    /// borrow has already been released, which no reachable state can observe because
+    /// `HCRC_STATE` is the last one to read a field byte.
     #[must_use]
-    pub fn name_at(self, index: usize) -> Option<u8> {
-        self.name?.get(index).copied()
+    pub fn name_at(&self, index: usize) -> Option<u8> {
+        Some(self.name?.get(index)?.get())
     }
 
     /// The byte at `index` of the comment, including its terminating zero, or
@@ -756,8 +868,42 @@ impl GzHeaderView<'_> {
     ///
     /// The Rust counterpart of `s->gzhead->comment[s->gzindex++]` (`deflate.c` L1180).
     #[must_use]
-    pub fn comment_at(self, index: usize) -> Option<u8> {
-        self.comment?.get(index).copied()
+    pub fn comment_at(&self, index: usize) -> Option<u8> {
+        Some(self.comment?.get(index)?.get())
+    }
+
+    /// The bytes `deflateBound` counts for `name`, terminator included.
+    ///
+    /// Reproduces `str = s->gzhead->name; if (str != Z_NULL) do { wraplen++; } while
+    /// (*str++);` (`deflate.c` L897-L901): one increment per byte and one more for the
+    /// terminating zero. The live borrow is *scanned*, exactly as C scans, so a caller
+    /// that shortened the string between `deflateSetHeader` and `deflateBound` gets the
+    /// same answer C would give; once the borrow has been released the captured length
+    /// is the only honest answer left, and it is the one C would have produced for an
+    /// unmodified string.
+    #[must_use]
+    pub fn name_bound_len(&self) -> usize {
+        Self::field_bound_len(self.name, self.name_len)
+    }
+
+    /// The bytes `deflateBound` counts for `comment` (`deflate.c` L902-L906).
+    #[must_use]
+    pub fn comment_bound_len(&self) -> usize {
+        Self::field_bound_len(self.comment, self.comment_len)
+    }
+
+    /// The shared body of the two accessors above.
+    fn field_bound_len(field: Option<&'h [Cell<u8>]>, captured: Option<usize>) -> usize {
+        match field {
+            Some(bytes) => match bytes.iter().position(|byte| byte.get() == 0) {
+                // The terminator is counted, so the answer is one past its index.
+                Some(index) => index.saturating_add(1),
+                // No terminator at all: the case in which C reads past the end of the
+                // caller's allocation. The slice length is the fail-closed answer.
+                None => bytes.len(),
+            },
+            None => captured.unwrap_or(0),
+        }
     }
 }
 
@@ -840,15 +986,32 @@ impl<'a, A: Allocator<'a>> AsMut<[u8]> for ByteBlock<'a, A> {
     }
 }
 
-impl<'a, A: Allocator<'a>> Drop for ByteBlock<'a, A> {
-    /// Returns the block to the allocator that produced it.
+impl<'a, A: Allocator<'a>> ByteBlock<'a, A> {
+    /// Returns the block to the allocator that produced it, in place.
     ///
-    /// `try_deallocate_bytes` is the `TRY_FREE(s, p)` analogue -- `{if (p)
+    /// [`Allocator::deallocate_bytes`] is the `TRY_FREE(s, p)` analogue -- `{if (p)
     /// ZFREE(s, p);}` (`zutil.h` L255) -- which is the form `deflateEnd` uses
     /// (`deflate.c` L1301-L1304) precisely because an initialisation that failed
-    /// part-way leaves some buffers absent.
+    /// part-way leaves some buffers absent. Calling it twice is harmless: the slot is
+    /// empty after the first call.
+    ///
+    /// ★ **Release in place; never by moving the block into a call.** A block moved
+    /// into a function -- `drop(block)` included -- puts the borrow it carries in
+    /// argument position, where it is protected for the duration of that call, and
+    /// freeing memory a protected reference covers is undefined behaviour.
+    /// `zlib_rs::allocate::ForeignBlock` documents the rule and the Miri diagnosis
+    /// behind it. Dropping a block *where it lives* is fine, which is why
+    /// [`ByteBlock::drop`] delegates here.
+    pub fn release(&mut self) {
+        self.allocator.deallocate_bytes(&mut self.buffer);
+    }
+}
+
+impl<'a, A: Allocator<'a>> Drop for ByteBlock<'a, A> {
+    /// Delegates to [`ByteBlock::release`], so that dropping a block in place and
+    /// releasing it explicitly are the same operation.
     fn drop(&mut self) {
-        self.allocator.try_deallocate_bytes(self.buffer.take());
+        self.release();
     }
 }
 
@@ -926,12 +1089,21 @@ impl<'a, A: Allocator<'a>> AsMut<[u16]> for PosBlock<'a, A> {
     }
 }
 
+impl<'a, A: Allocator<'a>> PosBlock<'a, A> {
+    /// Returns the block to the allocator that produced it, in place.
+    ///
+    /// The `TRY_FREE` analogue for `u16` blocks (`zutil.h` L255,
+    /// `deflate.c` L1302-L1303). Released in place for the reason
+    /// [`ByteBlock::release`] gives.
+    pub fn release(&mut self) {
+        self.allocator.deallocate_u16s(&mut self.buffer);
+    }
+}
+
 impl<'a, A: Allocator<'a>> Drop for PosBlock<'a, A> {
-    /// Returns the block to the allocator that produced it, through the
-    /// `TRY_FREE` analogue for `u16` blocks (`zutil.h` L255,
-    /// `deflate.c` L1302-L1303).
+    /// Delegates to [`PosBlock::release`].
     fn drop(&mut self) {
-        self.allocator.try_deallocate_u16s(self.buffer.take());
+        self.release();
     }
 }
 
@@ -1643,20 +1815,27 @@ impl<'a, A: Allocator<'a>> DeflateState<'a, A> {
     /// fields in declaration order; this method exists so that the order is
     /// stated where a reader of `deflateEnd` will look for it.
     ///
+    /// ★ Takes `&mut self`, and releases each block through a borrow rather than by
+    /// moving it out. Moving a block into a call -- which `drop(self.pending
+    /// .into_inner())` did -- puts the borrow it carries in argument position, where
+    /// it is protected for the whole call, and freeing memory a protected reference
+    /// covers is undefined behaviour; `zlib_rs::allocate::ForeignBlock` records the
+    /// rule. The state itself is then dropped by whoever owns it, with its four slots
+    /// already empty.
+    ///
     /// The rest of `deflateEnd` is **not** here. Freeing the state object itself
     /// (`ZFREE(strm, strm->state)`, L1306) belongs to the facade, which is what
     /// allocated it; clearing `strm->state` (L1307) is the stream's; and the
     /// return value -- [`ReturnCode::DATA_ERROR`] when the status was
     /// [`Status::Busy`], [`ReturnCode::OK`] otherwise (L1309) -- belongs to
     /// `deflate/mod.rs`, because a destructor cannot report anything.
-    pub fn release(self) {
-        drop(self.pending.into_inner());
-        // `HashChains` surrenders `head` first, matching `deflate.c`
-        // L1302-L1303.
-        let (head, prev) = self.hash.into_inner();
-        drop(head);
-        drop(prev);
-        drop(self.window.into_inner());
+    pub fn release(&mut self) {
+        self.pending.inner_mut().release();
+        // `head` first, then `prev`, matching `deflate.c` L1302-L1303.
+        let (head, prev) = self.hash.inner_mut();
+        head.release();
+        prev.release();
+        self.window.inner_mut().release();
     }
 
     /// Performs the part of `deflateResetKeep` that belongs to this state.
@@ -1719,6 +1898,59 @@ impl<'a, A: Allocator<'a>> DeflateState<'a, A> {
     /// `deflate/mod.rs`, which owns the entry point.
     pub fn set_gzhead(&mut self, gzhead: Option<GzHeaderView<'a>>) {
         self.gzhead = gzhead;
+    }
+
+    /// Drops the installed header's three borrows of the caller's buffers, keeping
+    /// every scalar and every length.
+    ///
+    /// ★ **Called exactly once, at the `HCRC_STATE` -> `BUSY_STATE` transition, which is
+    /// the moment the gzip header stops being read.** From there on the compressor is
+    /// working on the payload, and `zlib.h` L836-L852 asks the application only to keep
+    /// `extra`, `name` and `comment` available *while the header is being written* -- so
+    /// freeing or reusing them at this point is legal, and a borrow that outlived it
+    /// would be a dangling reference. C is unaffected: it holds a raw `gz_headerp` and
+    /// simply never looks at it again.
+    ///
+    /// Nothing observable changes, because [`GzHeaderView::release_fields`] retains the
+    /// presence flags and the three lengths that `deflateBound` and the `FLG` byte are
+    /// built from. A stream with no header installed is a no-op.
+    pub fn release_gzhead_fields(&mut self) {
+        if let Some(head) = self.gzhead.as_mut() {
+            head.release_fields();
+        }
+    }
+
+    /// Whether `deflateSetHeader` may install a header at all: `wrap == 2`
+    /// (`deflate.c` L715).
+    ///
+    /// ★ **Exposed so the facade can ask before it touches the caller's
+    /// `gz_header`.** C's guard is evaluated at L715 and returns at L716, *before*
+    /// L717 assigns the pointer -- so a stream that is not a gzip stream never causes
+    /// C to read a single member of the structure. Building a `GzHeaderView` requires
+    /// reading eight members and scanning two NUL-terminated strings, which for a wild
+    /// or dangling pointer is undefined behaviour; running this predicate first is what
+    /// keeps the Rust order identical to C's. `crate::deflate::deflate_set_header`
+    /// applies the same test, so the two cannot disagree.
+    #[must_use]
+    pub const fn accepts_gzip_header(&self) -> bool {
+        self.wrap == 2
+    }
+
+    /// Whether `deflateSetDictionary` may load a dictionary: the negation of
+    /// `wrap == 2 || (wrap == 1 && status != INIT_STATE) || s->lookahead`
+    /// (`deflate.c` L570-L572).
+    ///
+    /// ★ **Exposed for the same reason as [`DeflateState::accepts_gzip_header`].** C
+    /// evaluates this at L570 and returns at L572, before `read_buf` (L237) or
+    /// `adler32` (L575) ever reads a dictionary byte, so a rejected stream leaves the
+    /// caller's buffer untouched. Reconstructing the dictionary as a slice first would
+    /// be undefined behaviour for a pointer C would never have dereferenced.
+    /// `crate::deflate::deflate_set_dictionary` applies the same test.
+    #[must_use]
+    pub fn accepts_dictionary(&self) -> bool {
+        !(self.wrap == 2
+            || (self.wrap == 1 && self.status != Status::Init)
+            || self.window.lookahead != 0)
     }
 
     /// How many `prev` entries [`DeflateState::try_clone_in`] copies.
@@ -2058,12 +2290,23 @@ mod tests {
         MAX_BITS, MAX_MATCH, MIN_LOOKAHEAD, MIN_MATCH, NIL, PRESET_DICT, STATIC_TREES,
         STORED_BLOCK, SYMBOL_BYTES, WIN_INIT,
     };
-    use crate::allocate::{Allocator, AllocatorId, Buffer, GlobalAllocator, Opaque};
+    use crate::allocate::{Allocator, AllocatorId, Buffer, ForeignBlock, GlobalAllocator, Opaque};
     use crate::config::{Method, Strategy, Wrap, DEF_MEM_LEVEL, MAX_WBITS};
     use crate::error::ReturnCode;
     use crate::weak_slice::Pos;
     use alloc::vec::Vec;
-    use core::cell::RefCell;
+    use core::cell::{Cell, RefCell};
+
+    /// Wraps a byte literal as the shared-mutable slice a [`GzHeaderView`] field takes.
+    ///
+    /// The view's `extra`, `name` and `comment` model storage the *application* owns and
+    /// may write while the compressor holds the borrow, so their element type is [`Cell`]
+    /// rather than `u8`. A test owns its fixtures outright, so the conversion is a plain
+    /// copy into an owned vector that the caller keeps alive for as long as the view is
+    /// used -- which is exactly what the borrow requires.
+    fn cells(bytes: &[u8]) -> Vec<Cell<u8>> {
+        bytes.iter().copied().map(Cell::new).collect()
+    }
 
     /// The shape of one release, recorded by [`Logger`].
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2110,16 +2353,29 @@ mod tests {
             Some(buffer)
         }
 
-        fn deallocate_bytes(&self, buffer: Buffer<'a, u8>) {
-            self.order.borrow_mut().push(Released::Bytes(buffer.len()));
-            GlobalAllocator.deallocate_bytes(buffer);
+        // Never reached: every block this allocator hands out comes from
+        // `GlobalAllocator`, so `release_to` reports it as handled.
+        fn release_foreign_bytes(&self, _block: ForeignBlock<'a, u8>) {}
+
+        fn release_foreign_u16s(&self, _block: ForeignBlock<'a, u16>) {}
+
+        // The order log is the point of this allocator, so both slot methods are
+        // overridden: the length is read while the buffer is still whole, and the
+        // release is then delegated to the allocator that owns the block.
+        fn deallocate_bytes(&self, slot: &mut Option<Buffer<'a, u8>>) {
+            if let Some(buffer) = slot.as_ref() {
+                self.order.borrow_mut().push(Released::Bytes(buffer.len()));
+            }
+            GlobalAllocator.deallocate_bytes(slot);
         }
 
-        fn deallocate_u16s(&self, buffer: Buffer<'a, u16>) {
-            self.order
-                .borrow_mut()
-                .push(Released::Entries(buffer.len()));
-            GlobalAllocator.deallocate_u16s(buffer);
+        fn deallocate_u16s(&self, slot: &mut Option<Buffer<'a, u16>>) {
+            if let Some(buffer) = slot.as_ref() {
+                self.order
+                    .borrow_mut()
+                    .push(Released::Entries(buffer.len()));
+            }
+            GlobalAllocator.deallocate_u16s(slot);
         }
     }
 
@@ -2181,14 +2437,23 @@ mod tests {
             GlobalAllocator.allocate_u16s(items)
         }
 
-        fn deallocate_bytes(&self, buffer: Buffer<'a, u8>) {
-            *self.released.borrow_mut() += 1;
-            GlobalAllocator.deallocate_bytes(buffer);
+        // Never reached: the blocks come from `GlobalAllocator`, which handles them.
+        fn release_foreign_bytes(&self, _block: ForeignBlock<'a, u8>) {}
+
+        fn release_foreign_u16s(&self, _block: ForeignBlock<'a, u16>) {}
+
+        fn deallocate_bytes(&self, slot: &mut Option<Buffer<'a, u8>>) {
+            if slot.is_some() {
+                *self.released.borrow_mut() += 1;
+            }
+            GlobalAllocator.deallocate_bytes(slot);
         }
 
-        fn deallocate_u16s(&self, buffer: Buffer<'a, u16>) {
-            *self.released.borrow_mut() += 1;
-            GlobalAllocator.deallocate_u16s(buffer);
+        fn deallocate_u16s(&self, slot: &mut Option<Buffer<'a, u16>>) {
+            if slot.is_some() {
+                *self.released.borrow_mut() += 1;
+            }
+            GlobalAllocator.deallocate_u16s(slot);
         }
     }
 
@@ -2503,7 +2768,7 @@ mod tests {
     #[test]
     fn explicit_release_uses_the_same_order() {
         let logger = Logger::default();
-        let state = DeflateState::new(config(6, 9, 1), &logger).unwrap();
+        let mut state = DeflateState::new(config(6, 9, 1), &logger).unwrap();
         state.release();
         assert_eq!(
             *logger.order.borrow(),
@@ -2778,15 +3043,18 @@ mod tests {
         // The facade builds `name` and `comment` with their terminating zero,
         // because the C loop emits bytes until it has emitted one
         // (`deflate.c` L1158-L1160).
-        let header = GzHeaderView {
-            text: true,
-            time: 0x1234_5678,
-            os: 3,
-            extra: Some(&[1, 2, 3]),
-            name: Some(b"a.txt\0"),
-            comment: Some(b"c\0"),
-            hcrc: true,
-        };
+        let extra = cells(&[1, 2, 3]);
+        let name = cells(b"a.txt\0");
+        let comment = cells(b"c\0");
+        let header = GzHeaderView::new(
+            true,
+            0x1234_5678,
+            3,
+            true,
+            Some(&extra),
+            Some(&name),
+            Some(&comment),
+        );
 
         assert_eq!(header.extra_len(), 3);
         assert_eq!(header.extra_at(0), Some(1));
@@ -2799,15 +3067,7 @@ mod tests {
         assert_eq!(header.comment_at(1), Some(0));
 
         // `Z_NULL` for all three optional fields.
-        let bare = GzHeaderView {
-            text: false,
-            time: 0,
-            os: 255,
-            extra: None,
-            name: None,
-            comment: None,
-            hcrc: false,
-        };
+        let bare = GzHeaderView::new(false, 0, 255, false, None, None, None);
         assert_eq!(bare.extra_len(), 0);
         assert_eq!(bare.extra_at(0), None);
         assert_eq!(bare.name_at(0), None);
@@ -2821,5 +3081,102 @@ mod tests {
         assert_eq!(state.gzhead().unwrap().name_at(5), Some(0));
         state.set_gzhead(None);
         assert_eq!(state.gzhead(), None);
+    }
+
+    #[test]
+    fn releasing_the_header_fields_keeps_every_answer_still_needed() {
+        // The release exists so the borrows do not outlive the window `zlib.h`
+        // L836-L852 gives them, and it is only safe to do because nothing past
+        // `HCRC_STATE` reads a field byte. What *is* still read -- the `FLG` bits and
+        // `deflateBound`'s three lengths -- must therefore survive it unchanged.
+        let extra = cells(&[1, 2, 3, 4, 5]);
+        let name = cells(b"a.txt\0");
+        let comment = cells(b"hello\0");
+        let mut header =
+            GzHeaderView::new(true, 7, 3, true, Some(&extra), Some(&name), Some(&comment));
+
+        assert_eq!(header.extra_chunk(1).map(<[Cell<u8>]>::len), Some(4));
+        header.release_fields();
+
+        // Presence, and therefore every `FLG` bit, is unchanged.
+        assert!(header.has_extra());
+        assert!(header.has_name());
+        assert!(header.has_comment());
+
+        // `deflateBound`'s three contributions are unchanged.
+        assert_eq!(header.advertised_extra_len(), 5);
+        assert_eq!(header.extra_len(), 5);
+        assert_eq!(header.name_bound_len(), 6);
+        assert_eq!(header.comment_bound_len(), 6);
+
+        // Every byte accessor now refuses, which is what makes the release a
+        // release: no code path can read through a borrow that has ended.
+        assert_eq!(header.extra_chunk(0), None);
+        assert_eq!(header.extra_at(0), None);
+        assert_eq!(header.name_at(0), None);
+        assert_eq!(header.comment_at(0), None);
+
+        // The scalars are untouched.
+        assert!(header.text);
+        assert_eq!(header.time, 7);
+        assert_eq!(header.os, 3);
+        assert!(header.hcrc);
+
+        // Releasing twice, and releasing a header with no optional field at all,
+        // are both no-ops -- `Status::Hcrc` is reached once per stream but a
+        // `deflateReset` can bring a caller back to it.
+        header.release_fields();
+        assert!(header.has_extra());
+        let mut bare = GzHeaderView::new(false, 0, 255, false, None, None, None);
+        bare.release_fields();
+        assert!(!bare.has_extra());
+        assert_eq!(bare.name_bound_len(), 0);
+    }
+
+    #[test]
+    fn the_state_releases_the_installed_header_and_tolerates_having_none() {
+        let name = cells(b"n\0");
+        let header = GzHeaderView::new(false, 0, 3, false, None, Some(&name), None);
+        let mut state = DeflateState::new(config(6, 31, 8), GlobalAllocator).unwrap();
+
+        // No header installed: the release must not care.
+        state.release_gzhead_fields();
+        assert_eq!(state.gzhead(), None);
+
+        state.set_gzhead(Some(header));
+        assert_eq!(state.gzhead().unwrap().name_at(0), Some(b'n'));
+        state.release_gzhead_fields();
+
+        // The view is still installed -- `deflateBound` may still be called -- but its
+        // borrows are gone.
+        let released = state.gzhead().unwrap();
+        assert!(released.has_name());
+        assert_eq!(released.name_bound_len(), 2);
+        assert_eq!(released.name_at(0), None);
+    }
+
+    #[test]
+    fn a_field_the_caller_rewrites_is_observed_through_the_shared_borrow() {
+        // The reason the three fields are `Cell` slices rather than `&[u8]`: the bytes
+        // belong to the application, which may write them while the view is alive.
+        // `deflateBound` scans the live string exactly as C does
+        // (`deflate.c` L897-L901), so a shortened name must shorten the bound.
+        let name = cells(b"long-name\0");
+        let header = GzHeaderView::new(false, 0, 3, false, None, Some(&name), None);
+        assert_eq!(header.name_bound_len(), 10);
+        assert_eq!(header.name_at(0), Some(b'l'));
+
+        // The caller truncates its own string, through a shared reference, while the
+        // compressor holds the borrow. A `&[u8]` would have made this undefined
+        // behaviour; here it is simply observed.
+        name[1].set(0);
+        assert_eq!(header.name_bound_len(), 2);
+        assert_eq!(header.name_at(1), Some(0));
+
+        // A field with no terminator at all is where C reads past the caller's
+        // allocation. The view answers with the slice length instead.
+        let unterminated = cells(b"abc");
+        let ragged = GzHeaderView::new(false, 0, 3, false, None, None, Some(&unterminated));
+        assert_eq!(ragged.comment_bound_len(), 3);
     }
 }

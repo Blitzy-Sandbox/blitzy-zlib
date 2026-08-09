@@ -65,7 +65,7 @@
 //! carries no `#[repr(C)]`, no `#[no_mangle]` and no `extern "C"`, and the field
 //! types above were chosen for Rust rather than for byte-for-byte layout
 //! agreement. The `#[repr(C)]` mirrors of the genuinely public types --
-//! `z_stream`, `gz_header`, `struct gzFile_s` -- belong to the planned
+//! `z_stream`, `gz_header`, `struct gzFile_s` -- belong to
 //! `crates/libz-rs-sys/src/types.rs`.
 //!
 //! There is exactly one qualification to that, and it is worth stating loudly
@@ -231,6 +231,7 @@
 
 use core::cell::Cell;
 use core::fmt;
+use core::mem::MaybeUninit;
 
 use crate::allocate::{Allocator, Buffer};
 use crate::config::{
@@ -483,6 +484,383 @@ pub const GZ_HEADER_ABSENT: i32 = -1;
 /// `state->head->done = 1` (`inflate.c` L679).
 pub const GZ_HEADER_COMPLETE: i32 = 1;
 
+/// One of the three caller-owned gzip header buffers: `extra`, `name` or `comment`.
+///
+/// A bounds-clamped, **write-only** view of somebody else's memory. It is the header
+/// counterpart of [`crate::read_buf::OutputRegion`] and exists for the same two reasons.
+///
+/// # ★ Why the elements are cells
+///
+/// `test/infcover.c` L307-L312 sets up a `gz_header` in which `extra`, `name` and
+/// `comment` are all given the *same* buffer and the same length. Holding the three as
+/// `&mut [u8]` would therefore require three aliasing mutable borrows of one allocation
+/// -- undefined behaviour, and reported as such by Miri and AddressSanitizer -- for a
+/// test that must pass unmodified (AAP Goal 2). [`Cell`] resolves it exactly:
+/// overlapping *shared* references are legal, interior mutability makes writing through
+/// them safe, and `Cell<T>` is `repr(transparent)` over `T` so no representation
+/// changes. Shared references are also [`Copy`], which is what lets [`GzHeaderSink`]
+/// stay `Copy` and lets `inflateCopy` duplicate the view as faithfully as C's
+/// `zmemcpy` duplicates the pointer (`inflate.c` L1355).
+///
+/// # ★ Why there are two storages
+///
+/// `zlib.h` L123-L129 asks a caller for space, not for data: `inflateGetHeader`'s
+/// buffers are typically fresh `malloc` output, and `test/infcover.c`'s instrumented
+/// allocator deliberately fills its blocks with `0xa5` rather than zero to catch code
+/// that assumes otherwise. A `&[Cell<u8>]` over such memory would assert that every
+/// byte holds a valid `u8`, which is exactly the assertion the bytes have not earned,
+/// so the C boundary hands over `Cell<MaybeUninit<u8>>` slots instead.
+///
+/// The crate's own Rust API and its tests own initialised buffers and want to read what
+/// was written back out, which a `MaybeUninit` element cannot offer safely at this
+/// crate's MSRV. Both storages are therefore carried, selected once at construction:
+///
+/// * [`HeaderField::init`] -- an initialised buffer. The Rust API and every test.
+/// * [`HeaderField::write_only`] -- storage that may hold no values yet. The C facade.
+///
+/// Nothing here ever *reads* an element, so the two are interchangeable at every use
+/// site: `inflate.c`'s `EXTRA`, `NAME` and `COMMENT` states only ever store
+/// (L607-L613, L624-L627, L659-L662), and the crate never pre-fills a caller's buffer,
+/// which would cost a write per byte the header never supplies.
+#[derive(Clone, Copy)]
+pub struct HeaderField<'a> {
+    storage: FieldStorage<'a>,
+}
+
+/// The two element types [`HeaderField`] accepts.
+///
+/// Private so that the set can grow without breaking callers, and so that the
+/// distinction stays an implementation detail of the four methods below rather than
+/// something every use site has to match on.
+#[derive(Clone, Copy)]
+enum FieldStorage<'a> {
+    /// An initialised buffer, readable by whoever owns it.
+    Init(&'a [Cell<u8>]),
+
+    /// Storage that is writable but whose contents may not be valid `u8` values yet.
+    WriteOnly(&'a [Cell<MaybeUninit<u8>>]),
+}
+
+impl<'a> HeaderField<'a> {
+    /// A field backed by an initialised buffer.
+    ///
+    /// The form the crate's Rust API and its tests use, because they own the buffer and
+    /// can read back what the parse stored.
+    #[must_use]
+    pub const fn init(buffer: &'a [Cell<u8>]) -> Self {
+        Self {
+            storage: FieldStorage::Init(buffer),
+        }
+    }
+
+    /// A field backed by storage that may hold no values yet.
+    ///
+    /// The form `crates/libz-rs-sys` uses for a C caller's `extra`, `name` or
+    /// `comment`: `zlib.h` L123-L129 promises those buffers are writable for the
+    /// advertised maximum and promises nothing about their contents.
+    #[must_use]
+    pub const fn write_only(buffer: &'a [Cell<MaybeUninit<u8>>]) -> Self {
+        Self {
+            storage: FieldStorage::WriteOnly(buffer),
+        }
+    }
+
+    /// The number of bytes the caller advertised for this field: C's `extra_max`,
+    /// `name_max` or `comm_max`.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        match self.storage {
+            FieldStorage::Init(buffer) => buffer.len(),
+            FieldStorage::WriteOnly(buffer) => buffer.len(),
+        }
+    }
+
+    /// Stores one byte at `at`, reporting whether there was room for it.
+    ///
+    /// The bound is checked with a fallible lookup rather than a comparison so that the
+    /// test and the access cannot disagree.
+    fn store(&self, at: usize, byte: u8) -> bool {
+        match self.storage {
+            FieldStorage::Init(buffer) => match buffer.get(at) {
+                Some(slot) => {
+                    slot.set(byte);
+                    true
+                }
+                None => false,
+            },
+            FieldStorage::WriteOnly(buffer) => match buffer.get(at) {
+                Some(slot) => {
+                    slot.set(MaybeUninit::new(byte));
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+
+    /// Stores `bytes` from `at` onwards, returning how many were stored.
+    ///
+    /// Short-circuits to zero when `at` is at or past the end. The count is the shorter
+    /// of what is offered and what is left, which is `inflate.c` L610's
+    /// `len + copy > extra_max ? extra_max - len : copy` written on a slice.
+    fn store_slice(&self, at: usize, bytes: &[u8]) -> usize {
+        match self.storage {
+            FieldStorage::Init(buffer) => {
+                let Some(tail) = buffer.get(at..) else {
+                    return 0;
+                };
+                let count = tail.len().min(bytes.len());
+                let (Some(destination), Some(source)) = (tail.get(..count), bytes.get(..count))
+                else {
+                    return 0;
+                };
+                for (slot, byte) in destination.iter().zip(source) {
+                    slot.set(*byte);
+                }
+                count
+            }
+            FieldStorage::WriteOnly(buffer) => {
+                let Some(tail) = buffer.get(at..) else {
+                    return 0;
+                };
+                let count = tail.len().min(bytes.len());
+                let (Some(destination), Some(source)) = (tail.get(..count), bytes.get(..count))
+                else {
+                    return 0;
+                };
+                for (slot, byte) in destination.iter().zip(source) {
+                    slot.set(MaybeUninit::new(*byte));
+                }
+                count
+            }
+        }
+    }
+}
+
+impl<'a> From<&'a [Cell<u8>]> for HeaderField<'a> {
+    fn from(buffer: &'a [Cell<u8>]) -> Self {
+        Self::init(buffer)
+    }
+}
+
+impl<'a> From<&'a [Cell<MaybeUninit<u8>>]> for HeaderField<'a> {
+    fn from(buffer: &'a [Cell<MaybeUninit<u8>>]) -> Self {
+        Self::write_only(buffer)
+    }
+}
+
+impl fmt::Debug for HeaderField<'_> {
+    /// Reports the advertised capacity and nothing else.
+    ///
+    /// The contents are caller data -- quite possibly a file name out of somebody's
+    /// archive -- and on write-only storage they may not be readable at all.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HeaderField")
+            .field("capacity", &self.capacity())
+            .finish()
+    }
+}
+
+/// Which members of a caller's `gz_header` the parse has assigned.
+///
+/// A bit per publishable member of `zlib.h` L118-L133. The set exists because
+/// publication has to reproduce C's *selectivity*, not merely C's values: C's header
+/// states assign through `state->head` as each field is decoded, so a member the stream
+/// never supplied is never written and keeps whatever the caller put there. A
+/// publication that wrote all seven scalars unconditionally would be observably
+/// different for a caller that pre-filled `time` and then decoded a stream that turned
+/// out not to be gzip.
+///
+/// A bit set rather than ten booleans, because it is consulted as a whole -- "is
+/// anything outstanding?" is the common question, and it answers it in one comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HeaderFields(u16);
+
+impl HeaderFields {
+    /// `int text` (`zlib.h` L119).
+    const TEXT: u16 = 1 << 0;
+    /// `uLong time` (`zlib.h` L120).
+    const TIME: u16 = 1 << 1;
+    /// `int xflags` (`zlib.h` L121).
+    const XFLAGS: u16 = 1 << 2;
+    /// `int os` (`zlib.h` L122).
+    const OS: u16 = 1 << 3;
+    /// `uInt extra_len` (`zlib.h` L124).
+    const EXTRA_LEN: u16 = 1 << 4;
+    /// `int hcrc` (`zlib.h` L130).
+    const HCRC: u16 = 1 << 5;
+    /// `int done` (`zlib.h` L131-L132).
+    const DONE: u16 = 1 << 6;
+    /// `extra` was assigned `Z_NULL` (`inflate.c` L601).
+    const EXTRA_ABSENT: u16 = 1 << 7;
+    /// `name` was assigned `Z_NULL` (`inflate.c` L631).
+    const NAME_ABSENT: u16 = 1 << 8;
+    /// `comment` was assigned `Z_NULL` (`inflate.c` L666).
+    const COMMENT_ABSENT: u16 = 1 << 9;
+
+    /// Nothing assigned: the state `inflateGetHeader` installs.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self(0)
+    }
+
+    /// Whether any member is outstanding.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Whether `flag` is set.
+    #[must_use]
+    const fn holds(self, flag: u16) -> bool {
+        self.0 & flag != 0
+    }
+
+    /// Sets `flag`.
+    ///
+    /// Deliberately NOT `const fn`, unlike the reading half of this type: a `const fn`
+    /// taking `&mut self` needs `const_mut_refs`, stabilised in Rust 1.83, and the declared
+    /// floor is 1.80 (`cargo +1.80 check -D warnings` reports E0658 for it). No caller is a
+    /// const context -- every use is a parse assigning a member it has just decoded -- so
+    /// the keyword bought nothing and cost the MSRV.
+    fn insert(&mut self, flag: u16) {
+        self.0 |= flag;
+    }
+
+    /// Clears `flag`.
+    ///
+    /// Used by [`GzHeaderSink::rebind_fields`] for the three absence bits: they record a
+    /// `Z_NULL` assignment that has already been published to the caller, so a rebind must
+    /// withdraw them rather than null a pointer the caller has since supplied again.
+    ///
+    /// Not `const fn`, for the reason given on [`HeaderFields::insert`].
+    fn remove(&mut self, flag: u16) {
+        self.0 &= !flag;
+    }
+}
+
+/// The members a parse assigned, ready to be written into a caller's `gz_header`.
+///
+/// What [`GzHeaderSink::take_update`] hands to whoever owns the caller's pointer, and
+/// the reason it exists rather than a `GzHeaderSink` snapshot: the sink is over a
+/// hundred bytes because it carries the three buffer views, none of which a publisher
+/// needs -- a byte written by the `EXTRA`, `NAME` or `COMMENT` state is already in the
+/// caller's memory. This carries the seven scalars, the three `Z_NULL` assignments and
+/// the set that says which of them to write, and nothing else.
+///
+/// Each accessor answers [`None`] for a member the parse did not assign, which is the
+/// shape a publisher wants: `if let Some(value) = update.text()` writes exactly when C
+/// would have written.
+#[derive(Debug, Clone, Copy)]
+pub struct HeaderUpdate {
+    /// Which of the members below are outstanding.
+    assigned: HeaderFields,
+    /// `int text`, valid when [`HeaderFields::TEXT`] is set.
+    text: bool,
+    /// `uLong time`, valid when [`HeaderFields::TIME`] is set.
+    time: u32,
+    /// `int xflags`, valid when [`HeaderFields::XFLAGS`] is set.
+    xflags: i32,
+    /// `int os`, valid when [`HeaderFields::OS`] is set.
+    os: i32,
+    /// `uInt extra_len`, valid when [`HeaderFields::EXTRA_LEN`] is set.
+    extra_len: u32,
+    /// `int hcrc`, valid when [`HeaderFields::HCRC`] is set.
+    hcrc: bool,
+    /// `int done`, valid when [`HeaderFields::DONE`] is set.
+    done: i32,
+}
+
+impl HeaderUpdate {
+    /// `int text` (`zlib.h` L119), or [`None`] if the parse never assigned it.
+    #[must_use]
+    pub const fn text(&self) -> Option<bool> {
+        if self.assigned.holds(HeaderFields::TEXT) {
+            Some(self.text)
+        } else {
+            None
+        }
+    }
+
+    /// `uLong time` (`zlib.h` L120), or [`None`].
+    #[must_use]
+    pub const fn time(&self) -> Option<u32> {
+        if self.assigned.holds(HeaderFields::TIME) {
+            Some(self.time)
+        } else {
+            None
+        }
+    }
+
+    /// `int xflags` (`zlib.h` L121), or [`None`].
+    #[must_use]
+    pub const fn xflags(&self) -> Option<i32> {
+        if self.assigned.holds(HeaderFields::XFLAGS) {
+            Some(self.xflags)
+        } else {
+            None
+        }
+    }
+
+    /// `int os` (`zlib.h` L122), or [`None`].
+    #[must_use]
+    pub const fn os(&self) -> Option<i32> {
+        if self.assigned.holds(HeaderFields::OS) {
+            Some(self.os)
+        } else {
+            None
+        }
+    }
+
+    /// `uInt extra_len` (`zlib.h` L124), or [`None`].
+    #[must_use]
+    pub const fn extra_len(&self) -> Option<u32> {
+        if self.assigned.holds(HeaderFields::EXTRA_LEN) {
+            Some(self.extra_len)
+        } else {
+            None
+        }
+    }
+
+    /// `int hcrc` (`zlib.h` L130), or [`None`].
+    #[must_use]
+    pub const fn hcrc(&self) -> Option<bool> {
+        if self.assigned.holds(HeaderFields::HCRC) {
+            Some(self.hcrc)
+        } else {
+            None
+        }
+    }
+
+    /// `int done` (`zlib.h` L131-L132), or [`None`].
+    #[must_use]
+    pub const fn done(&self) -> Option<i32> {
+        if self.assigned.holds(HeaderFields::DONE) {
+            Some(self.done)
+        } else {
+            None
+        }
+    }
+
+    /// Whether `extra` must be set to `Z_NULL` (`inflate.c` L601).
+    #[must_use]
+    pub const fn extra_is_absent(&self) -> bool {
+        self.assigned.holds(HeaderFields::EXTRA_ABSENT)
+    }
+
+    /// Whether `name` must be set to `Z_NULL` (`inflate.c` L631).
+    #[must_use]
+    pub const fn name_is_absent(&self) -> bool {
+        self.assigned.holds(HeaderFields::NAME_ABSENT)
+    }
+
+    /// Whether `comment` must be set to `Z_NULL` (`inflate.c` L666).
+    #[must_use]
+    pub const fn comment_is_absent(&self) -> bool {
+        self.assigned.holds(HeaderFields::COMMENT_ABSENT)
+    }
+}
+
 /// Where the gzip header fields go while `inflate()` parses them: the safe
 /// replacement for `gz_headerp head` (`inflate.h` L94).
 ///
@@ -493,12 +871,12 @@ pub const GZ_HEADER_COMPLETE: i32 = 1;
 /// boundary, converts the caller's structure into this bounds-checked view, and
 /// keeps the raw `gz_headerp` on its own side.
 ///
-/// The scalar members are plain fields, written directly by
-/// `crates/zlib-rs/src/inflate/header.rs`; the three variable-length members are
-/// private and reached through the bounds-clamped writers below, so no write can
-/// run past the space the caller advertised.
+/// Every member is private. The scalars are read through the getters below and written
+/// through the setters, which is what records them in [`GzHeaderSink::assigned`]; the
+/// three variable-length members are reached through the bounds-clamped writers, so no
+/// write can run past the space the caller advertised.
 ///
-/// # ★ The three buffers are `&[Cell<u8>]`, not `&mut [u8]`
+/// # ★ The three buffers are [`HeaderField`]s, not `&mut [u8]`
 ///
 /// This is the one design decision here that is not obvious, and it is forced by
 /// the test suite rather than chosen. `test/infcover.c` L307-L312 sets up a header
@@ -511,12 +889,11 @@ pub const GZ_HEADER_COMPLETE: i32 = 1;
 /// reported by Miri and by AddressSanitizer -- for a test that must pass
 /// unmodified (AAP Goal 2).
 ///
-/// A shared reference to a slice of [`Cell`] resolves it exactly. `Cell<u8>` is
-/// `repr(transparent)` over `u8`, so the representation is unchanged; overlapping
-/// *shared* references are perfectly legal; and interior mutability makes writing
-/// through them safe. The facade's `slice::from_raw_parts` over `Cell<u8>` is
-/// sound even when two of the ranges coincide, which is precisely what the C
-/// contract permits and what the coverage harness does.
+/// A shared reference to a slice of [`Cell`] resolves it exactly, and
+/// [`HeaderField`] carries the argument in full -- including why the elements the
+/// facade hands over are `Cell<MaybeUninit<u8>>` rather than `Cell<u8>`: a caller's
+/// buffer is writable for the maximum it advertised and holds nothing until the
+/// parse stores something there.
 ///
 /// It has a second benefit. Shared references are [`Copy`], so this whole view is
 /// [`Copy`], and `inflateCopy` can duplicate it as faithfully as C's
@@ -533,72 +910,68 @@ pub const GZ_HEADER_COMPLETE: i32 = 1;
 /// is reproduced: [`GzHeaderSink::clear_extra`] and friends drop the borrow and
 /// record the fact, and [`GzHeaderSink::extra_is_absent`] and friends let the
 /// facade store `Z_NULL` back into the caller's structure.
-// Five booleans: `text` and `hcrc` mirror C's `int` flags, and the three
-// `*_is_absent` flags record the three `Z_NULL` assignments above. Grouping them
-// into a bit set would obscure the one-to-one correspondence with `zlib.h`
-// L118-L133 that this view exists to preserve.
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy)]
 pub struct GzHeaderSink<'a> {
+    /// Which members the parse has assigned since the last [`GzHeaderSink::take_update`].
+    ///
+    /// The whole reason the scalars below are private. C's header states write
+    /// *straight through* `state->head`, so the caller's structure receives exactly the
+    /// fields the stream actually supplied and nothing else; this crate parses into a
+    /// sink and something else publishes, so "which fields did the stream supply" has to
+    /// be carried explicitly or the publication cannot reproduce C's.
+    assigned: HeaderFields,
+
     /// `int text` (`zlib.h` L119): true if the compressed data is believed to be
     /// text. Written from bit 0 of the gzip `FLG` byte at `inflate.c` L566.
-    pub text: bool,
+    text: bool,
 
     /// `uLong time` (`zlib.h` L120): the modification time, as the four
-    /// little-endian bytes of the gzip `MTIME` field.
+    /// little-endian bytes of the gzip `MTIME` field, or [`None`] before the `TIME`
+    /// state runs.
     ///
-    /// Written from the whole accumulator at `inflate.c` L577, where `bits` is
+    /// Assigned from the whole accumulator at `inflate.c` L577, where `bits` is
     /// exactly 32, so the value never exceeds 32 bits and `u32` loses nothing.
-    pub time: u32,
+    time: u32,
 
-    /// `int xflags` (`zlib.h` L121): the gzip `XFL` byte, written masked to eight
+    /// `int xflags` (`zlib.h` L121): the gzip `XFL` byte, assigned masked to eight
     /// bits at `inflate.c` L586.
-    pub xflags: i32,
+    xflags: i32,
 
-    /// `int os` (`zlib.h` L122): the gzip `OS` byte, written as `hold >> 8` at
+    /// `int os` (`zlib.h` L122): the gzip `OS` byte, assigned as `hold >> 8` at
     /// `inflate.c` L587.
-    pub os: i32,
+    os: i32,
 
     /// `Bytef *extra` with `uInt extra_max` (`zlib.h` L123, L125), or [`None`] for
     /// `Z_NULL`.
     ///
-    /// The slice length **is** `extra_max`: pairing the pointer with its bound in
-    /// one value is what makes the clamped write in
+    /// The field's capacity **is** `extra_max`: pairing the pointer with its bound
+    /// in one value is what makes the clamped write in
     /// [`GzHeaderSink::write_extra`] unable to overrun.
-    extra: Option<&'a [Cell<u8>]>,
+    extra: Option<HeaderField<'a>>,
 
     /// `uInt extra_len` (`zlib.h` L124): the length the stream advertises for the
-    /// extra field, written whole at `inflate.c` L596 *before* any clamping, so a
+    /// extra field, assigned whole at `inflate.c` L596 *before* any clamping, so a
     /// caller can tell that its buffer was too small.
-    pub extra_len: u32,
-
-    /// Set once `extra` has been cleared to `Z_NULL` (`inflate.c` L601).
-    extra_absent: bool,
+    extra_len: u32,
 
     /// `Bytef *name` with `uInt name_max` (`zlib.h` L126-L127), or [`None`] for
-    /// `Z_NULL`. The slice length **is** `name_max`.
-    name: Option<&'a [Cell<u8>]>,
-
-    /// Set once `name` has been cleared to `Z_NULL` (`inflate.c` L631).
-    name_absent: bool,
+    /// `Z_NULL`. The field's capacity **is** `name_max`.
+    name: Option<HeaderField<'a>>,
 
     /// `Bytef *comment` with `uInt comm_max` (`zlib.h` L128-L129), or [`None`] for
-    /// `Z_NULL`. The slice length **is** `comm_max`.
-    comment: Option<&'a [Cell<u8>]>,
+    /// `Z_NULL`. The field's capacity **is** `comm_max`.
+    comment: Option<HeaderField<'a>>,
 
-    /// Set once `comment` has been cleared to `Z_NULL` (`inflate.c` L666).
-    comment_absent: bool,
-
-    /// `int hcrc` (`zlib.h` L130): true if the header carried a CRC. Written from
+    /// `int hcrc` (`zlib.h` L130): true if the header carried a CRC. Assigned from
     /// bit 9 of `flags` at `inflate.c` L678.
-    pub hcrc: bool,
+    hcrc: bool,
 
     /// `int done` (`zlib.h` L131-L132): [`GZ_HEADER_PENDING`],
     /// [`GZ_HEADER_ABSENT`] or [`GZ_HEADER_COMPLETE`].
     ///
     /// Tri-state, hence signed. See the three constants for the sites that write
     /// each value.
-    pub done: i32,
+    done: i32,
 }
 
 impl<'a> GzHeaderSink<'a> {
@@ -608,45 +981,259 @@ impl<'a> GzHeaderSink<'a> {
     /// `extra` with `extra_max`, `name` with `name_max`, `comment` with
     /// `comm_max`. Pass [`None`] where the caller passed `Z_NULL`.
     ///
-    /// # KNOWN COMPATIBILITY GAP -- scalar initialisation differs from C
+    /// # The scalars start neutral, and that is no longer observable
     ///
     /// `inflateGetHeader` writes **only** `head->done = 0` (`inflate.c` L1229) and leaves every
-    /// other field of the caller's structure exactly as the caller left it. This constructor
-    /// instead starts every scalar at a neutral value.
+    /// other member of the caller's structure exactly as the caller left it, so a caller that
+    /// pre-fills `head.text`, `head.time`, `head.xflags` or `head.os` and then decodes a stream
+    /// which turns out not to be gzip still sees its own values. This constructor starts every
+    /// scalar at a neutral value instead, and for a while that difference *was* observable: the
+    /// publication wrote all seven back.
     ///
-    /// That difference is **observable**, and it must not be described as an improvement, as
-    /// "strictly better defined", or as unobservable. A caller that pre-fills `head.text`,
-    /// `head.time`, `head.xflags` or `head.os` and then decodes a stream that turns out not to be
-    /// gzip sees its own values preserved under C and neutral values here. It is true that such a
-    /// caller is reading fields the format never supplied -- `done` is the flag that says whether
-    /// they mean anything -- but "the caller should not look" is not the same as "the caller cannot
-    /// tell", and behaviour preservation is the governing constraint for this port.
-    ///
-    /// The gap is therefore recorded as unresolved rather than justified, and it is closable at the
-    /// boundary: the facade's `inflateGetHeader` must write only `done = 0` into the caller's
-    /// `gz_header`, and on completion write back only the fields the parse actually supplied,
-    /// leaving the others at the caller's values. Whoever lands that entry point owns closing it.
+    /// It no longer is. Every scalar is now assigned through a setter that records the member in
+    /// [`GzHeaderSink::assigned`], and [`GzHeaderSink::take_update`] reports only what the parse
+    /// assigned, so a member the stream never supplied is never written and the value this
+    /// constructor chose for it is never seen. The neutral start is therefore an implementation
+    /// detail rather than a divergence -- and, unlike the alternative, it needs no read of the
+    /// caller's output members, which `zlib.h` L118-L133 does not require a caller to have
+    /// initialised at all.
     #[must_use]
     pub const fn new(
         extra: Option<&'a [Cell<u8>]>,
         name: Option<&'a [Cell<u8>]>,
         comment: Option<&'a [Cell<u8>]>,
     ) -> Self {
+        // `Option::map` is not const, so the three are unwrapped by hand.
+        Self::from_fields(
+            match extra {
+                Some(buffer) => Some(HeaderField::init(buffer)),
+                None => None,
+            },
+            match name {
+                Some(buffer) => Some(HeaderField::init(buffer)),
+                None => None,
+            },
+            match comment {
+                Some(buffer) => Some(HeaderField::init(buffer)),
+                None => None,
+            },
+        )
+    }
+
+    /// [`GzHeaderSink::new`] over caller storage that may hold no values yet.
+    ///
+    /// The form `crates/libz-rs-sys` uses. A C caller's `extra`, `name` and `comment`
+    /// are writable for the maximum it advertised and nothing more (`zlib.h`
+    /// L123-L129), and [`HeaderField`] carries the full argument for why that
+    /// distinction is represented rather than assumed away.
+    ///
+    /// Identical in behaviour to [`GzHeaderSink::new`]: nothing in this crate reads a
+    /// header buffer back, so the two storages differ only in what they promise about
+    /// bytes the parse never wrote.
+    #[must_use]
+    pub const fn new_write_only(
+        extra: Option<&'a [Cell<MaybeUninit<u8>>]>,
+        name: Option<&'a [Cell<MaybeUninit<u8>>]>,
+        comment: Option<&'a [Cell<MaybeUninit<u8>>]>,
+    ) -> Self {
+        Self::from_fields(
+            match extra {
+                Some(buffer) => Some(HeaderField::write_only(buffer)),
+                None => None,
+            },
+            match name {
+                Some(buffer) => Some(HeaderField::write_only(buffer)),
+                None => None,
+            },
+            match comment {
+                Some(buffer) => Some(HeaderField::write_only(buffer)),
+                None => None,
+            },
+        )
+    }
+
+    /// The general constructor both [`GzHeaderSink::new`] and
+    /// [`GzHeaderSink::new_write_only`] forward to.
+    ///
+    /// Takes each field already built, which is what lets one storage be mixed with
+    /// another -- a caller is free to advertise an initialised `name` alongside a
+    /// freshly allocated `extra`, and C makes no promise that the three come from the
+    /// same place.
+    #[must_use]
+    pub const fn from_fields(
+        extra: Option<HeaderField<'a>>,
+        name: Option<HeaderField<'a>>,
+        comment: Option<HeaderField<'a>>,
+    ) -> Self {
         Self {
+            assigned: HeaderFields::none(),
             text: false,
             time: 0,
             xflags: 0,
             os: 0,
             extra,
             extra_len: 0,
-            extra_absent: false,
             name,
-            name_absent: false,
             comment,
-            comment_absent: false,
             hcrc: false,
             done: GZ_HEADER_PENDING,
         }
+    }
+
+    /// Re-points the three variable-length fields at the caller's buffers.
+    ///
+    /// C reads `head->extra`, `head->extra_max`, `head->name`, `head->name_max`,
+    /// `head->comment` and `head->comm_max` at the moment it writes a byte -- inside the
+    /// `EXTRA` (`inflate.c` L608-L620), `NAME` (L625-L634) and `COMMENT` (L640-L649)
+    /// states -- not once when the header is installed. A caller is therefore free to
+    /// change a pointer or a capacity between calls, and the next call honours it.
+    ///
+    /// This is what lets a facade reproduce that: it rebinds the three fields from the
+    /// caller's live structure before each run and drops them again afterwards, so no
+    /// borrow of the caller's memory outlives a single call. The three absence bits are
+    /// cleared with the rebind, because they record `Z_NULL` assignments that have already
+    /// been published; keeping them would null a pointer the caller has since supplied
+    /// again.
+    ///
+    /// The storage is write-only, which is all `zlib.h` L123-L129 promises about a
+    /// decoding caller's buffers: the parse writes into them and never reads them back.
+    /// The parsed scalars are untouched -- they carry the header across calls, which is
+    /// what C achieves by leaving them in the caller's structure.
+    pub fn rebind_fields(
+        &mut self,
+        extra: Option<&'a [Cell<MaybeUninit<u8>>]>,
+        name: Option<&'a [Cell<MaybeUninit<u8>>]>,
+        comment: Option<&'a [Cell<MaybeUninit<u8>>]>,
+    ) {
+        self.extra = extra.map(HeaderField::write_only);
+        self.assigned.remove(HeaderFields::EXTRA_ABSENT);
+        self.name = name.map(HeaderField::write_only);
+        self.assigned.remove(HeaderFields::NAME_ABSENT);
+        self.comment = comment.map(HeaderField::write_only);
+        self.assigned.remove(HeaderFields::COMMENT_ABSENT);
+    }
+
+    /// `int text` (`zlib.h` L119): whether the stream believes its data to be text.
+    #[must_use]
+    pub const fn text(&self) -> bool {
+        self.text
+    }
+
+    /// `uLong time` (`zlib.h` L120): the gzip `MTIME` field.
+    #[must_use]
+    pub const fn time(&self) -> u32 {
+        self.time
+    }
+
+    /// `int xflags` (`zlib.h` L121): the gzip `XFL` byte.
+    #[must_use]
+    pub const fn xflags(&self) -> i32 {
+        self.xflags
+    }
+
+    /// `int os` (`zlib.h` L122): the gzip `OS` byte.
+    #[must_use]
+    pub const fn os(&self) -> i32 {
+        self.os
+    }
+
+    /// `uInt extra_len` (`zlib.h` L124): the length the stream advertises for its
+    /// extra field, before any clamping to `extra_max`.
+    #[must_use]
+    pub const fn extra_len(&self) -> u32 {
+        self.extra_len
+    }
+
+    /// `int hcrc` (`zlib.h` L130): whether the header carried a CRC.
+    #[must_use]
+    pub const fn hcrc(&self) -> bool {
+        self.hcrc
+    }
+
+    /// `int done` (`zlib.h` L131-L132): [`GZ_HEADER_PENDING`], [`GZ_HEADER_ABSENT`]
+    /// or [`GZ_HEADER_COMPLETE`].
+    #[must_use]
+    pub const fn done(&self) -> i32 {
+        self.done
+    }
+
+    /// `state->head->text = (int)(hold >> 8) & 1` (`inflate.c` L566).
+    pub fn set_text(&mut self, text: bool) {
+        self.text = text;
+        self.assigned.insert(HeaderFields::TEXT);
+    }
+
+    /// `state->head->time = hold` (`inflate.c` L577).
+    pub fn set_time(&mut self, time: u32) {
+        self.time = time;
+        self.assigned.insert(HeaderFields::TIME);
+    }
+
+    /// `state->head->xflags = (int)(hold & 0xff)` (`inflate.c` L586).
+    pub fn set_xflags(&mut self, xflags: i32) {
+        self.xflags = xflags;
+        self.assigned.insert(HeaderFields::XFLAGS);
+    }
+
+    /// `state->head->os = (int)(hold >> 8)` (`inflate.c` L587).
+    pub fn set_os(&mut self, os: i32) {
+        self.os = os;
+        self.assigned.insert(HeaderFields::OS);
+    }
+
+    /// `state->head->extra_len = (unsigned)hold` (`inflate.c` L596).
+    pub fn set_extra_len(&mut self, extra_len: u32) {
+        self.extra_len = extra_len;
+        self.assigned.insert(HeaderFields::EXTRA_LEN);
+    }
+
+    /// `state->head->hcrc = (int)((state->flags >> 9) & 1)` (`inflate.c` L678).
+    pub fn set_hcrc(&mut self, hcrc: bool) {
+        self.hcrc = hcrc;
+        self.assigned.insert(HeaderFields::HCRC);
+    }
+
+    /// `head->done = 0` at install time (`inflate.c` L1229).
+    ///
+    /// Deliberately **not** an assignment for publication purposes: `inflateGetHeader`
+    /// writes that zero into the caller's structure itself, at install time, exactly as
+    /// C does, so recording it here would make the first publication rewrite a value the
+    /// caller already has. The two later `done` values -- [`GzHeaderSink::mark_absent`]
+    /// and [`GzHeaderSink::mark_complete`] -- are assignments, because a *parse* produces
+    /// them.
+    pub fn reset_done(&mut self) {
+        self.done = GZ_HEADER_PENDING;
+    }
+
+    /// Takes the members the parse has assigned since the last call, clearing the set.
+    ///
+    /// [`None`] when nothing is outstanding, which is the common case: a header is
+    /// parsed once, published once, and every `inflate()` after that has nothing to
+    /// report. That is what keeps publication off the per-call path -- C writes these
+    /// members while parsing, not on every payload chunk -- and it needs no separate
+    /// "have I finished" flag, because a completed parse simply stops assigning.
+    pub fn take_update(&mut self) -> Option<HeaderUpdate> {
+        if self.assigned.is_empty() {
+            return None;
+        }
+        let update = HeaderUpdate {
+            assigned: self.assigned,
+            text: self.text,
+            time: self.time,
+            xflags: self.xflags,
+            os: self.os,
+            extra_len: self.extra_len,
+            hcrc: self.hcrc,
+            done: self.done,
+        };
+        self.assigned = HeaderFields::none();
+        Some(update)
+    }
+
+    /// Which members are outstanding, without taking them.
+    #[must_use]
+    pub const fn assigned(&self) -> HeaderFields {
+        self.assigned
     }
 
     /// `uInt extra_max` (`zlib.h` L125): the space available at `extra`, or zero
@@ -674,8 +1261,10 @@ impl<'a> GzHeaderSink<'a> {
     }
 
     /// The advertised capacity of one optional field.
-    fn capacity(field: Option<&'a [Cell<u8>]>) -> u32 {
-        field.map_or(0, |slice| u32::try_from(slice.len()).unwrap_or(u32::MAX))
+    fn capacity(field: Option<HeaderField<'a>>) -> u32 {
+        field.map_or(0, |field| {
+            u32::try_from(field.capacity()).unwrap_or(u32::MAX)
+        })
     }
 
     /// Whether `extra` is a non-null pointer: `state->head->extra != Z_NULL`
@@ -716,27 +1305,13 @@ impl<'a> GzHeaderSink<'a> {
             return 0;
         };
         // `(len = extra_len - length) < extra_max`. `at` is already the difference,
-        // and `field.len()` is `extra_max`, so this is the same test written on the
-        // slice; `get(start..)` yields `None` rather than panicking when `at` is at
-        // or past the end, which also covers `at` exceeding `usize` on a 16-bit
-        // target.
+        // and the field's capacity is `extra_max`, so `store_slice` performs the same
+        // test: it stores nothing rather than panicking when `at` is at or past the
+        // end, which also covers `at` exceeding `usize` on a 16-bit target. It then
+        // takes the shorter of what is offered and what is left, which is C's
+        // `len + copy > extra_max ? extra_max - len : copy`.
         let start = usize::try_from(at).unwrap_or(usize::MAX);
-        let Some(tail) = field.get(start..) else {
-            return 0;
-        };
-        // `len + copy > extra_max ? extra_max - len : copy` -- take the shorter of
-        // what is offered and what is left.
-        let count = tail.len().min(bytes.len());
-        let Some(destination) = tail.get(..count) else {
-            return 0;
-        };
-        let Some(source) = bytes.get(..count) else {
-            return 0;
-        };
-        for (slot, byte) in destination.iter().zip(source) {
-            slot.set(*byte);
-        }
-        count
+        field.store_slice(start, bytes)
     }
 
     /// Stores one byte of the file name, reporting whether it was stored.
@@ -763,7 +1338,7 @@ impl<'a> GzHeaderSink<'a> {
     }
 
     /// The shared body of the two byte-at-a-time writers.
-    fn push(field: Option<&'a [Cell<u8>]>, at: u32, byte: u8) -> bool {
+    fn push(field: Option<HeaderField<'a>>, at: u32, byte: u8) -> bool {
         let Some(field) = field else {
             return false;
         };
@@ -772,11 +1347,7 @@ impl<'a> GzHeaderSink<'a> {
         };
         // `state->length < state->head->name_max`, expressed as a checked lookup so
         // that the bound and the access cannot disagree.
-        let Some(slot) = field.get(index) else {
-            return false;
-        };
-        slot.set(byte);
-        true
+        field.store(index, byte)
     }
 
     /// Clears `extra` to `Z_NULL`: `state->head->extra = Z_NULL`
@@ -789,21 +1360,21 @@ impl<'a> GzHeaderSink<'a> {
     /// back into the caller's structure.
     pub fn clear_extra(&mut self) {
         self.extra = None;
-        self.extra_absent = true;
+        self.assigned.insert(HeaderFields::EXTRA_ABSENT);
     }
 
     /// Clears `name` to `Z_NULL`: `state->head->name = Z_NULL`
     /// (`inflate.c` L631).
     pub fn clear_name(&mut self) {
         self.name = None;
-        self.name_absent = true;
+        self.assigned.insert(HeaderFields::NAME_ABSENT);
     }
 
     /// Clears `comment` to `Z_NULL`: `state->head->comment = Z_NULL`
     /// (`inflate.c` L666).
     pub fn clear_comment(&mut self) {
         self.comment = None;
-        self.comment_absent = true;
+        self.assigned.insert(HeaderFields::COMMENT_ABSENT);
     }
 
     /// Whether the implementation assigned `Z_NULL` to the caller's `extra` pointer.
@@ -813,19 +1384,19 @@ impl<'a> GzHeaderSink<'a> {
     /// nulled, not merely left alone.
     #[must_use]
     pub const fn extra_is_absent(&self) -> bool {
-        self.extra_absent
+        self.assigned.holds(HeaderFields::EXTRA_ABSENT)
     }
 
     /// Whether the implementation assigned `Z_NULL` to the caller's `name` pointer.
     #[must_use]
     pub const fn name_is_absent(&self) -> bool {
-        self.name_absent
+        self.assigned.holds(HeaderFields::NAME_ABSENT)
     }
 
     /// Whether the implementation assigned `Z_NULL` to the caller's `comment` pointer.
     #[must_use]
     pub const fn comment_is_absent(&self) -> bool {
-        self.comment_absent
+        self.assigned.holds(HeaderFields::COMMENT_ABSENT)
     }
 
     /// Records that this stream carries no gzip header:
@@ -836,6 +1407,7 @@ impl<'a> GzHeaderSink<'a> {
     /// "header not read yet".
     pub fn mark_absent(&mut self) {
         self.done = GZ_HEADER_ABSENT;
+        self.assigned.insert(HeaderFields::DONE);
     }
 
     /// Records that the gzip header has been read in full:
@@ -845,6 +1417,7 @@ impl<'a> GzHeaderSink<'a> {
     /// optional header CRC have been consumed.
     pub fn mark_complete(&mut self) {
         self.done = GZ_HEADER_COMPLETE;
+        self.assigned.insert(HeaderFields::DONE);
     }
 
     /// Whether the header has been read in full, i.e. `done == 1`.
@@ -869,13 +1442,14 @@ impl fmt::Debug for GzHeaderSink<'_> {
             .field("os", &self.os)
             .field("extra_len", &self.extra_len)
             .field("extra_max", &self.extra_max())
-            .field("extra_absent", &self.extra_absent)
+            .field("extra_absent", &self.extra_is_absent())
             .field("name_max", &self.name_max())
-            .field("name_absent", &self.name_absent)
+            .field("name_absent", &self.name_is_absent())
             .field("comm_max", &self.comm_max())
-            .field("comment_absent", &self.comment_absent)
+            .field("comment_absent", &self.comment_is_absent())
             .field("hcrc", &self.hcrc)
             .field("done", &self.done)
+            .field("assigned", &self.assigned)
             .finish()
     }
 }
@@ -928,8 +1502,12 @@ impl<'a, A: Allocator<'a>> WindowBlock<'a, A> {
 impl<'a, A: Allocator<'a>> Drop for WindowBlock<'a, A> {
     /// Performs the `ZFREE(strm, state->window)` half of `inflateEnd`
     /// (`inflate.c` L1159-L1160).
+    ///
+    /// The slot is handed to the allocator rather than emptied here, so that the
+    /// block's borrow is not live in this frame while the block is freed -- the rule
+    /// `zlib_rs::allocate::ForeignBlock` documents.
     fn drop(&mut self) {
-        self.allocator.try_deallocate_bytes(self.buffer.take());
+        self.allocator.deallocate_bytes(&mut self.buffer);
     }
 }
 
@@ -1413,6 +1991,54 @@ impl<'a, A: Allocator<'a>> InflateState<'a, A> {
         }
     }
 
+    /// Whether `inflateSetDictionary` may load a dictionary: the negation of
+    /// `state->wrap != 0 && state->mode != DICT` (`inflate.c` L1196-L1197).
+    ///
+    /// ★ **Exposed for the same reason as [`InflateState::accepts_gzip_header`].** C
+    /// evaluates this at L1196 and returns at L1197, *before* `adler32` (L1200) or
+    /// `set_dictionary`'s window update (L1211) has read one dictionary byte -- so a
+    /// wrapped stream that is not waiting for a dictionary, which is what
+    /// `test/infcover.c` L362-L363 passes, leaves the caller's buffer untouched and may
+    /// legitimately supply a stale or wild non-null pointer. Reconstructing the slice
+    /// first would turn that documented refusal into undefined behaviour.
+    /// [`crate::inflate::inflate_set_dictionary`] applies the identical predicate.
+    #[must_use]
+    pub fn accepts_dictionary(&self) -> bool {
+        self.wrap.is_raw() || self.mode == Mode::Dict
+    }
+
+    /// Whether `inflateGetHeader` may install a header at all: `(state->wrap & 2) != 0`
+    /// (`inflate.c` L1225).
+    ///
+    /// ★ **Exposed so the facade can ask before it touches the caller's `gz_header`.**
+    /// C evaluates this at L1225 and returns at L1226, *before* L1228-L1229 assign the
+    /// pointer and write `done` -- so a stream that is not configured for gzip never
+    /// causes C to read or write one member of the structure, and such a caller may
+    /// legitimately pass a pointer that is stale, misaligned or wild. Building a
+    /// [`GzHeaderSink`] reads six members of it, which for such a pointer is undefined
+    /// behaviour; running this predicate first is what keeps the Rust order identical
+    /// to C's. [`crate::inflate::inflate_get_header`] applies the same test, so the two
+    /// cannot disagree.
+    #[must_use]
+    pub const fn accepts_gzip_header(&self) -> bool {
+        self.wrap.allows_gzip_header()
+    }
+
+    /// The number of bytes of history the window holds: `state->whave`
+    /// (`inflate.h` L118).
+    ///
+    /// ★ **Exposed because `inflateGetDictionary` copies exactly this many bytes and
+    /// its `dictLength` argument is write-only.** `inflate.c` L1177-L1183 copies
+    /// `whave - wnext` bytes and then `wnext` more -- `whave` in total -- and only then
+    /// assigns `*dictLength = state->whave`; it never reads through that pointer.
+    /// `zlib.h` L936-L942 documents the member the same way. A facade that sized its
+    /// destination slice from `*dictLength` would be reading an output-only argument,
+    /// so it asks the state instead, which is where C gets the number from.
+    #[must_use]
+    pub const fn history_len(&self) -> u32 {
+        self.whave
+    }
+
     /// Installs or clears the safe gzip-header sink.
     ///
     /// The facade performs `inflateGetHeader`'s `wrap & 2` guard and builds the
@@ -1422,27 +2048,60 @@ impl<'a, A: Allocator<'a>> InflateState<'a, A> {
         self.head = head;
     }
 
-    /// Reads the gzip-header sink back out, or [`None`] when none is installed.
+    /// Runs `body` against the installed gzip-header sink, if there is one.
     ///
-    /// The counterpart of [`InflateState::set_header_sink`], and the reason it
-    /// has to exist: C's header states write **through** `state->head` directly
-    /// into the caller's `gz_header` (`inflate.c` L566, L577, L586-L587, L596,
-    /// L601, L631, L666, L678, L687), whereas this crate parses into the sink and
-    /// therefore holds the scalars on its own side. Only the facade owns the raw
-    /// `gz_headerp`, so only the facade can publish them, and it needs a way to
-    /// read them. [`GzHeaderSink`] is [`Copy`], so this hands back a snapshot and
-    /// the state keeps its own.
+    /// ★ The sink is reached *in place* rather than copied out, modified and put back. A
+    /// facade has to rebind the three field views before every call -- C re-reads the
+    /// caller's `head->extra`, `head->name` and `head->comment` at the moment it writes a
+    /// byte -- and a copy-out/copy-back round trip would move the whole sink twice per
+    /// call for a change to three pointers. Returns [`None`] when no header is installed,
+    /// which is the same answer C's `state->head == Z_NULL` gives.
+    pub fn with_header_sink<R>(
+        &mut self,
+        body: impl FnOnce(&mut GzHeaderSink<'a>) -> R,
+    ) -> Option<R> {
+        self.head.as_mut().map(body)
+    }
+
+    /// Whether a gzip-header sink is installed: C's `state->head != Z_NULL`.
     ///
-    /// The three variable-length members need no such step: they are
-    /// `&[Cell<u8>]` views over the caller's own buffers, so a byte written by
-    /// the `EXTRA`, `NAME` or `COMMENT` state is already in the caller's memory.
-    /// What the facade takes from here is the seven scalars -- `text`, `time`,
-    /// `xflags`, `os`, `extra_len`, `hcrc`, `done` -- plus the three
-    /// `*_is_absent` answers that tell it to store `Z_NULL` back into the
-    /// caller's structure.
+    /// The facade needs this to keep its own copy of the caller's `gz_headerp`
+    /// honest -- every reset assigns `state->head = Z_NULL` (`inflate.c` L110), so a
+    /// stream that has been reset must forget the pointer too.
     #[must_use]
-    pub const fn header_sink(&self) -> Option<GzHeaderSink<'a>> {
-        self.head
+    pub const fn has_header_sink(&self) -> bool {
+        self.head.is_some()
+    }
+
+    /// Takes whatever the parse has assigned to the caller's `gz_header` since the
+    /// last call, or [`None`] when there is nothing outstanding.
+    ///
+    /// The counterpart of [`InflateState::set_header_sink`], and the reason it has to
+    /// exist: C's header states write **through** `state->head` directly into the
+    /// caller's `gz_header` (`inflate.c` L566, L577, L586-L587, L596, L601, L631,
+    /// L666, L678, L687), whereas this crate parses into a sink and therefore holds
+    /// the scalars on its own side. Only the facade owns the raw `gz_headerp`, so
+    /// only the facade can publish them.
+    ///
+    /// ★ **What comes back is the set of members the parse actually assigned, not a
+    /// copy of the sink.** Both halves of that matter. C's selectivity is observable:
+    /// a member the stream never supplied is never written and keeps whatever the
+    /// caller put there, so publishing all seven scalars unconditionally would differ
+    /// from the reference for a caller that pre-filled one of them. And C performs
+    /// these writes *while parsing*, not on every payload chunk, so an `inflate()`
+    /// that decodes compressed data long after the header finished must publish
+    /// nothing at all -- which is what taking the set achieves, since a finished parse
+    /// stops assigning. [`HeaderUpdate`] is a fraction of the sink's size for the same
+    /// reason: a publisher needs the scalars, never the three buffer views.
+    ///
+    /// The three variable-length members need no publication step: they are
+    /// [`HeaderField`] views over the caller's own buffers, so a byte written by the
+    /// `EXTRA`, `NAME` or `COMMENT` state is already in the caller's memory. What
+    /// *is* reported is the three `Z_NULL` assignments the reference makes when a
+    /// field is absent from the stream -- L601, L631 and L666 -- because a caller can
+    /// observe those.
+    pub fn take_header_update(&mut self) -> Option<HeaderUpdate> {
+        self.head.as_mut()?.take_update()
     }
 
     /// `INITBITS`: clear the input accumulator (`inflate.c` L347-L351).
@@ -1752,28 +2411,42 @@ impl<'a, A: Allocator<'a>> InflateState<'a, A> {
         }
     }
 
-    /// Constructs the state used by `inflateBackInit_`, borrowing the caller's
-    /// output window.
+    /// Constructs the state used by `inflateBackInit_`, which owns **no** window.
     ///
-    /// `window_bits` must be 8..=15 and `window` must contain at least
-    /// `2**window_bits` bytes (`infback.c` L22-L35). A longer slice is accepted
-    /// but only the required prefix is borrowed, exactly matching C's implicit
-    /// window extent.
+    /// `window_bits` must be 8..=15 (`infback.c` L33-L35). `wsize` is set to
+    /// `2**window_bits`, exactly as L58 sets it, and the window slot is left
+    /// [`InflateWindow::absent`].
+    ///
+    /// # ★ Why the window is not stored here
+    ///
+    /// C's L59 is `state->window = window;` -- it keeps the caller's raw pointer for
+    /// the state's whole life. A Rust `&mut [u8]` cannot be used that way: it asserts
+    /// *exclusive* access for as long as it is held, and `zlib.h` L1174-L1175 asks the
+    /// application only not to change the window "until `inflateBack()` returns" -- so
+    /// between calls, and after `inflateBackEnd`, the buffer is the caller's to read,
+    /// write or free. A borrow retained across that boundary would be a claim the
+    /// caller is entitled to violate, and one that outlives the memory it describes.
+    ///
+    /// So the window is supplied to [`crate::infback::inflate_back`] **per call**,
+    /// which is the only interval over which the exclusive claim is true. `wsize`
+    /// records the extent that window must have, and `inflate_back` refuses a window
+    /// that disagrees with it.
+    ///
+    /// There is deliberately no second constructor that stores a window: both callers
+    /// this crate has want the same shape. A Rust caller lends the window for the one
+    /// call and keeps it back afterwards, and a C facade *cannot* do otherwise --
+    /// `inflateBack`'s caller owns the buffer between calls -- so one constructor
+    /// serves both and no state can outlive a borrow of memory it does not own.
     ///
     /// # Errors
     ///
-    /// [`ReturnCode::STREAM_ERROR`] for an invalid exponent, a short window, or
-    /// an unrepresentable size.
-    pub fn with_borrowed_window(
-        window_bits: i32,
-        window: &'a mut [u8],
-        allocator: A,
-    ) -> Result<Self, ReturnCode> {
+    /// [`ReturnCode::STREAM_ERROR`] for an invalid exponent or an unrepresentable
+    /// size.
+    pub fn for_inflate_back(window_bits: i32, allocator: A) -> Result<Self, ReturnCode> {
         let window_bits = validate_inflate_back_window_bits(window_bits)?;
         let size = 1_usize
             .checked_shl(u32::from(window_bits))
             .ok_or(ReturnCode::STREAM_ERROR)?;
-        let window = window.get_mut(..size).ok_or(ReturnCode::STREAM_ERROR)?;
         let mut state = Self::with_validated_config(
             ValidatedInflateConfig {
                 wrap: InflateWrap::None,
@@ -1782,6 +2455,35 @@ impl<'a, A: Allocator<'a>> InflateState<'a, A> {
             allocator,
         );
         state.wsize = u32::try_from(size).map_err(|_| ReturnCode::STREAM_ERROR)?;
+        Ok(state)
+    }
+
+    /// Constructs a state that borrows `window` as its history, for a Rust caller
+    /// whose window has a real lifetime.
+    ///
+    /// The safe-Rust counterpart of an `inflateBack` state, and **not** what the C
+    /// facade uses: see [`InflateState::for_inflate_back`] for why a C caller's window
+    /// cannot be held across calls. Retained because a borrowed window is a genuine
+    /// third ownership mode -- one this state must neither allocate over nor free --
+    /// and because `crate::inflate::window::update_window` refuses it, which is the
+    /// property `window.rs`'s own tests establish.
+    ///
+    /// `window_bits` must be 8..=15 and `window` must contain at least
+    /// `2**window_bits` bytes; a longer slice is accepted and only that prefix is
+    /// borrowed, matching C's implicit window extent.
+    ///
+    /// # Errors
+    ///
+    /// [`ReturnCode::STREAM_ERROR`] for an invalid exponent, a short window, or an
+    /// unrepresentable size.
+    pub fn with_borrowed_window(
+        window_bits: i32,
+        window: &'a mut [u8],
+        allocator: A,
+    ) -> Result<Self, ReturnCode> {
+        let mut state = Self::for_inflate_back(window_bits, allocator)?;
+        let size = usize::try_from(state.wsize).map_err(|_| ReturnCode::STREAM_ERROR)?;
+        let window = window.get_mut(..size).ok_or(ReturnCode::STREAM_ERROR)?;
         state.window = InflateWindow::borrowed(window);
         Ok(state)
     }
@@ -1885,12 +2587,19 @@ impl<'a, A: Allocator<'a>> InflateState<'a, A> {
 
     /// Explicitly performs the memory half of `inflateEnd`.
     ///
-    /// Dropping the value has the same effect: [`InflateWindow`] owns its
-    /// allocator-backed block and releases only the owned variant. Freeing the
-    /// allocation that contains this state and clearing `z_stream.state` remain
-    /// facade responsibilities (`inflate.c` L1160-L1162).
-    pub fn release(self) {
-        drop(self);
+    /// Releases the window in place: [`InflateWindow`] owns its allocator-backed block
+    /// and releases only the owned variant, so a borrowed window -- `inflateBack`'s --
+    /// is left to its lender. Freeing the allocation that contains this state and
+    /// clearing `z_stream.state` remain facade responsibilities
+    /// (`inflate.c` L1160-L1162).
+    ///
+    /// ★ Takes `&mut self` rather than `self`. A state moved into a call carries its
+    /// window's borrow in argument position, where it is protected for the whole call,
+    /// and freeing memory a protected reference covers is undefined behaviour; see
+    /// `zlib_rs::allocate::ForeignBlock`. Dropping the state afterwards, where it
+    /// lives, is what actually retires it, and by then the window slot is empty.
+    pub fn release(&mut self) {
+        self.window.discard();
     }
 }
 
@@ -2033,7 +2742,7 @@ mod tests {
         is_live_mode_tag, GzHeaderSink, InflateState, StreamReset, WrapFlags, BACK_UNKNOWN,
         DMAX_DEFAULT, FLAGS_NO_HEADER, LENS_LEN, WORK_LEN,
     };
-    use crate::allocate::{Allocator, AllocatorId, Buffer, GlobalAllocator, Opaque};
+    use crate::allocate::{Allocator, AllocatorId, Buffer, ForeignBlock, GlobalAllocator, Opaque};
     use crate::config::{InflateConfig, InflateWrap};
     use crate::error::ReturnCode;
     use crate::inflate::inftrees::{Code, CodeTableSource, CodeTables, ENOUGH};
@@ -2124,15 +2833,24 @@ mod tests {
             Buffer::try_global(items, u16::from_ne_bytes([self.fill, self.fill]))
         }
 
-        fn deallocate_bytes(&self, buffer: Buffer<'a, u8>) {
-            self.record(Event::Free(buffer.len()));
-            GlobalAllocator.deallocate_bytes(buffer);
+        // Never reached: the blocks come from `GlobalAllocator`, which handles them.
+        fn release_foreign_bytes(&self, _block: ForeignBlock<'a, u8>) {}
+
+        fn release_foreign_u16s(&self, _block: ForeignBlock<'a, u16>) {}
+
+        fn deallocate_bytes(&self, slot: &mut Option<Buffer<'a, u8>>) {
+            if let Some(buffer) = slot.as_ref() {
+                self.record(Event::Free(buffer.len()));
+            }
+            GlobalAllocator.deallocate_bytes(slot);
         }
 
-        fn deallocate_u16s(&self, buffer: Buffer<'a, u16>) {
-            let bytes = buffer.len().saturating_mul(size_of::<u16>());
-            self.record(Event::Free(bytes));
-            GlobalAllocator.deallocate_u16s(buffer);
+        fn deallocate_u16s(&self, slot: &mut Option<Buffer<'a, u16>>) {
+            if let Some(buffer) = slot.as_ref() {
+                let bytes = buffer.len().saturating_mul(size_of::<u16>());
+                self.record(Event::Free(bytes));
+            }
+            GlobalAllocator.deallocate_u16s(slot);
         }
     }
 
@@ -2195,10 +2913,21 @@ mod tests {
         // pinned on 64-bit targets so that a change in field layout, or in how
         // much space an allocator handle occupies, has to be acknowledged here
         // rather than silently drifting toward either bound.
+        //
+        // The pins moved from 7280/7296/7312 to 7296/7312/7328, and the arithmetic is
+        // worth recording because two changes met here. The three gzip header buffers
+        // became `HeaderField`s, each carrying which storage it holds, which costs
+        // eight bytes over the bare slice reference it replaced -- 24 in total, and the
+        // price of describing a C caller's `extra`, `name` and `comment` as writable
+        // rather than initialised. Then the sink's three `*_absent` booleans folded
+        // into the `HeaderFields` bit set that records which members the parse
+        // assigned, which gave eight of those bytes back. The net is +16, 0.22% of the
+        // state and 1.90% over C's 7160, and it is paid once per stream, never per
+        // call.
         if cfg!(target_pointer_width = "64") {
-            assert_eq!(measured, 7280);
-            assert_eq!(shared_allocator, 7296);
-            assert_eq!(dynamic_allocator, 7312);
+            assert_eq!(measured, 7296);
+            assert_eq!(shared_allocator, 7312);
+            assert_eq!(dynamic_allocator, 7328);
         }
         assert!(
             (7033..=8234).contains(&measured),
@@ -2356,7 +3085,7 @@ mod tests {
         let mut state = InflateState::new(InflateConfig::new(-8), &recorder).unwrap();
         assert_eq!(state.ensure_window().unwrap().len(), 256);
         state.release();
-        recorder.deallocate_bytes(state_block);
+        recorder.deallocate_bytes(&mut Some(state_block));
 
         assert_eq!(recorder.len(), 4);
         assert_eq!(recorder.event(0), Some(Event::Allocate(state_size)));
@@ -2367,10 +3096,11 @@ mod tests {
         recorder.clear();
         let state_block = recorder.allocate_bytes(1, state_size).unwrap();
         let mut caller_window = [0_u8; 256];
-        let state = InflateState::with_borrowed_window(8, &mut caller_window, &recorder).unwrap();
+        let mut state =
+            InflateState::with_borrowed_window(8, &mut caller_window, &recorder).unwrap();
         assert!(state.window.is_borrowed());
         state.release();
-        recorder.deallocate_bytes(state_block);
+        recorder.deallocate_bytes(&mut Some(state_block));
 
         assert_eq!(recorder.len(), 2);
         assert_eq!(recorder.event(0), Some(Event::Allocate(state_size)));

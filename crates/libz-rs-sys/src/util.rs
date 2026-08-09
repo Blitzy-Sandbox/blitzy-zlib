@@ -127,8 +127,8 @@
 //! | 12 | `BUILDFIXED` | 0 | the fixed tables are `const` data |
 //! | 13 | `DYNAMIC_CRC_TABLE` | 0 | the CRC tables are `const` data |
 //! | 14, 15 | -- | 0 | reserved (`zlib.h` L1234) |
-//! | 16 | `NO_GZCOMPRESS` | 0 | the gz layer can compress |
-//! | 17 | `NO_GZIP` | 0 | gzip streams are written and detected |
+//! | 16 | `NO_GZCOMPRESS` | 0, or **1 without the `gz` feature** | the gz layer can compress -- when it is compiled at all |
+//! | 17 | `NO_GZIP` | 0 | gzip streams are written and detected; no feature removes this |
 //! | 18, 19 | -- | 0 | reserved (`zlib.h` L1242) |
 //! | 20 | `PKZIP_BUG_WORKAROUND` | 0 | not implemented, as in the reference |
 //! | 21 | `FASTEST` | 0 | all ten levels exist |
@@ -136,11 +136,27 @@
 //! | 24 | not `STDC`/`stdarg` | 0 | the variadic entry point is the `stdarg` one |
 //! | 25 | insecure `*printf` | 0 | the formatter is bounded |
 //! | 26 | void-returning `*printf` | 0 | the formatter reports a length |
-//! | 27 | `gzprintf` absent | 0 | `gzprintf` is present |
+//! | 27 | `gzprintf` absent | 0, or **1 without the `gz` feature** | `gzprintf` is present when the gz layer is |
 //! | 28-31 | -- | 0 | reserved (`zlib.h` L1255) |
 //!
-//! Three of those zeros are determinations made elsewhere in the workspace and are
-//! cited rather than assumed:
+//! ## Two of those rows are derived from the resolved feature set
+//!
+//! Bits 16 and 27 are the only configuration bits this crate can set, and they move
+//! together because one Cargo feature -- `gz` -- governs both `gzwrite` and
+//! `gzprintf`. In the default build (`gz` on, which is what ships) both are clear
+//! and the total on LP64 is exactly the reference `0xa9`; in the supported
+//! `libz-compat`-without-`gz` build the gz module is compiled out entirely and both
+//! are set, because a flag word that advertises functions the artifact does not
+//! contain is worse than useless.
+//!
+//! Bit 17 deliberately does NOT move with them: `NO_GZIP` describes `deflate`
+//! writing and `inflate` decoding the RFC 1952 *container* (`windowBits` 25-31, and
+//! `+32` auto-detection), which lives in the core's deflate and inflate and which no
+//! feature in this workspace removes. Confusing the gzip wrapper with the `gzFile`
+//! layer is the mistake this row exists to prevent.
+//!
+//! Three of the remaining zeros are determinations made elsewhere in the workspace
+//! and are cited rather than assumed:
 //!
 //! * **bit 12** is clear because `crates/zlib-rs/src/inflate/fixed_tables.rs`
 //!   transcribes `inffixed.h` as `const` data, so the fixed Huffman decode tables
@@ -232,6 +248,7 @@ use crate::types::{uInt, uLong, voidpf, z_crc_t, z_off_t};
 /// **Never derive this from `env!("CARGO_PKG_VERSION")`.** See the module
 /// documentation: `1.3.2.1-motley` is not valid Cargo semver, so the manifest
 /// declares `1.3.2` and the two cannot be the same datum.
+/// cbindgen:ignore
 pub const ZLIB_VERSION: &CStr = c"1.3.2.1-motley";
 
 /// The version as a single packed integer, one nibble per component -- `zlib.h` L45.
@@ -257,12 +274,39 @@ pub const ZLIB_VER_SUBREVISION: c_int = 1;
 
 /// The ASCII digit that [`ZLIB_VER_MAJOR`] is spelled as inside [`ZLIB_VERSION`].
 ///
+/// This is the byte the init entry points compare a caller's compile-time version
+/// against: `crate::inflate::version_error` reads it directly, which is what makes
+/// this constant the single spelling of the major-version character rather than a
+/// duplicate of one derived inside that function.
+///
 /// Written as a character literal rather than computed with an `as` cast from
 /// `c_int`: a narrowing cast is exactly what the workspace lint policy asks to be
 /// justified individually, and there would be nothing to justify -- the major
 /// version is one decimal digit and writing it as one is clearer than deriving it.
-/// The assertion below is what makes the pairing checked rather than assumed.
-const ZLIB_VER_MAJOR_DIGIT: u8 = b'1';
+/// The assertions below are what make the pairing checked rather than assumed: one
+/// ties this byte to [`ZLIB_VERSION`]'s first byte, the other to [`ZLIB_VER_MAJOR`].
+///
+/// ★ **This is the byte the two version gates compare against**, which is why it is
+/// `pub(crate)` rather than private. `deflateInit_`, `inflateInit_` and
+/// `inflateBackInit_` must decide whether a caller's compile-time `ZLIB_VERSION`
+/// agrees with the library's, and `zlib.h` L225-L229 defines the test as "if the
+/// first character differs, the library code actually used is not compatible with the
+/// `zlib.h` header file used by the application". Both gates
+/// (`crate::deflate::version_is_compatible` and `crate::inflate::version_error`) read
+/// this constant, so the answer comes from one assertion-backed place instead of
+/// being re-derived -- fallibly, since `.to_bytes().first()` returns an [`Option`] --
+/// at each site.
+///
+/// Those two readers are also what keep the declared 1.80 floor warning-clean, and
+/// the distinction matters: rustc 1.80's dead-code pass does NOT count a use that
+/// occurs only inside an anonymous `const _: () = assert!(...)` item, so a version of
+/// this constant that only the assertions below referenced was reported as
+/// `never used` at the floor while passing on current stable. Liveness here comes
+/// from production code reachable from a `#[no_mangle]` export, not from the
+/// assertions -- which is why no `#[allow(dead_code)]` is needed. `make rust-msrv` is
+/// the gate that keeps it that way.
+/// cbindgen:ignore
+pub(crate) const ZLIB_VER_MAJOR_DIGIT: u8 = b'1';
 
 // `zlib.h` keeps L44-L49 consistent by hand. Here the consistency is mechanical:
 // each assertion below is a build failure rather than a review note.
@@ -270,6 +314,7 @@ const ZLIB_VER_MAJOR_DIGIT: u8 = b'1';
 // 1. `ZLIB_VERNUM` packs the four components a nibble each, most significant
 //    first. This is the relationship that lets a caller's `#if ZLIB_VERNUM >= ...`
 //    mean what the dotted string says.
+/// cbindgen:ignore
 const _: () = assert!(
     ZLIB_VERNUM
         == (ZLIB_VER_MAJOR << 12)
@@ -282,15 +327,20 @@ const _: () = assert!(
 //    packing above lossless and the dotted spelling below unambiguous. Written as
 //    range patterns rather than pairs of comparisons: `RangeInclusive::contains` is
 //    not `const`, so the idiom clippy would otherwise ask for is unavailable here.
+/// cbindgen:ignore
 const _: () = assert!(matches!(ZLIB_VER_MAJOR, 0..=9));
+/// cbindgen:ignore
 const _: () = assert!(matches!(ZLIB_VER_MINOR, 0..=9));
+/// cbindgen:ignore
 const _: () = assert!(matches!(ZLIB_VER_REVISION, 0..=9));
+/// cbindgen:ignore
 const _: () = assert!(matches!(ZLIB_VER_SUBREVISION, 0..=9));
 
 // 3. The version string is exactly the fourteen bytes of "1.3.2.1-motley". A
 //    truncated or extended literal would otherwise pass every other check here.
 //    `to_bytes().len()` rather than `count_bytes()`: the latter is `const` only
 //    from Rust 1.81 and this workspace declares a 1.80 floor.
+/// cbindgen:ignore
 const _: () = assert!(ZLIB_VERSION.to_bytes().len() == 14);
 
 // 4. Its first byte is the major version digit. This is the byte `test/example.c`
@@ -298,6 +348,7 @@ const _: () = assert!(ZLIB_VERSION.to_bytes().len() == 14);
 //    makes `deflateInit_`, `inflateInit_` and `inflateBackInit_` return
 //    `Z_VERSION_ERROR`. Matched as a pattern rather than indexed, so the check
 //    needs neither `clippy::indexing_slicing` relief nor a panicking path.
+/// cbindgen:ignore
 const _: () = assert!(matches!(
     ZLIB_VERSION.to_bytes().first(),
     Some(&ZLIB_VER_MAJOR_DIGIT)
@@ -306,13 +357,15 @@ const _: () = assert!(matches!(
 // 5. `ZLIB_VER_MAJOR_DIGIT` really is `ZLIB_VER_MAJOR` rendered in ASCII, so
 //    assertion 4 is a statement about the declared major version and not merely
 //    about an unrelated byte that happens to be there.
+/// cbindgen:ignore
 const _: () = assert!(ZLIB_VER_MAJOR_DIGIT == b'0' + 1 && ZLIB_VER_MAJOR == 1);
 
 /// Returns the library's version string -- `zlib.h` L224.
 ///
-/// The pointer addresses [`ZLIB_VERSION`]: `'static`, NUL-terminated, never null,
-/// and the same address on every call. A caller may hold it indefinitely, compare
-/// it with `strcmp`, or print it.
+/// The pointer addresses [`ZLIB_VERSION`], by way of the crate-private
+/// `CHECKED_VERSION` -- spelled without a link because it is not part of the public
+/// surface: `'static`, NUL-terminated, never null, and the same address on every call.
+/// A caller may hold it indefinitely, compare it with `strcmp`, or print it.
 ///
 /// `zlib.h` L225-L229 documents what a caller is expected to do with it: compare
 /// it against the `ZLIB_VERSION` macro it was itself compiled against, because "if
@@ -329,6 +382,11 @@ const _: () = assert!(ZLIB_VER_MAJOR_DIGIT == b'0' + 1 && ZLIB_VER_MAJOR == 1);
 pub extern "C" fn zlibVersion() -> *const c_char {
     // No `unsafe`: `CStr::as_ptr` is a safe operation, and the `'static` lifetime
     // of the constant is what would otherwise have needed asserting by hand.
+    //
+    // The constant itself, whose five compile-time assertions above pin its length, its
+    // terminator, its numeric components and its major-version digit -- so what this
+    // export hands back is a string that could not have drifted from `zlib.h` L44
+    // without failing the build.
     panic_guard::guard(|| ZLIB_VERSION.as_ptr())
 }
 
@@ -367,6 +425,7 @@ const fn size_code(size: usize) -> uLong {
 /// codes are 1, 2, 2, 2 and the field total is `0xa9`; on LLP64 Windows `uLong` is
 /// four bytes and bits 2-3 become `1` instead, which is precisely why the value is
 /// derived rather than written down.
+/// cbindgen:ignore
 const SIZE_BITS: uLong = size_code(size_of::<uInt>())
     | (size_code(size_of::<uLong>()) << 2)
     | (size_code(size_of::<voidpf>()) << 4)
@@ -378,6 +437,7 @@ const SIZE_BITS: uLong = size_code(size_of::<uInt>())
 /// and `z_error` machinery, which this port replaces with ordinary Rust
 /// `debug_assert!`s and typed results rather than with a build switch of its own.
 /// There is no configuration of this crate that sets it.
+/// cbindgen:ignore
 const ZLIB_DEBUG_BIT: uLong = 0;
 
 /// Bit 10 -- `ZLIB_WINAPI` (`zutil.c` L67-L69).
@@ -385,6 +445,7 @@ const ZLIB_DEBUG_BIT: uLong = 0;
 /// Clear. The bit reports that the exported functions use the `WINAPI`
 /// (`__stdcall`) calling convention. Every export in this crate is declared
 /// `extern "C"`, on every target, so the answer is unconditional.
+/// cbindgen:ignore
 const ZLIB_WINAPI_BIT: uLong = 0;
 
 /// Bit 12 -- `BUILDFIXED` (`zutil.c` L70-L72).
@@ -395,6 +456,7 @@ const ZLIB_WINAPI_BIT: uLong = 0;
 /// L313-L352, which builds them on first use behind a `z_once_t` and, as
 /// `inftrees.c` L314-L319 warns, is not thread-safe without atomics -- is not
 /// implemented here at all.
+/// cbindgen:ignore
 const BUILDFIXED_BIT: uLong = 0;
 
 /// Bit 13 -- `DYNAMIC_CRC_TABLE` (`zutil.c` L73-L75).
@@ -407,20 +469,49 @@ const BUILDFIXED_BIT: uLong = 0;
 /// `get_crc_table()` before letting a second thread near `crc32()`. Const
 /// evaluation removes that requirement, and with it the `<stdatomic.h>` dependency
 /// `zutil.h` would otherwise carry.
+/// cbindgen:ignore
 const DYNAMIC_CRC_TABLE_BIT: uLong = 0;
 
 /// Bit 16 -- `NO_GZCOMPRESS` (`zutil.c` L76-L78).
 ///
-/// Clear. The bit reports that the `gz*` functions cannot compress, a size
-/// optimisation for callers who only ever read. `crates/zlib-rs/src/gz/write.rs`
-/// implements the write path in full, so the capability is present.
-const NO_GZCOMPRESS_BIT: uLong = 0;
+/// **Derived from the resolved feature set, not asserted.** `zlib.h` L1237-L1238
+/// defines the bit as "`gz*` functions cannot compress (to avoid linking deflate
+/// code when not needed)".
+///
+/// * With the default features, `crates/zlib-rs/src/gz/write.rs` implements the
+///   write path in full and the `gz*` exports are compiled, so the bit is clear.
+/// * With `--no-default-features` (or any build that leaves the `gz` feature off)
+///   the whole `gzFile` layer is compiled out, so no `gz*` function can compress --
+///   or do anything else -- and the bit is set. `NO_GZCOMPRESS` is the only flag
+///   `zlibCompileFlags` has for a missing `gz` layer; reporting the capability as
+///   present in a build that does not contain it would be a lie told to every
+///   caller that inspects the flags, which is the defect this derivation fixes.
+///
+/// One definition covers both cases deliberately: `cfg!()` is an expression, so the
+/// feature is read here rather than by duplicating the item under `#[cfg]`, and there
+/// is no configuration in which the name is declared twice.
+/// cbindgen:ignore
+const NO_GZCOMPRESS_BIT: uLong = if cfg!(feature = "gz") { 0 } else { 1 << 16 };
 
 /// Bit 17 -- `NO_GZIP` (`zutil.c` L79-L81).
 ///
-/// Clear. The bit reports that `deflate` cannot write gzip streams and `inflate`
-/// cannot detect or decode them. Both are implemented, including the automatic
-/// detection `inflateInit2_` enables for `windowBits + 32`.
+/// Clear, unconditionally, and the distinction from bit 16 above is the point: this
+/// bit is NOT about the `gzFile` layer.
+///
+/// `NO_GZIP` reports that **`deflate` cannot write gzip streams and `inflate`
+/// cannot detect or decode them** -- the RFC 1952 wrapper selected by a
+/// `windowBits` of 25-31, and the automatic detection `windowBits + 32` enables.
+/// In C that capability is compiled out by the `GZIP` macro in `deflate.c` and
+/// `inflate.c`, which has nothing to do with `gzread.c`/`gzwrite.c`.
+///
+/// In this port the wrapper lives in `crates/zlib-rs/src/{deflate,inflate}/**` and
+/// **no Cargo feature can remove it**: `zlib-rs` declares `default`, `rust-api`,
+/// `simd` and `std`, and not one of them gates gzip container support. So the
+/// capability is present in every configuration this crate can be built in,
+/// including `--no-default-features`, and a zero here is a derivation from the
+/// feature table rather than an assumption -- the `gz` feature that flips bit 16
+/// deliberately does not flip this one.
+/// cbindgen:ignore
 const NO_GZIP_BIT: uLong = 0;
 
 /// Bit 20 -- `PKZIP_BUG_WORKAROUND` (`zutil.c` L82-L84).
@@ -429,6 +520,7 @@ const NO_GZIP_BIT: uLong = 0;
 /// streams produced by a defective PKZip. The reference does not enable it by
 /// default and neither does this port, because doing so would accept input the
 /// reference rejects -- an observable behaviour change.
+/// cbindgen:ignore
 const PKZIP_BUG_WORKAROUND_BIT: uLong = 0;
 
 /// Bit 21 -- `FASTEST` (`zutil.c` L85-L87).
@@ -437,6 +529,7 @@ const PKZIP_BUG_WORKAROUND_BIT: uLong = 0;
 /// and a different `longest_match`, so a `FASTEST` build emits different bytes.
 /// This port implements the default configuration only, which is what the
 /// byte-identical-output requirement demands.
+/// cbindgen:ignore
 const FASTEST_BIT: uLong = 0;
 
 /// Bit 24 -- neither `STDC` nor `Z_HAVE_STDARG_H` (`zutil.c` L103-L104).
@@ -446,6 +539,7 @@ const FASTEST_BIT: uLong = 0;
 /// from the `va_list` forms to the fixed-argument ones. The variadic entry point
 /// this crate exports is the `stdarg` one, `gzvprintf` (`zlib.h` L2047), so the
 /// fallback branch has no counterpart here.
+/// cbindgen:ignore
 const SPRINTF_NOT_VARIADIC_BIT: uLong = 0;
 
 /// Bit 25 -- `NO_vsnprintf` together with `ZLIB_INSECURE` (`zutil.c` L89-L91,
@@ -456,6 +550,7 @@ const SPRINTF_NOT_VARIADIC_BIT: uLong = 0;
 /// the bounded path, and there is no `ZLIB_INSECURE` equivalent that could select
 /// the unbounded `vsprintf` -- reintroducing it would restore exactly the overflow
 /// class this port exists to remove.
+/// cbindgen:ignore
 const SPRINTF_INSECURE_BIT: uLong = 0;
 
 /// Bit 26 -- a void-returning formatter: `HAS_vsprintf_void`,
@@ -466,30 +561,49 @@ const SPRINTF_INSECURE_BIT: uLong = 0;
 /// inferred string length returned", the workaround for platforms whose
 /// `vsnprintf` returns nothing. Rust's formatting machinery always reports how much
 /// it wrote, so the length is measured rather than inferred.
+/// cbindgen:ignore
 const SPRINTF_RETURNS_VOID_BIT: uLong = 0;
 
 /// Bit 27 -- `NO_vsnprintf` without `ZLIB_INSECURE` (`zutil.c` L92-L93,
 /// L108-L109).
 ///
-/// Clear. `zlib.h` L1252 defines it as "0 = `gzprintf()` present, 1 = not -- 1
-/// means `gzprintf()` returns an error"; `gzwrite.c` L406-L412 and L505-L515 are the stub
-/// bodies such a build compiles. `gzprintf` is fully present here, and
-/// `crates/zlib-rs/src/gz/printf.rs` makes that a build-time guarantee rather than
-/// an intention.
-const GZPRINTF_UNAVAILABLE_BIT: uLong = 0;
+/// **Derived from the artifact, not asserted.** `zlib.h` L1252 defines it as
+/// "0 = `gzprintf()` present, 1 = not -- 1 means `gzprintf()` returns an error";
+/// `gzwrite.c` L406-L412 and L505-L515 are the stub bodies such a build compiles.
+///
+/// `gzprintf` and `gzvprintf` are variadic, so they cannot be *defined* in stable
+/// Rust; they are compiled from `csrc/gzprintf_shim.c` by the packaging layer
+/// (`Makefile.in`'s `rust` target), which archives the object into the staged
+/// library. That link happens after this constant is evaluated, so the packaging
+/// layer announces it with `ZLIB_RS_GZPRINTF_SHIM=1` and `build.rs` turns the
+/// announcement into `cfg(zlib_rs_gzprintf)`. Reading the cfg here is what ties the
+/// bit to the artifact rather than to an intention: `make rust` stages a library that
+/// has both symbols and reports the bit clear, while a bare `cargo build` -- which
+/// compiles no C at all -- produces one that has neither and reports it set. The
+/// `gz` feature off is the third configuration that omits them, and it needs no separate
+/// definition: `build.rs` refuses `ZLIB_RS_GZPRINTF_SHIM=1` unless both `libz-compat`
+/// and `gz` are on, so the cfg is necessarily absent there and this one expression
+/// reports the bit set.
+/// cbindgen:ignore
+const GZPRINTF_UNAVAILABLE_BIT: uLong = if cfg!(zlib_rs_gzprintf) { 0 } else { 1 << 27 };
 
 /// Bits 8-27: everything `zutil.c` derives from build configuration rather than
 /// from a type size.
 ///
-/// Every contribution is zero in this port, and each zero is a determination
-/// documented at its own constant rather than an omission. Combining them here,
-/// one name per line, is what makes the ladder auditable: enabling a
-/// configuration means editing exactly one constant, and the assertion below then
-/// checks that the constant landed on a legal bit.
+/// Every contribution is a determination documented at its own constant rather than
+/// an omission, and all but two of them are zero in every configuration. The two
+/// that are not -- [`NO_GZCOMPRESS_BIT`] (bit 16) and [`GZPRINTF_UNAVAILABLE_BIT`]
+/// (bit 27) -- are `cfg`-selected from the `gz` feature, so this total is a property
+/// of the build rather than a literal: `0` in the default configuration, and
+/// `0x0801_0000` in a `libz-compat`-without-`gz` build (bits 16 and 27). Combining them here, one
+/// name per line, is what makes the ladder auditable: enabling a configuration means
+/// editing exactly one constant, and the assertion below then checks that the
+/// constant landed on a legal bit.
 ///
 /// Bit 9 has no constant of its own on purpose -- see the module documentation:
 /// the C conditional that would set it is inside a block comment, so no build can
 /// reach it, and it is listed in [`FORBIDDEN_CONFIGURATION_BITS`] instead.
+/// cbindgen:ignore
 const CONFIGURATION_BITS: uLong = ZLIB_DEBUG_BIT
     | ZLIB_WINAPI_BIT
     | BUILDFIXED_BIT
@@ -528,20 +642,43 @@ const CONFIGURATION_BITS: uLong = ZLIB_DEBUG_BIT
 ///
 /// Every literal fits in 32 bits, so the mask is exact whether `uLong` is four
 /// bytes or eight.
+//
+// ★ `#[allow(dead_code)]` for the reason given at `ZLIB_VER_MAJOR_DIGIT` above: this
+// mask is used by the `const _: () = assert!(CONFIGURATION_BITS & … == 0)` item
+// immediately below, and rustc 1.80 does not see uses inside `const _` bodies. The
+// run-time test `no_configuration_bit_occupies_a_forbidden_position` reads it too,
+// but a `#[cfg(test)]` use does not satisfy the non-test build.
+#[allow(dead_code)]
+/// cbindgen:ignore
 const FORBIDDEN_CONFIGURATION_BITS: uLong =
     0x0000_00ff | 0x0000_0200 | 0x0000_0800 | 0x0000_c000 | 0x000c_0000 | 0x00c0_0000 | 0xf000_0000;
-
-// A configuration bit that strayed onto a size field, onto bit 9, or onto a
-// reserved position would make the library describe itself incorrectly to every
-// caller that inspects the flags. Checked at build time so it cannot ship.
-const _: () = assert!(CONFIGURATION_BITS & FORBIDDEN_CONFIGURATION_BITS == 0);
 
 /// The complete answer [`zlibCompileFlags`] returns, evaluated at compile time.
 ///
 /// The export cannot itself be `const fn` -- `const extern "C" fn` is not stable --
 /// but the value it returns is a constant, so the whole ladder is folded during
 /// compilation and the exported function is a single load of an immediate.
-const COMPILE_FLAGS: uLong = SIZE_BITS | CONFIGURATION_BITS;
+///
+/// ★ **The forbidden-bit check lives inside this initialiser, not beside it.** Two
+/// reasons, and the second is a hard requirement rather than a preference:
+///
+/// * The assertion cannot drift away from the value it guards. A bit that strayed onto
+///   a size field, onto bit 9, or onto a reserved position would make the library
+///   describe itself incorrectly to every caller that inspects the flags, and the
+///   check now runs as part of computing the very number that would carry the lie.
+/// * It keeps [`FORBIDDEN_CONFIGURATION_BITS`] a *used* constant on the declared
+///   1.80 MSRV. rustc 1.80's dead-code pass does not count a use that occurs only
+///   inside an anonymous `const _` item, so the mask -- referenced nowhere else
+///   outside `#[cfg(test)]` -- was reported as "never used" and, with warnings denied,
+///   failed the build. Current stable does count it, which is why the failure was
+///   MSRV-only. Reachability from the exported [`zlibCompileFlags`] is what makes it
+///   live on both.
+///
+/// cbindgen:ignore
+const COMPILE_FLAGS: uLong = {
+    assert!(CONFIGURATION_BITS & FORBIDDEN_CONFIGURATION_BITS == 0);
+    SIZE_BITS | CONFIGURATION_BITS
+};
 
 /// Returns a bit set describing how the library was built -- `zlib.h` L1216.
 ///
@@ -581,6 +718,7 @@ pub extern "C" fn zlibCompileFlags() -> uLong {
 // compile rather than silently truncate, which is the outcome to want. The rest of
 // the crate relies on the same equivalence, for instance where
 // `panic_guard::fallback` assigns `ReturnCode::as_i32()` to a `c_int`.
+/// cbindgen:ignore
 const _: () = assert!(size_of::<c_int>() == size_of::<i32>());
 
 /// The NUL-terminated mirror of the status-message table.
@@ -604,6 +742,7 @@ const _: () = assert!(size_of::<c_int>() == size_of::<i32>());
 /// only [`zError`] is.
 ///
 /// Ported from `z_errmsg[10]`, `zutil.c` L13-L24.
+/// cbindgen:ignore
 const Z_ERRMSG_C: [&CStr; 10] = [
     c"need dictionary",      // Z_NEED_DICT       2
     c"stream end",           // Z_STREAM_END      1
@@ -625,6 +764,7 @@ const Z_ERRMSG_C: [&CStr; 10] = [
 /// `"\0"`, and never `NULL`: a caller that hands [`zError`]'s result straight to
 /// `printf` must be safe for every possible input, including inputs no documented
 /// status code covers.
+/// cbindgen:ignore
 const EMPTY_MESSAGE: &CStr = c"";
 
 /// Maps any C `int` onto the NUL-terminated status message the reference pairs with
@@ -728,7 +868,9 @@ pub extern "C" fn zError(err: c_int) -> *const c_char {
 // would make `get_crc_table` below fail to compile -- and these two assertions are
 // the belt to that pair of braces, stating the width and alignment the C contract
 // actually depends on.
+/// cbindgen:ignore
 const _: () = assert!(size_of::<z_crc_t>() == size_of::<u32>());
+/// cbindgen:ignore
 const _: () = assert!(align_of::<z_crc_t>() == align_of::<u32>());
 
 /// Returns the byte-wise CRC-32 table -- `zlib.h` L2035.
@@ -951,6 +1093,22 @@ mod tests {
         );
     }
 
+    /// The gz-capability bits this build is expected to set: none with the `gz`
+    /// feature on, and bit 16 (`NO_GZCOMPRESS`) together with bit 27 (`gzprintf`
+    /// unavailable) with it off.
+    ///
+    /// Written as a helper rather than repeated in each test, so that the two
+    /// tests below and the implementation cannot drift from one another: this is
+    /// the same derivation `NO_GZCOMPRESS_BIT` and `GZPRINTF_UNAVAILABLE_BIT`
+    /// make, stated once, from the test side.
+    const fn expected_gz_bits() -> uLong {
+        if cfg!(feature = "gz") {
+            0
+        } else {
+            (1 << 16) | (1 << 27)
+        }
+    }
+
     #[test]
     fn the_flags_equal_the_reference_value_where_the_types_match_the_reference() {
         // Guarded on the measured widths rather than on `cfg`, so the test states
@@ -963,33 +1121,84 @@ mod tests {
             size_of::<voidpf>(),
             size_of::<z_off_t>(),
         );
-        if widths == (4, 8, 8, 8) {
+        if widths == (4, 8, 8, 8) && CONFIGURATION_BITS == 0 {
             assert_eq!(
                 zlibCompileFlags(),
-                REFERENCE_FLAGS_LP64,
-                "the reference C library returns 0xa9 for these type widths"
+                REFERENCE_FLAGS_LP64 | expected_gz_bits(),
+                "the reference C library returns 0xa9 for these type widths, plus \
+                 whichever gz-capability bits this feature set removes"
             );
         } else {
-            // Still a real assertion: whatever the widths, the configuration half
-            // must contribute nothing.
-            assert_eq!(zlibCompileFlags(), SIZE_BITS);
+            // Still a real assertion: whatever the widths, the two halves must be
+            // exactly the size codes plus this build's own content bits. The
+            // `CONFIGURATION_BITS == 0` guard above is what keeps 0xa9 as the claim
+            // for a full-featured build only -- a `--no-default-features` build
+            // legitimately sets bits 16 and 27, and reporting 0xa9 there would be
+            // the introspection defect this test now covers.
+            assert_eq!(zlibCompileFlags(), SIZE_BITS | CONFIGURATION_BITS);
         }
     }
 
     #[test]
-    fn every_configuration_bit_is_clear() {
-        // Enumerated one position at a time rather than asserted as a single zero,
-        // so a future build that sets one is reported by bit number.
+    fn every_configuration_bit_matches_this_builds_capabilities() {
+        // Enumerated one position at a time rather than asserted as a single value,
+        // so a future build that sets an unexpected one is reported by bit number.
+        // Bits 16 and 27 are the two this port derives rather than asserts, and each
+        // is checked against the same condition the implementation reads: the `gz`
+        // feature for the `gz*` layer, and `cfg(zlib_rs_gzprintf)` -- which `build.rs`
+        // sets only when `csrc/gzprintf_shim.c` was actually compiled in -- for
+        // `gzprintf`.
         let flags = zlibCompileFlags();
+        let expected = |bit: u32| -> uLong {
+            match bit {
+                16 => uLong::from(!cfg!(feature = "gz")),
+                27 => uLong::from(!cfg!(zlib_rs_gzprintf)),
+                _ => 0,
+            }
+        };
         for bit in [
-            8_u32, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            8_u32, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+            29, 30, 31,
         ] {
-            assert_eq!(flags >> bit & 1, 0, "bit {bit} should be clear");
+            assert_eq!(
+                flags >> bit & 1,
+                expected(bit),
+                "bit {bit} does not describe this build"
+            );
         }
-        for bit in [24_u32, 25, 26, 27, 28, 29, 30, 31] {
-            assert_eq!(flags >> bit & 1, 0, "bit {bit} should be clear");
+        assert_eq!(
+            CONFIGURATION_BITS,
+            (0..32).map(|bit| expected(bit) << bit).sum::<uLong>()
+        );
+    }
+
+    // The bit-27 claim above is a statement about the artifact, so it is checked
+    // against the artifact: when `cfg(zlib_rs_gzprintf)` is set, the two variadic
+    // symbols must really be linked into this binary, and taking their addresses is
+    // what proves it -- a missing definition is a link error rather than a test
+    // failure, which is the strongest form the check can take. `test/example.c`
+    // L153-L155 exercises the same two symbols for real, through
+    // `gzprintf(file, ", %s!", "hello")`.
+    #[cfg(zlib_rs_gzprintf)]
+    #[test]
+    fn the_variadic_shim_is_linked_when_the_flags_say_it_is() {
+        use crate::types::gzFile;
+        use core::ffi::{c_char, c_void};
+
+        extern "C" {
+            fn gzprintf(file: gzFile, format: *const c_char, ...) -> c_int;
+            fn gzvprintf(file: gzFile, format: *const c_char, va: *mut c_void) -> c_int;
         }
-        assert_eq!(CONFIGURATION_BITS, 0);
+
+        let printf: unsafe extern "C" fn(gzFile, *const c_char, ...) -> c_int = gzprintf;
+        let vprintf: unsafe extern "C" fn(gzFile, *const c_char, *mut c_void) -> c_int = gzvprintf;
+        // The assertion is the LINK, not the comparison: naming both symbols means
+        // this test binary cannot be produced unless the shim was compiled and
+        // linked, and `black_box` keeps the references from being optimised away
+        // before that happens. A null check would be the wrong instrument -- a
+        // function pointer is never null, and clippy says so.
+        core::hint::black_box((printf as *const c_void, vprintf as *const c_void));
+        assert_eq!(zlibCompileFlags() >> 27 & 1, 0);
     }
 
     #[test]

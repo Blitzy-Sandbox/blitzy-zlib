@@ -55,7 +55,9 @@
  * The PACKAGING layer compiles it, which is the same layer that already owns
  * the `zlib.map` relink -- and it has to, because `--version-script` cannot be
  * handed to rustc's own cdylib link at all (see the long measured comment
- * above `emit_version_script` in `crates/libz-rs-sys/build.rs`).  Concretely,
+ * above `reject_version_script_passthrough` in
+ * `crates/libz-rs-sys/build.rs`, which is where that request is now refused
+ * outright rather than emitted with a warning).  Concretely,
  * `Makefile.in`'s `rust` target:
  *
  *     $(CC) $(SFLAGS) $(ZINCOUT) -c -o gzprintf_shim.lo \

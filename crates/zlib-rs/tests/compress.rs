@@ -6,12 +6,16 @@
 //! numbers** rather than as plausible ranges:
 //!
 //! 1. **The bound.** `compress_bound`/`compress_bound_z` is a buffer-overflow
-//!    hazard, not a hint. A caller allocates from the returned value and then
-//!    writes into that allocation, so a bound one byte too small becomes a buffer
-//!    overflow **in caller code** -- which this library can neither detect nor
-//!    contain -- while a bound one byte too large breaks every caller and test
-//!    that asserts an exact size. Both directions are defects, so the only
-//!    acceptable assertion is equality against the reference's own output.
+//!    hazard, not a hint, and the two directions of error are not symmetric.
+//!    *Underestimating is a safety defect*: a caller allocates from the returned
+//!    value and then writes into that allocation, so a bound one byte too small
+//!    becomes a buffer overflow **in caller code**, which this library can neither
+//!    detect nor contain. *Overestimating is a parity defect*: `zlib.h` L768-L774
+//!    promises only an upper bound, so a larger answer merely wastes the caller's
+//!    memory and stays safe -- but this port must reproduce the reference's
+//!    numbers exactly, and a caller or test that asserts an exact size would see
+//!    the difference. So the assertion here is equality against the reference's
+//!    own output, which satisfies both requirements at once.
 //! 2. **The in/out accounting.** `uncompress2_z` reports *two* counts, and the
 //!    second one is easy to miss: `*sourceLen` comes back as the number of source
 //!    bytes **consumed** (`uncompr.c` L74), so `source + *sourceLen` addresses the
@@ -53,7 +57,8 @@
 //!
 //! Byte-for-byte equality against the C encoder over the whole
 //! level x `windowBits` x `memLevel` x strategy x flush matrix is a different
-//! job, belonging to the planned `crates/zlib-rs-differential`. What this suite
+//! job, belonging to `crates/zlib-rs-differential`, the crate that can link the C
+//! oracle; it has no test suite, so that equality is unverified. What this suite
 //! owns is the wrapper: the bound arithmetic, the chunking loop's shape, the
 //! bidirectional accounting, and the status ladder.
 //!
@@ -64,8 +69,9 @@
 //! cost of these tests is dominated not by payload size but by the **number of
 //! streams opened**: a compressor allocates its window, hash head and hash chain
 //! up front, so one round trip costs roughly the same whether the payload is 14
-//! bytes or 256. Measured on this toolchain, one round trip interprets in about
-//! eighteen seconds while two thousand bound evaluations interpret in under two.
+//! bytes or 256. Opening a stream is orders of magnitude more expensive under the
+//! interpreter than evaluating a bound, which is why the splits below are drawn on
+//! stream count and not on payload size.
 //!
 //! Two consequences shape the tests below, and both are about stream count rather
 //! than buffer size:
@@ -73,8 +79,8 @@
 //! * The level x corpus matrices are split. A reduced version -- levels
 //!   `{0, 1, 9, default}` against three payload classes -- runs unconditionally,
 //!   and the exhaustive version is `#[cfg_attr(miri, ignore)]`. Those skips are for
-//!   interpreter speed **only**: every one of them runs natively on `cargo test`,
-//!   and none is skipped in an ordinary CI run.
+//!   interpreter speed **only**: every one of them runs under an ordinary native
+//!   `cargo test`, and nothing else excludes them.
 //! * Every other test sweeps only the axis its own contract actually varies. A test
 //!   that two spellings of one function agree cannot be made stronger by varying
 //!   the payload, so it varies the level; a test that the bound is sufficient is
@@ -277,7 +283,7 @@ fn packed_with_preset_dictionary(source: &[u8]) -> Vec<u8> {
         );
         view.next_out
     };
-    check_err(deflate_end(state), "deflate_end");
+    check_err(deflate_end(&mut state), "deflate_end");
 
     stream.truncate(produced);
     stream

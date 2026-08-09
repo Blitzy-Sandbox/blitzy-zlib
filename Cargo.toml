@@ -20,14 +20,17 @@
 #                                 symbols.  `[lib] name = "z"` with
 #                                 crate-type = ["cdylib", "staticlib", "rlib"]
 #                                 makes Cargo write target/<profile>/libz.so and
-#                                 libz.a, which are INTENDED to become the
-#                                 drop-in replacements for the C build's
-#                                 artifacts.  That is the contract, not an
-#                                 achieved state: at this checkpoint the crate
-#                                 root src/lib.rs has not been written, so it
-#                                 exports nothing, `cargo metadata` cannot even
-#                                 load this workspace, and no drop-in claim
-#                                 anywhere in this tree has been demonstrated.
+#                                 libz.a, and its build script stages
+#                                 libz.so.1 and libz.so.1.3.2.1-motley beside
+#                                 them so that a consumer cannot silently bind
+#                                 the system libz instead.  Measured on those
+#                                 artifacts: SONAME libz.so.1 and 96 exported
+#                                 function symbols.  They are the BASE of the
+#                                 drop-in rather than the finished article --
+#                                 the 16 symbol-version nodes and the two
+#                                 C-variadic gz entry points come from the
+#                                 packaging relink, `make rust`, for reasons
+#                                 set out in crates/libz-rs-sys/Cargo.toml.
 #
 #   crates/zlib-rs-differential  Dev-only oracle harness.  Its build script
 #                                compiles the in-tree C translation units with `cc`
@@ -69,14 +72,32 @@
 #  feature: libz-compat".  Writing `-p libz-rs-sys` says what is meant and is
 #  valid either way.
 #
-#  NONE OF THESE RUN YET.  Every command above needs `cargo metadata` to succeed
-#  first, and it does not: `crates/libz-rs-sys/src/lib.rs` has not been written,
-#  so cargo reports `can't find library 'z', rename file to 'src/lib.rs' or
-#  specify lib.path` and exits before any of them starts.  Additionally,
-#  `crates/zlib-rs-differential` declares three `[[bench]]` targets at
-#  `benches/*.rs` that do not exist yet, so `--workspace --all-targets` and
-#  `cargo fmt --all` fail on target resolution independently of that.  Treat this
-#  list as the intended entry points and re-verify each one as those files land.
+#  WHAT THE SECOND COMMAND DOES NOT GIVE YOU.  All of the above run, but
+#  `cargo build --release -p libz-rs-sys --features libz-compat` produces an
+#  INTERMEDIATE, not an installable drop-in.  Measured with
+#  `nm -D --defined-only --extern-only`, that cdylib publishes 96 dynamic globals
+#  where the reference `libz.so.1.3.2.1-motley` publishes 111; it has no
+#  symbol-version nodes, because rustc attaches a version script of its own and
+#  `zlib.map` cannot be added alongside it; it lacks `gzprintf` and `gzvprintf`,
+#  which are variadic and come from `crates/libz-rs-sys/csrc/gzprintf_shim.c`; and
+#  it exports `inflate_table` and two `_zlib_rs_gzprintf_*` helpers that
+#  `zlib.map` hides.  The library fit to install is relinked from `libz.a` plus
+#  that shim under `zlib.map`, with a symbol-parity gate against `zlib.h` and
+#  `zlib.map` themselves -- and against the C library's own table when one has been
+#  built -- by:
+#
+#    make rust                                                # stage the drop-in
+#    make rust-test                                           # link + run the C drivers
+#    make rust-symbols                                        # diff against a built C libz
+#
+#  `./configure` is NOT a prerequisite for those three.  `Makefile.in` composes the
+#  shared-object link from its own RUSTLDSHARED and RUSTSHAREDFLAG defaults and
+#  names the staged library from the ZLIB_VERSION in zlib.h, so the SONAME, the
+#  versioned chain and the 16 version nodes are all correct on an unconfigured tree;
+#  the checked-in placeholder `Makefile` therefore FORWARDS these targets instead of
+#  refusing them.  What `./configure` adds is the C oracle build, which
+#  `make rust-symbols` compares against.
+
 #
 # Companion configuration, all of which lives beside this file and is expected to
 # stay consistent with it: rust-toolchain.toml (channel), clippy.toml (`msrv` —
@@ -101,16 +122,15 @@ resolver = "2"
 #   * `fuzz`     — excluded below; it is a cargo-fuzz crate with its own
 #                  dependencies and its own profile requirements.
 #   * `benches`  — a bare directory of bench sources, not a package.  A virtual
-#                  manifest cannot own bench targets, so the three suites planned
-#                  for benches/*.rs are hosted by crates/zlib-rs-differential,
-#                  which declares them as [[bench]] entries with
-#                  `path = "../../benches/<name>.rs"` and `harness = false` and
-#                  takes `criterion` as a dev-dependency.  That crate is the
-#                  correct host because all three benchmarks measure the Rust
-#                  implementation against the C oracle it builds.  Do not add a
-#                  fourth member for it, and do not move the directory once it
-#                  exists — it does not exist yet, which is why those three
-#                  [[bench]] entries currently fail target resolution.
+#                  manifest cannot own bench targets, so benches/*.rs belongs to
+#                  crates/zlib-rs-differential, which takes `criterion` as a
+#                  dev-dependency and is the correct host because every benchmark
+#                  measures the Rust implementation against the C oracle that
+#                  crate builds.  The directory is absent, and so are the matching
+#                  [[bench]] entries: an entry naming a missing file breaks every
+#                  cargo invocation that enumerates targets, so the entries belong
+#                  in the same change as the files.  Do not add a fourth member
+#                  for it, and do not move the directory once it exists.
 members = [
     "crates/zlib-rs",
     "crates/libz-rs-sys",
@@ -298,8 +318,9 @@ version_script = "zlib.map"
 # shared library with `nm -D --defined-only --extern-only`: 95 function symbols
 # (type T) plus the 16 symbol-version nodes (type A) declared in zlib.map.  They
 # are the target the Rust library has to match, recorded here so the parity diff
-# has a fixed baseline to compare against; they are not a measurement of the Rust
-# library, which exports nothing yet.
+# has a fixed baseline to compare against.  They describe the C library, not the
+# Rust one: only `make rust-symbols` measures the Rust side, and nothing runs it
+# automatically.
 exported_symbols = 111
 exported_functions = 95
 symbol_version_nodes = 16
@@ -320,6 +341,10 @@ symbol_version_nodes = 16
 #   * `libfuzzer-sys`, `arbitrary` — they belong to the excluded fuzz/ crate.
 #   * `cbindgen`, `cargo-fuzz`, `cargo-deny` — command-line tools, installed with
 #     `cargo install --locked`, never manifest dependencies.
+#   * `criterion`, `libc` — declared by the AAP but not yet used by any target.
+#     The long note in the table below records why each is withheld and exactly
+#     what brings it back; criterion's absence is also what keeps the declared
+#     1.80 MSRV resolvable, so read it before adding either.
 
 [workspace.dependencies]
 # The safe core, consumed by the facade and by the differential harness.  Cargo
@@ -336,20 +361,53 @@ zlib-rs = { path = "crates/zlib-rs", version = "1.3.2" }
 # [dependencies] or [build-dependencies] of a shipped crate.
 cc = "1.4.0"
 
-# Dev-dependency of crates/zlib-rs-differential, to back the three criterion
-# suites planned for benches/.  That directory does not exist yet.
-criterion = "0.8.2"
-
-# Optional, and for crates/libz-rs-sys only — used solely where a platform type or
-# a raw syscall in the gz layer cannot be expressed with std::fs / std::io.  The
-# `0.2` requirement is deliberate: the newest thing published on this crate is the
-# pre-release 1.0.0-alpha.4, and a looser requirement risks resolving to an
-# incompatible line.
+# DELIBERATELY ABSENT: criterion, and libc.
 #
-# `optional = true` CANNOT be set here — cargo rejects it with "libc is optional,
-# but workspace dependencies cannot be optional".  The consuming crate writes
-# `libc = { workspace = true, optional = true }` instead.
-libc = "0.2.189"
+# criterion 0.8.2 (AAP §0.5.1.3) is the pinned harness for the three benchmark
+# suites AAP §0.3.1 places at `benches/`.  That directory does not exist, no
+# `[[bench]]` target is declared anywhere in the workspace, and no source file
+# names the crate -- so the edge would gate nothing while imposing a real cost,
+# and it is not declared until the suites land.  The cost is not hypothetical, it
+# is the reason this entry is a comment:
+#
+#   criterion 0.8.2 declares `rust-version = "1.86"` and reaches clap 4.6.5,
+#   whose clap_builder/clap_lex declare `edition = "2024"`.  Cargo 1.80 cannot
+#   parse an edition-2024 manifest, so ANY command that resolves the whole
+#   workspace dev graph -- `cargo +1.80 metadata`, `cargo +1.80 check --tests`,
+#   `--all-targets` -- fails outright:
+#     error: failed to download `clap_builder v4.6.5` … the package requires the
+#            Cargo feature called `edition2024`, but that feature is not
+#            stabilized in this version of Cargo (1.80.1)
+#   With the edge present the workspace advertised `rust-version = "1.80"` while
+#   being unresolvable by that very toolchain.  It also duplicated `syn` (2.x for
+#   the older proc-macro graph, 3.x for the newer one) in the committed lock.
+#
+# WHERE THE SUITES MUST LAND, so the 1.80 promise stays true.  criterion's floor
+# is a property of criterion, not something this workspace can wish away, so the
+# benchmark package must NOT inherit `[workspace.package] rust-version`.  Either
+# of these is correct; the second matches what `fuzz/` already does:
+#
+#   1. a workspace member that sets its own `rust-version = "1.86"` (and does not
+#      write `rust-version.workspace = true`), carrying `criterion = "0.8.2"` in
+#      its `[dev-dependencies]` and the `[[bench]]` entries; or
+#   2. a package listed in `exclude` above, with its own Cargo.lock and its own
+#      deny.toml, exactly as `fuzz/` is isolated today.
+#
+# Either way the MSRV gate keeps naming the shipped packages explicitly --
+#   cargo +1.80 check --locked -p zlib-rs -p libz-rs-sys --all-features --all-targets
+#   cargo +1.80 rustc --locked -p libz-rs-sys --all-features -- -D warnings
+# -- because 1.80 is a promise that the two crates that SHIP compile on that
+# compiler, and criterion reaches neither of them.  Clippy is not part of that gate:
+# clippy 1.80 denies 28 things clippy 1.97 does not, all lint drift rather than code
+# defects.  `crates/zlib-rs-differential/Cargo.toml` records the measured list.
+#
+# libc 0.2.189 (AAP §0.5.1.3) was an OPTIONAL dependency of crates/libz-rs-sys,
+# for the case where "a platform type or a raw syscall in the gz layer cannot be
+# expressed with std::fs / std::io".  No such case arose: the gz layer is written
+# entirely against `std::fs`/`std::io` and every C type in the ABI surface comes
+# from `core::ffi`.  The note in `crates/libz-rs-sys/Cargo.toml` `[features]`
+# records the exact two lines that bring it back, pinned to the `0.2` line,
+# should a target ever need it.
 
 # Lints.  Member crates opt in with:
 #
@@ -445,6 +503,36 @@ todo = "deny"
 unimplemented = "deny"
 unreachable = "deny"
 exit = "deny"
+
+# Every `unsafe` block must state the invariant that discharges it, in a `// SAFETY:`
+# comment the compiler can see.  AAP 0.7.1(a) requires that "every block bears a
+# `// SAFETY:` comment naming its invariant", and this is the mechanical half of that
+# rule: crates/zlib-rs carries #![forbid(unsafe_code)] so nothing can fire there, and
+# crates/libz-rs-sys is the one crate where blocks legitimately exist -- roughly three
+# hundred of them across the FFI boundary and its tests.  Reviewing that many by eye is
+# not a control; this is.
+#
+# It applies to TEST code as well as library code, deliberately: a test that drives raw
+# pointers across the C ABI is exactly where an unstated assumption hides, and this
+# crate's own tests construct hostile inputs on purpose.  Where the same call is
+# repeated many times the invariant is stated once on a helper -- a named call gate --
+# that owns the single unsafe block, rather than copied onto every call site.
+#
+# It is a `restriction`-group lint, so neither `clippy::all` nor `clippy::pedantic`
+# enables it and it has to be named here.  Declared at the WORKSPACE level rather than
+# as a crate attribute for two reasons: the facade's own crate root documents that lint
+# levels live in this file and must not be restated per crate, and a crate attribute
+# would not reach the integration-test crates under crates/*/tests, which are separate
+# compilation units with their own roots.
+#
+# Placement matters when writing a block, and the rule is worth knowing before the
+# build tells you: clippy accepts the comment directly above the block, or above the
+# *statement* the block is the whole initialiser of.  A comment above an enclosing `if`,
+# `for` or `match`, or above an `assert_eq!` whose argument happens to contain the
+# block, does NOT count -- bind the expression to a `let` and comment that instead.
+# Every site in this workspace has been written that way; do not answer a new report by
+# adding an `#[allow]`.
+undocumented_unsafe_blocks = "deny"
 
 # `clippy::arithmetic_side_effects` is deliberately NOT enabled.  Every hash update,
 # window slide, bit-buffer accumulation and code-length computation in the reference

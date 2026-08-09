@@ -124,7 +124,7 @@ use crate::trees::{_tr_flush_block, flush_bits};
 ///
 /// `deflate/mod.rs` re-exports this again as `crate::deflate::Flush`, which is the path
 /// `crates/zlib-rs/src/compress.rs`, `crates/zlib-rs/src/gz/write.rs` and
-/// the planned `crates/libz-rs-sys/src/deflate.rs` use. That second re-export is why this one is `pub`
+/// `crates/libz-rs-sys/src/deflate.rs` use. That second re-export is why this one is `pub`
 /// and not `pub(crate)`: a `pub use` of a crate-public item is `E0365`, "`Flush` is only
 /// public within the crate, and cannot be re-exported outside". Nothing escapes as a result,
 /// because `deflate/mod.rs` declares this module itself as `pub(crate) mod algorithm;`.

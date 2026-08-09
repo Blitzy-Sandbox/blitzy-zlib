@@ -36,10 +36,11 @@
 //! the former into aliases of the latter (`zlib.h` L2002-L2003).
 //! `crc32_combine_op` takes `uLong` and needs no variant at all.
 //!
-//! That duality is a C header concern, and the planned
-//! `crates/libz-rs-sys/src/checksum.rs` is where it is to be resolved: that crate owns
-//! the C types and is to perform every
-//! width conversion. This module models a length as `i64` -- the widest form
+//! That duality is a C header concern, and `crates/libz-rs-sys/src/checksum.rs` is where
+//! it is resolved: that crate owns the C types and performs every width conversion,
+//! exporting `crc32_combine`/`crc32_combine_gen` over `z_off_t` and
+//! `crc32_combine64`/`crc32_combine_gen64` over `z_off64_t`.
+//! This module models a length as `i64` -- the widest form
 //! `z_off64_t` takes on any target (`zconf.h` L523-L531) -- and a check value
 //! as `u32`, and it implements each operation exactly once. The narrow-length
 //! entry points below are one-line delegations, precisely as `crc32.c`
@@ -287,8 +288,8 @@ pub(crate) fn x2nmodp(mut n: u64, mut k: u32) -> u32 {
 /// Mirrors `crc32_combine_gen64` at `crc32.c` L953-L961. This is the one
 /// implementation behind both exported C symbols, `crc32_combine_gen`
 /// (`zlib.h` L1884) and `crc32_combine_gen64` (`zlib.h` L1984);
-/// the planned `crates/libz-rs-sys/src/checksum.rs` will widen the caller's `z_off_t`
-/// or `z_off64_t` to the `i64` taken here.
+/// `crates/libz-rs-sys/src/checksum.rs` widens the caller's `z_off_t` or
+/// `z_off64_t` to the `i64` taken here.
 ///
 /// The operator is `x^(8 * len2) mod p(x)`. Hand it to `crc32_combine_op`
 /// along with two check values; computing it once and reusing it is the entire
@@ -320,9 +321,9 @@ pub fn crc32_combine_gen64(len2: i64) -> u32 {
 /// Return the combination operator for a second sequence of `len2` bytes.
 ///
 /// Mirrors `crc32_combine_gen` at `crc32.c` L963-L966, which is nothing
-/// but a widening cast onto `crc32_combine_gen64`. It is retained here so that
-/// the planned `crates/libz-rs-sys/src/checksum.rs` will have a core function per
-/// exported C symbol, and so that a reader tracing `crc32_combine_gen` out of `zlib.h`
+/// but a widening cast onto `crc32_combine_gen64`. It is retained so that
+/// `crates/libz-rs-sys/src/checksum.rs` has a core function per exported C symbol,
+/// and so that a reader tracing `crc32_combine_gen` out of `zlib.h`
 /// L1884 lands somewhere. The width conversion itself belongs to the facade;
 /// by the time a length arrives here it is already `i64`.
 ///
@@ -401,7 +402,7 @@ pub fn crc32_combine64(crc1: u32, crc2: u32, len2: i64) -> u32 {
 /// Mirrors `crc32_combine` at `crc32.c` L980-L983, which is nothing but a
 /// widening cast onto `crc32_combine64`. It is retained for the same reason
 /// `crc32_combine_gen` is: one core function per exported C symbol, so that
-/// the planned `crates/libz-rs-sys/src/checksum.rs` can wire up `zlib.h` L1874 without having
+/// `crates/libz-rs-sys/src/checksum.rs` wires up `zlib.h` L1874 without having
 /// to know that the two C entry points share an implementation. The width
 /// conversion belongs to the facade; a length reaching here is already `i64`.
 ///

@@ -23,7 +23,9 @@
 //!
 //! * Reading two window regions at once — what `longest_match` does with `scan` and `match`
 //!   (`deflate.c` L1391 and L1436) — is two *shared* borrows, which Rust permits directly.
-//!   [`Window::scan_pair`] hands both out after one bounds check.
+//!   [`Window::scan_pair`] hands both out after one bounds check, and [`Window::region`] hands
+//!   out one. `longest_match` reaches for the second of those inside its chain walk, because the
+//!   scan view is loop-invariant and only the candidate's view changes.
 //! * Appending to the window is one *exclusive* borrow of exactly the free space
 //!   ([`Window::free_space_mut`]), so the `read_buf` destination pointer
 //!   (`deflate.c` L311) disappears.
@@ -106,6 +108,8 @@
 // keeps the same lint gate passing on both toolchains. The same relaxation, for the same reason,
 // already appears in `config.rs`, `deflate/**`, `inflate/**` and `gz/**`.
 #![allow(clippy::module_name_repetitions)]
+
+use core::cell::Cell;
 
 /// Tail of the hash chains, and therefore also the "no match here" sentinel.
 ///
@@ -837,11 +841,16 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Window<S> {
     /// Two shared views of the window, `len` bytes each, for comparing a candidate match
     /// against the current string.
     ///
-    /// This is the whole of what `longest_match` needs from the window: `scan = s->window +
-    /// s->strstart` (`deflate.c` L1391) and `match = s->window + cur_match`
-    /// (`deflate.c` L1436) are two *read* pointers into one buffer, which in Rust is simply
-    /// two shared borrows — they may overlap, and for a hash-chain candidate at
+    /// `scan = s->window + s->strstart` (`deflate.c` L1391) and `match = s->window + cur_match`
+    /// (`deflate.c` L1436) are two *read* pointers into one buffer, which in Rust is simply two
+    /// shared borrows — they may overlap, and for a hash-chain candidate at
     /// `cur_match < strstart` they always do.
+    ///
+    /// Note which caller wants this shape. `longest_match` takes the pair once, to establish both
+    /// views, and then re-derives only the candidate's view per link with [`Window::region`]: the
+    /// scan view cannot change during a chain walk, so re-deriving it would be a bounds check per
+    /// link for a value that is already in hand. This method remains the right shape whenever both
+    /// views are genuinely new, and it is the one that states the overlap is permitted.
     ///
     /// Pass `len = MAX_MATCH + 1`: the comparison reads `scan[best_len]` where
     /// `best_len < MAX_MATCH` (`deflate.c` L1413-L1414) and the unrolled loop can reach
@@ -1074,6 +1083,20 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Window<S> {
     #[inline]
     pub fn into_inner(self) -> S {
         self.buf
+    }
+
+    /// Borrows the wrapped buffer in place, so the owner can release it *without*
+    /// moving it.
+    ///
+    /// ★ The distinction is not stylistic. Moving a block into a function -- which
+    /// [`Self::into_inner`] followed by `drop` does -- puts the borrow it carries in
+    /// argument position, where it is protected for the whole call; freeing memory a
+    /// protected reference covers is undefined behaviour. Releasing through this
+    /// borrow keeps the block where it is, so nothing protects the memory when the
+    /// allocator frees it. See `zlib_rs::allocate::ForeignBlock`.
+    #[inline]
+    pub fn inner_mut(&mut self) -> &mut S {
+        &mut self.buf
     }
 }
 
@@ -1359,6 +1382,16 @@ impl<S: AsRef<[u16]> + AsMut<[u16]>> HashChains<S> {
     pub fn into_inner(self) -> (S, S) {
         (self.head, self.prev)
     }
+
+    /// Borrows the wrapped `head` and `prev` buffers in place, in that order, so the
+    /// owner can release them without moving them.
+    ///
+    /// The order is `deflate.c` L1302-L1303's, and the borrow rather than the move is
+    /// for the reason [`PendingBuf::inner_mut`] gives.
+    #[inline]
+    pub fn inner_mut(&mut self) -> (&mut S, &mut S) {
+        (&mut self.head, &mut self.prev)
+    }
 }
 
 /// The overlaid pending-output and symbol buffer.
@@ -1615,6 +1648,45 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> PendingBuf<S> {
         };
         // Both slices are `take` bytes long by construction, so this cannot panic.
         dst.copy_from_slice(chunk);
+        self.pending = end;
+        take
+    }
+
+    /// The [`PendingBuf::append`] counterpart for a source the caller may mutate.
+    ///
+    /// ★ **This exists because the gzip extra field belongs to the application.**
+    /// `deflateSetHeader` records a pointer into the caller's own memory
+    /// (`deflate.c` L717) and the `FEXTRA` state copies from it during a later
+    /// `deflate()` (L1123-L1125), so the borrow the core holds is over storage that a
+    /// C caller may legitimately write between the two calls. A `&[u8]` would promise
+    /// the opposite and make that write undefined behaviour, so the header views hold
+    /// `&[Cell<u8>]` instead -- and a `Cell` slice cannot be `copy_from_slice`d,
+    /// because reading it has to go through [`Cell::get`].
+    ///
+    /// Byte-at-a-time rather than a bulk copy, which is not a performance concern
+    /// worth avoiding: the extra field is at most 65535 bytes and is copied once per
+    /// stream, against a compressor that touches every input byte many times.
+    ///
+    /// Returns how many bytes were written, exactly as [`PendingBuf::append`] does; a
+    /// short return means the buffer filled and the caller must flush and come back.
+    #[inline]
+    pub fn append_cells(&mut self, src: &[Cell<u8>]) -> usize {
+        let take = src.len().min(self.room());
+        let Some(chunk) = src.get(..take) else {
+            return 0;
+        };
+        let start = self.pending;
+        let Some(end) = start.checked_add(take) else {
+            return 0;
+        };
+        let Some(dst) = self.buf.as_mut().get_mut(start..end) else {
+            return 0;
+        };
+        // Both slices are `take` bytes long by construction, so `zip` visits every
+        // destination byte exactly once and no index can be out of range.
+        for (slot, byte) in dst.iter_mut().zip(chunk) {
+            *slot = byte.get();
+        }
         self.pending = end;
         take
     }
@@ -1999,6 +2071,13 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> PendingBuf<S> {
     #[inline]
     pub fn into_inner(self) -> S {
         self.buf
+    }
+
+    /// Borrows the wrapped buffer in place, so the owner can release it without moving
+    /// it -- for the reason [`PendingBuf::inner_mut`] gives.
+    #[inline]
+    pub fn inner_mut(&mut self) -> &mut S {
+        &mut self.buf
     }
 }
 

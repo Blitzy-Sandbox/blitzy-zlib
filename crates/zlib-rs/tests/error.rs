@@ -45,16 +45,15 @@
 //! `#[cfg(test)] mod tests` block inside `crates/zlib-rs/src/error.rs`**, which
 //! lives in the crate and can see both. That split is deliberate. Widening the
 //! array's visibility in order to move those assertions into this file would
-//! break the hidden-symbol contract that the symbol-parity test in
-//! `crates/libz-rs-sys/tests` enforces against the reference library's export
-//! list.
+//! break the hidden-symbol contract `zlib.map` states and `Makefile.in`'s
+//! `rust-symbols` target checks against the reference library's export list.
 //!
 //! # Constraints this file is written to
 //!
 //! * **No `unsafe`, and no FFI.** The crate under test carries
-//!   `#![forbid(unsafe_code)]`. Raw-pointer and C-ABI behaviour is the business
-//!   of `crates/libz-rs-sys/tests`; needing an escape hatch here would mean
-//!   testing the wrong crate.
+//!   `#![forbid(unsafe_code)]`. Raw-pointer and C-ABI behaviour belongs to the
+//!   facade crate and its own `#[cfg(test)]` modules; needing an escape hatch
+//!   here would mean testing the wrong crate.
 //! * **No third-party crates.** `crates/zlib-rs/Cargo.toml` has an empty
 //!   `[dependencies]` table and declares no `[dev-dependencies]`, and the
 //!   `[bans]` section of `deny.toml` names that table as the enforcement point.
