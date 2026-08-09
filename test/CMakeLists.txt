@@ -1,3 +1,38 @@
+# ============================================================================
+# the CTest suite
+# ============================================================================
+#
+# Every executable below links ZLIB::ZLIB or ZLIB::ZLIBSTATIC and nothing else,
+# and the root CMakeLists.txt decides which implementation those two names
+# denote: the C library by default, or -- with -DZLIB_BUILD_RUST=ON -- the
+# memory-safe Rust library staged from crates/libz-rs-sys.  Re-pointing those
+# two aliases is the entire mechanism by which this suite runs against either
+# implementation, and it is why no case here needs a Rust counterpart: with the
+# option ON, zlib_example, zlib_example64, zlib_static_example,
+# zlib_static_example64 and zlib_coverage ARE the Rust-linked cases, as are the
+# three find_package fixtures further down, which consume what was installed.
+# The absence of `_rust'-suffixed targets is deliberate rather than work left
+# undone -- a second case linking the same target the first one already links
+# would add no coverage, while a second example.c writing the same foo.gz would
+# add a race under `ctest -j' -- so a reader looking for them should look at the
+# alias instead.  The two add_subdirectory fixtures are the one exception and
+# say so at their own definitions.
+#
+# example.c, minigzip.c and infcover.c are compiled from the same sources, with
+# the same definitions, whichever implementation is behind the alias.  That
+# invariance is the point rather than an accident of how this file is written: a
+# consumer of zlib needs no edit and no recompilation, so a test driver that
+# needed one would disprove the very thing it exists to demonstrate.
+#
+# Nothing here declares an include directory of its own.  `zlib.h', the
+# generated `zconf.h' and, where the platform has off64_t,
+# `_LARGEFILE64_SOURCE=1' all arrive as usage requirements of the target behind
+# the alias, and both implementations publish them -- the C targets and the
+# imported Rust ones alike.  So if a driver ever fails to find a header or stops
+# seeing the *64 declarations, that interface is what is wrong. Compensating for
+# it here with target_include_directories or an extra definition would hide a
+# root CMakeLists.txt defect and could compile a driver against headers other
+# than the ones the library was built from; it belongs fixed there.
 function(ZLIB_findTestEnv testName)
     set(testEnv "PATH=")
 
@@ -35,6 +70,18 @@ if(ZLIB_BUILD_SHARED)
         OR MINGW
         OR CYGWIN)
 
+    # This case and zlib_static_example64 below take their large-file character
+    # entirely from the `_LARGEFILE64_SOURCE=1' the library target propagates,
+    # never from a flag of their own: zconf.h L504-L505 turns that into
+    # Z_LARGE64, under which zlib.h L1977-L1986 declares gzopen64, gzseek64,
+    # gztell64, gzoffset64, adler32_combine64, crc32_combine64 and
+    # crc32_combine_gen64 in addition to the unsuffixed family, so a driver
+    # compiled this way requires BOTH families to resolve.  That is the whole
+    # value of these two cases and it is why -D_FILE_OFFSET_BITS=64 is
+    # deliberately absent: it would select zconf.h L508-L509's Z_WANT64
+    # redirect, where the unsuffixed names become macros for the *64 ones and
+    # the unsuffixed symbols are no longer referenced at all.  That is a
+    # different case, covered by Makefile.in's example64 and minigzip64.
     if(HAVE_OFF64_T)
         add_executable(zlib_example64 example.c)
         target_compile_definitions(
@@ -55,6 +102,49 @@ if(ZLIB_BUILD_SHARED)
             OR MINGW
             OR CYGWIN)
     endif(HAVE_OFF64_T)
+
+    # Which library was actually loaded is not something the cases above can
+    # check.  ZLIB_BUILD_RUST stages libz.so.<ZLIB_VERSION> together with the
+    # libz.so.1 and libz.so links to it, and libz.so.1 -- the SONAME, recorded
+    # in this executable -- is the name the loader searches for.  Should that
+    # link ever be missing the loader does not fail: it keeps searching and
+    # binds the system libz, silently.  Nothing inside the process can tell,
+    # because the port returns the same ZLIB_VERSION the header declares, so
+    # example.c's own version check passes either way and the suite would report
+    # success while exercising a library this build did not produce.  Hence the
+    # binding itself is asserted, which Makefile.in's `rust-test' target does
+    # the same way for the autotools build.
+    #
+    # ldd is probed, never required: without it, or on a platform whose loader
+    # is not ELF, the case is simply not registered.  A C build never reaches
+    # this block at all, so no configuration acquires a new tool because of it.
+    if(ZLIB_BUILD_RUST
+       AND UNIX
+       AND NOT APPLE)
+        find_program(LDD_EXECUTABLE ldd)
+
+        if(LDD_EXECUTABLE)
+            add_test(NAME zlib_rust_loader_binding
+                     COMMAND ${LDD_EXECUTABLE} $<TARGET_FILE:zlib_example>)
+            # The pass expression is what keeps the case from being vacuous: an
+            # unresolved `libz.so.1 => not found' matches nothing and fails,
+            # rather than passing because the fail expression found nothing to
+            # object to.  The fail expression is the failure that was actually
+            # observed while porting -- the SONAME resolving into a system
+            # prefix -- and it is anchored to the resolved path so that a build
+            # directory of any name is accepted.  Both are plain strings: a test
+            # property is not generator-expression territory, which is also why
+            # neither can name the staged directory.
+            set_tests_properties(
+                zlib_rust_loader_binding
+                PROPERTIES PASS_REGULAR_EXPRESSION "libz\\.so\\.1 => /"
+                           FAIL_REGULAR_EXPRESSION
+                           "libz\\.so\\.1 => /(usr/)?lib")
+        endif(LDD_EXECUTABLE)
+    endif(
+        ZLIB_BUILD_RUST
+        AND UNIX
+        AND NOT APPLE)
 endif(ZLIB_BUILD_SHARED)
 
 if(ZLIB_BUILD_STATIC)
@@ -92,6 +182,39 @@ if(ZLIB_BUILD_STATIC)
             set(llvm_option "gcov")
         endif(${CMAKE_C_COMPILER_ID} STREQUAL "Clang")
 
+        # infcover.c is not an ordinary consumer of the public API: it defines
+        # ZLIB_INTERNAL and includes the private inftrees.h and inflate.h
+        # (L16-L18), fills every allocation with 0xa5 instead of zeroes (L87) so
+        # that anything assuming zeroed memory is caught, detects leaks,
+        # non-LIFO frees and rogue frees through the zalloc/zfree hooks it
+        # injects, forces Z_MEM_ERROR at chosen points with mem_limit(), writes
+        # DICT straight into ((struct inflate_state *)strm.state)->mode (L330),
+        # reads sizeof(struct inflate_state) (L428) and calls inflate_table()
+        # itself (L632, L636).  Three requirements on whichever library is
+        # behind the alias follow from that, and they hold for the Rust library
+        # as much as for the C one: inflate_table has to be a linkable global in
+        # the archive, struct inflate_state has to be layout-compatible, and the
+        # whole inflate and inflateBack surface this driver reaches has to be
+        # present.
+        #
+        # Which is why this case, alone among the drivers, needs the STATIC
+        # alias.  zlib.map's local: block hides inflate_table, but a version
+        # script governs shared linking only, so the name is absent from libz.so
+        # and present in libz.a -- and the Rust build reproduces that split
+        # deliberately, supplying the symbol from a C shim for this exact
+        # caller.  If a Rust-linked infcover ever fails to build, link or pass,
+        # that is a defect to fix in crates/libz-rs-sys: it must not be disabled
+        # or dropped from CTest here, and infcover.c must not be edited, because
+        # this driver is the only live check that the injected allocator
+        # contract is honoured.
+        #
+        # Its checks are assert()s, so they are live only where NDEBUG is not
+        # defined.  This block clears CMAKE_C_FLAGS but not
+        # CMAKE_C_FLAGS_<CONFIG>, and Release supplies -DNDEBUG, so a Release
+        # run establishes that all six cover_* paths run to completion without
+        # crashing while a Debug run additionally checks every assertion. `make
+        # cover' compiles with -O3 and no -DNDEBUG, so it is always the stricter
+        # of the two.
         add_executable(infcover infcover.c)
         target_link_libraries(infcover ZLIB::ZLIBSTATIC)
         target_compile_options(infcover PRIVATE -coverage)
@@ -247,6 +370,15 @@ set_tests_properties(
 #
 # add_subdirectory_test
 #
+# This fixture and the exclude one below forward only CMAKE_BUILD_TYPE,
+# CMAKE_C_COMPILER, CMAKE_C_FLAGS and CMAKE_INSTALL_PREFIX, so the nested build
+# re-configures zlib from source with ZLIB_BUILD_RUST at its default and
+# exercises the C library even when the outer tree was configured with the
+# option ON.  The three find_package fixtures above behave differently because
+# they consume what was installed, which is the implementation the outer build
+# selected.  Forwarding the option would change what these two cases have always
+# tested and would make a pure consumption fixture require a Rust toolchain, so
+# the difference is recorded here rather than removed.
 add_test(
     NAME zlib_add_subdirectory_configure
     COMMAND

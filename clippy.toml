@@ -12,9 +12,33 @@
 # decision points determine byte-identical output, so a lint never justifies
 # reshaping one of them.
 
-# Lockstep with `rust-version` in Cargo.toml; if they diverge, clippy proposes
-# APIs that do not exist on the MSRV floor.
-msrv = "1.80"
+# NO `msrv` KEY, deliberately -- and this is the correct setting rather than an
+# omission.  With the key absent, clippy takes each package's own `rust-version`
+# from Cargo.toml, which is what keeps it from proposing APIs that do not exist on
+# the floor that package actually promises.  That matters because the three
+# packages no longer share one floor:
+#
+#   crates/zlib-rs             rust-version.workspace = true  -> 1.80
+#   crates/libz-rs-sys         rust-version.workspace = true  -> 1.80
+#   crates/zlib-rs-differential rust-version = "1.86"         -> criterion's floor
+#
+# The last of those is dev-only and hosts the benchmark suites, whose harness
+# (criterion 0.8.2) declares `rust-version = "1.86"`; the two crates that SHIP
+# still promise 1.80 and clippy still holds them to it.  A single `msrv = "1.80"`
+# here would make clippy print
+#
+#   warning: the MSRV in `clippy.toml` and `Cargo.toml` differ; using `1.80.0`
+#            from `clippy.toml`
+#
+# on every target of the differential crate -- a warning, and therefore a failure
+# of the zero-warnings bar -- while telling clippy something untrue about that
+# package.  Setting it to "1.86" would be worse: it would relax the check for the
+# shipped crates, which is the opposite of what the key is for.
+#
+# Keep it absent.  If a fourth package with yet another floor is ever added, this
+# still needs no change.
+
+# Everything below is a configuration VALUE, not a lint level.
 
 # zlib.h is the immutable contract: no exported signature may change to satisfy a
 # lint.  Also clippy's default, stated so the ABI intent survives an edit.

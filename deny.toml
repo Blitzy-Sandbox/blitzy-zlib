@@ -152,14 +152,16 @@ allow = [
     "MIT",
     # The other half of every "MIT OR Apache-2.0" expression above.
     "Apache-2.0",
-    # NO "Unicode-3.0" ENTRY, deliberately.  It was here for unicode-ident, which is
-    # "(MIT OR Apache-2.0) AND Unicode-3.0" and reached this graph only through the
-    # criterion benchmark harness.  That edge is gone (see the criterion note in the
-    # root Cargo.toml), so the allowance matched nothing and cargo-deny reported it
-    # as an unmatched license allowance -- a warning, and the file's own rule above
-    # is that speculative entries are not free.  Restore this exact identifier when
-    # the benchmark suites bring criterion back; `cargo deny check licenses` will
-    # name unicode-ident the moment it is needed again.
+    # Required by unicode-ident, whose expression is
+    # "(MIT OR Apache-2.0) AND Unicode-3.0" -- an AND, so the MIT entry above cannot
+    # satisfy it on its own.  It reaches this graph only as a dev-dependency, through
+    # the criterion benchmark harness (unicode-ident <- proc-macro2 <- syn <-
+    # clap_derive <- clap <- criterion), which `include-dev = true` above brings into
+    # scope.  The entry was removed while that edge was absent, because an allowance
+    # that matches nothing is itself reported as a warning; it is restored here
+    # alongside the harness.  If the benchmark suites are ever detached again, remove
+    # it again -- `cargo deny check licenses` names the unmatched allowance either way.
+    "Unicode-3.0",
 ]
 
 [bans]

@@ -1945,6 +1945,13 @@ mod tests {
         let capacity = usize::try_from(bound).expect("a 27-byte bound fits in a usize");
         let mut compressed = vec![0u8; capacity];
         let mut compressed_len: uLongf = bound;
+        // `addr_of_mut!` rather than `&mut compressed_len`, and the difference is not cosmetic:
+        // `compress.c` L14-L16 makes `destLen` an in/out parameter, so C both reads and writes
+        // through the pointer, and taking a `&mut` first would materialise a Rust mutable
+        // reference whose aliasing rules C is under no obligation to respect. `addr_of_mut!`
+        // produces the raw pointer straight from the place. It is stable since Rust 1.51, so it
+        // holds whichever floor this package declares -- `&raw mut` would need 1.82.
+        //
         // SAFETY: `compressed` is a live allocation of `bound` bytes and `compressed_len` is
         // initialised to that same capacity, so the destination is valid for the writes C may make.
         // `HELLO` is a `'static` slice of `source_len` readable bytes. Both length pointers address
@@ -1953,7 +1960,7 @@ mod tests {
         let err = unsafe {
             c_compress(
                 compressed.as_mut_ptr(),
-                &mut compressed_len,
+                core::ptr::addr_of_mut!(compressed_len),
                 HELLO.as_ptr(),
                 source_len,
             )
@@ -1968,6 +1975,9 @@ mod tests {
         let mut restored = vec![0u8; HELLO.len()];
         let mut restored_len: uLongf =
             uLong::try_from(restored.len()).expect("the 14-byte buffer fits in a uLong");
+        // `addr_of_mut!` for the same reason as above: `uncompr.c` L13-L18 makes `destLen` in/out,
+        // so the raw pointer is taken from the place rather than through a `&mut`.
+        //
         // SAFETY: `restored` is a live allocation of `restored_len` bytes, and the source is the
         // prefix of `compressed` that the call above actually filled, so `compressed_len` bytes are
         // readable from its pointer. Both length pointers address live locals that outlive the call,
@@ -1975,7 +1985,7 @@ mod tests {
         let err = unsafe {
             c_uncompress(
                 restored.as_mut_ptr(),
-                &mut restored_len,
+                core::ptr::addr_of_mut!(restored_len),
                 compressed.as_ptr(),
                 compressed_len,
             )

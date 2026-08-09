@@ -146,11 +146,12 @@ resolver = "2"
 #                  crates/zlib-rs-differential, which takes `criterion` as a
 #                  dev-dependency and is the correct host because every benchmark
 #                  measures the Rust implementation against the C oracle that
-#                  crate builds.  The directory is absent, and so are the matching
-#                  [[bench]] entries: an entry naming a missing file breaks every
-#                  cargo invocation that enumerates targets, so the entries belong
-#                  in the same change as the files.  Do not add a fourth member
-#                  for it, and do not move the directory once it exists.
+#                  crate builds.  Each suite is attached there by an explicit
+#                  [[bench]] entry carrying `path = "../../benches/<name>.rs"` and
+#                  `harness = false`, added in the same change as the file it
+#                  names — an entry naming a missing file breaks every cargo
+#                  invocation that enumerates targets.  Do not add a fourth member
+#                  for it, and do not move the directory.
 members = [
     "crates/zlib-rs",
     "crates/libz-rs-sys",
@@ -365,10 +366,16 @@ symbol_version_nodes = 16
 #   * `libfuzzer-sys`, `arbitrary` — they belong to the excluded fuzz/ crate.
 #   * `cbindgen`, `cargo-fuzz`, `cargo-deny` — command-line tools, installed with
 #     `cargo install --locked`, never manifest dependencies.
-#   * `criterion`, `libc` — declared by the AAP but not yet used by any target.
-#     The long note in the table below records why each is withheld and exactly
-#     what brings it back; criterion's absence is also what keeps the declared
-#     1.80 MSRV resolvable, so read it before adding either.
+#   * `libc` — declared by the AAP but not yet used by any target.  The long note
+#     in the table below records why it is withheld and exactly what brings it
+#     back, so read it before adding it.
+#
+# `criterion` IS declared, as of the arrival of the first suite under `benches/`.
+# It is a dev-only harness, reached by exactly one package — the bench targets of
+# crates/zlib-rs-differential — and by nothing that ships.  The note beside its
+# entry below records the MSRV consequence, which is real and is the reason that
+# package now states `rust-version = "1.86"` for itself instead of inheriting the
+# workspace floor.
 
 [workspace.dependencies]
 # The safe core, consumed by the facade and by the differential harness.  Cargo
@@ -385,45 +392,46 @@ zlib-rs = { path = "crates/zlib-rs", version = "1.3.2" }
 # [dependencies] or [build-dependencies] of a shipped crate.
 cc = "1.4.0"
 
-# DELIBERATELY ABSENT: criterion, and libc.
+# Dev-dependency of the bench targets of crates/zlib-rs-differential ONLY.  The
+# statistics-driven harness AAP §0.5.1.3 pins for the suites AAP §0.3.1 places at
+# `benches/`; it backs the "within 10%" throughput gates of AAP §0.6.4.6 by
+# measuring the port and the in-process C oracle under one sampler.  Licensed
+# "Apache-2.0 OR MIT", which deny.toml allows.  It must never appear in the
+# [dependencies] or [build-dependencies] of a shipped crate.
 #
-# criterion 0.8.2 (AAP §0.5.1.3) is the pinned harness for the three benchmark
-# suites AAP §0.3.1 places at `benches/`.  That directory does not exist, no
-# `[[bench]]` target is declared anywhere in the workspace, and no source file
-# names the crate -- so the edge would gate nothing while imposing a real cost,
-# and it is not declared until the suites land.  The cost is not hypothetical, it
-# is the reason this entry is a comment:
+# THE MSRV CONSEQUENCE IS REAL, and it is why the hosting package states its own
+# floor.  Measured on this tree: criterion 0.8.2 declares `rust-version = "1.86"`
+# and reaches clap 4.6.5, whose clap_builder/clap_lex declare `edition = "2024"`.
+# Cargo 1.80 cannot parse an edition-2024 manifest, so ANY command that resolves
+# the whole workspace dev graph on that toolchain -- `cargo +1.80 metadata`,
+# `cargo +1.80 check --tests`, `--all-targets` -- fails outright:
+#   error: failed to download `clap_builder v4.6.5` … the package requires the
+#          Cargo feature called `edition2024`, but that feature is not
+#          stabilized in this version of Cargo (1.80.1)
+# A package cannot advertise `rust-version = "1.80"` and then require a dev graph
+# 1.80 cannot resolve, so `crates/zlib-rs-differential` now writes an explicit
+# `rust-version = "1.86"` instead of `rust-version.workspace = true` -- shape 1 of
+# the two this note has always named as correct.  (Shape 2, a package in `exclude`
+# with its own lock as `fuzz/` has, is also correct and remains available; shape 1
+# is what the suites use, because `benches/` is attached by path to the one crate
+# that builds the oracle they measure against and adding a fourth member for it
+# would duplicate that build.)
 #
-#   criterion 0.8.2 declares `rust-version = "1.86"` and reaches clap 4.6.5,
-#   whose clap_builder/clap_lex declare `edition = "2024"`.  Cargo 1.80 cannot
-#   parse an edition-2024 manifest, so ANY command that resolves the whole
-#   workspace dev graph -- `cargo +1.80 metadata`, `cargo +1.80 check --tests`,
-#   `--all-targets` -- fails outright:
-#     error: failed to download `clap_builder v4.6.5` … the package requires the
-#            Cargo feature called `edition2024`, but that feature is not
-#            stabilized in this version of Cargo (1.80.1)
-#   With the edge present the workspace advertised `rust-version = "1.80"` while
-#   being unresolvable by that very toolchain.  It also duplicated `syn` (2.x for
-#   the older proc-macro graph, 3.x for the newer one) in the committed lock.
-#
-# WHERE THE SUITES MUST LAND, so the 1.80 promise stays true.  criterion's floor
-# is a property of criterion, not something this workspace can wish away, so the
-# benchmark package must NOT inherit `[workspace.package] rust-version`.  Either
-# of these is correct; the second matches what `fuzz/` already does:
-#
-#   1. a workspace member that sets its own `rust-version = "1.86"` (and does not
-#      write `rust-version.workspace = true`), carrying `criterion = "0.8.2"` in
-#      its `[dev-dependencies]` and the `[[bench]]` entries; or
-#   2. a package listed in `exclude` above, with its own Cargo.lock and its own
-#      deny.toml, exactly as `fuzz/` is isolated today.
-#
-# Either way the MSRV gate keeps naming the shipped packages explicitly --
+# THE MSRV GATE IS UNAFFECTED, because it has always named the shipped packages
+# explicitly rather than the workspace:
 #   cargo +1.80 check --locked -p zlib-rs -p libz-rs-sys --all-features --all-targets
 #   cargo +1.80 rustc --locked -p libz-rs-sys --all-features -- -D warnings
-# -- because 1.80 is a promise that the two crates that SHIP compile on that
-# compiler, and criterion reaches neither of them.  Clippy is not part of that gate:
-# clippy 1.80 denies 28 things clippy 1.97 does not, all lint drift rather than code
-# defects.  `crates/zlib-rs-differential/Cargo.toml` records the measured list.
+# 1.80 is a promise that the two crates that SHIP compile on that compiler, and
+# criterion reaches neither of them -- `cargo tree -p zlib-rs -e normal` and
+# `cargo tree -p libz-rs-sys -e normal` show it.  What DOES change is that
+# `cargo +1.80 metadata` over the whole workspace no longer resolves; that is a
+# property of criterion, not something this workspace can wish away, and it is the
+# price of the benchmark gates.  Clippy is not part of the MSRV gate either:
+# clippy 1.80 denies 28 things clippy 1.97 does not, all lint drift rather than
+# code defects.  `crates/zlib-rs-differential/Cargo.toml` records the measured list.
+criterion = "0.8.2"
+
+# DELIBERATELY ABSENT: libc.
 #
 # libc 0.2.189 (AAP §0.5.1.3) was an OPTIONAL dependency of crates/libz-rs-sys,
 # for the case where "a platform type or a raw syscall in the gz layer cannot be
