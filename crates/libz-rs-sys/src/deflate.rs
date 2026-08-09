@@ -739,29 +739,47 @@ unsafe fn write_reset(strm: z_streamp, reset: DeflateReset) {
 /// Turns the message the core recorded into the `'static` C string to publish in `strm->msg`.
 ///
 /// The deflate core records a message only through [`ReturnCode::record_msg`], which stores
-/// `err_msg(code)` -- the `z_errmsg` entry belonging to the status it is about to return
-/// (`zutil.h` L65-L68, the `ERR_MSG`/`ERR_RETURN` pair). [`error_message`] is the
-/// NUL-terminated mirror of that same table, so the string to publish is the one belonging to
-/// `code`, and no second copy of the table or of its index arithmetic is needed here.
+/// `err_msg` of the status *that* call was about to return (`zutil.h` L65-L68, the
+/// `ERR_MSG`/`ERR_RETURN` pair). Every recorded message is therefore an entry of `z_errmsg`,
+/// and [`crate::util::message_cstr`] is the NUL-terminated mirror of that same table, so no
+/// second copy of the table is needed here.
+///
+/// ★ **The recorded message does not always belong to the returned status, and C's does not
+/// either.** `deflateParams` is the case that proves it. It flushes by calling `deflate`
+/// internally and then *discards that call's return value* unless it was `Z_STREAM_ERROR`
+/// (`deflate.c` L794-L800). So a caller who issues `Z_SYNC_FLUSH` and then changes the level
+/// with no new input takes the `RANK(flush) <= RANK(old_flush)` path at `deflate.c`
+/// L1018-L1021, whose `ERR_RETURN` records `"buffer error"` -- and `deflateParams` then goes on
+/// to succeed and return `Z_OK`. C leaves `strm->msg` pointing at that stale `"buffer error"`,
+/// because `ERR_RETURN` is a plain assignment and nothing clears it; `zlib.h` L100-L101 makes
+/// `msg` meaningful only when an error is returned, which is what makes that harmless.
+///
+/// This function therefore publishes **the message the core recorded**, not the message
+/// belonging to `code`. That is the C-faithful answer -- deriving it from `code` would publish
+/// the empty `Z_OK` string where C publishes `"buffer error"` -- and it is why the lookup goes
+/// through [`crate::util::message_cstr`] rather than [`error_message`].
 ///
 /// [`None`] in means [`None`] out, which is what leaves `strm->msg` untouched: C's plain
 /// `return Z_STREAM_ERROR` at `deflate.c` L985 is deliberately not an `ERR_RETURN`, so a
 /// caller's previous message survives it.
 ///
-/// The debug assertion is the self-check that keeps the two tables from drifting: it fires
-/// only if the core recorded a message that does not belong to the status it returned, which
-/// would mean the correspondence documented above had been broken. It is a `debug_assert!`
-/// rather than a hard failure for the reason the whole crate is careful about: aborting a C
-/// caller's process over a diagnostic string would be a far worse outcome than publishing the
-/// status's own message.
+/// The debug assertion is the self-check that keeps the two tables from drifting. What it can
+/// honestly assert is that the recorded message is *an entry in the table at all*, since a
+/// message the mirror lacks is the one real drift risk; it deliberately does **not** assert a
+/// correspondence with `code`, which the paragraph above shows does not hold. It is a
+/// `debug_assert!` rather than a hard failure for the reason the whole crate is careful about:
+/// aborting a C caller's process over a diagnostic string would be a far worse outcome than
+/// publishing the empty string.
 #[inline]
 #[must_use]
 fn recorded_msg(message: Option<&'static str>, code: ReturnCode) -> Option<&'static CStr> {
     let message = message?;
-    let published = error_message(code.as_i32());
+    let published = crate::util::message_cstr(message);
     debug_assert!(
         published.to_bytes() == message.as_bytes(),
-        "the deflate core recorded a message that does not belong to the status it returned"
+        "the deflate core recorded a message the facade's NUL-terminated mirror does not \
+         contain (status {})",
+        code.as_i32()
     );
     Some(published)
 }

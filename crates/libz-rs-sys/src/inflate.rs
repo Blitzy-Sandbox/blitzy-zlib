@@ -1412,7 +1412,12 @@ pub unsafe extern "C" fn inflateInit_(
 /// | 5 | `Z_BLOCK` | stop at a deflate block boundary |
 /// | 6 | `Z_TREES` | stop immediately after a block header |
 ///
-/// A value outside `0..=6` is refused with `Z_STREAM_ERROR`.
+/// A value outside `0..=6` is **not** refused. It is passed through unvalidated and behaves
+/// exactly as `Z_NO_FLUSH` behaves, because C's `inflate` validates `flush` nowhere: the
+/// value is only ever compared against `Z_FINISH`, `Z_BLOCK` and `Z_TREES`. The ★ note
+/// beside the pass-through in the body below carries the full argument, including why
+/// rejecting one -- as an earlier revision of this function did -- is stricter than the
+/// reference and wrong.
 ///
 /// # The entry guard
 ///
@@ -1435,9 +1440,15 @@ pub unsafe extern "C" fn inflateInit_(
 /// This is the library's primary attack surface: it must never panic, hang or
 /// over-read for **any** input, however malformed. The decoder is safe Rust
 /// throughout, so an out-of-range distance or a malformed table is a `Z_DATA_ERROR`
-/// rather than a memory-safety event. That property is argued structurally rather
-/// than demonstrated by fuzzing -- `fuzz/` declares a manifest but holds no fuzz
-/// targets, so nothing in the tree drives this entry point with arbitrary bytes.
+/// rather than a memory-safety event. That property is argued structurally *and*
+/// exercised: `fuzz/fuzz_targets/fuzz_inflate.rs` drives this entry point with
+/// arbitrary bytes across the whole `windowBits` and `flush` space, under
+/// AddressSanitizer and under a `test/infcover.c`-style tracking allocator that
+/// detects leaks, non-LIFO frees and rogue frees and that induces `Z_MEM_ERROR` at
+/// controlled points. It reconciles `total_in`/`total_out` against the bytes the
+/// caller's buffers actually gave up and took, and it surrounds each `gz_header`
+/// buffer with guard regions to catch a write past `extra_max`, `name_max` or
+/// `comm_max`.
 ///
 /// # Safety
 ///

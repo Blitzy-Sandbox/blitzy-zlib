@@ -10,8 +10,10 @@ All functions of the compression library are documented in the file zlib.h
 (volunteer to write man pages welcome, contact zlib@gzip.org).  A usage example
 of the library is given in the file test/example.c which also tests that
 the library is working correctly.  Another example is given in the file
-test/minigzip.c.  The compression library itself is composed of all source
-files in the root directory.
+test/minigzip.c.  The reference C compression library itself is composed of all
+source files in the root directory; a memory-safe Rust reimplementation of the
+same library, exporting the same C ABI, is in the Cargo workspace under crates/
+and is described below.
 
 To compile all files and run the test program, follow the instructions given at
 the top of Makefile.in.  In short "./configure; make test", and if that goes
@@ -29,6 +31,26 @@ this directory are retained and are the reference the Rust code is diffed
 against, so "./configure; make test" continues to build and test the C library
 exactly as before, on machines with no Rust toolchain at all.
 
+Each crate has a distinct job.  crates/zlib-rs is the algorithmic core --
+deflate, inflate, the Huffman coder, both checksums, the gzip file layer and
+the one-shot wrappers.  With no features it is no_std plus alloc and the gzip
+file layer is not compiled at all, since a gzFile is a real file and only the
+standard library can open one.  crates/libz-rs-sys is the C ABI layer, and the
+only crate permitted unsafe; it builds as a cdylib, a staticlib and an rlib
+under the library name z, which is why cargo emits libz.so and libz.a rather
+than Rust-flavoured names.  crates/zlib-rs-differential is a development-only
+harness that compiles the C sources in this directory as a test oracle; neither
+shipped crate depends on it, so an ordinary build of the Rust library never
+compiles them.
+
+For a program already linked against libz, the exported symbol set is the same,
+the z_stream and gz_header layouts are the same, the SONAME is still libz.so.1,
+and zlib.h and zconf.h are installed unchanged, so that program keeps working
+without being recompiled.  The compressed bytes are the same as well: the
+encoder reproduces the reference implementation's own heuristics rather than
+improving on them, and streams interoperate in both directions -- what the C
+library deflates the Rust library inflates, and the other way round.
+
 To build and check the Rust library:
 
     make rust          # stage the drop-in libz under target/dropin/
@@ -40,6 +62,33 @@ Makefile.in's own defaults and name the staged library from ZLIB_VERSION in
 zlib.h, so they work on an unconfigured tree; what ./configure adds is the C
 library build that "make rust-symbols" can then diff against, and a $(CARGO)
 recorded for you (unconfigured, name it yourself with "make rust CARGO=cargo").
+
+Three more targets complete the set:
+
+    make rust-header   # regenerate the C header with cbindgen and gate it
+    make rust-msrv     # check the two shipped crates on the 1.80 floor
+    make rust-clean    # remove what the Rust targets produced
+
+"make rust-header" wants cbindgen as well as a cargo reachable on PATH, and
+"make rust-clean" wants no cargo at all.  The comment at the top of Makefile.in
+describes all six targets, including what each one does and does not establish.
+
+CMake can point the exported ZLIB::ZLIB and ZLIB::ZLIBSTATIC targets at the
+Rust library instead of the C one:
+
+    cmake -S . -B build -DZLIB_BUILD_RUST=ON
+
+That option is off by default, and while it is off no Rust tool is probed and
+the CMake build is exactly what it always was.
+
+Inside the Rust workspace itself, cargo drives the build directly:
+
+    cargo build --release
+    cargo build --release --features libz-compat
+
+The first builds the two shipped crates with their default features, which
+already include the C ABI layer; the second names that layer explicitly, which
+is the form to use when the features are being chosen by hand.
 
 Note that "cargo build" alone does NOT produce an installable shared library,
 and the shortfall is measurable: the shared object cargo emits publishes 96
@@ -60,9 +109,39 @@ cargo's build script leaves a README-cargo-artifacts.txt there saying so.  Use
 ldd to see which library was bound rather than inferring it from a test that
 passed -- that check is exactly what "make rust-test" performs.
 
+Installing the Rust library means installing the same names the C build
+installs, with the same SONAME and the same symlink topology: the real file
+libz.so.1.3.2.1-motley, with libz.so.1 and libz.so as symlinks to it, and the
+static libz.a.  "make rust" stages exactly that set under target/dropin/ and
+names it from ZLIB_VERSION in zlib.h, ready to be copied into place.
+
 Building the Rust library needs Rust 1.80 or later and cargo.  Optional
 vectorised CRC-32 and Adler-32 backends are available behind the "simd" Cargo
 feature; they change speed only, never the compressed bytes.
+
+The workspace is edition 2021 and declares a minimum supported Rust version of
+1.80; rust-toolchain.toml pins the channel, so cargo selects a suitable
+compiler by itself.
+
+The Cargo features, with the crate that declares each one and its default:
+
+    libz-compat   libz-rs-sys, on   the exported extern "C" surface
+    gz            libz-rs-sys, on   the gzFile layer, which needs std
+    rust-api      zlib-rs, off      the idiomatic Rust surface
+    simd          zlib-rs, off      vectorised CRC-32 and Adler-32
+    std           zlib-rs, off      the core's file I/O; otherwise no_std
+
+Setting ZLIB_RS_SIMD=1 in the environment is how the simd feature is asked for
+through make or CMake, both of which translate it into "simd" for cargo; a
+direct cargo build takes "--features simd" instead, and the build script then
+checks that the two requests agree rather than letting a mismatch pass
+unnoticed.  ZLIB_RS_SIMD=0, or leaving it unset, builds the scalar backends.
+The feature reaches the two checksums and nothing else, which is what keeps it
+output neutral -- a checksum is one scalar however it is computed.
+
+rust/README.md is the developer guide for the port.  The differential tests
+against the C sources, the Miri and AddressSanitizer runs, the fuzz targets and
+the benchmarks are documented there rather than here.
 
 Questions about zlib should be sent to <zlib@gzip.org>, or to Gilles Vollant
 <info@winimage.com> for the Windows DLL version.  The zlib home page is
@@ -115,6 +194,10 @@ Notes for some targets:
   other compilers. Use "make test" to check your compiler.
 
 - For PalmOs, see https://palmzlib.sourceforge.net/
+
+- The Rust library is supported on Rust's tier 1 targets. The platform
+  makefiles in this distribution -- amiga, msdos, os400, qnx, watcom and
+  win32 -- build the C sources and are unaffected.
 
 
 Acknowledgments:

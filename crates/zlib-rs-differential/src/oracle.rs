@@ -44,7 +44,8 @@
 //! * The `deflateInit`, `deflateInit2`, `inflateInit`, `inflateInit2` and `inflateBackInit` spellings
 //!   are macros in `zlib.h`, not symbols, so they are absent here by construction. Call the
 //!   `_`-suffixed forms and pass what the macros pass: the version string, which
-//!   [`c_zlibVersion`] returns, and `size_of::<z_stream>()` as the `stream_size`.
+//!   [`c_zlibVersion`](crate::oracle::c_zlibVersion) returns, and `size_of::<z_stream>()` as the
+//!   `stream_size`.
 //! * `gzprintf` and `gzvprintf` are the two entry points in `zlib.h` that are deliberately **not**
 //!   declared here, and the omission is a safety decision rather than an oversight. Both are
 //!   declared with `ZEXPORTVA`, not `ZEXPORT` -- a distinction that exists precisely because the two
@@ -58,8 +59,8 @@
 //!   them can declare them locally, with the convention pinned per target and the hazard stated at
 //!   the declaration site. Neither is in the required surface, and formatted output is not a
 //!   byte-identity concern: `gzprintf` is a one-line forward to `gzvprintf`, which formats into a
-//!   buffer and hands the result to `gzwrite`, so [`c_gzwrite`] already covers the compression path
-//!   that differential testing actually measures.
+//!   buffer and hands the result to `gzwrite`, so [`c_gzwrite`](crate::oracle::c_gzwrite) already
+//!   covers the compression path that differential testing actually measures.
 //!
 //! # Type mirrors
 //!
@@ -69,10 +70,10 @@
 //! That is what the two `allow`s below are for, and they are scoped to this module.
 //!
 //! Integer widths follow the headers rather than convenience. `uLong` is `unsigned long` and must
-//! therefore be [`c_ulong`], which is 8 bytes on LP64 and 4 on LLP64 Windows; hardcoding `u64`
-//! would silently corrupt `total_in`, `total_out` and every checksum return value on Windows, and
-//! `u32` would do the same on Linux. The layout assertions at the end of this module fail the build
-//! if any of it drifts.
+//! therefore be [`c_ulong`](core::ffi::c_ulong), which is 8 bytes on LP64 and 4 on LLP64 Windows;
+//! hardcoding `u64` would silently corrupt `total_in`, `total_out` and every checksum return value
+//! on Windows, and `u32` would do the same on Linux. The layout assertions at the end of this
+//! module fail the build if any of it drifts.
 //!
 //! # Why the mirrors are declared here rather than imported
 //!
@@ -84,10 +85,12 @@
 //! keeps the oracle out of the shipped crates' graphs, so the mirrors are transcribed locally
 //! instead and held to agreement by two independent mechanisms: the compile-time layout assertions
 //! below, which encode the same measured numbers as
-//! `crates/libz-rs-sys/src/layout_assertions.rs`, and the [`c_oracle_ct_data_size`] /
-//! [`c_oracle_code_size`] accessors, which report what the C compiler actually produced. `ct_data`
-//! has no counterpart in the facade at all -- it is an internal `deflate.h` type, not part of the
-//! public ABI -- so it could only ever have been declared here.
+//! `crates/libz-rs-sys/src/layout_assertions.rs`, and the
+//! [`c_oracle_ct_data_size`](crate::oracle::c_oracle_ct_data_size) /
+//! [`c_oracle_code_size`](crate::oracle::c_oracle_code_size) accessors, which report what the C
+//! compiler actually produced. `ct_data` has no counterpart in the facade at all -- it is an
+//! internal `deflate.h` type, not part of the public ABI -- so it could only ever have been
+//! declared here.
 //!
 //! # How this crate divides up
 //!

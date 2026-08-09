@@ -1,5 +1,20 @@
 @PACKAGE_INIT@
 
+# find_package(ZLIB CONFIG) defines two imported targets: ZLIB::ZLIB for the
+# shared library and ZLIB::ZLIBSTATIC for the static one.  `shared' and `static'
+# are this package's only components -- name one to get just that target, or
+# request none and get both.
+#
+# Those two targets are the entire consumption interface, and it does not change
+# with the implementation behind them.  zlib is built either from its C sources
+# or, with -DZLIB_BUILD_RUST=ON, from the memory-safe Rust implementation in
+# crates/libz-rs-sys; both install the same unmodified zlib.h and generated
+# zconf.h, carry the SONAME libz.so.1, and export the same symbols at the same
+# versions, because zlib.map is handed to the linker either way.  There is
+# deliberately no `rust' component: which implementation was built is settled
+# when zlib itself is configured and is not something a consumer selects or can
+# observe.  Existing projects need no change and no recompilation.
+
 set(_ZLIB_supported_components "shared" "static")
 
 if(ZLIB_FIND_COMPONENTS)

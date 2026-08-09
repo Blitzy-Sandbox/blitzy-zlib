@@ -794,15 +794,25 @@ const EMPTY_MESSAGE: &CStr = c"";
 ///
 /// Ported from `ERR_MSG` (`zutil.h` L65) via `zError` (`zutil.c` L139-L141).
 pub(crate) fn error_message(err: c_int) -> &'static CStr {
-    // The core owns the index arithmetic; see above.
-    let message = zlib_rs::error::err_msg(err);
+    // The core owns the index arithmetic; see above. Its answer then selects the
+    // NUL-terminated mirror.
+    message_cstr(zlib_rs::error::err_msg(err))
+}
 
-    // Then the core's own answer selects its NUL-terminated mirror. `find` returns
-    // the first match, so the empty string resolves to slot 2 rather than slot 9;
-    // the two are byte-identical, so the choice cannot be observed. `unwrap_or`
-    // rather than `unwrap`: a message the table does not contain would mean the
-    // core had grown an entry this mirror lacks, and the correct response to that
-    // is the empty string a C caller can print, not an abort.
+/// Returns the NUL-terminated mirror of a message the core recorded.
+///
+/// This is the *one* mapping [`error_message`] describes, lifted out so that a caller
+/// holding a message rather than a status code uses it too instead of growing a second
+/// copy. [`crate::deflate::recorded_msg`] is that caller: a stream's recorded message
+/// does not always belong to the status the entry point ends up returning, so it cannot
+/// go back through the code.
+///
+/// `find` returns the first match, so the empty string resolves to slot 2 rather than
+/// slot 9; the two are byte-identical, so the choice cannot be observed. `unwrap_or`
+/// rather than `unwrap`: a message the table does not contain would mean the core had
+/// grown an entry this mirror lacks, and the correct response to that is the empty
+/// string a C caller can print, not an abort.
+pub(crate) fn message_cstr(message: &str) -> &'static CStr {
     Z_ERRMSG_C
         .iter()
         .copied()

@@ -94,10 +94,16 @@ description = "Dev-only differential harness comparing the Rust zlib implementat
 # by accident.
 publish = false
 # `build.rs` is picked up by Cargo's automatic detection, which is the standard and
-# preferred form; no explicit `build = "build.rs"` key is required. The script
-# compiles the C oracle with `-DZ_PREFIX`, so the oracle exports `z_*` names that
-# cannot collide with the Rust facade's unprefixed `#[no_mangle]` exports when both
-# are linked into one test binary.
+# preferred form; no explicit `build = "build.rs"` key is required. The script renames
+# every externally visible symbol of the oracle to `c_<name>` -- with 95
+# `-D<name>=c_<name>` macros where the preprocessor can reach the name and with an
+# `objcopy --redefine-syms` pass over the objects for the 19 it cannot, `gzgetc` chief
+# among them -- so the oracle cannot collide with the Rust facade's unprefixed
+# `#[no_mangle]` exports when both are linked into one test binary. It deliberately does
+# NOT use `-DZ_PREFIX`: the prefix this harness is specified to expose is `c_`, not
+# `z_`, and `zconf.h` states that standard zlib is built *without* `Z_PREFIX`, which
+# would put the oracle at odds with the requirement that it be the default
+# configuration. See the `build.rs` crate docs for the full derivation of both counts.
 
 [features]
 # Nothing extra by default: the differential matrix and the benchmarks must exercise

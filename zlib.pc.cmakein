@@ -1,3 +1,101 @@
+# CMake expands this template into the build tree's zlib.pc -- the
+# configure_file() call in CMakeLists.txt -- and installs the result into
+# <libdir>/pkgconfig.  The autotools build (configure plus Makefile.in) and
+# win32/Makefile.gcc use the parallel template zlib.pc.in rather than this file,
+# so a change to what either one advertises belongs in both.
+#
+# This descriptor is implementation-agnostic for DYNAMIC linking: the flags below
+# describe the C implementation and the memory-safe Rust implementation
+# (crates/libz-rs-sys) equally well there, so ZLIB_BUILD_RUST=ON needs no variant
+# of this file and changes none of the keys below.  What the Rust packaging is
+# REQUIRED to reproduce, and what the ZLIB_BUILD_RUST block in CMakeLists.txt
+# implements:
+#
+#   * the staged artifacts are named libz.so and libz.a -- the same names the C
+#     targets publish, and that block is ELF-only -- so -lz resolves to either;
+#   * the shared object carries SONAME libz.so.1 and the same
+#     libz.so -> libz.so.1 -> libz.so.1.3.2.1-motley chain, so a program already
+#     linked against libz keeps loading it under the name recorded in its
+#     DT_NEEDED entry.  Cargo does not produce that chain: it writes a bare
+#     libz.so, so CMakeLists.txt relinks cargo's static archive into the
+#     versioned name -- with the same SONAME and the same zlib.map version
+#     script the C shared target receives -- and symlinks the other names beside
+#     it, in a staging directory of its own rather than in cargo's output
+#     directory.  Those files install into the same libdir as the C libraries,
+#     from rules declared last, so where both implementations publish a name the
+#     Rust file is the one installed;
+#   * the exported symbol surface must match the C library's 111 dynamic
+#     globals, being 95 functions plus the 16 symbol-version nodes declared in
+#     zlib.map.  The CMake path takes that keep-list from the ZEXTERN
+#     declarations in zlib.h, localises everything else with objcopy before the
+#     shared link, and hands zlib.map to the linker; `make rust-symbols' is the
+#     autotools build's nm diff of the same property.  No in-tree automation
+#     runs that diff for this build, so read it as the parity requirement rather
+#     than as an achieved result;
+#   * the installed zlib.h and generated zconf.h are byte-identical, because the
+#     Rust build modifies neither header and that block leaves the header, the
+#     zlib.pc and the documentation install rules untouched.
+#
+# Libs: advertising -lz and Cflags: advertising the include directory are part of
+# that contract -- do not reword them, and do not add Requires: entries, -lm,
+# -lpthread or any Rust-specific flag to them.
+#
+# ONE PACKAGING DIFFERENCE, AND IT IS REAL: STATIC LINKING.
+#
+# The C libz.a needs no companion libraries, which is why there is no
+# Libs.private: line below and why adding one would be wrong for the C build.  A
+# Rust staticlib is different -- it carries the Rust runtime's own dependencies.
+# Measured, not assumed, with
+# `RUSTFLAGS="--print native-static-libs" cargo build --release -p libz-rs-sys`
+# on x86_64-unknown-linux-gnu:
+#
+#     -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc
+#
+# That set is TARGET-SPECIFIC and must be re-derived per target; it is not a
+# constant to copy.  This file advertises none of it, so static consumption of
+# the staged Rust libz.a is an OPEN PACKAGING GAP rather than a solved problem.
+# How far it bites depends on the consumer, and the honest measurement is that a
+# plain cc link of that archive with -lz alone still succeeds here, because the
+# compiler driver already puts libgcc and libc on the link line and this glibc
+# folds libpthread, libdl, librt and libutil into libc.  It breaks where that
+# does not hold -- ld driven directly, -nodefaultlibs, a toolchain belonging to
+# another language, an older glibc that ships those four separately, or a target
+# whose set simply differs -- and it breaks with nothing in this file to warn
+# that the requirement exists.  zlib.pc.in states it as an outright link
+# failure; read that as the worst case of this same gap, not as a different one.
+#
+# It cannot be closed by editing this template, because one file serves both
+# implementations and the C build must keep emitting a .pc with no Libs.private:
+# at all.  Closing it means having the Rust packaging step emit its own
+# descriptor, with Libs.private: populated from
+# `rustc --print native-static-libs` for the target being built.  Dynamic
+# linking is unaffected either way: the shared object records its own
+# dependencies in DT_NEEDED, so -lz alone remains correct there.
+#
+# Two things about the substitution, for whoever edits this next.  The
+# configure_file() call passes @ONLY, so only the at-delimited names are
+# substituted and the ${...} references in libdir, sharedlibdir and includedir
+# survive into the generated file, for pkg-config itself to resolve at use time
+# against the prefix recorded there.  That is what lets a consumer relocate the
+# prefix, so do not expand them by hand and do not drop that keyword.  And the
+# substitution pass runs over the whole file, comments included: never write one
+# of the substitutable names in here, because it would be rewritten here too,
+# and one CMake happens not to define expands to nothing at all rather than
+# failing.
+#
+# A KNOWN DIVERGENCE FROM zlib.pc.in, DELIBERATE AND OUT OF SCOPE TO HARMONISE:
+# the Version: field below is filled from the version given to project() in
+# CMakeLists.txt, which is 1.3.2.1, whereas the configure-generated zlib.pc
+# carries ZLIB_VERSION from zlib.h, which is 1.3.2.1-motley.  Both spellings
+# predate the Rust port.  The suffixed one is the library's version identity --
+# deflateInit_ and inflateInit_ compare a caller's compile-time copy of it --
+# while project() accepts numeric components only, so the two cannot be spelled
+# alike without changing one of them.  Nothing links differently for it:
+# pkg-config only reports this field and answers version queries from it, and
+# the Rust staging above publishes the project()-spelled library name alongside
+# the header-spelled one, so which spelling a consumer saw never decides which
+# file resolves.
+
 prefix=@CMAKE_INSTALL_PREFIX@
 exec_prefix=@CMAKE_INSTALL_PREFIX@
 libdir=${exec_prefix}/@CMAKE_INSTALL_LIBDIR@
