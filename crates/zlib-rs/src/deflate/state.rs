@@ -417,6 +417,40 @@ impl Status {
         matches!(self, Self::Extra | Self::Name | Self::Comment | Self::Hcrc)
     }
 
+    /// Whether `deflate()` in this status dereferences `DeflateState::gzhead`.
+    ///
+    /// ★ **One status wider than [`Status::writes_gzip_header_field`], and the
+    /// difference is load-bearing.** [`Status::GzipHeader`] writes no *field*, but
+    /// it reads seven members of the caller's structure to build the fixed
+    /// ten-byte header -- `text`, `hcrc`, `extra`, `name` and `comment` for the
+    /// `FLG` byte (`deflate.c` L1092-L1096), `time` for `MTIME` (L1098-L1101),
+    /// `os` for the `OS` byte (L1105) and `extra_len` when `extra` is present
+    /// (L1106-L1109). So the set of statuses in which the reference follows the
+    /// pointer at all is these five: `GZIP_STATE`, `EXTRA_STATE`, `NAME_STATE`,
+    /// `COMMENT_STATE` and `HCRC_STATE`, covering L1066-L1200.
+    ///
+    /// Once `HCRC_STATE` hands over to `BUSY_STATE` (L1195) the header is
+    /// entirely in the pending buffer and `deflate()` never looks again -- which
+    /// is what makes `zlib.h` L836-L852's promise true, that the application need
+    /// keep the structure and its three buffers available only until the header
+    /// has been written. A facade holding the caller's raw `gz_headerp` asks this
+    /// predicate before it follows it, so that a caller which frees the structure
+    /// at that documented point is not read after the fact.
+    ///
+    /// ★ **This governs `deflate()` only.** `deflateBound_z` reads `s->gzhead`
+    /// independently of the status, whenever `|wrap| == 2` and a header is
+    /// installed (L891-L910), and it goes on doing so for the whole life of the
+    /// stream: a caller that withdraws `extra`, `name` or `comment` sees the bound
+    /// shrink accordingly. Applying this predicate there would change an
+    /// observable answer, so it must not be.
+    #[must_use]
+    pub const fn dereferences_gzip_header(self) -> bool {
+        matches!(
+            self,
+            Self::GzipHeader | Self::Extra | Self::Name | Self::Comment | Self::Hcrc
+        )
+    }
+
     /// The reference spelling of this status, for diagnostics.
     ///
     /// Mirrors `deflate.h` L58-L67.
@@ -2657,7 +2691,8 @@ mod tests {
         for raw in [-1, 0, 41, 43, 56, 112, 114, 665, 667] {
             assert_eq!(Status::from_raw(raw), None);
         }
-        // The four states that dereference `gzhead` (`deflate.c` L1117-L1200).
+        // The four states that write a gzip header *field* (`deflate.c`
+        // L1117-L1200).
         assert!(Status::Extra.writes_gzip_header_field());
         assert!(Status::Name.writes_gzip_header_field());
         assert!(Status::Comment.writes_gzip_header_field());
@@ -2667,6 +2702,51 @@ mod tests {
         assert!(!Status::Busy.writes_gzip_header_field());
         assert!(!Status::Finish.writes_gzip_header_field());
         assert_eq!(Status::Busy.c_name(), "BUSY_STATE");
+    }
+
+    /// The five statuses in which `deflate()` follows `s->gzhead`, and the three
+    /// in which it must not.
+    ///
+    /// `GZIP_STATE` is the one that separates this set from
+    /// [`Status::writes_gzip_header_field`]: it writes no field but reads seven
+    /// members to compose the fixed ten bytes (`deflate.c` L1092-L1109). The
+    /// exclusions are what carry the lifetime guarantee -- `BUSY_STATE` and
+    /// `FINISH_STATE` are the statuses a stream is in once `zlib.h` L836-L852
+    /// permits the caller to have freed the structure.
+    #[test]
+    fn only_the_header_statuses_dereference_the_callers_gzip_header() {
+        const HEADER_STATUSES: [Status; 5] = [
+            Status::GzipHeader,
+            Status::Extra,
+            Status::Name,
+            Status::Comment,
+            Status::Hcrc,
+        ];
+
+        for status in Status::ALL {
+            assert_eq!(
+                status.dereferences_gzip_header(),
+                HEADER_STATUSES.contains(&status),
+                "{} is on the wrong side of the header-lifetime boundary",
+                status.c_name()
+            );
+        }
+
+        // `INIT_STATE` is the zlib-wrapper path, which has no gzip header at all
+        // -- `deflateSetHeader` refuses a stream whose `wrap != 2`.
+        assert!(!Status::Init.dereferences_gzip_header());
+        // The boundary: `HCRC_STATE -> BUSY_STATE` (`deflate.c` L1195).
+        assert!(Status::Hcrc.dereferences_gzip_header());
+        assert!(!Status::Busy.dereferences_gzip_header());
+        assert!(!Status::Finish.dereferences_gzip_header());
+
+        // Every field-writing status is also a dereferencing one; the reverse
+        // does not hold, and `GZIP_STATE` is the witness.
+        for status in Status::ALL {
+            assert!(!status.writes_gzip_header_field() || status.dereferences_gzip_header());
+        }
+        assert!(Status::GzipHeader.dereferences_gzip_header());
+        assert!(!Status::GzipHeader.writes_gzip_header_field());
     }
 
     #[test]

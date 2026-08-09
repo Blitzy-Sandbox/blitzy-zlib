@@ -343,8 +343,26 @@ impl AllocatorId {
     }
 }
 
+/// The largest byte count that can name a single allocated object: `isize::MAX`.
+///
+/// Not a policy figure, a representational one, and it is the same number on both
+/// sides of the FFI boundary. In Rust, `core::alloc::Layout` rejects any size above
+/// it and `core::slice::from_raw_parts` requires the total size of the slice to
+/// stay within it, so a larger block could not be described even if an allocator
+/// produced one. In C, the difference of two pointers into one object is a
+/// `ptrdiff_t`, so a larger object cannot be traversed either.
+///
+/// Written as `isize::MAX.unsigned_abs()` rather than as a cast, both because the
+/// workspace denies lossy `as` conversions and because the spelling says what the
+/// bound *is*.
+///
+/// Private, and deliberately so: it is an internal consequence of the platform
+/// rather than a knob, and [`block_len`] is the only thing that needs it. Its
+/// effect is documented on that function, which is the one callers see.
+const MAX_BLOCK_LEN: usize = isize::MAX.unsigned_abs();
+
 /// The size in bytes of an `items` by `size` allocation request, or [`None`] if
-/// that product does not fit in a `usize`.
+/// that product cannot name a single object.
 ///
 /// `ZALLOC` (`zutil.h` L252-L253) passes `items` and `size` to the caller's hook
 /// separately, and it is the hook that multiplies them: `zcalloc` does so in
@@ -355,9 +373,36 @@ impl AllocatorId {
 /// asked for -- so this implementation computes it checked, in `usize`, and treats overflow
 /// as an allocation failure.
 ///
-/// This cannot change behaviour for any request the library actually makes: every
-/// one is bounded by `MAX_WBITS` (15) and `MAX_MEM_LEVEL` (9), so the largest is
-/// `hash_size * sizeof(Pos)` = 131072 bytes. The check exists for the general
+/// # Two ways a request is refused
+///
+/// The product is refused when it overflows `usize`, and also when it exceeds
+/// [`isize::MAX`], which is the largest byte count that can name a single object:
+/// [`core::alloc::Layout`] rejects any size above it, [`core::slice::from_raw_parts`]
+/// requires the total size of the slice to stay within it, and in C the difference
+/// of two pointers into one object is a `ptrdiff_t`, so such a block could not be
+/// described on either side of the boundary even if an allocator produced one.
+///
+/// The second test is what makes the answer the same on every
+/// target rather than an accident of pointer width: `items = size = uInt::MAX`
+/// overflows a 32-bit `usize` and is refused there, while on LP64 the product is
+/// `0xffff_fffe_0000_0001`, which *is* representable and would otherwise be passed
+/// on to an allocator as a real request. It could never be honoured -- no such
+/// object can exist, in Rust or in C -- so refusing it up front is both the
+/// truthful answer and the useful one:
+///
+/// * `zalloc`'s documented failure answer is `Z_NULL` (`zlib.h` L149), which every
+///   caller of this library already turns into `Z_MEM_ERROR`, so nothing is lost;
+/// * an allocator asked for an impossible size may do rather more than return
+///   null. AddressSanitizer, which AAP §0.6.4.5 requires this library's boundary
+///   layer to run clean under, treats a request above its own maximum as a fatal
+///   `allocation-size-too-big` error and **aborts the process** unless
+///   `allocator_may_return_null=1` is set. Declining the request before it reaches
+///   `malloc` keeps the sanitizer job runnable with its default options, so a real
+///   finding cannot be masked by a configuration failure.
+///
+/// Neither test can change behaviour for any request the library actually makes:
+/// every one is bounded by `MAX_WBITS` (15) and `MAX_MEM_LEVEL` (9), so the
+/// largest is `hash_size * sizeof(Pos)` = 131072 bytes. They exist for the general
 /// case, and because an [`Allocator`] implementation must perform the same
 /// multiplication before calling a caller's hook and should perform it the same
 /// way.
@@ -367,10 +412,24 @@ impl AllocatorId {
 ///
 /// assert_eq!(block_len(32768, 2), Some(65536)); // deflate.c L458
 /// assert_eq!(block_len(usize::MAX, 2), None);   // overflow, not a wrapped size
+///
+/// // Representable on a 64-bit target, but no such object can exist.
+/// assert_eq!(block_len(0xffff_ffff, 0xffff_ffff), None);
 /// ```
 #[must_use]
 pub const fn block_len(items: usize, size: usize) -> Option<usize> {
-    items.checked_mul(size)
+    // Spelled with `match` and `if` rather than `let ... else` and a guard so that
+    // it is unambiguously a `const fn` on the declared 1.80 floor.
+    match items.checked_mul(size) {
+        Some(len) => {
+            if len > MAX_BLOCK_LEN {
+                None
+            } else {
+                Some(len)
+            }
+        }
+        None => None,
+    }
 }
 
 /// Where a [`Buffer`]'s elements actually live.
@@ -1374,11 +1433,25 @@ mod tests {
         assert!(allocator.allocate_u16s(usize::MAX).is_none());
 
         // The shape the brief calls out: both arguments at their C maximum. On a
-        // 64-bit target the product is representable, so this exercises the
-        // allocator declining rather than the multiply overflowing -- either way
-        // the answer is a reported failure, not a panic and not a short block.
-        let huge = u32::MAX as usize;
+        // 32-bit target the product overflows `usize`; on a 64-bit one it is
+        // representable but exceeds `MAX_BLOCK_LEN`, because no single object may
+        // be larger than `isize::MAX`. Either way the answer is a reported failure
+        // -- not a panic, not a short block, and not a request forwarded to an
+        // allocator that could only refuse it.
+        let huge = usize::try_from(u32::MAX).expect("u32 fits a usize on every target");
+        assert_eq!(block_len(huge, huge), None);
         assert!(allocator.allocate_bytes(huge, huge).is_none());
+
+        // The bound itself, from both sides. `isize::MAX` bytes is the largest
+        // count that can name an object at all, so it survives the check (and is
+        // then declined by the allocator, which is a different question); one byte
+        // more cannot, and is refused without any allocator being asked.
+        let max_len = isize::MAX.unsigned_abs();
+        assert_eq!(block_len(max_len, 1), Some(max_len));
+        assert_eq!(block_len(max_len / 2 + 1, 2), None);
+        assert_eq!(block_len(max_len, 2), None);
+        assert!(allocator.allocate_bytes(max_len, 2).is_none());
+        assert!(allocator.allocate_u16s(max_len).is_none());
 
         // And the failure maps to the status code a caller returns. `err` rather
         // than a direct comparison because a buffer is not a comparable value.

@@ -2073,6 +2073,30 @@ impl<'a, A: Allocator<'a>> InflateState<'a, A> {
         self.head.is_some()
     }
 
+    /// Whether this stream can still dereference the caller's `gz_header`:
+    /// [`Mode::dereferences_gzip_header`] applied to the current state.
+    ///
+    /// ★ **Exposed so the facade can ask before it touches the caller's
+    /// `gz_header`, for the same reason as [`InflateState::accepts_gzip_header`]
+    /// -- except that here the question is one of *lifetime* rather than of
+    /// configuration.** `zlib.h` L1075-L1084 asks the application to keep the
+    /// structure and its `extra`, `name` and `comment` buffers available while the
+    /// header is being read; once `head->done` is terminal the caller may free all
+    /// four, and C makes that safe by never revisiting a header state. Only the
+    /// facade holds the raw `gz_headerp`, so only the facade can decline to follow
+    /// it -- and this predicate is the state's answer to "would the reference read
+    /// it on this call?".
+    ///
+    /// [`false`] does not mean no header is installed: a finished parse keeps its
+    /// sink (C keeps `state->head`) and [`InflateState::has_header_sink`] keeps
+    /// reporting `true`. The two are asked together, because the pointer is
+    /// followed only when a sink exists *and* the parse can still write through
+    /// it.
+    #[must_use]
+    pub const fn dereferences_gzip_header(&self) -> bool {
+        self.mode.dereferences_gzip_header()
+    }
+
     /// Takes whatever the parse has assigned to the caller's `gz_header` since the
     /// last call, or [`None`] when there is nothing outstanding.
     ///
@@ -3159,6 +3183,67 @@ mod tests {
         sink.clear_extra();
         assert!(sink.extra_is_absent());
         assert_eq!(sink.write_extra(0, &[9]), 0);
+    }
+
+    /// A finished parse keeps its sink but stops being allowed to follow the
+    /// caller's pointer, and the two questions are therefore independent.
+    ///
+    /// This is the state-level half of the header lifetime contract (`zlib.h`
+    /// L1075-L1084): the facade holds the raw `gz_headerp` and asks both
+    /// questions before it dereferences it, so a stream whose mode has moved
+    /// past `HCRC` must answer `false` here even though a header is still
+    /// installed.
+    #[test]
+    fn a_finished_header_keeps_its_sink_but_stops_being_dereferenceable() {
+        let mut state = new_state(15);
+        assert!(!state.has_header_sink());
+        assert!(state.dereferences_gzip_header(), "a fresh state is in HEAD");
+
+        state.set_header_sink(Some(GzHeaderSink::new(None, None, None)));
+        assert!(state.has_header_sink());
+        assert!(state.dereferences_gzip_header());
+
+        // Every header state still follows it -- a caller may enlarge a capacity
+        // or supply a buffer between calls, which is why the facade re-reads.
+        for mode in [
+            Mode::Head,
+            Mode::Flags,
+            Mode::Time,
+            Mode::Os,
+            Mode::ExLen,
+            Mode::Extra,
+            Mode::Name,
+            Mode::Comment,
+            Mode::HCrc,
+        ] {
+            assert!(state.set_mode_tag(mode.as_raw()));
+            assert!(
+                state.dereferences_gzip_header(),
+                "{} still reads the header",
+                mode.c_name()
+            );
+        }
+
+        // `HCRC -> TYPE`, the transition that makes `head->done` terminal: the
+        // sink survives, the permission does not.
+        assert!(state.set_mode_tag(Mode::Type.as_raw()));
+        assert!(state.has_header_sink());
+        assert!(!state.dereferences_gzip_header());
+
+        // And nor does any later state, including the terminal and error ones.
+        for mode in [Mode::Len, Mode::Check, Mode::Done, Mode::Bad, Mode::Mem] {
+            assert!(state.set_mode_tag(mode.as_raw()));
+            assert!(
+                !state.dereferences_gzip_header(),
+                "{} must not read the header",
+                mode.c_name()
+            );
+        }
+
+        // A reset takes the sink away as well (`inflate.c` L110-L115), which is
+        // the other way the facade learns to forget the pointer.
+        state.set_header_sink(None);
+        assert!(!state.has_header_sink());
     }
 
     #[test]

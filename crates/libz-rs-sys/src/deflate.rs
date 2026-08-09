@@ -450,6 +450,64 @@ unsafe fn with_header<R>(slot: &mut DeflateSlot, body: impl FnOnce(&mut DeflateS
     result
 }
 
+/// Runs `body` with the caller's `gz_header` installed **only while the compressor is
+/// still emitting the header**, and with the structure left entirely untouched once it
+/// is out.
+///
+/// ★ **This is the header's lifetime contract, and it is narrower than
+/// [`with_header`]'s.** `zlib.h` L836-L852 asks the application to keep the
+/// `gz_header` and its `extra`, `name` and `comment` buffers available *until the
+/// header has been written*, and no longer — so a conforming caller frees the whole
+/// structure the moment the gzip header is out. C makes that safe by construction:
+/// every `s->gzhead` dereference inside `deflate()` sits under a
+/// `s->status == GZIP_STATE | EXTRA_STATE | NAME_STATE | COMMENT_STATE | HCRC_STATE`
+/// test (`deflate.c` L1066-L1200), the status only advances, and once `HCRC_STATE`
+/// hands over to `BUSY_STATE` at L1195 the pointer is never followed again.
+///
+/// [`with_header`] reads seven members and scans two NUL-terminated strings, so using
+/// it for every `deflate` call would read a structure the caller was entitled to have
+/// released — a use-after-free reachable from conforming C, observed as a `SIGSEGV`
+/// where the reference completes normally. Asking
+/// [`Status::dereferences_gzip_header`](zlib_rs::deflate::state::Status::dereferences_gzip_header)
+/// first is what reproduces C's own discipline.
+///
+/// The status is read on entry, which is the right instant for the same reason it is
+/// in C: the status ladder cannot re-enter a header stage inside one call. A
+/// `deflateReset` does return it to `GZIP_STATE`, and that is also correct — C's
+/// `deflateResetKeep` deliberately does **not** clear `s->gzhead` (`deflate.c`
+/// L640-L668), so a reset stream re-emits the caller's header and must read it again.
+///
+/// ★ **Not for the bound functions.** `deflateBound_z` reads `s->gzhead` whenever
+/// `|wrap| == 2` and a header is installed, regardless of status (`deflate.c`
+/// L891-L910), and goes on doing so for the whole life of the stream: a caller that
+/// withdraws `extra`, `name` or `comment` sees the bound shrink by exactly the field
+/// cost. Those two entry points therefore keep using [`with_header`] unconditionally.
+///
+/// # Safety
+///
+/// The same as [`with_header`]'s, and discharged on strictly fewer calls: `slot.head`
+/// must be null or address a live `gz_header` whose three buffers are readable as
+/// [`borrow_gz_header`] requires — but only for the calls that reach the read, which
+/// are the ones during which `zlib.h` L836-L852 obliges the caller to keep it alive.
+unsafe fn with_header_while_emitting<R>(
+    slot: &mut DeflateSlot,
+    body: impl FnOnce(&mut DeflateStateC) -> R,
+) -> R {
+    if !slot.state.status().dereferences_gzip_header() {
+        // The header is out (or the stream never had one), so C would not look at the
+        // structure on this call and neither does this. The core's own `gzhead` is
+        // already `None` — `with_header` clears it before returning from every call
+        // that installs it — so there is nothing to clear either, and the compressor
+        // sees exactly the state it would see for a stream with no header installed,
+        // which is what it needs past `BUSY_STATE`.
+        return body(&mut slot.state);
+    }
+
+    // SAFETY: unsafe-site category 6 -- `with_header`'s contract is this function's,
+    // narrowed to the header-emitting statuses above.
+    unsafe { with_header(slot, body) }
+}
+
 // ---------------------------------------------------------------------------
 // `z_stream` member access -- AAP §0.6.1 unsafe-site category 1
 // ---------------------------------------------------------------------------
@@ -2449,12 +2507,13 @@ pub unsafe extern "C" fn deflateParams(strm: z_streamp, level: c_int, strategy: 
         // reach the internal call at all, because `last_flush == -2` is exactly the
         // condition L791 tests to skip it, so it reads nothing and needs nothing.
         //
-        // SAFETY: unsafe-site category 6 -- `with_header`'s contract is this function's:
-        // `head` is null or the pointer the caller passed to `deflateSetHeader`, which
-        // `zlib.h` L838-L845 requires to stay live and readable while the header is
-        // being emitted.
+        // SAFETY: unsafe-site category 6 -- `with_header_while_emitting`'s contract is
+        // this function's: `head` is null or the pointer the caller passed to
+        // `deflateSetHeader`, which `zlib.h` L838-L845 requires to stay live and
+        // readable while the header is being emitted -- which is exactly the window in
+        // which that helper reads it.
         let mut code = unsafe {
-            with_header(block.state_mut(), |state| {
+            with_header_while_emitting(block.state_mut(), |state| {
                 core_deflate_params(state, &mut stream, level, strategy)
             })
         };
@@ -2809,12 +2868,14 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
         // its own canonical validation to the same value C validates.
         let mut stream = unsafe { borrow_stream(&entry, captured_input) };
 
-        // SAFETY: unsafe-site category 6 -- `with_header`'s contract is this function's:
-        // `head` is null or the pointer the caller passed to `deflateSetHeader`, which
-        // `zlib.h` L838-L845 requires to stay live and readable for the duration of the
-        // calls that emit it.
+        // SAFETY: unsafe-site category 6 -- `with_header_while_emitting`'s contract is
+        // this function's: `head` is null or the pointer the caller passed to
+        // `deflateSetHeader`, which `zlib.h` L838-L845 requires to stay live and
+        // readable for the duration of the calls that emit it. Past that point the
+        // helper reads nothing, so a caller which has released the structure -- as that
+        // same paragraph permits -- is not read after the fact.
         let code = unsafe {
-            with_header(block.state_mut(), |state| {
+            with_header_while_emitting(block.state_mut(), |state| {
                 core_deflate(state, &mut stream, flush)
             })
         };
@@ -3528,6 +3589,102 @@ mod tests {
         cursor += NAME.len();
         assert_eq!(&out[cursor..cursor + COMMENT.len()], COMMENT);
         assert!(produced > cursor + COMMENT.len() + 2);
+    }
+
+    /// The `gz_header` **structure itself** may be freed once the header is written,
+    /// and compression continues to `Z_STREAM_END` without reading it again.
+    ///
+    /// ★ The test above withdraws the three *buffers* and keeps the structure, because
+    /// it goes on to call `deflateBound`, which C re-reads the structure for on every
+    /// call (`deflate.c` L891-L910). This one is the other half of the same paragraph
+    /// of `zlib.h` (L836-L852): a caller that is done with the header releases the
+    /// whole allocation, and from that moment `deflate()` must not touch it. C honours
+    /// that because every `s->gzhead` dereference in `deflate()` is guarded by a
+    /// header status (L1066-L1200) and `HCRC_STATE` hands over to `BUSY_STATE` at
+    /// L1195, never to return.
+    ///
+    /// Before [`with_header_while_emitting`] gated it, this library rebuilt the whole
+    /// `GzHeaderView` on entry to every `deflate` call -- seven member reads plus a
+    /// NUL scan of `name` and `comment` -- so a caller that had freed the structure at
+    /// the documented point was read after the fact on every subsequent call. The
+    /// allocation is a `Box` here so that the retained read is a `heap-use-after-free`
+    /// under AddressSanitizer rather than a silent one.
+    #[test]
+    fn the_header_structure_itself_may_be_freed_once_the_header_has_been_written() {
+        const EXTRA: &[u8] = &[0x11, 0x22, 0x33];
+        const NAME: &[u8] = b"freed.txt\0";
+        const COMMENT: &[u8] = b"gone\0";
+
+        let mut strm = blank_stream();
+        init2(&mut strm, 6, GZIP);
+
+        let mut extra: Vec<u8> = EXTRA.to_vec();
+        let mut name: Vec<u8> = NAME.to_vec();
+        let mut comment: Vec<u8> = COMMENT.to_vec();
+        let head: gz_headerp = Box::into_raw(Box::new(gz_header {
+            text: 1,
+            time: 0x0102_0304,
+            xflags: 0,
+            os: 3,
+            extra: extra.as_mut_ptr(),
+            extra_len: uInt::try_from(extra.len()).unwrap(),
+            extra_max: 0,
+            name: name.as_mut_ptr(),
+            name_max: 0,
+            comment: comment.as_mut_ptr(),
+            comm_max: 0,
+            hcrc: 1,
+            done: 0,
+        }));
+        // SAFETY: `strm` holds a gzip state this module installed, and `head` is a
+        // live, aligned `gz_header` whose three buffers are live and NUL-terminated
+        // where the contract requires it.
+        assert_eq!(unsafe { deflateSetHeader(&mut strm, head) }, OK);
+
+        // One call with room to spare puts the whole header out and leaves the status
+        // at `BUSY_STATE` -- the point from which nothing may read the structure.
+        let mut out = vec![0_u8; 512];
+        strm.next_in = HELLO.as_ptr();
+        strm.avail_in = c_uint::try_from(HELLO.len()).unwrap();
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = c_uint::try_from(out.len()).unwrap();
+        // SAFETY: two disjoint live buffers and a state this module installed.
+        assert_eq!(unsafe { deflate(&mut strm, NO_FLUSH) }, OK);
+        let header_bytes = usize::try_from(strm.total_out).unwrap();
+        assert!(
+            header_bytes >= 10 + 2 + EXTRA.len() + NAME.len() + COMMENT.len() + 2,
+            "the whole gzip header must be out before the release"
+        );
+
+        // The caller releases everything: the structure and all three buffers.
+        // SAFETY: `head` came from `Box::into_raw` above and is released exactly once.
+        drop(unsafe { Box::from_raw(head) });
+        drop(extra);
+        drop(name);
+        drop(comment);
+
+        // Finishing the stream must not read one byte of any of them.
+        // SAFETY: `out` is live and disjoint from `HELLO`, and the state is installed.
+        assert_eq!(unsafe { deflate(&mut strm, FINISH) }, STREAM_END);
+        let produced = usize::try_from(strm.total_out).unwrap();
+        // SAFETY: as above.
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, OK);
+
+        // The header emitted before the release is intact, which is what proves the
+        // fields were read while they were still the caller's to read.
+        assert_eq!(&out[..3], &[0x1f, 0x8b, 0x08], "ID1, ID2, CM");
+        assert_eq!(out[3], 0x01 | 0x02 | 0x04 | 0x08 | 0x10, "every FLG bit");
+        assert_eq!(&out[4..8], &0x0102_0304_u32.to_le_bytes(), "MTIME");
+        let xlen = usize::from(u16::from_le_bytes([out[10], out[11]]));
+        assert_eq!(xlen, EXTRA.len());
+        let mut cursor = 12;
+        assert_eq!(&out[cursor..cursor + EXTRA.len()], EXTRA);
+        cursor += EXTRA.len();
+        assert_eq!(&out[cursor..cursor + NAME.len()], NAME);
+        cursor += NAME.len();
+        assert_eq!(&out[cursor..cursor + COMMENT.len()], COMMENT);
+        // The payload and the eight-byte gzip trailer follow the two HCRC bytes.
+        assert!(produced > cursor + COMMENT.len() + 2 + 8);
     }
 }
 

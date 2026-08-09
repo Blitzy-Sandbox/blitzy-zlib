@@ -1176,6 +1176,17 @@ extern "C" {
 /// `Z_MEM_ERROR`. No request the library itself makes can reach that bound:
 /// `MAX_WBITS` (15) and `MAX_MEM_LEVEL` (9) cap the largest at 131072 bytes.
 ///
+/// ★ [`block_len`] declines two classes of request, and the second one matters
+/// here rather than in the core: a product that overflows `usize`, and one that
+/// exceeds `isize::MAX` and so cannot name a single object on either side of the
+/// boundary. Both answer `Z_NULL` **without calling `malloc`**, which is what
+/// keeps this function's behaviour identical on every target and keeps it safe to
+/// call an impossible request into: an instrumented allocator handed one may abort
+/// the process rather than return null -- AddressSanitizer's default response to a
+/// request above its own maximum is a fatal `allocation-size-too-big` error -- and
+/// AAP §0.6.4.5 requires this crate's test suite to run clean under that
+/// sanitizer.
+///
 /// # Safety
 ///
 /// This is an `extern "C"` function whose address is handed to C. It dereferences
@@ -1189,11 +1200,15 @@ pub(crate) unsafe extern "C" fn zlib_rs_zalloc(_opaque: voidpf, items: uInt, siz
     };
 
     // SAFETY: unsafe-site category 4, on the library's own side of it. `malloc` is
-    // the C runtime's, its single argument is a byte count that `block_len` has
-    // proven does not overflow, and a zero count -- which `malloc` may answer with
-    // either null or a unique pointer -- is not reachable here because `block_len`
-    // rejects it. The result is treated as an address only; nothing is read or
-    // written through it.
+    // the C runtime's, and its single argument is a byte count `block_len` has
+    // proven both does not overflow and does not exceed `isize::MAX`, so it is a
+    // count an allocator can meaningfully be asked for. A zero count IS reachable
+    // -- `block_len(0, n)` is `Some(0)` -- and is equally well defined: C89 7.20.3
+    // lets `malloc(0)` answer either null or a unique pointer, and both answers are
+    // handled, because a null return is `zalloc`'s documented failure signal
+    // (`zlib.h` L149) and a unique pointer is released by `zlib_rs_zfree` like any
+    // other. The result is treated as an address only; nothing is read or written
+    // through it.
     let block = unsafe { malloc(bytes) };
     block.cast::<c_void>()
 }
@@ -3909,24 +3924,44 @@ mod tests {
             assert_eq!(block.cast::<u8>().read(), 0x5a);
             zfree(opaque, block);
 
-            // `zalloc`'s documented failure answer is `Z_NULL` (`zlib.h` L149): on a
-            // 32-bit target the product is unrepresentable and `block_len` refuses it
-            // without calling `malloc`, and on a 64-bit target the product is
-            // representable and `malloc` refuses it. Either way the answer is null.
+            // `zalloc`'s documented failure answer is `Z_NULL` (`zlib.h` L149), and
+            // `block_len` produces it here **without calling `malloc` on any target**:
+            // on a 32-bit one the product is unrepresentable, and on a 64-bit one it is
+            // 0xffff_fffe_0000_0001, which is representable but exceeds `isize::MAX`
+            // and so cannot name a single object in Rust or in C.
+            //
+            // ★ That the refusal precedes `malloc` is the property this assertion is
+            // really guarding, because an allocator handed an impossible size need not
+            // politely return null. AddressSanitizer -- which AAP §0.6.4.5 requires
+            // this crate's suite to run clean under -- treats a request above its own
+            // 0x100_0000_0000 maximum as a fatal `allocation-size-too-big` error and
+            // aborts the process, taking every test after this one with it, unless the
+            // job sets `allocator_may_return_null=1`. Refusing the request in
+            // `block_len` is what makes the sanitizer job runnable with its DEFAULT
+            // options, so a genuine finding can never be masked by a configuration
+            // failure.
             //
             // ★ `black_box` is load-bearing, not decoration. Measured on rustc 1.97.1
             // at `opt-level = 3` -- the release profile `make rust-test` builds with:
             // when the returned pointer is *only* null-tested and never otherwise
-            // used, LLVM removes the `malloc` call as a dead allocation and folds the
-            // comparison to `false`, so the assertion fires against a request that was
-            // never made. Observing the pointer keeps the call, and the answer is
-            // `Z_NULL` in both profiles. The library itself is unaffected: every block
-            // it obtains is written and released, so none is ever dead.
+            // used, LLVM can fold the comparison against a call it has proven cannot
+            // succeed, so the assertion would pass without the call being made.
+            // Observing the pointer keeps it. The library itself is unaffected: every
+            // block it obtains is written and released, so none is ever dead.
             let huge = core::hint::black_box(zalloc(opaque, uInt::MAX, uInt::MAX));
             assert!(
                 huge.is_null(),
                 "a product that cannot be honoured must answer Z_NULL"
             );
+            // Deliberately the only impossible request made through this hook. Where
+            // exactly `block_len` draws the line, and that `isize::MAX` bytes itself is
+            // on the permitted side of it, is settled by
+            // `zlib_rs::allocate`'s own `oversized_requests_fail_instead_of_wrapping`
+            // -- which can test the boundary without asking a real allocator for
+            // anything, because it calls `block_len` directly. Probing it from here
+            // would mean issuing a request that is under the bound and therefore
+            // genuinely forwarded to `malloc`, which is the situation this test exists
+            // to keep out of an instrumented run.
             // `zcfree` forwards to `free`, which accepts a null pointer.
             zfree(opaque, core::ptr::null_mut());
         }

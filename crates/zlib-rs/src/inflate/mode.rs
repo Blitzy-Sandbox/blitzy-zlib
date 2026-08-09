@@ -406,6 +406,58 @@ impl Mode {
         self.as_raw() < Self::Check.as_raw()
     }
 
+    /// Whether a parse in this state can still dereference the caller's
+    /// `gz_header`.
+    ///
+    /// ★ **The header states are the *only* states in which the reference
+    /// touches `state->head`, and that is a lifetime contract rather than an
+    /// optimisation.** `zlib.h` L1075-L1084 asks the application to keep the
+    /// structure and its three buffers available while `inflate()` is reading
+    /// the header; once `head->done` is terminal — `1` for a completed gzip
+    /// header, `-1` for a stream that turned out not to be gzip — a conforming
+    /// caller may free all four. C honours that by construction: it never
+    /// revisits a header state, so after `HCRC -> TYPE` the pointer is simply
+    /// never followed again.
+    ///
+    /// The nine states below are that set, enumerated from every `state->head`
+    /// dereference in `inflate.c`:
+    ///
+    /// | State | Sites |
+    /// |---|---|
+    /// | [`Mode::Head`] | L522-L523 `head->done = -1`, the zlib-stream case |
+    /// | [`Mode::Flags`] | L568-L569 `head->text` |
+    /// | [`Mode::Time`] | L577-L578 `head->time` |
+    /// | [`Mode::Os`] | L586-L588 `head->xflags`, `head->os` |
+    /// | [`Mode::ExLen`] | L599-L606 `head->extra_len`, or `head->extra = Z_NULL` |
+    /// | [`Mode::Extra`] | L614-L620 `head->extra`, `head->extra_max`, `head->extra_len` |
+    /// | [`Mode::Name`] | L639-L651 `head->name`, `head->name_max`, or `head->name = Z_NULL` |
+    /// | [`Mode::Comment`] | L661-L673 `head->comment`, `head->comm_max`, or `head->comment = Z_NULL` |
+    /// | [`Mode::HCrc`] | L686-L688 `head->hcrc`, `head->done = 1` |
+    ///
+    /// Nothing after L688 mentions `state->head`; the only other occurrences in
+    /// the file are `inflateResetKeep`'s `state->head = Z_NULL` (L115) and
+    /// `inflateGetHeader`'s `state->head = head` (L1228).
+    ///
+    /// Spelled as an explicit `matches!` rather than as a tag range so that the
+    /// set is readable as the nine C `case` labels it comes from, and so that a
+    /// state inserted into the ladder shows up here as a decision to make rather
+    /// than as a silently widened bound.
+    #[must_use]
+    pub const fn dereferences_gzip_header(self) -> bool {
+        matches!(
+            self,
+            Self::Head
+                | Self::Flags
+                | Self::Time
+                | Self::Os
+                | Self::ExLen
+                | Self::Extra
+                | Self::Name
+                | Self::Comment
+                | Self::HCrc
+        )
+    }
+
     /// The reference implementation's spelling of this state, exactly as
     /// `inflate.h` L21-L52 writes it.
     ///
@@ -657,6 +709,69 @@ mod tests {
         assert!(!Mode::Check.is_before_trailer());
         assert!(!Mode::Length.is_before_trailer());
         assert!(!Mode::Done.is_before_trailer());
+    }
+
+    /// The nine header states, and nothing else, may follow the caller's
+    /// `gz_header` pointer.
+    ///
+    /// Written as an independent list rather than by calling the predicate twice,
+    /// so that the test is a transcription of `inflate.c`'s `case` labels and not
+    /// a restatement of the implementation. The whole-set sweep then proves the
+    /// other twenty-three states are excluded — which is the half that carries
+    /// the lifetime guarantee, because those are the states a stream is in once
+    /// `head->done` is terminal and the caller is entitled to have freed the
+    /// structure.
+    #[test]
+    fn only_the_header_states_dereference_the_callers_gzip_header() {
+        const HEADER_STATES: [Mode; 9] = [
+            Mode::Head,
+            Mode::Flags,
+            Mode::Time,
+            Mode::Os,
+            Mode::ExLen,
+            Mode::Extra,
+            Mode::Name,
+            Mode::Comment,
+            Mode::HCrc,
+        ];
+
+        for state in Mode::ALL {
+            assert_eq!(
+                state.dereferences_gzip_header(),
+                HEADER_STATES.contains(&state),
+                "{} is on the wrong side of the header-lifetime boundary",
+                state.c_name()
+            );
+        }
+
+        // The boundary itself: `HCRC -> TYPE` is where the reference stops
+        // looking (`inflate.c` L688-L692), and TYPE is the state every later
+        // `inflate()` call resumes in.
+        assert!(Mode::HCrc.dereferences_gzip_header());
+        assert!(!Mode::Type.dereferences_gzip_header());
+        // A zlib stream leaves HEAD for DICTID or TYPE having written
+        // `head->done = -1` (L522-L523); neither successor may look again.
+        assert!(!Mode::DictId.dereferences_gzip_header());
+        assert!(!Mode::Dict.dereferences_gzip_header());
+        // Nor may any terminal or error state.
+        assert!(!Mode::Done.dereferences_gzip_header());
+        assert!(!Mode::Bad.dereferences_gzip_header());
+        assert!(!Mode::Mem.dereferences_gzip_header());
+        assert!(!Mode::Sync.dereferences_gzip_header());
+
+        // The set is contiguous and sits at the front of the ladder, which is
+        // what makes "the header is finished" equivalent to "the mode has moved
+        // past HCRC".
+        for state in HEADER_STATES {
+            assert!(state <= Mode::HCrc);
+        }
+        assert_eq!(
+            HEADER_STATES.len(),
+            Mode::ALL
+                .iter()
+                .filter(|state| state.dereferences_gzip_header())
+                .count()
+        );
     }
 
     #[test]

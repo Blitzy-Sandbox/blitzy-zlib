@@ -775,18 +775,59 @@ impl Session<'_> {
     ///
     /// A null `head`, or a stream with no sink installed, is nothing to bind.
     ///
+    /// # ★ And a finished header is nothing to bind either
+    ///
+    /// The three reads below are the *only* place this crate follows the caller's
+    /// `gz_headerp` on a decode call, so this is where the structure's lifetime
+    /// contract is honoured. `zlib.h` L1075-L1084 asks the application to keep the
+    /// `gz_header` -- and whichever of its three buffers it supplied -- available
+    /// while `inflate()` is reading the header, and no longer: once `head->done`
+    /// is `1` for a completed gzip header, or `-1` for a stream that turned out
+    /// not to be gzip, a conforming caller may free all four. C makes that safe by
+    /// construction rather than by promise: every `state->head` dereference in
+    /// `inflate.c` sits inside one of the nine header `case`s (L522-L688), the
+    /// ladder only ever moves forward, and so after `HCRC -> TYPE` the pointer is
+    /// never followed again.
+    ///
+    /// Binding unconditionally would break exactly that: a stream that had
+    /// finished its header would still read six members of a structure the caller
+    /// was entitled to have released, on every subsequent `inflate()` call, for
+    /// the whole life of the stream. That is a use-after-free reachable from
+    /// conforming C -- observed as a `SIGSEGV` where the reference completes, and
+    /// reported by AddressSanitizer as a read of the freed `extra` member.
+    ///
+    /// [`InflateState::dereferences_gzip_header`] is the state's answer to "would
+    /// the reference read it on this call?", and the mode it tests is the one the
+    /// parse is about to *resume* in. That is the right instant to ask, because
+    /// the ladder cannot re-enter a header state inside one call: `HEAD` leaves
+    /// for `FLAGS`, `DICTID`, `TYPE` or `TYPEDO` and `HCRC` leaves for `TYPE`, and
+    /// nothing returns. A reset does return the mode to `HEAD`, and that path is
+    /// already covered from the other side -- `inflateResetKeep` clears the sink
+    /// (`inflate.c` L110-L115) and [`Session::finish`] clears this crate's
+    /// pointer with it, so a reset stream has no header to bind at all until the
+    /// caller installs one again.
+    ///
     /// # Safety
     ///
     /// The `gz_header` recorded in the slot must be live, and each of its non-null
     /// `extra`, `name` and `comment` buffers valid for the capacity it advertises, for
     /// the duration of the call this binding covers -- which is what `zlib.h`
-    /// L1070-L1090 requires of a caller that installs a header.
+    /// L1070-L1090 requires of a caller that installs a header. The requirement is
+    /// discharged for exactly the calls that reach the reads: those whose entry
+    /// mode is a header state, which are the calls during which the caller is
+    /// still obliged to keep the structure alive.
     unsafe fn bind_header_fields(&mut self) {
         let head = self.block.state().head;
         if head.is_null() {
             return;
         }
         if !self.state().has_header_sink() {
+            return;
+        }
+        // The lifetime gate described above. Checked after the two cheap pointer
+        // tests and before anything is read, so that a stream whose header is
+        // finished performs no access to the caller's structure whatsoever.
+        if !self.state().dereferences_gzip_header() {
             return;
         }
 
@@ -4895,6 +4936,167 @@ mod tests {
                 || ret == ReturnCode::BUF_ERROR.as_i32()
                 || ret == ReturnCode::DATA_ERROR.as_i32(),
             "the second call gave {ret}"
+        );
+        // SAFETY: the stream is the initialised one.
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
+    }
+
+    /// The heap form of the case above, for a **gzip** stream: the caller releases
+    /// the whole `gz_header` allocation once `done == 1`, and decoding carries on.
+    ///
+    /// ★ The sibling test puts the structure on the stack, where a retained read is
+    /// a `stack-use-after-scope`. This one puts it in its own heap allocation and
+    /// really frees it, so the same retained read is a `heap-use-after-free` --
+    /// AddressSanitizer's least ambiguous verdict, and the shape a real caller
+    /// produces when it `free()`s the structure it `malloc()`ed. `zlib.h`
+    /// L1075-L1084 permits exactly this, and `inflate.c` never revisits a header
+    /// state, so the reference is unaffected by it; before the mode gate in
+    /// [`Session::bind_header_fields`] this library read six members of the freed
+    /// block on every later call, which is a `SIGSEGV` for a caller whose allocator
+    /// returns the pages to the kernel.
+    #[test]
+    fn a_freed_gzip_header_is_never_read_again() {
+        let gz = gzip_with_every_field();
+        let mut strm = blank_stream();
+        init(&mut strm, 47);
+
+        let mut extra: Vec<u8> = vec![0; 8];
+        let mut name: Vec<u8> = vec![0; 8];
+        let mut comment: Vec<u8> = vec![0; 16];
+        let head = Box::into_raw(Box::new(gz_header {
+            text: 0,
+            time: 0,
+            xflags: 0,
+            os: 0,
+            extra: extra.as_mut_ptr(),
+            extra_len: 0,
+            extra_max: 8,
+            name: name.as_mut_ptr(),
+            name_max: 8,
+            comment: comment.as_mut_ptr(),
+            comm_max: 16,
+            hcrc: 0,
+            done: 0,
+        }));
+        assert_eq!(
+            // SAFETY: the stream is initialised and `head` is a live, aligned
+            // `gz_header` whose three buffers are live for the capacities given.
+            unsafe { inflateGetHeader(&mut strm, head) },
+            ReturnCode::OK.as_i32()
+        );
+
+        let mut out = [0_u8; 32];
+        strm.next_in = gz.as_ptr();
+        strm.avail_in = uInt::try_from(gz.len()).unwrap();
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = 32;
+        // SAFETY: every region is live and disjoint and the stream is initialised.
+        let ret = unsafe { inflate(&mut strm, 0) };
+        assert!(
+            ret == ReturnCode::OK.as_i32() || ret == ReturnCode::STREAM_END.as_i32(),
+            "the header decode gave {ret}"
+        );
+        // SAFETY: `head` is still live here, and `done` was published by the parse.
+        let done = unsafe { core::ptr::addr_of!((*head).done).read() };
+        assert_eq!(done, 1, "the header must be complete before the release");
+        assert_eq!(&name[..5], b"name\0");
+
+        // The caller now does what the documentation permits: it releases the header
+        // allocation and the three buffers, and keeps decoding.
+        // SAFETY: `head` came from `Box::into_raw` above and is released exactly once.
+        drop(unsafe { Box::from_raw(head) });
+        drop(extra);
+        drop(name);
+        drop(comment);
+
+        strm.next_in = gz.as_ptr();
+        strm.avail_in = uInt::try_from(gz.len()).unwrap();
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = 32;
+        // SAFETY: the two regions are live and disjoint and the stream is initialised;
+        // the freed header is deliberately not passed to anything.
+        let ret = unsafe { inflate(&mut strm, 0) };
+        assert!(
+            ret == ReturnCode::STREAM_END.as_i32()
+                || ret == ReturnCode::OK.as_i32()
+                || ret == ReturnCode::BUF_ERROR.as_i32()
+                || ret == ReturnCode::DATA_ERROR.as_i32(),
+            "the call after the release gave {ret}"
+        );
+        // SAFETY: the stream is the initialised one.
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
+    }
+
+    /// The same release, for a stream that turns out **not** to be gzip.
+    ///
+    /// ★ `inflate.c` L522-L523 writes `head->done = -1` from the `HEAD` state -- the
+    /// documented "there will be no gzip header information forthcoming" answer
+    /// (`zlib.h` L1096-L1099) -- and that is just as terminal as `done == 1`: the
+    /// mode leaves for `DICTID` or `TYPE` and never comes back, so the caller may
+    /// release the structure immediately. This is the second of the three paths the
+    /// missing gate left reachable, and it is the one a caller hits when it installs
+    /// a header speculatively on a `windowBits + 32` auto-detecting stream and feeds
+    /// it a zlib stream.
+    #[test]
+    fn a_freed_header_is_never_read_again_after_a_zlib_stream_declines_it() {
+        let zlib = deflate_zlib(b"a zlib stream, not a gzip one");
+        let mut strm = blank_stream();
+        init(&mut strm, 47);
+
+        let head = Box::into_raw(Box::new(gz_header {
+            text: 0,
+            time: 0,
+            xflags: 0,
+            os: 0,
+            extra: core::ptr::null_mut(),
+            extra_len: 0,
+            extra_max: 0,
+            name: core::ptr::null_mut(),
+            name_max: 0,
+            comment: core::ptr::null_mut(),
+            comm_max: 0,
+            hcrc: 0,
+            done: 0,
+        }));
+        assert_eq!(
+            // SAFETY: the stream is initialised and `head` is a live, aligned
+            // `gz_header` with no buffers supplied.
+            unsafe { inflateGetHeader(&mut strm, head) },
+            ReturnCode::OK.as_i32()
+        );
+
+        let mut out = [0_u8; 64];
+        strm.next_in = zlib.as_ptr();
+        strm.avail_in = uInt::try_from(zlib.len()).unwrap();
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = 64;
+        // SAFETY: every region is live and disjoint and the stream is initialised.
+        // `Z_BLOCK` stops at the first block boundary, so the header is settled but
+        // the stream is not finished -- there is decoding left to do afterwards.
+        let ret = unsafe { inflate(&mut strm, 5) };
+        assert!(
+            ret == ReturnCode::OK.as_i32() || ret == ReturnCode::STREAM_END.as_i32(),
+            "the zlib decode gave {ret}"
+        );
+        // SAFETY: `head` is still live here.
+        let done = unsafe { core::ptr::addr_of!((*head).done).read() };
+        assert_eq!(
+            done, -1,
+            "a zlib stream must report that no gzip header is coming"
+        );
+
+        // Terminal, so the caller releases it.
+        // SAFETY: `head` came from `Box::into_raw` above and is released exactly once.
+        drop(unsafe { Box::from_raw(head) });
+
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = 64;
+        // SAFETY: the output region is live and disjoint from the input, and the
+        // stream is initialised; the freed header is deliberately not passed on.
+        let ret = unsafe { inflate(&mut strm, 0) };
+        assert!(
+            ret == ReturnCode::STREAM_END.as_i32() || ret == ReturnCode::OK.as_i32(),
+            "the call after the release gave {ret}"
         );
         // SAFETY: the stream is the initialised one.
         assert_eq!(unsafe { inflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
