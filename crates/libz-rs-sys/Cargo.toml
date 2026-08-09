@@ -300,13 +300,14 @@ zlib-rs = { path = "../zlib-rs", version = "1.3.2" }
 libc = { version = "0.2.189", optional = true }
 
 # ============================================================================
-# No [build-dependencies] — and no C compiler in a cargo build at all
+# No [build-dependencies] — the C compiler is invoked, the `cc` crate is not
 # ============================================================================
 #
-# `build.rs` emits link arguments, stages symlinks and publishes one `cfg`.  It
-# never runs a C compiler, so this manifest needs neither `cc` nor any other build
-# dependency, and `cargo build --release` for the shipped artifacts works on a
-# machine that has no C toolchain installed.  Two things follow, and both are
+# `build.rs` emits link arguments, prunes stale artifact aliases, publishes one
+# `cfg`, and compiles this crate's own two C translation units.  It reaches the
+# platform compiler through `std::process::Command`, so this manifest needs neither
+# `cc` nor any other build dependency, and a `--no-default-features` or
+# `zlib-rs`-only build needs no C toolchain at all.  Two things follow, and both are
 # deliberate:
 #
 #   * The AAP freezes the dependency inventory and records `cc` as a

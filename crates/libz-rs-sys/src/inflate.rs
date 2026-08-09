@@ -3160,7 +3160,7 @@ mod tests {
         inflatePrime, inflateReset, inflateReset2, inflateResetKeep, inflateSetDictionary,
         inflateSync, inflateSyncPoint, inflateUndermine, inflateValidate, message_ptr,
         narrow_uLong, widen_uLong, z_stream, BAD_STATE_MARK, ENOUGH_DISTS, ENOUGH_LENS,
-        MAX_WINDOW_BYTES, MESSAGES, TABLE_INVALID_CODE, TABLE_OK,
+        MAX_INFLATE_FLUSH, MAX_WINDOW_BYTES, MESSAGES, TABLE_INVALID_CODE, TABLE_OK,
     };
     use core::ffi::{c_char, c_int, c_uint, c_ulong, c_ushort, CStr};
     use core::mem::{offset_of, size_of, MaybeUninit};
@@ -3237,6 +3237,176 @@ mod tests {
     /// spelling of that cast is `StatePrefix`, whose `#[repr(C)]` layout places a
     /// `z_streamp` at offset 0 and the `int` tag at offset 8 -- exactly where
     /// `deflate.h` L105-L106 and `inflate.h` L83-L84 place theirs.
+    /// An allocator that hands out blocks until a chosen request, then refuses.
+    ///
+    /// Smaller than `test/infcover.c`'s zone -- it counts rather than tracks, because
+    /// what these tests need is a *named* allocation to fail, not a leak report -- but it
+    /// keeps the live count so a leak is still visible.
+    #[derive(Default)]
+    struct Refuse {
+        /// How many requests have been made.
+        requests: usize,
+        /// Refuse this request and every later one, counting from one; zero refuses
+        /// nothing.
+        deny_from: usize,
+        /// The outstanding blocks, as (address, bytes) so that each can be returned to
+        /// Rust's allocator with the layout it was taken with.
+        blocks: Vec<(*mut u8, usize)>,
+    }
+
+    impl Refuse {
+        /// How many blocks are outstanding.
+        fn live(&self) -> usize {
+            self.blocks.len()
+        }
+    }
+
+    /// A [`Refuse`] zone on the heap, reached only through the one raw pointer it owns.
+    ///
+    /// ★ **A tracking zone cannot live in a local.** The pointer the test installs in
+    /// `z_stream.opaque` is what the allocator hooks dereference, and a later write
+    /// through the *local* -- `zone.deny_from = ...` -- is a write through the local's
+    /// own tag, which invalidates every pointer derived from it. The next `zalloc` then
+    /// dereferences a dead tag, and Miri rejects the test. A C caller has no such rule;
+    /// this is a property of the harness, not of the library.
+    ///
+    /// So the zone is heap-allocated once, the raw pointer is the only handle, and every
+    /// access -- the test's and the hooks' -- derives from that single pointer. That is
+    /// also how a C caller holds its own zone, which is what makes the harness faithful
+    /// rather than merely acceptable.
+    struct Zone(*mut Refuse);
+
+    impl Zone {
+        /// Allocates a fresh zone that refuses nothing.
+        fn new() -> Self {
+            Self(Box::into_raw(Box::new(Refuse::default())))
+        }
+
+        /// The pointer to install as `z_stream.opaque`.
+        fn as_opaque(&self) -> crate::types::voidpf {
+            self.0.cast::<core::ffi::c_void>()
+        }
+
+        /// Borrows the zone through its one raw pointer, for the duration of `body`.
+        fn with<R>(&self, body: impl FnOnce(&mut Refuse) -> R) -> R {
+            // SAFETY: the pointer came from `Box::into_raw` in `Zone::new`, is live until
+            // `Zone::drop`, and is aligned and unique. No other reference to the zone
+            // exists while `body` runs: the library forms one only inside `refuse_alloc`
+            // and `refuse_free`, and neither can be executing while this statement is.
+            body(unsafe { &mut *self.0 })
+        }
+    }
+
+    impl Drop for Zone {
+        /// Releases the allocation, after asserting the zone leaked nothing.
+        fn drop(&mut self) {
+            // SAFETY: the pointer came from `Box::into_raw` in `Zone::new` and this is
+            // the only place it is reclaimed, so it is reclaimed exactly once.
+            let zone = unsafe { Box::from_raw(self.0) };
+            assert_eq!(zone.live(), 0, "the zone must own nothing at the end");
+        }
+    }
+
+    /// The `zalloc` half of [`Refuse`].
+    unsafe extern "C" fn refuse_alloc(
+        opaque: crate::types::voidpf,
+        count: uInt,
+        size: uInt,
+    ) -> crate::types::voidpf {
+        let zone = opaque.cast::<Refuse>();
+        assert!(!zone.is_null(), "the zone is always supplied");
+        // SAFETY: `opaque` is the `&mut Refuse` the test installed, and no other
+        // reference to it exists while this call runs.
+        let zone = unsafe { &mut *zone };
+        zone.requests += 1;
+        if zone.deny_from != 0 && zone.requests >= zone.deny_from {
+            return core::ptr::null_mut();
+        }
+        let len = (count as usize) * (size as usize);
+        let layout = core::alloc::Layout::from_size_align(len.max(1), 16).unwrap();
+        // SAFETY: the layout is non-zero-sized and validly aligned.
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        assert!(!ptr.is_null(), "the test allocator must not fail for real");
+        // Never zeroed, as C's `malloc` is not.
+        // SAFETY: `ptr` is a fresh allocation of `layout.size()` bytes.
+        unsafe { core::ptr::write_bytes(ptr, 0xa5, layout.size()) };
+        zone.blocks.push((ptr, layout.size()));
+        ptr.cast()
+    }
+
+    /// The `zfree` half of [`Refuse`].
+    ///
+    /// Rust's allocator needs the layout a block was taken with, which C's `free` does
+    /// not, so the size is looked up in [`Refuse::blocks`] -- and a free of an address the
+    /// zone never handed out is a defect worth failing on, exactly as
+    /// `test/infcover.c`'s `mem_free` treats one.
+    unsafe extern "C" fn refuse_free(opaque: crate::types::voidpf, address: crate::types::voidpf) {
+        let zone = opaque.cast::<Refuse>();
+        assert!(!zone.is_null(), "the zone is always supplied");
+        // SAFETY: as `refuse_alloc`.
+        let zone = unsafe { &mut *zone };
+        assert!(!address.is_null(), "no null is ever freed");
+        let found = zone
+            .blocks
+            .iter()
+            .position(|&(at, _)| core::ptr::eq(at.cast::<core::ffi::c_void>(), address));
+        let index = found.expect("every free must be of a block this zone handed out");
+        let (at, len) = zone.blocks.remove(index);
+        let layout = core::alloc::Layout::from_size_align(len, 16).unwrap();
+        // SAFETY: `at` came from `std::alloc::alloc` with this exact layout in
+        // `refuse_alloc`, and it has just been removed from the live list, so it cannot be
+        // released twice.
+        unsafe { std::alloc::dealloc(at, layout) };
+    }
+
+    /// A `gz_header` on the heap, reached only through the raw pointer this returns.
+    ///
+    /// ★ A `gz_header` in a local, passed as `&mut head` and then written through the
+    /// local again, is a Stacked Borrows violation *in the test*: the reference passed to
+    /// `inflateGetHeader` is what the library's stored raw pointer derives from, and a
+    /// later direct write to the local invalidates it, so the next `inflate` reading
+    /// through it is undefined behaviour under Miri. A C caller has no such rule -- this
+    /// is a property of the test harness, not of the library -- but a test that Miri
+    /// rejects is a test that cannot be run, so every access here goes through one raw
+    /// pointer with one provenance, which is also how a C caller holds it.
+    ///
+    /// The caller owns the allocation and must release it with [`release_header`].
+    fn header_on_heap(head: gz_header) -> *mut gz_header {
+        Box::into_raw(Box::new(head))
+    }
+
+    /// Releases a header [`header_on_heap`] produced.
+    ///
+    /// # Safety
+    ///
+    /// `head` must have come from [`header_on_heap`] and must not still be installed in a
+    /// live stream.
+    unsafe fn release_header(head: *mut gz_header) {
+        // SAFETY: by this function's contract `head` came from `Box::into_raw` on a
+        // `Box<gz_header>` and has not been released before.
+        drop(unsafe { Box::from_raw(head) });
+    }
+
+    /// A `gz_header` with every member zeroed, as a caller that fills in only what it
+    /// needs starts from.
+    fn zeroed_header() -> gz_header {
+        gz_header {
+            text: 0,
+            time: 0,
+            xflags: 0,
+            os: 0,
+            extra: core::ptr::null_mut(),
+            extra_len: 0,
+            extra_max: 0,
+            name: core::ptr::null_mut(),
+            name_max: 0,
+            comment: core::ptr::null_mut(),
+            comm_max: 0,
+            hcrc: 0,
+            done: 0,
+        }
+    }
+
     fn mode_slot(strm: &z_stream) -> *mut c_int {
         let prefix = strm.state.cast::<StatePrefix>();
         assert!(!prefix.is_null(), "the stream must hold a state");
@@ -3259,6 +3429,56 @@ mod tests {
     // -----------------------------------------------------------------------
     // The message table
     // -----------------------------------------------------------------------
+
+    /// `inflate.c` L183-L195: an init with `Z_NULL` hooks writes the library's own
+    /// routines into the caller's stream and clears `opaque`, and a stream in that
+    /// state can be torn down through the hooks it now holds.
+    ///
+    /// This is what `zlib.h` L151-L153 promises -- if `zalloc` and `zfree` are set
+    /// to `Z_NULL`, the init updates them to use default allocation functions -- and
+    /// it is observable to any caller that reads its own structure back, or that
+    /// hands the stream to `inflateCopy`, which copies all three members verbatim.
+    #[test]
+    fn an_init_with_null_hooks_publishes_the_librarys_own_routines() {
+        let mut strm = blank_stream();
+        // A non-null `opaque` the substitution must clear, and a message the init
+        // must clear (`inflate.c` L182).
+        strm.opaque = core::ptr::addr_of_mut!(strm.reserved).cast::<core::ffi::c_void>();
+        strm.msg = c"stale".as_ptr();
+
+        init(&mut strm, 15);
+
+        assert!(strm.zalloc.is_some(), "inflate.c L184-L190 fills zalloc in");
+        assert!(strm.zfree.is_some(), "inflate.c L191-L195 fills zfree in");
+        assert!(
+            strm.opaque.is_null(),
+            "inflate.c L188 clears opaque with the zalloc substitution"
+        );
+        assert!(strm.msg.is_null(), "inflate.c L182 clears msg");
+        assert!(!strm.state.is_null());
+
+        // The published pair is what the teardown runs through, so a mismatch here
+        // would be a rogue free rather than a wrong value.
+        // SAFETY: `strm` is the live stream this test initialised; the teardown runs
+        // through the hooks that init published.
+        let ended = unsafe { inflateEnd(&mut strm) };
+        assert_eq!(
+            ended,
+            ReturnCode::OK.as_i32(),
+            "the state must be releasable through the hooks the init published"
+        );
+        assert!(strm.state.is_null());
+
+        // And the reverse direction: with the members cleared again -- the state
+        // `test/infcover.c`'s `mem_done` leaves (L231-L233) -- every non-init entry
+        // point refuses the stream, which is `inflateStateCheck`'s first test.
+        strm.zalloc = None;
+        strm.zfree = None;
+        // SAFETY: `strm` is a live, aligned `z_stream` whose state was released just
+        // above, so this is exactly the cleared stream `inflateStateCheck` must refuse.
+        let reset = unsafe { inflateReset(&mut strm) };
+        assert_eq!(reset, ReturnCode::STREAM_ERROR.as_i32());
+    }
 
     #[test]
     fn the_message_table_is_consistent_and_fully_reachable() {
@@ -3598,7 +3818,7 @@ mod tests {
                 );
             }
             // All seven documented values are accepted, `Z_TREES` included.
-            for flush in 0..=6 {
+            for flush in 0..=MAX_INFLATE_FLUSH {
                 let answer = inflate(&mut strm, flush);
                 assert_ne!(answer, ReturnCode::STREAM_ERROR.as_i32(), "flush={flush}");
             }
@@ -4055,7 +4275,7 @@ mod tests {
         let mut extra = [0_u8; 8];
         let mut name = [0_u8; 8];
         let mut comment = [0_u8; 16];
-        let mut head = gz_header {
+        let head = header_on_heap(gz_header {
             text: 7,
             time: 0xdead,
             xflags: 7,
@@ -4069,7 +4289,7 @@ mod tests {
             comm_max: 16,
             hcrc: 7,
             done: 7,
-        };
+        });
 
         let mut strm = blank_stream();
         init(&mut strm, 15);
@@ -4077,7 +4297,7 @@ mod tests {
         // SAFETY: the stream is initialised and `head` is live with live buffers.
         unsafe {
             assert_eq!(
-                inflateGetHeader(&mut strm, &mut head),
+                inflateGetHeader(&mut strm, head),
                 ReturnCode::STREAM_ERROR.as_i32()
             );
             assert_eq!(inflateEnd(&mut strm), ReturnCode::OK.as_i32());
@@ -4092,16 +4312,17 @@ mod tests {
                 inflateGetHeader(&mut strm, core::ptr::null_mut()),
                 ReturnCode::STREAM_ERROR.as_i32()
             );
-            assert_eq!(
-                inflateGetHeader(&mut strm, &mut head),
-                ReturnCode::OK.as_i32()
-            );
+            assert_eq!(inflateGetHeader(&mut strm, head), ReturnCode::OK.as_i32());
         }
         // ★ Only `done` is written on install; the caller's other scalars survive.
-        assert_eq!(head.done, 0);
-        assert_eq!(head.text, 7);
-        assert_eq!(head.time, 0xdead);
-        assert_eq!(head.extra_len, 99);
+        // SAFETY: `head` is the live heap header, read through the same raw pointer the
+        // library holds.
+        unsafe {
+            assert_eq!((*head).done, 0);
+            assert_eq!((*head).text, 7);
+            assert_eq!((*head).time, 0xdead);
+            assert_eq!((*head).extra_len, 99);
+        }
 
         let mut out = [0_u8; 32];
         strm.next_in = gz.as_ptr();
@@ -4116,18 +4337,25 @@ mod tests {
                 || ret == ReturnCode::BUF_ERROR.as_i32(),
             "gzip decode gave {ret}"
         );
-        assert_eq!(head.done, 1, "the header parsed to completion");
-        assert_eq!(head.time, 0x4433_2211);
-        assert_eq!(head.xflags, 0x02);
-        assert_eq!(head.os, 0x03);
-        assert_eq!(head.extra_len, 2);
+        // SAFETY: as above -- one pointer, one provenance.
+        unsafe {
+            assert_eq!((*head).done, 1, "the header parsed to completion");
+            assert_eq!((*head).time, 0x4433_2211);
+            assert_eq!((*head).xflags, 0x02);
+            assert_eq!((*head).os, 0x03);
+            assert_eq!((*head).extra_len, 2);
+            assert_eq!((*head).text, 0);
+            assert_eq!((*head).hcrc, 0);
+        }
         assert_eq!(&extra[..2], &[0xab, 0xcd]);
         assert_eq!(&name[..5], b"name\0");
         assert_eq!(&comment[..8], b"comment\0");
-        assert_eq!(head.text, 0);
-        assert_eq!(head.hcrc, 0);
-        // SAFETY: the stream is the initialised one.
-        assert_eq!(unsafe { inflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
+        // SAFETY: the stream is the initialised one, and the header is released only
+        // after it, so nothing installed can outlive the allocation.
+        unsafe {
+            assert_eq!(inflateEnd(&mut strm), ReturnCode::OK.as_i32());
+            release_header(head);
+        }
     }
 
     #[test]
@@ -4254,33 +4482,20 @@ mod tests {
     fn a_reset_detaches_the_installed_header() {
         // `inflateResetKeep` assigns `state->head = Z_NULL` (`inflate.c` L110), so a
         // reset must leave the caller's structure alone from then on.
-        let mut head = gz_header {
-            text: 0,
-            time: 0,
-            xflags: 0,
-            os: 0,
-            extra: core::ptr::null_mut(),
-            extra_len: 0,
-            extra_max: 0,
-            name: core::ptr::null_mut(),
-            name_max: 0,
-            comment: core::ptr::null_mut(),
-            comm_max: 0,
-            hcrc: 0,
+        let head = header_on_heap(gz_header {
             done: 5,
-        };
+            ..zeroed_header()
+        });
         let mut strm = blank_stream();
         init(&mut strm, 47);
-        // SAFETY: the stream is initialised and `head` is live.
+        // SAFETY: the stream is initialised and `head` is the live heap header, reached
+        // through the one pointer the library also holds.
         unsafe {
-            assert_eq!(
-                inflateGetHeader(&mut strm, &mut head),
-                ReturnCode::OK.as_i32()
-            );
-            assert_eq!(head.done, 0);
+            assert_eq!(inflateGetHeader(&mut strm, head), ReturnCode::OK.as_i32());
+            assert_eq!((*head).done, 0);
             assert_eq!(inflateReset(&mut strm), ReturnCode::OK.as_i32());
+            (*head).done = 5;
         }
-        head.done = 5;
         let mut out = [0_u8; 8];
         let input = [0x1f_u8, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0];
         strm.next_in = input.as_ptr();
@@ -4290,13 +4505,14 @@ mod tests {
         // SAFETY: as above.
         unsafe {
             let _ = inflate(&mut strm, 0);
+            assert_eq!(
+                (*head).done,
+                5,
+                "a detached header must not be written after a reset"
+            );
+            assert_eq!(inflateEnd(&mut strm), ReturnCode::OK.as_i32());
+            release_header(head);
         }
-        assert_eq!(
-            head.done, 5,
-            "a detached header must not be written after a reset"
-        );
-        // SAFETY: the stream is the initialised one.
-        assert_eq!(unsafe { inflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
     }
 
     // -----------------------------------------------------------------------
@@ -4335,6 +4551,636 @@ mod tests {
             // what C's early `return` before `inftrees.c` L308-L309 does.
             assert_eq!(next, table.as_mut_ptr());
             assert_eq!(bits, requested);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Streams whose output members were never set
+    // -----------------------------------------------------------------------
+
+    /// A stream in the shape `test/infcover.c` builds: only the members a caller must
+    /// provide are written, so `next_out`, `avail_out` and `reserved` genuinely hold no
+    /// value.
+    ///
+    /// `MaybeUninit` rather than a poison value, because that is what gives these tests
+    /// teeth: reading an uninitialised member is undefined behaviour that Miri reports,
+    /// where a poison value would merely be a number nobody noticed being read. C's
+    /// `inflateSync`, `inflateGetDictionary`, `inflateSyncPoint` and `inflateCopy` all
+    /// run correctly on such a stream, so this port must too.
+    // Boxed deliberately, and `clippy::unnecessary_box_returns` is wrong about it here:
+    // `inflateInit2_` records the *address* of the `z_stream` in the state block's prefix,
+    // and every later entry point checks it (`inflate.c` L94's `state->strm != strm`).
+    // Returning the value would move it into the caller's slot after that address was
+    // taken, so the recorded owner would be stale and every subsequent call would report
+    // `Z_STREAM_ERROR`. The heap allocation is what keeps the address stable across the
+    // move. Written as a comment rather than the lint's `reason` field, which needs Rust
+    // 1.81 while this workspace declares `rust-version = "1.80"`.
+    #[allow(clippy::unnecessary_box_returns)]
+    fn stream_with_no_output_members(window_bits: c_int) -> Box<MaybeUninit<z_stream>> {
+        let mut raw: Box<MaybeUninit<z_stream>> = Box::new(MaybeUninit::uninit());
+        let strm: *mut z_stream = raw.as_mut_ptr();
+        let (version, size) = version_args();
+        // SAFETY: `strm` addresses a whole `z_stream` this function owns. Each write goes
+        // through a raw place, so nothing is read and no reference to the partly
+        // initialised structure is formed. `inflateInit2_` reads only the three allocator
+        // members, `version` and `stream_size`, all of which are written first.
+        unsafe {
+            core::ptr::addr_of_mut!((*strm).zalloc).write(None);
+            core::ptr::addr_of_mut!((*strm).zfree).write(None);
+            core::ptr::addr_of_mut!((*strm).opaque).write(core::ptr::null_mut());
+            core::ptr::addr_of_mut!((*strm).next_in).write(core::ptr::null());
+            core::ptr::addr_of_mut!((*strm).avail_in).write(0);
+            assert_eq!(
+                inflateInit2_(strm, window_bits, version, size),
+                ReturnCode::OK.as_i32()
+            );
+        }
+        raw
+    }
+
+    /// `inflateSync` works on a stream whose output members hold no value, and leaves
+    /// them alone.
+    ///
+    /// `inflate.c` L1264-L1309 reads `avail_in`, `next_in`, `total_in` and `total_out`
+    /// and writes `avail_in`, `next_in`, `total_in`, `total_out`, `msg`, `data_type` and
+    /// -- for a wrapped stream -- `adler`. The output pair appears nowhere, and
+    /// `zlib.h` L951-L963 asks nothing of it.
+    #[test]
+    fn sync_touches_no_output_member() {
+        let mut raw = stream_with_no_output_members(-15);
+        let strm = raw.as_mut_ptr();
+        // The four-byte sync marker `test/infcover.c` L435 uses.
+        let marker = [0x00_u8, 0x00, 0xff, 0xff];
+        // SAFETY: the stream is the initialised one, `marker` is live for the call, and
+        // every access goes through a raw place.
+        unsafe {
+            core::ptr::addr_of_mut!((*strm).next_in).write(marker.as_ptr());
+            core::ptr::addr_of_mut!((*strm).avail_in).write(4);
+            assert_eq!(inflateSync(strm), ReturnCode::OK.as_i32());
+            assert_eq!(
+                core::ptr::addr_of!((*strm).avail_in).read(),
+                0,
+                "all four marker bytes are consumed"
+            );
+            assert_eq!(
+                core::ptr::addr_of!((*strm).total_in).read(),
+                4,
+                "inflate.c L1294 adds the bytes looked at, and the reset restores it"
+            );
+            // `inflateSyncPoint` reads the state only, so it is safe here too.
+            let _ = inflateSyncPoint(strm);
+            assert_eq!(inflateEnd(strm), ReturnCode::OK.as_i32());
+        }
+    }
+
+    /// A raw stream's `adler` member is neither read nor written, from init to
+    /// `inflateEnd`.
+    ///
+    /// ★ **This is the member whose initialisation C makes conditional, so it is the
+    /// member the facade must never read.** `inflateResetKeep` assigns `strm->adler`
+    /// under `if (state->wrap)` (`inflate.c` L108-L109) and the epilogue under
+    /// `if ((state->wrap & 4) && out)` (L1144-L1146); `windowBits = -15` satisfies
+    /// neither, so the reference leaves the member exactly as the caller left it --
+    /// which for a caller that never set it means *indeterminate*. An earlier revision
+    /// loaded it into the core's view on every call, and Miri reported the read as
+    /// undefined behaviour on precisely this path.
+    ///
+    /// The sentinel is what makes both halves observable at once: it survives only if
+    /// the value is passed over untouched, and a spurious write would replace it with
+    /// the check value the decoder never computes for a raw stream.
+    #[test]
+    fn a_raw_stream_leaves_the_adler_member_alone_through_a_whole_decode() {
+        let payload = b"raw payload, raw payload, raw payload, and again";
+        let wrapped = deflate_zlib(payload);
+        // RFC 1950: a zlib stream is a two-byte header, the raw DEFLATE stream, then a
+        // four-byte Adler-32. The middle is exactly what `windowBits = -15` reads.
+        let raw = &wrapped[2..wrapped.len() - 4];
+
+        let mut strm = blank_stream();
+        let sentinel: c_ulong = 0x0bad_f00d;
+        strm.adler = sentinel;
+        init(&mut strm, -15);
+        assert_eq!(strm.adler, sentinel, "init left it alone (inflate.c L108)");
+
+        let mut out = vec![0_u8; payload.len() + 64];
+        strm.next_in = raw.as_ptr();
+        strm.avail_in = uInt::try_from(raw.len()).unwrap();
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = uInt::try_from(out.len()).unwrap();
+        // SAFETY: the stream is initialised and both regions are live and disjoint.
+        let ret = unsafe { inflate(&mut strm, 4) };
+        assert_eq!(
+            ret,
+            ReturnCode::STREAM_END.as_i32(),
+            "the raw stream decodes"
+        );
+        let produced = out.len() - usize::try_from(strm.avail_out).unwrap();
+        assert_eq!(&out[..produced], payload, "and produces the payload");
+        assert_eq!(
+            strm.adler, sentinel,
+            "and the whole decode left `adler` alone: `wrap & 4` is clear"
+        );
+
+        // A reset does not touch it either, for the same reason.
+        // SAFETY: the stream holds a live state.
+        unsafe {
+            assert_eq!(inflateReset(&mut strm), ReturnCode::OK.as_i32());
+        }
+        assert_eq!(strm.adler, sentinel, "nor does the reset");
+        // SAFETY: as above; the state is ended exactly once.
+        unsafe {
+            assert_eq!(inflateEnd(&mut strm), ReturnCode::OK.as_i32());
+        }
+    }
+
+    /// `inflateSync` reports `Z_BUF_ERROR` for an empty stream without reading the
+    /// output members either.
+    #[test]
+    fn sync_with_no_input_reports_buf_error() {
+        let mut raw = stream_with_no_output_members(-15);
+        let strm = raw.as_mut_ptr();
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(inflateSync(strm), ReturnCode::BUF_ERROR.as_i32());
+            assert_eq!(inflateEnd(strm), ReturnCode::OK.as_i32());
+        }
+    }
+
+    /// `inflateCopy` duplicates a stream whose output members hold no value.
+    ///
+    /// `inflate.c` L1352 is `zmemcpy((voidpf)dest, (voidpf)source, sizeof(z_stream))` --
+    /// a byte copy. Reading the structure as a `z_stream` value instead would read
+    /// `next_out`, `avail_out` and `reserved`, and reading an indeterminate `*mut Bytef`
+    /// is undefined behaviour rather than a garbage value.
+    #[test]
+    fn copy_of_a_stream_with_no_output_members_is_a_byte_copy() {
+        let mut raw = stream_with_no_output_members(-15);
+        let source = raw.as_mut_ptr();
+        let mut copy = blank_stream();
+        // SAFETY: both streams are live, distinct and non-overlapping; `source` holds a
+        // state this library installed.
+        unsafe {
+            assert_eq!(
+                inflateCopy(core::ptr::addr_of_mut!(copy), source),
+                ReturnCode::OK.as_i32()
+            );
+            assert!(!copy.state.is_null(), "the copy has a state of its own");
+            assert!(
+                !core::ptr::eq(copy.state, core::ptr::addr_of!((*source).state).read()),
+                "and it is not the source's"
+            );
+            assert_eq!(
+                inflateEnd(core::ptr::addr_of_mut!(copy)),
+                ReturnCode::OK.as_i32()
+            );
+            assert_eq!(inflateEnd(source), ReturnCode::OK.as_i32());
+        }
+    }
+
+    /// A refused allocation inside `inflateCopy` leaves `dest` **completely** untouched.
+    ///
+    /// `inflate.c` allocates the state at L1341 and the window at L1345, and only once
+    /// both have succeeded does it write anything to the destination: the `zmemcpy` of
+    /// the stream is at L1352 and `dest->state` is assigned last, at L1365. So a caller
+    /// whose copy fails for want of memory finds its structure exactly as it left it.
+    /// An earlier revision installed a placeholder state first and cleared it again on
+    /// failure, which is observable -- `dest->state` changed value and changed back --
+    /// and needlessly so.
+    #[test]
+    fn a_refused_copy_leaves_the_destination_untouched() {
+        for deny_from in [1_usize, 2] {
+            let zone = Zone::new();
+            let mut strm = blank_stream();
+            strm.zalloc = Some(refuse_alloc);
+            strm.zfree = Some(refuse_free);
+            strm.opaque = zone.as_opaque();
+            init(&mut strm, 15);
+
+            // Decode in pieces, so the source owns a window: that is the second
+            // allocation `inflateCopy` has to make.
+            let payload = [b'z'; 300];
+            let compressed = deflate_zlib(&payload);
+            let mut chunk = [0_u8; 64];
+            strm.next_in = compressed.as_ptr();
+            strm.avail_in = uInt::try_from(compressed.len()).unwrap();
+            loop {
+                strm.next_out = chunk.as_mut_ptr();
+                strm.avail_out = 64;
+                // SAFETY: the stream is initialised and both regions are live.
+                let ret = unsafe { inflate(&mut strm, 0) };
+                if ret == ReturnCode::STREAM_END.as_i32() {
+                    break;
+                }
+                assert_eq!(ret, ReturnCode::OK.as_i32());
+            }
+            let taken = zone.with(|zone| zone.requests);
+            assert!(taken >= 2, "the source must own a window by now");
+
+            // A destination filled with values nothing in this call may disturb.
+            let mut dest = blank_stream();
+            dest.next_in = compressed.as_ptr();
+            dest.avail_in = 7;
+            dest.total_in = 11;
+            dest.next_out = chunk.as_mut_ptr();
+            dest.avail_out = 13;
+            dest.total_out = 17;
+            dest.data_type = 19;
+            dest.adler = 23;
+            dest.reserved = 29;
+            let before = dest;
+
+            zone.with(|zone| zone.deny_from = taken + deny_from);
+            // SAFETY: both streams are live, distinct and non-overlapping.
+            let copied = unsafe { inflateCopy(&mut dest, &mut strm) };
+            assert_eq!(
+                copied,
+                ReturnCode::MEM_ERROR.as_i32(),
+                "request {deny_from} of the copy refused"
+            );
+
+            assert!(
+                dest.next_in == before.next_in
+                    && dest.avail_in == before.avail_in
+                    && dest.total_in == before.total_in
+                    && dest.next_out == before.next_out
+                    && dest.avail_out == before.avail_out
+                    && dest.total_out == before.total_out
+                    && dest.msg == before.msg
+                    && dest.state == before.state
+                    && dest.data_type == before.data_type
+                    && dest.adler == before.adler
+                    && dest.reserved == before.reserved,
+                "every member of dest must be untouched"
+            );
+            assert!(
+                dest.state.is_null(),
+                "including a state that was never installed"
+            );
+
+            // The source is still usable, and everything the copy took is back.
+            zone.with(|zone| zone.deny_from = 0);
+            // SAFETY: the stream is the initialised one.
+            assert_eq!(unsafe { inflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
+            assert_eq!(
+                zone.with(|zone| zone.live()),
+                0,
+                "a refused copy leaks nothing"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The dictionary
+    // -----------------------------------------------------------------------
+
+    /// `inflateGetDictionary` writes `*dictLength` and never reads it, and copies the
+    /// whole history rather than clamping to whatever the member happened to hold.
+    ///
+    /// `inflate.c` L1176-L1183 copies `state->whave` bytes and then assigns
+    /// `*dictLength = state->whave`; the member is an output. `zlib.h` L936-L942 puts
+    /// the capacity promise on the caller -- "32768 bytes is always enough" -- so there
+    /// is nothing to clamp against. An earlier revision read the member as a capacity,
+    /// which truncated the copy whenever it held a small value: below it holds zero, the
+    /// value a caller most naturally passes, and a clamp to zero would copy nothing at
+    /// all.
+    #[test]
+    fn get_dictionary_writes_the_length_and_never_reads_it() {
+        let payload: Vec<u8> = (0..600_u32).map(|index| (index % 251) as u8).collect();
+        let compressed = deflate_zlib(&payload);
+
+        let mut strm = blank_stream();
+        init(&mut strm, 15);
+        let mut produced: Vec<u8> = Vec::new();
+        let mut chunk = [0_u8; 100];
+        strm.next_in = compressed.as_ptr();
+        strm.avail_in = uInt::try_from(compressed.len()).unwrap();
+        // Decoded in 100-byte pieces, because the window is filled by `updatewindow`
+        // (`inflate.c` L1128-L1133) only when output is flushed: a single-shot decode
+        // into one large buffer with `Z_FINISH` leaves `whave` at zero, in C as here.
+        loop {
+            strm.next_out = chunk.as_mut_ptr();
+            strm.avail_out = 100;
+            // SAFETY: the stream is initialised and both regions are live and disjoint.
+            let ret = unsafe { inflate(&mut strm, 0) };
+            produced.extend_from_slice(&chunk[..100 - usize::try_from(strm.avail_out).unwrap()]);
+            if ret == ReturnCode::STREAM_END.as_i32() {
+                break;
+            }
+            assert_eq!(ret, ReturnCode::OK.as_i32());
+        }
+        assert_eq!(produced, payload);
+
+        // ★ Zero, as a caller that expects an output would leave it -- and the value an
+        // earlier revision clamped the copy to, copying nothing at all.
+        let mut length: uInt = 0;
+        // 0xa5 rather than zero, so that "not written" is distinguishable from "written
+        // as zero" -- the payload contains zero bytes.
+        let mut dictionary = vec![0xa5_u8; 32768];
+        // SAFETY: the stream holds a live state; `dictionary` is 32768 bytes, the space
+        // `zlib.h` L936-L942 requires; `length` is a live `uInt`.
+        let ret = unsafe {
+            inflateGetDictionary(
+                &mut strm,
+                dictionary.as_mut_ptr(),
+                core::ptr::addr_of_mut!(length),
+            )
+        };
+        assert_eq!(ret, ReturnCode::OK.as_i32());
+
+        // 500, not 600, and the number is the reference's. Measured by running this
+        // exact fixture -- 600 bytes decoded in 100-byte pieces -- against the C library:
+        // it reports `dictLength = 500`, the history `updatewindow` had added by the
+        // time the stream ended, and the bytes are the first 500 of the payload because
+        // the window has not wrapped. A one-shot `Z_FINISH` decode into one large buffer
+        // reports 0 in both implementations, which is why this test feeds chunks.
+        let reported = usize::try_from(length).unwrap();
+        assert_eq!(
+            reported, 500,
+            "the length the reference reports for this fixture"
+        );
+        assert_eq!(
+            &dictionary[..reported],
+            &payload[..reported],
+            "the history is copied in order, despite *dictLength arriving as zero"
+        );
+        assert!(
+            dictionary[reported..].iter().all(|byte| *byte == 0xa5),
+            "and nothing beyond the history is written"
+        );
+
+        // Either pointer may be null, independently (L1176 and L1182).
+        // SAFETY: as above; the nulls are the point of the calls.
+        unsafe {
+            let mut only_length: uInt = 12345;
+            assert_eq!(
+                inflateGetDictionary(
+                    &mut strm,
+                    core::ptr::null_mut(),
+                    core::ptr::addr_of_mut!(only_length)
+                ),
+                ReturnCode::OK.as_i32()
+            );
+            assert_eq!(usize::try_from(only_length).unwrap(), reported);
+            assert_eq!(
+                inflateGetDictionary(&mut strm, dictionary.as_mut_ptr(), core::ptr::null_mut()),
+                ReturnCode::OK.as_i32()
+            );
+            assert_eq!(inflateEnd(&mut strm), ReturnCode::OK.as_i32());
+        }
+    }
+
+    /// The same on a stream whose output members hold no value, and with no history yet.
+    #[test]
+    fn get_dictionary_on_a_fresh_stream_reports_nothing_and_reads_nothing() {
+        let mut raw = stream_with_no_output_members(15);
+        let strm = raw.as_mut_ptr();
+        let mut length: uInt = 999;
+        let mut dictionary = [0_u8; 32];
+        // SAFETY: the stream is the initialised one; both out-parameters are live.
+        unsafe {
+            assert_eq!(
+                inflateGetDictionary(
+                    strm,
+                    dictionary.as_mut_ptr(),
+                    core::ptr::addr_of_mut!(length)
+                ),
+                ReturnCode::OK.as_i32()
+            );
+            assert_eq!(length, 0, "no history yet");
+            assert_eq!(inflateEnd(strm), ReturnCode::OK.as_i32());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The gzip header, bound per call
+    // -----------------------------------------------------------------------
+
+    /// A buffer supplied *after* `inflateGetHeader` is filled, and a capacity enlarged
+    /// between calls is honoured.
+    ///
+    /// C reads `head->extra`, `head->extra_max`, `head->name`, `head->name_max`,
+    /// `head->comment` and `head->comm_max` inside the `EXTRA`, `NAME` and `COMMENT`
+    /// states -- `inflate.c` L608-L620, L625-L634, L640-L649 -- so the values that
+    /// matter are the ones present when the bytes arrive, not when the header was
+    /// installed. An earlier revision read them once, in `inflateGetHeader`, and so
+    /// ignored anything a caller did afterwards.
+    #[test]
+    fn a_header_buffer_supplied_after_get_header_is_still_filled() {
+        // FLG = 0x1c: FEXTRA | FNAME | FCOMMENT.
+        let mut gz: Vec<u8> = vec![0x1f, 0x8b, 0x08, 0x1c, 0x11, 0x22, 0x33, 0x44, 0x02, 0x03];
+        gz.extend_from_slice(&[0x02, 0x00, 0xab, 0xcd]);
+        gz.extend_from_slice(b"a-name\0");
+        gz.extend_from_slice(b"a-comment\0");
+        gz.extend_from_slice(&[0x01, 0x00, 0x00, 0xff, 0xff]);
+        gz.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        gz.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+        let head = header_on_heap(zeroed_header());
+
+        let mut strm = blank_stream();
+        init(&mut strm, 47);
+        // Installed with every buffer absent.
+        // SAFETY: the stream is initialised and `head` is the live heap header.
+        let installed = unsafe { inflateGetHeader(&mut strm, head) };
+        assert_eq!(installed, ReturnCode::OK.as_i32());
+
+        // Supplied afterwards, which C honours and a snapshot would not.
+        let mut extra = [0_u8; 8];
+        let mut name = [0_u8; 16];
+        let mut comment = [0_u8; 16];
+        // SAFETY: `head` is the live heap header; every write goes through the same raw
+        // pointer the library holds, so the provenance the library reads through stays
+        // valid -- which is the whole reason the header is not a local.
+        unsafe {
+            (*head).extra = extra.as_mut_ptr();
+            (*head).extra_max = 8;
+            (*head).name = name.as_mut_ptr();
+            (*head).name_max = 16;
+            (*head).comment = comment.as_mut_ptr();
+            (*head).comm_max = 16;
+        }
+
+        let mut out = [0_u8; 32];
+        strm.next_in = gz.as_ptr();
+        strm.avail_in = uInt::try_from(gz.len()).unwrap();
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = 32;
+        // SAFETY: the stream is initialised, every region is live and disjoint, and the
+        // header and its three buffers outlive the call.
+        let ret = unsafe { inflate(&mut strm, 0) };
+        assert!(
+            ret == ReturnCode::OK.as_i32() || ret == ReturnCode::STREAM_END.as_i32(),
+            "gzip decode gave {ret}"
+        );
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!((*head).done, 1, "the header parsed to completion");
+            assert_eq!((*head).time, 0x4433_2211);
+            assert_eq!((*head).os, 0x03);
+        }
+        assert_eq!(&extra[..2], &[0xab, 0xcd], "the extra field, bound late");
+        assert_eq!(&name[..7], b"a-name\0", "the name, bound late");
+        assert_eq!(&comment[..10], b"a-comment\0", "the comment, bound late");
+        // SAFETY: the stream is the initialised one, released before the header.
+        unsafe {
+            assert_eq!(inflateEnd(&mut strm), ReturnCode::OK.as_i32());
+            release_header(head);
+        }
+    }
+
+    /// A member the parse never assigns keeps the caller's value, and no member is read
+    /// to achieve that.
+    ///
+    /// A zlib stream is not a gzip stream, so `inflate` sets `done` to -1 (`inflate.c`
+    /// L509) and assigns nothing else. Every other member must therefore still hold what
+    /// the caller put there -- including the four a decoding caller need never
+    /// initialise at all.
+    #[test]
+    fn a_header_the_stream_does_not_carry_leaves_every_member_alone() {
+        let payload = b"hello, hello!";
+        let compressed = deflate_zlib(payload);
+
+        let head = header_on_heap(gz_header {
+            text: 5,
+            time: 0xfeed,
+            xflags: 6,
+            os: 7,
+            extra_len: 99,
+            hcrc: 8,
+            done: 4,
+            ..zeroed_header()
+        });
+
+        let mut strm = blank_stream();
+        // 47 accepts either container, so a zlib stream reaches the gzip-header check.
+        init(&mut strm, 47);
+        // SAFETY: the stream is initialised and `head` is the live heap header.
+        unsafe {
+            assert_eq!(inflateGetHeader(&mut strm, head), ReturnCode::OK.as_i32());
+            assert_eq!((*head).done, 0, "inflate.c L1229 writes only this one");
+            assert_eq!((*head).text, 5);
+            assert_eq!((*head).hcrc, 8);
+        }
+
+        let mut out = [0_u8; 32];
+        strm.next_in = compressed.as_ptr();
+        strm.avail_in = uInt::try_from(compressed.len()).unwrap();
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = 32;
+        // SAFETY: the stream is initialised and every region is live and disjoint.
+        let finished = unsafe { inflate(&mut strm, 4) };
+        assert_eq!(finished, ReturnCode::STREAM_END.as_i32());
+        assert_eq!(&out[..payload.len()], payload);
+
+        // SAFETY: as above -- one pointer, one provenance.
+        unsafe {
+            assert_eq!((*head).done, -1, "inflate.c L509: not a gzip stream");
+            assert_eq!((*head).text, 5, "untouched");
+            assert_eq!((*head).time, 0xfeed, "untouched");
+            assert_eq!((*head).xflags, 6, "untouched");
+            assert_eq!((*head).os, 7, "untouched");
+            assert_eq!((*head).extra_len, 99, "untouched");
+            assert_eq!((*head).hcrc, 8, "untouched");
+            assert_eq!(inflateEnd(&mut strm), ReturnCode::OK.as_i32());
+            release_header(head);
+        }
+    }
+
+    /// A build that runs out of space still leaves in the caller's array every entry
+    /// it wrote before it stopped.
+    ///
+    /// ★ C builds straight into the caller's table, so the `return 1` at `inftrees.c`
+    /// L287 leaves the entries written so far behind -- an earlier revision of this
+    /// wrapper built into scratch space and copied out nothing at all on failure,
+    /// discarding them. The expected values below are **measured** from the reference
+    /// implementation, by filling the table with a sentinel, calling C's
+    /// `inflate_table` with these exact arguments, and recording which entries changed:
+    ///
+    /// | root | return | entries written | contents |
+    /// |---|---|---|---|
+    /// | 1 | 1 | 1 | `[0] = {op 16, bits 1, val 1}` |
+    /// | 2 | 1 | 3 | `{16,1,1}`, `{16,2,2}`, `{16,1,1}` |
+    /// | 15 | 1 | 0 | nothing |
+    ///
+    /// The writes form a prefix in every case, with no gaps.
+    #[test]
+    fn a_table_that_runs_out_of_space_publishes_what_it_wrote() {
+        let mut lens = [0_u16; 16];
+        for (index, slot) in lens.iter_mut().enumerate().take(15) {
+            *slot = u16::try_from(index + 1).unwrap();
+        }
+        lens[15] = 15;
+
+        // The sentinel C's `code` array holds before the call. Any entry still equal to
+        // it afterwards is one the build did not write.
+        let sentinel = code {
+            op: 0xaa,
+            bits: 0xaa,
+            val: 0xaaaa,
+        };
+        let expected: [(c_uint, &[code]); 3] = [
+            (
+                1,
+                &[code {
+                    op: 16,
+                    bits: 1,
+                    val: 1,
+                }],
+            ),
+            (
+                2,
+                &[
+                    code {
+                        op: 16,
+                        bits: 1,
+                        val: 1,
+                    },
+                    code {
+                        op: 16,
+                        bits: 2,
+                        val: 2,
+                    },
+                    code {
+                        op: 16,
+                        bits: 1,
+                        val: 1,
+                    },
+                ],
+            ),
+            (15, &[]),
+        ];
+
+        for (requested, written) in expected {
+            let mut work = [0_u16; 16];
+            let mut table = vec![sentinel; ENOUGH_DISTS];
+            let mut next: *mut code = table.as_mut_ptr();
+            let mut bits: c_uint = requested;
+            // SAFETY: as the test above -- three distinct arrays, each at least as long
+            // as the call requires, and two live in/out locals.
+            let ret = unsafe {
+                _zlib_rs_inflate_table(
+                    DISTS,
+                    lens.as_mut_ptr().cast::<c_ushort>(),
+                    16,
+                    &mut next,
+                    &mut bits,
+                    work.as_mut_ptr().cast::<c_ushort>(),
+                )
+            };
+            assert_eq!(ret, 1, "root {requested}");
+            assert_eq!(next, table.as_mut_ptr(), "root {requested}: *table is C's");
+            assert_eq!(bits, requested, "root {requested}: *bits is C's");
+            assert_eq!(
+                &table[..written.len()],
+                written,
+                "root {requested}: the entries C writes must be published"
+            );
+            assert!(
+                table[written.len()..]
+                    .iter()
+                    .all(|entry| *entry == sentinel),
+                "root {requested}: no entry beyond C's may be touched"
+            );
         }
     }
 

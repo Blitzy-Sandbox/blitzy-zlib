@@ -96,6 +96,83 @@
 	    <depend name="inffast.h" />
 	</source>
     </library>
+
+    <!--
+    Rust workspace source set.  Built with Cargo, not by this manifest.
+
+    The fifteen C translation units above remain the authoritative description of
+    the retained reference implementation, and they are what this manifest builds.
+    They are read and never edited: they are the algorithmic oracle that the
+    memory-safe Rust reimplementation of this library is developed and
+    differentially tested against.  The Rust crates below carry no source, depend
+    or include-file entry of their own, deliberately: a .rs path offered to a
+    consumer of this manifest would be offered to a C compiler.
+
+    Workspace root:
+
+      Cargo.toml           virtual manifest: members, shared package metadata,
+                           workspace lints, release profile
+      Cargo.lock           committed, because this workspace ships a system library
+      rust-toolchain.toml  toolchain channel, with rustfmt and clippy
+      .rustfmt.toml        formatting policy
+      clippy.toml          lint thresholds
+      deny.toml            cargo deny license and advisory policy
+      cbindgen.toml        C header generation, diffed against zlib.h
+      rust/README.md       developer guide for the port
+
+    crates/zlib-rs         The safe core.  Carries forbid(unsafe_code) with no_std
+                           plus alloc and an empty dependencies table, so it pulls
+                           in no third party crate at all.  Every algorithm lives
+                           here.
+                           subtrees:   adler32/  crc32/  deflate/  trees/
+                                       inflate/ (inftrees and inffast folded in)
+                                       gz/
+                           top level:  lib.rs  allocate.rs  error.rs  config.rs
+                                       read_buf.rs  weak_slice.rs  infback.rs
+                                       compress.rs  uncompress.rs
+
+    crates/libz-rs-sys     The C ABI facade, and the only crate permitted to write
+                           unsafe.  [lib] name = "z" with
+                           crate-type = ["cdylib", "staticlib", "rlib"] makes Cargo
+                           emit libz.so and libz.a from one definition of the
+                           exported surface.  build.rs drives the packaging, and
+                           csrc/ holds the two C translation units stable Rust
+                           cannot declare: the variadic gzprintf and gzvprintf, and
+                           the codetype prototype of inflate_table.
+
+    crates/zlib-rs-differential
+                           Dev-only oracle harness.  Its build script compiles the
+                           C units above into a test-only archive, so both
+                           implementations are co-resident in one test process and
+                           comparing them is a memory compare.  It appears in the
+                           dependencies table of neither shipped crate, which is
+                           what keeps reference zlib an oracle rather than a build
+                           dependency.
+
+    fuzz/                  Dev-only cargo fuzz targets; its own workspace, excluded
+                           from the root one.
+    benches/               Dev-only criterion benchmark suites.
+
+    Packaging is unaffected.  Both implementations emit the same library named by
+    dlname above, install the same two public headers, and export the same ABI
+    under the same zlib.map version script: libz.so.1.3.2.1-motley with SONAME
+    libz.so.1, the libz.so.1 and libz.so symlinks onto it, and libz.a.  A consumer
+    includes zlib.h and links -lz either way, unrecompiled.
+
+    Entry points, spelled without the leading dashes their cargo and make options
+    need, because an XML comment may not hold two consecutive hyphens.  README,
+    rust/README.md and Makefile.in carry the exact command lines:
+
+      cargo build      release profile, packages zlib-rs and libz-rs-sys
+      cargo build      release profile, package libz-rs-sys, features libz-compat
+      cargo test       release profile, whole workspace
+      make rust        stage the installable shared and static drop-in libraries
+      make rust-test   link and run the unmodified C drivers against them
+      make rust-header regenerate the cbindgen header and diff it against zlib.h
+      make rust-clean  remove the Cargo target directory and the staged artifacts
+      cmake            configure with the ZLIB_BUILD_RUST option for the same
+                       drop-in through CMake
+    -->
 </package>
 
 <!--

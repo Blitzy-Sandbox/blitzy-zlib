@@ -1,12 +1,20 @@
 CMakeLists.txt  cmake build file
+Cargo.lock      pinned Rust dependency versions for reproducible builds
+Cargo.toml      Cargo workspace manifest for the Rust implementation
 ChangeLog       history of changes
 FAQ             Frequently Asked Questions about zlib
 INDEX           this file
 Makefile        dummy Makefile that tells you to ./configure
 Makefile.in     template for Unix Makefile
 README          guess what
+cbindgen.toml   cbindgen config to generate and verify the C header
+clippy.toml     Rust lint thresholds for the Cargo workspace
 configure       configure script for Unix
+deny.toml       cargo-deny license and advisory policy
 make_vms.com    makefile for VMS
+rust-toolchain.toml
+                Rust toolchain channel and required components
+.rustfmt.toml   Rust source formatting policy
 test/example.c  zlib usages examples for build testing
 test/minigzip.c minimal gzip-like functionality for build testing
 test/infcover.c inf*.c code coverage for build coverage testing
@@ -21,12 +29,17 @@ zlib.pc.cmakein zlib.pc template for cmake
 zlib2ansi       perl script to convert source files for C++ compilation
 
 amiga/          makefiles for Amiga SAS C
+benches/        criterion benchmark suites for the Rust implementation
+crates/         Cargo workspace: zlib-rs (safe core), libz-rs-sys (C ABI
+                library) and zlib-rs-differential (C oracle test harness)
 doc/            documentation for formats and algorithms
+fuzz/           cargo-fuzz targets for the Rust implementation
 msdos/          makefiles for MSDOS
 old/            makefiles for various architectures and zlib documentation
                 files that have not yet been updated for zlib 1.2.x
 os400/          makefiles for OS/400
 qnx/            makefiles for QNX
+rust/           developer guide for the Rust implementation
 watcom/         makefiles for OpenWatcom
 win32/          makefiles for Windows
 
@@ -65,3 +78,6 @@ See examples/README.examples
 
                 unsupported contributions by third parties
 See contrib/README.contrib
+
+                Rust source files used to build the Rust library
+See rust/README.md

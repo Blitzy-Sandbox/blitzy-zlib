@@ -117,6 +117,34 @@
 //! the staged library from `ZLIB_VERSION` in `zlib.h`. What `./configure` adds is the
 //! C oracle build that `make rust-symbols` compares against.
 //!
+//! ## Which artifact is the drop-in replacement
+//!
+//! ★ **The shipping library is the relinked, versioned, localized, symlinked one
+//! that `make rust` stages in `target/dropin/`, not the bare `libz.so` rustc
+//! emits.** State it that way round, because the difference is not cosmetic and
+//! cannot be closed inside cargo:
+//!
+//! | Property of the C `libz.so.1.3.2.1-motley` | bare rustc `cdylib` | `make rust` artifact |
+//! |---|---|---|
+//! | all 95 exported functions | **no** — `gzprintf` and `gzvprintf` are variadic, so they live in the C shim, whose objects a cdylib cannot re-export; the `libz.a` cargo emits does define all 95 | yes, relinked from that archive |
+//! | 16 `ZLIB_*` symbol-version nodes | **no**, and unreachable: rustc's own anonymous-tag version script cannot be combined with `zlib.map`'s named tags | yes |
+//! | `zlib.map`'s `local:` names hidden | **no** — `inflate_table` and the two `_zlib_rs_gzprintf_*` helpers stay visible, because stable Rust has no per-item hidden visibility for a `#[no_mangle]` item | yes, by `objcopy --localize-symbols` before the relink |
+//! | `SONAME libz.so.1` | yes | yes |
+//! | `libz.so.1.3.2.1-motley` ← `libz.so.1` ← `libz.so` | **no**, and deliberately so — see below | yes, the C build's exact topology |
+//!
+//! The symlinks are the part that bites silently rather than loudly. The SONAME
+//! is `libz.so.1`, so a program linked against this library asks the loader for
+//! that exact name; when only `libz.so` exists the loader falls back to the
+//! **system** `libz.so.1` and every drop-in test passes while exercising the
+//! wrong library. Staging the chain beside the *bare cdylib* does not fix that —
+//! it makes it worse, because the name then resolves to an object that cannot
+//! satisfy a variadic-`gz` caller, and cargo puts that directory first on the
+//! library search path of every build script it launches. `build.rs` therefore
+//! prunes any such alias an earlier revision left behind and writes
+//! `README-cargo-artifacts.txt` saying so; only `make rust` stages the chain, in
+//! `target/dropin`, beside a library that can answer for it. Every drop-in check
+//! has to confirm with `ldd` which file was actually bound.
+//!
 //! ## The import name, which is not the package name
 //!
 //! ★ Note the asymmetry, and note it precisely, because it is easy to get
