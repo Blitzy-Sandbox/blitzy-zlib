@@ -212,14 +212,18 @@ use crate::types::{uInt, uLong, widen, z_off64_t, z_off_t, z_size_t, Bytef};
 /// it, the value is provably in range; without it, the lint fires.
 ///
 /// ★ On i686 and on LLP64 Windows `uLong` is already `u32`, so the masked expression
-/// is `u32 as u32` and `trivial_numeric_casts` plus `clippy::unnecessary_cast` fire
-/// instead. No single spelling is clean on every supported target -- `u32::from` would
-/// be a `useless_conversion` there and `u32::try_from` an
-/// `unnecessary_fallible_conversion` -- so the two are allowed here, scoped to this
-/// one-line function exactly as `crate::deflate`'s width helpers scope theirs.
+/// is `u32 as u32` and three lints fire instead of none: `trivial_numeric_casts` and
+/// `clippy::unnecessary_cast` on the cast, and `clippy::identity_op` on the mask, which
+/// covers the full `u32` range there and so has no effect. No single spelling is clean on
+/// every supported target -- `u32::from` would be a `useless_conversion` there and
+/// `u32::try_from` an `unnecessary_fallible_conversion` -- so the three are allowed here,
+/// scoped to this one-line function exactly as `crate::deflate`'s width helpers scope
+/// theirs. The mask is kept because it is load-bearing on LP64, where it is what makes the
+/// narrowing provably in range, and because it mirrors the C source's own
+/// `crc1 & 0xffffffff`.
 #[inline]
 #[must_use]
-#[allow(trivial_numeric_casts, clippy::unnecessary_cast)]
+#[allow(trivial_numeric_casts, clippy::unnecessary_cast, clippy::identity_op)]
 const fn narrow_checksum(value: uLong) -> u32 {
     (value & 0xffff_ffff) as u32
 }
@@ -717,6 +721,14 @@ mod tests {
     ///
     /// Written as a mask rather than `value >> 32` so it does not overflow on LLP64
     /// Windows, where `uLong` is only 32 bits wide and the shift would panic.
+    ///
+    /// ★ On exactly those targets the complement is zero, so the expression is
+    /// `value & 0 == 0` and both `clippy::bad_bit_mask` and `clippy::erasing_op` fire --
+    /// correctly, and unhelpfully: the answer really is a constant `true` where `uLong`
+    /// cannot hold a thirty-second bit. That is the intended reading, and the mask is what
+    /// keeps the LP64 build meaningful, so the two are allowed here for the same
+    /// target-dependence reason [`narrow_checksum`] documents.
+    #[allow(clippy::bad_bit_mask, clippy::erasing_op)]
     fn fits_in_32_bits(value: uLong) -> bool {
         value & !0xffff_ffff == 0
     }

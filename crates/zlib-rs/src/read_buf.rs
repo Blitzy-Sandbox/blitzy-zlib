@@ -410,45 +410,36 @@ impl<'a> InputCursor<'a> {
 pub struct InitView {
     /// Written slots as the bytes they hold.
     shared: fn(&[MaybeUninit<u8>]) -> &[u8],
-    /// Written slots as bytes that may be written again.
-    exclusive: fn(&mut [MaybeUninit<u8>]) -> &mut [u8],
 }
 
 impl InitView {
-    /// Wraps the two reinterpretations [`OutputRegion`] uses.
+    /// Wraps the one reinterpretation [`OutputRegion`] uses.
     ///
     /// # Contract
     ///
-    /// Each function must return the bytes of the slots it is given, unchanged, as a slice
-    /// of the same length over the same memory. Both are called **only** on slices all of
-    /// whose elements have been written. See the type documentation for why a view that
-    /// breaks this produces wrong output rather than undefined behaviour, and why the
-    /// constructor is therefore not marked `unsafe`.
+    /// The function must return the bytes of the slots it is given, unchanged, as a slice of
+    /// the same length over the same memory. It is called **only** on slices all of whose
+    /// elements have been written. See the type documentation for why a view that breaks
+    /// this produces wrong output rather than undefined behaviour, and why the constructor
+    /// is therefore not marked `unsafe`.
     ///
-    /// The `exclusive` form exists for one caller: the gzip layer's transparent read path
-    /// hands a window of the caller's buffer to the operating system, and a file read needs
-    /// somewhere it may *write* -- see [`OutputRegion::writable_bytes`], which is the only
-    /// place it is used and which zero-fills the range first.
+    /// ★ **Shared only, and deliberately.** An exclusive counterpart existed, for the gzip
+    /// layer's transparent read path: a file read needs somewhere it may *write*, and the
+    /// only way to obtain that from write-only storage is to initialise it first. Doing so
+    /// destroys the bytes past the count `gzread` returns, which C leaves untouched, so that
+    /// path now stages its read through the layer's own buffer instead
+    /// (`crate::gz::read::gz_read`). With it went the only reason for a view that hands out
+    /// writable bytes, and the region's promise -- that a view is applied only to slots it
+    /// has itself written -- is the stronger for having exactly one way out.
     #[must_use]
-    pub const fn new(
-        shared: fn(&[MaybeUninit<u8>]) -> &[u8],
-        exclusive: fn(&mut [MaybeUninit<u8>]) -> &mut [u8],
-    ) -> Self {
-        Self { shared, exclusive }
+    pub const fn new(shared: fn(&[MaybeUninit<u8>]) -> &[u8]) -> Self {
+        Self { shared }
     }
 
-    /// Applies the shared view to `slots`, all of which the caller has established are
-    /// written.
+    /// Applies the view to `slots`, all of which the caller has established are written.
     #[inline]
     fn apply(self, slots: &[MaybeUninit<u8>]) -> &[u8] {
         (self.shared)(slots)
-    }
-
-    /// Applies the exclusive view to `slots`, all of which the caller has established are
-    /// written.
-    #[inline]
-    fn apply_mut(self, slots: &mut [MaybeUninit<u8>]) -> &mut [u8] {
-        (self.exclusive)(slots)
     }
 }
 
@@ -700,6 +691,36 @@ impl<'o> OutputRegion<'o> {
         }
     }
 
+    /// Narrows this region to its first `count` slots, keeping the storage's own lifetime.
+    ///
+    /// The difference from [`OutputRegion::reborrow`] is the lifetime: that one hands out a
+    /// sub-region borrowed from `&mut self`, which is right for a caller that keeps using
+    /// the whole region afterwards, whereas this one *consumes* the region and returns a
+    /// narrower one with the same `'o`. [`crate::infback::inflate_back`] needs the second
+    /// shape: `infback.c` L1163-L1166 states a *minimum* window size, so a generous caller
+    /// may pass more than `1 << windowBits` bytes and the decoder must use exactly
+    /// `state->wsize` of them for the whole call.
+    ///
+    /// The high-water mark is carried across unchanged, clamped to the new length -- a slot
+    /// that was written is still written. Returns [`None`] when `count` exceeds the region.
+    #[must_use]
+    pub fn into_prefix(self, count: usize) -> Option<Self> {
+        match self.storage {
+            Storage::Init(buf) => Some(Self::init(buf.get_mut(..count)?)),
+            Storage::WriteOnly {
+                slots,
+                view,
+                filled,
+            } => Some(Self {
+                storage: Storage::WriteOnly {
+                    slots: slots.get_mut(..count)?,
+                    view,
+                    filled: filled.min(count),
+                },
+            }),
+        }
+    }
+
     /// Reborrows `count` slots at `start` as a region of their own.
     ///
     /// The gzip read layer needs this: `gzread.c` L367-L378 hands part of the caller's
@@ -722,45 +743,26 @@ impl<'o> OutputRegion<'o> {
             }
         }
     }
-    /// `count` bytes at `start` as an ordinary writable byte slice, initialising them first
-    /// if the storage is write-only.
-    ///
-    /// # ★ The one operation here that can cost a pass over the region
-    ///
-    /// Every other write goes straight into the storage as it is. This one cannot, because
-    /// its caller is the gzip layer's transparent read path (`gzread.c` L369), which hands
-    /// a window of the caller's buffer to the operating system: a file read needs a
-    /// destination it may write, and on stable Rust that means an initialised
-    /// `&mut [u8]` -- `std::io::Read` has no uninitialised-buffer form.
-    ///
-    /// So for write-only storage the range is zero-filled and then reinterpreted, which is
-    /// one extra pass over exactly the bytes about to be read from the file, and nothing
-    /// more. It is confined to that one path: a gzip member decompresses through
-    /// [`OutputCursor`], and a small request is served from the layer's own buffer through
-    /// [`OutputRegion::write_slice_at`], neither of which fills anything.
-    ///
-    /// For [`OutputRegion::init`] storage there is no cost at all -- the bytes are already
-    /// bytes -- which is the case every Rust caller and every test takes.
-    ///
-    /// Returns [`None`] when the range does not lie inside the region.
-    pub fn writable_bytes(&mut self, start: usize, count: usize) -> Option<&mut [u8]> {
-        let end = start.checked_add(count)?;
-        match &mut self.storage {
-            Storage::Init(buf) => buf.get_mut(start..end),
-            Storage::WriteOnly {
-                slots,
-                view,
-                filled,
-            } => {
-                let window = slots.get_mut(start..end)?;
-                for slot in window.iter_mut() {
-                    slot.write(0);
-                }
-                *filled = (*filled).max(end);
-                Some(view.apply_mut(window))
-            }
-        }
-    }
+    // ★ There is deliberately **no** operation here that turns write-only storage into an
+    // ordinary `&mut [u8]`, and none may be added.
+    //
+    // One existed, for the gzip layer's transparent read path (`gzread.c` L367-L369), which hands
+    // a window of the caller's buffer to the operating system: a file read needs a destination it
+    // may write, and on stable Rust that means an initialised `&mut [u8]` because
+    // `std::io::Read` has no uninitialised-buffer form. It obtained one by zero-filling the range
+    // first.
+    //
+    // That is not sound as a *behaviour*, whatever its memory safety. C's `gz_load` loop advances
+    // `*have` by each `read` return and gives up only when one returns `<= 0`, so it under-fills
+    // the window just at end of file -- and everything past the count `gzread` reports is left as
+    // the caller had it. The count is the only thing that describes what was written, so a caller
+    // may rely on the rest surviving. Filling the whole offered window destroys precisely those
+    // bytes. `crate::gz::read::gz_read` stages that read through the layer's own output buffer
+    // instead and copies only the delivered prefix; the reasoning is at that call site.
+    //
+    // Every write here therefore goes straight into the storage as it is, and the only way bytes
+    // leave a write-only region is `OutputRegion::initialized`, which clamps to the high-water
+    // mark. That is what makes the promise `InitView` relies on structural rather than argued.
 }
 
 impl<'o> From<&'o mut [u8]> for OutputRegion<'o> {

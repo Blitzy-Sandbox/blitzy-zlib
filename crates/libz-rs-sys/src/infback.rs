@@ -79,16 +79,42 @@
 //!    `1 << windowBits` is evaluated, so that a caller's `0`, `64` or `-15`
 //!    becomes `Z_STREAM_ERROR` rather than a shift overflow.
 //!    `test/infcover.c` L479 passes `0`.
-//! 2. The window is rebuilt as a borrowed `&mut [u8]` of exactly `1 << windowBits`
-//!    bytes, once, on entry to [`inflateBackInit_`], and the core borrows it for
-//!    the state's whole life. That is [`zlib_rs::infback::inflate_back_init`]'s
-//!    signature, which takes `&'a mut [u8]` rather than an owned buffer.
+//! 2. The window is rebuilt as a borrowed region of exactly `1 << windowBits` bytes
+//!    once per [`inflateBack`] call and never held between calls. It is
+//!    **write-only** storage: `infback.c` L25-L64 writes not one byte of it, `zlib.h`
+//!    L1163-L1166 asks only for room, and `test/infcover.c` L475 hands over an
+//!    uninitialised stack array, so there is nothing to make a `&mut [u8]` out of and
+//!    filling it to manufacture one would destroy bytes the caller may still want.
+//!    [`crate::types::window_slots_mut`] produces the slots and
+//!    [`zlib_rs::infback::inflate_back_into`] takes the region -- the same shape a C
+//!    caller's `next_out` already takes.
 //! 3. The caller must therefore keep that buffer alive, and unaliased, until
 //!    [`inflateBackEnd`]. `test/infcover.c` L475 uses a 32768-byte stack array
 //!    (`unsigned char win[32768];`), which satisfies the requirement for exactly
 //!    as long as `cover_back` is on the stack. The obligation is stated in
 //!    [`inflateBackInit_`]'s own `# Safety` section, because no Rust lifetime can
 //!    express it across an `extern "C"` boundary.
+//!
+//! ★ **Staged input may live inside the window and is served by copying; a callback
+//! chunk inside the window is declined.** The two get different answers because the
+//! reference gives them different standing, not because one is harder.
+//!
+//! * `strm->next_in` is invited by `zlib.h` L1181-L1188 with no constraint on where it
+//!   lives, and the caller demonstrably put real bytes there. So the region is copied
+//!   through the stream's own allocator — in the entry point, which is the last moment
+//!   before the window becomes a reference — and the decoder reads the copy; the address
+//!   published back into `next_in` is translated to the caller's own.
+//!   [`StagedSnapshot`] carries the argument, the residual difference and the translation.
+//! * A chunk `in()` returns from inside the window cannot be served, and the reason is the
+//!   callback contract rather than this port's borrow rules: `infback.c` L172-L174 obliges
+//!   the application to leave those bytes unchanged until the next call, while `zlib.h`
+//!   L1141-L1146 has `inflateBack` writing the window as it decodes, so the obligation is
+//!   one the application cannot keep. With the window arriving as write-only storage the
+//!   unwritten part of it holds nothing to supply either. It is declined the way the
+//!   callback would have declined honestly — `Z_BUF_ERROR`, null `next_in`. See
+//!   [`CallerInput::next_chunk`].
+//!
+//! Every call whose input lies outside the window copies nothing.
 //!
 //! The window's *contents* are irrelevant: `test/infcover.c` L87 fills every
 //! allocation with `0xa5` precisely to catch code that assumes zeros. What makes
@@ -178,6 +204,19 @@
 //! safer of the two responses to state corruption, so the difference is not a
 //! reluctant compromise.
 //!
+//! ★ **Stopping earlier must not counterfeit an input failure.** C's `default` arm is
+//! reached with `next` and `have` exactly as `PULL()` left them, and `next = Z_NULL`
+//! happens on one path only — `in()` returned zero (`infback.c` L104). `zlib.h`
+//! L1199-L1202 makes that the documented discriminator: for `Z_BUF_ERROR`, "an input or
+//! output error can be distinguished using `strm->next_in` which will be `Z_NULL` only
+//! if `in()` returned an error". Declining the chunk is how this module stops the
+//! decode, so the pair the callback delivered is recorded and published instead of that
+//! null — see [`ModeWatch::stalled`] — and the two channels stay separate. For the same
+//! reason a mode written by a callback that *fails* is never acted on: `PULL()`'s own
+//! test runs first and its `goto inf_leave` skips the `switch`, so that combination is
+//! `Z_BUF_ERROR` with a null `next_in`, which is what [`CallerInput::next_chunk`]
+//! answers.
+//!
 //! A callback that writes a mode `inflateBack` *can* drive is not emulated: C
 //! would honour it as a state transition and this treats it as noise. No
 //! documented interface exposes the mode, `test/infcover.c` writes only `SYNC`
@@ -255,17 +294,18 @@ use core::ffi::{c_char, c_int, c_uint, c_void};
 use zlib_rs::config::validate_inflate_back_window_bits;
 use zlib_rs::error::ReturnCode;
 use zlib_rs::infback::{
-    inflate_back as core_inflate_back, inflate_back_end as core_inflate_back_end,
-    inflate_back_init as core_inflate_back_init, InflateBackInput, InflateBackOutput,
+    inflate_back_end as core_inflate_back_end, inflate_back_init as core_inflate_back_init,
+    inflate_back_into as core_inflate_back_into, InflateBackInput, InflateBackOutput,
     OutputFailure,
 };
 use zlib_rs::inflate::{InflateState, Mode};
+use zlib_rs::read_buf::OutputRegion;
 
 use crate::inflate::{message_ptr, version_error};
 use crate::panic_guard::{fallback, guard_code};
 use crate::types::{
-    checked_state_mut, in_func, input_slice, install_state, out_func, ranges_are_disjoint,
-    take_state, uInt, widen, window_bytes_mut, window_slice_mut, z_streamp, Bytef, StateKind,
+    checked_state_mut, in_func, init_view, install_state, out_func, ranges_are_disjoint,
+    take_state, uInt, widen, window_slots_mut, z_streamp, AliasScratch, Bytef, StateKind,
     StatePrefix, StreamAllocator,
 };
 
@@ -332,7 +372,7 @@ struct BackSlot {
 /// ★ No reference to the block is formed, by either this function or its result.
 /// `addr_of_mut!` produces a raw place, and the pointer it derives covers only the
 /// four tag bytes. That is what makes it safe to read and write the tag while
-/// [`core_inflate_back`] holds a `&mut` over the decoder state, which lives past
+/// [`core_inflate_back_into`] holds a `&mut` over the decoder state, which lives past
 /// the prefix at offset 16: the two byte ranges are disjoint, the pointer is
 /// derived from the block address rather than from that borrow, and the borrow of
 /// the enclosing [`crate::types::StateBlock`] is never used again once the tag
@@ -390,7 +430,103 @@ fn drivable(tag: c_int) -> bool {
     }
 }
 
-/// Watches the C-visible mode slot across a callback, and latches a hostile write.
+/// The staged-input snapshot: at most one per `inflateBack` call, owned by the entry point.
+///
+/// # ★ Why staged input inside the window has to be *served*
+///
+/// The window is the decoder's output buffer -- `zlib.h` L1141-L1146 says so in as many
+/// words, "by simply making the window itself the output buffer" -- and the decoder holds
+/// it for the whole call. Input the caller staged at `next_in` may nonetheless lie inside
+/// it: `zlib.h` L1181-L1188 invites staged input and says nothing about where it may live,
+/// C assigns two raw pointers and runs, and the caller demonstrably *did* put real bytes
+/// there. Refusing would be an error this library invented.
+///
+/// A `&[u8]` over bytes the window's own borrow covers is not expressible, so the region is
+/// **copied** before either borrow exists -- which is the only moment at which it can be,
+/// and is why this is taken in the entry point rather than anywhere deeper. The decoder
+/// then reads the copy.
+///
+/// The residual difference is which bytes it reads once the decoder's output catches up
+/// with the unread input: C reads whatever it has just written over, this reads the entry
+/// values. C's answer there is a function of its own write order and is documented nowhere,
+/// so this is a choice inside the space C leaves undefined -- and it is the more defined of
+/// the two. Every call whose staged input lies outside the window, which is every ordinary
+/// call, copies nothing.
+///
+/// ★ **What `in()` returns is a different question and gets a different answer**; see
+/// [`CallerInput::next_chunk`], which declines a chunk inside the window on the authority
+/// of the callback contract itself.
+///
+/// # ★ The address the caller gets back is always the caller's own
+///
+/// `infback.c` L567 publishes `next`, and for a copied run `next` would point into this
+/// library's scratch block -- an address the caller never supplied and which stops existing
+/// when the call returns. [`Self::translate`] maps it back: the core reports how much of the
+/// copy is unread, and the same offset from the caller's own base is what `next_in`
+/// receives. A caller cannot tell a copied run from a direct one by inspecting its stream.
+///
+/// # ★ The value must not move once a view has been taken
+///
+/// [`AliasScratch::view`] fabricates a `'static` slice whose provenance descends from the
+/// borrow it was taken through. Moving the [`AliasScratch`] afterwards -- into a `Cell`, or
+/// through any function that retags the block -- invalidates that slice, and Miri reports it
+/// as undefined behaviour rather than tolerating it. So this value lives in a local for the
+/// whole call, the view is taken in place, and [`Self::release`] is the last thing that
+/// touches it.
+#[derive(Default)]
+struct StagedSnapshot {
+    /// The copy, while it is live.
+    scratch: Option<AliasScratch>,
+
+    /// `(origin, copy, len)`: the caller's own base, the copy's base, and the extent both
+    /// share. [`None`] when nothing was copied.
+    mapping: Option<(*const Bytef, *const Bytef, usize)>,
+}
+
+impl core::fmt::Debug for StagedSnapshot {
+    /// Reports whether a copy is live and where it maps, but never its bytes.
+    ///
+    /// Written by hand because [`zlib_rs::allocate::Buffer`] -- what an [`AliasScratch`]
+    /// owns -- carries no [`Debug`], deliberately: a block obtained from a caller's `zalloc`
+    /// is storage, not a value, and formatting its contents would mean reading memory the
+    /// library was handed in order to write.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StagedSnapshot")
+            .field("copied", &self.scratch.is_some())
+            .field("mapping", &self.mapping)
+            .finish()
+    }
+}
+
+impl StagedSnapshot {
+    /// Maps an address inside the copy back to the caller's own buffer.
+    ///
+    /// Returns [`None`] when nothing was copied or when `at` lies outside the copy, which is
+    /// every direct call: the address the core reported is then already the caller's.
+    fn translate(&self, at: *const Bytef) -> Option<*const Bytef> {
+        let (origin, copy, len) = self.mapping?;
+        // `offset_from` is defined only within one allocation and `at` may legitimately be
+        // one past the end, so the arithmetic is done on addresses.
+        let offset = (at as usize).checked_sub(copy as usize)?;
+        if offset > len {
+            return None;
+        }
+        Some(origin.wrapping_add(offset))
+    }
+
+    /// Returns the copy's block to the allocator it came from, if there is one.
+    ///
+    /// Must be called after every borrow of the copy has ended -- which for this type means
+    /// after the core has returned and after [`Self::translate`] has been consulted.
+    fn release(&mut self, allocator: &StreamAllocator) {
+        if let Some(scratch) = self.scratch.as_mut() {
+            scratch.release(allocator);
+        }
+        self.mapping = None;
+    }
+}
+
+/// Watches the C-visible mode slot across a callback, and latches a hostile write./// Watches the C-visible mode slot across a callback, and latches a hostile write.
 ///
 /// One of these is shared by the two adapters for the duration of a single
 /// [`inflateBack`] call, which is why the interior mutability is a [`Cell`]: both
@@ -411,6 +547,27 @@ struct ModeWatch {
     /// The *first* is kept rather than the last, because C's dispatch stops at the
     /// first such value it sees and never looks again.
     latched: Cell<Option<c_int>>,
+
+    /// The chunk `in()` had just delivered when a hostile write was latched, as the
+    /// callback itself published it: `(buf, count)`.
+    ///
+    /// ★ **This is what keeps a null `next_in` meaning what `zlib.h` L1199-L1202 says
+    /// it means.** In C the mode write happens *inside* `in()`, so `PULL()` completes
+    /// normally -- `have` is the count, `next` is the pointer -- and only the next
+    /// dispatch notices, falling to `default:` and reaching `inf_leave` with both
+    /// locals intact (`infback.c` L554-L568). C's `next = Z_NULL` at L104 is reached
+    /// on one path and one path only: `in()` returned zero. So a caller may read a
+    /// null `next_in` as "the input callback failed" and nothing else, which is
+    /// exactly the discriminator the documentation promises for `Z_BUF_ERROR`.
+    ///
+    /// This module stops the decode by declining the chunk, which would otherwise
+    /// look identical to that failure. Recording the delivered pair here, and
+    /// publishing it in the epilogue, is what separates the two channels.
+    ///
+    /// [`None`] means no mode-stop occurred on the input side -- either none occurred
+    /// at all, or `out()` was the callback that tripped it, in which case the core's
+    /// own unused-input report is already right.
+    stalled: Cell<Option<(*const Bytef, usize)>>,
 }
 
 impl ModeWatch {
@@ -419,6 +576,7 @@ impl ModeWatch {
         Self {
             slot,
             latched: Cell::new(None),
+            stalled: Cell::new(None),
         }
     }
 
@@ -473,6 +631,24 @@ impl ModeWatch {
     fn latched(&self) -> Option<c_int> {
         self.latched.get()
     }
+
+    /// Records the chunk `in()` had just delivered when the write was latched.
+    ///
+    /// Called only from [`CallerInput::next_chunk`], only after the callback has been
+    /// found to have succeeded, and only once -- the first latch stops the decode, so
+    /// no later call can reach it. `(buf, count)` are the callback's own published
+    /// values, unexamined and uncopied: it is the *caller's* address that has to go
+    /// back into `next_in`, never a snapshot of it.
+    fn stall(&self, buf: *const Bytef, count: usize) {
+        if self.stalled.get().is_none() {
+            self.stalled.set(Some((buf, count)));
+        }
+    }
+
+    /// The stalled chunk, or [`None`] when no input-side mode-stop occurred.
+    fn stalled(&self) -> Option<(*const Bytef, usize)> {
+        self.stalled.get()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -492,8 +668,8 @@ struct CallerInput<'w> {
     desc: *mut c_void,
     /// The shared mode watch, consulted the instant `call` returns.
     watch: &'w ModeWatch,
-    /// The window's start address, so that a returned chunk overlapping it can be
-    /// refused before it becomes a reference. See [`CallerInput::next_chunk`].
+    /// The window's start address, so a returned chunk lying inside it can be judged
+    /// before it becomes a reference. See [`CallerInput::next_chunk`].
     window: *const Bytef,
     /// The window's extent, paired with `window`.
     window_len: usize,
@@ -528,14 +704,15 @@ impl<'i> InflateBackInput<'i> for CallerInput<'_> {
         // through it is in bounds and correctly typed.
         let count = unsafe { (self.call)(self.desc, core::ptr::addr_of_mut!(buf)) };
 
-        // ★ Re-read the mode NOW, before the count is even looked at: the callback
-        // has had its chance to write the slot, and this is the earliest point C's
-        // dispatch could act on it. See the module documentation.
-        if !self.watch.observe() {
-            return None;
-        }
-
         // L103: a zero count is failure, whatever `buf` holds.
+        //
+        // ★ **Judged before the mode slot is re-read, because that is C's order.**
+        // `PULL()`'s own test runs the instant `in()` returns and its `goto inf_leave`
+        // at L106 skips the `switch` entirely, so a mode a *failing* callback wrote is
+        // never dispatched on and never seen. The answer for that combination is
+        // `Z_BUF_ERROR` with a null `next_in` -- the input-failure channel -- not the
+        // `default:` arm's `Z_STREAM_ERROR`. Consulting the watch first would report
+        // the wrong one of the two.
         if count == 0 {
             return None;
         }
@@ -546,18 +723,49 @@ impl<'i> InflateBackInput<'i> for CallerInput<'_> {
             return None;
         }
 
-        // ★ **A chunk overlapping the window is refused, for the same reason and with
-        // the same answer.** The window is the decoder's output buffer and is held as a
-        // `&mut [u8]` for the whole call; a `&[u8]` over any of the same bytes would
-        // alias it, which is undefined behaviour whether or not either is touched. C has
-        // no such constraint -- it holds two raw pointers -- so a callback *can* hand
-        // back a region inside the window, and nothing in `zlib.h` L1167-L1178 forbids
-        // it. It would be a strange thing to do, since the decoder overwrites the window
-        // as it goes, but "strange" is not "impossible", and this is untrusted input.
+        // ★ Re-read the mode NOW: the callback has had its chance to write the slot,
+        // and this is the earliest point C's dispatch could act on it. See the module
+        // documentation.
         //
-        // `ranges_are_disjoint` compares addresses and dereferences nothing, so the test
-        // is safe on whatever the callback returned, and it runs before the slice exists.
-        if !ranges_are_disjoint(buf, widen(count), self.window, self.window_len) {
+        // The chunk is recorded before declining it. C's `default:` arm is reached with
+        // `next` and `have` exactly as `PULL()` left them, so the epilogue must publish
+        // the callback's own pointer and count rather than the null that means "`in()`
+        // failed" -- see [`ModeWatch::stalled`].
+        if !self.watch.observe() {
+            self.watch.stall(buf, widen(count));
+            return None;
+        }
+
+        let len = widen(count);
+
+        // ★ **A chunk lying inside the window is declined, on the authority of the callback
+        // contract itself.** Two documented obligations make the combination impossible to
+        // honour, not merely awkward:
+        //
+        // * The window *is* the output buffer, which `inflateBack` writes as it decodes
+        //   (`zlib.h` L1141-L1146).
+        // * The bytes `in()` publishes must not change "until `in()` is called again or
+        //   until `inflateBack()` returns" (`infback.c` L172-L174).
+        //
+        // A chunk inside the window is input that `inflateBack` itself overwrites, so the
+        // application cannot keep the promise the second obligation requires of it. And with
+        // the window arriving as write-only storage -- which is what `zlib.h` L1163-L1166
+        // permits and `test/infcover.c` L475 actually passes -- the part of it the decoder
+        // has not written holds nothing at all, so there is no input there to supply. This
+        // is therefore outside the contract rather than an input the reference serves and
+        // this one refuses.
+        //
+        // Copying is not an alternative here, unlike the *staged* case: by the time `in()`
+        // runs the decoder already holds the window exclusively, so reading those bytes at
+        // all -- through a slice or through a raw pointer -- would invalidate that borrow.
+        // Miri reports it. [`StagedSnapshot`] can copy only because it runs before the
+        // window borrow exists.
+        //
+        // The answer is the one the callback would have given by declining honestly:
+        // `Z_BUF_ERROR` with a null `next_in` (`infback.c` L104-L106, and `zlib.h`
+        // L1199-L1201). `ranges_are_disjoint` compares addresses and dereferences nothing,
+        // so the judgement is made before any slice exists.
+        if !ranges_are_disjoint(buf, len, self.window, self.window_len) {
             return None;
         }
 
@@ -567,8 +775,9 @@ impl<'i> InflateBackInput<'i> for CallerInput<'_> {
         // L172-L174 obliges the application to leave those bytes unchanged until the
         // next call or until `inflateBack` returns, which is the stability this
         // borrow requires. The library only reads through it, so a shared slice is
-        // the right shape.
-        Some(unsafe { core::slice::from_raw_parts(buf, widen(count)) })
+        // the right shape, and the test above established that it does not overlap the
+        // window borrow the entry point holds.
+        Some(unsafe { core::slice::from_raw_parts(buf, len) })
     }
 }
 
@@ -812,22 +1021,16 @@ pub unsafe extern "C" fn inflateBackInit_(
         };
 
         // ★ L59's `state->window = window` is **not** performed here as a stored borrow. The
-        // pointer and its extent are recorded in the slot below and turned into a `&mut [u8]`
+        // pointer and its extent are recorded in the slot below and turned into a region
         // only inside `inflateBack`, for the duration of one call. See `BackSlot`.
         //
-        // What *is* done here, exactly once per stream, is initialising those bytes. A
-        // `&mut [u8]` may not address indeterminate memory, and the caller's window is
-        // storage rather than values -- `zlib.h` L1142-L1178 asks only for room. Filling it
-        // at init costs one memset of at most 32 KiB per stream instead of one per call, and
-        // it is what makes the per-call borrow sound. The borrow taken for the fill ends
-        // here: nothing keeps it.
-        //
-        // SAFETY: unsafe-site categories 2 and 4 -- initialisation followed by slice
-        // reconstruction. `window` is non-null by the guard above and trivially aligned for
-        // `u8`; `extent` is `1 << windowBits` with `windowBits` already inside `8..=15`, so
-        // it is a count this function's contract makes writable. No other view of the window
-        // exists at this point, and this one is dropped at the end of the statement.
-        let _filled: &mut [u8] = unsafe { window_slice_mut(window, extent) };
+        // ★ **And not one byte of the window is touched here**, because `infback.c` L25-L64
+        // touches none either: it records the pointer and the extent and returns. `zlib.h`
+        // L1163-L1166 asks only for room, `test/infcover.c` L475 passes an uninitialised
+        // stack array, and a caller that had something in that buffer keeps it until the
+        // decoder writes output over it. The window reaches the decoder as write-only
+        // storage instead -- `window_slots_mut` plus `OutputRegion::write_only` -- which is
+        // the same shape a C caller's `next_out` takes and needs no fill to be sound.
 
         // L56-L62: `dmax`, `wbits`, `wsize`, `wnext`, `whave` and `sane`, all set by
         // the core's constructor, which re-validates `windowBits` so the two cannot
@@ -1015,47 +1218,75 @@ pub unsafe extern "C" fn inflateBack(
             (slot.window, slot.window_len)
         };
 
-        // ★ **Staged input that overlaps the window is refused before either becomes a
-        // reference.** The window is about to be borrowed as `&mut [u8]` -- it *is* the
-        // output buffer -- and the staged input as `&[u8]`; two such borrows over one
-        // region are undefined behaviour even if neither is touched. C holds two raw
-        // pointers and has no such constraint, so nothing in `zlib.h` L1163-L1190
-        // forbids the caller from staging bytes inside its own window, and this is
-        // untrusted input. `Z_STREAM_ERROR` is the fail-closed answer and the module
-        // documentation records the divergence.
+        // The allocator the snapshot, if one is needed, comes from.
         //
-        // `ranges_are_disjoint` compares addresses only, so this runs before any borrow
-        // exists -- which is the only point at which the answer can still be acted on.
-        if !ranges_are_disjoint(staged_ptr, staged_len, window_ptr.cast_const(), window_len) {
-            return fallback::STREAM_ERROR_CODE;
-        }
+        // SAFETY: unsafe-site category 4 -- reading the three hook members through raw
+        // places. `strm` is live by this function's contract, and `inflateBackInit_`
+        // published either the caller's own hooks or the library's substituted routines,
+        // so the fallback is unreachable for an initialised stream.
+        let allocator = unsafe { crate::types::scratch_allocator(strm) };
 
-        let staged = if staged_ptr.is_null() {
+        // ★ **Staged input inside the window is served by copying it**, not refused, and
+        // *here* is the only place the copy can be taken: the window becomes a reference a
+        // few statements below, and after that nothing may read those bytes at all. The
+        // value stays in this local for the whole call, because a view taken from it must
+        // not outlive its address. See [`StagedSnapshot`].
+        let mut snapshot = StagedSnapshot::default();
+        let staged = if staged_ptr.is_null() || staged_len == 0 {
+            // C's `have = next != Z_NULL ? strm->avail_in : 0` (L218-L219): a null pointer
+            // contributes nothing whatever `avail_in` says, and a zero count is the same
+            // "nothing staged" state. `None` rather than `Some(&[])` so that the first
+            // `PULL()` calls `in()` immediately, as `zlib.h` L1184-L1185 promises.
             None
-        } else {
+        } else if ranges_are_disjoint(staged_ptr, staged_len, window_ptr.cast_const(), window_len) {
             // SAFETY: unsafe-site category 2 -- slice reconstruction, once. `staged_ptr`
-            // is non-null inside this branch, and for a non-zero count this function's
-            // contract makes `staged_len` bytes readable and stable for the call; the
-            // helper still branches on a zero length, so `(non-null, 0)` yields an empty
-            // slice rather than a zero-length one at an unverified address. The library
+            // is non-null with a non-zero count inside this branch, and this function's
+            // contract makes those bytes readable and stable for the call. The library
             // only reads through the result, and the test above established that it does
             // not overlap the window borrow taken below.
-            Some(unsafe { input_slice(staged_ptr, narrow_avail(staged_len)) })
+            Some(unsafe { core::slice::from_raw_parts(staged_ptr, staged_len) })
+        } else {
+            // SAFETY: unsafe-site category 2 -- `AliasScratch::capture`'s contract.
+            // `staged_ptr` is non-null with a non-zero count by this branch, and this
+            // function's contract makes those bytes readable and stable for the call. No
+            // mutable borrow of them exists: the window borrow is taken *below* this
+            // statement, which is precisely why the copy is taken here.
+            snapshot.scratch = unsafe { AliasScratch::capture(&allocator, staged_ptr, staged_len) };
+            let Some(held) = snapshot.scratch.as_ref() else {
+                // The copy is the only way this pair can be served, so a refused allocation
+                // leaves the call unservable. `Z_STREAM_ERROR` is what this entry point
+                // already answers for an argument set it cannot use, and `zlib.h` L1203
+                // names it for exactly that.
+                return fallback::STREAM_ERROR_CODE;
+            };
+            // SAFETY: unsafe-site category 2 -- `AliasScratch::view`'s contract is that the
+            // slice must not outlive the scratch. `snapshot` is a local of this frame that
+            // is never moved and is released only in the epilogue below, after the core has
+            // returned and after the address translation has been consulted.
+            let view = unsafe { held.view() };
+            snapshot.mapping = Some((staged_ptr, view.as_ptr(), staged_len));
+            Some(view)
         };
 
         let state = &mut block.state_mut().state;
 
         // L59's pointer, borrowed for exactly the duration of this call. See `BackSlot`
         // for why the borrow cannot be held any longer than that.
+        //
+        // The region is **write-only**: nothing has initialised the caller's window and
+        // nothing may, so the decoder gets slots plus the reinterpretation to apply once it
+        // has written them. See `types::window_slots_mut`.
+        //
         // SAFETY: unsafe-site category 2 -- slice reconstruction, once per call.
         // `window` is the pointer `inflateBackInit_` recorded, which it established
         // non-null, and `window_len` is the `1 << windowBits` extent it computed; this
         // function's contract requires that region to be live and writable and to be
         // left alone by the application for the duration of the call, which is exactly
         // `zlib.h` L1174-L1175's obligation. Only one such view exists: the core keeps
-        // no window of its own, the staged input has been proved disjoint, and every
-        // callback chunk is proved disjoint before it becomes a reference.
-        let window: &mut [u8] = unsafe { window_bytes_mut(window_ptr, narrow_avail(window_len)) };
+        // no window of its own, and the staged input and every callback chunk is either
+        // proved disjoint from it or copied before it becomes a reference.
+        let slots = unsafe { window_slots_mut(window_ptr, narrow_avail(window_len)) };
+        let window = OutputRegion::write_only(slots, init_view());
 
         // L215: `state->mode = TYPE;`, published into the C-visible slot too, so a
         // callback that reads the mode sees a live value. The core performs the same
@@ -1064,7 +1295,7 @@ pub unsafe extern "C" fn inflateBack(
         watch.publish(Mode::Type.as_raw());
 
         // L226-L568: the state machine and its epilogue, both inside the core.
-        let result = core_inflate_back(
+        let result = core_inflate_back_into(
             state,
             window,
             staged,
@@ -1107,13 +1338,39 @@ pub unsafe extern "C" fn inflateBack(
         };
         watch.publish(final_tag);
 
-        // L567-L568: `strm->next_in = next; strm->avail_in = have;`. `None` is C's
-        // `next = Z_NULL` from a failed `in()` (L104), and C leaves `have` at zero on
-        // that path because `PULL()` only runs when it is already zero.
-        let (next_in, avail_in) = match result.next_in {
-            Some(rest) => (rest.as_ptr(), narrow_avail(rest.len())),
-            None => (core::ptr::null(), 0),
+        // L567-L568: `strm->next_in = next; strm->avail_in = have;`.
+        //
+        // Three cases, and the order between them is what keeps C's two error channels
+        // distinct (`zlib.h` L1199-L1202):
+        //
+        // 1. A callback wrote a mode this function cannot drive, *after* having supplied
+        //    input successfully. C's `PULL()` completed, so `next` and `have` reach the
+        //    `default:` arm intact and `inf_leave` publishes them; only the count differs,
+        //    because C's dispatch had already consumed a few bytes through `PULLBYTE()`
+        //    before it noticed -- the "stops earlier" residual the module documentation
+        //    states. Publishing the callback's own pair is what stops this looking like an
+        //    input failure. See [`ModeWatch::stalled`].
+        // 2. Ordinary completion, including a genuine output failure: the core's report,
+        //    with an address inside a snapshot mapped back to the caller's own buffer so
+        //    that a copied run is indistinguishable from a direct one. See
+        //    [`WindowOverlap::translate`].
+        // 3. `None`, which is C's `next = Z_NULL` at L104 and means one thing only: `in()`
+        //    declined. C leaves `have` at zero there, because `PULL()` runs only when it
+        //    is already zero.
+        let (next_in, avail_in) = match (watch.stalled(), result.next_in) {
+            (Some((buf, len)), _) => (buf, narrow_avail(len)),
+            (None, Some(rest)) => {
+                let at = rest.as_ptr();
+                let published = snapshot.translate(at).unwrap_or(at);
+                (published, narrow_avail(rest.len()))
+            }
+            (None, None) => (core::ptr::null(), 0),
         };
+
+        // The copy's block goes back to the allocator it came from, now that the core has
+        // returned and `result.next_in`'s address has been translated out of it. After this
+        // point nothing addresses the copy.
+        snapshot.release(&allocator);
         // SAFETY: unsafe-site category 1 -- writing three members of the caller's
         // stream, which is non-null, aligned and live as established above. Each
         // write goes through a raw place, so no `&mut z_stream` is materialised. The
@@ -1288,7 +1545,13 @@ mod tests {
     const RAW_15: c_int = -15;
 
     /// The four bytes `test/infcover.c` L450 hands out one at a time.
-    const DAT: [u8; 4] = [0x63, 0, 2, 0];
+    ///
+    /// A `static` rather than a `const`, because two tests compare the *address* a callback
+    /// published against this array's own. A `const` is materialised afresh at every use
+    /// site, so those addresses need not agree -- natively the linker usually merges them and
+    /// under Miri they never do, which makes a `const` a test that passes for the wrong
+    /// reason. `test/infcover.c`'s own `dat` is likewise one `static` array (its L450).
+    static DAT: [u8; 4] = [0x63, 0, 2, 0];
 
     // -----------------------------------------------------------------------
     // Harness
@@ -1498,11 +1761,48 @@ mod tests {
         unsafe { window.add(index).read() }
     }
 
+    /// Whether a window still holds `expected` from `at` onwards, read through its own
+    /// pointer one byte at a time.
+    ///
+    /// Reading through the window's single pointer rather than through a slice is what keeps
+    /// the pointer the library recorded valid under Rust's aliasing model; see
+    /// [`window_on_heap`].
+    fn window_matches(window: *mut Bytef, expected: &[u8], at: usize) -> bool {
+        expected
+            .iter()
+            .enumerate()
+            .skip(at)
+            .all(|(index, &byte)| window_byte(window, index) == byte)
+    }
+
     /// Fills a window through its own pointer, as a C caller would with `memset`.
     fn fill_window(window: *mut Bytef, len: usize, value: u8) {
         // SAFETY: `len` is the length `window_on_heap` was called with and the
         // allocation is live until `release_window`.
         unsafe { core::ptr::write_bytes(window, value, len) };
+    }
+
+    /// Compresses `payload` into a raw deflate stream -- the only form `inflateBack`
+    /// accepts (`zlib.h` L1156-L1160: "a raw deflate stream is one with no zlib or gzip
+    /// header or trailer").
+    ///
+    /// Built through the exported `deflate*` entry points rather than the core, so the
+    /// fixture is the same bytes a C caller would hand in.
+    fn raw_deflate(payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![0_u8; payload.len() + 64];
+        let mut writer = blank_stream();
+        assert_eq!(
+            deflate_init_raw(&mut writer, 6, RAW_15),
+            ReturnCode::OK.as_i32()
+        );
+        writer.next_in = payload.as_ptr();
+        writer.avail_in = uInt::try_from(payload.len()).unwrap();
+        writer.next_out = out.as_mut_ptr();
+        writer.avail_out = uInt::try_from(out.len()).unwrap();
+        assert_eq!(deflate_finish(&mut writer), ReturnCode::STREAM_END.as_i32());
+        out.truncate(usize::try_from(writer.total_out).unwrap());
+        assert_eq!(deflate_release(&mut writer), ReturnCode::OK.as_i32());
+        out
     }
 
     /// Stages `input` in a stream's `next_in`/`avail_in`, as a C caller would.
@@ -1943,9 +2243,21 @@ mod tests {
     impl FeedDesc {
         /// Prepares a cookie handing `chunk` bytes of `data` out per call.
         fn new(data: &[u8], chunk: usize) -> Self {
+            Self::from_raw(data.as_ptr(), data.len(), chunk)
+        }
+
+        /// The same, from a bare pointer and length.
+        ///
+        /// Needed for the window-overlap tests: a window the library has recorded must be
+        /// reached only through the one pointer the test took before `inflateBackInit_`
+        /// ran. Deriving a `&[u8]` from a `Vec` handle in between would invalidate that
+        /// pointer under Rust's aliasing model even though the memory is untouched, and
+        /// Miri reports it -- a property of the harness, not of the library. See
+        /// [`window_on_heap`].
+        fn from_raw(data: *const Bytef, len: usize, chunk: usize) -> Self {
             Self {
-                data: data.as_ptr(),
-                len: data.len(),
+                data,
+                len,
                 at: 0,
                 chunk,
             }
@@ -2709,7 +3021,6 @@ mod tests {
         /// `desc` is null or the very `z_stream` the `inflateBack` call was made on, so
         /// that the state it writes through is the one being driven. `buf` is ignored.
         unsafe extern "C" fn wreck(desc: *mut c_void, buf: *mut *const Bytef) -> c_uint {
-            let _ = buf;
             let strm = desc.cast::<z_stream>();
             if strm.is_null() {
                 return 0;
@@ -2727,7 +3038,19 @@ mod tests {
                 // and the library holds no reference to the state while a callback runs.
                 unsafe { core::ptr::addr_of_mut!((*prefix).tag).write(42) };
             }
-            0
+            // ★ **Supplies a byte, and that is load-bearing.** C's `PULL()` acts on a
+            // zero return *before* the `switch` runs again (`infback.c` L103-L106), so a
+            // mode written by a *failing* callback is never dispatched on and the answer
+            // is `Z_BUF_ERROR`, not the `default:` arm. Reaching the arm this test is
+            // about therefore requires the callback to succeed, exactly as
+            // `test/infcover.c`'s `pull` succeeds while it still has bytes. The companion
+            // test below asserts the other ordering.
+            //
+            // SAFETY: `buf` is the `unsigned char FAR **` out-parameter `inflateBack`
+            // supplies, so it addresses one writable, aligned pointer slot, and `DAT` is a
+            // `'static` array that outlives the call.
+            unsafe { buf.write(DAT.as_ptr()) };
+            1
         }
 
         let mut window = vec![0xa5_u8; 32768];
@@ -2751,6 +3074,85 @@ mod tests {
         // C's `inflateBackEnd` inspects no mode and gets that for free.
         assert_ne!(mode_tag(&strm), 42);
         assert!(Mode::from_raw(mode_tag(&strm)).is_some());
+
+        // ★ **The input channel stays intact.** C reaches its `default:` arm with `next`
+        // and `have` exactly as `PULL()` left them and `inf_leave` publishes both
+        // (`infback.c` L554-L568); `next = Z_NULL` happens on one path only, a failing
+        // `in()` (L104). `zlib.h` L1199-L1202 makes that the documented way to tell an
+        // input error from an output one, so a mode-stop must not counterfeit it.
+        assert!(
+            !strm.next_in.is_null(),
+            "a null next_in means `in()` failed, which it did not"
+        );
+        assert!(
+            core::ptr::eq(strm.next_in, DAT.as_ptr()),
+            "the address published is the callback's own, not a copy of it"
+        );
+        assert_eq!(strm.avail_in, 1, "the count the callback published");
+
+        assert_eq!(back_end(&mut strm), ReturnCode::OK.as_i32());
+    }
+
+    /// A callback that wrecks the mode *and* fails is a `Z_BUF_ERROR`, because C acts on
+    /// the failure first.
+    ///
+    /// `PULL()`'s own test runs the instant `in()` returns and its `goto inf_leave` at
+    /// `infback.c` L106 skips the `switch` entirely, so the write never reaches a
+    /// dispatch. The observable pair is the input-failure channel: `Z_BUF_ERROR` with
+    /// `next_in == Z_NULL` (L104, and `zlib.h` L1199-L1202).
+    #[test]
+    fn a_wrecked_mode_from_a_failing_callback_is_still_an_input_failure() {
+        /// Writes a non-mode tag and then declines, as `test/infcover.c`'s `pull` does
+        /// once its array is exhausted.
+        ///
+        /// # Safety
+        ///
+        /// As `wreck` above: `desc` is null or the very `z_stream` the call was made on.
+        /// `buf` is ignored, which `zlib.h` L1170-L1172 permits for a zero return.
+        unsafe extern "C" fn wreck_then_fail(desc: *mut c_void, buf: *mut *const Bytef) -> c_uint {
+            let _ = buf;
+            let strm = desc.cast::<z_stream>();
+            if strm.is_null() {
+                return 0;
+            }
+            // SAFETY: as `wreck` above -- `desc` is `from_mut` of the live `z_stream` the
+            // calling test handed to `back_run`, so `state` is an in-bounds aligned member
+            // and one pointer-sized read is all that happens.
+            let prefix = unsafe { core::ptr::addr_of!((*strm).state).read() };
+            let prefix = prefix.cast::<StatePrefix>();
+            if !prefix.is_null() {
+                // SAFETY: as `wreck` above -- `prefix` is the address this library wrote
+                // into `strm.state`, so `tag` is its aligned `c_int` at offset 8.
+                unsafe { core::ptr::addr_of_mut!((*prefix).tag).write(42) };
+            }
+            0
+        }
+
+        let mut window = vec![0xa5_u8; 32768];
+        let mut strm = blank_stream();
+        assert_eq!(
+            back_init(&mut strm, 15, &mut window),
+            ReturnCode::OK.as_i32()
+        );
+        let strm_ptr: *mut z_stream = &mut strm;
+
+        let code = back_run(
+            strm_ptr,
+            Some(wreck_then_fail),
+            strm_ptr.cast::<c_void>(),
+            Some(accept_out),
+            core::ptr::null_mut(),
+        );
+        assert_eq!(
+            code,
+            ReturnCode::BUF_ERROR.as_i32(),
+            "`PULL()` acts on the zero return before any dispatch"
+        );
+        assert!(
+            strm.next_in.is_null(),
+            "and a null next_in is what identifies that failure"
+        );
+        assert_eq!(strm.avail_in, 0);
         assert_eq!(back_end(&mut strm), ReturnCode::OK.as_i32());
     }
 
@@ -3188,10 +3590,10 @@ mod tests {
 
     /// An `in()` that hands back a region **inside the window**.
     ///
-    /// The cookie is the window's own pointer and length. A C caller could do this --
-    /// C holds two raw pointers and nothing in `zlib.h` L1167-L1178 forbids it -- and
-    /// this library must refuse it rather than form a `&[u8]` aliasing the `&mut [u8]`
-    /// it holds over the window.
+    /// The cookie is the window's own pointer and length. C would read through it; this
+    /// library declines it, because the callback contract cannot be honoured for bytes
+    /// `inflateBack` itself overwrites -- see [`CallerInput::next_chunk`] and
+    /// `a_callback_chunk_inside_the_window_is_declined`.
     unsafe extern "C" fn feed_from_window(desc: *mut c_void, buf: *mut *const Bytef) -> c_uint {
         let desc = desc.cast::<FeedDesc>();
         if desc.is_null() {
@@ -3206,7 +3608,7 @@ mod tests {
         }
         desc.at = 1;
         // Points straight into the window the cookie was built from -- which is exactly the
-        // overlap this test asserts the library refuses.
+        // overlap this test asserts the library declines.
         //
         // SAFETY: `buf` is the writable pointer slot `zlib.h` L1140-L1150 requires `in()` to
         // fill, and `desc.data` addresses `desc.chunk` readable bytes of the caller's window,
@@ -3216,50 +3618,150 @@ mod tests {
         c_uint::try_from(desc.chunk).unwrap_or(0)
     }
 
+    /// `inflateBackInit_` does not touch one byte of the caller's window.
+    ///
+    /// `infback.c` L25-L64 records the pointer and the extent and returns; it writes
+    /// `dmax`, `wbits`, `wsize`, `window`, `wnext`, `whave` and `sane` into the *state* and
+    /// nothing into the buffer. `zlib.h` L1163-L1166 asks only for room, so a caller may
+    /// legitimately hand over a buffer whose contents it still wants -- or, as
+    /// `test/infcover.c` L475 does, one that was never initialised at all.
+    ///
+    /// A position-dependent pattern is written first and every byte checked afterwards. It
+    /// has to be position-dependent: a constant would pass by coincidence against a build
+    /// whose fill byte happened to match.
     #[test]
-    fn staged_input_inside_the_window_is_refused() {
-        // The window is the decoder's output buffer and is borrowed mutably for the
-        // whole call; staged input overlapping it would alias that borrow. C has no such
-        // constraint, so this is a documented divergence and `Z_STREAM_ERROR` is the
-        // fail-closed answer.
-        let mut window = vec![0_u8; 1 << 15];
+    fn init_leaves_the_callers_window_exactly_as_it_found_it() {
+        const EXTENT: usize = 1 << 15;
+        let expected: Vec<u8> = (0..EXTENT)
+            .map(|at| u8::try_from(at % 251).unwrap_or(0))
+            .collect();
+
+        // One allocation, one pointer, every access through it. See `window_on_heap`.
+        let window = window_on_heap(EXTENT, 0);
+        for (at, &byte) in expected.iter().enumerate() {
+            // SAFETY: `at` is inside the allocation `window_on_heap` produced, which is
+            // live until `release_window` below.
+            unsafe { window.add(at).write(byte) };
+        }
+
         let mut strm = blank_stream();
+        let (version, size) = version_args();
         assert_eq!(
-            back_init(&mut strm, 15, &mut window),
+            back_init_raw(&mut strm, 15, window, version, size),
             ReturnCode::OK.as_i32()
         );
+        assert!(
+            window_matches(window, &expected, 0),
+            "inflateBackInit_ must record the window, not rewrite it"
+        );
 
-        // Poisoned *after* the installation, for two reasons. `inflateBackInit_` fills the
-        // window once -- see `types::window_slice_mut` -- with a byte that is `0xa5` in a
-        // debug build and zero in a release one, so a pattern written before that call
-        // would measure the fill rather than the refusal. And writing it here is exactly
-        // what a conforming caller is entitled to do: no borrow of the window survives a
-        // call, which is the property `the_state_is_a_single_block_from_the_callers_allocator`
-        // states and this line exercises.
-        window.fill(0xa5);
+        // Nor does a *failing* init: the guards at L33-L34 run before anything else, and
+        // the state allocation at L51 is the only other thing that could touch memory.
+        let mut refused = blank_stream();
+        assert_eq!(
+            back_init_raw(&mut refused, 0, window, version, size),
+            ReturnCode::STREAM_ERROR.as_i32(),
+            "windowBits 0 is C's L34 refusal, as test/infcover.c L479 asserts"
+        );
+        assert!(
+            window_matches(window, &expected, 0),
+            "and a refusal writes nothing either"
+        );
 
-        // `next_in` points at the window's tail: a real overlap.
-        strm.next_in = window
-            .get(16..)
-            .expect("the window is far longer than 16 bytes")
-            .as_ptr();
-        strm.avail_in = 8;
+        // The decode overwrites only what it produces. `zlib.h` L1141-L1146 makes the
+        // window the output buffer, so bytes past the output are the caller's still.
+        let payload = b"only this much of the window is overwritten";
+        let deflated = raw_deflate(payload);
+        stage(&mut strm, &deflated);
+        let mut sink: Vec<u8> = Vec::new();
         let code = back_run(
             &mut strm,
             Some(refuse_in),
             core::ptr::null_mut(),
-            Some(accept_out),
-            core::ptr::null_mut(),
+            Some(collect_out),
+            core::ptr::from_mut(&mut sink).cast::<c_void>(),
         );
-        assert_eq!(code, ReturnCode::STREAM_ERROR.as_i32());
+        assert_eq!(code, ReturnCode::STREAM_END.as_i32());
+        assert_eq!(sink, payload);
         assert!(
-            window.iter().all(|&byte| byte == 0xa5),
-            "the refusal must precede every write"
+            window_matches(window, &expected, payload.len()),
+            "everything past the decoded output is untouched"
         );
 
-        // Input that merely abuts the window is not overlapping and must be accepted:
-        // the call then fails for its own reason -- an empty stream and a declining
-        // callback -- rather than being refused up front.
+        assert_eq!(back_end(&mut strm), ReturnCode::OK.as_i32());
+        release_window(window, EXTENT);
+    }
+
+    /// A raw-deflate stream staged **inside the caller's own window** decodes correctly.
+    ///
+    /// The window is the decoder's output buffer (`zlib.h` L1141-L1146) and is borrowed
+    /// mutably for the whole call, so staged input overlapping it cannot become a `&[u8]`.
+    /// C has no such constraint and nothing in `zlib.h` L1163-L1190 forbids the
+    /// arrangement, so refusing would be an error this library invented. The input is
+    /// copied first instead; see [`WindowOverlap`].
+    ///
+    /// The payload is short enough to fit in one window pass, so the decoder's own output
+    /// never reaches the staged bytes and the copy and the original agree -- which is what
+    /// makes this a parity assertion rather than a statement about undefined ordering.
+    #[test]
+    fn staged_input_inside_the_window_is_served() {
+        const EXTENT: usize = 1 << 15;
+        let payload = b"staged inside the very window it decodes into";
+        let deflated = raw_deflate(payload);
+
+        let window = window_on_heap(EXTENT, 0xa5);
+        let mut strm = blank_stream();
+        let (version, size) = version_args();
+        assert_eq!(
+            back_init_raw(&mut strm, 15, window, version, size),
+            ReturnCode::OK.as_i32()
+        );
+
+        // The stream goes into the window's *tail*, far past anything a payload this short
+        // decodes into, and `next_in` points at it: a real overlap. Written through the
+        // window's own pointer, which is what a C caller has and what keeps the pointer the
+        // library recorded valid.
+        let at = EXTENT - deflated.len();
+        // SAFETY: `at + deflated.len() == EXTENT`, so the whole copy lies inside the
+        // allocation `window_on_heap` produced, which is live until `release_window`.
+        let staged_ptr = unsafe {
+            let base = window.add(at);
+            core::ptr::copy_nonoverlapping(deflated.as_ptr(), base, deflated.len());
+            base.cast_const()
+        };
+        strm.next_in = staged_ptr;
+        strm.avail_in = uInt::try_from(deflated.len()).unwrap();
+
+        let mut sink: Vec<u8> = Vec::new();
+        let code = back_run(
+            &mut strm,
+            // `refuse_in` declines, which is C's `pull` with a null `desc`: every byte has
+            // to come from the staged region or the call cannot succeed.
+            Some(refuse_in),
+            core::ptr::null_mut(),
+            Some(collect_out),
+            core::ptr::from_mut(&mut sink).cast::<c_void>(),
+        );
+        assert_eq!(
+            code,
+            ReturnCode::STREAM_END.as_i32(),
+            "an overlapping stage must be served, not refused"
+        );
+        assert_eq!(sink, payload, "and it must decode to the original bytes");
+
+        // ★ The address published back is the *caller's* own, never the copy's: `infback.c`
+        // L567 publishes `next`, and a pointer into this library's scratch block would be an
+        // address the caller never supplied and which stops existing at the return. See
+        // `WindowOverlap::translate`.
+        let consumed = deflated.len() - usize::try_from(strm.avail_in).unwrap();
+        assert!(
+            core::ptr::eq(strm.next_in, staged_ptr.wrapping_add(consumed)),
+            "next_in must be the caller's own base advanced by what was consumed"
+        );
+
+        // Input that merely abuts the window is not overlapping and takes the direct path:
+        // the call then fails for its own reason -- an empty stream and a declining callback
+        // -- rather than being refused up front.
         stage(&mut strm, &DAT);
         let code = back_run(
             &mut strm,
@@ -3275,31 +3777,86 @@ mod tests {
         );
 
         assert_eq!(back_end(&mut strm), ReturnCode::OK.as_i32());
+        release_window(window, EXTENT);
     }
 
+    /// A chunk `in()` hands back from inside the window is declined, and the decline is the
+    /// callback contract's, not this port's.
+    ///
+    /// Two documented obligations rule the combination out. `zlib.h` L1141-L1146 makes the
+    /// window the buffer `inflateBack` writes its output into, and `infback.c` L172-L174
+    /// obliges the application to leave the bytes `in()` published unchanged "until `in()` is
+    /// called again or until `inflateBack()` returns" -- a promise it cannot keep about bytes
+    /// `inflateBack` itself overwrites. And with the window arriving as write-only storage
+    /// (`zlib.h` L1163-L1166; `test/infcover.c` L475 passes an uninitialised array), the part
+    /// the decoder has not written holds nothing to supply.
+    ///
+    /// So the answer is the one the callback would have given by declining honestly:
+    /// `Z_BUF_ERROR` with a null `next_in` (`infback.c` L104-L106, `zlib.h` L1199-L1201).
+    /// Copying is not available here as it is for *staged* input, because by the time `in()`
+    /// runs the decoder already holds the window exclusively and reading those bytes at all
+    /// would invalidate that borrow -- Miri reports exactly that. See [`StagedSnapshot`] for
+    /// the case that can be served, and why it can.
     #[test]
-    fn a_callback_chunk_inside_the_window_is_refused() {
-        // Same aliasing rule, applied to what `in()` hands back rather than to what the
-        // caller staged. The refusal maps to `Z_BUF_ERROR`, exactly as a callback that
-        // declined by returning zero would -- which is the answer C gives for a failed
-        // `in()` at L105.
-        let mut window = vec![0xa5_u8; 1 << 15];
+    fn a_callback_chunk_inside_the_window_is_declined() {
+        const EXTENT: usize = 1 << 15;
+        let payload = b"delivered by in() from inside the window";
+        let deflated = raw_deflate(payload);
+
+        let window = window_on_heap(EXTENT, 0xa5);
         let mut strm = blank_stream();
+        let (version, size) = version_args();
         assert_eq!(
-            back_init(&mut strm, 15, &mut window),
+            back_init_raw(&mut strm, 15, window, version, size),
             ReturnCode::OK.as_i32()
         );
 
-        let mut cookie = FeedDesc::new(&window, 8);
+        let at = EXTENT - deflated.len();
+        // SAFETY: `at + deflated.len() == EXTENT`, so the whole copy lies inside the
+        // allocation `window_on_heap` produced, which is live until `release_window`.
+        let chunk_ptr = unsafe {
+            let base = window.add(at);
+            core::ptr::copy_nonoverlapping(deflated.as_ptr(), base, deflated.len());
+            base.cast_const()
+        };
+        let mut cookie = FeedDesc::from_raw(chunk_ptr, deflated.len(), deflated.len());
+
+        let mut sink: Vec<u8> = Vec::new();
         let code = back_run(
             &mut strm,
             Some(feed_from_window),
             core::ptr::from_mut(&mut cookie).cast::<c_void>(),
-            Some(accept_out),
-            core::ptr::null_mut(),
+            Some(collect_out),
+            core::ptr::from_mut(&mut sink).cast::<c_void>(),
         );
-        assert_eq!(code, ReturnCode::BUF_ERROR.as_i32());
+        assert_eq!(
+            code,
+            ReturnCode::BUF_ERROR.as_i32(),
+            "an unservable chunk is a declined input"
+        );
+        assert!(
+            strm.next_in.is_null(),
+            "and a null next_in is exactly how a declined input is identified"
+        );
+        assert_eq!(strm.avail_in, 0);
+        assert!(sink.is_empty(), "nothing was emitted");
+
+        // The very same bytes, delivered from outside the window, decode -- so the decline is
+        // about *where* the chunk lived and nothing else.
+        let mut elsewhere = FeedDesc::new(&deflated, deflated.len());
+        let mut sink: Vec<u8> = Vec::new();
+        let code = back_run(
+            &mut strm,
+            Some(feed_in),
+            core::ptr::from_mut(&mut elsewhere).cast::<c_void>(),
+            Some(collect_out),
+            core::ptr::from_mut(&mut sink).cast::<c_void>(),
+        );
+        assert_eq!(code, ReturnCode::STREAM_END.as_i32());
+        assert_eq!(sink, payload);
+
         assert_eq!(back_end(&mut strm), ReturnCode::OK.as_i32());
+        release_window(window, EXTENT);
     }
 
     #[test]
@@ -3311,20 +3868,7 @@ mod tests {
         // would be asserting the opposite; under Miri, writing through the `Vec` while
         // such a borrow existed would be reported.
         let payload = b"a window the caller still owns";
-        let mut deflated = vec![0_u8; payload.len() + 64];
-        let mut writer = blank_stream();
-        assert_eq!(
-            deflate_init_raw(&mut writer, 6, RAW_15),
-            ReturnCode::OK.as_i32()
-        );
-        writer.next_in = payload.as_ptr();
-        writer.avail_in = uInt::try_from(payload.len()).unwrap();
-        writer.next_out = deflated.as_mut_ptr();
-        writer.avail_out = uInt::try_from(deflated.len()).unwrap();
-        assert_eq!(deflate_finish(&mut writer), ReturnCode::STREAM_END.as_i32());
-        let produced = usize::try_from(writer.total_out).unwrap();
-        deflated.truncate(produced);
-        assert_eq!(deflate_release(&mut writer), ReturnCode::OK.as_i32());
+        let deflated = raw_deflate(payload);
 
         let mut window = vec![0xa5_u8; 1 << 15];
         let window_len = window.len();

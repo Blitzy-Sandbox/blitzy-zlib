@@ -57,10 +57,17 @@
 //! `inflateBack` caller, after which window offsets and output offsets name the same
 //! byte.
 //!
-//! # ★ The window is *not* zero-initialised, and `whave` is the guard
+//! # ★ The window is *not* initialised at all, and `whave` is the guard
 //!
-//! The caller may hand over a freshly allocated buffer; `test/infcover.c` fills
-//! every allocation with `0xa5` precisely to catch code that assumes otherwise.
+//! The caller may hand over a freshly allocated buffer; `test/infcover.c` fills every
+//! allocation with `0xa5` precisely to catch code that assumes otherwise, and its
+//! `cover_back` (L475) hands `inflateBackInit` a stack array that was never written.
+//! `infback.c` L25-L64 initialises none of it either. [`inflate_back_into`] is the entry
+//! point for that case: the window arrives as an [`OutputRegion`] over write-only
+//! storage, so nothing reads a byte the decoder has not itself stored, and
+//! [`inflate_back`] is the same function for a caller that already holds an initialised
+//! slice.
+//!
 //! `state.whave` is what records how much of the window has actually been
 //! written: zero at entry (`infback.c` L217), and the full window size once
 //! `ROOM()` has flushed it (L156). A distance may reach back only that far, and
@@ -337,51 +344,6 @@ fn low_bits(hold: u64, count: u32) -> u64 {
 #[inline]
 fn drop_bits<'a, A: Allocator<'a>>(state: &mut InflateState<'a, A>, count: u32) {
     let _dropped = state.drop_bits(count);
-}
-
-/// Copies `count` bytes forward inside one buffer, one byte at a time.
-///
-/// The Rust counterpart of the inner `do { *put++ = *from++; } while (--copy);` of
-/// `infback.c` L539-L541, and of the `zmemcpy`-free half of the match copy.
-///
-/// # Byte-at-a-time is required, not a simplification
-///
-/// When `to > from` the two ranges overlap, and they are *meant* to: a match
-/// with `distance < length` encodes a repeating run, so every byte after the
-/// first `distance` of them is read back from what this loop has just written. A
-/// bulk copy -- `copy_within`, `copy_from_slice` or `memmove` -- would read the
-/// pre-existing bytes instead and produce different output. The read and the
-/// write of one byte are strictly ordered here for that reason.
-///
-/// Returns `false` without completing if either range leaves the buffer. Both
-/// ranges are provably inside it at every call site (see [`Backer::copy_match`]),
-/// so this is what makes the bound structural rather than merely argued.
-fn copy_forward(window: &mut [u8], from: usize, to: usize, count: usize) -> bool {
-    let Some(from_end) = from.checked_add(count) else {
-        return false;
-    };
-    let Some(to_end) = to.checked_add(count) else {
-        return false;
-    };
-    if from_end > window.len() || to_end > window.len() {
-        return false;
-    }
-
-    // `step` is bounded by `count`, and both ends were just checked against the
-    // buffer length, so neither addition below can overflow and neither
-    // accessor can fail.
-    let mut step = 0;
-    while step < count {
-        let Some(&byte) = window.get(from + step) else {
-            return false;
-        };
-        let Some(slot) = window.get_mut(to + step) else {
-            return false;
-        };
-        *slot = byte;
-        step += 1;
-    }
-    true
 }
 
 /// The output callback declined to accept the bytes it was handed.
@@ -813,6 +775,47 @@ where
     I: InflateBackInput<'i>,
     O: InflateBackOutput,
 {
+    inflate_back_into(state, OutputRegion::init(window), next_in, input, output)
+}
+
+/// [`inflate_back`] over storage that is only guaranteed *writable*.
+///
+/// # ★ Why this form exists, and why the C boundary needs it
+///
+/// `inflateBackInit_` is handed a bare `unsigned char *` and `zlib.h` L1163-L1166 asks
+/// only for room: "window is a user-supplied window and output buffer that is
+/// `2**windowBits` bytes". `test/infcover.c` L475 duly passes an *uninitialised* stack
+/// array, `unsigned char win[32768];`. So the C caller's window is storage, not values,
+/// and a `&mut [u8]` over it would be a reference to memory that holds nothing.
+///
+/// The reference never writes it either: `infback.c` L25-L64 records the pointer and the
+/// extent and touches not one byte, so a caller's window keeps whatever it held until the
+/// decoder writes output into it. Filling it to manufacture an initialised slice would be
+/// observable — it would destroy bytes a caller is entitled to keep — and would make the
+/// visible contents depend on which fill byte a build chose.
+///
+/// [`OutputRegion::write_only`] is the answer the crate already uses for `next_out`: the
+/// region tracks how far it has been written and hands back only that prefix, so nothing
+/// ever reads a slot the decoder has not stored a byte into. `inflateBack` fits it exactly,
+/// because `state.whave` starts at zero (`infback.c` L217) and the decoder is already
+/// forbidden from reaching back past what it has written until `ROOM()` has flushed the
+/// whole window — the very invariant the baseline commit `09a1572` restored.
+///
+/// [`inflate_back`] is this function with [`OutputRegion::init`] applied, which is what
+/// every Rust caller and every test wants.
+#[must_use]
+pub fn inflate_back_into<'a, 'i, A, I, O>(
+    state: &mut InflateState<'a, A>,
+    window: OutputRegion<'_>,
+    next_in: Option<&'i [u8]>,
+    input: I,
+    output: O,
+) -> InflateBackResult<'i>
+where
+    A: Allocator<'a>,
+    I: InflateBackInput<'i>,
+    O: InflateBackOutput,
+{
     let Some(window) = window_prefix(state, window) else {
         // C would proceed with `put == NULL` and `left == 0` here and loop forever
         // inside `ROOM()`; refusing the call is the same "state was not properly
@@ -849,13 +852,13 @@ where
 /// live views of two different buffers both claiming to be "the window".
 fn window_prefix<'w, 'a, A: Allocator<'a>>(
     state: &InflateState<'a, A>,
-    window: &'w mut [u8],
-) -> Option<&'w mut [u8]> {
+    window: OutputRegion<'w>,
+) -> Option<OutputRegion<'w>> {
     let expected = usize::try_from(state.wsize).ok()?;
     if expected == 0 || !state.window.is_absent() {
         return None;
     }
-    window.get_mut(..expected)
+    window.into_prefix(expected)
 }
 
 /// Resets the state, runs the state machine, and performs the `inf_leave`
@@ -868,7 +871,7 @@ fn window_prefix<'w, 'a, A: Allocator<'a>>(
 /// jumping.
 fn run<'a, 'i, A, I, O>(
     state: &mut InflateState<'a, A>,
-    window: &mut [u8],
+    window: OutputRegion<'_>,
     next_in: Option<&'i [u8]>,
     input: I,
     output: O,
@@ -939,7 +942,12 @@ struct Backer<'i, 'w, I, O> {
 
     /// The caller's window, which is also the output buffer
     /// (`zlib.h` L1141-L1144). Its length is `state.wsize`.
-    window: &'w mut [u8],
+    ///
+    /// An [`OutputRegion`] rather than a `&mut [u8]` because a C caller's window arrives
+    /// as storage: see [`inflate_back_into`]. For a Rust caller the region is
+    /// [`OutputRegion::init`] and every operation below is the plain slice operation it
+    /// used to be.
+    window: OutputRegion<'w>,
 
     /// C's `put`, as an index into [`Self::window`]. C's `left` is
     /// `window.len() - put`.
@@ -1091,7 +1099,14 @@ where
         }
         self.put = 0;
         state.whave = state.wsize;
-        self.output.write_out(&*self.window).is_ok()
+        // C hands `out()` the whole window (`infback.c` L156). Reached only when `left()`
+        // is zero, i.e. `put == window.len()`, so every slot in the region has been
+        // written by this very call and the high-water mark covers all of it -- which is
+        // what makes `initialized` return the whole window rather than a prefix of it.
+        let whole = self.window.len();
+        self.output
+            .write_out(self.window.initialized(whole))
+            .is_ok()
     }
 
     /// Writes one literal byte into the window (`infback.c` L456-L457).
@@ -1099,10 +1114,9 @@ where
     /// The caller has just run [`Self::room`], so `put` addresses a free byte and
     /// the accessor cannot fail.
     fn put_byte(&mut self, byte: u8) -> bool {
-        let Some(slot) = self.window.get_mut(self.put) else {
+        if !self.window.write_byte_at(self.put, byte) {
             return false;
-        };
-        *slot = byte;
+        }
         self.put = self.put.saturating_add(1);
         true
     }
@@ -1124,9 +1138,14 @@ where
         if self.put == 0 {
             return ret;
         }
-        let Some(written) = self.window.get(..self.put) else {
+        // C's `out(out_desc, state->window, state->wsize - left)` (L563): the `put` bytes
+        // this call wrote and no more. Every one of them raised the region's high-water
+        // mark, so `initialized` yields exactly them.
+        let written = self.window.initialized(self.put);
+        if written.len() != self.put {
+            // Unreachable: `put` is only ever advanced by a successful write.
             return ret;
-        };
+        }
         if self.output.write_out(written).is_err() && ret == ReturnCode::STREAM_END {
             return ReturnCode::BUF_ERROR;
         }
@@ -1368,10 +1387,9 @@ where
         let Some(dest_end) = self.put.checked_add(copy) else {
             return false;
         };
-        let Some(dest) = self.window.get_mut(self.put..dest_end) else {
+        if !self.window.write_slice_at(self.put, source) {
             return false;
-        };
-        dest.copy_from_slice(source);
+        }
         self.consumed = source_end;
         self.put = dest_end;
         true
@@ -1940,9 +1958,17 @@ where
         };
         // L426. Equal to `self.window.len()`, which `window_prefix` established.
         let start = to_index(u64::from(state.wsize));
-        let mut output = OutputCursor::from_region(OutputRegion::init(&mut *self.window), self.put);
+        // The region is moved into the cursor for the duration of the call and moved back
+        // out afterwards, which is how `deflate` and `inflate` hand their own output to a
+        // cursor as well. `OutputRegion::empty` is the placeholder that keeps `self` whole
+        // while the real one is away; nothing can observe it, because `inflate_fast` is the
+        // only thing running and it holds the cursor.
+        let region = core::mem::replace(&mut self.window, OutputRegion::empty());
+        let mut output = OutputCursor::from_region(region, self.put);
         let exit = inflate_fast(state, chunk, &mut self.consumed, &mut output, start);
-        self.put = output.written();
+        let (region, written) = output.into_region();
+        self.window = region;
+        self.put = written;
         // C's `inflate_fast` writes `strm->msg` in place on its three error paths
         // and leaves it alone otherwise, so this assignment is conditional too.
         if let Some(msg) = exit.msg {
@@ -2032,12 +2058,15 @@ where
     ///
     /// Both ranges provably stay inside the window: in the first case
     /// `(p + w - d) + (d - p) == w`, and in the second `(p - d) + (w - p) == w - d`.
-    /// The destination is bounded by `left`. That is what makes [`copy_forward`]'s
+    /// The destination is bounded by `left`. That is what makes
+    /// [`OutputRegion::duplicate_within`]'s
     /// guards inert rather than load-bearing -- they exist so the bound is checked
     /// rather than merely reasoned about.
     ///
     /// ★ The copy is byte-at-a-time because `d < length` is legal and means a
-    /// repeating run; see [`copy_forward`].
+    /// repeating run; see [`OutputRegion::duplicate_within`], whose own documentation
+    /// carries the proof that its three moves reproduce C's byte loop exactly, including
+    /// `inflateBack`'s window-is-output case where the two indices coincide.
     ///
     /// Terminates on every input: `ROOM()` leaves `left >= 1`, so each turn copies
     /// at least one byte and `length` strictly decreases. (C's inner
@@ -2067,7 +2096,7 @@ where
             state.length = state.length.saturating_sub(to_count(copy));
 
             // L539-L541.
-            if !copy_forward(self.window, from, self.put, copy) {
+            if !self.window.duplicate_within(from, self.put, copy) {
                 // Unreachable: both ranges were shown above to end at or before
                 // the window's last byte.
                 return Step::Leave(ReturnCode::BUF_ERROR);

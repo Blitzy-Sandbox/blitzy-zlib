@@ -16,9 +16,12 @@
 # This crate depends on the two shipped crates; NEITHER shipped crate may ever
 # depend on it. `crates/zlib-rs` has an empty `[dependencies]` table and
 # `crates/libz-rs-sys` depends on nothing but `zlib-rs`, so
-# `cargo build --release` for `libz.so`/`libz.a` never invokes a C compiler and never
-# links the oracle. That is the mechanical proof that the reference implementation is
-# an ORACLE and not a build dependency. Verify with:
+# `cargo build --release` for `libz.so`/`libz.a` never compiles a line of the reference
+# implementation and never links the oracle. (It does compile two C translation units of
+# its own, in `crates/libz-rs-sys/csrc/`, for three declarations stable Rust cannot
+# express; those are not the reference sources and take no crate dependency.) That is the
+# mechanical proof that the reference implementation is an ORACLE and not a build
+# dependency. Verify with:
 #
 #     cargo tree -p zlib-rs     -e normal   # must not mention cc or this crate
 #     cargo tree -p libz-rs-sys -e normal   # must not mention cc or this crate

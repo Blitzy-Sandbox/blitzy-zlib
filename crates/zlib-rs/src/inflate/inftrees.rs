@@ -613,17 +613,19 @@ pub fn inflate_table(
     inflate_table_build(code_type, lens, codes, table, table_index, bits, work).code
 }
 
-/// What a table build did: the status code, and how many entries of `table` it
-/// wrote.
+/// What a table build did: the status code, and how much of each caller-supplied
+/// buffer it wrote.
 ///
-/// The extent exists because C's `inflate_table` writes entries into the caller's
-/// array **as it builds**, so a table that runs out of space -- `inftrees.c` L218 and
+/// The extents exist because C's `inflate_table` writes straight into the caller's
+/// arrays **as it builds**, so a table that runs out of space -- `inftrees.c` L218 and
 /// L287, the two `return 1` sites -- leaves every entry written before that point in
 /// the caller's memory, while `*table` and `*bits` stay exactly as they were passed
 /// in. A wrapper that builds into scratch space and copies out afterwards can only
 /// reproduce that if it is told how much was written, because the cursor is
-/// deliberately not advanced on a failure. `crates/libz-rs-sys`'s `inflate_table`
-/// export is that wrapper.
+/// deliberately not advanced on a failure -- and, just as importantly, it must not
+/// write a byte the reference would have left alone. `crates/libz-rs-sys`'s
+/// `_zlib_rs_inflate_table` export is that wrapper, and these two counts are the whole
+/// of what it needs to publish exactly the reference's footprint.
 ///
 /// `touched` is one past the highest index written, counted from the base of `table`
 /// rather than from `*table_index`, so it can be used as a length directly. It is the
@@ -638,14 +640,42 @@ pub struct TableBuild {
     pub code: i32,
     /// One past the highest entry index written, or zero if none was.
     pub touched: usize,
+    /// How many elements of `work` the build wrote, counted from index zero.
+    ///
+    /// The same reasoning as [`TableBuild::touched`], applied to the other buffer C
+    /// writes into the caller's memory. `work` is scratch -- C's own comment calls it
+    /// "that space being provided by the caller" (`inftrees.c` L104-L106) -- but it is
+    /// still the *caller's* storage, and C touches it only after the over-subscribed
+    /// and incomplete checks have passed: all four failure returns at `inftrees.c`
+    /// L143, L146, L218 and L287 leave it exactly as it arrived, and so does the
+    /// no-symbols return at L134.
+    ///
+    /// The written cells are always a gapless prefix. C's sort loop (L154-L156) writes
+    /// `work[offs[lens[sym]]++] = sym` for every symbol with a non-zero length, and
+    /// `offs` is the prefix sum of the length histogram, so the union of the positions
+    /// it visits is exactly `0 .. n` where `n` is the number of coded symbols -- in
+    /// some permuted order, but with no gaps. Reporting one count is therefore enough
+    /// for a wrapper that builds into scratch space to publish precisely the cells the
+    /// reference would have published and no others.
+    pub work_touched: usize,
 }
 
-/// Records that entry `index` has been written.
+/// Records that entry `index` of `table` has been written.
 ///
 /// A separate function so that every write site reads the same and none can forget
 /// the `+1`: the extent is a length, not an index.
-fn record(touched: &mut usize, index: usize) {
-    *touched = (*touched).max(index.saturating_add(1));
+fn record(extent: &mut WriteExtent, index: usize) {
+    extent.table = extent.table.max(index.saturating_add(1));
+}
+
+/// Records that element `index` of `work` has been written.
+///
+/// The counterpart of [`record`] for the scratch array. Written as `max` rather than a
+/// running count for the same reason: the sort loop visits the positions in a permuted
+/// order, so only the high-water mark is order-independent -- and because the visited
+/// set is a gapless prefix, the mark IS the count.
+fn record_work(extent: &mut WriteExtent, index: usize) {
+    extent.work = extent.work.max(index.saturating_add(1));
 }
 
 /// [`inflate_table`], additionally reporting how many entries were written.
@@ -663,7 +693,7 @@ pub fn inflate_table_build(
     bits: &mut usize,
     work: &mut [u16],
 ) -> TableBuild {
-    let mut touched = 0_usize;
+    let mut extent = WriteExtent::NONE;
     let code = inflate_table_inner(
         code_type,
         lens,
@@ -672,9 +702,31 @@ pub fn inflate_table_build(
         table_index,
         bits,
         work,
-        &mut touched,
+        &mut extent,
     );
-    TableBuild { code, touched }
+    TableBuild {
+        code,
+        touched: extent.table,
+        work_touched: extent.work,
+    }
+}
+
+/// How much of each caller-supplied buffer a build wrote.
+///
+/// Threaded through the implementation as one out-parameter rather than two so that
+/// the private body keeps the argument count it has; [`TableBuild`] is the public
+/// shape and documents what each half means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WriteExtent {
+    /// One past the highest `table` index written.
+    table: usize,
+    /// The number of `work` elements written, counted from zero.
+    work: usize,
+}
+
+impl WriteExtent {
+    /// Nothing written yet, which is the state every build starts in.
+    const NONE: Self = Self { table: 0, work: 0 };
 }
 
 // Eight parameters, one more than the lint permits, and the eighth is the whole
@@ -691,7 +743,7 @@ fn inflate_table_inner(
     table_index: &mut usize,
     bits: &mut usize,
     work: &mut [u16],
-    touched: &mut usize,
+    extent: &mut WriteExtent,
 ) -> i32 {
     // Defensive precondition checks. C states these as caller obligations; here they
     // are the reason every later index is provably in range. Once `entry_base` is
@@ -745,7 +797,7 @@ fn inflate_table_inner(
                 return TABLE_NOT_ENOUGH;
             };
             *slot = marker;
-            record(touched, entry_base + offset);
+            record(extent, entry_base + offset);
         }
         *table_index = entry_base + 2;
         *bits = 1;
@@ -808,6 +860,7 @@ fn inflate_table_inner(
         // Truncating exactly as C's `(unsigned short)sym` does. Symbol indices are
         // bounded by `codes`, which is at most 320 for every caller in the crate.
         *slot = symbol as u16;
+        record_work(extent, position);
         let Some(next_position) = offs.get_mut(usize::from(length)) else {
             return TABLE_INVALID_CODE;
         };
@@ -897,7 +950,7 @@ fn inflate_table_inner(
                 return TABLE_NOT_ENOUGH;
             };
             *slot = here;
-            record(touched, index);
+            record(extent, index);
             if fill == 0 {
                 break;
             }
@@ -990,7 +1043,7 @@ fn inflate_table_inner(
                 return TABLE_NOT_ENOUGH;
             };
             *slot = Code::new(curr as u8, root as u8, link_offset as u16);
-            record(touched, entry_base + low);
+            record(extent, entry_base + low);
         }
     }
 
@@ -1002,7 +1055,7 @@ fn inflate_table_inner(
             return TABLE_NOT_ENOUGH;
         };
         *slot = Code::new(64, (len - drop_bits) as u8, 0);
-        record(touched, next_base + huff);
+        record(extent, next_base + huff);
     }
 
     // Return parameters (`inftrees.c` L307-L310): advance the caller's cursor past

@@ -282,7 +282,7 @@ pub(crate) struct Progress {
 /// Naming the three cases lets the borrows be taken apart field by field, which is safe precisely
 /// because `handle`, `input` and `output` are distinct fields.
 #[derive(Debug)]
-pub(crate) enum LoadTarget<'buf> {
+pub(crate) enum LoadTarget {
     /// `state->in + strm->avail_in` for `state->size - strm->avail_in` bytes: `gz_avail`'s call
     /// (`gzread.c` L75-L76), which refills the free tail of the input buffer.
     Input {
@@ -297,15 +297,14 @@ pub(crate) enum LoadTarget<'buf> {
         /// How many bytes of the output buffer to offer to the handle.
         len: usize,
     },
-    /// The caller's own buffer: `gz_read`'s large-request transparent call (`gzread.c` L369).
-    ///
-    /// An [`OutputRegion`] rather than a `&mut [u8]`, because a C caller's buffer is
-    /// guaranteed writable and nothing more. This is the one destination in the module that
-    /// the operating system writes into rather than this crate, so it is also the one that
-    /// goes through [`OutputRegion::writable_bytes`]; that method documents the single extra
-    /// pass write-only storage costs here and why no other path pays it.
-    User(OutputRegion<'buf>),
 }
+
+// ★ There is deliberately **no** `User` variant. C's large-request transparent read hands the
+// operating system the caller's own buffer (`gzread.c` L369), and this module cannot: a C caller's
+// buffer is guaranteed writable and nothing more, and initialising it to obtain the `&mut [u8]`
+// `std::io::Read` requires would destroy the bytes past the returned count that C leaves alone.
+// `gz_read`'s `COPY` arm stages that read through `state->out` instead and copies only the
+// delivered prefix; the reasoning is set out there in full.
 
 /// Where `gz_decomp` sends the bytes the engine produces.
 ///
@@ -355,7 +354,7 @@ struct ReadOutcome {
 /// means the requested window does not lie inside the buffer it names, which C cannot express and
 /// this implementation reports as a corrupt state rather than trusting.
 fn resolve_load_window<'buf, 'alloc>(
-    target: &'buf mut LoadTarget<'_>,
+    target: &'buf mut LoadTarget,
     input: Option<&'buf mut Buffer<'alloc, u8>>,
     output: Option<&'buf mut Buffer<'alloc, u8>>,
 ) -> Option<&'buf mut [u8]> {
@@ -370,13 +369,6 @@ fn resolve_load_window<'buf, 'alloc>(
         LoadTarget::Output { len } => output
             .map_or(&mut [][..], Buffer::as_mut_slice)
             .get_mut(..*len),
-        LoadTarget::User(region) => {
-            // The window *is* the sub-region `gz_read` carved out, so the whole of it is
-            // offered. For write-only storage this is where the range is initialised before
-            // the handle writes into it; see `OutputRegion::writable_bytes`.
-            let len = region.len();
-            region.writable_bytes(0, len)
-        }
     }
 }
 
@@ -471,7 +463,7 @@ fn read_into<H: GzHandle + ?Sized>(handle: &mut H, buffer: &mut [u8]) -> ReadOut
 /// anything, only to render a message, and it takes the value from the failure the handle reported.
 pub(crate) fn gz_load<'a, A: Allocator<'a>>(
     state: &mut GzState<'a, A>,
-    mut target: LoadTarget<'_>,
+    mut target: LoadTarget,
 ) -> Progress {
     let outcome = {
         // `handle`, `input` and `output` are distinct fields, so these borrows are disjoint.
@@ -1177,16 +1169,76 @@ pub(crate) fn gz_read<'a, A: Allocator<'a> + Copy>(
             }
             refilled = true;
         } else if state.how() == COPY {
-            // L367-L369: large request, transparent stream -- read straight into the user buffer.
-            let window = dest.reborrow(offset, n);
-            if window.len() != n {
-                break;
+            // L367-L369: large request, transparent stream. C reads *straight into* the caller's
+            // buffer -- `gz_load(state, (unsigned char *)buf, n, &n)`.
+            //
+            // ★ **The read is staged through the layer's own output buffer instead, and only the
+            // returned prefix is copied across.** `gz_load`'s loop (L26-L34) advances `*have` by
+            // each `read` return and gives up only when one returns `<= 0`, so it under-fills the
+            // window only at end of file or on error -- and in that case C leaves everything past
+            // `*have` in the caller's buffer untouched. A caller may rely on that, because the
+            // count `gzread` returns is the only thing that describes what was written. Handing the
+            // handle the caller's storage directly cannot reproduce it here: a C caller's `buf` is
+            // guaranteed writable and nothing more, `std::io::Read` has no uninitialised-buffer
+            // form on stable Rust, and initialising the whole window first -- which is what an
+            // earlier revision of this module did -- destroys precisely the bytes past the count
+            // that C preserves.
+            //
+            // Staging costs one `memcpy` per bufferful of delivered bytes and is otherwise
+            // invisible:
+            //
+            // * the buffer used is `state->out`, which is `size << 1` bytes and provably free on
+            //   this branch -- the `else if` chain reached it only because `x.have == 0` -- and it
+            //   is the same buffer C fills on the *small*-request path (L260-L261);
+            // * nothing in `out` is published, so `x.have`/`x.next` stay as they were, which is
+            //   the state C leaves them in here. `gzungetc` with `x.have == 0` writes at
+            //   `out + (size << 1) - 1` and reads nothing (`gzread.c` L577-L584), so the scribbled
+            //   contents are unobservable;
+            // * the staging loop below requests exactly `n` bytes in total, so the descriptor ends
+            //   up at the same offset C would leave it at. That is load-bearing rather than tidy:
+            //   `gzoffset` reports `lseek(fd, 0, SEEK_CUR) - strm->avail_in` (`gzlib.c` L378-L381)
+            //   and a transparent read buffers nothing in `strm`, so any byte read past the
+            //   request would show up there. Letting one staged read of `size << 1` fall back out
+            //   to the outer loop would do exactly that: a request whose tail is shorter than
+            //   `size << 1` would drop into the `gz_fetch` arm above and read a whole further
+            //   buffer ahead.
+            let mut produced = 0_usize;
+            loop {
+                let chunk = n
+                    .saturating_sub(produced)
+                    .min(widen(state.size()).saturating_mul(2));
+                if chunk == 0 {
+                    // The request is satisfied, or -- unreachably, since `gz_look` allocated `out`
+                    // before `how` could become `COPY` -- there is nowhere to stage it.
+                    break;
+                }
+                let progress = gz_load(state, LoadTarget::Output { len: chunk });
+                let obtained = widen(progress.count);
+                if obtained != 0 {
+                    let delivered = state.output_prefix(obtained).is_some_and(|source| {
+                        dest.write_slice_at(offset.saturating_add(produced), source)
+                    });
+                    if !delivered {
+                        // Unreachable: `gz_load` clamps its count to the window it was given, which
+                        // is inside `out`, and `produced + obtained <= n <=` the space left in `dest`.
+                        failed = true;
+                        break;
+                    }
+                    produced = produced.saturating_add(obtained);
+                }
+                if progress.result.is_err() {
+                    failed = true;
+                    break;
+                }
+                if obtained < chunk {
+                    // C's `gz_load` loop (L26-L34) keeps reading until it has the whole window, so
+                    // an under-filled return means it stopped at end of file. Its caller sees the
+                    // partial count and a `0` return, and the outer loop's
+                    // `state->eof && strm->avail_in == 0` test ends the call on the next pass.
+                    break;
+                }
             }
-            let progress = gz_load(state, LoadTarget::User(window));
-            n = widen(progress.count);
-            if progress.result.is_err() {
-                failed = true;
-            }
+            n = produced;
         } else {
             // L371-L378: large request, gzip stream -- decompress straight into the user buffer.
             let Some(avail_out) = narrow(n) else {

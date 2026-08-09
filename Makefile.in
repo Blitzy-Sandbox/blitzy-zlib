@@ -172,12 +172,22 @@ EXE=
 #                      not substituted; a cross build overrides them on the
 #                      command line as shown above.
 #
-#   RUSTSHIM           The one C file the Rust library contains: the C-ABI
-#                      varargs shim that implements gzprintf and gzvprintf,
-#                      which stable Rust cannot define.  Compiled by the
-#                      package recipe and archived into the staged
-#                      $(STATICLIB) so both symbols reach the relink.
-#   RUSTSHIMFLAGS      Position-independent-code flags for it.
+#   RUSTSHIMDIR        The C translation units the Rust library contains: the
+#                      varargs shim that defines gzprintf and gzvprintf, and the
+#                      inftrees shim that defines inflate_table with its own
+#                      `codetype' prototype.  Stable Rust can declare none of
+#                      the three.  THIS RECIPE DOES NOT COMPILE THEM: cargo does,
+#                      in crates/libz-rs-sys/build.rs, and archives them into the
+#                      $(STATICLIB) it produces, so the relink below has one
+#                      complete archive to work from rather than an archive plus
+#                      an object this file compiled separately.  Named here only
+#                      for the diagnostics.
+#   RUSTSHIMSYMS       The symbols those units define.  Checked for in the
+#                      staged archive before anything is relinked, so a cargo
+#                      build that ran without a C compiler is caught here rather
+#                      than in some consumer's link.
+#   RUSTSHIMFLAGS      Extra C flags exported to that cargo build as $$CFLAGS,
+#                      on top of $(SFLAGS).
 #   ZLIBREF            The C shared library `rust-symbols' compares against.
 #                      Defaults to the one this build produces.
 #
@@ -186,14 +196,14 @@ EXE=
 #                      build.  THIS TARGET OWNS FEATURE SELECTION, which is why
 #                      the two lists are variables and why a `--features' or
 #                      `--no-default-features' in $(CARGO_BUILD_FLAGS) is
-#                      refused: the staged archive contains
-#                      $(RUSTSHIM)'s objects, and that shim calls two Rust
+#                      refused: the archive cargo produces contains
+#                      $(RUSTSHIMDIR)'s objects, and those units call Rust
 #                      adapters that exist only behind `libz-compat' and `gz'.
 #                      A build that dropped either feature would produce a
-#                      library with two unresolved symbols, and it would produce
-#                      it silently.  `gz' is therefore NAMED here rather than
-#                      relied on as a default -- a default is exactly what
-#                      `--no-default-features' removes.
+#                      library with no gzprintf, no gzvprintf and no
+#                      inflate_table, and it would produce it silently.  `gz' is
+#                      therefore NAMED here rather than relied on as a default --
+#                      a default is exactly what `--no-default-features' removes.
 #   RUSTZVERCMD        The one authoritative reading of ZLIB_VERSION, used by
 #                      every recipe that needs the versioned library name.  Its
 #                      pattern matches `.*define ZLIB_VERSION' rather than
@@ -286,20 +296,65 @@ EXE=
 #                      cbindgen.toml), so without them every conditional item
 #                      -- which is all of them -- is preprocessed away and the
 #                      gate would compare two empty sets and pass.
+#   RUSTHEADERTARGETS  Target-conditional macros the generated header is swept
+#                      under, in addition to the host configuration.  cbindgen
+#                      renders a cfg(windows) item inside `#if defined(_WIN32)'
+#                      rather than omitting it, so the artifact carries
+#                      declarations -- gzopen_w (zlib.h L2042) and the _WIN32
+#                      arm of the portability typedefs -- that the plain sweep
+#                      preprocesses away and therefore never compiles.  Sweeping
+#                      with -D_WIN32 as well is what puts those under a compiler.
+#                      MEASURED: a `typedef uint16_t wchar_t;' emitted inside
+#                      that guard compiles clean in every dialect without the
+#                      variant and fails as both C and C++ with it, so without
+#                      this the one defect the wchar_t exclusion in
+#                      cbindgen.toml exists to prevent would be invisible here.
+#                      Set it empty to sweep the host configuration only.
+#   RUSTPUBLICFNS      How many functions $(SRCDIR)zlib.h is expected to declare
+#                      for a non-Windows target: 95.  The symbol comparison is
+#                      already an exact two-way set diff, but both of its sides
+#                      are DERIVED -- want from the header, have from the
+#                      artifact -- so a change to the header moves both sides
+#                      together and passes.  zlib.h is immutable, so asserting
+#                      the count is what pins the contract itself rather than
+#                      the agreement between two things derived from it.  Not
+#                      asserted when $(EXE) is set, because gzopen_w is exported
+#                      there and the count is 96.  Set it empty to skip.
+#   RUSTVERNODES       How many symbol version nodes $(SRCDIR)zlib.map declares:
+#                      16.  Same reasoning as RUSTPUBLICFNS -- the diff above it
+#                      compares the map against the artifact, and this compares
+#                      the map against the frozen contract.  A consumer already
+#                      linked against a node this library stops defining fails
+#                      to bind at load time, which no set diff between two
+#                      derived sides would reveal.  Set it empty to skip.
 #   RUSTHEADERWARNOK   Extended regex matching the cbindgen notices that are an
-#                      enumerated, justified allowance.  It admits two, both of
-#                      the form "Can't find <type>", for the case where cbindgen
-#                      looks for a user-defined item named c_ulong or usize while
+#                      enumerated, justified allowance.  It admits three, all of
+#                      the form "Can't find <type>".
+#
+#                      Two are for the case where cbindgen looks for a
+#                      user-defined item named c_ulong or usize while
 #                      resolving `pub type uLong = c_ulong' and `pub type
 #                      z_size_t = usize', finds neither because both are compiler
 #                      primitives, and renders both correctly anyway.  With
 #                      `usize_is_size_t = true' in cbindgen.toml the current tree
-#                      does not produce them -- the target reports `0 allowed
-#                      notice(s), 0 unexpected', and the header does carry
+#                      does not produce them -- the header does carry
 #                      `typedef unsigned long uLong;' and `typedef size_t
 #                      z_size_t;' -- so the allowance is retained for a
 #                      configuration that resolves them differently rather than
-#                      because anything relies on it.  ANY other line on
+#                      because anything relies on it.
+#
+#                      The third is wchar_t, and it is REQUIRED rather than
+#                      tolerated.  cbindgen.toml excludes that item deliberately:
+#                      wchar_t is a BUILT-IN TYPE in C++, so emitting `typedef
+#                      uint16_t wchar_t;' -- which cbindgen does for the
+#                      #[cfg(windows)] alias gzopen_w needs -- makes the artifact
+#                      fail to compile as C++ under _WIN32.  zlib.h L2042 defines
+#                      no such typedef either: it names the type and lets the
+#                      platform supply it, which for C is the stddef.h already in
+#                      `sys_includes'.  So the notice is cbindgen reporting that it
+#                      resolved the name to nothing, having been told to, while
+#                      still rendering `const wchar_t *' correctly -- verified in
+#                      the generated artifact.  ANY other line on
 #                      cbindgen's stderr fails the target: the 269 warnings this
 #                      gate started from were all real -- items cbindgen could
 #                      not resolve and therefore could not have compared -- and
@@ -327,7 +382,7 @@ EXE=
 #                      gzprintf and gzvprintf were listed here while nothing
 #                      rendered them -- one is C variadic and the other takes a
 #                      va_list, so stable Rust can define neither and they live
-#                      in $(RUSTSHIM).  They are no longer an allowance: decision
+#                      in $(RUSTSHIMDIR).  They are no longer an allowance: decision
 #                      D11 in $(SRCDIR)cbindgen.toml annotates the shim's two
 #                      declarations, so the generated header carries both
 #                      prototypes and this target REQUIRES them, like any other
@@ -335,14 +390,16 @@ EXE=
 #                      and `rust-test' check with nm, which this target cannot,
 #                      because it never opens a library.
 #   RUSTHEADEREXTRAOK  Names the generated side is allowed to declare that
-#                      zlib.h does not.  One: inflate_table, which zlib.map
-#                      lists in its `local:' block -- hidden in the shared
-#                      object, still a global in the archive, because the
-#                      unmodified test/infcover.c calls it directly and will
-#                      not link without it.  Anything else appearing here is an
-#                      internal escaping into a file that looks exactly like
-#                      the public contract, which is the failure this list
-#                      exists to catch.
+#                      zlib.h does not.  EMPTY today, and that is the state to
+#                      keep it in.  inflate_table was the single entry while the
+#                      Rust side exported that name; it is now defined in
+#                      $(RUSTSHIMDIR)/inftrees_shim.c with inftrees.h's own
+#                      `codetype' prototype, so cbindgen never sees it and the
+#                      generated header cannot disagree with the declaration
+#                      test/infcover.c compiles against.  Anything appearing here
+#                      is an internal escaping into a file that looks exactly like
+#                      the public contract, which is the failure this list exists
+#                      to catch.
 #   RUSTHEADERSCRATCH  The working files the gate writes beside the artifact:
 #                      cbindgen's stderr, the last compiler log, the empty
 #                      translation unit each dialect is probed with, and the two
@@ -363,7 +420,8 @@ RUSTDIR=
 RUSTLIBDIR=$(RUSTTARGETDIR)/dropin
 RUSTNM=nm
 RUSTOBJCOPY=objcopy
-RUSTSHIM=$(SRCDIR)crates/libz-rs-sys/csrc/gzprintf_shim.c
+RUSTSHIMDIR=$(SRCDIR)crates/libz-rs-sys/csrc
+RUSTSHIMSYMS= gzprintf gzvprintf inflate_table
 RUSTSHIMFLAGS=-fPIC -DPIC
 ZLIBREF=$(SHAREDLIBV)
 RUSTCOREFEATURES=
@@ -384,9 +442,12 @@ RUSTHEADERCSTDS=c89 c99 c17
 RUSTHEADERCXXSTDS=c++17
 RUSTHEADERC89FLAGS=-Wno-endif-labels
 RUSTHEADERDEFS=-DZLIB_RS_LIBZ_COMPAT -DZLIB_RS_GZ
-RUSTHEADERWARNOK=Can.t find (c_ulong|usize)\.
+RUSTHEADERTARGETS=_WIN32
+RUSTPUBLICFNS=95
+RUSTVERNODES=16
+RUSTHEADERWARNOK=Can.t find (c_ulong|usize|wchar_t)\.
 RUSTHEADERNOGEN=$(RUSTWINONLY)
-RUSTHEADEREXTRAOK=inflate_table
+RUSTHEADEREXTRAOK=
 RUSTHEADERSCRATCH=$(RUSTHEADER).warn $(RUSTHEADER).log $(RUSTHEADER).probe.c \
 	$(RUSTHEADER).ref $(RUSTHEADER).gen
 
@@ -661,15 +722,19 @@ cover: infcover
 # drop-in test passes while exercising the wrong library.  When configure was run
 # with --static, $(SHAREDLIBV) is empty and only $(STATICLIB) is staged.
 #
-# One environment variable is exported into the cargo build: ZLIB_RS_GZPRINTF_SHIM=1.
-# It compiles no C -- crates/libz-rs-sys/build.rs never invokes a compiler -- it is
-# this recipe telling the Rust code which library is about to exist.  zlibCompileFlags()
-# is a compile-time constant and so cannot observe the relink below, yet bit 27 states
-# whether the library has gzprintf; the variable is what keeps that bit truthful about
-# the STAGED library, which does, rather than about cargo's cdylib, which does not.  It
-# is set unconditionally because this target always archives the shim, and a value
-# inherited from the caller's environment would only make the flags word disagree with
-# the artifact.  A plain `cargo build' leaves it unset and reports bit 27, honestly.
+# Three variables are exported into the cargo build: CC, CFLAGS and AR.  cargo is
+# what compiles $(RUSTSHIMDIR) -- crates/libz-rs-sys/build.rs drives the platform
+# compiler directly -- so exporting this build's own toolchain is what keeps the C
+# objects inside cargo's $(STATICLIB) built with the same compiler and the same flags
+# as everything else here.  $(RUSTSHIMFLAGS) is appended to $(SFLAGS) because those
+# objects are archived and then relinked into a shared library below, so they must be
+# position-independent.
+#
+# Nothing tells the Rust code what the finished library will contain any more, and
+# that is the point: the archive cargo produces already defines gzprintf, gzvprintf
+# and inflate_table, so cfg(zlib_rs_gzprintf) -- and with it zlibCompileFlags() bit
+# 27 -- follows from the compile that actually happened.  The recipe verifies the
+# three symbols are present in the staged archive before it relinks anything.
 #
 # Package selection is explicit.  `-p zlib-rs -p libz-rs-sys' names the two
 # crates that ship; the third workspace member, crates/zlib-rs-differential,
@@ -729,7 +794,9 @@ rust:
 	esac; \
 	if test -n "$$CORE_FEATURES"; then CORE_FEATURES="--features $$CORE_FEATURES"; fi; \
 	CARGO_TARGET_DIR=$(RUSTTARGETDIR); export CARGO_TARGET_DIR; \
-	ZLIB_RS_GZPRINTF_SHIM=1; export ZLIB_RS_GZPRINTF_SHIM; \
+	CC="$(CC)"; export CC; \
+	CFLAGS="$(SFLAGS) $(RUSTSHIMFLAGS)"; export CFLAGS; \
+	AR="$(AR)"; export AR; \
 	echo "$(CARGO) build $(CARGO_BUILD_FLAGS) -p zlib-rs $$CORE_FEATURES"; \
 	$(CARGO) build $(CARGO_BUILD_FLAGS) --manifest-path $(SRCDIR)Cargo.toml \
 	  -p zlib-rs $$CORE_FEATURES; \
@@ -790,12 +857,18 @@ rust:
 	mkdir -p $(RUSTLIBDIR); \
 	cp -p "$$rustdir/$(STATICLIB)" $(RUSTLIBDIR)/$(STATICLIB); \
 	echo "cp $$rustdir/$(STATICLIB) $(RUSTLIBDIR)/$(STATICLIB)"; \
-	echo "$(CC) $(SFLAGS) $(RUSTSHIMFLAGS) -c $(RUSTSHIM)"; \
-	$(CC) $(SFLAGS) $(RUSTSHIMFLAGS) $(ZINCOUT) -c \
-	  -o $(RUSTLIBDIR)/gzprintf_shim.o $(RUSTSHIM); \
-	$(AR) $(ARFLAGS) $(RUSTLIBDIR)/$(STATICLIB) \
-	  $(RUSTLIBDIR)/gzprintf_shim.o; \
-	rm -f $(RUSTLIBDIR)/gzprintf_shim.o; \
+	for sym in $(RUSTSHIMSYMS); do \
+	  if $(RUSTNM) $(RUSTLIBDIR)/$(STATICLIB) 2>/dev/null \
+	      | grep -q "^[0-9a-fA-F]* *T $$sym$$"; then :; else \
+	    echo "make rust: $(STATICLIB) does not define $$sym." >&2; \
+	    echo "make rust: cargo compiles $(RUSTSHIMDIR) into the archive it produces" >&2; \
+	    echo "make rust: (crates/libz-rs-sys/build.rs), so a missing name means that" >&2; \
+	    echo "make rust: build ran without a C compiler or without the libz-compat and" >&2; \
+	    echo "make rust: gz features.  This target will not stage an incomplete libz." >&2; \
+	    exit 1; \
+	  fi; \
+	done; \
+	echo "		$(STATICLIB) defines the C-ABI shim symbols cargo compiled:$(RUSTSHIMSYMS)"; \
 	sed -n 's/^ *ZEXTERN[^(]*[ *]\([A-Za-z_][A-Za-z0-9_]*\) *(.*/\1/p' \
 	  $(SRCDIR)zlib.h | sort -u > $(RUSTLIBDIR)/public.syms; \
 	printf '%s\n%s\n' "$$SOV" "$$SOM" > $(RUSTLIBDIR)/soname.stage; \
@@ -970,6 +1043,20 @@ rust:
 	if test ! -s $(RUSTLIBDIR)/missing.syms; then \
 	  echo "		every one of the `wc -l < $(RUSTLIBDIR)/want.syms` functions $(SRCDIR)zlib.h declares is exported"; \
 	fi; \
+	WANTN=`wc -l < $(RUSTLIBDIR)/want.syms | tr -d ' '`; \
+	if test -n "$(EXE)" || test -z "$(RUSTPUBLICFNS)"; then \
+	  echo "		$$WANTN functions expected on this platform; the $(RUSTPUBLICFNS)-function"; \
+	  echo '		count is the Linux contract and is not asserted here'; \
+	elif test "$$WANTN" -ne $(RUSTPUBLICFNS); then \
+	  echo "		$(SRCDIR)zlib.h now yields $$WANTN public functions, not $(RUSTPUBLICFNS)."; \
+	  echo '		That header is immutable, so the set this gate derives from it must not'; \
+	  echo '		change: either the header was edited or the derivation stopped matching'; \
+	  echo '		it.  Without this check a changed contract would be absorbed silently,'; \
+	  echo '		because the comparison above is derived-want against exported-have.'; \
+	  rc=1; \
+	else \
+	  echo "		and that is exactly $(RUSTPUBLICFNS) functions, as $(SRCDIR)zlib.h's frozen contract requires"; \
+	fi; \
 	sed -n '/^ *local:/,/}/{ s/^ *\([A-Za-z_][A-Za-z0-9_]*\);.*/\1/p; }' \
 	  $(SRCDIR)zlib.map | sort -u > $(RUSTLIBDIR)/local.syms; \
 	comm -12 $(RUSTLIBDIR)/local.syms $(RUSTLIBDIR)/exported.syms \
@@ -1000,6 +1087,19 @@ rust:
 	  else \
 	    echo '		symbol version nodes differ from $(SRCDIR)zlib.map, see the diff above'; \
 	    rc=1; \
+	  fi; \
+	  NODEN=`wc -l < $(RUSTLIBDIR)/so.nodes | tr -d ' '`; \
+	  if test -z "$(RUSTVERNODES)"; then \
+	    echo "		$$NODEN nodes; the node count is not asserted"; \
+	  elif test "$$NODEN" -ne $(RUSTVERNODES); then \
+	    echo "		$$NODEN symbol version nodes, not $(RUSTVERNODES)."; \
+	    echo '		$(SRCDIR)zlib.map is immutable, so its node set must not change: a'; \
+	    echo '		consumer already linked against a node this library no longer defines'; \
+	    echo '		fails to bind at load time.  The diff above compares the map against'; \
+	    echo '		the artifact; this compares the map against the frozen contract.'; \
+	    rc=1; \
+	  else \
+	    echo "		and that is exactly $(RUSTVERNODES) nodes, as $(SRCDIR)zlib.map's frozen contract requires"; \
 	  fi; \
 	fi; \
 	if command -v readelf > /dev/null 2>&1; then \
@@ -1304,6 +1404,43 @@ rust-symbols: rust
 #     Pass A.
 #   * It needs no built library and no `rust' run, so it is not a prerequisite
 #     of anything and nothing is a prerequisite of it.
+#
+# WHAT IS AUTOMATED HERE, AND WHAT IS DELIBERATELY NOT.  The boundary is worth
+# stating outright, because "the checks exist" and "the checks are automated"
+# are different claims and only the first was true of some of these before:
+#
+#   AUTOMATED BY THIS FILE, and each proven to FAIL when its property is
+#   violated rather than merely to pass today:
+#     - the generated header compiles as C89, C99, C17 and C++17, under the
+#       host configuration AND under each of $(RUSTHEADERTARGETS).  The target
+#       variant is not decoration: cbindgen renders cfg(windows) items inside
+#       `#if defined(_WIN32)', so without it the header's Windows half is never
+#       preprocessed in and a wchar_t typedef emitted there compiles clean in
+#       every dialect.  Measured both ways.
+#     - cbindgen's stderr carries nothing outside $(RUSTHEADERWARNOK).
+#     - every function $(SRCDIR)zlib.h declares is exported by the staged
+#       library, and nothing else is (`rust', two-way set diff).
+#     - that set is exactly $(RUSTPUBLICFNS) functions, and the artifact carries
+#       exactly $(RUSTVERNODES) version nodes.  These pin the frozen contract
+#       itself; the set diffs above them compare two DERIVED sides and so move
+#       together when the contract moves.
+#     - none of $(SRCDIR)zlib.map's `local:' names is exported, the node set
+#       matches the map, and the SONAME is the derived one.
+#     - the unmodified test/example.c, test/minigzip.c and test/infcover.c link
+#       against the staged library and pass, with ldd confirming which library
+#       was bound (`rust-test').
+#
+#   NOT AUTOMATED HERE, and left to .github/workflows/rust.yml by scope:
+#     - the ten signature/type/constant normalisation rules of Pass A, which
+#       need a C parser rather than sed.
+#     - cross-target BUILDS of the facade.  This file gates the generated
+#       header under -D_WIN32; type-checking the Rust for
+#       x86_64-pc-windows-gnu and i686 is `cargo clippy --target ...' and wants
+#       a matrix, and LINKING for Windows wants a cross-linker this tree does
+#       not assume.
+#     - Miri, AddressSanitizer, cargo-fuzz and the criterion throughput gates,
+#       all of which need a nightly toolchain or a time budget a build target
+#       must not impose.
 rust-header:
 	@set -e; \
 	srcroot=`cd "$(SRCDIR)." && pwd`; \
@@ -1355,15 +1492,21 @@ rust-header:
 	    echo "	C   -std=$$std: SKIPPED, $(CC) does not accept it"; \
 	    continue; \
 	  fi; \
-	  if $(CC) -std=$$std $(RUSTHEADERDEFS) -Wall -Wextra -pedantic -Werror \
-	     $$relax -fsyntax-only -x c '$(RUSTHEADER)' > '$(RUSTHEADER).log' 2>&1; then \
-	    cran=`expr $$cran + 1`; \
-	    echo "	C   -std=$$std: clean$${relax:+ (with $$relax, see D9)}"; \
-	  else \
-	    sed 's/^/    /' '$(RUSTHEADER).log' >&2; \
-	    echo "make rust-header: $(RUSTHEADER) is not valid C at -std=$$std" >&2; \
-	    exit 1; \
-	  fi; \
+	  for tgt in host $(RUSTHEADERTARGETS); do \
+	    case "$$tgt" in \
+	      host) tdef=; tname=;; \
+	      *) tdef=-D$$tgt; tname=" -D$$tgt";; \
+	    esac; \
+	    if $(CC) -std=$$std $(RUSTHEADERDEFS) $$tdef -Wall -Wextra -pedantic -Werror \
+	       $$relax -fsyntax-only -x c '$(RUSTHEADER)' > '$(RUSTHEADER).log' 2>&1; then \
+	      cran=`expr $$cran + 1`; \
+	      echo "	C   -std=$$std$$tname: clean$${relax:+ (with $$relax, see D9)}"; \
+	    else \
+	      sed 's/^/    /' '$(RUSTHEADER).log' >&2; \
+	      echo "make rust-header: $(RUSTHEADER) is not valid C at -std=$$std$$tname" >&2; \
+	      exit 1; \
+	    fi; \
+	  done; \
 	done; \
 	for std in $(RUSTHEADERCXXSTDS); do \
 	  if ! $(RUSTHEADERCXX) -std=$$std -fsyntax-only -x c++ \
@@ -1371,16 +1514,22 @@ rust-header:
 	    echo "	C++ -std=$$std: SKIPPED, $(RUSTHEADERCXX) does not accept it"; \
 	    continue; \
 	  fi; \
-	  if $(RUSTHEADERCXX) -std=$$std $(RUSTHEADERDEFS) -Wall -Wextra -pedantic \
-	     -Werror -fsyntax-only -x c++ '$(RUSTHEADER)' \
-	     > '$(RUSTHEADER).log' 2>&1; then \
-	    cxxran=`expr $$cxxran + 1`; \
-	    echo "	C++ -std=$$std: clean"; \
-	  else \
-	    sed 's/^/    /' '$(RUSTHEADER).log' >&2; \
-	    echo "make rust-header: $(RUSTHEADER) is not valid C++ at -std=$$std" >&2; \
-	    exit 1; \
-	  fi; \
+	  for tgt in host $(RUSTHEADERTARGETS); do \
+	    case "$$tgt" in \
+	      host) tdef=; tname=;; \
+	      *) tdef=-D$$tgt; tname=" -D$$tgt";; \
+	    esac; \
+	    if $(RUSTHEADERCXX) -std=$$std $(RUSTHEADERDEFS) $$tdef -Wall -Wextra -pedantic \
+	       -Werror -fsyntax-only -x c++ '$(RUSTHEADER)' \
+	       > '$(RUSTHEADER).log' 2>&1; then \
+	      cxxran=`expr $$cxxran + 1`; \
+	      echo "	C++ -std=$$std$$tname: clean"; \
+	    else \
+	      sed 's/^/    /' '$(RUSTHEADER).log' >&2; \
+	      echo "make rust-header: $(RUSTHEADER) is not valid C++ at -std=$$std$$tname" >&2; \
+	      exit 1; \
+	    fi; \
+	  done; \
 	done; \
 	if test $$cran -eq 0; then \
 	  echo "make rust-header: no C dialect could be compiled, so the artifact" >&2; \

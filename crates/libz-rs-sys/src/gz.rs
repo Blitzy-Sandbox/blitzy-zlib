@@ -92,10 +92,13 @@
 //! The resolution is already in the tree and is the third option
 //! `zlib_rs::gz::printf`'s documentation enumerates: `csrc/gzprintf_shim.c`, one C
 //! translation unit that owns nothing but `va_start`, `va_end` and a single
-//! `vsnprintf` call. `Makefile.in`'s `rust` target compiles it with `$(CC)`, adds
-//! the object to the staged `libz.a` and relinks the staged shared object from that
-//! archive. This crate's `build.rs` never invokes a C compiler, so
-//! `cargo build --release` still works on a machine without one.
+//! `vsnprintf` call. This crate's `build.rs` compiles it — with the platform
+//! compiler, taking no `cc` dependency — and emits `-l static=` for the archive it
+//! goes into, which rustc merges into the `libz.a` cargo produces. So the archive
+//! defines both names, and the packaged shared object is relinked from that same
+//! archive; a C compiler is consequently required to build this crate with
+//! `libz-compat` and `gz`, and `build.rs` says so rather than quietly omitting them.
+//! The artifact matrix in this crate's `lib.rs` states which artifact carries what.
 //!
 //! What this file owes the shim is exactly two hidden helpers, and their names are
 //! not negotiable:
@@ -1792,6 +1795,94 @@ unsafe fn dopen_descriptor(fd: c_int, mode: &[u8]) -> gzFile {
 #[allow(non_camel_case_types)]
 pub type wchar_t = u16;
 
+// The C runtime's `wcstombs`, used to narrow a wide path exactly as `gz_open` does.
+//
+// `gzlib.c` L200-L219 narrows the error label with `wcstombs`, which converts to the
+// **active code page** rather than to UTF-8 and reports `(size_t)-1` for text that page
+// cannot represent. Reproducing the label C would record means calling the very same
+// function, so it is declared here rather than approximated: no crate in the dependency
+// inventory (AAP §0.5.1.3) provides it, and `std` already links the C runtime that defines
+// it, so an `extern "C"` declaration costs nothing and adds no dependency.
+#[cfg(windows)]
+extern "C" {
+    /// `size_t wcstombs(char *dest, const wchar_t *src, size_t n);`
+    ///
+    /// Called in the two-step form C uses. With `dest` null it returns the number of bytes
+    /// the conversion needs, excluding the terminator; called again with a destination it
+    /// fills up to `n` bytes. Either call returns `(size_t)-1` if some character has no
+    /// multibyte representation in the active code page.
+    fn wcstombs(dest: *mut c_char, src: *const wchar_t, n: usize) -> usize;
+}
+
+/// Narrows a wide path to the bytes C would store in `state->path`.
+///
+/// The Rust counterpart of `gzlib.c` L198-L219 for the `fd == -2` case, kept faithful in
+/// three respects that a UTF-8 conversion gets wrong:
+///
+/// 1. it uses [`wcstombs`], so the label is in the active code page, which is what a C
+///    caller reading `gzerror`'s message sees;
+/// 2. an unconvertible path is **not** an error. C computes `len = wcstombs(NULL, path, 0)`,
+///    gets `(size_t)-1`, allocates `len + 1` -- which wraps to zero -- and stores an empty
+///    string. This returns an empty label for that case, which is the same observable
+///    outcome without relying on the wrap;
+/// 3. the allocation is **fallible**. C answers a failed `malloc` with `NULL`
+///    (`gzlib.c` L206-L209), so exhaustion must be reportable rather than fatal. An
+///    infallible `String` conversion aborts the process instead, and because the size comes
+///    from the caller's path that is a caller-controlled abort.
+///
+/// Returns [`None`] only for allocation failure, which the caller answers with `Z_NULL`.
+///
+/// # Safety
+///
+/// `path` must be non-null and a zero-terminated array of `wchar_t` that stays readable, and
+/// is not written by anything else, for the duration of the call.
+#[cfg(windows)]
+unsafe fn narrow_wide_label(path: *const wchar_t) -> Option<Vec<u8>> {
+    // `wcstombs(NULL, path, 0)` -- C's L200-L202 sizing call.
+    //
+    // SAFETY: unsafe-site category 5, discharged by this function's own contract: `path` is
+    // a non-null NUL-terminated wide string readable for the duration of the call, and a
+    // null destination with a zero count asks `wcstombs` only to measure it.
+    let needed = unsafe { wcstombs(ptr::null_mut(), path, 0) };
+
+    // C's `(size_t)-1` sentinel: the path cannot be represented in the active code page, so
+    // the label is empty. An empty `Vec` allocates nothing and cannot fail.
+    if needed == usize::MAX {
+        return Some(Vec::new());
+    }
+
+    // `malloc(len + 1)`, made fallible. `try_reserve_exact` is the only allocation here and
+    // the only thing that can return `None`.
+    let mut buffer = Vec::<u8>::new();
+    let room = needed.checked_add(1)?;
+    buffer.try_reserve_exact(room).ok()?;
+    buffer.resize(room, 0);
+
+    if needed != 0 {
+        // C's `wcstombs(state->path, path, len + 1)` at L212.
+        //
+        // SAFETY: unsafe-site category 5. `buffer` holds `needed + 1` writable bytes, which
+        // is the count passed, and `path` is the caller's NUL-terminated wide string. The
+        // destination and the source cannot overlap: one is this function's own allocation.
+        let written = unsafe { wcstombs(buffer.as_mut_ptr().cast::<c_char>(), path, room) };
+        // A second call that now reports failure, or more bytes than it just asked for, is a
+        // runtime disagreeing with itself. Truncating to what was requested keeps the label
+        // inside its own allocation; the label is diagnostic only, so a short one is
+        // harmless where a wrong length would not be.
+        let produced = if written == usize::MAX {
+            0
+        } else {
+            written.min(needed)
+        };
+        buffer.truncate(produced);
+    } else {
+        // C's `*(state->path) = 0` at L214: a zero-length path narrows to an empty string.
+        buffer.clear();
+    }
+
+    Some(buffer)
+}
+
 /// Open a gzip file named by a wide-character path. Windows only.
 ///
 /// `zlib.h` L2042: `gzFile gzopen_w(const wchar_t *path, const char *mode);`. Ported from
@@ -1804,19 +1895,20 @@ pub type wchar_t = u16;
 /// `zlib.h` declaration that is not among them. Compiling it unconditionally would add a
 /// ninety-sixth name and fail the parity diff.
 ///
-/// The conversion is the boundary's job, and it produces UTF-8. C converts inside
-/// `gz_open` with `wcstombs` (`gzlib.c` L200-L219), which narrows to the active code page
-/// and fails for any character that page cannot represent; the core's `gzopen_w`
-/// documentation records the resulting difference as forced and unresolved, because safe
-/// Rust cannot decode a locale-dependent encoding portably. Note what travels where: the
-/// caller's `wchar_t` units are passed through **unconverted** as the thing to open,
-/// while the narrowed text is supplied separately as the error label -- exactly the split
-/// C draws between `_wopen`'s argument and `state->path`. Narrowing the path *and*
-/// opening the narrowing could name a different file, or none.
+/// The conversion is the boundary's job, and it goes through the C runtime's own
+/// `wcstombs` (`gzlib.c` L200-L219) rather than a UTF-8 approximation, so the label a
+/// caller reads back from `gzerror` is in the active code page exactly as C's is. See
+/// [`narrow_wide_label`] for the three properties that depends on -- the code page, the
+/// treatment of an unconvertible path, and the fallible allocation.
 ///
-/// Unpaired surrogates are replaced rather than rejected, which
-/// [`String::from_utf16_lossy`] does and which only affects the label; the path itself is
-/// unaffected because it is never narrowed.
+/// Note what travels where: the caller's `wchar_t` units are passed through
+/// **unconverted** as the thing to open, while the narrowed text is supplied separately as
+/// the error label -- exactly the split C draws between `_wopen`'s argument and
+/// `state->path`. Narrowing the path *and* opening the narrowing could name a different
+/// file, or none.
+///
+/// The order of operations is C's and is load-bearing: the mode string is rejected before
+/// any allocation whose size the caller controls. The body says why.
 ///
 /// # Safety
 ///
@@ -1838,29 +1930,40 @@ pub unsafe extern "C" fn gzopen_w(path: *const wchar_t, mode: *const c_char) -> 
         let Some(mode) = mode else {
             return fallback::null_handle();
         };
-        // The zero-terminated length, found the way `wcslen` finds it. `wrapping_add` has
-        // no precondition to violate, and the loop stops at the terminator the caller's
-        // contract guarantees.
-        let mut len = 0_usize;
-        // SAFETY: unsafe-site category 5. The caller guarantees `path` is a
-        // zero-terminated `wchar_t` array readable for the duration of the call, so every
-        // unit up to and including the terminator is readable and the scan cannot run
-        // past it.
-        while unsafe { *path.add(len) } != 0 {
-            len = len.wrapping_add(1);
+        // ★ **The mode is judged before the path is narrowed, and that order is C's.**
+        // `gz_open` parses and rejects the mode string at `gzlib.c` L107-L197 -- freeing
+        // only the fixed-size state on each of its four refusals -- and reaches the path
+        // narrowing and its `malloc` at L198-L219 solely for a mode it has accepted. Doing
+        // the caller-sized work first would let an invalid mode still provoke an
+        // allocation the size of the caller's path, which is both a divergence and, since
+        // the size is the caller's to choose, a denial-of-service lever.
+        //
+        // The grammar is not re-implemented here: [`GzOpenSpec::parse`] is the core's
+        // single source of truth, and its documentation records that being callable ahead
+        // of any commitment is exactly what it is for. The accepted value is deliberately
+        // discarded -- `open_target` re-parses the same bytes through the core, so this is
+        // a rejection gate rather than a second parse whose result could drift.
+        if GzOpenSpec::parse(mode).is_err() {
+            return fallback::null_handle();
         }
-        // SAFETY: unsafe-site category 2. `path` is non-null, aligned for `u16` by the
-        // caller's contract, and `len` units before the terminator were just proved
-        // readable; the slice is built once and only safe values travel inward.
-        let units = unsafe { core::slice::from_raw_parts(path, len) };
-        let label = String::from_utf16_lossy(units);
+        // The label C would record, in the active code page and through a fallible
+        // allocation. `None` is a failed `malloc`, which C answers with `NULL`
+        // (`gzlib.c` L206-L209).
+        //
+        // SAFETY: `path` is non-null by the test above and, by this function's contract, a
+        // zero-terminated `wchar_t` array readable for the duration of the call -- which is
+        // `narrow_wide_label`'s requirement.
+        let narrowed = unsafe { narrow_wide_label(path) };
+        let Some(label) = narrowed else {
+            return fallback::null_handle();
+        };
         // The units are opened **unconverted**, through `_wopen`, which is what C does
         // (`gzlib.c` L250-L251); only the label is narrowed. `open_target` performs the
         // same three reservations before opening as it does for a narrow path.
         //
         // SAFETY: `path` is the caller's zero-terminated wide string, live for this call,
         // which is `open_descriptor`'s contract for the `Wide` variant.
-        unsafe { open_target(OpenTarget::Wide(path), label.as_bytes(), mode) }
+        unsafe { open_target(OpenTarget::Wide(path), &label, mode) }
     })
 }
 
@@ -3418,6 +3521,11 @@ mod tests {
     use core::sync::atomic::{AtomicU32, Ordering};
 
     use std::ffi::{CStr, CString};
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStrExt;
+
+    #[cfg(windows)]
+    use super::{gzopen_w, narrow_wide_label};
     use std::path::PathBuf;
 
     use zlib_rs::allocate::GlobalAllocator;
@@ -3966,6 +4074,104 @@ mod tests {
         }
     }
 
+    /// `gzopen_w` applies the same four mode rejections `gzopen` does.
+    ///
+    /// The point is the *ordering* as much as the outcome. `gz_open` parses and rejects the
+    /// mode at `gzlib.c` L107-L197 and only reaches the path narrowing and its `malloc` at
+    /// L198-L219 for a mode it has accepted, so a refused mode must cost no allocation whose
+    /// size the caller chose. An earlier revision of this entry point converted the whole
+    /// wide path -- infallibly, through `String::from_utf16_lossy` -- before looking at the
+    /// mode at all, which both diverged from that order and let a caller provoke an
+    /// out-of-memory abort with a long path and a mode that was never going to be accepted.
+    ///
+    /// The four are C's: `+` anywhere (L129-L131), no `r`/`w`/`a` (L174-L177), `T` while
+    /// reading (L181-L185) and `G` while writing (L191-L195). They are checked through the
+    /// wide entry point specifically, because the gate that applies them lives in it.
+    #[cfg(windows)]
+    #[test]
+    fn gzopen_w_refuses_the_rejected_mode_strings() {
+        let scratch = Scratch::new("wmodes");
+        let wide: Vec<u16> = scratch
+            .0
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        for mode in ["rb+", "wb+", "b", "9", "rbT", "wbG"] {
+            let c_mode = CString::new(mode).unwrap();
+            // SAFETY: `wide` is NUL-terminated and live for the call; `c_mode` likewise.
+            let file = unsafe { gzopen_w(wide.as_ptr(), c_mode.as_ptr()) };
+            assert!(file.is_null(), "wide open accepted mode {mode:?}");
+        }
+        // Nothing was created: every one of those was refused before the file was opened.
+        assert!(!scratch.0.exists());
+    }
+
+    /// A wide path round-trips through `gzopen_w`.
+    ///
+    /// Covers the half of the change the rejection test cannot: that an *accepted* mode still
+    /// reaches the open, that the label narrowing does not disturb the path -- the `wchar_t`
+    /// units are handed to `_wopen` unconverted, which is C's split at `gzlib.c` L250-L251 --
+    /// and that the bytes come back.
+    #[cfg(windows)]
+    #[test]
+    fn gzopen_w_round_trips_a_wide_path() {
+        let scratch = Scratch::new("wroundtrip");
+        let wide: Vec<u16> = scratch
+            .0
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let payload = b"a wide path names the same file a narrow one does";
+
+        let mode = CString::new("wb").unwrap();
+        // SAFETY: both strings are NUL-terminated and live for the call.
+        let writer = unsafe { gzopen_w(wide.as_ptr(), mode.as_ptr()) };
+        assert!(!writer.is_null());
+        assert_eq!(
+            write_bytes(writer, payload),
+            c_int::try_from(payload.len()).unwrap()
+        );
+        assert_eq!(close(writer), Z_OK);
+
+        // Read it back through the *narrow* entry point: the same file, either spelling.
+        assert_eq!(read_file(&scratch.c_path()), payload);
+    }
+
+    /// The error label is narrowed with the C runtime's `wcstombs`, and cannot abort.
+    ///
+    /// `gzlib.c` L200-L219 converts the label with `wcstombs`, which targets the **active code
+    /// page**; this library used `String::from_utf16_lossy`, which targets UTF-8, so the two
+    /// disagreed for any path outside ASCII. The three properties asserted here are the ones
+    /// `narrow_wide_label` exists to hold: an ASCII path narrows byte-for-byte, an empty path
+    /// narrows to empty (C's `*(state->path) = 0` at L214), and neither allocates fatally.
+    #[cfg(windows)]
+    #[test]
+    fn a_wide_label_is_narrowed_through_the_c_runtime() {
+        let ascii: Vec<u16> = "plain-ascii-name.gz"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: NUL-terminated and live for the call.
+        let narrowed = unsafe { narrow_wide_label(ascii.as_ptr()) };
+        assert_eq!(
+            narrowed.as_deref(),
+            Some(&b"plain-ascii-name.gz"[..]),
+            "ASCII must narrow byte-for-byte in any code page"
+        );
+
+        let empty: Vec<u16> = vec![0];
+        // SAFETY: NUL-terminated and live for the call.
+        let narrowed = unsafe { narrow_wide_label(empty.as_ptr()) };
+        assert_eq!(
+            narrowed.as_deref(),
+            Some(&b""[..]),
+            "an empty wide path narrows to an empty label"
+        );
+    }
+
     #[test]
     fn a_transparent_write_is_reported_by_gzdirect() {
         let scratch = Scratch::new("direct");
@@ -3979,6 +4185,213 @@ mod tests {
         let file = open(&path, "rb");
         assert_eq!(direct(file), 1);
         assert_eq!(read_file(&path), payload);
+        assert_eq!(close(file), Z_OK);
+    }
+
+    /// A transparent read that comes up short leaves the rest of the caller's buffer alone.
+    ///
+    /// `gzread.c` L367-L369 hands the caller's buffer straight to `gz_load` for a large request
+    /// on a transparent stream, and `gz_load`'s loop (L26-L34) advances `*have` by each `read`
+    /// return and gives up only when one returns `<= 0` -- so it under-fills the window just at
+    /// end of file, and there C has touched the returned prefix and nothing else. A caller may
+    /// rely on that, because the count `gzread` returns is the only thing that describes what was
+    /// written.
+    ///
+    /// The buffer is pre-filled with a **position-dependent** sentinel: a constant would pass by
+    /// coincidence against any implementation that happened to fill with the same byte, and an
+    /// earlier revision of this library filled the whole offered window with zeros.
+    ///
+    /// The sizes are chosen to reach the path under test rather than to be round: the file is
+    /// larger than one input buffer (the default `size` is 8192, so `gz_look` delivers 8192 bytes
+    /// through the layer's own buffer first) and the request is far larger than `size << 1`,
+    /// which is what steers `gz_read` past its double-buffering branch and into the direct one.
+    /// A large transparent read consumes from the descriptor exactly what it delivers.
+    ///
+    /// `gzread.c` L367-L369 gives `gz_load` the caller's buffer and the *whole* remaining request,
+    /// so the transparent path never reads past the request boundary. That is observable, because
+    /// `gzoffset` reports `lseek(fd, 0, SEEK_CUR) - strm->avail_in` (`gzlib.c` L478-L481) and a
+    /// transparent stream buffers nothing in `strm` for that subtraction to discount -- so any byte
+    /// read ahead shows up in the result.
+    ///
+    /// This pins the property because the staging this port performs could silently break it. An
+    /// intermediate revision staged a *single* `size << 1` read per pass of the outer loop and let
+    /// the remainder fall back through it; a request whose tail is shorter than `size << 1` then
+    /// dropped into the double-buffering arm and pulled a whole further buffer in. The sizes below
+    /// are chosen to hit exactly that case: with `size` 8 the direct arm moves 16 bytes at a time,
+    /// `gz_look` delivers the first 8 through the layer's own buffer, and the 28-byte request
+    /// therefore leaves a 4-byte tail. Measured against that revision this read 40 bytes from the
+    /// descriptor while returning 28.
+    #[test]
+    fn a_large_transparent_read_does_not_read_past_the_request() {
+        const FILE_LEN: usize = 100;
+        const REQUEST: usize = 28;
+
+        let scratch = Scratch::new("noreadahead");
+        let path = scratch.c_path();
+        let payload: Vec<u8> = (0..FILE_LEN)
+            .map(|at| u8::try_from(at % 251).unwrap_or(0))
+            .collect();
+        write_file(&path, "wbT", &payload);
+
+        let file = open(&path, "rb");
+        assert!(!file.is_null());
+        // `size` 8 makes the direct arm's staging buffer 16 bytes, so a 28-byte request has a tail
+        // shorter than one bufferful.
+        assert_eq!(set_buffer(file, 8), 0);
+
+        let mut buffer = vec![0_u8; REQUEST];
+        let got = read_bytes(file, &mut buffer);
+        assert_eq!(count(got), REQUEST, "the request is satisfied in full");
+        assert_eq!(
+            buffer,
+            payload[..REQUEST],
+            "and the delivered bytes are the file's"
+        );
+        assert_eq!(
+            offset(file),
+            z_off_t::try_from(REQUEST).unwrap(),
+            "the descriptor must sit exactly at the request boundary, with nothing read ahead"
+        );
+        assert_eq!(close(file), Z_OK);
+    }
+
+    #[test]
+    fn a_short_transparent_read_leaves_the_tail_of_the_callers_buffer_intact() {
+        const FILE_LEN: usize = 20_000;
+        const REQUEST: usize = 40_000;
+
+        let scratch = Scratch::new("shortread");
+        let path = scratch.c_path();
+
+        // A plain file, not a gzip member, so the reader takes the transparent path. Written
+        // with `T` through this library's own writer, which
+        // `a_transparent_write_is_reported_by_gzdirect` establishes stores bytes verbatim.
+        let payload: Vec<u8> = (0..FILE_LEN)
+            .map(|at| u8::try_from(at % 251).unwrap_or(0))
+            .collect();
+        write_file(&path, "wbT", &payload);
+        assert_eq!(std::fs::read(&scratch.0).unwrap(), payload);
+
+        let sentinel: Vec<u8> = (0..REQUEST)
+            .map(|at| u8::try_from(at % 241).unwrap_or(0) ^ 0x80)
+            .collect();
+        let mut buffer = sentinel.clone();
+
+        let file = open(&path, "rb");
+        assert_eq!(direct(file), 1, "the file must be read transparently");
+        let got = read_bytes(file, &mut buffer);
+        assert_eq!(
+            count(got),
+            FILE_LEN,
+            "the whole file is delivered in one call"
+        );
+        assert_eq!(close(file), Z_OK);
+
+        assert_eq!(
+            buffer.get(..FILE_LEN),
+            payload.get(..),
+            "the returned prefix is the file's bytes"
+        );
+        assert_eq!(
+            buffer.get(FILE_LEN..),
+            sentinel.get(FILE_LEN..),
+            "and every byte past the returned count is exactly as the caller left it"
+        );
+
+        // The same file again with the smallest buffer `gzbuffer` will accept, so that the
+        // staging loop has to run many times rather than twice. This is what makes the branch
+        // under test unambiguous: with `size` at its floor of 8, `size << 1` is 16, so every
+        // iteration after the first `gz_look` takes the direct arm.
+        let mut buffer = sentinel.clone();
+        let file = open(&path, "rb");
+        assert_eq!(set_buffer(file, 8), 0);
+        assert_eq!(direct(file), 1);
+        assert_eq!(count(read_bytes(file, &mut buffer)), FILE_LEN);
+        assert_eq!(close(file), Z_OK);
+        assert_eq!(
+            buffer.get(..FILE_LEN),
+            payload.get(..),
+            "a staged read that loops delivers the same bytes"
+        );
+        assert_eq!(
+            buffer.get(FILE_LEN..),
+            sentinel.get(FILE_LEN..),
+            "and still leaves the tail alone"
+        );
+    }
+
+    /// The same guarantee for `gzfread`, over a compressed stream.
+    ///
+    /// `gzfread` is `gz_read` behind an item/size product (`gzread.c` L437-L459), and the
+    /// decompressing large-request branch (L371-L378) writes through `inflate` rather than
+    /// through the handle. Both branches must leave the tail alone for the same reason, and the
+    /// decompressing one always has -- it is asserted here so a future change to either cannot
+    /// quietly diverge from the other.
+    #[test]
+    fn a_short_gzfread_leaves_the_tail_of_the_callers_buffer_intact() {
+        const FILE_LEN: usize = 20_000;
+        const REQUEST: usize = 40_000;
+
+        let scratch = Scratch::new("shortfread");
+        let path = scratch.c_path();
+
+        // Deliberately compressible, so the member is far smaller than the payload and the
+        // decompressing branch has to loop.
+        let payload: Vec<u8> = (0..FILE_LEN)
+            .map(|at| u8::try_from(at % 7).unwrap_or(0))
+            .collect();
+        write_file(&path, "wb", &payload);
+
+        let sentinel: Vec<u8> = (0..REQUEST)
+            .map(|at| u8::try_from(at % 241).unwrap_or(0) ^ 0x80)
+            .collect();
+        let mut buffer = sentinel.clone();
+
+        let file = open(&path, "rb");
+        assert_eq!(direct(file), 0, "the file must be a gzip member");
+        let len = z_size_t::try_from(buffer.len()).unwrap();
+        let got = fread_items(buffer.as_mut_ptr().cast::<c_void>(), len, 1, file);
+        assert_eq!(got, 0, "one item of 40000 bytes cannot be completed");
+        assert_eq!(close(file), Z_OK);
+
+        assert_eq!(
+            buffer.get(..FILE_LEN),
+            payload.get(..),
+            "the bytes that were delivered are the payload's"
+        );
+        assert_eq!(
+            buffer.get(FILE_LEN..),
+            sentinel.get(FILE_LEN..),
+            "and the tail is exactly as the caller left it"
+        );
+    }
+
+    /// A `gzungetc` still succeeds after a large transparent read.
+    ///
+    /// `gzread.c` L577-L584 handles an empty output buffer by parking the pushed byte at
+    /// `out + (size << 1) - 1`, which is what "allows more pushing" means. The transparent
+    /// large-request path stages its read through that same buffer, so this asserts the staging
+    /// leaves the push room intact: nothing is published, so `x.have` is still zero and the
+    /// empty-buffer arm is the one taken.
+    #[test]
+    fn a_push_back_still_works_after_a_large_transparent_read() {
+        const FILE_LEN: usize = 20_000;
+
+        let scratch = Scratch::new("ungetafter");
+        let path = scratch.c_path();
+        let payload: Vec<u8> = (0..FILE_LEN)
+            .map(|at| u8::try_from(at % 251).unwrap_or(0))
+            .collect();
+        write_file(&path, "wbT", &payload);
+
+        let file = open(&path, "rb");
+        let mut buffer = vec![0_u8; 40_000];
+        assert_eq!(count(read_bytes(file, &mut buffer)), FILE_LEN);
+
+        assert_eq!(unget_byte(0x5a, file), 0x5a, "the push must be accepted");
+        let mut one = [0_u8; 1];
+        assert_eq!(count(read_bytes(file, &mut one)), 1);
+        assert_eq!(one[0], 0x5a, "and the pushed byte comes back first");
         assert_eq!(close(file), Z_OK);
     }
 
@@ -5289,9 +5702,17 @@ mod tests_backend {
         gzclearerr, gzclose, gzclose_r, gzclose_w, gzdirect, gzdopen, gzeof, gzerror, gzflush,
         gzfread, gzfwrite, gzgetc, gzgetc_, gzgets, gzoffset, gzoffset64, gzopen, gzopen64, gzputc,
         gzputs, gzread, gzrewind, gzseek, gzseek64, gzsetparams, gztell, gztell64, gzungetc,
-        gzwrite, release, reserve_block, state_mut, Descriptor, FacadeGzState, GzBlock, GzOpenSpec,
-        GZ_TAG_CLOSED, GZ_TAG_LIVE,
+        gzwrite, release, reserve_block, state_mut, FacadeGzState, GzBlock, GZ_TAG_CLOSED,
+        GZ_TAG_LIVE,
     };
+
+    // Both of these serve platform-gated tests only, so importing them unconditionally is an
+    // `unused_imports` warning everywhere else -- `Descriptor` is exercised by the `cfg(unix)`
+    // descriptor-lifecycle tests and `GzOpenSpec` by the LP64-Linux mode-resolution test.
+    #[cfg(unix)]
+    use super::Descriptor;
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    use super::GzOpenSpec;
 
     use core::ffi::{c_char, c_int, c_uint, c_void};
     use core::sync::atomic::{AtomicU32, Ordering};
@@ -5390,6 +5811,9 @@ mod tests_backend {
     }
 
     /// `gzdopen(fd, mode)` -- hands a descriptor to the library.
+    ///
+    /// Gated because every caller is: the descriptor-adoption tests are `cfg(unix)`.
+    #[cfg(unix)]
     fn dopen(fd: c_int, mode: &CStr) -> gzFile {
         // SAFETY: category 5 for `mode`, which is a live `CStr` as in `open_raw`, plus
         // the documented descriptor-adoption site. Every caller of this helper has

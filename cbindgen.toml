@@ -281,18 +281,20 @@
 #      library and runs it -- measured passing on both the configured and the
 #      unconfigured paths, with `ldd` proving which library was bound.  The
 #      mechanism is the MSRV-compatible shim
-#      `crates/libz-rs-sys/csrc/gzprintf_shim.c`, compiled by the packaging layer
-#      rather than by `build.rs` so that a shipped `cargo build` still needs no C
-#      compiler; `crates/zlib-rs/src/gz/printf.rs` records the decision and the
-#      trade-off it accepts.
+#      `crates/libz-rs-sys/csrc/gzprintf_shim.c`, which
+#      `crates/libz-rs-sys/build.rs` compiles with the platform C compiler and
+#      archives into the `libz.a` cargo produces;
+#      `crates/zlib-rs/src/gz/printf.rs` records the decision and the trade-off it
+#      accepts.
 #
 #      ONE QUALIFICATION SURVIVES, and it is about the artifact rather than the
-#      calling convention: a bare `cargo build` produces a library without these
-#      two symbols at all.  `make rust` is what produces the complete one.  So
-#      the right reading of this entry is "absent from the generated HEADER by
-#      cbindgen's construction, present and call-tested in the PACKAGED library,
-#      absent from the bare cargo artifact" -- three different statements, none
-#      of which substitutes for another.
+#      calling convention: cargo's own `libz.so` does not EXPORT these two, because
+#      rustc's cdylib version script gives a symbol from a native archive no
+#      dynamic entry.  `libz.a` defines them and the packaged shared object exports
+#      them.  So the right reading of this entry is "absent from the generated
+#      HEADER by cbindgen's construction, defined in every artifact, exported by the
+#      archive and by the packaged shared object" -- and the artifact matrix in
+#      `crates/libz-rs-sys/src/lib.rs` is where that is stated once.
 #
 #  NORMALISATION RULES THE GATE MUST IMPLEMENT
 #  -------------------------------------------
@@ -425,9 +427,10 @@ header = '''
 #  `gzprintf` is variadic (`zlib.h` L1549) and `gzvprintf` takes a `va_list`
 #  (`zlib.h` L2047).  Neither can be DEFINED in stable Rust -- defining a
 #  C-variadic function needs `#![feature(c_variadic)]` and naming a `va_list`
-#  needs `core::ffi::VaList`, both unstable -- so both live in the one C
-#  translation unit this library contains, `crates/libz-rs-sys/csrc/gzprintf_shim.c`,
-#  which `crates/libz-rs-sys/build.rs` compiles into every artifact.  cbindgen
+#  needs `core::ffi::VaList`, both unstable -- so both live in
+#  `crates/libz-rs-sys/csrc/gzprintf_shim.c`, one of the two C translation units
+#  this library contains, which `crates/libz-rs-sys/build.rs` compiles into the
+#  archive every artifact is built from.  cbindgen
 #  reads Rust, so it cannot see them, and without this block the generated header
 #  would be missing two of the library's 95 exported functions: the diff gate
 #  would then report an incomplete artifact for a library that is in fact
@@ -630,10 +633,10 @@ item_types = [
 #       the two hidden helpers below are `pub` in Rust and yet are no part of the
 #       C contract.  Only an explicit exclusion keeps them out.
 #
-#  Both entries are `zlib.map` `local:` names (the `_*` rule), called by exactly
-#  one C translation unit -- `crates/libz-rs-sys/csrc/gzprintf_shim.c`, which
-#  declares them itself, at the top of the file, with the same signatures.  The
-#  shim needs no generated header, so excluding them costs nothing and prevents
+#  The three `_zlib_rs_*` entries are `zlib.map` `local:` names (the `_*` rule),
+#  each called by exactly one C translation unit in `crates/libz-rs-sys/csrc/`,
+#  which declares it itself, at the top of the file, with the same signature.  The
+#  shims need no generated header, so excluding them costs nothing and prevents
 #  the artifact from advertising an internal calling contract to every consumer
 #  that includes `zlib.h`.
 #
@@ -656,17 +659,33 @@ item_types = [
 #  against `zlib.h`'s `ZEXTERN` set in BOTH directions, so hiding a contract
 #  function here fails the build rather than passing quietly.
 #
-#  `inflate_table` MEETS THAT CONDITION AND IS STILL NOT LISTED, which is a
-#  decision rather than an oversight.  It is exported and `zlib.h` does not
-#  declare it -- but unlike the two shim helpers it has a real C declaration in
-#  this tree, `inftrees.h` L60-L62, which the unmodified `test/infcover.c`
-#  compiles against and calls directly.  Its rendered prototype is therefore
-#  worth having in the artifact, where the signature pass this file specifies
-#  can one day compare it against that declaration.  It is carried instead as
-#  the single entry in `RUSTHEADEREXTRAOK` (Makefile.in), where every run prints
-#  it by name and an unexercised entry is reported -- visible and counted, which
-#  an exclusion here would not be.
-exclude = ["_zlib_rs_gzprintf_begin", "_zlib_rs_gzprintf_commit", "malloc", "free"]
+#  `_zlib_rs_inflate_table` is the third such helper and is listed for the same
+#  reason.  The name `zlib.h` does not declare and `inftrees.h` L60-L62 does is
+#  `inflate_table`, whose first parameter is the C enum `codetype`; that
+#  declaration is supplied by `csrc/inftrees_shim.c`, in C, where the enum is
+#  legal, and the Rust side behind it is reached through this underscored name.
+#  Rendering the Rust spelling would put a prototype in a file that looks exactly
+#  like the public contract and that DISAGREES with the declaration the unmodified
+#  `test/infcover.c` compiles against -- `conflicting types for 'inflate_table'`
+#  is the whole reason the shim exists -- so it is excluded rather than annotated.
+#
+#  `wchar_t` is excluded on the same principle but for a sharper reason: cbindgen
+#  renders `crate::gz::wchar_t` (the `#[cfg(windows)]` alias `gzopen_w` needs) as
+#  `typedef uint16_t wchar_t;`, and `wchar_t` is a BUILT-IN TYPE in C++, so the
+#  generated header would not compile as C++ under `_WIN32` at all.  `zlib.h`
+#  itself defines no such typedef; it names the type and lets the platform supply
+#  it.  This artifact does the same -- `sys_includes` already carries `stddef.h`,
+#  which declares it in C, and C++ needs nothing -- so excluding the item while
+#  keeping the `WcharT` rename below is what makes `gzopen_w` render with the
+#  contract's own spelling in both languages.
+exclude = [
+    "_zlib_rs_gzprintf_begin",
+    "_zlib_rs_gzprintf_commit",
+    "_zlib_rs_inflate_table",
+    "wchar_t",
+    "malloc",
+    "free",
+]
 
 #  Understand the mechanism before adding an entry.  This table is an exact,
 #  case-sensitive lookup on an item's own name, applied to typedefs, structs,

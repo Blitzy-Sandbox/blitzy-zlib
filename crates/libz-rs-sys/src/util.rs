@@ -572,18 +572,16 @@ const SPRINTF_RETURNS_VOID_BIT: uLong = 0;
 /// `gzwrite.c` L406-L412 and L505-L515 are the stub bodies such a build compiles.
 ///
 /// `gzprintf` and `gzvprintf` are variadic, so they cannot be *defined* in stable
-/// Rust; they are compiled from `csrc/gzprintf_shim.c` by the packaging layer
-/// (`Makefile.in`'s `rust` target), which archives the object into the staged
-/// library. That link happens after this constant is evaluated, so the packaging
-/// layer announces it with `ZLIB_RS_GZPRINTF_SHIM=1` and `build.rs` turns the
-/// announcement into `cfg(zlib_rs_gzprintf)`. Reading the cfg here is what ties the
-/// bit to the artifact rather than to an intention: `make rust` stages a library that
-/// has both symbols and reports the bit clear, while a bare `cargo build` -- which
-/// compiles no C at all -- produces one that has neither and reports it set. The
-/// `gz` feature off is the third configuration that omits them, and it needs no separate
-/// definition: `build.rs` refuses `ZLIB_RS_GZPRINTF_SHIM=1` unless both `libz-compat`
-/// and `gz` are on, so the cfg is necessarily absent there and this one expression
-/// reports the bit set.
+/// Rust; they are compiled from `csrc/gzprintf_shim.c` by `build.rs`, which drives the
+/// platform C compiler and archives the object into the `libz.a` cargo produces.
+/// `cfg(zlib_rs_gzprintf)` is set by that same script, and only when the compile
+/// actually happened, so reading the cfg here ties the bit to the artifact rather than
+/// to an intention. One configuration reports the bit *set*, and it is the only one
+/// that can: with `libz-compat` or `gz` off there is no `gzFile` layer for the shim to
+/// call into, `build.rs` compiles no C, and the library really has no `gzprintf`. The
+/// test named below closes the loop by taking the address of both symbols, so a build
+/// whose flags word claims them cannot even link without them.
+///
 /// cbindgen:ignore
 const GZPRINTF_UNAVAILABLE_BIT: uLong = if cfg!(zlib_rs_gzprintf) { 0 } else { 1 << 27 };
 

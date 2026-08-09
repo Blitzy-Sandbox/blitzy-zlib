@@ -46,29 +46,27 @@
  *  Who compiles it
  * --------------------------------------------------------------------------
  *
- * NOT cargo.  `crates/libz-rs-sys/build.rs` is required to have no
- * `[build-dependencies]` and to never invoke a C compiler, so that
- * `cargo build --release` for the shipped artifacts works on a machine
- * without one (AAP §0.7.1 (i), and §0.6.4.1's rule that a C toolchain is the
- * differential crate's business alone).
+ * CARGO does, through `crates/libz-rs-sys/build.rs`, which drives the platform
+ * C compiler directly -- no `cc` crate and no other `[build-dependencies]`, so
+ * the dependency inventory AAP §0.5.1.3 freezes is untouched and §0.6.4.1's
+ * rule that the reference C sources are the differential crate's business alone
+ * still holds: nothing here compiles a line of the C library.
  *
- * The PACKAGING layer compiles it, which is the same layer that already owns
- * the `zlib.map` relink -- and it has to, because `--version-script` cannot be
- * handed to rustc's own cdylib link at all (see the long measured comment
- * above `reject_version_script_passthrough` in
- * `crates/libz-rs-sys/build.rs`, which is where that request is now refused
- * outright rather than emitted with a warning).  Concretely,
- * `Makefile.in`'s `rust` target:
+ * That is deliberate and it is what gives the workspace ONE complete artifact.
+ * The object is archived and rustc merges the archive into the `libz.a` it
+ * produces, so `cargo build -p libz-rs-sys --features libz-compat` yields a
+ * static library that defines every one of the 95 functions `zlib.h` declares.
+ * The packaged shared object is then relinked from exactly that archive:
  *
- *     $(CC) $(SFLAGS) $(ZINCOUT) -c -o gzprintf_shim.lo \
- *         $(SRCDIR)crates/libz-rs-sys/csrc/gzprintf_shim.c
- *     $(AR) $(ARFLAGS) <staged libz.a> gzprintf_shim.lo      # static form
- *     $(LDSHARED) $(SFLAGS) -o <staged libz.so.VER> gzprintf_shim.lo \
+ *     $(LDSHARED) $(SFLAGS) -o <staged libz.so.VER> \
  *         -Wl,--whole-archive <cargo libz.a> -Wl,--no-whole-archive
  *
- * `$(LDSHARED)` already carries `-Wl,-soname,libz.so.1,--version-script,
- * ${SRCDIR}zlib.map` from `configure`, so the relink is what produces both the
- * 16 symbol-version nodes and these two exports at the same time.
+ * where `$(LDSHARED)` carries `-Wl,-soname,libz.so.1,--version-script,
+ * ${SRCDIR}zlib.map`, which is what produces the 16 symbol-version nodes.  That
+ * relink cannot be folded into cargo: rustc attaches a version script of its own
+ * to every cdylib link, `zlib.map` cannot be added alongside it, and a symbol
+ * this file defines gets no dynamic entry there at all.  The artifact matrix in
+ * `crates/libz-rs-sys/src/lib.rs` states that once, with the measurements.
  *
  * --------------------------------------------------------------------------
  *  Symbol visibility -- read before renaming anything
@@ -160,7 +158,7 @@
  * a broken drop-in replacement that reports itself as working.
  *
  * So neither degradation is acceptable, and the build stops instead.  Note
- * that this file is compiled by the PACKAGING layer with the project's
+ * that this file is compiled by `build.rs` with the platform compiler's
  * ordinary flags (gnu17 by default), never as part of the C89 conformance
  * sweep, so this is a guard against misconfiguration rather than a
  * restriction on any supported build.  `HAVE_VSNPRINTF` is honoured as the

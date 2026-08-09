@@ -31,46 +31,40 @@
 //      relative to the C build and the reason it exists at all is a failure that
 //      was reproduced, not a tidiness preference.
 //
-//   5. cfg(zlib_rs_gzprintf) -- whether the library being packaged from this
-//      build will carry `gzprintf` and `gzvprintf`.  `ZLIB_RS_GZPRINTF_SHIM=1` is
-//      how the packaging layer announces that it will archive
-//      `csrc/gzprintf_shim.c` into the artifact; the cfg is what lets
-//      `zlibCompileFlags()` bit 27, a compile-time constant, describe a link that
-//      happens afterwards.  NO C IS COMPILED HERE -- see the note at the foot of
-//      this comment.  A bare `cargo build` leaves the variable unset and the bit
-//      set, which is honest about the artifact it produces.
+//   5. The C ABI shims -- `csrc/gzprintf_shim.c`, which defines the variadic
+//      `gzprintf` and `gzvprintf`, and `csrc/inftrees_shim.c`, which defines
+//      `inflate_table` with `inftrees.h`'s own `codetype` prototype.  Stable Rust
+//      can declare none of the three.  They are COMPILED HERE, with the platform
+//      compiler, and archived so that rustc merges them into the `libz.a` it
+//      produces; `cfg(zlib_rs_gzprintf)` -- and with it `zlibCompileFlags()` bit
+//      27 -- follows from that compile actually happening.  See the long comment
+//      above `build_c_abi_shims`.
 //
-// WHAT A BARE `cargo build` PRODUCES, STATED PRECISELY, BECAUSE IT IS NOT A
-// COMPLETE DROP-IN AND NOTHING HERE CAN MAKE IT ONE
+// WHAT A BARE `cargo build` PRODUCES, STATED PRECISELY
 //
 // After this script has run and the crate has been linked, `target/<profile>`
 // holds `libz.a`, `libz.so` with `SONAME libz.so.1`, and the two aliases job 4
-// creates.  That is enough for the loader to FIND this library under the name an
-// already-linked consumer records, and enough for a static link to be complete.
-// It is not enough to be the reference library, in three specific ways:
+// creates.
 //
-//   * No symbol-version nodes.  rustc supplies its own anonymous version script
-//     for a cdylib and zlib.map cannot be layered on top of it -- four distinct
-//     measured failure modes are catalogued above
-//     `reject_version_script_passthrough`.  A consumer that resolves
-//     `deflate@ZLIB_1.2.0` therefore cannot bind to this file.
+// `libz.a` IS COMPLETE: it defines all 95 functions `zlib.h` declares, plus
+// `inflate_table` as a hidden global, because job 5's objects are merged into it.
+// It is the installable static library and it is what `test/infcover.c` links.
 //
-//   * No `gzprintf`/`gzvprintf`.  Both are C-variadic and stable Rust cannot
-//     define either, so they live in `csrc/gzprintf_shim.c` -- which this script
-//     does not compile, because this crate takes no `cc` dependency and a shipped
-//     `cargo build` must never invoke a C compiler.  Job 5 records that fact in
-//     the flags word instead of hiding it.  `test/example.c` calls `gzprintf`, so
-//     the unmodified acceptance driver cannot link against the cargo artifact
-//     alone.
+// `libz.so` is NOT the installable shared library, and nothing this script can
+// emit would make it one.  One mechanism accounts for the whole difference:
+// rustc attaches its OWN anonymous version script to every cdylib link.  So
+// `zlib.map` cannot be layered on top of it (four distinct measured failure modes
+// are catalogued above `reject_version_script_passthrough`), which costs all 16
+// symbol-version nodes; a symbol job 5's objects define gets no dynamic entry at
+// all, which costs `gzprintf` and `gzvprintf`; and the three `_zlib_rs_*` helpers
+// `zlib.map` hides through `_*` are visible.  Measured: 96 dynamic globals and 0
+// version nodes.
 //
-//   * Internals in the dynamic table.  Without zlib.map, `inflate_table` and the
-//     two `_zlib_rs_gzprintf_*` shim helpers are visible there; the reference
-//     library hides all three through its `local:` blocks.
-//
-// The complete drop-in is produced by the PACKAGING step -- `Makefile.in`'s
-// `rust` target -- which relinks the staticlib through `zlib.map`, archives the
-// shim into it, and stages the whole chain in an isolated directory.  That step
-// is the drop-in contract; this script's job 4 is not a substitute for it and
+// The installable shared library is therefore produced by ONE further step --
+// `Makefile.in`'s `rust` target, or the CMake equivalent -- which relinks that
+// same complete archive through `zlib.map` and stages the versioned chain in an
+// isolated directory.  `crates/libz-rs-sys/src/lib.rs` carries the artifact matrix
+// that states this once; this script's job 4 is not a substitute for that step and
 // must not be described as one.
 //
 // WHY JOB 4 IS WORTH DOING ANYWAY, AND WHAT IT COSTS
@@ -102,19 +96,21 @@
 //     zlib's immutable public contract; this script only ever reads them, and
 //     it fails the build loudly rather than silently proceeding without them.
 //
-//   * It never compiles C.  This crate has no `[build-dependencies]` and must
-//     not acquire `cc`: `cargo build --release` for the shipped artifacts has
-//     to work on a machine with no C compiler at all.  Compiling the C
-//     reference implementation is exclusively the differential crate's job.
+//   * It compiles exactly the two C translation units in `csrc/`, and no others.
+//     This crate has no `[build-dependencies]` and must not acquire `cc`: the
+//     platform compiler is invoked directly, so the AAP's frozen dependency
+//     inventory is untouched.  Compiling the C reference implementation is
+//     exclusively the differential crate's job and nothing here goes near it.
 //
 //   * It never touches the network.
 //
-//   * The only things it creates are the two symlinks of job 4, and the only
-//     thing it deletes is a symlink it would otherwise replace at one of those
-//     two exact paths.  It writes nothing anywhere else -- not in the source
-//     tree, not in `OUT_DIR`, not outside `target/<profile>` -- and it will not
-//     remove or overwrite a regular file even at its own two paths.  In
-//     particular it never touches `libz.so`, `libz.a`, or anything cargo owns.
+//   * Outside `OUT_DIR`, the only things it creates are the two symlinks of job 4,
+//     and the only thing it deletes is a symlink it would otherwise replace at one
+//     of those two exact paths; it will not remove or overwrite a regular file even
+//     there.  Job 5's object files and their archive live in `OUT_DIR`, which is
+//     cargo's own scratch directory for exactly that purpose.  It writes nothing in
+//     the source tree, and in particular it never touches `libz.so`, `libz.a`, or
+//     anything else cargo owns.
 //
 //   * It uses `std` only, and the modern `cargo::` directive prefix
 //     throughout -- never the legacy single-colon `cargo:` form.  The two are
@@ -188,13 +184,19 @@ const MAX_ROOT_SEARCH_DEPTH: usize = 4;
 // The toggle the port documents: `ZLIB_RS_SIMD=0|1`.
 const ENV_SIMD: &str = "ZLIB_RS_SIMD";
 
-// How the packaging layer announces "the link I am about to perform includes
-// `csrc/gzprintf_shim.c`".  OPT-IN, and the polarity matters: this script compiles no
-// C, so the variable does not switch a compile on or off -- it tells the Rust code what
-// the finished artifact will contain, which `zlibCompileFlags()` bit 27 has to agree
-// with because it is a compile-time constant and cannot observe a later link.  Unset,
-// as in a plain `cargo build`, the library honestly reports that it has no `gzprintf`.
-const ENV_SHIM: &str = "ZLIB_RS_GZPRINTF_SHIM";
+// The C compiler this script drives, in the order it is consulted.  These are the
+// spellings every C-building build script in the ecosystem honours, so a
+// cross-compiling caller configures this one the way it already configures the rest:
+// `CC_<target>` (with `-` turned into `_`) is the most specific, `TARGET_CC` names the
+// target compiler generically, and `CC` is the ordinary variable.  With none of them
+// set the platform default is used -- `cc` everywhere except MSVC, where it is
+// `cl.exe`.  `CFLAGS` follows the same cascade.
+const ENV_CC: &str = "CC";
+const ENV_TARGET_CC: &str = "TARGET_CC";
+const ENV_CFLAGS: &str = "CFLAGS";
+const ENV_TARGET_CFLAGS: &str = "TARGET_CFLAGS";
+const ENV_AR: &str = "AR";
+const ENV_TARGET_AR: &str = "TARGET_AR";
 
 // A knob this script once offered, kept only so that setting it is an ERROR
 // with an explanation rather than a variable that is silently ignored.  It used
@@ -209,18 +211,32 @@ const ENV_VERSION_SCRIPT: &str = "ZLIB_RS_VERSION_SCRIPT";
 // underscores, so the `simd` feature is `CARGO_FEATURE_SIMD`.
 const CARGO_FEATURE_SIMD: &str = "CARGO_FEATURE_SIMD";
 
-// The two features the variadic shim needs: `libz-compat` turns the unmangled C
-// symbols on, and `gz` compiles the `gzFile` layer that owns the two Rust helpers
-// the shim calls.  With either one off the shim has nothing to link against, so a
-// request to link it against such a build is refused rather than papered over.
+// The two features the C shims need: `libz-compat` turns the unmangled C symbols on,
+// and `gz` compiles the `gzFile` layer that owns the two Rust helpers the variadic
+// shim calls.  With either one off the shim has nothing to link against, so it is not
+// compiled at all -- an archive with two undefined symbols in it would fail the link
+// of every consumer rather than of the crate that produced it.
 const CARGO_FEATURE_LIBZ_COMPAT: &str = "CARGO_FEATURE_LIBZ_COMPAT";
 const CARGO_FEATURE_GZ: &str = "CARGO_FEATURE_GZ";
 
-// The one C file this library contains, relative to CARGO_MANIFEST_DIR.  It is
-// compiled by the packaging layer, not here; this script names it only so that
-// editing it re-runs the script, which keeps `cfg(zlib_rs_gzprintf)` and the object
-// the packaging layer produces from describing different versions of the same shim.
-const SHIM_SOURCE: &str = "csrc/gzprintf_shim.c";
+// The C translation units this library contains, relative to CARGO_MANIFEST_DIR, and
+// the archive they are collected into.  `csrc/gzprintf_shim.c` defines the two variadic
+// entry points; `csrc/inftrees_shim.c` defines `inflate_table` with `inftrees.h`'s own
+// `codetype` prototype.  Both are compiled by THIS script -- see
+// `build_c_abi_shims` -- so that the archive cargo produces is a complete libz.
+const SHIM_SOURCES: [&str; 2] = ["csrc/gzprintf_shim.c", "csrc/inftrees_shim.c"];
+
+// The name of the static archive the shims are collected into, as `-l static=` names
+// it.  Both halves matter: the file must be `lib<name>.a` for a GNU-style linker to
+// find it, and the name must not collide with the crate's own `z`.
+const SHIM_LIB_NAME: &str = "zlib_rs_cabi";
+
+// `zutil.h` L15-L19 spells `ZLIB_INTERNAL` as `__attribute__((visibility("hidden")))`
+// only when this is defined, and `configure` L962-L963 defines it for both CFLAGS and
+// SFLAGS.  The shims are compiled with it for the same reason the C library is: it is
+// what keeps `inflate_table` out of a shared object's dynamic table, which is the
+// property `zlib.map`'s `local:` block asks for and the one the C build has.
+const VISIBILITY_DEFINE: &str = "HAVE_HIDDEN";
 
 // The cfg that records "`gzprintf` and `gzvprintf` are compiled into this build".
 // `util.rs` derives `zlibCompileFlags` bit 27 from it, so the flags word cannot
@@ -270,7 +286,7 @@ fn main() {
     let target = TargetInfo::from_env();
 
     check_simd_request();
-    declare_gzprintf_shim_cfg();
+    build_c_abi_shims(&repo_root);
     reject_version_script_passthrough(&version_script);
     emit_link_args(&target, &major);
     stage_versioned_aliases(&target, &version, &major);
@@ -479,69 +495,280 @@ impl TargetInfo {
 }
 
 // ---------------------------------------------------------------------------
-//  5. cfg(zlib_rs_gzprintf) -- what the packaged library will carry
+//  5. The C ABI shims -- the two declarations stable Rust cannot express
 // ---------------------------------------------------------------------------
 //
-// ★ **This script compiles no C, and that is deliberate.** The crate takes no `cc`
-// dependency and must not acquire one: AAP §0.5.1.3 keeps the dependency inventory
-// frozen and §0.6.4.1 requires that building the shipped artifacts never invoke a C
-// compiler. So the one C translation unit this library needs -- `csrc/gzprintf_shim.c`,
-// which defines the two variadic entry points stable Rust cannot express -- is compiled
-// by the packaging layer, `Makefile.in`'s `rust` target, which archives it into the
-// staged `libz.a` and relinks the shared object from it.
+// ★ **This script compiles C, and it has to.** Two of the declarations a drop-in
+// `libz` must define cannot be written in stable Rust at all, and a third must be
+// written with a C type Rust has no spelling for:
 //
-// What this script does own is the *description*. `zlibCompileFlags()` is a compile-time
-// constant in Rust code, so it cannot observe a later link: bit 27 ("`gzprintf` not
-// available") has to be decided here. `ZLIB_RS_GZPRINTF_SHIM=1` is how the packaging
-// layer says "the link I am about to perform includes the shim", and it turns on
-// `cfg(zlib_rs_gzprintf)`, which clears bit 27 and enables the test that proves the two
-// symbols really are linked. A bare `cargo build` leaves it unset, and the resulting
-// artifact then reports bit 27 -- honestly, because that artifact really has no
-// `gzprintf`.
-fn declare_gzprintf_shim_cfg() {
+//   * `gzprintf` is variadic (`zlib.h` L1549) and `gzvprintf` takes a `va_list`
+//     (`zlib.h` L2047). Defining either needs the unstable `c_variadic` feature or
+//     `core::ffi::VaList`, and AAP §0.7.1 (h) pins this workspace to stable Rust
+//     1.80. `csrc/gzprintf_shim.c` defines both over two hidden Rust helpers.
+//   * `inflate_table`'s first parameter is `codetype`, a C enum (`inftrees.h`
+//     L54-L62), and the unmodified `test/infcover.c` compiles a call against that
+//     prototype. A Rust `#[no_mangle]` function cannot present a C enum parameter
+//     without making an out-of-range `int` from a C caller into instant undefined
+//     behaviour, so `csrc/inftrees_shim.c` presents the exact prototype and
+//     forwards to a hidden Rust entry point that validates the value.
+//
+// Compiling them here rather than in the packaging layer is what makes ONE
+// artifact story possible: `target/<profile>/libz.a` -- the `staticlib` cargo
+// produces -- then contains every one of the 95 functions `zlib.h` declares, and
+// the packaged shared object is relinked from exactly that archive instead of from
+// an archive plus a separately compiled object. Measured: `ar t` lists both shim
+// objects in `libz.a` and `nm` reports `T gzprintf`, `T gzvprintf` and
+// `T inflate_table` in it.
+//
+// # ★ What the cdylib cargo produces still cannot be, and why
+//
+// `-l static=` is emitted with cargo's default modifiers, `+bundle,-whole-archive`.
+// The archive is therefore merged into the `staticlib` and, because no Rust item
+// references the shims, its objects are left out of the `cdylib`. That is not a
+// compromise, it is the only useful arrangement, and the measurement that settles
+// it is worth recording so nobody spends an afternoon rediscovering it:
+//
+//   * rustc always hands its OWN version script to a `cdylib` link -- an anonymous
+//     tag listing the crate's `#[no_mangle]` items under `global:` and `local: *`.
+//   * So a shim object pulled in with `+whole-archive` contributes its code and
+//     gets NO dynamic symbol: `local: *` hides it. `-Wl,--export-dynamic-symbol=`
+//     does not override a version script (measured with both `rust-lld` and
+//     `ld.bfd`: the name is absent from `.dynsym` either way).
+//   * `zlib.map` cannot be added alongside rustc's script either. `ld.bfd` refuses
+//     outright -- "anonymous version tag cannot be combined with other version
+//     tags" -- and `rust-lld` warns "attempt to reassign symbol ... to version" and
+//     ignores it, yielding zero version nodes.
+//
+// A rustc-linked `cdylib` consequently cannot export `gzprintf`/`gzvprintf` and
+// cannot carry the 16 `ZLIB_1.2.*` version nodes, whatever this script emits. The
+// installable shared object is therefore produced by ONE documented step from the
+// complete archive -- `Makefile.in`'s `rust` target, or the CMake equivalent --
+// which links it under `zlib.map` with the right SONAME and symlink chain.
+// `crates/libz-rs-sys/src/lib.rs` carries the artifact matrix that states this once.
+//
+// # Requiring a C compiler
+//
+// A C compiler is a hard requirement for a `libz-compat` + `gz` build, and the
+// failure is loud. The alternative -- skipping the shims when no compiler is found
+// -- is exactly the silently-incomplete artifact this arrangement exists to remove:
+// a library that links but has no `gzprintf` fails at the *consumer*, long after the
+// build that produced it went green. No new crate dependency is taken to do it
+// (AAP §0.5.1.3 freezes the inventory and §0.6.4.1 keeps `cc` to the differential
+// crate alone); the platform compiler is invoked directly, through the same
+// `CC`/`CC_<target>`/`TARGET_CC` and `CFLAGS` cascade every C-building build script
+// honours, so a cross-compiling caller configures this one the way it already
+// configures the rest.
+fn build_c_abi_shims(repo_root: &Path) {
     // Declared whether or not it is set, so the declaration cannot appear and
     // disappear with the configuration -- an intermittent `unexpected_cfgs`
     // warning is the hardest kind to attribute.
     println!("cargo::rustc-check-cfg=cfg({CFG_GZPRINTF})");
-    println!("cargo::rerun-if-env-changed={ENV_SHIM}");
 
-    let requested = match env::var(ENV_SHIM) {
-        Ok(value) => value == "1",
-        Err(_) => false,
-    };
-    if !requested {
+    let target = env::var("TARGET").unwrap_or_default();
+    let underscored = target.replace('-', "_");
+    for key in [
+        format!("{ENV_CC}_{underscored}"),
+        ENV_TARGET_CC.to_owned(),
+        ENV_CC.to_owned(),
+        format!("{ENV_CFLAGS}_{underscored}"),
+        ENV_TARGET_CFLAGS.to_owned(),
+        ENV_CFLAGS.to_owned(),
+        format!("{ENV_AR}_{underscored}"),
+        ENV_TARGET_AR.to_owned(),
+        ENV_AR.to_owned(),
+    ] {
+        println!("cargo::rerun-if-env-changed={key}");
+    }
+
+    // `gzprintf`/`gzvprintf` reach the core through `_zlib_rs_gzprintf_begin` and
+    // `_zlib_rs_gzprintf_commit`, and `inflate_table` through
+    // `_zlib_rs_inflate_table`; all three live behind `libz-compat`, the first two
+    // additionally behind `gz`. Compiling the shims against a build without those
+    // features would archive undefined symbols, so there is nothing to build here --
+    // and nothing missing either, because such a build is not a C-ABI libz at all.
+    if env::var_os(CARGO_FEATURE_LIBZ_COMPAT).is_none() || env::var_os(CARGO_FEATURE_GZ).is_none() {
         return;
     }
 
-    // The shim calls `_zlib_rs_gzprintf_begin` and `_zlib_rs_gzprintf_commit`, and both
-    // live behind `#[cfg(all(feature = "libz-compat", feature = "gz"))]`. A link that
-    // included the shim without them would leave two undefined symbols, so an explicit
-    // request against a feature set that cannot support it is a contradiction rather
-    // than something to ignore quietly.
-    assert!(
-        env::var_os(CARGO_FEATURE_LIBZ_COMPAT).is_some() && env::var_os(CARGO_FEATURE_GZ).is_some(),
-        "{ENV_SHIM}=1 needs both the `libz-compat` and `gz` features: the shim calls \
-         `_zlib_rs_gzprintf_begin` and `_zlib_rs_gzprintf_commit`, which are compiled \
-         only when both are on. Build with `--features libz-compat,gz` (the default \
-         feature set), or unset {ENV_SHIM}."
-    );
+    let manifest_dir = PathBuf::from(require_env("CARGO_MANIFEST_DIR"));
+    let out_dir = PathBuf::from(require_env("OUT_DIR"));
+    let msvc = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() == "msvc";
 
-    // The packaging layer compiles this file; naming it here is what makes a change to
-    // it re-run this script, so the cfg and the object can never describe different
-    // versions of the same shim.
-    let source = PathBuf::from(require_env("CARGO_MANIFEST_DIR")).join(SHIM_SOURCE);
-    assert!(
-        source.is_file(),
-        "the variadic shim {} is missing. It is the only C translation unit this library \
-         contains and it defines `gzprintf` and `gzvprintf`, two of the 95 functions a \
-         drop-in libz must export; neither can be written in stable Rust. Restore it from \
-         version control, or build without {ENV_SHIM} to accept a library that does not \
-         claim them.",
-        source.display()
-    );
-    println!("cargo::rerun-if-changed={}", source.display());
+    let mut objects = Vec::with_capacity(SHIM_SOURCES.len());
+    for relative in SHIM_SOURCES {
+        let source = manifest_dir.join(relative);
+        assert!(
+            source.is_file(),
+            "the C ABI shim {} is missing. The two shims define `gzprintf`, `gzvprintf` \
+             and `inflate_table`, none of which stable Rust can declare with the \
+             prototype the contract fixes, so a library built without them is not a \
+             drop-in libz. Restore the file from version control.",
+            source.display()
+        );
+        println!("cargo::rerun-if-changed={}", source.display());
+        objects.push(compile_shim(&source, &out_dir, repo_root, msvc));
+    }
 
+    let archive = archive_shims(&objects, &out_dir, msvc);
+
+    // `+bundle,-whole-archive` -- cargo's defaults -- for the reason given above: the
+    // archive is merged into `libz.a`, and its objects stay out of the cdylib that
+    // could not export them anyway. An integration test that names `gzprintf` still
+    // links, because naming it is what makes the linker take the member.
+    println!(
+        "cargo::rustc-link-search=native={}",
+        archive.parent().unwrap_or(&out_dir).display()
+    );
+    println!("cargo::rustc-link-lib=static={SHIM_LIB_NAME}");
+
+    // Now, and only now, may the Rust code claim the two formatting entry points.
+    // `util.rs` derives `zlibCompileFlags` bit 27 from this cfg, so the flags word
+    // describes the artifact that was actually built.
     println!("cargo::rustc-cfg={CFG_GZPRINTF}");
+}
+
+/// Compiles one shim translation unit, returning the object file it produced.
+///
+/// The include path is the repository root, because both shims include the immutable
+/// `zlib.h` (and, through it, `zconf.h`) rather than restating prototypes that could
+/// then drift from the contract. `-DHAVE_HIDDEN` is what makes `zutil.h`'s
+/// `ZLIB_INTERNAL` expand to hidden visibility, matching `configure` L962-L963.
+///
+/// Position-independent code is not optional: this object is archived into `libz.a`,
+/// and the packaged shared library is relinked from that archive.
+fn compile_shim(source: &Path, out_dir: &Path, repo_root: &Path, msvc: bool) -> PathBuf {
+    let stem = source.file_stem().map_or_else(
+        || "shim".to_owned(),
+        |stem| stem.to_string_lossy().into_owned(),
+    );
+    let object = out_dir.join(format!("{stem}{}", if msvc { ".obj" } else { ".o" }));
+    let _ = fs::remove_file(&object);
+
+    let compiler = tool_from_env(ENV_CC, ENV_TARGET_CC, if msvc { "cl" } else { "cc" });
+    let mut command = std::process::Command::new(&compiler);
+    if msvc {
+        command
+            .arg("/nologo")
+            .arg("/c")
+            .arg("/O2")
+            .arg(format!("/D{VISIBILITY_DEFINE}"))
+            .arg(format!("/I{}", repo_root.display()))
+            .arg(format!("/Fo{}", object.display()));
+    } else {
+        command
+            .arg("-c")
+            .arg("-O2")
+            .arg("-fPIC")
+            .arg(format!("-D{VISIBILITY_DEFINE}"))
+            .arg("-I")
+            .arg(repo_root)
+            .arg("-o")
+            .arg(&object);
+    }
+    // The caller's own flags go last so that they win: a cross-compilation sysroot or
+    // an `-fno-...` a platform needs must be able to override the defaults above.
+    command.args(flags_from_env(ENV_CFLAGS, ENV_TARGET_CFLAGS));
+    command.arg(source);
+
+    run_tool(&mut command, &compiler, "compile", source);
+    assert!(
+        object.is_file(),
+        "{} reported success but produced no object file at {}",
+        compiler,
+        object.display()
+    );
+    object
+}
+
+/// Collects the compiled shims into one static archive and returns its path.
+///
+/// The archive is removed first rather than updated in place, so a source file that
+/// stops existing cannot leave a stale member behind.
+fn archive_shims(objects: &[PathBuf], out_dir: &Path, msvc: bool) -> PathBuf {
+    let archive = out_dir.join(if msvc {
+        format!("{SHIM_LIB_NAME}.lib")
+    } else {
+        format!("lib{SHIM_LIB_NAME}.a")
+    });
+    let _ = fs::remove_file(&archive);
+
+    let archiver = tool_from_env(ENV_AR, ENV_TARGET_AR, if msvc { "lib" } else { "ar" });
+    let mut command = std::process::Command::new(&archiver);
+    if msvc {
+        command
+            .arg("/nologo")
+            .arg(format!("/OUT:{}", archive.display()));
+    } else {
+        // `c` create without a diagnostic, `r` insert, `s` write an index -- the same
+        // three `Makefile.in`'s ARFLAGS uses.
+        command.arg("crs").arg(&archive);
+    }
+    command.args(objects);
+
+    run_tool(&mut command, &archiver, "archive", &archive);
+    assert!(
+        archive.is_file(),
+        "{} reported success but produced no archive at {}",
+        archiver,
+        archive.display()
+    );
+    archive
+}
+
+/// Resolves one tool name through the `<VAR>_<target>` / `TARGET_<VAR>` / `<VAR>`
+/// cascade, falling back to the platform default.
+fn tool_from_env(base: &str, target_key: &str, default: &str) -> String {
+    let target = env::var("TARGET").unwrap_or_default().replace('-', "_");
+    env::var(format!("{base}_{target}"))
+        .or_else(|_| env::var(target_key))
+        .or_else(|_| env::var(base))
+        .map(|value| value.trim().to_owned())
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_owned())
+}
+
+/// Resolves one flag list through the same cascade, split on whitespace.
+///
+/// Whitespace splitting is what every other consumer of `CFLAGS` does; a flag with an
+/// embedded space has to be passed through a response file or a wrapper script, which
+/// is also true of `make`.
+fn flags_from_env(base: &str, target_key: &str) -> Vec<String> {
+    let target = env::var("TARGET").unwrap_or_default().replace('-', "_");
+    let raw = env::var(format!("{base}_{target}"))
+        .or_else(|_| env::var(target_key))
+        .or_else(|_| env::var(base))
+        .unwrap_or_default();
+    raw.split_whitespace().map(str::to_owned).collect()
+}
+
+/// Runs one tool invocation, turning both failure modes into an explanatory panic.
+///
+/// The two are genuinely different and the message says which happened: a tool that
+/// could not be spawned is a missing or misnamed compiler, and a tool that ran and
+/// failed has already printed its own diagnostics above this message.
+fn run_tool(command: &mut std::process::Command, tool: &str, action: &str, subject: &Path) {
+    let status = command.status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => panic!(
+            "failed to {action} {} with `{tool}`: {status}. The two C ABI shims define \
+             `gzprintf`, `gzvprintf` and `inflate_table`, which stable Rust cannot \
+             declare, so this is a hard failure rather than a skipped optimisation -- a \
+             library without them links here and fails at every consumer that calls \
+             one. The tool's own diagnostics are above.",
+            subject.display()
+        ),
+        Err(error) => panic!(
+            "could not run `{tool}` to {action} {}: {error}. A C compiler and archiver \
+             are required to build this crate with the `libz-compat` and `gz` features, \
+             because three of the declarations `zlib.h` and `inftrees.h` fix cannot be \
+             written in stable Rust. Name them if they are not on PATH under their usual \
+             names:\n    CC=<compiler> AR=<archiver> cargo build",
+            subject.display()
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------

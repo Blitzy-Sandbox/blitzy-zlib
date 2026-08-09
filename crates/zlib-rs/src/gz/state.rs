@@ -1908,6 +1908,20 @@ impl<'a, A: Allocator<'a>> GzState<'a, A> {
         slice.get(start..end).unwrap_or(&[])
     }
 
+    /// The first `len` bytes of the output buffer, regardless of `x.have`.
+    ///
+    /// The staging window `gz_read`'s transparent large-request path reads back after handing the
+    /// same range to the handle (`gzread.c` L367-L369, and the reasoning at that call site). It
+    /// deliberately ignores `x.next`/`x.have`: nothing is published on that path, so there is no
+    /// delivery window to consult -- the count `gz_load` returned is what describes the bytes.
+    ///
+    /// Reports [`None`] when the buffers are not allocated or when `len` exceeds the buffer, so a
+    /// caller fails cleanly rather than delivering bytes it cannot account for.
+    #[must_use]
+    pub fn output_prefix(&self, len: usize) -> Option<&[u8]> {
+        self.out_slice().get(..len)
+    }
+
     /// Just the bytes currently available for delivery, mutably.
     ///
     /// Needed by `gzungetc`, which writes the pushed byte through this window

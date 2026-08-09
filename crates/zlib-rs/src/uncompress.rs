@@ -274,6 +274,16 @@ pub fn uncompress2_z(dest: &mut [u8], source: &[u8]) -> Decompressed {
 /// writable and nothing more -- `zlib.h` L1319-L1327 asks for `*destLen` bytes of room and
 /// says nothing about their contents. Identical in behaviour to [`uncompress2_z`], which is a
 /// one-line forwarder to it over an [`OutputRegion::init`].
+///
+/// ★ `#[allow(clippy::unnecessary_min_or_max)]` is target-dependent, not a waived defect.
+/// `MAX_CHUNK` is `u32::MAX as usize`, so on a 32-bit target it *equals* `usize::MAX` and the
+/// two `.min(MAX_CHUNK)` caps below provably have no effect -- which is what the lint reports.
+/// On a 64-bit target the same caps are load-bearing: they are what reproduces C's chunking of
+/// a `z_size_t` request into `uInt`-sized pieces (`uncompr.c` L40-L41). Deleting them to satisfy the 32-bit
+/// build would therefore break the 64-bit one, so the lint is allowed here, scoped to this
+/// function, exactly as `narrow_checksum` in `crates/libz-rs-sys/src/checksum.rs` scopes the
+/// three lints its own width conversion trips on 32-bit targets.
+#[allow(clippy::unnecessary_min_or_max)]
 pub fn uncompress2_z_into(dest: &mut OutputRegion<'_>, source: &[u8]) -> Decompressed {
     // Captured before the first reborrow of `dest`, and the origin of every
     // bound below. These are C's entry values of `*sourceLen` and `*destLen`.

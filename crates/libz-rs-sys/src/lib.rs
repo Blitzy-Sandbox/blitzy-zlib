@@ -21,45 +21,77 @@
 //! constant surface for Rust consumers. It defines no entry point and adds no
 //! symbol of its own to the dynamic symbol table.
 //!
-//! # The artifact contract
+//! # ★ The artifact matrix — one table, and it is the only one
 //!
 //! `Cargo.toml` declares `[lib] name = "z"` with
-//! `crate-type = ["cdylib", "staticlib", "rlib"]`, so one crate produces all
-//! three artifacts and the exported C surface is defined in exactly one place:
+//! `crate-type = ["cdylib", "staticlib", "rlib"]`, so one crate defines the exported
+//! C surface in exactly one place. Three artifacts come out of it and a fourth is
+//! packaged from one of them. They are **not** interchangeable, every difference below
+//! was measured with `nm`/`readelf` rather than reasoned about, and this table is the
+//! single statement of it that the rest of the workspace refers back to:
 //!
-//! | Artifact | File | Consumer |
-//! |---|---|---|
-//! | `cdylib` | `libz.so` | an *intermediate*, not the installed library — see below |
-//! | `staticlib` | `libz.a` | `infcover` links it, and it is what the installed shared object is *relinked* from |
-//! | `rlib` | — | lets `zlib-rs-differential`, the `fuzz/` targets and this crate's own `tests/` depend on it as an ordinary Rust library |
+//! | Artifact | Produced by | Exports | Installable |
+//! |---|---|---|---|
+//! | `libz.a` (`staticlib`) | `cargo build -p libz-rs-sys --features libz-compat` | **all 95** functions `zlib.h` declares, plus `inflate_table` as a hidden global | **YES** — this is the static library, and `infcover` links it |
+//! | `libz.so` (`cdylib`) | the same command | **93** of the 95, plus three internals; **no** version nodes | no — see below |
+//! | *(the `rlib`)* | the same command | nothing; it is a Rust library | n/a — `zlib-rs-differential`, `fuzz/` and `tests/` depend on it |
+//! | `libz.so.1.3.2.1-motley` | `make rust`, or the `CMake` equivalent, **relinked from `libz.a`** | **95** functions and the **16** `ZLIB_1.2.*` version nodes, internals hidden | **YES** — this is the shared library |
 //!
-//! ## Why the `cdylib` is not the shipped library
+//! The archive is complete because `build.rs` compiles this crate's two C
+//! translation units — `csrc/gzprintf_shim.c`, which defines the variadic
+//! `gzprintf`/`gzvprintf`, and `csrc/inftrees_shim.c`, which defines
+//! `inflate_table` with `inftrees.h`'s own `codetype` prototype — and emits
+//! `-l static=` for the archive they are collected into, which rustc merges into
+//! `libz.a`. Measured: `ar t` lists both objects, and `nm` reports
+//! `T gzprintf`, `T gzvprintf` and a `GLOBAL HIDDEN` `inflate_table`.
 //!
-//! It is tempting to read the first row as "`cargo build` gives you the
-//! drop-in". It does not, and the gap is measurable rather than stylistic.
-//! Measured with `nm -D --defined-only --extern-only`, a
-//! `cargo build --release --features libz-compat` cdylib publishes **96** dynamic
-//! globals where the reference `libz.so.1.3.2.1-motley` publishes **111**. Three
-//! independent causes, none of which `cargo` can address:
+//! ## ★ Why the `cdylib` is not the shipped library, and cannot be made into one
 //!
-//! * **No version script.** `rustc` attaches one of its own to the cdylib link,
-//!   and `zlib.map` cannot be added alongside it — a second script is either
-//!   rejected outright or silently yields zero version nodes. So the cdylib has
-//!   none of the 16 `ZLIB_1.2.*` symbol-version nodes the C library defines.
-//! * **No `gzprintf` / `gzvprintf`.** Both are variadic. Rust cannot define a
-//!   variadic `extern "C"` function, so they are supplied by
-//!   `csrc/gzprintf_shim.c`, which `cargo` never compiles.
-//! * **Internals visible.** `inflate_table` and the two `_zlib_rs_gzprintf_*`
-//!   adapters the shim calls are all in `zlib.map`'s `local:` block, and without
-//!   the script they are exported.
+//! It is tempting to read the second row as "`cargo build` gives you the drop-in".
+//! It does not, the gap is exactly two exports and sixteen version nodes, and the
+//! cause is one mechanism rather than three: **rustc always hands the `cdylib` link a
+//! version script of its own** — an anonymous tag listing this crate's `#[no_mangle]`
+//! items under `global:`, and `local: *`. Three consequences follow, each measured on
+//! the toolchain this workspace pins:
 //!
-//! The installable library is therefore always *relinked* from `libz.a` together
-//! with the shim, under `zlib.map`, and then gated against the C library's own
-//! symbol table. `Makefile.in`'s `rust` target owns that step; `make rust-test`
-//! links the unmodified C drivers against the result and `make rust-symbols`
-//! prints the staged tables. Both require `./configure` to have run first,
-//! because the platform flag that asks the linker for a shared object is one of
-//! the things `configure` exists to discover.
+//! * **`zlib.map` cannot be added alongside it.** `ld.bfd` refuses outright —
+//!   *"anonymous version tag cannot be combined with other version tags"* — and
+//!   `rust-lld` warns *"attempt to reassign symbol … to version"* and ignores the
+//!   second script, producing a library with **zero** version nodes. So the 16
+//!   `ZLIB_1.2.*` nodes cannot be attached here by any argument.
+//! * **A symbol the C shims define gets no dynamic entry.** Pulling the shim objects
+//!   in with `+whole-archive` contributes their code, and `local: *` then hides the
+//!   names; `-Wl,--export-dynamic-symbol=gzprintf` does not override a version script
+//!   (the name is absent from `.dynsym` under both linkers). So `gzprintf` and
+//!   `gzvprintf` cannot be exported here either, which is why `build.rs` emits
+//!   `-l static=` with cargo's default `-whole-archive`: the objects go into the
+//!   archive that needs them and stay out of the cdylib that could not use them.
+//! * **`inflate_table` and the three `_zlib_rs_*` helpers are visible.** All four are
+//!   in `zlib.map`'s `local:` block — the last three through its `_*` pattern — and
+//!   without that script they are exported. `inflate_table` itself is the exception
+//!   that proves the rule: it is compiled with `ZLIB_INTERNAL`, so it is hidden even
+//!   here, and only its Rust half `_zlib_rs_inflate_table` shows up.
+//!
+//! Measured totals for the `cdylib`, so the arithmetic is checkable: **96** dynamic
+//! globals, being the 95 public functions less `gzprintf` and `gzvprintf`, plus
+//! `_zlib_rs_gzprintf_begin`, `_zlib_rs_gzprintf_commit` and
+//! `_zlib_rs_inflate_table`; and **0** version nodes.
+//!
+//! None of that is a defect in the packaging and none of it is fixable inside
+//! `cargo`: it is what a rustc-linked `cdylib` is. The installable shared object is
+//! therefore produced by **one** documented step from the complete archive, and that
+//! step is the only place a `libz.so.*` fit to install comes from:
+//!
+//! ```text
+//! make rust                # relink libz.a under zlib.map: SONAME, version nodes, symlink chain
+//! make rust-test           # link and run the UNMODIFIED example.c, minigzip.c and infcover.c
+//! make rust-symbols        # diff the staged tables against a built C libz
+//! ```
+//!
+//! `./configure` is not a prerequisite for those three: `Makefile.in` composes the
+//! shared-object link from its own `RUSTLDSHARED`/`RUSTSHAREDFLAG` defaults and names
+//! the staged library from `ZLIB_VERSION` in `zlib.h`. What `./configure` adds is the
+//! C oracle build that `make rust-symbols` compares against.
 //!
 //! ## The import name, which is not the package name
 //!
@@ -161,23 +193,35 @@
 //! | Module | Exports | Contents |
 //! |---|---|---|
 //! | `deflate` | 17 | the `deflate*` family, including both `_`-suffixed init forms |
-//! | `inflate` | 18 | the 18 public `inflate*` exports; `inflate_table` is a nineteenth `#[no_mangle]` symbol that `zlib.map` hides, so it is not one of the 18 |
+//! | `inflate` | 18 | the 18 public `inflate*` exports; `_zlib_rs_inflate_table` is a nineteenth `#[no_mangle]` symbol, the Rust half of the `inflate_table` `csrc/inftrees_shim.c` declares, and `zlib.map` hides it through `_*` |
 //! | `infback` | 3 | `inflateBackInit_`, `inflateBack`, `inflateBackEnd` |
 //! | `compress` | 10 | five one-shot wrappers and their five `_z` `size_t` forms |
 //! | `gz` | 32 | 30 `gz*` functions here, plus 2 from `csrc/gzprintf_shim.c` |
 //! | `checksum` | 11 | the Adler-32 and CRC-32 families |
 //! | `util` | 4 | `zlibVersion`, `zlibCompileFlags`, `zError`, `get_crc_table` |
 //!
-//! 17 + 18 + 3 + 10 + 32 + 11 + 4 = **95**. The tally reconciles to the built
-//! artifacts as follows: 97 items carry `#[no_mangle]` across the seven modules;
-//! `gzopen_w` is `#[cfg(windows)]`, leaving 96 compiled on Linux; `build.rs`
-//! compiles `csrc/gzprintf_shim.c` and links it in with `+whole-archive`, which
-//! adds `gzprintf` and `gzvprintf`, so `nm` reports **98** dynamic globals for
-//! `target/release/libz.so` and `libz.a` contains all 98 definitions; `zlib.map`
-//! then hides three of them — `inflate_table` and the two `_zlib_rs_gzprintf_*`
-//! helpers, the latter pair by its `_*` wildcard — leaving exactly **95** in the
-//! packaged library. Measured, not asserted: `make rust` reports "95 exported
-//! symbols, every one declared in zlib.h" and "111 symbols, identical to the C
+//! 17 + 18 + 3 + 10 + 32 + 11 + 4 = **95**, of which this crate's Rust code supplies
+//! 93 and `csrc/` supplies `gzprintf` and `gzvprintf`. The tally reconciles to the
+//! built artifacts as follows, and the arithmetic is worth following once because it
+//! is the same arithmetic the artifact matrix above tabulates:
+//!
+//! * **96** items carry `#[no_mangle]` across the seven modules — the 93 public Rust
+//!   entry points plus `_zlib_rs_gzprintf_begin`, `_zlib_rs_gzprintf_commit` and
+//!   `_zlib_rs_inflate_table`. `gzopen_w` is `#[cfg(windows)]`, so it is one of the 93
+//!   only on Windows and 92 are compiled on Linux, giving **95** `#[no_mangle]` items
+//!   there.
+//! * `build.rs` compiles `csrc/gzprintf_shim.c` and `csrc/inftrees_shim.c` and emits
+//!   `-l static=`, which rustc merges into the archive: `libz.a` therefore defines
+//!   **98** names — those 95 plus `gzprintf`, `gzvprintf` and `inflate_table` — of
+//!   which every one of the 95 the header declares is present.
+//! * `nm -D` on the `cdylib` reports **96** dynamic globals, because rustc's own
+//!   version script exports the Rust items and nothing else.
+//! * The packaged shared object is relinked from the archive under `zlib.map`, which
+//!   hides four of the 98 — `inflate_table` by name, and the three `_zlib_rs_*`
+//!   helpers through its `_*` wildcard — leaving exactly **95**.
+//!
+//! Measured, not asserted: `make rust` reports "95 exported symbols, every one
+//! declared in zlib.h" and "111 symbols, identical to the C
 //! libz.so.1.3.2.1-motley".
 //!
 //! Two numbers are easy to get wrong when re-deriving this table, so they are

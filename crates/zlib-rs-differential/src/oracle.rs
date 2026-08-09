@@ -380,24 +380,40 @@ pub struct code {
 //  arithmetic by the table-length accessors in the shim block below, which derive their answers
 //  from `sizeof(array) / sizeof(array[0])` rather than from any number written here.
 
-/// C `codetype` (`inftrees.h`): which table `inflate_table` is being asked to build.
+/// C `codetype` (`inftrees.h` L53-L58): which table `inflate_table` is being asked to build.
 ///
-/// C spells this as an unnamed `enum` with no explicit discriminants, so the values are 0, 1 and 2
-/// in declaration order and the type is `int`-sized on every target in scope. It is modelled as
-/// `c_int` constants rather than a Rust `enum` deliberately: a Rust `enum` would make any other
-/// value instant undefined behaviour, and the point of a fuzz-adjacent oracle harness is to be able
-/// to pass a deliberately invalid discriminant to `inflate_table` and watch what the reference does.
-pub mod codetype {
-    use core::ffi::c_int;
+/// ★ **A newtype, not an alias and not a Rust `enum`, and the choice is forced from both sides.**
+///
+/// C spells this as a `typedef enum { CODES, LENS, DISTS } codetype;`, so the values are 0, 1 and 2
+/// in declaration order and the representation is implementation-defined -- GCC, Clang and MSVC all
+/// give an all-non-negative enum `unsigned int`, which is why [`c_uint`] is the inner type here.
+/// Both spellings are ABI-identical for a 32-bit enum on every target in scope, but the *name*
+/// matters as much as the width: the prototype this harness calls through is
+/// `inflate_table(codetype type, ...)`, and a declaration that says `int` there is a different
+/// declaration -- a C translation unit that redeclares it alongside `inftrees.h` fails with
+/// `conflicting types for 'inflate_table'`. Naming the parameter `codetype` on the Rust side is what
+/// makes the two agree by inspection.
+///
+/// It is `#[repr(transparent)]` over an integer rather than a Rust `enum` for the opposite reason: a
+/// Rust `enum` would make any other value instant undefined behaviour, and the point of a
+/// fuzz-adjacent oracle harness is to be able to pass a deliberately invalid discriminant to
+/// `inflate_table` and watch what the reference does. `#[repr(transparent)]` guarantees the ABI of
+/// the inner type exactly, so an arbitrary bit pattern is a legal value of this type and travels
+/// unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+#[allow(non_camel_case_types)]
+pub struct codetype(pub c_uint);
 
+impl codetype {
     /// C `CODES` (`inftrees.h`): build the code-length code table.
-    pub const CODES: c_int = 0;
+    pub const CODES: Self = Self(0);
 
     /// C `LENS` (`inftrees.h`): build the literal/length code table.
-    pub const LENS: c_int = 1;
+    pub const LENS: Self = Self(1);
 
     /// C `DISTS` (`inftrees.h`): build the distance code table.
-    pub const DISTS: c_int = 2;
+    pub const DISTS: Self = Self(2);
 }
 
 /// C `ENOUGH_LENS` (`inftrees.h`): maximum [`code`] entries for literal/length codes.
@@ -1117,10 +1133,11 @@ extern "C" {
     /// `int inflate_table(codetype type, unsigned short FAR *lens, unsigned codes,
     /// code FAR * FAR *table, unsigned FAR *bits, unsigned short FAR *work);`
     ///
-    /// `type` takes one of the [`codetype`] constants. The C parameter is an `enum`, which is
-    /// `int`-sized on every target in scope, so `c_int` is the faithful spelling.
+    /// `type` is the [`codetype`] newtype, which reproduces the C enum's name and ABI exactly; its
+    /// three associated constants are the enumerators. See [`codetype`] for why the parameter is not
+    /// spelled `c_int` and not spelled as a Rust `enum`.
     pub fn c_inflate_table(
-        type_: c_int,
+        type_: codetype,
         lens: *mut u16,
         codes: c_uint,
         table: *mut *mut code,

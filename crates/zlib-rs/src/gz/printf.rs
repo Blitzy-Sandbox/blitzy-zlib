@@ -178,21 +178,25 @@
 //!
 //! ## Who compiles the shim
 //!
-//! Not cargo. `crates/libz-rs-sys/build.rs` is required to carry no `[build-dependencies]` and to
-//! never invoke a C compiler, so that `cargo build --release` for the shipped artifacts works on a
-//! machine without one (AAP §0.7.1 (i), and §0.6.4.1's rule that a C toolchain is the differential
-//! crate's business alone). The **packaging** layer compiles it, which is the same layer that
-//! already owns the `zlib.map` relink -- and it has to, because `--version-script` cannot be handed
-//! to rustc's own cdylib link at all, for the measured reasons `build.rs` documents above
+//! `crates/libz-rs-sys/build.rs` does, with the platform C compiler, taking no
+//! `[build-dependencies]` to do it -- so the AAP's frozen dependency inventory is untouched and
+//! §0.6.4.1's rule that the C *reference sources* are the differential crate's business alone
+//! still holds. The object is archived and rustc merges the archive into the `libz.a` cargo
+//! produces, so that archive defines both names and the packaged shared library is relinked from
+//! it. A C compiler is therefore required to build that crate with `libz-compat` and `gz`, which
+//! is stated rather than worked around: a `libz` with no `gzprintf` fails at the consumer, not at
+//! the build.
+//!
+//! What the packaging layer still owns is the `zlib.map` relink, because `--version-script` cannot
+//! be handed to rustc's own cdylib link at all, for the measured reasons `build.rs` documents above
 //! `reject_version_script_passthrough` (which is why that environment override is refused outright
-//! rather than honoured). `Makefile.in`'s `rust` target compiles the shim with
-//! `$(CC) $(SFLAGS) $(RUSTSHIMFLAGS)`, adds the object to the staged `libz.a`, and relinks the
-//! staged shared library from that archive with `$(RUSTLDSHARED)`. It does **not** depend on
-//! `configure` having loaded `LDSHARED` with the soname and version-script arguments: it inspects
-//! the link command and supplies whichever of `$(RUSTSHAREDFLAG)`, `$(RUSTSONAMEFLAG)` and
+//! rather than honoured). `Makefile.in`'s `rust` target relinks the staged shared library from the
+//! archive with `$(RUSTLDSHARED)`, and does **not** depend on `configure` having loaded `LDSHARED`
+//! with the soname and version-script arguments: it inspects the link command and supplies
+//! whichever of `$(RUSTSHAREDFLAG)`, `$(RUSTSONAMEFLAG)` and
 //! `$(RUSTVERSIONSCRIPTFLAG)$(RUSTVERSIONSCRIPT)` is absent, so the relink is correct on a
 //! configured tree, on an unconfigured one, and on a target whose linker spells those flags
-//! differently. The CMake Rust path and the Rust CI workflow owe the same two steps.
+//! differently. The CMake Rust path and the Rust CI workflow owe the same step.
 //!
 //! ## Symbol visibility -- verified, not assumed
 //!

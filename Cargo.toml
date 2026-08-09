@@ -72,23 +72,33 @@
 #  feature: libz-compat".  Writing `-p libz-rs-sys` says what is meant and is
 #  valid either way.
 #
-#  WHAT THE SECOND COMMAND DOES NOT GIVE YOU.  All of the above run, but
-#  `cargo build --release -p libz-rs-sys --features libz-compat` produces an
-#  INTERMEDIATE, not an installable drop-in.  Measured with
-#  `nm -D --defined-only --extern-only`, that cdylib publishes 96 dynamic globals
-#  where the reference `libz.so.1.3.2.1-motley` publishes 111; it has no
-#  symbol-version nodes, because rustc attaches a version script of its own and
-#  `zlib.map` cannot be added alongside it; it lacks `gzprintf` and `gzvprintf`,
-#  which are variadic and come from `crates/libz-rs-sys/csrc/gzprintf_shim.c`; and
-#  it exports `inflate_table` and two `_zlib_rs_gzprintf_*` helpers that
-#  `zlib.map` hides.  The library fit to install is relinked from `libz.a` plus
-#  that shim under `zlib.map`, with a symbol-parity gate against `zlib.h` and
-#  `zlib.map` themselves -- and against the C library's own table when one has been
-#  built -- by:
+#  WHICH OF THOSE ARTIFACTS IS INSTALLABLE.  The second command produces two
+#  libraries and they are not equivalent.  `target/release/libz.a` IS the
+#  installable static library: it defines all 95 functions `zlib.h` declares,
+#  because `crates/libz-rs-sys/build.rs` compiles that crate's two C translation
+#  units -- `csrc/gzprintf_shim.c` for the variadic `gzprintf`/`gzvprintf` and
+#  `csrc/inftrees_shim.c` for `inflate_table`'s `codetype` prototype, none of which
+#  stable Rust can declare -- and rustc merges their archive into it.
+#
+#  `target/release/libz.so` is NOT, and no cargo argument can make it so.  rustc
+#  attaches its own anonymous version script to every cdylib link, and that single
+#  mechanism accounts for the entire difference: `zlib.map` cannot be layered on
+#  top (so none of the reference library's 16 symbol-version nodes), a symbol the C
+#  units define gets no dynamic entry at all (so no `gzprintf`, no `gzvprintf`),
+#  and the `_zlib_rs_*` helpers `zlib.map` hides through `_*` are visible.
+#  Measured with `nm -D --defined-only --extern-only`: 96 dynamic globals against
+#  the reference library's 111, and zero version nodes.
+#
+#  The installable SHARED library is relinked from that same complete `libz.a`
+#  under `zlib.map`, with a symbol-parity gate against `zlib.h` and `zlib.map`
+#  themselves -- and against the C library's own table when one has been built -- by:
 #
 #    make rust                                                # stage the drop-in
 #    make rust-test                                           # link + run the C drivers
 #    make rust-symbols                                        # diff against a built C libz
+#
+#  One table states all of this, in `crates/libz-rs-sys/src/lib.rs`; anything here
+#  or elsewhere that disagrees with it is the thing that is wrong.
 #
 #  `./configure` is NOT a prerequisite for those three.  `Makefile.in` composes the
 #  shared-object link from its own RUSTLDSHARED and RUSTSHAREDFLAG defaults and

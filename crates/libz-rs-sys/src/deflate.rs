@@ -173,8 +173,8 @@ use crate::panic_guard::{fallback, guard, guard_code};
 use crate::types::{
     checked_state, checked_state_mut, commit_state, copy_stream, discard_reserved_state,
     gz_headerp, input_slice, output_region, publish_state, ranges_are_disjoint, reserve_state,
-    scratch_view, streams_are_disjoint, take_state_with, uLong, widen, z_size_t, z_stream,
-    z_streamp, AliasScratch, Bytef, StateBlock, StateKind, StreamAllocator,
+    scratch_allocator, scratch_view, streams_are_disjoint, take_state_with, uLong, widen, z_size_t,
+    z_stream, z_streamp, AliasScratch, Bytef, StateBlock, StateKind, StreamAllocator,
 };
 use crate::util::error_message;
 
@@ -945,18 +945,25 @@ unsafe fn borrow_stream(
 /// a `None` from an overlapping pair means "allocation failed" and is the one case that
 /// still has to be refused.
 ///
+/// ★ `allocator` is the stream's own, from [`scratch_allocator`], so a caller's `zalloc`
+/// sees the request and a caller's `mem_limit` can refuse it. A refusal arrives here as
+/// [`None`] and is reported, not worked around.
+///
 /// # Safety
 ///
 /// `entry` must have come from [`StreamFields::read`] on a live stream whose
 /// `(next_in, avail_in)` pair is readable, and no mutable borrow of that region may exist
 /// yet -- which is why this runs before [`borrow_stream`] rather than beside it.
 #[must_use]
-unsafe fn capture_overlapping_input(entry: &StreamFields) -> Option<AliasScratch> {
+unsafe fn capture_overlapping_input(
+    allocator: &StreamAllocator,
+    entry: &StreamFields,
+) -> Option<AliasScratch> {
     // SAFETY: unsafe-site category 2 -- `AliasScratch::capture`'s contract is this
     // function's: the region is readable for `avail_in` bytes and no mutable borrow of it
     // exists, because the only one this library ever creates is the output borrow that
     // `borrow_stream` makes afterwards.
-    unsafe { AliasScratch::capture(entry.next_in, entry.avail_in) }
+    unsafe { AliasScratch::capture(allocator, entry.next_in, widen(entry.avail_in)) }
 }
 
 impl StreamScalars {
@@ -2392,11 +2399,14 @@ pub unsafe extern "C" fn deflateParams(strm: z_streamp, level: c_int, strategy: 
         // right arm, because C's refusal for a bad pointer pair is `ERR_RETURN(strm,
         // Z_STREAM_ERROR)` and that is what an unservable pair deserves as well. See
         // `AliasScratch` and `StreamFields::buffers_overlap`.
-        let scratch = if entry.buffers_overlap() {
+        // SAFETY: unsafe-site category 4 -- `scratch_allocator`'s contract is this function's:
+        // `strm` is live, and the three hook members are read through raw places.
+        let allocator = unsafe { scratch_allocator(strm) };
+        let mut scratch = if entry.buffers_overlap() {
             // SAFETY: unsafe-site category 2 -- `capture_overlapping_input`'s contract. `entry`
             // came from `StreamFields::read` on this live stream and no mutable borrow of its
             // input region exists yet.
-            unsafe { capture_overlapping_input(&entry) }
+            unsafe { capture_overlapping_input(&allocator, &entry) }
         } else {
             None
         };
@@ -2467,6 +2477,16 @@ pub unsafe extern "C" fn deflateParams(strm: z_streamp, level: c_int, strategy: 
         // `deflate` refuses before it moves either cursor.
         unsafe {
             publish(strm, &entry, &stream, code);
+        }
+
+        // The snapshot, when there was one, goes back to the allocator it came from -- after
+        // the last use of the view built over it, so no borrow of the block is live when it is
+        // released, and before this frame returns, so a tracking allocator sees one strictly
+        // nested allocate/free pair around this call. `stream` is a plain view with no `Drop`,
+        // so `drop` would not shorten anything: what establishes the ordering is that
+        // `publish` above is its final use and nothing below reads it.
+        if let Some(scratch) = scratch.as_mut() {
+            scratch.release(&allocator);
         }
 
         code
@@ -2748,12 +2768,15 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
         // region, so the input is copied first and the core reads the copy. `AliasScratch`
         // documents the whole argument. Only a failed snapshot allocation is refused, and it is
         // refused exactly as an invalid pointer pair is, message included.
-        let scratch = if entry.buffers_overlap() {
+        // SAFETY: unsafe-site category 4 -- `scratch_allocator`'s contract is this function's:
+        // `strm` is live, and the three hook members are read through raw places.
+        let allocator = unsafe { scratch_allocator(strm) };
+        let mut scratch = if entry.buffers_overlap() {
             // SAFETY: unsafe-site category 2 -- `capture_overlapping_input`'s contract. `entry`
             // came from `StreamFields::read` on this live stream, whose input region is
             // readable for `avail_in` bytes, and no mutable borrow of it exists yet: the only
             // one this function creates comes from `borrow_stream`, below.
-            let captured = unsafe { capture_overlapping_input(&entry) };
+            let captured = unsafe { capture_overlapping_input(&allocator, &entry) };
             if captured.is_none() {
                 // SAFETY: unsafe-site category 1 -- one member written through a raw place on
                 // a non-null, aligned, live stream, with a `'static` NUL-terminated string.
@@ -2804,6 +2827,13 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
         // entry and `stream` the view built from them, on a non-null, aligned, live stream.
         unsafe {
             publish(strm, &entry, &stream, code);
+        }
+
+        // As `deflateParams`: the snapshot goes back to the stream's own allocator after the
+        // final use of the view over it -- the `publish` immediately above -- and before this
+        // frame returns.
+        if let Some(scratch) = scratch.as_mut() {
+            scratch.release(&allocator);
         }
 
         code
@@ -4401,5 +4431,165 @@ mod tests_backend {
         let reverse: Vec<*mut u8> = requested.iter().rev().map(|&(at, _)| at).collect();
         assert_eq!(released, reverse);
         zone.assert_clean("a copy and its source");
+    }
+
+    // -----------------------------------------------------------------------
+    // M4 -- the overlap snapshot is the caller's allocation, not Rust's
+    // -----------------------------------------------------------------------
+
+    /// The payload `test/example.c` L34 compresses, which is also what the overlap
+    /// tests elsewhere in this crate use.
+    const HELLO: &[u8] = b"hello, hello!\0";
+
+    /// An overlapping `deflate` takes its snapshot through the caller's `zalloc` and
+    /// gives it back through the caller's `zfree`, in strict LIFO order.
+    ///
+    /// `zlib.h` L140-L153 makes the three hook members the caller's resource policy for
+    /// a stream, and the snapshot is a request the size of the caller's own `avail_in`
+    /// -- precisely the kind of allocation that policy exists to govern. Taking it from
+    /// Rust's global allocator instead would put a caller-sized request outside both the
+    /// caller's accounting and `test/infcover.c`'s `mem_limit()`.
+    ///
+    /// So the assertions below are about *whose* memory it is, not about the bytes: the
+    /// snapshot appears in the tracking zone as one further request of exactly
+    /// `avail_in` bytes, it is the most recent block when it is freed -- which is what
+    /// keeps `mem_free`'s `notlifo` counter at zero -- and it is gone before `deflate`
+    /// returns, so no state carries it and `deflateEnd` has nothing extra to reclaim.
+    #[test]
+    fn an_overlapping_deflate_snapshots_through_the_callers_hooks() {
+        let zone = Zone::new();
+        let mut strm = blank_stream();
+        track(&mut strm, &zone);
+        assert_eq!(unsafe { init_gzip(&mut strm) }, ReturnCode::OK.as_i32());
+
+        let after_init = zone.with(|zone| zone.requested.len());
+        assert_eq!(after_init, 5, "deflate.c L440 plus L468-L479");
+
+        // One buffer, read and written at once: `next_in` and `next_out` both address
+        // its first byte, which is the overlap `test/example.c`'s `test_large_deflate`
+        // creates on purpose and which C serves rather than refuses.
+        let mut shared = vec![0_u8; 256];
+        shared[..HELLO.len()].copy_from_slice(HELLO);
+        let avail_in = HELLO.len();
+        strm.next_in = shared.as_ptr();
+        strm.avail_in = uInt::try_from(avail_in).unwrap();
+        strm.next_out = shared.as_mut_ptr();
+        strm.avail_out = uInt::try_from(shared.len()).unwrap();
+
+        let status = unsafe { deflate(&mut strm, Z_FINISH) };
+        assert_eq!(
+            status,
+            ReturnCode::STREAM_END.as_i32(),
+            "an overlapping pair runs, exactly as it does in C"
+        );
+        assert_eq!(
+            usize::try_from(strm.total_in).unwrap(),
+            avail_in,
+            "the whole input is consumed in the one pass the snapshot makes possible"
+        );
+
+        let (requested, released) =
+            zone.with(|zone| (zone.requested.clone(), zone.released.clone()));
+        assert_eq!(
+            requested.len(),
+            after_init + 1,
+            "the snapshot is one further request through the caller's zalloc: {requested:?}"
+        );
+        let (snapshot_at, snapshot_len) = requested[after_init];
+        assert_eq!(
+            snapshot_len, avail_in,
+            "the request is `avail_in` bytes, the shape ZALLOC(strm, avail_in, 1) has"
+        );
+        assert_eq!(
+            released.len(),
+            1,
+            "and it is returned before deflate does, through the caller's zfree"
+        );
+        assert!(
+            core::ptr::eq(released[0], snapshot_at),
+            "the block returned is the block taken"
+        );
+        // `mem_done`'s three defect counters, checked here rather than only at the end:
+        // the five state blocks are still live at this point, so the whole-zone check
+        // cannot run yet, but the two properties that are specifically the snapshot's --
+        // that the free was LIFO and of an address the zone handed out -- can.
+        zone.with(|zone| {
+            assert_eq!(
+                zone.live.len(),
+                after_init,
+                "only the five initialisation blocks remain live: {:?}",
+                zone.live
+            );
+            assert_eq!(zone.notlifo, 0, "the snapshot was freed last-in-first-out");
+            assert_eq!(
+                zone.rogue, 0,
+                "and the address freed was one the zone gave out"
+            );
+        });
+
+        assert_eq!(
+            unsafe { deflateEnd(&mut strm) },
+            ReturnCode::OK.as_i32(),
+            "the snapshot left nothing for deflateEnd to find"
+        );
+        zone.assert_clean("an overlapping deflate then deflateEnd");
+    }
+
+    /// A caller whose `zalloc` refuses the snapshot gets an error, not an abort.
+    ///
+    /// `test/infcover.c`'s `mem_limit()` exists to force exactly this, and a system
+    /// library must answer it by returning: reaching past the hooks to an infallible
+    /// allocator would turn a refused caller-sized request into a process abort. The
+    /// status is `Z_STREAM_ERROR` because an unservable buffer pair is the same class of
+    /// argument fault as the null pair C rejects at `deflate.c` L993 -- see the comment
+    /// above `AliasScratch` in `src/types.rs` -- and nothing is emitted or consumed.
+    #[test]
+    fn a_refused_overlap_snapshot_is_reported_rather_than_fatal() {
+        let zone = Zone::new();
+        let mut strm = blank_stream();
+        track(&mut strm, &zone);
+        assert_eq!(unsafe { init_gzip(&mut strm) }, ReturnCode::OK.as_i32());
+
+        let after_init = zone.with(|zone| zone.requested.len());
+        // Refuse the next request, which is the snapshot and nothing else.
+        zone.deny_from(after_init + 1);
+
+        let mut shared = vec![0_u8; 256];
+        shared[..HELLO.len()].copy_from_slice(HELLO);
+        strm.next_in = shared.as_ptr();
+        strm.avail_in = uInt::try_from(HELLO.len()).unwrap();
+        strm.next_out = shared.as_mut_ptr();
+        strm.avail_out = uInt::try_from(shared.len()).unwrap();
+
+        let status = unsafe { deflate(&mut strm, Z_FINISH) };
+        assert_eq!(
+            status,
+            ReturnCode::STREAM_ERROR.as_i32(),
+            "a refused snapshot is reported"
+        );
+        assert_eq!(strm.total_in, 0, "nothing was consumed");
+        assert_eq!(strm.total_out, 0, "nothing was emitted");
+        assert_eq!(
+            zone.with(|zone| zone.requested.len()),
+            after_init,
+            "the refused request left no block behind"
+        );
+        assert!(
+            zone.with(|zone| zone.released.is_empty()),
+            "and nothing was freed either"
+        );
+
+        // The stream is still usable, which is what `Z_STREAM_ERROR` for an argument
+        // fault means: the same call with room the zone will serve still completes.
+        zone.deny_from(0);
+        let status = unsafe { deflate(&mut strm, Z_FINISH) };
+        assert_eq!(
+            status,
+            ReturnCode::STREAM_END.as_i32(),
+            "the refusal cost the stream nothing"
+        );
+
+        assert_eq!(unsafe { deflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
+        zone.assert_clean("a refused overlap snapshot");
     }
 }
