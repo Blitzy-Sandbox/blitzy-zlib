@@ -5880,6 +5880,40 @@ mod tests_backend {
         drop(unsafe { std::fs::File::from_raw_fd(raw) });
     }
 
+    /// Moves an open descriptor to a number no other test in this binary can be handed.
+    ///
+    /// ★ Descriptor numbers are process-global and `open(2)` returns the LOWEST free one,
+    /// so a test that frees a low number and then asserts that `close(2)` on it FAILS is
+    /// hostile to every other test in the binary: another thread's `open` is handed that
+    /// number, this test's `close` therefore SUCCEEDS -- the assertion sees `Z_OK` where it
+    /// demanded `Z_ERRNO` -- and the other test loses its file underneath it. Measured
+    /// before this helper existed: the two tests that build that fixture failed together
+    /// in roughly two runs out of five, and under `AddressSanitizer`, which perturbs the
+    /// interleaving, the pair failed and then leaked the stream they could no longer close.
+    ///
+    /// `F_DUPFD` returns the lowest free descriptor **at or above** its argument, so the
+    /// number handed over afterwards is far outside the range anything allocates naturally.
+    /// It is used in preference to `dup2`, which would silently close whatever occupied the
+    /// target. The fixture is not weakened: the number a caller is given is still one that
+    /// was genuinely open and genuinely is not any more.
+    #[cfg(unix)]
+    fn relocate_high(open_fd: c_int) -> c_int {
+        /// Far above the handful of descriptors a test binary holds at once, and far below
+        /// any plausible `RLIMIT_NOFILE`.
+        const FLOOR: c_int = 512;
+
+        // SAFETY: a C call with no pointer arguments. `open_fd` is open and owned by the
+        // caller, `F_DUPFD` only reads it, and the third argument is the `c_int` that
+        // request expects.
+        let high = unsafe { libc::fcntl(open_fd, libc::F_DUPFD, FLOOR) };
+        assert!(
+            high >= FLOOR,
+            "F_DUPFD to a descriptor at or above {FLOOR}; is RLIMIT_NOFILE smaller than that?"
+        );
+        close_descriptor(open_fd);
+        high
+    }
+
     /// `open(2)` for reading, returning the raw descriptor the tests then hand over.
     ///
     /// A descriptor has to be obtained without `std::fs::File` in these tests, because
@@ -7361,9 +7395,15 @@ mod tests_backend {
         // ownership of the number, close it, and only then hand the stale number over.
         // Reclaiming and dropping is how the number is closed without a raw syscall; at
         // that instant it is still open, so the drop is sound and the only owner.
-        let raw = std::fs::File::open(scratch.0.as_path())
-            .unwrap()
-            .into_raw_fd();
+        //
+        // The number is relocated out of the range `open(2)` allocates from first, because
+        // otherwise freeing it here races every other test in this binary -- see
+        // [`relocate_high`], which records what that race was measured to do.
+        let raw = relocate_high(
+            std::fs::File::open(scratch.0.as_path())
+                .unwrap()
+                .into_raw_fd(),
+        );
         close_descriptor(raw);
 
         let file = dopen(raw, &mode);
@@ -7592,6 +7632,9 @@ mod tests_backend {
 
         let fd = sys_open_read(&path);
         assert!(fd >= 0, "opening the scratch file directly");
+        // Relocated before `gzdopen` adopts it, because the number is freed below and
+        // `open(2)` hands out the lowest free one; see [`relocate_high`].
+        let fd = relocate_high(fd);
         let file = dopen(fd, &mode);
         assert!(!file.is_null(), "gzdopen on a live descriptor");
 

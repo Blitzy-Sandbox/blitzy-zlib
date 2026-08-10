@@ -1,0 +1,1401 @@
+# =============================================================================
+# Rust CI -- the enforcement point for the memory-safe Rust port of zlib.
+#
+# The Cargo workspace at the top of this tree reimplements the zlib engine in
+# safe Rust and re-exports it through a thin `extern "C"` facade, so that a
+# consumer already linked against `libz` keeps working with no edit and no
+# recompilation.  Every claim in that sentence is checked by a job below, and
+# for seven of them THIS FILE IS THE ONLY PLACE THEY ARE CHECKED AT ALL.
+#
+# What each job enforces, by the quality-bar constraint it answers:
+#
+#   (a) unsafe containment .... `miri` (the safe core, which contains no FFI and
+#                               can therefore be analysed exhaustively) and
+#                               `asan` (the facade, where the raw pointers of
+#                               the six unavoidable unsafe site categories are)
+#   (b) contract immutability . `header` (cbindgen signature/field/macro gate)
+#                               and `symbols` (nm parity against the 111-symbol
+#                               C baseline, the SONAME, and the hidden set)
+#   (c) behavioral fidelity ... `differential` (byte-identical output and
+#                               bidirectional interoperability)
+#   (d) verification clean .... `miri`, `asan`, `fuzz` (five targets, 300 s
+#                               each, zero crashes) and `dropin` (the three
+#                               UNMODIFIED C drivers, relinked and run)
+#   (e) lint and format ....... `format` and `lint`
+#   (f) no panics in library .. `lint`.  The deny-level `unwrap_used`,
+#                               `expect_used`, `indexing_slicing`, `panic` and
+#                               `panic_in_result_fn` lints are declared in
+#                               Cargo.toml's [workspace.lints], so running
+#                               clippy with `-D warnings` IS the enforcement.
+#                               There is deliberately no grep-for-unwrap job.
+#   (h) MSRV honored .......... `msrv` (a build on the declared 1.80 floor)
+#   (i) dependency minimalism . `deny` (cargo-deny over the root deny.toml)
+#
+# (g), the documented-public-API constraint, is enforced in-crate by
+# `#![deny(missing_docs)]` and is therefore covered by any warning-free build.
+# It gets no job of its own on purpose.
+#
+# DIVISION OF LABOUR -- none of the following is redundant with this file, and
+# none of it may be deleted in favour of this file:
+#
+#   * fuzz.yml   keeps OSS-Fuzz/CIFuzz pointed at the C oracle.  The `fuzz` job
+#                here is cargo-fuzz over the RUST targets.  Two implementations,
+#                two fuzzers; the 300 s budget is shared so the two are
+#                comparable.
+#   * c-std.yml  keeps compiling the UNCHANGED zlib.h from C89 through gnu2x.
+#                That is the other half of contract immutability: this file
+#                proves the Rust library still matches the header, c-std.yml
+#                proves the header itself still compiles everywhere.
+#   * cmake.yml  exercises the CMake `ZLIB_BUILD_RUST` path.  Everything here
+#                drives cargo (and the Makefile's `rust*` targets) directly,
+#                which is what the verified command set uses.
+#
+# Nothing in this file writes to zlib.h, zconf.h, zlib.map, any C translation
+# unit, anything under contrib/, or any of the three test drivers.  zlib.h and
+# zlib.map are CONSUMED -- as the header-diff target and as the linker version
+# script -- and never modified.  No job downloads a benchmark corpus.
+# =============================================================================
+
+name: Rust
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # 1. The user-facing build and the whole test suite, on the Tier-1 targets.
+  #
+  # The three cargo lines are the project's own stated build commands, used
+  # verbatim.  `--locked` is added to every invocation because Cargo.lock is
+  # committed: this artifact ships as a system library, so a build that
+  # silently re-resolved a dependency would not be reproducible.
+  #
+  # The macOS and Windows rows are not decoration.  `uLong` is C's
+  # `unsigned long`, which is 8 bytes on LP64 and 4 on LLP64 Windows, so the
+  # facade maps it to `core::ffi::c_ulong` rather than to a fixed-width
+  # integer; the Windows row is what catches a regression to `u64`, and it is
+  # the only place that can.  Fast-fail is switched off on the matrix so that
+  # one platform's failure cannot hide the others'.
+  # ---------------------------------------------------------------------------
+  build-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu stable
+            os: ubuntu-latest
+
+          - name: macOS stable
+            os: macos-latest
+
+          - name: Windows stable
+            os: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      run: |
+        rustup toolchain install stable --profile minimal --component rustfmt,clippy
+        rustc --version
+        cargo --version
+
+    - name: Compile source code
+      run: |
+        cargo build --locked --release
+        cargo build --locked --release --features libz-compat
+
+    - name: Run test cases
+      run: cargo test --locked --workspace --release
+
+    - name: Upload build errors
+      uses: actions/upload-artifact@v6
+      if: failure()
+      with:
+        name: ${{ matrix.name }} (build-test)
+        path: |
+          Cargo.lock
+          target/release/build/*/output
+        retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 2. Formatting.  .rustfmt.toml exists at the root to be enforced here.
+  # ---------------------------------------------------------------------------
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      run: rustup toolchain install stable --profile minimal --component rustfmt
+
+    - name: Run test cases
+      run: cargo fmt --all -- --check
+
+  # ---------------------------------------------------------------------------
+  # 3. Lints.  The LEVELS live in Cargo.toml's [workspace.lints] -- clippy::all
+  # and clippy::pedantic at deny, plus unwrap_used, expect_used,
+  # indexing_slicing, panic, panic_in_result_fn, todo, unimplemented,
+  # unreachable, exit and undocumented_unsafe_blocks -- and the thresholds and
+  # `msrv` live in clippy.toml.  This job's whole contribution is to run clippy
+  # with warnings denied, which is what turns all of that into a gate.
+  #
+  # `--all-targets` reaches the tests, benches and fuzz-adjacent targets too,
+  # so a lint violation cannot hide in a test module.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      run: rustup toolchain install stable --profile minimal --component clippy
+
+    - name: Run test cases
+      run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # 4. Dependency policy.  Reads the root deny.toml: the [licenses] allow-list
+  # (Zlib, matching the in-tree LICENSE), [advisories], and the [bans] rules
+  # that keep the core crate's dependency table empty and reject duplicate or
+  # wildcard versions.  The core algorithm crate having zero third-party
+  # dependencies is a stated constraint, and this is the machine that holds it.
+  # ---------------------------------------------------------------------------
+  deny:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      run: rustup toolchain install stable --profile minimal
+
+    - name: Install packages (Linux)
+      run: cargo install cargo-deny --locked
+
+    - name: Run test cases
+      run: cargo deny --all-features check
+
+  # ---------------------------------------------------------------------------
+  # 5. The MSRV floor.  A build, not the test matrix, so it stays cheap: the
+  # point is that an accidentally-newer-than-1.80 construct fails here rather
+  # than in a downstream distribution.
+  #
+  # SCOPE, and it is not negotiable: `--workspace` CANNOT be used.  The dev-only
+  # zlib-rs-differential crate declares `rust-version = "1.86"` because that is
+  # criterion's own floor, so `cargo +1.80 build --workspace` fails before it
+  # compiles anything, with "rustc 1.80.1 is not supported by the following
+  # packages".  The MSRV is a promise about the two crates that SHIP, and those
+  # are exactly the two named here -- the same pair Makefile.in's
+  # CARGO_MSRV_FLAGS names.
+  #
+  # edition 2021 is likewise not a preference: edition 2024 requires rustc 1.85
+  # and cargo rejects the combination outright, so 2021 is the only valid choice
+  # at this floor.
+  # ---------------------------------------------------------------------------
+  msrv:
+    name: MSRV 1.80
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      run: |
+        rustup toolchain install 1.80 --profile minimal
+        cargo +1.80 --version
+
+    - name: Compile source code
+      run: cargo +1.80 build --locked -p zlib-rs -p libz-rs-sys --all-targets
+
+  # ---------------------------------------------------------------------------
+  # 6. The differential suite: byte-identical output, and interoperability in
+  # both directions.
+  #
+  # This is the behavioral-fidelity gate, and it is far stricter than RFC
+  # conformance.  RFC 1951 constrains the FORMAT, not the CHOICES: which of
+  # several equally valid matches to emit, when to abandon a lazy match, how to
+  # break a Huffman frequency tie and when to switch block type are all
+  # implementation-defined, and the port has to answer them exactly the way the
+  # reference does.  A better DEFLATE encoder fails this job, which is the
+  # point.
+  #
+  # What crates/zlib-rs-differential's tests sweep, so that the scope of the
+  # gate is legible from here rather than only from the test source:
+  #
+  #   level ........ 0-9, all ten
+  #   windowBits ... 9..15 (zlib), -9..-15 (raw), 25..31 (gzip)
+  #                  -- all three container formats
+  #   memLevel ..... 1-9
+  #   strategy ..... Z_DEFAULT_STRATEGY, Z_FILTERED, Z_RLE, Z_HUFFMAN_ONLY,
+  #                  Z_FIXED
+  #   flush ........ Z_NO_FLUSH, Z_PARTIAL_FLUSH, Z_SYNC_FLUSH, Z_FULL_FLUSH,
+  #                  Z_BLOCK, Z_FINISH .. Z_TREES
+  #   corpus ....... every fixture in the committed minimal corpus
+  #   feeding ...... single-shot AND incrementally chunked, because chunk
+  #                  boundaries interact with flush handling and with the
+  #                  pending-buffer state
+  #
+  #   plus C->Rust and Rust->C stream interoperability asserted as its own test
+  #   class rather than inferred from round-tripping, preset dictionaries in
+  #   both directions, and a numeric comparison of deflateBound/compressBound
+  #   (callers size their output buffers with those, so a bound that is too
+  #   small is a buffer overflow in CALLER code).
+  #
+  # A C COMPILER IS REQUIRED on the runner, not just cargo: that crate's own
+  # build.rs compiles the fifteen in-tree C translation units into a test-only
+  # static oracle with the `cc` crate, so both implementations live in one
+  # process and can be called alternately.  ubuntu-latest ships gcc; the
+  # version print below makes that a stated requirement rather than luck.
+  #
+  # The oracle is a dev-only dependency: it appears in no [dependencies] table
+  # of either shipped crate, so `cargo build --release` never invokes a C
+  # compiler.  Nothing is vendored and there are no submodules -- the reference
+  # sources are already in this tree.
+  # ---------------------------------------------------------------------------
+  differential:
+    name: Differential
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      run: rustup toolchain install stable --profile minimal
+
+    - name: Install packages (Linux)
+      run: |
+        cc --version
+        make --version | head -1
+
+    - name: Compile source code
+      run: cargo test --locked -p zlib-rs-differential --release --no-run
+
+    - name: Run test cases
+      run: cargo test --locked -p zlib-rs-differential --release
+
+    - name: Upload build errors
+      uses: actions/upload-artifact@v6
+      if: failure()
+      with:
+        name: differential
+        path: |
+          target/release/build/zlib-rs-differential-*/output
+          target/release/build/zlib-rs-differential-*/stderr
+        retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 7. Symbol parity: the exported surface of the Rust library, compared name
+  # for name against the C library built from the same tree.
+  #
+  # Both libraries are built here, because the comparison is only meaningful
+  # against a real baseline.  The measured baseline is 111 dynamic globals --
+  # 95 functions (nm type T) plus 16 symbol version nodes (type A) -- with
+  # SONAME libz.so.1.
+  #
+  # WHY `make rust` AND NOT JUST `cargo build`: cargo's own cdylib exports 96
+  # symbols, not 111.  build.rs compiles csrc/gzprintf_shim.c -- gzprintf is
+  # variadic and gzvprintf takes a va_list, neither of which stable Rust can
+  # define -- and csrc/inftrees_shim.c into the archive, and rustc gives a
+  # symbol that arrives from a native archive no dynamic entry under a version
+  # script.  `make rust` relinks the whole archive through zlib.map with the
+  # right SONAME and stages the versioned symlink chain, and THAT staged library
+  # is the artifact a consumer actually loads.  Comparing the raw cdylib here
+  # would report three missing exports that the shipped library has.
+  # ---------------------------------------------------------------------------
+  symbols:
+    name: Symbol parity
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      run: rustup toolchain install stable --profile minimal
+
+    - name: Generate project files
+      # The versioned library name is derived from ZLIB_VERSION in the immutable
+      # zlib.h -- the same expression Makefile.in uses -- so this gate keeps
+      # working across a version bump instead of carrying a stale literal.
+      run: |
+        set -eu
+        ZVER=$(sed -n 's/^.*define ZLIB_VERSION "\(.*\)".*$/\1/p' zlib.h)
+        if [ -z "$ZVER" ]; then
+          echo "::error::no ZLIB_VERSION in zlib.h; the versioned library name cannot be derived"
+          exit 1
+        fi
+        echo "ZVER=$ZVER" >> "$GITHUB_ENV"
+        echo "CLIB=libz.so.$ZVER" >> "$GITHUB_ENV"
+        echo "deriving the baseline library name from zlib.h: libz.so.$ZVER"
+
+    - name: Compile source code
+      # The C baseline.  ./configure is run in the checkout exactly as
+      # configure.yml already does; a runner checkout is throwaway, and the
+      # Makefile it writes still carries the rust* targets.  Then `make rust`
+      # builds and stages the Rust drop-in, with ZLIBREF pointed at the C
+      # library so that its own C-versus-Rust comparison runs as well.
+      run: |
+        set -eu
+        ./configure
+        make -j2
+        make rust CARGO=cargo ZLIBREF="$CLIB"
+
+    - name: Run test cases
+      run: |
+        set -eu
+        C_LIB="$CLIB"
+        R_LIB=target/dropin/libz.so
+        [ -f "$C_LIB" ] || { echo "::error::the C baseline $C_LIB was not built"; exit 1; }
+        [ -e "$R_LIB" ] || { echo "::error::the staged Rust library $R_LIB is missing"; exit 1; }
+
+        # Every list this step writes goes under target/, which .gitignore
+        # covers with an anchored rule, so a failing run cannot leave a
+        # committable file behind.  The lists ARE the evidence, so they are kept
+        # and uploaded rather than deleted.
+        S=target/symbol-parity
+        mkdir -p "$S"
+
+        # --- the authoritative comparison ----------------------------------
+        # `nm -D` prints a version tag on every versioned symbol, so field 3
+        # arrives in three shapes: 41 plain names, 54 of the form
+        # name@@ZLIB_x.y.z, and the 16 version node names themselves.  Diffing
+        # field 3 RAW therefore checks the version-node bindings as well as the
+        # name set, and zlib.map's bindings are part of the contract.
+        nm -D --defined-only --extern-only "$C_LIB" | awk '{print $3}' | sort > "$S/c.syms"
+        nm -D --defined-only --extern-only "$R_LIB" | awk '{print $3}' | sort > "$S/rust.syms"
+        if diff -u "$S/c.syms" "$S/rust.syms" > "$S/syms.diff"; then
+          echo "exported symbol sets are identical: $(wc -l < "$S/rust.syms" | tr -d ' ') symbols"
+        else
+          echo "::error::exported symbol sets differ"
+          cat "$S/syms.diff"
+          # A library that failed to apply --version-script=zlib.map differs
+          # from the baseline on roughly 108 lines, which reads as noise rather
+          # than as a diagnosis.  So compare the FUNCTION names alone -- nm type
+          # T, with the @@ tag stripped, and therefore without the type-A node
+          # names that would otherwise reappear as a difference of their own.
+          # If THAT comparison is clean, every function is present and only the
+          # version bindings are wrong, which points straight at the linker
+          # argument instead of at the facade.
+          echo "--- the same comparison over function names only, tags stripped ---"
+          nm -D --defined-only --extern-only "$C_LIB" | awk '$2=="T"{print $3}' | sed 's/@@.*//' | sort -u > "$S/c.names"
+          nm -D --defined-only --extern-only "$R_LIB" | awk '$2=="T"{print $3}' | sed 's/@@.*//' | sort -u > "$S/rust.names"
+          if diff -u "$S/c.names" "$S/rust.names"; then
+            echo "::error::the NAME sets are identical, so the difference is in the symbol version bindings: zlib.map was not applied to the Rust library"
+          fi
+          comm -23 "$S/c.names" "$S/rust.names" > "$S/missing.syms" || true
+          comm -13 "$S/c.names" "$S/rust.names" > "$S/extra.syms" || true
+          exit 1
+        fi
+
+        # --- the shape of the surface, on both sides -----------------------
+        # 111 = 95 functions + 16 version nodes.  The node count is re-derived
+        # from zlib.map rather than trusted, so a change to the version script
+        # cannot quietly agree with a stale literal.  The three totals are also
+        # recorded in Cargo.toml's [workspace.metadata.zlib].
+        MAP_NODES=$(grep -cE '^[A-Za-z_][A-Za-z0-9_.]*[[:space:]]*\{' zlib.map)
+        [ "$MAP_NODES" -eq 16 ] || { echo "::error::zlib.map declares $MAP_NODES version nodes, expected 16"; exit 1; }
+        for lib in "$C_LIB" "$R_LIB"; do
+          nm -D --defined-only --extern-only "$lib" > "$S/nm.out"
+          total=$(wc -l < "$S/nm.out" | tr -d ' ')
+          fns=$(awk '$2=="T"' "$S/nm.out" | wc -l | tr -d ' ')
+          nodes=$(awk '$2=="A"' "$S/nm.out" | wc -l | tr -d ' ')
+          echo "$lib: $total dynamic globals = $fns functions + $nodes version nodes"
+          [ "$total" -eq 111 ] || { echo "::error::$lib exports $total symbols, expected 111"; exit 1; }
+          [ "$fns"   -eq 95  ] || { echo "::error::$lib exports $fns functions, expected 95"; exit 1; }
+          [ "$nodes" -eq "$MAP_NODES" ] || { echo "::error::$lib carries $nodes version nodes, expected $MAP_NODES"; exit 1; }
+        done
+
+        # --- the SONAME ----------------------------------------------------
+        # The SONAME is what the loader searches for, so it is as much a part of
+        # the ABI as the symbol names are.  Get it wrong and every consumer
+        # silently binds a different library.
+        for lib in "$C_LIB" "$R_LIB"; do
+          readelf -d "$lib" | grep -i soname || true
+          readelf -d "$lib" | grep -qE 'SONAME.*\[libz\.so\.1\]' || {
+            echo "::error::$lib does not declare SONAME libz.so.1"; exit 1; }
+        done
+        echo "SONAME is libz.so.1 on both libraries"
+
+        # --- the hidden set ------------------------------------------------
+        # zlib.map's `local:` block names ten internals that must NOT be
+        # exported, plus everything matching _*.  The port keeps them hidden
+        # twice over -- they are never #[no_mangle], and the library is linked
+        # with --version-script=zlib.map -- and this is what proves it.
+        HIDDEN='deflate_copyright inflate_copyright inflate_fast inflate_table
+                zcalloc zcfree z_errmsg gz_error gz_intmax inflate_fixed'
+        for lib in "$C_LIB" "$R_LIB"; do
+          nm -D --defined-only --extern-only "$lib" | awk '{print $3}' | sed 's/@@.*//' | sort -u > "$S/exported.names"
+          for sym in $HIDDEN; do
+            if grep -qx "$sym" "$S/exported.names"; then
+              echo "::error::$lib exports $sym, which zlib.map lists under local:"
+              exit 1
+            fi
+          done
+          if grep -E '^_' "$S/exported.names"; then
+            echo "::error::$lib exports a symbol matching zlib.map's local: _* pattern"
+            exit 1
+          fi
+        done
+        echo "all 10 zlib.map local: names hidden, nothing matching _* exported"
+
+        # --- both large-file families, positively --------------------------
+        # zconf.h redirects these names based on the CALLER's own
+        # _FILE_OFFSET_BITS and _LARGEFILE64_SOURCE at the CALLER's own compile
+        # time, so the library has to export both spellings.  The raw diff above
+        # would already catch a missing one, but naming them makes the
+        # requirement legible instead of implicit.
+        nm -D --defined-only --extern-only "$R_LIB" | awk '{print $3}' | sed 's/@@.*//' | sort -u > "$S/exported.names"
+        for sym in adler32_combine64 adler32_z compress2_z compressBound_z compress_z \
+                   crc32_combine64 crc32_combine_gen64 crc32_z deflateBound_z \
+                   gzoffset64 gzopen64 gzseek64 gztell64 uncompress2_z uncompress_z; do
+          grep -qx "$sym" "$S/exported.names" || {
+            echo "::error::the Rust library does not export $sym"; exit 1; }
+        done
+        gzcount=$(grep -c '^gz' "$S/exported.names")
+        [ "$gzcount" -eq 32 ] || { echo "::error::$gzcount gz* symbols exported, expected 32"; exit 1; }
+        echo "both large-file families present; $gzcount gz* symbols"
+        echo "symbol parity: PASS"
+
+    - name: Upload build errors
+      uses: actions/upload-artifact@v6
+      if: failure()
+      with:
+        name: symbol-parity
+        path: |
+          target/symbol-parity/
+          configure.log
+        retention-days: 7
+
+
+  # ---------------------------------------------------------------------------
+  # 8. Header conformance: the C header cbindgen derives from the facade,
+  # compared against the immutable zlib.h.
+  #
+  # A VERBATIM `diff -u zlib.h generated_zlib.h` IS NOT THE GATE AND NEVER CAN
+  # BE.  cbindgen cannot emit the ZEXTERN/ZEXPORT declaration macros, cannot
+  # express zlib.h's conditional `#include` of zconf.h, cannot reproduce the
+  # function-like macros or the conditional large-file duplicate declaration
+  # blocks, and alphabetises what zlib.h orders thematically.  That diff is
+  # permanently non-empty, so wiring it up as the pass/fail check would produce
+  # a gate that is either always red or quietly ignored.  The accepted
+  # structural divergences are enumerated in the root cbindgen.toml under
+  # "ACCEPTED DIVERGENCES", and the comparison specified there under
+  # "NORMALISATION RULES THE GATE MUST IMPLEMENT" is what runs here.
+  #
+  # That specification is split across two mechanisms on purpose:
+  #
+  #   * `make rust-header` already implements rules A1, A2, A5 and A9 -- it
+  #     regenerates the artifact, holds cbindgen's stderr to an enumerated
+  #     allowance, compiles the result standalone as C89, C99, C17 and C++17
+  #     with warnings fatal, and compares the DECLARED FUNCTION NAMES against
+  #     zlib.h's ZEXTERN set in both directions.
+  #   * rules A3, A4, A6, A7, A8 and rule 10 -- the ones that need the typedef
+  #     chain resolved and the macro values evaluated -- are assigned by name to
+  #     this workflow, and the step below is where they run.  Until they run, no
+  #     command anywhere may be described as having verified a signature.
+  #
+  # HOW THE SHAPE COMPARISON WORKS, and why it is not a text normaliser: every
+  # prototype taken from the generated header is RE-DECLARED in a translation
+  # unit that has already included zlib.h.  A divergent return type, parameter
+  # type or qualifier is then a "conflicting types" error from the C compiler
+  # itself, which resolves the whole zconf.h typedef chain (A8), drops parameter
+  # names unambiguously (A6), canonicalises bare `unsigned` (A7) and ignores the
+  # ZEXTERN/ZEXPORT/FAR/z_const decoration (A4) for free.  A regex cannot do
+  # this reliably: zlib.h omits parameter names throughout the large-file block,
+  # so `adler32_combine(uLong, uLong, z_off_t)` gives a text pass no way to tell
+  # a type from a name -- an earlier normaliser reported eleven false mismatches
+  # for exactly that reason.
+  # ---------------------------------------------------------------------------
+  header:
+    name: Header conformance
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      run: rustup toolchain install stable --profile minimal
+
+    - name: Install packages (Linux)
+      # cbindgen is pinned: 0.29.4 is the version every key in cbindgen.toml was
+      # checked against, and a different release can change the incidental
+      # formatting the accepted-divergence list describes.  g++ is needed for
+      # the C++17 arm of the standalone compile sweep.
+      run: |
+        cargo install cbindgen --locked --version 0.29.4
+        cbindgen --version
+        g++ --version | head -1
+
+    - name: Compile source code
+      # Rules A1, A2, A5, A9 plus the standalone C89/C99/C17/C++17 compile
+      # sweep, with and without _WIN32.
+      run: make rust-header CARGO=cargo
+
+    - name: Run test cases
+      run: |
+        set -eu
+        # Regenerated explicitly so that this step stands on its own, and so
+        # that the exact command a developer runs by hand is the command the
+        # gate runs.  generated_zlib.h is a build artifact: .gitignore carries
+        # an anchored rule for it, and it must never be committed.  zlib.h is
+        # read-only and is never written by anything here.
+        cbindgen --config cbindgen.toml --crate libz-rs-sys --output generated_zlib.h
+        python3 - <<'SHAPE_GATE'
+        """cbindgen shape gate: rules A3, A4, A6, A7, A8 and rule 10.
+
+        Pass A  -- every generated prototype is re-declared against zlib.h, so
+                   the C compiler decides whether the signatures are identical.
+        Pass A' -- the four function-pointer typedefs are compared the same way.
+                   A signature that reaches one of them BY NAME would otherwise
+                   compare equal to itself and hide a divergence inside it.
+        Pass B  -- struct sizes and per-field offsets and widths, and the
+                   integer object-like macros by value, compared by building one
+                   probe program per side and diffing what they print.
+        """
+        import os
+        import re
+        import subprocess
+        import sys
+
+        REF, GEN = "zlib.h", "generated_zlib.h"
+        # Rule A2: preprocess each side under its own DECLARED configuration.
+        # _LARGEFILE64_SOURCE=1 without _FILE_OFFSET_BITS=64 is the reference
+        # build's own setting, and it is what makes the large-file duplicates
+        # unambiguous: Z_LARGE64 defined, Z_WANT64 undefined, and each of the 14
+        # large-file names declared exactly once.  ZLIB_CONST turns zconf.h's
+        # `z_const` into `const`, which is where the generated header hard-codes
+        # it; that is stricter than deleting the token, because every other
+        # `const` stays meaningful.
+        REF_DEFS = ["-D_LARGEFILE64_SOURCE=1", "-DZLIB_CONST"]
+        GEN_DEFS = ["-DZLIB_RS_LIBZ_COMPAT", "-DZLIB_RS_GZ"]
+        # The three structs whose layout is caller-visible.  gzFile_s is the one
+        # that cannot be got wrong quietly: the gzgetc macro is expanded in
+        # CALLER object code and loads have/next/pos at offsets 0, 8 and 16.
+        ABI_STRUCTS = ["z_stream", "gz_header", "gzFile_s"]
+        # Function-like macros in the contract.  gzgetc is both a macro and a
+        # real exported function, so it has to be undefined before the function
+        # can be re-declared.
+        MACRO_FN = ["deflateInit", "deflateInit2", "inflateInit", "inflateInit2",
+                    "inflateBackInit", "gzgetc"]
+        CC = os.environ.get("CC") or "cc"
+        STRICT = ["-std=c99", "-Wall", "-Wextra", "-Werror"]
+        # Every probe source and binary is written under target/, which
+        # .gitignore covers with an anchored rule, so this gate cannot leave a
+        # committable file behind however it exits.  The compiles keep `-I.`, so
+        # they still resolve zlib.h and zconf.h from the repository root.
+        SCRATCH = os.path.join("target", "header-gate")
+        os.makedirs(SCRATCH, exist_ok=True)
+        failures = []
+
+
+        def run(cmd):
+            return subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+
+        def nocomment(text):
+            """Rule A1."""
+            text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+            return re.sub(r"//[^\n]*", " ", text)
+
+
+        def preprocess(path, defs):
+            result = run([CC, "-E", "-P", "-I.", *defs, path])
+            if result.returncode != 0:
+                sys.exit("cannot preprocess %s:\n%s" % (path, result.stderr))
+            return result.stdout
+
+
+        # Rule A9: the contract is exactly zlib.h's ZEXTERN/ZEXPORTVA set.
+        contract = set()
+        for match in re.finditer(r"\bZEXTERN(?:VA)?\b(.*?);", nocomment(open(REF).read()), re.S):
+            named = re.findall(r"\b(\w+)\s*\(", match.group(1))
+            if named:
+                contract.add(named[0])
+        if len(contract) < 90:
+            sys.exit("only %d ZEXTERN declarations found in %s; the scan is wrong"
+                     % (len(contract), REF))
+
+        # Collect the generated prototypes and function-pointer typedefs.
+        text = nocomment(preprocess(GEN, GEN_DEFS))
+        text = re.sub(r"\b(?:struct|union|enum)\s*\w*\s*\{[^{}]*\}", "SBODY", text)
+        text = re.sub(r'\bextern\s*"C"\s*\{|\}', " ", text)          # rule A3
+        decls, typedefs = {}, {}
+        for statement in text.split(";"):
+            flat = " ".join(statement.split())
+            if not flat or "(" not in flat or "SBODY" in flat:
+                continue
+            if flat.startswith("typedef"):
+                pointer = re.match(r"typedef\s+(.*?)\(\s*\*\s*(\w+)\s*\)\s*\((.*)\)$", flat)
+                if pointer:
+                    typedefs[pointer.group(2)] = (pointer.group(1).strip(),
+                                                  pointer.group(3).strip())
+                continue
+            prototype = re.match(r"^.*?\b(\w+)\s*\(.*\)$", flat)
+            if prototype and prototype.group(1) in contract:
+                decls[prototype.group(1)] = flat
+        if not decls:
+            sys.exit("no contract prototypes found in %s; the scan is wrong" % GEN)
+
+        PREAMBLE = ["#define _LARGEFILE64_SOURCE 1", "#define ZLIB_CONST 1",
+                    "#include <stdarg.h>", "#include <stddef.h>", "#include <stdint.h>",
+                    '#include "zlib.h"'] + ["#undef %s" % name for name in MACRO_FN]
+
+
+        def compile_probe(stem, body):
+            stem = os.path.join(SCRATCH, stem)
+            with open(stem + ".c", "w") as handle:
+                handle.write("\n".join(PREAMBLE + body) + "\n")
+            return run([CC, *STRICT, "-I.", "-fsyntax-only", stem + ".c"])
+
+        # Pass A -- signatures.
+        result = compile_probe("gate_signatures", ["%s;" % decls[n] for n in sorted(decls)])
+        if result.returncode != 0:
+            failures.append("signature identity")
+            print("::error::a generated prototype does not match zlib.h")
+            print(result.stderr[:8000])
+        print("pass A: %d of %d contract signatures compared by the compiler"
+              % (len(decls), len(contract)))
+
+        # Pass A' -- the function-pointer typedefs.
+        body = []
+        for name, (ret, args) in sorted(typedefs.items()):
+            body.append("extern %s zrs_probe_%s;" % (name, name))
+            body.append("extern %s (*zrs_probe_%s)(%s);" % (ret, name, args))
+        result = compile_probe("gate_typedefs", body)
+        if result.returncode != 0:
+            failures.append("function-pointer typedef identity")
+            print("::error::a generated function-pointer typedef does not match zlib.h")
+            print(result.stderr[:4000])
+        print("pass A': typedefs compared: %s" % (", ".join(sorted(typedefs)) or "none"))
+
+
+        def struct_body(text, name):
+            """The balanced body of `typedef struct {...} name;` or `struct name {...};`."""
+            for match in re.finditer(r"\}\s*%s\s*;" % name, text):
+                depth, index = 1, match.start()
+                while index > 0 and depth:
+                    index -= 1
+                    if text[index] == "}":
+                        depth += 1
+                    elif text[index] == "{":
+                        depth -= 1
+                if depth == 0:
+                    return text[index + 1:match.start()]
+            match = re.search(r"\bstruct\s+%s\s*\{" % name, text)
+            if not match:
+                return None
+            depth, index = 1, match.end()
+            while index < len(text) and depth:
+                if text[index] == "{":
+                    depth += 1
+                elif text[index] == "}":
+                    depth -= 1
+                index += 1
+            return text[match.end():index - 1]
+
+
+        def spelling(path, name):
+            """zlib.h declares gzFile_s as a bare tag; the artifact typedefs it (D2)."""
+            text = nocomment(open(path).read())
+            if re.search(r"\}\s*%s\s*;" % name, text):
+                return name
+            if re.search(r"\bstruct\s+%s\s*\{" % name, text):
+                return "struct " + name
+            return None
+
+
+        def field_names(path, name):
+            body = struct_body(nocomment(open(path).read()), name)
+            if body is None:
+                return []
+            names = []
+            for field in body.split(";"):
+                flat = " ".join(field.split())
+                if not flat:
+                    continue
+                trailing = re.findall(r"\b(\w+)\s*(?:\[[^\]]*\])?$", flat)
+                if trailing:
+                    names.append(trailing[0])
+            return names
+
+        # Rule 10 -- collect the object-like macros each side defines.  A
+        # function-like macro never matches, because `-dM` emits its parameter
+        # list with no space before the `(`; a string-valued macro is dropped
+        # here, which is what excludes ZLIB_VERSION per D4.
+        defined = {}
+        for side, path, defs in (("ref", REF, REF_DEFS), ("gen", GEN, GEN_DEFS)):
+            defined[side] = {}
+            for line in run([CC, "-dM", "-E", "-P", "-I.", *defs, path]).stdout.splitlines():
+                macro = re.match(r"#define\s+(\w+)\s+(\S.*)$", line)
+                if macro and not macro.group(1).startswith("_") and '"' not in macro.group(2):
+                    defined[side][macro.group(1)] = macro.group(2)
+        # ZLIB_H is the include guard, not a contract constant.
+        own = {n for n in defined["ref"]
+               if re.match(r"^(Z_|ZLIB_|MAX_|DEF_)", n) and n != "ZLIB_H"}
+        shared = sorted(own & set(defined["gen"]))
+
+
+        def probe_values(path, defs, names, stem):
+            source = ["#define _LARGEFILE64_SOURCE 1", "#define ZLIB_CONST 1",
+                      "#include <stdio.h>", "#include <stddef.h>", "#include <stdint.h>",
+                      '#include "%s"' % path, "int main(void){"]
+            for name in names:
+                source.append('  printf("macro %s = %%lld\\n", (long long)(%s));'
+                              % (name, name))
+            for struct in ABI_STRUCTS:
+                spelled = spelling(path, struct)
+                if spelled is None:
+                    continue
+                source.append('  printf("size %s = %%lu\\n", (unsigned long)sizeof(%s));'
+                              % (struct, spelled))
+                for field in field_names(path, struct):
+                    source.append('  printf("field %s.%s = %%lu %%lu\\n",'
+                                  ' (unsigned long)offsetof(%s,%s),'
+                                  ' (unsigned long)sizeof(((%s*)0)->%s));'
+                                  % (struct, field, spelled, field, spelled, field))
+            source += ["  return 0;", "}"]
+            stem = os.path.join(SCRATCH, stem)
+            with open(stem + ".c", "w") as handle:
+                handle.write("\n".join(source) + "\n")
+            built = run([CC, "-std=c99", "-I.", *defs, "-o", stem, stem + ".c"])
+            if built.returncode != 0:
+                return None, built.stderr
+            return run([os.path.join(".", stem)]).stdout, ""
+
+        # Rule 10 keeps only the names defined to an INTEGER CONSTANT
+        # EXPRESSION.  Rather than guess which those are, build the reference
+        # probe and drop whatever the compiler rejects, then retry.
+        candidates = list(shared)
+        while True:
+            ref_out, error = probe_values(REF, REF_DEFS, candidates, "gate_ref")
+            if ref_out is not None:
+                break
+            rejected = {n for n in candidates if re.search(r"\b%s\b" % n, error)}
+            if not rejected:
+                sys.exit("the reference probe will not build:\n" + error[:4000])
+            candidates = [n for n in candidates if n not in rejected]
+        gen_out, error = probe_values(GEN, GEN_DEFS, candidates, "gate_gen")
+        if gen_out is None:
+            failures.append("generated probe build")
+            print("::error::the generated header cannot express something zlib.h can")
+            print(error[:4000])
+            gen_out = ""
+
+        ref_lines, gen_lines = ref_out.splitlines(), gen_out.splitlines()
+        if ref_lines != gen_lines:
+            failures.append("struct fields / macro values")
+            print("::error::a struct field or an integer constant differs")
+            for left, right in zip(ref_lines, gen_lines):
+                if left != right:
+                    print("MISMATCH  zlib.h: %-44s generated: %s" % (left, right))
+            for only in sorted(set(ref_lines) ^ set(gen_lines)):
+                print("ONE SIDE ONLY: %s" % only)
+        print("pass B: %d integer macros, %d struct sizes and %d struct fields compared"
+              % (sum(l.startswith("macro") for l in ref_lines),
+                 sum(l.startswith("size") for l in ref_lines),
+                 sum(l.startswith("field") for l in ref_lines)))
+        excluded = sorted(set(shared) - set(candidates))
+        print("pass B excluded, not an integer constant expression (D4): %s"
+              % (", ".join(excluded) or "none"))
+
+        if failures:
+            print("::error::header conformance FAILED: %s" % "; ".join(failures))
+            sys.exit(1)
+        print("header conformance: PASS")
+        SHAPE_GATE
+
+    - name: Upload build errors
+      uses: actions/upload-artifact@v6
+      if: failure()
+      with:
+        name: header-conformance
+        path: |
+          generated_zlib.h
+          generated_zlib.h.warn
+          generated_zlib.h.log
+          generated_zlib.h.ref
+          generated_zlib.h.gen
+          target/header-gate/*.c
+        retention-days: 7
+
+
+  # ---------------------------------------------------------------------------
+  # 9. Drop-in replacement: the three C drivers already in this tree, compiled
+  # WITH ZERO EDITS and linked against the Rust library.
+  #
+  # Their `#include "zlib.h"` stays byte for byte as written.  That invariance
+  # is the operational definition of drop-in compatibility, so this job never
+  # patches, wraps or regenerates them, and it never passes an extra -D to make
+  # them agree.
+  #
+  # THE ldd ASSERTION IS THE WHOLE JOB.  Without it this is theatre, and that is
+  # not a figure of speech -- it was reproduced.  The library declares SONAME
+  # libz.so.1, so the loader searches for a file literally called libz.so.1; if
+  # the link directory holds only libz.so, the loader falls through to
+  # /lib/x86_64-linux-gnu/libz.so.1 and the driver runs happily against the
+  # SYSTEM zlib, printing the system library's version, while -L and -rpath both
+  # point at the Rust build.  Every test passes and nothing under test was
+  # exercised.  So: create the symlinks, then PROVE with ldd which library got
+  # bound, and fail hard if it is the wrong one -- an ldd line echoed into the
+  # log is exactly how this gate rots.
+  #
+  # SYMLINK DIRECTION.  Makefile.in makes the REAL file the versioned name and
+  # points libz.so and libz.so.1 at it.  The staging directory below is the
+  # other way round -- the real file is copied in as libz.so and the two other
+  # names are symlinks TO it -- because that is the shape a cargo-shaped
+  # artifact has, and copying the Makefile idiom blindly here would produce two
+  # dangling links and a gate that fails for the wrong reason.
+  #
+  # WHICH LIBRARY EACH DRIVER LINKS.  example.c and minigzip.c link the shared
+  # object.  infcover.c CANNOT: it calls inflate_table, which zlib.map lists
+  # under `local:` and which is therefore hidden in both implementations, so it
+  # links the static archive -- exactly what the C build does for its own
+  # `cover` target.  Its assertion is the mirror image: it must have NO dynamic
+  # libz at all.
+  # ---------------------------------------------------------------------------
+  dropin:
+    name: Drop-in C drivers
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      run: rustup toolchain install stable --profile minimal
+
+    - name: Compile source code
+      # The first line is the project's own stated C-ABI build command.  The
+      # second is the packaging step, and it is required rather than belt and
+      # braces: cargo's cdylib gives no dynamic entry to the three symbols that
+      # arrive from the C shim archive, and example.c calls gzprintf, which is
+      # one of them.  `make rust` relinks the archive through zlib.map with the
+      # right SONAME, so the staged library is the one that can actually satisfy
+      # these drivers.  It needs no ./configure -- the checked-in Makefile
+      # forwards the rust* targets to Makefile.in.
+      run: |
+        set -eu
+        cargo build --locked --release --features libz-compat
+        make rust CARGO=cargo
+
+    - name: Generate project files
+      # Stage the artifact the way an installation would, with the versioned
+      # name derived from the immutable zlib.h rather than hard-coded.
+      run: |
+        set -eu
+        ZVER=$(sed -n 's/^.*define ZLIB_VERSION "\(.*\)".*$/\1/p' zlib.h)
+        [ -n "$ZVER" ] || { echo "::error::no ZLIB_VERSION in zlib.h"; exit 1; }
+        D="$PWD/target/dropin-stage"
+        rm -rf "$D"
+        mkdir -p "$D"
+        cp -L target/dropin/libz.so "$D/libz.so"
+        cp    target/dropin/libz.a  "$D/libz.a"
+        ln -sf libz.so "$D/libz.so.1"
+        ln -sf libz.so "$D/libz.so.$ZVER"
+        ls -l "$D"
+        # A dangling link here would send the loader back to the system library,
+        # which is the failure this whole job exists to detect.
+        for link in "$D/libz.so.1" "$D/libz.so.$ZVER"; do
+          [ -e "$link" ] || { echo "::error::$link is a dangling symlink"; exit 1; }
+        done
+        echo "ZVER=$ZVER"     >> "$GITHUB_ENV"
+        echo "DROPIN=$D"      >> "$GITHUB_ENV"
+
+    - name: Run test cases
+      run: |
+        set -eu
+        D="$DROPIN"
+
+        # --- the SONAME the loader will search for --------------------------
+        readelf -d "$D/libz.so" | grep -i soname || true
+        readelf -d "$D/libz.so" | grep -qE 'SONAME.*\[libz\.so\.1\]' || {
+          echo "::error::the staged library does not declare SONAME libz.so.1"; exit 1; }
+
+        # --- compile the three drivers, unmodified --------------------------
+        cc -I. -O2 -o "$D/example_rust"  test/example.c  -L"$D" -lz -Wl,-rpath,"$D"
+        cc -I. -O2 -o "$D/minigzip_rust" test/minigzip.c -L"$D" -lz -Wl,-rpath,"$D"
+        cc -I. -O2 -o "$D/infcover_rust" test/infcover.c "$D/libz.a"
+        echo "example.c, minigzip.c and infcover.c all compiled with zero edits"
+
+        # --- PROVE which libz is bound, before running anything ------------
+        for driver in example_rust minigzip_rust; do
+          ldd "$D/$driver" > "$D/$driver.ldd" 2>&1
+          grep -i libz "$D/$driver.ldd" || true
+          grep -F -q "$D/libz" "$D/$driver.ldd" || {
+            echo "::error::$driver did not bind the Rust library; libz resolved elsewhere (most likely the system zlib, which means the versioned symlinks are missing)"
+            cat "$D/$driver.ldd"
+            exit 1
+          }
+        done
+        echo "ldd: example_rust and minigzip_rust both bind $D/libz.so.1"
+        # infcover links the archive because inflate_table is hidden, so the
+        # inverse has to hold: no dynamic libz may be involved at all.
+        ldd "$D/infcover_rust" > "$D/infcover_rust.ldd" 2>&1 || true
+        if grep -qi libz "$D/infcover_rust.ldd"; then
+          echo "::error::infcover_rust has a dynamic libz dependency; it must link the static archive"
+          cat "$D/infcover_rust.ldd"
+          exit 1
+        fi
+        echo "ldd: infcover_rust has no dynamic libz, so it exercised the Rust archive"
+
+        # --- run them -------------------------------------------------------
+        # example.c compares ITS OWN compile-time ZLIB_VERSION against what the
+        # library reports and prints zlibCompileFlags().  The version string is
+        # asserted because deflateInit_ and inflateInit_ reject a major
+        # mismatch, so it has to come back verbatim.  The compile flags are NOT
+        # asserted against a literal: the value is computed from this target's
+        # own type sizes and build configuration, so a literal would be wrong on
+        # the next target along.
+        "$D/example_rust" "$D/tmp.gz" | tee "$D/example.out"
+        rm -f "$D/tmp.gz"
+        grep -q "zlib version $ZVER = " "$D/example.out" || {
+          echo "::error::example.c did not report zlibVersion() as $ZVER"; exit 1; }
+        echo "zlibVersion() reported $ZVER verbatim"
+
+        echo 'hello world' > "$D/plain.txt"
+        "$D/minigzip_rust" < "$D/plain.txt" > "$D/plain.gz"
+        "$D/minigzip_rust" -d < "$D/plain.gz" > "$D/roundtrip.txt"
+        cmp "$D/plain.txt" "$D/roundtrip.txt" || {
+          echo "::error::minigzip did not round-trip"; exit 1; }
+        echo "minigzip round-trip byte-for-byte identical"
+
+        # infcover is the most demanding of the three.  Its instrumented
+        # allocator fills every block with 0xa5 rather than zero, so any path
+        # that assumed zero-initialised memory shows up here; its mem_done()
+        # detects leaks, non-LIFO frees and rogue frees through the injected
+        # zalloc/zfree hooks, which is a direct test of the caller-allocator
+        # contract; and its mem_limit() forces Z_MEM_ERROR at chosen points,
+        # reaching error paths fuzzing finds only by luck.
+        "$D/infcover_rust"
+        echo "drop-in replacement: PASS"
+
+    - name: Upload build errors
+      uses: actions/upload-artifact@v6
+      if: failure()
+      with:
+        name: dropin-c-drivers
+        path: |
+          target/dropin-stage/*.ldd
+          target/dropin-stage/example.out
+          target/dropin/soname.stage
+        retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 10. Miri over the safe core.
+  #
+  # Miri is a NIGHTLY-ONLY component, which is why this job installs nightly
+  # with both `miri` and `rust-src`, and why every invocation says `+nightly`
+  # explicitly: rust-toolchain.toml pins stable on purpose and does not name a
+  # nightly, so the command line is the override mechanism.
+  #
+  # SCOPE IS `-p zlib-rs` AND MUST NOT BECOME `--workspace`.  zlib-rs is the
+  # safe core: #![forbid(unsafe_code)], no_std + alloc, zero dependencies, and
+  # no FFI whatsoever, which is precisely what lets Miri analyse it
+  # exhaustively.  Widening this to the workspace would pull in
+  # zlib-rs-differential, whose whole purpose is to call the C oracle -- and
+  # Miri cannot execute foreign functions, so the job would fail for a reason
+  # that has nothing to do with undefined behaviour.  The likely repair for that
+  # failure is deleting the gate, so do not create the situation.  libz-rs-sys,
+  # the crate that does hold raw pointers, is covered by the AddressSanitizer
+  # job below instead.
+  #
+  # Miri interprets rather than executes, so it runs orders of magnitude slower
+  # than native.  The core already marks its corpus-folding tests
+  # #[cfg_attr(miri, ignore = "...")] with the reason spelled out, which is what
+  # keeps this finite; the generous timeout below is the budget, and the right
+  # response to exceeding it is to shard the run by module filter -- for
+  # instance `-- deflate::` and `-- inflate::`, whose union is the whole suite --
+  # NOT to narrow what is checked.
+  # ---------------------------------------------------------------------------
+  miri:
+    name: Miri (safe core)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      run: |
+        rustup toolchain install nightly --profile minimal --component miri,rust-src
+        cargo +nightly miri --version
+
+    - name: Run test cases
+      run: cargo +nightly miri test -p zlib-rs
+
+  # ---------------------------------------------------------------------------
+  # 11. AddressSanitizer over the C ABI facade, and over the C drivers linked
+  # against it.
+  #
+  # This is the counterpart to the Miri job.  libz-rs-sys is the only crate
+  # allowed to use `unsafe`, it carries #![deny(unsafe_op_in_unsafe_fn)] so that
+  # each unsafe operation is individually scoped, and it is where the six
+  # unavoidable unsafe site categories live: validating a caller's z_streamp,
+  # rebuilding the (next_in, avail_in) and (next_out, avail_out) slices, the
+  # opaque `state` round-trip, calling the caller's zalloc/zfree, C strings and
+  # varargs, and writing through a caller's gz_header with the extra_max /
+  # name_max / comm_max clamps.  ASan is what exercises those with real
+  # pointers, which Miri cannot do.
+  #
+  # RUSTDOCFLAGS IS NOT OPTIONAL HERE.  Setting only RUSTFLAGS instruments the
+  # library but not the doctest binaries, because rustdoc does not read
+  # RUSTFLAGS; the doctests then fail to link with undefined __asan_* symbols.
+  # Measured, and fixed by setting both.
+  #
+  # `-Zbuild-std` would additionally instrument the standard library.  It is
+  # left off deliberately: it multiplies build time, and everything this job is
+  # aimed at -- the facade's own unsafe blocks and the caller-supplied allocator
+  # path -- is already instrumented without it.  An explicit --target is still
+  # required, because a sanitizer must not be applied to build scripts and
+  # proc-macros compiled for the host.
+  # ---------------------------------------------------------------------------
+  asan:
+    name: AddressSanitizer (C ABI facade)
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      run: |
+        rustup toolchain install nightly --profile minimal --component rust-src
+        cargo +nightly --version
+
+    - name: Run test cases (facade under ASan)
+      env:
+        RUSTFLAGS: -Zsanitizer=address
+        RUSTDOCFLAGS: -Zsanitizer=address
+        ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:strict_string_checks=1
+      run: cargo +nightly test --locked -p libz-rs-sys --target x86_64-unknown-linux-gnu
+
+    - name: Compile source code (instrumented archive)
+      # An instrumented archive for the C drivers.  A dedicated CARGO_TARGET_DIR
+      # keeps the sanitized objects away from the ordinary build cache AND makes
+      # the artifact path deterministic, which matters because the facade builds
+      # under several feature configurations.
+      env:
+        CARGO_TARGET_DIR: target/asan
+        RUSTFLAGS: -Zsanitizer=address
+        CFLAGS: -fsanitize=address -fno-omit-frame-pointer -O1 -g
+      run: |
+        set -eu
+        cargo +nightly build --locked -p libz-rs-sys --features libz-compat,gz \
+          --target x86_64-unknown-linux-gnu
+        A=target/asan/x86_64-unknown-linux-gnu/debug/libz.a
+        [ -f "$A" ] || { echo "::error::$A was not produced"; exit 1; }
+        echo "ASANLIB=$PWD/$A" >> "$GITHUB_ENV"
+
+    - name: Run test cases (C drivers under ASan)
+      env:
+        ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:abort_on_error=1
+      run: |
+        set -eu
+        D="$PWD/target/asan-drivers"
+        rm -rf "$D"
+        mkdir -p "$D"
+        for driver in example minigzip infcover; do
+          cc -I. -O1 -g -fsanitize=address -fno-omit-frame-pointer \
+            -o "$D/${driver}_asan" "test/$driver.c" "$ASANLIB" -fsanitize=address
+        done
+        echo "all three drivers linked against the instrumented archive"
+        "$D/example_asan" "$D/tmp.gz"
+        rm -f "$D/tmp.gz"
+        echo 'hello world' | "$D/minigzip_asan" | "$D/minigzip_asan" -d
+        "$D/infcover_asan"
+        echo "AddressSanitizer: PASS"
+
+    - name: Upload build errors
+      uses: actions/upload-artifact@v6
+      if: failure()
+      with:
+        name: asan
+        path: |
+          target/asan-drivers/
+        retention-days: 7
+
+
+  # ---------------------------------------------------------------------------
+  # 12. cargo-fuzz over the five Rust entry points, 300 seconds each.
+  #
+  # The budget matches fuzz.yml's existing `fuzz-seconds: 300`, deliberately, so
+  # that the Rust numbers and the OSS-Fuzz numbers on the C oracle are
+  # comparable.  This job does not replace fuzz.yml and fuzz.yml does not
+  # replace this job: two implementations, two fuzzers.
+  #
+  # fuzz/ IS ITS OWN CARGO WORKSPACE.  The root Cargo.toml declares
+  # `exclude = ["fuzz"]` and the fuzz crate carries its own Cargo.lock, so every
+  # command here runs with `working-directory: fuzz`; a `--locked` invocation
+  # from the repository root would not resolve these targets at all.  cargo-fuzz
+  # itself has no `--locked` pass-through, so the lockfile is proved separately
+  # with `cargo fetch --locked` before the run -- otherwise the one crate whose
+  # dependencies are pinned by a committed lockfile would be the one crate that
+  # never checks it.
+  #
+  # nightly is required for the sanitizer instrumentation libFuzzer needs.
+  #
+  # The gate is zero crashes and zero hangs, which is the exit status: libFuzzer
+  # returns non-zero and writes a reproducer under fuzz/artifacts/ on any
+  # finding, and that directory is uploaded so the input is not lost with the
+  # runner.  fuzz_inflate is the most important of the five -- inflate is the
+  # entry point that consumes untrusted bytes -- and must never panic, hang or
+  # over-read.
+  # ---------------------------------------------------------------------------
+  fuzz:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Fuzz deflate
+            target: fuzz_deflate
+
+          - name: Fuzz inflate
+            target: fuzz_inflate
+
+          - name: Fuzz inflateBack
+            target: fuzz_inflate_back
+
+          - name: Fuzz gz round-trip
+            target: fuzz_gz_roundtrip
+
+          - name: Fuzz checksums
+            target: fuzz_checksum
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      run: |
+        rustup toolchain install nightly --profile minimal
+        cargo install cargo-fuzz --locked --version 0.13.2
+        cargo +nightly fuzz --version
+
+    - name: Generate project files
+      # Proves fuzz/Cargo.lock resolves with no drift, which cargo-fuzz cannot
+      # be asked to do itself, and confirms the target name is one this crate
+      # actually declares -- a typo would otherwise turn the gate into a
+      # no-op-shaped error.
+      run: |
+        set -eu
+        cargo +nightly fetch --locked
+        mkdir -p target
+        cargo +nightly fuzz list > target/targets.txt
+        cat target/targets.txt
+        grep -qx '${{ matrix.target }}' target/targets.txt || {
+          echo "::error::${{ matrix.target }} is not a declared fuzz target"; exit 1; }
+      working-directory: fuzz
+
+    - name: Run Fuzzers
+      run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300
+      working-directory: fuzz
+
+    - name: Upload Crash
+      uses: actions/upload-artifact@v6
+      if: failure()
+      with:
+        name: fuzz-artifacts-${{ matrix.target }}
+        path: |
+          fuzz/artifacts/
+        retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 13. The criterion regression gate: throughput, and per-stream memory.
+  #
+  # The three bench files are explicit that they REPORT and never enforce --
+  # "the pass/fail decision belongs to the criterion regression job that
+  # AAP 0.4.1.6 places in .github/workflows/rust.yml" -- so THIS STEP IS THE
+  # DECISION.  If it is ever softened, nothing anywhere enforces the
+  # performance targets.
+  #
+  # The limits: throughput within 10% of the C implementation for decompression
+  # and for compression at levels 1, 6 and 9, and per-stream memory within 15%.
+  # Both numbers come out of the summary lines the benches print to stderr:
+  #
+  #   <bench>: RATIO-SUMMARY  group=G cases=N gated=K over=M informational=I limit=1.10
+  #   <bench>: MEMORY-SUMMARY group=G cases=N over=M dirty=D limit=1.15
+  #   <bench>: ALLOC-BALANCE  side=S case=C allocations=.. frees=.. live_bytes=..
+  #                           notlifo=.. rogue=.. verdict=clean|dirty
+  #
+  # `over` counts ONLY the gated cases, so reading it is reading exactly the
+  # stated gate: sub-page payloads are measured and printed with their own
+  # verdict but marked gate=informational, because a few hundred nanoseconds of
+  # entry validation and stream reset is not a bytes-per-second bound.
+  # `verdict=dirty` on an ALLOC-BALANCE line means deflateEnd did not return
+  # every block, a block came back out of LIFO order, or a pointer the counter
+  # never handed out was freed through it -- the same class of defect
+  # test/infcover.c's mem_done() looks for, here measured through the
+  # instrumented zalloc high-water counter that AAP 0.6.4.6 names.
+  #
+  # The parser is anchored on the `<name>_bench: ` prefix on purpose: the benches
+  # also print their own format documentation, and that prose contains the
+  # literal text RATIO-SUMMARY inside backticks.  A loose grep would count it as
+  # a data line.
+  #
+  # NO CORPUS IS DOWNLOADED, HERE OR ANYWHERE IN THIS FILE.  The committed
+  # minimal corpus drives every gate.  The Silesia corpus that the performance
+  # targets name is opt-in only: crates/zlib-rs-differential/corpus has a script
+  # for a human to run, the benches skip their tier-2 groups with an explicit
+  # message and exit zero when it is absent, and CI must stay network-free.  That
+  # script is never invoked from this file.
+  # ---------------------------------------------------------------------------
+  bench:
+    name: Benchmark regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      run: rustup toolchain install stable --profile minimal
+
+    - name: Install packages (Linux)
+      # The benches measure the port against the in-process C oracle, so the
+      # differential crate's build.rs needs a C compiler here too.
+      run: cc --version
+
+    - name: Compile source code
+      # The three benches live at the repository root but are wired as [[bench]]
+      # entries of crates/zlib-rs-differential with an explicit `path`, and that
+      # crate is not a default workspace member.  `-p zlib-rs-differential` is
+      # therefore required: a bare `cargo bench` from the root finds nothing and
+      # would report success having measured nothing at all.
+      run: cargo bench --locked -p zlib-rs-differential --no-run
+
+    - name: Run test cases
+      run: |
+        set -eu
+        set -o pipefail
+        mkdir -p target/bench
+        cargo bench --locked -p zlib-rs-differential 2>&1 | tee target/bench/bench.log
+
+    - name: Run test cases (gate the measurements)
+      run: |
+        set -eu
+        python3 - <<'BENCH_GATE'
+        import re
+        import sys
+
+        LOG = "target/bench/bench.log"
+        # Anchored on the bench's own log prefix so that the format
+        # documentation the benches print cannot be parsed as data.
+        SUMMARY = re.compile(r"^(?P<bench>\w+_bench): "
+                             r"(?P<kind>RATIO|MEMORY)-SUMMARY (?P<rest>group=\S+.*)$")
+        BALANCE = re.compile(r"^(?P<bench>\w+_bench): ALLOC-BALANCE (?P<rest>side=\S+.*)$")
+        CASE = re.compile(r"^(?P<bench>\w+_bench): (RATIO|MEMORY) (?P<rest>group=\S+.*)$")
+
+
+        def pairs(text):
+            return dict(part.split("=", 1) for part in text.split() if "=" in part)
+
+
+        with open(LOG, encoding="utf-8", errors="replace") as handle:
+            lines = [line.rstrip("\n") for line in handle]
+
+        summaries, balances, cases, failures = [], [], [], []
+        for line in lines:
+            match = SUMMARY.match(line)
+            if match:
+                summaries.append((match.group("bench"), match.group("kind"),
+                                  pairs(match.group("rest"))))
+                continue
+            match = BALANCE.match(line)
+            if match:
+                balances.append((match.group("bench"), pairs(match.group("rest"))))
+                continue
+            match = CASE.match(line)
+            if match:
+                cases.append((match.group("bench"), pairs(match.group("rest"))))
+
+        throughput = [s for s in summaries if s[1] == "RATIO"]
+        memory = [s for s in summaries if s[1] == "MEMORY"]
+
+        # A gate that measured nothing must not report success.  This is the
+        # guard against a bench that silently found no corpus, no oracle or no
+        # group to run.
+        if not throughput:
+            failures.append("no RATIO-SUMMARY line was produced: the throughput "
+                            "gate did not run")
+        if not memory:
+            failures.append("no MEMORY-SUMMARY line was produced: the memory gate "
+                            "did not run")
+        if not balances:
+            failures.append("no ALLOC-BALANCE line was produced: the allocator "
+                            "balance check did not run")
+
+        print("%-16s %-8s %-26s %6s %6s %6s %6s" %
+              ("bench", "kind", "group", "cases", "gated", "over", "limit"))
+        for bench, kind, field in summaries:
+            print("%-16s %-8s %-26s %6s %6s %6s %6s" %
+                  (bench, kind, field.get("group", "?"), field.get("cases", "?"),
+                   field.get("gated", "-"), field.get("over", "?"),
+                   field.get("limit", "?")))
+
+        for bench, kind, field in summaries:
+            group = field.get("group", "?")
+            limit = field.get("limit", "?")
+            over = int(field.get("over", "0"))
+            if over:
+                what = "throughput" if kind == "RATIO" else "memory"
+                failures.append("%s %s: %d gated case(s) in group %s exceeded the "
+                                "%s limit of %s" % (bench, what, over, group, what, limit))
+            dirty = int(field.get("dirty", "0"))
+            if dirty:
+                failures.append("%s: %d case(s) in group %s reported a dirty "
+                                "allocator balance" % (bench, dirty, group))
+
+        for bench, field in balances:
+            if field.get("verdict") != "clean":
+                failures.append("%s: allocator balance for side=%s case=%s is %s "
+                                "(live_bytes=%s notlifo=%s rogue=%s)" %
+                                (bench, field.get("side"), field.get("case"),
+                                 field.get("verdict"), field.get("live_bytes"),
+                                 field.get("notlifo"), field.get("rogue")))
+
+        if failures:
+            print()
+            print("The cases that exceeded their limit:")
+            for bench, field in cases:
+                if field.get("verdict") == "over" and field.get("gate") != "informational":
+                    print("  %s %s / %s  ratio=%s limit=%s" %
+                          (bench, field.get("group"), field.get("case"),
+                           field.get("ratio"), field.get("limit")))
+            for failure in failures:
+                print("::error::%s" % failure)
+            print()
+            print("Only OUTPUT-NEUTRAL remedies are admissible, because the "
+                  "differential job asserts byte-identical output: the `simd` "
+                  "feature for the checksum backends, memory-copy strategy, "
+                  "branch layout, fat LTO with one codegen unit at opt-level 3, "
+                  "and the -Cllvm-args=-enable-dfa-jump-thread codegen flag. "
+                  "Changing match selection, the lazy-match threshold, "
+                  "hash-chain traversal or Huffman tie-breaking is NOT "
+                  "admissible however much faster it would be: every one of "
+                  "those changes the emitted bytes.")
+            sys.exit(1)
+
+        print()
+        print("benchmark regression: PASS -- %d throughput group(s), %d memory "
+              "group(s) and %d allocator balance line(s), none over limit"
+              % (len(throughput), len(memory), len(balances)))
+        BENCH_GATE
+
+    - name: Upload build errors
+      uses: actions/upload-artifact@v6
+      if: failure()
+      with:
+        name: benchmark-regression
+        path: |
+          target/bench/bench.log
+          target/criterion/
+        retention-days: 7
