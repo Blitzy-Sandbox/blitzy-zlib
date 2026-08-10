@@ -248,6 +248,108 @@ if(ZLIB_BUILD_STATIC)
     endif(HAVE_OFF64_T)
 endif(ZLIB_BUILD_STATIC)
 
+# minigzip and static_minigzip are built above and, until now, never run: no
+# add_test named either of them, so the one driver in this directory that
+# exercises the gzFile layer as a program -- gzopen, gzwrite, gzread, gzclose
+# and gzerror over a real file, rather than the in-memory calls example.c makes
+# -- went untested by ctest in both implementations.  A round trip through the
+# file format is what closes that: whatever the library does to the bytes on the
+# way out it has to undo on the way back in, and the gzip container carries its
+# own CRC-32 and length check, so a defect anywhere in that path either aborts
+# the driver or shows up as a difference at the end.
+#
+# Four cases per driver rather than one, because minigzip removes its input --
+# file_compress() unlinks the file it compressed and file_uncompress() unlinks
+# the archive -- so the input has to be re-made on every run for the suite to be
+# repeatable, and no single command can both stage a file and compress it.  They
+# are chained with fixtures so that ctest orders them under `-j' and pulls the
+# whole chain in when only one of them is selected, and each driver gets a
+# working directory of its own so the two chains never touch the same file: the
+# case that fails is then the step that broke, not a collision.
+set(ZLIB_MINIGZIP_DRIVERS "")
+
+if(ZLIB_BUILD_SHARED)
+    list(APPEND ZLIB_MINIGZIP_DRIVERS minigzip)
+endif(ZLIB_BUILD_SHARED)
+
+if(ZLIB_BUILD_STATIC)
+    list(APPEND ZLIB_MINIGZIP_DRIVERS static_minigzip)
+endif(ZLIB_BUILD_STATIC)
+
+# The corpus is a file the tree already carries, so nothing has to be generated
+# and the expected result needs no separate copy: the same path is both the
+# input and what the restored file is compared against.  zlib.h is ~100 kB of
+# text, which compresses to roughly a quarter of that and is large enough to
+# cycle gzwrite's and gzread's internal buffers many times over, and it is
+# immutable, so the case cannot drift.  It is only ever read: the copy below is
+# what minigzip consumes and removes.
+set(ZLIB_MINIGZIP_INPUT ${zlib_SOURCE_DIR}/zlib.h)
+
+foreach(driver IN LISTS ZLIB_MINIGZIP_DRIVERS)
+    set(ZLIB_MINIGZIP_WORKDIR ${CMAKE_CURRENT_BINARY_DIR}/${driver}_roundtrip)
+    file(MAKE_DIRECTORY ${ZLIB_MINIGZIP_WORKDIR})
+
+    add_test(NAME zlib_${driver}_roundtrip_prepare
+             COMMAND ${CMAKE_COMMAND} -E copy ${ZLIB_MINIGZIP_INPUT}
+                     ${ZLIB_MINIGZIP_WORKDIR}/roundtrip.dat)
+    add_test(
+        NAME zlib_${driver}_roundtrip_compress
+        COMMAND ${driver} roundtrip.dat
+        WORKING_DIRECTORY ${ZLIB_MINIGZIP_WORKDIR})
+    add_test(
+        NAME zlib_${driver}_roundtrip_decompress
+        COMMAND ${driver} -d roundtrip.dat.gz
+        WORKING_DIRECTORY ${ZLIB_MINIGZIP_WORKDIR})
+    add_test(
+        NAME zlib_${driver}_roundtrip_verify
+        COMMAND ${CMAKE_COMMAND} -E compare_files
+                ${ZLIB_MINIGZIP_WORKDIR}/roundtrip.dat ${ZLIB_MINIGZIP_INPUT})
+
+    set_tests_properties(zlib_${driver}_roundtrip_prepare
+                         PROPERTIES FIXTURES_SETUP ${driver}_input)
+    set_tests_properties(
+        zlib_${driver}_roundtrip_compress
+        PROPERTIES FIXTURES_REQUIRED ${driver}_input FIXTURES_SETUP
+                   ${driver}_gz)
+    set_tests_properties(
+        zlib_${driver}_roundtrip_decompress
+        PROPERTIES FIXTURES_REQUIRED ${driver}_gz FIXTURES_SETUP ${driver}_out)
+    set_tests_properties(zlib_${driver}_roundtrip_verify
+                         PROPERTIES FIXTURES_REQUIRED ${driver}_out)
+
+    # The shared driver needs the library's directory on PATH on the platforms
+    # where that is how a dynamic library is found, for the same reason
+    # zlib_example does above.  The static driver does not, and neither do the
+    # other two cases in the chain, which run CMake rather than the driver.
+    if(MSVC
+       OR MSYS
+       OR MINGW
+       OR CYGWIN)
+        if(NOT driver STREQUAL static_minigzip)
+            zlib_findtestenv(zlib_${driver}_roundtrip_compress)
+            zlib_findtestenv(zlib_${driver}_roundtrip_decompress)
+        endif(NOT driver STREQUAL static_minigzip)
+    endif(
+        MSVC
+        OR MSYS
+        OR MINGW
+        OR CYGWIN)
+endforeach(driver IN LISTS ZLIB_MINIGZIP_DRIVERS)
+
+# Everything from here on consumes an installation: the fixture that produces
+# one, the three find_package cases that resolve a package out of it, and the
+# two add_subdirectory cases that are handed it as their install prefix.  With
+# ZLIB_INSTALL OFF this project installs nothing, so none of them can pass --
+# upstream they are registered all the same and four of them fail outright,
+# taking their dependents with them, identically in C and in Rust mode -- and a
+# case that cannot pass measures nothing while making a legitimate configuration
+# look broken.  Registering them only when there is an installation to consume
+# leaves every other configuration's set of cases exactly as it was,
+# ZLIB_INSTALL being ON by default.
+if(NOT ZLIB_INSTALL)
+    return()
+endif(NOT ZLIB_INSTALL)
+
 add_test(
     NAME zlib_install
     COMMAND ${CMAKE_COMMAND} --install ${zlib_BINARY_DIR} --prefix
@@ -323,6 +425,42 @@ set_tests_properties(
 set_tests_properties(
     zlib_find_package_test PROPERTIES FIXTURES_REQUIRED fp_build ENVIRONMENT
                                       CTEST_OUTPUT_ON_FAILURE=1)
+
+# The loader assertion above covers the build tree; this one covers the
+# installed prefix, which is a different chain of names produced by a different
+# set of rules -- install() copies the versioned library and its three links
+# separately -- so a build that staged the chain correctly and installed it
+# incompletely would satisfy the first case and not this one.  It asserts
+# against the consumer the fixture directly above has just built out of that
+# installation, which is the same thing a real consumer does:
+# find_package(ZLIB), link, run.  The expressions are the ones the build-tree
+# case uses and are explained there; the installed prefix lives under this build
+# directory, so a SONAME resolving into a system prefix still fails.
+#
+# The path cannot come from a generator expression because the executable
+# belongs to a nested project this build does not know the targets of, which is
+# also why the case is registered only for a single-configuration generator:
+# there the consumer's build directory holds the executable directly, whereas a
+# multi-config generator puts it in a per-configuration subdirectory this file
+# cannot name.  That is the same boundary the staged drop-in already documents.
+if(ZLIB_BUILD_RUST
+   AND ZLIB_BUILD_SHARED
+   AND LDD_EXECUTABLE
+   AND NOT IS_MULTI)
+    add_test(
+        NAME zlib_rust_loader_binding_installed
+        COMMAND ${LDD_EXECUTABLE}
+                ${CMAKE_CURRENT_BINARY_DIR}/findpackage_test_build/test_example)
+    set_tests_properties(
+        zlib_rust_loader_binding_installed
+        PROPERTIES FIXTURES_REQUIRED fp_build PASS_REGULAR_EXPRESSION
+                   "libz\\.so\\.1 => /" FAIL_REGULAR_EXPRESSION
+                   "libz\\.so\\.1 => /(usr/)?lib")
+endif(
+    ZLIB_BUILD_RUST
+    AND ZLIB_BUILD_SHARED
+    AND LDD_EXECUTABLE
+    AND NOT IS_MULTI)
 
 #
 # findpackage_no_components_test
@@ -440,8 +578,14 @@ set_tests_properties(
     zlib_add_subdirectory_exclude_configure
     PROPERTIES FIXTURES_REQUIRED zlib_install FIXTURES_SETUP asx_config)
 
+# asx_config, not as_config: this build belongs to the exclude fixture set up
+# directly above, and requiring the other fixture's configure step is what let
+# `ctest -j' start this build before its own configure had run -- reproducible
+# in both C and Rust mode, and visible even serially as `ctest -R
+# ^zlib_add_subdirectory_exclude_build$' pulling in the wrong prerequisite and
+# reporting Not Run.
 set_tests_properties(
-    zlib_add_subdirectory_exclude_build PROPERTIES FIXTURES_REQUIRED as_config
+    zlib_add_subdirectory_exclude_build PROPERTIES FIXTURES_REQUIRED asx_config
                                                    FIXTURES_SETUP asx_build)
 
 set_tests_properties(

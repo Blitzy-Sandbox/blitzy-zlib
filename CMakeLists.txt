@@ -83,6 +83,34 @@ if(ZLIB_BUILD_RUST)
         OR (CMAKE_SYSTEM_NAME STREQUAL AIX)
         OR (CMAKE_SYSTEM_NAME STREQUAL SunOS))
 
+    # ZLIB_PREFIX rewrites every public name to z_* -- zconf.h.in L11-L21 does
+    # it with the preprocessor for a caller, and the C library gets the prefixed
+    # names because it is compiled through that same header.  The staged Rust
+    # library cannot: its exported names come from the #[no_mangle] surface of
+    # crates/libz-rs-sys and from the ZEXTERN declarations in the unmodified
+    # zlib.h, so it publishes the unprefixed family and could never satisfy a
+    # consumer compiled against a prefixed header.  Left to itself the
+    # combination reaches the linker and fails there with undefined references
+    # to z_zlibVersion and its neighbours, which says nothing about the cause,
+    # so it is refused here where the reason can be given.  Note that
+    # ZLIB_PREFIX does not currently build in the C configuration either --
+    # minigzip.c fails the same way -- but that is upstream behaviour this port
+    # neither introduced nor takes responsibility for, and it is why the refusal
+    # is scoped to the combination with ZLIB_BUILD_RUST rather than to
+    # ZLIB_PREFIX itself.
+    if(ZLIB_PREFIX)
+        message(
+            FATAL_ERROR
+                "ZLIB_BUILD_RUST and ZLIB_PREFIX cannot both be ON.  "
+                "ZLIB_PREFIX renames the whole public surface to z_* through "
+                "zconf.h, and the staged Rust library exports the unprefixed "
+                "names that the unmodified zlib.h declares, so no consumer "
+                "compiled with the prefixed header could link against it.\n"
+                "Configure with -DZLIB_PREFIX=OFF (the default) to use the "
+                "Rust library, or with -DZLIB_BUILD_RUST=OFF to build the "
+                "prefixed C library.")
+    endif(ZLIB_PREFIX)
+
     # objcopy performs the one step of the relink below that no linker flag can
     # express, and it is only needed when a shared library is being staged.  It
     # comes from the same binutils CMake already located for this toolchain.
@@ -424,6 +452,56 @@ if(ZLIB_BUILD_RUST)
         endif(ZLIB_RS_SIMD)
     endif(DEFINED ZLIB_RS_SIMD AND NOT ZLIB_RS_SIMD STREQUAL "")
 
+    # Debug information, which the two staging steps below would otherwise ship
+    # by accident.  Cargo's release profile defaults to strip = "debuginfo", so
+    # cargo's own cdylib carries no .debug_* sections at all, and a Release
+    # build of the C library above carries none either because Release supplies
+    # no -g.  The static archive is the one artifact nothing strips: a staticlib
+    # is assembled rather than linked, so the DWARF the prebuilt core and std
+    # rlibs were compiled with survives into it (measured at 5,111,389 bytes),
+    # and `cc -r --whole-archive' then re-imports every one of those sections
+    # into the relinked shared library, measured at 4,667,746 bytes in a
+    # 6,497,400 byte libz.so.  Neither number has any effect on behaviour or on
+    # the exported surface, and both are invisible to `cmake --install --strip',
+    # which CMake implements for install(TARGETS) only and so cannot reach files
+    # installed as files below.  So the same treatment cargo applies to its own
+    # optimised output is applied here to both staged files, and the strip that
+    # install(TARGETS) performs on request is reproduced at the bottom of this
+    # file: a packager gets an artifact the size of the code in it, and the
+    # documented install option is not silently ineffective.
+    #
+    # Debug keeps its debug information, because Debug is the configuration that
+    # maps to cargo's `dev' profile and the C library keeps its own there too.
+    # The decision is made here, at configure time, rather than as a generator
+    # expression on the command lines below: a generator expression that
+    # evaluates to nothing reaches the tool as an empty argument -- the hazard
+    # --profile documents above -- whereas an empty CMake variable expands to no
+    # argument at all.  Under a multi-config generator CMAKE_BUILD_TYPE is empty
+    # and every configuration is therefore treated as optimised, which is the
+    # same limitation, and for the same reason, as the staged drop-in directory
+    # not being per-configuration.
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(ZLIB_RUST_STRIP_DEBUG "")
+    else(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(ZLIB_RUST_STRIP_DEBUG --strip-debug)
+    endif(CMAKE_BUILD_TYPE STREQUAL "Debug")
+
+    # The archive is stripped by a step of its own because cargo hands it over
+    # complete and nothing else in this file rewrites it.  objcopy processes an
+    # archive member by member and rebuilds its index, so the result is still a
+    # linkable archive -- measured: 332 members, inflate_table still a global,
+    # and both example.c and infcover.c link against it and pass.  It is
+    # tool-gated rather than required: the shared path already refuses without
+    # objcopy above, and a static-only build that has none simply stages the
+    # archive exactly as it did before instead of acquiring a new prerequisite.
+    set(ZLIB_RUST_STRIP_ARCHIVE_COMMAND "")
+
+    if(CMAKE_OBJCOPY AND ZLIB_RUST_STRIP_DEBUG)
+        set(ZLIB_RUST_STRIP_ARCHIVE_COMMAND
+            COMMAND ${CMAKE_OBJCOPY} ${ZLIB_RUST_STRIP_DEBUG}
+            ${ZLIB_RUST_ARCHIVE})
+    endif(CMAKE_OBJCOPY AND ZLIB_RUST_STRIP_DEBUG)
+
     # The published surface, taken from the ZEXTERN declarations in zlib.h so
     # that the header stays the single source of truth.  Everything else the
     # archive defines -- the Rust runtime's own globals above all -- is made
@@ -490,13 +568,30 @@ if(ZLIB_BUILD_RUST)
             ${CMAKE_COMMAND} -E copy_if_different
             ${ZLIB_RUST_CARGO_ARTIFACT_DIR}/${ZLIB_RUST_STATIC_LIB}
             ${ZLIB_RUST_ARCHIVE}
+            # Expands to one further COMMAND, or to nothing at all where no
+            # objcopy was found or the configuration keeps its debug
+            # information.
+            ${ZLIB_RUST_STRIP_ARCHIVE_COMMAND}
         DEPENDS ${ZLIB_RUST_SOURCES} ${zlib_SOURCE_DIR}/Cargo.toml
                 ${zlib_SOURCE_DIR}/Cargo.lock ${zlib_SOURCE_DIR}/zlib.h
         WORKING_DIRECTORY ${zlib_SOURCE_DIR}
         COMMENT "Building ${ZLIB_RUST_STATIC_LIB} with cargo"
         VERBATIM)
-    set(ZLIB_RUST_ARTIFACTS ${ZLIB_RUST_ARCHIVE})
+    # What the staging target below is asked to produce, which is also what
+    # decides whether cargo runs at all: add_custom_command's OUTPUT is built
+    # only when something depends on it, and this list is the only thing that
+    # ever depends on the archive.  With ZLIB_BUILD_SHARED and ZLIB_BUILD_STATIC
+    # both OFF this project deliberately produces and installs no library -- in
+    # Rust mode exactly as in C mode -- so a cargo build would be paid for and
+    # then thrown away.  The rule itself stays declared unconditionally: the
+    # relink below consumes the archive whenever a shared library is wanted, and
+    # a static build installs it directly.
+    set(ZLIB_RUST_ARTIFACTS "")
     set(ZLIB_RUST_SYMLINKS "")
+
+    if(ZLIB_BUILD_SHARED OR ZLIB_BUILD_STATIC)
+        list(APPEND ZLIB_RUST_ARTIFACTS ${ZLIB_RUST_ARCHIVE})
+    endif(ZLIB_BUILD_SHARED OR ZLIB_BUILD_STATIC)
 
     if(ZLIB_BUILD_SHARED)
         # Step two: turn that archive into an installable shared library.
@@ -504,10 +599,13 @@ if(ZLIB_BUILD_RUST)
         # of an archive unless something already references it, so without it
         # the result would be empty.  objcopy then localises everything outside
         # the published set -- measured: it is what keeps the Rust runtime's
-        # rust_eh_personality out of the dynamic table -- and the final link
-        # applies the same SONAME and the same zlib.map the C shared target
-        # above receives.  The intermediate object is large and of no further
-        # use, so it is removed rather than left behind.
+        # rust_eh_personality out of the dynamic table -- and drops the debug
+        # sections --whole-archive just pulled in, for the reasons set out where
+        # ZLIB_RUST_STRIP_DEBUG is decided; both are done in the one pass over
+        # the object.  The final link applies the same SONAME and the same
+        # zlib.map the C shared target above receives.  The intermediate object
+        # is large and of no further use, so it is removed rather than left
+        # behind.
         add_custom_command(
             OUTPUT ${ZLIB_RUST_LIBRARY}
             COMMAND
@@ -516,7 +614,7 @@ if(ZLIB_BUILD_RUST)
                 ${ZLIB_RUST_ARCHIVE} -Wl,--no-whole-archive
             COMMAND
                 ${CMAKE_OBJCOPY} --keep-global-symbols=${ZLIB_RUST_SYMBOL_FILE}
-                ${ZLIB_RUST_DROPIN_DIR}/libz-whole.o
+                ${ZLIB_RUST_STRIP_DEBUG} ${ZLIB_RUST_DROPIN_DIR}/libz-whole.o
             COMMAND
                 ${CMAKE_C_COMPILER} -shared -fPIC
                 -Wl,-soname,${ZLIB_RUST_SONAME}
@@ -729,7 +827,9 @@ if(ZLIB_INSTALL)
     # from CMake 3.21, well above this project's floor, so the staged files are
     # installed as files.  PROGRAMS rather than FILES for the shared library
     # because a shared object is installed executable, matching what
-    # install(TARGETS ... LIBRARY) does for the C target.
+    # install(TARGETS ... LIBRARY) does for the C target.  The one thing that
+    # spelling loses is the strip on request, which CMake generates for
+    # install(TARGETS) and for nothing else, so it is reproduced below.
     if(ZLIB_BUILD_RUST)
         if(ZLIB_BUILD_SHARED)
             install(
@@ -740,6 +840,50 @@ if(ZLIB_INSTALL)
                 FILES ${ZLIB_RUST_SYMLINKS}
                 COMPONENT Runtime
                 DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+
+            # `cmake --install --strip', and -DCMAKE_INSTALL_DO_STRIP=ON with
+            # it, is a documented option that a packager reasonably expects to
+            # apply to the library it is installing.  For the C target above
+            # CMake emits exactly this block itself; for a file installed by
+            # install(PROGRAMS) it emits nothing, so without this the option is
+            # silently ineffective on the primary artifact of a Rust-mode
+            # install.  What is reproduced is CMake's own behaviour, condition
+            # for condition: the tool it located, the existence and
+            # not-a-symlink guards -- the three published aliases are links and
+            # stripping through one would replace it with a file -- and
+            # CMAKE_INSTALL_DO_STRIP read at install time rather than here, so
+            # that one build directory serves a stripped and an unstripped
+            # install alike.  DESTDIR is honoured the same way the generated
+            # script honours it.  The static archive is deliberately not
+            # stripped: CMake refuses to strip static libraries because a full
+            # strip removes the symbol table that makes them linkable, and the
+            # debug sections it would otherwise carry are already dropped at
+            # staging time.
+            if(CMAKE_STRIP)
+                if(IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+                    set(ZLIB_RUST_INSTALLED_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
+                else(IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+                    set(ZLIB_RUST_INSTALLED_LIBDIR
+                        "\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}")
+                endif(IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+
+                install(
+                    CODE "
+set(_zlib_rust_installed_library
+    \"\$ENV{DESTDIR}${ZLIB_RUST_INSTALLED_LIBDIR}/${ZLIB_RUST_SHARED_LIBV}\")
+
+if(CMAKE_INSTALL_DO_STRIP
+   AND EXISTS \"\${_zlib_rust_installed_library}\"
+   AND NOT IS_SYMLINK \"\${_zlib_rust_installed_library}\")
+    message(STATUS \"Stripping: \${_zlib_rust_installed_library}\")
+    execute_process(COMMAND \"${CMAKE_STRIP}\"
+                            \"\${_zlib_rust_installed_library}\")
+endif(CMAKE_INSTALL_DO_STRIP
+      AND EXISTS \"\${_zlib_rust_installed_library}\"
+      AND NOT IS_SYMLINK \"\${_zlib_rust_installed_library}\")
+"
+                    COMPONENT Runtime)
+            endif(CMAKE_STRIP)
         endif(ZLIB_BUILD_SHARED)
 
         if(ZLIB_BUILD_STATIC)
