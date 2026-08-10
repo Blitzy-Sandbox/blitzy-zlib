@@ -369,3 +369,94 @@ The latest zlib FAQ is at https://zlib.net/zlib_faq.html
     so that we can use your software in our product?
 
     No. Go away. Shoo.
+
+45. How do I build the Rust implementation of zlib?
+
+    The Rust reimplementation lives in the Cargo workspace under crates/ , and
+    both the make and the CMake builds know how to drive it.  With make:
+
+    make rust          # stage the drop-in libz under target/dropin/
+    make rust-test     # link the unmodified C drivers against it and run them
+    make rust-clean    # remove what the Rust targets produced
+
+    Those need no ./configure; running it only records the cargo it found and
+    builds the C library that "make rust-symbols" can then diff against.
+    Three more targets complete the set (make rust-symbols, make rust-header
+    and make rust-msrv), and the comment at the top of Makefile.in describes
+    all six.  With CMake, the ZLIB_BUILD_RUST option is off by default and is
+    turned on like this:
+
+    cmake -S . -B build -DZLIB_BUILD_RUST=ON
+
+    which points the exported ZLIB::ZLIB and ZLIB::ZLIBSTATIC targets at the
+    Rust library instead of the C one.  Inside the workspace itself, cargo
+    drives the build directly:
+
+    cargo build --release
+    cargo build --release --features libz-compat
+
+    cargo writes libz.so and libz.a under target/release/ , but install what
+    "make rust" stages rather than those.  That target relinks the shared
+    library through zlib.map and lays out the names a consumer actually loads:
+    the real file libz.so.1.3.2.1-motley, with libz.so.1 and libz.so as
+    symlinks to it, and libz.a beside them, all under target/dropin/ .  Those
+    links are a correctness requirement and not packaging polish, since the
+    SONAME is libz.so.1, and a directory holding libz.so alone leaves the
+    loader free to go on searching and bind the system zlib instead, silently.
+
+    cargo itself is optional.  ./configure succeeds without it and no C target
+    reads it, so on a machine with no Rust toolchain the C library builds,
+    tests and installs exactly as it always has.  rust/README.md is the
+    developer guide for the port.
+
+46. What version of Rust do I need?
+
+    Rust 1.80 or newer, on the stable channel.  The workspace is edition 2021
+    and declares a minimum supported Rust version of 1.80 through the
+    rust-version key in its crate manifests, and rust-toolchain.toml pins the
+    channel, so cargo picks a suitable compiler by itself and refuses an older
+    one rather than failing part way through a build.  Nothing newer is
+    needed; "make rust-msrv" exists to check the two crates that ship on that
+    floor, with warnings treated as errors.
+
+    Dependencies are kept to a minimum.  The algorithmic core, crates/zlib-rs,
+    has none at all; its dependency list is empty.  The C ABI layer takes
+    exactly one, libc, and only for the gzFile layer, which needs a few raw
+    file operations and descriptor flags that the Rust standard library cannot
+    express; without the gz feature it is not resolved at all.  A nightly
+    toolchain is wanted only for the optional Miri and AddressSanitizer runs,
+    never to build or to use the library.
+
+47. If I link against the Rust build, do I need to recompile my program?
+
+    No.  Everything a compiled program depends on is unchanged.  zlib.h and
+    zconf.h are not modified, so every signature, constant, macro and struct
+    layout is the one your program was compiled against.  The exported symbol
+    set is the same, all 111 of them at the same symbol versions from
+    zlib.map, and the SONAME is still libz.so.1.  z_stream and gz_header have
+    byte-identical layouts, and the partially exposed struct gzFile_s keeps
+    have, next and pos at the front of it, which matters because gzgetc() is a
+    macro that reads those three fields from inside your own compiled code.
+
+    The data is unchanged as well.  The zlib, deflate and gzip formats are
+    exactly as described by RFC 1950, RFC 1951 and RFC 1952, no new format was
+    added, and streams interoperate in both directions: what the C library
+    deflates the Rust library inflates, and the other way round.  The
+    compressed bytes are identical too, over the configurations the
+    differential tests cover, because the encoder reproduces the reference
+    implementation's own heuristics rather than improving on them.  The
+    optional simd feature reaches the two checksums and nothing else, so it
+    changes speed only and never a single emitted byte.
+
+    None of that rests on inspection.  The struct sizes and field offsets are
+    asserted at compile time, the header cbindgen generates from the Rust
+    sources is checked against zlib.h, the exported symbols and version nodes
+    are diffed against the C library's own, and the unmodified test/example.c,
+    test/minigzip.c and test/infcover.c are linked against the staged library
+    and run, with ldd confirming which library was bound.
+
+    On memory safety, note what the claim is.  Every algorithm is compiled
+    under #![forbid(unsafe_code)] in crates/zlib-rs, and unsafe is confined to
+    the small C ABI layer in crates/libz-rs-sys, where raw pointers handed in
+    by the caller unavoidably exist; each block there carries a comment naming
+    the invariant that makes it sound.
