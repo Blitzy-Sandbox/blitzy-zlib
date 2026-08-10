@@ -152,10 +152,12 @@
 //!
 //! `cbindgen --crate libz-rs-sys` renders this module's declarations as C, for
 //! comparison against the immutable `zlib.h`, so the *spellings* here are part of
-//! the contract. Generation runs; the comparison is not automated -- `cbindgen.toml`
-//! specifies a normalised signature-and-constant comparison and explains why a
-//! verbatim `diff` can never be empty, and nothing in the tree implements it yet.
-//! Treat the spelling rules below as obligations to honour by hand until it does.
+//! the contract -- and a gated part. `cbindgen.toml` specifies a normalised
+//! signature-and-constant comparison, and explains why a verbatim `diff` can never be
+//! empty; `make rust-header` implements the name-set half and the `header` job of
+//! `.github/workflows/rust.yml` implements the shape half by re-declaring every
+//! generated prototype against the real `zlib.h`. A spelling below that stopped
+//! matching would fail that job.
 //! Every ABI type uses its exact C name -- `z_stream`,
 //! `gz_header`, `gzFile_s`, `uInt`, `uLong`, `voidpf` and the rest -- because
 //! cbindgen resolves `c_uint` to `unsigned int` and `c_ulong` to
@@ -1361,8 +1363,9 @@ struct Hooks {
 /// This is precisely why the two tools divide the workspace as they do: **Miri
 /// covers `crates/zlib-rs`, the safe core, and AddressSanitizer covers
 /// `crates/libz-rs-sys`, the boundary layer where the raw pointers actually
-/// exist.** Miri can analyse the core exhaustively because the core contains no
-/// FFI; it cannot model this crate's whole job. Accordingly:
+/// exist.** Miri can interpret the core's whole test suite because the core contains
+/// no FFI at all; it cannot model this crate's job, because a foreign call is exactly
+/// what it cannot execute. Accordingly:
 ///
 /// * Every raw-pointer path in this module -- caller-hook allocation, slice
 ///   reconstruction, stream validation, and the full state round-trip including
@@ -2952,6 +2955,57 @@ const _: () = assert!(StateKind::Deflate.cookie() != StateKind::InflateBack.cook
 #[cfg(feature = "libz-compat")]
 /// cbindgen:ignore
 const _: () = assert!(StateKind::Inflate.cookie() != StateKind::InflateBack.cookie());
+
+/// The measured layout of the crate-private [`StatePrefix`], for the ABI suite.
+///
+/// ★ **Why this exists.** [`StatePrefix`] is `pub(crate)` and must stay that way: it is
+/// the head of a block a C caller owns an opaque pointer to, and handing an integration
+/// test the *type* would hand it the ability to construct one. But
+/// `crates/libz-rs-sys/tests/abi_layout.rs` §9 has to pin the layout of the **real**
+/// prefix rather than of a look-alike mirror, because a mirror that drifted from the
+/// original would keep passing while the original moved. Four `usize`s carry every fact
+/// the suite needs and none of the capability it must not have.
+///
+/// The numbers are target-dependent by construction and are stated relationally at the
+/// const assertions above: `strm` at 0, `tag` at `size_of::<z_streamp>()`, and the whole
+/// prefix at `size_of::<z_streamp>() + 2 * size_of::<c_int>()` -- 16 with the tag at 8
+/// where a pointer is eight bytes wide, 12 with the tag at 4 on an ILP32 target.
+///
+/// Rust-ABI, not `extern "C"`, and named in `cbindgen.toml`'s `[export] exclude`, so it
+/// reaches neither the generated header nor the dynamic symbol table: a `pub` Rust item
+/// is a path and nothing more, and the 111-symbol parity diff is untouched by it.
+#[cfg(feature = "libz-compat")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatePrefixLayout {
+    /// `size_of::<StatePrefix>()`.
+    pub size: usize,
+    /// `align_of::<StatePrefix>()`.
+    pub align: usize,
+    /// `offset_of!(StatePrefix, strm)` -- the back-pointer C compares against the
+    /// incoming stream. Zero on every target.
+    pub strm_offset: usize,
+    /// `offset_of!(StatePrefix, tag)` -- the slot `test/infcover.c` L330 and L459 write
+    /// `->mode` into from unmodified C.
+    pub tag_offset: usize,
+    /// `size_of::<c_int>()` -- the width of that slot, which is what makes the two C
+    /// stores land on exactly those four bytes.
+    pub tag_size: usize,
+}
+
+/// The measured layout of the real, crate-private state prefix.
+///
+/// See [`StatePrefixLayout`] for why the facts are published and the type is not.
+#[cfg(feature = "libz-compat")]
+#[must_use]
+pub const fn state_prefix_layout() -> StatePrefixLayout {
+    StatePrefixLayout {
+        size: size_of::<StatePrefix>(),
+        align: core::mem::align_of::<StatePrefix>(),
+        strm_offset: core::mem::offset_of!(StatePrefix, strm),
+        tag_offset: core::mem::offset_of!(StatePrefix, tag),
+        tag_size: size_of::<c_int>(),
+    }
+}
 
 /// A state object with the C-visible [`StatePrefix`] at offset 0.
 ///

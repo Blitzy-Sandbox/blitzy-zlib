@@ -24,8 +24,8 @@ make_vms.com.
 The compression and decompression engine has also been reimplemented in Rust,
 in the Cargo workspace under crates/ .  It is a reimplementation and not a
 binding: crates/zlib-rs holds every algorithm under #![forbid(unsafe_code)]
-with an empty dependency list, and crates/libz-rs-sys is the only place raw
-pointers appear, exposing the same C ABI so that existing callers link against
+with an empty dependency list, and crates/libz-rs-sys holds the raw pointers a
+C ABI unavoidably has, exposing that ABI so that existing callers link against
 it unchanged.  zlib.h, zconf.h and zlib.map are unmodified; the C sources in
 this directory are retained and are the reference the Rust code is diffed
 against, so "./configure; make test" continues to build and test the C library
@@ -35,43 +35,100 @@ Each crate has a distinct job.  crates/zlib-rs is the algorithmic core --
 deflate, inflate, the Huffman coder, both checksums, the gzip file layer and
 the one-shot wrappers.  With no features it is no_std plus alloc and the gzip
 file layer is not compiled at all, since a gzFile is a real file and only the
-standard library can open one.  crates/libz-rs-sys is the C ABI layer, and the
-only crate permitted unsafe; it builds as a cdylib, a staticlib and an rlib
-under the library name z, which is why cargo emits libz.so and libz.a rather
-than Rust-flavoured names.  crates/zlib-rs-differential is a development-only
-harness that compiles the C sources in this directory as a test oracle; neither
-shipped crate depends on it, so an ordinary build of the Rust library never
-compiles them.
+standard library can open one.  crates/libz-rs-sys is the C ABI layer and the
+only shipped crate that uses unsafe, under #![deny(unsafe_op_in_unsafe_fn)] so
+that each unsafe operation is scoped on its own and carries a comment naming
+the invariant behind it; it builds as a cdylib, a staticlib and an rlib under
+the library name z, which is why cargo emits libz.so and libz.a rather than
+Rust-flavoured names.  crates/zlib-rs-differential is a development-only
+harness that compiles the C sources in this directory as a test oracle;
+neither shipped crate depends on it, so an ordinary build of the Rust library
+never compiles them.
 
-For a program already linked against libz, the exported symbol set is the same,
+Two things follow about where unsafe lives, and both are worth stating exactly
+rather than in round numbers.  Outside crates/libz-rs-sys, two dev-only files
+declare or wrap raw entry points, and neither ships anywhere:
+crates/zlib-rs-differential/src/oracle.rs, which is how the C oracle is called,
+and crates/zlib-rs-differential/src/port.rs, whose boundary gates are how
+everything else drives the C ABI.  Those gates are deliberately not part of the
+shipped facade: AAP 0.6.1 fixes that facade's unsafe at exactly the six
+unavoidable C-ABI site categories, and a test harness is not one of them.
+Everything that uses the gates -- the three differential suites, the three
+benchmark suites and all five fuzz targets -- contains no unsafe at all, and
+neither does the safe core or any of its own test suites.  The only unsafe
+outside the facade's src/ tree is a single slice cast in
+crates/libz-rs-sys/tests/write_only_window.rs, which asserts a property of the
+boundary from the crate that owns the boundary.
+
+For a program that dynamically links libz, the exported symbol set is the same,
 the z_stream and gz_header layouts are the same, the SONAME is still libz.so.1,
 and zlib.h and zconf.h are installed unchanged, so that program keeps working
-without being recompiled.  The compressed bytes are the same as well: the
-encoder reproduces the reference implementation's own heuristics rather than
-improving on them, and streams interoperate in both directions -- what the C
-library deflates the Rust library inflates, and the other way round.
+without being recompiled.  That is a measured result on one target,
+x86_64-unknown-linux-gnu: it is where the staged library, the symbol diff and
+the relinked C drivers are checked.  Staging the drop-in needs a linker that
+accepts -soname and --version-script, so it is offered on the ELF platforms
+that get zlib.map for the C shared library, and the CMake path stops with a
+message on anything else -- not-UNIX, Apple, AIX and SunOS.  Building and
+testing the Rust workspace is a wider claim than that and is made separately:
+see the tier 1 note under "Notes for some targets" below.
+
+Static linking is the one case that is not yet equivalent.  A Rust libz.a
+carries the Rust runtime's own companion libraries, the set differs per target,
+and the installed zlib.pc advertises none of it, so a consumer that static
+links through that descriptor alone can fail to link.  zlib.pc.in and
+zlib.pc.cmakein state the measurement and the remedy; treat it as an open
+packaging gap rather than as settled.
+
+The compressed bytes are the same as well, over the configurations the
+differential tests compare: the encoder reproduces the reference
+implementation's own heuristics rather than improving on them, and streams
+interoperate in both directions -- what the C library deflates the Rust library
+inflates, and the other way round.
 
 To build and check the Rust library:
 
     make rust          # stage the drop-in libz under target/dropin/
     make rust-test     # link the unmodified C drivers against it and run them
-    make rust-symbols  # print the staged symbol tables
+    make rust-symbols  # diff the staged symbol set against a built C library
 
-Those three do not need ./configure.  They compose the shared-object link from
-Makefile.in's own defaults and name the staged library from ZLIB_VERSION in
-zlib.h, so they work on an unconfigured tree; what ./configure adds is the C
-library build that "make rust-symbols" can then diff against, and a $(CARGO)
-recorded for you (unconfigured, name it yourself with "make rust CARGO=cargo").
+"make rust-symbols" is a comparison and not a listing.  It reports how many
+symbols each library exports and which names one has that the other does not,
+so it needs a C shared library built in this tree -- "make libz.so.1.3.2.1" or
+ZLIBREF=/path/to/one -- and stops with that instruction when there is none.
+"make rust" performs the same diff as one of its own checks, but only when such
+a reference happens to be there already.
 
-Three more targets complete the set:
+"make rust" and "make rust-test" do not need ./configure at all: they compose
+the shared-object link from Makefile.in's own defaults and name the staged
+library from ZLIB_VERSION in zlib.h, so they work on an unconfigured tree.
+What ./configure adds is the C library build that "make rust-symbols" diffs
+against, and a $(CARGO) recorded for you (unconfigured, name it yourself with
+"make rust CARGO=cargo").
 
+Four more targets complete the set:
+
+    make rust-pc       # emit the pkg-config descriptor and gate a consumer
     make rust-header   # regenerate the C header with cbindgen and gate it
     make rust-msrv     # check the two shipped crates on the 1.80 floor
     make rust-clean    # remove what the Rust targets produced
 
+"make rust-pc" is where the one packaging difference between the two
+implementations is handled.  Dynamic linking is identical -- -lz resolves to
+either library and a shared object records its own dependencies -- but a Rust
+static archive carries the Rust runtime and so needs that runtime's native
+libraries on a static link line, while the C libz.a needs none.  One zlib.pc
+cannot say both, so that target writes a second descriptor beside the staged
+library, with a Libs.private line derived for the target being built by
+"rustc --print native-static-libs", and then compiles, links and runs a C
+program from nothing but the flags pkg-config answers for it.  Install that
+file in place of zlib.pc whenever you install the staged Rust library; the
+target prints the copy command.  "make rust-test" runs it for you.  The CMake
+build generates and installs the equivalent descriptor itself.
+
 "make rust-header" wants cbindgen as well as a cargo reachable on PATH, and
 "make rust-clean" wants no cargo at all.  The comment at the top of Makefile.in
-describes all six targets, including what each one does and does not establish.
+describes all seven targets, including what each one does and does not
+establish.
 
 CMake can point the exported ZLIB::ZLIB and ZLIB::ZLIBSTATIC targets at the
 Rust library instead of the C one:
@@ -79,16 +136,25 @@ Rust library instead of the C one:
     cmake -S . -B build -DZLIB_BUILD_RUST=ON
 
 That option is off by default, and while it is off no Rust tool is probed and
-the CMake build is exactly what it always was.
+the CMake build is exactly what it always was.  With it on, CMake performs the
+same relink "make rust" does -- cargo's libz.a through zlib.map, with the same
+SONAME and the same versioned symlink chain -- and then INSTALLS that set, so
+"cmake --install" hands a consumer the complete drop-in and find_package(ZLIB)
+resolves to it.  It is supported for a native ELF build: a shared library needs
+a linker that takes -soname and --version-script, and a multi-config generator
+or a cross-compilation toolchain is refused at configure time with the reason.
 
 Inside the Rust workspace itself, cargo drives the build directly:
 
     cargo build --release
-    cargo build --release --features libz-compat
+    cargo build --release -p libz-rs-sys --features libz-compat
 
 The first builds the two shipped crates with their default features, which
-already include the C ABI layer; the second names that layer explicitly, which
-is the form to use when the features are being chosen by hand.
+already include the C ABI layer.  The second names that layer explicitly, which
+is the form to use when the features are being chosen by hand, and it names the
+package too: this is a virtual workspace, so a bare "--features libz-compat"
+leaves it to cargo to decide which selected package the feature was meant for.
+Saying "-p libz-rs-sys" says it instead.
 
 Note that "cargo build" alone does NOT produce an installable shared library,
 and the shortfall is measurable: the shared object cargo emits publishes 96
@@ -99,8 +165,24 @@ small C shim in crates/libz-rs-sys/csrc/), and it exports internals that
 zlib.map hides.  The static libz.a cargo builds IS complete -- the shim objects
 are archived into it -- and "make rust" is what relinks the shared library from
 that archive under zlib.map, creates the versioned symlink chain the SONAME
-libz.so.1 requires, and then compares the result against the C library's own
-symbol table.
+libz.so.1 requires, and checks the result against zlib.h and zlib.map: every
+function zlib.h declares is exported and nothing else is, the version-node count
+matches zlib.map, none of zlib.map's local names is exported, and the SONAME is
+the derived one.
+
+The further comparison against the C library's own symbol table is CONDITIONAL.
+"make rust" performs it only when that library exists -- ZLIBREF defaults to the
+C shared library built in this tree -- and prints a note saying it was skipped
+otherwise, so a green "make rust" on a tree where the C library was never built
+is not a statement about parity with C.  Two commands make that comparison
+mandatory instead of optional, and both fail rather than skip:
+
+    make                                    then  make rust
+    make rust-symbols ZLIBREF=/path/to/libz.so.<version>
+
+The symbols job of .github/workflows/rust.yml takes the first route on every
+push, so a parity regression fails there whether or not it was checked by
+hand.
 
 Link against what "make rust" stages, not against cargo's target/<profile>
 directory.  The versioned names are deliberately absent from the latter, so a
@@ -113,23 +195,61 @@ Installing the Rust library means installing the same names the C build
 installs, with the same SONAME and the same symlink topology: the real file
 libz.so.1.3.2.1-motley, with libz.so.1 and libz.so as symlinks to it, and the
 static libz.a.  "make rust" stages exactly that set under target/dropin/ and
-names it from ZLIB_VERSION in zlib.h, ready to be copied into place.
+names it from ZLIB_VERSION in zlib.h, ready to be copied into place.  Read the
+note above about static linking before installing the libz.a for consumers to
+link through zlib.pc.
 
 Building the Rust library needs Rust 1.80 or later and cargo.  Optional
 vectorised CRC-32 and Adler-32 backends are available behind the "simd" Cargo
-feature; they change speed only, never the compressed bytes.
+feature; they change speed only, never the compressed bytes, and the paragraph
+after the feature table below says how that is checked and where.
 
-The workspace is edition 2021 and declares a minimum supported Rust version of
-1.80; rust-toolchain.toml pins the channel, so cargo selects a suitable
-compiler by itself.
+The workspace is edition 2021, and it has two floors rather than one, because
+one of its three members never ships.  1.80 is the floor of the two crates that
+do -- zlib-rs and libz-rs-sys, which both inherit rust-version from
+[workspace.package] -- and it is the only floor that matters for building,
+installing or using the library: "cargo build --release", "make rust" and
+cmake -DZLIB_BUILD_RUST=ON each build just that pair.  The third member,
+crates/zlib-rs-differential, is a dev-only harness that holds the C oracle and
+the benchmarks, and it declares 1.86 of its own because that is the floor of
+criterion, the benchmarking crate it depends on.  So the commands that reach it
+-- "cargo test --workspace" and "cargo bench" -- want 1.86, and a 1.80 compiler
+refuses them by name rather than failing part way through.  rust-toolchain.toml
+pins the stable channel, comfortably above both, so cargo selects a suitable
+compiler by itself; "make rust-msrv" is what checks the shipped pair on 1.80.
 
-The Cargo features, with the crate that declares each one and its default:
+Selected Cargo features, with the crate that declares each one and its default.
+This is not the whole surface -- "cargo metadata" is authoritative, and
+rust/README.md carries the complete table with what each feature expands to:
 
     libz-compat   libz-rs-sys, on   the exported extern "C" surface
-    gz            libz-rs-sys, on   the gzFile layer, which needs std
+    gz            libz-rs-sys, on   the gzFile layer; it also turns on
+                                    zlib-rs/std and the optional libc dependency
+    libc          libz-rs-sys, off  names that optional dependency explicitly,
+                                    so a downstream feature request keeps
+                                    resolving; gz already enables it
     rust-api      zlib-rs, off      the idiomatic Rust surface
-    simd          zlib-rs, off      vectorised CRC-32 and Adler-32
-    std           zlib-rs, off      the core's file I/O; otherwise no_std
+    simd          zlib-rs, off      autovectorised CRC-32 and Adler-32.  libz-rs-sys
+                                    and zlib-rs-differential each declare a
+                                    forwarding "simd" of their own, so a
+                                    package-scoped request reaches the core
+                                    wherever it is spelled
+    std           zlib-rs, off      the core's file I/O; otherwise no_std.  A
+                                    default libz-rs-sys build turns it on through
+                                    gz
+
+The "simd" feature deserves a plain description, because its name promises more
+than it delivers.  Both backends behind it are ordinary portable integer code,
+written so that LLVM has a shape it can autovectorise at opt-level 3; there is
+not one architecture intrinsic in either, which is what lets the safe core keep
+#![forbid(unsafe_code)].  Whether any vector instruction actually comes out is
+therefore a property of the compiler and the target, not a promise made here.
+Neither backend is chosen by asking the CPU what it supports either: the CRC-32
+one performs no run-time feature test at all, and the Adler-32 one consults an
+is_supported() that is a throughput hint rather than a correctness gate.  A
+simd-enabled binary computes the right answer on a machine with no vector unit.
+What the feature does promise is the answer: both compute the same checksums as
+the scalar backends, on every input, so they change speed only.
 
 Setting ZLIB_RS_SIMD=1 in the environment is how the simd feature is asked for
 through make or CMake, both of which translate it into "simd" for cargo; a
@@ -137,11 +257,34 @@ direct cargo build takes "--features simd" instead, and the build script then
 checks that the two requests agree rather than letting a mismatch pass
 unnoticed.  ZLIB_RS_SIMD=0, or leaving it unset, builds the scalar backends.
 The feature reaches the two checksums and nothing else, which is what keeps it
-output neutral -- a checksum is one scalar however it is computed.
+output neutral -- a checksum is one scalar however it is computed, and neither
+module contains an architecture intrinsic: both are portable integer code that
+LLVM autovectorises, and the only run-time probe anywhere is Adler-32's SSE2
+check on x86 and x86_64, which selects between two arrangements of the same
+arithmetic.
 
-rust/README.md is the developer guide for the port.  The differential tests
-against the C sources, the Miri and AddressSanitizer runs, the fuzz targets and
-the benchmarks are documented there rather than here.
+Neutrality is checked rather than argued, and here is exactly what checks it
+and on which machines.  Three things run with the feature enabled: the crate's
+own equivalence sweep, which compares the vectorised backend against the
+scalar one at every path boundary and re-checks the dispatcher wiring; the
+differential suites, which compare the port against the in-tree C
+implementation over the committed corpus; and a 300-second cargo-fuzz run of
+the checksum target that compares the two backends on fuzzer-chosen inputs.
+The first two run in the all-features test pass, on all three platforms the
+Rust build is gated on -- Linux, macOS and Windows.  The fuzz run is Linux
+x86_64, as are the Miri and AddressSanitizer jobs.  A target outside that set
+gets the same portable code and the same tests, but no measurement from us.
+
+The gates themselves live in .github/workflows/rust.yml, and each one names
+what it establishes: the differential suites against the C sources in
+crates/zlib-rs-differential, Miri over the safe core with every feature enabled
+(sharded by module and by test binary, since interpreting the whole crate in
+one job does not finish), AddressSanitizer over the C ABI layer, the three
+unmodified C drivers and the oracle harness, five cargo-fuzz targets at 300
+seconds each plus the checksum target a second time with simd, the cbindgen
+header diffed against zlib.h, the exported symbols and version nodes diffed
+against the C library's own, and the criterion suites in benches/ measured
+against the C oracle in the same process.
 
 Questions about zlib should be sent to <zlib@gzip.org>, or to Gilles Vollant
 <info@winimage.com> for the Windows DLL version.  The zlib home page is
@@ -195,9 +338,14 @@ Notes for some targets:
 
 - For PalmOs, see https://palmzlib.sourceforge.net/
 
-- The Rust library is supported on Rust's tier 1 targets. The platform
-  makefiles in this distribution -- amiga, msdos, os400, qnx, watcom and
-  win32 -- build the C sources and are unaffected.
+- The Rust workspace builds and its test suite runs on Rust's tier 1 targets,
+  which is what the Rust CI matrix covers on Linux, macOS and Windows. The
+  installable drop-in library is a narrower claim than that: staging it needs a
+  linker that accepts -soname and --version-script, so it is offered on ELF
+  platforms only -- Windows, Apple, AIX and SunOS are refused with a message --
+  and it is verified on x86_64-unknown-linux-gnu. The platform makefiles in
+  this distribution -- amiga, msdos, os400, qnx, watcom and win32 -- build the
+  C sources and are unaffected.
 
 
 Acknowledgments:

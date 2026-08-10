@@ -71,9 +71,8 @@
 //! Nothing here can panic. Every index is produced by `.min()` against a length
 //! captured up front, every subtraction saturates, and no fallible operation is
 //! unwrapped. That is a hard requirement rather than a nicety: this function is
-//! the library's primary untrusted-input surface, it is to be the target of the planned
-//! `fuzz/fuzz_targets/fuzz_inflate.rs` -- which has not landed; `fuzz/fuzz_targets/` is still
-//! empty -- and it must terminate without panicking
+//! the library's primary untrusted-input surface, it is the target of
+//! `fuzz/fuzz_targets/fuzz_inflate.rs`, and it must terminate without panicking
 //! on arbitrary bytes. Termination is proved in [`uncompress2_z`].
 //!
 //! # Examples
@@ -506,7 +505,7 @@ pub fn uncompress(dest: &mut [u8], source: &[u8]) -> Decompressed {
 // The fixtures are compressed streams rather than plaintext because the encoder
 // is not this module's dependency: a stream produced by the C compressor and
 // decoded here is a direct test of the C-to-Rust interoperability that
-// the planned `crates/zlib-rs-differential/tests/roundtrip_interop.rs` will assert at workspace
+// `crates/zlib-rs-differential/tests/roundtrip_interop.rs` asserts at workspace
 // scope. Their spellings match the ones the inflate suite already uses, so a
 // reviewer can compare fixture for fixture.
 //
@@ -1048,7 +1047,7 @@ mod tests {
     /// reachable header -- valid, invalid, dictionary-requesting and
     /// reserved-method alike -- and asserts only that the call returns a
     /// documented status without panicking. This is the cheap in-crate precursor
-    /// to the planned `fuzz/fuzz_targets/fuzz_inflate.rs`.
+    /// to `fuzz/fuzz_targets/fuzz_inflate.rs`.
     #[test]
     fn every_two_byte_input_terminates() {
         let mut dest = [0_u8; 32];

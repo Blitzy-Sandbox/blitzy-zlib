@@ -7,10 +7,20 @@
 # infback, inffast, inflate, inftrees, trees, zutil, compress, uncompr, gzclose,
 # gzlib, gzread, gzwrite) into a test-only static archive. `src/oracle.rs` declares
 # those symbols under a `c_` prefix so a single process can run the Rust port and the
-# C reference implementation side by side and compare their output bytes. The machinery
-# for that comparison is therefore in place; the comparison itself is not, because the
-# `tests/**` suites that would perform it are not in the tree. So "compressed output is
-# byte-identical to the reference" remains an unmeasured requirement, not a result.
+# C reference implementation side by side and compare their output bytes, and
+# `src/port.rs` puts the facade's own `unsafe extern "C"` surface behind gates of the
+# same shape so a comparison reads as one safe call against another.
+#
+# The comparison itself lives in `tests/`: `byte_identical.rs` compares emitted bytes
+# across the configuration matrix, `roundtrip_interop.rs` crosses streams in both
+# directions, and `table_equality.rs` compares the ported constant tables against the
+# C arrays element for element. So "compressed output is byte-identical to the
+# reference" is a measured result here rather than an unmeasured requirement, with the
+# one qualification that decides what a green run means: the DEFAULT run covers a
+# sampled matrix in seconds, and the exhaustive sweeps are `#[ignore]`d and armed by
+# `ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE` and `ZLIB_RS_INTEROP_EXHAUSTIVE`, which
+# `.github/workflows/rust.yml` sets in steps of its own. Read a bare `cargo test`
+# as the sample, and those steps as the sweep.
 #
 # THE ONE-WAY DEPENDENCY EDGE IS THE WHOLE POINT
 # This crate depends on the two shipped crates; NEITHER shipped crate may ever
@@ -27,13 +37,20 @@
 #     cargo tree -p libz-rs-sys -e normal   # must not mention cc or this crate
 #
 # VERIFICATION POSTURE -- DO NOT "FIX" THE MIRI EXCLUSION
-# This crate sits deliberately OUTSIDE the Miri gate: Miri interprets Rust MIR and
-# cannot execute the compiled C oracle, so the Miri job is scoped to the safe core
-# (`cargo +nightly miri test -p zlib-rs`). It sits deliberately INSIDE the nightly
-# AddressSanitizer gate, which is where the raw pointers of the FFI boundary and of
-# the C oracle actually live. Neither posture is expressible as a manifest key; both
-# are CI job scopes, recorded here so that the exclusion reads as intentional rather
-# than as an oversight to be "corrected".
+# This crate sits outside BOTH sanitizer gates, and the two exclusions have different
+# causes. Miri cannot execute the compiled C oracle at all -- it interprets Rust MIR --
+# so the Miri job is scoped to the safe core (`cargo +nightly miri test -p zlib-rs`)
+# and widening it to `--workspace` would fail for a reason that has nothing to do with
+# undefined behaviour. The nightly AddressSanitizer job is scoped to
+# `cargo +nightly test -p libz-rs-sys` plus the three relinked C drivers, which is the
+# split AAP 0.6.4.5 specifies; it does not select this crate, so neither this crate's
+# tests nor the three benches attached to it run under a sanitizer. What this crate's
+# `unsafe` gets instead is review, the `// SAFETY:` comment on every block, and the
+# fact that a mistake here fails a differential comparison loudly rather than silently.
+# Neither posture is expressible as a manifest key; both are CI job scopes, recorded
+# here so that the exclusions read as intentional rather than as oversights to be
+# "corrected" -- and stated accurately, so that nobody cites a sanitizer this crate is
+# not run under.
 #
 # UNSAFE (AAP 0.7.1(a))
 # No key below enables or excuses `unsafe`. All `unsafe` in this crate lives in
@@ -46,22 +63,24 @@
 #
 # BENCHMARK HOSTING
 # The repository-root `Cargo.toml` is a virtual manifest and therefore cannot own
-# bench targets, so the three suites planned for `benches/` will attach HERE through
-# the `[[bench]]` entries near the bottom of this file. This crate is the correct
-# host because all three suites are specified to measure against the C oracle that
-# it builds.
+# bench targets, so the three suites in `benches/` attach HERE, through the three
+# `[[bench]]` entries near the bottom of this file -- `checksum_bench`,
+# `inflate_bench` and `deflate_bench`, each with an explicit `path` up to
+# `../../benches/` and `harness = false`. This crate is the correct host because
+# all three measure the port against the C oracle that it builds.
 #
-# `benches/` is absent, so the `[[bench]]` entries are NOT declared here either -- a
-# bench entry naming a file that is absent makes every Cargo invocation that
-# enumerates targets (`--all-targets`, `cargo fmt --all`) fail while resolving it, so
-# the entries belong in the same change that adds the files. Measured with the entries
-# withheld: `cargo metadata` resolves the workspace and reports no bench target for
-# this crate.
+# A bench entry naming a file that is absent makes every Cargo invocation that
+# enumerates targets (`--all-targets`, `cargo fmt --all`) fail while resolving it,
+# which is why the entries and the files belong in one change; they are in one
+# change, so nothing here is withheld any more.
 #
-# `tests/` is absent too. So every claim below about what the differential tests or the
-# benchmarks establish describes an intended contract, never an observed result: the
-# oracle archive and its `src/oracle.rs` declarations are built and linkable, and
-# nothing yet compares the two implementations with them.
+# `tests/` holds `byte_identical.rs`, `roundtrip_interop.rs` and
+# `table_equality.rs`, and they run: `cargo test -p zlib-rs-differential` compares
+# the two implementations through the oracle archive that `build.rs` produces. So
+# the claims below are observations of what these suites do, not a contract they
+# were still to be written against. Both are worth stating plainly, because a
+# reader who cannot tell an intention from a result cannot tell what this crate
+# has actually established.
 
 [package]
 name = "zlib-rs-differential"
@@ -126,25 +145,33 @@ publish = false
 # configuration. See the `build.rs` crate docs for the full derivation of both counts.
 
 [features]
-# Nothing extra by default: the differential matrix and the benchmarks must exercise
-# the same configuration the shipped artifacts are built with.
-default = []
+# `gz` only: the differential matrix and the benchmarks must otherwise exercise the same
+# configuration the shipped artifacts are built with, and `gz` IS part of that configuration --
+# `libz-rs-sys` has it on by default, so a default build of this crate that left it off would be
+# comparing against a facade nobody ships.
+default = ["gz"]
 
-# `simd` forwards to the checksum vectorization of both dev-dependencies. It is
+# `simd` forwards to the checksum vectorization of both crates under test. It is
 # default-OFF and OUTPUT-NEUTRAL: AAP 0.8.2 ambiguity 9 confines SIMD to CRC-32 and
 # Adler-32 precisely because a checksum yields one scalar regardless of computation
-# order, so vectorizing it cannot perturb the bitstream. Running the differential
+# order, so vectorizing it cannot perturb the bitstream. Re-running the differential
 # matrices with `--features simd` is how that neutrality is verified rather than
-# assumed, and both have been run: `tests/byte_identical.rs`'s exhaustive sweep
-# (11 tests, 2,542,729 cells, 1,528 s on the development machine) and
+# assumed, and both have been run: `tests/byte_identical.rs`'s exhaustive shards --
+# ten `#[ignore]`d tests whose products are the whole 9,922,500-cell matrix, sliced
+# by `ZLIB_RS_DIFFERENTIAL_SHARD` and accounted for cell by cell -- and
 # `tests/roundtrip_interop.rs`'s exhaustive product (16,380 crossings, 3.6 s) are
 # both green with the feature on, and the latter compares the check value on every
-# crossing as well as the bytes. Two reasons the switch is declared here and not
+# crossing as well as the bytes. `.github/workflows/rust.yml` runs both the scalar
+# and the `simd` form of each, which is what keeps the neutrality claim current
+# rather than a one-off observation. Two reasons the switch is declared here and not
 # only on the dependencies:
-#   1. The planned `benches/checksum_bench.rs` will compare the scalar and SIMD
-#      backends (AAP 0.4.1.5). Once it lands, the two-run procedure is:
+#   1. `benches/checksum_bench.rs` compares the scalar and SIMD
+#      backends (AAP 0.4.1.5). The two-run procedure is:
 #          cargo bench -p zlib-rs-differential -- --save-baseline scalar
 #          cargo bench -p zlib-rs-differential --features simd -- --baseline scalar
+#      CI additionally runs `cargo test -p zlib-rs-differential --release --features
+#      simd`, so the neutrality claim is re-established on every push rather than only
+#      when somebody remembers to pass the flag.
 #   2. Since Rust 1.80 the `unexpected_cfgs` lint validates `cfg!(feature = "...")`
 #      against the manifest of the crate being compiled. Test and bench targets are
 #      compiled as part of THIS package, so `cfg!(feature = "simd")` inside them
@@ -154,21 +181,42 @@ default = []
 # dependency by its key in this manifest, which is the rename introduced below.
 simd = ["zlib-rs/simd", "libz_rs_sys/simd"]
 
-# Intentionally empty, and audited as such. `src/lib.rs` is a module holder for
-# `src/oracle.rs`, which contains only `extern "C"` declarations, `#[repr(C)]`
-# mirrors, safe slice views over the generated tables and a minimal smoke module,
-# so the non-test build of this crate needs no dependency whatsoever. Everything the
-# tests and benchmarks need is a dev-dependency, which is what keeps this crate out
-# of the shipped crates' graphs.
-[dependencies]
+# The `gzFile` half of the harness, and of this crate's own oracle table.
+#
+# ON BY DEFAULT via `default` above, because `libz-rs-sys` itself has `gz` on by default and the
+# interoperability suite crosses the two implementations through a real file. It is a feature rather
+# than unconditional for one reason: `--no-default-features` is a supported configuration of the
+# facade, and a suite that could not be built without the gz layer would make that configuration
+# untestable from here.
+#
+# The reference always provides these symbols -- `gzlib.c`, `gzread.c`, `gzwrite.c` and `gzclose.c`
+# are four of the fifteen translation units `build.rs` compiles -- so this flag gates only what the
+# Rust side compiles against.
+gz = ["libz_rs_sys/gz"]
 
+# Two path edges and nothing else. No THIRD-PARTY dependency appears here, which is
+# the property that keeps this crate's non-test build trivial and keeps every
+# third-party crate the harness needs -- criterion above all -- out of any graph a
+# shipped artifact is resolved from.
 # Third-party pins live in the root `[workspace.dependencies]` so that each version
 # is stated in exactly one place; `{ workspace = true }` inherits them. Should a root
 # entry ever be removed, fall back to the exact pin -- `zlib-rs = { path =
-# "../zlib-rs" }`, `cc = "1.4.0"`, and `criterion = "0.8.2"` when the benchmark
-# suites bring it back -- and never to a wildcard: `deny.toml` sets `[bans]
-# wildcards = "deny"`.
-[dev-dependencies]
+# "../zlib-rs" }`, `cc = "1.4.0"` and `criterion = "0.8.2"` -- and never to a
+# wildcard: `deny.toml` sets `[bans] wildcards = "deny"`.
+#
+# ★ WHY THESE TWO ARE NOT DEV-DEPENDENCIES.  They were, until `src/port.rs` arrived.
+# A dev-dependency is resolved for test, example and bench targets but NOT for the
+# crate's own `lib` target, and `src/port.rs` is part of the lib: it is the port half
+# of this crate's FFI boundary, where every `unsafe` call into the facade's
+# `unsafe extern "C"` surface is confined so that `tests/`, `benches/` and the five
+# `fuzz_targets/` can each carry `#![forbid(unsafe_code)]`.  Moving the two edges
+# here is what makes the facade nameable from `src/`.  The edge DIRECTION is
+# unchanged and is the thing that matters: this dev-only harness depends on the two
+# shipped crates, neither ever depends on it, and this crate is not a
+# `default-member`, so `cargo build` still does not reach it.  `criterion` stays a
+# dev-dependency, because only the bench targets use it and it is what pins this
+# crate's `rust-version` to 1.86.
+[dependencies]
 # The safe core, for tests and benchmarks that drive the typed Rust surface directly:
 # `rust-api` exposes the typed configuration surface used to enumerate the
 # differential matrix (level x windowBits x memLevel x strategy x flush), and `std`
@@ -204,7 +252,19 @@ zlib-rs = { workspace = true, features = ["rust-api", "std"] }
 # three-component semver derivation of the CMake `PROJECT_VERSION 1.3.2.1` and
 # matches `[workspace.package] version`; the `path` key still wins for
 # resolution, so nothing is ever fetched from crates.io.
+#
+# No feature is requested beyond the facade's default set: the safe boundary this crate's tests,
+# benches and the fuzz targets drive both implementations through is `src/port.rs` and `src/oracle.rs`
+# HERE, not in the facade, so that a shipped `libz.so` contains none of that plumbing and the
+# facade's own `unsafe` surface stays at the six unavoidable C-ABI site categories and no wider.
 libz_rs_sys = { package = "libz-rs-sys", path = "../libz-rs-sys", version = "1.3.2" }
+
+# Third-party pins live in the root `[workspace.dependencies]` so that each version
+# is stated in exactly one place; `{ workspace = true }` inherits them. Should a root
+# entry ever be removed, fall back to the exact pin -- `zlib-rs = { path =
+# "../zlib-rs" }`, `cc = "1.4.0"` and `criterion = "0.8.2"` -- and never to a
+# wildcard: `deny.toml` sets `[bans] wildcards = "deny"`.
+[dev-dependencies]
 
 # The benchmark harness, for the suites the `[[bench]]` entries at the foot of this
 # file attach. It is THE dependency decision in this workspace that the declared
@@ -251,15 +311,14 @@ criterion = { workspace = true }
 cc = { workspace = true }
 
 # ---------------------------------------------------------------------------------
-# Benchmark suites (AAP 0.3.1, 0.4.1.5) -- DECLARED ONLY ONCE THE FILES EXIST
+# Benchmark suites (AAP 0.3.1, 0.4.1.5) -- DECLARED ONLY ALONGSIDE THE FILES
 #
 # The suites live at the REPOSITORY ROOT in `benches/`, outside any crate, and are
-# attached here by explicit path. An entry is added in the SAME change as the file
-# it names and never ahead of it: a `[[bench]]` entry whose `path` is absent is a
-# hard resolution error for `--all-targets` and for `cargo fmt --all`. Of the three
-# suites AAP 0.3.1 plans, all three now exist and all three are declared below --
-# `checksum_bench.rs`, `inflate_bench.rs` and `deflate_bench.rs`. Should a fourth
-# ever be added, add its entry beside its file and never ahead of it.
+# attached here by explicit path. All three AAP 0.3.1 names are declared below:
+# `checksum_bench.rs`, `inflate_bench.rs` and `deflate_bench.rs`. An entry is added in
+# the SAME change as the file it names and never ahead of it -- a `[[bench]]` entry
+# whose `path` is absent is a hard resolution error for `--all-targets` and for
+# `cargo fmt --all` -- and the same rule governs a fourth, should one ever be added.
 #
 # Paths are relative to THIS manifest's directory: `crates/zlib-rs-differential`
 # -> `..` -> `../..` is the repository root. `harness = false` is mandatory --
@@ -290,10 +349,14 @@ cc = { workspace = true }
 #     cargo bench -p zlib-rs-differential --bench checksum_bench
 #     cargo bench -p zlib-rs-differential --bench checksum_bench --features simd
 #
-# and the two-run form, for comparing whole configurations rather than backends:
+# and the two-run form, for comparing whole configurations rather than backends.
+# `--baseline-lenient` rather than `--baseline`, because the feature ADDS the vectorized
+# rows: `--baseline` treats a row with no counterpart in the saved baseline as a hard
+# error, while `--baseline-lenient` compares the rows that do have one and reports the
+# rest as new.
 #
 #     cargo bench -p zlib-rs-differential --bench checksum_bench -- --save-baseline scalar
-#     cargo bench -p zlib-rs-differential --bench checksum_bench --features simd -- --baseline scalar
+#     cargo bench -p zlib-rs-differential --bench checksum_bench --features simd -- --baseline-lenient scalar
 [[bench]]
 name = "checksum_bench"
 path = "../../benches/checksum_bench.rs"

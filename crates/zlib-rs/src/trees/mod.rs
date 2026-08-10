@@ -119,14 +119,22 @@ pub(crate) mod bit_writer;
 pub(crate) mod build;
 
 // The six generated tables, re-exported as data so that `crates/zlib-rs/src/lib.rs`
-// can expose them and the planned `crates/zlib-rs-differential/tests/table_equality.rs` will be
-// able to compare them element for element against `trees.h`. That comparison is the
+// can expose them and `crates/zlib-rs-differential/tests/table_equality.rs` can
+// compare them element for element against `trees.h`. That comparison is the
 // cheapest high-signal check in the whole port, which is why these six -- and
 // only these six -- are `pub`. Everything else in this folder is `pub(crate)` or
 // private, mirroring the `local` linkage of the C sources and the `local:` block
 // of `zlib.map`.
+//
+// The split within the ten is worth knowing, because it decides how the C side is reached.
+// `static_ltree`, `static_dtree`, `_dist_code`, `_length_code`, `base_length` and `base_dist` are
+// declared in the generated `trees.h`, so the differential harness includes that header. The four
+// `extra_*`/`bl_order` arrays are declared nowhere but `trees.c` itself (L62, L65, L68 and L71) and
+// are `local`, so the harness reaches them through a generated wrapper that includes `trees.c` --
+// the same device `configuration_table` needs.
 pub use crate::trees::static_tables::{
-    _dist_code, _length_code, base_dist, base_length, static_dtree, static_ltree,
+    _dist_code, _length_code, base_dist, base_length, bl_order, extra_blbits, extra_dbits,
+    extra_lbits, static_dtree, static_ltree,
 };
 
 use crate::config::Z_UNKNOWN;

@@ -23,17 +23,18 @@
 //!   and the documented single-pass guarantee -- all input, a bound-sized output
 //!   buffer and `Z_FINISH` yields `Z_STREAM_END` -- is exercised directly.
 //! - **Allocator discipline.** Every allocation goes through the caller-supplied
-//!   hooks, using the tracking zone of `test/infcover.c` L56-L239: allocations are
-//!   filled with `0xa5` rather than zeros, the release order is checked for
-//!   last-in-first-out discipline, frees of addresses the zone never handed out are
-//!   counted, and a fuzzer-chosen ceiling forces `Z_MEM_ERROR` systematically
-//!   instead of by luck.
+//!   hooks, using the tracking zone of `test/infcover.c` L56-L239 as the harness
+//!   crate carries it (`port::TrackingAllocator`): allocations are filled with
+//!   `0xa5` rather than zeros, the release order is checked for last-in-first-out
+//!   discipline, frees of addresses the zone never handed out are counted, and a
+//!   fuzzer-chosen ceiling forces `Z_MEM_ERROR` systematically instead of by luck.
 //! - **Return-code discipline.** Each entry point is held to its documented return
 //!   set. `Z_BUF_ERROR` is *not* a failure -- it means no progress was possible,
 //!   which is legitimate against a one-byte output buffer.
 //! - **Termination.** Payload length, output-buffer size, total output, iteration
-//!   count and allocator ceiling are all bounded, so one invocation costs
-//!   microseconds and neither hangs nor exhausts memory.
+//!   count and allocator ceiling are all bounded, so no input can make an
+//!   invocation hang or exhaust memory. The bounds and their derivations are under
+//!   "Termination bounds" below.
 //!
 //! # What this target deliberately does NOT do
 //!
@@ -57,36 +58,67 @@
 //! `+nightly` is required because the repository-root `rust-toolchain.toml` pins
 //! stable and cargo-fuzz's sanitizer instrumentation is nightly-only. The gate is
 //! zero crashes, zero hangs, zero timeouts and zero out-of-memory reports over at
-//! least 300 seconds, matching `fuzz-seconds: 300` in
-//! `.github/workflows/fuzz.yml`. AddressSanitizer is on by default under
-//! cargo-fuzz, so that run doubles as the sanitizer gate for the boundary layer.
+//! least 300 seconds; the `fuzz` job in `.github/workflows/rust.yml` runs exactly
+//! that command on every push, one matrix leg per target, and the budget matches
+//! the `fuzz-seconds: 300` precedent set by the C-side OSS-Fuzz workflow in
+//! `.github/workflows/fuzz.yml`.
+//!
+//! cargo-fuzz builds this target with `AddressSanitizer` by default, so the run is
+//! sanitized. Be precise about what that covers, though: it instruments the code
+//! paths *this target drives*, and it is not the boundary layer's ASan gate. That
+//! gate is the separate `asan` job, scoped to `cargo test -p libz-rs-sys` plus the
+//! three relinked C drivers. The two are complementary -- arbitrary input here,
+//! systematic coverage there -- and neither substitutes for the other.
+//!
+//! # Unsafe
+//!
+//! There is none: this file carries `#![forbid(unsafe_code)]`, which the compiler
+//! enforces. Driving the C ABI does require raw pointers, and every one of them is
+//! formed inside `zlib_rs_differential::port` -- the harness crate's documented FFI
+//! boundary -- where each `unsafe` block carries a `// SAFETY:` comment naming its
+//! invariant. That is also where the two allocator hooks live, and it is where they
+//! have to live: they are called *from* the library across an `extern "C"` edge, so a
+//! panic escaping one would be undefined behaviour, and they are panic-free by
+//! construction and answer every failure with a null pointer, exactly as `mem_alloc`
+//! answers with `NULL` and the caller turns that into `Z_MEM_ERROR`.
+//!
+//! `assert!` inside the fuzz target body is a different matter and is the intended
+//! reporting mechanism: it runs on this harness's own stack, never inside a callback.
 //!
 //! # Self-containment
 //!
-//! cargo-fuzz compiles every file in `fuzz_targets/` as an independent binary, so
-//! a shared helper module would simply never be compiled. The tracking allocator
-//! below is therefore duplicated with the sibling targets on purpose; do not try
-//! to factor it out.
+//! cargo-fuzz compiles every file in `fuzz_targets/` as an independent binary, so a
+//! helper module inside `fuzz_targets/` would simply never be compiled. Shared code
+//! therefore lives in the harness *crate* -- `zlib_rs_differential`, an ordinary path
+//! dependency in `fuzz/Cargo.toml` -- which every target links normally. That is where
+//! the tracking allocator and every entry-point gate come from, so nothing in this
+//! file is duplicated with its siblings.
 
 #![no_main]
+#![forbid(unsafe_code)]
 
-use std::alloc::{alloc, dealloc, Layout};
-use std::ffi::{c_char, c_int, c_uint, c_void};
+use std::ffi::{c_int, c_uint, CStr};
 use std::ptr;
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 
+// The facade is imported as `libz_rs_sys` and never as `z`, and only for its types and
+// constants -- every entry point is reached through `zlib_rs_differential::port`, except
+// `compressBound` and `compressBound_z`, which take no pointer at all and are therefore
+// declared safe by the facade itself and callable directly. `crates/libz-rs-sys` sets
+// `[lib] name = "z"` so that cargo emits the drop-in `libz.so`/`libz.a`, and cargo derives
+// a dependency's default `--extern` name from the lib target rather than the package;
+// `fuzz/Cargo.toml` therefore renames the key back to `libz_rs_sys`. Writing `use z::...`
+// here would not compile.
 use libz_rs_sys::{
-    compress2, compressBound, compressBound_z, deflate, deflateBound, deflateBound_z, deflateCopy,
-    deflateEnd, deflateGetDictionary, deflateInit2_, deflateParams, deflatePending, deflatePrime,
-    deflateReset, deflateResetKeep, deflateSetDictionary, deflateSetHeader, deflateTune,
-    deflateUsed, gz_header, gz_headerp, uInt, uLong, uLongf, voidpf, z_size_t, z_stream, Bytef,
-    MAX_MEM_LEVEL, MAX_WBITS, ZLIB_VERSION, Z_BEST_COMPRESSION, Z_BLOCK, Z_BUF_ERROR, Z_DATA_ERROR,
+    compressBound, compressBound_z, gz_header, uInt, uLong, z_size_t, z_stream, MAX_MEM_LEVEL,
+    MAX_WBITS, ZLIB_VERSION, Z_BEST_COMPRESSION, Z_BLOCK, Z_BUF_ERROR, Z_DATA_ERROR,
     Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY, Z_DEFLATED, Z_FINISH, Z_FIXED, Z_FULL_FLUSH,
     Z_MEM_ERROR, Z_NO_COMPRESSION, Z_NO_FLUSH, Z_OK, Z_PARTIAL_FLUSH, Z_STREAM_END, Z_STREAM_ERROR,
     Z_SYNC_FLUSH, Z_TREES, Z_VERSION_ERROR,
 };
+use zlib_rs_differential::port::{self, TrackingAllocator};
 
 // ---------------------------------------------------------------------------
 //  Termination bounds
@@ -165,399 +197,79 @@ const MAX_TUNE_LENGTH: c_int = 258;
 /// uses (level 9, `deflate.c` L123).
 const MAX_TUNE_CHAIN: c_int = 4096;
 
-/// The byte every tracked allocation is filled with.
-///
-/// `test/infcover.c` L87 fills with this rather than zeroing, "to make sure that
-/// the code isn't depending on zeros". Any code path that reads an allocation
-/// before writing it therefore sees `0xa5` and misbehaves visibly instead of
-/// silently benefiting from a zeroed heap.
-const SENTINEL_FILL: u8 = 0xa5;
-
-/// Alignment every tracked allocation is given.
-///
-/// The allocator contract in `crates/zlib-rs/src/allocate.rs` requires blocks to
-/// be aligned for any fundamental type, because both `zcalloc` and
-/// `test/infcover.c`'s zone are backed by `malloc`. Sixteen bytes is what a
-/// 64-bit `malloc` guarantees and exceeds every type the library allocates.
-const HOOK_ALIGN: usize = 16;
-
 // ---------------------------------------------------------------------------
-//  The tracking allocator -- a port of test/infcover.c L56-L239
+//  The tracking allocator -- reached through the harness boundary
 // ---------------------------------------------------------------------------
 //
-// This is the instrumentation that makes allocator misuse visible. Three
-// properties are worth stating up front, because each one catches a distinct
-// class of defect that ordinary testing does not:
+// `test/infcover.c`'s `mem_zone` is not transcribed here. `zlib_rs_differential::port`
+// carries that transcription once -- the `0xa5` fill that `test/infcover.c` L87 uses
+// "to make sure that the code isn't depending on zeros", the singly-linked block
+// list, the leak, non-LIFO and rogue-free counters, `mem_high`'s high-water mark and
+// `mem_limit`'s induced-failure ceiling -- as [`port::TrackingAllocator`], together
+// with the `extern "C"` `zalloc` and `zfree` hooks the library calls and the
+// panic-freedom argument they need.
 //
-//   * Blocks are filled with 0xa5, never zeroed (`SENTINEL_FILL`). Any code that
-//     reads a freshly allocated byte before writing it sees garbage rather than a
-//     convenient zero.
-//   * Release order is checked. Memory obtained from a caller's `zalloc` may only
-//     be returned to that same caller's `zfree`, and the reference implementation
+// Reaching it from there is what lets this file carry `#![forbid(unsafe_code)]`. The
+// two hooks are called *from* the library across an `extern "C"` edge, so a panic
+// escaping either one would be undefined behaviour; that obligation is discharged
+// once, in the boundary module, instead of once per target. The three properties the
+// instrumentation buys are unchanged by the move, and each catches a class of defect
+// ordinary testing does not:
+//
+//   * Blocks are filled, never zeroed, so any code that reads a freshly allocated
+//     byte before writing it sees garbage rather than a convenient zero.
+//   * Release order is checked. Memory obtained from a caller's `zalloc` may only be
+//     returned to that same caller's `zfree`, and the reference implementation
 //     releases strictly last-in-first-out, so any other order is recorded.
 //   * A fuzzer-chosen ceiling refuses allocations at a chosen point, which turns
 //     `Z_MEM_ERROR` from an accident into a systematically reachable path.
-//
-// Both hooks are called *from C*, across an `extern "C"` boundary, so a panic
-// escaping either one would be undefined behaviour. They are therefore panic-free
-// by construction: no `unwrap`, no `expect`, no `assert!`, no slice indexing and
-// no arithmetic that can overflow. Every failure is reported the way the C
-// contract reports it -- by returning a null pointer, which the library turns into
-// `Z_MEM_ERROR`. Neither is declared `extern "C-unwind"`.
-
-/// One tracked allocation. Mirrors `struct mem_item` (`test/infcover.c` L56-L60).
-///
-/// `size` is stored for the same reason C stores it -- the zone's byte total has to
-/// be decremented by it on release -- and for one Rust-specific reason: `dealloc`
-/// must be handed a `Layout` identical to the one `alloc` received, so the length
-/// has to survive until the free. Getting that wrong is undefined behaviour that
-/// AddressSanitizer reports as an allocator mismatch.
-struct MemItem {
-    /// Base address handed to the library.
-    ptr: *mut u8,
-    /// Bytes requested, before the "never zero-sized" adjustment.
-    size: usize,
-    /// The rest of the list. C threads this by hand; an owning `Option<Box<_>>`
-    /// expresses the same shape without a raw pointer, so the list itself needs no
-    /// `unsafe` at all.
-    next: Option<Box<MemItem>>,
-}
-
-/// The root of the allocation list and its statistics. Mirrors `struct mem_zone`
-/// (`test/infcover.c` L63-L68).
-struct MemZone {
-    /// Most recently allocated block first -- C's `mem_zone::first`.
-    first: Option<Box<MemItem>>,
-    /// Live bytes.
-    total: usize,
-    /// Largest value `total` ever reached. This is `mem_high()`'s number, the same
-    /// high-water measure the per-stream memory budget is expressed in.
-    highwater: usize,
-    /// Refuse any request that would push `total` past this. Zero means no ceiling,
-    /// exactly as `mem_limit()` defines it.
-    limit: usize,
-    /// Frees that were not of the most recent block -- C's `notlifo`.
-    notlifo: usize,
-    /// Frees of an address the zone never handed out -- C's `rogue`.
-    rogue: usize,
-}
-
-/// What the `mem_done` equivalent found. Every field must be zero for a clean run.
-#[derive(Debug, Clone, Copy)]
-struct MemReport {
-    /// Blocks still live at teardown, i.e. leaked.
-    blocks: usize,
-    /// Bytes still live at teardown.
-    bytes: usize,
-    /// Non-last-in-first-out frees observed.
-    notlifo: usize,
-    /// Frees of unrecognised addresses observed.
-    rogue: usize,
-    /// Largest live-byte total the zone ever reached -- `mem_high()`'s number.
-    highwater: usize,
-    /// The ceiling this zone was created with; zero means it had none.
-    limit: usize,
-}
-
-impl MemZone {
-    /// The `mem_done` equivalent (`test/infcover.c` L200-L234): release anything
-    /// left behind and report what was unusual.
-    ///
-    /// The list is drained iteratively. Dropping a long `Option<Box<MemItem>>` chain
-    /// recurses once per node, so a deep list could overflow the stack; taking it
-    /// apart in a loop cannot. Real streams hold about five blocks, but a fuzz
-    /// target must not depend on that.
-    fn finish(&mut self) -> MemReport {
-        let mut blocks = 0usize;
-        let mut cursor = self.first.take();
-        while let Some(mut item) = cursor {
-            cursor = item.next.take();
-            if let Some(layout) = tracked_layout(item.size) {
-                // SAFETY: `item.ptr` came from `alloc` in `mem_alloc` with the layout
-                // `tracked_layout(item.size)` returns, which is what is rebuilt here --
-                // `tracked_layout` is a pure function of `size`, so the two agree by
-                // construction. The block is still live because it is still on this
-                // list, and removing it from the list here means it is freed exactly
-                // once.
-                unsafe { dealloc(item.ptr, layout) };
-            }
-            blocks = blocks.saturating_add(1);
-        }
-        MemReport {
-            blocks,
-            bytes: self.total,
-            notlifo: self.notlifo,
-            rogue: self.rogue,
-            highwater: self.highwater,
-            limit: self.limit,
-        }
-    }
-}
-
-impl Drop for MemZone {
-    /// Reclaims anything `finish` did not, so a session that panics part-way through
-    /// still does not leak. `finish` leaves `first` empty, so the common path here is
-    /// a no-op.
-    fn drop(&mut self) {
-        let _ = self.finish();
-    }
-}
-
-/// The layout a tracked block of `len` bytes is allocated with.
-///
-/// Two adjustments, both necessary:
-///
-/// - `len.max(1)`, because Rust's allocator forbids a zero-sized request while
-///   C's `malloc(0)` is legal. The zone still records the requested `len`, so the
-///   byte accounting matches C's.
-/// - `HOOK_ALIGN`, because the library is entitled to `malloc`-grade alignment.
-///
-/// Returns `None` rather than panicking if the pair is not a valid layout, which is
-/// what keeps `mem_alloc` panic-free.
-fn tracked_layout(len: usize) -> Option<Layout> {
-    Layout::from_size_align(len.max(1), HOOK_ALIGN).ok()
-}
-
-/// `mem_alloc` (`test/infcover.c` L71-L109).
-///
-/// # Safety
-///
-/// `opaque` must be null or a pointer to a live [`MemZone`] that no other
-/// reference is borrowing for the duration of this call. Installing it through
-/// [`Zone::as_opaque`] and letting only the library call this satisfies both.
-unsafe extern "C" fn mem_alloc(opaque: voidpf, count: uInt, size: uInt) -> voidpf {
-    let zone = opaque.cast::<MemZone>();
-    if zone.is_null() {
-        // C's "induced allocation failure" for a missing zone (its L79-L80).
-        return ptr::null_mut();
-    }
-
-    // SAFETY: the caller guarantees `opaque` addresses a live, aligned `MemZone`
-    // and that nothing else is borrowing it while this call runs. The library only
-    // reaches this function from inside a `deflate*` entry point, and the harness
-    // never holds a borrow across such a call, so the exclusivity holds.
-    let zone = unsafe { &mut *zone };
-
-    // `len = count * (size_t)size` (its L76), in the wide type. C cannot overflow
-    // here on a 64-bit target because both factors are 32-bit, but the product is
-    // checked rather than assumed so that the hook is correct on any target and
-    // cannot panic on one where it could.
-    let Some(len) = (count as usize).checked_mul(size as usize) else {
-        return ptr::null_mut();
-    };
-
-    // The induced failure proper (its L79): `zone->limit && zone->total + len >
-    // zone->limit`. Saturating, so the comparison is still meaningful if the sum
-    // would not fit.
-    if zone.limit != 0 && zone.total.saturating_add(len) > zone.limit {
-        return ptr::null_mut();
-    }
-
-    let Some(layout) = tracked_layout(len) else {
-        return ptr::null_mut();
-    };
-
-    // SAFETY: `tracked_layout` never returns a zero-sized layout, which is the one
-    // precondition `alloc` has.
-    let block = unsafe { alloc(layout) };
-    if block.is_null() {
-        // C's `if (ptr == NULL) return NULL;` (its L85-L86).
-        return ptr::null_mut();
-    }
-
-    // SAFETY: `alloc` just returned `block` as a valid, writable, uninitialised
-    // region of exactly `layout.size()` bytes, and nothing aliases it yet.
-    //
-    // This is the 0xa5 fill of C's L87 and the whole point of the instrumentation:
-    // the block is never zeroed, so any code depending on zeroed memory misbehaves
-    // visibly here instead of passing by luck.
-    unsafe { ptr::write_bytes(block, SENTINEL_FILL, layout.size()) };
-
-    // Insert at the head of the list (its L98-L100). A `Box` allocation failure
-    // aborts the process rather than unwinding, so it cannot cross the `extern "C"`
-    // boundary; C's corresponding path frees the block and reports failure.
-    zone.first = Some(Box::new(MemItem {
-        ptr: block,
-        size: len,
-        next: zone.first.take(),
-    }));
-
-    // Statistics (its L103-L105).
-    zone.total = zone.total.saturating_add(len);
-    if zone.total > zone.highwater {
-        zone.highwater = zone.total;
-    }
-
-    block.cast()
-}
-
-/// `mem_free` (`test/infcover.c` L112-L154).
-///
-/// One deliberate divergence: where C ends with an unconditional `free(ptr)`, this
-/// releases only blocks the zone recognises. Returning a pointer of unknown
-/// provenance and unknown layout to Rust's allocator is undefined behaviour, so a
-/// rogue free is counted and otherwise ignored. Counting it is what matters -- the
-/// assertion at teardown fails either way.
-///
-/// # Safety
-///
-/// `opaque` must be null or a pointer to a live [`MemZone`] that no other
-/// reference is borrowing for the duration of this call.
-unsafe extern "C" fn mem_free(opaque: voidpf, address: voidpf) {
-    let zone = opaque.cast::<MemZone>();
-    if zone.is_null() {
-        // C's "if no zone, just do a free" (its L118-L121). Without a zone nothing
-        // was ever handed out, so there is nothing to release.
-        return;
-    }
-
-    // SAFETY: as for `mem_alloc` -- the caller guarantees a live, aligned, unaliased
-    // `MemZone`, and the library only calls this from inside an entry point.
-    let zone = unsafe { &mut *zone };
-    let target = address.cast::<u8>();
-
-    // Walk the list looking for `target`, unlinking it if found (its L125-L140).
-    // `hops` counts how far in it was: zero means the head, which is the
-    // last-in-first-out case C treats as normal.
-    let mut hops = 0usize;
-    let mut cursor = &mut zone.first;
-    let removed = loop {
-        let found = match cursor.as_deref() {
-            None => break None,
-            Some(item) => ptr::eq(item.ptr, target),
-        };
-        if found {
-            // `cursor.take()` detaches the node and leaves the slot empty; splicing
-            // its successor back in restores the list.
-            let Some(mut item) = cursor.take() else {
-                break None;
-            };
-            *cursor = item.next.take();
-            break Some(item);
-        }
-        let Some(item) = cursor.as_deref_mut() else {
-            break None;
-        };
-        cursor = &mut item.next;
-        hops = hops.saturating_add(1);
-    };
-
-    match removed {
-        // "if not found, update the rogue count" (its L149-L150).
-        None => zone.rogue = zone.rogue.saturating_add(1),
-        Some(item) => {
-            if hops != 0 {
-                // "not a LIFO free" (its L136).
-                zone.notlifo = zone.notlifo.saturating_add(1);
-            }
-            // "update the statistics and free the item" (its L143-L146).
-            zone.total = zone.total.saturating_sub(item.size);
-            if let Some(layout) = tracked_layout(item.size) {
-                // SAFETY: `item.ptr` came from `alloc` in `mem_alloc` under
-                // `tracked_layout(item.size)`, and `tracked_layout` is a pure function
-                // of `size`, so the layout rebuilt here is the identical one. The node
-                // has just been unlinked, so this block is released exactly once and
-                // nothing holds a reference to it.
-                unsafe { dealloc(item.ptr, layout) };
-            }
-        }
-    }
-}
-
-/// A [`MemZone`] on the heap, reached only through the one raw pointer it owns.
-///
-/// **The zone cannot live in a local.** The pointer installed in `z_stream.opaque`
-/// is what [`mem_alloc`] and [`mem_free`] dereference; a later write through a
-/// *local* zone would be a write through the local's own provenance and would
-/// invalidate every pointer derived from it, leaving the next `zalloc` to
-/// dereference a dead one. Heap-allocating once and routing every access -- the
-/// harness's through [`Zone::with`] and the library's through `opaque` -- through
-/// this single pointer keeps the provenance chain intact. It is also how
-/// `test/infcover.c` holds its own zone, so the port is faithful rather than merely
-/// acceptable.
-struct Zone(*mut MemZone);
-
-impl Zone {
-    /// A zone with the given byte ceiling; zero means no ceiling.
-    ///
-    /// Every field is written out rather than filled in from
-    /// `..MemZone::default()`: struct-update syntax moves out of the base value,
-    /// which a type with a `Drop` implementation does not allow.
-    fn new(limit: usize) -> Self {
-        Self(Box::into_raw(Box::new(MemZone {
-            first: None,
-            total: 0,
-            highwater: 0,
-            limit,
-            notlifo: 0,
-            rogue: 0,
-        })))
-    }
-
-    /// The pointer to install as `z_stream.opaque`, as `mem_setup` does
-    /// (`test/infcover.c` L170).
-    fn as_opaque(&self) -> voidpf {
-        self.0.cast::<c_void>()
-    }
-
-    /// Borrows the zone through its one raw pointer for the duration of `body`.
-    fn with<R>(&self, body: impl FnOnce(&mut MemZone) -> R) -> R {
-        // SAFETY: the pointer came from `Box::into_raw` in `Zone::new`, is live until
-        // `Zone::drop`, and is aligned and unique. No other reference exists while
-        // `body` runs: the library forms one only inside `mem_alloc`/`mem_free`, and
-        // neither can be executing, because this call and any library call are on the
-        // same thread and neither is re-entrant.
-        body(unsafe { &mut *self.0 })
-    }
-
-    /// The `mem_done` equivalent: tear the zone down and return what it found.
-    fn finish(&self) -> MemReport {
-        self.with(MemZone::finish)
-    }
-}
-
-impl Drop for Zone {
-    fn drop(&mut self) {
-        // SAFETY: the pointer came from `Box::into_raw` in `Zone::new` and this is the
-        // only place it is reclaimed, so it is reclaimed exactly once. `MemZone`'s own
-        // `Drop` releases any block still tracked.
-        drop(unsafe { Box::from_raw(self.0) });
-    }
-}
-
-/// Points a stream at `zone`, as `mem_setup` does (`test/infcover.c` L158-L173).
-fn track(strm: &mut z_stream, zone: &Zone) {
-    strm.zalloc = Some(mem_alloc);
-    strm.zfree = Some(mem_free);
-    strm.opaque = zone.as_opaque();
-}
 
 /// Asserts what `mem_done`'s three alert lines report (`test/infcover.c`
 /// L220-L227), plus the leaked-block count those lines share.
 ///
 /// This is the check that validates the allocator half of the boundary contract:
-/// memory obtained from a caller's `zalloc` is released, in order, only through
-/// that same caller's `zfree`. `assert!` here is correct and required -- this runs
-/// in the `fuzz_target!` body, where a failed assertion is how libFuzzer reports a
-/// finding, not in a callback C might unwind through.
-fn assert_zone_clean(zone: &Zone, what: &str) {
-    let report = zone.finish();
-    assert_eq!(report.blocks, 0, "{what}: blocks not freed ({report:?})");
-    assert_eq!(report.bytes, 0, "{what}: bytes not freed ({report:?})");
+/// memory obtained from a caller's `zalloc` is released, in order, only through that
+/// same caller's `zfree`. `assert!` here is correct and required -- this runs in the
+/// `fuzz_target!` body, where a failed assertion is how libFuzzer reports a finding,
+/// not in a callback C might unwind through.
+///
+/// [`port::TrackingAllocator::finish`] is the `mem_done` equivalent: it releases
+/// anything left behind and reports what was found *before* that release, so a leak
+/// is still visible after it has been cleaned up.
+fn assert_zone_clean(allocator: &TrackingAllocator, what: &str) {
+    let report = allocator.finish();
+    assert_eq!(
+        report.live_blocks, 0,
+        "{what}: blocks not freed ({report:?})"
+    );
+    assert_eq!(report.live_bytes, 0, "{what}: bytes not freed ({report:?})");
     assert_eq!(report.notlifo, 0, "{what}: frees not LIFO ({report:?})");
     assert_eq!(report.rogue, 0, "{what}: frees not recognized ({report:?})");
+    assert_eq!(
+        report.allocations, report.frees,
+        "{what}: {} allocations against {} frees ({report:?})",
+        report.allocations, report.frees
+    );
 
     // The zone's own invariants, checked so that a defect in the instrumentation
     // cannot silently disable it. If the high-water mark were ever allowed past the
     // ceiling, the induced-failure logic would not be working and the `Z_MEM_ERROR`
     // coverage this target claims would be imaginary.
     assert!(
-        report.highwater >= report.bytes,
+        report.high_water >= report.live_bytes,
         "{what}: high-water mark below the live total ({report:?})"
     );
     assert!(
-        report.limit == 0 || report.highwater <= report.limit,
+        report.limit == 0 || report.high_water <= report.limit,
         "{what}: the allocator ceiling was exceeded ({report:?})"
+    );
+
+    // The boundary's own predicate, over the same ledger. Asserting it alongside the
+    // individual fields keeps the sharper messages above while still exercising the
+    // one function every other consumer of the ledger relies on.
+    assert!(
+        report.is_clean(),
+        "{what}: the allocator ledger is not clean ({report:?})"
     );
 }
 
@@ -1057,32 +769,13 @@ impl FuzzInput {
 //  Stream plumbing
 // ---------------------------------------------------------------------------
 
-/// A `z_stream` with every member cleared, as a caller declaring one at file scope
-/// would have.
-///
-/// Written out field by field rather than produced with `mem::zeroed`: the ABI
-/// mirror deliberately does not derive `Default`, because an all-zero stream is not
-/// yet an initialised one, and spelling the fields out keeps that distinction
-/// visible while needing no `unsafe` at all. `None` for the two hooks is C's
-/// `Z_NULL`, which selects the library's own allocator; [`track`] replaces them.
-fn blank_stream() -> z_stream {
-    z_stream {
-        next_in: ptr::null(),
-        avail_in: 0,
-        total_in: 0,
-        next_out: ptr::null_mut(),
-        avail_out: 0,
-        total_out: 0,
-        msg: ptr::null(),
-        state: ptr::null_mut(),
-        zalloc: None,
-        zfree: None,
-        opaque: ptr::null_mut(),
-        data_type: 0,
-        adler: 0,
-        reserved: 0,
-    }
-}
+// A cleared `z_stream` -- the one a caller declaring one at file scope would have --
+// comes from [`port::zeroed_stream`], which builds it field by field for the same
+// reason this file used to: the ABI mirror deliberately implements neither `Default`
+// nor `Zeroable`, because an all-zero stream is not yet an initialised one, and
+// spelling the fields out needs no `unsafe`. Its two null hooks are C's `Z_NULL`,
+// which selects the library's own allocator; [`TrackingAllocator::install`] replaces
+// them.
 
 /// Detaches the stream from whatever buffers it was last pointing at.
 ///
@@ -1107,11 +800,15 @@ fn detach_buffers(strm: &mut z_stream) {
 /// `(int) sizeof(z_stream)`, the second half of the handshake the `deflateInit2`
 /// macro arranges (`zlib.h` L543).
 ///
-/// Getting this wrong is a silent-failure trap: `deflateInit2_` answers
-/// `Z_VERSION_ERROR` for a mismatched size, so a target that passed the wrong value
-/// would initialise nothing, compress nothing, and still report success. The
-/// conversion is checked rather than cast for the same reason -- a size that did not
-/// fit a `c_int` would mean the mirror had outgrown anything `zlib.h` can describe.
+/// The ordinary initialisation gates supply this themselves, so the only caller left
+/// here is [`check_version_gate_ordering`], which needs the *correct* size in order to
+/// prove that a deliberately wrong one is refused -- and needs to pass a wrong one
+/// alongside it. Getting it wrong unintentionally is a silent-failure trap:
+/// `deflateInit2_` answers `Z_VERSION_ERROR` for a mismatched size, so a target that
+/// passed the wrong value would initialise nothing, compress nothing, and still report
+/// success. The conversion is checked rather than cast for the same reason -- a size
+/// that did not fit a `c_int` would mean the mirror had outgrown anything `zlib.h` can
+/// describe.
 fn stream_size() -> c_int {
     c_int::try_from(size_of::<z_stream>()).expect("sizeof(z_stream) fits in a C int")
 }
@@ -1149,29 +846,20 @@ fn assert_documented(code: c_int, allowed: &[c_int], what: &str) {
 ///
 /// Returns whether the stream is now initialised and owns state that must be ended.
 ///
-/// # Safety
-///
-/// `strm` must be a live, aligned `z_stream` that does not already own state, with its
-/// three allocator members set to either a matching hook pair and a live `opaque` or
-/// all null.
-unsafe fn init_stream(strm: &mut z_stream, config: Config, ceiling_active: bool) -> bool {
-    // SAFETY: `strm` is a live, aligned, exclusively borrowed `z_stream` whose three
-    // allocator members were set by `track` to a matching hook pair and a live zone
-    // pointer. `ZLIB_VERSION` is a `&CStr`, so its pointer addresses a readable
-    // NUL-terminated string valid for `'static`, and `stream_size` reports the size
-    // of the very type `strm` points at.
-    let code = unsafe {
-        deflateInit2_(
-            strm,
-            config.level,
-            config.method,
-            config.window_bits,
-            config.mem_level,
-            config.strategy,
-            ZLIB_VERSION.as_ptr(),
-            stream_size(),
-        )
-    };
+/// `strm` must not already own state, and its three allocator members must already be
+/// installed -- [`TrackingAllocator::install`] does that -- because `deflateInit2_` is
+/// the call that reaches `zalloc`. The version string and the stream size are the
+/// gate's own, so the handshake cannot be got wrong here by accident; getting it wrong
+/// on purpose is [`check_version_gate_ordering`]'s business.
+fn init_stream(strm: &mut z_stream, config: Config, ceiling_active: bool) -> bool {
+    let code = port::deflate_init2(
+        strm,
+        config.level,
+        config.method,
+        config.window_bits,
+        config.mem_level,
+        config.strategy,
+    );
 
     if init_is_legal(config) {
         if ceiling_active {
@@ -1207,49 +895,49 @@ unsafe fn init_stream(strm: &mut z_stream, config: Config, ceiling_active: bool)
 /// analogous ordering for `inflateBackInit_`. All three ways of failing the
 /// handshake are covered: a wrong major digit, a wrong `stream_size`, and a null
 /// version pointer.
+///
+/// None of the three is expressible through the ordinary initialisation gate, which
+/// fixes the version and the size and cannot spell a null stream at all, so this is
+/// what [`port::deflate_init2_null_stream`] exists for: `None` is the null version and
+/// `stream_size` is passed through unchanged.
 fn check_version_gate_ordering() {
-    let wrong_major: [c_char; 2] = [b'9' as c_char, 0];
-    let good = ZLIB_VERSION.as_ptr();
+    let wrong_major: &CStr = c"9";
 
     for (version, size, expected, what) in [
         (
-            wrong_major.as_ptr(),
+            Some(wrong_major),
             stream_size(),
             Z_VERSION_ERROR,
             "null stream, wrong major version",
         ),
-        (good, 0, Z_VERSION_ERROR, "null stream, wrong stream_size"),
         (
-            ptr::null::<c_char>(),
+            Some(ZLIB_VERSION),
+            0,
+            Z_VERSION_ERROR,
+            "null stream, wrong stream_size",
+        ),
+        (
+            None,
             stream_size(),
             Z_VERSION_ERROR,
             "null stream, null version",
         ),
         (
-            good,
+            Some(ZLIB_VERSION),
             stream_size(),
             Z_STREAM_ERROR,
             "null stream, acceptable handshake",
         ),
     ] {
-        // SAFETY: the stream pointer is deliberately null, which is a value the
-        // contract defines rather than a violation of it -- `deflateInit2_` tests it
-        // and answers `Z_STREAM_ERROR`, and never dereferences it. `version` is either
-        // null or the start of a readable NUL-terminated array that outlives the call:
-        // `wrong_major` is a local live for this whole loop, and `good` addresses a
-        // `'static` `CStr`.
-        let code = unsafe {
-            deflateInit2_(
-                ptr::null_mut(),
-                6,
-                Z_DEFLATED,
-                MAX_WBITS,
-                8,
-                Z_DEFAULT_STRATEGY,
-                version,
-                size,
-            )
-        };
+        let code = port::deflate_init2_null_stream(
+            6,
+            Z_DEFLATED,
+            MAX_WBITS,
+            8,
+            Z_DEFAULT_STRATEGY,
+            version,
+            size,
+        );
         assert_eq!(code, expected, "{what}");
     }
 }
@@ -1284,13 +972,11 @@ struct DriveOutcome {
 /// being consumed, and a one-byte output buffer needs one call per byte of pending
 /// output.
 ///
-/// # Safety
-///
 /// `strm` must hold a state this harness initialised. Its `next_in`/`next_out` members
 /// are overwritten on every iteration from buffers this function owns, so whatever they
 /// held on entry is irrelevant, and [`detach_buffers`] clears them again before this
 /// frame's buffers die -- so no dangling pointer survives the call.
-unsafe fn drive(strm: &mut z_stream, payload: &[u8], input: &FuzzInput) -> DriveOutcome {
+fn drive(strm: &mut z_stream, payload: &[u8], input: &FuzzInput) -> DriveOutcome {
     let chunk_len = input.chunk_len();
     let mut out = vec![0u8; input.out_len()];
 
@@ -1316,19 +1002,19 @@ unsafe fn drive(strm: &mut z_stream, payload: &[u8], input: &FuzzInput) -> Drive
         let remaining = payload.get(offset..).unwrap_or(&[]);
         let feeding = clamped(remaining, chunk_len);
 
-        // SAFETY: `feeding` and `out` are live slices this frame owns; the pointer and
-        // length handed over describe exactly them, and `avail_in`/`avail_out` are
-        // their true lengths. `next_in` is only read for `avail_in` bytes and
-        // `next_out` only written for `avail_out` bytes, which is the contract at
-        // `zlib.h` L96-L101. An empty `feeding` yields a dangling-but-aligned pointer
-        // with `avail_in` 0, which the contract permits and which nothing dereferences.
-        let code = unsafe {
-            strm.next_in = feeding.as_ptr();
-            strm.avail_in = feeding.len() as uInt;
-            strm.next_out = out.as_mut_ptr();
-            strm.avail_out = out.len() as uInt;
-            deflate(strm, flush)
-        };
+        // `feeding` and `out` are live slices this frame owns; the pointer and length
+        // installed describe exactly them, and `avail_in`/`avail_out` are their true
+        // lengths. `next_in` is only read for `avail_in` bytes and `next_out` only
+        // written for `avail_out` bytes, which is the contract at `zlib.h` L96-L101 and
+        // the precondition `port::deflate` documents. An empty `feeding` yields a
+        // dangling-but-aligned pointer with `avail_in` 0, which the contract permits and
+        // which nothing dereferences. Installing the four members is plain field
+        // assignment and needs no `unsafe`; the pointers are never dereferenced here.
+        strm.next_in = feeding.as_ptr();
+        strm.avail_in = feeding.len() as uInt;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as uInt;
+        let code = port::deflate(strm, flush);
 
         assert_documented(code, &DEFLATE_RETURNS, &format!("deflate(flush={flush})"));
 
@@ -1347,8 +1033,8 @@ unsafe fn drive(strm: &mut z_stream, payload: &[u8], input: &FuzzInput) -> Drive
             bound_disturbed = true;
         }
 
-        // Reading back two plain integer members through the exclusive borrow this
-        // function holds needs no `unsafe`: the pointer work was all on the way in.
+        // Reading back the two counters the call decremented, through the exclusive
+        // borrow this function holds.
         let consumed = feeding.len() - strm.avail_in as usize;
         let written = out.len() - strm.avail_out as usize;
         offset += consumed;
@@ -1439,23 +1125,16 @@ unsafe fn drive(strm: &mut z_stream, payload: &[u8], input: &FuzzInput) -> Drive
 /// two types differ the values may legitimately differ too; they are compared only
 /// where the narrowing is lossless.
 ///
-/// # Safety
-///
-/// `strm` must be a live, aligned `z_stream`. It need not be initialised: a failed
-/// state check simply makes both functions return the larger conservative bound.
-unsafe fn assert_within_bound(strm: &mut z_stream, source_len: usize, produced: usize, what: &str) {
-    // SAFETY: `strm` is a live, aligned, exclusively borrowed `z_stream`. Both
-    // functions accept an uninitialised or already-ended stream -- `deflateStateCheck`
-    // failing simply makes them return the larger conservative bound (`deflate.c`
-    // L855-L858) -- so there is no state precondition to uphold beyond the pointer
-    // being valid.
-    let bound_z = unsafe { deflateBound_z(strm, source_len as z_size_t) };
+/// `strm` need not be initialised: both functions accept an uninitialised or
+/// already-ended stream -- a failed `deflateStateCheck` simply makes them return the
+/// larger conservative bound (`deflate.c` L855-L858) -- so there is no state
+/// precondition to uphold. `Some` is what carries the stream through the gate; `None`
+/// there would be C's null `z_streamp`, which this check has no use for.
+fn assert_within_bound(strm: &mut z_stream, source_len: usize, produced: usize, what: &str) {
+    let bound_z = port::deflate_bound_z(Some(&mut *strm), source_len);
 
     let narrowed = match uLong::try_from(source_len) {
-        Ok(len) => {
-            // SAFETY: as above.
-            Some(unsafe { deflateBound(strm, len) })
-        }
+        Ok(len) => Some(port::deflate_bound(Some(&mut *strm), len)),
         Err(_) => None,
     };
 
@@ -1495,10 +1174,8 @@ unsafe fn assert_within_bound(strm: &mut z_stream, source_len: usize, produced: 
 /// arithmetic is most fragile, along with `usize::MAX` and `uLong::MAX` to force the
 /// saturating branch.
 ///
-/// # Safety
-///
-/// `strm` must be a live, aligned `z_stream`; as above, it need not be initialised.
-unsafe fn assert_bounds_are_monotonic(strm: &mut z_stream) {
+/// As above, `strm` need not be initialised.
+fn assert_bounds_are_monotonic(strm: &mut z_stream) {
     let lengths: [usize; 9] = [
         0,
         1,
@@ -1514,9 +1191,7 @@ unsafe fn assert_bounds_are_monotonic(strm: &mut z_stream) {
     let mut previous_z: z_size_t = 0;
     let mut previous_compress_z: z_size_t = 0;
     for len in lengths {
-        // SAFETY: `strm` is a live, aligned, exclusively borrowed `z_stream`; neither
-        // bound function requires it to be initialised.
-        let bound_z = unsafe { deflateBound_z(strm, len as z_size_t) };
+        let bound_z = port::deflate_bound_z(Some(&mut *strm), len);
         assert!(
             bound_z >= previous_z,
             "deflateBound_z is not monotonic: {len} bytes bounded by {bound_z}, \
@@ -1528,7 +1203,10 @@ unsafe fn assert_bounds_are_monotonic(strm: &mut z_stream) {
         );
         previous_z = bound_z;
 
-        let compress_z = compressBound_z(len as z_size_t);
+        // `compressBound_z` takes no pointer, so the facade declares it safe and it is
+        // called directly rather than through a gate. `z_size_t` is `size_t`, so a
+        // `usize` length needs no conversion.
+        let compress_z = compressBound_z(len);
         assert!(
             compress_z >= previous_compress_z,
             "compressBound_z is not monotonic: {len} bytes bounded by {compress_z}, \
@@ -1546,8 +1224,7 @@ unsafe fn assert_bounds_are_monotonic(strm: &mut z_stream) {
     let mut previous_compress: uLong = 0;
     for len in [0u32, 1, 2, 127, 4095, 4096, 4097, u32::MAX] {
         let len = uLong::from(len);
-        // SAFETY: as above.
-        let bound = unsafe { deflateBound(strm, len) };
+        let bound = port::deflate_bound(Some(&mut *strm), len);
         assert!(
             bound >= previous,
             "deflateBound is not monotonic: {len} bytes bounded by {bound}, \
@@ -1577,28 +1254,17 @@ unsafe fn assert_bounds_are_monotonic(strm: &mut z_stream) {
 /// internal allocator and never touches the tracking zone.
 fn check_compress_bound_contract(payload: &[u8], level: c_int) {
     let source_len = payload.len();
-    let bound = compressBound_z(source_len as z_size_t);
+    let bound = compressBound_z(source_len);
     assert!(
         bound >= source_len,
         "compressBound_z({source_len}) returned {bound}, below the input itself"
     );
 
     let mut dest = vec![0u8; bound.max(1)];
-    let mut dest_len = dest.len() as uLongf;
 
-    // SAFETY: `dest` is writable for `dest_len` bytes and `payload` readable for
-    // `source_len` bytes, which is exactly what the two pointer/length pairs describe;
-    // both live for the whole call. `dest_len` is an out-parameter the function
-    // overwrites with the length actually used, so it must be, and is, a live `uLongf`.
-    let code = unsafe {
-        compress2(
-            dest.as_mut_ptr(),
-            &mut dest_len,
-            payload.as_ptr().cast::<Bytef>(),
-            source_len as uLong,
-            level,
-        )
-    };
+    // The gate sizes `destLen` from the destination slice and returns the length the
+    // call wrote back through that out-parameter, which is the number checked below.
+    let (code, dest_len) = port::compress2(&mut dest, payload, level);
 
     // `Z_DEFAULT_COMPRESSION` reaches `deflateInit`, which rewrites it to 6, so it is
     // legal here for the same reason it is legal at initialisation.
@@ -1643,10 +1309,12 @@ fn check_compress_bound_contract(payload: &[u8], level: c_int) {
 /// returned the pointer instead would hand back a dangle, and AddressSanitizer would
 /// report the harness's bug as a library crash.
 ///
-/// The pointer is taken with `ptr::addr_of_mut!` rather than `&mut head`, so it
-/// carries the struct's own provenance and no reference is ever formed. (`&raw mut`
-/// would say the same thing but is Rust 1.82 syntax, above this crate's 1.80 floor.)
-fn with_header<R>(input: &FuzzInput, body: impl FnOnce(gz_headerp) -> R) -> R {
+/// `body` receives the header by exclusive reference, which is what
+/// [`port::deflate_set_header`] takes. The raw pointer the library stores is formed
+/// inside that gate; what this frame provides is the guarantee behind it -- the struct
+/// and all three buffers are locals here, so nothing can be dropped or moved while
+/// `body` runs.
+fn with_header<R>(input: &FuzzInput, body: impl FnOnce(&mut gz_header) -> R) -> R {
     let flags = input.header_flags;
 
     // `extra` carries a length, so it needs no terminator; it is given at least one
@@ -1701,7 +1369,7 @@ fn with_header<R>(input: &FuzzInput, body: impl FnOnce(gz_headerp) -> R) -> R {
         done: 0,
     };
 
-    body(ptr::addr_of_mut!(head))
+    body(&mut head)
 }
 
 /// Installs a gzip header and asserts the answer the wrapper implies.
@@ -1711,16 +1379,11 @@ fn with_header<R>(input: &FuzzInput, body: impl FnOnce(gz_headerp) -> R) -> R {
 /// decides which is correct. The negative case is worth asserting in its own right:
 /// it is the one that proves a zlib or raw stream cannot be given a gzip header.
 ///
-/// # Safety
-///
-/// `strm` must hold a state this harness initialised, and `head` must remain live
-/// and unmoved for as long as the stream might read it -- which [`with_header`]
-/// arranges.
-unsafe fn apply_header(strm: &mut z_stream, config: Config, head: gz_headerp) {
-    // SAFETY: `strm` holds a state initialised by `init_stream`, and `head` addresses
-    // a live, aligned `gz_header` whose buffers are live for the whole enclosing
-    // `with_header` call, NUL-terminated where the contract requires it.
-    let code = unsafe { deflateSetHeader(strm, head) };
+/// `strm` must hold a state this harness initialised, and `head` must remain live and
+/// unmoved for as long as the stream might read it -- which [`with_header`] arranges,
+/// because `deflate.c` L718 stores the caller's pointer rather than copying anything.
+fn apply_header(strm: &mut z_stream, config: Config, head: &mut gz_header) {
+    let code = port::deflate_set_header(strm, head);
     if is_gzip(config) {
         assert_eq!(
             code, Z_OK,
@@ -1745,21 +1408,19 @@ unsafe fn apply_header(strm: &mut z_stream, config: Config, head: gz_headerp) {
 ///
 /// A zero-length dictionary is deliberately reachable and must still be accepted.
 ///
-/// # Safety
-///
 /// `strm` must hold a state this harness initialised.
-unsafe fn apply_dictionary(
+fn apply_dictionary(
     strm: &mut z_stream,
     config: Config,
     dictionary: &[u8],
     untouched: bool,
 ) -> bool {
-    let len = uInt::try_from(dictionary.len()).unwrap_or(0);
-    // SAFETY: `strm` holds a state initialised by `init_stream`. `dictionary.as_ptr()`
-    // is non-null and readable for `len` bytes for the whole call -- an empty slice
-    // yields a dangling-but-aligned non-null pointer, which is what the contract wants,
-    // because it tests the pointer against `Z_NULL` and then reads exactly `len` bytes.
-    let code = unsafe { deflateSetDictionary(strm, dictionary.as_ptr().cast::<Bytef>(), len) };
+    let len = dictionary.len();
+    // The gate passes the slice's own pointer verbatim, an empty slice included, and
+    // that is what keeps the zero-length case reachable: `deflate.c` L586 refuses a
+    // *null* dictionary outright, whereas a non-null pointer with a zero length is an
+    // ordinary zero-byte dictionary that must be accepted.
+    let code = port::deflate_set_dictionary(strm, dictionary);
 
     if is_gzip(config) {
         assert_eq!(
@@ -1837,10 +1498,8 @@ fn window_size(config: Config) -> usize {
 /// Calling it twice must report the same length: reading a dictionary does not
 /// consume it.
 ///
-/// # Safety
-///
 /// `strm` must hold a state this harness initialised.
-unsafe fn check_get_dictionary(strm: &mut z_stream, window: usize, expected: Option<usize>) {
+fn check_get_dictionary(strm: &mut z_stream, window: usize, expected: Option<usize>) {
     // Exactly what a correct caller allocates: the window, which is the most the
     // function can ever write. Sizing it to the window rather than to the largest
     // window there is makes the overrun check below sharper -- a report past the end of
@@ -1852,13 +1511,10 @@ unsafe fn check_get_dictionary(strm: &mut z_stream, window: usize, expected: Opt
         "a {window}-byte window exceeds 1 << MAX_WBITS"
     );
     let mut buffer = vec![0u8; window.max(1)];
-    let mut length: c_uint = c_uint::MAX;
 
-    // SAFETY: `strm` holds a state initialised by `init_stream`. `buffer` is writable
-    // for `GET_DICTIONARY_BUF_LEN` bytes, which is at least the largest window the
-    // library can have, and `length` is a live `c_uint` out-parameter.
-    let code =
-        unsafe { deflateGetDictionary(strm, buffer.as_mut_ptr().cast::<Bytef>(), &mut length) };
+    // The gate carries the destination as a slice, so the length the library may write
+    // is the length of a real allocation rather than a number the harness promised.
+    let (code, length) = port::deflate_get_dictionary(strm, Some(&mut buffer));
     assert_eq!(code, Z_OK, "deflateGetDictionary on a live stream");
 
     let reported = usize::try_from(length).unwrap_or(usize::MAX);
@@ -1880,10 +1536,9 @@ unsafe fn check_get_dictionary(strm: &mut z_stream, window: usize, expected: Opt
     }
 
     // The length-only form, which a caller uses to size a buffer before asking again.
-    let mut again: c_uint = c_uint::MAX;
-    // SAFETY: as above; a null dictionary pointer is explicitly permitted and means
+    // `None` is C's `dictionary == Z_NULL`, which is explicitly permitted and means
     // "report the length only" (`deflate.c` L638).
-    let code = unsafe { deflateGetDictionary(strm, ptr::null_mut(), &mut again) };
+    let (code, again) = port::deflate_get_dictionary(strm, None);
     assert_eq!(code, Z_OK, "deflateGetDictionary reporting length only");
     assert_eq!(
         again, length,
@@ -1927,16 +1582,9 @@ unsafe fn check_get_dictionary(strm: &mut z_stream, window: usize, expected: Opt
 ///    That is the sharpest true statement of the promise: the bound was sufficient all
 ///    along and only the status code lagged.
 ///
-/// # Safety
-///
 /// `strm` must hold a state this harness initialised, and `payload` must be live for the
 /// whole call.
-unsafe fn bound_contract_pass(
-    strm: &mut z_stream,
-    payload: &[u8],
-    bound: usize,
-    config: Config,
-) -> usize {
+fn bound_contract_pass(strm: &mut z_stream, payload: &[u8], bound: usize, config: Config) -> usize {
     let mut out = vec![0u8; bound.max(1)];
     // Checked rather than cast, and deliberately loud. A silently truncated `avail_in`
     // would compress fewer bytes than intended while every assertion below still
@@ -1945,18 +1593,15 @@ unsafe fn bound_contract_pass(
     let avail_out = uInt::try_from(out.len()).expect("the bound fits a uInt");
     let avail_in = uInt::try_from(payload.len()).expect("the payload fits a uInt");
 
-    // SAFETY: `payload` is readable for `avail_in` bytes and `out` writable for
-    // `avail_out` bytes; both are live for the whole call and the pointer/length pairs
-    // describe exactly them. `strm` holds a state this harness initialised.
-    let code = unsafe {
-        strm.next_in = payload.as_ptr();
-        strm.avail_in = avail_in;
-        strm.next_out = out.as_mut_ptr();
-        strm.avail_out = avail_out;
-        deflate(strm, Z_FINISH)
-    };
+    // `payload` is readable for `avail_in` bytes and `out` writable for `avail_out`
+    // bytes; both are live for the whole call and the two pointer/length pairs describe
+    // exactly them, which is the precondition `port::deflate` documents.
+    strm.next_in = payload.as_ptr();
+    strm.avail_in = avail_in;
+    strm.next_out = out.as_mut_ptr();
+    strm.avail_out = avail_out;
+    let code = port::deflate(strm, Z_FINISH);
 
-    // Reading plain integer members through an exclusive borrow needs no `unsafe`.
     let produced = out.len() - strm.avail_out as usize;
     let room_left = strm.avail_out;
 
@@ -1990,15 +1635,13 @@ unsafe fn bound_contract_pass(
     // (4). Generous room, so a genuine bound violation is measured rather than masked.
     let mut spare = vec![0u8; bound + MAX_OUTPUT_BUF_LEN];
     let spare_avail = uInt::try_from(spare.len()).expect("the spare buffer fits a uInt");
-    // SAFETY: `spare` is writable for `spare_avail` bytes and live across the call; no
-    // further input is offered, which `avail_in` 0 states truthfully.
-    let code = unsafe {
-        strm.next_in = ptr::null();
-        strm.avail_in = 0;
-        strm.next_out = spare.as_mut_ptr();
-        strm.avail_out = spare_avail;
-        deflate(strm, Z_FINISH)
-    };
+    // `spare` is writable for `spare_avail` bytes and live across the call; no further
+    // input is offered, which `avail_in` 0 states truthfully.
+    strm.next_in = ptr::null();
+    strm.avail_in = 0;
+    strm.next_out = spare.as_mut_ptr();
+    strm.avail_out = spare_avail;
+    let code = port::deflate(strm, Z_FINISH);
     let extra = spare.len() - strm.avail_out as usize;
 
     // `out` and `spare` both die with this frame.
@@ -2035,25 +1678,20 @@ unsafe fn bound_contract_pass(
 /// `Z_FINISH`. Nothing in this session primes, retunes or resets, so none of the
 /// disqualifying operations can interfere.
 ///
-/// # Safety
-///
 /// `head` must remain live and unmoved for the whole call, which is what the enclosing
 /// [`with_header`] frame guarantees.
-unsafe fn run_bound_session(input: &FuzzInput, config: Config, head: gz_headerp) {
-    let zone = Zone::new(input.alloc_limit());
-    let mut strm = blank_stream();
-    track(&mut strm, &zone);
+fn run_bound_session(input: &FuzzInput, config: Config, head: &mut gz_header) {
+    let allocator = TrackingAllocator::with_limit(input.alloc_limit());
+    let mut strm = port::zeroed_stream();
+    allocator.install(&mut strm);
 
-    // SAFETY: `strm` is a live local with a matching hook pair and a live zone pointer.
-    if !unsafe { init_stream(&mut strm, config, input.alloc_limit() != 0) } {
-        assert_zone_clean(&zone, "bound session, initialisation refused");
+    if !init_stream(&mut strm, config, input.alloc_limit() != 0) {
+        assert_zone_clean(&allocator, "bound session, initialisation refused");
         return;
     }
 
     if input.wants(OP_BOUND_HEADER) {
-        // SAFETY: `strm` holds a state `init_stream` installed; `head` is live for the
-        // whole enclosing `with_header` frame, which encloses this session.
-        unsafe { apply_header(&mut strm, config, head) };
+        apply_header(&mut strm, config, head);
     }
     // The exact number of dictionary bytes the stream should now be holding: nothing
     // when no dictionary was offered or it was refused, and otherwise the dictionary
@@ -2061,24 +1699,22 @@ unsafe fn run_bound_session(input: &FuzzInput, config: Config, head: gz_headerp)
     let window = window_size(config);
     let mut retained = 0usize;
     if input.wants(OP_BOUND_DICTIONARY) {
-        // SAFETY: as above; the stream has had no input, hence `untouched`.
-        let accepted = unsafe { apply_dictionary(&mut strm, config, input.dictionary(), true) };
+        // The stream has had no input, hence `untouched`.
+        let accepted = apply_dictionary(&mut strm, config, input.dictionary(), true);
         if accepted {
             retained = input.dictionary().len().min(window);
         }
     }
     if input.wants(OP_GET_DICTIONARY) {
         // Nothing has been compressed yet, so the retained length is pinned exactly.
-        // SAFETY: as above.
-        unsafe { check_get_dictionary(&mut strm, window, Some(retained)) };
+        check_get_dictionary(&mut strm, window, Some(retained));
     }
 
     let payload = input.payload();
 
     // The bound, taken last of all -- after the header and the dictionary, both of
     // which change it.
-    // SAFETY: `strm` holds a state `init_stream` installed.
-    let bound = unsafe { deflateBound_z(&mut strm, payload.len() as z_size_t) };
+    let bound = port::deflate_bound_z(Some(&mut strm), payload.len());
     assert!(
         bound >= payload.len(),
         "deflateBound_z returned {bound} for {} bytes, below the input itself",
@@ -2088,36 +1724,30 @@ unsafe fn run_bound_session(input: &FuzzInput, config: Config, head: gz_headerp)
     // Defensive, and unreachable with the payload cap in force: a bound larger than
     // the output cap would mean allocating more than this target is willing to.
     if bound > MAX_TOTAL_OUTPUT {
-        // SAFETY: as above.
         assert_documented(
-            unsafe { deflateEnd(&mut strm) },
+            port::deflate_end(&mut strm),
             &[Z_OK, Z_DATA_ERROR],
             "deflateEnd after an unexpectedly large bound",
         );
-        assert_zone_clean(&zone, "bound session, bound too large to exercise");
+        assert_zone_clean(&allocator, "bound session, bound too large to exercise");
         return;
     }
 
-    // SAFETY: `strm` holds a state `init_stream` installed, and `payload` is live for
-    // the whole call.
-    let produced = unsafe { bound_contract_pass(&mut strm, payload, bound, config) };
+    let produced = bound_contract_pass(&mut strm, payload, bound, config);
 
-    // SAFETY: `strm` holds a state `init_stream` installed.
-    unsafe { assert_within_bound(&mut strm, payload.len(), produced, "bound session") };
+    assert_within_bound(&mut strm, payload.len(), produced, "bound session");
 
     if input.wants(OP_BOUND_MONOTONIC) {
-        // SAFETY: as above.
-        unsafe { assert_bounds_are_monotonic(&mut strm) };
+        assert_bounds_are_monotonic(&mut strm);
     }
 
     // `out` dies with this frame. See `detach_buffers`.
     detach_buffers(&mut strm);
 
-    // SAFETY: as above.
-    let end = unsafe { deflateEnd(&mut strm) };
+    let end = port::deflate_end(&mut strm);
     assert_eq!(end, Z_OK, "deflateEnd after a completed single pass");
 
-    assert_zone_clean(&zone, "bound session");
+    assert_zone_clean(&allocator, "bound session");
 }
 
 // ---------------------------------------------------------------------------
@@ -2138,19 +1768,15 @@ unsafe fn run_bound_session(input: &FuzzInput, config: Config, head: gz_headerp)
 /// Both out-parameters are also exercised in their null forms, which the contract
 /// permits and which must not write anything.
 ///
-/// # Safety
-///
 /// `strm` must hold a state this harness initialised.
-unsafe fn check_pending(strm: &mut z_stream) {
+fn check_pending(strm: &mut z_stream) {
     /// `Buf_size` -- the bit buffer is a `ush`, so sixteen bits (`deflate.h` L332).
     const BUF_SIZE: c_int = 16;
 
     let mut pending: c_uint = c_uint::MAX;
     let mut bits: c_int = c_int::MIN;
 
-    // SAFETY: `strm` holds a state `init_stream` installed, and both out-parameters are
-    // live, aligned locals of this frame.
-    let code = unsafe { deflatePending(strm, &mut pending, &mut bits) };
+    let code = port::deflate_pending(strm, &mut pending, &mut bits);
     // `Z_BUF_ERROR` is documented for a `pending` count too large for an `unsigned`,
     // which cannot arise at these sizes but is part of the contract.
     assert_documented(code, &[Z_OK, Z_BUF_ERROR], "deflatePending");
@@ -2162,9 +1788,10 @@ unsafe fn check_pending(strm: &mut z_stream) {
         );
     }
 
-    // SAFETY: as above, with both out-parameters null -- explicitly permitted, and the
-    // assertion is that nothing is written through them.
-    let code = unsafe { deflatePending(strm, ptr::null_mut(), ptr::null_mut()) };
+    // Both out-parameters null -- explicitly permitted, and the assertion is that
+    // nothing is written through them. A safe signature cannot spell that pair, so it
+    // has its own gate.
+    let code = port::deflate_pending_null(strm);
     assert_documented(
         code,
         &[Z_OK, Z_BUF_ERROR],
@@ -2172,16 +1799,16 @@ unsafe fn check_pending(strm: &mut z_stream) {
     );
 
     let mut used: c_int = c_int::MIN;
-    // SAFETY: as above; `used` is a live, aligned local.
-    let code = unsafe { deflateUsed(strm, &mut used) };
+    let code = port::deflate_used(strm, &mut used);
     assert_eq!(code, Z_OK, "deflateUsed on a live stream");
     assert!(
         (0..=BUF_SIZE).contains(&used),
         "deflateUsed reported {used} bits, outside the bit buffer's capacity"
     );
 
-    // SAFETY: as above; a null out-parameter is permitted (`deflate.c` L739).
-    let code = unsafe { deflateUsed(strm, ptr::null_mut()) };
+    // A null out-parameter is permitted (`deflate.c` L739), and again only a dedicated
+    // gate can express it.
+    let code = port::deflate_used_null(strm);
     assert_eq!(code, Z_OK, "deflateUsed with a null output");
 }
 
@@ -2209,16 +1836,12 @@ unsafe fn check_pending(strm: &mut z_stream) {
 /// a stream that was never asked to finish must not answer `Z_STREAM_ERROR` -- instead
 /// of widening it to accept everything everywhere.
 ///
-/// # Safety
-///
 /// `strm` must hold a state this harness initialised, with `next_out` either null or
-/// pointing at a buffer that is live for this whole call -- the internal `deflate` writes
-/// through it.
-unsafe fn apply_params(strm: &mut z_stream, level: c_int, strategy: c_int, finish_issued: bool) {
-    // SAFETY: `strm` holds a state `init_stream` installed. `deflateParams` may call
-    // `deflate` internally, which reads `next_in`/`next_out` as the driving loop left
-    // them -- both were set from live slices that are still live at every call site.
-    let code = unsafe { deflateParams(strm, level, strategy) };
+/// pointing at a buffer that is live for this whole call: `deflateParams` may call
+/// `deflate` internally, which reads `next_in`/`next_out` as they were left, so both
+/// loans must still be good. Every call site here lends a buffer that is.
+fn apply_params(strm: &mut z_stream, level: c_int, strategy: c_int, finish_issued: bool) {
+    let code = port::deflate_params(strm, level, strategy);
     if params_are_legal(level, strategy) {
         let allowed: &[c_int] = if finish_issued {
             &[Z_OK, Z_BUF_ERROR, Z_STREAM_ERROR]
@@ -2247,13 +1870,9 @@ unsafe fn apply_params(strm: &mut z_stream, level: c_int, strategy: c_int, finis
 /// inconsistent stream. So the assertion here is that an out-of-range count is never
 /// *accepted*, rather than that it produces one particular refusal.
 ///
-/// # Safety
-///
 /// `strm` must hold a state this harness initialised.
-unsafe fn apply_prime(strm: &mut z_stream, bits: c_int, value: c_int) {
-    // SAFETY: `strm` holds a state `init_stream` installed; both arguments are plain
-    // integers and nothing is dereferenced.
-    let code = unsafe { deflatePrime(strm, bits, value) };
+fn apply_prime(strm: &mut z_stream, bits: c_int, value: c_int) {
+    let code = port::deflate_prime(strm, bits, value);
     assert_documented(
         code,
         &[Z_OK, Z_BUF_ERROR, Z_STREAM_ERROR],
@@ -2276,17 +1895,15 @@ unsafe fn apply_prime(strm: &mut z_stream, bits: c_int, value: c_int) {
 /// frees, and the teardown assertion would fail on the harness's mistake rather than
 /// on anything the library did.
 ///
-/// # Safety
-///
 /// `source` must hold a state this harness initialised.
-unsafe fn check_copy(source: &mut z_stream) {
-    let mut clone = blank_stream();
+fn check_copy(source: &mut z_stream) {
+    let mut clone = port::zeroed_stream();
 
-    // SAFETY: `source` holds a state `init_stream` installed; `clone` is a live,
-    // aligned, exclusively borrowed `z_stream`. `deflateCopy` overwrites every member
-    // of the destination, so its prior contents need not mean anything -- but it must
-    // not already own state, and a blank stream does not.
-    let code = unsafe { deflateCopy(&mut clone, source) };
+    // `deflateCopy` overwrites every member of the destination, so its prior contents
+    // need not mean anything -- but it must not already own state, and a cleared stream
+    // does not. The two exclusive borrows are also how the gate establishes that source
+    // and destination cannot alias, which is the one thing the copy cannot tolerate.
+    let code = port::deflate_copy(&mut clone, source);
     assert_documented(code, &[Z_OK, Z_MEM_ERROR], "deflateCopy from a live stream");
 
     if code != Z_OK {
@@ -2297,33 +1914,28 @@ unsafe fn check_copy(source: &mut z_stream) {
 
     // The clone is a working compressor in its own right: a `Z_FINISH` pass into ample
     // room must complete. Ample means the clone's own bound, taken now.
-    // SAFETY: `clone` now holds state `deflateCopy` installed.
-    let bound = unsafe { deflateBound_z(&mut clone, 0) };
+    let bound = port::deflate_bound_z(Some(&mut clone), 0);
     let mut out = vec![0u8; bound.clamp(1, MAX_TOTAL_OUTPUT)];
-    // SAFETY: `out` is writable for its whole length and lives across the call; no
-    // input is supplied, which `avail_in` 0 states truthfully.
-    let code = unsafe {
-        clone.next_in = ptr::null();
-        clone.avail_in = 0;
-        clone.next_out = out.as_mut_ptr();
-        clone.avail_out = uInt::try_from(out.len()).unwrap_or(0);
-        deflate(&mut clone, Z_FINISH)
-    };
+    // `out` is writable for its whole length and lives across the call; no input is
+    // supplied, which `avail_in` 0 states truthfully.
+    clone.next_in = ptr::null();
+    clone.avail_in = 0;
+    clone.next_out = out.as_mut_ptr();
+    clone.avail_out = uInt::try_from(out.len()).unwrap_or(0);
+    let code = port::deflate(&mut clone, Z_FINISH);
     assert_documented(code, &DEFLATE_RETURNS, "deflate on a cloned stream");
 
     // `out` dies at the end of this function, so the clone gives its loan back first.
     detach_buffers(&mut clone);
 
-    // SAFETY: `clone` holds state `deflateCopy` installed. `Z_DATA_ERROR` is documented
-    // for a stream ended while still compressing, which is reachable here whenever the
-    // pass above did not finish.
-    let end = unsafe { deflateEnd(&mut clone) };
+    // `Z_DATA_ERROR` is documented for a stream ended while still compressing, which is
+    // reachable here whenever the pass above did not finish.
+    let end = port::deflate_end(&mut clone);
     assert_documented(end, &[Z_OK, Z_DATA_ERROR], "deflateEnd on a cloned stream");
 
     // The source must be untouched by all of this.
     let mut used: c_int = c_int::MIN;
-    // SAFETY: `source` still holds the state it did before the copy.
-    let code = unsafe { deflateUsed(source, &mut used) };
+    let code = port::deflate_used(source, &mut used);
     assert_eq!(
         code, Z_OK,
         "the source stream stopped working after being copied"
@@ -2337,34 +1949,25 @@ unsafe fn check_copy(source: &mut z_stream) {
 /// (`deflate.c` L1195-L1197). Both halves are asserted, because together they are
 /// what lets a caller call `deflate` one time too many without consequence.
 ///
-/// # Safety
-///
-/// `strm` must hold a state this harness initialised that has reached
-/// `Z_STREAM_END`.
-unsafe fn check_after_finish(strm: &mut z_stream) {
+/// `strm` must hold a state this harness initialised that has reached `Z_STREAM_END`.
+fn check_after_finish(strm: &mut z_stream) {
     let mut out = [0u8; 32];
 
-    // SAFETY: `strm` holds a finished state `init_stream` installed; `out` is a live
-    // local writable for its whole length, and `avail_in` 0 with a null `next_in` is
-    // the documented way to supply no input.
-    let code = unsafe {
-        strm.next_in = ptr::null();
-        strm.avail_in = 0;
-        strm.next_out = out.as_mut_ptr();
-        strm.avail_out = out.len() as uInt;
-        deflate(strm, Z_NO_FLUSH)
-    };
+    // `out` is a live local writable for its whole length, and `avail_in` 0 with a null
+    // `next_in` is the documented way to supply no input.
+    strm.next_in = ptr::null();
+    strm.avail_in = 0;
+    strm.next_out = out.as_mut_ptr();
+    strm.avail_out = out.len() as uInt;
+    let code = port::deflate(strm, Z_NO_FLUSH);
     assert_eq!(
         code, Z_STREAM_ERROR,
         "deflate accepted Z_NO_FLUSH after the stream had finished"
     );
 
-    // SAFETY: as above.
-    let code = unsafe {
-        strm.next_out = out.as_mut_ptr();
-        strm.avail_out = out.len() as uInt;
-        deflate(strm, Z_FINISH)
-    };
+    strm.next_out = out.as_mut_ptr();
+    strm.avail_out = out.len() as uInt;
+    let code = port::deflate(strm, Z_FINISH);
     assert_eq!(
         code, Z_STREAM_END,
         "a repeated Z_FINISH on a finished stream must answer Z_STREAM_END again"
@@ -2419,26 +2022,22 @@ impl Disturbances {
 /// go in before compression starts, and the introspection calls are cheap enough to
 /// make unconditionally.
 ///
-/// # Safety
-///
 /// `strm` must hold a state this harness initialised and must not yet have been given
 /// input.
-unsafe fn apply_pre_compression_ops(
+fn apply_pre_compression_ops(
     strm: &mut z_stream,
     input: &FuzzInput,
     config: Config,
-    head: gz_headerp,
+    head: &mut gz_header,
 ) -> Disturbances {
     let mut disturbed = Disturbances::default();
 
     if input.wants(OP_STRESS_HEADER) {
-        // SAFETY: `strm` holds a state `init_stream` installed; `head` is live for the
-        // whole enclosing `with_header` frame.
-        unsafe { apply_header(strm, config, head) };
+        apply_header(strm, config, head);
     }
     if input.wants(OP_STRESS_DICTIONARY) {
-        // SAFETY: as above; no input has been supplied yet, hence `untouched`.
-        let accepted = unsafe { apply_dictionary(strm, config, input.dictionary(), true) };
+        // No input has been supplied yet, hence `untouched`.
+        let accepted = apply_dictionary(strm, config, input.dictionary(), true);
         let window = window_size(config);
         let retained = if accepted {
             input.dictionary().len().min(window)
@@ -2448,36 +2047,31 @@ unsafe fn apply_pre_compression_ops(
         // Still untouched by input at this point, so the retained length is exact here
         // too -- which is where the truncation of an over-long dictionary is actually
         // pinned down.
-        // SAFETY: as above.
-        unsafe { check_get_dictionary(strm, window, Some(retained)) };
+        check_get_dictionary(strm, window, Some(retained));
     }
     if input.wants(OP_TUNE) {
         let (good_length, max_lazy, nice_length, max_chain) = input.tune();
-        // SAFETY: as above; all four arguments are plain integers, clamped by `tune()` so
-        // the match search stays bounded.
-        let code = unsafe { deflateTune(strm, good_length, max_lazy, nice_length, max_chain) };
+        // All four arguments are plain integers, clamped by `tune()` so that the match
+        // search stays bounded.
+        let code = port::deflate_tune(strm, good_length, max_lazy, nice_length, max_chain);
         assert_eq!(code, Z_OK, "deflateTune on a live stream");
         disturbed.note(Disturbances::TUNED);
     }
     if input.wants(OP_PRIME) {
         let (bits, value) = input.prime();
-        // SAFETY: as above.
-        unsafe { apply_prime(strm, bits, value) };
+        apply_prime(strm, bits, value);
         disturbed.note(Disturbances::PRIMED);
     }
 
-    // SAFETY: as above; both only read through out-parameters this frame owns.
-    unsafe { check_pending(strm) };
+    check_pending(strm);
 
     disturbed
 }
 
 /// Applies the optional operations that only make sense mid-compression.
 ///
-/// # Safety
-///
 /// `strm` must hold a state this harness initialised.
-unsafe fn apply_mid_compression_ops(
+fn apply_mid_compression_ops(
     strm: &mut z_stream,
     input: &FuzzInput,
     outcome: DriveOutcome,
@@ -2497,10 +2091,9 @@ unsafe fn apply_mid_compression_ops(
         strm.next_out = room.as_mut_ptr();
         strm.avail_out = room.len() as uInt;
 
-        // SAFETY: `strm` holds a state `init_stream` installed, and `next_out` addresses
-        // `room`, which is writable for the `avail_out` bytes just declared and live
-        // across the call.
-        unsafe { apply_params(strm, level, strategy, outcome.finish_issued) };
+        // `next_out` addresses `room`, which is writable for the `avail_out` bytes just
+        // declared and live across the call.
+        apply_params(strm, level, strategy, outcome.finish_issued);
 
         // `room` dies at the end of this block, so the loan is called in first.
         detach_buffers(strm);
@@ -2509,12 +2102,11 @@ unsafe fn apply_mid_compression_ops(
         disturbed.note(Disturbances::RETUNED);
     }
     if input.wants(OP_COPY) {
-        // SAFETY: as above. The clone is ended inside `check_copy`, before this stream is,
-        // which is what keeps the zone's release order last-in-first-out.
-        unsafe { check_copy(strm) };
+        // The clone is ended inside `check_copy`, before this stream is, which is what
+        // keeps the zone's release order last-in-first-out.
+        check_copy(strm);
     }
-    // SAFETY: as above.
-    unsafe { check_pending(strm) };
+    check_pending(strm);
 }
 
 /// Drives the stream hard: chunked input, a fuzzer-chosen flush per call, possibly a
@@ -2524,67 +2116,55 @@ unsafe fn apply_mid_compression_ops(
 /// disqualifying operation happened to be switched off, which
 /// [`Disturbances::bound_still_guaranteed`] decides. What it does assert everywhere
 /// is the return-code discipline, the allocator discipline, and that nothing hangs.
-unsafe fn run_stress_session(input: &FuzzInput, config: Config, head: gz_headerp) {
+fn run_stress_session(input: &FuzzInput, config: Config, head: &mut gz_header) {
     let ceiling = input.alloc_limit();
-    let zone = Zone::new(ceiling);
-    let mut strm = blank_stream();
-    track(&mut strm, &zone);
+    let allocator = TrackingAllocator::with_limit(ceiling);
+    let mut strm = port::zeroed_stream();
+    allocator.install(&mut strm);
 
-    // SAFETY: `strm` is a live local with a matching hook pair and a live zone pointer.
-    if !unsafe { init_stream(&mut strm, config, ceiling != 0) } {
-        assert_zone_clean(&zone, "stress session, initialisation refused");
+    if !init_stream(&mut strm, config, ceiling != 0) {
+        assert_zone_clean(&allocator, "stress session, initialisation refused");
         return;
     }
 
-    // SAFETY: `strm` holds a state `init_stream` installed and has had no input.
-    let mut disturbed = unsafe { apply_pre_compression_ops(&mut strm, input, config, head) };
+    let mut disturbed = apply_pre_compression_ops(&mut strm, input, config, head);
 
     let payload = input.payload();
 
     // Restarting before the first pass, when selected. Both forms must leave a stream
     // that still compresses, which the pass below then demonstrates.
     if input.wants(OP_RESET) {
-        // SAFETY: `strm` holds a state `init_stream` installed.
-        let code = unsafe { deflateReset(&mut strm) };
+        let code = port::deflate_reset(&mut strm);
         assert_eq!(code, Z_OK, "deflateReset on a live stream");
         disturbed.note(Disturbances::RESTARTED);
     }
     if input.wants(OP_RESET_KEEP) {
-        // SAFETY: as above.
-        let code = unsafe { deflateResetKeep(&mut strm) };
+        let code = port::deflate_reset_keep(&mut strm);
         assert_eq!(code, Z_OK, "deflateResetKeep on a live stream");
         disturbed.note(Disturbances::RESTARTED);
     }
 
-    // SAFETY: `strm` holds a state `init_stream` installed; `drive` supplies its own
-    // live input and output buffers.
-    let first = unsafe { drive(&mut strm, payload, input) };
+    // `drive` supplies its own live input and output buffers and gives both loans back.
+    let first = drive(&mut strm, payload, input);
 
-    // SAFETY: as above.
-    unsafe { apply_mid_compression_ops(&mut strm, input, first, &mut disturbed) };
+    apply_mid_compression_ops(&mut strm, input, first, &mut disturbed);
 
     if first.finished && input.wants(OP_POST_FINISH_FLUSH) && !input.wants(OP_PARAMS) {
         // Only meaningful while the stream is still finished: `deflateParams` above may
         // have driven it, so this is skipped when it ran.
-        // SAFETY: `strm` holds a finished state `init_stream` installed.
-        unsafe { check_after_finish(&mut strm) };
+        check_after_finish(&mut strm);
     }
 
     if disturbed.bound_still_guaranteed(first) && first.finished {
-        // SAFETY: as above.
-        unsafe {
-            assert_within_bound(&mut strm, payload.len(), first.produced, "stress session");
-        }
+        assert_within_bound(&mut strm, payload.len(), first.produced, "stress session");
     }
 
     // A restart after finishing, and a second pass to prove the stream came back. This
     // is the path a caller reusing one stream for many members takes.
     if first.finished && input.wants(OP_RESET) {
-        // SAFETY: as above.
-        let code = unsafe { deflateReset(&mut strm) };
+        let code = port::deflate_reset(&mut strm);
         assert_eq!(code, Z_OK, "deflateReset after the stream finished");
-        // SAFETY: as above.
-        let second = unsafe { drive(&mut strm, clamped(payload, 64), input) };
+        let second = drive(&mut strm, clamped(payload, 64), input);
         assert!(
             second.produced > 0 || second.finished || payload.is_empty(),
             "a reset stream produced nothing at all"
@@ -2593,22 +2173,20 @@ unsafe fn run_stress_session(input: &FuzzInput, config: Config, head: gz_headerp
 
     if input.wants(OP_GET_DICTIONARY) {
         // Compression has moved `strstart` on, so only the inequality is checkable.
-        // SAFETY: as above.
-        unsafe { check_get_dictionary(&mut strm, window_size(config), None) };
+        check_get_dictionary(&mut strm, window_size(config), None);
     }
 
     // `Z_DATA_ERROR` is the documented answer for a stream ended while still
     // compressing, which is exactly what happens whenever a cap stopped the driving
-    // loop early.
-    // SAFETY: `strm` holds a state `init_stream` installed and is ended exactly once.
-    let end = unsafe { deflateEnd(&mut strm) };
+    // loop early. The stream is ended exactly once.
+    let end = port::deflate_end(&mut strm);
     assert_documented(
         end,
         &[Z_OK, Z_DATA_ERROR],
         "deflateEnd after the stress session",
     );
 
-    assert_zone_clean(&zone, "stress session");
+    assert_zone_clean(&allocator, "stress session");
 }
 
 // ---------------------------------------------------------------------------
@@ -2647,12 +2225,12 @@ fn run(input: &FuzzInput) {
 
     with_header(input, |head| {
         if input.wants(OP_BOUND_SESSION) {
-            // SAFETY: `head` is live for this whole closure, which is the frame
-            // `with_header` keeps the header and its buffers in.
-            unsafe { run_bound_session(input, config, head) };
+            // `head` is live for this whole closure, which is the frame `with_header`
+            // keeps the header and its buffers in -- so the pointer the library stores
+            // when a session installs it stays good for as long as that session runs.
+            run_bound_session(input, config, &mut *head);
         }
-        // SAFETY: as above.
-        unsafe { run_stress_session(input, config, head) };
+        run_stress_session(input, config, head);
     });
 }
 

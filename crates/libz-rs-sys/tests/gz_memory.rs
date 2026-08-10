@@ -174,21 +174,296 @@ fn measure(baseline: usize) -> Usage {
 // The C reference figures
 // ---------------------------------------------------------------------------------------------
 
-/// `sizeof(gz_state)` on this target: the one `malloc` `gz_open` makes for the state itself
-/// (`gzlib.c` L104, `state = (gz_statep)malloc(sizeof(gz_state))`).
+/// `#[repr(C)]` mirrors of the three private C state structs, so that every `sizeof` this suite
+/// divides by is the one **the target being tested** would really have.
 ///
-/// Measured with a C probe against the in-tree `gzguts.h`: 248 bytes on LP64. This is the figure the
-/// idle-state gate is set from, and the same one `crates/libz-rs-sys/src/gz.rs` asserts its own
-/// `GzBlock` against at compile time.
-const C_GZ_STATE: usize = 248;
+/// # Why mirrors rather than three literals
+///
+/// The literals this module replaces — 248, 5968 and 7160 — were measured with a C probe on
+/// `x86_64-unknown-linux-gnu` and were then applied on **every** target, including the LLP64
+/// Windows row the CI matrix runs. That is not a reporting inaccuracy, it is a hole in the gate:
+/// the figures are the *denominator* of `rust * 100 <= c * 115`, C's `gz_state` embeds a whole
+/// `z_stream` and C's `deflate_state`/`inflate_state` carry `unsigned long`s and pointers
+/// throughout, so all three shrink where `unsigned long` or a pointer is narrower. A denominator
+/// borrowed from a wider model is a budget that is too generous, and a Rust stream genuinely past
+/// 115 % of the real C footprint passed.
+///
+/// # Why this is a probe and not a guess
+///
+/// `#[repr(C)]` field placement is a function of nothing but field width and field alignment, so a
+/// faithful mirror laid out by the Rust compiler for a target *is* what the C compiler would lay
+/// out for that target. The mirrors are validated rather than asserted to be faithful:
+/// [`the_c_mirrors_reproduce_the_measured_lp64_sizes`] holds them against the three numbers the C
+/// probe actually measured, so on the one model where ground truth exists the mirrors must
+/// reproduce it exactly — and a mirror that reproduces 248/5968/7160 on LP64 is a mirror whose
+/// declaration order and field widths match the headers.
+///
+/// Declared from the headers, member for member and in declaration order:
+/// `gzguts.h` L170-L203 (`gz_state`), `deflate.h` L104-L288 (`deflate_state`) and
+/// `inflate.h` L82-L126 (`struct inflate_state`). `LIT_MEM` is deliberately absent because
+/// `deflate.h` L28 leaves it undefined, which is the configuration the reference build ships;
+/// `ZLIB_DEBUG` is absent for the same reason. Both would change the size, and the LP64 validation
+/// is what proves the shipped configuration is the one mirrored.
+///
+/// Nothing here is ever instantiated — only `size_of` is taken — so the pointer members need no
+/// referent and the arrays cost nothing.
+#[allow(dead_code)]
+mod c_probe {
+    use std::ffi::{c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_ushort, c_void};
+
+    /// `z_off64_t` (`zconf.h` L494-L531): 64 bits wherever large-file support exists.
+    type COff64 = i64;
+
+    /// `alloc_func` / `free_func` (`zlib.h` L85-L86), as one pointer-wide slot each.
+    type CHook = Option<unsafe extern "C" fn()>;
+
+    /// `z_stream` (`zlib.h` L90-L110). Embedded whole in `gz_state`, so its width drives that
+    /// struct's.
+    #[repr(C)]
+    pub struct CZStream {
+        next_in: *const c_uchar,
+        avail_in: c_uint,
+        total_in: c_ulong,
+        next_out: *mut c_uchar,
+        avail_out: c_uint,
+        total_out: c_ulong,
+        msg: *const c_char,
+        state: *mut c_void,
+        zalloc: CHook,
+        zfree: CHook,
+        opaque: *mut c_void,
+        data_type: c_int,
+        adler: c_ulong,
+        reserved: c_ulong,
+    }
+
+    /// `gz_header` (`zlib.h` L118-L133). Reached only as a pointer member below.
+    #[repr(C)]
+    pub struct CGzHeader {
+        text: c_int,
+        time: c_ulong,
+        xflags: c_int,
+        os: c_int,
+        extra: *mut c_uchar,
+        extra_len: c_uint,
+        extra_max: c_uint,
+        name: *mut c_uchar,
+        name_max: c_uint,
+        comment: *mut c_uchar,
+        comm_max: c_uint,
+        hcrc: c_int,
+        done: c_int,
+    }
+
+    /// `struct gzFile_s` (`zlib.h` L1956-L1960) — `gz_state`'s first member.
+    #[repr(C)]
+    pub struct CGzFileS {
+        have: c_uint,
+        next: *mut c_uchar,
+        pos: COff64,
+    }
+
+    /// `gz_state` (`gzguts.h` L170-L203). The one `malloc` `gz_open` makes for the state itself.
+    #[repr(C)]
+    pub struct CGzState {
+        x: CGzFileS,
+        mode: c_int,
+        fd: c_int,
+        path: *mut c_char,
+        size: c_uint,
+        want: c_uint,
+        input: *mut c_uchar,
+        out: *mut c_uchar,
+        direct: c_int,
+        junk: c_int,
+        how: c_int,
+        again: c_int,
+        start: COff64,
+        eof: c_int,
+        past: c_int,
+        level: c_int,
+        strategy: c_int,
+        reset: c_int,
+        skip: COff64,
+        err: c_int,
+        msg: *mut c_char,
+        strm: CZStream,
+    }
+
+    /// `HEAP_SIZE` = `2 * L_CODES + 1` = 573 (`deflate.h` L48).
+    const HEAP_SIZE: usize = 2 * 286 + 1;
+    /// `2 * D_CODES + 1` = 61 (`deflate.h` L206).
+    const D_TREE_SIZE: usize = 2 * 30 + 1;
+    /// `2 * BL_CODES + 1` = 39 (`deflate.h` L209).
+    const BL_TREE_SIZE: usize = 2 * 19 + 1;
+    /// `MAX_BITS + 1` = 16 (`deflate.h` L216).
+    const BL_COUNT_SIZE: usize = 16;
+
+    /// `struct ct_data_s` (`deflate.h` L74-L84): two `ush` unions.
+    #[repr(C)]
+    pub struct CCtData {
+        fc: c_ushort,
+        dl: c_ushort,
+    }
+
+    /// `struct tree_desc_s` (`deflate.h` L88-L92).
+    #[repr(C)]
+    pub struct CTreeDesc {
+        dyn_tree: *mut CCtData,
+        max_code: c_int,
+        stat_desc: *const c_void,
+    }
+
+    /// `deflate_state` (`deflate.h` L104-L288), in the shipped configuration: `LIT_MEM`
+    /// undefined, so one `sym_buf` rather than a `d_buf`/`l_buf` pair, and `ZLIB_DEBUG`
+    /// undefined, so no `compressed_len`/`bits_sent`.
+    #[repr(C)]
+    pub struct CDeflateState {
+        strm: *mut CZStream,
+        status: c_int,
+        pending_buf: *mut c_uchar,
+        pending_buf_size: c_ulong,
+        pending_out: *mut c_uchar,
+        pending: c_ulong,
+        wrap: c_int,
+        gzhead: *mut CGzHeader,
+        gzindex: c_ulong,
+        method: c_uchar,
+        last_flush: c_int,
+        w_size: c_uint,
+        w_bits: c_uint,
+        w_mask: c_uint,
+        window: *mut c_uchar,
+        window_size: c_ulong,
+        prev: *mut c_ushort,
+        head: *mut c_ushort,
+        ins_h: c_uint,
+        hash_size: c_uint,
+        hash_bits: c_uint,
+        hash_mask: c_uint,
+        hash_shift: c_uint,
+        block_start: c_long,
+        match_length: c_uint,
+        prev_match: c_uint,
+        match_available: c_int,
+        strstart: c_uint,
+        match_start: c_uint,
+        lookahead: c_uint,
+        prev_length: c_uint,
+        max_chain_length: c_uint,
+        max_lazy_match: c_uint,
+        level: c_int,
+        strategy: c_int,
+        good_match: c_uint,
+        nice_match: c_int,
+        dyn_ltree: [CCtData; HEAP_SIZE],
+        dyn_dtree: [CCtData; D_TREE_SIZE],
+        bl_tree: [CCtData; BL_TREE_SIZE],
+        l_desc: CTreeDesc,
+        d_desc: CTreeDesc,
+        bl_desc: CTreeDesc,
+        bl_count: [c_ushort; BL_COUNT_SIZE],
+        heap: [c_int; HEAP_SIZE],
+        heap_len: c_int,
+        heap_max: c_int,
+        depth: [c_uchar; HEAP_SIZE],
+        sym_buf: *mut c_uchar,
+        lit_bufsize: c_uint,
+        sym_next: c_uint,
+        sym_end: c_uint,
+        opt_len: c_ulong,
+        static_len: c_ulong,
+        matches: c_uint,
+        insert: c_uint,
+        bi_buf: c_ushort,
+        bi_valid: c_int,
+        bi_used: c_int,
+        high_water: c_ulong,
+        slid: c_int,
+    }
+
+    /// `ENOUGH` = `ENOUGH_LENS + ENOUGH_DISTS` = 1444 (`inftrees.h` L49-L51).
+    const ENOUGH: usize = 852 + 592;
+
+    /// `code` (`inftrees.h` L24-L28): four bytes on every target.
+    #[repr(C)]
+    pub struct CCode {
+        op: c_uchar,
+        bits: c_uchar,
+        val: c_ushort,
+    }
+
+    /// `struct inflate_state` (`inflate.h` L82-L126). `inflate_mode` is an all-non-negative C
+    /// enum, which GCC and Clang give `int` width, hence `c_int` for `mode`.
+    #[repr(C)]
+    pub struct CInflateState {
+        strm: *mut CZStream,
+        mode: c_int,
+        last: c_int,
+        wrap: c_int,
+        havedict: c_int,
+        flags: c_int,
+        dmax: c_uint,
+        check: c_ulong,
+        total: c_ulong,
+        head: *mut CGzHeader,
+        wbits: c_uint,
+        wsize: c_uint,
+        whave: c_uint,
+        wnext: c_uint,
+        window: *mut c_uchar,
+        hold: c_ulong,
+        bits: c_uint,
+        length: c_uint,
+        offset: c_uint,
+        extra: c_uint,
+        lencode: *const CCode,
+        distcode: *const CCode,
+        lenbits: c_uint,
+        distbits: c_uint,
+        ncode: c_uint,
+        nlen: c_uint,
+        ndist: c_uint,
+        have: c_uint,
+        next: *mut CCode,
+        lens: [c_ushort; 320],
+        work: [c_ushort; 288],
+        codes: [CCode; ENOUGH],
+        sane: c_int,
+        back: c_int,
+        was: c_uint,
+    }
+}
+
+/// `sizeof(gz_state)` **on the target being tested**: the one `malloc` `gz_open` makes for the
+/// state itself (`gzlib.c` L104, `state = (gz_statep)malloc(sizeof(gz_state))`).
+///
+/// ★ Derived from [`c_probe::CGzState`], not written as a literal, and that is the whole point of
+/// the probe module. This figure is the *denominator* of a 115 % budget, so a number measured on
+/// one integer model and applied to another does not merely mis-report: on a model where the real
+/// C state is smaller it makes the budget **larger than it should be**, and a Rust stream genuinely
+/// over the limit passes. The literal 248 was an LP64 measurement, and C's `gz_state` embeds a
+/// whole `z_stream` plus two `z_off64_t`s, so it is 224 on LLP64 and 160 on ILP32 — which is
+/// exactly how much slack the Windows and 32-bit rows were being handed.
+const fn c_gz_state() -> usize {
+    size_of::<c_probe::CGzState>()
+}
 
 /// `sizeof(deflate_state)`, allocated by `deflateInit2_` through `ZALLOC` (`deflate.c` L431).
-/// Measured: 5968 bytes on LP64.
-const C_DEFLATE_STATE: usize = 5968;
+///
+/// Derived from [`c_probe::CDeflateState`] for the reason [`c_gz_state`] gives: 5968 on LP64,
+/// 5920 on LLP64 and 5836 on ILP32.
+const fn c_deflate_state() -> usize {
+    size_of::<c_probe::CDeflateState>()
+}
 
 /// `sizeof(struct inflate_state)`, allocated by `inflateInit2_` through `ZALLOC`
-/// (`inflate.c` L172). Measured: 7160 bytes on LP64.
-const C_INFLATE_STATE: usize = 7160;
+/// (`inflate.c` L172).
+///
+/// Derived from [`c_probe::CInflateState`]: 7160 on LP64, 7152 on LLP64 and 7120 on ILP32.
+const fn c_inflate_state() -> usize {
+    size_of::<c_probe::CInflateState>()
+}
 
 /// `GZBUFSIZE` (`gzguts.h` L156): the default `state->want`, and the unit every gz buffer is sized
 /// in.
@@ -286,10 +561,10 @@ fn per_stream_memory_is_reported_and_within_the_c_budget() {
     let c_path = path.as_bytes().len() + 1;
 
     // ----- the write stream -------------------------------------------------------------------
-    let c_idle = C_GZ_STATE + c_path;
+    let c_idle = c_gz_state() + c_path;
     // `gz_init`: `in` is `want << 1` and `out` is `want` (`gzwrite.c` L16 and L26), plus the
     // compressor `deflateInit2` builds (`gzwrite.c` L35-L36).
-    let c_write_peak = c_idle + (C_WANT << 1) + C_WANT + C_DEFLATE_STATE + C_DEFLATE_BUFFERS;
+    let c_write_peak = c_idle + (C_WANT << 1) + C_WANT + c_deflate_state() + C_DEFLATE_BUFFERS;
 
     let baseline = begin();
     // SAFETY: two live `CString`s, each valid for reads through its terminator for the whole
@@ -319,7 +594,7 @@ fn per_stream_memory_is_reported_and_within_the_c_budget() {
     // ----- the read stream --------------------------------------------------------------------
     // `gz_look`: `in` is `want` and `out` is `want << 1` (`gzread.c` L99-L100), plus the
     // decompressor `inflateInit2` builds (`gzread.c` L115) and the window it allocates on demand.
-    let c_read_peak = c_idle + C_WANT + (C_WANT << 1) + C_INFLATE_STATE + C_INFLATE_WINDOW;
+    let c_read_peak = c_idle + C_WANT + (C_WANT << 1) + c_inflate_state() + C_INFLATE_WINDOW;
 
     let baseline = begin();
     // SAFETY: as the write open above -- two live `CString`s, neither retained.
@@ -403,4 +678,89 @@ fn per_stream_memory_is_reported_and_within_the_c_budget() {
         within_budget(read_peak, c_read_peak),
         "read high-water {read_peak} B exceeds 115% of C's {c_read_peak} B"
     );
+}
+
+/// The `#[repr(C)]` C mirrors reproduce the sizes a C probe measured, per integer model.
+///
+/// ★ This is what licenses [`c_gz_state`], [`c_deflate_state`] and [`c_inflate_state`] as
+/// *reference* figures rather than as plausible-looking arithmetic. On LP64 there is ground truth
+/// — a C probe compiled against the in-tree `gzguts.h`, `deflate.h` and `inflate.h` on
+/// `x86_64-unknown-linux-gnu` reported 248, 5968 and 7160 — and a mirror that reproduces all three
+/// exactly is a mirror whose declaration order, field widths and field alignments match the
+/// headers. `#[repr(C)]` placement depends on nothing else, so the same mirrors laid out for
+/// another target give that target's C sizes.
+///
+/// The other two models are then pinned at the numbers those same mirrors produce when compiled for
+/// them, so a drift is a named failure rather than a silently different denominator:
+///
+/// | Model | `gz_state` | `deflate_state` | `struct inflate_state` |
+/// |---|---|---|---|
+/// | LP64 | 248 | 5968 | 7160 |
+/// | LLP64 | 224 | 5920 | 7152 |
+/// | ILP32 | 160 | 5836 | 7120 |
+///
+/// A model none of the three tiers recognises fails outright rather than skipping. That is
+/// deliberate and is the opposite of how a *layout* tier behaves: an unpinned layout still has
+/// `tests/abi_layout.rs`'s relational tier behind it, whereas an unpinned budget denominator has
+/// nothing behind it at all — the gate would still compute a number and still pass or fail on it,
+/// with no one having checked which. Add a row rather than let that happen.
+#[test]
+fn the_c_mirrors_reproduce_the_measured_lp64_sizes() {
+    let pointer = size_of::<*const c_void>();
+    let ulong = size_of::<std::ffi::c_ulong>();
+
+    // Every model must at least agree about the two structural facts the mirrors rest on.
+    assert!(
+        c_gz_state() > size_of::<c_probe::CZStream>(),
+        "gz_state embeds a whole z_stream and more besides"
+    );
+    assert!(
+        c_inflate_state() > c_deflate_state(),
+        "struct inflate_state is the larger of the two engines on every target"
+    );
+
+    let (model, gz, def, inf) = match (pointer, ulong) {
+        (8, 8) => ("LP64", 248_usize, 5968_usize, 7160_usize),
+        (8, 4) => ("LLP64", 224, 5920, 7152),
+        (4, 4) => ("ILP32", 160, 5836, 7120),
+        _ => panic!(
+            "unrecognised integer model: {pointer}-byte pointer, {ulong}-byte unsigned long. \
+             The C reference sizes this suite divides by are pinned per model, and a budget \
+             denominator nothing has checked is worse than no budget: add a row above rather \
+             than measuring against another model's figures."
+        ),
+    };
+
+    println!(
+        "gz_memory: {model} C reference sizes -- gz_state {} B, deflate_state {} B, \
+         inflate_state {} B",
+        c_gz_state(),
+        c_deflate_state(),
+        c_inflate_state()
+    );
+
+    assert_eq!(
+        c_gz_state(),
+        gz,
+        "sizeof(gz_state) under {model}: the mirror and the header must agree"
+    );
+    assert_eq!(
+        c_deflate_state(),
+        def,
+        "sizeof(deflate_state) under {model}: the mirror and the header must agree"
+    );
+    assert_eq!(
+        c_inflate_state(),
+        inf,
+        "sizeof(struct inflate_state) under {model}: the mirror and the header must agree"
+    );
+
+    // The two mirrors C exposes publicly are already pinned exactly by
+    // `tests/abi_layout.rs`; asserting them against the facade's own types here is what
+    // proves the probe module is describing the same ABI that suite measures, rather than a
+    // parallel set of declarations that happens to compile.
+    assert_eq!(size_of::<c_probe::CZStream>(), size_of::<z::z_stream>());
+    assert_eq!(size_of::<c_probe::CGzHeader>(), size_of::<z::gz_header>());
+    assert_eq!(size_of::<c_probe::CGzFileS>(), size_of::<z::gzFile_s>());
+    assert_eq!(size_of::<c_probe::CCode>(), size_of::<z::code>());
 }

@@ -10,30 +10,80 @@
 # What each job enforces, by the quality-bar constraint it answers:
 #
 #   (a) unsafe containment .... `miri` (the safe core, which contains no FFI and
-#                               can therefore be analysed exhaustively) and
+#                               is therefore Miri-COMPATIBLE: Miri interprets
+#                               the test suite the job selects, and what is not
+#                               executed is not analysed) and
 #                               `asan` (the facade, where the raw pointers of
-#                               the six unavoidable unsafe site categories are)
+#                               the six unavoidable unsafe site categories are,
+#                               instrumented both on its own and with
+#                               `-Zbuild-std` so that faults inside `std`
+#                               routines reached from the facade are attributed)
 #   (b) contract immutability . `header` (cbindgen signature/field/macro gate)
 #                               and `symbols` (nm parity against the 111-symbol
 #                               C baseline, the SONAME, and the hidden set)
-#   (c) behavioral fidelity ... `differential` (byte-identical output and
-#                               bidirectional interoperability)
+#   (c) behavioral fidelity ... `differential`, which runs FOUR tiers: the fast
+#                               representative sweep, the armed exhaustive
+#                               byte-identity matrix, the armed exhaustive
+#                               interoperability product, and the same suites
+#                               with `--features simd` to prove the vectorised
+#                               checksum backends are output-neutral
 #   (d) verification clean .... `miri`, `asan`, `fuzz` (five targets, 300 s
-#                               each, zero crashes) and `dropin` (the three
-#                               UNMODIFIED C drivers, relinked and run)
-#   (e) lint and format ....... `format` and `lint`
+#                               each, zero crashes, with the differential
+#                               checksum target run once per backend) and
+#                               `dropin` (the three UNMODIFIED C drivers,
+#                               relinked and run)
+#   (e) lint and format ....... `format` and `lint`, each over BOTH workspaces
 #   (f) no panics in library .. `lint`.  The deny-level `unwrap_used`,
 #                               `expect_used`, `indexing_slicing`, `panic` and
 #                               `panic_in_result_fn` lints are declared in
 #                               Cargo.toml's [workspace.lints], so running
 #                               clippy with `-D warnings` IS the enforcement.
 #                               There is deliberately no grep-for-unwrap job.
-#   (h) MSRV honored .......... `msrv` (a build on the declared 1.80 floor)
-#   (i) dependency minimalism . `deny` (cargo-deny over the root deny.toml)
+#   (h) MSRV honored .......... `msrv` (an all-features build on the declared
+#                               1.80 floor, warnings denied)
+#   (i) dependency minimalism . `deny` (cargo-deny over BOTH policy graphs: the
+#                               root deny.toml and fuzz/deny.toml, which the
+#                               root command cannot reach)
+#
+# `features` answers no single constraint and is required by all of them: it
+# builds, tests and lints every feature configuration a consumer can select --
+# no-default, libz-compat alone, default, all, and simd -- because a cfg that
+# nothing compiles is a cfg the other twelve jobs never look at.
+#
+# And the performance targets of AAP 0.8.4, which are the one set of claims no
+# single job can settle:
+#
+#   `bench`         measures, three times over: the shipped `bench` profile, the
+#                   non-LTO `bench-parity` profile that is comparable to the way
+#                   the C oracle is BUILT, and the shipped profile with the
+#                   vectorized checksum backends.  It decides nothing.
+#   `bench-gate`    IS THE DECISION.  It validates a required-case manifest,
+#                   enforces the limits only where the AAP states one, and judges
+#                   each case on the STRONGER of the two profiles' ratios.
+#   `bench-silesia` makes the measurement the targets are actually stated on, in
+#                   acceptance mode, on a runner where the twelve pinned members
+#                   are already present.  It downloads nothing, and when no
+#                   corpus is provisioned it is skipped and `bench-gate` says so
+#                   rather than letting the minimal corpus stand in for it.
+#
+# EVERY JOB THAT COMPARES AGAINST THE C ORACLE RUNS BOTH CHECKSUM BACKENDS.
+# `simd` is default-off and required to be output-neutral, so `differential`,
+# `differential-exhaustive`, `bench` and `fuzz` each carry a scalar row and a
+# `--features simd` row, and every artifact is labelled with which it was.
 #
 # (g), the documented-public-API constraint, is enforced in-crate by
 # `#![deny(missing_docs)]` and is therefore covered by any warning-free build.
 # It gets no job of its own on purpose.
+#
+# THE FEATURE SPACE IS ALSO A CONTRACT, and it is `build-test` that holds it.
+# `simd`, `libz-compat` and `gz` are declared supported in the manifests, and a
+# default build compiles none of the vectorised checksum backends and never once
+# compiles the core as the `no_std` + `alloc` crate its manifest describes.  That
+# job therefore builds every declared configuration on all three Tier-1 targets,
+# runs the tests with the vectorised backends selected, and checks all five
+# outcomes of the documented `ZLIB_RS_SIMD=0|1` toggle -- two accepted and three
+# refused, because a build script that ignored the variable would satisfy a gate
+# that only checked the two agreeing cases.
 #
 # DIVISION OF LABOUR -- none of the following is redundant with this file, and
 # none of it may be deleted in favour of this file:
@@ -46,19 +96,71 @@
 #                That is the other half of contract immutability: this file
 #                proves the Rust library still matches the header, c-std.yml
 #                proves the header itself still compiles everywhere.
-#   * cmake.yml  exercises the CMake `ZLIB_BUILD_RUST` path.  Everything here
-#                drives cargo (and the Makefile's `rust*` targets) directly,
-#                which is what the verified command set uses.
+#   * cmake.yml  exercises the C library's CMake matrix.  It carries NO Rust
+#                job and names `ZLIB_BUILD_RUST` nowhere, so the CMake Rust
+#                path -- the option, its ELF-only preconditions and the
+#                ZLIB::ZLIB / ZLIB::ZLIBSTATIC redirection in CMakeLists.txt --
+#                is UNGATED by CI and is exercised only by hand.  Everything
+#                here drives cargo, and the Makefile's `rust*` targets, which
+#                is what the verified command set uses.
 #
 # Nothing in this file writes to zlib.h, zconf.h, zlib.map, any C translation
 # unit, anything under contrib/, or any of the three test drivers.  zlib.h and
 # zlib.map are CONSUMED -- as the header-diff target and as the linker version
-# script -- and never modified.  No job downloads a benchmark corpus.
+# script -- and never modified.  No job downloads a benchmark corpus: the
+# acceptance job reads one a runner already has, and every other job runs on the
+# committed minimal corpus.
 # =============================================================================
 
 name: Rust
 
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      differential_mode:
+        description: >-
+          How much of the byte-identity product the exhaustive differential
+          shards enumerate. `1` runs the armed product (9,459,450 cells, the
+          46,305-per-level tiny-window-over-window_boundary.bin cells declared
+          and counted as excluded); `full` lifts that one exclusion and runs the
+          whole 9,922,500, which costs roughly four times the wall clock.
+        default: '1'
+        required: false
+        type: choice
+        options:
+          - '1'
+          - 'full'
+
+# Least privilege, declared once at the top so that it applies to every job and a
+# new job cannot inherit more than it needs.  Nothing here writes to the
+# repository: no job pushes a commit, opens a release, comments on a pull request
+# or touches a package registry.  Without this block the workflow would receive
+# whatever the repository's default token permissions happen to be -- which is
+# `contents: write` on many repositories -- and every one of the twenty-odd
+# third-party-free steps below would run with a token able to rewrite the tree it
+# is checking.  A job that later needs more must ask for it in its own
+# `permissions:` block, which makes the request reviewable in the diff.
+permissions:
+  contents: read
+
+# One run of this workflow per ref at a time.
+#
+# The matrix here is wide -- three platforms, five fuzz targets, Miri, ASan and a
+# multi-hour benchmark -- so two runs on the same branch compete for runners and
+# the older one's result is worthless the moment it is superseded.  The group key
+# is the pull request number when there is one and the ref otherwise, so a pull
+# request and a branch push never cancel each other.
+#
+# Cancellation is deliberately limited to pull requests. A superseded pull-request
+# run has no lasting value, but a push run IS the recorded status of that commit,
+# and cancelling it would leave commits on a branch with no verdict at all --
+# which matters for a library where "was this commit green?" is the question a
+# bisect asks.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
 
@@ -76,6 +178,18 @@ jobs:
   # integer; the Windows row is what catches a regression to `u64`, and it is
   # the only place that can.  Fast-fail is switched off on the matrix so that
   # one platform's failure cannot hide the others'.
+  #
+  # WHAT THIS MATRIX DOES AND DOES NOT ESTABLISH.  It establishes that the
+  # workspace COMPILES and its TESTS PASS on the three Tier-1 platforms.  It
+  # does NOT establish a packaged, ABI-compatible, no-recompilation drop-in on
+  # any of them except Linux: staging that library means relinking under
+  # `zlib.map` with `-soname`, which is ELF-only -- `CMakeLists.txt` refuses
+  # `ZLIB_BUILD_RUST` outright on not-UNIX, Apple, AIX and SunOS, and the
+  # `symbols` and `dropin` jobs below (the ones that actually measure the
+  # export surface and relink the C drivers) run on ubuntu-latest alone.  So
+  # the drop-in claim is verified on x86_64-unknown-linux-gnu and the other two
+  # rows are compile-and-test coverage.  Do not cite this matrix as evidence of
+  # ABI compatibility on macOS or Windows.
   # ---------------------------------------------------------------------------
   build-test:
     name: ${{ matrix.name }}
@@ -95,13 +209,62 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # SEC hardening: the job needs the tree, never the credential.  See the
+        # `permissions` block at the top of this file.
+        persist-credentials: false
 
     - name: Install Rust toolchain
+      # llvm-tools is requested for its `llvm-objcopy`, and it is a requirement
+      # of this job rather than a convenience.  `cargo test --workspace` includes
+      # zlib-rs-differential, whose build.rs performs an `objcopy
+      # --redefine-syms` rename pass over the C oracle's objects so that both
+      # implementations can be linked into one test binary without their
+      # identically-named symbols colliding.  Stock macOS ships no objcopy at all
+      # -- `gobjcopy` is Homebrew binutils, not a system tool -- and a Windows
+      # MSVC host has none either, so on two of these three runners the build.rs
+      # is relying entirely on its own fallback chain.  That chain does end at
+      # `rust-objcopy` in the toolchain sysroot, but rust-objcopy links against
+      # the toolchain's libLLVM, which is not on the default library search path,
+      # so the fallback can fail for a reason that has nothing to do with this
+      # repository.  Installing the component makes a working objcopy a stated,
+      # provisioned dependency instead of a lucky one.
       run: |
-        rustup toolchain install stable --profile minimal --component rustfmt,clippy
+        rustup toolchain install stable --profile minimal --component rustfmt,clippy,llvm-tools
         rustc --version
         cargo --version
+
+    - name: Install packages (objcopy for the differential oracle)
+      # Fails the job HERE, with a name, rather than inside a build script whose
+      # diagnostic would be a link error in generated C.  Linux has binutils
+      # already; the sysroot probe is what covers macOS and Windows.
+      shell: bash
+      run: |
+        set -eu
+        for candidate in objcopy llvm-objcopy gobjcopy; do
+          if command -v "$candidate" > /dev/null 2>&1; then
+            echo "OBJCOPY=$(command -v "$candidate")" >> "$GITHUB_ENV"
+            "$candidate" --version | head -1
+            exit 0
+          fi
+        done
+        sysroot="$(rustc --print sysroot)"
+        for candidate in llvm-objcopy rust-objcopy; do
+          for found in "$sysroot"/lib/rustlib/*/bin/"$candidate"*; do
+            if [ -x "$found" ]; then
+              echo "OBJCOPY=$found" >> "$GITHUB_ENV"
+              "$found" --version | head -1
+              exit 0
+            fi
+          done
+        done
+        echo "::error::no usable objcopy was found on this runner, so"          \
+             "crates/zlib-rs-differential/build.rs cannot perform its"         \
+             "--redefine-syms rename pass and the workspace test run would"    \
+             "fail inside a build script. Install binutils, or"                \
+             "\`rustup component add llvm-tools\`, or set OBJCOPY explicitly."
+        exit 1
 
     - name: Compile source code
       run: |
@@ -111,25 +274,59 @@ jobs:
     - name: Run test cases
       run: cargo test --locked --workspace --release
 
+    - name: Run test cases (every feature enabled)
+      # ★ THE DEFAULT FEATURE SET IS NOT THE WHOLE LIBRARY.  zlib-rs declares
+      # `default = []`, so the line above compiles neither `std` -- which is what
+      # `pub mod gz` and the whole `tests/gz.rs` binary sit behind -- nor `simd`,
+      # nor `rust-api`.  Three of the four features the crate declares, and the
+      # entire vectorised checksum surface, were therefore never compiled by any
+      # deterministic test job: the only thing that exercised them was a fuzz run,
+      # and only if it happened to pass the feature.
+      #
+      # This step is deliberately DETERMINISTIC coverage rather than more fuzzing.
+      # The fuzz job's simd row explores inputs; this one runs the fixed
+      # assertions -- the checksum vectors, the gz layer's suite, the differential
+      # matrix -- with every backend compiled in, so a `simd` build that returns a
+      # wrong checksum for a *known* vector fails here in seconds instead of
+      # waiting for a fuzzer to stumble onto it.
+      #
+      # It is a second `cargo test` rather than a replacement for the first,
+      # because the default set is what ships and has to be tested as such.
+      run: cargo test --locked --workspace --release --all-features
+
     - name: Upload build errors
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       if: failure()
       with:
         name: ${{ matrix.name }} (build-test)
         path: |
           Cargo.lock
           target/release/build/*/output
+          target/feature-matrix/release/build/*/output
+          target/simd-toggle-refusal.log
         retention-days: 7
 
   # ---------------------------------------------------------------------------
   # 2. Formatting.  .rustfmt.toml exists at the root to be enforced here.
+  #
+  # TWO INVOCATIONS, BECAUSE THERE ARE TWO WORKSPACES.  The root Cargo.toml
+  # declares `exclude = ["fuzz"]` and fuzz/ carries its own [workspace] table and
+  # its own Cargo.lock, so `cargo fmt --all` from the root does not see the five
+  # fuzz targets at all -- it is not that they are formatted and passing, it is
+  # that nothing looked at them.  `--manifest-path` is how the second workspace
+  # is reached, and .rustfmt.toml at the root still governs both because rustfmt
+  # searches upwards from each file.
   # ---------------------------------------------------------------------------
   format:
     name: Format
     runs-on: ubuntu-latest
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # SEC hardening: the job needs the tree, never the credential.  See the
+        # `permissions` block at the top of this file.
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: rustup toolchain install stable --profile minimal --component rustfmt
@@ -137,52 +334,167 @@ jobs:
     - name: Run test cases
       run: cargo fmt --all -- --check
 
+    - name: Run test cases (the fuzz workspace)
+      run: cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
+
   # ---------------------------------------------------------------------------
   # 3. Lints.  The LEVELS live in Cargo.toml's [workspace.lints] -- clippy::all
   # and clippy::pedantic at deny, plus unwrap_used, expect_used,
   # indexing_slicing, panic, panic_in_result_fn, todo, unimplemented,
-  # unreachable, exit and undocumented_unsafe_blocks -- and the thresholds and
-  # `msrv` live in clippy.toml.  This job's whole contribution is to run clippy
-  # with warnings denied, which is what turns all of that into a gate.
+  # unreachable, exit and undocumented_unsafe_blocks -- and the THRESHOLDS live
+  # in clippy.toml, which declares no `msrv` key on purpose so that clippy reads
+  # each package's own `rust-version`.  This job's whole contribution is to run
+  # clippy with warnings denied, which is what turns all of that into a gate.
   #
-  # `--all-targets` reaches the tests, benches and fuzz-adjacent targets too,
-  # so a lint violation cannot hide in a test module.
+  # `--all-targets` reaches the tests and the benches too, so a lint violation
+  # cannot hide in a test module or in a bench that `cargo build` never
+  # compiles.
+  #
+  # `--workspace` DOES NOT REACH `fuzz/`, which is why there is a second step.
+  # The root Cargo.toml declares `exclude = ["fuzz"]`, so that directory is a
+  # workspace of its own: the first command below cannot select it however it is
+  # spelled, and the build cargo-fuzz performs in the `fuzz` job does not deny
+  # warnings.  The second command re-runs clippy with `working-directory: fuzz`
+  # so the five targets are held to the same deny-level policy.  A workspace
+  # lint table does not cross a workspace boundary either, which is why
+  # `fuzz/Cargo.toml` restates the policy in `[lints.rust]` and
+  # `[lints.clippy]` tables of its own.
   # ---------------------------------------------------------------------------
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # SEC hardening: the job needs the tree, never the credential.  See the
+        # `permissions` block at the top of this file.
+        persist-credentials: false
 
     - name: Install Rust toolchain
-      run: rustup toolchain install stable --profile minimal --component clippy
+      run: |
+        rustup toolchain install stable --profile minimal --component clippy
+        rustup toolchain install nightly --profile minimal --component clippy
+        cargo +nightly clippy --version
 
     - name: Run test cases
       run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+    - name: Run test cases (the fuzz workspace)
+      # `--workspace` above CANNOT reach fuzz/.  The root Cargo.toml `exclude`s
+      # it -- cargo-fuzz owns its profile and sanitizer configuration and must not
+      # inherit `panic = "abort"` from the shipped release profile -- so it is a
+      # separate workspace with its own [lints] table, and a clippy run from the
+      # root does not lint one line of it.
+      #
+      # That gap matters more here than almost anywhere else: the five fuzz
+      # targets have the highest raw-pointer density in the repository.  They
+      # drive the C ABI directly, reconstruct slices from caller pointers and
+      # install zalloc/zfree hooks the library calls back into.  fuzz/Cargo.toml
+      # denies `undocumented_unsafe_blocks` for exactly that reason, and this step
+      # is what makes the denial reachable by CI at all.
+      #
+      # Nightly, because the targets use `#![no_main]` with libfuzzer-sys.
+      run: |
+        set -eu
+        rustup toolchain install nightly --profile minimal --component clippy
+        cd fuzz
+        cargo +nightly clippy --locked --all-targets -- -D warnings
+        cargo +nightly clippy --locked --all-targets --all-features -- -D warnings
+
   # ---------------------------------------------------------------------------
   # 4. Dependency policy.  Reads the root deny.toml: the [licenses] allow-list
-  # (Zlib, matching the in-tree LICENSE), [advisories], and the [bans] rules
-  # that keep the core crate's dependency table empty and reject duplicate or
-  # wildcard versions.  The core algorithm crate having zero third-party
-  # dependencies is a stated constraint, and this is the machine that holds it.
+  # (Zlib for this project's own crates, plus the MIT / Apache-2.0 /
+  # Unicode-3.0 expressions the dev and build tooling resolves to),
+  # [advisories], and the [bans] rules that reject duplicate versions, wildcard
+  # requirements and a named set of crates that would link a C compressor back
+  # in.
+  #
+  # WHAT cargo-deny DOES NOT DO, and why the second command exists.  "The core
+  # algorithm crate has zero third-party dependencies" is a stated constraint,
+  # and no cargo-deny rule expresses it: the licence, advisory, source and bans
+  # policies would all happily admit a new, permissively licensed, non-duplicate
+  # dependency added to `crates/zlib-rs`.  Asserting the property therefore
+  # takes a direct look at the manifest, which is what the metadata step does --
+  # `cargo metadata --no-deps` reports each workspace member's own declared
+  # dependencies, so an empty list for `zlib-rs` is the constraint itself rather
+  # than a proxy for it.  It covers every kind: normal, dev and build.
+  #
+  # cargo-deny is pinned.  deny.toml is written against 0.20.2's schema -- which
+  # renamed and removed keys earlier versions accepted -- so an unpinned install
+  # would fail or, worse, silently ignore a section on a future release.  The
+  # cbindgen and cargo-fuzz installs elsewhere in this file are pinned for the
+  # same reason.
   # ---------------------------------------------------------------------------
   deny:
     name: Dependency policy
     runs-on: ubuntu-latest
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # SEC hardening: the job needs the tree, never the credential.  See the
+        # `permissions` block at the top of this file.
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: rustup toolchain install stable --profile minimal
 
     - name: Install packages (Linux)
-      run: cargo install cargo-deny --locked
+      run: |
+        cargo install cargo-deny --locked --version 0.20.2
+        cargo deny --version
 
     - name: Run test cases
-      run: cargo deny --all-features check
+      # `--locked` on the audit itself, not just on the installer: without it
+      # cargo-deny is free to update Cargo.lock before reading the graph, and
+      # the graph it then reports is not the one that ships.
+      run: cargo deny --locked --all-features check
+
+    - name: Run test cases (fuzz workspace)
+      # THE SECOND GRAPH, and it is invisible from the root.  fuzz/ is excluded
+      # from the workspace and carries its own Cargo.lock and its own
+      # deny.toml, so the command above never sees `libfuzzer-sys`, `arbitrary`
+      # or anything they pull in -- which would leave the one part of the tree
+      # that links a C++ fuzzing runtime as the one part with no advisory,
+      # license, source or bans enforcement at all.
+      run: cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check
+
+    - name: Run test cases (core dependency table is empty)
+      run: |
+        set -eu
+        mkdir -p target
+        cargo metadata --locked --format-version 1 --no-deps > target/metadata.json
+        python3 - <<'CORE_DEPS'
+        import json
+        import sys
+
+        with open("target/metadata.json", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+
+        core = [p for p in metadata["packages"] if p["name"] == "zlib-rs"]
+        if len(core) != 1:
+            print("::error::expected exactly one zlib-rs package in the workspace "
+                  "metadata, found %d" % len(core))
+            sys.exit(1)
+
+        declared = core[0]["dependencies"]
+        if declared:
+            for dependency in declared:
+                print("::error::crates/zlib-rs declares a dependency on %s (%s, kind=%s); "
+                      "the safe core's [dependencies], [dev-dependencies] and "
+                      "[build-dependencies] must all stay empty"
+                      % (dependency["name"], dependency["req"], dependency.get("kind")))
+            sys.exit(1)
+
+        print("crates/zlib-rs: 0 declared dependencies of any kind -- dependency "
+              "minimalism holds")
+        CORE_DEPS
+
+    - name: Run test cases (the fuzz workspace)
+      run: |
+        cargo deny --all-features --locked --manifest-path fuzz/Cargo.toml \
+          --config fuzz/deny.toml check
 
   # ---------------------------------------------------------------------------
   # 5. The MSRV floor.  A build, not the test matrix, so it stays cheap: the
@@ -200,21 +512,345 @@ jobs:
   # edition 2021 is likewise not a preference: edition 2024 requires rustc 1.85
   # and cargo rejects the combination outright, so 2021 is the only valid choice
   # at this floor.
+  #
+  # FEATURES, and this is the half that is easy to leave out: a default build
+  # never compiles crates/zlib-rs/src/{crc32,adler32}/simd.rs and never compiles
+  # the core without `std`, so an MSRV check of the default configuration alone
+  # declares a floor for only part of the source.  `--all-features` is the
+  # widest configuration and `--no-default-features` the narrowest, and between
+  # them every line either crate can compile is put in front of the 1.80
+  # compiler.  Both carry `--all-targets`, which is what puts the unit tests and
+  # the integration tests over the same floor -- `&raw mut` is Rust 1.82 syntax
+  # and reads so naturally that it lands in a test without anyone noticing;
+  # `core::ptr::addr_of_mut!` is the spelling this tree uses instead.
   # ---------------------------------------------------------------------------
   msrv:
     name: MSRV 1.80
     runs-on: ubuntu-latest
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # SEC hardening: the job needs the tree, never the credential.  See the
+        # `permissions` block at the top of this file.
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: |
         rustup toolchain install 1.80 --profile minimal
         cargo +1.80 --version
+        make --version | head -1
 
     - name: Compile source code
-      run: cargo +1.80 build --locked -p zlib-rs -p libz-rs-sys --all-targets
+      # `--all-features` and warnings-as-errors are BOTH part of the gate, and
+      # for the same reason: the floor has to hold for every configuration a
+      # consumer can select, and a construct newer than 1.80 shows up as a
+      # warning at least as often as it shows up as an error.  Cargo.toml's
+      # MSRV note records this exact command shape, and `make rust-msrv` runs
+      # it too -- if the three ever diverge the gate stops meaning anything.
+      #
+      # THREE CONFIGURATIONS, and an isolated target directory.  The floor has to hold for
+      # the default set, for every feature at once and for `--no-default-features`, because
+      # a consumer can select any of them.  The separate CARGO_TARGET_DIR is not tidiness:
+      # the `--no-default-features` line produces a cdylib with the exported surface
+      # compiled out and cargo writes it over `target/debug/libz.so`, so a developer who
+      # runs these commands by hand and then runs `cargo test` gets a wall of missing-symbol
+      # failures out of tests/symbol_parity.rs with nothing to connect them to.
+      env:
+        RUSTFLAGS: -D warnings
+        CARGO_TARGET_DIR: target/msrv
+      run: |
+        set -eu
+        cargo +1.80 build --locked -p zlib-rs -p libz-rs-sys --all-targets
+        cargo +1.80 build --locked -p zlib-rs -p libz-rs-sys --all-features --all-targets
+        cargo +1.80 build --locked -p zlib-rs -p libz-rs-sys --no-default-features --all-targets
+
+  # ---------------------------------------------------------------------------
+  # 5a. The other two integer models.
+  #
+  # `uLong` is `unsigned long` (`zconf.h` L406): 8 bytes on LP64, 4 on ILP32 and
+  # 4 on LLP64 Windows.  Every job above this one runs on LP64 only, so a
+  # constant, a shift or a cast that is fine at 64 bits and wrong at 32 has had
+  # nowhere to be caught -- and this is not hypothetical.  Three
+  # `uLong << 32` expressions and one `uInt::MAX as usize + 1` in the facade's
+  # own tests were arithmetic overflows on a 32-bit target; the same literals
+  # also broke the LLP64 target, where `c_ulong` is likewise 4 bytes.
+  #
+  # A BUILD OF THE TESTS, not a test run, and `build` NOT `check`.  The
+  # distinction is the whole point: `arithmetic_overflow` is produced by a MIR
+  # pass that runs during CODEGEN, so `cargo check --target i686-...` reports
+  # success on code that `cargo build --target i686-...` rejects.  Measured.
+  # Running the tests would need an emulator; compiling them is what catches this
+  # class, and it is cheap.
+  #
+  # THE C SHIM MUST BE BUILT FOR THE SAME MODEL.  build.rs compiles
+  # csrc/*.c through the `cc` crate, which takes its flags from
+  # `CFLAGS_<target>` -> `TARGET_CFLAGS` -> `CFLAGS`.  Without `-m32` the shim
+  # archive comes out ELF64 and the link fails with "i386 architecture of input
+  # file ... is incompatible with i386:x86-64 output".  Measured, and the reason
+  # the env block below is not optional.
+  # ---------------------------------------------------------------------------
+  integer-models:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "ILP32 (i686-unknown-linux-gnu)"
+            target: i686-unknown-linux-gnu
+            packages: gcc-multilib libc6-dev-i386
+
+          - name: "LLP64 (x86_64-pc-windows-gnu)"
+            target: x86_64-pc-windows-gnu
+            packages: mingw-w64
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # SEC-10's companion half, applied to every checkout in this file: without it
+        # actions/checkout leaves the job token in .git/config, where any later step --
+        # a build script, a proc macro, a test -- can read it out of the working tree.
+        # Nothing here pushes, so nothing needs the credential after the checkout.
+        persist-credentials: false
+
+    - name: Install Rust toolchain
+      run: |
+        rustup toolchain install stable --profile minimal
+        rustup target add ${{ matrix.target }}
+
+    - name: Install packages (Linux)
+      run: |
+        sudo apt-get update
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ${{ matrix.packages }}
+
+    - name: Compile source code
+      # The env is per-target and deliberately explicit rather than inherited.
+      env:
+        CFLAGS_i686_unknown_linux_gnu: "-m32"
+        CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
+        AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
+        CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+      run: |
+        cargo build --locked -p zlib-rs -p libz-rs-sys --all-targets \
+          --target ${{ matrix.target }}
+
+  # ---------------------------------------------------------------------------
+  # 5b. The feature matrix.
+  #
+  # Every other job in this file builds ONE configuration: the default feature
+  # set, or `--all-features`.  Neither is what a consumer necessarily gets.
+  # `zlib-rs` has `default = []` and `libz-rs-sys` has
+  # `default = ["libz-compat", "gz"]` with `gz = ["libz-compat",
+  # "zlib-rs/std", "dep:libc"]`, so the supported configurations differ from one
+  # another in what they even COMPILE -- `pub mod gz` is `#[cfg(feature =
+  # "std")]`, and the facade's inftrees shim is needed by `libz-compat` while its
+  # gzprintf shim is needed only by `gz`.  A partial configuration can therefore
+  # fail to compile or fail to LINK while the default and all-features builds are
+  # both green, which is exactly what happened: `--no-default-features --features
+  # libz-compat` failed to link `inflate_table`, and no job in this file was
+  # capable of noticing.
+  #
+  # So each supported configuration is its own cell, and each cell builds, tests
+  # AND lints.  Linting per cell is not padding: `#[cfg]`-gated code is invisible
+  # to clippy in the configurations that exclude it, so an unused import behind a
+  # feature gate is only reachable this way.
+  #
+  # The cells are the supported configurations, not the power set.  Every one of
+  # the nine below was verified to build on this tree; combinations that add no
+  # distinct compilation (`libc` alone, for instance, which `gz` already implies)
+  # are deliberately absent.
+  # ---------------------------------------------------------------------------
+  features:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The genuinely no_std + alloc engine: no features at all.
+          - name: "Features: core, no default"
+            args: "-p zlib-rs --no-default-features"
+
+          # The idiomatic surface -- ~80 re-exports that only exist behind it.
+          - name: "Features: core, rust-api"
+            args: "-p zlib-rs --features rust-api"
+
+          # Turns on `pub mod gz` and tests/gz.rs.  See the Miri job.
+          - name: "Features: core, std"
+            args: "-p zlib-rs --features std"
+
+          # Output-neutral vectorised checksum backends.
+          - name: "Features: core, simd"
+            args: "-p zlib-rs --features simd"
+
+          # The facade with NOTHING on: no exported C surface at all.
+          - name: "Features: facade, no default"
+            args: "-p libz-rs-sys --no-default-features"
+
+          # The C ABI without the gz file layer.  This is the configuration that
+          # was broken: it needs the inftrees shim but not the gzprintf one.
+          - name: "Features: facade, libz-compat only"
+            args: "-p libz-rs-sys --no-default-features --features libz-compat"
+
+          # gz implies libz-compat, zlib-rs/std and libc, so this cell proves the
+          # implication chain resolves from a bare start.
+          - name: "Features: facade, gz only"
+            args: "-p libz-rs-sys --no-default-features --features gz"
+
+          - name: "Features: facade, default + simd"
+            args: "-p libz-rs-sys --features simd"
+
+          - name: "Features: workspace, all"
+            args: "--workspace --all-features"
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # SEC-10's companion half, applied to every checkout in this file: without it
+        # actions/checkout leaves the job token in .git/config, where any later step --
+        # a build script, a proc macro, a test -- can read it out of the working tree.
+        # Nothing here pushes, so nothing needs the credential after the checkout.
+        persist-credentials: false
+
+    - name: Install Rust toolchain
+      run: rustup toolchain install stable --profile minimal --component clippy,llvm-tools
+
+    - name: Install packages (Linux)
+      run: cc --version
+
+    - name: Compile source code
+      # WARNINGS DENIED HERE TOO, and a RELEASE build beside the debug one.  A
+      # `#[cfg]`-gated item is only compiled in the configurations that select
+      # it, so a warning behind a feature gate is reachable nowhere else; and the
+      # release profile is a different compilation -- `panic = "abort"`, fat LTO
+      # and one codegen unit -- which is where a genuine no-default-features
+      # compile defect in this tree was actually found.  Debug alone would have
+      # missed it.
+      env:
+        RUSTFLAGS: -D warnings
+      run: |
+        set -eu
+        cargo build --locked ${{ matrix.args }} --all-targets
+        cargo build --locked --release ${{ matrix.args }}
+
+    - name: Run test cases
+      env:
+        RUSTFLAGS: -D warnings
+      run: cargo test --locked ${{ matrix.args }}
+
+    - name: Run test cases (lint this configuration)
+      run: cargo clippy --locked ${{ matrix.args }} --all-targets -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # 5c. The ZLIB_RS_SIMD build-time toggle, and the SIMD build's behaviour.
+  #
+  # Two separate claims, both unverified until now.
+  #
+  # FIRST, the toggle's contract.  A build script cannot enable or disable a
+  # Cargo feature -- resolution happens before any script runs -- so
+  # `crates/libz-rs-sys/build.rs` implements ZLIB_RS_SIMD as an ASSERTION about
+  # the resolved feature set: `=1` with `simd` off is a hard error naming the
+  # feature to pass, `=0` with it on is a hard error naming how to turn it off,
+  # agreement is silent, and unset asserts nothing.  That is a real contract with
+  # four outcomes, and a documented toggle that silently did nothing would be
+  # worse than no toggle, so all four are exercised below -- including the two
+  # that MUST fail.
+  #
+  # SECOND, and this is the load-bearing one: the `simd` feature must be
+  # OUTPUT-NEUTRAL.  A checksum yields one scalar however it is computed, which
+  # is the entire reason SIMD is confined to CRC-32 and Adler-32 -- vectorising
+  # match finding would change the emitted bytes and break byte-identical output
+  # outright.  "Output-neutral" is a claim about behaviour, so it is tested as
+  # one: the differential suite and the checksum fuzz target are both run against
+  # a SIMD build, and they compare against the same C oracle as always.  If a
+  # vectorised backend ever disagreed with the scalar one, this is where it
+  # surfaces.
+  # ---------------------------------------------------------------------------
+  simd:
+    name: SIMD toggle and output neutrality
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # SEC-10's companion half, applied to every checkout in this file: without it
+        # actions/checkout leaves the job token in .git/config, where any later step --
+        # a build script, a proc macro, a test -- can read it out of the working tree.
+        # Nothing here pushes, so nothing needs the credential after the checkout.
+        persist-credentials: false
+
+    - name: Install Rust toolchain
+      run: rustup toolchain install stable --profile minimal --component llvm-tools
+
+    - name: Install packages (Linux)
+      run: cc --version
+
+    - name: Compile source code
+      # The two agreeing combinations must build.
+      run: |
+        set -eu
+        ZLIB_RS_SIMD=1 cargo build --locked -p libz-rs-sys --features simd
+        ZLIB_RS_SIMD=0 cargo build --locked -p libz-rs-sys
+
+    - name: Run test cases (the toggle rejects a contradiction)
+      # A toggle that accepts a contradiction is a toggle that does nothing, and
+      # it would look exactly like a working one from the outside.  `if ... then
+      # fail` rather than `!`, so an unexpected SUCCESS is the failure.
+      shell: bash
+      run: |
+        set -eu
+        if ZLIB_RS_SIMD=1 cargo build --locked -p libz-rs-sys > /tmp/simd1.log 2>&1; then
+          echo "::error::ZLIB_RS_SIMD=1 was accepted with the simd feature OFF." \
+               "The toggle is documented to reject that combination, so it is"   \
+               "silently doing nothing and a SIMD build cannot be requested."
+          exit 1
+        fi
+        grep -q 'ZLIB_RS_SIMD=1' /tmp/simd1.log || {
+          echo "::error::the rejection did not name ZLIB_RS_SIMD, so it failed for" \
+               "some other reason."; cat /tmp/simd1.log; exit 1; }
+
+        if ZLIB_RS_SIMD=0 cargo build --locked -p libz-rs-sys --features simd \
+             > /tmp/simd0.log 2>&1; then
+          echo "::error::ZLIB_RS_SIMD=0 was accepted with the simd feature ON."   \
+               "The toggle cannot be used to turn the vectorised backends off."
+          exit 1
+        fi
+        grep -q 'ZLIB_RS_SIMD=0' /tmp/simd0.log || {
+          echo "::error::the rejection did not name ZLIB_RS_SIMD."; cat /tmp/simd0.log; exit 1; }
+        echo "both contradictions were rejected, and both agreements build."
+
+    - name: Run test cases (simd is output-neutral)
+      # The differential suite under a SIMD build: byte-identical output and
+      # checksum equality against the C oracle, with the vectorised backends in
+      # play.  This is the assertion that makes `simd` safe to ship.
+      run: |
+        set -eu
+        ZLIB_RS_SIMD=1 cargo test --locked -p zlib-rs-differential --release \
+          --features simd
+
+    - name: Run test cases (checksum fuzz under simd)
+      # The one fuzz target whose whole job is differential checksum comparison,
+      # run against a SIMD build for a bounded time.  Short by design: this is a
+      # neutrality check, not the fuzzing budget, which the fuzz job owns.
+      run: |
+        set -eu
+        rustup toolchain install nightly --profile minimal
+        cargo install cargo-fuzz --locked --version 0.13.2 || cargo fuzz --version
+        cd fuzz
+        ZLIB_RS_SIMD=1 cargo +nightly fuzz run fuzz_checksum \
+          --features simd -- -max_total_time=120
+
+    - name: Compile source code (benches under simd)
+      # Builds only.  The bench job owns the measurement; what matters here is
+      # that the SIMD configuration compiles the benches at all, since they are
+      # the one consumer that links both implementations at once.
+      run: cargo bench --locked -p zlib-rs-differential --features simd --no-run
 
   # ---------------------------------------------------------------------------
   # 6. The differential suite: byte-identical output, and interoperability in
@@ -228,8 +864,26 @@ jobs:
   # reference does.  A better DEFLATE encoder fails this job, which is the
   # point.
   #
-  # What crates/zlib-rs-differential's tests sweep, so that the scope of the
-  # gate is legible from here rather than only from the test source:
+  # TWO COMMANDS, AND BOTH ARE THE GATE.  The suites are split into a fast
+  # default sweep and an exhaustive one held behind `#[ignore]` plus an
+  # environment variable, because a bare `cargo test --workspace` in debug must
+  # not pay for the full cross product.  The variable and `--ignored` are BOTH
+  # required -- `#[ignore]` keeps the sweeps out of a default run, and the
+  # variable is what makes them do their work rather than report that they were
+  # not asked to -- so the second step below sets both and passes `--ignored`.
+  # Running only the first step would leave the full matrix AAP 0.6.4.2
+  # specifies unmeasured, and would make the `run by CI` phrasing in those
+  # tests' own `#[ignore]` descriptions false.  Do not delete the second step to
+  # save wall clock; shard it by test filter instead.
+  #
+  # --release for both, and --test-threads for the second: the exhaustive
+  # configuration sweep is sharded one `#[test]` per level precisely so cargo's
+  # own harness runs the shards concurrently, and a debug build of this suite is
+  # roughly fifteen times slower.
+  #
+  # What crates/zlib-rs-differential's tests sweep across the two commands, so
+  # that the scope of the gate is legible from here rather than only from the
+  # test source:
   #
   #   level ........ 0-9, all ten
   #   windowBits ... 9..15 (zlib), -9..-15 (raw), 25..31 (gzip)
@@ -250,6 +904,33 @@ jobs:
   #   (callers size their output buffers with those, so a bound that is too
   #   small is a buffer overflow in CALLER code).
   #
+  # THE SWEEP IS SPLIT IN TWO AND BOTH HALVES RUN HERE.  A plain `cargo test`
+  # runs only the default suites, because the full cross product is marked
+  # `#[ignore]` -- 2,542,729 byte-identity cells and a 16,380-crossing interop
+  # product are not what belongs in a developer's inner loop.  So the default
+  # step below covers the representative 13,804 cells and the default interop
+  # set, and the two steps after it lift the `#[ignore]` with the environment
+  # variable each suite requires.  Both halves are needed for the matrix above
+  # to be a description of what CI measured rather than of what the test file
+  # is capable of measuring:
+  #
+  #   ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE=1  ... eleven shards, one per compression
+  #                                          level plus the chunking matrix,
+  #                                          2,542,729 cells, ~25 min on four
+  #                                          cores (measured; see the "Measured
+  #                                          wall clock" section of
+  #                                          tests/byte_identical.rs)
+  #   ZLIB_RS_INTEROP_EXHAUSTIVE=1 ......... one shard, 16,380 crossings, a few
+  #                                          seconds
+  #
+  # The variable and `-- --ignored` are BOTH required by design: neither alone
+  # runs the sweep, and a suite that was asked for one way but not the other
+  # says so rather than reporting a vacuous pass.  `--test-threads 4` matches
+  # the standard runner's core count, which is what the per-level sharding
+  # exists to exploit.  `timeout-minutes` on the job is sized from the measured
+  # figure with headroom; if it is ever exceeded the answer is a bigger runner
+  # or more shards, NOT a narrower matrix.
+  #
   # A C COMPILER IS REQUIRED on the runner, not just cargo: that crate's own
   # build.rs compiles the fifteen in-tree C translation units into a test-only
   # static oracle with the `cc` crate, so both implementations live in one
@@ -257,16 +938,54 @@ jobs:
   # version print below makes that a stated requirement rather than luck.
   #
   # The oracle is a dev-only dependency: it appears in no [dependencies] table
-  # of either shipped crate, so `cargo build --release` never invokes a C
-  # compiler.  Nothing is vendored and there are no submodules -- the reference
-  # sources are already in this tree.
+  # of either shipped crate, so a shipped `cargo build --release` never compiles
+  # any of those fifteen reference translation units.  It is not, however, free
+  # of C altogether: crates/libz-rs-sys/build.rs compiles the two small units in
+  # its own csrc/ -- the variadic gzprintf/gzvprintf pair and the `code`-typed
+  # inflate_table prototype, neither of which stable Rust can declare -- so a C
+  # compiler and an archiver are prerequisites of the default facade build too,
+  # and only `cargo build -p zlib-rs` is toolchain-free.  What the dev-only
+  # boundary buys is that the REFERENCE IMPLEMENTATION is an oracle rather than
+  # a dependency.  Nothing is vendored and there are no submodules -- the
+  # reference sources are already in this tree.
+  #
+  # SIMD IS EXERCISED HERE, and this is the only job that does it.  The `simd`
+  # feature is output-neutral by construction (it reaches the two checksums and
+  # nothing else, and a checksum is one scalar however it is computed), but
+  # "by construction" is an argument, not a measurement.  The last step re-runs
+  # the default suites with the feature on, against the same C oracle, so the
+  # claim is machine-checked: the byte-identity cells compare the emitted bytes
+  # AND the running check value, so a vectorised backend that computed a
+  # different Adler-32 or CRC-32 would fail here.  The exhaustive sweeps are not
+  # repeated under the feature; the checksum backends do not vary with level,
+  # windowBits, memLevel or strategy, so the default suites are where the
+  # feature's effect is visible.
   # ---------------------------------------------------------------------------
+  # BOTH CHECKSUM BACKENDS ARE MANDATORY HERE, not one of them.  `simd` is
+  # default-off and is required to be OUTPUT-NEUTRAL -- it may change speed and
+  # never a single emitted byte (AAP 0.8.2 ambiguity 9) -- and the only way to
+  # hold it to that is to run the byte-identity matrix both ways and compare
+  # both against the same C oracle.  A single scalar-only run would leave the
+  # vectorized backends' output unverified by this job entirely, so the feature
+  # set is a matrix dimension and every log is labelled with it.
   differential:
-    name: Differential
+    name: Differential (${{ matrix.label }})
     runs-on: ubuntu-latest
+    # The exhaustive sweeps are the reason this is not the default.  Measured on a
+    # loaded four-core machine: the ten per-level shards plus the chunking sweep
+    # take 38 minutes wall clock at `--test-threads 4`, and the interoperability
+    # sweep 4 seconds.  The budget is generous rather than tight because the right
+    # response to exceeding it is to SHARD -- the sweeps are already one test per
+    # level, so `-- --ignored exhaustive_configuration_matrix_level_3` runs one --
+    # and never to narrow what is compared.
+    timeout-minutes: 120
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # SEC hardening: the job needs the tree, never the credential.  See the
+        # `permissions` block at the top of this file.
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: rustup toolchain install stable --profile minimal
@@ -277,17 +996,294 @@ jobs:
         make --version | head -1
 
     - name: Compile source code
-      run: cargo test --locked -p zlib-rs-differential --release --no-run
+      run: >-
+        cargo test --locked -p zlib-rs-differential --release
+        ${{ matrix.features }} --no-run
 
     - name: Run test cases
+      # THE FAST TIER, and it is exactly that -- representative, not the full
+      # matrix.  The twelve sweeps the two suites hold back are `#[ignore]`d and
+      # armed by an environment variable, and the `differential-exhaustive` job
+      # is what runs them, one shard per runner, with a gate that fails when a
+      # shard runs disarmed; do not read this step alone as the gate the comment
+      # block above describes.
       run: cargo test --locked -p zlib-rs-differential --release
 
+    - name: Run test cases (the exhaustive interoperability product)
+      # ARMED, and both halves are required: `#[ignore]` keeps the product out of a
+      # default run and ZLIB_RS_INTEROP_EXHAUSTIVE is what makes it do its work
+      # rather than report that it was not asked to.  With only one of the two set
+      # the sweep prints a SKIP line and PASSES, which is exactly how this gate
+      # would rot unnoticed, so the check below reads the log rather than trusting
+      # the exit status.
+      #
+      # It lives here rather than in `differential-exhaustive` because it is cheap:
+      # the whole C->Rust / Rust->C product runs in seconds, where the byte-identity
+      # cross product needs the sharding that job exists to provide.
+      env:
+        ZLIB_RS_INTEROP_EXHAUSTIVE: "1"
+      run: |
+        set -eu
+        set -o pipefail
+        mkdir -p target/differential
+        LOG=target/differential/exhaustive-interop.log
+        cargo test --locked -p zlib-rs-differential --release \
+          --test roundtrip_interop -- --ignored --nocapture 2>&1 | tee "$LOG"
+        if grep -q 'SKIP:' "$LOG"; then
+          echo "::error::the interoperability product ran DISARMED and compared nothing;" \
+               "ZLIB_RS_INTEROP_EXHAUSTIVE did not reach the test process."
+          grep -n 'SKIP:' "$LOG" || true
+          exit 1
+        fi
+        crossings="$(grep -oE '[0-9]+ crossings' "$LOG" | grep -oE '^[0-9]+' \
+                     | sort -rn | head -1 || true)"
+        if [ -z "${crossings:-}" ] || [ "$crossings" -eq 0 ]; then
+          echo "::error::the interoperability product reported no crossing count, so it" \
+               "never finished a sweep."
+          tail -20 "$LOG" || true
+          exit 1
+        fi
+        echo "interoperability product: armed, and compared $crossings crossings."
+
+    - name: Run test cases (simd checksum backends)
+      # THE OUTPUT-NEUTRALITY GATE for the `simd` feature, checked here against
+      # the C reference.  The autovectorised Adler-32 and CRC-32 backends are
+      # admissible precisely because a checksum yields one scalar however it is
+      # computed, so they may change speed and never the emitted bytes -- a
+      # claim that is worth nothing until a run with the feature on is compared
+      # against the same reference as a run with it off.  Both suites are
+      # re-run, because the checksums reach the zlib and gzip container trailers
+      # as well as the standalone entry points.
+      run: cargo test --locked -p zlib-rs-differential --release --features simd
+
     - name: Upload build errors
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       if: failure()
       with:
-        name: differential
+        name: differential-${{ matrix.label }}
         path: |
+          target/release/build/zlib-rs-differential-*/output
+          target/release/build/zlib-rs-differential-*/stderr
+          target/differential/
+        retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 6b. The EXHAUSTIVE byte-identity product.  The job above runs the fast
+  # default sweep -- 13,804 cells of a representative subset -- and that is not
+  # the matrix AAP 0.6.4.2 specifies.  This job is where the specified matrix
+  # actually runs.
+  #
+  # The product is 10 levels x 21 windowBits x 9 memLevels x 5 strategies x 7
+  # flush values x 15 chunkings x 10 fixtures = 9,922,500 cells, and the ten
+  # `exhaustive_configuration_matrix_level_N` tests each take one level's
+  # 992,250.  They are `#[ignore]`d and additionally gated on
+  # ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE, so BOTH `--ignored` and the variable are
+  # required -- setting one without the other makes the tests report that they
+  # were not asked to work rather than silently pass, and that report is what
+  # this job would otherwise have been reading all along.
+  #
+  # Wall clock is why this is sharded twice over.  Measured on a 4-core machine
+  # in --release: one level's 1/64 slice is 32.8 s, so a whole level is about 35
+  # minutes single-threaded.  The ten levels are ten `#[test]`s that cargo's own
+  # harness runs concurrently (`--test-threads 4`), and
+  # ZLIB_RS_DIFFERENTIAL_SHARD=i/8 divides each of those across the eight matrix
+  # rows below, which brings a row to roughly 10-15 minutes.  `1/8` through `8/8`
+  # are a PARTITION of the product -- proved by the
+  # cell_shards_partition_the_product unit test, not asserted here -- so the
+  # union of the eight rows is exactly the product and nothing falls between
+  # them.
+  #
+  # The gate is not merely the exit status.  Each level prints its own accounting
+  # line, and the step below parses all ten: the product must be 992,250, every
+  # cell must be accounted for as compared, declared-excluded or another shard's,
+  # and the coverage must be what the mode promises (95.30% armed, 100.00% under
+  # `full`).  A run that enumerated a quarter of its product and passed is
+  # exactly the failure this job exists to make impossible.
+  # ---------------------------------------------------------------------------
+  differential-exhaustive:
+    name: Differential exhaustive (${{ matrix.label }} shard ${{ matrix.shard }}/8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # A true cross product: eight cell slices x both checksum backends.
+        # `include` adds `features` to the combinations whose `label` it names,
+        # which is the documented way to attach a derived value to a dimension
+        # without it becoming a dimension of its own.
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        label: [scalar, simd]
+        include:
+          - label: scalar
+            features: ''
+
+          - label: simd
+            features: '--features simd'
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # SEC-10's companion half, applied to every checkout in this file: without it
+        # actions/checkout leaves the job token in .git/config, where any later step --
+        # a build script, a proc macro, a test -- can read it out of the working tree.
+        # Nothing here pushes, so nothing needs the credential after the checkout.
+        persist-credentials: false
+
+    - name: Install Rust toolchain
+      run: rustup toolchain install stable --profile minimal
+
+    - name: Install packages (Linux)
+      run: cc --version
+
+    - name: Compile source code
+      run: >-
+        cargo test --locked -p zlib-rs-differential --release
+        ${{ matrix.features }} --test byte_identical --no-run
+
+    - name: Run test cases
+      env:
+        # `1` runs the armed product; `full` additionally lifts the one declared
+        # exclusion.  The default keeps a push and a pull request affordable and
+        # `workflow_dispatch` is how the unabridged form is asked for.
+        ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE: ${{ inputs.differential_mode || '1' }}
+        ZLIB_RS_DIFFERENTIAL_SHARD: ${{ matrix.shard }}/8
+      run: |
+        set -eu
+        set -o pipefail
+        mkdir -p target/differential
+        cargo test --locked -p zlib-rs-differential --release ${{ matrix.features }} \
+          --test byte_identical -- --ignored --test-threads 4 --nocapture 2>&1 \
+          | tee target/differential/exhaustive.log
+
+    - name: Run test cases (assert the product was enumerated)
+      env:
+        ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE: ${{ inputs.differential_mode || '1' }}
+        ZLIB_RS_DIFFERENTIAL_SHARD: ${{ matrix.shard }}/8
+      run: |
+        set -eu
+        python3 - <<'COVERAGE_GATE'
+        import os
+        import re
+        import sys
+
+        LOG = "target/differential/exhaustive.log"
+        LEVELS = 10
+        PER_LEVEL = 992_250
+        # Read from the same variable the tests read, rather than hardcoded, so
+        # that changing the matrix's width cannot leave the gate checking a share
+        # nobody is running.
+        SHARDS = int(os.environ.get("ZLIB_RS_DIFFERENTIAL_SHARD", "1/1").split("/")[1])
+        # Anchored on the whole line shape so that the module documentation the
+        # test prints cannot be parsed as data.
+        LINE = re.compile(
+            r"^exhaustive matrix, level (?P<level>\d): (?P<compared>\d+) cells .*"
+            r"\[shard=(?P<shard>\d+/\d+) (?P<fields>product=\d+ .*)\]$")
+
+        unabridged = os.environ.get("ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE", "1") == "full"
+
+        def pairs(text):
+            out = {}
+            for part in text.split():
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    out[key] = value
+            return out
+
+        with open(LOG, encoding="utf-8", errors="replace") as handle:
+            records = {}
+            failures = []
+            for line in handle:
+                match = LINE.match(line.rstrip("\n"))
+                if not match:
+                    continue
+                level = int(match.group("level"))
+                if level in records:
+                    failures.append("level %d printed two accounting lines; a level runs once"
+                                    % level)
+                records[level] = (match.group("shard"), pairs(match.group("fields")),
+                                  int(match.group("compared")))
+
+        missing = [level for level in range(LEVELS) if level not in records]
+        if missing:
+            failures.append(
+                "levels %s produced no accounting line: the shards did not run. BOTH "
+                "`--ignored` and ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE are required, and the "
+                "tests report rather than silently pass when the variable is unset."
+                % missing)
+
+        total_compared = 0
+        total_excluded = 0
+        print("%-6s %-8s %10s %10s %10s %10s %9s" %
+              ("level", "shard", "product", "compared", "excluded", "in_shard", "coverage"))
+        for level in sorted(records):
+            shard, field, compared = records[level]
+            print("%-6d %-8s %10s %10s %10s %10s %9s" %
+                  (level, shard, field.get("product", "?"), field.get("compared", "?"),
+                   field.get("excluded_tiny_window", "?"), field.get("in_shard", "?"),
+                   field.get("coverage", "?")))
+
+            product = int(field.get("product", "0"))
+            excluded = int(field.get("excluded_tiny_window", "0"))
+            other = int(field.get("other_shard", "0"))
+            in_shard = int(field.get("in_shard", "0"))
+            total_compared += compared
+            total_excluded += excluded
+
+            if product != PER_LEVEL:
+                failures.append("level %d enumerated a product of %d cells, not the %d the "
+                                "matrix specifies" % (level, product, PER_LEVEL))
+            if compared + excluded + other != product:
+                failures.append(
+                    "level %d did not account for every cell of its product: "
+                    "compared %d + excluded %d + other shards %d != product %d"
+                    % (level, compared, excluded, other, product))
+            if compared == 0:
+                failures.append("level %d compared nothing at all" % level)
+            if unabridged and excluded:
+                failures.append("level %d excluded %d cell(s) with the fixture-size "
+                                "constraint lifted; `full` must exclude nothing"
+                                % (level, excluded))
+            if not unabridged and excluded == 0:
+                failures.append(
+                    "level %d excluded nothing in the armed mode, where the seven "
+                    "sub-64-byte windows are held back from window_boundary.bin; a zero "
+                    "here means the shard selected a biased slice of the product"
+                    % level)
+            # The slices are near-even by construction (the ordinal is mixed before it
+            # is divided), so a wildly lopsided share means the sharding is broken
+            # rather than that this row was unlucky.
+            even = product // SHARDS
+            if in_shard and abs(in_shard - even) * 4 > even:
+                failures.append("level %d was handed %d of the %d cells an eighth of the "
+                                "product should be, which is more than 25%% off"
+                                % (level, in_shard, even))
+
+        expected_share = LEVELS * PER_LEVEL // SHARDS
+        print()
+        print("mode=%s shards=%d levels=%d compared=%d excluded=%d (1/%d of the "
+              "%d-cell product is about %d cells)"
+              % ("full" if unabridged else "armed", SHARDS, len(records),
+                 total_compared, total_excluded, SHARDS, LEVELS * PER_LEVEL,
+                 expected_share))
+
+        if failures:
+            for failure in failures:
+                print("::error::%s" % failure)
+            sys.exit(1)
+
+        print("exhaustive differential: PASS -- every cell of this shard's slice of all "
+              "ten levels was compared or declared excluded, byte for byte against the "
+              "C oracle")
+        COVERAGE_GATE
+
+    - name: Upload build errors
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      if: failure()
+      with:
+        name: differential-exhaustive-${{ matrix.label }}-${{ matrix.shard }}
+        path: |
+          target/differential/exhaustive.log
           target/release/build/zlib-rs-differential-*/output
           target/release/build/zlib-rs-differential-*/stderr
         retention-days: 7
@@ -316,7 +1312,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # SEC hardening: the job needs the tree, never the credential.  See the
+        # `permissions` block at the top of this file.
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: rustup toolchain install stable --profile minimal
@@ -337,16 +1337,83 @@ jobs:
         echo "deriving the baseline library name from zlib.h: libz.so.$ZVER"
 
     - name: Compile source code
-      # The C baseline.  ./configure is run in the checkout exactly as
-      # configure.yml already does; a runner checkout is throwaway, and the
-      # Makefile it writes still carries the rust* targets.  Then `make rust`
-      # builds and stages the Rust drop-in, with ZLIBREF pointed at the C
-      # library so that its own C-versus-Rust comparison runs as well.
+      # ★ THE C BASELINE IS BUILT IN A COPY, NOT IN THE CHECKOUT.  `./configure`
+      # OVERWRITES TRACKED FILES: it rewrites `Makefile` and generates `zconf.h`,
+      # both of which are committed in this repository.  A runner checkout being
+      # throwaway is not the point -- the point is that a workflow which mutates
+      # tracked files cannot tell a real diff from its own, so it can neither
+      # assert that a build leaves the tree clean nor be safely reused by anyone
+      # running these steps locally.  configure.yml does it in the checkout
+      # because that IS its subject; here the C library is only a measuring stick.
+      #
+      # So the tree is copied to $RUNNER_TEMP, configured and built there, and the
+      # resulting library is copied back under target/ (which .gitignore covers)
+      # to be compared.  The Rust side is built in the checkout with `make rust`,
+      # which needs no configure because the committed Makefile forwards the rust*
+      # targets, and ZLIBREF points it at the copied-back baseline so its own
+      # C-versus-Rust comparison runs too.
       run: |
         set -eu
-        ./configure
-        make -j2
-        make rust CARGO=cargo ZLIBREF="$CLIB"
+        C_TREE="$RUNNER_TEMP/c-oracle"
+        rm -rf "$C_TREE"
+        mkdir -p "$C_TREE"
+        tar -cf - --exclude=./.git --exclude=./target . | (cd "$C_TREE" && tar -xf -)
+        mkdir -p target/symbol-parity
+        ( cd "$C_TREE" && ./configure && make -j2 ) || {
+          cp "$C_TREE/configure.log" target/symbol-parity/ 2>/dev/null || true
+          echo "::error::the C baseline could not be built; configure.log is in the uploaded artifact"
+          exit 1
+        }
+        cp "$C_TREE/$CLIB" "target/symbol-parity/$CLIB"
+        echo "CLIB=target/symbol-parity/$CLIB" >> "$GITHUB_ENV"
+        make rust CARGO=cargo ZLIBREF="target/symbol-parity/$CLIB"
+
+    - name: Verify the working tree is unmodified
+      # The assertion that makes the copy above meaningful rather than decorative.
+      # If anything in this job writes to a tracked file -- a stray ./configure, a
+      # generated header at the root, a Makefile rewrite -- this fails and names
+      # the file, instead of the mutation being discovered later by a developer
+      # wondering why their checkout is dirty.
+      run: |
+        set -eu
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "::error::the working tree was modified by this job"
+          git status --porcelain
+          exit 1
+        fi
+        echo "working tree clean: nothing tracked was written"
+
+    - name: Run test cases (pkg-config descriptor, configured tree)
+      # This tree HAS a configure-generated zlib.pc, which is what makes it the
+      # right place for the other half of the packaging gate: `make rust-pc'
+      # copies that descriptor, adds the one Libs.private line a Rust static
+      # archive needs, and asserts that Name, Description, Version, License,
+      # Requires, Libs and Cflags came through byte for byte -- the property
+      # that keeps the two implementations answering a consumer identically
+      # everywhere they do not genuinely differ.  It then links and runs a C
+      # consumer built from nothing but the flags pkg-config answers.
+      #
+      # The drop-in job runs the same target unconfigured, where the descriptor
+      # is substituted from zlib.pc.in instead.
+      run: |
+        set -eu
+        make rust-pc CARGO=cargo
+
+        # The C descriptor is the baseline this one is derived from, so the
+        # difference between them has to be exactly the added key -- nothing
+        # else, in either direction.
+        diff -u zlib.pc target/dropin/zlib.pc > target/symbol-parity-pc.diff || true
+        cat target/symbol-parity-pc.diff
+        ADDED=$(grep -c '^+' target/symbol-parity-pc.diff || true)
+        REMOVED=$(grep -c '^-' target/symbol-parity-pc.diff || true)
+        # One +++ header line, the added Libs.private, and the generated
+        # header comment; one --- header line and nothing else removed.
+        [ "$REMOVED" = 1 ] || {
+          echo "::error::the Rust descriptor removed $((REMOVED - 1)) line(s) from the C one"
+          exit 1; }
+        grep -q '^+Libs\.private: -' target/symbol-parity-pc.diff || {
+          echo "::error::the Rust descriptor added no Libs.private line"; exit 1; }
+        echo "the two descriptors differ by the added Libs.private key and its comment only"
 
     - name: Run test cases
       run: |
@@ -464,14 +1531,45 @@ jobs:
         echo "both large-file families present; $gzcount gz* symbols"
         echo "symbol parity: PASS"
 
+    - name: Run test cases (ZLIB_RS_SIMD=1 exports the same surface)
+      # `ZLIB_RS_SIMD=1 make rust` is the DOCUMENTED user-facing spelling of the
+      # toggle -- README and Makefile.in both give it that way -- and the
+      # Makefile is where the translation from variable to Cargo feature happens,
+      # because a build script cannot enable a feature.  Measured here: the
+      # recipe turns it into `--features simd` for zlib-rs and
+      # `--features libz-compat,gz,simd` for the facade.  Nothing else in this
+      # workflow drives that path; `build-test` checks the variable against the
+      # build script's reconciliation, which is the other half of the same
+      # contract.
+      #
+      # The assertion is that the vectorised build's exported surface is
+      # identical to the scalar one just compared against the C baseline --
+      # version tags included, since field 3 of `nm -D` carries them.  SIMD is
+      # confined to CRC-32 and Adler-32 and is output-neutral, so it must not
+      # add, remove or rebind one symbol; a checksum feature that moved the ABI
+      # would be a far worse defect than a slow checksum.  Verified locally:
+      # 111 symbols, identical.
+      run: |
+        set -eu
+        S=target/symbol-parity
+        cp "$S/rust.syms" "$S/rust-scalar.syms"
+        ZLIB_RS_SIMD=1 make rust CARGO=cargo ZLIBREF="$CLIB"
+        nm -D --defined-only --extern-only target/dropin/libz.so \
+          | awk '{print $3}' | sort > "$S/rust-simd.syms"
+        if ! diff -u "$S/rust-scalar.syms" "$S/rust-simd.syms" > "$S/simd.diff"; then
+          echo "::error::the ZLIB_RS_SIMD=1 build exports a different surface from the scalar build. SIMD is confined to the two checksums and must be ABI-neutral as well as output-neutral."
+          cat "$S/simd.diff"
+          exit 1
+        fi
+        echo "ZLIB_RS_SIMD=1 make rust: identical surface, $(wc -l < "$S/rust-simd.syms" | tr -d ' ') symbols"
+
     - name: Upload build errors
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       if: failure()
       with:
         name: symbol-parity
         path: |
           target/symbol-parity/
-          configure.log
         retention-days: 7
 
 
@@ -519,7 +1617,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # SEC hardening: the job needs the tree, never the credential.  See the
+        # `permissions` block at the top of this file.
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: rustup toolchain install stable --profile minimal
@@ -537,18 +1639,55 @@ jobs:
     - name: Compile source code
       # Rules A1, A2, A5, A9 plus the standalone C89/C99/C17/C++17 compile
       # sweep, with and without _WIN32.
-      run: make rust-header CARGO=cargo
+      #
+      # RUSTHEADER is redirected under target/ rather than left at Makefile.in's
+      # default of `generated_zlib.h` AT THE REPOSITORY ROOT.  The default is
+      # right for a developer typing `make rust-header` -- the artifact lands
+      # where they can read it -- but wrong for CI: this target and its scratch
+      # siblings (.warn, .log, .probe.c, .ref, .gen) write five files into the
+      # root of the tree, so the job cannot then assert that it left the tree
+      # untouched, and a stray one is a file someone can commit.  .gitignore
+      # covers `/target/` with an anchored rule, so nothing under it can be.
+      run: |
+        set -eu
+        mkdir -p target/rust-header
+        make rust-header CARGO=cargo RUSTHEADER=target/rust-header/generated_zlib.h
 
     - name: Run test cases
       run: |
         set -eu
+        set -o pipefail
         # Regenerated explicitly so that this step stands on its own, and so
         # that the exact command a developer runs by hand is the command the
         # gate runs.  generated_zlib.h is a build artifact: .gitignore carries
         # an anchored rule for it, and it must never be committed.  zlib.h is
         # read-only and is never written by anything here.
-        cbindgen --config cbindgen.toml --crate libz-rs-sys --output generated_zlib.h
-        python3 - <<'SHAPE_GATE'
+        #
+        # ★ THE FOUR SCRATCH FILES ARE (RE)PRODUCED HERE, and that is the point.
+        # `make rust-header` above writes generated_zlib.h.{warn,log,probe.c,
+        # ref,gen} -- Makefile.in's RUSTHEADERSCRATCH -- and keeps them only when
+        # IT fails; a successful make removes them.  So in the failure mode where
+        # THIS step's gate is what fails, the make has already swept them away
+        # and an upload naming them would collect nothing at all.  Each is
+        # therefore written again here with the same meaning the Makefile gives
+        # it: `.warn` is cbindgen's stderr, `.log` this gate's whole transcript,
+        # and `.ref`/`.gen` the contract function names each header declares
+        # (written by the gate itself, right after it scans them).
+        cbindgen --config cbindgen.toml --crate libz-rs-sys --output generated_zlib.h \
+          2> generated_zlib.h.warn || {
+            echo "::error::cbindgen could not generate the header"
+            sed 's/^/    /' generated_zlib.h.warn >&2
+            exit 1
+          }
+        if test -s generated_zlib.h.warn; then
+          echo "cbindgen wrote diagnostics (kept in generated_zlib.h.warn):"
+          sed 's/^/    /' generated_zlib.h.warn
+        else
+          echo "cbindgen produced no diagnostics" > generated_zlib.h.warn
+        fi
+        # `tee` plus `pipefail`: the transcript is captured for the upload and the
+        # gate's exit status still decides the step.
+        python3 - <<'SHAPE_GATE' 2>&1 | tee generated_zlib.h.log
         """cbindgen shape gate: rules A3, A4, A6, A7, A8 and rule 10.
 
         Pass A  -- every generated prototype is re-declared against zlib.h, so
@@ -565,7 +1704,8 @@ jobs:
         import subprocess
         import sys
 
-        REF, GEN = "zlib.h", "generated_zlib.h"
+        REF = "zlib.h"
+        GEN = os.path.join("target", "header-gate", "generated_zlib.h")
         # Rule A2: preprocess each side under its own DECLARED configuration.
         # _LARGEFILE64_SOURCE=1 without _FILE_OFFSET_BITS=64 is the reference
         # build's own setting, and it is what makes the large-file duplicates
@@ -643,6 +1783,20 @@ jobs:
                 decls[prototype.group(1)] = flat
         if not decls:
             sys.exit("no contract prototypes found in %s; the scan is wrong" % GEN)
+
+        # The two name lists, written where `make rust-header` writes them and
+        # meaning what they mean there, so the failure upload has them however
+        # this gate exits -- see the note at the top of this step.  `.gen` is the
+        # CONTRACT-FILTERED set, which is exactly what pass A goes on to compare:
+        # `comm -23` of the two files answers "which contract functions did the
+        # generated header not declare", the question a pass-A failure raises.
+        for path, names in ((GEN + ".ref", sorted(contract)),
+                            (GEN + ".gen", sorted(decls))):
+            with open(path, "w") as handle:
+                handle.write("\n".join(names) + "\n")
+        print("wrote %s.ref (%d ZEXTERN names in %s) and %s.gen (%d of them "
+              "declared by the generated header)"
+              % (GEN, len(contract), REF, GEN, len(decls)))
 
         PREAMBLE = ["#define _LARGEFILE64_SOURCE 1", "#define ZLIB_CONST 1",
                     "#include <stdarg.h>", "#include <stddef.h>", "#include <stdint.h>",
@@ -730,17 +1884,136 @@ jobs:
         # function-like macro never matches, because `-dM` emits its parameter
         # list with no space before the `(`; a string-valued macro is dropped
         # here, which is what excludes ZLIB_VERSION per D4.
-        defined = {}
-        for side, path, defs in (("ref", REF, REF_DEFS), ("gen", GEN, GEN_DEFS)):
-            defined[side] = {}
-            for line in run([CC, "-dM", "-E", "-P", "-I.", *defs, path]).stdout.splitlines():
+        #
+        # EVERY RETURN CODE IS CHECKED, and this is not defensive tidiness.  `run`
+        # is `check=False`, so a preprocessor that failed -- a missing include, a
+        # syntax error the generator introduced, a `cc` that is not there --
+        # returned an EMPTY stdout, `defined[side]` came out empty, and the whole
+        # macro half of this gate then compared nothing against nothing and
+        # reported success.  A silent pass is the worst outcome available to a
+        # conformance gate, so a non-zero status is fatal here and says what it
+        # was doing when it happened.
+        def object_macros(text):
+            """`-dM` output reduced to object-like macros with non-string values."""
+            found = {}
+            for line in text.splitlines():
                 macro = re.match(r"#define\s+(\w+)\s+(\S.*)$", line)
                 if macro and not macro.group(1).startswith("_") and '"' not in macro.group(2):
-                    defined[side][macro.group(1)] = macro.group(2)
-        # ZLIB_H is the include guard, not a contract constant.
-        own = {n for n in defined["ref"]
-               if re.match(r"^(Z_|ZLIB_|MAX_|DEF_)", n) and n != "ZLIB_H"}
-        shared = sorted(own & set(defined["gen"]))
+                    found[macro.group(1)] = macro.group(2)
+            return found
+
+        defined = {}
+        for side, path, defs in (("ref", REF, REF_DEFS), ("gen", GEN, GEN_DEFS)):
+            command = [CC, "-dM", "-E", "-P", "-I.", *defs, path]
+            result = run(command)
+            if result.returncode != 0:
+                sys.exit("cannot enumerate the macros %s defines: `%s` exited %d\n%s"
+                         % (path, " ".join(command), result.returncode,
+                            result.stderr[:4000]))
+            defined[side] = object_macros(result.stdout)
+            if not defined[side]:
+                sys.exit("`%s` succeeded but named no object-like macro at all in %s; "
+                         "the scan is wrong" % (" ".join(command), path))
+
+
+        # `-dM` reports every macro in scope, not only the ones the header under
+        # test defines, so two kinds of name have to come out before the two sides
+        # can be compared as sets.  Both are COMPUTED rather than listed, so that
+        # a change to REF_DEFS, to GEN_DEFS or to either header's `#include` set
+        # does not silently start hiding or exposing names.
+        #
+        #   1. The probe's own `-D` flags.  `-DZLIB_CONST` is passed to the
+        #      reference side only and `-DZLIB_RS_LIBZ_COMPAT`/`-DZLIB_RS_GZ` to
+        #      the generated side only, so all three would read as one-sided
+        #      differences that are entirely this gate's own doing.
+        #   2. Whatever the SYSTEM headers define.  zconf.h includes <limits.h>,
+        #      which defines MAX_CANON and MAX_INPUT -- names that match the
+        #      contract's MAX_* shape and have nothing to do with zlib.  The
+        #      generated header includes a different, smaller set, so the leakage
+        #      is one-sided too.
+        def baseline(defs, headers):
+            """Macros in scope for `defs` before the header under test is read."""
+            got = {}
+            builtins = run([CC, "-dM", "-E", "-P", "-x", "c", *defs, "/dev/null"])
+            if builtins.returncode != 0:
+                sys.exit("cannot enumerate the compiler's own macros: %s"
+                         % builtins.stderr[:2000])
+            got.update(object_macros(builtins.stdout))
+            for header in headers:
+                probe = os.path.join(SCRATCH, "gate_include_probe.c")
+                with open(probe, "w") as handle:
+                    handle.write("#include <%s>\n" % header)
+                # A header this platform does not have -- <windows.h>, <unixio.h> --
+                # simply contributes nothing, which is correct: it defined nothing
+                # on this side either.
+                result = run([CC, "-dM", "-E", "-P", *defs, probe])
+                if result.returncode == 0:
+                    got.update(object_macros(result.stdout))
+            return got
+
+
+        def system_includes(*paths):
+            """The `#include <...>` names a header pulls in, itself included."""
+            names = set()
+            for path in paths:
+                names |= set(re.findall(r"#\s*include\s*<([^>]+)>", open(path).read()))
+            return sorted(n for n in names if not n.endswith("zconf.h"))
+
+        # Z_U4 is the one contract-shaped name zconf.h defines that the generated
+        # header legitimately does not.  It is a portability HELPER, not a
+        # constant: zconf.h L429-L434 picks `unsigned` or `unsigned long` with it
+        # and then spells z_crc_t in terms of it, whereas cbindgen emits z_crc_t
+        # as a fixed-width type directly and has no use for the helper.  Listed
+        # with its reason, exactly as the function-level allowance
+        # (RUSTHEADERNOGEN: gzopen_w) is, so that the allowance is reviewable
+        # rather than an unexplained hole in an intersection.
+        MACRO_NOGEN = {"Z_U4": "a zconf.h portability helper for spelling z_crc_t, "
+                               "not a published constant"}
+
+        SHAPE = re.compile(r"^(Z_|ZLIB_|MAX_|DEF_)")
+        noise = {"ref": baseline(REF_DEFS, system_includes(REF, "zconf.h")),
+                 "gen": baseline(GEN_DEFS, system_includes(GEN))}
+
+
+        def relevant(side):
+            """The contract-shaped macro names this side's header itself defines.
+
+            The prefix set is the contract's own: every constant zlib.h publishes
+            is Z_*, ZLIB_*, MAX_* or DEF_*.  ZLIB_H is the include guard rather
+            than a constant, and cbindgen.toml gives the generated header the same
+            guard name, so it is excluded on both sides.
+            """
+            return {n for n in defined[side]
+                    if SHAPE.match(n) and n != "ZLIB_H" and n not in noise[side]}
+
+        # ★ SET EQUALITY, NOT INTERSECTION.  Comparing `own & defined["gen"]` --
+        # which is what this did -- silently excused every name that only one side
+        # defines: a generated header that dropped Z_BLOCK, MAX_WBITS or
+        # DEF_MEM_LEVEL entirely was compared on the names it DID define and
+        # passed, and a generated header inventing a contract-shaped constant of
+        # its own was never noticed either.  Both directions are reported, both
+        # fail, and the names are listed so the diff is actionable.
+        own, theirs = relevant("ref"), relevant("gen")
+        missing = sorted(n for n in own - theirs if n not in MACRO_NOGEN)
+        surplus = sorted(theirs - own)
+        allowed = sorted(n for n in own - theirs if n in MACRO_NOGEN)
+        if missing or surplus:
+            failures.append("macro name set")
+            print("::error::the generated header's contract-shaped macro set "
+                  "differs from zlib.h's")
+            for name in missing:
+                print("MISSING from %s:  %s = %s" % (GEN, name, defined["ref"][name]))
+            for name in surplus:
+                print("SURPLUS in %s:   %s = %s" % (GEN, name, defined["gen"][name]))
+        print("rule 10: %d contract-shaped names in %s, %d in %s"
+              % (len(own), REF, len(theirs), GEN))
+        for name in allowed:
+            print("rule 10 allowance: %s absent from %s -- %s"
+                  % (name, GEN, MACRO_NOGEN[name]))
+        # Values are then compared for the names both sides agree on.  When the
+        # sets differ the run has already failed above, so this narrows what is
+        # reported rather than what is enforced.
+        shared = sorted(own & theirs)
 
 
         def probe_values(path, defs, names, stem):
@@ -812,18 +2085,44 @@ jobs:
         print("header conformance: PASS")
         SHAPE_GATE
 
+    - name: Verify the working tree is unmodified
+      # The assertion that makes the target/ redirection above meaningful.  Six
+      # files used to be written into the root of the tree by this job -- the
+      # generated header and its five scratch siblings -- and a job that dirties
+      # the tree it is inspecting cannot tell its own writes from a real change.
+      # zlib.h, zconf.h and zlib.map are the immutable contract; if any of them is
+      # touched here, this is where it surfaces.
+      run: |
+        set -eu
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "::error::the working tree was modified by this job"
+          git status --porcelain
+          exit 1
+        fi
+        echo "working tree clean: the contract headers are untouched"
+
     - name: Upload build errors
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       if: failure()
       with:
         name: header-conformance
+        # EVERY PATH NAMED HERE HAS A PRODUCER.  The four `generated_zlib.h.*`
+        # scratch files come from `make rust-header` when the make is what failed,
+        # and are written again by the step above when the gate is what failed --
+        # which is the mode they used to be missing in, because a successful make
+        # deletes them.  target/header-gate/ holds the probe sources and binaries
+        # the gate compiles; the whole directory rather than `*.c`, because a
+        # probe that fails to LINK is diagnosed from what sits beside it.
+        # generated_zlib.h itself is the one path that can legitimately be
+        # absent, in the single mode where cbindgen produced nothing -- and there
+        # its absence is the diagnosis, with the reason in `.warn`.
         path: |
           generated_zlib.h
           generated_zlib.h.warn
           generated_zlib.h.log
           generated_zlib.h.ref
           generated_zlib.h.gen
-          target/header-gate/*.c
+          target/header-gate/
         retention-days: 7
 
 
@@ -866,7 +2165,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # SEC hardening: the job needs the tree, never the credential.  See the
+        # `permissions` block at the top of this file.
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: rustup toolchain install stable --profile minimal
@@ -976,8 +2279,60 @@ jobs:
         "$D/infcover_rust"
         echo "drop-in replacement: PASS"
 
+    - name: Run test cases (static pkg-config consumer)
+      # The drivers above are linked by hand.  A real consumer asks pkg-config,
+      # and that is where the two implementations genuinely differ: a Rust
+      # static archive carries the Rust runtime and needs its native libraries
+      # on the link line, while the C libz.a needs none, so one descriptor
+      # cannot serve both and the Rust packaging step emits its own.
+      #
+      # `make rust-pc' generates it -- the C descriptor plus one Libs.private
+      # line, derived for this target with `rustc --print native-static-libs' --
+      # and then proves it: a C program compiled with the -I flags
+      # `pkg-config --cflags' answers, linked with the -L and -l flags
+      # `pkg-config --static --libs' answers against a directory holding the
+      # staged libz.a and no shared library, and run.  It fails the build on a
+      # missing or empty private list, on a private library leaking into the
+      # public `--libs' answer, and on a consumer that links but misbehaves.
+      #
+      # This job runs it WITHOUT ./configure, so the generation path exercised
+      # here is the one that substitutes zlib.pc.in from Makefile.in's own
+      # variables.  The symbol-parity job runs the same target in a configured
+      # tree, which is where the other path -- copying the configure-generated
+      # zlib.pc and asserting every other field came through unchanged -- and
+      # its field-by-field comparison run.
+      run: |
+        set -eu
+        make rust-pc CARGO=cargo
+
+        PC=target/dropin/zlib.pc
+        [ -f "$PC" ] || { echo "::error::$PC was not generated"; exit 1; }
+        echo "--- $PC ---"
+        grep -v '^#' "$PC" | grep -v '^$'
+
+        # Independent of what the target already asserted: the key exists
+        # exactly once, it is not empty, and the descriptor is not simply the
+        # C one under a new name.
+        N=$(grep -c '^Libs\.private: ' "$PC" || true)
+        [ "$N" = 1 ] || { echo "::error::$PC has $N Libs.private lines, not 1"; exit 1; }
+        PRIV=$(sed -n 's/^Libs\.private: *//p' "$PC")
+        [ -n "$PRIV" ] || { echo "::error::$PC advertises an empty Libs.private"; exit 1; }
+        case "$PRIV" in
+          *-l*) ;;
+          *) echo "::error::Libs.private carries no library flag: $PRIV"; exit 1;;
+        esac
+        echo "the staged archive advertises its native dependencies: $PRIV"
+
+        # And the C build's own descriptor still carries none, because adding
+        # one there would be wrong: the C libz.a needs no companion libraries.
+        if grep -q '^Libs\.private' zlib.pc.in; then
+          echo "::error::zlib.pc.in carries a Libs.private key; the C descriptor must not"
+          exit 1
+        fi
+        echo "zlib.pc.in still advertises no private libraries, as the C build requires"
+
     - name: Upload build errors
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       if: failure()
       with:
         name: dropin-c-drivers
@@ -985,10 +2340,13 @@ jobs:
           target/dropin-stage/*.ldd
           target/dropin-stage/example.out
           target/dropin/soname.stage
+          target/dropin/zlib.pc
+          target/dropin/pc-gate/consumer.c
+          target/dropin/pc-gate/pkgconfig/zlib.pc
         retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # 10. Miri over the safe core.
+  # 10. Miri over the safe core, sharded.
   #
   # Miri is a NIGHTLY-ONLY component, which is why this job installs nightly
   # with both `miri` and `rust-src`, and why every invocation says `+nightly`
@@ -997,30 +2355,236 @@ jobs:
   #
   # SCOPE IS `-p zlib-rs` AND MUST NOT BECOME `--workspace`.  zlib-rs is the
   # safe core: #![forbid(unsafe_code)], no_std + alloc, zero dependencies, and
-  # no FFI whatsoever, which is precisely what lets Miri analyse it
-  # exhaustively.  Widening this to the workspace would pull in
-  # zlib-rs-differential, whose whole purpose is to call the C oracle -- and
-  # Miri cannot execute foreign functions, so the job would fail for a reason
-  # that has nothing to do with undefined behaviour.  The likely repair for that
-  # failure is deleting the gate, so do not create the situation.  libz-rs-sys,
-  # the crate that does hold raw pointers, is covered by the AddressSanitizer
-  # job below instead.
+  # no FFI whatsoever, which is precisely what makes it Miri-COMPATIBLE.
+  # Widening this to the workspace would pull in zlib-rs-differential, whose
+  # whole purpose is to call the C oracle -- and Miri cannot execute foreign
+  # functions, so the job would fail for a reason that has nothing to do with
+  # undefined behaviour.  The likely repair for that failure is deleting the
+  # gate, so do not create the situation.  libz-rs-sys, the crate that does hold
+  # raw pointers, is covered by the AddressSanitizer job below instead.
   #
-  # Miri interprets rather than executes, so it runs orders of magnitude slower
-  # than native.  The core already marks its corpus-folding tests
-  # #[cfg_attr(miri, ignore = "...")] with the reason spelled out, which is what
-  # keeps this finite; the generous timeout below is the budget, and the right
-  # response to exceeding it is to shard the run by module filter -- for
-  # instance `-- deflate::` and `-- inflate::`, whose union is the whole suite --
-  # NOT to narrow what is checked.
+  # WHAT THIS JOB DOES AND DOES NOT ESTABLISH.  Miri is an interpreter, not a
+  # prover: it reports undefined behaviour on the code paths the test suite
+  # actually EXECUTES, and says nothing about the paths it does not.  So the
+  # claim this job supports is "no undefined behaviour was observed while
+  # interpreting the zlib-rs test suite", and the coverage of that suite is the
+  # coverage of the gate.  Two things narrow it further, both deliberately:
+  # `cargo miri test` runs the crate's own `#[cfg(test)]` modules and its
+  # `tests/` targets, so nothing outside zlib-rs is interpreted at all; and the
+  # core marks its corpus-folding tests #[cfg_attr(miri, ignore = "...")] with
+  # the reason spelled out, so those cells are skipped here and covered by the
+  # `differential` job instead.  Do not read this job as an exhaustive analysis
+  # of the core.
+  #
+  # ★ EVERY SHARD PASSES `--all-features`, AND THAT IS THE SUBSTANCE OF THIS
+  # JOB.  zlib-rs declares `default = []`, so the single command this job used to
+  # run -- `cargo +nightly miri test -p zlib-rs` -- interpreted the crate with no
+  # features at all: no `std`, and with it neither the `pub mod gz` that
+  # src/lib.rs gates on that feature nor one single test out of `tests/gz.rs`,
+  # which gates its whole file on it; no `simd`, and with it neither vectorised
+  # checksum backend; no `rust-api`, and with it none of the idiomatic surface.
+  # The job named "Miri (safe core)" was interpreting a strict subset of the safe
+  # core and reporting the safe core clean.
+  #
+  # Omitting a feature does not fail anything, which is what made that
+  # invisible.  Measured on this tree: `cargo test -p zlib-rs --test gz` without
+  # `std` still builds the binary and still runs it, and prints "running 0 tests"
+  # then "test result: ok. 0 passed".  Green, and nothing asserted.  The coverage
+  # step below is what makes that outcome unreachable from now on -- it fails on
+  # any suite that ran no test at all, and it names the gz suite specifically.
+  #
+  # WHY IT IS SHARDED.  Miri interprets every machine instruction, and the cost
+  # is dominated by a handful of unit tests that sweep whole buffers: measured
+  # here, `cargo +nightly miri test -p zlib-rs --all-features` was still inside
+  # its FIRST test binary after 30 minutes, having finished 39 of the 1169 unit
+  # tests, with `adler32::tests::adler32_and_adler32_z_are_the_same_function`
+  # alone -- seven start values across seventeen lengths of a 100 kB corpus --
+  # occupying more than eight of them.  One invocation cannot finish inside a
+  # job, so the run is split and the shards run in parallel.  Nothing is dropped
+  # to achieve that, which is the whole point: sharding moves work between jobs,
+  # narrowing what is checked would move it out of CI.
+  #
+  # THE UNION OF THE SHARDS IS THE WHOLE SUITE BY CONSTRUCTION, not by a list
+  # somebody has to remember to update:
+  #
+  #   * the unit tests are split by module filter, and the last of those shards
+  #     is the exact COMPLEMENT of the others -- the same seven module strings,
+  #     passed as `--skip` -- so a module added tomorrow is interpreted by that
+  #     shard the day it lands.  Measured rather than assumed: the seven named
+  #     filters select 1007 of the 1169 unit tests and the complement selects
+  #     162, and 1007 + 162 is 1169 exactly.  deflate:: is then subdivided
+  #     across three rows whose union is itself exact -- 99 + 25 + 103 = 227.  A
+  #     test matching two filters runs in both shards, which costs a little and
+  #     hides nothing; a test matching none of them is impossible.
+  #   * the integration tests are the four heaviest binaries -- gz, deflate,
+  #     inflate and compress, each measured in the thousands of seconds and each
+  #     given a shard of its own -- and, computed from the tree at run time
+  #     rather than listed below, every other file in crates/zlib-rs/tests/.  A
+  #     test file added tomorrow is interpreted by that computed shard the day it
+  #     lands too.  The four exclusions are not taken on trust either: the
+  #     computed shard requires each name it excludes to still have a row of its
+  #     own in this file, so deleting one of those rows fails the job instead of
+  #     quietly removing a binary from it.
+  #
+  # So adding a shard means moving work out of a complement, and there is no way
+  # to add a test that quietly reaches none of them.  The filters are substrings,
+  # which is why `compress::` covers `uncompress::` as well -- 23 tests and 34 --
+  # and why the complement skips the identical string.
   # ---------------------------------------------------------------------------
   miri:
-    name: Miri (safe core)
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    # PER SHARD, not for the run as a whole, and deliberately close to the
+    # platform's own 360-minute job ceiling: a budget that fails an otherwise
+    # green run teaches everyone to distrust the job, and the cost of
+    # interpreting a given test is not something anyone can predict by reading
+    # it.  Every row below carries both the number of tests it selects and their
+    # native CPU cost, because Miri's cost tracks the latter closely -- so a
+    # shard that starts to strain this budget can be split on evidence rather
+    # than on a guess.  The remedy for a shard that no longer fits is always to
+    # promote one more filter out of it into a row of its own, which costs one
+    # runner and no coverage; it is never to drop a feature, a filter or a test.
+    timeout-minutes: 330
+    strategy:
+      # One shard's failure must not hide another's: the whole point of the split
+      # is that each shard covers different code.
+      fail-fast: false
+      matrix:
+        include:
+          # The unit tests, by module.  The split is by measured cost, not by
+          # taste: both checksum modules sweep 100 kB corpora across seven seeds
+          # and seventeen boundary lengths, and the deflate and inflate modules
+          # compress and decompress for real, so each of those is a shard of its
+          # own.  Test counts are from `cargo test --lib -- <filter> --list`.
+          - name: Miri units, Adler-32          # 57 tests, 0.97 s native
+            slug: units-adler32
+            select: "--lib -- adler32::"
+
+          - name: Miri units, CRC-32            # 82 tests, 0.44 s native
+            slug: units-crc32
+            select: "--lib -- crc32::"
+
+          # deflate:: is split three ways because it is the expensive module and
+          # one test inside it is the expensive test: measured natively, the
+          # whole module costs 6.10 s of CPU, `deflate::tests::` costs 4.30 s of
+          # that, and a single member of it --
+          # `every_level_and_container_round_trips`, ten levels across three
+          # container formats -- costs 3.61 s.  Miri's cost tracks that closely,
+          # so the three rows are sized rather than symmetrical.  Their union is
+          # `deflate::` exactly: 99 + 25 + 103 = 227, measured with `--list`.
+          - name: Miri units, deflate algorithms   # 99 tests, 1.65 s native
+            slug: units-deflate-algorithm
+            select: "--lib -- deflate::algorithm::"
+
+          # Measured under Miri, all features on: 1890 s -- 31.5 minutes -- for 23
+          # passed and 2 ignored.  That is the heaviest unit shard, and it is an
+          # order of magnitude inside the budget below, which is what makes the
+          # sizing above conservative rather than optimistic.
+          - name: Miri units, deflate driver       # 25 tests, 4.30 s native
+            slug: units-deflate-driver
+            select: "--lib -- deflate::tests::"
+
+          - name: Miri units, deflate machinery    # 103 tests, 0.16 s native
+            slug: units-deflate-machinery
+            select: >-
+              --lib -- deflate::
+              --skip deflate::algorithm:: --skip deflate::tests::
+
+          - name: Miri units, inflate           # 203 tests, 0.66 s native
+            slug: units-inflate
+            select: "--lib -- inflate::"
+
+          - name: Miri units, gz                # 268 tests, 0.43 s native
+            slug: units-gz
+            select: "--lib -- gz::"
+
+          # Two filters in one row, which libtest supports and which the
+          # arithmetic confirms: 134 for `trees::` and 57 for `compress::`, 191
+          # together.  Both filters are wider than their module name suggests,
+          # substrings being substrings -- `compress::` also selects
+          # `uncompress::`, and `trees::` also selects `inflate::inftrees::`.
+          # That costs a little duplicated interpretation against the inflate row
+          # and hides nothing, which is the trade this whole matrix makes.
+          - name: Miri units, trees and the one-shot wrappers  # 191 tests, 1.78 s native
+            slug: units-trees-wrappers
+            select: "--lib -- trees:: compress::"
+
+          # ★ THE COMPLEMENT: the same seven module strings as `--skip`, so every
+          # unit test the rows above do not name lands here -- allocate, error,
+          # config, read_buf and weak_slice today, and whatever is added
+          # tomorrow.  162 tests, measured at 167 s under Miri, which is almost
+          # entirely per-test interpreter overhead.  If it ever grows past its
+          # budget the repair is to promote one more module out of it into a row
+          # of its own AND add the identical string here; the two lists must stay
+          # in step, and the arithmetic above is how that is checked.
+          - name: Miri units, everything else      # 162 tests, 0.01 s native
+            slug: units-rest
+            select: >-
+              --lib --
+              --skip adler32:: --skip crc32:: --skip deflate:: --skip inflate::
+              --skip gz:: --skip trees:: --skip compress::
+
+          # The suite this job's `--all-features` exists for: under the default
+          # feature set the binary compiles empty, still runs and still reports
+          # ok, which is exactly how the gz layer went unchecked.  It therefore
+          # carries the named count assertion.  Measured at 3235 s -- 54 minutes
+          # -- for 69 passed and 8 ignored with every feature on.
+          - name: Miri gz layer
+            slug: tests-gz
+            select: "--test gz"
+            expect_gz: "1"
+
+          # ★ THE HEAVY BINARIES GET ROWS OF THEIR OWN, AND WHICH ONES WAS
+          # MEASURED, NOT GUESSED.  Interpreting this crate costs three to four
+          # orders of magnitude more than running it, and the cost is nowhere
+          # near evenly spread.  Per integration binary, under Miri with every
+          # feature on, on a contended four-core box:
+          #
+          #     deflate  10550 s    inflate   5143 s    gz        3235 s
+          #     compress  2260 s    trees     1458 s    roundtrip 1300 s
+          #     crc32      241 s    adler32    158 s    config     145 s
+          #     allocate   110 s    infback     84 s    error       21 s
+          #
+          # That is 24705 s -- 6.9 hours -- for the twelve of them, and 21470 s
+          # for everything except gz, which is already past the 330-minute
+          # ceiling below.  One row for the integration tests could therefore
+          # never have finished.  The three heaviest after gz get a row each and
+          # the remaining eight, 3517 s together, share the computed row: the
+          # worst row is then deflate at 176 minutes against a 330-minute
+          # timeout, and a row that does overrun names the binary that did it
+          # instead of hiding it behind whichever ran first.
+          - name: Miri integration, deflate
+            slug: tests-deflate
+            select: "--test deflate"
+
+          - name: Miri integration, inflate
+            slug: tests-inflate
+            select: "--test inflate"
+
+          - name: Miri integration, compress and uncompress wrappers
+            slug: tests-compress
+            select: "--test compress"
+
+          # ★ THE COMPLEMENT, COMPUTED FROM THE TREE by the step below -- which
+          # is why `select` is empty here.  It interprets every .rs file directly
+          # under crates/zlib-rs/tests/ except the four that have rows of their
+          # own, so a test file added later joins this row without an edit here.
+          # The exclusion list is not prose: the step below reads this file and
+          # requires each excluded name to still have a row, so deleting one of
+          # the four rows above turns this row red rather than quietly dropping
+          # that binary from the job.
+          - name: Miri integration, every other target
+            slug: tests-rest
+            select: ""
+            from_tree: "1"
+
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # SEC hardening: the job needs the tree, never the credential.  See the
+        # `permissions` block at the top of this file.
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: |
@@ -1028,14 +2592,206 @@ jobs:
         cargo +nightly miri --version
 
     - name: Run test cases
-      run: cargo +nightly miri test -p zlib-rs
+      env:
+        SELECT: ${{ matrix.select }}
+        FROM_TREE: ${{ matrix.from_tree }}
+      run: |
+        set -euo pipefail
+        mkdir -p target
+
+        if [ -n "${FROM_TREE:-}" ]; then
+          # THE TARGET LIST IS COMPUTED, NOT DECLARED.  Every .rs file directly
+          # under crates/zlib-rs/tests/ is a test target -- the manifest declares
+          # no [[test]] section -- so building the flags from the tree is what
+          # makes a file added later part of this shard without an edit here.
+          #
+          # Four binaries are excluded, and only because each has a row of its
+          # own.  That claim is checked rather than trusted: every excluded name
+          # must still appear as a one-target `select` in this workflow, so
+          # deleting one of those rows fails here instead of silently removing a
+          # binary from the job.
+          own_rows="gz deflate inflate compress"
+          for name in $own_rows; do
+            if ! grep -qF "select: \"--test $name\"" .github/workflows/rust.yml
+            then
+              echo "::error::tests/$name.rs is excluded from the computed shard" \
+                   "but no matrix row selects it on its own -- either restore" \
+                   "that row or drop $name from own_rows"
+              exit 1
+            fi
+          done
+
+          flags=()
+          expected=()
+          for path in crates/zlib-rs/tests/*.rs; do
+            name=$(basename "$path" .rs)
+            skip=
+            for own in $own_rows; do
+              if [ "$name" = "$own" ]; then
+                skip=1
+                break
+              fi
+            done
+            if [ -n "$skip" ]; then
+              continue
+            fi
+            flags+=(--test "$name")
+            expected+=("tests/$name.rs")
+          done
+          if [ "${#flags[@]}" -eq 0 ]; then
+            echo "::error::no integration test target was found under crates/zlib-rs/tests/"
+            exit 1
+          fi
+          # Handed to the coverage step, which then requires exactly these
+          # suites to have reported -- so a target that fails to build, or one
+          # cargo declines to run, is a failure rather than a silence.
+          echo "EXPECT_SUITES=${expected[*]}" >> "$GITHUB_ENV"
+          echo "interpreting ${#expected[@]} integration targets: ${expected[*]}"
+          cargo +nightly miri test -p zlib-rs --all-features "${flags[@]}" 2>&1 \
+            | tee target/miri.log
+        else
+          echo "interpreting: $SELECT"
+          # Unquoted on purpose: `select` carries several words, including the
+          # `--` that separates cargo's arguments from the test harness's.
+          # shellcheck disable=SC2086
+          cargo +nightly miri test -p zlib-rs --all-features $SELECT 2>&1 \
+            | tee target/miri.log
+        fi
+
+    - name: Run test cases (prove nothing was compiled away)
+      env:
+        EXPECT_GZ: ${{ matrix.expect_gz }}
+      # A feature gate that compiles a test binary empty does not fail: the
+      # binary still runs and still reports "ok", just with 0 passed.  That is
+      # exactly how the gz layer went unchecked, and `tests/gz.rs` L1-L11 says so
+      # of itself -- "a misspelled gate here is the single most likely way for
+      # this suite to fail silently ... The gate is therefore verified by
+      # counting".  This step is that count, moved out of the prose and into CI.
+      #
+      # Three rules, and each one closes a way for this job to report success
+      # having checked less than it claims:
+      #
+      #   1. every suite the shard reported passed at least one test.  A filter
+      #      that matches nothing, a feature gate that empties a binary, a
+      #      module renamed out from under a `--skip` -- all of them land here.
+      #   2. the gz shard reported a non-zero count from tests/gz.rs by name,
+      #      because that suite is why every command above says --all-features.
+      #   3. the computed shard reported exactly the suites it set out to run,
+      #      neither fewer nor more.
+      #
+      # Doctests are exempt from rule 1 alone: whether `cargo miri test` runs
+      # them is cargo-miri's business, not this gate's, and they are run natively
+      # in the build-test job either way.  Ignore counts are printed rather than
+      # asserted -- each `#[cfg_attr(miri, ignore)]` site in the core states its
+      # reason where it stands, the gz suite's filesystem tests because Miri
+      # cannot do file I/O at all and the rest because an unbounded sweep is
+      # unaffordable under interpretation, each with a bounded counterpart that
+      # does run -- so a growing total is visible here without this step
+      # pretending to judge it.
+      run: |
+        set -euo pipefail
+        python3 - <<'MIRI_COVERAGE'
+        import os
+        import re
+        import sys
+
+        with open("target/miri.log", encoding="utf-8", errors="replace") as handle:
+            lines = [line.rstrip("\n") for line in handle]
+
+        RUNNING = re.compile(r"^\s*Running (?:unittests )?(\S+)")
+        DOCTESTS = re.compile(r"^\s*Doc-tests (\S+)")
+        RESULT = re.compile(
+            r"^\s*test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored;"
+        )
+
+        suites = []
+        pending = None
+        for line in lines:
+            running = RUNNING.match(line)
+            if running:
+                pending = (running.group(1), False)
+                continue
+            doctests = DOCTESTS.match(line)
+            if doctests:
+                pending = ("doc-tests %s" % doctests.group(1), True)
+                continue
+            result = RESULT.match(line)
+            if result:
+                label, is_doc = pending or ("<result with no Running line>", False)
+                suites.append((label, is_doc, result.group(1), int(result.group(2)),
+                               int(result.group(3)), int(result.group(4))))
+                pending = None
+
+        problems = []
+        if not suites:
+            problems.append("the log holds no test result at all, so the run did not happen")
+
+        ignored_total = 0
+        for label, is_doc, status, passed, failed, ignored in suites:
+            print("%-34s %-6s %5d passed  %4d failed  %4d ignored"
+                  % (label, status, passed, failed, ignored))
+            ignored_total += ignored
+            if status != "ok" or failed:
+                problems.append("%s reported %s with %d failed" % (label, status, failed))
+            if passed == 0 and not is_doc:
+                problems.append("%s ran no test at all, so something -- a feature gate, a "
+                                "filter, a rename -- compiled or filtered it away" % label)
+
+        if os.environ.get("EXPECT_GZ"):
+            gz = [suite for suite in suites if suite[0].endswith("tests/gz.rs")]
+            if not gz:
+                problems.append("tests/gz.rs did not run; the gz layer is the whole reason "
+                                "these commands carry --all-features")
+            elif gz[0][3] == 0:
+                problems.append("tests/gz.rs ran 0 tests; its #![cfg(feature = \"std\")] "
+                                "gate did not take effect")
+            else:
+                print("tests/gz.rs: %d tests interpreted under Miri" % gz[0][3])
+
+        expected = os.environ.get("EXPECT_SUITES", "").split()
+        if expected:
+            ran = [label for label, is_doc, _, _, _, _ in suites if not is_doc]
+            for target in expected:
+                if not any(label.endswith(target) for label in ran):
+                    problems.append("%s was selected but reported no result; a test target "
+                                    "of the safe core was not interpreted" % target)
+            for label in ran:
+                if not any(label.endswith(target) for target in expected):
+                    problems.append("%s reported a result but was not among the selected "
+                                    "targets" % label)
+            print("selected targets: %d, all present" % len(expected))
+
+        print("ignored under Miri: %d across %d suites; every site states its reason where "
+              "it stands" % (ignored_total, len(suites)))
+
+        if problems:
+            for problem in problems:
+                print("::error::%s" % problem)
+            sys.exit(1)
+        binaries = [suite for suite in suites if not suite[1]]
+        print("Miri coverage: %d test %s ran, not one of them empty"
+              % (len(binaries), "binary" if len(binaries) == 1 else "binaries"))
+        MIRI_COVERAGE
+
+    - name: Upload build errors
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      if: failure()
+      with:
+        # Per shard, because an artifact name may not repeat within a run.
+        name: miri-${{ matrix.slug }}
+        path: |
+          target/miri.log
+        retention-days: 7
 
   # ---------------------------------------------------------------------------
   # 11. AddressSanitizer over the C ABI facade, and over the C drivers linked
   # against it.
   #
-  # This is the counterpart to the Miri job.  libz-rs-sys is the only crate
-  # allowed to use `unsafe`, it carries #![deny(unsafe_op_in_unsafe_fn)] so that
+  # This is the counterpart to the Miri job.  libz-rs-sys is the only shipped
+  # crate allowed to use `unsafe` -- the dev-only differential harness has a
+  # boundary of its own, in its src/oracle.rs and src/port.rs, which this job
+  # also instruments because the differential suites link the facade.  The facade
+  # carries #![deny(unsafe_op_in_unsafe_fn)] so that
   # each unsafe operation is individually scoped, and it is where the six
   # unavoidable unsafe site categories live: validating a caller's z_streamp,
   # rebuilding the (next_in, avail_in) and (next_out, avail_out) slices, the
@@ -1044,24 +2800,55 @@ jobs:
   # name_max / comm_max clamps.  ASan is what exercises those with real
   # pointers, which Miri cannot do.
   #
+  # SCOPE, EXACTLY, because several files elsewhere describe themselves in terms
+  # of this job.  Two things run under the sanitizer and nothing else does:
+  # `cargo test -p libz-rs-sys`, which is the facade's own unit tests, doctests
+  # and every suite under crates/libz-rs-sys/tests/ ; and the three UNMODIFIED C
+  # drivers, compiled with -fsanitize=address and linked against an instrumented
+  # libz.a.  Deliberately NOT covered: crates/zlib-rs-differential (its tests
+  # and the three benches attached to it) and the fuzz targets.  The differential
+  # crate is outside BOTH sanitizer gates -- Miri because it cannot execute the
+  # compiled oracle, ASan because this job does not select it -- and that is the
+  # split AAP 0.6.4.5 specifies.  The fuzz targets get their own instrumentation
+  # from cargo-fuzz, which builds each one with AddressSanitizer by default; that
+  # is per-target and belongs to the `fuzz` job, not to this one.
+  #
   # RUSTDOCFLAGS IS NOT OPTIONAL HERE.  Setting only RUSTFLAGS instruments the
   # library but not the doctest binaries, because rustdoc does not read
   # RUSTFLAGS; the doctests then fail to link with undefined __asan_* symbols.
   # Measured, and fixed by setting both.
   #
-  # `-Zbuild-std` would additionally instrument the standard library.  It is
-  # left off deliberately: it multiplies build time, and everything this job is
-  # aimed at -- the facade's own unsafe blocks and the caller-supplied allocator
-  # path -- is already instrumented without it.  An explicit --target is still
-  # required, because a sanitizer must not be applied to build scripts and
-  # proc-macros compiled for the host.
+  # TWO RUNS, AND THE ORDER IS THE POINT.  The first instruments the facade
+  # alone: it is quick, it is what a contributor wants feedback from, and
+  # everything the job is aimed at -- the facade's own unsafe blocks and the
+  # caller-supplied allocator path -- is already covered by it.  The second is
+  # the ACCEPTANCE shape, `-Zbuild-std`, which additionally rebuilds and
+  # instruments the standard library so that a fault inside a `std` routine
+  # reached from the facade is attributed rather than invisible; it is the
+  # command the project's own verified command set names, and it is slower for
+  # exactly that reason.  Neither replaces the other, and the acceptance run is
+  # not optional: dropping it would leave `std`'s allocation, formatting and
+  # I/O paths -- which the gz layer uses on every call -- uninstrumented.
+  #
+  # An explicit --target is required for both, because a sanitizer must not be
+  # applied to build scripts and proc-macros compiled for the host.
+  # `-Zbuild-std` additionally needs the `rust-src` component, which the
+  # toolchain step below installs.
   # ---------------------------------------------------------------------------
   asan:
-    name: AddressSanitizer (C ABI facade)
+    name: AddressSanitizer (C ABI facade and differential harness)
     runs-on: ubuntu-latest
+    # The differential step builds the C oracle with ASan and runs the default
+    # sweeps in release: measured at roughly six minutes on a 4-core machine,
+    # against about two for the facade and the three drivers.  60 leaves room.
+    timeout-minutes: 60
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # SEC hardening: the job needs the tree, never the credential.  See the
+        # `permissions` block at the top of this file.
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: |
@@ -1073,7 +2860,22 @@ jobs:
         RUSTFLAGS: -Zsanitizer=address
         RUSTDOCFLAGS: -Zsanitizer=address
         ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:strict_string_checks=1
-      run: cargo +nightly test --locked -p libz-rs-sys --target x86_64-unknown-linux-gnu
+      run: |
+        cargo +nightly test --locked -p libz-rs-sys \
+          -Zbuild-std --target x86_64-unknown-linux-gnu
+
+    - name: Run test cases (facade under ASan with an instrumented std)
+      # The acceptance command, verbatim.  A separate CARGO_TARGET_DIR because a
+      # `-Zbuild-std` build fingerprints differently from the one above and
+      # would otherwise invalidate it on every run.
+      env:
+        CARGO_TARGET_DIR: target/asan-build-std
+        RUSTFLAGS: -Zsanitizer=address
+        RUSTDOCFLAGS: -Zsanitizer=address
+        ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:strict_string_checks=1
+      run: |
+        cargo +nightly test --locked -p libz-rs-sys -Zbuild-std \
+          --target x86_64-unknown-linux-gnu
 
     - name: Compile source code (instrumented archive)
       # An instrumented archive for the C drivers.  A dedicated CARGO_TARGET_DIR
@@ -1087,7 +2889,7 @@ jobs:
       run: |
         set -eu
         cargo +nightly build --locked -p libz-rs-sys --features libz-compat,gz \
-          --target x86_64-unknown-linux-gnu
+          -Zbuild-std --target x86_64-unknown-linux-gnu
         A=target/asan/x86_64-unknown-linux-gnu/debug/libz.a
         [ -f "$A" ] || { echo "::error::$A was not produced"; exit 1; }
         echo "ASANLIB=$PWD/$A" >> "$GITHUB_ENV"
@@ -1096,7 +2898,14 @@ jobs:
       env:
         ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:abort_on_error=1
       run: |
-        set -eu
+        # `pipefail` is what makes the minigzip round trip below an assertion
+        # rather than a decoration.  Under `set -eu` alone the exit status of a
+        # pipeline is the status of its LAST command, so a minigzip that aborted
+        # under ASan mid-pipeline -- exactly the finding this job exists to
+        # catch -- was reported as success as long as the final process in the
+        # pipeline exited zero.
+        set -euo pipefail
+
         D="$PWD/target/asan-drivers"
         rm -rf "$D"
         mkdir -p "$D"
@@ -1107,22 +2916,119 @@ jobs:
         echo "all three drivers linked against the instrumented archive"
         "$D/example_asan" "$D/tmp.gz"
         rm -f "$D/tmp.gz"
-        echo 'hello world' | "$D/minigzip_asan" | "$D/minigzip_asan" -d
+
+        # THE ROUND TRIP IS COMPARED, NOT MERELY RUN.  Compressing and
+        # decompressing without looking at the result checks that neither process
+        # crashed and nothing else: a minigzip that emitted an empty stream, or
+        # truncated it, or corrupted a byte, satisfied the old form completely.
+        # So each stage writes a file, the exit status of each stage is its own,
+        # and `cmp` decides whether the bytes survived.
+        #
+        # The payload is deliberately more than one short line.  A 12-byte
+        # "hello world" fits inside a single deflate block and never exercises a
+        # window refill, so it cannot distinguish a working engine from one that
+        # mishandles a continuation.  This one is long enough to compress, spans
+        # many blocks, and mixes highly repetitive text with incompressible
+        # bytes so that both the match path and the stored-block path are taken.
+        {
+          for i in $(seq 1 400); do
+            echo "line $i: the quick brown fox jumps over the lazy dog"
+          done
+          head -c 4096 /dev/urandom | base64
+        } > "$D/original"
+        wc -c < "$D/original"
+
+        "$D/minigzip_asan" < "$D/original" > "$D/roundtrip.gz"
+        [ -s "$D/roundtrip.gz" ] || { echo "::error::minigzip produced an empty stream"; exit 1; }
+        "$D/minigzip_asan" -d < "$D/roundtrip.gz" > "$D/recovered"
+        cmp "$D/original" "$D/recovered" \
+          || { echo "::error::the minigzip round trip did not reproduce its input"; exit 1; }
+        echo "minigzip round trip: $(wc -c < "$D/original") bytes in, \
+        $(wc -c < "$D/roundtrip.gz") compressed, recovered byte for byte"
+
         "$D/infcover_asan"
         echo "AddressSanitizer: PASS"
 
+    - name: Run test cases (differential oracle under ASan)
+      # SEC-01 clause 2: every remaining `unsafe` outside the boundary crate is
+      # instrumented, not just the boundary crate itself.  After the harness
+      # conversion the only such code left in the tree is
+      # crates/zlib-rs-differential/src/oracle.rs -- the `extern "C"`
+      # declarations of the renamed C oracle, which AAP 0.4.1.4 requires to live
+      # there and 0.6.4.1 forbids relocating into libz-rs-sys -- plus its one
+      # `unsafe fn table_slice`, which builds a slice from a pointer and a length
+      # the C tables publish.  That is precisely the shape ASan checks and Miri
+      # cannot, because Miri cannot execute the foreign functions on the other
+      # side of those declarations.
+      #
+      # CFLAGS instruments the oracle itself: build.rs compiles the 15 C
+      # translation units with `cc`, so without it the Rust side would be
+      # sanitized and the C side it calls would not, and an over-read inside the
+      # oracle -- the thing a mismatched declaration causes -- would go unseen.
+      # A separate CARGO_TARGET_DIR keeps these objects out of the ordinary cache.
+      #
+      # `detect_leaks` is off for this step alone, and deliberately: the C oracle
+      # keeps `local` state alive for the life of the process by design (the
+      # `z_errmsg` table, `x2n_table`, the CRC tables), which LeakSanitizer
+      # cannot distinguish from a leak at exit.  Every other ASan check --
+      # out-of-bounds, use-after-free, use-after-return -- is fully in force, and
+      # the allocator-discipline half of leak detection is covered far more
+      # precisely by `harness::Zone`, which counts allocations and frees and
+      # asserts on leaks, non-LIFO frees and rogue frees inside the tests.
+      env:
+        CARGO_TARGET_DIR: target/asan-differential
+        RUSTFLAGS: -Zsanitizer=address
+        RUSTDOCFLAGS: -Zsanitizer=address
+        CFLAGS: -fsanitize=address -fno-omit-frame-pointer -O1 -g
+        ASAN_OPTIONS: detect_leaks=0:detect_stack_use_after_return=1:strict_string_checks=1
+      run: >-
+        cargo +nightly test --locked -p zlib-rs-differential
+        --target x86_64-unknown-linux-gnu
+
+    - name: Compile source code (benchmarks under ASan)
+      # The three benches are the other consumers of the oracle, and they reach
+      # it through the same declarations.  They are BUILT and their self-checks
+      # run, rather than measured: a criterion measurement under ASan is
+      # meaningless as a number, and the throughput gate is the `bench` job's
+      # job.  What matters here is that the harness calls and the oracle calls
+      # the benches make are exercised with instrumentation on.
+      #
+      # `--no-run` builds them; `-- --test` then runs each one in criterion's
+      # test mode, a single iteration per benchmark, which is enough to execute
+      # every code path the measurement would and cheap enough to belong in this
+      # job.
+      env:
+        CARGO_TARGET_DIR: target/asan-differential
+        RUSTFLAGS: -Zsanitizer=address
+        CFLAGS: -fsanitize=address -fno-omit-frame-pointer -O1 -g
+        ASAN_OPTIONS: detect_leaks=0:detect_stack_use_after_return=1
+      run: |
+        set -euo pipefail
+        cargo +nightly bench --locked -p zlib-rs-differential \
+          --target x86_64-unknown-linux-gnu --no-run
+        for bench in checksum_bench inflate_bench deflate_bench; do
+          echo "::group::$bench under ASan"
+          cargo +nightly bench --locked -p zlib-rs-differential \
+            --target x86_64-unknown-linux-gnu --bench "$bench" -- --test
+          echo "::endgroup::"
+        done
+        echo "AddressSanitizer over the differential oracle and the benches: PASS"
+
     - name: Upload build errors
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       if: failure()
       with:
         name: asan
         path: |
+          target/asan-diff-logs/
           target/asan-drivers/
         retention-days: 7
 
 
   # ---------------------------------------------------------------------------
-  # 12. cargo-fuzz over the five Rust entry points, 300 seconds each.
+  # 12. cargo-fuzz over the five Rust entry points, 300 seconds each -- in six
+  # matrix rows, because the differential checksum target is run twice, once per
+  # checksum backend.  See the comment on the sixth row.
   #
   # The budget matches fuzz.yml's existing `fuzz-seconds: 300`, deliberately, so
   # that the Rust numbers and the OSS-Fuzz numbers on the C oracle are
@@ -1146,6 +3052,31 @@ jobs:
   # runner.  fuzz_inflate is the most important of the five -- inflate is the
   # entry point that consumes untrusted bytes -- and must never panic, hang or
   # over-read.
+  #
+  # ★ THE CORPUS IS SEEDED AND CARRIED FORWARD, and without both this job is
+  # weaker than its 300-second budget suggests.  libFuzzer starts from whatever is
+  # in the corpus directory; with an empty one every run spends its first seconds
+  # rediscovering that a zlib stream begins 0x78 0x9c, and 300 seconds from
+  # nothing reaches shallower states than 300 seconds from a corpus that already
+  # decodes.  Two measures:
+  #
+  #   * A DETERMINISTIC SEED, staged from the ten fixtures in
+  #     crates/zlib-rs-differential/corpus/minimal -- the same committed files the
+  #     differential suite and the benches use, so the fuzzer starts from inputs
+  #     that are known to exercise stored blocks, long matches, the 32 KiB window
+  #     boundary and the degenerate cases.  Committed, so every run starts from
+  #     the same place whether or not a cache exists.
+  #   * THE EVOLVED CORPUS IS KEPT, through actions/cache keyed per target.  The
+  #     coverage libFuzzer buys with one run's 300 seconds is otherwise discarded
+  #     with the runner, so every run restarts from the seed forever.  With the
+  #     cache, successive runs deepen the same corpus.  `restore-keys` lets a run
+  #     start from the newest previous corpus for its target even when the exact
+  #     key misses, which it does on every run because the key carries the run
+  #     number.  The corpus is a CACHE and never a gate input: a cold cache is
+  #     normal and costs coverage, not correctness, so nothing here fails on one.
+  #
+  # fuzz/corpus/ and fuzz/artifacts/ are both already covered by .gitignore, so
+  # neither the seed nor anything the fuzzer writes can be committed.
   # ---------------------------------------------------------------------------
   fuzz:
     name: ${{ matrix.name }}
@@ -1157,22 +3088,52 @@ jobs:
         include:
           - name: Fuzz deflate
             target: fuzz_deflate
+            slug: fuzz_deflate
 
           - name: Fuzz inflate
             target: fuzz_inflate
+            slug: fuzz_inflate
 
           - name: Fuzz inflateBack
             target: fuzz_inflate_back
+            slug: fuzz_inflate_back
 
           - name: Fuzz gz round-trip
             target: fuzz_gz_roundtrip
+            slug: fuzz_gz_roundtrip
 
-          - name: Fuzz checksums
+          - name: Fuzz checksums scalar
             target: fuzz_checksum
+            slug: fuzz_checksum
+
+          # ★ THE SIMD ROW, and it is the only place the output-neutrality
+          # requirement is executed rather than asserted in prose.
+          #
+          # fuzz_checksum's `check_simd_neutrality` compares the vectorised
+          # Adler-32 and CRC-32 backends against the scalar ones directly, and it
+          # is `#[cfg(feature = "simd")]` because the `Adler32Simd` and `Simd`
+          # types only exist behind that feature.  `simd` is off by default in
+          # both zlib-rs and libz-rs-sys, so the five rows above compile that
+          # function AWAY: the requirement that the feature change speed and never
+          # bytes had no executable check in CI at all, only a comment in the
+          # target saying how to run one by hand.
+          #
+          # Same target, same 300 seconds, one extra feature.  The default row
+          # stays because it is not redundant -- it is what proves the scalar
+          # path, which is what ships by default -- and the two together are what
+          # make the neutrality claim a measured property of every commit.
+          - name: Fuzz checksums (simd)
+            target: fuzz_checksum
+            features: simd
+            slug: fuzz_checksum_simd
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # SEC hardening: the job needs the tree, never the credential.  See the
+        # `permissions` block at the top of this file.
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: |
@@ -1195,66 +3156,371 @@ jobs:
           echo "::error::${{ matrix.target }} is not a declared fuzz target"; exit 1; }
       working-directory: fuzz
 
+    - name: Run test cases (lint the fuzz workspace)
+      # THE ONLY PLACE THIS RUNS.  fuzz/ is excluded from the library
+      # workspace, so the root `cargo clippy --workspace --all-targets` never
+      # sees these five targets -- and they are the harnesses that consume
+      # attacker-controlled input.  The lint set is declared locally in
+      # fuzz/Cargo.toml, `undocumented_unsafe_blocks` included, and this step
+      # is what turns those declarations into a gate.  `--all-targets` from
+      # this directory reaches all five binaries.
+      #
+      # All five targets now carry `#![forbid(unsafe_code)]` and reach both
+      # implementations through `zlib_rs_differential::{port, oracle}`, so
+      # `undocumented_unsafe_blocks` is a backstop for a target added later
+      # without the attribute rather than the mechanism holding the line.
+      run: |
+        set -eu
+        cargo +nightly fmt --all -- --check
+        cargo +nightly clippy --all-targets -- -D warnings
+
+    - name: Restore the evolved corpus
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: fuzz/corpus/${{ matrix.target }}
+        # The run number makes every key unique, so the exact key always misses
+        # and the newest restore-key hit is what is used -- which is the documented
+        # way to keep a cache that is written on every run rather than read once.
+        key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          fuzz-corpus-${{ matrix.target }}-
+
+    - name: Generate project files (seed the corpus)
+      # Staged rather than symlinked, because libFuzzer writes new inputs into
+      # this directory and must not write through into the committed fixtures.
+      # An existing file is left alone, so a corpus the cache restored is never
+      # overwritten by the seed.  The `[ -e ]` test rather than `cp -n`: recent
+      # coreutils warns that -n's behaviour is non-portable, and a warning in a
+      # green log is a warning nobody reads.
+      run: |
+        set -eu
+        SEED=../crates/zlib-rs-differential/corpus/minimal
+        C="corpus/${{ matrix.target }}"
+        mkdir -p "$C"
+        [ -d "$SEED" ] || { echo "::error::the committed seed corpus $SEED is missing"; exit 1; }
+        for f in "$SEED"/*; do
+          [ -f "$f" ] || continue
+          dest="$C/$(basename "$f")"
+          [ -e "$dest" ] || cp "$f" "$dest"
+        done
+        n=$(find "$C" -type f | wc -l | tr -d ' ')
+        echo "corpus for ${{ matrix.target }}: $n input(s) before the run"
+        [ "$n" -gt 0 ] || { echo "::error::the corpus is empty even after seeding"; exit 1; }
+      working-directory: fuzz
+
     - name: Run Fuzzers
-      run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300
+      env:
+        FEATURES: ${{ matrix.features }}
+      # The feature list is threaded through the environment rather than
+      # interpolated into the command, so that a row without one produces the
+      # bare invocation instead of a stray empty `--features` argument -- which
+      # cargo rejects.
+      run: |
+        set -eu
+        if [ -n "${FEATURES:-}" ]; then
+          echo "running ${{ matrix.target }} with --features $FEATURES"
+          cargo +nightly fuzz run ${{ matrix.target }} --features "$FEATURES" \
+            -- -max_total_time=300
+        else
+          echo "running ${{ matrix.target }} with the default feature set"
+          cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300
+        fi
+      working-directory: fuzz
+
+    - name: Run test cases (report the corpus growth)
+      # Not a gate -- a fuzzer that finds no new input in 300 seconds on a mature
+      # corpus is doing its job -- but the number belongs in the log, because a
+      # corpus that never grows across many runs is the signal that the cache or
+      # the seed has stopped working.
+      run: |
+        set -eu
+        n=$(find "corpus/${{ matrix.target }}" -type f | wc -l | tr -d ' ')
+        echo "corpus for ${{ matrix.target }}: $n input(s) after the run"
       working-directory: fuzz
 
     - name: Upload Crash
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       if: failure()
+      # `slug` rather than `target`, because two rows now drive the same target
+      # and an artifact name may not repeat within a workflow run.
       with:
-        name: fuzz-artifacts-${{ matrix.target }}
+        name: fuzz-artifacts-${{ matrix.slug }}
         path: |
           fuzz/artifacts/
+          fuzz/corpus/${{ matrix.target }}/
         retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # 13. The criterion regression gate: throughput, and per-stream memory.
+  # 13. The CMake build of the Rust library, end to end.
+  #
+  # README-cmake.md tells a consumer to configure with -DZLIB_BUILD_RUST=ON, and
+  # the root CMakeLists.txt carries the cargo invocation, the versioned symlink
+  # chain, the install rules, the generated pkg-config file and the exported
+  # targets that make that work.  `cargo build` exercises none of it, so without
+  # this job every one of those could break with the workflow still green.
+  # ---------------------------------------------------------------------------
+  cmake-rust:
+    # -------------------------------------------------------------------------
+    # Run end to end, in the order a consumer meets it: configure, build, ctest,
+    # install, then compile and RUN a C program against the installation through
+    # pkg-config, against the static archive, and through find_package.  That
+    # last part is the part that matters -- a library that installs but cannot be
+    # consumed has not been delivered.
+    # -------------------------------------------------------------------------
+    name: CMake Rust build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        persist-credentials: false
+
+    - name: Install Rust toolchain
+      run: rustup toolchain install stable --profile minimal
+
+    - name: Install packages (Linux)
+      run: cmake --version && cc --version
+
+    - name: Generate project files
+      # ZLIB_RUST_TARGET_DIR is left at its default on purpose: the nested
+      # add_subdirectory fixtures in test/CMakeLists.txt forward whatever this
+      # configure resolves, so the default exercises the sharing that keeps the
+      # nested cargo invocations from re-probing the target triple.
+      run: |
+        set -eu
+        cmake -S . -B build-rust \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DZLIB_BUILD_RUST=ON \
+          -DZLIB_BUILD_TESTING=ON \
+          -DCMAKE_INSTALL_PREFIX="$PWD/stage-rust"
+
+    - name: Compile source code
+      run: cmake --build build-rust --parallel 2
+
+    - name: Run test cases
+      # stdin is redirected because ctest runs nested cmake/cargo invocations and
+      # a test process that inherits a consumed stdin is a genuine, if obscure,
+      # source of flakiness.  The nested trees share this build's cargo directory,
+      # which is what actually keeps them deterministic; this is hygiene.
+      run: ctest --test-dir build-rust --output-on-failure --parallel 2 < /dev/null
+
+    - name: Run test cases (install and consume the installation)
+      run: |
+        set -eu
+        cmake --install build-rust
+
+        echo "== installed tree =="
+        find stage-rust -maxdepth 3 \( -type f -o -type l \) | sort
+
+        # The versioned symlink chain is not cosmetic.  Cargo emits only
+        # libz.so; the SONAME is libz.so.1, so the loader looks for a file with
+        # that exact name and, finding none, silently binds the SYSTEM zlib
+        # instead.  Assert the whole chain resolves to one real file.
+        for name in libz.so libz.so.1; do
+          test -L "stage-rust/lib/$name" \
+            || { echo "::error::stage-rust/lib/$name is not a symlink"; exit 1; }
+        done
+        real="$(readlink -f stage-rust/lib/libz.so)"
+        echo "libz.so resolves to $real"
+        case "$real" in
+          *"$PWD/stage-rust/lib/"*) ;;
+          *) echo "::error::libz.so resolves outside the installation: $real"
+             exit 1 ;;
+        esac
+        readelf -d "$real" | grep -i soname
+
+        # pkg-config must still advertise a usable -lz, including the private
+        # native libraries the Rust staticlib needs.
+        export PKG_CONFIG_PATH="$PWD/stage-rust/lib/pkgconfig"
+        echo "== zlib.pc =="
+        cat "$PKG_CONFIG_PATH/zlib.pc"
+        pkg-config --exists zlib
+        echo "shared cflags/libs: $(pkg-config --cflags --libs zlib)"
+        echo "static libs:        $(pkg-config --static --libs zlib)"
+
+        # A C consumer, compiled against the installed header and linked against
+        # the installed library, must run and report the Rust library's version.
+        cat > consumer.c <<'CONSUMER'
+        #include <stdio.h>
+        #include <string.h>
+        #include "zlib.h"
+        int main(void) {
+            unsigned char packed[64];
+            unsigned char back[64];
+            uLong packed_len = (uLong)sizeof(packed);
+            uLong back_len = (uLong)sizeof(back);
+            const char *text = "cmake rust consumer";
+            if (compress(packed, &packed_len, (const Bytef *)text,
+                         (uLong)strlen(text) + 1) != Z_OK) return 1;
+            if (uncompress(back, &back_len, packed, packed_len) != Z_OK) return 2;
+            if (strcmp((const char *)back, text) != 0) return 3;
+            printf("zlibVersion=%s roundtrip=ok compiled=%s\n",
+                   zlibVersion(), ZLIB_VERSION);
+            return 0;
+        }
+        CONSUMER
+
+        cc -o consumer-shared consumer.c $(pkg-config --cflags --libs zlib) \
+          -Wl,-rpath,"$PWD/stage-rust/lib"
+        echo "== ldd consumer-shared =="
+        ldd ./consumer-shared | grep libz
+        # The whole point of the exercise: the binding must be the Rust artifact.
+        ldd ./consumer-shared | grep -q "$PWD/stage-rust/lib/libz.so.1" \
+          || { echo "::error::the consumer did not bind the installed Rust libz"
+               exit 1; }
+        ./consumer-shared
+
+        cc -o consumer-static consumer.c -I stage-rust/include \
+          stage-rust/lib/libz.a $(pkg-config --static --libs-only-l zlib | sed 's/-lz//')
+        ./consumer-static
+
+        # find_package against the installed config package.
+        mkdir -p consume-cmake && cd consume-cmake
+        cat > CMakeLists.txt <<'FINDPKG'
+        cmake_minimum_required(VERSION 3.12)
+        project(consume C)
+        find_package(ZLIB REQUIRED CONFIG)
+        add_executable(consume ../consumer.c)
+        target_link_libraries(consume PRIVATE ZLIB::ZLIB)
+        FINDPKG
+        cmake -S . -B build -DCMAKE_PREFIX_PATH="$PWD/../stage-rust" >/dev/null
+        cmake --build build --parallel 2 >/dev/null
+        ./build/consume
+
+    - name: Upload build errors
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      if: failure()
+      with:
+        name: cmake-rust
+        path: |
+          build-rust/CMakeFiles/CMakeConfigureLog.yaml
+          build-rust/Testing/Temporary/LastTest.log
+        retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 14. The criterion regression gate: throughput, and per-stream memory.
+  # the COMMITTED MINIMAL CORPUS.
+  #
+  # READ THIS BEFORE CITING THIS JOB.  It is a regression gate on the fixtures
+  # in crates/zlib-rs-differential/corpus/minimal/ .  It is NOT the Silesia
+  # acceptance measurement that AAP 0.8.4 names, and it cannot be: AAP 0.6.4.4
+  # requires CI to be network-free and makes the Silesia tier opt-in, fetched by
+  # a human running corpus/fetch_silesia.sh with a pinned SHA-256.  No job in
+  # this file supplies it, so the benches' `deflate_silesia` and
+  # `inflate_silesia` groups print an explicit skip and contribute no gated
+  # case.  The acceptance figure on the multi-megabyte corpus is therefore a
+  # measurement somebody runs deliberately, off CI, and records in a review --
+  # while what runs here is the thing that catches a regression on every push.
+  #
+  # The two are not interchangeable and the difference is not cosmetic: the
+  # committed fixtures are kilobytes, so they exercise the encoder and decoder
+  # but not the cache behaviour a multi-megabyte input does.  A change that
+  # passed here could still miss the AAP 0.8.4 target on Silesia.  What this job
+  # guarantees is that a gated case whose ratio worsens past the limit fails the
+  # build, and that a run which measured NOTHING fails too -- see the "gate that
+  # measured nothing must not report success" check in the parser.
   #
   # The three bench files are explicit that they REPORT and never enforce --
   # "the pass/fail decision belongs to the criterion regression job that
   # AAP 0.4.1.6 places in .github/workflows/rust.yml" -- so THIS STEP IS THE
-  # DECISION.  If it is ever softened, nothing anywhere enforces the
-  # performance targets.
+  # DECISION.  If it is ever softened, nothing anywhere reads the numbers.
   #
-  # The limits: throughput within 10% of the C implementation for decompression
-  # and for compression at levels 1, 6 and 9, and per-stream memory within 15%.
-  # Both numbers come out of the summary lines the benches print to stderr:
+  # WHAT THIS STEP DOES AND DOES NOT DECIDE.  AAP 0.8.4 states the throughput
+  # targets over the SILESIA corpus, and AAP 0.6.4.6 reads them from its
+  # multi-megabyte members.  This job provisions no corpus -- CI stays
+  # network-free -- so the summaries it gates are the ones produced from the
+  # committed minimal corpus, and the Silesia groups skip with a note.  Treat a
+  # green run here as the continuous-integration signal that the port has not
+  # regressed against the in-process C oracle on the fixtures available, NOT as
+  # the acceptance measurement AAP 0.8.4 names.  The acceptance measurement is
+  # taken by a human who has run
+  # crates/zlib-rs-differential/corpus/fetch_silesia.sh and then re-read the same
+  # summary lines from the `deflate_silesia` and `inflate_silesia` groups; those
+  # groups are absent from this log by construction, so nothing here can stand
+  # in for them.
   #
-  #   <bench>: RATIO-SUMMARY  group=G cases=N gated=K over=M informational=I limit=1.10
-  #   <bench>: MEMORY-SUMMARY group=G cases=N over=M dirty=D limit=1.15
-  #   <bench>: ALLOC-BALANCE  side=S case=C allocations=.. frees=.. live_bytes=..
-  #                           notlifo=.. rogue=.. verdict=clean|dirty
+  # The limits this step enforces on what it does see: throughput within 10% of
+  # the C implementation for decompression and for compression at levels 1, 6
+  # and 9, and per-stream memory within 15%.  `benches/checksum_bench.rs` emits
+  # no summary line and is therefore NOT gated here at all -- it is an
+  # informational backend comparison, and its rows are only ever read by hand.
+  # Both gated numbers come out of the summary lines the benches print to
+  # stderr:
   #
-  # `over` counts ONLY the gated cases, so reading it is reading exactly the
-  # stated gate: sub-page payloads are measured and printed with their own
-  # verdict but marked gate=informational, because a few hundred nanoseconds of
-  # entry validation and stream reset is not a bytes-per-second bound.
+  # ★ WHAT THIS GATE READS, AND WHY IT IS NOT JUST `over`.
+  #
+  # The benches print two kinds of number, and only one of them can carry a
+  # verdict.  The `RATIO` lines are a self-timed diagnostic -- a few milliseconds
+  # per side, best of three rounds, no outlier rejection, no confidence interval --
+  # and both bench headers now say so in as many words.  The measurement the
+  # performance targets name is criterion's, and criterion writes it to disk:
+  # `<root>/<group>/<label>/<case>/new/estimates.json`, one file per side per case,
+  # with `slope` and `mean` point estimates in nanoseconds.  So this gate decides
+  # from criterion's estimates and uses the log lines to know WHICH pairs to read
+  # and which of them clear the size floor.  A gate built on the self-timed
+  # numbers alone would be enforcing a limit against a figure the file that prints
+  # it calls indicative.
+  #
+  # The log lines it consumes, all anchored on the `<name>_bench: ` prefix because
+  # the benches also print their own format documentation and that prose contains
+  # the literal text RATIO-SUMMARY inside backticks:
+  #
+  # `over` counts ONLY the gated cases, so reading it is reading the limit
+  # rather than an average over cases the limit was never meant for: sub-page
+  # payloads are measured and printed with their own verdict but marked
+  # gate=informational, because a few hundred nanoseconds of entry validation
+  # and stream reset is not a bytes-per-second bound.
   # `verdict=dirty` on an ALLOC-BALANCE line means deflateEnd did not return
   # every block, a block came back out of LIFO order, or a pointer the counter
   # never handed out was freed through it -- the same class of defect
   # test/infcover.c's mem_done() looks for, here measured through the
   # instrumented zalloc high-water counter that AAP 0.6.4.6 names.
   #
-  # The parser is anchored on the `<name>_bench: ` prefix on purpose: the benches
-  # also print their own format documentation, and that prose contains the
-  # literal text RATIO-SUMMARY inside backticks.  A loose grep would count it as
-  # a data line.
+  # ★ AND WHY THE STRUCTURAL CHECKS ARE THE POINT.  `over=0` is what a clean run
+  # prints AND what a run that measured nothing prints.  The previous gate read
+  # `over` with a default of 0, accepted any set of summary lines as long as one of
+  # each kind existed, and treated every group's `over` as fatal -- so a bench
+  # whose corpus failed to load passed it, while a regression in an ancillary
+  # group that the performance targets say nothing about failed it.  This gate
+  # therefore asserts, before it looks at a single ratio:
   #
-  # NO CORPUS IS DOWNLOADED, HERE OR ANYWHERE IN THIS FILE.  The committed
-  # minimal corpus drives every gate.  The Silesia corpus that the performance
-  # targets name is opt-in only: crates/zlib-rs-differential/corpus has a script
-  # for a human to run, the benches skip their tier-2 groups with an explicit
-  # message and exit zero when it is absent, and CI must stay network-free.  That
-  # script is never invoked from this file.
+  # NO CORPUS IS DOWNLOADED, HERE OR ANYWHERE IN THIS FILE.  So the committed
+  # minimal corpus is what every summary line this step reads was produced from.
+  # The Silesia corpus that the performance targets name is opt-in only:
+  # crates/zlib-rs-differential/corpus has a script for a human to run, the
+  # benches skip their tier-2 groups with an explicit message and exit zero when
+  # it is absent, and CI must stay network-free.  That script is never invoked
+  # from this file, which is exactly why the acceptance measurement of AAP 0.8.4
+  # is not taken here.
   # ---------------------------------------------------------------------------
   bench:
-    name: Benchmark regression
-    runs-on: ubuntu-latest
+    name: Benchmark ${{ matrix.label }}
+    runs-on: ${{ vars.ZLIB_RS_BENCH_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: bench-scalar
+            profile: bench
+            features: ''
+
+          - label: bench-parity-scalar
+            profile: bench-parity
+            features: ''
+
+          - label: bench-simd
+            profile: bench
+            features: '--features simd'
+
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        # SEC hardening: the job needs the tree, never the credential.  See the
+        # `permissions` block at the top of this file.
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: rustup toolchain install stable --profile minimal
@@ -1264,65 +3530,243 @@ jobs:
       # differential crate's build.rs needs a C compiler here too.
       run: cc --version
 
-    - name: Compile source code
-      # The three benches live at the repository root but are wired as [[bench]]
-      # entries of crates/zlib-rs-differential with an explicit `path`, and that
-      # crate is not a default workspace member.  `-p zlib-rs-differential` is
-      # therefore required: a bare `cargo bench` from the root finds nothing and
-      # would report success having measured nothing at all.
-      run: cargo bench --locked -p zlib-rs-differential --no-run
-
-    - name: Run test cases
+    - name: Generate project files (write the benchmark gate)
+      # The gate is written to a file, once, and invoked by path below -- both
+      # for the minimal-corpus run and for the Silesia run.  Two copies of a
+      # limit is how a limit stops being enforced, so there is exactly one.
+      # It takes the log to read as its argument and reads the criterion
+      # estimates alongside it.
       run: |
         set -eu
-        set -o pipefail
-        mkdir -p target/bench
-        cargo bench --locked -p zlib-rs-differential 2>&1 | tee target/bench/bench.log
-
-    - name: Run test cases (gate the measurements)
-      run: |
-        set -eu
-        python3 - <<'BENCH_GATE'
+        cat > "$RUNNER_TEMP/bench_gate.py" <<'BENCH_GATE'
+        import json
+        import os
         import re
         import sys
 
         LOG = "target/bench/bench.log"
-        # Anchored on the bench's own log prefix so that the format
-        # documentation the benches print cannot be parsed as data.
+
+        # ---------------------------------------------------------------------------
+        # WHAT MUST BE PRESENT, not merely what is tolerated if it turns up.
+        #
+        # A gate that reads whatever summary lines it happens to find is satisfied by a
+        # bench that measured one group and skipped the rest, and by a log that was
+        # truncated when the process died.  Both look exactly like success.  So the
+        # groups that carry the AAP's numbered performance targets are named here and
+        # their absence is a failure:
+        #
+        #   AAP 0.6.4.6 / 0.8.4  decompression throughput within 10% of C zlib
+        #                        -> inflate_bench group inflate_steady_state
+        #   AAP 0.6.4.6 / 0.8.4  compression throughput within 10% at levels 1, 6, 9
+        #                        -> deflate_bench group deflate_steady_state
+        #   AAP 0.6.4.6 / 0.8.4  per-stream memory within 15%
+        #                        -> deflate_bench group deflate_memory
+        #
+        # The other thirteen groups the two benches print -- lifecycle, container,
+        # feeding, mem_level, strategy, stored_floor, oneshot, bound, degenerate and the
+        # opt-in silesia tier -- are measured and gated by the `over` count exactly as
+        # before.  They are deliberately NOT required to exist: `deflate_silesia` only
+        # appears when a human has fetched the opt-in corpus, and requiring a group that
+        # is absent by design would make the gate demand a network download.
+        #
+        # checksum_bench prints NO summary line of any kind -- it reports throughput per
+        # backend and nothing is gated on it, because a checksum has no output-fidelity
+        # dimension to trade against speed.  It is therefore absent from both sets on
+        # purpose; do not "fix" that by adding it.
+        # ---------------------------------------------------------------------------
+        RATIO_LIMIT = 1.10
+        MEMORY_LIMIT = 1.15
+
+        # The three compression levels AAP 0.8.4 names.  Case ids in the gated groups
+        # are `<fixture>-L<level>` and in the memory group `<fixture>-L<level>-mem<n>`,
+        # so the level a case measures is readable from its id.
+        REQUIRED_LEVELS = ("L1", "L6", "L9")
+
+        REQUIRED_RATIO = (
+            ("deflate_bench", "deflate_steady_state"),
+            ("inflate_bench", "inflate_steady_state"),
+        )
+        REQUIRED_MEMORY = (
+            ("deflate_bench", "deflate_memory"),
+        )
+        # One ALLOC-BALANCE line per side per memory case, and both sides are required:
+        # a balance that is clean on the port and never measured on the oracle proves
+        # only that the counter ran.
+        BALANCE_SIDES = ("zlib-rs", "c-oracle")
+
+        # Anchored on the bench's own log prefix so that the format documentation the
+        # benches print cannot be parsed as data.  That prose contains the literal text
+        # RATIO-SUMMARY inside backticks, and it is emitted with the same prefix, so the
+        # anchor has to require the keyword IMMEDIATELY after "<bench>: ".
         SUMMARY = re.compile(r"^(?P<bench>\w+_bench): "
                              r"(?P<kind>RATIO|MEMORY)-SUMMARY (?P<rest>group=\S+.*)$")
         BALANCE = re.compile(r"^(?P<bench>\w+_bench): ALLOC-BALANCE (?P<rest>side=\S+.*)$")
-        CASE = re.compile(r"^(?P<bench>\w+_bench): (RATIO|MEMORY) (?P<rest>group=\S+.*)$")
+        CASE = re.compile(r"^(?P<bench>\w+_bench): (?P<kind>RATIO|MEMORY) (?P<rest>group=\S+.*)$")
+        # `<fixture>-L<level>` with an optional `-mem<n>` tail.
+        LEVEL = re.compile(r"-(?P<level>L\d+)(?:-mem\d+)?$")
 
 
         def pairs(text):
-            return dict(part.split("=", 1) for part in text.split() if "=" in part)
+            """key=value pairs, or None if the line is not exactly that."""
+            out = {}
+            for part in text.split():
+                if "=" not in part:
+                    return None
+                key, value = part.split("=", 1)
+                if key in out:
+                    return None
+                out[key] = value
+            return out
+
+
+        def number(field, key, where, cast):
+            try:
+                return cast(field[key])
+            except (KeyError, ValueError):
+                fail("%s: %s=%r is not a %s" % (where, key, field.get(key), cast.__name__))
+                return None
+
+
+        def number(field, key, default="0"):
+            raw = field.get(key, default)
+            try:
+                return int(raw)
+            except ValueError:
+                return None
 
 
         with open(LOG, encoding="utf-8", errors="replace") as handle:
             lines = [line.rstrip("\n") for line in handle]
 
-        summaries, balances, cases, failures = [], [], [], []
+        seen = {}
         for line in lines:
-            match = SUMMARY.match(line)
-            if match:
-                summaries.append((match.group("bench"), match.group("kind"),
-                                  pairs(match.group("rest"))))
+            match = LINE.match(line)
+            if not match:
                 continue
-            match = BALANCE.match(line)
-            if match:
-                balances.append((match.group("bench"), pairs(match.group("rest"))))
+            bench, kind = match.group("bench"), match.group("kind")
+            field = pairs(match.group("rest"))
+            if field is None:
+                fail("%s: malformed %s line, not a sequence of unique key=value pairs: %s"
+                     % (bench, kind, line))
+                continue
+            missing = [key for key in KEYS[kind] if key not in field]
+            if missing:
+                fail("%s: %s line is missing required key(s) %s: %s"
+                     % (bench, kind, ", ".join(missing), line))
+                continue
+            seen.setdefault(bench, {}).setdefault(kind, []).append(field)
+
+        if not seen:
+            fail("the benchmark log carries no bench gate lines at all: nothing was "
+                 "measured, so there is nothing to gate")
+
+        unknown = sorted(set(seen) - set(EXPECTED))
+        if unknown:
+            fail("unrecognised bench suite(s) %s emitted gate lines.  A new suite must "
+                 "be wired into this gate's EXPECTED table with its authoritative "
+                 "groups, otherwise its measurements would be reported and never "
+                 "enforced." % ", ".join(unknown))
+
+        # --------------------------------------------------------------------------
+        # Structure, per suite, before a single ratio is looked at.
+        # --------------------------------------------------------------------------
+        report = []
+        decisions = []
+        for bench in sorted(EXPECTED):
+            want = EXPECTED[bench]
+            got = seen.get(bench, {})
+
+            inventories = got.get("GATE-INVENTORY", [])
+            if len(inventories) != 1:
+                fail("%s: expected exactly 1 GATE-INVENTORY line, found %d.  Without it "
+                     "the gate cannot know which groups are authoritative."
+                     % (bench, len(inventories)))
+                continue
+            inventory = inventories[0]
+
+            for key in ("suite", "ratio_limit", "min_bytes", "levels"):
+                if inventory[key] != want[key]:
+                    fail("%s: inventory %s=%s but this gate enforces %s"
+                         % (bench, key, inventory[key], want[key]))
+            if want["memory_limit"] is None:
+                if "memory_limit" in inventory:
+                    fail("%s: inventory declares memory_limit=%s but this suite is not "
+                         "expected to gate memory" % (bench, inventory["memory_limit"]))
+            elif inventory.get("memory_limit") != want["memory_limit"]:
+                fail("%s: inventory memory_limit=%s but this gate enforces %s"
+                     % (bench, inventory.get("memory_limit"), want["memory_limit"]))
+
+            tiers = {}
+            for tier in ("authoritative", "supporting", "informational"):
+                for group in csv(inventory["%s_ratio" % tier]):
+                    if group in tiers:
+                        fail("%s: group %s is declared in more than one ratio tier"
+                             % (bench, group))
+                    tiers[group] = tier
+            if sorted(g for g, t in tiers.items() if t == "authoritative") != \
+                    sorted(want["authoritative_ratio"]):
+                fail("%s: authoritative ratio groups are %s but this gate enforces %s.  "
+                     "Either the bench moved a group out of the gate or the gate is out "
+                     "of date; both need a human."
+                     % (bench, sorted(g for g, t in tiers.items() if t == "authoritative"),
+                        sorted(want["authoritative_ratio"])))
+
+            memory_groups = csv(inventory.get("authoritative_memory", ""))
+            if sorted(memory_groups) != sorted(want["authoritative_memory"]):
+                fail("%s: authoritative memory groups are %s but this gate enforces %s"
+                     % (bench, sorted(memory_groups), sorted(want["authoritative_memory"])))
+
+            criterions = got.get("CRITERION", [])
+            if len(criterions) != 1:
+                fail("%s: expected exactly 1 CRITERION line, found %d.  The gate decides "
+                     "from criterion's estimates and cannot locate them without it."
+                     % (bench, len(criterions)))
                 continue
             match = CASE.match(line)
             if match:
-                cases.append((match.group("bench"), pairs(match.group("rest"))))
+                cases.append((match.group("bench"), match.group("kind"),
+                              pairs(match.group("rest"))))
 
         throughput = [s for s in summaries if s[1] == "RATIO"]
         memory = [s for s in summaries if s[1] == "MEMORY"]
 
-        # A gate that measured nothing must not report success.  This is the
-        # guard against a bench that silently found no corpus, no oracle or no
-        # group to run.
+        # -------------------------------------------------------------------
+        # The MANDATORY groups, by name and by size.
+        #
+        # "At least one summary line exists" is not a gate.  The benches emit a
+        # summary per group -- eleven of them for deflate_bench alone -- and
+        # several are informational groups whose gated count is legitimately
+        # zero.  So a run that found no corpus, lost its oracle, or skipped the
+        # three groups that actually carry the AAP 0.8.4 numbers would still
+        # print summaries, still satisfy an "any line" check, and still report
+        # PASS.  `cases=0 gated=0 over=0` passes such a check trivially.
+        #
+        # What is required instead: each of the three gate-bearing groups is
+        # present EXACTLY ONCE, with exactly the number of cases and gated cases
+        # its own source produces.  Those numbers are not guesses -- they are the
+        # product the benches enumerate, and they were confirmed against a real
+        # run of this tree:
+        #
+        #   deflate_steady_state  FIXTURE_NAMES(5) x GATE_LEVELS(3)      = 15
+        #                         gated: 3 fixtures >= GATE_MIN_BYTES x 3 =  9
+        #   inflate_steady_state  5 fixtures x LEVELS[1,6,9]             = 15
+        #                                                        gated:  =  9
+        #   deflate_memory        GATE_LEVELS(3) x MEMORY_MEM_LEVELS(3)  =  9
+        #
+        # and deflate_memory's 9 cases are measured on both sides, so the
+        # allocator ledger must produce 2 x 9 = 18 distinct side/case rows.
+        #
+        # A count that DROPS means a fixture stopped loading or a level stopped
+        # being measured; a count that RISES means the matrix grew and this gate
+        # must be updated deliberately rather than drift. Either way it is a
+        # change a human should see, so both directions fail.
+        # -------------------------------------------------------------------
+        MANDATORY = {
+            ("deflate_bench", "RATIO", "deflate_steady_state"): (15, 9),
+            ("inflate_bench", "RATIO", "inflate_steady_state"): (15, 9),
+            ("deflate_bench", "MEMORY", "deflate_memory"): (9, None),
+        }
+        EXPECTED_BALANCE_ROWS = 18
         if not throughput:
             failures.append("no RATIO-SUMMARY line was produced: the throughput "
                             "gate did not run")
@@ -1333,23 +3777,211 @@ jobs:
             failures.append("no ALLOC-BALANCE line was produced: the allocator "
                             "balance check did not run")
 
+        seen = {}
+        for bench, kind, field in summaries:
+            key = (bench, kind, field.get("group", "?"))
+            seen.setdefault(key, []).append(field)
+
+        for key, (want_cases, want_gated) in sorted(MANDATORY.items()):
+            bench, kind, group = key
+            found = seen.get(key, [])
+            if not found:
+                failures.append(
+                    "%s produced no %s-SUMMARY for the mandatory group %s. That "
+                    "group carries the AAP 0.8.4 gate, so a run without it has "
+                    "measured nothing that this job exists to check."
+                    % (bench, kind, group))
+                continue
+            if len(found) > 1:
+                failures.append(
+                    "%s produced %d %s-SUMMARY lines for %s; exactly one is "
+                    "expected, and duplicates mean the log was concatenated or "
+                    "the group ran twice, so the counts below cannot be trusted."
+                    % (bench, len(found), kind, group))
+                continue
+            field = found[0]
+            for label, want in (("cases", want_cases), ("gated", want_gated)):
+                if want is None:
+                    continue
+                raw = field.get(label)
+                if raw is None:
+                    failures.append("%s %s: %s reported no %s count"
+                                    % (bench, group, kind, label))
+                    continue
+                try:
+                    got = int(raw)
+                except ValueError:
+                    failures.append("%s %s: %s=%r is not a number, so the summary "
+                                    "line is malformed" % (bench, group, label, raw))
+                    continue
+                if got == 0:
+                    failures.append(
+                        "%s %s: %s=0. The group ran but measured nothing -- the "
+                        "usual cause is that the committed corpus under "
+                        "crates/zlib-rs-differential/corpus/minimal did not load."
+                        % (bench, group, label))
+                elif got != want:
+                    failures.append(
+                        "%s %s: %s=%d but %d was expected. A drop means a fixture "
+                        "or level stopped being measured; a rise means the matrix "
+                        "grew and this gate must be updated deliberately."
+                        % (bench, group, label, got, want))
+
+        # Every mandatory case must have reported a real verdict of its own.  A
+        # summary can only count what the per-case loop produced, so a case that
+        # was skipped for want of input never appears -- and its absence is
+        # invisible in the summary's own arithmetic.
+        for key, (want_cases, _) in sorted(MANDATORY.items()):
+            bench, kind, group = key
+            got = [f for b, f in cases
+                   if b == bench and f.get("group") == group]
+            verdicts = [f for f in got if f.get("verdict") in ("within", "over")]
+            if len(verdicts) != want_cases:
+                failures.append(
+                    "%s %s: %d per-case line(s) carried a verdict, but %d cases "
+                    "were expected. A case that was skipped emits no line, so the "
+                    "summary alone cannot show this."
+                    % (bench, group, len(verdicts), want_cases))
+            ids = [f.get("case") for f in got]
+            duplicates = sorted({i for i in ids if ids.count(i) > 1})
+            if duplicates:
+                failures.append("%s %s: duplicate case id(s) %s"
+                                % (bench, group, ", ".join(map(str, duplicates))))
+
+        # The allocator ledger: 18 DISTINCT side/case rows, every one clean.
+        # Counting rows is not enough -- the same row repeated eighteen times
+        # would satisfy a count -- so identity is what is checked.
+        balance_ids = [(f.get("side"), f.get("case")) for _, f in balances]
+        unique_ids = set(balance_ids)
+        if len(unique_ids) != EXPECTED_BALANCE_ROWS:
+            failures.append(
+                "the allocator ledger reported %d distinct side/case row(s), but "
+                "%d were expected: deflate_memory's %d cases measured on both "
+                "sides. %d row(s) in total were printed."
+                % (len(unique_ids), EXPECTED_BALANCE_ROWS,
+                   EXPECTED_BALANCE_ROWS // 2, len(balance_ids)))
+        if len(balance_ids) != len(unique_ids):
+            repeated = sorted({i for i in balance_ids if balance_ids.count(i) > 1})
+            failures.append("the allocator ledger repeated %d row(s): %s"
+                            % (len(repeated),
+                               ", ".join("side=%s case=%s" % r for r in repeated)))
+
         print("%-16s %-8s %-26s %6s %6s %6s %6s" %
               ("bench", "kind", "group", "cases", "gated", "over", "limit"))
         for bench, kind, field in summaries:
-            print("%-16s %-8s %-26s %6s %6s %6s %6s" %
-                  (bench, kind, field.get("group", "?"), field.get("cases", "?"),
-                   field.get("gated", "-"), field.get("over", "?"),
-                   field.get("limit", "?")))
+            seen_summary.setdefault((bench, kind, field.get("group")), []).append(field)
 
+        required = ([(bench, "RATIO", group, RATIO_LIMIT) for bench, group in REQUIRED_RATIO] +
+                    [(bench, "MEMORY", group, MEMORY_LIMIT) for bench, group in REQUIRED_MEMORY])
+
+        for bench, kind, group, want_limit in required:
+            found = seen_summary.get((bench, kind, group), [])
+            if not found:
+                failures.append("%s printed no %s-SUMMARY for group %s. That group "
+                                "carries one of the AAP's numbered performance targets, "
+                                "so its absence means the target was not measured -- "
+                                "which a gate must never read as success"
+                                % (bench, kind, group))
+                continue
+            if len(found) > 1:
+                failures.append("%s printed %d %s-SUMMARY lines for group %s; exactly "
+                                "one is expected, so the log is duplicated or two "
+                                "groups share a name"
+                                % (bench, len(found), kind, group))
+            field = found[0]
+
+            # --- 3. The limit is the AAP's number, not whatever the bench chose -----
+            try:
+                limit = float(field.get("limit", "nan"))
+            except ValueError:
+                limit = float("nan")
+            if abs(limit - want_limit) > 1e-9:
+                failures.append("%s group %s reports limit=%s, but the AAP fixes it at "
+                                "%.2f. A gate that accepts the limit the bench prints "
+                                "enforces nothing: the bench could raise it and this "
+                                "job would still pass"
+                                % (bench, group, field.get("limit"), want_limit))
+
+            # --- 4. The group actually gates something ------------------------------
+            case_count = number(field, "cases")
+            if case_count is None or case_count <= 0:
+                failures.append("%s group %s reports cases=%s: the group produced no "
+                                "measurement at all" % (bench, group, field.get("cases")))
+            if kind == "RATIO":
+                gated = number(field, "gated")
+                if gated is None or gated <= 0:
+                    failures.append("%s group %s reports gated=%s. Every case in it is "
+                                    "informational, so nothing in the group can ever "
+                                    "fail and the throughput target it carries is "
+                                    "unenforced" % (bench, group, field.get("gated")))
+
+            # --- 5. The per-case lines are all there --------------------------------
+            # A log truncated mid-group, or a bench that died after printing its
+            # summary, is the failure mode this catches: the summary says 15 and the
+            # log holds nine.
+            observed = [f for b, k, f in cases
+                        if b == bench and k == kind and f.get("group") == group]
+            if case_count is not None and len(observed) != case_count:
+                failures.append("%s group %s summarises cases=%d but the log carries "
+                                "%d per-case %s line(s): the log is incomplete"
+                                % (bench, group, case_count, len(observed), kind))
+
+            # --- 6. Levels 1, 6 and 9 are each measured, and each one is GATED ------
+            levels = set()
+            for field_case in observed:
+                if kind == "RATIO" and field_case.get("gate") != "counted":
+                    continue
+                match = LEVEL.search(field_case.get("case", ""))
+                if match:
+                    levels.add(match.group("level"))
+            missing = [level for level in REQUIRED_LEVELS if level not in levels]
+            if missing:
+                failures.append("%s group %s gates no case at compression level(s) %s. "
+                                "AAP 0.8.4 names levels 1, 6 and 9 explicitly, and a "
+                                "case id is `<fixture>-L<level>`; the gated levels "
+                                "found were %s"
+                                % (bench, group, ", ".join(missing),
+                                   ", ".join(sorted(levels)) or "none"))
+
+        # --- 7. Allocator balance: one line per side per memory case ----------------
+        memory_cases = set()
+        for bench, kind, field in cases:
+            if kind == "MEMORY":
+                memory_cases.add((bench, field.get("case")))
+
+        want_balances = 2 * len(memory_cases)
+        if memory_cases and len(balances) != want_balances:
+            failures.append("the log carries %d ALLOC-BALANCE line(s) for %d memory "
+                            "case(s); %d are expected, one per case per side (%s). A "
+                            "missing line is an unmeasured allocator, not a clean one"
+                            % (len(balances), len(memory_cases), want_balances,
+                               " and ".join(BALANCE_SIDES)))
+
+        balanced = {}
+        for bench, field in balances:
+            balanced.setdefault((bench, field.get("case")), set()).add(field.get("side"))
+        for bench, case in sorted(memory_cases):
+            sides = balanced.get((bench, case), set())
+            absent = [side for side in BALANCE_SIDES if side not in sides]
+            if absent:
+                failures.append("%s memory case %s has no ALLOC-BALANCE line for "
+                                "side(s) %s: a balance that is clean on one side and "
+                                "unmeasured on the other proves only that the counter "
+                                "ran" % (bench, case, ", ".join(absent)))
+
+        # --- 8. The measurements themselves ----------------------------------------
         for bench, kind, field in summaries:
             group = field.get("group", "?")
             limit = field.get("limit", "?")
-            over = int(field.get("over", "0"))
-            if over:
+            over = number(field, "over")
+            if over is None:
+                failures.append("%s group %s reports a non-numeric over=%s"
+                                % (bench, group, field.get("over")))
+            elif over:
                 what = "throughput" if kind == "RATIO" else "memory"
                 failures.append("%s %s: %d gated case(s) in group %s exceeded the "
                                 "%s limit of %s" % (bench, what, over, group, what, limit))
-            dirty = int(field.get("dirty", "0"))
+            dirty = number(field, "dirty")
             if dirty:
                 failures.append("%s: %d case(s) in group %s reported a dirty "
                                 "allocator balance" % (bench, dirty, group))
@@ -1365,7 +3997,7 @@ jobs:
         if failures:
             print()
             print("The cases that exceeded their limit:")
-            for bench, field in cases:
+            for bench, kind, field in cases:
                 if field.get("verdict") == "over" and field.get("gate") != "informational":
                     print("  %s %s / %s  ratio=%s limit=%s" %
                           (bench, field.get("group"), field.get("case"),
@@ -1373,29 +4005,204 @@ jobs:
             for failure in failures:
                 print("::error::%s" % failure)
             print()
-            print("Only OUTPUT-NEUTRAL remedies are admissible, because the "
-                  "differential job asserts byte-identical output: the `simd` "
-                  "feature for the checksum backends, memory-copy strategy, "
-                  "branch layout, fat LTO with one codegen unit at opt-level 3, "
-                  "and the -Cllvm-args=-enable-dfa-jump-thread codegen flag. "
-                  "Changing match selection, the lazy-match threshold, "
-                  "hash-chain traversal or Huffman tie-breaking is NOT "
-                  "admissible however much faster it would be: every one of "
-                  "those changes the emitted bytes.")
+            print("Only OUTPUT-NEUTRAL remedies are admissible for a throughput "
+                  "shortfall, because the differential job asserts byte-identical "
+                  "output: the `simd` feature for the checksum backends, memory-copy "
+                  "strategy, branch layout, fat LTO with one codegen unit at opt-level "
+                  "3, and the -Cllvm-args=-enable-dfa-jump-thread codegen flag. "
+                  "Changing match selection, the lazy-match threshold, hash-chain "
+                  "traversal or Huffman tie-breaking is NOT admissible however much "
+                  "faster it would be: every one of those changes the emitted bytes.")
             sys.exit(1)
 
+        gated_total = sum(row[5] for row in report if row[3] in ("criterion", "memory"))
         print()
+        for key, (want_cases, want_gated) in sorted(MANDATORY.items()):
+            bench, kind, group = key
+            field = seen.get(key, [{}])[0]
+            print("mandatory %-14s %-22s cases=%s (expected %s) gated=%s (expected %s)"
+                  % (bench, group, field.get("cases", "-"), want_cases,
+                     field.get("gated", "-"),
+                     "n/a" if want_gated is None else want_gated))
         print("benchmark regression: PASS -- %d throughput group(s), %d memory "
-              "group(s) and %d allocator balance line(s), none over limit"
-              % (len(throughput), len(memory), len(balances)))
+              "group(s), all %d mandatory group(s) present with the expected case "
+              "counts, and %d distinct allocator balance row(s), none over limit"
+              % (len(throughput), len(memory), len(MANDATORY), len(set(
+                  (f.get("side"), f.get("case")) for _, f in balances))))
         BENCH_GATE
+        # A syntax error here must surface as a setup failure, not as a
+        # mysterious pass six steps later.
+        python3 -m py_compile "$RUNNER_TEMP/bench_gate.py"
+
+    - name: Compile source code
+      # The three benches live at the repository root but are wired as [[bench]]
+      # entries of crates/zlib-rs-differential with an explicit `path`, and that
+      # crate is not a default workspace member.  `-p zlib-rs-differential` is
+      # therefore required: a bare `cargo bench` from the root finds nothing and
+      # would report success having measured nothing at all.
+      run: cargo bench --locked -p zlib-rs-differential --no-run
+
+    - name: Run test cases
+      run: |
+        set -eu
+        set -o pipefail
+        # The gate below decides from the estimates criterion writes under
+        # target/criterion, so that directory must hold THIS run's measurements
+        # and nothing else.  A leftover estimates.json from an earlier run would
+        # let the gate read a number that was never measured here -- exactly the
+        # kind of stale-evidence pass it exists to prevent.  Nothing in this job
+        # restores a cache, so this is belt and braces rather than a fix, and it
+        # keeps the property true if a cache is ever added.
+        rm -rf target/criterion
+        mkdir -p target/bench
+        cargo bench --locked -p zlib-rs-differential 2>&1 | tee target/bench/bench.log
+
+    - name: Run test cases (gate the measurements)
+      run: python3 "$RUNNER_TEMP/bench_gate.py" target/bench/bench.log
+
+    - name: Run test cases (prove the corpus requirement actually refuses)
+      # -----------------------------------------------------------------------
+      # The job above measured the committed minimal corpus and legitimately
+      # skipped the tier-2 Silesia groups, because AAP 0.6.4.4 requires that
+      # `cargo test` and CI stay network-free and says the benches skip
+      # gracefully when the corpus is absent.  That skip is the right default and
+      # it is also, on its own, indistinguishable from a corpus that failed to
+      # load -- which is precisely the hole this step closes.
+      #
+      # ZLIB_RS_SILESIA_REQUIRED arms the benches to REFUSE absence instead of
+      # skipping it.  Here we arm it with the corpus deliberately absent and
+      # assert the benches fail.  That is a negative test OF THE GATE ITSELF: it
+      # runs on every push, needs no network, and proves that the acceptance job
+      # below cannot silently degrade into a skip.  Without it, "the armed mode
+      # refuses" would be an untested claim in exactly the runs where the corpus
+      # is unavailable.
+      # -----------------------------------------------------------------------
+      run: |
+        set -eu
+        empty="$(mktemp -d)"
+        status=0
+        env ZLIB_RS_SILESIA_REQUIRED=1 ZLIB_RS_SILESIA_DIR="$empty" \
+          cargo bench --locked -p zlib-rs-differential --bench deflate_bench -- --test \
+          > target/bench/refusal.log 2>&1 || status=$?
+
+        if [ "$status" -eq 0 ]; then
+          echo "::error::the benches were armed with ZLIB_RS_SILESIA_REQUIRED=1 and an"
+          echo "::error::empty corpus directory and still reported success.  The corpus"
+          echo "::error::requirement is not enforced, so the acceptance job below could"
+          echo "::error::skip the Silesia groups and still pass."
+          exit 1
+        fi
+
+        # Refusing for the RIGHT reason: a compile error or a missing bench binary
+        # would also be non-zero.
+        if ! grep -q 'ZLIB_RS_SILESIA_REQUIRED is set, so the Silesia corpus is required' \
+             target/bench/refusal.log; then
+          echo "::error::the armed run failed, but not with the corpus refusal.  The"
+          echo "::error::exit status alone does not prove the requirement fired."
+          sed -n '1,40p' target/bench/refusal.log
+          exit 1
+        fi
+
+        echo "the corpus requirement refuses absence (exit $status), as armed"
+        grep -m1 'SILESIA verdict=' target/bench/refusal.log || true
+
+    # -------------------------------------------------------------------------
+    # Silesia acceptance.  Everything above measured the committed minimal corpus
+    # and legitimately skipped the tier-2 groups; AAP 0.8.4 states the throughput
+    # bar against Silesia, so the named corpus has to be measured somewhere.
+    #
+    # AAP 0.6.4.4 is what shapes how: `cargo test` and CI must stay network-free,
+    # so the corpus is opt-in.  These steps run only when the repository has
+    # supplied the SHA-256 that
+    # crates/zlib-rs-differential/corpus/fetch_silesia.sh demands -- the script
+    # ships with SILESIA_SHA256_EXPECTED='UNPINNED' and refuses to fetch without
+    # one, so a fork that has configured nothing cannot make this job reach the
+    # network, and a fork that opts in gets a download verified by checksum over
+    # the archive AND over each of the twelve members.
+    #
+    # The refusal step above is what keeps this honest in every run where the
+    # corpus is unavailable: it proves, network-free, that armed mode really does
+    # refuse absence rather than quietly skipping.
+    # -------------------------------------------------------------------------
+    - name: Restore cached corpus
+      # Keyed on the pinned checksum, so the cache can only serve the exact corpus
+      # this run demands: change the pin and the key changes with it.  There are
+      # deliberately no restore-keys -- an older corpus is not a substitute for
+      # the pinned one, and silently accepting one would make the measurement
+      # untraceable.
+      id: corpus
+      if: vars.ZLIB_RS_SILESIA_SHA256 != ''
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: target/silesia
+        key: silesia-${{ vars.ZLIB_RS_SILESIA_SHA256 }}
+
+    - name: Run test cases (provision the Silesia corpus)
+      # On a cache hit the script re-verifies what came out of the cache rather
+      # than fetching, so a truncated or tampered cache entry is caught here
+      # instead of becoming a published throughput number.
+      if: vars.ZLIB_RS_SILESIA_SHA256 != ''
+      env:
+        ZLIB_RS_SILESIA_SHA256: ${{ vars.ZLIB_RS_SILESIA_SHA256 }}
+      run: |
+        set -eu
+        if [ "${{ steps.corpus.outputs.cache-hit }}" = "true" ]; then
+          sh crates/zlib-rs-differential/corpus/fetch_silesia.sh --verify-only
+        else
+          sh crates/zlib-rs-differential/corpus/fetch_silesia.sh
+        fi
+        ls -l target/silesia
+
+    - name: Run test cases (Silesia corpus, required)
+      # ZLIB_RS_SILESIA_REQUIRED=1 is the whole point of this pass: if
+      # provisioning produced eleven of the twelve members, or none, this refuses
+      # rather than reporting a pass earned on the minimal corpus.  The
+      # minimal-corpus criterion output is moved aside rather than deleted so both
+      # runs survive into the failure artifact.
+      if: vars.ZLIB_RS_SILESIA_SHA256 != ''
+      env:
+        ZLIB_RS_SILESIA_REQUIRED: '1'
+      run: |
+        set -eu
+        set -o pipefail
+        rm -rf target/criterion-minimal
+        mv target/criterion target/criterion-minimal
+        cargo bench --locked -p zlib-rs-differential 2>&1 \
+          | tee target/bench/silesia.log
+
+    - name: Run test cases (gate the Silesia measurements)
+      # The same gate, on a log whose SILESIA line reads required=yes.  That one
+      # difference removes the tier-2 exemption, so both *_silesia groups must now
+      # report expected>0 and every gated case of them is decided from criterion's
+      # estimates.  The two greps assert the precondition explicitly so that a
+      # corpus which loaded but was not demanded cannot pass as acceptance.
+      if: vars.ZLIB_RS_SILESIA_SHA256 != ''
+      run: |
+        set -eu
+        grep -h 'SILESIA verdict=' target/bench/silesia.log
+        for suite in deflate inflate; do
+          if ! grep -q "^${suite}_bench: SILESIA verdict=complete .*required=yes" \
+               target/bench/silesia.log; then
+            echo "::error::${suite}_bench did not report a complete, required Silesia"
+            echo "::error::corpus, so this pass did not measure what it exists to measure."
+            exit 1
+          fi
+          if grep -q "^${suite}_bench: RATIO-SUMMARY group=${suite}_silesia .* expected=0 " \
+               target/bench/silesia.log; then
+            echo "::error::${suite}_bench measured no Silesia case at all."
+            exit 1
+          fi
+        done
+        python3 "$RUNNER_TEMP/bench_gate.py" target/bench/silesia.log
 
     - name: Upload build errors
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       if: failure()
       with:
-        name: benchmark-regression
+        name: benchmark-criterion-${{ matrix.label }}
         path: |
-          target/bench/bench.log
+          target/bench/
           target/criterion/
+          target/criterion-minimal/
         retention-days: 7
+

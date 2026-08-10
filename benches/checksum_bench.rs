@@ -16,19 +16,30 @@
 //!   ships -- against `c_adler32_z` and `c_crc32_z`, the same two functions compiled from the
 //!   in-tree C sources by `crates/zlib-rs-differential/build.rs`. Both implementations run in ONE
 //!   process on ONE buffer, which AAP §0.6.4.6 requires so that cross-process noise cannot be
-//!   mistaken for a throughput difference. These are the numbers the "within 10% of C zlib" gate
-//!   reads.
+//!   mistaken for a throughput difference.
 //! * **The `uInt` forwarders** -- `uint_forwarders`. `adler32` and `crc32` take a `uInt` length
 //!   where the `_z` forms take a `z_size_t`; in the reference both are one-line forwarders
 //!   (`adler32.c` L128-L130, `crc32.c` L946-L951) and in the port both reduce to the same slice
 //!   call. One size is enough to show the forwarding costs nothing.
 //! * **Backend against backend** -- `adler32_backends` and `crc32_backends`. `crates/zlib-rs`
 //!   exposes its engines as named types behind the `Adler32Backend` and `Crc32Backend` traits, so
-//!   the scalar and vectorized paths are measured directly rather than inferred from two
+//!   the scalar and autovectorizable paths are measured directly rather than inferred from two
 //!   whole-binary runs. `Adler32Generic`, `crc32::Generic` and `crc32::Braid` are always present;
 //!   `Adler32Simd` and `crc32::Simd` exist only under the `simd` feature. Each group also carries a
 //!   `dispatch` row -- the safe core's own entry point -- so that selection cost and, against the
 //!   throughput groups above, the cost of crossing the C ABI are both isolated.
+//!
+//!   ★ **How to read a `simd` row, because the name overpromises.** Neither backend contains an
+//!   architecture intrinsic or any vector type: the core crate is `#![forbid(unsafe_code)]`, which
+//!   rules those out. Both are portable integer code *shaped so that LLVM can autovectorize it*,
+//!   and whether it does is a property of the compiler and of the target baseline being built --
+//!   this repository sets no `-C target-cpu` anywhere, so that baseline is the default for the
+//!   triple. A `simd` row that measures the same as its `generic` row is therefore a legitimate
+//!   outcome on a given machine and not a bug in this bench. Selection is likewise not what the
+//!   name suggests: `crc32::Simd` performs no run-time feature probe at all, and the Adler-32
+//!   dispatcher checks the input length first and treats detection only as a throughput hint --
+//!   which is why [`detected_cpu_features`] is printed as an *explanation of a rate* rather than as
+//!   a statement about which code ran.
 //! * **The combine family** -- `combine`. `adler32_combine`, `crc32_combine`,
 //!   `crc32_combine_gen`, `crc32_combine_op` and the three `*64` forms. These are O(log n)
 //!   bit-matrix operations over `x2n_table`, not byte pipelines, so they are measured per call and
@@ -58,6 +69,23 @@
 //! against the oracle's *before* timing it: a throughput number for a wrong value is worse than
 //! no number at all.
 //!
+//! # This is not a performance gate either
+//!
+//! Every number this file produces is an **informational backend comparison**, and nothing reads it
+//! automatically. Unlike `benches/deflate_bench.rs` and `benches/inflate_bench.rs`, this suite emits
+//! no `RATIO-SUMMARY` line and no `MEMORY-SUMMARY` line, so the parser in the `bench` job of
+//! `.github/workflows/rust.yml` finds nothing here to gate: a checksum regression cannot fail that
+//! job. That is deliberate rather than an omission. The two throughput limits AAP §0.8.4 states are
+//! for *compression* and *decompression*, and AAP §0.6.4.6 reads them from the multi-megabyte
+//! Silesia members through the two suites that do emit summary lines. A checksum sits on the decode
+//! and encode hot paths, so it contributes to those numbers, but its own rate is not one of the
+//! stated targets and no threshold is defined for it.
+//!
+//! What the rows are for, then: choosing between the scalar and vectorized backends on a given
+//! host, confirming that the `simd` feature is worth enabling there, seeing what crossing the C ABI
+//! costs, and noticing a change in the shape of the length curve. Read them by hand, and use
+//! criterion's baselines (below) when comparing two configurations.
+//!
 //! # This is not a correctness gate
 //!
 //! The agreement check below is a guard on the measurement, not a test. Table transcription is
@@ -75,11 +103,12 @@
 //! cargo bench -p zlib-rs-differential --bench checksum_bench -- --test    # one iteration each
 //! ```
 //!
-//! A full run measures 95 cases -- 101 with `--features simd` -- at criterion's default
-//! three-second warm-up and five-second measurement, which took twenty minutes when this file was
-//! written; pass `--sample-size`, `--warm-up-time` or `--measurement-time` to trade precision for
-//! wall clock. `--test` executes every case exactly once in a few seconds and is the cheapest
-//! end-to-end check that the harness, the oracle linkage and the corpus paths are all correct.
+//! A full run measures the whole case set -- the `simd` feature adds the vectorized backend rows
+//! rather than replacing any -- at criterion's default three-second warm-up and five-second
+//! measurement per case, so the wall clock is roughly `cases x 8 s` plus build time. Pass
+//! `--sample-size`, `--warm-up-time` or `--measurement-time` to trade precision for wall clock.
+//! `--test` executes every case exactly once and is the cheapest end-to-end check that the harness,
+//! the oracle linkage and the corpus paths are all correct.
 //!
 //! Scalar versus SIMD is available two ways, and they answer different questions.
 //!
@@ -174,11 +203,11 @@
 //! # Hygiene
 //!
 //! `crates/zlib-rs-differential` is dev-only and appears in neither shipped crate's
-//! `[dependencies]` (AAP §0.6.4.1), which is what makes `unsafe` acceptable in this file at all:
-//! it exists solely to call the oracle's `extern "C"` declarations, every such call is funnelled
-//! through one named gate that owns a single `unsafe` block, and every block states the
-//! invariant that discharges it. `extern "C-unwind"` appears nowhere and nothing here is
-//! `#[no_mangle]`.
+//! `[dependencies]` (AAP §0.6.4.1), and it is also where every `unsafe` this file's measurements
+//! need actually lives: its `port` and `oracle` modules hold one gate per entry point, each owning
+//! the single documented `unsafe` block and the invariant that discharges it. This file's root
+//! carries `#![forbid(unsafe_code)]`, so its own freedom from `unsafe` is compiler-enforced.
+//! `extern "C-unwind"` appears nowhere and nothing here is `#[no_mangle]`.
 //!
 //! A `harness = false` bench compiles without `--test`, so `cfg(test)` is false here and these
 //! functions are not `#[test]`. `clippy.toml`'s `allow-unwrap-in-tests`,
@@ -186,6 +215,10 @@
 //! workspace's denied panic family is fully in force. Nothing below unwraps, expects, panics or
 //! indexes: a fallible step logs to stderr and returns early, which is also the behaviour a
 //! benchmark should have.
+
+// Every FFI call this file makes goes through a gate in `crate::port` or `oracle`, so nothing here
+// needs `unsafe` and the compiler is asked to keep it that way.
+#![forbid(unsafe_code)]
 
 use std::fmt;
 use std::fs;
@@ -202,7 +235,10 @@ use libz_rs_sys::{uInt, uLong, z_off64_t, z_off_t};
 use zlib_rs::adler32::{Adler32Backend, Adler32Generic, ADLER32_INITIAL_VALUE, NMAX};
 use zlib_rs::crc32::tables::{N, W};
 use zlib_rs::crc32::{Braid, Crc32Backend, Generic};
-use zlib_rs_differential::oracle;
+// The two sides of the harness FFI boundary: `oracle` for the C reference's `extern "C"`
+// declarations, `port` for the facade's. Every `unsafe` call either measurement makes lives in one
+// of those two files and nowhere else.
+use zlib_rs_differential::{oracle, port};
 
 #[cfg(feature = "simd")]
 use zlib_rs::adler32::Adler32Simd;
@@ -316,9 +352,11 @@ const BRAID_ENTRY_LEN: usize = BRAID_STRIDE + W - 1;
 /// * `65536` -- eleven whole `NMAX` blocks plus a 4464-byte remainder, so both `adler32.c`'s block
 ///   loop (L97-L106) and its tail (L109-L121) run: steady state with the reduction cost amortized,
 ///   and larger than the 32 KiB window, so it is representative of bulk stream traffic.
-/// * `1 << 20` -- a mebibyte, far beyond every cache level on a typical machine, so the rate
-///   reported is memory-bandwidth-bound rather than table-lookup-bound. This is the number the
-///   "within 10%" gate of AAP §0.6.4.6 is most meaningfully read from.
+/// * `1 << 20` -- a mebibyte: the bulk row, long enough that per-call cost, the reduction
+///   schedule and the loop prologue are all amortized away and what remains is the steady-state
+///   inner loop. Whether it also exceeds the machine's last-level cache depends on the machine and
+///   is not asserted here; on a host with a multi-megabyte cache this row is warm, and the
+///   comparison is still apples to apples because both implementations read the same allocation.
 const SIZE_SWEEP: [usize; 10] = [
     1,
     16,
@@ -483,16 +521,17 @@ fn fixtures() -> &'static [(&'static str, Vec<u8>)] {
 //  Oracle and facade call gates
 // =============================================================================
 //
-//  Every FFI call in this file goes through one of the gates below, and each gate owns exactly
-//  one `unsafe` block carrying the invariant that discharges it. That is the shape the
-//  workspace's `undocumented_unsafe_blocks` policy asks for where one call is repeated many
-//  times: state the invariant once, on a named function, instead of copying it onto every call
-//  site inside a benchmark closure.
+//  Every FFI call in this file goes through one of the gates below, and NO gate contains
+//  `unsafe`: this file's root carries `#![forbid(unsafe_code)]`, and each gate delegates to the
+//  matching safe wrapper in `crates/zlib-rs-differential/src` -- `port` for the facade, `oracle`
+//  for the C reference -- which is where the single documented `unsafe` block per entry point
+//  lives together with the invariant that discharges it.
 //
-//  The invariant is the same for all four buffer gates and is stated in full on each, because a
-//  reader auditing one should not have to find another. In short: the pointer comes from a live
-//  slice that outlives the call, the length is that slice's own length, and nothing is written
-//  through the pointer or retained past the return.
+//  The gates below therefore exist for two reasons that survive that move. They keep each
+//  measurement's *shape* in one place, so the port row and the reference row of a comparison pay
+//  for exactly the same conversions; and they keep the `uInt` bounds test of the forwarder pair
+//  out of the timed closure's control flow. A benchmark that let one side convert and the other
+//  not would report the conversion as a throughput difference.
 //
 //  The `uLong` a gate returns is `core::ffi::c_ulong` on both sides -- `crates/libz-rs-sys`'s
 //  `types.rs` and the oracle's own aliases both track `unsigned long` rather than a fixed width,
@@ -506,22 +545,17 @@ fn fixtures() -> &'static [(&'static str, Vec<u8>)] {
 /// No length conversion: `z_size_t` is `size_t`, and `types.rs` pins its equality with `usize` at
 /// compile time, so the slice's own length is the argument.
 fn port_adler32_z(adler: uLong, buf: &[u8]) -> uLong {
-    // SAFETY: `buf.as_ptr()` is derived from a live slice that outlives this call, so it is
-    // non-null and readable for exactly `buf.len()` bytes -- which is the length passed, without
-    // conversion or truncation. `u8` has alignment 1, so any such pointer is aligned. The callee
-    // is documented to read at most that many bytes, to write nothing through the pointer and to
-    // retain nothing past its return.
-    unsafe { libz_rs_sys::adler32_z(adler, buf.as_ptr(), buf.len()) }
+    // The slice crosses the boundary whole, so the length cannot disagree with the pointer and
+    // no conversion happens on the way in.
+    port::adler32_z(adler, buf)
 }
 
 /// `c_adler32_z` -- the C reference's `adler32_z` (`adler32.c` L61-L125).
 fn oracle_adler32_z(adler: oracle::uLong, buf: &[u8]) -> oracle::uLong {
-    // SAFETY: as `port_adler32_z`, against the same declaration: the pointer comes from a live
-    // slice that outlives the call and is readable for exactly the `buf.len()` bytes passed
-    // alongside it, `u8` is alignment 1, and `adler32.c` L61-L125 only reads the buffer. The
-    // declaration in `crates/zlib-rs-differential/src/oracle.rs` L741 carries the C prototype
-    // verbatim, and this crate's `build.rs` is what links the archive that defines it.
-    unsafe { oracle::c_adler32_z(adler, buf.as_ptr(), buf.len()) }
+    // As `port_adler32_z`, against `adler32.c` L61-L125, which only reads the buffer. The
+    // `extern "C"` declaration it reaches carries the C prototype verbatim, and this crate's
+    // `build.rs` is what links the archive that defines it.
+    oracle::adler32_z(adler, buf)
 }
 
 /// `crc32_z` through the exported C ABI (`zlib.h` L1866-L1867, ported from `crc32.c` L508/L626).
@@ -530,20 +564,14 @@ fn oracle_adler32_z(adler: oracle::uLong, buf: &[u8]) -> oracle::uLong {
 /// word-at-a-time body at `crc32.c` L508 when a word type is available and the byte-at-a-time one
 /// at L626 otherwise -- and the port mirrors the choice with its `Braid` and `Generic` backends.
 fn port_crc32_z(crc: uLong, buf: &[u8]) -> uLong {
-    // SAFETY: `buf.as_ptr()` is derived from a live slice that outlives this call, so it is
-    // non-null and readable for exactly `buf.len()` bytes -- the length passed, unconverted.
-    // `u8` has alignment 1. The callee reads at most that many bytes, writes nothing through the
-    // pointer and retains nothing past its return.
-    unsafe { libz_rs_sys::crc32_z(crc, buf.as_ptr(), buf.len()) }
+    // As `port_adler32_z`: the slice crosses whole and unconverted.
+    port::crc32_z(crc, buf)
 }
 
 /// `c_crc32_z` -- the C reference's `crc32_z` (`crc32.c` L508 or L626, whichever `W` selected).
 fn oracle_crc32_z(crc: oracle::uLong, buf: &[u8]) -> oracle::uLong {
-    // SAFETY: as `port_crc32_z`, against the declaration at
-    // `crates/zlib-rs-differential/src/oracle.rs` L802: the pointer comes from a live slice that
-    // outlives the call and is readable for exactly the `buf.len()` bytes passed with it, `u8` is
-    // alignment 1, and both C bodies only read the buffer.
-    unsafe { oracle::c_crc32_z(crc, buf.as_ptr(), buf.len()) }
+    // As `port_crc32_z`; both C bodies -- braided and byte-at-a-time -- only read the buffer.
+    oracle::crc32_z(crc, buf)
 }
 
 /// `adler32` -- the `uInt`-length forwarder (`zlib.h` L1809, ported from `adler32.c` L128-L130).
@@ -553,52 +581,45 @@ fn oracle_crc32_z(crc: oracle::uLong, buf: &[u8]) -> oracle::uLong {
 /// [`oracle_adler32`] pay for it identically and the comparison stays fair; at
 /// [`FORWARDER_LEN`] it is one bounds test against a checksum over a kilobyte.
 fn port_adler32(adler: uLong, buf: &[u8]) -> Option<uLong> {
-    let len = uInt::try_from(buf.len()).ok()?;
+    // The bounds test stays here rather than in the gate, and it is what this row measures
+    // against the `_z` form: `adler32` takes a `uInt` length, so a slice that cannot be expressed
+    // in one has no answer. Having established that it can, the gate's own narrowing is exact.
+    let _len = uInt::try_from(buf.len()).ok()?;
 
-    // SAFETY: `buf.as_ptr()` is derived from a live slice that outlives this call, so it is
-    // non-null and readable for `buf.len()` bytes; `len` is that same length, converted by
-    // `try_from` and therefore equal to it rather than truncated. `u8` has alignment 1. The
-    // callee only reads, and retains nothing.
-    Some(unsafe { libz_rs_sys::adler32(adler, buf.as_ptr(), len) })
+    Some(port::adler32(adler, buf))
 }
 
 /// `c_adler32` -- the C reference's `uInt`-length forwarder (`adler32.c` L128-L130).
 fn oracle_adler32(adler: oracle::uLong, buf: &[u8]) -> Option<oracle::uLong> {
-    let len = oracle::uInt::try_from(buf.len()).ok()?;
+    // As `port_adler32`, including where the bounds test sits, so that both rows of the
+    // comparison pay for exactly the same conversion.
+    let _len = oracle::uInt::try_from(buf.len()).ok()?;
 
-    // SAFETY: as `port_adler32`, against the declaration at
-    // `crates/zlib-rs-differential/src/oracle.rs` L732: the pointer is from a live slice
-    // outliving the call, `len` equals that slice's length by `try_from` rather than by cast,
-    // `u8` is alignment 1, and the callee only reads.
-    Some(unsafe { oracle::c_adler32(adler, buf.as_ptr(), len) })
+    Some(oracle::adler32(adler, buf))
 }
 
 /// `crc32` -- the `uInt`-length forwarder (`zlib.h` L1848, ported from `crc32.c` L946-L951).
 fn port_crc32(crc: uLong, buf: &[u8]) -> Option<uLong> {
-    let len = uInt::try_from(buf.len()).ok()?;
+    // As `port_adler32`.
+    let _len = uInt::try_from(buf.len()).ok()?;
 
-    // SAFETY: `buf.as_ptr()` is derived from a live slice that outlives this call, so it is
-    // non-null and readable for `buf.len()` bytes; `len` is that same length via `try_from`, so
-    // it cannot exceed what is readable. `u8` has alignment 1. The callee only reads.
-    Some(unsafe { libz_rs_sys::crc32(crc, buf.as_ptr(), len) })
+    Some(port::crc32(crc, buf))
 }
 
 /// `c_crc32` -- the C reference's `uInt`-length forwarder (`crc32.c` L946-L951).
 fn oracle_crc32(crc: oracle::uLong, buf: &[u8]) -> Option<oracle::uLong> {
-    let len = oracle::uInt::try_from(buf.len()).ok()?;
+    // As `oracle_adler32`.
+    let _len = oracle::uInt::try_from(buf.len()).ok()?;
 
-    // SAFETY: as `port_crc32`, against the declaration at
-    // `crates/zlib-rs-differential/src/oracle.rs` L784: the pointer is from a live slice
-    // outliving the call, `len` equals that slice's length by `try_from`, `u8` is alignment 1,
-    // and the callee only reads.
-    Some(unsafe { oracle::c_crc32(crc, buf.as_ptr(), len) })
+    Some(oracle::crc32(crc, buf))
 }
 
-// The six combine gates below take no pointer at all: every argument is a by-value integer and
-// every result is one, so their `unsafe` is the irreducible kind -- calling a foreign function
-// whose Rust declaration is asserted, and not checked, to match its C prototype. The port's own
-// combine entry points are safe `extern "C" fn`s and need no gate, which is exactly the asymmetry
-// a hand-written `extern` block introduces and a reason to keep the blocks few and named.
+// The seven combine gates below take no pointer at all: every argument is a by-value integer and
+// every result is one. Their `unsafe` -- now discharged in `oracle` rather than here -- is the
+// irreducible kind: calling a foreign function whose Rust declaration is asserted, and not
+// checked, to match its C prototype. The port's own combine entry points are safe
+// `extern "C" fn`s and need no gate at all, which is exactly the asymmetry a hand-written
+// `extern` block introduces and a reason to keep those declarations in one audited file.
 //
 // `adler32_combine_` (`adler32.c` L133-L155) backs both Adler-32 forms and `x2nmodp`/`multmodp`
 // (`crc32.c` L184, L163) back all five CRC-32 ones, so each pair cannot disagree with itself; what
@@ -610,12 +631,9 @@ fn oracle_adler32_combine(
     adler2: oracle::uLong,
     len2: oracle::z_off_t,
 ) -> oracle::uLong {
-    // SAFETY: three by-value integers in, one out; no pointer, no buffer, no stream state, and
-    // therefore no precondition beyond the declaration at
-    // `crates/zlib-rs-differential/src/oracle.rs` L735 matching the `zlib.h` prototype -- which it
-    // carries verbatim in its own doc comment. A negative `len2` is well defined rather than
+    // Three by-value integers in, one out. A negative `len2` is well defined rather than
     // undefined: `adler32.c` L134-L137 returns `0xffffffff`.
-    unsafe { oracle::c_adler32_combine(adler1, adler2, len2) }
+    oracle::adler32_combine(adler1, adler2, len2)
 }
 
 /// `c_adler32_combine64` -- the C reference's wide combine (`adler32.c` L162-L164).
@@ -624,10 +642,8 @@ fn oracle_adler32_combine64(
     adler2: oracle::uLong,
     len2: oracle::z_off64_t,
 ) -> oracle::uLong {
-    // SAFETY: as `oracle_adler32_combine`, against the declaration at
-    // `crates/zlib-rs-differential/src/oracle.rs` L738 -- by-value integers only, so there is no
-    // memory obligation to discharge.
-    unsafe { oracle::c_adler32_combine64(adler1, adler2, len2) }
+    // As `oracle_adler32_combine`, with the 64-bit length.
+    oracle::adler32_combine64(adler1, adler2, len2)
 }
 
 /// `c_crc32_combine` -- the C reference's narrow combine (`crc32.c` L981-L983).
@@ -636,10 +652,8 @@ fn oracle_crc32_combine(
     crc2: oracle::uLong,
     len2: oracle::z_off_t,
 ) -> oracle::uLong {
-    // SAFETY: by-value integers only, against the declaration at
-    // `crates/zlib-rs-differential/src/oracle.rs` L787; no pointer and no state, so nothing to
-    // prove about memory. The callee reads only `x2n_table`, which has static storage duration.
-    unsafe { oracle::c_crc32_combine(crc1, crc2, len2) }
+    // By-value integers only. The callee reads `x2n_table`, which has static storage duration.
+    oracle::crc32_combine(crc1, crc2, len2)
 }
 
 /// `c_crc32_combine64` -- the C reference's wide combine (`crc32.c` L976-L978).
@@ -648,23 +662,20 @@ fn oracle_crc32_combine64(
     crc2: oracle::uLong,
     len2: oracle::z_off64_t,
 ) -> oracle::uLong {
-    // SAFETY: by-value integers only, against the declaration at
-    // `crates/zlib-rs-differential/src/oracle.rs` L790; no memory obligation.
-    unsafe { oracle::c_crc32_combine64(crc1, crc2, len2) }
+    // As `oracle_crc32_combine`, with the 64-bit length.
+    oracle::crc32_combine64(crc1, crc2, len2)
 }
 
 /// `c_crc32_combine_gen` -- the C reference's operator generator (`crc32.c` L964-L966).
 fn oracle_crc32_combine_gen(len2: oracle::z_off_t) -> oracle::uLong {
-    // SAFETY: one by-value integer in, one out, against the declaration at
-    // `crates/zlib-rs-differential/src/oracle.rs` L793; no pointer and no state.
-    unsafe { oracle::c_crc32_combine_gen(len2) }
+    // One by-value integer in, one out.
+    oracle::crc32_combine_gen(len2)
 }
 
 /// `c_crc32_combine_gen64` -- the wide operator generator (`crc32.c` L954-L956).
 fn oracle_crc32_combine_gen64(len2: oracle::z_off64_t) -> oracle::uLong {
-    // SAFETY: one by-value integer in, one out, against the declaration at
-    // `crates/zlib-rs-differential/src/oracle.rs` L796; no pointer and no state.
-    unsafe { oracle::c_crc32_combine_gen64(len2) }
+    // As `oracle_crc32_combine_gen`, with the 64-bit length.
+    oracle::crc32_combine_gen64(len2)
 }
 
 /// `c_crc32_combine_op` -- applies a precomputed operator (`crc32.c` L969-L971).
@@ -673,23 +684,19 @@ fn oracle_crc32_combine_op(
     crc2: oracle::uLong,
     op: oracle::uLong,
 ) -> oracle::uLong {
-    // SAFETY: three by-value integers in, one out, against the declaration at
-    // `crates/zlib-rs-differential/src/oracle.rs` L799; no pointer and no state. `op` is opaque
-    // to this caller and is only ever a value `crc32_combine_gen` produced.
-    unsafe { oracle::c_crc32_combine_op(crc1, crc2, op) }
+    // Three by-value integers in, one out. `op` is opaque to this caller and is only ever a
+    // value `crc32_combine_gen` produced.
+    oracle::crc32_combine_op(crc1, crc2, op)
 }
 
 /// `c_get_crc_table` -- the reference's table accessor (`crc32.c` L482-L487).
 ///
 /// The pointer is returned rather than dereferenced: what is being measured is the cost of the
-/// accessor, and the table's *contents* are compared through the safe `oracle::oracle_crc_table`
-/// wrapper instead, which discharges the slice construction once in the harness crate.
+/// accessor, not of a read through it. `oracle::crc_table` is the gate, and taking `as_ptr` of the
+/// `'static` slice it returns costs nothing at run time -- `slice::from_raw_parts` over a constant
+/// length compiles away -- so what the row times is `crc32.c` L482-L487 and the call to it.
 fn oracle_get_crc_table() -> *const oracle::z_crc_t {
-    // SAFETY: niladic, against the declaration at
-    // `crates/zlib-rs-differential/src/oracle.rs` L884. `crc32.c` L486 returns a pointer to
-    // `crc_table`, an array with static storage duration, so the call has no precondition and the
-    // returned pointer is not dereferenced here in any case.
-    unsafe { oracle::c_get_crc_table() }
+    oracle::crc_table().as_ptr()
 }
 
 // =============================================================================
@@ -895,7 +902,7 @@ const CRC32_START: u32 = 0;
 /// answers are compared before either is timed, so a rate is only ever published for a case where
 /// the port and the reference agree. Feeding both from one allocation is what AAP §0.6.4.6 means
 /// by measuring in one process: the alternative -- two runs, two buffers, two page-cache states --
-/// puts noise where the 10% gate reads signal.
+/// puts noise into a ratio that is only useful if it is noise-free.
 fn time_against_reference(
     group: &mut BenchmarkGroup<'_, WallTime>,
     algorithm: &str,
@@ -1642,9 +1649,9 @@ fn crc_table_accessor(c: &mut Criterion) {
 //
 //  `harness = false` in the `[[bench]]` entry means libtest supplies no `main`, so
 //  `criterion_main!` does. Ordering is the order a reader wants to see: throughput against the
-//  reference first, because that is what the AAP §0.6.4.6 gate reads; then the forwarders, the
-//  real-data cases, the backend comparison, the combine family, and the table accessor last
-//  because it is an observation rather than a measurement.
+//  reference first, because the port-versus-reference ratio is the primary question; then the
+//  forwarders, the real-data cases, the backend comparison, the combine family, and the table
+//  accessor last because it is an observation rather than a measurement.
 
 criterion_group!(
     checksum_benches,

@@ -253,9 +253,12 @@
 //!   file descriptor rather than a `HANDLE`, which is why `std::fs::File` could not
 //!   adopt one -- but `libc` binds the CRT's `_open`, `_read`, `_write`, `_lseeki64`
 //!   and `_close`, which are the very functions C's own gz layer calls there, so the
-//!   same [`Descriptor`] serves both platforms. `x86_64-pc-windows-gnu` is compiled in
-//!   CI to keep that arm honest; it is checked, not run, because the port's verified
-//!   Tier-1 target is Linux.
+//!   same [`Descriptor`] serves both platforms. What exercises the Windows arm is the
+//!   `windows-latest` row of `.github/workflows/rust.yml`'s `build-test` job, which
+//!   builds and tests on that runner's default host target -- `*-pc-windows-msvc`.
+//!   `*-pc-windows-gnu` is NOT installed or built anywhere in CI, so the MinGW arm of
+//!   any `#[cfg]` below is unexercised, and the port's verified target remains
+//!   `x86_64-unknown-linux-gnu` (see `rust-toolchain.toml` for the full matrix).
 //!
 //! A fifth is resolved on this side of the boundary rather than removed from the
 //! core's list. Divergence 1 of `zlib_rs::gz::open` -- `close(2)`'s result being
@@ -263,10 +266,10 @@
 //! it by stating that "a stream whose `close(2)` status must be exact takes an injected
 //! handle", and [`Descriptor`] is that handle for both openings. [`Descriptor::close`]
 //! calls `close(2)` and returns its result, which `zlib_rs::gz::gzclose_r` turns into
-//! `Z_ERRNO` exactly where C's `ret ? Z_ERRNO : err` does (`gzread.c` L665-L666). An
-//! earlier revision had to establish the same condition indirectly with `fstat(2)`,
-//! because `Drop for File` discards `close`'s status; that workaround is gone with the
-//! `File`.
+//! `Z_ERRNO` exactly where C's `ret ? Z_ERRNO : err` does (`gzread.c` L665-L666). This is
+//! why the layer owns a [`Descriptor`] rather than a `std::fs::File`: `Drop for File`
+//! discards `close`'s status, which leaves the condition observable only indirectly, with
+//! an `fstat(2)` probe that answers a different question.
 //!
 //! Divergence 5 of the core's inventory -- boxing the handle can abort the process,
 //! because `Box::new` has no fallible form -- does not apply to this facade either:
@@ -3121,8 +3124,8 @@ pub unsafe extern "C" fn gzdirect(file: gzFile) -> c_int {
 /// pure read at L527.
 ///
 /// ★ **This function performs no allocation, and that is a correctness property rather
-/// than an optimisation.** An earlier revision stored the message unterminated and built
-/// a terminated copy here, which introduced an allocation failure path C does not have --
+/// than an optimisation.** Storing the message unterminated and building a terminated
+/// copy here would introduce an allocation failure path C does not have --
 /// on the one call a caller makes *because* something has already gone wrong. Under
 /// memory pressure the text explaining the failure would then be the thing that could not
 /// be produced, and the caller would see `""` instead of the reason. There is now no
@@ -3548,12 +3551,24 @@ mod tests {
     ///
     /// `CLONE_INDEX` is honoured because the workspace may be built by several clones on one
     /// host at the same time; the process id and a counter separate the tests within a run.
+    ///
+    /// ★ `module_path!()` IS LOAD-BEARING, not decoration. This file carries two test
+    /// modules, `tests` and `tests_backend`; they compile into one binary, and they share 32
+    /// `Scratch` tags between them. Each has a `COUNTER` of its own, so without the module
+    /// name the two produce the SAME path whenever their counters happen to agree on a shared
+    /// tag -- same prefix, same process id, same tag, same serial. Both then use one file, and
+    /// whichever `Scratch` drops first deletes the other's, so the loser fails with `NotFound`
+    /// on a file it created itself. The collision is there by construction and intermittent
+    /// only in when it fires, so it is removed by construction too: the module name makes the
+    /// two namespaces disjoint whatever the counters do. Anything added here that must be
+    /// unique per test needs the same treatment.
     fn temp_path(tag: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
         let clone = std::env::var("CLONE_INDEX").unwrap_or_else(|_| String::from("local"));
+        let module = module_path!().replace("::", "_");
         std::env::temp_dir().join(format!(
-            "blitzy_libz_rs_gz_{clone}_{}_{tag}_{serial}.gz",
+            "blitzy_libz_rs_gz_{clone}_{}_{module}_{tag}_{serial}.gz",
             std::process::id()
         ))
     }
@@ -4079,10 +4094,10 @@ mod tests {
     /// The point is the *ordering* as much as the outcome. `gz_open` parses and rejects the
     /// mode at `gzlib.c` L107-L197 and only reaches the path narrowing and its `malloc` at
     /// L198-L219 for a mode it has accepted, so a refused mode must cost no allocation whose
-    /// size the caller chose. An earlier revision of this entry point converted the whole
-    /// wide path -- infallibly, through `String::from_utf16_lossy` -- before looking at the
-    /// mode at all, which both diverged from that order and let a caller provoke an
-    /// out-of-memory abort with a long path and a mode that was never going to be accepted.
+    /// size the caller chose. Converting the whole wide path first -- infallibly, through
+    /// `String::from_utf16_lossy` -- before looking at the mode would both diverge from that
+    /// order and let a caller provoke an out-of-memory abort with a long path and a mode that
+    /// was never going to be accepted.
     ///
     /// The four are C's: `+` anywhere (L129-L131), no `r`/`w`/`a` (L174-L177), `T` while
     /// reading (L181-L185) and `G` while writing (L191-L195). They are checked through the
@@ -4197,9 +4212,9 @@ mod tests {
     /// rely on that, because the count `gzread` returns is the only thing that describes what was
     /// written.
     ///
-    /// The buffer is pre-filled with a **position-dependent** sentinel: a constant would pass by
-    /// coincidence against any implementation that happened to fill with the same byte, and an
-    /// earlier revision of this library filled the whole offered window with zeros.
+    /// The buffer is pre-filled with a **position-dependent** sentinel rather than a constant: a
+    /// constant would pass by coincidence against any implementation that happened to fill the
+    /// whole offered window with that same byte -- zero being the obvious candidate.
     ///
     /// The sizes are chosen to reach the path under test rather than to be round: the file is
     /// larger than one input buffer (the default `size` is 8192, so `gz_look` delivers 8192 bytes
@@ -5715,7 +5730,7 @@ mod tests_backend {
     use super::GzOpenSpec;
 
     use core::ffi::{c_char, c_int, c_uint, c_void};
-    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
     use std::ffi::{CStr, CString};
     use std::path::PathBuf;
@@ -5758,8 +5773,12 @@ mod tests_backend {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
         let clone = std::env::var("CLONE_INDEX").unwrap_or_else(|_| String::from("local"));
+        // `module_path!()` for the same reason the copy in `super::tests` carries it: the two
+        // modules compile into one binary and share 32 tags, so the module name is what keeps
+        // their file namespaces disjoint however the two counters line up.
+        let module = module_path!().replace("::", "_");
         std::env::temp_dir().join(format!(
-            "blitzy_libz_rs_gz_{clone}_{}_{tag}_{serial}.gz",
+            "blitzy_libz_rs_gz_{clone}_{}_{module}_{tag}_{serial}.gz",
             std::process::id()
         ))
     }
@@ -5886,29 +5905,50 @@ mod tests_backend {
     /// so a test that frees a low number and then asserts that `close(2)` on it FAILS is
     /// hostile to every other test in the binary: another thread's `open` is handed that
     /// number, this test's `close` therefore SUCCEEDS -- the assertion sees `Z_OK` where it
-    /// demanded `Z_ERRNO` -- and the other test loses its file underneath it. Measured
-    /// before this helper existed: the two tests that build that fixture failed together
-    /// in roughly two runs out of five, and under `AddressSanitizer`, which perturbs the
-    /// interleaving, the pair failed and then leaked the stream they could no longer close.
+    /// demanded `Z_ERRNO` -- and the other test loses its file underneath it. That is a
+    /// race between the two tests that build the fixture and every other test in the
+    /// binary, so it is intermittent by nature, and anything that perturbs the
+    /// interleaving -- `--test-threads`, a sanitizer -- changes how often it fires without
+    /// removing it. Relocating the descriptor removes the race instead of hiding it.
     ///
     /// `F_DUPFD` returns the lowest free descriptor **at or above** its argument, so the
     /// number handed over afterwards is far outside the range anything allocates naturally.
     /// It is used in preference to `dup2`, which would silently close whatever occupied the
     /// target. The fixture is not weakened: the number a caller is given is still one that
     /// was genuinely open and genuinely is not any more.
+    ///
+    /// ★ A FIXED floor is not enough, and the reason is this function's own callers. Two
+    /// tests use it, and a single floor puts both of them in the same range: one frees its
+    /// relocated number, the other's `F_DUPFD` is handed that very number because it is now
+    /// the lowest free one at or above the floor, and the first test's `close` then SUCCEEDS
+    /// where it demanded `EBADF`. That is the same race the paragraph above describes,
+    /// merely moved above the floor instead of removed, and it fires only when the two run
+    /// concurrently -- which is why a release run under load can fail while every
+    /// single-test and lightly loaded run passes. So each CALL takes a floor of its own from
+    /// the counter below: floors are handed out in ascending order, so a number freed under
+    /// one floor is never at or above a later one, and no two calls can be given the same
+    /// descriptor however they interleave.
     #[cfg(unix)]
     fn relocate_high(open_fd: c_int) -> c_int {
         /// Far above the handful of descriptors a test binary holds at once, and far below
         /// any plausible `RLIMIT_NOFILE`.
-        const FLOOR: c_int = 512;
+        const FIRST_FLOOR: i32 = 512;
+        /// Gap between successive floors. One would do, since each call keeps exactly one
+        /// descriptor; the gap is slack for a future helper that keeps a few.
+        const FLOOR_STRIDE: i32 = 8;
+
+        /// The next floor to hand out. Monotonic, so floors never repeat within a run.
+        static NEXT_FLOOR: AtomicI32 = AtomicI32::new(FIRST_FLOOR);
+
+        let floor = NEXT_FLOOR.fetch_add(FLOOR_STRIDE, Ordering::Relaxed);
 
         // SAFETY: a C call with no pointer arguments. `open_fd` is open and owned by the
         // caller, `F_DUPFD` only reads it, and the third argument is the `c_int` that
         // request expects.
-        let high = unsafe { libc::fcntl(open_fd, libc::F_DUPFD, FLOOR) };
+        let high = unsafe { libc::fcntl(open_fd, libc::F_DUPFD, floor) };
         assert!(
-            high >= FLOOR,
-            "F_DUPFD to a descriptor at or above {FLOOR}; is RLIMIT_NOFILE smaller than that?"
+            high >= floor,
+            "F_DUPFD to a descriptor at or above {floor}; is RLIMIT_NOFILE smaller than that?"
         );
         close_descriptor(open_fd);
         high
@@ -7365,10 +7405,10 @@ mod tests_backend {
     /// `Z_ERRNO`, exactly as C's `ret = close(state->fd); return ret ? Z_ERRNO : err;`
     /// does (`gzread.c` L665-L667).
     ///
-    /// [`Descriptor::close`] calls `close(2)` and forwards its result, so this is now the
-    /// same answer C reaches by the same route. An earlier revision had no descriptor of
-    /// its own -- it held a `std::fs::File`, whose `Drop` discards `close`'s status -- and
-    /// had to establish the condition indirectly with `fstat(2)` to avoid answering
+    /// [`Descriptor::close`] calls `close(2)` and forwards its result, so this is the same
+    /// answer C reaches by the same route. Holding a `std::fs::File` instead would not do:
+    /// its `Drop` discards `close`'s status, leaving the condition observable only
+    /// indirectly, through an `fstat(2)` probe, to avoid answering
     /// `Z_OK`; see `a_close_that_fails_is_reported_as_z_errno`, which covers the same
     /// ground through the public entry points.
     #[test]
@@ -7664,9 +7704,10 @@ mod tests_backend {
     /// ```
     ///
     /// So in the reference implementation `e` does nothing to an adopted descriptor on
-    /// Linux, and this asserts that it does nothing here either. An earlier revision
-    /// substituted `FD_CLOEXEC`, which made `e` work and made the two libraries differ; the
-    /// behaviour of the reference is the specification, so the substitution was reverted.
+    /// Linux, and this asserts that it does nothing here either. Substituting `FD_CLOEXEC`
+    /// would make `e` work -- and would make the two libraries differ. The behaviour of the
+    /// reference is the specification, however inadvertent it looks, so the substitution is
+    /// prohibited and this test is what keeps it out.
     /// [`apply_cloexec`] carries the same measurement.
     ///
     /// The negative case is load-bearing for a second reason: without `e` the descriptor
@@ -7808,12 +7849,12 @@ mod tests_backend {
 
     /// `gzerror` returns a pointer into the stream's own storage, allocating nothing.
     ///
-    /// ★ Two consecutive calls returning the *same* pointer is what makes this a test of
-    /// the fix rather than of the message: it can only hold if the text was built when the
+    /// ★ Two consecutive calls returning the *same* pointer is what makes this a test of the
+    /// storage rather than of the message: it can only hold if the text was built when the
     /// error was recorded, which is C's arrangement (`gzlib.c` L576-L584 allocates, L527
-    /// merely returns). The earlier revision built a terminated copy inside `gzerror`, so
-    /// the query itself could fail under memory pressure -- on the one call a caller makes
-    /// because something has already gone wrong.
+    /// merely returns). Building a terminated copy inside `gzerror` instead would let the
+    /// query itself fail under memory pressure -- on the one call a caller makes because
+    /// something has already gone wrong.
     #[test]
     fn gzerror_returns_stored_text_without_allocating() {
         let scratch = Scratch::new("gzerror_stored");

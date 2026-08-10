@@ -49,11 +49,11 @@
 //! # Throughput claims
 //!
 //! The design intent is that this backend beats `braid.rs` above its delegation threshold. That
-//! is intent, not a result: **no benchmark artifact is committed in this repository** -- the
-//! `benches/` directory does not exist -- so nothing here has been substantiated by a reproducible
-//! measurement. The planned `benches/checksum_bench.rs` is where the comparison belongs. If it
-//! turns out not to win, the honest resolution is to simplify or remove this optimization, never
-//! to weaken bit-for-bit equality.
+//! is intent, not a result: no measurement is committed in this repository, and a claim about
+//! throughput belongs to a run rather than to a comment. `benches/checksum_bench.rs` is where the
+//! comparison belongs, and it compares the scalar and vectorised backends against each other and
+//! against the C oracle. If this turns out not to win, the honest resolution is to simplify or
+//! remove this optimization, never to weaken bit-for-bit equality.
 
 // There is deliberately no `#![cfg(feature = "simd")]` here.  `crc32/mod.rs` already declares this
 // module as `#[cfg(feature = "simd")] mod simd;`, so restating the condition inside the file

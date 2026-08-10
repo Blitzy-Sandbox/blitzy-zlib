@@ -39,7 +39,6 @@ old/            makefiles for various architectures and zlib documentation
                 files that have not yet been updated for zlib 1.2.x
 os400/          makefiles for OS/400
 qnx/            makefiles for QNX
-rust/           developer guide for the Rust implementation
 watcom/         makefiles for OpenWatcom
 win32/          makefiles for Windows
 
@@ -80,4 +79,11 @@ See examples/README.examples
 See contrib/README.contrib
 
                 Rust source files used to build the Rust library
-See rust/README.md
+crates/zlib-rs/                 the safe core: every algorithm, forbid(unsafe_code), no deps
+crates/libz-rs-sys/             the C ABI facade: the exported extern "C" surface
+crates/zlib-rs-differential/    dev-only harness that diffs the port against the C sources
+benches/                        dev-only criterion suites, hosted by the harness above
+fuzz/                           dev-only cargo fuzz targets, its own workspace
+See README for the build commands and the Cargo feature matrix, Makefile.in for the
+rust, rust-test, rust-symbols, rust-header, rust-msrv and rust-clean targets, and
+.github/workflows/rust.yml for the gates that run all of them

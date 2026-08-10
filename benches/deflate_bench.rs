@@ -14,12 +14,29 @@
 //! mirroring the `mem_high` technique that `test/infcover.c` has already proven against this
 //! library's allocation patterns.
 //!
+//! ★ **What an automated run answers, and what it does not.** Those two questions are AAP §0.8.4's
+//! acceptance criteria, and AAP §0.6.4.6 reads the throughput figure from the multi-megabyte
+//! Silesia members. CI cannot supply those: AAP §0.6.4.4 requires CI to stay network-free and makes
+//! Silesia an opt-in tier fetched by a human through
+//! `crates/zlib-rs-differential/corpus/fetch_silesia.sh` with a pinned SHA-256. So the `bench` job
+//! in `.github/workflows/rust.yml` runs this suite over the **committed minimal corpus** only, and
+//! [`deflate_silesia`] prints a skip note there and contributes no gated case.
+//!
+//! That makes an automated run a **regression gate**, not the acceptance measurement: it catches a
+//! change that slows the port relative to the reference on kilobyte fixtures, on the same machine,
+//! in the same process. It does not establish the AAP §0.8.4 figure, because kilobyte inputs do not
+//! exercise the cache and window behaviour a multi-megabyte input does. Producing the acceptance
+//! number is a deliberate off-CI run with the corpus installed. Both readings are useful; citing
+//! the first as the second is the error this note exists to prevent.
+//!
 //! The idioms come from `benches/checksum_bench.rs`, which established them, and from
 //! `benches/inflate_bench.rs`, which added stream state: committed-corpus loading, named call
-//! gates that own a single `unsafe` block each, agreement checks taken strictly outside every
-//! timed region, `RAII` guards so no path can leak a stream, graceful skipping in place of
+//! gates that delegate to the harness crate's FFI boundary, agreement checks taken strictly outside
+//! every timed region, `RAII` guards so no path can leak a stream, graceful skipping in place of
 //! assertions, and the `zlib-rs` / `c-oracle` row labels. What this suite adds on top is the
-//! allocator instrumentation of [`AllocCounter`], which exists nowhere else in the workspace.
+//! per-stream footprint: it is the only file in the workspace that installs
+//! `zlib_rs_differential::port::TrackingAllocator` into a *timed* comparison's untimed companion
+//! pass, and it reads the high-water mark the AAP §0.8.4 memory gate is expressed in.
 //!
 //! # Why the gated levels are 1, 6 and 9
 //!
@@ -57,12 +74,18 @@
 //!
 //! # What is measured
 //!
-//! Ten group functions. Every throughput group pairs the port and the reference as two rows under
+//! Twelve group functions, and all twelve are listed below — the list and the `criterion_group!`
+//! registration at the foot of this file are the same twelve, in the same order, which is the only
+//! way to check the count without trusting this sentence. Two of them are not throughput groups at
+//! all (`deflate_memory` registers no criterion row, and `deflate_bound` measures a pure
+//! computation), so "twelve groups" is not twelve throughput comparisons.
+//!
+//! Every throughput group pairs the port and the reference as two rows under
 //! one benchmark id so that criterion prints them side by side, and every such row carries
 //! `Throughput::Bytes(uncompressed_len)` so the reported rate is *input* bytes per second — which
 //! is the quantity the gate is expressed in.
 //!
-//! * **`deflate_steady_state`** — ★ **this is the group the ≤10% throughput gate is read from.**
+//! * **`deflate_steady_state`** — ★ **this is the group the ≤10% throughput ratio is read from.**
 //!   One encoder is initialised once per row and `deflateReset` returns it to the start of a
 //!   stream between iterations, so what is timed is the encode plus the cheap half of the stream
 //!   lifecycle and *not* the allocator. Axis: each committed fixture at levels 1, 6 and 9.
@@ -111,8 +134,9 @@
 //!   group's throughput setting is sticky across rows, a zero-length row mixed into a throughput
 //!   group would silently inherit the previous row's divisor. Latency rows belong in a latency
 //!   group.
-//! * **`deflate_silesia`** — the gate measurement over the opt-in tier-2 corpus, skipped entirely
-//!   and with one clear note when that corpus is not present.
+//! * **`deflate_silesia`** — the acceptance measurement AAP §0.8.4 names, over the opt-in tier-2
+//!   corpus; skipped entirely and with one clear note when that corpus is not present, which is the
+//!   case in CI.
 //!
 //! # Provenance
 //!
@@ -190,15 +214,61 @@
 //! and one aggregate line per group:
 //!
 //! ```text
-//! deflate_bench: RATIO-SUMMARY group=<group> cases=<n> gated=<k> over=<m> informational=<i> limit=1.10
+//! deflate_bench: RATIO-SUMMARY group=<group> gate=authoritative|supporting|informational expected=<e> cases=<n> gated=<k> over=<m> informational=<i> limit=1.10
 //! ```
 //!
 //! The field order is fixed and the keys are stable. `bytes` is the uncompressed length, which is
 //! what the throughput is per. `verdict=over` marks a case slower than `limit`. `cases` is
 //! `gated + informational`, and **`over` counts only gated cases**, so a workflow that reads
-//! `over` from the `deflate_steady_state` summary line is reading exactly the AAP §0.8.4
-//! compression gate. The informational groups named above emit the same lines and are excluded
-//! from the gate by group name, not by suppressing their numbers.
+//! `over` from the `deflate_steady_state` summary line is reading the ≤10% limit over the fixtures
+//! the run could see, and nothing else. The informational groups named above emit the same lines and
+//! are excluded from the count by group name, not by suppressing their numbers.
+//!
+//! ★ **Which corpus produced them decides what they mean, and CI only ever sees tier 1.** AAP §0.8.4
+//! states the compression target over the Silesia corpus and AAP §0.6.4.6 reads it from that
+//! corpus's multi-megabyte members, which is the [`deflate_silesia`] group. The `bench` job of
+//! `.github/workflows/rust.yml` provisions no corpus -- CI is network-free -- so in CI that group
+//! skips and the summary lines the job gates come from the committed minimal corpus. Read a green CI
+//! run as "no regression against the in-process C oracle on the fixtures available"; the acceptance
+//! measurement AAP §0.8.4 names is taken by a human who has fetched Silesia first and then read the
+//! `deflate_silesia` summary line. The same distinction applies to the memory limit.
+//!
+//! ★ **`gate` and `expected` exist so the summary can be CHECKED and not merely read**, because
+//! `over=0` is what both a clean run and an empty run print.
+//!
+//! * `gate` says what this group's `over` entitles a consumer to do. `authoritative` means the
+//!   group measures the quantity AAP §0.8.4 bounds, in the configuration it bounds it in, and a
+//!   non-zero `over` is a verdict; that is [`GROUP_STEADY_STATE`] and [`GROUP_SILESIA`] and nothing
+//!   else. `supporting` means the comparison is real and counted but measures more or other than
+//!   that quantity — [`GROUP_LIFECYCLE`] includes `deflateInit2_`/`deflateEnd`, [`GROUP_CONTAINER`]
+//!   and [`GROUP_FEEDING`] vary an axis the gate holds fixed, [`GROUP_ONE_SHOT`] measures a
+//!   wrapper — so a regression there is a signal to read, not a gate to fail. `informational`
+//!   counts nothing at all. The classification lives in exactly one place,
+//!   [`RATIO_GROUP_POLICIES`], which is also what the `GATE-INVENTORY` line below is printed from.
+//! * `expected` is the number of cases the group set out to measure, computed from the same
+//!   iteration counts its loops use. `cases < expected` means cases were skipped and `expected=0`
+//!   means the group had nothing to measure — a corpus that was not there, a fixture that would not
+//!   load, or a filter that matched nothing. Requiring `cases == expected` and `expected > 0` on the
+//!   authoritative groups is what makes a green gate mean "the measurement happened".
+//!
+//! Every group named in `GATE-INVENTORY` emits **exactly one** summary line per run, including a
+//! group that had nothing to measure: [`deflate_silesia`] and [`deflate_memory`] print
+//! `expected=0 cases=0` rather than printing nothing. So a consumer can require one line per
+//! declared group and treat a missing or duplicated line as a failure, rather than having to decide
+//! what an absent line meant.
+//!
+//! Two further lines are printed once per run, before any group's:
+//!
+//! ```text
+//! deflate_bench: GATE-INVENTORY suite=deflate ratio_limit=1.10 memory_limit=1.15 min_bytes=4096 levels=1,6,9 authoritative_ratio=<csv> supporting_ratio=<csv> informational_ratio=<csv> authoritative_memory=<csv>
+//! deflate_bench: CRITERION root=<dir> port_label=zlib-rs oracle_label=c-oracle layout=<root>/<group>/<label>/<case>/new/estimates.json estimate=slope fallback=mean authority=criterion self_timed=diagnostic
+//! ```
+//!
+//! `GATE-INVENTORY` publishes the limits, the size floor, the gate's level axis and the exact group
+//! sets, so a consumer can assert that the set it is prepared to fail on is the set this run
+//! declares — and any drift on either side fails rather than silently widening or narrowing the
+//! gate. `CRITERION` publishes where the authoritative numbers landed and how they are keyed; see
+//! the note on which number decides, below.
 //!
 //! ★ `gate=informational` also separates a throughput comparison from a per-call-overhead
 //! comparison, and it is a statement about what the gate *means* rather than a way of avoiding it.
@@ -208,14 +278,26 @@
 //! bytes-per-second bound AAP §0.8.4 states, which AAP §0.6.4.6 reads from the multi-megabyte
 //! Silesia members.
 //!
-//! Two further properties of these numbers matter to anyone reading them:
+//! ★ **Which number decides.** The `RATIO` and `RATIO-SUMMARY` lines are a **diagnostic**, and a
+//! gate must not be built on them alone. The pass behind them is bounded to a few milliseconds per
+//! side, takes the minimum of three rounds, performs no outlier rejection and reports one figure
+//! rather than a confidence interval; it exists so that every case has a visible number beside it
+//! even when criterion is filtered, and it is precise enough to see a factor but not to defend one.
 //!
-//! * They are **indicative**, not authoritative. The pass is bounded to a few milliseconds per
-//!   side, takes the minimum of three rounds, and reports one figure rather than a confidence
-//!   interval. criterion's own estimate remains the authoritative measurement, and a regression
-//!   job that wants statistics should read it from
-//!   `target/criterion/<group>/<label>/<case>/new/estimates.json` — note that a
-//!   `BenchmarkId::new(label, case)` becomes *two* path components under the group, not one.
+//! * **These lines are what CI gates on; criterion's estimate is the stronger measurement.** Those
+//!   are two different senses of "authoritative" and conflating them has misled readers of this
+//!   file before, so both halves are stated outright. The `bench` job in
+//!   `.github/workflows/rust.yml` parses the `RATIO-SUMMARY` and `MEMORY-SUMMARY` lines emitted
+//!   here and fails the build from `over`; it reads nothing under `target/criterion/`, and it fails
+//!   outright if no summary line was produced, so a run that measured nothing cannot report
+//!   success. **Statistically, though, these figures are the weaker of the two**: the pass is
+//!   bounded to a few milliseconds per side, takes the minimum of three rounds, and reports one
+//!   figure rather than a confidence interval. criterion's own estimate is the rigorous
+//!   measurement and nothing gates on it — a regression job that wants statistics should read it
+//!   from `target/criterion/<group>/<label>/<case>/new/estimates.json`, noting that a
+//!   `BenchmarkId::new(label, case)` becomes *two* path components under the group, not one. The
+//!   consequence to keep in mind when reading a green run: it means no summary ratio exceeded its
+//!   limit, not that a statistically significant regression has been ruled out.
 //! * They are measured **before** the criterion rows for the same case, so the calibration also
 //!   serves as an identical warm-up for both sides.
 //!
@@ -223,24 +305,34 @@
 //!
 //! AAP §0.8.4 bounds per-stream memory at 115% of the reference and AAP §0.6.4.6 names the
 //! measurement technique: an instrumented `zalloc` counter, "the same technique `test/infcover.c`
-//! already uses via `mem_high` for high-water tracking". [`AllocCounter`] is that counter and
-//! [`tracked_alloc`] / [`tracked_free`] are the hooks; both sides get their own instance, since
-//! the two implementations' `alloc_func` and `free_func` aliases resolve to the same underlying
-//! `extern "C"` signature.
+//! already uses via `mem_high` for high-water tracking".
+//! `zlib_rs_differential::port::TrackingAllocator` is that counter -- a transcription of that same
+//! `mem_zone` -- and its `zalloc`/`zfree` hooks are what each stream is given. Both sides get their
+//! own instance, and one hook pair serves both because the two implementations' `alloc_func` and
+//! `free_func` aliases resolve to the same underlying `extern "C"` signature.
 //!
 //! ```text
 //! deflate_bench: MEMORY group=<group> case=<case> port_bytes=<n> oracle_bytes=<n> ratio=<f> limit=1.15 verdict=within|over
-//! deflate_bench: MEMORY-SUMMARY group=<group> cases=<n> over=<m> limit=1.15
-//! deflate_bench: ALLOC-BALANCE side=<label> case=<case> allocations=<n> frees=<n> live_bytes=<n> notlifo=<n> rogue=<n> verdict=clean|dirty
+//! deflate_bench: MEMORY-SUMMARY group=<group> gate=authoritative expected=<e> cases=<n> over=<m> dirty=<d> limit=1.15
+//! deflate_bench: ALLOC-BALANCE side=<label> case=<case> allocations=<n> frees=<n> live_bytes=<n> notlifo=<n> rogue=<n> refusals=<n> verdict=clean|dirty
 //! ```
 //!
+//! `gate` and `expected` carry the same meaning as on the throughput summary, and `gate` is the
+//! constant `authoritative` because this group measures nothing but the quantity the AAP bounds.
+//! `ALLOC-BALANCE` carries `side` and `case` but no `group`, because there is one memory group: a
+//! consumer pairs each `MEMORY` line's `case` with the two `ALLOC-BALANCE` lines for that case, one
+//! per side, and a case with fewer than two is a truncated run.
+//!
 //! `port_bytes` and `oracle_bytes` are high-water marks in bytes, `ratio` is `port / oracle`, and
-//! a workflow reads `over` from the `MEMORY-SUMMARY` line exactly as it reads the throughput gate
+//! a workflow reads `over` from the `MEMORY-SUMMARY` line exactly as it reads the throughput limit
 //! from `RATIO-SUMMARY`. The `ALLOC-BALANCE` line is emitted once per side per case and is the
 //! leak check: `verdict=dirty` means `deflateEnd` did not return every block, or a block came back
 //! out of order, or a pointer this counter never handed out was freed through it. A leak here
-//! would also surface in the nightly `AddressSanitizer` job, which is the verification gate this
-//! crate does sit inside.
+//! would also surface under `AddressSanitizer` if this file were run under it -- but it is not:
+//! that job is scoped to `-p libz-rs-sys` and the three relinked C drivers and does not select
+//! `zlib-rs-differential` or the benches attached to it, and Miri cannot execute the C oracle at
+//! all. This `ALLOC-BALANCE` line is therefore the only leak check covering this file, which is
+//! exactly why it is emitted per side per case rather than left implicit.
 //!
 //! ★ **The tracked pass is never inside a timed region.** The counter maintains a registry and
 //! fills every block with `0xa5`, both of which cost time; letting that bookkeeping into a
@@ -357,10 +449,32 @@
 //! naming `crates/zlib-rs-differential/corpus/fetch_silesia.sh`, skips the Silesia group, and the
 //! run still succeeds.
 //!
+//! Every run says which of those happened, in one line a consumer can read:
+//!
+//! ```text
+//! deflate_bench: SILESIA verdict=complete|incomplete|absent|salvaged found=<n> of=12 required=yes|no dir=<path>
+//! ```
+//!
+//! Only `verdict=complete` is the corpus AAP §0.8.4 names — all twelve pinned members present under
+//! one directory. `incomplete` measures the members that are there, `salvaged` measures other
+//! readable files because none of the pinned twelve was found, and `absent` measures nothing.
+//!
+//! ★ **`ZLIB_RS_SILESIA_REQUIRED=1` turns the last three into failures**, and exists because a
+//! skip is the wrong outcome for exactly one caller: a job that has just provisioned the corpus in
+//! order to produce the AAP §0.8.4 acceptance number. For that job, a skipped group is not a pass —
+//! it is the headline measurement quietly not happening, with a green tick on top. Armed, this file
+//! refuses absence, refuses a partial inventory and refuses the salvage path, and it fails the run
+//! saying which and naming the remedy. Unset — the default, and what `cargo bench` and every job
+//! that has provisioned nothing get — the behaviour is unchanged and the run exits zero, which is
+//! what AAP §0.6.4.4 requires. The flag never fetches anything; it only decides whether absence is
+//! tolerable.
+//!
 //! **Nothing here touches the network, spawns a process, or executes that script.** AAP §0.6.4.4
 //! requires `cargo test` and CI to be network-free, and `corpus/README.md` states that the script
-//! is invoked by a human and by nothing else — it is referenced by no manifest, no build script,
-//! no test and no workflow, and this file keeps it that way. No crate is introduced for any of
+//! is invoked by a human and by nothing else — no manifest, no build script, no test and no
+//! workflow *runs* it, and this file keeps it that way. Several of them name it, this file
+//! included, because the note printed when the corpus is absent has to say where to get it; being
+//! named is not being invoked. No crate is introduced for any of
 //! this either: `std::fs`, `std::path` and `std::alloc` suffice.
 //!
 //! # Hygiene
@@ -391,20 +505,19 @@
 //! LP64 but four on LLP64 Windows (AAP §0.6.3.3), so that is a portability requirement rather
 //! than a style preference.
 
-// `unsafe_op_in_unsafe_fn` is denied here for the same reason `crates/libz-rs-sys` denies it: the
-// two allocator hooks below are `unsafe extern "C" fn` items, and without this attribute their
-// bodies would be implicitly unsafe, an inner `unsafe` block would be flagged as unnecessary, and
-// the `// SAFETY:` comment the workspace's `undocumented_unsafe_blocks` deny-level lint requires
-// would have nowhere to attach. With it, every unsafe operation in this file — in a safe function
-// or an unsafe one — sits inside an explicitly scoped block that carries its invariant.
-#![deny(unsafe_op_in_unsafe_fn)]
+// Every FFI call this file makes -- both implementations' entry points and the instrumented
+// allocator's hooks -- goes through a gate in `crate::port` or `oracle`, so nothing here needs
+// `unsafe` and the compiler is asked to keep it that way. The allocator hooks in particular are
+// `unsafe extern "C" fn` items and used to be defined here; they now live in
+// `crates/zlib-rs-differential/src/port.rs`, which is why this file no longer needs
+// `deny(unsafe_op_in_unsafe_fn)` either -- `forbid(unsafe_code)` is strictly stronger.
+#![forbid(unsafe_code)]
 
-use core::ffi::{c_char, c_int, c_uint, c_void};
-use core::mem::{align_of, size_of};
-use std::alloc::{alloc, dealloc, Layout};
-use std::ffi::{CStr, OsStr};
+use core::ffi::c_int;
+use std::ffi::OsStr;
 use std::fs;
 use std::hint::black_box;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Once, OnceLock};
 use std::time::{Duration, Instant};
@@ -432,7 +545,7 @@ use libz_rs_sys::{
 // The C reference. Every name here is declared in exactly one place --
 // `crates/zlib-rs-differential/src/oracle.rs` -- and this file adds no `extern "C"` block and no
 // `#[link]` attribute of its own.
-use zlib_rs_differential::oracle;
+use zlib_rs_differential::{oracle, port};
 
 // =================================================================================================
 //  Row labels
@@ -472,6 +585,12 @@ const MEMORY_SUMMARY_KEY: &str = "MEMORY-SUMMARY";
 
 /// The greppable per-side allocator balance line's leading key -- the leak check.
 const BALANCE_KEY: &str = "ALLOC-BALANCE";
+
+/// The key of the once-per-run line that publishes the gate's identity, limits and group sets.
+const INVENTORY_KEY: &str = "GATE-INVENTORY";
+
+/// The key of the once-per-run line that publishes where criterion's authoritative numbers are.
+const CRITERION_KEY: &str = "CRITERION";
 
 // =================================================================================================
 //  The two gates
@@ -910,12 +1029,45 @@ fn minimal_corpus_dir() -> PathBuf {
 
 /// The repository root, which is `<CARGO_MANIFEST_DIR>/../..`.
 ///
-/// The only consumer is [`silesia_dir`]'s default branch. Kept as its own named function because the
-/// two `..` components are the other half of the `CARGO_MANIFEST_DIR` surprise described on
-/// [`minimal_corpus_dir`], and a reader should find both facts stated once each rather than inlined
-/// at a use site.
+/// Consumed by [`silesia_dir`]'s default branch and by [`criterion_root`]. Kept as its own named
+/// function because the two `..` components are the other half of the `CARGO_MANIFEST_DIR` surprise
+/// described on [`minimal_corpus_dir`], and a reader should find both facts stated once each rather
+/// than inlined at a use site.
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+}
+
+/// Where criterion writes its reports, by criterion's own resolution rule.
+///
+/// Published on the `CRITERION` line so that a consumer reading the authoritative estimates does not
+/// have to reimplement this. Criterion's `default_output_directory` takes the first of:
+///
+/// 1. `$CRITERION_HOME`, when set and non-empty.
+/// 2. `$CARGO_TARGET_DIR/criterion`, when that is set and non-empty.
+/// 3. The `target_directory` cargo reports for the workspace, with `criterion` appended -- which for
+///    this workspace is `<repo-root>/target/criterion`.
+///
+/// Step 3 is reproduced from [`repository_root`] rather than by shelling out to `cargo metadata`: a
+/// benchmark must not spawn a build tool, and the two agree for any invocation that builds this file,
+/// because the manifest that declares this bench target lives in that workspace. An empty value
+/// counts as unset in both steps, matching the `${VAR:-}` reading used everywhere else here.
+fn criterion_root() -> PathBuf {
+    for (var, suffix) in [
+        ("CRITERION_HOME", None),
+        ("CARGO_TARGET_DIR", Some("criterion")),
+    ] {
+        if let Ok(value) = std::env::var(var) {
+            if !value.is_empty() {
+                let base = PathBuf::from(value);
+                return match suffix {
+                    Some(tail) => base.join(tail),
+                    None => base,
+                };
+            }
+        }
+    }
+
+    repository_root().join("target").join("criterion")
 }
 
 /// One loaded input: the name a benchmark id will carry, and the bytes to compress.
@@ -1044,9 +1196,168 @@ const SILESIA_MEMBERS: [&str; 12] = [
     "dickens", "mozilla", "mr",      "nci",     "ooffice", "osdb",
     "reymont", "sao",     "samba",   "webster", "x-ray",   "xml",
 ];
+/// The environment variable that turns the corpus from optional into required.
+///
+/// Unset, or set to an empty value, `0`, `no` or `false`, this file behaves exactly as it always has:
+/// a missing corpus is reported, the tier-2 group is skipped and the run exits zero, which is what
+/// AAP §0.6.4.4 requires of `cargo bench` and of a CI job that has not provisioned anything.
+///
+/// Set to `1`, `yes` or `true`, absence becomes a failure. That is the mode a job uses when it has
+/// just provisioned the corpus and is measuring the AAP §0.8.4 acceptance number: in that job a skip
+/// is not a success, it is the measurement silently not happening, and the job would go green having
+/// proved nothing about the corpus the AAP names. Arming it also refuses the two weaker outcomes --
+/// an incomplete pinned inventory, and the salvage path over arbitrary files -- because a number
+/// measured over eight of the twelve members, or over whatever else was in the directory, is not the
+/// number that gate is about.
+const SILESIA_REQUIRED_VAR: &str = "ZLIB_RS_SILESIA_REQUIRED";
+
+/// The key of the line that states what happened to the corpus, for a consumer to read.
+const SILESIA_KEY: &str = "SILESIA";
 
 /// The environment variable that overrides where the Silesia corpus lives.
 const SILESIA_DIR_VAR: &str = "ZLIB_RS_SILESIA_DIR";
+
+/// The largest single member this suite will load into memory, in bytes: 64 MiB.
+///
+/// ★ Nothing about the tier-2 input is pinned by the time it reaches [`fs::read`], and that is the
+/// problem this constant exists to bound. [`SILESIA_DIR_VAR`] is caller-supplied, and
+/// [`salvage_silesia_dir`] deliberately accepts *any* readable non-hidden regular file when none of
+/// the twelve pinned names is present -- a design that makes a hand-populated directory usable, and
+/// simultaneously means the bytes are whatever happens to be sitting there. Point the variable at a
+/// directory holding a VM image, a core dump or a rotated log and the loop below would hand each
+/// file whole to `fs::read`, which allocates the entire length before anything is in a position to
+/// object. The failure mode is an out-of-memory kill in the middle of a benchmark run, reported as
+/// a dead process rather than as the bad input it is.
+///
+/// 64 MiB is chosen against the corpus, not picked round. `corpus/README.md`'s inventory and
+/// `corpus/fetch_silesia.sh` document the collection as roughly 65 MiB compressed expanding to a few
+/// hundred megabytes, and its largest member -- `mozilla` -- is about 48.9 MiB. A 64 MiB ceiling
+/// therefore admits every pinned member in full, with about a third again in headroom, while
+/// refusing anything an order of magnitude outside the family. No pinned measurement changes because
+/// of it: the AAP §0.8.4 Silesia numbers are produced from exactly the same bytes as before.
+///
+/// Note what this is *not*. It is not a security boundary -- the corpus is fetched by a human who
+/// accepts its terms, and `fetch_silesia.sh` owns authenticity through its digest pin. It is a
+/// resource bound, in the same spirit as [`salvage_silesia_dir`]'s existing twelve-file cap: that
+/// one stops a directory of thousands of files from turning a benchmark into an afternoon, and this
+/// one stops a single enormous file from turning it into an OOM.
+const SILESIA_MAX_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The environment variable that raises or lowers [`SILESIA_MAX_MEMBER_BYTES`].
+///
+/// A developer deliberately measuring one large local file should be able to say so, explicitly and
+/// in one place, rather than editing the source. `benches/inflate_bench.rs` reads the same variable.
+const SILESIA_MAX_MEMBER_VAR: &str = "ZLIB_RS_SILESIA_MAX_MEMBER_BYTES";
+
+/// The per-member ceiling in force for this process, resolved once.
+///
+/// A value that does not parse, or parses as zero, is reported and ignored in favour of the default.
+/// Honouring a zero would skip every member and leave a run that printed throughput yesterday
+/// silently printing nothing today -- the opposite of what a diagnostic should do.
+fn silesia_member_ceiling() -> u64 {
+    static CACHE: OnceLock<u64> = OnceLock::new();
+
+    *CACHE.get_or_init(|| match std::env::var(SILESIA_MAX_MEMBER_VAR) {
+        Ok(value) if value.is_empty() => SILESIA_MAX_MEMBER_BYTES,
+        Ok(value) => match value.parse::<u64>() {
+            Ok(0) | Err(_) => {
+                eprintln!(
+                    "{LOG_PREFIX} {SILESIA_MAX_MEMBER_VAR}={value:?} is not a positive byte count \
+                     -- using the default ceiling of {SILESIA_MAX_MEMBER_BYTES} bytes."
+                );
+                SILESIA_MAX_MEMBER_BYTES
+            }
+            Ok(parsed) => {
+                eprintln!(
+                    "{LOG_PREFIX} Silesia per-member ceiling set to {parsed} bytes by \
+                     {SILESIA_MAX_MEMBER_VAR} (default {SILESIA_MAX_MEMBER_BYTES})."
+                );
+                parsed
+            }
+        },
+        Err(_) => SILESIA_MAX_MEMBER_BYTES,
+    })
+}
+
+/// One Silesia member's bytes, or [`None`] with one note saying precisely why it was skipped.
+///
+/// The order of operations is the point. [`fs::metadata`] is consulted **before** any read, so an
+/// oversized member costs one `stat` and is refused without a byte being allocated. The read that
+/// follows is then itself bounded by [`Read::take`] rather than trusting the length it was just
+/// told: metadata is authoritative for ordinary files, but a character device or a `/proc`-style
+/// pseudo-file reports zero and yields arbitrarily much, and `fs::read` would follow it as far as it
+/// went. Taking `ceiling + 1` bytes makes the bound hold for every file type while still leaving
+/// one byte of evidence that the limit was exceeded rather than exactly reached.
+///
+/// Every rejection is a named skip and the caller continues, which is this file's established
+/// posture for tier 2: a missing, empty or unreadable member is a note and the run exits zero,
+/// because tier 1 carries every correctness and gate measurement.
+fn silesia_member_bytes(path: &Path, name: &str) -> Option<Vec<u8>> {
+    let ceiling = silesia_member_ceiling();
+
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.len() > ceiling => {
+            eprintln!(
+                "{LOG_PREFIX} skipping Silesia member {name}: it is {} bytes, above the \
+                 {ceiling}-byte per-member ceiling, so it is not being read. The pinned corpus's \
+                 largest member is about 48.9 MiB and fits comfortably; raise \
+                 {SILESIA_MAX_MEMBER_VAR} if you mean to measure a file this large.",
+                metadata.len()
+            );
+            return None;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!(
+                "{LOG_PREFIX} skipping Silesia member {name}: cannot stat {}: {error}",
+                path.display()
+            );
+            return None;
+        }
+    }
+
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!(
+                "{LOG_PREFIX} skipping Silesia member {name}: cannot read {}: {error}",
+                path.display()
+            );
+            return None;
+        }
+    };
+
+    // `ceiling + 1` is what distinguishes "at the limit" from "past it", and the saturating add
+    // keeps a caller-supplied `u64::MAX` ceiling from wrapping to zero.
+    let mut bytes = Vec::new();
+    if let Err(error) = file.take(ceiling.saturating_add(1)).read_to_end(&mut bytes) {
+        eprintln!(
+            "{LOG_PREFIX} skipping Silesia member {name}: cannot read {}: {error}",
+            path.display()
+        );
+        return None;
+    }
+
+    // Reached only by a file whose metadata understated it -- the pseudo-file case above.
+    if bytes.len() as u64 > ceiling {
+        eprintln!(
+            "{LOG_PREFIX} skipping Silesia member {name}: it yielded more than the \
+             {ceiling}-byte per-member ceiling despite reporting a smaller size, so it is not an \
+             ordinary file this suite can measure."
+        );
+        return None;
+    }
+
+    if bytes.is_empty() {
+        eprintln!(
+            "{LOG_PREFIX} skipping Silesia member {name}: it is empty, and a zero-byte case has \
+             no rate to report."
+        );
+        return None;
+    }
+
+    Some(bytes)
+}
 
 /// Where to obtain the corpus, quoted in the skip note so a reader does not have to go looking.
 const SILESIA_SCRIPT: &str = "crates/zlib-rs-differential/corpus/fetch_silesia.sh";
@@ -1093,6 +1404,7 @@ fn silesia_members() -> &'static [PathBuf] {
 
     CACHE.get_or_init(|| {
         let dir = silesia_dir();
+        let required = silesia_required();
 
         let canonical: Vec<PathBuf> = SILESIA_MEMBERS
             .iter()
@@ -1100,18 +1412,30 @@ fn silesia_members() -> &'static [PathBuf] {
             .filter(|path| path.is_file())
             .collect();
 
-        if !canonical.is_empty() {
+        let found = canonical.len();
+        let total = SILESIA_MEMBERS.len();
+
+        if found == total {
+            report_silesia(&dir, "complete", found, required);
+            return canonical;
+        }
+
+        if found > 0 {
+            report_silesia(&dir, "incomplete", found, required);
             eprintln!(
-                "{LOG_PREFIX} Silesia: {} of the {} pinned members found under {}.",
-                canonical.len(),
-                SILESIA_MEMBERS.len(),
+                "{LOG_PREFIX} Silesia: {found} of the {total} pinned members found under {} -- \
+                 measuring those. The missing members are named by {SILESIA_SCRIPT} --verify-only.",
                 dir.display()
             );
+            if required {
+                refuse_silesia(&dir, "incomplete", found);
+            }
             return canonical;
         }
 
         let salvaged = salvage_silesia_dir(&dir);
         if salvaged.is_empty() {
+            report_silesia(&dir, "absent", 0, required);
             eprintln!(
                 "{LOG_PREFIX} Silesia not present under {} -- skipping the tier-2 group. This is \
                  normal and not an error: tier 1 covers every correctness gate and this run exits \
@@ -1120,10 +1444,87 @@ fn silesia_members() -> &'static [PathBuf] {
                  {SILESIA_DIR_VAR} at a directory that already holds it.",
                 dir.display()
             );
+            if required {
+                refuse_silesia(&dir, "absent", 0);
+            }
+            return salvaged;
+        }
+
+        report_silesia(&dir, "salvaged", 0, required);
+        if required {
+            refuse_silesia(&dir, "salvaged", 0);
         }
 
         salvaged
     })
+}
+
+/// Whether the corpus is required rather than optional, from [`SILESIA_REQUIRED_VAR`].
+///
+/// `1`, `yes` and `true` in any case arm it; unset, empty, `0`, `no` and `false` do not. Any other
+/// value is reported and treated as not armed, because silently reading an unrecognised value as
+/// "required" would turn a typo into a failing job, and reading it as "optional" without saying so
+/// would turn a typo into a job that proves nothing.
+fn silesia_required() -> bool {
+    let Ok(value) = std::env::var(SILESIA_REQUIRED_VAR) else {
+        return false;
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "yes" | "true" => true,
+        "" | "0" | "no" | "false" => false,
+        other => {
+            eprintln!(
+                "{LOG_PREFIX} {SILESIA_REQUIRED_VAR}={other:?} is not one of 1/yes/true or \
+                 0/no/false, so the corpus is treated as OPTIONAL. Set it to 1 to require the \
+                 corpus."
+            );
+            false
+        }
+    }
+}
+
+/// Print the one machine-readable line that says what happened to the corpus.
+///
+/// Always printed, in every outcome including the ordinary absent one, so that a consumer never has
+/// to infer the corpus state from the presence or absence of a group. `verdict` is one of `complete`,
+/// `incomplete`, `absent` or `salvaged`, and only `complete` is the corpus AAP §0.8.4 names.
+fn report_silesia(dir: &Path, verdict: &str, found: usize, required: bool) {
+    eprintln!(
+        "{LOG_PREFIX} {SILESIA_KEY} verdict={verdict} found={found} of={total} required={required} \
+         dir={dir}",
+        total = SILESIA_MEMBERS.len(),
+        required = if required { "yes" } else { "no" },
+        dir = dir.display(),
+    );
+}
+
+/// Fail the run, because the corpus was required and is not the pinned twelve.
+///
+/// A panic, and deliberately: this is the one place in this file that is allowed to stop the process,
+/// and it stops it because continuing would produce a green run whose headline measurement never
+/// happened. It is reachable only when a caller has explicitly set [`SILESIA_REQUIRED_VAR`], so the
+/// default `cargo bench` path -- and every CI job that has not provisioned the corpus -- still skips
+/// and exits zero exactly as AAP §0.6.4.4 requires. The message names the remedy rather than only the
+/// problem.
+///
+/// `clippy::panic` is denied workspace-wide and is allowed here for that single deliberate use, in the
+/// same shape the rest of the workspace uses for a deliberate abort. The alternative spellings are
+/// worse: `process::exit` is denied too and would skip every destructor, and returning an empty member
+/// list is precisely the silent success this function exists to prevent.
+#[allow(clippy::panic)]
+fn refuse_silesia(dir: &Path, verdict: &str, found: usize) -> ! {
+    panic!(
+        "{SILESIA_REQUIRED_VAR} is set, so the Silesia corpus is required, and it is {verdict}: \
+         {found} of the {total} pinned members are present under {dir}. This is the corpus AAP \
+         §0.8.4 names for the throughput gate, so a run that skips it, measures part of it, or \
+         measures other files instead cannot produce that number. Provision it with {SILESIA_SCRIPT} \
+         (which verifies a SHA-256 over the archive and over every member), point \
+         {SILESIA_DIR_VAR} at a directory that already holds the twelve, or unset \
+         {SILESIA_REQUIRED_VAR} to go back to skipping.",
+        total = SILESIA_MEMBERS.len(),
+        dir = dir.display(),
+    )
 }
 
 /// Up to twelve readable regular files from `dir`, sorted, when none of the pinned members is there.
@@ -1178,43 +1579,25 @@ fn salvage_silesia_dir(dir: &Path) -> Vec<PathBuf> {
 //  throughput figure for work that was never done. `uLong` is `c_ulong` -- eight bytes on LP64, four
 //  on LLP64 Windows (AAP §0.6.3.3) -- so this is portability rather than pedantry.
 
-/// `(int) sizeof(T)`, where `T` is **that side's own** `z_stream` mirror.
-///
-/// This is the second half of the handshake the `deflateInit2` macro arranges (`zlib.h`
-/// L1935-L1938) and it must never be crossed between sides:
-/// `zlib_rs_differential::oracle::z_stream` and the facade's `z_stream` are distinct Rust types that
-/// happen to have identical layout, and each library compares the number it is given against its
-/// *own* `sizeof`.
-///
-/// Checked rather than cast. On the impossible failure -- a `z_stream` larger than `INT_MAX`, which
-/// would mean the ABI mirror had grown past anything `zlib.h` could describe -- it yields 0, and
-/// every `*Init*_` entry point rejects 0 with `Z_VERSION_ERROR` because 0 cannot equal
-/// `sizeof(z_stream)`. That is a self-reporting fallback rather than a panic, which is what a
-/// benchmark should have.
-fn stream_size<T>() -> c_int {
-    c_int::try_from(size_of::<T>()).unwrap_or(0)
-}
-
-/// The version string both `deflateInit2_` calls are given: `ZLIB_VERSION` from `zlib.h` L44,
-/// verbatim.
-///
-/// This is precisely what the C macro passes -- the *caller's* compile-time constant -- so passing it
-/// to the oracle exercises the reference's real major-version check rather than side-stepping it. It
-/// is a `&CStr` constant with static storage duration, so `as_ptr` yields a `NUL`-terminated pointer
-/// that outlives every call; nothing allocates a `CString`.
-///
-/// Be precise about what that check is, because it is narrower than it looks. `deflate.c` L394
-/// compares **only `version[0]`** -- the major digit -- against the library's own. So a wrong major
-/// such as `"2.3.2.1-motley"` makes every `deflateInit2_` answer `Z_VERSION_ERROR` (−6), while the
-/// shorthand `"1.3.2"` is *accepted* because its major digit agrees. The shorthand is still wrong,
-/// for a different reason: it is not the string this library reports, and `zlibVersion` and the
-/// `test/example.c` startup check are about identity rather than about the init gate. Passing the
-/// `zlib.h` L44 constant verbatim is what a real caller does and is the only spelling that is right
-/// on both counts. [`report_configuration`] prints the reference's own `c_zlibVersion()` beside this
-/// constant so that a drift is visible in the output rather than only in a failure.
-fn version_ptr() -> *const c_char {
-    ZLIB_VERSION.as_ptr()
-}
+//  The `sizeof(z_stream)` half of each `deflateInit2_` handshake is not spelled in this file at all:
+//  the boundary gate for each side supplies its own mirror's `size_of`, which is what makes crossing
+//  the two impossible rather than merely discouraged. They are distinct Rust types with identical
+//  layout, and each library compares the number it is given against its own `sizeof`.
+//
+//  The version string both sides are given is `ZLIB_VERSION` from `zlib.h` L44, passed verbatim
+//  through the `_with_version` gate on each side. That is precisely what the C macro passes -- the
+//  *caller's* compile-time constant -- so handing it to the reference exercises the reference's real
+//  major-version check rather than side-stepping it.
+//
+//  Be precise about what that check is, because it is narrower than it looks. `deflate.c` L394
+//  compares ONLY `version[0]` -- the major digit -- against the library's own. So a wrong major such
+//  as `"2.3.2.1-motley"` makes every `deflateInit2_` answer `Z_VERSION_ERROR` (-6), while the
+//  shorthand `"1.3.2"` is *accepted* because its major digit agrees. The shorthand is still wrong,
+//  for a different reason: it is not the string this library reports, and `zlibVersion` and the
+//  `test/example.c` startup check are about identity rather than about the init gate. Passing the
+//  `zlib.h` L44 constant verbatim is what a real caller does and is the only spelling that is right
+//  on both counts. [`report_configuration`] prints the reference's own `c_zlibVersion()` beside it so
+//  that a drift is visible in the output rather than only in a failure.
 
 /// The outcome of one encode: the status the library returned and how many bytes it produced.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1236,8 +1619,8 @@ struct Encode {
 /// `MaybeUninit::zeroed`, which is both stricter and cheaper: it needs no `unsafe`, and it makes the
 /// three members that actually carry meaning visible as the deliberate choices they are. `None` is
 /// C's `Z_NULL` for the two hooks, which selects the library's own internal allocator -- and that is
-/// what every throughput group wants, because the instrumented allocator of [`AllocCounter`] is only
-/// ever installed by the untimed memory pass.
+/// what every throughput group wants, because the instrumented allocator is only ever installed by
+/// the untimed memory pass.
 ///
 /// `crates/libz-rs-sys` deliberately does not implement `Default` for `z_stream`, on the grounds
 /// that a zeroed stream is not yet a valid one; this function is the local spelling of the same
@@ -1309,380 +1692,64 @@ fn install_oracle(strm: &mut oracle::z_stream, input: &[u8], out: &mut [u8]) {
 //  The instrumented allocator -- the memory gate's instrument
 // =================================================================================================
 //
-//  A transcription of `test/infcover.c` L56-L200 rather than a reinvention of it, because that
-//  allocator is already proven against this library's allocation patterns and AAP §0.6.4.6 names it
-//  as the technique. What is kept:
+//  The ledger itself is not written here. `zlib_rs_differential::port::TrackingAllocator` is a
+//  transcription of `test/infcover.c` L56-L200 -- the technique AAP §0.6.4.6 names -- and it is
+//  where the `zalloc`/`zfree` hooks and their `unsafe` live, so this file installs it rather than
+//  duplicating it. What it provides, and what this file relies on:
 //
-//    * `len = count * (size_t) size` (L76), computed with `checked_mul` here because Rust will not
-//      silently wrap;
+//    * `len = count * (size_t) size` (L76), computed with `checked_mul`, answering `NULL` -- zlib's
+//      documented allocation-failure signal -- if it would wrap;
 //    * `malloc` then `memset(ptr, 0xa5, len)` (L84-L87) -- deliberately NON-zero, so that any code
-//      path assuming zero-initialised memory is exposed. This is the whole point of the fill and it
-//      costs nothing;
-//    * the registry, the head-first search, and the `notlifo` / `rogue` tallies (L98-L150);
+//      path assuming zero-initialised memory is exposed rather than passing by luck;
+//    * the registry, the newest-first search, and the `notlifo` / `rogue` tallies (L98-L150);
 //    * `total` and `highwater` (L103-L105), which is what `mem_high` (L192-L197) reports and what
-//      this file compares against the 1.15x gate;
-//    * the installation order of `mem_setup` (L158-L173): `opaque` first, then `zalloc`, then
-//      `zfree`, and all three BEFORE `deflateInit2_`.
+//      this file compares against the 1.15x gate, read back through
+//      [`port::TrackingReport::high_water`].
 //
-//  What differs, and why:
+//  Two properties of the installation are this file's own, because no signature can express them:
 //
-//    * `mem_limit` (L176-L181) is absent. Its purpose is to force `Z_MEM_ERROR` at a controlled
-//      point, which is a coverage technique for the error paths of `test/infcover.c` and has no
-//      place in a measurement -- a stream that failed to allocate has no footprint to compare.
-//    * `malloc`/`free` are replaced by `std::alloc::alloc`/`dealloc`, because AAP §0.7.1(i) forbids
-//      adding `libc` to reach the C allocator and the Rust global allocator is the honest
-//      equivalent. `dealloc` needs the `Layout` the block was created with, which C's `free` does
-//      not, so the block carries its own payload length in a header -- see [`BLOCK_HEADER`].
-//    * The registry is a `Vec` rather than an intrusive linked list. Same semantics, since the
-//      "head" of `infcover`'s list is the most recent allocation and the last element of a `Vec`
-//      pushed at the end is the same thing.
+//    * the ORDER of `mem_setup` (L158-L173) -- `opaque`, then `zalloc`, then `zfree`, and all three
+//      BEFORE `deflateInit2_`, because the init call makes the very first allocation request through
+//      them and installing them afterwards would leave the state block untracked and the high-water
+//      mark short by the largest single allocation the stream makes;
+//    * the LIFETIME -- the tracker is declared before the stream guard, so Rust's reverse drop order
+//      ends the stream while the ledger is still alive, and `end()` is called explicitly before the
+//      balance is read.
+//
+//  The same allocator serves both sides. `libz_rs_sys::alloc_func` and
+//  `zlib_rs_differential::oracle::alloc_func` are not merely compatible, they are the SAME Rust
+//  type: both are `Option<unsafe extern "C" fn(*mut c_void, c_uint, c_uint) -> *mut c_void>` after
+//  their aliases resolve, which is why one hook pair can be installed into either mirror's stream
+//  and why doing so needs no cast and no `unsafe`. Each stream still gets its OWN tracker, so the
+//  two footprints are measured independently.
+//
+//  `mem_limit` (L176-L181) is deliberately not used here. Its purpose is to force `Z_MEM_ERROR` at a
+//  controlled point, which is a coverage technique for `test/infcover.c`'s error paths and has no
+//  place in a measurement: a stream that failed to allocate has no footprint to compare.
 
-/// The alignment every block this allocator hands out is guaranteed to have.
+/// Print the `ALLOC-BALANCE` line for one side of one case, and say whether it was clean.
 ///
-/// 16 bytes, which is what a C `malloc` guarantees on every target this workspace supports and
-/// therefore what the reference implementation's own allocations have. It matters because the blocks
-/// zlib requests are arrays of `unsigned short` (`prev` and `head`), of `Bytef` (the window and the
-/// pending buffer) and one `deflate_state` containing pointers and `ct_data` structures; over-aligning
-/// is always sound, while under-aligning would not be.
-///
-/// Asserted against the largest primitive alignment Rust knows about on this target rather than
-/// assumed, so that a hypothetical target with a stricter requirement is a build failure here rather
-/// than a misaligned access somewhere in `deflate.c`.
-const BLOCK_ALIGN: usize = 16;
-const _: () = assert!(BLOCK_ALIGN >= align_of::<u128>());
-const _: () = assert!(BLOCK_ALIGN >= align_of::<usize>());
-const _: () = assert!(BLOCK_ALIGN.is_power_of_two());
-
-/// The `Layout` a payload of `len` bytes is allocated and deallocated with.
-///
-/// C's `free(ptr)` needs nothing but the pointer; Rust's `dealloc(ptr, layout)` needs the *exact*
-/// `Layout` the allocation was made with, and `zfree` is handed only a pointer. So the size has to be
-/// recoverable from the pointer, and this allocator recovers it from the side table
-/// [`AllocCounter::blocks`] -- which it has to maintain anyway, because
-/// `test/infcover.c`'s non-`LIFO` and rogue tallies are lookups in exactly that table. One record
-/// rather than two: a size-prefixed block would work equally well and would duplicate a fact the
-/// registry already holds.
-///
-/// The scheme's invariants, stated once and relied on by every `// SAFETY:` comment below:
-///
-/// 1. Every pointer this allocator returns came from `std::alloc::alloc` with the `Layout` this
-///    function produces for the requested `len`.
-/// 2. [`AllocCounter::blocks`] holds that pointer paired with that same `len` for exactly as long as
-///    the block is outstanding.
-/// 3. [`tracked_free`] takes the entry out of the registry, calls this function on the `len` it
-///    recorded, and so reconstructs a `Layout` identical to the one the block was created with.
-/// 4. A pointer that is not in the registry did not come from rule 1. It is counted as a rogue free
-///    and is **not** deallocated, because fabricating a `Layout` for a pointer of unknown provenance
-///    would be undefined behaviour.
-/// 5. The requested size can never overflow, because [`tracked_alloc`] computes `items * size` with
-///    `checked_mul` and answers `NULL` -- zlib's documented allocation-failure signal -- if it wraps.
-///
-/// `len.max(1)` is the one adjustment: a zero-sized `Layout` is undefined behaviour to pass to
-/// `alloc`, so a zero-byte request gets one byte it will never use, which is also what `malloc(0)`
-/// does in the reference's own default allocator (`zutil.c` L215). `len` rather than the layout's size
-/// is what the counter records, so the adjustment never inflates a reported high-water mark. The
-/// alignment is [`BLOCK_ALIGN`] for every block, which is what makes step 3 exact.
-fn block_layout(len: usize) -> Option<Layout> {
-    Layout::from_size_align(len.max(1), BLOCK_ALIGN).ok()
-}
-
-/// The non-zero byte every freshly allocated block is filled with.
-///
-/// `test/infcover.c` L87 exactly. The value is not arbitrary and must not be changed to zero: its
-/// entire purpose is that a port which silently assumed zero-initialised memory would be caught
-/// here, as it is caught there. The reference's own default allocator is plain `malloc`
-/// (`zutil.c` L215), which is uninitialised rather than zeroed, so this is the stricter of the two
-/// and neither implementation may depend on the difference.
-const POISON: u8 = 0xa5;
-
-/// One live block, as `test/infcover.c`'s `struct mem_item` (L56-L60) records it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Block {
-    /// The payload pointer handed to zlib -- that is, `base + BLOCK_HEADER`.
-    payload: *mut u8,
-    /// The payload length, which is also what the block's header holds.
-    len: usize,
-}
-
-/// The `zalloc`/`zfree` bookkeeping of one stream: `test/infcover.c`'s `struct mem_zone`
-/// (L63-L68).
-///
-/// One instance per stream, never shared between the two implementations, and never touched from
-/// more than one thread -- see the safety note on [`tracked_alloc`].
-#[derive(Debug, Default)]
-struct AllocCounter {
-    /// Every block currently outstanding, pushed at the end. The last element is `infcover`'s
-    /// list head, so a `LIFO` free matches there.
-    blocks: Vec<Block>,
-    /// Bytes currently outstanding: `mem_zone::total`.
-    total: usize,
-    /// The largest value `total` ever reached: `mem_zone::highwater`, and the number the memory
-    /// gate compares.
-    highwater: usize,
-    /// How many allocation requests were satisfied.
-    allocations: usize,
-    /// How many frees were performed. Must equal `allocations` once the stream has been ended.
-    frees: usize,
-    /// Frees that did not match the most recent outstanding block: `mem_zone::notlifo`.
-    notlifo: usize,
-    /// Frees of a pointer this counter never handed out: `mem_zone::rogue`.
-    rogue: usize,
-    /// Allocation requests refused because a size computation would have overflowed, or because the
-    /// global allocator returned null. Reported so that a zero high-water mark is never mistaken for
-    /// a frugal implementation.
-    refusals: usize,
-}
-
-impl AllocCounter {
-    /// An empty counter. `Default` supplies it; this name exists so call sites read deliberately.
-    fn new() -> Self {
-        Self::default()
-    }
-
-    /// Record a satisfied allocation of `len` bytes at `payload`, updating `total` and `highwater`.
-    ///
-    /// `test/infcover.c` L98-L105: push at the head of the list, add to the total, and raise the
-    /// high-water mark if the total has grown past it. `saturating_add` rather than `+` because a
-    /// benchmark must not panic; an overflow here is impossible in practice, since `total` cannot
-    /// exceed the address space.
-    fn record_alloc(&mut self, payload: *mut u8, len: usize) {
-        self.blocks.push(Block { payload, len });
-        self.total = self.total.saturating_add(len);
-        self.highwater = self.highwater.max(self.total);
-        self.allocations = self.allocations.saturating_add(1);
-    }
-
-    /// Look up and remove `payload` from the registry, returning its length.
-    ///
-    /// `test/infcover.c` L123-L150: the most recent block is checked first and matches without
-    /// comment; a match anywhere else is a non-`LIFO` free and increments `notlifo`; no match at all
-    /// is a rogue free and increments `rogue`. Returning `None` for the rogue case is what stops
-    /// [`tracked_free`] from deallocating a pointer whose provenance it does not know.
-    fn take_block(&mut self, payload: *mut u8) -> Option<usize> {
-        let found = self
-            .blocks
-            .iter()
-            .rposition(|block| block.payload == payload);
-
-        let Some(index) = found else {
-            self.rogue = self.rogue.saturating_add(1);
-            return None;
-        };
-
-        if index + 1 != self.blocks.len() {
-            self.notlifo = self.notlifo.saturating_add(1);
-        }
-
-        let block = self.blocks.remove(index);
-        self.total = self.total.saturating_sub(block.len);
-        self.frees = self.frees.saturating_add(1);
-        Some(block.len)
-    }
-
-    /// Record an allocation this counter refused to satisfy.
-    fn record_refusal(&mut self) {
-        self.refusals = self.refusals.saturating_add(1);
-    }
-
-    /// Whether every block handed out has come back, in order, and nothing foreign came back at all.
-    ///
-    /// This is `mem_done`'s verdict (`test/infcover.c` L200-L240) reduced to a boolean: no leftover
-    /// allocation, a balanced count, no non-`LIFO` free, no rogue free and no refusal.
-    fn is_clean(&self) -> bool {
-        self.blocks.is_empty()
-            && self.total == 0
-            && self.allocations == self.frees
-            && self.notlifo == 0
-            && self.rogue == 0
-            && self.refusals == 0
-    }
-
-    /// Print the `ALLOC-BALANCE` line for one side of one case.
-    ///
-    /// Reported, never asserted: a dirty verdict means this file found a leak, and the nightly
-    /// `AddressSanitizer` job is where that becomes a failure.
-    fn report_balance(&self, label: &str, case: &str) {
-        let verdict = if self.is_clean() { "clean" } else { "dirty" };
-        eprintln!(
-            "{LOG_PREFIX} {BALANCE_KEY} side={label} case={case} allocations={allocations} \
-             frees={frees} live_bytes={total} notlifo={notlifo} rogue={rogue} \
-             refusals={refusals} verdict={verdict}",
-            allocations = self.allocations,
-            frees = self.frees,
-            total = self.total,
-            notlifo = self.notlifo,
-            rogue = self.rogue,
-            refusals = self.refusals,
-        );
-    }
-}
-
-/// Owns one [`AllocCounter`] at a stable address and hands out the `opaque` pointer for it.
-///
-/// The counter is boxed rather than held inline for a reason that is about aliasing rather than about
-/// convenience: C calls back into [`tracked_alloc`] *during* a `deflateInit2_` or `deflateEnd` call
-/// that is itself being made through a raw pointer to the stream. Keeping the counter in its own
-/// allocation means the hook's transient `&mut AllocCounter` can never overlap the borrow the call
-/// site holds on the stream, because the two are different allocations.
-#[derive(Debug)]
-struct TrackedAllocator {
-    /// The counter. Boxed, so its address is stable across moves of this struct.
-    counter: Box<AllocCounter>,
-}
-
-impl TrackedAllocator {
-    /// A fresh counter with nothing outstanding.
-    fn new() -> Self {
-        Self {
-            counter: Box::new(AllocCounter::new()),
-        }
-    }
-
-    /// The `opaque` value to install on a stream: the address of the boxed counter.
-    ///
-    /// `addr_of_mut!` through the `Box` rather than `&mut *self.counter as *mut _`, so that no Rust
-    /// mutable reference is materialised here at all -- the pointer is taken straight from the place
-    /// and only the hooks ever form a reference from it.
-    fn opaque(&mut self) -> *mut c_void {
-        core::ptr::addr_of_mut!(*self.counter).cast::<c_void>()
-    }
-
-    /// The high-water mark in bytes: `test/infcover.c`'s `mem_high` (L192-L197).
-    fn highwater(&self) -> usize {
-        self.counter.highwater
-    }
-
-    /// Print this side's `ALLOC-BALANCE` line and answer whether the balance is clean.
-    fn report_balance(&self, label: &str, case: &str) -> bool {
-        self.counter.report_balance(label, case);
-        self.counter.is_clean()
-    }
-}
-
-/// zlib's `alloc_func`: allocate `items * size` bytes through the Rust global allocator, poison them,
-/// and record the block.
-///
-/// `test/infcover.c`'s `mem_alloc` (L71-L109), with `malloc` replaced by `std::alloc::alloc` and the
-/// size arithmetic checked. Answering `NULL` is zlib's documented allocation-failure signal, and it
-/// is what this function does for every condition it cannot satisfy: an overflowing size, a
-/// `Layout` the allocator will not accept, a null `opaque`, or a null from the global allocator.
-///
-/// This function is `extern "C"` and never `extern "C-unwind"`, so a panic crossing out of it would
-/// abort rather than unwind into C. Nothing in the body can panic in any case: every arithmetic
-/// operation is checked, the only allocation is guarded, and `Vec::push` is the sole operation that
-/// could abort on allocation failure -- which is the same behaviour the Rust global allocator has
-/// everywhere else in the process.
-///
-/// # Safety
-///
-/// `opaque` must be either null or the address of a live [`AllocCounter`] that outlives the stream it
-/// was installed on, and that counter must not be reachable from any other thread for the duration
-/// of the call. Both hold by construction here: the only writer is [`TrackedAllocator::opaque`], the
-/// counter is boxed so its address is stable, and one stream is driven by one thread at a time.
-unsafe extern "C" fn tracked_alloc(
-    opaque: *mut c_void,
-    items: c_uint,
-    size: c_uint,
-) -> *mut c_void {
-    if opaque.is_null() {
-        return core::ptr::null_mut();
-    }
-
-    // SAFETY: `opaque` is non-null, as just checked, and this function's contract states that a
-    // non-null `opaque` is the address of a live `AllocCounter` that outlives the stream and is
-    // reached from one thread at a time. The reference is transient -- it is created here, used
-    // below, and dropped when this call returns -- and the counter is a separate allocation from the
-    // `z_stream` the caller passed, so it cannot alias any borrow the call site holds.
-    let counter = unsafe { &mut *opaque.cast::<AllocCounter>() };
-
-    // `len = count * (size_t) size` -- test/infcover.c L76, but checked twice over: `try_from`
-    // because `usize` is not `From<c_uint>` on a 16-bit target, and `checked_mul` because zlib's own
-    // callers pass small products and a wrap would hand back a block smaller than the one requested.
-    let (Ok(items), Ok(size)) = (usize::try_from(items), usize::try_from(size)) else {
-        counter.record_refusal();
-        return core::ptr::null_mut();
-    };
-
-    let Some(len) = items.checked_mul(size) else {
-        counter.record_refusal();
-        return core::ptr::null_mut();
-    };
-
-    let Some(layout) = block_layout(len) else {
-        counter.record_refusal();
-        return core::ptr::null_mut();
-    };
-
-    // SAFETY: `layout` has a non-zero size -- `block_layout` raises a zero request to one byte
-    // precisely so that this holds -- and a power-of-two alignment, which is the whole of `alloc`'s
-    // contract. The returned pointer is checked for null immediately below, and nothing is read or
-    // written through it before that check.
-    let payload = unsafe { alloc(layout) };
-    if payload.is_null() {
-        counter.record_refusal();
-        return core::ptr::null_mut();
-    }
-
-    // SAFETY: `payload` is the start of a freshly allocated block of at least `len` bytes, so `len`
-    // bytes are writable there, and `u8` has no alignment requirement. This is
-    // `memset(ptr, 0xa5, len)` -- test/infcover.c L87 -- and it must not become a zero fill: a port
-    // that assumed zero-initialised memory is exactly what it exists to expose. `write_bytes` with a
-    // zero count is a documented no-op, which is the `items * size == 0` case.
-    unsafe { core::ptr::write_bytes(payload, POISON, len) };
-
-    // Invariant 2: the registry records the pointer with the length its layout was built from, before
-    // the pointer escapes to the caller.
-    counter.record_alloc(payload, len);
-    payload.cast::<c_void>()
-}
-
-/// zlib's `free_func`: look `address` up in the registry and return it to the Rust global allocator.
-///
-/// `test/infcover.c`'s `mem_free` (L112-L154), with one deliberate departure. C's version calls
-/// `free(ptr)` even for a pointer it did not recognise, because `free` needs no size and the C
-/// standard library can cope; this version does **not**, because `dealloc` needs the exact `Layout`
-/// and reconstructing one for a pointer of unknown provenance would be undefined behaviour. A rogue
-/// free is therefore counted and dropped, and `verdict=dirty` on the `ALLOC-BALANCE` line is how it
-/// is reported.
-///
-/// # Safety
-///
-/// `opaque` must satisfy [`tracked_alloc`]'s contract. `address` must be null, or a pointer this same
-/// counter returned from [`tracked_alloc`] and has not yet been given here -- which is precisely
-/// what zlib's own contract promises, since a block obtained from a stream's `zalloc` is released
-/// only through that same stream's `zfree` (AAP §0.6.1 category 4).
-unsafe extern "C" fn tracked_free(opaque: *mut c_void, address: *mut c_void) {
-    if opaque.is_null() || address.is_null() {
-        return;
-    }
-
-    // SAFETY: as for `tracked_alloc` -- `opaque` is non-null and, by this function's contract, the
-    // address of the same live, single-threaded `AllocCounter`. The reference is transient and the
-    // counter is a separate allocation from the `z_stream`.
-    let counter = unsafe { &mut *opaque.cast::<AllocCounter>() };
-
-    let payload = address.cast::<u8>();
-    let Some(len) = counter.take_block(payload) else {
-        // Invariant 4: a rogue free. Counted by `take_block` and deliberately not deallocated -- see
-        // the note above on the departure from `mem_free`.
-        return;
-    };
-
-    let Some(layout) = block_layout(len) else {
-        // Unreachable in practice -- `block_layout` already answered `Some` for this same `len`
-        // before the block existed -- but a benchmark answers an impossible condition by leaking one
-        // block rather than by panicking.
-        counter.record_refusal();
-        return;
-    };
-
-    // SAFETY: invariant 3 of the block scheme, and it is the registry lookup above that establishes
-    // it. That lookup found `payload` in the table, which by invariant 1 means `tracked_alloc`
-    // obtained it from `alloc` with `block_layout(len)` for the very `len` just returned -- so
-    // `layout` is identical to the allocation's own, which is exactly `dealloc`'s requirement. The
-    // lookup also *removed* the entry, so this runs at most once per block and cannot double free;
-    // and a pointer that was never in the table took the branch above instead.
-    unsafe { dealloc(payload, layout) };
+/// Reported, never asserted: a dirty verdict means this file found a leak, and the nightly
+/// `AddressSanitizer` job is where that becomes a failure. The `refusals` tally is folded into the
+/// verdict here even though [`port::TrackingReport::is_clean`] leaves it out, and the difference is
+/// deliberate: a refusal is expected when a ceiling was set, and no ceiling is set here, so a
+/// refusal can only mean the global allocator failed or a size computation would have wrapped --
+/// either of which makes the high-water mark below it an understatement rather than a measurement.
+fn report_balance(report: &port::TrackingReport, label: &str, case: &str) -> bool {
+    let clean = report.is_clean() && report.refusals == 0;
+    let verdict = if clean { "clean" } else { "dirty" };
+    eprintln!(
+        "{LOG_PREFIX} {BALANCE_KEY} side={label} case={case} allocations={allocations} \
+         frees={frees} live_bytes={live_bytes} notlifo={notlifo} rogue={rogue} \
+         refusals={refusals} verdict={verdict}",
+        allocations = report.allocations,
+        frees = report.frees,
+        live_bytes = report.live_bytes,
+        notlifo = report.notlifo,
+        rogue = report.rogue,
+        refusals = report.refusals,
+    );
+    clean
 }
 
 // =================================================================================================
@@ -1705,9 +1772,10 @@ unsafe extern "C" fn tracked_free(opaque: *mut c_void, address: *mut c_void) {
 //  Every guard's `Drop` calls `deflateEnd`, so a skip path, an early return and a panicking unwind
 //  all release the stream -- and a deflate stream is worth releasing: it owns a 32 KiB window, a
 //  `prev` array, a `head` array and the symbol buffers, all sized from `windowBits` and `memLevel`.
-//  That is what keeps this file clean under the nightly `AddressSanitizer` job, which is the
-//  verification gate this crate does sit inside, and it is what makes the `ALLOC-BALANCE` line of the
-//  memory pass meaningful.
+//  That is what keeps this file leak-free, and it is what makes the `ALLOC-BALANCE` line of the
+//  memory pass meaningful.  Note that the discipline has to be self-imposed here: no sanitizer job
+//  runs this file -- ASan is scoped to `-p libz-rs-sys` and the three relinked C drivers, and Miri
+//  cannot execute the oracle -- so `Drop` and that line are the whole of the check.
 
 /// The port's deflate stream, ended on every path by [`Drop`].
 #[derive(Debug)]
@@ -1729,39 +1797,33 @@ impl PortDeflate {
 
     /// Install the instrumented allocator, which must happen **before** `init`.
     ///
-    /// `test/infcover.c`'s `mem_setup` (L158-L173) in the same order: `opaque` first, then the two
-    /// hooks. `deflateInit2_` makes its very first allocation request through these, so installing
-    /// them afterwards would leave the state block itself untracked and the high-water mark short by
-    /// the largest single allocation the stream makes.
-    fn install_allocator(&mut self, opaque: *mut c_void) {
-        self.strm.opaque = opaque;
-        self.strm.zalloc = Some(tracked_alloc);
-        self.strm.zfree = Some(tracked_free);
+    /// `test/infcover.c`'s `mem_setup` (L158-L173): all three members -- `opaque` and the two hooks
+    /// -- set BEFORE `deflateInit2_`, because the init call makes the very first allocation request
+    /// through them and installing them afterwards would leave the state block itself untracked and
+    /// the high-water mark short by the largest single allocation the stream makes. The boundary's
+    /// `install` writes exactly those three and nothing else.
+    fn install_allocator(&mut self, tracker: &port::TrackingAllocator) {
+        tracker.install(&mut self.strm);
     }
 
     /// `deflateInit2_(strm, level, Z_DEFLATED, windowBits, memLevel, strategy, ZLIB_VERSION,
     /// sizeof(z_stream))` -- `zlib.h` L1907-L1910.
     fn init(&mut self, config: Config) -> c_int {
-        // SAFETY: `strm` is a live, zeroed, correctly-typed local of this side's own `z_stream` type
-        // that outlives the call; `version` points at `ZLIB_VERSION`, a NUL-terminated `'static`
-        // byte string; and `stream_size` is `size_of` of that same type, never the other side's.
-        // `deflateInit2_` reads at most one byte of `version` after testing it for null, allocates
-        // through the stream's own `zalloc` -- either null, which selects the library's internal
-        // allocator, or the pair `install_allocator` set, whose contract the caller has satisfied --
-        // writes `state`, and touches neither window, which is why a C caller may leave
-        // `next_in`/`next_out` unset until after the call.
-        let status = unsafe {
-            libz_rs_sys::deflateInit2_(
-                core::ptr::addr_of_mut!(self.strm),
-                config.level,
-                Z_DEFLATED,
-                config.window_bits,
-                config.mem_level,
-                config.strategy,
-                version_ptr(),
-                stream_size::<libz_rs_sys::z_stream>(),
-            )
-        };
+        // The `_with_version` gate, because this suite drives BOTH implementations with the
+        // caller's `zlib.h` L44 constant; the gate supplies this side's own `size_of::<z_stream>()`.
+        // `deflateInit2_` allocates through the stream's own `zalloc` -- either null, which selects
+        // the library's internal allocator, or the pair `install_allocator` set -- writes `state`,
+        // and touches neither window, which is why a C caller may leave `next_in`/`next_out` unset
+        // until after the call.
+        let status = port::deflate_init2_with_version(
+            &mut self.strm,
+            config.level,
+            Z_DEFLATED,
+            config.window_bits,
+            config.mem_level,
+            config.strategy,
+            ZLIB_VERSION,
+        );
         self.live = status == Z_OK;
         status
     }
@@ -1773,34 +1835,31 @@ impl PortDeflate {
     /// tree state are cleared. That is exactly why the steady-state group uses it -- what is then
     /// timed is the encode plus the cheap half of the lifecycle, and not the allocator.
     fn reset(&mut self) -> c_int {
-        // SAFETY: as for `init`, minus the version handshake. `strm` is live and initialised at this
-        // address, so `deflateReset` finds the state block `deflateInit2_` wrote and the identity
-        // check on the state's back-pointer to the stream succeeds. It allocates nothing and touches
-        // neither the input nor the output window.
-        unsafe { libz_rs_sys::deflateReset(core::ptr::addr_of_mut!(self.strm)) }
+        // `strm` is live and initialised at this address, so `deflateReset` finds the state block
+        // `deflateInit2_` wrote and the identity check on the state's back-pointer to the stream
+        // succeeds. It allocates nothing and touches neither the input nor the output window.
+        port::deflate_reset(&mut self.strm)
     }
 
     /// `deflateBound(strm, sourceLen)` -- `zlib.h` L768 -- as a `usize`, or `None` if a conversion
     /// does not fit.
     fn bound(&mut self, source_len: usize) -> Option<usize> {
         let source = libz_rs_sys::uLong::try_from(source_len).ok()?;
-        // SAFETY: `strm` is live and initialised at this address. `deflateBound` only reads the state
-        // block -- and, for a gzip stream, the `gz_header` the state holds, which is null here
-        // because this suite never calls `deflateSetHeader` -- and writes nothing. It touches neither
-        // window, so no pointer needs to be installed first.
-        let bound =
-            unsafe { libz_rs_sys::deflateBound(core::ptr::addr_of_mut!(self.strm), source) };
+        // `deflateBound` only reads the state block -- and, for a gzip stream, the `gz_header` the
+        // state holds, which is null here because this suite never calls `deflateSetHeader` -- and
+        // writes nothing. It touches neither window, so no pointer needs to be installed first.
+        let bound = port::deflate_bound(Some(&mut self.strm), source);
         usize::try_from(bound).ok()
     }
 
     /// `deflateBound_z(strm, sourceLen)` -- the `size_t` form, `zlib.h` L769.
     fn bound_z(&mut self, source_len: usize) -> Option<usize> {
         let source = libz_rs_sys::z_size_t::try_from(source_len).ok()?;
-        // SAFETY: as for `bound`; the only difference is the width of the argument and the result.
-        // No conversion on the way out: both mirrors define `z_size_t` as `usize` unconditionally, so
+        // As for `bound`; the only difference is the width of the argument and the result. No
+        // conversion on the way out: both mirrors define `z_size_t` as `usize` unconditionally, so
         // this is already the type the caller wants and `try_from` would be a no-op the lint gate
         // rejects.
-        Some(unsafe { libz_rs_sys::deflateBound_z(core::ptr::addr_of_mut!(self.strm), source) })
+        Some(port::deflate_bound_z(Some(&mut self.strm), source))
     }
 
     /// `deflateEnd(strm)` -- `zlib.h` L836 -- releasing every buffer the stream owns.
@@ -1821,12 +1880,12 @@ impl PortDeflate {
             return Z_OK;
         }
         self.live = false;
-        // SAFETY: `strm` is live, was initialised by `deflateInit2_` on this same address, and has not
-        // moved since -- this method takes `&mut self` rather than `self` so that it cannot have.
+        // `strm` is live, was initialised by `deflateInit2_` on this same address, and has not moved
+        // since -- this method takes `&mut self` rather than `self` so that it cannot have.
         // `deflateEnd` frees the state and its buffers through the same allocator that produced them
         // and nulls `state`, and the `live` flag above makes this run at most once per stream, so a
         // double free is impossible.
-        unsafe { libz_rs_sys::deflateEnd(core::ptr::addr_of_mut!(self.strm)) }
+        port::deflate_end(&mut self.strm)
     }
 }
 
@@ -1859,56 +1918,57 @@ impl OracleDeflate {
     /// [`PortDeflate::install_allocator`].
     ///
     /// The two implementations' `alloc_func` and `free_func` aliases resolve to the same underlying
-    /// `extern "C"` signature, which is why one pair of hooks serves both sides. The `z_stream`
-    /// types do not, and are never crossed.
-    fn install_allocator(&mut self, opaque: *mut c_void) {
-        self.strm.opaque = opaque;
-        self.strm.zalloc = Some(tracked_alloc);
-        self.strm.zfree = Some(tracked_free);
+    /// `extern "C"` signature -- the same Rust type, not merely a compatible one -- which is why the
+    /// boundary's one pair of hooks serves both sides and why installing them here is plain field
+    /// assignment rather than a cast. The `z_stream` types do not coincide, and are never crossed:
+    /// `port::TrackingAllocator::install` takes the facade's, so this side spells the three writes
+    /// out against the oracle's own mirror.
+    fn install_allocator(&mut self, tracker: &port::TrackingAllocator) {
+        self.strm.opaque = tracker.opaque();
+        self.strm.zalloc = port::TrackingAllocator::alloc_hook();
+        self.strm.zfree = port::TrackingAllocator::free_hook();
     }
 
     /// `deflateInit2_` in the reference, reached as `c_deflateInit2_`.
     fn init(&mut self, config: Config) -> c_int {
-        // SAFETY: as for `PortDeflate::init`, with `stream_size` taken from the ORACLE's own
+        // As for `PortDeflate::init`, and the same caller constant, so the reference's real
+        // major-version check is exercised. The gate takes `stream_size` from the ORACLE's own
         // `z_stream` mirror rather than the facade's -- the two are distinct Rust types and each
         // library compares the number against its own `sizeof`.
-        let status = unsafe {
-            oracle::c_deflateInit2_(
-                core::ptr::addr_of_mut!(self.strm),
-                config.level,
-                Z_DEFLATED,
-                config.window_bits,
-                config.mem_level,
-                config.strategy,
-                version_ptr(),
-                stream_size::<oracle::z_stream>(),
-            )
-        };
+        let status = oracle::deflate_init2_with_version(
+            &mut self.strm,
+            config.level,
+            Z_DEFLATED,
+            config.window_bits,
+            config.mem_level,
+            config.strategy,
+            ZLIB_VERSION,
+        );
         self.live = status == Z_OK;
         status
     }
 
     /// `deflateReset` in the reference, reached as `c_deflateReset`.
     fn reset(&mut self) -> c_int {
-        // SAFETY: as for `PortDeflate::reset`. `strm` is live, initialised at this address, and still
-        // the address the state block's back-pointer holds.
-        unsafe { oracle::c_deflateReset(core::ptr::addr_of_mut!(self.strm)) }
+        // As for `PortDeflate::reset`. `strm` is live, initialised at this address, and still the
+        // address the state block's back-pointer holds.
+        oracle::deflate_reset(&mut self.strm)
     }
 
     /// `c_deflateBound(strm, sourceLen)`.
     fn bound(&mut self, source_len: usize) -> Option<usize> {
         let source = oracle::uLong::try_from(source_len).ok()?;
-        // SAFETY: as for `PortDeflate::bound`, against the reference's own type and entry point.
-        let bound = unsafe { oracle::c_deflateBound(core::ptr::addr_of_mut!(self.strm), source) };
+        // As for `PortDeflate::bound`, against the reference's own type and entry point.
+        let bound = oracle::deflate_bound(Some(&mut self.strm), source);
         usize::try_from(bound).ok()
     }
 
     /// `c_deflateBound_z(strm, sourceLen)`.
     fn bound_z(&mut self, source_len: usize) -> Option<usize> {
         let source = oracle::z_size_t::try_from(source_len).ok()?;
-        // SAFETY: as for `PortDeflate::bound_z`, against the reference's own type and entry point.
+        // As for `PortDeflate::bound_z`, against the reference's own type and entry point.
         // `z_size_t` is `usize` in the oracle's mirror too, so the result needs no conversion.
-        Some(unsafe { oracle::c_deflateBound_z(core::ptr::addr_of_mut!(self.strm), source) })
+        Some(oracle::deflate_bound_z(Some(&mut self.strm), source))
     }
 
     /// `c_deflateEnd(strm)`, with the same contract and the same `&mut self` requirement as
@@ -1919,9 +1979,9 @@ impl OracleDeflate {
             return Z_OK;
         }
         self.live = false;
-        // SAFETY: as for `PortDeflate::end`, against the reference's own allocator. `strm` is live,
+        // As for `PortDeflate::end`, against the reference's own allocator. `strm` is live,
         // initialised at this address, and still the address the state block's back-pointer holds.
-        unsafe { oracle::c_deflateEnd(core::ptr::addr_of_mut!(self.strm)) }
+        oracle::deflate_end(&mut self.strm)
     }
 }
 
@@ -1961,17 +2021,9 @@ impl OracleInflate {
     /// `window_bits` is the encoder's own, unchanged: 15 decodes a zlib stream, −15 a raw one and 31
     /// a gzip one, exactly as it selected them on the way in.
     fn init(&mut self, window_bits: c_int) -> c_int {
-        // SAFETY: as for `OracleDeflate::init` -- a live zeroed local of the oracle's own type, the
-        // `'static` NUL-terminated version string, and that type's own `size_of`. `inflateInit2_`
-        // writes `state` and touches neither window.
-        let status = unsafe {
-            oracle::c_inflateInit2_(
-                core::ptr::addr_of_mut!(self.strm),
-                window_bits,
-                version_ptr(),
-                stream_size::<oracle::z_stream>(),
-            )
-        };
+        // As for `OracleDeflate::init`: the caller's version constant and the oracle's own
+        // `size_of`. `inflateInit2_` writes `state` and touches neither window.
+        let status = oracle::inflate_init2_with_version(&mut self.strm, window_bits, ZLIB_VERSION);
         self.live = status == Z_OK;
         status
     }
@@ -1986,12 +2038,10 @@ impl OracleInflate {
         self.strm.avail_in = avail_in;
         self.strm.avail_out = avail_out;
 
-        // SAFETY: `avail_in` bytes are readable at `next_in` and `avail_out` bytes writable at
-        // `next_out`, both installed immediately above from live slices that outlive this call, and
-        // both counts are those slices' own lengths converted with `try_from`. `strm` is live,
-        // initialised at this address, and has not moved since `c_inflateInit2_` wrote the
-        // back-pointer `inflate.c` L94 checks by identity.
-        let status = unsafe { oracle::c_inflate(core::ptr::addr_of_mut!(self.strm), Z_FINISH) };
+        // Both windows were installed immediately above from live slices that outlive this call.
+        // `strm` has not moved since `c_inflateInit2_` wrote the back-pointer `inflate.c` L94 checks
+        // by identity.
+        let status = oracle::inflate(&mut self.strm, Z_FINISH);
 
         let left = usize::try_from(self.strm.avail_out).ok()?;
         Some(Encode {
@@ -2007,13 +2057,13 @@ impl Drop for OracleInflate {
             return;
         }
         self.live = false;
-        // SAFETY: as for `OracleDeflate::end`. `strm` is live, was initialised by `c_inflateInit2_` on
-        // this same address and has not moved -- every `OracleInflate` in this file is created,
-        // used and dropped inside one function body, and is never passed to `drop` by value, which
-        // would move it and defeat `inflate.c` L94's identity check. `inflateEnd` frees the state and
-        // the window through the allocator that produced them and nulls `state`, so this runs at most
-        // once per stream.
-        unsafe { oracle::c_inflateEnd(core::ptr::addr_of_mut!(self.strm)) };
+        // As for `OracleDeflate::end`. `strm` is live, was initialised by `c_inflateInit2_` on this
+        // same address and has not moved -- every `OracleInflate` in this file is created, used and
+        // dropped inside one function body, and is never passed to `drop` by value, which would move
+        // it and defeat `inflate.c` L94's identity check. `inflateEnd` frees the state and the window
+        // through the allocator that produced them and nulls `state`, so this runs at most once per
+        // stream.
+        let _ = oracle::inflate_end(&mut self.strm);
     }
 }
 
@@ -2045,11 +2095,9 @@ fn port_single_shot(stream: &mut PortDeflate, input: &[u8], out: &mut [u8]) -> O
     stream.strm.avail_in = avail_in;
     stream.strm.avail_out = avail_out;
 
-    // SAFETY: `avail_in` bytes are readable at `next_in` and `avail_out` bytes writable at
-    // `next_out`, both installed immediately above from live slices that outlive this call, and both
-    // counts are those slices' own lengths converted with `try_from`. `strm` is live, initialised at
-    // this address, and reset by the caller when the caller intends a fresh stream.
-    let status = unsafe { libz_rs_sys::deflate(core::ptr::addr_of_mut!(stream.strm), Z_FINISH) };
+    // Both windows were installed immediately above from live slices that outlive this call. The
+    // caller resets the stream when it intends a fresh one.
+    let status = port::deflate(&mut stream.strm, Z_FINISH);
 
     let left = usize::try_from(stream.strm.avail_out).ok()?;
     Some(Encode {
@@ -2098,12 +2146,10 @@ fn port_chunked(
         stream.strm.avail_in = libz_rs_sys::uInt::try_from(offer_in).ok()?;
         stream.strm.avail_out = libz_rs_sys::uInt::try_from(offer_out).ok()?;
 
-        // SAFETY: as for `port_single_shot` -- `avail_in` bytes readable at `next_in` and `avail_out`
-        // bytes writable at `next_out`, both derived from the live slices installed before the loop,
-        // and both counts clamped to what those slices still hold. The library advances the two
-        // pointers itself, so re-offering counts without re-installing pointers is the documented way
-        // to resume.
-        status = unsafe { libz_rs_sys::deflate(core::ptr::addr_of_mut!(stream.strm), flush) };
+        // As for `port_single_shot`, with both counts clamped to what the installed slices still
+        // hold. The library advances the two pointers itself, so re-offering counts without
+        // re-installing pointers is the documented way to resume.
+        status = port::deflate(&mut stream.strm, flush);
 
         let consumed = offer_in.checked_sub(usize::try_from(stream.strm.avail_in).ok()?)?;
         let produced = offer_out.checked_sub(usize::try_from(stream.strm.avail_out).ok()?)?;
@@ -2131,10 +2177,10 @@ fn oracle_single_shot(stream: &mut OracleDeflate, input: &[u8], out: &mut [u8]) 
     stream.strm.avail_in = avail_in;
     stream.strm.avail_out = avail_out;
 
-    // SAFETY: as for `port_single_shot`, against the oracle's own `z_stream` type and its own entry
-    // point. The stream has not moved since `c_deflateInit2_` wrote the back-pointer that
-    // `deflate.c` L538 checks by identity.
-    let status = unsafe { oracle::c_deflate(core::ptr::addr_of_mut!(stream.strm), Z_FINISH) };
+    // As for `port_single_shot`, against the oracle's own `z_stream` type and its own entry point.
+    // The stream has not moved since `c_deflateInit2_` wrote the back-pointer that `deflate.c` L538
+    // checks by identity.
+    let status = oracle::deflate(&mut stream.strm, Z_FINISH);
 
     let left = usize::try_from(stream.strm.avail_out).ok()?;
     Some(Encode {
@@ -2169,8 +2215,8 @@ fn oracle_chunked(
         stream.strm.avail_in = oracle::uInt::try_from(offer_in).ok()?;
         stream.strm.avail_out = oracle::uInt::try_from(offer_out).ok()?;
 
-        // SAFETY: as for `port_chunked`, against the oracle's own type and entry point.
-        status = unsafe { oracle::c_deflate(core::ptr::addr_of_mut!(stream.strm), flush) };
+        // As for `port_chunked`, against the oracle's own type and entry point.
+        status = oracle::deflate(&mut stream.strm, flush);
 
         let consumed = offer_in.checked_sub(usize::try_from(stream.strm.avail_in).ok()?)?;
         let produced = offer_out.checked_sub(usize::try_from(stream.strm.avail_out).ok()?)?;
@@ -2266,22 +2312,13 @@ const ONE_SHOTS: [OneShot; 2] = [OneShot::Compress2, OneShot::Compress2Z];
 /// `destLen` is an in-out parameter: it carries the capacity in and the produced length out, which is
 /// why it is initialised from `dest.len()` rather than from zero.
 fn port_compress2(dest: &mut [u8], source: &[u8], level: c_int) -> Option<Encode> {
-    let mut dest_len = libz_rs_sys::uLongf::try_from(dest.len()).ok()?;
-    let source_len = libz_rs_sys::uLong::try_from(source.len()).ok()?;
+    // Both lengths must be expressible as the C types before the call is worth making, and the two
+    // `try_from`s are what say so; the gate then seeds the in/out `destLen` from `dest.len()` itself
+    // and hands back what the call left there. `compress2` retains no pointer past the return.
+    let _dest_capacity = libz_rs_sys::uLongf::try_from(dest.len()).ok()?;
+    let _source_len = libz_rs_sys::uLong::try_from(source.len()).ok()?;
 
-    // SAFETY: `dest_len` bytes are writable at `dest.as_mut_ptr()` and `source_len` bytes readable at
-    // `source.as_ptr()`, both counts being those live slices' own lengths converted with `try_from`,
-    // and both slices outlive this call. `dest_len` is a local this call may write through, and it is
-    // read back only after the call returns. `compress2` retains no pointer past the return.
-    let status = unsafe {
-        libz_rs_sys::compress2(
-            dest.as_mut_ptr(),
-            core::ptr::addr_of_mut!(dest_len),
-            source.as_ptr(),
-            source_len,
-            level,
-        )
-    };
+    let (status, dest_len) = port::compress2(dest, source, level);
 
     Some(Encode {
         status,
@@ -2291,20 +2328,12 @@ fn port_compress2(dest: &mut [u8], source: &[u8], level: c_int) -> Option<Encode
 
 /// `compress2_z(dest, &destLen, source, sourceLen, level)` through the port.
 fn port_compress2_z(dest: &mut [u8], source: &[u8], level: c_int) -> Option<Encode> {
-    let mut dest_len = libz_rs_sys::z_size_t::try_from(dest.len()).ok()?;
-    let source_len = libz_rs_sys::z_size_t::try_from(source.len()).ok()?;
+    // As for `port_compress2`; the only difference is the width of the out-parameter and of the
+    // source length.
+    let _dest_capacity = libz_rs_sys::z_size_t::try_from(dest.len()).ok()?;
+    let _source_len = libz_rs_sys::z_size_t::try_from(source.len()).ok()?;
 
-    // SAFETY: as for `port_compress2`; the only difference is the width of the out-parameter and of
-    // the source length.
-    let status = unsafe {
-        libz_rs_sys::compress2_z(
-            dest.as_mut_ptr(),
-            core::ptr::addr_of_mut!(dest_len),
-            source.as_ptr(),
-            source_len,
-            level,
-        )
-    };
+    let (status, dest_len) = port::compress2_z(dest, source, level);
 
     // `dest_len` needs no conversion: `z_size_t` is `usize` in both mirrors by definition.
     Some(Encode {
@@ -2315,20 +2344,11 @@ fn port_compress2_z(dest: &mut [u8], source: &[u8], level: c_int) -> Option<Enco
 
 /// `c_compress2(dest, &destLen, source, sourceLen, level)` through the reference.
 fn oracle_compress2(dest: &mut [u8], source: &[u8], level: c_int) -> Option<Encode> {
-    let mut dest_len = oracle::uLongf::try_from(dest.len()).ok()?;
-    let source_len = oracle::uLong::try_from(source.len()).ok()?;
+    // As for `port_compress2`, against the reference's own entry point and its own scalar aliases.
+    let _dest_capacity = oracle::uLongf::try_from(dest.len()).ok()?;
+    let _source_len = oracle::uLong::try_from(source.len()).ok()?;
 
-    // SAFETY: as for `port_compress2`, against the reference's own entry point and its own scalar
-    // aliases.
-    let status = unsafe {
-        oracle::c_compress2(
-            dest.as_mut_ptr(),
-            core::ptr::addr_of_mut!(dest_len),
-            source.as_ptr(),
-            source_len,
-            level,
-        )
-    };
+    let (status, dest_len) = oracle::compress2(dest, source, level);
 
     Some(Encode {
         status,
@@ -2338,19 +2358,11 @@ fn oracle_compress2(dest: &mut [u8], source: &[u8], level: c_int) -> Option<Enco
 
 /// `c_compress2_z(dest, &destLen, source, sourceLen, level)` through the reference.
 fn oracle_compress2_z(dest: &mut [u8], source: &[u8], level: c_int) -> Option<Encode> {
-    let mut dest_len = oracle::z_size_t::try_from(dest.len()).ok()?;
-    let source_len = oracle::z_size_t::try_from(source.len()).ok()?;
+    // As for `port_compress2_z`, against the reference's own entry point.
+    let _dest_capacity = oracle::z_size_t::try_from(dest.len()).ok()?;
+    let _source_len = oracle::z_size_t::try_from(source.len()).ok()?;
 
-    // SAFETY: as for `port_compress2_z`, against the reference's own entry point.
-    let status = unsafe {
-        oracle::c_compress2_z(
-            dest.as_mut_ptr(),
-            core::ptr::addr_of_mut!(dest_len),
-            source.as_ptr(),
-            source_len,
-            level,
-        )
-    };
+    let (status, dest_len) = oracle::compress2_z(dest, source, level);
 
     // As for `port_compress2_z`: `z_size_t` is `usize`, so there is nothing to convert.
     Some(Encode {
@@ -2443,19 +2455,19 @@ fn port_compress_bound_z(source_len: usize) -> Option<usize> {
 /// `c_compressBound(sourceLen)` through the reference.
 fn oracle_compress_bound(source_len: usize) -> Option<usize> {
     let source = oracle::uLong::try_from(source_len).ok()?;
-    // SAFETY: the oracle declares every symbol in one `extern "C"` block, so even a pointer-free
-    // function is an unsafe call in Rust. There is no pointer, no length and no state: the argument
-    // is a scalar and the result is a scalar, so the only obligation is that the symbol be the one
-    // `src/oracle.rs` declares -- which `build.rs`'s `c_` renaming and its `nm` audit establish.
-    let bound = unsafe { oracle::c_compressBound(source) };
+    // A scalar in, a scalar out. It still crosses through a gate, because the oracle declares every
+    // symbol in one `extern "C"` block and calling one is an unsafe operation whatever it computes;
+    // the port's counterpart needs no gate at all, because the facade declares its pointer-free entry
+    // points safe.
+    let bound = oracle::compress_bound(source);
     usize::try_from(bound).ok()
 }
 
 /// `c_compressBound_z(sourceLen)` through the reference.
 fn oracle_compress_bound_z(source_len: usize) -> Option<usize> {
     let source = oracle::z_size_t::try_from(source_len).ok()?;
-    // SAFETY: as for `oracle_compress_bound` -- a scalar in, a scalar out, no pointer involved.
-    Some(unsafe { oracle::c_compressBound_z(source) })
+    // As for `oracle_compress_bound` -- a scalar in, a scalar out, no pointer involved.
+    Some(oracle::compress_bound_z(source))
 }
 
 // =================================================================================================
@@ -3002,11 +3014,11 @@ fn as_f64(bytes: usize) -> Option<f64> {
 
 /// Samples per row.
 ///
-/// 50 rather than criterion's default 100. A default run registers about a hundred and forty rows
-/// across nine groups, and 100 samples at the default five-second measurement would put a full run
-/// well past twenty minutes -- long enough that it stops being run. Fifty samples still gives
-/// criterion enough to resample from for a usable confidence interval, and criterion refuses fewer
-/// than ten outright.
+/// 50 rather than criterion's default 100. Cost scales as rows x samples x per-sample time, and this
+/// file registers rows across nine groups -- more than any other suite here -- so criterion's 100
+/// samples at its default five-second measurement would put a full run far enough past a coffee break
+/// that it stops being run. Fifty samples still gives criterion enough to resample from for a usable
+/// confidence interval, and criterion refuses fewer than ten outright.
 const SAMPLE_SIZE: usize = 50;
 
 /// Warm-up per throughput row: 1 second rather than the default 3.
@@ -3123,7 +3135,7 @@ fn indicative_ns<F: FnMut() -> bool>(mut op: F) -> Option<f64> {
     Some(best?.as_secs_f64() * NANOS_PER_SEC / f64::from(reps))
 }
 
-/// Whether a group's cases count against [`GATE_RATIO`] at all.
+/// What a group's cases mean for [`GATE_RATIO`], in three levels rather than two.
 ///
 /// Declared once, where the group's ledger is created, rather than decided per case: whether a group
 /// is *about* the gate is a property of the group. `deflate_stored_floor` measures level 0,
@@ -3131,12 +3143,99 @@ fn indicative_ns<F: FnMut() -> bool>(mut op: F) -> Option<f64> {
 /// measures latency and `deflate_bound` measures a function that copies nothing -- none of those is
 /// the quantity AAP §0.8.4 bounds, and every one of them still prints its full `RATIO` line so that
 /// nothing is hidden.
+///
+/// The distinction between the first two variants exists because a consumer of these lines has to
+/// know which groups it is entitled to FAIL on. AAP §0.8.4 bounds one quantity -- "compression
+/// throughput at levels 1, 6 and 9" -- and two groups measure exactly that quantity in exactly that
+/// configuration: [`GROUP_STEADY_STATE`] on the committed corpus and [`GROUP_SILESIA`] on the corpus
+/// the AAP names. Those are [`GatePolicy::Authoritative`]. [`GROUP_LIFECYCLE`] additionally times
+/// `deflateInit2_`/`deflateEnd`, [`GROUP_CONTAINER`] and [`GROUP_FEEDING`] vary an axis the gate
+/// holds fixed, and [`GROUP_ONE_SHOT`] measures a wrapper -- each is a real per-byte comparison worth
+/// counting and reporting, but none of them is the sentence the AAP wrote, so they are
+/// [`GatePolicy::Supporting`]. Both count identically into `gated` and `over`; the difference is
+/// published on the `RATIO-SUMMARY` line as `gate=` so the decision is the reader's and is not
+/// guessed from a group name.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GatePolicy {
-    /// A case of at least [`GATE_MIN_BYTES`] counts against the gate.
-    Gated,
+    /// A case of at least [`GATE_MIN_BYTES`] counts, and this group IS the AAP §0.8.4 gate.
+    Authoritative,
+    /// A case of at least [`GATE_MIN_BYTES`] counts, but the group measures more or other than the
+    /// gate's quantity, so a regression here is a signal rather than a verdict.
+    Supporting,
     /// No case counts. The group is outside the gate by construction, not by size.
     Informational,
+}
+
+impl GatePolicy {
+    /// The word this policy prints as on a `RATIO-SUMMARY` line.
+    const fn tag(self) -> &'static str {
+        match self {
+            Self::Authoritative => "authoritative",
+            Self::Supporting => "supporting",
+            Self::Informational => "informational",
+        }
+    }
+
+    /// Whether a large enough case in this group enters the `gated`/`over` tallies.
+    const fn counts(self) -> bool {
+        matches!(self, Self::Authoritative | Self::Supporting)
+    }
+}
+
+/// Every group this file registers a throughput ledger for, with the policy it is measured under.
+///
+/// THE source of truth for that classification, and deliberately a single table rather than a
+/// decision repeated at each ledger: [`RatioLedger::for_group`] reads it, and the `GATE-INVENTORY`
+/// line [`report_configuration`] prints reads the same rows. A consumer can therefore check the
+/// authoritative set it requires against the set this run declares, and a group whose policy changed
+/// cannot say one thing in the inventory and another on its summary line.
+const RATIO_GROUP_POLICIES: [(&str, GatePolicy); 11] = [
+    (GROUP_STEADY_STATE, GatePolicy::Authoritative),
+    (GROUP_SILESIA, GatePolicy::Authoritative),
+    (GROUP_LIFECYCLE, GatePolicy::Supporting),
+    (GROUP_CONTAINER, GatePolicy::Supporting),
+    (GROUP_FEEDING, GatePolicy::Supporting),
+    (GROUP_ONE_SHOT, GatePolicy::Supporting),
+    (GROUP_MEM_LEVEL, GatePolicy::Informational),
+    (GROUP_STRATEGY, GatePolicy::Informational),
+    (GROUP_STORED_FLOOR, GatePolicy::Informational),
+    (GROUP_BOUND, GatePolicy::Informational),
+    (GROUP_DEGENERATE, GatePolicy::Informational),
+];
+
+/// Every group this file registers a memory ledger for. One, and it is the AAP §0.8.4 memory gate.
+const MEMORY_GROUP_POLICIES: [(&str, GatePolicy); 1] = [(GROUP_MEMORY, GatePolicy::Authoritative)];
+
+/// The declared policy of `group`, or [`GatePolicy::Informational`] with a loud line if it has none.
+///
+/// The fallback is deliberately the weakest policy and deliberately noisy rather than a panic. A
+/// group missing from [`RATIO_GROUP_POLICIES`] is a mistake in this file, and the effect of the
+/// fallback is that it cannot be mistaken for the gate: it is absent from the `GATE-INVENTORY` line's
+/// authoritative set, so a consumer that requires an exact authoritative set fails on it, and the
+/// note below says why in the same output.
+fn ratio_policy(group: &'static str) -> GatePolicy {
+    if let Some((_, policy)) = RATIO_GROUP_POLICIES.iter().find(|(name, _)| *name == group) {
+        return *policy;
+    }
+
+    eprintln!(
+        "{LOG_PREFIX} group={group} has no row in RATIO_GROUP_POLICIES, so it is reported as \
+         informational and counts towards nothing. Add it to that table."
+    );
+    GatePolicy::Informational
+}
+
+/// The names in `table` carrying `policy`, comma-joined, for the `GATE-INVENTORY` line.
+///
+/// Empty rather than absent when no group carries the policy, so the key is always present and a
+/// consumer never has to distinguish "no such key" from "no such group".
+fn groups_with(table: &[(&'static str, GatePolicy)], policy: GatePolicy) -> String {
+    table
+        .iter()
+        .filter(|(_, declared)| *declared == policy)
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Accumulates the per-case throughput ratios of one group and prints the greppable lines CI
@@ -3151,6 +3250,13 @@ struct RatioLedger {
     group: &'static str,
     /// Whether this group's cases can count against the gate at all.
     policy: GatePolicy,
+    /// How many cases the group set out to measure, from the same iteration counts its loops use.
+    ///
+    /// Published on the summary line so that a reader can tell "measured everything and nothing
+    /// regressed" from "measured nothing". Both print `over=0`, and without this field they are
+    /// indistinguishable -- which is exactly how a corpus that failed to load, a fixture directory
+    /// that was not there, or a filter that matched no case can read as a pass.
+    expected: u32,
     /// How many cases produced a ratio at all.
     cases: u32,
     /// How many of those had a payload of at least [`GATE_MIN_BYTES`] and so count against the gate.
@@ -3163,11 +3269,15 @@ struct RatioLedger {
 }
 
 impl RatioLedger {
-    /// An empty gated ledger for `group`: a case of at least [`GATE_MIN_BYTES`] counts.
-    const fn new(group: &'static str) -> Self {
+    /// An empty ledger for `group` with `policy`, expecting `expected` cases.
+    ///
+    /// `expected` is computed at the call site from the very collections that group's loops iterate,
+    /// so it is the loop's cardinality by construction rather than a number kept in step by hand.
+    const fn with_policy(group: &'static str, policy: GatePolicy, expected: u32) -> Self {
         Self {
             group,
-            policy: GatePolicy::Gated,
+            policy,
+            expected,
             cases: 0,
             gated: 0,
             over: 0,
@@ -3175,16 +3285,13 @@ impl RatioLedger {
         }
     }
 
-    /// An empty ledger for a group that is outside the gate by construction.
-    const fn informational(group: &'static str) -> Self {
-        Self {
-            group,
-            policy: GatePolicy::Informational,
-            cases: 0,
-            gated: 0,
-            over: 0,
-            informational: 0,
-        }
+    /// An empty ledger for `group`, under the policy [`RATIO_GROUP_POLICIES`] declares for it.
+    ///
+    /// The policy is looked up rather than passed so that the table stays the only place a group's
+    /// standing is decided, which is what lets the `GATE-INVENTORY` line be checked against these
+    /// summary lines.
+    fn for_group(group: &'static str, expected: u32) -> Self {
+        Self::with_policy(group, ratio_policy(group), expected)
     }
 
     /// Record one case, printing its `RATIO` line.
@@ -3215,7 +3322,7 @@ impl RatioLedger {
 
         let ratio = port_ns / oracle_ns;
         let verdict = if ratio > GATE_RATIO { "over" } else { "within" };
-        let counted = self.policy == GatePolicy::Gated && bytes >= GATE_MIN_BYTES;
+        let counted = self.policy.counts() && bytes >= GATE_MIN_BYTES;
         let gate = if counted { "counted" } else { "informational" };
 
         self.cases = self.cases.saturating_add(1);
@@ -3241,11 +3348,21 @@ impl RatioLedger {
     /// `cases` is `gated + informational`, and `over` counts only gated cases -- so a workflow that
     /// reads `over` from the `deflate_steady_state` line is reading exactly the AAP §0.8.4
     /// compression gate.
+    ///
+    /// `gate` and `expected` are here so that the line can be checked rather than merely read.
+    /// `gate` says whether this group's `over` is a verdict or a signal, and `expected` says how many
+    /// cases the group set out to measure: `cases < expected` means something was skipped, and
+    /// `expected=0` means the group had nothing to measure at all. A consumer that requires
+    /// `cases == expected` and `expected > 0` on the authoritative groups cannot be fooled by a run
+    /// that measured nothing, which `over=0` on its own looks exactly like.
     fn finish(&self) {
         eprintln!(
-            "{LOG_PREFIX} {RATIO_SUMMARY_KEY} group={group} cases={cases} gated={gated} \
-             over={over} informational={informational} limit={GATE_RATIO:.2}",
+            "{LOG_PREFIX} {RATIO_SUMMARY_KEY} group={group} gate={gate} expected={expected} \
+             cases={cases} gated={gated} over={over} informational={informational} \
+             limit={GATE_RATIO:.2}",
             group = self.group,
+            gate = self.policy.tag(),
+            expected = self.expected,
             cases = self.cases,
             gated = self.gated,
             over = self.over,
@@ -3264,6 +3381,12 @@ impl RatioLedger {
 struct MemoryLedger {
     /// The group name every line carries.
     group: &'static str,
+    /// How many cases the group set out to measure, from the same iteration counts its loops use.
+    ///
+    /// Present for the same reason as [`RatioLedger::expected`]: `over=0` from a pass that measured
+    /// nine configurations and `over=0` from a pass whose fixture was missing are the same three
+    /// characters, and only this field tells them apart.
+    expected: u32,
     /// How many cases produced a ratio at all.
     cases: u32,
     /// How many exceeded [`GATE_MEMORY_RATIO`]. This is the number a workflow reads.
@@ -3274,10 +3397,11 @@ struct MemoryLedger {
 }
 
 impl MemoryLedger {
-    /// An empty ledger for `group`.
-    const fn new(group: &'static str) -> Self {
+    /// An empty ledger for `group`, expecting `expected` cases.
+    const fn new(group: &'static str, expected: u32) -> Self {
         Self {
             group,
+            expected,
             cases: 0,
             over: 0,
             dirty: 0,
@@ -3336,11 +3460,18 @@ impl MemoryLedger {
     }
 
     /// Print the group's aggregate `MEMORY-SUMMARY` line.
+    ///
+    /// `gate=authoritative` is a constant here rather than a field: this group exists only to measure
+    /// the quantity AAP §0.8.4 bounds at 1.15, so there is no supporting or informational memory
+    /// group for the word to distinguish it from. It is printed anyway, so that a consumer can parse
+    /// both summary kinds with one rule and can require the word it expects.
     fn finish(&self) {
         eprintln!(
-            "{LOG_PREFIX} {MEMORY_SUMMARY_KEY} group={group} cases={cases} over={over} \
-             dirty={dirty} limit={GATE_MEMORY_RATIO:.2}",
+            "{LOG_PREFIX} {MEMORY_SUMMARY_KEY} group={group} gate={gate} expected={expected} \
+             cases={cases} over={over} dirty={dirty} limit={GATE_MEMORY_RATIO:.2}",
             group = self.group,
+            gate = GatePolicy::Authoritative.tag(),
+            expected = self.expected,
             cases = self.cases,
             over = self.over,
             dirty = self.dirty,
@@ -3357,23 +3488,13 @@ impl MemoryLedger {
 /// Reported rather than asserted, and it answers a question the init handshake cannot. That handshake
 /// compares only the major digit (`deflate.c` L394), so it would pass against a reference reporting
 /// any `1.x`; this line prints the reference's *whole* string beside the `zlib.h` L44 constant
-/// [`version_ptr`] passes, which is how a reader confirms the two agree character for character rather
+/// the `zlib.h` L44 constant passes, which is how a reader confirms the two agree character for
 /// than merely in their first byte.
 fn oracle_version() -> Option<&'static str> {
-    // SAFETY: `zlibVersion` returns a pointer to `ZLIB_VERSION`, a string literal with static storage
-    // duration compiled into the oracle archive, so the pointee outlives the process and is never
-    // written through. It is documented never to return null, and the check below does not rely on
-    // that.
-    let raw = unsafe { oracle::c_zlibVersion() };
-    if raw.is_null() {
-        return None;
-    }
-
-    // SAFETY: `raw` is non-null, as just checked, and addresses that same NUL-terminated `'static`
-    // literal, so the string it describes is valid for reads for the whole program and the `'static`
-    // lifetime this borrow claims is honest.
-    let text = unsafe { CStr::from_ptr(raw) };
-    text.to_str().ok()
+    // The gate hands back what `c_zlibVersion` points at -- `ZLIB_VERSION`, a string literal with
+    // static storage duration compiled into the oracle archive -- as a `&'static CStr`, so the
+    // `'static` lifetime this function returns is the pointee's own rather than an assumption.
+    oracle::reference_version().to_str().ok()
 }
 
 /// Print the compiled configuration, the version handshake and both gates once, to stderr.
@@ -3411,10 +3532,12 @@ fn report_configuration() {
             "{LOG_PREFIX}   per-case lines are `{RATIO_KEY} group=... case=... bytes=... \
              port_ns=... oracle_ns=... ratio=... limit=... gate=counted|informational \
              verdict=within|over` and `{MEMORY_KEY} group=... case=... port_bytes=... \
-             oracle_bytes=... ratio=... limit=... verdict=within|over`, with one \
-             `{RATIO_SUMMARY_KEY}` or `{MEMORY_SUMMARY_KEY}` line per group and one \
-             `{BALANCE_KEY}` line per side per memory case. Reported, never enforced -- the \
-             workflow decides."
+             oracle_bytes=... ratio=... limit=... verdict=within|over`; then exactly one \
+             `{RATIO_SUMMARY_KEY}`/`{MEMORY_SUMMARY_KEY}` line per declared group, carrying \
+             `gate=authoritative|supporting|informational` and `expected=<cases the group set out \
+             to measure>` -- a group with nothing to measure still prints its line, with \
+             `expected=0` -- and one `{BALANCE_KEY}` line per side per memory case. Reported, \
+             never enforced -- the workflow decides."
         );
         eprintln!(
             "{LOG_PREFIX}   only payloads of at least {GATE_MIN_BYTES} bytes are gate=counted: \
@@ -3422,6 +3545,48 @@ fn report_configuration() {
              their ratio but do not enter the `over` tally. The informational groups \
              ({GROUP_STORED_FLOOR}, {GROUP_MEM_LEVEL}, {GROUP_STRATEGY}, {GROUP_DEGENERATE}, \
              {GROUP_BOUND}) are outside the gate by group name."
+        );
+
+        // The machine-readable half of everything above. A consumer of these lines needs three facts
+        // it cannot safely infer: which groups it is entitled to fail on, what the limits are, and
+        // where criterion put the measurements that actually decide the question. Printing them from
+        // the same constants and the same table the ledgers use means the two can be checked against
+        // each other -- and a consumer that requires the authoritative set it expects will fail if
+        // either side drifts, which is the point.
+        eprintln!(
+            "{LOG_PREFIX} {INVENTORY_KEY} suite=deflate ratio_limit={GATE_RATIO:.2} \
+             memory_limit={GATE_MEMORY_RATIO:.2} min_bytes={GATE_MIN_BYTES} \
+             levels={levels} authoritative_ratio={auth_ratio} supporting_ratio={sup_ratio} \
+             informational_ratio={info_ratio} authoritative_memory={auth_memory}",
+            levels = GATE_LEVELS
+                .iter()
+                .map(c_int::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            auth_ratio = groups_with(&RATIO_GROUP_POLICIES, GatePolicy::Authoritative),
+            sup_ratio = groups_with(&RATIO_GROUP_POLICIES, GatePolicy::Supporting),
+            info_ratio = groups_with(&RATIO_GROUP_POLICIES, GatePolicy::Informational),
+            auth_memory = groups_with(&MEMORY_GROUP_POLICIES, GatePolicy::Authoritative),
+        );
+
+        // ★ WHICH NUMBER DECIDES. The `RATIO` lines above are a self-timed diagnostic: a short
+        // calibration loop, a handful of rounds, best-of, no outlier rejection and no confidence
+        // interval. They exist so that every case has a visible number next to it even when criterion
+        // is filtered, and they are precise enough to see a factor but not to defend one.
+        //
+        // The measurement AAP §0.6.4.6 names is criterion's, and criterion writes it to disk rather
+        // than to this stream. So the location and the row layout are published here, because a
+        // consumer that has to guess them will guess wrong the first time the harness changes:
+        // for each group and case there are two rows, one per side, and the file under each is
+        // `new/estimates.json` with `slope` and `mean` point estimates in nanoseconds. `slope` is the
+        // one to prefer -- criterion fits it across the whole sample and its standard error was
+        // measured here at a third of `mean`'s on a loaded machine.
+        eprintln!(
+            "{LOG_PREFIX} {CRITERION_KEY} root={root} port_label={PORT_LABEL} \
+             oracle_label={ORACLE_LABEL} \
+             layout=<root>/<group>/<label>/<case>/new/estimates.json estimate=slope \
+             fallback=mean authority=criterion self_timed=diagnostic",
+            root = criterion_root().display(),
         );
         eprintln!(
             "{LOG_PREFIX}   ★ AAP §0.7.1(c): this suite may not change what the encoder emits. No \
@@ -3501,7 +3666,7 @@ enum Report {
 /// The stream is initialised once here, outside every timed closure, and `deflateReset` returns it to
 /// the start of a stream inside the closure. `deflateReset` keeps the window, the hash arrays and the
 /// pending buffer, so what is timed is the encode plus the cheap half of the lifecycle and not the
-/// allocator -- which is why this is the shape the AAP §0.8.4 throughput gate is read from.
+/// allocator -- which is why this is the shape the AAP §0.8.4 throughput ratio is read from.
 ///
 /// The reset is inside the timed region on purpose: it is what makes each iteration compress the same
 /// input from the beginning rather than continue a finished stream, so it is part of the work, not
@@ -3771,13 +3936,13 @@ fn measure_memory(ledger: &mut MemoryLedger, case: &Prepared<'_>) {
 /// One allocation-tracked encode through the port: its high-water mark, and whether the balance was
 /// clean.
 ///
-/// The counter is declared before the stream so that Rust's reverse declaration order drops the
-/// stream first: `deflateEnd` must run, and must return every block through [`tracked_free`], while
-/// the counter is still alive.
+/// The tracker is declared before the stream so that Rust's reverse declaration order drops the
+/// stream first: `deflateEnd` must run, and must return every block through the tracker's `zfree`
+/// hook, while the ledger is still alive.
 fn tracked_port_encode(case: &Prepared<'_>) -> Option<(usize, bool)> {
-    let mut tracker = TrackedAllocator::new();
+    let tracker = port::TrackingAllocator::new();
     let mut port = PortDeflate::new();
-    port.install_allocator(tracker.opaque());
+    port.install_allocator(&tracker);
 
     let init = port.init(case.config);
     if init != Z_OK {
@@ -3801,7 +3966,8 @@ fn tracked_port_encode(case: &Prepared<'_>) -> Option<(usize, bool)> {
     // reject the relocated stream, free nothing, and report `frees=0` for a stream that was never
     // actually leaked. See [`PortDeflate::end`].
     let end = port.end();
-    let clean = tracker.report_balance(PORT_LABEL, &case.id) && end == Z_OK;
+    let report = tracker.report();
+    let clean = report_balance(&report, PORT_LABEL, &case.id) && end == Z_OK;
     if end != Z_OK {
         eprintln!(
             "{LOG_PREFIX} [{PORT_LABEL}] memory: deflateEnd returned {end} for {}, so the balance \
@@ -3810,14 +3976,14 @@ fn tracked_port_encode(case: &Prepared<'_>) -> Option<(usize, bool)> {
         );
     }
 
-    Some((tracker.highwater(), clean))
+    Some((report.high_water, clean))
 }
 
 /// One allocation-tracked encode through the reference. Same shape as [`tracked_port_encode`].
 fn tracked_oracle_encode(case: &Prepared<'_>) -> Option<(usize, bool)> {
-    let mut tracker = TrackedAllocator::new();
+    let tracker = port::TrackingAllocator::new();
     let mut reference = OracleDeflate::new();
-    reference.install_allocator(tracker.opaque());
+    reference.install_allocator(&tracker);
 
     let init = reference.init(case.config);
     if init != Z_OK {
@@ -3837,7 +4003,8 @@ fn tracked_oracle_encode(case: &Prepared<'_>) -> Option<(usize, bool)> {
 
     // As for the port: ended in place through `&mut`, before the balance is read.
     let end = reference.end();
-    let clean = tracker.report_balance(ORACLE_LABEL, &case.id) && end == Z_OK;
+    let report = tracker.report();
+    let clean = report_balance(&report, ORACLE_LABEL, &case.id) && end == Z_OK;
     if end != Z_OK {
         eprintln!(
             "{LOG_PREFIX} [{ORACLE_LABEL}] memory: c_deflateEnd returned {end} for {}, so the \
@@ -3846,7 +4013,7 @@ fn tracked_oracle_encode(case: &Prepared<'_>) -> Option<(usize, bool)> {
         );
     }
 
-    Some((tracker.highwater(), clean))
+    Some((report.high_water, clean))
 }
 
 /// Whether one tracked encode reached `Z_STREAM_END`, reporting rather than asserting.
@@ -3883,7 +4050,8 @@ fn encode_completed(label: &str, case: &Prepared<'_>, outcome: Option<Encode>) -
 //  The groups
 // =================================================================================================
 
-/// The group the AAP §0.8.4 throughput gate is read from.
+/// The tier-1 group the ≤10% throughput ratio is read from; see [`GROUP_SILESIA`] for the tier the
+/// acceptance measurement of AAP §0.8.4 comes from.
 const GROUP_STEADY_STATE: &str = "deflate_steady_state";
 
 /// The group that includes the per-stream setup cost.
@@ -3913,26 +4081,34 @@ const GROUP_BOUND: &str = "deflate_bound";
 /// The latency group for the degenerate and very short fixtures.
 const GROUP_DEGENERATE: &str = "deflate_degenerate";
 
-/// The group the AAP §0.8.4 memory gate is read from. Registers no criterion row.
+/// The group the ≤15% per-stream memory ratio is read from. Registers no criterion row.
 const GROUP_MEMORY: &str = "deflate_memory";
 
-/// The opt-in tier-2 group.
+/// The opt-in tier-2 group, and the one AAP §0.8.4's acceptance measurement is read from. Never
+/// registered in CI, because no job provisions the corpus.
 const GROUP_SILESIA: &str = "deflate_silesia";
 
 /// Steady-state compression throughput, per fixture and per gated level.
 ///
-/// ★ This is the group the ≤10% throughput gate of AAP §0.8.4 is read from. The container is zlib,
-/// the `memLevel` is the default 8, the strategy is `Z_DEFAULT_STRATEGY` and the feeding is the
-/// reference driver's 32768-byte chunking, so the axis is exactly the one the gate names: levels 1, 6
-/// and 9 over every committed fixture whose encode profile differs.
+/// ★ This is the group the ≤10% throughput ratio is read from on tier 1, and the only throughput
+/// group the `bench` job of `.github/workflows/rust.yml` can gate, because it is the only one whose
+/// corpus is committed. The container is zlib, the `memLevel` is the default 8, the strategy is
+/// `Z_DEFAULT_STRATEGY` and the feeding is the reference driver's 32768-byte chunking, so the axis is
+/// the one AAP §0.8.4 describes: levels 1, 6 and 9 over every committed fixture whose encode profile
+/// differs. The corpus, however, is not the one it names -- that is [`deflate_silesia`], which CI
+/// never runs.
 fn deflate_steady_state(c: &mut Criterion) {
     report_configuration();
 
     let mut group = c.benchmark_group(GROUP_STEADY_STATE);
     configure(&mut group);
-    let mut ledger = RatioLedger::new(GROUP_STEADY_STATE);
+    let fixtures = selected(&FIXTURE_NAMES);
+    let mut ledger = RatioLedger::for_group(
+        GROUP_STEADY_STATE,
+        expected_cases(fixtures.len() * GATE_LEVELS.len()),
+    );
 
-    for fixture in selected(&FIXTURE_NAMES) {
+    for fixture in &fixtures {
         for level in GATE_LEVELS {
             let id = format!("{name}-L{level}", name = fixture.name);
             let Some(case) = prepare(id, &fixture.bytes, Config::at_level(level), DEFAULT_FEEDING)
@@ -3957,9 +4133,10 @@ fn deflate_lifecycle(c: &mut Criterion) {
 
     let mut group = c.benchmark_group(GROUP_LIFECYCLE);
     configure(&mut group);
-    let mut ledger = RatioLedger::new(GROUP_LIFECYCLE);
+    let fixtures = selected(&LIFECYCLE_FIXTURE_NAMES);
+    let mut ledger = RatioLedger::for_group(GROUP_LIFECYCLE, expected_cases(fixtures.len()));
 
-    for fixture in selected(&LIFECYCLE_FIXTURE_NAMES) {
+    for fixture in &fixtures {
         let id = format!("{name}-L{DEFAULT_LEVEL}", name = fixture.name);
         let Some(case) = prepare(
             id,
@@ -3987,9 +4164,13 @@ fn deflate_container(c: &mut Criterion) {
 
     let mut group = c.benchmark_group(GROUP_CONTAINER);
     configure(&mut group);
-    let mut ledger = RatioLedger::new(GROUP_CONTAINER);
+    let fixtures = selected(&AXIS_FIXTURE_NAMES);
+    let mut ledger = RatioLedger::for_group(
+        GROUP_CONTAINER,
+        expected_cases(fixtures.len() * CONTAINERS.len()),
+    );
 
-    for fixture in selected(&AXIS_FIXTURE_NAMES) {
+    for fixture in &fixtures {
         for container in CONTAINERS {
             let id = format!("{name}-{tag}", name = fixture.name, tag = container.tag());
             let Some(case) = prepare(
@@ -4021,9 +4202,13 @@ fn deflate_feeding(c: &mut Criterion) {
 
     let mut group = c.benchmark_group(GROUP_FEEDING);
     configure(&mut group);
-    let mut ledger = RatioLedger::new(GROUP_FEEDING);
+    let fixtures = selected(&AXIS_FIXTURE_NAMES);
+    let mut ledger = RatioLedger::for_group(
+        GROUP_FEEDING,
+        expected_cases(fixtures.len() * FEEDINGS.len()),
+    );
 
-    for fixture in selected(&AXIS_FIXTURE_NAMES) {
+    for fixture in &fixtures {
         for feeding in FEEDINGS {
             let id = format!("{name}-{tag}", name = fixture.name, tag = feeding.tag());
             let Some(case) = prepare(id, &fixture.bytes, Config::at_level(DEFAULT_LEVEL), feeding)
@@ -4049,9 +4234,13 @@ fn deflate_mem_level(c: &mut Criterion) {
 
     let mut group = c.benchmark_group(GROUP_MEM_LEVEL);
     configure(&mut group);
-    let mut ledger = RatioLedger::informational(GROUP_MEM_LEVEL);
+    let fixtures = selected(&AXIS_FIXTURE_NAMES);
+    let mut ledger = RatioLedger::for_group(
+        GROUP_MEM_LEVEL,
+        expected_cases(fixtures.len() * AXIS_MEM_LEVELS.len()),
+    );
 
-    for fixture in selected(&AXIS_FIXTURE_NAMES) {
+    for fixture in &fixtures {
         for mem_level in AXIS_MEM_LEVELS {
             let id = format!("{name}-mem{mem_level}", name = fixture.name);
             let config = Config::at_level(DEFAULT_LEVEL).with_mem_level(mem_level);
@@ -4077,9 +4266,13 @@ fn deflate_strategy(c: &mut Criterion) {
 
     let mut group = c.benchmark_group(GROUP_STRATEGY);
     configure(&mut group);
-    let mut ledger = RatioLedger::informational(GROUP_STRATEGY);
+    let fixtures = selected(&AXIS_FIXTURE_NAMES);
+    let mut ledger = RatioLedger::for_group(
+        GROUP_STRATEGY,
+        expected_cases(fixtures.len() * AXIS_STRATEGIES.len()),
+    );
 
-    for fixture in selected(&AXIS_FIXTURE_NAMES) {
+    for fixture in &fixtures {
         for strategy in AXIS_STRATEGIES {
             let id = format!(
                 "{name}-{tag}",
@@ -4111,9 +4304,13 @@ fn compress_oneshot(c: &mut Criterion) {
 
     let mut group = c.benchmark_group(GROUP_ONE_SHOT);
     configure(&mut group);
-    let mut ledger = RatioLedger::new(GROUP_ONE_SHOT);
+    let fixtures = selected(&FIXTURE_NAMES);
+    let mut ledger = RatioLedger::for_group(
+        GROUP_ONE_SHOT,
+        expected_cases(fixtures.len() * ONE_SHOTS.len()),
+    );
 
-    for fixture in selected(&FIXTURE_NAMES) {
+    for fixture in &fixtures {
         for entry in ONE_SHOTS {
             let id = format!("{name}-{tag}", name = fixture.name, tag = entry.tag());
             let Some(case) = prepare(
@@ -4143,9 +4340,10 @@ fn deflate_stored_floor(c: &mut Criterion) {
 
     let mut group = c.benchmark_group(GROUP_STORED_FLOOR);
     configure(&mut group);
-    let mut ledger = RatioLedger::informational(GROUP_STORED_FLOOR);
+    let fixtures = selected(&AXIS_FIXTURE_NAMES);
+    let mut ledger = RatioLedger::for_group(GROUP_STORED_FLOOR, expected_cases(fixtures.len()));
 
-    for fixture in selected(&AXIS_FIXTURE_NAMES) {
+    for fixture in &fixtures {
         let id = format!("{name}-L{STORED_LEVEL}", name = fixture.name);
         let Some(case) = prepare(
             id,
@@ -4177,7 +4375,7 @@ fn deflate_bound(c: &mut Criterion) {
 
     let mut group = c.benchmark_group(GROUP_BOUND);
     configure_short(&mut group);
-    let mut ledger = RatioLedger::informational(GROUP_BOUND);
+    let mut ledger = RatioLedger::for_group(GROUP_BOUND, expected_cases(BOUND_ENTRIES.len()));
 
     for entry in BOUND_ENTRIES {
         let id = format!("{name}-{tag}", name = fixture.name, tag = entry.tag());
@@ -4212,9 +4410,10 @@ fn deflate_degenerate(c: &mut Criterion) {
 
     let mut group = c.benchmark_group(GROUP_DEGENERATE);
     configure_short(&mut group);
-    let mut ledger = RatioLedger::informational(GROUP_DEGENERATE);
+    let fixtures = selected(&DEGENERATE_FIXTURE_NAMES);
+    let mut ledger = RatioLedger::for_group(GROUP_DEGENERATE, expected_cases(fixtures.len()));
 
-    for fixture in selected(&DEGENERATE_FIXTURE_NAMES) {
+    for fixture in &fixtures {
         let id = format!(
             "{name}-{len}B",
             name = fixture.name,
@@ -4256,10 +4455,17 @@ fn deflate_memory(_c: &mut Criterion) {
     report_configuration();
 
     let Some(fixture) = memory_fixture() else {
+        // As in the Silesia group: one summary line in every run, `expected=0` when the fixture this
+        // pass needs could not be loaded, so that a consumer can require the line's presence and
+        // never has to read its absence as a pass.
+        MemoryLedger::new(GROUP_MEMORY, 0).finish();
         return;
     };
 
-    let mut ledger = MemoryLedger::new(GROUP_MEMORY);
+    let mut ledger = MemoryLedger::new(
+        GROUP_MEMORY,
+        expected_cases(GATE_LEVELS.len() * MEMORY_MEM_LEVELS.len()),
+    );
 
     for level in GATE_LEVELS {
         for mem_level in MEMORY_MEM_LEVELS {
@@ -4280,10 +4486,12 @@ fn deflate_memory(_c: &mut Criterion) {
 
 /// Steady-state throughput over the opt-in tier-2 corpus, or one note and nothing else.
 ///
-/// This is the corpus AAP §0.8.4 names for the throughput gate, and it is measured in the gate
-/// configuration only -- levels 1, 6 and 9, zlib, `memLevel` 8, 32768-byte chunking -- because the
-/// other axes are already covered on tier 1, where a case costs milliseconds rather than seconds.
-/// Skipped entirely, with a single note from [`silesia_members`], when the corpus is not present.
+/// This is the corpus AAP §0.8.4 names, so this group is where its acceptance measurement is taken.
+/// It is measured in one configuration only -- levels 1, 6 and 9, zlib, `memLevel` 8, 32768-byte
+/// chunking -- because the other axes are already covered on tier 1, where a case costs milliseconds
+/// rather than seconds. Skipped entirely, with a single note from [`silesia_members`], when the
+/// corpus is not present, which is the case in CI: no job fetches it, so nobody should treat a green
+/// CI bench run as this measurement having been taken.
 ///
 /// Each member is read, prepared, measured and dropped inside one loop iteration, so the peak memory
 /// is one member plus one output buffer rather than the whole two-hundred-megabyte corpus at once.
@@ -4292,12 +4500,21 @@ fn deflate_silesia(c: &mut Criterion) {
 
     let members = silesia_members();
     if members.is_empty() {
+        // A summary line even with nothing to summarise, so that EVERY group named in the
+        // `GATE-INVENTORY` line emits exactly one summary line in every run. A consumer can then
+        // require one line per declared group and read `expected=0` as "this group had no corpus",
+        // instead of having to treat a missing line as either an absent corpus or a broken run -- and
+        // an absent line is the one thing a parser cannot tell those two apart by.
+        RatioLedger::for_group(GROUP_SILESIA, 0).finish();
         return;
     }
 
     let mut group = c.benchmark_group(GROUP_SILESIA);
     configure(&mut group);
-    let mut ledger = RatioLedger::new(GROUP_SILESIA);
+    let mut ledger = RatioLedger::for_group(
+        GROUP_SILESIA,
+        expected_cases(members.len() * GATE_LEVELS.len()),
+    );
 
     for path in members {
         let Some(name) = path.file_name().and_then(OsStr::to_str) else {
@@ -4309,22 +4526,10 @@ fn deflate_silesia(c: &mut Criterion) {
             continue;
         };
 
-        let bytes = match fs::read(path) {
-            Ok(bytes) if bytes.is_empty() => {
-                eprintln!(
-                    "{LOG_PREFIX} skipping Silesia member {name}: it is empty, and a zero-byte case \
-                     has no rate to report."
-                );
-                continue;
-            }
-            Ok(bytes) => bytes,
-            Err(error) => {
-                eprintln!(
-                    "{LOG_PREFIX} skipping Silesia member {name}: cannot read {}: {error}",
-                    path.display()
-                );
-                continue;
-            }
+        // Bounded by `silesia_member_ceiling()` before a byte is allocated; every rejection is a
+        // named note and this loop continues, exactly as the missing-member path does.
+        let Some(bytes) = silesia_member_bytes(path, name) else {
+            continue;
         };
 
         for level in GATE_LEVELS {
@@ -4369,3 +4574,13 @@ criterion_group!(
     deflate_silesia,
 );
 criterion_main!(deflate_benches);
+
+/// The number of cases a group set out to measure, as the ledgers' `expected` field wants it.
+///
+/// Saturating rather than panicking, and the saturation is unreachable in practice: the largest
+/// product any group forms is a handful of fixtures times a handful of levels. A benchmark should not
+/// abort over its own bookkeeping, and `u32::MAX` would fail a `cases == expected` check just as
+/// loudly as a panic would.
+fn expected_cases(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
+}

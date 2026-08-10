@@ -240,10 +240,9 @@
 //! }
 //! ```
 //!
-//! [`Adler32Simd`] is public, and deliberately so: the planned `benches/checksum_bench.rs` is to
-//! measure the scalar and vectorised backends against each other from outside this crate, which
-//! it can only do if it can name both. That benchmark has not landed yet, so the type is public
-//! for a consumer that does not exist here. Every kernel helper stays private.
+//! [`Adler32Simd`] is public, and deliberately so: `benches/checksum_bench.rs` measures the scalar
+//! and vectorised backends against each other from outside this crate, which it can only do if it
+//! can name both. Every kernel helper stays private.
 //!
 //! # Layering and safety posture
 //!
@@ -344,14 +343,21 @@ const SHORT_INPUT_LEN: usize = SUB_CHUNK;
 /// the whole basis for the value.
 ///
 /// **This threshold is a design choice, not a measured crossover.** An earlier version of this
-/// comment published a per-size ratio table as though it had been measured; no benchmark artifact
-/// exists in this repository (`benches/` has not landed), so no such table can be substantiated
-/// and it has been removed rather than left to be read as evidence.
+/// comment published a per-size ratio table as though it had been measured; no measurement is
+/// committed in this repository, so no such table can be substantiated and it has been removed
+/// rather than left to be read as evidence. `benches/checksum_bench.rs` is where a crossover
+/// could be measured, and its numbers belong in a committed artifact rather than in this comment.
 ///
 /// The *goal* the threshold serves is that this backend should not be the slower of the two at any
 /// length, which is what would make selecting it a free decision for the parent module rather than
-/// a trade-off. Establishing that -- and retuning the constant if it does not hold -- is work for
-/// `benches/checksum_bench.rs`, which should record its numbers where they can be reproduced.
+/// a trade-off. `benches/checksum_bench.rs` is where that is established or refuted: its
+/// `adler32_backends` group carries one row per backend, and the shortest of its three lengths is
+/// this constant exactly -- chosen as the shortest input on which the vectorised arrangement is
+/// asked to do any work. Note what that does *not* cover: the sweep does not descend below the
+/// threshold, so it measures this backend where it is selected rather than establishing the
+/// crossover itself. The `simd` feature has to be on for the row to exist, and no CI job gates its
+/// output, so retuning this constant means running it deliberately and recording the numbers where
+/// they can be reproduced rather than in prose.
 ///
 /// Delegation is not a behavioural fork: the two backends agree bit for bit on every input and
 /// every starting value, which is the property the equivalence sweep at the bottom of this file
@@ -441,9 +447,9 @@ const _: () = assert!(
 // cannot widen the accumulation the loop shape was written for, and the backend would then be
 // doing the scalar work with extra bookkeeping -- i.e. slower than the code it exists to
 // replace. That is the design reason, and it is a prediction about codegen, not a measurement:
-// no benchmark artifact is committed in this repository yet (`benches/` does not exist). Do not
-// weaken this to a hint without measuring first, and record the numbers where they can be
-// reproduced rather than in prose.
+// no measurement is committed in this repository, and none belongs in a comment. Do not weaken
+// this to a hint without measuring first -- `benches/checksum_bench.rs` is where a number can be
+// reproduced -- and record it there rather than in prose.
 #[allow(clippy::inline_always)]
 #[inline(always)]
 #[must_use]
@@ -533,9 +539,9 @@ fn accumulate_bytes(mut sum1: u32, mut sum2: u32, bytes: &[u8]) -> (u32, u32) {
 // cannot widen the accumulation the loop shape was written for, and the backend would then be
 // doing the scalar work with extra bookkeeping -- i.e. slower than the code it exists to
 // replace. That is the design reason, and it is a prediction about codegen, not a measurement:
-// no benchmark artifact is committed in this repository yet (`benches/` does not exist). Do not
-// weaken this to a hint without measuring first, and record the numbers where they can be
-// reproduced rather than in prose.
+// no measurement is committed in this repository, and none belongs in a comment. Do not weaken
+// this to a hint without measuring first -- `benches/checksum_bench.rs` is where a number can be
+// reproduced -- and record it there rather than in prose.
 #[allow(clippy::inline_always)]
 #[inline(always)]
 #[must_use]

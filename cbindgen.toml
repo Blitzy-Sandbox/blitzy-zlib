@@ -5,31 +5,37 @@
 #  Every program that links `libz` was compiled against them, so a single
 #  changed signature, struct layout or constant silently breaks binaries that
 #  are never going to be recompiled.  Protecting that contract is not left to
-#  code review; it is to be enforced by four independent mechanical gates:
+#  code review; it is enforced by four independent mechanical gates:
 #
 #    1. compile-time layout assertions  crates/libz-rs-sys/src/layout_assertions.rs
 #    2. the cbindgen header diff        THIS FILE
 #    3. the `nm` symbol-parity diff     crates/libz-rs-sys/tests/symbol_parity.rs
 #    4. the C89 -> gnu2x compile sweep  .github/workflows/c-std.yml
 #
-#  STATE OF THOSE GATES.  Gate 1 is in the tree and runs on every build: the
-#  `const _: () = assert!(...)` items in
+#  STATE OF THOSE GATES.  All four are in the tree and all four run unattended.
+#  Gate 1 runs on every build: the `const _: () = assert!(...)` items in
 #  `crates/libz-rs-sys/src/layout_assertions.rs` are evaluated because the module
 #  is declared, so layout drift is a compile error.  Gate 4 is in the tree and
 #  runs in CI: `.github/workflows/c-std.yml` proves the unchanged `zlib.h`
-#  compiles from C89 through gnu2x.  Gate 3 names a file that has not been
-#  written; the equivalent nm diff exists only as `Makefile.in`'s `rust-test` and
-#  `rust-symbols` targets, which nothing invokes automatically.
+#  compiles from C89 through gnu2x.  Gate 3 is in the tree three times over:
+#  `crates/libz-rs-sys/tests/symbol_parity.rs` performs the nm diff inside
+#  `cargo test`, `Makefile.in`'s `rust` target performs it against `zlib.h` and
+#  `zlib.map` while staging the library, and `rust.yml`'s symbol-parity job runs
+#  that target plus `rust-symbols` for the direct diff against a built C library.
 #
-#  Gate 2 -- this file's own gate -- is half present.  cbindgen reads the facade
-#  crate and emits a header, so the GENERATION step works and is worth running.
-#  The COMPARISON step is not wired anywhere: the normalised comparison specified
-#  below is a specification, not a script, and no CI job performs it.  So treat
-#  everything under "NORMALISATION RULES THE GATE MUST IMPLEMENT" as the contract
-#  an executable gate has to satisfy rather than as a description of a check that
-#  runs.  Statements of the form "verified" or "reproduced" are marked where they
-#  were established against cbindgen 0.29.4 itself -- its `Config` schema, its
-#  emitted syntax, the two `zconf.h` compile failures.
+#  Gate 2 -- this file's own gate -- now runs end to end, in two halves.
+#  `make rust-header` implements rules A1, A2, A5 and A9 and the standalone
+#  C89/C99/C17/C++17 compile sweep; `rust.yml`'s header-conformance job runs that
+#  target and then the SHAPE half -- rules A3, A4, A6, A7, A8 and rule 10 -- by
+#  re-declaring every generated prototype in a translation unit that has already
+#  included `zlib.h`, so the C compiler itself reports a conflicting type, and by
+#  comparing struct sizes, field offsets and macro values through one probe
+#  program per side.  So "NORMALISATION RULES THE GATE MUST IMPLEMENT" below is
+#  both the specification and a description of what runs; where a rule is
+#  implemented, the rule says by which half.  Statements of the form "verified" or
+#  "reproduced" are marked where they were established against cbindgen 0.29.4
+#  itself -- its `Config` schema, its emitted syntax, the two `zconf.h` compile
+#  failures.
 #
 #  This file drives gate 2.  It tells cbindgen how to render the facade crate's
 #  exported surface as a C header so that header can be compared against the
@@ -38,8 +44,8 @@
 #    cbindgen --config cbindgen.toml --crate libz-rs-sys --output generated_zlib.h
 #
 #  A bare `diff -u zlib.h generated_zlib.h` is a USEFUL EYEBALL, NOT THE GATE --
-#  see "READ THIS BEFORE WRITING OR CHANGING THE CI GATE" below for why its
-#  output can never be empty and what the gate has to do instead.
+#  see "READ THIS BEFORE CHANGING THE CI GATE" below for why its output can never
+#  be empty and what the gate does instead.
 #
 #  `generated_zlib.h` is scratch.  `.gitignore` has an anchored `/generated_zlib.h`
 #  rule precisely so it can never be committed: a second header sitting beside
@@ -51,7 +57,7 @@
 #  `--output` at `zlib.h`, `zconf.h`, `test/`, `examples/` or any install
 #  directory.  If the diff shows a difference, the Rust facade is what changes.
 #
-#  READ THIS BEFORE WRITING OR CHANGING THE CI GATE
+#  READ THIS BEFORE CHANGING THE CI GATE
 #  ------------------------------------------------
 #  A verbatim `diff -u zlib.h generated_zlib.h` is NOT empty and never will be,
 #  so it must never be wired up as the pass/fail check.  Run it by hand to read
@@ -67,10 +73,11 @@
 #
 #  Each category below was derived from cbindgen 0.29.4's own behaviour and
 #  schema -- its emitted syntax, its `Config` definition, and, for D3, two
-#  reproduced compile failures -- rather than from a facade, which does not exist
-#  yet.  None of them is speculative about the generator; none of them is a
-#  record of a completed end-to-end run either.  Anything a diff hunk shows that
-#  is not on that list is a real defect: fix the facade, do not extend the list.
+#  reproduced compile failures -- rather than from the facade, so none of them is
+#  speculative about the generator.  The facade is now in the tree and the two
+#  halves described above run against it, so the list is also a record of what
+#  those runs tolerate.  Anything a diff hunk shows that is not on that list is a
+#  real defect: fix the facade, do not extend the list.
 #
 #  ACCEPTED DIVERGENCES  (structural; each one normalised away by the gate)
 #  D1. Declaration decoration.  `zlib.h` writes every prototype as
@@ -141,13 +148,16 @@
 #          over the UNCHANGED header, plus `test/example.c` relinked against the
 #          Rust library -- it drives `deflateInit` (L181), `inflateInit` (L222)
 #          and `gzgetc` (L141) through the macros, so a macro that stopped
-#          agreeing with the exported `_` forms would fail it -- and, once it is
-#          written, `tests/c_api_parity.rs`.  Neither the relink nor that test
-#          runs today.
-#        * `ZLIB_VERSION`, the string, is likewise out of scope here and is to be
+#          agreeing with the exported `_` forms would fail it -- and
+#          `crates/libz-rs-sys/tests/c_api_parity.rs`.  Both run: the `dropin` job
+#          in `.github/workflows/rust.yml` compiles all three unmodified C drivers
+#          against the Rust library and runs them, and `c_api_parity.rs` runs under
+#          `cargo test`.
+#        * `ZLIB_VERSION`, the string, is likewise out of scope here and is
 #          checked by comparing `zlibVersion()`'s return value against the
 #          header literal -- the check `test/example.c` makes before anything
-#          else, and which `tests/c_api_parity.rs` is to mirror.
+#          else, which `tests/c_api_parity.rs` mirrors, and which the `dropin` job
+#          additionally asserts by grepping the relinked driver's own output.
 #
 #      Do not widen this gate to "the full header contract" in prose without
 #      widening rule 10 to match: an over-claimed scope is worse than a narrow
@@ -298,19 +308,33 @@
 #
 #  NORMALISATION RULES THE GATE MUST IMPLEMENT
 #  -------------------------------------------
-#  This is the SPECIFICATION of the comparison.  Part of it now runs:
-#  `make rust-header` (Makefile.in) regenerates the artifact, requires
-#  cbindgen's stderr to be within an enumerated two-line allowance, compiles the
-#  result standalone as C89, C99, C17 and C++17 with warnings fatal, and
-#  compares the DECLARED FUNCTION NAMES against `zlib.h`'s `ZEXTERN` set in both
-#  directions -- rules A1, A2, A5 and A9, with the differences it is allowed to
-#  tolerate spelled out as two named, printed allowances rather than left
-#  implicit.  What is NOT yet implemented is the part that compares SHAPE:
-#  rules A3, A4, A6, A7, A8 and rule 10, which need the typedef chain resolved
-#  and the macro values evaluated on both sides.  Those belong to
-#  `.github/workflows/rust.yml`, which does not exist yet, and until they run no
-#  command anywhere may be described as having verified a signature.  Ten rules,
-#  in this order:
+#  This is the SPECIFICATION of the comparison, and all ten rules now run.
+#
+#  `make rust-header` (Makefile.in) regenerates the artifact, requires cbindgen's
+#  stderr to be within an enumerated two-line allowance, compiles the result
+#  standalone as C89, C99, C17 and C++17 with warnings fatal, and compares the
+#  DECLARED FUNCTION NAMES against `zlib.h`'s `ZEXTERN` set in both directions --
+#  rules A1, A2, A5 and A9, with the differences it is allowed to tolerate spelled
+#  out as two named, printed allowances rather than left implicit.
+#
+#  The SHAPE rules run in the `header` job of `.github/workflows/rust.yml`, and
+#  they are delegated to the C compiler rather than reimplemented as text
+#  normalisation: each generated prototype is re-declared in a translation unit
+#  that has already included `zlib.h` and compiled with `-fsyntax-only` under
+#  warnings-as-errors, so a conflicting redeclaration is a compile error.  That
+#  discharges A3, A4, A6, A7 and A8 at once -- the compiler resolves the `zconf.h`
+#  typedef chain, ignores parameter names and canonicalises bare `unsigned` -- and
+#  it is stricter than comparing normalised strings, because it cannot be fooled
+#  by a normalisation that is itself wrong.  The same job compares the four
+#  function-pointer typedefs the same way, evaluates the integer macro values,
+#  `sizeof` and `offsetof` on both sides for pass B, and enforces rule 10 as
+#  set EQUALITY of the contract-shaped macro names, both directions, with its one
+#  allowance (`Z_U4`) named and printed.
+#
+#  Measured on this tree: 95 of the 96 contract signatures compared by the
+#  compiler (the 96th is the `gzopen_w` allowance below), four typedefs, 38
+#  integer macros, three struct sizes, 30 struct fields, and 39 contract-shaped
+#  macro names against 38.  Ten rules, in this order:
 #
 #  PASS A -- SIGNATURES, STRUCTS AND TYPEDEFS
 #  Validated against this configuration; reduces the comparison to ZERO
@@ -685,6 +709,22 @@ exclude = [
     "wchar_t",
     "malloc",
     "free",
+    #  The layout probe `crates/libz-rs-sys/tests/abi_layout.rs` uses to pin the
+    #  crate-private state prefix.  Rust-ABI rather than `extern "C"`, so it is not a
+    #  symbol either implementation exports, and `zlib.h` declares nothing of the kind
+    #  -- it exists so that the ABI suite can assert against the REAL prefix instead of
+    #  a mirror that could drift from it.  Listed here so that a future cbindgen
+    #  release which starts emitting Rust-ABI functions or their return types cannot
+    #  add a declaration the contract does not contain.
+    "state_prefix_layout",
+    "StatePrefixLayout",
+    #  The caller-side `va_list` probe `csrc/gzvprintf_probe.c` defines so that
+    #  `gzvprintf` can be called the way a logging wrapper calls it.  Hidden through
+    #  `ZLIB_INTERNAL` and hidden again by `zlib.map`'s `local: _*;`, so it is no part
+    #  of the exported surface; the entry is inert today because cbindgen parses Rust
+    #  and this symbol is defined in C, and it is listed for the same belt-and-braces
+    #  reason the three `_zlib_rs_*` names above are.
+    "_zlib_rs_gzvprintf_probe",
 ]
 
 #  Understand the mechanism before adding an entry.  This table is an exact,

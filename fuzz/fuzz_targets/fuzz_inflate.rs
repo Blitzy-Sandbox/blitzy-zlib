@@ -1,4 +1,5 @@
 #![no_main]
+#![forbid(unsafe_code)]
 //! Arbitrary, attacker-controlled bytes into `inflate` -- the library's primary
 //! untrusted-input attack surface.
 //!
@@ -31,28 +32,35 @@
 //!
 //! # Why the tracking allocator is ported and not simplified away
 //!
-//! `test/infcover.c`'s zone is worth more than a `malloc` shim, for three reasons that
-//! all apply here:
+//! `test/infcover.c`'s zone is worth more than a `malloc` shim, for three reasons. Two of
+//! them are load-bearing here and the third is a guard rather than a detector, which is
+//! worth stating so the coverage is not read as wider than it is:
 //!
-//! * It fills every block with `0xa5` (`test/infcover.c` L87) rather than zeros, so any
-//!   path that quietly assumes zero-initialised memory misbehaves visibly.
 //! * Its `mem_done` (L200-L234) detects leaks, non-LIFO frees and rogue frees. Those
 //!   three are the observable face of the allocator contract: memory obtained from a
 //!   caller's `zalloc` may only be returned to that same caller's `zfree`. Here they are
 //!   assertions rather than messages on stderr, so a violation is a crash report.
 //! * Its `limit` induces allocation failure at a controlled point, which turns
 //!   `Z_MEM_ERROR` from a path fuzzing reaches by luck into one it reaches on purpose.
+//! * It fills every block with `0xa5` (`test/infcover.c` L87) rather than zeros. In C that
+//!   exposes any path that assumes zero-initialised memory. Against this port it cannot,
+//!   and [`ALLOC_FILL_BYTE`] explains why in full: the facade pre-fills every buffer
+//!   allocation itself and fully initialises the one block it does not pre-fill, so the
+//!   library never observes this byte. What the fill provides here is therefore not
+//!   detection but *falsifiability* -- it is what would make a future change that started
+//!   handing a buffer out unfilled visible instead of silent.
 //!
 //! # Unsafe
 //!
-//! This target drives the C ABI, so raw pointers are inherent to it and `unsafe` is
-//! permitted -- `#![forbid(unsafe_code)]` binds the safe core crate, not this harness.
-//! Every block below carries a `// SAFETY:` comment naming its invariant, the manifest
-//! denies `unsafe_op_in_unsafe_fn` so each operation is scoped individually, and
-//! `extern "C-unwind"` appears nowhere: the two allocator hooks are called *from* the
-//! library and a panic crossing that edge would be undefined behaviour, so they are
-//! panic-free by construction and answer every failure with a null pointer, exactly as
-//! `mem_alloc` answers with `NULL` and the caller turns that into `Z_MEM_ERROR`.
+//! There is none: this file carries `#![forbid(unsafe_code)]`, which the compiler enforces.
+//! Driving the C ABI does require raw pointers, and every one of them is formed inside
+//! `zlib_rs_differential::port` -- the harness crate's documented FFI boundary -- where each
+//! `unsafe` block carries a `// SAFETY:` comment naming its invariant. That is also where
+//! the two allocator hooks live, and it is where they have to live: they are called *from*
+//! the library across an `extern "C"` edge, so a panic escaping one would be undefined
+//! behaviour, and they are panic-free by construction and answer every failure with a null
+//! pointer, exactly as `mem_alloc` answers with `NULL` and the caller turns that into
+//! `Z_MEM_ERROR`.
 //!
 //! `assert!` inside the fuzz target body is a different matter and is the intended
 //! reporting mechanism: it runs on this harness's own stack, never inside a callback.
@@ -65,30 +73,32 @@
 //! ```
 //!
 //! `+nightly` because `../rust-toolchain.toml` pins stable and cargo-fuzz's sanitizer
-//! instrumentation is nightly-only. AddressSanitizer is on by default, so that command
-//! is simultaneously the fuzzing gate and the ASan gate for the boundary layer.
+//! instrumentation is nightly-only. The `fuzz` job in `.github/workflows/rust.yml` runs
+//! exactly that command on every push.
+//!
+//! `AddressSanitizer` is on by default under cargo-fuzz, so this run is sanitized -- over the
+//! code paths this target drives. It is not the boundary layer's ASan gate: that is the
+//! separate `asan` job, scoped to `cargo test -p libz-rs-sys` plus the three relinked C
+//! drivers. Arbitrary input here, systematic coverage there.
 
-use std::alloc::{alloc, dealloc, Layout};
-use std::ffi::{c_int, c_long, c_ulong, c_void};
-use std::mem::size_of;
-use std::ptr::{self, addr_of_mut};
+use std::ffi::{c_int, c_long, c_ulong};
+use std::ptr;
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 
-// The facade is imported as `libz_rs_sys` and never as `z`. `crates/libz-rs-sys` sets
-// `[lib] name = "z"` so that cargo emits the drop-in `libz.so`/`libz.a`, and cargo
-// derives a dependency's default `--extern` name from the lib target rather than the
-// package; `fuzz/Cargo.toml` therefore renames the key back to `libz_rs_sys`. Writing
-// `use z::...` here would not compile.
+// The facade is imported as `libz_rs_sys` and never as `z`, and only for its types and
+// constants -- every entry point is reached through `zlib_rs_differential::port`.
+// `crates/libz-rs-sys` sets `[lib] name = "z"` so that cargo emits the drop-in
+// `libz.so`/`libz.a`, and cargo derives a dependency's default `--extern` name from the lib
+// target rather than the package; `fuzz/Cargo.toml` therefore renames the key back to
+// `libz_rs_sys`. Writing `use z::...` here would not compile.
 use libz_rs_sys::{
-    gz_header, inflate, inflateCodesUsed, inflateCopy, inflateEnd, inflateGetDictionary,
-    inflateGetHeader, inflateInit2_, inflateMark, inflatePrime, inflateReset, inflateReset2,
-    inflateSetDictionary, inflateSync, inflateSyncPoint, inflateUndermine, inflateValidate, uInt,
-    uLong, voidpf, z_stream, Bytef, MAX_WBITS, ZLIB_VERSION, Z_BLOCK, Z_BUF_ERROR, Z_DATA_ERROR,
-    Z_FINISH, Z_MEM_ERROR, Z_NEED_DICT, Z_NO_FLUSH, Z_OK, Z_STREAM_END, Z_STREAM_ERROR,
-    Z_SYNC_FLUSH, Z_TREES,
+    gz_header, uInt, uLong, z_stream, MAX_WBITS, Z_BLOCK, Z_BUF_ERROR, Z_DATA_ERROR, Z_FINISH,
+    Z_MEM_ERROR, Z_NEED_DICT, Z_NO_FLUSH, Z_OK, Z_STREAM_END, Z_STREAM_ERROR, Z_SYNC_FLUSH,
+    Z_TREES,
 };
+use zlib_rs_differential::port::{self, GuardedBuf, TrackingAllocator, TrackingReport};
 
 // ---------------------------------------------------------------------------
 //  Bounds -- the anti-hang mechanism
@@ -110,11 +120,11 @@ use libz_rs_sys::{
 //     an input that consumes nothing while answering `Z_BUF_ERROR` would never reach; the
 //     two caps are what make it terminate for *every* input rather than for well-behaved
 //     ones. Reaching either is a successful stop and never an assertion failure.
-//   * `mem_free`'s and `mem_done`'s list walks -- bounded by the length of the allocation
-//     list, which is finite and acyclic by construction: a node is created once, inserted
-//     at the head once, and unlinked before it is released, so no node can be reached
-//     twice and none can point back into the chain.
-//   * `GuardedBuf::assert_intact`'s scan -- a `for` over `0..GUARD_LEN`.
+//   * the allocator ledger's list walks -- inside `port::TrackingAllocator`, bounded by
+//     the length of the allocation list, which is finite and acyclic by construction: a
+//     node is created once, inserted at the head once, and unlinked before it is released,
+//     so no node can be reached twice and none can point back into the chain.
+//   * `port::GuardedBuf::assert_intact`'s scan -- a `for` over `0..port::GUARD_LEN`.
 //
 // A fifth thing that is *not* a loop but bounds the work all the same: no operation in
 // `extras` iterates, so the whole post-loop stage is a fixed number of calls.
@@ -180,463 +190,50 @@ const DICT_OUT_LEN: usize = 1 << MAX_WBITS;
 /// shape that provokes it.
 const MAX_HEADER_FIELD_LEN: usize = 256;
 
-/// Bytes of sentinel placed either side of each `gz_header` buffer.
-const GUARD_LEN: usize = 16;
-
-/// The sentinel byte itself.
-///
-/// Deliberately not `0xa5`: that is the allocator's fill byte, so a distinct value keeps
-/// "the library wrote past the buffer" and "the allocator initialised the block"
-/// separable in a crash report.
-const GUARD_BYTE: u8 = 0x5a;
-
-/// Fill byte for every block the tracking allocator hands out -- `test/infcover.c` L87.
-///
-/// The C comment states the purpose exactly: fill with a non-zero value "to make sure
-/// that the code isn't depending on zeros".
-///
-/// ★ MEASURED: substituting `0x00` here changes nothing. A 60-second session with a zero
-/// fill completed 1,148,357 executions with the same coverage and no failure, so this port
-/// has no dependency on zero-initialised memory to expose. That is a real result rather
-/// than an absence of evidence, and it has a mechanical explanation: the facade fills every
-/// *buffer* allocation with its own `0xA5` before handing it to the core, and the one
-/// allocation it deliberately does not pre-fill -- the state block -- has every byte written
-/// by the move that occupies it before anything reads it. So the port cannot observe this
-/// byte at all. The fill is kept regardless: it is what makes that argument *checkable*
-/// rather than merely stated, and it would catch a future change that started handing a
-/// buffer out unfilled.
-const ALLOC_FILL_BYTE: u8 = 0xa5;
-
-/// Alignment every block from the tracking allocator is given.
-///
-/// NOT cosmetic, and not a free choice. `zlib`'s allocator contract is `malloc`'s, whose
-/// result is suitably aligned for any fundamental type -- `zutil.c`'s `zcalloc` and
-/// `test/infcover.c` L84 are both plain `malloc`. The facade holds an allocator to that:
-/// its `reserve::<T>` hands a misaligned block straight back and answers `Z_MEM_ERROR`.
-/// An under-aligned hook would therefore not crash, it would make *every* stream fail to
-/// initialise and this target would silently fuzz nothing at all -- the quiet failure
-/// mode worth guarding hardest against. Sixteen is `malloc`'s guarantee on every target
-/// this port is built for and exceeds the alignment of every type the library allocates.
-const BLOCK_ALIGN: usize = 16;
-
 // ---------------------------------------------------------------------------
-//  The tracking allocator -- `test/infcover.c` L55-L234
+//  The tracking allocator -- reached through the harness boundary
 // ---------------------------------------------------------------------------
 //
-// Self-contained on purpose. cargo-fuzz compiles each file under `fuzz_targets/` as an
-// independent `[[bin]]`, so a sibling helper module would simply not be part of any
-// crate; `fuzz_deflate.rs` carries its own copy of this allocator rather than sharing
-// one, and that duplication is the correct arrangement here rather than a smell.
+// `test/infcover.c`'s `mem_zone` is not transcribed here. `zlib_rs_differential::port`
+// carries that transcription once -- the `0xa5` fill, the singly-linked block list, the
+// leak, non-LIFO and rogue-free counters, `mem_high`'s high-water mark and `mem_limit`'s
+// ceiling -- as [`port::TrackingAllocator`], together with the `extern "C"` `zalloc` and
+// `zfree` hooks the library calls and the panic-freedom argument they need. Reaching it
+// from here is what lets this file carry `#![forbid(unsafe_code)]`: the two hooks are
+// called *from* the library across an `extern "C"` edge, where a panic would be undefined
+// behaviour, and that obligation is discharged and documented in one place rather than
+// once per target.
 
-/// One live allocation, strung into a singly linked list -- `struct mem_item`,
-/// `test/infcover.c` L56-L60.
-struct MemItem {
-    /// Base address handed to the library.
-    ptr: *mut u8,
-    /// Bytes the library asked for. Kept so the free path can rebuild the exact
-    /// [`Layout`] the block was allocated with; see [`block_layout`].
-    size: usize,
-    /// Next item, or null.
-    next: *mut MemItem,
-}
-
-/// The root of the list and the statistics -- `struct mem_zone`, `test/infcover.c`
-/// L62-L68.
-struct MemZone {
-    /// Head of the list of live allocations, or null.
-    first: *mut MemItem,
-    /// Bytes currently outstanding.
-    total: usize,
-    /// Largest value `total` ever reached.
-    highwater: usize,
-    /// Allocation ceiling in bytes, or zero for "no limit" -- `mem_limit`'s argument,
-    /// `test/infcover.c` L176-L181.
-    limit: usize,
-    /// Count of frees that were not of the most recent allocation.
-    notlifo: u32,
-    /// Count of frees of addresses this zone never handed out.
-    rogue: u32,
-}
-
-impl MemZone {
-    /// An empty zone carrying `limit` as its ceiling -- `mem_setup` (L158-L173) with
-    /// `mem_limit` (L176-L181) folded in.
-    ///
-    /// The limit is fixed at construction rather than adjusted later, and that is
-    /// deliberate: the zone is reached through exactly one raw pointer for the whole of
-    /// its life (see [`run`]), and giving it nothing to change mid-run keeps that single
-    /// chain of provenance trivially intact.
-    const fn new(limit: usize) -> Self {
-        Self {
-            first: ptr::null_mut(),
-            total: 0,
-            highwater: 0,
-            limit,
-            notlifo: 0,
-            rogue: 0,
-        }
-    }
-}
-
-/// What the zone looked like when tracking stopped -- the numbers `mem_done`
-/// (`test/infcover.c` L200-L234) prints, gathered so the caller can assert on them.
-#[derive(Debug)]
-struct MemReport {
-    /// Blocks still outstanding when tracking stopped. `mem_done` reports these as
-    /// `** ...: N bytes in M blocks not freed`.
-    leaked_blocks: usize,
-    /// Bytes still outstanding, the other half of the same message.
-    leaked_bytes: usize,
-    /// `mem_done`'s `N frees not LIFO`.
-    notlifo: u32,
-    /// `mem_done`'s `N frees not recognized`.
-    rogue: u32,
-    /// `mem_high`'s high water mark. Zero proves the hooks were never called, which is
-    /// how this target detects that it has silently fuzzed nothing.
-    highwater: usize,
-}
-
-/// The [`Layout`] a block of `len` requested bytes is allocated and released with.
+/// Asserts that a finished allocator ledger is clean, and that it was used at all.
 ///
-/// One function, used by both the allocation and the free path, because that is what
-/// makes the two agree by construction: releasing a block under a layout that differs in
-/// size or alignment from the one it was allocated with is undefined behaviour, and it is
-/// the sort AddressSanitizer reports as a mismatched free. Deriving the layout from the
-/// recorded size through a single pure function removes the possibility rather than
-/// testing for it.
-///
-/// `len.max(1)` handles a zero-byte request: [`alloc`] may not be called with a
-/// zero-sized layout, while C's `malloc(0)` returns either null or a unique freeable
-/// pointer. Rounding up to one byte reproduces the useful half of that and stays
-/// deterministic, so the free path computes the same layout from the same recorded size.
-/// The library never asks for zero bytes -- every `ZALLOC` names a positive item count
-/// and a positive item size -- so this arm exists for completeness rather than for use.
-///
-/// Returns [`None`] rather than panicking when the request cannot be a layout at all,
-/// which is what a hostile `items * size` product produces.
-fn block_layout(len: usize) -> Option<Layout> {
-    Layout::from_size_align(len.max(1), BLOCK_ALIGN).ok()
-}
-
-/// `zalloc` -- `mem_alloc`, `test/infcover.c` L71-L109.
-///
-/// # Panic-freedom
-///
-/// This function is called **from the library**, across an `extern "C"` boundary, so a
-/// panic escaping it would be undefined behaviour. It is therefore panic-free by
-/// construction and not merely by inspection: no `unwrap`, no `expect`, no indexing, no
-/// slicing, no `assert`, no arithmetic that can overflow -- every product and sum is
-/// checked or saturating -- and no allocation that aborts, because [`alloc`] reports
-/// failure by returning null rather than by calling the out-of-memory handler. Every
-/// failure path answers with a null pointer, which is precisely the C contract:
-/// `zlib.h` L149 lets `zalloc` answer `Z_NULL` and the caller turns that into
-/// `Z_MEM_ERROR`.
-///
-/// # Safety
-///
-/// `mem` must be either null or a pointer to a live [`MemZone`] that stays live and
-/// unmoved for as long as the stream using it does, and that is reached through no other
-/// path while this call runs. Both hold here: the zone is a local in [`run`] which
-/// outlives the stream, and it is touched only through the one raw pointer installed in
-/// `z_stream::opaque`.
-unsafe extern "C" fn mem_alloc(mem: voidpf, count: uInt, size: uInt) -> voidpf {
-    let zone = mem.cast::<MemZone>();
-
-    // L79's `zone == NULL` half. Nothing below may run without a zone, and there is
-    // nothing sensible to allocate for one either -- which is also what makes
-    // `mem_free`'s corresponding branch unreachable: no block can ever originate from a
-    // null zone.
-    if zone.is_null() {
-        return ptr::null_mut();
-    }
-
-    // L76: `size_t len = count * (size_t)size`. Computed in the wide type exactly as C
-    // does, but checked: `count` and `size` are both 32-bit and their product need not
-    // fit a `usize` on a 32-bit target, and even on a 64-bit one it need not fit the
-    // `isize` bound `Layout` imposes. An overflow is a refused request.
-    let Some(len) = usize::try_from(count)
-        .ok()
-        .and_then(|count| count.checked_mul(usize::try_from(size).unwrap_or(usize::MAX)))
-    else {
-        return ptr::null_mut();
-    };
-
-    // SAFETY: `zone` is non-null by the test above and, by this function's contract,
-    // addresses a live `MemZone` reached through no other path for the duration of this
-    // call. Two scalar fields are read out by value, so no borrow of the zone outlives
-    // this statement.
-    let (limit, total) = unsafe { ((*zone).limit, (*zone).total) };
-
-    // L79's induced-failure half: `zone->limit && zone->total + len > zone->limit`. The
-    // sum is checked rather than wrapped, so a request large enough to carry
-    // `total + len` past zero cannot masquerade as fitting under the ceiling.
-    if limit != 0 {
-        match total.checked_add(len) {
-            Some(after) if after <= limit => {}
-            _ => return ptr::null_mut(),
-        }
-    }
-
-    let Some(layout) = block_layout(len) else {
-        return ptr::null_mut();
-    };
-
-    // L84: `ptr = malloc(len)`. `alloc` answers null on failure and never aborts, which
-    // is what keeps this hook panic-free.
-    // SAFETY: `layout` came from `block_layout`, which never produces a zero size -- the
-    // one precondition `alloc` has.
-    let block = unsafe { alloc(layout) };
-    if block.is_null() {
-        return ptr::null_mut();
-    }
-
-    // L87: `memset(ptr, 0xa5, len)`, and the highest-value line in the whole allocator.
-    // The C comment gives the reason: a non-zero fill makes sure "that the code isn't
-    // depending on zeros". Anywhere the port assumed zero-initialised state, this is
-    // what would expose it.
-    // SAFETY: `block` is non-null and `alloc` returned a region of `layout.size()`
-    // bytes, which is `len.max(1)` and therefore at least `len`. The region is freshly
-    // allocated, so nothing else references it and the write cannot overlap anything.
-    unsafe { ptr::write_bytes(block, ALLOC_FILL_BYTE, len) };
-
-    // L90-L94: the bookkeeping node, under the same null-on-failure discipline. If it
-    // cannot be had, the block goes back before returning, so a failed allocation leaks
-    // nothing.
-    // `cast_ptr_alignment` is allowed for this one statement and for a reason clippy
-    // cannot see: the lint compares the alignment of `alloc`'s `*mut u8` return type
-    // against `MemItem`'s, whereas the alignment that actually governs is the one carried
-    // by the `Layout` -- `Layout::new::<MemItem>()` requests `align_of::<MemItem>()`, so
-    // the returned block is aligned for it by the allocator's contract. This is the idiom
-    // `std::alloc::alloc`'s own documentation uses. The allow is written here, at the
-    // statement, rather than on the function or the crate, so it cannot silently cover a
-    // second cast added later.
-    #[allow(clippy::cast_ptr_alignment)]
-    // SAFETY: `Layout::new::<MemItem>()` is non-zero-sized -- `MemItem` holds two
-    // pointers and a `usize` -- so `alloc`'s precondition holds, and the block it returns
-    // carries that layout's alignment, which is what makes the cast below sound.
-    let item = unsafe { alloc(Layout::new::<MemItem>()) }.cast::<MemItem>();
-    if item.is_null() {
-        // SAFETY: `block` was allocated moments ago with exactly `layout` and nothing
-        // else has taken ownership of it, so this is the matching deallocation.
-        unsafe { dealloc(block, layout) };
-        return ptr::null_mut();
-    }
-
-    // L95-L100: fill the node in and insert it at the **head** of the list. Head
-    // insertion is not an implementation detail -- it is the mechanism that makes a
-    // non-LIFO free detectable at all, because it puts the most recent allocation where
-    // `mem_free` looks first.
-    // SAFETY: `item` is non-null and addresses `size_of::<MemItem>()` writable,
-    // uninitialised bytes from the allocation above; `write` initialises them without
-    // dropping what was there, which is correct for uninitialised storage. `zone` is
-    // live per this function's contract and is the only path to the list.
-    unsafe {
-        item.write(MemItem {
-            ptr: block,
-            size: len,
-            next: (*zone).first,
-        });
-        (*zone).first = item;
-
-        // L103-L105: the statistics. Saturating rather than checked, because the
-        // allocation has already succeeded and there is no failure left to report --
-        // and because a wrapping `+` would panic in a debug build, which this hook may
-        // never do. `total` cannot in practice approach `usize::MAX`; saturating is the
-        // shape that makes that unnecessary to argue.
-        let after = total.saturating_add(len);
-        (*zone).total = after;
-        if after > (*zone).highwater {
-            (*zone).highwater = after;
-        }
-    }
-
-    // L108: the allocated memory.
-    block.cast::<c_void>()
-}
-
-/// `zfree` -- `mem_free`, `test/infcover.c` L112-L154.
-///
-/// The classification is the whole point and it is exactly C's: if the head of the list
-/// matches, the free is LIFO and unremarkable; if a *later* item matches, the free is out
-/// of order and `notlifo` records it; if nothing matches, the address was never handed
-/// out by this zone and `rogue` records it. Those three outcomes are the observable face
-/// of the allocator contract -- memory obtained from a caller's `zalloc` may only be
-/// returned to that same caller's `zfree` -- and [`assert_zone_clean`] turns them into
-/// crash reports.
-///
-/// # Panic-freedom
-///
-/// As [`mem_alloc`], and for the same reason: this is called from the library. The
-/// subtraction is saturating and the list walk uses raw pointers with explicit null
-/// tests rather than any construct that can panic.
-///
-/// # Safety
-///
-/// `mem` must satisfy [`mem_alloc`]'s contract. `ptr_arg` must be either null or a base
-/// address this same zone returned from [`mem_alloc`] and has not yet been given back.
-unsafe extern "C" fn mem_free(mem: voidpf, ptr_arg: voidpf) {
-    let zone = mem.cast::<MemZone>();
-    let block = ptr_arg.cast::<u8>();
-
-    // L118-L121: C's `if (zone == NULL) { free(ptr); return; }`.
-    //
-    // DIVERGENCE, and it is forced rather than chosen. Rust cannot release a block
-    // without the layout it was allocated with, and there is no layout to be had for a
-    // pointer this harness did not allocate. Nor can the case arise: `mem_alloc` answers
-    // a null zone with null, so no block ever originates from one, and this hook is only
-    // ever installed alongside that one. Doing nothing is therefore the only sound
-    // response -- guessing a layout would be undefined behaviour, and AddressSanitizer
-    // would rightly report it.
-    if zone.is_null() {
-        return;
-    }
-
-    // L125-L140: find the item whose `ptr` matches, remove it from the list, and record
-    // whether the match was at the head.
-    let mut found: *mut MemItem = ptr::null_mut();
-
-    // SAFETY: `zone` addresses a live `MemZone` per this function's contract, and every
-    // item reachable from `first` was produced by `mem_alloc` and has not been released,
-    // so each is a live, initialised `MemItem`. Every dereference below is guarded by an
-    // explicit null test, and the whole walk happens with no other access to the list.
-    unsafe {
-        let head = (*zone).first;
-        if !head.is_null() {
-            if (*head).ptr == block {
-                // L127-L128: the first one is it. A LIFO free, which needs no counter.
-                (*zone).first = (*head).next;
-                found = head;
-            } else {
-                // L130-L133: walk the rest of the list.
-                let mut prev = head;
-                let mut next = (*head).next;
-                while !next.is_null() && (*next).ptr != block {
-                    prev = next;
-                    next = (*next).next;
-                }
-                if !next.is_null() {
-                    // L134-L137: found, but not at the head.
-                    (*prev).next = (*next).next;
-                    (*zone).notlifo = (*zone).notlifo.saturating_add(1);
-                    found = next;
-                }
-            }
-        }
-    }
-
-    // L149-L150: not found at all.
-    if found.is_null() {
-        // SAFETY: `zone` is live per this function's contract.
-        unsafe { (*zone).rogue = (*zone).rogue.saturating_add(1) };
-        // C's L153 frees `ptr` regardless. This cannot, for the reason given above: the
-        // address is by definition not one this zone allocated, so no layout for it
-        // exists here. The `rogue` count is the report, and `assert_zone_clean` fires on
-        // it.
-        return;
-    }
-
-    // L143-L146 and L153: update the statistics, release the node, release the block.
-    // SAFETY: `found` was removed from the list above, so nothing references it; it was
-    // allocated by `mem_alloc` with `Layout::new::<MemItem>()` and initialised there, so
-    // reading `size` reads an initialised field and the deallocation layout matches.
-    // `block` equals the recorded `ptr` -- that is what made this item match -- and
-    // `block_layout` recomputes, from the same recorded size, the identical layout the
-    // block was allocated with. It is released exactly once, because the item is gone
-    // from the list and no second free can find it.
-    unsafe {
-        let size = (*found).size;
-        (*zone).total = (*zone).total.saturating_sub(size);
-        dealloc(found.cast::<u8>(), Layout::new::<MemItem>());
-        if let Some(layout) = block_layout(size) {
-            dealloc(block, layout);
-        }
-    }
-}
-
-/// `mem_done` -- `test/infcover.c` L200-L234, minus the printing.
-///
-/// Releases whatever the library left behind, exactly as C does at L209-L217, and returns
-/// the numbers C would have printed so the caller can assert on them. Freeing first and
-/// reporting second is C's order and is the right one here too: an assertion that fires
-/// should report a leak, not add one, and LeakSanitizer -- which AddressSanitizer enables
-/// by default under cargo-fuzz -- would otherwise report the same blocks a second time.
-///
-/// The zone is not reset the way C's L229-L233 clears the stream's hooks, because both
-/// are about to go out of scope together.
-///
-/// # Safety
-///
-/// `zone` must address a live [`MemZone`] that no stream is still using: every stream
-/// that named it must already have been ended, or the blocks freed here are blocks the
-/// library still believes it owns.
-unsafe fn mem_done(zone: *mut MemZone) -> MemReport {
-    let mut leaked_blocks = 0_usize;
-
-    // SAFETY: `zone` addresses a live `MemZone` per this function's contract, and every
-    // item reachable from `first` is a live, initialised `MemItem` whose `ptr` names a
-    // block allocated with `block_layout(size)`. Each is visited exactly once and the
-    // chain is read out of a node before that node is released, so nothing is touched
-    // after being freed. No stream references any of it, per the contract.
-    let (leaked_bytes, notlifo, rogue, highwater) = unsafe {
-        let mut item = (*zone).first;
-        while !item.is_null() {
-            let next = (*item).next;
-            let size = (*item).size;
-            let block = (*item).ptr;
-            if let Some(layout) = block_layout(size) {
-                dealloc(block, layout);
-            }
-            dealloc(item.cast::<u8>(), Layout::new::<MemItem>());
-            item = next;
-            leaked_blocks = leaked_blocks.saturating_add(1);
-        }
-        (*zone).first = ptr::null_mut();
-        (
-            (*zone).total,
-            (*zone).notlifo,
-            (*zone).rogue,
-            (*zone).highwater,
-        )
-    };
-
-    MemReport {
-        leaked_blocks,
-        leaked_bytes,
-        notlifo,
-        rogue,
-        highwater,
-    }
-}
-
-/// Asserts that a finished zone is clean, and that it was used at all.
-///
-/// The first four assertions are `mem_done`'s three complaints turned into crash reports:
-/// nothing leaked, no free out of order, no free of an address the zone never handed out.
-/// Together they validate the allocator half of the C ABI contract -- that memory
-/// obtained from a caller's `zalloc` is released only through that same caller's `zfree`,
-/// in a discipline the caller can actually audit.
+/// The first four assertions are `mem_done`'s three complaints (`test/infcover.c`
+/// L200-L234) turned into crash reports: nothing leaked, no free out of order, no free of an
+/// address the zone never handed out. Together they validate the allocator half of the C ABI
+/// contract -- that memory obtained from a caller's `zalloc` is released only through that
+/// same caller's `zfree`, in a discipline the caller can actually audit.
 ///
 /// The fifth is a harness self-check rather than a check on the library, and it earns its
 /// place: if `inflateInit2_` reported success then the state block must have come through
-/// these hooks, so a zero high water mark means they were never really installed and this
+/// these hooks, so a zero high-water mark means they were never really installed and this
 /// execution tested nothing. That is the one failure mode a fuzz target can have while
 /// looking perfectly healthy, so it is asserted rather than assumed.
 ///
-/// ★ MEASURED: all three library-facing counters were shown to be reachable, because a
-/// check that cannot fail is worth nothing. With `mem_free`'s list removal disabled the
-/// first assertion fired at once (`leaked_blocks: 1, leaked_bytes: 7384`); with its
-/// comparison made never to match, the rogue branch was taken and reported
-/// (`rogue: 2`); and with `mem_alloc` appending at the tail instead of the head, the
-/// non-LIFO assertion fired in isolation (`notlifo: 1, leaked_blocks: 0, rogue: 0`). That
-/// last one is also an independent confirmation of the allocation order the port documents:
-/// head insertion plus state-block-before-window is exactly what makes the real run LIFO.
-fn assert_zone_clean(report: &MemReport, expect_allocation: bool) {
+/// ★ MEASURED, before the ledger moved into the boundary crate: all three library-facing
+/// counters were shown to be reachable, because a check that cannot fail is worth nothing.
+/// With the free path's list removal disabled the leak assertion fired at once
+/// (`live_blocks: 1, live_bytes: 7384`); with its comparison made never to match, the rogue
+/// branch was taken and reported (`rogue: 2`); and with the allocation path appending at the
+/// tail instead of the head, the non-LIFO assertion fired in isolation (`notlifo: 1`,
+/// everything else zero). That last one is also an independent confirmation of the
+/// allocation order the port documents: head insertion plus state-block-before-window is
+/// exactly what makes the real run LIFO.
+fn assert_zone_clean(report: &TrackingReport, expect_allocation: bool) {
     assert_eq!(
-        report.leaked_blocks, 0,
+        report.live_blocks, 0,
         "blocks not freed -- inflate leaked state: {report:?}"
     );
     assert_eq!(
-        report.leaked_bytes, 0,
+        report.live_bytes, 0,
         "bytes not freed -- inflate leaked state: {report:?}"
     );
     assert_eq!(
@@ -648,7 +245,7 @@ fn assert_zone_clean(report: &MemReport, expect_allocation: bool) {
         "frees not recognized -- a block was returned to the wrong allocator: {report:?}"
     );
     assert!(
-        !expect_allocation || report.highwater > 0,
+        !expect_allocation || report.high_water > 0,
         "inflateInit2_ succeeded without allocating through the caller's hooks, \
          so this execution fuzzed nothing: {report:?}"
     );
@@ -912,131 +509,23 @@ impl<'a> Params<'a> {
 }
 
 // ---------------------------------------------------------------------------
-//  Guarded buffers
+//  Guarded buffers -- reached through the harness boundary
 // ---------------------------------------------------------------------------
-
-/// A byte buffer with a sentinel region on either side of the usable capacity.
-///
-/// This is `test/infcover.c` L301's `out = malloc(len); assert(out != NULL);` with two
-/// differences, both of which add checking rather than change behaviour.
-///
-/// First, the sentinel regions. The library is told about the middle only, so every byte
-/// of either guard that comes back changed is a write past a boundary the caller
-/// declared -- an over-write, reported as a crash. That is what "must never over-read or
-/// over-write" means for a harness that cannot see inside the library.
-///
-/// Second, it is reached only through the pointer [`alloc`] returned, and never through a
-/// borrow of a container. That matters for a buffer handed across an FFI boundary and
-/// retained there: the pointer's provenance is the allocation itself, so the library
-/// writing through it and this harness reading through it cannot invalidate one another
-/// however the owning value is borrowed in between. A `Vec` would give the same bytes and
-/// not that property.
-struct GuardedBuf {
-    /// Base of the whole allocation, guard region included.
-    base: *mut u8,
-    /// Usable bytes between the two guards.
-    capacity: usize,
-}
-
-impl GuardedBuf {
-    /// Allocates a buffer of `capacity` usable bytes, sentinel-filled end to end.
-    ///
-    /// The usable region starts filled with [`GUARD_BYTE`] as well, which is harmless --
-    /// the library is free to write anything there -- and means a stray write just inside
-    /// a boundary is as visible as one just outside it.
-    fn new(capacity: usize) -> Self {
-        // Two harness self-checks, not error handling. Every capacity this is called with
-        // is bounded by a Phase A constant -- `MAX_OUT_BUF_LEN`, `MAX_HEADER_FIELD_LEN` or
-        // `DICT_OUT_LEN` -- so neither can fire, and a failure would be a bug in this file
-        // rather than in the library. Reporting a bug in this file as a crash is precisely
-        // what a fuzz target's body is for: the panic-free discipline binds the two
-        // `extern "C"` allocator hooks, which the library calls, and not harness setup,
-        // which it does not.
-        assert!(
-            capacity <= usize::MAX - 2 * GUARD_LEN,
-            "guarded buffer capacity {capacity} cannot carry its guard regions"
-        );
-        // Never zero: the two guards alone are `2 * GUARD_LEN` bytes, so the layout is
-        // always valid even for a zero-capacity buffer. A zero *capacity* is a real case
-        // and must stay reachable -- `zlib.h` L118-L133 lets a caller advertise a buffer
-        // it has no room in, and the port documents that a non-null pointer with a zero
-        // maximum has to behave as such.
-        let total = capacity + 2 * GUARD_LEN;
-        let layout = Layout::from_size_align(total, BLOCK_ALIGN)
-            .expect("BLOCK_ALIGN is a power of two and the bounds above keep total small");
-        // SAFETY: `layout` has a non-zero size -- it is at least `2 * GUARD_LEN` -- which
-        // is `alloc`'s only precondition.
-        let base = unsafe { alloc(layout) };
-        assert!(!base.is_null(), "out of memory allocating a guarded buffer");
-        // SAFETY: `base` is non-null and `alloc` returned `total` writable bytes, which is
-        // exactly what is written here. The region is freshly allocated, so nothing else
-        // references it.
-        unsafe { ptr::write_bytes(base, GUARD_BYTE, total) };
-        Self { base, capacity }
-    }
-
-    /// The usable region's base address -- what the library is given.
-    ///
-    /// Typed as `*mut Bytef` rather than `*mut u8` because that is what it becomes: the
-    /// `next_out` of a `z_stream` and the `extra`, `name` and `comment` of a `gz_header`
-    /// are all `Bytef *`, and naming the ABI's own alias at the boundary keeps the two
-    /// spellings from drifting apart if the alias is ever anything but `u8`.
-    fn data(&self) -> *mut Bytef {
-        // SAFETY: the allocation is `capacity + 2 * GUARD_LEN` bytes, so `GUARD_LEN` is
-        // an offset within it and the result is at worst a one-past-the-end pointer for a
-        // zero-capacity buffer, which is a valid pointer to form.
-        unsafe { self.base.add(GUARD_LEN) }
-    }
-
-    /// Usable bytes, excluding the guards.
-    fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// Asserts that neither guard region has been touched.
-    ///
-    /// `what` names the buffer so a crash report says which boundary was crossed.
-    fn assert_intact(&self, what: &str) {
-        for offset in 0..GUARD_LEN {
-            // SAFETY: `offset` is below `GUARD_LEN` and `GUARD_LEN + capacity + offset` is
-            // below `capacity + 2 * GUARD_LEN`, so both addresses lie inside the
-            // allocation. Both bytes were initialised by `new` and can only have been
-            // overwritten, never deinitialised.
-            let (leading, trailing) = unsafe {
-                (
-                    self.base.add(offset).read(),
-                    self.base.add(GUARD_LEN + self.capacity + offset).read(),
-                )
-            };
-            assert_eq!(
-                leading, GUARD_BYTE,
-                "{what}: byte {offset} of the leading guard was overwritten -- \
-                 a write before the start of a caller buffer"
-            );
-            assert_eq!(
-                trailing, GUARD_BYTE,
-                "{what}: byte {offset} of the trailing guard was overwritten -- \
-                 a write past the end of a caller buffer of {} bytes",
-                self.capacity
-            );
-        }
-    }
-}
-
-impl Drop for GuardedBuf {
-    fn drop(&mut self) {
-        let Some(total) = self.capacity.checked_add(2 * GUARD_LEN) else {
-            return;
-        };
-        let Ok(layout) = Layout::from_size_align(total, BLOCK_ALIGN) else {
-            return;
-        };
-        // SAFETY: `base` came from `alloc` with exactly this layout in `new`, which is the
-        // only place a `GuardedBuf` is built, and `Drop` runs once. Recomputing the layout
-        // from the same recorded capacity guarantees it matches the allocation's.
-        unsafe { dealloc(self.base, layout) };
-    }
-}
+//
+// [`port::GuardedBuf`] is the buffer this target hands the library: a usable region with a
+// [`port::GUARD_LEN`]-byte sentinel field on either side of it, so that every byte of
+// either guard that comes back changed is a write past a boundary the caller declared. It
+// lives in the boundary crate because it is reached only through the pointer its allocator
+// returned and never through a borrow of a container, which is what keeps a pointer the
+// library *retained* -- `inflateGetHeader` holds the three field pointers until the header
+// completes or the stream is reset or ended -- and this harness's later reads of the guards
+// from invalidating one another.
+//
+// The consequence for this file is a declaration-order rule, enforced by comment rather
+// than by the compiler: every guarded buffer must be declared before the stream it is
+// handed to, because Rust drops locals in reverse declaration order and a buffer released
+// while the library still held a pointer into it would be a use-after-free inside the
+// library. See [`run`], which declares them first for exactly that reason.
 
 // ---------------------------------------------------------------------------
 //  The driver -- `test/infcover.c` L284-L347
@@ -1054,45 +543,6 @@ fn narrow(len: usize) -> uInt {
 /// Widens a `uInt` the C API reported back to a `usize`.
 fn widen(value: uInt) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
-}
-
-/// `sizeof(z_stream)` as `inflateInit2_`'s `stream_size` argument.
-///
-/// Getting this wrong is not a compile error and is not loud: `inflateInit2_` compares it
-/// against its own `size_of::<z_stream>()` and answers `Z_VERSION_ERROR`, so a wrong value
-/// would leave this target initialising nothing at all while appearing to run. It is
-/// derived rather than written down for exactly that reason, and the driver additionally
-/// asserts that `Z_VERSION_ERROR` never comes back.
-fn stream_size() -> c_int {
-    c_int::try_from(size_of::<z_stream>()).unwrap_or(0)
-}
-
-/// A `z_stream` with every field explicitly set and the tracking allocator installed.
-///
-/// `test/infcover.c`'s `mem_setup` (L158-L173) assigns only `opaque`, `zalloc` and
-/// `zfree` and leaves the rest of a stack `z_stream` uninitialised, which C permits
-/// because `inflateInit2_` writes what it needs. Rust does not permit a partly
-/// initialised struct, and writing all fourteen fields out is the better shape anyway:
-/// the three the C code really chooses are visible as choices, and `Z_NULL` -- which the
-/// facade exports as a `c_int` and which therefore cannot stand in for a pointer in Rust
-/// -- is spelled `ptr::null()` where a pointer is what is meant.
-fn new_stream(zone: *mut MemZone) -> z_stream {
-    z_stream {
-        next_in: ptr::null(),
-        avail_in: 0,
-        total_in: 0,
-        next_out: ptr::null_mut(),
-        avail_out: 0,
-        total_out: 0,
-        msg: ptr::null(),
-        state: ptr::null_mut(),
-        zalloc: Some(mem_alloc),
-        zfree: Some(mem_free),
-        opaque: zone.cast::<c_void>(),
-        data_type: 0,
-        adler: 0,
-        reserved: 0,
-    }
 }
 
 /// What the driver loop observed, gathered for the assertions that follow it.
@@ -1207,20 +657,11 @@ fn assert_inflate_return(ret: c_int, flush: c_int) {
 /// Returns whether the stream accepted it. A refusal ends the loop, because a stream still
 /// waiting for a dictionary consumes no input, so continuing would spin to
 /// [`MAX_ITERATIONS`] making no progress.
-fn offer_dictionary(strm: *mut z_stream, params: &Params<'_>) -> bool {
-    // SAFETY: `strm` addresses a live `z_stream` this function's caller initialised with
-    // `inflateInit2_`, and `dictionary` is a slice this harness owns, so its pointer is
-    // readable for its length. `inflateSetDictionary` only reads it and does not retain
-    // it, so the borrow ends with the call. A zero length with the non-null,
-    // possibly-dangling pointer an empty slice yields is the legal `(Z_NULL, 0)` shape the
-    // port documents.
-    let ret = unsafe {
-        inflateSetDictionary(
-            strm,
-            params.dictionary.as_ptr(),
-            narrow(params.dictionary.len()),
-        )
-    };
+fn offer_dictionary(strm: &mut z_stream, params: &Params<'_>) -> bool {
+    // The gate forms the `(pointer, length)` pair; `inflateSetDictionary` only reads it and
+    // does not retain it, so the borrow ends with the call, and an empty dictionary is
+    // offered as the legal zero-length shape the port documents.
+    let ret = port::inflate_set_dictionary(strm, params.dictionary);
     assert!(
         matches!(ret, Z_OK | Z_DATA_ERROR | Z_MEM_ERROR | Z_STREAM_ERROR),
         "inflateSetDictionary returned {ret}, which is outside its documented return set"
@@ -1240,14 +681,11 @@ fn offer_dictionary(strm: *mut z_stream, params: &Params<'_>) -> bool {
 /// allocation in the original and the eventual release genuinely is out of order, and
 /// `assert_zone_clean`'s `notlifo` assertion would fire on a harness bug rather than a
 /// library one.
-fn clone_and_end(strm: *mut z_stream) {
+fn clone_and_end(strm: &mut z_stream) {
     // The destination is overwritten wholesale by `inflateCopy`, hooks included, so what
     // it starts as does not matter -- only that it is a real, distinct `z_stream`.
-    let mut copy = new_stream(ptr::null_mut());
-    // SAFETY: `strm` addresses a live initialised `z_stream`; `&mut copy` addresses a
-    // distinct, fully initialised one, which is what `inflateCopy`'s disjointness check
-    // requires. Nothing else references either for the duration of the call.
-    let ret = unsafe { inflateCopy(addr_of_mut!(copy), strm) };
+    let mut copy = port::zeroed_stream();
+    let ret = port::inflate_copy(&mut copy, strm);
     assert!(
         matches!(ret, Z_OK | Z_MEM_ERROR | Z_STREAM_ERROR),
         "inflateCopy returned {ret}, which is outside its documented return set"
@@ -1257,9 +695,8 @@ fn clone_and_end(strm: *mut z_stream) {
         // the contract is that `dest` was left untouched, so there is nothing to end.
         return;
     }
-    // SAFETY: `copy` now holds a live state `inflateCopy` installed, reached through no
-    // other pointer.
-    let end = unsafe { inflateEnd(addr_of_mut!(copy)) };
+    // `copy` now holds a live state `inflateCopy` installed.
+    let end = port::inflate_end(&mut copy);
     assert_eq!(end, Z_OK, "inflateEnd on a successful clone returned {end}");
 }
 
@@ -1271,7 +708,7 @@ fn clone_and_end(strm: *mut z_stream) {
 /// The two additions are the caps from Phase A, and they are what make the loop terminate
 /// for *every* input rather than for well-behaved ones -- see [`MAX_ITERATIONS`] and
 /// [`MAX_TOTAL_OUTPUT`].
-fn drive(strm: *mut z_stream, params: &Params<'_>, out: &GuardedBuf) -> LoopOutcome {
+fn drive(strm: &mut z_stream, params: &Params<'_>, out: &GuardedBuf) -> LoopOutcome {
     let mut outcome = LoopOutcome {
         consumed: 0,
         produced: 0,
@@ -1289,17 +726,14 @@ fn drive(strm: *mut z_stream, params: &Params<'_>, out: &GuardedBuf) -> LoopOutc
     };
     have -= step;
 
-    // SAFETY: `strm` addresses a live `z_stream` the caller initialised with
-    // `inflateInit2_` and which nothing else references. `payload` is a slice this harness
-    // owns and keeps alive across the whole loop, so its pointer is readable for its
-    // length; `step` is at most that length, so the `(next_in, avail_in)` pair it forms
-    // names a readable region. An empty payload yields the non-null dangling pointer an
-    // empty slice has together with `avail_in == 0`, which is the legal shape
-    // `test/infcover.c` L294-L295 relies on.
-    unsafe {
-        (*strm).next_in = params.payload.as_ptr();
-        (*strm).avail_in = narrow(step);
-    }
+    // `payload` is a slice this harness owns and keeps alive across the whole loop, so the
+    // `(next_in, avail_in)` pair below names a readable region for as long as the library
+    // holds it; `step` is at most the slice's length. Both are plain field writes on a
+    // `z_stream` this frame borrows mutably -- no pointer is dereferenced here. An empty
+    // payload yields the non-null dangling pointer an empty slice has together with
+    // `avail_in == 0`, which is the legal shape `test/infcover.c` L294-L295 relies on.
+    strm.next_in = params.payload.as_ptr();
+    strm.avail_in = narrow(step);
 
     let mut copies = 0_usize;
     loop {
@@ -1311,19 +745,15 @@ fn drive(strm: *mut z_stream, params: &Params<'_>, out: &GuardedBuf) -> LoopOutc
         }
         outcome.iterations += 1;
 
-        // L318-L320: refill the output window and decode.
-        // SAFETY: as above for `strm`. `out` is a live `GuardedBuf` this harness owns for
-        // the whole loop, so its usable region is writable for `capacity` bytes and does
-        // not overlap the payload, which is a separate allocation.
-        let (before_in, ret) = unsafe {
-            let before_in = (*strm).avail_in;
-            (*strm).next_out = out.data();
-            (*strm).avail_out = narrow(out.capacity());
-            (before_in, inflate(strm, params.flush))
-        };
+        // L318-L320: refill the output window and decode. `out` is a live `GuardedBuf` this
+        // harness owns for the whole loop, so its usable region is writable for `capacity`
+        // bytes and does not overlap the payload, which is a separate allocation.
+        let before_in = strm.avail_in;
+        strm.next_out = out.data();
+        strm.avail_out = out.capacity_uint();
+        let ret = port::inflate(strm, params.flush);
 
-        // SAFETY: as above. Two scalar fields read out by value.
-        let (after_in, after_out) = unsafe { ((*strm).avail_in, (*strm).avail_out) };
+        let (after_in, after_out) = (strm.avail_in, strm.avail_out);
         let call_in = widen(before_in.saturating_sub(after_in));
         let call_out = out.capacity().saturating_sub(widen(after_out));
         outcome.consumed += call_in;
@@ -1356,10 +786,10 @@ fn drive(strm: *mut z_stream, params: &Params<'_>, out: &GuardedBuf) -> LoopOutc
         have += widen(after_in);
         let next = step.min(have);
         have -= next;
-        // SAFETY: as above. `next_in` is left exactly where `inflate` advanced it to, so
-        // it still addresses the first byte this harness has offered and not yet had
-        // consumed, and `next` counts no more bytes than remain after it.
-        unsafe { (*strm).avail_in = narrow(next) };
+        // `next_in` is left exactly where `inflate` advanced it to, so it still addresses
+        // the first byte this harness has offered and not yet had consumed, and `next`
+        // counts no more bytes than remain after it.
+        strm.avail_in = narrow(next);
         if next == 0 {
             break;
         }
@@ -1397,10 +827,8 @@ fn drive(strm: *mut z_stream, params: &Params<'_>, out: &GuardedBuf) -> LoopOutc
 /// Modelling it exactly rather than relaxing the comparison to an inequality is the whole
 /// point: an equality catches a library that *over*-reports as readily as one that
 /// under-reports, which an inequality would not.
-fn assert_accounting(strm: *const z_stream, outcome: &LoopOutcome, params: &Params<'_>) {
-    // SAFETY: `strm` addresses a live `z_stream` the caller initialised, and two scalar
-    // fields are read out by value.
-    let (total_in, total_out) = unsafe { ((*strm).total_in, (*strm).total_out) };
+fn assert_accounting(strm: &z_stream, outcome: &LoopOutcome, params: &Params<'_>) {
+    let (total_in, total_out) = (strm.total_in, strm.total_out);
     let reported_in = usize::try_from(total_in).unwrap_or(usize::MAX);
     let reported_out = usize::try_from(total_out).unwrap_or(usize::MAX);
 
@@ -1439,16 +867,14 @@ fn assert_accounting(strm: *const z_stream, outcome: &LoopOutcome, params: &Para
 /// unlike `deflateInit2_`, which refuses it outright with its
 /// `(windowBits == 8 && wrap != 1)` test. A target written by analogy to the deflate one
 /// would assert the wrong answer here.
-fn teardown(strm: *mut z_stream) {
-    // SAFETY: `strm` addresses a live `z_stream` the caller initialised with
-    // `inflateInit2_` and has not yet ended, reached through no other pointer.
-    let reset = unsafe { inflateReset2(strm, -8) };
+fn teardown(strm: &mut z_stream) {
+    let reset = port::inflate_reset2(strm, -8);
     assert_eq!(
         reset, Z_OK,
         "inflateReset2(strm, -8) returned {reset}; -8 is a legal raw request for inflate"
     );
-    // SAFETY: as above; after this the state is gone and `strm` must not be reused.
-    let end = unsafe { inflateEnd(strm) };
+    // After this the state is gone and `strm` must not be driven again.
+    let end = port::inflate_end(strm);
     assert_eq!(end, Z_OK, "inflateEnd on a live stream returned {end}");
 }
 
@@ -1481,14 +907,13 @@ fn teardown(strm: *mut z_stream) {
 /// `dictLength` is an out-parameter that `zlib.h` documents no obligation on beforehand,
 /// so it is passed uninitialised-in-spirit -- set to a sentinel here so that the
 /// assertion below has something to detect a missing write with.
-fn read_dictionary(strm: *mut z_stream) {
+fn read_dictionary(strm: &mut z_stream) {
     let buffer = GuardedBuf::new(DICT_OUT_LEN);
-    let mut length: uInt = uInt::MAX;
-    // SAFETY: `strm` addresses a live `z_stream` initialised by `inflateInit2_` and not
-    // yet ended. `buffer`'s usable region is writable for `DICT_OUT_LEN` bytes, which is
-    // the capacity `zlib.h` L936-L942 requires, and `length` is a live, aligned, writable
-    // `uInt` this frame owns. Neither aliases the other or the stream.
-    let ret = unsafe { inflateGetDictionary(strm, buffer.data(), addr_of_mut!(length)) };
+    // `buffer`'s usable region is writable for `DICT_OUT_LEN` bytes, which is the capacity
+    // `zlib.h` L936-L942 requires. The destination is offered as the guarded region rather
+    // than as a slice, so the guard bytes stay reachable only through the buffer's own
+    // pointer; the gate's slice-taking form would not admit that.
+    let (ret, length) = port::inflate_get_dictionary_guarded(strm, &buffer);
     assert_eq!(
         ret, Z_OK,
         "inflateGetDictionary on a live stream returned {ret}"
@@ -1509,16 +934,10 @@ fn read_dictionary(strm: *mut z_stream) {
 /// (`inflate.c` L1140-L1141), and accepts one for a raw stream, where it seeds the window.
 /// Both paths matter, and a zero-length dictionary -- which an empty `Vec` produces --
 /// exercises the `(pointer, 0)` shape as well.
-fn set_dictionary(strm: *mut z_stream, params: &Params<'_>) {
-    // SAFETY: as `offer_dictionary`; the dictionary is read for the duration of the call
-    // and not retained.
-    let ret = unsafe {
-        inflateSetDictionary(
-            strm,
-            params.dictionary.as_ptr(),
-            narrow(params.dictionary.len()),
-        )
-    };
+fn set_dictionary(strm: &mut z_stream, params: &Params<'_>) {
+    // As `offer_dictionary`; the dictionary is read for the duration of the call and not
+    // retained.
+    let ret = port::inflate_set_dictionary(strm, params.dictionary);
     assert!(
         matches!(ret, Z_OK | Z_DATA_ERROR | Z_MEM_ERROR | Z_STREAM_ERROR),
         "inflateSetDictionary returned {ret}, which is outside its documented return set"
@@ -1533,16 +952,14 @@ fn set_dictionary(strm: *mut z_stream, params: &Params<'_>) {
 /// `test/example.c`. All three of its answers are legitimate: `Z_BUF_ERROR` when there is
 /// nothing left to search (`avail_in == 0` and fewer than eight bits held), `Z_DATA_ERROR`
 /// when no `00 00 FF FF` marker is found, and `Z_OK` when one is.
-fn try_sync(strm: *mut z_stream) {
-    // SAFETY: `strm` addresses a live initialised `z_stream` reached through no other
-    // pointer. `inflateSyncPoint` only reads the state.
-    let point = unsafe { inflateSyncPoint(strm) };
+fn try_sync(strm: &mut z_stream) {
+    // `inflateSyncPoint` only reads the state.
+    let point = port::inflate_sync_point(strm);
     assert!(
         matches!(point, 0 | 1),
         "inflateSyncPoint returned {point}, which is neither a boolean nor a live-stream error"
     );
-    // SAFETY: as above.
-    let ret = unsafe { inflateSync(strm) };
+    let ret = port::inflate_sync(strm);
     assert!(
         matches!(ret, Z_OK | Z_DATA_ERROR | Z_BUF_ERROR | Z_STREAM_ERROR),
         "inflateSync returned {ret}, which is outside its documented return set"
@@ -1572,12 +989,10 @@ fn try_sync(strm: *mut z_stream) {
 /// `inflateCodesUsed` has a sentinel that genuinely cannot collide: it counts entries in a
 /// table bounded by `ENOUGH`, a few thousand at most, so `ULONG_MAX` can only mean the
 /// state check failed -- which for a live stream it must not have.
-fn read_marks(strm: *mut z_stream) {
-    // SAFETY: `strm` addresses a live initialised `z_stream` reached through no other
-    // pointer, and `inflateMark` only reads the state.
-    let mark: c_long = unsafe { inflateMark(strm) };
-    // SAFETY: as immediately above; `inflateCodesUsed` likewise only reads the state.
-    let codes: c_ulong = unsafe { inflateCodesUsed(strm) };
+fn read_marks(strm: &mut z_stream) {
+    // Both only read the state.
+    let mark: c_long = port::inflate_mark(strm);
+    let codes: c_ulong = port::inflate_codes_used(strm);
     assert!(
         (mark >> 16) >= -1,
         "inflateMark reported a back-pointer below the -1 sentinel: {mark}"
@@ -1598,10 +1013,8 @@ fn read_marks(strm: *mut z_stream) {
 /// when `bits` itself is in range. The last of those depends on the stream's current
 /// contents, which is why this asserts the return is one of the two rather than predicting
 /// which.
-fn prime(strm: *mut z_stream, params: &Params<'_>) {
-    // SAFETY: `strm` addresses a live initialised `z_stream` reached through no other
-    // pointer; both arguments are plain integers.
-    let ret = unsafe { inflatePrime(strm, params.prime_bits, params.prime_value) };
+fn prime(strm: &mut z_stream, params: &Params<'_>) {
+    let ret = port::inflate_prime(strm, params.prime_bits, params.prime_value);
     assert!(
         matches!(ret, Z_OK | Z_STREAM_ERROR),
         "inflatePrime returned {ret}, which is outside its documented return set"
@@ -1630,16 +1043,13 @@ fn prime(strm: *mut z_stream, params: &Params<'_>) {
 /// `inflateValidate` always answers `Z_OK`, including when it *declines* the request:
 /// C guards the set with `if (check && state->wrap)`, so asking a raw stream to validate a
 /// check value it does not have clears the bit instead of setting it and still succeeds.
-fn toggle_flags(strm: *mut z_stream, params: &Params<'_>) {
-    // SAFETY: `strm` addresses a live initialised `z_stream` reached through no other
-    // pointer; the second argument is a plain integer.
-    let undermine = unsafe { inflateUndermine(strm, c_int::from(params.prime_bits != 0)) };
+fn toggle_flags(strm: &mut z_stream, params: &Params<'_>) {
+    let undermine = port::inflate_undermine(strm, c_int::from(params.prime_bits != 0));
     assert_eq!(
         undermine, Z_DATA_ERROR,
         "inflateUndermine returned {undermine}; the shipped configuration refuses it"
     );
-    // SAFETY: as above.
-    let validate = unsafe { inflateValidate(strm, c_int::from(params.prime_value >= 0)) };
+    let validate = port::inflate_validate(strm, c_int::from(params.prime_value >= 0));
     assert_eq!(
         validate, Z_OK,
         "inflateValidate returned {validate}; it succeeds even when it declines the request"
@@ -1656,19 +1066,17 @@ fn toggle_flags(strm: *mut z_stream, params: &Params<'_>) {
 ///
 /// This runs last of the extras because it is destructive: it zeroes the accounting and
 /// uninstalls any `gz_header`, so nothing after it can assert on either.
-fn reset(strm: *mut z_stream, params: &Params<'_>) {
-    // SAFETY: `strm` addresses a live initialised `z_stream` reached through no other
-    // pointer.
-    let plain = unsafe { inflateReset(strm) };
+fn reset(strm: &mut z_stream, params: &Params<'_>) {
+    let plain = port::inflate_reset(strm);
     assert_eq!(
         plain, Z_OK,
         "inflateReset on a live stream returned {plain}"
     );
 
+    // Every value of `requested` is a request `inflateReset2` is required to answer rather
+    // than trust.
     let requested = params.reset_window_bits;
-    // SAFETY: as above; `requested` is a plain integer and every value of it is a request
-    // `inflateReset2` is required to answer rather than trust.
-    let ret = unsafe { inflateReset2(strm, requested) };
+    let ret = port::inflate_reset2(strm, requested);
     if OUT_OF_RANGE_WINDOW_BITS.contains(&requested) {
         assert_eq!(
             ret, Z_STREAM_ERROR,
@@ -1686,7 +1094,7 @@ fn reset(strm: *mut z_stream, params: &Params<'_>) {
 ///
 /// Ordered so that the destructive one is last: [`reset`] zeroes the accounting and
 /// uninstalls the header, so everything that wants a mid-stream state has already had it.
-fn extras(strm: *mut z_stream, params: &Params<'_>) {
+fn extras(strm: &mut z_stream, params: &Params<'_>) {
     if params.enabled(ops::GET_DICTIONARY) {
         read_dictionary(strm);
     }
@@ -1737,10 +1145,10 @@ fn extras(strm: *mut z_stream, params: &Params<'_>) {
 /// ended, so freeing any part of this early would be a use-after-free in the library --
 /// exactly as it would be under C.
 struct HeaderProbe {
-    /// The structure whose address is handed to `inflateGetHeader`.
+    /// The structure handed to `inflateGetHeader`.
     ///
-    /// Reached through one raw pointer from [`HeaderProbe::install`] onwards, and not
-    /// touched again until [`HeaderProbe::verify`] runs after the stream has been ended.
+    /// Not touched from [`HeaderProbe::install`] until [`HeaderProbe::verify`] runs, after
+    /// the stream has been ended.
     header: gz_header,
     /// Destination for the `FEXTRA` field.
     extra: GuardedBuf,
@@ -1784,40 +1192,35 @@ impl HeaderProbe {
         }
     }
 
-    /// Points the header at the three buffers and returns its address.
+    /// Points the header at the three buffers and installs it on `strm`.
     ///
-    /// Called once the probe is at its final address, because the returned pointer must
-    /// stay valid for the life of the stream. The buffer pointers themselves are
-    /// address-stable regardless: each names a separate heap allocation, so moving the
-    /// probe would move only the `gz_header`.
+    /// The six field writes happen *before* `inflateGetHeader` is called, so at that point
+    /// the library holds nothing and they are ordinary assignments on a structure this
+    /// probe owns. The three buffer pointers are address-stable regardless of where the
+    /// probe itself lives: each names a separate heap allocation, so moving the probe would
+    /// move only the `gz_header`.
     ///
     /// ★ Nothing may touch the probe between this call and [`HeaderProbe::verify`]. The
-    /// library holds the pointer this returns and writes through it during `inflate`;
-    /// interposing a borrow of `self` would put a second, conflicting access path on the
-    /// same memory. `verify` is safe because by then the stream has been ended and the
-    /// library has let go.
-    fn install(&mut self) -> *mut gz_header {
-        let header = addr_of_mut!(self.header);
-        // SAFETY: `header` addresses this probe's own `gz_header`, which is live, aligned
-        // and initialised by `new`. The three data pointers name three distinct
-        // allocations that this probe owns and keeps alive, each writable for the capacity
-        // written beside it. Field-wise writes through `addr_of_mut!` avoid forming a
-        // reference to the structure, so this establishes the single access path the
-        // library is about to share.
-        unsafe {
-            addr_of_mut!((*header).extra).write(self.extra.data());
-            addr_of_mut!((*header).extra_max).write(narrow(self.extra.capacity()));
-            addr_of_mut!((*header).name).write(self.name.data());
-            addr_of_mut!((*header).name_max).write(narrow(self.name.capacity()));
-            addr_of_mut!((*header).comment).write(self.comment.data());
-            addr_of_mut!((*header).comm_max).write(narrow(self.comment.capacity()));
-        }
-        header
+    /// library keeps the header's address and writes through it during `inflate`, so
+    /// interposing an access would put a second path on memory it is already using. The
+    /// probe must also not be moved while the stream is live, which is why [`run`] holds it
+    /// in a local it never reassigns. `verify` is unambiguous because by then the stream has
+    /// been ended and the library has let go.
+    ///
+    /// Returns `inflateGetHeader`'s status.
+    fn install(&mut self, strm: &mut z_stream) -> c_int {
+        self.header.extra = self.extra.data();
+        self.header.extra_max = self.extra.capacity_uint();
+        self.header.name = self.name.data();
+        self.header.name_max = self.name.capacity_uint();
+        self.header.comment = self.comment.data();
+        self.header.comm_max = self.comment.capacity_uint();
+        port::inflate_get_header(strm, &mut self.header)
     }
 
     /// Checks the guards and the reported fields, after the stream has been ended.
     ///
-    /// ★ MEASURED, both directions. Over-advertising each maximum by [`GUARD_LEN`] and
+    /// ★ MEASURED, both directions. Over-advertising each maximum by [`port::GUARD_LEN`] and
     /// feeding a gzip member whose `FNAME` is 32 bytes against a zero-capacity buffer made
     /// the guard fire immediately and attributably -- "gz_header.name: byte 0 of the
     /// trailing guard was overwritten -- a write past the end of a caller buffer of 0
@@ -1863,17 +1266,17 @@ impl HeaderProbe {
 
         assert_eq!(
             header.extra_max,
-            narrow(self.extra.capacity()),
+            self.extra.capacity_uint(),
             "the library modified extra_max"
         );
         assert_eq!(
             header.name_max,
-            narrow(self.name.capacity()),
+            self.name.capacity_uint(),
             "the library modified name_max"
         );
         assert_eq!(
             header.comm_max,
-            narrow(self.comment.capacity()),
+            self.comment.capacity_uint(),
             "the library modified comm_max"
         );
 
@@ -1950,58 +1353,49 @@ fuzz_target!(|input: InflateInput| {
 /// One execution: set up, initialise, decode, check, tear down, check again.
 ///
 /// The declaration order is load-bearing and is the reason this reads slightly
-/// back-to-front. `out` and `probe` are declared **before** the stream because Rust drops
-/// locals in reverse declaration order, so declaring them first guarantees they are still
-/// alive when [`teardown`] ends the stream. `inflateGetHeader` hands the library a pointer
-/// it keeps until the header completes or the stream is reset or ended, so a buffer that
-/// went out of scope first would be a use-after-free inside the library.
-///
-/// The zone and the stream are each reached through exactly **one** raw pointer, taken with
-/// `addr_of_mut!` and used for every subsequent access. Mixing that with direct use of the
-/// bindings would put two access paths on memory the library also holds a pointer to; one
-/// path is both sufficient and the only arrangement worth reasoning about.
+/// back-to-front. `out`, `probe` and the allocator are declared **before** the stream
+/// because Rust drops locals in reverse declaration order, so declaring them first
+/// guarantees they are still alive when [`teardown`] ends the stream. `inflateGetHeader`
+/// hands the library a pointer it keeps until the header completes or the stream is reset or
+/// ended, and the allocator's ledger is what `inflateEnd` returns blocks to, so either going
+/// out of scope first would be a use-after-free inside the library.
 fn run(input: &InflateInput) {
     let params = Params::from_input(input);
 
     let out = GuardedBuf::new(params.out_len);
     let mut probe = HeaderProbe::new(&params);
+    let allocator = TrackingAllocator::with_limit(params.alloc_limit);
 
-    let mut zone_storage = MemZone::new(params.alloc_limit);
-    let zone = addr_of_mut!(zone_storage);
+    // `test/infcover.c`'s `mem_setup` (L158-L173) assigns only `opaque`, `zalloc` and
+    // `zfree` and leaves the rest of a stack `z_stream` uninitialised, which C permits
+    // because `inflateInit2_` writes what it needs. Rust does not permit a partly
+    // initialised struct, so the gate's fully zeroed stream is the starting point and the
+    // three members C really chooses are then installed as the choices they are.
+    let mut stream = port::zeroed_stream();
+    allocator.install(&mut stream);
+    let strm = &mut stream;
 
-    let mut stream_storage = new_stream(zone);
-    let strm = addr_of_mut!(stream_storage);
-
-    // `test/infcover.c` L296: `inflateInit2(&strm, win)`, which is a macro over this.
-    // `inflateInit2` is not a symbol in either implementation, so a Rust caller performs
-    // the version-and-layout handshake the macro arranges by hand.
-    // SAFETY: `strm` addresses a fully initialised `z_stream` whose allocator hooks are
-    // both non-null and whose `opaque` is the live zone above; `ZLIB_VERSION` is a
-    // `'static` NUL-terminated string, which is what the `*const c_char` parameter needs.
-    let init = unsafe {
-        inflateInit2_(
-            strm,
-            params.window_bits,
-            ZLIB_VERSION.as_ptr(),
-            stream_size(),
-        )
-    };
+    // `test/infcover.c` L296: `inflateInit2(&strm, win)`, which is a macro over
+    // `inflateInit2_`. `inflateInit2` is not a symbol in either implementation, so the
+    // version-and-layout handshake the macro arranges is performed by the gate.
+    let init = port::inflate_init2(strm, params.window_bits);
 
     if init != Z_OK {
         // `test/infcover.c` L297-L300: nothing was initialised, so there is nothing to end.
         // Only two failures are reachable. `Z_STREAM_ERROR` is a `windowBits` outside the
         // legal space, and `Z_MEM_ERROR` is the induced allocation ceiling biting. A
-        // `Z_VERSION_ERROR` would mean `stream_size` or `ZLIB_VERSION` is wrong and that
-        // this target has been fuzzing nothing, which is why it is called out by name.
+        // `Z_VERSION_ERROR` would mean the `stream_size` or `ZLIB_VERSION` the gate passes
+        // is wrong and that this target has been fuzzing nothing, which is why it is called
+        // out by name.
         assert!(
             matches!(init, Z_STREAM_ERROR | Z_MEM_ERROR),
             "inflateInit2_ with windowBits {} returned {init}; a Z_VERSION_ERROR here \
              would mean the version handshake is wrong and nothing is being fuzzed",
             params.window_bits
         );
-        // SAFETY: no stream holds the zone -- initialisation failed, and a failed
+        // No stream holds the ledger -- initialisation failed, and a failed
         // `inflateInit2_` releases whatever it had reserved before returning.
-        let report = unsafe { mem_done(zone) };
+        let report = allocator.finish();
         assert_zone_clean(&report, false);
         return;
     }
@@ -2011,12 +1405,9 @@ fn run(input: &InflateInput) {
     // the C driver installs one for `win == 47` alone.
     let probing_header = params.enabled(ops::GET_HEADER) && collects_header(params.window_bits);
     if probing_header {
-        let header = probe.install();
-        // SAFETY: `strm` addresses the live stream initialised above. `header` addresses
-        // `probe`'s own `gz_header`, whose three buffers `install` has just pointed at live
-        // allocations `probe` owns; `probe` outlives the stream by declaration order, and
-        // nothing touches it again until after `teardown`.
-        let got = unsafe { inflateGetHeader(strm, header) };
+        // `probe` owns the three live allocations `install` points the header at, outlives
+        // the stream by declaration order, and is not touched again until after `teardown`.
+        let got = probe.install(strm);
         assert_eq!(
             got, Z_OK,
             "inflateGetHeader was refused for windowBits {}, which permits gzip decoding",
@@ -2045,8 +1436,7 @@ fn run(input: &InflateInput) {
     }
 
     // `test/infcover.c` L346: `mem_done(&strm, what)`. The stream has been ended, so a
-    // clean zone is the contract and anything else is a defect.
-    // SAFETY: `teardown` ended the stream, so nothing references the zone's blocks.
-    let report = unsafe { mem_done(zone) };
+    // clean ledger is the contract and anything else is a defect.
+    let report = allocator.finish();
     assert_zone_clean(&report, true);
 }

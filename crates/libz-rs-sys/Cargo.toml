@@ -1,11 +1,16 @@
 # libz-rs-sys -- the C ABI facade crate (workspace member 2 of 3).
 #
 # This crate is INTENDED to be the drop-in replacement for the C `libz`, and it is
-# the ONLY crate in the workspace permitted to use `unsafe`: every raw pointer
-# that crosses the C boundary is validated here and converted into a safe Rust
-# slice exactly once, before any call into the dependency-free `zlib-rs` core.
+# the only SHIPPED crate permitted to use `unsafe`: every raw pointer that crosses
+# the C boundary is validated here and converted into a safe Rust slice exactly
+# once, before any call into the dependency-free `zlib-rs` core.  The qualifier
+# is load-bearing rather than pedantic: `crates/zlib-rs-differential` is a
+# dev-only harness that has to call this facade's C ABI *and* the C reference's,
+# so it carries an FFI boundary of its own in `src/oracle.rs` and `src/port.rs`.
+# Neither shipped crate names it, so none of that is compiled into `libz.so` or
+# `libz.a`, and `crates/zlib-rs` remains free of `unsafe` altogether.
 #
-# STATE AT THIS CHECKPOINT, MEASURED.  `cargo build --release -p libz-rs-sys
+# WHAT CARGO PRODUCES, AND WHY IT IS NOT THE WHOLE DROP-IN.  `cargo build --release -p libz-rs-sys
 # --features libz-compat` produces `target/release/libz.a` and
 # `target/release/libz.so` (SONAME `libz.so.1`).  The ARCHIVE IS COMPLETE: it
 # defines all 95 functions `zlib.h` declares, because `build.rs` compiles this
@@ -45,11 +50,12 @@
 #      silently ignores it elsewhere, and with a single package selected that does
 #      not declare it the flag is a hard error.  Naming the package says what is
 #      meant in both cases.
-#   3. the artifact names, which the root `CMakeLists.txt` will consume once a
-#      `ZLIB_BUILD_RUST` path is added to it.  No such option exists in
-#      `CMakeLists.txt` or `README-cmake.md` today; that update is still to come.
-#   4. `Makefile.in`'s `rust`, `rust-test`, `rust-symbols`, `rust-header` and
-#      `rust-clean` targets, all of which do exist.
+#   3. the artifact names, which the root `CMakeLists.txt` consumes through its
+#      `ZLIB_BUILD_RUST` option — it stages `libz.so`/`libz.a` from this crate and
+#      points the exported `ZLIB::ZLIB` and `ZLIB::ZLIBSTATIC` targets at them.
+#      `README-cmake.md` documents the option.
+#   4. `Makefile.in`'s `rust`, `rust-test`, `rust-symbols`, `rust-header`,
+#      `rust-msrv` and `rust-clean` targets, all six of which exist.
 #   5. `zlib.pc`'s `Libs: ... -lz` — which requires `libz.so` / `libz.a`.
 #
 # Related files, and the boundary of this manifest's responsibility:
@@ -158,9 +164,10 @@ homepage = "https://zlib.net/"
 #                    target performs that relink.
 #   * `rlib`      -> required so `zlib-rs-differential`, the `fuzz/` targets and
 #                    this crate's own `tests/*.rs` can depend on it as a normal
-#                    Rust library.  Omitting `rlib` would silently break every
-#                    integration test in `tests/` — a directory that does not
-#                    exist yet.
+#                    Rust library.  Omitting it would break every integration
+#                    test in `tests/`, the three benches under `benches/` and all
+#                    five fuzz targets, every one of which links this crate as an
+#                    ordinary Rust dependency.
 [lib]
 name = "z"
 crate-type = ["cdylib", "staticlib", "rlib"]
@@ -235,19 +242,34 @@ libz-compat = []
 # still resolve without `libc`, and the safe core keeps its empty `[dependencies]`.
 gz = ["libz-compat", "zlib-rs/std", "dep:libc"]
 
-# Vectorised CRC-32 / Adler-32 backends, off by default.  A single pass-through
-# switch to `zlib-rs/simd`, and THE ONLY WAY THE VECTORISED CODE IS COMPILED.
+# The alternative CRC-32 / Adler-32 backends, off by default.  A single
+# pass-through switch to `zlib-rs/simd`, and THE ONLY WAY THAT CODE IS COMPILED.
+#
+# What the name promises and what it delivers are not the same thing, so: both
+# backends are ordinary portable integer code, written in a shape LLVM can
+# autovectorise at `opt-level = 3`, with no architecture intrinsic in either --
+# `crates/zlib-rs` carries `#![forbid(unsafe_code)]` and every `core::arch`
+# intrinsic is `unsafe`, so there could not be one.  Whether vector instructions
+# are actually emitted is a property of the compiler and the target, not a
+# guarantee of this feature.  Neither backend probes the CPU to decide what is
+# correct, either: `crc32/simd.rs` performs no run-time feature test at all, and
+# `adler32/simd.rs` exposes an `is_supported()` its parent consults as a
+# throughput hint.  A `simd`-enabled binary therefore computes the right answer on
+# a machine with no vector unit.
 #
 # Do not read `ZLIB_RS_SIMD=0|1` in `build.rs` as an alternative to it: a build
 # script cannot turn a Cargo feature on, so that variable only publishes a
-# `cfg(zlib_rs_simd)` that this crate's source can key off.  Selecting the
-# vectorised backends is this feature's job and nothing else's.
+# `cfg(zlib_rs_simd)` that this crate's source can key off.  Selecting these
+# backends is this feature's job and nothing else's.
 #
-# SIMD is deliberately confined to the two checksums and is OUTPUT-NEUTRAL: a
-# checksum yields one scalar however it is computed, so vectorising it cannot
-# perturb the bitstream.  It may change speed only, never emitted bytes.
-# Vectorising match-finding would change the compressed output and is therefore
-# prohibited outright — byte-identical output is a hard requirement.
+# The feature is deliberately confined to the two checksums and is
+# OUTPUT-NEUTRAL: a checksum yields one scalar however it is computed, so
+# computing it differently cannot perturb the bitstream.  It may change speed
+# only, never emitted bytes -- and that is measured rather than argued, by the
+# `--features simd` run in the `differential` CI job, which compares the emitted
+# bytes AND the running check value against the C oracle.  Vectorising
+# match-finding would change the compressed output and is therefore prohibited
+# outright: byte-identical output is a hard requirement.
 simd = ["zlib-rs/simd"]
 
 # Deliberate — not accidental — opt-in for the optional `libc` dependency below.
@@ -345,9 +367,10 @@ libc = { version = "0.2.189", optional = true }
 # it is required rather than optional.
 #
 # Note what is deliberately absent: nothing here forbids `unsafe`.  This is the
-# one crate allowed to use it, which is exactly why the workspace declines to
-# blanket-forbid `unsafe_code`; `#![forbid(unsafe_code)]` belongs to `zlib-rs`
-# alone.
+# one SHIPPED crate allowed to use it, which is exactly why the workspace declines
+# to blanket-forbid `unsafe_code`; `#![forbid(unsafe_code)]` belongs to `zlib-rs`
+# alone, and the dev-only differential harness needs `unsafe` for the same reason
+# this crate does -- it calls C.
 [lints]
 workspace = true
 
@@ -361,15 +384,25 @@ workspace = true
 #                        crossing the FFI edge into an abort instead of
 #                        undefined behaviour.  Restating it here would be
 #                        ignored *and* would falsely imply local control.
-# * [[bench]]          — the repo-root `benches/*.rs` are to attach to
-#                        `zlib-rs-differential`, which owns the C oracle they
-#                        measure against.  That directory does not exist yet.
+# * [[bench]]          — the repo-root `benches/checksum_bench.rs`,
+#                        `inflate_bench.rs` and `deflate_bench.rs` exist and are
+#                        attached to `zlib-rs-differential` instead, through the
+#                        three `[[bench]]` entries in that manifest.  That crate
+#                        owns the C oracle all three measure against, and this
+#                        one must not grow a dependency on it: AAP 0.6.4.1 keeps
+#                        the differential crate out of every shipped
+#                        `[dependencies]` table so that building the library
+#                        never invokes a C compiler.
 # * [[bin]]            — this crate is a library only.
-# * [dev-dependencies] — the planned integration tests (`abi_layout.rs`,
-#                        `symbol_parity.rs`, `c_api_parity.rs`, none of them
-#                        written yet) are to run on `std` alone, with
-#                        `symbol_parity.rs` shelling out to `nm` through
-#                        `std::process::Command`.  Nothing to add.
+# * [dev-dependencies] — still nothing to add, and now for a stronger reason than
+#                        when this list was first written: the five integration
+#                        tests are written -- `abi_layout.rs`, `symbol_parity.rs`,
+#                        `c_api_parity.rs`, `gz_memory.rs` and
+#                        `rust_api_surface.rs` -- and they need `std` and nothing
+#                        else.  `symbol_parity.rs` reaches its tools the same
+#                        way, shelling out to `nm` and `readelf` through
+#                        `std::process::Command` rather than linking a crate to
+#                        parse ELF.
 # * links              — the two files in `csrc/` are this crate's own translation
 #                        units, bundled into this crate's own archive.  Neither is
 #                        a system library another package could also claim, and

@@ -3621,12 +3621,13 @@ mod tests {
     /// header status (L1066-L1200) and `HCRC_STATE` hands over to `BUSY_STATE` at
     /// L1195, never to return.
     ///
-    /// Before [`with_header_while_emitting`] gated it, this library rebuilt the whole
-    /// `GzHeaderView` on entry to every `deflate` call -- seven member reads plus a
-    /// NUL scan of `name` and `comment` -- so a caller that had freed the structure at
-    /// the documented point was read after the fact on every subsequent call. The
-    /// allocation is a `Box` here so that the retained read is a `heap-use-after-free`
-    /// under AddressSanitizer rather than a silent one.
+    /// [`with_header_while_emitting`] is what holds that here: it is the only path that
+    /// forms a `GzHeaderView`, and it forms one only while a header status says the
+    /// emission is still in progress. Rebuilding the view on entry to every `deflate`
+    /// call instead -- seven member reads plus a NUL scan of `name` and `comment` --
+    /// would read a structure the caller was entitled to release, on every call after
+    /// the header was written. The allocation below is a `Box` so that such a read is a
+    /// `heap-use-after-free` under `AddressSanitizer` rather than a silent one.
     #[test]
     fn the_header_structure_itself_may_be_freed_once_the_header_has_been_written() {
         const EXTRA: &[u8] = &[0x11, 0x22, 0x33];
@@ -3711,9 +3712,50 @@ mod tests {
 // module has just checked the length of, so each one is provably in range. The reason
 // is spelled out in `crate::panic_guard`'s module documentation, which also records why
 // there is no `allow-indexing-slicing-in-tests` key to use instead.
+//
+// `clippy::undocumented_unsafe_blocks` is NOT relaxed. It is denied workspace-wide and
+// stays denied here, so every `unsafe` block below carries its own `// SAFETY:` naming
+// the invariant that discharges it, exactly as the library half of this file does and
+// as the test harnesses in `crate::gz` and `crate::infback` do. That is what makes the
+// module machine-checked rather than merely reviewed: there is no configuration in
+// which an undocumented block can be added here without failing the build.
 #[cfg(test)]
-#[allow(clippy::undocumented_unsafe_blocks, clippy::indexing_slicing)]
+#[allow(clippy::indexing_slicing)]
 mod tests_backend {
+    //! Backend tests for the `deflate*` exports: the allocation sequence a caller's
+    //! hooks observe, the `gz_header` lifetime contract, and `deflateCopy`'s failure
+    //! behaviour.
+    //!
+    //! # The facts every `// SAFETY:` below builds on
+    //!
+    //! Four properties hold across the whole module, so the individual invariants
+    //! name what is specific to their call rather than restating these:
+    //!
+    //! - Every `z_stream` reaches an export as `&mut z_stream` derived from a local
+    //!   this module declared with [`blank_stream`], so the pointer the export
+    //!   receives is non-null, aligned and valid for reads and writes for at least
+    //!   `size_of::<z_stream>()` bytes. A stream is never moved after its `state` is
+    //!   installed, which is the rule `deflate.c`'s `deflateStateCheck` enforces.
+    //!   Where a null or foreign pointer is passed on purpose, the block says so.
+    //! - Every `state` a call operates on is either null — before `deflateInit2_`, or
+    //!   after `deflateEnd` — or the exact value this module's own `deflateInit2_`
+    //!   installed and has not yet ended. No test hands an export a state another
+    //!   test owns.
+    //! - Every `gz_headerp` is a `Box::into_raw` allocation made in the same test,
+    //!   live until that test's matching `Box::from_raw`, and its `extra`, `name` and
+    //!   `comment` members point into `Vec`s that outlive the last call reading them.
+    //!   `deflateSetHeader` only records the pointer, so the *structure* has to stay
+    //!   live exactly as long as the emitting calls, which each test arranges.
+    //! - `zalloc` and `zfree` are [`mem_alloc`] and [`mem_free`], and `opaque` is the
+    //!   single `Box::into_raw` pointer a [`Zone`] owns. Memory obtained from
+    //!   `mem_alloc` is returned only to `mem_free`, which is the contract
+    //!   `test/infcover.c`'s `mem_done` checks and [`MemZone::assert_clean`]
+    //!   reproduces.
+    //!
+    //! Tests may panic — that is how they report failure — so `clippy.toml` allows
+    //! panicking here, and the `#[allow]` above re-enables indexing for the reason
+    //! stated beside it.
+
     use super::{
         deflate, deflateBound, deflateCopy, deflateEnd, deflateInit2_, deflateParams,
         deflateSetHeader, DeflateSlot,
@@ -3845,6 +3887,11 @@ mod tests_backend {
         if zone.is_null() {
             return core::ptr::null_mut();
         }
+        // SAFETY: `opaque` is the pointer a [`Zone`] obtained from `Box::into_raw`, the null branch
+        // above has already returned, and the library only ever hands back the value the caller
+        // installed -- so it addresses that live `MemZone`. `mem_alloc` and `mem_free` are its only
+        // other users and neither re-enters the other, so this is the sole live reference for the
+        // rest of the call.
         let zone = unsafe { &mut *zone };
         let len = (count as usize) * (size as usize);
         if zone.deny_from != 0 && zone.requested.len() + 1 >= zone.deny_from {
@@ -3853,11 +3900,17 @@ mod tests_backend {
         let Some(layout) = tracked_layout(len) else {
             return core::ptr::null_mut();
         };
+        // SAFETY: `tracked_layout` rejects nothing but a failed `from_size_align`, and its
+        // `len.max(1)` guarantees a non-zero size, which is `alloc`'s one requirement. A null
+        // return is handled on the next line.
         let ptr = unsafe { std::alloc::alloc(layout) };
         if ptr.is_null() {
             return core::ptr::null_mut();
         }
         // ★ Never zeros. This is the byte that catches code assuming zeroed memory.
+        // SAFETY: `ptr` came from `alloc(layout)` and the check above has ruled out null, so it is
+        // valid for writes for exactly `layout.size()` bytes; a `u8` write needs no further
+        // alignment.
         unsafe { core::ptr::write_bytes(ptr, 0xa5, layout.size()) };
         zone.live.insert(0, (ptr, len));
         zone.requested.push((ptr, len));
@@ -3871,6 +3924,9 @@ mod tests_backend {
         if zone.is_null() {
             return;
         }
+        // SAFETY: `opaque` is the pointer a [`Zone`] obtained from `Box::into_raw` and the null
+        // branch above has already returned, so it addresses that live `MemZone`; as in
+        // [`mem_alloc`], no other reference to it exists while this call runs.
         let zone = unsafe { &mut *zone };
         let found = zone
             .live
@@ -3887,6 +3943,9 @@ mod tests_backend {
         zone.total -= len;
         zone.released.push(at);
         if let Some(layout) = tracked_layout(len) {
+            // SAFETY: `at` was handed out by [`mem_alloc`], which allocated it with the layout
+            // `tracked_layout` returns for this same `len`, and it has just been removed from
+            // `live` -- so it is deallocated exactly once, with the layout it was allocated with.
             unsafe { std::alloc::dealloc(at, layout) };
         }
     }
@@ -3969,6 +4028,10 @@ mod tests_backend {
     /// Initialises a gzip-wrapped compressor at the default settings.
     unsafe fn init_gzip(strm: &mut z_stream) -> c_int {
         let (version, size) = version_args();
+        // SAFETY: `strm` arrives as `&mut z_stream`, so the pointer is non-null, aligned and valid
+        // for the whole structure; `version` is `ZLIB_VERSION`'s NUL-terminated bytes and `size` is
+        // `size_of::<z_stream>()`, which is the pair the `deflateInit2` macro supplies. Callers
+        // pass a stream whose `state` is still null.
         unsafe {
             deflateInit2_(
                 strm,
@@ -4001,6 +4064,9 @@ mod tests_backend {
         let mut strm = blank_stream();
         track(&mut strm, &zone);
 
+        // SAFETY: `strm` is this test's own blank stream: its `state` is still null, so nothing is
+        // leaked by initialising it, and `init_gzip` takes it by `&mut` so the pointer is non-null,
+        // aligned and valid for the whole structure.
         assert_eq!(unsafe { init_gzip(&mut strm) }, ReturnCode::OK.as_i32());
 
         let requested = zone.with(|zone| zone.requested.clone());
@@ -4020,6 +4086,9 @@ mod tests_backend {
         );
         let state_block = requested[0].0;
 
+        // SAFETY: `strm` still holds the state `init_gzip` installed and has not been ended, so
+        // `deflateEnd` releases each block exactly once through the same `zfree` it was allocated
+        // with.
         assert_eq!(unsafe { deflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
         assert!(strm.state.is_null());
 
@@ -4051,6 +4120,9 @@ mod tests_backend {
             track(&mut strm, &zone);
 
             assert_eq!(
+                // SAFETY: `strm` is this test's own blank stream: its `state` is still null, so
+                // nothing is leaked by initialising it, and `init_gzip` takes it by `&mut` so the
+                // pointer is non-null, aligned and valid for the whole structure.
                 unsafe { init_gzip(&mut strm) },
                 ReturnCode::MEM_ERROR.as_i32(),
                 "request {deny_from} refused"
@@ -4089,6 +4161,9 @@ mod tests_backend {
         track(&mut strm, &zone);
 
         assert_eq!(
+            // SAFETY: `strm` is this test's own blank stream: its `state` is still null, so nothing
+            // is leaked by initialising it, and `init_gzip` takes it by `&mut` so the pointer is
+            // non-null, aligned and valid for the whole structure.
             unsafe { init_gzip(&mut strm) },
             ReturnCode::MEM_ERROR.as_i32()
         );
@@ -4107,6 +4182,9 @@ mod tests_backend {
         let (version, size) = version_args();
 
         // `memLevel` 10 exceeds `MAX_MEM_LEVEL` (`deflate.c` L434).
+        // SAFETY: as [`init_gzip`], except that `memLevel` is deliberately 10. `deflate.c` L434
+        // rejects that before it allocates, so this exercises validation rather than
+        // initialisation; `strm` is still a blank stream and `version`/`size` are the macro's pair.
         let ret = unsafe {
             deflateInit2_(
                 &mut strm,
@@ -4142,6 +4220,9 @@ mod tests_backend {
     #[test]
     fn a_header_edited_after_deflate_set_header_is_the_one_emitted() {
         let mut strm = blank_stream();
+        // SAFETY: `strm` is this test's own blank stream: its `state` is still null, so nothing is
+        // leaked by initialising it, and `init_gzip` takes it by `&mut` so the pointer is non-null,
+        // aligned and valid for the whole structure.
         assert_eq!(unsafe { init_gzip(&mut strm) }, ReturnCode::OK.as_i32());
 
         // The header lives behind one raw pointer for its whole life, which is how a C
@@ -4149,14 +4230,25 @@ mod tests_backend {
         // through it later, so every access here goes through the same pointer rather
         // than alternating between it and the local.
         let head = Box::into_raw(Box::new(blank_header()));
+        // SAFETY: `head` is the `Box::into_raw` allocation this test made and has not yet
+        // reclaimed, so it is non-null, aligned and valid for writes for a whole `gz_header`. `os`
+        // is a plain `c_int` member.
         unsafe { (*head).os = 3 };
         assert_eq!(
+            // SAFETY: `strm` holds a gzip state this module installed, and `head` is the live,
+            // aligned `gz_header` this test allocated; `deflateSetHeader` records the pointer
+            // rather than copying the structure, and the structure and its buffers stay live until
+            // this test reclaims them.
             unsafe { deflateSetHeader(&mut strm, head) },
             ReturnCode::OK.as_i32()
         );
 
         // Every edit below happens after the call that recorded the pointer.
         let mut name = *b"late.txt\0";
+        // SAFETY: `head` is the `Box::into_raw` allocation this test made and has not yet
+        // reclaimed, so it is non-null, aligned and valid for writes for a whole `gz_header`.
+        // `name` is a local array that outlives every call below that reads it, and it is
+        // NUL-terminated, which is what `deflate.c` requires of the member.
         unsafe {
             (*head).name = name.as_mut_ptr();
             (*head).time = uLong::from(0x0102_0304_u32);
@@ -4170,6 +4262,9 @@ mod tests_backend {
         strm.next_out = out.as_mut_ptr();
         strm.avail_out = uInt::try_from(out.len()).expect("fits");
         assert_eq!(
+            // SAFETY: `strm` holds a live state, and `next_in`/`avail_in` and
+            // `next_out`/`avail_out` were set from the same slices whose lengths they carry, so
+            // both extents are exact.
             unsafe { deflate(&mut strm, Z_FINISH) },
             ReturnCode::STREAM_END.as_i32()
         );
@@ -4193,7 +4288,13 @@ mod tests_backend {
             "the name assigned after deflateSetHeader is emitted"
         );
 
+        // SAFETY: `strm` still holds the state `init_gzip` installed and has not been ended, so
+        // `deflateEnd` releases each block exactly once through the same `zfree` it was allocated
+        // with.
         assert_eq!(unsafe { deflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
+        // SAFETY: `head` came from `Box::into_raw` in this test, every stream that recorded it has
+        // been ended, and this is the only place it is reclaimed -- so it is reclaimed exactly once
+        // and nothing can read it afterwards.
         drop(unsafe { Box::from_raw(head) });
     }
 
@@ -4206,17 +4307,33 @@ mod tests_backend {
     #[test]
     fn a_header_edited_after_deflate_set_header_changes_the_bound() {
         let mut strm = blank_stream();
+        // SAFETY: `strm` is this test's own blank stream: its `state` is still null, so nothing is
+        // leaked by initialising it, and `init_gzip` takes it by `&mut` so the pointer is non-null,
+        // aligned and valid for the whole structure.
         assert_eq!(unsafe { init_gzip(&mut strm) }, ReturnCode::OK.as_i32());
 
         let head = Box::into_raw(Box::new(blank_header()));
         assert_eq!(
+            // SAFETY: `strm` holds a gzip state this module installed, and `head` is the live,
+            // aligned `gz_header` this test allocated; `deflateSetHeader` records the pointer
+            // rather than copying the structure, and the structure and its buffers stay live until
+            // this test reclaims them.
             unsafe { deflateSetHeader(&mut strm, head) },
             ReturnCode::OK.as_i32()
         );
+        // SAFETY: `strm` holds a live gzip state whose recorded header is the `head` above, which
+        // is what `deflateBound` re-reads on every call (`deflate.c` L891-L910); the structure is
+        // still live.
         let empty = unsafe { deflateBound(&mut strm, 100) };
 
         let mut name = *b"late.txt\0";
+        // SAFETY: `head` is the `Box::into_raw` allocation this test made and has not yet
+        // reclaimed, so it is non-null, aligned and valid for writes for a whole `gz_header`.
+        // `name` is a local that outlives the two `deflateBound` calls below.
         unsafe { (*head).name = name.as_mut_ptr() };
+        // SAFETY: `strm` holds a live gzip state whose recorded header is the `head` above, which
+        // is what `deflateBound` re-reads on every call (`deflate.c` L891-L910); the structure is
+        // still live.
         let named = unsafe { deflateBound(&mut strm, 100) };
         assert_eq!(
             named,
@@ -4224,14 +4341,26 @@ mod tests_backend {
             "eight name bytes and the terminator, counted live"
         );
 
+        // SAFETY: `head` is the `Box::into_raw` allocation this test made and has not yet
+        // reclaimed, so it is non-null, aligned and valid for writes for a whole `gz_header`.
+        // `hcrc` is a plain `c_int` member.
         unsafe { (*head).hcrc = 1 };
         assert_eq!(
+            // SAFETY: `strm` holds a live gzip state whose recorded header is the `head` above,
+            // which is what `deflateBound` re-reads on every call (`deflate.c` L891-L910); the
+            // structure is still live.
             unsafe { deflateBound(&mut strm, 100) },
             named + 2,
             "deflate.c L907-L908 adds two for the header CRC"
         );
 
+        // SAFETY: `strm` still holds the state `init_gzip` installed and has not been ended, so
+        // `deflateEnd` releases each block exactly once through the same `zfree` it was allocated
+        // with.
         assert_eq!(unsafe { deflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
+        // SAFETY: `head` came from `Box::into_raw` in this test, every stream that recorded it has
+        // been ended, and this is the only place it is reclaimed -- so it is reclaimed exactly once
+        // and nothing can read it afterwards.
         drop(unsafe { Box::from_raw(head) });
     }
 
@@ -4243,23 +4372,40 @@ mod tests_backend {
     #[test]
     fn a_copy_carries_the_header_pointer_and_still_reads_it_live() {
         let mut strm = blank_stream();
+        // SAFETY: `strm` is this test's own blank stream: its `state` is still null, so nothing is
+        // leaked by initialising it, and `init_gzip` takes it by `&mut` so the pointer is non-null,
+        // aligned and valid for the whole structure.
         assert_eq!(unsafe { init_gzip(&mut strm) }, ReturnCode::OK.as_i32());
 
         let head = Box::into_raw(Box::new(blank_header()));
+        // SAFETY: `head` is the `Box::into_raw` allocation this test made and has not yet
+        // reclaimed, so it is non-null, aligned and valid for writes for a whole `gz_header`. `os`
+        // is a plain `c_int` member.
         unsafe { (*head).os = 3 };
         assert_eq!(
+            // SAFETY: `strm` holds a gzip state this module installed, and `head` is the live,
+            // aligned `gz_header` this test allocated; `deflateSetHeader` records the pointer
+            // rather than copying the structure, and the structure and its buffers stay live until
+            // this test reclaims them.
             unsafe { deflateSetHeader(&mut strm, head) },
             ReturnCode::OK.as_i32()
         );
 
         let mut dest = blank_stream();
         assert_eq!(
+            // SAFETY: `dest` is a blank stream whose `state` is null and `strm` holds the live
+            // state to copy; both arrive as `&mut`, so both pointers are non-null, aligned and
+            // valid for a whole `z_stream`, and neither local moves afterwards.
             unsafe { deflateCopy(&mut dest, &mut strm) },
             ReturnCode::OK.as_i32()
         );
 
         // Edited after the copy was taken, and read by the copy.
         let mut name = *b"copied\0";
+        // SAFETY: `head` is the `Box::into_raw` allocation this test made and has not yet
+        // reclaimed, so it is non-null, aligned and valid for writes for a whole `gz_header`.
+        // `name` is a local that outlives the `deflate` call below, which is the call that reads
+        // it.
         unsafe { (*head).name = name.as_mut_ptr() };
 
         let input = b"hello, hello!";
@@ -4269,6 +4415,9 @@ mod tests_backend {
         dest.next_out = out.as_mut_ptr();
         dest.avail_out = uInt::try_from(out.len()).expect("fits");
         assert_eq!(
+            // SAFETY: `dest` holds a live state, and `next_in`/`avail_in` and
+            // `next_out`/`avail_out` were set from the same slices whose lengths they carry, so
+            // both extents are exact.
             unsafe { deflate(&mut dest, Z_FINISH) },
             ReturnCode::STREAM_END.as_i32()
         );
@@ -4278,8 +4427,17 @@ mod tests_backend {
             "the copy emitted the header the source was given"
         );
 
+        // SAFETY: `dest` holds the state `deflateCopy` installed and has not been ended, so
+        // `deflateEnd` releases each of its blocks exactly once through the same `zfree` they came
+        // from.
         assert_eq!(unsafe { deflateEnd(&mut dest) }, ReturnCode::OK.as_i32());
+        // SAFETY: `strm` still holds the state `init_gzip` installed and has not been ended, so
+        // `deflateEnd` releases each block exactly once through the same `zfree` it was allocated
+        // with.
         assert_eq!(unsafe { deflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
+        // SAFETY: `head` came from `Box::into_raw` in this test, every stream that recorded it has
+        // been ended, and this is the only place it is reclaimed -- so it is reclaimed exactly once
+        // and nothing can read it afterwards.
         drop(unsafe { Box::from_raw(head) });
     }
 
@@ -4306,6 +4464,9 @@ mod tests_backend {
         let mut strm = blank_stream();
         let (version, size) = version_args();
         // `memLevel` 1: the small pending buffer is what forces the suspension.
+        // SAFETY: as [`init_gzip`], with `memLevel` 1 so that the pending buffer is small enough to
+        // suspend the header emission this test needs; `strm` is a blank stream and
+        // `version`/`size` are the macro's pair.
         let ret = unsafe {
             deflateInit2_(
                 &mut strm,
@@ -4322,6 +4483,10 @@ mod tests_backend {
 
         let head = Box::into_raw(Box::new(blank_header()));
         assert_eq!(
+            // SAFETY: `strm` holds a gzip state this module installed, and `head` is the live,
+            // aligned `gz_header` this test allocated; `deflateSetHeader` records the pointer
+            // rather than copying the structure, and the structure and its buffers stay live until
+            // this test reclaims them.
             unsafe { deflateSetHeader(&mut strm, head) },
             ReturnCode::OK.as_i32()
         );
@@ -4329,6 +4494,10 @@ mod tests_backend {
         name[NAME_LEN] = 0;
         let mut extra = vec![0x5a_u8; EXTRA_LEN];
         let mut comment = *b"the comment\0";
+        // SAFETY: `head` is the `Box::into_raw` allocation this test made and has not yet
+        // reclaimed, so it is non-null, aligned and valid for writes for a whole `gz_header`.
+        // `name`, `extra` and `comment` are locals that outlive every `deflate` call below, `name`
+        // and `comment` are NUL-terminated, and `extra_len` is `extra`'s own length.
         unsafe {
             (*head).text = 1;
             (*head).time = uLong::from(0x0a0b_0c0d_u32);
@@ -4352,6 +4521,9 @@ mod tests_backend {
             strm.avail_in = 16;
             strm.next_out = small.as_mut_ptr();
             strm.avail_out = 3;
+            // SAFETY: `strm` holds a live state, and `next_in`/`avail_in` and
+            // `next_out`/`avail_out` were set from the same slices whose lengths they carry, so
+            // both extents are exact.
             let ret = unsafe { deflate(&mut strm, Z_NO_FLUSH) };
             assert_eq!(ret, ReturnCode::OK.as_i32());
             let got = 3 - strm.avail_out as usize;
@@ -4366,6 +4538,8 @@ mod tests_backend {
         strm.avail_in = 0;
         strm.next_out = room.as_mut_ptr();
         strm.avail_out = 64;
+        // SAFETY: `strm` holds a live state, and `deflateParams` may flush through
+        // `next_out`/`avail_out`, which were set from `out` and its length just above.
         let ret = unsafe { deflateParams(&mut strm, 9, 1) };
         assert!(
             ret == ReturnCode::OK.as_i32() || ret == ReturnCode::BUF_ERROR.as_i32(),
@@ -4383,6 +4557,9 @@ mod tests_backend {
             }
             strm.next_out = out.as_mut_ptr();
             strm.avail_out = 8192;
+            // SAFETY: `strm` holds a live state, and `next_in`/`avail_in` and
+            // `next_out`/`avail_out` were set from the same slices whose lengths they carry, so
+            // both extents are exact.
             let ret = unsafe {
                 deflate(
                     &mut strm,
@@ -4432,7 +4609,13 @@ mod tests_backend {
             "the comment, terminator included"
         );
 
+        // SAFETY: `strm` still holds the state `init_gzip` installed and has not been ended, so
+        // `deflateEnd` releases each block exactly once through the same `zfree` it was allocated
+        // with.
         assert_eq!(unsafe { deflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
+        // SAFETY: `head` came from `Box::into_raw` in this test, every stream that recorded it has
+        // been ended, and this is the only place it is reclaimed -- so it is reclaimed exactly once
+        // and nothing can read it afterwards.
         drop(unsafe { Box::from_raw(head) });
     }
 
@@ -4455,6 +4638,9 @@ mod tests_backend {
         let zone = Zone::new();
         let mut strm = blank_stream();
         track(&mut strm, &zone);
+        // SAFETY: `strm` is this test's own blank stream: its `state` is still null, so nothing is
+        // leaked by initialising it, and `init_gzip` takes it by `&mut` so the pointer is non-null,
+        // aligned and valid for the whole structure.
         assert_eq!(unsafe { init_gzip(&mut strm) }, ReturnCode::OK.as_i32());
 
         // The source took five blocks; refuse the sixth, which is the copy's state
@@ -4464,6 +4650,9 @@ mod tests_backend {
 
         let mut dest = blank_stream();
         assert_eq!(
+            // SAFETY: `dest` is a blank stream whose `state` is null and `strm` holds the live
+            // state to copy; both arrive as `&mut`, so both pointers are non-null, aligned and
+            // valid for a whole `z_stream`, and neither local moves afterwards.
             unsafe { deflateCopy(&mut dest, &mut strm) },
             ReturnCode::MEM_ERROR.as_i32()
         );
@@ -4472,6 +4661,11 @@ mod tests_backend {
             "deflate.c L1333's byte copy is what dest->state still holds"
         );
         assert_eq!(
+            // SAFETY: `dest` is a live `z_stream`, so the pointer is valid for the whole structure.
+            // Its `state` is the alias `deflate.c` L1333's byte copy left behind rather than a
+            // state `dest` owns, and rejecting exactly that is what this call is asserting: the
+            // owner-identity check answers `Z_STREAM_ERROR` and frees nothing, so the source's
+            // blocks are not freed twice.
             unsafe { deflateEnd(&mut dest) },
             ReturnCode::STREAM_ERROR.as_i32(),
             "the alias fails the owner-identity check instead of being freed twice"
@@ -4490,9 +4684,15 @@ mod tests_backend {
         strm.next_out = out.as_mut_ptr();
         strm.avail_out = uInt::try_from(out.len()).expect("fits");
         assert_eq!(
+            // SAFETY: `strm` holds a live state, and `next_in`/`avail_in` and
+            // `next_out`/`avail_out` were set from the same slices whose lengths they carry, so
+            // both extents are exact.
             unsafe { deflate(&mut strm, Z_FINISH) },
             ReturnCode::STREAM_END.as_i32()
         );
+        // SAFETY: `strm` still holds the state `init_gzip` installed and has not been ended, so
+        // `deflateEnd` releases each block exactly once through the same `zfree` it was allocated
+        // with.
         assert_eq!(unsafe { deflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
         zone.assert_clean("a refused copy");
     }
@@ -4504,6 +4704,9 @@ mod tests_backend {
         let zone = Zone::new();
         let mut strm = blank_stream();
         track(&mut strm, &zone);
+        // SAFETY: `strm` is this test's own blank stream: its `state` is still null, so nothing is
+        // leaked by initialising it, and `init_gzip` takes it by `&mut` so the pointer is non-null,
+        // aligned and valid for the whole structure.
         assert_eq!(unsafe { init_gzip(&mut strm) }, ReturnCode::OK.as_i32());
 
         // Allow the copy's state object (request six), refuse its window (seven).
@@ -4511,6 +4714,9 @@ mod tests_backend {
 
         let mut dest = blank_stream();
         assert_eq!(
+            // SAFETY: `dest` is a blank stream whose `state` is null and `strm` holds the live
+            // state to copy; both arrive as `&mut`, so both pointers are non-null, aligned and
+            // valid for a whole `z_stream`, and neither local moves afterwards.
             unsafe { deflateCopy(&mut dest, &mut strm) },
             ReturnCode::MEM_ERROR.as_i32()
         );
@@ -4529,6 +4735,9 @@ mod tests_backend {
             "and it is the block the copy had taken"
         );
 
+        // SAFETY: `strm` still holds the state `init_gzip` installed and has not been ended, so
+        // `deflateEnd` releases each block exactly once through the same `zfree` it was allocated
+        // with.
         assert_eq!(unsafe { deflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
         zone.assert_clean("a copy whose buffers are refused");
     }
@@ -4540,10 +4749,16 @@ mod tests_backend {
         let zone = Zone::new();
         let mut strm = blank_stream();
         track(&mut strm, &zone);
+        // SAFETY: `strm` is this test's own blank stream: its `state` is still null, so nothing is
+        // leaked by initialising it, and `init_gzip` takes it by `&mut` so the pointer is non-null,
+        // aligned and valid for the whole structure.
         assert_eq!(unsafe { init_gzip(&mut strm) }, ReturnCode::OK.as_i32());
 
         let mut dest = blank_stream();
         assert_eq!(
+            // SAFETY: `dest` is a blank stream whose `state` is null and `strm` holds the live
+            // state to copy; both arrive as `&mut`, so both pointers are non-null, aligned and
+            // valid for a whole `z_stream`, and neither local moves afterwards.
             unsafe { deflateCopy(&mut dest, &mut strm) },
             ReturnCode::OK.as_i32()
         );
@@ -4561,7 +4776,13 @@ mod tests_backend {
             "the copy has a state of its own"
         );
 
+        // SAFETY: `dest` holds the state `deflateCopy` installed and has not been ended, so
+        // `deflateEnd` releases each of its blocks exactly once through the same `zfree` they came
+        // from.
         assert_eq!(unsafe { deflateEnd(&mut dest) }, ReturnCode::OK.as_i32());
+        // SAFETY: `strm` still holds the state `init_gzip` installed and has not been ended, so
+        // `deflateEnd` releases each block exactly once through the same `zfree` it was allocated
+        // with.
         assert_eq!(unsafe { deflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
         zone.assert_clean("a successful copy");
     }
@@ -4573,10 +4794,16 @@ mod tests_backend {
         let zone = Zone::new();
         let mut strm = blank_stream();
         track(&mut strm, &zone);
+        // SAFETY: `strm` is this test's own blank stream: its `state` is still null, so nothing is
+        // leaked by initialising it, and `init_gzip` takes it by `&mut` so the pointer is non-null,
+        // aligned and valid for the whole structure.
         assert_eq!(unsafe { init_gzip(&mut strm) }, ReturnCode::OK.as_i32());
 
         let mut dest = blank_stream();
         assert_eq!(
+            // SAFETY: `dest` is a blank stream whose `state` is null and `strm` holds the live
+            // state to copy; both arrive as `&mut`, so both pointers are non-null, aligned and
+            // valid for a whole `z_stream`, and neither local moves afterwards.
             unsafe { deflateCopy(&mut dest, &mut strm) },
             ReturnCode::OK.as_i32()
         );
@@ -4588,6 +4815,9 @@ mod tests_backend {
         dest.next_out = out.as_mut_ptr();
         dest.avail_out = uInt::try_from(out.len()).expect("fits");
         assert_eq!(
+            // SAFETY: `dest` holds a live state, and `next_in`/`avail_in` and
+            // `next_out`/`avail_out` were set from the same slices whose lengths they carry, so
+            // both extents are exact.
             unsafe { deflate(&mut dest, Z_NO_FLUSH) },
             ReturnCode::OK.as_i32()
         );
@@ -4597,9 +4827,16 @@ mod tests_backend {
         // `zlib.h` L373-L377 documents. Everything is still released either way, which
         // is what this test is checking.
         assert_eq!(
+            // SAFETY: `dest` holds the state `deflateCopy` installed and has not been ended, so
+            // `deflateEnd` releases each of its blocks exactly once through the same `zfree` they
+            // came from. `Z_DATA_ERROR` here reports an unfinished stream, not a failure to
+            // release.
             unsafe { deflateEnd(&mut dest) },
             ReturnCode::DATA_ERROR.as_i32()
         );
+        // SAFETY: `strm` still holds the state `init_gzip` installed and has not been ended, so
+        // `deflateEnd` releases each block exactly once through the same `zfree` it was allocated
+        // with.
         assert_eq!(unsafe { deflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
         let (requested, released) =
             zone.with(|zone| (zone.requested.clone(), zone.released.clone()));
@@ -4635,6 +4872,9 @@ mod tests_backend {
         let zone = Zone::new();
         let mut strm = blank_stream();
         track(&mut strm, &zone);
+        // SAFETY: `strm` is this test's own blank stream: its `state` is still null, so nothing is
+        // leaked by initialising it, and `init_gzip` takes it by `&mut` so the pointer is non-null,
+        // aligned and valid for the whole structure.
         assert_eq!(unsafe { init_gzip(&mut strm) }, ReturnCode::OK.as_i32());
 
         let after_init = zone.with(|zone| zone.requested.len());
@@ -4651,6 +4891,8 @@ mod tests_backend {
         strm.next_out = shared.as_mut_ptr();
         strm.avail_out = uInt::try_from(shared.len()).unwrap();
 
+        // SAFETY: `strm` holds a live state, and `next_in`/`avail_in` and `next_out`/`avail_out`
+        // were set from the same slices whose lengths they carry, so both extents are exact.
         let status = unsafe { deflate(&mut strm, Z_FINISH) };
         assert_eq!(
             status,
@@ -4703,6 +4945,9 @@ mod tests_backend {
         });
 
         assert_eq!(
+            // SAFETY: `strm` still holds the state `init_gzip` installed and has not been ended, so
+            // `deflateEnd` releases each block exactly once through the same `zfree` it was
+            // allocated with.
             unsafe { deflateEnd(&mut strm) },
             ReturnCode::OK.as_i32(),
             "the snapshot left nothing for deflateEnd to find"
@@ -4723,6 +4968,9 @@ mod tests_backend {
         let zone = Zone::new();
         let mut strm = blank_stream();
         track(&mut strm, &zone);
+        // SAFETY: `strm` is this test's own blank stream: its `state` is still null, so nothing is
+        // leaked by initialising it, and `init_gzip` takes it by `&mut` so the pointer is non-null,
+        // aligned and valid for the whole structure.
         assert_eq!(unsafe { init_gzip(&mut strm) }, ReturnCode::OK.as_i32());
 
         let after_init = zone.with(|zone| zone.requested.len());
@@ -4736,6 +4984,8 @@ mod tests_backend {
         strm.next_out = shared.as_mut_ptr();
         strm.avail_out = uInt::try_from(shared.len()).unwrap();
 
+        // SAFETY: `strm` holds a live state, and `next_in`/`avail_in` and `next_out`/`avail_out`
+        // were set from the same slices whose lengths they carry, so both extents are exact.
         let status = unsafe { deflate(&mut strm, Z_FINISH) };
         assert_eq!(
             status,
@@ -4757,6 +5007,8 @@ mod tests_backend {
         // The stream is still usable, which is what `Z_STREAM_ERROR` for an argument
         // fault means: the same call with room the zone will serve still completes.
         zone.deny_from(0);
+        // SAFETY: `strm` holds a live state, and `next_in`/`avail_in` and `next_out`/`avail_out`
+        // were set from the same slices whose lengths they carry, so both extents are exact.
         let status = unsafe { deflate(&mut strm, Z_FINISH) };
         assert_eq!(
             status,
@@ -4764,6 +5016,9 @@ mod tests_backend {
             "the refusal cost the stream nothing"
         );
 
+        // SAFETY: `strm` still holds the state `init_gzip` installed and has not been ended, so
+        // `deflateEnd` releases each block exactly once through the same `zfree` it was allocated
+        // with.
         assert_eq!(unsafe { deflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
         zone.assert_clean("a refused overlap snapshot");
     }

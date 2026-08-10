@@ -75,7 +75,7 @@
 //!
 //! The two constants keep their C names, lowercase and unchanged, so that the
 //! element-for-element comparison in
-//! the planned `crates/zlib-rs-differential/tests/table_equality.rs` will read as a
+//! `crates/zlib-rs-differential/tests/table_equality.rs` reads as a
 //! direct diff against the header. That is the sole reason each carries a narrowly scoped
 //! `#[allow(non_upper_case_globals)]`.
 //!

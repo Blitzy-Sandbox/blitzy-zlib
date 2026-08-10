@@ -87,7 +87,7 @@
 //!
 //! Every table keeps its C name, lowercase and unchanged, so that the
 //! element-for-element comparison in
-//! the planned `crates/zlib-rs-differential/tests/table_equality.rs` will read as a
+//! `crates/zlib-rs-differential/tests/table_equality.rs` reads as a
 //! direct diff against the header. That, and only that, is why each carries a narrowly
 //! scoped `#[allow(non_upper_case_globals)]`.
 //!
@@ -724,8 +724,15 @@ pub const base_dist: [i32; D_CODES] = [
 /// [`extra_blbits`] because `static_tree_desc_s` reaches all three through a
 /// single `const intf *extra_bits` member (`trees.c` L119).
 // The identifier is deliberately the C name `extra_lbits` from `trees.c` L62.
+//
+// `pub` rather than `pub(crate)`, for the same reason the six `trees.h` tables above are:
+// `crates/zlib-rs-differential/tests/table_equality.rs` compares it element for element against
+// the C array. Reaching the C side needs a generated wrapper around `trees.c` itself, because
+// `local const int extra_lbits[]` is `static` and appears in no header -- see that crate's
+// `build.rs`. The functions that READ it stay crate-private, which is the same asymmetry
+// `zlib.map` describes for the `_tr_*` family.
 #[allow(non_upper_case_globals)]
-pub(crate) const extra_lbits: [i32; LENGTH_CODES] = [
+pub const extra_lbits: [i32; LENGTH_CODES] = [
     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 ];
 
@@ -743,8 +750,11 @@ pub(crate) const extra_lbits: [i32; LENGTH_CODES] = [
 ///
 /// Element type `i32`; see `extra_lbits`.
 // The identifier is deliberately the C name `extra_dbits` from `trees.c` L65.
+//
+// `pub` for the reason given at [`extra_lbits`]: the differential table-equality suite compares
+// it against `trees.c` L65-L66 through the generated `trees.c` wrapper.
 #[allow(non_upper_case_globals)]
-pub(crate) const extra_dbits: [i32; D_CODES] = [
+pub const extra_dbits: [i32; D_CODES] = [
     0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
     13,
 ];
@@ -755,15 +765,22 @@ pub(crate) const extra_dbits: [i32; D_CODES] = [
 /// Mirrors `local const int extra_blbits[BL_CODES]`, described there as "extra
 /// bits for each bit length code". The `extra_bits` member of `static_bl_desc`
 /// (`trees.c` L138). Only the last three entries are non-zero, and they are the
-/// repeat counts of RFC 1951 3.2.7: 2 bits for [`REP_3_6`], 3 for
-/// [`REPZ_3_10`], 7 for [`REPZ_11_138`]. Codes 0 through 15 encode a literal
-/// code width and carry nothing.
+/// repeat counts of RFC 1951 3.2.7: 2 bits for `REP_3_6`, 3 for `REPZ_3_10`,
+/// 7 for `REPZ_11_138`. Codes 0 through 15 encode a literal code width and carry
+/// nothing.
+///
+/// Those three names are the crate-private constants declared above -- rendered
+/// here as code rather than as links, because this item is `pub` for the
+/// differential table-equality suite while they are not, and a public doc
+/// comment must not point a reader at a name they cannot reach.
 ///
 /// Element type `i32`; see `extra_lbits`.
 // The identifier is deliberately the C name `extra_blbits` from `trees.c` L68.
+//
+// `pub` for the reason given at [`extra_lbits`]: the differential table-equality suite compares
+// it against `trees.c` L68-L69 through the generated `trees.c` wrapper.
 #[allow(non_upper_case_globals)]
-pub(crate) const extra_blbits: [i32; BL_CODES] =
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 7];
+pub const extra_blbits: [i32; BL_CODES] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 7];
 
 /// Transmission order of the bit-length codes: `bl_order[BL_CODES]`,
 /// transcribed from `trees.c` L71-L72.
@@ -785,8 +802,11 @@ pub(crate) const extra_blbits: [i32; BL_CODES] =
 /// Element type `u8`, from C's `uch`; every use indexes
 /// `DeflateState::bl_tree` with it, exactly as `trees.c` L819 and L847 do.
 // The identifier is deliberately the C name `bl_order` from `trees.c` L71.
+//
+// `pub` for the reason given at [`extra_lbits`]: the differential table-equality suite compares
+// it against `trees.c` L71-L72 through the generated `trees.c` wrapper.
 #[allow(non_upper_case_globals)]
-pub(crate) const bl_order: [u8; BL_CODES] = [
+pub const bl_order: [u8; BL_CODES] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
 

@@ -1,3 +1,11 @@
+// UNSAFE CONTAINMENT, and it is mechanical rather than a convention.  `crates/zlib-rs` is the
+// safe core: `src/lib.rs` carries `#![forbid(unsafe_code)]`, and its test suites carry it too, so
+// the property "the core and everything that exercises it contains no `unsafe`" is enforced by the
+// compiler in both halves.  The workspace's designated FFI boundary -- the only place a raw pointer
+// crosses into a foreign implementation -- is `crates/libz-rs-sys/src/**` for the shipped library
+// and `crates/zlib-rs-differential/src/{oracle,port}.rs` for the dev-only harness; an assertion
+// that needs one of those belongs in a suite of that package, not here.
+#![forbid(unsafe_code)]
 // THE FEATURE GATE. `crates/zlib-rs` has no `gz` feature: its manifest declares exactly `default`,
 // `rust-api`, `simd` and `std`, and `src/lib.rs` L450-L451 declares `pub mod gz` under
 // `#[cfg(feature = "std")]` because only the file-I/O half of the layer needs `std`. So this whole

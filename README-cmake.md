@@ -20,13 +20,21 @@ Every option is list below (excluding the cmake-standard options), they can be s
     ZLIB_BUILD_RUST=OFF -- Use the memory-safe Rust libz for the exported ZLIB::* targets
 
 With this option on, the exported ZLIB::ZLIB and ZLIB::ZLIBSTATIC targets are built by cargo from the
-Rust workspace at the top of this tree (crates/libz-rs-sys) instead of from the C sources. The libz.so
-and libz.a it stages present the same ABI as the C library, the shared one carrying the same SONAME
-libz.so.1 and the same 111 exported symbols at the same versions, so programs already linked against
-zlib keep working without being recompiled. cargo has to be reachable on PATH and configuration stops
+Rust workspace at the top of this tree (crates/libz-rs-sys) instead of from the C sources. The shared
+libz.so it stages presents the same ABI as the C one -- the same SONAME libz.so.1 and the same 111
+exported symbols at the same versions -- so a program that dynamically links zlib keeps working without
+being recompiled. That is verified on x86_64-unknown-linux-gnu. Static consumption is not yet
+equivalent: a Rust libz.a needs the Rust runtime's own companion libraries, the set is target-specific,
+and the installed zlib.pc advertises none of it, so read the note in zlib.pc.cmakein before pointing a
+static consumer at it through pkg-config. cargo has to be reachable on PATH and configuration stops
 with a message telling you so when it is not, or -DZLIB_CARGO_EXECUTABLE=/path/to/cargo names a
-particular one. Building the workspace needs Rust 1.80 or newer, which cargo enforces itself from
-rust-toolchain.toml and the crate manifests. The C targets zlib and zlibstatic are still defined and
+particular one. This path needs Rust 1.80 or newer, which cargo enforces itself from
+rust-toolchain.toml and the crate manifests: the build runs
+`cargo build --package libz-rs-sys`, so it compiles only the two crates that ship and only their
+1.80 floor applies. The workspace's third member, the dev-only `crates/zlib-rs-differential`
+harness that hosts the C oracle and the benchmarks, declares 1.86 because criterion does -- but no
+CMake target builds it, so that floor never reaches a production build. It applies to
+`cargo test --workspace` and `cargo bench`, which are developer commands. The C targets zlib and zlibstatic are still defined and
 still built, as they are the reference the Rust code is diffed against, so this option adds a library
 rather than taking one away. It is off by default, and while it is off no Rust tool is probed and
 everything here behaves exactly as it always has. The Rust library is supported on Rust's tier 1
@@ -38,8 +46,20 @@ topology the C build does: the real file libz.so.1.3.2.1-motley, named from ZLIB
 libz.so.1, libz.so and the versioned name the C library itself publishes all pointing at it, and the
 static libz.a beside them. Those links are a correctness requirement rather than packaging polish, as
 libz.so.1 is the SONAME the loader searches for and a directory holding libz.so alone leaves it free to
-go on searching and bind the system libz instead, silently. README and rust/README.md cover the Rust
-build in full.
+go on searching and bind the system libz instead, silently.
+
+One thing the Rust build has to advertise that the C build does not: a Rust static library carries the
+Rust standard library's own references, and a static archive cannot record a dependency the way a shared
+object records DT_NEEDED. So with this option on, configuration derives the target's native runtime
+libraries with `rustc --crate-type staticlib --print native-static-libs` and publishes them twice, once
+as `Libs.private:` in the generated zlib.pc and once as the installed ZLIB::ZLIBSTATIC target's interface
+libraries, so that a consumer linking libz.a is told what it needs without having to know it exists. The
+set is target-specific and is never hardcoded; if rustc cannot be reached, configuration warns and
+advertises nothing rather than guessing. Shared consumers are unaffected either way. `ctest -R
+static_link_closure` is the case that holds this to account, and it links with -nodefaultlibs on purpose
+-- a plain link succeeds on a modern glibc whether the advertisement is there or not.
+
+README and rust/README.md cover the Rust build in full.
 
     ZLIB_BUILD_MINIZIP=ON -- Enable building libminizip contrib library
 
@@ -105,8 +125,13 @@ When found the following targets are created for you:
 Those two zlib names are the whole consumption interface and they do not change with the implementation
 behind them: with ZLIB_BUILD_RUST=ON they resolve to the cargo-built libraries, with it off to the C
 ones. The find_package call above is written the same way either way, shared and static stay the only
-components, and there is deliberately no rust component to ask for, because which implementation was
-built is settled when zlib itself is configured and is not something a consumer selects or can see.
-That is also why the cases in test/ need no Rust-specific variants: example.c, minigzip.c and infcover.c
-link ZLIB::ZLIB or ZLIB::ZLIBSTATIC and are compiled from exactly the same unmodified sources whichever
-library is behind the name.
+components, and there is no rust component to ask for, because which implementation was built is settled
+when zlib itself is configured and is not something a consumer selects or can see.
+
+The CTest cases in test/ work the same way: example.c, minigzip.c and infcover.c link ZLIB::ZLIB or
+ZLIB::ZLIBSTATIC and are compiled from exactly the same unmodified sources whichever library is behind
+the name. Read that for what it is, though. A configured tree tests ONE implementation -- the one the
+option selected -- and no `_rust`-suffixed case is registered beside its C counterpart, so a single tree
+never runs the two side by side. Comparing them means configuring twice into two build directories, or
+using crates/zlib-rs-differential, which holds both implementations in one process and compares their
+output byte for byte. test/CMakeLists.txt states this at its own head.

@@ -1,3 +1,11 @@
+// UNSAFE CONTAINMENT, and it is mechanical rather than a convention.  `crates/zlib-rs` is the
+// safe core: `src/lib.rs` carries `#![forbid(unsafe_code)]`, and its test suites carry it too, so
+// the property "the core and everything that exercises it contains no `unsafe`" is enforced by the
+// compiler in both halves.  The workspace's designated FFI boundary -- the only place a raw pointer
+// crosses into a foreign implementation -- is `crates/libz-rs-sys/src/**` for the shipped library
+// and `crates/zlib-rs-differential/src/{oracle,port}.rs` for the dev-only harness; an assertion
+// that needs one of those belongs in a suite of that package, not here.
+#![forbid(unsafe_code)]
 //! Integration tests for the DEFLATE compressor.
 //!
 //! This suite drives `zlib_rs::deflate` from **outside** the crate, through exactly the surface
@@ -33,11 +41,10 @@
 //! # Scope boundary: this is *self*-consistency, not cross-implementation identity
 //!
 //! **Byte-identity against the compiled C library is deliberately not this file's job.** The
-//! full level x `windowBits` x `memLevel` x strategy x flush x corpus matrix belongs to a
-//! differential suite under `crates/zlib-rs-differential`, the only crate that can link the C
-//! oracle and compare the two implementations directly. **No such suite exists in the tree, so
-//! cross-implementation byte-identity is currently unverified by anything** -- and reproducing
-//! even part of that matrix here would be duplication that drifts, and would make Miri unusable.
+//! full level x `windowBits` x `memLevel` x strategy x flush x corpus matrix belongs to
+//! `crates/zlib-rs-differential/tests/byte_identical.rs`, in the only crate that can link the C
+//! oracle and compare the two implementations directly. Reproducing even part of that matrix
+//! here would be duplication that drifts, and would make Miri unusable.
 //!
 //! What this file pins instead:
 //!
@@ -80,8 +87,10 @@
 //!   `pub(crate)`, mirroring `zlib.map`'s `local:` block. Direct coverage lives in the
 //!   `#[cfg(test)] mod tests` blocks of the modules that define them. **Widening a visibility to
 //!   make one of them testable from here is prohibited** -- the hidden-symbol set is a shipped
-//!   contract stated by `zlib.map`, and `Makefile.in`'s `rust-symbols` target is what compares the
-//!   built library against the 111-symbol baseline. No `cargo test` checks it.
+//!   contract stated by `zlib.map`. What compares the built library against the 111-symbol
+//!   baseline is `Makefile.in`'s `rust-symbols` target, the `symbols` job of
+//!   `.github/workflows/rust.yml`, and `crates/libz-rs-sys/tests/symbol_parity.rs` under
+//!   `cargo test`.
 //! * `TOO_FAR` is a private constant in `src/deflate/algorithm/slow.rs`. Its value is pinned
 //!   behaviourally instead, at the exact 4096-byte boundary, which is a stronger check than
 //!   reading the constant back.
@@ -1064,11 +1073,10 @@ fn fixed_strategy_never_emits_a_dynamic_tree() {
 // heuristics fails the argument even if the bytes happened to survive.
 //
 // TO BE PLAIN ABOUT THE DIVISION OF LABOUR, so that this suite is not read as more than it is:
-// **cross-implementation byte-identity against the compiled C library belongs to a differential
-// suite under `crates/zlib-rs-differential`**, the only crate that links the oracle and can
-// therefore compare the two implementations directly, across the full
-// level x windowBits x memLevel x strategy x flush x corpus matrix. **No such suite is in the
-// tree, so that comparison has not been made.** This section pins *self*
+// **cross-implementation byte-identity against the compiled C library belongs to
+// `crates/zlib-rs-differential/tests/byte_identical.rs`**, in the only crate that links the
+// oracle and can therefore compare the two implementations directly, across the full
+// level x windowBits x memLevel x strategy x flush x corpus matrix. This section pins *self*
 // consistency -- the same input giving the same bytes, and the bytes not depending on how the
 // caller chunked its buffers -- plus the specific heuristic behaviours above. Neither would
 // substitute for the other: a differential matrix would not notice that `TOO_FAR` is a

@@ -473,11 +473,20 @@ fn the_abi_mirror_types_are_nameable_through_the_crate_root() {
     // The four `#[repr(C)]` mirrors. The exhaustive size-and-offset matrix belongs to the
     // layout suite; what is asserted here is that an external crate can *name* each one, which
     // it must be able to do before it can declare a `z_stream` to pass to `deflate`.
-    assert_eq!(size_of::<z::z_stream>(), 112);
-    assert_eq!(align_of::<z::z_stream>(), 8);
-    assert_eq!(size_of::<z::gz_header>(), 80);
-    assert_eq!(size_of::<z::gzFile_s>(), 24);
+    //
+    // `code` is `{ unsigned char; unsigned char; unsigned short }` and is 4 bytes on every
+    // target, so it is pinned unconditionally. The other three contain `unsigned long` or a
+    // pointer and are therefore pinned only on the LP64 model they were measured on: 112/8,
+    // 80 and 24 hold there, 88/8, 72 and 24 on LLP64 Windows, and 56/4, 52 and 16 on an ILP32
+    // target. Pinning the LP64 numbers unconditionally is exactly the mistake AAP 0.6.3.3
+    // warns about, and `tests/abi_layout.rs` is where all three models are pinned exactly.
     assert_eq!(size_of::<z::code>(), 4);
+    if size_of::<*mut c_void>() == 8 && size_of::<core::ffi::c_ulong>() == 8 {
+        assert_eq!(size_of::<z::z_stream>(), 112);
+        assert_eq!(align_of::<z::z_stream>(), 8);
+        assert_eq!(size_of::<z::gz_header>(), 80);
+        assert_eq!(size_of::<z::gzFile_s>(), 24);
+    }
 
     // The pointer aliases, each asserted against the type it points at rather than against a
     // number, because that is the relationship `zlib.h` fixes.

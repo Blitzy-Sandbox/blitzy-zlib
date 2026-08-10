@@ -111,8 +111,8 @@ pub(crate) mod window;
 // no second flush type in this module.
 pub use crate::deflate::algorithm::Flush;
 // `CONFIGURATION_TABLE` must keep exactly this identifier: `crate::lib` re-exports that
-// name, and a differential table-equality test would compare it element-for-element
-// against the C array. No such test is in the tree, so nothing checks it today.
+// name, and `crates/zlib-rs-differential/tests/table_equality.rs` compares it
+// element-for-element against the C array under that name.
 pub use crate::deflate::config_table::{Config, CONFIGURATION_TABLE};
 pub use crate::deflate::state::{DeflateState, Status};
 
@@ -2174,7 +2174,7 @@ mod tests {
     //! RFC 1952 gzip header, the flush-rank gate, the entry guards, the `deflateBound`
     //! arithmetic and the `deflateEnd` contract -- plus round trips through
     //! `crate::inflate`. They are deliberately *not* a substitute for
-    //! the planned `crates/zlib-rs-differential/tests/byte_identical.rs`: only a comparison against the
+    //! `crates/zlib-rs-differential/tests/byte_identical.rs`: only a comparison against the
     //! C oracle proves byte identity, and a round trip that merely decompresses proves
     //! nothing about it. What these do prove is that the specific constants and orderings
     //! this file is responsible for are the ones `deflate.c` computes.

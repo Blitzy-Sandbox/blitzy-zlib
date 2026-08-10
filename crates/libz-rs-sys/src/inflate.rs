@@ -1416,8 +1416,7 @@ pub unsafe extern "C" fn inflateInit_(
 /// exactly as `Z_NO_FLUSH` behaves, because C's `inflate` validates `flush` nowhere: the
 /// value is only ever compared against `Z_FINISH`, `Z_BLOCK` and `Z_TREES`. The ★ note
 /// beside the pass-through in the body below carries the full argument, including why
-/// rejecting one -- as an earlier revision of this function did -- is stricter than the
-/// reference and wrong.
+/// rejecting one would be stricter than the reference and therefore wrong.
 ///
 /// # The entry guard
 ///
@@ -1484,11 +1483,11 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
         // against `Z_FINISH`, `Z_BLOCK` and `Z_TREES` (`inflate.c` L622, L676, L1103
         // and L1147), so any other integer behaves as `Z_NO_FLUSH` behaves -- and the
         // core compares the same three values against the same `i32`, so it reaches
-        // the same answer for every input. Rejecting an out-of-range value here, as an
-        // earlier revision did, made this function stricter than the reference for a
-        // caller C serves happily: a wrapper that forwards a flush it computed, or an
-        // old binary built against a header with different spellings, would be told
-        // `Z_STREAM_ERROR` where C would decompress.
+        // the same answer for every input. Rejecting an out-of-range value here would
+        // make this function stricter than the reference for a caller C serves happily:
+        // a wrapper that forwards a flush it computed, or an old binary built against a
+        // header with different spellings, would be told `Z_STREAM_ERROR` where C would
+        // decompress.
         session.run(|session| {
             let strm = session.strm;
             // L494-L496: the two pointer halves of the entry guard.
@@ -3166,7 +3165,7 @@ mod tests {
     use core::mem::{offset_of, size_of, MaybeUninit};
 
     use crate::types::{
-        gz_header, gz_headerp, uInt, Bytef, StatePrefix, CODES, DISTS, ENOUGH, LENS,
+        gz_header, gz_headerp, uInt, z_streamp, Bytef, StatePrefix, CODES, DISTS, ENOUGH, LENS,
     };
     use crate::util::ZLIB_VERSION;
     use zlib_rs::error::ReturnCode;
@@ -3894,8 +3893,20 @@ mod tests {
         // `StatePrefix` mirrors, so the harness's `((struct inflate_state *)
         // strm.state)->mode` is a write to `StatePrefix::tag`. Pin the two numbers
         // the C header fixes before relying on them.
-        assert_eq!(size_of::<StatePrefix>(), 16);
-        assert_eq!(offset_of!(StatePrefix, tag), 8);
+        // Relational first, because that is the form that holds on every target: the tag
+        // follows the back-pointer with no padding, and the prefix is that pointer plus two
+        // `int`s. The measured 64-bit numbers are then pinned under the width guard that
+        // makes them true -- 16 and 8 where a pointer is eight bytes wide, 12 and 4 on an
+        // ILP32 target, which is what `types.rs`'s own const assertions already say.
+        assert_eq!(
+            size_of::<StatePrefix>(),
+            size_of::<z_streamp>() + 2 * size_of::<c_int>()
+        );
+        assert_eq!(offset_of!(StatePrefix, tag), size_of::<z_streamp>());
+        if size_of::<z_streamp>() == 8 {
+            assert_eq!(size_of::<StatePrefix>(), 16);
+            assert_eq!(offset_of!(StatePrefix, tag), 8);
+        }
         assert_eq!(size_of::<c_int>(), 4);
         let tag = mode_slot(&strm);
         // SAFETY: as above.
@@ -4641,9 +4652,9 @@ mod tests {
     /// under `if (state->wrap)` (`inflate.c` L108-L109) and the epilogue under
     /// `if ((state->wrap & 4) && out)` (L1144-L1146); `windowBits = -15` satisfies
     /// neither, so the reference leaves the member exactly as the caller left it --
-    /// which for a caller that never set it means *indeterminate*. An earlier revision
-    /// loaded it into the core's view on every call, and Miri reported the read as
-    /// undefined behaviour on precisely this path.
+    /// which for a caller that never set it means *indeterminate*. Loading it into the
+    /// core's view on every call would therefore read an uninitialised member, which Miri
+    /// reports as undefined behaviour on precisely this path.
     ///
     /// The sentinel is what makes both halves observable at once: it survives only if
     /// the value is passed over untouched, and a spurious write would replace it with
@@ -4743,9 +4754,9 @@ mod tests {
     /// both have succeeded does it write anything to the destination: the `zmemcpy` of
     /// the stream is at L1352 and `dest->state` is assigned last, at L1365. So a caller
     /// whose copy fails for want of memory finds its structure exactly as it left it.
-    /// An earlier revision installed a placeholder state first and cleared it again on
-    /// failure, which is observable -- `dest->state` changed value and changed back --
-    /// and needlessly so.
+    /// Installing a placeholder state first and clearing it again on failure would be
+    /// observable -- `dest->state` would change value and change back -- and needlessly
+    /// so, which is why the destination is written only once everything has succeeded.
     #[test]
     fn a_refused_copy_leaves_the_destination_untouched() {
         for deny_from in [1_usize, 2] {
@@ -4839,10 +4850,9 @@ mod tests {
     /// `inflate.c` L1176-L1183 copies `state->whave` bytes and then assigns
     /// `*dictLength = state->whave`; the member is an output. `zlib.h` L936-L942 puts
     /// the capacity promise on the caller -- "32768 bytes is always enough" -- so there
-    /// is nothing to clamp against. An earlier revision read the member as a capacity,
-    /// which truncated the copy whenever it held a small value: below it holds zero, the
-    /// value a caller most naturally passes, and a clamp to zero would copy nothing at
-    /// all.
+    /// is nothing to clamp against. Reading the member as a capacity would truncate the
+    /// copy whenever it held a small value: below it holds zero, the value a caller most
+    /// naturally passes, and a clamp to zero would copy nothing at all.
     #[test]
     fn get_dictionary_writes_the_length_and_never_reads_it() {
         let payload: Vec<u8> = (0..600_u32).map(|index| (index % 251) as u8).collect();
@@ -4870,8 +4880,8 @@ mod tests {
         }
         assert_eq!(produced, payload);
 
-        // ★ Zero, as a caller that expects an output would leave it -- and the value an
-        // earlier revision clamped the copy to, copying nothing at all.
+        // ★ Zero, as a caller that expects an output would leave it -- and the value a
+        // capacity misreading would clamp the copy to, copying nothing at all.
         let mut length: uInt = 0;
         // 0xa5 rather than zero, so that "not written" is distinguishable from "written
         // as zero" -- the payload contains zero bytes.
@@ -4962,8 +4972,8 @@ mod tests {
     /// `head->comment` and `head->comm_max` inside the `EXTRA`, `NAME` and `COMMENT`
     /// states -- `inflate.c` L608-L620, L625-L634, L640-L649 -- so the values that
     /// matter are the ones present when the bytes arrive, not when the header was
-    /// installed. An earlier revision read them once, in `inflateGetHeader`, and so
-    /// ignored anything a caller did afterwards.
+    /// installed. Reading them once, in `inflateGetHeader`, would ignore anything a caller
+    /// did afterwards.
     #[test]
     fn a_header_buffer_supplied_after_get_header_is_still_filled() {
         // FLG = 0x1c: FEXTRA | FNAME | FCOMMENT.
@@ -5090,9 +5100,9 @@ mod tests {
     /// it wrote before it stopped.
     ///
     /// ★ C builds straight into the caller's table, so the `return 1` at `inftrees.c`
-    /// L287 leaves the entries written so far behind -- an earlier revision of this
-    /// wrapper built into scratch space and copied out nothing at all on failure,
-    /// discarding them. The expected values below are **measured** from the reference
+    /// L287 leaves the entries written so far behind, so this wrapper must build straight
+    /// into the caller's table too: building into scratch space and copying out nothing on
+    /// failure would discard them. The expected values below are taken from the reference
     /// implementation, by filling the table with a sentinel, calling C's
     /// `inflate_table` with these exact arguments, and recording which entries changed:
     ///
@@ -5184,7 +5194,19 @@ mod tests {
         }
     }
 
+    // GATED ON THE SHIM ACTUALLY BEING BUILT, which is not the same condition as
+    // `libz-compat`.  `build.rs` compiles `csrc/inftrees_shim.c` and
+    // `csrc/gzprintf_shim.c` only when BOTH `libz-compat` and `gz` are on -- the
+    // gzprintf half reaches `_zlib_rs_gzprintf_begin`/`_commit`, which live behind
+    // `gz`, so archiving the pair against a build without it would archive undefined
+    // symbols -- and it emits `cfg(zlib_rs_gzprintf)` when it has done so.  Naming
+    // `inflate_table` unconditionally therefore made the `--no-default-features
+    // --features libz-compat` configuration fail to LINK its test binary, with
+    // `rust-lld: error: undefined symbol: inflate_table`, which nothing built until
+    // the feature matrix job did.  The cfg is the honest gate: it says "the shim
+    // archive is in this link", which is exactly what this test needs.
     #[test]
+    #[cfg(zlib_rs_gzprintf)]
     fn the_c_prototype_shim_is_linked_and_agrees_with_the_rust_half() {
         // ★ F4's proof, and it is a LINK first: `csrc/inftrees_shim.c` defines
         // `inflate_table` with `inftrees.h`'s own `codetype` prototype, which is the
@@ -6192,7 +6214,7 @@ mod tests_backend {
     use core::ffi::{c_char, c_int, c_uint, c_ulong, c_ushort, CStr};
     use core::mem::{align_of, offset_of, size_of, MaybeUninit};
 
-    use crate::types::{gz_header, uInt, StatePrefix, CODES, DISTS, ENOUGH, LENS};
+    use crate::types::{gz_header, uInt, z_streamp, StatePrefix, CODES, DISTS, ENOUGH, LENS};
     use crate::util::ZLIB_VERSION;
     use zlib_rs::error::ReturnCode;
     use zlib_rs::inflate::{Mode, INFLATE_CODES_USED_BAD_STATE};
@@ -6823,10 +6845,9 @@ mod tests_backend {
     ///
     /// ★ C's `inflate` validates `flush` nowhere. The value is compared against
     /// `Z_FINISH`, `Z_BLOCK` and `Z_TREES` and otherwise ignored, so `-1`, `7` and
-    /// `INT_MAX` all behave exactly as `Z_NO_FLUSH` behaves. An earlier revision of
-    /// this port refused anything outside `0..=6`, which made it stricter than the
-    /// reference for a caller C serves happily; this test is the record that the
-    /// strictness is gone and must not come back.
+    /// `INT_MAX` all behave exactly as `Z_NO_FLUSH` behaves. Refusing anything outside
+    /// `0..=6` would make this port stricter than the reference for a caller C serves
+    /// happily; this test is what keeps that strictness out.
     #[test]
     fn every_flush_value_is_accepted_and_a_null_output_is_not() {
         let mut strm = blank_stream();
@@ -6930,8 +6951,20 @@ mod tests_backend {
         // `StatePrefix` mirrors, so the harness's `((struct inflate_state *)
         // strm.state)->mode` is a write to `StatePrefix::tag`. Pin the two numbers
         // the C header fixes before relying on them.
-        assert_eq!(size_of::<StatePrefix>(), 16);
-        assert_eq!(offset_of!(StatePrefix, tag), 8);
+        // Relational first, because that is the form that holds on every target: the tag
+        // follows the back-pointer with no padding, and the prefix is that pointer plus two
+        // `int`s. The measured 64-bit numbers are then pinned under the width guard that
+        // makes them true -- 16 and 8 where a pointer is eight bytes wide, 12 and 4 on an
+        // ILP32 target, which is what `types.rs`'s own const assertions already say.
+        assert_eq!(
+            size_of::<StatePrefix>(),
+            size_of::<z_streamp>() + 2 * size_of::<c_int>()
+        );
+        assert_eq!(offset_of!(StatePrefix, tag), size_of::<z_streamp>());
+        if size_of::<z_streamp>() == 8 {
+            assert_eq!(size_of::<StatePrefix>(), 16);
+            assert_eq!(offset_of!(StatePrefix, tag), 8);
+        }
         assert_eq!(size_of::<c_int>(), 4);
         let tag = mode_slot(&strm);
         // SAFETY: `tag` is the pointer `mode_slot` derived from this stream's live
@@ -7820,9 +7853,9 @@ mod tests_backend {
     /// under `if (state->wrap)` (`inflate.c` L108-L109) and the epilogue under
     /// `if ((state->wrap & 4) && out)` (L1144-L1146); `windowBits = -15` satisfies
     /// neither, so the reference leaves the member exactly as the caller left it --
-    /// which for a caller that never set it means *indeterminate*. An earlier revision
-    /// loaded it into the core's view on every call, and Miri reported the read as
-    /// undefined behaviour on precisely this path.
+    /// which for a caller that never set it means *indeterminate*. Loading it into the
+    /// core's view on every call would therefore read an uninitialised member, which Miri
+    /// reports as undefined behaviour on precisely this path.
     ///
     /// The sentinel is what makes both halves observable at once: it survives only if
     /// the value is passed over untouched, and a spurious write would replace it with
@@ -7922,9 +7955,9 @@ mod tests_backend {
     /// both have succeeded does it write anything to the destination: the `zmemcpy` of
     /// the stream is at L1352 and `dest->state` is assigned last, at L1365. So a caller
     /// whose copy fails for want of memory finds its structure exactly as it left it.
-    /// An earlier revision installed a placeholder state first and cleared it again on
-    /// failure, which is observable -- `dest->state` changed value and changed back --
-    /// and needlessly so.
+    /// Installing a placeholder state first and clearing it again on failure would be
+    /// observable -- `dest->state` would change value and change back -- and needlessly
+    /// so, which is why the destination is written only once everything has succeeded.
     #[test]
     fn a_refused_copy_leaves_the_destination_untouched() {
         for deny_from in [1_usize, 2] {
@@ -8019,10 +8052,9 @@ mod tests_backend {
     /// `inflate.c` L1176-L1183 copies `state->whave` bytes and then assigns
     /// `*dictLength = state->whave`; the member is an output. `zlib.h` L936-L942 puts
     /// the capacity promise on the caller -- "32768 bytes is always enough" -- so there
-    /// is nothing to clamp against. An earlier revision read the member as a capacity,
-    /// which truncated the copy whenever it held a small value: below it holds zero, the
-    /// value a caller most naturally passes, and a clamp to zero would copy nothing at
-    /// all.
+    /// is nothing to clamp against. Reading the member as a capacity would truncate the
+    /// copy whenever it held a small value: below it holds zero, the value a caller most
+    /// naturally passes, and a clamp to zero would copy nothing at all.
     #[test]
     fn get_dictionary_writes_the_length_and_never_reads_it() {
         let payload: Vec<u8> = (0..600_u32).map(|index| (index % 251) as u8).collect();
@@ -8050,8 +8082,8 @@ mod tests_backend {
         }
         assert_eq!(produced, payload);
 
-        // ★ Zero, as a caller that expects an output would leave it -- and the value an
-        // earlier revision clamped the copy to, copying nothing at all.
+        // ★ Zero, as a caller that expects an output would leave it -- and the value a
+        // capacity misreading would clamp the copy to, copying nothing at all.
         let mut length: uInt = 0;
         // 0xa5 rather than zero, so that "not written" is distinguishable from "written
         // as zero" -- the payload contains zero bytes.
@@ -8142,8 +8174,8 @@ mod tests_backend {
     /// `head->comment` and `head->comm_max` inside the `EXTRA`, `NAME` and `COMMENT`
     /// states -- `inflate.c` L608-L620, L625-L634, L640-L649 -- so the values that
     /// matter are the ones present when the bytes arrive, not when the header was
-    /// installed. An earlier revision read them once, in `inflateGetHeader`, and so
-    /// ignored anything a caller did afterwards.
+    /// installed. Reading them once, in `inflateGetHeader`, would ignore anything a caller
+    /// did afterwards.
     #[test]
     fn a_header_buffer_supplied_after_get_header_is_still_filled() {
         // FLG = 0x1c: FEXTRA | FNAME | FCOMMENT.
@@ -8273,9 +8305,9 @@ mod tests_backend {
     /// it wrote before it stopped.
     ///
     /// ★ C builds straight into the caller's table, so the `return 1` at `inftrees.c`
-    /// L287 leaves the entries written so far behind -- an earlier revision of this
-    /// wrapper built into scratch space and copied out nothing at all on failure,
-    /// discarding them. The expected values below are **measured** from the reference
+    /// L287 leaves the entries written so far behind, so this wrapper must build straight
+    /// into the caller's table too: building into scratch space and copying out nothing on
+    /// failure would discard them. The expected values below are taken from the reference
     /// implementation, by filling the table with a sentinel, calling C's
     /// `inflate_table` with these exact arguments, and recording which entries changed:
     ///

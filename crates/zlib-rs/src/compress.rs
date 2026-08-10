@@ -683,7 +683,7 @@ pub const fn compress_bound(source_len: usize) -> usize {
 //
 // Byte-for-byte equality against the C encoder across the whole
 // level x windowBits x memLevel x strategy x flush matrix is
-// the planned `crates/zlib-rs-differential/tests/byte_identical.rs`'s job. What this module
+// `crates/zlib-rs-differential/tests/byte_identical.rs`'s job. What this module
 // owns is the wrapper: the bound arithmetic, the chunking loop's shape, the
 // accounting, and the four status outcomes. The fixtures here are exact output
 // bytes even so, because for the `deflateInit` defaults they cost nothing and

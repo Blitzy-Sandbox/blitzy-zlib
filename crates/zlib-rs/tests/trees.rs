@@ -1,3 +1,11 @@
+// UNSAFE CONTAINMENT, and it is mechanical rather than a convention.  `crates/zlib-rs` is the
+// safe core: `src/lib.rs` carries `#![forbid(unsafe_code)]`, and its test suites carry it too, so
+// the property "the core and everything that exercises it contains no `unsafe`" is enforced by the
+// compiler in both halves.  The workspace's designated FFI boundary -- the only place a raw pointer
+// crosses into a foreign implementation -- is `crates/libz-rs-sys/src/**` for the shipped library
+// and `crates/zlib-rs-differential/src/{oracle,port}.rs` for the dev-only harness; an assertion
+// that needs one of those belongs in a suite of that package, not here.
+#![forbid(unsafe_code)]
 //! Integration tests for the Huffman coder -- `crates/zlib-rs/src/trees/**`, ported
 //! from `trees.c` and `trees.h`.
 //!
@@ -79,9 +87,9 @@
 //! # What this suite deliberately does not do
 //!
 //! Element-for-element comparison of the ported Rust tables against the C arrays
-//! themselves belongs to a table-equality suite under `crates/zlib-rs-differential`, the
-//! crate that can link the C oracle; no such suite is in the tree, so that comparison has
-//! not been made. It is not duplicated here either. What is asserted instead is stronger in
+//! themselves belongs to `crates/zlib-rs-differential/tests/table_equality.rs`, in the
+//! crate that can link the C oracle, and is not duplicated here. What is asserted instead
+//! is stronger in
 //! one respect and weaker in another: every claim below is derived from RFC 1951 §3.2.3
 //! to §3.2.6 or from `doc/txtvsbin.txt`, i.e. from a normative text rather than from a
 //! transcription, so a table that was transcribed wrongly *and* compared against the same

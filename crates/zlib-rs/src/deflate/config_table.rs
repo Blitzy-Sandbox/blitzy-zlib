@@ -31,9 +31,8 @@
 //! for essentially every input. Since byte-identical output against the C
 //! reference is an acceptance criterion of this port, a "tuned", interpolated or
 //! formula-derived table is a defect even when it compresses better.
-//! The planned `crates/zlib-rs-differential/tests/table_equality.rs` will compare
-//! [`CONFIGURATION_TABLE`] against the C array element for element -- it has not landed, so
-//! nothing checks the transcription automatically today -- and the
+//! `crates/zlib-rs-differential/tests/table_equality.rs` compares
+//! [`CONFIGURATION_TABLE`] against the C array element for element, and the
 //! byte-identity matrix exercises all ten levels; the tests at the end of this
 //! file restate the forty numbers independently so that a transcription slip
 //! fails here, in the cheapest possible place, rather than in a compressed

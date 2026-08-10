@@ -82,10 +82,11 @@
 //!
 //! This is the contract `crates/libz-rs-sys/src/gz.rs` implements, stated in full on this side so
 //! that neither file has to be read to understand the other. Each requirement below is one that
-//! file satisfies, and one any replacement for it has to keep. What is *not* established anywhere
-//! in the tree is the end-to-end behaviour through a compiled C caller: that needs the unmodified
-//! `test/minigzip.c` relinked against the packaged library, which `Makefile.in`'s `rust-test`
-//! target runs and nothing runs automatically.
+//! file satisfies, and one any replacement for it has to keep. The end-to-end behaviour through a
+//! compiled C caller is established by the unmodified `test/minigzip.c` relinked against the
+//! packaged library: `Makefile.in`'s `rust-test` target compiles and runs it, and so does the
+//! `dropin` job of `.github/workflows/rust.yml`, which additionally asserts through `ldd` that the
+//! driver bound the staged `libz.so.1` rather than the system one.
 //!
 //! 1. **`gzopen` / `gzopen64`.** Convert the caller's `const char *` to a byte slice excluding
 //!    the terminating NUL, reject a null pointer with `NULL` before calling (a null pointer

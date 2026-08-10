@@ -7,9 +7,20 @@
 //! build artifacts, two page-cache states and two process start-ups cannot be mistaken for a
 //! throughput difference.
 //!
+//! ★ **What an automated run answers, and what it does not.** AAP §0.6.4.6 reads that figure from
+//! the multi-megabyte Silesia members, and CI cannot supply them: AAP §0.6.4.4 requires CI to stay
+//! network-free and makes Silesia an opt-in tier fetched by a human through
+//! `crates/zlib-rs-differential/corpus/fetch_silesia.sh` with a pinned SHA-256. The `bench` job in
+//! `.github/workflows/rust.yml` therefore runs this suite over the **committed minimal corpus**
+//! only, and the Silesia group prints a skip note there and contributes no gated case. So an
+//! automated run is a **regression gate** -- it catches a change that slows the port relative to
+//! the reference on kilobyte fixtures, on one machine, in one process -- and not the AAP §0.8.4
+//! acceptance measurement, which is a deliberate off-CI run with the corpus installed. Do not cite
+//! a green `bench` job as the acceptance figure.
+//!
 //! The idioms come from `benches/checksum_bench.rs`, which established them: committed-corpus
-//! loading, named call gates that own a single `unsafe` block each, an agreement check taken
-//! strictly outside every timed region, graceful skipping in place of assertions, and the
+//! loading, named call gates that delegate to the harness crate's FFI boundary, an agreement check
+//! taken strictly outside every timed region, graceful skipping in place of assertions, and the
 //! `zlib-rs` / `c-oracle` row labels. What this suite adds on top is *stream state* — a decoder
 //! has to be initialised, driven, possibly reset and always ended, and each of those is a
 //! measurable cost that has to be attributed deliberately rather than by accident.
@@ -21,7 +32,7 @@
 //! `Throughput::Bytes(uncompressed_len)` so the reported rate is *decompressed* bytes per second
 //! — which is the quantity the gate is expressed in.
 //!
-//! * **`inflate_steady_state`** — ★ **this is the group the ≤10% gate is read from.** One decoder
+//! * **`inflate_steady_state`** — ★ **this is the group the ≤10% ratio is read from.** One decoder
 //!   is initialised once per row and `inflateReset2` returns it to the start of a stream between
 //!   iterations, so what is timed is the decode itself plus the cheap half of the stream lifecycle
 //!   and *not* the allocator. `inflateReset2` keeps the window allocation when the window size is
@@ -119,13 +130,59 @@
 //! and one aggregate line per group:
 //!
 //! ```text
-//! inflate_bench: RATIO-SUMMARY group=<group> cases=<n> gated=<k> over=<m> informational=<i> limit=1.10
+//! inflate_bench: RATIO-SUMMARY group=<group> gate=authoritative|supporting expected=<e> cases=<n> gated=<k> over=<m> informational=<i> limit=1.10
 //! ```
 //!
 //! The field order is fixed and the keys are stable. `bytes` is the uncompressed length, which is
 //! what the throughput is per. `verdict=over` marks a case slower than `limit`. `cases` is
 //! `gated + informational`, and **`over` counts only gated cases**, so a workflow that reads `over`
-//! from the `inflate_steady_state` summary line is reading exactly the AAP §0.8.4 gate.
+//! from the `inflate_steady_state` summary line is reading the ≤10% limit over the fixtures the run
+//! could see, and nothing else.
+//!
+//! ★ **Which corpus produced them decides what they mean, and CI only ever sees tier 1.** AAP §0.8.4
+//! states the decompression target over the Silesia corpus and AAP §0.6.4.6 reads it from that
+//! corpus's multi-megabyte members, which is the `inflate_silesia` group below. The `bench` job of
+//! `.github/workflows/rust.yml` provisions no corpus -- CI is network-free -- so in CI that group
+//! skips and the summary lines the job gates come from the committed minimal corpus. Read a green CI
+//! run as "no regression against the in-process C oracle on the fixtures available"; the acceptance
+//! measurement AAP §0.8.4 names is taken by a human who has fetched Silesia first and then read the
+//! `inflate_silesia` summary line.
+//!
+//! ★ **`gate` and `expected` exist so the summary can be CHECKED and not merely read**, because
+//! `over=0` is what both a clean run and an empty run print.
+//!
+//! * `gate` says what this group's `over` entitles a consumer to do. `authoritative` means the group
+//!   measures the quantity AAP §0.8.4 bounds, and a non-zero `over` is a verdict: that is
+//!   [`GROUP_STEADY_STATE`] and [`GROUP_SILESIA`] and nothing else. `supporting` means the comparison
+//!   is real and counted but measures more or other than that quantity -- [`GROUP_LIFECYCLE`] includes
+//!   `inflateInit2_`/`inflateEnd`, [`GROUP_CONTAINER`] and [`GROUP_FEEDING`] vary an axis the gate
+//!   holds fixed, [`GROUP_ONE_SHOT`] measures the `uncompr.c` wrappers -- so a regression there is a
+//!   signal to read rather than a gate to fail. The classification lives in exactly one place,
+//!   [`RATIO_GROUP_POLICIES`], which is also what the `GATE-INVENTORY` line below is printed from.
+//! * `expected` is the number of cases the group set out to measure, computed from the same iteration
+//!   counts its loops use. `cases < expected` means cases were skipped and `expected=0` means the
+//!   group had nothing to measure -- a corpus that was not there, a fixture that would not load, or a
+//!   filter that matched nothing. Requiring `cases == expected` and `expected > 0` on the
+//!   authoritative groups is what makes a green gate mean "the measurement happened".
+//!
+//! Every group named in `GATE-INVENTORY` emits **exactly one** summary line per run, including a
+//! group that had nothing to measure: [`inflate_silesia`] prints `expected=0 cases=0` rather than
+//! printing nothing. So a consumer can require one line per declared group and treat a missing or
+//! duplicated line as a failure, rather than having to decide what an absent line meant.
+//!
+//! Two further lines are printed once per run, before any group's:
+//!
+//! ```text
+//! inflate_bench: GATE-INVENTORY suite=inflate ratio_limit=1.10 min_bytes=4096 levels=1,6,9 authoritative_ratio=<csv> supporting_ratio=<csv> informational_ratio=
+//! inflate_bench: CRITERION root=<dir> port_label=zlib-rs oracle_label=c-oracle layout=<root>/<group>/<label>/<case>/new/estimates.json estimate=slope fallback=mean authority=criterion self_timed=diagnostic
+//! ```
+//!
+//! `GATE-INVENTORY` publishes the limit, the size floor, the level axis and the exact group sets, so
+//! a consumer can assert that the set it is prepared to fail on is the set this run declares -- and
+//! any drift on either side fails rather than silently widening or narrowing the gate.
+//! `informational_ratio` is present and empty because no group in this file is outside the gate by
+//! name, which keeps one parsing rule working for both suites. `CRITERION` publishes where the
+//! authoritative numbers landed and how they are keyed.
 //!
 //! ★ `gate=informational` is what separates a throughput comparison from a per-call-overhead
 //! comparison, and it is a statement about what the gate *means* rather than a way of avoiding it.
@@ -135,16 +192,28 @@
 //! bytes-per-second bound AAP §0.8.4 states, which AAP §0.6.4.6 reads from the multi-megabyte
 //! Silesia members. The floor's derivation is at [`GATE_MIN_BYTES`].
 //!
-//! Two further properties of these numbers matter to anyone reading them:
+//! ★ **Which number decides.** The `RATIO` and `RATIO-SUMMARY` lines are a **diagnostic**, and a gate
+//! must not be built on them alone. The pass behind them is bounded to a few milliseconds per side,
+//! takes the minimum of three rounds, performs no outlier rejection and reports one figure rather
+//! than a confidence interval; it exists so that a ratio is available at all from a plain
+//! `cargo bench` run and is visible in the log next to the rows it summarises, and it is precise
+//! enough to see a factor but not to defend one.
 //!
-//! * They are **indicative**, not authoritative. The pass is bounded to a few milliseconds per
-//!   side, takes the minimum of three rounds, and reports one figure rather than a confidence
-//!   interval. criterion's own estimate remains the authoritative measurement, and a regression
-//!   job that wants statistics should read it from
-//!   `target/criterion/<group>/<label>/<case>/new/estimates.json` -- note that a
+//! * **These lines are what CI gates on; criterion's estimate is the stronger measurement.** Those
+//!   are two different senses of "authoritative", so both halves are stated outright. The `bench`
+//!   job in `.github/workflows/rust.yml` parses the `RATIO-SUMMARY` lines emitted here and fails
+//!   the build from `over`; it reads nothing under `target/criterion/`, and it fails outright if no
+//!   summary line was produced, so a run that measured nothing cannot report success.
+//!   **Statistically, though, these figures are the weaker of the two**: the pass is bounded to a
+//!   few milliseconds per side, takes the minimum of three rounds, and reports one figure rather
+//!   than a confidence interval. criterion's own estimate is the rigorous measurement and nothing
+//!   gates on it -- a regression job that wants statistics should read it from
+//!   `target/criterion/<group>/<label>/<case>/new/estimates.json`, noting that a
 //!   `BenchmarkId::new(label, case)` becomes *two* path components under the group, not one. The
 //!   ratio lines exist so that a ratio is available at all from a plain `cargo bench` run, and so
-//!   that the gate is visible in the log next to the rows it summarises.
+//!   that the gate is visible in the log next to the rows it summarises; reading a green run
+//!   correctly means no summary ratio exceeded its limit, not that a statistically significant
+//!   regression has been ruled out.
 //! * They are measured **before** the criterion rows for the same case, so the calibration also
 //!   serves as an identical warm-up for both sides.
 //!
@@ -157,11 +226,11 @@
 //! ```
 //!
 //! The groups run with an explicit 50-sample, 1-second warm-up, 3-second measurement budget
-//! rather than criterion's 100/3/5 defaults. A full default run registers exactly eighty-six rows
-//! and took eight minutes when this file was written; the reasoning is recorded at [`configure`].
-//! `--test` executes every case exactly once in a few seconds and is the cheapest end-to-end proof
-//! that the harness, the oracle linkage, the version-and-size handshake and the corpus paths are
-//! all correct. Filtering by group name is the way to spend the whole budget on one axis.
+//! rather than criterion's 100/3/5 defaults, so a default run costs roughly four seconds per
+//! registered row plus build time; the reasoning is recorded at [`configure`]. `--test` executes
+//! every case exactly once and is the cheapest end-to-end proof that the harness, the oracle
+//! linkage, the version-and-size handshake and the corpus paths are all correct. Filtering by group
+//! name is the way to spend the whole budget on one axis.
 //!
 //! Comparing two whole configurations — a `simd` build against a scalar one, say — is what
 //! criterion's baselines are for, and the row labels here are stable across configurations
@@ -237,28 +306,50 @@
 //! for a local run while stating plainly that the numbers are not the corpus AAP §0.8.4 names. See
 //! [`silesia_members`].
 //!
+//! Every run says which of those happened, in one line a consumer can read:
+//!
+//! ```text
+//! inflate_bench: SILESIA verdict=complete|incomplete|absent|salvaged found=<n> of=12 required=yes|no dir=<path>
+//! ```
+//!
+//! Only `verdict=complete` is the corpus AAP §0.8.4 names — all twelve pinned members present under
+//! one directory.
+//!
+//! ★ **`ZLIB_RS_SILESIA_REQUIRED=1` turns the other three into failures**, and exists because a skip
+//! is the wrong outcome for exactly one caller: a job that has just provisioned the corpus in order to
+//! produce the AAP §0.8.4 acceptance number. For that job a skipped group is not a pass — it is the
+//! headline measurement quietly not happening, with a green tick on top. Armed, this file refuses
+//! absence, refuses a partial inventory and refuses the salvage path, and it fails the run saying
+//! which and naming the remedy. Unset — the default, and what `cargo bench` and every job that has
+//! provisioned nothing get — the behaviour is unchanged and the run exits zero, which is what AAP
+//! §0.6.4.4 requires. The flag never fetches anything; it only decides whether absence is tolerable.
+//!
 //! **Nothing here touches the network, spawns a process, or executes that script.** AAP §0.6.4.4
 //! requires `cargo test` and CI to be network-free, and `corpus/README.md` states that the script
-//! is invoked by a human and by nothing else — it is referenced by no manifest, no build script,
-//! no test and no workflow, and this file keeps it that way. No crate is introduced for any of
+//! is invoked by a human and by nothing else — no manifest, no build script, no test and no
+//! workflow *runs* it, and this file keeps it that way. Several of them name it, this file
+//! included, because the note printed when the corpus is absent has to say where to get it; being
+//! named is not being invoked. No crate is introduced for any of
 //! this either: `std::fs` and `std::path` suffice.
 //!
 //! # Hygiene
 //!
 //! `crates/zlib-rs-differential` is dev-only and appears in neither shipped crate's
-//! `[dependencies]` (AAP §0.6.4.1), which is what makes `unsafe` acceptable in this file at all:
-//! it exists solely to call the oracle's `extern "C"` declarations and the facade's exported C
-//! ABI, every such call is funnelled through one named gate that owns a single `unsafe` block,
-//! and every block states the invariant that discharges it. AAP §0.8.1 directive 5 and §0.7.1(a)
-//! bind the *shipped* crates, and they are untouched. `extern "C-unwind"` appears nowhere,
-//! nothing here is `#[no_mangle]`, and no `extern "C"` block or `#[link]` attribute is declared —
-//! `crates/zlib-rs-differential/src/oracle.rs` owns every oracle declaration and
-//! `crates/zlib-rs-differential/build.rs` already emits the link directives.
+//! `[dependencies]` (AAP §0.6.4.1), and it is also where every `unsafe` these measurements need
+//! actually lives: its `port` and `oracle` modules hold one gate per entry point, each owning the
+//! single documented `unsafe` block and the invariant that discharges it. This file's root carries
+//! `#![forbid(unsafe_code)]`, so its own freedom from `unsafe` is compiler-enforced rather than
+//! asserted. AAP §0.8.1 directive 5 and §0.7.1(a) bind the *shipped* crates, and they are
+//! untouched. `extern "C-unwind"` appears nowhere, nothing here is `#[no_mangle]`, and no
+//! `extern "C"` block or `#[link]` attribute is declared — `oracle.rs` owns every oracle
+//! declaration and `build.rs` already emits the link directives.
 //!
 //! Every stream is ended on every path, including the skip paths, by the three RAII guards
-//! [`PortInflate`], [`OracleInflate`] and [`OracleDeflate`]. A leaked stream would surface in the
-//! nightly `AddressSanitizer` job, which is the gate this crate does sit inside; Miri is scoped
-//! to `-p zlib-rs` and cannot execute the C oracle, so this file is outside it by construction.
+//! [`PortInflate`], [`OracleInflate`] and [`OracleDeflate`]. This file is outside **both**
+//! sanitizer gates: the nightly `AddressSanitizer` job is scoped to `-p libz-rs-sys` and the three
+//! relinked C drivers and does not select `zlib-rs-differential` or the benches attached to it, and
+//! Miri is scoped to `-p zlib-rs` and cannot execute the C oracle. So the `RAII` guards are the
+//! leak discipline here, not a backstop behind one.
 //!
 //! A `harness = false` bench compiles without `--test`, so `cfg(test)` is false here and these
 //! functions are not `#[test]`. `clippy.toml`'s `allow-unwrap-in-tests`, `allow-expect-in-tests`
@@ -268,11 +359,15 @@
 //! are converted with `try_from` rather than `as`, so a length that could not be represented is
 //! reported and skipped instead of silently truncated.
 
-use core::ffi::{c_char, c_int};
-use core::mem::size_of;
-use std::ffi::{CStr, OsStr};
+// Every FFI call this file makes goes through a gate in `crate::port` or `oracle`, so nothing here
+// needs `unsafe` and the compiler is asked to keep it that way.
+#![forbid(unsafe_code)]
+
+use core::ffi::c_int;
+use std::ffi::OsStr;
 use std::fs;
 use std::hint::black_box;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Once, OnceLock};
 use std::time::{Duration, Instant};
@@ -298,7 +393,7 @@ use libz_rs_sys::{
 // The C reference. Every name here is declared in exactly one place --
 // `crates/zlib-rs-differential/src/oracle.rs` -- and this file adds no `extern "C"` block and no
 // `#[link]` attribute of its own.
-use zlib_rs_differential::oracle;
+use zlib_rs_differential::{oracle, port};
 
 // =================================================================================================
 //  Row labels
@@ -329,6 +424,12 @@ const RATIO_KEY: &str = "RATIO";
 
 /// The greppable per-group aggregate line's leading key.
 const RATIO_SUMMARY_KEY: &str = "RATIO-SUMMARY";
+
+/// The key of the once-per-run line that publishes the gate's identity, limits and group sets.
+const INVENTORY_KEY: &str = "GATE-INVENTORY";
+
+/// The key of the once-per-run line that publishes where criterion's authoritative numbers are.
+const CRITERION_KEY: &str = "CRITERION";
 
 // =================================================================================================
 //  The gate
@@ -471,9 +572,9 @@ enum Feeding {
     /// straight into the caller's buffer and skip the sliding-window copy that a resumable call has
     /// to perform. That is why it is measured separately rather than mixed into the chunked numbers.
     ///
-    /// Do not expect it to be uniformly the fastest row, though — measured on this corpus, the port
-    /// is faster single-shot than chunked on both axis fixtures while the reference is *slower*
-    /// single-shot on `repetitive.bin`, which is exactly the kind of asymmetry a separate row is for.
+    /// Do not expect it to be uniformly the fastest row, though: whether a whole-buffer decode beats
+    /// a chunked one depends on the fixture and on the implementation, and the two sides need not
+    /// agree about which direction that goes. Surfacing that asymmetry is what a separate row is for.
     SingleShot,
     /// The reference driver's loop, at the given chunk size, flushing `Z_SYNC_FLUSH`.
     ///
@@ -589,7 +690,8 @@ fn minimal_corpus_dir() -> PathBuf {
 
 /// The repository root, which is `<CARGO_MANIFEST_DIR>/../..`.
 ///
-/// The only consumer is [`silesia_dir`]'s default branch. Kept as its own named function because
+/// Consumed by [`silesia_dir`]'s default branch and by [`criterion_root`]. Kept as its own named
+/// function because
 /// the two `..` components are the other half of the `CARGO_MANIFEST_DIR` surprise described on
 /// [`minimal_corpus_dir`], and a reader should find both facts stated once each rather than inlined
 /// at a use site.
@@ -706,9 +808,168 @@ const SILESIA_MEMBERS: [&str; 12] = [
     "dickens", "mozilla", "mr",      "nci",     "ooffice", "osdb",
     "reymont", "sao",     "samba",   "webster", "x-ray",   "xml",
 ];
+/// The environment variable that turns the corpus from optional into required.
+///
+/// Unset, or set to an empty value, `0`, `no` or `false`, this file behaves exactly as it always has:
+/// a missing corpus is reported, the tier-2 group is skipped and the run exits zero, which is what
+/// AAP §0.6.4.4 requires of `cargo bench` and of a CI job that has not provisioned anything.
+///
+/// Set to `1`, `yes` or `true`, absence becomes a failure. That is the mode a job uses when it has
+/// just provisioned the corpus and is measuring the AAP §0.8.4 acceptance number: in that job a skip
+/// is not a success, it is the measurement silently not happening, and the job would go green having
+/// proved nothing about the corpus the AAP names. Arming it also refuses the two weaker outcomes --
+/// an incomplete pinned inventory, and the salvage path over arbitrary files -- because a number
+/// measured over eight of the twelve members, or over whatever else was in the directory, is not the
+/// number that gate is about.
+const SILESIA_REQUIRED_VAR: &str = "ZLIB_RS_SILESIA_REQUIRED";
+
+/// The key of the line that states what happened to the corpus, for a consumer to read.
+const SILESIA_KEY: &str = "SILESIA";
 
 /// The environment variable that overrides where the Silesia corpus lives.
 const SILESIA_DIR_VAR: &str = "ZLIB_RS_SILESIA_DIR";
+
+/// The largest single member this suite will load into memory, in bytes: 64 MiB.
+///
+/// ★ Nothing about the tier-2 input is pinned by the time it reaches [`fs::read`], and that is the
+/// problem this constant exists to bound. [`SILESIA_DIR_VAR`] is caller-supplied, and
+/// [`salvage_silesia_dir`] deliberately accepts *any* readable non-hidden regular file when none of
+/// the twelve pinned names is present -- a design that makes a hand-populated directory usable, and
+/// simultaneously means the bytes are whatever happens to be sitting there. Point the variable at a
+/// directory holding a VM image, a core dump or a rotated log and the loop below would hand each
+/// file whole to `fs::read`, which allocates the entire length before anything is in a position to
+/// object. The failure mode is an out-of-memory kill in the middle of a benchmark run, reported as
+/// a dead process rather than as the bad input it is.
+///
+/// 64 MiB is chosen against the corpus, not picked round. `corpus/README.md`'s inventory and
+/// `corpus/fetch_silesia.sh` document the collection as roughly 65 MiB compressed expanding to a few
+/// hundred megabytes, and its largest member -- `mozilla` -- is about 48.9 MiB. A 64 MiB ceiling
+/// therefore admits every pinned member in full, with about a third again in headroom, while
+/// refusing anything an order of magnitude outside the family. No pinned measurement changes because
+/// of it: the AAP §0.8.4 Silesia numbers are produced from exactly the same bytes as before.
+///
+/// Note what this is *not*. It is not a security boundary -- the corpus is fetched by a human who
+/// accepts its terms, and `fetch_silesia.sh` owns authenticity through its digest pin. It is a
+/// resource bound, in the same spirit as [`salvage_silesia_dir`]'s existing twelve-file cap: that
+/// one stops a directory of thousands of files from turning a benchmark into an afternoon, and this
+/// one stops a single enormous file from turning it into an OOM.
+const SILESIA_MAX_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The environment variable that raises or lowers [`SILESIA_MAX_MEMBER_BYTES`].
+///
+/// A developer deliberately measuring one large local file should be able to say so, explicitly and
+/// in one place, rather than editing the source. `benches/deflate_bench.rs` reads the same variable.
+const SILESIA_MAX_MEMBER_VAR: &str = "ZLIB_RS_SILESIA_MAX_MEMBER_BYTES";
+
+/// The per-member ceiling in force for this process, resolved once.
+///
+/// A value that does not parse, or parses as zero, is reported and ignored in favour of the default.
+/// Honouring a zero would skip every member and leave a run that printed throughput yesterday
+/// silently printing nothing today -- the opposite of what a diagnostic should do.
+fn silesia_member_ceiling() -> u64 {
+    static CACHE: OnceLock<u64> = OnceLock::new();
+
+    *CACHE.get_or_init(|| match std::env::var(SILESIA_MAX_MEMBER_VAR) {
+        Ok(value) if value.is_empty() => SILESIA_MAX_MEMBER_BYTES,
+        Ok(value) => match value.parse::<u64>() {
+            Ok(0) | Err(_) => {
+                eprintln!(
+                    "{LOG_PREFIX} {SILESIA_MAX_MEMBER_VAR}={value:?} is not a positive byte count \
+                     -- using the default ceiling of {SILESIA_MAX_MEMBER_BYTES} bytes."
+                );
+                SILESIA_MAX_MEMBER_BYTES
+            }
+            Ok(parsed) => {
+                eprintln!(
+                    "{LOG_PREFIX} Silesia per-member ceiling set to {parsed} bytes by \
+                     {SILESIA_MAX_MEMBER_VAR} (default {SILESIA_MAX_MEMBER_BYTES})."
+                );
+                parsed
+            }
+        },
+        Err(_) => SILESIA_MAX_MEMBER_BYTES,
+    })
+}
+
+/// One Silesia member's bytes, or [`None`] with one note saying precisely why it was skipped.
+///
+/// The order of operations is the point. [`fs::metadata`] is consulted **before** any read, so an
+/// oversized member costs one `stat` and is refused without a byte being allocated. The read that
+/// follows is then itself bounded by [`Read::take`] rather than trusting the length it was just
+/// told: metadata is authoritative for ordinary files, but a character device or a `/proc`-style
+/// pseudo-file reports zero and yields arbitrarily much, and `fs::read` would follow it as far as it
+/// went. Taking `ceiling + 1` bytes makes the bound hold for every file type while still leaving
+/// one byte of evidence that the limit was exceeded rather than exactly reached.
+///
+/// Every rejection is a named skip and the caller continues, which is this file's established
+/// posture for tier 2: a missing, empty or unreadable member is a note and the run exits zero,
+/// because tier 1 carries every correctness and gate measurement.
+fn silesia_member_bytes(path: &Path, name: &str) -> Option<Vec<u8>> {
+    let ceiling = silesia_member_ceiling();
+
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.len() > ceiling => {
+            eprintln!(
+                "{LOG_PREFIX} skipping Silesia member {name}: it is {} bytes, above the \
+                 {ceiling}-byte per-member ceiling, so it is not being read. The pinned corpus's \
+                 largest member is about 48.9 MiB and fits comfortably; raise \
+                 {SILESIA_MAX_MEMBER_VAR} if you mean to measure a file this large.",
+                metadata.len()
+            );
+            return None;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!(
+                "{LOG_PREFIX} skipping Silesia member {name}: cannot stat {}: {error}",
+                path.display()
+            );
+            return None;
+        }
+    }
+
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!(
+                "{LOG_PREFIX} skipping Silesia member {name}: cannot read {}: {error}",
+                path.display()
+            );
+            return None;
+        }
+    };
+
+    // `ceiling + 1` is what distinguishes "at the limit" from "past it", and the saturating add
+    // keeps a caller-supplied `u64::MAX` ceiling from wrapping to zero.
+    let mut bytes = Vec::new();
+    if let Err(error) = file.take(ceiling.saturating_add(1)).read_to_end(&mut bytes) {
+        eprintln!(
+            "{LOG_PREFIX} skipping Silesia member {name}: cannot read {}: {error}",
+            path.display()
+        );
+        return None;
+    }
+
+    // Reached only by a file whose metadata understated it -- the pseudo-file case above.
+    if bytes.len() as u64 > ceiling {
+        eprintln!(
+            "{LOG_PREFIX} skipping Silesia member {name}: it yielded more than the \
+             {ceiling}-byte per-member ceiling despite reporting a smaller size, so it is not an \
+             ordinary file this suite can measure."
+        );
+        return None;
+    }
+
+    if bytes.is_empty() {
+        eprintln!(
+            "{LOG_PREFIX} skipping Silesia member {name}: it is empty, and a zero-byte case has \
+             no rate to report."
+        );
+        return None;
+    }
+
+    Some(bytes)
+}
 
 /// Where to obtain the corpus, quoted in the skip note so a reader does not have to go looking.
 const SILESIA_SCRIPT: &str = "crates/zlib-rs-differential/corpus/fetch_silesia.sh";
@@ -754,6 +1015,7 @@ fn silesia_members() -> &'static [PathBuf] {
 
     CACHE.get_or_init(|| {
         let dir = silesia_dir();
+        let required = silesia_required();
 
         let canonical: Vec<PathBuf> = SILESIA_MEMBERS
             .iter()
@@ -761,18 +1023,30 @@ fn silesia_members() -> &'static [PathBuf] {
             .filter(|path| path.is_file())
             .collect();
 
-        if !canonical.is_empty() {
+        let found = canonical.len();
+        let total = SILESIA_MEMBERS.len();
+
+        if found == total {
+            report_silesia(&dir, "complete", found, required);
+            return canonical;
+        }
+
+        if found > 0 {
+            report_silesia(&dir, "incomplete", found, required);
             eprintln!(
-                "{LOG_PREFIX} Silesia: {} of the {} pinned members found under {}.",
-                canonical.len(),
-                SILESIA_MEMBERS.len(),
+                "{LOG_PREFIX} Silesia: {found} of the {total} pinned members found under {} -- \
+                 measuring those. The missing members are named by {SILESIA_SCRIPT} --verify-only.",
                 dir.display()
             );
+            if required {
+                refuse_silesia(&dir, "incomplete", found);
+            }
             return canonical;
         }
 
         let salvaged = salvage_silesia_dir(&dir);
         if salvaged.is_empty() {
+            report_silesia(&dir, "absent", 0, required);
             eprintln!(
                 "{LOG_PREFIX} Silesia not present under {} -- skipping the tier-2 groups. This is \
                  normal and not an error: tier 1 covers every correctness gate and this run exits \
@@ -781,10 +1055,120 @@ fn silesia_members() -> &'static [PathBuf] {
                  {SILESIA_DIR_VAR} at a directory that already holds it.",
                 dir.display()
             );
+            if required {
+                refuse_silesia(&dir, "absent", 0);
+            }
+            return salvaged;
+        }
+
+        report_silesia(&dir, "salvaged", 0, required);
+        if required {
+            refuse_silesia(&dir, "salvaged", 0);
         }
 
         salvaged
     })
+}
+
+/// Whether the corpus is required rather than optional, from [`SILESIA_REQUIRED_VAR`].
+///
+/// `1`, `yes` and `true` in any case arm it; unset, empty, `0`, `no` and `false` do not. Any other
+/// value is reported and treated as not armed, because silently reading an unrecognised value as
+/// "required" would turn a typo into a failing job, and reading it as "optional" without saying so
+/// would turn a typo into a job that proves nothing.
+fn silesia_required() -> bool {
+    let Ok(value) = std::env::var(SILESIA_REQUIRED_VAR) else {
+        return false;
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "yes" | "true" => true,
+        "" | "0" | "no" | "false" => false,
+        other => {
+            eprintln!(
+                "{LOG_PREFIX} {SILESIA_REQUIRED_VAR}={other:?} is not one of 1/yes/true or \
+                 0/no/false, so the corpus is treated as OPTIONAL. Set it to 1 to require the \
+                 corpus."
+            );
+            false
+        }
+    }
+}
+
+/// Print the one machine-readable line that says what happened to the corpus.
+///
+/// Always printed, in every outcome including the ordinary absent one, so that a consumer never has
+/// to infer the corpus state from the presence or absence of a group. `verdict` is one of `complete`,
+/// `incomplete`, `absent` or `salvaged`, and only `complete` is the corpus AAP §0.8.4 names.
+fn report_silesia(dir: &Path, verdict: &str, found: usize, required: bool) {
+    eprintln!(
+        "{LOG_PREFIX} {SILESIA_KEY} verdict={verdict} found={found} of={total} required={required} \
+         dir={dir}",
+        total = SILESIA_MEMBERS.len(),
+        required = if required { "yes" } else { "no" },
+        dir = dir.display(),
+    );
+}
+
+/// Fail the run, because the corpus was required and is not the pinned twelve.
+///
+/// A panic, and deliberately: this is the one place in this file that is allowed to stop the process,
+/// and it stops it because continuing would produce a green run whose headline measurement never
+/// happened. It is reachable only when a caller has explicitly set [`SILESIA_REQUIRED_VAR`], so the
+/// default `cargo bench` path -- and every CI job that has not provisioned the corpus -- still skips
+/// and exits zero exactly as AAP §0.6.4.4 requires. The message names the remedy rather than only the
+/// problem.
+///
+/// `clippy::panic` is denied workspace-wide and is allowed here for that single deliberate use, in the
+/// same shape the rest of the workspace uses for a deliberate abort. The alternative spellings are
+/// worse: `process::exit` is denied too and would skip every destructor, and returning an empty member
+/// list is precisely the silent success this function exists to prevent.
+#[allow(clippy::panic)]
+fn refuse_silesia(dir: &Path, verdict: &str, found: usize) -> ! {
+    panic!(
+        "{SILESIA_REQUIRED_VAR} is set, so the Silesia corpus is required, and it is {verdict}: \
+         {found} of the {total} pinned members are present under {dir}. This is the corpus AAP \
+         §0.8.4 names for the throughput gate, so a run that skips it, measures part of it, or \
+         measures other files instead cannot produce that number. Provision it with {SILESIA_SCRIPT} \
+         (which verifies a SHA-256 over the archive and over every member), point \
+         {SILESIA_DIR_VAR} at a directory that already holds the twelve, or unset \
+         {SILESIA_REQUIRED_VAR} to go back to skipping.",
+        total = SILESIA_MEMBERS.len(),
+        dir = dir.display(),
+    )
+}
+
+/// Where criterion writes its reports, by criterion's own resolution rule.
+///
+/// Published on the `CRITERION` line so that a consumer reading the authoritative estimates does not
+/// have to reimplement this. Criterion's `default_output_directory` takes the first of:
+///
+/// 1. `$CRITERION_HOME`, when set and non-empty.
+/// 2. `$CARGO_TARGET_DIR/criterion`, when that is set and non-empty.
+/// 3. The `target_directory` cargo reports for the workspace, with `criterion` appended -- which for
+///    this workspace is `<repo-root>/target/criterion`.
+///
+/// Step 3 is reproduced from [`repository_root`] rather than by shelling out to `cargo metadata`: a
+/// benchmark must not spawn a build tool, and the two agree for any invocation that builds this file,
+/// because the manifest that declares this bench target lives in that workspace. An empty value
+/// counts as unset in both steps, matching the `${VAR:-}` reading used everywhere else here.
+fn criterion_root() -> PathBuf {
+    for (var, suffix) in [
+        ("CRITERION_HOME", None),
+        ("CARGO_TARGET_DIR", Some("criterion")),
+    ] {
+        if let Ok(value) = std::env::var(var) {
+            if !value.is_empty() {
+                let base = PathBuf::from(value);
+                return match suffix {
+                    Some(tail) => base.join(tail),
+                    None => base,
+                };
+            }
+        }
+    }
+
+    repository_root().join("target").join("criterion")
 }
 
 /// Up to twelve readable regular files from `dir`, sorted, when none of the pinned members is there.
@@ -838,43 +1222,28 @@ fn salvage_silesia_dir(dir: &Path) -> Vec<PathBuf> {
 //  narrower than `usize` an `as` cast would silently truncate a large case into a small one and
 //  report a throughput figure for work that was never done.
 
-/// `(int) sizeof(T)`, where `T` is **that side's own** `z_stream` mirror.
-///
-/// This is the second half of the handshake the `inflateInit2` macro arranges (`zlib.h` L1939-L1941)
-/// and it must never be crossed between sides: `zlib_rs_differential::oracle::z_stream` and the
-/// facade's `z_stream` are distinct Rust types that happen to have identical layout, and each
-/// library compares the number it is given against its *own* `sizeof`.
-///
-/// Checked rather than cast. On the impossible failure -- a `z_stream` larger than `INT_MAX`, which
-/// would mean the ABI mirror had grown past anything `zlib.h` could describe -- it yields 0, and
-/// every `*Init*_` entry point rejects 0 with `Z_VERSION_ERROR` because 0 cannot equal
-/// `sizeof(z_stream)`. That is a self-reporting fallback rather than a panic, which is what a
-/// benchmark should have.
-fn stream_size<T>() -> c_int {
-    c_int::try_from(size_of::<T>()).unwrap_or(0)
-}
+//  The `sizeof(z_stream)` half of each `*Init*_` handshake is not spelled in this file at all: the
+//  boundary gate for each side supplies its own mirror's `size_of`, which is what makes crossing
+//  the two impossible rather than merely discouraged. They are distinct Rust types with identical
+//  layout, and each library compares the number it is given against its own `sizeof`.
 
-/// The version string both `*Init*_` calls are given: `ZLIB_VERSION` from `zlib.h` L44, verbatim.
-///
-/// This is precisely what the C macros pass -- the *caller's* compile-time constant -- and passing
-/// it to the oracle therefore exercises the reference's real major-version check rather than
-/// side-stepping it. It is a `&CStr` constant with static storage duration, so `as_ptr` yields a
-/// NUL-terminated pointer that outlives every call; nothing allocates a `CString`.
-///
-/// Be precise about what that check is, because it is narrower than it looks and the difference
-/// matters when reading a failure. `deflate.c` L394 and `inflate.c` L178 compare **only
-/// `version[0]`** -- the major digit -- against the library's own, and the facade documents and tests
-/// the same rule. Measured against both implementations from this file: a wrong major such as
-/// `"2.3.2.1-motley"` makes every `*Init*_` answer `Z_VERSION_ERROR` (−6), while the shorthand
-/// `"1.3.2"` is *accepted*, because its major digit agrees. So the shorthand is wrong for a different
-/// reason than a failed handshake -- it is not the string this library reports, and `zlibVersion` and
-/// the `test/example.c` startup check are about identity rather than about the init gate. Passing the
-/// `zlib.h` L44 constant verbatim is what a real caller does and is the only spelling that is right on
-/// both counts. [`report_configuration`] prints the reference's own `c_zlibVersion()` beside this
-/// constant so that a drift is visible in the output rather than only in a failure.
-fn version_ptr() -> *const c_char {
-    ZLIB_VERSION.as_ptr()
-}
+//  The version string both `*Init*_` calls are given is `ZLIB_VERSION` from `zlib.h` L44, passed
+//  verbatim through the `_with_version` gate on each side. That is precisely what the C macros pass
+//  -- the *caller's* compile-time constant -- so handing it to the reference exercises the
+//  reference's real major-version check rather than side-stepping it.
+//
+//  Be precise about what that check is, because it is narrower than it looks and the difference
+//  matters when reading a failure. `deflate.c` L394 and `inflate.c` L178 compare ONLY `version[0]`
+//  -- the major digit -- against the library's own, and the facade documents and tests the same
+//  rule. Measured against both implementations from this file: a wrong major such as
+//  `"2.3.2.1-motley"` makes every `*Init*_` answer `Z_VERSION_ERROR` (-6), while the shorthand
+//  `"1.3.2"` is *accepted*, because its major digit agrees. So the shorthand is wrong for a
+//  different reason than a failed handshake -- it is not the string this library reports, and
+//  `zlibVersion` and the `test/example.c` startup check are about identity rather than about the
+//  init gate. Passing the `zlib.h` L44 constant verbatim is what a real caller does and is the only
+//  spelling that is right on both counts. [`report_configuration`] prints the reference's own
+//  `c_zlibVersion()` beside it so that a drift is visible in the output rather than only in a
+//  failure.
 
 /// The outcome of one decode: the status the library returned and how many bytes it produced.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -981,8 +1350,9 @@ fn install_oracle(strm: &mut oracle::z_stream, input: &[u8], out: &mut [u8]) {
 //  measure precisely.
 //
 //  Every guard's `Drop` calls the matching `*End`, so a skip path, an early return and a panicking
-//  unwind all release the stream. That is what keeps this file clean under the nightly
-//  `AddressSanitizer` job, which is the verification gate this crate does sit inside.
+//  unwind all release the stream. That is what keeps this file leak-free, and it has to be
+//  self-imposed: no sanitizer job runs this file -- ASan is scoped to `-p libz-rs-sys` and the three
+//  relinked C drivers, and Miri cannot execute the oracle.
 
 /// The port's inflate stream, ended on every path by [`Drop`].
 #[derive(Debug)]
@@ -1004,20 +1374,11 @@ impl PortInflate {
 
     /// `inflateInit2_(strm, windowBits, ZLIB_VERSION, sizeof(z_stream))` -- `zlib.h` L1911.
     fn init(&mut self, window_bits: c_int) -> c_int {
-        // SAFETY: `strm` is a live, zeroed, correctly-typed local of this side's own `z_stream`
-        // type that outlives the call; `version` points at `ZLIB_VERSION`, a NUL-terminated
-        // `'static` byte string; and `stream_size` is `size_of` of that same type, never the other
-        // side's. `inflateInit2_` reads at most one byte of `version` after testing it for null,
-        // writes `state`, and touches neither window -- which is why a C caller may leave
-        // `next_in`/`next_out` unset until after the call.
-        let status = unsafe {
-            libz_rs_sys::inflateInit2_(
-                core::ptr::addr_of_mut!(self.strm),
-                window_bits,
-                version_ptr(),
-                stream_size::<libz_rs_sys::z_stream>(),
-            )
-        };
+        // The `_with_version` gate is the one to use here rather than `port::inflate_init2`: this
+        // suite drives BOTH implementations with the caller's `zlib.h` L44 constant, which is what a
+        // real caller passes and what makes the two rows comparable. The gate supplies this side's
+        // own `size_of::<z_stream>()`, never the other side's.
+        let status = port::inflate_init2_with_version(&mut self.strm, window_bits, ZLIB_VERSION);
         self.live = status == Z_OK;
         status
     }
@@ -1028,10 +1389,10 @@ impl PortInflate {
     /// the window size is unchanged, which is exactly why the steady-state group uses it: what is
     /// then timed is the decode plus the cheap half of the lifecycle, and not the allocator.
     fn reset(&mut self, window_bits: c_int) -> c_int {
-        // SAFETY: as for `init`, minus the version handshake. `strm` is live and initialised, so
-        // `inflateReset2` finds the state block it wrote; it reallocates the window only if
-        // `windowBits` changed, and touches neither the input nor the output window.
-        unsafe { libz_rs_sys::inflateReset2(core::ptr::addr_of_mut!(self.strm), window_bits) }
+        // `strm` is live and initialised at this address, so `inflateReset2` finds the state block
+        // `init` wrote; it reallocates the window only if `windowBits` changed, and touches neither
+        // the input nor the output window.
+        port::inflate_reset2(&mut self.strm, window_bits)
     }
 }
 
@@ -1041,11 +1402,10 @@ impl Drop for PortInflate {
             return;
         }
         self.live = false;
-        // SAFETY: `strm` is live and was initialised by `inflateInit2_` on this same address.
         // `inflateEnd` frees the state through the same allocator that produced it and nulls
-        // `state`, so this runs at most once per stream and a second call would be a documented
-        // no-op rather than a double free.
-        unsafe { libz_rs_sys::inflateEnd(core::ptr::addr_of_mut!(self.strm)) };
+        // `state`. The `live` flag above is what makes this run at most once per stream; a second
+        // call would be a documented no-op rather than a double free.
+        let _ = port::inflate_end(&mut self.strm);
     }
 }
 
@@ -1070,26 +1430,20 @@ impl OracleInflate {
 
     /// `inflateInit2_` in the reference, reached as `c_inflateInit2_`.
     fn init(&mut self, window_bits: c_int) -> c_int {
-        // SAFETY: as for `PortInflate::init`, with `stream_size` taken from the ORACLE's own
-        // `z_stream` mirror rather than the facade's -- the two are distinct Rust types and each
-        // library compares the number against its own `sizeof`.
-        let status = unsafe {
-            oracle::c_inflateInit2_(
-                core::ptr::addr_of_mut!(self.strm),
-                window_bits,
-                version_ptr(),
-                stream_size::<oracle::z_stream>(),
-            )
-        };
+        // As for `PortInflate::init`, and the same caller constant, so that the reference's real
+        // major-version check is exercised rather than side-stepped. The gate takes `stream_size`
+        // from the ORACLE's own `z_stream` mirror rather than the facade's -- the two are distinct
+        // Rust types and each library compares the number against its own `sizeof`.
+        let status = oracle::inflate_init2_with_version(&mut self.strm, window_bits, ZLIB_VERSION);
         self.live = status == Z_OK;
         status
     }
 
     /// `inflateReset2` in the reference, reached as `c_inflateReset2`.
     fn reset(&mut self, window_bits: c_int) -> c_int {
-        // SAFETY: as for `PortInflate::reset`. `strm` is live, initialised at this address, and
-        // still the address the state block's back-pointer holds.
-        unsafe { oracle::c_inflateReset2(core::ptr::addr_of_mut!(self.strm), window_bits) }
+        // As for `PortInflate::reset`. `strm` is live, initialised at this address, and still the
+        // address the state block's back-pointer holds -- `inflate.c` L94 checks it by identity.
+        oracle::inflate_reset2(&mut self.strm, window_bits)
     }
 }
 
@@ -1099,8 +1453,8 @@ impl Drop for OracleInflate {
             return;
         }
         self.live = false;
-        // SAFETY: as for `PortInflate::drop`, against the reference's own allocator.
-        unsafe { oracle::c_inflateEnd(core::ptr::addr_of_mut!(self.strm)) };
+        // As for `PortInflate::drop`, against the reference's own allocator.
+        let _ = oracle::inflate_end(&mut self.strm);
     }
 }
 
@@ -1134,21 +1488,17 @@ impl OracleDeflate {
     /// Every parameter but the level and the window bits is held at the default the shipped library
     /// uses, because AAP §0.7.1(c) forbids this suite from changing what the encoder emits.
     fn init(&mut self, level: c_int, window_bits: c_int) -> c_int {
-        // SAFETY: as for `OracleInflate::init` -- a live zeroed local of the oracle's own type, the
-        // `'static` NUL-terminated version string, and that type's own `size_of`. `deflateInit2_`
-        // writes `state` and touches neither window.
-        let status = unsafe {
-            oracle::c_deflateInit2_(
-                core::ptr::addr_of_mut!(self.strm),
-                level,
-                Z_DEFLATED,
-                window_bits,
-                DEFAULT_MEM_LEVEL,
-                Z_DEFAULT_STRATEGY,
-                version_ptr(),
-                stream_size::<oracle::z_stream>(),
-            )
-        };
+        // As for `OracleInflate::init`: the caller's version constant, and the oracle's own
+        // `size_of`. `deflateInit2_` writes `state` and touches neither window.
+        let status = oracle::deflate_init2_with_version(
+            &mut self.strm,
+            level,
+            Z_DEFLATED,
+            window_bits,
+            DEFAULT_MEM_LEVEL,
+            Z_DEFAULT_STRATEGY,
+            ZLIB_VERSION,
+        );
         self.live = status == Z_OK;
         status
     }
@@ -1163,10 +1513,9 @@ impl OracleDeflate {
     /// because it reads `wrap`, `w_bits` and `hash_bits` out of the state block.
     fn bound(&mut self, source_len: usize) -> Option<usize> {
         let source = oracle::uLong::try_from(source_len).ok()?;
-        // SAFETY: `strm` is live and initialised at this address. `deflateBound` only reads the
-        // state block and writes nothing; it touches neither window, so no pointer needs to be
-        // installed first.
-        let bound = unsafe { oracle::c_deflateBound(core::ptr::addr_of_mut!(self.strm), source) };
+        // `deflateBound` only reads the state block and writes nothing; it touches neither window,
+        // so no pointer needs to be installed first. `Some(..)` is the gate's live-stream form.
+        let bound = oracle::deflate_bound(Some(&mut self.strm), source);
         usize::try_from(bound).ok()
     }
 }
@@ -1177,9 +1526,9 @@ impl Drop for OracleDeflate {
             return;
         }
         self.live = false;
-        // SAFETY: as for `OracleInflate::drop`. `deflateEnd` frees the state through the allocator
-        // that produced it and nulls `state`.
-        unsafe { oracle::c_deflateEnd(core::ptr::addr_of_mut!(self.strm)) };
+        // As for `OracleInflate::drop`. `deflateEnd` frees the state through the allocator that
+        // produced it and nulls `state`.
+        let _ = oracle::deflate_end(&mut self.strm);
     }
 }
 
@@ -1219,11 +1568,9 @@ fn compress_with_oracle(data: &[u8], level: c_int, container: Container) -> Opti
     deflater.strm.avail_in = avail_in;
     deflater.strm.avail_out = avail_out;
 
-    // SAFETY: `avail_in` bytes are readable at `next_in` and `avail_out` bytes writable at
-    // `next_out`, both installed immediately above from live slices that outlive this call, and both
-    // counts are the slices' own lengths converted with `try_from`. `strm` is live and initialised at
-    // this address. `deflate` retains neither pointer past the return.
-    let status = unsafe { oracle::c_deflate(core::ptr::addr_of_mut!(deflater.strm), Z_FINISH) };
+    // The two windows were installed immediately above from live slices that outlive this call,
+    // with both counts converted from those slices' own lengths by `try_from`.
+    let status = oracle::deflate(&mut deflater.strm, Z_FINISH);
     if status != Z_STREAM_END {
         eprintln!(
             "{LOG_PREFIX} cannot build an input: c_deflate(Z_FINISH) returned {status} for \
@@ -1247,8 +1594,8 @@ fn compress_with_oracle(data: &[u8], level: c_int, container: Container) -> Opti
 //  Four functions: two feeding modes on each side. They are written out per side rather than behind
 //  a trait because `zlib_rs_differential::oracle::z_stream` and the facade's `z_stream` are distinct
 //  Rust types with identical layout -- nothing is ever transmuted or aliased between them -- and
-//  because a reader auditing one `unsafe` block should not have to follow a generic to find the type
-//  it applies to.
+//  because a reader following one row of a comparison should not have to resolve a generic to find
+//  which library it reaches.
 //
 //  None of them allocates, reads a file, prints, or compares anything: they are exactly the work the
 //  criterion rows are supposed to be timing, and nothing else. A conversion that could not be
@@ -1268,11 +1615,10 @@ fn port_single_shot(stream: &mut PortInflate, input: &[u8], out: &mut [u8]) -> O
     stream.strm.avail_in = avail_in;
     stream.strm.avail_out = avail_out;
 
-    // SAFETY: `avail_in` bytes are readable at `next_in` and `avail_out` bytes writable at
-    // `next_out`, both installed immediately above from live slices that outlive this call, and both
-    // counts are those slices' own lengths converted with `try_from`. `strm` is live, initialised at
-    // this address, and reset by the caller when the caller intends a fresh stream.
-    let status = unsafe { libz_rs_sys::inflate(core::ptr::addr_of_mut!(stream.strm), Z_FINISH) };
+    // Both windows were installed immediately above from live slices that outlive this call, with
+    // both counts converted from those slices' own lengths. The caller resets the stream when it
+    // intends a fresh one.
+    let status = port::inflate(&mut stream.strm, Z_FINISH);
 
     let left = usize::try_from(stream.strm.avail_out).ok()?;
     Some(Decode {
@@ -1313,13 +1659,10 @@ fn port_chunked(
         stream.strm.avail_in = libz_rs_sys::uInt::try_from(offer_in).ok()?;
         stream.strm.avail_out = libz_rs_sys::uInt::try_from(offer_out).ok()?;
 
-        // SAFETY: as for `port_single_shot` -- `avail_in` bytes readable at `next_in` and
-        // `avail_out` bytes writable at `next_out`, both derived from the live slices installed
-        // before the loop, and both counts clamped to what those slices still hold. The library
-        // advances the two pointers itself, so re-offering counts without re-installing pointers is
-        // the documented way to resume.
-        status =
-            unsafe { libz_rs_sys::inflate(core::ptr::addr_of_mut!(stream.strm), Z_SYNC_FLUSH) };
+        // As for `port_single_shot`, with both counts clamped to what the installed slices still
+        // hold. The library advances the two pointers itself, so re-offering counts without
+        // re-installing pointers is the documented way to resume.
+        status = port::inflate(&mut stream.strm, Z_SYNC_FLUSH);
 
         let consumed = offer_in.checked_sub(usize::try_from(stream.strm.avail_in).ok()?)?;
         let produced = offer_out.checked_sub(usize::try_from(stream.strm.avail_out).ok()?)?;
@@ -1347,10 +1690,10 @@ fn oracle_single_shot(stream: &mut OracleInflate, input: &[u8], out: &mut [u8]) 
     stream.strm.avail_in = avail_in;
     stream.strm.avail_out = avail_out;
 
-    // SAFETY: as for `port_single_shot`, against the oracle's own `z_stream` type and its own
-    // entry point. The stream has not moved since `c_inflateInit2_` wrote the back-pointer that
-    // `inflate.c` L94 checks by identity.
-    let status = unsafe { oracle::c_inflate(core::ptr::addr_of_mut!(stream.strm), Z_FINISH) };
+    // As for `port_single_shot`, against the oracle's own `z_stream` type and its own entry point.
+    // The stream has not moved since `c_inflateInit2_` wrote the back-pointer that `inflate.c` L94
+    // checks by identity.
+    let status = oracle::inflate(&mut stream.strm, Z_FINISH);
 
     let left = usize::try_from(stream.strm.avail_out).ok()?;
     Some(Decode {
@@ -1379,8 +1722,8 @@ fn oracle_chunked(
         stream.strm.avail_in = oracle::uInt::try_from(offer_in).ok()?;
         stream.strm.avail_out = oracle::uInt::try_from(offer_out).ok()?;
 
-        // SAFETY: as for `port_chunked`, against the oracle's own type and entry point.
-        status = unsafe { oracle::c_inflate(core::ptr::addr_of_mut!(stream.strm), Z_SYNC_FLUSH) };
+        // As for `port_chunked`, against the oracle's own type and entry point.
+        status = oracle::inflate(&mut stream.strm, Z_SYNC_FLUSH);
 
         let consumed = offer_in.checked_sub(usize::try_from(stream.strm.avail_in).ok()?)?;
         let produced = offer_out.checked_sub(usize::try_from(stream.strm.avail_out).ok()?)?;
@@ -1441,21 +1784,14 @@ fn oracle_decode(
 /// `destLen` is in-out: it carries the buffer's capacity in and the produced length out, which is
 /// why it is seeded from `dest.len()` on every call rather than once.
 fn port_uncompress(dest: &mut [u8], source: &[u8]) -> Option<Decode> {
-    let mut dest_len = libz_rs_sys::uLongf::try_from(dest.len()).ok()?;
-    let source_len = libz_rs_sys::uLong::try_from(source.len()).ok()?;
+    // Both lengths must be expressible as the C types before the call is worth making, and the
+    // two `try_from`s are what say so; the gate then seeds the in/out `destLen` from `dest.len()`
+    // itself and hands back what the call left there. `uncompress` allocates and frees its own
+    // stream internally and retains no pointer past the return.
+    let _dest_capacity = libz_rs_sys::uLongf::try_from(dest.len()).ok()?;
+    let _source_len = libz_rs_sys::uLong::try_from(source.len()).ok()?;
 
-    // SAFETY: `dest_len` bytes are writable at `dest.as_mut_ptr()` and `source_len` bytes readable
-    // at `source.as_ptr()`, both counts being those live slices' own lengths converted with
-    // `try_from`; `destLen` points at a live local that outlives the call. `uncompress` retains no
-    // pointer past the return and allocates and frees its own stream internally.
-    let status = unsafe {
-        libz_rs_sys::uncompress(
-            dest.as_mut_ptr(),
-            core::ptr::addr_of_mut!(dest_len),
-            source.as_ptr(),
-            source_len,
-        )
-    };
+    let (status, dest_len) = port::uncompress(dest, source);
 
     Some(Decode {
         status,
@@ -1468,19 +1804,12 @@ fn port_uncompress(dest: &mut [u8], source: &[u8]) -> Option<Decode> {
 /// The two-out-parameter form: `sourceLen` is in-out as well, reporting how much of the input was
 /// consumed, which is what lets a caller find the end of a stream inside a larger buffer.
 fn port_uncompress2(dest: &mut [u8], source: &[u8]) -> Option<Decode> {
-    let mut dest_len = libz_rs_sys::uLongf::try_from(dest.len()).ok()?;
-    let mut source_len = libz_rs_sys::uLong::try_from(source.len()).ok()?;
+    // As for `port_uncompress`, and here `sourceLen` is in/out as well: the gate returns it third,
+    // as the number of input bytes the call consumed.
+    let _dest_capacity = libz_rs_sys::uLongf::try_from(dest.len()).ok()?;
+    let _source_len = libz_rs_sys::uLong::try_from(source.len()).ok()?;
 
-    // SAFETY: as for `port_uncompress`, with `sourceLen` additionally pointing at a live local that
-    // outlives the call and is written with the number of input bytes consumed.
-    let status = unsafe {
-        libz_rs_sys::uncompress2(
-            dest.as_mut_ptr(),
-            core::ptr::addr_of_mut!(dest_len),
-            source.as_ptr(),
-            core::ptr::addr_of_mut!(source_len),
-        )
-    };
+    let (status, dest_len, _consumed) = port::uncompress2(dest, source);
 
     Some(Decode {
         status,
@@ -1490,19 +1819,12 @@ fn port_uncompress2(dest: &mut [u8], source: &[u8]) -> Option<Decode> {
 
 /// `uncompress` through the reference, reached as `c_uncompress`.
 fn oracle_uncompress(dest: &mut [u8], source: &[u8]) -> Option<Decode> {
-    let mut dest_len = oracle::uLongf::try_from(dest.len()).ok()?;
-    let source_len = oracle::uLong::try_from(source.len()).ok()?;
+    // As for `port_uncompress`, against the reference's own entry point and its own scalar aliases.
+    // Both are `core::ffi::c_ulong` on every supported target, so no width is assumed.
+    let _dest_capacity = oracle::uLongf::try_from(dest.len()).ok()?;
+    let _source_len = oracle::uLong::try_from(source.len()).ok()?;
 
-    // SAFETY: as for `port_uncompress`, against the reference's own entry point and its own scalar
-    // aliases. Both are `core::ffi::c_ulong` on every supported target, so no width is assumed.
-    let status = unsafe {
-        oracle::c_uncompress(
-            dest.as_mut_ptr(),
-            core::ptr::addr_of_mut!(dest_len),
-            source.as_ptr(),
-            source_len,
-        )
-    };
+    let (status, dest_len) = oracle::uncompress(dest, source);
 
     Some(Decode {
         status,
@@ -1512,18 +1834,11 @@ fn oracle_uncompress(dest: &mut [u8], source: &[u8]) -> Option<Decode> {
 
 /// `uncompress2` through the reference, reached as `c_uncompress2`.
 fn oracle_uncompress2(dest: &mut [u8], source: &[u8]) -> Option<Decode> {
-    let mut dest_len = oracle::uLongf::try_from(dest.len()).ok()?;
-    let mut source_len = oracle::uLong::try_from(source.len()).ok()?;
+    // As for `port_uncompress2`, against the reference's own entry point.
+    let _dest_capacity = oracle::uLongf::try_from(dest.len()).ok()?;
+    let _source_len = oracle::uLong::try_from(source.len()).ok()?;
 
-    // SAFETY: as for `port_uncompress2`, against the reference's own entry point.
-    let status = unsafe {
-        oracle::c_uncompress2(
-            dest.as_mut_ptr(),
-            core::ptr::addr_of_mut!(dest_len),
-            source.as_ptr(),
-            core::ptr::addr_of_mut!(source_len),
-        )
-    };
+    let (status, dest_len, _consumed) = oracle::uncompress2(dest, source);
 
     Some(Decode {
         status,
@@ -1810,10 +2125,11 @@ fn throughput_bytes(len: usize) -> Option<Throughput> {
 
 /// Samples per row.
 ///
-/// 50 rather than criterion's default 100. A default run registers about eighty-six rows across five
-/// groups, and 100 samples at the default five-second measurement would put a full run past twenty
-/// minutes -- long enough that it stops being run. Fifty samples still gives criterion enough to
-/// resample from for a usable confidence interval, and criterion refuses fewer than ten outright.
+/// 50 rather than criterion's default 100. Cost scales as rows x samples x per-sample time, and this
+/// file registers rows across five groups, so criterion's 100 samples at its default five-second
+/// measurement would put a full run far enough past a coffee break that it stops being run. Fifty
+/// samples still gives criterion enough to resample from for a usable confidence interval, and
+/// criterion refuses fewer than ten outright.
 const SAMPLE_SIZE: usize = 50;
 
 /// Warm-up per row: 1 second rather than the default 3.
@@ -1825,10 +2141,10 @@ const WARM_UP: Duration = Duration::from_secs(1);
 
 /// Measurement per row: 3 seconds rather than the default 5.
 ///
-/// With the warm-up that is about four seconds per row, and a full default run -- eighty-six rows --
-/// was measured at eight minutes. Pass `--sample-size`, `--warm-up-time` or `--measurement-time` on
-/// the command line to trade
-/// wall clock for precision, or filter to one group to spend the whole budget on one axis.
+/// With the warm-up that is about four seconds per row, so the cost of a run scales with the number
+/// of registered rows. Pass `--sample-size`, `--warm-up-time` or `--measurement-time` on the command
+/// line to trade wall clock for precision, or filter to one group to spend the whole budget on one
+/// axis.
 const MEASUREMENT: Duration = Duration::from_secs(3);
 
 /// Apply the budget above to a group.
@@ -1907,6 +2223,94 @@ fn indicative_ns<F: FnMut() -> bool>(mut op: F) -> Option<f64> {
     Some(best?.as_secs_f64() * NANOS_PER_SEC / f64::from(reps))
 }
 
+/// What a group's cases mean for [`GATE_RATIO`].
+///
+/// AAP §0.8.4 bounds one quantity here -- "decompression throughput" -- and two groups measure
+/// exactly that: [`GROUP_STEADY_STATE`] on the committed corpus and [`GROUP_SILESIA`] on the corpus
+/// the AAP names. Those are [`GatePolicy::Authoritative`], and a non-zero `over` on one of them is a
+/// verdict. [`GROUP_LIFECYCLE`] additionally times `inflateInit2_`/`inflateEnd`, [`GROUP_CONTAINER`]
+/// and [`GROUP_FEEDING`] vary an axis the gate holds fixed, and [`GROUP_ONE_SHOT`] measures the
+/// `uncompr.c` wrappers -- each is a real per-byte comparison worth counting, but none is the sentence
+/// the AAP wrote, so they are [`GatePolicy::Supporting`]. Both count identically into `gated` and
+/// `over`; the difference is published on the summary line so a consumer decides rather than guesses
+/// from a group name.
+///
+/// There is no informational variant here, unlike `benches/deflate_bench.rs`: every group in this
+/// file measures decompression of a payload, so the only cases outside the gate are the ones below
+/// [`GATE_MIN_BYTES`], which the per-case `gate=` field already marks. The `GATE-INVENTORY` line
+/// still prints an empty `informational_ratio=` key so that both suites parse under one rule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GatePolicy {
+    /// A case of at least [`GATE_MIN_BYTES`] counts, and this group IS the AAP §0.8.4 gate.
+    Authoritative,
+    /// A case of at least [`GATE_MIN_BYTES`] counts, but the group measures more or other than the
+    /// gate's quantity, so a regression here is a signal rather than a verdict.
+    Supporting,
+}
+
+impl GatePolicy {
+    /// The word this policy prints as on a `RATIO-SUMMARY` line.
+    const fn tag(self) -> &'static str {
+        match self {
+            Self::Authoritative => "authoritative",
+            Self::Supporting => "supporting",
+        }
+    }
+}
+
+/// Every group this file registers a ledger for, with the policy it is measured under.
+///
+/// THE source of truth for that classification: [`RatioLedger::for_group`] reads it and the
+/// `GATE-INVENTORY` line [`report_configuration`] prints reads the same rows, so the inventory a
+/// consumer checks against and the summary lines it enforces on cannot disagree.
+const RATIO_GROUP_POLICIES: [(&str, GatePolicy); 6] = [
+    (GROUP_STEADY_STATE, GatePolicy::Authoritative),
+    (GROUP_SILESIA, GatePolicy::Authoritative),
+    (GROUP_LIFECYCLE, GatePolicy::Supporting),
+    (GROUP_CONTAINER, GatePolicy::Supporting),
+    (GROUP_FEEDING, GatePolicy::Supporting),
+    (GROUP_ONE_SHOT, GatePolicy::Supporting),
+];
+
+/// The declared policy of `group`, or [`GatePolicy::Supporting`] with a loud line if it has none.
+///
+/// The fallback is the weaker of the two policies and is deliberately noisy rather than a panic: a
+/// group missing from [`RATIO_GROUP_POLICIES`] is a mistake in this file, and the effect of the
+/// fallback is that it cannot be mistaken for the gate -- it is absent from the inventory line's
+/// authoritative set, so a consumer requiring an exact set fails on it, with the reason in the same
+/// output.
+fn ratio_policy(group: &'static str) -> GatePolicy {
+    if let Some((_, policy)) = RATIO_GROUP_POLICIES.iter().find(|(name, _)| *name == group) {
+        return *policy;
+    }
+
+    eprintln!(
+        "{LOG_PREFIX} group={group} has no row in RATIO_GROUP_POLICIES, so it is reported as \
+         supporting and cannot be read as the gate. Add it to that table."
+    );
+    GatePolicy::Supporting
+}
+
+/// The names carrying `policy`, comma-joined, for the `GATE-INVENTORY` line.
+fn groups_with(policy: GatePolicy) -> String {
+    RATIO_GROUP_POLICIES
+        .iter()
+        .filter(|(_, declared)| *declared == policy)
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The number of cases a group set out to measure, as the ledger's `expected` field wants it.
+///
+/// Saturating rather than panicking, and the saturation is unreachable in practice: the largest
+/// product any group forms is a handful of fixtures times a handful of levels. A benchmark should not
+/// abort over its own bookkeeping, and `u32::MAX` would fail a `cases == expected` check just as
+/// loudly as a panic would.
+fn expected_cases(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
 /// Accumulates the per-case ratios of one group and prints the greppable lines CI consumes.
 ///
 /// The format is fixed and documented in the module header. Nothing here panics, exits or aborts on
@@ -1916,6 +2320,15 @@ fn indicative_ns<F: FnMut() -> bool>(mut op: F) -> Option<f64> {
 struct RatioLedger {
     /// The group name every line carries.
     group: &'static str,
+    /// Whether this group's `over` is the AAP §0.8.4 verdict or a supporting signal.
+    policy: GatePolicy,
+    /// How many cases the group set out to measure, from the same iteration counts its loops use.
+    ///
+    /// Published on the summary line so that a reader can tell "measured everything and nothing
+    /// regressed" from "measured nothing". Both print `over=0`, and without this field they are
+    /// indistinguishable -- which is exactly how a corpus that failed to load, a fixture directory
+    /// that was not there, or a filter that matched no case can read as a pass.
+    expected: u32,
     /// How many cases produced a ratio at all.
     cases: u32,
     /// How many of those had a payload of at least [`GATE_MIN_BYTES`] and so count against the gate.
@@ -1927,10 +2340,17 @@ struct RatioLedger {
 }
 
 impl RatioLedger {
-    /// An empty ledger for `group`.
-    const fn new(group: &'static str) -> Self {
+    /// An empty ledger for `group`, under the policy [`RATIO_GROUP_POLICIES`] declares for it.
+    ///
+    /// The policy is looked up rather than passed so that the table stays the only place a group's
+    /// standing is decided, which is what lets the `GATE-INVENTORY` line be checked against these
+    /// summary lines. `expected` is computed at the call site from the very collections that group's
+    /// loops iterate, so it is the loop's cardinality by construction.
+    fn for_group(group: &'static str, expected: u32) -> Self {
         Self {
             group,
+            policy: ratio_policy(group),
+            expected,
             cases: 0,
             gated: 0,
             over: 0,
@@ -1991,11 +2411,21 @@ impl RatioLedger {
     ///
     /// `cases` is `gated + informational`, and `over` counts only gated cases -- so a workflow that
     /// reads `over` from the `inflate_steady_state` line is reading exactly the AAP §0.8.4 gate.
+    ///
+    /// `gate` and `expected` are here so that the line can be checked rather than merely read.
+    /// `gate` says whether this group's `over` is a verdict or a signal, and `expected` says how many
+    /// cases the group set out to measure: `cases < expected` means something was skipped, and
+    /// `expected=0` means the group had nothing to measure at all. A consumer that requires
+    /// `cases == expected` and `expected > 0` on the authoritative groups cannot be fooled by a run
+    /// that measured nothing, which `over=0` on its own looks exactly like.
     fn finish(&self) {
         eprintln!(
-            "{LOG_PREFIX} {RATIO_SUMMARY_KEY} group={group} cases={cases} gated={gated} \
-             over={over} informational={informational} limit={GATE_RATIO:.2}",
+            "{LOG_PREFIX} {RATIO_SUMMARY_KEY} group={group} gate={gate} expected={expected} \
+             cases={cases} gated={gated} over={over} informational={informational} \
+             limit={GATE_RATIO:.2}",
             group = self.group,
+            gate = self.policy.tag(),
+            expected = self.expected,
             cases = self.cases,
             gated = self.gated,
             over = self.over,
@@ -2016,20 +2446,10 @@ impl RatioLedger {
 /// `zlib.h` L44 constant [`version_ptr`] passes, which is how a reader confirms the two agree
 /// character for character rather than merely in their first byte.
 fn oracle_version() -> Option<&'static str> {
-    // SAFETY: `zlibVersion` returns a pointer to `ZLIB_VERSION`, a string literal with static
-    // storage duration compiled into the oracle archive, so the pointee outlives the process and is
-    // never written through. It is documented never to return null, and the check below does not
-    // rely on that.
-    let raw = unsafe { oracle::c_zlibVersion() };
-    if raw.is_null() {
-        return None;
-    }
-
-    // SAFETY: `raw` is non-null, as just checked, and addresses that same NUL-terminated `'static`
-    // literal, so the string it describes is valid for reads for the whole program and the `'static`
-    // lifetime this borrow claims is honest.
-    let text = unsafe { CStr::from_ptr(raw) };
-    text.to_str().ok()
+    // The gate hands back what `c_zlibVersion` points at -- `ZLIB_VERSION`, a string literal with
+    // static storage duration compiled into the oracle archive -- as a `&'static CStr`, so the
+    // `'static` lifetime this function returns is the pointee's own rather than an assumption.
+    oracle::reference_version().to_str().ok()
 }
 
 /// Print the compiled configuration, the version handshake and the tier-2 state once, to stderr.
@@ -2060,13 +2480,57 @@ fn report_configuration() {
         eprintln!(
             "{LOG_PREFIX}   per-case lines are `{RATIO_KEY} group=... case=... bytes=... \
              port_ns=... oracle_ns=... ratio=... limit=... gate=counted|informational \
-             verdict=within|over`, one `{RATIO_SUMMARY_KEY}` line per group. Reported, never \
+             verdict=within|over`; then exactly one `{RATIO_SUMMARY_KEY}` line per declared group, \
+             carrying `gate=authoritative|supporting` and `expected=<cases the group set out to \
+             measure>` -- a group with nothing to measure still prints its line, with \
+             `expected=0`. Reported, never \
              enforced -- the workflow decides."
         );
         eprintln!(
             "{LOG_PREFIX}   only payloads of at least {GATE_MIN_BYTES} bytes are gate=counted: \
              below one page a decode is fixed cost rather than throughput, so those rows carry \
              their ratio but do not enter the `over` tally."
+        );
+
+        // The machine-readable half of everything above. A consumer of these lines needs three facts
+        // it cannot safely infer: which groups it is entitled to fail on, what the limit is, and
+        // where criterion put the measurements that actually decide the question. Printing them from
+        // the same constants and the same table the ledgers use means the two can be checked against
+        // each other -- and a consumer that requires the authoritative set it expects will fail if
+        // either side drifts, which is the point. `informational_ratio` is present and empty because
+        // no group here is outside the gate by name; keeping the key makes both suites parse under
+        // one rule.
+        eprintln!(
+            "{LOG_PREFIX} {INVENTORY_KEY} suite=inflate ratio_limit={GATE_RATIO:.2} \
+             min_bytes={GATE_MIN_BYTES} levels={levels} authoritative_ratio={auth_ratio} \
+             supporting_ratio={sup_ratio} informational_ratio=",
+            levels = LEVELS
+                .iter()
+                .map(c_int::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            auth_ratio = groups_with(GatePolicy::Authoritative),
+            sup_ratio = groups_with(GatePolicy::Supporting),
+        );
+
+        // ★ WHICH NUMBER DECIDES. The `RATIO` lines above are a self-timed diagnostic: a short
+        // calibration loop, a handful of rounds, best-of, no outlier rejection and no confidence
+        // interval. They exist so that every case has a visible number next to it even when criterion
+        // is filtered, and they are precise enough to see a factor but not to defend one.
+        //
+        // The measurement AAP §0.6.4.6 names is criterion's, and criterion writes it to disk rather
+        // than to this stream. So the location and the row layout are published here, because a
+        // consumer that has to guess them will guess wrong the first time the harness changes: for
+        // each group and case there are two rows, one per side, and the file under each is
+        // `new/estimates.json` with `slope` and `mean` point estimates in nanoseconds. `slope` is the
+        // one to prefer -- criterion fits it across the whole sample and its standard error was
+        // measured here at a third of `mean`'s on a loaded machine.
+        eprintln!(
+            "{LOG_PREFIX} {CRITERION_KEY} root={root} port_label={PORT_LABEL} \
+             oracle_label={ORACLE_LABEL} \
+             layout=<root>/<group>/<label>/<case>/new/estimates.json estimate=slope \
+             fallback=mean authority=criterion self_timed=diagnostic",
+            root = criterion_root().display(),
         );
 
         match oracle_version() {
@@ -2124,7 +2588,7 @@ fn report_configuration() {
 /// The stream is initialised once here, outside every timed closure, and `inflateReset2` returns it
 /// to the start of a stream inside the closure. `inflateReset2` keeps the window allocation when the
 /// window size is unchanged, so what is timed is the decode plus the cheap half of the lifecycle and
-/// not the allocator -- which is why this is the shape the AAP §0.8.4 gate is read from.
+/// not the allocator -- which is why this is the shape the AAP §0.8.4 ratio is read from.
 ///
 /// The reset is inside the timed region on purpose: it is what makes each iteration decode the same
 /// stream from its beginning rather than continue a finished one, so it is part of the work, not
@@ -2306,7 +2770,8 @@ fn measure_one_shot(
 //  The groups
 // =================================================================================================
 
-/// The group the AAP §0.8.4 gate is read from.
+/// The tier-1 group the ≤10% ratio is read from; see [`GROUP_SILESIA`] for the tier the
+/// acceptance measurement of AAP §0.8.4 comes from.
 const GROUP_STEADY_STATE: &str = "inflate_steady_state";
 
 /// The group that includes the per-stream setup cost.
@@ -2321,23 +2786,30 @@ const GROUP_FEEDING: &str = "inflate_feeding";
 /// The group that measures the `uncompr.c` wrappers.
 const GROUP_ONE_SHOT: &str = "uncompress_oneshot";
 
-/// The opt-in tier-2 group.
+/// The opt-in tier-2 group, and the one AAP §0.8.4's acceptance measurement is read from. Never
+/// registered in CI, because no job provisions the corpus.
 const GROUP_SILESIA: &str = "inflate_silesia";
 
 /// Steady-state decompression throughput, per fixture and per compression level.
 ///
-/// ★ This is the group the ≤10% gate of AAP §0.8.4 is read from. The container is zlib and the
-/// feeding is the reference driver's 32768-byte chunking, so the axis is exactly the one the gate
-/// names: the three levels AAP §0.8.4 lists, over every committed fixture whose decode profile
-/// differs.
+/// ★ This is the group the ≤10% ratio is read from on tier 1, and the only group the `bench` job of
+/// `.github/workflows/rust.yml` can gate, because it is the only one whose corpus is committed. The
+/// container is zlib and the feeding is the reference driver's 32768-byte chunking, so the axis is
+/// the one AAP §0.8.4 describes: the three levels it lists, over every committed fixture whose
+/// decode profile differs. The corpus, however, is not the one it names -- that is
+/// [`inflate_silesia`], which CI never runs.
 fn inflate_steady_state(c: &mut Criterion) {
     report_configuration();
 
     let mut group = c.benchmark_group(GROUP_STEADY_STATE);
     configure(&mut group);
-    let mut ledger = RatioLedger::new(GROUP_STEADY_STATE);
+    let fixtures = selected(&FIXTURE_NAMES);
+    let mut ledger = RatioLedger::for_group(
+        GROUP_STEADY_STATE,
+        expected_cases(fixtures.len() * LEVELS.len()),
+    );
 
-    for fixture in selected(&FIXTURE_NAMES) {
+    for fixture in &fixtures {
         for level in LEVELS {
             let id = format!("{name}-L{level}", name = fixture.name);
             let Some(case) = prepare(
@@ -2367,9 +2839,10 @@ fn inflate_lifecycle(c: &mut Criterion) {
 
     let mut group = c.benchmark_group(GROUP_LIFECYCLE);
     configure(&mut group);
-    let mut ledger = RatioLedger::new(GROUP_LIFECYCLE);
+    let fixtures = selected(&LIFECYCLE_FIXTURE_NAMES);
+    let mut ledger = RatioLedger::for_group(GROUP_LIFECYCLE, expected_cases(fixtures.len()));
 
-    for fixture in selected(&LIFECYCLE_FIXTURE_NAMES) {
+    for fixture in &fixtures {
         let id = format!("{name}-L{DEFAULT_LEVEL}", name = fixture.name);
         let Some(case) = prepare(
             id,
@@ -2399,9 +2872,13 @@ fn inflate_container(c: &mut Criterion) {
 
     let mut group = c.benchmark_group(GROUP_CONTAINER);
     configure(&mut group);
-    let mut ledger = RatioLedger::new(GROUP_CONTAINER);
+    let fixtures = selected(&AXIS_FIXTURE_NAMES);
+    let mut ledger = RatioLedger::for_group(
+        GROUP_CONTAINER,
+        expected_cases(fixtures.len() * CONTAINERS.len()),
+    );
 
-    for fixture in selected(&AXIS_FIXTURE_NAMES) {
+    for fixture in &fixtures {
         for container in CONTAINERS {
             let id = format!("{name}-{tag}", name = fixture.name, tag = container.tag());
             let Some(case) = prepare(
@@ -2433,9 +2910,13 @@ fn inflate_feeding(c: &mut Criterion) {
 
     let mut group = c.benchmark_group(GROUP_FEEDING);
     configure(&mut group);
-    let mut ledger = RatioLedger::new(GROUP_FEEDING);
+    let fixtures = selected(&AXIS_FIXTURE_NAMES);
+    let mut ledger = RatioLedger::for_group(
+        GROUP_FEEDING,
+        expected_cases(fixtures.len() * FEEDINGS.len()),
+    );
 
-    for fixture in selected(&AXIS_FIXTURE_NAMES) {
+    for fixture in &fixtures {
         for feeding in FEEDINGS {
             let id = format!("{name}-{tag}", name = fixture.name, tag = feeding.tag());
             let Some(case) = prepare(
@@ -2466,9 +2947,13 @@ fn uncompress_oneshot(c: &mut Criterion) {
 
     let mut group = c.benchmark_group(GROUP_ONE_SHOT);
     configure(&mut group);
-    let mut ledger = RatioLedger::new(GROUP_ONE_SHOT);
+    let fixtures = selected(&FIXTURE_NAMES);
+    let mut ledger = RatioLedger::for_group(
+        GROUP_ONE_SHOT,
+        expected_cases(fixtures.len() * ONE_SHOTS.len()),
+    );
 
-    for fixture in selected(&FIXTURE_NAMES) {
+    for fixture in &fixtures {
         for entry in ONE_SHOTS {
             let id = format!("{name}-{tag}", name = fixture.name, tag = entry.tag());
             let Some(case) = prepare(
@@ -2490,10 +2975,12 @@ fn uncompress_oneshot(c: &mut Criterion) {
 
 /// Steady-state throughput over the opt-in tier-2 corpus, or one note and nothing else.
 ///
-/// This is the corpus AAP §0.8.4 names for the throughput gate, and it is measured in the gate
-/// configuration only -- level 6, zlib, 32768-byte chunking -- because the container and feeding axes
-/// are already covered on tier 1, where a case costs milliseconds rather than seconds. Skipped
-/// entirely, with a single note from [`silesia_members`], when the corpus is not present.
+/// This is the corpus AAP §0.8.4 names, so this group is where its acceptance measurement is taken.
+/// It is measured in one configuration only -- level 6, zlib, 32768-byte chunking -- because the
+/// container and feeding axes are already covered on tier 1, where a case costs milliseconds rather
+/// than seconds. Skipped entirely, with a single note from [`silesia_members`], when the corpus is
+/// not present, which is the case in CI: no job fetches it, so nobody should treat a green CI bench
+/// run as this measurement having been taken.
 ///
 /// Each member is read, compressed, measured and dropped inside one loop iteration, so the peak
 /// memory is one member plus its compressed copy plus one output buffer rather than the whole
@@ -2503,12 +2990,18 @@ fn inflate_silesia(c: &mut Criterion) {
 
     let members = silesia_members();
     if members.is_empty() {
+        // A summary line even with nothing to summarise, so that EVERY group named in the
+        // `GATE-INVENTORY` line emits exactly one summary line in every run. A consumer can then
+        // require one line per declared group and read `expected=0` as "this group had no corpus",
+        // instead of having to treat a missing line as either an absent corpus or a broken run -- and
+        // an absent line is the one thing a parser cannot tell those two apart by.
+        RatioLedger::for_group(GROUP_SILESIA, 0).finish();
         return;
     }
 
     let mut group = c.benchmark_group(GROUP_SILESIA);
     configure(&mut group);
-    let mut ledger = RatioLedger::new(GROUP_SILESIA);
+    let mut ledger = RatioLedger::for_group(GROUP_SILESIA, expected_cases(members.len()));
 
     for path in members {
         let Some(name) = path.file_name().and_then(OsStr::to_str) else {
@@ -2520,22 +3013,10 @@ fn inflate_silesia(c: &mut Criterion) {
             continue;
         };
 
-        let bytes = match fs::read(path) {
-            Ok(bytes) if bytes.is_empty() => {
-                eprintln!(
-                    "{LOG_PREFIX} skipping Silesia member {name}: it is empty, and a zero-byte case \
-                     has no rate to report."
-                );
-                continue;
-            }
-            Ok(bytes) => bytes,
-            Err(error) => {
-                eprintln!(
-                    "{LOG_PREFIX} skipping Silesia member {name}: cannot read {}: {error}",
-                    path.display()
-                );
-                continue;
-            }
+        // Bounded by `silesia_member_ceiling()` before a byte is allocated; every rejection is a
+        // named note and this loop continues, exactly as the missing-member path does.
+        let Some(bytes) = silesia_member_bytes(path, name) else {
+            continue;
         };
 
         let id = format!("{name}-L{DEFAULT_LEVEL}");

@@ -120,8 +120,8 @@
 //! `crate::error`. Nothing here is `#[repr(C)]`, `#[no_mangle]` or `extern "C"`,
 //! and nothing here is a raw pointer -- turning these types back into the C
 //! `int`s a caller passed is the business of the `libz-rs-sys` facade, which is
-//! the only crate in the workspace allowed to **use** `unsafe`, and therefore the
-//! only one that can dereference a pointer or make an FFI call. (That is the
+//! the only shipped crate allowed to **use** `unsafe`, and therefore the only one
+//! that can dereference a pointer or make an FFI call in anything that ships. (That is the
 //! accurate form of the claim. This crate does hold two raw pointer *values* --
 //! `allocate::Opaque` and `gz::state::GzFileExposed::next` -- neither of which it
 //! can read through, and neither of which is in this module.) Every conversion is

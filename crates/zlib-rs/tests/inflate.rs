@@ -1,3 +1,11 @@
+// UNSAFE CONTAINMENT, and it is mechanical rather than a convention.  `crates/zlib-rs` is the
+// safe core: `src/lib.rs` carries `#![forbid(unsafe_code)]`, and its test suites carry it too, so
+// the property "the core and everything that exercises it contains no `unsafe`" is enforced by the
+// compiler in both halves.  The workspace's designated FFI boundary -- the only place a raw pointer
+// crosses into a foreign implementation -- is `crates/libz-rs-sys/src/**` for the shipped library
+// and `crates/zlib-rs-differential/src/{oracle,port}.rs` for the dev-only harness; an assertion
+// that needs one of those belongs in a suite of that package, not here.
+#![forbid(unsafe_code)]
 //! Integration tests for the decompressor: `crates/zlib-rs/src/inflate/**`.
 //!
 //! `inflate()` is the port's primary untrusted-input attack surface. Every byte it
@@ -2360,6 +2368,10 @@ fn build_gzip_member(
     comment: &[u8],
     payload: &[u8],
 ) -> Vec<u8> {
+    // RFC 1952's ISIZE modulus, declared here at the top of the scope rather than beside its
+    // use, because clippy::items_after_statements is denied for this workspace.
+    const ISIZE_MODULUS: u64 = 1 << 32;
+
     let mut member = vec![0x1f, 0x8b, 0x08, flg, 0, 0, 0, 0, 0, 0xff];
     if flg & FEXTRA != 0 {
         let len = u16::try_from(extra.len()).expect("the fixture extra field is short");
@@ -2380,7 +2392,14 @@ fn build_gzip_member(
     }
     member.extend_from_slice(&compress(payload, RAW));
     member.extend_from_slice(&crc32(0, payload).to_le_bytes());
-    let isize_field = u32::try_from(payload.len() % (1_usize << 32)).expect("modulo 2^32 fits");
+    // RFC 1952's ISIZE is the uncompressed size modulo 2^32.  The modulus is taken over
+    // `u64` rather than `usize` because `1_usize << 32` is an overflowing shift wherever
+    // `usize` is 32 bits wide -- and it is an `arithmetic_overflow` error rather than a
+    // warning, so this line refused to compile for a 32-bit target at all.  On such a
+    // target the reduction is the identity, which is exactly what the widened form
+    // computes, so the value is unchanged on every platform.
+    let payload_len = u64::try_from(payload.len()).expect("a fixture length fits in u64");
+    let isize_field = u32::try_from(payload_len % ISIZE_MODULUS).expect("modulo 2^32 fits");
     member.extend_from_slice(&isize_field.to_le_bytes());
     member
 }

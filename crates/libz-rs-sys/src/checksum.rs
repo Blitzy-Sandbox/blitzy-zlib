@@ -1087,15 +1087,40 @@ mod tests {
     }
 
     /// The high half of a `uLong` argument must be ignored, as the C bodies ignore it.
+    ///
+    /// ★ The three high halves are built with [`u32::checked_shl`] on a `uLong`, never
+    /// written as `1 << 32`. `uLong` is `c_ulong`, which is **32 bits on LLP64 Windows
+    /// and on every ILP32 target**, and a constant `1 << 32` on a 32-bit type is
+    /// `deny(arithmetic_overflow)` -- a hard *build* failure. The early return above
+    /// does not prevent it: the lint fires at codegen on the expression itself, not on
+    /// whether control ever reaches it, so an i686 or LLP64 `cargo build --tests` failed
+    /// before a single ABI test could run. `checked_shl` states the same fact without
+    /// writing an expression the target cannot hold -- on a 32-bit `uLong` it answers
+    /// `None` for every seed, which is precisely the "there is no high half" the early
+    /// return reports.
     #[test]
     fn the_high_bits_of_a_ulong_argument_are_ignored() {
+        /// Bit position the low half ends at: the boundary C's `(unsigned)` truncation cuts.
+        const HIGH_HALF_SHIFT: u32 = 32;
+
         if fits_in_32_bits(!0) {
             // LLP64 Windows: `uLong` has no high half, so there is nothing to ignore.
             return;
         }
         let data = pattern(64);
         let ptr = data.as_ptr();
-        let highs: [uLong; 3] = [1 << 32, 0xffff_ffff << 32, 0xdead_beef << 32];
+
+        let highs: Vec<uLong> = [1_u64, 0xffff_ffff, 0xdead_beef]
+            .into_iter()
+            .filter_map(|seed| uLong::try_from(seed).ok()?.checked_shl(HIGH_HALF_SHIFT))
+            .collect();
+        assert_eq!(
+            highs.len(),
+            3,
+            "a uLong wider than 32 bits must admit all three high halves; the early \
+             return above is what covers a 32-bit uLong"
+        );
+
         for high in highs {
             for low in [0, 1, 5, 0xffff, 0x1234_abcd, 0xffff_ffff] {
                 // SAFETY: 64 live bytes, 64 bytes read, `data` outlives the loop.

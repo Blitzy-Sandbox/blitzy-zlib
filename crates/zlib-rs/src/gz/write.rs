@@ -1673,9 +1673,10 @@ mod tests {
 
     /// Decompresses a concatenation of gzip members, the way `gzread` does.
     ///
-    /// `gz/read.rs` is the module that will do this for real; until it exists, the decoder is driven
-    /// directly, which is a stronger check anyway: it proves the bytes are a well-formed RFC 1952
-    /// stream rather than merely something this implementation's own reader happens to accept. Each member
+    /// `gz/read.rs` is the module that does this for real, and it is deliberately not used here:
+    /// driving the decoder directly is the stronger check, because it proves the bytes are a
+    /// well-formed RFC 1952 stream rather than merely something this implementation's own reader
+    /// happens to accept. Each member
     /// ends with `Z_STREAM_END`, after which `inflate_reset` starts the next one -- which is exactly
     /// what `zlib.h` L1654-L1657 promises about a `gzflush(Z_FINISH)` followed by more writes.
     fn gunzip(bytes: &[u8]) -> Vec<u8> {

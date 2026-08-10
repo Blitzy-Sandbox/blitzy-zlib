@@ -22,6 +22,11 @@
 # To compare the exported symbols of that library against the C one, which
 # is the gate that proves an already-linked consumer can bind to it, type:
 #    make rust-symbols
+# To emit the pkg-config descriptor for the staged library -- the C one plus the
+# single Libs.private key a Rust static archive needs, derived for the target
+# being built -- and then compile, link and run a C consumer from nothing but
+# the flags pkg-config answers for it, type:
+#    make rust-pc
 # To regenerate the C header from the Rust facade with cbindgen and hold that
 # artifact to the header gate -- an enumerated warning allowance, a standalone
 # compile as C89, C99, C17 and C++17 with warnings as errors, and a comparison
@@ -36,29 +41,41 @@
 # See the comment above the `rust-test' rule for what those checks do and do
 # not establish; several verification gates named in the port's plan are not
 # among them.
-# All six targets are standalone on purpose: no C target depends on
+# All seven targets are standalone on purpose: no C target depends on
 # them, because the C library is the reference the Rust port is diffed
-# against and has to stay buildable and green on its own.  When no cargo is
-# available configure leaves CARGO empty; `rust', `rust-test' and `rust-msrv'
-# then refuse and exit nonzero, naming the remedy, because an explicit request to
-# build, test or MSRV-check the Rust library must not be reported as done when it
-# cannot be honoured.  `rust-header' refuses on the same principle, and needs two
+# against and has to stay buildable and green on its own.  Among themselves two
+# do depend on `rust', which stages the library they read -- `rust-test' and
+# `rust-pc' -- and `rust-test' depends on `rust-pc' as well, so a green run of
+# it covers the packaging descriptor too.  When no cargo is available configure
+# leaves CARGO empty; `rust', `rust-test' and `rust-msrv' then refuse and exit
+# nonzero, naming the remedy, because an explicit request to build, test or
+# MSRV-check the Rust library must not be reported as done when it cannot be
+# honoured.  `rust-header' refuses on the same principle, and needs two
 # things `rust' does not: cbindgen, and a cargo reachable on PATH -- cbindgen
 # resolves `--crate' through `cargo metadata', so a $(CARGO) that names an
 # executable outside PATH is not enough for it.  `rust-clean' still succeeds,
 # because removing the staged library needs no cargo.
 
 #
-# To select the vectorised checksum backends, set ZLIB_RS_SIMD in the
+# To select the alternative checksum backends, set ZLIB_RS_SIMD in the
 # environment (or on the command line) when running either Rust target:
 #    ZLIB_RS_SIMD=1 make rust
 # 1 adds the `simd' Cargo feature to every package the target builds, 0 (or
 # leaving it unset) builds the scalar backends, and anything else is an
 # error.  It has to be resolved here rather than inside a build script,
-# because Cargo settles the feature graph before any build script runs.  SIMD
-# is confined to CRC-32 and Adler-32 and is output neutral: a checksum yields
-# one scalar however it is computed, so it changes speed only, never a single
-# emitted byte.
+# because Cargo settles the feature graph before any build script runs.
+#
+# The feature name says SIMD; what it selects is portable integer code written
+# in a shape LLVM can autovectorise at opt-level 3, with no architecture
+# intrinsic in it -- that is what lets the safe core keep forbid(unsafe_code) --
+# so whether vector instructions are emitted is a property of the compiler and
+# the target rather than something this option guarantees.  Nor is either backend
+# chosen by probing the CPU: the CRC-32 one performs no run-time feature test at
+# all, and the Adler-32 one consults an is_supported() that is a throughput hint,
+# never a correctness gate.  What IS guaranteed is the answer.  The feature is
+# confined to CRC-32 and Adler-32 and is output neutral: a checksum yields one
+# scalar however it is computed, so it changes speed only, never a single emitted
+# byte.
 
 CC=cc
 GCOV=GCOV
@@ -104,7 +121,7 @@ TAR=tar
 SHELL=/bin/sh
 EXE=
 
-# Rust workspace.  The variables below drive the `rust', `rust-test',
+# Rust workspace.  The variables below drive the `rust', `rust-pc', `rust-test',
 # `rust-symbols' and `rust-clean' targets; no C target reads any of them.
 #
 # Only CARGO is substituted by configure, through a
@@ -130,8 +147,11 @@ EXE=
 #                      SHIPPED crates on purpose -- see the comment above that
 #                      rule for why --workspace cannot resolve at the floor.
 #   RUSTMSRV           The MSRV floor toolchain `rust-msrv' checks against.
-#                      MUST equal `rust-version' in Cargo.toml and `msrv' in
-#                      clippy.toml.
+#                      MUST equal `rust-version' in the root Cargo.toml, which
+#                      both shipped crates inherit.  clippy.toml declares no
+#                      `msrv' key -- deliberately, so that clippy reads each
+#                      package's own `rust-version' -- so there is no third
+#                      value to keep in step.
 #   RUSTMSRVFLAGS      RUSTFLAGS for that check; `-D warnings' is the point of
 #                      the target.
 #   RUSTTARGETDIR      Cargo's target directory, relative to the build
@@ -409,10 +429,46 @@ EXE=
 #                      log and the two name lists are the evidence.
 #                      `rust-clean' removes them, and .gitignore carries an
 #                      anchored rule for each.
+#   RUSTC              The Rust compiler `rust-pc' asks for the target's native
+#                      static library list.  Only that: nothing here compiles
+#                      Rust code with it, cargo does that.  It is a separate
+#                      variable from $(CARGO) because a cross build can name a
+#                      cargo wrapper while still wanting the plain rustc, and
+#                      because the probe has to be answerable when the list is
+#                      the only thing wanted.
+#   RUSTPKGCONFIG      The pkg-config implementation the static-consumer gate in
+#                      `rust-pc' drives.  pkgconf answers the same options and
+#                      works unchanged.  When it is absent the gate says so and
+#                      skips the link leg; the content checks on the generated
+#                      descriptor do not need it and always run.
+#   RUSTPC             The pkg-config descriptor `rust-pc' generates for the
+#                      STAGED RUST LIBRARY, in $(RUSTLIBDIR) beside the library
+#                      it describes.  It is named zlib.pc because that is the
+#                      name `pkg-config zlib' looks for, and it lives in the
+#                      packaging directory rather than the build root so that it
+#                      cannot be confused with -- or overwrite -- the
+#                      configure-generated zlib.pc, which describes the C
+#                      library and must keep advertising no private libraries at
+#                      all.  A packager installing the staged Rust library
+#                      installs THIS file into $(pkgconfigdir) in place of that
+#                      one; `rust-pc' prints the copy command it should use.
+#   RUSTPCPRIVATE      The private library list to advertise, stated rather than
+#                      probed.  Empty by default, which means `rust-pc' derives
+#                      it from $(RUSTC) for the target being built -- the list
+#                      is target-specific and a literal would be wrong on the
+#                      next target along.  Set it when rustc cannot be run for
+#                      the target, or to pin a known-good list:
+#                          make rust-pc RUSTPCPRIVATE='-lm -lpthread -lc'
+#   RUSTPCGATE         Where the static-consumer gate builds its consumer.  A
+#                      directory holding the staged archive, the two headers and
+#                      a copy of $(RUSTPC) rewritten to point at itself, so that
+#                      -lz can only resolve to the archive under test and never
+#                      to a system libz.  Inside $(RUSTLIBDIR), so `rust-clean'
+#                      removes it with everything else staged there.
 CARGO=cargo
 CARGO_BUILD_FLAGS=--locked --release
 CARGO_TEST_FLAGS=--locked --workspace --release
-CARGO_MSRV_FLAGS=--locked -p zlib-rs -p libz-rs-sys --all-targets
+CARGO_MSRV_FLAGS=--locked -p zlib-rs -p libz-rs-sys --all-features --all-targets
 RUSTMSRV=1.80
 RUSTMSRVFLAGS=-D warnings
 RUSTTARGETDIR=target
@@ -420,6 +476,14 @@ RUSTDIR=
 RUSTLIBDIR=$(RUSTTARGETDIR)/dropin
 RUSTNM=nm
 RUSTOBJCOPY=objcopy
+# rustc is the only thing that knows which native libraries a Rust staticlib has
+# to be linked against, and the set is target-specific.  The `rust' target asks
+# it and reports the answer beside the staged libz.a, because zlib.pc cannot: it
+# is written by configure, which runs before anyone decides whether to build the
+# Rust library at all.  Overridable for a cross build, and a probe that cannot
+# run is reported rather than fatal -- the archive is already staged and correct
+# by then, and only the advice would be missing.
+RUSTC=rustc
 RUSTSHIMDIR=$(SRCDIR)crates/libz-rs-sys/csrc
 RUSTSHIMSYMS= gzprintf gzvprintf inflate_table
 RUSTSHIMFLAGS=-fPIC -DPIC
@@ -450,6 +514,11 @@ RUSTHEADERNOGEN=$(RUSTWINONLY)
 RUSTHEADEREXTRAOK=
 RUSTHEADERSCRATCH=$(RUSTHEADER).warn $(RUSTHEADER).log $(RUSTHEADER).probe.c \
 	$(RUSTHEADER).ref $(RUSTHEADER).gen
+RUSTC=rustc
+RUSTPKGCONFIG=pkg-config
+RUSTPC=$(RUSTLIBDIR)/zlib.pc
+RUSTPCPRIVATE=
+RUSTPCGATE=$(RUSTLIBDIR)/pc-gate
 
 # The variadic ABI boundary.  `gzprintf' is variadic and `gzvprintf' takes a
 # va_list, and stable Rust can define neither -- `c_variadic' and
@@ -751,6 +820,20 @@ cover: infcover
 # built here.  `--features libz-compat' is likewise package-scoped: with several
 # packages selected cargo applies a bare feature name only to the ones that
 # declare it, so naming the crate is what makes the command say what it means.
+#
+# .PHONY BELOW IS REQUIRED, NOT TIDINESS.  `rust' is also the name of a directory
+# in this tree -- rust/README.md, the developer guide -- and make treats a target
+# whose name matches an existing file or directory as up to date when it has no
+# prerequisites.  Without the declaration, `make rust' prints "'rust' is up to
+# date", runs nothing, and still exits 0: a silent no-op, which is worse than an
+# error because every caller downstream of it, `make rust-test' and
+# `make rust-symbols' included, then reports success against an unstaged library.
+# The whole rust* family is declared rather than just `rust', so a later addition
+# under any of these names cannot reintroduce the same trap.  The forwarding copy
+# of these targets in the pre-configure `Makefile' carries the same declaration
+# and the same reason; keep the two in step.
+.PHONY: rust rust-test rust-symbols rust-header rust-msrv rust-clean
+
 rust:
 	@if test -z "$(CARGO)"; then \
 	  echo 'make rust: no Rust toolchain -- $$(CARGO) is empty' >&2; \
@@ -878,6 +961,32 @@ rust:
 	  fi; \
 	done; \
 	echo "		$(STATICLIB) defines the C-ABI shim symbols cargo compiled:$(RUSTSHIMSYMS)"; \
+	if $(RUSTC) --version >/dev/null 2>&1; then \
+	  printf '#[no_mangle]\npub extern "C" fn zlib_rs_native_static_libs_probe() -> i32 { 0 }\n' \
+	    > $(RUSTLIBDIR)/nsl-probe.rs; \
+	  if $(RUSTC) --print native-static-libs --crate-type staticlib \
+	      -o $(RUSTLIBDIR)/libnsl-probe.a $(RUSTLIBDIR)/nsl-probe.rs \
+	      > $(RUSTLIBDIR)/nsl.log 2>&1; then \
+	    NSL=`sed -n 's/.*native-static-libs: *//p' $(RUSTLIBDIR)/nsl.log \
+	         | sed -n '1p'`; \
+	  else \
+	    NSL=''; \
+	  fi; \
+	  rm -f $(RUSTLIBDIR)/nsl-probe.rs $(RUSTLIBDIR)/libnsl-probe.a \
+	    $(RUSTLIBDIR)/nsl.log; \
+	else \
+	  NSL=''; \
+	fi; \
+	if test -n "$$NSL"; then \
+	  echo "		static-linking $(STATICLIB) additionally needs:$$NSL"; \
+	  echo '		(from `$(RUSTC) --print native-static-libs'"'"'; target-specific, and'; \
+	  echo '		not advertised by the configure-generated zlib.pc -- the CMake'; \
+	  echo '		build puts the same set in its own Libs.private: instead)'; \
+	else \
+	  echo '		could not ask $(RUSTC) which native libraries $(STATICLIB) needs'; \
+	  echo '		beside it; run `$(RUSTC) --print native-static-libs'"'"' yourself before'; \
+	  echo '		static-linking it, or pass RUSTC=<path>'; \
+	fi; \
 	sed -n 's/^ *ZEXTERN[^(]*[ *]\([A-Za-z_][A-Za-z0-9_]*\) *(.*/\1/p' \
 	  $(SRCDIR)zlib.h | sort -u > $(RUSTLIBDIR)/public.syms; \
 	printf '%s\n%s\n' "$$SOV" "$$SOM" > $(RUSTLIBDIR)/soname.stage; \
@@ -1143,6 +1252,390 @@ rust:
 	  echo '		*** zlib Rust ABI parity FAILED ***'; false; \
 	fi
 
+# Generate the pkg-config descriptor for the STAGED RUST LIBRARY, then prove a
+# static consumer can be built from nothing but that descriptor.
+#
+# WHY A SECOND DESCRIPTOR EXISTS AT ALL.  For DYNAMIC linking one descriptor
+# serves both implementations: -lz resolves to either library, and a shared
+# object records its own dependencies in DT_NEEDED, so the loader needs nothing
+# advertised.  Static linking is where they part.  The C libz.a needs no
+# companion libraries -- which is why the configure-generated zlib.pc carries no
+# Libs.private line, and why adding one there would be wrong -- while a Rust
+# staticlib carries the Rust runtime and needs that runtime's own native
+# libraries on the link line.  Measured on x86_64-unknown-linux-gnu:
+#
+#     -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc
+#
+# That set is TARGET-SPECIFIC, so this target derives it with
+# `$(RUSTC) --print native-static-libs' for the target being built rather than
+# carrying a literal.  A literal would be wrong on the next target along, and
+# wrong in the direction that fails to link.
+#
+# One file could not do both jobs: $(SRCDIR)zlib.pc.in and
+# $(SRCDIR)zlib.pc.cmakein are each shared by the two implementations, so the
+# only correct place for a Rust-specific key is a Rust-specific file, emitted by
+# the Rust packaging step.  $(RUSTPC) is therefore generated FROM the C
+# descriptor: everything except the added Libs.private line is copied byte for
+# byte, and this recipe asserts that Name, Version, Requires, Libs and Cflags
+# came through unchanged.  The two descriptors differ in exactly one key.
+#
+# WHAT IS AND IS NOT INSTALLED.  This build stages rather than installs the Rust
+# library -- `install' installs the C one -- so this target writes the descriptor
+# beside the library it describes, in $(RUSTLIBDIR), and prints the copy a
+# packager of the staged tree must perform.  The CMake build, which does install
+# the Rust artifacts, generates and installs the equivalent file itself, from
+# rules declared last so that it wins over the C zlib.pc exactly as the Rust
+# libraries win over the C ones.
+#
+# THE GATE, AND WHY IT IS SHAPED THIS WAY.  A descriptor is only as good as what
+# a consumer gets from it, so this target builds one: $(RUSTPCGATE) receives the
+# staged archive, the two public headers and a copy of $(RUSTPC) whose five path
+# variables point at that directory, and a C program is compiled with the -I
+# flags `pkg-config --cflags' answers and linked with the -L and -l flags
+# `pkg-config --static --libs' answers.  Nothing else is added to either line, so
+# a missing Libs.private is a failing link rather than a silent pass.
+#
+# The gate directory holds libz.a and NO libz.so, which is what makes the result
+# unambiguous: ld searches each -L directory in turn and takes the first match,
+# so -lz can only be the archive under test.  `ldd' then has to report no
+# dynamic libz at all, and the program itself checks that zlibVersion() returns
+# this tree's ZLIB_VERSION, round-trips through compress2/uncompress, agrees with
+# itself across crc32 and crc32_z, and drives the gzip layer -- gzprintf, whose
+# implementation is the C shim inside the archive, then gzgetc, which is a MACRO
+# in $(SRCDIR)zlib.h that reads g->have, g->next and g->pos in the consumer own
+# compiled code and therefore only works if the staged library reproduces the
+# gzFile_s prefix layout.  A static link is the strictest place to check that.
+#
+# It also asserts the opposite direction: the private libraries must NOT appear
+# in `pkg-config --libs', because dynamic consumption is unchanged by this file
+# and a private library leaking into the public answer would over-link every
+# dynamic consumer.
+#
+# pkg-config being absent is not a failure.  The descriptor is still generated
+# and every check on its contents still runs; only the link leg is skipped, and
+# the skip is printed rather than silent.
+rust-pc: rust
+	@set -e; \
+	LC_ALL=C; export LC_ALL; \
+	$(RUSTPATHGUARD); \
+	if test ! -f $(RUSTLIBDIR)/$(STATICLIB); then \
+	  echo 'make rust-pc: $(RUSTLIBDIR)/$(STATICLIB) is not staged, so there is no' >&2; \
+	  echo 'make rust-pc: archive for a descriptor to describe.  The rust target' >&2; \
+	  echo 'make rust-pc: stages it, and make runs that target as a prerequisite of' >&2; \
+	  echo 'make rust-pc: this one, so reaching here means it failed.' >&2; \
+	  exit 1; \
+	fi; \
+	PRIVATE='$(RUSTPCPRIVATE)'; \
+	TARGETDESC=; \
+	if test -n "$$PRIVATE"; then \
+	  TARGETDESC='stated in RUSTPCPRIVATE for the target being built'; \
+	  echo "		Libs.private stated by RUSTPCPRIVATE, not probed: $$PRIVATE"; \
+	else \
+	  triple=; want=; \
+	  for arg in $(CARGO_BUILD_FLAGS); do \
+	    if test -n "$$want"; then eval "$$want=\$$arg"; want=; continue; fi; \
+	    case "$$arg" in \
+	      --target) want=triple ;; \
+	      --target=*) triple=`expr "$$arg" : '--target=\(.*\)'` ;; \
+	    esac; \
+	  done; \
+	  if ! command -v $(RUSTC) > /dev/null 2>&1; then \
+	    echo 'make rust-pc: $(RUSTC) is unavailable, so the native static library' >&2; \
+	    echo 'make rust-pc: list cannot be derived.  It is target-specific, so this' >&2; \
+	    echo 'make rust-pc: recipe will not guess it.  Name the compiler, or state' >&2; \
+	    echo 'make rust-pc: the list:' >&2; \
+	    echo 'make rust-pc:     make rust-pc RUSTC=/path/to/rustc' >&2; \
+	    echo 'make rust-pc:     make rust-pc RUSTPCPRIVATE="-lm -lpthread -lc"' >&2; \
+	    exit 1; \
+	  fi; \
+	  tflag=; test -z "$$triple" || tflag="--target $$triple"; \
+	  : > $(RUSTLIBDIR)/pc-probe.rs; \
+	  if $(RUSTC) --print native-static-libs --crate-type staticlib $$tflag \
+	      -o /dev/null $(RUSTLIBDIR)/pc-probe.rs \
+	      > $(RUSTLIBDIR)/pc-probe.log 2>&1; then \
+	    :; \
+	  elif $(RUSTC) --print native-static-libs --crate-type staticlib $$tflag \
+	      -o $(RUSTLIBDIR)/pc-probe.a $(RUSTLIBDIR)/pc-probe.rs \
+	      > $(RUSTLIBDIR)/pc-probe.log 2>&1; then \
+	    rm -f $(RUSTLIBDIR)/pc-probe.a; \
+	  else \
+	    sed 's/^/		/' $(RUSTLIBDIR)/pc-probe.log >&2; \
+	    echo 'make rust-pc: the probe above failed, so the native static library' >&2; \
+	    echo 'make rust-pc: list is unknown.  State it instead:' >&2; \
+	    echo 'make rust-pc:     make rust-pc RUSTPCPRIVATE="-lm -lpthread -lc"' >&2; \
+	    exit 1; \
+	  fi; \
+	  PRIVATE=`sed -n 's/^note: native-static-libs: *//p' $(RUSTLIBDIR)/pc-probe.log \
+	    | sed -n 1p`; \
+	  rm -f $(RUSTLIBDIR)/pc-probe.rs; \
+	  if test -z "$$PRIVATE"; then \
+	    sed 's/^/		/' $(RUSTLIBDIR)/pc-probe.log >&2; \
+	    echo 'make rust-pc: $(RUSTC) printed no native-static-libs note above, so' >&2; \
+	    echo 'make rust-pc: nothing can be advertised.  A silently empty' >&2; \
+	    echo 'make rust-pc: Libs.private is the defect this target exists to' >&2; \
+	    echo 'make rust-pc: prevent, so this is a failure rather than a skip.' >&2; \
+	    exit 1; \
+	  fi; \
+	  rm -f $(RUSTLIBDIR)/pc-probe.log; \
+	  TARGETDESC="derived with $(RUSTC) for $${triple:-this build host target}"; \
+	  echo "		Libs.private $$TARGETDESC: $$PRIVATE"; \
+	fi; \
+	BASE=$(RUSTLIBDIR)/pc-base; \
+	if test -f zlib.pc; then \
+	  cp zlib.pc "$$BASE"; \
+	  ORIGIN='zlib.pc, as ./configure generated it in this build directory'; \
+	else \
+	  ZVER=`$(RUSTZVERCMD)`; \
+	  if test -z "$$ZVER"; then \
+	    echo 'make rust-pc: no ZLIB_VERSION in $(SRCDIR)zlib.h, so the Version field' >&2; \
+	    echo 'make rust-pc: cannot be filled.  That macro is the library version' >&2; \
+	    echo 'make rust-pc: identity and the header must not be edited.' >&2; \
+	    exit 1; \
+	  fi; \
+	  sed -e 's|^prefix *=.*|prefix=$(prefix)|' \
+	      -e 's|^exec_prefix *=.*|exec_prefix=$(exec_prefix)|' \
+	      -e 's|^libdir *=.*|libdir=$(libdir)|' \
+	      -e 's|^sharedlibdir *=.*|sharedlibdir=$(sharedlibdir)|' \
+	      -e 's|^includedir *=.*|includedir=$(includedir)|' \
+	      -e "s|@VERSION@|$$ZVER|g" \
+	      $(SRCDIR)zlib.pc.in > "$$BASE"; \
+	  ORIGIN='$(SRCDIR)zlib.pc.in, substituted from this Makefile because no zlib.pc exists yet'; \
+	fi; \
+	if grep -q '^Libs\.private' "$$BASE"; then \
+	  echo 'make rust-pc: the C descriptor already carries a Libs.private line.' >&2; \
+	  echo 'make rust-pc: It must not: the C libz.a needs no companion libraries,' >&2; \
+	  echo 'make rust-pc: and this recipe adds that key for the Rust archive only.' >&2; \
+	  echo 'make rust-pc: Source: '"$$ORIGIN" >&2; \
+	  exit 1; \
+	fi; \
+	{ printf '%s\n' \
+	  '# GENERATED FILE -- do not edit.  Regenerate it with: make rust-pc' \
+	  '#' \
+	  '# This descriptor describes the STAGED RUST LIBRARY in this directory, not' \
+	  '# the C one.  It is a copy of' \
+	  "#     $$ORIGIN" \
+	  '# with exactly one line added: Libs.private, carrying the native libraries a' \
+	  '# Rust staticlib needs on this target.  prefix, libdir, Name, Description,' \
+	  '# Version, License, Requires, Libs and Cflags are that file byte for byte,' \
+	  '# because dynamic consumption of the two implementations is identical and' \
+	  '# only static consumption differs.' \
+	  '#' \
+	  '# The Libs.private list below is TARGET-SPECIFIC.  Do not copy it to' \
+	  '# another target; derive it there.  This one was' \
+	  "#     $$TARGETDESC" \
+	  '#' \
+	  '# INSTALL THIS FILE IN PLACE OF the C zlib.pc whenever the staged Rust' \
+	  '# library is the one being installed:' \
+	  "#     cp $(RUSTPC) \$$DESTDIR$(pkgconfigdir)/zlib.pc" \
+	  '# Leaving the C descriptor in place beside a Rust libz.a is the failure this' \
+	  '# file exists to prevent: pkg-config --static --libs would answer -lz alone,' \
+	  '# and a consumer that believed it would fail to link.'; \
+	  awk -v priv="$$PRIVATE" '{ print } /^Libs:/ { print "Libs.private: " priv }' \
+	    "$$BASE"; \
+	} > $(RUSTPC); \
+	rm -f "$$BASE"; \
+	NPRIV=`grep -c '^Libs\.private:' $(RUSTPC)`; \
+	if test "$$NPRIV" -ne 1; then \
+	  echo "make rust-pc: $(RUSTPC) carries $$NPRIV Libs.private lines, not 1." >&2; \
+	  echo 'make rust-pc: pkg-config reads the first and ignores the rest, so a' >&2; \
+	  echo 'make rust-pc: second one hides whichever it shadows.' >&2; \
+	  exit 1; \
+	fi; \
+	LINE=`sed -n 's/^Libs\.private: *//p' $(RUSTPC)`; \
+	for lib in $$PRIVATE; do \
+	  case " $$LINE " in \
+	    *" $$lib "*) ;; \
+	    *) echo "make rust-pc: $$lib is missing from the generated Libs.private" >&2; \
+	       echo "make rust-pc:     Libs.private: $$LINE" >&2; \
+	       exit 1;; \
+	  esac; \
+	done; \
+	echo "		Libs.private: $$LINE"; \
+	for key in Name Description Version License Requires Libs Cflags; do \
+	  a=`sed -n "s/^$$key: *//p" $(RUSTPC)`; \
+	  b=`sed -n "s/^$$key: *//p" zlib.pc 2>/dev/null || true`; \
+	  if test -f zlib.pc && test "$$a" != "$$b"; then \
+	    echo "make rust-pc: the $$key field diverged from the C zlib.pc:" >&2; \
+	    echo "make rust-pc:     C   : $$b" >&2; \
+	    echo "make rust-pc:     Rust: $$a" >&2; \
+	    echo 'make rust-pc: only Libs.private may differ between the two.' >&2; \
+	    exit 1; \
+	  fi; \
+	done; \
+	if test -f zlib.pc; then \
+	  echo '		every other field is the C zlib.pc byte for byte'; \
+	fi; \
+	GATE=$(RUSTPCGATE); \
+	rm -rf "$$GATE"; \
+	mkdir -p "$$GATE/lib" "$$GATE/include" "$$GATE/pkgconfig"; \
+	cp $(RUSTLIBDIR)/$(STATICLIB) "$$GATE/lib/$(STATICLIB)"; \
+	cp $(SRCDIR)zlib.h "$$GATE/include/zlib.h"; \
+	if test -f zconf.h; then \
+	  cp zconf.h "$$GATE/include/zconf.h"; \
+	elif test -f $(SRCDIR)zconf.h; then \
+	  cp $(SRCDIR)zconf.h "$$GATE/include/zconf.h"; \
+	else \
+	  echo 'make rust-pc: no zconf.h in this build directory or beside zlib.h, so' >&2; \
+	  echo 'make rust-pc: the consumer cannot be compiled.  Run ./configure first.' >&2; \
+	  exit 1; \
+	fi; \
+	GATEABS=`cd "$$GATE" && pwd`; \
+	sed -e "s|^prefix *=.*|prefix=$$GATEABS|" \
+	    -e "s|^exec_prefix *=.*|exec_prefix=$$GATEABS|" \
+	    -e "s|^libdir *=.*|libdir=$$GATEABS/lib|" \
+	    -e "s|^sharedlibdir *=.*|sharedlibdir=$$GATEABS/lib|" \
+	    -e "s|^includedir *=.*|includedir=$$GATEABS/include|" \
+	    $(RUSTPC) > "$$GATE/pkgconfig/zlib.pc"; \
+	for key in Libs Libs.private Cflags; do \
+	  a=`sed -n "s/^$$key: *//p" $(RUSTPC)`; \
+	  b=`sed -n "s/^$$key: *//p" "$$GATE/pkgconfig/zlib.pc"`; \
+	  if test "$$a" != "$$b"; then \
+	    echo "make rust-pc: the gate copy changed the $$key line, so it would not" >&2; \
+	    echo 'make rust-pc: be exercising the descriptor that gets installed.' >&2; \
+	    exit 1; \
+	  fi; \
+	done; \
+	if ! command -v $(RUSTPKGCONFIG) > /dev/null 2>&1; then \
+	  echo '		$(RUSTPKGCONFIG) is unavailable, so the static consumer was NOT'; \
+	  echo '		linked.  The descriptor above was generated and its contents'; \
+	  echo '		checked; what is untested is whether a consumer built from it'; \
+	  echo '		links.  Install pkg-config, or name one:'; \
+	  echo '		    make rust-pc RUSTPKGCONFIG=pkgconf'; \
+	  echo '		*** zlib Rust pkg-config descriptor OK, consumer gate SKIPPED ***'; \
+	  exit 0; \
+	fi; \
+	PKG_CONFIG_PATH="$$GATEABS/pkgconfig"; export PKG_CONFIG_PATH; \
+	PKG_CONFIG_LIBDIR="$$GATEABS/pkgconfig"; export PKG_CONFIG_LIBDIR; \
+	if ! $(RUSTPKGCONFIG) --exists zlib; then \
+	  echo "make rust-pc: $(RUSTPKGCONFIG) cannot find the generated descriptor in" >&2; \
+	  echo "make rust-pc: $$GATEABS/pkgconfig, so it is malformed." >&2; \
+	  exit 1; \
+	fi; \
+	CF=`$(RUSTPKGCONFIG) --cflags zlib`; \
+	LSTATIC=`$(RUSTPKGCONFIG) --static --libs zlib`; \
+	LSHARED=`$(RUSTPKGCONFIG) --libs zlib`; \
+	echo "		pkg-config --cflags zlib        -> $$CF"; \
+	echo "		pkg-config --libs zlib          -> $$LSHARED"; \
+	echo "		pkg-config --static --libs zlib -> $$LSTATIC"; \
+	for lib in $$PRIVATE; do \
+	  case " $$LSTATIC " in \
+	    *" $$lib "*) ;; \
+	    *) echo "make rust-pc: pkg-config --static --libs does not answer $$lib," >&2; \
+	       echo 'make rust-pc: although the descriptor advertises it.' >&2; \
+	       exit 1;; \
+	  esac; \
+	  case " $$LSHARED " in \
+	    *" $$lib "*) \
+	       echo "make rust-pc: pkg-config --libs answers $$lib, and it must not:" >&2; \
+	       echo 'make rust-pc: dynamic consumption needs nothing but -lz, and a' >&2; \
+	       echo 'make rust-pc: private library in the public answer over-links every' >&2; \
+	       echo 'make rust-pc: dynamic consumer.  Libs.private is the right key.' >&2; \
+	       exit 1;; \
+	    *) ;; \
+	  esac; \
+	done; \
+	echo '		every private library is in the static answer and none of them'; \
+	echo '		is in the dynamic one'; \
+	printf '%s\n' \
+	  '/* Generated by `make rust-pc'"'"'.  A pkg-config consumer of the STAGED' \
+	  '   Rust library, compiled with the flags pkg-config answers and nothing' \
+	  '   else, and linked statically because that is the case the descriptor' \
+	  '   this program exists to check is the only one that differs.  */' \
+	  '#include <stdio.h>' \
+	  '#include <string.h>' \
+	  '#include "zlib.h"' \
+	  '' \
+	  'static const char payload[] =' \
+	  '    "pkg-config static consumer: hello, hello!  hello, hello!  hello!";' \
+	  '' \
+	  'int main(int argc, char **argv)' \
+	  '{' \
+	  '    Bytef packed[256];' \
+	  '    Bytef plain[256];' \
+	  '    char line[64];' \
+	  '    uLongf packed_len = (uLongf)sizeof packed;' \
+	  '    uLongf plain_len = (uLongf)sizeof plain;' \
+	  '    uLong crc;' \
+	  '    gzFile gz;' \
+	  '    int c;' \
+	  '' \
+	  '    if (argc < 2) {' \
+	  '        fprintf(stderr, "usage: consumer <gzfile>\n");' \
+	  '        return 1;' \
+	  '    }' \
+	  '    if (strcmp(zlibVersion(), ZLIB_VERSION) != 0) {' \
+	  '        fprintf(stderr, "zlibVersion() is %s, not %s\n",' \
+	  '                zlibVersion(), ZLIB_VERSION);' \
+	  '        return 2;' \
+	  '    }' \
+	  '    if (compress2(packed, &packed_len, (const Bytef *)payload,' \
+	  '                  (uLong)sizeof payload, 9) != Z_OK) {' \
+	  '        fprintf(stderr, "compress2 failed\n");' \
+	  '        return 3;' \
+	  '    }' \
+	  '    if (uncompress(plain, &plain_len, packed, packed_len) != Z_OK ||' \
+	  '        plain_len != (uLongf)sizeof payload ||' \
+	  '        memcmp(plain, payload, sizeof payload) != 0) {' \
+	  '        fprintf(stderr, "round trip failed\n");' \
+	  '        return 4;' \
+	  '    }' \
+	  '    crc = crc32(0L, (const Bytef *)payload, (uInt)sizeof payload);' \
+	  '    if (crc != crc32_z(0L, (const Bytef *)payload, sizeof payload)) {' \
+	  '        fprintf(stderr, "crc32 and crc32_z disagree\n");' \
+	  '        return 5;' \
+	  '    }' \
+	  '    gz = gzopen(argv[1], "wb9");' \
+	  '    if (gz == NULL || gzprintf(gz, "%s %d\n", "gz", 42) <= 0 ||' \
+	  '        gzclose(gz) != Z_OK) {' \
+	  '        fprintf(stderr, "gz write failed\n");' \
+	  '        return 6;' \
+	  '    }' \
+	  '    gz = gzopen(argv[1], "rb");' \
+	  '    if (gz == NULL) {' \
+	  '        fprintf(stderr, "gz read open failed\n");' \
+	  '        return 7;' \
+	  '    }' \
+	  '    c = gzgetc(gz);' \
+	  '    if (c != 0x67 || gzgets(gz, line, (int)sizeof line) == NULL ||' \
+	  '        strcmp(line, "z 42\n") != 0 || gzclose(gz) != Z_OK) {' \
+	  '        fprintf(stderr, "gz read failed: first byte %d, line %s\n", c, line);' \
+	  '        return 8;' \
+	  '    }' \
+	  '    printf("static pkg-config consumer OK: zlib %s, %lu -> %lu bytes,"' \
+	  '           " crc32 %08lx, gzgetc read the gzFile_s prefix\n",' \
+	  '           zlibVersion(), (unsigned long)sizeof payload,' \
+	  '           (unsigned long)packed_len, (unsigned long)crc);' \
+	  '    return 0;' \
+	  '}' \
+	  > "$$GATE/consumer.c"; \
+	echo "$(CC) $(CFLAGS) $$CF -o $$GATE/consumer$(EXE) $$GATE/consumer.c $(LDFLAGS) $$LSTATIC"; \
+	$(CC) $(CFLAGS) $$CF -o "$$GATE/consumer$(EXE)" "$$GATE/consumer.c" \
+	  $(LDFLAGS) $$LSTATIC; \
+	if command -v ldd > /dev/null 2>&1; then \
+	  ldd "$$GATE/consumer$(EXE)" > "$$GATE/consumer.ldd" 2>&1 || true; \
+	  if grep -i libz "$$GATE/consumer.ldd" > /dev/null 2>&1; then \
+	    grep -i libz "$$GATE/consumer.ldd" >&2; \
+	    echo 'make rust-pc: the consumer has a dynamic libz dependency, so it did' >&2; \
+	    echo 'make rust-pc: not static-link the staged archive and this gate would' >&2; \
+	    echo 'make rust-pc: be measuring some other library.' >&2; \
+	    exit 1; \
+	  fi; \
+	  echo "		ldd: no dynamic libz, so -lz resolved to the staged $(STATICLIB)"; \
+	else \
+	  echo '		no ldd, cannot confirm the link was static; the gate directory'; \
+	  echo '		holds no shared library, so -lz had nothing else to resolve to'; \
+	fi; \
+	OUT=`${QEMU_RUN} "$$GATE/consumer$(EXE)" "$$GATE/gate.gz"`; \
+	rm -f "$$GATE/gate.gz"; \
+	echo "		$$OUT"; \
+	case "$$OUT" in \
+	  *"static pkg-config consumer OK"*) ;; \
+	  *) echo 'make rust-pc: the consumer ran but did not report success.' >&2; \
+	     exit 1;; \
+	esac; \
+	echo '		*** zlib Rust pkg-config descriptor OK ***'
+
+
 # Run the Rust test suites, then verify the exported ABI of the staged library,
 # then the check that actually proves drop-in compatibility: compile the
 # UNMODIFIED test/example.c and test/minigzip.c, their #include "zlib.h"
@@ -1191,8 +1684,8 @@ rust:
 # cargo test or a failing compile would be reported as a pass.
 #
 # ZLIB_RS_SIMD is honoured here too, so the suites exercise the same checksum
-# backends the staged library was built with; the tests are what would catch a
-# vectorised backend that failed to be output neutral.  This selection is
+# backends the staged library was built with; the tests are what would catch an
+# alternative backend that failed to be output neutral.  This selection is
 # spelled with the `<package>/<feature>' form because CARGO_TEST_FLAGS is
 # --workspace, and the contradiction check lives in `rust', which make has
 # already run as a prerequisite by the time this recipe starts.
@@ -1211,13 +1704,22 @@ rust:
 # includes inflate.h and inftrees.h and calls inflate_table() directly, so it
 # needs a symbol the version script keeps out of the shared library's exports.
 #
+# PACKAGE METADATA IS COVERED, by prerequisite rather than by this recipe.
+# `rust-pc' is the second prerequisite, so a green `rust-test' also means the
+# pkg-config descriptor for the staged library was generated and a C consumer was
+# compiled from nothing but the flags that descriptor answers, linked against the
+# staged $(STATICLIB) and run.  That is the one packaging property where the two
+# implementations genuinely differ -- a Rust staticlib needs the Rust runtime's
+# native libraries on the link line and the C one needs nothing -- so it is
+# checked here rather than left to whoever installs the result.
+#
 # NOT COVERED HERE, and therefore still open: byte-identical compressed output
 # against the C encoder (the differential harness), Miri, the sanitizers, the
 # fuzz budget, and the throughput gates.  Do not read a green `rust-test' as
 # evidence for any of those.  The cbindgen header diff is no longer on that list:
 # `make rust-header' performs it, and its own comment says which parts of the
 # comparison it does and does not implement.
-rust-test: rust
+rust-test: rust rust-pc
 	@if test -z "$(CARGO)"; then \
 	  echo 'make rust-test: no Rust toolchain -- $$(CARGO) is empty' >&2; \
 	  echo 'make rust-test: install cargo, then re-run ./configure, or name it:' >&2; \
@@ -1405,9 +1907,12 @@ rust-symbols: rust
 #     nm, and it is why gzprintf and gzvprintf can be an allowance here while
 #     remaining a hard requirement there.
 #   * It compares NAMES, not signatures, parameter types, struct layouts or
-#     macro values.  The full normalisation -- ten rules, spelled out under
-#     "NORMALISATION RULES THE GATE MUST IMPLEMENT" in $(SRCDIR)cbindgen.toml
-#     -- belongs to .github/workflows/rust.yml, which does not exist yet.  What
+#     macro values.  The rest of the normalisation -- rules A3, A4, A6, A7, A8
+#     and rule 10, spelled out under "NORMALISATION RULES THE GATE MUST
+#     IMPLEMENT" in $(SRCDIR)cbindgen.toml -- belongs to the
+#     header-conformance job of .github/workflows/rust.yml, which runs this
+#     target first and then re-declares every generated prototype against
+#     $(SRCDIR)zlib.h so the compiler itself reports a conflicting type.  What
 #     is here is the part that is mechanical in make and catches the whole
 #     class of defect that made the header unusable; it is not the whole of
 #     Pass A.
@@ -1416,7 +1921,7 @@ rust-symbols: rust
 #
 # WHAT IS AUTOMATED HERE, AND WHAT IS DELIBERATELY NOT.  The boundary is worth
 # stating outright, because "the checks exist" and "the checks are automated"
-# are different claims and only the first was true of some of these before:
+# are different claims and a reader is entitled to know which one each item is:
 #
 #   AUTOMATED BY THIS FILE, and each proven to FAIL when its property is
 #   violated rather than merely to pass today:
@@ -1439,14 +1944,20 @@ rust-symbols: rust
 #       against the staged library and pass, with ldd confirming which library
 #       was bound (`rust-test').
 #
-#   NOT AUTOMATED HERE, and left to .github/workflows/rust.yml by scope:
-#     - the ten signature/type/constant normalisation rules of Pass A, which
-#       need a C parser rather than sed.
-#     - cross-target BUILDS of the facade.  This file gates the generated
-#       header under -D_WIN32; type-checking the Rust for
-#       x86_64-pc-windows-gnu and i686 is `cargo clippy --target ...' and wants
-#       a matrix, and LINKING for Windows wants a cross-linker this tree does
-#       not assume.
+#   NOT AUTOMATED HERE, and left to .github/workflows/rust.yml by scope.  Each of
+#   these IS automated there, in the job named:
+#     - the SHAPE half of the normalisation rules -- A3, A4, A6, A7, A8 and rule
+#       10 -- which need a C compiler and a probe program rather than sed.  The
+#       `header' job owns them, and runs this target first; `rust-header' owns
+#       A1, A2, A5 and A9.
+#     - BUILDS of the facade on another platform.  This file gates the generated
+#       header under -D_WIN32, which is a header check, not a build.  The
+#       `build-test' job builds and tests the workspace natively on
+#       `macos-latest' and `windows-latest' as well as Ubuntu.  What remains
+#       unautomated anywhere is CROSS-compilation: `cargo clippy --target
+#       x86_64-pc-windows-gnu' or an i686 triple wants a matrix row nothing
+#       carries, and cross-LINKING for Windows wants a cross-linker this tree
+#       does not assume.
 #     - Miri, AddressSanitizer, cargo-fuzz and the criterion throughput gates,
 #       all of which need a nightly toolchain or a time budget a build target
 #       must not impose.
@@ -1634,8 +2145,12 @@ rust-header:
 # is what keeps that true.
 #
 #   RUSTMSRV     The floor toolchain, as a rustup toolchain name.  MUST equal
-#                `rust-version' in Cargo.toml and `msrv' in clippy.toml; if the
-#                three diverge, this gate stops meaning anything.
+#                `rust-version' in the root Cargo.toml; if the two diverge, this
+#                gate stops meaning anything.  clippy.toml deliberately declares
+#                no `msrv' key -- clippy reads each package's own `rust-version'
+#                instead, which is what keeps the 1.86 differential crate from
+#                being judged against the shipped crates' floor -- so it is not a
+#                third place to change.
 #   RUSTMSRVFLAGS  RUSTFLAGS for the check.  `-D warnings' is the whole point of
 #                the target, so overriding it to nothing defeats it.
 #
@@ -2022,15 +2537,16 @@ clean: minizip-clean
 maintainer-clean: distclean
 # The printf sequence below regenerates the placeholder Makefile that tells the
 # user to run ./configure.  It has to stay BYTE-IDENTICAL to the checked-in
-# Makefile -- including the refusal rule for rust, rust-test and rust-symbols and
-# the forwarding rule for rust-clean -- because a distclean replaces that file
-# wholesale.  Drift here is not cosmetic: if the refusal is dropped, a
-# post-distclean tree forwards `make rust' into this file with LDSHARED still at
-# its unconfigured $(CC), and the user gets a link error instead of the sentence
-# telling them to run ./configure.  If the rust-clean forwarding is dropped, a
-# leftover $(RUSTTARGETDIR) becomes unreachable, because that is the one Rust
-# target that needs nothing configure computes.  Regenerate this block from the
-# checked-in Makefile rather than editing it by hand.
+# Makefile -- including the forwarding rule for every one of the seven rust*
+# targets -- because a distclean replaces that file wholesale.  Drift here is not
+# cosmetic: a forwarding rule that goes missing makes that target unreachable in
+# a post-distclean tree, and $(RUSTTARGETDIR) is what a lost rust-clean would
+# leave stranded, since that is the one Rust target needing nothing configure
+# computes.  Every one of them works unconfigured -- they name the staged library
+# from ZLIB_VERSION in the immutable $(SRCDIR)zlib.h rather than from the
+# unconfigured $(SHAREDLIBV) default -- which is why they forward rather than
+# refuse.  Regenerate this block from the checked-in Makefile rather than editing
+# it by hand.
 distclean: clean zconf # zconf.h.cmakein
 	rm -f Makefile zlib.pc configure.log
 	-@rm -f .DS_Store
@@ -2045,6 +2561,7 @@ distclean: clean zconf # zconf.h.cmakein
 	printf "# too -- verified here: 111 dynamic globals, identical to the C library's.\n" >> Makefile ; \
 	printf "# This file is regenerated by \`distclean'; keep it and that recipe in step.\n" >> Makefile ; \
 	printf 'rust:\n\t$$(MAKE) -f Makefile.in rust\n' >> Makefile ; \
+	printf '\nrust-pc:\n\t$$(MAKE) -f Makefile.in rust-pc\n' >> Makefile ; \
 	printf '\nrust-test:\n\t$$(MAKE) -f Makefile.in rust-test\n' >> Makefile ; \
 	printf '\nrust-symbols:\n\t$$(MAKE) -f Makefile.in rust-symbols\n' >> Makefile ; \
 	printf '\nrust-header:\n\t$$(MAKE) -f Makefile.in rust-header\n' >> Makefile ; \

@@ -71,9 +71,9 @@
 //! | `simd` | -- | Optional, output-neutral throughput work; `simd` feature only |
 //!
 //! `tables` is the only one of the five that is `pub`, because
-//! the planned `crates/zlib-rs-differential/tests/table_equality.rs` will compare its arrays
-//! against `crc32.h` element for element -- the cheapest high-signal check in the whole port,
-//! though it has not landed yet. The other four are
+//! `crates/zlib-rs-differential/tests/table_equality.rs` compares its arrays
+//! against `crc32.h` element for element -- the cheapest high-signal check in the whole port.
+//! The other four are
 //! private, and the items this module re-exports from them are the entirety of their reachable
 //! surface: everything the C sources declare `local` -- `braid`, `crc_word`, `crc_word_big`,
 //! `byte_swap`, `multmodp`, `x2nmodp` -- stays inside the subsystem, exactly as it does in C.
@@ -370,7 +370,7 @@ pub use self::simd::Simd;
 /// Word-sized big-endian CRC-32 table -- see [`tables::CRC_BIG_TABLE`].
 ///
 /// Re-exported so the whole subsystem is reachable from one path and so that
-/// the planned `crates/zlib-rs-differential/tests/table_equality.rs` will be able to compare it
+/// `crates/zlib-rs-differential/tests/table_equality.rs` can compare it
 /// against `crc32.h`.
 pub use self::tables::CRC_BIG_TABLE;
 
@@ -1074,7 +1074,7 @@ mod tests {
 
     /// The re-exported surface is reachable from this module and names the generated data.
     ///
-    /// the planned `crates/zlib-rs-differential/tests/table_equality.rs` will compare these arrays against
+    /// `crates/zlib-rs-differential/tests/table_equality.rs` compares these arrays against
     /// `crc32.h` element for element, and `crates/zlib-rs/src/lib.rs` re-exports [`CRC_TABLE`] from
     /// the crate root, so each name has to stay reachable here. Naming all five in one test makes a
     /// removal or a rename a compile error rather than a downstream surprise.

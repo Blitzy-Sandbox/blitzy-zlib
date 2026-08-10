@@ -167,19 +167,20 @@
 //! type-`A` symbol-version nodes -- under the soname `libz.so.1`, which is what the
 //! Rust artifact has to reproduce.
 //!
-//! That baseline is enforced today by `Makefile.in`'s `rust-test` target, which
-//! diffs `nm -D --defined-only --extern-only` over the built library against the
-//! reference library's symbols, checks the sixteen version nodes, checks that every
-//! name in `zlib.map`'s `local:` block stayed hidden, and confirms with `ldd` that
-//! the relinked C drivers bind the Rust artifact. One stray exported symbol from
+//! That baseline is enforced by `Makefile.in`'s `rust` target -- which `rust-test`
+//! runs as a prerequisite -- diffing `nm -D --defined-only --extern-only` over the
+//! staged library against `zlib.h` and `zlib.map`, checking the sixteen version
+//! nodes and checking that every name in `zlib.map`'s `local:` block stayed hidden;
+//! `rust-test` then confirms with `ldd` that the relinked C drivers bind the Rust
+//! artifact. One stray exported symbol from
 //! this module would fail that diff, and none does: measured on the staged library,
 //! ninety-five exported functions -- every one of them declared in `zlib.h` -- and
 //! one hundred and eleven dynamic symbols in total, identical to the C
 //! `libz.so.1.3.2.1-motley`, with all ten `zlib.map` `local:` names hidden and
-//! nothing matching `_*` exported. The planned
-//! `crates/libz-rs-sys/tests/symbol_parity.rs` will assert the same property from
-//! inside `cargo test` and **does not exist yet**, so that one gate still runs from
-//! `make` rather than from `cargo test`; the property itself is measured either way.
+//! nothing matching `_*` exported. `crates/libz-rs-sys/tests/symbol_parity.rs`
+//! asserts the same property from inside `cargo test`, over the artifact `make rust`
+//! stages, so the gate now runs from both places; when the staged library is absent
+//! those tests say which check they skipped and why rather than passing silently.
 //! The items below are ordinary Rust functions and constants, reached through the
 //! module path and inlined away.
 //!
@@ -455,14 +456,18 @@ where
 /// # Why the whole table is `#[allow(dead_code)]`
 ///
 /// Completeness is the point of a lookup table: one entry per documented failure
-/// value, cited to `zlib.h`, so that a call site never invents a literal. Six of
-/// them -- `MEM_ERROR`, `MEM_ERROR_CODE`, `BOUND_Z`, `CRC32_COMBINE_INVALID`,
-/// `ADLER32_COMBINE_INVALID` and `GZ_TRUE` -- have no call site at present, because
-/// the entry points they document either reach their failure through
-/// [`guard_code`] and a [`ReturnCode`] the core already produced, or cannot fail at
-/// all. Deleting them would leave a table with gaps and would delete the `zlib.h`
-/// citation that makes the next call site's choice checkable, so the attribute is
-/// on the module rather than on six separate items. Nothing here is reachable from
+/// value, cited to `zlib.h`, so that a call site never invents a literal. Thirteen
+/// of the fourteen entries are called; exactly one, `MEM_ERROR`, has no call site,
+/// because the two entry points that would want it -- `deflateInit2_` and
+/// `inflateInit2_` -- reach their allocation failure through [`guard_code`] and a
+/// [`ReturnCode`] the core already produced, so they never need the literal. That
+/// count is measured, not assumed: deleting the attribute and building
+/// `-p libz-rs-sys` under default features, `--all-features` and
+/// `--no-default-features --features libz-compat` reports `MEM_ERROR` and nothing
+/// else. Deleting the entry would leave a table with a gap and would delete the
+/// `zlib.h` citation that makes the next call site's choice checkable, so the
+/// attribute stays on the module: it keeps the table complete as call sites come
+/// and go without the attribute having to migrate between items. Nothing here is reachable from
 /// outside the crate either way: `panic_guard` is a private module and every item
 /// below is `pub(crate)`, so the table is spelled at exactly the visibility its one
 /// audience -- this crate's own export bodies -- needs.

@@ -50,32 +50,26 @@
 //!   `MAX_MATCH` -- is exactly what the reference's unrolled loop produces, for the reasons set out
 //!   at the comparison itself.
 //!
-//! Both are byte-for-byte verified rather than argued: the differential harness compares this
-//! implementation's output against the in-tree C library over 32400 configurations of level,
-//! `windowBits`, `memLevel`, strategy, flush mode and corpus fixture, and it passes unchanged.
+//! Both are output-neutral, and that is asserted rather than argued:
+//! `crates/zlib-rs-differential/tests/byte_identical.rs` compares this implementation's output
+//! against the in-tree C library across the whole level x `windowBits` x `memLevel` x strategy x
+//! flush x fixture matrix, and a transformation here that changed a single emitted byte would fail
+//! it. That is the only property this file is allowed to trade nothing for.
 //!
-//! Measured against that same C library, compiled from the in-tree sources and called in the same
-//! process (release profile, fat LTO, 1 MiB payloads, trimmed mean of the faster half of the
-//! samples):
+//! **Their throughput effect is measured, and not here.** `benches/deflate_bench.rs` times this
+//! port against the same C library in one process, and no figure written into this comment could be
+//! reproduced from it. Two things about *what* to measure are worth recording, because neither is
+//! obvious from the code:
 //!
-//! | payload | level | this port | C | ratio |
-//! |---|---|---|---|---|
-//! | text | 1 | 740 us | 1.920 ms | 0.386 |
-//! | text | 6 | 3.910 ms | 4.597 ms | 0.851 |
-//! | text | 9 | 3.912 ms | 4.628 ms | 0.845 |
-//! | repetitive | 1 | 1.923 ms | 2.842 ms | 0.677 |
-//! | repetitive | 6 | 12.685 ms | 16.123 ms | 0.787 |
-//! | repetitive | 9 | 18.838 ms | 22.130 ms | 0.851 |
-//!
-//! AAP §0.8.4 requires compression throughput within 10% of C at levels 1, 6 and 9; every point
-//! above is faster than C. The measurement is recorded here rather than only in a report because the
-//! numbers that matter are this function's: a review of the optimized static body counted 271
-//! instructions and 37 conditional branches against gcc's 135 and 18, and asked whether that cost
-//! anything. Before the two transformations above it did -- repetitive input measured 1.229 at level
-//! 6 and 1.203 at level 9, outside the gate -- and an instruction count is why that was worth
-//! checking, not proof on its own. Repetitive input at a high `max_chain` is the shape that exposes
-//! it, because it is the shape that walks the deepest chains; level 1 is unaffected either way, since
-//! `deflate_fast` walks at most four links.
+//! * **Repetitive input at a high `max_chain` is the shape that exposes a regression in this
+//!   function**, because it is the shape that walks the deepest hash chains. Level 1 is nearly
+//!   insensitive either way, since `deflate_fast` walks at most four links -- so a level-1
+//!   measurement that looks fine says almost nothing about this code.
+//! * **An instruction count is a reason to measure, not a result.** The optimized static body is
+//!   substantially larger than gcc's, in both instructions and conditional branches, which is worth
+//!   noticing and is not by itself evidence of anything: the two transformations above exist because
+//!   the *measured* level-6 and level-9 ratios on repetitive input, taken before them, were the
+//!   thing outside the AAP §0.8.4 gate.
 //!
 //! # Variants that are deliberately not implemented
 //!
@@ -845,8 +839,8 @@ where
 //  implementation detail.
 //
 //  Note that these tests can only prove the *local* behaviour of this function.
-//  The only proof of byte-identical output will be the planned
-//  `crates/zlib-rs-differential/tests/byte_identical.rs`, which is to diff the whole
+//  The only proof of byte-identical output is
+//  `crates/zlib-rs-differential/tests/byte_identical.rs`, which diffs the whole
 //  encoder against the C oracle across the level x windowBits x memLevel x
 //  strategy x flush x corpus matrix. Levels 1-3 (`deflate_fast`) and levels 4-9
 //  (`deflate_slow`) both route through here, so a defect in this file fails

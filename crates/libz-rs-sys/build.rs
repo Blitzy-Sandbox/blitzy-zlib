@@ -229,7 +229,7 @@ describes are not.)
 
   libz.so   is NOT the installable shared library.  rustc attaches its own
             anonymous version script to every cdylib link, so zlib.map cannot be
-            layered on: this object carries 0 of the 16 ZLIB_1.2.* symbol-version
+            layered on: this object carries 0 of the 16 zlib symbol-version
             nodes, does not export gzprintf or gzvprintf (both variadic, so they
             live in the C shim, whose objects a cdylib cannot re-export), and does
             export three _zlib_rs_* internals that zlib.map hides.  Measured: 96
@@ -319,20 +319,52 @@ const ENV_VERSION_SCRIPT: &str = "ZLIB_RS_VERSION_SCRIPT";
 // underscores, so the `simd` feature is `CARGO_FEATURE_SIMD`.
 const CARGO_FEATURE_SIMD: &str = "CARGO_FEATURE_SIMD";
 
-// The two features the C shims need: `libz-compat` turns the unmangled C symbols on,
-// and `gz` compiles the `gzFile` layer that owns the two Rust helpers the variadic
-// shim calls.  With either one off the shim has nothing to link against, so it is not
-// compiled at all -- an archive with two undefined symbols in it would fail the link
-// of every consumer rather than of the crate that produced it.
+// The two features the C shims are gated on, and they are NOT gated identically.
+// `libz-compat` turns the unmangled C symbols on; `gz` compiles the `gzFile` layer.
+// Each shim is compiled exactly when the Rust adapters it calls exist -- see
+// `SHIM_SOURCE_INFTREES` and `SHIM_SOURCE_GZPRINTF` -- because an archive holding an
+// undefined symbol would fail the link of every consumer rather than of the crate
+// that produced it, while an archive MISSING a symbol a supported configuration needs
+// fails the link just as surely.  Both mistakes were made here in turn; the two
+// constants below are what keeps them apart.
 const CARGO_FEATURE_LIBZ_COMPAT: &str = "CARGO_FEATURE_LIBZ_COMPAT";
 const CARGO_FEATURE_GZ: &str = "CARGO_FEATURE_GZ";
 
-// The C translation units this library contains, relative to CARGO_MANIFEST_DIR, and
-// the archive they are collected into.  `csrc/gzprintf_shim.c` defines the two variadic
-// entry points; `csrc/inftrees_shim.c` defines `inflate_table` with `inftrees.h`'s own
-// `codetype` prototype.  Both are compiled by THIS script -- see
-// `build_c_abi_shims` -- so that the archive cargo produces is a complete libz.
-const SHIM_SOURCES: [&str; 2] = ["csrc/gzprintf_shim.c", "csrc/inftrees_shim.c"];
+// The C translation unit that defines `inflate_table` with `inftrees.h`'s own
+// `codetype` prototype, relative to CARGO_MANIFEST_DIR.
+//
+// ★ GATED ON `libz-compat` ALONE, and that is load-bearing.  It forwards to
+// `_zlib_rs_inflate_table`, which `src/inflate.rs` declares behind `libz-compat` and
+// behind nothing else, so the symbol it needs exists in EVERY `libz-compat` build --
+// including `--no-default-features --features libz-compat`, which is a supported
+// configuration this crate's own manifest documents.  Suppressing this shim whenever
+// `gz` happened to be off left that configuration unable to link at all: the crate's
+// unit test `the_c_prototype_shim_is_linked_and_agrees_with_the_rust_half` names the C
+// `inflate_table` symbol on purpose, so `cargo test -p libz-rs-sys
+// --no-default-features --features libz-compat` failed with `undefined symbol:
+// inflate_table`.  The gate is per shim, never per shim set.
+const SHIM_SOURCE_INFTREES: &str = "csrc/inftrees_shim.c";
+
+// The C translation unit that defines `gzprintf` and `gzvprintf`, relative to
+// CARGO_MANIFEST_DIR.
+//
+// Gated on `libz-compat` AND `gz`: it calls `_zlib_rs_gzprintf_begin` and
+// `_zlib_rs_gzprintf_commit`, which live behind both, so a build with `gz` off has
+// nothing for it to link against.  A build without the `gzFile` layer is not a
+// drop-in libz and is not claimed to be -- `CFG_GZPRINTF` stays unset and
+// `zlibCompileFlags` bit 27 reports the artifact that was actually built.
+const SHIM_SOURCE_GZPRINTF: &str = "csrc/gzprintf_shim.c";
+
+// The TEST-ONLY C translation unit, relative to CARGO_MANIFEST_DIR.  It builds a
+// `va_list` and forwards it to `gzvprintf`, which no Rust caller can do: `va_list` has a
+// different type on every ABI and `core::ffi::VaList` is unstable, so without a line of C
+// `gzvprintf` can only ever be reached as the tail of `gzprintf`.
+//
+// DELIBERATELY NOT IN `SHIM_SOURCES`.  That array is what gets archived into the `libz.a`
+// rustc produces, and this file must never appear in the shipped library: it is handed to
+// the linker through `cargo::rustc-link-arg-tests`, which cargo applies to TEST TARGETS
+// ONLY -- see `link_test_probe`.
+const TEST_PROBE_SOURCE: &str = "csrc/gzvprintf_probe.c";
 
 // The name of the static archive the shims are collected into, as `-l static=` names
 // it.  Both halves matter: the file must be `lib<name>.a` for a GNU-style linker to
@@ -644,7 +676,7 @@ impl TargetInfo {
 //     ignores it, yielding zero version nodes.
 //
 // A rustc-linked `cdylib` consequently cannot export `gzprintf`/`gzvprintf` and
-// cannot carry the 16 `ZLIB_1.2.*` version nodes, whatever this script emits. The
+// cannot carry the 16 zlib version nodes, whatever this script emits. The
 // installable shared object is therefore produced by ONE documented step from the
 // complete archive -- `Makefile.in`'s `rust` target, or the CMake equivalent --
 // which links it under `zlib.map` with the right SONAME and symlink chain.
@@ -744,29 +776,41 @@ fn build_c_abi_shims(repo_root: &Path) {
         println!("cargo::rerun-if-env-changed={key}");
     }
 
-    // `gzprintf`/`gzvprintf` reach the core through `_zlib_rs_gzprintf_begin` and
-    // `_zlib_rs_gzprintf_commit`, and `inflate_table` through
-    // `_zlib_rs_inflate_table`; all three live behind `libz-compat`, the first two
-    // additionally behind `gz`. Compiling the shims against a build without those
-    // features would archive undefined symbols, so there is nothing to build here --
-    // and nothing missing either, because such a build is not a C-ABI libz at all.
-    if env::var_os(CARGO_FEATURE_LIBZ_COMPAT).is_none() || env::var_os(CARGO_FEATURE_GZ).is_none() {
+    // `inflate_table` reaches the core through `_zlib_rs_inflate_table`, which lives
+    // behind `libz-compat`; `gzprintf`/`gzvprintf` reach it through
+    // `_zlib_rs_gzprintf_begin` and `_zlib_rs_gzprintf_commit`, which live behind
+    // `libz-compat` AND `gz`.  With `libz-compat` off there is no unmangled C surface
+    // at all and neither shim has anything to link against, so nothing is built --
+    // and nothing is missing either, because such a build is not a C-ABI libz.
+    if env::var_os(CARGO_FEATURE_LIBZ_COMPAT).is_none() {
         return;
+    }
+
+    // ★ PER-SHIM, never per shim set.  `csrc/inftrees_shim.c` is required by
+    // `libz-compat` on its own; the two variadic translation units additionally need
+    // `gz`, because both reach the `gzFile` layer.
+    let gz = env::var_os(CARGO_FEATURE_GZ).is_some();
+    let mut sources: Vec<&str> = Vec::with_capacity(3);
+    sources.push(SHIM_SOURCE_INFTREES);
+    if gz {
+        sources.push(SHIM_SOURCE_GZPRINTF);
     }
 
     let manifest_dir = PathBuf::from(require_env("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(require_env("OUT_DIR"));
     let msvc = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() == "msvc";
 
-    let mut objects = Vec::with_capacity(SHIM_SOURCES.len());
-    for relative in SHIM_SOURCES {
+    let mut objects = Vec::with_capacity(sources.len());
+    for relative in sources {
         let source = manifest_dir.join(relative);
         assert!(
             source.is_file(),
-            "the C ABI shim {} is missing. The two shims define `gzprintf`, `gzvprintf` \
-             and `inflate_table`, none of which stable Rust can declare with the \
-             prototype the contract fixes, so a library built without them is not a \
-             drop-in libz. Restore the file from version control.",
+            "the C ABI shim {} is missing. The three translation units define \
+             `gzprintf`, `gzvprintf` and `inflate_table` -- none of which stable Rust \
+             can declare with the prototype the contract fixes, so a library built \
+             without them is not a drop-in libz -- and the caller-side `va_list` probe \
+             that is the only way `gzvprintf` can be exercised at all. Restore the file \
+             from version control.",
             source.display()
         );
         println!("cargo::rerun-if-changed={}", source.display());
@@ -785,10 +829,69 @@ fn build_c_abi_shims(repo_root: &Path) {
     );
     println!("cargo::rustc-link-lib=static={SHIM_LIB_NAME}");
 
-    // Now, and only now, may the Rust code claim the two formatting entry points.
-    // `util.rs` derives `zlibCompileFlags` bit 27 from this cfg, so the flags word
-    // describes the artifact that was actually built.
-    println!("cargo::rustc-cfg={CFG_GZPRINTF}");
+    // The probe is a TEST-ONLY translation unit and it is linked as one: `link_test_probe`
+    // hands it to the linker through `cargo::rustc-link-arg-tests`, which cargo applies to
+    // test targets and to nothing else, so `libz.a`, `libz.so` and the rlib are byte-for-byte
+    // what they would be without it.  It is inside the `gz` arm because the only thing it does
+    // is forward a `va_list` to `gzvprintf`, and that entry point exists only under `gz`;
+    // `tests/gz_printf.rs` carries the same gate at its root.
+    //
+    // Now, and only now, may the Rust code claim the two formatting entry points -- and only
+    // when the translation unit that DEFINES them was one of the objects archived above.
+    // `util.rs` derives `zlibCompileFlags` bit 27 from this cfg, so the flags word describes the
+    // artifact that was actually built; setting it for a `gz`-less build would claim a
+    // `gzprintf` the archive does not contain.
+    if gz {
+        link_test_probe(&manifest_dir, &out_dir, repo_root, msvc, &archive);
+        println!("cargo::rustc-cfg={CFG_GZPRINTF}");
+    }
+}
+
+/// Compiles [`TEST_PROBE_SOURCE`] and links it into the crate's TEST TARGETS ONLY.
+///
+/// `cargo::rustc-link-arg-tests` is the whole reason this can exist without touching the
+/// shipped artifact: cargo forwards it to the link of every test target and to nothing else,
+/// so `libz.a`, `libz.so` and the `rlib` are byte-for-byte what they would be without this
+/// file. `crates/libz-rs-sys/tests/symbol_parity.rs` is what holds that claim to account.
+///
+/// TWO INPUTS, IN THIS ORDER, AND THE ORDER IS THE POINT. Cargo appends link-args after the
+/// libraries, so by the time the linker reaches them it has already finished with
+/// `lib{SHIM_LIB_NAME}.a`:
+///
+///   1. the probe **object**, which a linker always loads whether or not anything references
+///      it, and which is what brings the undefined `gzvprintf` into the link;
+///   2. the shim **archive again**, so that `gzvprintf` can still be resolved from it.
+///
+/// Without (2) the probe would resolve only by luck -- specifically, only in a test binary
+/// that happens to name `gzprintf` and so pulled `gzprintf_shim.o` in earlier. Listing the
+/// archive a second time costs nothing (the member is taken at most once) and makes the link
+/// deterministic for every test target, including one that names neither entry point.
+///
+/// The archive is passed by PATH rather than as `-l`, because a path is the one spelling both
+/// a GNU-style driver and `link.exe` accept, and this function must not grow a per-linker
+/// flag vocabulary for a test-only convenience.
+fn link_test_probe(
+    manifest_dir: &Path,
+    out_dir: &Path,
+    repo_root: &Path,
+    msvc: bool,
+    archive: &Path,
+) {
+    let source = manifest_dir.join(TEST_PROBE_SOURCE);
+    assert!(
+        source.is_file(),
+        "the test-only C probe {} is missing. It builds the `va_list` that lets \
+         `tests/c_api_parity.rs` call `gzvprintf` as its own entry point rather than only \
+         through `gzprintf`; without it that contract function has no behavioural coverage. \
+         Restore the file from version control.",
+        source.display()
+    );
+    println!("cargo::rerun-if-changed={}", source.display());
+
+    let object = compile_shim(&source, out_dir, repo_root, msvc);
+
+    println!("cargo::rustc-link-arg-tests={}", object.display());
+    println!("cargo::rustc-link-arg-tests={}", archive.display());
 }
 
 /// Compiles one shim translation unit, returning the object file it produced.

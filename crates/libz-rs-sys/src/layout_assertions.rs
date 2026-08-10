@@ -83,10 +83,10 @@
 //!
 //! * On the measured target the absolute tier catches it immediately and loudly
 //!   — that exact `u8` substitution fires **14** of the assertions below.
-//! * On *any* target a cbindgen header comparison would catch it, because the
-//!   generated declaration reads `uint8_t total_in;` where `zlib.h` says
-//!   `uLong total_in;`. Generating and reading that header is a manual step today,
-//!   so this second net only catches the case when somebody runs it.
+//! * On *any* target the cbindgen header comparison catches it, because the generated
+//!   declaration reads `uint8_t total_in;` where `zlib.h` says `uLong total_in;`. That
+//!   comparison is the `header` job of `.github/workflows/rust.yml`, reachable locally
+//!   as `make rust-header`, so the second net is a gate rather than a habit.
 //!
 //! # ★ MSRV: every `offset_of!` is exactly one field deep
 //!

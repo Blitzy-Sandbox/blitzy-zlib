@@ -5,18 +5,32 @@
 # Every executable below links ZLIB::ZLIB or ZLIB::ZLIBSTATIC and nothing else,
 # and the root CMakeLists.txt decides which implementation those two names
 # denote: the C library by default, or -- with -DZLIB_BUILD_RUST=ON -- the
-# memory-safe Rust library staged from crates/libz-rs-sys.  Re-pointing those
-# two aliases is the entire mechanism by which this suite runs against either
-# implementation, and it is why no case here needs a Rust counterpart: with the
-# option ON, zlib_example, zlib_example64, zlib_static_example,
-# zlib_static_example64 and zlib_coverage ARE the Rust-linked cases, as are the
-# three find_package fixtures further down, which consume what was installed.
-# The absence of `_rust'-suffixed targets is deliberate rather than work left
-# undone -- a second case linking the same target the first one already links
-# would add no coverage, while a second example.c writing the same foo.gz would
-# add a race under `ctest -j' -- so a reader looking for them should look at the
-# alias instead.  The two add_subdirectory fixtures are the one exception and
-# say so at their own definitions.
+# memory-safe Rust library staged from crates/libz-rs-sys.  Re-pointing those two
+# aliases is the mechanism by which this suite runs against either
+# implementation: with the option ON, zlib_example, zlib_example64,
+# zlib_static_example, zlib_static_example64 and zlib_coverage ARE the
+# Rust-linked cases, as are the three find_package fixtures further down, which
+# consume what was installed.  The two add_subdirectory fixtures are the one
+# exception and say so at their own definitions.
+#
+# WHAT THAT DOES AND DOES NOT GIVE A READER, stated plainly because a case list
+# that names no implementation is easy to over-read.  A configured build tree
+# exercises exactly ONE implementation -- the one the option selected -- so this
+# file registers no `_rust'-suffixed case beside its C counterpart and a single
+# tree therefore never runs the two side by side.  Comparing them means
+# configuring twice, into two build directories, and comparing the two ctest
+# runs; or using the differential harness at crates/zlib-rs-differential, which
+# is where side-by-side comparison actually lives, because it holds both
+# implementations in one process and compares their output byte for byte.
+#
+# Two cases here ARE Rust-only and are registered conditionally rather than
+# aliased: zlib_rust_loader_binding below, and zlib_rust_loader_binding_installed
+# further down, which assert with ldd that the staged library is the one bound in
+# the build tree and in the install tree respectively.  Neither has a C
+# counterpart, because the failure they guard against -- a SONAME resolving to
+# the system libz -- can only happen to the Rust build.  Diffing the generated
+# CTestTestfile.cmake of a C configure against a ZLIB_BUILD_RUST=ON one shows
+# exactly those two names as the whole difference in the case list.
 #
 # example.c, minigzip.c and infcover.c are compiled from the same sources, with
 # the same definitions, whichever implementation is behind the alias.  That
@@ -48,11 +62,50 @@ function(ZLIB_findTestEnv testName)
     set_tests_properties(${testName} PROPERTIES ENVIRONMENT "${testEnv}")
 endfunction()
 
+# Registers one example.c driver with a private working directory and a private
+# archive name.
+#
+# example.c writes exactly one file and never removes it: test_gzio() is handed
+# `argc > 1 ? argv[1] : TESTFILE' (its L531), and TESTFILE is "foo.gz" on nearly
+# every platform (its L21-L25).  Four executables are built from that one source
+# -- zlib_example, zlib_example64, zlib_static_example and zlib_static_example64
+# -- and until now all four ran with no argument in this directory's build tree,
+# so all four wrote, read back and left behind the same test/foo.gz.  Serially
+# that merely means each run overwrites the last; under `ctest -j' it is a race
+# on a single path, and the driver's own gzopen-write / gzopen-read sequence is
+# exactly the window in which another copy of the same program can truncate the
+# file between them.  A failure of that kind names whichever driver lost, not the
+# collision, which is the worst possible diagnostic for a suite whose job is to
+# tell you which implementation broke.
+#
+# Both halves of the fix are deliberate rather than redundant.  The private
+# directory stops the four from sharing a path at all, and it keeps the artifact
+# beside the case that produced it instead of accumulating in the build root; the
+# private archive name means that even if two cases were ever pointed at one
+# directory again they still could not collide.  Passing the name through argv is
+# what makes this possible without touching example.c, which must stay
+# byte-identical -- the whole claim being that an existing consumer needs no
+# edit.
+#
+# The target and the test share a name for all four cases, so `COMMAND
+# ${testName}' resolves to that target's executable.  ZLIB_findTestEnv sets only
+# ENVIRONMENT and is applied afterwards, so it neither conflicts with the working
+# directory nor has to know about it.
+function(ZLIB_addExampleTest testName)
+    set(workDir ${CMAKE_CURRENT_BINARY_DIR}/${testName}_work)
+    file(MAKE_DIRECTORY ${workDir})
+
+    add_test(
+        NAME ${testName}
+        COMMAND ${testName} ${testName}.gz
+        WORKING_DIRECTORY ${workDir})
+endfunction()
+
 if(ZLIB_BUILD_SHARED)
     add_executable(zlib_example example.c)
     target_link_libraries(zlib_example ZLIB::ZLIB)
     target_compile_definitions(zlib_example PRIVATE ZLIB_BUILD)
-    add_test(NAME zlib_example COMMAND zlib_example)
+    zlib_addexampletest(zlib_example)
 
     add_executable(minigzip minigzip.c)
     target_compile_definitions(
@@ -89,7 +142,7 @@ if(ZLIB_BUILD_SHARED)
             PRIVATE ZLIB_BUILD
                     $<$<BOOL:${HAVE___ATTR__VIS_HIDDEN}>:HAVE_HIDDEN>)
         target_link_libraries(zlib_example64 ZLIB::ZLIB)
-        add_test(NAME zlib_example64 COMMAND zlib_example64)
+        zlib_addexampletest(zlib_example64)
 
         if(MSVC
            OR MSYS
@@ -115,32 +168,179 @@ if(ZLIB_BUILD_SHARED)
     # binding itself is asserted, which Makefile.in's `rust-test' target does
     # the same way for the autotools build.
     #
-    # ldd is probed, never required: without it, or on a platform whose loader
-    # is not ELF, the case is simply not registered.  A C build never reaches
-    # this block at all, so no configuration acquires a new tool because of it.
+    # Loader inspection is REQUIRED here, not probed.  The block is reached only
+    # on the ELF platforms the Rust staging itself supports -- CMakeLists.txt
+    # refuses to configure ZLIB_BUILD_RUST anywhere else -- and on every one of
+    # them the loader can be asked what it would bind.  ldd is the convenient
+    # spelling; setting LD_TRACE_LOADED_OBJECTS in the environment of the
+    # executable is what ldd does internally and needs no tool at all, so it is
+    # a mandatory fallback rather than an optional one.  A configuration without
+    # ldd therefore still gets the check.  A C build never reaches this block,
+    # so no C configuration acquires a requirement because of it.
+    #
+    # What is asserted is also stronger than a regular expression can express.
+    # `libz.so.1 => /<anything>' passes for the system library under any prefix
+    # that is not /lib or /usr/lib -- /lib64, /usr/lib64, an /opt install, a
+    # conda environment -- so the check is a comparison of CANONICAL PATHS
+    # against the exact artifact this build staged, performed by the script
+    # below.  A test property cannot do that (no generator expressions, no
+    # realpath), which is why the work moved into a script that a test property
+    # can only invoke.
     if(ZLIB_BUILD_RUST
        AND UNIX
        AND NOT APPLE)
-        find_program(LDD_EXECUTABLE ldd)
+        find_program(LDD_EXECUTABLE NAMES ldd)
 
-        if(LDD_EXECUTABLE)
-            add_test(NAME zlib_rust_loader_binding
-                     COMMAND ${LDD_EXECUTABLE} $<TARGET_FILE:zlib_example>)
-            # The pass expression is what keeps the case from being vacuous: an
-            # unresolved `libz.so.1 => not found' matches nothing and fails,
-            # rather than passing because the fail expression found nothing to
-            # object to.  The fail expression is the failure that was actually
-            # observed while porting -- the SONAME resolving into a system
-            # prefix -- and it is anchored to the resolved path so that a build
-            # directory of any name is accepted.  Both are plain strings: a test
-            # property is not generator-expression territory, which is also why
-            # neither can name the staged directory.
-            set_tests_properties(
-                zlib_rust_loader_binding
-                PROPERTIES PASS_REGULAR_EXPRESSION "libz\\.so\\.1 => /"
-                           FAIL_REGULAR_EXPRESSION
-                           "libz\\.so\\.1 => /(usr/)?lib")
-        endif(LDD_EXECUTABLE)
+        # Written at configure time into the build tree rather than shipped as a
+        # source file: it exists only to serve the two cases below, it needs
+        # nothing from version control, and keeping it here keeps the whole
+        # assertion readable in one place.
+        set(ZLIB_LOADER_BINDING_SCRIPT
+            ${CMAKE_CURRENT_BINARY_DIR}/zlib_loader_binding.cmake)
+        file(
+            WRITE ${ZLIB_LOADER_BINDING_SCRIPT}
+            "# Generated by test/CMakeLists.txt.  Asserts that the dynamic loader binds a
+# named executable to one exact shared object, by canonical path.
+#
+# Inputs, all as -D on the cmake -P command line:
+#   ZLIB_LB_EXECUTABLE  the program to inspect, or empty to search a directory
+#   ZLIB_LB_DIR         directory holding it, when the path is not known here
+#   ZLIB_LB_NAME        its file name, used with ZLIB_LB_DIR
+#   ZLIB_LB_CONFIG      build configuration, for a multi-config subdirectory
+#   ZLIB_LB_SONAME      the DT_NEEDED name whose binding is asserted
+#   ZLIB_LB_EXPECTED    the file that must be bound
+#   ZLIB_LB_LDD         path to ldd, or empty to use LD_TRACE_LOADED_OBJECTS
+#   ZLIB_LB_WHAT        a phrase naming the case, for the messages
+
+if(ZLIB_LB_EXECUTABLE STREQUAL \"\")
+    # A multi-config generator puts the executable in a per-configuration
+    # subdirectory, a single-config one puts it in the directory itself.  Trying
+    # both is what lets the installed case run under every generator instead of
+    # being skipped on the ones this file cannot name a path for.
+    set(_candidates \"\${ZLIB_LB_DIR}/\${ZLIB_LB_NAME}\")
+
+    if(NOT ZLIB_LB_CONFIG STREQUAL \"\")
+        list(APPEND _candidates \"\${ZLIB_LB_DIR}/\${ZLIB_LB_CONFIG}/\${ZLIB_LB_NAME}\")
+    endif()
+
+    foreach(_candidate IN LISTS _candidates)
+        if(EXISTS \"\${_candidate}\")
+            set(ZLIB_LB_EXECUTABLE \"\${_candidate}\")
+            break()
+        endif()
+    endforeach()
+
+    if(ZLIB_LB_EXECUTABLE STREQUAL \"\")
+        message(FATAL_ERROR \"\${ZLIB_LB_WHAT}: none of \${_candidates} exists, so \"
+                            \"the loader could not be asked what it binds\")
+    endif()
+endif()
+
+if(NOT EXISTS \"\${ZLIB_LB_EXPECTED}\")
+    message(FATAL_ERROR \"\${ZLIB_LB_WHAT}: the artifact that must be bound, \"
+                        \"\${ZLIB_LB_EXPECTED}, does not exist\")
+endif()
+
+# Ask ldd first, then the loader itself.  LD_TRACE_LOADED_OBJECTS=1 makes the
+# program's own interpreter print the map and exit without running main, which is
+# precisely what ldd arranges, so the two produce the same lines.
+set(_trace \"\")
+set(_how \"\")
+
+if(NOT ZLIB_LB_LDD STREQUAL \"\")
+    execute_process(
+        COMMAND \"\${ZLIB_LB_LDD}\" \"\${ZLIB_LB_EXECUTABLE}\"
+        RESULT_VARIABLE _rc
+        OUTPUT_VARIABLE _out
+        ERROR_VARIABLE _err)
+
+    if(_rc EQUAL 0)
+        set(_trace \"\${_out}\")
+        set(_how \"ldd\")
+    else()
+        set(_ldd_failure \"ldd exited \${_rc}: \${_err}\")
+    endif()
+endif()
+
+if(_trace STREQUAL \"\")
+    execute_process(
+        COMMAND \${CMAKE_COMMAND} -E env LD_TRACE_LOADED_OBJECTS=1
+                \"\${ZLIB_LB_EXECUTABLE}\"
+        RESULT_VARIABLE _rc
+        OUTPUT_VARIABLE _out
+        ERROR_VARIABLE _err)
+
+    if(_rc EQUAL 0)
+        set(_trace \"\${_out}\")
+        set(_how \"LD_TRACE_LOADED_OBJECTS\")
+    else()
+        message(FATAL_ERROR
+                \"\${ZLIB_LB_WHAT}: could not read the loader map of \"
+                \"\${ZLIB_LB_EXECUTABLE}.  \${_ldd_failure} \"
+                \"LD_TRACE_LOADED_OBJECTS exited \${_rc}: \${_err}\")
+    endif()
+endif()
+
+# `<soname> => <path> (0x...)' on glibc; the address is optional and musl omits
+# it.  `not found' is matched by the same expression and rejected below, which is
+# what keeps an unresolved dependency from reading as an absent line.
+string(REGEX REPLACE \"\\r?\\n\" \";\" _lines \"\${_trace}\")
+set(_resolved \"\")
+
+foreach(_line IN LISTS _lines)
+    if(_line MATCHES \"(^|[ \\t/])\${ZLIB_LB_SONAME} *=> *([^ \\t]+)\")
+        set(_resolved \"\${CMAKE_MATCH_2}\")
+        break()
+    endif()
+endforeach()
+
+if(_resolved STREQUAL \"\")
+    message(FATAL_ERROR
+            \"\${ZLIB_LB_WHAT}: \${ZLIB_LB_EXECUTABLE} records no dependency on \"
+            \"\${ZLIB_LB_SONAME} at all, so nothing was verified.  Loader map \"
+            \"(via \${_how}):\\n\${_trace}\")
+endif()
+
+if(_resolved STREQUAL \"not\")
+    message(FATAL_ERROR
+            \"\${ZLIB_LB_WHAT}: \${ZLIB_LB_SONAME} is not found by the loader for \"
+            \"\${ZLIB_LB_EXECUTABLE}.  Loader map (via \${_how}):\\n\${_trace}\")
+endif()
+
+# Canonical on both sides: the staged and installed artifacts are reached through
+# a libz.so -> libz.so.1 -> libz.so.<version> chain, so the loader reports one
+# name and this file names another, and only the real file they share settles
+# whether the right library was bound.
+get_filename_component(_resolved_real \"\${_resolved}\" REALPATH)
+get_filename_component(_expected_real \"\${ZLIB_LB_EXPECTED}\" REALPATH)
+
+if(NOT _resolved_real STREQUAL _expected_real)
+    message(FATAL_ERROR
+            \"\${ZLIB_LB_WHAT}: \${ZLIB_LB_EXECUTABLE} binds \${ZLIB_LB_SONAME} to \"
+            \"\${_resolved} (really \${_resolved_real}), not to the artifact this \"
+            \"build produced, \${ZLIB_LB_EXPECTED} (really \${_expected_real}).  A \"
+            \"drop-in test that ran against a different library would report \"
+            \"success while proving nothing.  Loader map (via \${_how}):\\n\${_trace}\")
+endif()
+
+message(STATUS \"\${ZLIB_LB_WHAT}: \${ZLIB_LB_SONAME} binds to \${_expected_real} \"
+               \"(via \${_how})\")
+")
+
+        # The build-tree case.  $<TARGET_FILE:> is available because the target
+        # belongs to this project; the expected artifact is the versioned file
+        # the staging rules produced, which the parent scope names.
+        add_test(
+            NAME zlib_rust_loader_binding
+            COMMAND
+                ${CMAKE_COMMAND}
+                -DZLIB_LB_EXECUTABLE=$<TARGET_FILE:zlib_example> -DZLIB_LB_DIR=
+                -DZLIB_LB_NAME= -DZLIB_LB_CONFIG=$<CONFIG>
+                -DZLIB_LB_SONAME=${ZLIB_RUST_SONAME}
+                -DZLIB_LB_EXPECTED=${ZLIB_RUST_LIBRARY}
+                -DZLIB_LB_LDD=${LDD_EXECUTABLE}
+                "-DZLIB_LB_WHAT=build-tree loader binding" -P
+                ${ZLIB_LOADER_BINDING_SCRIPT})
     endif(
         ZLIB_BUILD_RUST
         AND UNIX
@@ -154,7 +354,7 @@ if(ZLIB_BUILD_STATIC)
         zlib_static_example
         PRIVATE ZLIB_BUILD
                 $<$<BOOL:${HAVE___ATTR__VIS_HIDDEN}>:HAVE_HIDDEN>)
-    add_test(NAME zlib_static_example COMMAND zlib_static_example)
+    zlib_addexampletest(zlib_static_example)
 
     add_executable(static_minigzip minigzip.c)
     target_link_libraries(static_minigzip ZLIB::ZLIBSTATIC)
@@ -229,8 +429,17 @@ if(ZLIB_BUILD_STATIC)
                 ${GCOV_EXECUTABLE} ${llvm_option}
                 ${CMAKE_CURRENT_SOURCE_DIR}/infcover.c -o
                 ${INFCOVER_DIR}/infcover.c.gcda)
+        # zlib_coverage, with an underscore: the test registered directly
+        # above is named zlib_coverage, and `zlib-coverage' with a hyphen is no
+        # test at all.  CTest does not object to a DEPENDS naming something that
+        # does not exist -- it simply has nothing to order against -- so the
+        # dependency has been silently void, and this is the only DEPENDS in the
+        # suite that failed to resolve.  It matters under `ctest -j', where
+        # nothing then stops gcov from running before infcover has produced
+        # infcover.c.gcda and reporting on a coverage file that is absent or
+        # left over from an earlier run.
         set_tests_properties(zlib_coverage-summary PROPERTIES DEPENDS
-                                                              zlib-coverage)
+                                                              zlib_coverage)
         set(CMAKE_C_FLAGS
             ${CFLAGS_OLD}
             CACHE STRING "" FORCE)
@@ -244,12 +453,13 @@ if(ZLIB_BUILD_STATIC)
             PRIVATE ZLIB_BUILD
                     $<$<BOOL:${HAVE___ATTR__VIS_HIDDEN}>:HAVE_HIDDEN>)
         target_link_libraries(zlib_static_example64 ZLIB::ZLIBSTATIC)
-        add_test(NAME zlib_static_example64 COMMAND zlib_static_example64)
+        zlib_addexampletest(zlib_static_example64)
     endif(HAVE_OFF64_T)
 endif(ZLIB_BUILD_STATIC)
 
-# minigzip and static_minigzip are built above and, until now, never run: no
-# add_test named either of them, so the one driver in this directory that
+# minigzip and static_minigzip are built above.  Building a driver is not running
+# it, and for a long time no add_test named either of them, so the one driver in
+# this directory that
 # exercises the gzFile layer as a program -- gzopen, gzwrite, gzread, gzclose
 # and gzerror over a real file, rather than the in-memory calls example.c makes
 # -- went untested by ctest in both implementations.  A round trip through the
@@ -336,31 +546,45 @@ foreach(driver IN LISTS ZLIB_MINIGZIP_DRIVERS)
         OR CYGWIN)
 endforeach(driver IN LISTS ZLIB_MINIGZIP_DRIVERS)
 
-# Everything from here on consumes an installation: the fixture that produces
-# one, the three find_package cases that resolve a package out of it, and the
-# two add_subdirectory cases that are handed it as their install prefix.  With
-# ZLIB_INSTALL OFF this project installs nothing, so none of them can pass --
-# upstream they are registered all the same and four of them fail outright,
-# taking their dependents with them, identically in C and in Rust mode -- and a
-# case that cannot pass measures nothing while making a legitimate configuration
-# look broken.  Registering them only when there is an installation to consume
-# leaves every other configuration's set of cases exactly as it was,
-# ZLIB_INSTALL being ON by default.
-if(NOT ZLIB_INSTALL)
-    return()
-endif(NOT ZLIB_INSTALL)
+# The remaining cases come in two kinds, and the difference decides which of
+# them a ZLIB_INSTALL=OFF configuration can still run.
+#
+# * The three find_package cases CONSUME AN INSTALLATION: they resolve a package
+#   out of a prefix this suite installs into.  With ZLIB_INSTALL OFF this
+#   project installs nothing, so none of them can pass -- upstream they are
+#   registered all the same and fail outright, taking their dependents with
+#   them, identically in C and in Rust mode -- and a case that cannot pass
+#   measures nothing while making a legitimate configuration look broken.  They
+#   are therefore registered only when there is an installation to consume.
+# * The two add_subdirectory cases CONSUME THE SOURCE.  They re-configure zlib
+#   from this very tree inside a nested project and link what that produces;
+#   they never read the install prefix.  They used to sit behind the same guard
+#   and to carry FIXTURES_REQUIRED zlib_install, which made a -DZLIB_INSTALL=OFF
+#   build silently stop testing source consumption altogether -- the one form of
+#   consumption that has nothing to do with installing.  They are now registered
+#   unconditionally, and the install fixture is not among their prerequisites.
+#
+# ZLIB_INSTALL is ON by default, so every other configuration's set of cases is
+# exactly what it was.
+if(ZLIB_INSTALL)
+    add_test(
+        NAME zlib_install
+        COMMAND ${CMAKE_COMMAND} --install ${zlib_BINARY_DIR} --prefix
+                ${CMAKE_CURRENT_BINARY_DIR}/test_install --config $<CONFIG>
+        WORKING_DIRECTORY ${zlib_BINARY_DIR})
 
-add_test(
-    NAME zlib_install
-    COMMAND ${CMAKE_COMMAND} --install ${zlib_BINARY_DIR} --prefix
-            ${CMAKE_CURRENT_BINARY_DIR}/test_install --config $<CONFIG>
-    WORKING_DIRECTORY ${zlib_BINARY_DIR})
+    set_tests_properties(zlib_install PROPERTIES FIXTURES_SETUP zlib_install)
+endif(ZLIB_INSTALL)
 
-set_tests_properties(zlib_install PROPERTIES FIXTURES_SETUP zlib_install)
-
+# One directory per configured fixture, and every name here must match the
+# configure_file destination below: the two `find_package_*' spellings named
+# directories that nothing ever wrote to, while the fixtures themselves went to
+# `findpackage_*'.  configure_file creates a missing parent itself, so the
+# mismatch was harmless and therefore silent -- and it is exactly the sort of
+# near-miss that makes the F12 defect above easy to introduce.
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/findpackage_test)
-file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/find_package_no_components_test)
-file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/find_package_wrong_components_test)
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/findpackage_no_components_test)
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/findpackage_wrong_components_test)
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_test)
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_exclude_test)
 
@@ -391,8 +615,15 @@ set(GENERATOR ${CMAKE_GENERATOR_PLATFORM})
 if(GENERATOR)
     set(PLATFORM "-A ${GENERATOR}")
 endif(GENERATOR)
+
+# ★ Nested cmake invocations are run with a standard input that carries nothing.
 #
-# findpackage_test
+# The two add_subdirectory fixtures below build zlib from source, so in Rust
+# mode their nested `cmake --build' runs cargo -- and before building anything
+# cargo asks the compiler about the target by running `rustc - --crate-name ___
+# --print=file-names ...', where that `-' means rustc reads its program text
+# from STANDARD INPUT.  When that probe had to run inside ctest, those two cases
+# failed roughly one run in three:
 #
 add_test(
     NAME zlib_find_package_configure
@@ -433,90 +664,227 @@ set_tests_properties(
 # incompletely would satisfy the first case and not this one.  It asserts
 # against the consumer the fixture directly above has just built out of that
 # installation, which is the same thing a real consumer does:
-# find_package(ZLIB), link, run.  The expressions are the ones the build-tree
-# case uses and are explained there; the installed prefix lives under this build
-# directory, so a SONAME resolving into a system prefix still fails.
+# find_package(ZLIB), link, run.
 #
-# The path cannot come from a generator expression because the executable
-# belongs to a nested project this build does not know the targets of, which is
-# also why the case is registered only for a single-configuration generator:
-# there the consumer's build directory holds the executable directly, whereas a
-# multi-config generator puts it in a per-configuration subdirectory this file
-# cannot name.  That is the same boundary the staged drop-in already documents.
-if(ZLIB_BUILD_RUST
-   AND ZLIB_BUILD_SHARED
-   AND LDD_EXECUTABLE
-   AND NOT IS_MULTI)
+# Two things that used to narrow this case are gone.  It is no longer
+# conditional on ldd, because the script it runs falls back to the loader's own
+# LD_TRACE_LOADED_OBJECTS and so needs no tool; and it is no longer restricted
+# to a single-configuration generator.  $<TARGET_FILE:> is still unavailable --
+# the executable belongs to a nested project whose targets this build does not
+# know -- but that only means the path is not known HERE, and the script is
+# given the directory, the file name and the configuration and finds it under
+# either layout.  Skipping the installed check on a multi-config generator meant
+# the one configuration most likely to get the install rules wrong was the one
+# that never checked them.
+#
+# The expected artifact is the versioned file inside the test prefix, which is
+# where the Rust install rules put the real library with libz.so.1 and libz.so
+# pointing at it.  Comparing canonical paths is what makes the case meaningful:
+# the installed prefix is under this build directory, but so would be a stray
+# copy, and only the exact file settles it.
+if(ZLIB_BUILD_RUST AND ZLIB_BUILD_SHARED)
     add_test(
         NAME zlib_rust_loader_binding_installed
-        COMMAND ${LDD_EXECUTABLE}
-                ${CMAKE_CURRENT_BINARY_DIR}/findpackage_test_build/test_example)
+        COMMAND
+            ${CMAKE_COMMAND} -DZLIB_LB_EXECUTABLE=
+            -DZLIB_LB_DIR=${CMAKE_CURRENT_BINARY_DIR}/findpackage_test_build
+            -DZLIB_LB_NAME=test_example -DZLIB_LB_CONFIG=$<CONFIG>
+            -DZLIB_LB_SONAME=${ZLIB_RUST_SONAME}
+            -DZLIB_LB_EXPECTED=${CMAKE_CURRENT_BINARY_DIR}/test_install/${CMAKE_INSTALL_LIBDIR}/${ZLIB_RUST_SHARED_LIBV}
+            -DZLIB_LB_LDD=${LDD_EXECUTABLE}
+            "-DZLIB_LB_WHAT=installed loader binding" -P
+            ${ZLIB_LOADER_BINDING_SCRIPT})
+    set_tests_properties(zlib_rust_loader_binding_installed
+                         PROPERTIES FIXTURES_REQUIRED fp_build)
+endif(ZLIB_BUILD_RUST AND ZLIB_BUILD_SHARED)
+
+#
+# static_link_closure_test
+#
+# Static consumption of the installed Rust libz.a with -nodefaultlibs, so that the
+# native runtime libraries the archive needs have to come from
+# ZLIB::ZLIBSTATIC's own interface rather than from whatever the compiler driver
+# and a modern libc happen to contribute.  zlib_test_example_static above is the
+# plain link and would stay green with the advertisement removed entirely, which
+# is precisely why this case exists beside it rather than instead of it.  The
+# nested project's own comment carries the full argument.
+#
+# Registered only for the Rust build: the C libz.a needs no companion libraries,
+# so the same link would fail there on printf rather than on anything zlib
+# advertises, and ZLIB_BUILD_STATIC is required because the case consumes the
+# static component.  Single-configuration generators only, for the reason the
+# installed loader assertion above gives -- a multi-config generator puts the
+# consumer's executable in a per-configuration subdirectory this file cannot
+# name, and CTest here runs the nested build's own test list rather than a path.
+if(ZLIB_BUILD_RUST AND ZLIB_BUILD_STATIC AND NOT IS_MULTI)
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/static_link_closure_test)
+
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/static_link_closure_test.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/static_link_closure_test/CMakeLists.txt
+        @ONLY)
+
+    # The check script is copied beside the generated project rather than
+    # referenced in the source tree, so the nested build reads it from the same
+    # place it reads its own CMakeLists.txt and needs no path back into the
+    # checkout.
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/check_pc_private.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/static_link_closure_test/check_pc_private.cmake
+        COPYONLY)
+
+    add_test(
+        NAME zlib_static_link_closure_configure
+        COMMAND
+            ${CMAKE_COMMAND} ${PLATFORM}
+            -B${CMAKE_CURRENT_BINARY_DIR}/static_link_closure_test_build
+            -DCMAKE_BUILD_TYPE=$<CONFIG> -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+            -DCMAKE_C_FLAGS=${CMAKE_C_FLAGS}
+            -DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/test_install
+            --fresh -G "${CMAKE_GENERATOR}"
+            -S${CMAKE_CURRENT_BINARY_DIR}/static_link_closure_test)
+
+    add_test(
+        NAME zlib_static_link_closure_build
+        COMMAND ${CMAKE_COMMAND} --build . --config $<CONFIG>
+        WORKING_DIRECTORY
+            ${CMAKE_CURRENT_BINARY_DIR}/static_link_closure_test_build)
+
+    add_test(
+        NAME zlib_static_link_closure_test
+        COMMAND ${CMAKE_CTEST_COMMAND} -C $<CONFIG>
+        WORKING_DIRECTORY
+            ${CMAKE_CURRENT_BINARY_DIR}/static_link_closure_test_build)
+
     set_tests_properties(
-        zlib_rust_loader_binding_installed
-        PROPERTIES FIXTURES_REQUIRED fp_build PASS_REGULAR_EXPRESSION
-                   "libz\\.so\\.1 => /" FAIL_REGULAR_EXPRESSION
-                   "libz\\.so\\.1 => /(usr/)?lib")
-endif(
-    ZLIB_BUILD_RUST
-    AND ZLIB_BUILD_SHARED
-    AND LDD_EXECUTABLE
-    AND NOT IS_MULTI)
+        zlib_static_link_closure_configure
+        PROPERTIES FIXTURES_REQUIRED zlib_install FIXTURES_SETUP slc_config)
 
-#
-# findpackage_no_components_test
-#
-add_test(
-    NAME zlib_find_package_no_components_configure
-    COMMAND
-        ${CMAKE_COMMAND} ${PLATFORM}
-        -B${CMAKE_CURRENT_BINARY_DIR}/findpackage_no_components_test_build
-        -DCMAKE_BUILD_TYPE=$<CONFIG> -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
-        -DCMAKE_C_FLAGS=${CMAKE_C_FLAGS}
-        -DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/test_install --fresh
-        -G "${CMAKE_GENERATOR}"
-        -S${CMAKE_CURRENT_BINARY_DIR}/findpackage_no_components_test)
-
-set_tests_properties(
-    zlib_find_package_no_components_configure
-        PROPERTIES FIXTURES_REQUIRED zlib_install)
-
-if(NOT ZLIB_BUILD_SHARED OR NOT ZLIB_BUILD_STATIC)
     set_tests_properties(
-        zlib_find_package_no_components_configure
-            PROPERTIES WILL_FAIL TRUE)
-endif(NOT ZLIB_BUILD_SHARED OR NOT ZLIB_BUILD_STATIC)
+        zlib_static_link_closure_build
+        PROPERTIES FIXTURES_REQUIRED slc_config FIXTURES_SETUP slc_build)
 
-#
-# findpackage_no_component_test
-#
-add_test(
-    NAME zlib_find_package_wrong_components_configure
-    COMMAND
-        ${CMAKE_COMMAND} ${PLATFORM}
-        -B${CMAKE_CURRENT_BINARY_DIR}/findpackage_wrong_components_test_build
-        -DCMAKE_BUILD_TYPE=$<CONFIG> -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
-        -DCMAKE_C_FLAGS=${CMAKE_C_FLAGS}
-        -DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/test_install --fresh
-        -G "${CMAKE_GENERATOR}"
-        -S${CMAKE_CURRENT_BINARY_DIR}/findpackage_wrong_components_test)
+    set_tests_properties(
+        zlib_static_link_closure_test
+        PROPERTIES FIXTURES_REQUIRED slc_build ENVIRONMENT
+                   CTEST_OUTPUT_ON_FAILURE=1)
+endif(ZLIB_BUILD_RUST AND ZLIB_BUILD_STATIC AND NOT IS_MULTI)
 
-set_tests_properties(
-    zlib_find_package_wrong_components_configure
-        PROPERTIES FIXTURES_REQUIRED zlib_install
-                   WILL_FAIL TRUE)
+    set_tests_properties(
+        zlib_find_package_build PROPERTIES FIXTURES_REQUIRED fp_config
+                                           FIXTURES_SETUP fp_build)
+
+    set_tests_properties(
+        zlib_find_package_test PROPERTIES FIXTURES_REQUIRED fp_build
+                                          ENVIRONMENT CTEST_OUTPUT_ON_FAILURE=1)
+
+    # The loader assertion above covers the build tree; this one covers the
+    # installed prefix, which is a different chain of names produced by a
+    # different set of rules -- install() copies the versioned library and its
+    # three links separately -- so a build that staged the chain correctly and
+    # installed it incompletely would satisfy the first case and not this one.
+    # It asserts against the consumer the fixture directly above has just built
+    # out of that installation, which is the same thing a real consumer does:
+    # find_package(ZLIB), link, run.
+    #
+    # It runs the same script the build-tree case does and is therefore just as
+    # strict: the resolved path is canonicalised and compared against the exact
+    # library this project installed, and an absent loader tool fails rather
+    # than skipping.  EXPECTED is the installed versioned name, which is the
+    # real file install() copies -- libz.so.1 and libz.so are installed as links
+    # to it, so canonicalising both sides is what makes the two chains
+    # comparable.
+    #
+    # The consumer's path cannot come from a generator expression because it
+    # belongs to a nested project this build does not know the targets of.  The
+    # case is registered unconditionally in Rust shared mode all the same: the
+    # multi-configuration generator that used to be the reason for a NOT
+    # IS_MULTI guard here -- a per-configuration subdirectory this file cannot
+    # name -- is now refused outright by the root CMakeLists.txt in Rust mode,
+    # so there is no configuration left in which the path is unknowable.
+    if(ZLIB_BUILD_RUST AND ZLIB_BUILD_SHARED)
+        add_test(
+            NAME zlib_rust_loader_binding_installed
+            COMMAND
+                ${CMAKE_COMMAND} -DLOADER=${LDD_EXECUTABLE}
+                -DEXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/findpackage_test_build/test_example
+                -DEXPECTED=${CMAKE_CURRENT_BINARY_DIR}/test_install/${CMAKE_INSTALL_LIBDIR}/${ZLIB_RUST_SHARED_LIBV}
+                -DSONAME=${ZLIB_RUST_SONAME} -P ${ZLIB_LOADER_SCRIPT})
+        set_tests_properties(zlib_rust_loader_binding_installed
+                             PROPERTIES FIXTURES_REQUIRED fp_build)
+    endif(ZLIB_BUILD_RUST AND ZLIB_BUILD_SHARED)
+
+    #
+    # findpackage_no_components_test
+    #
+    add_test(
+        NAME zlib_find_package_no_components_configure
+        COMMAND
+            ${CMAKE_COMMAND} ${PLATFORM}
+            -B${CMAKE_CURRENT_BINARY_DIR}/findpackage_no_components_test_build
+            -DCMAKE_BUILD_TYPE=$<CONFIG> -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+            -DCMAKE_C_FLAGS=${CMAKE_C_FLAGS}
+            -DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/test_install
+            --fresh -G "${CMAKE_GENERATOR}"
+            -S${CMAKE_CURRENT_BINARY_DIR}/findpackage_no_components_test)
+
+    set_tests_properties(zlib_find_package_no_components_configure
+                         PROPERTIES FIXTURES_REQUIRED zlib_install)
+
+    if(NOT ZLIB_BUILD_SHARED OR NOT ZLIB_BUILD_STATIC)
+        set_tests_properties(zlib_find_package_no_components_configure
+                             PROPERTIES WILL_FAIL TRUE)
+    endif(NOT ZLIB_BUILD_SHARED OR NOT ZLIB_BUILD_STATIC)
+
+    #
+    # findpackage_no_component_test
+    #
+    add_test(
+        NAME zlib_find_package_wrong_components_configure
+        COMMAND
+            ${CMAKE_COMMAND} ${PLATFORM}
+            -B${CMAKE_CURRENT_BINARY_DIR}/findpackage_wrong_components_test_build
+            -DCMAKE_BUILD_TYPE=$<CONFIG> -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+            -DCMAKE_C_FLAGS=${CMAKE_C_FLAGS}
+            -DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/test_install
+            --fresh -G "${CMAKE_GENERATOR}"
+            -S${CMAKE_CURRENT_BINARY_DIR}/findpackage_wrong_components_test)
+
+    set_tests_properties(
+        zlib_find_package_wrong_components_configure
+        PROPERTIES FIXTURES_REQUIRED zlib_install WILL_FAIL TRUE)
+endif(ZLIB_INSTALL)
 
 #
 # add_subdirectory_test
 #
-# This fixture and the exclude one below forward only CMAKE_BUILD_TYPE,
-# CMAKE_C_COMPILER, CMAKE_C_FLAGS and CMAKE_INSTALL_PREFIX, so the nested build
-# re-configures zlib from source with ZLIB_BUILD_RUST at its default and
-# exercises the C library even when the outer tree was configured with the
-# option ON.  The three find_package fixtures above behave differently because
-# they consume what was installed, which is the implementation the outer build
-# selected.  Forwarding the option would change what these two cases have always
-# tested and would make a pure consumption fixture require a Rust toolchain, so
-# the difference is recorded here rather than removed.
+# -S names add_subdirectory_test, which is what makes this case an
+# add_subdirectory case at all.
+#
+# Both this fixture and the exclude one below used to point -S at
+# findpackage_test.  The consequence was not a small one: the two CMakeLists.txt
+# files configured from add_subdirectory_test.cmake.in and
+# add_subdirectory_exclude_test.cmake.in were written into the build tree and
+# then never read by anything, while these six cases silently re-ran the
+# find_package fixture a further two times.  `add_subdirectory' consumption --
+# the mode in which a project vendors this tree and builds it as part of its own
+# build, with no install step and no package config -- had therefore never been
+# exercised, in either implementation, and neither had EXCLUDE_FROM_ALL.  The
+# defect was invisible because a duplicate of a passing case passes: the give-away
+# was CMAKE_HOME_DIRECTORY in add_subdirectory_test_build/CMakeCache.txt naming
+# findpackage_test.
+#
+# ZLIB_BUILD_RUST is forwarded, together with the cargo path and SIMD selection
+# the root CMakeLists.txt needs to act on it.  These two cases build zlib from
+# source rather than consuming an installation, so unless the option travels with
+# them the nested build takes it at its default and compiles the C library --
+# which would mean that in Rust mode the one consumption path that builds from
+# source is the one path never testing the Rust library.  AAP 0.8.3 requires
+# ZLIB::ZLIB and ZLIB::ZLIBSTATIC to resolve to the Rust artifacts whenever the
+# Rust build is selected, and these fixtures are named there as the integration
+# fixtures that must keep passing.  Forwarding costs nothing in C mode, where the
+# variables are OFF and empty, and in Rust mode the outer build has already
+# required the same toolchain, so no configuration acquires a new prerequisite.
 add_test(
     NAME zlib_add_subdirectory_configure
     COMMAND
@@ -524,26 +892,54 @@ add_test(
         -B${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_test_build
         -DCMAKE_BUILD_TYPE=$<CONFIG> -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
         -DCMAKE_C_FLAGS=${CMAKE_C_FLAGS}
-        -DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/test_install --fresh
-        -G "${CMAKE_GENERATOR}" -S${CMAKE_CURRENT_BINARY_DIR}/findpackage_test)
+        -DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/test_install
+        -DZLIB_BUILD_RUST=${ZLIB_BUILD_RUST}
+        -DZLIB_CARGO_EXECUTABLE=${ZLIB_CARGO_EXECUTABLE}
+        -DZLIB_RS_SIMD=${ZLIB_RS_SIMD} --fresh -G "${CMAKE_GENERATOR}"
+        -S${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_test)
 
-add_test(
-    NAME zlib_add_subdirectory_build
-    COMMAND ${CMAKE_COMMAND} --build . --config $<CONFIG>
-    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_test_build)
+zlib_add_nested_test(
+    zlib_add_subdirectory_build
+    ${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_test_build
+    ${CMAKE_COMMAND}
+    --build
+    .
+    --config
+    $<CONFIG>)
 
 add_test(
     NAME zlib_add_subdirectory_test
     COMMAND ${CMAKE_CTEST_COMMAND} -C $<CONFIG>
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_test_build)
 
-set_tests_properties(
-    zlib_add_subdirectory_configure PROPERTIES FIXTURES_REQUIRED zlib_install
-                                               FIXTURES_SETUP as_config)
+# RESOURCE_LOCK on the configure and build steps of BOTH add_subdirectory
+# fixtures, so that the two never run at the same time under `ctest -j'.
+#
+# This is a resource decision and nothing more.  These two cases now build zlib
+# from source, so in Rust mode each one runs a full release cargo build of the
+# workspace; two of those concurrently doubles the peak memory and compiler
+# parallelism on the machine and makes both slower and their durations
+# unpredictable, which matters because the build step is the longest test in
+# this file.  Serialising them costs nothing that `ctest -j' can otherwise use,
+# since cargo already saturates the machine on its own.
+#
+# It is NOT what makes these tests reliable.  The intermittent failures seen
+# here under `ctest -j' -- rustc reporting `unknown start of token' on
+# `<anon>:1' whose text was another process's output -- came from cargo's `rustc
+# -' target probe reading an inherited standard input, and RESOURCE_LOCK was
+# tried against them first and did not stop them: the problem is inheritance
+# rather than concurrency, so one readable standard input anywhere above cargo
+# is enough.  What fixes it is zlib_add_nested_test, which runs each nested
+# cmake through a script that gives the whole subtree the null device on
+# standard input; see the note on that function above.  The name is arbitrary
+# and shared; nothing else in this file claims it.
+set_tests_properties(zlib_add_subdirectory_configure
+                     PROPERTIES FIXTURES_SETUP as_config RESOURCE_LOCK cargo)
 
 set_tests_properties(
-    zlib_add_subdirectory_build PROPERTIES FIXTURES_REQUIRED as_config
-                                           FIXTURES_SETUP as_build)
+    zlib_add_subdirectory_build
+    PROPERTIES FIXTURES_REQUIRED as_config FIXTURES_SETUP as_build
+               RESOURCE_LOCK cargo)
 
 set_tests_properties(
     zlib_add_subdirectory_test PROPERTIES FIXTURES_REQUIRED as_build
@@ -552,6 +948,11 @@ set_tests_properties(
 #
 # add_subdirectory_exclude_test
 #
+# -S names add_subdirectory_exclude_test, for the reason recorded at the case
+# above, and this is the only case anywhere in the suite that exercises
+# EXCLUDE_FROM_ALL: a vendoring project that does not want zlib's own targets in
+# its default build still has to be able to link them.  The same variables are
+# forwarded, so in Rust mode the excluded subdirectory builds the Rust library.
 add_test(
     NAME zlib_add_subdirectory_exclude_configure
     COMMAND
@@ -559,14 +960,20 @@ add_test(
         -B${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_exclude_test_build
         -DCMAKE_BUILD_TYPE=$<CONFIG> -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
         -DCMAKE_C_FLAGS=${CMAKE_C_FLAGS}
-        -DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/test_install --fresh
-        -G "${CMAKE_GENERATOR}" -S${CMAKE_CURRENT_BINARY_DIR}/findpackage_test)
+        -DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/test_install
+        -DZLIB_BUILD_RUST=${ZLIB_BUILD_RUST}
+        -DZLIB_CARGO_EXECUTABLE=${ZLIB_CARGO_EXECUTABLE}
+        -DZLIB_RS_SIMD=${ZLIB_RS_SIMD} --fresh -G "${CMAKE_GENERATOR}"
+        -S${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_exclude_test)
 
-add_test(
-    NAME zlib_add_subdirectory_exclude_build
-    COMMAND ${CMAKE_COMMAND} --build . --config $<CONFIG>
-    WORKING_DIRECTORY
-        ${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_exclude_test_build)
+zlib_add_nested_test(
+    zlib_add_subdirectory_exclude_build
+    ${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_exclude_test_build
+    ${CMAKE_COMMAND}
+    --build
+    .
+    --config
+    $<CONFIG>)
 
 add_test(
     NAME zlib_add_subdirectory_exclude_test
@@ -574,9 +981,8 @@ add_test(
     WORKING_DIRECTORY
         ${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_exclude_test_build)
 
-set_tests_properties(
-    zlib_add_subdirectory_exclude_configure
-    PROPERTIES FIXTURES_REQUIRED zlib_install FIXTURES_SETUP asx_config)
+set_tests_properties(zlib_add_subdirectory_exclude_configure
+                     PROPERTIES FIXTURES_SETUP asx_config RESOURCE_LOCK cargo)
 
 # asx_config, not as_config: this build belongs to the exclude fixture set up
 # directly above, and requiring the other fixture's configure step is what let
@@ -585,8 +991,9 @@ set_tests_properties(
 # ^zlib_add_subdirectory_exclude_build$' pulling in the wrong prerequisite and
 # reporting Not Run.
 set_tests_properties(
-    zlib_add_subdirectory_exclude_build PROPERTIES FIXTURES_REQUIRED asx_config
-                                                   FIXTURES_SETUP asx_build)
+    zlib_add_subdirectory_exclude_build
+    PROPERTIES FIXTURES_REQUIRED asx_config FIXTURES_SETUP asx_build
+               RESOURCE_LOCK cargo)
 
 set_tests_properties(
     zlib_add_subdirectory_exclude_test

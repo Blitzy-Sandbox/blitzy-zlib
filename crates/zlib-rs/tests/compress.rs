@@ -58,7 +58,8 @@
 //! Byte-for-byte equality against the C encoder over the whole
 //! level x `windowBits` x `memLevel` x strategy x flush matrix is a different
 //! job, belonging to `crates/zlib-rs-differential`, the crate that can link the C
-//! oracle; it has no test suite, so that equality is unverified. What this suite
+//! oracle; its `tests/byte_identical.rs` establishes that equality, and its
+//! `tests/table_equality.rs` establishes the transcribed tables. What this suite
 //! owns is the wrapper: the bound arithmetic, the chunking loop's shape, the
 //! bidirectional accounting, and the status ladder.
 //!

@@ -27,11 +27,11 @@
 # WHY IT EXISTS
 #
 # Solely so that `cargo bench` has large, heterogeneous, realistic input.  The
-# suites planned for the repository root -- benches/deflate_bench.rs and
-# benches/inflate_bench.rs, which ../Cargo.toml already declares as `[[bench]]`
-# entries although neither file has been written yet -- are to measure throughput
-# against the in-tree C reference, and throughput only means something when it is
-# measured on data of realistic size and variety.  Silesia is the standard corpus for exactly that.  This is
+# suites at the repository root -- benches/deflate_bench.rs and
+# benches/inflate_bench.rs, attached to this crate by the `[[bench]]` entries in
+# ../Cargo.toml -- measure throughput against the in-tree C reference, and
+# throughput only means something when it is measured on data of realistic size
+# and variety.  Silesia is the standard corpus for exactly that.  This is
 # tier 2 of the two-tier corpus described in AAP 0.6.4.4, and it is the
 # resolution of AAP 0.8.2 ambiguity #5: corpus acquisition was left
 # unspecified by the requirements, and a download performed at build time or
@@ -163,8 +163,16 @@ ZLIB_RS_SILESIA_DIR=${ZLIB_RS_SILESIA_DIR:-}
 # page is https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia and the
 # archive is the single zip below.  This URL is upstream-controlled and may
 # move or disappear without notice, which is precisely why it lives in a
-# variable: override it to point at a mirror or at a local copy (`file://...`,
-# which curl accepts) rather than editing this script.
+# variable: override it to point at an HTTPS mirror rather than editing this
+# script.
+#
+# HTTPS ONLY, and the check is fail-closed.  `is_safe_url` runs at the entry
+# point of `main` and accepts nothing but `https://` followed by a non-empty
+# remainder with no whitespace or control character in it, so `http://`,
+# `file://` and every other scheme are refused before anything is read,
+# downloaded or created.  If what you have is a local copy, either serve it
+# over HTTPS or install it into the destination directory yourself and do not
+# run this script -- there is deliberately no scheme here that reads a path.
 ZLIB_RS_SILESIA_URL=${ZLIB_RS_SILESIA_URL:-https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip}
 
 # The sentinel that means "no digest has been pinned yet".  It is deliberately
@@ -418,9 +426,13 @@ Environment:
                            <repo-root>/target/silesia, which the root
                            .gitignore already ignores.  The benchmarks read
                            this same variable, so set it for them too.
-  ZLIB_RS_SILESIA_URL      Source archive URL.  Override to use a mirror or a
-                           local copy.  Change it and the expected digest
-                           together: they identify one archive, jointly.
+  ZLIB_RS_SILESIA_URL      Source archive URL.  Must begin with https:// and
+                           carry no whitespace or control character; every
+                           other scheme, http:// and file:// included, is
+                           refused before anything is downloaded.  Override it
+                           to use an HTTPS mirror, and change it and the
+                           expected digest together: they identify one
+                           archive, jointly.
   ZLIB_RS_SILESIA_SHA256   Expected SHA-256, as for --sha256.  Used when
                            --sha256 is absent; itself overridden by nothing.
                            REQUIRED unless --sha256 is given: no digest is
@@ -983,42 +995,35 @@ stage_create() {
 #      the following argument as an operand whatever it starts with, which is
 #      the general fix and the one that does not depend on this function.
 #   2. This function allowlists the scheme, which is the same check stated
-#      positively: an argument that must begin with `http://`, `https://` or
-#      `file://` cannot begin with `-`.
+#      positively: an argument that must begin with `https://` cannot begin
+#      with `-`.
 #
-# Those three schemes are exactly the ones this script documents -- the
-# published https archive, plain http for a mirror without TLS, and `file://`
-# for a local copy.  Anything else is refused rather than forwarded, including
-# curl-only schemes such as scp://, sftp:// and smb://, whose credential and
-# filesystem behaviour this script has not reasoned about and does not intend
-# to offer.  Case is not folded: schemes are conventionally lower case, and
-# folding would widen the accepted set for no benefit.
+# `https://` is the whole accepted set, and this function agrees with
+# `is_safe_url` deliberately rather than accidentally.  `is_safe_url` runs
+# first, at the top of `main`, and has already refused anything else by the
+# time execution reaches here; the check is repeated at this point because
+# `probe_tools` has now run, so a diagnostic here can name the downloader that
+# was actually selected.  Two checks, one contract: no `http://`, no `file://`,
+# and no curl-only scheme such as scp://, sftp:// or smb://, whose credential
+# and filesystem behaviour this script has not reasoned about and does not
+# intend to offer.  Case is not folded: schemes are conventionally lower case,
+# and folding would widen the accepted set for no benefit.
 #
 # This runs in the pre-flight block in `main`, before the first byte of network
 # traffic and before any filesystem change, so a bad value costs nothing.
 validate_url() {
     case "$ZLIB_RS_SILESIA_URL" in
-        https://?* | http://?*) ;;
-        file://?*)
-            # Measured, not assumed: `wget -O out -- file:///path` answers
-            # "Unsupported scheme" and exits 1.  Saying so here, before the
-            # staging directory exists, beats that diagnostic after a mkdir.
-            if [ "$downloader" != curl ]; then
-                die "ZLIB_RS_SILESIA_URL is a file:// URL, which only curl can
-       read, but curl was not found and $downloader was selected instead:
-           $ZLIB_RS_SILESIA_URL
-       Install curl, or serve the archive over http:// or https://, or copy
-       it into place yourself and skip this script."
-            fi
-            ;;
+        https://?*) ;;
         *)
-            die "ZLIB_RS_SILESIA_URL must begin with https://, http:// or
-       file:// and name something after the scheme.  This does not:
+            die "ZLIB_RS_SILESIA_URL must begin with https:// and name
+       something after the scheme.  This does not:
            $ZLIB_RS_SILESIA_URL
        Any other value is refused rather than handed to $downloader: an
        argument that begins with '-' would be read as an option rather than
        as a URL, and one that begins with another scheme would take this
-       fetch somewhere this script has not reasoned about."
+       fetch somewhere this script has not reasoned about.  If what you have
+       is a local copy, install it into the destination directory yourself
+       instead of running this script."
             ;;
     esac
 }

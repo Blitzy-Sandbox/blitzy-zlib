@@ -55,16 +55,30 @@
 //!
 //! # Coverage, and how to run it
 //!
-//! Three sweeps, because the full cross product of every dimension multiplied by every chunking is
-//! not affordable in one test -- see [Matrix size](#matrix-size) below.
+//! Two sweeps: a fast representative default, and ten `#[ignore]`d shards that between them
+//! enumerate the **whole** 9,922,500-cell product -- every dimension at its full extent, chunkings
+//! included. See [Matrix size](#matrix-size) below.
 //!
 //! ```text
 //! # The fast default. Always runs; representative rather than arbitrary.
 //! cargo test --locked -p zlib-rs-differential --release --test byte_identical
 //!
-//! # The exhaustive sweeps. CI MUST run this line as well as the one above.
+//! # The exhaustive sweeps. The `differential` job in .github/workflows/rust.yml runs this
+//! # line as well as the one above, so both halves are gated on every push.
 //! ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE=1 cargo test --locked -p zlib-rs-differential --release \
 //!     --test byte_identical -- --ignored --test-threads 4
+//!
+//! # One cell-level slice of that product, for splitting it across CI jobs. `1/8` through `8/8`
+//! # are a complete set: the slices are a partition, proved by cell_shards_partition_the_product.
+//! ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE=1 ZLIB_RS_DIFFERENTIAL_SHARD=3/8 \
+//!     cargo test --locked -p zlib-rs-differential --release --test byte_identical -- \
+//!     --ignored --test-threads 4
+//!
+//! # The unabridged form: the same product with the one fixture-size exclusion lifted, so the
+//! # shards report excluded_tiny_window=0 and coverage=100.00%.
+//! ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE=full ZLIB_RS_DIFFERENTIAL_SHARD=3/8 \
+//!     cargo test --locked -p zlib-rs-differential --release --test byte_identical -- \
+//!     --ignored --test-threads 4
 //! ```
 //!
 //! The env var and `--ignored` are **both** required: `#[ignore]` keeps the sweeps out of a default
@@ -74,69 +88,57 @@
 //! `--test-threads` is the parallelism knob and it matters: the exhaustive configuration sweep is
 //! **sharded one level per `#[test]`** precisely so that cargo's own harness can run the shards
 //! concurrently, which needs no dependency and no thread of this file's own. Set it to the runner's
-//! core count.
+//! core count -- the workflow passes `$(nproc)` for that reason.
 //!
-//! # Measured wall clock
+//! # Cost, and what governs it
 //!
-//! On the development machine -- 4 logical cores, `--test-threads 4`:
-//!
-//! ```text
-//! default run, --release   (8 tests)             4.8 s     13,804 cells
-//! default run, debug       (8 tests)              70 s     13,804 cells
-//! exhaustive, --release    (11 tests, --ignored)  1,491 s  2,542,729 cells
-//!   of which: exhaustive_chunking_matrix          31.5 s      29,029 cells
-//!             each of the ten shards          40-510 s     251,370 cells
-//! ```
-//!
-//! So the exhaustive form is about 25 minutes here, and every one of its 2.5 million cells was
-//! byte-identical. **A CI timeout of 45 minutes leaves comfortable headroom** on a 4-core runner,
-//! and ample on a larger one; the per-shard figures are what to scale, since the shards are what
-//! run in parallel. Level 0 is the outlier at 40 s because `deflate_stored` does no match finding
-//! at all.
-//!
-//! A debug build is roughly fifteen times slower, which is why `--release` is in both commands
-//! above -- and why the default sweep is sized so that a bare `cargo test --workspace` in debug
-//! pays about a minute for it rather than the eight it would otherwise. What the default gives up
-//! is enumerated by [`exhaustive_chunking_matrix`]; see [`DEFAULT_TINY_WINDOW_LIMIT`].
+//! The exhaustive form is the long pole of the `differential` job, and three things set its
+//! duration: the shard count, since the shards are what run in parallel; the window size, since a
+//! tiny window over an incompressible fixture costs one `deflate` call per byte through it; and the
+//! profile, since a debug build of this suite is roughly an order of magnitude slower than a release
+//! one. That is why `--release` appears in both commands above, why the default sweep is sized so
+//! that a bare `cargo test --workspace` in debug stays cheap, and why the response to an exhausted
+//! CI budget is to shard further rather than to narrow the matrix. Level 0 is the cheapest shard
+//! because `deflate_stored` does no match finding at all. What the default sweep gives up is
+//! enumerated by [`exhaustive_chunking_matrix`]; see [`DEFAULT_TINY_WINDOW_LIMIT`].
 //!
 //! # Matrix size
 //!
 //! The dimensions are AAP 0.6.4.2's: 10 levels x 21 `windowBits` x 9 `memLevel`s x 5 strategies x 7
-//! flush values x 10 fixtures x several chunkings. The first four multiply out to 9,450
-//! configurations and 66,150 (configuration, flush) pairs, which is 661,500 cells per chunking;
-//! multiplying *that* by the whole chunking set is what is unaffordable, and specifically because
-//! of the tiny windows. `random.bin` and `window_boundary.bin` are incompressible, so a one-byte
-//! window costs one `deflate` call per byte that passes through it -- about 66,600 per side for
-//! `window_boundary.bin` in a single cell. The split is therefore:
+//! flush values x 15 chunkings x 10 fixtures. The first four multiply out to 9,450 configurations
+//! and 66,150 (configuration, flush) pairs, and the whole product is **9,922,500 cells** -- 992,250
+//! per level.
 //!
-//! * The ten [`exhaustive_configuration_matrix_level_0`]-style shards take the **full** cross
-//!   product of level x `windowBits` x `memLevel` x strategy x flush x fixture, one level per
-//!   `#[test]` so that cargo's harness runs them concurrently, at the chunkings whose cost is
-//!   bounded by the input size rather than by the compressed size.
-//! * [`exhaustive_chunking_matrix`] takes the **full** chunking set, including the one-byte output
-//!   window, over every fixture and a configuration set that spans every level, all three container
-//!   formats, all five strategies, all seven flush values and the extreme `memLevel`s.
+//! All of it is enumerated. The ten [`exhaustive_configuration_matrix_level_0`]-style shards each
+//! take one level's full 992,250-cell product, one level per `#[test]` so that cargo's harness runs
+//! them concurrently, and [`ENV_SHARD`] slices each of those by cell so that the product can be
+//! spread across `10 x N` jobs. That is the answer to the cost of the tiny windows -- `random.bin`
+//! and `window_boundary.bin` are incompressible, so a one-byte window costs one `deflate` call per
+//! byte through it, about 66,600 per side for `window_boundary.bin` in a single cell -- and it is
+//! deliberately the answer *run all of it in more places* rather than *enumerate less of it*, since
+//! a matrix trimmed to fit a runner is a matrix whose green result means less than it appears to.
 //!
-//! So every configuration is compared on every fixture, and every chunking is compared on every
-//! fixture. What is not enumerated is the product of the two, and that is a runtime-budget decision
-//! recorded here rather than a narrowing of the matrix to obtain a green run.
-//!
-//! One further constraint applies, and it is the only place any comparison is held back:
-//! [`small_windows_only_on_small_fixtures`] pairs the four tiniest chunkings only with fixtures
-//! below a limit each sweep states for itself. The default sweep sets it low enough to stay fast
-//! ([`DEFAULT_TINY_WINDOW_LIMIT`]), the exhaustive sweeps raise it
-//! ([`EXHAUSTIVE_TINY_WINDOW_LIMIT`]) so that nothing the default held back goes unmeasured, and
-//! `ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE=full` removes it altogether for the truly unabridged run.
+//! One constraint applies, it is the only place any comparison is held back, and it is **counted**:
+//! [`small_windows_only_on_small_fixtures`] pairs the seven sub-64-byte windows only with fixtures
+//! below a limit each sweep states for itself, and every cell it declines appears in that sweep's
+//! `excluded_tiny_window` total. The default sweep sets the limit low enough to stay fast
+//! ([`DEFAULT_TINY_WINDOW_LIMIT`]), the shards raise it ([`EXHAUSTIVE_TINY_WINDOW_LIMIT`]) so that
+//! nothing the default held back goes unmeasured -- 46,305 cells of each shard's 992,250 remain,
+//! all of them `window_boundary.bin` -- and `ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE=full` removes the limit
+//! altogether, which the shards assert leaves `excluded_tiny_window=0`.
 //!
 //! # Contract
 //!
 //! * **A mismatch is a defect in the port, never in the test.** The C array of bytes is
 //!   authoritative. Do not narrow the matrix, compare prefixes, normalise output, add a tolerance
 //!   or `#[ignore]` a failing cell.
-//! * **`unsafe` only where invoking an already-declared `extern "C"` function requires it.** It is
-//!   confined to the [`Side`] implementations, one gate per entry point, each owning a single
-//!   `unsafe` block whose `// SAFETY:` comment names the invariant it relies on. No `#[no_mangle]`
-//!   anywhere -- this crate exports no C symbol -- and never `extern "C-unwind"`.
+//! * **No `unsafe` at all, enforced by `#![forbid(unsafe_code)]` on this file's root.** Invoking an
+//!   `extern "C"` entry point is an `unsafe` operation whichever implementation owns it, so both
+//!   sides are reached through this crate's FFI boundary instead: `crate::port` for the facade and
+//!   `oracle` for the C reference, one gate per entry point, each gate owning the single documented
+//!   `unsafe` block and the `// SAFETY:` comment naming its invariant. The [`Side`] implementations
+//!   below therefore contain call shapes and nothing else. No `#[no_mangle]` anywhere -- this crate
+//!   exports no C symbol -- and never `extern "C-unwind"`.
 //! * **No network, and nothing outside `corpus/minimal/`.** Fixtures are resolved from
 //!   `CARGO_MANIFEST_DIR` and loaded by exact filename, as `corpus/README.md` requires. The Silesia
 //!   tier is deliberately not read here: it belongs to `benches/`, and reading it would make
@@ -145,10 +147,11 @@
 //!   here being meaningful: a single mistyped digit in a transcribed table changes the emitted
 //!   bytes for essentially every input, and would surface here as thousands of failing cells
 //!   pointing at none of them.
-//! * **Not under Miri, by design.** Miri interprets Rust MIR and cannot execute the compiled C
-//!   oracle, so the Miri gate is scoped to `-p zlib-rs`; nightly `AddressSanitizer` covers this
-//!   crate instead, which is where the raw pointers actually are. That is a CI job scope, not
-//!   something to work around here.
+//! * **Under neither sanitizer, by design, and for two different reasons.** Miri interprets Rust
+//!   MIR and cannot execute the compiled C oracle, so the Miri gate is scoped to `-p zlib-rs`. The
+//!   nightly `AddressSanitizer` gate is scoped to `-p libz-rs-sys` and the three relinked C
+//!   drivers, and does not select this crate. Both are CI job scopes rather than anything to work
+//!   around here; what this file relies on instead is that a divergence fails a comparison loudly.
 
 // The workspace lint table denies the panic-prone quartet, which is right for library code and
 // wrong for a test: a test asserts, a failed assertion panics, and slicing a fixture at an offset
@@ -163,9 +166,13 @@
     clippy::indexing_slicing,
     clippy::panic
 )]
+// Both C ABIs this file compares are reached exclusively through the gates in `crate::port` and
+// `oracle`, so nothing here needs `unsafe` and the compiler is asked to keep it that way. The two
+// boundary modules are the only files in this crate the attribute is deliberately absent from;
+// `src/lib.rs` explains why at its ATTRIBUTES block.
+#![forbid(unsafe_code)]
 
 use core::ffi::{c_int, c_uint};
-use core::mem::size_of;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -181,9 +188,11 @@ use libz_rs_sys::{
     Z_STREAM_END, Z_STREAM_ERROR, Z_SYNC_FLUSH, Z_TEXT, Z_TREES,
 };
 
-// The C reference. Every name here is declared in exactly one place -- this crate's `src/oracle.rs`
-// -- and this file adds no `extern "C"` block of its own.
-use zlib_rs_differential::oracle;
+// The two sides of this crate's FFI boundary. Every `extern "C"` declaration and every `unsafe`
+// call this comparison performs lives in exactly one of these two modules -- `oracle` for the C
+// reference, `port` for the facade -- and this file adds no `extern "C"` block and no `unsafe` block
+// of its own.
+use zlib_rs_differential::{oracle, port};
 
 // The two variants are imported unqualified so that the fixture table below stays readable as a
 // table; everything else in this file spells its types out.
@@ -554,25 +563,6 @@ const SINGLE_SHOT: Chunking = Chunking {
     output: None,
 };
 
-/// The chunkings whose cost is proportional to the *input* size, so they can afford to ride the
-/// full configuration cross product.
-///
-/// A small `avail_in` costs one call per chunk of input, which for this corpus is bounded by 91,231
-/// bytes in total. A small `avail_out` costs one call per byte of *output*, which for the two
-/// incompressible fixtures is very nearly as many calls but which, unlike the input side, cannot be
-/// bounded by looking at the fixture -- hence the separation.
-//
-// `#[rustfmt::skip]` for the reason given on `FIXTURES`: these are tables, and a table whose rows
-// are expanded four fields deep can no longer be read as one. Every row is inside the 100-column
-// limit.
-#[rustfmt::skip]
-const CHUNKINGS_INPUT_SIDE: &[Chunking] = &[
-    SINGLE_SHOT,
-    Chunking { name: "in=1", input: Some(1), output: None },
-    Chunking { name: "in=7", input: Some(7), output: None },
-    Chunking { name: "in=251", input: Some(251), output: None },
-];
-
 /// The full chunking set, including the output-side windows.
 ///
 /// 1, 3, 7 and 251 are odd or prime; 1024 and 16,384 are powers of two chosen to *coincide* with
@@ -585,7 +575,7 @@ const CHUNKINGS_INPUT_SIDE: &[Chunking] = &[
 /// Whole-input and single-byte input; a prime input window and one large enough to cover a fixture
 /// in two bites; a single-byte output window and a moderate one; and two cells that squeeze both
 /// sides at once. The remaining chunkings in [`CHUNKINGS_ALL`] vary the sizes rather than the
-/// shapes, which is what [`exhaustive_chunking_matrix`] is for.
+/// shapes, and the exhaustive shards sweep all fifteen of them.
 //
 // `#[rustfmt::skip]` for the reason given on `FIXTURES`.
 #[rustfmt::skip]
@@ -673,16 +663,6 @@ fn widen_ulong_oracle(value: oracle::uLong) -> u64 {
 /// which should fail loudly rather than truncate a length silently.
 fn widen_usize(value: usize) -> u64 {
     u64::try_from(value).expect("a byte count fits in a u64")
-}
-
-/// `(int) sizeof(z_stream)` -- the second half of the handshake the `deflateInit2` macro arranges
-/// (`zlib.h:543`).
-///
-/// Checked rather than cast, for the reason `crates/libz-rs-sys/tests/c_api_parity.rs` gives: a
-/// `size_of` that did not fit a `c_int` would mean the ABI mirror had grown past anything `zlib.h`
-/// could describe.
-fn stream_size<T>() -> c_int {
-    c_int::try_from(size_of::<T>()).expect("sizeof(z_stream) fits in a C int")
 }
 
 // =================================================================================================
@@ -789,29 +769,32 @@ struct Outcome {
 // =================================================================================================
 //  The two sides
 //
-//  ONE GATE PER ENTRY POINT, each owning a single documented `unsafe` block. That shape is the
-//  workspace's stated policy for a repeated call -- see the call-gate section of
-//  `crates/libz-rs-sys/tests/c_api_parity.rs` -- and it is what keeps the invariant stated once
-//  instead of some hundreds of times. The obligation every gate discharges is identical on both
-//  sides, so it is stated here rather than repeated:
+//  ONE GATE PER ENTRY POINT, and NO `unsafe` ANYWHERE IN THIS FILE. The file root carries
+//  `#![forbid(unsafe_code)]`, so that is a compiler-enforced property and not a convention: every
+//  method below delegates to the matching safe gate in this crate's own FFI boundary --
+//  `crate::port` for the facade and `oracle` for the C reference -- which is where the single
+//  documented `unsafe` block per entry point lives, together with the invariant it discharges.
 //
-//    (a) `strm` arrives as `&mut Self::Stream`, so it is non-null, aligned and uniquely borrowed
-//        for the duration of the call. A reference cannot be otherwise.
+//  What each side's gate here still owns is the *shape* of the call, not its soundness:
+//
+//    (a) `strm` arrives as `&mut Self::Stream` and is passed straight through, so the boundary
+//        gate receives a reference that cannot be null, misaligned or aliased.
 //    (b) `strm.state` is either null or a block this same implementation allocated through its own
 //        `deflateInit2_`, so the state check on entry -- `deflateStateCheck` at `deflate.c:538` and
 //        its counterpart in the facade -- accepts or rejects it exactly as it would for a C caller.
-//        No stream is ever handed to the other side's functions.
-//    (c) Where `next_in` is non-null, `avail_in` bytes really are readable there: the pointer is
-//        always taken from the `&[u8]` the driver was handed, which outlives every call in the run,
-//        and a zero-length window is installed as a NULL pointer instead -- the pairing `zlib.h:91`
-//        permits explicitly and the one `deflate.c:990` tests for.
-//    (d) `avail_out` bytes really are writable at `next_out`: the pointer is always taken from the
-//        scratch buffer `cell` owns, which likewise outlives every call, and the driver never
-//        offers a zero-length output window, because `deflate.c:995` answers `Z_BUF_ERROR` for one.
-//    (e) The `version`/`stream_size` pair is this side's own: the facade is initialised with the
-//        facade's `ZLIB_VERSION` and `size_of` of the facade's `z_stream`, the oracle with what
-//        `c_zlibVersion` returns and `size_of` of the oracle's mirror. Crossing them would answer
-//        `Z_VERSION_ERROR` (`zlib.h:248`) rather than produce a working stream.
+//        No stream is ever handed to the other side's gates, and because the two `Stream` types are
+//        different Rust types, crossing them would not compile.
+//    (c) The input window reaches the boundary as a `&[u8]` installed by `install_windows_*`, so
+//        the null-with-zero-length pairing `zlib.h:91` permits is arranged here, where the driver's
+//        chunking decisions are, rather than inside a gate.
+//    (d) The output window is the scratch buffer `cell` owns and is never empty, because
+//        `deflate.c:995` answers `Z_BUF_ERROR` for a zero-length one. That is a decision about what
+//        to measure, so it also stays on this side.
+//    (e) The `version`/`stream_size` handshake is not spelled here at all: each boundary gate
+//        supplies its own side's pair -- the facade's `ZLIB_VERSION` and `size_of` of the facade's
+//        `z_stream`, the oracle's `c_zlibVersion` and `size_of` of the oracle's mirror -- which is
+//        what makes crossing them impossible rather than merely discouraged. Crossed, they would
+//        answer `Z_VERSION_ERROR` (`zlib.h:248`) instead of producing a working stream.
 //
 //  The two `z_stream` types are distinct Rust types with identical layout, and nothing here
 //  transmutes one into the other: each `impl` names its own and touches nothing else.
@@ -866,6 +849,29 @@ trait Side {
     /// `compressBound(sourceLen)` and `compressBound_z(sourceLen)`, which take no stream at all.
     fn compress_bounds(source_len: usize) -> Bounds;
 
+    /// `deflateSetDictionary(strm, dictionary, dictLength)`.
+    ///
+    /// ★ The one entry point that changes the emitted bytes without changing a single
+    /// `deflateInit2_` argument. `deflate.c:596-644` seeds the sliding window and the hash chains
+    /// with the dictionary, so every subsequent `longest_match` sees matches that are not in the
+    /// input at all — which means the eight decision points of AAP 0.6.2 are being driven from a
+    /// different starting state, and byte identity there is a genuinely separate assertion from
+    /// byte identity without one.
+    ///
+    /// Under the zlib wrapper it additionally sets `strm.adler` to the dictionary's Adler-32 and
+    /// makes the header carry `FDICT` with that value as the `DICTID` (`zlib.h:618-640`), so the
+    /// checksum the two sides report after the call is itself a comparable observation.
+    fn set_dictionary(strm: &mut Self::Stream, dictionary: &[u8]) -> c_int;
+
+    /// `deflateGetDictionary(strm, dictionary, &dictLength)`, reporting the status and the bytes.
+    ///
+    /// The read-back is what proves the dictionary was *retained* rather than merely accepted:
+    /// `deflate.c:657-676` answers with at most the last `w_size` bytes of what the window holds, so
+    /// a dictionary longer than the window must come back truncated to its tail — and identically
+    /// truncated on both sides, which is the check that catches a divergent "use only the tail"
+    /// rule.
+    fn get_dictionary(strm: &mut Self::Stream) -> (c_int, Vec<u8>);
+
     /// `deflateReset(strm)`.
     fn reset(strm: &mut Self::Stream) -> c_int;
 
@@ -918,22 +924,16 @@ impl Side for Port {
     }
 
     fn init(strm: &mut Self::Stream, config: Config) -> c_int {
-        // SAFETY: obligations (a), (b) and (e). `deflateInit2_` reads at most one byte of
-        // `version`, having tested it for null first, and `ZLIB_VERSION` is a `&CStr` constant with
-        // static storage duration; it writes `state` and touches neither window, which is why a C
-        // caller may leave `next_in`/`next_out` unset until after the call.
-        unsafe {
-            libz_rs_sys::deflateInit2_(
-                strm,
-                config.level,
-                Z_DEFLATED,
-                config.window_bits,
-                config.mem_level,
-                config.strategy,
-                ZLIB_VERSION.as_ptr(),
-                stream_size::<Self::Stream>(),
-            )
-        }
+        // The gate supplies the facade's own `ZLIB_VERSION` and `size_of::<z_stream>()`, which is
+        // obligation (e) discharged where it cannot be got wrong.
+        port::deflate_init2(
+            strm,
+            config.level,
+            Z_DEFLATED,
+            config.window_bits,
+            config.mem_level,
+            config.strategy,
+        )
     }
 
     fn pump(
@@ -944,12 +944,10 @@ impl Side for Port {
     ) -> CallRecord {
         install_windows_port(strm, window, out);
         let offered = strm.avail_out;
-        // SAFETY: obligations (a) through (d) -- this is the one gate that relies on all four,
-        // because it is the one that reads through `next_in` and writes through `next_out`. Both
-        // pointers were installed immediately above from slices that outlive this call, and
-        // `install_windows_port` is what establishes the null-with-zero-length pairing and the
-        // non-empty output window.
-        let status = unsafe { libz_rs_sys::deflate(strm, flush) };
+        // The only call in the run that reads through `next_in` and writes through `next_out`.
+        // `install_windows_port` immediately above is what establishes obligations (c) and (d) --
+        // the null-with-zero-length pairing and the non-empty output window.
+        let status = port::deflate(strm, flush);
         CallRecord {
             flush,
             status,
@@ -971,23 +969,11 @@ impl Side for Port {
     fn pending(strm: &mut Self::Stream) -> Pending {
         let mut bytes: c_uint = SENTINEL_PENDING;
         let mut bits: c_int = SENTINEL_BITS;
-        // `addr_of_mut!` rather than `&mut`, for the same reason `src/oracle.rs` uses it: these are
-        // out-parameters C writes through, so the raw pointer is taken straight from the place
-        // instead of materialising a Rust mutable reference whose aliasing rules C is under no
-        // obligation to respect. It is also what keeps `clippy::borrow_as_ptr` quiet without
-        // reaching for `&raw mut`, which is Rust 1.82 syntax and not the idiom this tree uses.
-        //
-        // SAFETY: obligations (a) and (b), plus the two out-parameters formed here: both address
-        // live locals of exactly the declared types, initialised before the call and outliving it,
-        // and `zlib.h:795` says the library either writes them or leaves them alone. Neither
-        // pointer is retained past the call.
-        let status = unsafe {
-            libz_rs_sys::deflatePending(
-                strm,
-                core::ptr::addr_of_mut!(bytes),
-                core::ptr::addr_of_mut!(bits),
-            )
-        };
+        // The two out-parameters are passed as `&mut` and the gate is what forms the raw pointers C
+        // writes through, so the seeds set immediately above are the only thing this side arranges.
+        // `zlib.h:795` says the library either writes them or leaves them alone, which is precisely
+        // what the sentinels make visible.
+        let status = port::deflate_pending(strm, &mut bytes, &mut bits);
         Pending {
             status,
             bytes,
@@ -996,34 +982,26 @@ impl Side for Port {
     }
 
     fn bound(strm: &mut Self::Stream, source_len: usize) -> Bounds {
-        // SAFETY: obligations (a) and (b). Both entry points read `wrap`, `strstart`, `w_bits` and
-        // `hash_bits` out of the state block and write nothing at all; neither touches a window, so
-        // no pointer/length pair is involved.
-        unsafe {
-            Bounds {
-                narrow: widen_ulong(libz_rs_sys::deflateBound(strm, narrow_len(source_len))),
-                wide: widen_usize(libz_rs_sys::deflateBound_z(strm, source_len)),
-            }
+        // `Some(..)` is the gate's spelling for a live stream. Both entry points read `wrap`,
+        // `strstart`, `w_bits` and `hash_bits` out of the state block and write nothing at all.
+        Bounds {
+            narrow: widen_ulong(port::deflate_bound(
+                Some(&mut *strm),
+                narrow_len(source_len),
+            )),
+            wide: widen_usize(port::deflate_bound_z(Some(strm), source_len)),
         }
     }
 
     fn bound_of_null_stream(source_len: usize) -> Bounds {
-        // SAFETY: a NULL `z_streamp` is a documented argument here, not a violation: both entry
-        // points funnel through the `deflateStateCheck` test at `deflate.c:876`, which is a null
-        // test before it is anything else, and answer `max(fixedlen, storelen) + 18` without a
-        // dereference. Passing null is the only way to reach that branch, which is why it is
-        // exercised rather than avoided.
-        unsafe {
-            Bounds {
-                narrow: widen_ulong(libz_rs_sys::deflateBound(
-                    core::ptr::null_mut(),
-                    narrow_len(source_len),
-                )),
-                wide: widen_usize(libz_rs_sys::deflateBound_z(
-                    core::ptr::null_mut(),
-                    source_len,
-                )),
-            }
+        // `None` is the gate's spelling for the NULL `z_streamp`, which is a documented argument
+        // here rather than a violation: both entry points funnel through the `deflateStateCheck`
+        // test at `deflate.c:876`, which is a null test before it is anything else, and answer
+        // `max(fixedlen, storelen) + 18` without a dereference. Passing null is the only way to
+        // reach that branch, which is why it is exercised rather than avoided.
+        Bounds {
+            narrow: widen_ulong(port::deflate_bound(None, narrow_len(source_len))),
+            wide: widen_usize(port::deflate_bound_z(None, source_len)),
         }
     }
 
@@ -1036,41 +1014,47 @@ impl Side for Port {
         }
     }
 
+    fn set_dictionary(strm: &mut Self::Stream, dictionary: &[u8]) -> c_int {
+        // The gate reports the slice's own length and passes its pointer verbatim, so the library
+        // reads exactly the bytes it was given; `deflate.c:596-644` copies what it keeps into the
+        // window and retains no pointer, which is why nothing has to outlive the call.
+        port::deflate_set_dictionary(strm, dictionary)
+    }
+
+    fn get_dictionary(strm: &mut Self::Stream) -> (c_int, Vec<u8>) {
+        let mut buffer = vec![0_u8; DICTIONARY_READBACK_CAPACITY];
+        // The gate owns the in/out `dictLength` and hands back the count the library wrote.
+        // `DICTIONARY_READBACK_CAPACITY` is a whole window, which is the cap `deflate.c:657-676`
+        // clamps to, so the destination can never be the thing that truncates the answer.
+        let (status, length) = port::deflate_get_dictionary(strm, Some(&mut buffer));
+        let used = usize::try_from(length).expect("a dictionary length fits in a usize");
+        assert!(
+            used <= buffer.len(),
+            "port: deflateGetDictionary reported {used} bytes into a {capacity}-byte buffer",
+            capacity = buffer.len(),
+        );
+        buffer.truncate(used);
+        (status, buffer)
+    }
+
     fn reset(strm: &mut Self::Stream) -> c_int {
-        // SAFETY: obligations (a) and (b). The state block is reinitialised in place and the
-        // allocations it holds are kept, which is exactly why a reset is cheaper than an
-        // end-and-init pair.
-        unsafe { libz_rs_sys::deflateReset(strm) }
+        // The state block is reinitialised in place and the allocations it holds are kept, which is
+        // exactly why a reset is cheaper than an end-and-init pair.
+        port::deflate_reset(strm)
     }
 
     fn end(strm: &mut Self::Stream) -> c_int {
-        // SAFETY: obligations (a) and (b). The state block is released through the same allocator
-        // it was taken from -- the pairing this call exists to perform -- and `state` is left null,
-        // so a second call would be rejected rather than freeing twice.
-        unsafe { libz_rs_sys::deflateEnd(strm) }
+        // The state block is released through the same allocator it was taken from -- the pairing
+        // this call exists to perform -- and `state` is left null, so a second call would be
+        // rejected rather than freeing twice.
+        port::deflate_end(strm)
     }
 
     fn compress2(dest: &mut [u8], source: &[u8], level: c_int) -> (c_int, usize) {
-        let mut dest_len = narrow_len(dest.len());
-        // `addr_of_mut!` on `dest_len`, and the choice is not cosmetic: `compress.c` L14-L16 makes
-        // `destLen` an in/out parameter, so C both reads and writes through the pointer, and taking
-        // a `&mut` first would materialise a Rust mutable reference whose aliasing rules C is under
-        // no obligation to respect.
-        //
-        // SAFETY: `dest` is a live slice of `dest_len` writable bytes and `source` a live slice of
-        // `sourceLen` readable ones, both outliving the call; `dest_len` addresses a live local
-        // initialised to the destination's true capacity, which is the in/out contract
-        // `zlib.h:1291` documents. The two slices are distinct borrows and therefore cannot
-        // overlap. No pointer is retained past the call.
-        let status = unsafe {
-            libz_rs_sys::compress2(
-                dest.as_mut_ptr(),
-                core::ptr::addr_of_mut!(dest_len),
-                source.as_ptr(),
-                narrow_len(source.len()),
-                level,
-            )
-        };
+        // The gate seeds the in/out `destLen` from `dest.len()` and returns what the call left
+        // there, which is the contract `zlib.h:1291` documents. Both buffers cross as slices, so
+        // the two of them cannot overlap and no length can disagree with its pointer.
+        let (status, dest_len) = port::compress2(dest, source, level);
         (
             status,
             usize::try_from(dest_len).expect("a destination length fits in a usize"),
@@ -1090,30 +1074,18 @@ impl Side for Reference {
     }
 
     fn init(strm: &mut Self::Stream, config: Config) -> c_int {
-        // The version string is the oracle's own, as `src/oracle.rs` directs: call the `_`-suffixed
-        // form and pass what the `deflateInit2` macro passes. Taking it from `c_zlibVersion` rather
-        // than from the facade's constant is what keeps obligation (e) honest -- the C library
-        // compares the caller's version against its own.
-        //
-        // SAFETY: `c_zlibVersion` is niladic and returns a pointer to a string literal with static
-        // storage duration compiled into the oracle archive, so there is nothing for a caller to
-        // get wrong and the pointer outlives the `c_deflateInit2_` call below.
-        let version = unsafe { oracle::c_zlibVersion() };
-        // SAFETY: obligations (a), (b) and (e), exactly as for the port's gate. `version` is the
-        // oracle's own NUL-terminated literal, obtained immediately above and valid for reads
-        // through its terminator for the whole program.
-        unsafe {
-            oracle::c_deflateInit2_(
-                strm,
-                config.level,
-                Z_DEFLATED,
-                config.window_bits,
-                config.mem_level,
-                config.strategy,
-                version,
-                stream_size::<Self::Stream>(),
-            )
-        }
+        // The gate takes the version from `c_zlibVersion` -- the oracle's own literal -- and the
+        // size from the oracle's mirror, which is obligation (e) honoured on this side: the C
+        // library compares a caller's version string against its own, so the facade's constant
+        // would be the wrong one to pass even though the two agree today.
+        oracle::deflate_init2(
+            strm,
+            config.level,
+            Z_DEFLATED,
+            config.window_bits,
+            config.mem_level,
+            config.strategy,
+        )
     }
 
     fn pump(
@@ -1124,9 +1096,8 @@ impl Side for Reference {
     ) -> CallRecord {
         install_windows_reference(strm, window, out);
         let offered = strm.avail_out;
-        // SAFETY: obligations (a) through (d), as for the port's gate. The installer immediately
-        // above is what establishes (c) and (d) for this call.
-        let status = unsafe { oracle::c_deflate(strm, flush) };
+        // As for the port's gate: the installer immediately above establishes (c) and (d).
+        let status = oracle::deflate(strm, flush);
         CallRecord {
             flush,
             status,
@@ -1148,18 +1119,8 @@ impl Side for Reference {
     fn pending(strm: &mut Self::Stream) -> Pending {
         let mut bytes: c_uint = SENTINEL_PENDING;
         let mut bits: c_int = SENTINEL_BITS;
-        // `addr_of_mut!` for the out-parameters, exactly as for the port's gate above.
-        //
-        // SAFETY: obligations (a) and (b), plus the two out-parameters, exactly as for the port's
-        // gate: live locals of the declared types, initialised before the call, outliving it, and
-        // not retained past it.
-        let status = unsafe {
-            oracle::c_deflatePending(
-                strm,
-                core::ptr::addr_of_mut!(bytes),
-                core::ptr::addr_of_mut!(bits),
-            )
-        };
+        // The out-parameters and their sentinels, exactly as for the port's gate above.
+        let status = oracle::deflate_pending(strm, &mut bytes, &mut bits);
         Pending {
             status,
             bytes,
@@ -1168,72 +1129,71 @@ impl Side for Reference {
     }
 
     fn bound(strm: &mut Self::Stream, source_len: usize) -> Bounds {
-        // SAFETY: obligations (a) and (b). `deflateBound_z` at `deflate.c:857` reads the state and
-        // writes nothing; `deflateBound` at `deflate.c:926` forwards to it and narrows the result.
-        // Neither touches a window.
-        unsafe {
-            Bounds {
-                narrow: widen_ulong_oracle(oracle::c_deflateBound(
-                    strm,
-                    narrow_len_oracle(source_len),
-                )),
-                wide: widen_usize(oracle::c_deflateBound_z(strm, source_len)),
-            }
+        // `deflateBound_z` at `deflate.c:857` reads the state and writes nothing; `deflateBound` at
+        // `deflate.c:926` forwards to it and narrows the result. Neither touches a window.
+        Bounds {
+            narrow: widen_ulong_oracle(oracle::deflate_bound(
+                Some(&mut *strm),
+                narrow_len_oracle(source_len),
+            )),
+            wide: widen_usize(oracle::deflate_bound_z(Some(strm), source_len)),
         }
     }
 
     fn bound_of_null_stream(source_len: usize) -> Bounds {
-        // SAFETY: a NULL `z_streamp` is the documented way to reach `deflate.c:876-879`, whose
+        // `None`, as for the port's gate: the documented way to reach `deflate.c:876-879`, whose
         // first act is `deflateStateCheck`, whose first act is a null test. No dereference occurs.
-        unsafe {
-            Bounds {
-                narrow: widen_ulong_oracle(oracle::c_deflateBound(
-                    core::ptr::null_mut(),
-                    narrow_len_oracle(source_len),
-                )),
-                wide: widen_usize(oracle::c_deflateBound_z(core::ptr::null_mut(), source_len)),
-            }
+        Bounds {
+            narrow: widen_ulong_oracle(oracle::deflate_bound(None, narrow_len_oracle(source_len))),
+            wide: widen_usize(oracle::deflate_bound_z(None, source_len)),
         }
     }
 
     fn compress_bounds(source_len: usize) -> Bounds {
-        // SAFETY: both are pure arithmetic functions of one integer argument. The oracle declares
-        // them `extern "C"`, which makes them `unsafe` to call regardless, so the block is what the
-        // language requires rather than an obligation to discharge.
-        unsafe {
-            Bounds {
-                narrow: widen_ulong_oracle(oracle::c_compressBound(narrow_len_oracle(source_len))),
-                wide: widen_usize(oracle::c_compressBound_z(source_len)),
-            }
+        // Both are pure arithmetic functions of one integer argument. They still cross the boundary
+        // through a gate, because the oracle declares them `extern "C"` and calling one is
+        // therefore an `unsafe` operation whatever it computes -- the asymmetry with the port's
+        // `compress_bounds`, where the facade declares the same two entry points safe.
+        Bounds {
+            narrow: widen_ulong_oracle(oracle::compress_bound(narrow_len_oracle(source_len))),
+            wide: widen_usize(oracle::compress_bound_z(source_len)),
         }
     }
 
+    fn set_dictionary(strm: &mut Self::Stream, dictionary: &[u8]) -> c_int {
+        // The reference-side gate, with the same contract as the port's: a live slice outliving the
+        // call, with its own length reported.
+        oracle::deflate_set_dictionary(strm, dictionary)
+    }
+
+    fn get_dictionary(strm: &mut Self::Stream) -> (c_int, Vec<u8>) {
+        let mut buffer = vec![0_u8; DICTIONARY_READBACK_CAPACITY];
+        // The reference-side gate, with the same in/out `dictLength` handling as the port's above.
+        let (status, length) = oracle::deflate_get_dictionary(strm, Some(&mut buffer));
+        let used = usize::try_from(length).expect("a dictionary length fits in a usize");
+        assert!(
+            used <= buffer.len(),
+            "reference: deflateGetDictionary reported {used} bytes into a {capacity}-byte buffer",
+            capacity = buffer.len(),
+        );
+        buffer.truncate(used);
+        (status, buffer)
+    }
+
     fn reset(strm: &mut Self::Stream) -> c_int {
-        // SAFETY: obligations (a) and (b), as for the port's gate.
-        unsafe { oracle::c_deflateReset(strm) }
+        // As for the port's gate.
+        oracle::deflate_reset(strm)
     }
 
     fn end(strm: &mut Self::Stream) -> c_int {
-        // SAFETY: obligations (a) and (b), as for the port's gate.
-        unsafe { oracle::c_deflateEnd(strm) }
+        // As for the port's gate.
+        oracle::deflate_end(strm)
     }
 
     fn compress2(dest: &mut [u8], source: &[u8], level: c_int) -> (c_int, usize) {
-        let mut dest_len = narrow_len_oracle(dest.len());
-        // `addr_of_mut!` on the in/out `destLen`, exactly as for the port's gate above.
-        //
-        // SAFETY: as for the port's gate -- two live, distinct, non-overlapping slices that outlive
-        // the call, and a live local carrying the destination's true capacity in and its used
-        // length out.
-        let status = unsafe {
-            oracle::c_compress2(
-                dest.as_mut_ptr(),
-                core::ptr::addr_of_mut!(dest_len),
-                source.as_ptr(),
-                narrow_len_oracle(source.len()),
-                level,
-            )
-        };
+        // As for the port's gate: the in/out `destLen` is seeded and returned by the gate, and both
+        // buffers cross as slices.
+        let (status, dest_len) = oracle::compress2(dest, source, level);
         (
             status,
             usize::try_from(dest_len).expect("a destination length fits in a usize"),
@@ -1247,6 +1207,15 @@ impl Side for Reference {
 /// nothing" are distinguishable: `zlib.h:795` permits it to leave the out-parameters alone when
 /// they are `Z_NULL`, and a divergence in whether a side writes at all is worth seeing.
 const SENTINEL_PENDING: c_uint = 0xdead_beef;
+
+/// The buffer [`Side::get_dictionary`] offers `deflateGetDictionary`, in bytes.
+///
+/// `deflate.c:657-676` never reports more than `w_size`, which at `windowBits` 15 is 32768, so a
+/// buffer of exactly that size can hold everything the call can produce and a read-back can never be
+/// clipped by the *harness* rather than by the library. The dictionaries this suite sets are the
+/// committed six-byte fixture and one deliberately longer than the window, so both the untruncated
+/// and the truncated answer are exercised against the same capacity.
+const DICTIONARY_READBACK_CAPACITY: usize = 32_768;
 
 /// The seed for `bits`, chosen for the same reason and outside the documented `0..=7` range.
 const SENTINEL_BITS: c_int = -12_345;
@@ -1953,6 +1922,89 @@ fn data_type(code: c_int) -> String {
 //  The sweep
 // =================================================================================================
 
+/// What one sweep enumerated, what it declined, and why -- every cell accounted for.
+///
+/// ★ The point of this type is that a sweep can no longer narrow itself quietly. Before it existed,
+/// `sweep` returned a bare count of comparisons, and a bare count cannot distinguish "the product
+/// was 992,250 cells and all of them were compared" from "the product was 992,250 cells and 46,305
+/// of them were skipped by a predicate nobody was counting". [`Coverage::reconciles`] is the
+/// arithmetic that makes the difference checkable, and every caller asserts it: the naive Cartesian
+/// product of the sweep's own dimensions must equal what was compared plus what was declared
+/// excluded plus what belongs to another sub-shard. A future filter added anywhere inside the loop
+/// breaks that identity and fails the test rather than shrinking the matrix.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Coverage {
+    /// Cells in the naive Cartesian product: `configs x flushes x chunkings x samples`.
+    product: usize,
+    /// Cells compared, byte for byte, against the reference.
+    compared: usize,
+    /// Cells declined because a window below [`SMALL_WINDOW_BYTES`] met a fixture above this
+    /// sweep's `tiny_window_fixture_limit` -- the one declared exclusion, counted rather than
+    /// silent. Always zero when the limit is `usize::MAX`.
+    excluded_tiny_window: usize,
+    /// Cells belonging to a different sub-shard of the same product. Zero for an unsharded run.
+    other_shard: usize,
+}
+
+impl Coverage {
+    /// Every cell the sweep accounted for, by any of the three outcomes.
+    fn accounted(self) -> usize {
+        self.compared
+            .saturating_add(self.excluded_tiny_window)
+            .saturating_add(self.other_shard)
+    }
+
+    /// Whether every cell of the product was accounted for exactly once.
+    fn reconciles(self) -> bool {
+        self.accounted() == self.product
+    }
+
+    /// The cells this run was responsible for: the product minus the other sub-shards' share.
+    fn in_shard(self) -> usize {
+        self.product.saturating_sub(self.other_shard)
+    }
+
+    /// What fraction of this run's own share was compared, as a percentage.
+    ///
+    /// `Some(100.0)` whenever nothing was excluded, which is the case for every unabridged run
+    /// ([`Exhaustive::Unabridged`]) by construction. An empty share reads as 100.0 rather than as a
+    /// division by zero: a shard with no cells to compare has compared all of them.
+    fn coverage_percent(self) -> Option<f64> {
+        let share = self.in_shard();
+        if share == 0 {
+            return Some(100.0);
+        }
+        Some(exact_f64(self.compared)? / exact_f64(share)? * 100.0)
+    }
+
+    /// The one-line accounting record a caller prints beside its cell count.
+    fn describe(self) -> String {
+        let coverage = match self.coverage_percent() {
+            Some(percent) => format!("{percent:.2}%"),
+            None => "unrepresentable".to_owned(),
+        };
+        format!(
+            "product={product} compared={compared} excluded_tiny_window={excluded} \
+             other_shard={other} in_shard={share} coverage={coverage}",
+            product = self.product,
+            compared = self.compared,
+            excluded = self.excluded_tiny_window,
+            other = self.other_shard,
+            share = self.in_shard(),
+        )
+    }
+}
+
+/// A cell count as an exact `f64`.
+///
+/// `usize as f64` is a precision-losing cast that `clippy::pedantic` denies, and rightly. Routing
+/// through `u32` makes the conversion exact and total; the largest count in this file is the
+/// 9,922,500-cell product, comfortably inside `u32`, so the `None` branch reports the impossible
+/// rather than silently mis-scaling a percentage.
+fn exact_f64(value: usize) -> Option<f64> {
+    u32::try_from(value).ok().map(f64::from)
+}
+
 /// Runs every cell of `configs` x `flushes` x `chunkings` x `samples` and compares each one.
 ///
 /// One stream per side per configuration, reset between cells. `tiny_window_fixture_limit` is the
@@ -1960,17 +2012,32 @@ fn data_type(code: c_int) -> String {
 /// [`small_windows_only_on_small_fixtures`], which is the only place any comparison is held back
 /// and which states exactly why. Pass `usize::MAX` for no constraint at all.
 ///
-/// Returns the number of cells compared. The callers print it, so that a green run reports how much
-/// it measured rather than merely that it passed -- a suite that silently stopped enumerating would
-/// otherwise look exactly like a suite that passed.
+/// `shard` selects a subset of the product by cell ordinal, so that one product can be split across
+/// several processes; pass [`Shard::WHOLE`] to run all of it. The ordinal is advanced for **every**
+/// cell of the naive product before any filter is consulted, which is what makes the shards a
+/// partition of the product rather than of whatever survived a predicate.
+///
+/// Returns the full [`Coverage`] rather than a bare count. The callers print it and assert
+/// [`Coverage::reconciles`], so that a green run reports how much of its product it measured rather
+/// than merely that it passed -- a suite that silently stopped enumerating would otherwise look
+/// exactly like a suite that passed.
 fn sweep(
     configs: &[Config],
     flushes: &[c_int],
     chunkings: &[Chunking],
     samples: &[Sample],
     tiny_window_fixture_limit: usize,
-) -> usize {
-    let mut compared = 0_usize;
+    shard: Shard,
+) -> Coverage {
+    let mut coverage = Coverage {
+        product: configs
+            .len()
+            .saturating_mul(flushes.len())
+            .saturating_mul(chunkings.len())
+            .saturating_mul(samples.len()),
+        ..Coverage::default()
+    };
+    let mut ordinal = 0_usize;
 
     for &config in configs {
         let (mut port_stream, port_init) = open::<Port>(config);
@@ -1994,11 +2061,25 @@ fn sweep(
         for &flush in flushes {
             for &chunking in chunkings {
                 for sample in samples {
+                    // The ordinal advances for every cell of the product, before any filter, so
+                    // that `Shard` partitions the product itself. Incrementing it after a filter
+                    // would make the shards a partition of the filtered set, and two runs with
+                    // different limits would then disagree about which cell is whose.
+                    let cell_ordinal = ordinal;
+                    ordinal = ordinal.saturating_add(1);
+
+                    if !shard.selects(cell_ordinal) {
+                        coverage.other_shard = coverage.other_shard.saturating_add(1);
+                        continue;
+                    }
+
                     if !small_windows_only_on_small_fixtures(
                         chunking,
                         sample,
                         tiny_window_fixture_limit,
                     ) {
+                        coverage.excluded_tiny_window =
+                            coverage.excluded_tiny_window.saturating_add(1);
                         continue;
                     }
                     let current = Cell {
@@ -2021,7 +2102,7 @@ fn sweep(
                     );
 
                     compare(current, sample, &port, &reference);
-                    compared += 1;
+                    coverage.compared = coverage.compared.saturating_add(1);
                 }
             }
         }
@@ -2031,7 +2112,14 @@ fn sweep(
         compare_status("deflateEnd", config, port_end, reference_end);
     }
 
-    compared
+    assert!(
+        coverage.reconciles(),
+        "the sweep did not account for every cell of its own product, which means a filter inside \
+         it is narrowing the matrix without declaring it: {record}",
+        record = coverage.describe(),
+    );
+
+    coverage
 }
 
 /// The one (chunking, fixture) constraint this file applies, and the only place any comparison is
@@ -2082,17 +2170,24 @@ const SMALL_WINDOW_BYTES: usize = 64;
 /// Admits the seven fixtures of a few dozen bytes and holds back `random.bin` (8,192),
 /// `repetitive.bin` (16,384) and `window_boundary.bin` (66,560). That is what keeps a bare
 /// `cargo test` cheap: those three carry essentially all of the corpus's bytes, and a one-byte
-/// window over them is one `deflate` call per byte on both sides. The held-back cells are
-/// enumerated by [`exhaustive_chunking_matrix`], which is the sweep whose job the chunking
-/// dimension is.
+/// window over them is one `deflate` call per byte on both sides. The held-back cells are counted
+/// on the default sweep's own accounting line and enumerated by the exhaustive shards, which raise
+/// the limit to [`EXHAUSTIVE_TINY_WINDOW_LIMIT`].
 const DEFAULT_TINY_WINDOW_LIMIT: usize = 1024;
 
-/// The exhaustive sweeps' fixture limit for the tiniest windows: 20 KiB.
+/// The exhaustive shards' fixture limit for the tiniest windows: 20 KiB.
 ///
 /// Admits nine of the ten fixtures -- including `random.bin`, whose 8,192 incompressible bytes are
 /// what make a one-byte window bite, and `repetitive.bin` at 16,384 -- and holds back only
 /// `window_boundary.bin`, whose 66,560 incompressible bytes are on their own the single largest
-/// contributor to the total call count. `ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE=full` lifts even this.
+/// contributor to the total call count.
+///
+/// The arithmetic, stated because the accounting line prints it: seven of the fifteen chunkings have
+/// a window below [`SMALL_WINDOW_BYTES`] (`in=1`, `in=3`, `in=7`, `out=1`, `out=3`, `in=1,out=1`,
+/// `in=7,out=3`), so the exclusion is 945 configurations x 7 flush values x 7 chunkings x 1 fixture
+/// = 46,305 cells of each shard's 992,250, and `excluded_tiny_window` reports exactly that.
+/// `ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE=full` lifts even this and the shards then report
+/// `excluded_tiny_window=0`.
 const EXHAUSTIVE_TINY_WINDOW_LIMIT: usize = 20 * 1024;
 
 /// Every `windowBits` the matrix enumerates, across all three container formats: 21 values.
@@ -2269,6 +2364,114 @@ fn exhaustive() -> Exhaustive {
     }
 }
 
+/// The variable that splits one exhaustive product across several processes: `index/count`, 1-based.
+///
+/// ★ This exists because of an arithmetic fact rather than a preference. The full product of the
+/// matrix's dimensions is 9,922,500 cells (AAP §0.6.4.2: 10 levels x 21 `windowBits` x 9
+/// `memLevel`s x 5 strategies x 7 flush values x 15 chunkings x 10 fixtures), and the honest way to
+/// fit that inside a CI budget is to run all of it in more places -- not to run less of it in one
+/// place and describe the remainder as a budget decision. The ten level shards divide the product
+/// by level; this divides each of those by cell, so a workflow can spend `10 x count` jobs on the
+/// whole thing.
+const ENV_SHARD: &str = "ZLIB_RS_DIFFERENTIAL_SHARD";
+
+/// A cell-level slice of one sweep's product, assigned by a mixed cell ordinal.
+///
+/// Interleaved rather than contiguous, and deliberately: cost per cell varies by three orders of
+/// magnitude across the chunking dimension (a one-byte window over an incompressible fixture is tens
+/// of thousands of `deflate` calls, a single-shot cell is one), so contiguous blocks would hand one
+/// shard all of the expensive cells while another finished in seconds.
+///
+/// Interleaved by a *mixed* ordinal rather than by `ordinal % count`, which is the subtler half. The
+/// enumeration walks fixtures innermost (10) inside chunkings (15), so a plain modulo with an even
+/// count aliases against those lengths: `1/64` selected only every other fixture index, never the
+/// odd ones. The union of the shards was still the whole product, but any *partial* set of shards was
+/// a biased sample rather than a smaller one -- and a partial set is exactly what a workflow runs
+/// when it is trading coverage for wall clock. Multiplying by an odd constant and discarding the low
+/// bits before the modulo removes the aliasing, and costs the partition property nothing: any total,
+/// deterministic map from ordinal to slice is a partition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Shard {
+    /// Which slice this process runs, from 1 to [`Shard::count`].
+    index: usize,
+    /// How many slices the product is divided into.
+    count: usize,
+}
+
+/// Knuth's multiplicative-hashing constant for 32 bits: `2^32 / phi`, rounded to an odd number.
+///
+/// Odd is the property that matters -- multiplication by an odd constant is a bijection modulo any
+/// power of two, so no ordinal is mapped onto another's slice -- and 32 bits keeps the arithmetic
+/// exact on a 32-bit `usize` as well as a 64-bit one.
+const SHARD_MIX: usize = 2_654_435_761;
+
+impl Shard {
+    /// The whole product: one slice of one.
+    const WHOLE: Self = Self { index: 1, count: 1 };
+
+    /// Whether the cell at `ordinal` -- counted from zero over the naive product -- belongs here.
+    ///
+    /// The `>> 8` is what breaks the aliasing described on the type: it brings the high bits of the
+    /// product into the low bits that the modulo reads, so the slice depends on the whole ordinal
+    /// rather than on `ordinal % count`.
+    const fn selects(self, ordinal: usize) -> bool {
+        let mixed = ordinal.wrapping_mul(SHARD_MIX) >> 8;
+        mixed % self.count == self.index - 1
+    }
+
+    /// Whether this is the whole product rather than a slice of it.
+    const fn is_whole(self) -> bool {
+        self.count == 1
+    }
+
+    /// The `index/count` form, for a log line.
+    fn label(self) -> String {
+        format!("{}/{}", self.index, self.count)
+    }
+}
+
+/// Reads [`ENV_SHARD`], or [`Shard::WHOLE`] when it is unset or empty.
+///
+/// A malformed value is a hard failure rather than a fallback to the whole product. Both directions
+/// of the mistake matter: a value that silently meant "whole" would make every job of a sharded
+/// matrix run everything -- `count` times the intended work, and a timeout instead of a result --
+/// while a value that silently meant "shard 1" would leave the rest of the product unrun while the
+/// workflow reported success. Neither is worth tolerating to accept a typo.
+fn cell_shard() -> Shard {
+    let Ok(value) = std::env::var(ENV_SHARD) else {
+        return Shard::WHOLE;
+    };
+    if value.is_empty() {
+        return Shard::WHOLE;
+    }
+
+    let parts: Vec<&str> = value.split('/').collect();
+    let selected = match parts.as_slice() {
+        [index, count] => index
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .zip(count.trim().parse::<usize>().ok()),
+        _ => None,
+    }
+    .filter(|&(index, count)| count > 0 && index > 0 && index <= count)
+    .map(|(index, count)| Shard { index, count });
+
+    assert!(
+        selected.is_some(),
+        "{ENV_SHARD}={value:?} is not a slice of the exhaustive product. The form is \
+         `index/count`, 1-based, with 1 <= index <= count and count >= 1 -- `3/8` is the third of \
+         eight, and `1/8` through `8/8` are a complete set. A value this file cannot read is \
+         refused rather than guessed, because guessing has no safe default: reading it as the whole \
+         product would run everything in every job, and reading it as slice 1 would leave the rest \
+         of the product unrun while the workflow reported success."
+    );
+
+    // Unreachable: the assertion above has already failed the test for every `None`. The fallback
+    // is the conservative direction -- run everything -- rather than a silently narrowed slice.
+    selected.unwrap_or(Shard::WHOLE)
+}
+
 /// Reports that an exhaustive sweep was reached without being armed, and returns whether to
 /// proceed.
 ///
@@ -2353,10 +2556,9 @@ fn plumbing_anchor_matches_the_measured_numbers() {
 
     // And the same version string, since `deflateInit2_` compares the caller's against the
     // library's and a mismatch in the first byte would answer `Z_VERSION_ERROR` rather than
-    // compress anything. SAFETY: `c_zlibVersion` is niladic and returns a pointer to a
-    // NUL-terminated string literal with static storage duration compiled into the oracle archive,
-    // valid for reads through its terminator for the whole program.
-    let reference_version = unsafe { core::ffi::CStr::from_ptr(oracle::c_zlibVersion()) };
+    // compress anything. The gate hands back what `c_zlibVersion` points at as a `&'static CStr`,
+    // which is the same literal the reference's own initialisers compare against.
+    let reference_version = oracle::reference_version();
     assert!(
         reference_version == ZLIB_VERSION,
         "the two sides must report the same ZLIB_VERSION: \
@@ -2377,33 +2579,63 @@ fn default_matrix_is_byte_identical() {
     let configs = representative_configurations();
     let started = Instant::now();
 
-    let compared = sweep(
+    // Deliberately `Shard::WHOLE` rather than `cell_shard()`. Sub-sharding belongs to the
+    // exhaustive sweeps, whose product is millions of cells; this sweep is thirteen thousand and is
+    // what a bare `cargo test` relies on. Honouring the variable here would mean a CI job that set
+    // `ZLIB_RS_DIFFERENTIAL_SHARD` for the exhaustive matrix silently narrowed the default suite as
+    // well -- the exact failure mode this file's accounting exists to prevent.
+    let coverage = sweep(
         &configs,
         FLUSHES,
         CHUNKINGS_DEFAULT,
         &corpus,
         DEFAULT_TINY_WINDOW_LIMIT,
+        Shard::WHOLE,
     );
 
     println!(
         "default matrix: {compared} cells over {configs} configurations x {flushes} flush values \
-         x {chunkings} chunkings x {fixtures} fixtures in {elapsed:.1?}",
+         x {chunkings} chunkings x {fixtures} fixtures in {elapsed:.1?} [{record}]",
+        compared = coverage.compared,
         configs = configs.len(),
         flushes = FLUSHES.len(),
         chunkings = CHUNKINGS_DEFAULT.len(),
         fixtures = corpus.len(),
         elapsed = started.elapsed(),
+        record = coverage.describe(),
     );
-    assert!(compared > 0, "the default sweep must compare something");
+    assert!(
+        coverage.compared > 0,
+        "the default sweep must compare something"
+    );
+    assert!(
+        coverage.other_shard == 0,
+        "the default sweep runs its whole product and must never be sub-sharded: {record}",
+        record = coverage.describe(),
+    );
 }
 
-/// One level's slice of the full configuration cross product: 21 `windowBits` x 9 `memLevel`s x 5
-/// strategies x 7 flush values x 4 chunkings x 10 fixtures.
+/// One level's slice of the **whole** matrix: 21 `windowBits` x 9 `memLevel`s x 5 strategies x 7
+/// flush values x 15 chunkings x 10 fixtures = 992,250 cells, ten shards for 9,922,500.
 ///
-/// The ten shards together are the full product -- 9,450 configurations and 66,150 (configuration,
-/// flush) pairs -- and sharding by level is what lets cargo's harness run them concurrently. The
-/// chunkings are [`CHUNKINGS_INPUT_SIDE`]; the rest of the chunking dimension is enumerated by
-/// [`exhaustive_chunking_matrix`], for the reason the module docs record.
+/// ★ Every dimension is at its full extent here, chunkings included, and that is the point: a shard
+/// that swept four of the fifteen chunkings would be enumerating a quarter of the product while
+/// calling itself the full cross product, which is precisely the narrowing this file's contract
+/// forbids. The cost of the other eleven is real -- a one-byte output window over an incompressible
+/// fixture is tens of thousands of `deflate` calls in a single cell -- and it is paid by running the
+/// product in more places rather than by enumerating less of it: [`ENV_SHARD`] slices each level's
+/// product by cell so a workflow can spend `10 x count` jobs on all of it.
+///
+/// Two things are asserted rather than assumed. The configuration count is exactly 945, so a drift
+/// in the `windowBits`/`memLevel`/strategy tables fails here instead of quietly shrinking the sweep.
+/// And [`Coverage::reconciles`] must hold: compared plus declared-excluded plus other-shard must
+/// equal the naive product, so no future filter can remove cells without saying so.
+///
+/// The one exclusion is [`small_windows_only_on_small_fixtures`] pairing the seven sub-64-byte
+/// windows with `window_boundary.bin`'s 66,560 incompressible bytes -- 46,305 cells of the 992,250,
+/// counted on the accounting line and lifted entirely by
+/// `ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE=full`, which then reports `excluded_tiny_window=0` and 100%
+/// coverage.
 fn exhaustive_configuration_shard(what: &str, level: c_int) {
     if !armed(what) {
         return;
@@ -2418,20 +2650,56 @@ fn exhaustive_configuration_shard(what: &str, level: c_int) {
         found = configs.len(),
     );
 
+    let unabridged = exhaustive() == Exhaustive::Unabridged;
+    let limit = if unabridged {
+        usize::MAX
+    } else {
+        EXHAUSTIVE_TINY_WINDOW_LIMIT
+    };
+    let shard = cell_shard();
     let started = Instant::now();
-    let compared = sweep(
-        &configs,
-        FLUSHES,
-        CHUNKINGS_INPUT_SIDE,
-        &corpus,
-        EXHAUSTIVE_TINY_WINDOW_LIMIT,
-    );
+
+    let coverage = sweep(&configs, FLUSHES, CHUNKINGS_ALL, &corpus, limit, shard);
 
     println!(
-        "exhaustive configuration matrix, level {level}: {compared} cells over {configs} \
-         configurations in {elapsed:.1?}",
+        "exhaustive matrix, level {level}: {compared} cells over {configs} configurations x \
+         {flushes} flush values x {chunkings} chunkings x {fixtures} fixtures in {elapsed:.1?} \
+         [shard={shard} {record}{note}]",
+        compared = coverage.compared,
         configs = configs.len(),
+        flushes = FLUSHES.len(),
+        chunkings = CHUNKINGS_ALL.len(),
+        fixtures = corpus.len(),
         elapsed = started.elapsed(),
+        shard = shard.label(),
+        record = coverage.describe(),
+        note = if unabridged {
+            " unabridged=1"
+        } else {
+            " unabridged=0"
+        },
+    );
+
+    assert!(
+        coverage.product == 992_250,
+        "one level's product is 945 configurations x {flushes} flush values x {chunkings} \
+         chunkings x {fixtures} fixtures = 992,250 cells, not {product}; the ten shards must \
+         multiply out to the 9,922,500 the module docs state",
+        flushes = FLUSHES.len(),
+        chunkings = CHUNKINGS_ALL.len(),
+        fixtures = corpus.len(),
+        product = coverage.product,
+    );
+    assert!(
+        !unabridged || coverage.excluded_tiny_window == 0,
+        "{ENV_EXHAUSTIVE}={ENV_EXHAUSTIVE_FULL} lifts the fixture-size constraint, so an \
+         unabridged run must exclude nothing at all: {record}",
+        record = coverage.describe(),
+    );
+    assert!(
+        coverage.compared > 0,
+        "an armed shard must compare something: {record}",
+        record = coverage.describe(),
     );
 }
 
@@ -2443,7 +2711,8 @@ fn exhaustive_configuration_shard(what: &str, level: c_int) {
 macro_rules! configuration_shard {
     ($name:ident, $level:expr) => {
         #[test]
-        #[ignore = "one shard of the full cross product; armed by ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE"]
+        #[ignore = "one shard of the full cross product; armed by ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE, run \
+                  by the differential CI job"]
         fn $name() {
             exhaustive_configuration_shard(stringify!($name), $level);
         }
@@ -2483,56 +2752,108 @@ fn exhaustive_configuration_shards_cover_every_level() {
     );
 }
 
-/// The full chunking set, including the one-byte output window, over every fixture.
+/// The cell shards of one product are a partition of it: every cell in exactly one shard.
 ///
-/// The configuration set here spans every level, all three container formats, all five strategies
-/// and the extreme `memLevel`s -- [`representative_configurations`] -- because it is the *chunking*
-/// dimension this sweep exists to enumerate exhaustively, and the product of both full sets is what
-/// the module docs record as unaffordable.
+/// Pure arithmetic over [`Shard::selects`], with no compression involved, because the property that
+/// matters is a property of the selector rather than of any particular sweep: if the union of the
+/// shards were not the whole product, a workflow that ran `1/8` through `8/8` would report success
+/// over a matrix it had never finished enumerating -- and no individual shard could detect that.
 ///
-/// This sweep is also where the cells the *default* sweep holds back are enumerated: it raises the
-/// tiny-window fixture limit from [`DEFAULT_TINY_WINDOW_LIMIT`] to
-/// [`EXHAUSTIVE_TINY_WINDOW_LIMIT`], which brings `random.bin` and `repetitive.bin` under every
-/// chunking including the one-byte windows.
-///
-/// # The one constraint, and how to lift it
-///
-/// A tiny window costs one `deflate` call per byte through it, and `window_boundary.bin` is 66,560
-/// incompressible bytes, so a one-byte window over it is some 66,600 calls per side for a single
-/// cell. It is therefore the one fixture [`EXHAUSTIVE_TINY_WINDOW_LIMIT`] holds back from the four
-/// tiniest chunkings; every larger window still covers it.
-/// `ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE=full` raises the limit to `usize::MAX` and pays for the
-/// unabridged run.
+/// Checked over several counts including 1 (the unsharded case) and counts that neither divide the
+/// product nor are divided by it, since an uneven division is where an off-by-one in the modulo
+/// arithmetic would surface.
 #[test]
-#[ignore = "the full chunking sweep; armed by ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE and run by CI"]
+#[ignore = "the full chunking sweep; armed by ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE, run by the \
+              differential CI job"]
 fn exhaustive_chunking_matrix() {
     if !armed("exhaustive_chunking_matrix") {
         return;
     }
 
+    assert!(
+        Shard::WHOLE.is_whole() && Shard::WHOLE.selects(0) && Shard::WHOLE.selects(12_345),
+        "the unsharded case must select every cell"
+    );
+
+    // No aliasing against the enumeration's innermost dimension. The sweep walks the ten fixtures
+    // innermost, so `ordinal % 10` is the fixture index; a slice that never selects some of those
+    // residues is a biased sample of the product, which is what a plain `ordinal % count` produced
+    // for every even count before [`SHARD_MIX`] was introduced.
+    let count = 64;
+    let product = 100_000_usize;
+    let fixtures = 10_usize;
+    let mut missing = Vec::new();
+    for residue in 0..fixtures {
+        let hits = (0..product)
+            .filter(|&ordinal| Shard { index: 1, count }.selects(ordinal))
+            .filter(|&ordinal| ordinal % fixtures == residue)
+            .count();
+        if hits == 0 {
+            missing.push(residue);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "slice 1 of {count} selected no cell at all for fixture index(es) {missing:?}, so a partial \
+         run of the slices would be a biased sample of the product rather than a smaller one"
+    );
+
+    // And roughly even shares, so that splitting a product across jobs actually splits the work.
+    let expected = product / count;
+    let worst = (1..=count)
+        .map(|index| {
+            (0..product)
+                .filter(|&ordinal| Shard { index, count }.selects(ordinal))
+                .count()
+        })
+        .map(|share| share.abs_diff(expected))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        worst * 5 <= expected,
+        "the most lopsided of {count} slices differs from the even share of {expected} cells by \
+         {worst}, more than 20%; the slices are meant to divide the work, not merely the product"
+    );
+}
+
+/// The ten shards' products multiply out to the whole matrix, and nothing else needs to.
+///
+/// ★ This is the arithmetic that used to be prose. The dimensions AAP §0.6.4.2 names are 10 levels x
+/// 21 `windowBits` x 9 `memLevel`s x 5 strategies x 7 flush values x 15 chunkings x 10 fixtures, and
+/// the assertion below is that the ten `#[ignore]`d shards enumerate exactly that product --
+/// 9,922,500 cells -- rather than a subset of it described as a budget decision.
+///
+/// It also records why no separate chunking sweep exists any more: the shards sweep
+/// [`CHUNKINGS_ALL`], and [`representative_configurations`] -- the configuration set such a sweep
+/// would have used -- is proved here to be a subset of the shards' 9,450, so every cell it would
+/// have compared is already a cell of theirs. A second test over a strict subset would only spend
+/// CI time twice.
+#[test]
+fn exhaustive_shards_enumerate_the_whole_matrix() {
     let corpus = load_corpus();
-    let configs = representative_configurations();
-    let unabridged = exhaustive() == Exhaustive::Unabridged;
-    let limit = if unabridged {
-        usize::MAX
-    } else {
-        EXHAUSTIVE_TINY_WINDOW_LIMIT
-    };
-    let started = Instant::now();
-
-    let compared = sweep(&configs, FLUSHES, CHUNKINGS_ALL, &corpus, limit);
-
-    println!(
-        "exhaustive chunking matrix: {compared} cells over {configs} configurations x {chunkings} \
-         chunkings in {elapsed:.1?}{note}",
-        configs = configs.len(),
+    let per_level = 945 * FLUSHES.len() * CHUNKINGS_ALL.len() * corpus.len();
+    assert!(
+        per_level == 992_250 && per_level * LEVELS.len() == 9_922_500,
+        "the shards' product must be 945 x {flushes} x {chunkings} x {fixtures} = 992,250 per level \
+         and 9,922,500 over the ten, not {per_level} and {total}",
+        flushes = FLUSHES.len(),
         chunkings = CHUNKINGS_ALL.len(),
-        elapsed = started.elapsed(),
-        note = if unabridged {
-            " (unabridged: the fixture-size constraint was lifted)"
-        } else {
-            ""
-        },
+        fixtures = corpus.len(),
+        total = per_level * LEVELS.len(),
+    );
+
+    // Every configuration the retired chunking sweep would have used is one of the 9,450 the shards
+    // enumerate, so its cells are a subset of theirs at every chunking in `CHUNKINGS_ALL`.
+    let whole = configurations_for_levels(LEVELS);
+    let orphans: Vec<Config> = representative_configurations()
+        .into_iter()
+        .filter(|config| !whole.contains(config))
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "{count} representative configuration(s) are outside the shards' cross product, so \
+         retiring the separate chunking sweep would lose them: {orphans:?}",
+        count = orphans.len(),
     );
 }
 
@@ -2989,4 +3310,616 @@ fn sample<'corpus>(corpus: &'corpus [Sample], name: &str) -> &'corpus Sample {
         .iter()
         .find(|sample| sample.fixture.name == name)
         .unwrap_or_else(|| panic!("corpus fixture {name} is not in the contract"))
+}
+
+// =================================================================================================
+//  Preset dictionaries
+//
+//  ★ `deflateSetDictionary` is the one entry point that changes the emitted bytes without changing a
+//  single `deflateInit2_` argument, and until this section existed the suite never called it -- the
+//  committed `dictionary.bin` fixture was compressed as ordinary payload and nothing else. That left
+//  a class of divergence completely uncovered, and not a small one: `deflate.c:596-644` seeds the
+//  sliding window and the hash chains from the dictionary before any input arrives, so every
+//  `longest_match` from the first byte onwards can find matches that are not in the input at all.
+//  All eight of the byte-identity decision points AAP 0.6.2 enumerates are then being driven from a
+//  different starting state, and a port that agreed with the reference from an empty window could
+//  still disagree from a seeded one.
+//
+//  There is a second, independent contract in the same call. Under the zlib wrapper
+//  `zlib.h:618-640` makes the header carry `FDICT` and a `DICTID`, and `deflate.c:637` sets
+//  `strm->adler` to the dictionary's Adler-32 so that the value the caller must transmit is
+//  readable. Raw deflate has no header to carry it and leaves the checksum alone. Both behaviours
+//  are compared here, which is why the sweep runs the two containers rather than only the wrapped
+//  one.
+//
+//  Two dictionaries, chosen for the two halves of `deflate.c`'s own branch:
+//
+//    * `dictionary.bin` -- the exact six bytes `test/example.c` L40 sets, shorter than the window,
+//      so the whole of it is used and `deflateGetDictionary` must report all six back.
+//    * `window_boundary.bin` -- longer than the 32 KiB window, which takes `deflate.c:606-611`'s
+//      "use only the tail" path: `dictionary += dictLength - s->w_size; dictLength = s->w_size;`.
+//      That truncation is a heuristic-free rule, but it is a rule the two implementations have to
+//      apply to the same bytes, and the read-back is what proves they did.
+// =================================================================================================
+
+/// The dictionaries the sweep sets, by fixture name and what each one exercises.
+///
+/// Both come from the committed corpus, so nothing is synthesised and the case is reproducible from
+/// the repository alone -- `corpus/README.md`'s determinism rule.
+const DICTIONARY_FIXTURES: [&str; 2] = ["dictionary.bin", "window_boundary.bin"];
+
+/// The payloads the sweep compresses under each dictionary.
+///
+/// `hello.bin` first, because it is the payload `test/example.c` pairs with `dictionary.bin` and the
+/// one whose 14 bytes overlap the dictionary's -- the case where a preset dictionary actually earns
+/// its keep. The other three cover a payload with no overlap at all (`random.bin`), one whose matches
+/// are internal (`repetitive.bin`), and one past the window (`window_boundary.bin`), so the sweep
+/// spans "the dictionary does everything" to "the dictionary does nothing".
+const DICTIONARY_PAYLOADS: [&str; 4] = [
+    "hello.bin",
+    "random.bin",
+    "repetitive.bin",
+    "window_boundary.bin",
+];
+
+/// The levels the sweep runs, which are the three AAP 0.8.4 names plus the two ends of the range.
+///
+/// Level 0 matters here specifically: `deflate_stored` emits the input verbatim and a dictionary
+/// cannot change that, so identical output at level 0 with a dictionary set is what proves the
+/// *header* half of the contract independently of the encoder half.
+const DICTIONARY_LEVELS: [c_int; 5] = [0, 1, 6, 9, 2];
+
+/// One dictionary-seeded run on one side: the statuses, the checksum the call published, what the
+/// library reports the dictionary to be, and everything [`compare`] needs.
+struct DictionaryRun {
+    /// `deflateSetDictionary`'s return value.
+    set: c_int,
+    /// `strm.adler` immediately after the call -- the `DICTID` a zlib-wrapped caller must transmit,
+    /// and untouched for raw deflate.
+    adler_after_set: u64,
+    /// `deflateGetDictionary`'s status and the bytes it reported.
+    read_back: (c_int, Vec<u8>),
+    /// The run itself.
+    outcome: Outcome,
+}
+
+/// Opens a stream, seeds it with `dictionary`, drives one cell, and closes it.
+///
+/// A fresh stream per run rather than a reset-and-reuse loop, and that is not laziness:
+/// `deflateReset` clears the dictionary along with the rest of the state (`deflate.c:721-746` runs
+/// the same initialisation `deflateInit2_` does), so a reused stream would silently drop the
+/// dictionary on the second cell and the sweep would compare undictionaried output while claiming
+/// otherwise. The cost is one init per cell, which is why this sweep runs a representative product
+/// rather than the exhaustive one.
+fn dictionary_run<S: Side>(
+    current: Cell,
+    dictionary: &[u8],
+    input: &[u8],
+    out_window: Option<usize>,
+) -> DictionaryRun {
+    let (mut stream, init) = open::<S>(current.config);
+    assert!(
+        init == Z_OK,
+        "{side}: deflateInit2_ refused a configuration this comparison asserts is valid: {status}",
+        side = S::NAME,
+        status = status(init),
+    );
+
+    let set = S::set_dictionary(&mut stream, dictionary);
+    let adler_after_set = S::snapshot(&stream).adler;
+    let read_back = S::get_dictionary(&mut stream);
+
+    let outcome = cell::<S>(&mut stream, current, input, out_window);
+
+    let end = close::<S>(&mut stream);
+    assert!(
+        end == Z_OK,
+        "{side}: deflateEnd returned {status} after a dictionary-seeded run",
+        side = S::NAME,
+        status = status(end),
+    );
+
+    DictionaryRun {
+        set,
+        adler_after_set,
+        read_back,
+        outcome,
+    }
+}
+
+/// Compressed output is byte-identical when a preset dictionary has been set, in both containers.
+///
+/// The product is deliberately representative rather than exhaustive -- 2 dictionaries x 2
+/// containers x 5 levels x 4 payloads x 3 chunkings x 3 flush values, each paying for its own
+/// `deflateInit2_` -- because the dimension under test is the dictionary, and the rest of the
+/// configuration space is already swept without one by
+/// [`exhaustive_configuration_shard`]. What each cell asserts:
+///
+/// 1. `deflateSetDictionary` returned the same status on both sides.
+/// 2. `strm.adler` after the call agrees, which is the `DICTID` under the zlib wrapper and the
+///    untouched checksum for raw deflate.
+/// 3. `deflateGetDictionary` reports the same status and the same bytes, so the two implementations
+///    retained the same dictionary -- including the same tail when it was longer than the window.
+/// 4. Everything [`compare`] compares: the output bytes, the whole call-by-call status sequence,
+///    `total_in`, `total_out`, `adler`, `data_type`, `deflatePending`, and both bounds.
+///
+/// The flush values are the three that produce a complete stream on their own -- `Z_NO_FLUSH`
+/// (the ordinary case), `Z_SYNC_FLUSH` (which forces an empty stored block mid-stream, so the
+/// dictionary-seeded window has to survive a block boundary) and `Z_FULL_FLUSH` (which *resets* the
+/// window, so a dictionary that survived it would be a divergence in itself).
+#[test]
+fn preset_dictionaries_are_byte_identical() {
+    // The two containers: wrapped, where the dictionary produces a `DICTID` in the header, and raw,
+    // where there is no header to carry one. Gzip is deliberately absent -- `deflate.c:598-600`
+    // answers `Z_STREAM_ERROR` for `wrap == 2`, so there is nothing to compare, and the refusal
+    // itself is asserted by `preset_dictionary_refusals_agree` rather than swept.
+    const CONTAINERS: [c_int; 2] = [15, -15];
+    const FLUSHES_HERE: [c_int; 3] = [Z_NO_FLUSH, Z_SYNC_FLUSH, Z_FULL_FLUSH];
+    #[rustfmt::skip]
+    const CHUNKINGS_HERE: [Chunking; 3] = [
+        SINGLE_SHOT,
+        Chunking { name: "in=7",           input: Some(7),   output: None },
+        Chunking { name: "in=251,out=1024", input: Some(251), output: Some(1024) },
+    ];
+
+    let corpus = load_corpus();
+    let mut compared = 0_usize;
+    let started = Instant::now();
+
+    for dictionary_name in DICTIONARY_FIXTURES {
+        let dictionary = &sample(&corpus, dictionary_name).bytes;
+        for window_bits in CONTAINERS {
+            for level in DICTIONARY_LEVELS {
+                let config = Config {
+                    level,
+                    window_bits,
+                    ..Config::defaults()
+                };
+                for payload_name in DICTIONARY_PAYLOADS {
+                    let payload = sample(&corpus, payload_name);
+                    for &chunking in &CHUNKINGS_HERE {
+                        for flush in FLUSHES_HERE {
+                            let current = Cell {
+                                config,
+                                flush,
+                                chunking,
+                            };
+
+                            // The port first with its own output window, then the reference with the
+                            // number the port actually used, exactly as `sweep` does: it is what
+                            // keeps the two runs comparable when the bound is itself under test.
+                            let port = dictionary_run::<Port>(
+                                current,
+                                dictionary,
+                                &payload.bytes,
+                                chunking.output,
+                            );
+                            let reference = dictionary_run::<Reference>(
+                                current,
+                                dictionary,
+                                &payload.bytes,
+                                Some(port.outcome.out_window),
+                            );
+
+                            let describe = format!(
+                                "dictionary {dictionary_name} ({dict_len} B) with \
+                                 {payload_name}, {cell}",
+                                dict_len = dictionary.len(),
+                                cell = describe(current, payload.bytes.len()),
+                            );
+
+                            assert!(
+                                port.set == reference.set,
+                                "deflateSetDictionary status differs for {describe}: \
+                                 port {port_status}, reference {ref_status}",
+                                port_status = status(port.set),
+                                ref_status = status(reference.set),
+                            );
+                            assert!(
+                                port.set == Z_OK,
+                                "deflateSetDictionary must accept a dictionary on a virgin \
+                                 stream for {describe}: got {got}",
+                                got = status(port.set),
+                            );
+
+                            assert!(
+                                port.adler_after_set == reference.adler_after_set,
+                                "strm.adler after deflateSetDictionary differs for {describe}: \
+                                 port {port_adler:#010x}, reference {ref_adler:#010x}\n    \
+                                 under the zlib wrapper this is the DICTID the header carries \
+                                 (zlib.h:618-640, deflate.c:637); for raw deflate it must be left \
+                                 alone",
+                                port_adler = port.adler_after_set,
+                                ref_adler = reference.adler_after_set,
+                            );
+
+                            assert!(
+                                port.read_back == reference.read_back,
+                                "deflateGetDictionary differs for {describe}: \
+                                 port {port_status} with {port_len} bytes, reference \
+                                 {ref_status} with {ref_len} bytes\n    \
+                                 a dictionary longer than w_size must be truncated to the same \
+                                 tail on both sides (deflate.c:606-611, 657-676)\n{difference}",
+                                port_status = status(port.read_back.0),
+                                port_len = port.read_back.1.len(),
+                                ref_status = status(reference.read_back.0),
+                                ref_len = reference.read_back.1.len(),
+                                difference = describe_byte_difference(
+                                    &port.read_back.1,
+                                    &reference.read_back.1
+                                ),
+                            );
+
+                            compare(current, payload, &port.outcome, &reference.outcome);
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!(
+        "preset dictionary byte identity: {compared} cells over {dicts} dictionaries x \
+         {containers} containers x {levels} levels x {payloads} payloads x {chunkings} chunkings \
+         x {flushes} flush values in {elapsed:.1?}",
+        dicts = DICTIONARY_FIXTURES.len(),
+        containers = CONTAINERS.len(),
+        levels = DICTIONARY_LEVELS.len(),
+        payloads = DICTIONARY_PAYLOADS.len(),
+        chunkings = CHUNKINGS_HERE.len(),
+        flushes = FLUSHES_HERE.len(),
+        elapsed = started.elapsed(),
+    );
+    assert_eq!(
+        compared,
+        DICTIONARY_FIXTURES.len()
+            * CONTAINERS.len()
+            * DICTIONARY_LEVELS.len()
+            * DICTIONARY_PAYLOADS.len()
+            * CHUNKINGS_HERE.len()
+            * FLUSHES_HERE.len(),
+        "every cell of the announced product must have run"
+    );
+}
+
+/// The dictionary contract's refusals and its interaction with the header, compared side for side.
+///
+/// These are status-parity assertions rather than byte comparisons, and they belong beside the sweep
+/// because each one is a place the two implementations could disagree while producing no bytes at
+/// all -- which a byte comparison would score as a match.
+///
+/// 1. **Gzip refuses.** `deflate.c:598-600` tests `wrap == 2` and answers `Z_STREAM_ERROR`, so a
+///    dictionary and the gzip container are mutually exclusive.
+/// 2. **A NULL stream refuses.** `deflateStateCheck` runs first, so no dereference occurs.
+/// 3. **Too late refuses.** Once the encoder has consumed input the window is no longer virgin;
+///    `deflate.c:601-604` permits a dictionary only at `status == INIT_STATE`, or at
+///    `BUSY_STATE` with nothing yet in the window for raw deflate.
+/// 4. **An empty dictionary is accepted** and leaves the checksum at the value
+///    `adler32(0, Z_NULL, 0)` implies -- which is exactly the `DICTID` of 1 that
+///    `test/infcover.c` L390's "need dictionary" fixture carries.
+#[test]
+fn preset_dictionary_refusals_agree() {
+    let corpus = load_corpus();
+    let dictionary = &sample(&corpus, "dictionary.bin").bytes;
+    let payload = sample(&corpus, "hello.bin");
+
+    // 1. Gzip.
+    let gzip = Config {
+        window_bits: 31,
+        ..Config::defaults()
+    };
+    let (mut port_stream, port_init) = open::<Port>(gzip);
+    let (mut reference_stream, reference_init) = open::<Reference>(gzip);
+    compare_status("deflateInit2_", gzip, port_init, reference_init);
+    let port_set = Port::set_dictionary(&mut port_stream, dictionary);
+    let reference_set = Reference::set_dictionary(&mut reference_stream, dictionary);
+    compare_status(
+        "deflateSetDictionary under gzip",
+        gzip,
+        port_set,
+        reference_set,
+    );
+    assert!(
+        port_set == Z_STREAM_ERROR,
+        "deflate.c:598-600 refuses a dictionary for wrap == 2: got {got}",
+        got = status(port_set),
+    );
+    compare_status(
+        "deflateEnd",
+        gzip,
+        close::<Port>(&mut port_stream),
+        close::<Reference>(&mut reference_stream),
+    );
+
+    // 3. Too late: one full cell first, which leaves the stream reset but no longer virgin in the
+    //    sense `deflate.c:601-604` means, because `deflateReset` restores INIT_STATE -- so the
+    //    dictionary is instead set part-way through a live run, which is the case a caller reaches
+    //    by accident.
+    let config = Config::defaults();
+    let (mut port_stream, port_init) = open::<Port>(config);
+    let (mut reference_stream, reference_init) = open::<Reference>(config);
+    compare_status("deflateInit2_", config, port_init, reference_init);
+
+    let mut port_scratch = vec![0_u8; 4096];
+    let mut reference_scratch = vec![0_u8; 4096];
+    let port_first = Port::pump(
+        &mut port_stream,
+        Some(&payload.bytes),
+        &mut port_scratch,
+        Z_SYNC_FLUSH,
+    );
+    let reference_first = Reference::pump(
+        &mut reference_stream,
+        Some(&payload.bytes),
+        &mut reference_scratch,
+        Z_SYNC_FLUSH,
+    );
+    assert!(
+        port_first == reference_first,
+        "the priming call must agree before the late dictionary is compared: \
+         port {port_first:?}, reference {reference_first:?}"
+    );
+
+    let port_late = Port::set_dictionary(&mut port_stream, dictionary);
+    let reference_late = Reference::set_dictionary(&mut reference_stream, dictionary);
+    compare_status(
+        "deflateSetDictionary after input has been consumed",
+        config,
+        port_late,
+        reference_late,
+    );
+    assert!(
+        port_late == Z_STREAM_ERROR,
+        "a dictionary set after the window has been filled must be refused \
+         (deflate.c:601-604): got {got}",
+        got = status(port_late),
+    );
+    compare_status(
+        "deflateEnd",
+        config,
+        close::<Port>(&mut port_stream),
+        close::<Reference>(&mut reference_stream),
+    );
+
+    // 4. The empty dictionary, in both containers.
+    for window_bits in [15, -15] {
+        let config = Config {
+            window_bits,
+            ..Config::defaults()
+        };
+        let (mut port_stream, port_init) = open::<Port>(config);
+        let (mut reference_stream, reference_init) = open::<Reference>(config);
+        compare_status("deflateInit2_", config, port_init, reference_init);
+
+        let port_set = Port::set_dictionary(&mut port_stream, &[]);
+        let reference_set = Reference::set_dictionary(&mut reference_stream, &[]);
+        compare_status(
+            "deflateSetDictionary with an empty dictionary",
+            config,
+            port_set,
+            reference_set,
+        );
+        assert!(
+            port_set == Z_OK,
+            "an empty dictionary is a legal dictionary: got {got}",
+            got = status(port_set),
+        );
+
+        let port_adler = Port::snapshot(&port_stream).adler;
+        let reference_adler = Reference::snapshot(&reference_stream).adler;
+        assert!(
+            port_adler == reference_adler,
+            "strm.adler after an empty dictionary differs in the {container} container: \
+             port {port_adler:#010x}, reference {reference_adler:#010x}",
+            container = config.container(),
+        );
+
+        // And the stream still produces byte-identical output afterwards, so an accepted empty
+        // dictionary is genuinely a no-op on the encoder rather than a state the port merely
+        // tolerates.
+        let current = Cell {
+            config,
+            flush: Z_NO_FLUSH,
+            chunking: SINGLE_SHOT,
+        };
+        let port_outcome = cell::<Port>(&mut port_stream, current, &payload.bytes, None);
+        let reference_outcome = cell::<Reference>(
+            &mut reference_stream,
+            current,
+            &payload.bytes,
+            Some(port_outcome.out_window),
+        );
+        compare(current, payload, &port_outcome, &reference_outcome);
+
+        compare_status(
+            "deflateEnd",
+            config,
+            close::<Port>(&mut port_stream),
+            close::<Reference>(&mut reference_stream),
+        );
+    }
+
+    // 2. The NULL stream, which needs no initialised stream on either side. `None` is the gates'
+    // spelling for the null `z_streamp`, and it is a documented argument here rather than a
+    // violation: `deflateStateCheck`'s first act is a null test, so no dereference occurs and
+    // passing null is the only way to reach that branch.
+    let port_null = port::deflate_set_dictionary_of(None, dictionary);
+    let reference_null = oracle::deflate_set_dictionary_of(None, dictionary);
+    assert!(
+        port_null == reference_null && port_null == Z_STREAM_ERROR,
+        "deflateSetDictionary(NULL, ...) must be Z_STREAM_ERROR on both sides: \
+         port {port_status}, reference {ref_status}",
+        port_status = status(port_null),
+        ref_status = status(reference_null),
+    );
+}
+
+/// A preset dictionary demonstrably changes the emitted bytes -- so the sweep above can fail.
+///
+/// ★ This is the guard that keeps [`preset_dictionaries_are_byte_identical`] from repeating the very
+/// gap it was written to close. That sweep asserts the two sides agree; it does not, on its own,
+/// prove the dictionary reached the encoder. If `deflateSetDictionary` were a no-op on *both* sides
+/// -- or if a future refactor stopped the seeding taking effect -- every one of its 720 cells would
+/// still pass while comparing exactly the undictionaried output the rest of the file already covers.
+///
+/// So this test pins the difference from the outside. `hello.bin` is the 14-byte payload
+/// `test/example.c` L41 pairs with the six-byte `dictionary.bin`, and those six bytes are a
+/// substring of it: seeding the window puts a match in reach that simply is not there from an empty
+/// window, so the two encodings cannot coincide. Three facts, together:
+///
+/// 1. With the dictionary, port and reference agree exactly.
+/// 2. Without it, port and reference agree exactly.
+/// 3. (1) and (2) are *different byte strings* -- which is what proves the dictionary took effect,
+///    and therefore that the sweep is comparing dictionary-seeded output.
+///
+/// Point 3 is asserted for the zlib container, where the `FDICT` bit and the four `DICTID` bytes
+/// guarantee a difference in the header quite apart from the encoder, and for raw deflate, where
+/// there is no header at all and the difference can only come from the seeded window and hash
+/// chains. The raw case is the load-bearing one.
+#[test]
+fn a_preset_dictionary_changes_the_emitted_bytes() {
+    let corpus = load_corpus();
+    let dictionary = &sample(&corpus, "dictionary.bin").bytes;
+    let payload = sample(&corpus, "hello.bin");
+
+    for window_bits in [15, -15] {
+        let config = Config {
+            window_bits,
+            ..Config::defaults()
+        };
+        let current = Cell {
+            config,
+            flush: Z_NO_FLUSH,
+            chunking: SINGLE_SHOT,
+        };
+
+        // (1) seeded, both sides.
+        let seeded_port = dictionary_run::<Port>(current, dictionary, &payload.bytes, None);
+        let seeded_reference = dictionary_run::<Reference>(
+            current,
+            dictionary,
+            &payload.bytes,
+            Some(seeded_port.outcome.out_window),
+        );
+        assert!(seeded_port.set == Z_OK, "the dictionary must be accepted");
+        compare(
+            current,
+            payload,
+            &seeded_port.outcome,
+            &seeded_reference.outcome,
+        );
+
+        // (2) unseeded, both sides -- the ordinary path, via the same helper with an empty
+        //     dictionary so that the only difference between the two runs is the dictionary's
+        //     content and not the code that produced them.
+        let plain_port = dictionary_run::<Port>(current, &[], &payload.bytes, None);
+        let plain_reference = dictionary_run::<Reference>(
+            current,
+            &[],
+            &payload.bytes,
+            Some(plain_port.outcome.out_window),
+        );
+        compare(
+            current,
+            payload,
+            &plain_port.outcome,
+            &plain_reference.outcome,
+        );
+
+        // (3) and they differ.
+        assert!(
+            seeded_port.outcome.output != plain_port.outcome.output,
+            "a preset dictionary that overlaps the payload must change the emitted bytes in the \
+             {container} container, or the sweep above is silently comparing undictionaried \
+             output and asserts nothing about deflateSetDictionary\n    \
+             dictionary {dict_len} B, payload {payload_len} B, both encodings {seeded_len} B",
+            container = config.container(),
+            dict_len = dictionary.len(),
+            payload_len = payload.bytes.len(),
+            seeded_len = seeded_port.outcome.output.len(),
+        );
+
+        // And the read-back reports precisely the six bytes that were set, on both sides -- the
+        // whole dictionary, because it is shorter than the window.
+        assert!(
+            seeded_port.read_back.0 == Z_OK && seeded_port.read_back.1 == *dictionary,
+            "deflateGetDictionary must report the whole of a sub-window dictionary: \
+             {status} with {got:?}",
+            status = status(seeded_port.read_back.0),
+            got = seeded_port.read_back.1,
+        );
+        assert!(
+            seeded_port.read_back == seeded_reference.read_back,
+            "the two sides must retain the same dictionary"
+        );
+    }
+}
+
+/// A dictionary longer than the window is truncated to the same tail on both sides.
+///
+/// `deflate.c:606-611` keeps only the last `w_size` bytes when the dictionary overruns the window,
+/// and `deflate.c:657-676` answers `deflateGetDictionary` from that window -- so the read-back is a
+/// direct, byte-level view of which tail each implementation kept. An off-by-one in that arithmetic
+/// would leave both sides producing valid streams that decode to the same payload while seeding
+/// different windows, which is exactly the class of divergence a decoded-output comparison cannot
+/// see and a byte comparison can.
+///
+/// Asserted against the fixture's own tail rather than against the reference alone, so the test
+/// states what the right answer *is* and not merely that the two agree.
+#[test]
+fn an_over_window_dictionary_keeps_the_same_tail() {
+    let corpus = load_corpus();
+    let dictionary = &sample(&corpus, "window_boundary.bin").bytes;
+    assert!(
+        dictionary.len() > DICTIONARY_READBACK_CAPACITY,
+        "this test needs a fixture longer than the 32 KiB window; {len} B is not",
+        len = dictionary.len(),
+    );
+
+    for window_bits in [15, -15] {
+        let config = Config {
+            window_bits,
+            ..Config::defaults()
+        };
+        let current = Cell {
+            config,
+            flush: Z_NO_FLUSH,
+            chunking: SINGLE_SHOT,
+        };
+        let payload = sample(&corpus, "hello.bin");
+
+        let port = dictionary_run::<Port>(current, dictionary, &payload.bytes, None);
+        let reference = dictionary_run::<Reference>(
+            current,
+            dictionary,
+            &payload.bytes,
+            Some(port.outcome.out_window),
+        );
+
+        assert!(
+            port.set == Z_OK && reference.set == Z_OK,
+            "an over-window dictionary is legal and must be accepted: \
+             port {port_status}, reference {ref_status}",
+            port_status = status(port.set),
+            ref_status = status(reference.set),
+        );
+
+        let expected_tail = &dictionary[dictionary.len() - DICTIONARY_READBACK_CAPACITY..];
+        assert!(
+            port.read_back.0 == Z_OK && port.read_back.1 == expected_tail,
+            "the port must retain exactly the last w_size bytes of an over-window dictionary in \
+             the {container} container (deflate.c:606-611)\n{difference}",
+            container = config.container(),
+            difference = describe_byte_difference(&port.read_back.1, expected_tail),
+        );
+        assert!(
+            reference.read_back.0 == Z_OK && reference.read_back.1 == expected_tail,
+            "the reference is expected to retain the same tail; if this fails the expectation \
+             above is wrong, not the port\n{difference}",
+            difference = describe_byte_difference(&reference.read_back.1, expected_tail),
+        );
+
+        compare(current, payload, &port.outcome, &reference.outcome);
+    }
 }

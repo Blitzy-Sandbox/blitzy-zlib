@@ -84,7 +84,15 @@
 //! (L87) and whose `mem_done` catches leaks, non-LIFO frees and rogue frees; this suite exercises
 //! the default path that a caller who supplies no hooks actually gets.
 
-use core::ffi::{c_char, c_int, c_uint, CStr};
+use core::ffi::{c_int, c_uint, CStr};
+// `c_char` is reached only by the `gzFile` stages -- the `gzprintf` declaration below and the
+// `gzgets` call in `test_gzio` -- so the import carries the same gate they do. Imported
+// unconditionally it is an `unused_imports` warning in the supported
+// `--no-default-features --features libz-compat` configuration, and this workspace builds with
+// `-D warnings`, so the gate is what keeps that configuration compiling rather than a tidiness
+// preference -- which is how the feature matrix found it.
+#[cfg(feature = "gz")]
+use core::ffi::c_char;
 use core::mem::size_of;
 use core::ptr::{self, addr_of_mut};
 
@@ -92,7 +100,7 @@ use z::{
     uInt, uLong, z_stream, ZLIB_VERSION, Z_BEST_COMPRESSION, Z_BEST_SPEED, Z_BUF_ERROR,
     Z_DATA_ERROR, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY, Z_ERRNO, Z_FILTERED, Z_FINISH,
     Z_FULL_FLUSH, Z_MEM_ERROR, Z_NEED_DICT, Z_NO_COMPRESSION, Z_NO_FLUSH, Z_OK, Z_STREAM_END,
-    Z_STREAM_ERROR, Z_VERSION_ERROR,
+    Z_STREAM_ERROR, Z_SYNC_FLUSH, Z_VERSION_ERROR,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -581,27 +589,110 @@ extern "C" {
     fn gzprintf(file: z::gzFile, format: *const c_char, ...) -> c_int;
 }
 
-/// A unique path for this stage's `.gz` file, under the system temporary directory.
+/// A private directory for this stage's `.gz` file, and the file's path inside it.
 ///
-/// The C driver writes `TESTFILE` -- "foo.gz" -- into the current working directory (L25). Two
-/// reasons not to copy that: the relinked C driver runs in the same tree and would race for the very
-/// same name, and `cargo test` may run this binary concurrently with another invocation of itself.
-/// The process id plus a per-process counter makes collision impossible in both cases without
-/// reaching for a `tempfile` dev-dependency, which AAP 0.7.1(i) rules out and `std` makes
-/// unnecessary.
+/// The C driver writes `TESTFILE` -- "foo.gz" -- into the current working directory (L25). Three
+/// reasons not to copy that, and the third is the one that shapes this type:
+///
+/// 1. The relinked C driver runs in the same tree and would race for the very same name.
+/// 2. `cargo test` may run this binary concurrently with another invocation of itself.
+/// 3. **A predictable name in a shared, world-writable directory is an attack surface, not merely
+///    a collision risk.** Any other user on the machine can plant a symlink, a hard link or a
+///    directory at a path a test is about to create, and `gzopen` -- which calls `open()` with
+///    `O_CREAT` and no `O_EXCL` for a `"wb"` mode -- then follows it and writes wherever it points.
+///    A process id is neither secret nor unpredictable: it is visible in `/proc`, drawn from a small
+///    space, and reused.
+///
+/// So the *directory*, not the file, carries the security property. It is created:
+///
+/// * **Unguessable** -- 128 bits from [`RandomState`], whose seed the operating system provides.
+/// * **Owner-only in the same syscall that creates it** -- `mode(0o700)` on the [`DirBuilder`],
+///   rather than a create followed by a `chmod` that leaves a window open.
+/// * **Exclusively** -- `create` is the non-recursive form, so an existing path is refused with
+///   `AlreadyExists` rather than adopted. Nothing here ever removes a path it did not itself create,
+///   so a planted entry is refused, never deleted.
+///
+/// That is also what keeps the ported `gzopen(fname, "wb")` call at L99 *verbatim*: nothing can
+/// pre-exist inside a directory this process just created empty, so `"wb"`'s truncating open has
+/// nothing to be tricked by, and the stage still exercises the same `gz_open` branch the C driver
+/// does. (`"wbx"` would be the answer if the file had to live in a shared directory.)
+///
+/// [`Drop`] removes the tree, so cleanup is panic-safe: a failing assertion anywhere in the stage
+/// unwinds through it, where the previous trailing `remove_file` call was simply never reached.
+///
+/// No `tempfile` dev-dependency: AAP 0.7.1(i) rules one out and `std` makes it unnecessary.
 #[cfg(feature = "gz")]
-fn unique_gz_path() -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU32, Ordering};
+struct GzScratch {
+    /// The private directory. Removed, with its contents, when this value is dropped.
+    dir: std::path::PathBuf,
+    /// The `.gz` file inside it.
+    file: std::path::PathBuf,
+}
 
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
+#[cfg(feature = "gz")]
+impl Drop for GzScratch {
+    fn drop(&mut self) {
+        // Best effort, and only ever on a directory this process created: a missing tree must never
+        // itself become the failure, and nothing else can have a path into this one.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
 
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "zlib_rs_c_api_parity_{}_{serial}.gz",
-        std::process::id()
-    ));
-    path
+#[cfg(feature = "gz")]
+impl GzScratch {
+    /// How many unguessable names to try before giving up.
+    ///
+    /// A collision means another process holds that exact 128-bit name, which is vanishingly
+    /// unlikely; the retries keep one unlucky draw from failing the suite, and the bound keeps a
+    /// directory that refuses *every* create from spinning.
+    const ATTEMPTS: usize = 16;
+
+    /// Creates the private directory, or panics saying which step refused.
+    ///
+    /// Panicking is right here and only here: this is a test, the failure is an environment failure
+    /// rather than a library one, and continuing would test nothing. The message names the base
+    /// directory so the cause is actionable.
+    fn create() -> Self {
+        use std::hash::{BuildHasher, RandomState};
+        #[cfg(unix)]
+        use std::os::unix::fs::DirBuilderExt;
+
+        let base = std::env::temp_dir();
+        for _ in 0..Self::ATTEMPTS {
+            // Two independent OS-seeded draws, so the name carries 128 bits rather than 64.
+            let high = u128::from(RandomState::new().hash_one(0_u64));
+            let low = u128::from(RandomState::new().hash_one(u64::MAX));
+            let dir = base.join(format!("zlib_rs_c_api_parity_{:032x}", (high << 64) | low));
+
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            builder.mode(0o700);
+
+            match builder.create(&dir) {
+                Ok(()) => {
+                    let file = dir.join("example.gz");
+                    return Self { dir, file };
+                }
+                // Someone holds that name. Draw another; nothing is removed.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!(
+                    "cannot create a private scratch directory under {}: {error}",
+                    base.display()
+                ),
+            }
+        }
+        panic!(
+            "{} unguessable names under {} were all taken",
+            Self::ATTEMPTS,
+            base.display()
+        )
+    }
+
+    /// The `.gz` file's path.
+    fn path(&self) -> &std::path::Path {
+        &self.file
+    }
 }
 
 /// `gzerror(file, &err)` -- `zlib.h` L1775. Every failure message in this stage carries it, exactly
@@ -629,7 +720,9 @@ fn gz_error_text(file: z::gzFile) -> String {
 /// handles by removing the stage entirely rather than by turning it into a message.
 #[cfg(feature = "gz")]
 fn test_gzio(uncompr: &mut [u8], uncompr_len: uLong) {
-    let path = unique_gz_path();
+    // Held for the whole stage: its `Drop` is the cleanup, so it must outlive every assertion.
+    let scratch = GzScratch::create();
+    let path = scratch.path();
     let fname = std::ffi::CString::new(path.as_os_str().to_string_lossy().as_bytes())
         .expect("a temporary path contains no interior NUL");
 
@@ -758,11 +851,13 @@ fn test_gzio(uncompr: &mut [u8], uncompr_len: uLong) {
     let err = unsafe { z::gzclose(file) };
     check_err(err, "gzclose after reading");
 
-    // Not in the C driver, which leaves "foo.gz" behind for the build tree to clean up. A temporary
-    // file is this port's own creation, so removing it is this port's own responsibility; a missing
-    // file is tolerated so that cleanup can never itself become the failure. `"wb"` truncates, so a
-    // file left behind by an earlier panic cannot poison a later run either.
-    let _ = std::fs::remove_file(&path);
+    // Cleanup is not spelled out here on purpose. The C driver leaves "foo.gz" behind for the build
+    // tree to clean up; a temporary directory is this port's own creation, so removing it is this
+    // port's own responsibility -- and a trailing `remove_file` call discharges that responsibility
+    // only on the path where nothing went wrong. `GzScratch`'s `Drop` runs on *every* path out of
+    // this function, including an unwind from any assertion above, which is the whole reason the
+    // scratch is a value with a destructor rather than a path plus a tidy-up statement.
+    drop(scratch);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1372,4 +1467,396 @@ fn z_error_reports_the_status_table() {
         out_of_range.to_bytes().is_empty(),
         "an out-of-range code must select the empty sentinel"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+//  `gzvprintf`, driven through a C-built `va_list`
+// ---------------------------------------------------------------------------------------------
+//
+// `gzvprintf` is one of the 95 functions `zlib.h` declares, and until this section existed it was
+// the only one reachable in this process that no test called directly. `gzprintf` reaches it -- the
+// shim's `gzprintf` is literally `va_start`, one forward, `va_end` -- so its body did execute; what
+// had no coverage was `gzvprintf` AS AN ENTRY POINT, with its own argument guards, its own return
+// contract and its own error paths. One call shape from one caller is not that.
+//
+// It cannot be called from Rust. `core::ffi::VaList` is unstable at the declared 1.80 MSRV, and
+// `va_list` is a different type on every ABI -- `__va_list_tag[1]` on x86-64 SysV, a by-value
+// struct on AArch64, a `char *` on i386 -- so a hand-written Rust declaration would be ABI-invalid
+// rather than merely awkward. `crates/libz-rs-sys/csrc/gzvprintf_probe.c` is therefore the caller,
+// and `build.rs` links it with `cargo::rustc-link-arg-tests`, which cargo applies to test targets
+// and to nothing else. The shipped `libz.a` and `libz.so` are unchanged, and
+// `tests/symbol_parity.rs` is what proves it rather than this comment.
+
+// The test-only C helper that owns the `va_list`. See the section comment above.
+//
+// Declared with the same variadic form the probe defines, so the compiler marshals arguments the way
+// the C side reads them. Calling a C-variadic function through a declaration is stable Rust; only
+// *defining* one is not, which is precisely why the definition is in C and this is not. A `//`
+// comment rather than a doc comment, because an `extern` block is not an item a doc comment attaches
+// to -- the same shape the `gzprintf` declaration above uses.
+#[cfg(feature = "gz")]
+extern "C" {
+    fn _zlib_rs_gzvprintf_probe(file: z::gzFile, format: *const c_char, ...) -> c_int;
+}
+
+/// `gzvprintf` writes through a caller-owned `va_list`, and answers its documented codes.
+///
+/// Six cases, and each one is a distinct branch of `gzwrite.c` L403-L485 rather than a repetition:
+///
+/// 1. **A format with no directives.** The `va_list` is started and never read. Returns the literal
+///    length.
+/// 2. **A format with three directives of three different types** -- `%s`, `%d`, `%c`. This is the
+///    case that can only be written in C, and the one that would fail if the calling convention were
+///    wrong: an argument sequence walked at the wrong widths produces a wrong string rather than an
+///    error code, so the bytes are read back and compared.
+/// 3. **A read-mode stream.** `printf_begin` step 2 (`gzwrite.c` L421-L422) requires
+///    `Z_STREAM_ERROR`.
+/// 4. **A null `gzFile`.** `gzwrite.c` L418-L419 requires `Z_STREAM_ERROR`, and the shim performs
+///    that test because a `&mut GzState` cannot be null.
+/// 5. **A null format.** The reference has no such test and passes the pointer to `vsnprintf`, which
+///    is undefined behaviour; this port rejects it with `Z_STREAM_ERROR`, and that divergence is
+///    documented at `csrc/gzprintf_shim.c`. Asserted so the added guard cannot regress unnoticed.
+/// 6. **An expansion longer than the pending buffer.** `gzwrite.c` L471 answers 0 -- not an error
+///    code, and not a truncated count -- when `len >= state->size`, and the overflow sentinel is what
+///    detects it. Driven with a 4 KiB argument against a deliberately small `gzbuffer`.
+///
+/// The whole file is then read back and compared byte for byte, because a return value alone cannot
+/// distinguish "formatted and written" from "formatted and dropped".
+#[cfg(feature = "gz")]
+#[test]
+fn gzvprintf_formats_through_a_c_va_list() {
+    // Real file I/O, as at `example_c_parity`.
+    if cfg!(miri) {
+        println!("skipped under Miri: this suite performs real file I/O");
+        return;
+    }
+
+    // One private, unguessable, owner-only directory holds both files this test opens, and its
+    // `Drop` removes the tree on every path out -- including a panicking one. See `GzScratch`.
+    let scratch = GzScratch::create();
+    let path = scratch.path().to_path_buf();
+    let fname = std::ffi::CString::new(path.as_os_str().to_string_lossy().as_bytes())
+        .expect("a temporary path contains no interior NUL");
+
+    // ---- case 4: a null handle, before anything is opened ----
+    // SAFETY: a null `gzFile` is a published contract case -- `gzwrite.c` L418-L419 tests it rather
+    // than dereferencing it, and the shim performs that test before any Rust code sees the handle.
+    // The format is a `c"…"` literal with no directives, so no variadic argument is read.
+    let err = unsafe { _zlib_rs_gzvprintf_probe(ptr::null_mut(), c"unused".as_ptr()) };
+    assert_eq!(
+        err, Z_STREAM_ERROR,
+        "gzvprintf(NULL, ...) must be Z_STREAM_ERROR (gzwrite.c L418-L419)"
+    );
+
+    // ---- the write stream ----
+    // SAFETY: both arguments are NUL-terminated C strings that outlive the call -- `fname` is a live
+    // `CString` and the mode is a `c"…"` literal -- and `gzopen` only reads them.
+    let file = unsafe { z::gzopen(fname.as_ptr(), c"wb".as_ptr()) };
+    assert!(!file.is_null(), "gzopen error: {}", path.display());
+
+    // ---- case 5: a null format on a valid, open, writable stream ----
+    // SAFETY: `file` is the non-null handle just asserted. A null format is the case under test and
+    // the shim rejects it before `vsnprintf` could see it, so nothing dereferences it.
+    let err = unsafe { _zlib_rs_gzvprintf_probe(file, ptr::null()) };
+    assert_eq!(
+        err, Z_STREAM_ERROR,
+        "a null format must be refused rather than passed to vsnprintf"
+    );
+
+    // ---- case 1: no directives ----
+    // SAFETY: `file` is non-null and open for writing; the format is a `c"…"` literal with no
+    // directives, so the callee reads no variadic argument at all.
+    let plain = unsafe { _zlib_rs_gzvprintf_probe(file, c"plain".as_ptr()) };
+    assert_eq!(
+        plain,
+        5,
+        "gzvprintf returns the number of characters written: {}",
+        gz_error_text(file)
+    );
+
+    // ---- case 2: three directives, three argument types ----
+    // SAFETY: `file` is non-null and open for writing. The format's three directives -- `%s`, `%d`,
+    // `%c` -- are matched, in order and in type, by exactly three further arguments: a
+    // NUL-terminated `c"…"` literal, a `c_int` and a `c_int` holding a character value (C promotes
+    // the `%c` argument to `int`, which is what is passed). So the callee's `va_arg` sequence agrees
+    // with what was pushed.
+    let mixed = unsafe {
+        _zlib_rs_gzvprintf_probe(
+            file,
+            c"|%s=%d%c".as_ptr(),
+            c"k".as_ptr(),
+            42_i32,
+            c_int::from(b'!'),
+        )
+    };
+    assert_eq!(
+        mixed,
+        6,
+        "the three-directive expansion is the six characters |k=42! : {}",
+        gz_error_text(file)
+    );
+
+    // SAFETY: `file` is non-null and has not been closed; this call consumes it and the binding is
+    // not used again.
+    let err = unsafe { z::gzclose(file) };
+    check_err(err, "gzclose after gzvprintf");
+
+    // ---- read the file back: the return values above cannot prove the bytes landed ----
+    // SAFETY: as for the write-phase `gzopen`.
+    let file = unsafe { z::gzopen(fname.as_ptr(), c"rb".as_ptr()) };
+    assert!(!file.is_null(), "gzopen for reading: {}", path.display());
+
+    let mut got = [0_u8; 64];
+    let capacity = c_uint::try_from(got.len()).expect("64 fits a C unsigned");
+    // SAFETY: `file` is non-null and open for reading, and `capacity` bytes are writable at `got`'s
+    // start -- it is a live 64-byte array that outlives the call and `capacity` is its own length.
+    let read = unsafe { z::gzread(file, got.as_mut_ptr().cast(), capacity) };
+    assert_eq!(
+        read,
+        11,
+        "the two successful calls wrote 5 + 6 bytes: {}",
+        gz_error_text(file)
+    );
+    assert_eq!(
+        &got[..11],
+        b"plain|k=42!",
+        "gzvprintf wrote the wrong bytes, which is what a mis-marshalled va_list looks like"
+    );
+
+    // ---- case 3: a read-mode stream ----
+    // SAFETY: `file` is non-null and open, but for READING, which is the case under test; the format
+    // is a `c"…"` literal with no directives.
+    let err = unsafe { _zlib_rs_gzvprintf_probe(file, c"nope".as_ptr()) };
+    assert_eq!(
+        err, Z_STREAM_ERROR,
+        "gzvprintf on a read stream must be Z_STREAM_ERROR (gzwrite.c L421-L422)"
+    );
+
+    // SAFETY: `file` is non-null and has not been closed; this call consumes it.
+    let err = unsafe { z::gzclose(file) };
+    check_err(err, "gzclose after the read-mode case");
+
+    // ---- case 6: an expansion the pending buffer cannot hold ----
+    // A sibling inside the same private directory, so it is covered by the same `Drop`.
+    let over = path.with_file_name("gzvprintf_overflow.gz");
+    let overname = std::ffi::CString::new(over.as_os_str().to_string_lossy().as_bytes())
+        .expect("a temporary path contains no interior NUL");
+    // SAFETY: as for the write-phase `gzopen`.
+    let file = unsafe { z::gzopen(overname.as_ptr(), c"wb".as_ptr()) };
+    assert!(!file.is_null(), "gzopen error: {}", over.display());
+
+    // The smallest buffer `gzbuffer` accepts is what makes the overflow reachable with a payload
+    // this test can hold in a literal. `gzbuffer` must be called before the first write, which is
+    // why this case has a stream of its own rather than reusing the one above.
+    // SAFETY: `file` is non-null and nothing has been written through it yet, which is `gzbuffer`'s
+    // documented precondition (`zlib.h` L1429-L1443).
+    let err = unsafe { z::gzbuffer(file, 8) };
+    check_err(err, "gzbuffer(8)");
+
+    // 4096 characters of expansion against a pending buffer of at most a few dozen bytes.
+    let long = vec![b'x'; 4096];
+    let long = std::ffi::CString::new(long).expect("a run of 'x' contains no interior NUL");
+    // SAFETY: `file` is non-null and open for writing. The one `%s` directive is matched by one
+    // further argument, a live `CString` that outlives the call. The expansion cannot leave the
+    // scratch region however long it is: the shim passes `vsnprintf` the region's own size, so the
+    // overflow is detected by the sentinel rather than by writing past the end -- which is the
+    // property this case exists to exercise.
+    let dropped = unsafe { _zlib_rs_gzvprintf_probe(file, c"%s".as_ptr(), long.as_ptr()) };
+    assert_eq!(
+        dropped, 0,
+        "an expansion at or beyond the pending buffer answers 0, not an error and not a truncated \
+         count (gzwrite.c L471)"
+    );
+
+    // SAFETY: `file` is non-null and has not been closed; this call consumes it.
+    let err = unsafe { z::gzclose(file) };
+    check_err(err, "gzclose after the overflow case");
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&over);
+
+    println!("gzvprintf through a C va_list: 6 cases");
+}
+
+// ---------------------------------------------------------------------------------------------
+//  `inflateResetKeep`, through the facade's raw-pointer adapter
+// ---------------------------------------------------------------------------------------------
+
+/// `inflateResetKeep` restarts decoding without discarding the window or the set dictionary.
+///
+/// The safe core's own suite already covers the *behaviour*; what had no coverage was the facade
+/// adapter -- the `#[no_mangle] pub extern "C" fn` that validates a raw `z_streamp` and hands the
+/// call inward. `tests/symbol_parity.rs` proves the symbol exists and is bound to the right version
+/// node, which is a different claim: a symbol can be present, correctly versioned, and still be an
+/// adapter nobody ever ran.
+///
+/// The difference from `inflateReset` is the whole point of the entry point and is what this asserts:
+/// both rewind the stream, but `inflateResetKeep` retains the sliding window and the dictionary state
+/// (`zlib.h` L2039 declares it; `inflate.c`'s `inflateResetKeep` is the shared tail `inflateReset`
+/// calls after clearing `wsize`, `whave`, `wnext` and `head`). So a stream reset with *Keep* can
+/// still decode a raw block that back-references data from before the reset, and one reset without it
+/// cannot. Both directions are checked, because only the pair distinguishes the two functions.
+#[test]
+fn inflate_reset_keep_retains_the_window() {
+    /// Compresses the two parts as one raw deflate stream, split at a `Z_SYNC_FLUSH`.
+    ///
+    /// `Z_SYNC_FLUSH` is the load-bearing choice, and `Z_FULL_FLUSH` would be the wrong one.
+    /// A sync flush aligns the output to a byte boundary -- so the stream can be cut there -- while
+    /// *keeping* the encoder's history, which is what lets the second part's matches reference bytes
+    /// from the first. A full flush would reset that history and make the two parts independent, and
+    /// a decoder with no window would then decode the second part perfectly well: the test would pass
+    /// against an `inflateResetKeep` that kept nothing.
+    fn halves(first: &[u8], second: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut strm = new_stream();
+        // SAFETY: `strm` is a live, zeroed `z_stream` that outlives the call, and `ZLIB_VERSION`
+        // with `size_of::<z_stream>()` is the handshake the entry point requires. Raw `windowBits`
+        // of -15 selects the headerless form.
+        //
+        // `addr_of_mut!` throughout this test and the next, for the reason given on `compress`
+        // above: `&raw mut` is Rust 1.82 syntax and these crates declare a 1.80 floor, so the
+        // shorter spelling compiles here and breaks the `msrv` CI job.
+        let err = unsafe {
+            z::deflateInit2_(
+                addr_of_mut!(strm),
+                Z_BEST_SPEED,
+                8,
+                -15,
+                8,
+                Z_DEFAULT_STRATEGY,
+                ZLIB_VERSION.as_ptr().cast::<c_char>(),
+                stream_size(),
+            )
+        };
+        check_err(err, "deflateInit2_ raw");
+
+        let mut out = vec![0_u8; 4096];
+        let mut produced: Vec<Vec<u8>> = Vec::with_capacity(2);
+        for (index, part) in [first, second].into_iter().enumerate() {
+            strm.next_in = part.as_ptr().cast_mut();
+            strm.avail_in = uInt::try_from(part.len()).expect("the halves are short");
+            strm.next_out = out.as_mut_ptr();
+            strm.avail_out = uInt::try_from(out.len()).expect("4096 fits a uInt");
+            let flush = if index == 0 { Z_SYNC_FLUSH } else { Z_FINISH };
+            // SAFETY: `strm` is the live stream just initialised; `avail_in` bytes are readable at
+            // `next_in` (a live borrow of `part`) and `avail_out` are writable at `next_out` (a live
+            // borrow of `out`), and both outlive the call.
+            let err = unsafe { z::deflate(addr_of_mut!(strm), flush) };
+            let want = if index == 0 { Z_OK } else { Z_STREAM_END };
+            assert_eq!(err, want, "deflate half {index}");
+            let written = out.len() - usize::try_from(strm.avail_out).expect("a uInt fits a usize");
+            produced.push(out[..written].to_vec());
+        }
+
+        // SAFETY: `strm` is the live stream; this call releases its state and it is not used again.
+        let err = unsafe { z::deflateEnd(addr_of_mut!(strm)) };
+        check_err(err, "deflateEnd raw");
+
+        let mut parts = produced.into_iter();
+        let first = parts.next().expect("two halves were produced");
+        let second = parts.next().expect("two halves were produced");
+        (first, second)
+    }
+
+    /// Decodes `data` into `out` on an already-initialised raw stream.
+    fn inflate_part(strm: &mut z_stream, data: &[u8], out: &mut [u8]) -> (c_int, usize) {
+        strm.next_in = data.as_ptr().cast_mut();
+        strm.avail_in = uInt::try_from(data.len()).expect("the halves are short");
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = uInt::try_from(out.len()).expect("the buffer is short");
+        // SAFETY: `strm` is a live, initialised inflate stream; `avail_in` bytes are readable at
+        // `next_in` and `avail_out` writable at `next_out`, both borrowed from live slices that
+        // outlive the call.
+        let err = unsafe { z::inflate(strm, Z_NO_FLUSH) };
+        let written = out.len() - usize::try_from(strm.avail_out).expect("a uInt fits a usize");
+        (err, written)
+    }
+
+    // A payload whose second half is a long back-reference into the first. With the window kept, the
+    // second half decodes; without it, the distance points before the start of the stream.
+    let first = b"the quick brown fox jumps over the lazy dog. ".repeat(4);
+    let second = b"the quick brown fox jumps over the lazy dog. ".repeat(4);
+    let (head, tail) = halves(&first, &second);
+
+    // ---- with the window kept ----
+    let mut strm = new_stream();
+    // SAFETY: `strm` is a live, zeroed `z_stream` that outlives the call, and the version and
+    // `stream_size` arguments are the handshake `inflateInit2_` requires. -15 selects raw inflate.
+    let err = unsafe {
+        z::inflateInit2_(
+            addr_of_mut!(strm),
+            -15,
+            ZLIB_VERSION.as_ptr().cast::<c_char>(),
+            stream_size(),
+        )
+    };
+    check_err(err, "inflateInit2_ raw");
+
+    let mut out = vec![0_u8; first.len() + second.len() + 64];
+    let (err, written) = inflate_part(&mut strm, &head, &mut out);
+    check_err(err, "inflate of the first half");
+    assert_eq!(&out[..written], first.as_slice(), "first half round-trip");
+
+    // ★ THE CALL UNDER TEST. The facade adapter, on a real `z_stream` behind a raw pointer.
+    // SAFETY: `strm` is the live stream initialised above and not yet ended, which is exactly the
+    // state `inflateResetKeep` documents; the pointer is derived from a live local that outlives the
+    // call.
+    let err = unsafe { z::inflateResetKeep(addr_of_mut!(strm)) };
+    check_err(err, "inflateResetKeep");
+
+    // The documented reset half: the counters are cleared like any reset.
+    assert_eq!(strm.total_in, 0, "inflateResetKeep clears total_in");
+    assert_eq!(strm.total_out, 0, "inflateResetKeep clears total_out");
+    assert!(strm.msg.is_null(), "inflateResetKeep clears msg");
+
+    // The *keep* half: the window survived, so the second half's back-references resolve.
+    let (err, written) = inflate_part(&mut strm, &tail, &mut out);
+    assert_eq!(
+        err, Z_STREAM_END,
+        "the second half was closed with Z_FINISH, so inflate reports the end of the stream"
+    );
+    assert_eq!(
+        &out[..written],
+        second.as_slice(),
+        "inflateResetKeep must retain the sliding window, so a back-reference across the reset \
+         still resolves"
+    );
+
+    // SAFETY: `strm` is the live stream; this releases its state and it is not used again.
+    let err = unsafe { z::inflateEnd(addr_of_mut!(strm)) };
+    check_err(err, "inflateEnd after inflateResetKeep");
+
+    // ---- and the contrast: a full reset discards it ----
+    // Without this half the test would pass against an `inflateResetKeep` that was a synonym for
+    // `inflateReset`, which is the one way the entry point could be wrong and still look right.
+    let mut strm = new_stream();
+    // SAFETY: as for the first `inflateInit2_`.
+    let err = unsafe {
+        z::inflateInit2_(
+            addr_of_mut!(strm),
+            -15,
+            ZLIB_VERSION.as_ptr().cast::<c_char>(),
+            stream_size(),
+        )
+    };
+    check_err(err, "inflateInit2_ raw, second stream");
+
+    let (err, _) = inflate_part(&mut strm, &head, &mut out);
+    check_err(err, "inflate of the first half, second stream");
+
+    // SAFETY: `strm` is the live stream initialised above and not yet ended.
+    let err = unsafe { z::inflateReset(addr_of_mut!(strm)) };
+    check_err(err, "inflateReset");
+
+    let (err, _) = inflate_part(&mut strm, &tail, &mut out);
+    assert_eq!(
+        err, Z_DATA_ERROR,
+        "inflateReset discards the window, so the same back-reference must now be rejected -- if \
+         this succeeds, inflateResetKeep and inflateReset are doing the same thing"
+    );
+
+    // SAFETY: `strm` is the live stream; this releases its state and it is not used again.
+    let err = unsafe { z::inflateEnd(addr_of_mut!(strm)) };
+    check_err(err, "inflateEnd after inflateReset");
+
+    println!("inflateResetKeep retains the window; inflateReset does not");
 }

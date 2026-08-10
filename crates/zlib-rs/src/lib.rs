@@ -8,9 +8,12 @@
 //! The in-tree C sources are the algorithmic oracle for all of it; they are read and never
 //! edited.
 //!
-//! This crate exports **no C symbol**, and **every unsafe operation -- every dereference, every
-//! FFI call, every layout transmutation -- is confined to `crates/libz-rs-sys`**, the facade that
-//! reproduces the `libz` ABI on top of what is defined here.
+//! This crate exports **no C symbol**, and in the shipped library **every unsafe operation --
+//! every dereference, every FFI call, every layout transmutation -- is confined to
+//! `crates/libz-rs-sys`**, the facade that reproduces the `libz` ABI on top of what is defined
+//! here. The dev-only `crates/zlib-rs-differential` has a boundary of its own, in its
+//! `src/oracle.rs` and `src/port.rs`, because comparing two implementations means calling two C
+//! ABIs; neither shipped crate depends on it, so none of it reaches `libz.so` or `libz.a`.
 //!
 //! What this crate does *not* claim is that no raw pointer value ever appears in it. Two do, and
 //! both are inert by construction, because `#![forbid(unsafe_code)]` makes dereferencing them
@@ -48,8 +51,11 @@
 //! `(next_out, avail_out)` slices exactly once on entry, round-trips the opaque `state` pointer,
 //! calls the caller's `zalloc`/`zfree`, handles C strings and varargs, and writes through the
 //! caller's `gz_header`. Everything past that boundary -- which is everything in this crate --
-//! is ordinary safe Rust operating on slices and indices, so Miri can analyse it exhaustively
-//! precisely because it contains no FFI.
+//! is ordinary safe Rust operating on slices and indices, which is what makes this crate
+//! Miri-COMPATIBLE: containing no FFI, it holds nothing Miri cannot execute, so `cargo miri test
+//! -p zlib-rs` interprets the suite it selects rather than failing on a foreign call. It reports
+//! undefined behaviour on the paths that suite executes and says nothing about the rest, and the
+//! `#[cfg_attr(miri, ignore)]` marks in this crate's tests name what it therefore skips.
 //!
 //! Three consequences are worth stating outright, because the safety argument rests on them:
 //!
@@ -115,8 +121,8 @@
 //! # Public surface and visibility discipline
 //!
 //! Two sibling crates consume this one by path -- `libz-rs-sys`, which builds the `extern "C"`
-//! exports on top of it, and `zlib-rs-differential`, whose planned suites will compare this
-//! implementation against the C oracle byte for byte. Between them they fix the surface.
+//! exports on top of it, and `zlib-rs-differential`, whose suites compare this implementation
+//! against the C oracle byte for byte. Between them they fix the surface.
 //!
 //! The export target is **95 functions**, which together with 16 symbol-version nodes make the
 //! **111 dynamic globals** the reference `libz.so.1.3.2.1-motley` defines -- that is the measured
@@ -240,8 +246,9 @@
 //!
 //! # Minimum supported Rust version, and version identity
 //!
-//! Stable **1.80**, edition 2021, as declared by `rust-version` in the workspace manifest and
-//! mirrored by `msrv` in `clippy.toml`. There is no `#![feature(...)]` anywhere, so this crate
+//! Stable **1.80**, edition 2021, as declared by `rust-version` in the workspace manifest. That
+//! declaration is also what clippy's version-aware lints read, because `clippy.toml` deliberately
+//! carries no `msrv` key. There is no `#![feature(...)]` anywhere, so this crate
 //! builds on the stable channel; nightly is reached only through an explicit `cargo +nightly`
 //! for Miri, and edition 2024 is not an option at this floor because it requires rustc 1.85.
 //!
@@ -813,13 +820,12 @@ pub use crate::uncompress::Decompressed;
 //  Public DATA whose consuming FUNCTIONS stay crate-private, which is exactly
 //  the asymmetry `zlib.map` describes: `inflate_fixed`, `inflate_fast`
 //  and the `_tr_*` family are all hidden, while the arrays they
-//  read are the port's cheapest correctness check.  The planned
-//  `crates/zlib-rs-differential/tests/table_equality.rs` will compare every one
+//  read are the port's cheapest correctness check.
+//  `crates/zlib-rs-differential/tests/table_equality.rs` compares every one
 //  of them element for element against `crc32.h`, `trees.h` and `inffixed.h`, so
 //  that a transcription slip anywhere in these thousands of literals shows up
-//  there immediately -- long before any stream is compressed.  That file has not
-//  landed yet; until it does, the arrays are public for it and nothing checks
-//  them automatically.
+//  there immediately -- long before any stream is compressed.  That suite lives in
+//  another package, which is the whole reason the arrays are public.
 
 /// The byte-at-a-time CRC-32 table -- see [`crc32::tables::CRC_TABLE`].
 #[cfg(feature = "rust-api")]
@@ -874,6 +880,22 @@ pub use crate::trees::base_length;
 /// First distance of each distance code -- see [`trees::base_dist`].
 #[cfg(feature = "rust-api")]
 pub use crate::trees::base_dist;
+
+/// Extra bits carried by each length code -- see [`trees::extra_lbits`].
+#[cfg(feature = "rust-api")]
+pub use crate::trees::extra_lbits;
+
+/// Extra bits carried by each distance code -- see [`trees::extra_dbits`].
+#[cfg(feature = "rust-api")]
+pub use crate::trees::extra_dbits;
+
+/// Extra bits carried by each bit-length code -- see [`trees::extra_blbits`].
+#[cfg(feature = "rust-api")]
+pub use crate::trees::extra_blbits;
+
+/// Transmission order of the bit-length codes -- see [`trees::bl_order`].
+#[cfg(feature = "rust-api")]
+pub use crate::trees::bl_order;
 
 /// The fixed literal/length decode table -- see [`inflate::lenfix`].
 #[cfg(feature = "rust-api")]

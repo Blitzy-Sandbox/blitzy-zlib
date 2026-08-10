@@ -61,7 +61,7 @@
 //! encoder is already pinned byte-for-byte by `tests/byte_identical.rs`. The two triage lists are
 //! therefore different, and this one is the right one to start from:
 //!
-//! * the 31-variant `inflate_mode` state machine (`inflate.h` L54-L94) and its resumability at every
+//! * the 32-variant `inflate_mode` state machine (`inflate.h` L54-L94) and its resumability at every
 //!   state -- suspect when a chunked crossing fails and the same case passes single-shot;
 //! * `inflate_table` construction (`inftrees.c`) -- suspect when the failure is confined to
 //!   particular fixtures, since a bad table decodes most symbols correctly and a few wrongly;
@@ -93,10 +93,11 @@
 //! # Coverage, and how to run it
 //!
 //! ```text
-//! # The default run. Always runs, and is the one CI must not omit.
+//! # The default run. Always runs; the `differential` CI job runs it first.
 //! cargo test --locked -p zlib-rs-differential --release --test roundtrip_interop
 //!
-//! # The exhaustive window-bits sweep. CI MUST run this line as well.
+//! # The exhaustive window-bits sweep. The `differential` job in .github/workflows/rust.yml runs
+//! # this line as well as the one above, so both halves are gated on every push.
 //! ZLIB_RS_INTEROP_EXHAUSTIVE=1 cargo test --locked -p zlib-rs-differential --release \
 //!     --test roundtrip_interop -- --ignored --test-threads 4
 //! ```
@@ -123,10 +124,14 @@
 //!   trivially, so every success case asserts the specific expected `Z_OK` / `Z_STREAM_END`, and
 //!   every negative case asserts **equal, specific** status codes on both sides rather than merely
 //!   equal ones.
-//! * **`unsafe` only where invoking an already-declared `extern "C"` function requires it.** It is
-//!   confined to the [`Side`] and [`GzSide`] implementations, one gate per entry point, each owning a
-//!   single `unsafe` block whose `// SAFETY:` comment names the invariant it relies on. No
-//!   `#[no_mangle]` anywhere, and never `extern "C-unwind"`.
+//! * **No `unsafe` at all, enforced by `#![forbid(unsafe_code)]` on this file's root.** Invoking an
+//!   `extern "C"` entry point is an `unsafe` operation whichever implementation owns it, so both
+//!   sides are reached through this crate's FFI boundary instead: `crate::port` for the facade and
+//!   `oracle` for the C reference, one gate per entry point, each gate owning the single documented
+//!   `unsafe` block and the `// SAFETY:` comment naming its invariant. The [`Side`] and [`GzSide`]
+//!   implementations below therefore carry call shapes and the obligations a signature cannot
+//!   express -- the retained `gz_header` pointer, the `*_max` buffer caps, exactly one `gzclose` --
+//!   and nothing more. No `#[no_mangle]` anywhere, and never `extern "C-unwind"`.
 //! * **No network, and nothing outside `corpus/minimal/`.** Fixtures are resolved from
 //!   `CARGO_MANIFEST_DIR`. The Silesia tier is deliberately not read: it is opt-in and belongs to
 //!   `benches/`.
@@ -135,10 +140,16 @@
 //! * **Run `tests/table_equality.rs` and `tests/byte_identical.rs` first.** A mistyped digit in a
 //!   transcribed table or a divergent encoder would surface here as a wall of failures pointing at
 //!   neither.
-//! * **Not under Miri, by design.** Miri interprets Rust MIR and cannot execute the compiled C
-//!   oracle, so the Miri gate is scoped to `-p zlib-rs`; nightly `AddressSanitizer` covers this
-//!   crate, which matters especially for this file because the `gzFile` layer and
-//!   `inflateGetHeader` are where raw pointers and caller-owned buffers actually meet.
+//! * **Under neither sanitizer, by design, and for two different reasons.** Miri interprets Rust
+//!   MIR and cannot execute the compiled C oracle, so the Miri gate is scoped to `-p zlib-rs`. The
+//!   nightly `AddressSanitizer` gate is scoped to `-p libz-rs-sys` and the three relinked C drivers,
+//!   and does not select this crate. Both are CI job scopes rather than anything to work around
+//!   here. That split is worth stating precisely for this file, because the `gzFile` layer and
+//!   `inflateGetHeader` are where raw pointers and caller-owned buffers actually meet: that surface
+//!   *is* instrumented, but through the facade's own suites -- `-p libz-rs-sys` covers everything
+//!   under `crates/libz-rs-sys/tests/`, including the `gz_memory.rs` accounting named above -- and
+//!   not through this file. What this file relies on instead is that a divergence fails a
+//!   comparison loudly.
 
 // The workspace lint table denies the panic-prone quartet, which is right for library code and
 // wrong for a test: a test asserts, a failed assertion panics, and slicing a buffer at an offset
@@ -153,9 +164,13 @@
     clippy::indexing_slicing,
     clippy::panic
 )]
+// Both C ABIs this suite crosses are reached exclusively through the gates in `crate::port` and
+// `oracle`, so nothing here needs `unsafe` and the compiler is asked to keep it that way. Those two
+// boundary modules are the only files in this crate the attribute is deliberately absent from;
+// `src/lib.rs` explains why at its ATTRIBUTES block.
+#![forbid(unsafe_code)]
 
-use core::ffi::{c_char, c_int, c_uint};
-use core::mem::size_of;
+use core::ffi::{c_int, c_uint};
 use std::ffi::{CStr, CString};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -165,14 +180,15 @@ use std::path::{Path, PathBuf};
 // `libz.so`/`libz.a`, and this crate's manifest uses cargo's dependency-rename form to give the Rust
 // path a useful name. That manifest is the authority; see its comment at the `libz_rs_sys` key.
 use libz_rs_sys::{
-    ZLIB_VERSION, Z_BEST_COMPRESSION, Z_BUF_ERROR, Z_DATA_ERROR, Z_DEFAULT_COMPRESSION,
-    Z_DEFAULT_STRATEGY, Z_DEFLATED, Z_ERRNO, Z_FINISH, Z_FULL_FLUSH, Z_MEM_ERROR, Z_NEED_DICT,
-    Z_NO_FLUSH, Z_OK, Z_STREAM_END, Z_STREAM_ERROR, Z_SYNC_FLUSH, Z_VERSION_ERROR,
+    Z_BEST_COMPRESSION, Z_BUF_ERROR, Z_DATA_ERROR, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY,
+    Z_DEFLATED, Z_ERRNO, Z_FINISH, Z_FULL_FLUSH, Z_MEM_ERROR, Z_NEED_DICT, Z_NO_FLUSH, Z_OK,
+    Z_STREAM_END, Z_STREAM_ERROR, Z_SYNC_FLUSH, Z_VERSION_ERROR,
 };
 
-// The C reference. Every name here is declared in exactly one place -- this crate's `src/oracle.rs`
-// -- and this file adds no `extern "C"` block of its own.
-use zlib_rs_differential::oracle;
+// The two sides of this crate's FFI boundary. Every `extern "C"` declaration and every `unsafe` call
+// this suite performs lives in exactly one of these two modules -- `oracle` for the C reference,
+// `port` for the facade -- and this file adds no `extern "C"` block and no `unsafe` block of its own.
+use zlib_rs_differential::{oracle, port};
 
 use crate::Length::{AtLeast, Exactly};
 
@@ -188,7 +204,7 @@ const DECODER_TRIAGE: &str = "\
 where to look -- a crossing failure is usually a DECODER problem, because the encoder is already
 pinned byte-for-byte by tests/byte_identical.rs (use that file's eight-decision-point list instead
 if the port was the compressing side AND the same fixture fails there too):
-  1. inflate_mode state machine  inflate.h:54-94, 31 variants HEAD..SYNC, driven by the exhaustive
+  1. inflate_mode state machine  inflate.h:54-94, 32 variants HEAD..SYNC, driven by the exhaustive
                                  match in inflate.c.  Every state must be resumable, because that is
                                  the contract inflate() offers a caller feeding input in pieces ->
                                  suspect FIRST when a chunked crossing fails and the same case
@@ -214,43 +230,48 @@ if the port was the compressing side AND the same fixture fails there too):
                                  error.";
 
 // =================================================================================================
-//  The `unsafe` obligations
+//  What each side's gates still owe
 //
-//  ONE GATE PER ENTRY POINT, each owning a single documented `unsafe` block. That shape is the
-//  workspace's stated policy for a repeated call -- see the call-gate section of
-//  `crates/libz-rs-sys/tests/c_api_parity.rs` -- and it is what keeps the invariant stated once
-//  rather than some hundreds of times. The obligations are identical on both sides, so they are
-//  enumerated here and referenced by letter from each gate.
+//  ONE GATE PER ENTRY POINT, and NO `unsafe` ANYWHERE IN THIS FILE: the root carries
+//  `#![forbid(unsafe_code)]` and every method of [`Side`] and [`GzSide`] delegates to the matching
+//  safe gate in this crate's FFI boundary -- `crate::port` for the facade, `oracle` for the C
+//  reference -- which is where the single documented `unsafe` block per entry point lives together
+//  with the invariant it discharges. Four of the seven obligations below are therefore discharged by
+//  the gates' signatures and are recorded here only so that a reader of this file knows where they
+//  went; three of them are genuinely still this side's, because no signature can express them.
 //
-//    (a) `strm` arrives as `&mut Self::Stream`, so it is non-null, aligned and uniquely borrowed for
-//        the duration of the call. A reference cannot be otherwise.
-//    (b) `strm.state` is either null or a block THIS SAME implementation allocated through its own
-//        `*Init2_`, so the state check on entry -- `inflateStateCheck` at `inflate.c:88`,
-//        `deflateStateCheck` at `deflate.c:538`, and their counterparts in the facade -- accepts or
-//        rejects it exactly as it would for a C caller. No stream is ever handed to the other side's
-//        functions, which is the whole point of the two mirrors being distinct Rust types.
-//    (c) Where `next_in` is non-null, `avail_in` bytes really are readable there: the pointer is
-//        always taken from a `&[u8]` that outlives every call in the run, and a zero-length window is
-//        installed as a NULL pointer instead -- the pairing `zlib.h:91-92` permits explicitly.
-//    (d) `avail_out` bytes really are writable at `next_out`: the pointer is always taken from a
-//        scratch buffer the driver owns, which likewise outlives every call, and the driver never
-//        offers a zero-length output window because `inflate.c` and `deflate.c:995` both answer
-//        `Z_BUF_ERROR` for one.
-//    (e) The `version`/`stream_size` pair is this side's own: the facade is initialised with the
-//        facade's `ZLIB_VERSION` and `size_of` of the facade's `z_stream`, the oracle with what
-//        `c_zlibVersion` returns and `size_of` of the oracle's mirror. Crossing them would answer
-//        `Z_VERSION_ERROR` (`zlib.h:248`) rather than produce a working stream.
-//    (f) A `gz_header` handed to `deflateSetHeader` or `inflateGetHeader` is a live local of this
-//        side's own mirror type, and every non-null `extra`/`name`/`comment` pointer in it addresses
-//        at least `extra_max`/`name_max`/`comm_max` writable bytes in a buffer that outlives the
-//        whole stream. `Vec`'s heap allocation does not move when the `Vec` itself does, so a
-//        pointer taken from one stays valid for as long as the `Vec` is neither dropped nor grown --
-//        and neither happens to any buffer here.
-//    (g) A path handed to `gzopen` is a `CString`, hence NUL-terminated and valid for reads for the
-//        whole call, and the library copies what it keeps (`gzlib.c:200-204`); a mode string is a
-//        `c"..."` literal with `'static` storage. Every `gzopen`/`gzdopen` is matched by exactly one
-//        `gzclose` on every exit path, and a failed open is asserted before anything else touches
-//        the handle.
+//    (a) DISCHARGED BY THE GATE. `strm` arrives as `&mut Self::Stream` and is passed straight
+//        through, so it cannot be null, misaligned or aliased.
+//    (b) THIS SIDE'S. `strm.state` must be null or a block THIS SAME implementation allocated
+//        through its own `*Init2_`, so the state check on entry -- `inflateStateCheck` at
+//        `inflate.c:88`, `deflateStateCheck` at `deflate.c:538`, and their counterparts in the
+//        facade -- accepts or rejects it exactly as it would for a C caller. The two mirrors being
+//        distinct Rust types is what makes handing a stream to the other side's gate a compile
+//        error, so what remains here is only the discipline of not reusing an ended stream.
+//    (c) DISCHARGED BY THE GATE, arranged here. The input window crosses as a `&[u8]`, but which
+//        slice, and whether a zero-length window is installed as a NULL pointer -- the pairing
+//        `zlib.h:91-92` permits explicitly -- is a chunking decision, so `install_port` and
+//        `install_reference` own it.
+//    (d) THIS SIDE'S, and semantic rather than sound: the driver never offers a zero-length output
+//        window, because `inflate.c` and `deflate.c:995` both answer `Z_BUF_ERROR` for one and a run
+//        that tripped that would be measuring the harness. Both installers assert it.
+//    (e) DISCHARGED BY THE GATE. Each boundary gate supplies its own side's `version`/`stream_size`
+//        pair -- the facade's `ZLIB_VERSION` and `size_of` of the facade's `z_stream`, the oracle's
+//        `c_zlibVersion` and `size_of` of the oracle's mirror -- so crossing them is impossible
+//        rather than merely avoided. Crossed, they would answer `Z_VERSION_ERROR` (`zlib.h:248`).
+//    (f) THIS SIDE'S. A `gz_header` handed to `deflateSetHeader` or `inflateGetHeader` is a live
+//        local of this side's own mirror type, and every non-null `extra`/`name`/`comment` pointer
+//        in it must address at least `extra_max`/`name_max`/`comm_max` writable bytes in a buffer
+//        that outlives the whole stream, because the library RETAINS the pointer to the header.
+//        `Vec`'s heap allocation does not move when the `Vec` itself does, so a pointer taken from
+//        one stays valid for as long as the `Vec` is neither dropped nor grown -- and neither
+//        happens to any buffer here. [`HeaderBuffers`] is what sizes them.
+//    (g) MOSTLY DISCHARGED BY THE GATE, one half this side's. Paths and modes cross as `&CStr`, so
+//        termination is the type's business, and the library copies what it keeps
+//        (`gzlib.c:200-204`). What stays here is that every `gzopen`/`gzdopen` is matched by exactly
+//        one `gzclose` on every exit path and that a failed open is asserted before anything else
+//        touches the handle: the boundary's handle is `Copy`, deliberately, so that this suite can
+//        measure what a double close and a use-after-close actually report.
 //
 //  A `z_stream` must additionally NOT BE RELOCATED once `*Init2_` has seen it: `deflate.c:444` and
 //  `inflate.c:236` store a back-pointer to it, and the state check tests that pointer on the way
@@ -612,15 +633,6 @@ fn widen_ulong_oracle(value: oracle::uLong) -> u64 {
     u64::from(value)
 }
 
-/// `(int) sizeof(z_stream)` -- the second half of the handshake the `inflateInit2` macro arranges
-/// (`zlib.h` L859).
-///
-/// Checked rather than cast: a `size_of` that did not fit a `c_int` would mean the ABI mirror had
-/// grown past anything `zlib.h` could describe.
-fn stream_size<T>() -> c_int {
-    c_int::try_from(size_of::<T>()).expect("sizeof(z_stream) fits in a C int")
-}
-
 /// Narrows a window length to the facade's `uInt`, which is what `avail_in`/`avail_out` are.
 fn narrow_avail(len: usize) -> libz_rs_sys::uInt {
     libz_rs_sys::uInt::try_from(len).expect("a window length fits in a uInt")
@@ -668,14 +680,12 @@ fn widen_off_oracle(offset: oracle::z_off_t) -> i64 {
     i64::from(offset)
 }
 
-/// Narrows a length to the `unsigned` that `gzread` and `gzwrite` take (`zlib.h` L1458, L1508).
-fn narrow_uint(len: usize) -> c_uint {
-    c_uint::try_from(len).expect("a gz buffer length fits in a C unsigned")
-}
-
-/// Narrows a length to the `int` that `gzgets` takes (`zlib.h` L1553).
+/// Narrows a length to the `int` that `gzwrite` and `gzputs` answer with (`zlib.h` L1508, L1577).
+///
+/// The gates take and return the C types, so this is what an assertion needs to compare a reported
+/// count against the length that produced it.
 fn narrow_int(len: usize) -> c_int {
-    c_int::try_from(len).expect("a gzgets buffer length fits in a C int")
+    c_int::try_from(len).expect("a written length fits in a C int")
 }
 
 /// Narrows an offset to the facade's `z_off_t`, which is `long`.
@@ -702,16 +712,15 @@ const GZ_ERRNUM_SENTINEL: c_int = 0x5eed;
 ///
 /// A `NULL` return is a distinct outcome from an empty message -- `gzlib.c` L517 answers `NULL` only
 /// for a null handle, whereas L527 answers `""` for a live one with no error -- so the two are
-/// rendered differently rather than both becoming the empty string.
-fn gz_message(message: *const c_char) -> String {
-    if message.is_null() {
-        return "<NULL>".to_owned();
+/// rendered differently rather than both becoming the empty string. The boundary gate keeps them
+/// apart by handing back [`None`] for the null return, which is what makes the distinction available
+/// here at all: a side that answered `""` where the other answered `NULL` would otherwise compare
+/// equal.
+fn gz_message(message: Option<&[u8]>) -> String {
+    match message {
+        None => "<NULL>".to_owned(),
+        Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
     }
-    // SAFETY: on a non-null return the pointer addresses a NUL-terminated string owned either by the
-    // stream or by the library's `'static` message table, both of which outlive this borrow, and
-    // neither is written by reading it.
-    let text = unsafe { CStr::from_ptr(message) };
-    text.to_string_lossy().into_owned()
 }
 
 // =================================================================================================
@@ -740,28 +749,73 @@ struct Scratch {
 }
 
 impl Scratch {
-    /// Creates `<temp dir>/zlib-rs-interop-<pid>-<serial>-<tag>/`.
+    /// How many unguessable names to try before giving up.
+    ///
+    /// A collision means another process holds that exact 128-bit name, which is vanishingly
+    /// unlikely; the retries keep one unlucky draw from failing the suite, and the bound keeps a
+    /// temporary directory that refuses *every* create from spinning.
+    const ATTEMPTS: usize = 16;
+
+    /// Creates one private, unguessable, owner-only directory for this instantiation.
+    ///
+    /// ★ THE NAME IS NOT DERIVED FROM THE PROCESS ID, AND NOTHING IS REMOVED HERE. The earlier
+    /// form was `<temp dir>/zlib-rs-interop-<pid>-<serial>-<tag>` preceded by an unconditional
+    /// `remove_dir_all`, and both halves were wrong in a shared temporary directory. A process id
+    /// is neither secret nor unpredictable -- it is visible in `/proc`, drawn from a small space
+    /// and reused -- so another user can precreate that path, or plant a symlink at it, and the
+    /// `gzopen(.., "wb")` calls below (an `open()` with `O_CREAT` and no `O_EXCL`) then follow it
+    /// and write wherever it points. The `remove_dir_all` compounded it by deleting whatever stood
+    /// there, which for a symlinked or adopted directory means deleting a path this suite does not
+    /// own, and by leaving a window between the delete and the create.
+    ///
+    /// So the *directory* carries the security property, exactly as
+    /// `crates/libz-rs-sys/tests/c_api_parity.rs` does it:
+    ///
+    /// * **Unguessable** -- 128 bits from two OS-seeded [`RandomState`] draws.
+    /// * **Owner-only in the same syscall that creates it** -- `mode(0o700)` on the
+    ///   [`DirBuilder`], not a create followed by a `chmod` that leaves a window open.
+    /// * **Exclusively** -- `create` is the non-recursive form, so an existing path is refused
+    ///   with `AlreadyExists` rather than adopted, and this function never removes anything. The
+    ///   only `remove_dir_all` in this file is the RAII one in `Drop`, on a directory this process
+    ///   created empty.
+    ///
+    /// `tag` is kept, but only as a suffix for legibility in a failure message; it contributes no
+    /// uniqueness and nothing depends on it.
     fn new(tag: &str) -> Self {
-        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::hash::{BuildHasher, RandomState};
+        #[cfg(unix)]
+        use std::os::unix::fs::DirBuilderExt;
 
-        static SERIAL: AtomicU32 = AtomicU32::new(0);
-        let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir();
+        for _ in 0..Self::ATTEMPTS {
+            // Two independent OS-seeded draws, so the name carries 128 bits rather than 64.
+            let high = u128::from(RandomState::new().hash_one(0_u64));
+            let low = u128::from(RandomState::new().hash_one(u64::MAX));
+            let dir = base.join(format!(
+                "zlib-rs-interop-{name:032x}-{tag}",
+                name = (high << 64) | low
+            ));
 
-        let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "zlib-rs-interop-{pid}-{serial}-{tag}",
-            pid = std::process::id()
-        ));
-        // A leftover from a previous run at the same pid would otherwise make a later case read a
-        // stale file. Removing first is cheap and makes the directory's contents this run's alone.
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap_or_else(|err| {
-            panic!(
-                "could not create the scratch directory {dir}: {err}",
-                dir = dir.display()
-            )
-        });
-        Self { dir }
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            builder.mode(0o700);
+
+            match builder.create(&dir) {
+                Ok(()) => return Self { dir },
+                // Someone holds that name. Draw another; nothing is removed.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!(
+                    "could not create a private scratch directory under {base}: {error}",
+                    base = base.display()
+                ),
+            }
+        }
+        panic!(
+            "{attempts} unguessable names under {base} were all taken",
+            attempts = Self::ATTEMPTS,
+            base = base.display()
+        )
     }
 
     /// A path inside this scratch directory.
@@ -954,7 +1008,9 @@ const HEADER_SENTINEL: c_int = -1;
 /// (`crc32.h`, and `crc32.c` L216-L260).
 const CRC_TABLE_LEN: usize = 256;
 
-/// `get_crc_table()[1]`, measured from a C driver linked against this very oracle during planning.
+/// `get_crc_table()[1]`, as `crc32.h` publishes it -- the second entry of the generated
+/// byte-at-a-time table, and the cheapest single value that distinguishes a real table from a
+/// zeroed or uninitialised one.
 const CRC_TABLE_ENTRY_1: u64 = 0x7707_3096;
 
 impl HeaderBuffers {
@@ -1177,43 +1233,29 @@ impl Side for Port {
     }
 
     fn deflate_init(strm: &mut Self::Stream, level: c_int, window_bits: c_int) -> c_int {
-        // SAFETY: obligations (a), (b) and (e). `deflateInit2_` reads at most one byte of `version`,
-        // having tested it for null first, and `ZLIB_VERSION` is a `&CStr` constant with static
-        // storage duration; it writes `state` and touches neither window, which is why a C caller may
-        // leave `next_in`/`next_out` unset until after the call.
-        unsafe {
-            libz_rs_sys::deflateInit2_(
-                strm,
-                level,
-                Z_DEFLATED,
-                window_bits,
-                DEFAULT_MEM_LEVEL,
-                Z_DEFAULT_STRATEGY,
-                ZLIB_VERSION.as_ptr(),
-                stream_size::<Self::Stream>(),
-            )
-        }
+        // The gate supplies the facade's own `ZLIB_VERSION` and `size_of::<z_stream>()`, which is
+        // obligation (e) discharged where the two cannot be crossed with the reference's pair.
+        port::deflate_init2(
+            strm,
+            level,
+            Z_DEFLATED,
+            window_bits,
+            DEFAULT_MEM_LEVEL,
+            Z_DEFAULT_STRATEGY,
+        )
     }
 
     fn deflate_set_dictionary(strm: &mut Self::Stream, dictionary: &[u8]) -> c_int {
-        // SAFETY: obligations (a) and (b), plus `dictionary`: `dictLength` bytes really are readable
-        // at that pointer because both come from one live `&[u8]` that outlives the call, and the
-        // library copies what it keeps into the window rather than retaining the pointer.
-        unsafe {
-            libz_rs_sys::deflateSetDictionary(
-                strm,
-                dictionary.as_ptr(),
-                narrow_avail(dictionary.len()),
-            )
-        }
+        // The dictionary crosses as a slice, so its length cannot disagree with its pointer. The
+        // library copies what it keeps into the window rather than retaining what it was given.
+        port::deflate_set_dictionary(strm, dictionary)
     }
 
     fn deflate_set_header(strm: &mut Self::Stream, head: &mut Self::Header) -> c_int {
-        // SAFETY: obligations (a), (b) and (f). `head` arrives as `&mut`, so it is non-null and
-        // aligned, and the library RETAINS the pointer until the header has been fully emitted --
-        // which is why the caller keeps both the header and the buffers it points into alive for the
-        // whole stream.
-        unsafe { libz_rs_sys::deflateSetHeader(strm, head) }
+        // The library RETAINS the pointer to `head` until the header has been fully emitted, which
+        // is why the caller keeps both the header and the buffers it points into alive for the whole
+        // stream. The gate cannot express that lifetime, so it is this side's obligation.
+        port::deflate_set_header(strm, head)
     }
 
     fn deflate(
@@ -1224,11 +1266,10 @@ impl Side for Port {
     ) -> Call {
         install_port(strm, window, out);
         let (offered_out, offered_in) = (strm.avail_out, strm.avail_in);
-        // SAFETY: obligations (a) through (d) -- the one gate that relies on all four, because it is
-        // the one that reads through `next_in` and writes through `next_out`. Both pointers were
-        // installed immediately above from slices that outlive this call, and `install_port` is what
-        // establishes the null-with-zero-length pairing and the non-empty output window.
-        let status = unsafe { libz_rs_sys::deflate(strm, flush) };
+        // The one call that reads through `next_in` and writes through `next_out`. `install_port`
+        // immediately above establishes the null-with-zero-length pairing and the non-empty output
+        // window; the gate makes the call.
+        let status = port::deflate(strm, flush);
         Call {
             status,
             produced: widen_avail(offered_out - strm.avail_out),
@@ -1238,28 +1279,20 @@ impl Side for Port {
     }
 
     fn deflate_bound(strm: &mut Self::Stream, source_len: usize) -> u64 {
-        // SAFETY: obligations (a) and (b). `deflateBound` reads `wrap`, `strstart`, `w_bits` and
-        // `hash_bits` out of the state block and writes nothing; it touches neither window.
-        widen_ulong(unsafe { libz_rs_sys::deflateBound(strm, narrow_ulong(source_len)) })
+        // `deflateBound` reads `wrap`, `strstart`, `w_bits` and `hash_bits` out of the state block
+        // and writes nothing; it touches neither window. `Some(..)` is the gate's live-stream form.
+        widen_ulong(port::deflate_bound(Some(strm), narrow_ulong(source_len)))
     }
 
     fn deflate_end(strm: &mut Self::Stream) -> c_int {
-        // SAFETY: obligations (a) and (b). `deflateEnd` frees the state through the same allocator
-        // that produced it and nulls `state`, so a second call is a documented no-op rather than a
-        // double free.
-        unsafe { libz_rs_sys::deflateEnd(strm) }
+        // `deflateEnd` frees the state through the same allocator that produced it and nulls
+        // `state`, so a second call is a documented no-op rather than a double free.
+        port::deflate_end(strm)
     }
 
     fn inflate_init(strm: &mut Self::Stream, window_bits: c_int) -> c_int {
-        // SAFETY: obligations (a), (b) and (e), exactly as for `deflate_init`.
-        unsafe {
-            libz_rs_sys::inflateInit2_(
-                strm,
-                window_bits,
-                ZLIB_VERSION.as_ptr(),
-                stream_size::<Self::Stream>(),
-            )
-        }
+        // The version/size pair is the gate's, exactly as for `deflate_init`.
+        port::inflate_init2(strm, window_bits)
     }
 
     fn inflate(
@@ -1270,8 +1303,8 @@ impl Side for Port {
     ) -> Call {
         install_port(strm, window, out);
         let (offered_out, offered_in) = (strm.avail_out, strm.avail_in);
-        // SAFETY: obligations (a) through (d), for the reason given on `Port::deflate`.
-        let status = unsafe { libz_rs_sys::inflate(strm, flush) };
+        // As for `Port::deflate`: the installer above owns the windows, the gate owns the call.
+        let status = port::inflate(strm, flush);
         Call {
             status,
             produced: widen_avail(offered_out - strm.avail_out),
@@ -1281,46 +1314,40 @@ impl Side for Port {
     }
 
     fn inflate_set_dictionary(strm: &mut Self::Stream, dictionary: &[u8]) -> c_int {
-        // SAFETY: obligations (a) and (b), plus `dictionary`, for the reason given on
-        // `Port::deflate_set_dictionary`.
-        unsafe {
-            libz_rs_sys::inflateSetDictionary(
-                strm,
-                dictionary.as_ptr(),
-                narrow_avail(dictionary.len()),
-            )
-        }
+        // As for `Port::deflate_set_dictionary`: the dictionary crosses as a slice.
+        port::inflate_set_dictionary(strm, dictionary)
     }
 
     fn inflate_get_header(strm: &mut Self::Stream, head: &mut Self::Header) -> c_int {
-        // SAFETY: obligations (a), (b) and (f). This is unsafe-site category 6 -- the library writes
-        // through `head->extra`, `head->name` and `head->comment` as it parses -- and the guarantee
-        // the caller makes is that each non-null pointer addresses at least the matching
-        // `*_max` writable bytes. The pointer to `head` itself is retained until the header
-        // completes, so `head` outlives every `inflate` call on this stream.
-        unsafe { libz_rs_sys::inflateGetHeader(strm, head) }
+        // Unsafe-site category 6 of AAP §0.6.1: the library writes through `head->extra`,
+        // `head->name` and `head->comment` as it parses, so each non-null pointer must address at
+        // least the matching `*_max` writable bytes. [`HeaderBuffers`] on this side is what sizes
+        // them, and the pointer to `head` is retained until the header completes, so `head` outlives
+        // every `inflate` call on this stream. Neither guarantee is expressible in the gate's
+        // signature, which is why both stay stated here.
+        port::inflate_get_header(strm, head)
     }
 
     fn inflate_reset2(strm: &mut Self::Stream, window_bits: c_int) -> c_int {
-        // SAFETY: obligations (a) and (b). `inflateReset2` may reallocate the window through the
-        // stream's own allocator and writes only the state block.
-        unsafe { libz_rs_sys::inflateReset2(strm, window_bits) }
+        // `inflateReset2` may reallocate the window through the stream's own allocator and writes
+        // only the state block.
+        port::inflate_reset2(strm, window_bits)
     }
 
     fn inflate_sync(strm: &mut Self::Stream) -> c_int {
-        // SAFETY: obligations (a), (b) and (c). `inflateSync` scans forward through `avail_in` bytes
-        // at `next_in` looking for a flush point and writes no output at all.
-        unsafe { libz_rs_sys::inflateSync(strm) }
+        // `inflateSync` scans forward through the `avail_in` bytes at `next_in` looking for a flush
+        // point and writes no output at all, so it reads the window the previous call left installed.
+        port::inflate_sync(strm)
     }
 
     fn inflate_sync_point(strm: &mut Self::Stream) -> c_int {
-        // SAFETY: obligations (a) and (b). It reads two state members and writes nothing.
-        unsafe { libz_rs_sys::inflateSyncPoint(strm) }
+        // Reads two state members and writes nothing.
+        port::inflate_sync_point(strm)
     }
 
     fn inflate_end(strm: &mut Self::Stream) -> c_int {
-        // SAFETY: obligations (a) and (b), for the reason given on `Port::deflate_end`.
-        unsafe { libz_rs_sys::inflateEnd(strm) }
+        // As for `Port::deflate_end`.
+        port::inflate_end(strm)
     }
 
     fn snapshot(strm: &Self::Stream) -> Snapshot {
@@ -1337,20 +1364,9 @@ impl Side for Port {
     }
 
     fn compress2(dest: &mut [u8], source: &[u8], level: c_int) -> OneShot {
-        let mut dest_len = narrow_ulong(dest.len());
-        // SAFETY: `dest_len` bytes are writable at `dest`'s start and `source.len()` bytes readable
-        // at `source`'s, both from live slices that outlive the call; `dest_len` is a live local of
-        // exactly the declared type, written in place. `addr_of_mut!` rather than `&mut` because it is
-        // an out-parameter C writes through, so the raw pointer is taken straight from the place.
-        let status = unsafe {
-            libz_rs_sys::compress2(
-                dest.as_mut_ptr(),
-                core::ptr::addr_of_mut!(dest_len),
-                source.as_ptr(),
-                narrow_ulong(source.len()),
-                level,
-            )
-        };
+        // The gate seeds the in/out `destLen` from `dest.len()` and hands back what the call left
+        // there. Both buffers cross as slices, so neither length can disagree with its pointer.
+        let (status, dest_len) = port::compress2(dest, source, level);
         OneShot {
             status,
             dest_len: widen_ulong(dest_len),
@@ -1360,19 +1376,10 @@ impl Side for Port {
     }
 
     fn uncompress2(dest: &mut [u8], source: &[u8]) -> OneShot {
-        let mut dest_len = narrow_ulong(dest.len());
-        let mut source_len = narrow_ulong(source.len());
-        // SAFETY: as for `Port::compress2`, and additionally `source_len` is an in/out parameter --
-        // `uncompr.c` L86 reads it and L120 writes back the bytes actually consumed -- so it too is a
-        // live local addressed through `addr_of_mut!` and not retained past the call.
-        let status = unsafe {
-            libz_rs_sys::uncompress2(
-                dest.as_mut_ptr(),
-                core::ptr::addr_of_mut!(dest_len),
-                source.as_ptr(),
-                core::ptr::addr_of_mut!(source_len),
-            )
-        };
+        // As for `Port::compress2`, and additionally `sourceLen` is an in/out parameter here --
+        // `uncompr.c` L86 reads it and L120 writes back the bytes actually consumed -- which is why
+        // this gate returns three values rather than two.
+        let (status, dest_len, source_len) = port::uncompress2(dest, source);
         OneShot {
             status,
             dest_len: widen_ulong(dest_len),
@@ -1450,10 +1457,8 @@ impl Side for Port {
     }
 
     fn version() -> String {
-        // SAFETY: `zlibVersion` returns a pointer to the library's own `'static` NUL-terminated
-        // version string, which outlives this borrow and is never written.
-        let text = unsafe { CStr::from_ptr(libz_rs_sys::zlibVersion()) };
-        text.to_string_lossy().into_owned()
+        // The gate hands back the library's own `'static` NUL-terminated version string.
+        port::zlib_version().to_string_lossy().into_owned()
     }
 
     fn crc_table_entry(index: usize) -> u64 {
@@ -1461,23 +1466,21 @@ impl Side for Port {
             index < CRC_TABLE_LEN,
             "index {index} is outside the CRC table"
         );
-        // SAFETY: `get_crc_table` returns a pointer to the first of at least 256 `z_crc_t` entries
-        // in the library's own `'static` table (`crc32.c` L216-L260 and its const-evaluated
-        // counterpart), and `index` was just checked against that length.
-        let entry = unsafe { *libz_rs_sys::get_crc_table().add(index) };
-        u64::from(entry)
+        // The gate presents the table as the `'static` slice the C contract describes -- at least
+        // 256 `z_crc_t` entries in `const` storage (`crc32.c` L216-L260 and its const-evaluated
+        // counterpart) -- so the index above is bounds-checked by the language.
+        u64::from(port::crc_table()[index])
     }
 
     fn adler32(data: &[u8]) -> u64 {
-        // SAFETY: `len` bytes are readable at `data`'s start, from a live slice that outlives the
-        // call, and the function writes nothing. A zero-length slice is passed as its own dangling
-        // but non-null pointer with `len == 0`, which `adler32` answers without a dereference.
-        widen_ulong(unsafe { libz_rs_sys::adler32(1, data.as_ptr(), narrow_avail(data.len())) })
+        // The seed is 1, as `zlib.h` L1809-L1827 requires; the gate forms the pointer/length pair
+        // and answers a zero-length slice without a dereference.
+        widen_ulong(port::adler32(1, data))
     }
 
     fn crc32(data: &[u8]) -> u64 {
-        // SAFETY: as for `Port::adler32`.
-        widen_ulong(unsafe { libz_rs_sys::crc32(0, data.as_ptr(), narrow_avail(data.len())) })
+        // The seed is 0, as `zlib.h` L1848-L1864 requires; otherwise as for `Port::adler32`.
+        widen_ulong(port::crc32(0, data))
     }
 }
 
@@ -1507,38 +1510,27 @@ impl Side for Reference {
     }
 
     fn deflate_init(strm: &mut Self::Stream, level: c_int, window_bits: c_int) -> c_int {
-        // SAFETY: obligations (a), (b) and (e). The version string is the oracle's own, taken from
-        // `c_zlibVersion`, which returns a pointer into the C library's `'static` storage; the
-        // `stream_size` is `size_of` of the oracle's mirror. `deflateInit2` is a `zlib.h` macro rather
-        // than a symbol, so the `_`-suffixed form is what exists to be called.
-        unsafe {
-            oracle::c_deflateInit2_(
-                strm,
-                level,
-                Z_DEFLATED,
-                window_bits,
-                DEFAULT_MEM_LEVEL,
-                Z_DEFAULT_STRATEGY,
-                oracle::c_zlibVersion(),
-                stream_size::<Self::Stream>(),
-            )
-        }
+        // The gate passes the oracle's own version string -- what `c_zlibVersion` points at -- and
+        // `size_of` of the oracle's mirror, which is obligation (e) on this side. `deflateInit2` is a
+        // `zlib.h` macro rather than a symbol, so the `_`-suffixed form is what the gate calls.
+        oracle::deflate_init2(
+            strm,
+            level,
+            Z_DEFLATED,
+            window_bits,
+            DEFAULT_MEM_LEVEL,
+            Z_DEFAULT_STRATEGY,
+        )
     }
 
     fn deflate_set_dictionary(strm: &mut Self::Stream, dictionary: &[u8]) -> c_int {
-        // SAFETY: obligations (a) and (b), plus `dictionary`, for the reason given on the port's gate.
-        unsafe {
-            oracle::c_deflateSetDictionary(
-                strm,
-                dictionary.as_ptr(),
-                narrow_avail_oracle(dictionary.len()),
-            )
-        }
+        // As for the port's gate: the dictionary crosses as a slice.
+        oracle::deflate_set_dictionary(strm, dictionary)
     }
 
     fn deflate_set_header(strm: &mut Self::Stream, head: &mut Self::Header) -> c_int {
-        // SAFETY: obligations (a), (b) and (f), for the reason given on the port's gate.
-        unsafe { oracle::c_deflateSetHeader(strm, head) }
+        // As for the port's gate, including the retained `head` pointer this side must keep alive.
+        oracle::deflate_set_header(strm, head)
     }
 
     fn deflate(
@@ -1549,8 +1541,8 @@ impl Side for Reference {
     ) -> Call {
         install_reference(strm, window, out);
         let (offered_out, offered_in) = (strm.avail_out, strm.avail_in);
-        // SAFETY: obligations (a) through (d), for the reason given on the port's gate.
-        let status = unsafe { oracle::c_deflate(strm, flush) };
+        // As for the port's gate: the installer above owns the windows.
+        let status = oracle::deflate(strm, flush);
         Call {
             status,
             produced: widen_avail_oracle(offered_out - strm.avail_out),
@@ -1560,25 +1552,21 @@ impl Side for Reference {
     }
 
     fn deflate_bound(strm: &mut Self::Stream, source_len: usize) -> u64 {
-        // SAFETY: obligations (a) and (b). It reads the state block and writes nothing.
-        widen_ulong_oracle(unsafe { oracle::c_deflateBound(strm, narrow_ulong_oracle(source_len)) })
+        // Reads the state block and writes nothing. `Some(..)` is the gate's live-stream form.
+        widen_ulong_oracle(oracle::deflate_bound(
+            Some(strm),
+            narrow_ulong_oracle(source_len),
+        ))
     }
 
     fn deflate_end(strm: &mut Self::Stream) -> c_int {
-        // SAFETY: obligations (a) and (b), for the reason given on the port's gate.
-        unsafe { oracle::c_deflateEnd(strm) }
+        // As for the port's gate.
+        oracle::deflate_end(strm)
     }
 
     fn inflate_init(strm: &mut Self::Stream, window_bits: c_int) -> c_int {
-        // SAFETY: obligations (a), (b) and (e), exactly as for `Reference::deflate_init`.
-        unsafe {
-            oracle::c_inflateInit2_(
-                strm,
-                window_bits,
-                oracle::c_zlibVersion(),
-                stream_size::<Self::Stream>(),
-            )
-        }
+        // The version/size pair is the gate's, exactly as for `Reference::deflate_init`.
+        oracle::inflate_init2(strm, window_bits)
     }
 
     fn inflate(
@@ -1589,8 +1577,8 @@ impl Side for Reference {
     ) -> Call {
         install_reference(strm, window, out);
         let (offered_out, offered_in) = (strm.avail_out, strm.avail_in);
-        // SAFETY: obligations (a) through (d), for the reason given on the port's gate.
-        let status = unsafe { oracle::c_inflate(strm, flush) };
+        // As for the port's gate.
+        let status = oracle::inflate(strm, flush);
         Call {
             status,
             produced: widen_avail_oracle(offered_out - strm.avail_out),
@@ -1600,41 +1588,35 @@ impl Side for Reference {
     }
 
     fn inflate_set_dictionary(strm: &mut Self::Stream, dictionary: &[u8]) -> c_int {
-        // SAFETY: obligations (a) and (b), plus `dictionary`, for the reason given on the port's gate.
-        unsafe {
-            oracle::c_inflateSetDictionary(
-                strm,
-                dictionary.as_ptr(),
-                narrow_avail_oracle(dictionary.len()),
-            )
-        }
+        // As for the port's gate.
+        oracle::inflate_set_dictionary(strm, dictionary)
     }
 
     fn inflate_get_header(strm: &mut Self::Stream, head: &mut Self::Header) -> c_int {
-        // SAFETY: obligations (a), (b) and (f), for the reason given on the port's gate. This is the
-        // reference half of unsafe-site category 6, and the buffer caps are what keep the C code's
-        // `state->head->extra_max` clamps within the caller's memory.
-        unsafe { oracle::c_inflateGetHeader(strm, head) }
+        // The reference half of unsafe-site category 6. The buffer caps [`HeaderBuffers`] sets are
+        // what keep the C code's `state->head->extra_max` clamps within the caller's memory, and
+        // `head` must outlive every `inflate` call on this stream because the pointer is retained.
+        oracle::inflate_get_header(strm, head)
     }
 
     fn inflate_reset2(strm: &mut Self::Stream, window_bits: c_int) -> c_int {
-        // SAFETY: obligations (a) and (b), for the reason given on the port's gate.
-        unsafe { oracle::c_inflateReset2(strm, window_bits) }
+        // As for the port's gate.
+        oracle::inflate_reset2(strm, window_bits)
     }
 
     fn inflate_sync(strm: &mut Self::Stream) -> c_int {
-        // SAFETY: obligations (a), (b) and (c), for the reason given on the port's gate.
-        unsafe { oracle::c_inflateSync(strm) }
+        // As for the port's gate: it scans the window the previous call left installed.
+        oracle::inflate_sync(strm)
     }
 
     fn inflate_sync_point(strm: &mut Self::Stream) -> c_int {
-        // SAFETY: obligations (a) and (b). It reads two state members and writes nothing.
-        unsafe { oracle::c_inflateSyncPoint(strm) }
+        // Reads two state members and writes nothing.
+        oracle::inflate_sync_point(strm)
     }
 
     fn inflate_end(strm: &mut Self::Stream) -> c_int {
-        // SAFETY: obligations (a) and (b), for the reason given on the port's gate.
-        unsafe { oracle::c_inflateEnd(strm) }
+        // As for the port's gate.
+        oracle::inflate_end(strm)
     }
 
     fn snapshot(strm: &Self::Stream) -> Snapshot {
@@ -1651,17 +1633,8 @@ impl Side for Reference {
     }
 
     fn compress2(dest: &mut [u8], source: &[u8], level: c_int) -> OneShot {
-        let mut dest_len = narrow_ulong_oracle(dest.len());
-        // SAFETY: as for `Port::compress2`.
-        let status = unsafe {
-            oracle::c_compress2(
-                dest.as_mut_ptr(),
-                core::ptr::addr_of_mut!(dest_len),
-                source.as_ptr(),
-                narrow_ulong_oracle(source.len()),
-                level,
-            )
-        };
+        // As for `Port::compress2`.
+        let (status, dest_len) = oracle::compress2(dest, source, level);
         OneShot {
             status,
             dest_len: widen_ulong_oracle(dest_len),
@@ -1670,17 +1643,8 @@ impl Side for Reference {
     }
 
     fn uncompress2(dest: &mut [u8], source: &[u8]) -> OneShot {
-        let mut dest_len = narrow_ulong_oracle(dest.len());
-        let mut source_len = narrow_ulong_oracle(source.len());
-        // SAFETY: as for `Port::uncompress2`.
-        let status = unsafe {
-            oracle::c_uncompress2(
-                dest.as_mut_ptr(),
-                core::ptr::addr_of_mut!(dest_len),
-                source.as_ptr(),
-                core::ptr::addr_of_mut!(source_len),
-            )
-        };
+        // As for `Port::uncompress2`, including the in/out `sourceLen` the gate returns third.
+        let (status, dest_len, source_len) = oracle::uncompress2(dest, source);
         OneShot {
             status,
             dest_len: widen_ulong_oracle(dest_len),
@@ -1689,10 +1653,11 @@ impl Side for Reference {
     }
 
     fn compress_bound(source_len: usize) -> u64 {
-        // SAFETY: `compressBound` is a pure arithmetic function over its argument -- it dereferences
-        // nothing at all (`compress.c` L86-L88) -- so the only obligation is that the archive is
-        // linked, which `build.rs` guarantees.
-        widen_ulong_oracle(unsafe { oracle::c_compressBound(narrow_ulong_oracle(source_len)) })
+        // `compressBound` is a pure arithmetic function over its argument -- it dereferences nothing
+        // at all (`compress.c` L86-L88) -- but it is still `extern "C"`, so it crosses through a gate
+        // like every other reference entry point. The port's counterpart needs none, because the
+        // facade declares its pointer-free entry points safe.
+        widen_ulong_oracle(oracle::compress_bound(narrow_ulong_oracle(source_len)))
     }
 
     fn write_header(spec: &mut HeaderSpec) -> Self::Header {
@@ -1755,10 +1720,9 @@ impl Side for Reference {
     }
 
     fn version() -> String {
-        // SAFETY: `c_zlibVersion` returns a pointer to `ZLIB_VERSION`, a string literal with static
-        // storage duration in `zutil.c`, so the borrow outlives this call and nothing writes it.
-        let text = unsafe { CStr::from_ptr(oracle::c_zlibVersion()) };
-        text.to_string_lossy().into_owned()
+        // The gate hands back what `c_zlibVersion` points at: `ZLIB_VERSION`, a string literal with
+        // static storage duration in `zutil.c`.
+        oracle::reference_version().to_string_lossy().into_owned()
     }
 
     fn crc_table_entry(index: usize) -> u64 {
@@ -1766,25 +1730,20 @@ impl Side for Reference {
             index < CRC_TABLE_LEN,
             "index {index} is outside the CRC table"
         );
-        // SAFETY: `c_get_crc_table` returns a pointer to the first of at least 256 `z_crc_t` entries
-        // in the C library's own table (`crc32.c` L216-L260), and `index` was just checked against
-        // that length. The archive's tables are built once and never mutated afterwards.
-        let entry = unsafe { *oracle::c_get_crc_table().add(index) };
-        u64::from(entry)
+        // The gate presents the C library's own table (`crc32.c` L216-L260) as a `'static` slice of
+        // at least 256 entries -- built once and never mutated afterwards -- so the index above is
+        // bounds-checked by the language.
+        u64::from(oracle::crc_table()[index])
     }
 
     fn adler32(data: &[u8]) -> u64 {
-        // SAFETY: as for `Port::adler32`.
-        widen_ulong_oracle(unsafe {
-            oracle::c_adler32(1, data.as_ptr(), narrow_avail_oracle(data.len()))
-        })
+        // As for `Port::adler32`.
+        widen_ulong_oracle(oracle::adler32(1, data))
     }
 
     fn crc32(data: &[u8]) -> u64 {
-        // SAFETY: as for `Port::adler32`.
-        widen_ulong_oracle(unsafe {
-            oracle::c_crc32(0, data.as_ptr(), narrow_avail_oracle(data.len()))
-        })
+        // As for `Reference::adler32`, seeded with 0 rather than 1.
+        widen_ulong_oracle(oracle::crc32(0, data))
     }
 }
 
@@ -2685,20 +2644,20 @@ trait GzSide {
 
 impl GzSide for Port {
     const NAME: &'static str = "port (libz-rs-sys)";
-    type File = libz_rs_sys::gzFile;
+    type File = port::GzFile;
 
     fn open(path: &CStr, mode: &CStr) -> Self::File {
-        // SAFETY: obligation (g). Both arguments are NUL-terminated strings owned by live locals that
-        // outlive the call, and `gzopen` only reads them -- it copies the path it keeps
-        // (`gzlib.c` L200-L204).
-        unsafe { libz_rs_sys::gzopen(path.as_ptr(), mode.as_ptr()) }
+        // Both arguments cross as `&CStr`, so the gate needs no promise about termination. The
+        // library copies the path it keeps (`gzlib.c` L200-L204), so neither has to outlive the
+        // call.
+        port::GzFile::open(path, mode)
     }
 
     fn dopen(fd: c_int, mode: &CStr) -> Self::File {
-        // SAFETY: obligation (g) for the mode string. `fd` is a descriptor the caller has just
-        // obtained and does not use again: the handle takes ownership and `gzclose` closes it
-        // (`zlib.h` L1412-L1419), so there is exactly one owner at every moment.
-        unsafe { libz_rs_sys::gzdopen(fd, mode.as_ptr()) }
+        // `fd` is a descriptor the caller has just obtained and does not use again: the handle
+        // takes ownership and `gzclose` closes it (`zlib.h` L1412-L1419), so there is exactly one
+        // owner at every moment. That is this side's obligation, not the gate's.
+        port::GzFile::dopen(fd, mode)
     }
 
     fn is_null(file: Self::File) -> bool {
@@ -2706,164 +2665,160 @@ impl GzSide for Port {
     }
 
     fn buffer(file: Self::File, size: c_uint) -> c_int {
-        // SAFETY: `file` is a non-null handle this side opened and has not closed; the size is a
-        // plain integer. This and every gate below take the handle by value exactly as C does.
-        unsafe { libz_rs_sys::gzbuffer(file, size) }
+        // Every gate below takes the handle by value exactly as C does, and the obligation that
+        // stays on this side is the one no signature can express: `file` is a handle this side
+        // opened and has not closed. [`port::GzFile`] is `Copy` precisely so that the suite can
+        // exercise the double-close and use-after-close *diagnostics* the library returns, which
+        // means the type cannot enforce single use for it.
+        file.buffer(size)
     }
 
     fn setparams(file: Self::File, level: c_int, strategy: c_int) -> c_int {
-        // SAFETY: as for `Port::buffer`.
-        unsafe { libz_rs_sys::gzsetparams(file, level, strategy) }
+        // As for `Port::buffer`.
+        file.setparams(level, strategy)
     }
 
     fn write(file: Self::File, data: &[u8]) -> c_int {
-        // SAFETY: as for `Port::buffer`, plus `data`: `len` bytes really are readable at that pointer
-        // because both come from one live slice that outlives the call, and the library copies them
-        // into its own buffer rather than retaining the pointer.
-        unsafe { libz_rs_sys::gzwrite(file, data.as_ptr().cast(), narrow_uint(data.len())) }
+        // As for `Port::buffer`. `data` crosses as a slice, and the library copies it into its own
+        // buffer rather than retaining what it was given.
+        file.write(data)
     }
 
     fn fwrite(file: Self::File, data: &[u8]) -> usize {
-        // SAFETY: as for `Port::write`. `size` is 1 and `nitems` is the length, so the product cannot
-        // overflow and the readable region is exactly `data`.
-        unsafe { libz_rs_sys::gzfwrite(data.as_ptr().cast(), 1, data.len(), file) }
+        // As for `Port::write`. The gate passes `size` 1 and `nitems` the length, so the product
+        // cannot overflow and the region read is exactly `data`.
+        file.fwrite(data)
     }
 
     fn putc(file: Self::File, byte: u8) -> c_int {
-        // SAFETY: as for `Port::buffer`.
-        unsafe { libz_rs_sys::gzputc(file, c_int::from(byte)) }
+        // As for `Port::buffer`.
+        file.putc(c_int::from(byte))
     }
 
     fn puts(file: Self::File, text: &CStr) -> c_int {
-        // SAFETY: as for `Port::buffer`, plus `text`, which is NUL-terminated and read-only for the
-        // library, and whose storage outlives the call.
-        unsafe { libz_rs_sys::gzputs(file, text.as_ptr()) }
+        // As for `Port::buffer`. `text` crosses as a `&CStr`, which is where its termination and
+        // its read-only treatment come from.
+        file.puts(text)
     }
 
     fn flush(file: Self::File, flush: c_int) -> c_int {
-        // SAFETY: as for `Port::buffer`.
-        unsafe { libz_rs_sys::gzflush(file, flush) }
+        // As for `Port::buffer`.
+        file.flush(flush)
     }
 
     fn read(file: Self::File, buf: &mut [u8]) -> c_int {
-        // SAFETY: as for `Port::buffer`, plus `buf`: `len` bytes really are writable at that pointer,
-        // from a live slice that outlives the call.
-        unsafe { libz_rs_sys::gzread(file, buf.as_mut_ptr().cast(), narrow_uint(buf.len())) }
+        // As for `Port::buffer`. `buf` crosses as a mutable slice, so its length and its writable
+        // extent are the same fact.
+        file.read(buf)
     }
 
     fn fread(file: Self::File, buf: &mut [u8]) -> usize {
-        // SAFETY: as for `Port::read`, with `size` 1 and `nitems` the length.
-        unsafe { libz_rs_sys::gzfread(buf.as_mut_ptr().cast(), 1, buf.len(), file) }
+        // As for `Port::read`, with `size` 1 and `nitems` the length.
+        file.fread(buf)
     }
 
     fn gets(file: Self::File, buf: &mut [u8]) -> Option<Vec<u8>> {
-        // SAFETY: as for `Port::read`. `gzgets` writes at most `len` bytes including the terminating
-        // NUL (`zlib.h` L1555-L1563), and `len` here is exactly the slice's length.
-        let answer =
-            unsafe { libz_rs_sys::gzgets(file, buf.as_mut_ptr().cast(), narrow_int(buf.len())) };
-        if answer.is_null() {
-            return None;
-        }
-        // SAFETY: on a non-null return the library has written a NUL-terminated string into `buf`,
-        // which is still borrowed and therefore still live, and `answer` points at its first byte.
-        let text = unsafe { CStr::from_ptr(answer) };
-        Some(text.to_bytes().to_vec())
+        // As for `Port::read`; `gzgets` writes at most `len` bytes including the terminating NUL
+        // (`zlib.h` L1555-L1563), and `len` is the slice's length.
+        // The gate reads the NUL-terminated string the library wrote into `buf` and answers `None`
+        // for the null return, so the two outcomes `zlib.h` L1553-L1563 distinguishes arrive as
+        // `Some` and `None` rather than as a pointer to be tested here.
+        file.gets(buf)
     }
 
     fn getc(file: Self::File) -> c_int {
-        // SAFETY: as for `Port::buffer`.
-        unsafe { libz_rs_sys::gzgetc(file) }
+        // As for `Port::buffer`.
+        file.getc()
     }
 
     fn getc_(file: Self::File) -> c_int {
-        // SAFETY: as for `Port::buffer`.
-        unsafe { libz_rs_sys::gzgetc_(file) }
+        // As for `Port::buffer`.
+        file.getc_()
     }
 
     fn ungetc(file: Self::File, byte: c_int) -> c_int {
-        // SAFETY: as for `Port::buffer`.
-        unsafe { libz_rs_sys::gzungetc(byte, file) }
+        // As for `Port::buffer`.
+        file.ungetc(byte)
     }
 
     fn seek(file: Self::File, offset: i64, whence: c_int) -> i64 {
-        // SAFETY: as for `Port::buffer`.
-        widen_off(unsafe { libz_rs_sys::gzseek(file, narrow_off(offset), whence) })
+        // As for `Port::buffer`.
+        widen_off(file.seek(narrow_off(offset), whence))
     }
 
     fn seek64(file: Self::File, offset: i64, whence: c_int) -> i64 {
-        // SAFETY: as for `Port::buffer`.
-        unsafe { libz_rs_sys::gzseek64(file, offset, whence) }
+        // As for `Port::buffer`.
+        file.seek64(offset, whence)
     }
 
     fn rewind(file: Self::File) -> c_int {
-        // SAFETY: as for `Port::buffer`.
-        unsafe { libz_rs_sys::gzrewind(file) }
+        // As for `Port::buffer`.
+        file.rewind()
     }
 
     fn tell(file: Self::File) -> i64 {
-        // SAFETY: as for `Port::buffer`.
-        widen_off(unsafe { libz_rs_sys::gztell(file) })
+        // As for `Port::buffer`.
+        widen_off(file.tell())
     }
 
     fn tell64(file: Self::File) -> i64 {
-        // SAFETY: as for `Port::buffer`.
-        unsafe { libz_rs_sys::gztell64(file) }
+        // As for `Port::buffer`.
+        file.tell64()
     }
 
     fn offset(file: Self::File) -> i64 {
-        // SAFETY: as for `Port::buffer`.
-        widen_off(unsafe { libz_rs_sys::gzoffset(file) })
+        // As for `Port::buffer`.
+        widen_off(file.offset())
     }
 
     fn offset64(file: Self::File) -> i64 {
-        // SAFETY: as for `Port::buffer`.
-        unsafe { libz_rs_sys::gzoffset64(file) }
+        // As for `Port::buffer`.
+        file.offset64()
     }
 
     fn eof(file: Self::File) -> c_int {
-        // SAFETY: as for `Port::buffer`.
-        unsafe { libz_rs_sys::gzeof(file) }
+        // As for `Port::buffer`.
+        file.eof()
     }
 
     fn direct(file: Self::File) -> c_int {
-        // SAFETY: as for `Port::buffer`.
-        unsafe { libz_rs_sys::gzdirect(file) }
+        // As for `Port::buffer`.
+        file.direct()
     }
 
     fn error(file: Self::File) -> (c_int, String) {
-        let mut errnum: c_int = GZ_ERRNUM_SENTINEL;
-        // SAFETY: as for `Port::buffer`, plus the out-parameter: `errnum` is a live local of exactly
-        // the declared type, initialised before the call and outliving it, and the pointer is not
-        // retained. `addr_of_mut!` rather than `&mut` because C writes through it.
-        let message = unsafe { libz_rs_sys::gzerror(file, core::ptr::addr_of_mut!(errnum)) };
-        (errnum, gz_message(message))
+        // The gate seeds `errnum` with the sentinel and returns it with the message bytes, so "the
+        // library wrote nothing" stays distinguishable from "the library wrote zero".
+        let (errnum, message) = file.error(GZ_ERRNUM_SENTINEL);
+        (errnum, gz_message(message.as_deref()))
     }
 
     fn clearerr(file: Self::File) {
-        // SAFETY: as for `Port::buffer`.
-        unsafe { libz_rs_sys::gzclearerr(file) }
+        // As for `Port::buffer`.
+        file.clearerr();
     }
 
     fn close(file: Self::File) -> c_int {
-        // SAFETY: as for `Port::buffer`. This call consumes the handle, and no gate is called with it
-        // afterwards -- obligation (g)'s exactly-one-`gzclose` half.
-        unsafe { libz_rs_sys::gzclose(file) }
+        // As for `Port::buffer`, and this is the call the handle-liveness obligation turns on: it
+        // consumes the handle, so no gate is called with it afterwards except where a test is
+        // deliberately measuring what a second close reports.
+        file.close()
     }
 }
 
 impl GzSide for Reference {
     const NAME: &'static str = "C reference (oracle)";
-    type File = oracle::gzFile;
+    type File = oracle::GzFile;
 
     fn open(path: &CStr, mode: &CStr) -> Self::File {
-        // SAFETY: obligation (g), for the reason given on `Port::open`.
-        unsafe { oracle::c_gzopen(path.as_ptr(), mode.as_ptr()) }
+        // As for `Port::open`.
+        oracle::GzFile::open(path, mode)
     }
 
     fn dopen(fd: c_int, mode: &CStr) -> Self::File {
-        // SAFETY: obligation (g), for the reason given on `Port::dopen` -- including the single
-        // ownership of `fd`, which this handle's `gzclose` discharges.
-        unsafe { oracle::c_gzdopen(fd, mode.as_ptr()) }
+        // As for `Port::dopen`, including the single ownership of `fd` that this handle's
+        // `gzclose` discharges.
+        oracle::GzFile::dopen(fd, mode)
     }
 
     fn is_null(file: Self::File) -> bool {
@@ -2871,144 +2826,131 @@ impl GzSide for Reference {
     }
 
     fn buffer(file: Self::File, size: c_uint) -> c_int {
-        // SAFETY: `file` is a non-null handle this side opened and has not closed; the size is a
-        // plain integer.
-        unsafe { oracle::c_gzbuffer(file, size) }
+        // As for `Port::buffer`, including the handle-liveness obligation that stays here.
+        file.buffer(size)
     }
 
     fn setparams(file: Self::File, level: c_int, strategy: c_int) -> c_int {
-        // SAFETY: as for `Reference::buffer`.
-        unsafe { oracle::c_gzsetparams(file, level, strategy) }
+        // As for `Reference::buffer`.
+        file.setparams(level, strategy)
     }
 
     fn write(file: Self::File, data: &[u8]) -> c_int {
-        // SAFETY: as for `Reference::buffer`, plus `data`, for the reason given on `Port::write`.
-        unsafe { oracle::c_gzwrite(file, data.as_ptr().cast(), narrow_uint(data.len())) }
+        // As for `Port::write`.
+        file.write(data)
     }
 
     fn fwrite(file: Self::File, data: &[u8]) -> usize {
-        // SAFETY: as for `Reference::write`, with `size` 1 and `nitems` the length.
-        unsafe { oracle::c_gzfwrite(data.as_ptr().cast(), 1, data.len(), file) }
+        // As for `Port::fwrite`.
+        file.fwrite(data)
     }
 
     fn putc(file: Self::File, byte: u8) -> c_int {
-        // SAFETY: as for `Reference::buffer`.
-        unsafe { oracle::c_gzputc(file, c_int::from(byte)) }
+        // As for `Reference::buffer`.
+        file.putc(c_int::from(byte))
     }
 
     fn puts(file: Self::File, text: &CStr) -> c_int {
-        // SAFETY: as for `Reference::buffer`, plus `text`, for the reason given on `Port::puts`.
-        unsafe { oracle::c_gzputs(file, text.as_ptr()) }
+        // As for `Port::puts`.
+        file.puts(text)
     }
 
     fn flush(file: Self::File, flush: c_int) -> c_int {
-        // SAFETY: as for `Reference::buffer`.
-        unsafe { oracle::c_gzflush(file, flush) }
+        // As for `Reference::buffer`.
+        file.flush(flush)
     }
 
     fn read(file: Self::File, buf: &mut [u8]) -> c_int {
-        // SAFETY: as for `Reference::buffer`, plus `buf`, for the reason given on `Port::read`.
-        unsafe { oracle::c_gzread(file, buf.as_mut_ptr().cast(), narrow_uint(buf.len())) }
+        // As for `Port::read`.
+        file.read(buf)
     }
 
     fn fread(file: Self::File, buf: &mut [u8]) -> usize {
-        // SAFETY: as for `Reference::read`, with `size` 1 and `nitems` the length.
-        unsafe { oracle::c_gzfread(buf.as_mut_ptr().cast(), 1, buf.len(), file) }
+        // As for `Port::fread`.
+        file.fread(buf)
     }
 
     fn gets(file: Self::File, buf: &mut [u8]) -> Option<Vec<u8>> {
-        // SAFETY: as for `Reference::read`, and `gzgets` writes at most `len` bytes including the
-        // terminator, `len` here being exactly the slice's length.
-        let answer =
-            unsafe { oracle::c_gzgets(file, buf.as_mut_ptr().cast(), narrow_int(buf.len())) };
-        if answer.is_null() {
-            return None;
-        }
-        // SAFETY: on a non-null return the library has written a NUL-terminated string into `buf`,
-        // which is still borrowed and therefore still live.
-        let text = unsafe { CStr::from_ptr(answer) };
-        Some(text.to_bytes().to_vec())
+        // As for `Port::gets`.
+        file.gets(buf)
     }
 
     fn getc(file: Self::File) -> c_int {
-        // SAFETY: as for `Reference::buffer`. This is the real function: `gzread.c` undefines the
+        // As for `Reference::buffer`. This is the real function: `gzread.c` undefines the
         // `zlib.h` macro before defining it, which is why `build.rs` has to rename it with `objcopy`
         // rather than with a `-D` flag.
-        unsafe { oracle::c_gzgetc(file) }
+        file.getc()
     }
 
     fn getc_(file: Self::File) -> c_int {
-        // SAFETY: as for `Reference::buffer`.
-        unsafe { oracle::c_gzgetc_(file) }
+        // As for `Reference::buffer`.
+        file.getc_()
     }
 
     fn ungetc(file: Self::File, byte: c_int) -> c_int {
-        // SAFETY: as for `Reference::buffer`.
-        unsafe { oracle::c_gzungetc(byte, file) }
+        // As for `Reference::buffer`.
+        file.ungetc(byte)
     }
 
     fn seek(file: Self::File, offset: i64, whence: c_int) -> i64 {
-        // SAFETY: as for `Reference::buffer`.
-        widen_off_oracle(unsafe { oracle::c_gzseek(file, narrow_off_oracle(offset), whence) })
+        // As for `Reference::buffer`.
+        widen_off_oracle(file.seek(narrow_off_oracle(offset), whence))
     }
 
     fn seek64(file: Self::File, offset: i64, whence: c_int) -> i64 {
-        // SAFETY: as for `Reference::buffer`.
-        unsafe { oracle::c_gzseek64(file, offset, whence) }
+        // As for `Reference::buffer`.
+        file.seek64(offset, whence)
     }
 
     fn rewind(file: Self::File) -> c_int {
-        // SAFETY: as for `Reference::buffer`.
-        unsafe { oracle::c_gzrewind(file) }
+        // As for `Reference::buffer`.
+        file.rewind()
     }
 
     fn tell(file: Self::File) -> i64 {
-        // SAFETY: as for `Reference::buffer`.
-        widen_off_oracle(unsafe { oracle::c_gztell(file) })
+        // As for `Reference::buffer`.
+        widen_off_oracle(file.tell())
     }
 
     fn tell64(file: Self::File) -> i64 {
-        // SAFETY: as for `Reference::buffer`.
-        unsafe { oracle::c_gztell64(file) }
+        // As for `Reference::buffer`.
+        file.tell64()
     }
 
     fn offset(file: Self::File) -> i64 {
-        // SAFETY: as for `Reference::buffer`.
-        widen_off_oracle(unsafe { oracle::c_gzoffset(file) })
+        // As for `Reference::buffer`.
+        widen_off_oracle(file.offset())
     }
 
     fn offset64(file: Self::File) -> i64 {
-        // SAFETY: as for `Reference::buffer`.
-        unsafe { oracle::c_gzoffset64(file) }
+        // As for `Reference::buffer`.
+        file.offset64()
     }
 
     fn eof(file: Self::File) -> c_int {
-        // SAFETY: as for `Reference::buffer`.
-        unsafe { oracle::c_gzeof(file) }
+        // As for `Reference::buffer`.
+        file.eof()
     }
 
     fn direct(file: Self::File) -> c_int {
-        // SAFETY: as for `Reference::buffer`.
-        unsafe { oracle::c_gzdirect(file) }
+        // As for `Reference::buffer`.
+        file.direct()
     }
 
     fn error(file: Self::File) -> (c_int, String) {
-        let mut errnum: c_int = GZ_ERRNUM_SENTINEL;
-        // SAFETY: as for `Reference::buffer`, plus the out-parameter, for the reason given on
-        // `Port::error`.
-        let message = unsafe { oracle::c_gzerror(file, core::ptr::addr_of_mut!(errnum)) };
-        (errnum, gz_message(message))
+        // As for `Port::error`, including the sentinel.
+        let (errnum, message) = file.error(GZ_ERRNUM_SENTINEL);
+        (errnum, gz_message(message.as_deref()))
     }
 
     fn clearerr(file: Self::File) {
-        // SAFETY: as for `Reference::buffer`.
-        unsafe { oracle::c_gzclearerr(file) }
+        // As for `Reference::buffer`.
+        file.clearerr();
     }
 
     fn close(file: Self::File) -> c_int {
-        // SAFETY: as for `Reference::buffer`. This call consumes the handle and no gate is called
-        // with it afterwards.
-        unsafe { oracle::c_gzclose(file) }
+        // As for `Port::close`.
+        file.close()
     }
 }
 
@@ -5652,18 +5594,13 @@ fn armed() -> bool {
 ///
 /// Held out of the default run for runtime rather than for coverage. The default tests sweep each
 /// dimension against the others' defaults; this multiplies them together, which is what makes it the
-/// product rather than the coverage. Measured on the development machine, 4 logical cores:
-///
-/// ```text
-/// --release   16,380 crossings    3.6 s
-/// debug       16,380 crossings   53.1 s
-/// ```
-///
-/// So it is cheap enough that CI must run it, and expensive enough in debug -- where a bare
-/// `cargo test --workspace` lives -- to keep behind the variable rather than let it dominate that run.
-/// Every one of the 16,380 crossings decompresses as well as compresses, and every one was byte-exact.
+/// product rather than the coverage. It is cheap enough in release that the `differential` CI job
+/// runs it, and expensive enough in debug -- where a bare `cargo test --workspace` lives -- to keep
+/// behind the variable rather than let it dominate that run. Every crossing decompresses as well as
+/// compresses, and every one is asserted byte-exact.
 #[test]
-#[ignore = "the full interoperability product; armed by ZLIB_RS_INTEROP_EXHAUSTIVE and run by CI"]
+#[ignore = "the full interoperability product; armed by ZLIB_RS_INTEROP_EXHAUSTIVE, run by the \
+              differential CI job"]
 fn exhaustive_interoperability_matrix() {
     if !armed() {
         return;

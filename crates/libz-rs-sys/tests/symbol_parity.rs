@@ -46,7 +46,9 @@
 //! rustc hands every `cdylib` link a version script of its own -- an anonymous tag listing the
 //! crate's `#[no_mangle]` items under `global:`, with `local: *`. `zlib.map` therefore cannot be
 //! layered on top of it (`ld.bfd` refuses outright: *"anonymous version tag cannot be combined with
-//! other version tags"*), so the cargo `cdylib` carries **zero** of the 16 `ZLIB_1.2.*` nodes, and
+//! other version tags"*), so the cargo `cdylib` carries **zero** of the 16 zlib version nodes -- 14
+//! in the `ZLIB_1.2.*` family, plus `ZLIB_1.3.1.2` and `ZLIB_1.3.2`, all enumerated in
+//! [`VERSION_NODES`] below -- and
 //! no argument to cargo changes that. The installable shared object is produced by one documented
 //! step that relinks the *complete archive* under `zlib.map`, and that step is where the 111-symbol
 //! surface comes from:
@@ -66,6 +68,13 @@
 //!   nodes, and a delta from the contract that is exactly `gzprintf`/`gzvprintf` absent plus three
 //!   `_zlib_rs_*` helpers present. Pinning that is not a concession -- it is what detects an
 //!   unintended new export, or an accidental loss of one, in the artifact every developer builds.
+//! * The **cargo** `libz.a` is held to the *whole* contract -- all 95 functions defined as global
+//!   text symbols, `gzprintf` and `gzvprintf` among them. That is the positive claim the artifact
+//!   matrix makes about the direct-cargo command, and
+//!   [`cargo_staticlib_defines_the_whole_contract`] is what turns it into a gate. It matters that
+//!   the two cargo tests sit side by side: one pins an artifact that is deliberately incomplete,
+//!   and without the other the suite would describe a shortfall while asserting nothing about the
+//!   artifact the shared library is relinked from.
 //!
 //! # ★ Full decorated strings, never bare names
 //!
@@ -160,8 +169,12 @@ use z as _;
 
 /// The 16 `nm` type-`A` symbol version nodes, exactly as `zlib.map` declares them.
 ///
-/// A version node is a symbol in its own right, which is why the total is 111 rather than 95. The
-/// order here follows `zlib.map`'s declaration order (each node inherits the previous one), not
+/// A version node is a symbol in its own right, which is why the total is 111 rather than 95. Note
+/// that they are not all one family: fourteen are `ZLIB_1.2.*`, and the two most recent are
+/// `ZLIB_1.3.1.2` and `ZLIB_1.3.2`. "The 16 `ZLIB_1.2.*` nodes" is therefore the wrong shorthand for
+/// this set, however tempting; say "the 16 version nodes" and let the list below be the authority.
+///
+/// The order here follows `zlib.map`'s declaration order (each node inherits the previous one), not
 /// lexicographic order; [`the_version_node_baseline_matches_zlib_map`] checks the set against the
 /// contract text.
 const VERSION_NODES: [&str; 16] = [
@@ -342,6 +355,16 @@ const HIDDEN_SYMBOLS: [&str; 10] = [
 /// `local: *`, so a symbol contributed by a C object gets no dynamic entry, and
 /// `-Wl,--export-dynamic-symbol` does not override a version script. They reappear in the packaged
 /// library, which is relinked from the archive under `zlib.map`.
+///
+/// ★ **What this file establishes about these two, and what it does not.** Everything here is an
+/// ABI assertion: the name is present at the right version node in the packaged library, absent from
+/// the `cdylib`, and neither hidden nor duplicated. That is a different claim from "the function
+/// works", and for a variadic entry point the gap between the two is wider than usual -- `nm` cannot
+/// see a calling convention. The behavioural half is owned by `tests/c_api_parity.rs`:
+/// `gzprintf` is called there variadically with a format and a matched argument, and `gzvprintf` is
+/// called through `csrc/gzvprintf_probe.c`, a test-only C translation unit that builds a real
+/// `va_list`. The two halves are deliberately separate tests, because a symbol can be correctly
+/// exported and correctly versioned and still be an adapter nobody ever ran.
 const CDYLIB_ABSENT: [&str; 2] = ["gzprintf", "gzvprintf"];
 
 /// The three internal helpers the cargo `cdylib` exports and the packaged library hides.
@@ -1117,7 +1140,14 @@ fn soname_is_libz_so_1() {
     };
 
     match recorded_soname(&library) {
-        SonameProbe::ToolUnavailable => (),
+        // `tool_output` has already printed why the tool could not run; this adds what went
+        // unverified because of it, so a skipped SONAME check is attributable to this assertion
+        // rather than only to a generic "binutils missing" line further up the log.
+        SonameProbe::ToolUnavailable => skip(&format!(
+            "cannot read DT_SONAME from {}: `readelf` is unavailable, so the packaged library's \
+             SONAME was not verified",
+            library.display()
+        )),
         SonameProbe::Absent => panic!(
             "{} records no DT_SONAME; the packaging link must pass -Wl,-soname,{EXPECTED_SONAME}, \
              or an already-linked consumer carrying DT_NEEDED {EXPECTED_SONAME} will never bind it",
@@ -1254,6 +1284,87 @@ fn inflate_table_static_only() {
 // The cargo artifacts -- their own measured shape, not the packaged one
 // =================================================================================================
 
+/// The cargo **static** archive defines the whole 95-function contract, `gzprintf` included.
+///
+/// This is the positive half of the artifact matrix in `src/lib.rs`, and it is deliberately a gate
+/// rather than a sentence: that table's first row claims `cargo build -p libz-rs-sys --features
+/// libz-compat` yields a *complete* static library, and until this test existed the claim rested on
+/// a measurement someone took once by hand. It is also the half that matters most to a reader of
+/// [`cargo_cdylib_matches_its_measured_shape`], which pins an artifact that is deliberately
+/// **in**complete: without this test beside it, the suite would document a shortfall and assert
+/// nothing about the artifact that does not have one.
+///
+/// `gzprintf` and `gzvprintf` are the two names the distinction turns on. They are variadic, stable
+/// Rust cannot define a variadic function (`c_variadic`, rust-lang/rust#44930), so `build.rs`
+/// compiles them from `csrc/gzprintf_shim.c` and rustc merges that object into `libz.a`. A `cdylib`
+/// gives a C-contributed symbol no dynamic entry, which is why [`CDYLIB_ABSENT`] exists; an archive
+/// has no such filter, so here they must be present. Asserting them by name — rather than trusting
+/// the 95-name loop to notice — is what makes a regression in the shim's compilation legible.
+///
+/// The symbol type is required to be `T`: a name that arrived as a common or undefined entry would
+/// satisfy a presence check and then fail to link.
+#[test]
+fn cargo_staticlib_defines_the_whole_contract() {
+    let Some(archive) = cargo_staticlib() else {
+        return;
+    };
+    let path = archive.to_str().expect("artifact path is not valid UTF-8");
+    let Some(output) = tool_output("nm", &["--defined-only", "--extern-only", path]) else {
+        return;
+    };
+
+    // `parse_nm` returns owned names, so the parse is bound to a local and the set borrows from it.
+    let symbols = parse_nm(&output);
+    let defined: BTreeSet<&str> = symbols
+        .iter()
+        .filter(|symbol| symbol.kind == 'T')
+        .map(|symbol| {
+            let name = symbol.name.as_str();
+            name.split("@@").next().unwrap_or(name)
+        })
+        .collect();
+    let contract: BTreeSet<&str> = VERSIONED_EXPORTS
+        .iter()
+        .map(|name| name.split("@@").next().unwrap_or(name))
+        .chain(UNVERSIONED_EXPORTS.iter().copied())
+        .collect();
+    assert_eq!(
+        contract.len(),
+        FUNCTION_TOTAL,
+        "the undecorated contract must have 95 names"
+    );
+
+    let missing: BTreeSet<String> = contract
+        .iter()
+        .filter(|name| !defined.contains(**name))
+        .map(|name| (*name).to_owned())
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{}",
+        difference_report(
+            &format!(
+                "{} does not define the whole zlib.h contract, so it is not the complete static \
+                 drop-in src/lib.rs's artifact matrix says it is",
+                archive.display()
+            ),
+            &missing,
+            &BTreeSet::new()
+        )
+    );
+
+    for shimmed in CDYLIB_ABSENT {
+        assert!(
+            defined.contains(shimmed),
+            "{} does not define {shimmed} as a global text symbol. It is variadic, so it comes \
+             from csrc/gzprintf_shim.c rather than from Rust; its absence here means build.rs did \
+             not compile the shim or did not emit `-l static=` for the archive it goes into, and \
+             the packaged shared library relinked from this archive would lose it too",
+            archive.display()
+        );
+    }
+}
+
 /// The cargo `cdylib` exports 96 type-`T` symbols and no version nodes, and its delta from the
 /// contract is exactly the documented one.
 ///
@@ -1353,14 +1464,32 @@ fn cargo_cdylib_matches_its_measured_shape() {
     // The cdylib does record the contract SONAME even though it is not installable, so that a
     // relinked or repackaged copy cannot silently lose it. `build.rs` emits the argument only when
     // `libz-compat` is on -- an artifact exporting nothing must not claim to be `libz.so.1` -- and
-    // this suite compiles only with that feature, so a recorded value is expected here.
-    if let SonameProbe::Recorded(soname) = recorded_soname(&library) {
-        assert_eq!(
+    // this suite compiles only with that feature, so a recorded value is *required* here, not merely
+    // compared when one happens to be present.
+    //
+    // ★ The three outcomes are matched exhaustively on purpose. An `if let Recorded(..)` swallows
+    // `Absent`, and `Absent` is exactly the regression this assertion exists to catch: it is what a
+    // `build.rs` that stopped emitting `-Wl,-soname` produces, and a check that passes in that state
+    // reports success for an artifact no already-linked consumer could ever bind. Only a genuinely
+    // missing tool is a skip, and it says so.
+    match recorded_soname(&library) {
+        SonameProbe::ToolUnavailable => skip(&format!(
+            "cannot read DT_SONAME from {}: `readelf` is unavailable, so the cdylib's SONAME was \
+             not verified",
+            library.display()
+        )),
+        SonameProbe::Absent => panic!(
+            "{} records no DT_SONAME; build.rs must emit -Wl,-soname,{EXPECTED_SONAME} whenever \
+             `libz-compat` is on, and this suite compiles only with that feature -- an artifact \
+             without it cannot be bound by a consumer carrying DT_NEEDED {EXPECTED_SONAME}",
+            library.display()
+        ),
+        SonameProbe::Recorded(soname) => assert_eq!(
             soname,
             EXPECTED_SONAME,
-            "{} records SONAME {soname}",
+            "{} records SONAME {soname}, expected {EXPECTED_SONAME}",
             library.display()
-        );
+        ),
     }
 }
 

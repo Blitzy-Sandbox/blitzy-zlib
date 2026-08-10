@@ -15,9 +15,32 @@
 #                                infback, adler32, crc32, the gzip file layer and
 #                                the one-shot wrappers.
 #
-#    crates/libz-rs-sys           The C ABI facade.  The ONLY crate permitted to
-#                                 use `unsafe`, and the only crate that exports
-#                                 symbols.  `[lib] name = "z"` with
+#    crates/libz-rs-sys           The C ABI facade.  The only crate that exports
+#                                 symbols, and the only SHIPPED crate that uses
+#                                 `unsafe`: it carries
+#                                 #![deny(unsafe_op_in_unsafe_fn)] so that each
+#                                 unsafe operation is scoped individually, and
+#                                 every block names the invariant that makes it
+#                                 sound.  The safe wrappers that let the
+#                                 differential suites, the benchmarks and the fuzz
+#                                 targets drive this C ABI without writing raw
+#                                 pointers of their own are NOT in this crate: they
+#                                 are the boundary gates in
+#                                 crates/zlib-rs-differential/src/port.rs, which is
+#                                 dev-only and never shipped.  Keeping them there is
+#                                 deliberate -- AAP §0.6.1 fixes this facade's
+#                                 `unsafe` at exactly the six unavoidable C-ABI site
+#                                 categories, and a test harness is not one of them.
+#                                 One other dev-only place declares raw entry points:
+#                                 crates/zlib-rs-differential/src/oracle.rs, where
+#                                 AAP §0.4.1.4 puts the `c_`-prefixed `extern "C"`
+#                                 declarations of the C oracle.  Measured over the
+#                                 whole tree, the count outside this facade, port.rs
+#                                 and oracle.rs is ZERO: the safe core and its own
+#                                 test suites, the three differential suites, the
+#                                 three benchmarks and all five fuzz targets contain
+#                                 no `unsafe` construct at all.
+#                                 `[lib] name = "z"` with
 #                                 crate-type = ["cdylib", "staticlib", "rlib"]
 #                                 makes Cargo write target/<profile>/libz.so and
 #                                 libz.a, and its build script writes a
@@ -49,7 +72,16 @@
 #                                against the reference implementation in a single
 #                                process.  It is never a dependency of either
 #                                shipped crate, which is what keeps
-#                                `cargo build --release` free of any C compiler.
+#                                `cargo build --release` free of any C compiler
+#                                -- measured with
+#                                `cargo tree -p libz-rs-sys -e normal,build,dev`,
+#                                which names this crate nowhere.  Driving two C
+#                                ABIs does mean it needs `unsafe` of its own: it
+#                                is confined to src/oracle.rs (the reference
+#                                surface) and src/port.rs (the facade surface),
+#                                and every suite under tests/, every attached
+#                                bench and all five fuzz targets that drive those
+#                                gates carry #![forbid(unsafe_code)].
 #
 # The C sources in this directory are retained and unmodified; they serve only as
 # the algorithmic oracle.  zlib.h, zconf.h and zlib.map are the immutable public
@@ -120,10 +152,13 @@
 
 #
 # Companion configuration, all of which lives beside this file and is expected to
-# stay consistent with it: rust-toolchain.toml (channel), clippy.toml (`msrv` —
-# must equal `rust-version` below), .rustfmt.toml (`edition` — must equal `edition`
-# below), deny.toml (licence allow-list — must contain the `license` below) and
-# cbindgen.toml (generates the header that is diffed against zlib.h).
+# stay consistent with it: rust-toolchain.toml (channel), clippy.toml (thresholds
+# only — it deliberately declares NO `msrv` key, so clippy reads each package's own
+# `rust-version`, and its own header explains why that is the correct setting for a
+# workspace whose members no longer share one floor), .rustfmt.toml (`edition` —
+# must equal `edition` below), deny.toml (licence allow-list — must contain the
+# `license` below) and cbindgen.toml (generates the header that is diffed against
+# zlib.h).
 
 [workspace]
 
@@ -271,8 +306,12 @@ authors = [
 #          required by the specified edition (2024)
 edition = "2021"
 
-# Keep in lockstep with `msrv` in clippy.toml, or clippy's version-aware lints stop
-# agreeing with the declared floor.
+# THIS is what clippy's version-aware lints read: clippy.toml declares no `msrv`
+# key, so each package's own `rust-version` is the floor clippy holds it to.  That
+# is deliberate and documented at the top of clippy.toml — the two shipped crates
+# inherit 1.80 from here, while crates/zlib-rs-differential states 1.86 for itself
+# because criterion requires it, and a single `msrv` here would tell clippy
+# something untrue about one of them.
 rust-version = "1.80"
 
 # SPDX identifier for the zlib/libpng licence carried in LICENSE.  The same
@@ -344,37 +383,40 @@ version_script = "zlib.map"
 # (type T) plus the 16 symbol-version nodes (type A) declared in zlib.map.  They
 # are the target the Rust library has to match, recorded here so the parity diff
 # has a fixed baseline to compare against.  They describe the C library, not the
-# Rust one: only `make rust-symbols` measures the Rust side, and nothing runs it
-# automatically.
+# Rust one.  Three things measure the Rust side against them:
+# `crates/libz-rs-sys/tests/symbol_parity.rs` inside `cargo test`, `make rust` while
+# it stages the library, and `make rust-symbols` for the direct diff against a built
+# C library; `rust.yml`'s symbol-parity job runs the last two on every push.
 exported_symbols = 111
 exported_functions = 95
 symbol_version_nodes = 16
 
 # Shared dependency versions, declared here so member crates cannot drift; each
-# member opts in with `<name> = { workspace = true }`.  Every requirement is an
-# exact, registry-resolved version — no wildcards, no "latest", and no git or
-# alternate-registry sources (deny.toml rejects both).
+# member opts in with `<name> = { workspace = true }`.
 #
 #  Note that NOTHING here is a runtime dependency of the shipped library:
-#  crates/zlib-rs keeps an empty [dependencies] table and crates/libz-rs-sys
-#  depends only on zlib-rs.  Both facts are readable straight out of those two
-#  manifests; `cargo tree -p zlib-rs` is the command that will show it once the
-#  workspace loads, which it does not yet (see the entry-point note at the top of
-#  this file).
+#  crates/zlib-rs keeps an empty [dependencies] table, and crates/libz-rs-sys
+#  depends on zlib-rs plus the optional `libc` its `gz` feature requires.  Both
+#  facts are readable straight out of those two manifests, and
+#  `cargo tree -p zlib-rs -e normal` shows the first of them directly.
 #
 # Deliberately absent:
-#   * `libfuzzer-sys`, `arbitrary` — they belong to the excluded fuzz/ crate.
+#   * `libfuzzer-sys`, `arbitrary` — they belong to the excluded fuzz/ crate,
+#     which carries its own manifest, lockfile and deny configuration.
 #   * `cbindgen`, `cargo-fuzz`, `cargo-deny` — command-line tools, installed with
 #     `cargo install --locked`, never manifest dependencies.
-#   * `libc` — declared by the AAP but not yet used by any target.  The long note
-#     in the table below records why it is withheld and exactly what brings it
-#     back, so read it before adding it.
+#   * `libc` — used, but declared by the one crate that needs it rather than here.
+#     The long note in the table below records why this table is not where it
+#     belongs.
 #
-# `criterion` IS declared, as of the arrival of the first suite under `benches/`.
-# It is a dev-only harness, reached by exactly one package — the bench targets of
-# crates/zlib-rs-differential — and by nothing that ships.  The note beside its
-# entry below records the MSRV consequence, which is real and is the reason that
-# package now states `rust-version = "1.86"` for itself instead of inheriting the
+# Both of the entries below are here because a real target reached for them:
+# `libc` for the two `#[cfg(unix)] libc::fcntl` calls the gzFile layer needs, so
+# `libz-rs-sys/gz` enables it through `dep:libc` and every `libz-rs-sys` build
+# without that feature resolves without it; and `criterion` for the three suites
+# under `benches/`, a dev-only harness reached by exactly one package — the bench
+# targets of crates/zlib-rs-differential — and by nothing that ships.  The note
+# beside criterion records its MSRV consequence, which is real and is why that
+# package states `rust-version = "1.86"` for itself instead of inheriting the
 # workspace floor.
 
 [workspace.dependencies]
@@ -431,15 +473,26 @@ cc = "1.4.0"
 # code defects.  `crates/zlib-rs-differential/Cargo.toml` records the measured list.
 criterion = "0.8.2"
 
-# DELIBERATELY ABSENT: libc.
+# NOT LISTED HERE, BUT PRESENT IN THE GRAPH: libc.
 #
-# libc 0.2.189 (AAP §0.5.1.3) was an OPTIONAL dependency of crates/libz-rs-sys,
-# for the case where "a platform type or a raw syscall in the gz layer cannot be
-# expressed with std::fs / std::io".  No such case arose: the gz layer is written
-# entirely against `std::fs`/`std::io` and every C type in the ABI surface comes
-# from `core::ffi`.  The note in `crates/libz-rs-sys/Cargo.toml` `[features]`
-# records the exact two lines that bring it back, pinned to the `0.2` line,
-# should a target ever need it.
+# libc 0.2.189 (AAP §0.5.1.3) is an OPTIONAL dependency of crates/libz-rs-sys and
+# is enabled by that crate's DEFAULT feature set, because `gz = ["libz-compat",
+# "zlib-rs/std", "dep:libc"]`.  So `cargo tree -p libz-rs-sys -e normal` reports
+# it, and the case the AAP anticipated -- "a platform type or a raw syscall in the
+# gz layer cannot be expressed with std::fs / std::io" -- did arise: the
+# descriptor-adopting half of the gz layer needs `fcntl` for O_NONBLOCK and the
+# raw `read`/`write`/`close`/`lseek` numbers that a caller-supplied descriptor
+# implies, which `std::fs` cannot express because it owns what it opens.  There
+# are 57 `libc::` sites, all of them in `crates/libz-rs-sys/src/gz.rs`, and that
+# crate's `[features]` and `[dependencies]` tables carry the full reasoning and
+# the `0.2`-line pin.
+#
+# It is absent from THIS table for a different reason, and one worth keeping: a
+# `[workspace.dependencies]` entry is inherited by any member that writes
+# `{ workspace = true }`, and the only member that may ever link libc is the
+# facade.  The safe core's `[dependencies]` table is empty and must stay empty
+# (AAP §0.8.1 item 8), so the pin lives in the one manifest that uses it rather
+# than in the table every crate can reach.
 
 # Lints.  Member crates opt in with:
 #
@@ -603,3 +656,38 @@ inherits = "release"
 # small-chunk throughput and is output-neutral, but it is an LLVM-internal flag, so
 # it stays an opt-in RUSTFLAGS lever for performance runs rather than a committed
 # default that would break a non-LLVM toolchain.
+
+# A measurement instrument, not a build configuration: `bench-parity` exists so the
+# port can be measured the way the C oracle is BUILT, and it is never used to produce
+# an artifact anyone ships or installs.
+#
+# The comparability problem it solves is concrete.  Every throughput number this
+# workspace gates on is a ratio of the port against the in-tree C reference, compiled
+# by `crates/zlib-rs-differential/build.rs` as fifteen separate `-O3 -fPIC`
+# translation units with no cross-unit optimisation whatsoever.  `[profile.bench]`
+# above measures the port with `lto = "fat"` and `codegen-units = 1`, i.e. with
+# whole-program optimisation across every crate in the workspace — an advantage the C
+# side does not have and, in this harness, CANNOT be given: the oracle's symbols are
+# renamed with `objcopy --redefine-syms`, which rewrites the ELF symbol table and
+# cannot reach the names inside the `.gnu.lto_*` IR sections an `-flto` object carries,
+# so an LTO oracle would silently rebind to the port's own symbols and every
+# differential comparison would become the port against itself.  The asymmetry is
+# therefore removed from the Rust side instead, where removing it costs nothing.
+#
+# Usage, and the rule that makes it mean something:
+#
+#     ZLIB_RS_BENCH_RUST_PROFILE=bench        cargo bench --profile bench
+#     ZLIB_RS_BENCH_RUST_PROFILE=bench-parity cargo bench --profile bench-parity
+#
+# The environment variable is read by the differential crate's build script and baked
+# into the binary, so each log states which profile produced it, and the CI gate
+# decides on the STRONGER — that is, the worse-for-the-port — of the two passes' ratios
+# per case.  A favourable LTO-only number therefore cannot carry a case on its own.
+#
+# `lto = false` and `codegen-units = 16` are cargo's own non-LTO release defaults;
+# `opt-level` and `debug-assertions` are inherited unchanged, because the point is to
+# vary whole-program optimisation and nothing else.
+[profile.bench-parity]
+inherits = "bench"
+lto = false
+codegen-units = 16

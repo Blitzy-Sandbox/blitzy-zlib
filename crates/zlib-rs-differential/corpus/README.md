@@ -1,23 +1,36 @@
 # Differential test corpus
 
 This folder holds the input data for every correctness gate that **reads input bytes**, plus
-the pointer to the optional large-input tier that the repository-root benchmark suites will
-measure against. It is pure data, one shell script and this README — there is no Rust here,
+the pointer to the optional large-input tier the repository-root benchmark suites measure
+against. It is pure data, one shell script and this README — there is no Rust here,
 nothing in this folder is compiled, and nothing in it participates in a build. The
-differential harness that will consume it lives one directory up
+differential harness that consumes it lives one directory up
 ([`../Cargo.toml`](../Cargo.toml)); this folder only supplies the bytes that harness feeds
 to the Rust port and to the in-tree C oracle so their outputs can be compared.
 
-The qualifier "reads input bytes" is load-bearing, not hedging. Not every correctness gate
-takes an input sample — see [Which gates read this folder, and which do
-not](#which-gates-read-this-folder-and-which-do-not) below.
+Which gates those are is worth stating precisely, because "every correctness gate" would be
+wrong in two directions. `tests/table_equality.rs` is a correctness gate that takes no input
+sample at all, and the five `fuzz/` targets are correctness and security gates that generate
+their own arbitrary bytes and read nothing from here — see [Which gates read this folder, and
+which do not](#which-gates-read-this-folder-and-which-do-not) below.
 
-**Checkpoint state.** The tier-1 consumers exist: `tests/byte_identical.rs` and
-`tests/roundtrip_interop.rs` both read every fixture in `minimal/` on every run, and both
-fail outright when a filename is missing or a pinned length has drifted. The two Silesia
-consumers named below — `benches/deflate_bench.rs` and `benches/inflate_bench.rs` — do not
-exist yet, so the tier-2 path contract is still a contract those suites will be written to
-satisfy rather than an observation of current behaviour.
+**Every consumer named in this document exists and runs.** There are six — three tests and
+three benchmarks — and only two of them ever look at tier 2:
+
+| Consumer | Tier it reads | What it does with the bytes |
+| --- | --- | --- |
+| `tests/byte_identical.rs` | 1 only | Every fixture, multiplied by the configuration matrix |
+| `tests/roundtrip_interop.rs` | 1 only | Every fixture, compressed by one implementation and inflated by the other |
+| `tests/table_equality.rs` | neither | Reads no input sample at all — see below |
+| `benches/deflate_bench.rs` | 1, and 2 when present | Tier-1 fixtures in every gated group; the `deflate_silesia` group over tier 2 |
+| `benches/inflate_bench.rs` | 1, and 2 when present | The same, with `inflate_silesia` over tier 2 |
+| `benches/checksum_bench.rs` | 1 only | Tier-1 fixtures; it never reaches for Silesia |
+
+All three benches are attached to this crate by `[[bench]]` entries in
+[`../Cargo.toml`](../Cargo.toml) with an explicit `path` back to `benches/`, so
+`cargo bench -p zlib-rs-differential` builds and runs them. The tier-2 path contract below is
+therefore a description of what the two Silesia consumers **do**, verified by running them,
+rather than a specification something might later be written against.
 
 Because the governing acceptance criterion is that compressed output be *byte-identical* to
 the C reference, this corpus defines the sample over which that claim is measured. The
@@ -54,22 +67,28 @@ whose result depends on what a remote server served that day.
 | --- | --- | --- |
 | `tests/byte_identical.rs` | **Yes** | Every fixture, multiplied by the whole configuration matrix |
 | `tests/roundtrip_interop.rs` | **Yes** | Every fixture, compressed by one implementation and inflated by the other |
+| `benches/deflate_bench.rs`, `benches/inflate_bench.rs` | **Yes** | Named fixtures as the tier-1 throughput and memory cases, plus the optional Silesia tier |
+| `benches/checksum_bench.rs` | **No** | Buffers it generates itself, because a checksum's throughput does not depend on what the bytes mean |
 | `tests/table_equality.rs` | **No** | The generated C headers `crc32.h`, `trees.h` and `inffixed.h`, compared element for element against the ported Rust `const` arrays |
+| `fuzz/fuzz_targets/*.rs` (all five) | **No** | Bytes the fuzzer generates, guided by coverage; libFuzzer maintains its own corpus under `fuzz/corpus/` |
 
-`tests/table_equality.rs` is the exception worth naming explicitly, because it is easy to
-assume otherwise. It compresses nothing and decompresses nothing: it asserts that the
-transcribed Rust tables equal the committed C arrays, per AAP §0.4.1.4. It therefore takes
-no sample, is unaffected by anything in `minimal/`, and adding or removing a fixture cannot
-change its result. The contract in this document binds the two gates that consume byte
-fixtures; it does not reach a gate that has no input sample.
+Two rows deserve naming explicitly, because it is easy to assume otherwise.
+`tests/table_equality.rs` compresses nothing and decompresses nothing: it asserts that the
+transcribed Rust tables equal the committed C arrays, per AAP §0.4.1.4. It therefore takes no
+sample, is unaffected by anything in `minimal/`, and adding or removing a fixture cannot
+change its result. The five fuzz targets are likewise not consumers: their whole point is
+input nobody chose, so a fixture added here neither widens nor narrows what they explore.
 
-This corpus adds no tooling and no crate to the workspace. `fetch_silesia.sh` uses only
-ubiquitous shell utilities, and the fixtures are read with ordinary file I/O.
+The three benchmarks read `minimal/` as well, and the fixture contract binds them for the
+same reason — but they are not gates, so they are listed separately in the consumer table
+above rather than here. A benchmark that cannot find a fixture reports it and carries on with
+the rest; a gate that cannot find one fails.
 
 This corpus adds no tooling and no crate to the workspace. `fetch_silesia.sh` relies only on
 shell utilities, each of which it probes for by name rather than assuming — the concrete list
-is under [Prerequisites](#prerequisites) — and the fixtures are read with ordinary file I/O.
-No dependency exists, or may be added, to serve this folder.
+is under [Prerequisites](#prerequisites), which is the one place that contract is stated —
+and the fixtures are read with ordinary file I/O. No dependency exists, or may be added, to
+serve this folder.
 
 ## Fixture inventory — the contract
 
@@ -269,12 +288,11 @@ All ten fixtures above are checked against the current rules and none is matched
 
 ## The Silesia tier: path contract
 
-Silesia is to be used **only** for performance measurement, by the planned
-`benches/deflate_bench.rs` and `benches/inflate_bench.rs` suites at the repository root.
-Neither file exists yet, and the `[[bench]]` entries that will attach them to this crate are
-held back until they do -- see the benchmark-hosting note in
-[`../Cargo.toml`](../Cargo.toml) -- so the path contract below is what those suites will be
-written against.
+Silesia is to be used **only** for performance measurement, by
+[`benches/deflate_bench.rs`](../../../benches/deflate_bench.rs) and
+[`benches/inflate_bench.rs`](../../../benches/inflate_bench.rs) at the repository root, which
+are attached to this crate by the `[[bench]]` entries in [`../Cargo.toml`](../Cargo.toml).
+Both read the corpus through the contract below and neither downloads anything.
 
 ### Resolution order — one canonical rule
 
@@ -290,16 +308,54 @@ corpus can never be committed by accident — a default of `corpus/silesia/` wou
 ignored and would put several hundred megabytes of third-party data one `git add -A` away
 from the history.
 
-**Absence is normal, not an error.** A benchmark run without a fetched corpus must report
-that Silesia is not present, skip, and exit zero — never download.
+### Two kinds of run, and only one of them may skip
 
-### Absence is normal, not an error
+Absence is normal for a **developer's** run and unacceptable for a **deciding** one, and the
+benches distinguish the two explicitly rather than leaving it to whoever reads the log.
+`ZLIB_RS_BENCH_ACCEPTANCE=1` selects the second:
 
-**Benchmarks must skip gracefully when the directory is missing.** A developer running
-`cargo bench` without having fetched anything should get a clear "Silesia not present,
-skipping" message and a zero exit status — not an error, and under no circumstances an
-attempt to download. Correctness is measured on tier 1 and does not depend on tier 2 in any
-way.
+| | Exploratory (the default) | Acceptance (`ZLIB_RS_BENCH_ACCEPTANCE=1`) |
+| --- | --- | --- |
+| Corpus absent | one note naming this script; the tier-2 groups publish `cases=0 required=0` and the run exits zero | every one of the twelve members becomes a counted `MISSING` required case, `required != satisfied`, and the CI gate fails |
+| Member below the 1 MiB floor | measured, labelled | `REFUSING`, and a failed required case |
+| Some other directory's files | measured with `salvaged=1` and a note that the numbers are local signal only, bounded to 4096 entries and 64 MiB per file | refused outright |
+| `ZLIB_RS_SILESIA_MANIFEST` set | honoured; a size or CRC-32 mismatch is refused | honoured; a mismatch is refused |
+| Identity evidence | `CORPUS member=<name> bytes=<n> crc32=<hex>` per member, the CRC taken through the reference's own `crc32` | the same, and all twelve are required |
+| Downloads | none | none |
+
+**Neither mode downloads anything, ever.** Acceptance mode does not fetch the corpus; it
+*requires that the corpus is already there*, which is why the CI job that uses it
+(`bench-silesia` in [`../../../.github/workflows/rust.yml`](../../../.github/workflows/rust.yml))
+runs only when the repository variable `ZLIB_RS_SILESIA_DIR` names a directory a runner
+already has. On a public network-free runner that job is skipped, and the ordinary benchmark
+gate says so in its own output rather than letting a minimal-corpus run stand in for the
+AAP §0.8.4 Silesia measurement.
+
+So: a developer running `cargo bench` without having fetched anything gets a clear "Silesia
+not present" message and a zero exit status. Correctness is measured on tier 1 and does not
+depend on tier 2 in any way. What tier 2 decides is throughput, and that decision is only
+taken by a run that declares itself an acceptance run.
+
+### The two measurement profiles
+
+A throughput ratio is only a fact about two implementations if both were built comparably,
+and here they are not by default: the C oracle is compiled one translation unit at a time
+with no cross-unit optimisation, while `--profile bench` gives the port fat LTO across the
+whole workspace. It cannot be equalised on the C side — `objcopy --redefine-syms`, which
+gives the oracle its `c_` prefix, cannot rename symbols inside the `.gnu.lto_*` IR an
+`-flto` object carries, so an LTO oracle would rebind to the port's own symbols — so it is
+equalised on the Rust side. Measure twice:
+
+```sh
+ZLIB_RS_BENCH_RUST_PROFILE=bench        cargo bench --locked -p zlib-rs-differential --profile bench
+ZLIB_RS_BENCH_RUST_PROFILE=bench-parity cargo bench --locked -p zlib-rs-differential --profile bench-parity
+```
+
+`bench-parity` is `bench` with LTO off and codegen units uncollapsed. Every summary line
+carries `c_profile=` and `rust_profile=`, the profile name is baked into the binary at build
+time (cargo does not expose it to a build script, so it is declared), and the CI gate decides
+each case on the **stronger — worse-for-the-port —** of the two passes. It is not a
+formality: two cases pass under fat LTO and fail without it.
 
 ### Opt-in only — the no-network rule
 
@@ -307,8 +363,10 @@ way.
 
 - It is **never** invoked by `cargo test`.
 - It is **never** invoked by CI.
-- It is referenced from no `build.rs`, from no file under `tests/`, and from no workflow in
-  `.github/workflows/`.
+- It is referenced from no `build.rs` and from no file under `tests/`. The one workflow that
+  mentions it at all, `rust.yml`, names it in prose so that a human reading a skipped
+  `bench-silesia` job knows what to run; no step in any workflow executes it, and the
+  acceptance job requires a directory that is already provisioned rather than creating one.
 
 Those are not aspirations; they are the property that keeps the test suite hermetic. The
 moment any automated path calls this script, `cargo test` acquires a network dependency and
@@ -371,39 +429,24 @@ anything is written, rejecting absolute paths, `..` components and Windows drive
 forms, and the extracted tree is then rejected if it contains anything that is not a regular
 file or a directory, which excludes symlinks, devices, FIFOs and sockets.
 
-### An expected checksum is required, and you have to supply it
+#### How to supply the digest, and what re-use depends on
 
-`fetch_silesia.sh` verifies every download against an expected SHA-256, and
-**that digest is a mandatory input you provide** — there is no flag to skip the
-check, no value that disables it, and a mismatch is always fatal. Without a
-digest the script refuses to fetch and refuses to vouch for an existing
-directory.
-
-It does not ship with one pinned, and that is deliberate. Upstream publishes the
-archive but no checksum for it; a zip is not reproducible, so independent mirrors
-of the same twelve files legitimately differ byte-for-byte; and a digest computed
-from one unauthenticated download would look authoritative while being no
-sounder than trust-on-first-use. The value has to come from whoever is deciding
-which source to trust, which is you. The `CHECKSUM POLICY` block at the top of
-the script explains this at length and shows how to obtain and cross-check a
-digest.
-
-Supply it in whichever way suits you — `--sha256`, then
-`ZLIB_RS_SILESIA_SHA256`, then the `SILESIA_SHA256_EXPECTED` constant, first
-match wins. Change `ZLIB_RS_SILESIA_URL` and the expected digest together: they
-identify one archive jointly.
+Supply it in whichever way suits you — `--sha256`, then `ZLIB_RS_SILESIA_SHA256`, then the
+`SILESIA_SHA256_EXPECTED` constant, first match wins. Change `ZLIB_RS_SILESIA_URL` and the
+expected digest together: they identify one archive jointly. The `CHECKSUM POLICY` block at the
+top of the script shows how to obtain and cross-check a value.
 
 Two consequences worth knowing before you hit them:
 
-- **A previous fetch is re-used only if it matches.** The script stamps the
-  destination with the URL and digest it verified. On a later run both are
-  compared against what you expect *now*, before it can report that there is
-  nothing to do. A stamp left behind by a fetch from somewhere else, or one
-  written by hand, is refused rather than believed — the stamp is evidence of
-  provenance, never of authenticity. Pass `--force` to discard what is there and
+- **A previous fetch is re-used only if it matches.** The script stamps the destination with the
+  URL and digest it verified. On a later run both are compared against what you expect *now*,
+  before it can report that there is nothing to do. A stamp left behind by a fetch from
+  somewhere else, or one written by hand, is refused rather than believed — the stamp is
+  evidence of provenance, never of authenticity. Pass `--force` to discard what is there and
   refetch, which verifies the fresh download exactly as any other.
-- **`--verify-only` needs the digest too.** Verifying against nothing is not
-  verification.
+- **`--verify-only` needs the digest too**, because it compares the stamp against what you
+  expect now. Verifying against nothing is not verification, so there is no digest-free form of
+  any invocation.
 
 ### Extraction is not trusted either
 
@@ -429,15 +472,20 @@ Everything the script consumes is either upstream-controlled or environment-cont
 each of the following is a check on input it does not trust. All four are unconditional —
 there is no flag, and no environment variable, that waives any of them.
 
-- **The URL.** `ZLIB_RS_SILESIA_URL` must begin with `https://`, `http://` or `file://`, and
-  it is passed to `curl`/`wget` after a `--` operand terminator, so a value beginning with
-  `-` can never be read as a downloader option. (`file://` works with `curl` only; `wget`
-  rejects that scheme, and the script says so before it creates anything.)
+- **The URL.** `ZLIB_RS_SILESIA_URL` must begin with `https://` and contain no whitespace or
+  control character. That is the whole accepted set: `http://`, `file://` and every other
+  scheme are refused, before anything is downloaded or created, at the entry point of the
+  script. It is additionally passed to `curl`/`wget` after a `--` operand terminator, so a
+  value beginning with `-` could never be read as a downloader option even if the scheme check
+  were somehow bypassed. If you want to fetch from a mirror or from a copy you already have,
+  serve it over HTTPS or install the corpus into the destination directory yourself and skip
+  the script.
 - **The bytes.** The download is verified against an expected SHA-256 before anything else
   reads it, and a mismatch is fatal. Upstream publishes no digest, so the in-script constant
   ships at the `UNPINNED` sentinel and the digest is a mandatory input you supply, with
-  `--sha256` or `ZLIB_RS_SILESIA_SHA256`; a fetch that supplies neither refuses to run — see
-  the CHECKSUM POLICY block at the top of the script.
+  `--sha256` or `ZLIB_RS_SILESIA_SHA256`. Every invocation needs one, `--verify-only`
+  included; a run that supplies neither is refused before it touches the network — see the
+  CHECKSUM POLICY block at the top of the script.
 - **The member paths.** The archive is listed and inspected *before* extraction; an absolute
   path, a `..` component, a symbolic link or a hard link causes it to be refused outright. A
   digest proves *which* archive arrived, not that its member paths are safe to write. Both
@@ -449,10 +497,11 @@ there is no flag, and no environment variable, that waives any of them.
 
 ### Manual invocation
 
-Every fetching invocation must carry `ZLIB_RS_SILESIA_SHA256`, because a fetch without one
-is refused (see [Integrity](#integrity-and-the-difference-between-corruption-and-authentication)
-above for how to obtain a value and what it does and does not establish). Replace `<sha256>`
-with the 64-hex digest you obtained.
+Every invocation must carry an expected digest, `--verify-only` included, because a run
+without one is refused (see
+[Integrity](#integrity-and-the-difference-between-corruption-and-authentication) above for how
+to obtain a value and what it does and does not establish). Replace `<sha256>` with the 64-hex
+digest you obtained. `ZLIB_RS_SILESIA_URL` may be overridden, but only with an `https://` URL.
 
 ```sh
 # Default location: <repo-root>/target/silesia (git-ignored)
@@ -471,8 +520,9 @@ ZLIB_RS_SILESIA_SHA256=<sha256> \
     ZLIB_RS_SILESIA_MEMBER_SHA256=/path/to/silesia.sha256 \
     ./crates/zlib-rs-differential/corpus/fetch_silesia.sh
 
-# Report on an existing download without fetching anything (no digest needed)
-ZLIB_RS_SILESIA_DIR=/var/cache/silesia \
+# Report on an existing download without fetching anything.  The digest is required
+# here too: --verify-only compares the recorded stamp against what you expect now.
+ZLIB_RS_SILESIA_SHA256=<sha256> ZLIB_RS_SILESIA_DIR=/var/cache/silesia \
     ./crates/zlib-rs-differential/corpus/fetch_silesia.sh --verify-only
 
 # Then measure. The same variable is read by the benchmarks.
@@ -503,9 +553,15 @@ Adding a fixture is a contract change. Do all five steps in one commit.
    reads no fixtures at all.
 5. **Account for the cost.** Every fixture is multiplied by the whole differential matrix,
    which per AAP §0.6.4.4 spans compression levels 0-9, `windowBits` for all three container
-   formats (raw, zlib and gzip), `memLevel` 1-9, five strategies, six flush modes, and both
-   single-shot and incremental chunked feeding. Coverage is the reason to add a fixture;
-   runtime is the reason to add only fixtures that reach something new.
+   formats (raw, zlib and gzip), `memLevel` 1-9, five strategies, seven flush values, and both
+   single-shot and incremental chunked feeding. Seven rather than six: the six flushes a
+   `deflate` call accepts — `Z_NO_FLUSH`, `Z_PARTIAL_FLUSH`, `Z_SYNC_FLUSH`, `Z_FULL_FLUSH`,
+   `Z_FINISH` and `Z_BLOCK` — plus `Z_TREES`, which the tests pass deliberately in order to
+   assert that BOTH implementations refuse it with the same status, since it is valid for
+   `inflate` only and `deflate.c:985` answers `Z_STREAM_ERROR` for `flush > Z_BLOCK`. That
+   seventh value is a status-parity case rather than a byte-identity one; `FLUSHES` in
+   `tests/byte_identical.rs` is the authority. Coverage is the reason to add a fixture; runtime
+   is the reason to add only fixtures that reach something new.
 
 Removing or renaming a fixture narrows coverage rather than widening it. Say so explicitly in
 the commit message, so the reduction is a decision on the record rather than a side effect.

@@ -8,11 +8,11 @@
 #    five binaries declared at the bottom of this file are the whole of its
 #    intended surface.
 #
-#    STATE AT THIS CHECKPOINT: this manifest exists and the five target NAMES are
-#    fixed here, but `fuzz_targets/` is empty -- none of the five `.rs` files has
-#    been written yet -- so no `cargo fuzz` command in this file can run and the
-#    requirement above is not yet met by anything.  Nothing here should be read as
-#    a record of a completed fuzzing run.
+#    STATE: all five targets exist under `fuzz_targets/` and all five build and
+#    run.  What this file does NOT record is the result of any particular run:
+#    the >= 300 s per target gate is enforced by ../.github/workflows/rust.yml's
+#    `fuzz` job, and that job's log is the only record of a completed run.
+#    Nothing here should be read as one.
 #
 # 2. HOW TO RUN IT, AND THE GATE
 #
@@ -27,11 +27,12 @@
 #    the library workspace and is its own workspace root (see 4) — a root-level
 #    `cargo clippy --workspace` will never see this crate.
 #
-#    The gate is to be >= 300 seconds per target across all five targets, with
-#    zero crashes and zero hangs.  That budget is not arbitrary: it matches
-#    `fuzz-seconds: 300` in ../.github/workflows/fuzz.yml, so the Rust harness is
-#    to be held to exactly the budget this repository already applies to the C
-#    implementation.  Enumerate the targets with `cargo +nightly fuzz list` —
+#    The gate is >= 300 seconds per target across all five targets, with zero
+#    crashes and zero hangs, and the `fuzz` job in ../.github/workflows/rust.yml
+#    enforces it on every push with one matrix leg per target.  That budget is not
+#    arbitrary: it matches `fuzz-seconds: 300` in ../.github/workflows/fuzz.yml,
+#    so the Rust harness is held to exactly the budget this repository already
+#    applies to the C implementation.  Enumerate the targets with `cargo +nightly fuzz list` —
 #    cargo-fuzz sorts the names, so its output is alphabetical rather than the
 #    reading order used below.
 #
@@ -191,6 +192,14 @@ zlib-rs = { path = "../crates/zlib-rs", features = ["rust-api"] }
 # Default features are left ON deliberately.  They are ["libz-compat", "gz"] and
 # fuzz_gz_roundtrip needs `gz` for the gzFile layer, so `default-features =
 # false` must not be added here.
+#
+# No extra feature is requested.  What makes this crate's `unsafe` count zero is the
+# safe boundary layer in the dev-only oracle crate below -- `zlib_rs_differential::port`
+# for this facade and `::oracle` for the C reference -- so every raw pointer these
+# targets need is formed and justified there, once each, instead of several hundred
+# times here.  Keeping the boundary out of the facade is deliberate: AAP 0.6.1 fixes
+# the shipped crate's `unsafe` at six unavoidable C-ABI site categories and calls
+# anything beyond them a defect, and a development harness is beyond them.
 libz_rs_sys = { package = "libz-rs-sys", path = "../crates/libz-rs-sys" }
 
 # --- Differential oracle ------------------------------------------------------
@@ -199,7 +208,10 @@ libz_rs_sys = { package = "libz-rs-sys", path = "../crates/libz-rs-sys" }
 #
 #   1. The oracle is the in-tree C implementation compiled by
 #      crates/zlib-rs-differential/build.rs, and checksum fuzzing is specified
-#      against it.  This dependency is that oracle.
+#      against it.  This dependency is that oracle.  Since it also publishes the
+#      oracle's ABI tables, it is what lets every target here drive BOTH
+#      implementations through the safe `zlib_rs_differential::{port, oracle}` and hold zero
+#      `unsafe` of its own.
 #   2. Co-hosting the C reference with libz-rs-sys's `#[no_mangle]` exports in a
 #      single binary would collide on `crc32`, `adler32`, `deflate`, `inflate`
 #      and the rest of the exported surface.  That problem is already solved
@@ -207,11 +219,12 @@ libz_rs_sys = { package = "libz-rs-sys", path = "../crates/libz-rs-sys" }
 #      compile-time renames plus an `objcopy --redefine-syms` pass.  Re-solving
 #      it inside fuzz/ would duplicate roughly a hundred lines of build logic
 #      that could silently drift out of sync with the copy next door.
-#   3. Its lib target is to compile with zero regular dependencies — `src/lib.rs`
-#      is to be just `pub mod oracle;`, with `src/oracle.rs` declaring its own
-#      local `#[repr(C)]` mirrors — so a plain `[dependencies]` entry suffices
-#      even though zlib-rs and libz-rs-sys appear in its
-#      dev-dependencies.  Neither of those two source files has been written yet.
+#   3. Its lib target is `pub mod oracle;` plus that module, which declares the
+#      `c_`-prefixed `extern "C"` symbols, re-exports the facade's boundary types
+#      and publishes the safe gates every target here calls through.  It
+#      depends on zlib-rs and libz-rs-sys as ordinary `[dependencies]`, which does
+#      NOT put it into either shipped crate's graph: the edge points from it to
+#      them, and neither of their manifests names it.
 #   4. `exclude = ["fuzz"]` in the root manifest removes workspace MEMBERSHIP
 #      only; cross-workspace PATH dependencies remain perfectly legal in Cargo.
 #   5. It is intentionally NOT optional and NOT feature-gated, because the
@@ -219,12 +232,22 @@ libz_rs_sys = { package = "libz-rs-sys", path = "../crates/libz-rs-sys" }
 #      `cargo fuzz run <target> -- -max_total_time=300`.  Requiring `--features`
 #      just to build a target would break that command.
 #
-# Accepted costs, stated plainly rather than discovered later: the 15 in-tree C
-# translation units are compiled by `cc` on every build of this package, so a C
-# compiler and objcopy/binutils are fuzz-build prerequisites; and the oracle is
-# built without sanitizer instrumentation.  Both are fine — the C implementation
-# is fuzzed separately and continuously by OSS-Fuzz (see 5 in the header), so
-# leaving it uninstrumented here costs no coverage.
+# Accepted costs, stated plainly rather than discovered later.
+#
+#   * The 15 in-tree C translation units are compiled by `cc` on every build of
+#     this package, so a C compiler and objcopy/binutils are fuzz-build
+#     prerequisites.
+#   * The oracle is built WITHOUT sanitizer instrumentation, and that does cost
+#     something: `cargo fuzz`'s AddressSanitizer and coverage instrumentation
+#     apply to the Rust crates only, so a memory error inside the C reference is
+#     not detected here, and libFuzzer's coverage feedback is not guided by the
+#     oracle's branches either.  What is given up is acceptable rather than free:
+#     the C implementation is fuzzed separately and continuously by OSS-Fuzz (see
+#     5 in the header), the oracle is used as a comparison value and not as the
+#     subject, and instrumenting it would mean threading `-fsanitize=address`
+#     through a build script that a shipped crate must never depend on.  A
+#     mismatch between the two answers is still reported, because that assertion
+#     lives on the Rust side.
 zlib-rs-differential = { path = "../crates/zlib-rs-differential" }
 
 [features]
@@ -261,12 +284,26 @@ simd = ["zlib-rs/simd", "libz_rs_sys/simd"]
 # Clippy's ancestor search usually finds it, but this crate is not a member of
 # that workspace, so every lint decision that matters is spelled out below.
 [lints.rust]
-# Mirrors the facade crate's posture.  The targets legitimately handle raw
-# pointers when driving the C ABI, so `unsafe` is permitted here — but each
-# unsafe operation must be scoped individually instead of being blanket-permitted
-# by an `unsafe fn` signature.  `forbid(unsafe_code)` binds the safe core crate
-# only and must NOT be applied to this harness.
+# Mirrors the root `[workspace.lints.rust]` set, key for key, because this crate
+# cannot inherit it: `[lints] workspace = true` needs a parent workspace and this
+# directory is excluded from the one at the repository root.
+#
+# `unsafe_op_in_unsafe_fn` is a BACKSTOP, and it is worth being precise about what
+# holds the line now.  All five targets reach the two implementations through the
+# harness crate's safe boundary gates -- `zlib_rs_differential::port` for the port
+# and `::oracle` for the C reference -- and every one of the five carries
+# `#![forbid(unsafe_code)]`, which the compiler enforces: a target has no reason to
+# open an `unsafe` block and no way to.  This key matters for a target added later
+# without that attribute, where it stops an `unsafe fn` signature from
+# blanket-permitting the operations inside it.
 unsafe_op_in_unsafe_fn = "deny"
+future_incompatible = { level = "warn", priority = -1 }
+unused_macro_rules = "warn"
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+trivial_numeric_casts = "warn"
 
 [lints.clippy]
 # `priority = -1` makes these group denials evaluate BEFORE the individual allows
@@ -274,6 +311,28 @@ unsafe_op_in_unsafe_fn = "deny"
 # with it.
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
+
+# THE RESTRICTION SET, mirrored from the root `[workspace.lints.clippy]`.  It was
+# absent while this file claimed to mirror the workspace posture, which meant the
+# five harnesses that consume attacker-controlled input were the only Rust in the
+# tree these lints never reached.
+#
+# `undocumented_unsafe_blocks` is the one that matters most here: it is the
+# mechanical check that every `unsafe` block states the invariant discharging it,
+# and it is exactly the check these five files were outside of while this section
+# claimed to mirror the workspace posture.
+#
+# The panic family is deliberately NOT part of the mirror.  A fuzz target reports
+# a finding BY panicking: libFuzzer treats the abort as the crash it exists to
+# discover, so `panic`, `unwrap_used` and `expect_used` would forbid the very
+# mechanism these binaries are built around.  `indexing_slicing` is allowed for
+# the same reason -- an out-of-range index in a harness is an assertion failing,
+# not a library defect.  The four that carry no such justification are denied.
+undocumented_unsafe_blocks = "deny"
+todo = "deny"
+unimplemented = "deny"
+exit = "deny"
+panic_in_result_fn = "deny"
 # Fuzzer input arrives as bytes and has to be narrowed into the C API's integer
 # domains (a level in 0..=9, a signed windowBits, a memLevel in 1..=9), so these
 # three casts are inherent to a fuzz harness rather than a code smell.
@@ -304,17 +363,13 @@ debug = 1
 
 # Fuzz targets
 #
-# These five names are a CI-VISIBLE CONTRACT ONCE CI EXISTS.  The planned
-# `.github/workflows/rust.yml` is to run `cargo fuzz run <name> --
-# -max_total_time=300` over exactly this set, and is to cross-reference it from
-# `.github/workflows/fuzz.yml`; neither is true today -- `rust.yml` has not been
-# added, and the in-tree `fuzz.yml` is the unchanged OSS-Fuzz/CIFuzz workflow that
-# mentions no Rust target.  So renaming one of these five breaks nothing yet and
-# will break CI later.  Each name must match the corresponding file in
-# `fuzz_targets/`, a directory that is still empty; the `path` values below are
-# therefore the files to create, not files that exist.  They are listed in the
-# project plan's reading order; `cargo fuzz list` sorts them alphabetically, so
-# the two orders differ by design and that is not a discrepancy.
+# These five names are a CI-VISIBLE CONTRACT.  `.github/workflows/rust.yml`'s
+# `fuzz` job runs `cargo fuzz run <name> -- -max_total_time=300` over exactly this
+# set and `.github/workflows/fuzz.yml` cross-references it, so RENAMING ONE OF
+# THESE FIVE BREAKS CI.  Each name matches the corresponding file in
+# `fuzz_targets/`, and all five exist.  They are listed in the project plan's
+# reading order; `cargo fuzz list` sorts them alphabetically, so the two orders
+# differ by design and that is not a discrepancy.
 
 # From deflate.c — structured input over the configuration space (level,
 # windowBits, memLevel, strategy) via `arbitrary`, exercising the per-level

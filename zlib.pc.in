@@ -22,10 +22,11 @@
 #     packaging directory of its own rather than in cargo's output directory;
 #   * the exported symbol surface must match the C library's 111 dynamic
 #     globals, being 95 functions plus the 16 symbol-version nodes declared in
-#     zlib.map.  `make rust-test' diffs the two with nm.  The Rust side now
-#     carries the whole exported surface, so that diff is runnable, but no
-#     in-tree automation runs it -- read this as the parity requirement, and run
-#     `make rust-test' before treating parity as an achieved result;
+#     zlib.map.  Three things diff that with nm, each running on its own: the
+#     suite `crates/libz-rs-sys/tests/symbol_parity.rs' inside `cargo test', the
+#     `rust' target while it stages the library, and the symbol-parity job of
+#     .github/workflows/rust.yml, which also demands the direct diff against a
+#     built C library.  `make rust-symbols' is how to demand that diff by hand;
 #   * the installed zlib.h and generated zconf.h are byte-identical, because
 #     the Rust build modifies neither header.
 #
@@ -37,23 +38,33 @@
 #
 # The C libz.a needs no companion libraries, which is why there is no
 # Libs.private: line below and why adding one would be wrong for the C build.
-# A Rust staticlib is different -- it carries the Rust runtime's own
-# dependencies.  Measured, not assumed, with
-# `RUSTFLAGS="--print native-static-libs" cargo build --release -p libz-rs-sys`
-# on x86_64-unknown-linux-gnu:
+# A Rust staticlib is different -- it carries the Rust standard library's own
+# object code, whose undefined references reach into libc and its neighbours.
+# On x86_64-unknown-linux-gnu the set is
 #
 #     -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc
 #
-# That set is TARGET-SPECIFIC and must be re-derived per target; it is not a
-# constant to copy.  So a consumer that static-links the Rust libz.a using this
-# .pc file alone will fail to link, and this is an OPEN PACKAGING GAP rather
-# than a solved problem.  It cannot be closed by editing this template, because
-# one file serves both implementations and the C build must keep emitting a .pc
-# with no Libs.private: at all.  Closing it means having the Rust packaging step
-# emit its own descriptor, with Libs.private: populated from
-# `rustc --print native-static-libs` for the target being built.  Dynamic
-# linking is unaffected: the shared object records its own dependencies in
-# DT_NEEDED, so `-lz` alone remains correct there.
+# but that is an illustration, not a constant: the set is TARGET-SPECIFIC and
+# rustc is the only thing that knows it.
+#
+# This template cannot carry it, and the reason is specific to THIS build path
+# rather than general.  configure expands this file, and configure runs before
+# anyone decides whether to run `make rust' at all -- it does not even require
+# cargo to be present -- so at substitution time there is nothing to substitute.
+# Adding a placeholder would also need a matching rule in configure's zlib.pc sed
+# block and a matching -e in win32/Makefile.gcc, for a value that is empty on
+# every C build.
+#
+# So the autotools path reports the set instead of advertising it: `make rust'
+# asks rustc and prints the answer beside the staged libz.a, naming the flags a
+# static consumer has to add.  The CMake path, which knows at configure time
+# whether the Rust library is being built, does advertise it: zlib.pc.cmakein
+# carries a substitutable Libs.private: that is populated there and absent in C
+# mode, and CMakeLists.txt publishes the same set on the exported
+# ZLIB::ZLIBSTATIC target.
+#
+# Dynamic linking is unaffected on every path: the shared object records its own
+# dependencies in DT_NEEDED, so `-lz` alone remains correct there.
 #
 # Two constraints the substitution passes impose on future edits: every
 # name=value line must begin in column 0, because configure's rules are

@@ -20,22 +20,32 @@
 //!
 //! # What is compared
 //!
-//! Twelve table families, one `#[test]` each. The tests are independent, immutable, read-only
-//! comparisons over process-lifetime data with no shared mutable state, so Cargo running them in
-//! parallel is safe and deliberate. (Contrast `crates/libz-rs-sys/tests/c_api_parity.rs`, which
-//! puts everything in one `#[test]` because *its* helpers are order-dependent.)
+//! Nineteen table families, one `#[test]` each, plus two `#[test]`s for the two build-configuration
+//! numbers that decide *which* of `crc32.h`'s twelve alternative arms the comparisons are even
+//! looking at. The tests are independent, immutable, read-only comparisons over process-lifetime
+//! data with no shared mutable state, so Cargo running them in parallel is safe and deliberate.
+//! (Contrast `crates/libz-rs-sys/tests/c_api_parity.rs`, which puts everything in one `#[test]`
+//! because *its* helpers are order-dependent.)
 //!
 //! | Port | C reference | Entries |
 //! |---|---|---|
 //! | `CRC_TABLE` | `crc_table`, `crc32.h:5` | 256 |
+//! | `CRC_BIG_TABLE` | `crc_big_table`, `crc32.h:63` or `crc32.h:153` | 256 |
 //! | `X2N_TABLE` | `x2n_table`, `crc32.h:9439` | 32 |
 //! | `CRC_BRAID_TABLE` | `crc_braid_table`, `crc32.h:6365` or `crc32.h:7475` | `W` x 256 |
+//! | `CRC_BRAID_BIG_TABLE` | `crc_braid_big_table`, `crc32.h:6783` or `crc32.h:7685` | `W` x 256 |
+//! | `N` | `N`, `crc32.c:64` | 1 |
+//! | `W` / `Word` | `W` / `z_word_t`, `crc32.c:87` | 1 |
 //! | `static_ltree` | `static_ltree`, `trees.h:3` | 288 |
 //! | `static_dtree` | `static_dtree`, `trees.h:64` | 30 |
 //! | `base_length` | `base_length`, `trees.h:118` | 29 |
 //! | `base_dist` | `base_dist`, `trees.h:123` | 30 |
 //! | `_dist_code` | `_dist_code`, `trees.h:73` | 512 |
 //! | `_length_code` | `_length_code`, `trees.h:102` | 256 |
+//! | `extra_lbits` | `extra_lbits`, `trees.c:62` | 29 |
+//! | `extra_dbits` | `extra_dbits`, `trees.c:65` | 30 |
+//! | `extra_blbits` | `extra_blbits`, `trees.c:68` | 19 |
+//! | `bl_order` | `bl_order`, `trees.c:71` | 19 |
 //! | `lenfix` | `lenfix`, `inffixed.h:10` | 512 |
 //! | `distfix` | `distfix`, `inffixed.h:87` | 32 |
 //! | `CONFIGURATION_TABLE` | `configuration_table`, `deflate.c:112` | 10 |
@@ -43,7 +53,29 @@
 //! No length is hardcoded where the C side owns one: every comparison reads the count from the
 //! table's own `sizeof(array) / sizeof(array[0])` accessor and asserts the two lengths agree
 //! *before* looking at any element, so a dimension error is reported as a dimension error rather
-//! than as an out-of-range panic.
+//! than as an out-of-range panic. Element *widths* are read from the C side the same way, by
+//! `c_oracle_ct_data_size`, `c_oracle_code_size`, `c_oracle_config_field_size`,
+//! `c_oracle_extra_bits_element_size`, `c_oracle_bl_order_element_size` and `c_oracle_word_size`.
+//!
+//! # How each C object is reached, because three mechanisms are in play
+//!
+//! * **Declared in a generated header.** The five `crc32.h` tables, the six `trees.h` tables and the
+//!   two `inffixed.h` tables are `local`, so they have no linkable symbol -- but they *are* declared
+//!   in a header, so `build.rs`'s table shim includes that header and hands out a pointer and a
+//!   length per table.
+//! * **Declared in no header.** `configuration_table` (`deflate.c`) and the four `extra_*`/`bl_order`
+//!   arrays (`trees.c`) are `local` *and* absent from every header, because `gen_trees_header()`
+//!   generates only the six tables above. Nothing can include them and no linker can bind them, so
+//!   `build.rs` generates one wrapper per translation unit -- `zlib_c_oracle_deflate.c` and
+//!   `zlib_c_oracle_trees.c` -- which `#include`s the reference source itself and declares the
+//!   accessors inside its translation unit, the only vantage point from which a `static` object can
+//!   be read.
+//! * **Width-dependent element type.** `crc_big_table` and `crc_braid_big_table` are arrays of
+//!   `z_word_t`, which is 8 bytes under `W == 8`, 4 under `W == 4` and non-existent when the braided
+//!   path is compiled out, so one Rust slice type cannot describe them on every target. The shim
+//!   hands them out as `const void *` with a companion `c_oracle_word_size()`, and `oracle.rs`
+//!   resolves the pair into an `OracleWordTable` -- the typed view that keeps this file free of
+//!   `unsafe`.
 //!
 //! # Why the literal anchors are here as well
 //!
@@ -65,14 +97,6 @@
 //!
 //! # What is deliberately *not* compared, and why
 //!
-//! * `CRC_BIG_TABLE` and `CRC_BRAID_BIG_TABLE`. Their C accessors return `*const c_void`, because
-//!   `z_word_t` is 64 or 32 bits depending on the build, and `oracle.rs` therefore offers no typed
-//!   safe wrapper for either. Reaching them from here would mean writing `unsafe`, which this file
-//!   must not do. What would make the comparison direct is a typed safe wrapper in `oracle.rs`; the
-//!   byte-swapped relationship between the little- and big-endian tables is meanwhile covered
-//!   inside the core by `crates/zlib-rs/tests/crc32.rs`.
-//! * `N`, the braid count. `c_oracle_crc_braid_n` likewise has no safe wrapper. The per-width
-//!   literal anchors are what catch a wrong-`N` arm instead.
 //! * `zlibCompileFlags`. Worth knowing why, because it is adjacent: the port's tables are
 //!   `const`-evaluated rather than generated at run time, so it reports bit 13
 //!   (`DYNAMIC_CRC_TABLE`) **clear**, which is the honest answer -- and `crc32.c:13` records that
@@ -82,19 +106,22 @@
 //!
 //! # Contract
 //!
-//! * **No `unsafe`.** All of this crate's `unsafe` lives in `src/oracle.rs`; this file consumes the
-//!   safe `&'static [T]` wrappers built over the `c_oracle_*` accessors. If a comparison seems to
-//!   need `unsafe`, a wrapper is being bypassed -- or, as with the big-endian tables above, the
-//!   wrapper does not exist and the honest answer is to say so rather than to reach past it.
+//! * **No `unsafe`, enforced by `#![forbid(unsafe_code)]` on this file's root.** All of this
+//!   crate's `unsafe` lives in its two FFI boundary files, `src/oracle.rs` and `src/port.rs`; this
+//!   file consumes the safe `&'static [T]` wrappers built over the `c_oracle_*` accessors. If a
+//!   comparison seems to need `unsafe`, a wrapper is being bypassed -- or, as with the big-endian
+//!   tables above, the wrapper does not exist and the honest answer is to say so rather than to
+//!   reach past it.
 //! * **No `#[no_mangle]` and no `extern "C"` declarations.** This crate exports no C symbol and
 //!   declares its C surface in exactly one place.
 //! * **Nothing is loosened.** No prefix-only comparison, no `#[ignore]`, no tolerance. A mismatch
 //!   here is a defect in the port, never in the test: the C array is authoritative.
 //! * **No I/O.** These tables are compiled into the test binary and into the linked archive. This
 //!   file opens no file, reads no environment variable and touches no network.
-//! * **Not under Miri, by design.** Miri interprets Rust MIR and cannot execute the compiled C
-//!   oracle, so the Miri gate is scoped to `-p zlib-rs`; nightly AddressSanitizer covers this crate
-//!   instead. That is a CI job scope, not something to work around here.
+//! * **Under neither sanitizer, by design.** Miri interprets Rust MIR and cannot execute the
+//!   compiled C oracle, so the Miri gate is scoped to `-p zlib-rs`; the nightly AddressSanitizer
+//!   gate is scoped to `-p libz-rs-sys` and the relinked C drivers and does not select this crate.
+//!   Both are CI job scopes, not something to work around here.
 
 // The workspace lint table denies the panic-prone lints, which is right for library code and wrong
 // for a test: a test asserts, a failed assertion panics, and reading a table by index is clearer
@@ -110,6 +137,11 @@
     clippy::indexing_slicing,
     clippy::panic
 )]
+// Every table this file compares arrives through a safe accessor in `oracle`, so nothing here needs
+// `unsafe` and the compiler is asked to keep it that way. `src/oracle.rs` and `src/port.rs` are the
+// only files in this crate the attribute is deliberately absent from; `src/lib.rs` explains why at
+// its ATTRIBUTES block.
+#![forbid(unsafe_code)]
 
 use core::ffi::{c_int, c_uint};
 use core::mem::size_of;
@@ -124,10 +156,14 @@ use zlib_rs::deflate::state::CtData;
 use zlib_rs::deflate::{deflate, deflate_end, deflate_init2, deflate_params};
 use zlib_rs::inflate::inftrees::Code;
 use zlib_rs::{
-    _dist_code, _length_code, base_dist, base_length, distfix, lenfix, static_dtree, static_ltree,
-    DeflateConfig, DeflateStream, GlobalAllocator, Method, ReturnCode, Strategy,
-    CONFIGURATION_TABLE, CRC_BRAID_TABLE, CRC_TABLE, X2N_TABLE,
+    _dist_code, _length_code, base_dist, base_length, bl_order, distfix, extra_blbits, extra_dbits,
+    extra_lbits, lenfix, static_dtree, static_ltree, DeflateConfig, DeflateStream, GlobalAllocator,
+    Method, ReturnCode, Strategy, CONFIGURATION_TABLE, CRC_BIG_TABLE, CRC_BRAID_BIG_TABLE,
+    CRC_BRAID_TABLE, CRC_TABLE, X2N_TABLE,
 };
+// `N` and `W` have no crate-root re-export -- they are build-configuration numbers rather than
+// generated data -- so they come in by module path, like the flush and strategy constants above.
+use zlib_rs::crc32::tables::{Word, N, W};
 
 // `libz_rs_sys` is deliberately absent. The facade would only add a way to reach the same tables
 // through raw `z_stream` pointers, which would require `unsafe`; the safe core exposes the same
@@ -135,11 +171,14 @@ use zlib_rs::{
 // here. Should a future test in this file need it, the manifest's dependency-rename form fixes the
 // spelling as `use libz_rs_sys::...`, never `use z::...`.
 use zlib_rs_differential::oracle::{
-    code, ct_data, oracle_base_dist, oracle_base_length, oracle_config, oracle_config_field_size,
-    oracle_config_table_len, oracle_crc_braid_dimensions, oracle_crc_braid_table, oracle_crc_table,
-    oracle_dist_code, oracle_distfix, oracle_element_sizes, oracle_lenfix, oracle_length_code,
-    oracle_static_dtree, oracle_static_ltree, oracle_x2n_table, uch, OracleCompressFunc, D_CODES,
-    LENGTH_CODES, L_CODES,
+    code, ct_data, oracle_base_dist, oracle_base_length, oracle_bl_order, oracle_config,
+    oracle_config_field_size, oracle_config_table_len, oracle_crc_big_table,
+    oracle_crc_braid_big_dimensions, oracle_crc_braid_big_table, oracle_crc_braid_dimensions,
+    oracle_crc_braid_n, oracle_crc_braid_table, oracle_crc_braid_w, oracle_crc_table,
+    oracle_dist_code, oracle_distfix, oracle_element_sizes, oracle_extra_blbits,
+    oracle_extra_dbits, oracle_extra_lbits, oracle_lenfix, oracle_length_code, oracle_static_dtree,
+    oracle_static_ltree, oracle_trees_element_sizes, oracle_x2n_table, uch, OracleCompressFunc,
+    OracleWordTable, BL_CODES, D_CODES, LENGTH_CODES, L_CODES,
 };
 
 // =================================================================================================
@@ -184,6 +223,18 @@ const CONFIG_TABLE_SOURCE: &str = "deflate.c:112";
 
 /// `trees.c:295`, where `tr_static_init` derives the mappings the structural checks assert.
 const TR_STATIC_INIT_SOURCE: &str = "trees.c:295";
+
+/// `local const int extra_lbits[LENGTH_CODES]`, declared in `trees.c` and in no header.
+const EXTRA_LBITS_SOURCE: &str = "trees.c:62";
+
+/// `local const int extra_dbits[D_CODES]`, declared in `trees.c` and in no header.
+const EXTRA_DBITS_SOURCE: &str = "trees.c:65";
+
+/// `local const int extra_blbits[BL_CODES]`, declared in `trees.c` and in no header.
+const EXTRA_BLBITS_SOURCE: &str = "trees.c:68";
+
+/// `local const uch bl_order[BL_CODES]`, declared in `trees.c` and in no header.
+const BL_ORDER_SOURCE: &str = "trees.c:71";
 
 // =================================================================================================
 //  Literal anchors, transcribed by hand from the committed headers
@@ -236,6 +287,88 @@ const BRAID_W4_HEAD: [u32; 5] = [
 
 /// The final entry of the `W == 4` arm, `crc_braid_table[3][255]` (`crc32.h:7683`).
 const BRAID_W4_LAST: u32 = 0x18ba_364e;
+
+/// The first five entries of `crc_big_table` in the `W == 8` arm (`crc32.h:64-65`).
+///
+/// Every entry is `crc_table`'s corresponding entry byte-swapped into the high half of a 64-bit
+/// word, which is why these read as `crc_table`'s values reversed and then zero-extended: `crc_table`
+/// opens `0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419` and this arm opens with the
+/// same five words byte-reversed.
+const CRC_BIG_W8_HEAD: [u64; 5] = [
+    0x0000_0000_0000_0000,
+    0x9630_0777_0000_0000,
+    0x2c61_0eee_0000_0000,
+    0xba51_0999_0000_0000,
+    0x19c4_6d07_0000_0000,
+];
+
+/// The final entry of the `W == 8` arm, `crc_big_table[255]` (`crc32.h:150`).
+const CRC_BIG_W8_LAST: u64 = 0x8def_022d_0000_0000;
+
+/// The first five entries of `crc_big_table` in the `W == 4` arm (`crc32.h:154`).
+///
+/// The same byte-reversed values as the `W == 8` arm, in a 32-bit word rather than the high half of
+/// a 64-bit one -- which is exactly what makes [`OracleWordTable::widened`] the right comparison
+/// vehicle only *within* a width, never across two.
+const CRC_BIG_W4_HEAD: [u32; 5] = [
+    0x0000_0000,
+    0x9630_0777,
+    0x2c61_0eee,
+    0xba51_0999,
+    0x19c4_6d07,
+];
+
+/// The final entry of the `W == 4` arm, `crc_big_table[255]` (`crc32.h:206`).
+const CRC_BIG_W4_LAST: u32 = 0x8def_022d;
+
+/// The first five entries of `crc_braid_big_table[0]` in the `W == 8` arm (`crc32.h:6784`).
+const BRAID_BIG_W8_HEAD: [u64; 5] = [
+    0x0000_0000_0000_0000,
+    0xf390_f236_0000_0000,
+    0xe621_e56d_0000_0000,
+    0x15b1_175b_0000_0000,
+    0xcc43_cadb_0000_0000,
+];
+
+/// The final entry of the `W == 8` arm, `crc_braid_big_table[7][255]` (`crc32.h:7472`).
+const BRAID_BIG_W8_LAST: u64 = 0x6575_94e9_0000_0000;
+
+/// The first five entries of `crc_braid_big_table[0]` in the `W == 4` arm (`crc32.h:7686`).
+const BRAID_BIG_W4_HEAD: [u32; 5] = [
+    0x0000_0000,
+    0x43cb_a687,
+    0xc790_3cd4,
+    0x845b_9a53,
+    0xcf27_0873,
+];
+
+/// The final entry of the `W == 4` arm, `crc_braid_big_table[3][255]` (`crc32.h:7894`).
+const BRAID_BIG_W4_LAST: u32 = 0x356b_acd8;
+
+/// The whole of `extra_lbits` (`trees.c:63`), all 29 entries.
+///
+/// Short enough to transcribe in full, so the anchor is the entire table rather than an opening run:
+/// eight codes with no residue, then four each at widths 1 through 5, then the single-length code 28.
+const EXTRA_LBITS_ALL: [c_int; 29] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+];
+
+/// The whole of `extra_dbits` (`trees.c:66`), all 30 entries.
+const EXTRA_DBITS_ALL: [c_int; 30] = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13,
+];
+
+/// The whole of `extra_blbits` (`trees.c:69`), all 19 entries.
+///
+/// The three non-zero widths are RFC 1951 3.2.7's repeat counts: 2 bits for code 16, 3 for 17, 7
+/// for 18.
+const EXTRA_BLBITS_ALL: [c_int; 19] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 7];
+
+/// The whole of `bl_order` (`trees.c:72`), all 19 entries.
+const BL_ORDER_ALL: [uch; 19] = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+];
 
 /// The first five entries of `static_ltree` (`trees.h:4`), spelled `{{ 12},{  8}}` and so on:
 /// `fc` first, which for a built tree is the bit string, then `dl`, the code length.
@@ -376,6 +509,15 @@ const CONFIG_TABLE_ROWS: usize = 10;
 /// decimal cannot be compared against them by eye.
 fn as_hex_word(value: u32) -> String {
     format!("0x{value:08x}")
+}
+
+/// Renders a `z_word_t` entry the way `crc32.h` writes it, widened to the 64-bit form.
+///
+/// Sixteen digits rather than eight, because that is how the `W == 8` arm spells them; a `W == 4`
+/// value widens into the low half and so reads with eight leading zeros, which is itself the signal
+/// that the two arms are not interchangeable.
+fn as_hex_dword(value: u64) -> String {
+    format!("0x{value:016x}")
 }
 
 /// Renders a C `ct_data` entry as a built tree node: the bit string, then its length.
@@ -556,6 +698,170 @@ fn braid_arm(width: usize) -> (&'static [u32], u32, &'static str) {
              crc32.h holds no committed table to anchor against."
         ),
     }
+}
+
+/// The `crc_big_table` literals and header location for one `z_word_t` width.
+///
+/// The counterpart of [`braid_arm`] for the word-typed byte-at-a-time table. Both arms are widened
+/// to `u64` so that one signature serves both: within a width the widening is lossless, and the
+/// caller only ever compares values that came from the same width.
+fn crc_big_arm(word_bytes: u32) -> (Vec<u64>, u64, &'static str) {
+    match word_bytes {
+        8 => (
+            CRC_BIG_W8_HEAD.to_vec(),
+            CRC_BIG_W8_LAST,
+            "crc32.h:63 (#if W == 8)",
+        ),
+        4 => (
+            CRC_BIG_W4_HEAD.iter().map(|e| u64::from(*e)).collect(),
+            u64::from(CRC_BIG_W4_LAST),
+            "crc32.h:153 (#else W == 4)",
+        ),
+        other => panic!(
+            "crc_big_table: a z_word_t of {other} bytes is neither width crc32.c can compile -- \
+             crc32.c:96-106 gives 8 with Z_U8 and 4 with Z_U4 -- so crc32.h holds no committed \
+             table to anchor against."
+        ),
+    }
+}
+
+/// The `crc_braid_big_table` literals and header location for one `z_word_t` width.
+///
+/// As [`crc_big_arm`], for the big-endian braid table. The `N == 5` arms are the ones named, because
+/// that is the braid count `crc32.c:64-71` compiles by default and
+/// [`braid_count_matches_the_c_reference`] is what proves the oracle really took it.
+fn braid_big_arm(word_bytes: u32) -> (Vec<u64>, u64, &'static str) {
+    match word_bytes {
+        8 => (
+            BRAID_BIG_W8_HEAD.to_vec(),
+            BRAID_BIG_W8_LAST,
+            "crc32.h:6783 (#if N == 5, #if W == 8)",
+        ),
+        4 => (
+            BRAID_BIG_W4_HEAD.iter().map(|e| u64::from(*e)).collect(),
+            u64::from(BRAID_BIG_W4_LAST),
+            "crc32.h:7685 (#if N == 5, #else W == 4)",
+        ),
+        other => panic!(
+            "crc_braid_big_table: a z_word_t of {other} bytes is neither width crc32.c can \
+             compile -- crc32.c:96-106 gives 8 with Z_U8 and 4 with Z_U4 -- so crc32.h holds no \
+             committed table to anchor against."
+        ),
+    }
+}
+
+/// Widens one port `z_word_t` entry to `u64`, whichever width this build compiled.
+///
+/// The two arms are `cfg`-selected on exactly the condition
+/// `crates/zlib-rs/src/crc32/tables.rs:132` selects `Word` on, and that is deliberate rather than
+/// fussy: where `Word` is already `u64` a `u64::from` call is a no-op that
+/// `clippy::useless_conversion` rightly rejects, and where it is `u32` the conversion is a genuine
+/// widening that must not be written as an `as` cast. Keying both arms off the same condition as the
+/// type itself means the pair cannot fall out of step with it.
+#[cfg(target_pointer_width = "64")]
+fn widen_word(value: Word) -> u64 {
+    value
+}
+
+/// Widens one port `z_word_t` entry to `u64` on a target whose `Word` is `u32`.
+///
+/// See the 64-bit arm above for why there are two.
+#[cfg(not(target_pointer_width = "64"))]
+fn widen_word(value: Word) -> u64 {
+    u64::from(value)
+}
+
+/// The width, in bytes, of the `z_word_t` the *port* compiled: `size_of::<Word>()`.
+///
+/// `crates/zlib-rs/src/crc32/tables.rs` selects `Word` and `W` together, so this is the port's own
+/// answer to the question `c_oracle_word_size()` answers for C, and the two are compared rather than
+/// assumed equal -- they legitimately differ on a 64-bit target outside C's `__x86_64__`/`__aarch64__`
+/// list, which is the documented divergence [`crc_braid_table_matches_the_c_reference`] describes.
+fn port_word_bytes() -> u32 {
+    u32::try_from(size_of::<Word>()).expect("size_of::<Word>() is 4 or 8")
+}
+
+/// Compares one word-typed C table against the port's, or explains why it cannot.
+///
+/// The three legitimate reasons not to compare are the ones `crc_braid_table` already documents, and
+/// each is printed rather than passed over in silence: the C side compiled the braided path out
+/// altogether, the two builds selected different `z_word_t` widths, or -- for the braid table only --
+/// the row counts differ for that same reason. Anything else is a failure.
+fn assert_word_table_matches(
+    table: &str,
+    reference: &OracleWordTable,
+    port: &[u64],
+    port_bytes: u32,
+    arm: impl Fn(u32) -> (Vec<u64>, u64, &'static str),
+) {
+    let c_bytes = match reference {
+        OracleWordTable::Bits64(_) => 8_u32,
+        OracleWordTable::Bits32(_) => 4_u32,
+        OracleWordTable::Absent => {
+            println!(
+                "{table}: COMPARISON SKIPPED. c_oracle_word_size() reports 0, which means crc32.h \
+                 compiled the braided path out entirely on this target (crc32.c:96-106 leaves W \
+                 undefined when neither Z_U8 nor Z_U4 is available), so there is no C array to \
+                 compare the port's {} entries against.",
+                port.len(),
+            );
+            return;
+        }
+    };
+
+    // Each side is anchored against the header arm its OWN width selects, before the two are
+    // compared against each other. A shim that reached a valid-but-wrong arm fails here.
+    let widened = reference.widened();
+    let (c_head, c_last, c_source) = arm(c_bytes);
+    assert_opening_run(
+        &format!("{table} (C)"),
+        c_source,
+        &widened,
+        &c_head,
+        as_hex_dword,
+    );
+    assert_eq!(
+        widened[widened.len() - 1],
+        c_last,
+        "{table} (C): the final entry disagrees with {c_source}, so the shim reached a table \
+         crc32.c did not compile -- a different N arm, or the little-endian variant",
+    );
+
+    let (port_head, port_last, port_source) = arm(port_bytes);
+    assert_opening_run(
+        &format!("{table} (port)"),
+        port_source,
+        port,
+        &port_head,
+        as_hex_dword,
+    );
+    assert_eq!(
+        port[port.len() - 1],
+        port_last,
+        "{table} (port): the final entry disagrees with {port_source}",
+    );
+
+    if port_bytes != c_bytes {
+        println!(
+            "{table}: CONTENT COMPARISON SKIPPED. The port compiled the {port_bytes}-byte z_word_t \
+             arm and the C reference the {c_bytes}-byte one, which is the documented divergence \
+             recorded at crates/zlib-rs/src/crc32/tables.rs:125: the port keys W off \
+             target_pointer_width == 64 and crc32.c:87-95 keys it off __x86_64__/__aarch64__. Both \
+             arms were still checked against their own crc32.h literals above. The divergence is \
+             output-neutral -- the word width is an evaluation strategy, not part of the CRC's \
+             definition -- so there is nothing to compare rather than something being skipped."
+        );
+        return;
+    }
+
+    assert_tables_match(
+        table,
+        c_source,
+        port,
+        &widened,
+        |mine, theirs| mine == theirs,
+        |mine, theirs| format!("port {}, C {}", as_hex_dword(mine), as_hex_dword(theirs)),
+    );
 }
 
 // =================================================================================================
@@ -842,6 +1148,412 @@ fn crc_braid_table_matches_the_c_reference() {
         reference,
         |mine, theirs| mine == theirs,
         |mine, theirs| format!("port {}, C {}", as_hex_word(mine), as_hex_word(theirs)),
+    );
+}
+
+/// `N` is `crc32.c`'s braid count, and the port's must be the C build's.
+///
+/// This is the one number a table comparison cannot infer from the data it compares. `crc32.h`
+/// carries a separate `crc_braid_table` and `crc_braid_big_table` for every `#if N == 1..6` arm
+/// crossed with each `W`, and only one pair is ever compiled. A shim that reached the `N == 3` arm
+/// would hand back a table that is perfectly valid, internally consistent and the wrong answer --
+/// and the literal anchors on the two braid tests are the *reason* that is caught, so this test
+/// states the number they depend on explicitly rather than leaving it implicit in them.
+///
+/// `N` decides how many CRCs the braided body interleaves and therefore the stride it consumes,
+/// which is `N * W` bytes. It does not change the CRC of any input -- braiding is an evaluation
+/// strategy -- so a mismatch here is not a wrong checksum; it is a comparison measuring the wrong
+/// pair of tables, which is worse, because it would pass.
+#[test]
+fn braid_count_matches_the_c_reference() {
+    let c_braids = oracle_crc_braid_n();
+
+    assert_eq!(
+        c_braids, 5,
+        "crc32.c:64-71 defines N as 5 unless Z_TESTN overrides it, and the oracle is built without \
+         that define, so the C side must report 5 braids. It reports {c_braids}, which means the \
+         oracle compiled a different arm of crc32.h than the literal anchors in \
+         crc_braid_table_matches_the_c_reference and crc_braid_big_table_matches_the_c_reference \
+         were transcribed from.",
+    );
+
+    let port_braids = u32::try_from(N).expect("N is a small constant");
+    assert_eq!(
+        port_braids, c_braids,
+        "N: the port compiled {port_braids} braids and the C reference {c_braids}. \
+         crates/zlib-rs/src/crc32/tables.rs:103 transcribes crc32.c's own default, so the two must \
+         agree; a difference means one of the two selected a different crc32.h arm and every braid \
+         table comparison below is measuring unrelated data.",
+    );
+}
+
+/// `W` is the port's `z_word_t` width, and the port's `Word` type must be that wide.
+///
+/// Two things are checked, and they are different. First that the port's own `W` constant and its
+/// `Word` type agree with each other -- they are declared together at
+/// `crates/zlib-rs/src/crc32/tables.rs:133` and `:150`, and a build where they disagreed would index
+/// the right table with the wrong stride. Second that the port's width and the C build's agree, or
+/// that the disagreement is the one documented divergence: the port keys the choice off
+/// `target_pointer_width == "64"` and `crc32.c:87-95` keys it off `__x86_64__ || __aarch64__`, so a
+/// 64-bit target outside C's list takes 8 in the port and 4 in C.
+#[test]
+fn word_width_matches_the_c_reference_or_diverges_as_documented() {
+    let port_bytes = port_word_bytes();
+    let port_w = u32::try_from(W).expect("W is a small constant");
+
+    assert_eq!(
+        port_w, port_bytes,
+        "W: the port declares W = {port_w} and a Word of {port_bytes} bytes. crc32.c:205 declares \
+         both braid tables as [W][256] of z_word_t, so the row count and the element width are the \
+         same number; crates/zlib-rs/src/crc32/tables.rs sets them together and they cannot differ.",
+    );
+
+    let c_bytes = oracle_crc_braid_w();
+    if c_bytes == 0 {
+        println!(
+            "W: the C oracle reports 0, so crc32.h compiled the braided path out entirely on this \
+             target and there is no C width to compare the port's {port_bytes} against."
+        );
+        return;
+    }
+
+    if port_bytes == c_bytes {
+        return;
+    }
+
+    assert!(
+        port_bytes == 8 && c_bytes == 4 && cfg!(target_pointer_width = "64"),
+        "W: the port compiled a {port_bytes}-byte z_word_t and the C reference a {c_bytes}-byte \
+         one. The only admissible difference is the divergence recorded at \
+         crates/zlib-rs/src/crc32/tables.rs:125 -- port 8 and C 4 on a 64-bit target outside C's \
+         __x86_64__/__aarch64__ list -- and this is not it.",
+    );
+    println!(
+        "W: the port compiled 8 bytes and the C reference 4, which is the documented divergence at \
+         crates/zlib-rs/src/crc32/tables.rs:125 on a 64-bit target outside crc32.c:87-95's list. \
+         Both word tables are anchored against their own crc32.h arm instead of against each other."
+    );
+}
+
+/// `CRC_BIG_TABLE` is `crc_big_table` (`crc32.h:63` or `crc32.h:153`), all 256 entries.
+///
+/// `crc_table` with every entry byte-swapped. `crc32_z` reads it for the head and tail of a braided
+/// calculation on a big-endian host, so it participates in the CRC of essentially every stream there
+/// -- the same role `crc_table` plays on a little-endian one.
+///
+/// Reaching it needs a width, not just a pointer: its element type is `z_word_t`, which is 8 bytes
+/// under `W == 8`, 4 under `W == 4` and non-existent when the braided path is compiled out. The shim
+/// hands it out as `const void *` with a companion `c_oracle_word_size()`, and
+/// [`OracleWordTable`] is the typed view that pairs the two, which is what lets this comparison be
+/// written with no `unsafe` in this file.
+#[test]
+fn crc_big_table_matches_the_c_reference() {
+    let reference = oracle_crc_big_table();
+    let port: Vec<u64> = CRC_BIG_TABLE.iter().copied().map(widen_word).collect();
+
+    assert_eq!(
+        port.len(),
+        256,
+        "CRC_BIG_TABLE: crc32.c declares crc_big_table with one entry per byte value, so the port's \
+         transcription must hold 256",
+    );
+
+    if !reference.is_empty() {
+        assert_eq!(
+            reference.len(),
+            256,
+            "crc_big_table: the C side reports {} entries; crc32.h declares one per byte value",
+            reference.len(),
+        );
+    }
+
+    assert_word_table_matches(
+        "crc_big_table",
+        &reference,
+        &port,
+        port_word_bytes(),
+        crc_big_arm,
+    );
+}
+
+/// `CRC_BRAID_BIG_TABLE` is `crc_braid_big_table` (`crc32.h:6783` or `crc32.h:7685`), `W` x 256.
+///
+/// The big-endian counterpart of `crc_braid_table`, read by the braided body on a big-endian host.
+/// Both dimensions come from the C side rather than being assumed, for the reason
+/// [`crc_braid_table_matches_the_c_reference`] gives: `crc32.h` holds twelve alternative definitions
+/// and only one arm is ever compiled.
+///
+/// A C array is contiguous and row-major, so the port's rows flatten to the same order the C view
+/// already has: `crc_braid_big_table[k][b]` is entry `k * columns + b` on both sides.
+#[test]
+fn crc_braid_big_table_matches_the_c_reference() {
+    let reference = oracle_crc_braid_big_table();
+    let (c_rows, c_columns) = oracle_crc_braid_big_dimensions();
+    let port: Vec<u64> = CRC_BRAID_BIG_TABLE
+        .iter()
+        .flatten()
+        .copied()
+        .map(widen_word)
+        .collect();
+
+    // The port's geometry, from its own declaration.
+    assert_eq!(
+        CRC_BRAID_BIG_TABLE[0].len(),
+        BRAID_COLUMNS,
+        "CRC_BRAID_BIG_TABLE: each row must hold one entry per byte value",
+    );
+    assert_eq!(
+        CRC_BRAID_BIG_TABLE.len(),
+        W,
+        "CRC_BRAID_BIG_TABLE: crc32.c:205 declares crc_braid_big_table[W][256], so the port's row \
+         count must be its own W",
+    );
+
+    if !reference.is_empty() {
+        assert_eq!(
+            c_columns as usize, BRAID_COLUMNS,
+            "crc_braid_big_table: crc32.c:205 declares crc_braid_big_table[W][256], so the C side \
+             must report 256 columns",
+        );
+        assert_eq!(
+            reference.len(),
+            (c_rows as usize) * (c_columns as usize),
+            "crc_braid_big_table: the flattened C view must hold exactly rows x columns entries",
+        );
+        assert_eq!(
+            c_rows,
+            oracle_crc_braid_w(),
+            "crc_braid_big_table: the C row count must be the C W, since crc32.c:205 declares the \
+             table with W rows",
+        );
+    }
+
+    assert_word_table_matches(
+        "crc_braid_big_table",
+        &reference,
+        &port,
+        port_word_bytes(),
+        braid_big_arm,
+    );
+}
+
+// =================================================================================================
+//  trees.c -- the four tables no header declares
+//
+//  Reached through the generated trees.c wrapper rather than the table shim, for the reason
+//  configuration_table needs the same device: gen_trees_header() generates only the six tables
+//  trees.h carries, and these four are hand-written `local' declarations in trees.c itself.
+//
+//  All four are short enough to transcribe in full, so each anchor is the WHOLE table rather than an
+//  opening run -- which makes the shim-independent check as strong as the shim-dependent one here.
+// =================================================================================================
+
+/// The element widths the C compiler produced for the four `trees.c` tables.
+///
+/// Carried as its own test rather than folded into the four below, because it is one fact about the
+/// C build shared by all of them: the three `extra_*` arrays are `const int` and `bl_order` is
+/// `const uch`, and the port transcribes them as `i32` and `u8`. A target where C's `int` were not
+/// 4 bytes would make every one of those comparisons compare the wrong thing, and this is where that
+/// shows up as itself.
+#[test]
+fn trees_element_widths_match_the_c_reference() {
+    let (extra_bits, order) = oracle_trees_element_sizes();
+
+    assert_eq!(
+        extra_bits as usize,
+        size_of::<c_int>(),
+        "extra_lbits/extra_dbits/extra_blbits: the C compiler reports sizeof(int) as {extra_bits}, \
+         but Rust's c_int is {} bytes on this target. The port transcribes all three as i32 \
+         (crates/zlib-rs/src/trees/static_tables.rs), so the two must agree.",
+        size_of::<c_int>(),
+    );
+    assert_eq!(
+        order as usize,
+        size_of::<uch>(),
+        "bl_order: the C compiler reports sizeof(uch) as {order}, but the mirror is {} bytes. \
+         zutil.h defines uch as unsigned char and the port transcribes bl_order as u8.",
+        size_of::<uch>(),
+    );
+}
+
+/// `extra_lbits` is `extra_lbits` (`trees.c:62`), all `LENGTH_CODES` = 29 entries.
+///
+/// Extra bits carried by each length code, and one of the inputs to block-type selection: `gen_bitlen`
+/// adds `extra_lbits[n]` to the code's width for every occurrence when it accumulates `opt_len` and
+/// `static_len` (`trees.c:570-574`), and those two totals are what `_tr_flush_block` compares to
+/// choose between a dynamic, a static and a stored block. `compress_block` then reads the same array
+/// to decide whether a residue follows the code at all (`trees.c:926-929`), so a wrong entry does not
+/// merely mis-size a block, it writes the wrong number of bits.
+#[test]
+fn extra_lbits_matches_the_c_reference() {
+    let reference = oracle_extra_lbits();
+
+    assert_eq!(
+        reference.len(),
+        LENGTH_CODES as usize,
+        "extra_lbits: {EXTRA_LBITS_SOURCE} declares it with LENGTH_CODES = {LENGTH_CODES} entries, \
+         and the C side reports {}",
+        reference.len(),
+    );
+    assert_opening_run(
+        "extra_lbits",
+        EXTRA_LBITS_SOURCE,
+        reference,
+        &EXTRA_LBITS_ALL,
+        as_int,
+    );
+
+    assert_tables_match(
+        "extra_lbits",
+        EXTRA_LBITS_SOURCE,
+        &extra_lbits,
+        reference,
+        |mine, theirs| mine == theirs,
+        |mine, theirs| format!("port {mine}, C {theirs}"),
+    );
+}
+
+/// `extra_dbits` is `extra_dbits` (`trees.c:65`), all `D_CODES` = 30 entries.
+///
+/// Extra bits carried by each distance code. Every distance code is a leaf that may carry a residue,
+/// so this array is read on every match `compress_block` emits; it is also the run length of
+/// `_dist_code`, since `tr_static_init` steps by `1 << extra_dbits[code]` below code 16 and by
+/// `1 << (extra_dbits[code] - 7)` at or above it (`trees.c:336` and `:344`), which is where the
+/// `>> 7` in the `d_code` macro comes from.
+#[test]
+fn extra_dbits_matches_the_c_reference() {
+    let reference = oracle_extra_dbits();
+
+    assert_eq!(
+        reference.len(),
+        D_CODES as usize,
+        "extra_dbits: {EXTRA_DBITS_SOURCE} declares it with D_CODES = {D_CODES} entries, and the C \
+         side reports {}",
+        reference.len(),
+    );
+    assert_opening_run(
+        "extra_dbits",
+        EXTRA_DBITS_SOURCE,
+        reference,
+        &EXTRA_DBITS_ALL,
+        as_int,
+    );
+
+    assert_tables_match(
+        "extra_dbits",
+        EXTRA_DBITS_SOURCE,
+        &extra_dbits,
+        reference,
+        |mine, theirs| mine == theirs,
+        |mine, theirs| format!("port {mine}, C {theirs}"),
+    );
+}
+
+/// `extra_blbits` is `extra_blbits` (`trees.c:68`), all `BL_CODES` = 19 entries.
+///
+/// Extra bits carried by each bit-length code. Only the final three are non-zero, and they are the
+/// repeat counts RFC 1951 3.2.7 fixes: 2 bits for code 16 (repeat the previous length 3-6 times),
+/// 3 for code 17 (repeat zero 3-10 times) and 7 for code 18 (repeat zero 11-138 times). `send_tree`
+/// emits exactly those widths (`trees.c:770-790`), so a wrong entry corrupts the code-length
+/// sequence of every dynamic block and no decoder can recover the trees.
+#[test]
+fn extra_blbits_matches_the_c_reference() {
+    let reference = oracle_extra_blbits();
+
+    assert_eq!(
+        reference.len(),
+        BL_CODES as usize,
+        "extra_blbits: {EXTRA_BLBITS_SOURCE} declares it with BL_CODES = {BL_CODES} entries, and \
+         the C side reports {}",
+        reference.len(),
+    );
+    assert_opening_run(
+        "extra_blbits",
+        EXTRA_BLBITS_SOURCE,
+        reference,
+        &EXTRA_BLBITS_ALL,
+        as_int,
+    );
+
+    assert_tables_match(
+        "extra_blbits",
+        EXTRA_BLBITS_SOURCE,
+        &extra_blbits,
+        reference,
+        |mine, theirs| mine == theirs,
+        |mine, theirs| format!("port {mine}, C {theirs}"),
+    );
+}
+
+/// `bl_order` is `bl_order` (`trees.c:71`), all `BL_CODES` = 19 entries.
+///
+/// The transmission order of the bit-length code lengths, fixed by RFC 1951 3.2.7 and chosen so that
+/// the rare widths come last: the three repeat codes first, then 0, then the middle widths outward
+/// from 8, leaving 1 and 15 at the end. `build_bl_tree` walks it backwards from `BL_CODES - 1` and
+/// stops at the last non-zero entry (`trees.c:818-820`), and `send_all_trees` then sends only the
+/// leading `max_blindex + 1` three-bit fields (`trees.c:847`). So a wrong entry both mis-orders the
+/// fields and changes how many are sent -- two byte-level changes at once, in the one part of a
+/// dynamic block a decoder must read before it can read anything else.
+///
+/// The structural property is checked as well as the data: the order must be a permutation of
+/// `0..BL_CODES`, which is a fact about the array that holds independently of the transcription.
+#[test]
+fn bl_order_matches_the_c_reference() {
+    let reference = oracle_bl_order();
+
+    assert_eq!(
+        reference.len(),
+        BL_CODES as usize,
+        "bl_order: {BL_ORDER_SOURCE} declares it with BL_CODES = {BL_CODES} entries, and the C side \
+         reports {}",
+        reference.len(),
+    );
+    assert_opening_run(
+        "bl_order",
+        BL_ORDER_SOURCE,
+        reference,
+        &BL_ORDER_ALL,
+        as_code_index,
+    );
+
+    assert_tables_match(
+        "bl_order",
+        BL_ORDER_SOURCE,
+        &bl_order,
+        reference,
+        |mine, theirs| mine == theirs,
+        |mine, theirs| format!("port {mine}, C {theirs}"),
+    );
+
+    // Structural, and independent of both transcriptions: every bit-length code must appear exactly
+    // once, or build_bl_tree's backwards walk would send one twice and omit another.
+    let mut seen = [false; BL_CODES as usize];
+    for (index, &code) in reference.iter().enumerate() {
+        let slot = code as usize;
+        assert!(
+            slot < seen.len(),
+            "bl_order: entry {index} names code {code}, which is outside 0..{BL_CODES}. \
+             {BL_ORDER_SOURCE} is a permutation of the bit-length alphabet ({TR_STATIC_INIT_SOURCE} \
+             and RFC 1951 3.2.7), so every entry must be a code that exists.",
+        );
+        assert!(
+            !seen[slot],
+            "bl_order: code {code} appears twice, the second time at entry {index}. \
+             {BL_ORDER_SOURCE} is a permutation, so build_bl_tree (trees.c:818-820) would send that \
+             code's length twice and omit another code's entirely.",
+        );
+        seen[slot] = true;
+    }
+    let missing: Vec<usize> = seen
+        .iter()
+        .enumerate()
+        .filter(|(_, present)| !**present)
+        .map(|(code, _)| code)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "bl_order: bit-length code(s) {missing:?} appear nowhere, so their lengths would never be \
+         transmitted. {BL_ORDER_SOURCE} is a permutation of 0..{BL_CODES}.",
     );
 }
 

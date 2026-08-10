@@ -115,38 +115,51 @@
 //! Recorded explicitly, because the suites under `tests/` are written against it:
 //!
 //! ```text
-//! src/oracle.rs  -> local #[repr(C)] mirrors + extern "C" c_/c_oracle_* declarations, plus safe
-//!                   slice wrappers over the generated tables.
-//!                   The ONLY place in this crate where `unsafe` appears.
-//!                   Depends on nothing outside core/std.
-//! src/lib.rs     -> this file: crate docs + `pub mod oracle;`. No unsafe, no logic.
-//! tests/*.rs     -> import `zlib_rs_differential::oracle::*` (this crate's lib target)
-//!                   PLUS `zlib_rs::*` and `libz_rs_sys::*` (the dev-dependencies).
-//!                   ALL differential, interop and table-equality assertions live there.
-//! benches/*.rs   -> attached here by [[bench]] entries in Cargo.toml, once those files exist.
+//! src/oracle.rs  -> local #[repr(C)] mirrors + extern "C" c_/c_oracle_* declarations, safe slice
+//!                   wrappers over the generated tables, and one safe gate per reference entry
+//!                   point.  ONE of this crate's two files where `unsafe` appears.
+//! src/port.rs    -> one safe gate per libz-rs-sys entry point, the gzFile handle, the
+//!                   inflateBack callback bridge and the instrumented allocator.  THE OTHER.
+//! src/lib.rs     -> this file: crate docs + `pub mod oracle;` and `pub mod port;`.  No unsafe
+//!                   and no logic -- but see the ATTRIBUTES note below for why it still cannot
+//!                   carry `#![forbid(unsafe_code)]`.
+//! build.rs       -> the C oracle build.  No unsafe, and carries `#![forbid(unsafe_code)]`.
+//! tests/*.rs     -> import `zlib_rs_differential::{oracle, port}` (this crate's lib target) and
+//!                   `zlib_rs::*` for the idiomatic surface.  ALL differential, interop and
+//!                   table-equality assertions live there, and every root carries
+//!                   `#![forbid(unsafe_code)]`.
+//! benches/*.rs   -> the three suites attached by the [[bench]] entries in Cargo.toml; same
+//!                   posture as tests/.
 //! ```
 //!
-//! # Dev-dependencies are not available to `src/`
+//! # Both implementations are ordinary dependencies, and the direction of the edge is the point
 //!
-//! This is the one piece of Cargo behaviour that shapes the code rather than just the build, so it
-//! is stated as a warning. `zlib-rs` and `libz-rs-sys` are **dev-dependencies**. Cargo resolves
-//! dev-dependencies for test, example and bench targets but *not* for the crate's own `lib`
-//! target, so no module under `src/` can `use` either of them — a `use libz_rs_sys::…` here or
-//! in [`oracle`] would not compile. Keeping `[dependencies]` empty is precisely what keeps this
-//! crate out of the shipped crates' graphs, so the constraint is the price of the property and not
-//! an oversight to be tidied away.
+//! `zlib-rs` and `libz_rs_sys` sit in `[dependencies]`, not `[dev-dependencies]`, and that is a
+//! requirement rather than a convenience. [`port`] is a module under `src/`, so it belongs to the
+//! `lib` target, and Cargo resolves dev-dependencies for test, example and bench targets but *not*
+//! for the lib target: a `use libz_rs_sys::…` in [`port`] does not compile while the facade is a
+//! dev-dependency. The gates therefore could not have lived under `src/` at all — and they have to
+//! live there, because a boundary spread across every suite that needs it is not a boundary.
 //!
-//! The visible consequence is that [`oracle`] transcribes its own `#[repr(C)]` mirrors of
-//! `z_stream`, `gz_header` and `gzFile_s` instead of re-using the ones in
-//! `crates/libz-rs-sys/src/types.rs`, and **those local mirrors must agree with the facade's
-//! field for field**. Two independent mechanisms hold them to it: compile-time layout assertions
-//! in [`oracle`] that encode the same measured sizes and offsets as
-//! `crates/libz-rs-sys/src/layout_assertions.rs`, and the `c_oracle_ct_data_size` and
-//! `c_oracle_code_size` accessors, which report what the C compiler actually produced rather than
-//! what Rust assumed. `ct_data` has no counterpart in the facade at all — it is an internal
-//! `deflate.h` type, not part of the public ABI — so it could only ever have been declared here.
-//! Should a future change move the two crates into `[dependencies]`, re-using the facade's types
-//! becomes the better answer and these local mirrors should go.
+//! What keeps this crate out of the shipped crates' graphs is not an empty `[dependencies]` table
+//! but the **direction** of the edge. This crate depends on them; neither of them names this crate,
+//! in `[dependencies]`, `[build-dependencies]` or `[dev-dependencies]`. Measured:
+//! `cargo tree -p libz-rs-sys -e normal,build,dev` mentions `zlib-rs-differential` nowhere, so
+//! `cargo build --release -p zlib-rs -p libz-rs-sys` still invokes no C compiler — which is the
+//! property that makes the reference an oracle rather than a build dependency.
+//!
+//! [`oracle`] nevertheless keeps its own `#[repr(C)]` mirrors of `z_stream`, `gz_header` and
+//! `gzFile_s` rather than importing the facade's, and now that it *could* import them the reason is
+//! worth stating plainly rather than leaving as an artefact: **the reference side's view of the ABI
+//! has to be independent of the implementation under test.** One shared set of type definitions
+//! would make a layout error invisible to precisely the comparison that exists to catch it. So
+//! **those local mirrors must agree with the facade's field for field**, and two independent
+//! mechanisms hold them to it: compile-time layout assertions in [`oracle`] that encode the same
+//! measured sizes and offsets as `crates/libz-rs-sys/src/layout_assertions.rs`, and the
+//! `c_oracle_ct_data_size` and `c_oracle_code_size` accessors, which report what the C compiler
+//! actually produced rather than what Rust assumed. `ct_data` has no counterpart in the facade at
+//! all — it is an internal `deflate.h` type, not part of the public ABI — so it could only ever
+//! have been declared here.
 //!
 //! # The facade's import name is `libz_rs_sys`
 //!
@@ -165,7 +178,7 @@
 //! so `cargo test` needs no network, no download and no setup. The Silesia corpus is a second,
 //! opt-in tier used only for throughput measurement: `corpus/fetch_silesia.sh` is run by a human,
 //! deliberately, and by nothing else — not by `cargo test`, not by CI, and from no build script.
-//! Benchmarks are to report and skip when it is absent, with a zero exit status.
+//! Both throughput benchmarks report and skip when it is absent, with a zero exit status.
 //! `corpus/README.md` is the published contract for both tiers.
 //!
 //! # What this crate must never do
@@ -184,51 +197,67 @@
 //!
 //! # Miri and AddressSanitizer
 //!
-//! This crate sits deliberately *outside* the Miri gate and deliberately *inside* the nightly
-//! AddressSanitizer one. Miri interprets Rust MIR and cannot execute compiled C at all, so the
-//! Miri job is scoped to the safe core; the sanitizer job belongs here precisely because this is
-//! where the raw pointers of the FFI boundary and of the C oracle actually meet. Neither posture
+//! This crate sits outside *both* sanitizer gates, for two different reasons, and the distinction
+//! matters because several files describe themselves in terms of these jobs. Miri interprets Rust
+//! MIR and cannot execute compiled C at all, so the Miri job is scoped to the safe core
+//! (`-p zlib-rs`). The nightly AddressSanitizer job is scoped to `-p libz-rs-sys` and the three
+//! relinked C drivers — the split AAP 0.6.4.5 specifies — and it does not select this crate, so
+//! neither these tests nor the three benches attached to this package run under a sanitizer.
+//! What the `unsafe` here gets instead is a `// SAFETY:` comment per block, one gate per entry
+//! point, and a differential comparison that fails loudly when something is wrong. Neither posture
 //! is expressible as a manifest key — both are CI job scopes — so it is recorded here and in
-//! the manifest so that the exclusion reads as intentional rather than something to be corrected.
+//! the manifest, accurately, so that nobody cites a sanitizer this crate is not run under.
 //!
-//! # State of the tree
+//! # Modules, and where `unsafe` lives
 //!
-//! Stated plainly so that nothing above is mistaken for a measurement: `tests/` and `benches/` do
-//! not exist yet. The oracle archive is built, audited and linkable, and [`oracle`]'s own smoke
-//! module proves the renamed C entry points are callable and report the reference's version,
-//! bounds, checksums and tables. Nothing yet compares the two implementations across the
-//! differential matrix. Every claim above about what the differential suites establish therefore
-//! describes the contract they are to satisfy, not a result already in hand.
-//!
-//! # Modules
+//! This crate has to drive two C ABIs — the port's and the reference's — and calling a
+//! pointer-taking `extern "C"` function is an `unsafe` operation whichever side it belongs to.
+//! Both are therefore confined to **exactly two files**, which together are this crate's whole
+//! FFI boundary:
 //!
 //! * [`oracle`] — the C reference surface: `#[repr(C)]` mirrors of the boundary types,
-//!   `extern "C"` declarations for the `c_`-prefixed symbols, and safe accessors for the
-//!   generated tables.
+//!   `extern "C"` declarations for the `c_`-prefixed symbols, safe accessors for the generated
+//!   tables, and one safe gate per reference entry point.
+//! * [`port`] — the port's surface: one safe gate per `libz-rs-sys` entry point, the `gzFile`
+//!   handle, the `inflateBack` callback bridge, and the instrumented allocator both sides are
+//!   driven through.
+//!
+//! Everything else — `build.rs`, every suite in `tests/`, the three attached benches and the five
+//! `fuzz_targets/` — carries `#![forbid(unsafe_code)]`, so "the harness contains no `unsafe`
+//! outside its boundary" is a compiler-enforced property rather than a convention. This file is
+//! the one place the attribute is absent, and it cannot be otherwise: a crate-root `forbid` would
+//! cover the two modules above as well. It holds no code for the attribute to protect — crate
+//! documentation, `pub mod oracle;` and `pub mod port;`, nothing else. See the ATTRIBUTES note
+//! immediately below.
+//! Neither gate module decides anything: they convert shapes, make one call each, and convert the
+//! answer back, which is what keeps a measured difference attributable to the implementations
+//! rather than to the harness.
 
 // ---------------------------------------------------------------------------------------------
 // ATTRIBUTES.  Read the next paragraph before adding one, and in particular before adding the one
 // that is missing.
 //
 // `#![forbid(unsafe_code)]` IS DELIBERATELY ABSENT, and this is not an omission to be helpfully
-// corrected.  A crate-root `forbid` applies to the whole crate, `src/oracle.rs` included, and
-// `oracle.rs` is nothing but `extern "C"` declarations and their call sites -- it is this crate's
-// designated, and only, unsafe surface.  Adding the attribute here would make the crate
-// uncompilable, not safer.  The divergence from `crates/zlib-rs/src/lib.rs`, which does carry
-// `#![forbid(unsafe_code)]` and is a genuinely unsafe-free algorithmic core, is therefore
-// intentional; `crates/libz-rs-sys/src/lib.rs` diverges the same way and for the same reason.
-// Containment is achieved instead by keeping every `unsafe` operation in one small, audited file,
-// each occurrence carrying its own `// SAFETY:` comment -- the workspace lint set denies
-// `clippy::undocumented_unsafe_blocks`, so that is enforced rather than encouraged.  THIS file
-// contains no `unsafe` at all, and must not acquire any: it is a module holder and a document.
+// corrected.  A crate-root `forbid` applies to the whole crate, `src/oracle.rs` and `src/port.rs`
+// included, and those two files are nothing but `extern "C"` declarations, their call sites and the
+// C-ABI callbacks the library invokes -- they are this crate's designated, and only, unsafe
+// surface.  Adding the attribute here would make the crate uncompilable, not safer.  The divergence
+// from `crates/zlib-rs/src/lib.rs`, which does carry `#![forbid(unsafe_code)]` and is a genuinely
+// unsafe-free algorithmic core, is therefore intentional; `crates/libz-rs-sys/src/lib.rs` diverges
+// the same way and for the same reason.  Containment is achieved instead by keeping every `unsafe`
+// operation in those two audited files, each occurrence carrying its own `// SAFETY:` comment --
+// the workspace lint set denies `clippy::undocumented_unsafe_blocks`, so that is enforced rather
+// than encouraged -- and by every OTHER file that exercises them, in `tests/`, `benches/` and
+// `fuzz_targets/`, carrying `#![forbid(unsafe_code)]` itself.  THIS file contains no `unsafe` at
+// all, and must not acquire any: it is a module holder and a document.
 //
 // `#![no_std]` is absent for a simpler reason: this is not the safe core.  The tests do file I/O
 // and the oracle links against libc, so the crate uses `std`.
 // ---------------------------------------------------------------------------------------------
 
 // Mirrors `crates/libz-rs-sys/src/lib.rs`: an `unsafe fn` does not get to be an implicit `unsafe`
-// block, so every unsafe operation inside `oracle.rs` must be individually scoped and individually
-// justified.  Verified to hold: the crate's one `unsafe fn` already wraps its body explicitly.
+// block, so every unsafe operation inside `oracle.rs` and `port.rs` -- the crate's two boundary
+// files -- must be individually scoped and individually justified.
 #![deny(unsafe_op_in_unsafe_fn)]
 // Mirrors both sibling crate roots.  A harness whose whole purpose is to be read by whoever writes
 // the next differential test has no undocumented public items.
@@ -251,3 +280,11 @@
 /// declarations are written in terms of. The mirrors are transcribed from `zlib.h`, `zconf.h`,
 /// `inftrees.h`, `deflate.h` and `zutil.h`; the functions from the translation units themselves.
 pub mod oracle;
+
+/// The port's C ABI, exposed to the harness as safe Rust.
+///
+/// One safe gate per `libz-rs-sys` entry point the suites reach, the [`port::GzFile`] handle that
+/// keeps the opaque `gzFile` pointer out of harness code, the `inflateBack` callback bridge, and
+/// the [`port::TrackingAllocator`] port of `test/infcover.c`'s `mem_zone` that both sides are
+/// driven through. Together with [`oracle`] this is the whole of this crate's `unsafe`.
+pub mod port;

@@ -1,4 +1,5 @@
 #![no_main]
+#![forbid(unsafe_code)]
 //! `fuzz_gz_roundtrip` -- write a payload through the `gzFile` layer, read it back, and
 //! require the bytes to match.
 //!
@@ -30,23 +31,28 @@
 //!    process id, so parallel `-jobs` runs cannot collide and nothing is written into
 //!    `fuzz/` or anywhere else in the tree.
 //!
-//! # Where the `unsafe` is, and why it is here
+//! # Where the `unsafe` is
 //!
-//! `#![forbid(unsafe_code)]` binds the safe core crate `zlib-rs`; this harness exists to
-//! drive the C ABI facade, so raw pointers are unavoidable. They are confined to four
-//! kinds of site, and every block names its invariant:
+//! Not here: this file carries `#![forbid(unsafe_code)]`, which the compiler enforces.
+//! Driving the C ABI does need raw pointers, and every one of them is formed inside
+//! `zlib_rs_differential::port` -- the harness crate's documented FFI boundary -- which is
+//! where the four kinds of site this target reaches are discharged and documented:
 //!
-//! * calling a `gz*` export through a live handle -- discharged by [`Handle`]'s type
-//!   invariant, which is stated once on the type and referenced by each method;
-//! * building NUL-terminated path and mode strings -- the buffer outlives the call and
-//!   contains no interior NUL, which [`nul_terminated`] establishes by construction;
-//! * handing raw buffer/length pairs to `gzread`, `gzwrite`, `gzfread`, `gzfwrite` and
-//!   `gzgets` -- the length always comes from the same slice as the pointer;
-//! * reading the `*const c_char` `gzerror` returns, and the caller-visible `gzFile_s`
-//!   prefix that the `gzgetc` macro mutates in caller object code.
+//! * calling a `gz*` export through a handle, live or `Z_NULL`, which the gates' obligation
+//!   (g) covers and which [`Handle`]'s type invariant below narrows further to "live, and a
+//!   close is still owed";
+//! * building NUL-terminated path and mode strings -- this file produces the bytes with
+//!   [`nul_terminated`], which appends exactly one NUL and refuses an interior one, and
+//!   [`as_cstr`] views them as the `&CStr` a gate takes;
+//! * handing buffer/length pairs to `gzread`, `gzwrite`, `gzfread`, `gzfwrite` and `gzgets`
+//!   -- the gates take slices and derive both halves from the same one;
+//! * reading the `*const c_char` `gzerror` returns, and the caller-visible `gzFile_s` prefix
+//!   that the `gzgetc` macro mutates in caller object code, which `port::GzFile::macro_take`
+//!   reproduces because no amount of encapsulation on this side can change what a C caller's
+//!   own object code does.
 //!
-//! Nothing here defines a function that C calls back into, so there is no unwinding
-//! hazard: the `assert!` macros below are the intended libFuzzer crash-reporting
+//! Nothing anywhere in this path defines a function that C calls back into, so there is no
+//! unwinding hazard: the `assert!` macros below are the intended libFuzzer crash-reporting
 //! mechanism, and a failure is meant to abort the process with a reproducer.
 //!
 //! # Throughput is a design constraint
@@ -70,32 +76,28 @@
 //!   round trip and the documented API contract, nothing about the encoding.
 
 use std::env;
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
+use std::ffi::{c_int, c_uint, c_void, CStr};
 use std::fs::OpenOptions;
 use std::mem::{align_of, offset_of, size_of};
 use std::path::{Path, PathBuf};
-use std::process;
 use std::sync::OnceLock;
 
 #[cfg(unix)]
-use std::fs::File;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::io::{FromRawFd, IntoRawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd};
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 
 use libz_rs_sys::{
-    gzFile, gzFile_s, gzbuffer, gzclearerr, gzclose, gzclose_r, gzclose_w, gzdirect, gzdopen,
-    gzeof, gzerror, gzflush, gzfread, gzfwrite, gzgetc, gzgetc_, gzgets, gzoffset, gzoffset64,
-    gzopen, gzopen64, gzputc, gzputs, gzread, gzrewind, gzseek, gzseek64, gzsetparams, gztell,
-    gztell64, gzungetc, gzwrite, voidp, voidpc, z_off64_t, z_off_t, z_size_t, Z_BEST_COMPRESSION,
-    Z_BLOCK, Z_BUF_ERROR, Z_DATA_ERROR, Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY, Z_ERRNO,
-    Z_FILTERED, Z_FINISH, Z_FIXED, Z_FULL_FLUSH, Z_HUFFMAN_ONLY, Z_NO_COMPRESSION, Z_NO_FLUSH,
-    Z_OK, Z_PARTIAL_FLUSH, Z_RLE, Z_STREAM_ERROR, Z_SYNC_FLUSH,
+    gzFile_s, z_off64_t, z_off_t, z_size_t, Z_BEST_COMPRESSION, Z_BLOCK, Z_BUF_ERROR, Z_DATA_ERROR,
+    Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY, Z_ERRNO, Z_FILTERED, Z_FINISH, Z_FIXED,
+    Z_FULL_FLUSH, Z_HUFFMAN_ONLY, Z_NO_COMPRESSION, Z_NO_FLUSH, Z_OK, Z_PARTIAL_FLUSH, Z_RLE,
+    Z_STREAM_ERROR, Z_SYNC_FLUSH,
 };
+use zlib_rs_differential::port::GzFile;
 
 // ---------------------------------------------------------------------------
 //  Bounds -- every one of these exists to keep the 300-second budget useful
@@ -222,18 +224,79 @@ const _: () = assert!(MAX_PAYLOAD < c_int::MAX as usize);
 /// `-D warnings`. `LazyLock` is deliberately not used.
 static SCRATCH_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-/// The one file this target reads and writes, in the OS temporary directory.
+/// The one file this target reads and writes, inside a private directory of its own.
 ///
-/// The process id is part of the name so that `cargo fuzz run -jobs=N` cannot have two
-/// workers fighting over one file. The name is otherwise fixed, because a fresh name per
-/// iteration would mean a create and an unlink per iteration and would put this target's
-/// throughput in the tens of executions per second instead of the hundreds.
+/// ★ THE DIRECTORY IS UNGUESSABLE AND OWNER-ONLY; THE FILE NAME INSIDE IT IS FIXED. The
+/// earlier form was `<temp dir>/zlib-rs-fuzz-gz-<pid>.gz` opened non-exclusively with
+/// truncation, and in a shared temporary directory that is two problems. A process id is
+/// neither secret nor unpredictable -- it is visible in `/proc`, drawn from a small space and
+/// reused -- so another user on the machine can precreate that path, or plant a symlink or a
+/// directory at it, and `gzopen(.., "wb")` (an `open()` with `O_CREAT` and no `O_EXCL`) then
+/// follows it and writes wherever it points. Worse for a fuzz target: a planted *directory* at
+/// that path makes every open fail, which before [`preflight`] existed was a green
+/// 300-second run that exercised nothing.
 ///
-/// This must never resolve inside the repository: `fuzz/artifacts/` and `fuzz/corpus/` are
-/// gitignored runtime areas and the rest of the tree is source.
+/// So the security property is carried by the directory, exactly as
+/// `crates/libz-rs-sys/tests/c_api_parity.rs` carries it:
+///
+/// * **Unguessable** -- 128 bits from two OS-seeded [`RandomState`] draws, which also removes
+///   the `-jobs=N` collision the process id was there for.
+/// * **Owner-only in the same syscall that creates it** -- `mode(0o700)` on the
+///   [`DirBuilder`], not a create followed by a `chmod` that leaves a window open.
+/// * **Exclusively** -- `create` is the non-recursive form, so an existing path is refused
+///   rather than adopted, and nothing here removes a path it did not itself create.
+///
+/// Nothing can pre-exist inside a directory this process just created empty, so the fixed file
+/// name inside it is safe and the `"wb"` truncating open has nothing to be tricked by. The name
+/// stays fixed rather than per-iteration because a create and an unlink per iteration would put
+/// this target's throughput in the tens of executions per second instead of the hundreds.
+///
+/// This never resolves inside the repository: [`preflight`] asserts that, and the temporary
+/// directory is where the draw is rooted.
+///
+/// Panicking on failure is right, and is the same judgement [`preflight`] documents: an
+/// unusable temporary directory makes every iteration a no-op, and this runs on the
+/// `fuzz_target!` body's own stack rather than inside a callback the library invokes, so
+/// nothing unwinds across the FFI edge.
 fn scratch_path() -> &'static Path {
+    /// How many unguessable names to try before giving up.
+    const ATTEMPTS: usize = 16;
+
     SCRATCH_PATH
-        .get_or_init(|| env::temp_dir().join(format!("zlib-rs-fuzz-gz-{}.gz", process::id())))
+        .get_or_init(|| {
+            use std::hash::{BuildHasher, RandomState};
+            #[cfg(unix)]
+            use std::os::unix::fs::DirBuilderExt;
+
+            let base = env::temp_dir();
+            for _ in 0..ATTEMPTS {
+                // Two independent OS-seeded draws, so the name carries 128 bits rather than 64.
+                let high = u128::from(RandomState::new().hash_one(0_u64));
+                let low = u128::from(RandomState::new().hash_one(u64::MAX));
+                let dir = base.join(format!("zlib-rs-fuzz-gz-{:032x}", (high << 64) | low));
+
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(false);
+                #[cfg(unix)]
+                builder.mode(0o700);
+
+                match builder.create(&dir) {
+                    Ok(()) => return dir.join("round-trip.gz"),
+                    // Someone holds that name. Draw another; nothing is removed.
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => panic!(
+                        "cannot create a private scratch directory under {base}: {error}; \
+                         every iteration of this target would be a no-op, so set TMPDIR to a \
+                         writable directory",
+                        base = base.display()
+                    ),
+                }
+            }
+            panic!(
+                "{ATTEMPTS} unguessable names under {base} were all taken",
+                base = base.display()
+            )
+        })
         .as_path()
 }
 
@@ -269,6 +332,127 @@ fn prepare_scratch(path: &Path, remove: bool) -> Option<bool> {
     }
 }
 
+/// Proof, obtained once per process, that this target can actually do the thing it fuzzes.
+///
+/// ★ Without this every environment failure is indistinguishable from a clean run.
+/// [`attempt`]'s result is discarded by the `fuzz_target!` body -- deliberately, because a
+/// fuzzer-chosen mode string that the grammar refuses is an ordinary outcome and not a crash.
+/// But the same `None` also carries "the temporary directory is read-only", "it is full", and
+/// "this path cannot be expressed as a C string", and those are not ordinary outcomes: they
+/// make *every* iteration a no-op. A mandatory `-max_total_time=300` job would then run to
+/// completion, report success, and have exercised no gz round trip whatsoever -- the worst
+/// kind of green, because it is indistinguishable from the real thing.
+///
+/// So the environment is proven up front instead of being hoped for, and a failure here is a
+/// panic rather than a `None`. That is a safe place to panic: this runs on the `fuzz_target!`
+/// body's own stack, never inside a callback the library invokes, so nothing unwinds across
+/// the FFI edge.
+///
+/// The check is deliberately not a partial one. It resolves the path, insists the path is
+/// expressible, creates and truncates the file, then performs a complete `gzopen`/`gzwrite`/
+/// `gzclose` -> `gzopen`/`gzread`/`gzclose` cycle through the library under test and compares
+/// the bytes, and finally unlinks. Every filesystem operation the target depends on is
+/// therefore exercised before the first fuzz iteration -- including the unlink that the
+/// exclusive-create (`x`) path needs -- and passing it means at least one genuine gz round
+/// trip has provably happened in this process.
+///
+/// Mid-run refusals are still tolerated the way [`Opened::Environment`] describes: a
+/// filesystem that fills up half way through should not manufacture a crash reproducer that
+/// says nothing about the library. What is no longer tolerated is starting from an
+/// environment that never worked at all.
+static PREFLIGHT: OnceLock<()> = OnceLock::new();
+
+/// The bytes the preflight round-trips. Long enough to cross a deflate block boundary rather
+/// than sit entirely in the pending buffer, and fixed so the comparison is exact.
+const PREFLIGHT_PAYLOAD: &[u8] = b"zlib-rs gz round trip preflight; if you can read this back \
+the scratch directory works and the gz layer is wired up.";
+
+fn preflight() {
+    PREFLIGHT.get_or_init(|| {
+        let path = scratch_path();
+
+        // The doc on `scratch_path` promises this never lands in the repository; nothing
+        // enforced it until now. A scratch file inside the tree would be a dirty working
+        // copy at best and a clobbered source file at worst.
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            !path.starts_with(repo),
+            "the scratch path {} resolved inside the repository at {}; \
+             set TMPDIR to a writable directory outside the tree",
+            path.display(),
+            repo.display(),
+        );
+
+        let path_c = path_bytes(path).unwrap_or_else(|| {
+            panic!(
+                "the scratch path {} cannot be expressed as a NUL-terminated C string, so \
+                 gzopen can never be handed it and every iteration would be a no-op; set \
+                 TMPDIR to a path that is valid Unicode and free of interior NULs",
+                path.display(),
+            )
+        });
+        assert!(
+            prepare_scratch(path, false).is_some(),
+            "the scratch file {} could not be created or truncated; the temporary directory \
+             is unwritable or full, so no iteration of this target could do any work -- fix \
+             the environment or set TMPDIR",
+            path.display(),
+        );
+
+        // The two mode strings and the payload go through the gates in
+        // `zlib_rs_differential::port`, where the raw pointers and their invariants live. This
+        // file carries `#![forbid(unsafe_code)]`, so that is not a style choice: a raw
+        // `gzopen`/`gzwrite`/`gzread`/`gzclose` sequence here would not compile.
+        let write_mode = c"wb6";
+        let read_mode = c"rb";
+        let path_cstr = CStr::from_bytes_with_nul(&path_c)
+            .expect("path_bytes appends the one NUL and rejects interior ones");
+        let written = i32::try_from(PREFLIGHT_PAYLOAD.len()).expect("the payload is small");
+
+        let file = GzFile::open(path_cstr, write_mode);
+        assert!(
+            !file.is_null(),
+            "gzopen({}, \"wb6\") returned Z_NULL during preflight; the temporary \
+             directory is not usable for writing",
+            path.display(),
+        );
+        let put = file.write(PREFLIGHT_PAYLOAD);
+        assert_eq!(
+            put, written,
+            "gzwrite accepted {put} of {written} preflight bytes"
+        );
+        assert_eq!(file.close(), Z_OK, "gzclose after the preflight write");
+
+        let file = GzFile::open(path_cstr, read_mode);
+        assert!(
+            !file.is_null(),
+            "gzopen({}, \"rb\") returned Z_NULL during preflight; the file just written \
+             cannot be read back",
+            path.display(),
+        );
+        let mut back = vec![0_u8; PREFLIGHT_PAYLOAD.len() + 1];
+        let got = file.read(&mut back);
+        assert_eq!(
+            got, written,
+            "gzread returned {got} bytes for the {written} written during preflight"
+        );
+        assert_eq!(file.close(), Z_OK, "gzclose after the preflight read");
+        assert!(
+            back[..PREFLIGHT_PAYLOAD.len()] == *PREFLIGHT_PAYLOAD,
+            "the preflight round trip did not reproduce its own payload"
+        );
+
+        // The unlink the exclusive-create path depends on, proven here rather than discovered
+        // by an iteration that would have silently given up.
+        assert!(
+            prepare_scratch(path, true).is_some(),
+            "the scratch file {} could not be removed; the `x` exclusive-create mode could \
+             never reach its success path",
+            path.display(),
+        );
+    });
+}
+
 /// The scratch path as the NUL-terminated bytes `gzopen` wants.
 ///
 /// Unix hands the bytes over unchanged, exactly as C does -- a path is a byte string there
@@ -299,6 +483,25 @@ fn nul_terminated(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(owned)
 }
 
+/// Views a buffer [`nul_terminated`] produced as the `&CStr` the boundary gates take.
+///
+/// Total for every buffer that function produces: it appends exactly one NUL and refuses an
+/// interior one, which is precisely `CStr::from_bytes_with_nul`'s precondition. So a failure
+/// here would be a defect in this file rather than in the library, and reporting a defect in
+/// this file as a crash is what a fuzz target's body is for.
+///
+/// # Panics
+///
+/// Panics if `bytes` is not a single NUL-terminated C string.
+fn as_cstr(bytes: &[u8]) -> &CStr {
+    match CStr::from_bytes_with_nul(bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            panic!("nul_terminated produced a buffer that is not a C string: {error}")
+        }
+    }
+}
+
 /// Widens a length to the `z_off64_t` the gz layer reports positions in.
 ///
 /// Saturating rather than panicking: every length here is bounded by [`MAX_PAYLOAD`] plus at
@@ -306,11 +509,6 @@ fn nul_terminated(bytes: &[u8]) -> Option<Vec<u8>> {
 /// that fact from becoming a panic on some target where `usize` were wider.
 fn as_off64(value: usize) -> z_off64_t {
     z_off64_t::try_from(value).unwrap_or(z_off64_t::MAX)
-}
-
-/// Narrows a length to the `unsigned` that `gzread` and `gzwrite` take.
-fn as_uint(value: usize) -> c_uint {
-    c_uint::try_from(value).unwrap_or(c_uint::MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -835,20 +1033,19 @@ impl<'a> OpStream<'a> {
 }
 
 // ---------------------------------------------------------------------------
-//  The handle: where all of this target's unsafe lives
+//  The handle: this target's one owned resource
 // ---------------------------------------------------------------------------
 
 /// A live `gzFile` owned by this harness.
 ///
 /// # Type invariant
 ///
-/// `raw` is non-null and was produced by one of this target's own `gzopen`, `gzopen64` or
-/// `gzdopen` calls, and no `gzclose*` has yet succeeded on it. Every `unsafe` block below
-/// rests on exactly that, which is why the invariant is stated once here and referred to
-/// rather than restated at each of the thirty-odd call sites. It is established at
-/// construction -- [`Handle::adopt`] is the only constructor and it rejects null -- and
-/// preserved because the only thing that can invalidate it, a successful close, consumes the
-/// right to call anything else.
+/// `raw` is non-null and came from one of this target's own `gzopen`, `gzopen64` or `gzdopen`
+/// gates, and no `gzclose*` has yet succeeded on it. That is stronger than the gates' own
+/// obligation (g), which also admits `Z_NULL`, and it is what makes every method below a call
+/// on a stream that really exists. It is established at construction -- [`Handle::adopt`] is
+/// the only constructor and it rejects null -- and preserved because the only thing that can
+/// invalidate it, a successful close, consumes the right to call anything else.
 ///
 /// `open` records whether a close is still owed. [`Handle::close_as`] clears it and hands
 /// back the return code so it can be asserted on; [`Drop`] closes whatever is still open, so
@@ -857,7 +1054,7 @@ impl<'a> OpStream<'a> {
 /// `EMFILE` a few thousand executions into a run and reads exactly like a library defect.
 struct Handle {
     /// The handle itself, non-null by the type invariant.
-    raw: gzFile,
+    raw: GzFile,
     /// Whether a `gzclose*` is still owed.
     open: bool,
 }
@@ -875,7 +1072,7 @@ enum CloseWith {
 
 impl Handle {
     /// Takes ownership of a handle a `gz*open` call produced, or [`None`] for `Z_NULL`.
-    fn adopt(raw: gzFile) -> Option<Self> {
+    fn adopt(raw: GzFile) -> Option<Self> {
         if raw.is_null() {
             None
         } else {
@@ -887,42 +1084,31 @@ impl Handle {
 
     /// `gzbuffer(file, size)` -- `gzlib.c` L322-L343. Zero on success, -1 on refusal.
     fn buffer(&self, size: c_uint) -> c_int {
-        // SAFETY: the type invariant; `size` is a plain integer and carries no obligation.
-        unsafe { gzbuffer(self.raw, size) }
+        self.raw.buffer(size)
     }
 
     /// `gzsetparams(file, level, strategy)` -- `gzwrite.c` L630-L665.
     fn setparams(&self, level: c_int, strategy: c_int) -> c_int {
-        // SAFETY: the type invariant; both arguments are plain integers.
-        unsafe { gzsetparams(self.raw, level, strategy) }
+        self.raw.setparams(level, strategy)
     }
 
     // -- writing ------------------------------------------------------------
 
     /// `gzwrite(file, buf, len)` -- `gzwrite.c` L255-L277. Byte count, or zero on error.
     fn write(&self, bytes: &[u8]) -> c_int {
-        let buf: voidpc = bytes.as_ptr().cast::<c_void>();
-        // SAFETY: the type invariant, plus the buffer/length obligation: `buf` and the
-        // length come from the same slice, so `len` bytes are readable at `buf` for the
-        // duration of the call, and `bytes` is a separate allocation from the handle's state
-        // so the two cannot alias.
-        unsafe { gzwrite(self.raw, buf, as_uint(bytes.len())) }
+        self.raw.write(bytes)
     }
 
     /// `gzfwrite(buf, size, nitems, file)` -- `gzwrite.c` L279-L303. Full items written.
     fn fwrite(&self, bytes: &[u8], size: z_size_t) -> z_size_t {
-        let buf: voidpc = bytes.as_ptr().cast::<c_void>();
-        let items: z_size_t = bytes.len() / size;
-        // SAFETY: the type invariant, plus the buffer/length obligation: `size * items` is
-        // `bytes.len()` rounded down, so the region the call reads is inside the slice the
-        // pointer came from, and the slice cannot alias the handle's state.
-        unsafe { gzfwrite(buf, size, items, self.raw) }
+        // `size * items` is `bytes.len()` rounded down, so the region the call reads is inside
+        // the slice, which is what the gate requires of the two factors it is given.
+        self.raw.fwrite_items(bytes, size, bytes.len() / size)
     }
 
     /// `gzputc(file, c)` -- `gzwrite.c` L305-L344. Returns `c & 0xff`, or -1 on error.
     fn putc(&self, byte: u8) -> c_int {
-        // SAFETY: the type invariant; the byte is passed by value.
-        unsafe { gzputc(self.raw, c_int::from(byte)) }
+        self.raw.putc(c_int::from(byte))
     }
 
     /// `gzputs(file, s)` -- `gzwrite.c` L346-L369. Writes `strlen(s)` bytes.
@@ -936,39 +1122,27 @@ impl Handle {
             Some(&0),
             "gzputs needs a NUL-terminated buffer"
         );
-        let ptr: *const c_char = text.as_ptr().cast::<c_char>();
-        // SAFETY: the type invariant, plus the C-string obligation: `text` outlives the call
-        // and its final byte is a NUL, so the scan `gzputs` performs stays inside it.
-        unsafe { gzputs(self.raw, ptr) }
+        self.raw.puts(as_cstr(text))
     }
 
     /// `gzflush(file, flush)` -- `gzwrite.c` L603-L627.
     fn flush(&self, flush: c_int) -> c_int {
-        // SAFETY: the type invariant; `flush` is a plain integer and the call validates its
-        // range itself (`gzwrite.c` L616-L617).
-        unsafe { gzflush(self.raw, flush) }
+        // The call validates `flush`'s range itself (`gzwrite.c` L616-L617).
+        self.raw.flush(flush)
     }
 
     // -- reading ------------------------------------------------------------
 
     /// `gzread(file, buf, len)` -- `gzread.c` L395-L436. Byte count, zero at end, -1 on error.
     fn read(&self, into: &mut [u8]) -> c_int {
-        let buf: voidp = into.as_mut_ptr().cast::<c_void>();
-        // SAFETY: the type invariant, plus the buffer/length obligation: `buf` and the length
-        // come from the same mutable slice, so `len` bytes are writable at `buf`, and an
-        // exclusive borrow of `into` means nothing else can observe the region while the call
-        // writes it.
-        unsafe { gzread(self.raw, buf, as_uint(into.len())) }
+        self.raw.read(into)
     }
 
     /// `gzfread(buf, size, nitems, file)` -- `gzread.c` L438-L465. Full items read.
     fn fread(&self, into: &mut [u8], size: z_size_t) -> z_size_t {
-        let buf: voidp = into.as_mut_ptr().cast::<c_void>();
-        let items: z_size_t = into.len() / size;
-        // SAFETY: the type invariant, plus the buffer/length obligation: `size * items` is at
-        // most `into.len()`, so the region written is inside the slice the pointer came from,
-        // held under an exclusive borrow.
-        unsafe { gzfread(buf, size, items, self.raw) }
+        // `size * items` is at most `into.len()`, which is what the gate requires.
+        let items = into.len() / size;
+        self.raw.fread_items(into, size, items)
     }
 
     /// `gzgets(file, buf, len)` -- `gzread.c` L565-L624.
@@ -977,23 +1151,15 @@ impl Handle {
     /// only two answers, `buf` or `NULL` (L620-L623), and anything else would be a defect, so
     /// the identity is checked here where the pointer is still in scope.
     fn gets(&self, into: &mut [u8]) -> bool {
-        let ptr: *mut c_char = into.as_mut_ptr().cast::<c_char>();
-        let len = c_int::try_from(into.len()).unwrap_or(c_int::MAX);
-        // SAFETY: the type invariant, plus the buffer/length obligation: `len` is `into`'s
-        // own length, so the NUL-terminated string the call writes stays inside the slice,
-        // which is held under an exclusive borrow.
-        let returned = unsafe { gzgets(self.raw, ptr, len) };
-        assert!(
-            returned == ptr || returned.is_null(),
-            "gzgets must answer with the caller's buffer or NULL, nothing else"
-        );
-        !returned.is_null()
+        // The gate holds the call to the two answers the contract admits -- the caller's own
+        // buffer or `NULL` -- because the returned pointer is only comparable while it is still
+        // in scope, which is inside the gate and not here.
+        self.raw.gets(into).is_some()
     }
 
     /// `gzgetc(file)` -- `gzread.c` L473-L498, the function form of the macro.
     fn getc(&self) -> c_int {
-        // SAFETY: the type invariant.
-        unsafe { gzgetc(self.raw) }
+        self.raw.getc()
     }
 
     /// `gzgetc_(file)` -- `gzread.c` L500-L502.
@@ -1002,71 +1168,60 @@ impl Handle {
     /// address before the macro existed. Nothing else in the suite calls it, so it is called
     /// here.
     fn getc_(&self) -> c_int {
-        // SAFETY: the type invariant.
-        unsafe { gzgetc_(self.raw) }
+        self.raw.getc_()
     }
 
     /// `gzungetc(c, file)` -- `gzread.c` L504-L563.
     fn ungetc(&self, byte: c_int) -> c_int {
-        // SAFETY: the type invariant; the byte is passed by value.
-        unsafe { gzungetc(byte, self.raw) }
+        self.raw.ungetc(byte)
     }
 
     // -- position and state -------------------------------------------------
 
     /// `gzseek64(file, offset, whence)` -- `gzlib.c` L367-L433.
     fn seek(&self, offset: z_off64_t, whence: c_int) -> z_off64_t {
-        // SAFETY: the type invariant; both arguments are plain integers and the call
-        // validates `whence` itself.
-        unsafe { gzseek64(self.raw, offset, whence) }
+        // The call validates `whence` itself.
+        self.raw.seek64(offset, whence)
     }
 
     /// `gzseek(file, offset, whence)` -- `gzlib.c` L435-L441, the narrow form.
     fn seek_narrow(&self, offset: z_off_t, whence: c_int) -> z_off_t {
-        // SAFETY: the type invariant; both arguments are plain integers.
-        unsafe { gzseek(self.raw, offset, whence) }
+        self.raw.seek(offset, whence)
     }
 
     /// `gzrewind(file)` -- `gzlib.c` L346-L365.
     fn rewind(&self) -> c_int {
-        // SAFETY: the type invariant.
-        unsafe { gzrewind(self.raw) }
+        self.raw.rewind()
     }
 
     /// `gztell64(file)` -- `gzlib.c` L443-L457.
     fn tell(&self) -> z_off64_t {
-        // SAFETY: the type invariant.
-        unsafe { gztell64(self.raw) }
+        self.raw.tell64()
     }
 
     /// `gztell(file)` -- `gzlib.c` L459-L465, the narrow form.
     fn tell_narrow(&self) -> z_off_t {
-        // SAFETY: the type invariant.
-        unsafe { gztell(self.raw) }
+        self.raw.tell()
     }
 
     /// `gzoffset64(file)` -- `gzlib.c` L467-L483.
     fn offset(&self) -> z_off64_t {
-        // SAFETY: the type invariant.
-        unsafe { gzoffset64(self.raw) }
+        self.raw.offset64()
     }
 
     /// `gzoffset(file)` -- `gzlib.c` L485-L491, the narrow form.
     fn offset_narrow(&self) -> z_off_t {
-        // SAFETY: the type invariant.
-        unsafe { gzoffset(self.raw) }
+        self.raw.offset()
     }
 
     /// `gzeof(file)` -- `gzlib.c` L493-L506. Reports `past`, not `eof`.
     fn eof(&self) -> c_int {
-        // SAFETY: the type invariant.
-        unsafe { gzeof(self.raw) }
+        self.raw.eof()
     }
 
     /// `gzdirect(file)` -- `gzread.c` L626-L640.
     fn direct(&self) -> c_int {
-        // SAFETY: the type invariant.
-        unsafe { gzdirect(self.raw) }
+        self.raw.direct()
     }
 
     /// `gzerror(file, &errnum)` -- `gzlib.c` L508-L525.
@@ -1075,20 +1230,13 @@ impl Handle {
     /// the NUL rather than as UTF-8: it is built from the path (`gzlib.c` L577-L586) and a
     /// path is an arbitrary byte string on Unix.
     fn error(&self) -> Option<(c_int, Vec<u8>)> {
-        let mut errnum: c_int = Z_OK;
-        let slot: *mut c_int = &mut errnum;
-        // SAFETY: the type invariant, plus `slot` addressing a live, writable `c_int` local
-        // that outlives the call.
-        let message = unsafe { gzerror(self.raw, slot) };
-        if message.is_null() {
-            return None;
-        }
-        // SAFETY: the returned pointer is owned by the stream and, per `zlib.h` L1779-L1789,
-        // stays valid until the next gz call on it; it is either a `'static` literal or the
-        // stream's own NUL-terminated message buffer. It is copied out immediately, before any
-        // further call can replace it.
-        let bytes = unsafe { CStr::from_ptr(message) }.to_bytes().to_vec();
-        Some((errnum, bytes))
+        // `Z_OK` as the sentinel the gate initialises `errnum` to, which is what this target
+        // wants: it asserts on the code only where the contract fixes it, and a stream with no
+        // error reports `Z_OK` either way. The message comes back copied, so nothing outlives
+        // the window `zlib.h` L1779-L1789 gives it, and [`None`] is C's null return -- a null
+        // or wrongly-moded handle -- which is distinct from `Some` with an empty message.
+        let (errnum, message) = self.raw.error(Z_OK);
+        message.map(|bytes| (errnum, bytes))
     }
 
     /// `gzerror(file, NULL)` -- the form that asks only for the message.
@@ -1096,28 +1244,26 @@ impl Handle {
     /// `gzlib.c` L521-L522 makes the out-parameter optional, and nothing else exercises the
     /// null form.
     fn error_message_only(&self) -> bool {
-        // SAFETY: the type invariant; a null `errnum` is explicitly permitted, and is not
-        // dereferenced.
-        let message = unsafe { gzerror(self.raw, std::ptr::null_mut()) };
-        !message.is_null()
+        self.raw.error_message_only()
     }
 
     /// `gzclearerr(file)` -- `gzlib.c` L530-L547.
     fn clearerr(&self) {
-        // SAFETY: the type invariant.
-        unsafe { gzclearerr(self.raw) };
+        self.raw.clearerr();
     }
 
     // -- the caller-visible prefix -----------------------------------------
 
-    /// A copy of the caller-visible `gzFile_s` prefix.
-    fn prefix(&self) -> gzFile_s {
-        // SAFETY: the type invariant, plus the contract that makes the `gzgetc` macro legal
-        // at all: `zlib.h` L1956-L1960 publishes these three fields, `gzguts.h` L169-L172
-        // places them at offset 0 of the real state, and the assertions at the top of this
-        // file pin their offsets. Every one of the 24 bytes read is initialised, the read
-        // takes no borrow, and the copy cannot alias anything.
-        unsafe { *self.raw }
+    /// The caller-visible `gzFile_s` prefix, as `(have, next_is_non_null, pos)`.
+    ///
+    /// The gate reports `next` as a boolean rather than as a pointer, which is all this target
+    /// needs of it: what is asserted is that `have` and `pos` move together, and a raw address
+    /// is not a property any assertion here could compare. Reading the prefix at all rests on
+    /// the contract that makes the `gzgetc` macro legal -- `zlib.h` L1956-L1960 publishes the
+    /// three fields and `gzguts.h` L169-L172 places them at offset 0 of the real state -- which
+    /// the assertions at the top of this file pin independently.
+    fn prefix(&self) -> Option<(c_uint, bool, z_off64_t)> {
+        self.raw.prefix()
     }
 
     /// Consumes one byte exactly as the `gzgetc` **macro** does.
@@ -1131,25 +1277,7 @@ impl Handle {
     /// Nothing past the 24-byte prefix is touched; everything after it is the port's private
     /// state and is out of contract.
     fn macro_take(&self) -> Option<u8> {
-        let prefix = self.prefix();
-        if prefix.have == 0 || prefix.next.is_null() {
-            return None;
-        }
-        // SAFETY: `have` is non-zero, which is the library's own statement that `have` bytes
-        // are readable at `next` (`gzguts.h` L173); one of them therefore is.
-        let byte = unsafe { *prefix.next };
-        // SAFETY: the type invariant and the pinned offsets, as for `prefix`. `next.add(1)`
-        // is in bounds because `have >= 1` means at least one byte plus the one-past-the-end
-        // position are within the library's output buffer, and the three writes together are
-        // the macro's own single-byte step, so they leave the prefix in the coherent state
-        // `GzState::resync_from_exposed` requires: the cursor advances by exactly the amount
-        // `have` shrinks by.
-        unsafe {
-            (*self.raw).have = prefix.have - 1;
-            (*self.raw).next = prefix.next.add(1);
-            (*self.raw).pos = prefix.pos.wrapping_add(1);
-        }
-        Some(byte)
+        self.raw.macro_take()
     }
 
     // -- closing ------------------------------------------------------------
@@ -1158,14 +1286,12 @@ impl Handle {
     fn close_as(&mut self, which: CloseWith) -> c_int {
         assert!(self.open, "close_as must not be called twice on one handle");
         self.open = false;
-        // SAFETY: the type invariant -- this is the one call permitted to end it, and `open`
-        // has already been cleared so neither `Drop` nor a second `close_as` can repeat it.
-        unsafe {
-            match which {
-                CloseWith::Dispatch => gzclose(self.raw),
-                CloseWith::Reader => gzclose_r(self.raw),
-                CloseWith::Writer => gzclose_w(self.raw),
-            }
+        // `open` is cleared first, so neither `Drop` nor a second `close_as` can repeat the one
+        // close the type invariant permits.
+        match which {
+            CloseWith::Dispatch => self.raw.close(),
+            CloseWith::Reader => self.raw.close_r(),
+            CloseWith::Writer => self.raw.close_w(),
         }
     }
 
@@ -1177,15 +1303,13 @@ impl Handle {
     /// That is why this takes `&self` and leaves `open` set.
     fn close_mismatched(&self, which: CloseWith) -> c_int {
         assert!(self.open, "close_mismatched needs a live handle");
-        // SAFETY: the type invariant. The call is a refusal that returns before touching the
-        // state, so the invariant survives it and the owed close is still owed.
-        unsafe {
-            match which {
-                CloseWith::Reader => gzclose_r(self.raw),
-                CloseWith::Writer => gzclose_w(self.raw),
-                CloseWith::Dispatch => {
-                    unreachable!("gzclose dispatches on the mode and is never mismatched")
-                }
+        // The call is a refusal that returns before touching the state, so the type invariant
+        // survives it and the owed close is still owed.
+        match which {
+            CloseWith::Reader => self.raw.close_r(),
+            CloseWith::Writer => self.raw.close_w(),
+            CloseWith::Dispatch => {
+                unreachable!("gzclose dispatches on the mode and is never mismatched")
             }
         }
     }
@@ -1195,12 +1319,10 @@ impl Drop for Handle {
     fn drop(&mut self) {
         if self.open {
             self.open = false;
-            // SAFETY: the type invariant -- `raw` is a live handle from this target's own
-            // open path that has not been closed -- and `gzclose` is the dispatching form, so
-            // it is right for either direction. The code is discarded because a drop reached
-            // by an early return has nothing to assert; the point is that the descriptor and
-            // the state are released rather than leaked.
-            let _ = unsafe { gzclose(self.raw) };
+            // `gzclose` is the dispatching form, so it is right for either direction. The code
+            // is discarded because a drop reached by an early return has nothing to assert; the
+            // point is that the descriptor and the state are released rather than leaked.
+            let _ = self.raw.close();
         }
     }
 }
@@ -1325,19 +1447,17 @@ fn open_stream(
 }
 
 /// `gzopen` or `gzopen64` on a NUL-terminated path.
-fn named_open(path_c: &[u8], mode_c: &[u8], kind: OpenKind) -> gzFile {
-    let path_ptr: *const c_char = path_c.as_ptr().cast::<c_char>();
-    let mode_ptr: *const c_char = mode_c.as_ptr().cast::<c_char>();
-    // SAFETY: the C-string obligation, and nothing else -- neither argument is retained past
-    // the call. Both buffers come from `nul_terminated`, so each ends in a NUL and contains no
-    // interior one, and both outlive this call because the caller owns them for the whole
+fn named_open(path_c: &[u8], mode_c: &[u8], kind: OpenKind) -> GzFile {
+    // Neither argument is retained past the call. Both buffers come from `nul_terminated`, so
+    // each ends in a NUL and contains no interior one -- which is exactly what makes [`as_cstr`]
+    // total for them -- and both outlive this call because the caller owns them for the whole
     // iteration.
-    unsafe {
-        if kind == OpenKind::Named64 {
-            gzopen64(path_ptr, mode_ptr)
-        } else {
-            gzopen(path_ptr, mode_ptr)
-        }
+    let path = as_cstr(path_c);
+    let mode = as_cstr(mode_c);
+    if kind == OpenKind::Named64 {
+        GzFile::open64(path, mode)
+    } else {
+        GzFile::open(path, mode)
     }
 }
 
@@ -1348,7 +1468,7 @@ fn named_open(path_c: &[u8], mode_c: &[u8], kind: OpenKind) -> gzFile {
 /// by reconstructing the [`File`] and dropping it on failure. Doing both, or neither, is the
 /// classic way to turn this call into either a double close or a leak.
 #[cfg(unix)]
-fn descriptor_open(path: &Path, mode_c: &[u8], spec: Option<ModeSpec>) -> Option<gzFile> {
+fn descriptor_open(path: &Path, mode_c: &[u8], spec: Option<ModeSpec>) -> Option<GzFile> {
     let spec = spec?;
     let mut options = OpenOptions::new();
     match spec.direction {
@@ -1363,17 +1483,16 @@ fn descriptor_open(path: &Path, mode_c: &[u8], spec: Option<ModeSpec>) -> Option
         }
     }
     let file = options.open(path).ok()?;
-    let fd = file.into_raw_fd();
-    let mode_ptr: *const c_char = mode_c.as_ptr().cast::<c_char>();
-    // SAFETY: the C-string obligation on `mode_c`, as in `named_open`, plus the descriptor
-    // obligation: `fd` was just produced by `into_raw_fd`, so it is open and this is its only
-    // owner, and ownership passes to the library exactly once.
-    let raw = unsafe { gzdopen(fd, mode_ptr) };
+    // Held as an `OwnedFd` rather than as a bare number, so that both outcomes are expressed by
+    // ownership instead of by a raw reconstruction: on failure the `OwnedFd` is dropped and
+    // closes the descriptor, and on success `into_raw_fd` releases ownership without closing it,
+    // which is what hands it to the library exactly once.
+    let owned = OwnedFd::from(file);
+    let raw = GzFile::dopen(owned.as_raw_fd(), as_cstr(mode_c));
     if raw.is_null() {
-        // SAFETY: `gzdopen` answered NULL, and it is documented never to close `fd` on that
-        // path, so this harness still owns the descriptor and no other `File` wraps it.
-        // Rebuilding one and dropping it is the only way to give it back.
-        drop(unsafe { File::from_raw_fd(fd) });
+        drop(owned);
+    } else {
+        let _ = owned.into_raw_fd();
     }
     Some(raw)
 }
@@ -1382,7 +1501,7 @@ fn descriptor_open(path: &Path, mode_c: &[u8], spec: Option<ModeSpec>) -> Option
 /// produce, so the descriptor path is simply unavailable and the caller falls back to a named
 /// open.
 #[cfg(not(unix))]
-fn descriptor_open(_path: &Path, _mode_c: &[u8], _spec: Option<ModeSpec>) -> Option<gzFile> {
+fn descriptor_open(_path: &Path, _mode_c: &[u8], _spec: Option<ModeSpec>) -> Option<GzFile> {
     None
 }
 
@@ -2354,7 +2473,9 @@ fn read_ungetc_cycle(handle: &Handle, got: &mut Vec<u8>) -> usize {
 /// When `have` is zero the macro takes its function branch, and `zlib.h` L1961 keeps `gzgetc_`
 /// for precisely that; nothing else in the suite calls it, so it is called here.
 fn read_macro_take(handle: &Handle, expected: &[u8], got: &mut Vec<u8>) -> usize {
-    let before = handle.prefix();
+    let Some((before_have, _, before_pos)) = handle.prefix() else {
+        panic!("the exposed prefix must be readable for a live handle")
+    };
     match handle.macro_take() {
         Some(byte) => {
             let position = got.len();
@@ -2367,13 +2488,15 @@ fn read_macro_take(handle: &Handle, expected: &[u8], got: &mut Vec<u8>) -> usize
                     panic!("the gzgetc macro delivered a byte past the end of the written data")
                 }
             }
-            let after = handle.prefix();
+            let Some((after_have, _, after_pos)) = handle.prefix() else {
+                panic!("the exposed prefix must still be readable after a macro take")
+            };
             assert_eq!(
-                after.have,
-                before.have - 1,
+                after_have,
+                before_have - 1,
                 "the macro decrements have by one"
             );
-            assert_eq!(after.pos, before.pos + 1, "the macro increments pos by one");
+            assert_eq!(after_pos, before_pos + 1, "the macro increments pos by one");
             got.push(byte);
             1
         }
@@ -2598,76 +2721,72 @@ fn error_probe(handle: &Handle) {
 /// | `NULL` | `gzgets`, `gzerror`, `gzopen`, `gzopen64`, `gzdopen` |
 /// | nothing | `gzclearerr`, which returns void |
 fn null_handle_sweep() {
-    let null: gzFile = std::ptr::null_mut();
+    // `Z_NULL` is documented input for every one of these, and the gate that carries it says so:
+    // each entry point answers from a guard at its head without dereferencing anything, so a
+    // null handle owes no close and needs no `Handle`.
+    let null = GzFile::null();
     let mut sink = [0_u8; 4];
-    let text = b"gz\0";
-    let mut errnum: c_int = Z_STREAM_ERROR;
+    let text = c"gz";
 
-    let buf_out: voidp = sink.as_mut_ptr().cast::<c_void>();
-    let buf_in: voidpc = text.as_ptr().cast::<c_void>();
-    let chars: *mut c_char = sink.as_mut_ptr().cast::<c_char>();
-    let string: *const c_char = text.as_ptr().cast::<c_char>();
-    let slot: *mut c_int = &mut errnum;
+    assert_eq!(null.buffer(8), -1, "gzbuffer(NULL)");
+    assert_eq!(null.setparams(1, 0), Z_STREAM_ERROR, "gzsetparams(NULL)");
 
-    // SAFETY: every call below is handed `Z_NULL`, which `zlib.h` documents as an argument each
-    // of them must tolerate; the guard at the head of each entry point answers it without
-    // dereferencing anything. The pointer/length pairs come from two real locals that outlive
-    // the block, so they would be valid even if a call did look at them, and `slot` addresses a
-    // live local `c_int`. The mode and path strings are NUL-terminated literals.
-    unsafe {
-        assert_eq!(gzbuffer(null, 8), -1, "gzbuffer(NULL)");
-        assert_eq!(gzsetparams(null, 1, 0), Z_STREAM_ERROR, "gzsetparams(NULL)");
+    assert_eq!(null.read(&mut sink), -1, "gzread(NULL)");
+    assert_eq!(null.fread_items(&mut sink, 1, 4), 0, "gzfread(NULL)");
+    assert!(null.gets(&mut sink).is_none(), "gzgets(NULL)");
+    assert_eq!(null.getc(), -1, "gzgetc(NULL)");
+    assert_eq!(null.getc_(), -1, "gzgetc_(NULL)");
+    assert_eq!(null.ungetc(0), -1, "gzungetc(NULL)");
 
-        assert_eq!(gzread(null, buf_out, 4), -1, "gzread(NULL)");
-        assert_eq!(gzfread(buf_out, 1, 4, null), 0, "gzfread(NULL)");
-        assert!(gzgets(null, chars, 4).is_null(), "gzgets(NULL)");
-        assert_eq!(gzgetc(null), -1, "gzgetc(NULL)");
-        assert_eq!(gzgetc_(null), -1, "gzgetc_(NULL)");
-        assert_eq!(gzungetc(0, null), -1, "gzungetc(NULL)");
+    assert_eq!(null.write(text.to_bytes()), 0, "gzwrite(NULL)");
+    assert_eq!(
+        null.fwrite_items(text.to_bytes(), 1, 2),
+        0,
+        "gzfwrite(NULL)"
+    );
+    assert_eq!(null.putc(c_int::from(b'x')), -1, "gzputc(NULL)");
+    assert_eq!(null.puts(text), -1, "gzputs(NULL)");
+    assert_eq!(null.flush(Z_FINISH), Z_STREAM_ERROR, "gzflush(NULL)");
 
-        assert_eq!(gzwrite(null, buf_in, 2), 0, "gzwrite(NULL)");
-        assert_eq!(gzfwrite(buf_in, 1, 2, null), 0, "gzfwrite(NULL)");
-        assert_eq!(gzputc(null, c_int::from(b'x')), -1, "gzputc(NULL)");
-        assert_eq!(gzputs(null, string), -1, "gzputs(NULL)");
-        assert_eq!(gzflush(null, Z_FINISH), Z_STREAM_ERROR, "gzflush(NULL)");
+    assert_eq!(null.seek(0, SEEK_SET), -1, "gzseek(NULL)");
+    assert_eq!(null.seek64(0, SEEK_SET), -1, "gzseek64(NULL)");
+    assert_eq!(null.rewind(), -1, "gzrewind(NULL)");
+    assert_eq!(null.tell(), -1, "gztell(NULL)");
+    assert_eq!(null.tell64(), -1, "gztell64(NULL)");
+    assert_eq!(null.offset(), -1, "gzoffset(NULL)");
+    assert_eq!(null.offset64(), -1, "gzoffset64(NULL)");
 
-        assert_eq!(gzseek(null, 0, SEEK_SET), -1, "gzseek(NULL)");
-        assert_eq!(gzseek64(null, 0, SEEK_SET), -1, "gzseek64(NULL)");
-        assert_eq!(gzrewind(null), -1, "gzrewind(NULL)");
-        assert_eq!(gztell(null), -1, "gztell(NULL)");
-        assert_eq!(gztell64(null), -1, "gztell64(NULL)");
-        assert_eq!(gzoffset(null), -1, "gzoffset(NULL)");
-        assert_eq!(gzoffset64(null), -1, "gzoffset64(NULL)");
+    // The two that answer zero rather than -1, which is easy to get wrong in a rewrite.
+    assert_eq!(null.eof(), 0, "gzeof(NULL) is 0, not -1");
+    assert_eq!(null.direct(), 0, "gzdirect(NULL) is 0, not -1");
 
-        // The two that answer zero rather than -1, which is easy to get wrong in a rewrite.
-        assert_eq!(gzeof(null), 0, "gzeof(NULL) is 0, not -1");
-        assert_eq!(gzdirect(null), 0, "gzdirect(NULL) is 0, not -1");
+    // `Z_STREAM_ERROR` as the sentinel, so "the library wrote nothing" is distinguishable; the
+    // message being `None` is C's null return, which is what `gzerror(Z_NULL, &errnum)` owes.
+    let (errnum, message) = null.error(Z_STREAM_ERROR);
+    assert!(message.is_none(), "gzerror(NULL)");
+    assert_eq!(
+        errnum, Z_STREAM_ERROR,
+        "gzerror(NULL) must not write the errnum slot"
+    );
+    assert!(!null.error_message_only(), "gzerror(NULL, NULL)");
+    null.clearerr();
 
-        assert!(gzerror(null, slot).is_null(), "gzerror(NULL)");
-        gzclearerr(null);
+    assert_eq!(null.close(), Z_STREAM_ERROR, "gzclose(NULL)");
+    assert_eq!(null.close_r(), Z_STREAM_ERROR, "gzclose_r(NULL)");
+    assert_eq!(null.close_w(), Z_STREAM_ERROR, "gzclose_w(NULL)");
 
-        assert_eq!(gzclose(null), Z_STREAM_ERROR, "gzclose(NULL)");
-        assert_eq!(gzclose_r(null), Z_STREAM_ERROR, "gzclose_r(NULL)");
-        assert_eq!(gzclose_w(null), Z_STREAM_ERROR, "gzclose_w(NULL)");
-
-        // The open family's own null arguments. `gzlib.c` L96-L97 refuses a null path or mode,
-        // and L302 refuses `fd == -1` before it even looks at the mode -- which is why the
-        // descriptor case is probed with -1 and not with a real descriptor: `gzdopen` adopts
-        // whatever it is given, and there is no descriptor here that is safe to lose.
-        assert!(
-            gzopen(std::ptr::null(), string).is_null(),
-            "gzopen(NULL path)"
-        );
-        assert!(
-            gzopen(string, std::ptr::null()).is_null(),
-            "gzopen(NULL mode)"
-        );
-        assert!(
-            gzopen64(std::ptr::null(), string).is_null(),
-            "gzopen64(NULL path)"
-        );
-        assert!(gzdopen(-1, string).is_null(), "gzdopen(-1)");
-    }
+    // The open family's own null arguments. `gzlib.c` L96-L97 refuses a null path or mode, and
+    // L302 refuses `fd == -1` before it even looks at the mode -- which is why the descriptor
+    // case is probed with -1 and not with a real descriptor: `gzdopen` adopts whatever it is
+    // given, and there is no descriptor here that is safe to lose. A null *string* cannot be
+    // spelled as a `&CStr`, so those three have gates of their own.
+    assert!(GzFile::open_null_path(text).is_null(), "gzopen(NULL path)");
+    assert!(GzFile::open_null_mode(text).is_null(), "gzopen(NULL mode)");
+    assert!(
+        GzFile::open64_null_path(text).is_null(),
+        "gzopen64(NULL path)"
+    );
+    assert!(GzFile::dopen(-1, text).is_null(), "gzdopen(-1)");
 }
 
 // ---------------------------------------------------------------------------
@@ -2676,17 +2795,27 @@ fn null_handle_sweep() {
 
 /// One invocation: prepare the file, write, read back, compare.
 ///
-/// [`None`] means the environment refused something rather than the library misbehaving, and is
-/// deliberately not a failure. Everything that *is* a failure has already asserted by the time
-/// this returns.
+/// [`None`] means the fuzzer's own choices led nowhere -- a mode string the grammar refuses, or a
+/// transient filesystem refusal of the kind [`Opened::Environment`] documents -- rather than the
+/// library misbehaving, and is deliberately not a failure. Everything that *is* a failure has
+/// already asserted by the time this returns.
+///
+/// The one thing that is no longer allowed to be quiet is a scratch environment that never
+/// worked: [`preflight`] settles that once, with a panic, before the first plan is built. The
+/// two steps below therefore run against an environment already proven usable, so they say so
+/// with `expect` rather than folding a genuine fault into the same `None` the grammar uses for
+/// its ordinary refusals.
 fn attempt(input: &GzRoundTrip) -> Option<()> {
+    preflight();
+
     let plan = build_plan(input)?;
     if plan.has(flag::NULL_SWEEP) {
         null_handle_sweep();
     }
 
     let path = scratch_path();
-    let path_c = path_bytes(path)?;
+    let path_c =
+        path_bytes(path).expect("preflight proved the scratch path is expressible as a C string");
 
     // `O_EXCL` needs the file absent to succeed and present to be refused, and both are worth
     // exercising; the fuzzer picks which, and the prediction in `predict_open` follows from the
@@ -2696,7 +2825,10 @@ fn attempt(input: &GzRoundTrip) -> Option<()> {
         .is_some_and(|spec| spec.exclusive && spec.direction != Direction::Read);
     let remove = exclusive_write && plan.has(flag::EXCLUSIVE_SUCCEEDS);
 
-    let exists = prepare_scratch(path, remove)?;
+    let exists = prepare_scratch(path, remove).expect(
+        "preflight proved the scratch file can be created, truncated and removed; a refusal \
+         here means the temporary directory became unusable mid-run",
+    );
     let image = write_pass(path, &path_c, &plan, exists)?;
     read_pass(path, &path_c, &plan, &image)
 }

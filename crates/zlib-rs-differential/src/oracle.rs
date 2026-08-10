@@ -78,12 +78,13 @@
 //! # Why the mirrors are declared here rather than imported
 //!
 //! `crates/libz-rs-sys` defines the same `#[repr(C)]` types, and importing them would be the obvious
-//! way to guarantee they agree. It is not available: this crate's `[dependencies]` table is
-//! deliberately empty, and `libz_rs_sys`, `zlib-rs` and `criterion` are **dev-dependencies**. Cargo
-//! resolves dev-dependencies for test, example and bench targets but *not* for the crate's own `lib`
-//! target, so a `use libz_rs_sys::…` in this file would not compile. Keeping the table empty is what
-//! keeps the oracle out of the shipped crates' graphs, so the mirrors are transcribed locally
-//! instead and held to agreement by two independent mechanisms: the compile-time layout assertions
+//! way to guarantee they agree. **It is deliberately not done, and the reason is not that it cannot
+//! be.** The facade is an ordinary `[dependencies]` entry of this crate — `src/port.rs` needs it at
+//! the `lib` target — so `use libz_rs_sys::…` would compile here perfectly well. What it would cost
+//! is the independence the comparison rests on: this module is the *reference* side, and a reference
+//! whose view of the ABI is imported from the implementation under test cannot detect a layout error
+//! in it, because both sides would be wrong together and agree. So the mirrors are transcribed
+//! locally and held to agreement by two independent mechanisms: the compile-time layout assertions
 //! below, which encode the same measured numbers as
 //! `crates/libz-rs-sys/src/layout_assertions.rs`, and the
 //! [`c_oracle_ct_data_size`](crate::oracle::c_oracle_ct_data_size) /
@@ -96,24 +97,32 @@
 //!
 //! ```text
 //! src/oracle.rs  local #[repr(C)] mirrors + `extern "C"` c_/c_oracle_ declarations + safe slice
-//!                wrappers over the generated tables. Depends on nothing outside `core`/`std`.
-//! src/lib.rs     `pub mod oracle;` plus the crate-level documentation.
+//!                wrappers over the generated tables + one safe gate per reference entry point.
+//!                Depends on nothing outside `core`/`std`.
+//! src/port.rs    one safe gate per `libz-rs-sys` entry point, the `gzFile` handle, the
+//!                `inflateBack` callback bridge and the instrumented allocator.
+//! src/lib.rs     `pub mod oracle;` and `pub mod port;` plus the crate-level documentation.
 //! tests/*.rs     The three differential gates: table_equality.rs compares the transcribed
 //!                constants, byte_identical.rs compares the encoder's output bytes, and
 //!                roundtrip_interop.rs crosses the two implementations in both directions.
+//! benches/*.rs   The three criterion suites attached by the [[bench]] entries in Cargo.toml.
 //! ```
 //!
 //! The split is a design decision about where such assertions *belong*: a suite under `tests/`
-//! imports `zlib_rs_differential::oracle::*` (this lib) alongside `zlib_rs::*` and
-//! `libz_rs_sys::*`, which is the only place those dev-dependencies resolve. Nothing in *this* file
-//! asserts anything about either implementation's output; the only thing it executes is the
-//! deliberately minimal smoke module at its foot, which proves that the archive links and that the
-//! renaming worked, and nothing more.
+//! drives both implementations through this module's gates and `port`'s, and `zlib_rs::*` for the
+//! idiomatic surface. Nothing in *this* file asserts anything about either implementation's output;
+//! the only thing it executes is the deliberately minimal smoke module at its foot, which proves
+//! that the archive links and that the renaming worked, and nothing more.
+//!
+//! This module and `src/port.rs` are also the crate's whole `unsafe` surface: calling a
+//! pointer-taking `extern "C"` function is an `unsafe` operation whichever implementation it
+//! belongs to, so both are confined here and `build.rs`, every suite under `tests/`, all three
+//! benches and all five `fuzz_targets/` carry `#![forbid(unsafe_code)]`.
 
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
-use core::ffi::{c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_void};
+use core::ffi::{c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_void, CStr};
 
 // =============================================================================
 //  Scalar and pointer aliases (zconf.h)
@@ -1290,6 +1299,54 @@ extern "C" {
 }
 
 // =============================================================================
+//  The generated trees.c wrapper: the four tables no header declares
+// =============================================================================
+//
+//  `extra_lbits`, `extra_dbits`, `extra_blbits` and `bl_order` (`trees.c` L62, L65, L68 and L71) are
+//  in exactly `configuration_table`'s position: declared `local`, and declared in no header, because
+//  `gen_trees_header()` generates only the six tables `trees.h` carries and these four are not among
+//  them.  So the table shim above cannot reach them either, and `build.rs` supplies a second
+//  wrapper, `zlib_c_oracle_trees.c`, which `#include`s `trees.c` and hands each array out through a
+//  `c_oracle_*` accessor paired with its own `sizeof/sizeof` length.
+//
+//  The safety argument is the table shim's, unchanged: every accessor is niladic, so there is no
+//  input to get wrong, and every returned pointer addresses a `static const` array that lives for
+//  the whole program and is never mutated.  None of these four can be null -- unlike the word-typed
+//  CRC tables, they exist in every configuration -- but the wrappers still go through
+//  [`table_slice`], which null-checks regardless.
+extern "C" {
+    /// Returns the `extra_lbits` from `trees.c` L62.
+    pub fn c_oracle_extra_lbits() -> *const c_int;
+
+    /// Returns the element count of `extra_lbits`, which is `LENGTH_CODES`.
+    pub fn c_oracle_extra_lbits_len() -> c_uint;
+
+    /// Returns the `extra_dbits` from `trees.c` L65.
+    pub fn c_oracle_extra_dbits() -> *const c_int;
+
+    /// Returns the element count of `extra_dbits`, which is `D_CODES`.
+    pub fn c_oracle_extra_dbits_len() -> c_uint;
+
+    /// Returns the `extra_blbits` from `trees.c` L68.
+    pub fn c_oracle_extra_blbits() -> *const c_int;
+
+    /// Returns the element count of `extra_blbits`, which is `BL_CODES`.
+    pub fn c_oracle_extra_blbits_len() -> c_uint;
+
+    /// Returns the `bl_order` from `trees.c` L71.
+    pub fn c_oracle_bl_order() -> *const uch;
+
+    /// Returns the element count of `bl_order`, which is `BL_CODES`.
+    pub fn c_oracle_bl_order_len() -> c_uint;
+
+    /// Returns `sizeof(int)`, the element width shared by all three `extra_*` arrays.
+    pub fn c_oracle_extra_bits_element_size() -> c_uint;
+
+    /// Returns `sizeof(uch)`, the element width of `bl_order`.
+    pub fn c_oracle_bl_order_element_size() -> c_uint;
+}
+
+// =============================================================================
 //  The generated deflate.c wrapper: configuration_table
 // =============================================================================
 //
@@ -1372,8 +1429,9 @@ extern "C" {
 //  One wrapper per table, each returning a `&'static [T]` built from the table's own pointer
 //  accessor and its own length accessor.  This is the only place in the crate where a raw pointer is
 //  turned into a slice, so a comparison of the ported Rust `const` arrays against the C arrays can
-//  be written without a single `unsafe` block of its own.  Only the shape checks in the smoke module
-//  call these today; the content comparison they were built for is not yet written.
+//  be written without a single `unsafe` block of its own.  `tests/table_equality.rs` is what they
+//  were built for and it imports every one of them: the shape checks in the smoke module below
+//  cover the accessors themselves, and that suite compares the contents element for element.
 //
 //  Three properties make every one of these sound, and they are stated once here rather than
 //  repeated in nine near-identical comments:
@@ -1620,6 +1678,218 @@ pub fn oracle_element_sizes() -> (c_uint, c_uint) {
     unsafe { (c_oracle_ct_data_size(), c_oracle_code_size()) }
 }
 
+/// One of the reference's `z_word_t` tables, typed by the width the C build actually compiled.
+///
+/// `z_word_t` is `Z_U8` where `crc32.c` chose `W == 8` and `Z_U4` where it chose `W == 4`, and it
+/// does not exist at all where neither is available and the braided path is compiled out. A single
+/// Rust slice type therefore cannot describe the C object on every target, which is why the shim
+/// hands these two tables out as `const void *` with a companion `c_oracle_word_size()` -- and why
+/// reaching them from a test used to require `unsafe`.
+///
+/// This enum is the typed answer: the width decides the variant, so a consumer matches rather than
+/// casts, and the case where there is no table at all is a variant rather than an empty slice that
+/// could be mistaken for a table of length zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OracleWordTable {
+    /// `sizeof(z_word_t) == 8`: the `W == 8` arm of `crc32.h`.
+    Bits64(&'static [u64]),
+    /// `sizeof(z_word_t) == 4`: the `W == 4` arm of `crc32.h`.
+    Bits32(&'static [u32]),
+    /// The braided path was compiled out, so `crc32.h` defined no word-typed table.
+    Absent,
+}
+
+impl OracleWordTable {
+    /// The element count, and zero when the table is absent.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Bits64(table) => table.len(),
+            Self::Bits32(table) => table.len(),
+            Self::Absent => 0,
+        }
+    }
+
+    /// Whether the table holds no elements, which includes being absent altogether.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The entries widened to `u64`, so a comparison can be written once for both widths.
+    ///
+    /// Widening is lossless in both directions of interest: a `W == 4` entry occupies the low 32
+    /// bits of the `u64` and a `W == 8` entry is already 64 bits wide, so equality on the widened
+    /// values is equality on the originals whenever both sides were produced at the same width.
+    #[must_use]
+    pub fn widened(&self) -> Vec<u64> {
+        match self {
+            Self::Bits64(table) => table.to_vec(),
+            Self::Bits32(table) => table.iter().map(|entry| u64::from(*entry)).collect(),
+            Self::Absent => Vec::new(),
+        }
+    }
+}
+
+/// Builds an [`OracleWordTable`] from a `const void *` accessor and its element count.
+///
+/// # Safety
+///
+/// The caller must guarantee that `table` is either null or a pointer to a `static` array of at
+/// least `len` correctly initialised `z_word_t` values whose width is what `c_oracle_word_size()`
+/// reports, living for the whole program and never mutated. Both call sites below satisfy this by
+/// pairing a shim pointer accessor with that same table's own length accessor.
+unsafe fn word_table(table: *const c_void, len: c_uint) -> OracleWordTable {
+    // SAFETY: niladic accessor returning `unsigned`; no pointers and no preconditions.
+    let width = unsafe { c_oracle_word_size() };
+    match width {
+        // SAFETY: the width the C compiler itself reports is 8, so the array's element type is an
+        // 8-byte unsigned integer, which `u64` mirrors exactly -- both are 8 bytes with no padding
+        // and no niche. The caller's contract supplies everything else `table_slice` needs, and
+        // `table_slice` null-checks besides.
+        8 => OracleWordTable::Bits64(unsafe { table_slice(table.cast::<u64>(), len) }),
+        // SAFETY: as above, with the reported width 4 and `u32` as the mirror.
+        4 => OracleWordTable::Bits32(unsafe { table_slice(table.cast::<u32>(), len) }),
+        _ => OracleWordTable::Absent,
+    }
+}
+
+/// The reference's `crc_big_table` from `crc32.h`, 256 entries of `z_word_t`.
+///
+/// The byte-at-a-time table with each entry byte-swapped, which `crc32_z` reads on a big-endian
+/// host for the head and tail of a braided calculation. `crc32.h` holds one definition per `W` arm
+/// -- `crc32.h:63` for `W == 8`, `crc32.h:153` for `W == 4` -- and only one is compiled, so the
+/// variant this returns is the arm the oracle was built with.
+#[must_use]
+pub fn oracle_crc_big_table() -> OracleWordTable {
+    // SAFETY: `c_oracle_crc_big_table` returns `crc_big_table`, a `static const z_word_t` array in
+    // the oracle archive, or null where `W` is undefined and `crc32.h` defined no such array;
+    // `c_oracle_crc_big_table_len` is that same array's `sizeof/sizeof`, or 0 in the null case. Both
+    // are niladic, so the calls themselves have no preconditions.
+    unsafe { word_table(c_oracle_crc_big_table(), c_oracle_crc_big_table_len()) }
+}
+
+/// The reference's `crc_braid_big_table` from `crc32.h`, flattened to `W` x 256 entries.
+///
+/// The big-endian counterpart of `crc_braid_table`, read by the braided body on a big-endian host.
+/// Row-major and contiguous like every C array, so `crc_braid_big_table[k][b]` is entry
+/// `k * columns + b` of the returned view; [`oracle_crc_braid_big_dimensions`] reports the two
+/// dimensions, each from its own `sizeof/sizeof`.
+#[must_use]
+pub fn oracle_crc_braid_big_table() -> OracleWordTable {
+    // SAFETY: `c_oracle_crc_braid_big_table` returns `crc_braid_big_table`, a `static const
+    // z_word_t[W][256]` in the oracle archive, or null where the braided path is compiled out. The
+    // length passed is the product of the row and column counts, each read from that same array's
+    // own `sizeof/sizeof`, which is exactly its element total. All three accessors are niladic.
+    unsafe {
+        let rows = c_oracle_crc_braid_big_table_rows();
+        let columns = c_oracle_crc_braid_big_table_cols();
+        word_table(c_oracle_crc_braid_big_table(), rows.saturating_mul(columns))
+    }
+}
+
+/// The C side's own `(rows, columns)` for `crc_braid_big_table`, `(0, 0)` when it has none.
+///
+/// Reported separately for the same reason [`oracle_crc_braid_dimensions`] is: the flattened view
+/// cannot carry a shape, and hardcoding one on the Rust side would defeat the point of asking C.
+#[must_use]
+pub fn oracle_crc_braid_big_dimensions() -> (c_uint, c_uint) {
+    // SAFETY: two niladic accessors returning `unsigned`; no pointers and no preconditions.
+    unsafe {
+        (
+            c_oracle_crc_braid_big_table_rows(),
+            c_oracle_crc_braid_big_table_cols(),
+        )
+    }
+}
+
+/// `crc32.c`'s braid count `N`, the number of interleaved CRCs the braided body carries.
+///
+/// Always defined, even where the braided path is compiled out, because `crc32.c:64-71` sets it
+/// before it decides anything about `W`. It selects which of the six `#if N == 1..6` arms of
+/// `crc32.h` supplies `crc_braid_table` and `crc_braid_big_table`, so it is the one number that
+/// decides *which* valid table the oracle holds -- and therefore the one number a table comparison
+/// cannot infer from the data it is comparing.
+#[must_use]
+pub fn oracle_crc_braid_n() -> c_uint {
+    // SAFETY: a niladic accessor returning `unsigned`; no pointers and no preconditions.
+    unsafe { c_oracle_crc_braid_n() }
+}
+
+/// `crc32.c`'s word width `W`, or 0 where the braided path is compiled out.
+///
+/// The row count of both braid tables, and the width `z_word_t` is a synonym for.
+#[must_use]
+pub fn oracle_crc_braid_w() -> c_uint {
+    // SAFETY: a niladic accessor returning `unsigned`; no pointers and no preconditions.
+    unsafe { c_oracle_crc_braid_w() }
+}
+
+/// The reference's `extra_lbits` from `trees.c` L62, all `LENGTH_CODES` entries.
+///
+/// Extra bits carried by each length code. `gen_bitlen` adds it to a code width when accumulating
+/// `opt_len` and `static_len` (`trees.c` L570-L574), and `compress_block` reads it to decide whether
+/// a residue follows the code (`trees.c` L926-L929), so a wrong entry changes emitted bytes.
+#[must_use]
+pub fn oracle_extra_lbits() -> &'static [c_int] {
+    // SAFETY: `c_oracle_extra_lbits` returns `extra_lbits`, a `static const int` array in the oracle
+    // archive, paired with that same array's own `sizeof/sizeof`. Both accessors are niladic.
+    unsafe { table_slice(c_oracle_extra_lbits(), c_oracle_extra_lbits_len()) }
+}
+
+/// The reference's `extra_dbits` from `trees.c` L65, all `D_CODES` entries.
+///
+/// Extra bits carried by each distance code, and the run length of `_dist_code`: the two loops of
+/// `tr_static_init` step by `1 << extra_dbits[code]` and `1 << (extra_dbits[code] - 7)`
+/// (`trees.c` L336 and L344).
+#[must_use]
+pub fn oracle_extra_dbits() -> &'static [c_int] {
+    // SAFETY: `c_oracle_extra_dbits` returns `extra_dbits`, a `static const int` array in the oracle
+    // archive, paired with that same array's own `sizeof/sizeof`. Both accessors are niladic.
+    unsafe { table_slice(c_oracle_extra_dbits(), c_oracle_extra_dbits_len()) }
+}
+
+/// The reference's `extra_blbits` from `trees.c` L68, all `BL_CODES` entries.
+///
+/// Extra bits carried by each bit-length code. Only the last three are non-zero, and they are the
+/// repeat-count widths of RFC 1951 3.2.7.
+#[must_use]
+pub fn oracle_extra_blbits() -> &'static [c_int] {
+    // SAFETY: `c_oracle_extra_blbits` returns `extra_blbits`, a `static const int` array in the
+    // oracle archive, paired with that same array's own `sizeof/sizeof`. Both accessors are niladic.
+    unsafe { table_slice(c_oracle_extra_blbits(), c_oracle_extra_blbits_len()) }
+}
+
+/// The reference's `bl_order` from `trees.c` L71, all `BL_CODES` entries.
+///
+/// The transmission order of the bit-length codes, fixed by RFC 1951 3.2.7. `build_bl_tree` walks it
+/// backwards to find the last non-zero entry (`trees.c` L818-L820) and `send_all_trees` sends the
+/// leading `max_blindex + 1` of it (`trees.c` L847), so a wrong entry makes every dynamic block's
+/// header unreadable.
+#[must_use]
+pub fn oracle_bl_order() -> &'static [uch] {
+    // SAFETY: `c_oracle_bl_order` returns `bl_order`, a `static const uch` array in the oracle
+    // archive, paired with that same array's own `sizeof/sizeof`. Both accessors are niladic.
+    unsafe { table_slice(c_oracle_bl_order(), c_oracle_bl_order_len()) }
+}
+
+/// The element widths the C compiler produced for the four `trees.c` tables:
+/// `(sizeof(int), sizeof(uch))`.
+///
+/// The same discipline [`oracle_element_sizes`] and [`oracle_config_field_size`] apply. C declares
+/// all three `extra_*` arrays as `int` and `bl_order` as `uch`; reporting the C compiler's own
+/// `sizeof` is what lets the port's choice of `i32` and `u8` be checked rather than assumed.
+#[must_use]
+pub fn oracle_trees_element_sizes() -> (c_uint, c_uint) {
+    // SAFETY: two niladic accessors returning `unsigned`; no pointers and no preconditions.
+    unsafe {
+        (
+            c_oracle_extra_bits_element_size(),
+            c_oracle_bl_order_element_size(),
+        )
+    }
+}
+
 // =============================================================================
 //  Safe view over configuration_table
 // =============================================================================
@@ -1720,9 +1990,11 @@ impl OracleCompressFunc {
 /// [`OracleCompressFunc::Fast`] at levels 1 to 3 and [`OracleCompressFunc::Slow`] at 4 to 9, which
 /// is what `deflateParams`' identity test at `deflate.c` L791 observes.
 ///
-/// The example is `text` rather than a doctest on purpose: `zlib_rs` is a dev-dependency of this
-/// crate, so it does not resolve from this module. That comparison belongs in
-/// `crates/zlib-rs-differential/tests/`, which is where the dev-dependencies exist.
+/// The example is `text` rather than a doctest on purpose, and not because `zlib_rs` is
+/// unreachable from here -- it is an ordinary dependency of this crate. A doctest would make the
+/// reference-side module assert something about the port, which is exactly what the module
+/// documentation says nothing in this file does. The comparison belongs in a suite under
+/// `crates/zlib-rs-differential/tests/`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OracleConfig {
     /// `good_length` (L99) -- above this previous-match length the lazy search is cut short.
@@ -1798,6 +2070,1005 @@ pub fn oracle_config(level: c_uint) -> Option<OracleConfig> {
 }
 
 // =============================================================================
+//  Safe gates over the reference entry points
+// =============================================================================
+//
+//  Every declaration above is `unsafe` to call, so a suite that reached for one directly would
+//  open an `unsafe` block of its own -- which is what this section exists to prevent.  One gate
+//  per entry point, each converting Rust's safe shapes into the C shapes the ABI takes, making
+//  exactly one call and converting the answer back.  Nothing here decides anything: the chunk
+//  boundaries, the flush values, the corpora and the comparisons all stay in the harness.
+//
+//  The obligations are the same seven `crate::port` lists, discharged the same way and named by
+//  the same letters: (a) the stream, (b) the state, (c) readable input, (d) writable output,
+//  (e) version and size, (f) out-parameters, (g) C strings and handles.  Two clauses are this
+//  side's own.  Obligation (b) is stricter here than it looks: a stream initialised by the
+//  reference must only ever be handed back to the reference, never to the port, and the `Stream`
+//  type being a different Rust type from `libz_rs_sys::z_stream` is what makes crossing them a
+//  compile error rather than a mystery.  Obligation (e) takes the version from
+//  [`reference_version`] -- what `c_zlibVersion` itself returns -- rather than from the port's
+//  constant, because the C library compares a caller's string against its own.
+
+/// This side's `stream_size` argument: `sizeof(z_stream)` as the initialisers take it.
+fn stream_size() -> c_int {
+    c_int::try_from(size_of::<z_stream>()).unwrap_or(c_int::MAX)
+}
+
+/// The reference's own version string, for obligation (e).
+#[must_use]
+pub fn reference_version() -> &'static CStr {
+    // SAFETY: obligation (g). `c_zlibVersion` is niladic and returns a pointer to a string
+    // literal with static storage duration compiled into the oracle archive, so the pointer is
+    // valid for reads for `'static` and is never written.
+    unsafe { CStr::from_ptr(c_zlibVersion()) }
+}
+
+/// `zlibCompileFlags()` as the reference reports it.
+#[must_use]
+pub fn compile_flags() -> uLong {
+    // SAFETY: niladic, no pointer, no state.
+    unsafe { c_zlibCompileFlags() }
+}
+
+/// `zError(err)`, as the message it points at.
+#[must_use]
+pub fn z_error(err: c_int) -> &'static CStr {
+    // SAFETY: obligation (g). The message table is `'static` const data inside the archive.
+    unsafe { CStr::from_ptr(c_zError(err)) }
+}
+
+/// `len` as a `uInt`, saturating rather than truncating.
+fn narrow_uint(len: usize) -> uInt {
+    uInt::try_from(len).unwrap_or(uInt::MAX)
+}
+
+/// `len` as a `uLong`, saturating rather than truncating.
+fn narrow_ulong(len: usize) -> uLong {
+    uLong::try_from(len).unwrap_or(uLong::MAX)
+}
+
+/// `len` as a `c_int`, saturating rather than truncating.
+fn narrow_int(len: usize) -> c_int {
+    c_int::try_from(len).unwrap_or(c_int::MAX)
+}
+
+/// `deflateInit2_(strm, level, method, windowBits, memLevel, strategy, version, size)`.
+#[must_use]
+pub fn deflate_init2(
+    strm: &mut z_stream,
+    level: c_int,
+    method: c_int,
+    window_bits: c_int,
+    mem_level: c_int,
+    strategy: c_int,
+) -> c_int {
+    let version = reference_version();
+    // SAFETY: obligations (a), (b) and (e). The entry point reads at most one byte of `version`
+    // after testing it for null; it writes `state` and touches neither window.
+    unsafe {
+        c_deflateInit2_(
+            strm,
+            level,
+            method,
+            window_bits,
+            mem_level,
+            strategy,
+            version.as_ptr(),
+            stream_size(),
+        )
+    }
+}
+
+/// `deflateInit_(strm, level, version, size)`.
+#[must_use]
+pub fn deflate_init(strm: &mut z_stream, level: c_int) -> c_int {
+    let version = reference_version();
+    // SAFETY: obligations (a), (b) and (e), as [`deflate_init2`].
+    unsafe { c_deflateInit_(strm, level, version.as_ptr(), stream_size()) }
+}
+
+/// `deflateInit2_` with the version string the *caller* chooses rather than the reference's own.
+///
+/// The reference compares only `version[0]` -- the major digit -- against its own (`deflate.c`
+/// L394), so a caller that was compiled against a different minor version still gets a working
+/// stream. A harness that wants to exercise that check, or to drive both implementations with one
+/// caller's constant so that the comparison is between the libraries and not between two version
+/// strings, needs to supply the string; [`deflate_init2`] supplies the reference's own instead.
+#[must_use]
+pub fn deflate_init2_with_version(
+    strm: &mut z_stream,
+    level: c_int,
+    method: c_int,
+    window_bits: c_int,
+    mem_level: c_int,
+    strategy: c_int,
+    version: &CStr,
+) -> c_int {
+    // SAFETY: obligations (a), (b) and (g). `version` is NUL-terminated for as long as the borrow
+    // lasts, which covers the call; the library reads its first byte after testing the pointer
+    // for null, and retains nothing. `stream_size` is this side's own `size_of`, never the
+    // facade's.
+    unsafe {
+        c_deflateInit2_(
+            strm,
+            level,
+            method,
+            window_bits,
+            mem_level,
+            strategy,
+            version.as_ptr(),
+            stream_size(),
+        )
+    }
+}
+
+/// `deflate(strm, flush)`, with the two windows left as the caller installed them.
+#[must_use]
+pub fn deflate(strm: &mut z_stream, flush: c_int) -> c_int {
+    // SAFETY: obligations (a) through (d) -- the one gate that relies on all four, because it is
+    // the one that reads through `next_in` and writes through `next_out`.
+    unsafe { c_deflate(strm, flush) }
+}
+
+/// `deflateEnd(strm)`.
+#[must_use]
+pub fn deflate_end(strm: &mut z_stream) -> c_int {
+    // SAFETY: obligations (a) and (b). The state block is released through the same allocator it
+    // was taken from and `state` is left null.
+    unsafe { c_deflateEnd(strm) }
+}
+
+/// `deflateReset(strm)`.
+#[must_use]
+pub fn deflate_reset(strm: &mut z_stream) -> c_int {
+    // SAFETY: obligations (a) and (b). Reinitialised in place, allocations kept.
+    unsafe { c_deflateReset(strm) }
+}
+
+/// `deflateResetKeep(strm)`.
+#[must_use]
+pub fn deflate_reset_keep(strm: &mut z_stream) -> c_int {
+    // SAFETY: obligations (a) and (b), as [`deflate_reset`].
+    unsafe { c_deflateResetKeep(strm) }
+}
+
+/// `deflateSetDictionary(strm, dictionary, dictLength)`.
+///
+/// The slice's own pointer is passed verbatim, empty slice included, as on the port side and for
+/// the same reason: `deflate.c` L586 refuses a null dictionary with `Z_STREAM_ERROR` outright,
+/// while a non-null pointer with a zero length is an ordinary zero-byte dictionary and succeeds.
+#[must_use]
+pub fn deflate_set_dictionary(strm: &mut z_stream, dictionary: &[u8]) -> c_int {
+    // SAFETY: obligations (a), (b) and (c) -- `dictionary.len()` bytes are readable at
+    // `dictionary.as_ptr()` for the whole call. The library copies what it keeps into its own
+    // window and retains no pointer into `dictionary`.
+    unsafe { c_deflateSetDictionary(strm, dictionary.as_ptr(), narrow_uint(dictionary.len())) }
+}
+
+/// `deflateSetDictionary(strm, dictionary, dictLength)`, where `None` passes the null `z_streamp`.
+///
+/// The null case is documented behaviour on this side too, and for the same reason: the reference
+/// `deflateStateCheck` tests for null before it reads anything, so the call answers
+/// `Z_STREAM_ERROR` without a dereference.
+#[must_use]
+pub fn deflate_set_dictionary_of(strm: Option<&mut z_stream>, dictionary: &[u8]) -> c_int {
+    let strm = strm.map_or(core::ptr::null_mut(), core::ptr::from_mut);
+    // SAFETY: obligations (a) -- including its null case -- (b) and (c), as on the port side.
+    unsafe { c_deflateSetDictionary(strm, dictionary.as_ptr(), narrow_uint(dictionary.len())) }
+}
+
+/// `deflateGetDictionary(strm, dictionary, &dictLength)`, as the status and the length written.
+#[must_use]
+pub fn deflate_get_dictionary(strm: &mut z_stream, dictionary: Option<&mut [u8]>) -> (c_int, uInt) {
+    let mut length: uInt = 0;
+    let ptr = match dictionary {
+        Some(buf) => buf.as_mut_ptr(),
+        None => core::ptr::null_mut(),
+    };
+    // SAFETY: obligations (a), (b), (d) and (f). The destination must be window-sized, which
+    // every caller satisfies; `length` is a live local the library either writes or leaves alone.
+    let status = unsafe { c_deflateGetDictionary(strm, ptr, core::ptr::addr_of_mut!(length)) };
+    (status, length)
+}
+
+/// `deflateSetHeader(strm, head)`.
+#[must_use]
+pub fn deflate_set_header(strm: &mut z_stream, head: &mut gz_header) -> c_int {
+    // SAFETY: obligations (a), (b) and (d). `head` is live and aligned for the whole borrow,
+    // which outlives the library's retention of the pointer.
+    unsafe { c_deflateSetHeader(strm, head) }
+}
+
+/// `deflateParams(strm, level, strategy)`.
+#[must_use]
+pub fn deflate_params(strm: &mut z_stream, level: c_int, strategy: c_int) -> c_int {
+    // SAFETY: obligations (a) through (d): a level change can flush pending output.
+    unsafe { c_deflateParams(strm, level, strategy) }
+}
+
+/// `deflatePrime(strm, bits, value)`.
+#[must_use]
+pub fn deflate_prime(strm: &mut z_stream, bits: c_int, value: c_int) -> c_int {
+    // SAFETY: obligations (a) and (b). Only the pending-output buffer is touched.
+    unsafe { c_deflatePrime(strm, bits, value) }
+}
+
+/// `deflateTune(strm, good_length, max_lazy, nice_length, max_chain)`.
+#[must_use]
+pub fn deflate_tune(
+    strm: &mut z_stream,
+    good_length: c_int,
+    max_lazy: c_int,
+    nice_length: c_int,
+    max_chain: c_int,
+) -> c_int {
+    // SAFETY: obligations (a) and (b). Four integers are written into the state block.
+    unsafe { c_deflateTune(strm, good_length, max_lazy, nice_length, max_chain) }
+}
+
+/// `deflateCopy(dest, source)`.
+#[must_use]
+pub fn deflate_copy(dest: &mut z_stream, source: &mut z_stream) -> c_int {
+    // SAFETY: obligations (a) and (b) for both, which are distinct exclusive borrows and
+    // therefore cannot alias -- the one thing the copy cannot tolerate.
+    unsafe { c_deflateCopy(dest, source) }
+}
+
+/// `deflatePending(strm, &pending, &bits)`, as the status and the two out-parameters.
+#[must_use]
+pub fn deflate_pending(strm: &mut z_stream, bytes: &mut c_uint, bits: &mut c_int) -> c_int {
+    // SAFETY: obligations (a), (b) and (f). `addr_of_mut!` because these are out-parameters C
+    // writes through; neither pointer is retained past the call.
+    unsafe {
+        c_deflatePending(
+            strm,
+            core::ptr::addr_of_mut!(*bytes),
+            core::ptr::addr_of_mut!(*bits),
+        )
+    }
+}
+
+/// `deflateUsed(strm, &bits)`, as the status and the out-parameter.
+#[must_use]
+pub fn deflate_used(strm: &mut z_stream, bits: &mut c_int) -> c_int {
+    // SAFETY: obligations (a), (b) and (f), as [`deflate_pending`].
+    unsafe { c_deflateUsed(strm, core::ptr::addr_of_mut!(*bits)) }
+}
+
+/// `deflateBound(strm, sourceLen)`, where `None` passes the null `z_streamp`.
+#[must_use]
+pub fn deflate_bound(strm: Option<&mut z_stream>, source_len: uLong) -> uLong {
+    let strm = strm.map_or(core::ptr::null_mut(), core::ptr::from_mut);
+    // SAFETY: obligation (a), including its null case: with a null stream the entry point
+    // funnels through `deflateStateCheck`'s null test and answers without a dereference.
+    unsafe { c_deflateBound(strm, source_len) }
+}
+
+/// `deflateBound_z(strm, sourceLen)`, where `None` passes the null `z_streamp`.
+#[must_use]
+pub fn deflate_bound_z(strm: Option<&mut z_stream>, source_len: z_size_t) -> z_size_t {
+    let strm = strm.map_or(core::ptr::null_mut(), core::ptr::from_mut);
+    // SAFETY: obligation (a), including its null case, as [`deflate_bound`].
+    unsafe { c_deflateBound_z(strm, source_len) }
+}
+
+/// `compressBound(sourceLen)`.
+#[must_use]
+pub fn compress_bound(source_len: uLong) -> uLong {
+    // SAFETY: pure arithmetic on the argument; no pointer and no state.
+    unsafe { c_compressBound(source_len) }
+}
+
+/// `compressBound_z(sourceLen)`.
+#[must_use]
+pub fn compress_bound_z(source_len: z_size_t) -> z_size_t {
+    // SAFETY: pure arithmetic on the argument, as [`compress_bound`].
+    unsafe { c_compressBound_z(source_len) }
+}
+
+/// `compress(dest, &destLen, source, sourceLen)`, as the status and `*destLen`.
+#[must_use]
+pub fn compress(dest: &mut [u8], source: &[u8]) -> (c_int, uLong) {
+    let mut dest_len = narrow_ulong(dest.len());
+    // SAFETY: obligations (c), (d) and (f). `destLen` is an in/out parameter, so the pointer is
+    // taken straight from the place; the two slices are distinct borrows and cannot overlap.
+    let status = unsafe {
+        c_compress(
+            dest.as_mut_ptr(),
+            core::ptr::addr_of_mut!(dest_len),
+            source.as_ptr(),
+            narrow_ulong(source.len()),
+        )
+    };
+    (status, dest_len)
+}
+
+/// `compress2(dest, &destLen, source, sourceLen, level)`, as the status and `*destLen`.
+#[must_use]
+pub fn compress2(dest: &mut [u8], source: &[u8], level: c_int) -> (c_int, uLong) {
+    let mut dest_len = narrow_ulong(dest.len());
+    // SAFETY: obligations (c), (d) and (f), as [`compress`].
+    let status = unsafe {
+        c_compress2(
+            dest.as_mut_ptr(),
+            core::ptr::addr_of_mut!(dest_len),
+            source.as_ptr(),
+            narrow_ulong(source.len()),
+            level,
+        )
+    };
+    (status, dest_len)
+}
+
+/// `compress2_z(dest, &destLen, source, sourceLen, level)`, the `size_t` form.
+#[must_use]
+pub fn compress2_z(dest: &mut [u8], source: &[u8], level: c_int) -> (c_int, z_size_t) {
+    let mut dest_len: z_size_t = dest.len();
+    // SAFETY: obligations (c), (d) and (f), as [`compress`].
+    let status = unsafe {
+        c_compress2_z(
+            dest.as_mut_ptr(),
+            core::ptr::addr_of_mut!(dest_len),
+            source.as_ptr(),
+            source.len(),
+            level,
+        )
+    };
+    (status, dest_len)
+}
+
+/// `uncompress(dest, &destLen, source, sourceLen)`, as the status and `*destLen`.
+#[must_use]
+pub fn uncompress(dest: &mut [u8], source: &[u8]) -> (c_int, uLong) {
+    let mut dest_len = narrow_ulong(dest.len());
+    // SAFETY: obligations (c), (d) and (f), as [`compress`].
+    let status = unsafe {
+        c_uncompress(
+            dest.as_mut_ptr(),
+            core::ptr::addr_of_mut!(dest_len),
+            source.as_ptr(),
+            narrow_ulong(source.len()),
+        )
+    };
+    (status, dest_len)
+}
+
+/// `uncompress2(dest, &destLen, source, &sourceLen)`, as the status and both lengths.
+#[must_use]
+pub fn uncompress2(dest: &mut [u8], source: &[u8]) -> (c_int, uLong, uLong) {
+    let mut dest_len = narrow_ulong(dest.len());
+    let mut source_len = narrow_ulong(source.len());
+    // SAFETY: obligations (c), (d) and (f). Both lengths are live locals initialised to the
+    // slices' true extents, which is the in/out contract `zlib.h` L1330 documents.
+    let status = unsafe {
+        c_uncompress2(
+            dest.as_mut_ptr(),
+            core::ptr::addr_of_mut!(dest_len),
+            source.as_ptr(),
+            core::ptr::addr_of_mut!(source_len),
+        )
+    };
+    (status, dest_len, source_len)
+}
+
+/// `inflateInit2_(strm, windowBits, version, size)`.
+#[must_use]
+pub fn inflate_init2(strm: &mut z_stream, window_bits: c_int) -> c_int {
+    let version = reference_version();
+    // SAFETY: obligations (a), (b) and (e), as [`deflate_init2`].
+    unsafe { c_inflateInit2_(strm, window_bits, version.as_ptr(), stream_size()) }
+}
+
+/// `inflateInit_(strm, version, size)`.
+#[must_use]
+pub fn inflate_init(strm: &mut z_stream) -> c_int {
+    let version = reference_version();
+    // SAFETY: obligations (a), (b) and (e), as [`deflate_init2`].
+    unsafe { c_inflateInit_(strm, version.as_ptr(), stream_size()) }
+}
+
+/// `inflateInit2_` with the caller's version string, for the reason
+/// [`deflate_init2_with_version`] gives.
+#[must_use]
+pub fn inflate_init2_with_version(
+    strm: &mut z_stream,
+    window_bits: c_int,
+    version: &CStr,
+) -> c_int {
+    // SAFETY: obligations (a), (b) and (g), as [`deflate_init2_with_version`].
+    unsafe { c_inflateInit2_(strm, window_bits, version.as_ptr(), stream_size()) }
+}
+
+/// `inflate(strm, flush)`, with the two windows left as the caller installed them.
+#[must_use]
+pub fn inflate(strm: &mut z_stream, flush: c_int) -> c_int {
+    // SAFETY: obligations (a) through (d), as [`deflate`].
+    unsafe { c_inflate(strm, flush) }
+}
+
+/// `inflateEnd(strm)`.
+#[must_use]
+pub fn inflate_end(strm: &mut z_stream) -> c_int {
+    // SAFETY: obligations (a) and (b), as [`deflate_end`].
+    unsafe { c_inflateEnd(strm) }
+}
+
+/// `inflateReset(strm)`.
+#[must_use]
+pub fn inflate_reset(strm: &mut z_stream) -> c_int {
+    // SAFETY: obligations (a) and (b), as [`deflate_reset`].
+    unsafe { c_inflateReset(strm) }
+}
+
+/// `inflateReset2(strm, windowBits)`.
+#[must_use]
+pub fn inflate_reset2(strm: &mut z_stream, window_bits: c_int) -> c_int {
+    // SAFETY: obligations (a) and (b). A window-size change can reallocate the window through
+    // the same allocator the stream was initialised with.
+    unsafe { c_inflateReset2(strm, window_bits) }
+}
+
+/// `inflateResetKeep(strm)`.
+#[must_use]
+pub fn inflate_reset_keep(strm: &mut z_stream) -> c_int {
+    // SAFETY: obligations (a) and (b), as [`inflate_reset`].
+    unsafe { c_inflateResetKeep(strm) }
+}
+
+/// `inflateSetDictionary(strm, dictionary, dictLength)`.
+#[must_use]
+pub fn inflate_set_dictionary(strm: &mut z_stream, dictionary: &[u8]) -> c_int {
+    // SAFETY: obligations (a), (b) and (c), as [`deflate_set_dictionary`], whose note on the
+    // empty-slice pointer applies here too.
+    unsafe { c_inflateSetDictionary(strm, dictionary.as_ptr(), narrow_uint(dictionary.len())) }
+}
+
+/// `inflateGetDictionary(strm, dictionary, &dictLength)`, as the status and the length written.
+#[must_use]
+pub fn inflate_get_dictionary(strm: &mut z_stream, dictionary: Option<&mut [u8]>) -> (c_int, uInt) {
+    let mut length: uInt = 0;
+    let ptr = match dictionary {
+        Some(buf) => buf.as_mut_ptr(),
+        None => core::ptr::null_mut(),
+    };
+    // SAFETY: obligations (a), (b), (d) and (f), as [`deflate_get_dictionary`].
+    let status = unsafe { c_inflateGetDictionary(strm, ptr, core::ptr::addr_of_mut!(length)) };
+    (status, length)
+}
+
+/// `inflateGetHeader(strm, head)`.
+///
+/// The library retains the pointer until the header has been parsed and writes through the
+/// `extra`, `name` and `comment` buffers it names, clamped to `extra_max`, `name_max` and
+/// `comm_max`.
+#[must_use]
+pub fn inflate_get_header(strm: &mut z_stream, head: &mut gz_header) -> c_int {
+    // SAFETY: obligations (a), (b) and (d). `head` is live and aligned for the whole borrow, and
+    // the buffers it points at are the caller's, sized by the three `*_max` members the library
+    // clamps its writes to.
+    unsafe { c_inflateGetHeader(strm, head) }
+}
+
+/// `inflateSync(strm)`.
+#[must_use]
+pub fn inflate_sync(strm: &mut z_stream) -> c_int {
+    // SAFETY: obligations (a) through (c): the search consumes input through `next_in`.
+    unsafe { c_inflateSync(strm) }
+}
+
+/// `inflateSyncPoint(strm)`.
+#[must_use]
+pub fn inflate_sync_point(strm: &mut z_stream) -> c_int {
+    // SAFETY: obligations (a) and (b). Read-only.
+    unsafe { c_inflateSyncPoint(strm) }
+}
+
+/// `inflateCopy(dest, source)`.
+#[must_use]
+pub fn inflate_copy(dest: &mut z_stream, source: &mut z_stream) -> c_int {
+    // SAFETY: obligations (a) and (b) for both, as [`deflate_copy`].
+    unsafe { c_inflateCopy(dest, source) }
+}
+
+/// `inflatePrime(strm, bits, value)`.
+#[must_use]
+pub fn inflate_prime(strm: &mut z_stream, bits: c_int, value: c_int) -> c_int {
+    // SAFETY: obligations (a) and (b). The bit accumulator is written.
+    unsafe { c_inflatePrime(strm, bits, value) }
+}
+
+/// `inflateMark(strm)`.
+#[must_use]
+pub fn inflate_mark(strm: &mut z_stream) -> c_long {
+    // SAFETY: obligations (a) and (b). Read-only.
+    unsafe { c_inflateMark(strm) }
+}
+
+/// `inflateCodesUsed(strm)`.
+#[must_use]
+pub fn inflate_codes_used(strm: &mut z_stream) -> c_ulong {
+    // SAFETY: obligations (a) and (b). Read-only.
+    unsafe { c_inflateCodesUsed(strm) }
+}
+
+/// `inflateUndermine(strm, subvert)`.
+#[must_use]
+pub fn inflate_undermine(strm: &mut z_stream, subvert: c_int) -> c_int {
+    // SAFETY: obligations (a) and (b). One state member is written.
+    unsafe { c_inflateUndermine(strm, subvert) }
+}
+
+/// `inflateValidate(strm, check)`.
+#[must_use]
+pub fn inflate_validate(strm: &mut z_stream, check: c_int) -> c_int {
+    // SAFETY: obligations (a) and (b). One state member is written.
+    unsafe { c_inflateValidate(strm, check) }
+}
+
+// As on the port side, the four buffer entry points have two faces and each gets its own gate:
+// a live slice's own pointer is an ordinary update that leaves a zero-length call's check value
+// alone, while `Z_NULL` in the same position requests the family's initial value and discards
+// both the incoming value and the length (`adler32.c` L81-L82, `crc32.c` L627-L628). The
+// pointer is therefore passed verbatim below, empty slice included, and the null face has its
+// own gates.
+
+/// `adler32(adler, buf, len)` over a live slice.
+#[must_use]
+pub fn adler32(adler: uLong, data: &[u8]) -> uLong {
+    // SAFETY: obligation (c). `data.len()` bytes are readable at `data.as_ptr()` for the whole
+    // of the call; the pointer is `u8`-aligned and non-null even for an empty slice, and the
+    // reference only reads through it -- `adler32.c` L61-L125 writes nothing and retains
+    // nothing. The `len == 1` path at L70 reads `buf[0]`, which is in range whenever `len` is
+    // the slice's own length.
+    unsafe { c_adler32(adler, data.as_ptr(), narrow_uint(data.len())) }
+}
+
+/// `adler32_z(adler, buf, len)` over a live slice, the `size_t` form.
+#[must_use]
+pub fn adler32_z(adler: uLong, data: &[u8]) -> uLong {
+    // SAFETY: obligation (c), as [`adler32`].
+    unsafe { c_adler32_z(adler, data.as_ptr(), data.len()) }
+}
+
+/// `adler32(adler, Z_NULL, len)` -- the seed-request face.
+///
+/// # Panics
+///
+/// Panics for `len == 1`, and the guard is load-bearing rather than defensive. `adler32_z`
+/// tests `len == 1` at `adler32.c` L70 and reads `buf[0]` there, *before* it tests
+/// `buf == Z_NULL` at L81 -- the comment at L80 calls the ordering a "deferred check for
+/// len == 1 speed" -- so `adler32(a, Z_NULL, 1)` dereferences a null pointer in correct C.
+/// There is no reference answer at that length to compare a port against, so the gate refuses
+/// to produce one rather than crash inside the oracle archive. The port's counterpart,
+/// [`crate::port::adler32_null`], reaches the null test first and is defined for every length.
+#[must_use]
+pub fn adler32_null(adler: uLong, len: uInt) -> uLong {
+    assert_ne!(
+        len, 1,
+        "adler32.c dereferences a null buffer at len == 1; see this gate's documentation"
+    );
+    // SAFETY: obligation (c) in its null form. A null buffer pointer is documented input, and
+    // the reference tests it against `Z_NULL` and returns before any dereference for every
+    // length except 1, which the assertion above excludes.
+    unsafe { c_adler32(adler, core::ptr::null(), len) }
+}
+
+/// `adler32_z(adler, Z_NULL, len)` -- the seed-request face, the `size_t` form.
+///
+/// # Panics
+///
+/// Panics for `len == 1`, for the reason given on [`adler32_null`] -- `adler32` forwards to
+/// this same function (`adler32.c` L128-L130), so the hazard is identical.
+#[must_use]
+pub fn adler32_z_null(adler: uLong, len: z_size_t) -> uLong {
+    assert_ne!(
+        len, 1,
+        "adler32.c dereferences a null buffer at len == 1; see this gate's documentation"
+    );
+    // SAFETY: as [`adler32_null`].
+    unsafe { c_adler32_z(adler, core::ptr::null(), len) }
+}
+
+/// `adler32_combine(adler1, adler2, len2)`.
+#[must_use]
+pub fn adler32_combine(adler1: uLong, adler2: uLong, len2: z_off_t) -> uLong {
+    // SAFETY: three integers in, one out; no pointer is involved.
+    unsafe { c_adler32_combine(adler1, adler2, len2) }
+}
+
+/// `adler32_combine64(adler1, adler2, len2)`.
+#[must_use]
+pub fn adler32_combine64(adler1: uLong, adler2: uLong, len2: z_off64_t) -> uLong {
+    // SAFETY: no pointer is involved, as [`adler32_combine`].
+    unsafe { c_adler32_combine64(adler1, adler2, len2) }
+}
+
+/// `crc32(crc, buf, len)` over a live slice.
+#[must_use]
+pub fn crc32(crc: uLong, data: &[u8]) -> uLong {
+    // SAFETY: obligation (c), as [`adler32`].
+    unsafe { c_crc32(crc, data.as_ptr(), narrow_uint(data.len())) }
+}
+
+/// `crc32_z(crc, buf, len)` over a live slice, the `size_t` form.
+#[must_use]
+pub fn crc32_z(crc: uLong, data: &[u8]) -> uLong {
+    // SAFETY: obligation (c), as [`adler32_z`].
+    unsafe { c_crc32_z(crc, data.as_ptr(), data.len()) }
+}
+
+/// `crc32(crc, Z_NULL, len)` -- the seed-request face.
+///
+/// No length is excluded here, unlike [`adler32_null`]: `crc32_z` tests the pointer against
+/// `Z_NULL` first (`crc32.c` L627-L628), so this family reads nothing at any length.
+#[must_use]
+pub fn crc32_null(crc: uLong, len: uInt) -> uLong {
+    // SAFETY: obligation (c) in its null form. The reference returns at L627-L628 for a null
+    // buffer without reading through the pointer, for every length.
+    unsafe { c_crc32(crc, core::ptr::null(), len) }
+}
+
+/// `crc32_z(crc, Z_NULL, len)` -- the seed-request face, the `size_t` form.
+#[must_use]
+pub fn crc32_z_null(crc: uLong, len: z_size_t) -> uLong {
+    // SAFETY: as [`crc32_null`].
+    unsafe { c_crc32_z(crc, core::ptr::null(), len) }
+}
+
+/// `crc32_combine(crc1, crc2, len2)`.
+#[must_use]
+pub fn crc32_combine(crc1: uLong, crc2: uLong, len2: z_off_t) -> uLong {
+    // SAFETY: no pointer is involved, as [`adler32_combine`].
+    unsafe { c_crc32_combine(crc1, crc2, len2) }
+}
+
+/// `crc32_combine64(crc1, crc2, len2)`.
+#[must_use]
+pub fn crc32_combine64(crc1: uLong, crc2: uLong, len2: z_off64_t) -> uLong {
+    // SAFETY: no pointer is involved, as [`adler32_combine`].
+    unsafe { c_crc32_combine64(crc1, crc2, len2) }
+}
+
+/// `crc32_combine_gen(len2)`.
+#[must_use]
+pub fn crc32_combine_gen(len2: z_off_t) -> uLong {
+    // SAFETY: no pointer is involved, as [`adler32_combine`].
+    unsafe { c_crc32_combine_gen(len2) }
+}
+
+/// `crc32_combine_gen64(len2)`.
+#[must_use]
+pub fn crc32_combine_gen64(len2: z_off64_t) -> uLong {
+    // SAFETY: no pointer is involved, as [`adler32_combine`].
+    unsafe { c_crc32_combine_gen64(len2) }
+}
+
+/// `crc32_combine_op(crc1, crc2, op)`.
+#[must_use]
+pub fn crc32_combine_op(crc1: uLong, crc2: uLong, op: uLong) -> uLong {
+    // SAFETY: no pointer is involved, as [`adler32_combine`].
+    unsafe { c_crc32_combine_op(crc1, crc2, op) }
+}
+
+/// `get_crc_table()`, as the 256-entry table it points at.
+#[must_use]
+pub fn crc_table() -> &'static [z_crc_t] {
+    // SAFETY: the returned pointer addresses the reference's own table, which has static storage
+    // duration and at least 256 elements of exactly this type. Nothing writes to it after
+    // `crc32.c`'s one-time construction, so a shared `'static` slice is sound and 256 is the
+    // documented length.
+    unsafe { core::slice::from_raw_parts(c_get_crc_table(), 256) }
+}
+
+/// A reference `gzFile` handle, and the only way this crate's consumers obtain one.
+///
+/// The counterpart of [`crate::port::GzFile`], and `Copy` for the same reason: `gzclose` consumes
+/// the handle in C, and the harness deliberately exercises the diagnostics the library returns
+/// for a handle used after it was closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GzFile(gzFile);
+
+impl GzFile {
+    /// `gzopen(path, mode)`.
+    #[must_use]
+    pub fn open(path: &CStr, mode: &CStr) -> Self {
+        // SAFETY: obligation (g). Both arguments are NUL-terminated and outlive the call, and
+        // the library copies the path it keeps (`gzlib.c` L200-L204).
+        Self(unsafe { c_gzopen(path.as_ptr(), mode.as_ptr()) })
+    }
+
+    /// `gzopen64(path, mode)`.
+    #[must_use]
+    pub fn open64(path: &CStr, mode: &CStr) -> Self {
+        // SAFETY: obligation (g), as [`GzFile::open`].
+        Self(unsafe { c_gzopen64(path.as_ptr(), mode.as_ptr()) })
+    }
+
+    /// `gzdopen(fd, mode)`. The handle takes ownership of `fd`.
+    #[must_use]
+    pub fn dopen(fd: c_int, mode: &CStr) -> Self {
+        // SAFETY: obligation (g) for the mode string; `fd` is handed over, so there is exactly
+        // one owner at every moment.
+        Self(unsafe { c_gzdopen(fd, mode.as_ptr()) })
+    }
+
+    /// Whether the open failed, which C reports as a null handle.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        self.0.is_null()
+    }
+
+    /// The three members of the exposed `struct gzFile_s` prefix, or [`None`] for a null handle.
+    ///
+    /// `zlib.h` L1966-L1968's `gzgetc` macro reads and mutates `have`, `next` and `pos` inside
+    /// caller-compiled object code, so the prefix is part of the ABI. `next` is reported as
+    /// whether it is non-null, because a pointer's value is not comparable between
+    /// implementations.
+    #[must_use]
+    pub fn prefix(self) -> Option<(c_uint, bool, z_off64_t)> {
+        if self.0.is_null() || !self.0.is_aligned() {
+            return None;
+        }
+        // SAFETY: `self.0` is a live, aligned handle this module opened and the caller has not
+        // closed, and `gzFile_s` is the `#[repr(C)]` mirror of the prefix `gzguts.h` L170-L175
+        // embeds as `gz_state`'s first member -- so these are reads of initialised members of
+        // exactly the declared types. Nothing is written and no reference escapes.
+        let (have, next_is_null, pos) =
+            unsafe { ((*self.0).have, (*self.0).next.is_null(), (*self.0).pos) };
+        Some((have, !next_is_null, pos))
+    }
+
+    /// `gzbuffer(file, size)`.
+    #[must_use]
+    pub fn buffer(self, size: c_uint) -> c_int {
+        // SAFETY: obligation (g). `file` is a handle this module opened and the caller has not
+        // closed. Every gate below relies on the same clause.
+        unsafe { c_gzbuffer(self.0, size) }
+    }
+
+    /// `gzsetparams(file, level, strategy)`.
+    #[must_use]
+    pub fn setparams(self, level: c_int, strategy: c_int) -> c_int {
+        // SAFETY: obligation (g), as [`GzFile::buffer`].
+        unsafe { c_gzsetparams(self.0, level, strategy) }
+    }
+
+    /// `gzwrite(file, buf, len)`.
+    #[must_use]
+    pub fn write(self, data: &[u8]) -> c_int {
+        // SAFETY: obligations (c) and (g). The library copies the bytes into its own buffer
+        // rather than retaining the pointer.
+        unsafe { c_gzwrite(self.0, data.as_ptr().cast(), narrow_uint(data.len())) }
+    }
+
+    /// `gzfwrite(buf, 1, nitems, file)`.
+    #[must_use]
+    pub fn fwrite(self, data: &[u8]) -> z_size_t {
+        // SAFETY: obligations (c) and (g), with `size` 1 and `nitems` the length, so the product
+        // cannot overflow and the readable region is exactly `data`.
+        unsafe { c_gzfwrite(data.as_ptr().cast(), 1, data.len(), self.0) }
+    }
+
+    /// `gzfwrite(buf, size, nitems, file)` with the two factors given separately.
+    #[must_use]
+    pub fn fwrite_items(self, data: &[u8], size: z_size_t, nitems: z_size_t) -> z_size_t {
+        // The extra clause the caller owes, checked rather than assumed.
+        match size.checked_mul(nitems) {
+            // SAFETY: obligations (c) and (g), plus the product clause this arm's guard
+            // establishes: `size * nitems` readable bytes really are there.
+            Some(total) if total <= data.len() => unsafe {
+                c_gzfwrite(data.as_ptr().cast(), size, nitems, self.0)
+            },
+            _ => 0,
+        }
+    }
+
+    /// `gzputc(file, c)`.
+    #[must_use]
+    pub fn putc(self, byte: c_int) -> c_int {
+        // SAFETY: obligation (g), as [`GzFile::buffer`].
+        unsafe { c_gzputc(self.0, byte) }
+    }
+
+    /// `gzputs(file, s)`.
+    #[must_use]
+    pub fn puts(self, text: &CStr) -> c_int {
+        // SAFETY: obligation (g), plus that `text` is NUL-terminated, read-only for the library
+        // and outlives the call.
+        unsafe { c_gzputs(self.0, text.as_ptr()) }
+    }
+
+    /// `gzflush(file, flush)`.
+    #[must_use]
+    pub fn flush(self, flush: c_int) -> c_int {
+        // SAFETY: obligation (g), as [`GzFile::buffer`].
+        unsafe { c_gzflush(self.0, flush) }
+    }
+
+    /// `gzread(file, buf, len)`.
+    #[must_use]
+    pub fn read(self, buf: &mut [u8]) -> c_int {
+        // SAFETY: obligations (d) and (g). `len` bytes really are writable at that pointer, both
+        // taken from one live exclusive slice.
+        unsafe { c_gzread(self.0, buf.as_mut_ptr().cast(), narrow_uint(buf.len())) }
+    }
+
+    /// `gzfread(buf, 1, nitems, file)`.
+    #[must_use]
+    pub fn fread(self, buf: &mut [u8]) -> z_size_t {
+        // SAFETY: obligations (d) and (g), with `size` 1 and `nitems` the length.
+        unsafe { c_gzfread(buf.as_mut_ptr().cast(), 1, buf.len(), self.0) }
+    }
+
+    /// `gzfread(buf, size, nitems, file)` with the two factors given separately.
+    #[must_use]
+    pub fn fread_items(self, buf: &mut [u8], size: z_size_t, nitems: z_size_t) -> z_size_t {
+        // The product clause [`GzFile::fwrite_items`] records, applied to the destination.
+        match size.checked_mul(nitems) {
+            // SAFETY: obligations (d) and (g), plus the product clause this arm's guard
+            // establishes: `size * nitems` writable bytes really are there.
+            Some(total) if total <= buf.len() => unsafe {
+                c_gzfread(buf.as_mut_ptr().cast(), size, nitems, self.0)
+            },
+            _ => 0,
+        }
+    }
+
+    /// `gzgets(file, buf, len)`, as the bytes written before the terminating NUL.
+    #[must_use]
+    pub fn gets(self, buf: &mut [u8]) -> Option<Vec<u8>> {
+        // SAFETY: obligations (d) and (g). `gzgets` writes at most `len` bytes including the
+        // terminating NUL, and `len` here is exactly the slice's length.
+        let answer = unsafe { c_gzgets(self.0, buf.as_mut_ptr().cast(), narrow_int(buf.len())) };
+        if answer.is_null() {
+            return None;
+        }
+        // SAFETY: on a non-null return the library has written a NUL-terminated string into
+        // `buf`, which is still borrowed and therefore still live, and `answer` addresses its
+        // first byte.
+        let text = unsafe { CStr::from_ptr(answer) };
+        Some(text.to_bytes().to_vec())
+    }
+
+    /// `gzgetc(file)`.
+    #[must_use]
+    pub fn getc(self) -> c_int {
+        // SAFETY: obligation (g), as [`GzFile::buffer`].
+        unsafe { c_gzgetc(self.0) }
+    }
+
+    /// `gzgetc_(file)`, the always-a-function form the macro falls back to.
+    #[must_use]
+    pub fn getc_(self) -> c_int {
+        // SAFETY: obligation (g), as [`GzFile::buffer`].
+        unsafe { c_gzgetc_(self.0) }
+    }
+
+    /// `gzungetc(c, file)`. Note C's argument order, which puts the byte first.
+    #[must_use]
+    pub fn ungetc(self, byte: c_int) -> c_int {
+        // SAFETY: obligation (g), as [`GzFile::buffer`].
+        unsafe { c_gzungetc(byte, self.0) }
+    }
+
+    /// `gzseek(file, offset, whence)`.
+    #[must_use]
+    pub fn seek(self, offset: z_off_t, whence: c_int) -> z_off_t {
+        // SAFETY: obligation (g), as [`GzFile::buffer`].
+        unsafe { c_gzseek(self.0, offset, whence) }
+    }
+
+    /// `gzseek64(file, offset, whence)`.
+    #[must_use]
+    pub fn seek64(self, offset: z_off64_t, whence: c_int) -> z_off64_t {
+        // SAFETY: obligation (g), as [`GzFile::buffer`].
+        unsafe { c_gzseek64(self.0, offset, whence) }
+    }
+
+    /// `gzrewind(file)`.
+    #[must_use]
+    pub fn rewind(self) -> c_int {
+        // SAFETY: obligation (g), as [`GzFile::buffer`].
+        unsafe { c_gzrewind(self.0) }
+    }
+
+    /// `gztell(file)`.
+    #[must_use]
+    pub fn tell(self) -> z_off_t {
+        // SAFETY: obligation (g), as [`GzFile::buffer`].
+        unsafe { c_gztell(self.0) }
+    }
+
+    /// `gztell64(file)`.
+    #[must_use]
+    pub fn tell64(self) -> z_off64_t {
+        // SAFETY: obligation (g), as [`GzFile::buffer`].
+        unsafe { c_gztell64(self.0) }
+    }
+
+    /// `gzoffset(file)`.
+    #[must_use]
+    pub fn offset(self) -> z_off_t {
+        // SAFETY: obligation (g), as [`GzFile::buffer`].
+        unsafe { c_gzoffset(self.0) }
+    }
+
+    /// `gzoffset64(file)`.
+    #[must_use]
+    pub fn offset64(self) -> z_off64_t {
+        // SAFETY: obligation (g), as [`GzFile::buffer`].
+        unsafe { c_gzoffset64(self.0) }
+    }
+
+    /// `gzeof(file)`.
+    #[must_use]
+    pub fn eof(self) -> c_int {
+        // SAFETY: obligation (g), as [`GzFile::buffer`].
+        unsafe { c_gzeof(self.0) }
+    }
+
+    /// `gzdirect(file)`.
+    #[must_use]
+    pub fn direct(self) -> c_int {
+        // SAFETY: obligation (g), as [`GzFile::buffer`].
+        unsafe { c_gzdirect(self.0) }
+    }
+
+    /// `gzerror(file, &errnum)`, as the code and the message together.
+    ///
+    /// `sentinel` is what `errnum` is initialised to, so a caller can tell "the library wrote
+    /// nothing" from "the library wrote zero"; the message is [`None`] for the null return, for
+    /// the reason [`crate::port::GzFile::error`] gives.
+    #[must_use]
+    pub fn error(self, sentinel: c_int) -> (c_int, Option<Vec<u8>>) {
+        let mut errnum: c_int = sentinel;
+        // SAFETY: obligations (f) and (g). `errnum` is a live local of exactly the declared
+        // type, initialised before the call and outliving it, and the pointer is not retained.
+        let message = unsafe { c_gzerror(self.0, core::ptr::addr_of_mut!(errnum)) };
+        (errnum, gz_message(message))
+    }
+
+    /// `gzclearerr(file)`.
+    pub fn clearerr(self) {
+        // SAFETY: obligation (g), as [`GzFile::buffer`].
+        unsafe { c_gzclearerr(self.0) }
+    }
+
+    /// `gzclose(file)`. Consumes the handle.
+    #[must_use]
+    pub fn close(self) -> c_int {
+        // SAFETY: obligation (g)'s exactly-one-`gzclose` half, which the caller owes and which
+        // taking `self` by value expresses as far as a `Copy` handle can.
+        unsafe { c_gzclose(self.0) }
+    }
+
+    /// `gzclose_r(file)`, the read-side form.
+    #[must_use]
+    pub fn close_r(self) -> c_int {
+        // SAFETY: as [`GzFile::close`].
+        unsafe { c_gzclose_r(self.0) }
+    }
+
+    /// `gzclose_w(file)`, the write-side form.
+    #[must_use]
+    pub fn close_w(self) -> c_int {
+        // SAFETY: as [`GzFile::close`].
+        unsafe { c_gzclose_w(self.0) }
+    }
+}
+
+/// The bytes of a `gzerror` message, or [`None`] for a null pointer.
+fn gz_message(message: *const c_char) -> Option<Vec<u8>> {
+    if message.is_null() {
+        return None;
+    }
+    // SAFETY: `gzerror` returns either null -- handled above -- or a NUL-terminated string owned
+    // by the stream and valid for reads until the next call on that handle. It is copied here
+    // rather than borrowed, so nothing outlives that window.
+    Some(unsafe { CStr::from_ptr(message) }.to_bytes().to_vec())
+}
+
+// =============================================================================
 //  Smoke tests
 // =============================================================================
 //
@@ -1810,20 +3081,18 @@ pub fn oracle_config(level: c_uint) -> Option<OracleConfig> {
 //  linker to resolve the names, which is why the smoke module lives here rather than under
 //  `tests/`.
 //
-//  It is also, today, the only thing this crate runs.  Nothing compares the two implementations:
-//  `crates/zlib-rs-differential/tests/` does not exist, so there is no byte-identity suite, no
-//  stream-interoperability suite and no ported-table comparison anywhere in the tree.  That work is
-//  where such assertions belong, and the rule of thumb for the boundary still holds -- a test in
-//  this module may reference the oracle and nothing else; the moment it needs `zlib_rs` or
-//  `libz_rs_sys` it is a differential test and belongs under `tests/`, which is also the only place
-//  those dev-dependencies resolve.
+//  It is not, however, the only thing this crate runs any more: `tests/byte_identical.rs`,
+//  `tests/roundtrip_interop.rs` and `tests/table_equality.rs` are the byte-identity,
+//  stream-interoperability and ported-table comparisons, and each one drives both implementations.
+//  The rule of thumb that separates them from this module still holds -- a test here may reference
+//  the oracle and nothing else; the moment it needs `zlib_rs` or `libz_rs_sys` it is a differential
+//  test and belongs under `tests/`.
 //
 //  The expected values below are properties of the reference implementation, taken from the headers
 //  and from `test/example.c` rather than from a previous run of this code.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::ffi::CStr;
 
     /// `ZLIB_VERSION` from `zlib.h`, which the oracle must report verbatim.
     ///
@@ -2038,10 +3307,10 @@ mod tests {
 
     /// The generated-table accessors are wired up and the safe wrappers bound them correctly.
     ///
-    /// This checks *shape* only -- lengths, geometry and element sizes. Nothing compares the
-    /// contents against the port's `const` arrays: that belongs in a table-equality suite under
-    /// `tests/`, which has not been written, and reproducing it here is exactly the growth this
-    /// module must not undergo.
+    /// This checks *shape* only -- lengths, geometry and element sizes. Nothing here compares the
+    /// contents against the port's `const` arrays: that is `tests/table_equality.rs`, which
+    /// imports every accessor below and does it element for element, and reproducing it here is
+    /// exactly the growth this module must not undergo.
     #[test]
     fn table_accessors_report_the_expected_shapes() {
         assert_eq!(oracle_crc_table().len(), 256, "crc_table");

@@ -4,11 +4,12 @@
 # and the exported C ABI live one layer up, in `libz-rs-sys`.
 #
 # `version`, `edition`, `rust-version`, `license` and `publish` are inherited
-# from the workspace root so the MSRV contract (edition 2021 + rustc 1.80,
-# mirrored by `msrv` in clippy.toml) and the publishing policy are each stated in
-# exactly one place.  Only keys the root `[workspace.package]` is contracted to
-# provide are inherited: inheriting a key the root does not declare is a hard,
-# workspace-wide manifest error.
+# from the workspace root so the MSRV contract (edition 2021 + rustc 1.80, which
+# is also the floor clippy holds this crate to, because clippy.toml declares no
+# `msrv` key and clippy therefore reads this `rust-version`) and the publishing
+# policy are each stated in exactly one place.  Only keys the root
+# `[workspace.package]` is contracted to provide are inherited: inheriting a key
+# the root does not declare is a hard, workspace-wide manifest error.
 
 [package]
 name = "zlib-rs"

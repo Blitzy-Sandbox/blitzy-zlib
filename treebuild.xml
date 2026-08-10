@@ -118,7 +118,6 @@
       clippy.toml          lint thresholds
       deny.toml            cargo deny license and advisory policy
       cbindgen.toml        C header generation, diffed against zlib.h
-      rust/README.md       developer guide for the port
 
     crates/zlib-rs         The safe core.  Carries forbid(unsafe_code) with no_std
                            plus alloc and an empty dependencies table, so it pulls
@@ -131,14 +130,34 @@
                                        read_buf.rs  weak_slice.rs  infback.rs
                                        compress.rs  uncompress.rs
 
-    crates/libz-rs-sys     The C ABI facade, and the only crate permitted to write
-                           unsafe.  [lib] name = "z" with
+    crates/libz-rs-sys     The C ABI facade: the only crate that exports symbols and
+                           the only shipped crate that writes unsafe, under
+                           deny(unsafe_op_in_unsafe_fn) with an invariant named at
+                           every block.  The safe wrappers that let the differential
+                           suites, the benchmarks and the fuzz targets drive this C
+                           ABI without raw pointers of their own are NOT here: they
+                           are the boundary gates in the dev-only
+                           crates/zlib-rs-differential/src/port.rs, kept outside the
+                           facade because AAP 0.6.1 fixes the facade's unsafe at the
+                           six unavoidable C-ABI site categories and a test harness
+                           is not one of them.  The one other place that declares raw
+                           entry points is the dev-only
+                           crates/zlib-rs-differential/src/oracle.rs, which is where
+                           the C oracle is declared.  [lib] name = "z" with
                            crate-type = ["cdylib", "staticlib", "rlib"] makes Cargo
                            emit libz.so and libz.a from one definition of the
-                           exported surface.  build.rs drives the packaging, and
-                           csrc/ holds the two C translation units stable Rust
-                           cannot declare: the variadic gzprintf and gzvprintf, and
-                           the codetype prototype of inflate_table.
+                           exported surface.  csrc/ holds the two C translation
+                           units stable Rust cannot declare: the variadic gzprintf
+                           and gzvprintf, and the codetype prototype of
+                           inflate_table.
+                           build.rs handles what belongs to the build: it emits the
+                           link arguments, publishes one cfg, compiles those two C
+                           units, and prunes stale artifact aliases.  Packaging is
+                           NOT its work and cannot be: a build script runs before
+                           the link, so a versioned name it created would dangle.
+                           The relink through zlib.map, the SONAME and the symlink
+                           chain belong to Makefile.in's rust target and to the
+                           equivalent block in CMakeLists.txt.
 
     crates/zlib-rs-differential
                            Dev-only oracle harness.  Its build script compiles the
@@ -147,28 +166,47 @@
                            comparing them is a memory compare.  It appears in the
                            dependencies table of neither shipped crate, which is
                            what keeps reference zlib an oracle rather than a build
-                           dependency.
+                           dependency.  Driving two C ABIs does mean it needs
+                           unsafe of its own; that is confined to src/oracle.rs
+                           and src/port.rs, and every suite under tests/, all
+                           three attached benches and all five fuzz targets that
+                           drive those gates carry forbid(unsafe_code).
 
     fuzz/                  Dev-only cargo fuzz targets; its own workspace, excluded
                            from the root one.
     benches/               Dev-only criterion benchmark suites.
 
-    Packaging is unaffected.  Both implementations emit the same library named by
-    dlname above, install the same two public headers, and export the same ABI
-    under the same zlib.map version script: libz.so.1.3.2.1-motley with SONAME
-    libz.so.1, the libz.so.1 and libz.so symlinks onto it, and libz.a.  A consumer
-    includes zlib.h and links -lz either way, unrecompiled.
+    Packaging is unaffected on the ELF platforms where the Rust drop-in is staged
+    at all, which is where a linker accepts soname and version-script and is
+    verified on x86_64-unknown-linux-gnu.  There, both implementations emit the
+    same library named by dlname above, install the same two public headers, and
+    export the same ABI under the same zlib.map version script:
+    libz.so.1.3.2.1-motley with SONAME libz.so.1, the libz.so.1 and libz.so
+    symlinks onto it, and libz.a.  A consumer includes zlib.h and dynamically
+    links -lz either way, unrecompiled.  Static linking through the installed
+    zlib.pc is the one case that is not equivalent yet, because a Rust libz.a
+    needs the Rust runtime's target-specific companion libraries and the
+    descriptor advertises none of them; zlib.pc.in states the measurement.
 
     Entry points, spelled without the leading dashes their cargo and make options
-    need, because an XML comment may not hold two consecutive hyphens.  README,
-    rust/README.md and Makefile.in carry the exact command lines:
+    need, because an XML comment may not hold two consecutive hyphens.  README and
+    Makefile.in carry the exact command lines, and the workflow that runs every one
+    of them is .github/workflows/rust.yml:
 
       cargo build      release profile, packages zlib-rs and libz-rs-sys
       cargo build      release profile, package libz-rs-sys, features libz-compat
       cargo test       release profile, whole workspace
       make rust        stage the installable shared and static drop-in libraries
       make rust-test   link and run the unmodified C drivers against them
-      make rust-header regenerate the cbindgen header and diff it against zlib.h
+      make rust-header regenerate the cbindgen header, compile it standalone in
+                       four dialects, and compare the function names it declares
+                       against the ones zlib.h declares, in both directions.
+                       Comparing SHAPE, meaning signatures, struct layouts and
+                       macro values, belongs to the header job of
+                       .github/workflows/rust.yml, which invokes this target first
+      make rust-symbols diff the staged library's exported symbols against a built
+                       C library; unlike make rust it fails rather than skips when
+                       that library is absent
       make rust-clean  remove the Cargo target directory and the staged artifacts
       cmake            configure with the ZLIB_BUILD_RUST option for the same
                        drop-in through CMake

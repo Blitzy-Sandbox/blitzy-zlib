@@ -35,11 +35,21 @@
 //! * **Coverage of facts a `const` item is not placed to check.** Two of them:
 //!   the internal `inflate_state` prefix that unmodified C *test* code writes
 //!   through, and the non-zero-based `inflate_mode` ladder. See §9 and §10.
-//! * **Execution under the sanitizers.** A `const` item is *evaluated*, not
-//!   executed, so it is invisible to AddressSanitizer and to Miri; a test binary is
-//!   not. This file touches no file, no socket and no subprocess — only `size_of`,
-//!   `align_of`, `offset_of!` and one `CStr` read — and it was run under both
-//!   `-Zsanitizer=address` and `cargo miri test` on nightly, clean in each.
+//! * **Execution under AddressSanitizer.** A `const` item is *evaluated*, not
+//!   executed, so it is invisible to a sanitizer; a test binary is not. This file
+//!   touches no file, no socket and no subprocess — only `size_of`, `align_of`,
+//!   `offset_of!` and one `CStr` read — and the `asan` job in
+//!   `.github/workflows/rust.yml` runs it: that job's scope is
+//!   `cargo +nightly test -p libz-rs-sys` under `-Zsanitizer=address`, which is
+//!   every suite in this directory, so this one is covered on every push.
+//!
+//!   Miri is a different matter and the distinction is worth keeping straight. The
+//!   `miri` job is scoped to `-p zlib-rs`, deliberately: Miri cannot execute
+//!   foreign functions, and this crate is the one that calls them. So this file is
+//!   NOT under a Miri gate in CI. It happens to contain nothing Miri would object
+//!   to, and `cargo +nightly miri test -p libz-rs-sys --test abi_layout` was run by
+//!   hand and was clean, but that is a manual observation rather than something a
+//!   push re-establishes — do not cite it as automated coverage.
 //!
 //! # ★ Two places where *unmodified C code* reaches into memory this port owns
 //!
@@ -77,6 +87,7 @@
 //! |---|---|---|---|
 //! | Absolute, LP64 | [`is_lp64`] | LP64 only | any drift at all |
 //! | Absolute, LLP64 | [`is_llp64`] | LLP64 only | any drift at all |
+//! | Absolute, ILP32 | [`is_ilp32`] | ILP32 only | any drift at all |
 //! | Relational | none | every target | reordered, inserted, removed or widened fields |
 //!
 //! A gated-away tier **skips**; it never fails. The gate is a plain runtime `if`
@@ -84,7 +95,14 @@
 //! [`is_lp64`] to `false` and the absolute tests report `ok` having asserted
 //! nothing, while [`relational_invariants_all_targets`] still passes on its own.
 //! [`integer_model_is_recognised`] exists so that "asserted nothing" can never
-//! happen silently on a 64-bit target.
+//! happen silently on **any** of the three models this port supports.
+//!
+//! ★ ILP32 is a full absolute tier and not a relational-only fallback. The Rust
+//! Tier-1 list includes `i686-unknown-linux-gnu`, so a 32-bit consumer is a real
+//! consumer, and the relational tier cannot see a *narrowing* re-type the target's
+//! padding absorbs — the very failure mode it was left uncovered against. Leaving
+//! it to `skipped(…)` meant the ILP32 rows of §2, §3, §4, §6 and §9 reported `ok`
+//! while asserting nothing at all.
 //!
 //! `#[cfg(…)]` cannot express the condition: the width of `c_ulong` is not a
 //! `cfg` predicate, and `cfg(target_pointer_width = "64")` is wrong precisely on
@@ -112,6 +130,27 @@
 //! `gz_header::time` sits at **8, not 4**: `uLong time` needs 8-byte alignment
 //! after `int text`, leaving four bytes of padding. It is the single offset most
 //! likely to be derived wrongly by hand, so §3 asserts it explicitly.
+//!
+//! The LLP64 and ILP32 numbers are *derived* rather than measured on hardware, and
+//! derived is enough because `#[repr(C)]` placement is a function of nothing but
+//! field width and field alignment. They were obtained by compiling these very
+//! facade types for `x86_64-pc-windows-gnu` and `i686-unknown-linux-gnu` and reading
+//! `size_of` / `align_of` / `offset_of!` back out of the compiler, and the method was
+//! cross-validated by re-deriving the LP64 column the same way and getting the C
+//! probe's numbers back exactly:
+//!
+//! | Type | LP64 | LLP64 | ILP32 |
+//! |---|---|---|---|
+//! | `z_stream` size / align | 112 / 8 | 88 / 8 | **56 / 4** |
+//! | `gz_header` size / align | 80 / 8 | 72 / 8 | **52 / 4** |
+//! | `struct gzFile_s` size / align | 24 / 8 | 24 / 8 | **16 / 4** |
+//! | `uInt` / `uLong` / `voidpf` / `z_off_t` | 4 / 8 / 8 / 8 | 4 / 4 / 8 / 8 | **4 / 4 / 4 / 4** |
+//!
+//! ★ `struct gzFile_s` is 16 bytes and 4-aligned on ILP32, not 24/8: the i386
+//! System V ABI aligns `z_off64_t` — a 64-bit type — to **four** bytes, so `pos`
+//! lands at offset 8 behind a 4-byte `have` and a 4-byte `next` with no padding
+//! anywhere and no tail. That is the offset a 32-bit caller's `gzgetc` macro baked
+//! into its own object code, so it is asserted rather than derived at run time.
 //!
 //! # What is deliberately absent
 //!
@@ -279,6 +318,29 @@ fn is_lp64() -> bool {
 /// 4 and 8 bytes. [`integer_model_is_recognised`] asserts that.
 fn is_llp64() -> bool {
     size_of::<*const c_void>() == 8 && size_of::<c_ulong>() == 4
+}
+
+/// True when the target uses the 32-bit model: ILP32 — 32-bit pointers with a
+/// 32-bit `unsigned long`, which is `i686-unknown-linux-gnu` and every other 32-bit
+/// Tier-1 target.
+///
+/// ★ This gate is why the ILP32 rows of §2, §3, §4, §6 and §9 assert anything at
+/// all. Before it existed they reached `skipped(…)` and reported `ok` having checked
+/// nothing, leaving a Tier-1 integer model covered only by
+/// [`relational_invariants_all_targets`] — and a relational chain is precisely blind
+/// to the one defect class this file exists to catch on a narrower target: a
+/// *narrowing* re-type whose lost bytes the target's own padding absorbs, leaving
+/// every link in the chain intact.
+///
+/// Spelled as a computed predicate for the same reason [`is_lp64`] is: no `cfg`
+/// reports the width of `c_ulong`, and `cfg(target_pointer_width = "32")` alone
+/// would also admit a hypothetical 32-bit-pointer target with a 64-bit
+/// `unsigned long`, whose `z_stream` would not be 56 bytes.
+///
+/// The three gates are pairwise exclusive by construction — a pointer cannot be
+/// both 4 and 8 bytes — which [`integer_model_is_recognised`] asserts.
+fn is_ilp32() -> bool {
+    size_of::<*const c_void>() == 4 && size_of::<c_ulong>() == 4
 }
 
 /// Reports that a gated tier was skipped, naming the tier and the model that
@@ -669,6 +731,44 @@ fn z_stream_layout_llp64() {
     assert_eq!(offset_of!(z_stream, reserved), 80);
 }
 
+/// `z_stream` under ILP32 (`i686`): 56 bytes, align 4, and every field 4 bytes apart.
+///
+/// With a 4-byte pointer and a 4-byte `unsigned long` every one of the fourteen
+/// members is four bytes wide, so the struct is a packed array of them and no padding
+/// exists anywhere: offsets 0, 4, 8, … 52. That regularity is exactly what makes the
+/// relational tier blind here — a narrowed field would still leave every later offset
+/// where it was — so the absolute numbers are the only thing that can catch drift on
+/// this model, which is why the tier exists rather than skipping.
+#[test]
+fn z_stream_layout_ilp32() {
+    if !is_ilp32() {
+        skipped("z_stream_layout_ilp32");
+        return;
+    }
+
+    assert_eq!(size_of::<z_stream>(), 56, "sizeof(z_stream) under ILP32");
+    assert_eq!(align_of::<z_stream>(), 4, "_Alignof(z_stream) under ILP32");
+
+    assert_eq!(offset_of!(z_stream, next_in), 0);
+    assert_eq!(offset_of!(z_stream, avail_in), 4);
+    assert_eq!(
+        offset_of!(z_stream, total_in),
+        8,
+        "a 4-byte unsigned long needs no padding after uInt avail_in"
+    );
+    assert_eq!(offset_of!(z_stream, next_out), 12);
+    assert_eq!(offset_of!(z_stream, avail_out), 16);
+    assert_eq!(offset_of!(z_stream, total_out), 20);
+    assert_eq!(offset_of!(z_stream, msg), 24);
+    assert_eq!(offset_of!(z_stream, state), 28);
+    assert_eq!(offset_of!(z_stream, zalloc), 32);
+    assert_eq!(offset_of!(z_stream, zfree), 36);
+    assert_eq!(offset_of!(z_stream, opaque), 40);
+    assert_eq!(offset_of!(z_stream, data_type), 44);
+    assert_eq!(offset_of!(z_stream, adler), 48);
+    assert_eq!(offset_of!(z_stream, reserved), 52);
+}
+
 // =============================================================================
 //  §3  `gz_header` — `zlib.h` L118-L133.  Measured: 80 bytes, align 8
 // =============================================================================
@@ -757,6 +857,47 @@ fn gz_header_layout_llp64() {
     assert_eq!(offset_of!(gz_header, done), 64);
 }
 
+/// `gz_header` under ILP32: 52 bytes, align 4, thirteen fields four bytes apart.
+///
+/// Every member — three `int`s plus `done`, a 4-byte `uLong time`, three 4-byte
+/// pointers and four `uInt` capacities — is four bytes wide on this model, so the
+/// padding LP64 needs after `int text` disappears and the struct packs to 13 × 4.
+/// The three capacity fields `inflateGetHeader` clamps against (`extra_max` 24,
+/// `name_max` 32, `comm_max` 40) are the ones a caller's own object code addresses,
+/// so they are pinned by name.
+#[test]
+fn gz_header_layout_ilp32() {
+    if !is_ilp32() {
+        skipped("gz_header_layout_ilp32");
+        return;
+    }
+
+    assert_eq!(size_of::<gz_header>(), 52, "sizeof(gz_header) under ILP32");
+    assert_eq!(
+        align_of::<gz_header>(),
+        4,
+        "_Alignof(gz_header) under ILP32"
+    );
+
+    assert_eq!(offset_of!(gz_header, text), 0);
+    assert_eq!(
+        offset_of!(gz_header, time),
+        4,
+        "a 4-byte unsigned long needs no padding after int text"
+    );
+    assert_eq!(offset_of!(gz_header, xflags), 8);
+    assert_eq!(offset_of!(gz_header, os), 12);
+    assert_eq!(offset_of!(gz_header, extra), 16);
+    assert_eq!(offset_of!(gz_header, extra_len), 20);
+    assert_eq!(offset_of!(gz_header, extra_max), 24);
+    assert_eq!(offset_of!(gz_header, name), 28);
+    assert_eq!(offset_of!(gz_header, name_max), 32);
+    assert_eq!(offset_of!(gz_header, comment), 36);
+    assert_eq!(offset_of!(gz_header, comm_max), 40);
+    assert_eq!(offset_of!(gz_header, hcrc), 44);
+    assert_eq!(offset_of!(gz_header, done), 48);
+}
+
 // =============================================================================
 //  §4  `struct gzFile_s` — `zlib.h` L1956-L1960.  Measured: 24 bytes, align 8
 // =============================================================================
@@ -797,9 +938,9 @@ fn gz_header_layout_llp64() {
 ///
 /// See the section banner above for why these three offsets are the ones a
 /// regression would hurt most. The gate accepts either 64-bit model because the
-/// struct's layout is the same under both; on a 32-bit target the test skips and
-/// [`relational_invariants_all_targets`] still holds `have` at 0, which is the part
-/// that is true everywhere.
+/// struct's layout is the same under both. ILP32 is a genuinely different layout
+/// and gets its own tier immediately below rather than being skipped, because a
+/// 32-bit caller's `gzgetc` macro baked its own three offsets in just as firmly.
 #[test]
 fn gz_file_s_prefix() {
     if !is_lp64() && !is_llp64() {
@@ -832,6 +973,64 @@ fn gz_file_s_prefix() {
 
     // `zlib.h` L1354: `gzFile` is a pointer to it, and it is the handle every one
     // of the thirty `gz*` entry points takes or returns.
+    assert_eq!(size_of::<gzFile>(), size_of::<*mut c_void>());
+}
+
+/// The caller-visible `gzFile_s` prefix under ILP32: **16 bytes, align 4**, `have` 0,
+/// `next` 4, `pos` 8.
+///
+/// ★ Not 24/8 with `pos` at 16. Two independent narrowings compose here and the
+/// result is easy to get wrong in either direction:
+///
+/// * `next` is a pointer, so it shrinks to 4 bytes and moves from offset 8 to 4.
+/// * `pos` is `z_off64_t`, which stays **64 bits** — `zconf.h` fixes that so a 32-bit
+///   caller and a 64-bit library agree on the field at all — but the i386 System V ABI
+///   aligns a 64-bit integer to **four** bytes, not eight. So `pos` lands at 8 with no
+///   padding before it, the struct's alignment is 4, and its size is exactly 16 with no
+///   tail padding either.
+///
+/// Getting the alignment wrong would put `pos` at 8 with the struct padded to 24 and
+/// aligned to 8, which is a *different* object with the same field offsets — and every
+/// relational assertion would still hold. That is exactly the narrowing-absorbed-by-
+/// padding case the relational tier cannot see, and it is why this tier is not optional.
+#[test]
+fn gz_file_s_prefix_ilp32() {
+    if !is_ilp32() {
+        skipped("gz_file_s_prefix_ilp32");
+        return;
+    }
+
+    assert_eq!(
+        size_of::<gzFile_s>(),
+        16,
+        "sizeof(struct gzFile_s) under ILP32: a 4-byte next and a 4-aligned z_off64_t"
+    );
+    assert_eq!(
+        align_of::<gzFile_s>(),
+        4,
+        "_Alignof(struct gzFile_s) under ILP32: the i386 SysV ABI aligns a 64-bit \
+         integer to four bytes"
+    );
+
+    assert_eq!(
+        offset_of!(gzFile_s, have),
+        0,
+        "the gzgetc macro reads and decrements (g)->have here"
+    );
+    assert_eq!(
+        offset_of!(gzFile_s, next),
+        4,
+        "the gzgetc macro dereferences and increments *((g)->next)++ here"
+    );
+    assert_eq!(
+        offset_of!(gzFile_s, pos),
+        8,
+        "the gzgetc macro increments (g)->pos here"
+    );
+
+    // `z_off64_t` is 64 bits on every target with large-file support, which is the
+    // property that lets the field mean the same thing to both widths of caller.
+    assert_eq!(size_of::<z_off64_t>(), 8);
     assert_eq!(size_of::<gzFile>(), size_of::<*mut c_void>());
 }
 
@@ -1015,6 +1214,63 @@ fn primitive_type_sizes_lp64() {
     // §7 checks the property that actually matters about them.
     assert_eq!(size_of::<alloc_func>(), 8);
     assert_eq!(size_of::<free_func>(), 8);
+}
+
+/// Every `zconf.h` primitive width, at its ILP32 value.
+///
+/// Nine of the sixteen differ from LP64, which is the whole reason this tier exists
+/// rather than deferring to the relational one: `uLong`, `uLongf`, `voidpf`, `voidpc`,
+/// `voidp`, `z_off_t`, `z_size_t` and both allocator hooks are all **4** bytes here
+/// against 8 there. `z_off64_t` is the one that deliberately does *not* narrow — it is
+/// 64 bits everywhere, which is what makes `gzseek64`/`gztell64` mean the same thing to
+/// a 32-bit caller — and `z_crc_t`, `uInt`, `Bytef`, `Byte`, `charf` and `intf` are
+/// fixed-width by definition and are unchanged.
+#[test]
+fn primitive_type_sizes_ilp32() {
+    if !is_ilp32() {
+        skipped("primitive_type_sizes_ilp32");
+        return;
+    }
+
+    // `zconf.h` L405-L406 — the two integer aliases. `uLong` follows `unsigned long`
+    // down to 4 bytes here; mapping it to a fixed 64-bit integer would corrupt
+    // `total_in`, `total_out` and every checksum return value on this model.
+    assert_eq!(size_of::<uInt>(), 4);
+    assert_eq!(size_of::<uLong>(), 4);
+
+    // `zconf.h` L416-L417 — the `FAR`-qualified spellings of the same two.
+    assert_eq!(size_of::<uIntf>(), 4);
+    assert_eq!(size_of::<uLongf>(), 4);
+
+    // `zconf.h` L419-L427 — the three pointer aliases.
+    assert_eq!(size_of::<voidpf>(), 4);
+    assert_eq!(size_of::<voidpc>(), 4);
+    assert_eq!(size_of::<voidp>(), 4);
+
+    // `zconf.h` L494-L532 — `z_off_t` follows the platform's `off_t`, which is 4 bytes
+    // on a 32-bit target that has not asked for `_FILE_OFFSET_BITS=64`; `z_off64_t`
+    // stays 64 bits regardless, which is the point of its existing at all.
+    assert_eq!(size_of::<z_off_t>(), 4);
+    assert_eq!(size_of::<z_off64_t>(), 8);
+
+    // `zconf.h` L253-L270 — `size_t`, the type of the `_z` entry points.
+    assert_eq!(size_of::<z_size_t>(), 4);
+
+    // `zconf.h` L440-L444 — the CRC word `get_crc_table` publishes. Fixed width, so
+    // unchanged from LP64.
+    assert_eq!(size_of::<z_crc_t>(), 4);
+
+    // `zconf.h` L403, L412, L414, L415 — the byte, character and int types.
+    assert_eq!(size_of::<Bytef>(), 1);
+    assert_eq!(size_of::<Byte>(), 1);
+    assert_eq!(size_of::<charf>(), 1);
+    assert_eq!(size_of::<intf>(), 4);
+    assert_eq!(size_of::<c_int>(), 4);
+
+    // `zlib.h` L85-L86 — the two caller-supplied allocator hooks. §7 checks the niche
+    // property; these are the raw widths, which follow the pointer down to 4.
+    assert_eq!(size_of::<alloc_func>(), 4);
+    assert_eq!(size_of::<free_func>(), 4);
 }
 
 // =============================================================================
@@ -1221,9 +1477,11 @@ fn bounds_constants() {
 /// the header's declaration order, really does put `mode` at offset 8 — which is
 /// the arithmetic `test/infcover.c` compiled into its own object code.
 ///
-/// Reaching the port's actual state instead would need `unsafe` to dereference a
-/// private item through `z_stream::state`, which AAP §0.7.1 (a) forbids and which
-/// this file therefore does not do.
+/// The other half of the agreement — that the port's *own* prefix agrees with that
+/// mirror — is [`inflate_state_mode_abi_matches_the_real_state_prefix`], which reads
+/// the real, crate-private type through its published layout probe. Neither test
+/// dereferences a private item and neither uses `unsafe`, which AAP §0.7.1 (a)
+/// forbids in this crate's tests.
 #[test]
 fn inflate_state_mode_abi() {
     // Target-independent first: `mode` immediately follows the back-pointer,
@@ -1242,6 +1500,20 @@ fn inflate_state_mode_abi() {
     // mirror would move `last` and `wrap`.
     assert_eq!(size_of::<c_int>(), 4);
 
+    if is_ilp32() {
+        // A 4-byte pointer moves the whole tail down by four. These are the offsets a
+        // 32-bit caller's `test/infcover.c` compiled in, and they are asserted rather
+        // than skipped for the reason `is_ilp32` records.
+        assert_eq!(
+            offset_of!(CInflateStatePrefix, mode),
+            4,
+            "test/infcover.c L330 and L459 write ->mode at offset 4 under ILP32"
+        );
+        assert_eq!(offset_of!(CInflateStatePrefix, last), 8);
+        assert_eq!(offset_of!(CInflateStatePrefix, wrap), 12);
+        return;
+    }
+
     if !is_lp64() && !is_llp64() {
         skipped("inflate_state_mode_abi absolute offsets");
         return;
@@ -1254,6 +1526,76 @@ fn inflate_state_mode_abi() {
     );
     assert_eq!(offset_of!(CInflateStatePrefix, last), 12);
     assert_eq!(offset_of!(CInflateStatePrefix, wrap), 16);
+}
+
+/// The port's **real** state prefix puts the tag exactly where the C mirror puts
+/// `mode`.
+///
+/// ★ This is the assertion [`inflate_state_mode_abi`] cannot make. That test pins the
+/// *C* side of the agreement using a mirror; a mirror, by construction, compares equal
+/// to itself, so it would keep passing if the port's own prefix moved out from under
+/// it. What closes the loop is reading the layout of the actual `pub(crate)`
+/// `StatePrefix` — the head of the block `z_stream::state` really points at — and that
+/// is what [`libz_rs_sys::state_prefix_layout`] publishes: size, alignment and the two
+/// offsets, and nothing that would let this test *construct* one.
+///
+/// Both stores unmodified C makes through the opaque pointer land on
+/// `prefix.tag`:
+///
+/// ```c
+/// test/infcover.c L330   ((struct inflate_state *)strm.state)->mode = DICT;
+/// test/infcover.c L459   state->mode = SYNC;
+/// ```
+///
+/// so `tag_offset` must equal the mirror's `mode` offset on every target, and the tag
+/// must be exactly as wide as the C `int` those stores write. Gated on nothing: the
+/// agreement is relational and therefore true under every integer model, and the
+/// per-model absolute numbers it resolves to are pinned in the three tiers above.
+#[cfg(feature = "libz-compat")]
+#[test]
+fn inflate_state_mode_abi_matches_the_real_state_prefix() {
+    let real = libz_rs_sys::state_prefix_layout();
+
+    assert_eq!(
+        real.strm_offset,
+        offset_of!(CInflateStatePrefix, strm),
+        "the real prefix must carry the back-pointer where inflate.h L83 does"
+    );
+    assert_eq!(
+        real.tag_offset,
+        offset_of!(CInflateStatePrefix, mode),
+        "the real prefix must carry the tag where inflate.h L84 puts inflate_mode mode: \
+         that is the address test/infcover.c L330 and L459 write through"
+    );
+    assert_eq!(
+        real.tag_size,
+        size_of::<c_int>(),
+        "the tag must be exactly as wide as the C int those two stores write"
+    );
+
+    // The prefix is `{ z_streamp, c_int, c_int }`: the back-pointer, the tag, and the
+    // flavour cookie the ABI's own tail padding pays for on a 64-bit target. Asserting
+    // the total is what catches an inserted member, which moving the Rust payload would
+    // otherwise hide from C entirely.
+    assert_eq!(
+        real.size,
+        size_of::<z_streamp>() + 2 * size_of::<c_int>(),
+        "the prefix must stay pointer + two ints with no member beyond the ABI's own \
+         padding"
+    );
+    assert_eq!(real.align, align_of::<z_streamp>());
+
+    // Per-model resolution of the same two numbers, so a drift is reported as a
+    // concrete difference rather than only as a broken relationship.
+    if is_lp64() || is_llp64() {
+        assert_eq!(real.size, 16);
+        assert_eq!(real.tag_offset, 8);
+    } else if is_ilp32() {
+        assert_eq!(real.size, 12);
+        assert_eq!(real.tag_offset, 4);
+    } else {
+        skipped("inflate_state_mode_abi_matches_the_real_state_prefix absolute sizes");
+    }
 }
 
 // =============================================================================
@@ -1381,14 +1723,21 @@ fn inflate_mode_discriminant_ladder() {
 /// report `ok` — the one failure mode a contract test must not have. Three things
 /// are established:
 ///
-/// * The two models are mutually exclusive, so at most one absolute tier ever runs.
-///   A future third gate cannot be written in a way that overlaps them without
+/// * The three models are mutually exclusive, so at most one absolute tier ever runs.
+///   A future fourth gate cannot be written in a way that overlaps them without
 ///   failing here.
-/// * On any 64-bit-pointer target, exactly one of them holds — so §2, §3, §4, §6 and
-///   §9 really did assert their exact numbers rather than returning early.
+/// * On any 64-bit-pointer target, exactly one of LP64/LLP64 holds, and on any
+///   32-bit-pointer target with a 32-bit `unsigned long` ILP32 holds — so §2, §3, §4,
+///   §6 and §9 really did assert their exact numbers rather than returning early.
 /// * The relational tier's premise holds: whatever the model, `c_ulong` is one of
 ///   the two widths the absolute tiers were derived for, or the target falls through
 ///   to relational-only checking by design.
+///
+/// ★ The 32-bit arm is the reason this test changed. Every Tier-1 32-bit target is
+/// ILP32, so before [`is_ilp32`] existed a `cargo test --target
+/// i686-unknown-linux-gnu` reported `ok` with **five** tiers skipped and nothing
+/// absolute asserted anywhere — the exact silence this test exists to make impossible,
+/// missed because it only ever asked the question of a 64-bit target.
 ///
 /// The model is printed either way, so a CI log records which tier ran.
 #[test]
@@ -1400,6 +1749,11 @@ fn integer_model_is_recognised() {
         !(is_lp64() && is_llp64()),
         "LP64 and LLP64 cannot both hold: c_ulong cannot be 4 and 8 bytes at once"
     );
+    assert!(
+        !(is_ilp32() && (is_lp64() || is_llp64())),
+        "ILP32 cannot hold beside a 64-bit model: a pointer cannot be 4 and 8 bytes \
+         at once"
+    );
 
     if pointer_width == 8 {
         assert!(
@@ -1409,12 +1763,22 @@ fn integer_model_is_recognised() {
         );
     }
 
+    if pointer_width == 4 {
+        assert!(
+            is_ilp32(),
+            "a 32-bit target must match the ILP32 absolute tier, but c_ulong is \
+             {ulong_width} bytes — add a tier rather than leaving it unchecked"
+        );
+    }
+
     let model = if is_lp64() {
         "LP64 (absolute tier active)"
     } else if is_llp64() {
         "LLP64 (absolute tier active)"
+    } else if is_ilp32() {
+        "ILP32 (absolute tier active)"
     } else {
-        "neither LP64 nor LLP64 (relational tier only, by design)"
+        "none of LP64, LLP64 or ILP32 (relational tier only, by design)"
     };
     eprintln!("abi_layout: pointer {pointer_width} bytes, c_ulong {ulong_width} bytes -> {model}");
 }

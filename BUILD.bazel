@@ -121,14 +121,18 @@ config_setting(
 # now and after the port, because Rust is out of Bazel scope here.
 #
 # The Rust equivalents of the artifacts produced by this target, libz.so and
-# libz.a, are INTENDED to carry the same exported symbols and are built with
+# libz.a, carry the same exported symbols; they are built with
 # `cargo build --release -p zlib-rs -p libz-rs-sys` and packaged by
 # `make rust`.  Name the two packages explicitly: a bare `cargo build` at the
 # workspace root also reaches crates/zlib-rs-differential, whose build script
 # compiles the very C sources listed below.  Symbol parity against this target's
-# output is the requirement, and `make rust-test` is what checks it with nm.  The
-# facade carries the whole exported surface in Rust, so that check is runnable;
-# run it before relying on parity, because no in-tree automation runs it.
+# output is the requirement, `make rust-test` and `make rust-symbols` check it
+# locally with nm, and the `symbols` job of .github/workflows/rust.yml is the
+# gate: it builds the C library from these same sources, stages the Rust
+# drop-in, diffs both nm tables, and asserts 111 exported symbols, 95 functions
+# and the 16 version nodes it re-derives from zlib.map.  Bazel is not part of
+# that path -- it builds only the C oracle -- so run the make targets rather
+# than inferring parity from a Bazel build.
 cc_library(
     name = "z",
     srcs = [

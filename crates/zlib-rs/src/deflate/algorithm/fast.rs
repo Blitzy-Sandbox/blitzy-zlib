@@ -468,8 +468,7 @@ mod tests {
     //! the reference proves the requirement this file exists to satisfy: a round trip that
     //! merely decompresses proves nothing about byte identity, and RFC 1951 conformance is a
     //! far weaker property. These are a committed subset, not a substitute for
-    //! the planned `crates/zlib-rs-differential/tests/byte_identical.rs`, which is to sweep the
-    //! whole matrix and has not landed yet.
+    //! `crates/zlib-rs-differential/tests/byte_identical.rs`, which sweeps the whole matrix.
     //!
     //! **The individual decisions, observed directly.** A compressor called with `Z_NO_FLUSH`
     //! and a pre-loaded window returns [`BlockState::NeedMore`] *without* flushing, which

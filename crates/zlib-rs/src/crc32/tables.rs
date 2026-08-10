@@ -13,10 +13,9 @@
 //! the decoder depends on.
 //!
 //! The C header stays in the repository unmodified, so the two can be compared at
-//! any time. The planned `crates/zlib-rs-differential/tests/table_equality.rs`
-//! will be that comparison, and it is why every table below is `pub` rather than
-//! crate-private -- it has not landed yet, so nothing checks the transcription
-//! automatically today.
+//! any time. `crates/zlib-rs-differential/tests/table_equality.rs` is that
+//! comparison, and it is why every table below is `pub` rather than
+//! crate-private.
 //!
 //! The braided design these tables serve is due to Kadatch and Jenkins (2010),
 //! credited at `crc32.c` L5-L7; the paper is carried in this distribution at

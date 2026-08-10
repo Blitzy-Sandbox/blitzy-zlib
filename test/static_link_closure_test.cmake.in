@@ -1,0 +1,85 @@
+# Static consumption of the INSTALLED Rust libz.a, with nothing implicit on the link line.
+#
+# CMake expands this template into a standalone project -- the configure_file() call in
+# test/CMakeLists.txt -- which the zlib_static_link_closure_* CTest cases then configure,
+# build and run against the test install prefix.  It is a sibling of
+# find_package_test.cmake.in and consumes the package exactly as that one does:
+# find_package(ZLIB CONFIG COMPONENTS static), link ZLIB::ZLIBSTATIC, run.
+#
+# WHAT IT IS FOR, AND WHY THE OBVIOUS TEST WOULD NOT DO
+#
+# The C libz.a needs no companion libraries.  A Rust staticlib does: it carries the Rust
+# standard library's own references -- memcpy and friends, the pthread and dl entry points
+# std's synchronisation and backtrace machinery names, and the unwinder -- and a static
+# archive cannot record a dependency the way a shared object records DT_NEEDED.  So the set
+# has to be advertised, on the exported CMake target and in zlib.pc, or a consumer that
+# links the archive alone gets undefined references.
+#
+# A PLAIN LINK TEST CANNOT DETECT ITS ABSENCE.  Measured on the development host: a plain
+# `cc' link of the Rust libz.a with -lz alone SUCCEEDS, because the compiler driver already
+# puts libgcc and libc on the link line and a modern glibc folds libpthread, libdl, librt
+# and libutil into libc.  The existing zlib_test_example_static case is that plain link, and
+# it would stay green with the whole advertisement deleted.  So this project passes
+# -nodefaultlibs: the driver then contributes NO libraries of its own, the link succeeds only
+# if ZLIB::ZLIBSTATIC's interface is complete, and a target whose libc does not fold those
+# four is simulated on the host that does.
+#
+# The startup files are deliberately kept -- -nodefaultlibs, never -nostartfiles -- because
+# crt1.o is not a library and no package could reasonably be expected to advertise it.
+#
+# ONLY REGISTERED FOR THE RUST BUILD, and that is not a gap.  With the C library installed
+# there is nothing to advertise, so linking with -nodefaultlibs and no interface libraries
+# would fail on printf rather than on anything zlib is responsible for.  The property under
+# test exists only where the archive carries a runtime.
+#
+# The second case below reads the INSTALLED zlib.pc, because the CMake target and the .pc
+# file are two independent advertisements of the same requirement and a consumer may use
+# either.  Asserted by reading the file rather than by invoking pkg-config, so the case does
+# not depend on a tool this project has never required.
+
+cmake_minimum_required(VERSION 3.12...3.31)
+
+project(
+    zlib_static_link_closure_test
+    LANGUAGES C
+    VERSION @zlib_VERSION@)
+
+enable_testing()
+
+find_package(ZLIB @zlib_VERSION@ CONFIG COMPONENTS static REQUIRED)
+
+# The advertisement itself, before anything is linked.  Checked separately from the link so
+# that an empty interface is reported as an empty interface -- naming the property and the
+# derivation that fills it -- rather than as a pile of undefined references.
+get_target_property(_zlib_static_interface ZLIB::ZLIBSTATIC INTERFACE_LINK_LIBRARIES)
+
+if(NOT _zlib_static_interface)
+    message(
+        FATAL_ERROR
+            "the installed ZLIB::ZLIBSTATIC advertises no INTERFACE_LINK_LIBRARIES, so a "
+            "consumer that static-links the Rust libz.a is not told which native runtime "
+            "libraries it needs.  CMakeLists.txt derives them with `rustc --crate-type "
+            "staticlib --print native-static-libs' and zlibConfig.cmake.in appends them to "
+            "the installed target; one of the two did not happen.")
+endif(NOT _zlib_static_interface)
+
+message(STATUS "ZLIB::ZLIBSTATIC interface libraries: ${_zlib_static_interface}")
+
+# The consumer.  example.c unmodified, exactly as the sibling fixtures use it, so that the
+# case exercises a real spread of the API -- deflate, inflate, the gz file layer, dictionaries
+# and flush handling -- rather than one call that might happen to need nothing.
+add_executable(static_closure_consumer @zlib_SOURCE_DIR@/test/example.c)
+target_link_libraries(static_closure_consumer ZLIB::ZLIBSTATIC)
+
+# THE POINT OF THE WHOLE FIXTURE.  With this flag the driver adds no libraries at all, so
+# every reference the archive carries has to be satisfied by the interface above.
+target_link_options(static_closure_consumer PRIVATE -nodefaultlibs)
+
+add_test(NAME zlib_static_closure_runs COMMAND static_closure_consumer)
+
+# And the pkg-config half of the same requirement.
+add_test(
+    NAME zlib_static_closure_pc_advertises_private_libs
+    COMMAND
+        ${CMAKE_COMMAND} -DZLIB_PC_FILE=@CMAKE_CURRENT_BINARY_DIR@/test_install/@CMAKE_INSTALL_LIBDIR@/pkgconfig/zlib.pc
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check_pc_private.cmake)

@@ -14,6 +14,18 @@
 # deliberately no `rust' component: which implementation was built is settled
 # when zlib itself is configured and is not something a consumer selects or can
 # observe.  Existing projects need no change and no recompilation.
+#
+# One thing the two implementations genuinely do not share is what STATIC linking
+# requires beside the archive.  A C libz.a stands alone; a Rust one carries the
+# Rust standard library's object code and needs the target-specific set that
+# `rustc --print native-static-libs' names.  That difference is not left to the
+# consumer to discover: when the Rust library was built, CMakeLists.txt probes
+# the set at configure time and publishes it in the INTERFACE_LINK_LIBRARIES of
+# the ZLIB::ZLIBSTATIC target that ZLIB-static.cmake defines, so the very same
+# `target_link_libraries(app ZLIB::ZLIBSTATIC)' produces a complete link line
+# under either implementation.  In C mode nothing extra is published, because
+# nothing extra is needed.  Read ZLIB-static.cmake to see which case this
+# installation is.
 
 set(_ZLIB_supported_components "shared" "static")
 
@@ -31,3 +43,39 @@ else(ZLIB_FIND_COMPONENTS)
         include("${CMAKE_CURRENT_LIST_DIR}/ZLIB-${_component_config}.cmake")
     endforeach(_component_config IN LISTS _ZLIB_supported_components)
 endif(ZLIB_FIND_COMPONENTS)
+
+# The static archive's native runtime dependencies, when the installed libz.a is
+# the Rust one.
+#
+# This has to be done here rather than on the installed export itself, and the
+# reason is worth stating because it looks like the wrong place.  With
+# -DZLIB_BUILD_RUST=ON the Rust libz.a is installed by a FILES rule that lands on
+# the same name as the C archive, while the CMake export set that produces
+# ZLIB-static.cmake is still generated from the C target -- one file describing
+# whichever archive is installed there.  So the interface libraries cannot be
+# attached to that export without also attaching them to the C build's, where they
+# would be wrong: the C libz.a needs no companion libraries at all.  Appending
+# them here keeps the two configurations honest, because this file is generated
+# per build and the list below is empty in the C one.
+#
+# The set is target-specific and is derived at configure time by
+# `rustc --crate-type staticlib --print native-static-libs' -- never hardcoded --
+# and it is the same set zlib.pc's private link line advertises to pkg-config
+# consumers.  A Rust staticlib carries the Rust standard library's own references
+# and a static archive cannot record a dependency the way a shared object records
+# DT_NEEDED, which is why the consumer has to be told.  Shared consumers need
+# none of this: ZLIB::ZLIB resolves through the SONAME and its own DT_NEEDED.
+#
+# APPEND, never set: the export may already have published an interface, and
+# replacing it would silently drop whatever was there.
+set(_ZLIB_static_native_libs "@ZLIB_RUST_NATIVE_STATIC_LIBS@")
+
+if(_ZLIB_static_native_libs AND TARGET ZLIB::ZLIBSTATIC)
+    string(REPLACE " " ";" _ZLIB_static_native_libs
+                   "${_ZLIB_static_native_libs}")
+    set_property(
+        TARGET ZLIB::ZLIBSTATIC APPEND
+        PROPERTY INTERFACE_LINK_LIBRARIES ${_ZLIB_static_native_libs})
+endif(_ZLIB_static_native_libs AND TARGET ZLIB::ZLIBSTATIC)
+
+unset(_ZLIB_static_native_libs)

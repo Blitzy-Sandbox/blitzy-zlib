@@ -1,3 +1,11 @@
+// UNSAFE CONTAINMENT, and it is mechanical rather than a convention.  `crates/zlib-rs` is the
+// safe core: `src/lib.rs` carries `#![forbid(unsafe_code)]`, and its test suites carry it too, so
+// the property "the core and everything that exercises it contains no `unsafe`" is enforced by the
+// compiler in both halves.  The workspace's designated FFI boundary -- the only place a raw pointer
+// crosses into a foreign implementation -- is `crates/libz-rs-sys/src/**` for the shipped library
+// and `crates/zlib-rs-differential/src/{oracle,port}.rs` for the dev-only harness; an assertion
+// that needs one of those belongs in a suite of that package, not here.
+#![forbid(unsafe_code)]
 //! Integration suite for `inflateBack`, the callback-driven raw-DEFLATE
 //! decompressor.
 //!
@@ -137,8 +145,8 @@ use zlib_rs::allocate::{Allocator, GlobalAllocator};
 use zlib_rs::config::InflateConfig;
 use zlib_rs::error::ReturnCode;
 use zlib_rs::infback::{
-    inflate_back, inflate_back_end, inflate_back_init, inflate_back_into, InflateBackInput,
-    InflateBackOutput, OutputFailure,
+    inflate_back, inflate_back_end, inflate_back_init, InflateBackInput, InflateBackOutput,
+    OutputFailure,
 };
 use zlib_rs::inflate::state::{InflateState, DMAX_DEFAULT};
 use zlib_rs::inflate::Mode;
@@ -3697,113 +3705,18 @@ fn the_cover_back_sequence_from_the_c_harness_reproduces_step_for_step() {
 // ---------------------------------------------------------------------------
 // The write-only window form -- `inflate_back_into`
 // ---------------------------------------------------------------------------
-
-/// A window that arrives as write-only storage decodes to exactly the same bytes.
-///
-/// `inflate_back_into` is what the C boundary calls: `infback.c` L25-L64 writes nothing
-/// into the caller's window and `test/infcover.c` L475 passes a stack array that was never
-/// initialised, so there is no `&mut [u8]` to be had and none may be manufactured by
-/// filling. `OutputRegion::write_only` carries a high-water mark instead and hands back
-/// only what the decoder has stored.
-///
-/// The assertion is parity with the slice form over the same stream: same status, same
-/// output, same unused input. That is the property the change has to preserve -- the
-/// storage shape is a boundary concern and must not reach the decoder's decisions.
-#[test]
-fn a_write_only_window_decodes_identically_to_an_initialised_one() {
-    use core::mem::MaybeUninit;
-    use zlib_rs::read_buf::{InitView, OutputRegion};
-
-    /// The `MaybeUninit<u8>` to `u8` reinterpretation the facade supplies as a function
-    /// pointer. Sound here for the same reason it is sound there: `OutputRegion` raises its
-    /// high-water mark only in its write methods and clamps every read to it, so neither
-    /// arm is ever reached with a slot nothing has been stored into.
-    fn view() -> InitView {
-        fn shared(slots: &[MaybeUninit<u8>]) -> &[u8] {
-            // SAFETY: `MaybeUninit<u8>` is `repr(transparent)` over `u8`, and every slot
-            // handed here lies inside the region's written prefix.
-            unsafe { &*(core::ptr::from_ref(slots) as *const [u8]) }
-        }
-        InitView::new(shared)
-    }
-
-    // The reference run, over an ordinary initialised window.
-    let mut initialised = sentinel_window(HARNESS_WINDOW_LEN);
-    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
-    let mut expected_sink = Collector::default();
-    let mut expected_source = Pieces::new(HELLO_FIXED, 3);
-    let expected = inflate_back(
-        &mut state,
-        &mut initialised,
-        None,
-        &mut expected_source,
-        &mut expected_sink,
-    );
-    assert_eq!(expected.code, ReturnCode::STREAM_END);
-    assert_eq!(expected_sink.written, HELLO);
-    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
-
-    // The same stream again, over storage that holds nothing.
-    let mut slots: Vec<MaybeUninit<u8>> = Vec::with_capacity(HARNESS_WINDOW_LEN);
-    slots.resize_with(HARNESS_WINDOW_LEN, MaybeUninit::uninit);
-    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
-    let mut sink = Collector::default();
-    let mut source = Pieces::new(HELLO_FIXED, 3);
-    let actual = inflate_back_into(
-        &mut state,
-        OutputRegion::write_only(&mut slots, view()),
-        None,
-        &mut source,
-        &mut sink,
-    );
-
-    assert_eq!(actual.code, expected.code, "same status");
-    assert_eq!(sink.written, expected_sink.written, "same output bytes");
-    assert_eq!(actual.next_in, expected.next_in, "same unused input");
-    assert_eq!(source.calls, expected_source.calls, "same callback traffic");
-    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
-}
-
-/// A window shorter than `1 << windowBits` is refused in the write-only form too.
-///
-/// `inflate_back`'s window check is `window_prefix`, which narrows the region to exactly
-/// `state.wsize` and reports `Z_STREAM_ERROR` when it cannot -- C would proceed with
-/// `left == 0` and spin inside `ROOM()` forever (`zlib.h` L1203 names the status). The
-/// narrowing now goes through `OutputRegion::into_prefix`, so it is worth asserting that
-/// the guard survived the change of shape.
-#[test]
-fn a_short_write_only_window_is_refused() {
-    use core::mem::MaybeUninit;
-    use zlib_rs::read_buf::{InitView, OutputRegion};
-
-    fn view() -> InitView {
-        fn shared(slots: &[MaybeUninit<u8>]) -> &[u8] {
-            // SAFETY: as the test above; only a written prefix is ever passed.
-            unsafe { &*(core::ptr::from_ref(slots) as *const [u8]) }
-        }
-        InitView::new(shared)
-    }
-
-    let mut slots: Vec<MaybeUninit<u8>> = Vec::with_capacity(HARNESS_WINDOW_LEN - 1);
-    slots.resize_with(HARNESS_WINDOW_LEN - 1, MaybeUninit::uninit);
-    let mut state = inflate_back_init(HARNESS_WINDOW_BITS, GlobalAllocator).expect("init");
-    let mut sink = Collector::default();
-    let mut source = Pieces::new(HELLO_FIXED, 3);
-    let result = inflate_back_into(
-        &mut state,
-        OutputRegion::write_only(&mut slots, view()),
-        Some(HELLO_FIXED),
-        &mut source,
-        &mut sink,
-    );
-
-    assert_eq!(result.code, ReturnCode::STREAM_ERROR);
-    assert_eq!(
-        result.next_in,
-        Some(HELLO_FIXED),
-        "a refusal before the loop hands the staged input straight back"
-    );
-    assert!(sink.written.is_empty(), "and emits nothing");
-    assert_eq!(source.calls, 0, "and never calls in()");
-    assert_eq!(inflate_back_end(&mut state), ReturnCode::OK);
-}
+//
+// `inflate_back_into` is the shape the C boundary calls: `infback.c` L25-L64 writes nothing
+// into the caller's window before decoding into it, and `test/infcover.c` L475 hands
+// `inflateBack` a stack array that was never initialised, so there is no `&mut [u8]` to be had
+// there and none may be manufactured by filling.  `OutputRegion::write_only` carries a
+// high-water mark and an `InitView` instead, and supplying an `InitView` is a
+// `MaybeUninit<u8>`-to-`u8` reinterpretation -- an `unsafe` operation this crate cannot express,
+// which is precisely why the view is a caller-supplied function pointer rather than something
+// the core does for itself.
+//
+// The two assertions that need one -- that the write-only shape decodes identically to an
+// initialised window, and that the short-window guard survives the change of shape -- are
+// properties of the boundary, so they live in the crate that owns the boundary:
+// `crates/libz-rs-sys/tests/write_only_window.rs`.  This file carries this crate-root's
+// `#![forbid(unsafe_code)]`, and every remaining assertion here needs no `unsafe` at all.

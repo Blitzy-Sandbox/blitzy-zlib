@@ -1520,8 +1520,8 @@ mod tests {
     use core::mem::size_of;
 
     use crate::types::{
-        alloc_func, free_func, in_func, out_func, uInt, voidpf, z_stream, Bytef, StateBlock,
-        StatePrefix,
+        alloc_func, free_func, in_func, out_func, uInt, voidpf, z_stream, z_streamp, Bytef,
+        StateBlock, StatePrefix,
     };
     use crate::util::ZLIB_VERSION;
     use zlib_rs::error::ReturnCode;
@@ -3230,10 +3230,29 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// The installed block exposes the tag where caller-compiled code expects it.
+    ///
+    /// The offset is asserted **relationally** first, because that is the form that is true
+    /// on every target: C's prefix is `{ z_streamp strm; inflate_mode mode; }`, so the tag
+    /// sits at `sizeof(z_streamp)` -- 8 where a pointer is eight bytes, and 4 on an ILP32
+    /// target, where `types.rs`'s own const assertions say the same thing. The measured
+    /// 64-bit number is then pinned under the width guard that makes it true, exactly as
+    /// AAP 0.6.3.3 requires of every layout assertion.
     #[test]
     fn the_state_block_exposes_the_mode_tag_at_offset_eight() {
         assert_eq!(core::mem::offset_of!(StatePrefix, strm), 0);
-        assert_eq!(core::mem::offset_of!(StatePrefix, tag), 8);
+        assert_eq!(
+            core::mem::offset_of!(StatePrefix, tag),
+            size_of::<z_streamp>(),
+            "the tag follows the back-pointer with no padding on every target"
+        );
+        if size_of::<z_streamp>() == 8 {
+            assert_eq!(
+                core::mem::offset_of!(StatePrefix, tag),
+                8,
+                "test/infcover.c L330 and L459 write ->mode at offset 8 where a pointer \
+                 is eight bytes wide"
+            );
+        }
         assert_eq!(size_of::<c_int>(), 4);
 
         let mut window = vec![0xa5_u8; 32768];
@@ -3575,12 +3594,23 @@ mod tests {
     }
 
     /// `narrow_avail` saturates instead of wrapping.
+    ///
+    /// ★ The "one past `uInt::MAX`" case is constructed with [`usize::checked_add`], never
+    /// as `uInt::MAX as usize + 1`. On an ILP32 target `usize` and `uInt` are both 32 bits,
+    /// so `uInt::MAX as usize` already *is* `usize::MAX` and the literal successor is
+    /// `deny(arithmetic_overflow)` -- a hard *build* failure that stopped an i686
+    /// `cargo build --tests` before any ABI test could run. Where the successor is
+    /// representable it is asserted; where it is not, the `usize::MAX` case immediately
+    /// below is that same successor's stand-in and covers the saturating branch, so no
+    /// coverage is lost on either width.
     #[test]
     fn narrow_avail_saturates() {
         assert_eq!(narrow_avail(0), 0);
         assert_eq!(narrow_avail(7), 7);
         assert_eq!(narrow_avail(uInt::MAX as usize), uInt::MAX);
-        assert_eq!(narrow_avail(uInt::MAX as usize + 1), uInt::MAX);
+        if let Some(one_past) = (uInt::MAX as usize).checked_add(1) {
+            assert_eq!(narrow_avail(one_past), uInt::MAX);
+        }
         assert_eq!(narrow_avail(usize::MAX), uInt::MAX);
     }
 

@@ -29,6 +29,12 @@ option(ZLIB_PREFIX "prefix for all types and library functions, see zconf.h.in"
        OFF)
 mark_as_advanced(ZLIB_PREFIX)
 
+# Whether the generator produces one build tree per configuration.  Queried
+# here, ahead of everything that reads it, because the ZLIB_BUILD_RUST block
+# below is the first consumer and the default-CMAKE_BUILD_TYPE rule further down
+# is the second.
+get_property(IS_MULTI GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+
 # ZLIB_BUILD_RUST builds the memory-safe Rust implementation
 # (crates/libz-rs-sys) instead of the C library for the exported ZLIB::*
 # targets. It is entirely opt-in: with the option OFF -- the default -- nothing
@@ -57,31 +63,111 @@ if(ZLIB_BUILD_RUST)
                 "the C library and needs no cargo.")
     endif(NOT ZLIB_CARGO_EXECUTABLE)
 
-    # The staged drop-in library is relinked from cargo's static archive through
+    # A multi-config generator is refused, and this is the one refusal that
+    # looks like a limitation and is actually a correctness requirement.  Cargo
+    # has two profiles where CMake has four configurations, and three of the
+    # things this block produces cannot be made per-configuration at this
+    # project's 3.12 floor: add_custom_command's OUTPUT, BYPRODUCTS and DEPENDS
+    # accept generator expressions only from CMake 3.20, and IMPORTED_LOCATION
+    # accepts none at any version.  So under Xcode or Visual Studio a Debug
+    # build and a Release build would write cargo's output into one directory,
+    # stage one drop-in, and point one IMPORTED_LOCATION at it -- whichever
+    # configuration was built last wins, silently, and a consumer asking for
+    # Debug gets an optimised library.  The configure-time strip decision has
+    # the same shape: CMAKE_BUILD_TYPE is empty under a multi-config generator,
+    # so every configuration including Debug would be stripped as though it were
+    # optimised.  Refusing at configure time says so once, where the reason can
+    # be given, instead of producing four configurations that are quietly the
+    # same one.  Single-config generators -- Unix Makefiles and Ninja, which is
+    # what every configuration in .github/workflows/ uses on this platform --
+    # are unaffected, and the C build is untouched in either case.
+    if(IS_MULTI)
+        message(
+            FATAL_ERROR
+                "ZLIB_BUILD_RUST does not support the multi-configuration "
+                "generator \"${CMAKE_GENERATOR}\".  Cargo has one output "
+                "directory per profile where this generator has one per "
+                "configuration, and at this project's CMake 3.12 floor neither "
+                "the staging rules nor IMPORTED_LOCATION can be made "
+                "per-configuration, so Debug and Release would share one staged "
+                "library and one imported location.\n"
+                "Configure with a single-configuration generator -- for "
+                "example -G \"Unix Makefiles\" or -G Ninja, with "
+                "-DCMAKE_BUILD_TYPE=Debug or Release -- or with "
+                "-DZLIB_BUILD_RUST=OFF to build the C library.")
+    endif(IS_MULTI)
+
+    # Cross-compilation is refused for the same reason: honestly, and at
+    # configure time.  Nothing below passes cargo a --target, so cargo would
+    # build for the HOST while CMake believed it had a target-architecture
+    # library; the artifact path this file reads has no target-triple component
+    # to look under either, and the two raw link commands drive
+    # ${CMAKE_C_COMPILER} without the sysroot, the toolchain-file arguments or
+    # the target flags a cross toolchain requires.  Producing a host library and
+    # installing it as though it were a target one is the worst available
+    # outcome -- it links, it installs, and it fails at run time on the device
+    # -- so the combination is rejected rather than approximated.  Supporting it
+    # means a CMake-system-to-Rust-target mapping plus target-specific artifact
+    # paths and tools, which is a larger change than this option's contract.
+    if(CMAKE_CROSSCOMPILING)
+        message(
+            FATAL_ERROR
+                "ZLIB_BUILD_RUST does not support cross-compilation.  "
+                "CMAKE_CROSSCOMPILING is set (CMAKE_SYSTEM_NAME "
+                "${CMAKE_SYSTEM_NAME}, CMAKE_SYSTEM_PROCESSOR "
+                "${CMAKE_SYSTEM_PROCESSOR}), but cargo is invoked here without "
+                "--target, so it would build for the host and this file would "
+                "stage and install that host library under the target's name.\n"
+                "Build the Rust library natively on the target, or configure "
+                "with -DZLIB_BUILD_RUST=OFF to cross-compile the C library, "
+                "which supports it fully.")
+    endif(CMAKE_CROSSCOMPILING)
+
+    # The SHARED library is relinked from cargo's static archive through
     # zlib.map, which needs an ELF linker that understands -soname and
     # --version-script.  That is precisely the platform set on which the C
     # shared target applies the same version script below, so the two agree by
     # construction.  Mach-O and MSVC spell every one of those concepts
-    # differently and are out of scope for this port; refusing here is honest
-    # and actionable, whereas emitting a half-formed dylib or import library
-    # would look like support that does not exist.
-    if(NOT UNIX
-       OR APPLE
-       OR (CMAKE_SYSTEM_NAME STREQUAL AIX)
-       OR (CMAKE_SYSTEM_NAME STREQUAL SunOS))
+    # differently -- an install name rather than a soname, an exported-symbol
+    # list or a .def file rather than a version script -- and reproducing the
+    # published surface through them is out of scope for this port; refusing
+    # here is honest and actionable, whereas emitting a half-formed dylib or
+    # import library would look like support that does not exist.
+    #
+    # ★ The refusal is scoped to shared linking, and that scope is the point.
+    # The STATIC library needs none of it: cargo emits a complete archive on
+    # every Tier-1 target, this file copies it under the platform's own archive
+    # name (${CMAKE_STATIC_LIBRARY_PREFIX}z${CMAKE_STATIC_LIBRARY_SUFFIX}, which
+    # is libz.a on Linux and macOS and z.lib under MSVC -- exactly what cargo
+    # writes for the same target), and nothing in that path touches a soname or
+    # a version script.  So -DZLIB_BUILD_RUST=ON -DZLIB_BUILD_SHARED=OFF is
+    # supported wherever cargo runs, and .github/workflows/rust.yml's macOS and
+    # Windows rows -- which exist because uLong is 8 bytes on LP64 and 4 on
+    # LLP64 -- are not contradicted by a configure-time refusal on the very
+    # platforms they cover.
+    if(ZLIB_BUILD_SHARED
+       AND (NOT UNIX
+            OR APPLE
+            OR (CMAKE_SYSTEM_NAME STREQUAL AIX)
+            OR (CMAKE_SYSTEM_NAME STREQUAL SunOS)
+           ))
         message(
             FATAL_ERROR
-                "ZLIB_BUILD_RUST is only supported on ELF platforms whose "
-                "linker accepts -soname and --version-script, which is the "
-                "same platform set that receives zlib.map in the C shared "
-                "library below.  CMAKE_SYSTEM_NAME is ${CMAKE_SYSTEM_NAME}.\n"
-                "Reconfigure with -DZLIB_BUILD_RUST=OFF to build the C library."
-        )
+                "ZLIB_BUILD_RUST can only build a SHARED library on ELF "
+                "platforms whose linker accepts -soname and --version-script, "
+                "which is the same platform set that receives zlib.map in the C "
+                "shared library below.  CMAKE_SYSTEM_NAME is "
+                "${CMAKE_SYSTEM_NAME}.\n"
+                "Configure with -DZLIB_BUILD_SHARED=OFF to stage the Rust "
+                "static library, which is supported here, or with "
+                "-DZLIB_BUILD_RUST=OFF to build the C library.")
     endif(
-        NOT UNIX
-        OR APPLE
-        OR (CMAKE_SYSTEM_NAME STREQUAL AIX)
-        OR (CMAKE_SYSTEM_NAME STREQUAL SunOS))
+        ZLIB_BUILD_SHARED
+        AND (NOT UNIX
+             OR APPLE
+             OR (CMAKE_SYSTEM_NAME STREQUAL AIX)
+             OR (CMAKE_SYSTEM_NAME STREQUAL SunOS)
+            ))
 
     # ZLIB_PREFIX rewrites every public name to z_* -- zconf.h.in L11-L21 does
     # it with the preprocessor for a caller, and the C library gets the prefixed
@@ -124,7 +210,10 @@ if(ZLIB_BUILD_RUST)
     endif(ZLIB_BUILD_SHARED AND NOT CMAKE_OBJCOPY)
 
     # ZLIB_RS_SIMD=0|1 is the build-time toggle the port documents for the
-    # vectorised checksum backends.  crates/libz-rs-sys/build.rs declares
+    # alternative checksum backends -- portable integer code shaped so that LLVM
+    # can autovectorise it, with no architecture intrinsic and no run-time CPU
+    # probe deciding correctness, and output neutral either way (a checksum is
+    # one scalar however it is computed).  crates/libz-rs-sys/build.rs declares
     # cargo::rerun-if-env-changed=ZLIB_RS_SIMD and VALIDATES the variable
     # against the resolved `simd` Cargo feature, refusing a request it cannot
     # satisfy -- a build script cannot switch a feature on.  Translating the
@@ -143,9 +232,254 @@ if(ZLIB_BUILD_RUST)
                     "ZLIB_RS_SIMD must be 0 or 1, got \"${ZLIB_RS_SIMD}\".")
         endif(NOT ZLIB_RS_SIMD MATCHES "^[01]$")
     endif(DEFINED ZLIB_RS_SIMD AND NOT ZLIB_RS_SIMD STREQUAL "")
+
+    # ------------------------------------------------------------------------
+    # The native libraries a Rust staticlib needs beside it
+    # ------------------------------------------------------------------------
+    #
+    # A C libz.a needs no companion libraries.  A Rust staticlib does: it
+    # carries the Rust standard library's own object code, whose undefined
+    # references reach into libc and its neighbours, and nothing in the archive
+    # records that.  A consumer that links the staged libz.a and nothing else
+    # therefore fails at link time -- not always, which is what makes it
+    # insidious.  A plain `cc' link happens to succeed on a glibc that folds
+    # libpthread, libdl, librt and libutil into libc, and fails on one that
+    # ships them separately, under -nodefaultlibs, when ld is driven directly,
+    # or from a toolchain belonging to another language.
+    #
+    # The set is TARGET-SPECIFIC and must be measured, never copied: rustc is
+    # the only thing that knows it.  `--print native-static-libs' is rustc's
+    # answer to exactly this question, and it needs a real staticlib link to
+    # produce one, so the probe compiles a two-line crate rather than asking an
+    # abstract question.  The result is cached, so the probe runs once per build
+    # tree and a packager can override it for a cross build with
+    # -DZLIB_RUST_NATIVE_STATIC_LIBS="-lfoo -lbar".
+    #
+    # A probe that cannot answer is FATAL rather than empty.  Emitting an empty
+    # answer would publish a static library whose link requirements are silently
+    # understated, which is the failure this block exists to remove; and the
+    # probe cannot fail on a host that has already been established to have a
+    # working cargo and an ELF linker, so a failure here is a real toolchain
+    # problem worth stopping for.  ZLIB_BUILD_STATIC=OFF stages no archive, so
+    # the probe is scoped to the configuration that publishes one.
+    if(ZLIB_BUILD_STATIC AND NOT DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS)
+        # rustc lives beside cargo in every rustup and distribution layout, so
+        # the located cargo is the hint that keeps the two from coming from
+        # different toolchains.
+        get_filename_component(ZLIB_RUST_TOOLCHAIN_BIN ${ZLIB_CARGO_EXECUTABLE}
+                               DIRECTORY)
+        find_program(
+            ZLIB_RUSTC_EXECUTABLE
+            NAMES rustc
+            HINTS ${ZLIB_RUST_TOOLCHAIN_BIN})
+        mark_as_advanced(ZLIB_RUSTC_EXECUTABLE)
+
+        if(NOT ZLIB_RUSTC_EXECUTABLE)
+            message(
+                FATAL_ERROR
+                    "ZLIB_BUILD_RUST with ZLIB_BUILD_STATIC needs rustc to "
+                    "determine the native libraries a Rust static library must "
+                    "be linked against, and none was found beside "
+                    "${ZLIB_CARGO_EXECUTABLE} or on PATH.\n"
+                    "Point CMake at one with -DZLIB_RUSTC_EXECUTABLE=..., "
+                    "state the answer directly with "
+                    "-DZLIB_RUST_NATIVE_STATIC_LIBS=\"-lm -ldl -lc\" (as a "
+                    "cross build must), or configure with "
+                    "-DZLIB_BUILD_STATIC=OFF to stage only the shared library, "
+                    "which records its dependencies in DT_NEEDED and needs "
+                    "none of this.")
+        endif(NOT ZLIB_RUSTC_EXECUTABLE)
+
+        set(ZLIB_RUST_PROBE_DIR
+            ${zlib_BINARY_DIR}/CMakeFiles/zlib-native-static-libs)
+        file(MAKE_DIRECTORY ${ZLIB_RUST_PROBE_DIR})
+        # `#[no_mangle] extern "C"' so the crate has an exported symbol and the
+        # archive is a realistic one; the body is irrelevant, only the link is.
+        file(
+            WRITE ${ZLIB_RUST_PROBE_DIR}/probe.rs
+            "#[no_mangle]\npub extern \"C\" fn zlib_rs_native_static_libs_probe() -> i32 { 0 }\n"
+        )
+
+        execute_process(
+            COMMAND
+                ${ZLIB_RUSTC_EXECUTABLE} --print native-static-libs --crate-type
+                staticlib -o ${ZLIB_RUST_PROBE_DIR}/libzlib_rs_probe.a
+                ${ZLIB_RUST_PROBE_DIR}/probe.rs
+            WORKING_DIRECTORY ${ZLIB_RUST_PROBE_DIR}
+            RESULT_VARIABLE ZLIB_RUST_PROBE_RESULT
+            OUTPUT_VARIABLE ZLIB_RUST_PROBE_STDOUT
+            ERROR_VARIABLE ZLIB_RUST_PROBE_STDERR)
+
+        if(NOT ZLIB_RUST_PROBE_RESULT EQUAL 0)
+            message(
+                FATAL_ERROR
+                    "${ZLIB_RUSTC_EXECUTABLE} --print native-static-libs "
+                    "failed with ${ZLIB_RUST_PROBE_RESULT}, so the native "
+                    "libraries the staged libz.a must be linked against are "
+                    "unknown:\n${ZLIB_RUST_PROBE_STDERR}")
+        endif(NOT ZLIB_RUST_PROBE_RESULT EQUAL 0)
+
+        # rustc reports the answer as a `note:' on stderr.  Match the line and
+        # keep what follows the marker; the flags are already in the order rustc
+        # says is significant, so they are not sorted or de-duplicated.
+        if(NOT ZLIB_RUST_PROBE_STDERR MATCHES
+           "native-static-libs:[ \t]*([^\r\n]*)")
+            message(
+                FATAL_ERROR
+                    "${ZLIB_RUSTC_EXECUTABLE} --print native-static-libs "
+                    "printed no native-static-libs line, so the link "
+                    "requirements of the staged libz.a cannot be published. "
+                    "Its output was:\n${ZLIB_RUST_PROBE_STDOUT}"
+                    "${ZLIB_RUST_PROBE_STDERR}")
+        endif(NOT ZLIB_RUST_PROBE_STDERR MATCHES
+              "native-static-libs:[ \t]*([^\r\n]*)")
+
+        string(STRIP "${CMAKE_MATCH_1}" ZLIB_RUST_PROBE_LIBS)
+
+        if(ZLIB_RUST_PROBE_LIBS STREQUAL "")
+            message(
+                FATAL_ERROR
+                    "${ZLIB_RUSTC_EXECUTABLE} reported an empty "
+                    "native-static-libs set.  That is not a usable answer for "
+                    "a Rust staticlib on an ELF target; state the set "
+                    "explicitly with -DZLIB_RUST_NATIVE_STATIC_LIBS=... if this "
+                    "toolchain genuinely needs none.")
+        endif(ZLIB_RUST_PROBE_LIBS STREQUAL "")
+
+        set(ZLIB_RUST_NATIVE_STATIC_LIBS
+            "${ZLIB_RUST_PROBE_LIBS}"
+            CACHE
+                STRING
+                "Native libraries a Rust static library must be linked against, from rustc --print native-static-libs"
+        )
+        mark_as_advanced(ZLIB_RUST_NATIVE_STATIC_LIBS)
+        message(
+            STATUS "Rust static library needs: ${ZLIB_RUST_NATIVE_STATIC_LIBS}")
+    endif(ZLIB_BUILD_STATIC AND NOT DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS)
+
+    # CMake wants a list where rustc printed a single space-separated string.
+    # Every element begins with `-', so CMake passes each through to the link
+    # line verbatim rather than treating it as a target or a file path.
+    if(DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS)
+        string(REPLACE " " ";" ZLIB_RUST_NATIVE_STATIC_LIBS_LIST
+                       "${ZLIB_RUST_NATIVE_STATIC_LIBS}")
+        list(REMOVE_ITEM ZLIB_RUST_NATIVE_STATIC_LIBS_LIST "")
+    endif(DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS)
 endif(ZLIB_BUILD_RUST)
 
-get_property(IS_MULTI GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+    # ------------------------------------------------------------------------
+    # The native libraries a Rust STATIC library has to be linked against
+    # ------------------------------------------------------------------------
+    #
+    # The C libz.a needs no companion libraries.  A Rust staticlib does: it
+    # carries the Rust runtime's own dependencies, and unlike a shared object --
+    # which records them in DT_NEEDED and resolves them itself -- an archive can
+    # only state them as metadata for whoever links it.  Leaving that metadata
+    # out is not a cosmetic omission: `cc -lz` happens to succeed on a glibc
+    # that folds libpthread, libdl, librt and libutil into libc and whose driver
+    # already supplies libgcc and libc, and it fails on everything else -- ld
+    # driven directly, -nodefaultlibs, a toolchain belonging to another
+    # language, an older glibc that ships those four separately, or simply a
+    # target whose set differs.
+    #
+    # rustc is the only authority on that set, so it is asked rather than
+    # guessed: `rustc --print native-static-libs` prints, for the target it is
+    # compiling for, exactly the arguments a static consumer needs and in the
+    # order that matters on some platforms.  It needs a crate to compile, so it
+    # is given an empty one in the build tree; what comes back describes the
+    # standard library and its platform dependencies, which is the whole of what
+    # this crate adds to an archive (its own two C translation units are already
+    # inside it, and it declares no other native library).  Measured on
+    # x86_64-unknown-linux-gnu: -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc.
+    #
+    # The value is a cache variable so that a packager on a target whose rustc
+    # cannot be run here -- or who wants to pin the set for a reproducible
+    # package -- can supply it with -DZLIB_RUST_NATIVE_STATIC_LIBS="...".  When
+    # it is neither supplied nor derivable, the configure fails: an installed
+    # static library whose link requirements are unknown is worse than no static
+    # library, because the failure surfaces in the consumer's build with nothing
+    # to connect it to this one.
+    #
+    # It is needed only when a static library is being built.  A shared-only
+    # Rust build never reaches this probe, so it acquires no dependency on rustc
+    # being runnable beyond what cargo already needs.
+    if(ZLIB_BUILD_STATIC AND NOT DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS)
+        get_filename_component(ZLIB_CARGO_BIN_DIR ${ZLIB_CARGO_EXECUTABLE}
+                               DIRECTORY)
+        find_program(
+            ZLIB_RUSTC_EXECUTABLE
+            NAMES rustc
+            HINTS ${ZLIB_CARGO_BIN_DIR})
+        mark_as_advanced(ZLIB_RUSTC_EXECUTABLE)
+
+        if(NOT ZLIB_RUSTC_EXECUTABLE)
+            message(
+                FATAL_ERROR
+                    "ZLIB_BUILD_RUST with ZLIB_BUILD_STATIC needs rustc to "
+                    "discover the native libraries a Rust static library must "
+                    "be linked against, and none was found on PATH beside "
+                    "${ZLIB_CARGO_EXECUTABLE}.\n"
+                    "Install a full Rust toolchain, point CMake at one with "
+                    "-DZLIB_RUSTC_EXECUTABLE=/path/to/rustc, supply the set "
+                    "yourself with -DZLIB_RUST_NATIVE_STATIC_LIBS=\"-lm -lc\" "
+                    "(the exact list `rustc --print native-static-libs` gives "
+                    "for your target), or configure with "
+                    "-DZLIB_BUILD_STATIC=OFF.")
+        endif(NOT ZLIB_RUSTC_EXECUTABLE)
+
+        set(ZLIB_RUST_NSL_DIR ${zlib_BINARY_DIR}/rust-native-static-libs)
+        file(MAKE_DIRECTORY ${ZLIB_RUST_NSL_DIR})
+        # An empty crate: rustc reports the set for the standard library it
+        # would link, which is what an archive of this crate needs on top of its
+        # own objects.  Written rather than reused so that the probe cannot be
+        # perturbed by anything in the workspace.
+        file(WRITE ${ZLIB_RUST_NSL_DIR}/probe.rs "")
+        execute_process(
+            COMMAND
+                ${ZLIB_RUSTC_EXECUTABLE} --print native-static-libs --crate-type
+                staticlib --crate-name zlib_rust_nsl_probe -o
+                ${ZLIB_RUST_NSL_DIR}/libzlib_rust_nsl_probe.a
+                ${ZLIB_RUST_NSL_DIR}/probe.rs
+            WORKING_DIRECTORY ${zlib_SOURCE_DIR}
+            RESULT_VARIABLE ZLIB_RUST_NSL_RESULT
+            OUTPUT_VARIABLE ZLIB_RUST_NSL_OUT
+            ERROR_VARIABLE ZLIB_RUST_NSL_ERR)
+
+        # rustc prints the answer to stderr as a `note:', so both streams are
+        # searched rather than assuming which one carries it.
+        string(REGEX MATCH "native-static-libs:([^\n\r]*)" ZLIB_RUST_NSL_MATCH
+                     "${ZLIB_RUST_NSL_ERR}${ZLIB_RUST_NSL_OUT}")
+
+        if(NOT ZLIB_RUST_NSL_RESULT EQUAL 0 OR NOT ZLIB_RUST_NSL_MATCH)
+            message(
+                FATAL_ERROR
+                    "`${ZLIB_RUSTC_EXECUTABLE} --print native-static-libs' did "
+                    "not report the native libraries a Rust static library "
+                    "must be linked against, so the installed libz.a would "
+                    "carry no link metadata and a static consumer would fail "
+                    "to link with nothing to connect the failure to this "
+                    "build.\n"
+                    "Exit status: ${ZLIB_RUST_NSL_RESULT}\n"
+                    "Output: ${ZLIB_RUST_NSL_OUT}${ZLIB_RUST_NSL_ERR}\n"
+                    "Supply the set yourself with "
+                    "-DZLIB_RUST_NATIVE_STATIC_LIBS=\"...\", or configure with "
+                    "-DZLIB_BUILD_STATIC=OFF.")
+        endif(NOT ZLIB_RUST_NSL_RESULT EQUAL 0 OR NOT ZLIB_RUST_NSL_MATCH)
+
+        string(STRIP "${CMAKE_MATCH_1}" ZLIB_RUST_NSL_FLAGS)
+        # A CMake list, so that it reaches INTERFACE_LINK_LIBRARIES as separate
+        # arguments; the .pc file joins it back with spaces below.
+        string(REPLACE " " ";" ZLIB_RUST_NSL_FLAGS "${ZLIB_RUST_NSL_FLAGS}")
+        set(ZLIB_RUST_NATIVE_STATIC_LIBS
+            "${ZLIB_RUST_NSL_FLAGS}"
+            CACHE STRING
+                  "Native libraries a Rust static libz.a must be linked against"
+        )
+        mark_as_advanced(ZLIB_RUST_NATIVE_STATIC_LIBS)
+        message(
+            STATUS "Rust static library needs: ${ZLIB_RUST_NATIVE_STATIC_LIBS}")
+    endif(ZLIB_BUILD_STATIC AND NOT DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS)
+endif(ZLIB_BUILD_RUST)
 
 if(NOT DEFINED CMAKE_BUILD_TYPE AND NOT IS_MULTI)
     message(STATUS "No CMAKE_BUILD_TYPE set -- using Release")
@@ -229,6 +563,29 @@ check_c_source_compiles(
     HAVE___ATTR__VIS_HIDDEN)
 
 unset(CMAKE_COMPILE_FLAGS)
+
+# The one implementation-specific key in zlib.pc, and the reason it is assembled
+# here rather than written in the template.
+#
+# `Libs.private:' lists what a *static* consumer needs beyond the library
+# itself.  A C libz.a needs nothing, and a .pc that claimed otherwise would be
+# wrong for the C build; a Rust libz.a needs the set rustc printed above.  One
+# template serves both implementations, so the difference has to be a
+# substitution rather than a comment saying the difference exists.
+#
+# The newline is part of the value on purpose.  Making the whole line
+# substitutable -- rather than leaving `Libs.private:' in the template with a
+# possibly-empty value after it -- keeps the C-mode output byte-for-byte what it
+# has always been: no such key at all, not an empty one.  zlib.pc.in, which the
+# autotools build uses, has no equivalent because `configure' does not know
+# whether `make rust' will be run afterwards; `make rust' prints the set
+# instead.
+if(ZLIB_BUILD_RUST AND DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS)
+    set(ZLIB_PC_LIBS_PRIVATE "\nLibs.private: ${ZLIB_RUST_NATIVE_STATIC_LIBS}")
+else(ZLIB_BUILD_RUST AND DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS)
+    set(ZLIB_PC_LIBS_PRIVATE "")
+endif(ZLIB_BUILD_RUST AND DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS)
+
 set(ZLIB_PC ${zlib_BINARY_DIR}/zlib.pc)
 configure_file(${zlib_SOURCE_DIR}/zlib.pc.cmakein ${ZLIB_PC} @ONLY)
 configure_file(${zlib_BINARY_DIR}/zconf.h.cmakein ${zlib_BINARY_DIR}/zconf.h)
@@ -343,13 +700,28 @@ endif(ZLIB_BUILD_STATIC)
 # ============================================================================
 #
 # ZLIB_BUILD_RUST redirects the exported ZLIB::ZLIB and ZLIB::ZLIBSTATIC targets
-# at libraries built from crates/libz-rs-sys instead of the C sources.  The C
-# targets `zlib' and `zlibstatic' above are ALWAYS defined and built exactly as
-# before: they are the differential oracle the port is verified against, and
-# contrib/ consumes them by name.  Nothing here touches zlib.h, zconf.h or
-# zlib.map -- the public contract is read and, in zlib.map's case, handed to the
-# linker, never edited -- so the exported API and ABI are unchanged and callers
-# link without recompilation.
+# at libraries built from crates/libz-rs-sys instead of the C sources.  Whichever
+# C targets the ZLIB_BUILD_SHARED and ZLIB_BUILD_STATIC options enable above --
+# `zlib' and `zlibstatic' -- are defined and built exactly as before, unaffected
+# by this option: they are the differential oracle the port is verified against,
+# and contrib/ consumes them by name.  This option adds a library rather than
+# replacing one; turning a C target off is still the job of its own option.
+# Nothing here touches zlib.h, zconf.h or zlib.map -- the public contract is read
+# and, in zlib.map's case, handed to the linker, never edited -- so the exported
+# API and ABI are unchanged and a consumer that dynamically links keeps working
+# without recompilation.  Static consumption through the installed zlib.pc is the
+# one case that is not equivalent; zlib.pc.cmakein states the measurement.
+#
+# The redirection is a SWITCH, not a fork.  Both C targets exist in either
+# configuration, but only one implementation is behind the two exported aliases,
+# so everything downstream of them -- test/, the find_package fixtures, an
+# add_subdirectory consumer -- exercises whichever one the option selected and
+# not both.  test/CMakeLists.txt registers no `_rust'-suffixed case beside its C
+# counterpart, so a single build tree does not compare the two; that comparison
+# lives in crates/zlib-rs-differential, which holds both in one process.  No CI
+# job configures with this option on either -- .github/workflows/cmake.yml
+# carries no Rust job and names ZLIB_BUILD_RUST nowhere -- so this path is
+# exercised by hand.
 #
 # Why cargo's own libz.so is not the drop-in.  rustc attaches its own anonymous
 # version script to every cdylib link, so zlib.map cannot be layered on top of
@@ -405,35 +777,140 @@ if(ZLIB_BUILD_RUST)
     set(ZLIB_RUST_SHARED_LIB libz.so)
     set(ZLIB_RUST_SONAME ${ZLIB_RUST_SHARED_LIB}.${ZLIB_RUST_SOVERSION})
     set(ZLIB_RUST_SHARED_LIBV ${ZLIB_RUST_SHARED_LIB}.${ZLIB_RUST_VERSION})
-    set(ZLIB_RUST_STATIC_LIB libz.a)
+
+    # The archive name comes from the platform rather than from a literal, so
+    # that a static-only Rust build works wherever cargo does.  Cargo spells a
+    # staticlib's file name with the target's own conventions -- libz.a on Linux
+    # and macOS, z.lib for an MSVC target -- and these two CMake variables carry
+    # exactly those conventions, so one expression names cargo's output and the
+    # file this project installs at the same time.  The shared names above stay
+    # literal because the block that uses them is ELF-only by construction.
+    set(ZLIB_RUST_STATIC_LIB
+        ${CMAKE_STATIC_LIBRARY_PREFIX}z${CMAKE_STATIC_LIBRARY_SUFFIX})
 
     # Cargo writes into a directory of this build's own, never into the source
     # tree's target/, so an out-of-source build cannot collide with a
     # developer's plain `cargo build'.  The staged drop-in lives beside it and
     # is the only directory that ever holds the versioned chain.
-    set(ZLIB_RUST_TARGET_DIR ${zlib_BINARY_DIR}/rust-target)
+    #
+    # It is a cache entry so that a project embedding this one -- and this
+    # project's own test/CMakeLists.txt, whose two add_subdirectory fixtures
+    # configure a nested copy of this file -- can point several build trees at
+    # one cargo directory.  Sharing it is safe: cargo locks the directory, keeps
+    # each profile in a subdirectory of its own, and only ever reads and writes
+    # its own bookkeeping there.  Nothing caller-visible is shared, because the
+    # staged archive, the relinked shared library and the whole versioned
+    # symlink chain are copied out into ${ZLIB_RUST_DROPIN_DIR}, which stays per
+    # build tree.
+    set(ZLIB_RUST_TARGET_DIR
+        "${zlib_BINARY_DIR}/rust-target"
+        CACHE PATH
+              "Directory cargo builds the Rust zlib in (cargo --target-dir)")
     set(ZLIB_RUST_DROPIN_DIR ${zlib_BINARY_DIR}/rust-dropin)
     set(ZLIB_RUST_ARCHIVE ${ZLIB_RUST_DROPIN_DIR}/${ZLIB_RUST_STATIC_LIB})
     set(ZLIB_RUST_LIBRARY ${ZLIB_RUST_DROPIN_DIR}/${ZLIB_RUST_SHARED_LIBV})
 
+    # A faithful, unmodified copy of what cargo produced, kept beside the staged
+    # archive rather than being the staged archive.  It exists so that the
+    # always-running cargo step has something whose CONTENT it can compare
+    # against: the staged archive has its debug sections dropped, so it never
+    # equals cargo's output and a copy_if_different straight onto it would
+    # rewrite it -- and with it every downstream link -- on every single build.
+    # This copy does equal cargo's output, so it is rewritten only on a real
+    # change, and the strip below is what turns it into the staged archive.
+    set(ZLIB_RUST_RAW_ARCHIVE ${ZLIB_RUST_DROPIN_DIR}/libz-cargo.a)
+
     # Cargo has two profiles where CMake has four configurations, so Debug maps
     # to cargo's `dev' -- whose output directory is spelled `debug' -- and every
     # optimised configuration maps to `release' (RelWithDebInfo and MinSizeRel
-    # have no cargo counterpart).  The mapping is a generator expression because
-    # a multi-config generator only knows the configuration at build time, and
-    # it is spelled as an argument to `--profile' rather than as a conditional
-    # `--release' so that it is never empty: a VERBATIM custom command passes an
+    # have no cargo counterpart).  The mapping is decided HERE, at configure
+    # time, from CMAKE_BUILD_TYPE, and it can be: multi-configuration generators
+    # are refused where the option is declared, so exactly one configuration is
+    # in play and CMAKE_BUILD_TYPE names it -- the default-to-Release rule above
+    # guarantees it is never empty.  A configure-time string is preferable to
+    # the generator expression this used to be for two reasons that both bit:
+    # the cargo profile, the artifact directory, the staged file names and
+    # IMPORTED_LOCATION all have to agree, and IMPORTED_LOCATION accepts no
+    # generator expression at any CMake version, so only one of the four could
+    # ever have been per-configuration; and a VERBATIM custom command passes an
     # empty generator expression through as an empty argument, which cargo
-    # rejects outright.  The staged drop-in directory, by contrast, is NOT
-    # per-configuration: add_custom_command's OUTPUT, BYPRODUCTS and DEPENDS
-    # accept generator expressions only from CMake 3.20, well above the 3.12
-    # floor this project supports, and IMPORTED_LOCATION accepts none at all. So
-    # under a multi-config generator the staged library is the one belonging to
-    # the configuration most recently built; single-config generators -- which
-    # is what every configuration in .github/workflows/cmake.yml uses on this
-    # platform -- are unaffected.
+    # rejects outright.
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(ZLIB_RUST_CARGO_PROFILE dev)
+        set(ZLIB_RUST_CARGO_PROFILE_DIR debug)
+    else(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(ZLIB_RUST_CARGO_PROFILE release)
+        set(ZLIB_RUST_CARGO_PROFILE_DIR release)
+    endif(CMAKE_BUILD_TYPE STREQUAL "Debug")
+
     set(ZLIB_RUST_CARGO_ARTIFACT_DIR
-        ${ZLIB_RUST_TARGET_DIR}/$<IF:$<CONFIG:Debug>,debug,release>)
+        ${ZLIB_RUST_TARGET_DIR}/${ZLIB_RUST_CARGO_PROFILE_DIR})
+
+    # ★ Cargo is invoked through a script, because CARGO IS GIVEN A STANDARD
+    # INPUT THAT CARRIES NOTHING, AND A COMMAND CANNOT DO THAT.
+    #
+    # Before building anything cargo asks the compiler about the target with
+    # `rustc - --crate-name ___ --print=file-names ...', and that `-' means
+    # rustc reads its program text from standard input.  Neither cargo nor this
+    # file controls what that standard input is: it is whatever the process that
+    # started the build had, so a build driven from something that leaves data
+    # there hands rustc that data as a Rust source file.  That is not
+    # theoretical.  It is what made test/CMakeLists.txt's two add_subdirectory
+    # fixtures fail intermittently under `ctest -j', with rustc reporting
+    # `unknown start of token' on an `<anon>:1' whose text was another process's
+    # output -- a compiler diagnostic in one run, another cargo's "Finished
+    # `release` profile" line in another, NUL bytes in a third.
+    #
+    # add_custom_command cannot redirect standard input and `cmake -E env'
+    # cannot either, but execute_process can: INPUT_FILE gives the child a
+    # standard input of the caller's choosing.  So the command line is handed to
+    # a generated script that runs it with the null device there, forwards the
+    # environment, and turns a non-zero status into a fatal error naming the
+    # command.  The script is written into the build tree, so nothing is added
+    # to the source tree and the C configuration never sees it.
+    #
+    # Be precise about what this does and does not buy.  It removes the one
+    # thing this file is responsible for -- cargo, as invoked from here, no
+    # longer inherits a standard input from an unknown caller -- and it costs
+    # one extra process per build.  It did NOT on its own stop the ctest
+    # failures above: they continued with cargo measurably running on /dev/null,
+    # so under ctest the bytes reach rustc by a path that starts below this
+    # command.  What stopped them was removing the trigger, by not letting a
+    # cold target-info probe run inside ctest at all; see the
+    # ZLIB_RUST_TARGET_DIR note above and the note in test/CMakeLists.txt beside
+    # zlib_add_nested_test.
+    set(ZLIB_RUST_CARGO_SCRIPT ${zlib_BINARY_DIR}/zlib-rust-cargo.cmake)
+    file(
+        WRITE ${ZLIB_RUST_CARGO_SCRIPT}
+        "# Generated by CMakeLists.txt.  Runs one cargo command with a standard input
+# that carries nothing, because cargo probes the target with `rustc -' -- which
+# reads its source from standard input -- and fails when anything is on it.
+#
+# Invoked as:
+#   cmake -DCARGO=<path> \"-DCARGO_ARGS=<;-list>\" \"-DCARGO_ENV=<;-list>\"
+#         -DWORK_DIR=<dir> -P zlib-rust-cargo.cmake
+if(NOT CARGO)
+    message(FATAL_ERROR \"CARGO was not given to this script\")
+endif(NOT CARGO)
+
+if(WIN32)
+    set(zlib_rust_null_device NUL)
+else(WIN32)
+    set(zlib_rust_null_device /dev/null)
+endif(WIN32)
+
+execute_process(
+    COMMAND \${CMAKE_COMMAND} -E env \${CARGO_ENV} \"\${CARGO}\" \${CARGO_ARGS}
+    WORKING_DIRECTORY \"\${WORK_DIR}\"
+    INPUT_FILE \${zlib_rust_null_device}
+    RESULT_VARIABLE zlib_rust_cargo_status)
+
+if(NOT zlib_rust_cargo_status EQUAL 0)
+    message(FATAL_ERROR
+        \"cargo failed with status \${zlib_rust_cargo_status}:\\n\"
+        \"  \${CARGO} \${CARGO_ARGS}\")
+endif(NOT zlib_rust_cargo_status EQUAL 0)
+")
 
     # libz-compat exposes the extern "C" surface and gz gates the gzFile layer;
     # without either one the staged library would export nothing at all or carry
@@ -458,11 +935,11 @@ if(ZLIB_BUILD_RUST)
     # build of the C library above carries none either because Release supplies
     # no -g.  The static archive is the one artifact nothing strips: a staticlib
     # is assembled rather than linked, so the DWARF the prebuilt core and std
-    # rlibs were compiled with survives into it (measured at 5,111,389 bytes),
-    # and `cc -r --whole-archive' then re-imports every one of those sections
-    # into the relinked shared library, measured at 4,667,746 bytes in a
-    # 6,497,400 byte libz.so.  Neither number has any effect on behaviour or on
-    # the exported surface, and both are invisible to `cmake --install --strip',
+    # rlibs were compiled with survives into it, and `cc -r --whole-archive' then
+    # re-imports every one of those sections into the relinked shared library,
+    # where they are the majority of its size.  Debug information has no effect
+    # on behaviour or on the exported surface, and it is invisible to
+    # `cmake --install --strip',
     # which CMake implements for install(TARGETS) only and so cannot reach files
     # installed as files below.  So the same treatment cargo applies to its own
     # optimised output is applied here to both staged files, and the strip that
@@ -476,10 +953,10 @@ if(ZLIB_BUILD_RUST)
     # expression on the command lines below: a generator expression that
     # evaluates to nothing reaches the tool as an empty argument -- the hazard
     # --profile documents above -- whereas an empty CMake variable expands to no
-    # argument at all.  Under a multi-config generator CMAKE_BUILD_TYPE is empty
-    # and every configuration is therefore treated as optimised, which is the
-    # same limitation, and for the same reason, as the staged drop-in directory
-    # not being per-configuration.
+    # argument at all.  It reads the same CMAKE_BUILD_TYPE the cargo profile
+    # above does, and for the same reason it is unambiguous: multi-config
+    # generators are refused, so this is a real configuration name rather than
+    # the empty string every configuration would share.
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         set(ZLIB_RUST_STRIP_DEBUG "")
     else(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -489,17 +966,26 @@ if(ZLIB_BUILD_RUST)
     # The archive is stripped by a step of its own because cargo hands it over
     # complete and nothing else in this file rewrites it.  objcopy processes an
     # archive member by member and rebuilds its index, so the result is still a
-    # linkable archive -- measured: 332 members, inflate_table still a global,
-    # and both example.c and infcover.c link against it and pass.  It is
-    # tool-gated rather than required: the shared path already refuses without
-    # objcopy above, and a static-only build that has none simply stages the
-    # archive exactly as it did before instead of acquiring a new prerequisite.
+    # linkable archive: every member survives, the internal globals the relink
+    # needs are still defined, and the unmodified C drivers link against it and
+    # pass -- which is what `make rust-test' and the dropin CI job check rather
+    # than something to take on trust here.  It is tool-gated rather than
+    # required: the shared path already refuses without objcopy above, and a
+    # static-only build that has none simply stages the archive as it is instead
+    # of acquiring a new prerequisite.
     set(ZLIB_RUST_STRIP_ARCHIVE_COMMAND "")
 
     if(CMAKE_OBJCOPY AND ZLIB_RUST_STRIP_DEBUG)
-        set(ZLIB_RUST_STRIP_ARCHIVE_COMMAND
+        set(ZLIB_RUST_STAGE_ARCHIVE_COMMAND
             COMMAND ${CMAKE_OBJCOPY} ${ZLIB_RUST_STRIP_DEBUG}
+            ${ZLIB_RUST_RAW_ARCHIVE} ${ZLIB_RUST_ARCHIVE})
+        set(ZLIB_RUST_STAGE_ARCHIVE_COMMENT
+            "Staging ${ZLIB_RUST_STATIC_LIB} without debug sections")
+    else(CMAKE_OBJCOPY AND ZLIB_RUST_STRIP_DEBUG)
+        set(ZLIB_RUST_STAGE_ARCHIVE_COMMAND
+            COMMAND ${CMAKE_COMMAND} -E copy ${ZLIB_RUST_RAW_ARCHIVE}
             ${ZLIB_RUST_ARCHIVE})
+        set(ZLIB_RUST_STAGE_ARCHIVE_COMMENT "Staging ${ZLIB_RUST_STATIC_LIB}")
     endif(CMAKE_OBJCOPY AND ZLIB_RUST_STRIP_DEBUG)
 
     # The published surface, taken from the ZEXTERN declarations in zlib.h so
@@ -537,61 +1023,128 @@ if(ZLIB_BUILD_RUST)
     configure_file(${ZLIB_RUST_SYMBOL_FILE}.in ${ZLIB_RUST_SYMBOL_FILE}
                    COPYONLY)
 
-    # Cargo owns incremental rebuilds of its own crates, but it has to be
-    # reached first, so the crate sources are what this rule depends on.
-    # CONFIGURE_DEPENDS re-runs the glob at build time, so adding or removing a
-    # source file is noticed without a manual reconfigure.
-    file(
-        GLOB_RECURSE
-        ZLIB_RUST_SOURCES
-        CONFIGURE_DEPENDS
-        ${zlib_SOURCE_DIR}/crates/*.rs
-        ${zlib_SOURCE_DIR}/crates/*.c
-        ${zlib_SOURCE_DIR}/crates/*.h
-        ${zlib_SOURCE_DIR}/crates/*.toml)
+    # The cargo command line, as a list, so that it can be handed to the script
+    # above as a single -D argument and reassembled there.
+    set(ZLIB_RUST_CARGO_ARGS
+        build
+        --locked
+        --profile
+        ${ZLIB_RUST_CARGO_PROFILE}
+        --manifest-path
+        ${zlib_SOURCE_DIR}/Cargo.toml
+        --target-dir
+        ${ZLIB_RUST_TARGET_DIR}
+        --package
+        libz-rs-sys
+        --features
+        ${ZLIB_RUST_FEATURES})
 
-    # Step one: cargo, then stage the archive.  --locked holds the build to the
-    # committed Cargo.lock, which is what makes a system library's build
-    # reproducible, and is the same flag Makefile.in L413 defaults to.  The
-    # archive is complete on its own: it defines every function zlib.h declares,
-    # including the two variadic ones build.rs compiles from C and merges in.
-    add_custom_command(
-        OUTPUT ${ZLIB_RUST_ARCHIVE}
+    # ★ Step one: cargo, ALWAYS, and the archive as a byproduct.
+    #
+    # This used to be an add_custom_command(OUTPUT ${ZLIB_RUST_ARCHIVE} ...)
+    # with a hand-written DEPENDS list, and that shape is not repairable by
+    # extending the list.  The rule would be skipped whenever the archive was
+    # newer than every declared input, and the inputs a cargo build actually has
+    # are not enumerable from here: they include every file rustc reads, the
+    # private headers crates/libz-rs-sys/csrc/*.c include from the repository
+    # root, rust-toolchain.toml (which decides WHICH compiler runs, so an edit
+    # changes the output without changing any source), clippy.toml,
+    # .rustfmt.toml, every environment variable build.rs declares
+    # rerun-if-env-changed for, and the contents of the registry cache.  Miss
+    # one and CMake serves a stale archive -- silently, and with a library that
+    # no longer corresponds to the sources.
+    #
+    # So cargo is invoked on every build and asked to decide the incremental
+    # work, which is the one thing it is authoritative about.  The cost of that
+    # decision is a few tens of milliseconds when nothing changed.  Everything
+    # DOWNSTREAM stays incremental because what this target writes is a faithful
+    # copy of cargo's output through `copy_if_different': identical content
+    # means no write, which means the staged archive, the relink, the symlinks
+    # and every consumer that links them are all skipped, exactly as before.
+    # That is why ${ZLIB_RUST_RAW_ARCHIVE} exists and why the strip is a rule of
+    # its own rather than a second command here -- stripping in place would make
+    # the compared file differ from cargo's every time and rewrite the whole
+    # chain on every build.
+    #
+    # BYPRODUCTS rather than OUTPUT is what lets a file produced by an
+    # always-running target be a dependency of the OUTPUT rules below; it also
+    # tells the generator to remove the file on `clean'.
+    #
+    # With ZLIB_BUILD_SHARED and ZLIB_BUILD_STATIC both OFF this project
+    # deliberately produces and installs no library -- in Rust mode exactly as
+    # in C mode -- so the target is not added to ALL and cargo is never paid
+    # for.
+    add_custom_target(
+        zlibrust-cargo
         COMMAND ${CMAKE_COMMAND} -E make_directory ${ZLIB_RUST_DROPIN_DIR}
         COMMAND
-            ${CMAKE_COMMAND} -E env ${ZLIB_RUST_CARGO_ENV}
-            ${ZLIB_CARGO_EXECUTABLE} build --locked --profile
-            $<IF:$<CONFIG:Debug>,dev,release> --manifest-path
-            ${zlib_SOURCE_DIR}/Cargo.toml --target-dir ${ZLIB_RUST_TARGET_DIR}
-            --package libz-rs-sys --features ${ZLIB_RUST_FEATURES}
+            # Through the script written above, so that cargo's `rustc -' target
+            # probe reads an empty standard input rather than whatever the
+            # caller happened to leave on it.  --locked holds the build to the
+            # committed Cargo.lock, which is what makes a system library's build
+            # reproducible, and is the same flag Makefile.in L413 defaults to.
+            # The archive is complete on its own: it defines every function
+            # zlib.h declares, including the two variadic ones build.rs compiles
+            # from C and merges in.
+            ${CMAKE_COMMAND} -DCARGO=${ZLIB_CARGO_EXECUTABLE}
+            "-DCARGO_ARGS=${ZLIB_RUST_CARGO_ARGS}"
+            "-DCARGO_ENV=${ZLIB_RUST_CARGO_ENV}" -DWORK_DIR=${zlib_SOURCE_DIR}
+            -P ${ZLIB_RUST_CARGO_SCRIPT}
         COMMAND
             ${CMAKE_COMMAND} -E copy_if_different
             ${ZLIB_RUST_CARGO_ARTIFACT_DIR}/${ZLIB_RUST_STATIC_LIB}
-            ${ZLIB_RUST_ARCHIVE}
-            # Expands to one further COMMAND, or to nothing at all where no
-            # objcopy was found or the configuration keeps its debug
-            # information.
-            ${ZLIB_RUST_STRIP_ARCHIVE_COMMAND}
-        DEPENDS ${ZLIB_RUST_SOURCES} ${zlib_SOURCE_DIR}/Cargo.toml
-                ${zlib_SOURCE_DIR}/Cargo.lock ${zlib_SOURCE_DIR}/zlib.h
+            ${ZLIB_RUST_RAW_ARCHIVE}
+        BYPRODUCTS ${ZLIB_RUST_RAW_ARCHIVE}
         WORKING_DIRECTORY ${zlib_SOURCE_DIR}
         COMMENT "Building ${ZLIB_RUST_STATIC_LIB} with cargo"
         VERBATIM)
-    # What the staging target below is asked to produce, which is also what
-    # decides whether cargo runs at all: add_custom_command's OUTPUT is built
-    # only when something depends on it, and this list is the only thing that
-    # ever depends on the archive.  With ZLIB_BUILD_SHARED and ZLIB_BUILD_STATIC
-    # both OFF this project deliberately produces and installs no library -- in
-    # Rust mode exactly as in C mode -- so a cargo build would be paid for and
-    # then thrown away.  The rule itself stays declared unconditionally: the
-    # relink below consumes the archive whenever a shared library is wanted, and
-    # a static build installs it directly.
+
+    # Step two: the staged archive, which is what this project installs and what
+    # the relink below consumes.  Skipped when cargo produced the same bytes as
+    # last time.
+    add_custom_command(
+        OUTPUT ${ZLIB_RUST_ARCHIVE} ${ZLIB_RUST_STAGE_ARCHIVE_COMMAND}
+        DEPENDS ${ZLIB_RUST_RAW_ARCHIVE}
+        COMMENT "${ZLIB_RUST_STAGE_ARCHIVE_COMMENT}"
+        VERBATIM)
+
+    # What the staging target below is asked to produce.  The archive is on the
+    # list whenever either library is wanted: a static build installs it
+    # directly and the shared relink consumes it, and naming it here is also
+    # what makes the rule above run at all -- an add_custom_command OUTPUT is
+    # built only when something depends on it.
     set(ZLIB_RUST_ARTIFACTS "")
     set(ZLIB_RUST_SYMLINKS "")
 
     if(ZLIB_BUILD_SHARED OR ZLIB_BUILD_STATIC)
         list(APPEND ZLIB_RUST_ARTIFACTS ${ZLIB_RUST_ARCHIVE})
     endif(ZLIB_BUILD_SHARED OR ZLIB_BUILD_STATIC)
+
+    # The compiler and linker arguments this build was configured with,
+    # forwarded to the two raw ${CMAKE_C_COMPILER} invocations below.
+    #
+    # Those two commands are the only place in this file that drives a compiler
+    # by hand rather than through a CMake target, so they are also the only
+    # place where the configured toolchain arguments have to be passed on
+    # explicitly. Leaving them out is not cosmetic: -m32 changes the ABI of the
+    # object being produced, -fsanitize=address changes what it must be linked
+    # against, and -flto changes its representation entirely -- so a project
+    # configured with any of them would get a shared library that does not match
+    # the rest of the build, from commands that looked like they had honoured
+    # the configuration. CMAKE_SHARED_LINKER_FLAGS goes to the shared link only,
+    # which is the only command that produces a shared object.
+    #
+    # The per-configuration flags are folded in at configure time, which is
+    # exact here because multi-configuration generators are refused:
+    # CMAKE_BUILD_TYPE names the one configuration in play.  separate_arguments
+    # is required because these are single strings and a VERBATIM custom command
+    # would otherwise pass each whole string as one argument.
+    string(TOUPPER "${CMAKE_BUILD_TYPE}" ZLIB_RUST_CONFIG_UPPER)
+    separate_arguments(
+        ZLIB_RUST_CC_FLAGS UNIX_COMMAND
+        "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_${ZLIB_RUST_CONFIG_UPPER}}")
+    separate_arguments(ZLIB_RUST_LD_FLAGS UNIX_COMMAND
+                       "${CMAKE_SHARED_LINKER_FLAGS}")
 
     if(ZLIB_BUILD_SHARED)
         # Step two: turn that archive into an installable shared library.
@@ -609,15 +1162,15 @@ if(ZLIB_BUILD_RUST)
         add_custom_command(
             OUTPUT ${ZLIB_RUST_LIBRARY}
             COMMAND
-                ${CMAKE_C_COMPILER} -r -nostdlib -o
+                ${CMAKE_C_COMPILER} ${ZLIB_RUST_CC_FLAGS} -r -nostdlib -o
                 ${ZLIB_RUST_DROPIN_DIR}/libz-whole.o -Wl,--whole-archive
                 ${ZLIB_RUST_ARCHIVE} -Wl,--no-whole-archive
             COMMAND
                 ${CMAKE_OBJCOPY} --keep-global-symbols=${ZLIB_RUST_SYMBOL_FILE}
                 ${ZLIB_RUST_STRIP_DEBUG} ${ZLIB_RUST_DROPIN_DIR}/libz-whole.o
             COMMAND
-                ${CMAKE_C_COMPILER} -shared -fPIC
-                -Wl,-soname,${ZLIB_RUST_SONAME}
+                ${CMAKE_C_COMPILER} ${ZLIB_RUST_CC_FLAGS} ${ZLIB_RUST_LD_FLAGS}
+                -shared -fPIC -Wl,-soname,${ZLIB_RUST_SONAME}
                 -Wl,--version-script=${zlib_SOURCE_DIR}/zlib.map -o
                 ${ZLIB_RUST_LIBRARY} ${ZLIB_RUST_DROPIN_DIR}/libz-whole.o
             COMMAND ${CMAKE_COMMAND} -E remove -f
@@ -664,6 +1217,17 @@ if(ZLIB_BUILD_RUST)
 
     add_custom_target(zlibrust ALL DEPENDS ${ZLIB_RUST_ARTIFACTS})
 
+    # The ordering edge that makes the always-running cargo step run FIRST.  The
+    # relink and symlink rules above take ${ZLIB_RUST_ARCHIVE} as a DEPENDS, and
+    # it is a BYPRODUCT rather than an OUTPUT, so the file dependency alone does
+    # not tell the generator which rule produces it -- this does.  It is
+    # conditional so that a build wanting neither library never invokes cargo:
+    # zlibrust-cargo is deliberately not in ALL, and this is the only edge that
+    # ever reaches it.
+    if(ZLIB_BUILD_SHARED OR ZLIB_BUILD_STATIC)
+        add_dependencies(zlibrust zlibrust-cargo)
+    endif(ZLIB_BUILD_SHARED OR ZLIB_BUILD_STATIC)
+
     # The staged files are described to CMake as imported libraries so that they
     # can stand in for the C targets everywhere ZLIB::ZLIB and ZLIB::ZLIBSTATIC
     # are consumed.  GLOBAL is required both for the alias below and because
@@ -702,7 +1266,223 @@ if(ZLIB_BUILD_RUST)
         target_compile_definitions(
             zlibrsstatic
             INTERFACE $<$<BOOL:${HAVE_OFF64_T}>:_LARGEFILE64_SOURCE=1>)
+
+        # The one part of the interface that is NOT the C target's interface. A
+        # Rust staticlib carries the Rust standard library's object code, so
+        # linking it needs the libraries rustc named above; a C libz.a needs
+        # none of them.  Publishing them on the target is what makes
+        # `target_link_libraries(app ZLIB::ZLIBSTATIC)' produce a complete link
+        # line -- without it a consumer of this build tree gets undefined
+        # references to symbols it never mentioned, from an archive it was told
+        # was self-contained.  Every element begins with `-', which CMake passes
+        # through as a link flag.
+        if(DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS_LIST)
+            target_link_libraries(
+                zlibrsstatic INTERFACE ${ZLIB_RUST_NATIVE_STATIC_LIBS_LIST})
+        endif(DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS_LIST)
+
         add_dependencies(zlibrsstatic zlibrust)
+
+        # ------------------------------------------------------------------
+        # The pkg-config descriptor for the staged ARCHIVE.
+        #
+        # For dynamic linking one descriptor serves both implementations: -lz
+        # resolves to either library, and a shared object records its own
+        # dependencies in DT_NEEDED, so nothing has to be advertised.  Static
+        # linking is where they part.  The C libz.a needs no companion
+        # libraries, which is why zlib.pc.cmakein carries no Libs.private key
+        # and why adding one there would be wrong for the C build; a Rust
+        # staticlib needs the Rust runtime's own native libraries.  One template
+        # serves both implementations, so the only correct place for a
+        # Rust-specific key is a Rust-specific file, generated here.
+        #
+        # It is generated FROM ${ZLIB_PC}, the descriptor the C build publishes,
+        # with exactly one line added.  Every other field -- prefix, libdir,
+        # Name, Description, Version, License, Requires, Libs and Cflags --
+        # is therefore that file byte for byte and cannot drift from it, which
+        # is the property that matters: a consumer must get the same answers
+        # from both implementations everywhere they do not genuinely differ.
+        #
+        # It is written into the staging directory under the name pkg-config
+        # looks for, so that PKG_CONFIG_PATH pointed at the staged tree answers
+        # correctly before anything is installed.  Installing it is the one
+        # decision the Rust install block below does NOT make: two rules for
+        # <libdir>/pkgconfig/zlib.pc cannot be resolved by declaration order,
+        # for a reason recorded where the single rule that picks between them
+        # lives.
+        #
+        # Makefile.in's `rust-pc' target is the autotools half of this, and it
+        # additionally links and runs a C consumer built from nothing but the
+        # flags this descriptor answers.  That gate belongs to a build system
+        # that can run tools at build time against a staged tree; what is
+        # asserted here is what can be asserted at configure time -- that the
+        # probe produced linker flags, that the C descriptor carried no private
+        # libraries of its own, and that the added key landed exactly once.
+        if(ZLIB_RUST_PC_PRIVATE_LIBS)
+            set(ZLIB_RUST_PC_LIBS "${ZLIB_RUST_PC_PRIVATE_LIBS}")
+            set(ZLIB_RUST_PC_ORIGIN
+                "the list stated in ZLIB_RUST_PC_PRIVATE_LIBS")
+        else(ZLIB_RUST_PC_PRIVATE_LIBS)
+            # An empty crate is enough: the list describes the Rust runtime that
+            # every staticlib carries, not anything specific to this one, and
+            # asking rustc directly keeps the probe independent of whether cargo
+            # has built yet.  -o /dev/null is safe here because this whole path
+            # is refused on any platform that is not ELF.
+            set(ZLIB_RUST_PC_PROBE ${zlib_BINARY_DIR}/rust-pc-probe.rs)
+            file(WRITE ${ZLIB_RUST_PC_PROBE} "")
+            execute_process(
+                COMMAND
+                    ${ZLIB_RUSTC_EXECUTABLE} --print native-static-libs
+                    --crate-type staticlib -o /dev/null ${ZLIB_RUST_PC_PROBE}
+                RESULT_VARIABLE ZLIB_RUST_PC_PROBE_RESULT
+                OUTPUT_VARIABLE ZLIB_RUST_PC_PROBE_STDOUT
+                ERROR_VARIABLE ZLIB_RUST_PC_PROBE_STDERR)
+            file(REMOVE ${ZLIB_RUST_PC_PROBE})
+
+            if(NOT ZLIB_RUST_PC_PROBE_RESULT EQUAL 0)
+                message(
+                    FATAL_ERROR
+                        "${ZLIB_RUSTC_EXECUTABLE} could not report the native "
+                        "static libraries for this target:\n"
+                        "${ZLIB_RUST_PC_PROBE_STDERR}"
+                        "State the list instead:\n"
+                        "    -DZLIB_RUST_PC_PRIVATE_LIBS=\"-lm -lpthread -lc\"")
+            endif(NOT ZLIB_RUST_PC_PROBE_RESULT EQUAL 0)
+
+            if(NOT ZLIB_RUST_PC_PROBE_STDERR MATCHES
+               "native-static-libs:([^\n]*)")
+                message(
+                    FATAL_ERROR
+                        "${ZLIB_RUSTC_EXECUTABLE} printed no "
+                        "native-static-libs note, so nothing can be "
+                        "advertised.  A silently empty Libs.private is the "
+                        "defect this descriptor exists to prevent, so this is "
+                        "a hard failure rather than an empty key.  Output "
+                        "was:\n${ZLIB_RUST_PC_PROBE_STDERR}")
+            endif(NOT ZLIB_RUST_PC_PROBE_STDERR MATCHES
+                  "native-static-libs:([^\n]*)")
+
+            string(STRIP "${CMAKE_MATCH_1}" ZLIB_RUST_PC_LIBS)
+            set(ZLIB_RUST_PC_ORIGIN
+                "${ZLIB_RUSTC_EXECUTABLE} --print native-static-libs")
+        endif(ZLIB_RUST_PC_PRIVATE_LIBS)
+
+        # Every token has to be a library flag.  Without this a probe whose
+        # output shape changed would put prose into the descriptor, and the
+        # first thing to notice would be a consumer's link line.
+        #
+        # Two normalisations come first, and both are about the value arriving
+        # as a CMake list.  -DZLIB_RUST_PC_PRIVATE_LIBS="-lm;-lpthread" is a
+        # perfectly ordinary way to pass one, and pkg-config reads a flag line
+        # rather than a list, so the separator becomes a space -- without this
+        # the descriptor would advertise a single unresolvable -lm;-lpthread.
+        # Runs of whitespace are then collapsed, so that the split below cannot
+        # manufacture an empty element and report it as an unrecognised flag.
+        string(REPLACE ";" " " ZLIB_RUST_PC_LIBS "${ZLIB_RUST_PC_LIBS}")
+        string(REGEX REPLACE "[ \t]+" " " ZLIB_RUST_PC_LIBS
+                             "${ZLIB_RUST_PC_LIBS}")
+        string(STRIP "${ZLIB_RUST_PC_LIBS}" ZLIB_RUST_PC_LIBS)
+        string(REPLACE " " ";" ZLIB_RUST_PC_LIB_LIST "${ZLIB_RUST_PC_LIBS}")
+
+        if(NOT ZLIB_RUST_PC_LIB_LIST)
+            message(
+                FATAL_ERROR
+                    "The native static library list for this target came back "
+                    "empty, from ${ZLIB_RUST_PC_ORIGIN}.")
+        endif(NOT ZLIB_RUST_PC_LIB_LIST)
+
+        foreach(flag IN LISTS ZLIB_RUST_PC_LIB_LIST)
+            if(NOT flag MATCHES "^-[lL]")
+                message(
+                    FATAL_ERROR
+                        "\"${flag}\" is not a linker library flag, and it "
+                        "came from ${ZLIB_RUST_PC_ORIGIN} as part of\n"
+                        "    ${ZLIB_RUST_PC_LIBS}\n"
+                        "Refusing to advertise it in Libs.private.")
+            endif(NOT flag MATCHES "^-[lL]")
+        endforeach(flag IN LISTS ZLIB_RUST_PC_LIB_LIST)
+
+        file(READ ${ZLIB_PC} ZLIB_RUST_PC_BASE)
+
+        if(ZLIB_RUST_PC_BASE MATCHES "(^|\n)Libs\\.private:")
+            message(
+                FATAL_ERROR
+                    "${ZLIB_PC} already carries a Libs.private key.  It must "
+                    "not: the C libz.a needs no companion libraries, and this "
+                    "file adds that key for the Rust archive only.")
+        endif(ZLIB_RUST_PC_BASE MATCHES "(^|\n)Libs\\.private:")
+
+        string(REGEX REPLACE "(\nLibs:[^\n]*\n)"
+                             "\\1Libs.private: ${ZLIB_RUST_PC_LIBS}\n"
+                             ZLIB_RUST_PC_BODY "${ZLIB_RUST_PC_BASE}")
+        string(REGEX MATCHALL "(^|\n)Libs\\.private: " ZLIB_RUST_PC_ADDED
+                              "${ZLIB_RUST_PC_BODY}")
+        list(LENGTH ZLIB_RUST_PC_ADDED ZLIB_RUST_PC_ADDED_COUNT)
+
+        if(NOT ZLIB_RUST_PC_ADDED_COUNT EQUAL 1)
+            message(
+                FATAL_ERROR
+                    "Adding Libs.private to ${ZLIB_PC} produced "
+                    "${ZLIB_RUST_PC_ADDED_COUNT} such keys instead of one.  "
+                    "pkg-config reads the first and ignores the rest, so the "
+                    "descriptor would not say what it appears to say.  Check "
+                    "that zlib.pc.cmakein still carries exactly one Libs: "
+                    "line beginning in column 0.")
+        endif(NOT ZLIB_RUST_PC_ADDED_COUNT EQUAL 1)
+
+        set(ZLIB_RUST_PC ${ZLIB_RUST_DROPIN_DIR}/zlib.pc)
+        file(
+            WRITE ${ZLIB_RUST_PC}
+            "# GENERATED FILE -- do not edit.  CMake rewrites it on every"
+            " configure.\n"
+            "#\n"
+            "# This descriptor describes the STAGED RUST LIBRARY in this"
+            " directory, not\n"
+            "# the C one.  It is ${ZLIB_PC} with exactly one line added:\n"
+            "# Libs.private, carrying the native libraries a Rust staticlib"
+            " needs on\n"
+            "# this target.  Everything else is that file byte for byte,"
+            " because dynamic\n"
+            "# consumption of the two implementations is identical and only"
+            " static\n"
+            "# consumption differs.\n"
+            "#\n"
+            "# The list came from ${ZLIB_RUST_PC_ORIGIN} and is"
+            " TARGET-SPECIFIC.\n"
+            "# Do not copy it to another target: derive it there.\n"
+            "#\n"
+            "# `cmake --install' installs this file over the C zlib.pc, from a"
+            " rule\n"
+            "# declared alongside the ones that install the Rust libraries, so"
+            " that the\n"
+            "# descriptor and the library a consumer finds are the same"
+            " implementation.\n")
+        file(APPEND ${ZLIB_RUST_PC} "${ZLIB_RUST_PC_BODY}")
+
+        # The same list, through the other consumption channel.  Libs.private
+        # answers `pkg-config --static'; a CMake consumer never reads it, and
+        # writes target_link_libraries(app ZLIB::ZLIBSTATIC) instead.  Linking
+        # an archive that needs seven native libraries through an interface that
+        # names none is the same defect in a second place, so the interface
+        # names them.
+        #
+        # It is set on BOTH static targets, and for different reasons.  On
+        # zlibrsstatic it serves this build tree: ZLIB::ZLIBSTATIC aliases it,
+        # so test/ and contrib/ get the flags.  On the C zlibstatic it serves
+        # the INSTALLED package: install(EXPORT) writes that target's interface
+        # into ZLIB-static.cmake, and the libz.a a consumer of the installed
+        # package finds at that location is the Rust archive, because the Rust
+        # install rule publishes it over the C one.  Describing it with the C
+        # library's requirements -- none -- is what would be wrong.  Only raw
+        # link flags go in, never a target name, so the exported file stays
+        # self-contained.
+        set_target_properties(
+            zlibrsstatic PROPERTIES INTERFACE_LINK_LIBRARIES
+                                    "${ZLIB_RUST_PC_LIB_LIST}")
+        set_target_properties(
+            zlibstatic PROPERTIES INTERFACE_LINK_LIBRARIES
+                                  "${ZLIB_RUST_PC_LIB_LIST}")
+        # ------------------------------------------------------------------
     endif(ZLIB_BUILD_STATIC)
 endif(ZLIB_BUILD_RUST)
 
@@ -803,18 +1583,47 @@ if(ZLIB_INSTALL)
               doc/txtvsbin.txt
         COMPONENT Docs
         DESTINATION "${CMAKE_INSTALL_DOCDIR}/zlib")
-    install(
-        FILES ${ZLIB_PC}
-        COMPONENT Development
-        DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig")
+    # The pkg-config descriptor, and there is exactly one of it.  With
+    # ZLIB_BUILD_RUST the staged Rust library brings its own -- generated in the
+    # ZLIB_BUILD_RUST block above, the C descriptor plus the one Libs.private
+    # key a Rust static archive needs -- and both files are named zlib.pc, so
+    # both would occupy <libdir>/pkgconfig/zlib.pc.
+    #
+    # THE CHOICE IS MADE HERE RATHER THAN BY DECLARATION ORDER, and that is a
+    # correction rather than a preference.  Everything else the Rust path
+    # publishes wins by being installed last, but a descriptor cannot: the
+    # generated cmake_install.cmake calls file(INSTALL), which skips a copy
+    # whose source and destination timestamps agree, and both descriptors are
+    # written by the same configure run.  Measured with both rules declared --
+    # the C descriptor was installed, and the Rust one reported "Up-to-date" and
+    # never replaced it, leaving an installed libz.a that needs seven native
+    # libraries described by a file naming none.  Two rules for one path is the
+    # defect; one rule that picks is the fix.
+    #
+    # Only the static case takes the Rust descriptor, because static consumption
+    # is the only case where the two differ, and it is also the only case in
+    # which a Rust archive is published at all.
+    if(ZLIB_BUILD_RUST AND ZLIB_BUILD_STATIC)
+        install(
+            FILES ${ZLIB_RUST_PC}
+            COMPONENT Development
+            DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig")
+    else(ZLIB_BUILD_RUST AND ZLIB_BUILD_STATIC)
+        install(
+            FILES ${ZLIB_PC}
+            COMPONENT Development
+            DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig")
+    endif(ZLIB_BUILD_RUST AND ZLIB_BUILD_STATIC)
 
     # The Rust artifacts go to the same destinations, under the same component
     # names, as the C libraries above, so that zlib.pc keeps advertising -lz and
     # the exported ZLIB-shared.cmake and ZLIB-static.cmake keep naming files
     # that exist.  Those two export files, their component names and the header,
-    # zlib.3, LICENSE, doc/ and zlib.pc rules are deliberately untouched: the
-    # installed package's shape is part of the contract, and test/*.cmake.in
-    # asserts that requesting a component outside {shared, static} fails.
+    # zlib.3, LICENSE and doc/ rules are deliberately untouched: the installed
+    # package's shape is part of the contract, and test/*.cmake.in asserts that
+    # requesting a component outside {shared, static} fails.  The zlib.pc rule
+    # above is the one exception, and it is not an addition to the shape: still
+    # one descriptor at one path, chosen there rather than duplicated here.
     #
     # These rules are declared LAST on purpose.  install() runs in declaration
     # order, so where a name is published by both implementations the Rust file
@@ -891,6 +1700,33 @@ endif(CMAKE_INSTALL_DO_STRIP
                 FILES ${ZLIB_RUST_ARCHIVE}
                 COMPONENT Development
                 DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+
+            # The installed ZLIB-static.cmake is generated from the C target
+            # `zlibstatic', because install(TARGETS) does not accept an IMPORTED
+            # target below CMake 3.21 and the staged archive is therefore
+            # installed as a file.  In Rust mode the FILE that lands in libdir
+            # is the Rust archive -- the rule above runs after the C one and
+            # wins the name -- while the exported interface describing it still
+            # came from the C target, which needs no companion libraries.  An
+            # installed consumer writing `find_package(ZLIB CONFIG);
+            # target_link_libraries(app ZLIB::ZLIBSTATIC)' would get an
+            # incomplete link line from a package that had every chance to state
+            # the truth.
+            #
+            # Publishing the probed set on `zlibstatic' is what closes that: the
+            # generated export file carries INTERFACE_LINK_LIBRARIES verbatim,
+            # and every element is a `-l' flag, so it needs no target to exist
+            # in the consumer's project and no path to survive relocation.  It
+            # is appended only in Rust mode, so a C-mode package keeps
+            # advertising an archive that stands alone, which is the truth
+            # there.
+            if(DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS_LIST)
+                set_property(
+                    TARGET zlibstatic
+                    APPEND
+                    PROPERTY INTERFACE_LINK_LIBRARIES
+                             ${ZLIB_RUST_NATIVE_STATIC_LIBS_LIST})
+            endif(DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS_LIST)
         endif(ZLIB_BUILD_STATIC)
     endif(ZLIB_BUILD_RUST)
 endif(ZLIB_INSTALL)

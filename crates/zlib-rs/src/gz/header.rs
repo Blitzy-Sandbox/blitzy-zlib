@@ -107,13 +107,13 @@
 // recording because neither is obvious:
 //
 //   * Everything here is `pub(crate)`, mirroring the `local` and `ZLIB_INTERNAL` linkage of the C
-//     sources, so nothing is reachable from the crate root and rustc reports any entry whose callers
-//     are not yet written. `crates/zlib-rs/src/gz/read.rs` is the consumer of `looks_like_gzip`.
+//     sources, so nothing is reachable from the crate root and rustc reports any entry no sibling
+//     module happens to name. `crates/zlib-rs/src/gz/read.rs` is the consumer of `looks_like_gzip`.
 //   * The `const _: () = assert!(...)` invariants below do NOT count as uses of a constant on the
 //     declared MSRV. Building this module with rustc 1.80.0 reports all nineteen constants as never
 //     used; building it with rustc 1.97.1 reports none of them. So the attribute is what keeps the
-//     MSRV toolchain's build warning-free even once every sibling module has landed, and removing it
-//     would reintroduce nineteen warnings on the very toolchain `rust-version` promises to support.
+//     MSRV toolchain's build warning-free, and removing it would reintroduce nineteen warnings on
+//     the very toolchain `rust-version` promises to support.
 #![allow(dead_code)]
 
 use crate::crc32::crc32;

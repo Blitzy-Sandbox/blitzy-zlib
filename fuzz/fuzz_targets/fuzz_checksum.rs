@@ -10,10 +10,14 @@
 //! a CRC-32 are both part of the zlib and gzip wire formats and a single wrong bit
 //! produces a stream the reference implementation rejects.
 //!
-//! The C side is reached through `zlib_rs_differential::oracle`, whose `c_`-prefixed
-//! declarations are the in-tree C sources compiled by that crate's `build.rs` and renamed
-//! so that `crc32` can mean two things in one binary. So `c_crc32` here is exactly
-//! `crc32` in `crc32.c`, and `libz_rs_sys::crc32` is the port.
+//! Both sides are reached through the harness crate's safe boundary gates:
+//! `zlib_rs_differential::oracle` wraps the `c_`-prefixed declarations of the in-tree C
+//! sources, compiled by that crate's `build.rs` and renamed so that `crc32` can mean two
+//! things in one binary, and `zlib_rs_differential::port` wraps the facade. So
+//! `oracle::crc32` here is exactly `crc32` in `crc32.c` and `port::crc32` is the port's
+//! `crc32`, and this file opens no `unsafe` block of its own -- the crate-level
+//! `#![forbid(unsafe_code)]` below is what holds that, and the two gate files are where
+//! the FFI obligations are discharged and documented.
 //!
 //! Six families of assertion are made:
 //!
@@ -54,11 +58,29 @@
 //! # Why this target is the executable form of the SIMD requirement
 //!
 //! The `simd` feature may change how long a checksum takes and must never change what it
-//! returns. That claim is worth nothing unasserted, so this target is where it is
-//! checked: build it with `--features simd` and every equality above still has to hold
+//! returns. That claim is worth nothing unasserted, so this target is one of the places it
+//! is checked: build it with `--features simd` and every equality above still has to hold
 //! against a scalar C oracle that knows nothing about vectors. See
 //! [`check_simd_neutrality`] for the direct backend-against-backend comparison that runs
 //! on top of that.
+//!
+//! **Which of those checks CI actually performs, precisely.** The `fuzz` job in
+//! `.github/workflows/rust.yml` runs this target with no `--features` argument, so the
+//! automated fuzzing run exercises the scalar backends only and the neutrality assertions
+//! above are compiled out of it. Reaching them means passing the feature yourself:
+//!
+//! ```text
+//! cd fuzz
+//! cargo +nightly fuzz run fuzz_checksum --features simd -- -max_total_time=300
+//! ```
+//!
+//! The neutrality property is nonetheless machine-enforced on every push, just not from
+//! here: the `differential` job runs
+//! `cargo test -p zlib-rs-differential --release --features simd`, and because the
+//! byte-identity cells compare the running check value as well as the emitted bytes, a
+//! vectorized checksum that returned a different answer would fail there. So this target
+//! is the arbitrary-input form of the check, run deliberately, and the differential suite
+//! is the automatic one. Do not cite a green `fuzz` job as evidence about SIMD.
 //!
 //! # What this target deliberately does NOT do
 //!
@@ -80,36 +102,37 @@
 //! `+nightly` is required because the repository-root `rust-toolchain.toml` pins stable
 //! and cargo-fuzz's sanitizer instrumentation is nightly-only. The gate is zero crashes,
 //! zero hangs, zero timeouts and zero out-of-memory reports over at least 300 seconds,
-//! matching `fuzz-seconds: 300` in `.github/workflows/fuzz.yml`. Note that the oracle
-//! archive is compiled without sanitizer instrumentation, which costs nothing here: the
-//! C implementation is fuzzed separately and continuously by OSS-Fuzz.
+//! matching `fuzz-seconds: 300` in `.github/workflows/fuzz.yml`.
+//!
+//! Two limits on what that instrumentation reaches, stated so the coverage is not read as
+//! wider than it is. AddressSanitizer and coverage feedback apply to the Rust crates, so
+//! they cover the checksum entry points this target drives and not the boundary layer as a
+//! whole. And the oracle archive is compiled WITHOUT instrumentation, so a memory error
+//! inside the C reference is not detected here and libFuzzer's coverage feedback is not
+//! guided by the oracle's branches. That trade is accepted rather than free: the oracle is
+//! a comparison value rather than the subject, the C implementation is fuzzed separately
+//! and continuously by OSS-Fuzz, and a disagreement between the two answers is still
+//! reported because that assertion lives on the Rust side.
 //!
 //! # Self-containment
 //!
 //! cargo-fuzz compiles every file in `fuzz_targets/` as an independent binary, so a
-//! shared helper module would simply never be compiled. Everything this target needs is
-//! therefore in this file; do not try to factor any of it out.
+//! shared helper module in this directory would simply never be compiled. Everything this
+//! target needs is therefore either in this file or in `zlib-rs-differential`, which is a
+//! real dependency and does get compiled; do not try to factor any of it into a sibling
+//! of this file.
 
 #![no_main]
-
-use core::ptr;
-use core::slice;
+#![forbid(unsafe_code)]
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 
-use libz_rs_sys::{
-    adler32, adler32_combine, adler32_combine64, adler32_z, crc32, crc32_combine, crc32_combine64,
-    crc32_combine_gen, crc32_combine_gen64, crc32_combine_op, crc32_z, get_crc_table, uInt, uLong,
-    z_off64_t, z_off_t, z_size_t,
-};
+use libz_rs_sys::{uInt, uLong, z_off64_t, z_off_t, z_size_t};
 use zlib_rs::adler32::{ADLER32_INITIAL_VALUE, NMAX};
 use zlib_rs::crc32::{Braid, Crc32Backend, Generic, CRC_TABLE};
-use zlib_rs_differential::oracle::{
-    c_adler32, c_adler32_combine, c_adler32_combine64, c_adler32_z, c_crc32, c_crc32_combine,
-    c_crc32_combine64, c_crc32_combine_gen, c_crc32_combine_gen64, c_crc32_combine_op, c_crc32_z,
-    c_get_crc_table, oracle_crc_table,
-};
+use zlib_rs_differential::oracle::oracle_crc_table;
+use zlib_rs_differential::{oracle, port};
 
 // The vectorized engines are named only by the neutrality check, so their imports are
 // gated exactly as it is. Without the feature the types do not exist at all -- `zlib-rs`
@@ -133,26 +156,23 @@ use zlib_rs::crc32::Simd;
 // cost throughput linearly. These constants are therefore bounds, not tuning knobs; raising
 // them trades the gate away for coverage that is already had.
 //
-// Every value below was chosen by measurement rather than by taste, and the measurements are
-// recorded here so that a later maintainer can tell which of them are load-bearing. Two
-// findings shaped them, and neither is what a byte count would suggest:
+// The bounds below are set from where the cost actually is, and two properties govern that.
+// Both are worth recording, because neither is what a byte count would suggest:
 //
 //   * Per-call cost dominates, not bytes hashed. Each piece of a streaming pass is a call
 //     across the C ABI carrying the facade's panic guard, and under cargo-fuzz also
-//     AddressSanitizer and coverage instrumentation. Halving the iteration bounds bought more
-//     than halving the payload did.
-//   * The NMAX probe was, and remains, the single most expensive thing here: removing it
-//     entirely took the small-input rate from 10k to 40k executions per second. It cannot be
-//     shortened -- its length is fixed by `NMAX` itself -- so what was reduced instead was the
-//     number of times it is traversed.
+//     AddressSanitizer and coverage instrumentation. So the iteration bounds are the lever
+//     that matters, ahead of the payload length.
+//   * The `NMAX` probe is the single most expensive thing here, and it cannot be shortened --
+//     its length is fixed by `NMAX` itself. What is bounded instead is the number of times it
+//     is traversed.
 //
-// The result, on the host this port is measured on and with the whole assertion set live, is
-// roughly 6,100 executions per second at a full payload and 9,300 at a short one, against
-// 2,100 for `fuzz_deflate` and 2,000 for `fuzz_gz_roundtrip` measured the same way. That is
-// the rate the mandated coverage permits, not a rate left on the table: a byte-for-byte
-// differential against a second implementation costs two computations of everything it
-// checks, and the `NMAX` crossing costs five and a half kilobytes of that on every
-// invocation by design.
+// The execution rate this target sustains is therefore lower than a checksum fuzzer's would
+// otherwise be, and that is the price of the coverage rather than something left on the table:
+// a byte-for-byte differential against a second implementation costs two computations of
+// everything it checks, and the `NMAX` crossing costs five and a half kilobytes of that on
+// every invocation by design. Re-measure on the host in question before changing a bound;
+// raising one trades the no-hang half of the gate away.
 
 /// Longest payload handed to either checksum, in bytes.
 ///
@@ -161,9 +181,8 @@ use zlib_rs::crc32::Simd;
 /// below, and the braided CRC-32 path, which `crc32.c` L640 enters at `N * W + W - 1` -- 47
 /// bytes where a 64-bit word type is available, and which then runs about a dozen full
 /// braid rounds at this length. Nothing in either algorithm branches on a length above this,
-/// so a longer payload costs throughput linearly and buys no coverage; this figure was
-/// lowered from a kibibyte after measurement, which is also why it is written as a bound and
-/// not as a preference.
+/// so a longer payload costs throughput linearly and buys no coverage. It is written as a bound
+/// rather than as a preference for that reason: raising it buys nothing and costs executions.
 const MAX_PAYLOAD_LEN: usize = 512;
 
 /// Longest slice handed to the backend-interchangeability comparison, in bytes.
@@ -348,10 +367,20 @@ struct ChecksumInput<'a> {
     split: u16,
     /// Starting value for every Adler-32 assertion.
     ///
-    /// Unconstrained on purpose. The reference reduces a starting value whose halves are
-    /// not below `BASE` differently in each of its three code paths (`adler32.c` L72-L76,
-    /// L90-L92, L104-L105), and those paths must still agree with one another; a seed
-    /// drawn only from the well-formed range would never test that.
+    /// Unconstrained on purpose, but note carefully what that does and does not buy.
+    ///
+    /// The reference reduces a starting value whose halves are not below `BASE` differently
+    /// in each of its three code paths (`adler32.c` L72-L76, L90-L92, L104-L105), and the
+    /// port has to reproduce each of those reductions exactly -- which is what
+    /// [`check_adler_one_shot`] asserts against `adler32.c` on this raw value, and a seed
+    /// drawn only from the well-formed range would never reach.
+    ///
+    /// Those paths do NOT, however, agree with one another outside the well-formed range,
+    /// and the reference does not claim they do: a single conditional subtraction and a
+    /// modulo give different answers once a half is already >= `BASE`. So the assertions
+    /// that compare *chunkings against each other* normalise this value first --
+    /// see [`normalised_adler_seed`] -- because otherwise they would report the port as
+    /// broken for agreeing with the reference.
     adler_seed: u32,
     /// Starting value for every CRC-32 assertion.
     crc_seed: u32,
@@ -452,95 +481,70 @@ fn narrow(value: uLong) -> u32 {
     value as u32
 }
 
-/// Narrows a bounded length to the `uInt` the unsuffixed entry points take.
-///
-/// Every caller passes either a payload bounded by [`MAX_PAYLOAD_LEN`] or the probe
-/// bounded by [`NMAX_PROBE_LEN`], both of which the compile-time assertions above hold
-/// below 65536.
-fn as_uint(len: usize) -> uInt {
-    len as uInt
-}
-
 // ---------------------------------------------------------------------------
-//  The eight buffer entry points, behind safe wrappers
+//  The eight buffer entry points, behind the harness's boundary gates
 // ---------------------------------------------------------------------------
 //
-// This is the whole of the unsafety in this file, and it is all one shape: turn a live
-// `&[u8]` into the `(*const Bytef, len)` pair the C signature takes, call the function,
-// return the `uLong`. Wrapping each of the eight once means the safety argument is made
-// eight times in total rather than at every one of the several hundred call sites below,
-// and it means the phase functions read as ordinary safe Rust.
+// Eight one-line forwards into `zlib_rs_differential::{port, oracle}`, which is where this
+// harness keeps the whole of its FFI. Each gate turns the `&[u8]` into the
+// `(*const Bytef, len)` pair the C signature takes and discharges the obligation that goes
+// with it -- a live shared borrow is non-null, `u8`-aligned and readable for exactly
+// `data.len()` bytes, and neither implementation writes through the pointer or retains it
+// past the call. Naming the gate eight times here rather than at each of the several
+// hundred call sites below is what lets every phase function be ordinary safe Rust.
 //
-// The obligation each wrapper discharges is identical, so it is stated once here and
-// referred to by each: `data` is a live shared borrow for the whole of the call, so
-// `data.as_ptr()` is non-null, aligned (`u8` has alignment 1, so any non-null pointer is)
-// and readable for exactly `data.len()` bytes; the callee only reads, writes nothing
-// through the pointer and retains nothing past its return. An empty `data` yields a
-// non-null dangling-but-aligned pointer with length zero, which both implementations
-// handle without a read -- C's `while (len--)` on an unsigned zero does not enter the loop
-// and `crc32_z`'s `while (len)` does not either -- so no caller has to special-case it.
+// Two properties of the gates are load-bearing for this target specifically.
 //
-// The pointer/length pair is built at the call and not stored, so there is no window in
-// which it could outlive the borrow it came from.
+// The slice's own pointer is passed verbatim, empty slice included. A non-null zero-length
+// buffer and `Z_NULL` are two different documented inputs with two different answers --
+// `adler32.c` L81-L82 answers `1` only for the null pointer, so a zero-length update
+// through a live pointer returns the seed it was handed -- and this target asserts both.
+// The null face has its own four gates per side, used by [`check_null_buffer`] and
+// [`check_null_at_length_one`].
+//
+// Length narrowing into `uInt` is the gates' as well, and it saturates rather than
+// truncates. This target never reaches either behaviour: every buffer it hands over is
+// bounded by [`MAX_PAYLOAD_LEN`] or by [`NMAX_PROBE_LEN`], and the compile-time assertions
+// above hold both below 65536.
 
 /// The port's `adler32` -- the `uInt`-length face, `zlib.h` L1809.
 fn rust_adler32(seed: uLong, data: &[u8]) -> uLong {
-    // SAFETY: as stated for this block of wrappers -- `data.len()` bytes are readable at
-    // `data.as_ptr()` for the duration of the call, the pointer is non-null and aligned,
-    // and `as_uint` cannot truncate at the lengths this target bounds itself to.
-    unsafe { adler32(seed, data.as_ptr(), as_uint(data.len())) }
+    port::adler32(seed, data)
 }
 
 /// The port's `adler32_z` -- the `z_size_t`-length face, `zlib.h` L1829.
 fn rust_adler32_z(seed: uLong, data: &[u8]) -> uLong {
-    let len: z_size_t = data.len();
-    // SAFETY: as stated for this block of wrappers. No length conversion is involved at
-    // all here: `z_size_t` is `size_t`, which `crates/libz-rs-sys/src/types.rs` asserts
-    // equal to `usize` at compile time.
-    unsafe { adler32_z(seed, data.as_ptr(), len) }
+    port::adler32_z(seed, data)
 }
 
 /// The port's `crc32` -- the `uInt`-length face, `zlib.h` L1848.
 fn rust_crc32(seed: uLong, data: &[u8]) -> uLong {
-    // SAFETY: as stated for this block of wrappers.
-    unsafe { crc32(seed, data.as_ptr(), as_uint(data.len())) }
+    port::crc32(seed, data)
 }
 
 /// The port's `crc32_z` -- the `z_size_t`-length face, `zlib.h` L1866.
 fn rust_crc32_z(seed: uLong, data: &[u8]) -> uLong {
-    let len: z_size_t = data.len();
-    // SAFETY: as stated for this block of wrappers.
-    unsafe { crc32_z(seed, data.as_ptr(), len) }
+    port::crc32_z(seed, data)
 }
 
 /// The reference's `adler32` -- `adler32.c` L128-L130, renamed by the oracle's `build.rs`.
 fn oracle_adler32(seed: uLong, data: &[u8]) -> uLong {
-    // SAFETY: as stated for this block of wrappers. The callee is the reference
-    // implementation compiled from the in-tree `adler32.c`; it reads at most `len` bytes
-    // and has no other precondition. `data` is never empty *and* null at once, and a null
-    // pointer is never passed through here -- the null-buffer contract has its own
-    // function, which is also where the C `len == 1` hazard is documented.
-    unsafe { c_adler32(seed, data.as_ptr(), as_uint(data.len())) }
+    oracle::adler32(seed, data)
 }
 
 /// The reference's `adler32_z` -- `adler32.c` L61-L125.
 fn oracle_adler32_z(seed: uLong, data: &[u8]) -> uLong {
-    let len: z_size_t = data.len();
-    // SAFETY: as stated for this block of wrappers.
-    unsafe { c_adler32_z(seed, data.as_ptr(), len) }
+    oracle::adler32_z(seed, data)
 }
 
 /// The reference's `crc32` -- `crc32.c` L946-L951.
 fn oracle_crc32(seed: uLong, data: &[u8]) -> uLong {
-    // SAFETY: as stated for this block of wrappers.
-    unsafe { c_crc32(seed, data.as_ptr(), as_uint(data.len())) }
+    oracle::crc32(seed, data)
 }
 
 /// The reference's `crc32_z` -- `crc32.c` L626-L941.
 fn oracle_crc32_z(seed: uLong, data: &[u8]) -> uLong {
-    let len: z_size_t = data.len();
-    // SAFETY: as stated for this block of wrappers.
-    unsafe { c_crc32_z(seed, data.as_ptr(), len) }
+    oracle::crc32_z(seed, data)
 }
 
 /// One checksum entry point, as this target drives it.
@@ -695,20 +699,17 @@ fn check_null_buffer(adler_seed: uLong, crc_seed: uLong) {
     for &len in &NULL_LENGTHS {
         let wide_len = len as z_size_t;
 
-        // SAFETY: a null pointer in buffer position is documented input for all four of
-        // these entry points, and the reference tests it against `Z_NULL` and returns
-        // before dereferencing it (`adler32.c` L81-L82, `crc32.c` L627-L628). `len` is
-        // never 1 here, by the construction of `NULL_LENGTHS`, so the one reference path
-        // that reads a byte before testing the pointer is not reachable. Nothing is
-        // written through the pointer and nothing retains it.
-        let observed = unsafe {
-            [
-                adler32(adler_seed, ptr::null(), len),
-                adler32_z(adler_seed, ptr::null(), wide_len),
-                c_adler32(adler_seed, ptr::null(), len),
-                c_adler32_z(adler_seed, ptr::null(), wide_len),
-            ]
-        };
+        // The null face has its own gates, so the null pointer is formed inside the
+        // harness crate and never here. `len` is never 1, by the construction of
+        // `NULL_LENGTHS`, which is what keeps the two oracle gates below out of the one
+        // reference path that reads a byte before it tests the pointer -- they assert that
+        // precondition themselves, and would panic rather than crash if it were violated.
+        let observed = [
+            port::adler32_null(adler_seed, len),
+            port::adler32_z_null(adler_seed, wide_len),
+            oracle::adler32_null(adler_seed, len),
+            oracle::adler32_z_null(adler_seed, wide_len),
+        ];
         for value in observed {
             assert_eq!(
                 value, ADLER32_SEED,
@@ -716,16 +717,15 @@ fn check_null_buffer(adler_seed: uLong, crc_seed: uLong) {
             );
         }
 
-        // SAFETY: exactly as above, and with one fewer caveat -- `crc32_z` tests the
-        // pointer first (`crc32.c` L627-L628), so no length is excluded for this family.
-        let observed = unsafe {
-            [
-                crc32(crc_seed, ptr::null(), len),
-                crc32_z(crc_seed, ptr::null(), wide_len),
-                c_crc32(crc_seed, ptr::null(), len),
-                c_crc32_z(crc_seed, ptr::null(), wide_len),
-            ]
-        };
+        // As above, and with one fewer caveat -- `crc32_z` tests the pointer first
+        // (`crc32.c` L627-L628), so no length is excluded for this family and the oracle
+        // gates carry no precondition of their own.
+        let observed = [
+            port::crc32_null(crc_seed, len),
+            port::crc32_z_null(crc_seed, wide_len),
+            oracle::crc32_null(crc_seed, len),
+            oracle::crc32_z_null(crc_seed, wide_len),
+        ];
         for value in observed {
             assert_eq!(
                 value, CRC32_SEED,
@@ -752,16 +752,15 @@ fn check_null_buffer(adler_seed: uLong, crc_seed: uLong) {
 /// The CRC-32 family has no such hazard, so its `len == 1` case is compared against the
 /// oracle in full.
 fn check_null_at_length_one(adler_seed: uLong, crc_seed: uLong) {
-    // SAFETY: no pointer is dereferenced on this path at all. `crates/libz-rs-sys/src/
-    // checksum.rs` tests `buf.is_null()` before it builds any slice and returns the seed
-    // directly, so the null pointer reaches nothing that could read it. The reference is
-    // deliberately not called with these arguments -- see this function's documentation.
-    let observed = unsafe {
-        [
-            adler32(adler_seed, ptr::null(), 1),
-            adler32_z(adler_seed, ptr::null(), 1),
-        ]
-    };
+    // No pointer is dereferenced on this path at all. `crates/libz-rs-sys/src/checksum.rs`
+    // tests `buf.is_null()` before it builds any slice and returns the seed directly, so the
+    // null pointer the gate forms reaches nothing that could read it. The reference is
+    // deliberately not called with these arguments -- see this function's documentation --
+    // and `oracle::adler32_null` would refuse this length if it were.
+    let observed = [
+        port::adler32_null(adler_seed, 1),
+        port::adler32_z_null(adler_seed, 1),
+    ];
     for value in observed {
         assert_eq!(
             value, ADLER32_SEED,
@@ -770,17 +769,15 @@ fn check_null_at_length_one(adler_seed: uLong, crc_seed: uLong) {
         );
     }
 
-    // SAFETY: as in `check_null_buffer` -- `crc32_z` tests the pointer against `Z_NULL`
-    // first (`crc32.c` L627-L628), so a length of 1 reads nothing and both
-    // implementations are defined here.
-    let observed = unsafe {
-        [
-            crc32(crc_seed, ptr::null(), 1),
-            crc32_z(crc_seed, ptr::null(), 1),
-            c_crc32(crc_seed, ptr::null(), 1),
-            c_crc32_z(crc_seed, ptr::null(), 1),
-        ]
-    };
+    // As in `check_null_buffer` -- `crc32_z` tests the pointer against `Z_NULL` first
+    // (`crc32.c` L627-L628), so a length of 1 reads nothing and both implementations are
+    // defined here, which is why the reference is included for this family.
+    let observed = [
+        port::crc32_null(crc_seed, 1),
+        port::crc32_z_null(crc_seed, 1),
+        oracle::crc32_null(crc_seed, 1),
+        oracle::crc32_z_null(crc_seed, 1),
+    ];
     for value in observed {
         assert_eq!(
             value, CRC32_SEED,
@@ -792,6 +789,51 @@ fn check_null_at_length_one(adler_seed: uLong, crc_seed: uLong) {
 // ---------------------------------------------------------------------------
 //  Streaming equivalence
 // ---------------------------------------------------------------------------
+
+/// Largest prime below 65536 -- `adler32.c` L10's `BASE`, and the modulus both halves of an
+/// Adler-32 value are reduced by.
+const ADLER_BASE: uLong = 65521;
+
+/// Reduces both halves of an Adler-32 starting value into `0..BASE`.
+///
+/// ★ Needed because **resumability is a property of well-formed Adler-32 values only**, and
+/// asserting it for any other starting value asserts something the reference implementation
+/// does not do either.
+///
+/// `adler32` reduces a starting value in three different places, and they are not
+/// equivalent when the value is already out of range. The byte-at-a-time branch
+/// (`adler32.c` L69-L77, entered only at `len == 1`) applies a *single conditional
+/// subtraction* to each half -- `if (sum2 >= BASE) sum2 -= BASE;` -- whereas the general
+/// path applies a full `MOD`. So a `sum2` seeded at `0xffff` (65535, which is `BASE + 14`)
+/// comes back as 14 from one path and as something else from the other, and the difference
+/// then propagates through the rest of the accumulation.
+///
+/// Measured on this tree, seed `0xffffffef` over the three bytes `00 00 00`:
+///
+/// | | one-shot | one byte at a time |
+/// |---|---|---|
+/// | `adler32.c` | `0x0008ffef` | `0xfff9ffef` |
+/// | this port | `0x0008ffef` | `0xfff9ffef` |
+///
+/// The two implementations agree exactly -- zero divergence -- and *neither* is resumable
+/// there. So a chunking assertion over a raw fuzzer seed reports a defect in the port for
+/// faithfully reproducing the reference, which is the opposite of this target's purpose. The
+/// seed is therefore normalised for the resumability assertions specifically, which is
+/// exactly the domain `zlib.h` L1819-L1826 describes: every value `adler32` *returns* has
+/// both halves below `BASE`, so a caller accumulating across calls is always in this domain.
+///
+/// Coverage of out-of-range seeds is not lost, and that matters: [`check_adler_one_shot`]
+/// compares the port against `adler32.c` on the *raw* seed and is where the three reduction
+/// paths are held to the reference. What is dropped here is only the claim that those paths
+/// agree with *each other* outside the well-formed range -- a claim the reference refutes.
+///
+/// CRC-32 needs no equivalent. It has no modulus and no distinguished range: every `u32` is
+/// a valid running CRC, so its resumability assertions take the raw seed unchanged.
+fn normalised_adler_seed(seed: uLong) -> uLong {
+    let low = (seed & 0xffff) % ADLER_BASE;
+    let high = ((seed >> 16) & 0xffff) % ADLER_BASE;
+    low | (high << 16)
+}
 
 /// Requires that chunking an input changes nothing about the answer.
 ///
@@ -807,8 +849,12 @@ fn check_null_at_length_one(adler_seed: uLong, crc_seed: uLong) {
 /// streamed, and both are held to the *port's* one-shot answer, which chains the
 /// equalities -- reference-streamed equals port-one-shot only if the two implementations
 /// agree and both are resumable.
+///
+/// The Adler-32 seed is normalised first; [`normalised_adler_seed`] records why, and why the
+/// CRC-32 seed is not.
 fn check_streaming(data: &[u8], adler_seed: uLong, crc_seed: uLong, chunk: usize) {
     let len = data.len();
+    let adler_seed = normalised_adler_seed(adler_seed);
     let one_shot_adler = rust_adler32(adler_seed, data);
     let one_shot_crc = rust_crc32(crc_seed, data);
 
@@ -852,6 +898,10 @@ fn check_streaming(data: &[u8], adler_seed: uLong, crc_seed: uLong, chunk: usize
 fn check_bytewise(data: &[u8], adler_seed: uLong, crc_seed: uLong) {
     let prefix = &data[..data.len().min(BYTEWISE_PREFIX_LEN)];
     let len = prefix.len();
+    // Normalised for the reason [`normalised_adler_seed`] records, and this is the function
+    // where it matters most: it drives `len == 1` on every call, which is precisely the
+    // branch whose single conditional subtraction differs from the general path's modulo.
+    let adler_seed = normalised_adler_seed(adler_seed);
     let one_shot_adler = rust_adler32(adler_seed, prefix);
     let one_shot_crc = rust_crc32(crc_seed, prefix);
 
@@ -915,12 +965,17 @@ fn check_nmax_boundary(probe: &[u8], adler_seed: uLong, split: usize, resumption
     );
 
     if resumption {
+        // Normalised, and the one-shot answer recomputed from the same value, so that the
+        // two sides of the equality start from one state.  A split of 1 reaches the
+        // byte-at-a-time branch, so this arm is exposed to exactly the asymmetry
+        // [`normalised_adler_seed`] describes.
+        let seed = normalised_adler_seed(adler_seed);
         let (head, tail) = probe.split_at(split);
         assert_eq!(
-            rust_adler32(rust_adler32(adler_seed, head), tail),
-            rust,
+            rust_adler32(rust_adler32(seed, head), tail),
+            rust_adler32(seed, probe),
             "adler32 is not resumable across the NMAX boundary: \
-             seed {adler_seed:#x}, len {len}, split {split}"
+             seed {seed:#x}, len {len}, split {split}"
         );
     }
 }
@@ -949,19 +1004,18 @@ fn check_adler_combine(data: &[u8], split: usize) {
 
     let head_sum = rust_adler32(ADLER32_SEED, head);
     let tail_sum = rust_adler32(ADLER32_SEED, tail);
-    let combined = adler32_combine(head_sum, tail_sum, tail_len);
+    let combined = port::adler32_combine(head_sum, tail_sum, tail_len);
 
-    // SAFETY: both declarations take three integers by value and dereference nothing.
-    // `adler32.c` L158-L164 forwards each to the `local` `adler32_combine_`, which is pure
-    // arithmetic -- no pointer, no length, no lifetime -- so the only FFI obligation is
-    // that these declarations match the definitions, which the oracle crate establishes by
-    // auditing the renamed archive with `nm`.
-    let (reference, reference_64) = unsafe {
-        (
-            c_adler32_combine(head_sum, tail_sum, tail_len),
-            c_adler32_combine64(head_sum, tail_sum, tail_len_64),
-        )
-    };
+    // Three integers by value in each direction and no pointer anywhere: `adler32.c`
+    // L158-L164 forwards each entry point to the `local` `adler32_combine_`, which is pure
+    // arithmetic. So the only FFI obligation these four gates carry is that the reference
+    // declarations match the definitions, which the oracle crate establishes by auditing
+    // the renamed archive with `nm`; the port's two need no `unsafe` at all, because the
+    // facade declares pointer-free entry points as safe `extern "C"`.
+    let (reference, reference_64) = (
+        oracle::adler32_combine(head_sum, tail_sum, tail_len),
+        oracle::adler32_combine64(head_sum, tail_sum, tail_len_64),
+    );
 
     assert_eq!(
         combined,
@@ -979,7 +1033,7 @@ fn check_adler_combine(data: &[u8], split: usize) {
     );
     assert_eq!(
         combined,
-        adler32_combine64(head_sum, tail_sum, tail_len_64),
+        port::adler32_combine64(head_sum, tail_sum, tail_len_64),
         "adler32_combine and adler32_combine64 disagree in the port: split {split}"
     );
     assert_eq!(
@@ -1011,17 +1065,15 @@ fn check_crc_combine(data: &[u8], split: usize) {
 
     let head_crc = rust_crc32(CRC32_SEED, head);
     let tail_crc = rust_crc32(CRC32_SEED, tail);
-    let combined = crc32_combine(head_crc, tail_crc, tail_len);
+    let combined = port::crc32_combine(head_crc, tail_crc, tail_len);
 
-    // SAFETY: as in `check_adler_combine` -- three integers by value, no pointer and no
-    // dereference anywhere on the path (`crc32.c` L977-L984 reduces both to `multmodp`
-    // arithmetic over the operator table).
-    let (reference, reference_64) = unsafe {
-        (
-            c_crc32_combine(head_crc, tail_crc, tail_len),
-            c_crc32_combine64(head_crc, tail_crc, tail_len_64),
-        )
-    };
+    // As in `check_adler_combine` -- three integers by value, no pointer and no dereference
+    // anywhere on the path (`crc32.c` L977-L984 reduces both to `multmodp` arithmetic over
+    // the operator table).
+    let (reference, reference_64) = (
+        oracle::crc32_combine(head_crc, tail_crc, tail_len),
+        oracle::crc32_combine64(head_crc, tail_crc, tail_len_64),
+    );
 
     assert_eq!(
         combined,
@@ -1039,7 +1091,7 @@ fn check_crc_combine(data: &[u8], split: usize) {
     );
     assert_eq!(
         combined,
-        crc32_combine64(head_crc, tail_crc, tail_len_64),
+        port::crc32_combine64(head_crc, tail_crc, tail_len_64),
         "crc32_combine and crc32_combine64 disagree in the port: split {split}"
     );
     assert_eq!(
@@ -1070,21 +1122,19 @@ fn check_crc_combine(data: &[u8], split: usize) {
 /// form a one-line forward to the `*64` form, so all four values here -- two per
 /// implementation -- must be one number.
 fn check_combine_gen(tail_len: z_off_t, tail_len_64: z_off64_t) -> uLong {
-    let op = crc32_combine_gen(tail_len);
+    let op = port::crc32_combine_gen(tail_len);
 
-    // SAFETY: both declarations take one integer by value and dereference nothing;
-    // `crc32.c` L954-L966 is a sign test followed by `x2nmodp`, which only walks a
-    // `static const` table by value. No pointer crosses the boundary.
-    let (reference, reference_64) = unsafe {
-        (
-            c_crc32_combine_gen(tail_len),
-            c_crc32_combine_gen64(tail_len_64),
-        )
-    };
+    // One integer by value into each gate and no dereference anywhere; `crc32.c`
+    // L954-L966 is a sign test followed by `x2nmodp`, which only walks a `static const`
+    // table by value. No pointer crosses the boundary in either direction.
+    let (reference, reference_64) = (
+        oracle::crc32_combine_gen(tail_len),
+        oracle::crc32_combine_gen64(tail_len_64),
+    );
 
     assert_eq!(
         op,
-        crc32_combine_gen64(tail_len_64),
+        port::crc32_combine_gen64(tail_len_64),
         "crc32_combine_gen and crc32_combine_gen64 disagree in the port: len {tail_len}"
     );
     assert_eq!(
@@ -1128,27 +1178,25 @@ fn check_combine_gen(tail_len: z_off_t, tail_len_64: z_off64_t) -> uLong {
 /// this is what forbids it.
 fn check_combine_op_reuse(op: uLong, tail_len: z_off_t, tail_len_64: z_off64_t, pairs: &[Pair]) {
     for &(left, right) in pairs {
-        let by_op = crc32_combine_op(left, right, op);
+        let by_op = port::crc32_combine_op(left, right, op);
 
-        // SAFETY: three integers by value into `crc32.c` L969-L984, which dereferences
-        // nothing: `crc32_combine_op` masks both check values and calls `multmodp`, and
+        // Three integers by value into `crc32.c` L969-L984, which dereferences nothing:
+        // `crc32_combine_op` masks both check values and calls `multmodp`, and
         // `crc32_combine` forwards through `crc32_combine64` to that same function.
-        let (reference_by_op, reference_by_len) = unsafe {
-            (
-                c_crc32_combine_op(left, right, op),
-                c_crc32_combine(left, right, tail_len),
-            )
-        };
+        let (reference_by_op, reference_by_len) = (
+            oracle::crc32_combine_op(left, right, op),
+            oracle::crc32_combine(left, right, tail_len),
+        );
 
         assert_eq!(
             by_op,
-            crc32_combine(left, right, tail_len),
+            port::crc32_combine(left, right, tail_len),
             "crc32_combine_op and crc32_combine disagree in the port: \
              crc1 {left:#x}, crc2 {right:#x}, op {op:#x}, len {tail_len}"
         );
         assert_eq!(
             by_op,
-            crc32_combine64(left, right, tail_len_64),
+            port::crc32_combine64(left, right, tail_len_64),
             "crc32_combine_op and crc32_combine64 disagree in the port: \
              crc1 {left:#x}, crc2 {right:#x}, op {op:#x}"
         );
@@ -1231,17 +1279,15 @@ const SENTINEL_PAIRS: usize = 2;
 /// values carrying different information.
 fn check_adler_sentinel(negative: z_off_t, negative_64: z_off64_t, pairs: &[Pair]) {
     for &(left, right) in pairs {
-        let rust = adler32_combine(left, right, negative);
-        let rust_64 = adler32_combine64(left, right, negative_64);
+        let rust = port::adler32_combine(left, right, negative);
+        let rust_64 = port::adler32_combine64(left, right, negative_64);
 
-        // SAFETY: integers by value into `adler32.c` L158-L164, which returns before doing
-        // anything at all for a negative length. No pointer is involved.
-        let (reference, reference_64) = unsafe {
-            (
-                c_adler32_combine(left, right, negative),
-                c_adler32_combine64(left, right, negative_64),
-            )
-        };
+        // Integers by value into `adler32.c` L158-L164, which returns before doing anything
+        // at all for a negative length. No pointer is involved.
+        let (reference, reference_64) = (
+            oracle::adler32_combine(left, right, negative),
+            oracle::adler32_combine64(left, right, negative_64),
+        );
 
         assert_eq!(
             rust, ADLER32_COMBINE_INVALID,
@@ -1281,17 +1327,15 @@ fn check_adler_sentinel(negative: z_off_t, negative_64: z_off64_t, pairs: &[Pair
 /// Both steps are asserted, so a port that returned the right answer by the wrong route
 /// would still be caught.
 fn check_crc_gen_sentinel(negative: z_off_t, negative_64: z_off64_t) {
-    let gen = crc32_combine_gen(negative);
-    let gen_64 = crc32_combine_gen64(negative_64);
+    let gen = port::crc32_combine_gen(negative);
+    let gen_64 = port::crc32_combine_gen64(negative_64);
 
-    // SAFETY: one integer by value into `crc32.c` L954-L966, which returns immediately for
-    // a negative length. No pointer is involved.
-    let (reference, reference_64) = unsafe {
-        (
-            c_crc32_combine_gen(negative),
-            c_crc32_combine_gen64(negative_64),
-        )
-    };
+    // One integer by value into `crc32.c` L954-L966, which returns immediately for a
+    // negative length. No pointer is involved.
+    let (reference, reference_64) = (
+        oracle::crc32_combine_gen(negative),
+        oracle::crc32_combine_gen64(negative_64),
+    );
 
     assert_eq!(
         gen, CRC32_COMBINE_GEN_INVALID,
@@ -1326,19 +1370,17 @@ fn check_crc_gen_sentinel(negative: z_off_t, negative_64: z_off64_t) {
 /// both the unsuffixed and the `*64` spelling.
 fn check_crc_op_sentinel(negative: z_off_t, negative_64: z_off64_t, pairs: &[Pair]) {
     for &(left, right) in pairs {
-        let zero_op = crc32_combine_op(left, right, 0);
-        let by_negative = crc32_combine(left, right, negative);
-        let by_negative_64 = crc32_combine64(left, right, negative_64);
+        let zero_op = port::crc32_combine_op(left, right, 0);
+        let by_negative = port::crc32_combine(left, right, negative);
+        let by_negative_64 = port::crc32_combine64(left, right, negative_64);
 
-        // SAFETY: three integers by value into `crc32.c` L969-L984. The zero-operator path
-        // returns before reaching `multmodp` and the negative-length path returns before
-        // reaching the operator table; neither dereferences anything.
-        let (reference_zero_op, reference_negative) = unsafe {
-            (
-                c_crc32_combine_op(left, right, 0),
-                c_crc32_combine(left, right, negative),
-            )
-        };
+        // Three integers by value into `crc32.c` L969-L984. The zero-operator path returns
+        // before reaching `multmodp` and the negative-length path returns before reaching
+        // the operator table; neither dereferences anything.
+        let (reference_zero_op, reference_negative) = (
+            oracle::crc32_combine_op(left, right, 0),
+            oracle::crc32_combine(left, right, negative),
+        );
 
         assert_eq!(
             zero_op, CRC32_COMBINE_OP_ZERO,
@@ -1400,31 +1442,24 @@ fn check_crc_op_sentinel(negative: z_off_t, negative_64: z_off64_t, pairs: &[Pai
 /// deterministically; repeating constant work on every invocation here would only spend the
 /// time budget on an answer that cannot change.
 fn check_crc_table() {
-    let rust = get_crc_table();
+    // Both gates present the pointer `get_crc_table` returns as the `&'static [z_crc_t]` the
+    // C contract describes -- at least 256 entries in `const` storage that nothing ever
+    // writes, `crc32.c` L216-L232 and L482-L487 -- so non-nullness and the element count are
+    // properties of the type here rather than assertions to make, and the comparisons below
+    // are slice equality performed by the standard library.
+    let rust_table = port::crc_table();
+    let reference_table = oracle::crc_table();
 
-    // SAFETY: `c_get_crc_table` is niladic and returns a pointer to `crc_table`, which has
-    // static storage duration in the oracle archive (`crc32.c` L482-L487 returns the address
-    // of a `local const` array). It cannot fail and it retains nothing.
-    let reference = unsafe { c_get_crc_table() };
-
-    assert!(!rust.is_null(), "get_crc_table returned a null pointer");
-    assert!(
-        !reference.is_null(),
-        "c_get_crc_table returned a null pointer"
+    assert_eq!(
+        rust_table.len(),
+        CRC_TABLE_LEN,
+        "get_crc_table must publish one entry per byte value"
     );
-
-    // SAFETY: both pointers are non-null by the assertions immediately above, both are
-    // properly aligned for `z_crc_t` because each is the address of a `z_crc_t` array, and
-    // each addresses at least `CRC_TABLE_LEN` initialised elements: the port's comes from a
-    // `&'static [u32; 256]`, and the reference's from `crc_table[]` at `crc32.h` L5, which
-    // has one entry per byte value. Both arrays are read-only, live for the whole program and
-    // are never written, so the borrows cannot alias a mutation.
-    let (rust_table, reference_table) = unsafe {
-        (
-            slice::from_raw_parts(rust, CRC_TABLE_LEN),
-            slice::from_raw_parts(reference, CRC_TABLE_LEN),
-        )
-    };
+    assert_eq!(
+        reference_table.len(),
+        CRC_TABLE_LEN,
+        "c_get_crc_table must publish one entry per byte value"
+    );
 
     let local = oracle_crc_table();
     assert_eq!(
@@ -1446,8 +1481,8 @@ fn check_crc_table() {
         "get_crc_table diverged from the table the port computes with"
     );
     assert_eq!(
-        rust,
-        get_crc_table(),
+        rust_table.as_ptr(),
+        port::crc_table().as_ptr(),
         "get_crc_table must return the same address on every call"
     );
 }

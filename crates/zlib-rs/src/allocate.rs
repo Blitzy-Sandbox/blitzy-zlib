@@ -658,8 +658,17 @@ impl<'a, T> Buffer<'a, T> {
     ///   for it.
     ///
     /// The ad-hoc probes used while this was being written follow exactly that
-    /// discipline, and `benches/**` must too when it lands: cost that is invisible
-    /// in a rate is cost that gets attributed to the wrong thing.
+    /// discipline, and so does every suite under `benches/`: cost that is
+    /// invisible in a rate is cost that gets attributed to the wrong thing.
+    /// `benches/deflate_bench.rs` discharges all three clauses explicitly — its
+    /// `deflate_steady_state` group, which is the one the throughput gate is read
+    /// from, initialises one encoder per row and calls `deflateReset` between
+    /// iterations so the fill never enters the timed region; its
+    /// `deflate_lifecycle` group times `deflateInit2_` and `deflateEnd` as their
+    /// own measurement and is deliberately kept out of the gate; and the
+    /// per-stream high-water figure it reports comes from the instrumented
+    /// allocator rather than from either rate. `benches/inflate_bench.rs` splits
+    /// the same way.
     ///
     /// # ★ What it actually costs, measured
     ///

@@ -22,9 +22,10 @@
 #
 # The MSRV is a different contract and is NOT declared here: `rust-version` in
 # Cargo.toml's [workspace.package] declares the oldest compiler a consumer may
-# need, clippy.toml mirrors it as `msrv`, and `rust-version` is not a valid key in
-# a toolchain file.  The floor is exercised through an explicit override such as
-# `cargo +1.80 check`, which this file does not obstruct.
+# need -- and is the only declaration of it, since clippy.toml deliberately
+# carries no `msrv` key and reads that one instead -- while `rust-version` is not
+# a valid key in a toolchain file.  The floor is exercised through an explicit
+# override such as `cargo +1.80 check`, which this file does not obstruct.
 #
 # `profile = "minimal"` installs only rustc, cargo and the standard library.
 # `components` is additive to it, and both entries are mandatory rather than
@@ -75,35 +76,54 @@
 # THE SUPPORTED TARGET MATRIX IS THIS, and it is stated here because "Tier-1"
 # on its own names a rustc platform tier rather than a commitment by this port:
 #
-#   VERIFIED        x86_64-unknown-linux-gnu.  The only target the port is
-#                   built, tested and measured on today.  Every measured claim
-#                   anywhere in this workspace -- struct sizes and offsets, the
-#                   95-function / 111-global symbol surface, `zlibCompileFlags`
-#                   returning 0xa9, the ELF soname and version-script handling --
-#                   was established on it and on no other.
+#   FULLY VERIFIED  x86_64-unknown-linux-gnu.  The only target the port is
+#                   built, tested, PACKAGED and measured on.  Twelve of the
+#                   thirteen jobs in `.github/workflows/rust.yml` run
+#                   `ubuntu-latest` and nothing else, and they are the ones that
+#                   establish the measured claims made across this workspace:
+#                   struct sizes and offsets, the 95-function / 111-global symbol
+#                   surface, `zlibCompileFlags` returning 0xa9, the ELF soname and
+#                   version-script handling, the cbindgen header comparison, the
+#                   drop-in relink, Miri, ASan, the differential sweeps and the
+#                   benchmarks.
 #
-#   INTENDED        The remaining 64-bit ELF Tier-1 GNU/Linux targets
-#                   (aarch64-unknown-linux-gnu) plus the Tier-1 macOS targets.
-#                   The source is written to build there: the soname/version
-#                   script logic in `crates/libz-rs-sys/build.rs` has an explicit
-#                   Mach-O branch, and nothing in the core is x86-specific.  None
-#                   of it is exercised yet, so treat any platform-specific number
-#                   as unverified there until a CI job produces it.
+#   BUILT AND       macOS and Windows, on the host triple each GitHub runner image
+#   TESTED ONLY     provides -- `rustup toolchain install stable` fetches the host
+#                   target and no other, so no cross-compilation is involved.  The
+#                   `build-test` job's matrix carries a `macos-latest` and a
+#                   `windows-latest` row beside the Ubuntu one, and all three run
+#                   the same three commands: `cargo build --locked --release`, the
+#                   same with `--features libz-compat`, and `cargo test --locked
+#                   --workspace --release`.  So the library compiles and its test
+#                   suites pass on both, and that is the whole of what those rows
+#                   establish.  Everything platform-specific is UNVERIFIED there,
+#                   because no job that measures it runs there: no symbol parity,
+#                   no header comparison, no packaging, no sanitizer, no benchmark.
+#                   Treat any platform-specific number as unverified off Linux.
 #
-#   OUT OF SCOPE    Windows (`*-pc-windows-msvc`, `*-pc-windows-gnu`) and every
-#                   non-ELF, non-Mach-O target.  `build.rs` emits neither a
-#                   soname nor a version script for PE/COFF; the PE analogue of
-#                   `zlib.map` is `win32/zlib.def`, which this port does not wire
-#                   up.  Windows-only ITEMS still exist in the source --
-#                   `gzopen_w` behind `#[cfg(windows)]`, and the `_WIN32` entries
-#                   in `cbindgen.toml`'s `[defines]` -- so that the port stays
-#                   coherent if Windows is brought in scope later.  Their
-#                   presence is forward compatibility, NOT a claim that a Windows
-#                   build works or has been tried.
+#   NOT PACKAGED    Windows specifically.  Compiling is not the same as producing a
+#                   drop-in replacement, and the packaging half is not wired:
+#                   `crates/libz-rs-sys/build.rs` emits neither a soname nor a
+#                   version script for PE/COFF, and the PE analogue of `zlib.map`
+#                   is `win32/zlib.def`, which this port does not consume.  The
+#                   Mach-O branch in that build script exists but is likewise
+#                   unexercised, since the packaging targets are Make and CMake
+#                   rules that only run on the Linux jobs.  Windows-only ITEMS in
+#                   the source -- `gzopen_w` behind `#[cfg(windows)]`, the `_WIN32`
+#                   entries in `cbindgen.toml`'s `[defines]` -- keep the port
+#                   coherent for that platform; they are not a claim that a
+#                   Windows drop-in install has been produced or tried.
+#
+#   NOT BUILT       Every other triple, including aarch64-unknown-linux-gnu.  The
+#                   source is written to be portable and nothing in the core is
+#                   x86-specific, but no job compiles them, so nothing about them
+#                   is established.
 #
 # Nothing in this file enforces the matrix; a `targets` list here could not, and
 # rustup would happily install any triple on request.  Enforcement is a CI
-# concern, and the matrix above is the contract a CI job should encode.
+# concern, and `.github/workflows/rust.yml` is where the matrix above is encoded --
+# the `build-test` job's three rows for the first two categories, and the absence of
+# any row for the last.
 #
 # This file takes effect only once cargo is invoked.  The C library keeps
 # building with `./configure && make` or with CMake on a machine that has no

@@ -1,3 +1,11 @@
+// UNSAFE CONTAINMENT, and it is mechanical rather than a convention.  `crates/zlib-rs` is the
+// safe core: `src/lib.rs` carries `#![forbid(unsafe_code)]`, and its test suites carry it too, so
+// the property "the core and everything that exercises it contains no `unsafe`" is enforced by the
+// compiler in both halves.  The workspace's designated FFI boundary -- the only place a raw pointer
+// crosses into a foreign implementation -- is `crates/libz-rs-sys/src/**` for the shipped library
+// and `crates/zlib-rs-differential/src/{oracle,port}.rs` for the dev-only harness; an assertion
+// that needs one of those belongs in a suite of that package, not here.
+#![forbid(unsafe_code)]
 //! End-to-end round-trip suite for the whole safe core: compress, decompress, assert
 //! exact recovery -- across every corpus class, every container format and both feeding
 //! styles.
@@ -2500,9 +2508,9 @@ fn the_one_shot_path_emits_what_the_streaming_path_emits() {
 //
 // Cross-*implementation* interoperability -- a stream produced by the C library decoded here,
 // and one produced here decoded there -- needs the C oracle, so it belongs to a suite under
-// `crates/zlib-rs-differential`. No such suite is in the tree, so it is unverified. This
-// suite must not attempt it and must not pre-empt the differential matrix; what follows is
-// only about this implementation's own container discrimination.
+// `crates/zlib-rs-differential`, and it is verified there by `tests/roundtrip_interop.rs` in
+// both directions. This suite must not attempt it and must not duplicate the differential
+// matrix; what follows is only about this implementation's own container discrimination.
 
 /// Adding 32 to `windowBits` is the decoder-only spelling that asks for automatic
 /// `zlib`-or-`gzip` detection (`zlib.h` L893-L897).

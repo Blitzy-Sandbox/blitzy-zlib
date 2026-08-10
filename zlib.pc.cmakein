@@ -28,59 +28,98 @@
 #     globals, being 95 functions plus the 16 symbol-version nodes declared in
 #     zlib.map.  The CMake path takes that keep-list from the ZEXTERN
 #     declarations in zlib.h, localises everything else with objcopy before the
-#     shared link, and hands zlib.map to the linker; `make rust-symbols' is the
-#     autotools build's nm diff of the same property.  No in-tree automation
-#     runs that diff for this build, so read it as the parity requirement rather
-#     than as an achieved result;
+#     shared link, and hands zlib.map to the linker.  The nm diff of that same
+#     property runs on the autotools artifacts and on cargo's own -- the `rust'
+#     target, `make rust-symbols', the symbol-parity job of
+#     .github/workflows/rust.yml, and `crates/libz-rs-sys/tests/symbol_parity.rs'
+#     inside `cargo test' -- and NOT on the library this block stages, whose
+#     keep-list is enforced by construction with objcopy instead.  So for this
+#     build read it as the parity requirement, and run `make rust-symbols' on the
+#     autotools staging to see it measured;
 #   * the installed zlib.h and generated zconf.h are byte-identical, because the
 #     Rust build modifies neither header and that block leaves the header, the
 #     zlib.pc and the documentation install rules untouched.
 #
 # Libs: advertising -lz and Cflags: advertising the include directory are part of
 # that contract -- do not reword them, and do not add Requires: entries, -lm,
-# -lpthread or any Rust-specific flag to them.
+# -lpthread or any Rust-specific flag to them by hand.
 #
 # ONE PACKAGING DIFFERENCE, AND IT IS REAL: STATIC LINKING.
 #
-# The C libz.a needs no companion libraries, which is why there is no
-# Libs.private: line below and why adding one would be wrong for the C build.  A
-# Rust staticlib is different -- it carries the Rust runtime's own dependencies.
-# Measured, not assumed, with
-# `RUSTFLAGS="--print native-static-libs" cargo build --release -p libz-rs-sys`
-# on x86_64-unknown-linux-gnu:
+# The C libz.a needs no companion libraries.  A Rust staticlib is different: it
+# carries the Rust standard library's own object code, whose undefined
+# references reach into libc and its neighbours, and nothing in the archive
+# records that.  On x86_64-unknown-linux-gnu the set is
 #
-#     -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc
+# THAT IS WHAT THE SUBSTITUTED LINE BETWEEN Libs: AND Cflags: BELOW IS FOR, and
+# it is why the whole line rather than just its value is substituted: an empty
+# private link line is not the same thing as none, and a consumer testing for the
+# key's presence must not see it appear in the C build.  CMakeLists.txt derives
+# the set with `rustc --crate-type staticlib --print native-static-libs' for the
+# target being built and expands the line only when ZLIB_BUILD_RUST is ON.  For
+# the C build it expands to nothing and this file emits exactly the descriptor it
+# always did.
 #
-# That set is TARGET-SPECIFIC and must be re-derived per target; it is not a
-# constant to copy.  This file advertises none of it, so static consumption of
-# the staged Rust libz.a is an OPEN PACKAGING GAP rather than a solved problem.
-# How far it bites depends on the consumer, and the honest measurement is that a
-# plain cc link of that archive with -lz alone still succeeds here, because the
-# compiler driver already puts libgcc and libc on the link line and this glibc
-# folds libpthread, libdl, librt and libutil into libc.  It breaks where that
-# does not hold -- ld driven directly, -nodefaultlibs, a toolchain belonging to
-# another language, an older glibc that ships those four separately, or a target
-# whose set simply differs -- and it breaks with nothing in this file to warn
-# that the requirement exists.  zlib.pc.in states it as an outright link
-# failure; read that as the worst case of this same gap, not as a different one.
+# but that is an illustration, not a constant: the set is TARGET-SPECIFIC and
+# rustc is the only thing that knows it.  So it is not written here.  Instead
+# CMakeLists.txt runs `rustc --print native-static-libs' at configure time
+# against a throwaway staticlib -- the only invocation that makes rustc answer --
+# refuses to configure if it cannot get an answer, and substitutes the result
+# into the single @-delimited name at the end of the Libs: line below.
 #
-# It cannot be closed by editing this template, because one file serves both
-# implementations and the C build must keep emitting a .pc with no Libs.private:
-# at all.  Closing it means having the Rust packaging step emit its own
-# descriptor, with Libs.private: populated from
-# `rustc --print native-static-libs` for the target being built.  Dynamic
-# linking is unaffected either way: the shared object records its own
-# dependencies in DT_NEEDED, so -lz alone remains correct there.
+# That name expands to a complete additional line, `Libs.private: <set>', in
+# Rust mode and to NOTHING AT ALL in C mode.  Folding the newline into the
+# substituted value, rather than leaving a bare `Libs.private:' key in the
+# template with a possibly-empty value after it, is what leaves the C build's key
+# set exactly what it always was: a descriptor with no such key, which is the
+# truth for an archive that stands alone.  One template therefore serves both
+# implementations honestly, which the earlier revision of this comment wrongly
+# claimed was impossible.
+#
+# Dynamic linking never needed any of it: the shared object records its own
+# dependencies in DT_NEEDED, so -lz alone is correct there in both modes -- which
+# is why the substitution appends to Libs: rather than altering it.
+#
+# The CMake build additionally publishes the same set on the exported
+# ZLIB::ZLIBSTATIC target, so a consumer reaching the library through
+# find_package(ZLIB CONFIG) gets a complete link line without going through
+# pkg-config at all.  zlib.pc.in, which `configure' expands for the autotools
+# build, carries no equivalent: configure runs before anyone decides whether to
+# run `make rust', so that path reports the set from the `rust' target itself.
+#
+# Note that zlib.pc.in, the autotools template, still describes this as an open
+# gap and is correct to: `configure' has no ZLIB_BUILD_RUST equivalent and
+# `make rust' STAGES the drop-in without installing it, so that descriptor is
+# never the Rust one.  Only the CMake path publishes a Rust-selected .pc.
 #
 # Two things about the substitution, for whoever edits this next.  The
 # configure_file() call passes @ONLY, so only the at-delimited names are
 # substituted and the ${...} references in libdir, sharedlibdir and includedir
 # survive into the generated file, for pkg-config itself to resolve at use time
-# against the prefix recorded there.  That is what lets a consumer relocate the
-# prefix, so do not expand them by hand and do not drop that keyword.  And the
-# substitution pass runs over the whole file, comments included: never write one
-# of the substitutable names in here, because it would be rewritten here too,
-# and one CMake happens not to define expands to nothing at all rather than
+# against the prefix recorded there -- so those three follow whatever prefix line
+# ends up in the generated descriptor.  Do not expand them by hand and do not drop
+# that keyword.
+#
+# WHAT THAT DOES NOT BUY, because it is easy to over-read.  The prefix itself is
+# NOT relocatable: it is written from the configure-time CMAKE_INSTALL_PREFIX by
+# the substitution below, and CMake does not regenerate this descriptor at install
+# time, so `cmake --install . --prefix /somewhere/else` installs a .pc that still
+# names the configure-time prefix and pkg-config then reports paths that do not
+# exist.  Only the three ${...} derivations move with it.  Two ways to make the
+# whole thing relocatable, neither of which this file can choose for itself:
+# generate the descriptor from an install-time script (install(CODE ...) with
+# configure_file at that point), or write the prefix relative to the descriptor's
+# own location with pkg-config's ${pcfiledir} -- for example
+# `prefix=${pcfiledir}/../..`, which is what a distribution that relocates
+# packages usually wants.  Until one of those is adopted, treat the generated
+# zlib.pc as bound to the prefix it was configured with, and pass the final
+# prefix at configure time rather than at install time.  The
+# configure-generated zlib.pc from zlib.pc.in has the same property, from
+# ./configure's own --prefix.
+#
+# And the substitution pass runs over the whole file, comments included: never
+# write one of the substitutable names in here, because it would be rewritten here
+# too, and one CMake happens not to define expands to nothing at all rather than
 # failing.
 #
 # A KNOWN DIVERGENCE FROM zlib.pc.in, DELIBERATE AND OUT OF SCOPE TO HARMONISE:
@@ -108,5 +147,6 @@ Version: @zlib_VERSION@
 License: Zlib
 
 Requires:
-Libs: -L${libdir} -L${sharedlibdir} -lz
+Libs: -L${libdir} -L${sharedlibdir} -lz@ZLIB_PC_LIBS_PRIVATE@
 Cflags: -I${includedir}
+@ZLIB_PC_LIBS_PRIVATE@

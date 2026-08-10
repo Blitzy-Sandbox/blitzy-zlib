@@ -35,7 +35,7 @@
 //! | `libz.a` (`staticlib`) | `cargo build -p libz-rs-sys --features libz-compat` | **all 95** functions `zlib.h` declares, plus `inflate_table` as a hidden global | **YES** — this is the static library, and `infcover` links it |
 //! | `libz.so` (`cdylib`) | the same command | **93** of the 95, plus three internals; **no** version nodes | no — see below |
 //! | *(the `rlib`)* | the same command | nothing; it is a Rust library | n/a — `zlib-rs-differential`, `fuzz/` and `tests/` depend on it |
-//! | `libz.so.1.3.2.1-motley` | `make rust`, or the `CMake` equivalent, **relinked from `libz.a`** | **95** functions and the **16** `ZLIB_1.2.*` version nodes, internals hidden | **YES** — this is the shared library, and it is the only one |
+//! | `libz.so.1.3.2.1-motley` | `make rust`, or the `CMake` equivalent, **relinked from `libz.a`** | **95** functions and the **16** zlib version nodes, internals hidden | **YES** — this is the shared library, and it is the only one |
 //!
 //! ★ Only the last row carries the versioned names `libz.so.1` and
 //! `libz.so.1.3.2.1-motley`, and that is deliberate. `build.rs` used to stage those
@@ -69,6 +69,17 @@
 //! `libz.a`. Measured: `ar t` lists both objects, and `nm` reports
 //! `T gzprintf`, `T gzvprintf` and a `GLOBAL HIDDEN` `inflate_table`.
 //!
+//! ★ Every row of that table is a gate rather than a recorded measurement, and
+//! the row about the *complete* artifact is the one worth naming here.
+//! `tests/symbol_parity.rs::cargo_staticlib_defines_the_whole_contract` requires
+//! all 95 contract functions to be global text symbols in cargo's `libz.a`, and
+//! names `gzprintf`/`gzvprintf` explicitly, so a shim that stopped being
+//! compiled fails immediately instead of surfacing as a missing export from the
+//! packaged library much later. `cargo_cdylib_matches_its_measured_shape` pins
+//! the second row the same way, and the packaged row is held to full parity by
+//! the rest of that file, by `make rust-symbols` and by the `symbols` job of
+//! `.github/workflows/rust.yml`.
+//!
 //! ## ★ Why the `cdylib` is not the shipped library, and cannot be made into one
 //!
 //! It is tempting to read the second row as "`cargo build` gives you the drop-in".
@@ -82,7 +93,7 @@
 //!   *"anonymous version tag cannot be combined with other version tags"* — and
 //!   `rust-lld` warns *"attempt to reassign symbol … to version"* and ignores the
 //!   second script, producing a library with **zero** version nodes. So the 16
-//!   `ZLIB_1.2.*` nodes cannot be attached here by any argument.
+//!   version nodes cannot be attached here by any argument.
 //! * **A symbol the C shims define gets no dynamic entry.** Pulling the shim objects
 //!   in with `+whole-archive` contributes their code, and `local: *` then hides the
 //!   names; `-Wl,--export-dynamic-symbol=gzprintf` does not override a version script
@@ -111,6 +122,14 @@
 //! make rust-test           # link and run the UNMODIFIED example.c, minigzip.c and infcover.c
 //! make rust-symbols        # diff the staged tables against a built C libz
 //! ```
+//!
+//! `CMake` performs the same relink under its own `ZLIB_BUILD_RUST` option — same
+//! archive, same `zlib.map`, same SONAME, same chain — and additionally installs
+//! the result, so the two build systems reach one artifact by one recipe rather
+//! than two. `.github/workflows/rust.yml` exercises both: its `symbols`,
+//! `dropin` and `cmake` jobs each start from `libz.a` and each assert the
+//! packaged library with `ldd` rather than inferring the binding from a test
+//! that passed.
 //!
 //! `./configure` is not a prerequisite for those three: `Makefile.in` composes the
 //! shared-object link from its own `RUSTLDSHARED`/`RUSTSHAREDFLAG` defaults and names
@@ -201,44 +220,71 @@
 //! `nm` type-`T` functions plus 16 type-`A` symbol-version nodes, under
 //! `SONAME libz.so.1`. That set is the parity target, and it is checked by
 //! diffing `nm -D --defined-only --extern-only` against the C baseline.
-//! `Makefile.in`'s `rust` and `rust-symbols` targets perform exactly that diff;
-//! **nothing performs it automatically**, because this crate has no `tests/`
-//! directory and no workflow in `.github/workflows/` runs Cargo. The root
-//! `Cargo.toml` records the three numbers under `[workspace.metadata.zlib]`, so the
-//! expectation at least lives somewhere a build can read.
+//! Four things perform that diff, and none of them needs a human:
+//! `tests/symbol_parity.rs` runs it inside `cargo test`, so an export that goes
+//! missing fails the ordinary test run; `Makefile.in`'s `rust` target runs it while
+//! staging the drop-in tree, so a packaged artefact that fails parity is never
+//! produced; `Makefile.in`'s `rust-symbols` target runs it on demand with the full
+//! report; and the `symbols` job of `.github/workflows/rust.yml` runs it in CI. The
+//! root `Cargo.toml` records the three numbers under `[workspace.metadata.zlib]`, so
+//! the expectation is readable from a build as well as from a test.
 //!
-//! Run `make rust-symbols` to measure it. Against the packaged artefact `make rust`
+//! Run `make rust-symbols` for the report. Against the packaged artefact `make rust`
 //! stages, the expected result is 111 symbols, an empty diff against the C
 //! `libz.so.1.3.2.1-motley`, 95 type-`T` and 16 type-`A`, `SONAME libz.so.1`, and
 //! none of the `zlib.map` `local:` names visible.
 //!
-//! ## Where 95 comes from
+//! ## Where 96 and 95 come from
 //!
-//! `zlib.h` contains 119 `ZEXTERN` declarations naming **101 distinct**
-//! functions. The 18 duplicate declarations are all deliberate: the large-file
-//! section re-declares fourteen names across its `#if` arms — the seven `*64`
-//! entry points and their seven unsuffixed counterparts, with the three
-//! `*combine*` names appearing three times each — and `gzprintf` is declared
-//! twice, with a prototype under `#if defined(STDC) || defined(Z_HAVE_STDARG_H)`
-//! (L1549) and with an empty parameter list in the `#else` arm (L1551), for a
-//! pre-ANSI compiler that has no `<stdarg.h>`. Of the 101, six are not exported:
+//! Count the DECLARATIONS THE PREPROCESSOR CAN REACH, not the occurrences of the
+//! word. `zlib.h` contains 119 lines mentioning `ZEXTERN`, and **12 of them sit
+//! inside comment blocks** — the API documentation shows `deflateInit`,
+//! `deflateInit2`, `inflateInit`, `inflateInit2` and `inflateBackInit` written out
+//! as though they were functions, which is exactly the shape a `grep` cannot tell
+//! from a declaration. Strip the comments and **107 declaration sites** remain,
+//! naming **96 distinct functions**. That 96 is the public API contract, and it is
+//! the same 96 the AAP states.
 //!
-//! | Name | `zlib.h` | Why it is not a symbol |
+//! Those five documented-but-not-declared names are `#define` macros further down
+//! the header — `deflateInit` over `deflateInit_` (L1932), `inflateInit` over
+//! `inflateInit_` (L1934), `deflateInit2` over `deflateInit2_` (L1936),
+//! `inflateInit2` over `inflateInit2_` (L1939), `inflateBackInit` over
+//! `inflateBackInit_` (L1942) — and they exist so that a caller passes its own
+//! compile-time `ZLIB_VERSION` and `sizeof(z_stream)` to the `_`-suffixed real
+//! function. The version and layout check that makes drop-in replacement safe is
+//! precisely what those macros arrange, which is why they are entry points in a
+//! caller's source and not symbols in a library.
+//!
+//! From 96 names to 95 exported symbols is one subtraction, and it is
+//! platform-dependent:
+//!
+//! | Name | `zlib.h` | Why it is not a symbol here |
 //! |---|---|---|
-//! | `deflateInit` | L232 | macro over `deflateInit_` (L1932) |
-//! | `inflateInit` | L382 | macro over `inflateInit_` (L1934) |
-//! | `deflateInit2` | L543 | macro over `deflateInit2_` (L1936) |
-//! | `inflateInit2` | L859 | macro over `inflateInit2_` (L1939) |
-//! | `inflateBackInit` | L1113 | macro over `inflateBackInit_` (L1942) |
-//! | `gzopen_w` | L2042 | `#if defined(_WIN32)` only |
+//! | `gzopen_w` | L2042 | declared under `#if defined(_WIN32)`, so it is a symbol on Windows and absent on every other target |
 //!
-//! The five macros exist so that a caller passes its own compile-time
-//! `ZLIB_VERSION` and `sizeof(z_stream)` to the `_`-suffixed real function; the
-//! version and layout check that makes drop-in replacement safe is precisely
-//! what those macros arrange. So 101 − 5 = **96 real entry points**, and
-//! 96 − 1 = **95 exported on a non-Windows target**. There are zero
-//! exported-but-not-declared symbols: the surface is neither a subset nor a
+//! So **96 declared − 1 Windows-only = 95 exported functions on a non-Windows
+//! target**, plus the 16 version nodes = the 111 dynamic globals above. There are
+//! zero exported-but-not-declared symbols: the surface is neither a subset nor a
 //! superset of the header.
+//!
+//! Where the 107 sites and the 96 names diverge is worth recording, because the
+//! difference is what makes a naive count come out wrong. Measured on this header:
+//!
+//! * **83 active sites, naming 82 functions, begin at column zero** — outside every
+//!   conditional block. One name has two of those sites: `gzprintf` is declared with
+//!   a prototype under `#if defined(STDC) || defined(Z_HAVE_STDARG_H)` (L1549) and
+//!   with an empty parameter list in the `#else` arm (L1551), for a pre-ANSI
+//!   compiler with no `<stdarg.h>`.
+//! * **The remaining 14 names appear only inside the large-file `#if` arms**: the
+//!   seven `*64` entry points `gzopen64`, `gzseek64`, `gztell64`, `gzoffset64`,
+//!   `adler32_combine64`, `crc32_combine64` and `crc32_combine_gen64`, and their
+//!   seven unsuffixed counterparts, which `zlib.h` re-declares there because
+//!   `Z_LARGE64` and `Z_WANT64` decide which spelling a caller sees. Both families
+//!   must be exported; the indentation of a declaration says nothing about whether
+//!   it is part of the contract.
+//!
+//! `crates/zlib-rs-differential/build.rs` derives its own rename list from the same
+//! 96 and says so, so the two derivations cannot drift apart.
 //!
 //! ## Per-module allocation
 //!
@@ -501,27 +547,35 @@
 //!
 //! `zlib.h`, `zconf.h` and `zlib.map` are **immutable**. They are the contract,
 //! not an artefact of this implementation, and no part of this port edits them.
-//! Four mechanisms are meant to catch a divergence by tooling rather than by a
-//! reviewer's memory, and only two of them currently run on their own:
+//! Four mechanisms catch a divergence by tooling rather than by a reviewer's
+//! memory, and each one now runs without being remembered:
 //!
-//! 1. **Runs on every build.** The compile-time assertions in `layout_assertions`
-//!    pin every struct size, field offset and integer width the two headers fix.
-//!    Layout drift is a build failure rather than silent memory corruption in every
-//!    program that links the result.
-//! 2. **Manual.** A cbindgen run generates a header from this crate for comparison
-//!    against `zlib.h`, which is what would catch a changed public signature.
-//!    Generation works; the comparison does not exist as an executable check --
-//!    `cbindgen.toml` specifies a normalised signature-and-constant comparison,
-//!    explains why a verbatim `diff` can never be empty, and nothing implements it.
-//! 3. **Manual.** An `nm` diff against the 111-symbol baseline catches both a
-//!    missing and an extra export. It lives in `Makefile.in`'s `rust-symbols`
-//!    target and nothing invokes it automatically.
-//! 4. **Runs in CI.** The `c-std.yml` workflow keeps compiling the unchanged
-//!    `zlib.h` from C89 through gnu2x, so the header stays valid for every dialect a
-//!    caller may use.
+//! 1. **Every build.** The compile-time assertions in `layout_assertions` pin every
+//!    struct size, field offset and integer width the two headers fix. Layout drift
+//!    is a build failure rather than silent memory corruption in every program that
+//!    links the result.
+//! 2. **`make rust-header`, and the `header` job of `rust.yml`.** cbindgen
+//!    regenerates a header from this crate, its stderr is held to an enumerated
+//!    allowance, the artifact is compiled standalone as C89, C99, C17 and C++17 with
+//!    warnings fatal, and its declared function set is compared against `zlib.h`'s
+//!    `ZEXTERN` set in both directions. `cbindgen.toml` explains why a verbatim
+//!    `diff` can never be empty and states the comparison that replaces it; the
+//!    per-signature half of it is a step of that CI job, which re-declares every
+//!    generated prototype in a translation unit that has already included `zlib.h`
+//!    so the C compiler itself reports a conflicting type.
+//! 3. **`cargo test`, `make rust`, and the `symbols` job of `rust.yml`.** An `nm`
+//!    diff against the 111-symbol baseline catches both a missing and an extra
+//!    export. `tests/symbol_parity.rs` performs it inside `cargo test` (13 tests,
+//!    including the `inflate_table` archive-versus-dynamic split and the SONAME);
+//!    `Makefile.in`'s `rust` target performs it against `zlib.h` and `zlib.map`
+//!    while staging, and its `rust-symbols` target demands the direct diff against a
+//!    built C library.
+//! 4. **CI.** The `c-std.yml` workflow keeps compiling the unchanged `zlib.h` from
+//!    C89 through gnu2x, so the header stays valid for every dialect a caller may
+//!    use.
 //!
-//! So a change to an exported signature or to the export set is caught only by
-//! somebody running steps 2 and 3. Treat them as part of reviewing such a change.
+//! So a change to an exported signature or to the export set fails a gate rather
+//! than depending on somebody remembering to look.
 //!
 //! # cbindgen compatibility
 //!
@@ -646,11 +700,12 @@
 //!
 //! # The crate-root Rust surface
 //!
-//! Everything re-exported below exists for *Rust* consumers. `zlib-rs-differential`
-//! is the one that exists today; an integration test in this crate, a `fuzz/` target
-//! or a benchmark would each reach the ABI types the same way. It
-//! creates no dynamic symbol: a `pub use` is a Rust-level path and nothing more,
-//! which is why adding one cannot disturb the 111-symbol parity diff.
+//! Everything re-exported below exists for *Rust* consumers, and there are four
+//! classes of them: this crate's own integration tests under `tests/`,
+//! `zlib-rs-differential`'s suites, the five `fuzz/` targets and the three benches.
+//! Each reaches the ABI types the same way. Re-exporting creates no dynamic symbol: a
+//! `pub use` is a Rust-level path and nothing more, which is why adding one cannot
+//! disturb the 111-symbol parity diff.
 //!
 //! Three groups, and the crate root is the *only* Rust path to any of them,
 //! because every module below it is private:
@@ -1058,6 +1113,18 @@ pub use crate::types::{
     internal_state, intf, out_func, uInt, uIntf, uLong, uLongf, voidp, voidpc, voidpf, z_crc_t,
     z_off64_t, z_off_t, z_size_t, z_stream, z_streamp, Byte, Bytef,
 };
+
+// The measured layout of the crate-private state prefix -- the four numbers
+// `tests/abi_layout.rs` §9 needs in order to pin the REAL prefix rather than a
+// look-alike mirror of it.  The prefix TYPE stays `pub(crate)`, because handing an
+// integration test the type would hand it the ability to construct a block a C caller
+// owns an opaque pointer to; the facts are safe to publish and the capability is not.
+//
+// Gated exactly as `StatePrefix` itself is, and named in `cbindgen.toml`'s
+// `[export] exclude` so it reaches no generated header.  Like every other `pub use`
+// here it creates no dynamic symbol.
+#[cfg(feature = "libz-compat")]
+pub use crate::types::{state_prefix_layout, StatePrefixLayout};
 
 // The version identity, re-exported from the module that owns it. Gated exactly
 // as `util` is: with `libz-compat` off there is no introspection module to take

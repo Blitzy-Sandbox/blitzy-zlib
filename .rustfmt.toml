@@ -4,8 +4,14 @@
 # tab characters, line ending) have counterparts here; rustfmt's remaining defaults
 # are already the community standard and are left alone.
 #
-# Applied by `cargo fmt`, which reads this file today; the CI job that will make it a gate,
-# `cargo fmt --check` in .github/workflows/rust.yml, has not been added yet. ONLY STABLE OPTIONS MAY BE
+# Applied by `cargo fmt`, and made a gate by the `format` job of
+# .github/workflows/rust.yml, which runs `cargo fmt --all -- --check`.  That
+# command selects the root workspace's members, so the gate covers the three
+# crates and `benches/`; `fuzz/` declares its own [workspace] and is listed under
+# `exclude`, so the gate does not reach it, though this file still GOVERNS it --
+# rustfmt searches upward for its configuration and `fuzz/` carries none of its
+# own, so `cargo fmt` run inside that directory formats to exactly the settings
+# below. ONLY STABLE OPTIONS MAY BE
 # ADDED -- rust-toolchain.toml pins channel = "stable", so a nightly-gated key (wrap_comments,
 # imports_granularity, group_imports, unstable_features, ...) makes rustfmt warn "unstable
 # features are only available in nightly channel" on every run and fail the zero-warnings gate;
