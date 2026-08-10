@@ -257,9 +257,9 @@ cc = { workspace = true }
 # attached here by explicit path. An entry is added in the SAME change as the file
 # it names and never ahead of it: a `[[bench]]` entry whose `path` is absent is a
 # hard resolution error for `--all-targets` and for `cargo fmt --all`. Of the three
-# suites AAP 0.3.1 plans, `checksum_bench.rs` and `inflate_bench.rs` exist and are
-# declared below; `deflate_bench.rs` does not exist yet, so it is not declared --
-# add its entry beside its file.
+# suites AAP 0.3.1 plans, all three now exist and all three are declared below --
+# `checksum_bench.rs`, `inflate_bench.rs` and `deflate_bench.rs`. Should a fourth
+# ever be added, add its entry beside its file and never ahead of it.
 #
 # Paths are relative to THIS manifest's directory: `crates/zlib-rs-differential`
 # -> `..` -> `../..` is the repository root. `harness = false` is mandatory --
@@ -325,6 +325,51 @@ harness = false
 [[bench]]
 name = "inflate_bench"
 path = "../../benches/inflate_bench.rs"
+harness = false
+
+# Compression throughput AND per-stream memory: the port against the in-process C oracle, enforcing
+# BOTH AAP 0.8.4 gates -- "compression throughput within 10% of C zlib" at levels 1, 6 and 9, and
+# "per-stream memory within 15% of C zlib" (AAP 0.4.1.5, source `contrib/testzlib/testzlib.c` by way
+# of `deflate.c`, `trees.c` and `compress.c`; the allocator technique from `test/infcover.c`
+# L56-L200). Twelve group functions:
+#
+#   * `deflate_steady_state` -- the group the THROUGHPUT gate is read from, since `deflateReset` keeps
+#     the window, `prev`, `head` and pending allocations and so times the encode rather than the
+#     allocator. Levels 1/6/9 are not a sample: `deflate.c`'s `configuration_table[10]` (L112-L124)
+#     puts level 1 on `deflate_fast` with `max_chain` 4 and levels 6 and 9 on `deflate_slow` with
+#     `max_chain` 128 and 4096, so the three span both algorithm families and the chain extremes.
+#   * `deflate_memory` -- the group the MEMORY gate is read from. It registers NO criterion row on
+#     purpose: it installs an instrumented `zalloc`/`zfree` pair that mirrors `test/infcover.c`'s
+#     `mem_zone`, including the `0xa5` fill at L87, and runs its nine level x memLevel encodes
+#     entirely OUTSIDE any timed region, because the counter's bookkeeping would otherwise contaminate
+#     a rate.
+#   * `deflate_lifecycle` (init and end inside the timed region), `deflate_container` (zlib, raw and
+#     gzip), `deflate_feeding` (single-shot against chunked at 32768/1024/16), `compress_oneshot`
+#     (`compress2` and `compress2_z`), and the informational `deflate_mem_level`,
+#     `deflate_strategy`, `deflate_stored_floor` (level 0), `deflate_bound` (the four bound entry
+#     points, per call) and `deflate_degenerate` (the zero- and single-byte fixtures as latency, since
+#     `Throughput::Bytes(0)` has no rate), plus the opt-in `deflate_silesia`.
+#
+# The suite writes one greppable `deflate_bench: RATIO ...` line per throughput case, one
+# `RATIO-SUMMARY` line per group, one `MEMORY ...` line per memory case, one `MEMORY-SUMMARY` line and
+# one `ALLOC-BALANCE ...` leak-check line per side per memory case -- all to STDERR, since stdout
+# belongs to criterion's machine-readable output. It reports rather than enforces: the pass/fail
+# decision belongs to the criterion regression job of AAP 0.4.1.6. It reads the committed tier-1
+# corpus and, when `ZLIB_RS_SILESIA_DIR` or `<repo-root>/target/silesia` holds one, the opt-in tier-2
+# corpus; it never fetches either, and `corpus/fetch_silesia.sh` stays referenced by no manifest,
+# build script, test or workflow.
+#
+#     cargo bench -p zlib-rs-differential --bench deflate_bench
+#     cargo bench -p zlib-rs-differential --bench deflate_bench -- --test   # one iteration each
+#
+# ★ It must never motivate an encoder change. AAP 0.7.1(c) forbids tuning `configuration_table`,
+# enabling a non-default compile-time knob (`FASTEST`, `LIT_MEM`, `UNALIGNED_OK`, `FORCE_STATIC`,
+# `FORCE_STORED`) or adopting a zlib-ng-style improvement, however much faster it would be, because
+# each changes emitted bytes and breaks the byte identity `tests/byte_identical.rs` gates. Admissible
+# optimization is output-neutral only.
+[[bench]]
+name = "deflate_bench"
+path = "../../benches/deflate_bench.rs"
 harness = false
 
 # Opt into the root `[workspace.lints]` policy: `deny(clippy::all, clippy::pedantic)`
