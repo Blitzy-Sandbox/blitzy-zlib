@@ -55,13 +55,30 @@
 # block and a matching -e in win32/Makefile.gcc, for a value that is empty on
 # every C build.
 #
-# So the autotools path reports the set instead of advertising it: `make rust'
-# asks rustc and prints the answer beside the staged libz.a, naming the flags a
-# static consumer has to add.  The CMake path, which knows at configure time
-# whether the Rust library is being built, does advertise it: zlib.pc.cmakein
-# carries a substitutable Libs.private: that is populated there and absent in C
-# mode, and CMakeLists.txt publishes the same set on the exported
-# ZLIB::ZLIBSTATIC target.
+# So THE AUTOTOOLS PATH ADVERTISES IT FROM A DESCRIPTOR OF ITS OWN, generated
+# beside the staged library rather than substituted into this file.  `make rust'
+# asks rustc once and records the answer in
+# target/dropin/native-static-libs.stage; `make rust-pc' turns that one answer
+# into target/dropin/zlib.pc -- this descriptor with a single Libs.private: line
+# added and every other field byte for byte -- then compiles, links and runs a C
+# program from nothing but the flags pkg-config answers for it, and prints the
+# command that installs it over the installed zlib.pc.  `make rust-test' runs
+# that gate as part of its own.  So a static consumer keeps writing the link
+# command it always wrote, and it is `pkg-config --static' that changes its
+# answer rather than the consumer: the historical `Libs: ... -lz' line is
+# untouched on every path.
+#
+# Installing that descriptor is a deliberate step rather than something `make
+# install' does, because the autotools path STAGES the Rust library and never
+# installs it -- `make install' installs the C libraries, and a descriptor
+# advertising a Rust archive's requirements beside a C libz.a would describe
+# something that is not there.
+#
+# The CMake path, which knows at configure time whether the Rust library is
+# being built, needs no separate file: zlib.pc.cmakein carries a substitutable
+# Libs.private: that is populated there and absent in C mode, CMakeLists.txt
+# installs exactly one descriptor at <libdir>/pkgconfig/zlib.pc, and it
+# publishes the same set on the exported ZLIB::ZLIBSTATIC target as well.
 #
 # Dynamic linking is unaffected on every path: the shared object records its own
 # dependencies in DT_NEEDED, so `-lz` alone remains correct there.

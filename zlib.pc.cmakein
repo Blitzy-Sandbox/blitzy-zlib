@@ -47,34 +47,32 @@
 # ONE PACKAGING DIFFERENCE, AND IT IS REAL: STATIC LINKING.
 #
 # The C libz.a needs no companion libraries.  A Rust staticlib is different: it
-# carries the Rust standard library's own object code, whose undefined
-# references reach into libc and its neighbours, and nothing in the archive
-# records that.  On x86_64-unknown-linux-gnu the set is
+# carries the Rust standard library's own object code, whose undefined references
+# reach into libc and its neighbours, and nothing in the archive records that.  On
+# x86_64-unknown-linux-gnu the set measured for this tree is
 #
-# THAT IS WHAT THE SUBSTITUTED LINE BETWEEN Libs: AND Cflags: BELOW IS FOR, and
-# it is why the whole line rather than just its value is substituted: an empty
-# private link line is not the same thing as none, and a consumer testing for the
-# key's presence must not see it appear in the C build.  CMakeLists.txt derives
-# the set with `rustc --crate-type staticlib --print native-static-libs' for the
-# target being built and expands the line only when ZLIB_BUILD_RUST is ON.  For
-# the C build it expands to nothing and this file emits exactly the descriptor it
-# always did.
+#   -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc
 #
 # but that is an illustration, not a constant: the set is TARGET-SPECIFIC and
-# rustc is the only thing that knows it.  So it is not written here.  Instead
-# CMakeLists.txt runs `rustc --print native-static-libs' at configure time
+# rustc is the only thing that knows it, so it is not written here.  CMakeLists.txt
+# runs `rustc --crate-type staticlib --print native-static-libs' at configure time
 # against a throwaway staticlib -- the only invocation that makes rustc answer --
-# refuses to configure if it cannot get an answer, and substitutes the result
-# into the single @-delimited name at the end of the Libs: line below.
+# refuses to configure if it cannot get an answer, and substitutes the result into
+# the single @-delimited name at the end of the Libs: line below.
 #
-# That name expands to a complete additional line, `Libs.private: <set>', in
-# Rust mode and to NOTHING AT ALL in C mode.  Folding the newline into the
-# substituted value, rather than leaving a bare `Libs.private:' key in the
-# template with a possibly-empty value after it, is what leaves the C build's key
-# set exactly what it always was: a descriptor with no such key, which is the
-# truth for an archive that stands alone.  One template therefore serves both
-# implementations honestly, which the earlier revision of this comment wrongly
-# claimed was impossible.
+# THERE IS EXACTLY ONE SUCH NAME IN THIS FILE, AND EXACTLY ONE OWNER OF THE KEY IT
+# WRITES.  It expands to a complete additional line, `Libs.private: <set>', in Rust
+# mode and to NOTHING AT ALL in C mode.  Folding the newline into the substituted
+# value, rather than leaving a bare `Libs.private:' key in the template with a
+# possibly-empty value after it, is what leaves the C build's key set exactly what
+# it always was: a descriptor with no such key, which is the truth for an archive
+# that stands alone.  One template therefore serves both implementations honestly.
+#
+# Do not add a second occurrence of the name, and do not add the key from anywhere
+# else either.  Two occurrences write the key twice; pkg-config reads the first and
+# ignores the rest, so the descriptor stops saying what it appears to say -- and a
+# second producer downstream of configure_file() cannot even tell whether the key
+# it is about to add is already there.  This file is where the key comes from.
 #
 # Dynamic linking never needed any of it: the shared object records its own
 # dependencies in DT_NEEDED, so -lz alone is correct there in both modes -- which
@@ -83,14 +81,14 @@
 # The CMake build additionally publishes the same set on the exported
 # ZLIB::ZLIBSTATIC target, so a consumer reaching the library through
 # find_package(ZLIB CONFIG) gets a complete link line without going through
-# pkg-config at all.  zlib.pc.in, which `configure' expands for the autotools
-# build, carries no equivalent: configure runs before anyone decides whether to
-# run `make rust', so that path reports the set from the `rust' target itself.
+# pkg-config at all.
 #
-# Note that zlib.pc.in, the autotools template, still describes this as an open
-# gap and is correct to: `configure' has no ZLIB_BUILD_RUST equivalent and
-# `make rust' STAGES the drop-in without installing it, so that descriptor is
-# never the Rust one.  Only the CMake path publishes a Rust-selected .pc.
+# zlib.pc.in, the template `configure' expands for the autotools build, has no
+# ZLIB_BUILD_RUST equivalent to key off: configure runs before anyone decides
+# whether to run `make rust'.  That path therefore derives the same set inside the
+# `rust' target and writes it into a descriptor of its own beside the staged
+# library, which `make rust-pc' gates and prints the install command for; see
+# zlib.pc.in and the `rust-pc' target in Makefile.in.
 #
 # Two things about the substitution, for whoever edits this next.  The
 # configure_file() call passes @ONLY, so only the at-delimited names are
@@ -149,4 +147,3 @@ License: Zlib
 Requires:
 Libs: -L${libdir} -L${sharedlibdir} -lz@ZLIB_PC_LIBS_PRIVATE@
 Cflags: -I${includedir}
-@ZLIB_PC_LIBS_PRIVATE@

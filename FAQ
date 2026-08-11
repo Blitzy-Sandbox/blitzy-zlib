@@ -423,9 +423,10 @@ The latest zlib FAQ is at https://zlib.net/zlib_faq.html
     cargo itself is optional.  ./configure succeeds without it and no C target
     reads it, so on a machine with no Rust toolchain the C library builds,
     tests and installs exactly as it always has.  The comment at the top of
-    Makefile.in describes all six Rust targets and what each one does and does
-    not establish, and .github/workflows/rust.yml is where every gate over the
-    port is defined.
+    Makefile.in describes all seven Rust targets -- rust, rust-pc, rust-test,
+    rust-symbols, rust-header, rust-msrv and rust-clean -- and what each one
+    does and does not establish, and .github/workflows/rust.yml is where every
+    gate over the port is defined.
 
 46. What version of Rust do I need?
 
@@ -436,16 +437,17 @@ The latest zlib FAQ is at https://zlib.net/zlib_faq.html
     part way through a build.  "make rust-msrv" exists to check the two crates
     that ship on that floor, with warnings treated as errors.
 
-    There is a second, higher floor, and it applies only if you develop on the
-    port rather than consume it.  The workspace has three members: zlib-rs and
-    libz-rs-sys ship and take 1.80 from the workspace, while
-    crates/zlib-rs-differential is a dev-only harness -- it builds the C oracle
-    and hosts the benchmarks -- and declares 1.86, the floor of criterion, the
-    benchmarking crate it depends on.  So "cargo build --release", "make rust"
-    and cmake -DZLIB_BUILD_RUST=ON all want 1.80 and build only the shipped
-    pair, while "cargo test --workspace" and "cargo bench" reach the harness and
-    want 1.86.  A 1.80 compiler refuses those two by name.  Nothing about the
-    installed library depends on the higher floor.
+    There is a second, higher floor, and it applies to exactly one command.  All
+    three workspace members -- zlib-rs, libz-rs-sys and the dev-only
+    crates/zlib-rs-differential, which builds the C oracle -- take 1.80 from the
+    workspace, so "cargo build --release", "make rust",
+    cmake -DZLIB_BUILD_RUST=ON, "cargo test --workspace" and
+    "cargo +1.80 check --locked --workspace --all-targets" all hold to it.  The
+    three benchmark suites in benches/ are a separate, excluded package with
+    their own lock, because criterion 0.8.2 declares 1.86 and reaches clap
+    crates whose manifests are edition 2024, which cargo 1.80 cannot parse.  So
+    "cargo bench --manifest-path benches/Cargo.toml" wants 1.86 and nothing else
+    does.  Nothing about the installed library depends on the higher floor.
 
     Dependencies are kept to a minimum.  The algorithmic core, crates/zlib-rs,
     has none at all; its dependency list is empty.  The C ABI layer takes
@@ -522,16 +524,30 @@ The latest zlib FAQ is at https://zlib.net/zlib_faq.html
     so each operation is scoped on its own, and each block carries a comment
     naming the invariant that makes it sound.
 
-    Outside the shipped library two more dev-only files touch the C ABI, and
-    both are deliberate: crates/zlib-rs-differential/src/oracle.rs declares
+    Counted rather than characterised: 1,153 occurrences across nine files
+    under crates/libz-rs-sys/src/ when this was last counted, and none anywhere
+    else in the shipped library.  crates/zlib-rs has zero, enforced by the
+    compiler rather than by counting.  The counts below are a snapshot; the
+    shape of the claim is what matters, and
+
+        grep -rn --include='*.rs' -E 'unsafe *(\{|fn|extern|impl)' crates fuzz benches
+
+    is how to check it against the tree in front of you.
+
+    Outside the shipped library, unsafe appears in three dev-only places and
+    each is unavoidable.  crates/zlib-rs-differential/src/oracle.rs declares
     the C oracle the differential tests compare against, and
     crates/zlib-rs-differential/src/port.rs holds the safe boundary gates that
-    the differential suites, the three benchmarks and all five fuzz targets use
-    to drive the C ABI.  Those gates sit in the dev-only crate rather than in
-    the facade on purpose, because AAP 0.6.1 fixes the facade's unsafe at the
-    six unavoidable C-ABI site categories and a test harness is not one of
-    them.  All of those callers contain no unsafe at all, and neither does the
-    core or any of its test suites; the only unsafe outside the facade's src/
-    tree is one slice cast in crates/libz-rs-sys/tests/write_only_window.rs,
-    carrying its own safety comment, which that crate may write because it is
-    the crate that owns the boundary.
+    the differential suites, the benchmarks and all five fuzz targets use to
+    drive the C ABI -- 273 occurrences between the two.  The suites under
+    crates/libz-rs-sys/tests/ have 101 more, for a reason that is structural
+    rather than stylistic: calling an extern "C" function is itself an unsafe
+    operation, so a test that exercises the facade's own entry points cannot
+    avoid an unsafe block however safe the code under test is.  The gates sit
+    in the dev-only crate rather than in the facade on purpose, because AAP
+    0.6.1 fixes the facade's unsafe at the six unavoidable C-ABI site
+    categories and a test harness is not one of them.
+
+    What the gates buy is measurable: the benchmark suites and all five fuzz
+    targets contain no unsafe at all, and neither does the core or any of its
+    own test suites.

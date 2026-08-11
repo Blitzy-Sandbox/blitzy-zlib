@@ -3521,7 +3521,6 @@ mod tests {
     };
 
     use core::ffi::{c_char, c_int, c_uint, c_void};
-    use core::sync::atomic::{AtomicU32, Ordering};
 
     use std::ffi::{CStr, CString};
     #[cfg(windows)]
@@ -3529,7 +3528,7 @@ mod tests {
 
     #[cfg(windows)]
     use super::{gzopen_w, narrow_wide_label};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use zlib_rs::allocate::GlobalAllocator;
     use zlib_rs::error::ReturnCode;
@@ -3547,49 +3546,112 @@ mod tests {
     /// `SEEK_END`, which `gzseek` must refuse.
     const SEEK_END: c_int = 2;
 
-    /// A distinct temporary path per test, safe against parallel clones and parallel tests.
+    /// A private directory for one test, and the path of its `.gz` file inside it.
     ///
-    /// `CLONE_INDEX` is honoured because the workspace may be built by several clones on one
-    /// host at the same time; the process id and a counter separate the tests within a run.
+    /// # The directory carries the security property, not the file name
     ///
-    /// ★ `module_path!()` IS LOAD-BEARING, not decoration. This file carries two test
-    /// modules, `tests` and `tests_backend`; they compile into one binary, and they share 32
-    /// `Scratch` tags between them. Each has a `COUNTER` of its own, so without the module
-    /// name the two produce the SAME path whenever their counters happen to agree on a shared
-    /// tag -- same prefix, same process id, same tag, same serial. Both then use one file, and
-    /// whichever `Scratch` drops first deletes the other's, so the loser fails with `NotFound`
-    /// on a file it created itself. The collision is there by construction and intermittent
-    /// only in when it fires, so it is removed by construction too: the module name makes the
-    /// two namespaces disjoint whatever the counters do. Anything added here that must be
-    /// unique per test needs the same treatment.
-    fn temp_path(tag: &str) -> PathBuf {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let clone = std::env::var("CLONE_INDEX").unwrap_or_else(|_| String::from("local"));
-        let module = module_path!().replace("::", "_");
-        std::env::temp_dir().join(format!(
-            "blitzy_libz_rs_gz_{clone}_{}_{module}_{tag}_{serial}.gz",
-            std::process::id()
-        ))
+    /// These tests open their file through `gzopen(path, "wb")`, which is
+    /// `open(..., O_CREAT | O_TRUNC, ...)` with **no** `O_EXCL` (`gzlib.c` L228-L244), and several
+    /// also reach it with `std::fs::write` or `File::create`. A name built from the process id, a
+    /// clone index and a counter is *unique* but not *unpredictable*: a process id is visible in
+    /// `/proc`, drawn from a small space and reused, so another user on the machine can plant a
+    /// symlink at the name a test is about to create and have the truncating open follow it. That is
+    /// CWE-377, CWE-367 and CWE-59, and it is why the *directory* is what is made safe:
+    ///
+    /// * **Unguessable** -- 128 bits from two OS-seeded [`RandomState`](std::hash::RandomState)
+    ///   draws.
+    /// * **Owner-only in the same syscall that creates it** -- `mode(0o700)` on the
+    ///   [`DirBuilder`](std::fs::DirBuilder), not a create followed by a `chmod` that leaves a window
+    ///   open.
+    /// * **Exclusively** -- `create` is the non-recursive form, so an occupied name is refused with
+    ///   [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) rather than adopted. Nothing here
+    ///   removes a path it did not itself create, so a planted entry is refused, never deleted.
+    ///
+    /// `crates/libz-rs-sys/tests/gz_printf.rs` carries the same three bullets on its own guard and
+    /// asserts each of them in
+    /// `the_scratch_directory_is_private_unguessable_and_exclusively_created`.
+    ///
+    /// ★ The collision this used to guard against is now structural rather than negotiated, and the
+    /// history is worth keeping because it says what a per-test name has to survive. This file
+    /// carries two test modules, `tests` and `tests_backend`; they compile into one binary and share
+    /// 32 `Scratch` tags. Each had a `COUNTER` of its own, so a name made of prefix, process id, tag
+    /// and serial was IDENTICAL across the two whenever their counters happened to agree on a shared
+    /// tag -- both used one file, and whichever `Scratch` dropped first deleted the other's, so the
+    /// loser failed with `NotFound` on a file it created itself. `module_path!()` was the fix. Two
+    /// independent 128-bit draws remove the whole class: no two calls can produce one directory,
+    /// whatever module they are in and whatever any counter does. Anything added here that must be
+    /// unique per test gets that for free -- but only while it goes through this function.
+    fn temp_paths(tag: &str) -> (PathBuf, PathBuf) {
+        use std::hash::{BuildHasher, RandomState};
+        #[cfg(unix)]
+        use std::os::unix::fs::DirBuilderExt;
+
+        /// How many unguessable names to try before giving up. A collision means another
+        /// process holds that exact 128-bit name; the bound keeps a temporary directory that
+        /// refuses *every* create from spinning.
+        const ATTEMPTS: usize = 16;
+
+        let base = std::env::temp_dir();
+        for _ in 0..ATTEMPTS {
+            // Two independent OS-seeded draws, so the name carries 128 bits rather than 64.
+            let high = u128::from(RandomState::new().hash_one(0_u64));
+            let low = u128::from(RandomState::new().hash_one(u64::MAX));
+            let dir = base.join(format!("blitzy_libz_rs_gz_{:032x}", (high << 64) | low));
+
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            builder.mode(0o700);
+
+            match builder.create(&dir) {
+                Ok(()) => {
+                    let file = dir.join(format!("{tag}.gz"));
+                    return (dir, file);
+                }
+                // Someone holds that name. Draw another; nothing is removed.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!(
+                    "cannot create a private scratch directory under {}: {error}",
+                    base.display()
+                ),
+            }
+        }
+        panic!(
+            "{ATTEMPTS} unguessable names under {} were all taken",
+            base.display()
+        )
     }
 
-    /// Removes its path when dropped, so a failing assertion still cleans up.
-    struct Scratch(PathBuf);
+    /// Owns a private directory and the `.gz` file inside it, removing the tree when dropped.
+    struct Scratch {
+        /// The private directory. Removed, with its contents, on drop.
+        dir: PathBuf,
+        /// The `.gz` file inside it.
+        file: PathBuf,
+    }
 
     impl Scratch {
         fn new(tag: &str) -> Self {
-            Self(temp_path(tag))
+            let (dir, file) = temp_paths(tag);
+            Self { dir, file }
+        }
+
+        /// The scratch file's path.
+        fn path(&self) -> &Path {
+            &self.file
         }
 
         /// The path as the NUL-terminated string the C entry points take.
         fn c_path(&self) -> CString {
-            CString::new(self.0.as_os_str().as_encoded_bytes()).unwrap()
+            CString::new(self.file.as_os_str().as_encoded_bytes()).unwrap()
         }
     }
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ignored = std::fs::remove_file(&self.0);
+            // Best effort, and only ever on a directory this process created: nothing outside can
+            // have a path into it, and a missing tree must never itself fail a test.
+            let _ignored = std::fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -4120,7 +4182,7 @@ mod tests {
             assert!(file.is_null(), "wide open accepted mode {mode:?}");
         }
         // Nothing was created: every one of those was refused before the file was opened.
-        assert!(!scratch.0.exists());
+        assert!(!scratch.path().exists());
     }
 
     /// A wide path round-trips through `gzopen_w`.
@@ -4196,7 +4258,7 @@ mod tests {
 
         // `T` writes the payload through untouched, so the file is not a gzip member and a
         // reader reports transparent copying.
-        assert_eq!(std::fs::read(&scratch.0).unwrap(), payload);
+        assert_eq!(std::fs::read(scratch.path()).unwrap(), payload);
         let file = open(&path, "rb");
         assert_eq!(direct(file), 1);
         assert_eq!(read_file(&path), payload);
@@ -4285,7 +4347,7 @@ mod tests {
             .map(|at| u8::try_from(at % 251).unwrap_or(0))
             .collect();
         write_file(&path, "wbT", &payload);
-        assert_eq!(std::fs::read(&scratch.0).unwrap(), payload);
+        assert_eq!(std::fs::read(scratch.path()).unwrap(), payload);
 
         let sentinel: Vec<u8> = (0..REQUEST)
             .map(|at| u8::try_from(at % 241).unwrap_or(0) ^ 0x80)
@@ -4794,10 +4856,10 @@ mod tests {
         // decompresses, which clears `junk`, and the check then fails with
         // "incorrect data check".
         write_file(&path, "wb", b"a payload whose trailer will be corrupted");
-        let mut whole = std::fs::read(&scratch.0).unwrap();
+        let mut whole = std::fs::read(scratch.path()).unwrap();
         let crc = whole.len() - 8;
         whole[crc] ^= 0xff;
-        std::fs::write(&scratch.0, &whole).unwrap();
+        std::fs::write(scratch.path(), &whole).unwrap();
 
         let file = open(&path, "rb");
         let mut buf = [0_u8; 64];
@@ -4847,7 +4909,11 @@ mod tests {
         // A ten-byte RFC 1952 header -- magic, CM=8, no flags, no mtime, XFL=0, OS=255 --
         // followed by a byte whose low three bits are `0b110`: BFINAL=0 with BTYPE=11, which
         // RFC 1951 reserves and every conforming decoder must reject.
-        std::fs::write(&scratch.0, b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff\x06").unwrap();
+        std::fs::write(
+            scratch.path(),
+            b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff\x06",
+        )
+        .unwrap();
 
         let file = open(&path, "rb");
         let mut buf = [0_u8; 32];
@@ -5083,8 +5149,8 @@ mod tests {
             "wb",
             b"a reasonably long payload so that truncation removes data",
         );
-        let whole = std::fs::read(&scratch.0).unwrap();
-        std::fs::write(&scratch.0, &whole[..whole.len() - 6]).unwrap();
+        let whole = std::fs::read(scratch.path()).unwrap();
+        std::fs::write(scratch.path(), &whole[..whole.len() - 6]).unwrap();
 
         let file = open(&path, "rb");
         let mut out = vec![0_u8; 256];
@@ -5100,9 +5166,9 @@ mod tests {
         let path = scratch.c_path();
         let payload = b"a complete member";
         write_file(&path, "wb", payload);
-        let mut whole = std::fs::read(&scratch.0).unwrap();
+        let mut whole = std::fs::read(scratch.path()).unwrap();
         whole.extend_from_slice(b"not a gzip member at all");
-        std::fs::write(&scratch.0, &whole).unwrap();
+        std::fs::write(scratch.path(), &whole).unwrap();
 
         // The member's own bytes still come back; the junk is recognised as junk.
         let file = open(&path, "rb");
@@ -5140,7 +5206,7 @@ mod tests {
         let payload = b"written through an adopted descriptor";
 
         // Write through a descriptor the test opened itself.
-        let handle = std::fs::File::create(&scratch.0).unwrap();
+        let handle = std::fs::File::create(scratch.path()).unwrap();
         let fd = handle.into_raw_fd();
         let mode = CString::new("wb").unwrap();
         let file = dopen(fd, mode.as_ptr());
@@ -5149,7 +5215,7 @@ mod tests {
         assert_eq!(close(file), Z_OK);
 
         // Read it back through another adopted descriptor.
-        let handle = std::fs::File::open(&scratch.0).unwrap();
+        let handle = std::fs::File::open(scratch.path()).unwrap();
         let fd = handle.into_raw_fd();
         let mode = CString::new("rb").unwrap();
         let file = dopen(fd, mode.as_ptr());
@@ -5177,8 +5243,8 @@ mod tests {
         // An invalid mode must leave the descriptor untouched -- `zlib.h` L1415-L1416. The
         // descriptor is still usable afterwards, which is what proves it.
         let scratch = Scratch::new("dopenbad");
-        std::fs::write(&scratch.0, b"contents").unwrap();
-        let handle = std::fs::File::open(&scratch.0).unwrap();
+        std::fs::write(scratch.path(), b"contents").unwrap();
+        let handle = std::fs::File::open(scratch.path()).unwrap();
         let raw = handle.as_raw_fd();
         let bad = CString::new("rb+").unwrap();
         assert!(dopen(raw, bad.as_ptr()).is_null());
@@ -5279,11 +5345,11 @@ mod tests {
         use std::os::fd::{AsRawFd, IntoRawFd};
 
         let scratch = Scratch::new("cloexec");
-        std::fs::write(&scratch.0, b"contents").unwrap();
+        std::fs::write(scratch.path(), b"contents").unwrap();
 
         // Both modes answer 0: see this test's own note on `F_SETFD` and `O_CLOEXEC`.
         for (mode, expected) in [("rb", 0), ("rbe", 0)] {
-            let handle = std::fs::File::open(&scratch.0).unwrap();
+            let handle = std::fs::File::open(scratch.path()).unwrap();
             let raw = handle.as_raw_fd();
             update_flag_word(raw, libc::F_GETFD, libc::F_SETFD, libc::FD_CLOEXEC, false).unwrap();
             assert_eq!(
@@ -5325,10 +5391,10 @@ mod tests {
         use std::os::fd::{AsRawFd, IntoRawFd};
 
         let scratch = Scratch::new("nonblock");
-        std::fs::write(&scratch.0, b"contents").unwrap();
+        std::fs::write(scratch.path(), b"contents").unwrap();
 
         for (mode, expected) in [("rb", 0), ("rbN", libc::O_NONBLOCK)] {
-            let handle = std::fs::File::open(&scratch.0).unwrap();
+            let handle = std::fs::File::open(scratch.path()).unwrap();
             assert_eq!(
                 descriptor_flags(handle.as_raw_fd(), libc::F_GETFL) & libc::O_NONBLOCK,
                 0,
@@ -5364,7 +5430,7 @@ mod tests {
         let payload = b"payload behind two descriptor flags";
         write_file(&path, "wb", payload);
 
-        let handle = std::fs::File::open(&scratch.0).unwrap();
+        let handle = std::fs::File::open(scratch.path()).unwrap();
         let raw = handle.as_raw_fd();
         update_flag_word(raw, libc::F_GETFD, libc::F_SETFD, libc::FD_CLOEXEC, false).unwrap();
         let mode = CString::new("rbeN").unwrap();
@@ -5399,8 +5465,8 @@ mod tests {
         use std::os::fd::AsRawFd;
 
         let scratch = Scratch::new("clearflag");
-        std::fs::write(&scratch.0, b"contents").unwrap();
-        let handle = std::fs::File::open(&scratch.0).unwrap();
+        std::fs::write(scratch.path(), b"contents").unwrap();
+        let handle = std::fs::File::open(scratch.path()).unwrap();
         let fd = handle.as_raw_fd();
 
         update_flag_word(fd, libc::F_GETFL, libc::F_SETFL, libc::O_NONBLOCK, true).unwrap();
@@ -5511,7 +5577,7 @@ mod tests {
         let mode = CString::new("rb").unwrap();
 
         // A live descriptor must close cleanly: the probe may not invent a failure.
-        let good = std::fs::File::open(scratch.0.as_path()).unwrap();
+        let good = std::fs::File::open(scratch.path()).unwrap();
         let file = dopen(good.into_raw_fd(), mode.as_ptr());
         assert!(!file.is_null());
         assert_eq!(close(file), Z_OK, "a valid descriptor");
@@ -5520,9 +5586,7 @@ mod tests {
         // ownership of the number, close it, and only then hand the stale number over.
         // Reclaiming and dropping is how the number is closed without a raw syscall; at
         // that instant it is still open, so the drop is sound and the only owner.
-        let raw = std::fs::File::open(scratch.0.as_path())
-            .unwrap()
-            .into_raw_fd();
+        let raw = std::fs::File::open(scratch.path()).unwrap().into_raw_fd();
         let file = dopen(raw, mode.as_ptr());
         assert!(!file.is_null(), "gzdopen does not validate the descriptor");
         // Closing the descriptor behind the library's back, which is what this test exists
@@ -5730,10 +5794,10 @@ mod tests_backend {
     use super::GzOpenSpec;
 
     use core::ffi::{c_char, c_int, c_uint, c_void};
-    use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+    use core::sync::atomic::{AtomicI32, Ordering};
 
     use std::ffi::{CStr, CString};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use zlib_rs::allocate::GlobalAllocator;
     use zlib_rs::error::ReturnCode;
@@ -5765,41 +5829,88 @@ mod tests_backend {
         unsafe { commit_block(block, state) }
     }
 
-    /// A distinct temporary path per test, safe against parallel clones and parallel tests.
+    /// A private directory for one test, and the path of its `.gz` file inside it.
     ///
-    /// `CLONE_INDEX` is honoured because the workspace may be built by several clones on one
-    /// host at the same time; the process id and a counter separate the tests within a run.
-    fn temp_path(tag: &str) -> PathBuf {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let clone = std::env::var("CLONE_INDEX").unwrap_or_else(|_| String::from("local"));
-        // `module_path!()` for the same reason the copy in `super::tests` carries it: the two
-        // modules compile into one binary and share 32 tags, so the module name is what keeps
-        // their file namespaces disjoint however the two counters line up.
-        let module = module_path!().replace("::", "_");
-        std::env::temp_dir().join(format!(
-            "blitzy_libz_rs_gz_{clone}_{}_{module}_{tag}_{serial}.gz",
-            std::process::id()
-        ))
+    /// The copy in `super::tests`, and its documentation is the full account: the *directory* is what
+    /// is unguessable, owner-only from the creating syscall, and exclusively created, because
+    /// `gzopen(path, "wb")` is `O_CREAT | O_TRUNC` without `O_EXCL` (`gzlib.c` L228-L244) and a
+    /// process id is not a secret. Two independent 128-bit draws also make the cross-module name
+    /// collision that `module_path!()` used to prevent structurally impossible, which is why no
+    /// module name appears here any more.
+    fn temp_paths(tag: &str) -> (PathBuf, PathBuf) {
+        use std::hash::{BuildHasher, RandomState};
+        #[cfg(unix)]
+        use std::os::unix::fs::DirBuilderExt;
+
+        /// How many unguessable names to try before giving up. A collision means another
+        /// process holds that exact 128-bit name; the bound keeps a temporary directory that
+        /// refuses *every* create from spinning.
+        const ATTEMPTS: usize = 16;
+
+        let base = std::env::temp_dir();
+        for _ in 0..ATTEMPTS {
+            // Two independent OS-seeded draws, so the name carries 128 bits rather than 64.
+            let high = u128::from(RandomState::new().hash_one(0_u64));
+            let low = u128::from(RandomState::new().hash_one(u64::MAX));
+            let dir = base.join(format!(
+                "blitzy_libz_rs_gz_backend_{:032x}",
+                (high << 64) | low
+            ));
+
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            builder.mode(0o700);
+
+            match builder.create(&dir) {
+                Ok(()) => {
+                    let file = dir.join(format!("{tag}.gz"));
+                    return (dir, file);
+                }
+                // Someone holds that name. Draw another; nothing is removed.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!(
+                    "cannot create a private scratch directory under {}: {error}",
+                    base.display()
+                ),
+            }
+        }
+        panic!(
+            "{ATTEMPTS} unguessable names under {} were all taken",
+            base.display()
+        )
     }
 
-    /// Removes its path when dropped, so a failing assertion still cleans up.
-    struct Scratch(PathBuf);
+    /// Owns a private directory and the `.gz` file inside it, removing the tree when dropped.
+    struct Scratch {
+        /// The private directory. Removed, with its contents, on drop.
+        dir: PathBuf,
+        /// The `.gz` file inside it.
+        file: PathBuf,
+    }
 
     impl Scratch {
         fn new(tag: &str) -> Self {
-            Self(temp_path(tag))
+            let (dir, file) = temp_paths(tag);
+            Self { dir, file }
+        }
+
+        /// The scratch file's path.
+        fn path(&self) -> &Path {
+            &self.file
         }
 
         /// The path as the NUL-terminated string the C entry points take.
         fn c_path(&self) -> CString {
-            CString::new(self.0.as_os_str().as_encoded_bytes()).unwrap()
+            CString::new(self.file.as_os_str().as_encoded_bytes()).unwrap()
         }
     }
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ignored = std::fs::remove_file(&self.0);
+            // Best effort, and only ever on a directory this process created: nothing outside can
+            // have a path into it, and a missing tree must never itself fail a test.
+            let _ignored = std::fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -6671,7 +6782,7 @@ mod tests_backend {
 
         // `T` writes the payload through untouched, so the file is not a gzip member and a
         // reader reports transparent copying.
-        assert_eq!(std::fs::read(&scratch.0).unwrap(), payload);
+        assert_eq!(std::fs::read(scratch.path()).unwrap(), payload);
         let file = open(&path, "rb");
         assert_eq!(direct(file), 1);
         assert_eq!(read_file(&path), payload);
@@ -7048,10 +7159,10 @@ mod tests_backend {
         // decompresses, which clears `junk`, and the check then fails with
         // "incorrect data check".
         write_file(&path, "wb", b"a payload whose trailer will be corrupted");
-        let mut whole = std::fs::read(&scratch.0).unwrap();
+        let mut whole = std::fs::read(scratch.path()).unwrap();
         let crc = whole.len() - 8;
         whole[crc] ^= 0xff;
-        std::fs::write(&scratch.0, &whole).unwrap();
+        std::fs::write(scratch.path(), &whole).unwrap();
 
         let file = open(&path, "rb");
         let mut buf = [0_u8; 64];
@@ -7099,7 +7210,11 @@ mod tests_backend {
         // A ten-byte RFC 1952 header -- magic, CM=8, no flags, no mtime, XFL=0, OS=255 --
         // followed by a byte whose low three bits are `0b110`: BFINAL=0 with BTYPE=11, which
         // RFC 1951 reserves and every conforming decoder must reject.
-        std::fs::write(&scratch.0, b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff\x06").unwrap();
+        std::fs::write(
+            scratch.path(),
+            b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff\x06",
+        )
+        .unwrap();
 
         let file = open(&path, "rb");
         let mut buf = [0_u8; 32];
@@ -7287,8 +7402,8 @@ mod tests_backend {
             "wb",
             b"a reasonably long payload so that truncation removes data",
         );
-        let whole = std::fs::read(&scratch.0).unwrap();
-        std::fs::write(&scratch.0, &whole[..whole.len() - 6]).unwrap();
+        let whole = std::fs::read(scratch.path()).unwrap();
+        std::fs::write(scratch.path(), &whole[..whole.len() - 6]).unwrap();
 
         let file = open(&path, "rb");
         let mut out = vec![0_u8; 256];
@@ -7304,9 +7419,9 @@ mod tests_backend {
         let path = scratch.c_path();
         let payload = b"a complete member";
         write_file(&path, "wb", payload);
-        let mut whole = std::fs::read(&scratch.0).unwrap();
+        let mut whole = std::fs::read(scratch.path()).unwrap();
         whole.extend_from_slice(b"not a gzip member at all");
-        std::fs::write(&scratch.0, &whole).unwrap();
+        std::fs::write(scratch.path(), &whole).unwrap();
 
         // The member's own bytes still come back; the junk is recognised as junk.
         let file = open(&path, "rb");
@@ -7344,7 +7459,7 @@ mod tests_backend {
         let payload = b"written through an adopted descriptor";
 
         // Write through a descriptor the test opened itself.
-        let handle = std::fs::File::create(&scratch.0).unwrap();
+        let handle = std::fs::File::create(scratch.path()).unwrap();
         let fd = handle.into_raw_fd();
         let mode = CString::new("wb").unwrap();
         let file = dopen(fd, &mode);
@@ -7353,7 +7468,7 @@ mod tests_backend {
         assert_eq!(close(file), Z_OK);
 
         // Read it back through another adopted descriptor.
-        let handle = std::fs::File::open(&scratch.0).unwrap();
+        let handle = std::fs::File::open(scratch.path()).unwrap();
         let fd = handle.into_raw_fd();
         let mode = CString::new("rb").unwrap();
         let file = dopen(fd, &mode);
@@ -7381,8 +7496,8 @@ mod tests_backend {
         // An invalid mode must leave the descriptor untouched -- `zlib.h` L1415-L1416. The
         // descriptor is still usable afterwards, which is what proves it.
         let scratch = Scratch::new("dopenbad");
-        std::fs::write(&scratch.0, b"contents").unwrap();
-        let handle = std::fs::File::open(&scratch.0).unwrap();
+        std::fs::write(scratch.path(), b"contents").unwrap();
+        let handle = std::fs::File::open(scratch.path()).unwrap();
         let raw = handle.as_raw_fd();
         let bad = CString::new("rb+").unwrap();
         assert!(dopen(raw, &bad).is_null());
@@ -7426,7 +7541,7 @@ mod tests_backend {
         let mode = CString::new("rb").unwrap();
 
         // A live descriptor must close cleanly: the probe may not invent a failure.
-        let good = std::fs::File::open(scratch.0.as_path()).unwrap();
+        let good = std::fs::File::open(scratch.path()).unwrap();
         let file = dopen(good.into_raw_fd(), &mode);
         assert!(!file.is_null());
         assert_eq!(close(file), Z_OK, "a valid descriptor");
@@ -7439,11 +7554,7 @@ mod tests_backend {
         // The number is relocated out of the range `open(2)` allocates from first, because
         // otherwise freeing it here races every other test in this binary -- see
         // [`relocate_high`], which records what that race was measured to do.
-        let raw = relocate_high(
-            std::fs::File::open(scratch.0.as_path())
-                .unwrap()
-                .into_raw_fd(),
-        );
+        let raw = relocate_high(std::fs::File::open(scratch.path()).unwrap().into_raw_fd());
         close_descriptor(raw);
 
         let file = dopen(raw, &mode);
@@ -7644,7 +7755,7 @@ mod tests_backend {
         let file = open_raw(&scratch.c_path(), &bad_mode);
         assert!(file.is_null(), "`+` is rejected (gzlib.c L128-L131)");
         assert!(
-            !scratch.0.exists(),
+            !scratch.path().exists(),
             "a rejected mode string must not create the file"
         );
     }
@@ -7861,7 +7972,7 @@ mod tests_backend {
         let path = scratch.c_path();
 
         // Not a gzip file, and not the empty file that would be read transparently.
-        std::fs::write(&scratch.0, b"this is not compressed data at all").unwrap();
+        std::fs::write(scratch.path(), b"this is not compressed data at all").unwrap();
         let file = open(&path, "rb");
 
         let mut out = [0_u8; 64];
@@ -7878,7 +7989,7 @@ mod tests_backend {
         let text = message_text(first).expect("a non-null message");
         // C's `"%s%s%s", path, ": ", msg`, so the stored message begins with the path.
         assert!(
-            text.starts_with(scratch.0.as_os_str().as_encoded_bytes()),
+            text.starts_with(scratch.path().as_os_str().as_encoded_bytes()),
             "the message is prefixed with the path: {:?}",
             String::from_utf8_lossy(&text)
         );

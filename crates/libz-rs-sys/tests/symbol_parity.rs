@@ -66,8 +66,11 @@
 //!   versioned symlink chain.
 //! * The **cargo** `cdylib` is held to its own measured shape: 96 type-`T` symbols, no version
 //!   nodes, and a delta from the contract that is exactly `gzprintf`/`gzvprintf` absent plus three
-//!   `_zlib_rs_*` helpers present. Pinning that is not a concession -- it is what detects an
-//!   unintended new export, or an accidental loss of one, in the artifact every developer builds.
+//!   `_zlib_rs_*` helpers present. That is a *development* artifact -- convenient, produced by every
+//!   `cargo build`, and marked not installable in the artifact matrix -- so pinning its shape is not
+//!   a concession and not a parity claim either: it detects an unintended new export, or an
+//!   accidental loss of one, and it stops the deviation from drifting into something wider without a
+//!   test going red.
 //! * The **cargo** `libz.a` is held to the *whole* contract -- all 95 functions defined as global
 //!   text symbols, `gzprintf` and `gzvprintf` among them. That is the positive claim the artifact
 //!   matrix makes about the direct-cargo command, and
@@ -98,6 +101,14 @@
 //! What is *forbidden* is the converse: a real diff must never be downgraded to a skip, and a name
 //! must never be removed from the baseline to make a build pass. AAP 0.7.1 (b) makes the exported
 //! surface immutable; if the diff fails, the facade's exports are wrong, not the baseline.
+//!
+//! ★ And a skip is only ever legitimate while nobody has claimed the artifact is there. A harness
+//! that has just staged the drop-in sets **`ZLIB_RS_REQUIRE_PACKAGED=1`**, and every skip in the
+//! packaged group then becomes a failure naming what went unverified -- see [`packaged_required`].
+//! Without that switch the strongest gates in this file are also the easiest to satisfy vacuously: a
+//! CI job could run `make rust`, run this suite, print eight `SKIP:` lines and be recorded green,
+//! which is the state the `symbols` job of `.github/workflows/rust.yml` now forbids twice over -- it
+//! arms the variable, and it fails on any `SKIP:` line in the output.
 //!
 //! # ★ Why `SONAME` and the symlink chain are asserted here, and must not be deleted as redundant
 //!
@@ -154,6 +165,7 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -583,6 +595,67 @@ fn skip(reason: &str) {
     println!("SKIP: {reason}");
 }
 
+/// The environment variable that arms the packaged-artifact gates.
+///
+/// See [`packaged_required`]. Named here as a constant because three places have to agree on the
+/// spelling: this file, the `symbols` job of `.github/workflows/rust.yml`, and the `README`
+/// paragraph that documents the packaging step.
+const REQUIRE_PACKAGED_VAR: &str = "ZLIB_RS_REQUIRE_PACKAGED";
+
+/// Whether the caller has declared that the packaged drop-in **must** exist and be inspectable.
+///
+/// # ★ Why an arming switch exists at all
+///
+/// The packaged gates below -- full 111-symbol parity, the 95/16 split, the hidden set, the
+/// `SONAME`, the symlink topology -- describe the artifact that actually ships. Every one of them
+/// skips when `target/dropin` has not been populated, which is right for a developer who has only
+/// run `cargo test`, and *wrong* for continuous integration: a job that stages the drop-in and then
+/// runs a suite which silently skips every assertion about it reports success while verifying
+/// nothing. That is not a hypothetical -- it is the state this switch was added to end, and it is
+/// the reason the AAP's parity requirement (0.4.1.3, 0.6.3.6) could be satisfied on paper by a
+/// green run that never opened the file.
+///
+/// So the harness that staged the artifact says so, and every skip in the packaged group becomes a
+/// failure naming what went unverified. `ZLIB_RS_REQUIRE_PACKAGED=1 cargo test -p libz-rs-sys
+/// --test symbol_parity` is the armed form; unset, or `0`, is the developer default.
+///
+/// A value that is neither is a hard error rather than a fall-through to disarmed. A typo in a CI
+/// expression -- `ZLIB_RS_REQUIRE_PACKAGED=true `, `yes`, `on` -- must not quietly turn the gate
+/// off, because the whole point of the switch is that its absence is invisible. `Makefile.in`
+/// refuses a malformed `ZLIB_RS_SIMD` for the same reason.
+fn packaged_required() -> bool {
+    match env::var(REQUIRE_PACKAGED_VAR) {
+        Err(_) => false,
+        Ok(value) => match value.trim() {
+            "" | "0" => false,
+            "1" => true,
+            other => panic!(
+                "{REQUIRE_PACKAGED_VAR}={other:?} is not a recognised value: use 1 to require the \
+                 packaged drop-in staged by `make rust`, or 0 (or leave it unset) to let the \
+                 packaged gates skip when it has not been built. Anything else is refused rather \
+                 than treated as 0, because a silently disarmed gate is exactly the failure this \
+                 variable exists to prevent"
+            ),
+        },
+    }
+}
+
+/// Reports that a **packaged**-artifact gate could not run: a skip when disarmed, a failure when
+/// [`packaged_required`] says the artifact had to be there.
+///
+/// The reason string is written once and used in both modes, so the armed failure and the disarmed
+/// skip name the same remedy and cannot drift apart.
+fn packaged_unavailable(reason: &str) {
+    assert!(
+        !packaged_required(),
+        "{REQUIRE_PACKAGED_VAR}=1 declares that the packaged drop-in was staged, but {reason}. \
+         The packaged library is the artifact that ships -- cargo's own `libz.so` is not \
+         installable (see the artifact matrix in src/lib.rs) -- so this is a failure rather than a \
+         skip: with it skipped, nothing in this suite has inspected the shared library at all"
+    );
+    skip(reason);
+}
+
 /// Whether this host can be inspected with ELF tooling at all.
 ///
 /// Three conditions, each a legitimate skip rather than a failure:
@@ -721,13 +794,19 @@ fn recorded_soname(library: &Path) -> SonameProbe {
 // Guards that resolve an artifact or explain its absence
 // =================================================================================================
 
-/// The packaged shared object `make rust` stages, or `None` with a `SKIP:` line.
+/// The packaged shared object `make rust` stages, or `None` with a `SKIP:` line -- or a failure,
+/// when [`packaged_required`] is armed.
 fn packaged_library() -> Option<PathBuf> {
     if !elf_tooling_available() {
+        packaged_unavailable(
+            "the ELF tooling this suite reads the packaged library with is unavailable, so its \
+             symbol table, SONAME and version nodes went unverified; install binutils (`nm`, \
+             `readelf`)",
+        );
         return None;
     }
     let Some(directory) = packaged_dir() else {
-        skip(&format!(
+        packaged_unavailable(&format!(
             "no packaged library directory at {}; run `make rust` (or `make rust CARGO=cargo`) \
              to relink libz.a under zlib.map and stage the drop-in",
             target_root().join("dropin").display()
@@ -736,7 +815,7 @@ fn packaged_library() -> Option<PathBuf> {
     };
     let library = directory.join(packaged_file_name());
     if !library.is_file() {
-        skip(&format!(
+        packaged_unavailable(&format!(
             "packaged library not found at {}; run `make rust` to stage it",
             library.display()
         ));
@@ -1143,7 +1222,7 @@ fn soname_is_libz_so_1() {
         // `tool_output` has already printed why the tool could not run; this adds what went
         // unverified because of it, so a skipped SONAME check is attributable to this assertion
         // rather than only to a generic "binutils missing" line further up the log.
-        SonameProbe::ToolUnavailable => skip(&format!(
+        SonameProbe::ToolUnavailable => packaged_unavailable(&format!(
             "cannot read DT_SONAME from {}: `readelf` is unavailable, so the packaged library's \
              SONAME was not verified",
             library.display()
@@ -1171,17 +1250,30 @@ fn soname_is_libz_so_1() {
 /// system version until `-Wl,-rpath` was added. Deleting this test would let a "drop-in replacement"
 /// suite pass while exercising a different library.
 ///
-/// What is deliberately *not* asserted is which of the three names is the regular file. `make rust`
-/// makes `libz.so.<ZLIB_VERSION>` real with the two shorter names pointing at it, matching
-/// `Makefile.in`'s C recipe; requiring a particular alias to be a link would over-specify the
-/// packaging without adding safety, so the requirement is stated as "all three exist and agree".
+/// ★ The **topology** is asserted too, not merely that the three names resolve to one object:
+/// `libz.so.<ZLIB_VERSION>` must be the regular file, and `libz.so.1` and `libz.so` must each be a
+/// symlink whose recorded target is that bare versioned name. That is exactly what `Makefile.in`
+/// does for the C library (`ln -s $@ libz.so` and `ln -s $@ libz.so.1`, L2500-L2501) and for the
+/// Rust one (L1123-L1126), so requiring it is parity rather than over-specification. The weaker
+/// "all three exist and agree" form this test used to carry is satisfied by three independent
+/// regular files, or by a copy taken with `cp -L`, and both of those *look* installed while
+/// behaving differently: `make install` and the `CMake` install rules recreate links, a versioned
+/// tree of copies triples on disk, and a consumer inspecting the chain to find the real object --
+/// as the `dropin` job of `.github/workflows/rust.yml` does -- cannot tell a producer that never
+/// made the links from one whose links were repaired downstream. `read_link` is used rather than
+/// `canonicalize` for that half deliberately: it reports what the producer *recorded*, which is
+/// the thing under test.
 #[test]
 fn versioned_symlink_chain_present() {
     if !elf_tooling_available() {
+        packaged_unavailable(
+            "the ELF tooling guard failed, so the staged symlink topology went unverified; \
+             install binutils (`nm`, `readelf`)",
+        );
         return;
     }
     let Some(directory) = packaged_dir() else {
-        skip("no packaged library directory; run `make rust` to stage the drop-in");
+        packaged_unavailable("no packaged library directory; run `make rust` to stage the drop-in");
         return;
     };
     let versioned = packaged_file_name();
@@ -1189,11 +1281,46 @@ fn versioned_symlink_chain_present() {
 
     let real = directory.join(&versioned);
     if !real.is_file() {
-        skip(&format!(
+        packaged_unavailable(&format!(
             "packaged library not found at {}; run `make rust`",
             real.display()
         ));
         return;
+    }
+
+    // The producer's own topology, read without dereferencing anything.
+    let kind = real
+        .symlink_metadata()
+        .unwrap_or_else(|error| panic!("{} cannot be inspected ({error})", real.display()))
+        .file_type();
+    assert!(
+        kind.is_file(),
+        "{} is not a regular file; the versioned name is the object itself in both the C recipe \
+         and the Rust one, with the two shorter names pointing at it",
+        real.display()
+    );
+    for alias in ["libz.so", EXPECTED_SONAME] {
+        let path = directory.join(alias);
+        let kind = path
+            .symlink_metadata()
+            .unwrap_or_else(|error| panic!("{} cannot be inspected ({error})", path.display()))
+            .file_type();
+        assert!(
+            kind.is_symlink(),
+            "{} is not a symlink; `make rust` records it as `ln -s {versioned}`, and a copy in its \
+             place hides a producer that never staged the chain",
+            path.display()
+        );
+        let target = path
+            .read_link()
+            .unwrap_or_else(|error| panic!("{} cannot be read ({error})", path.display()));
+        assert_eq!(
+            target,
+            Path::new(&versioned),
+            "{} records target {} rather than the bare {versioned}",
+            path.display(),
+            target.display()
+        );
     }
 
     let mut resolved = Vec::new();
@@ -1365,16 +1492,166 @@ fn cargo_staticlib_defines_the_whole_contract() {
     }
 }
 
+/// The arming switch parses, and the mode it selected is printed.
+///
+/// Unconditional, and that is the whole reason it exists. [`packaged_required`] is otherwise
+/// consulted only when an artifact turns out to be missing, so a misspelled
+/// `ZLIB_RS_REQUIRE_PACKAGED` -- `true`, `yes`, `ON` -- would go unnoticed on any run where
+/// everything happened to be in place, and would then be discovered as a *skip* on the one run where
+/// the artifact was absent and the gate was needed. Validating the value here fails the run
+/// immediately instead, and printing the resolved mode puts "armed" or "unarmed" in the log so a
+/// reader of a green CI run can tell which of the two they are looking at.
+#[test]
+fn the_arming_switch_parses() {
+    let armed = packaged_required();
+    println!(
+        "{REQUIRE_PACKAGED_VAR}={}: the packaged-artifact gates are {}",
+        env::var(REQUIRE_PACKAGED_VAR).unwrap_or_else(|_| "<unset>".to_owned()),
+        if armed {
+            "REQUIRED -- a missing drop-in fails"
+        } else {
+            "advisory -- a missing drop-in skips"
+        }
+    );
+}
+
+// =================================================================================================
+// The flags word against the artifacts that ship
+// =================================================================================================
+
+/// The two variadic entry points `zlibCompileFlags()` bit 27 speaks about.
+///
+/// The same pair as [`CDYLIB_ABSENT`] by construction, and that is the point rather than a
+/// coincidence: they are absent from the `cdylib` *because* they are the ones that cannot be
+/// defined in Rust, and bit 27 is the ABI's way of saying whether they exist. Spelled separately so
+/// that the test below reads as a statement about the flags word instead of borrowing a name that
+/// describes a different artifact.
+const VARIADIC_EXPORTS: [&str; 2] = CDYLIB_ABSENT;
+
+/// `zlibCompileFlags()` bit 27 agrees with the symbol table of every artifact that ships.
+///
+/// # What the bit means, and why a *symbol* test owns it
+///
+/// `zlib.h` L1252 defines bit 27 as "0 = `gzprintf()` present, 1 = not -- 1 means `gzprintf()`
+/// returns an error", and `src/util.rs` derives it from `cfg(zlib_rs_gzprintf)`, which `build.rs`
+/// sets only when it actually compiled `csrc/gzprintf_shim.c`. That ties the bit to the
+/// *compilation*. It does not, by itself, tie it to the **export**, and the two can diverge: the
+/// shim's objects go into `libz.a`, and a `cdylib` gives a C-contributed symbol no dynamic entry at
+/// all, so cargo's `libz.so` reports bit 27 clear while its `.dynsym` has neither name. One
+/// compilation of this crate produces all three artifact kinds from the same object code -- rustc
+/// receives `--crate-type` three times in a single invocation -- so a *different* flags word per
+/// artifact is not something a `cfg` could express even in principle.
+///
+/// The resolution is the one the artifact matrix in `src/lib.rs` already states: the `cdylib` is not
+/// a shipping artifact. What ships is `libz.a` and the packaged
+/// `libz.so.<ZLIB_VERSION>` relinked from it, and for both of those the bit must be honest. This
+/// test is what makes that a gate:
+///
+/// * bit 27 **clear** requires `gzprintf` and `gzvprintf` to be present in the artifact -- a
+///   consumer that reads the flags word and then calls `gzprintf` must not meet an undefined
+///   symbol;
+/// * bit 27 **set** requires them to be *absent* -- a build that advertises the stub behaviour of
+///   `gzwrite.c` L406-L412 while exporting the real thing is lying in the other direction.
+///
+/// The `cdylib`'s deviation is pinned separately, and deliberately, by
+/// [`cargo_cdylib_matches_its_measured_shape`] -- so it cannot spread to an artifact that ships
+/// without a test going red.
+///
+/// This file compiles only with `libz-compat` and `gz` (see the crate-level `#![cfg]`), so the
+/// expected answer here is "bit clear, both names present". That is not a tautology: if `build.rs`
+/// stopped compiling the shim, or emitted the archive without `-l static=`, the cfg would clear and
+/// the bit would set while the packaged library still had to be relinked from an archive that no
+/// longer defined them -- which is precisely the drift this catches.
+#[test]
+fn compile_flags_bit_27_agrees_with_the_shipping_artifacts() {
+    let flags = z::zlibCompileFlags();
+    let claims_present = flags >> 27 & 1 == 0;
+    let mut inspected = 0_usize;
+
+    // The packaged shared library: the dynamic table is what a run-time consumer resolves against.
+    if let Some(library) = packaged_library() {
+        if let Some(symbols) = dynamic_symbols(&library) {
+            let exported: BTreeSet<&str> = symbols
+                .iter()
+                .map(|symbol| {
+                    let name = symbol.name.as_str();
+                    name.split("@@").next().unwrap_or(name)
+                })
+                .collect();
+            for name in VARIADIC_EXPORTS {
+                assert_eq!(
+                    exported.contains(name),
+                    claims_present,
+                    "zlibCompileFlags() = 0x{flags:x} has bit 27 {}, so {name} must be {} in {}, \
+                     and it is not. The flags word is part of the ABI: a consumer reads it to \
+                     decide whether gzprintf is usable",
+                    if claims_present { "clear" } else { "set" },
+                    if claims_present { "exported" } else { "absent" },
+                    library.display()
+                );
+            }
+            inspected += 1;
+        }
+    }
+
+    // The static archive: the same claim, resolved at link time instead.
+    if let Some(archive) = cargo_staticlib() {
+        let path = archive.to_str().expect("artifact path is not valid UTF-8");
+        if let Some(output) = tool_output("nm", &["--defined-only", "--extern-only", path]) {
+            let symbols = parse_nm(&output);
+            let defined: BTreeSet<&str> = symbols
+                .iter()
+                .filter(|symbol| symbol.kind == 'T')
+                .map(|symbol| symbol.name.as_str())
+                .collect();
+            for name in VARIADIC_EXPORTS {
+                assert_eq!(
+                    defined.contains(name),
+                    claims_present,
+                    "zlibCompileFlags() = 0x{flags:x} has bit 27 {}, so {name} must be {} in {}",
+                    if claims_present { "clear" } else { "set" },
+                    if claims_present {
+                        "a defined global text symbol"
+                    } else {
+                        "undefined"
+                    },
+                    archive.display()
+                );
+            }
+            inspected += 1;
+        }
+    }
+
+    if inspected == 0 {
+        skip(
+            "neither shipping artifact was available, so bit 27 was checked against nothing; run \
+             `make rust` for target/dropin and `cargo build -p libz-rs-sys` for libz.a",
+        );
+    }
+}
+
+// =================================================================================================
+// The cargo artifacts' own measured shape
+// =================================================================================================
+
 /// The cargo `cdylib` exports 96 type-`T` symbols and no version nodes, and its delta from the
 /// contract is exactly the documented one.
 ///
-/// This is not a relaxation of the parity gate; it is a second, independent gate on the artifact
-/// every developer actually builds. rustc attaches its own anonymous version script to a `cdylib`
-/// link, which has three measured consequences: `zlib.map` cannot be layered on (so zero version
-/// nodes), a symbol defined by a C object in the archive gets no dynamic entry (so `gzprintf` and
-/// `gzvprintf` are absent), and the `_zlib_rs_*` helpers that `zlib.map`'s `_*` pattern would hide
-/// are visible. Pinning that shape catches a new or lost export in the cargo build immediately,
-/// months before anyone runs `make rust`.
+/// ★ This pins a **development** artifact, and it must not be read as a statement that the artifact
+/// is fit to install. `cargo build` emits it, `cargo test` links nothing against it, and the
+/// artifact matrix in `src/lib.rs` marks it not installable: it is short two exports and all 16
+/// version nodes, and no argument to cargo closes either gap. The shipping shared library is what
+/// `make rust` relinks from `libz.a` and stages in `target/dropin`, which the packaged tests above
+/// hold to full parity.
+///
+/// So this is not a relaxation of the parity gate; it is a second, independent gate whose subject is
+/// the deviation itself. rustc attaches its own anonymous version script to a `cdylib` link, which
+/// has three measured consequences: `zlib.map` cannot be layered on (so zero version nodes), a
+/// symbol defined by a C object in the archive gets no dynamic entry (so `gzprintf` and `gzvprintf`
+/// are absent), and the `_zlib_rs_*` helpers that `zlib.map`'s `_*` pattern would hide are visible.
+/// Pinning that shape catches a new or lost export in the cargo build immediately, months before
+/// anyone runs `make rust` -- and, just as importantly, makes any *change* to the deviation visible
+/// rather than absorbed.
 #[test]
 fn cargo_cdylib_matches_its_measured_shape() {
     let Some(library) = cargo_cdylib() else {
@@ -1514,12 +1791,25 @@ fn cargo_artifact_directory_holds_no_versioned_names() {
 
     for name in [EXPECTED_SONAME.to_owned(), packaged_file_name()] {
         let path = directory.join(&name);
-        assert!(
-            path.symlink_metadata().is_err(),
-            "{} exists; the versioned names belong only to what `make rust` stages, because a \
-             build script cannot keep them non-dangling and cargo puts this directory on the \
-             library search path of the tools building the workspace",
-            path.display()
-        );
+        // ★ `is_err()` is NOT absence, and the distinction matters here in the direction that
+        // hides a defect: an `EACCES` on the directory, or any other inspection failure, would
+        // satisfy a bare `is_err()` while the alias sat there. Only `NotFound` means "not
+        // present"; anything else is reported as what it is. This is the same idiom `build.rs`'s
+        // `prune_retired_alias` is held to, for the same reason.
+        match path.symlink_metadata() {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => panic!(
+                "{} could not be inspected ({error}); this test cannot conclude the versioned \
+                 alias is absent, and an alias that is present here is loaded by the tools \
+                 building the workspace",
+                path.display()
+            ),
+            Ok(_) => panic!(
+                "{} exists; the versioned names belong only to what `make rust` stages, because a \
+                 build script cannot keep them non-dangling and cargo puts this directory on the \
+                 library search path of the tools building the workspace",
+                path.display()
+            ),
+        }
     }
 }

@@ -841,6 +841,19 @@ fn build_c_abi_shims(repo_root: &Path) {
     // `util.rs` derives `zlibCompileFlags` bit 27 from this cfg, so the flags word describes the
     // artifact that was actually built; setting it for a `gz`-less build would claim a
     // `gzprintf` the archive does not contain.
+    //
+    // ★ WHAT THIS CFG DOES AND DOES NOT ESTABLISH, because the difference is one artifact wide.
+    // It records that the shim was COMPILED and archived, which is what makes bit 27 honest for
+    // the two artifacts that ship: `libz.a`, whose members these objects are, and the packaged
+    // `libz.so.<ZLIB_VERSION>` that is relinked from it.  It cannot record what a given artifact
+    // EXPORTS, and for cargo's `cdylib` the two differ -- rustc's `local: *` gives a
+    // C-contributed symbol no dynamic entry, so that library reports bit 27 clear while its
+    // `.dynsym` holds neither name.  No cfg could say otherwise: cargo emits all three crate
+    // types from ONE rustc invocation (measured: a single `--crate-name z` command carrying
+    // `--crate-type` three times), so the compiled constant is shared.  That is why the `cdylib`
+    // is documented as a development artifact rather than an installable one, and why
+    // `tests/symbol_parity.rs::compile_flags_bit_27_agrees_with_the_shipping_artifacts` checks
+    // the bit against the archive and the packaged library instead of trusting this line.
     if gz {
         link_test_probe(&manifest_dir, &out_dir, repo_root, msvc, &archive);
         println!("cargo::rustc-cfg={CFG_GZPRINTF}");
@@ -1400,13 +1413,45 @@ fn prune_retired_alias(dir: &Path, real: &str, alias: &str) {
     let link = dir.join(alias);
 
     match fs::symlink_metadata(&link) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            if !fs::read_link(&link).is_ok_and(|current| current == Path::new(real)) {
-                return;
-            }
-        }
-        // A regular file, a directory, or nothing at all: not ours.
-        Ok(_) | Err(_) => return,
+        Ok(metadata) if metadata.file_type().is_symlink() => match fs::read_link(&link) {
+            // Ours, and pointing where this script used to point it: remove it below.
+            Ok(current) if current == Path::new(real) => {}
+            // A link somebody else arranged. Never touched.
+            Ok(_) => return,
+            // ★ AN UNREADABLE LINK IS NOT AN ABSENT ONE. The alias is demonstrably
+            // there -- `symlink_metadata` just succeeded on it -- and the one thing
+            // that decides whether it is safe to leave in place is where it points.
+            // Treating a permission or I/O failure as "not ours" leaves a
+            // `libz.so.1` next to an artifact that cannot satisfy it, which is the
+            // exact trap this function exists to disarm, and leaves it silently.
+            Err(error) => panic!(
+                "cannot read the symlink {}: {error}. It is a versioned alias next to cargo's \
+                 `{real}`, which is NOT an installable libz -- it carries none of zlib.map's 16 \
+                 symbol-version nodes and does not export gzprintf or gzvprintf -- and whether \
+                 this build script staged it cannot be established without reading it. Fix the \
+                 permissions or remove the link by hand, then rebuild; the installable chain is \
+                 staged by `make rust`, never here.",
+                link.display()
+            ),
+        },
+        // A regular file or a directory: not ours, and not this script's to judge.
+        Ok(_) => return,
+        // Nothing there is the wanted state.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        // ★ EVERY OTHER INSPECTION ERROR IS A FAILURE, for the same reason as
+        // above: `NotFound` is the only error that means "no alias here". A
+        // permission error on the directory, an I/O error, a path that is not a
+        // directory -- each of those means the answer is UNKNOWN, and an unknown
+        // answer must not be reported as absence when the consequence of being
+        // wrong is a stale alias that satisfies a `libz.so.1` lookup with a
+        // library exporting 96 of the contract's 111 dynamic globals.
+        Err(error) => panic!(
+            "cannot inspect {}: {error}. That path is where an older revision of this build \
+             script staged a versioned alias beside cargo's `{real}`, and this script cannot \
+             establish whether one is present. Resolve the error and rebuild; a stale alias there \
+             would satisfy a `libz.so.1` lookup with a library that is not a drop-in.",
+            link.display()
+        ),
     }
 
     if let Err(error) = fs::remove_file(&link) {

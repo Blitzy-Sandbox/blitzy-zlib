@@ -29,7 +29,8 @@ zlib.pc.cmakein zlib.pc template for cmake
 zlib2ansi       perl script to convert source files for C++ compilation
 
 amiga/          makefiles for Amiga SAS C
-benches/        criterion benchmark suites for the Rust implementation
+benches/        criterion benchmark suites for the Rust implementation, its own
+                excluded Cargo package with its own lock
 crates/         Cargo workspace: zlib-rs (safe core), libz-rs-sys (C ABI
                 library) and zlib-rs-differential (C oracle test harness)
 doc/            documentation for formats and algorithms
@@ -82,8 +83,12 @@ See contrib/README.contrib
 crates/zlib-rs/                 the safe core: every algorithm, forbid(unsafe_code), no deps
 crates/libz-rs-sys/             the C ABI facade: the exported extern "C" surface
 crates/zlib-rs-differential/    dev-only harness that diffs the port against the C sources
-benches/                        dev-only criterion suites, hosted by the harness above
+benches/                        dev-only criterion suites, their own excluded package and lock;
+                                they measure against the harness above by path dependency
 fuzz/                           dev-only cargo fuzz targets, its own workspace
 See README for the build commands and the Cargo feature matrix, Makefile.in for the
-rust, rust-test, rust-symbols, rust-header, rust-msrv and rust-clean targets, and
-.github/workflows/rust.yml for the gates that run all of them
+seven targets rust, rust-pc, rust-test, rust-symbols, rust-header, rust-msrv and
+rust-clean, and .github/workflows/rust.yml for the eighteen jobs that gate them.
+.github/scripts/ holds the gate programs those jobs invoke rather than inline:
+bench_gate.py with its self-test and fixture, dropin_chain.sh which verifies the
+staged symlink chain, and whitespace_gate.sh

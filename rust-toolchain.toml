@@ -77,9 +77,14 @@
 # on its own names a rustc platform tier rather than a commitment by this port:
 #
 #   FULLY VERIFIED  x86_64-unknown-linux-gnu.  The only target the port is
-#                   built, tested, PACKAGED and measured on.  Twelve of the
-#                   thirteen jobs in `.github/workflows/rust.yml` run
-#                   `ubuntu-latest` and nothing else, and they are the ones that
+#                   built, tested, PACKAGED and measured on.  SIXTEEN of the
+#                   EIGHTEEN jobs in `.github/workflows/rust.yml` run
+#                   `ubuntu-latest` and nothing else; the two that do not are
+#                   `build-test`, whose matrix adds a macOS and a Windows row,
+#                   and `bench`, which runs on `ubuntu-latest` unless the
+#                   `ZLIB_RS_BENCH_RUNNER` repository variable redirects it to a
+#                   machine that already carries the Silesia corpus.  The sixteen
+#                   are the ones that
 #                   establish the measured claims made across this workspace:
 #                   struct sizes and offsets, the 95-function / 111-global symbol
 #                   surface, `zlibCompileFlags` returning 0xa9, the ELF soname and

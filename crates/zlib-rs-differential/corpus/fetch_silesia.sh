@@ -6,11 +6,23 @@
 # important thing about it is what it does *not* do:
 #
 #   * it is NEVER invoked by `cargo test`;
-#   * it is NEVER invoked by CI;
-#   * it is referenced from no `Cargo.toml`, from no `build.rs`, from no file
-#     under `tests/`, and from no workflow in `.github/workflows/`;
+#   * it NEVER FETCHES from CI -- see the exact boundary below;
+#   * it is referenced from no `Cargo.toml`, from no `build.rs` and from no file
+#     under `tests/`;
 #   * it has no side effect of any kind -- not a directory, not a temporary
-#     file, not a single byte of network traffic -- unless a human runs it.
+#     file, not a single byte of network traffic -- unless a human runs it
+#     WITHOUT `--verify-only`.
+#
+# THE EXACT CI BOUNDARY, because "never invoked by CI" used to be written here
+# and was not true.  The `bench` job of `.github/workflows/rust.yml` invokes this
+# script in exactly one mode, `--verify-only`, which "fetches nothing and writes
+# nothing" (see `verify_only` below) and therefore reaches no network and touches
+# no path.  It NEVER invokes it in fetching mode, and the workflow fails closed
+# when the corpus it was told to expect is absent rather than downloading it:
+# provisioning is done from outside the workflow, by a human or by a cache entry
+# keyed on the pinned digest.  That is what AAP 0.6.4.4 asks for -- the corpus is
+# opt-in "so `cargo test` and CI never require the network" -- and a side-effect
+# free verification does not require one.
 #
 # Those are not aspirations, they are the property that keeps this crate's
 # test suite hermetic.  The correctness gates here must be reproducible from a
@@ -18,18 +30,21 @@
 # corpus bytes -- the byte-identity matrix and the round-trip interoperability
 # tests -- and read them from `minimal/`; the table-equality checks read no
 # corpus at all, since they compare this port's `const` tables against the
-# generated C headers.  The moment any automated path calls this script, every gate
-# becomes contingent on a remote host that may be unreachable, may be slow, or
-# may serve something different today than it served yesterday.  If you are
-# adding automation and find yourself wanting this corpus, the answer is to
-# make the automation skip, exactly as the benchmarks do.
+# generated C headers.  The moment any automated path calls this script IN
+# FETCHING MODE, every gate becomes contingent on a remote host that may be
+# unreachable, may be slow, or may serve something different today than it served
+# yesterday.  If you are adding automation and find yourself wanting this corpus,
+# the answer is to make the automation skip, exactly as the benchmarks do -- or,
+# if it must know whether a corpus provisioned elsewhere is the pinned one, to ask
+# with `--verify-only`, which is the one mode that neither fetches nor writes.
 #
 # WHY IT EXISTS
 #
 # Solely so that `cargo bench` has large, heterogeneous, realistic input.  The
 # suites at the repository root -- benches/deflate_bench.rs and
-# benches/inflate_bench.rs, attached to this crate by the `[[bench]]` entries in
-# ../Cargo.toml -- measure throughput against the in-tree C reference, and
+# benches/inflate_bench.rs, hosted by the `[[bench]]` entries of
+# benches/Cargo.toml, an excluded package that depends on this crate -- measure
+# throughput against the in-tree C reference, and
 # throughput only means something when it is measured on data of realistic size
 # and variety.  Silesia is the standard corpus for exactly that.  This is
 # tier 2 of the two-tier corpus described in AAP 0.6.4.4, and it is the
@@ -477,7 +492,7 @@ value you obtained and cross-checked:
   ZLIB_RS_SILESIA_MEMBER_SHA256=/path/to/silesia.sha256 \
       ./crates/zlib-rs-differential/corpus/fetch_silesia.sh \
       --sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-  ZLIB_RS_SILESIA_DIR=/var/cache/silesia cargo bench -p zlib-rs-differential
+  ZLIB_RS_SILESIA_DIR=/var/cache/silesia cargo bench --manifest-path benches/Cargo.toml
 
 See ./README.md for the corpus contract this script implements.
 EOF
@@ -1779,10 +1794,10 @@ main() {
     info "Silesia corpus ready at: $destination"
     info "The benchmarks discover it automatically -- measure with:"
     if [ "$destination_is_default" -eq 1 ]; then
-        info "    cargo bench -p zlib-rs-differential"
+        info "    cargo bench --manifest-path benches/Cargo.toml"
     else
         info "    ZLIB_RS_SILESIA_DIR=$destination \\"
-        info "        cargo bench -p zlib-rs-differential"
+        info "        cargo bench --manifest-path benches/Cargo.toml"
     fi
     info "Nothing else reads it: no test, no build script, and no CI job."
 }

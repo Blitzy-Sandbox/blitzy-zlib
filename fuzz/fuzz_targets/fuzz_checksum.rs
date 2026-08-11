@@ -65,22 +65,30 @@
 //! on top of that.
 //!
 //! **Which of those checks CI actually performs, precisely.** The `fuzz` job in
-//! `.github/workflows/rust.yml` runs this target with no `--features` argument, so the
-//! automated fuzzing run exercises the scalar backends only and the neutrality assertions
-//! above are compiled out of it. Reaching them means passing the feature yourself:
+//! `.github/workflows/rust.yml` runs this target TWICE. Its matrix is six rows over five
+//! fuzz binaries: one row each for `fuzz_deflate`, `fuzz_inflate`, `fuzz_inflate_back` and
+//! `fuzz_gz_roundtrip`, then `fuzz_checksum` with the default feature set, then
+//! `fuzz_checksum` again with `--features simd`. Both checksum rows get the same 300-second
+//! budget and upload artifacts under distinct slugs (`fuzz_checksum` and
+//! `fuzz_checksum_simd`), so the neutrality assertions above are compiled IN and exercised
+//! on every push rather than only when somebody remembers to pass the feature. This comment
+//! said the opposite for a while -- that the job ran scalar only and that a green `fuzz` job
+//! was no evidence about SIMD -- and the sixth row is why that was wrong.
+//!
+//! The same command by hand, when you want it locally:
 //!
 //! ```text
 //! cd fuzz
 //! cargo +nightly fuzz run fuzz_checksum --features simd -- -max_total_time=300
 //! ```
 //!
-//! The neutrality property is nonetheless machine-enforced on every push, just not from
-//! here: the `differential` job runs
-//! `cargo test -p zlib-rs-differential --release --features simd`, and because the
-//! byte-identity cells compare the running check value as well as the emitted bytes, a
-//! vectorized checksum that returned a different answer would fail there. So this target
-//! is the arbitrary-input form of the check, run deliberately, and the differential suite
-//! is the automatic one. Do not cite a green `fuzz` job as evidence about SIMD.
+//! Neutrality is additionally enforced from a second, independent direction: the
+//! `differential` job runs `cargo test -p zlib-rs-differential --release --features simd`,
+//! and because the byte-identity cells compare the running check value as well as the
+//! emitted bytes, a vectorized checksum that returned a different answer would fail there
+//! too. So this target is the arbitrary-input form of the check and the differential suite
+//! is the fixed-corpus form; both run automatically, and neither is a substitute for the
+//! other.
 //!
 //! # What this target deliberately does NOT do
 //!

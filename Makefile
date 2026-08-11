@@ -19,7 +19,7 @@ distclean:
 # runs nothing while still exiting 0.  That is a silent no-op, which is worse
 # than an error.  The whole family is declared rather than just `rust', so a
 # later addition under any of these names cannot reintroduce the same trap.
-.PHONY: all distclean rust rust-test rust-symbols rust-header rust-msrv rust-clean
+.PHONY: all distclean rust rust-pc rust-test rust-symbols rust-header rust-msrv rust-clean
 
 rust:
 	$(MAKE) -f Makefile.in rust

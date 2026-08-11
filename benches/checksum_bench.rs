@@ -99,8 +99,9 @@
 //! # Running it
 //!
 //! ```text
-//! cargo bench -p zlib-rs-differential --bench checksum_bench
-//! cargo bench -p zlib-rs-differential --bench checksum_bench -- --test    # one iteration each
+//! cargo bench --manifest-path benches/Cargo.toml --bench checksum_bench
+//! # one iteration per case:
+//! cargo bench --manifest-path benches/Cargo.toml --bench checksum_bench -- --test
 //! ```
 //!
 //! A full run measures the whole case set -- the `simd` feature adds the vectorized backend rows
@@ -117,7 +118,7 @@
 //! vectorized one, so one run shows all of them side by side:
 //!
 //! ```text
-//! cargo bench -p zlib-rs-differential --bench checksum_bench --features simd
+//! cargo bench --manifest-path benches/Cargo.toml --bench checksum_bench --features simd
 //! ```
 //!
 //! *Configuration against configuration, across two runs* -- what criterion's baselines are
@@ -125,8 +126,8 @@
 //! measures the exported C ABI rather than a named type:
 //!
 //! ```text
-//! cargo bench -p zlib-rs-differential --bench checksum_bench -- --save-baseline scalar
-//! cargo bench -p zlib-rs-differential --bench checksum_bench --features simd \
+//! cargo bench --manifest-path benches/Cargo.toml --bench checksum_bench -- --save-baseline scalar
+//! cargo bench --manifest-path benches/Cargo.toml --bench checksum_bench --features simd \
 //!     -- --baseline-lenient scalar
 //! ```
 //!
@@ -453,15 +454,22 @@ fn sweep_bytes(len: usize) -> Vec<u8> {
     out
 }
 
-/// The committed tier-1 corpus directory.
+/// The committed tier-1 corpus directory, `crates/zlib-rs-differential/corpus/minimal`.
 ///
-/// ★ `CARGO_MANIFEST_DIR` is the **host package's** directory for a bench target -- that is
-/// `crates/zlib-rs-differential`, the crate whose manifest carries the `[[bench]]` entry that
-/// attaches this file -- and not the `benches/` directory the file sits in. So the corpus is one
-/// join away, and the repository root, which nothing here needs, would be
-/// `<CARGO_MANIFEST_DIR>/../..`.
+/// ★ `CARGO_MANIFEST_DIR` is the **host package's** directory for a bench target, and the host
+/// package of this file is `benches/` -- the excluded package whose manifest carries the
+/// `[[bench]]` entry that attaches it -- so the repository root is one component up and the corpus
+/// hangs off the differential crate, which owns the fixtures and documents them in
+/// `corpus/README.md`. It was `<CARGO_MANIFEST_DIR>/corpus/minimal` while these suites were
+/// attached to that crate; the path moved with the hosting.
+///
+/// Never an absolute path baked into the source, and never derived from the current directory,
+/// which cargo does not guarantee for a bench binary.
 fn minimal_corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("crates")
+        .join("zlib-rs-differential")
         .join("corpus")
         .join("minimal")
 }

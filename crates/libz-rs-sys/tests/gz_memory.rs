@@ -55,7 +55,6 @@ use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
 use std::fs;
 use std::path::PathBuf;
-use std::process;
 
 // Forces the rlib onto the link line. The gz entry points are `#[no_mangle] pub extern "C"` inside a
 // private module, so they are reachable only as C symbols -- which is the point: this measures what a
@@ -498,25 +497,80 @@ fn percent_of(rust: usize, c: usize) -> f64 {
     rust * 100.0 / c
 }
 
-/// A scratch file removed when the guard is dropped, including while a failing test unwinds.
-struct TempPath(PathBuf);
+/// A private directory for this suite's scratch file, and the file's path inside it.
+///
+/// The measurement below opens the file with `gzopen(path, "wb")`, which is
+/// `open(..., O_CREAT | O_TRUNC, ...)` with no `O_EXCL` (`gzlib.c` L228-L244). A predictable name in
+/// a shared, world-writable directory is therefore an attack surface and not merely a collision
+/// risk -- a process id is visible in `/proc`, drawn from a small space and reused, so another user
+/// can plant a symlink at the name and have the truncating open follow it. The *directory* carries
+/// the property instead, created unguessable (128 bits from two OS-seeded
+/// [`RandomState`](std::hash::RandomState) draws), owner-only in the same syscall that creates it
+/// (`mode(0o700)`), and exclusively (`recursive(false)`, so an occupied name is refused rather than
+/// adopted -- nothing here removes a path it did not itself create).
+///
+/// `crates/libz-rs-sys/tests/gz_printf.rs` sets the reasoning out in full on its own `TempPath`, and
+/// `the_scratch_directory_is_private_unguessable_and_exclusively_created` there asserts each of the
+/// three bullets; this is the same type with a different name prefix.
+///
+/// [`Drop`] removes the tree, so cleanup survives a failing assertion unwinding through it. No
+/// `tempfile` dev-dependency: AAP 0.7.1(i) keeps the dependency table minimal.
+struct TempPath {
+    /// The private directory. Removed, with its contents, when this value is dropped.
+    dir: PathBuf,
+    /// The scratch file inside it.
+    file: PathBuf,
+}
 
 impl TempPath {
+    /// How many unguessable names to try before giving up. A collision means another process holds
+    /// that exact 128-bit name; the bound keeps a directory that refuses every create from spinning.
+    const ATTEMPTS: usize = 16;
+
     fn new(tag: &str) -> Self {
-        let mut path = std::env::temp_dir();
-        path.push(format!("blitzy-gz-memory-{}-{tag}", process::id()));
-        let _ = fs::remove_file(&path);
-        Self(path)
+        use std::hash::{BuildHasher, RandomState};
+        #[cfg(unix)]
+        use std::os::unix::fs::DirBuilderExt;
+
+        let base = std::env::temp_dir();
+        for _ in 0..Self::ATTEMPTS {
+            let high = u128::from(RandomState::new().hash_one(0_u64));
+            let low = u128::from(RandomState::new().hash_one(u64::MAX));
+            let dir = base.join(format!("blitzy_gz_memory_{:032x}", (high << 64) | low));
+
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            builder.mode(0o700);
+
+            match builder.create(&dir) {
+                Ok(()) => {
+                    let file = dir.join(format!("{tag}.gz"));
+                    return Self { dir, file };
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!(
+                    "cannot create a private scratch directory under {}: {error}",
+                    base.display()
+                ),
+            }
+        }
+        panic!(
+            "{} unguessable names under {} were all taken",
+            Self::ATTEMPTS,
+            base.display()
+        )
     }
 
     fn as_cstring(&self) -> CString {
-        CString::new(self.0.to_str().expect("a temp path must be UTF-8")).unwrap()
+        CString::new(self.file.to_str().expect("a temp path must be UTF-8")).unwrap()
     }
 }
 
 impl Drop for TempPath {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        // Best effort, and only ever on a directory this process created.
+        let _ = fs::remove_dir_all(&self.dir);
     }
 }
 

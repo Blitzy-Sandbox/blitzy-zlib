@@ -45,20 +45,33 @@ harness that compiles the C sources in this directory as a test oracle;
 neither shipped crate depends on it, so an ordinary build of the Rust library
 never compiles them.
 
-Two things follow about where unsafe lives, and both are worth stating exactly
-rather than in round numbers.  Outside crates/libz-rs-sys, two dev-only files
-declare or wrap raw entry points, and neither ships anywhere:
-crates/zlib-rs-differential/src/oracle.rs, which is how the C oracle is called,
-and crates/zlib-rs-differential/src/port.rs, whose boundary gates are how
-everything else drives the C ABI.  Those gates are deliberately not part of the
-shipped facade: AAP 0.6.1 fixes that facade's unsafe at exactly the six
-unavoidable C-ABI site categories, and a test harness is not one of them.
-Everything that uses the gates -- the three differential suites, the three
-benchmark suites and all five fuzz targets -- contains no unsafe at all, and
-neither does the safe core or any of its own test suites.  The only unsafe
-outside the facade's src/ tree is a single slice cast in
-crates/libz-rs-sys/tests/write_only_window.rs, which asserts a property of the
-boundary from the crate that owns the boundary.
+Where unsafe lives is worth stating by count rather than in round numbers,
+because "the only crate permitted to write unsafe" is a statement about the
+SHIPPED library and is often read as a statement about the whole tree.
+
+In the shipped library, every occurrence is under crates/libz-rs-sys/src/ --
+1,153 of them across nine files when this was last counted, none anywhere else.
+Re-derive the numbers rather than trusting them:
+
+    grep -rn --include='*.rs' -E 'unsafe *(\{|fn|extern|impl)' crates fuzz benches  crates/zlib-rs, which is
+the whole of the algorithm, carries #![forbid(unsafe_code)] and therefore has
+zero, checked by the compiler on every build rather than by grep.
+
+Outside the shipped library, three dev-only places have unsafe, and each is
+unavoidable rather than tolerated.  crates/zlib-rs-differential/src/oracle.rs
+declares the C oracle and src/port.rs holds the safe boundary gates that
+everything else drives the C ABI through (273 occurrences between them); and the
+suites under crates/libz-rs-sys/tests/ have 101, because CALLING an extern "C"
+function is itself an unsafe operation, so a test that exercises the facade's own
+entry points cannot avoid an unsafe block however safe the code under test is.
+Those gates are deliberately not part of the shipped facade: AAP 0.6.1 fixes that
+facade's unsafe at exactly the six unavoidable C-ABI site categories, and a test
+harness is not one of them.
+
+What that buys is measurable: the three benchmark suites and all five fuzz
+targets contain no unsafe at all -- zero, because they reach both
+implementations through those gates -- and neither does the safe core or any of
+its own test suites.
 
 For a program that dynamically links libz, the exported symbol set is the same,
 the z_stream and gz_header layouts are the same, the SONAME is still libz.so.1,
@@ -72,12 +85,28 @@ message on anything else -- not-UNIX, Apple, AIX and SunOS.  Building and
 testing the Rust workspace is a wider claim than that and is made separately:
 see the tier 1 note under "Notes for some targets" below.
 
-Static linking is the one case that is not yet equivalent.  A Rust libz.a
-carries the Rust runtime's own companion libraries, the set differs per target,
-and the installed zlib.pc advertises none of it, so a consumer that static
-links through that descriptor alone can fail to link.  zlib.pc.in and
-zlib.pc.cmakein state the measurement and the remedy; treat it as an open
-packaging gap rather than as settled.
+Static linking needs one thing dynamic linking does not, and both package paths
+supply it.  A Rust libz.a carries the Rust runtime's own object code, whose
+undefined references reach into libc and its neighbours, and an archive cannot
+record a dependency the way a shared object records DT_NEEDED; the set differs
+per target and only rustc knows it.  So it is measured once and published
+through the standard metadata a consumer already reads: the installed zlib.pc
+gains a single Libs.private line, which is what "pkg-config --static --libs
+zlib" reports, and the CMake package publishes the same set as the exported
+ZLIB::ZLIBSTATIC target's interface libraries.  The historical "Libs: ... -lz"
+line is untouched on every path, so a consumer that reads either channel keeps
+writing the link command it always wrote.
+
+The two build systems differ only in when that descriptor is written.  CMake
+knows at configure time whether the Rust library is being built, so with
+-DZLIB_BUILD_RUST=ON it installs exactly one zlib.pc and that one carries the
+line.  The autotools path stages the Rust library rather than installing it, so
+"make rust-pc" writes the descriptor beside the staged library, gates it by
+building and running a C program from nothing but the flags pkg-config answers,
+and prints the single command that installs it over the installed zlib.pc; do
+that whenever you install the staged libz.a.  A consumer that reads neither
+channel -- one that hardcodes "-lz" -- has to add the set itself, and every one
+of these commands prints it.
 
 The compressed bytes are the same as well, over the configurations the
 differential tests compare: the encoder reproduces the reference
@@ -118,12 +147,22 @@ either library and a shared object records its own dependencies -- but a Rust
 static archive carries the Rust runtime and so needs that runtime's native
 libraries on a static link line, while the C libz.a needs none.  One zlib.pc
 cannot say both, so that target writes a second descriptor beside the staged
-library, with a Libs.private line derived for the target being built by
-"rustc --print native-static-libs", and then compiles, links and runs a C
-program from nothing but the flags pkg-config answers for it.  Install that
-file in place of zlib.pc whenever you install the staged Rust library; the
-target prints the copy command.  "make rust-test" runs it for you.  The CMake
-build generates and installs the equivalent descriptor itself.
+library, with a Libs.private line and every other field taken from zlib.pc
+unchanged, and then compiles, links and runs a C program from nothing but the
+flags pkg-config answers for it.  Install that file in place of zlib.pc
+whenever you install the staged Rust library; the target prints the copy
+command.  "make rust-test" runs it for you.  The CMake build generates and
+installs the equivalent descriptor itself.
+
+The set in that line is probed once, by "make rust", with "rustc --print
+native-static-libs" for the target being built, and recorded in
+target/dropin/native-static-libs.stage.  Everything that needs it reads it from
+there: the relink of the shared library, the static links "make rust-test"
+performs against libz.a, and the descriptor above.  One probe and one recorded
+answer is the point -- a second probe is a second thing to disagree with -- and
+a target whose rustc cannot be run is not stuck: RUSTPCPRIVATE="-lm -lpthread
+-lc" states the set instead, and every command that needs it stops with that
+instruction rather than linking against a requirement set it does not know.
 
 "make rust-header" wants cbindgen as well as a cargo reachable on PATH, and
 "make rust-clean" wants no cargo at all.  The comment at the top of Makefile.in
@@ -155,6 +194,26 @@ is the form to use when the features are being chosen by hand, and it names the
 package too: this is a virtual workspace, so a bare "--features libz-compat"
 leaves it to cargo to decide which selected package the feature was meant for.
 Saying "-p libz-rs-sys" says it instead.
+
+Read those as the first step of one recipe rather than as the whole of it.  The
+C-ABI deliverable is the set "make rust" stages, and the three commands together
+are what produce it and prove it:
+
+    cargo build --locked --release -p libz-rs-sys --features libz-compat,gz
+    make rust CARGO=cargo
+    ZLIB_RS_REQUIRE_PACKAGED=1 cargo test --locked --release \
+        -p libz-rs-sys --test symbol_parity -- --nocapture
+
+The third command is the gate on the second.  Every assertion about the staged
+library -- 111 symbols, 95 functions and 16 version nodes, none of zlib.map's
+local names exported, the SONAME, the symlink TOPOLOGY (the versioned file real
+and the two shorter names symlinks to it, not copies), and zlibCompileFlags()
+bit 27 against the artifacts that ship -- inspects a file cargo does not build,
+so all nine of them SKIP unless something says the library is there.
+ZLIB_RS_REQUIRE_PACKAGED=1 is that something: each skip becomes a failure naming
+what went unverified.  The symbols job of .github/workflows/rust.yml sets it
+after staging, and additionally fails on any SKIP line, so the artifact that
+ships cannot be recorded green without having been opened.
 
 Note that "cargo build" alone does NOT produce an installable shared library,
 and the shortfall is measurable: the shared object cargo emits publishes 96
@@ -204,19 +263,23 @@ vectorised CRC-32 and Adler-32 backends are available behind the "simd" Cargo
 feature; they change speed only, never the compressed bytes, and the paragraph
 after the feature table below says how that is checked and where.
 
-The workspace is edition 2021, and it has two floors rather than one, because
-one of its three members never ships.  1.80 is the floor of the two crates that
-do -- zlib-rs and libz-rs-sys, which both inherit rust-version from
-[workspace.package] -- and it is the only floor that matters for building,
-installing or using the library: "cargo build --release", "make rust" and
-cmake -DZLIB_BUILD_RUST=ON each build just that pair.  The third member,
-crates/zlib-rs-differential, is a dev-only harness that holds the C oracle and
-the benchmarks, and it declares 1.86 of its own because that is the floor of
-criterion, the benchmarking crate it depends on.  So the commands that reach it
--- "cargo test --workspace" and "cargo bench" -- want 1.86, and a 1.80 compiler
-refuses them by name rather than failing part way through.  rust-toolchain.toml
-pins the stable channel, comfortably above both, so cargo selects a suitable
-compiler by itself; "make rust-msrv" is what checks the shipped pair on 1.80.
+The workspace is edition 2021 and it has ONE floor: 1.80.  All three members --
+zlib-rs, libz-rs-sys and the dev-only crates/zlib-rs-differential, which holds
+the C oracle -- inherit rust-version from [workspace.package], so every command
+that reaches the workspace holds to it, including "cargo test --workspace",
+"cargo +1.80 check --locked --workspace --all-targets" and
+"cargo +1.80 metadata --locked".  "make rust-msrv" is what checks it.
+
+The one floor that is higher is criterion's, and it is confined to the package
+that needs it.  The three benchmark suites in benches/ are their own excluded
+package with their own lock file, because criterion 0.8.2 declares 1.86 and
+reaches clap crates whose manifests are written in edition 2024 -- which cargo
+1.80 cannot parse at all.  While those suites were attached to the differential
+crate the workspace declared 1.80 and could not be resolved by 1.80, which is
+not a floor so much as a claim.  So "cargo bench --manifest-path
+benches/Cargo.toml" wants 1.86 and nothing else does, and the benches reach the
+same oracle as before through a path dependency on the differential crate.
+rust-toolchain.toml pins the stable channel, comfortably above both.
 
 Selected Cargo features, with the crate that declares each one and its default.
 This is not the whole surface -- "cargo metadata" is authoritative, and
@@ -282,8 +345,12 @@ crates/zlib-rs-differential, Miri over the safe core with every feature enabled
 one job does not finish), AddressSanitizer over the C ABI layer, the three
 unmodified C drivers and the oracle harness, five cargo-fuzz targets at 300
 seconds each plus the checksum target a second time with simd, the cbindgen
-header diffed against zlib.h, the exported symbols and version nodes diffed
-against the C library's own, and the criterion suites in benches/ measured
+header compared against zlib.h -- a literal diff of all 95 contract signatures
+as the C++ compiler resolves them, required to be empty, plus struct layouts and
+macro values from a probe program per side, and `diff -u zlib.h
+generated_zlib.h' itself published as an artifact because the two FILES
+necessarily differ for the reasons cbindgen.toml enumerates -- the exported
+symbols and version nodes diffed against the C library's own, and the criterion suites in benches/ measured
 against the C oracle in the same process.
 
 Questions about zlib should be sent to <zlib@gzip.org>, or to Gilles Vollant

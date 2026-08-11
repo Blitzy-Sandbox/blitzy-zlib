@@ -15,28 +15,29 @@
 # NO `msrv` KEY, deliberately -- and this is the correct setting rather than an
 # omission.  With the key absent, clippy takes each package's own `rust-version`
 # from Cargo.toml, which is what keeps it from proposing APIs that do not exist on
-# the floor that package actually promises.  That matters because the three
-# packages no longer share one floor:
+# the floor that package actually promises.  Every package in this workspace states
+# one floor:
 #
-#   crates/zlib-rs             rust-version.workspace = true  -> 1.80
-#   crates/libz-rs-sys         rust-version.workspace = true  -> 1.80
-#   crates/zlib-rs-differential rust-version = "1.86"         -> criterion's floor
+#   crates/zlib-rs              rust-version.workspace = true  -> 1.80
+#   crates/libz-rs-sys          rust-version.workspace = true  -> 1.80
+#   crates/zlib-rs-differential rust-version.workspace = true  -> 1.80
 #
-# The last of those is dev-only and hosts the benchmark suites, whose harness
-# (criterion 0.8.2) declares `rust-version = "1.86"`; the two crates that SHIP
-# still promise 1.80 and clippy still holds them to it.  A single `msrv = "1.80"`
-# here would make clippy print
+# so a `msrv = "1.80"` key here would agree with all three today.  It stays absent
+# anyway, because agreement is not the property that matters: two packages OUTSIDE
+# this workspace are linted by the `lint` job with `--manifest-path`, and one of
+# them, `benches/`, declares 1.86 because criterion 0.8.2 does.  clippy resolves a
+# clippy.toml by searching upwards from the crate, so this file governs those runs
+# too, and a key here would either print
 #
 #   warning: the MSRV in `clippy.toml` and `Cargo.toml` differ; using `1.80.0`
 #            from `clippy.toml`
 #
-# on every target of the differential crate -- a warning, and therefore a failure
-# of the zero-warnings bar -- while telling clippy something untrue about that
-# package.  Setting it to "1.86" would be worse: it would relax the check for the
-# shipped crates, which is the opposite of what the key is for.
+# on every benchmark target -- a warning, and therefore a failure of the
+# zero-warnings bar -- or, spelled "1.86", would relax the check for the crates
+# that SHIP, which is the opposite of what the key is for.
 #
-# Keep it absent.  If a fourth package with yet another floor is ever added, this
-# still needs no change.
+# Keep it absent.  Per-package `rust-version` is the single source of truth, and a
+# fourth package with yet another floor still needs no change here.
 
 # Everything below is a configuration VALUE, not a lint level.
 

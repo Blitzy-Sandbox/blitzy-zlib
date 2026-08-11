@@ -32,6 +32,25 @@
 # same complete archive through `zlib.map` and staging the versioned chain.  One
 # table states all of this, in `src/lib.rs`; every claim below is written to it.
 #
+# THE DELIVERABLE IS THE STAGED PAIR, AND IT IS GATED AS SUCH.  Read the two
+# commands as one recipe rather than as an alternative to each other: the first
+# produces the archive and the Rust library, the second produces the shared
+# library from that archive, and nothing installable comes out of the first alone.
+#
+#     cargo build --locked --release -p libz-rs-sys --features libz-compat,gz
+#     make rust CARGO=cargo          # -> target/dropin: libz.a + the versioned .so + chain
+#     ZLIB_RS_REQUIRE_PACKAGED=1 cargo test --locked --release \
+#       -p libz-rs-sys --test symbol_parity -- --nocapture
+#
+# The third line is the gate on the second.  Every packaged assertion in
+# `tests/symbol_parity.rs` -- 111 symbols, the 95/16 split, the hidden set, the
+# SONAME, the symlink TOPOLOGY, and `zlibCompileFlags()` bit 27 against the
+# artifacts that ship -- inspects a file `cargo test` never builds, so each one
+# SKIPS by default.  `ZLIB_RS_REQUIRE_PACKAGED=1` turns those skips into failures
+# that name what went unverified; the `symbols` job of
+# `.github/workflows/rust.yml` sets it and additionally fails on any `SKIP:` line,
+# so the shipped artifact cannot be recorded green without having been opened.
+#
 # The versioned names `libz.so.1` and `libz.so.1.3.2.1-motley` therefore exist in
 # exactly one place -- what `make rust` stages -- and `build.rs` writes a
 # `README-cargo-artifacts.txt` beside cargo's output saying so.  A C program
@@ -55,7 +74,7 @@
 #      points the exported `ZLIB::ZLIB` and `ZLIB::ZLIBSTATIC` targets at them.
 #      `README-cmake.md` documents the option.
 #   4. `Makefile.in`'s `rust`, `rust-test`, `rust-symbols`, `rust-header`,
-#      `rust-msrv` and `rust-clean` targets, all six of which exist.
+#      `rust-msrv`, `rust-pc` and `rust-clean` targets, all seven of which exist.
 #   5. `zlib.pc`'s `Libs: ... -lz` — which requires `libz.so` / `libz.a`.
 #
 # Related files, and the boundary of this manifest's responsibility:
@@ -150,10 +169,18 @@ homepage = "https://zlib.net/"
 #
 # All three crate types come from this one crate rather than from two or three
 # separate crates, so the exported C surface is defined in exactly one place:
-#   * `cdylib`    -> `libz.so`.  The shared library, and the base the packaged
-#                    drop-in is built from -- not itself the finished drop-in:
-#                    see the measured list of what it lacks at the top of this
-#                    file.
+#   * `cdylib`    -> `libz.so`.  A DEVELOPMENT artifact, and not the base the
+#                    packaged drop-in is built from either -- that is the
+#                    `staticlib` below, because a version script cannot be
+#                    attached to a rustc-linked cdylib and the two variadic
+#                    exports live in the archive.  What this one is for: it makes
+#                    `cargo build` produce a loadable shared object for local
+#                    experiments, it is what `--crate-type cdylib` has to be
+#                    declared to obtain, and its exported shape is pinned by
+#                    `tests/symbol_parity.rs::cargo_cdylib_matches_its_measured_shape`
+#                    so the documented deviation cannot widen unnoticed.  It is
+#                    NOT installable: see the measured list of what it lacks at
+#                    the top of this file.
 #   * `staticlib` -> `libz.a`.  Two consumers: `test/CMakeLists.txt` links
 #                    `infcover` against a static zlib via `ZLIB::ZLIBSTATIC`,
 #                    and — the reason this crate type is mandatory rather than
@@ -162,12 +189,12 @@ homepage = "https://zlib.net/"
 #                    version script at all, because a version script cannot be
 #                    attached to a rustc-built cdylib.  `Makefile.in`'s `rust`
 #                    target performs that relink.
-#   * `rlib`      -> required so `zlib-rs-differential`, the `fuzz/` targets and
-#                    this crate's own `tests/*.rs` can depend on it as a normal
-#                    Rust library.  Omitting it would break every integration
-#                    test in `tests/`, the three benches under `benches/` and all
-#                    five fuzz targets, every one of which links this crate as an
-#                    ordinary Rust dependency.
+#   * `rlib`      -> required so `zlib-rs-differential`, the `benches/` package,
+#                    the `fuzz/` package and this crate's own `tests/*.rs` can
+#                    depend on it as a normal Rust library.  Omitting it would break
+#                    all seven integration tests in `tests/`, the three criterion
+#                    suites and all five fuzz targets, every one of which links this
+#                    crate as an ordinary Rust dependency.
 [lib]
 name = "z"
 crate-type = ["cdylib", "staticlib", "rlib"]
@@ -386,23 +413,33 @@ workspace = true
 #                        ignored *and* would falsely imply local control.
 # * [[bench]]          — the repo-root `benches/checksum_bench.rs`,
 #                        `inflate_bench.rs` and `deflate_bench.rs` exist and are
-#                        attached to `zlib-rs-differential` instead, through the
-#                        three `[[bench]]` entries in that manifest.  That crate
-#                        owns the C oracle all three measure against, and this
-#                        one must not grow a dependency on it: AAP 0.6.4.1 keeps
-#                        the differential crate out of every shipped
-#                        `[dependencies]` table so that building the library
-#                        never invokes a C compiler.
+#                        declared by `benches/Cargo.toml`, an EXCLUDED package with
+#                        its own lock.  Two reasons they are not here.  criterion
+#                        0.8.2 declares `rust-version = "1.86"` and reaches
+#                        edition-2024 clap manifests, so hosting them in any
+#                        workspace member breaks the 1.80 floor AAP 0.7.1(h) sets --
+#                        `cargo +1.80 check --locked --workspace --all-targets`
+#                        fails outright.  And all three measure against the C oracle
+#                        that `zlib-rs-differential` builds, which this crate must
+#                        not depend on at all: AAP 0.6.4.1 keeps that crate out of
+#                        every shipped `[dependencies]` table so building the
+#                        library never invokes a C compiler.  The benchmark package
+#                        depends on both of them instead, which is the only place
+#                        that combination is allowed.
 # * [[bin]]            — this crate is a library only.
 # * [dev-dependencies] — still nothing to add, and now for a stronger reason than
-#                        when this list was first written: the five integration
+#                        when this list was first written: all SEVEN integration
 #                        tests are written -- `abi_layout.rs`, `symbol_parity.rs`,
-#                        `c_api_parity.rs`, `gz_memory.rs` and
-#                        `rust_api_surface.rs` -- and they need `std` and nothing
-#                        else.  `symbol_parity.rs` reaches its tools the same
-#                        way, shelling out to `nm` and `readelf` through
-#                        `std::process::Command` rather than linking a crate to
-#                        parse ELF.
+#                        `c_api_parity.rs`, `gz_memory.rs`, `gz_printf.rs`,
+#                        `write_only_window.rs` and `rust_api_surface.rs`, which
+#                        is what `cargo metadata` reports for this package -- and
+#                        they need `std` and nothing else.  `symbol_parity.rs`
+#                        reaches its tools the same way, shelling out to `nm` and
+#                        `readelf` through `std::process::Command` rather than
+#                        linking a crate to parse ELF; `gz_printf.rs` drives the
+#                        variadic `gzprintf`/`gzvprintf` through the C probe in
+#                        `csrc/`, and `write_only_window.rs` holds the one
+#                        `unsafe` slice cast outside `src/`.
 # * links              — the two files in `csrc/` are this crate's own translation
 #                        units, bundled into this crate's own archive.  Neither is
 #                        a system library another package could also claim, and

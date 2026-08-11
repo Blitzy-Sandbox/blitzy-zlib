@@ -145,6 +145,15 @@ if(ZLIB_BUILD_RUST)
     # Windows rows -- which exist because uLong is 8 bytes on LP64 and 4 on
     # LLP64 -- are not contradicted by a configure-time refusal on the very
     # platforms they cover.
+    #
+    # That claim reaches one more thing besides the copy, and it is the reason the
+    # native-static-libraries probe below writes its throwaway archive into the
+    # CMake binary directory: static-only mode also asks rustc what a Rust archive
+    # must be linked against, and an output path of /dev/null -- which an earlier
+    # revision passed -- does not exist on Windows, so the claim above would have
+    # failed at exactly the place it promises support.  A packager who cannot run
+    # rustc for the target at all supplies the answer with
+    # -DZLIB_RUST_NATIVE_STATIC_LIBS="...", which is what a cross build does.
     if(ZLIB_BUILD_SHARED
        AND (NOT UNIX
             OR APPLE
@@ -290,6 +299,13 @@ if(ZLIB_BUILD_RUST)
                     "none of this.")
         endif(NOT ZLIB_RUSTC_EXECUTABLE)
 
+        # In the CMake BINARY DIRECTORY, never in the source tree and never
+        # /dev/null.  The output path has to be somewhere rustc can really write
+        # an archive: an earlier revision passed `-o /dev/null', which works on
+        # a Unix host and fails on Windows, where there is no such file -- and
+        # static-only Rust mode is offered on every target cargo runs on, so
+        # this path is reached there.  It is removed again below, so nothing but
+        # the cached answer survives the configure.
         set(ZLIB_RUST_PROBE_DIR
             ${zlib_BINARY_DIR}/CMakeFiles/zlib-native-static-libs)
         file(MAKE_DIRECTORY ${ZLIB_RUST_PROBE_DIR})
@@ -355,6 +371,12 @@ if(ZLIB_BUILD_RUST)
         mark_as_advanced(ZLIB_RUST_NATIVE_STATIC_LIBS)
         message(
             STATUS "Rust static library needs: ${ZLIB_RUST_NATIVE_STATIC_LIBS}")
+
+        # The answer is cached; the crate and the archive it was linked from are
+        # not wanted again, and a stale probe archive beside the real one is only
+        # something for a reader to wonder about later.
+        file(REMOVE ${ZLIB_RUST_PROBE_DIR}/probe.rs
+             ${ZLIB_RUST_PROBE_DIR}/libzlib_rs_probe.a)
     endif(ZLIB_BUILD_STATIC AND NOT DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS)
 
     # CMake wants a list where rustc printed a single space-separated string.
@@ -365,120 +387,6 @@ if(ZLIB_BUILD_RUST)
                        "${ZLIB_RUST_NATIVE_STATIC_LIBS}")
         list(REMOVE_ITEM ZLIB_RUST_NATIVE_STATIC_LIBS_LIST "")
     endif(DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS)
-endif(ZLIB_BUILD_RUST)
-
-    # ------------------------------------------------------------------------
-    # The native libraries a Rust STATIC library has to be linked against
-    # ------------------------------------------------------------------------
-    #
-    # The C libz.a needs no companion libraries.  A Rust staticlib does: it
-    # carries the Rust runtime's own dependencies, and unlike a shared object --
-    # which records them in DT_NEEDED and resolves them itself -- an archive can
-    # only state them as metadata for whoever links it.  Leaving that metadata
-    # out is not a cosmetic omission: `cc -lz` happens to succeed on a glibc
-    # that folds libpthread, libdl, librt and libutil into libc and whose driver
-    # already supplies libgcc and libc, and it fails on everything else -- ld
-    # driven directly, -nodefaultlibs, a toolchain belonging to another
-    # language, an older glibc that ships those four separately, or simply a
-    # target whose set differs.
-    #
-    # rustc is the only authority on that set, so it is asked rather than
-    # guessed: `rustc --print native-static-libs` prints, for the target it is
-    # compiling for, exactly the arguments a static consumer needs and in the
-    # order that matters on some platforms.  It needs a crate to compile, so it
-    # is given an empty one in the build tree; what comes back describes the
-    # standard library and its platform dependencies, which is the whole of what
-    # this crate adds to an archive (its own two C translation units are already
-    # inside it, and it declares no other native library).  Measured on
-    # x86_64-unknown-linux-gnu: -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc.
-    #
-    # The value is a cache variable so that a packager on a target whose rustc
-    # cannot be run here -- or who wants to pin the set for a reproducible
-    # package -- can supply it with -DZLIB_RUST_NATIVE_STATIC_LIBS="...".  When
-    # it is neither supplied nor derivable, the configure fails: an installed
-    # static library whose link requirements are unknown is worse than no static
-    # library, because the failure surfaces in the consumer's build with nothing
-    # to connect it to this one.
-    #
-    # It is needed only when a static library is being built.  A shared-only
-    # Rust build never reaches this probe, so it acquires no dependency on rustc
-    # being runnable beyond what cargo already needs.
-    if(ZLIB_BUILD_STATIC AND NOT DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS)
-        get_filename_component(ZLIB_CARGO_BIN_DIR ${ZLIB_CARGO_EXECUTABLE}
-                               DIRECTORY)
-        find_program(
-            ZLIB_RUSTC_EXECUTABLE
-            NAMES rustc
-            HINTS ${ZLIB_CARGO_BIN_DIR})
-        mark_as_advanced(ZLIB_RUSTC_EXECUTABLE)
-
-        if(NOT ZLIB_RUSTC_EXECUTABLE)
-            message(
-                FATAL_ERROR
-                    "ZLIB_BUILD_RUST with ZLIB_BUILD_STATIC needs rustc to "
-                    "discover the native libraries a Rust static library must "
-                    "be linked against, and none was found on PATH beside "
-                    "${ZLIB_CARGO_EXECUTABLE}.\n"
-                    "Install a full Rust toolchain, point CMake at one with "
-                    "-DZLIB_RUSTC_EXECUTABLE=/path/to/rustc, supply the set "
-                    "yourself with -DZLIB_RUST_NATIVE_STATIC_LIBS=\"-lm -lc\" "
-                    "(the exact list `rustc --print native-static-libs` gives "
-                    "for your target), or configure with "
-                    "-DZLIB_BUILD_STATIC=OFF.")
-        endif(NOT ZLIB_RUSTC_EXECUTABLE)
-
-        set(ZLIB_RUST_NSL_DIR ${zlib_BINARY_DIR}/rust-native-static-libs)
-        file(MAKE_DIRECTORY ${ZLIB_RUST_NSL_DIR})
-        # An empty crate: rustc reports the set for the standard library it
-        # would link, which is what an archive of this crate needs on top of its
-        # own objects.  Written rather than reused so that the probe cannot be
-        # perturbed by anything in the workspace.
-        file(WRITE ${ZLIB_RUST_NSL_DIR}/probe.rs "")
-        execute_process(
-            COMMAND
-                ${ZLIB_RUSTC_EXECUTABLE} --print native-static-libs --crate-type
-                staticlib --crate-name zlib_rust_nsl_probe -o
-                ${ZLIB_RUST_NSL_DIR}/libzlib_rust_nsl_probe.a
-                ${ZLIB_RUST_NSL_DIR}/probe.rs
-            WORKING_DIRECTORY ${zlib_SOURCE_DIR}
-            RESULT_VARIABLE ZLIB_RUST_NSL_RESULT
-            OUTPUT_VARIABLE ZLIB_RUST_NSL_OUT
-            ERROR_VARIABLE ZLIB_RUST_NSL_ERR)
-
-        # rustc prints the answer to stderr as a `note:', so both streams are
-        # searched rather than assuming which one carries it.
-        string(REGEX MATCH "native-static-libs:([^\n\r]*)" ZLIB_RUST_NSL_MATCH
-                     "${ZLIB_RUST_NSL_ERR}${ZLIB_RUST_NSL_OUT}")
-
-        if(NOT ZLIB_RUST_NSL_RESULT EQUAL 0 OR NOT ZLIB_RUST_NSL_MATCH)
-            message(
-                FATAL_ERROR
-                    "`${ZLIB_RUSTC_EXECUTABLE} --print native-static-libs' did "
-                    "not report the native libraries a Rust static library "
-                    "must be linked against, so the installed libz.a would "
-                    "carry no link metadata and a static consumer would fail "
-                    "to link with nothing to connect the failure to this "
-                    "build.\n"
-                    "Exit status: ${ZLIB_RUST_NSL_RESULT}\n"
-                    "Output: ${ZLIB_RUST_NSL_OUT}${ZLIB_RUST_NSL_ERR}\n"
-                    "Supply the set yourself with "
-                    "-DZLIB_RUST_NATIVE_STATIC_LIBS=\"...\", or configure with "
-                    "-DZLIB_BUILD_STATIC=OFF.")
-        endif(NOT ZLIB_RUST_NSL_RESULT EQUAL 0 OR NOT ZLIB_RUST_NSL_MATCH)
-
-        string(STRIP "${CMAKE_MATCH_1}" ZLIB_RUST_NSL_FLAGS)
-        # A CMake list, so that it reaches INTERFACE_LINK_LIBRARIES as separate
-        # arguments; the .pc file joins it back with spaces below.
-        string(REPLACE " " ";" ZLIB_RUST_NSL_FLAGS "${ZLIB_RUST_NSL_FLAGS}")
-        set(ZLIB_RUST_NATIVE_STATIC_LIBS
-            "${ZLIB_RUST_NSL_FLAGS}"
-            CACHE STRING
-                  "Native libraries a Rust static libz.a must be linked against"
-        )
-        mark_as_advanced(ZLIB_RUST_NATIVE_STATIC_LIBS)
-        message(
-            STATUS "Rust static library needs: ${ZLIB_RUST_NATIVE_STATIC_LIBS}")
-    endif(ZLIB_BUILD_STATIC AND NOT DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS)
 endif(ZLIB_BUILD_RUST)
 
 if(NOT DEFINED CMAKE_BUILD_TYPE AND NOT IS_MULTI)
@@ -1276,9 +1184,37 @@ endif(NOT zlib_rust_cargo_status EQUAL 0)
         # references to symbols it never mentioned, from an archive it was told
         # was self-contained.  Every element begins with `-', which CMake passes
         # through as a link flag.
+        #
+        # ★ THIS IS THE ONLY PLACE THE BUILD-TREE INTERFACE IS SET, and the
+        # installed export has exactly one owner of its own further down.  An
+        # earlier revision attached the same list from three places and from two
+        # separate probes: `target_link_libraries' here, a `set_target_properties'
+        # beside the descriptor below that overwrote rather than appended, and a
+        # `set_property(APPEND)' in the install block.  Duplicated flags were the
+        # visible symptom; the real cost was that no single place owned the answer,
+        # so a change to the probe could reach one consumption channel and not the
+        # other.  One owner per channel, and the result is read back and asserted.
         if(DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS_LIST)
             target_link_libraries(
                 zlibrsstatic INTERFACE ${ZLIB_RUST_NATIVE_STATIC_LIBS_LIST})
+
+            get_target_property(ZLIB_RUST_STATIC_INTERFACE zlibrsstatic
+                               INTERFACE_LINK_LIBRARIES)
+
+            if(NOT ZLIB_RUST_STATIC_INTERFACE STREQUAL
+               "${ZLIB_RUST_NATIVE_STATIC_LIBS_LIST}")
+                message(
+                    FATAL_ERROR
+                        "ZLIB::ZLIBSTATIC's interface link libraries are\n"
+                        "    ${ZLIB_RUST_STATIC_INTERFACE}\n"
+                        "but the probe for this target says they must be exactly\n"
+                        "    ${ZLIB_RUST_NATIVE_STATIC_LIBS_LIST}\n"
+                        "Something else in this file is also writing that "
+                        "property.  There must be exactly one owner of it: a "
+                        "second writer either duplicates the flags or discards "
+                        "the probe's answer.")
+            endif(NOT ZLIB_RUST_STATIC_INTERFACE STREQUAL
+                  "${ZLIB_RUST_NATIVE_STATIC_LIBS_LIST}")
         endif(DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS_LIST)
 
         add_dependencies(zlibrsstatic zlibrust)
@@ -1289,199 +1225,105 @@ endif(NOT zlib_rust_cargo_status EQUAL 0)
         # For dynamic linking one descriptor serves both implementations: -lz
         # resolves to either library, and a shared object records its own
         # dependencies in DT_NEEDED, so nothing has to be advertised.  Static
-        # linking is where they part.  The C libz.a needs no companion
-        # libraries, which is why zlib.pc.cmakein carries no Libs.private key
-        # and why adding one there would be wrong for the C build; a Rust
-        # staticlib needs the Rust runtime's own native libraries.  One template
-        # serves both implementations, so the only correct place for a
-        # Rust-specific key is a Rust-specific file, generated here.
+        # linking is where they part: the C libz.a needs no companion libraries,
+        # while a Rust staticlib needs the Rust runtime's own native ones.
         #
-        # It is generated FROM ${ZLIB_PC}, the descriptor the C build publishes,
-        # with exactly one line added.  Every other field -- prefix, libdir,
-        # Name, Description, Version, License, Requires, Libs and Cflags --
-        # is therefore that file byte for byte and cannot drift from it, which
-        # is the property that matters: a consumer must get the same answers
-        # from both implementations everywhere they do not genuinely differ.
+        # THERE IS EXACTLY ONE PRODUCER OF THAT Libs.private KEY, AND IT IS
+        # zlib.pc.cmakein.  The template carries a single @ZLIB_PC_LIBS_PRIVATE@
+        # at the end of its Libs: line; the block above this one sets that
+        # variable to the probed set in Rust mode and to nothing in C mode, and
+        # configure_file() writes ${ZLIB_PC} from it.  So ${ZLIB_PC} ALREADY IS
+        # the Rust-mode descriptor -- there is nothing left to add here, and
+        # adding it here is precisely the defect this revision removes: a second
+        # producer that read ${ZLIB_PC}, refused to continue if it already
+        # carried the key, and then added the key itself could never succeed in
+        # the one mode it existed for.
         #
-        # It is written into the staging directory under the name pkg-config
-        # looks for, so that PKG_CONFIG_PATH pointed at the staged tree answers
-        # correctly before anything is installed.  Installing it is the one
-        # decision the Rust install block below does NOT make: two rules for
-        # <libdir>/pkgconfig/zlib.pc cannot be resolved by declaration order,
-        # for a reason recorded where the single rule that picks between them
-        # lives.
+        # What remains here is the staged COPY.  It is written into the staging
+        # directory under the name pkg-config looks for, so that
+        # PKG_CONFIG_PATH pointed at the staged tree answers correctly before
+        # anything is installed, and it is a copy rather than a second
+        # generation so that it cannot drift from the descriptor the install
+        # rule publishes.  Which of the two files is installed is decided by the
+        # single install() rule further down, not by declaration order, for the
+        # reason recorded there.
         #
         # Makefile.in's `rust-pc' target is the autotools half of this, and it
         # additionally links and runs a C consumer built from nothing but the
         # flags this descriptor answers.  That gate belongs to a build system
         # that can run tools at build time against a staged tree; what is
-        # asserted here is what can be asserted at configure time -- that the
-        # probe produced linker flags, that the C descriptor carried no private
-        # libraries of its own, and that the added key landed exactly once.
-        if(ZLIB_RUST_PC_PRIVATE_LIBS)
-            set(ZLIB_RUST_PC_LIBS "${ZLIB_RUST_PC_PRIVATE_LIBS}")
-            set(ZLIB_RUST_PC_ORIGIN
-                "the list stated in ZLIB_RUST_PC_PRIVATE_LIBS")
-        else(ZLIB_RUST_PC_PRIVATE_LIBS)
-            # An empty crate is enough: the list describes the Rust runtime that
-            # every staticlib carries, not anything specific to this one, and
-            # asking rustc directly keeps the probe independent of whether cargo
-            # has built yet.  -o /dev/null is safe here because this whole path
-            # is refused on any platform that is not ELF.
-            set(ZLIB_RUST_PC_PROBE ${zlib_BINARY_DIR}/rust-pc-probe.rs)
-            file(WRITE ${ZLIB_RUST_PC_PROBE} "")
-            execute_process(
-                COMMAND
-                    ${ZLIB_RUSTC_EXECUTABLE} --print native-static-libs
-                    --crate-type staticlib -o /dev/null ${ZLIB_RUST_PC_PROBE}
-                RESULT_VARIABLE ZLIB_RUST_PC_PROBE_RESULT
-                OUTPUT_VARIABLE ZLIB_RUST_PC_PROBE_STDOUT
-                ERROR_VARIABLE ZLIB_RUST_PC_PROBE_STDERR)
-            file(REMOVE ${ZLIB_RUST_PC_PROBE})
-
-            if(NOT ZLIB_RUST_PC_PROBE_RESULT EQUAL 0)
-                message(
-                    FATAL_ERROR
-                        "${ZLIB_RUSTC_EXECUTABLE} could not report the native "
-                        "static libraries for this target:\n"
-                        "${ZLIB_RUST_PC_PROBE_STDERR}"
-                        "State the list instead:\n"
-                        "    -DZLIB_RUST_PC_PRIVATE_LIBS=\"-lm -lpthread -lc\"")
-            endif(NOT ZLIB_RUST_PC_PROBE_RESULT EQUAL 0)
-
-            if(NOT ZLIB_RUST_PC_PROBE_STDERR MATCHES
-               "native-static-libs:([^\n]*)")
-                message(
-                    FATAL_ERROR
-                        "${ZLIB_RUSTC_EXECUTABLE} printed no "
-                        "native-static-libs note, so nothing can be "
-                        "advertised.  A silently empty Libs.private is the "
-                        "defect this descriptor exists to prevent, so this is "
-                        "a hard failure rather than an empty key.  Output "
-                        "was:\n${ZLIB_RUST_PC_PROBE_STDERR}")
-            endif(NOT ZLIB_RUST_PC_PROBE_STDERR MATCHES
-                  "native-static-libs:([^\n]*)")
-
-            string(STRIP "${CMAKE_MATCH_1}" ZLIB_RUST_PC_LIBS)
-            set(ZLIB_RUST_PC_ORIGIN
-                "${ZLIB_RUSTC_EXECUTABLE} --print native-static-libs")
-        endif(ZLIB_RUST_PC_PRIVATE_LIBS)
-
-        # Every token has to be a library flag.  Without this a probe whose
-        # output shape changed would put prose into the descriptor, and the
-        # first thing to notice would be a consumer's link line.
-        #
-        # Two normalisations come first, and both are about the value arriving
-        # as a CMake list.  -DZLIB_RUST_PC_PRIVATE_LIBS="-lm;-lpthread" is a
-        # perfectly ordinary way to pass one, and pkg-config reads a flag line
-        # rather than a list, so the separator becomes a space -- without this
-        # the descriptor would advertise a single unresolvable -lm;-lpthread.
-        # Runs of whitespace are then collapsed, so that the split below cannot
-        # manufacture an empty element and report it as an unrecognised flag.
-        string(REPLACE ";" " " ZLIB_RUST_PC_LIBS "${ZLIB_RUST_PC_LIBS}")
-        string(REGEX REPLACE "[ \t]+" " " ZLIB_RUST_PC_LIBS
-                             "${ZLIB_RUST_PC_LIBS}")
-        string(STRIP "${ZLIB_RUST_PC_LIBS}" ZLIB_RUST_PC_LIBS)
-        string(REPLACE " " ";" ZLIB_RUST_PC_LIB_LIST "${ZLIB_RUST_PC_LIBS}")
-
-        if(NOT ZLIB_RUST_PC_LIB_LIST)
-            message(
-                FATAL_ERROR
-                    "The native static library list for this target came back "
-                    "empty, from ${ZLIB_RUST_PC_ORIGIN}.")
-        endif(NOT ZLIB_RUST_PC_LIB_LIST)
-
-        foreach(flag IN LISTS ZLIB_RUST_PC_LIB_LIST)
-            if(NOT flag MATCHES "^-[lL]")
-                message(
-                    FATAL_ERROR
-                        "\"${flag}\" is not a linker library flag, and it "
-                        "came from ${ZLIB_RUST_PC_ORIGIN} as part of\n"
-                        "    ${ZLIB_RUST_PC_LIBS}\n"
-                        "Refusing to advertise it in Libs.private.")
-            endif(NOT flag MATCHES "^-[lL]")
-        endforeach(flag IN LISTS ZLIB_RUST_PC_LIB_LIST)
-
-        file(READ ${ZLIB_PC} ZLIB_RUST_PC_BASE)
-
-        if(ZLIB_RUST_PC_BASE MATCHES "(^|\n)Libs\\.private:")
-            message(
-                FATAL_ERROR
-                    "${ZLIB_PC} already carries a Libs.private key.  It must "
-                    "not: the C libz.a needs no companion libraries, and this "
-                    "file adds that key for the Rust archive only.")
-        endif(ZLIB_RUST_PC_BASE MATCHES "(^|\n)Libs\\.private:")
-
-        string(REGEX REPLACE "(\nLibs:[^\n]*\n)"
-                             "\\1Libs.private: ${ZLIB_RUST_PC_LIBS}\n"
-                             ZLIB_RUST_PC_BODY "${ZLIB_RUST_PC_BASE}")
-        string(REGEX MATCHALL "(^|\n)Libs\\.private: " ZLIB_RUST_PC_ADDED
-                              "${ZLIB_RUST_PC_BODY}")
-        list(LENGTH ZLIB_RUST_PC_ADDED ZLIB_RUST_PC_ADDED_COUNT)
-
-        if(NOT ZLIB_RUST_PC_ADDED_COUNT EQUAL 1)
-            message(
-                FATAL_ERROR
-                    "Adding Libs.private to ${ZLIB_PC} produced "
-                    "${ZLIB_RUST_PC_ADDED_COUNT} such keys instead of one.  "
-                    "pkg-config reads the first and ignores the rest, so the "
-                    "descriptor would not say what it appears to say.  Check "
-                    "that zlib.pc.cmakein still carries exactly one Libs: "
-                    "line beginning in column 0.")
-        endif(NOT ZLIB_RUST_PC_ADDED_COUNT EQUAL 1)
-
+        # asserted at configure time is what can be asserted here -- that the
+        # descriptor really does carry one non-empty private link line and still
+        # advertises -lz, which is what test/check_pc_private.cmake checks again
+        # on the INSTALLED file.
         set(ZLIB_RUST_PC ${ZLIB_RUST_DROPIN_DIR}/zlib.pc)
+
+        file(READ ${ZLIB_PC} ZLIB_RUST_PC_BODY)
+
+        # One key, non-empty, and the public -lz line intact.  A gate on the
+        # generated descriptor rather than on the variable that fed it, because
+        # the template is what decides where the substitution lands: a stray
+        # second occurrence of the name, or a Libs: line that stopped beginning
+        # in column 0, is invisible in the variable and obvious here.
+        string(REGEX MATCHALL "(^|\n)Libs\\.private:[ \t]*[^\n]*"
+                     ZLIB_RUST_PC_PRIVATE_KEYS "${ZLIB_RUST_PC_BODY}")
+        list(LENGTH ZLIB_RUST_PC_PRIVATE_KEYS ZLIB_RUST_PC_PRIVATE_COUNT)
+
+        if(NOT ZLIB_RUST_PC_PRIVATE_COUNT EQUAL 1)
+            message(
+                FATAL_ERROR
+                    "${ZLIB_PC} carries ${ZLIB_RUST_PC_PRIVATE_COUNT} "
+                    "Libs.private keys; a Rust static build must publish "
+                    "exactly one, carrying "
+                    "${ZLIB_RUST_NATIVE_STATIC_LIBS}.  pkg-config reads the "
+                    "first and ignores the rest, so a duplicate descriptor "
+                    "would not say what it appears to say.  Check that "
+                    "zlib.pc.cmakein still contains exactly one "
+                    "@-delimited private-libraries name and one Libs: line "
+                    "beginning in column 0.")
+        endif(NOT ZLIB_RUST_PC_PRIVATE_COUNT EQUAL 1)
+
+        if(NOT ZLIB_RUST_PC_BODY MATCHES "(^|\n)Libs\\.private:[ \t]*[^ \t\n]")
+            message(
+                FATAL_ERROR
+                    "${ZLIB_PC} carries an empty Libs.private key.  An empty "
+                    "value satisfies a presence test while telling a static "
+                    "consumer nothing, which is the defect this key exists to "
+                    "remove.")
+        endif(NOT ZLIB_RUST_PC_BODY MATCHES "(^|\n)Libs\\.private:[ \t]*[^ \t\n]")
+
+        if(NOT ZLIB_RUST_PC_BODY MATCHES "(^|\n)Libs:[^\n]*-lz")
+            message(
+                FATAL_ERROR
+                    "${ZLIB_PC} no longer advertises `Libs: ... -lz'.  That is "
+                    "part of the drop-in contract: a consumer's link command "
+                    "must not have to change because the implementation did.")
+        endif(NOT ZLIB_RUST_PC_BODY MATCHES "(^|\n)Libs:[^\n]*-lz")
+
         file(
             WRITE ${ZLIB_RUST_PC}
             "# GENERATED FILE -- do not edit.  CMake rewrites it on every"
             " configure.\n"
             "#\n"
-            "# This descriptor describes the STAGED RUST LIBRARY in this"
-            " directory, not\n"
-            "# the C one.  It is ${ZLIB_PC} with exactly one line added:\n"
-            "# Libs.private, carrying the native libraries a Rust staticlib"
-            " needs on\n"
-            "# this target.  Everything else is that file byte for byte,"
-            " because dynamic\n"
-            "# consumption of the two implementations is identical and only"
-            " static\n"
-            "# consumption differs.\n"
+            "# This is ${ZLIB_PC}, copied beside the STAGED RUST LIBRARY in"
+            " this directory\n"
+            "# so that PKG_CONFIG_PATH pointed here answers before anything is"
+            " installed.\n"
+            "# It is a copy and not a second generation, so the two cannot"
+            " disagree.\n"
             "#\n"
-            "# The list came from ${ZLIB_RUST_PC_ORIGIN} and is"
+            "# Its Libs.private line carries the native libraries a Rust"
+            " staticlib needs on\n"
+            "# this target, from `rustc --print native-static-libs', and is"
             " TARGET-SPECIFIC.\n"
             "# Do not copy it to another target: derive it there.\n"
             "#\n"
-            "# `cmake --install' installs this file over the C zlib.pc, from a"
-            " rule\n"
-            "# declared alongside the ones that install the Rust libraries, so"
-            " that the\n"
-            "# descriptor and the library a consumer finds are the same"
-            " implementation.\n")
+            "# `cmake --install' installs one descriptor at"
+            " <libdir>/pkgconfig/zlib.pc, chosen\n"
+            "# by the single rule declared with the Rust install rules, so the"
+            " descriptor and\n"
+            "# the library a consumer finds are the same implementation.\n")
         file(APPEND ${ZLIB_RUST_PC} "${ZLIB_RUST_PC_BODY}")
-
-        # The same list, through the other consumption channel.  Libs.private
-        # answers `pkg-config --static'; a CMake consumer never reads it, and
-        # writes target_link_libraries(app ZLIB::ZLIBSTATIC) instead.  Linking
-        # an archive that needs seven native libraries through an interface that
-        # names none is the same defect in a second place, so the interface
-        # names them.
-        #
-        # It is set on BOTH static targets, and for different reasons.  On
-        # zlibrsstatic it serves this build tree: ZLIB::ZLIBSTATIC aliases it,
-        # so test/ and contrib/ get the flags.  On the C zlibstatic it serves
-        # the INSTALLED package: install(EXPORT) writes that target's interface
-        # into ZLIB-static.cmake, and the libz.a a consumer of the installed
-        # package finds at that location is the Rust archive, because the Rust
-        # install rule publishes it over the C one.  Describing it with the C
-        # library's requirements -- none -- is what would be wrong.  Only raw
-        # link flags go in, never a target name, so the exported file stays
-        # self-contained.
-        set_target_properties(
-            zlibrsstatic PROPERTIES INTERFACE_LINK_LIBRARIES
-                                    "${ZLIB_RUST_PC_LIB_LIST}")
-        set_target_properties(
-            zlibstatic PROPERTIES INTERFACE_LINK_LIBRARIES
-                                  "${ZLIB_RUST_PC_LIB_LIST}")
         # ------------------------------------------------------------------
     endif(ZLIB_BUILD_STATIC)
 endif(ZLIB_BUILD_RUST)
@@ -1720,12 +1562,37 @@ endif(CMAKE_INSTALL_DO_STRIP
             # is appended only in Rust mode, so a C-mode package keeps
             # advertising an archive that stands alone, which is the truth
             # there.
+            #
+            # ★ THIS IS THE ONLY OWNER OF THE INSTALLED EXPORT'S COPY, exactly as
+            # the build-tree target above owns its own.  The C target carries no
+            # interface link libraries of its own, so the append lands on an empty
+            # property and the result is asserted to be precisely the probed set --
+            # a second writer anywhere would show up here as a duplicate.
             if(DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS_LIST)
                 set_property(
                     TARGET zlibstatic
                     APPEND
                     PROPERTY INTERFACE_LINK_LIBRARIES
                              ${ZLIB_RUST_NATIVE_STATIC_LIBS_LIST})
+
+                get_target_property(ZLIB_C_STATIC_INTERFACE zlibstatic
+                                   INTERFACE_LINK_LIBRARIES)
+
+                if(NOT ZLIB_C_STATIC_INTERFACE STREQUAL
+                   "${ZLIB_RUST_NATIVE_STATIC_LIBS_LIST}")
+                    message(
+                        FATAL_ERROR
+                            "the interface link libraries exported for the "
+                            "installed static package are\n"
+                            "    ${ZLIB_C_STATIC_INTERFACE}\n"
+                            "but the probe for this target says they must be "
+                            "exactly\n"
+                            "    ${ZLIB_RUST_NATIVE_STATIC_LIBS_LIST}\n"
+                            "ZLIB-static.cmake carries this property verbatim, "
+                            "so a duplicated or foreign entry becomes a "
+                            "consumer's link line.")
+                endif(NOT ZLIB_C_STATIC_INTERFACE STREQUAL
+                      "${ZLIB_RUST_NATIVE_STATIC_LIBS_LIST}")
             endif(DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS_LIST)
         endif(ZLIB_BUILD_STATIC)
     endif(ZLIB_BUILD_RUST)

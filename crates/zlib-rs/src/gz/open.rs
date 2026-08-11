@@ -126,6 +126,9 @@
 //! * **FORCED, UNRESOLVED** -- reproducing C exactly would require `unsafe` or would reproduce a
 //!   memory-safety defect. The difference stands and is recorded as unresolved.
 //! * **COSMETIC** -- affects human-readable text only, and no documented value.
+//! * **CLOSED** -- the difference was a defect in this port rather than a constraint, and it has
+//!   been removed. The entry stays on the list so that any claim previously qualified against it can
+//!   be re-read, and so that the reason it was mis-filed as forced is on the record.
 //!
 //! ## Divergences owned by this file
 //!
@@ -188,14 +191,25 @@
 //!    non-blocking stall the next call derives an underflowing length from it and writes out of
 //!    bounds. See `gz/write.rs`, `gz_write`.
 //!
-//! 9. **`gz_fetch` publishes the output cursor and count together.** *(FORCED, UNRESOLVED -- it
-//!    avoids a C defect.)* C can leave a non-zero `x.have` paired with a stale `x.next`, so the
-//!    application receives bytes from the wrong place. See `gz/read.rs`, `gz_fetch`.
+//! 9. **`gz_fetch`'s failing transparent read.** *(CLOSED -- it was a defect in this port, not a
+//!    forced difference.)* This entry used to claim that C can leave a non-zero `x.have` paired with
+//!    a stale `x.next`, and that publishing cursor and count together therefore avoided a C defect.
+//!    That reading of `gzread.c` L260-L263 was wrong, and the line that settles it is in `gz_error`:
+//!    *"if fatal, set `state->x.have` to 0 so that the `gzgetc()` macro fails"* (`gzlib.c`
+//!    L563-L565), which every failing exit from `gz_load` passes through. C's reachable states are
+//!    therefore only two -- publish cursor and count together on success, or leave the count at zero
+//!    and the cursor untouched on failure -- and a non-blocking stall that already has bytes in hand
+//!    is a SUCCESS (`gzread.c` L36-L40) rather than a third case. What this port actually did was
+//!    publish `(0, count)` BEFORE checking the result, which resurrected a count C had discarded and
+//!    handed the application bytes from a failing read. The publication now follows the check, so
+//!    the state after a failure is C's exactly. See `gz/read.rs`, `gz_fetch`.
 //!
-//! Items 7-9 are cases where matching C exactly would mean reproducing an out-of-bounds access or
-//! a read of uninitialised memory. They are therefore not going to be "fixed" by aligning with C;
-//! they are recorded as differences so that no blanket claim of exact behavioural equivalence is
-//! made on their behalf.
+//! Items 7 and 8 are cases where matching C exactly would mean reproducing an out-of-bounds WRITE or
+//! a read of uninitialised memory into a caller's stream. They are therefore not going to be "fixed"
+//! by aligning with C; they are recorded as differences so that no blanket claim of exact
+//! behavioural equivalence is made on their behalf. Item 9 was on that list and is not any more --
+//! which is worth stating plainly, because it was listed as forced on the strength of an incorrect
+//! reading of the reference rather than of a real constraint.
 //!
 //! # What this module expects of the crate root
 //!
@@ -1581,7 +1595,6 @@ mod tests {
     use alloc::string::String;
     use alloc::vec::Vec;
     use core::cell::Cell;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A [`GzHandle`] that records what was asked of it and answers with canned results.
     ///
@@ -1654,25 +1667,89 @@ mod tests {
         }
     }
 
-    /// A unique path under the system temporary directory.
+    /// A path inside a freshly created private directory under the system temporary directory.
     ///
     /// Built by hand rather than with a crate: `zlib-rs` has no dependencies and no
-    /// dev-dependencies, by design (AAP §0.7.1 (i)), so `tempfile` is unavailable. The process id
-    /// separates concurrent test binaries and the counter separates tests within one binary.
+    /// dev-dependencies, by design (AAP §0.7.1 (i)), so `tempfile` is unavailable.
+    ///
+    /// # The directory carries the security property, not the file name
+    ///
+    /// Several tests below open the returned path for writing, and this crate's own opener composes
+    /// `O_CREAT | O_TRUNC` without `O_EXCL` for a `"wb"` mode, exactly as `gzlib.c` L228-L244 does. A
+    /// name built from the process id and a counter is *unique* but not *unpredictable*: a process id
+    /// is visible in `/proc`, drawn from a small space and reused, so another user on the machine can
+    /// plant a symlink at the name a test is about to create and the truncating open follows it. The
+    /// previous `remove` call some of these tests made before opening widened that window rather than
+    /// closing it. So the directory is created:
+    ///
+    /// * **Unguessable** -- 128 bits from two OS-seeded [`RandomState`](std::hash::RandomState)
+    ///   draws, which also removes the counter: two draws cannot collide the way two counters in
+    ///   different modules can.
+    /// * **Owner-only in the same syscall that creates it** -- `mode(0o700)` on the
+    ///   [`DirBuilder`](std::fs::DirBuilder), not a create followed by a `chmod`.
+    /// * **Exclusively** -- `create` is the non-recursive form, so an occupied name is refused with
+    ///   [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) rather than adopted. Nothing here
+    ///   removes a path it did not itself create, so a planted entry is refused, never deleted.
+    ///
+    /// A fresh empty directory is also why the tests no longer clear the path before using it: there
+    /// is nothing there to clear, and [`a_missing_file_reports_the_os_error`] gets its precondition by
+    /// construction rather than by a best-effort delete.
+    ///
+    /// Panics if the temporary directory cannot be written, which is an environment failure rather
+    /// than a library one.
     fn temp_path(tag: &str) -> String {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "blitzy_zlib_rs_gz_open_{}_{tag}_{unique}",
-            std::process::id()
-        ));
-        path.to_string_lossy().into_owned()
+        use std::hash::{BuildHasher, RandomState};
+        #[cfg(unix)]
+        use std::os::unix::fs::DirBuilderExt;
+
+        /// How many unguessable names to try before giving up. A collision means another process
+        /// holds that exact 128-bit name; the bound keeps a directory that refuses every create from
+        /// spinning.
+        const ATTEMPTS: usize = 16;
+
+        let base = std::env::temp_dir();
+        for _ in 0..ATTEMPTS {
+            let high = u128::from(RandomState::new().hash_one(0_u64));
+            let low = u128::from(RandomState::new().hash_one(u64::MAX));
+            let dir = base.join(format!(
+                "blitzy_zlib_rs_gz_open_{:032x}",
+                (high << 64) | low
+            ));
+
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            builder.mode(0o700);
+
+            match builder.create(&dir) {
+                Ok(()) => return dir.join(tag).to_string_lossy().into_owned(),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!(
+                    "cannot create a private scratch directory under {}: {error}",
+                    base.display()
+                ),
+            }
+        }
+        panic!(
+            "{ATTEMPTS} unguessable names under {} were all taken",
+            base.display()
+        )
     }
 
-    /// Best-effort cleanup; a leftover file must never fail a test.
+    /// Best-effort cleanup of the private directory [`temp_path`] created, contents included.
+    ///
+    /// The whole tree rather than the one file, because the directory is what has to go: leaving it
+    /// behind would accumulate empty directories in the shared temporary directory across runs. It is
+    /// only ever called on a directory this process created, and a leftover tree must never fail a
+    /// test, so the result is discarded.
+    ///
+    /// Call it at the **end** of a test, never before the path is used: it removes the directory the
+    /// path lives in, so a test that called it first would then be opening a file in a directory that
+    /// no longer exists.
     fn remove(path: &str) {
-        let _ = std::fs::remove_file(path);
+        if let Some(dir) = std::path::Path::new(path).parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// Writes every byte, looping over short writes exactly as `gz_comp` does.
@@ -2117,7 +2194,6 @@ mod tests {
     )]
     fn a_file_written_by_path_reads_back() {
         let path = temp_path("round_trip");
-        remove(&path);
 
         let mut writer =
             gzopen(path.as_bytes(), b"wb", GlobalAllocator).expect("wb must open a new file");
@@ -2202,11 +2278,15 @@ mod tests {
         ignore = "filesystem access is unavailable under Miri's isolation"
     )]
     fn a_missing_file_reports_the_os_error() {
+        // The path is inside a directory this call just created empty, so "nonexistent" is a fact
+        // rather than a hope -- where the `remove` this test used to make first was best effort.
         let path = temp_path("missing");
-        remove(&path);
 
         let error = gz_open(path.as_bytes(), b"rb", GlobalAllocator)
             .expect_err("reading a nonexistent file must fail");
+        // Cleaned up before the assertions, because nothing below needs the path and an unwinding
+        // assertion would otherwise leave the private directory behind.
+        remove(&path);
         match error {
             GzOpenError::Io(io) => {
                 assert_ne!(io.errno, 0, "the platform error number is preserved");
@@ -2225,7 +2305,6 @@ mod tests {
     )]
     fn exclusive_create_refuses_an_existing_file() {
         let path = temp_path("exclusive");
-        remove(&path);
 
         let first = gzopen(path.as_bytes(), b"wbx", GlobalAllocator)
             .expect("the first exclusive create must succeed");
@@ -2330,7 +2409,6 @@ mod tests {
     )]
     fn file_handle_close_is_idempotent() {
         let path = temp_path("close");
-        remove(&path);
 
         let mut slot = {
             let state = gzopen(path.as_bytes(), b"wb", GlobalAllocator).expect("wb must open");
@@ -2497,7 +2575,6 @@ mod tests {
     #[cfg_attr(miri, ignore = "opens a real file")]
     fn opening_by_path_stores_the_handle_inline() {
         let path = temp_path("inline");
-        remove(&path);
 
         let state = gzopen(path.as_bytes(), b"wb", GlobalAllocator).expect("wb must open");
         let shape = format!("{state:?}");
@@ -2781,7 +2858,6 @@ mod tests {
     #[cfg_attr(miri, ignore = "opens a real file")]
     fn gzopen_and_gz_open_with_the_default_opener_agree() {
         let path = temp_path("agree");
-        remove(&path);
 
         {
             let mut direct = gzopen(path.as_bytes(), b"wb", GlobalAllocator).expect("wb opens");

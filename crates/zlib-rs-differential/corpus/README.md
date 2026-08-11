@@ -28,7 +28,8 @@ three benchmarks — and only two of them ever look at tier 2:
 
 All three benches are attached to this crate by `[[bench]]` entries in
 [`../Cargo.toml`](../Cargo.toml) with an explicit `path` back to `benches/`, so
-`cargo bench -p zlib-rs-differential` builds and runs them. The tier-2 path contract below is
+`cargo bench --manifest-path benches/Cargo.toml` builds and runs them. The tier-2 path contract
+below is
 therefore a description of what the two Silesia consumers **do**, verified by running them,
 rather than a specification something might later be written against.
 
@@ -40,7 +41,7 @@ contract, and every consumer is written to conform to it.
 ```
 corpus/
 ├── README.md            this file — the published contract
-├── fetch_silesia.sh     opt-in, manual, never run by cargo test or CI
+├── fetch_silesia.sh     opt-in; fetches only when a human runs it, never from CI
 └── minimal/             the ten committed fixtures
 ```
 
@@ -291,8 +292,10 @@ All ten fixtures above are checked against the current rules and none is matched
 Silesia is to be used **only** for performance measurement, by
 [`benches/deflate_bench.rs`](../../../benches/deflate_bench.rs) and
 [`benches/inflate_bench.rs`](../../../benches/inflate_bench.rs) at the repository root, which
-are attached to this crate by the `[[bench]]` entries in [`../Cargo.toml`](../Cargo.toml).
-Both read the corpus through the contract below and neither downloads anything.
+are hosted by the `[[bench]]` entries of [`benches/Cargo.toml`](../../../benches/Cargo.toml)
+— an excluded package that depends on this crate, so that criterion's own MSRV cannot raise
+the workspace's. Both read the corpus through the contract below and neither downloads
+anything.
 
 ### Resolution order — one canonical rule
 
@@ -312,29 +315,35 @@ from the history.
 
 Absence is normal for a **developer's** run and unacceptable for a **deciding** one, and the
 benches distinguish the two explicitly rather than leaving it to whoever reads the log.
-`ZLIB_RS_BENCH_ACCEPTANCE=1` selects the second:
+`ZLIB_RS_SILESIA_REQUIRED=1` selects the second:
 
-| | Exploratory (the default) | Acceptance (`ZLIB_RS_BENCH_ACCEPTANCE=1`) |
+| | Exploratory (the default) | Required (`ZLIB_RS_SILESIA_REQUIRED=1`) |
 | --- | --- | --- |
-| Corpus absent | one note naming this script; the tier-2 groups publish `cases=0 required=0` and the run exits zero | every one of the twelve members becomes a counted `MISSING` required case, `required != satisfied`, and the CI gate fails |
-| Member below the 1 MiB floor | measured, labelled | `REFUSING`, and a failed required case |
-| Some other directory's files | measured with `salvaged=1` and a note that the numbers are local signal only, bounded to 4096 entries and 64 MiB per file | refused outright |
-| `ZLIB_RS_SILESIA_MANIFEST` set | honoured; a size or CRC-32 mismatch is refused | honoured; a mismatch is refused |
-| Identity evidence | `CORPUS member=<name> bytes=<n> crc32=<hex>` per member, the CRC taken through the reference's own `crc32` | the same, and all twelve are required |
+| Corpus absent | one note naming this script; the tier-2 groups publish `expected=0 cases=0` and the run exits zero | the bench **panics** and the run fails |
+| Some of the twelve present | measured over those, `verdict=incomplete` | refused: a number measured over part of the corpus is not the AAP §0.8.4 number |
+| Some other directory's files | measured over the first twelve, sorted, `verdict=salvaged` and a note that it is not the pinned inventory | refused outright |
+| Identity evidence | one `SILESIA verdict=<v> found=<n> of=12 required=no dir=<path>` line per suite | the same line with `required=yes`, and `verdict` must be `complete` |
 | Downloads | none | none |
 
-**Neither mode downloads anything, ever.** Acceptance mode does not fetch the corpus; it
-*requires that the corpus is already there*, which is why the CI job that uses it
-(`bench-silesia` in [`../../../.github/workflows/rust.yml`](../../../.github/workflows/rust.yml))
-runs only when the repository variable `ZLIB_RS_SILESIA_DIR` names a directory a runner
-already has. On a public network-free runner that job is skipped, and the ordinary benchmark
-gate says so in its own output rather than letting a minimal-corpus run stand in for the
-AAP §0.8.4 Silesia measurement.
+**Neither mode downloads anything, ever.** Required mode does not fetch the corpus; it
+*requires that the corpus is already there*. The `bench` job of
+[`../../../.github/workflows/rust.yml`](../../../.github/workflows/rust.yml) arms it only when
+the repository variable `ZLIB_RS_SILESIA_SHA256` pins a digest, and even then the corpus has
+to have been provisioned **from outside the workflow** — by a cache entry keyed on that
+digest, or by a self-hosted runner that already holds it and exports `ZLIB_RS_SILESIA_DIR`.
+The workflow's only invocation of `fetch_silesia.sh` is `--verify-only`, which fetches nothing
+and writes nothing; when the pin is set and no corpus turns up, the job **fails** rather than
+downloading one, and when the pin is unset the job says so with a `::warning::` instead of
+letting a minimal-corpus run stand in silently for the AAP §0.8.4 Silesia measurement.
+
+That the job proves its armed mode really refuses is not left to inspection either: every run,
+armed or not, executes a network-free negative test that arms the benches against an empty
+directory and requires them to fail.
 
 So: a developer running `cargo bench` without having fetched anything gets a clear "Silesia
 not present" message and a zero exit status. Correctness is measured on tier 1 and does not
 depend on tier 2 in any way. What tier 2 decides is throughput, and that decision is only
-taken by a run that declares itself an acceptance run.
+taken by a run that has been armed.
 
 ### The two measurement profiles
 
@@ -347,8 +356,10 @@ gives the oracle its `c_` prefix, cannot rename symbols inside the `.gnu.lto_*` 
 equalised on the Rust side. Measure twice:
 
 ```sh
-ZLIB_RS_BENCH_RUST_PROFILE=bench        cargo bench --locked -p zlib-rs-differential --profile bench
-ZLIB_RS_BENCH_RUST_PROFILE=bench-parity cargo bench --locked -p zlib-rs-differential --profile bench-parity
+ZLIB_RS_BENCH_RUST_PROFILE=bench \
+    cargo bench --locked --manifest-path benches/Cargo.toml --profile bench
+ZLIB_RS_BENCH_RUST_PROFILE=bench-parity \
+    cargo bench --locked --manifest-path benches/Cargo.toml --profile bench-parity
 ```
 
 `bench-parity` is `bench` with LTO off and codegen units uncollapsed. Every summary line
@@ -362,17 +373,19 @@ formality: two cases pass under fat LTO and fail without it.
 **`fetch_silesia.sh` is invoked by a human, deliberately, and by nothing else.**
 
 - It is **never** invoked by `cargo test`.
-- It is **never** invoked by CI.
-- It is referenced from no `build.rs` and from no file under `tests/`. The one workflow that
-  mentions it at all, `rust.yml`, names it in prose so that a human reading a skipped
-  `bench-silesia` job knows what to run; no step in any workflow executes it, and the
-  acceptance job requires a directory that is already provisioned rather than creating one.
+- It **never fetches from CI.** `rust.yml`'s `bench` job invokes it in exactly one mode,
+  `--verify-only`, which in the script's own words "fetches nothing and writes nothing": it
+  confirms that a corpus provisioned elsewhere carries a well-formed stamp recording the URL
+  and archive digest expected now. No workflow step ever invokes it in fetching mode, and the
+  job fails closed when the corpus it was told to expect is absent.
+- It is referenced from no `build.rs` and from no file under `tests/`.
 
 Those are not aspirations; they are the property that keeps the test suite hermetic. The
-moment any automated path calls this script, `cargo test` acquires a network dependency and
-every gate becomes contingent on a remote host. If you are adding automation and find
-yourself wanting the corpus, the answer is to make the automation skip, exactly as the
-benchmarks do.
+moment any automated path calls this script **in fetching mode**, `cargo test` acquires a
+network dependency and every gate becomes contingent on a remote host. If you are adding
+automation and find yourself wanting the corpus, the answer is to make the automation skip,
+exactly as the benchmarks do — or, if it must know whether an already-provisioned corpus is
+the pinned one, to ask with `--verify-only`.
 
 ### Prerequisites
 
@@ -527,7 +540,7 @@ ZLIB_RS_SILESIA_SHA256=<sha256> ZLIB_RS_SILESIA_DIR=/var/cache/silesia \
 
 # Then measure. The same variable is read by the benchmarks.
 ZLIB_RS_SILESIA_DIR=/var/cache/silesia \
-    cargo bench -p zlib-rs-differential
+    cargo bench --manifest-path benches/Cargo.toml
 ```
 
 `./fetch_silesia.sh --help` prints the authoritative list of options and environment

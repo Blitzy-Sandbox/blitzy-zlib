@@ -37,20 +37,33 @@
 #     cargo tree -p libz-rs-sys -e normal   # must not mention cc or this crate
 #
 # VERIFICATION POSTURE -- DO NOT "FIX" THE MIRI EXCLUSION
-# This crate sits outside BOTH sanitizer gates, and the two exclusions have different
-# causes. Miri cannot execute the compiled C oracle at all -- it interprets Rust MIR --
-# so the Miri job is scoped to the safe core (`cargo +nightly miri test -p zlib-rs`)
+# This crate is outside MIRI and INSIDE AddressSanitizer, and only the Miri half is an
+# exclusion. Miri cannot execute the compiled C oracle at all -- it interprets Rust MIR
+# -- so the Miri job is scoped to the safe core (`cargo +nightly miri test -p zlib-rs`)
 # and widening it to `--workspace` would fail for a reason that has nothing to do with
-# undefined behaviour. The nightly AddressSanitizer job is scoped to
-# `cargo +nightly test -p libz-rs-sys` plus the three relinked C drivers, which is the
-# split AAP 0.6.4.5 specifies; it does not select this crate, so neither this crate's
-# tests nor the three benches attached to it run under a sanitizer. What this crate's
-# `unsafe` gets instead is review, the `// SAFETY:` comment on every block, and the
-# fact that a mistake here fails a differential comparison loudly rather than silently.
-# Neither posture is expressible as a manifest key; both are CI job scopes, recorded
-# here so that the exclusions read as intentional rather than as oversights to be
-# "corrected" -- and stated accurately, so that nobody cites a sanitizer this crate is
-# not run under.
+# undefined behaviour.
+#
+# The nightly AddressSanitizer job DOES select this crate. Its scope, step by step, is:
+# `cargo +nightly test -p libz-rs-sys` twice (plain, then `-Zbuild-std` so that faults
+# inside `std` routines reached from the facade are attributed), an instrumented
+# `libz-rs-sys` archive that the three relinked C drivers are then linked against and
+# run, `cargo +nightly test -p zlib-rs-differential` -- this crate, oracle included --
+# and finally `cargo +nightly bench --manifest-path benches/Cargo.toml` to COMPILE the
+# criterion suites under instrumentation without measuring under it. Prose here said the
+# opposite for a while: that this crate sat outside both gates and that "the three
+# benches attached to it" ran under neither. Neither half was true, and the second was
+# doubly stale -- the benches are their own excluded package (`benches/Cargo.toml`) and
+# are attached to nothing here.
+#
+# So the `unsafe` in `src/oracle.rs` gets the sanitizer as well as review, the
+# `// SAFETY:` comment on every block, and the fact that a mistake here fails a
+# differential comparison loudly rather than silently. AAP 0.6.4.5's split -- Miri over
+# the safe core, ASan over the boundary layer -- is honoured by scoping Miri narrowly
+# and ASan widely, which is the direction that costs nothing. Neither posture is
+# expressible as a manifest key; both are CI job scopes, recorded here so that the one
+# real exclusion reads as intentional rather than as an oversight to be "corrected" --
+# and stated accurately, so that nobody cites a sanitizer this crate is not run under,
+# or overlooks one it is.
 #
 # UNSAFE (AAP 0.7.1(a))
 # No key below enables or excuses `unsafe`. All `unsafe` in this crate lives in
@@ -94,37 +107,33 @@ name = "zlib-rs-differential"
 version.workspace = true
 edition.workspace = true      # 2021 -- see rust-version
 
-# NOT `rust-version.workspace = true`, and the departure from the other two
-# members is deliberate rather than an oversight.  The benchmark suites at
-# `benches/` are attached to THIS package by the `[[bench]]` entries at the foot
-# of this file, so criterion is in this package's dev graph -- and criterion 0.8.2
-# declares `rust-version = "1.86"` and reaches clap 4.6.5, whose
-# clap_builder/clap_lex declare `edition = "2024"`, which cargo 1.80.1 cannot
-# parse at all.  A package cannot claim a 1.80 floor and then require a dev graph
-# 1.80 cannot resolve, so the floor stated here is criterion's own.  Edition stays
-# 2021: edition 2024 requires rustc >= 1.85, which 1.86 satisfies, but the
-# workspace is uniformly 2021 and there is no reason for one member to diverge.
+# ★ INHERITED, LIKE THE OTHER TWO MEMBERS, AND IT MUST STAY THAT WAY.
 #
-# This is shape 1 of the two the root `[workspace.dependencies]` criterion note
-# names as correct.  Shape 2 -- a package in the root `exclude` list with its own
-# lock, as `fuzz/` has -- is equally correct and remains available; shape 1 is used
-# because this is the one crate that builds the C oracle every suite measures
-# against, and a separate package would have to duplicate that build.
+# This package once wrote an explicit `rust-version = "1.86"` because the three
+# criterion suites at `benches/` were attached to it by `[[bench]]` entries, which
+# put criterion 0.8.2 -- floor 1.86, reaching clap 4.6.5 whose clap_builder/clap_lex
+# manifests are `edition = "2024"` -- into this package's dev graph.  Cargo 1.80
+# cannot parse an edition-2024 manifest, so the workspace's own declared floor could
+# not resolve the workspace: `cargo +1.80 metadata --locked` and `cargo +1.80 check
+# --locked --workspace --all-targets` both failed outright.
 #
-# THE SHIPPED CRATES ARE UNAFFECTED and the MSRV gate still holds, because it
-# names them explicitly rather than the workspace:
-#   cargo +1.80 check --locked -p zlib-rs -p libz-rs-sys --all-features --all-targets
-#   cargo +1.80 rustc --locked -p libz-rs-sys --all-features -- -D warnings
-# criterion reaches neither of them -- `cargo tree -p zlib-rs -e normal` and
-# `cargo tree -p libz-rs-sys -e normal` show it -- because it is a dev-dependency
-# of a crate neither of them depends on.  What this line does NOT rescue is
-# `cargo +1.80 metadata --locked` or `cargo +1.80 check --locked --workspace
-# --all-targets`: both resolve the entire workspace dev graph and therefore still
-# fail on clap's edition-2024 manifests.  That is a property of criterion, and
-# `rust-version` is a declaration rather than a resolver directive, so no manifest
-# key can change it.  Do not "fix" it by removing the criterion edge -- that would
-# delete the throughput gates of AAP §0.6.4.6.
-rust-version = "1.86"        # criterion 0.8.2's own floor -- see the note above.
+# The suites now live in their own excluded package, `benches/Cargo.toml`, with their
+# own lock and their own copy of the two measurement profiles -- the shape `fuzz/`
+# uses.  It depends on THIS crate by path, so the C oracle is built by this crate's
+# build script exactly as before and nothing is duplicated; only the bench TARGETS
+# moved.  Consequently:
+#
+#   * this package inherits the 1.80 floor of AAP §0.7.1(h) again, so all three
+#     members state one floor and `cargo +1.80 check --locked --workspace
+#     --all-targets` covers this crate too;
+#   * criterion is absent from this package's dev graph and from the root `Cargo.lock`;
+#   * the throughput and memory gates of AAP §0.6.4.6 are unchanged -- they run as
+#     `cargo bench --manifest-path benches/Cargo.toml`.
+#
+# Do NOT add a criterion dev-dependency or a `[[bench]]` entry back to this manifest.
+# Either one re-imports the 1.86 floor into a workspace that promises 1.80, which is
+# the defect the move removed.
+rust-version.workspace = true # 1.80 -- see the note above before changing this.
 license.workspace = true      # Zlib -- the SPDX id for the in-tree LICENSE, and an
                               # allowed identifier in deny.toml.
 description = "Dev-only differential harness comparing the Rust zlib implementation against the in-tree C oracle"
@@ -165,18 +174,23 @@ default = ["gz"]
 # and the `simd` form of each, which is what keeps the neutrality claim current
 # rather than a one-off observation. Two reasons the switch is declared here and not
 # only on the dependencies:
-#   1. `benches/checksum_bench.rs` compares the scalar and SIMD
-#      backends (AAP 0.4.1.5). The two-run procedure is:
-#          cargo bench -p zlib-rs-differential -- --save-baseline scalar
-#          cargo bench -p zlib-rs-differential --features simd -- --baseline scalar
-#      CI additionally runs `cargo test -p zlib-rs-differential --release --features
+#   1. The benchmark package forwards it. `benches/Cargo.toml`'s own `simd` feature
+#      expands to `zlib-rs/simd`, `libz_rs_sys/simd` AND
+#      `zlib-rs-differential/simd`, because `benches/checksum_bench.rs` compares the
+#      scalar and SIMD backends (AAP 0.4.1.5) and must reach a vectorised oracle
+#      harness rather than a scalar one. The two-run procedure is:
+#          cargo bench --manifest-path benches/Cargo.toml -- --save-baseline scalar
+#          cargo bench --manifest-path benches/Cargo.toml --features simd -- --baseline scalar
+#      Without this entry that forward would be a hard manifest error. CI
+#      additionally runs `cargo test -p zlib-rs-differential --release --features
 #      simd`, so the neutrality claim is re-established on every push rather than only
 #      when somebody remembers to pass the flag.
 #   2. Since Rust 1.80 the `unexpected_cfgs` lint validates `cfg!(feature = "...")`
-#      against the manifest of the crate being compiled. Test and bench targets are
-#      compiled as part of THIS package, so `cfg!(feature = "simd")` inside them
-#      would warn -- and therefore fail under `cargo clippy --all-targets -- -D
-#      warnings` -- unless the feature is declared here.
+#      against the manifest of the crate being compiled. This package's TEST targets
+#      are compiled as part of it, so `cfg!(feature = "simd")` inside them would warn
+#      -- and therefore fail under `cargo clippy --all-targets -- -D warnings` --
+#      unless the feature is declared here. (The bench targets are no longer this
+#      package's; `benches/Cargo.toml` declares `simd` for exactly the same reason.)
 # The reference is `libz_rs_sys/simd`, not `libz-rs-sys/simd`: feature paths name the
 # dependency by its key in this manifest, which is the rename introduced below.
 simd = ["zlib-rs/simd", "libz_rs_sys/simd"]
@@ -213,9 +227,10 @@ gz = ["libz_rs_sys/gz"]
 # here is what makes the facade nameable from `src/`.  The edge DIRECTION is
 # unchanged and is the thing that matters: this dev-only harness depends on the two
 # shipped crates, neither ever depends on it, and this crate is not a
-# `default-member`, so `cargo build` still does not reach it.  `criterion` stays a
-# dev-dependency, because only the bench targets use it and it is what pins this
-# crate's `rust-version` to 1.86.
+# `default-member`, so `cargo build` still does not reach it.  What DID move is
+# `criterion`: it was a dev-dependency here for the bench targets and it pinned this
+# crate's `rust-version` to 1.86, and both are gone -- the suites and criterion now
+# live in the excluded `benches/` package, which depends on this crate by path.
 [dependencies]
 # The safe core, for tests and benchmarks that drive the typed Rust surface directly:
 # `rust-api` exposes the typed configuration surface used to enumerate the
@@ -262,35 +277,24 @@ libz_rs_sys = { package = "libz-rs-sys", path = "../libz-rs-sys", version = "1.3
 # Third-party pins live in the root `[workspace.dependencies]` so that each version
 # is stated in exactly one place; `{ workspace = true }` inherits them. Should a root
 # entry ever be removed, fall back to the exact pin -- `zlib-rs = { path =
-# "../zlib-rs" }`, `cc = "1.4.0"` and `criterion = "0.8.2"` -- and never to a
-# wildcard: `deny.toml` sets `[bans] wildcards = "deny"`.
+# "../zlib-rs" }` and `cc = "1.4.0"` -- and never to a wildcard: `deny.toml` sets
+# `[bans] wildcards = "deny"`. criterion is deliberately NOT among them: it belongs
+# to `benches/Cargo.toml` and to no member of this workspace.
 [dev-dependencies]
 
-# The benchmark harness, for the suites the `[[bench]]` entries at the foot of this
-# file attach. It is THE dependency decision in this workspace that the declared
-# MSRV turns on, which is why the `rust-version` line above is an explicit `1.86`
-# rather than an inheritance -- read that note before touching either.
+# ★ NOTHING HERE, AND THAT IS THE POINT OF THE MOVE.
 #
-# Licensed "Apache-2.0 OR MIT", which deny.toml allows. The version is pinned once,
-# in the root `[workspace.dependencies]`, and inherited here; the note beside that
-# entry carries the full MSRV derivation. Default features are taken as published
-# (`rayon`, `plotters`, `cargo_bench_support`); `cargo_bench_support` in particular
-# is what lets `cargo bench` drive the harness at all, so do not switch to
-# `default-features = false` without restoring it.
+# This table used to carry `criterion = { workspace = true }`, for the three suites the
+# `[[bench]]` entries at the foot of this file attached. Both are gone: the suites are hosted by
+# `benches/Cargo.toml`, an excluded package with its own lock, because criterion's 1.86 floor
+# cannot sit in a workspace that promises 1.80 (the `rust-version` note above carries the
+# measurement). That package depends on THIS crate by path, so the oracle it measures against is
+# still built by the build script below -- only the bench targets moved.
 #
-# ★ USE `std::hint::black_box`, NEVER `criterion::black_box`. criterion 0.8.2 marks
-# its own re-export `#[deprecated(note = "use std::hint::black_box() instead")]`
-# (vendored `criterion-0.8.2/src/lib.rs` L164), and a deprecation warning fails
-# `cargo clippy --all-targets -- -D warnings`. `std::hint::black_box` has been
-# stable since 1.66, so it is available on every toolchain this workspace supports.
-#
-# ★ A `harness = false` bench compiles WITHOUT `--test`. So `cfg(test)` is false in
-# a bench target and its functions are not `#[test]`, which means clippy.toml's
-# `allow-unwrap-in-tests` / `allow-expect-in-tests` / `allow-panic-in-tests` do NOT
-# apply there: the workspace's denied panic family is fully in force. A bench
-# handles a missing fixture or a mismatched value by logging to stderr and skipping,
-# never by unwrapping.
-criterion = { workspace = true }
+# This crate's own tests need no dev-dependency at all: `byte_identical.rs`,
+# `roundtrip_interop.rs` and `table_equality.rs` use `std`, this crate's `oracle`/`port` modules
+# and nothing else, per AAP §0.7.1(i). Keep it that way -- an assertion helper crate here would be
+# a third-party dependency in the graph of the crate that defines the oracle.
 
 # CLIPPY IS DELIBERATELY NOT PART OF THE MSRV GATE, and this is measured rather than
 # assumed: `cargo +1.80 clippy -p zlib-rs -p libz-rs-sys --all-features
@@ -311,135 +315,40 @@ criterion = { workspace = true }
 cc = { workspace = true }
 
 # ---------------------------------------------------------------------------------
-# Benchmark suites (AAP 0.3.1, 0.4.1.5) -- DECLARED ONLY ALONGSIDE THE FILES
+# NO BENCHMARK TARGETS ARE DECLARED HERE, AND NONE MAY BE ADDED
 #
-# The suites live at the REPOSITORY ROOT in `benches/`, outside any crate, and are
-# attached here by explicit path. All three AAP 0.3.1 names are declared below:
-# `checksum_bench.rs`, `inflate_bench.rs` and `deflate_bench.rs`. An entry is added in
-# the SAME change as the file it names and never ahead of it -- a `[[bench]]` entry
-# whose `path` is absent is a hard resolution error for `--all-targets` and for
-# `cargo fmt --all` -- and the same rule governs a fourth, should one ever be added.
+# The three criterion suites at `benches/` -- `checksum_bench.rs`, `inflate_bench.rs` and
+# `deflate_bench.rs` -- were attached to this package by `[[bench]]` entries at this point in
+# the file. They are now declared by `benches/Cargo.toml`, which is their own excluded package
+# with its own committed lock and its own copy of the `bench` and `bench-parity` profiles.
 #
-# Paths are relative to THIS manifest's directory: `crates/zlib-rs-differential`
-# -> `..` -> `../..` is the repository root. `harness = false` is mandatory --
-# criterion supplies its own `main` through `criterion_main!`, so libtest's harness
-# must not also be linked.
+# WHY, in one sentence: a `[[bench]]` entry here puts criterion in this package's dev graph,
+# criterion 0.8.2 declares `rust-version = "1.86"` and reaches clap manifests written in
+# edition 2024, and cargo 1.80 -- the floor AAP §0.7.1(h) sets and the `rust-version` line
+# above declares -- cannot parse those manifests, so `cargo +1.80 metadata --locked` and
+# `cargo +1.80 check --locked --workspace --all-targets` failed for as long as they lived here.
 #
-# Do NOT create, move, or delete `benches/*.rs`: those files are owned elsewhere and
-# are only attached from here. Cargo's `bench` profile inherits the root
-# `[profile.release]`, so the suites are measured against fat-LTO, single-codegen-unit,
-# opt-level-3 code (`panic = "abort"` is ignored for bench targets, which is
-# expected and harmless).
+# WHAT DID NOT CHANGE: the suites still measure the oracle THIS crate builds, because
+# `benches/Cargo.toml` depends on this package by path and the suites still reach both
+# implementations through `zlib_rs_differential::{oracle, port}` in one process. The `simd`
+# feature of this crate is forwarded by the `simd` feature of that package for the same reason.
 #
-# A NOTE ON `CARGO_MANIFEST_DIR`, because it surprises people: for a bench target
-# it expands to the HOST PACKAGE's directory -- this one -- and not to the directory
-# the source file sits in. So a suite reads the committed corpus from
-# `<CARGO_MANIFEST_DIR>/corpus/minimal` and reaches the repository root as
-# `<CARGO_MANIFEST_DIR>/../..`, regardless of living under `benches/`.
+#     cargo bench --manifest-path benches/Cargo.toml
+#     cargo bench --manifest-path benches/Cargo.toml --bench checksum_bench --features simd
+#
+# Two facts that used to be recorded beside those entries and are still worth having, because
+# they belong to whoever edits a suite:
+#
+#   * ★ USE `std::hint::black_box`, NEVER `criterion::black_box`. criterion 0.8.2 marks its own
+#     re-export `#[deprecated(note = "use std::hint::black_box() instead")]`, and a deprecation
+#     warning fails `cargo clippy --all-targets -- -D warnings`.
+#   * ★ A `harness = false` bench compiles WITHOUT `--test`, so `cfg(test)` is false in a bench
+#     target and its functions are not `#[test]`: `clippy.toml`'s `allow-unwrap-in-tests` /
+#     `allow-expect-in-tests` / `allow-panic-in-tests` do NOT apply there and the denied panic
+#     family is fully in force. A suite handles a missing fixture by logging to stderr and
+#     skipping, never by unwrapping.
 # ---------------------------------------------------------------------------------
 
-# Adler-32 and CRC-32 throughput: the port against the in-process C oracle, and the
-# scalar backends against the `simd` ones (AAP 0.4.1.5, source `crc32.c`). The
-# scalar-versus-SIMD comparison runs in ONE binary because `crates/zlib-rs` exposes
-# `Adler32Generic` / `crc32::Generic` / `crc32::Braid` unconditionally and
-# `Adler32Simd` / `crc32::Simd` under the `simd` feature, all through the
-# `Adler32Backend` / `Crc32Backend` traits; the `simd` feature of THIS package
-# forwards to both dependencies, so:
-#
-#     cargo bench -p zlib-rs-differential --bench checksum_bench
-#     cargo bench -p zlib-rs-differential --bench checksum_bench --features simd
-#
-# and the two-run form, for comparing whole configurations rather than backends.
-# `--baseline-lenient` rather than `--baseline`, because the feature ADDS the vectorized
-# rows: `--baseline` treats a row with no counterpart in the saved baseline as a hard
-# error, while `--baseline-lenient` compares the rows that do have one and reports the
-# rest as new.
-#
-#     cargo bench -p zlib-rs-differential --bench checksum_bench -- --save-baseline scalar
-#     cargo bench -p zlib-rs-differential --bench checksum_bench --features simd -- --baseline-lenient scalar
-[[bench]]
-name = "checksum_bench"
-path = "../../benches/checksum_bench.rs"
-harness = false
-
-# Decompression throughput: the port against the in-process C oracle, enforcing the AAP 0.8.4
-# gate of "decompression throughput within 10% of C zlib" (AAP 0.4.1.5, source
-# `contrib/testzlib/testzlib.c` by way of `inflate.c` and `uncompr.c`). Six groups:
-# `inflate_steady_state` -- the group the gate is read from, since `inflateReset2` keeps the
-# window allocation and so times the decode rather than the allocator -- plus
-# `inflate_lifecycle` (init and end inside the timed region), `inflate_container` (zlib, raw and
-# gzip), `inflate_feeding` (single-shot against chunked at 32768/1024/16), `uncompress_oneshot`
-# and the opt-in `inflate_silesia`.
-#
-# The suite writes one greppable `inflate_bench: RATIO ...` line per case and one
-# `RATIO-SUMMARY` line per group to STDERR -- stdout belongs to criterion's machine-readable
-# output -- and reports rather than enforces: the pass/fail decision belongs to the criterion
-# regression job of AAP 0.4.1.6. It reads the committed tier-1 corpus and, when
-# `ZLIB_RS_SILESIA_DIR` or `<repo-root>/target/silesia` holds one, the opt-in tier-2 corpus; it
-# never fetches either, and `corpus/fetch_silesia.sh` stays referenced by no manifest, build
-# script, test or workflow.
-#
-#     cargo bench -p zlib-rs-differential --bench inflate_bench
-#     cargo bench -p zlib-rs-differential --bench inflate_bench -- --test   # one iteration each
-#
-# `--features simd` is meaningful here and not only for the checksum suite: `inflate` verifies an
-# Adler-32 or a CRC-32 over everything it produces, so the checksum backend sits on the decoder's
-# hot path -- while remaining unable to change a single emitted byte.
-[[bench]]
-name = "inflate_bench"
-path = "../../benches/inflate_bench.rs"
-harness = false
-
-# Compression throughput AND per-stream memory: the port against the in-process C oracle, enforcing
-# BOTH AAP 0.8.4 gates -- "compression throughput within 10% of C zlib" at levels 1, 6 and 9, and
-# "per-stream memory within 15% of C zlib" (AAP 0.4.1.5, source `contrib/testzlib/testzlib.c` by way
-# of `deflate.c`, `trees.c` and `compress.c`; the allocator technique from `test/infcover.c`
-# L56-L200). Twelve group functions:
-#
-#   * `deflate_steady_state` -- the group the THROUGHPUT gate is read from, since `deflateReset` keeps
-#     the window, `prev`, `head` and pending allocations and so times the encode rather than the
-#     allocator. Levels 1/6/9 are not a sample: `deflate.c`'s `configuration_table[10]` (L112-L124)
-#     puts level 1 on `deflate_fast` with `max_chain` 4 and levels 6 and 9 on `deflate_slow` with
-#     `max_chain` 128 and 4096, so the three span both algorithm families and the chain extremes.
-#   * `deflate_memory` -- the group the MEMORY gate is read from. It registers NO criterion row on
-#     purpose: it installs an instrumented `zalloc`/`zfree` pair that mirrors `test/infcover.c`'s
-#     `mem_zone`, including the `0xa5` fill at L87, and runs its nine level x memLevel encodes
-#     entirely OUTSIDE any timed region, because the counter's bookkeeping would otherwise contaminate
-#     a rate.
-#   * `deflate_lifecycle` (init and end inside the timed region), `deflate_container` (zlib, raw and
-#     gzip), `deflate_feeding` (single-shot against chunked at 32768/1024/16), `compress_oneshot`
-#     (`compress2` and `compress2_z`), and the informational `deflate_mem_level`,
-#     `deflate_strategy`, `deflate_stored_floor` (level 0), `deflate_bound` (the four bound entry
-#     points, per call) and `deflate_degenerate` (the zero- and single-byte fixtures as latency, since
-#     `Throughput::Bytes(0)` has no rate), plus the opt-in `deflate_silesia`.
-#
-# The suite writes one greppable `deflate_bench: RATIO ...` line per throughput case, one
-# `RATIO-SUMMARY` line per group, one `MEMORY ...` line per memory case, one `MEMORY-SUMMARY` line and
-# one `ALLOC-BALANCE ...` leak-check line per side per memory case -- all to STDERR, since stdout
-# belongs to criterion's machine-readable output. It reports rather than enforces: the pass/fail
-# decision belongs to the criterion regression job of AAP 0.4.1.6. It reads the committed tier-1
-# corpus and, when `ZLIB_RS_SILESIA_DIR` or `<repo-root>/target/silesia` holds one, the opt-in tier-2
-# corpus; it never fetches either, and `corpus/fetch_silesia.sh` stays referenced by no manifest,
-# build script, test or workflow.
-#
-#     cargo bench -p zlib-rs-differential --bench deflate_bench
-#     cargo bench -p zlib-rs-differential --bench deflate_bench -- --test   # one iteration each
-#
-# ★ It must never motivate an encoder change. AAP 0.7.1(c) forbids tuning `configuration_table`,
-# enabling a non-default compile-time knob (`FASTEST`, `LIT_MEM`, `UNALIGNED_OK`, `FORCE_STATIC`,
-# `FORCE_STORED`) or adopting a zlib-ng-style improvement, however much faster it would be, because
-# each changes emitted bytes and breaks the byte identity `tests/byte_identical.rs` gates. Admissible
-# optimization is output-neutral only.
-[[bench]]
-name = "deflate_bench"
-path = "../../benches/deflate_bench.rs"
-harness = false
-
-# Opt into the root `[workspace.lints]` policy: `deny(clippy::all, clippy::pedantic)`
-# plus the panic-prone lint set. This key is the ONLY mechanism by which that policy
-# reaches this crate's build script, sources, tests and attached bench targets;
-# omitting it would silently exempt the whole crate from the lint gate. Requires
-# cargo >= 1.74, which the 1.80 MSRV satisfies.
 [lints]
 workspace = true
 

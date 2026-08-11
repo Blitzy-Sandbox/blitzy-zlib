@@ -117,7 +117,9 @@
       .rustfmt.toml        formatting policy
       clippy.toml          lint thresholds
       deny.toml            cargo deny license and advisory policy
-      cbindgen.toml        C header generation, diffed against zlib.h
+      cbindgen.toml        C header generation.  Specifies the eleven-rule
+                           comparison against zlib.h, including rule A11's
+                           literal signature diff, which must be empty
 
     crates/zlib-rs         The safe core.  Carries forbid(unsafe_code) with no_std
                            plus alloc and an empty dependencies table, so it pulls
@@ -174,7 +176,9 @@
 
     fuzz/                  Dev-only cargo fuzz targets; its own workspace, excluded
                            from the root one.
-    benches/               Dev-only criterion benchmark suites.
+    benches/               Dev-only criterion benchmark suites; its own workspace,
+                           excluded from the root one because criterion's MSRV is
+                           higher than the library's.
 
     Packaging is unaffected on the ELF platforms where the Rust drop-in is staged
     at all, which is where a linker accepts soname and version-script and is
@@ -197,16 +201,23 @@
       cargo build      release profile, package libz-rs-sys, features libz-compat
       cargo test       release profile, whole workspace
       make rust        stage the installable shared and static drop-in libraries
+      make rust-pc     emit the pkg-config descriptor for the staged library and
+                       gate it by linking and running a C consumer from nothing
+                       but the flags pkg-config answers
       make rust-test   link and run the unmodified C drivers against them
       make rust-header regenerate the cbindgen header, compile it standalone in
                        four dialects, and compare the function names it declares
                        against the ones zlib.h declares, in both directions.
                        Comparing SHAPE, meaning signatures, struct layouts and
-                       macro values, belongs to the header job of
+                       macro values, and diffing a compiler resolved rendering of
+                       every contract signature with an empty diff required,
+                       belongs to the header job of
                        .github/workflows/rust.yml, which invokes this target first
       make rust-symbols diff the staged library's exported symbols against a built
                        C library; unlike make rust it fails rather than skips when
                        that library is absent
+      make rust-msrv   build and test the whole workspace on the declared 1.80
+                       floor, with warnings denied
       make rust-clean  remove the Cargo target directory and the staged artifacts
       cmake            configure with the ZLIB_BUILD_RUST option for the same
                        drop-in through CMake

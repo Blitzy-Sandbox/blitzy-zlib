@@ -103,9 +103,7 @@ use core::mem::{align_of, offset_of, size_of};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 // Everything from `zlib_rs` is imported by **module path**, never through the crate root. That is not
 // a style preference: the crate declares `default = []` and every root re-export carries
@@ -578,40 +576,101 @@ fn error_of(state: &mut GzState<'static, GlobalAllocator>) -> (i32, String) {
 // The temporary file, written from `std` alone
 // ---------------------------------------------------------------------------------------------
 
-/// A uniquely named path under the platform's temporary directory, removed when dropped.
+/// A private directory under the platform's temporary directory, and the scratch file inside it.
 ///
 /// There is no `tempfile` crate here and there cannot be one: `crates/zlib-rs` declares an empty
 /// `[dependencies]` and no `[dev-dependencies]`, and `deny.toml`'s `[bans]` section names that table
-/// as the enforcement point. So the name is built from the process id and a per-process counter --
-/// the process id keeps two concurrent `cargo test` runs apart, the counter keeps the tests inside
-/// one run apart -- and cleanup is a [`Drop`] impl, which runs on the panicking path as well as the
-/// successful one. Nothing here needs `unsafe`.
+/// as the enforcement point. So the guard is built from `std` alone, and it puts the security
+/// property on the **directory** rather than on the file name.
+///
+/// # Why not just a unique file name
+///
+/// Most cases below open their file with `gzopen(path, "wb")`, which is
+/// `open(..., O_CREAT | O_TRUNC, ...)` with no `O_EXCL` (`gzlib.c` L228-L244). A name built from the
+/// process id and a counter is unique but *not unpredictable*: a process id is visible in `/proc`,
+/// drawn from a small space and reused, so another user on the machine can plant a symlink at the
+/// name a test is about to create and the truncating open follows it -- and the `remove_file` this
+/// type used to perform before the open widened the window rather than closing it. So the directory
+/// is created:
+///
+/// * **Unguessable** -- 128 bits from two OS-seeded [`RandomState`](std::hash::RandomState) draws.
+/// * **Owner-only in the same syscall that creates it** -- `mode(0o700)` on the
+///   [`DirBuilder`](fs::DirBuilder), not a create followed by a `chmod`.
+/// * **Exclusively** -- `create` is the non-recursive form, so an occupied name is refused with
+///   [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) rather than adopted. Nothing here removes a
+///   path it did not itself create, so a planted entry is refused, never deleted.
+///
+/// A fresh empty directory also makes [`exclusive_create_fails_when_the_file_exists`] exact rather
+/// than hopeful: its "against a path that does not exist, it succeeds" half is now guaranteed by
+/// construction, where the previous `remove_file` was only best effort and a file left behind by a
+/// killed earlier run would have failed the `x` open for the wrong reason.
+///
+/// Cleanup is a [`Drop`] impl, which runs on the panicking path as well as the successful one, and
+/// removes the whole tree. Nothing here needs `unsafe`.
 struct TempPath {
-    /// The path, which may or may not exist at any moment.
+    /// The private directory. Removed, with its contents, when this value is dropped.
+    dir: PathBuf,
+    /// The path of the scratch file inside it, which may or may not exist at any moment.
     path: PathBuf,
 }
 
 impl TempPath {
-    /// Reserves a fresh path whose name contains `tag`, removing any stale file at it.
-    fn new(tag: &str) -> Self {
-        /// Distinguishes the paths reserved within one process.
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
+    /// How many unguessable names to try before giving up.
+    ///
+    /// A collision means another process holds that exact 128-bit name, which is vanishingly
+    /// unlikely; the retries keep one unlucky draw from failing the suite, and the bound keeps a
+    /// temporary directory that refuses *every* create from spinning.
+    const ATTEMPTS: usize = 16;
 
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "zlib_rs_gz_{pid}_{tag}_{unique}.gz",
-            pid = process::id()
-        ));
-        // A path left behind by a killed earlier run would make an `x` (`O_EXCL`) open fail for the
-        // wrong reason.
-        let _ = fs::remove_file(&path);
-        Self { path }
+    /// Creates a private directory and names the scratch file `<tag>.gz` inside it.
+    ///
+    /// Panics saying which step refused: this is a test, and a temporary directory that cannot be
+    /// written is an environment failure rather than a library one.
+    fn new(tag: &str) -> Self {
+        use std::hash::{BuildHasher, RandomState};
+        #[cfg(unix)]
+        use std::os::unix::fs::DirBuilderExt;
+
+        let base = std::env::temp_dir();
+        for _ in 0..Self::ATTEMPTS {
+            // Two independent OS-seeded draws, so the name carries 128 bits rather than 64.
+            let high = u128::from(RandomState::new().hash_one(0_u64));
+            let low = u128::from(RandomState::new().hash_one(u64::MAX));
+            let dir = base.join(format!("zlib_rs_gz_{:032x}", (high << 64) | low));
+
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            builder.mode(0o700);
+
+            match builder.create(&dir) {
+                Ok(()) => {
+                    let path = dir.join(format!("{tag}.gz"));
+                    return Self { dir, path };
+                }
+                // Someone holds that name. Draw another; nothing is removed.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!(
+                    "cannot create a private scratch directory under {}: {error}",
+                    base.display()
+                ),
+            }
+        }
+        panic!(
+            "{} unguessable names under {} were all taken",
+            Self::ATTEMPTS,
+            base.display()
+        )
     }
 
     /// The reserved path.
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The private directory holding it.
+    fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// The path as the bytes `gzopen` takes, which are C's `const char *`.
@@ -648,9 +707,10 @@ impl TempPath {
 
 impl Drop for TempPath {
     fn drop(&mut self) {
-        // Best effort, and deliberately silent: a test that already failed must not be reported as
-        // failing again because its scratch file had gone.
-        let _ = fs::remove_file(&self.path);
+        // Best effort, deliberately silent, and only ever on a directory this process created: a
+        // test that already failed must not be reported as failing again because its scratch tree
+        // had gone, and nothing outside can have a path into that tree.
+        let _ = fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -4191,29 +4251,80 @@ fn foreign_members_read_from_a_real_file() {
     assert_eq!(gzclose(Some(&mut file)), ReturnCode::OK);
 }
 
-/// The temporary-file guard removes its file, on the panicking path as well as the ordinary one.
+/// The temporary-file guard is private and unguessable, and removes its tree on the panicking path
+/// as well as the ordinary one.
 ///
-/// There is no `tempfile` crate available here -- see [`TempPath`] for why -- so the cleanup is this
-/// suite's own responsibility and is worth checking rather than assuming. A leaked scratch file is not
-/// merely untidy: [`exclusive_create_fails_when_the_file_exists`] would fail for the wrong reason if a
-/// previous run had left a file at the path it reserves.
+/// There is no `tempfile` crate available here -- see [`TempPath`] for why -- so both the cleanup and
+/// the security property are this suite's own responsibility and are worth checking rather than
+/// assuming. A leaked scratch tree is not merely untidy:
+/// [`exclusive_create_fails_when_the_file_exists`] would fail for the wrong reason if a previous run
+/// had left a file at the path it reserves.
 ///
-/// Both paths are asserted. The panicking one goes through [`std::panic::catch_unwind`], which is what
-/// a failing `#[test]` does, so this checks the guard under exactly the conditions that matter.
+/// Every property [`TempPath`] claims is asserted, because each can regress on its own: the
+/// directory is `0700`, an occupied name is refused rather than adopted, the file is *inside* the
+/// directory, two guards built from the same tag name two directories, and the tree goes away. The
+/// panicking path goes through [`std::panic::catch_unwind`], which is what a failing `#[test]` does,
+/// so the cleanup is checked under exactly the conditions that matter.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn the_temporary_file_guard_cleans_up() {
     // The ordinary path.
     let remembered;
+    let remembered_dir;
     {
         let path = TempPath::new("cleanup");
+
+        // The file is inside the private directory, and the directory is empty until this suite puts
+        // something in it -- which is what leaves a `"wb"` open nothing to follow.
+        assert_eq!(path.path().parent(), Some(path.dir()));
+        assert_eq!(
+            fs::read_dir(path.dir())
+                .expect("the private directory must be readable")
+                .count(),
+            0
+        );
+
+        // `symlink_metadata`, so the assertion is about the entry itself rather than about whatever
+        // a link at that path might resolve to.
+        let meta = fs::symlink_metadata(path.dir()).expect("the private directory must exist");
+        assert!(meta.is_dir());
+
+        // Owner-only, set by the syscall that created the directory rather than by a later `chmod`
+        // that would leave a window open.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o700,
+                "the directory must be traversable by its owner alone"
+            );
+        }
+
+        // Exclusive creation is what makes a planted entry harmless: the guard draws another name
+        // rather than deleting what it found, so an occupied name has to be refused.
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(false);
+        assert_eq!(
+            builder
+                .create(path.dir())
+                .expect_err("a non-recursive create at an existing path must fail")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+
         path.write(b"scratch");
         assert!(path.exists());
         remembered = path.path().to_path_buf();
+        remembered_dir = path.dir().to_path_buf();
     }
     assert!(
         !remembered.exists(),
         "the guard must remove its file when it goes out of scope"
+    );
+    assert!(
+        !remembered_dir.exists(),
+        "and the private directory with it, so nothing accumulates across runs"
     );
 
     // The panicking path.
@@ -4232,13 +4343,20 @@ fn the_temporary_file_guard_cleans_up() {
         "the guard must remove its file while the stack unwinds, which is what a failing test does"
     );
 
-    // Two guards reserved in the same process never collide.
+    // Two guards reserved from the same tag never collide, because each draws its own unguessable
+    // directory: that is what keeps two concurrent `cargo test` runs -- and the relinked C drivers
+    // in the same tree -- off each other's files without relying on a process id.
     let first = TempPath::new("unique");
     let second = TempPath::new("unique");
     assert_ne!(
+        first.dir(),
+        second.dir(),
+        "each guard must own its own private directory"
+    );
+    assert_ne!(
         first.path(),
         second.path(),
-        "the per-process counter must keep concurrent reservations apart"
+        "and therefore its own scratch file"
     );
 }
 

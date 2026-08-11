@@ -1,0 +1,134 @@
+# cargo-deny policy for the benchmark harness graph.
+#
+# WHY THIS FILE EXISTS
+#
+# `benches/` is excluded from the library workspace and is its own workspace root, so
+# the repository-root `deny.toml` cannot see it: `cargo deny` resolves through cargo,
+# and cargo stops at a workspace boundary.  Without a policy of its own this graph --
+# criterion 0.8.2 and its closure, which is by far the largest dependency tree
+# anywhere in this repository -- would be audited by nothing at all, and a copyleft
+# licence or a fresh advisory in it would pass unnoticed.
+#
+# `fuzz/deny.toml` exists for the same reason and this file follows it deliberately,
+# key for key, so that a reader who has understood one has understood all three.  The
+# `deny` job of ../.github/workflows/rust.yml runs all three:
+#
+#   cargo deny --locked --all-features check
+#   cargo deny --locked --all-features --manifest-path fuzz/Cargo.toml \
+#     --config fuzz/deny.toml check
+#   cargo deny --locked --all-features --manifest-path benches/Cargo.toml \
+#     --config benches/deny.toml check
+#
+# WHAT THIS GRAPH IS
+#
+# Three path dependencies on the crates under measurement -- zlib-rs, libz-rs-sys and
+# zlib-rs-differential -- plus criterion as the sampler.  Nothing here ships: the
+# suites measure a working tree and are never published.  The measured shape, from
+# `cargo deny --all-features --manifest-path benches/Cargo.toml list`, is 78 packages
+# against the library workspace's seven, and that asymmetry is precisely why the two
+# graphs are audited separately rather than merged.
+#
+# SCHEMA
+#
+# Written against cargo-deny 0.20.2, and only that schema's keys appear.  The older
+# spellings ([licenses] unlicensed/copyleft/deny/allow-osi-fsf-free, [advisories]
+# vulnerability/unsound/severity-threshold) are hard errors in that version and are
+# deliberately absent; "deny anything not explicitly allowed" is its built-in
+# behaviour rather than something to configure.
+
+[graph]
+# No `targets` filter, for the same reason the root policy gives: narrowing to one
+# triple would hide a licence or advisory problem in a crate that only builds
+# elsewhere, and criterion's closure carries several of those (wasm-bindgen,
+# web-sys, the Windows shims behind plotters).
+all-features = true
+
+[advisories]
+# Report unmaintained crates of every kind rather than only direct ones: a
+# measurement harness is exactly the kind of tree that accumulates them quietly.
+unmaintained = "all"
+yanked = "deny"
+# Empty, and it should stay empty.  An entry here silences a real advisory; if one
+# fires, the honest responses are to update the pin or to record the reason in the
+# same change that adds the exception.
+ignore = []
+
+[licenses]
+confidence-threshold = 0.93
+# Audit dev and build dependencies too.  criterion is a DEV-dependency of this
+# package -- the bench targets are dev targets -- so without `include-dev` this
+# policy would audit almost nothing.
+include-dev = true
+include-build = true
+# Exactly the identifiers this graph resolves to and nothing more.  cargo-deny
+# reports an allowance that never matches as a warning, and this project's bar is
+# zero warnings, so a speculative entry is not free.  Regenerate the list with
+# `cargo deny --all-features --manifest-path benches/Cargo.toml list` after any
+# dependency change.
+allow = [
+    # The project's own licence, carried by ../LICENSE and by the three crates under
+    # measurement.
+    "Zlib",
+    # The dual-licensed bulk of the graph: criterion, serde, regex, rayon, plotters,
+    # clap and their closures are all offered as "MIT OR Apache-2.0" or as an
+    # expression this satisfies.
+    "MIT",
+    # The other half of every "MIT OR Apache-2.0" expression above.
+    "Apache-2.0",
+    # Required by unicode-ident, whose expression is
+    # "(MIT OR Apache-2.0) AND Unicode-3.0" -- an AND, so the MIT entry cannot satisfy
+    # it alone.  Two paths reach it, both through criterion: serde -> serde_derive ->
+    # syn -> unicode-ident, and ciborium -> half -> zerocopy -> zerocopy-derive ->
+    # {proc-macro2, syn} -> unicode-ident.  This allowance used to sit in the root
+    # policy, where it warned as unmatched the moment the suites moved here.
+    "Unicode-3.0",
+]
+
+[bans]
+# One version of any crate that this package reaches through a NORMAL or BUILD edge.
+multiple-versions = "deny"
+# ★ Left at its default of false, and the reason is measured rather than
+# precautionary: criterion 0.8.2 resolves two major versions of syn -- 2.0.119 under
+# zerocopy-derive and 3.0.3 under serde_derive.  Turning the key on would fail this
+# gate over somebody else's dependency tree, and the alternative, a permanent `skip`
+# entry for syn, would blunt the check for every future duplicate of that name.  The
+# library workspace pays nothing for this: its own policy sets
+# `multiple-versions-include-dev = true`, which it can do precisely because criterion
+# is no longer in that graph.
+#
+# multiple-versions-include-dev = false   (default; see above)
+wildcards = "deny"
+# The three crates under measurement are path dependencies, which cargo-deny
+# classifies as wildcards unless they carry a `version` key.  They do carry one, so
+# this is belt-and-braces rather than load-bearing.
+allow-wildcard-paths = true
+# No other compression implementation may enter a graph whose whole purpose is to
+# measure THIS one.  A ratio against the wrong library is worse than no ratio: it
+# would look like a number.
+deny = [
+    { crate = "libz-sys", use-instead = "libz-rs-sys", reason = "links the C zlib; the in-tree C sources are the oracle, reached through zlib-rs-differential" },
+    { crate = "libz-ng-sys", use-instead = "libz-rs-sys", reason = "links zlib-ng, whose encoder does not emit byte-identical output" },
+    { crate = "cloudflare-zlib-sys", use-instead = "libz-rs-sys", reason = "links a forked C zlib" },
+    { crate = "libdeflate-sys", use-instead = "libz-rs-sys", reason = "links libdeflate, a separate C compressor" },
+    { crate = "libdeflater", use-instead = "libz-rs-sys", reason = "wraps libdeflate, a separate C compressor" },
+    { crate = "flate2", use-instead = "libz-rs-sys", reason = "third-party DEFLATE front end; the suites must measure the port itself" },
+    { crate = "miniz_oxide", use-instead = "zlib-rs", reason = "third-party Rust DEFLATE implementation" },
+    { crate = "deflate", use-instead = "zlib-rs", reason = "third-party Rust DEFLATE encoder" },
+    { crate = "inflate", use-instead = "zlib-rs", reason = "third-party Rust DEFLATE decoder" },
+    { crate = "zopfli", use-instead = "zlib-rs", reason = "alternative DEFLATE encoder; its output is not byte-identical to zlib's" },
+    { crate = "zstd", reason = "no new compression formats" },
+    { crate = "zstd-sys", reason = "no new compression formats" },
+    { crate = "brotli", reason = "no new compression formats" },
+    { crate = "brotli-decompressor", reason = "no new compression formats" },
+    { crate = "bzip2", reason = "no new compression formats" },
+    { crate = "bzip2-sys", reason = "no new compression formats" },
+    { crate = "lzma-sys", reason = "no new compression formats" },
+    { crate = "xz2", reason = "no new compression formats" },
+    { crate = "snap", reason = "no new compression formats" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

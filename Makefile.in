@@ -469,6 +469,7 @@ CARGO=cargo
 CARGO_BUILD_FLAGS=--locked --release
 CARGO_TEST_FLAGS=--locked --workspace --release
 CARGO_MSRV_FLAGS=--locked -p zlib-rs -p libz-rs-sys --all-features --all-targets
+CARGO_MSRV_WS_FLAGS=--locked --workspace --all-targets
 RUSTMSRV=1.80
 RUSTMSRVFLAGS=-D warnings
 RUSTTARGETDIR=target
@@ -553,16 +554,35 @@ RUSTNOWHOLEARCHIVE=-Wl,--no-whole-archive
 # introduced with `--' so that a leading dash or an embedded space cannot be
 # read as an option or as a second word.
 #
-# The check is deliberately in two parts.  A lexical pass rejects the forms that
-# are wrong regardless of what is on disk: empty, absolute, tilde-prefixed, `.',
-# `..', anything containing a `..' path component, and anything outside a
-# conservative character set (which also removes every shell-metacharacter and
-# whitespace hazard).  A canonicalising pass then walks up to the nearest
-# existing ancestor, resolves it with `cd -P' and `pwd -P' so that a symlinked
-# component cannot smuggle the path elsewhere, and requires the result to be the
-# build directory or something strictly beneath it.  Neither pass alone is
-# sufficient: the first cannot see a symlink, and the second cannot judge a path
-# whose ancestors do not exist yet.
+# The check is deliberately in three parts, and STRICTLY BENEATH is what it
+# enforces -- the build directory itself is refused, because these recipes remove
+# what they are given and the build directory is not theirs to remove.
+#
+#   1. A LEXICAL pass rejects the forms that are wrong regardless of what is on
+#      disk: empty, absolute, tilde-prefixed, `.', `..', `./', `.//...', `./.',
+#      anything containing a `..' path component, and anything outside a
+#      conservative character set (which also removes every shell-metacharacter
+#      and whitespace hazard).  The trailing-slash and `./' spellings are named
+#      individually because they all canonicalise to the build root while
+#      matching none of `.' or `..': rejecting only the literal `.' left
+#      `RUSTLIBDIR=./' accepted, which is the hole this pass closes.
+#   2. A CANONICALISING pass walks up to the nearest existing ancestor, resolves
+#      it with `cd -P' and `pwd -P' so that a symlinked component cannot smuggle
+#      the path elsewhere, and requires the result to be the build directory or
+#      something beneath it.  It cannot decide the root question by itself: the
+#      normal, legitimate `RUSTTARGETDIR=target' before `target' exists resolves
+#      its nearest existing ancestor to the build directory too.
+#   3. An IDENTITY pass therefore resolves the path ITSELF whenever it already
+#      exists and refuses equality with the build root, which is what catches a
+#      spelling that reaches the root through a symlink or through components
+#      this file cannot enumerate.  A path that does not exist cannot be the
+#      root, because pass 1 has already removed every spelling of the root that
+#      names nothing new, and the basename is additionally required not to be
+#      `.' or `..'.
+#
+# No pass alone is sufficient: the first cannot see a symlink, the second cannot
+# judge a path whose ancestors do not exist yet, and the third cannot judge a
+# path that is not there.
 RUSTPATHGUARD = \
 	zrs_reject() { \
 	  echo "$$1" >&2; \
@@ -575,7 +595,7 @@ RUSTPATHGUARD = \
 	    "") zrs_reject "$$zrs_n is empty" ;; \
 	    /*) zrs_reject "$$zrs_n=$$zrs_v is an absolute path; it must be relative to the build directory" ;; \
 	    "~"*) zrs_reject "$$zrs_n=$$zrs_v starts with a tilde" ;; \
-	    . | ..) zrs_reject "$$zrs_n=$$zrs_v names the build directory or its parent" ;; \
+	    . | .. | ./ | ../ | ./. | .//*) zrs_reject "$$zrs_n=$$zrs_v names the build directory or its parent" ;; \
 	    ../* | */.. | */../*) zrs_reject "$$zrs_n=$$zrs_v contains a .. component" ;; \
 	    *[!A-Za-z0-9._/+-]*) zrs_reject "$$zrs_n=$$zrs_v contains a character outside A-Za-z0-9._+-/" ;; \
 	  esac; \
@@ -589,6 +609,16 @@ RUSTPATHGUARD = \
 	    "$$zrs_root" | "$$zrs_root"/*) ;; \
 	    *) zrs_reject "$$zrs_n=$$zrs_v resolves to $$zrs_abs, outside the build directory $$zrs_root" ;; \
 	  esac; \
+	  zrs_leaf=`basename -- "$$zrs_v"`; \
+	  case "$$zrs_leaf" in \
+	    . | ..) zrs_reject "$$zrs_n=$$zrs_v ends in a $$zrs_leaf component, so it names a directory it does not spell" ;; \
+	  esac; \
+	  if test -d "$$zrs_v"; then \
+	    zrs_full=`cd -P -- "$$zrs_v" 2>/dev/null && pwd -P` || \
+	      zrs_reject "$$zrs_n=$$zrs_v: could not resolve it"; \
+	    test "$$zrs_full" != "$$zrs_root" || \
+	      zrs_reject "$$zrs_n=$$zrs_v resolves to the build directory $$zrs_root ITSELF, not to something beneath it, and this target creates and REMOVES what it names"; \
+	  fi; \
 	}; \
 	zrs_guard_dir "$(RUSTTARGETDIR)" RUSTTARGETDIR; \
 	zrs_guard_dir "$(RUSTLIBDIR)" RUSTLIBDIR
@@ -832,7 +862,7 @@ cover: infcover
 # under any of these names cannot reintroduce the same trap.  The forwarding copy
 # of these targets in the pre-configure `Makefile' carries the same declaration
 # and the same reason; keep the two in step.
-.PHONY: rust rust-test rust-symbols rust-header rust-msrv rust-clean
+.PHONY: rust rust-pc rust-test rust-symbols rust-header rust-msrv rust-clean
 
 rust:
 	@if test -z "$(CARGO)"; then \
@@ -961,7 +991,10 @@ rust:
 	  fi; \
 	done; \
 	echo "		$(STATICLIB) defines the C-ABI shim symbols cargo compiled:$(RUSTSHIMSYMS)"; \
-	if $(RUSTC) --version >/dev/null 2>&1; then \
+	if test -n "$(RUSTPCPRIVATE)"; then \
+	  NSL='$(RUSTPCPRIVATE)'; \
+	  echo "		native static libraries stated by RUSTPCPRIVATE: $$NSL"; \
+	elif $(RUSTC) --version >/dev/null 2>&1; then \
 	  printf '#[no_mangle]\npub extern "C" fn zlib_rs_native_static_libs_probe() -> i32 { 0 }\n' \
 	    > $(RUSTLIBDIR)/nsl-probe.rs; \
 	  if $(RUSTC) --print native-static-libs --crate-type staticlib \
@@ -977,15 +1010,19 @@ rust:
 	else \
 	  NSL=''; \
 	fi; \
+	printf '%s\n' "$$NSL" > $(RUSTLIBDIR)/native-static-libs.stage; \
 	if test -n "$$NSL"; then \
-	  echo "		static-linking $(STATICLIB) additionally needs:$$NSL"; \
-	  echo '		(from `$(RUSTC) --print native-static-libs'"'"'; target-specific, and'; \
-	  echo '		not advertised by the configure-generated zlib.pc -- the CMake'; \
-	  echo '		build puts the same set in its own Libs.private: instead)'; \
+	  echo "		static-linking $(STATICLIB) additionally needs: $$NSL"; \
+	  echo '		(from `$(RUSTC) --print native-static-libs'"'"'; target-specific, so'; \
+	  echo '		it is recorded in $(RUSTLIBDIR)/native-static-libs.stage and used by'; \
+	  echo '		the relink below, by the static links `make rust-test'"'"' performs, and'; \
+	  echo '		by the Libs.private: line `make rust-pc'"'"' writes)'; \
 	else \
 	  echo '		could not ask $(RUSTC) which native libraries $(STATICLIB) needs'; \
-	  echo '		beside it; run `$(RUSTC) --print native-static-libs'"'"' yourself before'; \
-	  echo '		static-linking it, or pass RUSTC=<path>'; \
+	  echo '		beside it; the shared relink below adds none, and `make rust-test'"'"''; \
+	  echo '		and `make rust-pc'"'"' will stop rather than link or advertise an'; \
+	  echo '		archive whose requirements are unknown.  Pass RUSTC=<path>, or state'; \
+	  echo '		the set with RUSTPCPRIVATE="-lm -lpthread -lc".'; \
 	fi; \
 	sed -n 's/^ *ZEXTERN[^(]*[ *]\([A-Za-z_][A-Za-z0-9_]*\) *(.*/\1/p' \
 	  $(SRCDIR)zlib.h | sort -u > $(RUSTLIBDIR)/public.syms; \
@@ -1038,23 +1075,23 @@ rust:
 	  $(RUSTOBJCOPY) --localize-symbols=$(RUSTLIBDIR)/hidden.syms \
 	    $(RUSTLIBDIR)/libz-whole.o; \
 	fi; \
-	echo "$$LDS $(SFLAGS)$$EXTRA $$VSARG -o $(RUSTLIBDIR)/$$SOV $(RUSTLIBDIR)/libz-whole.o"; \
+	echo "$$LDS $(SFLAGS)$$EXTRA $$VSARG -o $(RUSTLIBDIR)/$$SOV $(RUSTLIBDIR)/libz-whole.o $(LDSHAREDLIBC) $(LDFLAGS) $$NSL"; \
 	if $$LDS $(SFLAGS) $$EXTRA $$VSARG -Wl,--undefined-version \
 	    -o "$(RUSTLIBDIR)/$$SOV" $(RUSTLIBDIR)/libz-whole.o \
-	    $(LDSHAREDLIBC) $(LDFLAGS) 2> $(RUSTLIBDIR)/relink.log; then \
+	    $(LDSHAREDLIBC) $(LDFLAGS) $$NSL 2> $(RUSTLIBDIR)/relink.log; then \
 	  :; \
 	elif $$LDS $(SFLAGS) $$EXTRA $$VSARG -o "$(RUSTLIBDIR)/$$SOV" \
-	    $(RUSTLIBDIR)/libz-whole.o $(LDSHAREDLIBC) $(LDFLAGS) \
+	    $(RUSTLIBDIR)/libz-whole.o $(LDSHAREDLIBC) $(LDFLAGS) $$NSL \
 	    2>> $(RUSTLIBDIR)/relink.log; then \
 	  echo 'note: the linker rejected --undefined-version; relinked without it'; \
 	elif test -n "$$rustvs" && $(LDSHARED) $(SFLAGS) -Wl,--undefined-version \
 	    -o $(RUSTLIBDIR)/$(SHAREDLIBV) $(RUSTLIBDIR)/libz-whole.o \
-	    $(LDSHAREDLIBC) $(LDFLAGS) 2>> $(RUSTLIBDIR)/relink.log; then \
+	    $(LDSHAREDLIBC) $(LDFLAGS) $$NSL 2>> $(RUSTLIBDIR)/relink.log; then \
 	  echo 'note: this linker rejects --version-script; relinked without one'; \
 	  : > $(RUSTLIBDIR)/unversioned; \
 	elif test -n "$$rustvs" && $(LDSHARED) $(SFLAGS) \
 	    -o $(RUSTLIBDIR)/$(SHAREDLIBV) $(RUSTLIBDIR)/libz-whole.o \
-	    $(LDSHAREDLIBC) $(LDFLAGS) 2>> $(RUSTLIBDIR)/relink.log; then \
+	    $(LDSHAREDLIBC) $(LDFLAGS) $$NSL 2>> $(RUSTLIBDIR)/relink.log; then \
 	  echo 'note: this linker rejects --version-script and --undefined-version'; \
 	  : > $(RUSTLIBDIR)/unversioned; \
 	else \
@@ -1330,6 +1367,13 @@ rust-pc: rust
 	if test -n "$$PRIVATE"; then \
 	  TARGETDESC='stated in RUSTPCPRIVATE for the target being built'; \
 	  echo "		Libs.private stated by RUSTPCPRIVATE, not probed: $$PRIVATE"; \
+	elif test -s $(RUSTLIBDIR)/native-static-libs.stage; then \
+	  PRIVATE=`cat $(RUSTLIBDIR)/native-static-libs.stage`; \
+	  TARGETDESC='recorded by `make rust'"'"' for the target being built'; \
+	  echo "		Libs.private $$TARGETDESC:$$PRIVATE"; \
+	  echo '		(one probe per `make rust'"'"', recorded in'; \
+	  echo '		$(RUSTLIBDIR)/native-static-libs.stage, so the descriptor advertises'; \
+	  echo '		exactly the set the shared relink and the static links used)'; \
 	else \
 	  triple=; want=; \
 	  for arg in $(CARGO_BUILD_FLAGS); do \
@@ -1741,7 +1785,9 @@ rust-test: rust rust-pc
 	  $(CARGO) test $(CARGO_TEST_FLAGS) --manifest-path "$$SRCROOT/Cargo.toml" \
 	    $$TEST_FEATURES; \
 	  SOV=`sed -n 1p "$$RUSTLIB/soname.stage"`; \
+	  SOM=`sed -n 2p "$$RUSTLIB/soname.stage"`; \
 	  VSMODE=`sed -n 3p "$$RUSTLIB/soname.stage"`; \
+	  NSL=`cat "$$RUSTLIB/native-static-libs.stage" 2>/dev/null || :`; \
 	  if test "$$VSMODE" = static; then \
 	    echo "make rust-test: configured --static, so the C drivers link $(STATICLIB)"; \
 	    ZLINK="$$RUSTLIB/$(STATICLIB)"; DYNAMIC=0; \
@@ -1757,12 +1803,31 @@ rust-test: rust rust-pc
 	  fi; \
 	  echo "make rust-test: the exported-symbol comparisons ran in \`rust', which make"; \
 	  echo "make rust-test: has already completed as a prerequisite of this target"; \
+	  if test -z "$$NSL"; then \
+	    echo "make rust-test: $$RUSTLIB/native-static-libs.stage names no native" >&2; \
+	    echo "make rust-test: libraries, so the static links below would be composed" >&2; \
+	    echo "make rust-test: from an unknown requirement set.  \`make rust' records" >&2; \
+	    echo "make rust-test: the set it probed there; an empty file means it could" >&2; \
+	    echo "make rust-test: not ask $(RUSTC).  A link that happens to succeed on" >&2; \
+	    echo "make rust-test: this libc proves nothing about the archive published" >&2; \
+	    echo "make rust-test: for consumers, so this stops instead:" >&2; \
+	    echo "make rust-test:     make rust rust-test RUSTC=/path/to/rustc" >&2; \
+	    echo "make rust-test:     make rust rust-test RUSTPCPRIVATE=\"-lm -lpthread -lc\"" >&2; \
+	    exit 1; \
+	  fi; \
+	  echo "make rust-test: static links additionally carry $$NSL"; \
+	  echo "make rust-test: (from $$RUSTLIB/native-static-libs.stage, which \`make rust'"; \
+	  echo "make rust-test: probed for this target -- the archive carries the Rust"; \
+	  echo "make rust-test: runtime and cannot record them itself)"; \
+	  case "$$DYNAMIC" in \
+	    0) ZLINK="$$ZLINK $$NSL" ;; \
+	  esac; \
 	  $(CC) $(CFLAGS) $(ZINCOUT) -o "$$RUSTLIB/examplerust$(EXE)" \
 	    "$$SRCROOT/test/example.c" $(LDFLAGS) $$ZLINK; \
 	  $(CC) $(CFLAGS) $(ZINCOUT) -o "$$RUSTLIB/minigziprust$(EXE)" \
 	    "$$SRCROOT/test/minigzip.c" $(LDFLAGS) $$ZLINK; \
 	  $(CC) $(CFLAGS) $(ZINCOUT) -o "$$RUSTLIB/infcoverrust$(EXE)" \
-	    "$$SRCROOT/test/infcover.c" $(LDFLAGS) "$$RUSTLIB/$(STATICLIB)"; \
+	    "$$SRCROOT/test/infcover.c" $(LDFLAGS) "$$RUSTLIB/$(STATICLIB)" $$NSL; \
 	  if test $$DYNAMIC -eq 1; then \
 	    LD_LIBRARY_PATH=$$RUSTLIB$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}; \
 	    export LD_LIBRARY_PATH; \
@@ -1773,10 +1838,24 @@ rust-test: rust rust-pc
 	    if command -v ldd > /dev/null 2>&1; then \
 	      ldd "$$RUSTLIB/examplerust$(EXE)" > "$$RUSTLIB/ldd.log" 2>&1; \
 	      grep libz "$$RUSTLIB/ldd.log" || true; \
-	      grep -F -q "$$RUSTLIB/libz" "$$RUSTLIB/ldd.log" || { \
-	        echo "libz did not resolve to $$RUSTLIB" >&2; \
+	      BOUND=`awk -v want="$$SOM" '$$1 == want && $$2 == "=>" { print $$3; exit }' \
+	        "$$RUSTLIB/ldd.log"`; \
+	      if test -z "$$BOUND"; then \
+	        echo "make rust-test: examplerust has no dynamic dependency on $$SOM at" >&2; \
+	        echo "make rust-test: all, so the loader was never asked for the staged" >&2; \
+	        echo "make rust-test: library and nothing under test was exercised." >&2; \
 	        exit 1; \
-	      }; \
+	      fi; \
+	      if test "$$BOUND" != "$$RUSTLIB/$$SOM"; then \
+	        echo "make rust-test: $$SOM resolved to $$BOUND rather than to the staged" >&2; \
+	        echo "make rust-test: $$RUSTLIB/$$SOM.  That is almost always the SYSTEM" >&2; \
+	        echo "make rust-test: zlib: the library declares SONAME $$SOM, so the loader" >&2; \
+	        echo "make rust-test: searches for that name, and when it is not in the" >&2; \
+	        echo "make rust-test: staging directory every driver passes against a" >&2; \
+	        echo "make rust-test: library this build did not produce." >&2; \
+	        exit 1; \
+	      fi; \
+	      echo "make rust-test: ldd confirms $$SOM bound from $$RUSTLIB"; \
 	    else \
 	      echo 'warning: no ldd, cannot confirm which libz was bound'; \
 	    fi; \
@@ -1907,12 +1986,14 @@ rust-symbols: rust
 #     nm, and it is why gzprintf and gzvprintf can be an allowance here while
 #     remaining a hard requirement there.
 #   * It compares NAMES, not signatures, parameter types, struct layouts or
-#     macro values.  The rest of the normalisation -- rules A3, A4, A6, A7, A8
-#     and rule 10, spelled out under "NORMALISATION RULES THE GATE MUST
-#     IMPLEMENT" in $(SRCDIR)cbindgen.toml -- belongs to the
+#     macro values.  The rest of the normalisation -- rules A3, A4, A6, A7, A8,
+#     rule 10 and rule A11, spelled out under "NORMALISATION RULES THE GATE
+#     MUST IMPLEMENT" in $(SRCDIR)cbindgen.toml -- belongs to the
 #     header-conformance job of .github/workflows/rust.yml, which runs this
 #     target first and then re-declares every generated prototype against
-#     $(SRCDIR)zlib.h so the compiler itself reports a conflicting type.  What
+#     $(SRCDIR)zlib.h so the compiler itself reports a conflicting type, and
+#     diffs a compiler-resolved rendering of all 95 contract signatures against
+#     the same rendering of $(SRCDIR)zlib.h's with an EMPTY diff required.  What
 #     is here is the part that is mechanical in make and catches the whole
 #     class of defect that made the header unusable; it is not the whole of
 #     Pass A.
@@ -1946,10 +2027,10 @@ rust-symbols: rust
 #
 #   NOT AUTOMATED HERE, and left to .github/workflows/rust.yml by scope.  Each of
 #   these IS automated there, in the job named:
-#     - the SHAPE half of the normalisation rules -- A3, A4, A6, A7, A8 and rule
-#       10 -- which need a C compiler and a probe program rather than sed.  The
-#       `header' job owns them, and runs this target first; `rust-header' owns
-#       A1, A2, A5 and A9.
+#     - the SHAPE half of the normalisation rules -- A3, A4, A6, A7, A8, rule 10
+#       and rule A11's literal signature diff -- which need a C and a C++
+#       compiler and a probe program rather than sed.  The `header' job owns
+#       them, and runs this target first; `rust-header' owns A1, A2, A5 and A9.
 #     - BUILDS of the facade on another platform.  This file gates the generated
 #       header under -D_WIN32, which is a header check, not a build.  The
 #       `build-test' job builds and tests the workspace natively on
@@ -2148,17 +2229,25 @@ rust-header:
 #                `rust-version' in the root Cargo.toml; if the two diverge, this
 #                gate stops meaning anything.  clippy.toml deliberately declares
 #                no `msrv' key -- clippy reads each package's own `rust-version'
-#                instead, which is what keeps the 1.86 differential crate from
-#                being judged against the shipped crates' floor -- so it is not a
-#                third place to change.
+#                instead, which is what keeps the excluded `benches' package, whose
+#                floor is criterion's 1.86, from being judged against the shipped
+#                crates' floor and vice versa -- so it is not a third place to
+#                change.
 #   RUSTMSRVFLAGS  RUSTFLAGS for the check.  `-D warnings' is the whole point of
 #                the target, so overriding it to nothing defeats it.
 #
-# Deliberately scoped to `-p zlib-rs -p libz-rs-sys' rather than --workspace: the
-# differential harness takes `criterion' as a dev-dependency, whose own manifest
-# needs a newer cargo than 1.80, so `--workspace' cannot even resolve at the
-# floor.  That is a property of the test tooling, not of the shipped library, and
-# the shipped library is what the MSRV promise covers.
+# TWO SCOPES, and the first one used to be impossible.  `$(CARGO_MSRV_FLAGS)' names
+# `-p zlib-rs -p libz-rs-sys --all-features --all-targets', because the feature
+# matrix is a promise about the two crates that SHIP.  `$(CARGO_MSRV_WS_FLAGS)' adds
+# `--locked --workspace --all-targets', which is a statement about the workspace
+# itself: every member declares the same floor, so the floor compiler can resolve
+# and check all three.  While the three criterion suites were attached to the
+# differential harness as `[[bench]]' entries, criterion's own manifest -- and the
+# edition-2024 clap manifests it reaches -- needed a newer cargo than 1.80, so
+# `--workspace' could not even RESOLVE at the floor.  The suites now live in the
+# excluded `benches' package with their own lock (see benches/Cargo.toml section 2),
+# which is what makes the second scope meaningful; adding a criterion edge back to
+# any member removes it again.
 #
 # It also writes to its own subdirectory of $(RUSTTARGETDIR).  Two compilers
 # sharing one target directory is legal but makes each invalidate the other's
@@ -2187,6 +2276,12 @@ rust-msrv:
 	  $(RUSTPATHGUARD); \
 	  CARGO_TARGET_DIR='$(RUSTTARGETDIR)/msrv'; export CARGO_TARGET_DIR; \
 	  RUSTFLAGS='$(RUSTMSRVFLAGS)'; export RUSTFLAGS; \
+	  echo "$(CARGO) +$(RUSTMSRV) metadata --locked"; \
+	  $(CARGO) +$(RUSTMSRV) metadata --locked --format-version 1 \
+	    --manifest-path "$$SRCROOT/Cargo.toml" > /dev/null; \
+	  echo "RUSTFLAGS='$(RUSTMSRVFLAGS)' $(CARGO) +$(RUSTMSRV) check $(CARGO_MSRV_WS_FLAGS)"; \
+	  $(CARGO) +$(RUSTMSRV) check $(CARGO_MSRV_WS_FLAGS) \
+	    --manifest-path "$$SRCROOT/Cargo.toml"; \
 	  echo "RUSTFLAGS='$(RUSTMSRVFLAGS)' $(CARGO) +$(RUSTMSRV) check $(CARGO_MSRV_FLAGS)"; \
 	  $(CARGO) +$(RUSTMSRV) check $(CARGO_MSRV_FLAGS) \
 	    --manifest-path "$$SRCROOT/Cargo.toml" ); \
@@ -2236,6 +2331,7 @@ rust-clean:
 	@set -e; \
 	srcroot=`cd "$(SRCDIR)." && pwd`; \
 	buildroot=`pwd -P`; \
+	$(RUSTPATHGUARD); \
 	for d in '$(RUSTTARGETDIR)' '$(RUSTLIBDIR)' '$(RUSTLIBDIR).new'; do \
 	  test -n "$$d" || continue; \
 	  case "$$d" in \
@@ -2560,7 +2656,14 @@ distclean: clean zconf # zconf.h.cmakein
 	printf '# name, the SONAME and the 16 symbol version nodes are all right on this path\n' >> Makefile ; \
 	printf "# too -- verified here: 111 dynamic globals, identical to the C library's.\n" >> Makefile ; \
 	printf "# This file is regenerated by \`distclean'; keep it and that recipe in step.\n" >> Makefile ; \
-	printf 'rust:\n\t$$(MAKE) -f Makefile.in rust\n' >> Makefile ; \
+	printf '#\n' >> Makefile ; \
+	printf '# .PHONY IS REQUIRED, NOT TIDINESS: `rust'"'"' is also the name of a directory in\n' >> Makefile ; \
+	printf '# this tree, and make treats a target whose name matches an existing file or\n' >> Makefile ; \
+	printf '# directory as up to date when it has no prerequisites -- so without this line\n' >> Makefile ; \
+	printf "# \`make rust' prints \"'rust' is up to date\", runs nothing and still exits 0.\n" >> Makefile ; \
+	printf '# The whole family is declared, so a later addition cannot reintroduce it.\n' >> Makefile ; \
+	printf '.PHONY: all distclean rust rust-pc rust-test rust-symbols rust-header rust-msrv rust-clean\n' >> Makefile ; \
+	printf '\nrust:\n\t$$(MAKE) -f Makefile.in rust\n' >> Makefile ; \
 	printf '\nrust-pc:\n\t$$(MAKE) -f Makefile.in rust-pc\n' >> Makefile ; \
 	printf '\nrust-test:\n\t$$(MAKE) -f Makefile.in rust-test\n' >> Makefile ; \
 	printf '\nrust-symbols:\n\t$$(MAKE) -f Makefile.in rust-symbols\n' >> Makefile ; \

@@ -1,0 +1,287 @@
+# zlib-rs-benches -- the criterion measurement harness for the Rust zlib port.
+#
+# 1. PURPOSE
+#    This manifest hosts the three benchmark suites AAP §0.3.1 places at
+#    `benches/` and AAP §0.8.4 gates on: `deflate_bench.rs` (compression
+#    throughput at levels 1/6/9 and per-stream memory), `inflate_bench.rs`
+#    (decompression throughput) and `checksum_bench.rs` (scalar against SIMD).
+#    Each measures the port and the in-process C oracle under one sampler, so a
+#    number here is always a RATIO rather than an absolute.
+#
+#    It ships nothing, it is never published, and -- the point of this file -- it
+#    is NOT a member of the library workspace.
+#
+# 2. ★ WHY THIS IS A SEPARATE, EXCLUDED PACKAGE WITH ITS OWN LOCK
+#    Because criterion's floor is not the library's floor, and a workspace has
+#    exactly one dependency graph.
+#
+#    Measured on this tree: criterion 0.8.2 declares `rust-version = "1.86"` and
+#    reaches clap 4.6.5, whose `clap_builder`/`clap_lex` declare
+#    `edition = "2024"`.  Cargo 1.80 cannot parse an edition-2024 manifest at all,
+#    so while these suites were attached to `crates/zlib-rs-differential` -- a
+#    workspace MEMBER -- every command that resolves the workspace dev graph on the
+#    declared floor failed outright:
+#
+#      $ cargo +1.80 metadata --locked
+#      $ cargo +1.80 check --locked --workspace --all-targets
+#      error: failed to download `clap_builder v4.6.5` … requires the Cargo
+#             feature called `edition2024`, but that feature is not stabilized in
+#             this version of Cargo (1.80.1)
+#
+#    That is not a cosmetic inconvenience: AAP §0.7.1(h) declares
+#    `rust-version = "1.80"` for this project, and a workspace whose own floor
+#    cannot resolve the workspace is not honouring it.  Nor can a manifest key fix
+#    it -- `rust-version` is a declaration, not a resolver directive -- and
+#    dropping criterion is not available either, because it would delete the
+#    throughput gates of AAP §0.6.4.6.
+#
+#    Moving the host OUT of the workspace resolves all of it, and resolves it
+#    without weakening anything:
+#
+#      * the three members again inherit `rust-version.workspace = true` (1.80),
+#        and `cargo +1.80 check --locked --workspace --all-targets` and
+#        `cargo +1.80 metadata --locked` both succeed;
+#      * criterion, clap and their trees leave the root `Cargo.lock` entirely, so
+#        the graph a consumer of the library resolves contains nothing that exists
+#        only to measure it;
+#      * this directory gets its OWN lock, which is what a gate needs: a
+#        measurement whose harness versions can move underneath it reports on a
+#        different program each run.
+#
+#    `fuzz/` is the same shape for the same reason and is the precedent followed
+#    here, down to the empty `[workspace]` table, the committed lock and the
+#    directory-local `deny.toml`.
+#
+#    THE ORACLE IS NOT DUPLICATED.  The one objection to this layout was that the
+#    suites measure against the C oracle that `crates/zlib-rs-differential/build.rs`
+#    compiles, and a separate package would have to rebuild it.  It does not: this
+#    package depends on that crate BY PATH, so cargo builds the very same crate --
+#    the same build script, the same fifteen `-O3 -fPIC` translation units, the
+#    same `objcopy --redefine-syms` rename pass -- and the suites keep calling it
+#    through `zlib_rs_differential::{oracle, port}` unchanged.  What differs is only
+#    which package the bench TARGETS belong to.
+#
+# 3. HOW TO RUN THE SUITES
+#
+#      cargo bench --manifest-path benches/Cargo.toml                       # all three
+#      cargo bench --manifest-path benches/Cargo.toml --bench deflate_bench
+#      cargo bench --manifest-path benches/Cargo.toml -- --test             # one iteration each
+#      cargo bench --manifest-path benches/Cargo.toml --features simd
+#
+#    From inside this directory the `--manifest-path` is unnecessary, because this
+#    is its own workspace root.  Plain cargo commands run from the repository root
+#    DO need it: `cargo bench` there now finds no bench target at all, which is the
+#    honest answer -- the library workspace has none.
+#
+#    `.github/workflows/rust.yml`'s `bench` job runs the same commands and is the
+#    only place the ≤10% throughput and ≤15% memory limits are ENFORCED; the suites
+#    themselves measure and report.  `make` has no bench target: `Makefile.in`
+#    documents the seven `rust*` targets it does have and none of them measures.
+#
+# 4. WHAT IS COMMITTED
+#    `benches/Cargo.lock` IS committed, exactly like `fuzz/Cargo.lock` and the
+#    repository-root `Cargo.lock`, and for the reason in 2 above: a gate needs a
+#    fixed harness.  criterion is pinned with `=` rather than a caret for the same
+#    reason -- a minor bump can change the sampler, and a sampler change moves
+#    every ratio in the log.
+#
+#    Criterion's own output (`target/criterion/`) is runtime data, not source, and
+#    the repository-root `.gitignore` covers `target/` with an anchored rule.  This
+#    package writes into `benches/target/`, which the same rule does not cover, so
+#    `.gitignore` carries `benches/target/` explicitly -- the same treatment
+#    `fuzz/target/` has.
+
+[package]
+name = "zlib-rs-benches"
+# Not inherited from the root `[workspace.package]`: this package is not a member,
+# so `field.workspace = true` has no workspace to read.  Every key is therefore
+# written out, and kept equal to the root's where the root has an opinion.
+version = "1.3.2"
+edition = "2021"
+
+# ★ criterion's floor, stated in the one manifest where it is TRUE.
+#
+# 1.86 is not this project's MSRV -- AAP §0.7.1(h) sets that at 1.80, and the three
+# workspace members declare it.  It is criterion 0.8.2's own declared floor, and
+# the whole purpose of this package is to be the single place that floor applies,
+# so that it constrains the measurement harness and nothing else.  Raising or
+# lowering it here has no bearing on what the library promises.
+rust-version = "1.86"
+
+license = "Zlib"
+description = "Dev-only criterion benchmark suites measuring the Rust zlib port against the in-tree C oracle"
+
+# Never publishable.  These suites exist to measure a working tree.
+publish = false
+
+# Cargo would otherwise look for `benches/benches/*.rs`, and there is no such
+# directory: the three suites sit beside this manifest and are declared explicitly
+# at the foot of the file.  Turning discovery off makes that a statement rather
+# than a coincidence.
+autobenches = false
+autotests = false
+autoexamples = false
+autobins = false
+
+# ★ THE EMPTY WORKSPACE TABLE IS THE MECHANISM, and it is not decoration.
+#
+# Without it this directory sits inside the repository-root workspace's directory
+# tree, so cargo would treat it as a member candidate and its dev graph -- criterion,
+# clap, edition-2024 manifests -- would be back in the root lock and back in the
+# root's MSRV resolution, which is exactly what this package exists to prevent.  The
+# root `Cargo.toml` additionally names `benches` in its `exclude` list, so the
+# separation is stated from both ends rather than inferred from one.
+[workspace]
+
+# The three crates under measurement, all by path.  `version` accompanies each one
+# because `deny.toml` sets `bans.wildcards = "deny"` and cargo-deny classifies a
+# path dependency with no version requirement as a wildcard.
+[dependencies]
+# The safe core.  `rust-api` for the typed surface the checksum suite measures
+# directly (`Adler32Backend`, `Crc32Backend`, `Braid`, `Generic`), `std` because a
+# bench binary reads corpus files.
+zlib-rs = { path = "../crates/zlib-rs", version = "1.3.2", features = ["rust-api", "std"] }
+
+# The C ABI facade: the deflate and inflate suites drive the port through its
+# exported `extern "C"` surface, which is the surface a consumer actually calls.
+libz_rs_sys = { package = "libz-rs-sys", path = "../crates/libz-rs-sys", version = "1.3.2" }
+
+# The oracle harness.  Its build script compiles the in-tree C sources into the
+# renamed test-only archive, and `oracle`/`port` are how every suite reaches both
+# implementations in ONE process -- which is what removes cross-process noise from
+# a ratio.
+zlib-rs-differential = { path = "../crates/zlib-rs-differential", version = "1.3.2" }
+
+[dev-dependencies]
+# AAP §0.5.1.3 pins criterion 0.8.2; `=` keeps the sampler fixed for the reasons in
+# section 4 above.  Licensed "Apache-2.0 OR MIT", which `benches/deny.toml` allows.
+criterion = "=0.8.2"
+
+[features]
+# Forwarded to all three path dependencies at once, because a partial SIMD build
+# would measure a mixture and report it as a configuration.  `ZLIB_RS_SIMD=1` is the
+# documented user-facing spelling elsewhere; here the Cargo feature is the interface,
+# and `checksum_bench.rs` reads `option_env!("ZLIB_RS_SIMD")` only to LABEL a row.
+#
+# SIMD is confined to CRC-32 and Adler-32 and is output-neutral (AAP §0.8.2 item 9),
+# so enabling it may move a rate and must never move a byte.
+simd = ["zlib-rs/simd", "libz_rs_sys/simd", "zlib-rs-differential/simd"]
+
+# ★ Lints are DUPLICATED here rather than inherited, because `[lints] workspace =
+# true` cannot cross a workspace boundary.  The set below is the root
+# `[workspace.lints]` tables, with the two relaxations the suites legitimately need:
+# `doc_markdown` (the suite documentation names C functions, `nm` output and shell
+# commands in prose) and the narrowing-cast family (a benchmark converts sizes and
+# durations constantly, and every such cast here is on a value bounded by a corpus
+# fixture).  `unsafe_code` is not relaxed: all three suites carry
+# `#![forbid(unsafe_code)]` in their own source.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+future_incompatible = { level = "warn", priority = -1 }
+unused_macro_rules = "warn"
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+undocumented_unsafe_blocks = "deny"
+todo = "deny"
+unimplemented = "deny"
+exit = "deny"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+doc_markdown = "allow"
+
+# ★ THE MEASUREMENT PROFILES, and why they are copied rather than referenced.
+#
+# A profile is a property of a workspace root, so this package needs its own or a
+# `cargo bench` here would silently fall back to cargo's default release settings
+# (`lto = false`, `codegen-units = 16`) and every ratio would change meaning between
+# the two build systems.  These reproduce the repository-root profiles the suites
+# were measured under, minus `panic = "abort"`: cargo ignores `panic` for test and
+# bench targets, and nothing here ships, so stating it would be noise.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# Note on codegen flags: `-Cllvm-args=-enable-dfa-jump-thread` measurably helps
+# small-chunk throughput and is output-neutral, but it is an LLVM-internal flag, so
+# it stays an opt-in RUSTFLAGS lever for performance runs rather than a committed
+# default that would break a non-LLVM toolchain.
+[profile.bench]
+inherits = "release"
+
+# A measurement instrument, not a build configuration: `bench-parity` exists so the
+# port can be measured the way the C oracle is BUILT, and it never produces an
+# artifact anyone ships.
+#
+# The comparability problem it solves is concrete.  Every throughput number gated on
+# here is a ratio of the port against the in-tree C reference, compiled by
+# `crates/zlib-rs-differential/build.rs` as fifteen separate `-O3 -fPIC` translation
+# units with no cross-unit optimisation whatsoever.  `[profile.bench]` above measures
+# the port with fat LTO and one codegen unit -- an advantage the C side does not have
+# and, in this harness, CANNOT be given: the oracle's symbols are renamed with
+# `objcopy --redefine-syms`, which rewrites the ELF symbol table and cannot reach the
+# names inside the `.gnu.lto_*` IR sections an `-flto` object carries, so an LTO
+# oracle would silently rebind to the port's own symbols and every differential
+# comparison would become the port against itself.  The asymmetry is therefore
+# removed from the Rust side instead, where removing it costs nothing.
+#
+#     ZLIB_RS_BENCH_RUST_PROFILE=bench        cargo bench --profile bench
+#     ZLIB_RS_BENCH_RUST_PROFILE=bench-parity cargo bench --profile bench-parity
+#
+# The environment variable is read by the differential crate's build script and baked
+# into that crate, so a run can state which profile produced it, and the CI gate
+# decides each case on the STRONGER -- that is, the worse-for-the-port -- of the two
+# passes' ratios.  A favourable LTO-only number therefore cannot carry a case alone.
+#
+# `lto = false` and `codegen-units = 16` are cargo's own non-LTO release defaults;
+# `opt-level` and `debug-assertions` are inherited unchanged, because the point is to
+# vary whole-program optimisation and nothing else.
+[profile.bench-parity]
+inherits = "bench"
+lto = false
+codegen-units = 16
+
+# The three suites.  `harness = false` because criterion supplies its own `main`,
+# and the paths are explicit because these files sit beside this manifest rather
+# than in a `benches/` subdirectory of it.
+#
+# Scalar against SIMD for both checksums, and the suite that gives the other two
+# their shared shape -- corpus discovery, per-call gates, criterion group layout and
+# graceful skipping (AAP §0.4.1.5, source `crc32.c`).
+[[bench]]
+name = "checksum_bench"
+path = "checksum_bench.rs"
+harness = false
+
+# Decompression throughput: the port against the in-process C oracle, enforcing the
+# AAP §0.8.4 gate of "decompression throughput within 10% of C zlib" (AAP §0.4.1.5,
+# source `contrib/testzlib/testzlib.c` by way of `inflate.c` and `uncompr.c`).
+[[bench]]
+name = "inflate_bench"
+path = "inflate_bench.rs"
+harness = false
+
+# Compression throughput AND per-stream memory: the port against the in-process C
+# oracle, enforcing BOTH AAP §0.8.4 gates -- "compression throughput within 10% of C
+# zlib" at levels 1, 6 and 9, and "per-stream memory within 15% of C zlib" (AAP
+# §0.4.1.5, source `contrib/testzlib/testzlib.c` by way of `deflate.c`, `trees.c` and
+# `compress.c`; the allocator technique from `test/infcover.c` L56-L200).
+#
+# ★ It must never motivate an encoder change.  AAP §0.7.1(c) forbids tuning
+# `configuration_table`, enabling a non-default compile-time knob or adopting a
+# zlib-ng-style heuristic, however much faster it would be, because each one changes
+# the emitted bytes.  Every admissible lever is output-neutral.
+[[bench]]
+name = "deflate_bench"
+path = "deflate_bench.rs"
+harness = false

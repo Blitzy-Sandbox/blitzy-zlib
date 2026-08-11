@@ -18,14 +18,25 @@
 # `libc`, optional, enabled by the default-on `gz` feature for the two
 # `#[cfg(unix)] libc::fcntl` calls `gzdopen` needs.  `cargo tree -p zlib-rs
 # -e normal` and `cargo tree -p libz-rs-sys -e normal --all-features` are the
-# authority on that.  Everything ELSE cargo-deny can see is dev and build tooling
-# that never reaches libz.so or libz.a: `cc` (plus `shlex` and `find-msvc-tools`)
-# compiling the in-tree C oracle for crates/zlib-rs-differential, and `criterion`
-# with its own substantial closure -- clap, plotters, rayon, serde, regex, walkdir,
-# wasm-bindgen -- behind the benchmark suites.  77 packages resolve in total;
-# `cargo deny --all-features list` enumerates them with their licences.  This file
-# is the mechanical half of keeping the division true: a regression fails the gate
-# instead of passing unnoticed in a diff.
+# authority on that.  Everything ELSE cargo-deny can see here is build tooling that
+# never reaches libz.so or libz.a: `cc`, plus `shlex` and `find-msvc-tools`,
+# compiling the in-tree C oracle for crates/zlib-rs-differential.  **Seven** packages
+# resolve in total -- cc, find-msvc-tools, libc, libz-rs-sys, shlex, zlib-rs,
+# zlib-rs-differential -- and `cargo deny --all-features list` enumerates them with
+# their licences.
+#
+# ★ It used to be seventy-seven, and the difference is criterion.  The benchmark
+# harness with its own substantial closure -- clap, plotters, rayon, serde, regex,
+# walkdir, wasm-bindgen -- was in THIS graph for as long as the three `benches/`
+# suites were attached to crates/zlib-rs-differential.  They are now hosted by
+# `benches/Cargo.toml`, an excluded package with its own lock and its own
+# `benches/deny.toml`, because criterion 0.8.2's 1.86 floor cannot sit in a
+# workspace that declares 1.80.  So the graph audited here is now almost exactly the
+# graph that ships, the two harness graphs are audited separately and to their own
+# policies (`fuzz/deny.toml`, `benches/deny.toml`), and nothing lost coverage -- the
+# `deny` job of .github/workflows/rust.yml runs all three.  This file is the
+# mechanical half of keeping the division true: a regression fails the gate instead
+# of passing unnoticed in a diff.
 #
 # LICENSING
 #
@@ -63,14 +74,16 @@
 # permit an NCSA-licensed crate to enter the SHIPPED graph, which is precisely
 # what this file is for preventing.
 #
-# `Unicode-3.0` is a different case and IS granted below, because it is genuinely
-# in this graph.  unicode-ident 1.0.24 is "(MIT OR Apache-2.0) AND Unicode-3.0" and
-# it arrives through criterion 0.8.2, which
-# `crates/zlib-rs-differential/Cargo.toml` declares in `[dev-dependencies]` to host
-# the three `benches/` suites: criterion -> serde/ciborium -> serde_derive and
-# zerocopy-derive -> syn -> unicode-ident, plus proc-macro2 -> unicode-ident.  It
-# reaches no shipped crate: `cargo tree -p zlib-rs -e normal` and
-# `cargo tree -p libz-rs-sys -e normal` do not mention it.
+# `Unicode-3.0` is the same case for the same reason, and it is NOT granted below any
+# more.  unicode-ident 1.0.24 is "(MIT OR Apache-2.0) AND Unicode-3.0" -- an AND, so
+# the `MIT` entry cannot satisfy it alone -- and it entered this graph only through
+# criterion, by way of serde_derive/zerocopy-derive -> syn -> unicode-ident and
+# proc-macro2 -> unicode-ident.  With the benchmark suites hosted by the excluded
+# `benches/` package, criterion is no longer in this graph at all, so the allowance
+# became unmatched and cargo-deny reported it as a warning.  It now lives in
+# `benches/deny.toml`, which audits the graph that actually needs it.  Measured
+# either way: the entry warned here the moment the suites detached, and removing it
+# returns this gate to zero diagnostics.
 #
 # SCHEMA
 #
@@ -95,15 +108,25 @@
 # with no diagnostics of any kind.  The requirement is zero errors AND zero
 # warnings across all four gates, because an allowance that never matches is
 # reported as a diagnostic and would break the project's zero-warning bar just as
-# a real violation would.  `Unicode-3.0` is the entry that demonstrates this in both
-# directions: it reaches the graph only through the criterion harness, so it was
-# unmatched and reported while that edge was absent and is matched and required now
-# that the benchmark suites are attached.  The one third-party edge the shipped
-# crates keep, `libc` behind the facade's `gz` feature, needs no new allowance: it
-# is "MIT OR Apache-2.0", both of which are already listed for the tooling graph.
-# Measured on the current graph with `--all-features`, criterion and libc both
-# resolved: advisories ok, bans ok, licenses ok, sources ok, no warnings.
-# Re-run the command above after any dependency change and keep this block truthful.
+# a real violation would.  `Unicode-3.0` is the entry that demonstrated this in both
+# directions: it reached this graph only through the criterion harness, so it was
+# unmatched and reported while that edge was absent, matched and required while the
+# benchmark suites were attached to a member, and unmatched and reported again the
+# moment they moved to the excluded `benches/` package -- which is why it is not in
+# the list below and is in `benches/deny.toml` instead.  The one third-party edge the
+# shipped crates keep, `libc` behind the facade's `gz` feature, needs no new
+# allowance: it is "MIT OR Apache-2.0", both of which are already listed for the
+# tooling graph.  Measured on the current seven-package graph with `--all-features`:
+# advisories ok, bans ok, licenses ok, sources ok, no warnings.  Re-run the command
+# above after any dependency change and keep this block truthful.
+#
+# The two harness graphs are audited by the same command against their own manifests
+# and their own policies, and the `deny` job runs all three:
+#
+#   cargo deny --locked --all-features --manifest-path fuzz/Cargo.toml \
+#     --config fuzz/deny.toml check
+#   cargo deny --locked --all-features --manifest-path benches/Cargo.toml \
+#     --config benches/deny.toml check
 
 [graph]
 # No `targets` filter, on purpose.  Narrowing the graph to a single triple would
@@ -149,9 +172,10 @@ ignore = []
 # be worth investigating rather than worth accepting.
 confidence-threshold = 0.93
 # Audit development and build dependencies as well.  cargo-deny skips
-# dev-dependencies by default, which would leave the benchmark and
-# differential-test trees -- by far the largest part of this graph -- unchecked, and
-# would let a copyleft dev-dependency through without a word.
+# dev-dependencies by default, which would leave the differential harness's tree
+# unchecked and would let a copyleft dev-dependency through without a word.  The
+# benchmark harness's own tree is audited by `benches/deny.toml`, and the fuzz
+# harness's by `fuzz/deny.toml`, both with the same keys.
 include-dev = true
 include-build = true
 # Exactly the identifiers this workspace resolves to, and nothing more.  An
@@ -169,40 +193,40 @@ allow = [
     "MIT",
     # The other half of every "MIT OR Apache-2.0" expression above.
     "Apache-2.0",
-    # Required by unicode-ident 1.0.24, whose expression is
-    # "(MIT OR Apache-2.0) AND Unicode-3.0" -- an AND, so the MIT entry above cannot
-    # satisfy it on its own.  It reaches this graph only as a dev-dependency, through
-    # the criterion benchmark harness, which `include-dev = true` above brings into
-    # scope.  The paths, read off `cargo tree -p zlib-rs-differential -e normal,dev`:
-    # criterion -> ciborium -> ciborium-ll -> half -> zerocopy -> zerocopy-derive ->
-    # {proc-macro2, syn 2.0.119} -> unicode-ident, and criterion -> serde ->
-    # serde_derive -> syn 3.0.3 -> unicode-ident.  (Not through clap: criterion does
-    # depend on clap 4.6.5, but that edge stops at clap_builder/clap_lex and pulls in
-    # no derive crate.)  If the benchmark suites are ever detached from this
-    # workspace, remove this entry in the same change -- an allowance that matches
-    # nothing is itself reported as a warning, and `cargo deny check licenses` names
-    # it either way.
-    "Unicode-3.0",
+    # ★ `Unicode-3.0` IS NOT LISTED, and its absence is the same rule applied.
+    # unicode-ident 1.0.24 is "(MIT OR Apache-2.0) AND Unicode-3.0" -- an AND, so the
+    # MIT entry above cannot satisfy it alone -- and it reached this graph only as a
+    # dev-dependency of the criterion benchmark harness.  The suites are now hosted by
+    # the excluded `benches/` package, so criterion is gone from here and the
+    # allowance stopped matching anything; cargo-deny reports an unmatched allowance
+    # as a warning, and this project's bar is zero warnings.  It is granted in
+    # `benches/deny.toml`, where the paths are still real.  If a criterion edge is
+    # ever added back to a member, add the entry back in the same change.
 ]
 
 [bans]
 # A duplicate version in this graph means something went wrong: the shipped crates
 # have no third-party dependencies to disagree about in the first place.
 #
-# `multiple-versions-include-dev` is left at its default of false on purpose, and
-# the reason is current rather than precautionary: the dev graph DOES carry a
-# duplicate today.  criterion 0.8.2 resolves two major versions of syn -- 2.0.119
-# under zerocopy-derive and 3.0.3 under serde_derive, both reported by
-# `cargo tree -p zlib-rs-differential --duplicates` -- and turning the key on would
-# fail this workspace over somebody else's tree.  The alternative, a `skip` entry
-# for syn, would blunt the check permanently and for every future duplicate of that
-# name.  So the key stays off, and what it costs is bounded: the shipped crates
-# have no third-party dependencies at all to disagree about, which is the property
-# `multiple-versions = "deny"` below actually protects.  Note that a bare
-# `cargo tree --duplicates` from the repository root reports nothing, because the
-# root selects only the default members; the duplicate is visible only when the
-# differential crate is selected, which is exactly why this key is documented here
-# instead of being rediscovered later.
+# ★ `multiple-versions-include-dev` IS NOW ON, and it could not be before.
+#
+# It was left at its default of false because the dev graph genuinely carried a
+# duplicate: criterion 0.8.2 resolved two major versions of syn -- 2.0.119 under
+# zerocopy-derive and 3.0.3 under serde_derive -- so turning the key on would have
+# failed this workspace over somebody else's tree, and the alternative, a permanent
+# `skip` entry for syn, would have blunted the check for every future duplicate of
+# that name.
+#
+# Moving the benchmark suites to the excluded `benches/` package removed that
+# criterion edge from this graph, and with it the duplicate.  Measured on the current
+# tree: `cargo tree --locked --workspace --duplicates -e normal,dev,build` and
+# `cargo tree --locked -p zlib-rs-differential --duplicates` both report nothing. So
+# the stronger setting is available for free, and taking it is the point of having
+# removed the edge -- the dev and build tooling this workspace does keep (`cc`,
+# `shlex`, `find-msvc-tools`, `libc`) is now held to the same single-version rule as
+# the shipped graph. criterion's own duplicate is audited where it lives, by
+# `benches/deny.toml`, which keeps this key off for exactly the reason above.
+multiple-versions-include-dev = true
 multiple-versions = "deny"
 # Every version in this workspace was pinned against the registry deliberately,
 # so a `*` requirement is a mistake rather than a shortcut.

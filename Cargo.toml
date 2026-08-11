@@ -139,6 +139,13 @@
 #    make rust-test                                           # link + run the C drivers
 #    make rust-symbols                                        # diff against a built C libz
 #
+#  and the Rust-side gate on the same staged file, which has to be ARMED because the
+#  file it inspects is one `cargo test` never builds, so every assertion about it
+#  skips by default:
+#
+#    ZLIB_RS_REQUIRE_PACKAGED=1 cargo test --locked --release \
+#      -p libz-rs-sys --test symbol_parity -- --nocapture
+#
 #  One table states all of this, in `crates/libz-rs-sys/src/lib.rs`; anything here
 #  or elsewhere that disagrees with it is the thing that is wrong.
 #
@@ -243,7 +250,29 @@ default-members = [
 #     cargo fuzz build --                                   # honours the lock
 #     cargo deny --locked --manifest-path fuzz/Cargo.toml \
 #                --config fuzz/deny.toml check
-exclude = ["fuzz"]
+# ★ TWO DIRECTORIES ARE EXCLUDED, AND BOTH EXCLUSIONS ARE LOAD-BEARING.
+#
+# Each is a package with its own `[workspace]` table, its own committed lock and its
+# own `deny.toml`, and each holds tooling whose dependency graph must not reach the
+# library's:
+#
+#   * `fuzz`    -- libfuzzer-sys and arbitrary, plus a compiler-runtime component,
+#                  none of which belongs in the graph a consumer resolves.
+#   * `benches` -- criterion 0.8.2, which declares `rust-version = "1.86"` and
+#                  reaches clap crates whose manifests are `edition = "2024"`.  While
+#                  the three suites were attached to `crates/zlib-rs-differential` --
+#                  a MEMBER -- cargo 1.80 could not even parse the workspace dev
+#                  graph, so `cargo +1.80 metadata --locked` and `cargo +1.80 check
+#                  --locked --workspace --all-targets` both failed and the declared
+#                  1.80 floor of AAP §0.7.1(h) was not something the workspace could
+#                  actually hold.  With the host outside, all three members inherit
+#                  `rust-version.workspace = true` again and both commands pass.
+#
+# Naming them here is deliberate belt-and-braces: the empty `[workspace]` table in
+# each package is what cargo acts on, and this list is what makes the boundary
+# visible from the root as well.  `benches/Cargo.toml` section 2 carries the full
+# measurement.
+exclude = ["benches", "fuzz"]
 
 # Shared package metadata.  Member crates opt in per field with
 # `<field>.workspace = true`.
@@ -308,10 +337,10 @@ edition = "2021"
 
 # THIS is what clippy's version-aware lints read: clippy.toml declares no `msrv`
 # key, so each package's own `rust-version` is the floor clippy holds it to.  That
-# is deliberate and documented at the top of clippy.toml — the two shipped crates
-# inherit 1.80 from here, while crates/zlib-rs-differential states 1.86 for itself
-# because criterion requires it, and a single `msrv` here would tell clippy
-# something untrue about one of them.
+# is deliberate and documented at the top of clippy.toml — all three members inherit
+# 1.80 from here, and the two EXCLUDED packages that clippy is also run against
+# state their own (`benches/` declares criterion's 1.86), so a single `msrv` key here
+# would tell clippy something untrue about one of them.
 rust-version = "1.80"
 
 # SPDX identifier for the zlib/libpng licence carried in LICENSE.  The same
@@ -409,15 +438,14 @@ symbol_version_nodes = 16
 #     The long note in the table below records why this table is not where it
 #     belongs.
 #
-# Both of the entries below are here because a real target reached for them:
-# `libc` for the two `#[cfg(unix)] libc::fcntl` calls the gzFile layer needs, so
-# `libz-rs-sys/gz` enables it through `dep:libc` and every `libz-rs-sys` build
-# without that feature resolves without it; and `criterion` for the three suites
-# under `benches/`, a dev-only harness reached by exactly one package — the bench
-# targets of crates/zlib-rs-differential — and by nothing that ships.  The note
-# beside criterion records its MSRV consequence, which is real and is why that
-# package states `rust-version = "1.86"` for itself instead of inheriting the
-# workspace floor.
+# One entry is here because a real target reached for it: `libc`, for the two
+# `#[cfg(unix)] libc::fcntl` calls the gzFile layer needs, so `libz-rs-sys/gz`
+# enables it through `dep:libc` and every `libz-rs-sys` build without that feature
+# resolves without it.  `criterion` used to be the second, for the three suites
+# under `benches/`; it is not in this table any more, and the note where it stood
+# records why — its 1.86 floor cannot sit in a workspace that declares 1.80, so the
+# suites and the harness that measures them live in an excluded package with their
+# own lock.
 
 [workspace.dependencies]
 # The safe core, consumed by the facade and by the differential harness.  Cargo
@@ -434,44 +462,41 @@ zlib-rs = { path = "crates/zlib-rs", version = "1.3.2" }
 # [dependencies] or [build-dependencies] of a shipped crate.
 cc = "1.4.0"
 
-# Dev-dependency of the bench targets of crates/zlib-rs-differential ONLY.  The
-# statistics-driven harness AAP §0.5.1.3 pins for the suites AAP §0.3.1 places at
-# `benches/`; it backs the "within 10%" throughput gates of AAP §0.6.4.6 by
-# measuring the port and the in-process C oracle under one sampler.  Licensed
-# "Apache-2.0 OR MIT", which deny.toml allows.  It must never appear in the
-# [dependencies] or [build-dependencies] of a shipped crate.
+# ★ NOT LISTED HERE, AND DELIBERATELY: criterion.
 #
-# THE MSRV CONSEQUENCE IS REAL, and it is why the hosting package states its own
-# floor.  Measured on this tree: criterion 0.8.2 declares `rust-version = "1.86"`
-# and reaches clap 4.6.5, whose clap_builder/clap_lex declare `edition = "2024"`.
-# Cargo 1.80 cannot parse an edition-2024 manifest, so ANY command that resolves
-# the whole workspace dev graph on that toolchain -- `cargo +1.80 metadata`,
-# `cargo +1.80 check --tests`, `--all-targets` -- fails outright:
+# The three suites AAP §0.3.1 places at `benches/` need the statistics-driven harness
+# AAP §0.5.1.3 pins at 0.8.2, and it backs the "within 10%" throughput gates of AAP
+# §0.6.4.6 by measuring the port and the in-process C oracle under one sampler.  It is
+# not in this table, and no member depends on it, because it cannot be in this
+# workspace's graph at all.
+#
+# THE MEASUREMENT.  criterion 0.8.2 declares `rust-version = "1.86"` and reaches clap
+# 4.6.5, whose clap_builder/clap_lex declare `edition = "2024"`.  Cargo 1.80 cannot
+# parse an edition-2024 manifest, so while the suites were attached to
+# `crates/zlib-rs-differential` -- a MEMBER -- every command that resolves the
+# workspace dev graph on the declared floor failed outright:
 #   error: failed to download `clap_builder v4.6.5` … the package requires the
 #          Cargo feature called `edition2024`, but that feature is not
 #          stabilized in this version of Cargo (1.80.1)
-# A package cannot advertise `rust-version = "1.80"` and then require a dev graph
-# 1.80 cannot resolve, so `crates/zlib-rs-differential` now writes an explicit
-# `rust-version = "1.86"` instead of `rust-version.workspace = true` -- shape 1 of
-# the two this note has always named as correct.  (Shape 2, a package in `exclude`
-# with its own lock as `fuzz/` has, is also correct and remains available; shape 1
-# is what the suites use, because `benches/` is attached by path to the one crate
-# that builds the oracle they measure against and adding a fourth member for it
-# would duplicate that build.)
+# A workspace cannot declare `rust-version = "1.80"` (AAP §0.7.1(h)) and then require
+# a dev graph 1.80 cannot resolve, and no manifest key can rescue it: `rust-version`
+# is a declaration, not a resolver directive.
 #
-# THE MSRV GATE IS UNAFFECTED, because it has always named the shipped packages
-# explicitly rather than the workspace:
-#   cargo +1.80 check --locked -p zlib-rs -p libz-rs-sys --all-features --all-targets
-#   cargo +1.80 rustc --locked -p libz-rs-sys --all-features -- -D warnings
-# 1.80 is a promise that the two crates that SHIP compile on that compiler, and
-# criterion reaches neither of them -- `cargo tree -p zlib-rs -e normal` and
-# `cargo tree -p libz-rs-sys -e normal` show it.  What DOES change is that
-# `cargo +1.80 metadata` over the whole workspace no longer resolves; that is a
-# property of criterion, not something this workspace can wish away, and it is the
-# price of the benchmark gates.  Clippy is not part of the MSRV gate either:
-# clippy 1.80 denies 28 things clippy 1.97 does not, all lint drift rather than
-# code defects.  `crates/zlib-rs-differential/Cargo.toml` records the measured list.
-criterion = "0.8.2"
+# THE RESOLUTION is the hosting package in `exclude` with its own lock, the shape
+# `fuzz/` already uses: `benches/Cargo.toml` owns criterion, owns the two measurement
+# profiles, states criterion's 1.86 floor in the one place it is true, and reaches the
+# oracle through a PATH dependency on `crates/zlib-rs-differential`, so nothing is
+# rebuilt or duplicated.  Consequences, all verified:
+#   * all three members inherit `rust-version.workspace = true` (1.80) again;
+#   * `cargo +1.80 check --locked --workspace --all-targets` and
+#     `cargo +1.80 metadata --locked` both succeed, so the floor is a property of the
+#     workspace rather than of a hand-picked package list;
+#   * criterion, clap and their trees are absent from this lock entirely;
+#   * the gates are unchanged -- `cargo bench --manifest-path benches/Cargo.toml`
+#     runs the same three suites against the same oracle.
+# Do NOT reintroduce a criterion edge into any member to "simplify" the layout: that
+# is the change this note exists to prevent, and it silently breaks the MSRV floor
+# again.
 
 # NOT LISTED HERE, BUT PRESENT IN THE GRAPH: libc.
 #
@@ -643,51 +668,15 @@ codegen-units = 1
 # [profile.bench] — cargo will not honour it there.
 panic = "abort"
 
-# Benchmarks must be measured against the same code generation as the shipped
-# library, otherwise the "within 10% of C zlib" throughput gates measure the wrong
-# binary.  Cargo's built-in `bench` profile already inherits `release`, so
-# `inherits` is stated explicitly only to pin that relationship in the manifest and
-# to give bench-specific settings an obvious home.  `panic` is deliberately absent,
-# per the note above.
-[profile.bench]
-inherits = "release"
-
-# Note on codegen flags: `-Cllvm-args=-enable-dfa-jump-thread` measurably helps
-# small-chunk throughput and is output-neutral, but it is an LLVM-internal flag, so
-# it stays an opt-in RUSTFLAGS lever for performance runs rather than a committed
-# default that would break a non-LLVM toolchain.
-
-# A measurement instrument, not a build configuration: `bench-parity` exists so the
-# port can be measured the way the C oracle is BUILT, and it is never used to produce
-# an artifact anyone ships or installs.
+# ★ THE TWO MEASUREMENT PROFILES LIVE WITH THE SUITES, NOT HERE.
 #
-# The comparability problem it solves is concrete.  Every throughput number this
-# workspace gates on is a ratio of the port against the in-tree C reference, compiled
-# by `crates/zlib-rs-differential/build.rs` as fifteen separate `-O3 -fPIC`
-# translation units with no cross-unit optimisation whatsoever.  `[profile.bench]`
-# above measures the port with `lto = "fat"` and `codegen-units = 1`, i.e. with
-# whole-program optimisation across every crate in the workspace — an advantage the C
-# side does not have and, in this harness, CANNOT be given: the oracle's symbols are
-# renamed with `objcopy --redefine-syms`, which rewrites the ELF symbol table and
-# cannot reach the names inside the `.gnu.lto_*` IR sections an `-flto` object carries,
-# so an LTO oracle would silently rebind to the port's own symbols and every
-# differential comparison would become the port against itself.  The asymmetry is
-# therefore removed from the Rust side instead, where removing it costs nothing.
-#
-# Usage, and the rule that makes it mean something:
-#
-#     ZLIB_RS_BENCH_RUST_PROFILE=bench        cargo bench --profile bench
-#     ZLIB_RS_BENCH_RUST_PROFILE=bench-parity cargo bench --profile bench-parity
-#
-# The environment variable is read by the differential crate's build script and baked
-# into the binary, so each log states which profile produced it, and the CI gate
-# decides on the STRONGER — that is, the worse-for-the-port — of the two passes' ratios
-# per case.  A favourable LTO-only number therefore cannot carry a case on its own.
-#
-# `lto = false` and `codegen-units = 16` are cargo's own non-LTO release defaults;
-# `opt-level` and `debug-assertions` are inherited unchanged, because the point is to
-# vary whole-program optimisation and nothing else.
-[profile.bench-parity]
-inherits = "bench"
-lto = false
-codegen-units = 16
+# `[profile.bench]` and the custom `[profile.bench-parity]` used to sit at this
+# point in the file, because the three criterion suites were attached to
+# `crates/zlib-rs-differential`.  They now live in `benches/Cargo.toml`, which is
+# the workspace root that actually builds them -- a profile is a property of a
+# workspace root, so a copy here would apply to nothing.  No member of this
+# workspace declares a bench target, and `cargo bench` from this directory
+# therefore finds none, which is the honest answer rather than an omission: the
+# measurement harness is `cargo bench --manifest-path benches/Cargo.toml`, and the
+# reason it is a separate package is recorded in the `exclude` note above and in
+# section 2 of that file.

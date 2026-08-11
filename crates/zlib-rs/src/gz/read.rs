@@ -1002,20 +1002,43 @@ pub(crate) fn gz_decomp<'a, A: Allocator<'a> + Copy>(
 /// * [`ReturnCode::STREAM_ERROR`] for an unrecognised `how`, or for a size that cannot be doubled
 ///   into a `c_uint`.
 ///
-/// # A behaviour divergence in the [`COPY`] arm -- divergence 9 of the `gz/open.rs` inventory
+/// # ★ The [`COPY`] arm's publication order, and the state C actually leaves behind
 ///
-/// C assigns the byte count straight into `x.have` through `gz_load`'s out-parameter but sets
-/// `x.next = state->out` only after checking for failure (L260-L263), so a read that fails *after*
-/// delivering bytes leaves a count paired with a stale cursor -- and `gz_read`, which proceeds
-/// whenever `x.have != 0` (L359-L361), then hands the application bytes from the wrong place. This
-/// port publishes cursor and count together in both cases, so the delivered bytes are the ones that
-/// were just read.
+/// C's transparent arm passes `&state->x.have` straight to `gz_load`, so the count is written
+/// through that out-parameter as the read progresses, while the `state->x.next = state->out;` that
+/// publishes the window sits *after* the `return -1` (L260-L263). Reading only those four lines
+/// suggests a third state -- a non-zero count paired with a stale cursor, which `gz_read` would then
+/// deliver from the wrong place (L359-L361) -- and this port was written against that reading, in the
+/// opposite direction: it published `(0, count)` before checking, so a failing read delivered the
+/// bytes it had just collected. Both are wrong, and the line that settles it is in `gz_error`:
 ///
-/// That is **not** presented as an improvement: it is an observable difference on the failing path,
-/// and behaviour preservation is this port's governing constraint. It is recorded as **forced and
-/// unresolved**, because reproducing C exactly would mean handing the application bytes from a
-/// stale cursor -- a read of memory the count does not describe. See the inventory in
-/// `gz/open.rs` for the full list and for what "forced, unresolved" means there.
+/// ```c
+/// /* if fatal, set state->x.have to 0 so that the gzgetc() macro fails */
+/// if (err != Z_OK && err != Z_BUF_ERROR && !state->again)
+///     state->x.have = 0;                       /* gzlib.c L563-L565 */
+/// ```
+///
+/// Every failing exit from `gz_load` runs through that (`gzread.c` L41), so the reachable states are
+/// exactly two:
+///
+/// * **Success**, including a non-blocking stall that already had bytes in hand -- `gz_load` returns
+///   0 for that case *before* touching `gz_error` (L36-L40) -- and the cursor and count are published
+///   together at the head of the buffer.
+/// * **Failure**, in which the count is zero by either of two routes. A hard error reaches
+///   `gz_error` with `state->again` clear, and the line above zeroes it; a stall that read *nothing*
+///   leaves `again` set so that line is skipped, but the out-parameter *is* `&state->x.have` and
+///   `gz_load` wrote 0 through it before the first `read` (L25). `x.next` is untouched either way, so
+///   `gz_read` finds `x.have == 0`, sets its own `err`, and the deferred-copy path is never taken.
+///
+/// So the count a failing `gz_load` collected is discarded by design, and the only thing this arm has
+/// to get right is the ORDER: check, then publish. `progress.result?` before
+/// [`GzState::set_output_window`] is that, and it is why the failure path here writes no state of its
+/// own -- the port's `gz_error` implements the same `clear_have` rule at `gz/mod.rs`, so the state
+/// after a failure is C's without this function adding anything.
+///
+/// This closes divergence 9 of the `gz/open.rs` inventory, and it closes it as a plain defect rather
+/// than as a trade-off: no `unsafe`, no out-of-bounds read and no "improvement" was involved, only a
+/// publication that happened before the check instead of after it.
 pub(crate) fn gz_fetch<'a, A: Allocator<'a> + Copy>(
     state: &mut GzState<'a, A>,
 ) -> Result<(), ReturnCode> {
@@ -1030,8 +1053,16 @@ pub(crate) fn gz_fetch<'a, A: Allocator<'a> + Copy>(
             Some(GzHow::Copy) => {
                 let len = widen(state.size()).saturating_mul(2);
                 let progress = gz_load(state, LoadTarget::Output { len });
-                state.set_output_window(0, progress.count)?;
+                // ★ ORDER, AND IT IS C'S ORDER. The failure check comes FIRST (L260-L261) and the
+                // window is published only after it (L262-L263). Publishing before the check -- as
+                // this arm used to -- overwrites what the failure already established: `gz_load`
+                // reports through `gz_error`, whose "if fatal, set state->x.have to 0 so that the
+                // gzgetc() macro fails" (`gzlib.c` L563-L565) leaves the count at ZERO on every
+                // fatal path, and re-publishing `progress.count` here resurrected a count C had
+                // deliberately discarded. See this function's documentation for why no other state
+                // is reachable.
                 progress.result?;
+                state.set_output_window(0, progress.count)?;
                 return Ok(());
             }
             Some(GzHow::Gzip) => {
@@ -2190,6 +2221,17 @@ mod tests {
         AlwaysStall,
         /// Deliver `first` bytes on the first read and stall on every one after that.
         StallAfter(usize),
+        /// Serve bytes normally until `budget` of them have been transferred in total, then report
+        /// `EIO` on every read after that.
+        ///
+        /// A BYTE budget rather than a read count, and that is what makes it useful: `gz_load` loops
+        /// until its window is full (`gzread.c` L29-L35), so a budget that runs out mid-window
+        /// produces a SHORT read followed by a HARD failure. That is the one arrangement in which a
+        /// *failing* `gz_load` has bytes in hand, and therefore the only way to tell "check, then
+        /// publish" apart from "publish, then check" in `gz_fetch`'s transparent arm. A `would_block`
+        /// failure cannot substitute for it: `gz_load` treats a stall with bytes in hand as a
+        /// SUCCESS (L36-L40), which is exactly the distinction from [`Behaviour::StallAfter`].
+        HardAfterBytes(usize),
     }
 
     /// An in-memory stand-in for the file a `gzFile` reads: this module's [`GzHandle`] fixture.
@@ -2200,6 +2242,9 @@ mod tests {
         position: usize,
         behaviour: Behaviour,
         reads: Cell<usize>,
+        /// Bytes handed over so far, which is what [`Behaviour::HardAfterBytes`] budgets. Separate
+        /// from `reads`, because the interesting failure is measured in bytes rather than calls.
+        served: Cell<usize>,
         closes: &'c Cell<usize>,
     }
 
@@ -2210,6 +2255,7 @@ mod tests {
                 position: 0,
                 behaviour,
                 reads: Cell::new(0),
+                served: Cell::new(0),
                 closes,
             }
         }
@@ -2217,6 +2263,10 @@ mod tests {
 
     /// The `EAGAIN` a stalled read reports. The number is Linux's; only `would_block` is acted on.
     const EAGAIN: i32 = 11;
+
+    /// The `EIO` a hard failure reports. Linux's number again, and the value `gz_error` carries into
+    /// `gzerror`; what matters to the layer is only that `would_block` is false.
+    const EIO: i32 = 5;
 
     impl GzHandle for MemoryFile<'_> {
         fn read(&mut self, buf: &mut [u8]) -> Result<usize, GzIoError> {
@@ -2233,11 +2283,19 @@ mod tests {
                         return Err(GzIoError::new(EAGAIN, true));
                     }
                 }
+                Behaviour::HardAfterBytes(budget) => {
+                    let spent = self.served.get();
+                    if spent >= budget {
+                        return Err(GzIoError::new(EIO, false));
+                    }
+                    buf.len().min(budget - spent)
+                }
             };
             let available = self.data.len().saturating_sub(self.position);
             let count = allowance.min(available);
             buf[..count].copy_from_slice(&self.data[self.position..self.position + count]);
             self.position += count;
+            self.served.set(self.served.get() + count);
             Ok(count)
         }
 
@@ -2423,6 +2481,117 @@ mod tests {
         assert_eq!(state.direct(), 1);
         assert_eq!(state.how(), COPY);
         assert_eq!(state.err(), ReturnCode::OK.as_i32());
+    }
+
+    /// ★ A transparent read that fails AFTER delivering bytes delivers NOTHING and reports -1,
+    /// because the failure has already discarded the count.
+    ///
+    /// `gz_fetch`'s `COPY` arm passes `&state->x.have` to `gz_load`, which fills it in as it goes,
+    /// and the `state->x.next = state->out;` that publishes the window sits on the far side of the
+    /// `return -1` (`gzread.c` L260-L263). Those four lines on their own suggest a partial count
+    /// surviving next to a stale cursor, with `gz_read` then copying from the wrong place
+    /// (L359-L361). It does not survive: `gz_load` reports every failure through `gz_error`, and
+    /// `gz_error` zeroes the count on each fatal path -- *"if fatal, set `state->x.have` to 0 so
+    /// that the `gzgetc()` macro fails"* (`gzlib.c` L563-L565). So `gz_read` finds `x.have == 0`,
+    /// takes the `failed` branch, produces nothing, and `gzread` turns that into -1 with `Z_ERRNO`
+    /// latched.
+    ///
+    /// This port used to publish `(0, count)` *before* checking the result, which resurrected the
+    /// count C had thrown away and handed the application the bytes from a failing read. Nothing
+    /// observable separates the two orders unless the failing read had bytes in hand, which is what
+    /// the byte budget arranges: the header sniff spends 8 of the 12, so the transparent load that
+    /// follows gets a short read of 4 and then `EIO`. Behaviour preservation is the contract
+    /// (AAP §0.1.1.1 goal 3), and this is the assertion that holds the order to it.
+    #[test]
+    fn a_failing_transparent_read_delivers_nothing_and_reports_minus_one() {
+        let closes = Cell::new(0);
+        // `want` 8 gives an 8-byte input buffer and a 16-byte output buffer, C's `malloc(want)` and
+        // `malloc(want << 1)` (`gzread.c` L99-L100) -- both small enough to reason about exactly.
+        let data = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let mut state = reader(data, 8, Behaviour::HardAfterBytes(12), &closes);
+
+        // The header sniff fills the 8-byte input buffer, finds no gzip magic and copies those bytes
+        // to the output buffer transparently. Consuming all 8 empties the window, which is
+        // `gz_fetch`'s documented precondition, and leaves 4 bytes of read budget.
+        let mut buf = [0_u8; 8];
+        assert_eq!(gzread(&mut state, &mut buf), 8);
+        assert_eq!(&buf, b"01234567");
+        assert_eq!(state.how(), COPY);
+        assert_eq!(state.have(), 0, "the buffered window must be exhausted");
+        assert_eq!(
+            state.out_pos(),
+            8,
+            "the cursor sits where the consumption ended"
+        );
+
+        // The next request drives `gz_fetch`: the load serves the 4 bytes left in the budget and then
+        // fails with `EIO`, so `gz_load` has a count of 4 and a failure to report at the same time.
+        let mut tail = [0_u8; 4];
+        assert_eq!(
+            gzread(&mut state, &mut tail),
+            -1,
+            "a hard failure with nothing published is -1, not a short count"
+        );
+        assert_eq!(
+            &tail, b"\0\0\0\0",
+            "not one byte of the failing read may reach the caller"
+        );
+        assert_eq!(state.err(), ReturnCode::ERRNO.as_i32());
+        assert_eq!(
+            state.have(),
+            0,
+            "`gz_error` zeroed the count and nothing re-published it"
+        );
+        assert!(
+            !state.again(),
+            "a hard error, not a stall -- which is what makes the count discardable"
+        );
+        // `gzread` reports -1 for the failure itself, so neither end-of-file flag is involved.
+        assert!(!state.eof());
+        assert!(!state.past());
+    }
+
+    /// The same failure, asserted on [`gz_fetch`] directly so that the count, the window and the
+    /// bytes that were actually read are all visible rather than inferred from a return value.
+    ///
+    /// Driving `gz_fetch` itself is what separates the two halves of C's `COPY` arm: the failing call
+    /// must publish no window at all, and yet the bytes it managed to read are sitting in the output
+    /// buffer where the handle put them. Asserting both is what states positively that the count was
+    /// discarded rather than merely unused -- with the publication moved back before the check, the
+    /// window would be exactly those bytes.
+    #[test]
+    fn gz_fetch_publishes_no_window_when_the_transparent_read_fails() {
+        let closes = Cell::new(0);
+        let data = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let mut state = reader(data, 8, Behaviour::HardAfterBytes(12), &closes);
+
+        let mut buf = [0_u8; 8];
+        assert_eq!(gzread(&mut state, &mut buf), 8);
+        assert_eq!(state.how(), COPY);
+        assert_eq!(state.have(), 0);
+        assert_eq!(state.out_pos(), 8);
+
+        assert_eq!(gz_fetch(&mut state), Err(ReturnCode::ERRNO));
+        assert_eq!(
+            state.have(),
+            0,
+            "the arm returns before `set_output_window`, so the discarded count stays discarded"
+        );
+        assert!(
+            state.available_out().is_empty(),
+            "there is no delivery window for `gz_read` to copy from"
+        );
+        // The 4 bytes the handle did deliver are in the buffer, unpublished. `gz_load` reads into
+        // `out` from index 0 (`gzread.c` L260), so this is where the old publication order found the
+        // `have` it should not have had.
+        assert_eq!(&state.out_slice()[..4], b"89ab");
+        // Zero rather than the 8 it was, and not because this arm wrote it: `gz_error` reaches
+        // `clear_have`, which is C's `state->x.have = 0` plus the pointer this port refuses to leave
+        // dangling (`gz/state.rs`, `clear_have`). Once `have` is zero the cursor is unobservable in C
+        // too, because every reader of `x.next` is guarded by `x.have != 0`.
+        assert_eq!(state.out_pos(), 0);
+        assert_eq!(state.err(), ReturnCode::ERRNO.as_i32());
+        assert!(!state.again());
     }
 
     #[test]

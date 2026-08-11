@@ -74,8 +74,7 @@
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::fmt::Write as _;
 use std::fs;
-use std::path::PathBuf;
-use std::process;
+use std::path::{Path, PathBuf};
 
 use z::{gzFile, Z_OK, Z_STREAM_ERROR};
 
@@ -96,37 +95,123 @@ extern "C" {
 //  Scratch files
 // ---------------------------------------------------------------------------------------------
 
-/// A scratch path removed when the guard is dropped, including while a failing test unwinds.
+/// A private directory for one case's `.gz` file, and the file's path inside it.
 ///
-/// The process id plus a per-process counter, in the system temporary directory, so that neither a
-/// concurrent `cargo test` nor the relinked C drivers running in the same tree can collide with it.
+/// # Why the directory carries the security property and the file does not
+///
+/// Every case below opens its scratch file with `gzopen(path, "wb")`, and that is
+/// `open(..., O_CREAT | O_TRUNC, ...)` with **no** `O_EXCL` (`gzlib.c` L228-L244). A predictable
+/// name in a shared, world-writable directory is therefore an attack surface rather than merely a
+/// collision risk: any other user on the machine can plant a symlink at a path a test is about to
+/// create, and the truncating open follows it and destroys whatever it points at. The previous
+/// version of this type built its name from the process id and a counter and then *removed* the
+/// path before using it -- and a process id is neither secret nor unpredictable (it is visible in
+/// `/proc`, drawn from a small space, and reused), while the removal opened a second window between
+/// the check and the open. That is CWE-377, CWE-367 and CWE-59 in three lines.
+///
+/// So the *directory* is what is made safe, and it is created:
+///
+/// * **Unguessable** -- 128 bits from two OS-seeded [`RandomState`](std::hash::RandomState) draws.
+/// * **Owner-only in the same syscall that creates it** -- `mode(0o700)` on the
+///   [`DirBuilder`](fs::DirBuilder), rather than a create followed by a `chmod` that leaves a window
+///   open.
+/// * **Exclusively** -- `create` is the non-recursive form, so an existing path is refused with
+///   [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) rather than adopted. Nothing here ever
+///   removes a path it did not itself create, so a planted entry is refused, never deleted.
+///
+/// That is also what keeps every `gzopen(path, "wb")` below *verbatim*, which matters because these
+/// cases exist to exercise `gzvprintf` against `gzwrite.c`'s documented behaviour and not to
+/// exercise a hardened opener: nothing can pre-exist inside a directory this process just created
+/// empty, so `"wb"` has nothing to be tricked by. (`"wbx"` would be the answer if the file had to
+/// live in a shared directory.)
+///
+/// The same reasoning, and the same three bullets, appear on `GzScratch` in
+/// `crates/libz-rs-sys/tests/c_api_parity.rs`; this type is that one with the file name taken from
+/// a caller's tag.
+///
+/// [`Drop`] removes the tree, so cleanup is panic-safe: a failing assertion anywhere in a case
+/// unwinds through it.
+///
 /// No `tempfile` dev-dependency: AAP 0.7.1(i) keeps the dependency table minimal and `std` makes one
 /// unnecessary.
-struct TempPath(PathBuf);
+struct TempPath {
+    /// The private directory. Removed, with its contents, when this value is dropped.
+    dir: PathBuf,
+    /// The `.gz` file inside it.
+    file: PathBuf,
+}
 
 impl TempPath {
+    /// How many unguessable names to try before giving up.
+    ///
+    /// A collision means another process holds that exact 128-bit name, which is vanishingly
+    /// unlikely; the retries keep one unlucky draw from failing the suite, and the bound keeps a
+    /// temporary directory that refuses *every* create from spinning.
+    const ATTEMPTS: usize = 16;
+
+    /// Creates the private directory and names the file `<tag>.gz` inside it.
+    ///
+    /// Panics saying which step refused, which is right here: this is a test, the failure is an
+    /// environment failure rather than a library one, and continuing would test nothing.
     fn new(tag: &str) -> Self {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "libz-rs-sys-gzprintf-{tag}-{}-{n}.gz",
-            process::id()
-        ));
-        let _ = fs::remove_file(&path);
-        Self(path)
+        use std::hash::{BuildHasher, RandomState};
+        #[cfg(unix)]
+        use std::os::unix::fs::DirBuilderExt;
+
+        let base = std::env::temp_dir();
+        for _ in 0..Self::ATTEMPTS {
+            // Two independent OS-seeded draws, so the name carries 128 bits rather than 64.
+            let high = u128::from(RandomState::new().hash_one(0_u64));
+            let low = u128::from(RandomState::new().hash_one(u64::MAX));
+            let dir = base.join(format!("libz_rs_sys_gzprintf_{:032x}", (high << 64) | low));
+
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            builder.mode(0o700);
+
+            match builder.create(&dir) {
+                Ok(()) => {
+                    let file = dir.join(format!("{tag}.gz"));
+                    return Self { dir, file };
+                }
+                // Someone holds that name. Draw another; nothing is removed.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!(
+                    "cannot create a private scratch directory under {}: {error}",
+                    base.display()
+                ),
+            }
+        }
+        panic!(
+            "{} unguessable names under {} were all taken",
+            Self::ATTEMPTS,
+            base.display()
+        )
+    }
+
+    /// The `.gz` file's path.
+    fn path(&self) -> &Path {
+        &self.file
+    }
+
+    /// The private directory's path.
+    fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// The path as the NUL-terminated bytes `gzopen` wants.
     fn c_string(&self) -> CString {
-        CString::new(self.0.to_str().expect("a temp path is valid UTF-8")).expect("no interior NUL")
+        CString::new(self.file.to_str().expect("a temp path is valid UTF-8"))
+            .expect("no interior NUL")
     }
 }
 
 impl Drop for TempPath {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        // Best effort, and only ever on a directory this process created: a missing tree must never
+        // itself become the failure, and nothing else can have a path into this one.
+        let _ = fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -206,6 +291,102 @@ fn error_of(file: gzFile) -> (c_int, String) {
 // ---------------------------------------------------------------------------------------------
 //  The cases
 // ---------------------------------------------------------------------------------------------
+
+/// ★ The scratch directory this suite writes into is private, unguessable and exclusively created.
+///
+/// The property [`TempPath`] exists for, asserted rather than described. Every case below opens its
+/// file with `gzopen(path, "wb")`, which is `O_CREAT | O_TRUNC` and **not** `O_EXCL`
+/// (`gzlib.c` L228-L244), so the only thing standing between that truncating open and a planted
+/// symlink is the directory it happens inside. A regression here -- a name made predictable again, a
+/// `chmod` moved out of the creating syscall, a `create` made recursive so that an existing path is
+/// adopted -- would leave every other case in this file passing.
+///
+/// Five separate things are checked, because each of the three bullets on [`TempPath`] can regress
+/// on its own: the names differ, the file is *inside* the directory, the directory is empty and
+/// `0700`, a second create at the same name is refused rather than adopted, and the guard removes
+/// the whole tree.
+#[test]
+fn the_scratch_directory_is_private_unguessable_and_exclusively_created() {
+    let first = TempPath::new("guard");
+    let second = TempPath::new("guard");
+
+    // The same tag twice: two guards must still name two directories, so neither a second
+    // invocation of this binary -- the `simd` matrix row runs the identical suite -- nor the
+    // relinked C drivers in the same tree can land on the one this case owns.
+    assert_ne!(
+        first.dir(),
+        second.dir(),
+        "each guard owns its own directory"
+    );
+    assert_ne!(first.path(), second.path(), "and therefore its own file");
+
+    // The fixed file name is safe only because of where it is: inside a directory nothing else can
+    // reach. Both halves of that are asserted, so a future change that moved the file up a level
+    // would fail here rather than silently reopen the hole.
+    assert_eq!(
+        first.path().parent(),
+        Some(first.dir()),
+        "the .gz file must live inside the private directory"
+    );
+    assert_eq!(
+        first.path().file_name().and_then(std::ffi::OsStr::to_str),
+        Some("guard.gz"),
+        "the file name comes from the tag, unchanged"
+    );
+
+    // `symlink_metadata` rather than `metadata`: the assertion is about the entry itself, not about
+    // whatever a link at that path might resolve to.
+    let meta = fs::symlink_metadata(first.dir()).expect("the private directory must exist");
+    assert!(meta.is_dir(), "the guard must have created a directory");
+    assert_eq!(
+        fs::read_dir(first.dir())
+            .expect("the private directory must be readable")
+            .count(),
+        0,
+        "a freshly created private directory is empty, which is what leaves `wb` nothing to follow"
+    );
+
+    // Owner-only, and set by the syscall that created the directory rather than by a later `chmod`
+    // that would leave a window open.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o700,
+            "the directory must be traversable by its owner alone"
+        );
+    }
+
+    // Exclusive creation. This is the property that makes a planted entry harmless: the guard draws
+    // another name rather than deleting whatever it found, so `AlreadyExists` has to be what a
+    // create at an occupied name reports.
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(false);
+    let refused = builder
+        .create(first.dir())
+        .expect_err("a non-recursive create at an existing path must fail");
+    assert_eq!(
+        refused.kind(),
+        std::io::ErrorKind::AlreadyExists,
+        "an occupied name must be refused, never adopted"
+    );
+
+    // And the guard removes the tree it made, contents included, so nothing accumulates in the
+    // shared temporary directory across runs.
+    let remembered_dir = first.dir().to_path_buf();
+    let remembered_file = first.path().to_path_buf();
+    fs::write(&remembered_file, b"scratch").expect("the private directory must be writable");
+    drop(first);
+    assert!(
+        !remembered_file.exists(),
+        "the file must go with the directory"
+    );
+    assert!(
+        !remembered_dir.exists(),
+        "the private directory must be removed when the guard is dropped"
+    );
+}
 
 /// A caller-built `va_list` reaches `gzvprintf`, which reports the exact byte count it wrote.
 ///

@@ -66,14 +66,27 @@ MODULE.bazel.lock
 # dirty working tree.  See the "WHAT IS NEVER COMMITTED, AND WHAT IS" section of
 # fuzz/Cargo.toml.
 #
+# The same applies a third time to benches/Cargo.lock.  benches/ is excluded from
+# the root workspace and is its own workspace root, because criterion 0.8.2 declares
+# rust-version 1.86 and reaches edition-2024 clap manifests that cargo 1.80 -- this
+# project's declared floor -- cannot parse at all; hosting the suites inside the
+# workspace made `cargo +1.80 metadata --locked` and `cargo +1.80 check --locked
+# --workspace --all-targets` fail outright.  Its lock is tracked because the
+# throughput and memory gates are only meaningful against a fixed sampler.  See
+# section 2 of benches/Cargo.toml.
+#
 # Cargo writes every product of the root workspace -- the three crates under
-# crates/, their test binaries and any bench target they host -- into the one
-# target/ directory at the top of the tree, so a single anchored rule covers the
-# whole library build.
+# crates/ and their test binaries -- into the one target/ directory at the top of
+# the tree, so a single anchored rule covers the whole library build.
 /target/
 # fuzz/ is excluded from the root workspace and is its own workspace root, so
 # cargo gives it a target/ of its own that the anchored rule above cannot reach.
 fuzz/target/
+# benches/ is excluded for the same structural reason and gets the same treatment:
+# `cargo bench --manifest-path benches/Cargo.toml` writes benches/target/, which
+# includes criterion's own reports under benches/target/criterion/.  Runtime
+# measurement output, never source.
+benches/target/
 # Being its own workspace root, fuzz/ resolves independently and cargo writes a
 # second lock file there.  That one IS committed, exactly like the root
 # Cargo.lock: fuzz/deny.toml audits the harness graph against it and both
@@ -109,3 +122,12 @@ fuzz/corpus/
 /c.syms
 /missing.syms
 /extra.syms
+
+# Bytecode from the benchmark gate.  `.github/scripts/bench_gate.py` is compiled
+# with `python3 -m py_compile` before it is trusted -- a gate that cannot even be
+# compiled must fail at setup rather than six steps later -- and its self-test
+# imports nothing, but py_compile still writes a __pycache__ beside the source.
+# Build output, never source, and the rule is unanchored so it covers the
+# self-test's cache too.
+__pycache__/
+*.pyc

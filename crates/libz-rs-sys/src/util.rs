@@ -582,6 +582,28 @@ const SPRINTF_RETURNS_VOID_BIT: uLong = 0;
 /// test named below closes the loop by taking the address of both symbols, so a build
 /// whose flags word claims them cannot even link without them.
 ///
+/// # ★ The one artifact where this bit and the symbol table disagree
+///
+/// The cfg records that the shim was **compiled**; it cannot record whether a given
+/// artifact **exported** it, and for one of the three cargo emits those differ. The
+/// shim's objects are archived into `libz.a`, and rustc gives a C-contributed symbol no
+/// entry in a `cdylib`'s dynamic table, so `target/<profile>/libz.so` reports this bit
+/// clear while neither name appears in its `.dynsym`. No `cfg` could express the
+/// difference even in principle: cargo passes `--crate-type` three times in **one**
+/// rustc invocation, so all three artifacts contain the same compiled constant.
+///
+/// That is not a defect to work around here, because the `cdylib` is not an artifact
+/// that ships -- `src/lib.rs`'s artifact matrix marks it not installable, and the two
+/// that do ship both export the pair. What the port owes instead is proof, and there are
+/// two gates rather than a comment:
+/// `tests/symbol_parity.rs::compile_flags_bit_27_agrees_with_the_shipping_artifacts`
+/// requires bit 27 clear to mean both names are present in `libz.a` **and** in the
+/// packaged `libz.so.<ZLIB_VERSION>` (and bit 27 set to mean both are absent), and
+/// `cargo_cdylib_matches_its_measured_shape` pins the development artifact's deviation
+/// so it cannot widen unnoticed. Anyone tempted to "fix" the bit for the `cdylib` should
+/// read those two first: clearing it there would misdescribe the static and packaged
+/// libraries, which are the ones a consumer installs.
+///
 /// cbindgen:ignore
 const GZPRINTF_UNAVAILABLE_BIT: uLong = if cfg!(zlib_rs_gzprintf) { 0 } else { 1 << 27 };
 

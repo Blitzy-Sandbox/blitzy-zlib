@@ -26,11 +26,12 @@
 #  Gate 2 -- this file's own gate -- now runs end to end, in two halves.
 #  `make rust-header` implements rules A1, A2, A5 and A9 and the standalone
 #  C89/C99/C17/C++17 compile sweep; `rust.yml`'s header-conformance job runs that
-#  target and then the SHAPE half -- rules A3, A4, A6, A7, A8 and rule 10 -- by
-#  re-declaring every generated prototype in a translation unit that has already
-#  included `zlib.h`, so the C compiler itself reports a conflicting type, and by
-#  comparing struct sizes, field offsets and macro values through one probe
-#  program per side.  So "NORMALISATION RULES THE GATE MUST IMPLEMENT" below is
+#  target and then the SHAPE half -- rules A3, A4, A6, A7, A8, rule 10 and the
+#  literal diff of rule A11 -- by re-declaring every generated prototype in a
+#  translation unit that has already included `zlib.h`, so the C compiler itself
+#  reports a conflicting type; by diffing a canonical, compiler-resolved rendering
+#  of all 95 contract signatures and requiring NO OUTPUT; and by comparing struct
+#  sizes, field offsets and macro values through one probe program per side.  So "NORMALISATION RULES THE GATE MUST IMPLEMENT" below is
 #  both the specification and a description of what runs; where a rule is
 #  implemented, the rule says by which half.  Statements of the form "verified" or
 #  "reproduced" are marked where they were established against cbindgen 0.29.4
@@ -43,9 +44,12 @@
 #
 #    cbindgen --config cbindgen.toml --crate libz-rs-sys --output generated_zlib.h
 #
-#  A bare `diff -u zlib.h generated_zlib.h` is a USEFUL EYEBALL, NOT THE GATE --
-#  see "READ THIS BEFORE CHANGING THE CI GATE" below for why its output can never
-#  be empty and what the gate does instead.
+#  A bare `diff -u zlib.h generated_zlib.h` compares the two FILES, which is a
+#  different question from whether the CONTRACT diverges: its output can never be
+#  empty, so CI runs it and publishes it as evidence rather than as the check.
+#  The check is rule A11, and it IS a literal diff that must be empty -- of a
+#  canonical, compiler-resolved rendering of every contract signature.  See "READ
+#  THIS BEFORE CHANGING THE CI GATE" below.
 #
 #  `generated_zlib.h` is scratch.  `.gitignore` has an anchored `/generated_zlib.h`
 #  rule precisely so it can never be committed: a second header sitting beside
@@ -59,11 +63,26 @@
 #
 #  READ THIS BEFORE CHANGING THE CI GATE
 #  ------------------------------------------------
-#  A verbatim `diff -u zlib.h generated_zlib.h` is NOT empty and never will be,
-#  so it must never be wired up as the pass/fail check.  Run it by hand to read
-#  the differences; make the GATE the normalised comparison specified under
-#  "NORMALISATION RULES THE GATE MUST IMPLEMENT" below, which is the only form of
-#  the comparison that can legitimately pass.
+#  THERE IS A LITERAL DIFF AND IT MUST BE EMPTY.  Rule A11 below renders each
+#  side's contract signatures through the C++ compiler's own name mangling -- so
+#  the `zconf.h` typedef chain, the parameter names, bare `unsigned`, the
+#  ZEXTERN/ZEXPORT/FAR/z_const decoration and the declaration order are resolved
+#  by the compiler and not by a normaliser -- and requires `diff -u` of the two
+#  renderings to produce NO OUTPUT.  Never replace that with a comparison that
+#  merely reports agreement: "the signatures were compared" and "their diff is
+#  empty" are different claims, AAP 0.8.6 freezes the second, and this gate spent
+#  a revision claiming the first.
+#
+#  A verbatim `diff -u zlib.h generated_zlib.h` -- the two FILES -- is NOT empty
+#  and never will be, because cbindgen emits no comments, no ZEXTERN/ZEXPORT, no
+#  function-like macros and no conditional include of `zconf.h`.  It must not be
+#  the pass/fail check, and it is not omitted either: the `header` job runs it,
+#  writes it to target/header-gate/aap-0.8.6-raw.diff and publishes it with the
+#  job's artifacts, so that what it contains can be checked against the
+#  "ACCEPTED DIVERGENCES" list rather than taken on trust.  When a divergence is
+#  removable at the SOURCE, remove it there instead of adding an allowance -- D2
+#  is the worked example, and closing it is what left rule A11's diff empty with
+#  no allowance at all.
 #
 #  The gate is a SIGNATURE-AND-CONSTANT gate: it must fail on any divergence in a
 #  public signature -- a changed parameter type, a changed return type, a missing
@@ -90,15 +109,33 @@
 #      it also included `zconf.h` -- which D3 shows it cannot.  The gate strips
 #      all five tokens from the reference side.
 #
-#  D2. Struct tag names.  `style = "type"` emits
-#      `typedef struct { ... } z_stream;`, whereas `zlib.h` names the tags:
-#      `typedef struct z_stream_s { ... } z_stream;`, likewise `gz_header_s`.
-#      `struct gzFile_s` is the mirror image -- `zlib.h` declares it as a bare
-#      tag with no typedef, the generated header as a typedef.  Layout, field
-#      order and field types are identical in every case, and those are what
-#      `layout_assertions.rs` and `tests/abi_layout.rs` will verify once the
-#      facade lands; the tag spellings carry no ABI weight.  The gate compares
-#      struct FIELDS, not the typedef/tag form.
+#  D2. Struct tag names -- CLOSED, and worth recording as closed because the
+#      closure is what lets rule A11's diff be empty rather than nearly empty.
+#      This used to read: `style = "type"` emits `typedef struct { ... }
+#      z_stream;` while `zlib.h` names the tag, `typedef struct z_stream_s { ...
+#      } z_stream;`, and the tag spelling carries no ABI weight so the gate
+#      compares fields instead.  Both halves of that were true and the
+#      conclusion was still the wrong one: `struct z_stream_s` is part of the
+#      API a caller may name, an anonymous tag cannot express it, and a
+#      comparison that normalises the difference away is a comparison with an
+#      allowance in it.
+#
+#      So the difference was removed at the source rather than normalised: the
+#      facade's structs carry the CONTRACT's tag names (`z_stream_s`,
+#      `gz_header_s`, `gzFile_s`) and publish the typedefs `z_stream` and
+#      `gz_header` as aliases beside them, and `style = "both"` below emits both
+#      halves.  The generated header now declares `typedef struct z_stream_s {
+#      ... } z_stream_s;` plus `typedef struct z_stream_s z_stream;`, so every
+#      name `zlib.h` publishes is present under the same spelling, resolved
+#      signatures match with NO tag allowance, and `typedef struct gzFile_s
+#      *gzFile;` is now character-for-character what `zlib.h` L1354 writes.
+#
+#      What remains is an ADDITION rather than a divergence: the generated header
+#      also publishes `z_stream_s` and `gz_header_s` as typedef names, and
+#      `gzFile_s` as one, where `zlib.h` leaves those as tags only.  An extra
+#      typedef spelling for a type the contract already publishes cannot break a
+#      consumer of `zlib.h`, which is the header that is installed; the generated
+#      artifact is a verification input and is never installed.
 #
 #  D3. Includes.  `zlib.h` includes exactly one header, conditionally:
 #      `#ifdef ZLIB_BUILD` -> `<zconf.h>`, `#else` -> `"zconf.h"`.  cbindgen
@@ -308,7 +345,7 @@
 #
 #  NORMALISATION RULES THE GATE MUST IMPLEMENT
 #  -------------------------------------------
-#  This is the SPECIFICATION of the comparison, and all ten rules now run.
+#  This is the SPECIFICATION of the comparison, and all eleven rules now run.
 #
 #  `make rust-header` (Makefile.in) regenerates the artifact, requires cbindgen's
 #  stderr to be within an enumerated two-line allowance, compiles the result
@@ -331,10 +368,16 @@
 #  set EQUALITY of the contract-shaped macro names, both directions, with its one
 #  allowance (`Z_U4`) named and printed.
 #
+#  Rule A11 then puts the comparison in the form AAP 0.8.6 froze: the same
+#  compiler renders each side's signatures canonically, and a literal `diff` of
+#  the two renderings must be EMPTY.  Compiler re-declaration and an empty diff
+#  are not redundant -- the first pinpoints a mismatch by file and line, the
+#  second is the artifact a reader can check without rerunning anything.
+#
 #  Measured on this tree: 95 of the 96 contract signatures compared by the
 #  compiler (the 96th is the `gzopen_w` allowance below), four typedefs, 38
 #  integer macros, three struct sizes, 30 struct fields, and 39 contract-shaped
-#  macro names against 38.  Ten rules, in this order:
+#  macro names against 38.  Eleven rules, in this order:
 #
 #  PASS A -- SIGNATURES, STRUCTS AND TYPEDEFS
 #  Validated against this configuration; reduces the comparison to ZERO
@@ -383,7 +426,34 @@
 #       conditional renaming blocks are excluded here by D4 and are covered
 #       by the mechanisms D4 names.
 #
-#  After rules 1-10, compare the two name -> normalised-signature maps and the
+#   A11. THE LITERAL DIFF, required to be EMPTY.  Rules A1-A9 describe a
+#       comparison; this rule fixes the FORM it takes, because "the signatures
+#       were compared" and "a diff of the signatures is empty" are different
+#       claims and AAP 0.8.6 freezes the second one.
+#
+#       Render each side's contract signatures as one `name<TAB>type` line per
+#       function, where the type is produced BY THE C++ COMPILER: for every
+#       function an explicit instantiation of `zrs_sig<zrs_tag_NAME,
+#       decltype(&NAME)>` is emitted and `nm -C` prints the mangled type back.
+#       Itanium mangling has already applied A4, A6, A7 and A8 in order to reach
+#       a type at all, and the tag parameter keys the line by name (A5), so the
+#       two projections are directly comparable text.  `diff -u ref gen` over
+#       them must produce NO OUTPUT.  The `header` job of
+#       .github/workflows/rust.yml implements this as its pass D, asserts the
+#       projection carries one line per compared function so a lost function
+#       cannot shorten both sides into agreement, and floors the count at 90.
+#
+#       This rule is why D2 was closed rather than normalised: with the tag
+#       spellings matching, the diff is empty with no allowance of any kind.
+#
+#       `diff -u zlib.h generated_zlib.h` -- the two FILES, as AAP 0.8.6 writes
+#       it -- is run as well, written to target/header-gate/aap-0.8.6-raw.diff
+#       and published with the job's artifacts.  It is not the pass/fail check
+#       and cannot be: D1, D3, D5, D7, D8, D9 and D10 each guarantee output no
+#       generator configuration can remove.  It is published so that a reviewer
+#       can confirm the difference consists of those reasons and nothing else.
+#
+#  After rules A1-A11, compare the two name -> normalised-signature maps and the
 #  two name -> integer-value maps.  A name present on one side only (D11
 #  excepted), a name mapped to different signature text, or a constant with a
 #  different value, is a FAILURE.
@@ -534,9 +604,11 @@ include_guard = "ZLIB_H"
 # mangle the symbol names.  See D10 for the span difference.
 cpp_compat = true
 
-# Emits `typedef struct { ... } z_stream;` -- a typedef without a tag.  See D2:
-# the ABI is identical, only the tag spelling is lost.
-style = "type"
+# Emits BOTH halves of each struct declaration -- `typedef struct z_stream_s {
+# ... } z_stream_s;` -- so the contract's struct TAGS reach the artifact.  `"type"`
+# was here and emitted an anonymous tag; see D2 for why that was closed rather
+# than normalised away, and rule A11 for the diff it makes empty.
+style = "both"
 
 # Alphabetical, deterministic ordering.  See D7 for why this is a feature and
 # not a compromise.

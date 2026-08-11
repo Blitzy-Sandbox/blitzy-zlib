@@ -63,8 +63,9 @@
 //! # The fast default. Always runs; representative rather than arbitrary.
 //! cargo test --locked -p zlib-rs-differential --release --test byte_identical
 //!
-//! # The exhaustive sweeps. The `differential` job in .github/workflows/rust.yml runs this
-//! # line as well as the one above, so both halves are gated on every push.
+//! # The exhaustive sweeps. The `differential-exhaustive` job in .github/workflows/rust.yml runs
+//! # this line -- sharded, sixteen ways -- on every push, and the `differential` job runs the one
+//! # above, so both halves are gated. See the note below on which mode each trigger uses.
 //! ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE=1 cargo test --locked -p zlib-rs-differential --release \
 //!     --test byte_identical -- --ignored --test-threads 4
 //!
@@ -75,11 +76,21 @@
 //!     --ignored --test-threads 4
 //!
 //! # The unabridged form: the same product with the one fixture-size exclusion lifted, so the
-//! # shards report excluded_tiny_window=0 and coverage=100.00%.
+//! # shards report excluded_tiny_window=0 and coverage=100.00%.  The `schedule` trigger of
+//! # .github/workflows/rust.yml runs exactly this, nightly, across all sixteen shard jobs.
 //! ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE=full ZLIB_RS_DIFFERENTIAL_SHARD=3/8 \
 //!     cargo test --locked -p zlib-rs-differential --release --test byte_identical -- \
 //!     --ignored --test-threads 4
 //! ```
+//!
+//! ★ **Which of the two modes CI runs, and when.** Both are gated; neither is optional. A push and
+//! a pull request run the armed product -- 9,459,450 of the 9,922,500 cells -- because lifting the
+//! one exclusion costs roughly four times the wall clock, and the nightly `schedule` run of the
+//! `differential-exhaustive` job runs `full`, so the remaining 463,050 cells are verified
+//! continuously rather than only when a human remembers to ask. That job's coverage gate checks the
+//! event against the mode, so a workflow edit that silently returned the scheduled run to the
+//! abridged product fails instead of passing. `workflow_dispatch` still offers `full` for asking
+//! early; it is no longer the only way to reach it.
 //!
 //! The env var and `--ignored` are **both** required: `#[ignore]` keeps the sweeps out of a default
 //! run, and the variable is what makes them do their work rather than report that they were not
@@ -88,11 +99,12 @@
 //! `--test-threads` is the parallelism knob and it matters: the exhaustive configuration sweep is
 //! **sharded one level per `#[test]`** precisely so that cargo's own harness can run the shards
 //! concurrently, which needs no dependency and no thread of this file's own. Set it to the runner's
-//! core count -- the workflow passes `$(nproc)` for that reason.
+//! core count -- the workflow passes `--test-threads 4` for that reason, matching the four cores a
+//! GitHub-hosted `ubuntu-latest` runner provides.
 //!
 //! # Cost, and what governs it
 //!
-//! The exhaustive form is the long pole of the `differential` job, and three things set its
+//! The exhaustive form is the whole of the `differential-exhaustive` job, and three things set its
 //! duration: the shard count, since the shards are what run in parallel; the window size, since a
 //! tiny window over an incompressible fixture costs one `deflate` call per byte through it; and the
 //! profile, since a debug build of this suite is roughly an order of magnitude slower than a release
@@ -2338,6 +2350,12 @@ fn algorithm_family_representatives() -> Vec<c_int> {
 const ENV_EXHAUSTIVE: &str = "ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE";
 
 /// The value that additionally lifts the fixture-size constraint inside the chunking sweep.
+///
+/// Not a manual-only mode: the nightly `schedule` run of `.github/workflows/rust.yml`'s
+/// `differential-exhaustive` job sets it unconditionally, which is what makes the whole
+/// 9,922,500-cell product a continuously verified gate rather than something a human has to
+/// remember. A push and a pull request run the armed 9,459,450 for wall-clock reasons, and the
+/// coverage gate in that job checks the triggering event against the mode so the two cannot drift.
 const ENV_EXHAUSTIVE_FULL: &str = "full";
 
 /// How the exhaustive sweeps were asked to run.
@@ -2635,7 +2653,9 @@ fn default_matrix_is_byte_identical() {
 /// windows with `window_boundary.bin`'s 66,560 incompressible bytes -- 46,305 cells of the 992,250,
 /// counted on the accounting line and lifted entirely by
 /// `ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE=full`, which then reports `excluded_tiny_window=0` and 100%
-/// coverage.
+/// coverage. Those 463,050 cells across the ten levels are not left to a manual run: the nightly
+/// `schedule` trigger of `.github/workflows/rust.yml` runs every shard in `full` mode, and that
+/// job's coverage gate refuses a scheduled run that is not unabridged.
 fn exhaustive_configuration_shard(what: &str, level: c_int) {
     if !armed(what) {
         return;
@@ -2712,7 +2732,7 @@ macro_rules! configuration_shard {
     ($name:ident, $level:expr) => {
         #[test]
         #[ignore = "one shard of the full cross product; armed by ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE, run \
-                  by the differential CI job"]
+                  by the differential-exhaustive CI job"]
         fn $name() {
             exhaustive_configuration_shard(stringify!($name), $level);
         }
@@ -2764,7 +2784,7 @@ fn exhaustive_configuration_shards_cover_every_level() {
 /// arithmetic would surface.
 #[test]
 #[ignore = "the full chunking sweep; armed by ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE, run by the \
-              differential CI job"]
+              differential-exhaustive CI job"]
 fn exhaustive_chunking_matrix() {
     if !armed("exhaustive_chunking_matrix") {
         return;

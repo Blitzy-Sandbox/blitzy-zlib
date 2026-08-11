@@ -80,6 +80,37 @@
 //! the rest of that file, by `make rust-symbols` and by the `symbols` job of
 //! `.github/workflows/rust.yml`.
 //!
+//! ★ The packaged row's gates are **armed**, not merely present. Every one of
+//! them inspects a file `cargo test` does not build, so each skips when
+//! `target/dropin` is empty -- right for a developer, and vacuous for CI, where a
+//! job could stage the drop-in, run the suite, print `SKIP:` for all nine gates
+//! and be recorded green. `ZLIB_RS_REQUIRE_PACKAGED=1` turns each of those skips
+//! into a failure that names what went unverified, and the `symbols` job sets it
+//! and additionally fails on any `SKIP:` line in the output:
+//!
+//! ```text
+//! make rust CARGO=cargo                                    # stage target/dropin
+//! ZLIB_RS_REQUIRE_PACKAGED=1 cargo test --locked --release \
+//!   -p libz-rs-sys --test symbol_parity -- --nocapture      # 16 gates, zero skips
+//! ```
+//!
+//! Two of those gates are worth naming because they are what keeps the second row
+//! from being read as a shipping artifact.
+//! `versioned_symlink_chain_present` asserts the **topology** the C build
+//! produces -- the versioned file real, `libz.so.1` and `libz.so` symlinks whose
+//! recorded target is that bare name -- rather than only that three names resolve
+//! to one object, which a `cp -L` copy or three independent files would also
+//! satisfy. And `compile_flags_bit_27_agrees_with_the_shipping_artifacts` ties
+//! `zlibCompileFlags()`'s "gzprintf is present" claim to the symbol tables of
+//! `libz.a` and the packaged library, because the `cdylib` is the one artifact
+//! where that bit and the dynamic table disagree: the shim's objects are in the
+//! archive, and rustc gives a C-contributed symbol no dynamic entry, so the bare
+//! `cdylib` reports the pair available while exporting neither. `src/util.rs`
+//! documents that at the constant; cargo compiles all three artifacts from one
+//! rustc invocation -- measured: one `--crate-name z` command carrying
+//! `--crate-type` three times -- so no `cfg` could report a different word per
+//! artifact even in principle.
+//!
 //! ## ★ Why the `cdylib` is not the shipped library, and cannot be made into one
 //!
 //! It is tempting to read the second row as "`cargo build` gives you the drop-in".
@@ -127,7 +158,7 @@
 //! archive, same `zlib.map`, same SONAME, same chain — and additionally installs
 //! the result, so the two build systems reach one artifact by one recipe rather
 //! than two. `.github/workflows/rust.yml` exercises both: its `symbols`,
-//! `dropin` and `cmake` jobs each start from `libz.a` and each assert the
+//! `dropin` and `cmake-rust` jobs each start from `libz.a` and each assert the
 //! packaged library with `ldd` rather than inferring the binding from a test
 //! that passed.
 //!
@@ -583,13 +614,19 @@
 //!
 //! ```text
 //! cbindgen --config cbindgen.toml --crate libz-rs-sys --output generated_zlib.h
-//! diff -u zlib.h generated_zlib.h    # a reading aid, NOT a pass/fail check
+//! diff -u zlib.h generated_zlib.h    # the two FILES: published, not gated
+//! make rust-header                   # names, warnings, C89/C99/C17/C++17
 //! ```
 //!
-//! The `diff` is deliberately labelled: its output is never empty and never will be,
-//! for the structural reasons `cbindgen.toml` enumerates, so it is something to read
-//! rather than something to gate on. Compiling the generated header, however, *is* a
-//! real check, and it is the one that catches a doc comment which breaks the output.
+//! Two diffs, and only one of them can be empty. The `diff` of the two FILES never
+//! will be, for the structural reasons `cbindgen.toml` enumerates -- no comments, no
+//! `ZEXTERN`/`ZEXPORT`, no function-like macros -- so the `header` job runs it and
+//! publishes it as evidence. The diff that IS the gate is rule A11's: both headers'
+//! contract signatures rendered canonically by the C++ compiler's own mangling and
+//! diffed, with **no output permitted**. It is empty today for all 95 signatures,
+//! with no allowance of any kind. Compiling the generated header is a third,
+//! independent check, and it is the one that catches a doc comment which breaks the
+//! output.
 //!
 //! Three consequences shape the module tree below.
 //!

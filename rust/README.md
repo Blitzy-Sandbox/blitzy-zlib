@@ -23,9 +23,9 @@ that oracle keeps working.
 | Path | Role |
 |---|---|
 | `crates/zlib-rs` | The safe core. `#![forbid(unsafe_code)]`, `no_std` + `alloc`, and an empty `[dependencies]` table. Every algorithm lives here. |
-| `crates/libz-rs-sys` | The C ABI facade, and the only crate permitted to write `unsafe`. `[lib] name = "z"` with `crate-type = ["cdylib", "staticlib", "rlib"]`. |
-| `crates/zlib-rs-differential` | Dev-only oracle harness. Its build script compiles the in-tree C translation units into a test-only archive, so both implementations are co-resident in one process and comparing them is a memory compare. |
-| `benches/` | Three criterion suites, attached to the differential crate because they measure against the same oracle. |
+| `crates/libz-rs-sys` | The C ABI facade, and the only **shipped** crate that writes `unsafe` — all of it under `src/`, one `// SAFETY:` comment per block. `[lib] name = "z"` with `crate-type = ["cdylib", "staticlib", "rlib"]`. |
+| `crates/zlib-rs-differential` | Dev-only oracle harness. Its build script compiles the in-tree C translation units into a test-only archive, so both implementations are co-resident in one process and comparing them is a memory compare. It has an unsafe boundary of its own — `src/oracle.rs` declares the C entry points and `src/port.rs` wraps them in safe gates — which is why the benches and the fuzz targets need none. |
+| `benches/` | Three criterion suites. Its own workspace, listed under `exclude` in the root `Cargo.toml`, with its own `Cargo.lock` and its own `deny.toml`, because criterion's MSRV is higher than the library's. It measures against the differential crate's oracle through a path dependency on it. |
 | `fuzz/` | Five cargo-fuzz targets. Its own workspace, listed under `exclude` in the root `Cargo.toml`, with its own `Cargo.lock` and its own `deny.toml`. |
 
 `crates/zlib-rs-differential` appears in the `[dependencies]` of neither shipped
@@ -38,12 +38,20 @@ compiler for the oracle.
 `rust-toolchain.toml` pins `channel = "stable"` with `rustfmt` and `clippy`, so
 cargo selects a suitable compiler by itself inside this checkout.
 
-The two shipped crates declare `rust-version = "1.80"`, and that is the MSRV the
-library promises. `crates/zlib-rs-differential` declares `rust-version = "1.86"`
-for itself, because criterion 0.8.2 declares 1.86 and reaches clap crates whose
-manifests are `edition = "2024"`; cargo 1.80 cannot parse those, so any command
-that resolves the whole workspace dev graph on 1.80 fails at resolve time. The
-MSRV check therefore names the shipped packages explicitly:
+All three members declare `rust-version = "1.80"` through
+`[workspace.package]`, and that is the MSRV the library promises. It is a
+property of the whole workspace rather than of a hand-picked package list, so
+both of these hold:
+
+    cargo +1.80 metadata --locked
+    cargo +1.80 check --locked --workspace --all-targets
+
+`benches/` is the one package with a higher floor: criterion 0.8.2 declares 1.86
+and reaches clap crates whose manifests are `edition = "2024"`, which cargo 1.80
+cannot parse at all. That is exactly why it is an excluded package with its own
+lock -- while the suites were attached to `crates/zlib-rs-differential`, both
+commands above failed and the declared floor was unenforceable. The MSRV check
+runs the shipped pair in all three feature configurations as well:
 
     make rust-msrv
 
@@ -82,6 +90,22 @@ two variadic exports get no dynamic entry, and internal helpers stay visible.
 Producing the installable shared library is a separate relink step, and
 `crates/libz-rs-sys/src/lib.rs` carries the artifact matrix that states this
 once.
+
+The relink is `make rust` (or `cmake -DZLIB_BUILD_RUST=ON`), and the gate on what
+it stages has to be armed, because every assertion about that file — 111 symbols,
+the 95/16 split, the hidden set, the `SONAME`, the symlink topology, and
+`zlibCompileFlags()` bit 27 against the artifacts that ship — inspects something
+`cargo test` never builds and therefore skips by default:
+
+```console
+$ make rust CARGO=cargo
+$ ZLIB_RS_REQUIRE_PACKAGED=1 cargo test --locked --release \
+    -p libz-rs-sys --test symbol_parity -- --nocapture
+```
+
+`ZLIB_RS_REQUIRE_PACKAGED=1` turns each of those skips into a failure naming what
+went unverified; the `symbols` job of `.github/workflows/rust.yml` sets it after
+staging and additionally fails on any `SKIP:` line.
 
 ## The Cargo feature surface
 
@@ -209,9 +233,18 @@ rather than zero, so any code path assuming zero-initialised memory shows up, an
 its `mem_done()` detects leaks, non-LIFO frees and rogue frees through the
 injected `zalloc`/`zfree` hooks.
 
-Note the scope honestly. ASan covers `crates/libz-rs-sys` and those three C
-drivers. It does not cover `crates/zlib-rs-differential`, the bench targets, or
-the C oracle archive, which is compiled uninstrumented.
+Note the scope honestly, and note that this paragraph used to understate it. The
+`asan` job runs five things, not two: `cargo test -p libz-rs-sys` as above, the
+same again with `-Zbuild-std` so faults inside `std` routines reached from the
+facade are attributed, the three C drivers against an instrumented `libz.a`,
+`cargo test -p zlib-rs-differential` — the dev-only harness, with
+`CFLAGS=-fsanitize=address` so the C oracle archive is instrumented rather than
+merely linked — and the criterion suites from `benches/`, compiled under the
+sanitizer and executed once each through criterion's `--test` mode. What ASan
+does **not** cover is the fuzz targets: `cargo fuzz` builds each one with
+AddressSanitizer itself, so that instrumentation is per-target and belongs to the
+`fuzz` job. Miri stays scoped to `crates/zlib-rs`, because it interprets Rust MIR
+and cannot execute the compiled C oracle at all.
 
 ### Fuzzing
 
@@ -220,25 +253,51 @@ the C oracle archive, which is compiled uninstrumented.
     cargo +nightly fuzz run fuzz_inflate_back -- -max_total_time=300
     cargo +nightly fuzz run fuzz_gz_roundtrip -- -max_total_time=300
     cargo +nightly fuzz run fuzz_checksum     -- -max_total_time=300
+    cargo +nightly fuzz run fuzz_checksum --features simd -- -max_total_time=300
 
 Run from `fuzz/`, which is a workspace of its own. The bar is zero crashes and
 zero hangs at 300 seconds per target. `fuzz_inflate` is the one that matters
 most: `inflate` is the entry point that reads untrusted bytes.
 
+Five binaries, six invocations: `fuzz_checksum` is run once per checksum backend,
+because its SIMD-neutrality assertions are `#[cfg(feature = "simd")]` and are
+compiled away in the default build. The `fuzz` job's matrix is those same six rows
+with the same budget, and it uploads each one's artifacts under its own slug, so
+the sixth is a gate rather than a suggestion.
+
 Because `fuzz/` is excluded from the root workspace, the root `cargo clippy
 --workspace --all-targets` cannot reach it, and a workspace lint table does not
 cross a workspace boundary. `fuzz/Cargo.toml` therefore restates the lint policy
 in `[lints.rust]` and `[lints.clippy]` tables of its own, and the `lint` job runs
-clippy a second time with `working-directory: fuzz`.
+clippy a second time with `working-directory: fuzz`. `benches/Cargo.toml` is
+excluded for its own reason -- criterion's MSRV -- and restates the same tables
+for the same reason, so the suites are linted to the workspace's policy even
+though the workspace cannot see them.
 
 ### Benchmarks
 
-    cargo bench --locked -p zlib-rs-differential
+    cargo bench --locked --manifest-path benches/Cargo.toml
+    cargo bench --locked --manifest-path benches/Cargo.toml --bench deflate_bench
+    cargo bench --locked --manifest-path benches/Cargo.toml --features simd
 
-The `-p` is required: the suites are attached to the differential crate, so a
-bare `cargo bench` from the root finds nothing. Each suite measures the port and
-the in-process C oracle under one sampler, which is what removes cross-process
-noise from the comparison.
+The `--manifest-path` is required: `benches/` is its own excluded package, so a
+bare `cargo bench` from the root finds no bench target at all. Each suite
+measures the port and the in-process C oracle under one sampler, which is what
+removes cross-process noise from the comparison — the oracle is the one
+`crates/zlib-rs-differential/build.rs` compiles, reached through a path
+dependency, so nothing is built twice.
+
+`benches/Cargo.toml` also owns the two measurement profiles. `bench` is fat-LTO,
+single-codegen-unit; `bench-parity` (`--profile bench-parity`) is the deliberately
+non-LTO, multi-codegen-unit build that is structurally comparable to the
+per-translation-unit oracle. The `bench` job measures both and decides each case
+on the worse-for-the-port of the two.
+
+Criterion's reports land under `benches/target/criterion` by default, because
+criterion resolves its output directory relative to the bench process's working
+directory. Set `CRITERION_HOME` to an absolute path to put them somewhere
+specific; the `bench` job does exactly that so its gate and the suites agree on
+one directory.
 
 `deflate_bench.rs` and `inflate_bench.rs` emit `RATIO-SUMMARY`, `MEMORY-SUMMARY`
 and `ALLOC-BALANCE` lines that the `bench` job parses. `checksum_bench.rs` emits
@@ -281,14 +340,23 @@ on review:
    `const _: () = assert!(...)` over `size_of` and `offset_of!`, evaluated on
    every build, so layout drift is a compile error rather than a runtime
    surprise.
-2. **The cbindgen header comparison** — `cbindgen.toml` specifies it in ten
+2. **The cbindgen header comparison** — `cbindgen.toml` specifies it in eleven
    rules. `make rust-header` owns the name half (A1, A2, A5, A9) and the
    standalone C89/C99/C17/C++17 compile sweep with and without `_WIN32`; the
    `header` CI job invokes that target and then owns the shape half (A3, A4, A6,
-   A7, A8 and rule 10) by re-declaring every generated prototype against
-   `zlib.h` so the C compiler decides whether the signatures agree, and by
+   A7, A8, rule 10 and rule A11) by re-declaring every generated prototype
+   against `zlib.h` so the C compiler decides whether the signatures agree, by
    diffing struct sizes, field offsets and integer macro values from a probe
-   program per side.
+   program per side, and — rule A11, the form AAP 0.8.6 froze — by diffing a
+   canonical rendering of all 95 contract signatures against the same rendering
+   of `zlib.h`'s and requiring the diff to be **empty**. That rendering is the
+   C++ compiler's own mangling of `decltype(&f)`, so the typedef chain,
+   parameter names, bare `unsigned` and the `ZEXTERN`/`FAR`/`z_const` decoration
+   are resolved by the compiler rather than by a text normaliser.
+   `diff -u zlib.h generated_zlib.h` — the two files — is run as well and
+   published as a job artifact; it is necessarily non-empty, because cbindgen
+   cannot emit comments, the declaration macros or the function-like macros, and
+   the artifact is how a reviewer confirms the difference is only that.
 3. **The `nm` symbol-parity diff** — `crates/libz-rs-sys/tests/symbol_parity.rs`
    under any `cargo test -p libz-rs-sys`, `make rust-symbols` locally against a
    built C library, and the `symbols` CI job as the gate. The baseline is 111
@@ -307,6 +375,15 @@ caller's compile-time version against the library's.
     make rust
     make rust-test
     make rust-symbols
+    make rust-pc
+
+`make rust-pc` is part of installing rather than an extra: the Rust static archive
+carries the Rust runtime and needs that runtime's companion libraries on a
+consumer's link line, which the C `libz.a` does not, so one `zlib.pc` cannot serve
+both. The target emits the descriptor for the staged library — the C one plus the
+`Libs.private` line probed for this target — and gates it by linking and running a
+C program from nothing but the flags `pkg-config` answers. Install that descriptor
+in place of `zlib.pc` whenever the staged libraries are the ones installed.
 
 `make rust` relinks cargo's complete static archive through `zlib.map` with the
 right SONAME and stages the installable set under `target/dropin/`, naming it
@@ -386,7 +463,7 @@ reasoning stays next to the code it governs. When something here is not enough:
 |---|---|
 | Why is the unsafe surface shaped this way, and what does each block promise? | `crates/libz-rs-sys/src/lib.rs`, and the `// SAFETY:` comment on each block |
 | Which artifact is installable, and why is cargo's cdylib not? | `crates/libz-rs-sys/src/lib.rs` — the artifact matrix |
-| What exactly must the generated header match? | `cbindgen.toml` — the ten normalisation rules and the accepted divergences |
+| What exactly must the generated header match? | `cbindgen.toml` — the eleven normalisation rules and the accepted divergences |
 | What may a dependency be, and what may it never be? | `deny.toml`, and the root `Cargo.toml`'s `[workspace.dependencies]` notes |
 | Which targets are supported, and to what degree? | `rust-toolchain.toml` — the supported-target matrix |
 | What does each corpus fixture exist to exercise? | `crates/zlib-rs-differential/corpus/README.md` |

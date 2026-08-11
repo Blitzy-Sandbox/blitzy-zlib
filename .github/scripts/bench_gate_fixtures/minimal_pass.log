@@ -1,0 +1,162 @@
+deflate_bench: measuring compression throughput and per-stream memory: the Rust port against the in-process C oracle.
+deflate_bench:   per-case lines are `RATIO group=... case=... bytes=... port_ns=... oracle_ns=... ratio=... limit=... gate=counted|informational verdict=within|over` and `MEMORY group=... case=... port_bytes=... oracle_bytes=... ratio=... limit=... verdict=within|over`; then exactly one `RATIO-SUMMARY`/`MEMORY-SUMMARY` line per declared group, carrying `gate=authoritative|supporting|informational` and `expected=<cases the group set out to measure>` -- a group with nothing to measure still prints its line, with `expected=0` -- and one `ALLOC-BALANCE` line per side per memory case. Reported, never enforced -- the workflow decides.
+deflate_bench: GATE-INVENTORY suite=deflate ratio_limit=1.10 memory_limit=1.15 min_bytes=4096 levels=1,6,9 authoritative_ratio=deflate_steady_state,deflate_silesia supporting_ratio=deflate_lifecycle,deflate_container,deflate_feeding,compress_oneshot informational_ratio=deflate_mem_level,deflate_strategy,deflate_stored_floor,deflate_bound,deflate_degenerate authoritative_memory=deflate_memory
+deflate_bench: CRITERION root=/synthetic/target/criterion port_label=zlib-rs oracle_label=c-oracle layout=<root>/<group>/<label>/<case>/new/estimates.json estimate=slope fallback=mean authority=criterion self_timed=diagnostic
+deflate_bench: RATIO group=deflate_steady_state case=repetitive.bin-L1 bytes=16384 port_ns=15287.6 oracle_ns=16092.2 ratio=0.950 limit=1.10 gate=counted verdict=within
+deflate_bench: RATIO group=deflate_steady_state case=repetitive.bin-L6 bytes=16384 port_ns=62445.8 oracle_ns=65732.4 ratio=0.950 limit=1.10 gate=counted verdict=within
+deflate_bench: RATIO group=deflate_steady_state case=repetitive.bin-L9 bytes=16384 port_ns=82875.1 oracle_ns=87236.9 ratio=0.950 limit=1.10 gate=counted verdict=within
+deflate_bench: RATIO group=deflate_steady_state case=random.bin-L1 bytes=8192 port_ns=71561.3 oracle_ns=75327.7 ratio=0.950 limit=1.10 gate=counted verdict=within
+deflate_bench: RATIO group=deflate_steady_state case=random.bin-L6 bytes=8192 port_ns=69187.9 oracle_ns=72829.4 ratio=0.950 limit=1.10 gate=counted verdict=within
+deflate_bench: RATIO group=deflate_steady_state case=random.bin-L9 bytes=8192 port_ns=68617.8 oracle_ns=72229.3 ratio=0.950 limit=1.10 gate=counted verdict=within
+deflate_bench: RATIO group=deflate_steady_state case=text.txt-L1 bytes=45 port_ns=6206.8 oracle_ns=3274.3 ratio=1.896 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_steady_state case=text.txt-L6 bytes=45 port_ns=6193.6 oracle_ns=3292.0 ratio=1.881 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_steady_state case=text.txt-L9 bytes=45 port_ns=6395.4 oracle_ns=3289.0 ratio=1.944 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_steady_state case=binary.bin-L1 bytes=23 port_ns=4831.6 oracle_ns=2742.8 ratio=1.762 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_steady_state case=binary.bin-L6 bytes=23 port_ns=4855.0 oracle_ns=4688.9 ratio=1.035 limit=1.10 gate=informational verdict=within
+deflate_bench: RATIO group=deflate_steady_state case=binary.bin-L9 bytes=23 port_ns=4828.7 oracle_ns=2786.3 ratio=1.733 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_steady_state case=window_boundary.bin-L1 bytes=66560 port_ns=1281782.8 oracle_ns=1349245.0 ratio=0.950 limit=1.10 gate=counted verdict=within
+deflate_bench: RATIO group=deflate_steady_state case=window_boundary.bin-L6 bytes=66560 port_ns=1366953.1 oracle_ns=1438898.0 ratio=0.950 limit=1.10 gate=counted verdict=within
+deflate_bench: RATIO group=deflate_steady_state case=window_boundary.bin-L9 bytes=66560 port_ns=1375415.7 oracle_ns=1447806.0 ratio=0.950 limit=1.10 gate=counted verdict=within
+deflate_bench: RATIO-SUMMARY group=deflate_steady_state gate=authoritative expected=15 cases=15 gated=9 over=0 informational=6 limit=1.10
+deflate_bench: RATIO group=deflate_lifecycle case=hello.bin-L6 bytes=14 port_ns=8998.8 oracle_ns=2736.6 ratio=3.288 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_lifecycle case=binary.bin-L6 bytes=23 port_ns=9992.6 oracle_ns=3188.2 ratio=3.134 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_lifecycle case=repetitive.bin-L6 bytes=16384 port_ns=79800.1 oracle_ns=65960.0 ratio=1.210 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO group=deflate_lifecycle case=window_boundary.bin-L6 bytes=66560 port_ns=1685767.0 oracle_ns=1425792.0 ratio=1.182 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO-SUMMARY group=deflate_lifecycle gate=supporting expected=4 cases=4 gated=2 over=2 informational=2 limit=1.10
+deflate_bench: ALLOC-BALANCE side=zlib-rs case=window_boundary.bin-L1-mem1 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: ALLOC-BALANCE side=c-oracle case=window_boundary.bin-L1-mem1 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: MEMORY group=deflate_memory case=window_boundary.bin-L1-mem1 port_bytes=138432 oracle_bytes=138064 ratio=1.003 limit=1.15 verdict=within
+deflate_bench: ALLOC-BALANCE side=zlib-rs case=window_boundary.bin-L1-mem8 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: ALLOC-BALANCE side=c-oracle case=window_boundary.bin-L1-mem8 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: MEMORY group=deflate_memory case=window_boundary.bin-L1-mem8 port_bytes=268480 oracle_bytes=268112 ratio=1.001 limit=1.15 verdict=within
+deflate_bench: ALLOC-BALANCE side=zlib-rs case=window_boundary.bin-L1-mem9 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: ALLOC-BALANCE side=c-oracle case=window_boundary.bin-L1-mem9 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: MEMORY group=deflate_memory case=window_boundary.bin-L1-mem9 port_bytes=399552 oracle_bytes=399184 ratio=1.001 limit=1.15 verdict=within
+deflate_bench: ALLOC-BALANCE side=zlib-rs case=window_boundary.bin-L6-mem1 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: ALLOC-BALANCE side=c-oracle case=window_boundary.bin-L6-mem1 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: MEMORY group=deflate_memory case=window_boundary.bin-L6-mem1 port_bytes=138432 oracle_bytes=138064 ratio=1.003 limit=1.15 verdict=within
+deflate_bench: ALLOC-BALANCE side=zlib-rs case=window_boundary.bin-L6-mem8 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: ALLOC-BALANCE side=c-oracle case=window_boundary.bin-L6-mem8 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: MEMORY group=deflate_memory case=window_boundary.bin-L6-mem8 port_bytes=268480 oracle_bytes=268112 ratio=1.001 limit=1.15 verdict=within
+deflate_bench: ALLOC-BALANCE side=zlib-rs case=window_boundary.bin-L6-mem9 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: ALLOC-BALANCE side=c-oracle case=window_boundary.bin-L6-mem9 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: MEMORY group=deflate_memory case=window_boundary.bin-L6-mem9 port_bytes=399552 oracle_bytes=399184 ratio=1.001 limit=1.15 verdict=within
+deflate_bench: ALLOC-BALANCE side=zlib-rs case=window_boundary.bin-L9-mem1 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: ALLOC-BALANCE side=c-oracle case=window_boundary.bin-L9-mem1 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: MEMORY group=deflate_memory case=window_boundary.bin-L9-mem1 port_bytes=138432 oracle_bytes=138064 ratio=1.003 limit=1.15 verdict=within
+deflate_bench: ALLOC-BALANCE side=zlib-rs case=window_boundary.bin-L9-mem8 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: ALLOC-BALANCE side=c-oracle case=window_boundary.bin-L9-mem8 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: MEMORY group=deflate_memory case=window_boundary.bin-L9-mem8 port_bytes=268480 oracle_bytes=268112 ratio=1.001 limit=1.15 verdict=within
+deflate_bench: ALLOC-BALANCE side=zlib-rs case=window_boundary.bin-L9-mem9 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: ALLOC-BALANCE side=c-oracle case=window_boundary.bin-L9-mem9 allocations=5 frees=5 live_bytes=0 notlifo=0 rogue=0 refusals=0 verdict=clean
+deflate_bench: MEMORY group=deflate_memory case=window_boundary.bin-L9-mem9 port_bytes=399552 oracle_bytes=399184 ratio=1.001 limit=1.15 verdict=within
+deflate_bench: MEMORY-SUMMARY group=deflate_memory gate=authoritative expected=9 cases=9 over=0 dirty=0 limit=1.15
+deflate_bench: RATIO group=deflate_container case=repetitive.bin-zlib bytes=16384 port_ns=74175.0 oracle_ns=66064.6 ratio=1.123 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO group=deflate_container case=repetitive.bin-raw bytes=16384 port_ns=69520.8 oracle_ns=59933.1 ratio=1.160 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO group=deflate_container case=repetitive.bin-gzip bytes=16384 port_ns=72790.3 oracle_ns=64318.8 ratio=1.132 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO group=deflate_container case=window_boundary.bin-zlib bytes=66560 port_ns=1681960.0 oracle_ns=1425643.0 ratio=1.180 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO group=deflate_container case=window_boundary.bin-raw bytes=66560 port_ns=1702541.0 oracle_ns=1426050.0 ratio=1.194 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO group=deflate_container case=window_boundary.bin-gzip bytes=66560 port_ns=1665249.0 oracle_ns=1429593.0 ratio=1.165 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO-SUMMARY group=deflate_container gate=supporting expected=6 cases=6 gated=6 over=6 informational=0 limit=1.10
+deflate_bench: RATIO group=deflate_feeding case=repetitive.bin-single bytes=16384 port_ns=75349.5 oracle_ns=64899.2 ratio=1.161 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO group=deflate_feeding case=repetitive.bin-chunk32768 bytes=16384 port_ns=75115.0 oracle_ns=65301.2 ratio=1.150 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO group=deflate_feeding case=repetitive.bin-chunk1024 bytes=16384 port_ns=121417.2 oracle_ns=115825.6 ratio=1.048 limit=1.10 gate=counted verdict=within
+deflate_bench: RATIO group=deflate_feeding case=repetitive.bin-chunk16 bytes=16384 port_ns=2048281.0 oracle_ns=1085803.0 ratio=1.886 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO group=deflate_feeding case=window_boundary.bin-single bytes=66560 port_ns=1675925.0 oracle_ns=1438829.0 ratio=1.165 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO group=deflate_feeding case=window_boundary.bin-chunk32768 bytes=66560 port_ns=1684579.0 oracle_ns=1437042.0 ratio=1.172 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO group=deflate_feeding case=window_boundary.bin-chunk1024 bytes=66560 port_ns=4978468.0 oracle_ns=3605640.0 ratio=1.381 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO group=deflate_feeding case=window_boundary.bin-chunk16 bytes=66560 port_ns=16699777.0 oracle_ns=9437763.0 ratio=1.769 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO-SUMMARY group=deflate_feeding gate=supporting expected=8 cases=8 gated=8 over=7 informational=0 limit=1.10
+deflate_bench: RATIO group=deflate_mem_level case=repetitive.bin-mem1 bytes=16384 port_ns=73601.7 oracle_ns=64457.6 ratio=1.142 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_mem_level case=repetitive.bin-mem9 bytes=16384 port_ns=76073.5 oracle_ns=66784.9 ratio=1.139 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_mem_level case=window_boundary.bin-mem1 bytes=66560 port_ns=35446351.0 oracle_ns=28510530.0 ratio=1.243 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_mem_level case=window_boundary.bin-mem9 bytes=66560 port_ns=2050417.0 oracle_ns=1105404.0 ratio=1.855 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO-SUMMARY group=deflate_mem_level gate=informational expected=4 cases=4 gated=0 over=0 informational=4 limit=1.10
+deflate_bench: RATIO group=deflate_strategy case=repetitive.bin-filtered bytes=16384 port_ns=74807.5 oracle_ns=65800.5 ratio=1.137 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_strategy case=repetitive.bin-huffman bytes=16384 port_ns=96598.8 oracle_ns=131043.6 ratio=0.737 limit=1.10 gate=informational verdict=within
+deflate_bench: RATIO group=deflate_strategy case=repetitive.bin-rle bytes=16384 port_ns=69267.7 oracle_ns=72845.0 ratio=0.951 limit=1.10 gate=informational verdict=within
+deflate_bench: RATIO group=deflate_strategy case=repetitive.bin-fixed bytes=16384 port_ns=75243.1 oracle_ns=64631.7 ratio=1.164 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_strategy case=window_boundary.bin-filtered bytes=66560 port_ns=1660157.0 oracle_ns=1463949.0 ratio=1.134 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_strategy case=window_boundary.bin-huffman bytes=66560 port_ns=424480.0 oracle_ns=545923.0 ratio=0.778 limit=1.10 gate=informational verdict=within
+deflate_bench: RATIO group=deflate_strategy case=window_boundary.bin-rle bytes=66560 port_ns=889227.5 oracle_ns=717065.5 ratio=1.240 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_strategy case=window_boundary.bin-fixed bytes=66560 port_ns=1680033.0 oracle_ns=1466060.0 ratio=1.146 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO-SUMMARY group=deflate_strategy gate=informational expected=8 cases=8 gated=0 over=0 informational=8 limit=1.10
+deflate_bench: RATIO group=deflate_stored_floor case=repetitive.bin-L0 bytes=16384 port_ns=6954.2 oracle_ns=7446.0 ratio=0.934 limit=1.10 gate=informational verdict=within
+deflate_bench: RATIO group=deflate_stored_floor case=window_boundary.bin-L0 bytes=66560 port_ns=27269.7 oracle_ns=29409.1 ratio=0.927 limit=1.10 gate=informational verdict=within
+deflate_bench: RATIO-SUMMARY group=deflate_stored_floor gate=informational expected=2 cases=2 gated=0 over=0 informational=2 limit=1.10
+deflate_bench: RATIO group=compress_oneshot case=repetitive.bin-compress2 bytes=16384 port_ns=78418.5 oracle_ns=66003.1 ratio=1.188 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO group=compress_oneshot case=repetitive.bin-compress2_z bytes=16384 port_ns=78076.6 oracle_ns=65865.0 ratio=1.185 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO group=compress_oneshot case=random.bin-compress2 bytes=8192 port_ns=117655.8 oracle_ns=73393.6 ratio=1.603 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO group=compress_oneshot case=random.bin-compress2_z bytes=8192 port_ns=114814.8 oracle_ns=73496.4 ratio=1.562 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO group=compress_oneshot case=text.txt-compress2 bytes=45 port_ns=11078.7 oracle_ns=3720.0 ratio=2.978 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=compress_oneshot case=text.txt-compress2_z bytes=45 port_ns=11115.9 oracle_ns=3709.4 ratio=2.997 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=compress_oneshot case=binary.bin-compress2 bytes=23 port_ns=9802.2 oracle_ns=3227.0 ratio=3.038 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=compress_oneshot case=binary.bin-compress2_z bytes=23 port_ns=9903.7 oracle_ns=3181.3 ratio=3.113 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=compress_oneshot case=window_boundary.bin-compress2 bytes=66560 port_ns=1750107.0 oracle_ns=1459114.0 ratio=1.199 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO group=compress_oneshot case=window_boundary.bin-compress2_z bytes=66560 port_ns=1692397.0 oracle_ns=1438787.0 ratio=1.176 limit=1.10 gate=counted verdict=over
+deflate_bench: RATIO-SUMMARY group=compress_oneshot gate=supporting expected=10 cases=10 gated=6 over=6 informational=4 limit=1.10
+deflate_bench: RATIO group=deflate_bound case=window_boundary.bin-deflateBound bytes=66560 port_ns=8.8 oracle_ns=5.8 ratio=1.533 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_bound case=window_boundary.bin-deflateBound_z bytes=66560 port_ns=8.8 oracle_ns=4.9 ratio=1.818 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_bound case=window_boundary.bin-compressBound bytes=66560 port_ns=0.6 oracle_ns=3.2 ratio=0.202 limit=1.10 gate=informational verdict=within
+deflate_bench: RATIO group=deflate_bound case=window_boundary.bin-compressBound_z bytes=66560 port_ns=0.3 oracle_ns=2.1 ratio=0.144 limit=1.10 gate=informational verdict=within
+deflate_bench: RATIO-SUMMARY group=deflate_bound gate=informational expected=4 cases=4 gated=0 over=0 informational=4 limit=1.10
+deflate_bench: RATIO group=deflate_degenerate case=empty.bin-0B bytes=0 port_ns=2925.6 oracle_ns=2094.3 ratio=1.397 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_degenerate case=single_byte.bin-1B bytes=1 port_ns=2902.0 oracle_ns=1990.7 ratio=1.458 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_degenerate case=dictionary.bin-6B bytes=6 port_ns=3474.6 oracle_ns=2156.5 ratio=1.611 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_degenerate case=gray_list.bin-6B bytes=6 port_ns=3609.6 oracle_ns=2318.6 ratio=1.557 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO group=deflate_degenerate case=hello.bin-14B bytes=14 port_ns=3887.0 oracle_ns=3239.9 ratio=1.200 limit=1.10 gate=informational verdict=over
+deflate_bench: RATIO-SUMMARY group=deflate_degenerate gate=informational expected=5 cases=5 gated=0 over=0 informational=5 limit=1.10
+deflate_bench: SILESIA verdict=absent found=0 of=12 required=no dir=/synthetic/target/silesia
+deflate_bench: RATIO-SUMMARY group=deflate_silesia gate=authoritative expected=0 cases=0 gated=0 over=0 informational=0 limit=1.10
+inflate_bench: GATE-INVENTORY suite=inflate ratio_limit=1.10 min_bytes=4096 levels=1,6,9 authoritative_ratio=inflate_steady_state,inflate_silesia supporting_ratio=inflate_lifecycle,inflate_container,inflate_feeding,uncompress_oneshot informational_ratio=
+inflate_bench: CRITERION root=/synthetic/target/criterion port_label=zlib-rs oracle_label=c-oracle layout=<root>/<group>/<label>/<case>/new/estimates.json estimate=slope fallback=mean authority=criterion self_timed=diagnostic
+inflate_bench: RATIO group=inflate_steady_state case=repetitive.bin-L1 bytes=16384 port_ns=8778.8 oracle_ns=9240.8 ratio=0.950 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_steady_state case=repetitive.bin-L6 bytes=16384 port_ns=17219.5 oracle_ns=18125.8 ratio=0.950 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_steady_state case=repetitive.bin-L9 bytes=16384 port_ns=13940.5 oracle_ns=14674.2 ratio=0.950 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_steady_state case=random.bin-L1 bytes=8192 port_ns=2800.7 oracle_ns=2948.1 ratio=0.950 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_steady_state case=random.bin-L6 bytes=8192 port_ns=2791.0 oracle_ns=2937.9 ratio=0.950 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_steady_state case=random.bin-L9 bytes=8192 port_ns=2771.5 oracle_ns=2917.4 ratio=0.950 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_steady_state case=text.txt-L1 bytes=45 port_ns=660.6 oracle_ns=204.1 ratio=3.236 limit=1.10 gate=informational verdict=over
+inflate_bench: RATIO group=inflate_steady_state case=text.txt-L6 bytes=45 port_ns=659.4 oracle_ns=213.9 ratio=3.082 limit=1.10 gate=informational verdict=over
+inflate_bench: RATIO group=inflate_steady_state case=text.txt-L9 bytes=45 port_ns=664.6 oracle_ns=202.3 ratio=3.285 limit=1.10 gate=informational verdict=over
+inflate_bench: RATIO group=inflate_steady_state case=binary.bin-L1 bytes=23 port_ns=363.1 oracle_ns=121.7 ratio=2.983 limit=1.10 gate=informational verdict=over
+inflate_bench: RATIO group=inflate_steady_state case=binary.bin-L6 bytes=23 port_ns=367.6 oracle_ns=130.7 ratio=2.812 limit=1.10 gate=informational verdict=over
+inflate_bench: RATIO group=inflate_steady_state case=binary.bin-L9 bytes=23 port_ns=361.2 oracle_ns=125.7 ratio=2.873 limit=1.10 gate=informational verdict=over
+inflate_bench: RATIO group=inflate_steady_state case=window_boundary.bin-L1 bytes=66560 port_ns=24674.0 oracle_ns=25972.6 ratio=0.950 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_steady_state case=window_boundary.bin-L6 bytes=66560 port_ns=24839.3 oracle_ns=26146.6 ratio=0.950 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_steady_state case=window_boundary.bin-L9 bytes=66560 port_ns=24748.0 oracle_ns=26050.5 ratio=0.950 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO-SUMMARY group=inflate_steady_state gate=authoritative expected=15 cases=15 gated=9 over=0 informational=6 limit=1.10
+inflate_bench: RATIO group=inflate_lifecycle case=hello.bin-L6 bytes=14 port_ns=355.6 oracle_ns=192.9 ratio=1.843 limit=1.10 gate=informational verdict=over
+inflate_bench: RATIO group=inflate_lifecycle case=binary.bin-L6 bytes=23 port_ns=486.8 oracle_ns=238.2 ratio=2.043 limit=1.10 gate=informational verdict=over
+inflate_bench: RATIO group=inflate_lifecycle case=repetitive.bin-L6 bytes=16384 port_ns=10010.7 oracle_ns=18068.9 ratio=0.554 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_lifecycle case=window_boundary.bin-L6 bytes=66560 port_ns=24387.2 oracle_ns=26304.8 ratio=0.927 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO-SUMMARY group=inflate_lifecycle gate=supporting expected=4 cases=4 gated=2 over=0 informational=2 limit=1.10
+inflate_bench: RATIO group=inflate_container case=repetitive.bin-zlib bytes=16384 port_ns=9974.0 oracle_ns=17939.3 ratio=0.556 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_container case=repetitive.bin-raw bytes=16384 port_ns=4975.6 oracle_ns=12375.7 ratio=0.402 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_container case=repetitive.bin-gzip bytes=16384 port_ns=8890.1 oracle_ns=16585.2 ratio=0.536 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_container case=window_boundary.bin-zlib bytes=66560 port_ns=23808.7 oracle_ns=26099.3 ratio=0.912 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_container case=window_boundary.bin-raw bytes=66560 port_ns=3340.4 oracle_ns=3130.6 ratio=1.067 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_container case=window_boundary.bin-gzip bytes=66560 port_ns=19615.4 oracle_ns=20231.3 ratio=0.970 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO-SUMMARY group=inflate_container gate=supporting expected=6 cases=6 gated=6 over=0 informational=0 limit=1.10
+inflate_bench: RATIO group=inflate_feeding case=repetitive.bin-single bytes=16384 port_ns=9947.8 oracle_ns=17963.2 ratio=0.554 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_feeding case=repetitive.bin-chunk32768 bytes=16384 port_ns=9904.3 oracle_ns=18057.3 ratio=0.548 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_feeding case=repetitive.bin-chunk1024 bytes=16384 port_ns=16213.6 oracle_ns=18643.8 ratio=0.870 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_feeding case=repetitive.bin-chunk16 bytes=16384 port_ns=74091.3 oracle_ns=37028.5 ratio=2.001 limit=1.10 gate=counted verdict=over
+inflate_bench: RATIO group=inflate_feeding case=window_boundary.bin-single bytes=66560 port_ns=22160.4 oracle_ns=24521.8 ratio=0.904 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_feeding case=window_boundary.bin-chunk32768 bytes=66560 port_ns=23751.7 oracle_ns=26041.2 ratio=0.912 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_feeding case=window_boundary.bin-chunk1024 bytes=66560 port_ns=25185.3 oracle_ns=26347.5 ratio=0.956 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=inflate_feeding case=window_boundary.bin-chunk16 bytes=66560 port_ns=180427.3 oracle_ns=117393.8 ratio=1.537 limit=1.10 gate=counted verdict=over
+inflate_bench: RATIO-SUMMARY group=inflate_feeding gate=supporting expected=8 cases=8 gated=8 over=2 informational=0 limit=1.10
+inflate_bench: RATIO group=uncompress_oneshot case=repetitive.bin-uncompress bytes=16384 port_ns=9855.9 oracle_ns=18187.1 ratio=0.542 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=uncompress_oneshot case=repetitive.bin-uncompress2 bytes=16384 port_ns=9910.6 oracle_ns=18246.4 ratio=0.543 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=uncompress_oneshot case=random.bin-uncompress bytes=8192 port_ns=2691.1 oracle_ns=3354.5 ratio=0.802 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=uncompress_oneshot case=random.bin-uncompress2 bytes=8192 port_ns=2696.7 oracle_ns=3010.3 ratio=0.896 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=uncompress_oneshot case=text.txt-uncompress bytes=45 port_ns=703.6 oracle_ns=327.0 ratio=2.151 limit=1.10 gate=informational verdict=over
+inflate_bench: RATIO group=uncompress_oneshot case=text.txt-uncompress2 bytes=45 port_ns=699.9 oracle_ns=322.4 ratio=2.171 limit=1.10 gate=informational verdict=over
+inflate_bench: RATIO group=uncompress_oneshot case=binary.bin-uncompress bytes=23 port_ns=401.6 oracle_ns=237.8 ratio=1.689 limit=1.10 gate=informational verdict=over
+inflate_bench: RATIO group=uncompress_oneshot case=binary.bin-uncompress2 bytes=23 port_ns=407.1 oracle_ns=235.5 ratio=1.729 limit=1.10 gate=informational verdict=over
+inflate_bench: RATIO group=uncompress_oneshot case=window_boundary.bin-uncompress bytes=66560 port_ns=22339.1 oracle_ns=24602.5 ratio=0.908 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO group=uncompress_oneshot case=window_boundary.bin-uncompress2 bytes=66560 port_ns=22241.1 oracle_ns=24567.9 ratio=0.905 limit=1.10 gate=counted verdict=within
+inflate_bench: RATIO-SUMMARY group=uncompress_oneshot gate=supporting expected=10 cases=10 gated=6 over=0 informational=4 limit=1.10
+inflate_bench: SILESIA verdict=absent found=0 of=12 required=no dir=/synthetic/target/silesia
+inflate_bench: RATIO-SUMMARY group=inflate_silesia gate=authoritative expected=0 cases=0 gated=0 over=0 informational=0 limit=1.10

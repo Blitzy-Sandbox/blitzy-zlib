@@ -220,9 +220,10 @@
 //! # Running it
 //!
 //! ```text
-//! cargo bench -p zlib-rs-differential --bench inflate_bench
-//! cargo bench -p zlib-rs-differential --bench inflate_bench -- --test    # one iteration each
-//! cargo bench -p zlib-rs-differential --bench inflate_bench -- inflate_steady_state
+//! cargo bench --manifest-path benches/Cargo.toml --bench inflate_bench
+//! # one iteration per case:
+//! cargo bench --manifest-path benches/Cargo.toml --bench inflate_bench -- --test
+//! cargo bench --manifest-path benches/Cargo.toml --bench inflate_bench -- inflate_steady_state
 //! ```
 //!
 //! The groups run with an explicit 50-sample, 1-second warm-up, 3-second measurement budget
@@ -237,8 +238,8 @@
 //! precisely so that it works:
 //!
 //! ```text
-//! cargo bench -p zlib-rs-differential --bench inflate_bench -- --save-baseline scalar
-//! cargo bench -p zlib-rs-differential --bench inflate_bench --features simd \
+//! cargo bench --manifest-path benches/Cargo.toml --bench inflate_bench -- --save-baseline scalar
+//! cargo bench --manifest-path benches/Cargo.toml --bench inflate_bench --features simd \
 //!     -- --baseline-lenient scalar
 //! ```
 //!
@@ -263,7 +264,7 @@
 //!
 //! ```text
 //! RUSTFLAGS="-Cllvm-args=-enable-dfa-jump-thread" \
-//!     cargo bench -p zlib-rs-differential --bench inflate_bench
+//!     cargo bench --manifest-path benches/Cargo.toml --bench inflate_bench
 //! ```
 //!
 //! # Inputs — two tiers, and no network, ever
@@ -675,28 +676,34 @@ const LIFECYCLE_FIXTURE_NAMES: [&str; 4] = [
 /// the two shapes those axes can actually interact with.
 const AXIS_FIXTURE_NAMES: [&str; 2] = ["repetitive.bin", "window_boundary.bin"];
 
-/// `<this crate>/corpus/minimal`, resolved from the manifest directory at compile time.
+/// The repository root, which is `<CARGO_MANIFEST_DIR>/..`.
 ///
-/// ★ `CARGO_MANIFEST_DIR` is the **host package's** directory for a bench target -- that is
-/// `crates/zlib-rs-differential`, the crate whose manifest carries the `[[bench]]` entry that
-/// attaches this file -- and not the `benches/` directory the file sits in. Never an absolute path
-/// baked into the source, and never derived from the current directory, which cargo does not
-/// guarantee for a bench binary.
-fn minimal_corpus_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("corpus")
-        .join("minimal")
+/// ★ `CARGO_MANIFEST_DIR` is the **host package's** directory for a bench target, and the host
+/// package of this file is `benches/` -- the excluded package whose manifest carries the
+/// `[[bench]]` entry that attaches it. So the repository root is exactly one component up. It was
+/// two while these suites were attached to `crates/zlib-rs-differential`; the path moved with the
+/// hosting, which is why the rule is stated here once and derived everywhere else.
+///
+/// Never an absolute path baked into the source, and never derived from the current directory,
+/// which cargo does not guarantee for a bench binary.
+///
+/// Consumed by [`minimal_corpus_dir`], by [`silesia_dir`]'s default branch and by
+/// [`criterion_root`].
+fn repository_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
-/// The repository root, which is `<CARGO_MANIFEST_DIR>/../..`.
+/// The committed tier-1 corpus, `crates/zlib-rs-differential/corpus/minimal`.
 ///
-/// Consumed by [`silesia_dir`]'s default branch and by [`criterion_root`]. Kept as its own named
-/// function because
-/// the two `..` components are the other half of the `CARGO_MANIFEST_DIR` surprise described on
-/// [`minimal_corpus_dir`], and a reader should find both facts stated once each rather than inlined
-/// at a use site.
-fn repository_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+/// It belongs to the differential harness rather than to this package -- the crate this suite
+/// measures against owns the fixtures and `corpus/README.md` documents their provenance -- so it is
+/// reached through [`repository_root`] instead of being assumed to sit beside this manifest.
+fn minimal_corpus_dir() -> PathBuf {
+    repository_root()
+        .join("crates")
+        .join("zlib-rs-differential")
+        .join("corpus")
+        .join("minimal")
 }
 
 /// Every fixture from `names` that is present and non-empty, loaded fresh.
@@ -1145,13 +1152,22 @@ fn refuse_silesia(dir: &Path, verdict: &str, found: usize) -> ! {
 ///
 /// 1. `$CRITERION_HOME`, when set and non-empty.
 /// 2. `$CARGO_TARGET_DIR/criterion`, when that is set and non-empty.
-/// 3. The `target_directory` cargo reports for the workspace, with `criterion` appended -- which for
-///    this workspace is `<repo-root>/target/criterion`.
+/// 3. `target/criterion` **relative to the process's working directory**, which for a bench binary
+///    cargo launches is the HOST PACKAGE's directory -- `benches/` -- and therefore
+///    `<CARGO_MANIFEST_DIR>/target/criterion`.
 ///
-/// Step 3 is reproduced from [`repository_root`] rather than by shelling out to `cargo metadata`: a
-/// benchmark must not spawn a build tool, and the two agree for any invocation that builds this file,
-/// because the manifest that declares this bench target lives in that workspace. An empty value
-/// counts as unset in both steps, matching the `${VAR:-}` reading used everywhere else here.
+/// ★ Step 3 is the one that is easy to get wrong, and getting it wrong is silent: this function used
+/// to answer `<repo-root>/target/criterion` there, while criterion itself wrote
+/// `<host-package>/target/criterion`, so a consumer that trusted the published path found no
+/// `estimates.json` at all and had nothing to say so. Measured on this tree with a short real run
+/// (not `--test`, which writes nothing): the reports appeared under `benches/target/criterion`. The
+/// rule is reproduced from `CARGO_MANIFEST_DIR` rather than by shelling out to `cargo metadata` --
+/// a benchmark must not spawn a build tool -- and an empty value counts as unset in both env steps,
+/// matching the `${VAR:-}` reading used everywhere else here.
+///
+/// A harness that wants the reports somewhere specific should set `CRITERION_HOME` to an absolute
+/// path, which pins criterion and this function to the same answer by construction; that is what
+/// the `bench` job of `.github/workflows/rust.yml` does.
 fn criterion_root() -> PathBuf {
     for (var, suffix) in [
         ("CRITERION_HOME", None),
@@ -1168,7 +1184,9 @@ fn criterion_root() -> PathBuf {
         }
     }
 
-    repository_root().join("target").join("criterion")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("criterion")
 }
 
 /// Up to twelve readable regular files from `dir`, sorted, when none of the pinned members is there.

@@ -23,18 +23,21 @@ With this option on, the exported ZLIB::ZLIB and ZLIB::ZLIBSTATIC targets are bu
 Rust workspace at the top of this tree (crates/libz-rs-sys) instead of from the C sources. The shared
 libz.so it stages presents the same ABI as the C one -- the same SONAME libz.so.1 and the same 111
 exported symbols at the same versions -- so a program that dynamically links zlib keeps working without
-being recompiled. That is verified on x86_64-unknown-linux-gnu. Static consumption is not yet
-equivalent: a Rust libz.a needs the Rust runtime's own companion libraries, the set is target-specific,
-and the installed zlib.pc advertises none of it, so read the note in zlib.pc.cmakein before pointing a
-static consumer at it through pkg-config. cargo has to be reachable on PATH and configuration stops
+being recompiled. That is verified on x86_64-unknown-linux-gnu. Static consumption needs one thing the C
+build does not, and this build path supplies it rather than leaving it to the consumer: a Rust libz.a
+carries the Rust runtime's own companion libraries, so configuration derives that target's set and
+publishes it in the installed zlib.pc as `Libs.private:` and on the exported ZLIB::ZLIBSTATIC target.
+See "One thing the Rust build has to advertise" below for what that means for a static link command.
+cargo has to be reachable on PATH and configuration stops
 with a message telling you so when it is not, or -DZLIB_CARGO_EXECUTABLE=/path/to/cargo names a
 particular one. This path needs Rust 1.80 or newer, which cargo enforces itself from
 rust-toolchain.toml and the crate manifests: the build runs
-`cargo build --package libz-rs-sys`, so it compiles only the two crates that ship and only their
-1.80 floor applies. The workspace's third member, the dev-only `crates/zlib-rs-differential`
-harness that hosts the C oracle and the benchmarks, declares 1.86 because criterion does -- but no
-CMake target builds it, so that floor never reaches a production build. It applies to
-`cargo test --workspace` and `cargo bench`, which are developer commands. The C targets zlib and zlibstatic are still defined and
+`cargo build --package libz-rs-sys`, so it compiles only the two crates that ship. All three
+workspace members declare the same 1.80 floor, including the dev-only
+`crates/zlib-rs-differential` harness that hosts the C oracle, so no CMake configuration can reach
+a higher one. The only higher floor in the repository is criterion's 1.86, and it belongs to the
+excluded `benches/` package, which no CMake target builds and which is reached only by
+`cargo bench --manifest-path benches/Cargo.toml`. The C targets zlib and zlibstatic are still defined and
 still built, as they are the reference the Rust code is diffed against, so this option adds a library
 rather than taking one away. It is off by default, and while it is off no Rust tool is probed and
 everything here behaves exactly as it always has. The Rust library is supported on Rust's tier 1
@@ -51,13 +54,22 @@ go on searching and bind the system libz instead, silently.
 One thing the Rust build has to advertise that the C build does not: a Rust static library carries the
 Rust standard library's own references, and a static archive cannot record a dependency the way a shared
 object records DT_NEEDED. So with this option on, configuration derives the target's native runtime
-libraries with `rustc --crate-type staticlib --print native-static-libs` and publishes them twice, once
-as `Libs.private:` in the generated zlib.pc and once as the installed ZLIB::ZLIBSTATIC target's interface
-libraries, so that a consumer linking libz.a is told what it needs without having to know it exists. The
-set is target-specific and is never hardcoded; if rustc cannot be reached, configuration warns and
-advertises nothing rather than guessing. Shared consumers are unaffected either way. `ctest -R
-static_link_closure` is the case that holds this to account, and it links with -nodefaultlibs on purpose
--- a plain link succeeds on a modern glibc whether the advertisement is there or not.
+libraries with `rustc --crate-type staticlib --print native-static-libs` and publishes that one answer
+through the two channels a consumer can read: as the single `Libs.private:` key in the generated zlib.pc,
+which `pkg-config --static --libs zlib` reports, and as the interface link libraries of the exported
+ZLIB::ZLIBSTATIC target, which a `find_package(ZLIB CONFIG)` consumer gets without pkg-config at all. A
+consumer that reads either one keeps writing the link command it always wrote; one that hardcodes `-lz`
+and reads neither has to add the printed set itself.
+
+The set is target-specific and is never hardcoded, and this path is FAIL-CLOSED: if rustc cannot be
+reached, or answers with no set at all, configuration stops with a FATAL_ERROR naming the remedy --
+either -DZLIB_RUSTC_EXECUTABLE=/path/to/rustc, or -DZLIB_RUST_NATIVE_STATIC_LIBS="-lm -ldl -lc" to state
+the answer yourself as a cross build must, or -DZLIB_BUILD_STATIC=OFF to publish no archive. Installing a
+static library whose link requirements are unknown would be worse than not installing one, because the
+failure would surface in a consumer's build with nothing to connect it to this one. Shared consumers are
+unaffected either way, and a C-mode build never reaches any of it. `ctest -R static_link_closure` is the
+case that holds this to account, and it links with -nodefaultlibs on purpose -- a plain link succeeds on a
+modern glibc whether the advertisement is there or not.
 
 README and rust/README.md cover the Rust build in full.
 

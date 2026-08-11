@@ -152,12 +152,24 @@
 //!
 //! `cbindgen --crate libz-rs-sys` renders this module's declarations as C, for
 //! comparison against the immutable `zlib.h`, so the *spellings* here are part of
-//! the contract -- and a gated part. `cbindgen.toml` specifies a normalised
-//! signature-and-constant comparison, and explains why a verbatim `diff` can never be
-//! empty; `make rust-header` implements the name-set half and the `header` job of
-//! `.github/workflows/rust.yml` implements the shape half by re-declaring every
-//! generated prototype against the real `zlib.h`. A spelling below that stopped
-//! matching would fail that job.
+//! the contract -- and a gated part. `cbindgen.toml` specifies the comparison in
+//! eleven rules; `make rust-header` implements the name-set half and the `header`
+//! job of `.github/workflows/rust.yml` implements the shape half by re-declaring
+//! every generated prototype against the real `zlib.h` and by diffing a canonical
+//! rendering of all 95 contract signatures against the same rendering of
+//! `zlib.h`'s, which is required to be **empty** (rule A11). A spelling below that
+//! stopped matching would fail that job.
+//!
+//! A diff of the two whole FILES is a different question and is necessarily
+//! non-empty -- cbindgen emits no comments, no `ZEXTERN`/`ZEXPORT` and no
+//! function-like macros -- so the job runs it as published evidence rather than as
+//! the check. What the empty diff needs from this module is that each ABI struct
+//! carries the CONTRACT's tag name: [`z_stream_s`] and [`gz_header_s`] are the tags
+//! `zlib.h` L90 and L118 declare, with [`z_stream`] and [`gz_header`] published
+//! beside them as the typedefs L110 and L133 declare, and `style = "both"` emits
+//! both halves. Renaming either struct to its typedef would put an allowance back
+//! into a diff that currently needs none.
+//!
 //! Every ABI type uses its exact C name -- `z_stream`,
 //! `gz_header`, `gzFile_s`, `uInt`, `uLong`, `voidpf` and the rest -- because
 //! cbindgen resolves `c_uint` to `unsigned int` and `c_ulong` to
@@ -518,7 +530,7 @@ pub struct internal_state {
 /// entry point will accept it. Offering a `Default` would advertise the opposite.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct z_stream {
+pub struct z_stream_s {
     /// Offset 0. `z_const Bytef *next_in` -- the next input byte.
     ///
     /// `zlib.h` L91. Typed `*const` because the library never writes through it;
@@ -595,6 +607,18 @@ pub struct z_stream {
     pub reserved: uLong,
 }
 
+/// `z_stream` -- the typedef `zlib.h` L110 publishes for [`z_stream_s`].
+///
+/// Two names for one type, because `zlib.h` L90-L110 publishes two names for one
+/// type: the struct tag `z_stream_s` and the typedef `z_stream`. A consumer may
+/// legitimately write either, so the generated header has to carry both, and it
+/// only can if both exist here -- cbindgen renders the struct under its Rust name
+/// and this alias as `typedef struct z_stream_s z_stream;`. Nothing about the
+/// layout or the ABI depends on which name is used; this is the API surface being
+/// reproduced exactly rather than approximately, which is what lets the header
+/// gate compare resolved signatures with no allowance for the tag spelling.
+pub type z_stream = z_stream_s;
+
 /// `z_stream FAR *` -- `zlib.h` L112.
 ///
 /// The parameter type of every stream entry point. Nullability is part of the
@@ -629,7 +653,7 @@ pub type z_streamp = *mut z_stream;
 /// category 6 rather than ordinary slice work.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct gz_header {
+pub struct gz_header_s {
     /// Offset 0. `int text` -- true if the data is believed to be text.
     ///
     /// `zlib.h` L119.
@@ -689,6 +713,13 @@ pub struct gz_header {
     /// padding follow, bringing the struct to 80.
     pub done: c_int,
 }
+
+/// `gz_header` -- the typedef `zlib.h` L133 publishes for [`gz_header_s`].
+///
+/// The same two-names-for-one-type arrangement as [`z_stream`], for the same
+/// reason: `zlib.h` L118-L133 publishes the tag `gz_header_s` and the typedef
+/// `gz_header`, so both have to reach the generated header.
+pub type gz_header = gz_header_s;
 
 /// `gz_header FAR *` -- `zlib.h` L135.
 ///

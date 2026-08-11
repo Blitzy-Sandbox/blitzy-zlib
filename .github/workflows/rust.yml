@@ -4,8 +4,27 @@
 # The Cargo workspace at the top of this tree reimplements the zlib engine in
 # safe Rust and re-exports it through a thin `extern "C"` facade, so that a
 # consumer already linked against `libz` keeps working with no edit and no
-# recompilation.  Every claim in that sentence is checked by a job below, and
-# for seven of them THIS FILE IS THE ONLY PLACE THEY ARE CHECKED AT ALL.
+# recompilation.  Every claim in that sentence is checked by a job below.
+#
+# ★ THE JOB INVENTORY, and it is the whole of it -- EIGHTEEN jobs, in the order
+# they appear in this file.  Anything not on this list does not exist here, and
+# every name here can be found as a `<name>:` key under `jobs:`:
+#
+#     build-test   format   lint     deny      msrv     integer-models
+#     features     simd     differential       differential-exhaustive
+#     symbols      header   dropin   miri      asan     fuzz
+#     cmake-rust   bench
+#
+# Three of the seven `make rust*` targets are invoked from here, so those parts
+# are reproducible by hand exactly as CI runs them: `make rust` (build-test's
+# sibling jobs `symbols`, `header`, `dropin` and `cmake-rust`), `make rust-header`
+# (`header`) and `make rust-pc` (`symbols`, `dropin`).  `make rust-test`,
+# `make rust-symbols`, `make rust-msrv` and `make rust-clean` are NOT invoked
+# here: the jobs that cover the same ground -- `dropin`, `symbols` and `msrv` --
+# drive the compilers directly so that the CI transcript names each assertion
+# individually.  Run the make targets locally as well; they are the same checks
+# with a different reporting surface, and Makefile.in's header comment states for
+# each one what it does and does not establish.
 #
 # What each job enforces, by the quality-bar constraint it answers:
 #
@@ -17,16 +36,28 @@
 #                               the six unavoidable unsafe site categories are,
 #                               instrumented both on its own and with
 #                               `-Zbuild-std` so that faults inside `std`
-#                               routines reached from the facade are attributed)
+#                               routines reached from the facade are attributed;
+#                               it also instruments the three C drivers, the
+#                               dev-only differential harness and a compile of
+#                               the criterion suites -- see that job's own SCOPE
+#                               note for the five items and the one exclusion)
 #   (b) contract immutability . `header` (cbindgen signature/field/macro gate)
 #                               and `symbols` (nm parity against the 111-symbol
 #                               C baseline, the SONAME, and the hidden set)
-#   (c) behavioral fidelity ... `differential`, which runs FOUR tiers: the fast
+#   (c) behavioral fidelity ... `differential` and `differential-exhaustive`.
+#                               `differential` runs three tiers: the fast
 #                               representative sweep, the armed exhaustive
-#                               byte-identity matrix, the armed exhaustive
-#                               interoperability product, and the same suites
-#                               with `--features simd` to prove the vectorised
-#                               checksum backends are output-neutral
+#                               INTEROPERABILITY product (cheap -- seconds), and
+#                               both suites again with `--features simd` to prove
+#                               the vectorised checksum backends are
+#                               output-neutral.  The exhaustive BYTE-IDENTITY
+#                               matrix is the other job, because it needs
+#                               sharding: sixteen rows, eight cell slices x both
+#                               checksum backends, with a coverage gate that
+#                               reads each level's own accounting line.  A push
+#                               runs the armed product; the nightly `schedule`
+#                               run lifts the one declared exclusion and
+#                               enumerates all 9,922,500 cells
 #   (d) verification clean .... `miri`, `asan`, `fuzz` (five targets, 300 s
 #                               each, zero crashes, with the differential
 #                               checksum target run once per backend) and
@@ -48,23 +79,35 @@
 # `features` answers no single constraint and is required by all of them: it
 # builds, tests and lints every feature configuration a consumer can select --
 # no-default, libz-compat alone, default, all, and simd -- because a cfg that
-# nothing compiles is a cfg the other twelve jobs never look at.
+# nothing compiles is a cfg the other seventeen jobs never look at.
 #
 # And the performance targets of AAP 0.8.4, which are the one set of claims no
 # single job can settle:
 #
-#   `bench`         measures, three times over: the shipped `bench` profile, the
-#                   non-LTO `bench-parity` profile that is comparable to the way
-#                   the C oracle is BUILT, and the shipped profile with the
-#                   vectorized checksum backends.  It decides nothing.
-#   `bench-gate`    IS THE DECISION.  It validates a required-case manifest,
-#                   enforces the limits only where the AAP states one, and judges
-#                   each case on the STRONGER of the two profiles' ratios.
-#   `bench-silesia` makes the measurement the targets are actually stated on, in
-#                   acceptance mode, on a runner where the twelve pinned members
-#                   are already present.  It downloads nothing, and when no
-#                   corpus is provisioned it is skipped and `bench-gate` says so
-#                   rather than letting the minimal corpus stand in for it.
+#   `bench`         is ONE job, and it both measures and decides.  There is no
+#                   separate `bench-gate` job and no separate `bench-silesia`
+#                   job; prose here described both for a while, and neither has
+#                   ever existed.  What the single job does, in step order:
+#                     * measures across the matrix -- the shipped `bench`
+#                       profile, the non-LTO `bench-parity` profile that is
+#                       comparable to the way the C oracle is BUILT, and the
+#                       shipped profile with the vectorised checksum backends;
+#                     * self-tests the gate against a committed synthetic log
+#                       before trusting it, 31 cases including deliberate
+#                       failures, because a gate that cannot fail is not a gate;
+#                     * GATES the measurements with `.github/scripts/bench_gate.py`
+#                       -- a committed program, not a heredoc -- which validates
+#                       each suite's own declared inventory, enforces the AAP
+#                       0.8.4 limits only on the groups those suites publish as
+#                       authoritative, and takes the ratio from criterion's
+#                       `estimates.json` rather than from the log's own summary;
+#                     * runs the Silesia tier when, and only when, a corpus is
+#                       provisioned outside this workflow.  Nothing here fetches
+#                       one: the cache step is restore-only and the only
+#                       invocation of the fetch script is `--verify-only`.  When
+#                       the tier is armed and no corpus is present the job FAILS
+#                       and says what to configure; when it is not armed it warns
+#                       and the minimal corpus never stands in for Silesia.
 #
 # EVERY JOB THAT COMPARES AGAINST THE C ORACLE RUNS BOTH CHECKSUM BACKENDS.
 # `simd` is default-off and required to be output-neutral, so `differential`,
@@ -97,19 +140,22 @@
 #                proves the Rust library still matches the header, c-std.yml
 #                proves the header itself still compiles everywhere.
 #   * cmake.yml  exercises the C library's CMake matrix.  It carries NO Rust
-#                job and names `ZLIB_BUILD_RUST` nowhere, so the CMake Rust
-#                path -- the option, its ELF-only preconditions and the
-#                ZLIB::ZLIB / ZLIB::ZLIBSTATIC redirection in CMakeLists.txt --
-#                is UNGATED by CI and is exercised only by hand.  Everything
-#                here drives cargo, and the Makefile's `rust*` targets, which
-#                is what the verified command set uses.
+#                job and names `ZLIB_BUILD_RUST` nowhere -- but the CMake Rust
+#                path is NOT ungated, and prose here said it was: the
+#                `cmake-rust` job in THIS file owns it, configuring with
+#                `-DZLIB_BUILD_RUST=ON`, building, running the CTest cases and
+#                checking the ZLIB::ZLIB / ZLIB::ZLIBSTATIC redirection and the
+#                installed layout.  cmake.yml stays C-only on purpose, so that
+#                the C build's own matrix cannot be perturbed by a Rust
+#                toolchain problem.
 #
 # Nothing in this file writes to zlib.h, zconf.h, zlib.map, any C translation
 # unit, anything under contrib/, or any of the three test drivers.  zlib.h and
 # zlib.map are CONSUMED -- as the header-diff target and as the linker version
-# script -- and never modified.  No job downloads a benchmark corpus: the
-# acceptance job reads one a runner already has, and every other job runs on the
-# committed minimal corpus.
+# script -- and never modified.  No job downloads a benchmark corpus: the Silesia
+# tier of `bench` reads one a runner already has -- restore-only cache, and the
+# fetch script invoked only as `--verify-only` -- and every other job, benchmarks
+# included, runs on the committed minimal corpus.
 # =============================================================================
 
 name: Rust
@@ -117,6 +163,18 @@ name: Rust
 on:
   push:
   pull_request:
+  # ★ THE UNABRIDGED BYTE-IDENTITY PRODUCT RUNS ON A SCHEDULE, and until this
+  # trigger existed it ran only when a human asked for it by hand.  AAP 0.1.1.1
+  # goal 3 makes byte-identical output a governing requirement, and the whole
+  # 9,922,500-cell product is what substantiates it; a push and a pull request run
+  # the armed 9,459,450 because `full` costs roughly four times the wall clock, so
+  # without a scheduled run the remaining 463,050 cells -- the seven sub-64-byte
+  # windows over window_boundary.bin's 66,560 incompressible bytes -- were never
+  # continuously verified at all.  They are now, nightly, on the default branch,
+  # and the coverage gate asserts that a scheduled run really is running `full`
+  # rather than trusting the mapping below.
+  schedule:
+    - cron: '17 3 * * *'
   workflow_dispatch:
     inputs:
       differential_mode:
@@ -125,7 +183,9 @@ on:
           shards enumerate. `1` runs the armed product (9,459,450 cells, the
           46,305-per-level tiny-window-over-window_boundary.bin cells declared
           and counted as excluded); `full` lifts that one exclusion and runs the
-          whole 9,922,500, which costs roughly four times the wall clock.
+          whole 9,922,500, which costs roughly four times the wall clock. The
+          scheduled run above always uses `full`, so this input is for asking for
+          it early rather than for reaching it at all.
         default: '1'
         required: false
         type: choice
@@ -309,13 +369,13 @@ jobs:
   # ---------------------------------------------------------------------------
   # 2. Formatting.  .rustfmt.toml exists at the root to be enforced here.
   #
-  # TWO INVOCATIONS, BECAUSE THERE ARE TWO WORKSPACES.  The root Cargo.toml
-  # declares `exclude = ["fuzz"]` and fuzz/ carries its own [workspace] table and
-  # its own Cargo.lock, so `cargo fmt --all` from the root does not see the five
-  # fuzz targets at all -- it is not that they are formatted and passing, it is
-  # that nothing looked at them.  `--manifest-path` is how the second workspace
-  # is reached, and .rustfmt.toml at the root still governs both because rustfmt
-  # searches upwards from each file.
+  # THREE INVOCATIONS, BECAUSE THERE ARE THREE WORKSPACES.  The root Cargo.toml
+  # declares `exclude = ["benches", "fuzz"]`, and each of those directories carries
+  # its own [workspace] table and its own Cargo.lock, so `cargo fmt --all` from the
+  # root sees neither the five fuzz targets nor the three benchmark suites -- it is
+  # not that they are formatted and passing, it is that nothing looked at them.
+  # `--manifest-path` is how the other two are reached, and .rustfmt.toml at the
+  # root still governs all three because rustfmt searches upwards from each file.
   # ---------------------------------------------------------------------------
   format:
     name: Format
@@ -336,6 +396,32 @@ jobs:
 
     - name: Run test cases (the fuzz workspace)
       run: cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
+
+    - name: Run test cases (the benchmark workspace)
+      run: cargo fmt --manifest-path benches/Cargo.toml --all -- --check
+    - name: Run test cases (whitespace hygiene)
+      # `cargo fmt` has nothing to say about a YAML file, a TOML manifest, a
+      # markdown document or a shell script, and this file itself had accumulated
+      # a blank line at end of file -- which makes `git diff --check` exit
+      # non-zero on any later diff that touches it, and the usual response to a
+      # check that is always red is to stop running it.
+      #
+      # So the hygiene is gated rather than conventional, by a committed script a
+      # contributor can run by hand.  It is scoped to the files this port
+      # introduced, on purpose: the tree around them is upstream zlib and carries
+      # whitespace this port has no business rewriting -- Makefile.in has had no
+      # newline at end of file since long before the port existed.  The script
+      # FAILS if its file list comes out empty, so a pattern that stopped matching
+      # cannot leave it checking nothing and reporting success.
+      #
+      # `git diff --check` runs beside it over the checkout, which is a different
+      # question -- whether anything in this job dirtied the tree -- and costs
+      # nothing to answer here.
+      run: |
+        set -eu
+        sh .github/scripts/whitespace_gate.sh
+        git diff --check
+        echo "git diff --check: clean"
 
   # ---------------------------------------------------------------------------
   # 3. Lints.  The LEVELS live in Cargo.toml's [workspace.lints] -- clippy::all
@@ -402,6 +488,25 @@ jobs:
         cargo +nightly clippy --locked --all-targets -- -D warnings
         cargo +nightly clippy --locked --all-targets --all-features -- -D warnings
 
+    - name: Run test cases (the benchmark workspace)
+      # `--workspace` at the root cannot reach `benches/` either, and for a
+      # different reason: it is excluded because criterion 0.8.2 declares
+      # rust-version 1.86 and reaches edition-2024 clap manifests, which cargo
+      # 1.80 -- this project's floor -- cannot parse, so hosting the suites inside
+      # the workspace made `cargo +1.80 check --workspace` impossible.
+      #
+      # The consequence for linting is the same as for fuzz/: a workspace lint
+      # table does not cross a workspace boundary, so `benches/Cargo.toml`
+      # restates the policy in `[lints.rust]` and `[lints.clippy]` tables of its
+      # own and this step is what makes those denials reachable by CI.  Both
+      # feature configurations are linted, because `--features simd` compiles the
+      # vectorised rows that the default build does not.
+      run: |
+        set -eu
+        cargo clippy --locked --manifest-path benches/Cargo.toml --all-targets -- -D warnings
+        cargo clippy --locked --manifest-path benches/Cargo.toml --all-targets \
+          --features simd -- -D warnings
+
   # ---------------------------------------------------------------------------
   # 4. Dependency policy.  Reads the root deny.toml: the [licenses] allow-list
   # (Zlib for this project's own crates, plus the MIT / Apache-2.0 /
@@ -460,6 +565,19 @@ jobs:
       # license, source or bans enforcement at all.
       run: cargo deny --locked --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check
 
+    - name: Run test cases (benchmark workspace)
+      # THE THIRD GRAPH, and the largest one in the repository.  `benches/` is
+      # excluded from the workspace for an MSRV reason -- criterion 0.8.2
+      # declares rust-version 1.86 and reaches edition-2024 clap manifests that
+      # cargo 1.80 cannot parse -- so the root command above cannot see criterion
+      # or any of its closure (clap, plotters, rayon, serde, regex, walkdir,
+      # wasm-bindgen).  Measured: 78 packages here against the library
+      # workspace's seven.  Auditing it separately is what stops the exclusion
+      # from becoming a coverage hole; `benches/deny.toml` carries the policy and
+      # the one licence identifier this graph needs and the root one does not
+      # (`Unicode-3.0`, through unicode-ident).
+      run: cargo deny --locked --manifest-path benches/Cargo.toml --config benches/deny.toml check
+
     - name: Run test cases (core dependency table is empty)
       run: |
         set -eu
@@ -501,13 +619,27 @@ jobs:
   # point is that an accidentally-newer-than-1.80 construct fails here rather
   # than in a downstream distribution.
   #
-  # SCOPE, and it is not negotiable: `--workspace` CANNOT be used.  The dev-only
-  # zlib-rs-differential crate declares `rust-version = "1.86"` because that is
-  # criterion's own floor, so `cargo +1.80 build --workspace` fails before it
-  # compiles anything, with "rustc 1.80.1 is not supported by the following
-  # packages".  The MSRV is a promise about the two crates that SHIP, and those
-  # are exactly the two named here -- the same pair Makefile.in's
-  # CARGO_MSRV_FLAGS names.
+  # SCOPE: THE WHOLE WORKSPACE, PLUS THE SHIPPED PAIR IN THREE CONFIGURATIONS.
+  #
+  # `--workspace` used to be impossible here.  While the three criterion suites
+  # were attached to the dev-only zlib-rs-differential crate, that crate declared
+  # `rust-version = "1.86"` -- criterion's own floor -- and reached clap manifests
+  # written in edition 2024, so `cargo +1.80 build --workspace` failed before
+  # compiling anything and `cargo +1.80 metadata --locked` could not even resolve.
+  # A workspace that declares 1.80 and cannot be resolved by 1.80 is not honouring
+  # the floor, so the suites moved to `benches/`, an excluded package with its own
+  # lock.  Both commands now pass, and the workspace-wide pair below is what keeps
+  # them passing:
+  #
+  #   cargo +1.80 metadata --locked
+  #   cargo +1.80 check --locked --workspace --all-targets
+  #
+  # The three `build` lines that follow them are still scoped to the two crates
+  # that SHIP -- the same pair Makefile.in's CARGO_MSRV_FLAGS names -- because the
+  # feature matrix below is a promise about those two and codegen is what catches
+  # the `arithmetic_overflow` class.  Adding a criterion edge to any member
+  # re-breaks the two commands above; `benches/Cargo.toml` section 2 says so at
+  # length.
   #
   # edition 2021 is likewise not a preference: edition 2024 requires rustc 1.85
   # and cargo rejects the combination outright, so 2021 is the only valid choice
@@ -561,6 +693,14 @@ jobs:
         CARGO_TARGET_DIR: target/msrv
       run: |
         set -eu
+        # THE WORKSPACE-WIDE PAIR FIRST, because they are the two commands the
+        # benchmark-hosting move exists to make possible.  Resolution comes before
+        # compilation: `metadata` fails on an unparseable manifest anywhere in the
+        # dev graph, which is exactly how a criterion edge would reappear.
+        cargo +1.80 metadata --locked --format-version 1 > /dev/null
+        cargo +1.80 check --locked --workspace --all-targets
+        # Then the shipped pair, compiled rather than checked, in all three
+        # configurations a consumer can select.
         cargo +1.80 build --locked -p zlib-rs -p libz-rs-sys --all-targets
         cargo +1.80 build --locked -p zlib-rs -p libz-rs-sys --all-features --all-targets
         cargo +1.80 build --locked -p zlib-rs -p libz-rs-sys --no-default-features --all-targets
@@ -850,7 +990,14 @@ jobs:
       # Builds only.  The bench job owns the measurement; what matters here is
       # that the SIMD configuration compiles the benches at all, since they are
       # the one consumer that links both implementations at once.
-      run: cargo bench --locked -p zlib-rs-differential --features simd --no-run
+      #
+      # `--manifest-path benches/Cargo.toml`, because the three suites live in
+      # their own excluded package: criterion 0.8.2 declares rust-version 1.86 and
+      # reaches edition-2024 clap manifests, which cargo 1.80 -- this project's
+      # floor -- cannot parse, so hosting them inside the workspace broke
+      # `cargo +1.80 check --workspace`.  The package forwards its own `simd`
+      # feature to all three crates under measurement.
+      run: cargo bench --locked --manifest-path benches/Cargo.toml --features simd --no-run
 
   # ---------------------------------------------------------------------------
   # 6. The differential suite: byte-identical output, and interoperability in
@@ -971,12 +1118,11 @@ jobs:
   differential:
     name: Differential (${{ matrix.label }})
     runs-on: ubuntu-latest
-    # The exhaustive sweeps are the reason this is not the default.  Measured on a
-    # loaded four-core machine: the ten per-level shards plus the chunking sweep
-    # take 38 minutes wall clock at `--test-threads 4`, and the interoperability
-    # sweep 4 seconds.  The budget is generous rather than tight because the right
-    # response to exceeding it is to SHARD -- the sweeps are already one test per
-    # level, so `-- --ignored exhaustive_configuration_matrix_level_3` runs one --
+    # The byte-identity shards do NOT run here -- `differential-exhaustive` below owns
+    # them, sixteen ways.  What this job runs is the fast default sweep of both
+    # suites, the whole interoperability product (4 seconds, measured), and both
+    # suites again with `--features simd`.  The budget is generous rather than tight
+    # because the right response to exceeding it is to move work into a sharded job
     # and never to narrow what is compared.
     timeout-minutes: 120
     steps:
@@ -1103,7 +1249,13 @@ jobs:
   differential-exhaustive:
     name: Differential exhaustive (${{ matrix.label }} shard ${{ matrix.shard }}/8)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # Sized for the nightly `full` run, not for a push.  Lifting the one declared
+    # exclusion multiplies the work by roughly four -- the seven sub-64-byte output
+    # windows over a 66,560-byte incompressible fixture are tens of thousands of
+    # `deflate` calls per cell -- so a 90-minute ceiling that fits the armed product
+    # would cancel the very run that makes the product complete.  330 leaves margin
+    # under GitHub's 360-minute per-job maximum.
+    timeout-minutes: 330
     strategy:
       fail-fast: false
       matrix:
@@ -1144,9 +1296,17 @@ jobs:
     - name: Run test cases
       env:
         # `1` runs the armed product; `full` additionally lifts the one declared
-        # exclusion.  The default keeps a push and a pull request affordable and
-        # `workflow_dispatch` is how the unabridged form is asked for.
-        ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE: ${{ inputs.differential_mode || '1' }}
+        # exclusion.  A push and a pull request get the armed product because the
+        # unabridged one costs about four times the wall clock; the nightly
+        # `schedule` run gets `full` unconditionally, which is what makes the whole
+        # product a continuously verified gate rather than a manual choice, and
+        # `workflow_dispatch` can ask for it early.  The gate step below asserts
+        # the mapping held, so dropping it fails loudly instead of quietly
+        # returning the job to the abridged product.
+        # One line on purpose: a folded scalar whose continuation is more indented is
+        # preserved literally by YAML, and a newline inside `${{ }}` is not something
+        # to find out about at run time.
+        ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE: ${{ github.event_name == 'schedule' && 'full' || inputs.differential_mode || '1' }}
         ZLIB_RS_DIFFERENTIAL_SHARD: ${{ matrix.shard }}/8
       run: |
         set -eu
@@ -1158,8 +1318,14 @@ jobs:
 
     - name: Run test cases (assert the product was enumerated)
       env:
-        ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE: ${{ inputs.differential_mode || '1' }}
+        # One line on purpose: a folded scalar whose continuation is more indented is
+        # preserved literally by YAML, and a newline inside `${{ }}` is not something
+        # to find out about at run time.
+        ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE: ${{ github.event_name == 'schedule' && 'full' || inputs.differential_mode || '1' }}
         ZLIB_RS_DIFFERENTIAL_SHARD: ${{ matrix.shard }}/8
+        # Read by the gate so that the event and the mode can be checked against
+        # each other rather than each being trusted on its own.
+        ZLIB_RS_TRIGGERING_EVENT: ${{ github.event_name }}
       run: |
         set -eu
         python3 - <<'COVERAGE_GATE'
@@ -1181,6 +1347,23 @@ jobs:
             r"\[shard=(?P<shard>\d+/\d+) (?P<fields>product=\d+ .*)\]$")
 
         unabridged = os.environ.get("ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE", "1") == "full"
+        event = os.environ.get("ZLIB_RS_TRIGGERING_EVENT", "")
+
+        # The event and the mode, checked against each other.  A scheduled run is what
+        # makes the unabridged product continuous, so a future edit that drops the
+        # mapping -- or an expression that evaluates to something other than `full` --
+        # has to fail here rather than quietly returning this job to the abridged
+        # product with everything still green.
+        mode_failures = []
+        if event == "schedule" and not unabridged:
+            mode_failures.append(
+                "the scheduled run is meant to enumerate the whole 9,922,500-cell "
+                "product, but ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE is %r rather than 'full'. "
+                "That is the mapping in this job's `env:` block having stopped working, "
+                "and it would leave 463,050 cells unverified with the job reporting "
+                "success."
+                % os.environ.get("ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE", "")
+            )
 
         def pairs(text):
             out = {}
@@ -1267,6 +1450,7 @@ jobs:
                  total_compared, total_excluded, SHARDS, LEVELS * PER_LEVEL,
                  expected_share))
 
+        failures = mode_failures + failures
         if failures:
             for failure in failures:
                 print("::error::%s" % failure)
@@ -1274,7 +1458,8 @@ jobs:
 
         print("exhaustive differential: PASS -- every cell of this shard's slice of all "
               "ten levels was compared or declared excluded, byte for byte against the "
-              "C oracle")
+              "C oracle (event=%s, mode=%s)"
+              % (event or "unknown", "full" if unabridged else "armed"))
         COVERAGE_GATE
 
     - name: Upload build errors
@@ -1531,6 +1716,47 @@ jobs:
         echo "both large-file families present; $gzcount gz* symbols"
         echo "symbol parity: PASS"
 
+    - name: Run test cases (the packaged gates, armed)
+      # ★ THE RUST-SIDE HALF OF THIS JOB, AND WHY IT IS ARMED.
+      #
+      # Everything above is shell: `nm`, `readelf`, `diff`.  `symbol_parity.rs`
+      # asserts the same contract from inside the workspace and adds what shell
+      # cannot reach -- the baseline reconciled against zlib.map's own text, the
+      # symlink TOPOLOGY read with `read_link` rather than dereferenced, the
+      # `inflate_table` asymmetry between archive and shared library, and
+      # `zlibCompileFlags()` bit 27 checked against the two artifacts that ship.
+      #
+      # Every one of those inspects a file `cargo test` never builds, so each
+      # SKIPS by default.  That default is right for a developer and vacuous
+      # here: before this step existed, no job in this workflow ran the suite at
+      # all, so its nine packaged gates were green everywhere and had never
+      # opened the library.  Two mechanisms close that, and both are needed --
+      # `ZLIB_RS_REQUIRE_PACKAGED=1` turns a missing drop-in into a failure that
+      # names what went unverified, and the `SKIP:` scan below catches the
+      # remaining skip reasons (a missing cdylib, a missing staticlib, absent
+      # binutils) which arming does not cover because they are not packaged
+      # artifacts.
+      #
+      # `--release` is not incidental: `make rust` above built with
+      # CARGO_BUILD_FLAGS='--locked --release', so the release directory already
+      # holds the cdylib and the archive this suite compares, and the test binary
+      # must land beside them for `profile_dir()` to find them.
+      run: |
+        set -eu
+        S=target/symbol-parity
+        mkdir -p "$S"
+        ZLIB_RS_REQUIRE_PACKAGED=1 cargo test --locked --release \
+          -p libz-rs-sys --test symbol_parity -- --nocapture 2>&1 | tee "$S/symbol_parity.log"
+        if grep -n '^SKIP:' "$S/symbol_parity.log"; then
+          echo "::error::symbol_parity.rs skipped an assertion in a job that staged every artifact it inspects; a skip here is an unverified gate, not a pass"
+          exit 1
+        fi
+        RAN=$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' "$S/symbol_parity.log")
+        [ -n "$RAN" ] && [ "$RAN" -ge 16 ] || {
+          echo "::error::expected at least 16 passing symbol_parity gates, saw '${RAN:-none}'"
+          exit 1; }
+        echo "symbol_parity.rs: $RAN gates passed, zero skipped"
+
     - name: Run test cases (ZLIB_RS_SIMD=1 exports the same surface)
       # `ZLIB_RS_SIMD=1 make rust` is the DOCUMENTED user-facing spelling of the
       # toggle -- README and Makefile.in both give it that way -- and the
@@ -1577,28 +1803,49 @@ jobs:
   # 8. Header conformance: the C header cbindgen derives from the facade,
   # compared against the immutable zlib.h.
   #
-  # A VERBATIM `diff -u zlib.h generated_zlib.h` IS NOT THE GATE AND NEVER CAN
-  # BE.  cbindgen cannot emit the ZEXTERN/ZEXPORT declaration macros, cannot
-  # express zlib.h's conditional `#include` of zconf.h, cannot reproduce the
-  # function-like macros or the conditional large-file duplicate declaration
-  # blocks, and alphabetises what zlib.h orders thematically.  That diff is
-  # permanently non-empty, so wiring it up as the pass/fail check would produce
-  # a gate that is either always red or quietly ignored.  The accepted
-  # structural divergences are enumerated in the root cbindgen.toml under
-  # "ACCEPTED DIVERGENCES", and the comparison specified there under
-  # "NORMALISATION RULES THE GATE MUST IMPLEMENT" is what runs here.
+  # ★ THERE IS A LITERAL DIFF, IT IS REQUIRED TO BE EMPTY, AND IT IS PASS D.
+  # AAP 0.8.6 freezes `diff -u zlib.h generated_zlib.h`; AAP 0.4.2.3 makes the
+  # diff the gate.  Two things follow, and this job does both rather than
+  # choosing between them.
   #
-  # That specification is split across two mechanisms on purpose:
+  # First, a diff of the two FILES cannot be the pass/fail check.  cbindgen
+  # cannot emit the ZEXTERN/ZEXPORT declaration macros, cannot express zlib.h's
+  # conditional `#include` of zconf.h, cannot reproduce the function-like macros
+  # or the conditional large-file duplicate declaration blocks, and alphabetises
+  # what zlib.h orders thematically -- so that diff is permanently non-empty
+  # (6,020 lines here) and wiring it up would give a gate that is always red or
+  # quietly ignored.  It IS run, and written to
+  # target/header-gate/aap-0.8.6-raw.diff with the job's artifacts, so a reviewer
+  # can confirm its content is only the reasons cbindgen.toml enumerates as D1,
+  # D3, D5, D7, D8, D9 and D10.
+  #
+  # Second, and this is the part that used to be missing: the CONTRACT is
+  # diffable literally, and its diff is required to be empty.  Pass D renders
+  # each side's 95 contract signatures as one `name<TAB>type` line, where the
+  # type is produced by the C++ compiler's own mangling of `decltype(&f)` -- so
+  # the zconf.h typedef chain, the parameter names, bare `unsigned`, the
+  # ZEXTERN/FAR/z_const decoration and declaration order are all resolved by the
+  # compiler rather than by a regex guessing at those rules -- and requires
+  # `diff -u` over the two renderings to produce NO OUTPUT.  It is empty today
+  # with no allowance of any kind, which is why cbindgen.toml's D2 was CLOSED at
+  # the source (the facade's structs carry the contract's tag names) instead of
+  # being normalised away.
+  #
+  # The rest of the specification in cbindgen.toml under "NORMALISATION RULES THE
+  # GATE MUST IMPLEMENT" is split across two mechanisms on purpose:
   #
   #   * `make rust-header` already implements rules A1, A2, A5 and A9 -- it
   #     regenerates the artifact, holds cbindgen's stderr to an enumerated
   #     allowance, compiles the result standalone as C89, C99, C17 and C++17
   #     with warnings fatal, and compares the DECLARED FUNCTION NAMES against
   #     zlib.h's ZEXTERN set in both directions.
-  #   * rules A3, A4, A6, A7, A8 and rule 10 -- the ones that need the typedef
-  #     chain resolved and the macro values evaluated -- are assigned by name to
-  #     this workflow, and the step below is where they run.  Until they run, no
-  #     command anywhere may be described as having verified a signature.
+  #   * rules A3, A4, A6, A7, A8, rule 10 and rule A11 -- the ones that need the
+  #     typedef chain resolved and the macro values evaluated -- are assigned by
+  #     name to this workflow, and the step below is where they run.  Until they
+  #     run, no command anywhere may be described as having verified a signature.
+  #     THEY DID NOT RUN UNTIL THIS WAS FIXED: the gate read its generated header
+  #     from target/header-gate/, which nothing writes, so it died on its first
+  #     preprocess and passes A, A', B and rule 10 had never executed once.
   #
   # HOW THE SHAPE COMPARISON WORKS, and why it is not a text normaliser: every
   # prototype taken from the generated header is RE-DECLARED in a translation
@@ -1629,8 +1876,13 @@ jobs:
     - name: Install packages (Linux)
       # cbindgen is pinned: 0.29.4 is the version every key in cbindgen.toml was
       # checked against, and a different release can change the incidental
-      # formatting the accepted-divergence list describes.  g++ is needed for
-      # the C++17 arm of the standalone compile sweep.
+      # formatting the accepted-divergence list describes.  g++ is needed twice
+      # over: for the C++17 arm of the standalone compile sweep, and because rule
+      # A11's literal diff renders both sides' signatures through C++ name
+      # mangling, which is what resolves the zconf.h typedef chain.  `nm` comes
+      # from binutils and reads that rendering back; the gate fails closed if
+      # either is missing, because a literal diff that quietly did not run is the
+      # failure it was added to end.
       run: |
         cargo install cbindgen --locked --version 0.29.4
         cbindgen --version
@@ -1688,13 +1940,16 @@ jobs:
         # `tee` plus `pipefail`: the transcript is captured for the upload and the
         # gate's exit status still decides the step.
         python3 - <<'SHAPE_GATE' 2>&1 | tee generated_zlib.h.log
-        """cbindgen shape gate: rules A3, A4, A6, A7, A8 and rule 10.
+        """cbindgen shape gate: rules A3, A4, A6, A7, A8, rule 10 and rule A11.
 
         Pass A  -- every generated prototype is re-declared against zlib.h, so
                    the C compiler decides whether the signatures are identical.
         Pass A' -- the four function-pointer typedefs are compared the same way.
                    A signature that reaches one of them BY NAME would otherwise
                    compare equal to itself and hide a divergence inside it.
+        Pass D  -- the LITERAL diff AAP 0.8.6 freezes: both sides' signatures
+                   rendered canonically by the C++ compiler's mangling, diffed,
+                   and required to produce no output at all.
         Pass B  -- struct sizes and per-field offsets and widths, and the
                    integer object-like macros by value, compared by building one
                    probe program per side and diffing what they print.
@@ -1705,7 +1960,17 @@ jobs:
         import sys
 
         REF = "zlib.h"
-        GEN = os.path.join("target", "header-gate", "generated_zlib.h")
+        # ★ THE ARTIFACT THIS STEP JUST GENERATED, at the repository root.  This
+        # read `os.path.join("target", "header-gate", "generated_zlib.h")`, which
+        # NOTHING writes: the `cbindgen` invocation above outputs
+        # `generated_zlib.h` and the make step before it wrote
+        # target/rust-header/generated_zlib.h, so the first `preprocess` call died
+        # with "No such file or directory" and every pass below it -- A, A', B and
+        # rule 10 -- had never once run.  Reproduced locally before the fix.  The
+        # root path is also the one the `.ref`/`.gen` scratch siblings and the
+        # failure upload are named for, so it is the value the rest of this step
+        # was already written around.
+        GEN = "generated_zlib.h"
         # Rule A2: preprocess each side under its own DECLARED configuration.
         # _LARGEFILE64_SOURCE=1 without _FILE_OFFSET_BITS=64 is the reference
         # build's own setting, and it is what makes the large-file duplicates
@@ -1716,10 +1981,20 @@ jobs:
         # `const` stays meaningful.
         REF_DEFS = ["-D_LARGEFILE64_SOURCE=1", "-DZLIB_CONST"]
         GEN_DEFS = ["-DZLIB_RS_LIBZ_COMPAT", "-DZLIB_RS_GZ"]
-        # The three structs whose layout is caller-visible.  gzFile_s is the one
-        # that cannot be got wrong quietly: the gzgetc macro is expanded in
-        # CALLER object code and loads have/next/pos at offsets 0, 8 and 16.
-        ABI_STRUCTS = ["z_stream", "gz_header", "gzFile_s"]
+        # The three structs whose layout is caller-visible, named by their CONTRACT
+        # TAG rather than by a typedef.  gzFile_s is the one that cannot be got
+        # wrong quietly: the gzgetc macro is expanded in CALLER object code and
+        # loads have/next/pos at offsets 0, 8 and 16.
+        #
+        # The tag is the right key because both headers now declare all three of
+        # them -- `zlib.h` L90/L118/L1956 always did, and the generated header does
+        # since cbindgen.toml moved to `style = "both"` and the facade's structs
+        # took the contract's tag names.  Keying on the typedef instead is what
+        # this did, and it made the generated side silently contribute NOTHING for
+        # z_stream and gz_header: `spelling()` looked for `} z_stream;`, the
+        # artifact ends that struct `} z_stream_s;`, so both structs were skipped
+        # and 27 of the 30 field comparisons below never happened.
+        ABI_STRUCTS = ["z_stream_s", "gz_header_s", "gzFile_s"]
         # Function-like macros in the contract.  gzgetc is both a macro and a
         # real exported function, so it has to be undefined before the function
         # can be re-declared.
@@ -1830,6 +2105,143 @@ jobs:
             print(result.stderr[:4000])
         print("pass A': typedefs compared: %s" % (", ".join(sorted(typedefs)) or "none"))
 
+        # ---------------------------------------------------------------------
+        # Pass D -- THE LITERAL DIFF, and it is required to be EMPTY.
+        #
+        # AAP 0.8.6 freezes `diff -u zlib.h generated_zlib.h` and AAP 0.4.2.3 makes
+        # the diff the gate.  A diff of the two FILES cannot be the gate and this
+        # step says so plainly at the top -- cbindgen cannot emit zlib.h's comments,
+        # its ZEXTERN/ZEXPORT declaration macros, its function-like macros or its
+        # conditional include of zconf.h -- but "the files differ" was never the
+        # requirement.  The requirement is that the CONTRACT does not differ, and
+        # that IS diffable, literally, if both sides are rendered by one tool
+        # applied identically to each.
+        #
+        # The tool is the C++ compiler and the renderer is Itanium name mangling.
+        # For every contract function, one explicit instantiation of
+        # `zrs_sig<zrs_tag_NAME, decltype(&NAME)>` is emitted; the mangled symbol
+        # encodes the FULLY RESOLVED function type, and `nm -C` prints it back.
+        # That resolution is the whole point: it walks the entire zconf.h typedef
+        # chain (A8), drops parameter names (A6), canonicalises bare `unsigned`
+        # (A7), discards the ZEXTERN/ZEXPORT/FAR/z_const decoration (A4, D1) and
+        # normalises declaration order (D7) -- not by a regex that guesses at
+        # those rules, but because the compiler has already applied them to reach a
+        # type.  The tag parameter carries the function's NAME into the symbol, so
+        # two functions with the same signature stay distinguishable and the
+        # projection is keyed rather than merely sorted.
+        #
+        # WHAT MAKES IT NON-VACUOUS.  The line count is asserted against the number
+        # of names pass A compared, so a projection that silently lost a function
+        # fails rather than diffing a shorter file against a shorter file; the
+        # count is floored at 90 so an empty projection cannot pass; and the two
+        # sides are produced by the SAME generator function differing only in the
+        # header and its `-D` set, so there is no per-side normalisation to drift.
+        #
+        # WHAT IT DOES NOT COVER, and where that is covered instead: struct layout
+        # and macro values are pass B, which is also a literal comparison of two
+        # probe outputs; the two-way NAME set is rule A9 and `make rust-header`;
+        # export status is `make rust` with nm.  Between them nothing in the
+        # contract is checked by prose alone.
+        # ---------------------------------------------------------------------
+        CXX = os.environ.get("CXX") or "g++"
+        compared_names = sorted(decls)
+
+
+        def signature_projection(header, defs, stem):
+            """One `name<TAB>fully-resolved-type` line per contract function."""
+            source = ["#define _LARGEFILE64_SOURCE 1", "#define ZLIB_CONST 1",
+                      "#include <stdarg.h>", "#include <stddef.h>",
+                      '#include "%s"' % header]
+            source += ["#undef %s" % name for name in MACRO_FN]
+            source.append("template <class Tag, class T> void zrs_sig() {}")
+            for name in compared_names:
+                source.append("struct zrs_tag_%s {};" % name)
+                source.append("template void zrs_sig<zrs_tag_%s, decltype(&%s)>();"
+                              % (name, name))
+            stem = os.path.join(SCRATCH, stem)
+            with open(stem + ".cpp", "w") as handle:
+                handle.write("\n".join(source) + "\n")
+            built = run([CXX, "-std=c++17", "-I.", *defs, "-c", "-o", stem + ".o",
+                         stem + ".cpp"])
+            if built.returncode != 0:
+                return None, "%s: %s" % (CXX, built.stderr)
+            listed = run(["nm", "-C", "--defined-only", stem + ".o"])
+            if listed.returncode != 0:
+                return None, "nm: %s" % listed.stderr
+            found = {}
+            for line in listed.stdout.splitlines():
+                match = re.search(r"void zrs_sig<zrs_tag_(\w+), (.*)>\(\)", line)
+                if match:
+                    found[match.group(1)] = match.group(2)
+            return found, ""
+
+        # Fail closed rather than skipping: a literal diff that quietly did not run
+        # is the exact failure this pass was added to end.
+        for tool in (CXX, "nm"):
+            if run(["sh", "-c", "command -v %s" % tool]).returncode != 0:
+                sys.exit("pass D needs %s, which is not on PATH.  It is the tool "
+                         "that resolves the typedef chain, so there is no reduced "
+                         "form of this check to fall back to." % tool)
+
+        projections, sides = {}, (("ref", REF, REF_DEFS), ("gen", GEN, GEN_DEFS))
+        for side, path, defs in sides:
+            found, error = signature_projection(path, defs, "gate_sig_" + side)
+            if found is None:
+                failures.append("signature projection (%s)" % side)
+                print("::error::the canonical signature projection of %s could not "
+                      "be built, so the literal diff could not run" % path)
+                print(error[:4000])
+                projections[side] = None
+                continue
+            missing = [n for n in compared_names if n not in found]
+            if missing:
+                failures.append("signature projection (%s) is incomplete" % side)
+                print("::error::%s projected %d of %d contract functions; missing: %s"
+                      % (path, len(found), len(compared_names), ", ".join(missing)))
+            projections[side] = found
+
+        if all(projections.get(side) is not None for side, _, _ in sides):
+            written = {}
+            for side, path, _ in sides:
+                out = os.path.join(SCRATCH, "signatures.%s" % side)
+                with open(out, "w") as handle:
+                    for name in compared_names:
+                        handle.write("%s\t%s\n" % (name, projections[side][name]))
+                written[side] = out
+            if len(compared_names) < 90:
+                sys.exit("the projection carries only %d signatures; the contract has "
+                         "96 and this gate must not pass on a near-empty one"
+                         % len(compared_names))
+            literal = run(["diff", "-u", written["ref"], written["gen"]])
+            with open(os.path.join(SCRATCH, "signatures.diff"), "w") as handle:
+                handle.write(literal.stdout)
+            if literal.returncode != 0 or literal.stdout:
+                failures.append("literal signature diff")
+                print("::error::the generated header's resolved signatures are not "
+                      "identical to zlib.h's.  The diff below is authoritative: the "
+                      "left side is the frozen contract.")
+                print(literal.stdout[:8000])
+            else:
+                print("pass D: literal diff of %d resolved contract signatures is "
+                      "EMPTY (%s vs %s, rendered by %s + nm -C)"
+                      % (len(compared_names), REF, GEN, CXX))
+
+        # AAP 0.8.6's command itself, run and PUBLISHED rather than gated.  It is
+        # necessarily non-empty for the reasons enumerated as D1, D3, D5, D7, D8,
+        # D9 and D10 in cbindgen.toml, and the artifact is how a reviewer confirms
+        # that what it contains is only those reasons.  A `diff` exit status above
+        # 1 means diff itself failed, which is not the same thing as a difference.
+        raw = run(["diff", "-u", REF, GEN])
+        if raw.returncode > 1:
+            sys.exit("`diff -u %s %s` failed to run: %s" % (REF, GEN, raw.stderr[:2000]))
+        raw_path = os.path.join(SCRATCH, "aap-0.8.6-raw.diff")
+        with open(raw_path, "w") as handle:
+            handle.write(raw.stdout)
+        print("AAP 0.8.6 `diff -u %s %s`: %d lines, written to %s.  Non-empty by "
+              "construction (D1, D3, D5, D7, D8, D9, D10); pass D above is the "
+              "diff that has to be empty."
+              % (REF, GEN, len(raw.stdout.splitlines()), raw_path))
+
 
         def struct_body(text, name):
             """The balanced body of `typedef struct {...} name;` or `struct name {...};`."""
@@ -1857,12 +2269,20 @@ jobs:
 
 
         def spelling(path, name):
-            """zlib.h declares gzFile_s as a bare tag; the artifact typedefs it (D2)."""
+            """How to name an ABI struct in a probe: always by its tag.
+
+            Both headers declare the tag, so `struct <tag>` is valid C on both
+            sides and needs no per-side special case.  A tag that is NOT declared
+            is a divergence in the contract's type surface, so it is reported here
+            rather than skipped -- skipping is how the generated side came to
+            contribute no z_stream fields at all while the gate printed success.
+            """
             text = nocomment(open(path).read())
-            if re.search(r"\}\s*%s\s*;" % name, text):
-                return name
-            if re.search(r"\bstruct\s+%s\s*\{" % name, text):
+            if re.search(r"\bstruct\s+%s\b" % name, text):
                 return "struct " + name
+            failures.append("struct tag %s absent from %s" % (name, path))
+            print("::error::%s does not declare `struct %s`, which %s publishes as "
+                  "part of the type surface a caller may name" % (path, name, REF))
             return None
 
 
@@ -2112,7 +2532,11 @@ jobs:
         # which is the mode they used to be missing in, because a successful make
         # deletes them.  target/header-gate/ holds the probe sources and binaries
         # the gate compiles; the whole directory rather than `*.c`, because a
-        # probe that fails to LINK is diagnosed from what sits beside it.
+        # probe that fails to LINK is diagnosed from what sits beside it.  It also
+        # carries rule A11's three products -- signatures.ref, signatures.gen and
+        # the signatures.diff that has to be empty -- and aap-0.8.6-raw.diff, the
+        # two-file diff AAP 0.8.6 names, which is published precisely because it
+        # is not the gate and a reader is entitled to check what it contains.
         # generated_zlib.h itself is the one path that can legitimately be
         # absent, in the single mode where cbindgen produced nothing -- and there
         # its absence is the diagnosis, with the reason in `.warn`.
@@ -2142,16 +2566,27 @@ jobs:
   # /lib/x86_64-linux-gnu/libz.so.1 and the driver runs happily against the
   # SYSTEM zlib, printing the system library's version, while -L and -rpath both
   # point at the Rust build.  Every test passes and nothing under test was
-  # exercised.  So: create the symlinks, then PROVE with ldd which library got
-  # bound, and fail hard if it is the wrong one -- an ldd line echoed into the
-  # log is exactly how this gate rots.
+  # exercised.  So: PROVE with ldd which library got bound, and fail hard if it
+  # is the wrong one -- an ldd line echoed into the log is exactly how this gate
+  # rots.
   #
-  # SYMLINK DIRECTION.  Makefile.in makes the REAL file the versioned name and
-  # points libz.so and libz.so.1 at it.  The staging directory below is the
-  # other way round -- the real file is copied in as libz.so and the two other
-  # names are symlinks TO it -- because that is the shape a cargo-shaped
-  # artifact has, and copying the Makefile idiom blindly here would produce two
-  # dangling links and a gate that fails for the wrong reason.
+  # ★ THE CHAIN IS THE PRODUCER'S, AND THIS JOB NEVER REPAIRS IT.  `make rust'
+  # stages the Makefile idiom: the REAL file is the versioned name
+  # libz.so.<version>, and libz.so and libz.so.1 are relative symlinks to it,
+  # with the three names recorded in target/dropin/soname.stage.  This job used
+  # to `cp -L' the staged libz.so -- dereferencing it -- and then `ln -sf' fresh
+  # aliases beside the copy, which made the gate blind to the very failure it
+  # exists to detect: a producer that staged a dangling alias, an absolute link
+  # target, a flattened regular file or no alias at all still went green,
+  # because CI rebuilt the chain before testing it.  Nothing below creates,
+  # retargets or dereferences a link.  .github/scripts/dropin_chain.sh reads the
+  # producer's descriptor, asserts every link by its literal target text AND its
+  # canonicalised destination, asserts the SONAME the loader will search for
+  # against the alias that was staged, and is itself self-tested against eleven
+  # deliberately broken trees first -- because a gate that cannot fail is not a
+  # gate.  The staging directory is then an ARCHIVE copy (`cp -a', which implies
+  # --no-dereference --preserve=links) and the identical assertions run again in
+  # the copy, so a copy that flattened the chain fails too.
   #
   # WHICH LIBRARY EACH DRIVER LINKS.  example.c and minigzip.c link the shared
   # object.  infcover.c CANNOT: it calls inflate_table, which zlib.map lists
@@ -2189,37 +2624,70 @@ jobs:
         make rust CARGO=cargo
 
     - name: Generate project files
-      # Stage the artifact the way an installation would, with the versioned
-      # name derived from the immutable zlib.h rather than hard-coded.
+      # Stage the artifact the way an installation would -- by carrying the
+      # producer's chain across unchanged, never by rebuilding it.  Three things
+      # happen here, in this order, and the order is the point:
+      #
+      #   1. VERIFY the producer's tree AS STAGED, cross-checked against
+      #      ZLIB_VERSION from the immutable zlib.h so that the producer's name
+      #      and the header's cannot drift apart.  First, so that a broken chain
+      #      is diagnosed by the assertion it broke.
+      #   2. SELF-TEST the verifier.  It runs against eleven copies of the staged
+      #      tree, each broken one way -- a removed alias, an alias flattened by
+      #      the `cp -L' this step used to do, an absolute target, a dangling
+      #      target, a missing or symlinked real file, a missing archive, a
+      #      truncated descriptor, a descriptor contradicting the SONAME -- and
+      #      must reject every one of them while accepting the good copy.  A
+      #      verifier that silently stopped verifying would otherwise sit here
+      #      passing forever, and running it second costs nothing because it
+      #      mutates a tree step 1 has just established is good.
+      #   3. ARCHIVE-COPY it and verify the copy.  `cp -a' preserves links as
+      #      links; the second verification is what proves it did.
+      #
+      # The names come from the producer's descriptor rather than from a `sed' of
+      # zlib.h, so a rename in Makefile.in cannot leave this job asserting a name
+      # nobody staged.
       run: |
         set -eu
         ZVER=$(sed -n 's/^.*define ZLIB_VERSION "\(.*\)".*$/\1/p' zlib.h)
         [ -n "$ZVER" ] || { echo "::error::no ZLIB_VERSION in zlib.h"; exit 1; }
+
+        sh .github/scripts/dropin_chain.sh verify target/dropin \
+          --expect-version "$ZVER"
+        sh .github/scripts/dropin_chain.sh self-test target/dropin
+
+        SOV=$(sed -n 1p target/dropin/soname.stage)
+        SOM=$(sed -n 2p target/dropin/soname.stage)
+
         D="$PWD/target/dropin-stage"
         rm -rf "$D"
         mkdir -p "$D"
-        cp -L target/dropin/libz.so "$D/libz.so"
-        cp    target/dropin/libz.a  "$D/libz.a"
-        ln -sf libz.so "$D/libz.so.1"
-        ln -sf libz.so "$D/libz.so.$ZVER"
+        # No -L, no ln: the two aliases arrive as the symlinks the producer made.
+        cp -a "target/dropin/$SOV" "target/dropin/$SOM" target/dropin/libz.so \
+              target/dropin/libz.a target/dropin/soname.stage "$D/"
         ls -l "$D"
-        # A dangling link here would send the loader back to the system library,
-        # which is the failure this whole job exists to detect.
-        for link in "$D/libz.so.1" "$D/libz.so.$ZVER"; do
-          [ -e "$link" ] || { echo "::error::$link is a dangling symlink"; exit 1; }
-        done
-        echo "ZVER=$ZVER"     >> "$GITHUB_ENV"
-        echo "DROPIN=$D"      >> "$GITHUB_ENV"
+        sh .github/scripts/dropin_chain.sh verify "$D" --expect-version "$ZVER"
+
+        echo "ZVER=$ZVER"   >> "$GITHUB_ENV"
+        echo "DROPIN=$D"    >> "$GITHUB_ENV"
+        echo "DROPIN_SOV=$SOV" >> "$GITHUB_ENV"
+        echo "DROPIN_SOM=$SOM" >> "$GITHUB_ENV"
 
     - name: Run test cases
       run: |
         set -eu
         D="$DROPIN"
+        SOV="$DROPIN_SOV"
+        SOM="$DROPIN_SOM"
+        REAL=$(readlink -e "$D/$SOV")
 
-        # --- the SONAME the loader will search for --------------------------
-        readelf -d "$D/libz.so" | grep -i soname || true
-        readelf -d "$D/libz.so" | grep -qE 'SONAME.*\[libz\.so\.1\]' || {
-          echo "::error::the staged library does not declare SONAME libz.so.1"; exit 1; }
+        # The SONAME, the link targets and the canonical destinations were all
+        # asserted by dropin_chain.sh in the step above -- against the producer's
+        # tree and again against this copy -- so they are not re-checked here.
+        # What IS checked here is the thing only a linked binary can show: that
+        # the loader, searching for the SONAME, landed on the producer's own
+        # alias inside this directory and through it on the producer's own object.
+        echo "staged chain: $SOM -> $SOV (real file $REAL)"
 
         # --- compile the three drivers, unmodified --------------------------
         cc -I. -O2 -o "$D/example_rust"  test/example.c  -L"$D" -lz -Wl,-rpath,"$D"
@@ -2228,16 +2696,32 @@ jobs:
         echo "example.c, minigzip.c and infcover.c all compiled with zero edits"
 
         # --- PROVE which libz is bound, before running anything ------------
+        # Not `grep libz': the resolved path is extracted by name and compared
+        # exactly, then canonicalised, so that binding some OTHER file whose path
+        # merely contains the staged directory cannot read as success.
         for driver in example_rust minigzip_rust; do
           ldd "$D/$driver" > "$D/$driver.ldd" 2>&1
           grep -i libz "$D/$driver.ldd" || true
-          grep -F -q "$D/libz" "$D/$driver.ldd" || {
-            echo "::error::$driver did not bind the Rust library; libz resolved elsewhere (most likely the system zlib, which means the versioned symlinks are missing)"
+          resolved=$(awk -v want="$SOM" \
+            '$1 == want && $2 == "=>" { print $3; exit }' "$D/$driver.ldd")
+          if [ -z "${resolved:-}" ]; then
+            echo "::error::$driver has no dynamic dependency on $SOM at all, so the loader was never asked for the staged library"
             cat "$D/$driver.ldd"
             exit 1
-          }
+          fi
+          if [ "$resolved" != "$D/$SOM" ]; then
+            echo "::error::$driver resolved $SOM to $resolved rather than to the staged $D/$SOM (most likely the system zlib, which is what happens when the producer's versioned aliases are not where the loader looks)"
+            cat "$D/$driver.ldd"
+            exit 1
+          fi
+          bound=$(readlink -e "$resolved") || {
+            echo "::error::$driver bound $resolved, which does not resolve to a file"; exit 1; }
+          if [ "$bound" != "$REAL" ]; then
+            echo "::error::$driver bound $resolved, which canonicalises to $bound rather than to the producer's object $REAL"
+            exit 1
+          fi
         done
-        echo "ldd: example_rust and minigzip_rust both bind $D/libz.so.1"
+        echo "ldd: example_rust and minigzip_rust both bind $D/$SOM, which is the producer's $SOV"
         # infcover links the archive because inflate_table is hidden, so the
         # inverse has to hold: no dynamic libz may be involved at all.
         ldd "$D/infcover_rust" > "$D/infcover_rust.ldd" 2>&1 || true
@@ -2801,17 +3285,42 @@ jobs:
   # pointers, which Miri cannot do.
   #
   # SCOPE, EXACTLY, because several files elsewhere describe themselves in terms
-  # of this job.  Two things run under the sanitizer and nothing else does:
-  # `cargo test -p libz-rs-sys`, which is the facade's own unit tests, doctests
-  # and every suite under crates/libz-rs-sys/tests/ ; and the three UNMODIFIED C
-  # drivers, compiled with -fsanitize=address and linked against an instrumented
-  # libz.a.  Deliberately NOT covered: crates/zlib-rs-differential (its tests
-  # and the three benches attached to it) and the fuzz targets.  The differential
-  # crate is outside BOTH sanitizer gates -- Miri because it cannot execute the
-  # compiled oracle, ASan because this job does not select it -- and that is the
-  # split AAP 0.6.4.5 specifies.  The fuzz targets get their own instrumentation
-  # from cargo-fuzz, which builds each one with AddressSanitizer by default; that
-  # is per-target and belongs to the `fuzz` job, not to this one.
+  # of this job.  FOUR things run under the sanitizer and a fifth is compiled
+  # under it, in this order:
+  #
+  #   1. `cargo test -p libz-rs-sys` -- the facade's own unit tests, doctests and
+  #      every suite under crates/libz-rs-sys/tests/.
+  #   2. the same again with `-Zbuild-std`, so a fault inside a `std` routine
+  #      reached from the facade is attributed rather than invisible.
+  #   3. the three UNMODIFIED C drivers, compiled with -fsanitize=address and
+  #      linked against an instrumented libz.a.
+  #   4. `cargo test -p zlib-rs-differential` -- the dev-only harness, oracle
+  #      included, which has an unsafe boundary of its own in src/oracle.rs and
+  #      src/port.rs.
+  #   5. `cargo bench --manifest-path benches/Cargo.toml`, first `--no-run` and
+  #      then each suite with criterion's `-- --test`: the suites are compiled
+  #      under instrumentation and each benchmark body is executed ONCE, which is
+  #      what surfaces a fault in the harness.  They are not MEASURED under the
+  #      sanitizer, because a sanitized timing is not a timing.
+  #
+  # The C oracle is instrumented too, not merely linked: steps 4 and 5 set
+  # CFLAGS=-fsanitize=address, so the archive the differential crate's build script
+  # compiles is built with the sanitizer rather than around it.
+  #
+  # This paragraph used to say the opposite -- "two things and nothing else", with
+  # crates/zlib-rs-differential and "the three benches attached to it" listed as
+  # deliberately not covered.  Both halves were wrong: step 4 has always selected
+  # that crate (this job's own name says "and differential harness"), and the
+  # benches are their own excluded package rather than attached to anything.
+  # AAP 0.6.4.5's split is Miri over the safe core and ASan over the boundary
+  # layer; scoping ASan wider than the facade honours it, since every extra target
+  # here is one that drives the boundary.
+  #
+  # Genuinely NOT covered here: the fuzz targets, which get their own
+  # instrumentation from cargo-fuzz -- it builds each one with AddressSanitizer by
+  # default -- so that is per-target and belongs to the `fuzz` job.  And Miri
+  # remains scoped to crates/zlib-rs alone, because it interprets Rust MIR and
+  # cannot execute the compiled C oracle at all.
   #
   # RUSTDOCFLAGS IS NOT OPTIONAL HERE.  Setting only RUSTFLAGS instruments the
   # library but not the doctest binaries, because rustdoc does not read
@@ -3004,11 +3513,11 @@ jobs:
         ASAN_OPTIONS: detect_leaks=0:detect_stack_use_after_return=1
       run: |
         set -euo pipefail
-        cargo +nightly bench --locked -p zlib-rs-differential \
+        cargo +nightly bench --locked --manifest-path benches/Cargo.toml \
           --target x86_64-unknown-linux-gnu --no-run
         for bench in checksum_bench inflate_bench deflate_bench; do
           echo "::group::$bench under ASan"
-          cargo +nightly bench --locked -p zlib-rs-differential \
+          cargo +nightly bench --locked --manifest-path benches/Cargo.toml \
             --target x86_64-unknown-linux-gnu --bench "$bench" -- --test
           echo "::endgroup::"
         done
@@ -3485,14 +3994,18 @@ jobs:
   # group that the performance targets say nothing about failed it.  This gate
   # therefore asserts, before it looks at a single ratio:
   #
-  # NO CORPUS IS DOWNLOADED, HERE OR ANYWHERE IN THIS FILE.  So the committed
-  # minimal corpus is what every summary line this step reads was produced from.
-  # The Silesia corpus that the performance targets name is opt-in only:
-  # crates/zlib-rs-differential/corpus has a script for a human to run, the
-  # benches skip their tier-2 groups with an explicit message and exit zero when
-  # it is absent, and CI must stay network-free.  That script is never invoked
-  # from this file, which is exactly why the acceptance measurement of AAP 0.8.4
-  # is not taken here.
+  # NO CORPUS IS DOWNLOADED, HERE OR ANYWHERE IN THIS FILE -- and that is now a
+  # property of the steps rather than a claim above them.  The Silesia corpus the
+  # performance targets name is opt-in (AAP 0.6.4.4): crates/zlib-rs-differential/
+  # corpus has a script for a human to run, and the benches skip their tier-2
+  # groups with an explicit message and exit zero when it is absent.  This file
+  # invokes that script in exactly ONE mode, `--verify-only`, which fetches
+  # nothing and writes nothing; it never invokes it in fetching mode, and when a
+  # pinned corpus is expected and does not turn up the job FAILS instead of
+  # downloading it.  Provisioning happens outside the workflow.  So the tier-1
+  # gate below always reads measurements of the committed minimal corpus, and the
+  # tier-2 acceptance measurement of AAP 0.8.4 is taken only in the armed steps at
+  # the end of this job -- announced, never silently skipped.
   # ---------------------------------------------------------------------------
   bench:
     name: Benchmark ${{ matrix.label }}
@@ -3514,6 +4027,27 @@ jobs:
             profile: bench
             features: '--features simd'
 
+    # ★ THE MATRIX IS APPLIED, and until this block existed it was not.  All three
+    # rows ran one identical command, so `profile` and `features` were decoration:
+    # `bench-parity-scalar` measured the fat-LTO build and `bench-simd` measured the
+    # scalar one, and the AAP 0.8.4 rule that a case is decided on the STRONGER of the
+    # two profiles' ratios was therefore reading the same number twice.  Every bench
+    # invocation below now passes `--profile ${{ matrix.profile }}` and
+    # `${{ matrix.features }}`.
+    #
+    # ZLIB_RS_BENCH_RUST_PROFILE is the declaration the differential crate's build
+    # script cross-checks and bakes in, so a log states which profile produced it.
+    #
+    # CRITERION_HOME is ABSOLUTE and deliberately so.  criterion resolves its default
+    # output directory relative to the bench process's working directory, which is the
+    # host package's directory -- `benches/` -- while every path in this job is
+    # relative to the repository root.  Setting it here pins criterion, the suites'
+    # own published `CRITERION root=` path and the gate below to one directory by
+    # construction, instead of to three plausible ones.
+    env:
+      ZLIB_RS_BENCH_RUST_PROFILE: ${{ matrix.profile }}
+      CRITERION_HOME: ${{ github.workspace }}/target/criterion
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -3530,517 +4064,42 @@ jobs:
       # differential crate's build.rs needs a C compiler here too.
       run: cc --version
 
-    - name: Generate project files (write the benchmark gate)
-      # The gate is written to a file, once, and invoked by path below -- both
-      # for the minimal-corpus run and for the Silesia run.  Two copies of a
-      # limit is how a limit stops being enforced, so there is exactly one.
-      # It takes the log to read as its argument and reads the criterion
-      # estimates alongside it.
+    - name: Generate project files (verify and self-test the benchmark gate)
+      # ★ THE GATE IS A COMMITTED FILE, and until this step existed it was a heredoc.
+      # `.github/scripts/bench_gate.py` used to be written into $RUNNER_TEMP by this
+      # step, and the copy that was written there was three generations of parser
+      # spliced together: it defined `number()` twice and referenced sixty-odd names
+      # -- LINE, KEYS, EXPECTED, fail, summaries, cases, failures, balances,
+      # seen_summary, csv -- that no statement in it ever bound.  The only check made
+      # of it was `python3 -m py_compile`, which validates syntax and nothing else, so
+      # this step passed, the gate raised NameError on its first real invocation, and
+      # the AAP 0.8.4 1.10/1.15 limits went unenforced with the job green.
+      #
+      # A committed file can be compiled, linted, diffed, reviewed and -- decisively --
+      # TESTED.  `bench_gate_selftest.py` runs the real gate against a committed
+      # synthetic log and against twenty-nine deliberately broken variants of it: a
+      # missing authoritative summary, an overrun, a raised limit, a truncated log, a
+      # missing allocator side, a group moved out of the inventory, a perturbed
+      # criterion estimate, and so on.  It runs HERE, before any measurement, and it
+      # runs in every matrix row, so a gate that has stopped enforcing something fails
+      # this step rather than reporting success six steps later.
       run: |
         set -eu
-        cat > "$RUNNER_TEMP/bench_gate.py" <<'BENCH_GATE'
-        import json
-        import os
-        import re
-        import sys
-
-        LOG = "target/bench/bench.log"
-
-        # ---------------------------------------------------------------------------
-        # WHAT MUST BE PRESENT, not merely what is tolerated if it turns up.
-        #
-        # A gate that reads whatever summary lines it happens to find is satisfied by a
-        # bench that measured one group and skipped the rest, and by a log that was
-        # truncated when the process died.  Both look exactly like success.  So the
-        # groups that carry the AAP's numbered performance targets are named here and
-        # their absence is a failure:
-        #
-        #   AAP 0.6.4.6 / 0.8.4  decompression throughput within 10% of C zlib
-        #                        -> inflate_bench group inflate_steady_state
-        #   AAP 0.6.4.6 / 0.8.4  compression throughput within 10% at levels 1, 6, 9
-        #                        -> deflate_bench group deflate_steady_state
-        #   AAP 0.6.4.6 / 0.8.4  per-stream memory within 15%
-        #                        -> deflate_bench group deflate_memory
-        #
-        # The other thirteen groups the two benches print -- lifecycle, container,
-        # feeding, mem_level, strategy, stored_floor, oneshot, bound, degenerate and the
-        # opt-in silesia tier -- are measured and gated by the `over` count exactly as
-        # before.  They are deliberately NOT required to exist: `deflate_silesia` only
-        # appears when a human has fetched the opt-in corpus, and requiring a group that
-        # is absent by design would make the gate demand a network download.
-        #
-        # checksum_bench prints NO summary line of any kind -- it reports throughput per
-        # backend and nothing is gated on it, because a checksum has no output-fidelity
-        # dimension to trade against speed.  It is therefore absent from both sets on
-        # purpose; do not "fix" that by adding it.
-        # ---------------------------------------------------------------------------
-        RATIO_LIMIT = 1.10
-        MEMORY_LIMIT = 1.15
-
-        # The three compression levels AAP 0.8.4 names.  Case ids in the gated groups
-        # are `<fixture>-L<level>` and in the memory group `<fixture>-L<level>-mem<n>`,
-        # so the level a case measures is readable from its id.
-        REQUIRED_LEVELS = ("L1", "L6", "L9")
-
-        REQUIRED_RATIO = (
-            ("deflate_bench", "deflate_steady_state"),
-            ("inflate_bench", "inflate_steady_state"),
-        )
-        REQUIRED_MEMORY = (
-            ("deflate_bench", "deflate_memory"),
-        )
-        # One ALLOC-BALANCE line per side per memory case, and both sides are required:
-        # a balance that is clean on the port and never measured on the oracle proves
-        # only that the counter ran.
-        BALANCE_SIDES = ("zlib-rs", "c-oracle")
-
-        # Anchored on the bench's own log prefix so that the format documentation the
-        # benches print cannot be parsed as data.  That prose contains the literal text
-        # RATIO-SUMMARY inside backticks, and it is emitted with the same prefix, so the
-        # anchor has to require the keyword IMMEDIATELY after "<bench>: ".
-        SUMMARY = re.compile(r"^(?P<bench>\w+_bench): "
-                             r"(?P<kind>RATIO|MEMORY)-SUMMARY (?P<rest>group=\S+.*)$")
-        BALANCE = re.compile(r"^(?P<bench>\w+_bench): ALLOC-BALANCE (?P<rest>side=\S+.*)$")
-        CASE = re.compile(r"^(?P<bench>\w+_bench): (?P<kind>RATIO|MEMORY) (?P<rest>group=\S+.*)$")
-        # `<fixture>-L<level>` with an optional `-mem<n>` tail.
-        LEVEL = re.compile(r"-(?P<level>L\d+)(?:-mem\d+)?$")
-
-
-        def pairs(text):
-            """key=value pairs, or None if the line is not exactly that."""
-            out = {}
-            for part in text.split():
-                if "=" not in part:
-                    return None
-                key, value = part.split("=", 1)
-                if key in out:
-                    return None
-                out[key] = value
-            return out
-
-
-        def number(field, key, where, cast):
-            try:
-                return cast(field[key])
-            except (KeyError, ValueError):
-                fail("%s: %s=%r is not a %s" % (where, key, field.get(key), cast.__name__))
-                return None
-
-
-        def number(field, key, default="0"):
-            raw = field.get(key, default)
-            try:
-                return int(raw)
-            except ValueError:
-                return None
-
-
-        with open(LOG, encoding="utf-8", errors="replace") as handle:
-            lines = [line.rstrip("\n") for line in handle]
-
-        seen = {}
-        for line in lines:
-            match = LINE.match(line)
-            if not match:
-                continue
-            bench, kind = match.group("bench"), match.group("kind")
-            field = pairs(match.group("rest"))
-            if field is None:
-                fail("%s: malformed %s line, not a sequence of unique key=value pairs: %s"
-                     % (bench, kind, line))
-                continue
-            missing = [key for key in KEYS[kind] if key not in field]
-            if missing:
-                fail("%s: %s line is missing required key(s) %s: %s"
-                     % (bench, kind, ", ".join(missing), line))
-                continue
-            seen.setdefault(bench, {}).setdefault(kind, []).append(field)
-
-        if not seen:
-            fail("the benchmark log carries no bench gate lines at all: nothing was "
-                 "measured, so there is nothing to gate")
-
-        unknown = sorted(set(seen) - set(EXPECTED))
-        if unknown:
-            fail("unrecognised bench suite(s) %s emitted gate lines.  A new suite must "
-                 "be wired into this gate's EXPECTED table with its authoritative "
-                 "groups, otherwise its measurements would be reported and never "
-                 "enforced." % ", ".join(unknown))
-
-        # --------------------------------------------------------------------------
-        # Structure, per suite, before a single ratio is looked at.
-        # --------------------------------------------------------------------------
-        report = []
-        decisions = []
-        for bench in sorted(EXPECTED):
-            want = EXPECTED[bench]
-            got = seen.get(bench, {})
-
-            inventories = got.get("GATE-INVENTORY", [])
-            if len(inventories) != 1:
-                fail("%s: expected exactly 1 GATE-INVENTORY line, found %d.  Without it "
-                     "the gate cannot know which groups are authoritative."
-                     % (bench, len(inventories)))
-                continue
-            inventory = inventories[0]
-
-            for key in ("suite", "ratio_limit", "min_bytes", "levels"):
-                if inventory[key] != want[key]:
-                    fail("%s: inventory %s=%s but this gate enforces %s"
-                         % (bench, key, inventory[key], want[key]))
-            if want["memory_limit"] is None:
-                if "memory_limit" in inventory:
-                    fail("%s: inventory declares memory_limit=%s but this suite is not "
-                         "expected to gate memory" % (bench, inventory["memory_limit"]))
-            elif inventory.get("memory_limit") != want["memory_limit"]:
-                fail("%s: inventory memory_limit=%s but this gate enforces %s"
-                     % (bench, inventory.get("memory_limit"), want["memory_limit"]))
-
-            tiers = {}
-            for tier in ("authoritative", "supporting", "informational"):
-                for group in csv(inventory["%s_ratio" % tier]):
-                    if group in tiers:
-                        fail("%s: group %s is declared in more than one ratio tier"
-                             % (bench, group))
-                    tiers[group] = tier
-            if sorted(g for g, t in tiers.items() if t == "authoritative") != \
-                    sorted(want["authoritative_ratio"]):
-                fail("%s: authoritative ratio groups are %s but this gate enforces %s.  "
-                     "Either the bench moved a group out of the gate or the gate is out "
-                     "of date; both need a human."
-                     % (bench, sorted(g for g, t in tiers.items() if t == "authoritative"),
-                        sorted(want["authoritative_ratio"])))
-
-            memory_groups = csv(inventory.get("authoritative_memory", ""))
-            if sorted(memory_groups) != sorted(want["authoritative_memory"]):
-                fail("%s: authoritative memory groups are %s but this gate enforces %s"
-                     % (bench, sorted(memory_groups), sorted(want["authoritative_memory"])))
-
-            criterions = got.get("CRITERION", [])
-            if len(criterions) != 1:
-                fail("%s: expected exactly 1 CRITERION line, found %d.  The gate decides "
-                     "from criterion's estimates and cannot locate them without it."
-                     % (bench, len(criterions)))
-                continue
-            match = CASE.match(line)
-            if match:
-                cases.append((match.group("bench"), match.group("kind"),
-                              pairs(match.group("rest"))))
-
-        throughput = [s for s in summaries if s[1] == "RATIO"]
-        memory = [s for s in summaries if s[1] == "MEMORY"]
-
-        # -------------------------------------------------------------------
-        # The MANDATORY groups, by name and by size.
-        #
-        # "At least one summary line exists" is not a gate.  The benches emit a
-        # summary per group -- eleven of them for deflate_bench alone -- and
-        # several are informational groups whose gated count is legitimately
-        # zero.  So a run that found no corpus, lost its oracle, or skipped the
-        # three groups that actually carry the AAP 0.8.4 numbers would still
-        # print summaries, still satisfy an "any line" check, and still report
-        # PASS.  `cases=0 gated=0 over=0` passes such a check trivially.
-        #
-        # What is required instead: each of the three gate-bearing groups is
-        # present EXACTLY ONCE, with exactly the number of cases and gated cases
-        # its own source produces.  Those numbers are not guesses -- they are the
-        # product the benches enumerate, and they were confirmed against a real
-        # run of this tree:
-        #
-        #   deflate_steady_state  FIXTURE_NAMES(5) x GATE_LEVELS(3)      = 15
-        #                         gated: 3 fixtures >= GATE_MIN_BYTES x 3 =  9
-        #   inflate_steady_state  5 fixtures x LEVELS[1,6,9]             = 15
-        #                                                        gated:  =  9
-        #   deflate_memory        GATE_LEVELS(3) x MEMORY_MEM_LEVELS(3)  =  9
-        #
-        # and deflate_memory's 9 cases are measured on both sides, so the
-        # allocator ledger must produce 2 x 9 = 18 distinct side/case rows.
-        #
-        # A count that DROPS means a fixture stopped loading or a level stopped
-        # being measured; a count that RISES means the matrix grew and this gate
-        # must be updated deliberately rather than drift. Either way it is a
-        # change a human should see, so both directions fail.
-        # -------------------------------------------------------------------
-        MANDATORY = {
-            ("deflate_bench", "RATIO", "deflate_steady_state"): (15, 9),
-            ("inflate_bench", "RATIO", "inflate_steady_state"): (15, 9),
-            ("deflate_bench", "MEMORY", "deflate_memory"): (9, None),
-        }
-        EXPECTED_BALANCE_ROWS = 18
-        if not throughput:
-            failures.append("no RATIO-SUMMARY line was produced: the throughput "
-                            "gate did not run")
-        if not memory:
-            failures.append("no MEMORY-SUMMARY line was produced: the memory gate "
-                            "did not run")
-        if not balances:
-            failures.append("no ALLOC-BALANCE line was produced: the allocator "
-                            "balance check did not run")
-
-        seen = {}
-        for bench, kind, field in summaries:
-            key = (bench, kind, field.get("group", "?"))
-            seen.setdefault(key, []).append(field)
-
-        for key, (want_cases, want_gated) in sorted(MANDATORY.items()):
-            bench, kind, group = key
-            found = seen.get(key, [])
-            if not found:
-                failures.append(
-                    "%s produced no %s-SUMMARY for the mandatory group %s. That "
-                    "group carries the AAP 0.8.4 gate, so a run without it has "
-                    "measured nothing that this job exists to check."
-                    % (bench, kind, group))
-                continue
-            if len(found) > 1:
-                failures.append(
-                    "%s produced %d %s-SUMMARY lines for %s; exactly one is "
-                    "expected, and duplicates mean the log was concatenated or "
-                    "the group ran twice, so the counts below cannot be trusted."
-                    % (bench, len(found), kind, group))
-                continue
-            field = found[0]
-            for label, want in (("cases", want_cases), ("gated", want_gated)):
-                if want is None:
-                    continue
-                raw = field.get(label)
-                if raw is None:
-                    failures.append("%s %s: %s reported no %s count"
-                                    % (bench, group, kind, label))
-                    continue
-                try:
-                    got = int(raw)
-                except ValueError:
-                    failures.append("%s %s: %s=%r is not a number, so the summary "
-                                    "line is malformed" % (bench, group, label, raw))
-                    continue
-                if got == 0:
-                    failures.append(
-                        "%s %s: %s=0. The group ran but measured nothing -- the "
-                        "usual cause is that the committed corpus under "
-                        "crates/zlib-rs-differential/corpus/minimal did not load."
-                        % (bench, group, label))
-                elif got != want:
-                    failures.append(
-                        "%s %s: %s=%d but %d was expected. A drop means a fixture "
-                        "or level stopped being measured; a rise means the matrix "
-                        "grew and this gate must be updated deliberately."
-                        % (bench, group, label, got, want))
-
-        # Every mandatory case must have reported a real verdict of its own.  A
-        # summary can only count what the per-case loop produced, so a case that
-        # was skipped for want of input never appears -- and its absence is
-        # invisible in the summary's own arithmetic.
-        for key, (want_cases, _) in sorted(MANDATORY.items()):
-            bench, kind, group = key
-            got = [f for b, f in cases
-                   if b == bench and f.get("group") == group]
-            verdicts = [f for f in got if f.get("verdict") in ("within", "over")]
-            if len(verdicts) != want_cases:
-                failures.append(
-                    "%s %s: %d per-case line(s) carried a verdict, but %d cases "
-                    "were expected. A case that was skipped emits no line, so the "
-                    "summary alone cannot show this."
-                    % (bench, group, len(verdicts), want_cases))
-            ids = [f.get("case") for f in got]
-            duplicates = sorted({i for i in ids if ids.count(i) > 1})
-            if duplicates:
-                failures.append("%s %s: duplicate case id(s) %s"
-                                % (bench, group, ", ".join(map(str, duplicates))))
-
-        # The allocator ledger: 18 DISTINCT side/case rows, every one clean.
-        # Counting rows is not enough -- the same row repeated eighteen times
-        # would satisfy a count -- so identity is what is checked.
-        balance_ids = [(f.get("side"), f.get("case")) for _, f in balances]
-        unique_ids = set(balance_ids)
-        if len(unique_ids) != EXPECTED_BALANCE_ROWS:
-            failures.append(
-                "the allocator ledger reported %d distinct side/case row(s), but "
-                "%d were expected: deflate_memory's %d cases measured on both "
-                "sides. %d row(s) in total were printed."
-                % (len(unique_ids), EXPECTED_BALANCE_ROWS,
-                   EXPECTED_BALANCE_ROWS // 2, len(balance_ids)))
-        if len(balance_ids) != len(unique_ids):
-            repeated = sorted({i for i in balance_ids if balance_ids.count(i) > 1})
-            failures.append("the allocator ledger repeated %d row(s): %s"
-                            % (len(repeated),
-                               ", ".join("side=%s case=%s" % r for r in repeated)))
-
-        print("%-16s %-8s %-26s %6s %6s %6s %6s" %
-              ("bench", "kind", "group", "cases", "gated", "over", "limit"))
-        for bench, kind, field in summaries:
-            seen_summary.setdefault((bench, kind, field.get("group")), []).append(field)
-
-        required = ([(bench, "RATIO", group, RATIO_LIMIT) for bench, group in REQUIRED_RATIO] +
-                    [(bench, "MEMORY", group, MEMORY_LIMIT) for bench, group in REQUIRED_MEMORY])
-
-        for bench, kind, group, want_limit in required:
-            found = seen_summary.get((bench, kind, group), [])
-            if not found:
-                failures.append("%s printed no %s-SUMMARY for group %s. That group "
-                                "carries one of the AAP's numbered performance targets, "
-                                "so its absence means the target was not measured -- "
-                                "which a gate must never read as success"
-                                % (bench, kind, group))
-                continue
-            if len(found) > 1:
-                failures.append("%s printed %d %s-SUMMARY lines for group %s; exactly "
-                                "one is expected, so the log is duplicated or two "
-                                "groups share a name"
-                                % (bench, len(found), kind, group))
-            field = found[0]
-
-            # --- 3. The limit is the AAP's number, not whatever the bench chose -----
-            try:
-                limit = float(field.get("limit", "nan"))
-            except ValueError:
-                limit = float("nan")
-            if abs(limit - want_limit) > 1e-9:
-                failures.append("%s group %s reports limit=%s, but the AAP fixes it at "
-                                "%.2f. A gate that accepts the limit the bench prints "
-                                "enforces nothing: the bench could raise it and this "
-                                "job would still pass"
-                                % (bench, group, field.get("limit"), want_limit))
-
-            # --- 4. The group actually gates something ------------------------------
-            case_count = number(field, "cases")
-            if case_count is None or case_count <= 0:
-                failures.append("%s group %s reports cases=%s: the group produced no "
-                                "measurement at all" % (bench, group, field.get("cases")))
-            if kind == "RATIO":
-                gated = number(field, "gated")
-                if gated is None or gated <= 0:
-                    failures.append("%s group %s reports gated=%s. Every case in it is "
-                                    "informational, so nothing in the group can ever "
-                                    "fail and the throughput target it carries is "
-                                    "unenforced" % (bench, group, field.get("gated")))
-
-            # --- 5. The per-case lines are all there --------------------------------
-            # A log truncated mid-group, or a bench that died after printing its
-            # summary, is the failure mode this catches: the summary says 15 and the
-            # log holds nine.
-            observed = [f for b, k, f in cases
-                        if b == bench and k == kind and f.get("group") == group]
-            if case_count is not None and len(observed) != case_count:
-                failures.append("%s group %s summarises cases=%d but the log carries "
-                                "%d per-case %s line(s): the log is incomplete"
-                                % (bench, group, case_count, len(observed), kind))
-
-            # --- 6. Levels 1, 6 and 9 are each measured, and each one is GATED ------
-            levels = set()
-            for field_case in observed:
-                if kind == "RATIO" and field_case.get("gate") != "counted":
-                    continue
-                match = LEVEL.search(field_case.get("case", ""))
-                if match:
-                    levels.add(match.group("level"))
-            missing = [level for level in REQUIRED_LEVELS if level not in levels]
-            if missing:
-                failures.append("%s group %s gates no case at compression level(s) %s. "
-                                "AAP 0.8.4 names levels 1, 6 and 9 explicitly, and a "
-                                "case id is `<fixture>-L<level>`; the gated levels "
-                                "found were %s"
-                                % (bench, group, ", ".join(missing),
-                                   ", ".join(sorted(levels)) or "none"))
-
-        # --- 7. Allocator balance: one line per side per memory case ----------------
-        memory_cases = set()
-        for bench, kind, field in cases:
-            if kind == "MEMORY":
-                memory_cases.add((bench, field.get("case")))
-
-        want_balances = 2 * len(memory_cases)
-        if memory_cases and len(balances) != want_balances:
-            failures.append("the log carries %d ALLOC-BALANCE line(s) for %d memory "
-                            "case(s); %d are expected, one per case per side (%s). A "
-                            "missing line is an unmeasured allocator, not a clean one"
-                            % (len(balances), len(memory_cases), want_balances,
-                               " and ".join(BALANCE_SIDES)))
-
-        balanced = {}
-        for bench, field in balances:
-            balanced.setdefault((bench, field.get("case")), set()).add(field.get("side"))
-        for bench, case in sorted(memory_cases):
-            sides = balanced.get((bench, case), set())
-            absent = [side for side in BALANCE_SIDES if side not in sides]
-            if absent:
-                failures.append("%s memory case %s has no ALLOC-BALANCE line for "
-                                "side(s) %s: a balance that is clean on one side and "
-                                "unmeasured on the other proves only that the counter "
-                                "ran" % (bench, case, ", ".join(absent)))
-
-        # --- 8. The measurements themselves ----------------------------------------
-        for bench, kind, field in summaries:
-            group = field.get("group", "?")
-            limit = field.get("limit", "?")
-            over = number(field, "over")
-            if over is None:
-                failures.append("%s group %s reports a non-numeric over=%s"
-                                % (bench, group, field.get("over")))
-            elif over:
-                what = "throughput" if kind == "RATIO" else "memory"
-                failures.append("%s %s: %d gated case(s) in group %s exceeded the "
-                                "%s limit of %s" % (bench, what, over, group, what, limit))
-            dirty = number(field, "dirty")
-            if dirty:
-                failures.append("%s: %d case(s) in group %s reported a dirty "
-                                "allocator balance" % (bench, dirty, group))
-
-        for bench, field in balances:
-            if field.get("verdict") != "clean":
-                failures.append("%s: allocator balance for side=%s case=%s is %s "
-                                "(live_bytes=%s notlifo=%s rogue=%s)" %
-                                (bench, field.get("side"), field.get("case"),
-                                 field.get("verdict"), field.get("live_bytes"),
-                                 field.get("notlifo"), field.get("rogue")))
-
-        if failures:
-            print()
-            print("The cases that exceeded their limit:")
-            for bench, kind, field in cases:
-                if field.get("verdict") == "over" and field.get("gate") != "informational":
-                    print("  %s %s / %s  ratio=%s limit=%s" %
-                          (bench, field.get("group"), field.get("case"),
-                           field.get("ratio"), field.get("limit")))
-            for failure in failures:
-                print("::error::%s" % failure)
-            print()
-            print("Only OUTPUT-NEUTRAL remedies are admissible for a throughput "
-                  "shortfall, because the differential job asserts byte-identical "
-                  "output: the `simd` feature for the checksum backends, memory-copy "
-                  "strategy, branch layout, fat LTO with one codegen unit at opt-level "
-                  "3, and the -Cllvm-args=-enable-dfa-jump-thread codegen flag. "
-                  "Changing match selection, the lazy-match threshold, hash-chain "
-                  "traversal or Huffman tie-breaking is NOT admissible however much "
-                  "faster it would be: every one of those changes the emitted bytes.")
-            sys.exit(1)
-
-        gated_total = sum(row[5] for row in report if row[3] in ("criterion", "memory"))
-        print()
-        for key, (want_cases, want_gated) in sorted(MANDATORY.items()):
-            bench, kind, group = key
-            field = seen.get(key, [{}])[0]
-            print("mandatory %-14s %-22s cases=%s (expected %s) gated=%s (expected %s)"
-                  % (bench, group, field.get("cases", "-"), want_cases,
-                     field.get("gated", "-"),
-                     "n/a" if want_gated is None else want_gated))
-        print("benchmark regression: PASS -- %d throughput group(s), %d memory "
-              "group(s), all %d mandatory group(s) present with the expected case "
-              "counts, and %d distinct allocator balance row(s), none over limit"
-              % (len(throughput), len(memory), len(MANDATORY), len(set(
-                  (f.get("side"), f.get("case")) for _, f in balances))))
-        BENCH_GATE
-        # A syntax error here must surface as a setup failure, not as a
-        # mysterious pass six steps later.
-        python3 -m py_compile "$RUNNER_TEMP/bench_gate.py"
+        python3 -m py_compile .github/scripts/bench_gate.py
+        python3 -m py_compile .github/scripts/bench_gate_selftest.py
+        python3 .github/scripts/bench_gate_selftest.py
 
     - name: Compile source code
-      # The three benches live at the repository root but are wired as [[bench]]
-      # entries of crates/zlib-rs-differential with an explicit `path`, and that
-      # crate is not a default workspace member.  `-p zlib-rs-differential` is
-      # therefore required: a bare `cargo bench` from the root finds nothing and
-      # would report success having measured nothing at all.
-      run: cargo bench --locked -p zlib-rs-differential --no-run
+      # The three suites live in `benches/`, which is its own excluded package --
+      # criterion 0.8.2 declares rust-version 1.86 and reaches edition-2024 clap
+      # manifests that cargo 1.80, this project's floor, cannot parse, so hosting
+      # them inside the workspace broke `cargo +1.80 check --workspace`.
+      # `--manifest-path benches/Cargo.toml` is therefore required: a bare
+      # `cargo bench` from the root now finds no bench target at all and would
+      # report success having measured nothing.
+      run: |
+        cargo bench --locked --manifest-path benches/Cargo.toml \
+          --profile ${{ matrix.profile }} ${{ matrix.features }} --no-run
 
     - name: Run test cases
       run: |
@@ -4055,10 +4114,12 @@ jobs:
         # keeps the property true if a cache is ever added.
         rm -rf target/criterion
         mkdir -p target/bench
-        cargo bench --locked -p zlib-rs-differential 2>&1 | tee target/bench/bench.log
+        cargo bench --locked --manifest-path benches/Cargo.toml \
+          --profile ${{ matrix.profile }} ${{ matrix.features }} \
+          2>&1 | tee target/bench/bench.log
 
     - name: Run test cases (gate the measurements)
-      run: python3 "$RUNNER_TEMP/bench_gate.py" target/bench/bench.log
+      run: python3 .github/scripts/bench_gate.py target/bench/bench.log
 
     - name: Run test cases (prove the corpus requirement actually refuses)
       # -----------------------------------------------------------------------
@@ -4082,7 +4143,8 @@ jobs:
         empty="$(mktemp -d)"
         status=0
         env ZLIB_RS_SILESIA_REQUIRED=1 ZLIB_RS_SILESIA_DIR="$empty" \
-          cargo bench --locked -p zlib-rs-differential --bench deflate_bench -- --test \
+          cargo bench --locked --manifest-path benches/Cargo.toml \
+          --profile ${{ matrix.profile }} ${{ matrix.features }} --bench deflate_bench -- --test \
           > target/bench/refusal.log 2>&1 || status=$?
 
         if [ "$status" -eq 0 ]; then
@@ -4111,55 +4173,113 @@ jobs:
     # and legitimately skipped the tier-2 groups; AAP 0.8.4 states the throughput
     # bar against Silesia, so the named corpus has to be measured somewhere.
     #
-    # AAP 0.6.4.4 is what shapes how: `cargo test` and CI must stay network-free,
-    # so the corpus is opt-in.  These steps run only when the repository has
-    # supplied the SHA-256 that
-    # crates/zlib-rs-differential/corpus/fetch_silesia.sh demands -- the script
-    # ships with SILESIA_SHA256_EXPECTED='UNPINNED' and refuses to fetch without
-    # one, so a fork that has configured nothing cannot make this job reach the
-    # network, and a fork that opts in gets a download verified by checksum over
-    # the archive AND over each of the twelve members.
+    # ★ CI NEVER FETCHES, AND UNTIL THESE STEPS WERE REWRITTEN IT DID.  The
+    # provisioning step used to call
+    # crates/zlib-rs-differential/corpus/fetch_silesia.sh in FETCHING mode on a
+    # cache miss, which contradicted three statements at once: the script's own
+    # header ("it is NEVER invoked by CI ... not a single byte of network traffic
+    # unless a human runs it"), corpus/README.md, and AAP 0.6.4.4, which makes the
+    # corpus opt-in precisely "so `cargo test` and CI never require the network".
+    # The corpus is now PROVISIONED FROM OUTSIDE THIS WORKFLOW -- by a cache entry
+    # keyed on the pin, or by a runner that already holds it and names it in
+    # ZLIB_RS_SILESIA_DIR -- and the only invocation of the script here is
+    # `--verify-only`, which the script documents as side-effect free and which
+    # performs no network access at all.
     #
-    # The refusal step above is what keeps this honest in every run where the
-    # corpus is unavailable: it proves, network-free, that armed mode really does
-    # refuse absence rather than quietly skipping.
+    # ★ AND WHEN ARMED IT FAILS CLOSED.  The old shape could reach the acceptance
+    # steps, find nothing, download nothing (or download something broken) and
+    # still leave the job green, because absence was indistinguishable from "the
+    # variable is unset".  Arming is now decided once, in the open, by the step
+    # below; when armed, a corpus that is absent, incomplete or fails verification
+    # FAILS the job, and when not armed the job says so loudly with a ::warning::
+    # rather than silently reporting a pass earned on tier 1 alone.
+    #
+    # Arming remains conditional on the repository having pinned a SHA-256, and
+    # that is AAP 0.6.4.4's explicit exception rather than an oversight: a fork
+    # that has configured nothing must still get a green, network-free run.  What
+    # the exception does NOT license is a silent skip, which is why the unarmed
+    # path is announced and why the network-free refusal test above proves, on
+    # every push, that armed mode really does refuse absence.
     # -------------------------------------------------------------------------
     - name: Restore cached corpus
       # Keyed on the pinned checksum, so the cache can only serve the exact corpus
       # this run demands: change the pin and the key changes with it.  There are
       # deliberately no restore-keys -- an older corpus is not a substitute for
       # the pinned one, and silently accepting one would make the measurement
-      # untraceable.
+      # untraceable.  A MISS is not a licence to download: the step below fails.
       id: corpus
       if: vars.ZLIB_RS_SILESIA_SHA256 != ''
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: target/silesia
         key: silesia-${{ vars.ZLIB_RS_SILESIA_SHA256 }}
 
-    - name: Run test cases (provision the Silesia corpus)
-      # On a cache hit the script re-verifies what came out of the cache rather
-      # than fetching, so a truncated or tampered cache entry is caught here
-      # instead of becoming a published throughput number.
-      if: vars.ZLIB_RS_SILESIA_SHA256 != ''
+    - name: Run test cases (decide and announce whether tier-2 acceptance is armed)
+      # One place decides, and it decides in the log.  `armed` is consumed by every
+      # step below, so there is no second reading of the variable to drift from
+      # this one, and the unarmed case is a ::warning:: rather than an absence:
+      # "the AAP 0.8.4 Silesia number was not measured" has to be visible in the
+      # checks UI, not inferred from steps that did not run.
+      id: acceptance
+      run: |
+        set -eu
+        if [ -n "${{ vars.ZLIB_RS_SILESIA_SHA256 }}" ]; then
+          echo 'armed=yes' >> "$GITHUB_OUTPUT"
+          echo "tier-2 Silesia acceptance is ARMED: the repository pins a corpus digest."
+          echo "A corpus that is absent, incomplete or unverifiable now FAILS this job."
+        else
+          echo 'armed=no' >> "$GITHUB_OUTPUT"
+          echo "::warning::tier-2 Silesia acceptance was NOT performed: the repository"
+          echo "::warning::variable ZLIB_RS_SILESIA_SHA256 is unset, so no pinned corpus"
+          echo "::warning::could be verified. The AAP 0.8.4 throughput numbers reported by"
+          echo "::warning::this job were measured on the committed minimal corpus only."
+          echo "::warning::To arm it: provision the corpus outside this workflow (populate"
+          echo "::warning::the silesia-<digest> cache, or set ZLIB_RS_SILESIA_DIR on a"
+          echo "::warning::self-hosted runner that holds it) and set the repository"
+          echo "::warning::variable ZLIB_RS_SILESIA_SHA256 to the pinned archive digest."
+          echo "::warning::CI never downloads it -- AAP 0.6.4.4 and the header of"
+          echo "::warning::crates/zlib-rs-differential/corpus/fetch_silesia.sh."
+        fi
+
+    - name: Run test cases (verify the provisioned Silesia corpus, never fetch it)
+      # `--verify-only` and ONLY `--verify-only`.  The script's own words for that
+      # mode are "fetches nothing and writes nothing": it requires a digest even
+      # here -- "verifying against nothing is not verification" -- and it checks that
+      # the directory carries a well-formed stamp, that the payload is present, and
+      # that the stamp records the URL and archive digest expected NOW.  Stated
+      # precisely because the script states it precisely: the archive is not retained
+      # after a fetch, so this validates the recorded provenance of the fetch rather
+      # than re-hashing each member.  Per-member digests are checked at FETCH time,
+      # by the human who fetched, and only when they supplied a manifest through
+      # ZLIB_RS_SILESIA_MEMBER_SHA256.  What closes the remaining gap here is not
+      # this step but the next one: the benches, armed, require the complete pinned
+      # twelve by exact name and refuse anything less.
+      #
+      # A cache miss is a provisioning failure to report, never a download to perform.
+      if: steps.acceptance.outputs.armed == 'yes'
       env:
         ZLIB_RS_SILESIA_SHA256: ${{ vars.ZLIB_RS_SILESIA_SHA256 }}
       run: |
         set -eu
-        if [ "${{ steps.corpus.outputs.cache-hit }}" = "true" ]; then
-          sh crates/zlib-rs-differential/corpus/fetch_silesia.sh --verify-only
-        else
-          sh crates/zlib-rs-differential/corpus/fetch_silesia.sh
+        if [ "${{ steps.corpus.outputs.cache-hit }}" != "true" ] \
+           && [ -z "${ZLIB_RS_SILESIA_DIR:-}" ]; then
+          echo "::error::tier-2 acceptance is armed, but no corpus was provisioned: the"
+          echo "::error::silesia-${{ vars.ZLIB_RS_SILESIA_SHA256 }} cache did not hit and"
+          echo "::error::ZLIB_RS_SILESIA_DIR is unset. This workflow does not download the"
+          echo "::error::corpus -- AAP 0.6.4.4 and fetch_silesia.sh's own header -- so"
+          echo "::error::provision it outside the workflow and re-run."
+          exit 1
         fi
-        ls -l target/silesia
+        sh crates/zlib-rs-differential/corpus/fetch_silesia.sh --verify-only
+        ls -l "${ZLIB_RS_SILESIA_DIR:-target/silesia}"
 
     - name: Run test cases (Silesia corpus, required)
-      # ZLIB_RS_SILESIA_REQUIRED=1 is the whole point of this pass: if
-      # provisioning produced eleven of the twelve members, or none, this refuses
-      # rather than reporting a pass earned on the minimal corpus.  The
-      # minimal-corpus criterion output is moved aside rather than deleted so both
-      # runs survive into the failure artifact.
-      if: vars.ZLIB_RS_SILESIA_SHA256 != ''
+      # ZLIB_RS_SILESIA_REQUIRED=1 is the whole point of this pass: if provisioning
+      # produced eleven of the twelve members, or none, this refuses rather than
+      # reporting a pass earned on the minimal corpus.  The minimal-corpus criterion
+      # output is moved aside rather than deleted so both runs survive into the
+      # failure artifact.
+      if: steps.acceptance.outputs.armed == 'yes'
       env:
         ZLIB_RS_SILESIA_REQUIRED: '1'
       run: |
@@ -4167,16 +4287,18 @@ jobs:
         set -o pipefail
         rm -rf target/criterion-minimal
         mv target/criterion target/criterion-minimal
-        cargo bench --locked -p zlib-rs-differential 2>&1 \
+        cargo bench --locked --manifest-path benches/Cargo.toml \
+          --profile ${{ matrix.profile }} ${{ matrix.features }} 2>&1 \
           | tee target/bench/silesia.log
 
     - name: Run test cases (gate the Silesia measurements)
       # The same gate, on a log whose SILESIA line reads required=yes.  That one
-      # difference removes the tier-2 exemption, so both *_silesia groups must now
-      # report expected>0 and every gated case of them is decided from criterion's
-      # estimates.  The two greps assert the precondition explicitly so that a
-      # corpus which loaded but was not demanded cannot pass as acceptance.
-      if: vars.ZLIB_RS_SILESIA_SHA256 != ''
+      # difference removes the tier-2 exemption inside the gate, so both *_silesia
+      # groups must now report expected>0 and every gated case of them is decided
+      # from criterion's estimates.  The two greps assert the precondition
+      # explicitly as well, so that a corpus which loaded but was not demanded
+      # cannot pass as acceptance.
+      if: steps.acceptance.outputs.armed == 'yes'
       run: |
         set -eu
         grep -h 'SILESIA verdict=' target/bench/silesia.log
@@ -4193,7 +4315,7 @@ jobs:
             exit 1
           fi
         done
-        python3 "$RUNNER_TEMP/bench_gate.py" target/bench/silesia.log
+        python3 .github/scripts/bench_gate.py target/bench/silesia.log
 
     - name: Upload build errors
       uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -4205,4 +4327,3 @@ jobs:
           target/criterion/
           target/criterion-minimal/
         retention-days: 7
-
