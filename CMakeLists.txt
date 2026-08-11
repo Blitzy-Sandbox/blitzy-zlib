@@ -63,6 +63,28 @@ if(ZLIB_BUILD_RUST)
                 "the C library and needs no cargo.")
     endif(NOT ZLIB_CARGO_EXECUTABLE)
 
+    # find_program() does not re-examine a value it was handed. The line above
+    # asks "is the variable set", and a user-supplied cache entry is set whether
+    # or not it names anything, so -DZLIB_CARGO_EXECUTABLE=/nonexistent/cargo
+    # configured successfully and failed later, in the middle of a build, with a
+    # command line instead of an explanation. The two spellings of the same
+    # mistake -- no cargo at all, and a cargo named wrongly -- now fail in the
+    # same place, at configure time, where the remedy can be given once.
+    if(NOT EXISTS "${ZLIB_CARGO_EXECUTABLE}")
+        message(
+            FATAL_ERROR
+                "ZLIB_CARGO_EXECUTABLE is set to\n"
+                "    ${ZLIB_CARGO_EXECUTABLE}\n"
+                "and no such file exists. It has to be the cargo executable "
+                "itself, not a directory and not a name to be looked up.\n"
+                "Leave it unset to have PATH searched, or give a path that "
+                "exists:\n"
+                "    cmake -S . -B build -DZLIB_BUILD_RUST=ON "
+                "-DZLIB_CARGO_EXECUTABLE=/opt/rust/bin/cargo\n"
+                "Configuring with -DZLIB_BUILD_RUST=OFF (the default) builds "
+                "the C library and needs no cargo.")
+    endif(NOT EXISTS "${ZLIB_CARGO_EXECUTABLE}")
+
     # A multi-config generator is refused, and this is the one refusal that
     # looks like a limitation and is actually a correctness requirement.  Cargo
     # has two profiles where CMake has four configurations, and three of the
@@ -1147,32 +1169,54 @@ endif(NOT zlib_rust_cargo_status EQUAL 0)
     # private to compiling the C library.  add_dependencies is what makes a
     # consumer wait for the staging above; without it the build stops at "No
     # rule to make target".
+    #
+    # ★ THE IMPORTED TARGETS ARE NAMED ZLIB::ZLIB AND ZLIB::ZLIBSTATIC DIRECTLY,
+    # not `zlibrs' with an alias added later, and the name is load-bearing
+    # rather than cosmetic.  When a downstream project links one of these and
+    # then exports a target of its own, CMake writes the LINKED TARGET'S NAME
+    # into that project's generated export file.  In the C build the linked name
+    # is an alias for a target that belongs to an export set with NAMESPACE
+    # ZLIB::, so CMake writes `ZLIB::ZLIB' -- a name the consumer's own
+    # find_package(ZLIB) defines.  An IMPORTED target belongs to no export set,
+    # so an alias over `zlibrs' made CMake write the bare internal name instead,
+    # and a consumer of that export got `-lzlibrs: No such file or directory'.
+    # Reproduced with contrib/minizip, whose minizip-shared.cmake read
+    #
+    # INTERFACE_LINK_LIBRARIES "ZLIB::ZLIB;..."   (C build)
+    # INTERFACE_LINK_LIBRARIES "zlibrs;..."       (Rust build)
+    #
+    # for the identical source.  Naming the imported targets what they are
+    # consumed as makes the two byte-identical, which is the whole claim. `::'
+    # in a target name is exactly what CMake reserves for ALIAS and IMPORTED
+    # targets, so this is the supported spelling, and it has the side benefit
+    # that a typo in a consumer now fails at configure time, not at link time.
     if(ZLIB_BUILD_SHARED)
-        add_library(zlibrs SHARED IMPORTED GLOBAL)
+        add_library(ZLIB::ZLIB SHARED IMPORTED GLOBAL)
         set_target_properties(
-            zlibrs PROPERTIES IMPORTED_LOCATION ${ZLIB_RUST_LIBRARY}
-                              IMPORTED_SONAME ${ZLIB_RUST_SONAME})
+            ZLIB::ZLIB PROPERTIES IMPORTED_LOCATION ${ZLIB_RUST_LIBRARY}
+                                  IMPORTED_SONAME ${ZLIB_RUST_SONAME})
         target_include_directories(
-            zlibrs
+            ZLIB::ZLIB
             INTERFACE $<BUILD_INTERFACE:${zlib_BINARY_DIR}>
                       $<BUILD_INTERFACE:${zlib_SOURCE_DIR}>
                       $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
         target_compile_definitions(
-            zlibrs INTERFACE $<$<BOOL:${HAVE_OFF64_T}>:_LARGEFILE64_SOURCE=1>)
-        add_dependencies(zlibrs zlibrust)
+            ZLIB::ZLIB
+            INTERFACE $<$<BOOL:${HAVE_OFF64_T}>:_LARGEFILE64_SOURCE=1>)
+        add_dependencies(ZLIB::ZLIB zlibrust)
     endif(ZLIB_BUILD_SHARED)
 
     if(ZLIB_BUILD_STATIC)
-        add_library(zlibrsstatic STATIC IMPORTED GLOBAL)
-        set_target_properties(zlibrsstatic PROPERTIES IMPORTED_LOCATION
-                                                      ${ZLIB_RUST_ARCHIVE})
+        add_library(ZLIB::ZLIBSTATIC STATIC IMPORTED GLOBAL)
+        set_target_properties(ZLIB::ZLIBSTATIC PROPERTIES IMPORTED_LOCATION
+                                                          ${ZLIB_RUST_ARCHIVE})
         target_include_directories(
-            zlibrsstatic
+            ZLIB::ZLIBSTATIC
             INTERFACE $<BUILD_INTERFACE:${zlib_BINARY_DIR}>
                       $<BUILD_INTERFACE:${zlib_SOURCE_DIR}>
                       $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
         target_compile_definitions(
-            zlibrsstatic
+            ZLIB::ZLIBSTATIC
             INTERFACE $<$<BOOL:${HAVE_OFF64_T}>:_LARGEFILE64_SOURCE=1>)
 
         # The one part of the interface that is NOT the C target's interface. A
@@ -1196,9 +1240,9 @@ endif(NOT zlib_rust_cargo_status EQUAL 0)
         # other.  One owner per channel, and the result is read back and asserted.
         if(DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS_LIST)
             target_link_libraries(
-                zlibrsstatic INTERFACE ${ZLIB_RUST_NATIVE_STATIC_LIBS_LIST})
+                ZLIB::ZLIBSTATIC INTERFACE ${ZLIB_RUST_NATIVE_STATIC_LIBS_LIST})
 
-            get_target_property(ZLIB_RUST_STATIC_INTERFACE zlibrsstatic
+            get_target_property(ZLIB_RUST_STATIC_INTERFACE ZLIB::ZLIBSTATIC
                                INTERFACE_LINK_LIBRARIES)
 
             if(NOT ZLIB_RUST_STATIC_INTERFACE STREQUAL
@@ -1217,7 +1261,7 @@ endif(NOT zlib_rust_cargo_status EQUAL 0)
                   "${ZLIB_RUST_NATIVE_STATIC_LIBS_LIST}")
         endif(DEFINED ZLIB_RUST_NATIVE_STATIC_LIBS_LIST)
 
-        add_dependencies(zlibrsstatic zlibrust)
+        add_dependencies(ZLIB::ZLIBSTATIC zlibrust)
 
         # ------------------------------------------------------------------
         # The pkg-config descriptor for the staged ARCHIVE.
@@ -1338,21 +1382,19 @@ endif(ZLIB_BUILD_RUST)
 # names, so this is the single switch that decides which implementation the
 # whole tree is built and tested against.  With ZLIB_BUILD_RUST OFF they are the
 # C targets, exactly as before.
-if(ZLIB_BUILD_SHARED)
-    if(ZLIB_BUILD_RUST)
-        add_library(ZLIB::ZLIB ALIAS zlibrs)
-    else(ZLIB_BUILD_RUST)
-        add_library(ZLIB::ZLIB ALIAS zlib)
-    endif(ZLIB_BUILD_RUST)
-endif(ZLIB_BUILD_SHARED)
+#
+# Only the C branch appears here.  In Rust mode the two names are the IMPORTED
+# targets themselves, created under these names in the ZLIB_BUILD_RUST block
+# above rather than aliased to internal ones -- see the comment there for why
+# the name has to be the consumed name and not an alias over it.  So there is
+# nothing to alias in that mode, and this block would be a redefinition.
+if(ZLIB_BUILD_SHARED AND NOT ZLIB_BUILD_RUST)
+    add_library(ZLIB::ZLIB ALIAS zlib)
+endif(ZLIB_BUILD_SHARED AND NOT ZLIB_BUILD_RUST)
 
-if(ZLIB_BUILD_STATIC)
-    if(ZLIB_BUILD_RUST)
-        add_library(ZLIB::ZLIBSTATIC ALIAS zlibrsstatic)
-    else(ZLIB_BUILD_RUST)
-        add_library(ZLIB::ZLIBSTATIC ALIAS zlibstatic)
-    endif(ZLIB_BUILD_RUST)
-endif(ZLIB_BUILD_STATIC)
+if(ZLIB_BUILD_STATIC AND NOT ZLIB_BUILD_RUST)
+    add_library(ZLIB::ZLIBSTATIC ALIAS zlibstatic)
+endif(ZLIB_BUILD_STATIC AND NOT ZLIB_BUILD_RUST)
 
 if(ZLIB_INSTALL)
     if(ZLIB_BUILD_SHARED)

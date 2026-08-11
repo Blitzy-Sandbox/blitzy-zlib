@@ -103,8 +103,21 @@ three -- the versioned file, the major alias and the version-script mode."
 name; a descriptor carrying a path component is not something to resolve"
     plain_name "$som" || fail "the staged major alias '$som' is not a plain file name"
 
+    # `required' and `ldshared' are the same fact recorded from two producers.
+    # Makefile.in composes the shared-object link itself and writes `required'
+    # when it passes --version-script on that command line; when the version
+    # script is ALREADY in $(LDSHARED) -- which is exactly what ./configure
+    # writes, so it is the state of every configured tree -- it has nothing to
+    # add and records `ldshared' instead.  Either way a version script WAS
+    # applied, which is the only thing that matters to this script: it is why the
+    # symbol version nodes below are expected to exist.  Makefile.in's own
+    # consumers already treat the two identically (each tests `= none' or
+    # `= static'), and rejecting `ldshared' here made this verifier fail on the
+    # documented `./configure; make; make rust' path while passing on the
+    # unconfigured one -- a disagreement between two parts of this repository,
+    # not a fault in the tree being verified.
     case $vsmode in
-        required | none) ;;
+        required | ldshared | none) ;;
         static)
             fail "the producer recorded a static-only build, so there is no shared \
 object to verify.  This gate needs the shared chain; build without \

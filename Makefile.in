@@ -870,6 +870,14 @@ rust:
 	  echo 'make rust: install cargo, then re-run ./configure, or name it:' >&2; \
 	  echo 'make rust:     make rust CARGO=cargo' >&2; \
 	  exit 1; \
+	elif ! command -v $(CARGO) > /dev/null 2>&1; then \
+	  echo 'make rust: $$(CARGO) is set to `$(CARGO)'"'"', and that is not an executable' >&2; \
+	  echo 'make rust: this shell can run.  Named rather than left to the shell so the' >&2; \
+	  echo 'make rust: diagnosis is the same shape as the empty case above instead of a' >&2; \
+	  echo 'make rust: bare "not found" from the first recipe line that tried to use it.' >&2; \
+	  echo 'make rust: Give it a cargo that exists, or re-run ./configure with one on PATH:' >&2; \
+	  echo 'make rust:     make rust CARGO=cargo' >&2; \
+	  exit 1; \
 	fi; \
 	set -e; \
 	$(RUSTPATHGUARD); \
@@ -1369,6 +1377,24 @@ rust-pc: rust
 	  echo "		Libs.private stated by RUSTPCPRIVATE, not probed: $$PRIVATE"; \
 	elif test -s $(RUSTLIBDIR)/native-static-libs.stage; then \
 	  PRIVATE=`cat $(RUSTLIBDIR)/native-static-libs.stage`; \
+	  if test -z "$$PRIVATE"; then \
+	    echo 'make rust-pc: $(RUSTLIBDIR)/native-static-libs.stage is EMPTY, which is' >&2; \
+	    echo 'make rust-pc: how `make rust'"'"' records "I could not find out", not "none are' >&2; \
+	    echo 'make rust-pc: needed" -- it writes one line either way, so the file exists and' >&2; \
+	    echo 'make rust-pc: holds just a newline.  Advertising that as Libs.private: with' >&2; \
+	    echo 'make rust-pc: nothing after it is the one outcome this target exists to' >&2; \
+	    echo 'make rust-pc: prevent: every consumer of a Rust libz.a would then be told it' >&2; \
+	    echo 'make rust-pc: needs no companion libraries and fail to link, and the two' >&2; \
+	    echo 'make rust-pc: checks below would approve it because iterating an empty set' >&2; \
+	    echo 'make rust-pc: succeeds vacuously.  `make rust'"'"' said so at the time; this is' >&2; \
+	    echo 'make rust-pc: that promise being kept.  Re-run `make rust'"'"' with a $(RUSTC) it' >&2; \
+	    echo 'make rust-pc: can probe, or state the set yourself:' >&2; \
+	    echo 'make rust-pc:     make rust RUSTC=/path/to/rustc' >&2; \
+	    echo 'make rust-pc:     make rust-pc RUSTPCPRIVATE="-lgcc_s -lutil -lrt -lpthread -lm -ldl -lc"' >&2; \
+	    echo 'make rust-pc: (that list is this host'"'"'s answer, not a portable one -- ask' >&2; \
+	    echo 'make rust-pc: $(RUSTC) --print native-static-libs for the target you build.)' >&2; \
+	    exit 1; \
+	  fi; \
 	  TARGETDESC='recorded by `make rust'"'"' for the target being built'; \
 	  echo "		Libs.private $$TARGETDESC:$$PRIVATE"; \
 	  echo '		(one probe per `make rust'"'"', recorded in'; \
@@ -1486,6 +1512,17 @@ rust-pc: rust
 	  exit 1; \
 	fi; \
 	LINE=`sed -n 's/^Libs\.private: *//p' $(RUSTPC)`; \
+	if test -z "$$LINE"; then \
+	  echo 'make rust-pc: the generated Libs.private line is EMPTY.  Reaching here' >&2; \
+	  echo 'make rust-pc: means the set was non-empty when it was resolved above and' >&2; \
+	  echo 'make rust-pc: arrived empty in the descriptor, so the file is wrong however' >&2; \
+	  echo 'make rust-pc: it got that way.  This is asserted separately from the source' >&2; \
+	  echo 'make rust-pc: checks because the two loops below iterate the set: with an' >&2; \
+	  echo 'make rust-pc: empty answer they succeed without comparing anything, and an' >&2; \
+	  echo 'make rust-pc: empty Libs.private would be published under a gate that had' >&2; \
+	  echo 'make rust-pc: approved it.' >&2; \
+	  exit 1; \
+	fi; \
 	for lib in $$PRIVATE; do \
 	  case " $$LINE " in \
 	    *" $$lib "*) ;; \
@@ -1769,6 +1806,11 @@ rust-test: rust rust-pc
 	  echo 'make rust-test: install cargo, then re-run ./configure, or name it:' >&2; \
 	  echo 'make rust-test:     make rust-test CARGO=cargo' >&2; \
 	  exit 1; \
+	elif ! command -v $(CARGO) > /dev/null 2>&1; then \
+	  echo 'make rust-test: $$(CARGO) is set to `$(CARGO)'"'"', which is not an executable' >&2; \
+	  echo 'make rust-test: this shell can run.  Name a cargo that exists:' >&2; \
+	  echo 'make rust-test:     make rust-test CARGO=cargo' >&2; \
+	  exit 1; \
 	fi; \
 	SRCROOT=`cd "$(SRCDIR)." && pwd`; \
 	RUSTLIB=`pwd`/$(RUSTLIBDIR); \
@@ -1893,6 +1935,11 @@ rust-symbols: rust
 	  echo 'make rust-symbols: install cargo, then re-run ./configure, or name it:' >&2; \
 	  echo 'make rust-symbols:     make rust-symbols CARGO=cargo' >&2; \
 	  exit 1; \
+	elif ! command -v $(CARGO) > /dev/null 2>&1; then \
+	  echo 'make rust-symbols: $$(CARGO) is set to `$(CARGO)'"'"', which is not an' >&2; \
+	  echo 'make rust-symbols: executable this shell can run.  Name a cargo that exists:' >&2; \
+	  echo 'make rust-symbols:     make rust-symbols CARGO=cargo' >&2; \
+	  exit 1; \
 	fi; \
 	SOV=`sed -n 1p $(RUSTLIBDIR)/soname.stage`; \
 	VSMODE=`sed -n 3p $(RUSTLIBDIR)/soname.stage`; \
@@ -1913,7 +1960,19 @@ rust-symbols: rust
 	fi; \
 	if test ! -f $(ZLIBREF); then \
 	  echo "the C reference library $(ZLIBREF) does not exist." >&2; \
-	  echo "Build it with 'make $(SHAREDLIBV)', or point ZLIBREF at a copy:" >&2; \
+	  if test -f configure.log; then \
+	    echo "Build it with 'make $(SHAREDLIBV)' (plain 'make' builds it too)," >&2; \
+	    echo "or point ZLIBREF at a copy:" >&2; \
+	  else \
+	    echo "This build directory is not configured -- there is no configure.log --" >&2; \
+	    echo "so no C library can be built in it yet, and \$$(SHAREDLIBV) still holds" >&2; \
+	    echo "the deliberately stale unconfigured default '$(SHAREDLIBV)' rather than" >&2; \
+	    echo "the name configure derives from ZLIB_VERSION.  Naming that as a target" >&2; \
+	    echo "would send you to one that cannot exist.  Run './configure' and then" >&2; \
+	    echo "'make': that builds '$$SOV', the very name the Rust library is staged" >&2; \
+	    echo "under, because both are derived from ZLIB_VERSION in $(SRCDIR)zlib.h." >&2; \
+	    echo "Or point ZLIBREF at a copy:" >&2; \
+	  fi; \
 	  echo "    make rust-symbols ZLIBREF=/path/to/$$SOV" >&2; \
 	  exit 1; \
 	fi; \
@@ -2262,6 +2321,11 @@ rust-msrv:
 	@if test -z "$(CARGO)"; then \
 	  echo 'make rust-msrv: no Rust toolchain -- $$(CARGO) is empty' >&2; \
 	  echo 'make rust-msrv: install cargo, then re-run ./configure, or name it:' >&2; \
+	  echo 'make rust-msrv:     make rust-msrv CARGO=cargo' >&2; \
+	  exit 1; \
+	elif ! command -v $(CARGO) > /dev/null 2>&1; then \
+	  echo 'make rust-msrv: $$(CARGO) is set to `$(CARGO)'"'"', which is not an executable' >&2; \
+	  echo 'make rust-msrv: this shell can run.  Name a cargo that exists:' >&2; \
 	  echo 'make rust-msrv:     make rust-msrv CARGO=cargo' >&2; \
 	  exit 1; \
 	fi; \
@@ -2634,15 +2698,22 @@ maintainer-clean: distclean
 # The printf sequence below regenerates the placeholder Makefile that tells the
 # user to run ./configure.  It has to stay BYTE-IDENTICAL to the checked-in
 # Makefile -- including the forwarding rule for every one of the seven rust*
-# targets -- because a distclean replaces that file wholesale.  Drift here is not
-# cosmetic: a forwarding rule that goes missing makes that target unreachable in
-# a post-distclean tree, and $(RUSTTARGETDIR) is what a lost rust-clean would
-# leave stranded, since that is the one Rust target needing nothing configure
-# computes.  Every one of them works unconfigured -- they name the staged library
-# from ZLIB_VERSION in the immutable $(SRCDIR)zlib.h rather than from the
-# unconfigured $(SHAREDLIBV) default -- which is why they forward rather than
-# refuse.  Regenerate this block from the checked-in Makefile rather than editing
-# it by hand.
+# targets, the .PHONY declaration and the .NOTPARALLEL declaration -- because a
+# distclean replaces that file wholesale.  Drift here is not cosmetic, and it is
+# not hypothetical: this block and the checked-in Makefile HAD drifted, by one
+# reworded comment paragraph, so `make distclean' left the tracked Makefile
+# modified in a clean checkout.  Beyond tidiness, a forwarding rule that goes
+# missing makes that target unreachable in a post-distclean tree --
+# $(RUSTTARGETDIR) is what a lost rust-clean would leave stranded, since that is
+# the one Rust target needing nothing configure computes -- and a lost
+# .NOTPARALLEL puts the parallel-sub-make race back.  Every one of them works
+# unconfigured -- they name the staged library from ZLIB_VERSION in the immutable
+# $(SRCDIR)zlib.h rather than from the unconfigured $(SHAREDLIBV) default --
+# which is why they forward rather than refuse.  Regenerate this block from the
+# checked-in Makefile rather than editing it by hand, and prove it the only way
+# that counts:
+#     make distclean && git diff --exit-code -- Makefile
+# which the `distclean' step of rust.yml's `header' job now runs on every push.
 distclean: clean zconf # zconf.h.cmakein
 	rm -f Makefile zlib.pc configure.log
 	-@rm -f .DS_Store
@@ -2657,12 +2728,27 @@ distclean: clean zconf # zconf.h.cmakein
 	printf "# too -- verified here: 111 dynamic globals, identical to the C library's.\n" >> Makefile ; \
 	printf "# This file is regenerated by \`distclean'; keep it and that recipe in step.\n" >> Makefile ; \
 	printf '#\n' >> Makefile ; \
-	printf '# .PHONY IS REQUIRED, NOT TIDINESS: `rust'"'"' is also the name of a directory in\n' >> Makefile ; \
-	printf '# this tree, and make treats a target whose name matches an existing file or\n' >> Makefile ; \
-	printf '# directory as up to date when it has no prerequisites -- so without this line\n' >> Makefile ; \
-	printf "# \`make rust' prints \"'rust' is up to date\", runs nothing and still exits 0.\n" >> Makefile ; \
-	printf '# The whole family is declared, so a later addition cannot reintroduce it.\n' >> Makefile ; \
+	printf '# .PHONY is REQUIRED, not tidiness.  `rust'"'"' is also the name of a directory in\n' >> Makefile ; \
+	printf '# this tree -- rust/README.md, the developer guide -- and a target whose name\n' >> Makefile ; \
+	printf '# matches an existing file or directory with no prerequisites is considered up\n' >> Makefile ; \
+	printf '# to date, so without this line `make rust'"'"' prints "'"'"'rust'"'"' is up to date" and\n' >> Makefile ; \
+	printf '# runs nothing while still exiting 0.  That is a silent no-op, which is worse\n' >> Makefile ; \
+	printf '# than an error.  The whole family is declared rather than just `rust'"'"', so a\n' >> Makefile ; \
+	printf '# later addition under any of these names cannot reintroduce the same trap.\n' >> Makefile ; \
 	printf '.PHONY: all distclean rust rust-pc rust-test rust-symbols rust-header rust-msrv rust-clean\n' >> Makefile ; \
+	printf '\n' >> Makefile ; \
+	printf '# .NOTPARALLEL is REQUIRED here too, and for a reason make cannot see for itself.\n' >> Makefile ; \
+	printf '# Every rule below dispatches to a SEPARATE sub-make, and inside Makefile.in\n' >> Makefile ; \
+	printf '# rust-pc, rust-test and rust-symbols each depend on `rust'"'"' -- so `make -j8 rust\n' >> Makefile ; \
+	printf '# rust-pc'"'"' starts two sub-makes that both build `rust'"'"', concurrently, into the\n' >> Makefile ; \
+	printf '# same target/dropin, racing on every file they stage.  That overlap is invisible\n' >> Makefile ; \
+	printf '# to this make because it lives behind the recursion, and the observed result was\n' >> Makefile ; \
+	printf '# an exit 2, a Bus error, and a zlib.pc published with an empty Libs.private that\n' >> Makefile ; \
+	printf '# its own gate then approved.  This line makes the goals of THIS file run one\n' >> Makefile ; \
+	printf '# after another; each sub-make is still free to use -jN internally, where the\n' >> Makefile ; \
+	printf '# dependency graph is visible and correct.  Keep it in step with the recipe in\n' >> Makefile ; \
+	printf '# Makefile.in that regenerates this file.\n' >> Makefile ; \
+	printf '.NOTPARALLEL:\n' >> Makefile ; \
 	printf '\nrust:\n\t$$(MAKE) -f Makefile.in rust\n' >> Makefile ; \
 	printf '\nrust-pc:\n\t$$(MAKE) -f Makefile.in rust-pc\n' >> Makefile ; \
 	printf '\nrust-test:\n\t$$(MAKE) -f Makefile.in rust-test\n' >> Makefile ; \

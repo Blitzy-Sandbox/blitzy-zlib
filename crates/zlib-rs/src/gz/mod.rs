@@ -1745,7 +1745,16 @@ mod tests {
     /// (`gzguts.h` L131-L133), and `gzerror` hands that string straight back to a caller. `std`
     /// composes its `Display` as `error_string(code)` plus that suffix, so the suffix has to come
     /// off again -- this asserts that it does, for a spread of real error numbers.
+    ///
+    /// Skipped under Miri, which has no platform `strerror` to render through: its shim answers
+    /// with text that *already* ends in ` (os error N)`, `std` then appends its own copy, and
+    /// [`ErrnoMessage::strip_os_error_suffix`] removes exactly the one `std` added -- correctly,
+    /// and leaving the shim's behind. Measured under the interpreter, errno 1 comes back as
+    /// `"Operation not permitted (os error 1) (os error 1)"`, so the assertion below would report a
+    /// property of the interpreter rather than of this crate. Natively it holds for every errno
+    /// tried here, and `read.rs` skips its two `Z_ERRNO` message tests in these same words.
     #[test]
+    #[cfg_attr(miri, ignore = "renders a message through the platform's strerror")]
     fn the_errno_message_carries_no_os_error_suffix() {
         // ENOENT, EACCES, EBADF, EINVAL, ENOSPC on unix; whatever the platform maps them to
         // elsewhere. The point is not which text comes back but that no suffix is attached to it.
@@ -1781,7 +1790,17 @@ mod tests {
 
     /// With no error object the text comes from the thread's current `errno`, as C's bare
     /// `zstrerror()` does (`gzread.c` L429).
+    ///
+    /// Skipped under Miri, whose isolation refuses `open` outright. The probe below is a real
+    /// syscall made for its side effect alone -- putting a meaningful value in the thread's `errno`
+    /// -- and an unsupported operation under interpretation is not a failing test but an abort of
+    /// the whole binary, which took the 38 tests of [`mod@write`] and one of this module's own down
+    /// with it before this guard existed. `open.rs` guards its file-opening tests the same way.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "filesystem access is unavailable under Miri's isolation"
+    )]
     fn the_errno_message_falls_back_to_the_threads_errno() {
         // Provoke a real failure so the thread's errno is set to something meaningful.
         let _ = std::fs::File::open("/nonexistent/zlib-rs/errno/probe");

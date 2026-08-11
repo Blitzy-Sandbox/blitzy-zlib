@@ -1,4 +1,35 @@
 name: CMake
+
+# This matrix is the C library's, and the four `rust: yes` rows at the end of it
+# are the Rust library's, built through the same CMakeLists with
+# -DZLIB_BUILD_RUST=ON.  Both are here because the CMake path is one contract with
+# two backends, and a matrix that exercised only one of them would let the other's
+# install rules, exported targets and CTest registrations rot.
+#
+# The C rows are unaffected by the addition.  `fail-fast: false` (below, and
+# already there before) means a Rust row going red cancels nothing, and every step
+# that touches a Rust toolchain is guarded on `matrix.rust`, so a C row neither
+# installs one nor probes for one.
+#
+# WHY ONLY SINGLE-CONFIG GENERATORS CARRY A RUST ROW.  CMakeLists refuses
+# -DZLIB_BUILD_RUST=ON under a multi-config generator, with a FATAL_ERROR that
+# explains why: cargo has two profiles where CMake has four configurations, and
+# add_custom_command's OUTPUT/BYPRODUCTS/DEPENDS take generator expressions only
+# from CMake 3.20 while IMPORTED_LOCATION takes none at any version -- so Debug
+# and Release would share one cargo output directory and one staged library,
+# whichever was built last winning silently.  That rules out the MSVC rows, whose
+# `-A Win32`/`-A x64`/`-A ARM64` select the Visual Studio generator.  Windows GCC
+# already uses Ninja and is single-config, so it carries one.
+#
+# `-DZLIB_PREFIX=ON` is likewise refused with the Rust build and appears in no row
+# here.
+#
+# The `rust.yml` workflow's own `cmake-rust` job is NOT made redundant by these
+# rows and is not replaced by them: it goes further on one configuration --
+# installing, then compiling and RUNNING C consumers against the installation
+# through pkg-config, through the static archive and through find_package, with an
+# `ldd` assertion that the Rust artifact is the one bound.  These rows are breadth
+# across compilers and platforms; that job is depth on one.
 on: [push, pull_request]
 jobs:
   ci-cmake:
@@ -107,6 +138,39 @@ jobs:
             pkgtgt: package
             cmake-args: -DMINIZIP_ENABLE_BZIP2=ON
 
+          # ---- the same contract, Rust backend (AAP 0.4.1.6) ----------------
+          # CFLAGS is deliberately left off these rows: with ZLIB_BUILD_RUST=ON
+          # the library is compiled by cargo, so -Wall -Wextra would describe
+          # only minizip and the test drivers and reading a green row as "the
+          # library built warning-free" would be wrong.
+          - name: Ubuntu GCC Rust
+            os: ubuntu-latest
+            compiler: gcc
+            rust: yes
+            pkgtgt: package package_source
+            cmake-args: -DZLIB_BUILD_RUST=ON -DMINIZIP_ENABLE_BZIP2=ON
+
+          - name: Ubuntu GCC Rust no shared
+            os: ubuntu-latest
+            compiler: gcc
+            rust: yes
+            pkgtgt: package package_source
+            cmake-args: -DZLIB_BUILD_RUST=ON -DZLIB_BUILD_SHARED=OFF -DMINIZIP_ENABLE_BZIP2=ON
+
+          - name: Ubuntu Clang Rust
+            os: ubuntu-latest
+            compiler: clang
+            rust: yes
+            pkgtgt: package package_source
+            cmake-args: -DZLIB_BUILD_RUST=ON -DMINIZIP_ENABLE_BZIP2=ON
+
+          - name: macOS Clang Rust
+            os: macos-latest
+            compiler: clang
+            rust: yes
+            pkgtgt: package
+            cmake-args: -DZLIB_BUILD_RUST=ON -DMINIZIP_ENABLE_BZIP2=ON
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v6
@@ -120,6 +184,13 @@ jobs:
       if: runner.os == 'Linux'
       run: |
         sudo apt install libbz2-dev
+
+    - name: Install Rust toolchain
+      # Only the rust: yes rows.  A C row must not acquire a new requirement from
+      # this file -- that is the whole reason the Rust build is opt-in in
+      # CMakeLists too, where nothing is probed unless ZLIB_BUILD_RUST is ON.
+      if: ${{ matrix.rust == 'yes' }}
+      run: rustup toolchain install stable --profile minimal
     - name: Generate project files
       run: cmake -S . -B ../build ${{ matrix.cmake-args }} -D CMAKE_BUILD_TYPE=${{ matrix.build-config || 'Release' }} -DZLIB_BUILD_MINIZIP=ON
       env:

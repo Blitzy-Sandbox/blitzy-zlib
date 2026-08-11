@@ -63,13 +63,19 @@ and reads neither has to add the printed set itself.
 
 The set is target-specific and is never hardcoded, and this path is FAIL-CLOSED: if rustc cannot be
 reached, or answers with no set at all, configuration stops with a FATAL_ERROR naming the remedy --
-either -DZLIB_RUSTC_EXECUTABLE=/path/to/rustc, or -DZLIB_RUST_NATIVE_STATIC_LIBS="-lm -ldl -lc" to state
-the answer yourself as a cross build must, or -DZLIB_BUILD_STATIC=OFF to publish no archive. Installing a
-static library whose link requirements are unknown would be worse than not installing one, because the
-failure would surface in a consumer's build with nothing to connect it to this one. Shared consumers are
-unaffected either way, and a C-mode build never reaches any of it. `ctest -R static_link_closure` is the
-case that holds this to account, and it links with -nodefaultlibs on purpose -- a plain link succeeds on a
-modern glibc whether the advertisement is there or not.
+either -DZLIB_RUSTC_EXECUTABLE=/path/to/rustc, or -DZLIB_RUST_NATIVE_STATIC_LIBS="<the set for your
+target>" to state the answer yourself as a cross build must, or -DZLIB_BUILD_STATIC=OFF to publish no
+archive. That second form takes the same `-l` list rustc prints, and there is deliberately no example
+value here: on x86_64-linux-gnu it is currently seven libraries including -lgcc_s, and a plausible-looking
+short list such as `-lm -ldl -lc` configures and builds and then fails at link time with an undefined
+reference to `_Unwind_Resume`. Ask the compiler for the target you are building --
+`rustc --print native-static-libs --crate-type staticlib [--target <triple>]` -- and pass what it answers.
+Installing a static library whose link requirements are unknown would be worse than not installing one,
+because the failure would surface in a consumer's build with nothing to connect it to this one. Shared
+consumers are unaffected either way, and a C-mode build never reaches any of it. `ctest -R
+static_link_closure` is the case that holds this to account, and it links with -nodefaultlibs on purpose --
+a plain link succeeds on a modern glibc whether the advertisement is there or not, so it is also what
+catches an incomplete set stated by hand.
 
 README and rust/README.md cover the Rust build in full.
 

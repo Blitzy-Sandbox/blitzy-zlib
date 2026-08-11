@@ -424,11 +424,14 @@ Options:
   --verify-only  Report on an existing download and exit without fetching
                  anything.  Exits non-zero when the destination is missing,
                  incomplete, carries an unreadable stamp, or was fetched from
-                 a URL or digest other than the ones expected now.  The
-                 archive is not retained after a fetch, so this re-checks the
-                 recorded stamp against what you expect and confirms the
-                 payload is present; it does not recompute a digest over the
-                 unpacked corpus files.
+                 a URL or digest other than the ones expected now.
+                 "Incomplete" is judged against ZLIB_RS_SILESIA_MEMBERS, the
+                 same inventory a fetch applies, so a destination holding
+                 eleven of the twelve members fails here.  The archive is not
+                 retained after a fetch, so this re-checks the recorded stamp
+                 against what you expect and confirms the inventory is
+                 complete; it does not recompute a digest over the unpacked
+                 corpus files.
   -h, --help     Print this text and exit 0.  Touches no network and creates
                  no files.
 
@@ -1423,23 +1426,60 @@ $_exotic
 # Set ZLIB_RS_SILESIA_MEMBERS to a space-separated list to accept a deliberately
 # repackaged mirror; set it to `-` to skip the inventory check entirely, which is
 # recorded as an explicit choice rather than a silent default.
+#
+# Called from TWO places, which is why $2 exists.  On the fetch path it judges a
+# freshly extracted payload, and a mismatch is evidence about the ARCHIVE.  From
+# `verify_only` it judges a payload installed by some earlier run, and a mismatch
+# is evidence about THAT DIRECTORY -- the archive is long gone and is not what
+# went wrong -- so the two need different advice.  Reading the same inventory in
+# both places is the point: `--verify-only` promising to detect an "incomplete"
+# destination while consulting only "is there at least one non-stamp entry" is
+# how eleven of the twelve members, and even a single unrelated file, used to
+# pass.
+# The quiet predicate underneath it: 0 when the inventory under $1 is exactly
+# ZLIB_RS_SILESIA_MEMBERS (or when the check is opted out), 1 otherwise.  It
+# prints nothing and NEVER dies, which is what lets `destination_is_complete`
+# call it -- that function is used as a condition, so an inventory check that
+# exited would turn a decision into a termination.  It leaves the sorted lists in
+# _found and _expected for whichever caller wants to report them.
+member_inventory_matches() {
+    if [ "$ZLIB_RS_SILESIA_MEMBERS" = '-' ]; then
+        return 0
+    fi
+
+    _found=$(find "$1" -type f ! -name "$STAMP_NAME" -exec basename {} \; |
+        sort) || return 1
+    # Unquoted on purpose: the variable is a space-separated list and word
+    # splitting is how it is read.
+    # shellcheck disable=SC2086
+    _expected=$(printf '%s\n' $ZLIB_RS_SILESIA_MEMBERS | sort)
+
+    [ "$_found" = "$_expected" ]
+}
+
 verify_member_inventory() {
     if [ "$ZLIB_RS_SILESIA_MEMBERS" = '-' ]; then
         warn "inventory check skipped by request (ZLIB_RS_SILESIA_MEMBERS=-)"
         return 0
     fi
 
-    info "Checking the extracted member inventory"
+    if [ "${2-}" = installed ]; then
+        info "Checking the installed member inventory"
+    else
+        info "Checking the extracted member inventory"
+    fi
 
-    _found=$(find "$1" -type f ! -name "$STAMP_NAME" -exec basename {} \; |
-        sort) || die "could not list the extracted files under $1"
-    # Unquoted on purpose: the variable is a space-separated list and word
-    # splitting is how it is read.
-    # shellcheck disable=SC2086
-    _expected=$(printf '%s\n' $ZLIB_RS_SILESIA_MEMBERS | sort)
-
-    if [ "$_found" != "$_expected" ]; then
+    if ! member_inventory_matches "$1"; then
         printf 'expected:\n%s\nfound:\n%s\n' "$_expected" "$_found" >&2
+        if [ "${2-}" = installed ]; then
+            die "the payload installed in
+         $1
+       is not the expected corpus inventory (see above), so this destination is
+       incomplete or is holding something else.  The archive it was fetched
+       from is not retained, so nothing here can repair it: replace the
+       directory with --force, or -- if you are deliberately benchmarking a
+       repackaged mirror -- set ZLIB_RS_SILESIA_MEMBERS to the list you mean."
+        fi
         die "the extracted payload is not the expected corpus inventory (see
        above).  Either the archive at
          $ZLIB_RS_SILESIA_URL
@@ -1612,6 +1652,13 @@ destination_is_complete() {
     [ -d "$destination" ] || return 1
     read_stamp "$destination" || return 1
     payload_present "$destination" || return 1
+    # COMPLETE means the pinned inventory, not "something is in there".  Without
+    # this line the function's name was a promise it did not keep: `payload_present`
+    # is satisfied by a single non-stamp entry, so a destination holding eleven of
+    # the twelve members short-circuited a fetch with "there is nothing to do"
+    # while --verify-only, reading the same directory, called it incomplete.  One
+    # definition of complete, used by both.
+    member_inventory_matches "$destination" || return 1
     return 0
 }
 
@@ -1699,18 +1746,27 @@ verify_only() {
        produced it did not complete.  Replace it with --force."
     fi
 
+    # "Present" is not "complete", and the two used to be conflated here: the
+    # check above is satisfied by ONE non-stamp entry, so a destination holding
+    # eleven of the twelve members -- or one unrelated file -- reported success
+    # while --help promised a non-zero exit for an incomplete one.  The inventory
+    # is the same one the fetch path applies, read with `find` and `basename`
+    # only, so this stays a mode that writes nothing and reaches no network.
+    verify_member_inventory "$destination" installed
+
     report_existing
-    info "  stamp:   well formed, and the payload is present"
+    info "  stamp:   well formed, and the payload is the complete pinned inventory"
 
     assert_stamp_matches_expected
     info "  archive: matches the expected URL"
     info "  digest:  matches the expected archive digest"
 
-    # Said plainly rather than implied: the archive is not kept after a fetch,
-    # so this confirms the recorded fetch and the presence of its payload, not
+    # Said plainly rather than implied: the archive is not kept after a fetch, so
+    # this confirms the recorded fetch and the completeness of its inventory, not
     # the bytes of the individual corpus files.
     info "Verified.  Note that the archive is not retained after a fetch, so"
-    info "this checks the recorded fetch rather than re-hashing the corpus."
+    info "this checks the recorded fetch and the inventory rather than"
+    info "re-hashing the corpus."
 }
 
 main() {
@@ -1764,10 +1820,12 @@ main() {
             info "--force given: replacing the corpus at $destination"
         else
             if [ "$opt_force" -eq 0 ]; then
-                die "$destination already exists but is not a corpus this script
-       installed: it carries no valid $STAMP_NAME, or its payload is missing.
-       Nothing has been touched.  Re-run with --force to replace it, remove
-       it yourself, or point ZLIB_RS_SILESIA_DIR somewhere else."
+                die "$destination already exists but is not a complete corpus this
+       script installed: it carries no valid $STAMP_NAME, or its payload is
+       missing, or its contents are not the inventory named by
+       ZLIB_RS_SILESIA_MEMBERS.  Nothing has been touched.  Re-run with --force
+       to replace it, remove it yourself, or point ZLIB_RS_SILESIA_DIR somewhere
+       else.  --verify-only reports which of those it is."
             fi
             warn "replacing the existing, unstamped $destination (--force)"
         fi

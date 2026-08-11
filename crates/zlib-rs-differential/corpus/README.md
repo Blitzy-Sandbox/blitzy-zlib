@@ -248,11 +248,15 @@ responsible for the terms of every member they thereby obtain.** That is why not
 phrased as a licence grant, and why the corpus is confined to local throughput measurement
 and is never redistributed or shipped.
 
-The inventory is not merely documentation. `fetch_silesia.sh` enforces it: after extraction
-it compares the payload's file names against exactly that twelve-name list
-(`ZLIB_RS_SILESIA_MEMBERS`) and fails if anything is missing or anything extra is present, so
-an archive that is not this corpus is rejected rather than measured. Setting the variable to
-`-` skips the check and emits a warning.
+The inventory is not merely documentation. `fetch_silesia.sh` enforces it in all three places
+it forms an opinion about a directory: after extraction, so an archive that is not this corpus
+is rejected rather than installed; under `--verify-only`, so a destination provisioned by an
+earlier run is reported incomplete rather than blessed; and in the idempotent short-circuit
+that skips a fetch, so "there is nothing to do" cannot be said about a partial corpus. All
+three compare the payload's file names against exactly that twelve-name list
+(`ZLIB_RS_SILESIA_MEMBERS`) and fail if anything is missing or anything extra is present.
+One definition of complete, three callers. Setting the variable to `-` skips the check and
+emits a warning.
 
 ## Determinism is a requirement, not a preference
 

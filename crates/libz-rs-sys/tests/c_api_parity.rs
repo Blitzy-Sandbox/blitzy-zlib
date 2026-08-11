@@ -84,15 +84,18 @@
 //! (L87) and whose `mem_done` catches leaks, non-LIFO frees and rogue frees; this suite exercises
 //! the default path that a caller who supplies no hooks actually gets.
 
-use core::ffi::{c_int, c_uint, CStr};
-// `c_char` is reached only by the `gzFile` stages -- the `gzprintf` declaration below and the
-// `gzgets` call in `test_gzio` -- so the import carries the same gate they do. Imported
-// unconditionally it is an `unused_imports` warning in the supported
-// `--no-default-features --features libz-compat` configuration, and this workspace builds with
-// `-D warnings`, so the gate is what keeps that configuration compiling rather than a tidiness
-// preference -- which is how the feature matrix found it.
-#[cfg(feature = "gz")]
-use core::ffi::c_char;
+// `c_char` is imported UNCONDITIONALLY, and that is not a tidiness choice -- it is what makes
+// `--no-default-features --features libz-compat` compile. It once carried `#[cfg(feature = "gz")]`
+// on the theory that only the `gzFile` stages reach it, and that theory was wrong: the version
+// string handed to `deflateInit2_` and `inflateInit2_` is a `*const c_char`, and three of those
+// calls live in [`inflate_reset_keep_retains_the_window`], which is gated on nothing. With
+// `libz-compat` on and `gz` off the import configured out while its uses stayed, and the test
+// target failed to build with three `error[E0425]: cannot find type c_char in this scope`.
+//
+// There is no `unused_imports` risk to trade against, in any configuration: this whole file is
+// `#![cfg(feature = "libz-compat")]`, so it either compiles with those three ungated uses present
+// or it does not compile at all. A gate here can therefore only ever subtract.
+use core::ffi::{c_char, c_int, c_uint, CStr};
 use core::mem::size_of;
 use core::ptr::{self, addr_of_mut};
 

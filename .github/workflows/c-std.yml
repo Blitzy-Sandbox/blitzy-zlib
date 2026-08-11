@@ -2,6 +2,17 @@ name: C Standard
 
 # Compile with as many C standards as possible.
 # The worflow is setup to fail on any compilation warnings.
+#
+# THIS WORKFLOW IS THE HEADER-IMMUTABILITY GUARD, and that role became load-bearing
+# when the library was reimplemented in Rust.  zlib.h and zconf.h are the frozen
+# public contract (AAP 0.8.1 directive 2): the Rust facade must match them, and
+# rust.yml proves that half with a cbindgen-generated header diffed against
+# zlib.h.  The other half is that the headers THEMSELVES still compile everywhere
+# they always did, from c89 through gnu2x, and that is what runs here.  A port that
+# quietly edited a declaration to suit itself would be caught by one of the two.
+#
+# It stays C-only, and deliberately so -- nothing here needs cargo, names a Rust
+# target, or would tell you anything more if it did.  The C rows are the point.
 
 on:
   workflow_dispatch:

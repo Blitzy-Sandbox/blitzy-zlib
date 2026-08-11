@@ -1,4 +1,20 @@
 name: Configure
+
+# The autotools build of the C library, across the cross-compilation matrix below.
+# It is C-only on purpose and needs no Rust toolchain, which is itself one of the
+# things it checks: ./configure probes for cargo and, when there is none, records
+# an empty $(CARGO) and logs "Checking for cargo... No (Rust build targets will be
+# unavailable)" -- and the C build then proceeds exactly as it always has.  Every
+# green row here is evidence that adding the Rust workspace did not make a Rust
+# toolchain a requirement of the C build (AAP 0.4.1.6).
+#
+# The rust* Makefile targets are therefore not exercised here; they refuse with a
+# named remedy on these runners rather than half-running.  rust.yml owns them, and
+# its `dropin` job runs `make rust' on both an unconfigured and a ./configure'd
+# tree, because the two compose the shared-object link differently.
+#
+# The Rust library is built only for Tier-1 targets.  The cross-compiled rows in
+# this matrix have no Rust counterpart and are not expected to grow one.
 on: [push, pull_request]
 jobs:
   ci-configure:

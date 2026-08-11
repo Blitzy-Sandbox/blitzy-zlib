@@ -1,4 +1,14 @@
 name: OSS-Fuzz
+
+# CIFuzz against the C implementation, which is retained in this tree as the
+# differential oracle for the Rust port (AAP 0.8.2 ambiguity 3).  This workflow is
+# NOT superseded by the Rust port and must not be deleted in favour of it: the
+# cargo-fuzz targets in `.github/workflows/rust.yml` (job `fuzz`, five targets --
+# deflate, inflate, inflateBack, gz round-trip and checksums) fuzz the RUST
+# implementation.  Two implementations, two fuzzers, and they can disagree.
+#
+# The 300-second budget below is shared with that job deliberately, so the two
+# results are comparable rather than merely both present (AAP 0.8.4).
 on: [pull_request]
 jobs:
   Fuzzing:

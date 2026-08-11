@@ -754,6 +754,25 @@ mod tests {
     /// [`ADLER32_INITIAL_VALUE`] and update as each buffer of input is consumed
     /// (`deflate.c` L229, `inflate.c` L300-L305). Because a chunk boundary can fall
     /// anywhere, the reduction schedule must be invariant under re-chunking.
+    ///
+    /// Skipped under Miri, and the last member of its class to be: `generic.rs` and `combine.rs`
+    /// already skip their own whole-corpus folds there for the same reason. This is the heaviest of
+    /// them, because it is the only test in the file that calls the entry point once *per byte* --
+    /// the `chunks(1)` pass is 100 000 separate calls -- and the interpreter's cost for that
+    /// pattern grows with the square of the corpus: measured on an external clock at 1 s for 500
+    /// bytes and 86 s for 8 000, which extrapolates to hours at 100 000 and was observed reaching
+    /// 4.0 GB of interpreter memory before the process was killed. Skipping it there costs no
+    /// undefined-behaviour coverage: this module has no `unsafe`, no raw pointer and no
+    /// uninitialised memory for Miri to inspect, the only faults it could surface are integer
+    /// overflow and an out-of-bounds index, and both are reached by the cheap tests above, which
+    /// run in full. The chunk-boundary path itself is interpreted anyway, by the `deflate` and
+    /// `inflate` shards, which feed input buffer by buffer through this same entry point at the two
+    /// C lines cited above. Nothing is skipped under a normal `cargo test`, where all seven
+    /// chunkings run.
+    #[cfg_attr(
+        miri,
+        ignore = "folds a 100 000-byte corpus a byte at a time; numeric agreement, no UB coverage"
+    )]
     #[test]
     fn incremental_updates_agree_with_a_single_call() {
         let corpus = pattern_corpus(CORPUS_LEN);

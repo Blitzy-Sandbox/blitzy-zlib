@@ -2,6 +2,25 @@
                 ChangeLog file for zlib
 
 Changes in 1.3.2.1 (xx Feb 2026)
+- Reimplement the library in safe Rust, with the C API and ABI unchanged
+- Add a Cargo workspace at the repository root: zlib-rs, the algorithm core,
+  which carries #![forbid(unsafe_code)] and has no dependencies; libz-rs-sys,
+  the extern "C" facade that is the only crate permitted unsafe and builds
+  libz.so and libz.a; and zlib-rs-differential, a dev-only harness that
+  compiles the C sources as a test oracle
+- Keep the C implementation in the tree, unmodified, as that oracle; zlib.h,
+  zconf.h and zlib.map are unchanged and are consumed rather than edited
+- Compress to byte-identical output: the encoder reproduces the reference
+  heuristics rather than improving on them, and streams interoperate in both
+  directions
+- Add rust, rust-pc, rust-test, rust-symbols, rust-header, rust-msrv and
+  rust-clean targets to the Makefile, and detect cargo in ./configure; the C
+  build is unaffected and needs no Rust toolchain
+- Add a ZLIB_BUILD_RUST option to the CMake build, installing the same library
+  names, SONAME and symlink chain as the C build
+- Add .github/workflows/rust.yml, gating the port on build, test, format, lint,
+  MSRV, feature-matrix, differential, symbol-parity, header-conformance,
+  drop-in, Miri, sanitizer, fuzz, CMake and benchmark jobs
 - 
 
 Changes in 1.3.2 (17 Feb 2026)

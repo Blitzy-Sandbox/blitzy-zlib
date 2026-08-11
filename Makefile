@@ -21,6 +21,19 @@ distclean:
 # later addition under any of these names cannot reintroduce the same trap.
 .PHONY: all distclean rust rust-pc rust-test rust-symbols rust-header rust-msrv rust-clean
 
+# .NOTPARALLEL is REQUIRED here too, and for a reason make cannot see for itself.
+# Every rule below dispatches to a SEPARATE sub-make, and inside Makefile.in
+# rust-pc, rust-test and rust-symbols each depend on `rust' -- so `make -j8 rust
+# rust-pc' starts two sub-makes that both build `rust', concurrently, into the
+# same target/dropin, racing on every file they stage.  That overlap is invisible
+# to this make because it lives behind the recursion, and the observed result was
+# an exit 2, a Bus error, and a zlib.pc published with an empty Libs.private that
+# its own gate then approved.  This line makes the goals of THIS file run one
+# after another; each sub-make is still free to use -jN internally, where the
+# dependency graph is visible and correct.  Keep it in step with the recipe in
+# Makefile.in that regenerates this file.
+.NOTPARALLEL:
+
 rust:
 	$(MAKE) -f Makefile.in rust
 

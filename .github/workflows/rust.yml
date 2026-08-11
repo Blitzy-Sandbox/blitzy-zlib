@@ -139,20 +139,46 @@
 #                That is the other half of contract immutability: this file
 #                proves the Rust library still matches the header, c-std.yml
 #                proves the header itself still compiles everywhere.
-#   * cmake.yml  exercises the C library's CMake matrix.  It carries NO Rust
-#                job and names `ZLIB_BUILD_RUST` nowhere -- but the CMake Rust
-#                path is NOT ungated, and prose here said it was: the
-#                `cmake-rust` job in THIS file owns it, configuring with
-#                `-DZLIB_BUILD_RUST=ON`, building, running the CTest cases and
-#                checking the ZLIB::ZLIB / ZLIB::ZLIBSTATIC redirection and the
-#                installed layout.  cmake.yml stays C-only on purpose, so that
-#                the C build's own matrix cannot be perturbed by a Rust
-#                toolchain problem.
+#   * cmake.yml  exercises the CMake contract with BOTH backends.  Its C rows are
+#                the C library's; its four `rust: yes` rows configure with
+#                `-DZLIB_BUILD_RUST=ON` across gcc, clang, a no-shared build and
+#                macOS -- breadth, on single-config generators only, because
+#                CMakeLists refuses the Rust build under a multi-config one.  Every
+#                Rust-toolchain step there is guarded on `matrix.rust` and
+#                `fail-fast: false` was already set, so a Rust row cannot perturb a
+#                C row.  The `cmake-rust` job in THIS file is not superseded by
+#                them and is not redundant with them: it goes DEEP on one
+#                configuration -- installing, then compiling and RUNNING C
+#                consumers against the installation through pkg-config, the static
+#                archive and find_package, with an `ldd` assertion that the Rust
+#                artifact is the one bound, plus the ZLIB::ZLIB /
+#                ZLIB::ZLIBSTATIC redirection and the installed layout.
+#   * contribs.yml builds the out-of-scope contrib/ consumers against BOTH
+#                libraries: its original jobs against the C one, and its
+#                `ci-cmake-rust` job against a `-DZLIB_BUILD_RUST=ON`
+#                installation.  That second one is the strongest drop-in evidence
+#                in this repository and exists nowhere else, including here --
+#                blast, iostream3, minizip and puff are third-party code this
+#                port has never seen, written against zlib.h alone and consuming
+#                the installed package through `find_package(ZLIB CONFIG)`.
+#                Nothing in THIS file touches contrib/, and nothing edits it.
+#   * configure.yml, msys-cygwin.yml and others.yml stay C-only, which is itself
+#                evidence: ./configure degrades to an empty $(CARGO) when there is
+#                no cargo and the C build proceeds unchanged, so those green rows
+#                prove the Rust workspace added no requirement to the C build.
+#                They also mark the Rust Tier-1 boundary -- cross-compiled,
+#                MSYS2/Cygwin and exotic-OS rows have no Rust counterpart.
 #
 # Nothing in this file writes to zlib.h, zconf.h, zlib.map, any C translation
 # unit, anything under contrib/, or any of the three test drivers.  zlib.h and
 # zlib.map are CONSUMED -- as the header-diff target and as the linker version
-# script -- and never modified.  No job downloads a benchmark corpus: the Silesia
+# script -- and never modified.  Two steps are the stated exceptions and both
+# assert their way back: the `header` job's last step runs `make distclean`, which
+# REPLACES the tracked Makefile from Makefile.in's printf sequence and rewrites
+# zconf.h from zconf.h.in, and then requires `git status --porcelain` to be empty
+# -- the regeneration has to be byte-exact or the job fails; and the `dropin`
+# job's last step runs ./configure in a COPY of the tree under RUNNER_TEMP,
+# precisely so it does not run here.  No job downloads a benchmark corpus: the Silesia
 # tier of `bench` reads one a runner already has -- restore-only cache, and the
 # fetch script invoked only as `--verify-only` -- and every other job, benchmarks
 # included, runs on the committed minimal corpus.
@@ -2521,6 +2547,53 @@ jobs:
         fi
         echo "working tree clean: the contract headers are untouched"
 
+    - name: Run test cases (distclean regenerates the placeholder Makefile exactly)
+      # `make distclean' REPLACES the tracked, committed Makefile wholesale, from a
+      # printf sequence inside Makefile.in.  The two had drifted by one reworded
+      # comment paragraph, so distclean left a clean checkout with a modified
+      # tracked file -- 1589 bytes committed against 1430 emitted.  Nothing caught
+      # it because nothing ran distclean and then looked, which is what this step
+      # does.  It belongs in THIS job because the step above already establishes
+      # that the tree was clean beforehand, so a failure here can only be
+      # distclean's doing.
+      #
+      # The drift is not cosmetic: that file is the ONLY way the seven rust*
+      # targets are reachable in a post-distclean tree, and its .NOTPARALLEL line
+      # is what stops `make -jN' with two Rust goals from starting two sub-makes
+      # that race on target/dropin.  Losing either by drift is losing a
+      # guarantee, silently.
+      #
+      # Ordered last because it is destructive: distclean removes the build
+      # products the steps above produced.
+      run: |
+        set -eu
+        make distclean
+        git diff --exit-code -- Makefile || {
+          echo "::error::make distclean did not regenerate the committed Makefile"
+          echo "::error::byte for byte.  Regenerate the printf sequence in"
+          echo "::error::Makefile.in's distclean recipe from the committed file."
+          git diff -- Makefile
+          exit 1
+        }
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "::error::make distclean left the tree dirty"
+          git status --porcelain
+          exit 1
+        fi
+        grep -q '^\.NOTPARALLEL:$' Makefile || {
+          echo "::error::the regenerated Makefile has no .NOTPARALLEL line"
+          exit 1
+        }
+        for t in rust rust-pc rust-test rust-symbols rust-header rust-msrv rust-clean; do
+          grep -q "^$t:\$" Makefile || {
+            echo "::error::the regenerated Makefile has no $t rule, so that target"
+            echo "::error::is unreachable in a post-distclean tree"
+            exit 1
+          }
+        done
+        echo "distclean regenerated the Makefile byte for byte, with .NOTPARALLEL"
+        echo "and all seven rust* forwarding rules intact"
+
     - name: Upload build errors
       uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       if: failure()
@@ -2814,6 +2887,59 @@ jobs:
           exit 1
         fi
         echo "zlib.pc.in still advertises no private libraries, as the C build requires"
+
+    - name: Run test cases (the same chain gate on a CONFIGURED tree)
+      # WHY THIS EXISTS AS A SEPARATE STEP.  Everything above ran on an
+      # UNCONFIGURED tree, which is a real and supported path -- `make rust' needs
+      # no ./configure -- but it is only one of the two, and the two do not stage
+      # the same descriptor.  Makefile.in composes the shared-object link itself
+      # and records `required' on line 3 of soname.stage when it passes
+      # --version-script on that command line; when the script is ALREADY inside
+      # $(LDSHARED), which is exactly what ./configure writes, it has nothing to
+      # add and records `ldshared' instead.  dropin_chain.sh accepted only
+      # `required', so the project's own verifier rejected the project's own
+      # documented `./configure; make; make rust' path -- and this job passed
+      # anyway, because it never configured.  A gate that only ever sees one of
+      # two producers is how that stayed invisible, so both are exercised now.
+      #
+      # IN A COPY, NOT HERE.  ./configure overwrites the TRACKED Makefile and
+      # zconf.h in whatever directory it runs in, and the step above asserts this
+      # tree is clean.  The copy excludes target/ and .git so it is cheap and so
+      # cargo cannot be confused about which workspace it is in.
+      run: |
+        set -eu
+        ZVER=$(sed -n 's/^.*define ZLIB_VERSION "\(.*\)".*$/\1/p' zlib.h)
+        [ -n "$ZVER" ] || { echo "::error::no ZLIB_VERSION in zlib.h"; exit 1; }
+
+        T="$RUNNER_TEMP/configured-tree"
+        rm -rf "$T"
+        mkdir -p "$T"
+        tar -cf - --exclude=./target --exclude=./.git \
+                  --exclude=./benches/target --exclude=./fuzz/target . \
+          | tar -xf - -C "$T"
+
+        cd "$T"
+        ./configure
+        grep -E '^(LDSHARED|SHAREDLIBV|CARGO) *=' Makefile
+
+        make rust
+        MODE=$(sed -n 3p target/dropin/soname.stage)
+        echo "version-script mode recorded on the configured path: $MODE"
+        # Named rather than merely accepted: this path must record `ldshared',
+        # so if Makefile.in ever stops distinguishing the two the assertion
+        # below stops testing anything and this line says so.
+        [ "$MODE" = ldshared ] || {
+          echo "::error::expected soname.stage line 3 to be 'ldshared' on a"
+          echo "::error::configured tree, got '$MODE'.  Either ./configure no"
+          echo "::error::longer puts the version script in LDSHARED, or"
+          echo "::error::Makefile.in no longer records that it did."
+          exit 1
+        }
+
+        sh .github/scripts/dropin_chain.sh verify target/dropin \
+          --expect-version "$ZVER"
+        sh .github/scripts/dropin_chain.sh self-test target/dropin
+        echo "the configured path stages a chain this repository's own verifier accepts"
 
     - name: Upload build errors
       uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -4245,15 +4371,21 @@ jobs:
       # `--verify-only` and ONLY `--verify-only`.  The script's own words for that
       # mode are "fetches nothing and writes nothing": it requires a digest even
       # here -- "verifying against nothing is not verification" -- and it checks that
-      # the directory carries a well-formed stamp, that the payload is present, and
-      # that the stamp records the URL and archive digest expected NOW.  Stated
-      # precisely because the script states it precisely: the archive is not retained
-      # after a fetch, so this validates the recorded provenance of the fetch rather
-      # than re-hashing each member.  Per-member digests are checked at FETCH time,
-      # by the human who fetched, and only when they supplied a manifest through
-      # ZLIB_RS_SILESIA_MEMBER_SHA256.  What closes the remaining gap here is not
-      # this step but the next one: the benches, armed, require the complete pinned
-      # twelve by exact name and refuse anything less.
+      # the directory carries a well-formed stamp, that its contents are the COMPLETE
+      # pinned inventory named by ZLIB_RS_SILESIA_MEMBERS, and that the stamp records
+      # the URL and archive digest expected NOW.  The inventory half of that used to
+      # be missing -- the mode checked only that SOMETHING other than the stamp was
+      # there, so eleven of the twelve members passed while --help promised a non-zero
+      # exit for an incomplete destination -- and it is the same comparison a fetch
+      # applies, reading the directory with find and basename only, so the mode still
+      # writes nothing and reaches no network.  Stated precisely because the script
+      # states it precisely: the archive is not retained after a fetch, so this
+      # validates the recorded provenance and the inventory rather than re-hashing
+      # each member.  Per-member digests are checked at FETCH time, by the human who
+      # fetched, and only when they supplied a manifest through
+      # ZLIB_RS_SILESIA_MEMBER_SHA256.  The next step is an INDEPENDENT check of the
+      # same fact rather than the only one: the benches, armed, require the complete
+      # pinned twelve by exact name and refuse anything less.
       #
       # A cache miss is a provisioning failure to report, never a download to perform.
       if: steps.acceptance.outputs.armed == 'yes'

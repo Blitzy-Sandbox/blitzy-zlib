@@ -1,5 +1,15 @@
 name: anyVM-OSes
 
+# The C library on the exotic operating systems below, each inside its own VM.
+# These jobs REMAIN C-ONLY, and that is a decision rather than an omission: the
+# Rust library is built for Tier-1 targets, and DragonflyBSD, NetBSD, OpenBSD,
+# Solaris and the rest are not among them.  Installing a Rust toolchain in these
+# VMs would test rustup's platform support, not this port (AAP 0.4.1.6).
+#
+# What they do contribute to the port is the C oracle's portability: the
+# implementation these rows build is the same one crates/zlib-rs-differential
+# compiles as the differential baseline, so a C build that broke on one of these
+# platforms would be a problem for the comparison as well as for the C library.
 on: [push, pull_request]
 
 jobs:

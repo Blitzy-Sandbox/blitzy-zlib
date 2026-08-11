@@ -1,5 +1,16 @@
 name: mingw/cygwin
 
+# The C library under the Windows Unix-alike toolchains.  C-only, and this is the
+# Rust Tier-1 boundary in practice: the Rust library targets Tier 1, which on
+# Windows means the MSVC and GNU host triples rustup ships, not MSYS2's mingw32 /
+# mingw64 / ucrt64 / clang64 / clangarm64 environments or Cygwin.  No row here has
+# a Rust counterpart and none is expected to grow one (AAP 0.4.1.6).
+#
+# Worth recording for whoever later exercises a Windows Rust target: the export
+# surface is declared to the linker by zlib.map through --version-script on ELF
+# platforms, and win32/zlib.def is its MSVC-side analogue.  AAP 0.2.2.3 puts that
+# file out of scope, so it has not been touched -- but it is what would need to
+# agree with the Rust facade's exports there.
 on: [push, pull_request]
 
 jobs:

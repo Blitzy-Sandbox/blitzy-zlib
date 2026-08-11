@@ -62,3 +62,156 @@ jobs:
     - name: Run test cases
       run: ctest -C Release --output-on-failure --max-width 120
       working-directory: ../build
+
+  # ---------------------------------------------------------------------------
+  # The same consumers, built against the RUST library instead of the C one.
+  #
+  # This is the strongest drop-in evidence available anywhere in this repository,
+  # and it is the only place it exists.  Everything in rust.yml is this project
+  # testing its own port; contrib/ is code this port has never seen, is out of
+  # scope for the port and is not modified by it, written against zlib.h alone and
+  # consuming the installed library through `find_package(ZLIB CONFIG)` exactly as
+  # a third party would.  If the exported CMake targets, the installed headers, the
+  # SONAME, the symlink chain or the symbol set were wrong in any way that matters
+  # to a real consumer, these builds are where it shows -- without a line of this
+  # project's own test code being involved.
+  #
+  # WHAT IS AND IS NOT SHARED WITH THE JOB ABOVE.  The install step is the only
+  # difference: `-DZLIB_BUILD_RUST=ON` makes CMake build the Cargo workspace and
+  # install the Rust libz.so/libz.a, its symlink chain and its zlib.pc under the
+  # same names and the same layout.  The consumer configure, build and ctest lines
+  # are byte-identical to the C matrix's, on purpose: a consumer that needed
+  # different flags against the Rust library would not be a drop-in replacement,
+  # so any divergence here would itself be the finding.
+  #
+  # NOTHING UNDER contrib/ IS EDITED, by this job or by the port.  AAP 0.2.2.1
+  # puts all nineteen entries out of scope; they are built, never changed.
+  #
+  # ADA IS DELIBERATELY ABSENT.  The C matrix covers it; it needs gnat, and its
+  # binding declares the interface itself rather than consuming ZLIB::ZLIB, so it
+  # would exercise the toolchain rather than the installed package.  The four
+  # covered here -- blast, iostream3, minizip, puff -- are the ones that consume
+  # the exported targets.
+  # ---------------------------------------------------------------------------
+  ci-cmake-rust:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu BLAST against Rust libz
+            os: ubuntu-latest
+            src_dir: contrib/blast
+
+          - name: Ubuntu IOSTREAM against Rust libz
+            os: ubuntu-latest
+            src_dir: contrib/iostream3
+
+          - name: Ubuntu MINIZIP against Rust libz
+            os: ubuntu-latest
+            src_dir: contrib/minizip
+
+          - name: Ubuntu PUFF against Rust libz
+            os: ubuntu-latest
+            src_dir: contrib/puff
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install packages
+      run: |
+        sudo apt install libbz2-dev
+
+    - name: Install Rust toolchain
+      run: rustup toolchain install stable --profile minimal
+
+    - name: Install zlib (Rust implementation)
+      # INSTALLED TO AN EXPLICIT PREFIX, not over the system one as the C jobs do,
+      # and that difference is deliberate.  Both implementations declare SONAME
+      # libz.so.1 and install as libz.so, so a consumer that fell back to the
+      # system zlib would link, run, pass every test below and have exercised
+      # nothing -- and nothing in its output would say so.  A prefix this job owns,
+      # named to the consumer through CMAKE_PREFIX_PATH, makes the binding
+      # decidable, and the two assertions here and the `ldd` one further down are
+      # what decide it.
+      run: |
+        set -eu
+        PREFIX="$GITHUB_WORKSPACE/../zlib-rust-prefix"
+        cmake -S . -B ../build-zlib \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DZLIB_BUILD_RUST=ON \
+          -DCMAKE_INSTALL_PREFIX="$PREFIX"
+        cmake --build ../build-zlib --config Release --parallel 2
+        cmake --install ../build-zlib
+
+        echo "PREFIX=$(cd "$PREFIX" && pwd)" >> "$GITHUB_ENV"
+
+        echo "== installed tree =="
+        find "$PREFIX" -maxdepth 3 \( -type f -o -type l \) | sort
+
+        # Only the Rust build publishes a Libs.private key -- a Rust staticlib
+        # needs the Rust standard library's own dependencies beside it, a C libz.a
+        # needs none -- so its presence identifies the implementation without
+        # parsing a version string.
+        PC="$PREFIX/lib/pkgconfig/zlib.pc"
+        test -f "$PC" || { echo "::error::no zlib.pc at $PC"; exit 1; }
+        cat "$PC"
+        grep -q '^Libs\.private' "$PC" || {
+          echo "::error::the installed zlib.pc carries no Libs.private key, so this"
+          echo "::error::is the C descriptor: the Rust install did not take effect."
+          exit 1
+        }
+
+        # And the symlink chain, because cargo emits only libz.so while the SONAME
+        # is libz.so.1: without libz.so.1 present the loader searches for that name,
+        # does not find it, and binds the system library instead.
+        for name in libz.so libz.so.1; do
+          test -L "$PREFIX/lib/$name" \
+            || { echo "::error::$PREFIX/lib/$name is not a symlink"; exit 1; }
+        done
+        readelf -d "$(readlink -f "$PREFIX/lib/libz.so")" | grep -i soname
+
+    - name: Generate project files
+      run: cmake -S ${{ matrix.src_dir }} -B ../build ${{ matrix.cmake-args }} -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=${{ env.PREFIX }}
+
+    - name: Compile source code
+      run: cmake --build ../build --config Release --parallel 2
+
+    - name: Run test cases
+      run: ctest -C Release --output-on-failure --max-width 120
+      working-directory: ../build
+
+    - name: Run test cases (prove the consumers bound the Rust library)
+      # The assertion that makes the run above mean something.  ctest passing tells
+      # you the consumer worked; only this tells you WHICH library it worked
+      # against.  Every dynamically linked executable the consumer built must
+      # resolve libz.so.1 inside the prefix installed above, and none may resolve
+      # it anywhere else.  A consumer with no dynamic libz at all (a purely static
+      # one) is fine and is reported rather than failed -- what is not fine is one
+      # bound to /lib/x86_64-linux-gnu/libz.so.1.
+      run: |
+        set -eu
+        found=0
+        outside=0
+        for f in $(find ../build -maxdepth 3 -type f -perm -u+x); do
+          file "$f" | grep -q 'ELF .* executable' || continue
+          line=$(ldd "$f" 2>/dev/null | grep -F 'libz.so' || true)
+          [ -n "$line" ] || continue
+          found=$((found + 1))
+          echo "$f -> $line"
+          case "$line" in
+            *"$PREFIX"*) ;;
+            *) echo "::error::$f did not bind the installed Rust libz"
+               outside=$((outside + 1)) ;;
+          esac
+        done
+        [ "$outside" -eq 0 ] || exit 1
+        if [ "$found" -eq 0 ]; then
+          echo "no dynamically linked consumer executable references libz;"
+          echo "this consumer links statically, which ctest above exercised."
+        else
+          echo "$found consumer executable(s) bound the installed Rust libz"
+        fi
