@@ -15,6 +15,17 @@ name: Configure
 #
 # The Rust library is built only for Tier-1 targets.  The cross-compiled rows in
 # this matrix have no Rust counterpart and are not expected to grow one.
+#
+# None of that retires this workflow.  The C sources stay in the tree unmodified
+# and remain the differential oracle the memory-safe Rust port is checked
+# against, so a green row here is not legacy upkeep: it is the evidence that the
+# oracle itself still configures, builds and passes `make test' on that platform
+# -- test/example.c and test/minigzip.c, run through $QEMU_RUN on the emulated
+# rows.  The 13 rows below are that coverage in full: native Ubuntu, the
+# out-of-source variant, seven QEMU cross-compiled targets, four macOS
+# compilers.  Rows may be added; none may be removed or weakened, because
+# dropping one narrows the baseline the byte-identity and interoperability
+# comparisons in `.github/workflows/rust.yml` are run against (AAP 0.2.2.4).
 on: [push, pull_request]
 jobs:
   ci-configure:
@@ -37,6 +48,7 @@ jobs:
             build-dir: ../build
             src-dir: ../zlib
 
+          # Cross-compiled C oracle rows -- never Rust-built (Tier-1 only)
           - name: Ubuntu GCC ARM SF
             os: ubuntu-latest
             compiler: arm-linux-gnueabi-gcc

@@ -11,8 +11,22 @@ name: C Standard
 # they always did, from c89 through gnu2x, and that is what runs here.  A port that
 # quietly edited a declaration to suit itself would be caught by one of the two.
 #
+# That companion is `.github/workflows/rust.yml`, which gates the EXPORTS as well
+# as the signatures: an `nm` symbol-parity diff against the C library's 111-symbol
+# export baseline.  Signatures there, exports there, and the header's portability
+# across every standard here -- and nothing else in this repository does the third.
+#
 # It stays C-only, and deliberately so -- nothing here needs cargo, names a Rust
 # target, or would tell you anything more if it did.  The C rows are the point.
+# What they build is the C reference implementation, which this tree retains as the
+# differential oracle the Rust port is measured against (AAP 0.8.2 ambiguity 3), so
+# they go on earning their place for a second reason: an oracle that stopped
+# building would take the byte-identity comparison down with it.
+#
+# CONSEQUENTLY the two matrices below, their `exclude:` lists and their compiler
+# flags MUST NOT be weakened or reduced (AAP 0.4.1.6).  Dropping a standard, an
+# architecture, a builder, `-Werror` or `/WX` would not make this workflow cheaper
+# -- it would make it stop being the guard, and nothing else here would notice.
 
 on:
   workflow_dispatch:
@@ -21,6 +35,7 @@ on:
 
 jobs:
 
+  # The GCC and Clang half of the guard: eleven C standards x both builders.
   main:
     name: ${{ matrix.os.name }} ${{ matrix.compiler }} ${{ matrix.arch.name }} ${{ matrix.std.name }}  ${{ matrix.builder }}
     runs-on: ${{ matrix.os.value }}
@@ -189,6 +204,7 @@ jobs:
       run: ctest ./build2 -C Release --output-on-failure --max-width 120
 
 
+  # The MSVC half of the guard: the /std: sweep, with warnings fatal under /WX.
   msvc:
     name: ${{ matrix.os.name }} ${{ matrix.compiler }} ${{ matrix.arch.name }} ${{ matrix.std.name }}  ${{ matrix.builder }}
     runs-on: ${{ matrix.os.value }}

@@ -53,9 +53,11 @@ In the shipped library, every occurrence is under crates/libz-rs-sys/src/ --
 1,153 of them across nine files when this was last counted, none anywhere else.
 Re-derive the numbers rather than trusting them:
 
-    grep -rn --include='*.rs' -E 'unsafe *(\{|fn|extern|impl)' crates fuzz benches  crates/zlib-rs, which is
-the whole of the algorithm, carries #![forbid(unsafe_code)] and therefore has
-zero, checked by the compiler on every build rather than by grep.
+    grep -rn --include='*.rs' -E 'unsafe *(\{|fn|extern|impl)' crates fuzz benches
+
+crates/zlib-rs, which is the whole of the algorithm, carries
+#![forbid(unsafe_code)] and therefore has zero, checked by the compiler on every
+build rather than by grep.
 
 Outside the shipped library, three dev-only places have unsafe, and each is
 unavoidable rather than tolerated.  crates/zlib-rs-differential/src/oracle.rs

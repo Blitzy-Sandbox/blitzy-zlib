@@ -2783,6 +2783,89 @@ fn exhaustive_configuration_shards_cover_every_level() {
 /// product nor are divided by it, since an uneven division is where an off-by-one in the modulo
 /// arithmetic would surface.
 #[test]
+fn cell_shards_partition_the_product() {
+    for count in [1_usize, 2, 3, 4, 7, 8, 16, 97] {
+        let product = 1_000_usize;
+        let selections = (0..product).map(|ordinal| {
+            (1..=count)
+                .filter(|&index| Shard { index, count }.selects(ordinal))
+                .count()
+        });
+        let wrong = selections.filter(|&hits| hits != 1).count();
+        assert!(
+            wrong == 0,
+            "with {count} shards, {wrong} of {product} cell ordinals were selected by a number of \
+             shards other than exactly one; the shards must partition the product"
+        );
+    }
+
+    assert!(
+        Shard::WHOLE.is_whole() && Shard::WHOLE.selects(0) && Shard::WHOLE.selects(12_345),
+        "the unsharded case must select every cell"
+    );
+
+    // No aliasing against the enumeration's innermost dimension. The sweep walks the ten fixtures
+    // innermost, so `ordinal % 10` is the fixture index; a slice that never selects some of those
+    // residues is a biased sample of the product, which is what a plain `ordinal % count` produced
+    // for every even count before [`SHARD_MIX`] was introduced.
+    let count = 64;
+    let product = 100_000_usize;
+    let fixtures = 10_usize;
+    let mut missing = Vec::new();
+    for residue in 0..fixtures {
+        let hits = (0..product)
+            .filter(|&ordinal| Shard { index: 1, count }.selects(ordinal))
+            .filter(|&ordinal| ordinal % fixtures == residue)
+            .count();
+        if hits == 0 {
+            missing.push(residue);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "slice 1 of {count} selected no cell at all for fixture index(es) {missing:?}, so a partial \
+         run of the slices would be a biased sample of the product rather than a smaller one"
+    );
+
+    // And roughly even shares, so that splitting a product across jobs actually splits the work.
+    let expected = product / count;
+    let worst = (1..=count)
+        .map(|index| {
+            (0..product)
+                .filter(|&ordinal| Shard { index, count }.selects(ordinal))
+                .count()
+        })
+        .map(|share| share.abs_diff(expected))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        worst * 5 <= expected,
+        "the most lopsided of {count} slices differs from the even share of {expected} cells by \
+         {worst}, more than 20%; the slices are meant to divide the work, not merely the product"
+    );
+}
+
+/// The full chunking set, including the one-byte output window, over every fixture.
+///
+/// The configuration set here spans every level, all three container formats, all five strategies
+/// and the extreme `memLevel`s -- [`representative_configurations`] -- because it is the *chunking*
+/// dimension this sweep exists to enumerate exhaustively, and the product of both full sets is what
+/// the module docs record as unaffordable.
+///
+/// This sweep is also where the cells the *default* sweep holds back are enumerated: it raises the
+/// tiny-window fixture limit from [`DEFAULT_TINY_WINDOW_LIMIT`] to
+/// [`EXHAUSTIVE_TINY_WINDOW_LIMIT`], which brings `random.bin` and `repetitive.bin` under every
+/// chunking including the one-byte windows.
+///
+/// # The one constraint, and how to lift it
+///
+/// A tiny window costs one `deflate` call per byte through it, and `window_boundary.bin` is 66,560
+/// incompressible bytes, so a one-byte window over it is some 66,600 calls per side for a single
+/// cell. It is therefore the one fixture [`EXHAUSTIVE_TINY_WINDOW_LIMIT`] holds back from the four
+/// tiniest chunkings; every larger window still covers it.
+/// `ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE=full` raises the limit to `usize::MAX` and pays for the
+/// unabridged run.
+#[test]
 #[ignore = "the full chunking sweep; armed by ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE, run by the \
               differential-exhaustive CI job"]
 fn exhaustive_chunking_matrix() {

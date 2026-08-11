@@ -1,15 +1,21 @@
 name: anyVM-OSes
 
-# The C library on the exotic operating systems below, each inside its own VM.
-# These jobs REMAIN C-ONLY, and that is a decision rather than an omission: the
-# Rust library is built for Tier-1 targets, and DragonflyBSD, NetBSD, OpenBSD,
-# Solaris and the rest are not among them.  Installing a Rust toolchain in these
-# VMs would test rustup's platform support, not this port (AAP 0.4.1.6).
+# The C reference implementation on the exotic operating systems below, each
+# inside its own `vmactions` VM: DragonflyBSD, FreeBSD, NetBSD, OmniOS, OpenBSD
+# and Solaris.  These jobs REMAIN C-ONLY, and that is a decision rather than an
+# omission: the Rust library is built for Tier-1 targets and none of those six
+# is among them, so no Rust build is attempted here.  Installing a Rust
+# toolchain in these VMs would test that toolchain's own platform support, not
+# this port.  The Rust workspace is exercised by `.github/workflows/rust.yml`,
+# which is limited to Tier-1 platforms (AAP 0.2.2.3, 0.4.1.6).
 #
 # What they do contribute to the port is the C oracle's portability: the
-# implementation these rows build is the same one crates/zlib-rs-differential
-# compiles as the differential baseline, so a C build that broke on one of these
-# platforms would be a problem for the comparison as well as for the C library.
+# implementation these rows build is retained unmodified and is the same one
+# crates/zlib-rs-differential compiles as the differential baseline, so a C
+# build that broke on one of these platforms would be a problem for the
+# comparison as well as for the C library.  This matrix is therefore the
+# oracle's exotic-OS coverage and must not be reduced -- a row dropped here is
+# coverage the comparison loses (AAP 0.2.2.4).
 on: [push, pull_request]
 
 jobs:

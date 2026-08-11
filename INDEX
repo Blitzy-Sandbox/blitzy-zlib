@@ -40,6 +40,7 @@ old/            makefiles for various architectures and zlib documentation
                 files that have not yet been updated for zlib 1.2.x
 os400/          makefiles for OS/400
 qnx/            makefiles for QNX
+rust/           developer guide for the Rust implementation (rust/README.md)
 watcom/         makefiles for OpenWatcom
 win32/          makefiles for Windows
 
@@ -86,9 +87,11 @@ crates/zlib-rs-differential/    dev-only harness that diffs the port against the
 benches/                        dev-only criterion suites, their own excluded package and lock;
                                 they measure against the harness above by path dependency
 fuzz/                           dev-only cargo fuzz targets, its own workspace
-See README for the build commands and the Cargo feature matrix, Makefile.in for the
-seven targets rust, rust-pc, rust-test, rust-symbols, rust-header, rust-msrv and
-rust-clean, and .github/workflows/rust.yml for the eighteen jobs that gate them.
+rust/README.md                  the developer guide for all of the above
+See README for the build commands and the Cargo feature matrix, rust/README.md for
+the developer guide, Makefile.in for the seven targets rust, rust-pc, rust-test,
+rust-symbols, rust-header, rust-msrv and rust-clean, and
+.github/workflows/rust.yml for the eighteen jobs that gate them.
 .github/scripts/ holds the gate programs those jobs invoke rather than inline:
 bench_gate.py with its self-test and fixture, dropin_chain.sh which verifies the
 staged symlink chain, and whitespace_gate.sh

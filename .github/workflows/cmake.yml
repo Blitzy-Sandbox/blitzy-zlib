@@ -18,8 +18,31 @@ name: CMake
 # from CMake 3.20 while IMPORTED_LOCATION takes none at any version -- so Debug
 # and Release would share one cargo output directory and one staged library,
 # whichever was built last winning silently.  That rules out the MSVC rows, whose
-# `-A Win32`/`-A x64`/`-A ARM64` select the Visual Studio generator.  Windows GCC
-# already uses Ninja and is single-config, so it carries one.
+# `-A Win32`/`-A x64`/`-A ARM64` select the Visual Studio generator.
+#
+# WHY NO WINDOWS ROW EVEN SO.  `Windows GCC` is single-config already -- it uses
+# Ninja -- so the paragraph above does not exclude it, and two other things do.
+# Its compiler is MinGW, while `rustup toolchain install stable` on that runner
+# installs the MSVC host toolchain, and CMakeLists names cargo's archive with the
+# platform's own conventions: that spelling is libz.a for a GNU toolchain and
+# z.lib for an MSVC one, so the file CMake would look for is not the file cargo
+# would write.  Staging a Windows drop-in is not wired either -- build.rs emits
+# neither a soname nor a version script for PE/COFF, and win32/zlib.def, the PE
+# analogue of zlib.map, is out of scope for this port.  So Windows is covered
+# where that coverage is real: rust.yml's `build-test` matrix compiles the
+# workspace and runs its tests on `windows-latest`, which is what would catch an
+# LLP64 regression in the `uLong` mapping.  A row here would go red on every
+# push and would establish nothing that job does not.
+#
+# WHY THE macOS ROW IS STATIC-ONLY.  The Rust SHARED library is relinked through
+# zlib.map with `-soname`, so CMakeLists refuses that combination on not-UNIX,
+# Apple, AIX and SunOS -- the same platform set the C shared target hands
+# zlib.map to, so the two agree by construction.  The static archive needs none
+# of it: cargo emits a complete one wherever it runs, and CMakeLists copies it
+# under the platform's own archive name.  `-DZLIB_BUILD_SHARED=OFF` on that row
+# is therefore not a workaround but the supported mode, and configuring it is the
+# point -- this is the only place in the repository that holds that support claim
+# to an actual build, on the one platform whose shared half is refused.
 #
 # `-DZLIB_PREFIX=ON` is likewise refused with the Rust build and appears in no row
 # here.
@@ -164,12 +187,15 @@ jobs:
             pkgtgt: package package_source
             cmake-args: -DZLIB_BUILD_RUST=ON -DMINIZIP_ENABLE_BZIP2=ON
 
+          # -DZLIB_BUILD_SHARED=OFF is required on this row rather than chosen:
+          # with it ON, CMakeLists stops at configure time on Apple, because the
+          # Rust shared library is relinked through zlib.map.  See the header.
           - name: macOS Clang Rust
             os: macos-latest
             compiler: clang
             rust: yes
             pkgtgt: package
-            cmake-args: -DZLIB_BUILD_RUST=ON -DMINIZIP_ENABLE_BZIP2=ON
+            cmake-args: -DZLIB_BUILD_RUST=ON -DZLIB_BUILD_SHARED=OFF -DMINIZIP_ENABLE_BZIP2=ON
 
     steps:
     - name: Checkout repository
@@ -189,8 +215,17 @@ jobs:
       # Only the rust: yes rows.  A C row must not acquire a new requirement from
       # this file -- that is the whole reason the Rust build is opt-in in
       # CMakeLists too, where nothing is probed unless ZLIB_BUILD_RUST is ON.
+      #
+      # The two rustup components are named even though neither gate runs in this
+      # workflow, because rust-toolchain.toml asks for them.  Omitting them does
+      # not skip the download, it defers it to the first in-tree cargo invocation
+      # -- which is the one CMake makes inside a custom command during `Compile
+      # source code', where a failed component fetch reads as a build failure
+      # instead of a provisioning one.  This spelling is the one that
+      # rust-toolchain.toml names as the command its `profile` and `components`
+      # are equivalent to.
       if: ${{ matrix.rust == 'yes' }}
-      run: rustup toolchain install stable --profile minimal
+      run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
     - name: Generate project files
       run: cmake -S . -B ../build ${{ matrix.cmake-args }} -D CMAKE_BUILD_TYPE=${{ matrix.build-config || 'Release' }} -DZLIB_BUILD_MINIZIP=ON
       env:

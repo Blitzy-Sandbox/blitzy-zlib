@@ -9,6 +9,16 @@ name: OSS-Fuzz
 #
 # The 300-second budget below is shared with that job deliberately, so the two
 # results are comparable rather than merely both present (AAP 0.8.4).
+#
+# Those five targets, by the exact names that are the CI-visible contract:
+# `fuzz_deflate`, `fuzz_inflate`, `fuzz_inflate_back`, `fuzz_gz_roundtrip` and
+# `fuzz_checksum`.  BOTH SURFACES ARE REQUIRED AND NEITHER REPLACES THE OTHER --
+# this file covers the C oracle, that job covers the Rust port.  The budget is
+# matched there as `-max_total_time=300` per target, so CHANGING IT HERE MEANS
+# CHANGING IT THERE TOO.
+#
+# PR-only ON PURPOSE -- CIFuzz derives the fuzzers to build and run from the
+# pull-request diff, so broader triggers would leave it nothing to work from.
 on: [pull_request]
 jobs:
   Fuzzing:
@@ -24,6 +34,7 @@ jobs:
       uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@master
       with:
         oss-fuzz-project-name: 'zlib'
+        # THE BUDGET ANCHOR -- rust.yml's `fuzz` job matches this per target.
         fuzz-seconds: 300
         dry-run: false
 

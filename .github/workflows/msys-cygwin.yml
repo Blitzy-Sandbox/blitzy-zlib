@@ -1,16 +1,21 @@
 name: mingw/cygwin
 
-# The C library under the Windows Unix-alike toolchains.  C-only, and this is the
-# Rust Tier-1 boundary in practice: the Rust library targets Tier 1, which on
-# Windows means the MSVC and GNU host triples rustup ships, not MSYS2's mingw32 /
-# mingw64 / ucrt64 / clang64 / clangarm64 environments or Cygwin.  No row here has
-# a Rust counterpart and none is expected to grow one (AAP 0.4.1.6).
+# The C reference implementation under the Windows Unix-alike toolchains.  C-only,
+# and this is the Rust Tier-1 boundary in practice: on Windows, Tier 1 means the
+# MSVC and GNU host triples the Rust project ships, which MSYS2's mingw32,
+# mingw64, ucrt64, clang64 and clangarm64 environments and Cygwin do not all
+# correspond to.  No row here has a Rust counterpart and none is expected to grow
+# one -- the CMake option that would select the Rust library is off by default,
+# and its shared path needs an ELF linker regardless.
+# `.github/workflows/rust.yml` exercises the Rust workspace; nothing Rust is
+# built, installed or linked here (AAP 0.4.1.6).
 #
-# Worth recording for whoever later exercises a Windows Rust target: the export
-# surface is declared to the linker by zlib.map through --version-script on ELF
-# platforms, and win32/zlib.def is its MSVC-side analogue.  AAP 0.2.2.3 puts that
-# file out of scope, so it has not been touched -- but it is what would need to
-# agree with the Rust facade's exports there.
+# What these rows contribute to the port is the C oracle's portability: the
+# implementation they build is retained UNMODIFIED as the differential baseline
+# crates/zlib-rs-differential compiles against, so a break here is a problem for
+# that comparison as well as for the C library (AAP 0.2.2.4).  For a later Windows
+# Rust target, win32/zlib.def is the MSVC-side analogue of the zlib.map version
+# script, out of scope under the same exclusion and untouched (AAP 0.2.2.3).
 on: [push, pull_request]
 
 jobs:

@@ -1,4 +1,46 @@
 name: contribs
+# =============================================================================
+# WHY THIS FILE MATTERS TO THE RUST PORT, AND WHY IT IS THE ONLY PLACE THIS
+# PARTICULAR EVIDENCE EXISTS.
+#
+# contrib/ IS OUT OF SCOPE FOR THE RUST PORT -- all nineteen entries of it -- and
+# no file under it is modified by this workflow or by the port: not a source file,
+# not a CMakeLists.txt, not a README.  That exclusion is precisely what gives this
+# file its value.  Everything in .github/workflows/rust.yml is this project
+# testing its own port against its own oracle with its own test code.  The code
+# built here is third-party code the port has never seen: it is written against
+# zlib.h, discovers the installed package with find_package(ZLIB CONFIG) and links
+# libz exactly as any other dependant would -- the job below records which
+# consumer does which -- and its only contract with this repository is the
+# published API and ABI.  So if that contract were broken, in the exported CMake
+# targets, the installed headers, the SONAME, the symlink chain or the symbol
+# surface, this is where it surfaces, with none of this project's own test code
+# involved.  Should a consumer ever fail here, the defect is in the library and
+# the fix belongs in the library: patching contrib/ would delete the evidence
+# rather than the fault.
+#
+# TWO JOBS, ONE STEP OF DIFFERENCE.  `ci-cmake' installs the C library and is the
+# baseline -- it is the differential oracle the port is measured against, and its
+# six rows predate the port and are untouched by it.  `ci-cmake-rust' adds
+# -DZLIB_BUILD_RUST=ON to the same `Install zlib' step, which builds the Cargo
+# workspace and installs the memory-safe Rust libz system-wide in its place: the
+# versioned real file libz.so.<VER>, with libz.so and the libz.so.1 its SONAME
+# names beside it as links onto it, plus libz.a, the CMake package and zlib.pc --
+# all under the names the C build publishes, because the C names are what an
+# already-linked consumer resolves.  The three steps that then build the
+# consumer -- generate, compile, ctest -- are byte-identical between the jobs, and
+# deliberately so: a consumer needing different flags against the Rust library
+# would not be a drop-in replacement, so a divergence there would itself be the
+# finding.  All the Rust job adds around them is two assertions, because an
+# install of a library whose SONAME the distribution already publishes can
+# succeed, be ignored, and leave every test below green; see those steps.
+#
+# WHAT IS NOT HERE.  The port's own gates -- the differential matrix, symbol
+# parity against the 111-symbol baseline, the cbindgen header diff, Miri,
+# AddressSanitizer, cargo-fuzz and the criterion benchmarks -- all live in
+# .github/workflows/rust.yml.  This file supplies the one thing that file cannot:
+# an outside witness.
+# =============================================================================
 on: [push, pull_request]
 jobs:
   ci-cmake:
@@ -63,36 +105,44 @@ jobs:
       run: ctest -C Release --output-on-failure --max-width 120
       working-directory: ../build
 
-  # ---------------------------------------------------------------------------
-  # The same consumers, built against the RUST library instead of the C one.
+  # ===========================================================================
+  # THE SAME CONSUMERS, BUILT AGAINST THE RUST LIBRARY.
   #
-  # This is the strongest drop-in evidence available anywhere in this repository,
-  # and it is the only place it exists.  Everything in rust.yml is this project
-  # testing its own port; contrib/ is code this port has never seen, is out of
-  # scope for the port and is not modified by it, written against zlib.h alone and
-  # consuming the installed library through `find_package(ZLIB CONFIG)` exactly as
-  # a third party would.  If the exported CMake targets, the installed headers, the
-  # SONAME, the symlink chain or the symbol set were wrong in any way that matters
-  # to a real consumer, these builds are where it shows -- without a line of this
-  # project's own test code being involved.
+  # One row per consumer this workflow covers, and all five of them, because each
+  # asks a different question of the installed package:
   #
-  # WHAT IS AND IS NOT SHARED WITH THE JOB ABOVE.  The install step is the only
-  # difference: `-DZLIB_BUILD_RUST=ON` makes CMake build the Cargo workspace and
-  # install the Rust libz.so/libz.a, its symlink chain and its zlib.pc under the
-  # same names and the same layout.  The consumer configure, build and ctest lines
-  # are byte-identical to the C matrix's, on purpose: a consumer that needed
-  # different flags against the Rust library would not be a drop-in replacement,
-  # so any divergence here would itself be the finding.
+  #   ada        an Ada binding.  It links both ZLIB::ZLIB and ZLIB::ZLIBSTATIC
+  #              and calls into libz from outside C entirely, through an interface
+  #              it declares in its own language against zlib.h.  Needs gnat.
+  #   iostream3  a C++ consumer, linking ZLIB::ZLIB into its own shared library.
+  #   minizip    the largest consumer in the tree; drives deflate, inflate and the
+  #              gz layer through a real archive format.  Needs libbz2-dev.
+  #   blast      decodes the older PKWare format and links no libz at all.
+  #   puff       decodes deflate independently and links no libz either, but like
+  #              blast it still requires find_package(ZLIB REQUIRED COMPONENTS
+  #              shared static CONFIG) to succeed against the installation.
   #
-  # NOTHING UNDER contrib/ IS EDITED, by this job or by the port.  AAP 0.2.2.1
-  # puts all nineteen entries out of scope; they are built, never changed.
+  # That last pair is not filler.  A package that installs but cannot be FOUND --
+  # a missing config file, a component that no longer resolves, a target whose
+  # location is wrong -- fails silently rather than loudly, and those two rows are
+  # what make it fail loudly.  No row introduces a component name of its own:
+  # zlibConfig.cmake supports exactly `shared' and `static', and the consumers ask
+  # for those, which is the whole of what they ask for.
   #
-  # ADA IS DELIBERATELY ABSENT.  The C matrix covers it; it needs gnat, and its
-  # binding declares the interface itself rather than consuming ZLIB::ZLIB, so it
-  # would exercise the toolchain rather than the installed package.  The four
-  # covered here -- blast, iostream3, minizip, puff -- are the ones that consume
-  # the exported targets.
-  # ---------------------------------------------------------------------------
+  # `dynamic_libz' records which answer each row must give, so the binding check
+  # at the end can ASSERT rather than tolerate.  Without it, a regression that
+  # stopped a consumer linking libz at all would sail straight through the check
+  # written to catch it, because "nothing bound the wrong library" would still
+  # hold.
+  #
+  # `cmake-args' is declared EMPTY on every row rather than omitted.  None of
+  # these consumers needs a configure flag -- that is part of the point -- but the
+  # `Generate project files' step below is byte-identical to the C job's and so
+  # interpolates the key, and a matrix property no row defines is a workflow-lint
+  # error even though GitHub renders it as the empty string.  Declaring it keeps
+  # the two jobs' consumer steps identical AND the lint clean; the rendered
+  # command is exactly what a C row without cmake-args renders today.
+  # ===========================================================================
   ci-cmake-rust:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -101,117 +151,218 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Ubuntu BLAST against Rust libz
+          - name: Ubuntu ADA (Rust zlib)
+            os: ubuntu-latest
+            src_dir: contrib/ada
+            cmake-args: ''
+            dynamic_libz: required
+
+          - name: Ubuntu BLAST (Rust zlib)
             os: ubuntu-latest
             src_dir: contrib/blast
+            cmake-args: ''
+            dynamic_libz: none
 
-          - name: Ubuntu IOSTREAM against Rust libz
+          - name: Ubuntu IOSTREAM (Rust zlib)
             os: ubuntu-latest
             src_dir: contrib/iostream3
+            cmake-args: ''
+            dynamic_libz: required
 
-          - name: Ubuntu MINIZIP against Rust libz
+          - name: Ubuntu MINIZIP (Rust zlib)
             os: ubuntu-latest
             src_dir: contrib/minizip
+            cmake-args: ''
+            dynamic_libz: required
 
-          - name: Ubuntu PUFF against Rust libz
+          - name: Ubuntu PUFF (Rust zlib)
             os: ubuntu-latest
             src_dir: contrib/puff
+            cmake-args: ''
+            dynamic_libz: none
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      # Pinned to a commit, as every action in rust.yml is.  This job installs a
+      # library system-wide with sudo, so the action that fetches the tree it
+      # builds is worth pinning to an immutable reference.  The C job above keeps
+      # its own tag: it predates the port, it is the oracle's baseline, and
+      # nothing here is a reason to touch it.
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        persist-credentials: false
 
     - name: Install packages
       run: |
-        sudo apt install libbz2-dev
+        sudo apt install gnat libbz2-dev
 
     - name: Install Rust toolchain
-      run: rustup toolchain install stable --profile minimal
+      # cargo is not assumed to be present: CMakeLists.txt probes for it inside
+      # the ZLIB_BUILD_RUST option and refuses to configure without it.  No
+      # `+toolchain' argument appears anywhere, because rust-toolchain.toml pins
+      # channel = "stable" and every cargo invocation in the tree resolves through
+      # it; this line installs exactly the toolchain that file describes, both
+      # components included.
+      run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
 
-    - name: Install zlib (Rust implementation)
-      # INSTALLED TO AN EXPLICIT PREFIX, not over the system one as the C jobs do,
-      # and that difference is deliberate.  Both implementations declare SONAME
-      # libz.so.1 and install as libz.so, so a consumer that fell back to the
-      # system zlib would link, run, pass every test below and have exercised
-      # nothing -- and nothing in its output would say so.  A prefix this job owns,
-      # named to the consumer through CMAKE_PREFIX_PATH, makes the binding
-      # decidable, and the two assertions here and the `ldd` one further down are
-      # what decide it.
+    - name: Install zlib
+      # The only step that differs from the C job, and it differs by one flag.
+      # ZLIB_BUILD_RUST=ON builds crates/libz-rs-sys through Cargo, relinks it
+      # with SONAME libz.so.1 through zlib.map, stages the versioned name beside
+      # its symlink chain, redirects ZLIB::ZLIB and ZLIB::ZLIBSTATIC at the
+      # result, and installs all of it over the C names -- those install rules are
+      # declared last, so wherever both implementations publish a name the Rust
+      # file is the one that lands.
+      #
+      # The chain is not cosmetic.  Cargo emits a bare libz.so while the SONAME is
+      # libz.so.1, and when no libz.so.1 exists the loader goes looking for that
+      # name, does not find it, and binds the SYSTEM zlib instead -- so a consumer
+      # builds, runs, passes and has exercised nothing.  CMake's install rules
+      # create the chain, which is why nothing is hand-rolled here -- and why the
+      # two `Verify' steps in this job assert it rather than assume it.
+      run: |
+        cmake -S . -B ../build-zlib -DCMAKE_BUILD_TYPE=Release -DZLIB_BUILD_RUST=ON
+        cmake --build ../build-zlib --config Release
+        sudo cmake --install ../build-zlib
+
+    - name: Verify the installed library is the Rust one
+      # Asserted before a consumer is built, so a failure here reads as an install
+      # fault rather than a consumer fault.  Nothing downstream can tell the two
+      # implementations apart by name -- both install as libz.so with SONAME
+      # libz.so.1 -- so this keys on the one packaging difference that is real: a
+      # Rust staticlib carries the Rust standard library's own object code, whose
+      # undefined references reach into libc and its neighbours, and a static
+      # archive cannot record that the way a shared object records DT_NEEDED.  So
+      # the Rust descriptor publishes a Libs.private key, from `rustc --print
+      # native-static-libs', and the C descriptor has no such key at all.
       run: |
         set -eu
-        PREFIX="$GITHUB_WORKSPACE/../zlib-rust-prefix"
-        cmake -S . -B ../build-zlib \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DZLIB_BUILD_RUST=ON \
-          -DCMAKE_INSTALL_PREFIX="$PREFIX"
-        cmake --build ../build-zlib --config Release --parallel 2
-        cmake --install ../build-zlib
 
-        echo "PREFIX=$(cd "$PREFIX" && pwd)" >> "$GITHUB_ENV"
+        # The libdir is discovered rather than assumed: GNUInstallDirs decides it
+        # from the prefix, and a wrong guess here would be a confusing failure in
+        # a later step instead of a clear one in this step.
+        soname=$(find /usr/local -name libz.so.1 -print -quit)
+        if [ -z "$soname" ]; then
+          echo "::error::no libz.so.1 anywhere under /usr/local, so the install"
+          echo "::error::above did not land where a consumer will look for it."
+          exit 1
+        fi
+        libdir=$(dirname "$soname")
+        echo "installed libdir: $libdir"
+        find "$libdir" -maxdepth 1 -name 'libz*' \( -type f -o -type l \) | sort
 
-        echo "== installed tree =="
-        find "$PREFIX" -maxdepth 3 \( -type f -o -type l \) | sort
+        # The published names must be links, and they must land on one real file
+        # inside this libdir -- not on the distribution's copy.
+        for name in libz.so libz.so.1; do
+          test -L "$libdir/$name" \
+            || { echo "::error::$libdir/$name is not a symlink"; exit 1; }
+        done
+        real=$(readlink -f "$libdir/libz.so")
+        echo "libz.so resolves to $real"
+        case "$real" in
+          "$libdir"/*) ;;
+          *) echo "::error::libz.so resolves outside $libdir: $real"
+             exit 1 ;;
+        esac
+        readelf -d "$real" | grep -i soname \
+          || { echo "::error::$real declares no SONAME, so a program already"
+               echo "::error::linked against libz.so.1 cannot resolve to it."
+               exit 1; }
 
-        # Only the Rust build publishes a Libs.private key -- a Rust staticlib
-        # needs the Rust standard library's own dependencies beside it, a C libz.a
-        # needs none -- so its presence identifies the implementation without
-        # parsing a version string.
-        PC="$PREFIX/lib/pkgconfig/zlib.pc"
-        test -f "$PC" || { echo "::error::no zlib.pc at $PC"; exit 1; }
-        cat "$PC"
-        grep -q '^Libs\.private' "$PC" || {
-          echo "::error::the installed zlib.pc carries no Libs.private key, so this"
-          echo "::error::is the C descriptor: the Rust install did not take effect."
+        pc="$libdir/pkgconfig/zlib.pc"
+        test -f "$pc" || { echo "::error::no zlib.pc at $pc"; exit 1; }
+        echo "installed $pc, directives only:"
+        grep -v -e '^#' -e '^$' "$pc"
+        grep -q '^Libs\.private' "$pc" || {
+          echo "::error::the installed zlib.pc carries no Libs.private key, so it"
+          echo "::error::describes the C archive: the Rust install did not take."
           exit 1
         }
 
-        # And the symlink chain, because cargo emits only libz.so while the SONAME
-        # is libz.so.1: without libz.so.1 present the loader searches for that name,
-        # does not find it, and binds the system library instead.
-        for name in libz.so libz.so.1; do
-          test -L "$PREFIX/lib/$name" \
-            || { echo "::error::$PREFIX/lib/$name is not a symlink"; exit 1; }
-        done
-        readelf -d "$(readlink -f "$PREFIX/lib/libz.so")" | grep -i soname
-
     - name: Generate project files
-      run: cmake -S ${{ matrix.src_dir }} -B ../build ${{ matrix.cmake-args }} -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=${{ env.PREFIX }}
+      run: cmake -S ${{ matrix.src_dir }} -B ../build ${{ matrix.cmake-args }} -DCMAKE_BUILD_TYPE=Release
 
     - name: Compile source code
-      run: cmake --build ../build --config Release --parallel 2
+      run: cmake --build ../build --config Release
 
     - name: Run test cases
       run: ctest -C Release --output-on-failure --max-width 120
       working-directory: ../build
 
-    - name: Run test cases (prove the consumers bound the Rust library)
-      # The assertion that makes the run above mean something.  ctest passing tells
-      # you the consumer worked; only this tells you WHICH library it worked
-      # against.  Every dynamically linked executable the consumer built must
-      # resolve libz.so.1 inside the prefix installed above, and none may resolve
-      # it anywhere else.  A consumer with no dynamic libz at all (a purely static
-      # one) is fine and is reported rather than failed -- what is not fine is one
-      # bound to /lib/x86_64-linux-gnu/libz.so.1.
+    - name: Verify the consumers bound the Rust library
+      # The assertion that makes the run above mean something.  ctest passing says
+      # the consumer worked; only this says WHICH library it worked against, and
+      # AAP 0.3.1.2 requires every drop-in validation to establish that with ldd
+      # for exactly that reason.
+      #
+      # Scoped to the consumer's own artifacts at the top of its build tree.  The
+      # nested trees ctest creates underneath ../build/test are the consumer
+      # PACKAGE's own installability fixtures, and one of them is an installed
+      # copy whose build RPATH CMake strips on install by design; what that copy
+      # binds is decided by the loader's default search rather than by this
+      # install, which is a different question from the one asked here.
+      #
+      # The row's expectation arrives through the environment rather than being
+      # interpolated into the script: a matrix value expanded inline is expanded
+      # before any shell sees it, and keeping workflow expressions out of shell
+      # bodies is the habit that makes that never matter.
+      env:
+        DYNAMIC_LIBZ: ${{ matrix.dynamic_libz }}
       run: |
         set -eu
+
+        soname=$(find /usr/local -name libz.so.1 -print -quit)
+        test -n "$soname" || {
+          echo "::error::no installed libz.so.1 to compare a binding against"
+          exit 1
+        }
+        libdir=$(dirname "$soname")
         found=0
         outside=0
-        for f in $(find ../build -maxdepth 3 -type f -perm -u+x); do
-          file "$f" | grep -q 'ELF .* executable' || continue
+
+        # NUL-delimited and read in this shell rather than a pipeline, so that a
+        # path containing whitespace cannot split and the two counters survive
+        # the loop.
+        while IFS= read -r -d '' f; do
           line=$(ldd "$f" 2>/dev/null | grep -F 'libz.so' || true)
           [ -n "$line" ] || continue
           found=$((found + 1))
-          echo "$f -> $line"
+          echo "$f ->$line"
           case "$line" in
-            *"$PREFIX"*) ;;
+            *"$libdir/"*) ;;
             *) echo "::error::$f did not bind the installed Rust libz"
                outside=$((outside + 1)) ;;
           esac
-        done
+        done < <(find ../build -maxdepth 1 -type f \
+                      \( -perm -u+x -o -name '*.so*' \) -print0)
+
         [ "$outside" -eq 0 ] || exit 1
-        if [ "$found" -eq 0 ]; then
-          echo "no dynamically linked consumer executable references libz;"
-          echo "this consumer links statically, which ctest above exercised."
-        else
-          echo "$found consumer executable(s) bound the installed Rust libz"
-        fi
+
+        case "$DYNAMIC_LIBZ" in
+          required)
+            [ "$found" -gt 0 ] || {
+              echo "::error::this consumer links libz dynamically and none of its"
+              echo "::error::artifacts does, so find_package stopped handing it a"
+              echo "::error::usable ZLIB::ZLIB.  A green ctest above did not test"
+              echo "::error::this library."
+              exit 1
+            }
+            echo "$found artifact(s) bound the installed Rust libz"
+            ;;
+          none)
+            [ "$found" -eq 0 ] || {
+              echo "::error::this consumer is not expected to link libz at all,"
+              echo "::error::yet $found artifact(s) do.  If that is now correct,"
+              echo "::error::set dynamic_libz: required on this row."
+              exit 1
+            }
+            echo "no artifact links libz, which is correct for this consumer."
+            echo "What its build proved is that the installed package resolves:"
+            echo "find_package(ZLIB REQUIRED COMPONENTS shared static CONFIG)"
+            echo "succeeded against the Rust installation."
+            ;;
+          *)
+            echo "::error::matrix.dynamic_libz must be 'required' or 'none'"
+            exit 1
+            ;;
+        esac
