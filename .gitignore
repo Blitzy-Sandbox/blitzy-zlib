@@ -132,6 +132,29 @@ fuzz/coverage/
 /missing.syms
 /extra.syms
 
+# The core dump a PASSING test leaves behind.
+#
+# crates/libz-rs-sys/src/panic_guard.rs's
+# `guard_aborts_the_process_when_the_body_panics' re-executes the test binary as
+# a child and asserts the child died of SIGABRT -- that assertion is how the
+# `extern "C"' (never `extern "C-unwind"') requirement is actually proved, so the
+# child HAS to abort for the test to pass.  On any host whose
+# /proc/sys/kernel/core_pattern is a bare filename and whose `ulimit -c' is not
+# 0, the kernel then writes that dump into the aborting process's working
+# directory, which for a cargo-run test binary is the package root.  The result
+# is a multi-megabyte untracked binary sitting inside the tree after an ordinary
+# `cargo test' -- indistinguishable, to `git add -A', from something worth
+# committing.
+#
+# Anchored to the one package that can produce it rather than left bare: only
+# libz-rs-sys asserts on SIGABRT, and an unanchored `core' would also match a
+# directory or file legitimately named `core' anywhere in the tree.  Both the
+# plain name and the `core.<pid>' form are covered because core_pattern differs
+# between hosts.  `ulimit -c 0' before `cargo test' suppresses the dump entirely
+# and is the better habit; these rules are for the runs where it was not set.
+/crates/libz-rs-sys/core
+/crates/libz-rs-sys/core.*
+
 # Bytecode from the benchmark gate.  `.github/scripts/bench_gate.py` is compiled
 # with `python3 -m py_compile` before it is trusted -- a gate that cannot even be
 # compiled must fail at setup rather than six steps later -- and its self-test
