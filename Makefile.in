@@ -192,20 +192,28 @@ EXE=
 #                      not substituted; a cross build overrides them on the
 #                      command line as shown above.
 #
-#   RUSTSHIMDIR        The C translation units the Rust library contains: the
-#                      varargs shim that defines gzprintf and gzvprintf, and the
-#                      inftrees shim that defines inflate_table with its own
-#                      `codetype' prototype.  Stable Rust can declare none of
-#                      the three.  THIS RECIPE DOES NOT COMPILE THEM: cargo does,
-#                      in crates/libz-rs-sys/build.rs, and archives them into the
+#   RUSTSHIMDIR        The C translation unit the Rust library contains: the
+#                      varargs shim that defines gzprintf and gzvprintf, neither
+#                      of which stable Rust can declare -- a variadic definition
+#                      needs the unstable c_variadic feature and a va_list
+#                      parameter needs the unstable core::ffi::VaList.  It is the
+#                      LAST one: inflate_table used to need a second unit, for its
+#                      `codetype' enum parameter, and is now defined in Rust over a
+#                      validated int.  THIS RECIPE DOES NOT COMPILE IT: cargo does,
+#                      in crates/libz-rs-sys/build.rs, and archives it into the
 #                      $(STATICLIB) it produces, so the relink below has one
 #                      complete archive to work from rather than an archive plus
 #                      an object this file compiled separately.  Named here only
 #                      for the diagnostics.
-#   RUSTSHIMSYMS       The symbols those units define.  Checked for in the
-#                      staged archive before anything is relinked, so a cargo
-#                      build that ran without a C compiler is caught here rather
-#                      than in some consumer's link.
+#   RUSTSHIMSYMS       The symbols that unit defines.  Checked for in the staged
+#                      archive before anything is relinked, so a cargo build that
+#                      ran without a C compiler is caught here rather than in some
+#                      consumer's link.  inflate_table is deliberately NOT in this
+#                      list any more: it is Rust, so its presence says nothing
+#                      about whether a C compiler ran.  That the archive still
+#                      defines it is checked where it matters -- `rust-test' links
+#                      the unmodified test/infcover.c against the staged archive,
+#                      and it calls inflate_table directly.
 #   RUSTSHIMFLAGS      Extra C flags exported to that cargo build as $$CFLAGS,
 #                      on top of $(SFLAGS).
 #   ZLIBREF            The C shared library `rust-symbols' compares against.
@@ -217,11 +225,11 @@ EXE=
 #                      the two lists are variables and why a `--features' or
 #                      `--no-default-features' in $(CARGO_BUILD_FLAGS) is
 #                      refused: the archive cargo produces contains
-#                      $(RUSTSHIMDIR)'s objects, and those units call Rust
+#                      $(RUSTSHIMDIR)'s object, and that unit calls Rust
 #                      adapters that exist only behind `libz-compat' and `gz'.
 #                      A build that dropped either feature would produce a
-#                      library with no gzprintf, no gzvprintf and no
-#                      inflate_table, and it would produce it silently.  `gz' is
+#                      library with no gzprintf and no gzvprintf, and it would
+#                      produce it silently.  `gz' is
 #                      therefore NAMED here rather than relied on as a default --
 #                      a default is exactly what `--no-default-features' removes.
 #   RUSTZVERCMD        The one authoritative reading of ZLIB_VERSION, used by
@@ -411,12 +419,13 @@ EXE=
 #                      because it never opens a library.
 #   RUSTHEADEREXTRAOK  Names the generated side is allowed to declare that
 #                      zlib.h does not.  EMPTY today, and that is the state to
-#                      keep it in.  inflate_table was the single entry while the
-#                      Rust side exported that name; it is now defined in
-#                      $(RUSTSHIMDIR)/inftrees_shim.c with inftrees.h's own
-#                      `codetype' prototype, so cbindgen never sees it and the
-#                      generated header cannot disagree with the declaration
-#                      test/infcover.c compiles against.  Anything appearing here
+#                      keep it in.  inflate_table would be the single entry, since
+#                      crates/libz-rs-sys defines that name in Rust and cbindgen
+#                      renders every #[no_mangle] item it parses; $(SRCDIR)cbindgen.toml
+#                      lists it under [export] exclude instead, because zlib.h
+#                      declares nothing of the kind and inftrees.h remains the sole
+#                      authority for the declaration test/infcover.c compiles
+#                      against.  Anything appearing here
 #                      is an internal escaping into a file that looks exactly like
 #                      the public contract, which is the failure this list exists
 #                      to catch.
@@ -457,8 +466,16 @@ EXE=
 #                      it from $(RUSTC) for the target being built -- the list
 #                      is target-specific and a literal would be wrong on the
 #                      next target along.  Set it when rustc cannot be run for
-#                      the target, or to pin a known-good list:
-#                          make rust-pc RUSTPCPRIVATE='-lm -lpthread -lc'
+#                      the target, or to pin a list you obtained from rustc for
+#                      it.  There is deliberately no example value here: the
+#                      answer on a glibc host runs to seven libraries and
+#                      includes -lgcc_s, and a plausible-looking short list
+#                      builds and then fails in a consumer's link on
+#                      _Unwind_Resume.  Get the real one from the compiler:
+#                          : > /tmp/pc-probe.rs
+#                          rustc --print native-static-libs --crate-type staticlib \
+#                              [--target <triple>] -o /tmp/pc-probe.a /tmp/pc-probe.rs
+#                          make rust-pc RUSTPCPRIVATE='<the note: line it prints>'
 #   RUSTPCGATE         Where the static-consumer gate builds its consumer.  A
 #                      directory holding the staged archive, the two headers and
 #                      a copy of $(RUSTPC) rewritten to point at itself, so that
@@ -486,7 +503,7 @@ RUSTOBJCOPY=objcopy
 # by then, and only the advice would be missing.
 RUSTC=rustc
 RUSTSHIMDIR=$(SRCDIR)crates/libz-rs-sys/csrc
-RUSTSHIMSYMS= gzprintf gzvprintf inflate_table
+RUSTSHIMSYMS= gzprintf gzvprintf
 RUSTSHIMFLAGS=-fPIC -DPIC
 ZLIBREF=$(SHAREDLIBV)
 RUSTCOREFEATURES=
@@ -516,6 +533,17 @@ RUSTHEADEREXTRAOK=
 RUSTHEADERSCRATCH=$(RUSTHEADER).warn $(RUSTHEADER).log $(RUSTHEADER).probe.c \
 	$(RUSTHEADER).ref $(RUSTHEADER).gen
 RUSTC=rustc
+# The ELF inspectors this file will accept for proving DT_SONAME, in preference
+# order.  It is a LIST rather than a single tool because the proof is REQUIRED --
+# `make rust' fails when none of them can answer -- and a platform that ships
+# llvm-binutils instead of GNU binutils must be able to satisfy it without editing
+# this file:
+#     make rust RUSTELFREADERS=llvm-readelf
+# `objdump -p' is understood as well as `readelf -d'; the recipe picks the reading
+# for whichever name it finds.  A missing reader used to be reported as `no readelf,
+# cannot confirm the SONAME' with a successful exit, which made the one property
+# that decides whether an already-linked consumer can bind the library optional.
+RUSTELFREADERS=readelf objdump
 RUSTPKGCONFIG=pkg-config
 RUSTPC=$(RUSTLIBDIR)/zlib.pc
 RUSTPCPRIVATE=
@@ -523,16 +551,27 @@ RUSTPCGATE=$(RUSTLIBDIR)/pc-gate
 
 # The variadic ABI boundary.  `gzprintf' is variadic and `gzvprintf' takes a
 # va_list, and stable Rust can define neither -- `c_variadic' and
-# `core::ffi::VaList' are both unstable, and guessing a va_list layout is
-# ABI-invalid across the Tier-1 targets.  So those two exports live in one C
-# translation unit that owns nothing but va_start/va_end and vsnprintf; every
-# guard, the overflow sentinel and all the accounting are in safe Rust, in
+# `core::ffi::VaList' are both unstable (measured: E0658 on the declared 1.80
+# floor and on current stable), and guessing a va_list layout is ABI-invalid
+# across the Tier-1 targets.  So those two exports live in one C translation
+# unit that owns nothing but va_start/va_end and vsnprintf; every guard, the
+# overflow sentinel and all the accounting are in safe Rust, in
 # crates/zlib-rs/src/gz/printf.rs, which carries the whole contract.
 #
-# Cargo does NOT compile it: crates/libz-rs-sys has no [build-dependencies] and
-# `cargo build --release' must work with no C compiler present.  Compiling it and
-# getting it into both libraries is this file's job, which is the right place
-# because this is also where zlib.map is applied.
+# CARGO COMPILES IT, and this file does not.  crates/libz-rs-sys/build.rs invokes
+# the platform compiler on $(RUSTSHIMDIR)/gzprintf_shim.c -- directly, taking no
+# [build-dependencies] -- and archives the object so that rustc merges it into the
+# libz.a it produces.  A C compiler is therefore a hard requirement of the DEFAULT
+# `cargo build -p libz-rs-sys' (features libz-compat + gz), and its absence fails
+# that build loudly rather than yielding a library without gzprintf; only
+# `--no-default-features --features libz-compat' and `-p zlib-rs' are C-free.  What
+# this file does with the archive is stage it and apply zlib.map, and $(RUSTSHIMSYMS)
+# below is how it proves cargo really did its half before staging anything.
+#
+# There used to be a second unit here, for inflate_table's `codetype' prototype.
+# There is not: an enumerator of 0..2 is passed exactly as an int, so
+# crates/libz-rs-sys/src/inflate.rs defines that name in Rust with a validated
+# c_int and test/infcover.c resolves it at link time.
 # The GNU ld spellings for "take every member of this archive, including the
 # ones nothing references yet".  They are separate variables so that a platform
 # with a different linker can override them -- Mach-O's ld wants `-all_load' and
@@ -559,13 +598,17 @@ RUSTNOWHOLEARCHIVE=-Wl,--no-whole-archive
 # what they are given and the build directory is not theirs to remove.
 #
 #   1. A LEXICAL pass rejects the forms that are wrong regardless of what is on
-#      disk: empty, absolute, tilde-prefixed, `.', `..', `./', `.//...', `./.',
-#      anything containing a `..' path component, and anything outside a
-#      conservative character set (which also removes every shell-metacharacter
-#      and whitespace hazard).  The trailing-slash and `./' spellings are named
-#      individually because they all canonicalise to the build root while
-#      matching none of `.' or `..': rejecting only the literal `.' left
-#      `RUSTLIBDIR=./' accepted, which is the hole this pass closes.
+#      disk: empty, absolute, tilde-prefixed, DASH-PREFIXED, `.', `..', `./',
+#      `.//...', `./.', anything containing a `..' path component, and anything
+#      outside a conservative character set (which also removes every
+#      shell-metacharacter and whitespace hazard).  The trailing-slash and `./'
+#      spellings are named individually because they all canonicalise to the build
+#      root while matching none of `.' or `..': rejecting only the literal `.' left
+#      `RUSTLIBDIR=./' accepted, which is the hole this pass closes.  The dash test
+#      is there for the same class of reason and it is not covered by the character
+#      set, which necessarily permits `-' inside a name: `RUSTLIBDIR=-rf' would
+#      otherwise reach `rm -rf' and `mkdir' as an OPTION, and every operand below is
+#      introduced with `--' precisely so that the two defences are independent.
 #   2. A CANONICALISING pass walks up to the nearest existing ancestor, resolves
 #      it with `cd -P' and `pwd -P' so that a symlinked component cannot smuggle
 #      the path elsewhere, and requires the result to be the build directory or
@@ -596,6 +639,7 @@ RUSTPATHGUARD = \
 	    /*) zrs_reject "$$zrs_n=$$zrs_v is an absolute path; it must be relative to the build directory" ;; \
 	    "~"*) zrs_reject "$$zrs_n=$$zrs_v starts with a tilde" ;; \
 	    . | .. | ./ | ../ | ./. | .//*) zrs_reject "$$zrs_n=$$zrs_v names the build directory or its parent" ;; \
+	    -*) zrs_reject "$$zrs_n=$$zrs_v starts with a dash, so a command would read it as an option rather than as a path" ;; \
 	    ../* | */.. | */../*) zrs_reject "$$zrs_n=$$zrs_v contains a .. component" ;; \
 	    *[!A-Za-z0-9._/+-]*) zrs_reject "$$zrs_n=$$zrs_v contains a character outside A-Za-z0-9._+-/" ;; \
 	  esac; \
@@ -796,6 +840,27 @@ cover: infcover
 # internals too.  Check 1 still runs.  What is no longer possible is reaching
 # that state by accident.
 #
+# ★ THE MODE RECORDED ON LINE 3 OF soname.stage HAS THREE VALUES -- `required',
+# `none' and `static' -- AND IT IS DELIBERATELY NOT FOUR.  A version script can
+# reach the shared link from either of two producers: the `rust' recipe passes
+# $(RUSTVERSIONSCRIPTFLAG)$(RUSTVERSIONSCRIPT) on the link command itself, or the
+# script is ALREADY inside $(LDSHARED) -- which is exactly what ./configure
+# writes, so it is the state of every configured tree, and the recipe then has
+# nothing to add.  Those are two spellings of ONE fact: a version script WAS
+# applied, so the version nodes must exist and the local: block must have taken
+# effect.  Every reader of that line tests only `= static' or `= none' -- the
+# gates in this file, `make rust-test', `make rust-symbols' and
+# crates/libz-rs-sys/tests/dropin_chain.rs -- so a fourth value distinguishes nothing for
+# any of them while giving every one of them a name it has to be taught.  So
+# `required' is recorded in both cases, and the PRODUCER is reported separately in
+# $$VSFROM, which is the only thing that ever wanted it: the note the recipe
+# prints, and the diagnostic for a library that came out with zero nodes.  Do not
+# reintroduce a per-producer mode value here.  That is how the documented
+# `./configure && make && make rust' path came to stage a correct drop-in tree and
+# then be refused by this repository's own chain verifier, while the unconfigured
+# path passed -- a disagreement between two parts of this repository rather than a
+# fault in the tree being verified.
+#
 # Packaging happens in $(RUSTLIBDIR), never in $(RUSTDIR), for two reasons that
 # have nothing to do with each other.  The first is that the two libraries are
 # not the same file: $(RUSTDIR) holds cargo's own cdylib, which carries no
@@ -839,10 +904,10 @@ cover: infcover
 # position-independent.
 #
 # Nothing tells the Rust code what the finished library will contain any more, and
-# that is the point: the archive cargo produces already defines gzprintf, gzvprintf
-# and inflate_table, so cfg(zlib_rs_gzprintf) -- and with it zlibCompileFlags() bit
-# 27 -- follows from the compile that actually happened.  The recipe verifies the
-# three symbols are present in the staged archive before it relinks anything.
+# that is the point: the archive cargo produces already defines gzprintf and
+# gzvprintf, so cfg(zlib_rs_gzprintf) -- and with it zlibCompileFlags() bit 27 --
+# follows from the compile that actually happened.  The recipe verifies both symbols
+# are present in the staged archive before it relinks anything.
 #
 # Package selection is explicit.  `-p zlib-rs -p libz-rs-sys' names the two
 # crates that ship; the third workspace member, crates/zlib-rs-differential,
@@ -940,22 +1005,22 @@ rust:
 	fi; \
 	set -e; \
 	LC_ALL=C; export LC_ALL; \
+	profile=debug; triple=; want=; \
+	for arg in $(CARGO_BUILD_FLAGS); do \
+	  if test -n "$$want"; then \
+	    eval "$$want=\$$arg"; want=; continue; \
+	  fi; \
+	  case "$$arg" in \
+	    --release | -r) profile=release ;; \
+	    --profile) want=profile ;; \
+	    --profile=*) profile=`expr "$$arg" : '--profile=\(.*\)'` ;; \
+	    --target) want=triple ;; \
+	    --target=*) triple=`expr "$$arg" : '--target=\(.*\)'` ;; \
+	  esac; \
+	done; \
+	case "$$profile" in dev | test) profile=debug ;; bench) profile=release ;; esac; \
 	rustdir='$(RUSTDIR)'; \
 	if test -z "$$rustdir"; then \
-	  profile=debug; triple=; want=; \
-	  for arg in $(CARGO_BUILD_FLAGS); do \
-	    if test -n "$$want"; then \
-	      eval "$$want=\$$arg"; want=; continue; \
-	    fi; \
-	    case "$$arg" in \
-	      --release | -r) profile=release ;; \
-	      --profile) want=profile ;; \
-	      --profile=*) profile=`expr "$$arg" : '--profile=\(.*\)'` ;; \
-	      --target) want=triple ;; \
-	      --target=*) triple=`expr "$$arg" : '--target=\(.*\)'` ;; \
-	    esac; \
-	  done; \
-	  case "$$profile" in dev | test) profile=debug ;; bench) profile=release ;; esac; \
 	  rustdir='$(RUSTTARGETDIR)'; \
 	  test -z "$$triple" || rustdir="$$rustdir/$$triple"; \
 	  rustdir="$$rustdir/$$profile"; \
@@ -983,37 +1048,60 @@ rust:
 	  echo "make rust: (the C build calls it $(SHAREDLIBV); that name is only the"; \
 	  echo "make rust: unconfigured default and disagrees with the header)"; \
 	fi; \
-	rm -rf $(RUSTLIBDIR); \
-	mkdir -p $(RUSTLIBDIR); \
-	cp -p "$$rustdir/$(STATICLIB)" $(RUSTLIBDIR)/$(STATICLIB); \
+	rm -rf -- $(RUSTLIBDIR); \
+	mkdir -p -- $(RUSTLIBDIR); \
+	cp -p -- "$$rustdir/$(STATICLIB)" $(RUSTLIBDIR)/$(STATICLIB); \
 	echo "cp $$rustdir/$(STATICLIB) $(RUSTLIBDIR)/$(STATICLIB)"; \
 	for sym in $(RUSTSHIMSYMS); do \
 	  if $(RUSTNM) $(RUSTLIBDIR)/$(STATICLIB) 2>/dev/null \
 	      | grep -q "^[0-9a-fA-F]* *T $$sym$$"; then :; else \
 	    echo "make rust: $(STATICLIB) does not define $$sym." >&2; \
-	    echo "make rust: cargo compiles $(RUSTSHIMDIR) into the archive it produces" >&2; \
-	    echo "make rust: (crates/libz-rs-sys/build.rs), so a missing name means that" >&2; \
-	    echo "make rust: build ran without a C compiler or without the libz-compat and" >&2; \
-	    echo "make rust: gz features.  This target will not stage an incomplete libz." >&2; \
+	    echo "make rust: gzprintf and gzvprintf come from $(RUSTSHIMDIR)/gzprintf_shim.c," >&2; \
+	    echo "make rust: which crates/libz-rs-sys/build.rs compiles with the platform C" >&2; \
+	    echo "make rust: compiler and archives into the library cargo produces;" >&2; \
+	    echo "make rust: inflate_table is Rust and needs only libz-compat.  A missing name" >&2; \
+	    echo "make rust: therefore means that build ran without a C compiler, or without" >&2; \
+	    echo "make rust: the libz-compat and gz features.  This target will not stage an" >&2; \
+	    echo "make rust: incomplete libz." >&2; \
 	    exit 1; \
 	  fi; \
 	done; \
-	echo "		$(STATICLIB) defines the C-ABI shim symbols cargo compiled:$(RUSTSHIMSYMS)"; \
+	echo "		$(STATICLIB) defines the C-ABI names only a libz-compat+gz cargo build has:$(RUSTSHIMSYMS)"; \
 	if test -n "$(RUSTPCPRIVATE)"; then \
 	  NSL='$(RUSTPCPRIVATE)'; \
 	  echo "		native static libraries stated by RUSTPCPRIVATE: $$NSL"; \
 	elif $(RUSTC) --version >/dev/null 2>&1; then \
 	  printf '#[no_mangle]\npub extern "C" fn zlib_rs_native_static_libs_probe() -> i32 { 0 }\n' \
 	    > $(RUSTLIBDIR)/nsl-probe.rs; \
-	  if $(RUSTC) --print native-static-libs --crate-type staticlib \
+	  if test -n "$$triple"; then \
+	    NSLTGT="--target $$triple"; \
+	  else \
+	    NSLTGT=; \
+	  fi; \
+	  if $(RUSTC) --print native-static-libs --crate-type staticlib $$NSLTGT \
 	      -o $(RUSTLIBDIR)/libnsl-probe.a $(RUSTLIBDIR)/nsl-probe.rs \
 	      > $(RUSTLIBDIR)/nsl.log 2>&1; then \
 	    NSL=`sed -n 's/.*native-static-libs: *//p' $(RUSTLIBDIR)/nsl.log \
 	         | sed -n '1p'`; \
 	  else \
 	    NSL=''; \
+	    if test -n "$$triple"; then \
+	      cat $(RUSTLIBDIR)/nsl.log >&2; \
+	      echo "make rust: $(RUSTC) --print native-static-libs --target $$triple failed," >&2; \
+	      echo "make rust: so the libraries the staged $(STATICLIB) must be linked against on" >&2; \
+	      echo "make rust: THAT target are unknown.  This is a cross build and the host answer" >&2; \
+	      echo "make rust: is not a substitute for it: a target archive published with the" >&2; \
+	      echo "make rust: host's library set is exactly the silent mismatch this probe" >&2; \
+	      echo "make rust: exists to prevent.  Install the target's std with" >&2; \
+	      echo "make rust:     rustup target add $$triple" >&2; \
+	      echo "make rust: or state the set yourself:" >&2; \
+	      echo 'make rust:     make rust RUSTPCPRIVATE="-lm -lpthread -lc"' >&2; \
+	      rm -f -- $(RUSTLIBDIR)/nsl-probe.rs $(RUSTLIBDIR)/libnsl-probe.a \
+	        $(RUSTLIBDIR)/nsl.log; \
+	      exit 1; \
+	    fi; \
 	  fi; \
-	  rm -f $(RUSTLIBDIR)/nsl-probe.rs $(RUSTLIBDIR)/libnsl-probe.a \
+	  rm -f -- $(RUSTLIBDIR)/nsl-probe.rs $(RUSTLIBDIR)/libnsl-probe.a \
 	    $(RUSTLIBDIR)/nsl.log; \
 	else \
 	  NSL=''; \
@@ -1029,8 +1117,14 @@ rust:
 	  echo '		could not ask $(RUSTC) which native libraries $(STATICLIB) needs'; \
 	  echo '		beside it; the shared relink below adds none, and `make rust-test'"'"''; \
 	  echo '		and `make rust-pc'"'"' will stop rather than link or advertise an'; \
-	  echo '		archive whose requirements are unknown.  Pass RUSTC=<path>, or state'; \
-	  echo '		the set with RUSTPCPRIVATE="-lm -lpthread -lc".'; \
+	  echo '		archive whose requirements are unknown.  Pass RUSTC=<path>, or ask'; \
+	  echo '		rustc for the target elsewhere and state what it answers:'; \
+	  echo '		    : > /tmp/pc-probe.rs'; \
+	  echo '		    rustc --print native-static-libs --crate-type staticlib \'; \
+	  echo '		        [--target <triple>] -o /tmp/pc-probe.a /tmp/pc-probe.rs'; \
+	  echo '		    make rust RUSTPCPRIVATE="<the note: line it prints>"'; \
+	  echo '		Seven libraries on a glibc host, -lgcc_s among them; a short list'; \
+	  echo '		assembled by hand links here and fails in a consumer.'; \
 	fi; \
 	sed -n 's/^ *ZEXTERN[^(]*[ *]\([A-Za-z_][A-Za-z0-9_]*\) *(.*/\1/p' \
 	  $(SRCDIR)zlib.h | sort -u > $(RUSTLIBDIR)/public.syms; \
@@ -1050,7 +1144,7 @@ rust:
 	  *-soname* | *install_name* | *,-h* ) ;; \
 	  *) EXTRA="$$EXTRA $(RUSTSONAMEFLAG)$$SOM";; \
 	esac; \
-	VSMODE=none; VSARG=''; \
+	VSMODE=none; VSARG=''; VSFROM='no version script'; \
 	if test -n '$(RUSTVERSIONSCRIPT)' && test -n '$(RUSTVERSIONSCRIPTFLAG)'; then \
 	  if test ! -f '$(RUSTVERSIONSCRIPT)'; then \
 	    echo "make rust: the version script $(RUSTVERSIONSCRIPT) is missing.  It is part" >&2; \
@@ -1059,11 +1153,12 @@ rust:
 	    echo "make rust: dynamic table.  Restore it from version control." >&2; \
 	    exit 1; \
 	  fi; \
-	  VSMODE=required; \
+	  VSMODE=required; VSFROM='this recipe'; \
 	  case " $$LDS " in \
-	    *version-script*) VSMODE=ldshared;; \
+	    *version-script*) VSFROM='$$(LDSHARED), as ./configure wrote it';; \
 	    *) VSARG='$(RUSTVERSIONSCRIPTFLAG)$(RUSTVERSIONSCRIPT)';; \
 	  esac; \
+	  echo "		the version script reaches the link from $$VSFROM"; \
 	else \
 	  echo '		RUSTVERSIONSCRIPT or RUSTVERSIONSCRIPTFLAG is empty, so no version'; \
 	  echo '		script is applied.  That is an explicit choice for a format that'; \
@@ -1104,15 +1199,15 @@ rust:
 	  : > $(RUSTLIBDIR)/unversioned; \
 	else \
 	  cat $(RUSTLIBDIR)/relink.log; \
-	  rm -f $(RUSTLIBDIR)/libz-whole.o $(RUSTLIBDIR)/relink.log; \
+	  rm -f -- $(RUSTLIBDIR)/libz-whole.o $(RUSTLIBDIR)/relink.log; \
 	  echo "		*** relink of $$SOV from $(STATICLIB) FAILED ***"; \
 	  echo "		The staged library is NOT a drop-in and nothing was substituted" >&2; \
 	  echo "		for it.  Fix the link, or state the platform's own spellings:" >&2; \
 	  echo "		    make rust RUSTSONAMEFLAG=-Wl,-install_name, RUSTVERSIONSCRIPT=" >&2; \
 	  exit 1; \
 	fi; \
-	rm -f $(RUSTLIBDIR)/relink.log; \
-	rm -f $(RUSTLIBDIR)/libz-whole.o; \
+	rm -f -- $(RUSTLIBDIR)/relink.log; \
+	rm -f -- $(RUSTLIBDIR)/libz-whole.o; \
 	if test "$$VSMODE" != none && command -v $(RUSTNM) > /dev/null 2>&1; then \
 	  NODES=`$(RUSTNM) -D --defined-only --extern-only "$(RUSTLIBDIR)/$$SOV" \
 	    | awk '$$2 == "A"' | wc -l`; \
@@ -1121,17 +1216,18 @@ rust:
 	    echo "make rust: script was required.  That is the failure this step exists to" >&2; \
 	    echo "make rust: catch: the library links, loads and passes every name-based" >&2; \
 	    echo "make rust: check, and yet no consumer resolving deflate@ZLIB_1.2.0 can" >&2; \
-	    echo "make rust: bind to it.  VSMODE was $$VSMODE; the arguments used were" >&2; \
+	    echo "make rust: bind to it.  The script came from $$VSFROM; the arguments" >&2; \
+	    echo "make rust: used were" >&2; \
 	    echo "make rust:     $$LDS $(SFLAGS)$$EXTRA $$VSARG" >&2; \
-	    rm -f "$(RUSTLIBDIR)/$$SOV"; \
+	    rm -f -- "$(RUSTLIBDIR)/$$SOV"; \
 	    exit 1; \
 	  fi; \
 	  echo "		$$NODES symbol version nodes in $$SOV"; \
 	fi; \
-	rm -f "$(RUSTLIBDIR)/$(SHAREDLIB)" "$(RUSTLIBDIR)/$$SOM"; \
-	ln -s "$$SOV" "$(RUSTLIBDIR)/$$SOM"; \
+	rm -f -- "$(RUSTLIBDIR)/$(SHAREDLIB)" "$(RUSTLIBDIR)/$$SOM"; \
+	ln -s -- "$$SOV" "$(RUSTLIBDIR)/$$SOM"; \
 	echo "ln -s $$SOV $(RUSTLIBDIR)/$$SOM"; \
-	ln -s "$$SOV" $(RUSTLIBDIR)/$(SHAREDLIB); \
+	ln -s -- "$$SOV" $(RUSTLIBDIR)/$(SHAREDLIB); \
 	echo "ln -s $$SOV $(RUSTLIBDIR)/$(SHAREDLIB)"; \
 	echo "$$VSMODE" >> $(RUSTLIBDIR)/soname.stage
 	@if test -z "$(CARGO)"; then \
@@ -1265,15 +1361,34 @@ rust:
 	    echo "		and that is exactly $(RUSTVERNODES) nodes, as $(SRCDIR)zlib.map's frozen contract requires"; \
 	  fi; \
 	fi; \
-	if command -v readelf > /dev/null 2>&1; then \
-	  if readelf -d "$(RUSTLIBDIR)/$$SOV" | grep -q "\[$$SOM\]"; then \
-	    echo "		SONAME is $$SOM"; \
-	  else \
-	    echo "		SONAME is not $$SOM, so an already-linked consumer will not bind this library"; \
-	    rc=1; \
-	  fi; \
+	SONAMEOUT=; \
+	for reader in $(RUSTELFREADERS); do \
+	  command -v "$$reader" > /dev/null 2>&1 || continue; \
+	  case "$$reader" in \
+	    *objdump*) SONAMEOUT=`"$$reader" -p "$(RUSTLIBDIR)/$$SOV" 2>/dev/null \
+	                 | sed -n 's/^ *SONAME  *\([^ ]*\).*/[\1]/p'` ;; \
+	    *) SONAMEOUT=`"$$reader" -d "$(RUSTLIBDIR)/$$SOV" 2>/dev/null \
+	         | sed -n 's/.*SONAME[^[]*\(\[[^]]*\]\).*/\1/p'` ;; \
+	  esac; \
+	  test -z "$$SONAMEOUT" || { SONAMEREADER=$$reader; break; }; \
+	done; \
+	if test -z "$$SONAMEOUT"; then \
+	  echo "make rust: the SONAME of $$SOV could not be read.  None of" >&2; \
+	  echo "make rust:     $(RUSTELFREADERS)" >&2; \
+	  echo "make rust: is available, or none of them reported a SONAME for it.  That is a" >&2; \
+	  echo "make rust: hard failure and not a note: the SONAME is the name the dynamic" >&2; \
+	  echo "make rust: loader searches for, so a library without it -- or one carrying the" >&2; \
+	  echo "make rust: wrong one -- lets every already-linked consumer fall through to the" >&2; \
+	  echo "make rust: system libz while every name-based check here still passes.  An" >&2; \
+	  echo "make rust: earlier revision printed 'no readelf, cannot confirm the SONAME'" >&2; \
+	  echo "make rust: and reported success.  Install binutils, or name a reader:" >&2; \
+	  echo "make rust:     make rust RUSTELFREADERS=llvm-readelf" >&2; \
+	  rc=1; \
+	elif test "$$SONAMEOUT" = "[$$SOM]"; then \
+	  echo "		SONAME is $$SOM (read with $$SONAMEREADER)"; \
 	else \
-	  echo '		no readelf, cannot confirm the SONAME'; \
+	  echo "		SONAME is $$SONAMEOUT, not [$$SOM], so an already-linked consumer will not bind this library"; \
+	  rc=1; \
 	fi; \
 	if test -f "$(ZLIBREF)"; then \
 	  $(RUSTNM) -D --defined-only --extern-only "$(ZLIBREF)" \
@@ -1315,6 +1430,24 @@ rust:
 # `$(RUSTC) --print native-static-libs' for the target being built rather than
 # carrying a literal.  A literal would be wrong on the next target along, and
 # wrong in the direction that fails to link.
+#
+# ★ THAT PROBE'S -o PATH IS A REAL FILE IN $(RUSTLIBDIR) AND MUST NEVER BE
+# /dev/null.  `--print native-static-libs' is only emitted for a link, so the
+# probe has to produce an archive somewhere, and /dev/null looks like the obvious
+# nowhere.  It is not: rustc writes its output to a temporary file and RENAMES it
+# into place, and rename(2) onto /dev/null REPLACES THE DEVICE NODE with an
+# ordinary file.  Measured -- one
+# `rustc --print native-static-libs --crate-type staticlib -o /dev/null probe.rs'
+# turned /dev/null into a 21 MB regular file, after which every `2>/dev/null' on
+# the machine appended to it and every reader of it got that accumulation back.
+# The failure that surfaced from it was several steps away and looked like
+# nothing to do with this recipe: cargo's own `rustc -' target probe reads its
+# program text from standard input, so a later build died with
+# `error[E0762]: unterminated character literal --> <anon>:1' quoting an
+# unrelated command's stderr.  Writing $(RUSTLIBDIR)/pc-probe.a and removing it
+# costs one file and cannot damage the host.  The same reasoning is recorded
+# beside the native-static-libs probe in CMakeLists.txt, which had the same
+# defect and was corrected there first.
 #
 # One file could not do both jobs: $(SRCDIR)zlib.pc.in and
 # $(SRCDIR)zlib.pc.cmakein are each shared by the two implementations, so the
@@ -1412,32 +1545,46 @@ rust-pc: rust
 	  if ! command -v $(RUSTC) > /dev/null 2>&1; then \
 	    echo 'make rust-pc: $(RUSTC) is unavailable, so the native static library' >&2; \
 	    echo 'make rust-pc: list cannot be derived.  It is target-specific, so this' >&2; \
-	    echo 'make rust-pc: recipe will not guess it.  Name the compiler, or state' >&2; \
-	    echo 'make rust-pc: the list:' >&2; \
+	    echo 'make rust-pc: recipe will not guess it.  Name the compiler:' >&2; \
 	    echo 'make rust-pc:     make rust-pc RUSTC=/path/to/rustc' >&2; \
-	    echo 'make rust-pc:     make rust-pc RUSTPCPRIVATE="-lm -lpthread -lc"' >&2; \
+	    echo 'make rust-pc: or state the list, which only rustc for the target you' >&2; \
+	    echo 'make rust-pc: are building can tell you.  Ask it, on a machine that' >&2; \
+	    echo 'make rust-pc: has it, and pass back what it prints:' >&2; \
+	    echo 'make rust-pc:     : > /tmp/pc-probe.rs' >&2; \
+	    echo 'make rust-pc:     rustc --print native-static-libs --crate-type staticlib \' >&2; \
+	    echo 'make rust-pc:         [--target <triple>] -o /tmp/pc-probe.a /tmp/pc-probe.rs' >&2; \
+	    echo 'make rust-pc:     make rust-pc RUSTPCPRIVATE="<the note: line it prints>"' >&2; \
+	    echo 'make rust-pc: The list is longer than it looks -- on this kind of host it' >&2; \
+	    echo 'make rust-pc: is seven libraries and includes -lgcc_s, without which a' >&2; \
+	    echo 'make rust-pc: consumer fails at link time on _Unwind_Resume -- so do not' >&2; \
+	    echo 'make rust-pc: assemble one by hand.' >&2; \
 	    exit 1; \
 	  fi; \
 	  tflag=; test -z "$$triple" || tflag="--target $$triple"; \
 	  : > $(RUSTLIBDIR)/pc-probe.rs; \
 	  if $(RUSTC) --print native-static-libs --crate-type staticlib $$tflag \
-	      -o /dev/null $(RUSTLIBDIR)/pc-probe.rs \
-	      > $(RUSTLIBDIR)/pc-probe.log 2>&1; then \
-	    :; \
-	  elif $(RUSTC) --print native-static-libs --crate-type staticlib $$tflag \
 	      -o $(RUSTLIBDIR)/pc-probe.a $(RUSTLIBDIR)/pc-probe.rs \
 	      > $(RUSTLIBDIR)/pc-probe.log 2>&1; then \
-	    rm -f $(RUSTLIBDIR)/pc-probe.a; \
+	    rm -f -- $(RUSTLIBDIR)/pc-probe.a; \
 	  else \
 	    sed 's/^/		/' $(RUSTLIBDIR)/pc-probe.log >&2; \
 	    echo 'make rust-pc: the probe above failed, so the native static library' >&2; \
-	    echo 'make rust-pc: list is unknown.  State it instead:' >&2; \
-	    echo 'make rust-pc:     make rust-pc RUSTPCPRIVATE="-lm -lpthread -lc"' >&2; \
+	    echo 'make rust-pc: list is unknown.  Both spellings of the probe are shown' >&2; \
+	    echo 'make rust-pc: in that log; run one of them by hand to see why, then' >&2; \
+	    echo 'make rust-pc: state what it prints:' >&2; \
+	    echo 'make rust-pc:     : > /tmp/pc-probe.rs' >&2; \
+	    echo 'make rust-pc:     $(RUSTC) --print native-static-libs --crate-type staticlib \' >&2; \
+	    echo 'make rust-pc:         [--target <triple>] -o /tmp/pc-probe.a /tmp/pc-probe.rs' >&2; \
+	    echo 'make rust-pc:     make rust-pc RUSTPCPRIVATE="<the note: line it prints>"' >&2; \
+	    echo 'make rust-pc: Do not substitute a plausible short list: the answer is' >&2; \
+	    echo 'make rust-pc: target-specific, runs to seven libraries on a glibc host,' >&2; \
+	    echo 'make rust-pc: and omitting -lgcc_s alone breaks a consumer at link time' >&2; \
+	    echo 'make rust-pc: with an undefined reference to _Unwind_Resume.' >&2; \
 	    exit 1; \
 	  fi; \
 	  PRIVATE=`sed -n 's/^note: native-static-libs: *//p' $(RUSTLIBDIR)/pc-probe.log \
 	    | sed -n 1p`; \
-	  rm -f $(RUSTLIBDIR)/pc-probe.rs; \
+	  rm -f -- $(RUSTLIBDIR)/pc-probe.rs; \
 	  if test -z "$$PRIVATE"; then \
 	    sed 's/^/		/' $(RUSTLIBDIR)/pc-probe.log >&2; \
 	    echo 'make rust-pc: $(RUSTC) printed no native-static-libs note above, so' >&2; \
@@ -1446,7 +1593,7 @@ rust-pc: rust
 	    echo 'make rust-pc: prevent, so this is a failure rather than a skip.' >&2; \
 	    exit 1; \
 	  fi; \
-	  rm -f $(RUSTLIBDIR)/pc-probe.log; \
+	  rm -f -- $(RUSTLIBDIR)/pc-probe.log; \
 	  TARGETDESC="derived with $(RUSTC) for $${triple:-this build host target}"; \
 	  echo "		Libs.private $$TARGETDESC: $$PRIVATE"; \
 	fi; \
@@ -1503,7 +1650,7 @@ rust-pc: rust
 	  awk -v priv="$$PRIVATE" '{ print } /^Libs:/ { print "Libs.private: " priv }' \
 	    "$$BASE"; \
 	} > $(RUSTPC); \
-	rm -f "$$BASE"; \
+	rm -f -- "$$BASE"; \
 	NPRIV=`grep -c '^Libs\.private:' $(RUSTPC)`; \
 	if test "$$NPRIV" -ne 1; then \
 	  echo "make rust-pc: $(RUSTPC) carries $$NPRIV Libs.private lines, not 1." >&2; \
@@ -1547,8 +1694,8 @@ rust-pc: rust
 	  echo '		every other field is the C zlib.pc byte for byte'; \
 	fi; \
 	GATE=$(RUSTPCGATE); \
-	rm -rf "$$GATE"; \
-	mkdir -p "$$GATE/lib" "$$GATE/include" "$$GATE/pkgconfig"; \
+	rm -rf -- "$$GATE"; \
+	mkdir -p -- "$$GATE/lib" "$$GATE/include" "$$GATE/pkgconfig"; \
 	cp $(RUSTLIBDIR)/$(STATICLIB) "$$GATE/lib/$(STATICLIB)"; \
 	cp $(SRCDIR)zlib.h "$$GATE/include/zlib.h"; \
 	if test -f zconf.h; then \
@@ -1577,13 +1724,16 @@ rust-pc: rust
 	  fi; \
 	done; \
 	if ! command -v $(RUSTPKGCONFIG) > /dev/null 2>&1; then \
-	  echo '		$(RUSTPKGCONFIG) is unavailable, so the static consumer was NOT'; \
-	  echo '		linked.  The descriptor above was generated and its contents'; \
-	  echo '		checked; what is untested is whether a consumer built from it'; \
-	  echo '		links.  Install pkg-config, or name one:'; \
-	  echo '		    make rust-pc RUSTPKGCONFIG=pkgconf'; \
-	  echo '		*** zlib Rust pkg-config descriptor OK, consumer gate SKIPPED ***'; \
-	  exit 0; \
+	  echo 'make rust-pc: $(RUSTPKGCONFIG) is unavailable, so the consumer half of this' >&2; \
+	  echo 'make rust-pc: target cannot run: nothing would compile, link or execute against' >&2; \
+	  echo 'make rust-pc: the descriptor it just generated.  This target is documented as a' >&2; \
+	  echo 'make rust-pc: link-and-run consumer gate, so it FAILS rather than reporting a' >&2; \
+	  echo 'make rust-pc: descriptor-only pass -- an earlier revision exited 0 here with' >&2; \
+	  echo 'make rust-pc: "consumer gate SKIPPED", which is how a green run came to mean' >&2; \
+	  echo 'make rust-pc: less than it appeared to.  Install pkg-config, or name an' >&2; \
+	  echo 'make rust-pc: implementation of it:' >&2; \
+	  echo 'make rust-pc:     make rust-pc RUSTPKGCONFIG=pkgconf' >&2; \
+	  exit 1; \
 	fi; \
 	PKG_CONFIG_PATH="$$GATEABS/pkgconfig"; export PKG_CONFIG_PATH; \
 	PKG_CONFIG_LIBDIR="$$GATEABS/pkgconfig"; export PKG_CONFIG_LIBDIR; \
@@ -1707,7 +1857,7 @@ rust-pc: rust
 	  echo '		holds no shared library, so -lz had nothing else to resolve to'; \
 	fi; \
 	OUT=`${QEMU_RUN} "$$GATE/consumer$(EXE)" "$$GATE/gate.gz"`; \
-	rm -f "$$GATE/gate.gz"; \
+	rm -f -- "$$GATE/gate.gz"; \
 	echo "		$$OUT"; \
 	case "$$OUT" in \
 	  *"static pkg-config consumer OK"*) ;; \
@@ -1782,8 +1932,11 @@ rust-pc: rust
 # path that assumes zero-initialised memory, and its mem_done() detects leaks,
 # non-LIFO frees and rogue frees through the injected zalloc/zfree hooks.  It is
 # linked against the archive rather than the shared library on purpose, because it
-# includes inflate.h and inftrees.h and calls inflate_table() directly, so it
-# needs a symbol the version script keeps out of the shared library's exports.
+# includes inflate.h and inftrees.h and calls inflate_table() directly, so it needs
+# a symbol both the version script and ELF hidden visibility keep out of a shared
+# library's exports.  That call is also the last C compiler still checking the
+# Rust definition against inftrees.h's `codetype' prototype, which is why this
+# target rather than a cargo test is where it is verified.
 #
 # PACKAGE METADATA IS COVERED, by prerequisite rather than by this recipe.
 # `rust-pc' is the second prerequisite, so a green `rust-test' also means the
@@ -1854,7 +2007,12 @@ rust-test: rust rust-pc
 	    echo "make rust-test: this libc proves nothing about the archive published" >&2; \
 	    echo "make rust-test: for consumers, so this stops instead:" >&2; \
 	    echo "make rust-test:     make rust rust-test RUSTC=/path/to/rustc" >&2; \
-	    echo "make rust-test:     make rust rust-test RUSTPCPRIVATE=\"-lm -lpthread -lc\"" >&2; \
+	    echo "make rust-test: or state the set, having asked rustc for the target:" >&2; \
+	    echo "make rust-test:     : > /tmp/pc-probe.rs" >&2; \
+	    echo "make rust-test:     rustc --print native-static-libs --crate-type staticlib \\" >&2; \
+	    echo "make rust-test:         [--target <triple>] -o /tmp/pc-probe.a /tmp/pc-probe.rs" >&2; \
+	    echo "make rust-test:     make rust rust-test RUSTPCPRIVATE=\"<the note: line>\"" >&2; \
+	    echo "make rust-test: Seven libraries on a glibc host, -lgcc_s among them." >&2; \
 	    exit 1; \
 	  fi; \
 	  echo "make rust-test: static links additionally carry $$NSL"; \
@@ -1905,7 +2063,7 @@ rust-test: rust rust-pc
 	  echo hello world | ${QEMU_RUN} "$$RUSTLIB/minigziprust$(EXE)" | \
 	    ${QEMU_RUN} "$$RUSTLIB/minigziprust$(EXE)" -d; \
 	  ${QEMU_RUN} "$$RUSTLIB/examplerust$(EXE)" "$$RUSTLIB/tmprust.gz"; \
-	  rm -f "$$RUSTLIB/tmprust.gz"; \
+	  rm -f -- "$$RUSTLIB/tmprust.gz"; \
 	  ${QEMU_RUN} "$$RUSTLIB/infcoverrust$(EXE)"; \
 	); rc=$$?; \
 	if test $$rc -eq 0; then \
@@ -1996,7 +2154,7 @@ rust-symbols: rust
 	    echo "EXTRA in the Rust library (`wc -l < extra.syms`):"; \
 	    sed 's/^/    /' extra.syms; \
 	  fi; \
-	  rm -f missing.syms extra.syms; \
+	  rm -f -- missing.syms extra.syms; \
 	  echo '		*** zlib Rust symbol parity FAILED ***'; \
 	  false; \
 	fi
@@ -2119,7 +2277,7 @@ rust-header:
 	  echo 'make rust-header: though this target builds nothing.' >&2; \
 	  exit 1; \
 	fi; \
-	rm -f '$(RUSTHEADER)' $(RUSTHEADERSCRATCH); \
+	rm -f -- '$(RUSTHEADER)' $(RUSTHEADERSCRATCH); \
 	echo "$(RUSTCBINDGEN) --config cbindgen.toml --crate libz-rs-sys --output $(RUSTHEADER)"; \
 	if ! $(RUSTCBINDGEN) --config "$$srcroot/cbindgen.toml" --crate libz-rs-sys \
 	     --output '$(RUSTHEADER)' "$$srcroot" 2> '$(RUSTHEADER).warn'; then \
@@ -2149,8 +2307,17 @@ rust-header:
 	  case "$$std" in c89) relax='$(RUSTHEADERC89FLAGS)' ;; esac; \
 	  if ! $(CC) -std=$$std -fsyntax-only '$(RUSTHEADER).probe.c' \
 	       > '$(RUSTHEADER).log' 2>&1; then \
-	    echo "	C   -std=$$std: SKIPPED, $(CC) does not accept it"; \
-	    continue; \
+	    sed 's/^/    /' '$(RUSTHEADER).log' >&2; \
+	    echo "make rust-header: $(CC) does not accept -std=$$std, so the artifact was" >&2; \
+	    echo "make rust-header: never checked in that dialect.  Every dialect named in" >&2; \
+	    echo "make rust-header: RUSTHEADERCSTDS is REQUIRED: the C89 leg is the one that" >&2; \
+	    echo "make rust-header: catches a declaration the oldest supported consumer cannot" >&2; \
+	    echo "make rust-header: compile, and skipping legs individually let this gate pass" >&2; \
+	    echo "make rust-header: while proving only that one dialect worked.  Name a compiler" >&2; \
+	    echo "make rust-header: that accepts them, or state the set you can support:" >&2; \
+	    echo "make rust-header:     make rust-header CC=gcc" >&2; \
+	    echo "make rust-header:     make rust-header RUSTHEADERCSTDS=\"c99 c17\"" >&2; \
+	    exit 1; \
 	  fi; \
 	  for tgt in host $(RUSTHEADERTARGETS); do \
 	    case "$$tgt" in \
@@ -2171,8 +2338,14 @@ rust-header:
 	for std in $(RUSTHEADERCXXSTDS); do \
 	  if ! $(RUSTHEADERCXX) -std=$$std -fsyntax-only -x c++ \
 	       '$(RUSTHEADER).probe.c' > '$(RUSTHEADER).log' 2>&1; then \
-	    echo "	C++ -std=$$std: SKIPPED, $(RUSTHEADERCXX) does not accept it"; \
-	    continue; \
+	    sed 's/^/    /' '$(RUSTHEADER).log' >&2; \
+	    echo "make rust-header: $(RUSTHEADERCXX) does not accept -std=$$std, so the" >&2; \
+	    echo "make rust-header: extern \"C\" bracket every C++ consumer needs was never" >&2; \
+	    echo "make rust-header: checked in that dialect.  Every dialect named in" >&2; \
+	    echo "make rust-header: RUSTHEADERCXXSTDS is REQUIRED.  Name a compiler, or state" >&2; \
+	    echo "make rust-header: the set you can support:" >&2; \
+	    echo "make rust-header:     make rust-header RUSTHEADERCXX=clang++" >&2; \
+	    exit 1; \
 	  fi; \
 	  for tgt in host $(RUSTHEADERTARGETS); do \
 	    case "$$tgt" in \
@@ -2192,16 +2365,16 @@ rust-header:
 	  done; \
 	done; \
 	if test $$cran -eq 0; then \
-	  echo "make rust-header: no C dialect could be compiled, so the artifact" >&2; \
-	  echo "make rust-header: was never checked.  Name a dialect $(CC) accepts:" >&2; \
+	  echo "make rust-header: no C dialect ran, so the artifact was never checked." >&2; \
+	  echo "make rust-header: RUSTHEADERCSTDS is empty; name at least one dialect:" >&2; \
 	  echo "make rust-header:     make rust-header RUSTHEADERCSTDS=gnu99" >&2; \
 	  exit 1; \
 	fi; \
 	if test $$cxxran -eq 0; then \
-	  echo "make rust-header: no C++ dialect could be compiled, so the" >&2; \
-	  echo "make rust-header: extern \"C\" bracket every C++ consumer needs was" >&2; \
-	  echo "make rust-header: never checked.  Name a compiler and dialect:" >&2; \
-	  echo "make rust-header:     make rust-header RUSTHEADERCXX=clang++" >&2; \
+	  echo "make rust-header: no C++ dialect ran, so the extern \"C\" bracket every" >&2; \
+	  echo "make rust-header: C++ consumer needs was never checked.  RUSTHEADERCXXSTDS" >&2; \
+	  echo "make rust-header: is empty; name at least one dialect:" >&2; \
+	  echo "make rust-header:     make rust-header RUSTHEADERCXXSTDS=c++17" >&2; \
 	  exit 1; \
 	fi; \
 	skip=; for n in $(RUSTMACROFN); do skip="$$skip -e $$n"; done; \
@@ -2262,7 +2435,7 @@ rust-header:
 	  echo '		*** zlib Rust header gate FAILED ***'; \
 	  exit 1; \
 	fi; \
-	rm -f $(RUSTHEADERSCRATCH); \
+	rm -f -- $(RUSTHEADERSCRATCH); \
 	echo '		*** zlib Rust header gate OK ***'
 
 # Remove everything `rust', `rust-test' and `rust-header' produced: cargo's own
@@ -2425,10 +2598,10 @@ rust-clean:
 	for d in '$(RUSTTARGETDIR)' '$(RUSTLIBDIR)' '$(RUSTLIBDIR).new'; do \
 	  test -n "$$d" || continue; \
 	  test -d "$$d" || continue; \
-	  echo "rm -rf $$d"; \
-	  rm -rf "$$d"; \
+	  echo "rm -rf -- $$d"; \
+	  rm -rf -- "$$d"; \
 	done; \
-	rm -f '$(RUSTHEADER)' $(RUSTHEADERSCRATCH) \
+	rm -f -- '$(RUSTHEADER)' $(RUSTHEADERSCRATCH) \
 	      generated_zlib.h rust.syms c.syms missing.syms extra.syms
 
 libz.a: $(OBJS)

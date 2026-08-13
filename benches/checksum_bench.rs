@@ -25,7 +25,7 @@
 //!   exposes its engines as named types behind the `Adler32Backend` and `Crc32Backend` traits, so
 //!   the scalar and autovectorizable paths are measured directly rather than inferred from two
 //!   whole-binary runs. `Adler32Generic`, `crc32::Generic` and `crc32::Braid` are always present;
-//!   `Adler32Simd` and `crc32::Simd` exist only under the `simd` feature. Each group also carries a
+//!   `Adler32Simd` and `crc32::StrideBraid` exist only under the `simd` feature. Each group also carries a
 //!   `dispatch` row -- the safe core's own entry point -- so that selection cost and, against the
 //!   throughput groups above, the cost of crossing the C ABI are both isolated.
 //!
@@ -36,7 +36,7 @@
 //!   this repository sets no `-C target-cpu` anywhere, so that baseline is the default for the
 //!   triple. A `simd` row that measures the same as its `generic` row is therefore a legitimate
 //!   outcome on a given machine and not a bug in this bench. Selection is likewise not what the
-//!   name suggests: `crc32::Simd` performs no run-time feature probe at all, and the Adler-32
+//!   name suggests: `crc32::StrideBraid` performs no run-time feature probe at all, and the Adler-32
 //!   dispatcher checks the input length first and treats detection only as a throughput hint --
 //!   which is why [`detected_cpu_features`] is printed as an *explanation of a rate* rather than as
 //!   a statement about which code ran.
@@ -193,13 +193,17 @@
 //! Silesia is deliberately **not** consulted. `corpus/README.md` names its two consumers --
 //! `benches/deflate_bench.rs` and `benches/inflate_bench.rs` -- and a checksum measured over
 //! several hundred megabytes of third-party data says nothing the 1 MiB steady-state case does
-//! not already say. `fetch_silesia.sh` is invoked by a human and by nothing else.
+//! not already say. `fetch_silesia.sh` is invoked in FETCHING mode by a human and by nothing else;
+//! the only automated invocation of it anywhere is `rust.yml`'s `--verify-only` check, which
+//! obtains nothing and does not concern this suite.
 //!
-//! ★ For a `[[bench]]` target `CARGO_MANIFEST_DIR` expands to the **host package's** directory
-//! -- `crates/zlib-rs-differential`, the crate whose manifest carries the `[[bench]]` entry --
-//! and *not* to the `benches/` directory this file lives in. That is genuinely surprising, so the
-//! one path derived from it is named once, in [`minimal_corpus_dir`]; the repository root, should a
-//! later case need it, is `<CARGO_MANIFEST_DIR>/../..`.
+//! ★ For a `[[bench]]` target `CARGO_MANIFEST_DIR` expands to the **host package's** directory,
+//! not to the file's own -- and the host package of this suite is `benches/Cargo.toml`, the
+//! excluded package `zlib-rs-benches`, which declares the `[[bench]]` entry that names this file.
+//! So the value is the `benches/` directory itself, the repository root is one component up, and
+//! the committed corpus hangs off the differential crate that owns it. The one path derived from
+//! that is named once, in [`minimal_corpus_dir`], so that a future case reads it there rather than
+//! re-deriving it.
 //!
 //! # Hygiene
 //!
@@ -226,6 +230,8 @@ use std::fs;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::sync::{Once, OnceLock};
+#[cfg(feature = "simd")]
+use std::time::{Duration, Instant};
 
 use criterion::measurement::WallTime;
 use criterion::{
@@ -244,7 +250,7 @@ use zlib_rs_differential::{oracle, port};
 #[cfg(feature = "simd")]
 use zlib_rs::adler32::Adler32Simd;
 #[cfg(feature = "simd")]
-use zlib_rs::crc32::Simd;
+use zlib_rs::crc32::StrideBraid;
 
 // =============================================================================
 //  Labels
@@ -1175,7 +1181,7 @@ fn uint_forwarders(c: &mut Criterion) {
 //  and `Crc32Backend` traits (AAP §0.3.3.5) rather than hiding them behind the dispatcher, and
 //  `Crc32Backend` even carries a `const NAME` whose documented purpose is to label a benchmark
 //  row. `Adler32Generic`, `crc32::Generic` and `crc32::Braid` are present in every configuration;
-//  `Adler32Simd` and `crc32::Simd` exist only under the `simd` feature, so the rows they produce
+//  `Adler32Simd` and `crc32::StrideBraid` exist only under the `simd` feature, so the rows they produce
 //  appear only in a run that compiled them -- which is why [`PORT_LABEL`] and the banner name the
 //  configuration.
 //
@@ -1328,7 +1334,7 @@ fn crc32_backends(c: &mut Criterion) {
         bench_crc32_backend::<Generic>(&mut group, len, &data, reference_value);
         bench_crc32_backend::<Braid>(&mut group, len, &data, reference_value);
         #[cfg(feature = "simd")]
-        bench_crc32_backend::<Simd>(&mut group, len, &data, reference_value);
+        bench_crc32_backend::<StrideBraid>(&mut group, len, &data, reference_value);
 
         // The dispatcher, for the same reason the Adler-32 group carries one: it isolates what
         // selection and conditioning cost from what the engine costs. `crc32.c` has no dispatcher
@@ -1661,8 +1667,586 @@ fn crc_table_accessor(c: &mut Criterion) {
 //  forwarders, the real-data cases, the backend comparison, the combine family, and the table
 //  accessor last because it is an observation rather than a measurement.
 
+// =================================================================================================
+//  The backend acceptance measurement -- the one part of this file that is enforced
+// =================================================================================================
+//
+//  ★ Everything above this line is an informational comparison and the module header says so. This
+//  section is different, and it is the answer to a specific question that the informational rows
+//  could not answer: **is the `simd` feature worth compiling in at all?**
+//
+//  The feature is optional, it is the only optional code path in the shipped library, and AAP
+//  §0.8.2 item 9 permits it solely because a check value is one scalar however its recurrence is
+//  evaluated -- so it may move a rate and can never move a byte. A feature admitted on those terms
+//  has to earn the compile-time cost and the second code path it creates, and "earn" is a
+//  measurement, not a design intent. Until this section existed the repository committed no result
+//  either way, which meant the CRC-32 backend's own module header had to say, accurately, that its
+//  throughput claim was "intent, not a result".
+//
+//  What is enforced, per backend family:
+//
+//    1. **Never slower.** At every measured length the feature-on backend's time must not exceed
+//       the scalar baseline it replaces. A feature that is faster on one input size and slower on
+//       another is not an optimization -- it is a bet on the caller's input, and a system library
+//       does not get to make that bet on a caller's behalf.
+//    2. **Faster somewhere.** At least one measured length must show a real speedup. Without this,
+//       a backend that merely forwarded to the baseline would pass condition 1 perfectly, and the
+//       gate would certify a no-op.
+//
+//  Both are decided from the same paired, order-alternating rounds that `benches/deflate_bench.rs`
+//  uses, for the same reason: two sweeps taken seconds apart on a shared machine differ by more
+//  than the effect being measured, whereas two equal-work runs taken microseconds apart in
+//  alternating order do not, and the residual is published rather than hidden.
+//
+//  The baseline is the backend the feature actually displaces, which is different for the two
+//  families and is why they are measured separately: `crc32/mod.rs` selects `StrideBraid` in place of
+//  `Braid`, so `braid` is CRC's baseline and the byte-at-a-time `generic` would be an unfairly slow
+//  one; `adler32/mod.rs` selects `Adler32Simd` in place of `Adler32Generic`, so `generic` is
+//  Adler's baseline and it has no third path.
+
+/// How many bytes the acceptance sweep measures, from below the shortest wide-path threshold to
+/// steady state.
+///
+/// Wider than [`BACKEND_SWEEP`] and for a different purpose. The informational rows compare engines
+/// at three representative scales; this sweep has to be able to *fail* the "never slower" condition,
+/// so it needs points on both sides of every threshold either family switches on. Reading them in
+/// order:
+///
+/// * `16` -- below both CRC thresholds and below Adler's lane threshold, so every backend runs its
+///   byte or word tail and nothing else. A regression here is pure per-call overhead.
+/// * `32`, `48` -- still below Adler's lane threshold, so the delegation the threshold performs is
+///   measured rather than assumed. `adler32/simd.rs`'s own documentation used to note that the
+///   benchmark never descended below the threshold and therefore could not say what the delegation
+///   cost; these two points and `16` are what closed that gap.
+/// * `55` -- exactly `crc32/simd.rs`'s `MIN_STRIDE_LEN` (`N * W + 2 * W - 1`), the first length at
+///   which the CRC feature path runs its own body rather than delegating.
+/// * `64` -- `adler32/simd.rs`'s lane threshold, the first length at which the Adler feature path
+///   runs its vector body. Shared with [`BACKEND_SWEEP`] so the two sets have a comparable point.
+/// * `256`, `4096` -- L1-resident, the range a `gzread` or an `inflate` call actually checksums.
+/// * `65536` -- past L1 on a typical host and past `NMAX` (5552) several times over, so Adler's
+///   modulo schedule has run its full period repeatedly.
+/// * `1 << 20` -- steady state, memory-bandwidth bound, the length at which a body that is one
+///   instruction longer per word shows up and a shortened epilogue does not.
+#[cfg(feature = "simd")]
+const ACCEPTANCE_SWEEP: [usize; 9] = [16, 32, 48, 55, 64, 256, 4096, 65536, 1 << 20];
+
+/// Paired rounds per acceptance case.
+///
+/// Nine, as in `benches/deflate_bench.rs`: an odd count so the median is a sample rather than a mean
+/// of two, and enough rounds that one descheduled round cannot move it.
+#[cfg(feature = "simd")]
+const ACCEPTANCE_ROUNDS: u32 = 9;
+
+/// Wall-clock budget for the calibration probe that sizes a round.
+///
+/// ★ Twenty milliseconds, and the figure is load-bearing rather than arbitrary. It was 2 ms, which
+/// is enough to average out the timer but *not* enough to average out the scheduler: on a shared
+/// machine a 2 ms round can be descheduled in its entirety, and the null measurement showed exactly
+/// that -- two timed runs of identical code differing by 20% or more on the 6-to-20-nanosecond
+/// cases, where a round is millions of repetitions of a call shorter than a scheduling decision. At
+/// 20 ms a single deschedule is a few percent of the round rather than all of it.
+///
+/// The cost is bounded and small: three timed runs per round, nine rounds, nine lengths, two
+/// families, so about ten seconds of measurement for the whole acceptance sweep. That is the right
+/// trade against the alternative, which is widening the pass band until noise fits inside it.
+#[cfg(feature = "simd")]
+const ACCEPTANCE_CALIBRATION: Duration = Duration::from_millis(20);
+
+/// Ceiling on the repetitions one round may run, so a fast case cannot spin unboundedly.
+#[cfg(feature = "simd")]
+const ACCEPTANCE_MAX_REPS: u32 = 1 << 22;
+
+/// Nanoseconds in a second, as a float, so no integer is ever cast to one implicitly.
+#[cfg(feature = "simd")]
+const NANOS_PER_SEC: f64 = 1_000_000_000.0;
+
+/// The "never slower" limit: the feature-on backend may not take longer than its baseline.
+///
+/// One, exactly. A tolerance is applied on top of it per case rather than baked in here, because a
+/// fixed percentage would be too loose for the microsecond cases and too tight for the millisecond
+/// ones -- see [`acceptance_tolerance`].
+const ACCEPTANCE_LIMIT: f64 = 1.00;
+
+/// The "faster somewhere" bar: at least one measured length must reach this ratio or better.
+///
+/// 0.90, i.e. a 10% improvement at some length. Chosen to match the only throughput figure the AAP
+/// states -- §0.8.4's 10% -- rather than invented: a backend that cannot beat its own baseline by
+/// as much as the margin the whole port is allowed to lose against C is not carrying its weight as
+/// an optional second code path.
+const ACCEPTANCE_BENEFIT: f64 = 0.90;
+
+/// The candidate backend's label for the CRC-32 family, available with or without the feature.
+///
+/// Taken from [`StrideBraid::NAME`] when the feature is on, so the two cannot drift; written out
+/// when it is off, because the type does not exist to ask. A feature-off run still prints its
+/// `BACKEND-SUMMARY` line -- with `expected=0`, so a consumer can read "no candidate" rather than
+/// having to interpret an absent line -- and that line carries this label.
+#[cfg(feature = "simd")]
+const CRC32_CANDIDATE: &str = StrideBraid::NAME;
+
+/// See the feature-on spelling above.
+#[cfg(not(feature = "simd"))]
+const CRC32_CANDIDATE: &str = "stride-braid";
+
+/// The candidate backend's label for the Adler-32 family.
+///
+/// Written out in both configurations: `Adler32Backend` has no `NAME` associated constant, which
+/// `adler32_backends` already notes, so there is no constant to take it from.
+const ADLER32_CANDIDATE: &str = "simd";
+
+/// Which of an acceptance pair a timed closure is being asked to run.
+///
+/// One closure serving both, rather than two closures, because both need the same borrowed input
+/// buffer; a single closure captures it once and dispatches on this.
+#[cfg(feature = "simd")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Which {
+    /// The scalar backend the feature displaces.
+    Baseline,
+    /// The backend the `simd` feature selects.
+    Candidate,
+}
+
+/// One acceptance case's paired result.
+#[cfg(feature = "simd")]
+#[derive(Clone, Copy, Debug)]
+struct Acceptance {
+    /// Median nanoseconds per call for the baseline.
+    baseline_ns: f64,
+    /// Median nanoseconds per call for the candidate.
+    candidate_ns: f64,
+    /// The worst single round's ratio, so the spread is published rather than hidden by the median.
+    ratio_hi: f64,
+    /// ★ The measured noise floor: how much two runs of the **same** backend differ.
+    ///
+    /// Each round times the baseline twice, and this is the **second-largest** per-round spread
+    /// between those two identical measurements -- the largest with a single outlier round
+    /// discarded.
+    ///
+    /// ★ Both extremes were tried and both were wrong, which is why the statistic is worth spelling
+    /// out. The question is "how large a ratio *can* arise from nothing", so the median is too
+    /// generous a reading of it: a case whose identical runs agreed closely on most rounds published
+    /// a tolerance narrower than its own worst round and was intermittently failed by it -- that was
+    /// the 48-byte Adler case, where both backends run the same delegated code and the true ratio is
+    /// 1.000. The plain maximum is too pessimistic in the other direction: on a shared four-core
+    /// machine one round in nine is routinely descheduled, and letting that round define the floor
+    /// pushed most cases past [`ACCEPTANCE_NOISE_CEILING`] and had them refused as unmeasurable.
+    /// Discarding exactly one round is what makes the figure describe the measurement rather than
+    /// the scheduler, and nine rounds is enough that discarding one leaves eight. It is the answer to a question a fixed tolerance can only
+    /// guess at: on *this* host, in *this* run, at *this* length, how large a ratio can arise from
+    /// nothing at all? A candidate/baseline ratio inside this figure is indistinguishable from two
+    /// runs of one backend, so it is not evidence of a regression -- and one outside it is.
+    ///
+    /// This is what the review asked for when it objected to constants that were "design choices,
+    /// not measured crossovers": the allowance is now an observation. Nothing about it is tuned,
+    /// and it costs one extra timed run per round.
+    noise: f64,
+    /// How many paired rounds produced the medians.
+    rounds: u32,
+}
+
+/// Repetitions per round, from one probe call of `which`.
+#[cfg(feature = "simd")]
+fn acceptance_calibrate<F: FnMut(Which) -> u64>(op: &mut F, which: Which) -> u32 {
+    let started = Instant::now();
+    black_box(op(which));
+    let probe_ns = started.elapsed().as_nanos().max(1);
+    let wanted = ACCEPTANCE_CALIBRATION.as_nanos() / probe_ns;
+    u32::try_from(wanted.clamp(1, u128::from(ACCEPTANCE_MAX_REPS))).unwrap_or(ACCEPTANCE_MAX_REPS)
+}
+
+/// Mean nanoseconds per call over `reps` calls of one side.
+///
+/// The checksum each call returns is folded into an accumulator and handed to [`black_box`], so the
+/// optimizer cannot hoist the call out of the loop or discard it as dead -- a timed loop whose body
+/// has been deleted measures the loop.
+#[cfg(feature = "simd")]
+fn acceptance_round<F: FnMut(Which) -> u64>(op: &mut F, which: Which, reps: u32) -> f64 {
+    let mut sink = 0_u64;
+    let started = Instant::now();
+    for _ in 0..reps {
+        sink = sink.wrapping_add(op(which));
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    black_box(sink);
+    elapsed * NANOS_PER_SEC / f64::from(reps)
+}
+
+/// Times the two backends against each other in [`ACCEPTANCE_ROUNDS`] paired, alternating rounds.
+///
+/// Both sides get the **same** repetition count -- the smaller of the two probes' -- so a round is
+/// two equal-work measurements taken microseconds apart. Even rounds run the baseline first, odd
+/// rounds the candidate, so neither collects the second-mover cache advantage a fixed order hands
+/// out. This is `benches/deflate_bench.rs`'s protocol, and it is the same protocol because the
+/// alternative -- one sweep of each -- is what produced the ordering bias that made the earlier
+/// informational rows unusable as evidence.
+#[cfg(feature = "simd")]
+fn acceptance_ns<F: FnMut(Which) -> u64>(mut op: F) -> Option<Acceptance> {
+    let reps = acceptance_calibrate(&mut op, Which::Baseline)
+        .min(acceptance_calibrate(&mut op, Which::Candidate));
+
+    let mut baseline_samples = Vec::with_capacity(ACCEPTANCE_ROUNDS as usize);
+    let mut candidate_samples = Vec::with_capacity(ACCEPTANCE_ROUNDS as usize);
+    let mut noise_samples = Vec::with_capacity(ACCEPTANCE_ROUNDS as usize);
+    let mut ratio_hi = f64::NEG_INFINITY;
+
+    for round in 0..ACCEPTANCE_ROUNDS {
+        // Three timed runs per round, not two: the baseline is timed on both sides of the
+        // candidate. The pair of baseline runs is the null measurement -- two runs of identical
+        // code -- and their spread is what [`Acceptance::noise`] reports. Timing them either side
+        // of the candidate rather than back to back is deliberate: back-to-back runs share a warm
+        // cache and a stable frequency and would understate the noise the real comparison sees.
+        let (baseline_ns, candidate_ns, other_ns) = if round % 2 == 0 {
+            let first = acceptance_round(&mut op, Which::Baseline, reps);
+            let candidate = acceptance_round(&mut op, Which::Candidate, reps);
+            (
+                first,
+                candidate,
+                acceptance_round(&mut op, Which::Baseline, reps),
+            )
+        } else {
+            let first = acceptance_round(&mut op, Which::Candidate, reps);
+            let baseline = acceptance_round(&mut op, Which::Baseline, reps);
+            (
+                baseline,
+                first,
+                acceptance_round(&mut op, Which::Baseline, reps),
+            )
+        };
+        if baseline_ns > 0.0 {
+            ratio_hi = ratio_hi.max(candidate_ns / baseline_ns);
+        }
+        // The symmetric spread of the two identical runs, as a ratio above one. Symmetric because
+        // which of the two happened to be faster is meaningless.
+        let (low, high) = if baseline_ns <= other_ns {
+            (baseline_ns, other_ns)
+        } else {
+            (other_ns, baseline_ns)
+        };
+        if low > 0.0 {
+            noise_samples.push(high / low - 1.0);
+        }
+        baseline_samples.push(baseline_ns);
+        candidate_samples.push(candidate_ns);
+    }
+
+    baseline_samples.sort_by(f64::total_cmp);
+    candidate_samples.sort_by(f64::total_cmp);
+    noise_samples.sort_by(f64::total_cmp);
+    // The second-largest spread: ascending order, so one index below the last. `saturating_sub`
+    // handles the degenerate one-sample case by taking that sample.
+    let noise = noise_samples
+        .len()
+        .checked_sub(2)
+        .and_then(|at| noise_samples.get(at).copied())
+        .or_else(|| noise_samples.last().copied())
+        .unwrap_or(0.0);
+    Some(Acceptance {
+        baseline_ns: *baseline_samples.get(baseline_samples.len() / 2)?,
+        candidate_ns: *candidate_samples.get(candidate_samples.len() / 2)?,
+        ratio_hi: if ratio_hi.is_finite() {
+            ratio_hi
+        } else {
+            f64::NAN
+        },
+        noise: if noise.is_finite() { noise } else { 0.0 },
+        rounds: ACCEPTANCE_ROUNDS,
+    })
+}
+
+/// The smallest allowance any case gets, however quiet the host looked.
+///
+/// A machine can be quiet enough during the null runs that the measured spread is near zero, and
+/// publishing a near-zero tolerance would make the gate fail on the next slightly noisier run. Half
+/// a percent is small enough that no real regression hides under it -- the smallest effect this
+/// suite is built to detect is 10% -- and large enough to survive a quiet-host measurement.
+#[cfg(feature = "simd")]
+const ACCEPTANCE_NOISE_FLOOR: f64 = 0.005;
+
+/// The largest allowance any case gets, however noisy the host was.
+///
+/// ★ The safeguard on a self-measured tolerance. A derived allowance is better evidence than a
+/// constant, but it has a failure mode a constant does not: on a badly contended machine the null
+/// spread grows without limit, and a tolerance that grew with it would eventually admit anything.
+/// Ten percent is where that stops. A case whose two identical runs differ by more than 10% has not
+/// measured its backend, and the honest response is to refuse the result rather than to widen the
+/// bar until it passes -- which is why exceeding this is reported as a case that could not be
+/// measured, and why `.github/scripts/bench_gate.py` independently refuses any published tolerance
+/// above the same figure.
+#[cfg(feature = "simd")]
+const ACCEPTANCE_NOISE_CEILING: f64 = 0.10;
+
+/// The noise allowance for one acceptance case, from that case's own null measurement.
+///
+/// ★ This is an observation, not a constant. [`Acceptance::noise`] is the median spread between two
+/// timed runs of *identical* code at this length on this host, so it is exactly the size of ratio
+/// that can arise from nothing; a candidate/baseline ratio inside it is not evidence. The earlier
+/// form of this function converted a guessed 0.5 ns timer allowance into a ratio, and the guess was
+/// wrong in a way that only measurement showed: the 32-byte CRC case, where both backends run the
+/// *same* delegated code, reported ratios from 0.97 to 1.03 across runs -- a spread of 1 ns, twice
+/// the guess -- and was intermittently failed by it.
+///
+/// Bounded at both ends, for the reasons [`ACCEPTANCE_NOISE_FLOOR`] and
+/// [`ACCEPTANCE_NOISE_CEILING`] give.
+#[cfg(feature = "simd")]
+fn acceptance_tolerance(noise: f64) -> f64 {
+    if noise.is_finite() {
+        noise.clamp(ACCEPTANCE_NOISE_FLOOR, ACCEPTANCE_NOISE_CEILING)
+    } else {
+        ACCEPTANCE_NOISE_CEILING
+    }
+}
+
+/// Accumulates one backend family's acceptance cases and prints its summary line.
+struct AcceptanceLedger {
+    /// The family: `"crc32"` or `"adler32"`.
+    family: &'static str,
+    /// The scalar backend's label, as it appears on every case line.
+    baseline: &'static str,
+    /// The feature-on backend's label.
+    candidate: &'static str,
+    /// How many cases the sweep set out to measure, so an absent case cannot read as a pass.
+    expected: u32,
+    /// How many produced a ratio.
+    cases: u32,
+    /// How many exceeded [`ACCEPTANCE_LIMIT`] plus their own tolerance.
+    over: u32,
+    /// ★ How many cases were refused because the host was too noisy to measure them.
+    ///
+    /// A case whose two identical null runs differ by more than [`ACCEPTANCE_NOISE_CEILING`] has
+    /// not measured its backend, and publishing a ratio for it would be publishing the scheduler.
+    /// Counting those separately is what lets a consumer tell "the candidate is fine" from "this
+    /// machine could not tell" -- and `cases + unmeasured == expected` is then an exact identity a
+    /// gate can check, so a case that vanished for any *other* reason is still caught.
+    unmeasured: u32,
+    /// The best ratio any case reached, which decides the "faster somewhere" condition.
+    best: f64,
+}
+
+impl AcceptanceLedger {
+    /// An empty ledger for one family.
+    fn new(
+        family: &'static str,
+        baseline: &'static str,
+        candidate: &'static str,
+        expected: u32,
+    ) -> Self {
+        Self {
+            family,
+            baseline,
+            candidate,
+            expected,
+            cases: 0,
+            over: 0,
+            unmeasured: 0,
+            best: f64::INFINITY,
+        }
+    }
+
+    /// Record one length's paired result, printing its `BACKEND` line.
+    #[cfg(feature = "simd")]
+    fn record(&mut self, len: usize, paired: &Acceptance) {
+        if paired.baseline_ns <= 0.0 || paired.candidate_ns <= 0.0 {
+            eprintln!(
+                "checksum_bench: no acceptance ratio for family={family} case={len}: the paired \
+                 rounds measured {baseline} at {b} ns and {candidate} at {c} ns, and a zero on \
+                 either side is a broken measurement rather than an infinitely fast backend.",
+                family = self.family,
+                baseline = self.baseline,
+                candidate = self.candidate,
+                b = paired.baseline_ns,
+                c = paired.candidate_ns,
+            );
+            return;
+        }
+
+        if paired.noise > ACCEPTANCE_NOISE_CEILING {
+            eprintln!(
+                "checksum_bench: no acceptance ratio for family={family} case={len}: two timed \
+                 runs of the SAME backend differed by {noise:.1}%, above the {ceiling:.0}% \
+                 ceiling, so this host was too contended for the comparison to mean anything. \
+                 Re-run on a quiet machine rather than reading the ratio.",
+                family = self.family,
+                noise = paired.noise * 100.0,
+                ceiling = ACCEPTANCE_NOISE_CEILING * 100.0,
+            );
+            self.unmeasured = self.unmeasured.saturating_add(1);
+            return;
+        }
+
+        let ratio = paired.candidate_ns / paired.baseline_ns;
+        let tolerance = acceptance_tolerance(paired.noise);
+        let allowed = ACCEPTANCE_LIMIT + tolerance;
+        let verdict = if ratio > allowed { "over" } else { "within" };
+
+        self.cases = self.cases.saturating_add(1);
+        if ratio > allowed {
+            self.over = self.over.saturating_add(1);
+        }
+        self.best = self.best.min(ratio);
+
+        eprintln!(
+            "checksum_bench: BACKEND family={family} case={len} baseline={baseline} \
+             candidate={candidate} baseline_ns={b:.1} candidate_ns={c:.1} ratio={ratio:.3} \
+             ratio_hi={hi:.3} noise={noise:.4} tolerance={tolerance:.4} rounds={rounds} \
+             order=alternating limit={ACCEPTANCE_LIMIT:.2} verdict={verdict}",
+            family = self.family,
+            baseline = self.baseline,
+            candidate = self.candidate,
+            b = paired.baseline_ns,
+            c = paired.candidate_ns,
+            hi = paired.ratio_hi,
+            noise = paired.noise,
+            rounds = paired.rounds,
+        );
+    }
+
+    /// Print the family's aggregate `BACKEND-SUMMARY` line.
+    ///
+    /// `best` is the field that answers "is the feature worth having": it is the strongest speedup
+    /// any measured length showed, and a consumer requires it at or below [`ACCEPTANCE_BENEFIT`].
+    /// `expected=0` is printed by a build without the feature, where there is no candidate to
+    /// measure and therefore nothing to accept -- which a consumer must be able to tell apart from
+    /// a feature-on run that measured nothing, and can, because only the latter has `expected>0`.
+    fn finish(&self) {
+        eprintln!(
+            "checksum_bench: BACKEND-SUMMARY family={family} baseline={baseline} \
+             candidate={candidate} expected={expected} cases={cases} over={over} \
+             unmeasured={unmeasured} best={best:.3} limit={ACCEPTANCE_LIMIT:.2} \
+             benefit={ACCEPTANCE_BENEFIT:.2}",
+            family = self.family,
+            baseline = self.baseline,
+            candidate = self.candidate,
+            expected = self.expected,
+            cases = self.cases,
+            over = self.over,
+            unmeasured = self.unmeasured,
+            best = if self.best.is_finite() {
+                self.best
+            } else {
+                f64::NAN
+            },
+        );
+    }
+}
+
+/// Whether the `simd` feature was compiled in, as the count of cases the sweep will produce.
+///
+/// Zero without the feature. A feature-off run still prints both `BACKEND-SUMMARY` lines, with
+/// `expected=0`, so that a consumer can require one line per family in every run and read the
+/// count rather than having to interpret an absent line.
+#[cfg(feature = "simd")]
+const fn acceptance_expected() -> u32 {
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        ACCEPTANCE_SWEEP.len() as u32
+    }
+}
+
+/// See the feature-on spelling above: zero, because there is no candidate backend to measure.
+#[cfg(not(feature = "simd"))]
+const fn acceptance_expected() -> u32 {
+    0
+}
+
+/// CRC-32: the feature-on backend against `braid`, the backend it displaces, at every sweep length.
+///
+/// Registers no criterion row. The paired protocol above is the measurement, and adding criterion
+/// rows for the same comparison would double the run time to produce a second, order-biased answer
+/// to a question already answered.
+#[allow(unused_variables, unused_mut)]
+fn crc32_acceptance(_c: &mut Criterion) {
+    report_configuration();
+
+    let mut ledger =
+        AcceptanceLedger::new("crc32", Braid::NAME, CRC32_CANDIDATE, acceptance_expected());
+
+    #[cfg(feature = "simd")]
+    for &len in &ACCEPTANCE_SWEEP {
+        let data = sweep_bytes(len);
+
+        // Correctness before speed, exactly as the informational rows do it: a rate for a wrong
+        // value is worse than no rate. Both backends are checked against the C oracle rather than
+        // against each other, so a shared mistake cannot agree its way past this.
+        let reference = oracle_crc32_z(0, &data);
+        let baseline = uLong::from(crc32_through::<Braid>(CRC32_START, &data));
+        let candidate = uLong::from(crc32_through::<StrideBraid>(CRC32_START, &data));
+        if !agrees(
+            Braid::NAME,
+            format_args!("acceptance len={len}"),
+            baseline,
+            reference,
+        ) || !agrees(
+            CRC32_CANDIDATE,
+            format_args!("acceptance len={len}"),
+            candidate,
+            reference,
+        ) {
+            continue;
+        }
+
+        let Some(paired) = acceptance_ns(|which| match which {
+            Which::Baseline => u64::from(crc32_through::<Braid>(CRC32_START, &data)),
+            Which::Candidate => u64::from(crc32_through::<StrideBraid>(CRC32_START, &data)),
+        }) else {
+            continue;
+        };
+        ledger.record(len, &paired);
+    }
+
+    ledger.finish();
+}
+
+/// Adler-32: the feature-on backend against `generic`, at every sweep length. Same shape as
+/// [`crc32_acceptance`]; a different family and a different baseline.
+#[allow(unused_variables, unused_mut)]
+fn adler32_acceptance(_c: &mut Criterion) {
+    report_configuration();
+
+    let mut ledger = AcceptanceLedger::new(
+        "adler32",
+        "generic",
+        ADLER32_CANDIDATE,
+        acceptance_expected(),
+    );
+
+    #[cfg(feature = "simd")]
+    for &len in &ACCEPTANCE_SWEEP {
+        let data = sweep_bytes(len);
+
+        let reference = oracle_adler32_z(ADLER32_SEED, &data);
+        let baseline = uLong::from(Adler32Generic::checksum(ADLER32_START, &data));
+        let candidate = uLong::from(Adler32Simd::checksum(ADLER32_START, &data));
+        if !agrees(
+            "Adler32Generic",
+            format_args!("acceptance len={len}"),
+            baseline,
+            reference,
+        ) || !agrees(
+            "Adler32Simd",
+            format_args!("acceptance len={len}"),
+            candidate,
+            reference,
+        ) {
+            continue;
+        }
+
+        let Some(paired) = acceptance_ns(|which| match which {
+            Which::Baseline => u64::from(Adler32Generic::checksum(ADLER32_START, &data)),
+            Which::Candidate => u64::from(Adler32Simd::checksum(ADLER32_START, &data)),
+        }) else {
+            continue;
+        };
+        ledger.record(len, &paired);
+    }
+
+    ledger.finish();
+}
+
 criterion_group!(
     checksum_benches,
+    crc32_acceptance,
+    adler32_acceptance,
     adler32_throughput,
     crc32_throughput,
     uint_forwarders,

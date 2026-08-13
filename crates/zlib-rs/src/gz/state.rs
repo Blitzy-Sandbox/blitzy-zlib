@@ -1402,11 +1402,41 @@ const _: () = assert!(HOW_LOOK as i32 == LOOK);
 ///   read stream (100.4%)**.
 ///
 /// Folding the first into the second hides a real difference behind a large denominator; quoting only
-/// the first misrepresents what a stream costs. The same discipline applies to the deflate and
-/// inflate states, whose fixed overheads measure +2.9% and +1.9% on this target -- 6144 against C's
-/// 5968 and 7296 against 7160, the latter pinned by
-/// `inline_arrays_and_state_footprint_match_the_c_budget` -- and which are equally not the whole
-/// story.
+/// the first misrepresents what a stream costs.
+///
+/// # ★ The engine states have no single size either, so all of theirs are given too
+///
+/// The same discipline applies to the deflate and inflate states, and there it applies twice over,
+/// because both are generic over their allocator: a zero-sized [`crate::allocate::GlobalAllocator`]
+/// adds nothing to the struct, a reference adds one word, a `&dyn` handle adds two, and the block a
+/// caller's `zalloc` is actually asked for adds the C-visible prefix on top. Naming one of those as
+/// "the" size is wrong for the others, and this note used to do exactly that -- it quoted 6144 for
+/// deflate, which is no form of the type at all. Measured on this target against C's 5968-byte
+/// `deflate_state` (`deflate.h` L104-L288) and 7160-byte `inflate_state` (`inflate.h` L83-L125):
+///
+/// | form | deflate | inflate |
+/// |---|---:|---:|
+/// | core state, zero-sized `GlobalAllocator` | 6192 (103.8%) | 7296 (101.9%) |
+/// | core state, `&GlobalAllocator` | 6232 (104.4%) | 7312 (102.1%) |
+/// | core state, `&dyn Allocator` | 6272 (105.1%) | 7328 (102.3%) |
+/// | core state, the facade's `StreamAllocator` | 6312 (105.8%) | 7344 (102.6%) |
+/// | + the facade's own per-stream members | 6320 (105.9%) | 7368 (102.9%) |
+/// | **the block a `zalloc` is asked for** | **6336 (106.2%)** | **7384 (103.1%)** |
+///
+/// The last row is the one to quote when the question is what a stream costs: it is the only figure
+/// any allocator sees, and it is the figure the ≤15% budget applies to -- 6863 bytes for deflate and
+/// 8234 for inflate, so both are inside it with room. Every row is pinned by a test rather than
+/// written down, in the crate that can name the types: the four core forms by
+/// `crate::deflate::state`'s `state_footprint_matches_the_c_budget` and
+/// `crate::inflate::state`'s `inline_arrays_and_state_footprint_match_the_c_budget`, the two facade
+/// forms by the `the_facade_state_block_footprint_matches_the_c_budget` pair in
+/// `libz_rs_sys::deflate` and `libz_rs_sys::inflate`. A figure in this table that drifts fails a
+/// test rather than becoming a stale sentence.
+///
+/// And these fixed overheads are equally not the whole story. A live deflate stream carries four
+/// buffers besides its state -- a quarter of a megabyte at the default configuration, forty times
+/// the state itself -- so every number above is a rounding error against what a stream that is
+/// actually compressing costs.
 ///
 /// A `gzFile` has no caller-supplied allocator to instrument, which is why the measurement uses a
 /// global one: C's gz layer clears the hooks on its own embedded stream before initialising an engine

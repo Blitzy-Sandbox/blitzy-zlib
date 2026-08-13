@@ -93,9 +93,10 @@ version = "0.0.0"
 # inherit from and `field.workspace = true` would be a hard error anywhere in
 # this file.
 edition = "2021"
-# MSRV floor for the whole workspace.  Edition 2024 would require rustc >= 1.85
-# and Cargo rejects that combination at this MSRV, so 2021 is the only valid
-# choice.
+# MSRV floor for the whole workspace, matching the root one so the fuzz harness
+# cannot quietly require more than the library.  Edition 2024 would need
+# rustc >= 1.85 and Cargo rejects that combination at this floor, so the 2021
+# above is the AAP-required edition and also the latest one compatible with it.
 rust-version = "1.80"
 # Matches ../LICENSE (the zlib licence) and every other crate manifest in the
 # tree.
@@ -360,6 +361,29 @@ doc_markdown = "allow"
 # codegen unit here would only slow instrumented rebuilds and risk interfering
 # with the coverage instrumentation, for no benefit to the fuzzing gate.
 debug = 1
+
+# The one shared library in this package.
+#
+# WHY A LIB AT ALL, in a package whose whole purpose is five independent binaries: the seed
+# corpus gate needs every target to answer the same question in the same words -- "what did
+# this execution reach?" -- and five copies of that helper would be five things to drift.
+# `fuzz/src/lib.rs` is that helper and nothing else: an environment check resolved once per
+# process and one `eprintln!`.
+#
+# It does NOT disturb the contract below.  `cargo fuzz list` enumerates `[[bin]]` targets, so
+# the five names it prints are unchanged, and `cargo fuzz run <name>` builds one bin plus
+# whatever it depends on.  A lib target is also what lets `cargo +nightly clippy
+# --all-targets` lint the helper under the same `[lints]` tables the binaries get.
+[lib]
+name = "zlib_rs_fuzz"
+path = "src/lib.rs"
+# A fuzz package is not a test package: `cargo fuzz` never runs `cargo test` here, and the
+# helper's behaviour is asserted by the CI gate that consumes its output.  Keeping these off
+# matches the five bins below and keeps `cargo +nightly clippy --all-targets` to the targets
+# that exist.
+test = false
+doc = false
+bench = false
 
 # Fuzz targets
 #

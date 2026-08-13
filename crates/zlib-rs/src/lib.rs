@@ -219,7 +219,7 @@
 //! re-export would dangle in the default configuration.
 //!
 //! The corollary covers items whose *definition* is gated rather than merely their root
-//! re-export, and it is stricter: a `gz::state::GzState` or a `crc32::Simd` cannot be linked from
+//! re-export, and it is stricter: a `gz::state::GzState` or a `crc32::StrideBraid` cannot be linked from
 //! ungated documentation at all, because in a build without `std` or without `simd` the item does
 //! not exist and `#![deny(rustdoc::broken_intra_doc_links)]` would fail the build. Those names are
 //! therefore written as plain code spans throughout this crate's ungated prose, and only

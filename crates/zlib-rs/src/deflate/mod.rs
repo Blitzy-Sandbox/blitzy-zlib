@@ -715,6 +715,40 @@ pub fn deflate_tune<'a, A: Allocator<'a>>(
     ReturnCode::OK
 }
 
+/// Whether a [`deflate_params`] change with these arguments will flush the open block, and
+/// therefore whether it will read the caller's input at all.
+///
+/// Exactly the condition at `deflate.c` L791 --
+/// `(strategy != s->strategy || func != configuration_table[level].func) && s->last_flush != -2`
+/// -- evaluated without changing anything, so that a caller can find out in advance what
+/// [`deflate_params`] is about to do.
+///
+/// ★ **Why this is worth a public function rather than a comment.** The C ABI facade serves an
+/// overlapping `(next_in, avail_in)` / `(next_out, avail_out)` pair by copying the input in
+/// bounded chunks, which for `deflateParams` means feeding every chunk but the last through an
+/// ordinary `Z_NO_FLUSH` [`deflate`] and letting this function's inner `Z_BLOCK` call see the
+/// last one. That is byte-for-byte what C does *when the inner call runs at all* -- and
+/// nothing at all when it does not, because then C reads none of the caller's input and
+/// pre-feeding it would consume bytes the reference leaves untouched. The facade cannot tell
+/// those two apart from outside, so this states the test once, here, beside the code that
+/// applies it, instead of letting a second copy of it drift in another crate.
+///
+/// An out-of-range `level` or `strategy` answers `false`: [`deflate_params`] rejects such a
+/// call with `Z_STREAM_ERROR` before it reaches L791, having read nothing.
+#[must_use]
+pub fn deflate_params_will_flush<'a, A: Allocator<'a>>(
+    state: &DeflateState<'a, A>,
+    level: i32,
+    strategy: i32,
+) -> bool {
+    let Ok((level, strategy)) = validate_deflate_params_change(level, strategy) else {
+        return false;
+    };
+    let func = config_for_level(state.level).func;
+    (strategy != state.strategy || func != config_for_level(i32::from(level)).func)
+        && state.last_flush != -2
+}
+
 /// Changes the compression level and strategy of a live stream.
 ///
 /// The Rust counterpart of `deflateParams` (`deflate.c` L774-L816), declared at `zlib.h` L723. The

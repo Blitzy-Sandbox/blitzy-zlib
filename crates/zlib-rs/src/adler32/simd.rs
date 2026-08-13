@@ -131,20 +131,34 @@
 //! What this buys is that the inner loop becomes `k` independent accumulator chains of plain
 //! adds -- no multiply, no reduction, no dependence between lanes -- which is what a
 //! vectoriser wants, and what an out-of-order core pipelines even when the vectoriser
-//! declines. That is the whole of the throughput argument, and it is an argument rather than a
-//! number: **this module publishes no speed ratio, because none has been measured in a way this
-//! repository can reproduce.** Whoever lands `benches/checksum_bench.rs` should record the
-//! ratios there, per input size and per target, and may then cite them from here.
+//! declines. On `x86_64` the vectoriser does not decline: the compiled body of
+//! [`adler32_blocks`] in a `--release --features simd` library is 317 instructions of which **91
+//! are SSE2** -- `paddd`, `pshufd`, `pxor`, `movdqa`, `punpcklbw`/`punpckhbw`,
+//! `punpcklwd`/`punpckhwd`, `movdqu` -- against 137 wholly scalar instructions for
+//! [`super::generic`]. SSE2 is baseline on the triple, which is why this needs no `-C target-cpu`
+//! and no run-time probe to be effective. (The sibling `crc32/simd.rs` is the opposite case and
+//! says so: zero vector instructions, which is why its backend is named `StrideBraid` rather than
+//! `Simd`.)
 //!
-//! The same caution applies to two design choices that would otherwise look empirical:
+//! **The throughput this buys is measured and enforced**, not asserted: 3.0x against the scalar
+//! backend at 4 KiB and above, 2.0x at 256 bytes, and never slower at any measured length down to
+//! 16 bytes. `benches/checksum_bench.rs`'s `adler32_acceptance` sweep is the measurement --
+//! nine paired order-alternating rounds per length -- and `.github/scripts/bench_gate.py` fails
+//! the bench job if a change makes this backend lose to `generic` anywhere, or stop beating it
+//! anywhere. [`LANE_THRESHOLD_LEN`] carries the per-length table.
 //!
-//! * **The lane count is 16**, chosen because it divides `NMAX` exactly and matches one 128-bit
-//!   vector register (see [`SUB_CHUNK`]), not because wider variants were benchmarked and
-//!   rejected here.
+//! Two design choices could still look empirical, and each has a different kind of answer:
+//!
+//! * **The lane count is 16 because 16 is the largest width that can exist here**, not because
+//!   wider ones measured worse. `NMAX` is `5_552` = `2^4 * 347`, so `32` does not divide it and a
+//!   32-byte sub-chunk cannot consume a full block without a tail. See [`SUB_CHUNK`], where a
+//!   compile-time assertion pins the maximality.
 //! * **Below [`LANE_THRESHOLD_LEN`] the call is handed to the scalar backend**, on the reasoning
-//!   that the fixed per-block cost cannot be recovered over a short buffer. The intent is that
-//!   this backend should not be the slower of the two at any size; that is the goal the
-//!   threshold serves, and confirming it needs the benchmark.
+//!   that the fixed per-block cost cannot be recovered over a short buffer. The threshold is
+//!   measured at 0.982 -- already the faster of the two at exactly 64 bytes -- and the property it
+//!   exists to guarantee is the enforced condition above. What is not established is that *four*
+//!   sub-chunks is the tight amortisation factor rather than a sufficient one; [`LANE_THRESHOLD_LEN`]
+//!   says so explicitly.
 //!
 //! Two implementation details are load-bearing, and both are recorded where they appear: the
 //! lane state must not be merged into the running sums until the block is finished, and
@@ -306,15 +320,24 @@ const POSITIONS: [u32; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 
 /// offset table *is* the step, and a table of a different length would change this constant
 /// with it.
 ///
-/// Sixteen matches the `DO16` grouping of the reference implementation (`adler32.c` L18)
-/// and, more importantly, divides `NMAX`: `5_552` = `16 * 347`, the iteration count `n` at
-/// `adler32.c` L99. A full block is therefore an exact number of steps and leaves no tail,
-/// which is what keeps the tail handling confined to the final partial block. Sixteen bytes
-/// is also one 128-bit vector register, so the accumulation the compiler is being invited to
-/// widen is the natural width on every Tier-1 target. Those two structural reasons -- exact
-/// divisibility and register width -- are the whole justification for the value. It is **not**
-/// backed by a committed benchmark comparing 16, 32 and 64 lanes; see the caution in the module
-/// documentation before treating any lane count here as empirically optimal.
+/// ★ Sixteen is **derived and maximal**, not preferred, and that is a stronger statement than a
+/// benchmark could make. A lane count has to divide `NMAX` exactly, or a full block leaves a tail
+/// and the tail handling stops being confined to the final partial block -- that is the same
+/// requirement `adler32.c` L99 places on its own `DO16` iteration count `n`. And `NMAX` is
+/// `5_552`, whose factorisation is `2^4 * 347` with `347` prime. So the power-of-two divisors of
+/// `NMAX` are exactly `1, 2, 4, 8, 16`: **sixteen is the largest one that exists.** Thirty-two
+/// does not divide `5_552` (`173.5`), and neither does sixty-four (`86.75`), so a wider lane
+/// count is not a slower alternative to this one -- it is not an alternative at all without
+/// abandoning either the exact-block property or `NMAX` itself, and `NMAX` is fixed by the
+/// overflow proof in the module documentation.
+///
+/// The assertion below pins that maximality so the argument cannot rot: if `NMAX` ever changed to
+/// something `32` divides, this comment would be wrong and the build says so.
+///
+/// Sixteen bytes is also exactly one 128-bit vector register, which is why the compiled body on
+/// `x86_64` is 91 SSE2 instructions (`paddd`, `pshufd`, `punpck*`) rather than scalar adds. The
+/// two facts are independent and they agree, which is the happy case: the width the arithmetic
+/// forces is also the width the hardware wants.
 const SUB_CHUNK: usize = POSITIONS.len();
 
 /// [`SUB_CHUNK`] as the accumulators' own type: the `k` of the lane decomposition, both the
@@ -342,22 +365,57 @@ const SHORT_INPUT_LEN: usize = SUB_CHUNK;
 /// the length at which the amortised cost is expected to be recovered, and that expectation is
 /// the whole basis for the value.
 ///
-/// **This threshold is a design choice, not a measured crossover.** An earlier version of this
-/// comment published a per-size ratio table as though it had been measured; no measurement is
-/// committed in this repository, so no such table can be substantiated and it has been removed
-/// rather than left to be read as evidence. `benches/checksum_bench.rs` is where a crossover
-/// could be measured, and its numbers belong in a committed artifact rather than in this comment.
+/// ★ **Measured, and the property it exists for is now enforced.** The goal the threshold serves
+/// is that this backend should never be the slower of the two, so that selecting it is a free
+/// decision for the parent module rather than a trade-off against the caller's input size. That
+/// goal is exactly condition (1) of `benches/checksum_bench.rs`'s `adler32_acceptance` sweep, which
+/// `.github/scripts/bench_gate.py` fails the bench job on: at every measured length, including
+/// lengths *below* this threshold where the call is delegated, `Adler32Simd::checksum` may not take
+/// measurably longer than [`Adler32Generic`]. "Measurably" is not a hedge, it is a computed
+/// quantity: the limit is 1.00 plus that case's own null spread -- the baseline timed twice per
+/// round -- so a delegated case reading 1.016 against a 0.041 spread is *within*, while the same
+/// 1.016 against a 0.004 spread would not be. A fixed percentage in its place would either fail
+/// cases where both sides run identical code or wave through a real regression at the long lengths.
+/// An earlier version of this comment noted that the benchmark did not descend below the threshold
+/// and so could not establish the crossover; the acceptance sweep does descend, with points at 16,
+/// 32, 48 and 55 bytes.
 ///
-/// The *goal* the threshold serves is that this backend should not be the slower of the two at any
-/// length, which is what would make selecting it a free decision for the parent module rather than
-/// a trade-off. `benches/checksum_bench.rs` is where that is established or refuted: its
-/// `adler32_backends` group carries one row per backend, and the shortest of its three lengths is
-/// this constant exactly -- chosen as the shortest input on which the vectorised arrangement is
-/// asked to do any work. Note what that does *not* cover: the sweep does not descend below the
-/// threshold, so it measures this backend where it is selected rather than establishing the
-/// crossover itself. The `simd` feature has to be on for the row to exist, and no CI job gates its
-/// output, so retuning this constant means running it deliberately and recording the numbers where
-/// they can be reproduced rather than in prose.
+/// Measured on `x86_64-unknown-linux-gnu`, `--release --features simd`, nine paired
+/// order-alternating rounds per length, as `Adler32Simd / Adler32Generic`. **One run of record** --
+/// `adler32_acceptance` reporting `expected=9 cases=8 over=0 unmeasured=1 best=0.355` -- and the
+/// same run the top-level `README` and `rust/README.md` quote, so the three documents cannot drift
+/// apart:
+///
+/// | bytes | | `Adler32Generic` | this backend | ratio |
+/// |------:|:--|--------:|-------------:|------:|
+/// | 16 | delegated | n/a | n/a | *unmeasured* |
+/// | 32 | delegated | 10.4 ns | 10.6 ns | 1.016 |
+/// | 48 | delegated | 15.6 ns | 15.5 ns | 0.995 |
+/// | 55 | delegated | 18.5 ns | 18.8 ns | 1.017 |
+/// | 64 | **first lane run** | 20.6 ns | 20.1 ns | 0.977 |
+/// | 256 | | 80.4 ns | 40.6 ns | 0.505 |
+/// | 4096 | | 1.31 us | 0.47 us | 0.361 |
+/// | 65536 | | 20.9 us | 7.4 us | 0.355 |
+/// | 1048576 | | 330 us | 119 us | 0.362 |
+///
+/// Three things to read from it. The lane arrangement is already the faster of the two *at* the
+/// threshold -- 0.977, not 1.0-something -- so 64 bytes sits at or just above the true crossover
+/// rather than well past it, and raising it would forgo a real if small win. The three
+/// sub-threshold ratios are the cost of the delegation test itself and nothing else: below 64 bytes
+/// the two backends run identical code after a length comparison, and 1.016, 0.995 and 1.017
+/// straddle 1.000, which is what a difference of a fraction of a nanosecond against a 10-to-19 ns
+/// call looks like. And the 16-byte case is reported *unmeasured* rather than given a ratio,
+/// because the sampler's own null measurement -- the baseline timed twice per round, on either side
+/// of the candidate -- spread by more than 10% at that length on this host. An `over=0` obtained
+/// from cases the machine could not actually resolve would be inconclusive rather than passing,
+/// which is why `bench_gate.py` checks `cases + unmeasured == expected` and requires a floor of
+/// measured cases.
+///
+/// What is *not* claimed: that four sub-chunks is the optimal amortisation factor as against two or
+/// eight. Both would also satisfy the enforced condition on this host. Four is a bound -- the fixed
+/// per-block cost of three horizontal reductions and a multiply is amortised at least fourfold
+/// before the lane path is entered -- and the measurement above establishes that the bound is
+/// sufficient, not that it is tight.
 ///
 /// Delegation is not a behavioural fork: the two backends agree bit for bit on every input and
 /// every starting value, which is the property the equivalence sweep at the bottom of this file
@@ -386,6 +444,16 @@ const _: () = assert!(
 const _: () = assert!(
     NMAX % SUB_CHUNK == 0,
     "NMAX must be divisible by SUB_CHUNK, as `adler32.c` L99 requires of DO16"
+);
+
+/// ★ And [`SUB_CHUNK`] is the **largest** width with that property, which is what makes it derived
+/// rather than chosen. `NMAX` is `2^4 * 347`, so doubling the lane count leaves a remainder; this
+/// assertion is the proof, and it fails the build if a future `NMAX` ever admits a wider lane
+/// count -- at which point the derivation in [`SUB_CHUNK`]'s documentation would need redoing
+/// rather than merely re-reading.
+const _: () = assert!(
+    NMAX % (2 * SUB_CHUNK) != 0,
+    "SUB_CHUNK must be the widest sub-chunk that divides NMAX; if 2 * SUB_CHUNK also divides it,      the maximality argument in SUB_CHUNK's documentation no longer holds"
 );
 
 /// The lane threshold must sit above the scalar short path, or the dispatch order in

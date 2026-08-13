@@ -105,10 +105,11 @@ use libfuzzer_sys::fuzz_target;
 // consumed from the library rather than redeclared, so this file cannot drift from
 // `zlib.h`.
 use libz_rs_sys::{
-    uInt, z_stream, Bytef, Z_BUF_ERROR, Z_DATA_ERROR, Z_MEM_ERROR, Z_OK, Z_STREAM_END,
-    Z_STREAM_ERROR, Z_VERSION_ERROR,
+    uInt, Bytef, Z_BUF_ERROR, Z_DATA_ERROR, Z_MEM_ERROR, Z_OK, Z_STREAM_END, Z_STREAM_ERROR,
+    Z_VERSION_ERROR,
 };
 use zlib_rs_differential::port::{self, BackSink, BackSource, TrackingAllocator, TrackingReport};
+use zlib_rs_fuzz::reached;
 
 // ---------------------------------------------------------------------------
 //  Bounds
@@ -607,13 +608,20 @@ fn parameter_ladder(window: &mut [u8]) {
     // A real stream this time, and an empty window slice -- which the initialisation gate
     // presents as the null pointer this call exists to have rejected. Nothing is installed,
     // so nothing leaks.
-    let mut strm = port::zeroed_stream();
-    let null_window = port::inflate_back_init(&mut strm, 15, &mut []);
+    //
+    // The empty slice is declared before the session for the reason `port::Session` exists: a
+    // window handed to `inflateBackInit_` is retained until `inflateBackEnd`, so the session holds
+    // it borrowed for its own whole life, and the compiler enforces the order. This one is refused
+    // and therefore retains nothing, but the signature cannot know that in advance.
+    let mut empty: [u8; 0] = [];
+    let mut session = port::Session::new(port::zeroed_stream());
+    let null_window = port::inflate_back_init(&mut session, 15, &mut empty);
     assert_eq!(
         null_window, Z_STREAM_ERROR,
         "infback.c L33-L35: a null window is Z_STREAM_ERROR -- it is borrowed, so there is \
          no fallback"
     );
+    drop(session);
 
     // `inflateBack(Z_NULL, Z_NULL, Z_NULL, Z_NULL, Z_NULL)`. The stream is tested before
     // use and no callback is invoked on a stream that failed that test, so no null function
@@ -638,19 +646,20 @@ fn parameter_ladder(window: &mut [u8]) {
 /// no valid extent to derive from an invalid exponent, which is precisely why the
 /// bound has to be checked before the shift.
 fn reject_bad_window_bits(bits: c_int) {
+    // Window first, session second: see `parameter_ladder`.
     let mut window: Box<[u8]> = (0..MAX_WINDOW_LEN).map(sentinel).collect();
-    let mut strm = port::zeroed_stream();
+    let mut session = port::Session::new(port::zeroed_stream());
 
     // The window is a live 32 KiB allocation that outlives the call and the gate satisfies
     // the version handshake, so `bits` is the one thing left to reject.
-    let refused = port::inflate_back_init(&mut strm, bits, &mut window);
+    let refused = port::inflate_back_init(&mut session, bits, &mut window);
     assert_eq!(
         refused, Z_STREAM_ERROR,
         "infback.c L33-L35: windowBits {bits} is outside 8..=15 and must be Z_STREAM_ERROR"
     );
 
     assert!(
-        strm.state.is_null(),
+        session.peek().state.is_null(),
         "a refused inflateBackInit_ must leave z_stream::state null"
     );
 }
@@ -672,23 +681,32 @@ fn run_session(
     in_side: &mut InSide<'_>,
     out_side: &mut OutSide,
 ) -> Option<TrackingReport> {
-    let mut strm = port::zeroed_stream();
-
-    // `infback.c` L37-L50 substitutes the library's own routines when these are null, so
-    // leaving them alone covers the default path and installing them covers the
-    // caller-hook path. The fuzzer picks.
+    // ★ THE SESSION IS WHAT MAKES THIS FUNCTION SOUND, and it is why the allocator is declared
+    // before it. Two of the three pointers the library keeps past a call are installed here -- the
+    // ledger behind `opaque`, reached by every allocation and free including the ones inside
+    // `inflateBackEnd`, and the window, retained from `inflateBackInit_` until that same call. A
+    // `&mut` that ends with the call cannot say either, and this function used to be written with
+    // exactly those signatures and the obligations in prose; `port::Session` holds both borrows for
+    // as long as the stream is reachable, and its drop-check obligation is what forces the
+    // declaration order below. Reversing the two `let`s is E0597, not a review comment.
     let allocator = if input.tracked_allocator {
-        let allocator = TrackingAllocator::new();
-        allocator.install(&mut strm);
-        Some(allocator)
+        // `infback.c` L37-L50 substitutes the library's own routines when these are null, so
+        // leaving them alone covers the default path and installing them covers the
+        // caller-hook path. The fuzzer picks.
+        Some(TrackingAllocator::new())
     } else {
         None
     };
+    let mut session = port::Session::new(port::zeroed_stream());
+    if let Some(allocator) = allocator.as_ref() {
+        allocator.install(&mut session);
+    }
 
-    let started = port::inflate_back_init(&mut strm, bits, window);
+    let started = port::inflate_back_init(&mut session, bits, window);
     if started == Z_MEM_ERROR {
         // The tracked allocator refused. Nothing was installed, so there is nothing to
         // release and nothing further to exercise.
+        drop(session);
         return allocator.as_ref().map(TrackingAllocator::finish);
     }
     assert_eq!(
@@ -696,37 +714,75 @@ fn run_session(
         "inflateBackInit_ must accept windowBits {bits} with a window of exactly 1 << {bits} bytes"
     );
 
-    let first = one_pass(&mut strm, window, in_side, out_side);
+    let first = one_pass(&mut session, in_side, out_side);
     if input.reuse_state {
         // `zlib.h` L1150-L1152: "inflateBack() may then be used multiple times".
         // `infback.c` L214-L223 resets mode, `last`, `whave` and the bit accumulator on
         // entry and leaves `wsize`, `window` and `dmax` alone, so replaying identical
         // input on the same state must produce an identical answer. A state that is only
         // partly reset shows up here and nowhere else.
-        let again = one_pass(&mut strm, window, in_side, out_side);
+        let again = one_pass(&mut session, in_side, out_side);
         assert_eq!(
             again, first,
             "a reset inflateBack state answered {again} where the first pass answered {first}"
         );
     }
 
-    let ended = port::inflate_back_end(&mut strm);
+    let ended = port::inflate_back_end(session.stream());
     assert_eq!(
         ended, Z_OK,
         "infback.c L572-L579: inflateBackEnd must release a live inflateBack state"
     );
     assert!(
-        strm.state.is_null(),
+        session.peek().state.is_null(),
         "infback.c L577: inflateBackEnd must clear z_stream::state"
+    );
+
+    // The library has let go of both the window and the ledger, so the session may end. The window
+    // is the caller's again from here, which is what lets `attempt` read the sentinels back.
+    drop(session);
+
+    // Off unless `ZLIB_RS_FUZZ_REPORT` is set. `stream_end` is the value a committed seed
+    // has to reach: it means the decoder consumed a complete raw DEFLATE stream and handed
+    // the bytes back through the output callback. `no_output` is the shape a seed built from
+    // an uncompressed fixture produces -- the decoder refused the first byte and the
+    // callback never ran -- which is the whole reason `fuzz/seeds/` exists. See
+    // `zlib_rs_fuzz`.
+    reached(
+        "fuzz_inflate_back",
+        back_reached_name(first, out_side),
+        |fields| {
+            fields
+                .with("windowBits", bits)
+                .with("payload", in_side.payload.len())
+                .with("status", first)
+                .with("outCalls", out_side.out_calls)
+                .with("totalOut", out_side.total_out)
+        },
     );
 
     allocator.as_ref().map(TrackingAllocator::finish)
 }
 
+/// The seed-quality vocabulary for one `inflateBack` pass.
+///
+/// A closed set, because `.github/workflows/rust.yml` matches on it. Two of the three names
+/// distinguish cases that share a status: `Z_BUF_ERROR` after the output callback has run is
+/// a truncated stream that still decoded something, and `Z_BUF_ERROR` before it has run is an
+/// input that was rejected outright.
+fn back_reached_name(status: c_int, out_side: &OutSide) -> &'static str {
+    if status == Z_STREAM_END {
+        "stream_end"
+    } else if out_side.out_calls == 0 {
+        "no_output"
+    } else {
+        "partial_output"
+    }
+}
+
 /// One `inflateBack` call, from re-staging the input to checking the outcome.
 fn one_pass(
-    strm: &mut z_stream,
-    window: &[u8],
+    session: &mut port::Session<'_>,
     in_side: &mut InSide<'_>,
     out_side: &mut OutSide,
 ) -> c_int {
@@ -745,13 +801,16 @@ fn one_pass(
     // Two plain field writes on a stream this frame borrows mutably; no pointer is
     // dereferenced. The pointer, when non-null, is the base of the payload the fuzzer
     // lent for the whole session, and `staged` bytes are readable there.
-    strm.next_in = next_in;
-    strm.avail_in = narrow(avail_in);
+    session.stream().next_in = next_in;
+    session.stream().avail_in = narrow(avail_in);
 
-    let ret = port::inflate_back(strm, window, in_side, out_side);
+    // No window argument: the session recorded the extent when `inflateBackInit_` was given the
+    // window, so the offsets `OutSide` is handed are computed against the same allocation the
+    // library was initialised with by construction rather than by the caller passing it twice.
+    let ret = port::inflate_back(session, in_side, out_side);
 
     // The two members `inf_leave` publishes (`infback.c` L567-L568), read back by value.
-    let (out_next_in, out_avail_in) = (strm.next_in, strm.avail_in);
+    let (out_next_in, out_avail_in) = (session.peek().next_in, session.peek().avail_in);
     check_outcome(ret, out_next_in, out_avail_in, in_side, out_side);
     ret
 }

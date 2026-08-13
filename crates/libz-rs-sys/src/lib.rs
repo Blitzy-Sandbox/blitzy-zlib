@@ -33,7 +33,7 @@
 //! | Artifact | Produced by | Exports | Installable |
 //! |---|---|---|---|
 //! | `libz.a` (`staticlib`) | `cargo build -p libz-rs-sys --features libz-compat` | **all 95** functions `zlib.h` declares, plus `inflate_table` as a hidden global | **YES** — this is the static library, and `infcover` links it |
-//! | `libz.so` (`cdylib`) | the same command | **93** of the 95, plus three internals; **no** version nodes | no — see below |
+//! | `libz.so` (`cdylib`) | the same command | **93** of the 95, and nothing else; **no** version nodes | no — see below |
 //! | *(the `rlib`)* | the same command | nothing; it is a Rust library | n/a — `zlib-rs-differential`, `fuzz/` and `tests/` depend on it |
 //! | `libz.so.1.3.2.1-motley` | `make rust`, or the `CMake` equivalent, **relinked from `libz.a`** | **95** functions and the **16** zlib version nodes, internals hidden | **YES** — this is the shared library, and it is the only one |
 //!
@@ -61,13 +61,12 @@
 //! `make rust` stages, and check with `ldd` — `make rust-test` does exactly that
 //! and refuses to infer the binding from a passing run.
 //!
-//! The archive is complete because `build.rs` compiles this crate's two C
-//! translation units — `csrc/gzprintf_shim.c`, which defines the variadic
-//! `gzprintf`/`gzvprintf`, and `csrc/inftrees_shim.c`, which defines
-//! `inflate_table` with `inftrees.h`'s own `codetype` prototype — and emits
-//! `-l static=` for the archive they are collected into, which rustc merges into
-//! `libz.a`. Measured: `ar t` lists both objects, and `nm` reports
-//! `T gzprintf`, `T gzvprintf` and a `GLOBAL HIDDEN` `inflate_table`.
+//! The archive is complete because `build.rs` compiles this crate's one shipped C
+//! translation unit — `csrc/gzprintf_shim.c`, which defines the variadic `gzprintf`
+//! and the `va_list`-taking `gzvprintf` — and emits `-l static=` for the archive it
+//! is collected into, which rustc merges into `libz.a`. Every other export, including
+//! `inflate_table`, is Rust. Measured: `ar t` lists the one object, and `nm` reports
+//! `T gzprintf`, `T gzvprintf` and `T inflate_table` in the archive.
 //!
 //! ★ Every row of that table is a gate rather than a recorded measurement, and
 //! the row about the *complete* artifact is the one worth naming here.
@@ -132,16 +131,20 @@
 //!   `gzvprintf` cannot be exported here either, which is why `build.rs` emits
 //!   `-l static=` with cargo's default `-whole-archive`: the objects go into the
 //!   archive that needs them and stay out of the cdylib that could not use them.
-//! * **`inflate_table` and the three `_zlib_rs_*` helpers are visible.** All four are
-//!   in `zlib.map`'s `local:` block — the last three through its `_*` pattern — and
-//!   without that script they are exported. `inflate_table` itself is the exception
-//!   that proves the rule: it is compiled with `ZLIB_INTERNAL`, so it is hidden even
-//!   here, and only its Rust half `_zlib_rs_inflate_table` shows up.
+//! * **The crate's three internal helpers WOULD be visible, and are not.** All three
+//!   are in `zlib.map`'s `local:` block — `inflate_table` by name, and
+//!   `_zlib_rs_gzprintf_begin`/`_zlib_rs_gzprintf_commit` through its `_*` pattern —
+//!   and rustc's script, which lists every `#[no_mangle]` item under `global:`, exports
+//!   them regardless. This one consequence IS fixable, and is fixed: the `.hidden`
+//!   directives further down this file give all three ELF `STV_HIDDEN` visibility,
+//!   which no version script can undo and which leaves static linking untouched. The
+//!   cdylib went from 96 dynamic globals to 93 when they were added.
 //!
-//! Measured totals for the `cdylib`, so the arithmetic is checkable: **96** dynamic
-//! globals, being the 95 public functions less `gzprintf` and `gzvprintf`, plus
-//! `_zlib_rs_gzprintf_begin`, `_zlib_rs_gzprintf_commit` and
-//! `_zlib_rs_inflate_table`; and **0** version nodes.
+//! Measured totals for the `cdylib`, so the arithmetic is checkable: **93** dynamic
+//! globals, being the 95 public functions less `gzprintf` and `gzvprintf`, with no
+//! internal helper among them; and **0** version nodes. The remaining gap to the
+//! contract is therefore two functions and sixteen version nodes, and both halves are
+//! structural — a rustc-linked `cdylib` can carry neither.
 //!
 //! None of that is a defect in the packaging and none of it is fixable inside
 //! `cargo`: it is what a rustc-linked `cdylib` is. The installable shared object is
@@ -178,9 +181,9 @@
 //! |---|---|---|
 //! | all 95 exported functions | **no** — `gzprintf` and `gzvprintf` are variadic, so they live in the C shim, whose objects a cdylib cannot re-export; the `libz.a` cargo emits does define all 95 | yes, relinked from that archive |
 //! | 16 `ZLIB_*` symbol-version nodes | **no**, and unreachable: rustc's own anonymous-tag version script cannot be combined with `zlib.map`'s named tags | yes |
-//! | `zlib.map`'s `local:` names hidden | **no** — `inflate_table` and the two `_zlib_rs_gzprintf_*` helpers stay visible, because stable Rust has no per-item hidden visibility for a `#[no_mangle]` item | yes, by `objcopy --localize-symbols` before the relink |
+//! | `zlib.map`'s `local:` names hidden | **no** — three helpers stay visible, measured with `nm -D`: `_zlib_rs_gzprintf_begin`, `_zlib_rs_gzprintf_commit` and `_zlib_rs_inflate_table`, because stable Rust has no per-item hidden visibility for a `#[no_mangle]` item. (`inflate_table` itself is *not* among them: like `gzprintf`, it is defined in a C shim, and rustc's own `local: *` gives a C-contributed symbol no dynamic entry at all.) | yes, by `objcopy --localize-symbols` before the relink |
 //! | `SONAME libz.so.1` | yes | yes |
-//! | `libz.so.1.3.2.1-motley` ← `libz.so.1` ← `libz.so` | **no**, and deliberately so — see below | yes, the C build's exact topology |
+//! | `libz.so.1` and `libz.so`, each a symlink directly onto the real `libz.so.1.3.2.1-motley` | **no**, and deliberately so — see below | yes, the C build's exact topology: two direct aliases, not a chain through one another |
 //!
 //! The symlinks are the part that bites silently rather than loudly. The SONAME
 //! is `libz.so.1`, so a program linked against this library asks the loader for
@@ -322,7 +325,7 @@
 //! | Module | Exports | Contents |
 //! |---|---|---|
 //! | `deflate` | 17 | the `deflate*` family, including both `_`-suffixed init forms |
-//! | `inflate` | 18 | the 18 public `inflate*` exports; `_zlib_rs_inflate_table` is a nineteenth `#[no_mangle]` symbol, the Rust half of the `inflate_table` `csrc/inftrees_shim.c` declares, and `zlib.map` hides it through `_*` |
+//! | `inflate` | 18 | the 18 public `inflate*` exports; `inflate_table` is a nineteenth `#[no_mangle]` symbol, defined in Rust over a validated `int`, named in `zlib.map`'s `local:` block and hidden from both shared objects |
 //! | `infback` | 3 | `inflateBackInit_`, `inflateBack`, `inflateBackEnd` |
 //! | `compress` | 10 | five one-shot wrappers and their five `_z` `size_t` forms |
 //! | `gz` | 32 | 30 `gz*` functions here, plus 2 from `csrc/gzprintf_shim.c` |
@@ -331,22 +334,26 @@
 //!
 //! 17 + 18 + 3 + 10 + 32 + 11 + 4 = **95**, of which this crate's Rust code supplies
 //! 93 and `csrc/` supplies `gzprintf` and `gzvprintf`. The tally reconciles to the
-//! built artifacts as follows, and the arithmetic is worth following once because it
-//! is the same arithmetic the artifact matrix above tabulates:
+//! built artifacts as follows, every figure measured with `nm`, and the arithmetic is
+//! worth following once because it is the same arithmetic the artifact matrix above
+//! tabulates:
 //!
-//! * **96** items carry `#[no_mangle]` across the seven modules — the 93 public Rust
-//!   entry points plus `_zlib_rs_gzprintf_begin`, `_zlib_rs_gzprintf_commit` and
-//!   `_zlib_rs_inflate_table`. `gzopen_w` is `#[cfg(windows)]`, so it is one of the 93
-//!   only on Windows and 92 are compiled on Linux, giving **95** `#[no_mangle]` items
-//!   there.
-//! * `build.rs` compiles `csrc/gzprintf_shim.c` and `csrc/inftrees_shim.c` and emits
-//!   `-l static=`, which rustc merges into the archive: `libz.a` therefore defines
-//!   **98** names — those 95 plus `gzprintf`, `gzvprintf` and `inflate_table` — of
-//!   which every one of the 95 the header declares is present.
-//! * `nm -D` on the `cdylib` reports **96** dynamic globals, because rustc's own
-//!   version script exports the Rust items and nothing else.
+//! * **97** items carry `#[no_mangle]` across the seven modules — 94 contract names
+//!   plus the three internal helpers `inflate_table`, `_zlib_rs_gzprintf_begin` and
+//!   `_zlib_rs_gzprintf_commit`. `gzopen_w` is `#[cfg(windows)]`, so it is one of the
+//!   94 only on Windows; **96** are compiled off Windows, being 93 contract names and
+//!   the three helpers.
+//! * `build.rs` compiles `csrc/gzprintf_shim.c` and emits `-l static=`, which rustc
+//!   merges into the archive: `libz.a` therefore defines **98** unmangled global text
+//!   symbols — those 96 plus `gzprintf` and `gzvprintf` — so every one of the 95
+//!   functions the header declares off Windows is present, and the three helpers with
+//!   them.
+//! * `nm -D` on the `cdylib` reports **93** dynamic globals: rustc's own version
+//!   script exports the Rust items and nothing else, the two C-defined names among
+//!   them are consequently absent, and the three helpers are hidden by the `.hidden`
+//!   directives below.
 //! * The packaged shared object is relinked from the archive under `zlib.map`, which
-//!   hides four of the 98 — `inflate_table` by name, and the three `_zlib_rs_*`
+//!   hides three of the 98 — `inflate_table` by name, and the two `_zlib_rs_*`
 //!   helpers through its `_*` wildcard — leaving exactly **95**.
 //!
 //! Measured, not asserted: `make rust` reports "95 exported symbols, every one
@@ -443,36 +450,65 @@
 //!
 //! # Unsafe containment
 //!
-//! Unsafety is confined to six categories of site. They are the sites the FFI
-//! contract *forces*; anywhere else, `unsafe` in this crate is a defect. Each
-//! block carries a `// SAFETY:` comment naming the invariant it relies on.
+//! Unsafety is confined to six categories of site — the six AAP §0.6.1 fixes as
+//! the sites the FFI contract *forces*. Anywhere else, `unsafe` in this crate is a
+//! defect. Every block carries a `// SAFETY:` comment naming the invariant it
+//! relies on, which `clippy::undocumented_unsafe_blocks` enforces rather than
+//! trusting; where a block's category is not obvious from the operation, the
+//! comment names it, and `grep -rn 'unsafe-site categor' crates/libz-rs-sys/src`
+//! is how to read the mapping off the code instead of off this list.
 //!
-//! 1. **Stream-pointer validation.** Every exported stream function receives a
-//!    `z_streamp`. The pointer must be non-null, aligned, and addressing a
-//!    caller-allocated `z_stream`. Nullability is part of the published
-//!    contract — a null stream yields `Z_STREAM_ERROR` — so the guard always
-//!    precedes the first dereference.
-//! 2. **Reconstructing the input and output slices.** `(next_in, avail_in)` and
-//!    `(next_out, avail_out)` are pointer/length pairs. `from_raw_parts` is
-//!    called once, on entry, and only the resulting safe slices travel inward.
-//!    An `avail_in` of zero with a null `next_in` must produce an empty slice
-//!    rather than undefined behaviour.
-//! 3. **The opaque `state` round-trip.** `z_stream::state` is caller-visible but
-//!    caller-opaque. Before it is treated as state it is tag-validated, exactly
-//!    as `deflateStateCheck` and `inflateStateCheck` do in the C sources, so a
-//!    foreign, stale, or already-freed stream is rejected instead of trusted.
-//! 4. **Invoking `zalloc` and `zfree`.** These are caller-supplied C function
-//!    pointers, modelled as `Option<unsafe extern "C" fn(…)>` so that `Z_NULL`
-//!    is `None` and selects the internal default. A block obtained from a
-//!    caller's `zalloc` is released only through that same caller's `zfree`.
+//! Each category is stated at the width the code actually uses it, which is wider
+//! than the one operation that names it. A category is a *kind* of trust the C
+//! contract obliges this crate to extend, not a single function call.
+//!
+//! 1. **The caller's stream, through a raw pointer: validation, and every field
+//!    access.** Every exported stream function receives a `z_streamp`, which must
+//!    be non-null, aligned, and addressing a caller-allocated `z_stream`.
+//!    Nullability is part of the published contract — a null stream yields
+//!    `Z_STREAM_ERROR` — so the guard always precedes the first dereference. The
+//!    same category then covers each individual READ and WRITE of a member
+//!    through that pointer: `next_in`/`avail_in`, `total_in`/`total_out`, `msg`,
+//!    `adler`, `data_type`, and the three hook members. They are separate unsafe
+//!    operations from the validation, and the same guarantee discharges them.
+//! 2. **Pointer/length pairs, and the caller's out-parameters.**
+//!    `(next_in, avail_in)` and `(next_out, avail_out)` are reconstructed with
+//!    `from_raw_parts` once, on entry, and only the resulting safe slices travel
+//!    inward; an `avail_in` of zero with a null `next_in` must produce an empty
+//!    slice rather than undefined behaviour. The same reasoning covers the scalar
+//!    OUT-PARAMETERS the API is full of — `deflatePending`'s `*mut c_uint` and
+//!    `*mut c_int`, `inflateGetDictionary`'s `dictLength`, the `*mut uLong` and
+//!    `*mut z_size_t` lengths of the one-shot wrappers, `gzerror`'s status slot —
+//!    each of which is a caller-owned location this crate reads or writes exactly
+//!    once, having established that it is non-null and aligned.
+//! 3. **The opaque handle round-trip, for both handles.** `z_stream::state` is
+//!    caller-visible but caller-opaque; before it is treated as state it is
+//!    tag-validated, exactly as `deflateStateCheck` and `inflateStateCheck` do in
+//!    the C sources, so a foreign, stale, or already-freed stream is rejected
+//!    instead of trusted. `gzFile` is the same category in the gz layer, and this
+//!    crate owns rather more of its life cycle: reserving the block, initialising
+//!    it, handing back the handle, recovering the state from it on each later
+//!    call, and releasing it on `gzclose` — with the caller-visible `gzFile_s`
+//!    prefix (`have`, `next`, `pos`) at offset 0, because the `gzgetc` macro
+//!    dereferences those three fields in code this crate cannot recompile.
+//! 4. **Calling back into caller-supplied C function pointers.** `zalloc` and
+//!    `zfree` are modelled as `Option<unsafe extern "C" fn(…)>` so that `Z_NULL`
+//!    is `None` and selects the internal default, and a block obtained from a
+//!    caller's `zalloc` is released only through that same caller's `zfree`. The
+//!    `inflateBack` hooks are the same category with a different signature: `in()`
+//!    hands this crate a buffer it must then treat as valid for the length
+//!    returned, and `out()` is handed one of ours; both are invoked through a raw
+//!    function pointer whose validity only the caller can establish.
 //! 5. **C strings and varargs.** Paths reaching `gzopen` are assumed
 //!    NUL-terminated and readable for the duration of the call; returned strings
 //!    are `'static` or owned by the stream and outlive the caller's use of them.
-//!    `gzprintf` is variadic and `gzvprintf` takes a `va_list`.
-//! 6. **Writing through a caller's `gz_header`.** `inflateGetHeader` fills
-//!    caller buffers, and every write is clamped to `extra_max`, `name_max` and
+//!    `gzprintf` is variadic and `gzvprintf` takes a `va_list`, neither of which
+//!    stable Rust can declare, so both are C shims under `csrc/`.
+//! 6. **Writing through a caller's `gz_header`.** `inflateGetHeader` fills caller
+//!    buffers, and every write is clamped to `extra_max`, `name_max` and
 //!    `comm_max`. This is historically the source of gzip-header overflow
-//!    defects, and it becomes a length-checked slice write.
+//!    defects, and it becomes a length-checked slice write. `deflateSetHeader`
+//!    reads the same struct under the same rules.
 //!
 //! # Panic discipline
 //!
@@ -596,8 +632,9 @@
 //!    so the C compiler itself reports a conflicting type.
 //! 3. **`cargo test`, `make rust`, and the `symbols` job of `rust.yml`.** An `nm`
 //!    diff against the 111-symbol baseline catches both a missing and an extra
-//!    export. `tests/symbol_parity.rs` performs it inside `cargo test` (13 tests,
-//!    including the `inflate_table` archive-versus-dynamic split and the SONAME);
+//!    export. `tests/symbol_parity.rs` performs it inside `cargo test` (16 tests,
+//!    including the `inflate_table` archive-versus-dynamic split, the SONAME, the
+//!    two-direct-alias symlink layout and the measured shape of the bare cdylib);
 //!    `Makefile.in`'s `rust` target performs it against `zlib.h` and `zlib.map`
 //!    while staging, and its `rust-symbols` target demands the direct diff against a
 //!    built C library.
@@ -1061,6 +1098,61 @@ mod util;
 mod gz;
 
 // ---------------------------------------------------------------------------
+//  Hidden internals -- the cdylib's dynamic table, narrowed to the contract
+// ---------------------------------------------------------------------------
+//
+// ★ Three `#[no_mangle]` items in the modules above are not part of any contract:
+// `inflate_table`, which `zlib.map`'s `ZLIB_1.2.0` `local:` block names outright, and
+// the two `_zlib_rs_gzprintf_*` helpers, which its trailing `_*` pattern covers. The
+// packaged shared library is relinked under that version script, so it hides all
+// three. The `cdylib` cargo links directly is not, and rustc's own anonymous version
+// script lists every `#[no_mangle]` item of the crate under `global:` -- so without the
+// directives below those three names appear in its `.dynsym`, and `nm -D` on
+// `target/<profile>/libz.so` reports 96 dynamic globals where the contract has 93.
+//
+// `.hidden` closes that gap, and it is the only mechanism that does. Measured on rustc
+// 1.97.1 against both `rust-lld` and `ld.bfd`, in debug (16 codegen units) and release
+// (fat LTO, one codegen unit):
+//
+//   * `.hidden <name>` gives the symbol ELF `STV_HIDDEN`, and rustc's version script
+//     cannot re-export it: the name is absent from `.dynsym` on both linkers.
+//   * `.symver` does bind a cdylib symbol to a named version node -- and then emits
+//     both `name` and `name@@NODE` into the object, so a C program linking the
+//     resulting `libz.a` fails with `multiple definition of 'name'`. Unusable.
+//   * `#[export_name = "name@@NODE"]` makes rustc write `@@` into its own version
+//     script, which `rust-lld` then rejects (`expected ; but got @`). Unusable.
+//   * A second, anonymous version script listing the names exports them under
+//     `rust-lld` and is refused by `ld.bfd` ("anonymous version tag cannot be combined
+//     with other version tags"). Linker-dependent, therefore unusable.
+//
+// ★ Hidden visibility is a property of a SHARED OBJECT's dynamic table and says
+// nothing about static linking. `libz.a` still defines all three names as ordinary
+// globals -- `nm` reports `T` whether or not the symbol is hidden -- which is what the
+// unmodified `test/infcover.c` needs from `inflate_table`, since its `cover_trees`
+// calls it directly, and what `csrc/gzprintf_shim.c` needs from the two helpers it
+// forwards to. Verified end to end: a C program that links the archive and calls a
+// hidden symbol builds and runs.
+//
+// The cfgs are the defining modules' own, exactly. Naming a symbol a configuration does
+// not define would leave an undefined hidden reference and fail the link, so they are
+// load-bearing rather than tidy.
+//
+// ELF only. `.hidden` is a GNU-as directive; Mach-O spells the property
+// `.private_extern` and PE/COFF has no equivalent, and neither platform is reached by
+// the packaging step `build.rs` implements. Elsewhere the directives are simply not
+// emitted, the cdylib keeps the three extra names, and
+// `tests/symbol_parity.rs::cargo_cdylib_matches_its_measured_shape` runs only where the
+// artifact it measures exists.
+#[cfg(all(feature = "libz-compat", target_os = "linux"))]
+core::arch::global_asm!(".hidden inflate_table");
+
+#[cfg(all(feature = "libz-compat", feature = "gz", target_os = "linux"))]
+core::arch::global_asm!(
+    ".hidden _zlib_rs_gzprintf_begin",
+    ".hidden _zlib_rs_gzprintf_commit"
+);
+
+// ---------------------------------------------------------------------------
 //  Build-script bridge
 // ---------------------------------------------------------------------------
 //
@@ -1137,7 +1229,7 @@ const _: () = {
 // It is exactly the C contract and nothing else: the four `#[repr(C)]` structs,
 // the `zconf.h` primitive and pointer aliases, and the four nullable hook types.
 // The module's remaining items -- `StreamAllocator`, `StateBlock`, `StatePrefix`,
-// `StateKind`, `AliasScratch`, `input_slice`, `output_region`, `output_slots_mut`,
+// `StateKind`, `OverlapStage`, `input_slice`, `output_region`, `output_slots_mut`,
 // `reserve_state`, `publish_state`, `commit_state`, `install_state`,
 // `checked_state`, `checked_state_mut`, `take_state`, `widen` and the `inftrees.h`
 // bounds -- are `pub(crate)` machinery and are deliberately absent, for the reason

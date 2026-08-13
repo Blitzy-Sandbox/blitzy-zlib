@@ -24,14 +24,14 @@ three benchmarks — and only two of them ever look at tier 2:
 | `tests/table_equality.rs` | neither | Reads no input sample at all — see below |
 | `benches/deflate_bench.rs` | 1, and 2 when present | Tier-1 fixtures in every gated group; the `deflate_silesia` group over tier 2 |
 | `benches/inflate_bench.rs` | 1, and 2 when present | The same, with `inflate_silesia` over tier 2 |
-| `benches/checksum_bench.rs` | 1 only | Tier-1 fixtures; it never reaches for Silesia |
+| `benches/checksum_bench.rs` | 1 only | A synthetic length sweep as its primary axis, plus the named tier-1 fixtures as secondary cases; it never reaches for Silesia |
 
-All three benches are attached to this crate by `[[bench]]` entries in
-[`../Cargo.toml`](../Cargo.toml) with an explicit `path` back to `benches/`, so
-`cargo bench --manifest-path benches/Cargo.toml` builds and runs them. The tier-2 path contract
-below is
-therefore a description of what the two Silesia consumers **do**, verified by running them,
-rather than a specification something might later be written against.
+All three benches belong to [`../../../benches/Cargo.toml`](../../../benches/Cargo.toml), the
+excluded package `zlib-rs-benches`, which depends on this crate by path and reaches the fixtures
+through it. Nothing is attached to this crate by a `[[bench]]` entry, and it takes no criterion
+dependency; `cargo bench --manifest-path benches/Cargo.toml` is what builds and runs them. The
+tier-2 path contract below is therefore a description of what the two Silesia consumers **do**,
+verified by running them, rather than a specification something might later be written against.
 
 Because the governing acceptance criterion is that compressed output be *byte-identical* to
 the C reference, this corpus defines the sample over which that claim is measured. The
@@ -69,7 +69,7 @@ whose result depends on what a remote server served that day.
 | `tests/byte_identical.rs` | **Yes** | Every fixture, multiplied by the whole configuration matrix |
 | `tests/roundtrip_interop.rs` | **Yes** | Every fixture, compressed by one implementation and inflated by the other |
 | `benches/deflate_bench.rs`, `benches/inflate_bench.rs` | **Yes** | Named fixtures as the tier-1 throughput and memory cases, plus the optional Silesia tier |
-| `benches/checksum_bench.rs` | **No** | Buffers it generates itself, because a checksum's throughput does not depend on what the bytes mean |
+| `benches/checksum_bench.rs` | **Yes, secondarily** | Buffers it generates itself for the length sweep that is its main axis — a checksum's rate depends on length, not on what the bytes mean — and the named tier-1 fixtures for its `adler32_fixtures` and `crc32_fixtures` groups. A missing fixture logs once and is skipped. Never Silesia |
 | `tests/table_equality.rs` | **No** | The generated C headers `crc32.h`, `trees.h` and `inffixed.h`, compared element for element against the ported Rust `const` arrays |
 | `fuzz/fuzz_targets/*.rs` (all five) | **No** | Bytes the fuzzer generates, guided by coverage; libFuzzer maintains its own corpus under `fuzz/corpus/` |
 
@@ -255,8 +255,19 @@ earlier run is reported incomplete rather than blessed; and in the idempotent sh
 that skips a fetch, so "there is nothing to do" cannot be said about a partial corpus. All
 three compare the payload's file names against exactly that twelve-name list
 (`ZLIB_RS_SILESIA_MEMBERS`) and fail if anything is missing or anything extra is present.
-One definition of complete, three callers. Setting the variable to `-` skips the check and
-emits a warning.
+One definition of complete, three callers.
+
+Setting the variable to `-` skips the check, and the script warns about it **once, at the
+entry point, whatever mode it was asked for**. That placement is deliberate rather than
+incidental: two of those three callers — `--verify-only` and the idempotent short-circuit —
+decide through a quiet predicate that returns "matches" without a word when the check is
+opted out, so a warning emitted at the point of the check would have been silent on exactly
+the runs that report success having examined no inventory at all.
+
+The names are not the bytes, though, and the same three places also hash the members when a
+per-member manifest is available — required under `--verify-only`, where it is the only
+evidence that comes from outside the directory being judged. See
+[Integrity](#integrity-and-the-difference-between-corruption-and-authentication).
 
 ## Determinism is a requirement, not a preference
 
@@ -374,22 +385,68 @@ formality: two cases pass under fat LTO and fail without it.
 
 ### Opt-in only — the no-network rule
 
-**`fetch_silesia.sh` is invoked by a human, deliberately, and by nothing else.**
+**Fetching is invoked by a human, deliberately, and by nothing else. Verifying is what CI does
+with this script, in two read-only modes, and it obtains nothing.**
 
-- It is **never** invoked by `cargo test`.
-- It **never fetches from CI.** `rust.yml`'s `bench` job invokes it in exactly one mode,
-  `--verify-only`, which in the script's own words "fetches nothing and writes nothing": it
-  confirms that a corpus provisioned elsewhere carries a well-formed stamp recording the URL
-  and archive digest expected now. No workflow step ever invokes it in fetching mode, and the
-  job fails closed when the corpus it was told to expect is absent.
-- It is referenced from no `build.rs` and from no file under `tests/`.
+That distinction is the whole of this section, and an earlier version of this file opened by
+saying the script was "invoked by a human and by nothing else" and then, three lines later,
+documented the workflow's own invocation of it. Both halves were true and together they read as
+a contradiction. Stated precisely, there are exactly three modes and CI uses two of them:
+
+| mode | reaches the network | writes anything | invoked by CI |
+|---|---|---|---|
+| *(no flag)* — fetch | **yes** | yes, the corpus | **never** |
+| `--verify-only` | no | no | yes, conditionally |
+| `--pin-status` | no | no | yes, unconditionally |
+
+- **CI never fetches.** No workflow step invokes this script without one of the two read-only
+  flags, and there is no code path in either of those two that downloads, extracts or creates
+  anything. That is what keeps `cargo test` hermetic.
+- **`--pin-status`** runs unconditionally in the `bench` job. It prints what `silesia.pin`
+  records and exits, touching no destination, no network and no tool — its whole purpose is to
+  tell the workflow whether this repository carries an approved corpus identity at all, so that
+  "the acceptance measurement was not taken" can be distinguished from "it cannot be taken
+  here".
+- **`--verify-only`** runs when a corpus has been provisioned into the job's cache. It confirms
+  that the corpus already on disk carries a well-formed stamp recording the URL and archive
+  digest expected now, and, when `silesia.sha256` is present, that every member's digest
+  matches. It fetches nothing and writes nothing.
+- **The job fails closed on the designated release runner** when the pin is armed and the
+  corpus is nevertheless absent. On a hosted runner the same condition is a notice, because a
+  hosted runner's throughput numbers are informational anyway — see
+  `.github/workflows/rust.yml`.
+- It is invoked from no `build.rs` and from no file under `tests/`, in any mode.
 
 Those are not aspirations; they are the property that keeps the test suite hermetic. The
 moment any automated path calls this script **in fetching mode**, `cargo test` acquires a
 network dependency and every gate becomes contingent on a remote host. If you are adding
 automation and find yourself wanting the corpus, the answer is to make the automation skip,
 exactly as the benchmarks do — or, if it must know whether an already-provisioned corpus is
-the pinned one, to ask with `--verify-only`.
+the pinned one, to ask with `--verify-only`, or whether one could be, with `--pin-status`.
+
+### What is pinned, and where
+
+`silesia.pin` and `silesia.sha256` are committed beside the script and are the repository's
+record of which corpus is approved. They exist because the alternative was worse: the script
+used to ship its built-in digest as the literal string `UNPINNED`, so verification depended on
+an environment variable somebody had to remember to set, and a required CI check could be green
+having verified nothing at all.
+
+- **`silesia.pin`** — the archive's URL, its SHA-256, and the four resource bounds the fetch
+  enforces *before* it writes 65 MiB and *before* it expands that into 202 MiB. Every bound is
+  the measured truth about the approved archive, applied with a stated slack factor, so a
+  hostile archive is refused on its declared size rather than only on its digest, and refused
+  early. Run `./fetch_silesia.sh --pin-status` to read it.
+- **`silesia.sha256`** — all twelve members' digests in `sha256sum` format, so
+  `sha256sum --check` reads it directly. The script uses it automatically when no
+  `ZLIB_RS_SILESIA_MEMBER_SHA256` is given. This survives repackaging where the archive digest
+  does not, and it is what makes an *already-extracted* directory verifiable.
+
+Both are trust-on-first-use with respect to upstream: they prove the corpus has not changed
+since it was pinned here, not that what was pinned is what the Silesia authors published. For
+the latter, obtain the digests through a channel independent of the download and pass them
+explicitly. Change `url` and `sha256` together and never separately — a digest without the URL
+it came from asserts nothing about the provenance of the bytes.
 
 ### Prerequisites
 
@@ -414,30 +471,52 @@ free in the destination's filesystem.
 
 ### Integrity, and the difference between corruption and authentication
 
-**A fetch without an expected digest is refused.** Upstream publishes the archive but no
-digest for it, so no digest is pinned in the script and `ZLIB_RS_SILESIA_SHA256` is
-*required*: a bare `./fetch_silesia.sh` downloads nothing, exits non-zero and says so. The
-check cannot be waived — there is no flag to skip it and a mismatch is always fatal.
+**A fetch without an expected digest is refused, and `silesia.pin` supplies one.** The check
+cannot be waived — there is no flag to skip it and a mismatch is always fatal — but it no
+longer depends on the caller remembering a value: a bare `./fetch_silesia.sh` reads the
+committed pin described under *What is pinned, and where* above and proceeds. Remove or empty
+that file and the refusal returns: with no pin, no `--sha256` and no
+`ZLIB_RS_SILESIA_SHA256`, the script downloads nothing, exits non-zero and says so.
 
-That refusal is deliberate, and so is the absence of a pinned value. A digest computed from
-the same download it is checking detects **corruption** — a truncated transfer, a flaky
-proxy, a bit flip — and nothing more. It cannot **authenticate** the bytes, because anyone
-positioned to alter the archive in flight is equally positioned to alter the digest you would
-then compute from it. Writing such a value into the script would look authoritative while
-being nothing sounder than trust-on-first-use.
+What the pin does **not** do is change what a digest is worth, and it would be easy to read a
+committed file as though it did. A digest computed from the same download it is checking
+detects **corruption** — a truncated transfer, a flaky proxy, a bit flip — and nothing more.
+It cannot **authenticate** the bytes, because anyone positioned to alter the archive in flight
+is equally positioned to alter the digest you would then compute from it. That is exactly what
+`silesia.pin` holds: item 3 of the list below, trust-on-first-use, stated as such here and in
+the script's own `CHECKSUM POLICY` block rather than left to be inferred. Its value is that the
+approved corpus is now named in a reviewed file that CI can read, not that upstream has been
+authenticated.
 
-Authentication requires evidence arriving through a channel independent of the download, in
-descending order of strength:
+Authentication requires evidence arriving through a channel independent of the download. Both
+checks this script offers can authenticate when their value arrives that way — what differs is
+**what** each one authenticates, which is the distinction to hold on to:
 
 1. **Per-member digests from an independent source** — a published paper, a distribution
    package, an existing trusted copy — supplied as a `sha256sum`-format manifest via
-   `ZLIB_RS_SILESIA_MEMBER_SHA256`. Every listed member is hashed after extraction and must
-   match. This is the only check available here that authenticates rather than merely detects
-   corruption, and it survives upstream rebuilding the zip, which an archive digest does not.
-2. **An archive digest obtained from such a source** and passed as `ZLIB_RS_SILESIA_SHA256`.
-3. **An archive digest computed from your own download.** Corruption detection only.
-   Acceptable for a throughput measurement on a machine you control, provided it is not
-   mistaken for more than that.
+   `ZLIB_RS_SILESIA_MEMBER_SHA256`. Every listed member is hashed and must match: after
+   extraction on a fetch, and against the installed directory under `--verify-only`. This
+   authenticates the **extracted content**, independently of how the archive was packed, so it
+   survives upstream rebuilding the zip and carries across mirrors. It is optional on a fetch,
+   which has already hashed the archive it downloaded, and **required by `--verify-only`**,
+   which downloads nothing — there, the manifest must cover every name in the inventory, and
+   `ZLIB_RS_SILESIA_MEMBER_SHA256=-` is the only way to waive it, which the report then states
+   in so many words. It defaults to the committed `silesia.sha256`.
+2. **An archive digest obtained from such a source** and passed as `--sha256` or
+   `ZLIB_RS_SILESIA_SHA256`; both outrank the pin, which is what makes an independently
+   obtained value usable without editing a committed file. This authenticates **one exact
+   archive**: match it and you hold precisely the bytes that value describes. What it cannot
+   survive is repackaging — zip archives are not reproducible, so a rebuilt archive of the
+   identical twelve files has a different digest and is indistinguishable from a hostile one.
+   Strictly narrower than (1), and not weaker within its scope.
+3. **An archive digest computed from your own download.** Corruption detection only — the same
+   check with no independent evidence behind it, which is trust-on-first-use however the value
+   is spelled. Acceptable for a throughput measurement on a machine you control, provided it
+   is not mistaken for more than that. **This is the category `silesia.pin` falls in.**
+
+So neither check is "the only one that authenticates", and neither bootstraps trust on its
+own: (1) and (2) differ in scope, and both collapse into (3) if the value came from the
+download's own channel.
 
 Two further checks are independent of all of the above and always run, so they bound what an
 unexpected archive can do even when its digest matched: the twelve-name inventory check
@@ -448,8 +527,8 @@ file or a directory, which excludes symlinks, devices, FIFOs and sockets.
 
 #### How to supply the digest, and what re-use depends on
 
-Supply it in whichever way suits you — `--sha256`, then `ZLIB_RS_SILESIA_SHA256`, then the
-`SILESIA_SHA256_EXPECTED` constant, first match wins. Change `ZLIB_RS_SILESIA_URL` and the
+Supply it in whichever way suits you — `--sha256`, then `ZLIB_RS_SILESIA_SHA256`, then
+`silesia.pin`, first match wins, and supplying nothing selects the pin. Change `ZLIB_RS_SILESIA_URL` and the
 expected digest together: they identify one archive jointly. The `CHECKSUM POLICY` block at the
 top of the script shows how to obtain and cross-check a value.
 
@@ -464,6 +543,14 @@ Two consequences worth knowing before you hit them:
 - **`--verify-only` needs the digest too**, because it compares the stamp against what you
   expect now. Verifying against nothing is not verification, so there is no digest-free form of
   any invocation.
+- **`--verify-only` needs a per-member manifest as well**, or an explicit
+  `ZLIB_RS_SILESIA_MEMBER_SHA256=-` waiver. The reason is the same argument one level down: the
+  stamp, the file names and the inventory all live *inside* the directory being vouched for, and
+  the archive is not retained after a fetch, so its digest can never be recomputed there. Rewrite
+  a member and every one of those checks still passes. A manifest is the one expectation that
+  comes from elsewhere, so that mode hashes every member against it and refuses a manifest that
+  covers only part of the inventory. Under the `-` waiver the closing report says that it
+  establishes nothing about the bytes, rather than the word "Verified" standing alone.
 
 ### Extraction is not trusted either
 
@@ -489,14 +576,19 @@ Everything the script consumes is either upstream-controlled or environment-cont
 each of the following is a check on input it does not trust. All four are unconditional —
 there is no flag, and no environment variable, that waives any of them.
 
-- **The URL.** `ZLIB_RS_SILESIA_URL` must begin with `https://` and contain no whitespace or
-  control character. That is the whole accepted set: `http://`, `file://` and every other
-  scheme are refused, before anything is downloaded or created, at the entry point of the
-  script. It is additionally passed to `curl`/`wget` after a `--` operand terminator, so a
-  value beginning with `-` could never be read as a downloader option even if the scheme check
-  were somehow bypassed. If you want to fetch from a mirror or from a copy you already have,
-  serve it over HTTPS or install the corpus into the destination directory yourself and skip
-  the script.
+- **The URL, and every hop it leads through.** `ZLIB_RS_SILESIA_URL` must begin with
+  `https://` and contain no whitespace or control character. That is the whole accepted set:
+  `http://`, `file://` and every other scheme are refused, before anything is downloaded or
+  created, at the entry point of the script. It is additionally passed to `curl`/`wget` after
+  a `--` operand terminator, so a value beginning with `-` could never be read as a downloader
+  option even if the scheme check were somehow bypassed. Checking the value alone would not be
+  enough, though: both tools follow redirects, so a `302` to `http://` would have moved the
+  transfer somewhere the scheme check had already refused. The download therefore also passes
+  `--proto '=https' --proto-redir '=https'` to `curl` and `--https-only` to `wget`, and the
+  tool probe **selects only a downloader that accepts its option** — a build of either that
+  does not is passed over rather than used unprotected. If you want to fetch from a mirror or
+  from a copy you already have, serve it over HTTPS or install the corpus into the destination
+  directory yourself and skip the script.
 - **The bytes.** The download is verified against an expected SHA-256 before anything else
   reads it, and a mismatch is fatal. Upstream publishes no digest, so the in-script constant
   ships at the `UNPINNED` sentinel and the digest is a mandatory input you supply, with
@@ -514,13 +606,20 @@ there is no flag, and no environment variable, that waives any of them.
 
 ### Manual invocation
 
-Every invocation must carry an expected digest, `--verify-only` included, because a run
-without one is refused (see
-[Integrity](#integrity-and-the-difference-between-corruption-and-authentication) above for how
-to obtain a value and what it does and does not establish). Replace `<sha256>` with the 64-hex
-digest you obtained. `ZLIB_RS_SILESIA_URL` may be overridden, but only with an `https://` URL.
+Every invocation carries an expected digest, `--verify-only` included, and the committed
+`silesia.pin` provides one — so the simplest form takes no digest at all. Pass one explicitly
+only to override the pin: for a mirror, a repackaging, or a value you obtained independently
+(see [Integrity](#integrity-and-the-difference-between-corruption-and-authentication) above for
+what that does and does not establish). Replace `<sha256>` with the 64-hex digest you obtained.
+`ZLIB_RS_SILESIA_URL` may be overridden, but only with an `https://` URL.
 
 ```sh
+# Simplest form: the pinned digest and the pinned bounds, nothing to remember
+./crates/zlib-rs-differential/corpus/fetch_silesia.sh
+
+# Read what is pinned, and which ceilings it implies.  No network, no writes.
+./crates/zlib-rs-differential/corpus/fetch_silesia.sh --pin-status
+
 # Default location: <repo-root>/target/silesia (git-ignored)
 ZLIB_RS_SILESIA_SHA256=<sha256> \
     ./crates/zlib-rs-differential/corpus/fetch_silesia.sh
@@ -537,9 +636,17 @@ ZLIB_RS_SILESIA_SHA256=<sha256> \
     ZLIB_RS_SILESIA_MEMBER_SHA256=/path/to/silesia.sha256 \
     ./crates/zlib-rs-differential/corpus/fetch_silesia.sh
 
-# Report on an existing download without fetching anything.  The digest is required
-# here too: --verify-only compares the recorded stamp against what you expect now.
-ZLIB_RS_SILESIA_SHA256=<sha256> ZLIB_RS_SILESIA_DIR=/var/cache/silesia \
+# Report on an existing download without fetching anything.  A digest applies here
+# too -- --verify-only compares the recorded stamp against what is expected now --
+# and it comes from the pin unless one is given, which is how CI runs this mode.
+ZLIB_RS_SILESIA_DIR=/var/cache/silesia \
+    ./crates/zlib-rs-differential/corpus/fetch_silesia.sh --verify-only
+
+# Waiving the per-member manifest deliberately and visibly.  The report then says
+# plainly that it checked the recorded fetch and the inventory and nothing about
+# the bytes.
+ZLIB_RS_SILESIA_DIR=/var/cache/silesia \
+    ZLIB_RS_SILESIA_MEMBER_SHA256=- \
     ./crates/zlib-rs-differential/corpus/fetch_silesia.sh --verify-only
 
 # Then measure. The same variable is read by the benchmarks.

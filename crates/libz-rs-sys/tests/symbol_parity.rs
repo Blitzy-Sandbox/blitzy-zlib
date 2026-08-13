@@ -40,7 +40,7 @@
 //!
 //! | Artifact | Produced by | Dynamic globals |
 //! |---|---|---|
-//! | `target/<profile>/libz.so` (`cdylib`) | `cargo build` | **96**, of which **0** are version nodes |
+//! | `target/<profile>/libz.so` (`cdylib`) | `cargo build` | **93**, of which **0** are version nodes |
 //! | `target/dropin/libz.so.<ZLIB_VERSION>` | `make rust`, relinked from `libz.a` | **111** = 95 functions + 16 version nodes |
 //!
 //! rustc hands every `cdylib` link a version script of its own -- an anonymous tag listing the
@@ -64,13 +64,17 @@
 //! * The **packaged** library is held to full parity -- 111 symbols, the 95/16 type split, the exact
 //!   decorated strings in both directions, no hidden name leaked, `SONAME libz.so.1`, and the
 //!   versioned symlink chain.
-//! * The **cargo** `cdylib` is held to its own measured shape: 96 type-`T` symbols, no version
-//!   nodes, and a delta from the contract that is exactly `gzprintf`/`gzvprintf` absent plus three
-//!   `_zlib_rs_*` helpers present. That is a *development* artifact -- convenient, produced by every
-//!   `cargo build`, and marked not installable in the artifact matrix -- so pinning its shape is not
-//!   a concession and not a parity claim either: it detects an unintended new export, or an
+//! * The **cargo** `cdylib` is held to its own measured shape: 93 type-`T` symbols, no version
+//!   nodes, and a delta from the contract that is exactly `gzprintf` and `gzvprintf` absent -- no
+//!   internal helper is exported, because the `.hidden` directives in
+//!   `crates/libz-rs-sys/src/lib.rs` give all three ELF `STV_HIDDEN` visibility, which rustc's
+//!   own version script cannot undo. That is a *development* artifact -- convenient, produced by
+//!   every `cargo build`, and marked not installable in the artifact matrix -- so pinning its shape
+//!   is not a concession and not a parity claim either: it detects an unintended new export, or an
 //!   accidental loss of one, and it stops the deviation from drifting into something wider without a
-//!   test going red.
+//!   test going red. What remains between it and the contract is two variadic C entry points and
+//!   sixteen version nodes, and both gaps are structural rather than editable: see the artifact
+//!   matrix in `src/lib.rs`.
 //! * The **cargo** `libz.a` is held to the *whole* contract -- all 95 functions defined as global
 //!   text symbols, `gzprintf` and `gzvprintf` among them. That is the positive claim the artifact
 //!   matrix makes about the direct-cargo command, and
@@ -134,11 +138,16 @@
 //! `inflate_table` is in `zlib.map`'s `local:` block, yet it must be a defined global in `libz.a`:
 //! `test/infcover.c`'s `cover_trees()` calls it **directly**, twice (L632 and L636), and
 //! `test/CMakeLists.txt` L95-96 links `infcover` against `ZLIB::ZLIBSTATIC`. Hide it from the
-//! archive and `infcover` does not link; leave it in the shared library's dynamic table and the
-//! parity diff fails. The version script is what resolves the two. The C build behaves identically
-//! -- verified here: `nm libz.a` reports `T inflate_table` while `nm -D` on the reference
-//! `libz.so.1.3.2.1-motley` reports zero occurrences -- so this is parity, not an exception to it.
-//! It is asserted positively so that a later reader cannot mistake it for a defect and "fix" it.
+//! archive and `infcover` does not link; leave it in either shared object's dynamic table and the
+//! parity diff fails. Two mechanisms resolve the two requirements: the version script for the
+//! packaged library, and `.hidden` for the `cdylib` cargo links directly. Neither reaches a static
+//! archive. The C build behaves identically -- verified here: `nm libz.a` reports `T inflate_table`
+//! while `nm -D` on the reference `libz.so.1.3.2.1-motley` reports zero occurrences -- so this is
+//! parity, not an exception to it. It is asserted positively so that a later reader cannot mistake
+//! it for a defect and "fix" it.
+//!
+//! The symbol is defined in Rust, in `src/inflate.rs`, over a plain `int` that it validates; the C
+//! translation unit that used to present `inftrees.h`'s `codetype` prototype for it is gone.
 //!
 //! # ★ `zlib.map` has two `local:` blocks
 //!
@@ -379,15 +388,27 @@ const HIDDEN_SYMBOLS: [&str; 10] = [
 /// exported and correctly versioned and still be an adapter nobody ever ran.
 const CDYLIB_ABSENT: [&str; 2] = ["gzprintf", "gzvprintf"];
 
-/// The three internal helpers the cargo `cdylib` exports and the packaged library hides.
+/// The three internal helpers **neither** library exports, and the reason the two agree.
 ///
-/// All three match `zlib.map`'s `_*` pattern. Without that script they are visible; with it they
-/// are not, which is why [`underscore_symbols_hidden`] can require zero underscore-prefixed names
-/// from the packaged library while this set is expected in the `cdylib`.
+/// The packaged library hides them because it is relinked under `zlib.map`: `inflate_table` is
+/// named in the `ZLIB_1.2.0` `local:` block outright at L13, and the two `_zlib_rs_gzprintf_*`
+/// helpers match its trailing `_*` pattern. The cargo `cdylib` is linked under rustc's own
+/// anonymous script, which lists every `#[no_mangle]` item of the crate under `global:` -- so all
+/// three USED to appear in its dynamic table, and it exported 96 names where the contract has 93.
+/// The `.hidden` directives in `crates/libz-rs-sys/src/lib.rs` are what closed that gap: ELF
+/// `STV_HIDDEN` keeps a symbol out of a shared object's dynamic table on both `rust-lld` and
+/// `ld.bfd`, in debug and under fat LTO, and affects static linking not at all.
+///
+/// So this array is now an ABSENCE assertion for both artifacts rather than a presence
+/// assertion for one, which is why [`underscore_symbols_hidden`] can require zero
+/// underscore-prefixed names from either artifact and [`version_script_local_symbols_hidden`]
+/// zero `local:` names. [`inflate_table_static_only`] is the other half: all three remain
+/// ordinary global text symbols in `libz.a`, which is what `test/infcover.c` and
+/// `csrc/gzprintf_shim.c` need.
 const CDYLIB_INTERNALS: [&str; 3] = [
     "_zlib_rs_gzprintf_begin",
     "_zlib_rs_gzprintf_commit",
-    "_zlib_rs_inflate_table",
+    "inflate_table",
 ];
 
 /// Functions the packaged library exports: 54 decorated plus 41 undecorated.
@@ -396,8 +417,10 @@ const FUNCTION_TOTAL: usize = VERSIONED_EXPORTS.len() + UNVERSIONED_EXPORTS.len(
 /// Dynamic globals the packaged library exports: the functions plus the version nodes.
 const DYNAMIC_GLOBAL_TOTAL: usize = FUNCTION_TOTAL + VERSION_NODES.len();
 
-/// Dynamic globals the cargo `cdylib` exports.
-const CDYLIB_TOTAL: usize = FUNCTION_TOTAL - CDYLIB_ABSENT.len() + CDYLIB_INTERNALS.len();
+/// Dynamic globals the cargo `cdylib` exports: the contract, less the two variadic functions a
+/// C object contributes and rustc's `local: *` therefore cannot re-export. Nothing is added,
+/// because [`CDYLIB_INTERNALS`] is hidden in this artifact too.
+const CDYLIB_TOTAL: usize = FUNCTION_TOTAL - CDYLIB_ABSENT.len();
 
 // The arithmetic is asserted at compile time, not merely commented, so that an edit which adds a
 // name to one array without adjusting the others cannot silently unbalance the baseline. AAP 0.6.3.6
@@ -415,8 +438,8 @@ const _: () = assert!(
     "the measured C baseline is 111 symbols"
 );
 const _: () = assert!(
-    CDYLIB_TOTAL == 96,
-    "the measured cargo cdylib exports 96 symbols"
+    CDYLIB_TOTAL == 93,
+    "the measured cargo cdylib exports 93 symbols"
 );
 
 /// The `SONAME` both libraries must record, and the name the loader searches for.
@@ -726,7 +749,7 @@ struct DynSymbol {
 /// `nm` emits `<address> <type> <name>` for a function and `<type> <name>` for a version node, which
 /// has no address -- so the fields are taken from the **end** of the line rather than by column. A
 /// line with fewer than two fields, or whose type field is not a single character, is not a symbol
-/// (archive member headers such as `inftrees_shim.o:` take that shape) and is skipped.
+/// (archive member headers such as `gzprintf_shim.o:` take that shape) and is skipped.
 fn parse_nm(output: &str) -> Vec<DynSymbol> {
     let mut symbols = Vec::new();
     for line in output.lines() {
@@ -1372,6 +1395,11 @@ fn versioned_symlink_chain_present() {
 ///
 /// The same asymmetry holds for `inflate_fast`, `zcalloc`, `zcfree`, `inflate_fixed` and the `_tr_*`
 /// family; `inflate_table` is singled out because it is the one with a hard external consumer.
+///
+/// ★ The archive half is what makes the `.hidden` directive in `src/lib.rs` safe to add. ELF
+/// hidden visibility keeps a symbol out of a *shared object's* dynamic table and changes static
+/// linking not at all, which is why `nm` still reports `T` here -- and why this assertion is the
+/// one that would fail if a future edit reached for a mechanism that does remove the definition.
 #[test]
 fn inflate_table_static_only() {
     if let Some(archive) = cargo_staticlib() {
@@ -1720,9 +1748,10 @@ fn cargo_cdylib_matches_its_measured_shape() {
     }
     for internal in CDYLIB_INTERNALS {
         assert!(
-            names.contains(internal),
-            "{} no longer exports {internal}; csrc/gzprintf_shim.c and csrc/inftrees_shim.c \
-             resolve against these helpers",
+            !names.contains(internal),
+            "{} exports the internal helper {internal}; the `.hidden` directives in \
+             crates/libz-rs-sys/src/lib.rs must keep it out of the dynamic table, and `libz.a` \
+             is where csrc/gzprintf_shim.c and test/infcover.c resolve against it",
             library.display()
         );
     }
@@ -1730,8 +1759,8 @@ fn cargo_cdylib_matches_its_measured_shape() {
     assert_eq!(
         symbols.len(),
         CDYLIB_TOTAL,
-        "{} exports {} dynamic globals, expected {CDYLIB_TOTAL} (95 contract functions, less {} \
-         the shim defines, plus {} internal helpers)",
+        "{} exports {} dynamic globals, expected {CDYLIB_TOTAL} (95 contract functions, less the \
+         {} a C object defines, plus none of the {} internal helpers)",
         library.display(),
         symbols.len(),
         CDYLIB_ABSENT.len(),

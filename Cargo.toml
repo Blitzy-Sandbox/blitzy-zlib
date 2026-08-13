@@ -71,29 +71,44 @@
 #                                encoder's output can be diffed byte for byte
 #                                against the reference implementation in a single
 #                                process.  It is never a dependency of either
-#                                shipped crate, which is what keeps
-#                                `cargo build --release` free of any C compiler
-#                                -- measured with
+#                                shipped crate -- measured with
 #                                `cargo tree -p libz-rs-sys -e normal,build,dev`,
-#                                which names this crate nowhere.  Driving two C
-#                                ABIs does mean it needs `unsafe` of its own: it
-#                                is confined to src/oracle.rs (the reference
-#                                surface) and src/port.rs (the facade surface),
-#                                and every suite under tests/, every attached
-#                                bench and all five fuzz targets that drive those
-#                                gates carry #![forbid(unsafe_code)].
+#                                which names this crate nowhere -- so the
+#                                REFERENCE IMPLEMENTATION is an oracle rather
+#                                than a build dependency.  That is a different
+#                                claim from "no C is compiled": the facade's own
+#                                build.rs compiles the two shims in its csrc/, so
+#                                a C compiler and an archiver are prerequisites
+#                                of the default facade build too, and only
+#                                `cargo build -p zlib-rs` needs neither.  Driving
+#                                two C ABIs does mean this crate needs `unsafe`
+#                                of its own: it is confined to src/oracle.rs (the
+#                                reference surface) and src/port.rs (the facade
+#                                surface), and every suite under tests/, all
+#                                three benchmark suites and all five fuzz targets
+#                                that drive those gates carry
+#                                #![forbid(unsafe_code)].
 #
 # The C sources in this directory are retained and unmodified; they serve only as
 # the algorithmic oracle.  zlib.h, zconf.h and zlib.map are the immutable public
 # contract and are never edited, generated or overwritten by the Rust build.
 #
 #  Build and verification entry points.  Note the package selection: the two
-#  shipped crates are named explicitly, because `--workspace` and a bare
-#  `cargo build` also reach crates/zlib-rs-differential, whose build script
-#  compiles the in-tree C sources and therefore needs a C toolchain.  The
-#  `default-members` key below makes a bare `cargo build` select the shipped pair
-#  on its own; the `-p` forms are spelled out anyway so a command copied out of
-#  this file keeps working if that key is ever changed.
+#  shipped crates are named explicitly because `--workspace` reaches
+#  crates/zlib-rs-differential as well, whose build script compiles the fifteen
+#  in-tree C reference translation units.  A BARE `cargo build` does not: the
+#  `default-members` key below selects the shipped pair on its own.  The `-p`
+#  forms are spelled out anyway, so that a command copied out of this file keeps
+#  meaning the same thing if that key is ever changed.
+#
+#  A C compiler and an archiver are prerequisites either way, and it is worth
+#  saying so here rather than leaving it to be discovered: crates/libz-rs-sys has
+#  a build script that compiles the two translation units in its csrc/ -- the
+#  variadic gzprintf/gzvprintf pair and inflate_table's `code`-typed prototype,
+#  neither of which stable Rust can declare -- and archives them into the libz.a
+#  rustc emits.  `cargo build -p zlib-rs` is the only toolchain-free build here.
+#  What the differential crate's boundary buys is not a C-free build; it is that
+#  the REFERENCE IMPLEMENTATION is an oracle rather than a dependency.
 #
 #    cargo build --release -p zlib-rs -p libz-rs-sys          # the shipped pair
 #    cargo build --release -p libz-rs-sys --features libz-compat
@@ -117,19 +132,22 @@
 #  WHICH OF THOSE ARTIFACTS IS INSTALLABLE.  The second command produces two
 #  libraries and they are not equivalent.  `target/release/libz.a` IS the
 #  installable static library: it defines all 95 functions `zlib.h` declares,
-#  because `crates/libz-rs-sys/build.rs` compiles that crate's two C translation
-#  units -- `csrc/gzprintf_shim.c` for the variadic `gzprintf`/`gzvprintf` and
-#  `csrc/inftrees_shim.c` for `inflate_table`'s `codetype` prototype, none of which
-#  stable Rust can declare -- and rustc merges their archive into it.
+#  because 93 of them are Rust and `crates/libz-rs-sys/build.rs` compiles that
+#  crate's one shipped C translation unit -- `csrc/gzprintf_shim.c`, for the variadic
+#  `gzprintf` and the `va_list`-taking `gzvprintf`, neither of which stable Rust can
+#  declare -- and rustc merges its archive into it.
 #
 #  `target/release/libz.so` is NOT, and no cargo argument can make it so.  rustc
 #  attaches its own anonymous version script to every cdylib link, and that single
 #  mechanism accounts for the entire difference: `zlib.map` cannot be layered on
-#  top (so none of the reference library's 16 symbol-version nodes), a symbol the C
-#  units define gets no dynamic entry at all (so no `gzprintf`, no `gzvprintf`),
-#  and the `_zlib_rs_*` helpers `zlib.map` hides through `_*` are visible.
-#  Measured with `nm -D --defined-only --extern-only`: 96 dynamic globals against
-#  the reference library's 111, and zero version nodes.
+#  top (so none of the reference library's 16 symbol-version nodes), and a symbol
+#  the C unit defines gets no dynamic entry at all (so no `gzprintf`, no
+#  `gzvprintf`).  The crate's three internal helpers WOULD also be visible, and are
+#  not: `.hidden` directives in `crates/libz-rs-sys/src/lib.rs` give them ELF
+#  `STV_HIDDEN` visibility, which no version script can undo and which leaves the
+#  archive's definitions alone.  Measured with `nm -D --defined-only
+#  --extern-only`: 93 dynamic globals against the reference library's 111, and zero
+#  version nodes.  So the gap is exactly two functions and sixteen version nodes.
 #
 #  The installable SHARED library is relinked from that same complete `libz.a`
 #  under `zlib.map`, with a symbol-parity gate against `zlib.h` and `zlib.map`
@@ -183,17 +201,20 @@ resolver = "2"
 # here:
 #   * `fuzz`     — excluded below; it is a cargo-fuzz crate with its own
 #                  dependencies and its own profile requirements.
-#   * `benches`  — a bare directory of bench sources, not a package.  A virtual
-#                  manifest cannot own bench targets, so benches/*.rs belongs to
-#                  crates/zlib-rs-differential, which takes `criterion` as a
-#                  dev-dependency and is the correct host because every benchmark
-#                  measures the Rust implementation against the C oracle that
-#                  crate builds.  Each suite is attached there by an explicit
-#                  [[bench]] entry carrying `path = "../../benches/<name>.rs"` and
-#                  `harness = false`, added in the same change as the file it
-#                  names — an entry naming a missing file breaks every cargo
-#                  invocation that enumerates targets.  Do not add a fourth member
-#                  for it, and do not move the directory.
+#   * `benches`  — excluded below as well, and for a reason of its own: it is a
+#                  PACKAGE, `zlib-rs-benches`, with its own Cargo.toml, its own
+#                  [workspace] table and its own Cargo.lock.  It has to be
+#                  separate because criterion declares `rust-version = "1.86"`
+#                  and reaches an edition-2024 transitive manifest, which cargo
+#                  on this workspace's declared 1.80 floor cannot resolve at all
+#                  — see the criterion note further down for the exact error.  It
+#                  depends on all three members above by path as ordinary
+#                  dependencies, so a benchmark reaches the port and the C oracle
+#                  the way any consumer would, and it is reached with
+#                  `--manifest-path benches/Cargo.toml`.  Nothing is attached to
+#                  crates/zlib-rs-differential by a [[bench]] entry, and that
+#                  crate takes no criterion dependency.  Do not add a fourth
+#                  member for either directory.
 members = [
     "crates/zlib-rs",
     "crates/libz-rs-sys",
@@ -329,10 +350,13 @@ authors = [
     "Mark Adler <madler@alumni.caltech.edu>",
 ]
 
-# Edition 2021 is not a preference, it is the only valid choice at this MSRV:
-# edition 2024 requires rustc >= 1.85 and cargo rejects the combination —
+# Edition 2021 is what AAP §0.7.1(h) requires, and it is the LATEST edition
+# compatible with the 1.80 floor declared below rather than an arbitrary pick:
+# edition 2024 requires rustc >= 1.85 and cargo rejects the combination outright —
 #   error: rust-version 1.80 is incompatible with the version (1.85.0)
 #          required by the specified edition (2024)
+# The older editions remain valid at this floor and are simply worse; raising the
+# edition is a decision about the floor, in that order.
 edition = "2021"
 
 # THIS is what clippy's version-aware lints read: clippy.toml declares no `msrv`
@@ -460,7 +484,20 @@ zlib-rs = { path = "crates/zlib-rs", version = "1.3.2" }
 # Build-dependency of crates/zlib-rs-differential ONLY.  Compiles the in-tree C
 # translation units into the test-only oracle archive.  It must never appear in the
 # [dependencies] or [build-dependencies] of a shipped crate.
-cc = "1.4.0"
+#
+# ★ EXACT, NOT CARET, AND THE `=` IS LOAD-BEARING.  AAP §0.5.1.3 pins this provider
+# at 1.4.0 and it is the tool that compiles the C ORACLE -- the thing every
+# byte-identity, interoperability and throughput number in this project is measured
+# against.  `cc = "1.4.0"` is a caret requirement, so it admits any 1.x, and because
+# `benches/` and `fuzz/` are EXCLUDED PACKAGES WITH THEIR OWN LOCKFILES the
+# requirement was resolved three times independently: this lock and fuzz/Cargo.lock
+# came out at 1.4.0 while benches/Cargo.lock came out at 1.4.2.  Correctness was
+# therefore comparing against an oracle built by one provider version and
+# performance against an oracle built by another, which is exactly the variable a
+# differential harness exists to eliminate.  The `=` makes all three locks resolve
+# the one reviewed version, and the `cross-lock oracle provider` step of
+# .github/workflows/rust.yml asserts they still agree on every push.
+cc = "=1.4.0"
 
 # ★ NOT LISTED HERE, AND DELIBERATELY: criterion.
 #
@@ -470,14 +507,19 @@ cc = "1.4.0"
 # not in this table, and no member depends on it, because it cannot be in this
 # workspace's graph at all.
 #
-# THE MEASUREMENT.  criterion 0.8.2 declares `rust-version = "1.86"` and reaches clap
-# 4.6.5, whose clap_builder/clap_lex declare `edition = "2024"`.  Cargo 1.80 cannot
-# parse an edition-2024 manifest, so while the suites were attached to
+# THE MEASUREMENT.  criterion 0.8.2 declares `rust-version = "1.86"` and reaches clap,
+# whose clap_builder/clap_lex declare `edition = "2024"`.  Cargo 1.80 cannot parse an
+# edition-2024 manifest, so while the suites were attached to
 # `crates/zlib-rs-differential` -- a MEMBER -- every command that resolves the
-# workspace dev graph on the declared floor failed outright:
-#   error: failed to download `clap_builder v4.6.5` … the package requires the
+# workspace dev graph on the declared floor failed outright, naming whichever clap
+# patch release was current at the time:
+#   error: failed to download `clap_builder v4.6.x` … the package requires the
 #          Cargo feature called `edition2024`, but that feature is not
 #          stabilized in this version of Cargo (1.80.1)
+# The exact patch number is deliberately not pinned into this prose: it is a
+# transitive dependency of a dev-dependency of an excluded package, benches/Cargo.lock
+# is where the resolved version actually lives, and it moves without anything here
+# changing.
 # A workspace cannot declare `rust-version = "1.80"` (AAP §0.7.1(h)) and then require
 # a dev graph 1.80 cannot resolve, and no manifest key can rescue it: `rust-version`
 # is a declaration, not a resolver directive.

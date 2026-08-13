@@ -12,14 +12,19 @@
 # implements:
 #
 #   * the artifacts are named libz.so and libz.a, so -lz resolves to either;
-#   * the shared object carries SONAME libz.so.1 and the same
-#     libz.so -> libz.so.1 -> libz.so.1.3.2.1-motley chain, so a program
-#     already linked against libz keeps loading it under the name recorded in
-#     its DT_NEEDED entry.  Cargo does not produce that chain: it writes a bare
-#     libz.so, and the `rust' target relinks the staticlib into the versioned
-#     name -- through $(LDSHARED), so the soname and the zlib.map version
-#     script are the C build's own -- and symlinks the other two beside it, in a
-#     packaging directory of its own rather than in cargo's output directory;
+#   * the shared object carries SONAME libz.so.1, and the names around it are
+#     laid out exactly as the C build lays them out: the real file is
+#     libz.so.1.3.2.1-motley, and libz.so.1 and libz.so are two symlinks
+#     pointing DIRECTLY at it -- not a chain in which one alias resolves through
+#     the other, which is what `ln -s $(SHAREDLIBV)' does twice for the C
+#     library further down and what the `rust' target does twice for this one.
+#     A program already linked against libz then keeps loading it under the name
+#     recorded in its DT_NEEDED entry, whichever of the three that is.  Cargo
+#     produces none of this: it writes a bare libz.so, and the `rust' target
+#     relinks the staticlib into the versioned name -- through $(LDSHARED), so
+#     the soname and the zlib.map version script are the C build's own -- and
+#     symlinks the other two onto it, in a packaging directory of its own rather
+#     than in cargo's output directory;
 #   * the exported symbol surface must match the C library's 111 dynamic
 #     globals, being 95 functions plus the 16 symbol-version nodes declared in
 #     zlib.map.  Three things diff that with nm, each running on its own: the

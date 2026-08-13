@@ -86,7 +86,8 @@
 //! None of these changes a compressed byte or a table *value*. Each one instead changes
 //! initialization strategy, the reported compile flags, the per-stream memory footprint, or the
 //! exported surface. The suites that compare those four things -- `tests/` beside this file and
-//! the benchmark suites in `benches/` attached to this package -- are the reason each one still
+//! the benchmark suites of the `benches/` package, which depends on this one -- are the reason each
+//! one still
 //! has to stay undefined: they matter for their own reasons rather than for byte identity, and an
 //! oracle built with any of them defined would fail those comparisons while emitting identical
 //! bytes.
@@ -662,6 +663,59 @@ const SHIM_LOCAL_RENAMES: [(&str, &str); 2] = [
     ("_length_code", "c_shim_length_code"),
 ];
 
+/// The only `__`-prefixed globals the oracle archive may export, as (prefix, kind) pairs.
+///
+/// [`verify_every_export_is_prefixed`] tolerates a defined global beginning with `__` only when it
+/// matches one of these families AND its payload is accountable, which for an ODR indicator means
+/// naming a global this script itself renames. Everything else fails the build.
+///
+/// ★ MEASURED, not assumed. Building this crate with `RUSTFLAGS=-Zsanitizer=address` and
+/// `CFLAGS='-fsanitize=address -fno-omit-frame-pointer -O1 -g'` -- the exact configuration the
+/// `asan` job of `.github/workflows/rust.yml` uses -- leaves precisely seven such symbols, all of
+/// them ODR indicators:
+///
+/// ```text
+/// __odr_asan._dist_code          __odr_asan.c_shim_dist_code    __odr_asan.deflate_copyright
+/// __odr_asan._length_code        __odr_asan.c_shim_length_code  __odr_asan.inflate_copyright
+///                                                              __odr_asan.z_errmsg
+/// ```
+///
+/// Two spellings appear because the two rename mechanisms differ in what the indicator is named
+/// after. `objcopy --redefine-syms` rewrites the DATA symbol after compilation, so the indicator
+/// keeps the source spelling (`__odr_asan.z_errmsg` beside the renamed `c_z_errmsg`); the shim's
+/// two copies are renamed by `-D` before the compiler sees them, so their indicators carry the new
+/// spelling (`__odr_asan.c_shim_dist_code`). Both are checked against the tables rather than
+/// pattern-matched loosely.
+///
+/// An ODR indicator can never collide with `libz-rs-sys`: it is emitted by the C compiler's
+/// sanitizer instrumentation, rustc emits no symbol of that shape, and it is referenced only by
+/// the ASan runtime's own duplicate-global detection.
+///
+/// `__x86.get_pc_thunk.*` is the second family, and it is here for the 32-bit `-fPIC` leg of the
+/// `integer-models` job: gcc emits one PC thunk per register on i686, they are `.gnu.linkonce`
+/// COMDAT globals, and rustc's own i686 objects contain identical copies that the linker folds.
+const TOOLCHAIN_SYMBOL_FAMILIES: [(&str, ToolchainSymbol); 3] = [
+    // gcc / clang, `-fsanitize=address`: one ODR indicator per instrumented global.
+    ("__odr_asan.", ToolchainSymbol::OdrIndicator),
+    // clang's older spelling of the same thing, kept so a clang-driven `cc` build is not a
+    // surprise failure on a developer's machine.
+    ("__odr_asan_gen_", ToolchainSymbol::OdrIndicator),
+    // gcc, 32-bit x86 `-fPIC`: position-independent-code thunks.
+    ("__x86.get_pc_thunk.", ToolchainSymbol::PcThunk),
+];
+
+/// What a [`TOOLCHAIN_SYMBOL_FAMILIES`] entry describes, and therefore how its payload is checked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolchainSymbol {
+    /// An AddressSanitizer ODR indicator. The payload must name a global this script renames,
+    /// under either its source spelling or its renamed one.
+    OdrIndicator,
+    /// A 32-bit x86 PC thunk. The payload is a register name; any non-empty payload is accepted,
+    /// because the register set is the compiler's business and none of the spellings can collide
+    /// with a zlib name.
+    PcThunk,
+}
+
 /// The generated table-exposure shim, written verbatim into `OUT_DIR`.
 ///
 /// Kept as one deterministic string constant: the file has no timestamp, no host paths and no
@@ -1115,6 +1169,12 @@ fn main() {
 
     emit_rerun_directives(&repo_root);
 
+    // BEFORE a single object exists.  An `-flto` in the environment makes the symbol rename
+    // below unsound, and the whole crate depends on that rename, so the answer is refused
+    // here -- where the diagnostic can name the variable -- rather than surfacing later as an
+    // `objcopy` exit status, or (worse) as a suite that compares the port against itself.
+    refuse_link_time_optimisation(&repo_root);
+
     // Everything generated goes to OUT_DIR. The repository working tree is never written to.
     let shim = write_table_shim(&out_dir);
     let wrappers = write_wrapper_tus(&out_dir);
@@ -1377,7 +1437,9 @@ fn reference_build(repo_root: &Path) -> cc::Build {
 /// that IR are invisible to `--redefine-syms`. An LTO oracle would therefore emerge from the
 /// rename pass with its *real* names still in the IR and rebind, at link time, to the port's
 /// unprefixed definitions -- a differential test comparing the port against itself and passing
-/// trivially. Losing the oracle to gain a comparable flag set is not a trade worth making.
+/// trivially. Losing the oracle to gain a comparable flag set is not a trade worth making, so an
+/// `-flto` that reaches this build through the environment is a HARD FAILURE here rather than a
+/// note in the tag: by the time a log could be read, the suites would already have passed.
 ///
 /// The comparability is therefore restored from the Rust side, where it costs nothing: the root
 /// `Cargo.toml` defines a second measurement profile, `bench-parity`, identical to `bench` except
@@ -1392,6 +1454,62 @@ fn reference_build(repo_root: &Path) -> cc::Build {
 /// build script both of those things (`PROFILE`, `OPT_LEVEL`), so a declaration that contradicts
 /// them -- most usefully, a dev build labelled as a measurement profile -- fails the build here
 /// rather than producing a plausible-looking log.
+/// Refuses to build the oracle when the C flags carry link-time optimisation.
+///
+/// # Why this is a hard failure and not a recorded asymmetry
+///
+/// Every externally visible symbol in the oracle archive is renamed to carry a `c_` prefix by
+/// `objcopy --redefine-syms` ([`apply_symbol_renames`]); that rename is what lets the reference
+/// implementation and the port be linked into one test binary and called alternately. `objcopy`
+/// rewrites the ELF symbol table. Under `-flto` the object files carry GCC's serialised IR in
+/// `.gnu.lto_*` sections instead, and the names inside that IR are invisible to
+/// `--redefine-syms` -- so the oracle would emerge from the rename pass with its *real* names
+/// still in the IR and rebind, at link time, to the port's own unprefixed definitions. Every
+/// differential comparison in this crate would then compare the port against itself and pass
+/// trivially.
+///
+/// A vacuous pass is the worst outcome this crate can produce, and worse than a failed build:
+/// an earlier revision detected the flag, folded the answer into the profile tag and continued,
+/// on the reasoning that a log line saying `lto` was enough for a reader to notice. It is not --
+/// by the time the log exists the suites have already reported success. `-flto` can only arrive
+/// here through an external `CFLAGS`, `TARGET_CFLAGS`, `HOST_CFLAGS` or the per-target spelling,
+/// all of which `cc` absorbs, so the flag set `cc` is about to use is the authority for the
+/// question and this runs before any object exists.
+///
+/// Comparable measurement of the port is not lost by refusing: the root `Cargo.toml`'s
+/// `bench-parity` profile turns LTO off on the RUST side, which is the direction that does not
+/// break the rename pass.
+fn refuse_link_time_optimisation(repo_root: &Path) {
+    let tool = reference_build(repo_root).get_compiler();
+    let offending: Vec<String> = tool
+        .args()
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .filter(|flag| flag.starts_with("-flto") || flag == "/GL")
+        .collect();
+
+    if offending.is_empty() {
+        return;
+    }
+
+    fail(&format!(
+        "build.rs: the C oracle cannot be built with link-time optimisation, and {offending:?} \
+         is in the flag set `{cc}` is about to use.\n\
+         \n\
+         This crate renames every exported symbol in the oracle to a `c_` prefix with `objcopy \
+         --redefine-syms`, which is what lets the reference and the port live in one test binary. \
+         Under LTO the names live inside `.gnu.lto_*` IR sections that `--redefine-syms` does not \
+         touch: the oracle would keep its real names, rebind to the port's definitions at link \
+         time, and every differential comparison in this crate would silently compare the port \
+         against itself.\n\
+         \n\
+         Remove the flag from CFLAGS, TARGET_CFLAGS, HOST_CFLAGS or CFLAGS_<target> for this \
+         build. Whole-program optimisation is compared instead from the Rust side, with the \
+         `bench-parity` profile, which turns LTO off there.",
+        cc = tool.path().display(),
+    ));
+}
+
 fn emit_baseline_metadata(repo_root: &Path) {
     // The tool `cc` will invoke, built from the same function the oracle itself uses. The 95
     // `-D` renames are deliberately not part of this build: they are name substitutions with no
@@ -1403,11 +1521,6 @@ fn emit_baseline_metadata(repo_root: &Path) {
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
 
-    // Stated as a fact rather than assumed: `-flto` can only appear here by way of an external
-    // `CFLAGS`, and if it ever does, the tag must say so -- both because the rename pass above
-    // would then be unsound and because the LTO asymmetry this whole function exists to expose
-    // would have quietly reversed.
-    let lto = flags.iter().any(|flag| flag.starts_with("-flto"));
     let family = if tool.is_like_msvc() {
         "msvc"
     } else if tool.is_like_clang() {
@@ -1417,10 +1530,9 @@ fn emit_baseline_metadata(repo_root: &Path) {
     } else {
         "unknown"
     };
-    let tag = format!(
-        "{family}-O3-fPIC-per-tu-{}",
-        if lto { "lto" } else { "no-lto" }
-    );
+    // `no-lto` is unconditional because the assertion above is what makes it true, rather
+    // than a hope: an LTO build never reaches this line.
+    let tag = format!("{family}-O3-fPIC-per-tu-no-lto");
 
     println!(
         "cargo::rustc-env={C_FLAGS_ENV}=cc={cc} renames={renames} units=per-translation-unit \
@@ -1932,11 +2044,25 @@ fn remove_if_present(path: &Path) {
 /// exported C symbol shows up here as a precise diagnostic naming the symbol and the list to add
 /// it to, instead of as a `multiple definition of ...` from the linker weeks later.
 ///
-/// Names beginning with a double underscore are reported but tolerated: that spelling is reserved
-/// to the implementation, zlib defines no such symbol, and toolchains legitimately emit their own
-/// -- 32-bit x86 `-fPIC` builds, for instance, emit `__x86.get_pc_thunk.bx`. Nothing of zlib's can
-/// hide behind the allowance, and anything that appears is surfaced as a warning rather than
-/// passed over in silence.
+/// ★ THE TOOLCHAIN ALLOWANCE IS AN EXACT LIST, NOT A PREFIX RULE. This used to tolerate *every*
+/// defined global whose name began with a double underscore, on the reasoning that the spelling is
+/// reserved to the implementation and zlib defines no such name. Both halves of that are true and
+/// the conclusion was still too wide: `__` is also the spelling a mistake takes when a future
+/// reference source, a sanitizer, a profiler or an LTO plugin introduces a global this script has
+/// never seen, and a blanket prefix rule passes all of them while printing a warning nobody reads.
+/// The allowance is now [`TOOLCHAIN_SYMBOL_FAMILIES`] applied to a payload this script can
+/// ACCOUNT FOR -- an ODR indicator, or a PC thunk, and in the ODR case only for a global whose name
+/// appears in this script's own rename tables -- and any other `__` global fails the build with the
+/// same diagnostic an unprefixed name gets.
+///
+/// It is also no longer an unconditional `cargo::warning`. The seven `__odr_asan.*` indicators an
+/// `-fsanitize=address` build emits are a KNOWN, EXPECTED consequence of a configuration this
+/// project asks for in CI, and warning about them on every sanitizer build made
+/// `cargo +nightly test -p zlib-rs-differential` non-quiet forever, which contradicted the
+/// zero-warning bar the project holds itself to. Expected families are recorded on this script's
+/// own stdout, which cargo captures per build (`run/stdout` beside this crate's `out` directory on
+/// current cargo, `output` on older layouts), and nothing else; only an unaccountable name is
+/// loud, and it is loud by failing.
 ///
 /// AN AUDIT THAT CANNOT RUN IS A BUILD FAILURE, not a warning.
 ///
@@ -1971,6 +2097,7 @@ fn verify_every_export_is_prefixed(archive: &Path) {
 
     let mut unprefixed: Vec<&str> = Vec::new();
     let mut toolchain: Vec<&str> = Vec::new();
+    let mut unaccountable: Vec<&str> = Vec::new();
     for line in listing.lines() {
         let mut fields = line.split_whitespace();
         let Some(symbol) = fields.next() else {
@@ -1990,7 +2117,11 @@ fn verify_every_export_is_prefixed(archive: &Path) {
             continue;
         }
         if symbol.starts_with("__") {
-            toolchain.push(symbol);
+            if accountable_toolchain_symbol(symbol) {
+                toolchain.push(symbol);
+            } else {
+                unaccountable.push(symbol);
+            }
         } else {
             unprefixed.push(symbol);
         }
@@ -1999,13 +2130,36 @@ fn verify_every_export_is_prefixed(archive: &Path) {
     if !toolchain.is_empty() {
         toolchain.sort_unstable();
         toolchain.dedup();
+        // Recorded, not warned: see this function's doc comment. These names are an expected
+        // consequence of the configuration being built (a sanitizer build emits one ODR indicator
+        // per instrumented global), they cannot collide with anything Rust defines, and every one
+        // of them was matched against this script's own rename tables before it got here.
         println!(
-            "cargo::warning=zlib-rs-differential: the oracle archive exports {} symbol(s) \
-             reserved to the toolchain, left unrenamed because zlib defines no `__`-prefixed \
-             name: {}",
+            "zlib-rs-differential: the oracle archive exports {} accounted-for toolchain \
+             symbol(s), each an artifact of the configuration rather than a zlib name: {}",
             toolchain.len(),
             join_names(&toolchain)
         );
+    }
+
+    if !unaccountable.is_empty() {
+        unaccountable.sort_unstable();
+        unaccountable.dedup();
+        fail(&format!(
+            "build.rs: {} global symbol(s) exported by `{}` begin with `__` but are not one of \
+             the accounted-for toolchain families: {}.\n\
+             The `__` spelling is reserved to the implementation, so a name like this is normally \
+             a sanitizer, profiler or codegen artifact -- but it is not passed over on that \
+             assumption, because it is also what a newly introduced global in the reference \
+             sources would look like if it were spelled that way, and a blanket prefix allowance \
+             would hide it. Either add the family to TOOLCHAIN_SYMBOL_FAMILIES in this script, \
+             stating what emits it and why it cannot collide with libz-rs-sys, or add the \
+             underlying name to PUBLIC_RENAMES / INTERNAL_REDEFINES so it is renamed like every \
+             other export.",
+            unaccountable.len(),
+            archive.display(),
+            join_names(&unaccountable)
+        ));
     }
 
     if !unprefixed.is_empty() {
@@ -2029,8 +2183,55 @@ fn join_names(names: &[&str]) -> String {
     names.join(", ")
 }
 
-/// Publishes the archive to the crate's own targets: the library, the tests and the attached
-/// benches.
+/// Whether `symbol` is a `__`-prefixed global this script can account for.
+///
+/// The gate [`verify_every_export_is_prefixed`] applies. Returns `false` for anything that is not
+/// one of [`TOOLCHAIN_SYMBOL_FAMILIES`], and for an ODR indicator whose payload is not a global
+/// this script renames -- so a sanitizer build of a reference source that gained a new global
+/// stops the build rather than passing under the family allowance.
+fn accountable_toolchain_symbol(symbol: &str) -> bool {
+    for (prefix, kind) in TOOLCHAIN_SYMBOL_FAMILIES {
+        let Some(payload) = symbol.strip_prefix(prefix) else {
+            continue;
+        };
+        if payload.is_empty() {
+            continue;
+        }
+        return match kind {
+            ToolchainSymbol::PcThunk => true,
+            ToolchainSymbol::OdrIndicator => renames_global_named(payload),
+        };
+    }
+    false
+}
+
+/// Whether `name` is a global this script renames, under either spelling.
+///
+/// The three tables are the complete record of what the archive defines under a name of its own:
+/// [`PUBLIC_RENAMES`] and [`INTERNAL_REDEFINES`] are renamed after compilation by `objcopy`, so a
+/// derived symbol may carry either the source name or the `c_`-prefixed one, and
+/// [`SHIM_LOCAL_RENAMES`] is applied by `-D` before compilation, so only the replacement spelling
+/// can appear.
+fn renames_global_named(name: &str) -> bool {
+    let source_spelling = PUBLIC_RENAMES
+        .iter()
+        .chain(INTERNAL_REDEFINES.iter())
+        .any(|renamed| *renamed == name);
+    let prefixed_spelling = name
+        .strip_prefix(SYMBOL_PREFIX)
+        .is_some_and(|bare| PUBLIC_RENAMES.contains(&bare) || INTERNAL_REDEFINES.contains(&bare));
+    let shim_spelling = SHIM_LOCAL_RENAMES
+        .iter()
+        .any(|(_, replacement)| *replacement == name);
+
+    source_spelling || prefixed_spelling || shim_spelling
+}
+
+/// Publishes the archive to this crate's own targets: the library and the three test suites.
+///
+/// It reaches the `benches/` package too, and not by being listed there: that package depends on
+/// this crate, so cargo replays these directives for anything that links this rlib. Nothing is
+/// attached to this package by a `[[bench]]` entry.
 ///
 /// Linking it crate-wide rather than for tests alone is harmless -- the crate is dev-only, so
 /// nothing shipped is affected, and the linker pulls no member that nothing references.

@@ -72,6 +72,19 @@ rust
 # Fixture bytes are the fixture; see the note above.
 EXCLUDE=':(exclude)crates/zlib-rs-differential/corpus/minimal'
 
+# UNQUOTED ON PURPOSE, AND SUPPRESSED RATHER THAN LEFT AS NOISE.  $SCOPE is a
+# newline-separated list and `git ls-files' wants each entry as its own operand,
+# so the field splitting IS the mechanism here: quoting it would hand git ONE
+# pathspec containing embedded newlines, which matches nothing, and the emptiness
+# check below would then fail every run.  The split is safe as well as intended --
+# SCOPE is an internal constant defined a few lines above, every entry is a
+# literal path with no whitespace inside it and no glob metacharacter, so pathname
+# expansion has nothing to expand and each line becomes exactly one operand.  The
+# exclude pathspec is quoted because it is a single operand whose `:(exclude)'
+# prefix must survive intact.  ShellCheck cannot see any of that, so it reports
+# SC2086 here; the suppression is scoped to this one line so that the same
+# diagnostic anywhere else in this file is still a real finding.
+# shellcheck disable=SC2086
 files=$(git ls-files -- $SCOPE "$EXCLUDE")
 
 if [ "${1:-}" = '--list' ]; then

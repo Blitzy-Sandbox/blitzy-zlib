@@ -141,6 +141,7 @@ use zlib_rs::adler32::{ADLER32_INITIAL_VALUE, NMAX};
 use zlib_rs::crc32::{Braid, Crc32Backend, Generic, CRC_TABLE};
 use zlib_rs_differential::oracle::oracle_crc_table;
 use zlib_rs_differential::{oracle, port};
+use zlib_rs_fuzz::reached;
 
 // The vectorized engines are named only by the neutrality check, so their imports are
 // gated exactly as it is. Without the feature the types do not exist at all -- `zlib-rs`
@@ -149,7 +150,7 @@ use zlib_rs_differential::{oracle, port};
 #[cfg(feature = "simd")]
 use zlib_rs::adler32::{Adler32Backend, Adler32Generic, Adler32Simd};
 #[cfg(feature = "simd")]
-use zlib_rs::crc32::Simd;
+use zlib_rs::crc32::StrideBraid;
 
 // ---------------------------------------------------------------------------
 //  Termination bounds
@@ -1565,7 +1566,7 @@ fn check_simd_neutrality(data: &[u8], adler_seed: u32, crc_seed: u32) {
     );
 
     let generic_crc = !<Generic as Crc32Backend>::update(!crc_seed, data);
-    let simd_crc = !<Simd as Crc32Backend>::update(!crc_seed, data);
+    let simd_crc = !<StrideBraid as Crc32Backend>::update(!crc_seed, data);
     assert_eq!(
         generic_crc, simd_crc,
         "the vectorized CRC-32 backend changed the answer: seed {crc_seed:#x}, len {len}"
@@ -1713,4 +1714,28 @@ fn drive(input: &ChecksumInput<'_>) {
 
 fuzz_target!(|input: ChecksumInput<'_>| {
     drive(&input);
+    // Off unless `ZLIB_RS_FUZZ_REPORT` is set. This target differs from the other four in
+    // that nothing here can be *refused*: a checksum over any slice, empty included, is a
+    // defined comparison against the oracle. So the productive value says what a committed
+    // seed actually has to carry -- a payload long enough for the multi-chunk, resumption
+    // and NMAX paths to differ from the single-shot one. `MAX_BACKEND_LEN` is the threshold
+    // because it is the point past which the backend comparisons stop being trimmed, and it
+    // is comfortably past the 5552-byte NMAX boundary's smaller relatives. See
+    // `zlib_rs_fuzz`.
+    reached(
+        "fuzz_checksum",
+        if input.payload.len() >= BYTEWISE_PREFIX_LEN {
+            "compared"
+        } else {
+            "compared_short"
+        },
+        |fields| {
+            fields
+                .with("payload", input.payload.len())
+                .with("chunk", input.chunk)
+                .with("split", input.split)
+                .with("tables", input.check_tables)
+                .with("resumption", input.probe_resumption)
+        },
+    );
 });

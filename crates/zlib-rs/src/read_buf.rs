@@ -589,7 +589,17 @@ impl<'o> OutputRegion<'o> {
     }
 
     /// Writes one byte at `at`, reporting whether it fitted.
-    #[inline]
+    // ★ `inline(always)`, not `inline`, and the reason is measured rather than stylistic.
+    // This is on `inflate_fast`'s per-symbol path (`inffast.c` L246-L275), where C has a
+    // pointer store and a pointer increment and this has a call. A warmed release build of
+    // the library kept it OUT OF LINE inside `inflate_fast` -- the call, the argument
+    // marshalling and the storage-variant branch, once per literal and once per match copy
+    // -- because the function is large enough in MIR terms that the ordinary hint does not
+    // carry it into a caller that big. Forcing it lets LLVM hoist the storage discriminant
+    // and the high-water mark out of the decode loop, which is the whole point: the variant
+    // is loop-invariant and the compiler can only see that once the body is present.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn write_byte_at(&mut self, at: usize, byte: u8) -> bool {
         match &mut self.storage {
             Storage::Init(buf) => match buf.get_mut(at) {
@@ -616,7 +626,17 @@ impl<'o> OutputRegion<'o> {
     /// over a byte slot is a plain store, and release codegen turns the loop into the same
     /// `memcpy` [`slice::copy_from_slice`] emits. That was verified on the assembly, not
     /// assumed.
-    #[inline]
+    // ★ `inline(always)`, not `inline`, and the reason is measured rather than stylistic.
+    // This is on `inflate_fast`'s per-symbol path (`inffast.c` L246-L275), where C has a
+    // pointer store and a pointer increment and this has a call. A warmed release build of
+    // the library kept it OUT OF LINE inside `inflate_fast` -- the call, the argument
+    // marshalling and the storage-variant branch, once per literal and once per match copy
+    // -- because the function is large enough in MIR terms that the ordinary hint does not
+    // carry it into a caller that big. Forcing it lets LLVM hoist the storage discriminant
+    // and the high-water mark out of the decode loop, which is the whole point: the variant
+    // is loop-invariant and the compiler can only see that once the body is present.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn write_slice_at(&mut self, at: usize, src: &[u8]) -> bool {
         let Some(end) = at.checked_add(src.len()) else {
             return false;
@@ -656,7 +676,17 @@ impl<'o> OutputRegion<'o> {
     /// inherits the source's initialisation rather than requiring the source to be read.
     /// The high-water mark is raised only when the *source* lay inside it, which is what
     /// keeps the promise [`OutputRegion::initialized`] relies on.
-    #[inline]
+    // ★ `inline(always)`, not `inline`, and the reason is measured rather than stylistic.
+    // This is on `inflate_fast`'s per-symbol path (`inffast.c` L246-L275), where C has a
+    // pointer store and a pointer increment and this has a call. A warmed release build of
+    // the library kept it OUT OF LINE inside `inflate_fast` -- the call, the argument
+    // marshalling and the storage-variant branch, once per literal and once per match copy
+    // -- because the function is large enough in MIR terms that the ordinary hint does not
+    // carry it into a caller that big. Forcing it lets LLVM hoist the storage discriminant
+    // and the high-water mark out of the decode loop, which is the whole point: the variant
+    // is loop-invariant and the compiler can only see that once the body is present.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn duplicate_within(&mut self, from: usize, to: usize, count: usize) -> bool {
         let Some(source_end) = from.checked_add(count) else {
             return false;
@@ -797,7 +827,12 @@ impl<'o> From<&'o mut [u8]> for OutputRegion<'o> {
 ///   longest codeable match.
 ///
 /// Returns `false` -- having moved nothing -- if either range falls outside `buf`.
-#[inline]
+// ★ `inline(always)` for the reason given on `OutputRegion::duplicate_within`: this is the
+// body of the match copy, and it is only cheap if the caller's `count` and the chosen move
+// are visible to each other. Out of line, every repeating match paid a call plus a
+// three-way branch that the caller often knows the answer to.
+#[allow(clippy::inline_always)]
+#[inline(always)]
 pub(crate) fn duplicate_forward<T: Copy>(
     buf: &mut [T],
     from: usize,
@@ -1002,7 +1037,17 @@ impl<'a> OutputCursor<'a> {
     ///
     /// The `LIT` arm of `inflate()` (L1068-L1069) and the literal store of `inflate_fast`
     /// (L200) are both this.
-    #[inline]
+    // ★ `inline(always)`, not `inline`, and the reason is measured rather than stylistic.
+    // This is on `inflate_fast`'s per-symbol path (`inffast.c` L246-L275), where C has a
+    // pointer store and a pointer increment and this has a call. A warmed release build of
+    // the library kept it OUT OF LINE inside `inflate_fast` -- the call, the argument
+    // marshalling and the storage-variant branch, once per literal and once per match copy
+    // -- because the function is large enough in MIR terms that the ordinary hint does not
+    // carry it into a caller that big. Forcing it lets LLVM hoist the storage discriminant
+    // and the high-water mark out of the decode loop, which is the whole point: the variant
+    // is loop-invariant and the compiler can only see that once the body is present.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn push_byte(&mut self, byte: u8) -> bool {
         if !self.region.write_byte_at(self.position, byte) {
             return false;
@@ -1041,7 +1086,17 @@ impl<'a> OutputCursor<'a> {
     /// return value is the `len` the C code computed, and the un-copied remainder of `src`
     /// stays the caller's to re-present on the next call. The cursor is advanced by exactly
     /// the number of bytes copied, so the two can never disagree.
-    #[inline]
+    // ★ `inline(always)`, not `inline`, and the reason is measured rather than stylistic.
+    // This is on `inflate_fast`'s per-symbol path (`inffast.c` L246-L275), where C has a
+    // pointer store and a pointer increment and this has a call. A warmed release build of
+    // the library kept it OUT OF LINE inside `inflate_fast` -- the call, the argument
+    // marshalling and the storage-variant branch, once per literal and once per match copy
+    // -- because the function is large enough in MIR terms that the ordinary hint does not
+    // carry it into a caller that big. Forcing it lets LLVM hoist the storage discriminant
+    // and the high-water mark out of the decode loop, which is the whole point: the variant
+    // is loop-invariant and the compiler can only see that once the body is present.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn push_slice(&mut self, src: &[u8]) -> usize {
         let len = src.len().min(self.remaining());
         // Mirrors `if (len == 0) return;` -- and, more importantly, keeps the two writes
@@ -1071,7 +1126,17 @@ impl<'a> OutputCursor<'a> {
     ///
     /// Returns `false`, having written nothing, if the source is not wholly inside what has
     /// been written or the destination does not fit.
-    #[inline]
+    // ★ `inline(always)`, not `inline`, and the reason is measured rather than stylistic.
+    // This is on `inflate_fast`'s per-symbol path (`inffast.c` L246-L275), where C has a
+    // pointer store and a pointer increment and this has a call. A warmed release build of
+    // the library kept it OUT OF LINE inside `inflate_fast` -- the call, the argument
+    // marshalling and the storage-variant branch, once per literal and once per match copy
+    // -- because the function is large enough in MIR terms that the ordinary hint does not
+    // carry it into a caller that big. Forcing it lets LLVM hoist the storage discriminant
+    // and the high-water mark out of the decode loop, which is the whole point: the variant
+    // is loop-invariant and the compiler can only see that once the body is present.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn duplicate_from(&mut self, from: usize, count: usize) -> bool {
         if count > self.remaining() {
             return false;
@@ -1368,6 +1433,67 @@ pub(crate) fn read_buf_into_output(
     *total_out = total_out.wrapping_add(copied as u64);
 
     copied
+}
+/// Supplies a one-shot wrapper's input in windows, so that the whole of it need not be
+/// addressable at once.
+///
+/// # Why this exists
+///
+/// `compress2_z` and `uncompress2_z` already offer their input to the engine a window at a
+/// time, because C does: `compress.c` L28 and `uncompr.c` L28 chunk a `z_size_t` request into
+/// `uInt`-sized pieces, and the loop that does it carries the running Adler-32 and the two
+/// totals across the pieces. This trait changes *where the window comes from* without changing
+/// that loop, so there is exactly one implementation of the flush selector, the residual
+/// accounting and the termination invariant, whatever the input is behind.
+///
+/// It exists for one caller. The C ABI facade has to serve a `source`/`dest` pair that
+/// **overlaps**, which the reference implementation serves and which two Rust borrows over one
+/// region cannot express, so it copies the input first -- and it copies it into a *bounded*
+/// stage rather than an allocation the size of the caller's own `sourceLen`, because a
+/// caller-sized allocation is what put an overlapping call's peak memory outside the 15%
+/// envelope AAP §0.8.4 sets. A bounded stage can only be handed over a window at a time, and
+/// this is that window.
+///
+/// # Contract
+///
+/// [`OneShotSource::window`] must answer the same bytes the caller's buffer holds at the given
+/// offset, and [`OneShotSource::total`] must not change during a call. A supplier whose
+/// [`OneShotSource::max_window`] is [`usize::MAX`] imposes no chunking of its own, which is
+/// what the blanket implementation for a plain slice reports -- so the ordinary, non-overlapping
+/// path keeps C's own `uInt`-sized windows exactly.
+pub trait OneShotSource {
+    /// Total bytes the call is to consume, i.e. C's `sourceLen`.
+    fn total(&self) -> usize;
+
+    /// Largest window this supplier can produce in one call to [`OneShotSource::window`].
+    ///
+    /// The engine's own chunking is `min`ed with this, so a supplier that can produce
+    /// everything reports [`usize::MAX`] and changes nothing.
+    fn max_window(&self) -> usize;
+
+    /// `len` bytes of the input starting at `at`, or [`None`] when that range does not lie
+    /// wholly inside it.
+    ///
+    /// `len` never exceeds [`OneShotSource::max_window`]. The returned borrow is only used
+    /// before the next call, which is what lets a bounded supplier reuse one buffer.
+    fn window(&mut self, at: usize, len: usize) -> Option<&[u8]>;
+}
+
+impl OneShotSource for &[u8] {
+    fn total(&self) -> usize {
+        self.len()
+    }
+
+    /// No chunking of its own: the whole slice is addressable, so the engine's `uInt`-sized
+    /// windows are the only ones applied.
+    fn max_window(&self) -> usize {
+        usize::MAX
+    }
+
+    fn window(&mut self, at: usize, len: usize) -> Option<&[u8]> {
+        let end = at.checked_add(len)?;
+        self.get(at..end)
+    }
 }
 
 // Assertion macros panic, and every expectation below is a compile-time constant or a value

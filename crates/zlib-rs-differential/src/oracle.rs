@@ -124,6 +124,16 @@
 
 use core::ffi::{c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_void, CStr};
 
+/// A session over the REFERENCE's `z_stream`: the stream plus everything the library retains a
+/// pointer into.
+///
+/// The reference declares its own `#[repr(C)]` mirror of `z_stream` -- ABI-identical to the
+/// facade's, a different Rust type -- and [`crate::retain::Session`] is generic over which, so this
+/// alias is what keeps the two sides from being crossed by accident. Only the `gz_header` gates need
+/// it here: this module declares no `inflateBack` bridge and no tracking allocator, which are the
+/// port's other two retained families.
+pub type Session<'r> = crate::retain::Session<'r, z_stream>;
+
 // =============================================================================
 //  Scalar and pointer aliases (zconf.h)
 // =============================================================================
@@ -2271,12 +2281,20 @@ pub fn deflate_get_dictionary(strm: &mut z_stream, dictionary: Option<&mut [u8]>
     (status, length)
 }
 
-/// `deflateSetHeader(strm, head)`.
+/// `deflateSetHeader(strm, head)`, through the session that keeps `head` alive.
+///
+/// ★ **Obligation (h).** `deflate.c` stores the pointer in `s->gzhead` and reads it on every
+/// `deflate` call until the header has been emitted, so the header must outlive the STREAM. A
+/// signature whose borrows end with the call cannot say that, and this one used to be exactly that
+/// signature with the obligation written in prose beneath it. [`Session`] carries it instead: see
+/// [`crate::retain`], and [`crate::port::deflate_set_header`] for the port's identical gate.
 #[must_use]
-pub fn deflate_set_header(strm: &mut z_stream, head: &mut gz_header) -> c_int {
-    // SAFETY: obligations (a), (b) and (d). `head` is live and aligned for the whole borrow,
-    // which outlives the library's retention of the pointer.
-    unsafe { c_deflateSetHeader(strm, head) }
+pub fn deflate_set_header<'r>(session: &mut Session<'r>, head: &'r mut gz_header) -> c_int {
+    session.install(head, |strm, head| {
+        // SAFETY: obligations (a), (b), (d) and (h). `head` is live and aligned for `'r`, which
+        // outlives every later call on this stream, so the pointer the library keeps cannot dangle.
+        unsafe { c_deflateSetHeader(strm, head) }
+    })
 }
 
 /// `deflateParams(strm, level, strategy)`.
@@ -2542,11 +2560,13 @@ pub fn inflate_get_dictionary(strm: &mut z_stream, dictionary: Option<&mut [u8]>
 /// `extra`, `name` and `comment` buffers it names, clamped to `extra_max`, `name_max` and
 /// `comm_max`.
 #[must_use]
-pub fn inflate_get_header(strm: &mut z_stream, head: &mut gz_header) -> c_int {
-    // SAFETY: obligations (a), (b) and (d). `head` is live and aligned for the whole borrow, and
-    // the buffers it points at are the caller's, sized by the three `*_max` members the library
-    // clamps its writes to.
-    unsafe { c_inflateGetHeader(strm, head) }
+pub fn inflate_get_header<'r>(session: &mut Session<'r>, head: &'r mut gz_header) -> c_int {
+    session.install(head, |strm, head| {
+        // SAFETY: obligations (a), (b), (d) and (h). `head` is live and aligned for `'r`, and the
+        // buffers it points at are the caller's, sized by the three `*_max` members the library
+        // clamps its writes to. The session holds both borrows past this call.
+        unsafe { c_inflateGetHeader(strm, head) }
+    })
 }
 
 /// `inflateSync(strm)`.

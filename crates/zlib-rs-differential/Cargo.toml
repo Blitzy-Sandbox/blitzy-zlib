@@ -27,9 +27,11 @@
 # depend on it. `crates/zlib-rs` has an empty `[dependencies]` table and
 # `crates/libz-rs-sys` depends on nothing but `zlib-rs`, so
 # `cargo build --release` for `libz.so`/`libz.a` never compiles a line of the reference
-# implementation and never links the oracle. (It does compile two C translation units of
-# its own, in `crates/libz-rs-sys/csrc/`, for three declarations stable Rust cannot
-# express; those are not the reference sources and take no crate dependency.) That is the
+# implementation and never links the oracle. (With the default `gz` feature on it does
+# compile two small translation units of its own, in `crates/libz-rs-sys/csrc/` -- one
+# shipped, one test-only -- for the two variadic declarations stable Rust cannot express;
+# those are not the reference sources and take no crate dependency. With `gz` off it
+# compiles no C at all.) That is the
 # mechanical proof that the reference implementation is an ORACLE and not a build
 # dependency. Verify with:
 #
@@ -74,18 +76,15 @@
 # `#![deny(unsafe_op_in_unsafe_fn)]` is a crate-root attribute of
 # `crates/libz-rs-sys`.
 #
-# BENCHMARK HOSTING
-# The repository-root `Cargo.toml` is a virtual manifest and therefore cannot own
-# bench targets, so the three suites in `benches/` attach HERE, through the three
-# `[[bench]]` entries near the bottom of this file -- `checksum_bench`,
-# `inflate_bench` and `deflate_bench`, each with an explicit `path` up to
-# `../../benches/` and `harness = false`. This crate is the correct host because
-# all three measure the port against the C oracle that it builds.
-#
-# A bench entry naming a file that is absent makes every Cargo invocation that
-# enumerates targets (`--all-targets`, `cargo fmt --all`) fail while resolving it,
-# which is why the entries and the files belong in one change; they are in one
-# change, so nothing here is withheld any more.
+# BENCHMARK HOSTING -- NOT HERE.
+# The three criterion suites in `benches/` are owned by `benches/Cargo.toml`, the
+# excluded package `zlib-rs-benches`, which declares its own `[[bench]]` entries,
+# its own `[workspace]` table and its own lock file. THIS manifest declares no
+# bench target and takes no criterion dependency; see the `rust-version` note
+# below for why that separation is load-bearing rather than tidy. What connects
+# them is a path dependency in the other direction: that package depends on this
+# one, so the benches reach the C oracle this crate's build script produces
+# without anything being duplicated or rebuilt.
 #
 # `tests/` holds `byte_identical.rs`, `roundtrip_interop.rs` and
 # `table_equality.rs`, and they run: `cargo test -p zlib-rs-differential` compares
@@ -111,11 +110,14 @@ edition.workspace = true      # 2021 -- see rust-version
 #
 # This package once wrote an explicit `rust-version = "1.86"` because the three
 # criterion suites at `benches/` were attached to it by `[[bench]]` entries, which
-# put criterion 0.8.2 -- floor 1.86, reaching clap 4.6.5 whose clap_builder/clap_lex
+# put criterion 0.8.2 -- floor 1.86, reaching a clap whose clap_builder/clap_lex
 # manifests are `edition = "2024"` -- into this package's dev graph.  Cargo 1.80
 # cannot parse an edition-2024 manifest, so the workspace's own declared floor could
 # not resolve the workspace: `cargo +1.80 metadata --locked` and `cargo +1.80 check
-# --locked --workspace --all-targets` both failed outright.
+# --locked --workspace --all-targets` both failed outright.  (The clap patch version
+# is deliberately not named here: it is transitive to a dev-dependency of an
+# excluded package and moves on its own; `benches/Cargo.lock` is where the resolved
+# one lives.)
 #
 # The suites now live in their own excluded package, `benches/Cargo.toml`, with their
 # own lock and their own copy of the two measurement profiles -- the shape `fuzz/`
@@ -248,7 +250,8 @@ zlib-rs = { workspace = true, features = ["rust-api", "std"] }
 # `[lib] name = "z"` so Cargo emits `libz.so`/`libz.a`; with a plain dependency key
 # Cargo would pass `--extern z=...` and the Rust path would be `z`. The
 # dependency-rename form below makes Cargo pass `--extern libz_rs_sys=...`, so every
-# module, test and attached bench in this crate writes `use libz_rs_sys::...`.
+# module and test in this crate writes `use libz_rs_sys::...`, and so does every
+# suite in the `benches/` package, which renames it the same way.
 # `libz-rs-sys` is a workspace member and is not listed in the root
 # `[workspace.dependencies]`, hence the path form rather than `workspace = true`.
 #
@@ -310,8 +313,17 @@ libz_rs_sys = { package = "libz-rs-sys", path = "../libz-rs-sys", version = "1.3
 
 [build-dependencies]
 # The ONLY build dependency: `cc` compiles the in-tree C sources into the test-only
-# oracle archive. Pinned to 1.4.0 in the root `[workspace.dependencies]`; licensed
-# "MIT OR Apache-2.0", which deny.toml allows.
+# oracle archive. EXACT-pinned to `=1.4.0` in the root `[workspace.dependencies]`;
+# licensed "MIT OR Apache-2.0", which deny.toml allows.
+#
+# The exact pin matters here more than anywhere else in the tree, and the reason is
+# recorded beside the pin itself: this crate is resolved by THREE independent
+# lockfiles -- the workspace root's, `benches/Cargo.lock` and `fuzz/Cargo.lock` --
+# because the benches and the fuzz targets are excluded packages that reach this
+# crate by path. A caret requirement let benches resolve a different `cc` from
+# correctness and fuzzing, so the same C oracle was compiled by two different
+# providers depending on which lock you came through. `workspace = true` keeps the
+# requirement in one place; the `=` keeps the resolution in one place too.
 cc = { workspace = true }
 
 # ---------------------------------------------------------------------------------
@@ -361,7 +373,7 @@ workspace = true
 #   * `[lib]` -- the default rlib target is exactly right. `cdylib`/`staticlib`
 #     belong to `crates/libz-rs-sys` alone, which is the single place the exported C
 #     surface is defined.
-#   * `[[bin]]` / `[[example]]` -- this crate is a library plus tests plus the
-#     attached benches.
+#   * `[[bin]]` / `[[example]]` -- this crate is a library plus its three test
+#     suites, and nothing else; the benches are their own package.
 #   * `[patch]` / `[replace]` / `[target.*]` / git or alternate-registry sources --
 #     submodules and vendoring are forbidden, and the C oracle is already in-tree.

@@ -19,21 +19,37 @@ name: contribs
 # the fix belongs in the library: patching contrib/ would delete the evidence
 # rather than the fault.
 #
-# TWO JOBS, ONE STEP OF DIFFERENCE.  `ci-cmake' installs the C library and is the
-# baseline -- it is the differential oracle the port is measured against, and its
-# six rows predate the port and are untouched by it.  `ci-cmake-rust' adds
+# TWO JOBS, AND WHAT DIFFERS BETWEEN THEM.  `ci-cmake' installs the C library and
+# is the baseline -- it is the differential oracle the port is measured against,
+# and its six rows predate the port and are untouched by it.  `ci-cmake-rust' adds
 # -DZLIB_BUILD_RUST=ON to the same `Install zlib' step, which builds the Cargo
-# workspace and installs the memory-safe Rust libz system-wide in its place: the
+# workspace and installs the memory-safe Rust libz in place of the C one: the
 # versioned real file libz.so.<VER>, with libz.so and the libz.so.1 its SONAME
 # names beside it as links onto it, plus libz.a, the CMake package and zlib.pc --
 # all under the names the C build publishes, because the C names are what an
-# already-linked consumer resolves.  The three steps that then build the
-# consumer -- generate, compile, ctest -- are byte-identical between the jobs, and
-# deliberately so: a consumer needing different flags against the Rust library
-# would not be a drop-in replacement, so a divergence there would itself be the
-# finding.  All the Rust job adds around them is two assertions, because an
-# install of a library whose SONAME the distribution already publishes can
-# succeed, be ignored, and leave every test below green; see those steps.
+# already-linked consumer resolves.
+#
+# WHERE IT INSTALLS, because it is not /usr/local and that is deliberate.  The
+# Rust job installs into a `mktemp -d' directory under $RUNNER_TEMP, as the runner
+# user, and never with sudo: this job builds an unreviewed tree on a
+# `pull_request' event, so a root install driven by that tree -- through install
+# rules that same tree could edit -- is a privilege nothing here needs.  The
+# prefix also makes the job's own assertions mean something, since a libz.so.1
+# under a directory this job created cannot have come from the distribution.  The
+# C job above still uses sudo and /usr/local; it predates the port and changing
+# the oracle's baseline is not this port's business.
+#
+# So the consumer steps are NOT byte-identical between the two jobs any more, and
+# the difference is exactly one argument: `Generate project files' passes
+# -DCMAKE_PREFIX_PATH="$ZLIB_PREFIX" so that `find_package(ZLIB ... CONFIG)'
+# reaches THIS package rather than whatever the default search finds.  Nothing
+# else changes -- no extra include path, no extra library, no extra define -- which
+# is the property that matters: a consumer needing different FLAGS against the Rust
+# library would not be a drop-in replacement, and being told where the package is
+# installed is not a flag about the implementation.  Around those steps the Rust
+# job adds two assertions, because an install of a library whose SONAME the
+# distribution already publishes can succeed, be ignored, and leave every test
+# below green; see those steps.
 #
 # WHAT IS NOT HERE.  The port's own gates -- the differential matrix, symbol
 # parity against the 111-symbol baseline, the cbindgen header diff, Miri,
@@ -183,11 +199,17 @@ jobs:
 
     steps:
     - name: Checkout repository
-      # Pinned to a commit, as every action in rust.yml is.  This job installs a
-      # library system-wide with sudo, so the action that fetches the tree it
-      # builds is worth pinning to an immutable reference.  The C job above keeps
-      # its own tag: it predates the port, it is the oracle's baseline, and
-      # nothing here is a reason to touch it.
+      # Pinned to a commit, as every action in rust.yml is.  This job builds an
+      # unreviewed tree on a `pull_request' event and then runs five contributed
+      # consumers against what it produced, so the action that fetches that tree is
+      # worth pinning to an immutable reference; `@v6' is a tag anyone with write
+      # access to that repository can move after review.  The C job above keeps its
+      # own tag: it predates the port, it is the oracle's baseline, and nothing here
+      # is a reason to touch it.
+      #
+      # The install itself needs no privilege -- see the `Install zlib' step, which
+      # installs into a prefix of its own under $RUNNER_TEMP rather than into
+      # /usr/local with sudo.
       uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       with:
         persist-credentials: false
@@ -220,10 +242,34 @@ jobs:
       # builds, runs, passes and has exercised nothing.  CMake's install rules
       # create the chain, which is why nothing is hand-rolled here -- and why the
       # two `Verify' steps in this job assert it rather than assume it.
+      #
+      # ★ INTO A PREFIX OF ITS OWN, AND WITHOUT sudo.  This was
+      # `sudo cmake --install ../build-zlib', which installed to /usr/local as root
+      # -- and this job runs on `pull_request', so the tree being built is a
+      # contributor's.  Three things were wrong with it and all three are closed by
+      # the prefix.  It was a ROOT write driven by unreviewed code, through install
+      # rules that same code could edit.  It COMMINGLED with the distribution's own
+      # /usr/local, so the `find ... -name libz.so.1' assertions below could not
+      # distinguish this install's file from anything else that had put one there,
+      # and the run left the machine altered -- harmless on an ephemeral hosted
+      # runner, not harmless anywhere that reuses one.  And it made the consumers'
+      # `find_package' succeed through the default search rather than through this
+      # package, so a broken install could have been masked by a system zlib.
+      #
+      # A unique directory under $RUNNER_TEMP fixes all of that: the runner user
+      # owns it, `mktemp -d' guarantees the name is this job's alone even on a
+      # runner that reuses its temp directory, nothing else has ever written a libz
+      # into it, and every step below is scoped to it -- the consumers reach the
+      # package only because CMAKE_PREFIX_PATH names it.
       run: |
-        cmake -S . -B ../build-zlib -DCMAKE_BUILD_TYPE=Release -DZLIB_BUILD_RUST=ON
+        set -eu
+        ZLIB_PREFIX=$(mktemp -d "${RUNNER_TEMP}/zlib-rust-prefix.XXXXXX")
+        echo "ZLIB_PREFIX=$ZLIB_PREFIX" >> "$GITHUB_ENV"
+        echo "installing into $ZLIB_PREFIX"
+        cmake -S . -B ../build-zlib -DCMAKE_BUILD_TYPE=Release -DZLIB_BUILD_RUST=ON \
+              -DCMAKE_INSTALL_PREFIX="$ZLIB_PREFIX"
         cmake --build ../build-zlib --config Release
-        sudo cmake --install ../build-zlib
+        cmake --install ../build-zlib
 
     - name: Verify the installed library is the Rust one
       # Asserted before a consumer is built, so a failure here reads as an install
@@ -240,10 +286,15 @@ jobs:
 
         # The libdir is discovered rather than assumed: GNUInstallDirs decides it
         # from the prefix, and a wrong guess here would be a confusing failure in
-        # a later step instead of a clear one in this step.
-        soname=$(find /usr/local -name libz.so.1 -print -quit)
+        # a later step instead of a clear one in this step.  The SEARCH ROOT is not
+        # discovered -- it is $ZLIB_PREFIX, the directory the step above created and
+        # installed into, so a libz.so.1 that came from anywhere else cannot satisfy
+        # this check.  Searching /usr/local, which is what this did before, could
+        # not tell this install's library from the distribution's.
+        : "${ZLIB_PREFIX:?the install step did not record its prefix}"
+        soname=$(find "$ZLIB_PREFIX" -name libz.so.1 -print -quit)
         if [ -z "$soname" ]; then
-          echo "::error::no libz.so.1 anywhere under /usr/local, so the install"
+          echo "::error::no libz.so.1 anywhere under $ZLIB_PREFIX, so the install"
           echo "::error::above did not land where a consumer will look for it."
           exit 1
         fi
@@ -280,7 +331,14 @@ jobs:
         }
 
     - name: Generate project files
-      run: cmake -S ${{ matrix.src_dir }} -B ../build ${{ matrix.cmake-args }} -DCMAKE_BUILD_TYPE=Release
+      # CMAKE_PREFIX_PATH is what makes the consumer find THIS install.  The library
+      # is no longer in /usr/local -- see the install step -- so `find_package(ZLIB
+      # ... CONFIG)` reaches ZLIBConfig.cmake only through this path, which is the
+      # point: a consumer that configures is a consumer that found the package this
+      # job built, not whatever the distribution happens to ship.
+      run: >-
+        cmake -S ${{ matrix.src_dir }} -B ../build ${{ matrix.cmake-args }}
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$ZLIB_PREFIX"
 
     - name: Compile source code
       run: cmake --build ../build --config Release
@@ -311,9 +369,11 @@ jobs:
       run: |
         set -eu
 
-        soname=$(find /usr/local -name libz.so.1 -print -quit)
+        : "${ZLIB_PREFIX:?the install step did not record its prefix}"
+        soname=$(find "$ZLIB_PREFIX" -name libz.so.1 -print -quit)
         test -n "$soname" || {
-          echo "::error::no installed libz.so.1 to compare a binding against"
+          echo "::error::no installed libz.so.1 under $ZLIB_PREFIX to compare a"
+          echo "::error::binding against"
           exit 1
         }
         libdir=$(dirname "$soname")

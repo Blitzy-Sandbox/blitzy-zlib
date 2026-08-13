@@ -96,15 +96,57 @@ RATIO_LIMIT = 1.10
 #: AAP 0.8.4: per-stream memory within 15% of the C reference.
 MEMORY_LIMIT = 1.15
 
+#: The suffix the memory suite gives a case measured with ``next_in`` and ``next_out``
+#: addressing one buffer.  ``gate_overlap_rows`` pairs each such row with the row of the
+#: same name without it and requires the two byte counts to be equal.
+OVERLAP_SUFFIX = "-overlap"
+
 #: AAP 0.8.4 names levels 1, 6 and 9 explicitly.  The suites publish the same axis
 #: on their ``GATE-INVENTORY`` line as ``levels=1,6,9``, and a case id carries it as
 #: an ``-L<n>`` element, so the two can be checked against each other.
 REQUIRED_LEVELS = ("L1", "L6", "L9")
 
+#: ...but the sentence AAP 0.8.4 writes with those three levels is about COMPRESSION
+#: throughput, and only the deflate suite measures that.  This tuple is what stops the
+#: level requirement from being applied to a suite whose gate quantity has no level.
+#:
+#: ★ It is a correctness fix, not a relaxation.  ``inflate_bench`` sweeps the three
+#: levels in its tier-1 group because a level-1 stream and a level-9 stream are
+#: different work to decode -- but its tier-2 group, ``inflate_silesia``, decodes each
+#: corpus member at the ONE default level, so its case ids are ``<member>-L6`` and
+#: nothing else.  Requiring L1/L6/L9 of every authoritative group therefore made a
+#: complete, armed Silesia acceptance run fail by construction: the corpus would load,
+#: every case would be decided from criterion's estimates, every ratio would be inside
+#: the limit, and the gate would still report "no gated case was decided at compression
+#: level(s) L1, L9".  A gate that cannot pass when everything it measures is correct is
+#: not enforcing the AAP, it is blocking it.
+#:
+#: The inflate side keeps its level axis enforced where the axis exists: the
+#: ``GATE-INVENTORY`` check above compares ``levels=1,6,9`` for BOTH suites, so a suite
+#: that stopped sweeping the three levels is still caught -- by the declaration it
+#: prints, rather than by the ids of one group.
+LEVELLED_SUITES = ("deflate",)
+
 #: Below one page an encode is fixed cost rather than throughput, which is why the
 #: suites mark smaller cases ``gate=informational``.  Checked, not assumed: a bench
 #: that raised its own floor would drop cases out of the gate silently.
 MIN_BYTES = "4096"
+
+#: The measurement protocol the suites' self-timed pass must have used, published on
+#: every ``RATIO`` line as ``order=`` and on the ``CRITERION`` line as ``registration=``.
+#:
+#: A ratio between two implementations is only a comparison if neither side is measured
+#: from a fixed position: whichever side runs second inherits warm pages, a warm
+#: allocator and whatever clock state the first side raised.  The suites therefore pair
+#: the two sides inside every round and flip the order between rounds, and they alternate
+#: the criterion registration order per case for the same reason.  Requiring the word
+#: here is what turns that from a claim in a comment into a property of the log.
+PAIRED_ORDER = "alternating"
+
+#: The floor on ``rounds=``.  Nine paired rounds is what the suites run; a log with
+#: fewer was produced by something else, and a log with three was produced by the
+#: single-order sampler this requirement replaced.
+MIN_ROUNDS = 9
 
 # =====================================================================================
 #  What each suite must declare, and the floors its authoritative groups must clear.
@@ -130,7 +172,7 @@ SUITES = {
         # being exempt the moment the SILESIA line reports required=yes.
         "tier2_ratio": ("deflate_silesia",),
         "min_gated": {"deflate_steady_state": 9},
-        "min_cases": {"deflate_memory": 9},
+        "min_cases": {"deflate_memory": 18},
     },
     "inflate_bench": {
         "suite": "inflate",
@@ -143,11 +185,67 @@ SUITES = {
     },
 }
 
-#: ``checksum_bench`` prints no summary line of any kind and is absent from
-#: :data:`SUITES` on purpose: a checksum produces one scalar however it is computed,
-#: so there is no output-fidelity dimension to trade against speed and nothing to
-#: gate.  Do not "fix" that by adding it -- but do not let it be parsed as a gate
-#: suite either, which is why an unknown suite emitting gate lines is a failure.
+#: The suite whose ``BACKEND`` lines this gate enforces, and the one suite that is
+#: absent from :data:`SUITES`.
+#:
+#: ``checksum_bench`` is not a throughput suite and emits no ``RATIO-SUMMARY`` or
+#: ``MEMORY-SUMMARY`` line: a checksum produces one scalar however it is computed, so
+#: there is no output-fidelity dimension to trade against speed and none of AAP
+#: 0.8.4's two throughput targets is about it.  What it *does* have is a question the
+#: throughput suites cannot answer -- **is the optional ``simd`` feature worth
+#: compiling in?** -- and that question has a right answer that a machine can check,
+#: which is what :func:`gate_backend_families` does.
+#:
+#: The suite is OPTIONAL here where the two in :data:`SUITES` are required.  A log
+#: produced by ``cargo bench --bench deflate_bench`` legitimately carries no
+#: ``BACKEND`` line, and a log from a build without the ``simd`` feature carries the
+#: two summary lines with ``expected=0`` because there is no candidate backend to
+#: accept.  Both are passes.  What is not a pass is a feature-on run whose candidate
+#: lost to its own baseline.
+CHECKSUM_SUITE = "checksum_bench"
+
+#: Every backend family the checksum suite must report on, so that deleting one
+#: cannot quietly retire its acceptance.  An absent family is the one failure a loop
+#: over the families present cannot see.
+BACKEND_FAMILIES = ("adler32", "crc32")
+
+#: The "never slower" limit every ``BACKEND`` case must clear, per its own derived
+#: ``tolerance``.  One, exactly: an optional backend that is slower than the path it
+#: displaces is a bet on the caller's input size, and a system library does not get to
+#: place that bet on a caller's behalf.
+BACKEND_LIMIT = 1.00
+
+#: The "faster somewhere" bar the best case of each family must reach.  0.90, i.e. a
+#: 10% improvement at some length -- AAP 0.8.4's own figure rather than an invented
+#: one.  Without this, a candidate that merely forwarded to its baseline would clear
+#: :data:`BACKEND_LIMIT` at every length and the gate would certify a no-op.
+BACKEND_BENEFIT = 0.90
+
+#: Ceiling on the per-case noise allowance the suite may publish.
+#:
+#: The suite derives each case's tolerance from its own measured baseline -- an absolute
+#: timer allowance converted into a ratio -- which is right, because the same jitter is a
+#: large fraction of a 6 ns call and a negligible one of a 300 us call.  This ceiling is
+#: what stops that derivation from being a loophole: a suite that reported a very small
+#: baseline would derive a very large tolerance and could pass anything.  0.10 admits the
+#: sub-20-nanosecond cases, where the allowance is genuinely a few tenths of a nanosecond,
+#: and refuses any case that would need more.
+BACKEND_TOLERANCE_CEILING = 0.10
+
+#: How many of a family's lengths must actually have been measurable for its verdict to
+#: mean anything.
+#:
+#: A case whose two identical null runs differ by more than
+#: :data:`BACKEND_TOLERANCE_CEILING` is reported ``unmeasured`` rather than given a ratio,
+#: which is the right behaviour -- publishing a number there would be publishing the
+#: scheduler -- but it means a sufficiently noisy machine could refuse every case and leave
+#: ``over=0`` to be misread as a pass.  This floor is what stops that: fewer than four
+#: measured lengths is an inconclusive run, not a passing one.  Four is chosen because the
+#: four longest lengths in the suite's sweep (256 bytes upward) take between 80 ns and
+#: 300 us per call, which is far enough above a scheduling decision to measure on a shared
+#: machine -- as the committed figures show, where only the sub-65-nanosecond cases were
+#: refused.
+BACKEND_MIN_CASES = 4
 
 #: One ledger line per side per memory case, and both sides are required: a balance
 #: that is clean on the port and never measured on the oracle proves only that the
@@ -176,6 +274,12 @@ REQUIRED_KEYS = {
         "fallback",
         "authority",
         "self_timed",
+        # criterion samples its rows in registration order, so the order the two labels
+        # are registered in is part of the measurement; the suites alternate it per case
+        # and declare that here.
+        "registration",
+        "rounds",
+        "order",
     ),
     "RATIO": (
         "group",
@@ -184,6 +288,14 @@ REQUIRED_KEYS = {
         "port_ns",
         "oracle_ns",
         "ratio",
+        # The three fields that make the measurement PROTOCOL checkable rather than
+        # merely trusted.  A suite that reverted to timing one side to completion and
+        # then the other -- which systematically favours whichever side runs second --
+        # cannot print these, so :func:`check_pairing` can reject its log instead of
+        # gating a number produced by a biased sampler.
+        "ratio_hi",
+        "rounds",
+        "order",
         "limit",
         "gate",
         "verdict",
@@ -212,6 +324,34 @@ REQUIRED_KEYS = {
         "verdict",
     ),
     "SILESIA": ("verdict", "found", "of", "required", "dir"),
+    "BACKEND": (
+        "family",
+        "case",
+        "baseline",
+        "candidate",
+        "baseline_ns",
+        "candidate_ns",
+        "ratio",
+        "ratio_hi",
+        "noise",
+        "tolerance",
+        "rounds",
+        "order",
+        "limit",
+        "verdict",
+    ),
+    "BACKEND-SUMMARY": (
+        "family",
+        "baseline",
+        "candidate",
+        "expected",
+        "cases",
+        "over",
+        "unmeasured",
+        "best",
+        "limit",
+        "benefit",
+    ),
 }
 
 #: The keyword must follow ``"<suite>: "`` IMMEDIATELY.  The suites also print their
@@ -221,8 +361,8 @@ REQUIRED_KEYS = {
 #: before ``RATIO`` because the alternation is ordered.
 LINE = re.compile(
     r"^(?P<suite>\w+_bench): "
-    r"(?P<kind>GATE-INVENTORY|CRITERION|RATIO-SUMMARY|MEMORY-SUMMARY|RATIO|MEMORY"
-    r"|ALLOC-BALANCE|SILESIA) "
+    r"(?P<kind>GATE-INVENTORY|CRITERION|RATIO-SUMMARY|MEMORY-SUMMARY|BACKEND-SUMMARY"
+    r"|RATIO|MEMORY|BACKEND|ALLOC-BALANCE|SILESIA) "
     r"(?P<rest>\S+=\S*(?: .*)?)$"
 )
 
@@ -574,18 +714,26 @@ def gate_ratio_group(
             )
 
     if over:
-        what = "throughput"
-        message = (
-            f"{suite}: {over} gated case(s) in group {group} exceeded the {what} limit "
-            f"of {summary.get('limit')} on the suite's own self-timed diagnostic"
+        # ★ WARNING-ONLY, IN EVERY TIER, and the reason is this file's own declared
+        # authority model.  The ``CRITERION`` line says ``authority=criterion
+        # self_timed=diagnostic``, and the decision below is taken from criterion's
+        # estimates precisely because the suite's self-timed pass is a bounded
+        # few-millisecond probe: nine paired rounds of a two-millisecond budget, whose
+        # own ``ratio_hi`` field routinely lands 30-60% above its median on a shared
+        # machine.  Failing on it made the diagnostic decide the build BEFORE criterion
+        # was consulted -- so a case criterion measured inside the limit could still fail
+        # the gate on a probe that the same log declares non-authoritative.  Two things
+        # cannot both be the authority; criterion is.
+        #
+        # Nothing is hidden by the demotion.  The message is emitted for every tier, it
+        # names the count and the group, and the criterion loop below still FAILS on any
+        # gated case of an authoritative group that exceeds the limit.
+        report.warn(
+            f"{suite}: {over} gated case(s) in group {group} exceeded the throughput "
+            f"limit of {summary.get('limit')} on the suite's own self-timed diagnostic "
+            f"-- reported, never fatal: this log declares self_timed=diagnostic and "
+            f"authority=criterion, and the criterion estimates below are what decide"
         )
-        if tier == "authoritative":
-            report.fail(message)
-        else:
-            report.warn(
-                message + " -- reported, not fatal: the suite declares this group "
-                f"gate={tier}, so a regression here is a signal rather than a verdict"
-            )
 
     # ★ The decision, from criterion's estimates rather than from the self-timed
     # numbers above.  Only the gated cases of an authoritative group are decided:
@@ -631,19 +779,112 @@ def gate_ratio_group(
             f"estimates, so the AAP 0.8.4 target this group carries was not enforced"
         )
 
-    levels = {
-        match.group("level")
-        for match in (LEVEL.search(case) for case, _ in decided)
-        if match
-    }
-    absent = [level for level in REQUIRED_LEVELS if level not in levels]
-    if absent:
-        report.fail(
-            f"{suite} group {group}: no gated case was decided at compression level(s) "
-            f"{', '.join(absent)}. AAP 0.8.4 names levels 1, 6 and 9 explicitly; the "
-            f"levels decided were {', '.join(sorted(levels)) or 'none'}"
-        )
+    # The level axis, enforced only where the AAP's sentence has one; see
+    # :data:`LEVELLED_SUITES` for why applying it to inflate made an armed run
+    # unpassable.
+    if spec["suite"] in LEVELLED_SUITES:
+        levels = {
+            match.group("level")
+            for match in (LEVEL.search(case) for case, _ in decided)
+            if match
+        }
+        absent = [level for level in REQUIRED_LEVELS if level not in levels]
+        if absent:
+            report.fail(
+                f"{suite} group {group}: no gated case was decided at compression "
+                f"level(s) {', '.join(absent)}. AAP 0.8.4 names levels 1, 6 and 9 "
+                f"explicitly; the levels decided were "
+                f"{', '.join(sorted(levels)) or 'none'}"
+            )
     return decided
+
+
+def check_pairing(
+    suite: str,
+    criterion: dict[str, str],
+    observed: list[dict[str, str]],
+    report: Report,
+) -> None:
+    """Check that the log was produced by the paired, order-alternating protocol.
+
+    Three facts, each of which a biased sampler cannot fake:
+
+    * the ``CRITERION`` line declares an alternating registration order and the paired
+      round count, so the criterion rows the decision is taken from were not all
+      sampled with one side permanently second;
+    * every ``RATIO`` line declares ``order=alternating`` and at least
+      :data:`MIN_ROUNDS` rounds;
+    * every ``RATIO`` line's ``ratio`` is its own ``port_ns / oracle_ns``.  That is an
+      identity by construction -- both figures are medians of the same paired rounds --
+      so a line that fails it was assembled from two unrelated passes.
+
+    Failures, not warnings: the numbers this gate enforces are meaningless if the
+    protocol that produced them is unknown, and unlike a threshold this cannot be
+    contaminated by a noisy runner.
+    """
+    if criterion.get("registration") != PAIRED_ORDER:
+        report.fail(
+            f"{suite}: the CRITERION line declares "
+            f"registration={criterion.get('registration')!r}, not {PAIRED_ORDER!r}. "
+            f"criterion samples rows in registration order, so a fixed order gives "
+            f"whichever side is registered second a systematic advantage"
+        )
+    if criterion.get("order") != PAIRED_ORDER:
+        report.fail(
+            f"{suite}: the CRITERION line declares order={criterion.get('order')!r}, "
+            f"not {PAIRED_ORDER!r}"
+        )
+    rounds = as_int(criterion, "rounds")
+    if rounds is None or rounds < MIN_ROUNDS:
+        report.fail(
+            f"{suite}: the CRITERION line declares rounds={criterion.get('rounds')!r}, "
+            f"below the {MIN_ROUNDS} paired rounds the protocol requires"
+        )
+
+    for field in observed:
+        where = f"{suite} group {field['group']} case {field['case']}"
+        if field["order"] != PAIRED_ORDER:
+            report.fail(
+                f"{where}: order={field['order']!r}, not {PAIRED_ORDER!r}. This ratio "
+                f"was not produced by a paired, order-alternating measurement"
+            )
+        case_rounds = as_int(field, "rounds")
+        if case_rounds is None or case_rounds < MIN_ROUNDS:
+            report.fail(
+                f"{where}: rounds={field['rounds']!r}, below the {MIN_ROUNDS} paired "
+                f"rounds the protocol requires"
+            )
+        port = as_float(field, "port_ns")
+        oracle = as_float(field, "oracle_ns")
+        ratio = as_float(field, "ratio")
+        high = as_float(field, "ratio_hi")
+        if port is None or oracle is None or ratio is None or high is None:
+            report.fail(
+                f"{where}: one of port_ns/oracle_ns/ratio/ratio_hi is not a number, so "
+                f"the line cannot be checked for self-consistency"
+            )
+            continue
+        # The tolerance is the rounding the LOG FORMAT introduces, derived rather than
+        # guessed.  The suites print `ratio` to three decimals from the two full-precision
+        # medians, but print the medians themselves to one decimal -- so recomputing the
+        # quotient from the printed timings can be off by
+        #
+        #     d(p/o) = dp/o + p*do/o^2 = (dp + ratio*do) / o
+        #
+        # with dp = do = 0.05 ns (half of the last printed digit), plus 0.0005 for the
+        # ratio's own rounding.  On a nanosecond-scale row -- `compressBound` prints
+        # `port_ns=0.6 oracle_ns=2.9` -- that is two percent and legitimate; on a
+        # microsecond-scale throughput row it vanishes and the 0.002 floor is what applies.
+        # A discrepancy above this bound is not rounding: the two figures did not come from
+        # one paired pass.
+        tolerance = max(0.002, (0.05 * (1.0 + abs(ratio))) / oracle + 0.0005)
+        if oracle > 0.0 and abs(ratio - port / oracle) > tolerance:
+            report.fail(
+                f"{where}: ratio={ratio:.3f} is not port_ns/oracle_ns "
+                f"({port / oracle:.3f}). The two figures are medians of the same paired "
+                f"rounds, so they must agree; a line that does not was assembled from "
+                f"two independent passes"
+            )
 
 
 def gate_memory_group(
@@ -721,6 +962,255 @@ def gate_memory_group(
                 f"against {oracle} reference byte(s) exceeds the AAP 0.8.4 budget of "
                 f"{MEMORY_LIMIT:.2f}"
             )
+
+    gate_overlap_rows(suite, group, observed, report)
+
+
+def gate_overlap_rows(
+    suite: str,
+    group: str,
+    observed: list[dict[str, str]],
+    report: Report,
+) -> None:
+    """Serving an overlapping buffer pair must cost the caller's allocator nothing.
+
+    The suite emits two rows per configuration: ``<case>`` with disjoint ``next_in`` and
+    ``next_out``, and ``<case>-overlap`` with both addressing one buffer.  The ratio check
+    above already holds each row to the 15% budget, but for the overlap row a ratio inside
+    the budget is weaker than the property that actually holds, and weaker in the direction
+    that matters.  This implementation cannot form a shared and an exclusive borrow over one
+    region, so it copies the input before the compressor reads it.  The copy is a fixed
+    ``OverlapStage`` on the stack, fed a window at a time -- so the caller's ``zalloc`` is
+    not called for it and the overlap row's ``port_bytes`` must be *exactly* the disjoint
+    row's.  An input-sized snapshot would satisfy the 15% ratio for a small fixture and fail
+    it for a large one, which is a gate that passes or fails on the corpus rather than on the
+    code.  Equality does not: it fails the moment an allocation is reintroduced, whatever the
+    fixture.
+
+    Each row is also required to have a partner, so that deleting the overlap measurement
+    cannot quietly retire the check -- an absent row is the one thing a per-row loop cannot
+    distinguish from a passing one.
+    """
+    bytes_by_case = {}
+    for field in observed:
+        port = as_int(field, "port_bytes")
+        if port is not None:
+            bytes_by_case[field["case"]] = port
+
+    overlaps = sorted(case for case in bytes_by_case if case.endswith(OVERLAP_SUFFIX))
+    disjoint = sorted(case for case in bytes_by_case if not case.endswith(OVERLAP_SUFFIX))
+
+    if disjoint and not overlaps:
+        report.fail(
+            f"{suite} group {group}: {len(disjoint)} disjoint memory case(s) and no "
+            f"{OVERLAP_SUFFIX} partner, so the bounded overlap stage was never measured"
+        )
+        return
+
+    for case in overlaps:
+        base = case[: -len(OVERLAP_SUFFIX)]
+        if base not in bytes_by_case:
+            report.fail(
+                f"{suite} group {group} case {case}: no disjoint row {base!r} to compare "
+                f"against, so this row cannot show what the overlap added"
+            )
+            continue
+        if bytes_by_case[case] != bytes_by_case[base]:
+            report.fail(
+                f"{suite} group {group} case {case}: serving an overlapping buffer pair "
+                f"took {bytes_by_case[case]} byte(s) through the caller's allocator "
+                f"against {bytes_by_case[base]} for the same configuration with disjoint "
+                f"buffers. The overlap stage is a fixed stack buffer and must add nothing "
+                f"to the caller's high-water mark; a difference means an allocation sized "
+                f"from the caller's own avail_in was reintroduced"
+            )
+
+    for case in disjoint:
+        if case + OVERLAP_SUFFIX not in bytes_by_case:
+            report.fail(
+                f"{suite} group {group} case {case}: no {case + OVERLAP_SUFFIX} row, so "
+                f"this configuration's overlapping buffer pair was not measured"
+            )
+
+
+def gate_backend_families(
+    got: dict[str, list[dict[str, str]]],
+    report: Report,
+) -> list[tuple[str, str, float]]:
+    """Enforce the optional ``simd`` feature's two acceptance conditions.
+
+    Returns one ``(family, case, ratio)`` triple per accepted case, for the caller's
+    summary.  See :data:`CHECKSUM_SUITE` for why this suite is handled apart from
+    :data:`SUITES`, and :data:`BACKEND_LIMIT` / :data:`BACKEND_BENEFIT` for the two
+    conditions and why each exists.
+    """
+    summaries = {
+        field["family"]: field for field in got.get("BACKEND-SUMMARY", []) if "family" in field
+    }
+    cases: dict[str, list[dict[str, str]]] = {}
+    for field in got.get("BACKEND", []):
+        cases.setdefault(field["family"], []).append(field)
+
+    for family in BACKEND_FAMILIES:
+        if family not in summaries:
+            report.fail(
+                f"{CHECKSUM_SUITE}: no BACKEND-SUMMARY line for family {family}. Every "
+                f"family prints its line in every run, with expected=0 when the simd "
+                f"feature is off, so an absent line is a suite that did not reach the end "
+                f"of that family rather than a build without the feature"
+            )
+
+    unknown = sorted(set(summaries) - set(BACKEND_FAMILIES))
+    if unknown:
+        report.fail(
+            f"{CHECKSUM_SUITE}: unrecognised backend family/families "
+            f"{', '.join(unknown)}. A new family must be added to BACKEND_FAMILIES, or "
+            f"its acceptance would be reported and never enforced"
+        )
+
+    accepted: list[tuple[str, str, float]] = []
+    for family in sorted(summaries):
+        summary = summaries[family]
+        observed = cases.get(family, [])
+        expected = as_int(summary, "expected")
+        counted = as_int(summary, "cases")
+        over = as_int(summary, "over")
+        limit = as_float(summary, "limit")
+        benefit = as_float(summary, "benefit")
+        best = as_float(summary, "best")
+
+        for name, value in (("expected", expected), ("cases", counted), ("over", over)):
+            if value is None:
+                report.fail(
+                    f"{CHECKSUM_SUITE} family {family}: {name}={summary.get(name)!r} is "
+                    f"not a number"
+                )
+                break
+        else:
+            if limit is None or abs(limit - BACKEND_LIMIT) > 1e-9:
+                report.fail(
+                    f"{CHECKSUM_SUITE} family {family}: reports limit={summary.get('limit')} "
+                    f"but the acceptance limit is {BACKEND_LIMIT:.2f} -- a candidate backend "
+                    f"may not be slower than the path it displaces"
+                )
+            if benefit is None or abs(benefit - BACKEND_BENEFIT) > 1e-9:
+                report.fail(
+                    f"{CHECKSUM_SUITE} family {family}: reports "
+                    f"benefit={summary.get('benefit')} but the bar is "
+                    f"{BACKEND_BENEFIT:.2f}"
+                )
+
+            if expected == 0:
+                # A build without the `simd` feature.  There is no candidate backend, so
+                # there is nothing to accept and nothing to fail -- but the run must not
+                # also claim to have measured cases, which would mean the suite measured
+                # a candidate it had just declared absent.
+                if counted or observed or as_int(summary, "unmeasured"):
+                    report.fail(
+                        f"{CHECKSUM_SUITE} family {family}: expected=0 says the simd "
+                        f"feature is off and there is no candidate backend, yet the run "
+                        f"reports cases={counted}, "
+                        f"unmeasured={summary.get('unmeasured')} and "
+                        f"{len(observed)} BACKEND line(s)"
+                    )
+                else:
+                    report.note(
+                        f"{CHECKSUM_SUITE} family {family}: the simd feature was off, so "
+                        f"there is no candidate backend to accept. Run `cargo bench "
+                        f"--features simd` to take this measurement"
+                    )
+                continue
+
+            # `cases + unmeasured == expected` exactly. Either a length produced a ratio or
+            # it was refused as unmeasurable and said so; a length that vanished for any
+            # other reason -- a backend that disagreed with the C oracle, which the suite
+            # reports separately and never times -- is caught right here.
+            unmeasured = as_int(summary, "unmeasured")
+            if unmeasured is None:
+                report.fail(
+                    f"{CHECKSUM_SUITE} family {family}: "
+                    f"unmeasured={summary.get('unmeasured')!r} is not a number"
+                )
+            elif counted + unmeasured != expected:
+                report.fail(
+                    f"{CHECKSUM_SUITE} family {family}: cases={counted} plus "
+                    f"unmeasured={unmeasured} is {counted + unmeasured}, not the "
+                    f"expected={expected} lengths the sweep set out to measure, so a length "
+                    f"was skipped for a reason the suite did not report"
+                )
+            if counted < BACKEND_MIN_CASES:
+                report.fail(
+                    f"{CHECKSUM_SUITE} family {family}: only {counted} of {expected} "
+                    f"length(s) could be measured, below the floor of "
+                    f"{BACKEND_MIN_CASES}. over=0 from a run that measured almost nothing "
+                    f"is not a pass -- it is an inconclusive result, and the machine was "
+                    f"too noisy for this comparison. Re-run somewhere quieter"
+                )
+            if len(observed) != counted:
+                report.fail(
+                    f"{CHECKSUM_SUITE} family {family}: the summary counts "
+                    f"cases={counted} but the log carries {len(observed)} per-case "
+                    f"BACKEND line(s)"
+                )
+            if over:
+                report.fail(
+                    f"{CHECKSUM_SUITE} family {family}: {over} measured length(s) where "
+                    f"the candidate backend was SLOWER than {summary.get('baseline')}. An "
+                    f"optional backend that wins on one input size and loses on another "
+                    f"is not an optimization; fix the regression or remove the feature "
+                    f"path, and never weaken bit-for-bit equality to buy speed"
+                )
+            if best is None or best > BACKEND_BENEFIT:
+                report.fail(
+                    f"{CHECKSUM_SUITE} family {family}: the best measured ratio is "
+                    f"{summary.get('best')}, so the candidate never reached the "
+                    f"{BACKEND_BENEFIT:.2f} improvement bar at any length. A second code "
+                    f"path behind a feature flag has to earn the compile-time cost it "
+                    f"adds; one that merely matches its baseline does not"
+                )
+
+        # Independently of the summary's own tally, recomputed from the two times, so a
+        # miscounted `over` cannot pass.  The per-case `tolerance` is the suite's own
+        # derived allowance -- see its `acceptance_tolerance` -- and is read rather than
+        # recomputed here, then bounded so a suite cannot widen its way to a pass.
+        for field in observed:
+            baseline_ns = as_float(field, "baseline_ns")
+            candidate_ns = as_float(field, "candidate_ns")
+            tolerance = as_float(field, "tolerance")
+            case = field.get("case", "?")
+            if (
+                baseline_ns is None
+                or candidate_ns is None
+                or tolerance is None
+                or baseline_ns <= 0.0
+            ):
+                report.fail(
+                    f"{CHECKSUM_SUITE} family {family} case {case}: "
+                    f"baseline_ns={field.get('baseline_ns')} "
+                    f"candidate_ns={field.get('candidate_ns')} "
+                    f"tolerance={field.get('tolerance')} cannot be compared"
+                )
+                continue
+            if tolerance > BACKEND_TOLERANCE_CEILING:
+                report.fail(
+                    f"{CHECKSUM_SUITE} family {family} case {case}: tolerance="
+                    f"{tolerance:.4f} exceeds the ceiling of "
+                    f"{BACKEND_TOLERANCE_CEILING:.2f}. The allowance is derived from the "
+                    f"timer floor and a case slow enough to need more than that is a case "
+                    f"the timer is not dominating"
+                )
+                continue
+            ratio = candidate_ns / baseline_ns
+            if ratio > BACKEND_LIMIT + tolerance:
+                report.fail(
+                    f"{CHECKSUM_SUITE} family {family} case {case}: the candidate took "
+                    f"{candidate_ns:.1f} ns against {baseline_ns:.1f} ns for "
+                    f"{field.get('baseline')} (ratio {ratio:.3f}, allowance "
+                    f"{BACKEND_LIMIT + tolerance:.3f})"
+                )
+            accepted.append((family, str(case), ratio))
+
+    return accepted
 
 
 def gate_balances(
@@ -815,6 +1305,10 @@ def gate_suite(
     ratio_cases: dict[str, list[dict[str, str]]] = {}
     for field in got.get("RATIO", []):
         ratio_cases.setdefault(field["group"], []).append(field)
+
+    # The protocol before the numbers: a ratio measured with one side permanently second
+    # is not a comparison, so the log has to prove which protocol produced it.
+    check_pairing(suite, criterion, got.get("RATIO", []), report)
     memory_cases: dict[str, list[dict[str, str]]] = {}
     for field in got.get("MEMORY", []):
         memory_cases.setdefault(field["group"], []).append(field)
@@ -941,13 +1435,19 @@ def main(argv: list[str]) -> int:
             f"is nothing to gate. A truncated or empty log looks exactly like this"
         )
 
-    unknown = sorted(set(seen) - set(SUITES))
+    unknown = sorted(set(seen) - set(SUITES) - {CHECKSUM_SUITE})
     if unknown:
         report.fail(
             f"unrecognised bench suite(s) {', '.join(unknown)} emitted gate lines. A new "
             f"suite must be wired into this gate's SUITES table with its authoritative "
             f"groups, otherwise its measurements would be reported and never enforced"
         )
+
+    # The checksum suite when it is present, and silence when it is not: a log from
+    # `--bench deflate_bench` legitimately carries no BACKEND line.  See CHECKSUM_SUITE.
+    backends: list[tuple[str, str, float]] = []
+    if CHECKSUM_SUITE in seen:
+        backends = gate_backend_families(seen[CHECKSUM_SUITE], report)
 
     decisions: list[tuple[str, str, str, float]] = []
     for suite in sorted(SUITES):
@@ -967,6 +1467,14 @@ def main(argv: list[str]) -> int:
     for suite, group, case, ratio in sorted(decisions):
         mark = "OVER" if ratio > RATIO_LIMIT else "ok"
         print(f"    {mark:<4} {suite:<14} {group:<22} {case:<28} ratio={ratio:.3f}")
+    if backends:
+        print(
+            f"  backend acceptance: {len(backends)} measured length(s), candidate against "
+            f"the path it displaces"
+        )
+        for family, case, ratio in sorted(backends, key=lambda row: (row[0], int(row[1]))):
+            mark = "OVER" if ratio > BACKEND_LIMIT else "ok"
+            print(f"    {mark:<4} {family:<10} len={case:<10} ratio={ratio:.3f}")
     for note in report.notes:
         print(f"::notice::{note}")
     for warning in report.warnings:

@@ -124,7 +124,7 @@ use crate::allocate::GlobalAllocator;
 use crate::config::Z_NO_FLUSH;
 use crate::error::ReturnCode;
 use crate::inflate::{inflate, inflate_end, inflate_init, InflateStream};
-use crate::read_buf::OutputRegion;
+use crate::read_buf::{OneShotSource, OutputRegion};
 
 /// The largest number of bytes handed to the decoder in one call.
 ///
@@ -282,11 +282,24 @@ pub fn uncompress2_z(dest: &mut [u8], source: &[u8]) -> Decompressed {
 /// build would therefore break the 64-bit one, so the lint is allowed here, scoped to this
 /// function, exactly as `narrow_checksum` in `crates/libz-rs-sys/src/checksum.rs` scopes the
 /// three lints its own width conversion trips on 32-bit targets.
-#[allow(clippy::unnecessary_min_or_max)]
 pub fn uncompress2_z_into(dest: &mut OutputRegion<'_>, source: &[u8]) -> Decompressed {
+    uncompress2_z_from(dest, &mut { source })
+}
+
+/// [`uncompress2_z_into`] over an input the caller supplies a window at a time.
+///
+/// The body of `uncompr.c` L24-L79 lives here and nowhere else; [`uncompress2_z_into`] is the
+/// slice-shaped front for it. See [`OneShotSource`] for the one caller that needs the other
+/// shape and why. A slice supplier reports `usize::MAX` for its window, so the ordinary path is
+/// byte-for-byte the loop it always was.
+#[allow(clippy::unnecessary_min_or_max)]
+pub fn uncompress2_z_from<S: OneShotSource>(
+    dest: &mut OutputRegion<'_>,
+    source: &mut S,
+) -> Decompressed {
     // Captured before the first reborrow of `dest`, and the origin of every
     // bound below. These are C's entry values of `*sourceLen` and `*destLen`.
-    let source_len = source.len();
+    let source_len = source.total();
     let dest_len = dest.len();
 
     // L40-L41. `len` and `left` are the residuals: input not yet handed to the
@@ -346,7 +359,9 @@ pub fn uncompress2_z_into(dest: &mut OutputRegion<'_>, source: &[u8]) -> Decompr
             left = left.saturating_sub(avail_out);
         }
         if avail_in == 0 {
-            avail_in = len.min(MAX_CHUNK);
+            // ★ `min(max_window())` is the only line the window supplier adds to C's chunking;
+            // see the same note in `crate::compress::compress2_z_from`.
+            avail_in = len.min(MAX_CHUNK).min(source.max_window());
             len = len.saturating_sub(avail_in);
         }
 
@@ -356,7 +371,12 @@ pub fn uncompress2_z_into(dest: &mut OutputRegion<'_>, source: &[u8]) -> Decompr
         // whatever the arithmetic above produced.
         let in_end = next_in.saturating_add(avail_in).min(source_len);
         let out_end = next_out.saturating_add(avail_out).min(dest_len);
-        let (input, _unread) = source.split_at(in_end);
+        let Some(input) = source.window(next_in, in_end.saturating_sub(next_in)) else {
+            // Unreachable by the invariant just stated. Reported rather than asserted so that
+            // this function stays panic-free on every path; `Z_BUF_ERROR` is the honest status
+            // for "no window could be offered" and is one of the documented outcomes.
+            break ReturnCode::BUF_ERROR;
+        };
 
         // ★ The output window starts **at** `next_out` and the stream's own cursor starts at
         // zero, rather than the window starting at the destination's base with the cursor
@@ -368,7 +388,10 @@ pub fn uncompress2_z_into(dest: &mut OutputRegion<'_>, source: &[u8]) -> Decompr
         // own base.
         let mut window = dest.reborrow(next_out, out_end.saturating_sub(next_out));
         let mut stream = InflateStream::with_region(input, window.reborrow(0, window.len()));
-        stream.next_in = next_in;
+        // ★ Zero, and the window starts *at* `next_in`; see the same note in
+        // `crate::compress::compress2_z_from` for why the cursor moved out of the stream and
+        // into this loop.
+        stream.next_in = 0;
         stream.total_in = total_in;
         stream.total_out = total_out;
         stream.msg = msg;
@@ -378,7 +401,7 @@ pub fn uncompress2_z_into(dest: &mut OutputRegion<'_>, source: &[u8]) -> Decompr
         // L66.
         let err = inflate(&mut state, &mut stream, Z_NO_FLUSH);
 
-        next_in = stream.next_in;
+        next_in = next_in.saturating_add(stream.next_in);
         next_out = next_out.saturating_add(stream.next_out);
         avail_in = stream.avail_in();
         avail_out = stream.avail_out();

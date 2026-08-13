@@ -98,9 +98,17 @@ benches/target/
 # from.  Together with fuzz/target/ above, those are every directory cargo-fuzz
 # 0.13.2 creates inside fuzz/, which is the point: no documented subcommand of it
 # may leave an untracked file in the tree, for exactly the reason the
-# fuzz/Cargo.lock note above gives for `cargo fuzz run'.  `cargo fuzz coverage' is
-# how the boundary coverage of each target is evidenced, so it gets run, and it is
-# output rather than input -- regenerated from the corpus whenever it is wanted.
+# fuzz/Cargo.lock note above gives for `cargo fuzz run'.
+#
+# To be precise about the third of those, because an ignore rule is easy to read
+# as evidence of a gate: NOTHING in this repository runs `cargo fuzz coverage'.
+# No workflow job and no make target invokes it, and the `fuzz' job of
+# .github/workflows/rust.yml runs `cargo fuzz run' with a time budget instead.
+# The rule is here because the subcommand is available to anyone with cargo-fuzz
+# installed and is a reasonable thing to run locally when investigating what a
+# target reaches -- and when someone does, its output must not turn up as
+# untracked files.  Output rather than input either way, regenerated from the
+# corpus whenever it is wanted.
 # All three rules stay anchored to fuzz/ on purpose -- a bare corpus/ would also
 # swallow crates/zlib-rs-differential/corpus/, which is a committed, deterministic
 # test fixture and has to stay tracked.

@@ -40,9 +40,18 @@ excluded `benches/` package, which no CMake target builds and which is reached o
 `cargo bench --manifest-path benches/Cargo.toml`. The C targets zlib and zlibstatic are still defined and
 still built, as they are the reference the Rust code is diffed against, so this option adds a library
 rather than taking one away. It is off by default, and while it is off no Rust tool is probed and
-everything here behaves exactly as it always has. The Rust library is supported on Rust's tier 1
-targets, and this option additionally wants a linker that accepts the -soname and --version-script
-flags, the same platform set that gets zlib.map for the C shared library.
+everything here behaves exactly as it always has.
+
+The two library kinds this option can build have different platform requirements, and only one of
+them is ELF-only. The SHARED library is relinked through zlib.map, so `-DZLIB_BUILD_SHARED=ON` with
+this option needs a linker that accepts `-soname` and `--version-script` -- the same platform set
+that gets zlib.map for the C shared library -- and Apple, AIX, SunOS and anything not UNIX are
+refused at configure time with that reason. The STATIC library carries no such requirement and is
+supported wherever cargo runs; `-DZLIB_BUILD_RUST=ON -DZLIB_BUILD_SHARED=OFF` is the portable form,
+and it is the row CI exercises on macOS. Verified by triple rather than by tier: this option is
+configured, built and installed in CI on x86_64-unknown-linux-gnu (shared and static) and on
+aarch64-apple-darwin (static only). A multi-config generator and a cross-compilation toolchain are
+refused in either mode.
 
 With ZLIB_INSTALL on as well, installing publishes the same names, the same SONAME and the same symlink
 topology the C build does: the real file libz.so.1.3.2.1-motley, named from ZLIB_VERSION in zlib.h, with
@@ -68,14 +77,36 @@ target>" to state the answer yourself as a cross build must, or -DZLIB_BUILD_STA
 archive. That second form takes the same `-l` list rustc prints, and there is deliberately no example
 value here: on x86_64-linux-gnu it is currently seven libraries including -lgcc_s, and a plausible-looking
 short list such as `-lm -ldl -lc` configures and builds and then fails at link time with an undefined
-reference to `_Unwind_Resume`. Ask the compiler for the target you are building --
-`rustc --print native-static-libs --crate-type staticlib [--target <triple>]` -- and pass what it answers.
+reference to `_Unwind_Resume`. Ask the compiler for the target you are building, and give it a source file: with no input rustc
+exits saying `no input filename given`, so the command has to be spelled the way this project's own
+configure step spells it -- write a one-line crate, name an output path, and read the `note:` line
+off stderr:
+
+```sh
+printf '#[no_mangle] pub extern "C" fn probe() -> i32 { 0 }\n' > probe.rs
+rustc --print native-static-libs --crate-type staticlib [--target <triple>] \
+      -o libprobe.a probe.rs
+```
+
+Pass what it answers. (The output path is a real file rather than `/dev/null` for the same reason
+CMake uses one: there is no `/dev/null` on Windows, and static-only Rust mode is offered there.)
 Installing a static library whose link requirements are unknown would be worse than not installing one,
 because the failure would surface in a consumer's build with nothing to connect it to this one. Shared
 consumers are unaffected either way, and a C-mode build never reaches any of it. `ctest -R
 static_link_closure` is the case that holds this to account, and it links with -nodefaultlibs on purpose --
 a plain link succeeds on a modern glibc whether the advertisement is there or not, so it is also what
 catches an incomplete set stated by hand.
+
+One extra target comes with this option, and it exists because `clean` cannot reach everything. Building
+the Rust library writes two directories into the build tree: `rust-dropin/`, which holds the staged
+archive, the relinked shared library, its symlink chain and the staged zlib.pc, and `rust-target/`, which
+is cargo's own build directory and is by far the larger of the two -- a release build leaves several
+hundred megabytes there. Everything in `rust-dropin/` is declared to CMake, so `cmake --build . --target
+clean` removes all of it. `rust-target/` is not: it is cargo's, it holds cargo's incremental state, and it
+is a cache entry (`ZLIB_RUST_TARGET_DIR`) that several build trees may deliberately share, so removing it
+during one tree's clean could throw away another's. Reclaim it with `cmake --build . --target
+zlibrust-clean`, which runs `cargo clean` on that directory and removes `rust-dropin/` outright. It is
+never run for you.
 
 README and rust/README.md cover the Rust build in full.
 

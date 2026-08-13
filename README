@@ -51,13 +51,24 @@ SHIPPED library and is often read as a statement about the whole tree.
 
 In the shipped library, every occurrence is under crates/libz-rs-sys/src/ --
 1,153 of them across nine files when this was last counted, none anywhere else.
-Re-derive the numbers rather than trusting them:
+Re-derive the numbers rather than trusting them, and use this command rather
+than the obvious one:
 
-    grep -rn --include='*.rs' -E 'unsafe *(\{|fn|extern|impl)' crates fuzz benches
+    grep -rn --include='*.rs' -E 'unsafe *(\{|fn|extern|impl)' crates fuzz benches \
+      | grep -vE ':[0-9]+:[[:space:]]*(//|/\*|\*)'
+
+The second stage is not decoration.  This tree documents itself heavily, and the
+pattern matches PROSE as readily as code: at the time of writing the unfiltered
+command reports 1,554 hits where the filtered one reports 1,527, and five of the
+difference fall in crates that provably contain no unsafe at all -- a doc comment
+quoting "unsafe { vsnprintf(...) }" is a match.  With the filter it counts
+constructs, and the three figures given here sum to exactly what it prints.
+Treat any count in a document as a snapshot; the command is the authority.
 
 crates/zlib-rs, which is the whole of the algorithm, carries
-#![forbid(unsafe_code)] and therefore has zero, checked by the compiler on every
-build rather than by grep.
+#![forbid(unsafe_code)] and therefore has zero -- checked by the compiler on
+every build rather than by grep, which is why it is worth stating separately from
+any number.
 
 Outside the shipped library, three dev-only places have unsafe, and each is
 unavoidable rather than tolerated.  crates/zlib-rs-differential/src/oracle.rs
@@ -68,12 +79,16 @@ function is itself an unsafe operation, so a test that exercises the facade's ow
 entry points cannot avoid an unsafe block however safe the code under test is.
 Those gates are deliberately not part of the shipped facade: AAP 0.6.1 fixes that
 facade's unsafe at exactly the six unavoidable C-ABI site categories, and a test
-harness is not one of them.
+harness is not one of them.  The facade's own crate documentation states those
+six categories at the width the code uses them, and every unsafe block there
+carries a // SAFETY: comment naming its invariant -- which clippy enforces
+through undocumented_unsafe_blocks rather than leaving to review.
 
-What that buys is measurable: the three benchmark suites and all five fuzz
-targets contain no unsafe at all -- zero, because they reach both
-implementations through those gates -- and neither does the safe core or any of
-its own test suites.
+What that buys is measurable, and it is compiler-enforced rather than counted:
+the three benchmark suites, all five fuzz targets, the differential crate's three
+test suites and its build script each carry #![forbid(unsafe_code)] of their own,
+as do the safe core and every one of its test suites.  Zero there is a build
+failure if it ever stops being true.
 
 For a program that dynamically links libz, the exported symbol set is the same,
 the z_stream and gz_header layouts are the same, the SONAME is still libz.so.1,
@@ -83,9 +98,10 @@ x86_64-unknown-linux-gnu: it is where the staged library, the symbol diff and
 the relinked C drivers are checked.  Staging the drop-in needs a linker that
 accepts -soname and --version-script, so it is offered on the ELF platforms
 that get zlib.map for the C shared library, and the CMake path stops with a
-message on anything else -- not-UNIX, Apple, AIX and SunOS.  Building and
-testing the Rust workspace is a wider claim than that and is made separately:
-see the tier 1 note under "Notes for some targets" below.
+message on anything else -- not-UNIX, Apple, AIX and SunOS.  The STATIC library
+has no such requirement and is supported wherever cargo runs.  Building and
+testing the Rust workspace is a wider claim than either and is made separately,
+by triple: see the note under "Notes for some targets" below.
 
 Static linking needs one thing dynamic linking does not, and both package paths
 supply it.  A Rust libz.a carries the Rust runtime's own object code, whose
@@ -165,9 +181,22 @@ target/dropin/native-static-libs.stage.  Everything that needs it reads it from
 there: the relink of the shared library, the static links "make rust-test"
 performs against libz.a, and the descriptor above.  One probe and one recorded
 answer is the point -- a second probe is a second thing to disagree with -- and
-a target whose rustc cannot be run is not stuck: RUSTPCPRIVATE="-lm -lpthread
--lc" states the set instead, and every command that needs it stops with that
-instruction rather than linking against a requirement set it does not know.
+a target whose rustc cannot be run is not stuck: RUSTPCPRIVATE states the set
+instead, and every command that needs it stops with that instruction rather than
+linking against a requirement set it does not know.
+
+Ask the compiler for the set; do not assemble one by hand.  On this kind of host
+it is seven libraries, -lgcc_s among them, and a plausible short list such as
+"-lm -lpthread -lc" configures, builds, and then fails in a consumer's link with
+an undefined reference to _Unwind_Resume.  The probe needs an input file, which
+is easy to miss -- rustc with no source exits saying "no input filename given":
+
+    : > /tmp/pc-probe.rs
+    rustc --print native-static-libs --crate-type staticlib \
+        [--target <triple>] -o /tmp/pc-probe.a /tmp/pc-probe.rs
+    make rust RUSTPCPRIVATE="<the note: line it prints>"
+
+The answer is target-specific, so run it for the target you are building.
 
 "make rust-header" wants cbindgen as well as a cargo reachable on PATH, and
 "make rust-clean" wants no cargo at all.  The comment at the top of Makefile.in
@@ -184,9 +213,15 @@ the CMake build is exactly what it always was.  With it on, CMake performs the
 same relink "make rust" does -- cargo's libz.a through zlib.map, with the same
 SONAME and the same versioned symlink chain -- and then INSTALLS that set, so
 "cmake --install" hands a consumer the complete drop-in and find_package(ZLIB)
-resolves to it.  It is supported for a native ELF build: a shared library needs
-a linker that takes -soname and --version-script, and a multi-config generator
-or a cross-compilation toolchain is refused at configure time with the reason.
+resolves to it.  The two library kinds have different platform
+requirements, and only one of them is ELF-only.  A SHARED Rust library needs a
+linker that takes -soname and --version-script, so ZLIB_BUILD_SHARED=ON with
+ZLIB_BUILD_RUST=ON is refused at configure time on Apple, AIX, SunOS and
+anything not UNIX, naming the reason.  The STATIC library has no such
+requirement and is supported wherever cargo runs: -DZLIB_BUILD_RUST=ON
+-DZLIB_BUILD_SHARED=OFF is the portable form, and it is the row CI exercises on
+macOS.  A multi-config generator and a cross-compilation toolchain are refused
+at configure time in either mode, also with the reason.
 
 Inside the Rust workspace itself, cargo drives the build directly:
 
@@ -221,13 +256,17 @@ after staging, and additionally fails on any SKIP line, so the artifact that
 ships cannot be recorded green without having been opened.
 
 Note that "cargo build" alone does NOT produce an installable shared library,
-and the shortfall is measurable: the shared object cargo emits publishes 96
+and the shortfall is measurable: the shared object cargo emits publishes 93
 dynamic global symbols where the C library publishes 111.  It carries no
 zlib.map version script (rustc attaches one of its own, and a second cannot be
-added), it lacks gzprintf and gzvprintf (both variadic, so they come from the
-small C shim in crates/libz-rs-sys/csrc/), and it exports internals that
-zlib.map hides.  The static libz.a cargo builds IS complete -- the shim objects
-are archived into it -- and "make rust" is what relinks the shared library from
+added), and it lacks gzprintf and gzvprintf (both variadic, so they come from the
+small C shim in crates/libz-rs-sys/csrc/).  That is the whole of the gap -- two
+functions and sixteen version nodes, both structural.  It does NOT export
+internals: .hidden directives in crates/libz-rs-sys/src/lib.rs keep the three
+zlib.map hides out of its dynamic table too, which is what took it from 96
+symbols to 93.  The static libz.a cargo builds IS complete -- the shim object is
+archived into it, and hidden visibility does not reach a static archive -- and
+"make rust" is what relinks the shared library from
 that archive under zlib.map, creates the versioned symlink chain the SONAME
 libz.so.1 requires, and checks the result against zlib.h and zlib.map: every
 function zlib.h declares is exported and nothing else is, the version-node count
@@ -263,10 +302,25 @@ names it from ZLIB_VERSION in zlib.h, ready to be copied into place.  Read the
 note above about static linking before installing the libz.a for consumers to
 link through zlib.pc.
 
-Building the Rust library needs Rust 1.80 or later and cargo.  Optional
-vectorised CRC-32 and Adler-32 backends are available behind the "simd" Cargo
-feature; they change speed only, never the compressed bytes, and the paragraph
-after the feature table below says how that is checked and where.
+Building the Rust library needs Rust 1.80 or later and cargo -- and, for the C
+ABI layer, the target's C compiler and archiver as well.  That last part is easy
+to miss because the C reference implementation is emphatically NOT a build
+dependency, and both things are true at once: crates/libz-rs-sys has a build
+script that compiles the one translation unit its csrc/ still ships -- the
+variadic gzprintf/gzvprintf pair, which stable Rust cannot declare -- and
+archives it into the libz.a cargo emits.  So cc and ar (or cl.exe and lib.exe)
+are ordinary prerequisites of the default facade build, exactly as they are of
+the C build; "cargo build -p zlib-rs" and "cargo build -p libz-rs-sys
+--no-default-features --features libz-compat" are the builds here that need
+neither.  What the reference implementation's dev-only boundary buys is that it
+is an ORACLE rather than a dependency: no shipped build compiles any of the
+fifteen C translation units in this directory.
+
+Two optional checksum backends are available behind the "simd" Cargo feature: a
+vectorised Adler-32 and a CRC-32 that is scalar rather than vector code.  Both
+change speed only, never the compressed bytes; the paragraphs after the feature
+table below say what each one actually is, how much it wins, and how neutrality
+is checked and where.
 
 The workspace is edition 2021 and it has ONE floor: 1.80.  All three members --
 zlib-rs, libz-rs-sys and the dev-only crates/zlib-rs-differential, which holds
@@ -297,7 +351,8 @@ rust/README.md carries the complete table with what each feature expands to:
                                     so a downstream feature request keeps
                                     resolving; gz already enables it
     rust-api      zlib-rs, off      the idiomatic Rust surface
-    simd          zlib-rs, off      autovectorised CRC-32 and Adler-32.  libz-rs-sys
+    simd          zlib-rs, off      a vectorised Adler-32 and a scalar
+                                    stride-braid CRC-32.  libz-rs-sys
                                     and zlib-rs-differential each declare a
                                     forwarding "simd" of their own, so a
                                     package-scoped request reaches the core
@@ -306,35 +361,89 @@ rust/README.md carries the complete table with what each feature expands to:
                                     default libz-rs-sys build turns it on through
                                     gz
 
-The "simd" feature deserves a plain description, because its name promises more
-than it delivers.  Both backends behind it are ordinary portable integer code,
-written so that LLVM has a shape it can autovectorise at opt-level 3; there is
-not one architecture intrinsic in either, which is what lets the safe core keep
-#![forbid(unsafe_code)].  Whether any vector instruction actually comes out is
-therefore a property of the compiler and the target, not a promise made here.
-Neither backend is chosen by asking the CPU what it supports either: the CRC-32
-one performs no run-time feature test at all, and the Adler-32 one consults an
-is_supported() that is a throughput hint rather than a correctness gate.  A
-simd-enabled binary computes the right answer on a machine with no vector unit.
-What the feature does promise is the answer: both compute the same checksums as
-the scalar backends, on every input, so they change speed only.
+The "simd" feature covers two backends and they are not the same kind of thing,
+so describing them together would misdescribe one of them.  Neither contains an
+architecture intrinsic -- that is what lets the safe core keep
+#![forbid(unsafe_code)] -- and both are written so that LLVM has a shape it can
+autovectorise at opt-level 3.  Whether it does is then a property of the
+compiler and the target, and on x86_64 the answer differs between them:
+
+  Adler-32   Vectorises.  Its body carries 91 SSE2 instructions in the release
+             library -- paddd, pshufd, punpck* and their kin -- against none at
+             all in the portable path it replaces.  It also carries the one
+             run-time probe in either module, an is_supported() SSE2 check,
+             which is a throughput hint and not a correctness gate.
+
+  CRC-32     Does not vectorise.  Its body is 487 instructions of mov, xor, shr
+             and movzbl -- zero vector instructions in the same library -- so it
+             is a scalar reformulation, not a SIMD one, and it is named for what
+             it is: the backend is "stride-braid", it performs no run-time
+             feature test at all, and it wins by exposing instruction-level
+             parallelism and by shortening the serial byte tail of the braided
+             algorithm in crc32.c.  Genuine vector CRC-32 would need the
+             carry-less-multiply intrinsics, which the core's safety rule rules
+             out.
+
+Both are therefore correct on a machine with no vector unit whatsoever, and what
+the feature promises is the answer: both compute the same checksums as the
+portable backends, on every input, so they change speed only.
+
+The speed is measured rather than asserted, and it is enforced.  On
+x86_64-unknown-linux-gnu, as candidate time over portable-backend time --
+smaller is faster, and each figure is the median of nine paired rounds run in
+alternating order:
+
+    bytes        64     256      4096     65536       1 MiB
+    Adler-32    0.98    0.51      0.36      0.36        0.36
+    CRC-32      0.24    0.46      0.90      0.97        0.99
+
+The sweep also covers 16, 32, 48 and 55 bytes, omitted above because at those
+lengths one or both backends delegate to the portable path and the true ratio is
+1.000 by construction.  The sweep does not assume that: it times the baseline
+twice per round and reports a case as unmeasured, rather than giving it a ratio,
+when those two identical runs disagree by more than 10%.  The module comments on
+crates/zlib-rs/src/{crc32,adler32}/simd.rs carry the full nine-length tables and
+say which cases that applies to.
+
+The shapes are different because the wins have different sources.  Adler-32
+gains where there is enough data to fill its lanes, so it improves as inputs
+grow and merely breaks even at 64 bytes.  CRC-32 gains most between 55 and 256
+bytes, where the serial epilogue it removes is most of the work, and converges
+with the portable path past 4 KiB where the braided body dominates -- which is
+the honest expectation for two arrangements of the same table folded over the
+same words.  benches/checksum_bench.rs carries both sweeps and CI fails the
+bench job if either backend is slower than the path it replaces at any measured
+length, or if it is not at least 10% faster at one of them; the second condition
+is there because a backend that merely forwarded to its baseline would satisfy
+the first one perfectly.
 
 Setting ZLIB_RS_SIMD=1 in the environment is how the simd feature is asked for
 through make or CMake, both of which translate it into "simd" for cargo; a
 direct cargo build takes "--features simd" instead, and the build script then
 checks that the two requests agree rather than letting a mismatch pass
-unnoticed.  ZLIB_RS_SIMD=0, or leaving it unset, builds the scalar backends.
+unnoticed.  The variable is an ASSERTION about the build, not a switch the build
+script can honour on its own -- a build script cannot enable a Cargo feature --
+and the three cases differ:
+
+    ZLIB_RS_SIMD=1   asserts the simd feature is on.  With it off, the build
+                     fails and names the feature to pass.
+    ZLIB_RS_SIMD=0   asserts it is off.  With it on, the build fails and names
+                     how to turn it off.
+    unset            asserts nothing; the Cargo features as resolved decide.
+
+So the default build -- no feature, no variable -- is scalar, and unset means
+"no assertion" rather than "scalar": with "--features simd" and the variable
+unset, the vectorised backends are built and nothing complains.
 The feature reaches the two checksums and nothing else, which is what keeps it
-output neutral -- a checksum is one scalar however it is computed, and neither
-module contains an architecture intrinsic: both are portable integer code that
-LLVM autovectorises, and the only run-time probe anywhere is Adler-32's SSE2
-check on x86 and x86_64, which selects between two arrangements of the same
-arithmetic.
+output neutral -- a checksum is one scalar however it is computed, so a
+rearranged computation cannot perturb a compressed byte.  Vectorising
+match-finding would change which matches are emitted, and that is prohibited
+outright.
 
 Neutrality is checked rather than argued, and here is exactly what checks it
 and on which machines.  Three things run with the feature enabled: the crate's
-own equivalence sweep, which compares the vectorised backend against the
-scalar one at every path boundary and re-checks the dispatcher wiring; the
+own equivalence sweep, which compares each optional backend against the
+portable one at every path boundary and re-checks the dispatcher wiring; the
 differential suites, which compare the port against the in-tree C
 implementation over the committed corpus; and a 300-second cargo-fuzz run of
 the checksum target that compares the two backends on fuzzer-chosen inputs.
@@ -410,14 +519,25 @@ Notes for some targets:
 
 - For PalmOs, see https://palmzlib.sourceforge.net/
 
-- The Rust workspace builds and its test suite runs on Rust's tier 1 targets,
-  which is what the Rust CI matrix covers on Linux, macOS and Windows. The
-  installable drop-in library is a narrower claim than that: staging it needs a
-  linker that accepts -soname and --version-script, so it is offered on ELF
-  platforms only -- Windows, Apple, AIX and SunOS are refused with a message --
-  and it is verified on x86_64-unknown-linux-gnu. The platform makefiles in
-  this distribution -- amiga, msdos, os400, qnx, watcom and win32 -- build the
-  C sources and are unaffected.
+- What the Rust workspace is VERIFIED on, exactly, rather than by tier. The CI
+  matrix in .github/workflows/rust.yml builds it and runs its test suite -- the
+  default features and then every feature -- on three host triples:
+  x86_64-unknown-linux-gnu, aarch64-apple-darwin and x86_64-pc-windows-msvc.
+  Two further targets are COMPILED and not run, to hold the integer models the
+  ABI depends on: i686-unknown-linux-gnu for ILP32 and x86_64-pc-windows-gnu
+  for LLP64. Everything deeper than build-and-test -- the differential
+  byte-identity matrix, Miri, AddressSanitizer, the fuzz targets, the relinked
+  C drivers, symbol parity, the cbindgen header check and the CMake install --
+  runs on x86_64-unknown-linux-gnu alone. Other targets rustc calls tier 1 are
+  expected to work and are not measured here.
+- The installable SHARED drop-in is narrower still: staging it needs a linker
+  that accepts -soname and --version-script, so it is offered on the ELF
+  platforms that get zlib.map for the C library, and Apple, AIX, SunOS and
+  anything not UNIX are refused with a message. The STATIC library carries no
+  such requirement -- -DZLIB_BUILD_RUST=ON -DZLIB_BUILD_SHARED=OFF is supported
+  wherever cargo runs, and CI exercises exactly that row on macOS. The platform
+  makefiles in this distribution -- amiga, msdos, os400, qnx, watcom and win32
+  -- build the C sources and are unaffected.
 
 
 Acknowledgments:

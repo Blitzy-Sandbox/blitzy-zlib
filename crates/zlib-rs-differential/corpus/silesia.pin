@@ -1,0 +1,78 @@
+# The approved identity of the Silesia corpus archive: repository-controlled,
+# committed, and reviewed like code.
+#
+# WHY THIS FILE EXISTS
+#
+# AAP 0.8.4 states the port's throughput targets against the Silesia corpus, and
+# 0.6.4.4 requires that no build or test step ever reach the network to get it.
+# Those two together leave exactly one honest arrangement: the corpus is fetched
+# deliberately, out of band, and its identity is fixed *here* rather than by
+# whoever happens to run the fetch.
+#
+# Before this file existed, `fetch_silesia.sh` shipped its built-in digest as the
+# literal string `UNPINNED`, so a release run's acceptance measurement depended on
+# an environment variable somebody had to remember to set.  A required check could
+# be green having verified nothing, and the AAP's own acceptance corpus could be
+# absent from a passing release with no signal anywhere.  The digest below is the
+# fix: it is in the repository, it moves only through a reviewed commit, and both
+# `fetch_silesia.sh` and `.github/workflows/rust.yml` read it from here rather than
+# carrying their own copy.
+#
+# WHAT IT PINS, AND WHY EACH FIELD
+#
+# The archive digest alone would authenticate the download and nothing else.  The
+# other fields are the resource ceilings the fetch enforces *before* it has
+# written 68 MB and *before* it expands that into 202 MiB -- an integrity check
+# that runs after the disk is full has protected nothing (CWE-400).  Every bound
+# below is the measured truth about the approved archive, so a mirror that serves
+# something larger is refused on the size, not merely on the digest, and is
+# refused early.
+#
+# HOW TO READ IT
+#
+# Plain `key=value`, one per line, `#` comments, no quoting, no continuation, no
+# substitution.  It is parsed by a shell script with `case`/`read` and by a YAML
+# workflow with `grep`, so it must stay parseable by both without either needing a
+# parser.  Do not add a field type that `key=value` cannot express.
+#
+# HOW TO CHANGE IT
+#
+# Run `./fetch_silesia.sh --pin-status` to see what is pinned, and
+# `./fetch_silesia.sh --print-pin <dir-or-archive>` to compute the block a new
+# archive would need.  Change `url` and `sha256` together and never separately: a
+# digest without the URL it was taken from asserts nothing about where the bytes
+# came from.  Expect the size and member fields to move with them.
+
+# Where the approved archive was retrieved from.  HTTPS only; `fetch_silesia.sh`
+# refuses every other scheme fail-closed, before it reads or creates anything.
+url=https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip
+
+# SHA-256 of the archive exactly as served by the URL above, lowercase hex.
+# Verified on 2026-08-12 against a fresh retrieval.
+sha256=0626e25f45c0ffb5dc801f13b7c82a3b75743ba07e3a71835a41e3d9f63c77af
+
+# Size of that archive in bytes.  Enforced as a transfer ceiling before the
+# download starts (from the server's advertised length) and again as an exact
+# equality after it finishes, so a truncated or padded transfer is caught without
+# hashing 68 MB first.
+archive_bytes=68182744
+
+# How many regular files the archive expands to.  Upstream publishes twelve, one
+# per data type, and `members` in `fetch_silesia.sh` names them.
+member_count=12
+
+# Total expanded size in bytes: 202.1 MiB.  Enforced against the sum of the
+# archive's own member headers *before* extraction, so an archive claiming to
+# expand to more than the approved corpus is refused without writing a byte.
+expanded_bytes=211938580
+
+# The largest single member, `mozilla` at 48.8 MiB.  A per-member ceiling as well
+# as a total one, because one member claiming 200 MiB inside a total that happens
+# to add up is still an archive nobody approved.
+max_member_bytes=51220480
+
+# Expanded bytes divided by archive bytes, to two decimal places: 211938580 /
+# 68182744 = 3.11.  Enforced with a margin as a compression-ratio ceiling, which
+# is the bound that catches a zip bomb whose declared sizes are honest but
+# enormous relative to what was downloaded.
+compression_ratio=3.11

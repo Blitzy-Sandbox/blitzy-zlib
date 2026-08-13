@@ -421,10 +421,13 @@ if(_resolved STREQUAL \"not\")
             \"\${ZLIB_LB_EXECUTABLE}.  Loader map (via \${_how}):\\n\${_trace}\")
 endif()
 
-# Canonical on both sides: the staged and installed artifacts are reached through
-# a libz.so -> libz.so.1 -> libz.so.<version> chain, so the loader reports one
-# name and this file names another, and only the real file they share settles
-# whether the right library was bound.
+# Canonical on both sides.  The staged and installed layout is one real file,
+# libz.so.<version>, with libz.so.1 and libz.so as two symlinks pointing directly
+# at it, so the loader reports whichever of those three names the executable
+# recorded and this file may well name a different one.  Comparing the two paths
+# as written would therefore fail on a correct install; canonicalising both and
+# comparing the real file they share is what settles whether the right library
+# was bound.
 get_filename_component(_resolved_real \"\${_resolved}\" REALPATH)
 get_filename_component(_expected_real \"\${ZLIB_LB_EXPECTED}\" REALPATH)
 
@@ -689,6 +692,49 @@ endforeach(driver IN LISTS ZLIB_MINIGZIP_DRIVERS)
 #
 # ZLIB_INSTALL is ON by default, so every other configuration's set of cases is
 # exactly what it was.
+#
+# ★ WHAT THE TWO KINDS SHARE HAS TO BE PRODUCED OUTSIDE THE GUARD, and this is the
+# half that registering the cases unconditionally did not finish.  Deciding that the
+# add_subdirectory cases do not need an installation is only half a fix if the files
+# they read are still written inside `if(ZLIB_INSTALL)': with -DZLIB_INSTALL=OFF the
+# two nested CMakeLists.txt were never configured, so `-S .../add_subdirectory_test'
+# named a directory that did not exist and both cases failed at configure time,
+# taking their build and test dependents with them.  MEASURED before this change:
+# `cmake -DZLIB_INSTALL=OFF' configured cleanly and then
+# `ctest -R zlib_add_subdirectory_.*configure' reported 0% of 2 passing.
+#
+# So everything the source-consumption cases need is produced here, before the guard,
+# and the guard keeps only what genuinely depends on there being an installation.
+# `PLATFORM' comes with them because every nested `cmake' invocation in this file
+# interpolates it, including the two below the guard -- on a generator with
+# CMAKE_GENERATOR_PLATFORM set, leaving it inside would have quietly dropped `-A' from
+# the source-consumption cases in a ZLIB_INSTALL=OFF build and configured them for the
+# wrong architecture.
+
+# CMAKE_GENERATOR_PLATFORM doesn't work in the if
+set(GENERATOR ${CMAKE_GENERATOR_PLATFORM})
+
+if(GENERATOR)
+    set(PLATFORM "-A ${GENERATOR}")
+endif(GENERATOR)
+
+# The two source-consumption fixtures.  Read by the `zlib_add_subdirectory_*' and
+# `zlib_add_subdirectory_exclude_*' cases below, which are registered
+# unconditionally, so these have to be written unconditionally too.  configure_file
+# creates a missing parent itself, but the explicit MAKE_DIRECTORY is kept for the
+# reason the note inside the guard gives: it is what makes a name mismatch between a
+# directory and its destination visible instead of silent.
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_test)
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_exclude_test)
+
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/add_subdirectory_test.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_test/CMakeLists.txt @ONLY)
+
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/add_subdirectory_exclude_test.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_exclude_test/CMakeLists.txt @ONLY)
+
 if(ZLIB_INSTALL)
     add_test(
         NAME zlib_install
@@ -707,8 +753,6 @@ if(ZLIB_INSTALL)
     file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/findpackage_test)
     file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/findpackage_no_components_test)
     file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/findpackage_wrong_components_test)
-    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_test)
-    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_exclude_test)
 
     configure_file(
         ${CMAKE_CURRENT_SOURCE_DIR}/find_package_test.cmake.in
@@ -722,21 +766,10 @@ if(ZLIB_INSTALL)
         ${CMAKE_CURRENT_SOURCE_DIR}/find_package_wrong_components_test.cmake.in
         ${CMAKE_CURRENT_BINARY_DIR}/findpackage_wrong_components_test/CMakeLists.txt @ONLY)
 
-    configure_file(
-        ${CMAKE_CURRENT_SOURCE_DIR}/add_subdirectory_test.cmake.in
-        ${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_test/CMakeLists.txt @ONLY)
-
-    configure_file(
-        ${CMAKE_CURRENT_SOURCE_DIR}/add_subdirectory_exclude_test.cmake.in
-        ${CMAKE_CURRENT_BINARY_DIR}/add_subdirectory_exclude_test/CMakeLists.txt
-        @ONLY)
-
-    # CMAKE_GENERATOR_PLATFORM doesn't work in the if
-    set(GENERATOR ${CMAKE_GENERATOR_PLATFORM})
-
-    if(GENERATOR)
-        set(PLATFORM "-A ${GENERATOR}")
-    endif(GENERATOR)
+    # The two add_subdirectory fixtures and the PLATFORM derivation used to live here
+    # and are now produced above the guard, because the cases that read them are
+    # registered unconditionally.  Nothing else moved: every remaining producer in
+    # this block writes a fixture that resolves an installation.
 
     # ★ Nested cmake invocations are run with a standard input that carries nothing.
     #

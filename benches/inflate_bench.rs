@@ -8,15 +8,20 @@
 //! throughput difference.
 //!
 //! ★ **What an automated run answers, and what it does not.** AAP §0.6.4.6 reads that figure from
-//! the multi-megabyte Silesia members, and CI cannot supply them: AAP §0.6.4.4 requires CI to stay
+//! the multi-megabyte Silesia members, and CI never ACQUIRES them: AAP §0.6.4.4 requires CI to stay
 //! network-free and makes Silesia an opt-in tier fetched by a human through
-//! `crates/zlib-rs-differential/corpus/fetch_silesia.sh` with a pinned SHA-256. The `bench` job in
-//! `.github/workflows/rust.yml` therefore runs this suite over the **committed minimal corpus**
-//! only, and the Silesia group prints a skip note there and contributes no gated case. So an
-//! automated run is a **regression gate** -- it catches a change that slows the port relative to
-//! the reference on kilobyte fixtures, on one machine, in one process -- and not the AAP §0.8.4
-//! acceptance measurement, which is a deliberate off-CI run with the corpus installed. Do not cite
-//! a green `bench` job as the acceptance figure.
+//! `crates/zlib-rs-differential/corpus/fetch_silesia.sh` with a pinned SHA-256. Two shapes of
+//! automated run follow, and they differ by configuration rather than by capability. **Unarmed** --
+//! the default, and what every ordinary push gets -- provisions no corpus, so the `bench` job runs
+//! this suite over the **committed minimal corpus** only, the Silesia group prints a skip note and
+//! contributes no gated case, and the run is a **regression gate**: it catches a change that slows
+//! the port relative to the reference on kilobyte fixtures, on one machine, in one process, and it
+//! is not the AAP §0.8.4 acceptance measurement. **Armed** -- a maintainer has provisioned the
+//! corpus outside the workflow, from a cache keyed on the pinned digest or through
+//! `ZLIB_RS_SILESIA_DIR`, and the job verifies it with `--verify-only` rather than fetching it --
+//! makes the Silesia group RUN, and the same gate then enforces the same limits over its summary
+//! lines. Do not cite an unarmed `bench` job as the acceptance figure; read the log, where the
+//! Silesia group is either present or explicitly skipped.
 //!
 //! The idioms come from `benches/checksum_bench.rs`, which established them: committed-corpus
 //! loading, named call gates that delegate to the harness crate's FFI boundary, an agreement check
@@ -120,11 +125,14 @@
 //! this file *reports* the gate and never enforces it: nothing here panics, exits or aborts on a
 //! regression.
 //!
-//! Alongside criterion's own estimates, each case is measured by a small bounded self-timed pass
-//! and one line per case is written to **stderr** in a stable, greppable form:
+//! Alongside criterion's own estimates, each case is measured by a small bounded self-timed pass --
+//! **paired and order-alternating**: both sides are timed inside every round, the order flips between
+//! rounds, and the published figures are the medians of the per-round means, with the worst round's
+//! quotient published beside them as `ratio_hi` so a reader can see how much of the number is
+//! scheduling noise. One line per case is written to **stderr** in a stable, greppable form:
 //!
 //! ```text
-//! inflate_bench: RATIO group=<group> case=<case> bytes=<n> port_ns=<f> oracle_ns=<f> ratio=<f> limit=1.10 gate=counted|informational verdict=within|over
+//! inflate_bench: RATIO group=<group> case=<case> bytes=<n> port_ns=<f> oracle_ns=<f> ratio=<f> ratio_hi=<f> rounds=<n> order=alternating limit=1.10 gate=counted|informational verdict=within|over
 //! ```
 //!
 //! and one aggregate line per group:
@@ -174,7 +182,7 @@
 //!
 //! ```text
 //! inflate_bench: GATE-INVENTORY suite=inflate ratio_limit=1.10 min_bytes=4096 levels=1,6,9 authoritative_ratio=<csv> supporting_ratio=<csv> informational_ratio=
-//! inflate_bench: CRITERION root=<dir> port_label=zlib-rs oracle_label=c-oracle layout=<root>/<group>/<label>/<case>/new/estimates.json estimate=slope fallback=mean authority=criterion self_timed=diagnostic
+//! inflate_bench: CRITERION root=<dir> port_label=zlib-rs oracle_label=c-oracle layout=<root>/<group>/<label>/<case>/new/estimates.json estimate=slope fallback=mean authority=criterion self_timed=diagnostic registration=alternating rounds=<n> order=alternating
 //! ```
 //!
 //! `GATE-INVENTORY` publishes the limit, the size floor, the level axis and the exact group sets, so
@@ -326,11 +334,13 @@
 //! §0.6.4.4 requires. The flag never fetches anything; it only decides whether absence is tolerable.
 //!
 //! **Nothing here touches the network, spawns a process, or executes that script.** AAP §0.6.4.4
-//! requires `cargo test` and CI to be network-free, and `corpus/README.md` states that the script
-//! is invoked by a human and by nothing else — no manifest, no build script, no test and no
-//! workflow *runs* it, and this file keeps it that way. Several of them name it, this file
+//! requires `cargo test` and CI to be network-free, and `corpus/README.md` states that the script is
+//! invoked in FETCHING mode by a human and by nothing else — no manifest, no build script, no test
+//! and no workflow ever *fetches* with it, and this file keeps it that way. The one automated
+//! invocation that exists is a different thing: the `bench` job runs it as `--verify-only`, which
+//! obtains nothing, writes nothing and reaches no network. Several files name the script, this one
 //! included, because the note printed when the corpus is absent has to say where to get it; being
-//! named is not being invoked. No crate is introduced for any of
+//! named is not being invoked, and being verified is not being fetched. No crate is introduced for any of
 //! this either: `std::fs` and `std::path` suffice.
 //!
 //! # Hygiene
@@ -346,11 +356,14 @@
 //! declaration and `build.rs` already emits the link directives.
 //!
 //! Every stream is ended on every path, including the skip paths, by the three RAII guards
-//! [`PortInflate`], [`OracleInflate`] and [`OracleDeflate`]. This file is outside **both**
-//! sanitizer gates: the nightly `AddressSanitizer` job is scoped to `-p libz-rs-sys` and the three
-//! relinked C drivers and does not select `zlib-rs-differential` or the benches attached to it, and
-//! Miri is scoped to `-p zlib-rs` and cannot execute the C oracle. So the `RAII` guards are the
-//! leak discipline here, not a backstop behind one.
+//! [`PortInflate`], [`OracleInflate`] and [`OracleDeflate`]. This file IS reached by the nightly
+//! `AddressSanitizer` job -- it builds all three suites with `-Zsanitizer=address`, and the C oracle
+//! with `-fsanitize=address`, then runs each in criterion's `--test` mode for one iteration per
+//! benchmark -- so an out-of-bounds access or a use-after-free here would be reported rather than
+//! merely improbable. What that job deliberately does not provide is leak detection: LeakSanitizer
+//! is off for the step, because the C oracle keeps `local` tables alive for the life of the process
+//! by design. Miri is the gate this file can never see, since it cannot execute the C oracle at all.
+//! So the `RAII` guards remain the leak discipline here rather than a backstop behind one.
 //!
 //! A `harness = false` bench compiles without `--test`, so `cfg(test)` is false here and these
 //! functions are not `#[test]`. `clippy.toml`'s `allow-unwrap-in-tests`, `allow-expect-in-tests`
@@ -1368,9 +1381,10 @@ fn install_oracle(strm: &mut oracle::z_stream, input: &[u8], out: &mut [u8]) {
 //  measure precisely.
 //
 //  Every guard's `Drop` calls the matching `*End`, so a skip path, an early return and a panicking
-//  unwind all release the stream. That is what keeps this file leak-free, and it has to be
-//  self-imposed: no sanitizer job runs this file -- ASan is scoped to `-p libz-rs-sys` and the three
-//  relinked C drivers, and Miri cannot execute the oracle.
+//  unwind all release the stream. That is what keeps this file leak-free, and the discipline is still
+//  self-imposed: the ASan job does build and run this file in criterion's `--test` mode, but with
+//  LeakSanitizer off for that step -- the C oracle's `local` tables live for the whole process -- and
+//  Miri cannot execute the oracle at all.
 
 /// The port's inflate stream, ended on every path by [`Drop`].
 #[derive(Debug)]
@@ -2183,62 +2197,202 @@ fn configure(group: &mut BenchmarkGroup<'_, WallTime>) {
 //  harness API hands no timing back to the benchmark that produced it, so a plain `cargo bench` run
 //  would print two rates per case and no ratio -- and the gate is a ratio. This pass supplies one.
 //
-//  It is deliberately small: bounded to a couple of milliseconds per round, three rounds, minimum
-//  reported. The minimum rather than the mean because the shortest observed time is the least
-//  contaminated by scheduling, and because the figure is a comparison rather than a distribution.
+//  ★ IT IS PAIRED AND ORDER-ALTERNATING, and that is not a refinement -- it is the difference
+//  between a comparison and an artefact. The pass used to time one side to completion and then the
+//  other, always in the same order, and a fixed order systematically favours whichever side runs
+//  second: the compressed input, the output buffer and the stream state are already resident and warm
+//  by then, and on a shared machine the second side also inherits whatever frequency state the first
+//  one raised. Two independently sampled slopes are not a paired ratio either -- their quotient
+//  carries the drift between two separate stretches of wall clock. So the two sides are now timed
+//  round by round *within* one bounded round, the order flips on every round, and the ratio is formed
+//  from the paired rounds rather than from two unrelated sweeps.
+//
 //  criterion's `target/criterion/<group>/<label>/<case>/new/estimates.json` remains the
-//  authoritative measurement.
+//  authoritative measurement, and the criterion registration order alternates per case for exactly
+//  the same reason; see [`register_pair`].
 
 /// Nanoseconds in a second, as a float, for turning a [`Duration`] into a per-operation figure.
 const NANOS_PER_SEC: f64 = 1_000_000_000.0;
 
-/// Timed rounds per side. The minimum of the three is reported.
-const CALIBRATION_ROUNDS: u32 = 3;
+/// Paired rounds per case. Each round times both sides once; the order flips between rounds.
+///
+/// Nine rather than three, because a paired statistic is only as good as the number of pairs it is
+/// taken over and this pass is cheap: nine rounds of a two-millisecond budget per side is under
+/// forty milliseconds a case. Odd, so that the median of the per-round ratios is an observed round
+/// rather than an average of two, and so that neither order can be silently over-represented by an
+/// even split -- five rounds lead with the port and four with the reference, which the `order=` field
+/// publishes.
+const PAIRED_ROUNDS: u32 = 9;
 
-/// Wall-clock budget for one round, from which the repetition count is derived.
+/// Wall-clock budget for one side of one round, from which the repetition count is derived.
 const CALIBRATION_BUDGET: Duration = Duration::from_millis(2);
 
 /// Ceiling on repetitions per round, so that a nanosecond-scale operation cannot turn the budget
 /// calculation into a long loop.
 const CALIBRATION_MAX_REPS: u32 = 100_000;
 
-/// The mean nanoseconds per call of `op`, from a bounded self-timed pass, or `None` if `op` failed.
+/// The word the `order=` field carries, so a reader can tell the protocol from the log alone.
+const PAIRED_ORDER: &str = "alternating";
+
+/// One case's paired self-timed measurement.
 ///
-/// One probe call establishes the scale, an integer division turns [`CALIBRATION_BUDGET`] into a
-/// repetition count, and [`CALIBRATION_ROUNDS`] rounds of that many calls are timed. All arithmetic
-/// on the count is integer arithmetic on nanoseconds, so no float is ever cast from an integer and
-/// no precision is lost silently.
+/// `port_ns` and `oracle_ns` are the medians of the per-round means, so the published `ratio` is
+/// exactly their quotient and a consumer can recompute it. `ratio_hi` is the *worst* round for the
+/// port, published as spread that decides nothing: it says how much of the figure is scheduling
+/// noise, which is the question a single point estimate cannot answer on a shared machine.
+#[derive(Clone, Copy, Debug)]
+struct Paired {
+    /// Median of the port's per-round mean nanoseconds per call.
+    port_ns: f64,
+    /// Median of the reference's per-round mean nanoseconds per call.
+    oracle_ns: f64,
+    /// The largest per-round `port / oracle` quotient observed.
+    ratio_hi: f64,
+    /// How many rounds contributed. Always [`PAIRED_ROUNDS`] on success; published so a truncated
+    /// pass cannot read as a complete one.
+    rounds: u32,
+}
+
+/// The word the `registration=` field of the `CRITERION` line carries.
+const CRITERION_REGISTRATION: &str = "alternating";
+
+/// Whether the port's criterion row is registered *before* the reference's for `case`.
 ///
-/// `op` returns `false` to mean "this did not work", which aborts the pass and yields `None`; the
-/// caller reports the case as unmeasured rather than publishing a ratio for a failed operation.
-fn indicative_ns<F: FnMut() -> bool>(mut op: F) -> Option<f64> {
+/// criterion samples each registered row in registration order, so a file that always registers the
+/// port first hands the reference every second-mover advantage there is: warm pages, a warm
+/// allocator, a warm branch predictor and whatever clock state the first row raised. Alternating by a
+/// stable hash of the case id spreads that across the cases of a group instead of parking it on one
+/// side, and keeps a given case's order **reproducible** from run to run, which a random choice would
+/// not.
+///
+/// FNV-1a over the id's bytes, low bit. Any parity function would do; this one is three lines and has
+/// no dependencies.
+fn registration_leads_with_port(case: &str) -> bool {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in case.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash & 1 == 0
+}
+
+/// Registers a case's two criterion rows in the order [`registration_leads_with_port`] chose.
+///
+/// A macro rather than a function taking two closures, and deliberately: both closures capture the
+/// same output buffer and the same fixture mutably, so two of them cannot be alive at once. Expanding
+/// the two `bench_function` calls in each branch keeps each closure a temporary whose borrow ends
+/// with its own statement, which is exactly the shape the two sequential calls had before.
+macro_rules! register_pair {
+    ($group:expr, $case:expr, $port:expr, $oracle:expr) => {{
+        let case_id = $case;
+        if registration_leads_with_port(case_id) {
+            $group.bench_function(BenchmarkId::new(PORT_LABEL, case_id), $port);
+            $group.bench_function(BenchmarkId::new(ORACLE_LABEL, case_id), $oracle);
+        } else {
+            $group.bench_function(BenchmarkId::new(ORACLE_LABEL, case_id), $oracle);
+            $group.bench_function(BenchmarkId::new(PORT_LABEL, case_id), $port);
+        }
+    }};
+}
+
+/// Which implementation a [`paired_ns`] closure is being asked to run.
+///
+/// One closure serving both sides rather than two closures, because the two sides share the output
+/// buffer and the fixture: two `FnMut` closures would each need `&mut` to the same `Vec`, which does
+/// not borrow-check. A single closure captures once and dispatches on this.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Side {
+    /// The Rust port.
+    Port,
+    /// The in-process C oracle.
+    Oracle,
+}
+
+/// Repetitions per round for one side, from one probe call.
+///
+/// An integer division turns [`CALIBRATION_BUDGET`] into a count, so no float is ever cast from an
+/// integer and no precision is lost silently. `None` means the probe call itself failed.
+fn calibrate<F: FnMut(Side) -> bool>(op: &mut F, side: Side) -> Option<u32> {
     let probe_started = Instant::now();
-    if !op() {
+    if !op(side) {
         return None;
     }
-    let probe = probe_started.elapsed();
-
-    let probe_ns = probe.as_nanos().max(1);
+    let probe_ns = probe_started.elapsed().as_nanos().max(1);
     let wanted = CALIBRATION_BUDGET.as_nanos() / probe_ns;
-    let reps = u32::try_from(wanted.clamp(1, u128::from(CALIBRATION_MAX_REPS)))
-        .unwrap_or(CALIBRATION_MAX_REPS);
+    Some(
+        u32::try_from(wanted.clamp(1, u128::from(CALIBRATION_MAX_REPS)))
+            .unwrap_or(CALIBRATION_MAX_REPS),
+    )
+}
 
-    let mut best: Option<Duration> = None;
-    for _ in 0..CALIBRATION_ROUNDS {
-        let started = Instant::now();
-        for _ in 0..reps {
-            if !op() {
-                return None;
-            }
+/// Mean nanoseconds per call over `reps` calls of one side, or `None` if any call failed.
+fn timed_run<F: FnMut(Side) -> bool>(op: &mut F, side: Side, reps: u32) -> Option<f64> {
+    let started = Instant::now();
+    for _ in 0..reps {
+        if !op(side) {
+            return None;
         }
-        let elapsed = started.elapsed();
-        best = match best {
-            Some(current) if current <= elapsed => Some(current),
-            _ => Some(elapsed),
+    }
+    Some(started.elapsed().as_secs_f64() * NANOS_PER_SEC / f64::from(reps))
+}
+
+/// The median of `samples`, which must be non-empty. Sorted by a total order, so a NaN cannot
+/// silently reorder the slice.
+fn median(samples: &mut [f64]) -> Option<f64> {
+    samples.sort_by(f64::total_cmp);
+    samples.get(samples.len() / 2).copied()
+}
+
+/// Times the two sides against each other in [`PAIRED_ROUNDS`] paired, order-alternating rounds.
+///
+/// Both sides are given the **same** repetition count -- the smaller of the two probes' -- so a
+/// round is two equal-work measurements taken microseconds apart rather than two sweeps taken
+/// seconds apart. Even-numbered rounds run the port first and odd-numbered rounds run the reference
+/// first, so each side leads roughly half the rounds and neither can collect the second-mover
+/// advantage that a fixed order hands out.
+///
+/// `op` returning `false` means "this did not work", which aborts the pass and yields `None`; the
+/// caller then reports the case as unmeasured rather than publishing a ratio for a failed operation.
+fn paired_ns<F: FnMut(Side) -> bool>(mut op: F) -> Option<Paired> {
+    // One probe per side, and the smaller of the two counts, so that neither side is measured over
+    // a budget the other could not fill.
+    let reps = calibrate(&mut op, Side::Port)?.min(calibrate(&mut op, Side::Oracle)?);
+
+    let mut port_samples = Vec::with_capacity(PAIRED_ROUNDS as usize);
+    let mut oracle_samples = Vec::with_capacity(PAIRED_ROUNDS as usize);
+    let mut ratio_hi = f64::NEG_INFINITY;
+
+    for round in 0..PAIRED_ROUNDS {
+        // The flip. `round % 2` and nothing else: a pseudo-random choice would make the log
+        // unreproducible for no gain, because a strict alternation already removes the systematic
+        // part of the bias and the residual is what `ratio_hi` publishes.
+        let (port_ns, oracle_ns) = if round % 2 == 0 {
+            let first = timed_run(&mut op, Side::Port, reps)?;
+            (first, timed_run(&mut op, Side::Oracle, reps)?)
+        } else {
+            let first = timed_run(&mut op, Side::Oracle, reps)?;
+            (timed_run(&mut op, Side::Port, reps)?, first)
         };
+        if oracle_ns > 0.0 {
+            ratio_hi = ratio_hi.max(port_ns / oracle_ns);
+        }
+        port_samples.push(port_ns);
+        oracle_samples.push(oracle_ns);
     }
 
-    Some(best?.as_secs_f64() * NANOS_PER_SEC / f64::from(reps))
+    Some(Paired {
+        port_ns: median(&mut port_samples)?,
+        oracle_ns: median(&mut oracle_samples)?,
+        // `NEG_INFINITY` survives only if every round measured the reference at zero, which the
+        // ledger already refuses to divide by; reported as the point ratio in that case so the
+        // field is always a number.
+        ratio_hi: if ratio_hi.is_finite() {
+            ratio_hi
+        } else {
+            f64::NAN
+        },
+        rounds: PAIRED_ROUNDS,
+    })
 }
 
 /// What a group's cases mean for [`GATE_RATIO`].
@@ -2384,8 +2538,14 @@ impl RatioLedger {
     /// A side that could not be timed, or a reference time of zero that no ratio can be taken
     /// against, is reported as unmeasured on its own line and does not enter any count -- so an
     /// aggregate of zero `over` never quietly means "nothing was compared".
-    fn record(&mut self, case: &str, bytes: usize, port_ns: Option<f64>, oracle_ns: Option<f64>) {
-        let (Some(port_ns), Some(oracle_ns)) = (port_ns, oracle_ns) else {
+    fn record(&mut self, case: &str, bytes: usize, paired: Option<Paired>) {
+        let Some(Paired {
+            port_ns,
+            oracle_ns,
+            ratio_hi,
+            rounds,
+        }) = paired
+        else {
             eprintln!(
                 "{LOG_PREFIX} no ratio for group={group} case={case}: one side could not be timed.",
                 group = self.group,
@@ -2420,6 +2580,7 @@ impl RatioLedger {
         eprintln!(
             "{LOG_PREFIX} {RATIO_KEY} group={group} case={case} bytes={bytes} \
              port_ns={port_ns:.1} oracle_ns={oracle_ns:.1} ratio={ratio:.3} \
+             ratio_hi={ratio_hi:.3} rounds={rounds} order={PAIRED_ORDER} \
              limit={GATE_RATIO:.2} gate={gate} verdict={verdict}",
             group = self.group,
         );
@@ -2497,7 +2658,8 @@ fn report_configuration() {
         );
         eprintln!(
             "{LOG_PREFIX}   per-case lines are `{RATIO_KEY} group=... case=... bytes=... \
-             port_ns=... oracle_ns=... ratio=... limit=... gate=counted|informational \
+             port_ns=... oracle_ns=... ratio=... ratio_hi=... rounds=... order=... limit=... \
+             gate=counted|informational \
              verdict=within|over`; then exactly one `{RATIO_SUMMARY_KEY}` line per declared group, \
              carrying `gate=authoritative|supporting` and `expected=<cases the group set out to \
              measure>` -- a group with nothing to measure still prints its line, with \
@@ -2547,7 +2709,8 @@ fn report_configuration() {
             "{LOG_PREFIX} {CRITERION_KEY} root={root} port_label={PORT_LABEL} \
              oracle_label={ORACLE_LABEL} \
              layout=<root>/<group>/<label>/<case>/new/estimates.json estimate=slope \
-             fallback=mean authority=criterion self_timed=diagnostic",
+             fallback=mean authority=criterion self_timed=diagnostic \
+             registration={CRITERION_REGISTRATION} rounds={PAIRED_ROUNDS} order={PAIRED_ORDER}",
             root = criterion_root().display(),
         );
 
@@ -2642,41 +2805,47 @@ fn measure_steady_state(
         return;
     }
 
-    let port_ns = indicative_ns(|| {
-        port.reset(window_bits) == Z_OK
-            && port_decode(&mut port, &case.compressed, &mut out, case.feeding).is_some()
+    let paired = paired_ns(|side| match side {
+        Side::Port => {
+            port.reset(window_bits) == Z_OK
+                && port_decode(&mut port, &case.compressed, &mut out, case.feeding).is_some()
+        }
+        Side::Oracle => {
+            reference.reset(window_bits) == Z_OK
+                && oracle_decode(&mut reference, &case.compressed, &mut out, case.feeding).is_some()
+        }
     });
-    let oracle_ns = indicative_ns(|| {
-        reference.reset(window_bits) == Z_OK
-            && oracle_decode(&mut reference, &case.compressed, &mut out, case.feeding).is_some()
-    });
-    ledger.record(&case.id, case.original.len(), port_ns, oracle_ns);
+    ledger.record(&case.id, case.original.len(), paired);
 
     group.throughput(throughput);
-    group.bench_function(BenchmarkId::new(PORT_LABEL, &case.id), |b| {
-        b.iter(|| {
-            let reset = port.reset(window_bits);
-            let decoded = port_decode(
-                &mut port,
-                black_box(case.compressed.as_slice()),
-                black_box(out.as_mut_slice()),
-                case.feeding,
-            );
-            black_box((reset, decoded))
-        });
-    });
-    group.bench_function(BenchmarkId::new(ORACLE_LABEL, &case.id), |b| {
-        b.iter(|| {
-            let reset = reference.reset(window_bits);
-            let decoded = oracle_decode(
-                &mut reference,
-                black_box(case.compressed.as_slice()),
-                black_box(out.as_mut_slice()),
-                case.feeding,
-            );
-            black_box((reset, decoded))
-        });
-    });
+    register_pair!(
+        group,
+        &case.id,
+        |b| {
+            b.iter(|| {
+                let reset = port.reset(window_bits);
+                let decoded = port_decode(
+                    &mut port,
+                    black_box(case.compressed.as_slice()),
+                    black_box(out.as_mut_slice()),
+                    case.feeding,
+                );
+                black_box((reset, decoded))
+            });
+        },
+        |b| {
+            b.iter(|| {
+                let reset = reference.reset(window_bits);
+                let decoded = oracle_decode(
+                    &mut reference,
+                    black_box(case.compressed.as_slice()),
+                    black_box(out.as_mut_slice()),
+                    case.feeding,
+                );
+                black_box((reset, decoded))
+            });
+        }
+    );
 }
 
 /// Register the full-lifecycle pair for one case: `inflateInit2_`, a decode and `inflateEnd`.
@@ -2700,45 +2869,51 @@ fn measure_lifecycle(
     let window_bits = case.container.window_bits();
     let mut out = vec![0_u8; case.stream_output_len()];
 
-    let port_ns = indicative_ns(|| {
-        let mut port = PortInflate::new();
-        port.init(window_bits) == Z_OK
-            && port_decode(&mut port, &case.compressed, &mut out, case.feeding).is_some()
+    let paired = paired_ns(|side| match side {
+        Side::Port => {
+            let mut port = PortInflate::new();
+            port.init(window_bits) == Z_OK
+                && port_decode(&mut port, &case.compressed, &mut out, case.feeding).is_some()
+        }
+        Side::Oracle => {
+            let mut reference = OracleInflate::new();
+            reference.init(window_bits) == Z_OK
+                && oracle_decode(&mut reference, &case.compressed, &mut out, case.feeding).is_some()
+        }
     });
-    let oracle_ns = indicative_ns(|| {
-        let mut reference = OracleInflate::new();
-        reference.init(window_bits) == Z_OK
-            && oracle_decode(&mut reference, &case.compressed, &mut out, case.feeding).is_some()
-    });
-    ledger.record(&case.id, case.original.len(), port_ns, oracle_ns);
+    ledger.record(&case.id, case.original.len(), paired);
 
     group.throughput(throughput);
-    group.bench_function(BenchmarkId::new(PORT_LABEL, &case.id), |b| {
-        b.iter(|| {
-            let mut port = PortInflate::new();
-            let init = port.init(window_bits);
-            let decoded = port_decode(
-                &mut port,
-                black_box(case.compressed.as_slice()),
-                black_box(out.as_mut_slice()),
-                case.feeding,
-            );
-            black_box((init, decoded))
-        });
-    });
-    group.bench_function(BenchmarkId::new(ORACLE_LABEL, &case.id), |b| {
-        b.iter(|| {
-            let mut reference = OracleInflate::new();
-            let init = reference.init(window_bits);
-            let decoded = oracle_decode(
-                &mut reference,
-                black_box(case.compressed.as_slice()),
-                black_box(out.as_mut_slice()),
-                case.feeding,
-            );
-            black_box((init, decoded))
-        });
-    });
+    register_pair!(
+        group,
+        &case.id,
+        |b| {
+            b.iter(|| {
+                let mut port = PortInflate::new();
+                let init = port.init(window_bits);
+                let decoded = port_decode(
+                    &mut port,
+                    black_box(case.compressed.as_slice()),
+                    black_box(out.as_mut_slice()),
+                    case.feeding,
+                );
+                black_box((init, decoded))
+            });
+        },
+        |b| {
+            b.iter(|| {
+                let mut reference = OracleInflate::new();
+                let init = reference.init(window_bits);
+                let decoded = oracle_decode(
+                    &mut reference,
+                    black_box(case.compressed.as_slice()),
+                    black_box(out.as_mut_slice()),
+                    case.feeding,
+                );
+                black_box((init, decoded))
+            });
+        }
+    );
 }
 
 /// Register the one-shot pair for one case and one entry point.
@@ -2761,27 +2936,33 @@ fn measure_one_shot(
 
     let mut out = vec![0_u8; case.one_shot_output_len()];
 
-    let port_ns = indicative_ns(|| entry.port(&mut out, &case.compressed).is_some());
-    let oracle_ns = indicative_ns(|| entry.oracle(&mut out, &case.compressed).is_some());
-    ledger.record(&case.id, case.original.len(), port_ns, oracle_ns);
+    let paired = paired_ns(|side| match side {
+        Side::Port => entry.port(&mut out, &case.compressed).is_some(),
+        Side::Oracle => entry.oracle(&mut out, &case.compressed).is_some(),
+    });
+    ledger.record(&case.id, case.original.len(), paired);
 
     group.throughput(throughput);
-    group.bench_function(BenchmarkId::new(PORT_LABEL, &case.id), |b| {
-        b.iter(|| {
-            black_box(entry.port(
-                black_box(out.as_mut_slice()),
-                black_box(case.compressed.as_slice()),
-            ))
-        });
-    });
-    group.bench_function(BenchmarkId::new(ORACLE_LABEL, &case.id), |b| {
-        b.iter(|| {
-            black_box(entry.oracle(
-                black_box(out.as_mut_slice()),
-                black_box(case.compressed.as_slice()),
-            ))
-        });
-    });
+    register_pair!(
+        group,
+        &case.id,
+        |b| {
+            b.iter(|| {
+                black_box(entry.port(
+                    black_box(out.as_mut_slice()),
+                    black_box(case.compressed.as_slice()),
+                ))
+            });
+        },
+        |b| {
+            b.iter(|| {
+                black_box(entry.oracle(
+                    black_box(out.as_mut_slice()),
+                    black_box(case.compressed.as_slice()),
+                ))
+            });
+        }
+    );
 }
 
 // =================================================================================================

@@ -1233,24 +1233,43 @@ impl<S: AsRef<[u16]> + AsMut<[u16]>> HashChains<S> {
     /// `hash` is reduced by [`HashChains::hash_mask`] first, mirroring `UPDATE_HASH`
     /// (`deflate.c` L141), so this cannot fail. A [`NIL`] result means the chain is empty
     /// (`deflate.c` L144).
+    ///
+    /// ★ **The mask is taken from the array's own length, and that is a throughput decision
+    /// rather than a style one.** `HashChains::new` refuses a `head` whose length is not
+    /// `1 << hash_bits`, so `head.len() - 1` and [`HashChains::hash_mask`] are the same
+    /// number -- but only one of the two is a fact the compiler can *use*. `x & (len - 1)` is
+    /// at most `len - 1`, so a bounds check against `len` is provably redundant and LLVM
+    /// removes it; masking with a value read from a struct field leaves it with two unrelated
+    /// quantities and it emits the compare and the branch. This accessor sits on the
+    /// per-input-byte path through `insert_string` and on every hash-chain probe in
+    /// `longest_match`, where C indexes an array with no check at all, so that one branch is
+    /// paid tens of millions of times in a megabyte of input.
     #[must_use]
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn head_at(&self, hash: usize) -> Pos {
-        let index = hash & self.hash_mask();
-        self.head
-            .as_ref()
-            .get(index)
-            .copied()
-            .map_or(Pos::NIL, Pos::new)
+        let head = self.head.as_ref();
+        // Empty is unreachable -- `new` requires `1 << hash_bits` entries, and `hash_bits`
+        // is at least `MIN_HASH_BITS` -- and answering NIL rather than panicking is this
+        // module's posture everywhere.
+        let Some(mask) = head.len().checked_sub(1) else {
+            return Pos::NIL;
+        };
+        head.get(hash & mask).copied().map_or(Pos::NIL, Pos::new)
     }
 
     /// Sets the head of the hash chain for `hash`, i.e. `s->head[hash] = pos`.
     ///
-    /// `hash` is reduced by [`HashChains::hash_mask`] first, so this cannot fail.
-    #[inline]
+    /// `hash` is reduced by the array's own length-derived mask, for the reason
+    /// [`HashChains::head_at`] gives.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn set_head_at(&mut self, hash: usize, pos: Pos) {
-        let index = hash & self.hash_mask();
-        if let Some(slot) = self.head.as_mut().get_mut(index) {
+        let head = self.head.as_mut();
+        let Some(mask) = head.len().checked_sub(1) else {
+            return;
+        };
+        if let Some(slot) = head.get_mut(hash & mask) {
             *slot = pos.get();
         }
     }
@@ -1260,23 +1279,30 @@ impl<S: AsRef<[u16]> + AsMut<[u16]>> HashChains<S> {
     /// The mask is part of the data structure, not a bounds check: an index into `prev` "is
     /// thus a window index modulo 32K" (`deflate.h` L139-L142), which is how a 64 KiB window
     /// is tracked with a 32 KiB array. Matches `prev[cur_match & wmask]` in `longest_match`
-    /// (`deflate.c` L1525).
+    /// (`deflate.c` L1525). Taken from `prev.len()` for the reason
+    /// [`HashChains::head_at`] gives.
     #[must_use]
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn prev_at(&self, str_index: usize) -> Pos {
-        let index = str_index & self.w_mask();
-        self.prev
-            .as_ref()
-            .get(index)
+        let prev = self.prev.as_ref();
+        let Some(mask) = prev.len().checked_sub(1) else {
+            return Pos::NIL;
+        };
+        prev.get(str_index & mask)
             .copied()
             .map_or(Pos::NIL, Pos::new)
     }
 
     /// Links `str_index` to `pos`, i.e. `s->prev[str & w_mask] = pos`.
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn set_prev_at(&mut self, str_index: usize, pos: Pos) {
-        let index = str_index & self.w_mask();
-        if let Some(slot) = self.prev.as_mut().get_mut(index) {
+        let prev = self.prev.as_mut();
+        let Some(mask) = prev.len().checked_sub(1) else {
+            return;
+        };
+        if let Some(slot) = prev.get_mut(str_index & mask) {
             *slot = pos.get();
         }
     }
@@ -1299,7 +1325,8 @@ impl<S: AsRef<[u16]> + AsMut<[u16]>> HashChains<S> {
     /// Returns [`None`] only when `str_index` does not fit a [`Pos`], which the C cast at
     /// L163 would silently truncate; window offsets stay below `2 * w_size <= 65536`, so a
     /// well-formed stream never reaches it.
-    #[inline]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn insert_string(&mut self, hash: usize, str_index: usize) -> Option<Pos> {
         let pos = Pos::from_index(str_index)?;
         let previous = self.head_at(hash);
@@ -1904,60 +1931,86 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> PendingBuf<S> {
         }
     }
 
-    /// Decodes up to `out.len()` consecutive symbols starting at byte offset `offset`,
-    /// returning how many were written into `out`.
+    /// A forward cursor over the buffered symbols, with the symbol region's bounds
+    /// established **once**.
     ///
-    /// The batched form of [`PendingBuf::symbol_at`], and the shape `compress_block`
-    /// (`trees.c` L900-L951) should use. `symbol_at` establishes the symbol region's bounds
-    /// afresh for every three bytes; this establishes them **once for the whole batch** and
-    /// then walks it with [`slice::chunks_exact`], so the emission loop pays no range work
-    /// per symbol. Each decoded pair is `(distance, length_or_literal)`, with a distance of
-    /// zero marking a literal, exactly as in C (L913-L917).
+    /// This is the shape `compress_block` (`trees.c` L900-L951) uses. Its predecessor
+    /// decoded a fixed batch of symbols into a stack array of `(u16, u8)` pairs before
+    /// emitting any of them, which paid for one range proof per batch with a materialised
+    /// copy of the batch -- 128 bytes of stack zeroed once per block, and every three-byte
+    /// record widened to four bytes and stored before being read straight back. On
+    /// literal-heavy input, where a symbol is emitted for every input byte, that copy is
+    /// pure overhead on the encoder's hottest loop.
     ///
-    /// Reading a batch out before any of it is emitted is not merely allowed, it is safer
-    /// than what C does. The compressed output and the unread symbols share one allocation,
-    /// and `Assert(s->pending < s->lit_bufsize + sx, "pendingBuf overflow")` (L945) is what
-    /// keeps the write cursor behind the read cursor. Copying the batch out first means the
-    /// bytes this batch occupies may be overwritten while the batch is emitted -- which the
-    /// assertion permits -- without any symbol being lost, and the assertion still keeps the
-    /// cursor below `lit_bufsize + offset + 3 * filled`, so the *next* batch is untouched.
+    /// The cursor removes it. [`PendingBuf::symbol_cursor_from`] proves the region
+    /// `sym_buf[offset..sym_next]` lies inside the allocation, and hands back a value
+    /// carrying two integers; [`SymbolCursor::next_symbol`] then reads one packed record
+    /// straight into registers against a bound the cursor already owns. Nothing is
+    /// materialised and nothing is read twice.
     ///
-    /// Stops early at `sym_next`: a partial symbol at the end is not decoded, so the return
-    /// value is always a whole number of symbols and `offset + SYMBOL_BYTES * returned`
-    /// never exceeds `sym_next`.
+    /// # Why a value rather than a borrow
+    ///
+    /// A cursor holding `&[u8]` would be the obvious design and cannot work here: the
+    /// compressed output is appended to this same allocation *while* the symbols are being
+    /// read out of it, so a live shared borrow of the symbol region would forbid the very
+    /// writes emission performs. The cursor therefore holds offsets and is handed the
+    /// buffer again on each read, which is also why it is `Copy`: it is two `usize`s.
+    ///
+    /// Reading a record before emitting it is not merely allowed, it is what C does. The
+    /// compressed output and the unread symbols share one allocation, and
+    /// `Assert(s->pending < s->lit_bufsize + sx, "pendingBuf overflow")` (L945) is what keeps
+    /// the write cursor strictly behind the read cursor -- so the bytes emission may
+    /// overwrite are only ones already consumed.
+    ///
+    /// `offset` is `sx` from `compress_block`. A partial record at the end is not reachable:
+    /// the end is rounded down to a whole number of records, so the cursor stops at or before
+    /// `sym_next`.
+    #[must_use]
     #[inline]
-    pub fn decode_symbols(&self, offset: usize, out: &mut [(u16, u8)]) -> usize {
+    pub fn symbol_cursor_from(&self, offset: usize) -> SymbolCursor {
+        // The one range proof the whole walk pays. Everything after it is arithmetic on two
+        // integers that are known to describe bytes inside `buf`.
         let Some(available) = self.sym_next.checked_sub(offset) else {
-            return 0;
+            return SymbolCursor::EMPTY;
         };
-        let wanted = out.len().min(available / SYMBOL_BYTES);
-        let Some(span) = wanted.checked_mul(SYMBOL_BYTES) else {
-            return 0;
-        };
+        let span = (available / SYMBOL_BYTES) * SYMBOL_BYTES;
         let Some(start) = self.lit_bufsize.checked_add(offset) else {
-            return 0;
+            return SymbolCursor::EMPTY;
         };
         let Some(end) = start.checked_add(span) else {
-            return 0;
+            return SymbolCursor::EMPTY;
         };
-        // The one range check the whole batch pays. `None` is unreachable while `sym_next`
-        // is within `sym_end`, which `push_symbol` and `set_sym_next` both maintain.
-        let Some(bytes) = self.buf.as_ref().get(start..end) else {
-            return 0;
-        };
-
-        let mut filled = 0;
-        for (slot, symbol) in out.iter_mut().zip(bytes.chunks_exact(SYMBOL_BYTES)) {
-            match symbol {
-                [low, high, len_or_lit] => {
-                    *slot = (u16::from_le_bytes([*low, *high]), *len_or_lit);
-                    filled += 1;
-                }
-                // Unreachable: `chunks_exact` yields only full-length chunks.
-                _ => break,
-            }
+        // Unreachable while `sym_next <= sym_end`, which `push_symbol` and `set_sym_next`
+        // both maintain; an empty cursor rather than a panic if it ever is not.
+        if self.buf.as_ref().get(start..end).is_none() {
+            return SymbolCursor::EMPTY;
         }
-        filled
+        SymbolCursor { next: start, end }
+    }
+
+    /// A forward cursor over every buffered symbol, i.e. [`PendingBuf::symbol_cursor_from`]
+    /// at offset zero.
+    #[must_use]
+    #[inline]
+    pub fn symbol_cursor_all(&self) -> SymbolCursor {
+        self.symbol_cursor_from(0)
+    }
+
+    /// One packed symbol record at absolute offset `at` within the allocation.
+    ///
+    /// The primitive behind [`SymbolCursor::next_symbol`], and deliberately the only place
+    /// the three-byte decode of `trees.c` L913-L915 is written. `at` is an offset into the
+    /// whole buffer, not into the symbol region, because the cursor has already added
+    /// `lit_bufsize` once.
+    #[must_use]
+    #[inline]
+    fn record_at(&self, at: usize) -> Option<(u16, u8)> {
+        let end = at.checked_add(SYMBOL_BYTES)?;
+        match self.buf.as_ref().get(at..end)? {
+            [low, high, len_or_lit] => Some((u16::from_le_bytes([*low, *high]), *len_or_lit)),
+            // Unreachable: the range above is exactly `SYMBOL_BYTES` long.
+            _ => None,
+        }
     }
 
     /// The symbol bytes written so far, i.e. `sym_buf[0..sym_next]`.
@@ -1975,8 +2028,10 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> PendingBuf<S> {
             .unwrap_or_default()
     }
 
-    /// A read cursor over [`PendingBuf::symbols`], for walking the buffer three bytes at a
-    /// time as `compress_block` does with `sx` (`trees.c` L913-L948).
+    /// A read cursor over [`PendingBuf::symbols`], for bulk inspection of the symbol bytes.
+    ///
+    /// Not what `compress_block` uses -- that needs a cursor which holds no borrow, because
+    /// emission writes into this same allocation; see [`PendingBuf::symbol_cursor_from`].
     #[must_use]
     #[inline]
     pub fn symbol_cursor(&self) -> WeakSlice<'_, u8> {
@@ -2081,6 +2136,70 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> PendingBuf<S> {
     }
 }
 
+/// A forward cursor over the packed symbol records in a [`PendingBuf`].
+///
+/// Two integers and no borrow, which is what makes it usable from `compress_block`: emission
+/// writes compressed output into the same allocation the records live in, so a cursor holding
+/// `&[u8]` would forbid the writes it exists to serve. [`PendingBuf::symbol_cursor_from`]
+/// establishes that the whole region lies inside the allocation, once, and every
+/// [`SymbolCursor::next_symbol`] afterwards is a compare against `end` and a three-byte read.
+///
+/// `Copy` deliberately: it is cheaper to copy than to reference, and a caller that wants to
+/// re-walk the records from a saved position can just keep a copy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SymbolCursor {
+    /// Absolute offset of the next record within the allocation -- `lit_bufsize` is already
+    /// added in, so this is directly indexable.
+    next: usize,
+    /// One past the last byte of the last whole record the cursor may read.
+    end: usize,
+}
+
+impl SymbolCursor {
+    /// A cursor over nothing, which [`SymbolCursor::next_symbol`] answers [`None`] for
+    /// immediately. Returned instead of panicking when a region cannot be established.
+    const EMPTY: Self = Self { next: 0, end: 0 };
+
+    /// The next `(distance, length_or_literal)` record, or [`None`] at the end of the
+    /// buffered symbols.
+    ///
+    /// The three-byte decode of `trees.c` L913-L915, one record at a time into registers:
+    ///
+    /// ```text
+    /// dist  = s->sym_buf[sx++] & 0xff;
+    /// dist += (unsigned)(s->sym_buf[sx++] & 0xff) << 8;
+    /// lc    = s->sym_buf[sx++];
+    /// ```
+    ///
+    /// A distance of zero means `lc` is a literal, exactly as in C (L916-L917).
+    ///
+    /// `pending` must be the buffer the cursor came from. Handing it a different one cannot
+    /// be unsound -- every read is still bounds checked against that buffer -- but the
+    /// records would be meaningless, so don't.
+    #[inline]
+    pub fn next_symbol<S: AsRef<[u8]> + AsMut<[u8]>>(
+        &mut self,
+        pending: &PendingBuf<S>,
+    ) -> Option<(u16, u8)> {
+        // `end` is a whole number of records past `next`, so "the region is not exhausted"
+        // and "three more bytes are readable" are the same condition -- which is why this is
+        // one compare and not a range check.
+        if self.end.saturating_sub(self.next) < SYMBOL_BYTES {
+            return None;
+        }
+        let record = pending.record_at(self.next)?;
+        self.next = self.next.saturating_add(SYMBOL_BYTES);
+        Some(record)
+    }
+
+    /// How many whole records the cursor has yet to yield.
+    #[must_use]
+    #[inline]
+    pub const fn remaining(&self) -> usize {
+        self.end.saturating_sub(self.next) / SYMBOL_BYTES
+    }
+}
+
 #[cfg(test)]
 // The workspace denies the panic family in library code, which is exactly the point of this
 // module; a test that cannot assert is useless, so the harness opts back in here only.
@@ -2099,7 +2218,6 @@ mod tests {
         MIN_LOOKAHEAD, MIN_MATCH, MIN_WBITS, NIL, SYMBOL_BYTES, WIN_INIT,
     };
 
-    use alloc::vec;
     use alloc::vec::Vec;
 
     /// `w_bits` for the window fixtures: the smallest a deflate stream can have, because
@@ -3080,11 +3198,11 @@ mod tests {
     }
 
     #[test]
-    fn pending_buf_decode_symbols_agrees_with_symbol_at_everywhere() {
-        // The batched decoder is what `compress_block` walks the symbol buffer
-        // with, so it has to be indistinguishable from calling `symbol_at` for
-        // every offset -- including at the partial batch that ends the buffer, and
-        // including past `sym_next`, where it must stop rather than read ahead.
+    fn pending_buf_symbol_cursor_agrees_with_symbol_at_everywhere() {
+        // The cursor is what `compress_block` walks the symbol buffer with, so it has to
+        // be indistinguishable from calling `symbol_at` at every offset -- including from
+        // a mid-buffer start, and including at and past `sym_next`, where it must stop
+        // rather than read ahead into bytes no symbol was written to.
         let mut buffer = garbage_pending();
         let symbols: Vec<(u16, u8)> = (0..37_u8)
             .map(|n| (u16::from(n).wrapping_mul(701), n.wrapping_mul(37)))
@@ -3093,43 +3211,60 @@ mod tests {
             assert_eq!(buffer.push_symbol(dist, len_or_lit), Some(false));
         }
 
-        for capacity in [1_usize, 2, 8, 32, 64] {
-            let mut out = vec![(0_u16, 0_u8); capacity];
-            let mut offset = 0;
-            let mut seen: Vec<(u16, u8)> = Vec::new();
-            while offset < buffer.sym_next() {
-                let filled = buffer.decode_symbols(offset, &mut out);
-                assert!(filled > 0, "capacity {capacity} stalled at {offset}");
-                assert!(filled <= capacity);
-                for (index, symbol) in out.iter().enumerate().take(filled) {
-                    assert_eq!(
-                        *symbol,
-                        buffer.symbol_at(offset + index * SYMBOL_BYTES).unwrap(),
-                        "capacity {capacity}, offset {offset}, index {index}"
-                    );
-                }
-                seen.extend_from_slice(&out[..filled]);
-                offset += filled * SYMBOL_BYTES;
-            }
+        // From the base: every record, in order, and then exhaustion.
+        let mut cursor = buffer.symbol_cursor_all();
+        assert_eq!(cursor.remaining(), symbols.len());
+        let mut seen: Vec<(u16, u8)> = Vec::new();
+        let mut offset = 0;
+        while let Some(record) = cursor.next_symbol(&buffer) {
             assert_eq!(
-                offset,
-                buffer.sym_next(),
-                "every symbol is consumed exactly once"
+                record,
+                buffer.symbol_at(offset).unwrap(),
+                "the cursor and symbol_at disagree at offset {offset}"
             );
-            assert_eq!(seen, symbols, "capacity {capacity}");
+            seen.push(record);
+            offset += SYMBOL_BYTES;
+        }
+        assert_eq!(
+            seen, symbols,
+            "every symbol is yielded exactly once, in order"
+        );
+        assert_eq!(offset, buffer.sym_next(), "and the walk stops at sym_next");
+        assert_eq!(cursor.remaining(), 0);
+        assert_eq!(cursor.next_symbol(&buffer), None, "and stays exhausted");
+
+        // From every possible mid-buffer start, the cursor is the tail of the sequence.
+        for start in 0..symbols.len() {
+            let mut cursor = buffer.symbol_cursor_from(start * SYMBOL_BYTES);
+            assert_eq!(cursor.remaining(), symbols.len() - start);
+            let mut tail: Vec<(u16, u8)> = Vec::new();
+            while let Some(record) = cursor.next_symbol(&buffer) {
+                tail.push(record);
+            }
+            assert_eq!(tail, symbols[start..], "cursor from record {start}");
         }
 
-        // A whole batch of room at the very end yields only the symbols there are.
-        let mut out = [(0_u16, 0_u8); 8];
-        let tail = buffer.sym_next() - SYMBOL_BYTES;
-        assert_eq!(buffer.decode_symbols(tail, &mut out), 1);
-        // At and past `sym_next` there is nothing to decode.
-        assert_eq!(buffer.decode_symbols(buffer.sym_next(), &mut out), 0);
-        assert_eq!(buffer.decode_symbols(usize::MAX, &mut out), 0);
-        // A zero-length destination asks for nothing and gets nothing.
-        assert_eq!(buffer.decode_symbols(0, &mut []), 0);
-    }
+        // The last record alone, then nothing at or past `sym_next`, and nothing from an
+        // offset that would overflow the addition.
+        let mut cursor = buffer.symbol_cursor_from(buffer.sym_next() - SYMBOL_BYTES);
+        assert_eq!(cursor.remaining(), 1);
+        assert_eq!(cursor.next_symbol(&buffer), symbols.last().copied());
+        assert_eq!(cursor.next_symbol(&buffer), None);
+        assert_eq!(buffer.symbol_cursor_from(buffer.sym_next()).remaining(), 0);
+        assert_eq!(buffer.symbol_cursor_from(usize::MAX).remaining(), 0);
 
+        // A partial record at the end is never yielded: with `sym_next` moved to a
+        // non-multiple of three, the cursor rounds down to whole records.
+        let ragged = buffer.sym_next() - 1;
+        let mut clone = garbage_pending();
+        for &(dist, len_or_lit) in &symbols {
+            assert_eq!(clone.push_symbol(dist, len_or_lit), Some(false));
+        }
+        assert_eq!(
+            clone.symbol_cursor_from(ragged % SYMBOL_BYTES).remaining(),
+            36
+        );
+    }
     #[test]
     fn pending_buf_put_short_le_is_all_or_nothing() {
         // The little-endian short is what the bit accumulator spills through, so

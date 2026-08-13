@@ -148,13 +148,20 @@
                            the C oracle is declared.  [lib] name = "z" with
                            crate-type = ["cdylib", "staticlib", "rlib"] makes Cargo
                            emit libz.so and libz.a from one definition of the
-                           exported surface.  csrc/ holds the two C translation
-                           units stable Rust cannot declare: the variadic gzprintf
-                           and gzvprintf, and the codetype prototype of
-                           inflate_table.
+                           exported surface.  csrc/ holds three C translation
+                           units, and only two of them ship: gzprintf_shim.c, the
+                           variadic gzprintf and gzvprintf, and inftrees_shim.c,
+                           the codetype prototype of inflate_table.  Both are archived
+                           into the libz.a rustc emits, because stable Rust can
+                           declare neither.  The third, gzvprintf_probe.c, builds a
+                           va_list and forwards it to gzvprintf, which no Rust
+                           caller can do; it reaches TEST TARGETS ONLY, through
+                           rustc-link-arg-tests, and is never part of the shipped
+                           library.
                            build.rs handles what belongs to the build: it emits the
-                           link arguments, publishes one cfg, compiles those two C
-                           units, and prunes stale artifact aliases.  Packaging is
+                           link arguments, publishes one cfg, compiles those two
+                           shipped C units plus the test-only probe, and prunes
+                           stale artifact aliases.  Packaging is
                            NOT its work and cannot be: a build script runs before
                            the link, so a versioned name it created would dangle.
                            The relink through zlib.map, the SONAME and the symlink
@@ -171,26 +178,39 @@
                            dependency.  Driving two C ABIs does mean it needs
                            unsafe of its own; that is confined to src/oracle.rs
                            and src/port.rs, and every suite under tests/, all
-                           three attached benches and all five fuzz targets that
-                           drive those gates carry forbid(unsafe_code).
+                           five fuzz targets, and the three criterion suites of
+                           the excluded benches package that depends on this crate
+                           by path, all carry forbid(unsafe_code).
 
-    fuzz/                  Dev-only cargo fuzz targets; its own workspace, excluded
-                           from the root one.
-    benches/               Dev-only criterion benchmark suites; its own workspace,
-                           excluded from the root one because criterion's MSRV is
-                           higher than the library's.
+    fuzz/                  Dev-only cargo fuzz targets; its own package and its own
+                           workspace, excluded from the root one.
+    benches/               Dev-only criterion benchmark suites: the package
+                           zlib-rs-benches, with its own Cargo.toml, its own
+                           [workspace] table and its own Cargo.lock, excluded from
+                           the root workspace because criterion's MSRV is higher
+                           than the library's.  It depends on all three crates
+                           above by path, so the benches reach the port and the C
+                           oracle as an ordinary consumer would; nothing is
+                           attached to zlib-rs-differential by a bench entry.  Run
+                           them with cargo bench and manifest-path benches.
 
     Packaging is unaffected on the ELF platforms where the Rust drop-in is staged
     at all, which is where a linker accepts soname and version-script and is
     verified on x86_64-unknown-linux-gnu.  There, both implementations emit the
     same library named by dlname above, install the same two public headers, and
-    export the same ABI under the same zlib.map version script:
-    libz.so.1.3.2.1-motley with SONAME libz.so.1, the libz.so.1 and libz.so
-    symlinks onto it, and libz.a.  A consumer includes zlib.h and dynamically
-    links -lz either way, unrecompiled.  Static linking through the installed
-    zlib.pc is the one case that is not equivalent yet, because a Rust libz.a
-    needs the Rust runtime's target-specific companion libraries and the
-    descriptor advertises none of them; zlib.pc.in states the measurement.
+    export the same ABI under the same zlib.map version script: the real file
+    libz.so.1.3.2.1-motley with SONAME libz.so.1, two symlinks (libz.so.1 and
+    libz.so) pointing DIRECTLY at that file rather than through one another, and
+    libz.a.  A consumer includes zlib.h and dynamically links -lz either way,
+    unrecompiled.  Static linking is equivalent too, and is the one case that
+    needed something added rather than merely reproduced: a Rust libz.a carries the
+    Rust runtime, whose companion libraries an archive cannot record for itself, so
+    the target's set is probed once from rustc and published as the single
+    Libs.private key.  make rust-pc writes that descriptor beside the staged
+    library, asserting every other field is the C one byte for byte, and then
+    compiles, links and runs a C consumer from nothing but the flags pkg-config
+    answers; the CMake path substitutes the same key into zlib.pc and sets it on
+    the exported ZLIB::ZLIBSTATIC target as well.  zlib.pc.in states the reasoning.
 
     Entry points, spelled without the leading dashes their cargo and make options
     need, because an XML comment may not hold two consecutive hyphens.  README and
@@ -216,8 +236,13 @@
       make rust-symbols diff the staged library's exported symbols against a built
                        C library; unlike make rust it fails rather than skips when
                        that library is absent
-      make rust-msrv   build and test the whole workspace on the declared 1.80
-                       floor, with warnings denied
+      make rust-msrv   type check the root workspace on the declared 1.80 floor
+                       with warnings denied: cargo metadata locked, then cargo
+                       check over the workspace and again over the two shipped
+                       crates with all features.  It does not build artifacts and
+                       does not run tests, and the excluded benches and fuzz
+                       workspaces are outside it: benches declares a higher floor
+                       of its own and fuzz needs nightly
       make rust-clean  remove the Cargo target directory and the staged artifacts
       cmake            configure with the ZLIB_BUILD_RUST option for the same
                        drop-in through CMake

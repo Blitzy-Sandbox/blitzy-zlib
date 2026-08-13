@@ -20,18 +20,41 @@ name: OSS-Fuzz
 # PR-only ON PURPOSE -- CIFuzz derives the fuzzers to build and run from the
 # pull-request diff, so broader triggers would leave it nothing to work from.
 on: [pull_request]
+
+# WHY THE TWO CIFUZZ ACTIONS CARRY A COMMIT SHA RATHER THAN `@master`.  A tag or a
+# branch is a mutable pointer: whoever can move it decides what code runs in this
+# job, and CIFuzz runs with the pull request's tree already checked out.  A full
+# commit SHA is immutable, so the action definition this workflow executes is the
+# one that was reviewed here.
+#
+# google/oss-fuzz publishes NO tags and NO releases -- the repository is the
+# infrastructure, continuously deployed -- so there is no version to name in the
+# comment beside the pin, and the SHA below is a master commit with its date.  That
+# is also why refreshing it is a deliberate maintenance step: read
+# https://github.com/google/oss-fuzz/commits/master for what changed under
+# infra/cifuzz/, then update both pins together, because the two actions share the
+# same infra/ tree and a split pin would run two revisions of it.
+#
+# One thing the pin does NOT freeze, and it is worth being precise rather than
+# reassuring: both are Docker actions (`runs.using: docker`) built from
+# infra/build_fuzzers.Dockerfile and infra/run_fuzzers.Dockerfile, which derive from
+# an OSS-Fuzz base image by tag.  Pinning the SHA freezes the action definition and
+# its Dockerfile; the base image that Dockerfile pulls remains upstream-tracked, as
+# it must be for CIFuzz to keep working against the live OSS-Fuzz project.  The pin
+# closes the mutable-source-code hole, not the whole supply chain, and no
+# repository-side setting can close the rest of it.
 jobs:
   Fuzzing:
     runs-on: ubuntu-latest
     steps:
     - name: Build Fuzzers
-      uses: google/oss-fuzz/infra/cifuzz/actions/build_fuzzers@master
+      uses: google/oss-fuzz/infra/cifuzz/actions/build_fuzzers@1671dec36453cdf32bbde283fab9dc005ac2bf2d # master, 2026-08-12
       with:
         oss-fuzz-project-name: 'zlib'
         dry-run: false
 
     - name: Run Fuzzers
-      uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@master
+      uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@1671dec36453cdf32bbde283fab9dc005ac2bf2d # master, 2026-08-12
       with:
         oss-fuzz-project-name: 'zlib'
         # THE BUDGET ANCHOR -- rust.yml's `fuzz` job matches this per target.

@@ -99,6 +99,7 @@ use libz_rs_sys::{
     Z_TREES,
 };
 use zlib_rs_differential::port::{self, GuardedBuf, TrackingAllocator, TrackingReport};
+use zlib_rs_fuzz::reached;
 
 // ---------------------------------------------------------------------------
 //  Bounds -- the anti-hang mechanism
@@ -559,6 +560,35 @@ struct LoopOutcome {
     accounted_out: usize,
     /// Passes actually made.
     iterations: usize,
+    /// The status the LAST `inflate` call returned, or `Z_OK` when the loop's own caps ended
+    /// the run before any call was made.
+    ///
+    /// Recorded for the seed-quality report and for nothing else: no assertion reads it,
+    /// because every status this loop can end on is already checked individually by
+    /// [`assert_inflate_return`]. What it answers is a different question -- did this
+    /// execution decode a whole stream, or did it stop in a refusal? -- which is what makes
+    /// a corpus seed worth committing. See [`zlib_rs_fuzz`].
+    last: c_int,
+}
+
+/// The seed-quality vocabulary for a terminal `inflate` status.
+///
+/// A closed set, because `.github/workflows/rust.yml` matches on it: `stream_end` is the one
+/// value that says this execution decoded a complete stream, and it is what the committed
+/// seeds under `fuzz/seeds/fuzz_inflate/` exist to reach. Everything else names a refusal,
+/// which is a perfectly good thing for a fuzzer to explore and a poor thing for every seed in
+/// a corpus to be.
+fn reached_name(status: c_int) -> &'static str {
+    match status {
+        Z_STREAM_END => "stream_end",
+        Z_OK => "ok",
+        Z_BUF_ERROR => "buf_error",
+        Z_DATA_ERROR => "data_error",
+        Z_NEED_DICT => "need_dict",
+        Z_MEM_ERROR => "mem_error",
+        Z_STREAM_ERROR => "stream_error",
+        _ => "other",
+    }
 }
 
 /// Whether a return value means `inflate` reached its epilogue.
@@ -715,6 +745,7 @@ fn drive(strm: &mut z_stream, params: &Params<'_>, out: &GuardedBuf) -> LoopOutc
         accounted_in: 0,
         accounted_out: 0,
         iterations: 0,
+        last: Z_OK,
     };
 
     // L312-L316: `if (step == 0 || step > have) step = have;` then offer the first chunk.
@@ -758,6 +789,7 @@ fn drive(strm: &mut z_stream, params: &Params<'_>, out: &GuardedBuf) -> LoopOutc
         let call_out = out.capacity().saturating_sub(widen(after_out));
         outcome.consumed += call_in;
         outcome.produced += call_out;
+        outcome.last = ret;
         if reaches_epilogue(ret) {
             outcome.accounted_in += call_in;
             outcome.accounted_out += call_out;
@@ -1203,19 +1235,26 @@ impl HeaderProbe {
     /// ★ Nothing may touch the probe between this call and [`HeaderProbe::verify`]. The
     /// library keeps the header's address and writes through it during `inflate`, so
     /// interposing an access would put a second path on memory it is already using. The
-    /// probe must also not be moved while the stream is live, which is why [`run`] holds it
-    /// in a local it never reassigns. `verify` is unambiguous because by then the stream has
-    /// been ended and the library has let go.
+    /// probe must also not be moved while the stream is live.
+    ///
+    /// That is no longer a comment asking to be believed. `&'r mut self` and
+    /// `&mut Session<'r>` name *one* lifetime, and [`port::Session`] cannot be dropped
+    /// while `'r` is live, so the exclusive loan of this probe provably outlasts the
+    /// stream that holds its address. An access interposed before the session is gone --
+    /// including the `&self` that [`HeaderProbe::verify`] needs -- is a borrow-check
+    /// error rather than a review finding, and moving the probe is impossible for the
+    /// same reason. `verify` is unambiguous because by then the stream has been ended and
+    /// the library has let go.
     ///
     /// Returns `inflateGetHeader`'s status.
-    fn install(&mut self, strm: &mut z_stream) -> c_int {
+    fn install<'r>(&'r mut self, session: &mut port::Session<'r>) -> c_int {
         self.header.extra = self.extra.data();
         self.header.extra_max = self.extra.capacity_uint();
         self.header.name = self.name.data();
         self.header.name_max = self.name.capacity_uint();
         self.header.comment = self.comment.data();
         self.header.comm_max = self.comment.capacity_uint();
-        port::inflate_get_header(strm, &mut self.header)
+        port::inflate_get_header(session, &mut self.header)
     }
 
     /// Checks the guards and the reported fields, after the stream has been ended.
@@ -1359,6 +1398,12 @@ fuzz_target!(|input: InflateInput| {
 /// hands the library a pointer it keeps until the header completes or the stream is reset or
 /// ended, and the allocator's ledger is what `inflateEnd` returns blocks to, so either going
 /// out of scope first would be a use-after-free inside the library.
+///
+/// ★ That order is now *enforced* rather than merely observed. The stream lives inside a
+/// [`port::Session`], and every gate that hands the library an address it keeps -- the
+/// allocator triple and the `gz_header` -- takes the session and the storage under one
+/// lifetime. Reversing two of these declarations no longer produces a latent
+/// use-after-free that only a sanitiser could find; it produces `E0597` at compile time.
 fn run(input: &InflateInput) {
     let params = Params::from_input(input);
 
@@ -1371,9 +1416,9 @@ fn run(input: &InflateInput) {
     // because `inflateInit2_` writes what it needs. Rust does not permit a partly
     // initialised struct, so the gate's fully zeroed stream is the starting point and the
     // three members C really chooses are then installed as the choices they are.
-    let mut stream = port::zeroed_stream();
-    allocator.install(&mut stream);
-    let strm = &mut stream;
+    let mut session = port::Session::new(port::zeroed_stream());
+    allocator.install(&mut session);
+    let strm = &mut session;
 
     // `test/infcover.c` L296: `inflateInit2(&strm, win)`, which is a macro over
     // `inflateInit2_`. `inflateInit2` is not a symbol in either implementation, so the
@@ -1397,6 +1442,16 @@ fn run(input: &InflateInput) {
         // `inflateInit2_` releases whatever it had reserved before returning.
         let report = allocator.finish();
         assert_zone_clean(&report, false);
+        // Reported on THIS path too, and it is the more useful of the two while a seed is
+        // being written: an execution that never got a stream reached nothing at all, and a
+        // corpus of those is precisely the failure the seed gate exists to detect.
+        reached("fuzz_inflate", "init_refused", |fields| {
+            fields
+                .with("windowBits", params.window_bits)
+                .with("payload", params.payload.len())
+                .with("allocLimit", params.alloc_limit)
+                .with("status", init)
+        });
         return;
     }
 
@@ -1429,6 +1484,14 @@ fn run(input: &InflateInput) {
     // `test/infcover.c` L344-L345.
     teardown(strm);
 
+    // ★ Releasing the session is what ends the exclusive loan `HeaderProbe::install` took
+    // out, and therefore what makes the probe readable again. This is not tidiness: with
+    // the session still in scope, `probe.verify()` below is `E0502`, because the borrow
+    // checker knows the library may still be writing through the header pointer. The
+    // sequence "end the stream, drop the session, then read the probe" is the only one
+    // that compiles, and it is the correct one.
+    drop(session);
+
     // Now that the stream is gone the library holds no pointer into the probe, so reading
     // it back is unambiguous.
     if probing_header {
@@ -1439,4 +1502,17 @@ fn run(input: &InflateInput) {
     // clean ledger is the contract and anything else is a defect.
     let report = allocator.finish();
     assert_zone_clean(&report, true);
+
+    // Off unless `ZLIB_RS_FUZZ_REPORT` is set, and then one line naming what this execution
+    // got to. Last, because everything above it is an assertion: a line printed here
+    // describes a run that passed.
+    reached("fuzz_inflate", reached_name(outcome.last), |fields| {
+        fields
+            .with("windowBits", params.window_bits)
+            .with("payload", params.payload.len())
+            .with("dictionary", params.dictionary.len())
+            .with("flush", params.flush)
+            .with("consumed", outcome.consumed)
+            .with("produced", outcome.produced)
+    });
 }

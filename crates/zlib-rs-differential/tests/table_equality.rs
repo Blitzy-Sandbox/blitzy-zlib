@@ -118,10 +118,16 @@
 //!   here is a defect in the port, never in the test: the C array is authoritative.
 //! * **No I/O.** These tables are compiled into the test binary and into the linked archive. This
 //!   file opens no file, reads no environment variable and touches no network.
-//! * **Under neither sanitizer, by design.** Miri interprets Rust MIR and cannot execute the
-//!   compiled C oracle, so the Miri gate is scoped to `-p zlib-rs`; the nightly AddressSanitizer
-//!   gate is scoped to `-p libz-rs-sys` and the relinked C drivers and does not select this crate.
-//!   Both are CI job scopes, not something to work around here.
+//! * **Outside Miri, inside AddressSanitizer.** Miri interprets Rust MIR and cannot execute the
+//!   compiled C oracle at all, so the Miri gate is scoped to `-p zlib-rs` and this suite can never
+//!   run under it. The nightly AddressSanitizer gate DOES run it: `rust.yml`'s `asan` job runs
+//!   `cargo +nightly test -p zlib-rs-differential --target x86_64-unknown-linux-gnu` under
+//!   `-Zsanitizer=address`, with the oracle's C compiled `-fsanitize=address`, and this file is one
+//!   of the three suites that executes there. It is the cheapest of them to instrument and the most
+//!   direct: every comparison below reads a C array through a raw-pointer-derived slice, so a
+//!   mis-declared length would be an out-of-bounds read the sanitizer reports rather than a wrong
+//!   value that happened to compare equal. Both scopes are CI job scopes, not something to work
+//!   around here.
 
 // The workspace lint table denies the panic-prone lints, which is right for library code and wrong
 // for a test: a test asserts, a failed assertion panics, and reading a table by index is clearer

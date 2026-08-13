@@ -13,17 +13,24 @@
 #
 #   * the staged artifacts are named libz.so and libz.a -- the same names the C
 #     targets publish, and that block is ELF-only -- so -lz resolves to either;
-#   * the shared object carries SONAME libz.so.1 and the same
-#     libz.so -> libz.so.1 -> libz.so.1.3.2.1-motley chain, so a program already
-#     linked against libz keeps loading it under the name recorded in its
-#     DT_NEEDED entry.  Cargo does not produce that chain: it writes a bare
-#     libz.so, so CMakeLists.txt relinks cargo's static archive into the
-#     versioned name -- with the same SONAME and the same zlib.map version
-#     script the C shared target receives -- and symlinks the other names beside
-#     it, in a staging directory of its own rather than in cargo's output
-#     directory.  Those files install into the same libdir as the C libraries,
-#     from rules declared last, so where both implementations publish a name the
-#     Rust file is the one installed;
+#   * the shared object carries SONAME libz.so.1, and the names around it are laid
+#     out exactly as the C build lays them out: the real file is
+#     libz.so.1.3.2.1-motley, named from ZLIB_VERSION in zlib.h, and libz.so.1
+#     and libz.so are two symlinks pointing DIRECTLY at it rather than one
+#     resolving through the other.  A program already linked against libz then
+#     keeps loading it under the name recorded in its DT_NEEDED entry.  This
+#     build adds ONE further direct alias, and only when it is a different name:
+#     if project()'s version spells the versioned file differently from the
+#     header's -- libz.so.<PROJECT_VERSION> -- that name is symlinked onto the
+#     same real file too, so an installed ZLIB-shared.cmake naming the C
+#     library's file resolves here as well.  Cargo produces none of this: it
+#     writes a bare libz.so, so CMakeLists.txt relinks cargo's static archive
+#     into the versioned name -- with the same SONAME and the same zlib.map
+#     version script the C shared target receives -- and creates those aliases in
+#     a staging directory of its own rather than in cargo's output directory.
+#     Those files install into the same libdir as the C libraries, from rules
+#     declared last, so where both implementations publish a name the Rust file
+#     is the one installed;
 #   * the exported symbol surface must match the C library's 111 dynamic
 #     globals, being 95 functions plus the 16 symbol-version nodes declared in
 #     zlib.map.  The CMake path takes that keep-list from the ZEXTERN
@@ -98,22 +105,33 @@
 # ends up in the generated descriptor.  Do not expand them by hand and do not drop
 # that keyword.
 #
-# WHAT THAT DOES NOT BUY, because it is easy to over-read.  The prefix itself is
-# NOT relocatable: it is written from the configure-time CMAKE_INSTALL_PREFIX by
-# the substitution below, and CMake does not regenerate this descriptor at install
-# time, so `cmake --install . --prefix /somewhere/else` installs a .pc that still
-# names the configure-time prefix and pkg-config then reports paths that do not
-# exist.  Only the three ${...} derivations move with it.  Two ways to make the
-# whole thing relocatable, neither of which this file can choose for itself:
-# generate the descriptor from an install-time script (install(CODE ...) with
-# configure_file at that point), or write the prefix relative to the descriptor's
-# own location with pkg-config's ${pcfiledir} -- for example
-# `prefix=${pcfiledir}/../..`, which is what a distribution that relocates
-# packages usually wants.  Until one of those is adopted, treat the generated
-# zlib.pc as bound to the prefix it was configured with, and pass the final
-# prefix at configure time rather than at install time.  The
-# configure-generated zlib.pc from zlib.pc.in has the same property, from
-# ./configure's own --prefix.
+# WHERE THE PREFIX COMES FROM, AND WHO CORRECTS IT.  The two prefix lines below are
+# written from the configure-time CMAKE_INSTALL_PREFIX by the substitution, and
+# CMake does not regenerate a configure_file() output at install time.  On its own
+# that made the descriptor non-relocatable: `cmake --install . --prefix
+# /somewhere/else` installed a .pc still naming the configure-time prefix, and
+# `pkg-config --cflags zlib` then answered an include directory that did not exist.
+#
+# CMakeLists.txt now closes that at the only place that knows the answer.  An
+# install(CODE ...) rule declared beside the zlib.pc install rule rewrites the
+# `prefix=` and `exec_prefix=` lines of the INSTALLED copy to the prefix the install
+# actually used, and honours DESTDIR the way CMake's own generated script does: the
+# file is read and written under $ENV{DESTDIR} while the prefix written INTO it is
+# the prefix without DESTDIR, because a staged install is meant to be unpacked at
+# the prefix rather than to advertise the staging directory.  Measured: an
+# alternate-prefix install reports `-- Rewriting prefix in: <alt>/lib/pkgconfig/
+# zlib.pc` and pkg-config then answers -I<alt>/include and -L<alt>/lib, and a
+# DESTDIR install of --prefix /opt/zlibrust writes the file under DESTDIR carrying
+# prefix=/opt/zlibrust.
+#
+# So: the two lines below are a DEFAULT that a correct install overwrites, not a
+# binding. Keep them as plain absolute assignments -- the rewrite matches
+# `(^|\n)prefix=[^\n]*`, so a `${pcfiledir}`-relative form or a line moved out of
+# column 0 would silently stop being corrected.  Only the three ${...} derivations
+# were ever relocatable by themselves, and they still follow whatever prefix line
+# the installed file ends up carrying.  The configure-generated zlib.pc from
+# zlib.pc.in is a separate file with its own prefix, taken from ./configure's
+# --prefix, and is unaffected by any of this.
 #
 # And the substitution pass runs over the whole file, comments included: never
 # write one of the substitutable names in here, because it would be rewritten here

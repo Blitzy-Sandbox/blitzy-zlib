@@ -624,8 +624,8 @@ pub fn inflate_table(
 /// reproduce that if it is told how much was written, because the cursor is
 /// deliberately not advanced on a failure -- and, just as importantly, it must not
 /// write a byte the reference would have left alone. `crates/libz-rs-sys`'s
-/// `_zlib_rs_inflate_table` export is that wrapper, and these two counts are the whole
-/// of what it needs to publish exactly the reference's footprint.
+/// `inflate_table` export is that wrapper, and these two counts are the whole of what
+/// it needs to publish exactly the reference's footprint.
 ///
 /// `touched` is one past the highest index written, counted from the base of `table`
 /// rather than from `*table_index`, so it can be used as a length directly. It is the

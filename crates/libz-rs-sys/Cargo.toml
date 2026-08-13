@@ -13,19 +13,24 @@
 # WHAT CARGO PRODUCES, AND WHY IT IS NOT THE WHOLE DROP-IN.  `cargo build --release -p libz-rs-sys
 # --features libz-compat` produces `target/release/libz.a` and
 # `target/release/libz.so` (SONAME `libz.so.1`).  The ARCHIVE IS COMPLETE: it
-# defines all 95 functions `zlib.h` declares, because `build.rs` compiles this
-# crate's two C translation units -- `csrc/gzprintf_shim.c` for the variadic
-# `gzprintf`/`gzvprintf` and `csrc/inftrees_shim.c` for `inflate_table`'s
-# `codetype` prototype -- and rustc merges the archive they are collected into.
-# Measured: `ar t` lists both objects and `nm` finds all 98 names.
+# defines all 95 functions `zlib.h` declares, because 93 of them are Rust and
+# `build.rs` compiles this crate's one shipped C translation unit --
+# `csrc/gzprintf_shim.c`, for the variadic `gzprintf` and the `va_list`-taking
+# `gzvprintf` -- and rustc merges the archive it is collected into.  Measured:
+# `ar t` lists the one object and `nm` finds all 98 unmangled globals, being those
+# 95 plus the three internal helpers.
 #
 # The cdylib is NOT the shipped shared library, and no argument to cargo can make
 # it one.  rustc attaches its own anonymous version script to every cdylib link,
 # from which everything else follows: `zlib.map` cannot be layered on top (so
-# ZERO of the reference library's 16 version nodes), a symbol the C shims define
-# gets no dynamic entry at all (so no `gzprintf`, no `gzvprintf`), and the
-# `_zlib_rs_*` helpers `zlib.map` hides through `_*` are visible.  Measured: 96
-# dynamic globals, 0 version nodes.
+# ZERO of the reference library's 16 version nodes), and a symbol the C shim
+# defines gets no dynamic entry at all (so no `gzprintf`, no `gzvprintf`).  What
+# does NOT follow is a leak: the three names `zlib.map` hides -- the two
+# `_zlib_rs_gzprintf_*` helpers and `inflate_table` -- would appear in that
+# script's `global:` list, so `src/lib.rs` gives all three `.hidden` and rustc
+# cannot re-export them.  Measured with `nm -D --defined-only --extern-only`
+# on `target/release/libz.so`: 93 dynamic globals, 0 version nodes, being the
+# 95 contract functions less the shim's two and no internal helper at all.
 #
 # So `cargo build --release` yields the installable STATIC library plus a Rust
 # `rlib`, and `make rust` yields the installable SHARED library by relinking that
@@ -216,11 +221,15 @@ default = ["libz-compat", "gz"]
 # 95 unmangled function symbols that make this library ABI-compatible with the C
 # original — those 95 plus zlib.map's 16 symbol-version nodes are the 111 dynamic
 # globals the reference `libz.so.1.3.2.1-motley` publishes, measured with
-# `nm -D --defined-only --extern-only`.  All 96 are implemented and the same
-# command on `target/release/libz.so` now reports 96 `T` symbols, so this feature
-# gates the entire exported surface: `--no-default-features` compiles the crate
-# with none of it.  (96 rather than 95 because `inflate_table` is exported for
-# `test/infcover.c` and is hidden again by `zlib.map` in the packaged library.)
+# `nm -D --defined-only --extern-only`.  All 96 are implemented, and the same
+# command on `target/release/libz.so` reports 93 `T` symbols -- those 95 less
+# `gzopen_w`, which is `_WIN32`-only, and less `gzprintf` and `gzvprintf`, which a C
+# object defines and rustc's own version script therefore cannot re-export.  So this
+# feature gates the entire exported surface: `--no-default-features` compiles the
+# crate with none of it.  (`inflate_table` is exported too, for `test/infcover.c`,
+# and is counted in neither figure: `zlib.map` hides it from the packaged library by
+# name and a `.hidden` directive hides it from the cdylib, while `libz.a` keeps it as
+# an ordinary global, which is exactly what the C build does.)
 # Named exactly as the documented build command requires:
 #   cargo build --release -p libz-rs-sys --features libz-compat
 libz-compat = []
@@ -353,10 +362,13 @@ libc = { version = "0.2.189", optional = true }
 # ============================================================================
 #
 # `build.rs` emits link arguments, prunes stale artifact aliases, publishes one
-# `cfg`, and compiles this crate's own two C translation units.  It reaches the
-# platform compiler through `std::process::Command`, so this manifest needs neither
-# `cc` nor any other build dependency, and a `--no-default-features` or
-# `zlib-rs`-only build needs no C toolchain at all.  Two things follow, and both are
+# `cfg`, and compiles this crate's own two C translation units -- one shipped, one
+# test-only.  It reaches the platform compiler through `std::process::Command`, so this
+# manifest needs neither `cc` nor any other build dependency, and a
+# `--no-default-features`, `libz-compat`-only or `zlib-rs`-only build needs no C
+# toolchain at all: both units belong to the `gz` layer, so an early return skips the
+# compiler entirely without it (measured with `cargo build -vv`: zero `cc`, `as` or `ar`
+# invocations).  Two things follow, and both are
 # deliberate:
 #
 #   * The AAP freezes the dependency inventory and records `cc` as a

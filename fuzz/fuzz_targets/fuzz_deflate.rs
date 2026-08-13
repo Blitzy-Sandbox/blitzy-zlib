@@ -119,6 +119,7 @@ use libz_rs_sys::{
     Z_SYNC_FLUSH, Z_TREES, Z_VERSION_ERROR,
 };
 use zlib_rs_differential::port::{self, TrackingAllocator};
+use zlib_rs_fuzz::reached;
 
 // ---------------------------------------------------------------------------
 //  Termination bounds
@@ -437,6 +438,15 @@ impl RawConfig {
 ///
 /// Used for the boundary band, where every value in the range matters and an even
 /// spread over it is what gets the trap values hit often rather than occasionally.
+/// The seed-quality name for a draw kind. See [`zlib_rs_fuzz`].
+fn kind_name(kind: DrawKind) -> &'static str {
+    match kind {
+        DrawKind::Legal => "legal",
+        DrawKind::Boundary => "boundary",
+        DrawKind::Unrestricted => "unrestricted",
+    }
+}
+
 fn band(drawn: i8, low: c_int, high: c_int) -> c_int {
     let span = high - low + 1;
     low + c_int::from(drawn.unsigned_abs()) % span
@@ -1379,11 +1389,15 @@ fn with_header<R>(input: &FuzzInput, body: impl FnOnce(&mut gz_header) -> R) -> 
 /// decides which is correct. The negative case is worth asserting in its own right:
 /// it is the one that proves a zlib or raw stream cannot be given a gzip header.
 ///
-/// `strm` must hold a state this harness initialised, and `head` must remain live and
-/// unmoved for as long as the stream might read it -- which [`with_header`] arranges,
-/// because `deflate.c` L718 stores the caller's pointer rather than copying anything.
-fn apply_header(strm: &mut z_stream, config: Config, head: &mut gz_header) {
-    let code = port::deflate_set_header(strm, head);
+/// `session` must hold a state this harness initialised, and `head` must remain live and
+/// unmoved for as long as the stream might read it -- which `deflate.c` L718 makes a
+/// requirement rather than a courtesy, since it stores the caller's pointer instead of
+/// copying anything. That is why the header travels as `&'r mut gz_header` against the
+/// session's own retention lifetime: [`port::Session`] then holds the borrow for as long
+/// as the stream is reachable, and [`with_header`]'s frame is checked to outlive it by the
+/// compiler rather than by this comment.
+fn apply_header<'r>(session: &mut port::Session<'r>, config: Config, head: &'r mut gz_header) {
+    let code = port::deflate_set_header(session, head);
     if is_gzip(config) {
         assert_eq!(
             code, Z_OK,
@@ -1681,17 +1695,22 @@ fn bound_contract_pass(strm: &mut z_stream, payload: &[u8], bound: usize, config
 /// `head` must remain live and unmoved for the whole call, which is what the enclosing
 /// [`with_header`] frame guarantees.
 fn run_bound_session(input: &FuzzInput, config: Config, head: &mut gz_header) {
+    // The allocator is declared before the session and the header outlives both: the ledger
+    // behind `opaque` and the `gz_header` are two of the three pointers the library keeps
+    // past the call that installed them, and `port::Session` holds both borrowed for as long
+    // as the stream is reachable. Reversing these two lines does not compile.
     let allocator = TrackingAllocator::with_limit(input.alloc_limit());
-    let mut strm = port::zeroed_stream();
-    allocator.install(&mut strm);
+    let mut session = port::Session::new(port::zeroed_stream());
+    allocator.install(&mut session);
+    let strm = &mut session;
 
-    if !init_stream(&mut strm, config, input.alloc_limit() != 0) {
+    if !init_stream(strm, config, input.alloc_limit() != 0) {
         assert_zone_clean(&allocator, "bound session, initialisation refused");
         return;
     }
 
     if input.wants(OP_BOUND_HEADER) {
-        apply_header(&mut strm, config, head);
+        apply_header(strm, config, head);
     }
     // The exact number of dictionary bytes the stream should now be holding: nothing
     // when no dictionary was offered or it was refused, and otherwise the dictionary
@@ -1700,21 +1719,21 @@ fn run_bound_session(input: &FuzzInput, config: Config, head: &mut gz_header) {
     let mut retained = 0usize;
     if input.wants(OP_BOUND_DICTIONARY) {
         // The stream has had no input, hence `untouched`.
-        let accepted = apply_dictionary(&mut strm, config, input.dictionary(), true);
+        let accepted = apply_dictionary(strm, config, input.dictionary(), true);
         if accepted {
             retained = input.dictionary().len().min(window);
         }
     }
     if input.wants(OP_GET_DICTIONARY) {
         // Nothing has been compressed yet, so the retained length is pinned exactly.
-        check_get_dictionary(&mut strm, window, Some(retained));
+        check_get_dictionary(strm, window, Some(retained));
     }
 
     let payload = input.payload();
 
     // The bound, taken last of all -- after the header and the dictionary, both of
     // which change it.
-    let bound = port::deflate_bound_z(Some(&mut strm), payload.len());
+    let bound = port::deflate_bound_z(Some(strm.stream()), payload.len());
     assert!(
         bound >= payload.len(),
         "deflateBound_z returned {bound} for {} bytes, below the input itself",
@@ -1725,7 +1744,7 @@ fn run_bound_session(input: &FuzzInput, config: Config, head: &mut gz_header) {
     // the output cap would mean allocating more than this target is willing to.
     if bound > MAX_TOTAL_OUTPUT {
         assert_documented(
-            port::deflate_end(&mut strm),
+            port::deflate_end(strm),
             &[Z_OK, Z_DATA_ERROR],
             "deflateEnd after an unexpectedly large bound",
         );
@@ -1733,18 +1752,18 @@ fn run_bound_session(input: &FuzzInput, config: Config, head: &mut gz_header) {
         return;
     }
 
-    let produced = bound_contract_pass(&mut strm, payload, bound, config);
+    let produced = bound_contract_pass(strm, payload, bound, config);
 
-    assert_within_bound(&mut strm, payload.len(), produced, "bound session");
+    assert_within_bound(strm, payload.len(), produced, "bound session");
 
     if input.wants(OP_BOUND_MONOTONIC) {
-        assert_bounds_are_monotonic(&mut strm);
+        assert_bounds_are_monotonic(strm);
     }
 
     // `out` dies with this frame. See `detach_buffers`.
-    detach_buffers(&mut strm);
+    detach_buffers(strm);
 
-    let end = port::deflate_end(&mut strm);
+    let end = port::deflate_end(strm);
     assert_eq!(end, Z_OK, "deflateEnd after a completed single pass");
 
     assert_zone_clean(&allocator, "bound session");
@@ -2022,14 +2041,16 @@ impl Disturbances {
 /// go in before compression starts, and the introspection calls are cheap enough to
 /// make unconditionally.
 ///
-/// `strm` must hold a state this harness initialised and must not yet have been given
-/// input.
-fn apply_pre_compression_ops(
-    strm: &mut z_stream,
+/// `session` must hold a state this harness initialised and must not yet have been given
+/// input. The header travels against the session's retention lifetime for the reason
+/// [`apply_header`] states.
+fn apply_pre_compression_ops<'r>(
+    session: &mut port::Session<'r>,
     input: &FuzzInput,
     config: Config,
-    head: &mut gz_header,
+    head: &'r mut gz_header,
 ) -> Disturbances {
+    let strm = session;
     let mut disturbed = Disturbances::default();
 
     if input.wants(OP_STRESS_HEADER) {
@@ -2117,54 +2138,66 @@ fn apply_mid_compression_ops(
 /// [`Disturbances::bound_still_guaranteed`] decides. What it does assert everywhere
 /// is the return-code discipline, the allocator discipline, and that nothing hangs.
 fn run_stress_session(input: &FuzzInput, config: Config, head: &mut gz_header) {
+    // Allocator before session, header outliving both: see [`run_bound_session`].
     let ceiling = input.alloc_limit();
     let allocator = TrackingAllocator::with_limit(ceiling);
-    let mut strm = port::zeroed_stream();
-    allocator.install(&mut strm);
+    let mut session = port::Session::new(port::zeroed_stream());
+    allocator.install(&mut session);
+    let strm = &mut session;
 
-    if !init_stream(&mut strm, config, ceiling != 0) {
+    if !init_stream(strm, config, ceiling != 0) {
         assert_zone_clean(&allocator, "stress session, initialisation refused");
+        // Reported because a corpus of nothing but refused initialisations is exactly the
+        // failure the seed gate exists to detect. See `zlib_rs_fuzz`.
+        reached("fuzz_deflate", "init_refused", |fields| {
+            fields
+                .with("kind", kind_name(config.kind))
+                .with("level", config.level)
+                .with("windowBits", config.window_bits)
+                .with("memLevel", config.mem_level)
+                .with("allocLimit", ceiling)
+        });
         return;
     }
 
-    let mut disturbed = apply_pre_compression_ops(&mut strm, input, config, head);
+    let mut disturbed = apply_pre_compression_ops(strm, input, config, head);
 
     let payload = input.payload();
 
     // Restarting before the first pass, when selected. Both forms must leave a stream
     // that still compresses, which the pass below then demonstrates.
     if input.wants(OP_RESET) {
-        let code = port::deflate_reset(&mut strm);
+        let code = port::deflate_reset(strm);
         assert_eq!(code, Z_OK, "deflateReset on a live stream");
         disturbed.note(Disturbances::RESTARTED);
     }
     if input.wants(OP_RESET_KEEP) {
-        let code = port::deflate_reset_keep(&mut strm);
+        let code = port::deflate_reset_keep(strm);
         assert_eq!(code, Z_OK, "deflateResetKeep on a live stream");
         disturbed.note(Disturbances::RESTARTED);
     }
 
     // `drive` supplies its own live input and output buffers and gives both loans back.
-    let first = drive(&mut strm, payload, input);
+    let first = drive(strm, payload, input);
 
-    apply_mid_compression_ops(&mut strm, input, first, &mut disturbed);
+    apply_mid_compression_ops(strm, input, first, &mut disturbed);
 
     if first.finished && input.wants(OP_POST_FINISH_FLUSH) && !input.wants(OP_PARAMS) {
         // Only meaningful while the stream is still finished: `deflateParams` above may
         // have driven it, so this is skipped when it ran.
-        check_after_finish(&mut strm);
+        check_after_finish(strm);
     }
 
     if disturbed.bound_still_guaranteed(first) && first.finished {
-        assert_within_bound(&mut strm, payload.len(), first.produced, "stress session");
+        assert_within_bound(strm, payload.len(), first.produced, "stress session");
     }
 
     // A restart after finishing, and a second pass to prove the stream came back. This
     // is the path a caller reusing one stream for many members takes.
     if first.finished && input.wants(OP_RESET) {
-        let code = port::deflate_reset(&mut strm);
+        let code = port::deflate_reset(strm);
         assert_eq!(code, Z_OK, "deflateReset after the stream finished");
-        let second = drive(&mut strm, clamped(payload, 64), input);
+        let second = drive(strm, clamped(payload, 64), input);
         assert!(
             second.produced > 0 || second.finished || payload.is_empty(),
             "a reset stream produced nothing at all"
@@ -2173,13 +2206,13 @@ fn run_stress_session(input: &FuzzInput, config: Config, head: &mut gz_header) {
 
     if input.wants(OP_GET_DICTIONARY) {
         // Compression has moved `strstart` on, so only the inequality is checkable.
-        check_get_dictionary(&mut strm, window_size(config), None);
+        check_get_dictionary(strm, window_size(config), None);
     }
 
     // `Z_DATA_ERROR` is the documented answer for a stream ended while still
     // compressing, which is exactly what happens whenever a cap stopped the driving
     // loop early. The stream is ended exactly once.
-    let end = port::deflate_end(&mut strm);
+    let end = port::deflate_end(strm);
     assert_documented(
         end,
         &[Z_OK, Z_DATA_ERROR],
@@ -2187,6 +2220,28 @@ fn run_stress_session(input: &FuzzInput, config: Config, head: &mut gz_header) {
     );
 
     assert_zone_clean(&allocator, "stress session");
+
+    // Off unless `ZLIB_RS_FUZZ_REPORT` is set. `stream_end` means this execution actually
+    // compressed something to completion, which is what a committed seed has to do; every
+    // other value names a run that stopped short of it.
+    reached(
+        "fuzz_deflate",
+        if first.finished {
+            "stream_end"
+        } else {
+            "not_finished"
+        },
+        |fields| {
+            fields
+                .with("kind", kind_name(config.kind))
+                .with("level", config.level)
+                .with("windowBits", config.window_bits)
+                .with("memLevel", config.mem_level)
+                .with("strategy", config.strategy)
+                .with("payload", payload.len())
+                .with("produced", first.produced)
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------

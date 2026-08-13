@@ -471,13 +471,23 @@ The latest zlib FAQ is at https://zlib.net/zlib_faq.html
     matters because gzgetc() is a macro that reads those three fields from
     inside your own compiled code.
 
-    Two limits on that answer, stated rather than left to be discovered.  The
-    drop-in library is staged only where the linker accepts -soname and
-    --version-script, so Windows, Apple, AIX and SunOS are outside it -- the
-    Rust workspace still compiles and passes its tests on Rust's tier 1
-    targets, but that is a different claim from a packaged, symbol-versioned
-    libz.  And static linking through the installed zlib.pc is not equivalent
-    yet: see the note in question 45.
+    Two limits on that answer, stated rather than left to be discovered.
+    First, the SHARED drop-in is staged only where the linker accepts -soname
+    and --version-script, so Apple, AIX, SunOS and anything not UNIX are
+    outside it; the static library has no such requirement and is supported
+    wherever cargo runs.  Building and testing the Rust workspace is a wider
+    claim than either, and it is made by triple rather than by tier: CI builds
+    it and runs its tests on x86_64-unknown-linux-gnu, aarch64-apple-darwin and
+    x86_64-pc-windows-msvc, compiles it for i686-unknown-linux-gnu and
+    x86_64-pc-windows-gnu to hold the ILP32 and LLP64 integer models, and runs
+    everything deeper -- byte identity, Miri, AddressSanitizer, fuzzing, the
+    relinked C drivers, symbol parity -- on x86_64-unknown-linux-gnu alone.
+    Second, static linking needs the Rust runtime's companion libraries named,
+    which an archive cannot record for itself.  Both package paths now do name
+    them: `make rust-pc' writes a descriptor with the probed Libs.private line
+    and gates it by linking a C consumer from pkg-config's flags alone, and the
+    CMake build substitutes the same set into zlib.pc and onto
+    ZLIB::ZLIBSTATIC.  See question 45 for what a consumer has to do about it.
 
     The data is unchanged as well.  The zlib, deflate and gzip formats are
     exactly as described by RFC 1950, RFC 1951 and RFC 1952, no new format was
@@ -527,12 +537,18 @@ The latest zlib FAQ is at https://zlib.net/zlib_faq.html
     Counted rather than characterised: 1,153 occurrences across nine files
     under crates/libz-rs-sys/src/ when this was last counted, and none anywhere
     else in the shipped library.  crates/zlib-rs has zero, enforced by the
-    compiler rather than by counting.  The counts below are a snapshot; the
-    shape of the claim is what matters, and
+    compiler rather than by counting.  The counts here are a snapshot; the shape
+    of the claim is what matters, and
 
-        grep -rn --include='*.rs' -E 'unsafe *(\{|fn|extern|impl)' crates fuzz benches
+        grep -rn --include='*.rs' -E 'unsafe *(\{|fn|extern|impl)' crates fuzz benches \
+          | grep -vE ':[0-9]+:[[:space:]]*(//|/\*|\*)'
 
-    is how to check it against the tree in front of you.
+    is how to check it against the tree in front of you.  The second stage
+    matters: the pattern matches prose as readily as code, and this tree
+    documents itself heavily, so without it the same command reports about
+    thirty extra hits -- including a few in crates that provably contain none,
+    because a doc comment quoting an unsafe block is a match.  With it, the
+    three figures in this answer sum to exactly what it prints.
 
     Outside the shipped library, unsafe appears in three dev-only places and
     each is unavoidable.  crates/zlib-rs-differential/src/oracle.rs declares
@@ -548,6 +564,8 @@ The latest zlib FAQ is at https://zlib.net/zlib_faq.html
     0.6.1 fixes the facade's unsafe at the six unavoidable C-ABI site
     categories and a test harness is not one of them.
 
-    What the gates buy is measurable: the benchmark suites and all five fuzz
-    targets contain no unsafe at all, and neither does the core or any of its
-    own test suites.
+    What the gates buy is compiler-enforced rather than counted: the three
+    benchmark suites, all five fuzz targets, the differential crate's own three
+    test suites and its build script each carry #![forbid(unsafe_code)], as do
+    the core and every one of its test suites.  Zero there stops being a claim
+    and becomes a build failure if it ever ceases to be true.

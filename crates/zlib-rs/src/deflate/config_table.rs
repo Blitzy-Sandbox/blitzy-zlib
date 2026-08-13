@@ -22,7 +22,8 @@
 //! several valid encodings of a given input an encoder should choose. Those
 //! choices are the reference implementation's own, they are explicitly
 //! non-normative -- "better values may be found" -- and this table is where four
-//! of them live. Together the four numbers of a row decide which candidate
+//! of them live. It is **decision point #1** in the numbering `rust/README.md`
+//! uses, and the one a byte-identity mismatch most often implicates. Together the four numbers of a row decide which candidate
 //! matches `longest_match` examines and which it accepts, and therefore the
 //! literal/length/distance symbols that reach the Huffman coder.
 //!

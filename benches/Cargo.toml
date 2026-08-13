@@ -16,17 +16,22 @@
 #    exactly one dependency graph.
 #
 #    Measured on this tree: criterion 0.8.2 declares `rust-version = "1.86"` and
-#    reaches clap 4.6.5, whose `clap_builder`/`clap_lex` declare
-#    `edition = "2024"`.  Cargo 1.80 cannot parse an edition-2024 manifest at all,
-#    so while these suites were attached to `crates/zlib-rs-differential` -- a
-#    workspace MEMBER -- every command that resolves the workspace dev graph on the
-#    declared floor failed outright:
+#    reaches clap, whose `clap_builder`/`clap_lex` declare `edition = "2024"`.
+#    Cargo 1.80 cannot parse an edition-2024 manifest at all, so while these suites
+#    were attached to `crates/zlib-rs-differential` -- a workspace MEMBER -- every
+#    command that resolves the workspace dev graph on the declared floor failed
+#    outright, naming whichever clap patch release was current:
 #
 #      $ cargo +1.80 metadata --locked
 #      $ cargo +1.80 check --locked --workspace --all-targets
-#      error: failed to download `clap_builder v4.6.5` … requires the Cargo
+#      error: failed to download `clap_builder v4.6.x` … requires the Cargo
 #             feature called `edition2024`, but that feature is not stabilized in
 #             this version of Cargo (1.80.1)
+#
+#    The patch number is deliberately left as `x` here rather than pinned into
+#    prose: clap is transitive to this package's own dev-dependency, the resolved
+#    version lives in the `Cargo.lock` beside this file, and it moves without
+#    anything in this manifest changing.
 #
 #    That is not a cosmetic inconvenience: AAP §0.7.1(h) declares
 #    `rust-version = "1.80"` for this project, and a workspace whose own floor

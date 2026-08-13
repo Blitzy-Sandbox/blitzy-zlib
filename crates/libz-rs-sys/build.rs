@@ -38,14 +38,15 @@
 //      belongs to the packaging step, which runs after the link and stages the
 //      library that can actually satisfy the names.
 //
-//   5. The C ABI shims -- `csrc/gzprintf_shim.c`, which defines the variadic
-//      `gzprintf` and `gzvprintf`, and `csrc/inftrees_shim.c`, which defines
-//      `inflate_table` with `inftrees.h`'s own `codetype` prototype.  Stable Rust
-//      can declare none of the three.  They are COMPILED HERE, with the platform
-//      compiler, and archived so that rustc merges them into the `libz.a` it
-//      produces; `cfg(zlib_rs_gzprintf)` -- and with it `zlibCompileFlags()` bit
-//      27 -- follows from that compile actually happening.  See the long comment
-//      above `build_c_abi_shims`.
+//   5. The C ABI shim -- `csrc/gzprintf_shim.c`, and it is the only one: it defines
+//      the variadic `gzprintf` and the `va_list`-taking `gzvprintf`, which stable
+//      Rust cannot define at all (`c_variadic` and `core::ffi::VaList` are both
+//      unstable; measured E0658 on 1.80.1 and on current stable).  It is COMPILED
+//      HERE, with the platform compiler, and archived so that rustc merges it into
+//      the `libz.a` it produces; `cfg(zlib_rs_gzprintf)` -- and with it
+//      `zlibCompileFlags()` bit 27 -- follows from that compile actually happening.
+//      Everything else in the contract, `inflate_table` included, is defined in
+//      Rust.  See the long comment above `build_c_abi_shims`.
 //
 // WHAT A BARE `cargo build` PRODUCES, STATED PRECISELY
 //
@@ -56,7 +57,7 @@
 // belong to the packaged library that can satisfy them.
 //
 // `libz.a` IS COMPLETE: it defines all 95 functions `zlib.h` declares, plus
-// `inflate_table` as a hidden global, because job 5's objects are merged into it.
+// `inflate_table` as a hidden global, because job 5's object is merged into it.
 // It is the installable static library and it is what `test/infcover.c` links.
 //
 // `libz.so` is NOT the installable shared library, and nothing this script can
@@ -126,9 +127,10 @@
 //     zlib's immutable public contract; this script only ever reads them, and
 //     it fails the build loudly rather than silently proceeding without them.
 //
-//   * It compiles exactly the two C translation units in `csrc/`, and no others.
-//     This crate has no `[build-dependencies]` and must not acquire `cc`: the
-//     platform compiler is invoked directly, so the AAP's frozen dependency
+//   * It compiles exactly one C translation unit in `csrc/` for the shipped
+//     library -- `gzprintf_shim.c` -- plus the test-only `gzvprintf_probe.c`, and no
+//     others.  This crate has no `[build-dependencies]` and must not acquire `cc`:
+//     the platform compiler is invoked directly, so the AAP's frozen dependency
 //     inventory is untouched.  Compiling the C reference implementation is
 //     exclusively the differential crate's job and nothing here goes near it.
 //
@@ -224,17 +226,20 @@ is linked, so after a `cargo check' this note is here and the artifacts it
 describes are not.)
 
   libz.a    IS the installable static library.  It defines all 95 functions
-            zlib.h declares, because build.rs compiles csrc/gzprintf_shim.c and
-            csrc/inftrees_shim.c into it.  test/infcover.c links this file.
+            zlib.h declares -- 93 of them in Rust, and gzprintf and gzvprintf
+            from csrc/gzprintf_shim.c, which build.rs compiles into it because
+            stable Rust cannot define a variadic function.  It also defines
+            inflate_table, in Rust, as a hidden global: test/infcover.c calls
+            that name directly and links this file.
 
   libz.so   is NOT the installable shared library.  rustc attaches its own
             anonymous version script to every cdylib link, so zlib.map cannot be
             layered on: this object carries 0 of the 16 zlib symbol-version
             nodes, does not export gzprintf or gzvprintf (both variadic, so they
             live in the C shim, whose objects a cdylib cannot re-export), and does
-            export three _zlib_rs_* internals that zlib.map hides.  Measured: 96
-            dynamic globals against the C library's 111.  No build-script
-            argument can change any of that.
+            export internals that zlib.map hides -- the two _zlib_rs_gzprintf_*
+            helpers and inflate_table.  Measured: 96 dynamic globals against the
+            C library's 111.  No build-script argument can change any of that.
 
   libz.rlib is a Rust library, for Rust dependents.  It exports no C symbol.
 
@@ -319,38 +324,34 @@ const ENV_VERSION_SCRIPT: &str = "ZLIB_RS_VERSION_SCRIPT";
 // underscores, so the `simd` feature is `CARGO_FEATURE_SIMD`.
 const CARGO_FEATURE_SIMD: &str = "CARGO_FEATURE_SIMD";
 
-// The two features the C shims are gated on, and they are NOT gated identically.
+// The two features the remaining C shim is gated on, and it needs BOTH.
 // `libz-compat` turns the unmangled C symbols on; `gz` compiles the `gzFile` layer.
-// Each shim is compiled exactly when the Rust adapters it calls exist -- see
-// `SHIM_SOURCE_INFTREES` and `SHIM_SOURCE_GZPRINTF` -- because an archive holding an
-// undefined symbol would fail the link of every consumer rather than of the crate
-// that produced it, while an archive MISSING a symbol a supported configuration needs
-// fails the link just as surely.  Both mistakes were made here in turn; the two
-// constants below are what keeps them apart.
+// The shim is compiled exactly when the Rust adapters it calls exist -- see
+// `SHIM_SOURCE_GZPRINTF` -- because an archive holding an undefined symbol would fail
+// the link of every consumer rather than of the crate that produced it, while an
+// archive MISSING a symbol a supported configuration needs fails the link just as
+// surely.  Both mistakes were made here in turn.
+//
+// ★ There used to be a second shim, `csrc/inftrees_shim.c`, gated on `libz-compat`
+// ALONE, because `inflate_table`'s first parameter is the C enum `codetype` and only a
+// C translation unit can restate that prototype.  It is gone: `src/inflate.rs` now
+// defines `inflate_table` directly, taking the plain `int` the enum is passed as and
+// VALIDATING it, so a `--no-default-features --features libz-compat` build compiles no
+// C at all.  What that removed is the C compiler's declaration-compatibility check,
+// whose only subject was a unit that both included `inftrees.h` and defined the
+// function; the consumer that matters -- the unmodified `test/infcover.c` -- includes
+// the header and merely CALLS the symbol, and `make rust-test` compiles and links it,
+// so a C compiler still performs the check where it means something.
 const CARGO_FEATURE_LIBZ_COMPAT: &str = "CARGO_FEATURE_LIBZ_COMPAT";
 const CARGO_FEATURE_GZ: &str = "CARGO_FEATURE_GZ";
 
-// The C translation unit that defines `inflate_table` with `inftrees.h`'s own
-// `codetype` prototype, relative to CARGO_MANIFEST_DIR.
-//
-// ★ GATED ON `libz-compat` ALONE, and that is load-bearing.  It forwards to
-// `_zlib_rs_inflate_table`, which `src/inflate.rs` declares behind `libz-compat` and
-// behind nothing else, so the symbol it needs exists in EVERY `libz-compat` build --
-// including `--no-default-features --features libz-compat`, which is a supported
-// configuration this crate's own manifest documents.  Suppressing this shim whenever
-// `gz` happened to be off left that configuration unable to link at all: the crate's
-// unit test `the_c_prototype_shim_is_linked_and_agrees_with_the_rust_half` names the C
-// `inflate_table` symbol on purpose, so `cargo test -p libz-rs-sys
-// --no-default-features --features libz-compat` failed with `undefined symbol:
-// inflate_table`.  The gate is per shim, never per shim set.
-const SHIM_SOURCE_INFTREES: &str = "csrc/inftrees_shim.c";
-
-// The C translation unit that defines `gzprintf` and `gzvprintf`, relative to
-// CARGO_MANIFEST_DIR.
+// The one C translation unit the shipped library takes, relative to
+// CARGO_MANIFEST_DIR.  It defines `gzprintf` and `gzvprintf`.
 //
 // Gated on `libz-compat` AND `gz`: it calls `_zlib_rs_gzprintf_begin` and
 // `_zlib_rs_gzprintf_commit`, which live behind both, so a build with `gz` off has
-// nothing for it to link against.  A build without the `gzFile` layer is not a
+// nothing for it to link against -- and, since this is the only shipped C source,
+// `--no-default-features --features libz-compat` invokes no C compiler at all.  A build without the `gzFile` layer is not a
 // drop-in libz and is not claimed to be -- `CFG_GZPRINTF` stays unset and
 // `zlibCompileFlags` bit 27 reports the artifact that was actually built.
 const SHIM_SOURCE_GZPRINTF: &str = "csrc/gzprintf_shim.c";
@@ -373,9 +374,11 @@ const SHIM_LIB_NAME: &str = "zlib_rs_cabi";
 
 // `zutil.h` L15-L19 spells `ZLIB_INTERNAL` as `__attribute__((visibility("hidden")))`
 // only when this is defined, and `configure` L962-L963 defines it for both CFLAGS and
-// SFLAGS.  The shims are compiled with it for the same reason the C library is: it is
-// what keeps `inflate_table` out of a shared object's dynamic table, which is the
-// property `zlib.map`'s `local:` block asks for and the one the C build has.
+// SFLAGS.  The shim is compiled with it for the same reason the C library is: so that
+// this port's C flags are the C build's C flags.  It no longer changes any symbol --
+// `gzprintf` and `gzvprintf` are `ZEXPORT`, not `ZLIB_INTERNAL` -- because the one
+// `ZLIB_INTERNAL` definition that used to be compiled here, `inflate_table`, is now
+// Rust, where the same property comes from the `.hidden` directive in `src/lib.rs`.
 const VISIBILITY_DEFINE: &str = "HAVE_HIDDEN";
 
 // The cfg that records "`gzprintf` and `gzvprintf` are compiled into this build".
@@ -394,7 +397,14 @@ const CFG_SIMD: &str = "zlib_rs_simd";
 // The environment variable that names the compiled backend, so a test or a
 // benchmark can assert which implementation it is measuring with `env!` rather
 // than inferring it.  The two values name `zlib_rs::adler32::Adler32Simd` /
-// `zlib_rs::crc32::Simd` and `Adler32Generic` / `Braid` respectively.
+// `zlib_rs::crc32::StrideBraid` and `Adler32Generic` / `Braid` respectively.
+//
+// ★ Note the asymmetry in those names, which is deliberate and is documented at
+// length in the two backend modules: the Adler-32 path really does compile to
+// vector instructions (91 SSE2 instructions on x86_64), while the CRC-32 path
+// compiles to none at all and is therefore called `StrideBraid` rather than
+// `Simd`.  The value of this variable stays `simd`/`scalar` because it names the
+// FEATURE that selected the pair, not either implementation.
 const ENV_BACKEND: &str = "ZLIB_RS_CHECKSUM_BACKEND";
 const BACKEND_SIMD: &str = "simd";
 const BACKEND_SCALAR: &str = "scalar";
@@ -585,19 +595,32 @@ enum SharedObjectFormat {
     // script.  configure L347-L348 (QNX: `-Wl,-hlibz.so.1`).
     ElfDashH,
     // Mach-O: no soname and no version script; the analogue of a soname is
-    // `-install_name`, and the analogue of a version script is an exported
-    // symbols list, which this port does not ship.  configure L362-L367.
+    // `-install_name`, which this branch emits below, and the analogue of a
+    // version script is an exported-symbols list, which is not emitted HERE --
+    // rustc controls the cdylib link, and the artifact that needs the list is the
+    // one staged from the complete archive.  `.github/workflows/rust.yml`'s
+    // `platform-abi-macos` job stages it and passes
+    // `-Wl,-exported_symbols_list` with a list derived from `zlib.h`, then
+    // measures the `-install_name` this branch emits and relinks the three
+    // unmodified C drivers against the result.  configure L362-L367.
     MachO,
     // PE/COFF, MSVC or MinGW.  Neither construct exists.  configure L341-L345
     // uses a plain `-shared` for MinGW.  The PE analogue of zlib.map is a
-    // module-definition file, and `win32/zlib.def` does exist in this tree --
-    // but Windows is OUT OF SCOPE for this port, as the target matrix in
-    // `rust-toolchain.toml` states, so nothing is emitted here and no Windows
-    // build has been attempted or verified.  Should Windows ever be brought in
-    // scope, `win32/zlib.def` is the file to wire up, as `/DEF:` on MSVC.  The
-    // `#[cfg(windows)]` items that already exist in the source (`gzopen_w`, the
-    // `_WIN32` entries in cbindgen.toml's `[defines]`) are forward
-    // compatibility, not a claim that this branch works.
+    // module-definition file, and `win32/zlib.def` does exist in this tree -- but
+    // AAP 0.2.2.3 places it out of scope, so nothing is emitted here and this
+    // port produces no packaged, versioned, export-controlled Windows install.
+    // Should that change, `win32/zlib.def` is the file to wire up, as `/DEF:` on
+    // MSVC.
+    //
+    // What IS verified on that platform, by `platform-abi-windows` in
+    // `.github/workflows/rust.yml`: the DLL cargo produces is read for its export
+    // table, `gzopen_w` is required to be in it, and MSVC compiles a C consumer
+    // and the unmodified `test/minigzip.c` against cargo's import library and
+    // runs them.  So the `#[cfg(windows)]` items in the source (`gzopen_w`, the
+    // `_WIN32` entries in cbindgen.toml's `[defines]`) are exercised rather than
+    // merely present -- while the two names that cannot cross a PE cdylib
+    // boundary, `gzprintf` and `gzvprintf`, are recorded as expected absences by
+    // `.github/scripts/platform_abi_gate.py` rather than passing unnoticed.
     Pe,
     // Everything else: wasm, emscripten, AIX, HP-UX, bare metal.  Emitting an
     // ELF-only argument here would break the link, so nothing is emitted.
@@ -630,31 +653,42 @@ impl TargetInfo {
 }
 
 // ---------------------------------------------------------------------------
-//  5. The C ABI shims -- the two declarations stable Rust cannot express
+//  5. The C ABI shim -- the one pair of declarations stable Rust cannot express
 // ---------------------------------------------------------------------------
 //
-// ★ **This script compiles C, and it has to.** Two of the declarations a drop-in
-// `libz` must define cannot be written in stable Rust at all, and a third must be
-// written with a C type Rust has no spelling for:
+// ★ **This script compiles C, and the reason is exactly two functions wide.**
+// `gzprintf` is variadic (`zlib.h` L1549) and `gzvprintf` takes a `va_list`
+// (`zlib.h` L2047). DEFINING either needs the unstable `c_variadic` feature or
+// `core::ffi::VaList`, and AAP §0.7.1 (h) pins this workspace to stable Rust 1.80 --
+// measured on both ends of that range: `rustc 1.80.1` and current stable each reject
+// `extern "C" fn f(...)` and `use core::ffi::VaList` with E0658. `zlib.h` declares
+// them, AAP §0.1.1.1 Goal 1 requires all 96 declarations, and AAP §0.8.1 directive 12
+// requires the tests that exercise them, so the pair cannot be dropped, cannot be
+// written here, and cannot be moved to the packaging layer without taking
+// `tests/c_api_parity.rs` and `tests/gz_printf.rs` with it -- a `cargo test` links
+// the same archive this script contributes to. `csrc/gzprintf_shim.c` defines both
+// over two hidden Rust helpers, and that TU is the whole of the shipped C surface.
 //
-//   * `gzprintf` is variadic (`zlib.h` L1549) and `gzvprintf` takes a `va_list`
-//     (`zlib.h` L2047). Defining either needs the unstable `c_variadic` feature or
-//     `core::ffi::VaList`, and AAP §0.7.1 (h) pins this workspace to stable Rust
-//     1.80. `csrc/gzprintf_shim.c` defines both over two hidden Rust helpers.
-//   * `inflate_table`'s first parameter is `codetype`, a C enum (`inftrees.h`
-//     L54-L62), and the unmodified `test/infcover.c` compiles a call against that
-//     prototype. A Rust `#[no_mangle]` function cannot present a C enum parameter
-//     without making an out-of-range `int` from a C caller into instant undefined
-//     behaviour, so `csrc/inftrees_shim.c` presents the exact prototype and
-//     forwards to a hidden Rust entry point that validates the value.
+// ★ NOTHING ELSE IN THE CONTRACT NEEDS C, and one entry point that used to be here
+// no longer is. `inflate_table`'s first parameter is `codetype`, a C enum
+// (`inftrees.h` L54-L62) that the unmodified `test/infcover.c` compiles a call
+// against; an earlier revision presented that prototype from a second translation
+// unit, `csrc/inftrees_shim.c`. It does not need one. An enumeration of `0`, `1` and
+// `2` is passed in a 32-bit integer register or stack slot on every target in this
+// port's matrix, exactly as an `int` is, and no translation unit in this tree
+// restates the prototype -- so `src/inflate.rs` defines the name in Rust with a
+// `c_int` parameter that it VALIDATES rather than transmutes, and `infcover.c`
+// resolves it at link time. That halved the shipped C surface and made
+// `--no-default-features --features libz-compat` a build that invokes no C compiler
+// at all.
 //
-// Compiling them here rather than in the packaging layer is what makes ONE
-// artifact story possible: `target/<profile>/libz.a` -- the `staticlib` cargo
-// produces -- then contains every one of the 95 functions `zlib.h` declares, and
-// the packaged shared object is relinked from exactly that archive instead of from
-// an archive plus a separately compiled object. Measured: `ar t` lists both shim
-// objects in `libz.a` and `nm` reports `T gzprintf`, `T gzvprintf` and
-// `T inflate_table` in it.
+// Compiling the remaining unit here rather than in the packaging layer is what makes
+// ONE artifact story possible: `target/<profile>/libz.a` -- the `staticlib` cargo
+// produces -- contains every one of the 95 functions `zlib.h` declares, and the
+// packaged shared object is relinked from exactly that archive instead of from an
+// archive plus a separately compiled object. Measured: `ar t` lists the shim object
+// in `libz.a` and `nm` reports `T gzprintf`, `T gzvprintf` and `T inflate_table`
+// in it.
 //
 // # ★ What the cdylib cargo produces still cannot be, and why
 //
@@ -676,7 +710,10 @@ impl TargetInfo {
 //     ignores it, yielding zero version nodes.
 //
 // A rustc-linked `cdylib` consequently cannot export `gzprintf`/`gzvprintf` and
-// cannot carry the 16 zlib version nodes, whatever this script emits. The
+// cannot carry the 16 zlib version nodes, whatever this script emits. What it CAN be
+// held to is exporting nothing but the contract: the `.hidden` directives in
+// `src/lib.rs` keep this crate's three internal helpers out of its dynamic table, so
+// the cdylib's 93 globals are 93 contract names and nothing else. The
 // installable shared object is therefore produced by ONE documented step from the
 // complete archive -- `Makefile.in`'s `rust` target, or the CMake equivalent --
 // which links it under `zlib.map` with the right SONAME and symlink chain.
@@ -684,8 +721,10 @@ impl TargetInfo {
 //
 // # Requiring a C compiler
 //
-// A C compiler is a hard requirement for a `libz-compat` + `gz` build, and the
-// failure is loud. The alternative -- skipping the shims when no compiler is found
+// A C compiler is a hard requirement for a `libz-compat` + `gz` build -- and for no
+// other configuration, now that `inflate_table` is Rust: `--no-default-features
+// --features libz-compat` returns from `build_c_abi_shims` before naming a compiler.
+// Where it is required the failure is loud. The alternative -- skipping the shim when no compiler is found
 // -- is exactly the silently-incomplete artifact this arrangement exists to remove:
 // a library that links but has no `gzprintf` fails at the *consumer*, long after the
 // build that produced it went green. No new crate dependency is taken to do it
@@ -695,17 +734,46 @@ impl TargetInfo {
 // honours, so a cross-compiling caller configures this one the way it already
 // configures the rest.
 //
-// ★ Note the plan divergence this creates, because it is real and it is small.
-// AAP §0.6.4.1 states that "`cargo build --release` for either shipped artifact
-// never touches a C compiler". That sentence is not literally satisfied: `cc`,
-// `as` and `ar` are invoked here, for these two translation units, whenever
-// `libz-compat` and `gz` are both on -- which is the default. The RULE behind the
-// sentence is satisfied exactly: the 15 retained C translation units of the
+// ★ THE PLAN DIVERGENCE THIS CREATES, STATED IN FULL, because it is real and a
+// reader is entitled to the whole of it.
+//
+// AAP §0.6.4.1 states that "`cargo build --release` for either shipped artifact never
+// touches a C compiler". That sentence is not literally satisfied: `cc`, `as` and `ar`
+// are invoked here, for ONE translation unit, whenever `libz-compat` and `gz` are both
+// on -- which is the default feature set. It was TWO until `inflate_table` moved into
+// Rust and `csrc/inftrees_shim.c` was deleted; the remaining one is irreducible on
+// stable, for the reason set out below.
+//
+// It cannot be satisfied while the rest of the plan is. Three of its requirements meet
+// here and only two of any three can hold at once:
+//
+//   * §0.7.1 (h) pins the workspace to stable Rust 1.80, where defining a variadic
+//     function or naming `core::ffi::VaList` is E0658 (measured on 1.80.1 and on
+//     current stable);
+//   * §0.1.1.1 Goal 1 requires all 96 `ZEXTERN` declarations, `gzprintf` and
+//     `gzvprintf` among them, and §0.6.3.6 requires the 95-function export surface;
+//   * §0.8.1 directive 12 requires the existing test coverage, and both
+//     `tests/c_api_parity.rs` and `tests/gz_printf.rs` call those two entry points
+//     through the archive a `cargo test` links -- so moving the unit to the packaging
+//     layer would remove their coverage rather than relocate it.
+//
+// The alternatives were considered and rejected on merit: nightly violates the MSRV;
+// hand-written `global_asm!` variadic thunks would need one correct per-ABI register
+// save area per Tier-1 target, which is a far larger and less auditable unsafe surface
+// than 300 lines of C that the platform compiler is authoritative about; and dropping
+// the two functions fails Goal 1 and symbol parity outright.
+//
+// So the RULE behind §0.6.4.1 -- reference zlib is an ORACLE and not a build
+// dependency -- is satisfied exactly: the 15 retained C translation units of the
 // reference implementation are compiled by `crates/zlib-rs-differential`'s build
 // script and by nothing else, which `cargo build -vv` confirms for both shipped
-// crates (`-p zlib-rs` invokes no compiler at all). So a C toolchain is a
-// documented hard requirement of a C-ABI facade build rather than an accident, it
-// is named in this crate's manifest, and its absence names itself.
+// crates (`-p zlib-rs` invokes no compiler at all, and `-p libz-rs-sys
+// --no-default-features --features libz-compat` now invokes none either). What
+// remains is a C toolchain as a documented hard requirement of the DEFAULT C-ABI
+// facade build: it is named in this crate's manifest, in `rust/README.md`, in
+// `Makefile.in`'s variable block and here, its scope is one file and two functions,
+// and its absence names itself at once rather than yielding a library that links and
+// then fails at a consumer.
 
 /// Removes the dynamic-library search path from this process, so that every tool
 /// this script spawns resolves `libz` the way the system intends rather than out
@@ -718,7 +786,7 @@ impl TargetInfo {
 /// themselves linked against zlib: `ld.so --list` on `as`, `ar`, `ld`, `objcopy`
 /// and `nm` shows `DT_NEEDED libz.so.1` with no `RPATH` of their own, and `rustc`
 /// reaches it through libLLVM.  This script spawns `cc` (which spawns `as`) and
-/// `ar` to build the two `csrc/` shims.  So without this call, the tools that
+/// `ar` to build the `csrc/` shim and the test-only probe beside it.  So without this call, the tools that
 /// COMPILE the library can load the library -- while it is being built.
 ///
 /// Measured, before job 4 stopped staging a `libz.so.1` alias in that directory:
@@ -776,25 +844,27 @@ fn build_c_abi_shims(repo_root: &Path) {
         println!("cargo::rerun-if-env-changed={key}");
     }
 
-    // `inflate_table` reaches the core through `_zlib_rs_inflate_table`, which lives
-    // behind `libz-compat`; `gzprintf`/`gzvprintf` reach it through
-    // `_zlib_rs_gzprintf_begin` and `_zlib_rs_gzprintf_commit`, which live behind
-    // `libz-compat` AND `gz`.  With `libz-compat` off there is no unmangled C surface
-    // at all and neither shim has anything to link against, so nothing is built --
-    // and nothing is missing either, because such a build is not a C-ABI libz.
+    // `gzprintf`/`gzvprintf` reach the core through `_zlib_rs_gzprintf_begin` and
+    // `_zlib_rs_gzprintf_commit`, which live behind `libz-compat` AND `gz`.  With
+    // `libz-compat` off there is no unmangled C surface at all and the shim has
+    // nothing to link against, so nothing is built -- and nothing is missing either,
+    // because such a build is not a C-ABI libz.
     if env::var_os(CARGO_FEATURE_LIBZ_COMPAT).is_none() {
         return;
     }
 
-    // ★ PER-SHIM, never per shim set.  `csrc/inftrees_shim.c` is required by
-    // `libz-compat` on its own; the two variadic translation units additionally need
-    // `gz`, because both reach the `gzFile` layer.
+    // ★ ONE SHIM, and it needs `gz` as well.  `csrc/gzprintf_shim.c` reaches
+    // `_zlib_rs_gzprintf_begin` and `_zlib_rs_gzprintf_commit`, which live behind
+    // `libz-compat` AND `gz`, so a build without `gz` has nothing for it to link
+    // against -- and, with `inflate_table` now defined in Rust, nothing else to
+    // compile either.  A `--no-default-features --features libz-compat` build
+    // therefore runs no C compiler, no assembler and no archiver at all, which is
+    // what the early return below makes true rather than merely claims.
     let gz = env::var_os(CARGO_FEATURE_GZ).is_some();
-    let mut sources: Vec<&str> = Vec::with_capacity(3);
-    sources.push(SHIM_SOURCE_INFTREES);
-    if gz {
-        sources.push(SHIM_SOURCE_GZPRINTF);
+    if !gz {
+        return;
     }
+    let sources: [&str; 1] = [SHIM_SOURCE_GZPRINTF];
 
     let manifest_dir = PathBuf::from(require_env("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(require_env("OUT_DIR"));
@@ -805,12 +875,13 @@ fn build_c_abi_shims(repo_root: &Path) {
         let source = manifest_dir.join(relative);
         assert!(
             source.is_file(),
-            "the C ABI shim {} is missing. The three translation units define \
-             `gzprintf`, `gzvprintf` and `inflate_table` -- none of which stable Rust \
-             can declare with the prototype the contract fixes, so a library built \
-             without them is not a drop-in libz -- and the caller-side `va_list` probe \
-             that is the only way `gzvprintf` can be exercised at all. Restore the file \
-             from version control.",
+            "the C ABI shim {} is missing. It defines `gzprintf` and `gzvprintf`, \
+             neither of which stable Rust can declare -- a variadic definition needs \
+             the unstable `c_variadic` feature and a `va_list` parameter needs the \
+             unstable `core::ffi::VaList` -- so a library built without it is not a \
+             drop-in libz. The caller-side `va_list` probe beside it is the only way \
+             `gzvprintf` can be exercised at all. Restore the file from version \
+             control.",
             source.display()
         );
         println!("cargo::rerun-if-changed={}", source.display());
@@ -832,8 +903,9 @@ fn build_c_abi_shims(repo_root: &Path) {
     // The probe is a TEST-ONLY translation unit and it is linked as one: `link_test_probe`
     // hands it to the linker through `cargo::rustc-link-arg-tests`, which cargo applies to
     // test targets and to nothing else, so `libz.a`, `libz.so` and the rlib are byte-for-byte
-    // what they would be without it.  It is inside the `gz` arm because the only thing it does
-    // is forward a `va_list` to `gzvprintf`, and that entry point exists only under `gz`;
+    // what they would be without it.  Reaching this line already means `gz` is on -- the
+    // early return above is what establishes it -- and the only thing the probe does is
+    // forward a `va_list` to `gzvprintf`, which exists only under `gz`;
     // `tests/gz_printf.rs` carries the same gate at its root.
     //
     // Now, and only now, may the Rust code claim the two formatting entry points -- and only
@@ -854,10 +926,8 @@ fn build_c_abi_shims(repo_root: &Path) {
     // is documented as a development artifact rather than an installable one, and why
     // `tests/symbol_parity.rs::compile_flags_bit_27_agrees_with_the_shipping_artifacts` checks
     // the bit against the archive and the packaged library instead of trusting this line.
-    if gz {
-        link_test_probe(&manifest_dir, &out_dir, repo_root, msvc, &archive);
-        println!("cargo::rustc-cfg={CFG_GZPRINTF}");
-    }
+    link_test_probe(&manifest_dir, &out_dir, repo_root, msvc, &archive);
+    println!("cargo::rustc-cfg={CFG_GZPRINTF}");
 }
 
 /// Compiles [`TEST_PROBE_SOURCE`] and links it into the crate's TEST TARGETS ONLY.
@@ -909,10 +979,13 @@ fn link_test_probe(
 
 /// Compiles one shim translation unit, returning the object file it produced.
 ///
-/// The include path is the repository root, because both shims include the immutable
+/// The include path is the repository root, because the shim includes the immutable
 /// `zlib.h` (and, through it, `zconf.h`) rather than restating prototypes that could
 /// then drift from the contract. `-DHAVE_HIDDEN` is what makes `zutil.h`'s
-/// `ZLIB_INTERNAL` expand to hidden visibility, matching `configure` L962-L963.
+/// `ZLIB_INTERNAL` expand to hidden visibility, matching `configure` L962-L963; no
+/// symbol in the one remaining shim is `ZLIB_INTERNAL`, so it is passed for exactly
+/// one reason -- the C build passes it, and a shim compiled with different flags from
+/// the library it joins is a difference waiting to matter.
 ///
 /// Position-independent code is not optional: this object is archived into `libz.a`,
 /// and the packaged shared library is relinked from that archive.

@@ -164,13 +164,6 @@ def _missing_summary(text: str) -> str:
     return drop_line(text, "RATIO-SUMMARY group=deflate_steady_state")
 
 
-@case("authoritative overrun on the summary", "exceeded the throughput limit")
-def _summary_over(text: str) -> str:
-    return substitute(
-        text, "RATIO-SUMMARY group=inflate_steady_state", "over=0", "over=3"
-    )
-
-
 @case("a case that stopped being measured", "cases=14 but expected=15")
 def _case_dropped(text: str) -> str:
     return substitute(
@@ -215,6 +208,188 @@ def _memory_bytes(text: str) -> str:
         "port_bytes=138432",
         "port_bytes=999999",
     )
+
+
+@case(
+    "an overlap row that cost the caller an allocation",
+    "must add nothing to the caller's high-water mark",
+)
+def _overlap_allocated(text: str) -> str:
+    """The defect the pairing gate exists for: a caller-sized snapshot, reintroduced.
+
+    `mem1` is the smallest state in the matrix and the fixture is 65 KiB, so an input-sized
+    snapshot would roughly halve into the budget on this row -- 138432 + 66560 against a
+    reference of 138064 is a ratio of 1.48 and would be caught by the ratio check too. The
+    substitution here is deliberately far smaller than that, 1 KiB, so that the ratio stays
+    at 1.011 and *only* the equality check can see it. That is the whole point: an allocation
+    small enough to pass a percentage gate is still an allocation, and it is still on a path
+    whose size the caller chooses.
+    """
+    return substitute(
+        text,
+        "MEMORY group=deflate_memory case=window_boundary.bin-L1-mem1-overlap",
+        "port_bytes=138432",
+        "port_bytes=139456",
+    )
+
+
+@case("an overlap row with no disjoint partner", "no disjoint row")
+def _overlap_orphaned(text: str) -> str:
+    """A row whose baseline is gone cannot show what the overlap added."""
+    return drop_line(
+        text, "MEMORY group=deflate_memory case=window_boundary.bin-L6-mem8 port_bytes"
+    )
+
+
+@case(
+    "a configuration measured only with disjoint buffers",
+    "row, so\nthis configuration",
+)
+def _overlap_missing_partner(text: str) -> str:
+    """One overlap row dropped. Every other check still passes, which is the point."""
+    return drop_line(text, "MEMORY group=deflate_memory case=window_boundary.bin-L9-mem9-overlap")
+
+
+@case(
+    "an overlap balance published under its disjoint partner's name",
+    "no ALLOC-BALANCE line for side",
+)
+def _overlap_balance_misfiled(text: str) -> str:
+    """The defect this actually caught in `deflate_bench.rs`, reproduced as a fixture.
+
+    The suite formatted the `-overlap` suffix inline for the `MEMORY` row but handed the
+    *unsuffixed* case id to its balance reporter, so every overlap case's two `ALLOC-BALANCE`
+    rows were filed under the disjoint case's name. The visible result is what this fixture
+    reproduces: the base case gets four balance rows instead of two, the overlap case gets
+    none, and the row *count* is unchanged -- 36 lines either way -- which is why counting
+    them is not the check. Two independent conditions have to fire: the duplicate-key check,
+    because one side/case pair appeared twice, and the per-case presence check, because a
+    memory case with no balance at all has an unmeasured allocator rather than a clean one.
+
+    Distinct from `_overlap_retired`: there the measurement is gone, here it ran and its
+    evidence was misattributed, which is the harder of the two to notice by reading a log.
+    """
+    lines = []
+    for line in text.split("\n"):
+        if "ALLOC-BALANCE" in line and "-overlap" in line:
+            line = line.replace("-overlap ", " ")
+        lines.append(line)
+    changed = "\n".join(lines)
+    assert changed != text, "the fixture carries no overlap ALLOC-BALANCE line"
+    return changed
+
+
+@case("the overlap measurement retired wholesale", "the bounded overlap stage was never measured")
+def _overlap_retired(text: str) -> str:
+    """Every overlap row dropped at once.
+
+    Checked separately from the single-row case because it is the failure a per-row loop
+    cannot see: with no overlap rows at all there is nothing to iterate over, and a gate that
+    only compared the rows it found would report a clean pass over a measurement that had
+    been deleted.
+    """
+    return drop_line(text, "-overlap")
+
+
+# -------------------------------------------------------------------------------------
+#  The optional `simd` feature's acceptance -- checksum_bench's BACKEND lines
+# -------------------------------------------------------------------------------------
+
+
+@case("a candidate backend slower than the path it displaces", "was SLOWER than")
+def _backend_regressed(text: str) -> str:
+    """The condition the whole acceptance sweep exists for.
+
+    An optional backend that loses to its own baseline at some length is a bet on the
+    caller's input size. The summary's own tally is moved here; `_backend_case_over`
+    below moves a per-case time instead, so both the tally and the recomputation are
+    covered and neither can be the only thing standing between a regression and a pass.
+    """
+    return substitute(text, "BACKEND-SUMMARY family=crc32", "over=0", "over=1")
+
+
+@case("a per-case time that lost to its baseline", "the candidate took")
+def _backend_case_over(text: str) -> str:
+    """One case's candidate time raised past its own published tolerance.
+
+    The summary still says `over=0`, so this is caught only by the gate recomputing the
+    ratio from the two times -- which is the point of recomputing it.
+    """
+    return substitute(
+        text,
+        "BACKEND family=crc32 case=1048576",
+        "candidate_ns=253699.5",
+        "candidate_ns=999999.9",
+    )
+
+
+@case("a candidate that never beat its baseline anywhere", "improvement bar at any length")
+def _backend_no_benefit(text: str) -> str:
+    """A backend that merely matches its baseline.
+
+    ★ This is the case the "never slower" condition alone would certify. `best=0.99` passes
+    every per-case check -- nothing is slower than anything -- and still describes a second
+    code path, behind a feature flag, that buys nothing. A feature has to earn the
+    compile-time cost it adds.
+    """
+    return substitute(text, "BACKEND-SUMMARY family=adler32", "best=0.355", "best=0.990")
+
+
+@case("an acceptance limit raised above 1.00", "the acceptance limit is 1.00")
+def _backend_limit_raised(text: str) -> str:
+    return substitute(text, "BACKEND-SUMMARY family=crc32", "limit=1.00", "limit=1.50")
+
+
+@case("a benefit bar lowered below the AAP's 10%", "but the bar is 0.90")
+def _backend_benefit_lowered(text: str) -> str:
+    return substitute(text, "BACKEND-SUMMARY family=adler32", "benefit=0.90", "benefit=0.99")
+
+
+@case("a case tolerance widened past the ceiling", "exceeds the ceiling of 0.10")
+def _backend_tolerance_widened(text: str) -> str:
+    """The loophole a self-measured tolerance would otherwise open.
+
+    The suite derives each case's allowance from its own null measurement, which is better
+    evidence than a constant -- but a suite that published a large one could pass anything,
+    so the gate refuses any allowance above the same ceiling the suite itself applies.
+    """
+    return substitute(
+        text,
+        "BACKEND family=adler32 case=1048576",
+        "tolerance=0.0137",
+        "tolerance=0.5000",
+    )
+
+
+@case("a length that vanished without being reported", "was skipped for a reason")
+def _backend_case_vanished(text: str) -> str:
+    """`cases + unmeasured == expected` is an exact identity, and this breaks it.
+
+    A length may produce a ratio or be refused as unmeasurable, and either way it is
+    counted. One that disappears for a third reason -- a backend that disagreed with the C
+    oracle, which the suite reports separately and never times -- shows up only here.
+    """
+    return substitute(text, "BACKEND-SUMMARY family=adler32", "cases=8", "cases=7")
+
+
+@case("a run too noisy to conclude anything", "below the floor of 4")
+def _backend_inconclusive(text: str) -> str:
+    """`over=0` from a machine that could measure almost nothing is not a pass.
+
+    Two cases measured and seven refused is an inconclusive run. Without the floor the
+    gate would read its `over=0` as a clean bill of health for a comparison that never
+    happened.
+    """
+    text = substitute(
+        text, "BACKEND-SUMMARY family=crc32", "cases=6 over=0 unmeasured=3", "cases=2 over=0 unmeasured=7"
+    )
+    return drop_line(text, "BACKEND family=crc32 case=1")
+
+
+@case("a backend family that stopped reporting", "no BACKEND-SUMMARY line for family")
+def _backend_family_retired(text: str) -> str:
+    """The failure a loop over the families present cannot see."""
+    return drop_line(text, "BACKEND-SUMMARY family=adler32")
 
 
 @case("a truncated log", "the log is incomplete")
@@ -268,12 +443,59 @@ def _tier_mismatch(text: str) -> str:
 
 @case("levels 1, 6 and 9 not all gated", "no gated case was decided at compression level(s)")
 def _missing_level(text: str) -> str:
+    """The level requirement, on the suite whose gate quantity HAS a level.
+
+    Deliberately ``deflate``: AAP 0.8.4's three levels qualify compression throughput, so
+    that is where the requirement belongs and where it is still fatal.  The companion
+    positive case in :func:`main` proves the same requirement is not applied to
+    ``inflate_silesia``, which measures one level by construction.
+    """
     out = []
     for line in text.split("\n"):
-        if "RATIO group=inflate_steady_state" in line and "-L9 " in line:
+        if "RATIO group=deflate_steady_state" in line and "-L9 " in line:
             line = line.replace("gate=counted", "gate=informational")
         out.append(line)
     return "\n".join(out)
+
+
+@case("a self-timed pass that was not order-alternating", "This ratio\nwas not produced by a paired")
+def _fixed_order(text: str) -> str:
+    return substitute(
+        text,
+        "RATIO group=deflate_steady_state case=random.bin-L6",
+        "order=alternating",
+        "order=port-first",
+    )
+
+
+@case("too few paired rounds", "below the 9 paired\nrounds")
+def _too_few_rounds(text: str) -> str:
+    return substitute(
+        text,
+        "RATIO group=inflate_steady_state case=random.bin-L6",
+        "rounds=9",
+        "rounds=3",
+    )
+
+
+@case("a ratio that is not its own quotient", "is not port_ns/oracle_ns")
+def _inconsistent_ratio(text: str) -> str:
+    return substitute(
+        text,
+        "RATIO group=deflate_steady_state case=window_boundary.bin-L6",
+        "ratio=0.950",
+        "ratio=0.500",
+    )
+
+
+@case("criterion rows registered in a fixed order", "registration='port-first'")
+def _fixed_registration(text: str) -> str:
+    return substitute(
+        text,
+        "CRITERION root=",
+        "registration=alternating",
+        "registration=port-first",
+    )
 
 
 @case("a required corpus that did not load", "the Silesia corpus was required but reports")
@@ -335,14 +557,33 @@ def arm_tier_two(text: str) -> str:
         elif ": RATIO-SUMMARY group=" in line and "_silesia " in line:
             suite = line.split(":", 1)[0]
             group = f"{suite.split('_')[0]}_silesia"
+            # ★ EACH SUITE'S REAL SCHEMA, not one shape for both, because the two
+            # differ and the difference used to make an armed run unpassable.
+            # `deflate_silesia` sweeps the three gate levels over a member;
+            # `inflate_silesia` decodes each member at the ONE default level, so its
+            # ids are `<member>-L6` and there is no L1 or L9 for a gate to demand.
+            # An armed run of this exact shape must PASS.
+            if group.startswith("deflate"):
+                cases = [
+                    ("dickens-L1", 10192446, 4200000.0),
+                    ("dickens-L6", 10192446, 9100000.0),
+                    ("dickens-L9", 10192446, 21000000.0),
+                ]
+            else:
+                cases = [
+                    ("dickens-L6", 10192446, 31000000.0),
+                    ("mozilla-L6", 51220480, 152000000.0),
+                    ("webster-L6", 41458703, 121000000.0),
+                ]
             out.append(
                 f"{suite}: RATIO-SUMMARY group={group} gate=authoritative expected=3 "
                 f"cases=3 gated=3 over=0 informational=0 limit=1.10"
             )
-            for level, oracle in (("L1", 4200000.0), ("L6", 9100000.0), ("L9", 21000000.0)):
+            for case_id, size, oracle in cases:
                 out.append(
-                    f"{suite}: RATIO group={group} case=dickens-{level} bytes=10192446 "
+                    f"{suite}: RATIO group={group} case={case_id} bytes={size} "
                     f"port_ns={oracle * 0.94:.1f} oracle_ns={oracle:.1f} ratio=0.940 "
+                    f"ratio_hi=1.053 rounds=9 order=alternating "
                     f"limit=1.10 gate=counted verdict=within"
                 )
             continue
@@ -436,6 +677,42 @@ def main() -> int:
         ok = status == 1 and "expected=0" in output
         outcomes.append(
             (ok, "an armed run whose tier-2 group measured nothing", "" if ok else output)
+        )
+
+        # ---- A diagnostic overrun that criterion contradicts --------------------
+        # The property this proves is the authority model the CRITERION line declares:
+        # `self_timed=diagnostic authority=criterion`.  An authoritative group whose
+        # self-timed pass reports cases over the limit -- which a bounded nine-round
+        # probe on a loaded machine does routinely -- must WARN and let criterion decide,
+        # and criterion here says every case is inside the limit.  Before this, the
+        # diagnostic failed the build before criterion was consulted at all.
+        diagnostic = os.path.join(workspace, "diagnostic-over.log")
+        over_text = substitute(
+            substitute(
+                fixture,
+                "RATIO-SUMMARY group=deflate_steady_state",
+                "over=0",
+                "over=2",
+            ),
+            "RATIO group=deflate_steady_state case=random.bin-L6",
+            "verdict=within",
+            "verdict=over",
+        )
+        with open(diagnostic, "w", encoding="utf-8") as handle:
+            handle.write(over_text)
+        status, output = run_gate(diagnostic, root)
+        ok = (
+            status == 0
+            and "benchmark regression: PASS" in output
+            and "self-timed diagnostic" in output
+            and "::error::" not in output
+        )
+        outcomes.append(
+            (
+                ok,
+                "a diagnostic overrun warns while criterion passes the run",
+                "" if ok else output,
+            )
         )
 
         # ---- A perturbed criterion estimate, with the log left alone ------------

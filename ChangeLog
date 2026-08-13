@@ -3,20 +3,41 @@
 
 Changes in 1.3.2.1 (xx Feb 2026)
 - Reimplement the compression and decompression engine in safe Rust
-- Add a Cargo workspace at the repository root: crates/zlib-rs is the core
-- Add crates/libz-rs-sys, the C ABI layer that builds libz.so and libz.a
+- Add a Cargo workspace at the repository root: crates/zlib-rs is the core,
+  compiled under #![forbid(unsafe_code)]
+- Add crates/libz-rs-sys, the C ABI layer that builds libz.so and libz.a, and
+  the only shipped crate permitted unsafe
 - Add crates/zlib-rs-differential, a dev-only harness holding the C oracle
-- Preserve the API, ABI, struct layouts, symbol versions and wire format
+- Preserve the API, ABI, struct layouts, symbol versions and wire format:
+  the exported surface, the z_stream and gz_header layouts, the gzFile_s
+  prefix gzgetc() reads, the SONAME and zlib.map's 16 version nodes
 - Leave zlib.h, zconf.h and zlib.map unchanged; they are consumed, not edited
-- Link existing programs against the Rust library without recompiling
-- Emit compressed output byte-identical to the C implementation
+- Link existing programs against the Rust library without recompiling.
+  Measured on x86_64-unknown-linux-gnu, where the drop-in is staged, the
+  symbols are diffed against a built C library and the unmodified
+  test/example.c, test/minigzip.c and test/infcover.c are relinked and run
+- Emit compressed output byte-identical to the C implementation, gated by a
+  differential matrix run against the in-tree sources over the committed
+  corpus
 - Keep the C sources unmodified in the tree as the differential oracle
-- Add optional SIMD CRC-32 and Adler-32 backends that emit the same bytes
-- Verify the port with cargo-fuzz targets, Miri and AddressSanitizer
-- Add rust, rust-pc, rust-test, rust-symbols, rust-header, rust-msrv and
-  rust-clean make targets, cargo detection in configure, and a CMake
-  ZLIB_BUILD_RUST option that installs the C build's names and symlink chain
-- Add .github/workflows/rust.yml to gate the port in CI
+- Add two optional checksum backends behind one feature, off by default, both
+  of which emit the same checksums as the portable paths: a vectorized
+  Adler-32, and a CRC-32 that is scalar stride-braid rather than vector code
+- Gate the port with cargo-fuzz targets, Miri over the safe core and
+  AddressSanitizer over the C ABI layer, the C drivers and the oracle harness
+- Add the rust make target, staging the drop-in libz.so chain and libz.a
+- Add the rust-test make target, running the unmodified C drivers on it
+- Add the rust-symbols make target, diffing the exported ABI against C zlib
+- Add the rust-pc make target, gating the pkg-config descriptor by a consumer
+- Add the rust-header make target, regenerating and gating the C header
+- Add the rust-msrv make target, checking the crates on the 1.80 floor
+- Add the rust-clean make target, removing what the Rust targets produced
+- Detect cargo in configure, leaving the C build unaffected when it is absent
+- Add a CMake ZLIB_BUILD_RUST option installing the C build's names, SONAME
+  and symlink layout; its shared mode needs an ELF linker, its static mode
+  does not
+- Add .github/workflows/rust.yml, where every gate above is defined, and
+  extend the existing workflows around the retained C library
 
 Changes in 1.3.2 (17 Feb 2026)
 - Continued rewrite of CMake build [Vollstrecker]
@@ -475,7 +496,8 @@ Changes in 1.2.5.1 (10 Sep 2011)
 - Add dummy name before $(SHAREDLIBV) in Makefile [Bar-Lev, Bowler]
 - Delete line in configure that adds -L. libz.a to LDFLAGS [Weigelt]
 - Add debug records in assembler code [Londer]
-- Update RFC references to use http://tools.ietf.org/html/... [Li]
+- Update RFC references to use the IETF tools URLs, since moved to
+  datatracker.ietf.org [Li]
 - Add --archs option, use of libtool to configure for Mac OS X [Borstel]
 
 Changes in 1.2.5 (19 Apr 2010)
@@ -770,7 +792,7 @@ Changes in 1.2.3.2 (3 September 2006)
 - Rig configure --shared to build both shared and static [Teredesai, Truta]
 - Remove zconf.in.h and instead create a new zlibdefs.h file
 - Fix contrib/minizip/unzip.c non-encrypted after encrypted [Vollant]
-- Add treebuild.xml (see http://treebuild.metux.de/) [Weigelt]
+- Add treebuild.xml (see treebuild.metux.de, no longer reachable) [Weigelt]
 
 Changes in 1.2.3.1 (16 August 2006)
 - Add watcom directory with OpenWatcom make files [Daniel]

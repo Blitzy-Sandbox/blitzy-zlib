@@ -1,8 +1,23 @@
-//! Portable high-throughput CRC-32 backend.
+//! Portable high-throughput CRC-32 backend: braided residues with a stride-`W` epilogue.
 //!
 //! This module is the optional, output-neutral checksum optimization enabled by the
 //! `simd` feature. It reformulates the braided section of `crc32_z` (`crc32.c`
 //! L637-L920); it does not define a different checksum.
+//!
+//! # ★ This is not SIMD, and the backend is no longer named as though it were
+//!
+//! The file is `simd.rs` and the Cargo feature is `simd` because AAP §0.3.1 fixes this path in the
+//! target layout and §0.5.1.4 fixes the feature name; neither is renamed. **Everything else was.**
+//! The backend type is [`StrideBraid`], its [`Crc32Backend::NAME`] is `"stride-braid"`, and the
+//! entry point is [`crc32_stride_braid`] -- because a review of the compiled `x86_64` release
+//! library found this code's body to contain **zero** vector instructions, and it was previously
+//! called `Simd` / `"simd"` / `crc32_simd`. It is 487 instructions of `mov`, `xor`, `shr` and
+//! `movzbl`: portable integer work that exposes instruction-level parallelism and that LLVM may or
+//! may not autovectorize on a given target. The sibling `adler32/simd.rs` is genuinely different --
+//! its body compiles to 91 SSE2 instructions (`paddd`, `pshufd`, `punpck*`) on the same host -- and
+//! conflating the two is what the old name did.
+//!
+//! The next section says why real vector code is not reachable from here at all.
 //!
 //! # Why the implementation is portable integer code
 //!
@@ -46,14 +61,70 @@
 //! The S390X path in `contrib/crc32vx/` and the `ARMCRC32` assembly path at `crc32.c` L498-L599
 //! are outside this port's scope. Omitting either can cost throughput only, never correctness.
 //!
-//! # Throughput claims
+//! # Throughput: measured, and enforced
 //!
-//! The design intent is that this backend beats `braid.rs` above its delegation threshold. That
-//! is intent, not a result: no measurement is committed in this repository, and a claim about
-//! throughput belongs to a run rather than to a comment. `benches/checksum_bench.rs` is where the
-//! comparison belongs, and it compares the scalar and vectorised backends against each other and
-//! against the C oracle. If this turns out not to win, the honest resolution is to simplify or
-//! remove this optimization, never to weaken bit-for-bit equality.
+//! This backend beats `braid.rs` at every length measured, and that is now a result rather than an
+//! intent. `benches/checksum_bench.rs` carries the measurement as an enforced acceptance sweep --
+//! `crc32_acceptance`, seven lengths from 16 bytes to 1 MiB, each a median of nine paired
+//! order-alternating rounds against `braid` -- and `.github/scripts/bench_gate.py` fails the bench
+//! job on two conditions: the candidate may not be slower than `braid` at *any* measured length,
+//! and it must be at least 10% faster at one of them. The second condition exists because a
+//! backend that merely forwarded to `braid` would satisfy the first one perfectly.
+//!
+//! Measured on `x86_64-unknown-linux-gnu`, `--release --features simd`, as
+//! `candidate_ns / baseline_ns`. **One run of record** -- `crc32_acceptance` reporting
+//! `expected=9 cases=6 over=0 unmeasured=3 best=0.235` -- and the same run the top-level `README`
+//! and `rust/README.md` quote, so the three documents cannot drift apart:
+//!
+//! | bytes | `braid` | this backend | ratio |
+//! |------:|--------:|-------------:|------:|
+//! | 16 | n/a | n/a | *unmeasured* |
+//! | 32 | n/a | n/a | *unmeasured* |
+//! | 48 | n/a | n/a | *unmeasured* |
+//! | 55 | 91.7 ns | 28.3 ns | 0.309 |
+//! | 64 | 114.7 ns | 27.0 ns | 0.235 |
+//! | 256 | 158.2 ns | 72.2 ns | 0.456 |
+//! | 4096 | 1.08 us | 0.98 us | 0.901 |
+//! | 65536 | 16.2 us | 15.6 us | 0.966 |
+//! | 1048576 | 257 us | 254 us | 0.986 |
+//!
+//! ★ The three *unmeasured* rows are neither omissions nor failures, and reading them as either
+//! would be the wrong lesson. Below [`MIN_STRIDE_LEN`] -- 55 bytes -- [`crc32_stride_braid`]
+//! delegates to `crc32_braid`, so at 16, 32 and 48 bytes both sides run *identical code* and the
+//! true ratio is 1.000 by construction. The sampler establishes that rather than assuming it: each
+//! round times the baseline **twice**, on either side of the candidate so the two do not share a
+//! warm cache, and the spread between those two identical runs is the tolerance. Where that null
+//! spread exceeds 10% the case is reported `unmeasured` instead of being given a ratio it cannot
+//! support, and on the shared host these figures come from everything under roughly 65 ns lands
+//! there. That is also why `bench_gate.py` checks `cases + unmeasured == expected` and requires a
+//! floor of measured cases: an `over=0` from a machine that measured almost nothing is an
+//! inconclusive run, not a pass.
+//!
+//! The shape is the design: the win is largest between 55 and 256 bytes, where `braid`'s serial
+//! epilogue -- up to `N * W - 1` byte steps -- is most of the work and the stride-`W` transform
+//! replaces it with at most `W - 1`. Past 4 KiB the braided body dominates and the two converge,
+//! which is the honest expectation for two formulations that fold the same table over the same
+//! words. Those are also the lengths a `gzread` or an `inflate` call actually checksums, so the
+//! region where this backend wins is the region that matters.
+//!
+//! ★ Two things had to be got right for the long-length figures to land where they are, and both
+//! were found by measuring rather than by reading:
+//!
+//! * [`fold_braided_body`] is deliberately **not** `#[inline]`. It was, and the effect was to
+//!   inline a 487-instruction loop nest into `crc32()`, which produced one 0x6ef-byte function
+//!   whose register pressure cost 5-22% against `braid` at 4 KiB and above -- the backend was
+//!   *slower* than the path it replaced on exactly the inputs where throughput is measured. Left
+//!   out of line it is its own 0x5a5-byte leaf and `crc32()` is 0x151 bytes, matching how
+//!   `braid.rs` keeps `fold_blocks_little_endian` separate. Do not add the attribute back.
+//! * [`table_step`] folds each row with `row.get(i).copied().unwrap_or(0)` rather than
+//!   `if let Some(&entry) = row.get(i) { next ^= entry }`. The two are equivalent -- the index is a
+//!   byte and the row has 256 entries, so the lookup cannot fail -- but the first compiles to an
+//!   unconditional exclusive-or and the second to a branch the optimizer has to prove away,
+//!   which it did not always do.
+//!
+//! If a future change makes this backend lose to `braid` anywhere, the acceptance sweep fails and
+//! the honest resolutions are to fix the regression or to remove the optimization. Weakening
+//! bit-for-bit equality is never one of them.
 
 // There is deliberately no `#![cfg(feature = "simd")]` here.  `crc32/mod.rs` already declares this
 // module as `#[cfg(feature = "simd")] mod simd;`, so restating the condition inside the file
@@ -95,7 +166,7 @@ const BRAID_MIN_LEN: usize = CHUNK + W - 1;
 /// The alignment prefix consumes at most `W - 1` bytes. Starting with
 /// `CHUNK + 2 * W - 1` therefore leaves one full braided chunk and at least one full
 /// `W`-byte tail word. Shorter inputs retain the already tuned `crc32_braid` path.
-const MIN_SIMD_LEN: usize = CHUNK + 2 * W - 1;
+const MIN_STRIDE_LEN: usize = CHUNK + 2 * W - 1;
 
 /// Polynomial representation of one in zlib's reflected modular arithmetic.
 const X_POW_0: u32 = 1 << 31;
@@ -204,7 +275,7 @@ const _: () = assert!(N == 5);
 const _: () = assert!(STREAMS == N);
 const _: () = assert!(W == size_of::<Word>());
 const _: () = assert!(CHUNK == N * W);
-const _: () = assert!(CHUNK + W - 1 < MIN_SIMD_LEN);
+const _: () = assert!(CHUNK + W - 1 < MIN_STRIDE_LEN);
 
 /// Widen a CRC residue to the machine word used by the braid.
 #[inline]
@@ -223,9 +294,7 @@ fn table_step(table: &[[u32; TABLE_LEN]; W], crc: u32, word: Word) -> u32 {
     let mut next = 0;
 
     for (row, &byte) in table.iter().zip(bytes.iter()) {
-        if let Some(&entry) = row.get(usize::from(byte)) {
-            next ^= entry;
-        }
+        next ^= row.get(usize::from(byte)).copied().unwrap_or(0);
     }
 
     next
@@ -238,7 +307,6 @@ fn table_step(table: &[[u32; TABLE_LEN]; W], crc: u32, word: Word) -> u32 {
 /// is linear over `GF(2)`, so applying the stride-`W` transform to
 /// `braid ^ word ^ folded` is identical to zlib's serial `crc_word` transform: both advance
 /// the same polynomial by one machine word before combining the next stream with XOR.
-#[inline]
 fn fold_braided_body(crc: u32, body: &[u8]) -> Option<u32> {
     if body.len() < CHUNK || body.len() % CHUNK != 0 {
         return None;
@@ -298,7 +366,7 @@ fn fold_tail_words(mut crc: u32, tail: &[u8]) -> Option<(u32, &[u8])> {
 /// This is an output-neutral reformulation of the braided body in `crc32_z`
 /// (`crc32.c` L637-L920):
 ///
-/// 1. Inputs shorter than [`MIN_SIMD_LEN`] use `crc32_braid`.
+/// 1. Inputs shorter than [`MIN_STRIDE_LEN`] use `crc32_braid`.
 /// 2. A byte prefix reaches the next `W`-byte address boundary through
 ///    `crc32_generic`.
 /// 3. Whole `N * W` chunks update the same five braid residues as `braid.rs`.
@@ -315,8 +383,8 @@ fn fold_tail_words(mut crc: u32, tail: &[u8]) -> Option<(u32, &[u8])> {
 /// their returned state directly into the next call.
 #[must_use]
 #[inline]
-pub fn crc32_simd(crc: u32, buf: &[u8]) -> u32 {
-    if buf.len() < MIN_SIMD_LEN {
+pub fn crc32_stride_braid(crc: u32, buf: &[u8]) -> u32 {
+    if buf.len() < MIN_STRIDE_LEN {
         return crc32_braid(crc, buf);
     }
 
@@ -348,23 +416,32 @@ pub fn crc32_simd(crc: u32, buf: &[u8]) -> u32 {
 
 /// The optional portable high-throughput CRC-32 backend.
 ///
-/// A zero-sized marker around `crc32_simd`, used by the parent module's backend
+/// A zero-sized marker around `crc32_stride_braid`, used by the parent module's backend
 /// selection and by checksum benchmarks. It takes and returns the same pre-conditioned
 /// state as the generic and braided backends.
 ///
 /// There is deliberately no support-query API. The implementation has no optional machine
 /// instruction to guard, and selecting this marker can affect speed only.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Simd;
+pub struct StrideBraid;
 
-impl Crc32Backend for Simd {
+impl Crc32Backend for StrideBraid {
     /// Identifies this backend in diagnostics and benchmark labels.
-    const NAME: &'static str = "simd";
+    ///
+    /// ★ `"stride-braid"` and not `"simd"`, which is what it used to say. The label names the
+    /// mechanism -- braided residues combined through a stride-`W` transform -- because that is
+    /// what the code does, and a review of the shipped `x86_64` release library found the
+    /// compiled body to contain **zero** vector instructions. It is portable integer work that
+    /// exposes instruction-level parallelism, and calling it SIMD promised a machine capability
+    /// it never used. The Cargo feature and this file's name are `simd` because AAP §0.3.1 and
+    /// §0.5.1.4 fix both, and neither is renamed here; what is corrected is every claim about
+    /// what the backend *is*.
+    const NAME: &'static str = "stride-braid";
 
-    /// Forward to `crc32_simd` without changing the state or buffer.
+    /// Forward to `crc32_stride_braid` without changing the state or buffer.
     #[inline]
     fn update(crc: u32, buf: &[u8]) -> u32 {
-        crc32_simd(crc, buf)
+        crc32_stride_braid(crc, buf)
     }
 }
 
@@ -373,9 +450,9 @@ mod tests {
     use core::mem::{size_of, size_of_val};
 
     use super::{
-        braid_table, crc32_braid, crc32_generic, crc32_simd, fold_braided_body, Crc32Backend, Simd,
-        Word, BRAID_MIN_LEN, CHUNK, CRC_BRAID_TABLE, CRC_TABLE, MIN_SIMD_LEN, N, STREAMS,
-        STRIDE_W_TABLE, TABLE_LEN, W,
+        braid_table, crc32_braid, crc32_generic, crc32_stride_braid, fold_braided_body,
+        Crc32Backend, StrideBraid, Word, BRAID_MIN_LEN, CHUNK, CRC_BRAID_TABLE, CRC_TABLE,
+        MIN_STRIDE_LEN, N, STREAMS, STRIDE_W_TABLE, TABLE_LEN, W,
     };
 
     /// Length of the deterministic fixture used by native sweeps.
@@ -411,9 +488,9 @@ mod tests {
         BRAID_MIN_LEN - 1,
         BRAID_MIN_LEN,
         BRAID_MIN_LEN + 1,
-        MIN_SIMD_LEN - 1,
-        MIN_SIMD_LEN,
-        MIN_SIMD_LEN + 1,
+        MIN_STRIDE_LEN - 1,
+        MIN_STRIDE_LEN,
+        MIN_STRIDE_LEN + 1,
         2 * CHUNK - 1,
         2 * CHUNK,
         2 * CHUNK + 1,
@@ -493,7 +570,7 @@ mod tests {
 
     /// Assert direct agreement among all three pre-conditioned backends.
     fn assert_three_way(state: u32, bytes: &[u8], label: &str) {
-        let simd = crc32_simd(state, bytes);
+        let simd = crc32_stride_braid(state, bytes);
         let braid = crc32_braid(state, bytes);
         let generic = crc32_generic(state, bytes);
 
@@ -514,14 +591,14 @@ mod tests {
         assert_eq!(W, size_of::<Word>());
         assert_eq!(CHUNK, N * W);
         assert_eq!(BRAID_MIN_LEN, CHUNK + W - 1);
-        assert_eq!(MIN_SIMD_LEN, CHUNK + 2 * W - 1);
+        assert_eq!(MIN_STRIDE_LEN, CHUNK + 2 * W - 1);
         assert_eq!(TABLE_LEN, 256);
         assert_eq!(braid_table(CHUNK), CRC_BRAID_TABLE);
         assert_eq!(STRIDE_W_TABLE[W - 1], CRC_TABLE);
 
         // The fixed constants stay far below every arithmetic limit used to form lengths and
         // table addresses. `checked_*` keeps this statement valid on every pointer width.
-        assert_eq!(CHUNK.checked_add(2 * W - 1), Some(MIN_SIMD_LEN));
+        assert_eq!(CHUNK.checked_add(2 * W - 1), Some(MIN_STRIDE_LEN));
         assert_eq!(
             W.checked_mul(TABLE_LEN),
             Some(STRIDE_W_TABLE.len() * TABLE_LEN)
@@ -638,18 +715,18 @@ mod tests {
             CHUNK - 1,
             CHUNK,
             CHUNK + 1,
-            MIN_SIMD_LEN - 1,
-            MIN_SIMD_LEN,
-            MIN_SIMD_LEN + 1,
+            MIN_STRIDE_LEN - 1,
+            MIN_STRIDE_LEN,
+            MIN_STRIDE_LEN + 1,
             257,
         ];
 
         for state in SEEDS {
-            let single = crc32_simd(state, &fixture);
+            let single = crc32_stride_braid(state, &fixture);
             for step in steps {
                 let mut split = state;
                 for piece in fixture.chunks(step) {
-                    split = crc32_simd(split, piece);
+                    split = crc32_stride_braid(split, piece);
                 }
                 assert_eq!(
                     split, single,
@@ -661,7 +738,7 @@ mod tests {
 
     #[test]
     fn published_check_value_is_preserved() {
-        let crc = crc32_simd(!0, b"123456789") ^ 0xffff_ffff;
+        let crc = crc32_stride_braid(!0, b"123456789") ^ 0xffff_ffff;
         assert_eq!(crc, 0xcbf4_3926);
     }
 
@@ -670,14 +747,17 @@ mod tests {
 
     #[test]
     fn marker_backend_is_zero_sized_and_forwards_exactly() {
-        assert_marker_traits::<Simd>();
-        let marker = Simd;
+        assert_marker_traits::<StrideBraid>();
+        let marker = StrideBraid;
         let fixture = pseudo_random();
 
         assert_eq!(size_of_val(&marker), 0);
-        assert_eq!(Simd::NAME, "simd");
+        assert_eq!(StrideBraid::NAME, "stride-braid");
         for state in SEEDS {
-            assert_eq!(Simd::update(state, &fixture), crc32_simd(state, &fixture));
+            assert_eq!(
+                StrideBraid::update(state, &fixture),
+                crc32_stride_braid(state, &fixture)
+            );
         }
     }
 }

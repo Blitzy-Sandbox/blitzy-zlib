@@ -26,18 +26,27 @@ name: CMake
 # installs the MSVC host toolchain, and CMakeLists names cargo's archive with the
 # platform's own conventions: that spelling is libz.a for a GNU toolchain and
 # z.lib for an MSVC one, so the file CMake would look for is not the file cargo
-# would write.  Staging a Windows drop-in is not wired either -- build.rs emits
-# neither a soname nor a version script for PE/COFF, and win32/zlib.def, the PE
-# analogue of zlib.map, is out of scope for this port.  So Windows is covered
-# where that coverage is real: rust.yml's `build-test` matrix compiles the
-# workspace and runs its tests on `windows-latest`, which is what would catch an
-# LLP64 regression in the `uLong` mapping.  A row here would go red on every
-# push and would establish nothing that job does not.
+# would write.  Staging a Windows drop-in INSTALL is not wired either -- build.rs
+# emits neither a soname nor a version script for PE/COFF, and win32/zlib.def,
+# the PE analogue of zlib.map, is out of scope for this port per AAP 0.2.2.3.  So
+# Windows is covered where that coverage is real, and in rust.yml rather than
+# here: `build-test` compiles the workspace and runs its tests on
+# `windows-latest`, which is what would catch an LLP64 regression in the `uLong`
+# mapping, and `platform-abi-windows` goes further without needing the excluded
+# file -- it reads the PE export table, requires `gzopen_w` (declared only under
+# _WIN32, so no Linux job can see it), and has MSVC compile a C consumer plus the
+# UNMODIFIED test/minigzip.c against cargo's import library and run them.  A row
+# HERE would still go red on every push, for the two reasons above, and would
+# establish nothing those jobs do not.
 #
 # WHY THE macOS ROW IS STATIC-ONLY.  The Rust SHARED library is relinked through
 # zlib.map with `-soname`, so CMakeLists refuses that combination on not-UNIX,
 # Apple, AIX and SunOS -- the same platform set the C shared target hands
-# zlib.map to, so the two agree by construction.  The static archive needs none
+# zlib.map to, so the two agree by construction.  The Mach-O SHARED artifact is
+# therefore staged outside CMake, by rust.yml's `platform-abi-macos` job, which
+# uses that format's own analogues -- `-install_name`, and an exported-symbols
+# list derived from zlib.h -- and relinks the three unmodified C drivers against
+# it.  The static archive needs none
 # of it: cargo emits a complete one wherever it runs, and CMakeLists copies it
 # under the platform's own archive name.  `-DZLIB_BUILD_SHARED=OFF` on that row
 # is therefore not a workaround but the supported mode, and configuring it is the
@@ -54,6 +63,20 @@ name: CMake
 # `ldd` assertion that the Rust artifact is the one bound.  These rows are breadth
 # across compilers and platforms; that job is depth on one.
 on: [push, pull_request]
+
+# ★ LEAST PRIVILEGE, declared once so that it covers the C rows and the four Rust
+# rows alike.  Without this block the workflow receives whatever the repository's
+# default token permissions happen to be -- `contents: write` on many
+# repositories -- and every step here would run with a token able to rewrite the
+# tree it just checked out, on a pull request, from a fork.  Nothing in this
+# workflow writes to the repository: it configures, builds, runs CTest and packages.
+# `contents: read` is what those need; `actions/upload-artifact` uses the runner's
+# own artifact token rather than this one.  A job that later needs more must ask in
+# its own `permissions:` block, which puts the request in the diff.  rust.yml
+# carries the identical block for the same reason.
+permissions:
+  contents: read
+
 jobs:
   ci-cmake:
     name: ${{ matrix.name }}
@@ -199,7 +222,23 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      # ★ PINNED TO A COMMIT, NOT A TAG, and the credential is not left behind.
+      # `actions/checkout@v6` is a MUTABLE reference: the tag can be moved to any
+      # commit at any time by anyone who can write to that repository, so the code
+      # this workflow runs on every push and every pull request is not the code
+      # anybody reviewed.  A digest cannot be moved.  The comment records which
+      # release the digest is, so the pin stays legible and can be bumped
+      # deliberately -- it is the same digest rust.yml and contribs.yml pin.
+      #
+      # `persist-credentials: false` stops the action writing an
+      # `http.extraheader` with the job's token into ../build/../.git/config, where
+      # it stays readable for the rest of the job.  This workflow only needs the
+      # tree; nothing fetches, pushes or tags.  Together with the `permissions:`
+      # block above, a step that tried to use the token would find neither the
+      # credential nor the scope.
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        persist-credentials: false
 
     - name: Install packages (Windows)
       if: runner.os == 'Windows'
@@ -243,7 +282,9 @@ jobs:
       run: cmake --build ../build --config ${{ matrix.build-config || 'Release' }} -t ${{ matrix.pkgtgt }}
 
     - name: Upload build errors
-      uses: actions/upload-artifact@v6
+      # Pinned for the same reason as the checkout above: a mutable tag is a
+      # dependency somebody else can change after review.  Same digest as rust.yml.
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       if: failure()
       with:
         name: ${{ matrix.name }} (cmake)

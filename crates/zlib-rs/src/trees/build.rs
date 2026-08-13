@@ -41,17 +41,19 @@
 //! the `continue` at L604 that deliberately skips a decrement, and the nested
 //! assignment at L656.
 //!
-//! Three of the encoder's decisions are made in this file and nowhere else:
+//! Three of the encoder's eight byte-identity decisions are made in this file and
+//! nowhere else. They keep the numbering `rust/README.md` uses, so that a
+//! `grep -rn 'ecision point' crates/zlib-rs/src` lands here for all three:
 //!
-//! * **The `smaller` tie-break** ([`HeapView::smaller`], L499-L501) compares depth with
+//! * **Decision point #6 -- the `smaller` tie-break** ([`HeapView::smaller`], L499-L501) compares depth with
 //!   `<=`, not `<`. Reverse that and equal-frequency symbols swap places in the
 //!   heap, the code lengths change, and every emitted block changes with them.
-//! * **The forced-two-codes repair** ([`build_tree`], L655-L661) invents up to
+//! * **Decision point #7 -- the forced-two-codes repair** ([`build_tree`], L655-L661) invents up to
 //!   two symbols so that a degenerate alphabet still has two codes, because "the
 //!   pkzip format requires that at least one distance code exists, and that at
 //!   least one bit should be sent even if there is only one possible code"
 //!   (L650-L653).
-//! * **The block-type comparison** ([`select_block_type`], L1027-L1074) is
+//! * **Decision point #8 -- the block-type comparison** ([`select_block_type`], L1027-L1074) is
 //!   integer arithmetic with a truncating `>> 3`, and its three predicates are
 //!   evaluated in a fixed order.
 //!
@@ -1633,17 +1635,22 @@ fn send_distance_code<'a, A: Allocator<'a>, const USE_STATIC: bool>(
 /// ```
 ///
 /// -- which is a little-endian distance followed by a length or literal.
-/// `PendingBuf::decode_symbols` performs precisely that decode, so the three reads
-/// and the three increments of `sx` become one array slot and one `SYMBOL_BYTES`
-/// step. The `d_buf`/`l_buf` pair of the `LIT_MEM` build (L909-L911) is not
-/// implemented.
+/// [`SymbolCursor::next_symbol`] performs precisely that decode, so the three reads
+/// and the three increments of `sx` become one cursor step. The `d_buf`/`l_buf`
+/// pair of the `LIT_MEM` build (L909-L911) is not implemented.
 ///
-/// Symbols are decoded [`SYMBOL_BATCH`] at a time rather than one at a time. C
-/// reads its three bytes straight out of `sym_buf` with no bound to establish;
-/// safe Rust has to establish one, and doing it once per batch instead of once per
-/// symbol is what keeps that cost off the per-symbol path. See
-/// [`SYMBOL_BATCH`] for why reading a batch before emitting any of it cannot lose
-/// a symbol.
+/// ★ **One record at a time, into registers, and nothing staged.** C reads its three
+/// bytes straight out of `sym_buf` with no bound to establish; safe Rust has to
+/// establish one, and an earlier version of this function paid for that by decoding
+/// a fixed batch of thirty-two symbols into a stack array of `(u16, u8)` pairs
+/// before emitting any of them. That bought one range proof per batch at the price
+/// of a materialised copy of the batch -- 128 bytes of stack zeroed once per block,
+/// every three-byte record widened to four bytes and stored, then read straight back
+/// -- on the loop that runs once per emitted symbol, which on literal-heavy input is
+/// once per input byte. [`PendingBuf::symbol_cursor_from`] establishes the region's
+/// bounds once for the *whole block* instead, and the walk below reads each record
+/// against a bound the cursor already owns. Strictly less work per symbol than the
+/// batch, and strictly less than a fresh `symbol_at` per symbol.
 ///
 /// A distance of zero marks a literal (L916-L917). Otherwise `lc` is the match
 /// length minus `MIN_MATCH`, and the pair is emitted as a length code with its
@@ -1673,108 +1680,85 @@ pub(crate) fn compress_block<'a, A: Allocator<'a>>(
     }
 }
 
-/// How many symbols one [`crate::weak_slice::PendingBuf::decode_symbols`] call
-/// establishes bounds for.
-///
-/// C decodes one symbol at a time straight out of `sym_buf` (L913-L915) with no
-/// bound to establish; safe Rust has to establish one, so it establishes it for a
-/// batch. Thirty-two symbols is 96 bytes of buffer described by one range check
-/// and 128 bytes of stack for the decoded pairs -- small enough to stay in
-/// registers-and-cache territory, large enough that the range work per symbol
-/// disappears.
-///
-/// # Why reading ahead cannot lose a symbol
-///
-/// The compressed output and the unread symbols share one allocation, and
-/// `Assert(s->pending < s->lit_bufsize + sx, "pendingBuf overflow")` (L945) is
-/// what keeps the write cursor behind the read cursor. Emitting the batch may
-/// therefore overwrite the very bytes the batch came from -- which the assertion
-/// permits, and which costs nothing here because those symbols have already been
-/// copied out. What the assertion also guarantees is that after the batch's last
-/// symbol the cursor is still below `lit_bufsize + sx`, and `sx` by then names the
-/// *end* of the batch, so the next batch's bytes have not been touched.
-const SYMBOL_BATCH: usize = 32;
-
 /// The body of [`compress_block`], monomorphised for one of the two tree pairs.
 ///
 /// `USE_STATIC` selects `static_ltree`/`static_dtree` when true and
 /// `dyn_ltree`/`dyn_dtree` when false; see [`send_literal_code`] for why it is a
 /// const generic rather than a parameter.
+///
+/// # The zero test, and why the cursor keeps it
+///
+/// The reference writes `if (s->sym_next != 0) do { ... } while (sx < s->sym_next);`
+/// -- a `do`-`while` guarded by a zero test, because the body must not run for an
+/// empty block. A cursor over an empty region yields [`None`] on its first read, so
+/// the guard is structural here rather than written out, and the end-of-block code
+/// after the loop is emitted either way, exactly as at L950.
 fn compress_block_with<'a, A: Allocator<'a>, const USE_STATIC: bool>(
     state: &mut DeflateState<'a, A>,
 ) {
-    let sym_next = state.sym_next();
-    // `unsigned sx = 0;` -- the running index in the symbol buffer.
+    // `unsigned sx = 0;` -- the running index in the symbol buffer, which the cursor
+    // owns from here on. The region's bounds are proved once, now, for the whole
+    // block; `sx` survives only as the debug assertion's operand.
+    let mut symbols = state.pending.symbol_cursor_all();
     let mut sx: usize = 0;
-    let mut batch = [(0_u16, 0_u8); SYMBOL_BATCH];
 
-    while sx < sym_next {
-        // The three-byte decode of L913-L915, for up to `SYMBOL_BATCH` symbols
-        // under one range check. Zero is unreachable while `sx < sym_next`:
-        // `sym_next` is a whole number of symbols within the buffer, which
-        // `push_symbol` maintains.
-        let filled = state.pending.decode_symbols(sx, &mut batch);
-        if filled == 0 {
-            break;
-        }
+    // `while (sx < s->sym_next)`, expressed as "the cursor still has a record".
+    while let Some((symbol_dist, len_or_lit)) = symbols.next_symbol(&state.pending) {
+        sx = sx.saturating_add(SYMBOL_BYTES);
 
-        for &(symbol_dist, len_or_lit) in batch.iter().take(filled) {
-            sx = sx.saturating_add(SYMBOL_BYTES);
+        // C's `unsigned dist` and `int lc`. `len_or_lit` is a `u8`, so both
+        // conversions are infallible -- which is the point: `lc` indexes
+        // `_length_code`, whose 256 entries cover every value a byte can hold,
+        // so no fallible narrowing and no range fallback is needed on the
+        // per-symbol path.
+        let mut dist = u32::from(symbol_dist);
+        let lc = usize::from(len_or_lit);
 
-            // C's `unsigned dist` and `int lc`. `len_or_lit` is a `u8`, so both
-            // conversions are infallible -- which is the point: `lc` indexes
-            // `_length_code`, whose 256 entries cover every value a byte can hold,
-            // so no fallible narrowing and no range fallback is needed on the
-            // per-symbol path.
-            let mut dist = u32::from(symbol_dist);
-            let lc = usize::from(len_or_lit);
-
-            if dist == 0 {
-                // `send_code(s, lc, ltree);` -- a literal byte.
-                send_literal_code::<A, USE_STATIC>(state, lc);
-            } else {
-                // Here `lc` is the match length minus `MIN_MATCH`.
-                // `code = _length_code[lc];`
-                let code = usize::from(_length_code.get(lc).copied().unwrap_or(0));
-                // `send_code(s, code + LITERALS + 1, ltree);` -- the length code.
-                send_literal_code::<A, USE_STATIC>(
-                    state,
-                    code.saturating_add(LITERALS).saturating_add(1),
-                );
-                // `extra = extra_lbits[code]; if (extra != 0) { lc -= base_length[code]; send_bits(s, lc, extra); }`
-                let extra = extra_lbits.get(code).copied().unwrap_or(0);
-                if extra != 0 {
-                    let residue = as_int(lc) - base_length.get(code).copied().unwrap_or(0);
-                    send_bits(state, as_ush(residue), extra);
-                }
-
-                // `dist--;` -- dist is now the match distance minus one.
-                dist -= 1;
-                // `code = d_code(dist);`
-                let code = d_code(dist);
-                // `Assert (code < D_CODES, "bad d_code");`
-                debug_assert!(code < D_CODES, "bad d_code (trees.c L931)");
-
-                // `send_code(s, code, dtree);` -- the distance code.
-                send_distance_code::<A, USE_STATIC>(state, code);
-                // `extra = extra_dbits[code]; if (extra != 0) { dist -= (unsigned)base_dist[code]; send_bits(s, (int)dist, extra); }`
-                let extra = extra_dbits.get(code).copied().unwrap_or(0);
-                if extra != 0 {
-                    dist -= u32::try_from(base_dist.get(code).copied().unwrap_or(0)).unwrap_or(0);
-                    send_bits(state, as_ush(dist), extra);
-                }
+        if dist == 0 {
+            // `send_code(s, lc, ltree);` -- a literal byte.
+            send_literal_code::<A, USE_STATIC>(state, lc);
+        } else {
+            // Here `lc` is the match length minus `MIN_MATCH`.
+            // `code = _length_code[lc];`
+            let code = usize::from(_length_code.get(lc).copied().unwrap_or(0));
+            // `send_code(s, code + LITERALS + 1, ltree);` -- the length code.
+            send_literal_code::<A, USE_STATIC>(
+                state,
+                code.saturating_add(LITERALS).saturating_add(1),
+            );
+            // `extra = extra_lbits[code]; if (extra != 0) { lc -= base_length[code]; send_bits(s, lc, extra); }`
+            let extra = extra_lbits.get(code).copied().unwrap_or(0);
+            if extra != 0 {
+                let residue = as_int(lc) - base_length.get(code).copied().unwrap_or(0);
+                send_bits(state, as_ush(residue), extra);
             }
 
-            // `Assert(s->pending < s->lit_bufsize + sx, "pendingBuf overflow");`
-            // (L945) -- the compressed output must not overtake the symbols it is
-            // still reading. Debug-only, as in the reference, and checked per
-            // symbol exactly as C checks it, because it is what licenses the
-            // batching above.
-            debug_assert!(
-                state.pending_bytes() < state.lit_bufsize().saturating_add(sx),
-                "pendingBuf overflow (trees.c L945)"
-            );
+            // `dist--;` -- dist is now the match distance minus one.
+            dist -= 1;
+            // `code = d_code(dist);`
+            let code = d_code(dist);
+            // `Assert (code < D_CODES, "bad d_code");`
+            debug_assert!(code < D_CODES, "bad d_code (trees.c L931)");
+
+            // `send_code(s, code, dtree);` -- the distance code.
+            send_distance_code::<A, USE_STATIC>(state, code);
+            // `extra = extra_dbits[code]; if (extra != 0) { dist -= (unsigned)base_dist[code]; send_bits(s, (int)dist, extra); }`
+            let extra = extra_dbits.get(code).copied().unwrap_or(0);
+            if extra != 0 {
+                dist -= u32::try_from(base_dist.get(code).copied().unwrap_or(0)).unwrap_or(0);
+                send_bits(state, as_ush(dist), extra);
+            }
         }
+
+        // `Assert(s->pending < s->lit_bufsize + sx, "pendingBuf overflow");`
+        // (L945) -- the compressed output must not overtake the symbols it is
+        // still reading. Debug-only, as in the reference, and checked per symbol
+        // exactly as C checks it: it is the invariant that lets emission write into
+        // the same allocation the cursor is still reading records out of.
+        debug_assert!(
+            state.pending_bytes() < state.lit_bufsize().saturating_add(sx),
+            "pendingBuf overflow (trees.c L945)"
+        );
     }
 
     // `send_code(s, END_BLOCK, ltree);`

@@ -13,8 +13,8 @@
 //! in a narrowly scoped, documented C-ABI boundary and nowhere else. This module is the port half
 //! of that boundary for the dev-only harness and [`crate::oracle`] is the reference half. Every
 //! other file that could hold `unsafe` is held to not holding it by the compiler: `build.rs`,
-//! every suite under `tests/`, all three attached benches and all five `fuzz_targets/` carry
-//! `#![forbid(unsafe_code)]`. The crate's own `src/lib.rs` is the single exception and cannot be
+//! every suite under `tests/`, all five `fuzz_targets/`, and all three criterion suites of the
+//! excluded `benches/` package carry `#![forbid(unsafe_code)]`. The crate's own `src/lib.rs` is the single exception and cannot be
 //! otherwise -- a crate-root `forbid` would cover this module too -- which is why it holds
 //! documentation and two `pub mod` declarations and no code at all.
 //!
@@ -86,8 +86,20 @@ use std::ptr;
 
 use libz_rs_sys::{
     gzFile, gz_header, in_func, out_func, uInt, uLong, voidpf, z_crc_t, z_off64_t, z_off_t,
-    z_size_t, z_stream, Bytef, ZLIB_VERSION,
+    z_size_t, z_stream, Bytef, ZLIB_VERSION, Z_STREAM_ERROR,
 };
+
+use crate::retain::window_offset;
+
+/// A session over the PORT's `z_stream`: the stream plus everything the library retains a pointer
+/// into.
+///
+/// The alias exists so that harness code writes `port::Session<'_>` beside `port::deflate`, and so
+/// that the port and the reference sides cannot be crossed by accident -- they are different Rust
+/// types with the same layout, and [`crate::retain::Session`] is generic over which. See
+/// [`crate::retain`] for what the lifetime parameter enforces and why the storage must be declared
+/// before the session.
+pub type Session<'r> = crate::retain::Session<'r, z_stream>;
 
 /// This side's `stream_size` argument: `sizeof(z_stream)` as the initialisers take it.
 ///
@@ -120,6 +132,40 @@ pub fn zeroed_stream() -> z_stream {
         data_type: 0,
         adler: 0,
         reserved: 0,
+    }
+}
+
+/// A `gz_header` with every member zeroed, ready to be handed to one of the header gates.
+///
+/// A sibling of [`zeroed_stream`] and for the same two reasons. It is built member by member so it
+/// needs no `unsafe`, which matters because `gz_header` holds three raw pointers and
+/// `MaybeUninit::zeroed().assume_init()` on it would be an `unsafe` block in every caller that
+/// wanted an empty one; and it keeps `libz_rs_sys` out of harnesses that only need somewhere for
+/// the library to write, which is what
+/// `crates/zlib-rs-differential/tests/retention_compile_fail` relies on.
+///
+/// Zero is the right starting value here in a way it is not for `z_stream`: `zlib.h` L118-L133
+/// makes the three capacities inputs, and zero capacity for a null buffer is the documented way to
+/// say "do not collect this field". Callers that want the library's writes to be *attributable*
+/// should still start the seven output members at values it cannot produce -- `-1` for the four
+/// `int`s -- rather than at zero; `fuzz/fuzz_targets/fuzz_inflate.rs`'s `HeaderProbe` does exactly
+/// that.
+#[must_use]
+pub fn zeroed_header() -> gz_header {
+    gz_header {
+        text: 0,
+        time: 0,
+        xflags: 0,
+        os: 0,
+        extra: ptr::null_mut(),
+        extra_len: 0,
+        extra_max: 0,
+        name: ptr::null_mut(),
+        name_max: 0,
+        comment: ptr::null_mut(),
+        comm_max: 0,
+        hcrc: 0,
+        done: 0,
     }
 }
 
@@ -336,15 +382,24 @@ pub fn deflate_get_dictionary(strm: &mut z_stream, dictionary: Option<&mut [u8]>
     (status, length)
 }
 
-/// `deflateSetHeader(strm, head)`.
+/// `deflateSetHeader(strm, head)`, through the session that keeps `head` alive.
 ///
-/// The header stays borrowed for as long as the library holds it -- `deflate.c` keeps the
-/// pointer until the header has been emitted -- which the exclusive borrow expresses.
+/// ★ **Obligation (h), and a plain `&mut` cannot carry it.** `deflate.c` stores the pointer in
+/// `s->gzhead` and reads it on every `deflate` call until the header has been emitted, so the
+/// header has to outlive the *stream*, not the call. This used to be
+/// `fn deflate_set_header(strm: &mut z_stream, head: &mut gz_header)`, whose borrows both end when
+/// it returns -- which left safe code free to drop or move the header and then call `deflate`
+/// again, a use-after-free with no `unsafe` anywhere in the caller. The session's `'r` is what
+/// makes the borrow last as long as the stream is reachable; see [`crate::retain`].
 #[must_use]
-pub fn deflate_set_header(strm: &mut z_stream, head: &mut gz_header) -> c_int {
-    // SAFETY: obligations (a), (b) and (d). `head` is a live, aligned `gz_header` the caller
-    // owns; the library reads its members and writes `done`, and the borrow outlives the call.
-    unsafe { libz_rs_sys::deflateSetHeader(strm, head) }
+pub fn deflate_set_header<'r>(session: &mut Session<'r>, head: &'r mut gz_header) -> c_int {
+    session.install(head, |strm, head| {
+        // SAFETY: obligations (a), (b), (d) and (h). `head` is a live, aligned `gz_header` the
+        // caller owns; the library reads its members and writes `done`. The session holds the
+        // borrow for `'r`, which outlives every later call on this stream, so the pointer the
+        // library keeps cannot dangle.
+        unsafe { libz_rs_sys::deflateSetHeader(strm, head) }
+    })
 }
 
 /// `deflateParams(strm, level, strategy)`.
@@ -660,18 +715,22 @@ pub fn inflate_get_dictionary_guarded(
     (status, length)
 }
 
-/// `inflateGetHeader(strm, head)`.
+/// `inflateGetHeader(strm, head)`, through the session that keeps `head` alive.
 ///
-/// The library retains the pointer until the header has been parsed and writes through the
-/// `extra`, `name` and `comment` buffers it names, clamped to `extra_max`, `name_max` and
-/// `comm_max` -- which is why the borrow is exclusive and why the caller keeps those buffers
-/// alive for the whole decode.
+/// ★ **Obligation (h), and the sharpest case of it.** The library retains the pointer until the
+/// header has been parsed and *writes through* the `extra`, `name` and `comment` buffers it names,
+/// clamped to `extra_max`, `name_max` and `comm_max` (`inflate.c` L639-L642). So the header and the
+/// three buffers it points into must both outlive every `inflate` call on this stream, and the
+/// borrow that says so has to be the session's `'r` rather than the call's. As
+/// [`deflate_set_header`], and for the same reason.
 #[must_use]
-pub fn inflate_get_header(strm: &mut z_stream, head: &mut gz_header) -> c_int {
-    // SAFETY: obligations (a), (b) and (d). `head` is live and aligned for the duration of the
-    // borrow, and the buffers it points at are the caller's, sized by the three `*_max` members
-    // the library clamps its writes to.
-    unsafe { libz_rs_sys::inflateGetHeader(strm, head) }
+pub fn inflate_get_header<'r>(session: &mut Session<'r>, head: &'r mut gz_header) -> c_int {
+    session.install(head, |strm, head| {
+        // SAFETY: obligations (a), (b), (d) and (h). `head` is live and aligned for `'r`, and the
+        // buffers it points at are the caller's, sized by the three `*_max` members the library
+        // clamps its writes to. The session holds both borrows past this call.
+        unsafe { libz_rs_sys::inflateGetHeader(strm, head) }
+    })
 }
 
 /// `inflateSync(strm)`.
@@ -785,8 +844,13 @@ struct BackBridge<'a, 'i> {
     /// The sink `push` writes to.
     sink: &'a mut dyn BackSink,
 
-    /// Base of the window handed to `inflateBackInit_`, for the offset computation.
-    window: *const u8,
+    /// Base ADDRESS of the window handed to `inflateBackInit_`, for the offset computation.
+    ///
+    /// An address rather than a pointer, and deliberately: the decoder is writing through that
+    /// allocation while this bridge is alive, so the bridge must not hold a reference to it. All it
+    /// needs is arithmetic -- is the region the library named inside the window? -- and
+    /// [`window_offset`] answers that from two integers.
+    window: usize,
 
     /// Length of that window: exactly `1 << windowBits`.
     window_len: usize,
@@ -866,69 +930,111 @@ unsafe extern "C" fn push(desc: *mut c_void, buf: *mut u8, len: c_uint) -> c_int
 
     // The offset is computed from the addresses rather than dereferencing anything, so a region
     // outside the window is reported instead of read.
-    let base = bridge.window as usize;
-    let start = buf as usize;
-    let offset = start
-        .checked_sub(base)
-        .filter(|start| start.saturating_add(count) <= bridge.window_len);
+    let Some(offset) = window_offset(bridge.window, bridge.window_len, buf as usize, count) else {
+        // ★ REFUSED BEFORE ANY SLICE EXISTS, and the order is the whole point. This used to
+        // compute the offset, keep it as an `Option`, and then form
+        // `slice::from_raw_parts(buf, count)` regardless -- so on the one input this branch exists
+        // to catch, a library that reported a region outside the window it was given, the harness
+        // dereferenced a pointer it had just proved was wrong. That is undefined behaviour in the
+        // harness, reached BEFORE the defect could be recorded, which is the worst possible order
+        // for a detector: the bug report would be an ASan trace inside the bridge rather than the
+        // sink's account of what the library did.
+        //
+        // The sink is told the region lay outside the window, exactly as for a null pointer, and
+        // the call is then refused. `infback.c` only ever reports `state->window` and a count
+        // bounded by `wsize`, so reaching here at all is a defect in the library and the honest
+        // thing to say about the memory is nothing.
+        let _ = bridge.sink.write_out(&[], None);
+        return 1;
+    };
 
     // SAFETY: `buf` is valid for `count` readable, initialised bytes for the duration of this
-    // call: `infback.c` reports only what it has itself written into the window it was given,
-    // and the window outlives the `inflateBack` call because the caller borrows it. The slice is
-    // handed to safe code and not retained.
+    // call. The check above establishes that `[buf, buf + count)` lies wholly inside the window
+    // the session handed `inflateBackInit_`, so the region is part of one live allocation that
+    // outlives this call -- the session borrows it for `'r`. `infback.c` reports only what it has
+    // itself written there. The slice is handed to safe code and not retained.
     let data = unsafe { core::slice::from_raw_parts(buf.cast_const(), count) };
-    c_int::from(!bridge.sink.write_out(data, offset))
+    c_int::from(!bridge.sink.write_out(data, Some(offset)))
 }
 
-/// `inflateBackInit_(strm, windowBits, window, ZLIB_VERSION, size)`.
+/// `inflateBackInit_(strm, windowBits, window, ZLIB_VERSION, size)`, through the session that keeps
+/// the window alive.
 ///
-/// The window is the caller's, must be at least `1 << windowBits` bytes, and must stay
-/// untouched until `inflateBack` returns -- `zlib.h` L1175-L1177.
+/// ★ **Obligation (h), and the window is WRITTEN, not merely read.** `zlib.h` L1175-L1177 gives the
+/// window to the library until `inflateBackEnd` returns, and the decoder decompresses *into* it.
+/// Two things follow, and the session provides both: the borrow has to be the session's `'r` rather
+/// than this call's, and it has to be `&mut`. The pair used to be
+/// `inflate_back_init(strm, bits, window: &mut [u8])` followed by
+/// `inflate_back(strm, window: &[u8], ..)`, which asked the caller to pass the same slice twice
+/// -- the second time as a SHARED reference to memory C was writing through, which is a violation
+/// of `&`'s own guarantee before it is anything else.
+///
+/// The extent is recorded by the session, so [`inflate_back`] needs no window argument at all and
+/// the "must be the same slice" obligation has nowhere left to be got wrong.
 #[must_use]
-pub fn inflate_back_init(strm: &mut z_stream, window_bits: c_int, window: &mut [u8]) -> c_int {
-    let ptr = if window.is_empty() {
-        ptr::null_mut()
-    } else {
-        window.as_mut_ptr()
-    };
-    // SAFETY: obligations (a), (b), (d) and (e). `window` is exclusively borrowed and outlives
-    // the initialisation; a zero-length window is offered as null, which is a documented
-    // argument the entry point tests for before the null-stream test.
-    unsafe {
-        libz_rs_sys::inflateBackInit_(strm, window_bits, ptr, ZLIB_VERSION.as_ptr(), stream_size())
-    }
+pub fn inflate_back_init<'r>(
+    session: &mut Session<'r>,
+    window_bits: c_int,
+    window: &'r mut [u8],
+) -> c_int {
+    session.install_back_window(window, |strm, window| {
+        let ptr = if window.is_empty() {
+            ptr::null_mut()
+        } else {
+            window.as_mut_ptr()
+        };
+        // SAFETY: obligations (a), (b), (d), (e) and (h). `window` is exclusively borrowed for
+        // `'r`, which outlives every `inflateBack` call on this stream and the `inflateBackEnd`
+        // that releases it; a zero-length window is offered as null, which is a documented
+        // argument the entry point tests for before the null-stream test.
+        unsafe {
+            libz_rs_sys::inflateBackInit_(
+                strm,
+                window_bits,
+                ptr,
+                ZLIB_VERSION.as_ptr(),
+                stream_size(),
+            )
+        }
+    })
 }
 
 /// `inflateBack(strm, in, in_desc, out, out_desc)` driven by a safe source and sink.
 ///
-/// `window` must be the same slice [`inflate_back_init`] was given: it is what the offsets
-/// handed to [`BackSink::write_out`] are computed against.
+/// The window is the one [`inflate_back_init`] installed on this session; the offsets handed to
+/// [`BackSink::write_out`] are computed against its recorded extent. A session that has not
+/// installed one has no window for the library to have been initialised with, so the call is
+/// refused with `Z_STREAM_ERROR` -- the same answer `infback.c` L209-L210 gives a stream with no
+/// state.
 #[must_use]
-pub fn inflate_back<'i, S, K>(
-    strm: &mut z_stream,
-    window: &[u8],
-    source: &mut S,
-    sink: &mut K,
-) -> c_int
+pub fn inflate_back<'i, 'r, S, K>(session: &mut Session<'r>, source: &mut S, sink: &mut K) -> c_int
 where
     S: BackSource<'i>,
     K: BackSink,
 {
+    let Some((window, window_len)) = session.back_window() else {
+        return Z_STREAM_ERROR;
+    };
     let mut bridge = BackBridge {
         source,
         sink,
-        window: window.as_ptr(),
-        window_len: window.len(),
+        window,
+        window_len,
     };
     let desc = core::ptr::addr_of_mut!(bridge).cast::<c_void>();
     let in_hook: in_func = Some(pull);
     let out_hook: out_func = Some(push);
+    // The bridge is NOT installed on the session, and that is correct rather than an oversight:
+    // `infback.c` uses `in_desc`/`out_desc` only while `inflateBack` is executing and keeps neither
+    // afterwards, so this one really is a call-scoped borrow -- the case a plain `&mut` describes
+    // properly. Only the window outlives the call, and the session is already holding that.
+    //
     // SAFETY: obligations (a) through (d), plus the two callbacks: both are `extern "C"` items
     // with exactly the declared signatures, and `desc` addresses `bridge`, which lives on this
     // stack frame for the whole call and is borrowed by nothing else -- the two trait objects
     // inside it are reached only from `pull`/`push`, which the library invokes one at a time
     // from inside this call.
-    unsafe { libz_rs_sys::inflateBack(strm, in_hook, desc, out_hook, desc) }
+    unsafe { libz_rs_sys::inflateBack(session.stream(), in_hook, desc, out_hook, desc) }
 }
 
 /// `inflateBackEnd(strm)`.
@@ -1927,11 +2033,24 @@ impl TrackingAllocator {
         })))
     }
 
-    /// Points `strm` at this allocator, as `mem_setup` does (`test/infcover.c` L158-L173).
-    pub fn install(&self, strm: &mut z_stream) {
-        strm.zalloc = Some(mem_alloc);
-        strm.zfree = Some(mem_free);
-        strm.opaque = self.opaque();
+    /// Points `session`'s stream at this allocator, as `mem_setup` does (`test/infcover.c`
+    /// L158-L173), and keeps the ledger borrowed for the stream's whole life.
+    ///
+    /// ★ **Obligation (h) again, and this one is retained for longer than either header.** The
+    /// `opaque` word reaches `mem_alloc` and `mem_free` on every allocation and free the stream
+    /// performs -- including the ones inside `deflateEnd`/`inflateEnd`, after the last call the
+    /// harness makes on its own account. This used to be `install(&self, strm: &mut z_stream)`,
+    /// whose `&self` borrow ended immediately, so safe code could drop the allocator while a live
+    /// stream still carried a pointer to its ledger and the next allocation would write through it.
+    /// `&'r self` ties the ledger to the session's retention lifetime instead, which the drop-check
+    /// obligation on [`crate::retain::Session`] turns into "declare the allocator before the
+    /// session, or do not compile".
+    pub fn install<'r>(&'r self, session: &mut Session<'r>) {
+        session.install_shared(self, |strm, allocator| {
+            strm.zalloc = Some(mem_alloc);
+            strm.zfree = Some(mem_free);
+            strm.opaque = allocator.opaque();
+        });
     }
 
     /// The `zalloc` hook, for a caller that installs the three members itself.
@@ -2245,7 +2364,8 @@ mod tests {
 
     use super::{
         adler32, compress2, crc32, crc_table, deflate, deflate_bound, deflate_end, deflate_init2,
-        deflate_pending, inflate_end, inflate_init2, uncompress, zeroed_stream, zlib_version,
+        deflate_pending, inflate_back, inflate_back_end, inflate_back_init, inflate_end,
+        inflate_init2, uncompress, zeroed_stream, zlib_version, BackSink, BackSource, Session,
         TrackingAllocator,
     };
     use libz_rs_sys::{Z_DEFAULT_STRATEGY, Z_DEFLATED, Z_FINISH, Z_OK, Z_STREAM_END};
@@ -2294,12 +2414,15 @@ mod tests {
 
     #[test]
     fn the_tracking_allocator_balances_and_reports_a_high_water_mark() {
+        // The allocator is declared BEFORE the session, and it has to be: the session's `Drop`
+        // makes drop-check require the ledger to strictly outlive it. Swapping these two lines is
+        // the use-after-free this arrangement exists to prevent, and it does not compile.
         let allocator = TrackingAllocator::new();
-        let mut strm = zeroed_stream();
-        allocator.install(&mut strm);
-        assert_eq!(inflate_init2(&mut strm, 15), Z_OK);
+        let mut session = Session::new(zeroed_stream());
+        allocator.install(&mut session);
+        assert_eq!(inflate_init2(session.stream(), 15), Z_OK);
         assert!(allocator.live_bytes() > 0);
-        assert_eq!(inflate_end(&mut strm), Z_OK);
+        assert_eq!(inflate_end(session.stream()), Z_OK);
 
         let report = allocator.finish();
         assert!(report.is_clean(), "{report:?}");
@@ -2310,10 +2433,10 @@ mod tests {
     #[test]
     fn an_allocator_ceiling_forces_a_refusal() {
         let allocator = TrackingAllocator::with_limit(64);
-        let mut strm = zeroed_stream();
-        allocator.install(&mut strm);
+        let mut session = Session::new(zeroed_stream());
+        allocator.install(&mut session);
         assert_ne!(
-            deflate_init2(&mut strm, 6, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY),
+            deflate_init2(session.stream(), 6, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY),
             Z_OK
         );
         let report = allocator.finish();
@@ -2326,5 +2449,107 @@ mod tests {
         let (status, len) = compress2(&mut out, HELLO, 9);
         assert_eq!(status, Z_OK);
         assert!(len > 0);
+    }
+    /// A [`BackSource`] that offers one run of input and then nothing.
+    struct OneChunk<'i>(Option<&'i [u8]>);
+
+    impl<'i> BackSource<'i> for OneChunk<'i> {
+        fn next_chunk(&mut self) -> Option<&'i [u8]> {
+            self.0.take()
+        }
+    }
+
+    /// A [`BackSink`] that keeps every run it is handed together with the offset it was told.
+    #[derive(Default)]
+    struct Recorder {
+        /// Everything pushed, concatenated -- the decoded stream.
+        bytes: Vec<u8>,
+        /// One entry per `out()` call: the offset reported, and how many bytes it covered.
+        runs: Vec<(Option<usize>, usize)>,
+    }
+
+    impl BackSink for Recorder {
+        fn write_out(&mut self, data: &[u8], offset: Option<usize>) -> bool {
+            self.bytes.extend_from_slice(data);
+            self.runs.push((offset, data.len()));
+            true
+        }
+    }
+
+    /// Raw DEFLATE bytes for `payload`, produced through the gates at `windowBits = -15`.
+    fn raw_deflate(payload: &[u8]) -> Vec<u8> {
+        let mut strm = zeroed_stream();
+        assert_eq!(
+            deflate_init2(&mut strm, 6, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY),
+            Z_OK
+        );
+        let mut out = vec![0u8; payload.len() + 128];
+        strm.next_in = payload.as_ptr();
+        strm.avail_in = payload.len() as _;
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = out.len() as _;
+        assert_eq!(deflate(&mut strm, Z_FINISH), Z_STREAM_END);
+        let produced = out.len() - strm.avail_out as usize;
+        assert_eq!(deflate_end(&mut strm), Z_OK);
+        out.truncate(produced);
+        out
+    }
+
+    /// ★ The alias-aware half of the retention rules: `inflateBack` **writes through the caller's
+    /// window**, so the gate has to lend it exclusively.
+    ///
+    /// This is the executable form of the reason [`inflate_back_init`] takes `&'r mut [u8]`. The
+    /// window goes in carrying a sentinel this decoder cannot legitimately produce, and comes back
+    /// changed -- which is only observable *after* the session is released, because until then the
+    /// window is exclusively loaned to it. A shared `&[u8]` would have promised that no write
+    /// through any alias could happen, while `infback.c` L25-L64 decodes straight into that
+    /// storage; the promise was the bug, not the pointer.
+    ///
+    /// The offsets are checked at the same time, because they are the other half of the same
+    /// arithmetic: every run the sink is handed must name a region *inside* the recorded extent.
+    /// `Some(_)` for all of them is what says the library reported nothing outside the window --
+    /// the case [`super::window_offset`] refuses before any slice is formed, and which
+    /// `retain.rs`'s own unit tests cover from the arithmetic side.
+    #[test]
+    fn the_inflate_back_window_is_written_through_and_every_run_lands_inside_it() {
+        const SENTINEL: u8 = 0x5a;
+        // 258 bytes is one maximum match, so this compresses to a short stream that still makes
+        // the decoder emit both a literal run and a copy.
+        let payload: Vec<u8> = (0..600u32).map(|i| (i % 7) as u8).collect();
+        let compressed = raw_deflate(&payload);
+
+        // Declared before the session, and it must be: the window is loaned for the session's
+        // whole life, so a window declared second would be dropped first and this would not build.
+        let mut window = vec![SENTINEL; 1 << 15];
+        let mut source = OneChunk(Some(compressed.as_slice()));
+        let mut sink = Recorder::default();
+
+        let mut session = Session::new(zeroed_stream());
+        assert_eq!(inflate_back_init(&mut session, 15, &mut window), Z_OK);
+        let status = inflate_back(&mut session, &mut source, &mut sink);
+        assert_eq!(status, Z_STREAM_END, "inflateBack returned {status}");
+        assert_eq!(inflate_back_end(session.stream()), Z_OK);
+        // Releasing the session is what ends the window's loan; the read below is `E0502` while it
+        // is still in scope, which is the guarantee working rather than a formality.
+        drop(session);
+
+        assert_eq!(sink.bytes, payload, "the decoded stream is not the input");
+        assert!(!sink.runs.is_empty(), "the output callback never ran");
+        for (index, (offset, len)) in sink.runs.iter().enumerate() {
+            let offset = offset.unwrap_or_else(|| {
+                panic!("run {index} was reported outside the window, which the library must not do")
+            });
+            assert!(
+                offset + len <= window.len(),
+                "run {index} covers {offset}..{} of a {}-byte window",
+                offset + len,
+                window.len()
+            );
+        }
+        assert!(
+            window.iter().any(|&b| b != SENTINEL),
+            "the window still holds only the sentinel, so nothing wrote through it -- either the \
+             decoder stopped using the caller's storage or this test is no longer proving anything"
+        );
     }
 }

@@ -104,7 +104,7 @@
 //!   through the stream's own allocator — in the entry point, which is the last moment
 //!   before the window becomes a reference — and the decoder reads the copy; the address
 //!   published back into `next_in` is translated to the caller's own.
-//!   [`StagedSnapshot`] carries the argument, the residual difference and the translation.
+//!   [`StagedMapping`] carries the argument, the residual difference and the translation.
 //! * A chunk `in()` returns from inside the window cannot be served, and the reason is the
 //!   callback contract rather than this port's borrow rules: `infback.c` L172-L174 obliges
 //!   the application to leave those bytes unchanged until the next call, while `zlib.h`
@@ -305,7 +305,7 @@ use crate::inflate::{message_ptr, version_error};
 use crate::panic_guard::{fallback, guard_code};
 use crate::types::{
     checked_state_mut, in_func, init_view, install_state, out_func, ranges_are_disjoint,
-    take_state, uInt, widen, window_slots_mut, z_streamp, AliasScratch, Bytef, StateKind,
+    take_state, uInt, widen, window_slots_mut, z_streamp, Bytef, OverlapStage, StateKind,
     StatePrefix, StreamAllocator,
 };
 
@@ -430,7 +430,8 @@ fn drivable(tag: c_int) -> bool {
     }
 }
 
-/// The staged-input snapshot: at most one per `inflateBack` call, owned by the entry point.
+/// Where the current staged window maps back to: one per `inflateBack` call, owned by the
+/// entry point.
 ///
 /// # ★ Why staged input inside the window has to be *served*
 ///
@@ -443,8 +444,11 @@ fn drivable(tag: c_int) -> bool {
 ///
 /// A `&[u8]` over bytes the window's own borrow covers is not expressible, so the region is
 /// **copied** before either borrow exists -- which is the only moment at which it can be,
-/// and is why this is taken in the entry point rather than anywhere deeper. The decoder
-/// then reads the copy.
+/// and is why this is owned by the entry point rather than anywhere deeper. The copy goes
+/// into [`OverlapStage`], a fixed buffer refilled a window at a time rather than a block
+/// sized from the caller's own `avail_in`, so an `inflateBack` over staged input costs the
+/// caller's allocator nothing and adds nothing to its high-water mark. The decoder reads
+/// the stage.
 ///
 /// The residual difference is which bytes it reads once the decoder's output catches up
 /// with the unread input: C reads whatever it has just written over, this reads the entry
@@ -459,52 +463,44 @@ fn drivable(tag: c_int) -> bool {
 ///
 /// # ★ The address the caller gets back is always the caller's own
 ///
-/// `infback.c` L567 publishes `next`, and for a copied run `next` would point into this
-/// library's scratch block -- an address the caller never supplied and which stops existing
-/// when the call returns. [`Self::translate`] maps it back: the core reports how much of the
-/// copy is unread, and the same offset from the caller's own base is what `next_in`
-/// receives. A caller cannot tell a copied run from a direct one by inspecting its stream.
+/// `infback.c` L567 publishes `next`, and for a staged run `next` would point into the
+/// stage -- an address the caller never supplied and which stops existing when the call
+/// returns. [`Self::translate`] maps it back: the core reports how much of the current
+/// window is unread, and the same offset from the caller's own base is what `next_in`
+/// receives. A caller cannot tell a staged run from a direct one by inspecting its stream,
+/// and chunking the staging changes nothing here, because the mapping is republished for
+/// each window as it is served.
 ///
-/// # ★ The value must not move once a view has been taken
+/// # ★ The mapping is published through a [`Cell`], because the wrapper that fills it is moved
 ///
-/// [`AliasScratch::view`] fabricates a `'static` slice whose provenance descends from the
-/// borrow it was taken through. Moving the [`AliasScratch`] afterwards -- into a `Cell`, or
-/// through any function that retags the block -- invalidates that slice, and Miri reports it
-/// as undefined behaviour rather than tolerating it. So this value lives in a local for the
-/// whole call, the view is taken in place, and [`Self::release`] is the last thing that
-/// touches it.
+/// The staged windows are served by [`StagedCallerInput`], which the core takes by value -- so
+/// nothing can be read back out of it after the call. The one thing the epilogue needs, the
+/// window most recently handed over, therefore lives here and is written through a shared
+/// borrow each time a window is served.
 #[derive(Default)]
-struct StagedSnapshot {
-    /// The copy, while it is live.
-    scratch: Option<AliasScratch>,
-
-    /// `(origin, copy, len)`: the caller's own base, the copy's base, and the extent both
-    /// share. [`None`] when nothing was copied.
-    mapping: Option<(*const Bytef, *const Bytef, usize)>,
+struct StagedMapping {
+    /// `(origin, copy, len)`: the caller's own base for the current window, the stage's base,
+    /// and the extent both share. [`None`] when the current chunk is not a staged one -- which
+    /// is every direct call, and every chunk that came from the caller's own `in()`.
+    current: Cell<Option<(*const Bytef, *const Bytef, usize)>>,
 }
 
-impl core::fmt::Debug for StagedSnapshot {
-    /// Reports whether a copy is live and where it maps, but never its bytes.
-    ///
-    /// Written by hand because [`zlib_rs::allocate::Buffer`] -- what an [`AliasScratch`]
-    /// owns -- carries no [`Debug`], deliberately: a block obtained from a caller's `zalloc`
-    /// is storage, not a value, and formatting its contents would mean reading memory the
-    /// library was handed in order to write.
+impl core::fmt::Debug for StagedMapping {
+    /// Reports where the current window maps, never its bytes.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("StagedSnapshot")
-            .field("copied", &self.scratch.is_some())
-            .field("mapping", &self.mapping)
+        f.debug_struct("StagedMapping")
+            .field("current", &self.current.get())
             .finish()
     }
 }
 
-impl StagedSnapshot {
-    /// Maps an address inside the copy back to the caller's own buffer.
+impl StagedMapping {
+    /// Maps an address inside the current staged window back to the caller's own buffer.
     ///
-    /// Returns [`None`] when nothing was copied or when `at` lies outside the copy, which is
-    /// every direct call: the address the core reported is then already the caller's.
+    /// Returns [`None`] when the current chunk was not staged or when `at` lies outside it,
+    /// which is every direct call: the address the core reported is then already the caller's.
     fn translate(&self, at: *const Bytef) -> Option<*const Bytef> {
-        let (origin, copy, len) = self.mapping?;
+        let (origin, copy, len) = self.current.get()?;
         // `offset_from` is defined only within one allocation and `at` may legitimately be
         // one past the end, so the arithmetic is done on addresses.
         let offset = (at as usize).checked_sub(copy as usize)?;
@@ -513,16 +509,62 @@ impl StagedSnapshot {
         }
         Some(origin.wrapping_add(offset))
     }
+}
 
-    /// Returns the copy's block to the allocator it came from, if there is one.
-    ///
-    /// Must be called after every borrow of the copy has ended -- which for this type means
-    /// after the core has returned and after [`Self::translate`] has been consulted.
-    fn release(&mut self, allocator: &StreamAllocator) {
-        if let Some(scratch) = self.scratch.as_mut() {
-            scratch.release(allocator);
+/// Serves the caller's staged input region in bounded windows, then defers to the caller's own
+/// `in()`.
+///
+/// ★ **Why chunking is free of consequence here, unlike anywhere else in the facade.**
+/// `inflateBack`'s input arrives through a callback whose contract already says nothing about
+/// how much it returns: `zlib.h` L1180-L1187 has `in()` answer "the number of bytes" it chose
+/// to supply, and `test/infcover.c`'s own `pull` returns as little as one byte at a time. So
+/// serving the caller's initial `(next_in, avail_in)` region as a sequence of
+/// `OVERLAP_STAGE_BYTES` windows is a shape the decoder is already required to handle, and it
+/// produces identical output for identical input. Passing `next_in = None` to the core and
+/// letting the first window arrive through `next_chunk` keeps the order right too, because
+/// `zlib.h` L1184-L1185 has the first `PULL()` call `in()` when nothing is staged.
+///
+/// The bound is what matters: the region is the caller's own `avail_in`, and copying all of it
+/// is what put an overlapping `inflateBack` outside the memory envelope AAP §0.8.4 sets. See
+/// [`OverlapStage`].
+struct StagedCallerInput<'s, 'w> {
+    /// Base of the caller's staged region.
+    origin: *const Bytef,
+    /// How many bytes of it the call is to serve, i.e. C's `have` at L218-L219.
+    total: usize,
+    /// How many have been served so far.
+    served: usize,
+    /// The bounded copy one window lives in.
+    stage: OverlapStage,
+    /// Where the current window's mapping is published for the epilogue to read.
+    mapping: &'s StagedMapping,
+    /// The caller's own `in()`, reached once the staged region is exhausted.
+    inner: CallerInput<'w>,
+}
+
+impl<'i> InflateBackInput<'i> for StagedCallerInput<'_, '_> {
+    fn next_chunk(&mut self) -> Option<&'i [u8]> {
+        if self.served < self.total {
+            let take = OverlapStage::chunk_len(self.total.saturating_sub(self.served));
+            let at = self.origin.wrapping_add(self.served);
+            // SAFETY: unsafe-site category 2 -- `OverlapStage::fill`'s contract, which is the
+            // one `inflateBack` already places on the caller: `total` bytes are readable at
+            // `origin` and the application must leave them alone for the duration of the call
+            // (`zlib.h` L1174-L1179), so the `take` bytes at `origin + served` are readable.
+            // No mutable borrow of them exists: the only mutable borrow this call creates is
+            // over the caller's *window*, and this type exists precisely because the two
+            // regions overlap, so the input region is never borrowed mutably at all.
+            let view = unsafe { self.stage.fill(at, take) };
+            self.mapping
+                .current
+                .set(Some((at, view.as_ptr(), view.len())));
+            self.served = self.served.saturating_add(take);
+            return Some(view);
         }
-        self.mapping = None;
+        // Past the staged region the caller's own callback supplies the bytes, and the address
+        // it reports is already the caller's, so there is nothing to map.
+        self.mapping.current.set(None);
+        self.inner.next_chunk()
     }
 }
 
@@ -758,7 +800,7 @@ impl<'i> InflateBackInput<'i> for CallerInput<'_> {
         // Copying is not an alternative here, unlike the *staged* case: by the time `in()`
         // runs the decoder already holds the window exclusively, so reading those bytes at
         // all -- through a slice or through a raw pointer -- would invalidate that borrow.
-        // Miri reports it. [`StagedSnapshot`] can copy only because it runs before the
+        // Miri reports it. [`StagedMapping`] can copy only because it runs before the
         // window borrow exists.
         //
         // The answer is the one the callback would have given by declining honestly:
@@ -1218,56 +1260,31 @@ pub unsafe extern "C" fn inflateBack(
             (slot.window, slot.window_len)
         };
 
-        // The allocator the snapshot, if one is needed, comes from.
-        //
-        // SAFETY: unsafe-site category 4 -- reading the three hook members through raw
-        // places. `strm` is live by this function's contract, and `inflateBackInit_`
-        // published either the caller's own hooks or the library's substituted routines,
-        // so the fallback is unreachable for an initialised stream.
-        let allocator = unsafe { crate::types::scratch_allocator(strm) };
-
         // ★ **Staged input inside the window is served by copying it**, not refused, and
-        // *here* is the only place the copy can be taken: the window becomes a reference a
-        // few statements below, and after that nothing may read those bytes at all. The
-        // value stays in this local for the whole call, because a view taken from it must
-        // not outlive its address. See [`StagedSnapshot`].
-        let mut snapshot = StagedSnapshot::default();
-        let staged = if staged_ptr.is_null() || staged_len == 0 {
+        // *here* is the only place the decision can be taken: the window becomes a reference a
+        // few statements below, and after that nothing may read those bytes at all. See
+        // [`StagedMapping`] and [`StagedCallerInput`].
+        let mapping = StagedMapping::default();
+        let direct = if staged_ptr.is_null() || staged_len == 0 {
             // C's `have = next != Z_NULL ? strm->avail_in : 0` (L218-L219): a null pointer
             // contributes nothing whatever `avail_in` says, and a zero count is the same
             // "nothing staged" state. `None` rather than `Some(&[])` so that the first
             // `PULL()` calls `in()` immediately, as `zlib.h` L1184-L1185 promises.
-            None
+            Some(None)
         } else if ranges_are_disjoint(staged_ptr, staged_len, window_ptr.cast_const(), window_len) {
             // SAFETY: unsafe-site category 2 -- slice reconstruction, once. `staged_ptr`
             // is non-null with a non-zero count inside this branch, and this function's
             // contract makes those bytes readable and stable for the call. The library
             // only reads through the result, and the test above established that it does
             // not overlap the window borrow taken below.
-            Some(unsafe { core::slice::from_raw_parts(staged_ptr, staged_len) })
+            Some(Some(unsafe {
+                core::slice::from_raw_parts(staged_ptr, staged_len)
+            }))
         } else {
-            // SAFETY: unsafe-site category 2 -- `AliasScratch::capture`'s contract.
-            // `staged_ptr` is non-null with a non-zero count by this branch, and this
-            // function's contract makes those bytes readable and stable for the call. No
-            // mutable borrow of them exists: the window borrow is taken *below* this
-            // statement, which is precisely why the copy is taken here.
-            snapshot.scratch = unsafe { AliasScratch::capture(&allocator, staged_ptr, staged_len) };
-            let Some(held) = snapshot.scratch.as_ref() else {
-                // The copy is the only way this pair can be served, so a refused allocation
-                // leaves the call unservable. `Z_STREAM_ERROR` is what this entry point
-                // already answers for an argument set it cannot use, and `zlib.h` L1203
-                // names it for exactly that.
-                return fallback::STREAM_ERROR_CODE;
-            };
-            // SAFETY: unsafe-site category 2 -- `AliasScratch::view`'s contract is that the
-            // slice must not outlive the scratch. `snapshot` is a local of this frame that
-            // is never moved and is released only in the epilogue below, after the core has
-            // returned and after the address translation has been consulted.
-            let view = unsafe { held.view() };
-            snapshot.mapping = Some((staged_ptr, view.as_ptr(), staged_len));
-            Some(view)
+            // Overlapping: nothing is handed over directly, and every byte of the region
+            // arrives through the bounded stage inside `StagedCallerInput` instead.
+            None
         };
-
         let state = &mut block.state_mut().state;
 
         // L59's pointer, borrowed for exactly the duration of this call. See `BackSlot`
@@ -1295,16 +1312,27 @@ pub unsafe extern "C" fn inflateBack(
         watch.publish(Mode::Type.as_raw());
 
         // L226-L568: the state machine and its epilogue, both inside the core.
+        let caller_input = CallerInput {
+            call: call_in,
+            desc: in_desc,
+            watch: &watch,
+            window: window_ptr.cast_const(),
+            window_len,
+        };
         let result = core_inflate_back_into(
             state,
             window,
-            staged,
-            CallerInput {
-                call: call_in,
-                desc: in_desc,
-                watch: &watch,
-                window: window_ptr.cast_const(),
-                window_len,
+            direct.flatten(),
+            StagedCallerInput {
+                origin: staged_ptr,
+                // Nothing is staged on the direct paths, where `direct` is `Some`: the region
+                // was either empty or handed over whole, so this wrapper has no windows of its
+                // own to serve and forwards every `next_chunk` to the caller's `in()`.
+                total: if direct.is_some() { 0 } else { staged_len },
+                served: 0,
+                stage: OverlapStage::new(),
+                mapping: &mapping,
+                inner: caller_input,
             },
             CallerOutput {
                 call: call_out,
@@ -1351,7 +1379,7 @@ pub unsafe extern "C" fn inflateBack(
         //    states. Publishing the callback's own pair is what stops this looking like an
         //    input failure. See [`ModeWatch::stalled`].
         // 2. Ordinary completion, including a genuine output failure: the core's report,
-        //    with an address inside a snapshot mapped back to the caller's own buffer so
+        //    with an address inside the stage mapped back to the caller's own buffer so
         //    that a copied run is indistinguishable from a direct one. See
         //    [`WindowOverlap::translate`].
         // 3. `None`, which is C's `next = Z_NULL` at L104 and means one thing only: `in()`
@@ -1361,7 +1389,7 @@ pub unsafe extern "C" fn inflateBack(
             (Some((buf, len)), _) => (buf, narrow_avail(len)),
             (None, Some(rest)) => {
                 let at = rest.as_ptr();
-                let published = snapshot.translate(at).unwrap_or(at);
+                let published = mapping.translate(at).unwrap_or(at);
                 (published, narrow_avail(rest.len()))
             }
             (None, None) => (core::ptr::null(), 0),
@@ -1370,7 +1398,6 @@ pub unsafe extern "C" fn inflateBack(
         // The copy's block goes back to the allocator it came from, now that the core has
         // returned and `result.next_in`'s address has been translated out of it. After this
         // point nothing addresses the copy.
-        snapshot.release(&allocator);
         // SAFETY: unsafe-site category 1 -- writing three members of the caller's
         // stream, which is non-null, aligned and live as established above. Each
         // write goes through a raw place, so no `&mut z_stream` is materialised. The
@@ -3825,7 +3852,7 @@ mod tests {
     /// `Z_BUF_ERROR` with a null `next_in` (`infback.c` L104-L106, `zlib.h` L1199-L1201).
     /// Copying is not available here as it is for *staged* input, because by the time `in()`
     /// runs the decoder already holds the window exclusively and reading those bytes at all
-    /// would invalidate that borrow -- Miri reports exactly that. See [`StagedSnapshot`] for
+    /// would invalidate that borrow -- Miri reports exactly that. See [`StagedMapping`] for
     /// the case that can be served, and why it can.
     #[test]
     fn a_callback_chunk_inside_the_window_is_declined() {

@@ -1429,7 +1429,7 @@ impl StreamAllocator {
     /// (`gzlib.c` L100 and L206, `gzread.c` L99-L100, `gzwrite.c` L16 and L25),
     /// because a `gzFile` has no caller-supplied hooks to honour.
     #[must_use]
-    // One entry point calls it: `_zlib_rs_inflate_table`, which has no `z_stream` and
+    // One entry point calls it: `inflate_table`, which has no `z_stream` and
     // therefore no caller hooks to honour, and needs a fallible block for a `codes`
     // beyond its stack bound. Every stream entry point reaches the same routines
     // through `from_hooks` instead, which performs the substitution inline while
@@ -1999,9 +1999,14 @@ impl StreamAllocator {
     /// C initialises its state *in place*: `deflateInit2_` allocates `sizeof(deflate_state)` and
     /// then assigns each field through `s->` (`deflate.c` L440-L505). This crate cannot, because the
     /// core owns the state type and constructs it as a Rust value; that value is then moved here.
-    /// The state is 6144 bytes for deflate and 7296 for inflate, so the move is a copy of that much
-    /// -- one pass, once per stream, and it is the second half of the initialisation cost whose first
-    /// half is the buffer fill documented on `zlib_rs::allocate::Buffer::try_global`.
+    /// The `T` this is called with is the whole [`StateBlock`], not the core state alone, so the
+    /// move copies **6336 bytes for deflate and 7384 for inflate** on this target -- one pass, once
+    /// per stream, and it is the second half of the initialisation cost whose first half is the
+    /// buffer fill documented on `zlib_rs::allocate::Buffer::try_global`. Those two figures are the
+    /// bottom row of the footprint table on `zlib_rs::gz::state::GzState`, which gives every form of
+    /// both states and says why one number will not do; they are pinned by the
+    /// `the_facade_state_block_footprint_matches_the_c_budget` tests in [`crate::deflate`] and
+    /// [`crate::inflate`], so a layout change moves this sentence by failing a test.
     ///
     /// Measured, the two together are 6.10 us per `deflateInit2_` + `deflateEnd` at the default
     /// configuration against C's 1.40 us. The buffer fill dominates: a quarter of a megabyte against
@@ -2299,207 +2304,459 @@ pub(crate) fn streams_are_disjoint(dest: z_streamp, source: z_streamp) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Alias-tolerant input capture -- unsafe-site category 2
+// Bounded overlap staging -- unsafe-site category 2
 // ---------------------------------------------------------------------------
 
-/// An owned copy of a caller's input range, used when that range overlaps the
-/// caller's output range.
+/// Bytes of caller input one staged chunk carries.
 ///
-/// ★ **Why a copy, rather than a refusal.** [`ranges_are_disjoint`] can *detect* an
+/// ★ **The bound is the point, and 1 KiB is chosen against a measured limit.** An earlier
+/// design copied the caller's *whole* `avail_in` into a block from the stream's own
+/// allocator, which meant an overlapping call's peak allocation grew without limit with a
+/// number the caller chose: a 64 KiB overlapping `deflate` measured 124.6% of the reference
+/// implementation's per-stream footprint and a 32 KiB overlapping `inflate` 182.6%, against
+/// the 15% ceiling AAP §0.8.4 sets. A fixed stage cannot do that. It also cannot *fail*,
+/// which removes an allocation-refusal path from four entry points, and it costs the
+/// allocator nothing at all -- so an overlapping call's high-water mark is now exactly the
+/// reference implementation's, not merely close to it. That is the same discipline C keeps:
+/// `deflate_stored`'s direct copy and `gz_look`'s header sniff both work in space the
+/// function already has rather than in space they ask for.
+///
+/// 1 KiB and not more because this is stack space inside a function called from arbitrary C,
+/// where the reference implementation's own frames are a couple of hundred bytes; and not
+/// less because every extra chunk is another trip through the compressor's or decoder's
+/// entry accounting.
+///
+/// Annotated for cbindgen because it is crate-private and `zlib.h` declares nothing of the
+/// kind: without this, cbindgen reports `Skip libz-rs-sys::OVERLAP_STAGE_BYTES - (not pub)`,
+/// and `make rust-header` treats an unallowed notice as a failure on the ground that a
+/// skipped item is an item the header diff did not compare. Silencing it here rather than
+/// widening `RUSTHEADERWARNOK` keeps that gate's allowance list to the three entries it
+/// documents.
+/// cbindgen:ignore
+pub(crate) const OVERLAP_STAGE_BYTES: usize = 1024;
+
+/// A bounded copy of part of a caller's input range, used when that range overlaps a region
+/// this library has to write through.
+///
+/// ★ **Why a copy at all, rather than a refusal.** [`ranges_are_disjoint`] can *detect* an
 /// overlapping `(next_in, avail_in)` / `(next_out, avail_out)` pair, and for a while the
 /// obvious response was to answer `Z_STREAM_ERROR`. That is wrong, and `test/example.c`
 /// proves it: `test_large_deflate` sets `next_out = compr`, deflates 40 000 bytes into it,
 /// and then at L275-L277 sets `next_in = compr` with `avail_in = uncomprLen/2` while
 /// `next_out` still points a few hundred bytes into that same `compr` — deliberately
-/// feeding already-compressed data back through the compressor. Reference zlib runs it,
-/// and `test_large_inflate` then asserts `total_out == 2*uncomprLen + uncomprLen/2`
-/// (L327), which only holds if all `uncomprLen/2` overlapping bytes were consumed by that
-/// one call. Refusing the pair fails the suite the port is required to pass unmodified,
-/// so shrinking a range, splitting the call, or returning an error are all ruled out: the
-/// call has to consume the whole input in one pass.
+/// feeding already-compressed data back through the compressor. Reference zlib runs it, and
+/// `test_large_inflate` then asserts `total_out == 2*uncomprLen + uncomprLen/2` (L327),
+/// which only holds if all `uncomprLen/2` overlapping bytes were consumed by that one call.
+/// Refusing the pair fails the suite the port is required to pass unmodified.
 ///
-/// Copying the input is what makes that possible without aliasing. The snapshot is taken
-/// while no mutable borrow of the output exists, so the shared read is sound; afterwards
-/// the core is handed the snapshot plus a `&mut [u8]` over the caller's output, and those
-/// two never overlap. Consumption accounting is unaffected, because the snapshot is
-/// exactly `avail_in` bytes long and the caller's `next_in` is advanced by the count the
-/// core reports, not by anything derived from the snapshot's address.
+/// Copying is what makes serving it possible without aliasing. Each chunk is taken while no
+/// mutable borrow of the caller's output exists, so the shared read is sound; afterwards the
+/// core is handed the chunk plus a `&mut [u8]` over the caller's output, and those two never
+/// overlap.
 ///
-/// The one observable difference from C is *which* bytes get compressed when the output
-/// actually catches up with the unread input: C reads whatever it has just written over,
-/// whereas this reads the values the buffer held when the call began. C's own answer there
-/// is unspecified — it depends on the interleaving of `read_buf` and `flush_pending` — so
-/// this is a divergence within the space C leaves undefined, and it is the more defined of
-/// the two. Every disjoint call, which is every call the differential corpus makes, is
-/// completely untouched by this path.
+/// ★ **What a bounded stage changes, stated plainly.** The whole input no longer reaches the
+/// core in one piece, so an overlapping call becomes a sequence of core calls over
+/// [`OVERLAP_STAGE_BYTES`] windows. Callers cannot observe the seam: every entry point still
+/// consumes the whole input before it returns, the compressor's and decoder's state carries
+/// across the windows exactly as it carries across a caller's own incremental feeding, and
+/// intermediate windows are driven with `Z_NO_FLUSH` so no flush is issued that the caller
+/// did not ask for. The one place it is observable at all is `deflate` at **level 0** with
+/// more than about 32 KiB of overlapping input, where `deflate_stored` sizes a stored block
+/// from `avail_in` and would therefore choose different block boundaries — and that path in
+/// C reads the bytes it is concurrently overwriting through `memcpy`, so C's own answer
+/// there is undefined. The divergence lies inside the space C leaves undefined, which is
+/// where the byte-choice divergence below already lives.
 ///
-/// ★ **Allocation goes through the stream's own allocator, not Rust's.** `zlib.h`
-/// L140-L153 makes `zalloc`/`zfree`/`opaque` the caller's resource policy for a stream,
-/// and a buffer whose size is `avail_in` -- the caller's own number -- is exactly the kind
-/// of allocation that policy exists to govern: a custom arena has to be able to see it,
-/// and `test/infcover.c`'s `mem_limit()` has to be able to refuse it. Reaching past the
-/// hooks to Rust's global allocator would put a caller-sized request outside both, which
-/// is CWE-789 in the small. So [`AliasScratch::capture`] takes the allocator the entry
-/// point already read off the stream and returns the block through that same allocator,
-/// which is the discipline `zlib.h` L151-L153 states and [`Buffer::release_to`] enforces.
+/// The other observable difference from C is *which* bytes get compressed when the output
+/// catches up with the unread input: C reads whatever it has just written over, whereas this
+/// reads the values the buffer held when the chunk was taken. C's own answer there is
+/// unspecified — it depends on the interleaving of `read_buf` and `flush_pending` — so this
+/// is a choice within the space C leaves undefined, and it is the more defined of the two.
+/// Every disjoint call, which is every call the differential corpus makes, is completely
+/// untouched by this path.
 ///
-/// The release is the other half of the contract and is why [`AliasScratch::release`]
-/// exists rather than a `Drop` implementation: the block must go back to *this*
-/// allocator, and a `Drop` has no way to name it. It is released before the entry point
-/// returns and after every borrow of it has ended, so a tracking allocator sees a strict
-/// last-in, first-out pair around one call -- which is what `test/infcover.c`'s
-/// `mem_done()` checks for.
-///
-/// Allocation failure is reported rather than fatal, for the same reason a system library
-/// should not abort on a large `avail_in`: [`AliasScratch::capture`] answers [`None`] and
-/// the caller maps it to the outcome its own entry point documents.
-///
-/// Gated on `libz-compat`, which is what turns on the two modules that use it. Every other
+/// Gated on `libz-compat`, which is what turns on the modules that use it. Every other
 /// helper in this module is `pub` and therefore exempt from `dead_code` by construction; this
 /// one is deliberately crate-private -- an internal scratch buffer has no business in the
 /// crate's Rust surface -- so the gate is what keeps a `--no-default-features` build free of
 /// `dead_code`, rather than an `allow` that would also hide a genuine future disuse.
 #[cfg(feature = "libz-compat")]
-pub(crate) struct AliasScratch {
-    /// The captured bytes, in a block this value owns until [`AliasScratch::release`]
-    /// hands it back. Exactly as long as the count [`AliasScratch::capture`] was given.
-    ///
-    /// An [`Option`] because the release takes the block out through the slot: a
-    /// reference in argument position is protected for the duration of the call, and
-    /// freeing memory a protected reference covers is undefined behaviour, so
-    /// [`Allocator::deallocate_bytes`] is documented to take the *slot*.
-    bytes: Option<Buffer<'static, u8>>,
+pub(crate) struct OverlapStage {
+    /// The staged bytes. Zeroed on construction rather than left uninitialised so that this
+    /// type needs no `unsafe` to *exist*, only to be filled from a raw pointer.
+    bytes: [u8; OVERLAP_STAGE_BYTES],
 }
 
 #[cfg(feature = "libz-compat")]
-impl AliasScratch {
-    /// Copies `len` bytes from `src` into a block from `allocator`, or reports that the
-    /// allocation failed.
+impl core::fmt::Debug for OverlapStage {
+    /// Reports the stage's capacity, never its contents: it holds a caller's data.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OverlapStage")
+            .field("capacity", &self.bytes.len())
+            .finish()
+    }
+}
+
+#[cfg(feature = "libz-compat")]
+impl OverlapStage {
+    /// An empty stage.
+    pub(crate) const fn new() -> Self {
+        Self {
+            bytes: [0; OVERLAP_STAGE_BYTES],
+        }
+    }
+
+    /// How many bytes the next chunk takes from a range with `remaining` bytes left.
     ///
-    /// The block is `len` bytes exactly, requested as `len` items of one byte, which is
-    /// the shape `ZALLOC(strm, len, 1)` would have.
+    /// Named rather than open-coded because every caller has to agree with every other about
+    /// it: the loop that decides "this is the last chunk, so the caller's flush applies"
+    /// tests the same number this returns.
+    pub(crate) const fn chunk_len(remaining: usize) -> usize {
+        if remaining < OVERLAP_STAGE_BYTES {
+            remaining
+        } else {
+            OVERLAP_STAGE_BYTES
+        }
+    }
+
+    /// Copies up to [`OVERLAP_STAGE_BYTES`] bytes from `src` and returns them with the
+    /// `'static` lifetime the core's stream views require.
+    ///
+    /// The returned slice is exactly `Self::chunk_len(len)` bytes long, so a caller that
+    /// advances by its length advances by what it asked for.
     ///
     /// # Safety
     ///
-    /// `src` and `len` must satisfy [`input_slice`]'s contract: either `len` is zero, or
-    /// `len` bytes are readable at `src` and nothing mutates them for the duration of this
-    /// call. No mutable borrow of any part of that region may exist, which is what makes
-    /// the shared read sound even when the region overlaps the caller's output.
+    /// `src` and the returned length must satisfy [`input_slice`]'s contract: either that
+    /// length is zero, or that many bytes are readable at `src` and nothing mutates them for
+    /// the duration of this call. No mutable borrow of any part of that region may exist,
+    /// which is what makes the shared read sound even when the region overlaps the caller's
+    /// output -- so this has to run *before* the output is borrowed, not beside it.
     ///
-    /// The value must be released with [`AliasScratch::release`], passing the same
-    /// `allocator`, before it is dropped.
-    pub(crate) unsafe fn capture(
-        allocator: &StreamAllocator,
-        src: *const Bytef,
-        len: usize,
-    ) -> Option<Self> {
-        let mut block = allocator.allocate_bytes(len, 1)?;
-        // SAFETY: unsafe-site category 2 -- one shared slice over the caller's input,
-        // formed under this function's contract, which is `input_slice`'s. It is the only
-        // borrow of that region in existence at this point: the mutable borrow of the
-        // output is created by the caller *after* this returns, precisely so that the two
-        // never coexist. The slice dies at the end of this statement.
-        let source = unsafe { core::slice::from_raw_parts(src, len) };
-        // The block arrives holding `FILL_BYTE`, never zero, so every byte is written
-        // rather than appended to. `copy_from_slice` panics on a length mismatch, so the
-        // lengths are reconciled first: the block is `len` bytes by construction and the
-        // slice is `len` bytes by this function's contract, and the `get_mut` states that
-        // rather than asserting it.
-        let written = block.as_mut_slice().get_mut(..len).map(|window| {
-            window.copy_from_slice(source);
-        });
-        if written.is_none() {
-            // Unreachable: the block was requested as `len` bytes. Releasing rather than
-            // leaking is what makes it unreachable *and* harmless.
-            allocator.deallocate_bytes(&mut Some(block));
-            return None;
+    /// The returned slice must not be used after the next [`OverlapStage::fill`] on the same
+    /// stage, nor after the stage is dropped. Callers satisfy both by holding the stage in a
+    /// binding that outlives the stream view and by building exactly one view per chunk.
+    #[must_use]
+    pub(crate) unsafe fn fill(&mut self, src: *const Bytef, len: usize) -> &'static [u8] {
+        let take = Self::chunk_len(len);
+        let Some(target) = self.bytes.get_mut(..take) else {
+            // Unreachable: `chunk_len` never exceeds the array's length. An empty slice is
+            // the one answer that cannot be unsound.
+            return &[];
+        };
+        if take != 0 {
+            // SAFETY: unsafe-site category 2 -- one shared slice over the caller's input,
+            // formed under this function's contract, which is `input_slice`'s. It is the
+            // only borrow of that region in existence at this point: the mutable borrow of
+            // the output is created by the caller *after* this returns, precisely so that
+            // the two never coexist. The slice dies at the end of this statement.
+            let source = unsafe { core::slice::from_raw_parts(src, take) };
+            target.copy_from_slice(source);
         }
-        Some(Self { bytes: Some(block) })
+        // SAFETY: unsafe-site category 2 -- one shared slice over memory this value owns.
+        // The pointer is non-null, aligned for `u8` and valid for `take` initialised bytes,
+        // because the array is initialised on construction and the copy above rewrote the
+        // first `take` of them; so the slice is well formed. The `'static` lifetime is
+        // fabricated and is exactly what this function's contract makes the caller
+        // responsible for.
+        unsafe { core::slice::from_raw_parts(target.as_ptr(), take) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// gz_header field ranges -- the preflight for unsafe-site category 6
+// ---------------------------------------------------------------------------
+
+/// The address ranges of a caller's `gz_header` fields, for comparison against the
+/// caller's stream buffers *before* any borrow of either exists.
+///
+/// ★ **Why this has to exist.** A `gz_header`'s `extra`, `name` and `comment` are
+/// caller-owned buffers reached across entry-point calls, so this crate views them as
+/// `Cell` slices -- shared-mutable, which is what makes a concurrent write from C defined
+/// rather than undefined (see `crate::deflate`'s `field_with_nul` and `crate::inflate`'s
+/// `header_field`). The stream buffers are viewed differently and must be: `(next_in,
+/// avail_in)` becomes a shared `&[u8]` and `(next_out, avail_out)` becomes an **exclusive**
+/// [`OutputRegion`], because that is the only shape in which the core can write output.
+///
+/// Nothing in `zlib.h` requires those regions to be distinct. L833-L855 describes
+/// `deflateSetHeader`'s buffers and L1070-L1096 `inflateGetHeader`'s, and neither says a
+/// word about `next_in` or `next_out`; a conforming C caller may therefore point `name` at
+/// a slice of its own output buffer. C copies bytes either way. Rust does not: an exclusive
+/// borrow and a `Cell` borrow of one byte may not be live at the same time, and it is
+/// undefined behaviour for them to be **whether or not either is used**. So the overlap has
+/// to be detected before the borrows are formed, exactly as [`ranges_are_disjoint`] already
+/// detects the input/output case, and then *served* -- by moving one side onto storage this
+/// library owns -- rather than refused.
+///
+/// A field with a zero length is disjoint from everything, which is the right answer for
+/// the two cases that produce one: `extra` non-null with `extra_len == 0` (`deflate.c`
+/// L1094 still counts that as a present field) and `extra_max`/`name_max`/`comm_max` of
+/// zero (a caller advertising a buffer it has no room in). Neither reads nor writes a byte,
+/// so neither can alias.
+///
+/// Nothing here is dereferenced: this is arithmetic on addresses, and every pointer arrives
+/// through a raw read of the caller's structure. That is what lets the comparison run at
+/// the one moment its answer can still be acted on.
+#[cfg(feature = "libz-compat")]
+#[derive(Clone, Copy)]
+pub(crate) struct HeaderRanges {
+    /// `extra`, `name` and `comment`, in `zlib.h` L123-L129 order. An absent field is
+    /// recorded as a null pointer with a zero length, which [`ranges_are_disjoint`] treats
+    /// as disjoint from every range including itself.
+    ranges: [(*const Bytef, usize); Self::FIELDS],
+}
+
+#[cfg(feature = "libz-compat")]
+impl HeaderRanges {
+    /// The three variable-length fields a `gz_header` carries.
+    ///
+    /// cbindgen:ignore
+    const FIELDS: usize = 3;
+
+    /// No header is installed, or none of its fields is read or written on this call.
+    ///
+    /// The value every entry point starts from, and the one a stream with no `gz_header`
+    /// keeps: it overlaps nothing, so the preflight below costs three comparisons against
+    /// a zero length and the ordinary path is untouched.
+    ///
+    /// cbindgen:ignore
+    pub(crate) const NONE: Self = Self {
+        ranges: [(core::ptr::null(), 0); Self::FIELDS],
+    };
+
+    /// The ranges of whichever of the three fields are present.
+    ///
+    /// Takes the fields as an array of [`Option`] because that is the shape both callers
+    /// already have: each field is `None` for `Z_NULL` and `Some` with the length the
+    /// direction defines -- the emitted length for `deflateSetHeader`, the advertised
+    /// capacity for `inflateGetHeader`.
+    #[must_use]
+    pub(crate) fn of(fields: [Option<(*const Bytef, usize)>; Self::FIELDS]) -> Self {
+        let mut ranges = Self::NONE.ranges;
+        for (slot, field) in ranges.iter_mut().zip(fields) {
+            if let Some(field) = field {
+                *slot = field;
+            }
+        }
+        Self { ranges }
+    }
+
+    /// Whether any present field shares a byte with the range at `base` for `len` bytes.
+    #[must_use]
+    pub(crate) fn overlap(&self, base: *const Bytef, len: usize) -> bool {
+        self.ranges
+            .iter()
+            .any(|&(field, field_len)| !ranges_are_disjoint(field, field_len, base, len))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Alias-tolerant output staging -- unsafe-site category 2
+// ---------------------------------------------------------------------------
+
+/// Storage this library owns, standing in for a caller's output range while a
+/// `gz_header` field overlaps it.
+///
+/// The output counterpart of [`OverlapStage`], and the reason the two are different types
+/// rather than one: an input snapshot is read and discarded, whereas output has to be
+/// *written back*, and the write-back is the whole of the extra contract.
+///
+/// # ★ Why the output moves and not the header
+///
+/// When a header field overlaps the caller's output, one of the two views has to come off
+/// the caller's memory. Moving the **output** is the choice that keeps the header where C
+/// keeps it -- in the caller's own buffers, written by the core through the same clamped
+/// `Cell` views, so `inflateGetHeader`'s fields still appear in the caller's structure and
+/// `deflateSetHeader`'s are still read from it at the moment C reads them. Moving the
+/// header instead would mean copying a field of caller-advertised capacity *and* copying it
+/// back, and for `inflateGetHeader` the copy back could not be bounded: the core reports no
+/// per-field written count, so an unwritten byte of the caller's buffer would have to be
+/// re-written from a snapshot. The produced-byte count, by contrast, is exact and already
+/// travels out of the core -- it is the cursor `publish` uses -- so [`OutputScratch::commit`]
+/// copies precisely the bytes the call produced and not one byte more.
+///
+/// # What a caller observes
+///
+/// Every byte the call produces, at the address it would have been written to, in the same
+/// order relative to the entry point's return. What changes is *when* within the call the
+/// bytes land, which matters only in the pathological case that makes this path run at all:
+/// a caller whose header field overlaps its own output has asked for two writers of one
+/// byte, and `zlib.h` L836-L852 already obliges it not to modify those buffers while the
+/// header is being written. C's own result there depends on the interleaving of the header
+/// states and the output writes and is unspecified; this is the more defined of the two, and
+/// the header bytes win only where the two ranges genuinely coincide.
+///
+/// Allocation goes through the stream's own `zalloc` for the reasons [`OverlapStage`]
+/// states in full, and the block goes back through the same `zfree` before the entry point
+/// returns, so a tracking allocator sees one strictly nested pair -- what
+/// `test/infcover.c`'s `mem_done()` checks. A refusal arrives as [`None`] and is reported,
+/// never worked around.
+#[cfg(feature = "libz-compat")]
+pub(crate) struct OutputScratch {
+    /// The staging block, `avail_out` bytes exactly. An [`Option`] because the release takes
+    /// the block out through the slot.
+    bytes: Option<Buffer<'static, u8>>,
+    /// The caller's `next_out`, where [`OutputScratch::commit`] copies the produced bytes.
+    destination: *mut Bytef,
+    /// The caller's `avail_out`, which is both the block's length and the extent the first
+    /// region handed to the core advertises.
+    extent: uInt,
+    /// How many bytes of the block earlier rounds have already produced.
+    ///
+    /// ★ **Why a cursor exists at all.** An entry point that stages its output may still run
+    /// the core more than once: an overlapping `(next_in, avail_in)` pair is served as a
+    /// sequence of [`OverlapStage`] windows, and each window is a separate core call. Every
+    /// one of those calls needs a region, and the second must begin where the first stopped or
+    /// it would overwrite what the first produced. So [`OutputScratch::region`] hands out the
+    /// *unwritten tail*, [`OutputScratch::advance`] records each round's production, and
+    /// [`OutputScratch::commit`] copies the accumulated total. A single-call entry point never
+    /// calls `advance`, so its cursor stays at zero and the behaviour is exactly what it was
+    /// when the block could only be handed out whole.
+    produced: usize,
+}
+
+#[cfg(feature = "libz-compat")]
+impl OutputScratch {
+    /// Allocates `avail_out` bytes of staging for the caller's output range, or reports
+    /// that the allocation failed.
+    ///
+    /// The block is requested as `avail_out` items of one byte, which is the shape
+    /// `ZALLOC(strm, avail_out, 1)` would have.
+    ///
+    /// # Safety
+    ///
+    /// `next_out` must be non-null and writable for `avail_out` bytes -- the ordinary C
+    /// contract for a non-zero `avail_out` -- and it must stay so until
+    /// [`OutputScratch::commit`] has run. Nothing is read or written here: the caller's
+    /// region is not touched until the commit, which is what makes this safe to call while
+    /// the header field views over the same bytes are being formed.
+    ///
+    /// The value must be released with [`OutputScratch::release`], passing the same
+    /// `allocator`, before it is dropped.
+    pub(crate) unsafe fn stage(
+        allocator: &StreamAllocator,
+        next_out: *mut Bytef,
+        avail_out: uInt,
+    ) -> Option<Self> {
+        let block = allocator.allocate_bytes(widen(avail_out), 1)?;
+        Some(Self {
+            bytes: Some(block),
+            destination: next_out,
+            extent: avail_out,
+            produced: 0,
+        })
+    }
+
+    /// The staging block as the write-only region the core writes output through.
+    ///
+    /// Built with [`output_region`], the same helper the caller's own buffer goes through,
+    /// so the core cannot tell the two apart and no second construction of an
+    /// [`OutputRegion`] exists to drift from the first.
+    ///
+    /// # Safety
+    ///
+    /// Call this **once**, and neither use the returned region nor touch `self` in any
+    /// other way after [`OutputScratch::commit`] has run: the region borrows the block
+    /// mutably for a fabricated `'static`, and the caller owns the ordering that keeps any
+    /// two of them apart.
+    #[must_use]
+    pub(crate) unsafe fn region(&mut self) -> OutputRegion<'static> {
+        let produced = self.produced;
+        let Some(block) = self.bytes.as_mut() else {
+            // Released already, which this function's contract forbids. An empty region is
+            // the one answer that cannot be unsound.
+            return OutputRegion::write_only(&mut [], init_view());
+        };
+        let Some(tail) = block.as_mut_slice().get_mut(produced..) else {
+            // `produced` can only have come from `advance`, which clamps it to the block's
+            // length, so this is unreachable -- and an empty region is the one answer that
+            // cannot be unsound. `get_mut` rather than an index because library code may not
+            // contain an operation that could panic (AAP 0.7.1 (f)).
+            return OutputRegion::write_only(&mut [], init_view());
+        };
+        let remaining = tail.len();
+        let base = tail.as_mut_ptr();
+        // `remaining` is at most `self.extent`, which came from a `uInt`, so the narrowing
+        // cannot lose information; `unwrap_or` keeps the expression panic-free rather than
+        // relying on that.
+        let extent = uInt::try_from(remaining).unwrap_or(self.extent);
+        // SAFETY: unsafe-site category 2 -- `output_region`'s contract, discharged over
+        // memory this value owns rather than the caller's: `base` is non-null and valid for
+        // `extent` bytes, because it is the tail of a block `stage` allocated `self.extent`
+        // bytes of and `extent` is that tail's own length, and nothing else borrows the
+        // block while the region lives -- this method's own contract. A zero extent yields
+        // an empty region without forming a slice, as it does for a caller's buffer.
+        unsafe { output_region(base, extent) }
+    }
+
+    /// Records that a round produced `produced` bytes, so the next
+    /// [`OutputScratch::region`] begins after them.
+    ///
+    /// Call this once per core call, with the count that call wrote through the region it
+    /// was given, and only after that region has fallen out of use. An entry point that
+    /// runs the core once never needs it: [`OutputScratch::commit`] is given the same total
+    /// either way.
+    pub(crate) fn advance(&mut self, produced: usize) {
+        let capacity = self
+            .bytes
+            .as_ref()
+            .map_or(0, |block| block.as_slice().len());
+        // Saturating and clamped rather than checked: the count comes from the core's own
+        // cursor into a region built over this block, so it cannot carry the sum past the
+        // capacity -- and library code may not panic (AAP 0.7.1 (f)).
+        self.produced = self.produced.saturating_add(produced).min(capacity);
+    }
+
+    /// Copies the bytes the call produced into the caller's output range.
+    ///
+    /// # Safety
+    ///
+    /// `produced` must be the number of bytes the core wrote through the *last* region
+    /// [`OutputScratch::region`] returned -- every earlier round's count having been recorded
+    /// with [`OutputScratch::advance`] -- that region must no longer be in use, and the
+    /// caller's `next_out` must still be writable for `avail_out` bytes -- the same
+    /// obligation that let [`OutputScratch::stage`] record it.
+    pub(crate) unsafe fn commit(&self, produced: usize) {
+        let Some(block) = self.bytes.as_ref() else {
+            return;
+        };
+        // Earlier rounds' output, plus this one's. `advance` accounts for every round but the
+        // last, whose count arrives here, so the sum is the whole production.
+        let produced = self.produced.saturating_add(produced);
+        let staged = block.as_slice();
+        // `min` rather than an assertion: the count comes from the core's own cursor into a
+        // region built over this block, so it cannot exceed the length -- and the library
+        // may not contain an operation that could panic (AAP 0.7.1 (f)), so the impossible
+        // case is clamped rather than checked.
+        let Some(written) = staged.get(..produced.min(staged.len())) else {
+            return;
+        };
+        if written.is_empty() {
+            return;
+        }
+        // SAFETY: unsafe-site category 2 -- one copy from storage this value owns into the
+        // caller's output range. The source is `written.len()` initialised bytes of this
+        // block; the destination is the caller's `next_out`, writable for `self.extent`
+        // bytes by this function's contract and for at least `written.len()` of them
+        // because every region the core wrote through was a window of this block, whose
+        // whole length is that same extent. The
+        // two are separate allocations -- the block came from the allocator, the
+        // destination is the caller's -- so they cannot overlap, and no Rust reference to
+        // either exists: the region is out of use by contract, and the destination is
+        // reached through the caller's own pointer.
+        unsafe {
+            core::ptr::copy_nonoverlapping(written.as_ptr(), self.destination, written.len());
+        }
     }
 
     /// Returns the block to the allocator it came from.
     ///
-    /// Must be called with the allocator [`AliasScratch::capture`] was given, and must be
-    /// called after every borrow taken through [`AliasScratch::view`] has ended.
+    /// Must be called with the allocator [`OutputScratch::stage`] was given, after
+    /// [`OutputScratch::commit`] and after every borrow taken through
+    /// [`OutputScratch::region`] has ended.
     pub(crate) fn release(&mut self, allocator: &StreamAllocator) {
         allocator.deallocate_bytes(&mut self.bytes);
     }
-
-    /// The captured bytes, with the `'static` lifetime the core's stream views require.
-    ///
-    /// # Safety
-    ///
-    /// The returned slice must not be used after `self` is dropped. Callers satisfy this
-    /// by keeping the [`AliasScratch`] alive in a binding that outlives the stream view
-    /// built from it -- the same discipline [`input_slice`] already relies on, and the
-    /// reason this returns `'static` at all: the core's stream types take owned lifetimes
-    /// that the raw C boundary cannot otherwise supply.
-    #[must_use]
-    pub(crate) unsafe fn view(&self) -> &'static [u8] {
-        let Some(block) = self.bytes.as_ref() else {
-            // Released already, which this function's contract forbids. An empty slice is
-            // the one answer that cannot be unsound.
-            return &[];
-        };
-        let captured = block.as_slice();
-        // SAFETY: unsafe-site category 2 -- one shared slice over memory this value owns.
-        // The pointer is non-null, aligned for `u8` and valid for `len` initialised bytes,
-        // because `capture` wrote every one of them; so the slice is well formed. The
-        // `'static` lifetime is fabricated and is exactly what this function's contract
-        // makes the caller responsible for.
-        unsafe { core::slice::from_raw_parts(captured.as_ptr(), captured.len()) }
-    }
-}
-
-/// The allocator an overlap snapshot for `strm` must be taken from.
-///
-/// [`StreamAllocator::from_stream_ptr`] reads the caller's published triple, which for any
-/// stream this library initialised is either the caller's own hooks or the library's own
-/// substituted routines -- exactly the pair `zlib.h` L151-L153 says a caller may observe.
-/// The fallback matters only for a stream that has no hooks at all, which no initialised
-/// stream is: [`StreamAllocator::internal`] then names the same two routines the
-/// substitution would have installed, so the snapshot is never taken from Rust's global
-/// allocator on any path.
-///
-/// # Safety
-///
-/// `strm` must be null or address a live [`z_stream`], as
-/// [`StreamAllocator::from_stream_ptr`] requires.
-#[cfg(feature = "libz-compat")]
-#[must_use]
-pub(crate) unsafe fn scratch_allocator(strm: z_streamp) -> StreamAllocator {
-    // SAFETY: unsafe-site category 4 -- reads the three hook members through raw places.
-    // `strm` is live or null by this function's contract, which is the helper's own.
-    let published = unsafe { StreamAllocator::from_stream_ptr(strm) };
-    match published {
-        Some(allocator) => allocator,
-        None => StreamAllocator::internal(),
-    }
-}
-
-/// [`AliasScratch::view`] lifted over [`Option`], which is the shape every caller wants.
-///
-/// The overlap check yields an `Option<AliasScratch>` -- [`None`] on the ordinary disjoint
-/// path -- and the stream builders take an `Option<&'static [u8]>`, so every call site would
-/// otherwise spell the same three-line `map` with the same safety comment. Naming it once
-/// keeps the invariant in one place.
-///
-/// # Safety
-///
-/// The returned slice must not be used after `scratch` is dropped, exactly as
-/// [`AliasScratch::view`] requires. Callers satisfy this by passing a borrow of a binding
-/// that outlives the stream view built from the result.
-///
-/// Gated on `libz-compat` for the reason [`AliasScratch`] is.
-#[cfg(feature = "libz-compat")]
-#[must_use]
-pub(crate) unsafe fn scratch_view(scratch: Option<&AliasScratch>) -> Option<&'static [u8]> {
-    scratch.map(|scratch| {
-        // SAFETY: unsafe-site category 2 -- `AliasScratch::view`'s contract is this
-        // function's, and this only forwards it: the caller owns the requirement that the
-        // slice not outlive the scratch it borrows.
-        unsafe { scratch.view() }
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2864,7 +3121,7 @@ const _: () = assert!(size_of::<c_int>() == size_of::<i32>());
 /// state->mode = SYNC;
 /// ```
 ///
-/// -- `test/infcover.c` L330 and L458 respectively.
+/// -- `test/infcover.c` L330 and L459 respectively.
 ///
 /// Measured layout those writes assume: `sizeof(struct inflate_state)` is 7160,
 /// `strm` is at offset **0** and `mode` is at offset **8** with width **4**. The
@@ -2913,7 +3170,9 @@ pub(crate) struct StatePrefix {
     /// ★ **This field costs nothing and closes a type-confusion hole the tag cannot.**
     /// [`StatePrefix::tag`] is four bytes at offset 8 inside a structure whose
     /// alignment is 8, so offsets 12 to 15 were already *padding* -- adding this field
-    /// leaves `size_of::<StatePrefix>()` at 16, which `layout_assertions` asserts.
+    /// leaves `size_of::<StatePrefix>()` at 16, which the const assertions below this
+    /// struct assert -- in THIS file, because they name a `pub(crate)` type that
+    /// `layout_assertions` cannot see.
     ///
     /// Nothing in C looks here. `deflate_state` has `Bytef *pending_buf` next, which
     /// the ABI places at offset 16, leaving 12 to 15 as padding; `inflate_state` has
@@ -3126,7 +3385,7 @@ impl<S> StateBlock<S> {
     ///
     /// Read this on entry and feed it to
     /// [`zlib_rs::inflate::InflateState::set_mode_tag`] so that a mode written by
-    /// caller code -- `test/infcover.c` L330 and L458 -- is honoured rather than
+    /// caller code -- `test/infcover.c` L330 and L459 -- is honoured rather than
     /// silently discarded.
     #[must_use]
     pub(crate) const fn tag(&self) -> c_int {

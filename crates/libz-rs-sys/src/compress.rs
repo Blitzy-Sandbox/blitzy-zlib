@@ -47,10 +47,13 @@
 //!    writes and is described nowhere, so this is a choice within the space C leaves
 //!    undefined -- and it is the more defined of the two.
 //!
-//!    ★ The *streaming* entry points answer it the same way and always did, through the
-//!    same `crate::types::AliasScratch`: `test/example.c`'s `test_large_deflate` overlaps
+//!    ★ The *streaming* entry points answer it the same way, through the same bounded
+//!    `crate::types::OverlapStage`: `test/example.c`'s `test_large_deflate` overlaps
 //!    `next_in` and `next_out` on purpose and the suite asserts the byte count that call
-//!    consumes. One rule, one mechanism, one allocator.
+//!    consumes. One rule, one mechanism, and -- because the stage is a fixed buffer the
+//!    operation is fed one window at a time rather than a copy of the caller's whole
+//!    `avail_in` -- no allocation at all, so an overlapping call's high-water mark is the
+//!    reference implementation's.
 //! 3. **A length out-parameter that points inside `source` or `dest` is served by
 //!    ordering.** *(No divergence.)* `*destLen = 0` (`compress.c` L36) is written before
 //!    either buffer is borrowed and the closing count after every borrow has ended, which
@@ -226,16 +229,16 @@ use core::mem::{size_of, MaybeUninit};
 
 use crate::types::init_view;
 use zlib_rs::compress::{
-    compress2_z_into as core_compress2_z_into, compress_bound_z as core_compress_bound_z,
+    compress2_z_from as core_compress2_z_from, compress_bound_z as core_compress_bound_z,
 };
 use zlib_rs::config::{normalize_deflate_level, Z_DEFAULT_COMPRESSION};
 use zlib_rs::error::ReturnCode;
-use zlib_rs::read_buf::OutputRegion;
-use zlib_rs::uncompress::uncompress2_z_into as core_uncompress2_z_into;
+use zlib_rs::read_buf::{OneShotSource, OutputRegion};
+use zlib_rs::uncompress::uncompress2_z_from as core_uncompress2_z_from;
 
 use crate::panic_guard::{fallback, guard, guard_code};
 use crate::types::{
-    ranges_are_disjoint, uLong, uLongf, z_size_t, AliasScratch, Bytef, StreamAllocator,
+    ranges_are_disjoint, uLong, uLongf, z_size_t, Bytef, OverlapStage, OVERLAP_STAGE_BYTES,
 };
 
 // ---------------------------------------------------------------------------
@@ -399,7 +402,7 @@ unsafe fn dest_slice<'a>(dest: *mut Bytef, len: usize) -> OutputRegion<'a> {
 // Staging, which is how an overlapping one-shot call is served
 // ---------------------------------------------------------------------------
 
-/// Copies the caller's input when it shares memory with the caller's output, so that an
+/// Stages the caller's input when it shares memory with the caller's output, so that an
 /// overlapping call runs instead of being refused.
 ///
 /// ★ **Overlap is an input these four entry points can receive, and C serves it.**
@@ -411,61 +414,123 @@ unsafe fn dest_slice<'a>(dest: *mut Bytef, len: usize) -> OutputRegion<'a> {
 ///
 /// What cannot happen is a `&[u8]` and a `&mut [u8]` over one region: that is undefined
 /// behaviour *whether or not either is ever touched*, and there is no later point at which
-/// it could be undone. So the input is copied first, while no mutable borrow exists, and the
-/// operation reads the copy. The output is then the only view of the caller's `dest`.
+/// it could be undone. So the input is copied first, while no mutable borrow of the output
+/// exists, and the operation reads the copy.
 ///
-/// The one observable difference from C is *which* bytes are compressed or decompressed when
-/// the output catches up with the unread input: C reads whatever it has just written over,
-/// whereas this reads the values the buffer held on entry. C's own answer there is
-/// unspecified -- it depends on the interleaving of the encoder's reads and writes -- so this
-/// is a choice within the space C leaves undefined, and it is the more defined of the two.
+/// ★ **The copy is bounded**, which is the difference between this and the allocated snapshot
+/// it replaces: it is a fixed stage the core is handed one window at a time, so an
+/// overlapping call's peak memory no longer grows with the caller's own `sourceLen`. See
+/// [`OverlapStage`] for the measurement that made that necessary and for the two respects in
+/// which an overlapping call can be told from C's -- both inside the space C leaves undefined.
+/// It also cannot *fail*, so `Z_MEM_ERROR` for an unobtainable snapshot is a status these
+/// entry points can no longer produce.
 ///
-/// The length out-parameters are deliberately *not* part of this test. A slot inside either
-/// buffer is served by ordering rather than by copying: the entry reads and the `*destLen = 0`
-/// of `compress.c` L36 happen before any borrow exists, and the closing write-back happens
-/// after every borrow has ended, which is exactly where C performs them.
+/// The length out-parameters are deliberately *not* part of the overlap test. A slot inside
+/// either buffer is served by ordering rather than by copying: the entry reads and the
+/// `*destLen = 0` of `compress.c` L36 happen before any borrow exists, and the closing
+/// write-back happens after every borrow has ended, which is exactly where C performs them.
 ///
-/// Returns [`StagedInput::Direct`] when the ranges are already disjoint -- the overwhelmingly
-/// common case, in which nothing is copied at all.
+/// Returns [`OneShotInput::Direct`] when the ranges are already disjoint -- the overwhelmingly
+/// common case, in which nothing is copied at all and the core applies C's own `uInt`-sized
+/// chunking and nothing else.
 ///
 /// # Safety
 ///
-/// `source` and `source_len` must satisfy [`AliasScratch::capture`]'s contract: either the
-/// length is zero, or that many bytes are readable at `source` and nothing mutates them for
-/// the duration of this call, with no mutable borrow of any part of the region in existence.
-/// This therefore has to run *before* the output is borrowed, not beside it.
+/// `source` and `source_len` must satisfy [`source_slice`]'s contract: either the length is
+/// zero, or that many bytes are readable at `source` and nothing mutates them for the duration
+/// of the call, with no mutable borrow of any part of the region in existence. This therefore
+/// has to run *before* the output is borrowed, not beside it.
 #[must_use]
 unsafe fn stage_one_shot_input(
-    allocator: &StreamAllocator,
     dest: *mut Bytef,
     dest_len: usize,
     source: *const Bytef,
     source_len: usize,
-) -> StagedInput {
+) -> OneShotInput {
     // Nothing is dereferenced to decide it: `ranges_are_disjoint` compares addresses.
     if ranges_are_disjoint(dest.cast_const(), dest_len, source, source_len) {
-        return StagedInput::Direct;
+        // SAFETY: unsafe-site category 2 -- `source_slice`'s contract is this function's,
+        // forwarded unweakened, and this arm is reached only when the region is disjoint from
+        // the output.
+        return OneShotInput::Direct(unsafe { source_slice(source, source_len) });
     }
-    // SAFETY: unsafe-site category 2 -- `AliasScratch::capture`'s contract is this
-    // function's, forwarded unweakened.
-    match unsafe { AliasScratch::capture(allocator, source, source_len) } {
-        Some(scratch) => StagedInput::Copied(scratch),
-        None => StagedInput::Failed,
+    OneShotInput::Staged {
+        origin: source,
+        total: source_len,
+        stage: OverlapStage::new(),
     }
 }
 
-/// What [`stage_one_shot_input`] decided.
-enum StagedInput {
-    /// The ranges are disjoint; borrow the caller's buffer directly.
-    Direct,
-    /// The ranges overlap and the bytes were copied; read the copy.
-    Copied(AliasScratch),
-    /// The ranges overlap and the copy could not be allocated.
-    ///
-    /// Reported as `Z_MEM_ERROR`, which is not an invented status: `zlib.h` L1284-L1286 and
-    /// L1330-L1332 already document it for these entry points as "not enough memory", and
-    /// that is precisely what happened.
-    Failed,
+/// What [`stage_one_shot_input`] decided, in the shape the core asks its input for.
+///
+/// ★ `clippy::large_enum_variant` is allowed here rather than obeyed, because the size
+/// difference it reports *is* the design and its remedy is the defect. The lint would have
+/// `Staged` boxed; a box is an allocation, and the whole reason this type exists is that the
+/// earlier design's allocation -- one block sized from the caller's own `sourceLen`, taken per
+/// call -- put a caller-controlled amount of memory on top of the reference implementation's
+/// per-stream footprint, which AAP §0.8.4 caps at 15%. Boxing would shrink the enum and
+/// reintroduce the allocation, and would do it from Rust's global allocator, where neither the
+/// caller's `zfree` accounting nor `test/infcover.c`'s `mem_limit()` can see it. A fixed
+/// [`OVERLAP_STAGE_BYTES`] of stack in a function C calls is the cost being chosen deliberately;
+/// the enum is one stack frame deep and its larger arm is never touched on the direct path.
+#[allow(clippy::large_enum_variant)]
+enum OneShotInput {
+    /// The ranges are disjoint; the core reads the caller's buffer directly.
+    Direct(&'static [u8]),
+    /// The ranges overlap; each window is copied into the bounded stage first.
+    Staged {
+        /// Base of the caller's input region.
+        origin: *const Bytef,
+        /// `sourceLen`, i.e. how much of it the call is to consume.
+        total: usize,
+        /// The bounded copy one window lives in.
+        stage: OverlapStage,
+    },
+}
+
+impl OneShotSource for OneShotInput {
+    fn total(&self) -> usize {
+        match self {
+            Self::Direct(bytes) => bytes.len(),
+            Self::Staged { total, .. } => *total,
+        }
+    }
+
+    fn max_window(&self) -> usize {
+        match self {
+            // No chunking beyond the core's own, so a disjoint call is byte-for-byte the call
+            // it was before bounded staging existed.
+            Self::Direct(_) => usize::MAX,
+            Self::Staged { .. } => OVERLAP_STAGE_BYTES,
+        }
+    }
+
+    fn window(&mut self, at: usize, len: usize) -> Option<&[u8]> {
+        let end = at.checked_add(len)?;
+        match self {
+            Self::Direct(bytes) => bytes.get(at..end),
+            Self::Staged {
+                origin,
+                total,
+                stage,
+            } => {
+                if end > *total {
+                    return None;
+                }
+                // SAFETY: unsafe-site category 2 -- `OverlapStage::fill`'s contract, which is
+                // `stage_one_shot_input`'s own: `total` bytes are readable at `origin` and
+                // nothing mutates them for the duration of the call, so the `len` bytes at
+                // `origin + at` are readable too, `end <= total` having just been established.
+                // No mutable borrow of that region exists -- the only mutable borrow this
+                // module creates is over the caller's *output*, and the whole reason this arm
+                // exists is that the two regions overlap, so the input is never borrowed
+                // mutably at all. `len` is at most `OVERLAP_STAGE_BYTES` because
+                // `max_window` says so and the core honours it, so the returned slice is
+                // exactly `len` bytes.
+                Some(unsafe { stage.fill(origin.wrapping_add(at), len) })
+            }
+        }
+    }
 }
 
 /// Reports whether `level` is one `deflateInit_` would accept.
@@ -589,52 +654,27 @@ pub unsafe extern "C" fn compress2_z(
             return fallback::STREAM_ERROR_CODE;
         }
 
-        // An overlapping pair is *served*, by copying the input first; see
-        // `stage_one_shot_input`. The allocator is the library's own routines, which is
-        // what C would use for this stream: `compress.c` L38-L40 leaves all three hook
-        // members null, so the substitution installs `zcalloc`/`zcfree`.
-        let allocator = StreamAllocator::internal();
+        // An overlapping pair is *served*, by staging the input in bounded windows; see
+        // `stage_one_shot_input`.
+        //
         // SAFETY: unsafe-site category 2 -- `stage_one_shot_input`'s contract. `source`
         // is readable for `sourceLen` bytes by the guard above and this function's
         // contract, and no mutable borrow of it exists: the output borrow is created
         // below, after this returns.
-        let mut staged =
-            unsafe { stage_one_shot_input(&allocator, dest, dest_len, source, sourceLen) };
-        if matches!(staged, StagedInput::Failed) {
-            return fallback::MEM_ERROR_CODE;
-        }
+        let mut staged = unsafe { stage_one_shot_input(dest, dest_len, source, sourceLen) };
 
         // Both views are built exactly once, inside a block that ends before the count is
         // written back -- which is what lets a `destLen` inside `dest` be written safely,
         // and is where C writes it (L63, after the loop). The helpers additionally map the
         // zero-length cases to genuine empty slices rather than to a dangling pointer.
         let report = {
-            let input = match &staged {
-                // SAFETY: unsafe-site category 2 -- `AliasScratch::view` fabricates
-                // `'static`, and its contract is that the slice must not outlive the
-                // scratch. `staged` is a local declared above this block and released
-                // below it, so the slice dies first.
-                StagedInput::Copied(scratch) => unsafe { scratch.view() },
-                // SAFETY: unsafe-site category 2 -- slice reconstruction. The guard above
-                // established that `source` is non-null whenever `sourceLen` is non-zero,
-                // the caller's contract makes those bytes readable and stable for the
-                // call, and this arm is reached only when they are disjoint from `dest`.
-                StagedInput::Direct | StagedInput::Failed => unsafe {
-                    source_slice(source, sourceLen)
-                },
-            };
             // SAFETY: unsafe-site category 2 -- slice reconstruction. The guard above
             // established that `dest` is non-null whenever `dest_len` is non-zero, and
             // the caller's contract makes those bytes writable; the only other view that
             // could have covered them has been replaced by a copy.
             let mut output = unsafe { dest_slice(dest, dest_len) };
-            core_compress2_z_into(&mut output, input, level)
+            core_compress2_z_from(&mut output, &mut staged, level)
         };
-
-        // The copy goes back to the allocator it came from, once nothing borrows it.
-        if let StagedInput::Copied(scratch) = &mut staged {
-            scratch.release(&allocator);
-        }
 
         // `compress.c` L36 and L63 together: the count is written on every path
         // past the guard. The core reports `produced == 0` for a failed encoder
@@ -727,41 +767,21 @@ pub unsafe extern "C" fn compress2(
             return fallback::STREAM_ERROR_CODE;
         }
 
-        // An overlapping pair is served by copying the input; see `stage_one_shot_input`.
-        let allocator = StreamAllocator::internal();
+        // An overlapping pair is served by staging the input in bounded windows; see
+        // `stage_one_shot_input`.
         // SAFETY: unsafe-site category 2 -- `stage_one_shot_input`'s contract, discharged
         // by the guard above and this function's own: `source` is readable for
         // `source_len` bytes and no mutable borrow of it exists yet.
-        let mut staged =
-            unsafe { stage_one_shot_input(&allocator, dest, dest_len, source, source_len) };
-        if matches!(staged, StagedInput::Failed) {
-            return fallback::MEM_ERROR_CODE;
-        }
+        let mut staged = unsafe { stage_one_shot_input(dest, dest_len, source, source_len) };
 
         let report = {
-            let input = match &staged {
-                // SAFETY: unsafe-site category 2 -- `AliasScratch::view`'s contract:
-                // `staged` outlives this block, so the slice dies first.
-                StagedInput::Copied(scratch) => unsafe { scratch.view() },
-                // SAFETY: unsafe-site category 2 -- slice reconstruction, once, under the
-                // guard above: `source` is non-null whenever `source_len` is non-zero and
-                // the caller's contract makes those bytes readable for the call. See
-                // `compress2_z`.
-                StagedInput::Direct | StagedInput::Failed => unsafe {
-                    source_slice(source, source_len)
-                },
-            };
             // SAFETY: unsafe-site category 2 -- slice reconstruction. `dest` is non-null
             // whenever `dest_len` is non-zero by the guard above, and the caller's
             // contract makes those bytes writable; the only other view that could have
             // covered them has been replaced by a copy.
             let mut output = unsafe { dest_slice(dest, dest_len) };
-            core_compress2_z_into(&mut output, input, level)
+            core_compress2_z_from(&mut output, &mut staged, level)
         };
-
-        if let StagedInput::Copied(scratch) = &mut staged {
-            scratch.release(&allocator);
-        }
 
         // L72: `*destLen = (uLong)got;` -- unconditional, and narrowing exactly as
         // C's cast narrows.
@@ -1003,49 +1023,29 @@ pub unsafe extern "C" fn uncompress2_z(
             return fallback::STREAM_ERROR_CODE;
         }
 
-        // An overlapping pair is served by copying the input; see `stage_one_shot_input`.
+        // An overlapping pair is served by staging the input in bounded windows; see
+        // `stage_one_shot_input`.
         // Neither length slot enters that decision: both are written after every borrow
         // has ended, which is where `uncompr.c` L74-L75 writes them. `uncompress` needs
         // no level gate either: it has no level argument, and `inflateInit` cannot reject
         // anything a caller supplied.
-        let allocator = StreamAllocator::internal();
         // SAFETY: unsafe-site category 2 -- `stage_one_shot_input`'s contract, discharged
         // by the guards above and this function's own: `source` is readable for
         // `source_len` bytes and no mutable borrow of it exists yet.
-        let mut staged =
-            unsafe { stage_one_shot_input(&allocator, dest, dest_len, source, source_len) };
-        if matches!(staged, StagedInput::Failed) {
-            return fallback::MEM_ERROR_CODE;
-        }
+        let mut staged = unsafe { stage_one_shot_input(dest, dest_len, source, source_len) };
 
         // Both views are built exactly once, inside a block that ends before either count
         // is written back. An empty output slice is additionally what discharges
         // `uncompr.c` L42-L43's "next_out cannot be NULL", with no scratch space to
         // manufacture.
         let report = {
-            let input = match &staged {
-                // SAFETY: unsafe-site category 2 -- `AliasScratch::view`'s contract:
-                // `staged` outlives this block, so the slice dies first.
-                StagedInput::Copied(scratch) => unsafe { scratch.view() },
-                // SAFETY: unsafe-site category 2 -- slice reconstruction. The guard above
-                // established that `source` is non-null whenever `source_len` is
-                // non-zero, and the caller's contract makes those bytes readable for the
-                // call.
-                StagedInput::Direct | StagedInput::Failed => unsafe {
-                    source_slice(source, source_len)
-                },
-            };
             // SAFETY: unsafe-site category 2 -- slice reconstruction. The guard above
             // established that `dest` is non-null whenever `dest_len` is non-zero, and
             // the caller's contract makes those bytes writable; the only other view that
             // could have covered them has been replaced by a copy.
             let mut output = unsafe { dest_slice(dest, dest_len) };
-            core_uncompress2_z_into(&mut output, input)
+            core_uncompress2_z_from(&mut output, &mut staged)
         };
-
-        if let StagedInput::Copied(scratch) = &mut staged {
-            scratch.release(&allocator);
-        }
 
         // `uncompr.c` L74-L75: `*sourceLen -= len; *destLen -= left;`.
         //
@@ -1140,44 +1140,24 @@ pub unsafe extern "C" fn uncompress2(
             return fallback::STREAM_ERROR_CODE;
         }
 
-        // As `uncompress2_z`: an overlapping pair is served by copying the input, and
-        // neither length slot enters that decision because both are written after every
-        // borrow has ended. `uLongf` is `uLong` (`zconf.h` L410), so both slots share one
-        // width here.
-        let allocator = StreamAllocator::internal();
+        // As `uncompress2_z`: an overlapping pair is served by staging the input in bounded
+        // windows, and neither length slot enters that decision because both are written
+        // after every borrow has ended. `uLongf` is `uLong` (`zconf.h` L410), so both slots
+        // share one width here.
+        //
         // SAFETY: unsafe-site category 2 -- `stage_one_shot_input`'s contract, discharged
         // by the guards above and this function's own: `source` is readable for
         // `source_len` bytes and no mutable borrow of it exists yet.
-        let mut staged =
-            unsafe { stage_one_shot_input(&allocator, dest, dest_len, source, source_len) };
-        if matches!(staged, StagedInput::Failed) {
-            return fallback::MEM_ERROR_CODE;
-        }
+        let mut staged = unsafe { stage_one_shot_input(dest, dest_len, source, source_len) };
 
         let report = {
-            let input = match &staged {
-                // SAFETY: unsafe-site category 2 -- `AliasScratch::view`'s contract:
-                // `staged` outlives this block, so the slice dies first.
-                StagedInput::Copied(scratch) => unsafe { scratch.view() },
-                // SAFETY: unsafe-site category 2 -- slice reconstruction, once, under the
-                // guard above: `source` is non-null whenever `source_len` is non-zero and
-                // the caller's contract makes those bytes readable for the call. See
-                // `uncompress2_z`.
-                StagedInput::Direct | StagedInput::Failed => unsafe {
-                    source_slice(source, source_len)
-                },
-            };
             // SAFETY: unsafe-site category 2 -- slice reconstruction. `dest` is non-null
             // whenever `dest_len` is non-zero by the guard above, and the caller's
             // contract makes those bytes writable; the only other view that could have
             // covered them has been replaced by a copy.
             let mut output = unsafe { dest_slice(dest, dest_len) };
-            core_uncompress2_z_into(&mut output, input)
+            core_uncompress2_z_from(&mut output, &mut staged)
         };
-
-        if let StagedInput::Copied(scratch) = &mut staged {
-            scratch.release(&allocator);
-        }
 
         // L88-L89, in C's order, each narrowing exactly as C's cast narrows.
         //
@@ -1720,10 +1700,17 @@ mod tests {
     /// caller the reference serves would stop working.
     ///
     /// What this implementation cannot do is form a `&[u8]` and a `&mut [u8]` over one
-    /// region, so the input is copied first and the operation reads the copy --
-    /// `stage_one_shot_input` documents the whole argument. The observable consequence is
-    /// the one asserted here: the call runs, reports a status from the operation rather
-    /// than an argument refusal, and writes the count.
+    /// region, so the operation is fed the input through `OverlapStage` -- a fixed 1 KiB
+    /// buffer refilled a window at a time, which `stage_one_shot_input` documents in full.
+    /// The staging is bounded rather than input-sized precisely so that an overlapping
+    /// call costs no allocation and no memory above the reference implementation's, and it
+    /// is invisible at the API: the observable consequence is the one asserted here, that
+    /// the call runs, reports a status from the operation rather than an argument refusal,
+    /// and writes the count.
+    ///
+    /// The last two cases below are the ones that matter for the bound: an input several
+    /// stage windows long, in both directions, so that the refill loop is exercised rather
+    /// than only its first iteration.
     #[test]
     fn overlapping_source_and_destination_are_served() {
         // The payload is written into the shared region first, so the overlapping call has
@@ -1828,6 +1815,174 @@ mod tests {
         assert_ne!(
             status, STREAM_ERROR,
             "the status must come from the decoder, not from an argument gate"
+        );
+
+        // ★ An input several stage windows long, which is what actually exercises the refill
+        // loop rather than only its first iteration -- and which is where an input-sized
+        // snapshot and a bounded stage stop being interchangeable. The payload is built from a
+        // repeating unit so that it compresses to something much smaller than itself, which
+        // makes the overlapping destination genuinely collide with the unread input.
+        let payload: Vec<u8> = HELLO.repeat(600);
+        assert!(
+            payload.len() > 4 * crate::types::OVERLAP_STAGE_BYTES,
+            "the fixture must span several stage windows, not one"
+        );
+
+        // The reference answer: the same payload compressed out of a disjoint source, so the
+        // only difference between the two calls is whether the input was staged.
+        let mut disjoint = vec![0_u8; payload.len() * 2];
+        let mut disjoint_len = narrow_uLong(disjoint.len());
+        // SAFETY: `disjoint` and `payload` are two distinct live allocations, and the lengths
+        // passed are their own.
+        let status = unsafe {
+            compress2(
+                disjoint.as_mut_ptr(),
+                &mut disjoint_len,
+                payload.as_ptr(),
+                narrow_uLong(payload.len()),
+                DEFAULT_LEVEL,
+            )
+        };
+        assert_eq!(status, OK, "the disjoint reference call must run");
+        let expected = disjoint[..widen_uLong(disjoint_len)].to_vec();
+
+        // The same compression, in place, over one buffer.
+        let mut shared = vec![0_u8; payload.len() * 2];
+        shared[..payload.len()].copy_from_slice(&payload);
+        let base = shared.as_mut_ptr();
+        let mut dest_len = narrow_uLong(shared.len());
+        // SAFETY: one live allocation, aliased on purpose; the operation reads the staged
+        // window and never holds a shared and an exclusive view of the region together.
+        let status = unsafe {
+            compress2(
+                base,
+                &mut dest_len,
+                base,
+                narrow_uLong(payload.len()),
+                DEFAULT_LEVEL,
+            )
+        };
+        assert_eq!(status, OK, "a multi-window overlapping call must run");
+        assert_eq!(
+            &shared[..widen_uLong(dest_len)],
+            &expected[..],
+            "staging the input a window at a time must not change a byte of the output"
+        );
+
+        // The `Z_NO_FLUSH` feeding above is what makes that byte-for-byte equality hold, and
+        // it holds for every level whose compressor buffers its input. Level 0 is the one
+        // exception -- `deflate_stored` sizes each stored block from the `avail_in` it is
+        // handed, so a window-sized feed produces window-sized blocks -- and it is documented
+        // as such above `OverlapStage`. It is inside the space C leaves undefined, because C's
+        // own overlapping level-0 path `memcpy`s a region onto itself. The round trip is what
+        // has to hold there, and it does:
+        let mut shared0 = vec![0_u8; payload.len() * 2];
+        shared0[..payload.len()].copy_from_slice(&payload);
+        let base0 = shared0.as_mut_ptr();
+        let mut dest_len0 = narrow_uLong(shared0.len());
+        // SAFETY: as above.
+        let status =
+            unsafe { compress2(base0, &mut dest_len0, base0, narrow_uLong(payload.len()), 0) };
+        assert_eq!(status, OK, "level 0 must run over an overlapping pair too");
+        let stored = shared0[..widen_uLong(dest_len0)].to_vec();
+
+        // And the decoder side, in place, over a stream several stage windows long: the bytes
+        // that come back are the bytes that went in.
+        for stream in [&expected, &stored] {
+            let mut shared = vec![0_u8; payload.len() + stream.len() + 64];
+            shared[..stream.len()].copy_from_slice(stream);
+            let base = shared.as_mut_ptr();
+            let mut got = shared.len();
+            let mut used = stream.len();
+            // SAFETY: one live allocation, aliased on purpose, whose extent is the length
+            // reported for the destination.
+            let status = unsafe { uncompress2_z(base, &mut got, base, &mut used) };
+            assert_eq!(status, OK, "a multi-window in-place inflate must run");
+            assert_eq!(got, payload.len(), "*destLen is the produced length");
+            assert_eq!(used, stream.len(), "*sourceLen is the consumed length");
+            assert_eq!(
+                &shared[..payload.len()],
+                &payload[..],
+                "and the round trip is exact"
+            );
+        }
+    }
+
+    /// No window the core is handed for a staged input can exceed the stage.
+    ///
+    /// ★ The bound itself, checked directly rather than inferred from an allocator ledger. The
+    /// streaming entry points can be measured through the caller's `zalloc` -- `benches/`'s
+    /// `deflate_memory` group emits a `-overlap` row per configuration and the gate requires its
+    /// high-water mark to equal the disjoint row's exactly -- but the one-shot wrappers cannot be:
+    /// `compress.c` L38 initialises its stream with the hook members zeroed, so the allocation
+    /// they make is the library's own and no caller hook can see it. What is left to check is the
+    /// property the bound actually rests on, and it is checkable at the source: whatever
+    /// `sourceLen` a caller supplies, the largest window [`OneShotSource`] will offer the core is
+    /// [`OVERLAP_STAGE_BYTES`], so the staging cost is a constant of this crate rather than a
+    /// function of the caller's argument.
+    ///
+    /// The disjoint arm is asserted in the same test and for the same reason: it must report no
+    /// bound at all, because a disjoint call has to be the call it was before bounded staging
+    /// existed -- the core's own `MAX_CHUNK` and nothing else.
+    #[test]
+    fn a_staged_window_is_bounded_by_the_stage_and_a_direct_one_is_not() {
+        use zlib_rs::read_buf::OneShotSource;
+
+        // Far past the stage, so a supplier that reported its own `sourceLen` would be caught.
+        let payload = vec![0x5a_u8; 8 * super::OVERLAP_STAGE_BYTES + 7];
+        let mut shared = vec![0_u8; payload.len() * 2];
+        shared[..payload.len()].copy_from_slice(&payload);
+        let base = shared.as_mut_ptr();
+
+        // Overlapping: same base for both, so `stage_one_shot_input` takes the staged arm.
+        // SAFETY: `base` addresses a live allocation of `shared.len()` bytes and the two lengths
+        // passed are inside it; nothing is dereferenced to decide the arm, which
+        // `ranges_are_disjoint` settles by comparing addresses.
+        let mut staged =
+            unsafe { super::stage_one_shot_input(base, shared.len(), base, payload.len()) };
+        assert_eq!(
+            staged.total(),
+            payload.len(),
+            "the total is the caller's whole sourceLen: the staging changes how it is delivered,              not how much"
+        );
+        assert_eq!(
+            staged.max_window(),
+            super::OVERLAP_STAGE_BYTES,
+            "and no window may exceed the stage, whatever sourceLen was"
+        );
+        // Every window the core can ask for, at the two extremes and across a boundary.
+        for at in [0, super::OVERLAP_STAGE_BYTES, payload.len() - 1] {
+            let len = super::OVERLAP_STAGE_BYTES.min(payload.len() - at);
+            let window = staged
+                .window(at, len)
+                .expect("an in-range window is served");
+            assert_eq!(window.len(), len);
+            assert_eq!(
+                window,
+                &payload[at..at + len],
+                "and it carries the caller's own bytes, taken before the output could land on them"
+            );
+        }
+        assert!(
+            staged.window(payload.len(), 1).is_none(),
+            "a window past the total is refused rather than clamped, so a mis-stepped loop              cannot read a byte the caller never offered"
+        );
+
+        // Disjoint: the tail of the buffer as the source, the head as the destination.
+        let mut shared = vec![0_u8; payload.len() * 2];
+        shared[payload.len()..].copy_from_slice(&payload);
+        let base = shared.as_mut_ptr();
+        // SAFETY: `[0, payload.len())` and `[payload.len(), 2 * payload.len())` lie inside the
+        // same live allocation and share no byte.
+        let direct = unsafe {
+            let tail = base.add(payload.len());
+            super::stage_one_shot_input(base, payload.len(), tail, payload.len())
+        };
+        assert_eq!(direct.total(), payload.len());
+        assert_eq!(
+            direct.max_window(),
+            usize::MAX,
+            "a disjoint call reports no bound, so it is chunked exactly as it was before the              stage existed"
         );
     }
 

@@ -77,13 +77,16 @@
 # on its own names a rustc platform tier rather than a commitment by this port:
 #
 #   FULLY VERIFIED  x86_64-unknown-linux-gnu.  The only target the port is
-#                   built, tested, PACKAGED and measured on.  SIXTEEN of the
-#                   EIGHTEEN jobs in `.github/workflows/rust.yml` run
-#                   `ubuntu-latest` and nothing else; the two that do not are
-#                   `build-test`, whose matrix adds a macOS and a Windows row,
-#                   and `bench`, which runs on `ubuntu-latest` unless the
-#                   `ZLIB_RS_BENCH_RUNNER` repository variable redirects it to a
-#                   machine that already carries the Silesia corpus.  The sixteen
+#                   built, tested, packaged, MEASURED and benchmarked on, and the
+#                   only one where every gate runs.  EIGHTEEN of the TWENTY-TWO
+#                   jobs in `.github/workflows/rust.yml` run `ubuntu-latest` and
+#                   nothing else; the four that do not are `build-test`, whose
+#                   matrix adds a macOS and a Windows row, `platform-abi-macos`
+#                   and `platform-abi-windows`, which are those two platforms'
+#                   packaged-artifact gates, and `bench`, which runs on
+#                   `ubuntu-latest` unless the `ZLIB_RS_BENCH_RUNNER` repository
+#                   variable redirects it to a machine that already carries the
+#                   Silesia corpus.  The eighteen
 #                   are the ones that
 #                   establish the measured claims made across this workspace:
 #                   struct sizes and offsets, the 95-function / 111-global symbol
@@ -92,32 +95,71 @@
 #                   drop-in relink, Miri, ASan, the differential sweeps and the
 #                   benchmarks.
 #
-#   BUILT AND       macOS and Windows, on the host triple each GitHub runner image
-#   TESTED ONLY     provides -- `rustup toolchain install stable` fetches the host
+#   BUILT, TESTED   macOS and Windows, on the host triple each GitHub runner image
+#   AND ABI-GATED   provides -- `rustup toolchain install stable` fetches the host
 #                   target and no other, so no cross-compilation is involved.  The
 #                   `build-test` job's matrix carries a `macos-latest` and a
 #                   `windows-latest` row beside the Ubuntu one, and all three run
 #                   the same three commands: `cargo build --locked --release`, the
 #                   same with `--features libz-compat`, and `cargo test --locked
-#                   --workspace --release`.  So the library compiles and its test
-#                   suites pass on both, and that is the whole of what those rows
-#                   establish.  Everything platform-specific is UNVERIFIED there,
-#                   because no job that measures it runs there: no symbol parity,
-#                   no header comparison, no packaging, no sanitizer, no benchmark.
-#                   Treat any platform-specific number as unverified off Linux.
+#                   --workspace --release`.  That is the whole of what those ROWS
+#                   establish -- with one addition on macOS:
+#                   `.github/workflows/cmake.yml`'s `macOS Clang Rust' row
+#                   configures `-DZLIB_BUILD_RUST=ON -DZLIB_BUILD_SHARED=OFF' on
+#                   `macos-latest' and runs the CTest suite, so the CMake STATIC
+#                   Rust path -- cargo producing `libz.a', the derived install name,
+#                   the exported static target -- is executed off ELF.  CMake's
+#                   SHARED half is not: CMakeLists refuses that configuration on
+#                   Apple rather than attempting it, because its relink needs
+#                   -soname and --version-script.
 #
-#   NOT PACKAGED    Windows specifically.  Compiling is not the same as producing a
-#                   drop-in replacement, and the packaging half is not wired:
-#                   `crates/libz-rs-sys/build.rs` emits neither a soname nor a
-#                   version script for PE/COFF, and the PE analogue of `zlib.map`
-#                   is `win32/zlib.def`, which this port does not consume.  The
-#                   Mach-O branch in that build script exists but is likewise
-#                   unexercised, since the packaging targets are Make and CMake
-#                   rules that only run on the Linux jobs.  Windows-only ITEMS in
-#                   the source -- `gzopen_w` behind `#[cfg(windows)]`, the `_WIN32`
-#                   entries in `cbindgen.toml`'s `[defines]` -- keep the port
-#                   coherent for that platform; they are not a claim that a
-#                   Windows drop-in install has been produced or tried.
+#                   The packaged ABI on each of those two formats is gated by its
+#                   own job, and this entry used to say it was not gated at all:
+#                   `platform-abi-macos` measures the `-install_name` build.rs
+#                   emits, stages the dylib from the complete archive with an
+#                   exported-symbols list DERIVED from zlib.h, compares the export
+#                   table against the contract, and relinks and runs the three
+#                   unmodified C drivers with an `otool -L` proof that no system
+#                   zlib is bound.  `platform-abi-windows` reads the PE export
+#                   table, requires `gzopen_w` (which no Linux job can see), and
+#                   has MSVC compile a C consumer plus the unmodified
+#                   test/minigzip.c against cargo's import library and run them --
+#                   which also exercises the `gzgetc` MACRO, whose field
+#                   arithmetic a second compiler expands against a library rustc
+#                   built.
+#
+#                   STILL UNVERIFIED off Linux: the header comparison, the
+#                   sanitizers, Miri, the differential sweeps and the benchmarks.
+#                   Treat any performance number as unverified off Linux.
+#
+#   NOT INSTALLED   Windows specifically, and only the INSTALL half.  A consumer
+#                   can link cargo's `z.dll.lib` and load `z.dll` without
+#                   recompiling, and `platform-abi-windows` proves exactly that
+#                   with an MSVC C consumer.  What is not wired is the packaged,
+#                   versioned, export-controlled install: `build.rs` emits neither
+#                   a soname nor a version script for PE/COFF, because the PE
+#                   analogue of `zlib.map` is `win32/zlib.def`, which AAP 0.2.2.3
+#                   places out of scope.  The visible consequence is that `z.dll`
+#                   does not export `gzprintf` or `gzvprintf` -- both live in the C
+#                   shim, and a rustc-linked cdylib cannot re-export a
+#                   native-archive symbol -- so
+#                   `.github/scripts/platform_abi_gate.py` records those two
+#                   absences with their reason rather than letting them pass
+#                   unnoticed.  The Mach-O branch of that build script IS now
+#                   exercised, by `platform-abi-macos`, which stages that format's
+#                   shared library outside Make and CMake -- both of which refuse
+#                   it, since their packaging rules are ELF-only.
+#
+#   COMPILED, NOT   i686-unknown-linux-gnu (ILP32) and x86_64-pc-windows-gnu
+#   RUN             (LLP64).  The `integer-models` job cross-compiles
+#                   `-p zlib-rs -p libz-rs-sys --all-targets` for both from
+#                   ubuntu-latest, with gcc-multilib and mingw-w64 respectively.
+#                   It runs nothing.  What it establishes is the one thing that
+#                   cannot be established on LP64 alone: that the layout
+#                   assertions and every `c_ulong`/`z_size_t`/`z_off_t` use still
+#                   hold where `unsigned long` is 4 bytes, which is exactly the
+#                   hazard AAP 0.6.3.3 records.  A compile failure there is a real
+#                   ABI defect; a pass is not a claim that anything was executed.
 #
 #   NOT BUILT       Every other triple, including aarch64-unknown-linux-gnu.  The
 #                   source is written to be portable and nothing in the core is

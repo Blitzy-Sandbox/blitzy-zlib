@@ -2658,6 +2658,48 @@ mod tests {
     }
 
     #[test]
+    fn state_footprint_matches_the_c_budget() {
+        // C's `deflate_state` (`deflate.h` L104-L288) is 5968 bytes on LP64, the figure
+        // `crates/libz-rs-sys/tests/gz_memory.rs` obtains from a C probe rather than from a
+        // literal. AAP §0.8.4 caps a per-stream footprint at 115% of C, which is 6863 bytes,
+        // and the range assertion below is that contract.
+        //
+        // The three exact sizes are pinned on 64-bit targets, and pinning all three rather
+        // than one is the point: this type is generic over its allocator, so "the size of a
+        // deflate state" is not a single number. A zero-sized `GlobalAllocator` adds nothing,
+        // a reference adds one word, and a `&dyn` handle adds two -- so a prose figure that
+        // names only one form is wrong for the other two, which is exactly how the stale 6144
+        // in `crate::gz::state`'s memory note came about. A change in field layout, or in how
+        // much space an allocator handle occupies, has to be acknowledged here rather than
+        // silently drifting toward the bound.
+        //
+        // The facade's own forms -- `DeflateState<'_, StreamAllocator>` at 6312, the slot that
+        // adds the caller's `gz_header` pointer at 6320, and the `StateBlock` that adds the
+        // C-visible prefix at 6336 -- are pinned on the other side of the boundary, by
+        // `libz_rs_sys::deflate`'s `the_facade_state_block_footprint_matches_the_c_budget`,
+        // because `StreamAllocator` is that crate's type and is not nameable from here.
+        let global = size_of::<DeflateState<'static, GlobalAllocator>>();
+        let shared_allocator = size_of::<DeflateState<'static, &'static GlobalAllocator>>();
+        let dynamic_allocator = size_of::<DeflateState<'static, &'static dyn Allocator<'static>>>();
+        if cfg!(target_pointer_width = "64") {
+            assert_eq!(global, 6192);
+            assert_eq!(shared_allocator, 6232);
+            assert_eq!(dynamic_allocator, 6272);
+        }
+        for (label, measured) in [
+            ("GlobalAllocator", global),
+            ("&GlobalAllocator", shared_allocator),
+            ("&dyn Allocator", dynamic_allocator),
+        ] {
+            assert!(
+                measured <= 6863,
+                "DeflateState<{label}> is {measured} bytes, above the 6863-byte ceiling 115% of \
+                 C's 5968 sets"
+            );
+        }
+    }
+
+    #[test]
     fn hash_shift_invariant_holds_for_every_mem_level() {
         // "It must be such that after MIN_MATCH steps, the oldest byte no longer
         // takes part in the hash key, that is: hash_shift * MIN_MATCH >=

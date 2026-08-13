@@ -54,25 +54,31 @@
 //! (its L618-L639) calls the C symbol directly, twice, in order to provoke the
 //! `ENOUGH`-exceeded return that a well-behaved `inflate()` never can.
 //!
-//! ★ **It is not this module that defines that name.** `inftrees.h` L53-L62 declares
-//! the first parameter as a `codetype` enum, and a Rust `extern "C" fn` cannot spell
-//! a C enum, so a translation unit that restates the prototype exactly is the only
-//! way for `infcover.c` to see a declaration and a definition that agree. That unit
-//! is `crates/libz-rs-sys/csrc/inftrees_shim.c`, which `build.rs` compiles and
-//! archives into `libz.a`; it carries `inftrees.h`'s prototype verbatim and
-//! `ZLIB_INTERNAL` visibility, and it forwards to [`_zlib_rs_inflate_table`] below.
-//! What this module exports is that underscore-prefixed name, which `zlib.map`'s
-//! `local: _*;` (L18) keeps hidden.
+//! ★ **This module defines that name, in Rust.** `inftrees.h` L53-L62 declares the
+//! first parameter as a `codetype` enum, which no Rust signature can name, so
+//! [`inflate_table`] below takes a plain [`c_int`] and **validates** it — a
+//! `#[repr(C)]` Rust enum would render the prototype correctly and then turn a C
+//! caller's arbitrary `int` into undefined behaviour on construction. The two
+//! spellings are ABI-identical: an enumeration of 0, 1 and 2 is passed in a 32-bit
+//! register exactly as an `int` is. What a Rust definition gives up is the C
+//! compiler's *declaration*-compatibility check, and that check has one subject —
+//! a translation unit that both includes `inftrees.h` and defines this function.
+//! No such unit exists anywhere in this tree; the consumer that matters includes
+//! `inftrees.h` and *calls* the symbol, so `make rust-test`, which compiles and
+//! links the unmodified `test/infcover.c` against the staged archive, is where a C
+//! compiler still performs it.
 //!
 //! Being absent from the shared object and present in the archive are facts about
-//! two different artifacts, and both are the C build's own.
-//! `--version-script=zlib.map` is a *shared object* link argument, so it localises
-//! the name in `libz.so`; the `staticlib` archive is not linked at all, so the
-//! name stays a `T` in `libz.a`, which is what `infcover` links against
-//! (`Makefile.in` L121-L122, and decisively `test/CMakeLists.txt` L95-L96, which
-//! links it to `ZLIB::ZLIBSTATIC`). Measured: `readelf -sW` reports the archive's
-//! definition as FUNC GLOBAL HIDDEN, matching the C build, and the 111-symbol
-//! parity diff polices both halves automatically.
+//! two different artifacts, and both are the C build's own. A version script and
+//! ELF hidden visibility are *shared object* mechanisms, so the name is localised
+//! in `libz.so` — by `--version-script=zlib.map` for the packaged library, and by
+//! the `.hidden` directive in `crates/libz-rs-sys/src/lib.rs` for the `cdylib`
+//! cargo links directly, which no version script of this project's reaches. The
+//! `staticlib` archive is not linked at all, so the name stays a `T` in `libz.a`,
+//! which is what `infcover` links against (`Makefile.in` L121-L122, and decisively
+//! `test/CMakeLists.txt` L95-L96, which links it to `ZLIB::ZLIBSTATIC`). Measured:
+//! `readelf -sW` reports the archive's definition as FUNC GLOBAL HIDDEN, matching
+//! the C build, and the 111-symbol parity diff polices both halves automatically.
 //!
 //! `inflate_table` is the **only** name from either `local:` block that is
 //! exported. The other nine — `deflate_copyright`, `inflate_copyright`,
@@ -87,7 +93,7 @@
 //!
 //! ```c
 //! ((struct inflate_state *)strm.state)->mode = DICT;   /* L330 */
-//! state->mode = SYNC;                                  /* L458, inside pull() */
+//! state->mode = SYNC;                                  /* L459, inside pull() */
 //! ```
 //!
 //! Those assignments are compiled into *caller* object code that this port cannot
@@ -118,7 +124,7 @@
 //! | Category | Where it appears here |
 //! |---|---|
 //! | 1 — stream-pointer validation | [`entry`], [`inflateInit2_`], [`inflateCopy`] |
-//! | 2 — slice reconstruction | [`inflate`], [`inflateSync`], [`inflateSetDictionary`], [`inflateGetDictionary`], [`_zlib_rs_inflate_table`] |
+//! | 2 — slice reconstruction | [`inflate`], [`inflateSync`], [`inflateSetDictionary`], [`inflateGetDictionary`], [`inflate_table`] |
 //! | 3 — the opaque `state` round-trip | [`entry`], [`inflateEnd`], [`inflateCopy`] |
 //! | 4 — invoking `zalloc`/`zfree` | [`inflateInit2_`], [`inflateEnd`], [`inflateCopy`], and every state recovery |
 //! | 5 — reading a caller's C string | the `version` argument of [`inflateInit_`] and [`inflateInit2_`], read by [`version_error`] |
@@ -194,9 +200,10 @@ use crate::panic_guard::{fallback, guard, guard_code};
 use crate::types::{
     checked_state_mut, code, code_type_from_raw, commit_state, copy_stream, discard_reserved_state,
     gz_headerp, input_slice, install_state, output_region, publish_state, ranges_are_disjoint,
-    reserve_state, scratch_allocator, scratch_view, streams_are_disjoint, take_state, uInt, uLong,
-    widen, z_stream, z_streamp, AliasScratch, Bytef, StateBlock, StateKind, StreamAllocator,
+    reserve_state, streams_are_disjoint, take_state, uInt, uLong, widen, z_stream, z_streamp,
+    Bytef, HeaderRanges, OutputScratch, OverlapStage, StateBlock, StateKind, StreamAllocator,
 };
+use crate::{Z_BLOCK, Z_NO_FLUSH};
 
 /// The largest documented `flush` value: `Z_TREES` (`zlib.h` L178).
 ///
@@ -308,7 +315,7 @@ struct Session<'s> {
 /// state with `set_mode_tag`. C's `state->mode` *is* the tag, so a mode written by
 /// caller code is simply the mode; here they are separate storage, and this
 /// assignment is what makes `test/infcover.c`'s `->mode = DICT` (L330) and
-/// `->mode = SYNC` (L458) take effect instead of being silently discarded. The tag
+/// `->mode = SYNC` (L459) take effect instead of being silently discarded. The tag
 /// has already been range-checked, so `set_mode_tag` cannot reject it — but its
 /// answer is honoured anyway rather than ignored, because a `false` would mean the
 /// two range predicates had drifted apart and continuing would be worse than
@@ -447,7 +454,7 @@ impl Session<'_> {
     /// pair is an input this library can be handed.
     ///
     /// It is **served**, not refused. This reports the condition; the caller answers it by
-    /// snapshotting the input with [`AliasScratch`] before any mutable borrow exists and
+    /// staging the input with [`OverlapStage`] before any mutable borrow exists and
     /// passing the snapshot to `with_buffers` in the caller's place, which keeps the two
     /// borrows apart without changing what the call consumes. `deflate` does the same, and
     /// there it is not optional: `test/example.c` overlaps the pair deliberately.
@@ -508,9 +515,22 @@ impl Session<'_> {
     /// # `input_override`
     ///
     /// [`Some`] substitutes that slice for a borrow of `(next_in, avail_in)`, which is how an
-    /// overlapping buffer pair is served rather than refused. It must be exactly `avail_in`
-    /// bytes long, because the write-back derives the caller's new `avail_in` from the cursor
-    /// into it. [`AliasScratch`] produces it and documents the reasoning.
+    /// overlapping buffer pair is served rather than refused. It may be *shorter* than
+    /// `avail_in`, because the stage that produces it is bounded: the write-back derives the
+    /// caller's new `avail_in` from `avail_in` minus the cursor into the override, so a short
+    /// override simply leaves the residue for the next window. [`OverlapStage`] produces it
+    /// and documents the reasoning.
+    ///
+    /// # `staged_output`
+    ///
+    /// The same answer for the other direction, and the case it serves is a `gz_header` field
+    /// buffer that overlaps `(next_out, avail_out)` — see [`Session::header_alias_plan`]. The
+    /// nine header states write *through* those buffers (`inflate.c` L607-L613, L624-L627,
+    /// L659-L662), so a shared `Cell` view of them cannot coexist with an exclusive borrow of
+    /// an output region covering the same bytes. [`Some`] substitutes a block this library owns
+    /// for that borrow; the bytes the decoder produces are copied into the caller's buffer
+    /// below, before the cursors are advanced. It must be exactly `avail_out` bytes long,
+    /// because the core's cursor into it becomes an offset into the caller's buffer.
     ///
     /// # Safety
     ///
@@ -519,10 +539,14 @@ impl Session<'_> {
     /// readable and writable regions. When `input_override` is [`None`] the two must
     /// additionally not overlap — the contract `zlib.h` L138-L139 places on the application.
     /// When it is [`Some`], the caller's input region is not borrowed at all and only the
-    /// override's own bytes are read, so the two regions may overlap freely.
+    /// override's own bytes are read, so the two regions may overlap freely. When
+    /// `staged_output` is [`None`] the output region must likewise be disjoint from every
+    /// `gz_header` field buffer this call writes through; when it is [`Some`] that requirement
+    /// is discharged by construction, because the caller's output region is not borrowed.
     unsafe fn with_buffers<F>(
         &mut self,
         input_override: Option<&'static [u8]>,
+        staged_output: Option<&mut OutputScratch>,
         body: F,
     ) -> ReturnCode
     where
@@ -562,7 +586,7 @@ impl Session<'_> {
         let input = match input_override {
             // The overlapping-buffer path: the caller's input has already been copied and
             // the copy is what the decoder reads, so no borrow of the caller's input region
-            // is formed at all. `AliasScratch` documents why a copy rather than a refusal.
+            // is formed at all. `OverlapStage` documents why a bounded copy rather than a refusal.
             Some(captured) => captured,
             // SAFETY: unsafe-site category 2 -- slice reconstruction, performed exactly
             // once per call. `input_slice` branches on a zero length or a null pointer and
@@ -572,10 +596,23 @@ impl Session<'_> {
             // contract, so the shared and mutable borrows cannot alias.
             None => unsafe { input_slice(next_in, avail_in) },
         };
-        // SAFETY: unsafe-site category 2, as above -- and the output is **write-only**
-        // storage rather than a byte slice, because `avail_out` bytes of room is all
-        // `zlib.h` L94-L95 promises about it. `output_region` states that argument in full.
-        let output = unsafe { output_region(next_out, avail_out) };
+        let mut staged_output = staged_output;
+        let output = match staged_output.as_deref_mut() {
+            // The overlapping-header path: the decoder writes into a block this library owns
+            // and the commit below moves the produced bytes into the caller's buffer, so no
+            // borrow of the caller's output region is formed at all. `OutputScratch` documents
+            // why a staged write rather than a refusal.
+            //
+            // SAFETY: unsafe-site category 2 -- `OutputScratch::region`'s contract. The block
+            // is live for the whole call, is `avail_out` bytes long, and the region is taken
+            // exactly once, so nothing else views those bytes while the decoder holds it.
+            Some(staged) => unsafe { staged.region() },
+            // SAFETY: unsafe-site category 2, as above -- and the output is **write-only**
+            // storage rather than a byte slice, because `avail_out` bytes of room is all
+            // `zlib.h` L94-L95 promises about it. `output_region` states that argument in
+            // full. On this arm no header field overlaps it, by this function's contract.
+            None => unsafe { output_region(next_out, avail_out) },
+        };
 
         let mut stream = InflateStream {
             input,
@@ -594,6 +631,19 @@ impl Session<'_> {
         let consumed = stream.next_in;
         let produced = stream.next_out;
         let published = core::mem::replace(&mut self.block.state_mut().msg, stream.msg);
+
+        // The staged output reaches the caller's buffer here: after the last use of `stream`,
+        // so no borrow of the staging block is live, and before the cursors below are advanced,
+        // so the copy lands at the address this call started from.
+        if let Some(staged) = staged_output.as_deref() {
+            // SAFETY: unsafe-site category 2 -- `OutputScratch::commit`'s contract. `produced`
+            // is the core's own cursor into the region built over that block, that region is
+            // out of use, and the caller's `next_out` is writable for `avail_out` bytes by this
+            // function's contract.
+            unsafe {
+                staged.commit(produced);
+            }
+        }
 
         // Advancing the caller's cursors, exactly as C's `strm->next_in += have` does once
         // the input is consumed. The zero guard is what keeps a null pointer out of `add`,
@@ -817,18 +867,62 @@ impl Session<'_> {
     /// mode is a header state, which are the calls during which the caller is
     /// still obliged to keep the structure alive.
     unsafe fn bind_header_fields(&mut self) {
+        // SAFETY: unsafe-site category 6 -- `header_fields`' contract is this function's,
+        // and it answers `None` without reading anything when no binding is to be made.
+        let Some(fields) = (unsafe { self.header_fields() }) else {
+            return;
+        };
+        let [(extra, extra_max), (name, name_max), (comment, comm_max)] = fields;
+
+        // SAFETY: unsafe-site category 6 -- each buffer is null or valid for its
+        // advertised capacity by this function's contract, which is exactly what
+        // `header_field` requires. The three ranges are permitted to overlap, which is
+        // why they become *shared* `Cell` slices -- `test/infcover.c` L305-L310 points
+        // all three at one buffer.
+        let (extra, name, comment) = unsafe {
+            (
+                header_field(extra, extra_max),
+                header_field(name, name_max),
+                header_field(comment, comm_max),
+            )
+        };
+
+        // Reached in place: the sink is 100-odd bytes and this runs before every call, so a
+        // copy out and back would move it twice for a change to three pointers.
+        self.state_mut()
+            .with_header_sink(|sink| sink.rebind_fields(extra, name, comment));
+    }
+
+    /// The three `gz_header` buffers this call will write through, with the capacities the
+    /// caller advertised for them, or [`None`] when this call writes none.
+    ///
+    /// Extracted from [`Session::bind_header_fields`] so that
+    /// [`Session::header_alias_plan`] can compare the same addresses **before** any borrow
+    /// exists, and so that the two can never disagree about which calls read the caller's
+    /// structure at all. The three gates are, in order: no header installed; the core holds
+    /// no sink; and the parse is not resuming in a header state -- the lifetime gate that
+    /// keeps this from touching a structure `zlib.h` L1070-L1090 lets the caller release
+    /// once the header is complete.
+    ///
+    /// # Safety
+    ///
+    /// The `gz_header` recorded in the slot must be live for the duration of the call, as
+    /// [`Session::bind_header_fields`] documents. Nothing is dereferenced *through* the three
+    /// buffer pointers here; only the structure's own members are read.
+    #[must_use]
+    unsafe fn header_fields(&self) -> Option<[(*mut Bytef, uInt); 3]> {
         let head = self.block.state().head;
         if head.is_null() {
-            return;
+            return None;
         }
         if !self.state().has_header_sink() {
-            return;
+            return None;
         }
         // The lifetime gate described above. Checked after the two cheap pointer
         // tests and before anything is read, so that a stream whose header is
         // finished performs no access to the caller's structure whatsoever.
         if !self.state().dereferences_gzip_header() {
-            return;
+            return None;
         }
 
         // SAFETY: unsafe-site category 6 -- reads the three buffer pointers of the
@@ -879,23 +973,68 @@ impl Session<'_> {
             unsafe { core::ptr::addr_of!((*head).comm_max).read() }
         };
 
-        // SAFETY: unsafe-site category 6 -- each buffer is null or valid for its
-        // advertised capacity by this function's contract, which is exactly what
-        // `header_field` requires. The three ranges are permitted to overlap, which is
-        // why they become *shared* `Cell` slices -- `test/infcover.c` L305-L310 points
-        // all three at one buffer.
-        let (extra, name, comment) = unsafe {
+        Some([(extra, extra_max), (name, name_max), (comment, comm_max)])
+    }
+
+    /// Whether a `gz_header` buffer this call writes through overlaps the caller's input or
+    /// output range, and therefore which side has to move onto storage this library owns.
+    ///
+    /// ★ **BACKEND-ALIAS-01, the inflate half.** The three fields become
+    /// `Cell<MaybeUninit<u8>>` slices over the caller's memory and the nine header states
+    /// **write** through them (`inflate.c` L607-L613, L624-L627, L659-L662), while
+    /// [`Session::with_buffers`] holds a shared `&[u8]` over `(next_in, avail_in)` and an
+    /// exclusive region over `(next_out, avail_out)`. `zlib.h` L1070-L1096 requires no
+    /// disjointness -- it describes the buffers and their capacities and says nothing about
+    /// the stream's own pointers -- so a conforming caller may point `name` into either. Both
+    /// arrangements are undefined behaviour in Rust and neither is in C:
+    ///
+    /// * against the **output**, an exclusive borrow and a `Cell` borrow of one byte may not
+    ///   both be live, used or not;
+    /// * against the **input**, the frozen `&[u8]` and the `Cell` view are both shared, but a
+    ///   write through the `Cell` invalidates the frozen view, and the decoder then keeps
+    ///   reading input through it.
+    ///
+    /// So the answer is the one [`AliasScratch`] and [`OutputScratch`] already give for the
+    /// caller's own overlapping pair: snapshot the input, or stage the output, and serve the
+    /// layout rather than refusing it. Nothing is dereferenced to decide it -- this is
+    /// address arithmetic on members read raw -- which is what lets it run before the first
+    /// borrow exists.
+    ///
+    /// # Safety
+    ///
+    /// [`Session::header_fields`]' contract, and `self.strm` must be the live, validated
+    /// stream [`entry`] produced with its four buffer members initialised.
+    #[must_use]
+    unsafe fn header_alias_plan(&self) -> (bool, bool) {
+        // SAFETY: unsafe-site category 6 -- `header_fields`' contract is this function's.
+        let Some(fields) = (unsafe { self.header_fields() }) else {
+            return (false, false);
+        };
+        let ranges = HeaderRanges::of(fields.map(|(base, capacity)| {
+            if base.is_null() {
+                None
+            } else {
+                Some((base.cast_const(), widen(capacity)))
+            }
+        }));
+
+        let strm = self.strm;
+        // SAFETY: unsafe-site category 1 -- four members read through raw places on a
+        // non-null, aligned, live stream whose buffer members are initialised by this
+        // function's contract. Neither pointer is dereferenced.
+        let (next_in, avail_in, next_out, avail_out) = unsafe {
             (
-                header_field(extra, extra_max),
-                header_field(name, name_max),
-                header_field(comment, comm_max),
+                core::ptr::addr_of!((*strm).next_in).read(),
+                core::ptr::addr_of!((*strm).avail_in).read(),
+                core::ptr::addr_of!((*strm).next_out).read(),
+                core::ptr::addr_of!((*strm).avail_out).read(),
             )
         };
 
-        // Reached in place: the sink is 100-odd bytes and this runs before every call, so a
-        // copy out and back would move it twice for a change to three pointers.
-        self.state_mut()
-            .with_header_sink(|sink| sink.rebind_fields(extra, name, comment));
+        (
+            ranges.overlap(next_in, widen(avail_in)),
+            ranges.overlap(next_out.cast_const(), widen(avail_out)),
+        )
     }
 
     /// Drops the three field views again, so that no borrow of the caller's buffers
@@ -1513,51 +1652,83 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
             // `with_buffers` build a `&[u8]` over `(next_in, avail_in)` and a `&mut [u8]`
             // over `(next_out, avail_out)`, because two such borrows over one region are
             // undefined behaviour *whether or not either is ever touched*. So the input is
-            // copied first and the decoder reads the copy; `AliasScratch` documents the
-            // whole argument, including why this is the same answer `deflate` gives.
+            // copied first and the decoder reads the copy; `OverlapStage` documents the whole
+            // argument, including why the copy is *bounded* and why nothing is refused any
+            // more -- a fixed stage cannot fail to be obtained, so the `Z_STREAM_ERROR` a
+            // failed snapshot allocation used to earn has no way to arise.
             //
-            // Only a failed snapshot allocation is refused, with the `Z_STREAM_ERROR` C
-            // gives an unusable pointer pair.
+            // ★ **One caller call still consumes as much as C's would.** The stage carries
+            // `OVERLAP_STAGE_BYTES` at a time, so an overlapping call becomes a loop of core
+            // calls over successive windows of the caller's input. The decoded bytes cannot
+            // differ: `flush` never changes what `inflate` produces, only when it returns, and
+            // the decoder's window, bit buffer and mode carry across the windows exactly as
+            // they carry across a caller's own incremental feeding. The one flush value that
+            // *does* choose a stopping point -- `Z_BLOCK`, and `Z_TREES` with it -- is passed
+            // through on every window rather than only the last, so a block-boundary stop is
+            // still honoured: it leaves the window part-consumed, which ends the loop.
             //
             // Nothing is dereferenced to decide it: `Session::buffers_overlap` compares
             // addresses, so it is safe to run on the raw members, which is the only point at
             // which the answer can still be acted on.
             //
-            // SAFETY: the stream is the validated one `entry` produced, so its four
-            // buffer members are readable as plain scalars.
-            // SAFETY: unsafe-site category 4 -- `scratch_allocator`'s contract. `strm` is the
-            // validated stream `entry` produced, and the three hook members are read through
-            // raw places. The snapshot has to come from the stream's own allocator: it is
-            // `avail_in` bytes, the caller's own number, so a custom arena must see it and a
-            // `mem_limit` must be able to refuse it.
-            let allocator = unsafe { scratch_allocator(strm) };
+            // Held in a binding that outlives every stream view built from it, as
+            // `OverlapStage::fill` requires.
+            let mut stage = OverlapStage::new();
+            // ★ The same rule reaches the caller's `gz_header`, and there it is not optional.
+            // `Session::header_alias_plan` states the whole argument: the three field views
+            // are `Cell` slices that the nine header states WRITE through, so a field inside
+            // the caller's output range would put a `Cell` borrow and an exclusive borrow over
+            // one byte, and a field inside the input range would have a write through the
+            // `Cell` invalidate the frozen input view the decoder is still reading. Neither is
+            // undefined in C, and `zlib.h` L1070-L1096 permits both layouts, so both are
+            // served: the input is staged through `OverlapStage`, the output through
+            // [`OutputScratch`].
+            //
+            // SAFETY: unsafe-site categories 1 and 6 -- `header_alias_plan`'s contract is this
+            // function's; it reads the header's own members and the stream's four buffer
+            // members through raw places and dereferences neither buffer pointer.
+            let (header_over_input, header_over_output) = unsafe { session.header_alias_plan() };
             // SAFETY: the stream is the validated one `entry` produced, so its four buffer
             // members are readable as plain scalars; nothing is dereferenced through them.
-            let overlapping = unsafe { session.buffers_overlap() };
-            let mut scratch = if overlapping {
-                // SAFETY: unsafe-site category 2 -- `AliasScratch::capture`'s contract. The
-                // stream is the validated one, its input region is readable for `avail_in`
-                // bytes, and no mutable borrow of it exists yet: the only one this library
-                // creates is the output borrow `with_buffers` makes below.
-                let captured =
-                    unsafe { AliasScratch::capture(&allocator, next_in, widen(avail_in)) };
-                if captured.is_none() {
+            let overlapping = unsafe { session.buffers_overlap() } || header_over_input;
+
+            // ★ **Why the output stage still allocates when the input stage does not.** The
+            // input stage is bounded -- a window at a time is enough, because the loop below
+            // feeds every window -- so it lives on the stack and cannot fail. The output has no
+            // such freedom: the core must be handed the caller's whole `avail_out` extent in one
+            // region or a single call would stop short of what C's would produce, so the block
+            // is `avail_out` bytes and has to come from the stream's own allocator. That is also
+            // the right place for it: it is the caller's own number, so a custom arena must see
+            // it and `test/infcover.c`'s `mem_limit` must be able to refuse it. This path is
+            // reached only when a caller has pointed a `gz_header` field into its own output
+            // range, which no disjoint call ever does.
+            let mut staged_output = if header_over_output {
+                // SAFETY: unsafe-site category 4 -- `StreamAllocator::from_stream_ptr`'s
+                // contract. `strm` is the validated stream `entry` produced, and the three
+                // hook members are read through raw places; a stream that published no hooks
+                // falls back to the internal allocator, exactly as `zcalloc`/`zcfree` do for
+                // a `Z_NULL` pair.
+                let allocator = unsafe { StreamAllocator::from_stream_ptr(strm) }
+                    .unwrap_or_else(StreamAllocator::internal);
+                // SAFETY: unsafe-site category 2 -- `OutputScratch::stage`'s contract.
+                // `next_out` is non-null (the guard above rejected a null one) and writable
+                // for `avail_out` bytes by this function's contract, and it stays so until the
+                // commit inside `with_buffers`; nothing of the caller's is read or written
+                // here.
+                let staged = unsafe {
+                    let avail_out = core::ptr::addr_of!((*strm).avail_out).read();
+                    OutputScratch::stage(&allocator, next_out, avail_out)
+                };
+                if staged.is_none() {
                     return fallback::STREAM_ERROR_CODE;
                 }
-                captured
+                staged.map(|staged| (staged, allocator))
             } else {
                 None
             };
-            // Held in a binding that outlives the stream view, as `scratch_view` requires.
-            //
-            // SAFETY: unsafe-site category 2 -- `scratch_view` fabricates `'static`; `scratch`
-            // is a local of this closure and outlives the `with_buffers` call below, which is
-            // the only thing that ever reads the slice.
-            let captured_input = unsafe { scratch_view(scratch.as_ref()) };
 
-            // L497-L1152: the whole engine, with `LOAD`/`RESTORE` and the epilogue
-            // handled by `with_buffers`.
-            // The caller's header buffers, bound for this call only.
+            // The caller's header buffers, bound for this call only -- once, around every
+            // window, because a gzip header can straddle them.
             //
             // SAFETY: unsafe-site category 6 -- `bind_header_fields`' contract is this
             // function's: the `gz_header` a caller installed with `inflateGetHeader`,
@@ -1568,13 +1739,68 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
                 session.bind_header_fields();
             }
 
-            // SAFETY: the stream is the validated one and its two regions are readable and
-            // writable by this function's contract; they are either disjoint or the input is
-            // replaced by `captured_input`, which is what `with_buffers` requires.
-            let outcome = unsafe {
-                session.with_buffers(captured_input, |state, stream| {
-                    core_inflate(state, stream, flush)
-                })
+            let outcome = loop {
+                // SAFETY: unsafe-site category 1 -- two members read through raw places on the
+                // validated stream, forming no reference.
+                let (round_in, round_avail) = unsafe {
+                    (
+                        core::ptr::addr_of!((*strm).next_in).read(),
+                        core::ptr::addr_of!((*strm).avail_in).read(),
+                    )
+                };
+                let remaining = widen(round_avail);
+                let take = if overlapping {
+                    OverlapStage::chunk_len(remaining)
+                } else {
+                    remaining
+                };
+                let last = take == remaining;
+                let staged = if overlapping {
+                    // SAFETY: unsafe-site category 2 -- `OverlapStage::fill`'s contract. The
+                    // stream is the validated one, so `take` bytes are readable at `next_in`,
+                    // and no mutable borrow of that region exists yet: the only one this
+                    // library creates is the output borrow `with_buffers` makes below.
+                    Some(unsafe { stage.fill(round_in, take) })
+                } else {
+                    None
+                };
+                // `Z_BLOCK` and `Z_TREES` choose where to stop, so they travel on every
+                // window; every other value only chooses when to return and is therefore
+                // `Z_NO_FLUSH` until the last one, so that no window is told the input has
+                // ended while more of it is still to come.
+                let chunk_flush = if last || flush >= Z_BLOCK {
+                    flush
+                } else {
+                    Z_NO_FLUSH
+                };
+
+                // L497-L1152: the whole engine, with `LOAD`/`RESTORE` and the epilogue
+                // handled by `with_buffers`.
+                //
+                // SAFETY: the stream is the validated one and its two regions are readable and
+                // writable by this function's contract; they are either disjoint or the input
+                // is replaced by `staged`, and the output is either disjoint from every header
+                // buffer this call writes through or replaced by `staged_output`, which is what
+                // `with_buffers` requires.
+                let outcome = unsafe {
+                    let staged_output = staged_output.as_mut().map(|(staged, _)| staged);
+                    session.with_buffers(staged, staged_output, |state, stream| {
+                        core_inflate(state, stream, chunk_flush)
+                    })
+                };
+
+                if last || outcome != ReturnCode::OK {
+                    break outcome;
+                }
+                // SAFETY: unsafe-site category 1 -- one member read through a raw place, as
+                // above. `with_buffers` has already written the advanced value.
+                let left = widen(unsafe { core::ptr::addr_of!((*strm).avail_in).read() });
+                if remaining.saturating_sub(left) != take {
+                    // The window was not fully consumed -- the output filled, or a
+                    // `Z_BLOCK`/`Z_TREES` boundary was reached. Either way this is a state C
+                    // reaches from its single call, and it is already published.
+                    break outcome;
+                }
             };
 
             // The gzip header the parse may have filled. C has already written it
@@ -1585,12 +1811,14 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
             session.publish_header();
             session.unbind_header_fields();
 
-            // The snapshot goes back to the allocator it came from once nothing borrows it:
-            // `with_buffers` has returned, so the stream view it built is gone, and this is
+            // The staging block goes back to the allocator it came from once nothing borrows
+            // it: `with_buffers` has returned, so the stream view it built is gone, and this is
             // still inside the call, so a tracking allocator sees one strictly nested
-            // allocate/free pair.
-            if let Some(scratch) = scratch.as_mut() {
-                scratch.release(&allocator);
+            // allocate/free pair -- the LIFO discipline `test/infcover.c`'s `mem_done()` checks
+            // for. Its bytes reached the caller inside `with_buffers`. The input stage needs no
+            // counterpart: it is a stack buffer the allocator never saw.
+            if let Some((staged, allocator)) = staged_output.as_mut() {
+                staged.release(allocator);
             }
 
             outcome
@@ -2796,33 +3024,50 @@ pub unsafe extern "C" fn inflateGetHeader(strm: z_streamp, head: gz_headerp) -> 
 // ★ The internal symbol the test suite forces this library to export
 // ---------------------------------------------------------------------------
 
-/// `_zlib_rs_inflate_table` — builds a Huffman decode table from a set of code lengths.
+/// `inflate_table` — builds a Huffman decode table from a set of code lengths.
 ///
-/// The Rust half of `inflate_table`, declared at `inftrees.h` L60-L62 and ported from
-/// `inftrees.c` L46-L311, whose algorithm is implemented by
-/// [`zlib_rs::inflate::inftrees::inflate_table`] and is **not** reimplemented here.
-/// This function is purely the pointer-to-slice adaptation.
+/// Declared at `inftrees.h` L60-L62 and ported from `inftrees.c` L46-L311, whose
+/// algorithm is implemented by [`zlib_rs::inflate::inftrees::inflate_table`] and is
+/// **not** reimplemented here. This function is purely the pointer-to-slice adaptation.
 ///
-/// # ★ Why the exported name is not `inflate_table`
+/// # ★ Why the first parameter is a plain [`c_int`]
 ///
 /// The contract's first parameter is `codetype`, a C enum (`inftrees.h` L53-L58), and
-/// that cannot be presented from Rust. Spelling it `c_int` is ABI-identical on every
-/// target in scope but is a *different declaration*: a translation unit that
-/// redeclares it alongside `inftrees.h` fails with `conflicting types`. Spelling it as
-/// a `#[repr(C)]` Rust enum would render correctly and then make a C caller's
-/// arbitrary `int` — nothing in the language stops a 7 — into instant undefined
-/// behaviour on construction.
+/// no Rust signature can name that type. The two candidate spellings are not equally
+/// safe:
 ///
-/// So the enum stops at C, where it is legal: `csrc/inftrees_shim.c` defines
-/// `inflate_table` with `inftrees.h`'s own prototype and `ZLIB_INTERNAL` visibility,
-/// and forwards to this function with the value widened to a plain `int`, which is
-/// validated below. `crates/libz-rs-sys/build.rs` compiles that shim into the archive
-/// cargo produces, so `libz.a` defines the contract name. The leading underscore here
-/// is what keeps *this* name out of a shared object's dynamic table: `zlib.map`'s
-/// `local:` block ends with the pattern `_*`, the same mechanism zlib uses for
-/// `_tr_init` and its five siblings.
+/// * a `#[repr(C)]` Rust enum would render the prototype correctly and then make a C
+///   caller's arbitrary `int` — nothing in the language stops a 7 — into instant
+///   undefined behaviour on construction;
+/// * a plain [`c_int`] is ABI-identical on every target in scope, because an
+///   enumeration whose values are 0, 1 and 2 is passed in a 32-bit register exactly as
+///   an `int` is, and it lets the value be **validated** rather than assumed —
+///   [`code_type_from_raw`] answers `-1` for anything outside `0..=2`.
 ///
-/// # ★ Why an internal symbol exists at all
+/// So the parameter is a `c_int` and the enum stops at the caller, which is where C
+/// keeps it anyway. What is given up by not routing through a C translation unit is the
+/// compiler's *declaration*-compatibility check, and that check had exactly one
+/// subject: a translation unit that both includes `inftrees.h` and defines this
+/// function. There is now no such translation unit anywhere in the tree, and the one
+/// consumer that matters — the unmodified `test/infcover.c`, which includes
+/// `inftrees.h` at L17 and *calls* this symbol — is satisfied by name and calling
+/// convention alone. `make rust-test` compiles and links it for exactly that reason, so
+/// the check is still performed by a C compiler; it has simply moved to the consumer,
+/// which is the only place it was ever meaningful.
+///
+/// # ★ How it stays out of a shared object's dynamic table
+///
+/// Two mechanisms, and the port uses both because they cover different artifacts:
+///
+/// * `zlib.map`'s `ZLIB_1.2.0` `local:` block names `inflate_table` outright, so the
+///   packaged library — relinked under `--version-script=zlib.map` — cannot export it;
+/// * the `.hidden` directive in `crates/libz-rs-sys/src/lib.rs` gives the symbol
+///   ELF `STV_HIDDEN` visibility, which is what keeps it out of the dynamic table of
+///   the `cdylib` cargo builds directly, where no version script of this project's
+///   applies. Hidden visibility does not affect static linking, so `libz.a` still
+///   defines the name as an ordinary global `T`.
+///
+/// # ★ Why a hidden symbol is exported at all
 ///
 /// `zlib.map`'s `ZLIB_1.2.0` `local:` block names `inflate_table`, so it is absent
 /// from the reference shared library's dynamic table — and yet the unmodified
@@ -2842,17 +3087,18 @@ pub unsafe extern "C" fn inflateGetHeader(strm: z_streamp, head: gz_headerp) -> 
 /// ```
 ///
 /// The two requirements are compatible because they concern two different artifacts.
-/// `--version-script=zlib.map` applies to the *shared object*, so the name is hidden
-/// there; the `staticlib` archive is not linked, so the name stays a global `T` in
-/// `libz.a`, which is what `infcover` links (`test/CMakeLists.txt` L95-L96 links it
-/// to `ZLIB::ZLIBSTATIC`). That is exactly the pair of properties the C build has, and
-/// the 111-symbol parity diff checks both.
+/// A version script and hidden visibility both act on a *shared object*, so the name is
+/// absent there; the `staticlib` archive is not linked at all, so the name stays a
+/// global `T` in `libz.a` — `nm` reports `T` for a hidden symbol just as it does for a
+/// default-visibility one — which is what `infcover` links (`test/CMakeLists.txt`
+/// L95-L96 links it to `ZLIB::ZLIBSTATIC`). That is exactly the pair of properties the
+/// C build has, and the 111-symbol parity diff checks both.
 ///
 /// # The parameter adaptation
 ///
 /// | C | Here |
 /// |---|---|
-/// | `codetype type` | a [`c_int`] the shim widened from the enum, validated by [`code_type_from_raw`] — never a Rust `enum`, because a C caller may pass any `int` |
+/// | `codetype type` | a [`c_int`], validated by [`code_type_from_raw`] — never a Rust `enum`, because a C caller may pass any `int` |
 /// | `unsigned short *lens` | a `&[u16]` of exactly `codes` elements |
 /// | `unsigned codes` | the length of both `lens` and `work` |
 /// | `code **table` | in/out: `*table` is the base, advanced past the entries the call consumed |
@@ -2896,7 +3142,7 @@ pub unsafe extern "C" fn inflateGetHeader(strm: z_streamp, head: gz_headerp) -> 
 /// or `LENS` build and `ENOUGH_DISTS` entries for a `DISTS` build. None of the
 /// regions may overlap.
 #[no_mangle]
-pub unsafe extern "C" fn _zlib_rs_inflate_table(
+pub unsafe extern "C" fn inflate_table(
     type_: c_int,
     lens: *mut c_ushort,
     codes: c_uint,
@@ -3136,30 +3382,30 @@ pub unsafe extern "C" fn _zlib_rs_inflate_table(
 // There is deliberately no `allow-indexing-slicing-in-tests` key -- it is newer than
 // the declared 1.80 floor and an unrecognised `clippy.toml` field aborts the whole
 // lint run -- so the slicing allowance is taken as a module-local attribute instead.
-// `used_underscore_items` joins them because these tests call
-// `_zlib_rs_inflate_table`, whose leading underscore is what `zlib.map`'s `local: _*;`
-// pattern hides it by and `zlib.map` is immutable. Its real caller is
-// `csrc/inftrees_shim.c`, which presents the `codetype` prototype no Rust caller can
-// spell; these tests are the only Rust callers it will ever have. `unknown_lints`
-// comes first because the lint postdates the declared 1.80 floor, where naming it
-// would otherwise be a warning of its own -- the same guard
+// `unknown_lints` comes first because `clippy::indexing_slicing`'s companion keys move
+// with the toolchain and naming a lint the declared 1.80 floor does not know would
+// otherwise be a warning of its own -- the same guard
 // `crates/zlib-rs/src/deflate/algorithm.rs` uses for `_tr_init`.
+//
+// `clippy::used_underscore_items` was here too, for the days when these tests called
+// `_zlib_rs_inflate_table` -- the underscore-prefixed Rust half of an `inflate_table`
+// that a C translation unit defined. The Rust function now IS `inflate_table`, so
+// nothing in this module names an underscore-prefixed item and the allowance is gone.
 #[allow(
     unknown_lints,
     clippy::indexing_slicing,
     clippy::panic,
     clippy::too_many_lines,
-    clippy::unwrap_used,
-    clippy::used_underscore_items
+    clippy::unwrap_used
 )]
 mod tests {
     use super::{
-        _zlib_rs_inflate_table, code, inflate, inflateCodesUsed, inflateCopy, inflateEnd,
-        inflateGetDictionary, inflateGetHeader, inflateInit2_, inflateInit_, inflateMark,
-        inflatePrime, inflateReset, inflateReset2, inflateResetKeep, inflateSetDictionary,
-        inflateSync, inflateSyncPoint, inflateUndermine, inflateValidate, message_ptr,
-        narrow_uLong, widen_uLong, z_stream, BAD_STATE_MARK, ENOUGH_DISTS, ENOUGH_LENS,
-        MAX_INFLATE_FLUSH, MAX_WINDOW_BYTES, MESSAGES, TABLE_INVALID_CODE, TABLE_OK,
+        code, inflate, inflateCodesUsed, inflateCopy, inflateEnd, inflateGetDictionary,
+        inflateGetHeader, inflateInit2_, inflateInit_, inflateMark, inflatePrime, inflateReset,
+        inflateReset2, inflateResetKeep, inflateSetDictionary, inflateSync, inflateSyncPoint,
+        inflateUndermine, inflateValidate, inflate_table, message_ptr, narrow_uLong, widen_uLong,
+        z_stream, BAD_STATE_MARK, ENOUGH_DISTS, ENOUGH_LENS, MAX_INFLATE_FLUSH, MAX_WINDOW_BYTES,
+        MESSAGES, TABLE_INVALID_CODE, TABLE_OK,
     };
     use core::ffi::{c_char, c_int, c_uint, c_ulong, c_ushort, CStr};
     use core::mem::{offset_of, size_of, MaybeUninit};
@@ -3174,7 +3420,7 @@ mod tests {
     /// The mode tag `test/infcover.c` L330 writes: `DICT`, i.e. 16190.
     const DICT_TAG: c_int = 16190;
 
-    /// The mode tag `test/infcover.c` L458 writes: `SYNC`, i.e. 16211.
+    /// The mode tag `test/infcover.c` L459 writes: `SYNC`, i.e. 16211.
     const SYNC_TAG: c_int = 16211;
 
     /// A zeroed `z_stream`, which is what a C caller declares before initialising.
@@ -3232,7 +3478,7 @@ mod tests {
     /// ★ This is the one thing about the state that is *deliberately* reachable from
     /// outside the library, because `test/infcover.c` includes the private
     /// `inflate.h` and writes through it -- `((struct inflate_state *)strm.state)
-    /// ->mode = DICT` at its L330 and `state->mode = SYNC` at its L458. The Rust
+    /// ->mode = DICT` at its L330 and `state->mode = SYNC` at its L459. The Rust
     /// spelling of that cast is `StatePrefix`, whose `#[repr(C)]` layout places a
     /// `z_streamp` at offset 0 and the `int` tag at offset 8 -- exactly where
     /// `deflate.h` L105-L106 and `inflate.h` L83-L84 place theirs.
@@ -4548,7 +4794,7 @@ mod tests {
             // `ENOUGH_DISTS` entries, and `next`/`bits` are live locals. The three
             // arrays are distinct allocations.
             let ret = unsafe {
-                _zlib_rs_inflate_table(
+                inflate_table(
                     DISTS,
                     lens.as_mut_ptr().cast::<c_ushort>(),
                     16,
@@ -5168,7 +5414,7 @@ mod tests {
             // SAFETY: as the test above -- three distinct arrays, each at least as long
             // as the call requires, and two live in/out locals.
             let ret = unsafe {
-                _zlib_rs_inflate_table(
+                inflate_table(
                     DISTS,
                     lens.as_mut_ptr().cast::<c_ushort>(),
                     16,
@@ -5194,31 +5440,25 @@ mod tests {
         }
     }
 
-    // GATED ON THE SHIM ACTUALLY BEING BUILT, which is not the same condition as
-    // `libz-compat`.  `build.rs` compiles `csrc/inftrees_shim.c` and
-    // `csrc/gzprintf_shim.c` only when BOTH `libz-compat` and `gz` are on -- the
-    // gzprintf half reaches `_zlib_rs_gzprintf_begin`/`_commit`, which live behind
-    // `gz`, so archiving the pair against a build without it would archive undefined
-    // symbols -- and it emits `cfg(zlib_rs_gzprintf)` when it has done so.  Naming
-    // `inflate_table` unconditionally therefore made the `--no-default-features
-    // --features libz-compat` configuration fail to LINK its test binary, with
-    // `rust-lld: error: undefined symbol: inflate_table`, which nothing built until
-    // the feature matrix job did.  The cfg is the honest gate: it says "the shim
-    // archive is in this link", which is exactly what this test needs.
+    // UNCONDITIONAL within this module, and that is the whole point of the change it
+    // records. `inflate_table` used to be defined by a C translation unit,
+    // `csrc/inftrees_shim.c`, which `build.rs` archived only when BOTH `libz-compat` and
+    // `gz` were on -- so this test had to be gated on `cfg(zlib_rs_gzprintf)`, and a
+    // `--no-default-features --features libz-compat` build had no C definition to link
+    // at all. The symbol is now defined in Rust, behind `libz-compat` and nothing else,
+    // exactly like every other export in this module, so there is no gate left to state.
     #[test]
-    #[cfg(zlib_rs_gzprintf)]
-    fn the_c_prototype_shim_is_linked_and_agrees_with_the_rust_half() {
-        // ★ F4's proof, and it is a LINK first: `csrc/inftrees_shim.c` defines
-        // `inflate_table` with `inftrees.h`'s own `codetype` prototype, which is the
-        // declaration the unmodified `test/infcover.c` compiles against. Naming the
-        // symbol here means this test binary cannot be produced unless `build.rs`
-        // compiled and archived that translation unit.
+    fn the_contract_symbol_agrees_with_the_c_enum_prototype() {
+        // ★ The ABI claim that replaces what a C translation unit used to guarantee.
+        // `inftrees.h` L53-L62 declares the first parameter as `codetype`, an enum whose
+        // values are 0, 1 and 2; GCC and Clang give such an enum the representation of
+        // `unsigned int`, and that is the slot the unmodified `test/infcover.c` passes
+        // `DISTS` through. The definition receives a `c_int`. This declares the caller's
+        // spelling and calls the same symbol both ways, so the claim "an enum of 0..=2
+        // is passed exactly as an int" is asserted rather than assumed.
         //
-        // The Rust declaration below deliberately spells the first parameter `c_uint`,
-        // because that is what GCC and Clang choose for an all-non-negative C enum, and
-        // it is ABI-identical to the `c_int` the shim widens it to. This is a *test*
-        // calling a C function, not the contract: the contract is the C prototype in
-        // the shim, and no Rust spelling of it exists.
+        // The declaration below is what a C caller compiles; `super::inflate_table` is
+        // the definition. They are one symbol, and the results must be identical.
         extern "C" {
             fn inflate_table(
                 type_: c_uint,
@@ -5230,8 +5470,8 @@ mod tests {
             ) -> c_int;
         }
 
-        // `test/infcover.c` L617-L639 again, run through the C entry point this time,
-        // so that the two halves are compared on the input the acceptance suite uses.
+        // `test/infcover.c` L617-L639 again, run through both spellings, so that the
+        // two are compared on the exact input the acceptance suite uses.
         let mut lens = [0_u16; 16];
         for (index, slot) in lens.iter_mut().enumerate().take(15) {
             *slot = u16::try_from(index + 1).unwrap();
@@ -5239,50 +5479,65 @@ mod tests {
         lens[15] = 15;
 
         for requested in [15_u32, 1] {
-            let mut through_c = vec![code::default(); ENOUGH_DISTS];
-            let mut through_rust = vec![code::default(); ENOUGH_DISTS];
-            let mut work_c = [0xa5a5_u16; 16];
-            let mut work_rust = [0xa5a5_u16; 16];
-            let mut next_c: *mut code = through_c.as_mut_ptr();
-            let mut next_rust: *mut code = through_rust.as_mut_ptr();
-            let mut bits_c: c_uint = requested;
-            let mut bits_rust: c_uint = requested;
+            let mut via_unsigned_table = vec![code::default(); ENOUGH_DISTS];
+            let mut via_int_table = vec![code::default(); ENOUGH_DISTS];
+            let mut via_unsigned_work = [0xa5a5_u16; 16];
+            let mut via_int_work = [0xa5a5_u16; 16];
+            let mut via_unsigned_next: *mut code = via_unsigned_table.as_mut_ptr();
+            let mut via_int_next: *mut code = via_int_table.as_mut_ptr();
+            let mut via_unsigned_bits: c_uint = requested;
+            let mut via_int_bits: c_uint = requested;
 
             // SAFETY: every argument is a live local of the size the prototype
             // requires -- sixteen `u16`s of `lens` and `work`, `ENOUGH_DISTS` entries
             // of table -- and the arrays are distinct allocations.
-            let (from_c, from_rust) = unsafe {
+            let (via_unsigned, via_int) = unsafe {
                 (
                     inflate_table(
                         2, // DISTS
                         lens.as_mut_ptr().cast::<c_ushort>(),
                         16,
-                        &mut next_c,
-                        &mut bits_c,
-                        work_c.as_mut_ptr().cast::<c_ushort>(),
+                        &mut via_unsigned_next,
+                        &mut via_unsigned_bits,
+                        via_unsigned_work.as_mut_ptr().cast::<c_ushort>(),
                     ),
-                    _zlib_rs_inflate_table(
+                    super::inflate_table(
                         DISTS,
                         lens.as_mut_ptr().cast::<c_ushort>(),
                         16,
-                        &mut next_rust,
-                        &mut bits_rust,
-                        work_rust.as_mut_ptr().cast::<c_ushort>(),
+                        &mut via_int_next,
+                        &mut via_int_bits,
+                        via_int_work.as_mut_ptr().cast::<c_ushort>(),
                     ),
                 )
             };
 
-            assert_eq!(from_c, from_rust, "status must agree");
-            assert_eq!(from_c, 1, "requested root width {requested} must overflow");
-            assert_eq!(next_c, through_c.as_mut_ptr());
-            assert_eq!(next_rust, through_rust.as_mut_ptr());
-            assert_eq!(bits_c, requested);
-            assert_eq!(bits_rust, requested);
-            assert_eq!(work_c, work_rust, "the scratch footprint must agree");
-            for (through_c, through_rust) in through_c.iter().zip(through_rust.iter()) {
+            assert_eq!(
+                via_unsigned, via_int,
+                "both spellings of the enum slot must agree"
+            );
+            assert_eq!(
+                via_unsigned, 1,
+                "requested root width {requested} must overflow"
+            );
+            assert_eq!(via_unsigned_next, via_unsigned_table.as_mut_ptr());
+            assert_eq!(via_int_next, via_int_table.as_mut_ptr());
+            assert_eq!(via_unsigned_bits, requested);
+            assert_eq!(via_int_bits, requested);
+            assert_eq!(
+                via_unsigned_work, via_int_work,
+                "and so must the scratch footprint"
+            );
+            for (via_unsigned_table, via_int_table) in
+                via_unsigned_table.iter().zip(via_int_table.iter())
+            {
                 assert_eq!(
-                    (through_c.op, through_c.bits, through_c.val),
-                    (through_rust.op, through_rust.bits, through_rust.val),
+                    (
+                        via_unsigned_table.op,
+                        via_unsigned_table.bits,
+                        via_unsigned_table.val
+                    ),
+                    (via_int_table.op, via_int_table.bits, via_int_table.val),
                 );
             }
         }
@@ -5324,7 +5579,7 @@ mod tests {
             // covers every element the reference could sort, `table` holds
             // `ENOUGH_LENS` entries, and all three are distinct allocations.
             let outcome = unsafe {
-                _zlib_rs_inflate_table(
+                inflate_table(
                     LENS,
                     lens.as_mut_ptr().cast::<c_ushort>(),
                     codes,
@@ -5372,7 +5627,7 @@ mod tests {
 
         // SAFETY: as the test above; `lens` and `work` are four `u16`s each.
         let outcome = unsafe {
-            _zlib_rs_inflate_table(
+            inflate_table(
                 CODES,
                 lens.as_mut_ptr().cast::<c_ushort>(),
                 4,
@@ -5406,7 +5661,7 @@ mod tests {
         // SAFETY: `lens` and `work` cover the two codes requested, and `table` is
         // larger than either `ENOUGH_*` bound.
         let ret = unsafe {
-            _zlib_rs_inflate_table(
+            inflate_table(
                 CODES,
                 lens.as_mut_ptr().cast::<c_ushort>(),
                 2,
@@ -5429,7 +5684,7 @@ mod tests {
         let mut bits: c_uint = 7;
         // SAFETY: as above.
         let ret = unsafe {
-            _zlib_rs_inflate_table(
+            inflate_table(
                 LENS,
                 over.as_mut_ptr().cast::<c_ushort>(),
                 3,
@@ -5448,7 +5703,7 @@ mod tests {
         let mut bits: c_uint = 9;
         // SAFETY: as above.
         let ret = unsafe {
-            _zlib_rs_inflate_table(
+            inflate_table(
                 LENS,
                 none.as_mut_ptr().cast::<c_ushort>(),
                 4,
@@ -5478,7 +5733,7 @@ mod tests {
         unsafe {
             for bad_type in [-1, 3, 4, c_int::MAX, c_int::MIN] {
                 assert_eq!(
-                    _zlib_rs_inflate_table(
+                    inflate_table(
                         bad_type,
                         lens.as_mut_ptr().cast::<c_ushort>(),
                         2,
@@ -5491,7 +5746,7 @@ mod tests {
                 );
             }
             assert_eq!(
-                _zlib_rs_inflate_table(
+                inflate_table(
                     CODES,
                     core::ptr::null_mut(),
                     2,
@@ -5502,7 +5757,7 @@ mod tests {
                 -1
             );
             assert_eq!(
-                _zlib_rs_inflate_table(
+                inflate_table(
                     CODES,
                     lens.as_mut_ptr().cast::<c_ushort>(),
                     2,
@@ -5513,7 +5768,7 @@ mod tests {
                 -1
             );
             assert_eq!(
-                _zlib_rs_inflate_table(
+                inflate_table(
                     CODES,
                     lens.as_mut_ptr().cast::<c_ushort>(),
                     2,
@@ -5524,7 +5779,7 @@ mod tests {
                 -1
             );
             assert_eq!(
-                _zlib_rs_inflate_table(
+                inflate_table(
                     CODES,
                     lens.as_mut_ptr().cast::<c_ushort>(),
                     2,
@@ -5537,7 +5792,7 @@ mod tests {
             // A null *inside* `table` is refused too.
             let mut null_base: *mut code = core::ptr::null_mut();
             assert_eq!(
-                _zlib_rs_inflate_table(
+                inflate_table(
                     CODES,
                     lens.as_mut_ptr().cast::<c_ushort>(),
                     2,
@@ -6018,13 +6273,15 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_input_and_output_are_served_from_a_snapshot() {
+    fn overlapping_input_and_output_are_served_from_the_stage() {
         // ★ C decodes with an overlapping input and output -- `inflate.c` L305-L326 just
-        // `LOAD()`s both into locals -- so this must too, and it does it by snapshotting the
-        // input before the mutable borrow of the output exists. The decode then reads the
-        // bytes the buffer held on entry, so it succeeds even though the output lands on top
-        // of them. Refusing the pair would be a divergence from C for no safety benefit; see
-        // `AliasScratch`, and `deflate`'s matching test, which `test/example.c` forces.
+        // `LOAD()`s both into locals -- so this must too, and it does it by copying the input
+        // into `OverlapStage` a window at a time, each window taken before the mutable borrow
+        // of the output that could overwrite it exists. The decode then reads the bytes the
+        // buffer held when each window was taken, so it succeeds even though the output lands
+        // on top of them. Refusing the pair would be a divergence from C for no safety
+        // benefit; see `OverlapStage`, and `deflate`'s matching test, which `test/example.c`
+        // forces.
         let compressed = deflate_zlib(b"overlap me");
         let mut buffer = vec![0x5a_u8; 256];
         buffer[..compressed.len()].copy_from_slice(&compressed);
@@ -6176,6 +6433,331 @@ mod tests {
             assert_eq!(inflateEnd(&mut source), ReturnCode::OK.as_i32());
         }
     }
+
+    /// The CRC-32 of `bytes`, computed here rather than through the library, so that a
+    /// fixture built for a decode test does not depend on the code under test to be valid.
+    ///
+    /// The reflected polynomial is RFC 1952 §8's, which is what `crc32.h` tabulates.
+    fn crc32_of(bytes: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffff_u32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 0 {
+                    crc >> 1
+                } else {
+                    (crc >> 1) ^ 0xedb8_8320
+                };
+            }
+        }
+        !crc
+    }
+
+    /// A complete gzip stream carrying an extra field, a name and a comment, wrapping
+    /// `payload` in one stored block.
+    ///
+    /// Hand-built so that the header fields are known exactly and so that all three of the
+    /// header states which write *through* the caller's buffers are reached: `EXTRA`
+    /// (`inflate.c` L607-L613), `NAME` (L624-L627) and `COMMENT` (L659-L662). FLG = 0x1c is
+    /// FEXTRA | FNAME | FCOMMENT; a stored block keeps the payload byte-exact without
+    /// depending on a compressor.
+    fn gzip_fixture(payload: &[u8]) -> Vec<u8> {
+        let mut gz = vec![0x1f, 0x8b, 0x08, 0x1c, 0x11, 0x22, 0x33, 0x44, 0x02, 0x03];
+        gz.extend_from_slice(&[0x02, 0x00, 0xab, 0xcd]); // XLEN = 2, then the bytes
+        gz.extend_from_slice(b"name\0");
+        gz.extend_from_slice(b"comment\0");
+        // One final stored block: BFINAL = 1, BTYPE = 00, then LEN and its complement, which
+        // is the pair `inflate.c` L1017-L1021 checks.
+        let len = u16::try_from(payload.len()).unwrap();
+        gz.push(0x01);
+        gz.extend_from_slice(&len.to_le_bytes());
+        gz.extend_from_slice(&(!len).to_le_bytes());
+        gz.extend_from_slice(payload);
+        gz.extend_from_slice(&crc32_of(payload).to_le_bytes());
+        gz.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+        gz
+    }
+
+    #[test]
+    fn a_gzip_header_field_inside_the_output_buffer_is_served() {
+        // ★ BACKEND-ALIAS-01, the inflate half. `zlib.h` L1070-L1096 places no disjointness
+        // requirement on the three `gz_header` buffers, so a conforming caller may point
+        // `name` -- or `comment`, or `extra` -- into the very buffer it is decompressing into.
+        // C writes the header bytes there and then writes the payload over them. This library
+        // cannot do that directly: the fields become shared-mutable `Cell` views while the
+        // output is an EXCLUSIVE region, and two such borrows over one byte are undefined
+        // behaviour whether or not either is used. The answer is to serve the layout from
+        // staging, never to refuse it, so this asserts that the decode succeeds, that the
+        // header really was written into the caller's own buffer, and that the payload then
+        // landed on top of it -- the state C leaves behind.
+        const PAYLOAD: &[u8] = b"hello, hello!";
+        let gz = gzip_fixture(PAYLOAD);
+
+        let mut strm = blank_stream();
+        init(&mut strm, 47);
+
+        // One buffer, with every header field inside the output region. ★ ONE derivation,
+        // then offsets: a second `as_mut_ptr()` would retag the whole allocation and
+        // invalidate the first pointer, which Miri reports as the TEST aliasing rather than
+        // the library. A C caller reaches into one buffer the same way.
+        let mut work = vec![0_u8; 256];
+        let base = work.as_mut_ptr();
+        let mut head = zeroed_header();
+        // `name` sits where the payload will land, so the payload must overwrite it.
+        head.name = base;
+        head.name_max = 16;
+        // `comment` and `extra` sit past the payload, so their bytes must survive -- which is
+        // what proves the header write reached the caller's own buffer rather than the
+        // staging block the decoder wrote its output into.
+        // SAFETY: `work` is 256 bytes, so offsets 64 and 128 are in bounds of one allocation.
+        head.comment = unsafe { base.add(64) };
+        head.comm_max = 16;
+        // SAFETY: as above.
+        head.extra = unsafe { base.add(128) };
+        head.extra_max = 8;
+
+        assert_eq!(
+            // SAFETY: a gzip-capable stream this module initialised, and a live header whose
+            // three buffers are inside `work`, which outlives the call.
+            unsafe { inflateGetHeader(&mut strm, &mut head) },
+            ReturnCode::OK.as_i32()
+        );
+
+        strm.next_in = gz.as_ptr();
+        strm.avail_in = uInt::try_from(gz.len()).unwrap();
+        strm.next_out = base;
+        strm.avail_out = uInt::try_from(work.len()).unwrap();
+
+        // SAFETY: the input is a live `Vec`, the output is `work`, live for its count, and
+        // the header fields overlap the output deliberately -- the case under test.
+        let ret = unsafe { inflate(&mut strm, 0) };
+        assert_eq!(
+            ret,
+            ReturnCode::STREAM_END.as_i32(),
+            "an overlapping header layout must decode, not fail"
+        );
+
+        // The header parsed to completion, out of the bytes the input carried.
+        assert_eq!(head.done, 1, "the header parsed to completion");
+        assert_eq!(head.time, 0x4433_2211);
+        assert_eq!(head.xflags, 0x02);
+        assert_eq!(head.os, 0x03);
+        assert_eq!(head.extra_len, 2);
+
+        // Nothing views `work` through the header any more -- the stream is finished and
+        // `unbind_header_fields` has already dropped the three views -- so a slice of it is
+        // the only live borrow.
+        let produced = usize::try_from(strm.total_out).unwrap();
+        assert_eq!(produced, PAYLOAD.len());
+        assert_eq!(
+            &work[..produced],
+            PAYLOAD,
+            "the staged output must reach the caller's buffer, over the name"
+        );
+        assert_eq!(
+            &work[64..72],
+            b"comment\0",
+            "the comment must have been written into the caller's own buffer"
+        );
+        assert_eq!(
+            &work[128..130],
+            &[0xab, 0xcd],
+            "and the extra field with it"
+        );
+
+        // SAFETY: the stream is the initialised one.
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
+    }
+
+    #[test]
+    fn a_gzip_header_field_inside_the_input_buffer_is_served() {
+        // The other direction of the same rule, and a stricter one than `deflate`'s: the
+        // field views are `Cell`s that the header states WRITE through, so a field inside the
+        // input range would have that write invalidate the frozen `&[u8]` the decoder is
+        // still reading from -- undefined behaviour even though both borrows are shared. The
+        // input is therefore snapshotted, exactly as an overlapping `next_in`/`next_out` pair
+        // is, and the field write still has to reach the caller's own bytes.
+        const PAYLOAD: &[u8] = b"hello, hello!";
+        let gz = gzip_fixture(PAYLOAD);
+
+        let mut strm = blank_stream();
+        init(&mut strm, 47);
+
+        // The stream at the front of a wider input buffer, with the header buffers in the
+        // slack past its end: inside `(next_in, avail_in)`, so the ranges overlap, but not
+        // over bytes the decoder reads -- which is also the only such layout whose result is
+        // well defined in C, since C would otherwise write over its own unread input.
+        let mut input = vec![0_u8; 256];
+        input[..gz.len()].copy_from_slice(&gz);
+        let base = input.as_mut_ptr();
+        let mut head = zeroed_header();
+        // SAFETY: `input` is 256 bytes and the fixture is far shorter, so offsets 128, 160
+        // and 192 are in bounds of one allocation and past the end of the stream.
+        head.name = unsafe { base.add(128) };
+        head.name_max = 16;
+        // SAFETY: as above.
+        head.comment = unsafe { base.add(160) };
+        head.comm_max = 16;
+        // SAFETY: as above.
+        head.extra = unsafe { base.add(192) };
+        head.extra_max = 8;
+
+        assert_eq!(
+            // SAFETY: a gzip-capable stream this module initialised, and a live header whose
+            // three buffers are inside `input`, which outlives the call.
+            unsafe { inflateGetHeader(&mut strm, &mut head) },
+            ReturnCode::OK.as_i32()
+        );
+
+        let mut out = [0_u8; 64];
+        strm.next_in = base.cast_const();
+        strm.avail_in = uInt::try_from(input.len()).unwrap();
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = uInt::try_from(out.len()).unwrap();
+
+        // SAFETY: the input is `input`, live for its count, the output is a disjoint local,
+        // and the header fields overlap the input deliberately -- the case under test.
+        let ret = unsafe { inflate(&mut strm, 0) };
+        assert_eq!(
+            ret,
+            ReturnCode::STREAM_END.as_i32(),
+            "a header buffer inside the input must decode, not fail"
+        );
+        assert_eq!(head.done, 1, "the header parsed to completion");
+        assert_eq!(head.extra_len, 2);
+        assert_eq!(
+            &out[..PAYLOAD.len()],
+            PAYLOAD,
+            "the payload must decode from the snapshot"
+        );
+
+        // The fields were written into the caller's own buffer, not into the snapshot.
+        assert_eq!(&input[128..133], b"name\0");
+        assert_eq!(&input[160..168], b"comment\0");
+        assert_eq!(&input[192..194], &[0xab, 0xcd]);
+
+        // SAFETY: the stream is the initialised one.
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
+    }
+
+    #[test]
+    fn one_buffer_shared_by_all_three_header_fields_inside_the_output_is_served() {
+        // `test/infcover.c` L305-L310 points `extra`, `name` and `comment` at ONE buffer,
+        // which is why the three views have to be *shared* `Cell` slices in the first place.
+        // Put that one buffer inside the output region and every hazard BACKEND-ALIAS-01
+        // describes is present at once; it still has to decode.
+        const PAYLOAD: &[u8] = b"hello, hello!";
+        let gz = gzip_fixture(PAYLOAD);
+
+        let mut strm = blank_stream();
+        init(&mut strm, 47);
+
+        let mut work = vec![0_u8; 256];
+        let base = work.as_mut_ptr();
+        let mut head = zeroed_header();
+        head.extra = base;
+        head.extra_max = 32;
+        head.name = base;
+        head.name_max = 32;
+        head.comment = base;
+        head.comm_max = 32;
+
+        assert_eq!(
+            // SAFETY: a gzip-capable stream this module initialised, and a live header whose
+            // three buffers are one 32-byte region inside `work`, which outlives the call.
+            unsafe { inflateGetHeader(&mut strm, &mut head) },
+            ReturnCode::OK.as_i32()
+        );
+
+        strm.next_in = gz.as_ptr();
+        strm.avail_in = uInt::try_from(gz.len()).unwrap();
+        strm.next_out = base;
+        strm.avail_out = uInt::try_from(work.len()).unwrap();
+
+        // SAFETY: as in the test above; all three fields alias each other and the output
+        // deliberately.
+        let ret = unsafe { inflate(&mut strm, 0) };
+        assert_eq!(
+            ret,
+            ReturnCode::STREAM_END.as_i32(),
+            "three aliased header buffers inside the output must decode, not fail"
+        );
+        assert_eq!(head.done, 1, "the header parsed to completion");
+        assert_eq!(head.extra_len, 2);
+
+        let produced = usize::try_from(strm.total_out).unwrap();
+        assert_eq!(
+            &work[..produced],
+            PAYLOAD,
+            "the payload is written last, exactly as C leaves it"
+        );
+
+        // SAFETY: the stream is the initialised one.
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
+    }
+
+    #[test]
+    fn the_header_alias_plan_is_empty_for_an_ordinary_call() {
+        // The preflight must cost nothing on the path every real caller takes: header buffers
+        // somewhere else entirely plan no snapshot and no staging, which is what keeps the
+        // ordinary call free of allocation. The decode that follows is the regression half --
+        // the disjoint layout has to behave exactly as it did before any of this existed.
+        const PAYLOAD: &[u8] = b"hello, hello!";
+        let gz = gzip_fixture(PAYLOAD);
+
+        let mut strm = blank_stream();
+        init(&mut strm, 47);
+
+        let mut extra = [0_u8; 8];
+        let mut name = [0_u8; 16];
+        let mut comment = [0_u8; 16];
+        let mut out = [0_u8; 64];
+        let mut head = zeroed_header();
+        head.extra = extra.as_mut_ptr();
+        head.extra_max = 8;
+        head.name = name.as_mut_ptr();
+        head.name_max = 16;
+        head.comment = comment.as_mut_ptr();
+        head.comm_max = 16;
+
+        assert_eq!(
+            // SAFETY: a gzip-capable stream this module initialised, and a live header whose
+            // three buffers are this test's own locals.
+            unsafe { inflateGetHeader(&mut strm, &mut head) },
+            ReturnCode::OK.as_i32()
+        );
+
+        strm.next_in = gz.as_ptr();
+        strm.avail_in = uInt::try_from(gz.len()).unwrap();
+        strm.next_out = out.as_mut_ptr();
+        strm.avail_out = uInt::try_from(out.len()).unwrap();
+
+        // SAFETY: `strm` holds a state this module installed and its four buffer members are
+        // initialised, which is `entry`'s and `header_alias_plan`'s contract. The session
+        // borrows the state block in place and is dropped before the decode below, so no
+        // borrow of it outlives this statement.
+        let plan = unsafe {
+            let session = super::entry(&mut strm).expect("the state is installed");
+            session.header_alias_plan()
+        };
+        assert_eq!(
+            plan,
+            (false, false),
+            "disjoint header buffers must plan no copying"
+        );
+
+        // SAFETY: four disjoint live regions on an initialised gzip stream.
+        let ret = unsafe { inflate(&mut strm, 0) };
+        assert_eq!(ret, ReturnCode::STREAM_END.as_i32());
+        assert_eq!(head.done, 1);
+        assert_eq!(&name[..5], b"name\0");
+        assert_eq!(&comment[..8], b"comment\0");
+        assert_eq!(&extra[..2], &[0xab, 0xcd]);
+        assert_eq!(&out[..PAYLOAD.len()], PAYLOAD);
+
+        // SAFETY: the stream is the initialised one.
+        assert_eq!(unsafe { inflateEnd(&mut strm) }, ReturnCode::OK.as_i32());
+    }
 }
 
 #[cfg(test)]
@@ -6186,35 +6768,38 @@ mod tests {
 // There is deliberately no `allow-indexing-slicing-in-tests` key -- it is newer than
 // the declared 1.80 floor and an unrecognised `clippy.toml` field aborts the whole
 // lint run -- so the slicing allowance is taken as a module-local attribute instead.
-// `used_underscore_items` joins them because these tests call
-// `_zlib_rs_inflate_table`, whose leading underscore is what `zlib.map`'s `local: _*;`
-// pattern hides it by and `zlib.map` is immutable. Its real caller is
-// `csrc/inftrees_shim.c`, which presents the `codetype` prototype no Rust caller can
-// spell; these tests are the only Rust callers it will ever have. `unknown_lints`
-// comes first because the lint postdates the declared 1.80 floor, where naming it
-// would otherwise be a warning of its own -- the same guard
+// `unknown_lints` comes first because `clippy::indexing_slicing`'s companion keys move
+// with the toolchain and naming a lint the declared 1.80 floor does not know would
+// otherwise be a warning of its own -- the same guard
 // `crates/zlib-rs/src/deflate/algorithm.rs` uses for `_tr_init`.
+//
+// `clippy::used_underscore_items` was here too, for the days when these tests called
+// `_zlib_rs_inflate_table` -- the underscore-prefixed Rust half of an `inflate_table`
+// that a C translation unit defined. The Rust function now IS `inflate_table`, so
+// nothing in this module names an underscore-prefixed item and the allowance is gone.
 #[allow(
     unknown_lints,
     clippy::indexing_slicing,
     clippy::panic,
     clippy::too_many_lines,
-    clippy::unwrap_used,
-    clippy::used_underscore_items
+    clippy::unwrap_used
 )]
 mod tests_backend {
     use super::{
-        _zlib_rs_inflate_table, code, inflate, inflateCodesUsed, inflateCopy, inflateEnd,
-        inflateGetDictionary, inflateGetHeader, inflateInit2_, inflateInit_, inflateMark,
-        inflatePrime, inflateReset, inflateReset2, inflateResetKeep, inflateSetDictionary,
-        inflateSync, inflateSyncPoint, inflateUndermine, inflateValidate, message_ptr,
-        narrow_uLong, widen_uLong, z_stream, BAD_STATE_MARK, ENOUGH_DISTS, MAX_INFLATE_FLUSH,
+        code, inflate, inflateCodesUsed, inflateCopy, inflateEnd, inflateGetDictionary,
+        inflateGetHeader, inflateInit2_, inflateInit_, inflateMark, inflatePrime, inflateReset,
+        inflateReset2, inflateResetKeep, inflateSetDictionary, inflateSync, inflateSyncPoint,
+        inflateUndermine, inflateValidate, inflate_table, message_ptr, narrow_uLong, widen_uLong,
+        z_stream, InflateSlot, InflateState, BAD_STATE_MARK, ENOUGH_DISTS, MAX_INFLATE_FLUSH,
         MAX_WINDOW_BYTES, MESSAGES,
     };
     use core::ffi::{c_char, c_int, c_uint, c_ulong, c_ushort, CStr};
     use core::mem::{align_of, offset_of, size_of, MaybeUninit};
 
-    use crate::types::{gz_header, uInt, z_streamp, StatePrefix, CODES, DISTS, ENOUGH, LENS};
+    use crate::types::{
+        gz_header, uInt, z_streamp, StateBlock, StatePrefix, StreamAllocator, CODES, DISTS, ENOUGH,
+        LENS,
+    };
     use crate::util::ZLIB_VERSION;
     use zlib_rs::error::ReturnCode;
     use zlib_rs::inflate::{Mode, INFLATE_CODES_USED_BAD_STATE};
@@ -6222,7 +6807,7 @@ mod tests_backend {
     /// The mode tag `test/infcover.c` L330 writes: `DICT`, i.e. 16190.
     const DICT_TAG: c_int = 16190;
 
-    /// The mode tag `test/infcover.c` L458 writes: `SYNC`, i.e. 16211.
+    /// The mode tag `test/infcover.c` L459 writes: `SYNC`, i.e. 16211.
     const SYNC_TAG: c_int = 16211;
 
     /// A zeroed `z_stream`, which is what a C caller declares before initialising.
@@ -6280,7 +6865,7 @@ mod tests_backend {
     /// ★ This is the one thing about the state that is *deliberately* reachable from
     /// outside the library, because `test/infcover.c` includes the private
     /// `inflate.h` and writes through it -- `((struct inflate_state *)strm.state)
-    /// ->mode = DICT` at its L330 and `state->mode = SYNC` at its L458. The Rust
+    /// ->mode = DICT` at its L330 and `state->mode = SYNC` at its L459. The Rust
     /// spelling of that cast is `StatePrefix`, whose `#[repr(C)]` layout places a
     /// `z_streamp` at offset 0 and the `int` tag at offset 8 -- exactly where
     /// `deflate.h` L105-L106 and `inflate.h` L83-L84 place theirs.
@@ -6474,6 +7059,44 @@ mod tests_backend {
     }
 
     // -----------------------------------------------------------------------
+    /// The facade's three state footprints, pinned against C's 7160-byte `inflate_state`.
+    ///
+    /// The deflate side of this pair carries the reasoning -- see
+    /// `the_facade_state_block_footprint_matches_the_c_budget` in `crate::deflate` -- and the
+    /// short form is that "the size of an inflate state" is three numbers, not one. The core
+    /// pins its own three generic forms in `zlib_rs::inflate::state`'s
+    /// `inline_arrays_and_state_footprint_match_the_c_budget`; these are the three that exist
+    /// only here, because [`StreamAllocator`] is this crate's type:
+    ///
+    /// * `InflateState<'_, StreamAllocator>` -- the core state carrying the caller's hooks;
+    /// * [`InflateSlot`] -- that state plus the caller's `gz_header` pointer and the retained
+    ///   message identity; and
+    /// * `StateBlock<InflateSlot>` -- the slot plus the C-visible [`StatePrefix`] at offset 0,
+    ///   which is the block `z_stream.state` points at and the only one a `zalloc` sees.
+    #[test]
+    fn the_facade_state_block_footprint_matches_the_c_budget() {
+        let stream_allocator = size_of::<InflateState<'static, StreamAllocator>>();
+        let slot = size_of::<InflateSlot>();
+        let block = size_of::<StateBlock<InflateSlot>>();
+
+        if cfg!(target_pointer_width = "64") {
+            assert_eq!(stream_allocator, 7344);
+            assert_eq!(slot, 7368);
+            assert_eq!(block, 7384);
+        }
+
+        assert!(
+            stream_allocator <= slot && slot <= block,
+            "the three forms nest: state {stream_allocator} <= slot {slot} <= block {block}"
+        );
+        // AAP §0.8.4 caps a per-stream footprint at 115% of C's 7160, which is 8234 bytes.
+        assert!(
+            block <= 8234,
+            "the allocated block is {block} bytes, above the 8234-byte ceiling 115% of C's 7160 \
+             sets"
+        );
+    }
+
     // The message table
     // -----------------------------------------------------------------------
 
@@ -7749,7 +8372,7 @@ mod tests_backend {
             // `ENOUGH_DISTS` entries, and `next`/`bits` are live locals. The three
             // arrays are distinct allocations.
             let ret = unsafe {
-                _zlib_rs_inflate_table(
+                inflate_table(
                     DISTS,
                     lens.as_mut_ptr().cast::<c_ushort>(),
                     16,
@@ -8373,7 +8996,7 @@ mod tests_backend {
             // SAFETY: as the test above -- three distinct arrays, each at least as long
             // as the call requires, and two live in/out locals.
             let ret = unsafe {
-                _zlib_rs_inflate_table(
+                inflate_table(
                     DISTS,
                     lens.as_mut_ptr().cast::<c_ushort>(),
                     16,
@@ -8411,7 +9034,7 @@ mod tests_backend {
         // SAFETY: `lens` and `work` cover the two codes requested, and `table` is
         // larger than either `ENOUGH_*` bound.
         let ret = unsafe {
-            _zlib_rs_inflate_table(
+            inflate_table(
                 CODES,
                 lens.as_mut_ptr().cast::<c_ushort>(),
                 2,
@@ -8437,7 +9060,7 @@ mod tests_backend {
         // sized for the `LENS` root as `inftrees.c` requires. `inflate_table` writes
         // only within those bounds and retains none of them.
         let ret = unsafe {
-            _zlib_rs_inflate_table(
+            inflate_table(
                 LENS,
                 over.as_mut_ptr().cast::<c_ushort>(),
                 3,
@@ -8459,7 +9082,7 @@ mod tests_backend {
         // sized for the `LENS` root as `inftrees.c` requires. `inflate_table` writes
         // only within those bounds and retains none of them.
         let ret = unsafe {
-            _zlib_rs_inflate_table(
+            inflate_table(
                 LENS,
                 none.as_mut_ptr().cast::<c_ushort>(),
                 4,
@@ -8489,7 +9112,7 @@ mod tests_backend {
         unsafe {
             for bad_type in [-1, 3, 4, c_int::MAX, c_int::MIN] {
                 assert_eq!(
-                    _zlib_rs_inflate_table(
+                    inflate_table(
                         bad_type,
                         lens.as_mut_ptr().cast::<c_ushort>(),
                         2,
@@ -8502,7 +9125,7 @@ mod tests_backend {
                 );
             }
             assert_eq!(
-                _zlib_rs_inflate_table(
+                inflate_table(
                     CODES,
                     core::ptr::null_mut(),
                     2,
@@ -8513,7 +9136,7 @@ mod tests_backend {
                 -1
             );
             assert_eq!(
-                _zlib_rs_inflate_table(
+                inflate_table(
                     CODES,
                     lens.as_mut_ptr().cast::<c_ushort>(),
                     2,
@@ -8524,7 +9147,7 @@ mod tests_backend {
                 -1
             );
             assert_eq!(
-                _zlib_rs_inflate_table(
+                inflate_table(
                     CODES,
                     lens.as_mut_ptr().cast::<c_ushort>(),
                     2,
@@ -8535,7 +9158,7 @@ mod tests_backend {
                 -1
             );
             assert_eq!(
-                _zlib_rs_inflate_table(
+                inflate_table(
                     CODES,
                     lens.as_mut_ptr().cast::<c_ushort>(),
                     2,
@@ -8548,7 +9171,7 @@ mod tests_backend {
             // A null *inside* `table` is refused too.
             let mut null_base: *mut code = core::ptr::null_mut();
             assert_eq!(
-                _zlib_rs_inflate_table(
+                inflate_table(
                     CODES,
                     lens.as_mut_ptr().cast::<c_ushort>(),
                     2,
@@ -8582,20 +9205,26 @@ mod tests_backend {
     }
 
     // -----------------------------------------------------------------------
-    // The overlap snapshot is the caller's allocation, not Rust's
+    // The overlap stage costs the allocator nothing
     // -----------------------------------------------------------------------
 
-    /// An overlapping `inflate` takes its snapshot through the caller's `zalloc`, and a
-    /// caller who refuses it gets an error rather than an abort.
+    /// An overlapping `inflate` decodes correctly and asks the allocator for **nothing**.
     ///
-    /// The companion of `deflate.rs`'s pair, for the other streaming entry point. The
-    /// snapshot is `avail_in` bytes -- a number the *caller* chose -- so `zlib.h`
-    /// L140-L153 makes it the caller's allocator's business: a custom arena has to see
-    /// it, and `test/infcover.c`'s `mem_limit()` has to be able to refuse it. Reaching
-    /// past the hooks to Rust's global allocator would put a caller-sized request outside
-    /// both, and would turn a refusal into a process abort.
+    /// The companion of `deflate.rs`'s test, for the other streaming entry point, and the
+    /// regression test for the bounded stage. An earlier design copied the caller's whole
+    /// `avail_in` into a block from the caller's own `zalloc`, which is a request whose size
+    /// the *caller* chose and which therefore had no bound at all: a 32 KiB overlapping call
+    /// measured 182.6% of the reference implementation's per-stream footprint against the 15%
+    /// ceiling AAP §0.8.4 sets. `OverlapStage` replaced it with a fixed stage the decoder is
+    /// handed one window at a time, so the allocator sees no request whatsoever and an
+    /// overlapping call's high-water mark is exactly the reference's.
+    ///
+    /// Two things follow and both are asserted here: the request count does not move, and a
+    /// caller who refuses *every* allocation still gets a correct decode -- where before it
+    /// got `Z_STREAM_ERROR`, because the snapshot it refused was the only way the call could
+    /// be served.
     #[test]
-    fn an_overlapping_inflate_snapshots_through_the_callers_hooks() {
+    fn an_overlapping_inflate_costs_the_callers_allocator_nothing() {
         const PAYLOAD: &[u8] = b"hello, hello! hello, hello! hello, hello!";
         let compressed = deflate_zlib(PAYLOAD);
 
@@ -8629,26 +9258,27 @@ mod tests_backend {
         assert_eq!(
             &shared[..PAYLOAD.len()],
             PAYLOAD,
-            "the snapshot is what was decoded, so the output is the original bytes"
+            "the stage is what was decoded, so the output is the original bytes"
         );
 
         let after_call = zone.with(|zone| (zone.requests, zone.live()));
         assert_eq!(
-            after_call.0,
-            after_init.0 + 1,
-            "the snapshot is one further request through the caller's zalloc"
+            after_call.0, after_init.0,
+            "the bounded stage is stack space: the caller's zalloc is not called at all"
         );
         assert_eq!(
             after_call.1, after_init.1,
-            "and it was returned through the caller's zfree before inflate returned"
+            "and nothing is left live for `inflateEnd` to find"
         );
 
-        // A caller who refuses the snapshot is answered, not aborted. `Z_STREAM_ERROR` is
-        // the status an unservable buffer pair earns, the same class of argument fault C
-        // rejects for a null pair -- see `AliasScratch` in `src/types.rs`.
+        // ★ The behaviour change this replaced. A caller who refuses every allocation used to
+        // be told `Z_STREAM_ERROR` for an overlapping pair, because the snapshot it refused
+        // was the only way to serve one. There is nothing left to refuse, so the call now
+        // succeeds -- which is what C does too, C having never allocated for this at all.
         // SAFETY: `strm` is the live, initialised stream this test owns.
         let reset = unsafe { inflateReset(&mut strm) };
         assert_eq!(reset, ReturnCode::OK.as_i32());
+        shared.fill(0);
         shared[..compressed.len()].copy_from_slice(&compressed);
         zone.with(|zone| zone.deny_from = zone.requests + 1);
         strm.next_in = shared.as_ptr();
@@ -8659,11 +9289,14 @@ mod tests_backend {
         let status = unsafe { inflate(&mut strm, 4) };
         assert_eq!(
             status,
-            ReturnCode::STREAM_ERROR.as_i32(),
-            "a refused snapshot is reported"
+            ReturnCode::STREAM_END.as_i32(),
+            "a refused allocator no longer refuses an overlapping call, because none is made"
         );
-        assert_eq!(strm.total_in, 0, "nothing was consumed");
-        assert_eq!(strm.total_out, 0, "nothing was emitted");
+        assert_eq!(
+            &shared[..PAYLOAD.len()],
+            PAYLOAD,
+            "and the decode is still correct"
+        );
 
         zone.with(|zone| zone.deny_from = 0);
         // SAFETY: `strm` is the live, initialised stream this test owns.

@@ -31,7 +31,17 @@
 #  translation unit that has already included `zlib.h`, so the C compiler itself
 #  reports a conflicting type; by diffing a canonical, compiler-resolved rendering
 #  of all 95 contract signatures and requiring NO OUTPUT; and by comparing struct
-#  sizes, field offsets and macro values through one probe program per side.  So "NORMALISATION RULES THE GATE MUST IMPLEMENT" below is
+#  sizes, field offsets and macro values through one probe program per side.
+#
+#  That job also CLASSIFIES the raw file diff, which is its pass E and the reason
+#  the "ACCEPTED DIVERGENCES" list below is enforced rather than merely asserted:
+#  it re-runs the comparison on comment-stripped copies of the two headers and
+#  requires every remaining differing line to be attributable to one of the D
+#  categories, printing the category counts and failing on a line it cannot
+#  attribute.  An identifier that belongs to neither header is exactly what that
+#  catches -- it is how the C-runtime `wcstombs` declaration cbindgen was
+#  re-emitting was found, and why `wcstombs` now sits in `[export] exclude` beside
+#  `malloc` and `free`.  So "NORMALISATION RULES THE GATE MUST IMPLEMENT" below is
 #  both the specification and a description of what runs; where a rule is
 #  implemented, the rule says by which half.  Statements of the form "verified" or
 #  "reproduced" are marked where they were established against cbindgen 0.29.4
@@ -46,10 +56,12 @@
 #
 #  A bare `diff -u zlib.h generated_zlib.h` compares the two FILES, which is a
 #  different question from whether the CONTRACT diverges: its output can never be
-#  empty, so CI runs it and publishes it as evidence rather than as the check.
-#  The check is rule A11, and it IS a literal diff that must be empty -- of a
-#  canonical, compiler-resolved rendering of every contract signature.  See "READ
-#  THIS BEFORE CHANGING THE CI GATE" below.
+#  empty, so its exit status is not the pass/fail signal.  CI runs it, publishes
+#  it, and then asserts its CONTENT line by line against the D categories below
+#  (pass E), so nothing about it is taken on trust.  The contract check proper is
+#  rule A11, and it IS a literal diff that must be empty -- of a canonical,
+#  compiler-resolved rendering of every contract signature.  See "READ THIS BEFORE
+#  CHANGING THE CI GATE" below.
 #
 #  `generated_zlib.h` is scratch.  `.gitignore` has an anchored `/generated_zlib.h`
 #  rule precisely so it can never be committed: a second header sitting beside
@@ -77,9 +89,15 @@
 #  and never will be, because cbindgen emits no comments, no ZEXTERN/ZEXPORT, no
 #  function-like macros and no conditional include of `zconf.h`.  It must not be
 #  the pass/fail check, and it is not omitted either: the `header` job runs it,
-#  writes it to target/header-gate/aap-0.8.6-raw.diff and publishes it with the
-#  job's artifacts, so that what it contains can be checked against the
-#  "ACCEPTED DIVERGENCES" list rather than taken on trust.  When a divergence is
+#  writes it to target/header-gate/aap-0.8.6-raw.diff, publishes it with the job's
+#  artifacts, and then CHECKS it -- pass E strips the comments both sides, squeezes
+#  the blank lines, re-diffs, and requires every remaining differing line to be
+#  attributable to a D category named in this file, failing the job on one it
+#  cannot attribute and publishing the full attribution as
+#  target/header-gate/aap-0.8.6-classified.diff beside the two comment-stripped
+#  inputs, aap-0.8.6-nocomments.ref and .gen.  "A reviewer can confirm the content"
+#  was the previous standard and it was not one: it asked a human to re-read six
+#  thousand lines.  When a divergence is
 #  removable at the SOURCE, remove it there instead of adding an allowance -- D2
 #  is the worked example, and closing it is what left rule A11's diff empty with
 #  no allowance at all.
@@ -266,22 +284,28 @@
 #      does, but around a different span (prototypes only, rather than the
 #      whole body).  The gate strips the `extern "C" {` and `}` tokens.
 #
-#  D11. `gzprintf` and `gzvprintf` are absent from the GENERATED HEADER, and
-#      that is a cbindgen fact rather than a missing export.  Both symbols are
-#      IMPLEMENTED and both are EXPORTED; they are simply not implemented in
-#      Rust, so cbindgen has no Rust item to render.
+#  D11. `gzprintf` and `gzvprintf` cannot be DERIVED by cbindgen, so they are
+#      declared by hand -- and the distinction matters, because the artifact
+#      therefore carries them and the gate compares them like any other name.
+#      They are not an exception to pass A any more; they are an exception to
+#      cbindgen's reach.
 #
 #      `gzprintf` is C variadic (zlib.h L1549) and `gzvprintf` takes a `va_list`
 #      (zlib.h L2047).  Defining either in Rust needs `c_variadic`, which is
 #      UNSTABLE on the toolchain this workspace pins -- verified: rustc 1.97.1
-#      stable rejects a variadic `extern "C" fn` with E0658, and the feature
-#      only became stable on 1.99.0-nightly.  cbindgen can therefore see no
-#      Rust item to emit for them.  Both names are a DECLARED, ENUMERATED
-#      exception in the header gate -- and the exception list must be exactly
-#      these two, so that a genuinely missing export cannot hide behind it.
+#      stable AND rustc 1.80.1, the declared floor, both reject a variadic
+#      `extern "C" fn` and `core::ffi::VaList` with E0658, and the feature only
+#      became stable on 1.99.0-nightly.  So they are implemented in
+#      `crates/libz-rs-sys/csrc/gzprintf_shim.c`, cbindgen has no Rust item to
+#      render, and `trailer` below emits the two prototypes verbatim with the
+#      reason beside them.  What remains an ENUMERATED, PRINTED allowance in
+#      `make rust-header` is one name and one only, `gzopen_w` via
+#      `RUSTHEADERNOGEN`, and that one is present in the artifact too -- behind
+#      `#ifdef _WIN32`, which the name-extracting preprocessor pass does not
+#      enter unless `-D_WIN32` is given, while the compile legs do enter it.
 #      When the pinned toolchain reaches a release with `c_variadic` stable,
-#      delete this entry and require both names in Pass A.  Keep C1 and C2
-#      regardless: they test something the header diff never can.
+#      move these two from `trailer` into Rust and delete the trailer text.  Keep
+#      C1 and C2 regardless: they test something the header diff never can.
 #
 #  WHICH GATE OWNS WHAT
 #  --------------------
@@ -317,11 +341,19 @@
 #    * A name MISSING from the generated side is a failure in Pass A and in
 #      Pass B, subject only to the enumerated exceptions each pass names.
 #
-#      BE PRECISE ABOUT WHAT COVERS THEM INSTEAD, because it is less than it
-#      sounds.  The `nm` symbol-parity gate can only establish that symbols
-#      named `gzprintf` and `gzvprintf` are EXPORTED; it says nothing about
-#      whether either one honours the C variadic / `va_list` calling convention,
-#      because `nm` never calls anything.  What DOES discharge them is a C caller
+#      TWO NAMES USED TO BE EXCEPTED HERE AND NO LONGER ARE.  `gzprintf` and
+#      `gzvprintf` are declared in the generated artifact today -- the facade
+#      declares them in an `extern "C"` block, with the reason recorded beside it,
+#      and cbindgen renders a declaration exactly as it renders an export -- so
+#      pass A compares them like any other name.  What follows is still worth
+#      keeping, because a DECLARATION is not a calling convention and the symbol
+#      gates cannot see one either.
+#
+#      BE PRECISE ABOUT WHAT COVERS THEM, because it is less than it sounds.  The
+#      `nm` symbol-parity gate can only establish that symbols named `gzprintf`
+#      and `gzvprintf` are EXPORTED; it says nothing about whether either one
+#      honours the C variadic / `va_list` calling convention, because `nm` never
+#      calls anything.  What DOES discharge them is a C caller
 #      with real varargs, and that exists: `test/example.c` L109 requires
 #      `gzprintf(file, ", %s!", "hello")` to return exactly 8, and
 #      `make rust-test` compiles that UNMODIFIED driver against the staged
@@ -335,13 +367,15 @@
 #      accepts.
 #
 #      ONE QUALIFICATION SURVIVES, and it is about the artifact rather than the
-#      calling convention: cargo's own `libz.so` does not EXPORT these two, because
-#      rustc's cdylib version script gives a symbol from a native archive no
-#      dynamic entry.  `libz.a` defines them and the packaged shared object exports
-#      them.  So the right reading of this entry is "absent from the generated
-#      HEADER by cbindgen's construction, defined in every artifact, exported by the
-#      archive and by the packaged shared object" -- and the artifact matrix in
-#      `crates/libz-rs-sys/src/lib.rs` is where that is stated once.
+#      calling convention: cargo's own `target/release/libz.so` does not EXPORT
+#      these two, because nothing in the cdylib references the archived shim
+#      objects, so they get no dynamic entry there.  `libz.a` defines them and the
+#      packaged shared object staged by `make rust` exports them -- measured with
+#      `nm` on both.  So the right reading of this entry is "declared in the
+#      generated header, defined in every artifact, exported by the archive and by
+#      the packaged shared object, and NOT by the raw cargo cdylib" -- and the
+#      artifact matrix in `crates/libz-rs-sys/src/lib.rs` is where that is stated
+#      once.
 #
 #  NORMALISATION RULES THE GATE MUST IMPLEMENT
 #  -------------------------------------------
@@ -448,37 +482,58 @@
 #
 #       `diff -u zlib.h generated_zlib.h` -- the two FILES, as AAP 0.8.6 writes
 #       it -- is run as well, written to target/header-gate/aap-0.8.6-raw.diff
-#       and published with the job's artifacts.  It is not the pass/fail check
-#       and cannot be: D1, D3, D5, D7, D8, D9 and D10 each guarantee output no
-#       generator configuration can remove.  It is published so that a reviewer
-#       can confirm the difference consists of those reasons and nothing else.
+#       and published with the job's artifacts.  Its exit status is not the
+#       pass/fail check and cannot be: D1, D3, D5, D7, D8, D9 and D10 each
+#       guarantee output no generator configuration can remove.  Its CONTENT is
+#       checked, by pass E of the same job: comments stripped from both sides,
+#       blank runs squeezed, re-diffed, and every remaining differing line
+#       required to be attributable to one of those enumerated reasons -- a line
+#       that is not fails the job, and the attribution is published as
+#       aap-0.8.6-classified.diff.  So the difference IS confirmed to consist of
+#       those reasons and nothing else, mechanically rather than by reading.
 #
 #  After rules A1-A11, compare the two name -> normalised-signature maps and the
-#  two name -> integer-value maps.  A name present on one side only (D11
-#  excepted), a name mapped to different signature text, or a constant with a
-#  different value, is a FAILURE.
+#  two name -> integer-value maps.  A name present on one side only -- excepting
+#  only the named, printed `RUSTHEADERNOGEN` allowance for the `_WIN32`-guarded
+#  `gzopen_w`, and the extra typedef spellings D2 records as additions -- a name
+#  mapped to different signature text, or a constant with a different value, is a
+#  FAILURE.
 #
 #  SHAPE OF A PASSING RUN -- MEASURED, not predicted.  `make rust-header` on
 #  this platform (gcc 15, cbindgen 0.29.4, x86_64-unknown-linux-gnu) reports:
 #
-#    cbindgen: 2 allowed notice(s), 0 unexpected
+#    cbindgen: 1 allowed notice(s), 0 unexpected
 #    C   -std=c89: clean (with -Wno-endif-labels, see D9)
+#    C   -std=c89 -D_WIN32: clean (with -Wno-endif-labels, see D9)
 #    C   -std=c99: clean
+#    C   -std=c99 -D_WIN32: clean
 #    C   -std=c17: clean
+#    C   -std=c17 -D_WIN32: clean
 #    C++ -std=c++17: clean
-#    zlib.h declares 96 contract functions; generated_zlib.h declares 94
-#    missing, allowed: gzopen_w, gzprintf, gzvprintf
-#    extra, allowed: inflate_table
+#    C++ -std=c++17 -D_WIN32: clean
+#    zlib.h declares 96 contract functions;
+#    generated_zlib.h declares 95
+#    missing, allowed by RUSTHEADERNOGEN: gzopen_w
 #
-#  Read those numbers carefully, because they are not the ones an earlier draft
-#  of this file predicted.  96 is the `ZEXTERN` count less the five macro-only
-#  init spellings.  94 is 93 contract functions -- 96 less `gzopen_w`, which is
-#  `_WIN32`-only, and less the two D11 names -- PLUS `inflate_table`, which is a
-#  real export that `zlib.h` does not declare and `test/infcover.c` cannot link
-#  without.  So the difference is not the "2 names" the prediction expected but
-#  four names in two directions, every one of them enumerated and printed by
-#  name on each run.  Re-derive these from `make rust-header` after any change
-#  to the facade's exported surface rather than trusting the transcript above.
+#  Read those numbers carefully, because they are not the ones earlier drafts of
+#  this file recorded, and the difference is a real narrowing rather than a
+#  re-count.  96 is the `ZEXTERN` count less the five macro-only init spellings.
+#  95 is all of them except `gzopen_w`, which is declared in the artifact but
+#  behind `#ifdef _WIN32`, so the preprocessor pass that extracts the names does
+#  not see it unless `-D_WIN32` is given -- hence the one named, printed
+#  `RUSTHEADERNOGEN` allowance, and hence the eight compile legs rather than four:
+#  every dialect is compiled with and without `_WIN32` so the block is not merely
+#  assumed to compile.  Two names that used to be on the missing list are on it no
+#  longer: `gzprintf` and `gzvprintf` are declared by the facade's own documented
+#  `extern "C"` block and cbindgen re-emits them, so the artifact now carries every
+#  contract prototype that is reachable on this platform.  `inflate_table` used to
+#  be an "extra, allowed" name and is not emitted at all now: it is a Rust
+#  function rather than a C shim, and `[export] exclude` keeps it out of a header
+#  whose subject is the public contract -- `zlib.map` marks it `local`, and
+#  `test/infcover.c` reaches it by linking the static archive.  So there are NO
+#  extras: `RUSTHEADEREXTRAOK` is empty and stays empty.  Re-derive these
+#  from `make rust-header` after any change to the facade's exported surface
+#  rather than trusting the transcript above.
 #
 #  MAINTENANCE NOTES
 #  * Pinned tool: cbindgen 0.29.4.  Every key below was checked against that
@@ -522,9 +577,9 @@ header = '''
 #  (`zlib.h` L2047).  Neither can be DEFINED in stable Rust -- defining a
 #  C-variadic function needs `#![feature(c_variadic)]` and naming a `va_list`
 #  needs `core::ffi::VaList`, both unstable -- so both live in
-#  `crates/libz-rs-sys/csrc/gzprintf_shim.c`, one of the two C translation units
-#  this library contains, which `crates/libz-rs-sys/build.rs` compiles into the
-#  archive every artifact is built from.  cbindgen
+#  `crates/libz-rs-sys/csrc/gzprintf_shim.c`, the one shipped C translation unit this
+#  library contains, which `crates/libz-rs-sys/build.rs` compiles into the archive
+#  every artifact is built from.  cbindgen
 #  reads Rust, so it cannot see them, and without this block the generated header
 #  would be missing two of the library's 95 exported functions: the diff gate
 #  would then report an incomplete artifact for a library that is in fact
@@ -729,24 +784,29 @@ item_types = [
 #       the two hidden helpers below are `pub` in Rust and yet are no part of the
 #       C contract.  Only an explicit exclusion keeps them out.
 #
-#  The three `_zlib_rs_*` entries are `zlib.map` `local:` names (the `_*` rule),
-#  each called by exactly one C translation unit in `crates/libz-rs-sys/csrc/`,
-#  which declares it itself, at the top of the file, with the same signature.  The
-#  shims need no generated header, so excluding them costs nothing and prevents
-#  the artifact from advertising an internal calling contract to every consumer
-#  that includes `zlib.h`.
+#  The two `_zlib_rs_*` entries are `zlib.map` `local:` names (the `_*` rule), both
+#  called by exactly one C translation unit in `crates/libz-rs-sys/csrc/`, which
+#  declares them itself, at the top of the file, with the same signatures.  The shim
+#  needs no generated header, so excluding them costs nothing and prevents the
+#  artifact from advertising an internal calling contract to every consumer that
+#  includes `zlib.h`.
 #
-#  `malloc` and `free` are here for the second admissible reason: they are C
-#  RUNTIME functions this crate *imports* -- the `extern "C"` block in
-#  `crates/libz-rs-sys/src/types.rs` that backs the published `zalloc`/`zfree`
-#  substitutes, since `zcfree` receives a bare pointer exactly as `free` does.
-#  cbindgen renders an imported declaration just as it renders an exported one, so
-#  without these two entries the artifact declares `void free(void *)` and
-#  `void *malloc(z_size_t)` inside a file guarded by ZLIB_H -- an internal calling
-#  contract advertised to every consumer, and a redeclaration of two <stdlib.h>
-#  names at that.  The annotation cannot be carried in the source: a doc comment on
-#  an `extern` block is `unused_doc_comments`, which is an error under
-#  `-D warnings`.
+#  `malloc`, `free` and `wcstombs` are here for the second admissible reason: they
+#  are C RUNTIME functions this crate *imports*.  `malloc` and `free` come from the
+#  `extern "C"` block in `crates/libz-rs-sys/src/types.rs` that backs the published
+#  `zalloc`/`zfree` substitutes, since `zcfree` receives a bare pointer exactly as
+#  `free` does; `wcstombs` comes from the block in `crates/libz-rs-sys/src/gz.rs`
+#  that narrows a wide path for `gzopen_w`, reproducing what `gzlib.c` L200-L219
+#  does.  cbindgen renders an imported declaration just as it renders an exported
+#  one, so without these entries the artifact declares `void free(void *)`,
+#  `void *malloc(z_size_t)` and `size_t wcstombs(char *, const wchar_t *, size_t)`
+#  inside a file guarded by ZLIB_H -- an internal calling contract advertised to
+#  every consumer, and a redeclaration of three standard-library names at that.
+#  `wcstombs` was the one that got through: it was found by the raw-diff
+#  classification gate in `.github/workflows/rust.yml`, which is there to make
+#  exactly this kind of omission fail rather than sit in a published artifact.  The
+#  annotation cannot be carried in the source: a doc comment on an `extern` block is
+#  `unused_doc_comments`, which is an error under `-D warnings`.
 #
 #  RULE FOR ADDING TO THIS LIST: an entry belongs here only if the name is absent
 #  from `zlib.h` AND is either exported as a symbol or imported from the C runtime.
@@ -755,15 +815,21 @@ item_types = [
 #  against `zlib.h`'s `ZEXTERN` set in BOTH directions, so hiding a contract
 #  function here fails the build rather than passing quietly.
 #
-#  `_zlib_rs_inflate_table` is the third such helper and is listed for the same
-#  reason.  The name `zlib.h` does not declare and `inftrees.h` L60-L62 does is
-#  `inflate_table`, whose first parameter is the C enum `codetype`; that
-#  declaration is supplied by `csrc/inftrees_shim.c`, in C, where the enum is
-#  legal, and the Rust side behind it is reached through this underscored name.
-#  Rendering the Rust spelling would put a prototype in a file that looks exactly
-#  like the public contract and that DISAGREES with the declaration the unmodified
-#  `test/infcover.c` compiles against -- `conflicting types for 'inflate_table'`
-#  is the whole reason the shim exists -- so it is excluded rather than annotated.
+#  `inflate_table` is the third such name and is excluded for a sharper reason than
+#  either of those, and it is the one entry whose name is not underscored.  It IS a
+#  real export -- `crates/libz-rs-sys/src/inflate.rs` defines it, because the
+#  unmodified `test/infcover.c` calls it directly and links the static archive -- but
+#  `zlib.h` does not declare it; `inftrees.h` L60-L62 does, `zlib.map`'s `local:`
+#  block hides it, and there its first parameter is the C enum `codetype`.  The Rust definition takes
+#  a plain `int`, which is ABI-identical and validated, so rendering it here would put
+#  a prototype into a file that looks exactly like the public contract and that
+#  DISAGREES with the declaration `test/infcover.c` compiles against:
+#  `conflicting types for 'inflate_table'` in any translation unit that included
+#  both -- inside a file guarded by `ZLIB_H`, at that.  A consumer needing that
+#  prototype includes `inftrees.h`, which is unmodified and remains the sole authority
+#  for it; this artifact must not offer a second, different one.  Excluding it also
+#  keeps `RUSTHEADEREXTRAOK` in `Makefile.in` empty, which is the state that target's
+#  documentation asks for.
 #
 #  `wchar_t` is excluded on the same principle but for a sharper reason: cbindgen
 #  renders `crate::gz::wchar_t` (the `#[cfg(windows)]` alias `gzopen_w` needs) as
@@ -777,10 +843,11 @@ item_types = [
 exclude = [
     "_zlib_rs_gzprintf_begin",
     "_zlib_rs_gzprintf_commit",
-    "_zlib_rs_inflate_table",
+    "inflate_table",
     "wchar_t",
     "malloc",
     "free",
+    "wcstombs",
     #  The layout probe `crates/libz-rs-sys/tests/abi_layout.rs` uses to pin the
     #  crate-private state prefix.  Rust-ABI rather than `extern "C"`, so it is not a
     #  symbol either implementation exports, and `zlib.h` declares nothing of the kind
@@ -795,7 +862,7 @@ exclude = [
     #  `ZLIB_INTERNAL` and hidden again by `zlib.map`'s `local: _*;`, so it is no part
     #  of the exported surface; the entry is inert today because cbindgen parses Rust
     #  and this symbol is defined in C, and it is listed for the same belt-and-braces
-    #  reason the three `_zlib_rs_*` names above are.
+    #  reason the other internal names above are.
     "_zlib_rs_gzvprintf_probe",
 ]
 

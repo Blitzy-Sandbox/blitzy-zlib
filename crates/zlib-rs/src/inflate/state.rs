@@ -1941,7 +1941,7 @@ impl<'a, A: Allocator<'a>> InflateState<'a, A> {
     /// Returns the current mode in C's 16180..=16211 tag numbering.
     ///
     /// The facade uses this to synchronise the compatibility prefix required by
-    /// `test/infcover.c` L331.
+    /// `test/infcover.c` L330 and L459.
     #[must_use]
     pub const fn mode_tag(&self) -> i32 {
         self.mode.as_raw()

@@ -128,8 +128,9 @@
 //!                   `zlib_rs::*` for the idiomatic surface.  ALL differential, interop and
 //!                   table-equality assertions live there, and every root carries
 //!                   `#![forbid(unsafe_code)]`.
-//! benches/*.rs   -> the three suites attached by the [[bench]] entries in Cargo.toml; same
-//!                   posture as tests/.
+//! benches/*.rs   -> the three suites of the `benches/` package (its own manifest, its own
+//!                   workspace, its own lock), which depends on THIS crate by path; nothing is
+//!                   attached here by a [[bench]] entry.  Same posture as tests/.
 //! ```
 //!
 //! # Both implementations are ordinary dependencies, and the direction of the edge is the point
@@ -168,17 +169,23 @@
 //! Rust path `z`, which is an unhelpfully short name for the crate under test, so this crate's
 //! manifest uses Cargo's dependency-rename form —
 //! `libz_rs_sys = { package = "libz-rs-sys", path = "../libz-rs-sys", version = "1.3.2" }` — and
-//! Cargo passes `--extern libz_rs_sys`. **Every test and attached bench here writes
-//! `use libz_rs_sys::…`, never `use z::…`.** The manifest is the authority on that name; this
+//! Cargo passes `--extern libz_rs_sys`. **Every test here writes `use libz_rs_sys::…`, never
+//! `use z::…`**, and the `benches/` package renames the dependency identically so its suites read
+//! the same way. The manifest is the authority on that name; this
 //! paragraph exists so the two never drift.
 //!
 //! # Corpus
 //!
 //! Correctness is measured against the committed, deterministic fixtures under `corpus/minimal/`,
 //! so `cargo test` needs no network, no download and no setup. The Silesia corpus is a second,
-//! opt-in tier used only for throughput measurement: `corpus/fetch_silesia.sh` is run by a human,
-//! deliberately, and by nothing else — not by `cargo test`, not by CI, and from no build script.
-//! Both throughput benchmarks report and skip when it is absent, with a zero exit status.
+//! opt-in tier used only for throughput measurement. FETCHING it is something a human does
+//! deliberately: `corpus/fetch_silesia.sh` is invoked in fetching mode by nobody else — not by
+//! `cargo test`, not by CI, and from no build script. VERIFYING is different, and worth stating
+//! because "and by nothing else" used to be written here: `rust.yml`'s `bench` job runs that script
+//! as `--verify-only`, which obtains nothing, writes nothing and reaches no network, against a
+//! corpus provisioned outside the workflow (a cache keyed on the pinned digest, or
+//! `ZLIB_RS_SILESIA_DIR`). So CI may verify and use a Silesia corpus while never acquiring one, and
+//! when none is present both throughput benchmarks report and skip with a zero exit status.
 //! `corpus/README.md` is the published contract for both tiers.
 //!
 //! # What this crate must never do
@@ -197,16 +204,32 @@
 //!
 //! # Miri and AddressSanitizer
 //!
-//! This crate sits outside *both* sanitizer gates, for two different reasons, and the distinction
-//! matters because several files describe themselves in terms of these jobs. Miri interprets Rust
-//! MIR and cannot execute compiled C at all, so the Miri job is scoped to the safe core
-//! (`-p zlib-rs`). The nightly AddressSanitizer job is scoped to `-p libz-rs-sys` and the three
-//! relinked C drivers — the split AAP 0.6.4.5 specifies — and it does not select this crate, so
-//! neither these tests nor the three benches attached to this package run under a sanitizer.
-//! What the `unsafe` here gets instead is a `// SAFETY:` comment per block, one gate per entry
-//! point, and a differential comparison that fails loudly when something is wrong. Neither posture
-//! is expressible as a manifest key — both are CI job scopes — so it is recorded here and in
-//! the manifest, accurately, so that nobody cites a sanitizer this crate is not run under.
+//! This crate is outside Miri and INSIDE AddressSanitizer, and the asymmetry has a cause rather
+//! than being an oversight. Miri interprets Rust MIR and cannot execute compiled C at all, so the
+//! Miri job is scoped to the safe core (`-p zlib-rs`) and this crate — whose whole purpose is to
+//! call into a C archive — can never be run under it.
+//!
+//! AddressSanitizer has no such limitation, and `rust.yml`'s `asan` job does select this crate.
+//! Its steps, in order: `cargo +nightly test -p libz-rs-sys` plain and again with `-Zbuild-std`;
+//! an instrumented facade archive that the three relinked C drivers are linked against and run;
+//! `cargo +nightly test -p zlib-rs-differential --target x86_64-unknown-linux-gnu`, which is THIS
+//! crate's default sweeps with the oracle itself compiled `-fsanitize=address` through `CFLAGS`;
+//! and finally `cargo +nightly bench --manifest-path benches/Cargo.toml`, which builds all three
+//! suites under instrumentation and runs each in criterion's `--test` mode, one iteration per
+//! benchmark. So the `unsafe` in `oracle.rs` and `port.rs` is exercised with instrumentation on,
+//! on both sides of the boundary, which is exactly where a mismatched declaration would show up as
+//! an over-read.
+//!
+//! One option is dropped for that step alone: `detect_leaks=0`, because the C oracle keeps `local`
+//! state alive for the life of the process by design (`z_errmsg`, `x2n_table`, the CRC tables) and
+//! `LeakSanitizer` cannot tell that from a leak at exit. Every other check — out-of-bounds,
+//! use-after-free, use-after-return — is fully in force, and allocator discipline is covered far
+//! more precisely by `port`'s instrumented allocator, which counts allocations and frees and
+//! asserts on leaks, non-LIFO frees and rogue frees inside the tests themselves.
+//!
+//! Neither scope is expressible as a manifest key — both are CI job scopes — so they are recorded
+//! here and in the manifest, and they must be kept in step with that workflow rather than
+//! described from memory.
 //!
 //! # Modules, and where `unsafe` lives
 //!
@@ -222,9 +245,10 @@
 //!   handle, the `inflateBack` callback bridge, and the instrumented allocator both sides are
 //!   driven through.
 //!
-//! Everything else — `build.rs`, every suite in `tests/`, the three attached benches and the five
-//! `fuzz_targets/` — carries `#![forbid(unsafe_code)]`, so "the harness contains no `unsafe`
-//! outside its boundary" is a compiler-enforced property rather than a convention. This file is
+//! Everything else — `build.rs`, every suite in `tests/`, the five `fuzz_targets/`, and the three
+//! criterion suites of the excluded `benches/` package that depends on this crate by path —
+//! carries `#![forbid(unsafe_code)]`, so "the harness contains no `unsafe` outside its boundary"
+//! is a compiler-enforced property rather than a convention. This file is
 //! the one place the attribute is absent, and it cannot be otherwise: a crate-root `forbid` would
 //! cover the two modules above as well. It holds no code for the attribute to protect — crate
 //! documentation, `pub mod oracle;` and `pub mod port;`, nothing else. See the ATTRIBUTES note
@@ -288,3 +312,14 @@ pub mod oracle;
 /// the [`port::TrackingAllocator`] port of `test/infcover.c`'s `mem_zone` that both sides are
 /// driven through. Together with [`oracle`] this is the whole of this crate's `unsafe`.
 pub mod port;
+
+/// The retention discipline both boundary modules hand their callers.
+///
+/// Three zlib entry points keep a pointer past the call that installed it -- the `gz_header` of
+/// `deflateSetHeader`/`inflateGetHeader`, the `inflateBack` window, and the ledger behind
+/// `opaque` -- and a `&mut` borrow that ends with the call cannot express that. [`retain::Session`]
+/// owns the stream, holds every retained allocation borrowed for the stream's whole life, and makes
+/// declaring the storage after the stream a compile error rather than a comment. It contains no
+/// `unsafe` and makes no library call of its own: [`port`] and [`oracle`] keep every `extern "C"`
+/// call and every `// SAFETY:` comment.
+pub mod retain;

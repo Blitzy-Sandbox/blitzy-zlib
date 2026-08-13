@@ -190,7 +190,7 @@ use crate::allocate::GlobalAllocator;
 use crate::config::{Flush, Z_DEFAULT_COMPRESSION};
 use crate::deflate::{deflate, deflate_end, deflate_init, DeflateStream};
 use crate::error::ReturnCode;
-use crate::read_buf::OutputRegion;
+use crate::read_buf::{OneShotSource, OutputRegion};
 
 /// The bound arithmetic shifts a length right by 25 (`compress.c` L93), so
 /// `usize` has to be wide enough for that to be defined.
@@ -346,12 +346,28 @@ pub fn compress2_z(dest: &mut [u8], source: &[u8], level: i32) -> Compressed {
 /// build would therefore break the 64-bit one, so the lint is allowed here, scoped to this
 /// function, exactly as `narrow_checksum` in `crates/libz-rs-sys/src/checksum.rs` scopes the
 /// three lints its own width conversion trips on 32-bit targets.
-#[allow(clippy::unnecessary_min_or_max)]
 pub fn compress2_z_into(dest: &mut OutputRegion<'_>, source: &[u8], level: i32) -> Compressed {
+    compress2_z_from(dest, &mut { source }, level)
+}
+
+/// [`compress2_z_into`] over an input the caller supplies a window at a time.
+///
+/// The body of `compress.c` L24-L66 lives here and nowhere else; [`compress2_z_into`] is the
+/// slice-shaped front for it. See [`OneShotSource`] for the one caller that needs the other
+/// shape and why: the C ABI facade serves an overlapping `source`/`dest` pair by copying the
+/// input into a **bounded** stage, and a bounded stage can only be handed over a window at a
+/// time. A slice supplier reports `usize::MAX` for its window, so the ordinary path is
+/// byte-for-byte the loop it always was, with C's own `uInt`-sized chunking and nothing else.
+#[allow(clippy::unnecessary_min_or_max)]
+pub fn compress2_z_from<S: OneShotSource>(
+    dest: &mut OutputRegion<'_>,
+    source: &mut S,
+    level: i32,
+) -> Compressed {
     // Captured before the first reborrow of `dest`, and the origin of every bound
     // below. These are C's entry values of `*destLen` and `sourceLen`.
     let dest_len = dest.len();
-    let source_len = source.len();
+    let source_len = source.total();
 
     // L35-L36: `left = *destLen; *destLen = 0;`
     //
@@ -409,7 +425,12 @@ pub fn compress2_z_into(dest: &mut OutputRegion<'_>, source: &[u8], level: i32) 
             left = left.saturating_sub(avail_out);
         }
         if avail_in == 0 {
-            avail_in = len.min(MAX_CHUNK);
+            // ★ `min(max_window())` is the only line the window supplier adds to C's chunking.
+            // A slice supplier reports `usize::MAX`, so for every ordinary call this is C's
+            // `min(MAX_CHUNK)` and nothing more; a bounded stage reports its own capacity and
+            // the loop simply takes smaller bites, which is what keeps the flush selector below
+            // -- `Z_FINISH` only once `len` reaches zero -- correct either way.
+            avail_in = len.min(MAX_CHUNK).min(source.max_window());
             len = len.saturating_sub(avail_in);
         }
 
@@ -421,7 +442,7 @@ pub fn compress2_z_into(dest: &mut OutputRegion<'_>, source: &[u8], level: i32) 
         // them, neither accessor can fail whatever the arithmetic above produced.
         let in_end = next_in.saturating_add(avail_in).min(source_len);
         let out_end = next_out.saturating_add(avail_out).min(dest_len);
-        let Some(input) = source.get(..in_end) else {
+        let Some(input) = source.window(next_in, in_end.saturating_sub(next_in)) else {
             // Unreachable by the invariant just stated. Reported rather than
             // asserted so that this function stays panic-free on every path;
             // `Z_BUF_ERROR` is the honest status for "no window could be
@@ -439,7 +460,12 @@ pub fn compress2_z_into(dest: &mut OutputRegion<'_>, source: &[u8], level: i32) 
         // what an earlier iteration did.
         let mut window = dest.reborrow(next_out, out_end.saturating_sub(next_out));
         let mut stream = DeflateStream::with_region(input, window.reborrow(0, window.len()));
-        stream.next_in = next_in;
+        // ★ Zero, and the window starts *at* `next_in`, where before the whole prefix was
+        // handed over with the cursor pre-positioned. The bytes the encoder reads are the same
+        // bytes; what changes is that a supplier which cannot address the prefix -- a bounded
+        // stage -- can serve this shape, and the consumed count below is read off the cursor
+        // rather than differenced against its entry value.
+        stream.next_in = 0;
         stream.total_in = total_in;
         stream.total_out = total_out;
         stream.msg = msg;
@@ -461,9 +487,9 @@ pub fn compress2_z_into(dest: &mut OutputRegion<'_>, source: &[u8], level: i32) 
 
         // Whether this call moved either cursor; only the termination assertion
         // below reads it.
-        let advanced = stream.next_in != next_in || stream.next_out != 0;
+        let advanced = stream.next_in != 0 || stream.next_out != 0;
 
-        next_in = stream.next_in;
+        next_in = next_in.saturating_add(stream.next_in);
         next_out = next_out.saturating_add(stream.next_out);
         avail_in = stream.avail_in();
         avail_out = stream.avail_out();

@@ -113,7 +113,54 @@ fi
 # missing toolchain rather than surfacing as an exec error from inside a
 # recipe.
 CARGO=${CARGO-"cargo"}
-if "$CARGO" --version >/dev/null 2>/dev/null || test $? -lt 126; then
+
+# The value is DATA until it has been checked, and two of the three places it goes
+# treat it as something else: it is substituted into the sed script below that writes
+# Makefile, and it lands in a make variable that recipes expand unquoted.  So the
+# characters that would stop being data are rejected here, once, by name:
+#
+#   * a NEWLINE cannot survive a one-line sed substitution at all -- it would end the
+#     s command and turn the rest of the value into sed script text;
+#   * a leading `-' would be read as an option by the commands that run $(CARGO);
+#   * `"' and `'"'"'' would unbalance the quoting in the recipes that pass CARGO on;
+#   * `$', `\', backtick, `;', `&', `|', `<', `>', `(' and `)' are make- or
+#     shell-active in the same way.
+#
+# `#' and `&' additionally have meaning to sed itself -- `#' is this script's own s
+# delimiter and `&' reinserts the match -- and they are covered by the same refusal,
+# so the substitution below needs no escaping pass beyond it.  A path with a SPACE is
+# refused for the same reason: make would split it into two words.
+#
+# Refusing beats escaping here because the accepted set is exactly what a toolchain
+# path needs, and because a value this script cannot state plainly in Makefile is a
+# value the Rust targets could not run anyway.
+case $CARGO in
+  "")
+    ;;
+  -*)
+    echo "Checking for cargo... refused." | tee -a configure.log
+    echo "CARGO=$CARGO starts with a dash, so every command that runs it would read" \
+        | tee -a configure.log
+    echo "it as an option.  Give a path such as ./cargo or /opt/rust/bin/cargo." \
+        | tee -a configure.log
+    exit 1
+    ;;
+  *[!A-Za-z0-9./_+-]*)
+    echo "Checking for cargo... refused." | tee -a configure.log
+    echo "CARGO=$CARGO contains a character outside A-Za-z0-9 . / _ + -, and this" \
+        | tee -a configure.log
+    echo "value is written into Makefile and expanded by shell recipes, where such a" \
+        | tee -a configure.log
+    echo "character would stop being part of the path.  Install cargo somewhere" \
+        | tee -a configure.log
+    echo "plainly named, or symlink it there." | tee -a configure.log
+    exit 1
+    ;;
+esac
+
+if test -z "$CARGO"; then
+    echo "Checking for cargo... No (CARGO was set empty; Rust build targets will be unavailable)." | tee -a configure.log
+elif "$CARGO" --version >/dev/null 2>/dev/null || test $? -lt 126; then
     echo "Checking for cargo... Yes." | tee -a configure.log
     test "$CARGO" = "cargo" || echo Using ${CARGO} | tee -a configure.log
 else
@@ -1068,6 +1115,13 @@ echo HAVE_S390X_VX = $HAVE_S390X_VX >> configure.log
 echo VGFMAFLAG = $VGFMAFLAG >> configure.log
 
 # update Makefile with the configure results
+#
+# Every value substituted here is inserted into an s command whose delimiter is `#',
+# so a value containing `#', `&', a backslash or a newline would change the script
+# rather than the Makefile.  CARGO is the one of them this port added, and it is
+# validated at the point it is read (see the `look for cargo' block above) to a
+# character set that has no such member -- so it is safe as data here without an
+# escaping pass.  Anything added to this block in future needs the same treatment.
 sed < ${SRCDIR}Makefile.in "
 /^CC *=/s#=.*#=$CC#
 /^GCOV *=/s#=.*#=$GCOV#

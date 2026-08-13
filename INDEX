@@ -93,5 +93,6 @@ the developer guide, Makefile.in for the seven targets rust, rust-pc, rust-test,
 rust-symbols, rust-header, rust-msrv and rust-clean, and
 .github/workflows/rust.yml for the eighteen jobs that gate them.
 .github/scripts/ holds the gate programs those jobs invoke rather than inline:
-bench_gate.py with its self-test and fixture, dropin_chain.sh which verifies the
-staged symlink chain, and whitespace_gate.sh
+bench_gate.py with its self-test and fixture, and whitespace_gate.sh.  The staged
+symlink chain is verified instead by crates/libz-rs-sys/tests/dropin_chain.rs, a
+test of the crate that produces the chain, so `cargo test' checks it too.

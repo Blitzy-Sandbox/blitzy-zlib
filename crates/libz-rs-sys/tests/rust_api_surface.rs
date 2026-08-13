@@ -55,9 +55,10 @@
 //!
 //! # What is deliberately *not* here
 //!
-//! Three names this crate compiles are absent from the crate root on purpose, all three hidden
-//! from the shared library's dynamic table by `zlib.map`: `inflate_table`, whose only caller is
-//! the unmodified `test/infcover.c` linking `libz.a`, and the two `_zlib_rs_gzprintf_*` helpers,
+//! Three names this crate compiles are absent from the crate root on purpose, all three kept out
+//! of both shared objects' dynamic tables -- by `zlib.map` for the packaged library and by the
+//! `.hidden` directives in `src/lib.rs` for the cdylib: `inflate_table`, whose only caller is the
+//! unmodified `test/infcover.c` linking `libz.a`, and the two `_zlib_rs_gzprintf_*` helpers,
 //! whose only caller is `csrc/gzprintf_shim.c`. Their absence is asserted here arithmetically,
 //! by the tally in [`the_families_reconcile_to_the_export_symbol_count`]; that they cannot be
 //! *named* is asserted by the `compile_fail` examples in the crate documentation, which is the
@@ -329,8 +330,9 @@ fn no_function_is_listed_twice() {
 #[test]
 fn the_families_reconcile_to_the_export_symbol_count() {
     // The three names this crate compiles and deliberately does not re-export: `inflate_table`
-    // plus the two `_zlib_rs_gzprintf_*` helpers, all three in `zlib.map`'s `local:` set, which
-    // is what keeps them out of the shared library's dynamic table.
+    // plus the two `_zlib_rs_gzprintf_*` helpers, all three in `zlib.map`'s `local:` set and all
+    // three additionally `.hidden`, which is what keeps them out of both shared objects.
+    // `inflate_table` is `#[no_mangle]` all the same, because `test/infcover.c` links `libz.a`.
     const HIDDEN: usize = 3;
     // Every `#[no_mangle]` item the seven export modules compile on a non-Windows target: 17
     // deflate + 19 inflate (18 plus `inflate_table`) + 3 infback + 10 compress + 32 gz (30 plus

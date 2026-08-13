@@ -35,7 +35,7 @@
 //! | Known answers | `crc32`, `crc32_z` | the C oracle and [`reference_crc32`] |
 //! | Length sweeps | the `N * W + W - 1` braid threshold of `crc32.c` L640 | [`reference_crc32`] |
 //! | Resumability | chunked versus single-shot accumulation | a single call over the whole buffer |
-//! | Backends | [`Generic`], [`Braid`] and, when built, `Simd` | each other, bit for bit |
+//! | Backends | [`Generic`], [`Braid`] and, when built, `StrideBraid` | each other, bit for bit |
 //! | Combine | the five `crc32_combine*` entry points | the concatenation identity and the C oracle |
 //!
 //! # The structural boundary everything turns on
@@ -126,7 +126,7 @@ use zlib_rs::crc32::{
 };
 
 #[cfg(feature = "simd")]
-use zlib_rs::crc32::Simd;
+use zlib_rs::crc32::StrideBraid;
 
 /// `z_word_t` is 64 or 32 bits and nothing else (`crc32.c` L71-L74, L96-L103).
 ///
@@ -1407,7 +1407,7 @@ fn byte_at_a_time_accumulation_matches_a_single_call() {
 //
 // "Cannot change" is a claim, so it is tested: the backends are compared against each other bit
 // for bit, and against the byte-at-a-time reference. `Generic` and `Braid` are always reachable;
-// `Simd` is compiled only under the `simd` feature, so the sections that name it are gated and CI
+// `StrideBraid` is compiled only under the `simd` feature, so the sections that name it are gated and CI
 // runs this file in both configurations.
 // ---------------------------------------------------------------------------------------------
 
@@ -1424,7 +1424,7 @@ fn through<B: Crc32Backend>(start: u32, buf: &[u8]) -> u32 {
 /// Every backend agrees at every structural boundary, for every starting value.
 ///
 /// The boundaries are where the backends differ most: [`Braid`] delegates the whole buffer to
-/// [`Generic`] below [`MIN_BRAID_LEN`] and `Simd` delegates to [`Braid`] below its own, slightly
+/// [`Generic`] below [`MIN_BRAID_LEN`] and `StrideBraid` delegates to [`Braid`] below its own, slightly
 /// larger, threshold. So these lengths are precisely the ones at which one backend starts doing
 /// something the others are not, and they are the lengths at which a mismatch is possible at all.
 #[test]
@@ -1452,10 +1452,10 @@ fn every_backend_agrees_at_the_structural_boundaries() {
 
             #[cfg(feature = "simd")]
             assert_eq!(
-                through::<Simd>(start, slice),
+                through::<StrideBraid>(start, slice),
                 expected,
                 "{} disagrees with the reference at length {len}, start {start:#010x}",
-                Simd::NAME
+                StrideBraid::NAME
             );
 
             // And the public entry point, whichever backend the build selected, must agree with
@@ -1507,10 +1507,10 @@ fn every_backend_agrees_on_every_corpus_class() {
 
             #[cfg(feature = "simd")]
             assert_eq!(
-                through::<Simd>(start, payload),
+                through::<StrideBraid>(start, payload),
                 expected,
                 "{} disagrees on corpus::{name} at start {start:#010x}",
-                Simd::NAME
+                StrideBraid::NAME
             );
 
             assert_eq!(
@@ -1535,9 +1535,9 @@ fn backend_names_are_distinct_and_stable() {
 
     #[cfg(feature = "simd")]
     {
-        assert_eq!(Simd::NAME, "simd");
-        assert_ne!(Simd::NAME, Generic::NAME);
-        assert_ne!(Simd::NAME, Braid::NAME);
+        assert_eq!(StrideBraid::NAME, "stride-braid");
+        assert_ne!(StrideBraid::NAME, Generic::NAME);
+        assert_ne!(StrideBraid::NAME, Braid::NAME);
     }
 }
 
@@ -1571,10 +1571,10 @@ fn every_backend_matches_the_oracle_matrix() {
 
             #[cfg(feature = "simd")]
             assert_eq!(
-                through::<Simd>(start, slice),
+                through::<StrideBraid>(start, slice),
                 expected,
                 "{} disagrees with the C implementation at start {start:#010x}, length {len}",
-                Simd::NAME
+                StrideBraid::NAME
             );
         }
     }

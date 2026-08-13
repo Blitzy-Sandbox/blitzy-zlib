@@ -80,6 +80,7 @@ use std::ffi::{c_int, c_uint, c_void, CStr};
 use std::fs::OpenOptions;
 use std::mem::{align_of, offset_of, size_of};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 #[cfg(unix)]
@@ -98,6 +99,7 @@ use libz_rs_sys::{
     Z_STREAM_ERROR, Z_SYNC_FLUSH,
 };
 use zlib_rs_differential::port::GzFile;
+use zlib_rs_fuzz::reached;
 
 // ---------------------------------------------------------------------------
 //  Bounds -- every one of these exists to keep the 300-second budget useful
@@ -216,6 +218,82 @@ const _: () = assert!(MAX_PAYLOAD < c_int::MAX as usize);
 //  Phase B -- one scratch path per process, resolved once and reused
 // ---------------------------------------------------------------------------
 
+/// The fixed part of every scratch directory name, which is what makes the sweep possible.
+///
+/// A name is `<prefix><pid>-<32 hex digits>`: the prefix identifies the target, the pid
+/// identifies the owner, and the hex is the unguessable part.
+const SCRATCH_PREFIX: &str = "zlib-rs-fuzz-gz-";
+
+/// Removes scratch directories left behind by processes that no longer exist.
+///
+/// ★ WHY THIS IS NEEDED AT ALL: nothing here can remove its own directory on the way out.
+/// This target carries `#![forbid(unsafe_code)]`, so `atexit` is unavailable; statics are
+/// never dropped; and libFuzzer leaves through `exit()` on most of its paths anyway. So the
+/// directory a run creates outlives the run, and a machine that fuzzes this target regularly
+/// accumulates one per invocation -- each holding a compressed file, in a directory that on a
+/// shared build host is often never cleaned.
+///
+/// Sweeping on the way IN is the mechanism that is actually available, and it is safe in the
+/// one way that matters: it removes a directory only when the pid encoded in its name has no
+/// entry in `/proc`, so a directory belonging to a *live* sibling -- `cargo fuzz run -jobs=N`
+/// starts several at once -- is never touched. Anything unparseable, anything whose pid is
+/// still alive, and anything this process cannot remove is left exactly where it is.
+///
+/// Failures are ignored on purpose, every one of them. A temporary directory this process
+/// cannot enumerate, an entry another user owns, a race with a sibling doing the same sweep:
+/// none of those is a defect in the library under test, and none may become a crash
+/// reproducer. [`preflight`] is what fails loudly if the environment is unusable, and it runs
+/// straight after this.
+///
+/// Only on Linux, and deliberately so. The liveness test is `/proc/<pid>`; there is no
+/// portable, dependency-free way to ask the same question elsewhere, and the alternative --
+/// deleting by age -- would eventually delete a long-running sibling's directory out from
+/// under it. Elsewhere the directory is left for the platform's own temporary-file cleanup,
+/// and the CI job removes it explicitly.
+#[cfg(target_os = "linux")]
+fn sweep_abandoned_scratch(base: &Path) {
+    // No `/proc` means the liveness test cannot be made, and a sweep that cannot tell live
+    // from dead must not run.
+    if !Path::new("/proc/self").is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(tail) = name.strip_prefix(SCRATCH_PREFIX) else {
+            continue;
+        };
+        // `<pid>-<hex>`; anything else is not one of ours, whatever it looks like.
+        let Some((pid, hex)) = tail.split_once('-') else {
+            continue;
+        };
+        if pid.is_empty()
+            || !pid.bytes().all(|b| b.is_ascii_digit())
+            || hex.len() != 32
+            || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        if Path::new("/proc").join(pid).is_dir() {
+            // Its owner is still running. Not ours to remove.
+            continue;
+        }
+        if !entry.path().is_dir() {
+            continue;
+        }
+        // Recursive, and bounded to a path this target's own naming scheme produced: the
+        // directory holds exactly one file, `round-trip.gz`.
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
+/// The sweep is Linux-only; see the Linux definition for why.
+#[cfg(not(target_os = "linux"))]
+fn sweep_abandoned_scratch(_base: &Path) {}
+
 /// The scratch path, resolved on first use and cached for the life of the process.
 ///
 /// [`OnceLock`] rather than `Once` guarding a `static mut`: it has been stable since 1.70,
@@ -269,11 +347,25 @@ fn scratch_path() -> &'static Path {
             use std::os::unix::fs::DirBuilderExt;
 
             let base = env::temp_dir();
+            // Before creating this process's directory, remove the ones abandoned by
+            // processes that are gone. See `sweep_abandoned_scratch`.
+            sweep_abandoned_scratch(&base);
             for _ in 0..ATTEMPTS {
                 // Two independent OS-seeded draws, so the name carries 128 bits rather than 64.
                 let high = u128::from(RandomState::new().hash_one(0_u64));
                 let low = u128::from(RandomState::new().hash_one(u64::MAX));
-                let dir = base.join(format!("zlib-rs-fuzz-gz-{:032x}", (high << 64) | low));
+                // ★ THE PROCESS ID IS A PREFIX, and it buys the cleanup below without
+                // costing any of the unguessability the 128 bits carry: an attacker who
+                // knows the pid -- everyone does, it is in `/proc` -- still has to guess
+                // 128 unbiased bits, so the security argument above is untouched. What the
+                // prefix adds is the ability for a LATER process to tell whose directory
+                // this is, which is the only thing standing between "one directory per
+                // fuzzing run" and a temporary directory that grows without bound.
+                let dir = base.join(format!(
+                    "{SCRATCH_PREFIX}{pid}-{:032x}",
+                    (high << 64) | low,
+                    pid = std::process::id()
+                ));
 
                 let mut builder = std::fs::DirBuilder::new();
                 builder.recursive(false);
@@ -2801,10 +2893,28 @@ fn null_handle_sweep() {
 /// already asserted by the time this returns.
 ///
 /// The one thing that is no longer allowed to be quiet is a scratch environment that never
-/// worked: [`preflight`] settles that once, with a panic, before the first plan is built. The
-/// two steps below therefore run against an environment already proven usable, so they say so
-/// with `expect` rather than folding a genuine fault into the same `None` the grammar uses for
-/// its ordinary refusals.
+/// worked: [`preflight`] settles that once, with a panic, before the first plan is built.
+///
+/// # ★ ONE POLICY FOR FILESYSTEM REFUSALS, AND ONLY ONE
+///
+/// There used to be two, and they contradicted each other. [`Opened::Environment`] documents
+/// that a mid-run refusal is *tolerated* -- "reporting it as a crash would yield a reproducer
+/// that says nothing about the library" -- while the step that prepares the scratch file said
+/// the opposite by calling `.expect()` on it, so a `/tmp` that filled up half way through a
+/// 300-second run produced a libFuzzer crash and an artifact that no amount of staring at
+/// would explain. Both positions have a real concern behind them: a refusal must not be
+/// silent forever, and it must not masquerade as a finding.
+///
+/// The policy that satisfies both, and is now the only one in this file:
+///
+/// * A refusal is **tolerated** and the iteration is abandoned, exactly as
+///   [`Opened::Environment`] says. [`CONSECUTIVE_REFUSALS`] counts it.
+/// * A **success resets the count**, so a transient full disk costs nothing once it clears.
+/// * [`MAX_CONSECUTIVE_REFUSALS`] refusals in a row is no longer transient, and *that* fails
+///   loudly -- with a message that names the environment as the cause and says in terms that
+///   the artifact is not a reproducer, so nobody spends an afternoon on it.
+///
+/// What is never done is manufacturing a product reproducer out of an environment fault.
 fn attempt(input: &GzRoundTrip) -> Option<()> {
     preflight();
 
@@ -2825,14 +2935,78 @@ fn attempt(input: &GzRoundTrip) -> Option<()> {
         .is_some_and(|spec| spec.exclusive && spec.direction != Direction::Read);
     let remove = exclusive_write && plan.has(flag::EXCLUSIVE_SUCCEEDS);
 
-    let exists = prepare_scratch(path, remove).expect(
-        "preflight proved the scratch file can be created, truncated and removed; a refusal \
-         here means the temporary directory became unusable mid-run",
-    );
+    let Some(exists) = prepare_scratch(path, remove) else {
+        note_filesystem_refusal(path);
+        return None;
+    };
+    note_filesystem_success();
     let image = write_pass(path, &path_c, &plan, exists)?;
     read_pass(path, &path_c, &plan, &image)
 }
 
+/// How many consecutive filesystem refusals are treated as transient before the run is failed.
+///
+/// Sized against what it has to distinguish. A genuinely transient refusal -- a disk that is
+/// briefly full, a sibling job racing on the same directory -- clears within a handful of
+/// iterations, and this target runs hundreds per second, so sixty-four in a row is far outside
+/// that. A permanently broken environment reaches sixty-four in a fraction of a second, so the
+/// diagnosis is prompt rather than deferred to the end of the budget.
+const MAX_CONSECUTIVE_REFUSALS: usize = 64;
+
+/// Consecutive filesystem refusals since the last success. See [`attempt`]'s policy note.
+static CONSECUTIVE_REFUSALS: AtomicUsize = AtomicUsize::new(0);
+
+/// Records one tolerated filesystem refusal, failing only once they stop looking transient.
+fn note_filesystem_refusal(path: &Path) {
+    let seen = CONSECUTIVE_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;
+    if seen < MAX_CONSECUTIVE_REFUSALS {
+        return;
+    }
+    // Deliberately a panic and deliberately worded. libFuzzer offers no other failure
+    // channel -- `std::process::exit` is denied by this crate's lints and would be reported
+    // as a crash anyway -- so the message has to carry what the mechanism cannot.
+    panic!(
+        "ENVIRONMENT FAILURE, NOT A LIBRARY FINDING. The scratch file {path} could not be \
+         created or truncated {seen} times in a row, so this target has stopped doing any \
+         work. preflight proved the temporary directory was usable when this process \
+         started, so it has become unusable since -- full, unmounted, read-only, or removed \
+         underneath us. Any artifact libFuzzer writes alongside this message is NOT a \
+         reproducer and re-running it will prove nothing: fix the temporary directory or \
+         point TMPDIR somewhere writable. A refusal that clears on its own is tolerated and \
+         never gets here; see the policy note on `attempt`.",
+        path = path.display(),
+    )
+}
+
+/// Records that the filesystem is working, which is what makes a refusal streak transient.
+fn note_filesystem_success() {
+    // A relaxed store is right: the only reader is the counter above, the count is a
+    // heuristic about the environment rather than a synchronisation point, and libFuzzer
+    // drives this target from one thread per job.
+    CONSECUTIVE_REFUSALS.store(0, Ordering::Relaxed);
+}
+
 fuzz_target!(|input: GzRoundTrip| {
-    let _ = attempt(&input);
+    let outcome = attempt(&input);
+    // Off unless `ZLIB_RS_FUZZ_REPORT` is set. `round_trip` means this execution wrote a gz
+    // member and read it back with the bytes compared -- the only outcome that exercises the
+    // gz layer end to end, and therefore the one a committed seed has to reach.
+    // `incomplete` covers both ordinary cases: a mode string the grammar refuses, and a
+    // tolerated filesystem refusal. See `zlib_rs_fuzz`.
+    reached(
+        "fuzz_gz_roundtrip",
+        if outcome.is_some() {
+            "round_trip"
+        } else {
+            "incomplete"
+        },
+        |fields| {
+            fields
+                .with("payload", input.payload.len())
+                .with("level", input.level)
+                .with("writeShape", input.write_shape)
+                .with("readShape", input.read_shape)
+                .with("ops", input.ops.len())
+        },
+    );
 });

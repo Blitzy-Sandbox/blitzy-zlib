@@ -86,7 +86,21 @@ jobs:
       with:
         fetch-depth: 0
     - name: Setup cygwin
-      uses: cygwin/cygwin-install-action@master
+      # PINNED BY COMMIT SHA, not by `@master`.  A branch is a mutable pointer, so
+      # `@master` means whoever can move it chooses what runs in a job that already
+      # has this repository's tree checked out.  The SHA below is immutable and is
+      # the one the upstream tags v6.1 and v6 both name (release v6, 2025-07-07),
+      # so the pin is a release rather than an arbitrary commit -- refresh it from
+      # https://github.com/cygwin/cygwin-install-action/releases and keep the tag in
+      # the trailing comment so the next reader can tell what was pinned.
+      #
+      # The other `uses:` lines in this file stay on their major tags on purpose:
+      # actions/checkout and msys2/setup-msys2 are not the same exposure.  The
+      # first is GitHub's own action, and the second is the MSYS2 project's own,
+      # both consumed as `@vN` throughout this repository's C workflows; the rule
+      # applied here is that a THIRD-PARTY action tracked on a BRANCH gets a SHA,
+      # which is the case `@master` created and the only one in this file.
+      uses: cygwin/cygwin-install-action@3f0a3f9f988f7e96b8c18098ae05eaec175f5b52 # v6.1
       with:
         packages: >-
           cmake

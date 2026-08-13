@@ -31,9 +31,11 @@
 //! Nothing is shelled out to and no two-run diff has to be trusted.
 //!
 //! The two `z_stream` types, and likewise the two `gz_header` types, are **distinct Rust types with
-//! identical layout**: `src/oracle.rs` transcribes its own `#[repr(C)]` mirrors because the two
-//! shipped crates are dev-dependencies and so are invisible to this crate's `lib` target. One value
-//! of each type is constructed and **neither is ever transmuted into the other**. Every stream is
+//! identical layout**: `src/oracle.rs` transcribes its own `#[repr(C)]` mirrors from the C headers
+//! rather than reusing the facade's, so a mistake in the port's mirror cannot cancel itself out.
+//! (Both shipped crates are ordinary `[dependencies]` of this harness rather than dev-dependencies,
+//! which is what lets the per-side gates live in its `lib` target at all.) One value of each type is
+//! constructed and **neither is ever transmuted into the other**. Every stream is
 //! zeroed before use with `zalloc`, `zfree` and `opaque` left null, so each side exercises its own
 //! internal default allocator -- the `memset`-then-`inflateInit` sequence `test/example.c` performs.
 //!
@@ -140,16 +142,18 @@
 //! * **Run `tests/table_equality.rs` and `tests/byte_identical.rs` first.** A mistyped digit in a
 //!   transcribed table or a divergent encoder would surface here as a wall of failures pointing at
 //!   neither.
-//! * **Under neither sanitizer, by design, and for two different reasons.** Miri interprets Rust
-//!   MIR and cannot execute the compiled C oracle, so the Miri gate is scoped to `-p zlib-rs`. The
-//!   nightly `AddressSanitizer` gate is scoped to `-p libz-rs-sys` and the three relinked C drivers,
-//!   and does not select this crate. Both are CI job scopes rather than anything to work around
-//!   here. That split is worth stating precisely for this file, because the `gzFile` layer and
-//!   `inflateGetHeader` are where raw pointers and caller-owned buffers actually meet: that surface
-//!   *is* instrumented, but through the facade's own suites -- `-p libz-rs-sys` covers everything
-//!   under `crates/libz-rs-sys/tests/`, including the `gz_memory.rs` accounting named above -- and
-//!   not through this file. What this file relies on instead is that a divergence fails a
-//!   comparison loudly.
+//! * **Outside Miri, inside AddressSanitizer.** Miri interprets Rust MIR and cannot execute the
+//!   compiled C oracle at all, so the Miri gate is scoped to `-p zlib-rs` and this suite can never
+//!   run under it. The nightly `AddressSanitizer` gate DOES run it, as part of
+//!   `cargo +nightly test -p zlib-rs-differential --target x86_64-unknown-linux-gnu` with
+//!   `RUSTFLAGS=-Zsanitizer=address` and the oracle's C compiled `-fsanitize=address` -- so every
+//!   crossing below, including the `gzFile` ones that write real files, is exercised with both
+//!   sides instrumented. `detect_leaks` is off for that step alone, because the C oracle keeps
+//!   `local` tables alive by design; every other check is in force. The facade's own suites are
+//!   instrumented in the same job (`-p libz-rs-sys` covers everything under
+//!   `crates/libz-rs-sys/tests/`, including the `gz_memory.rs` accounting named above), so the
+//!   `gzFile` and `inflateGetHeader` surface is reached from both directions rather than only from
+//!   here.
 
 // The workspace lint table denies the panic-prone quartet, which is right for library code and
 // wrong for a test: a test asserts, a failed assertion panics, and slicing a buffer at an offset
@@ -188,6 +192,7 @@ use libz_rs_sys::{
 // The two sides of this crate's FFI boundary. Every `extern "C"` declaration and every `unsafe` call
 // this suite performs lives in exactly one of these two modules -- `oracle` for the C reference,
 // `port` for the facade -- and this file adds no `extern "C"` block and no `unsafe` block of its own.
+use zlib_rs_differential::retain::Session;
 use zlib_rs_differential::{oracle, port};
 
 use crate::Length::{AtLeast, Exactly};
@@ -240,7 +245,7 @@ if the port was the compressing side AND the same fixture fails there too):
 //  the gates' signatures and are recorded here only so that a reader of this file knows where they
 //  went; three of them are genuinely still this side's, because no signature can express them.
 //
-//    (a) DISCHARGED BY THE GATE. `strm` arrives as `&mut Self::Stream` and is passed straight
+//    (a) DISCHARGED BY THE GATE. `strm` arrives as `&mut Session<'_, Self::Stream>` and is passed straight
 //        through, so it cannot be null, misaligned or aliased.
 //    (b) THIS SIDE'S. `strm.state` must be null or a block THIS SAME implementation allocated
 //        through its own `*Init2_`, so the state check on entry -- `inflateStateCheck` at
@@ -1051,63 +1056,73 @@ trait Side {
     // ---- deflate ----------------------------------------------------------------------------
 
     /// `deflateInit2_(strm, level, Z_DEFLATED, windowBits, DEF_MEM_LEVEL, Z_DEFAULT_STRATEGY, ...)`.
-    fn deflate_init(strm: &mut Self::Stream, level: c_int, window_bits: c_int) -> c_int;
+    fn deflate_init(
+        strm: &mut Session<'_, Self::Stream>,
+        level: c_int,
+        window_bits: c_int,
+    ) -> c_int;
 
     /// `deflateSetDictionary(strm, dictionary, dictLength)` -- `zlib.h` L618.
-    fn deflate_set_dictionary(strm: &mut Self::Stream, dictionary: &[u8]) -> c_int;
+    fn deflate_set_dictionary(strm: &mut Session<'_, Self::Stream>, dictionary: &[u8]) -> c_int;
 
     /// `deflateSetHeader(strm, head)` -- `zlib.h` L724.
-    fn deflate_set_header(strm: &mut Self::Stream, head: &mut Self::Header) -> c_int;
+    fn deflate_set_header<'r>(
+        strm: &mut Session<'r, Self::Stream>,
+        head: &'r mut Self::Header,
+    ) -> c_int;
 
     /// `deflate(strm, flush)`, with the two windows installed first.
     fn deflate(
-        strm: &mut Self::Stream,
+        strm: &mut Session<'_, Self::Stream>,
         window: Option<&[u8]>,
         out: &mut [u8],
         flush: c_int,
     ) -> Call;
 
     /// `deflateBound(strm, sourceLen)` -- `zlib.h` L768.
-    fn deflate_bound(strm: &mut Self::Stream, source_len: usize) -> u64;
+    fn deflate_bound(strm: &mut Session<'_, Self::Stream>, source_len: usize) -> u64;
 
     /// `deflateEnd(strm)`.
-    fn deflate_end(strm: &mut Self::Stream) -> c_int;
+    fn deflate_end(strm: &mut Session<'_, Self::Stream>) -> c_int;
 
     // ---- inflate ----------------------------------------------------------------------------
 
     /// `inflateInit2_(strm, windowBits, ...)`.
-    fn inflate_init(strm: &mut Self::Stream, window_bits: c_int) -> c_int;
+    fn inflate_init(strm: &mut Session<'_, Self::Stream>, window_bits: c_int) -> c_int;
 
     /// `inflate(strm, flush)`, with the two windows installed first.
     fn inflate(
-        strm: &mut Self::Stream,
+        strm: &mut Session<'_, Self::Stream>,
         window: Option<&[u8]>,
         out: &mut [u8],
         flush: c_int,
     ) -> Call;
 
     /// `inflateSetDictionary(strm, dictionary, dictLength)` -- `zlib.h` L913.
-    fn inflate_set_dictionary(strm: &mut Self::Stream, dictionary: &[u8]) -> c_int;
+    fn inflate_set_dictionary(strm: &mut Session<'_, Self::Stream>, dictionary: &[u8]) -> c_int;
 
     /// `inflateGetHeader(strm, head)` -- `zlib.h` L1070.
-    fn inflate_get_header(strm: &mut Self::Stream, head: &mut Self::Header) -> c_int;
+    fn inflate_get_header<'r>(
+        strm: &mut Session<'r, Self::Stream>,
+        head: &'r mut Self::Header,
+    ) -> c_int;
 
     /// `inflateReset2(strm, windowBits)` -- `zlib.h` L995.
-    fn inflate_reset2(strm: &mut Self::Stream, window_bits: c_int) -> c_int;
+    fn inflate_reset2(strm: &mut Session<'_, Self::Stream>, window_bits: c_int) -> c_int;
 
     /// `inflateSync(strm)` -- `zlib.h` L951.
-    fn inflate_sync(strm: &mut Self::Stream) -> c_int;
+    fn inflate_sync(strm: &mut Session<'_, Self::Stream>) -> c_int;
 
     /// `inflateSyncPoint(strm)` -- `zlib.h` L2022.
-    fn inflate_sync_point(strm: &mut Self::Stream) -> c_int;
+    fn inflate_sync_point(strm: &mut Session<'_, Self::Stream>) -> c_int;
 
     /// `inflateEnd(strm)`.
-    fn inflate_end(strm: &mut Self::Stream) -> c_int;
+    fn inflate_end(strm: &mut Session<'_, Self::Stream>) -> c_int;
 
     // ---- state, read and written directly ---------------------------------------------------
 
     /// The accounting members, read straight off the struct.
-    fn snapshot(strm: &Self::Stream) -> Snapshot;
+    fn snapshot(strm: &Session<'_, Self::Stream>) -> Snapshot;
 
     /// Sets `avail_in` without touching `next_in`.
     ///
@@ -1115,7 +1130,7 @@ trait Side {
     /// because `test/example.c`'s `test_sync` (L370-L408) does exactly this: it offers the two header
     /// bytes, calls `inflate`, then widens `avail_in` to the rest of the buffer -- `next_in` having
     /// already advanced -- and calls `inflateSync`. Reproducing that shape is the point.
-    fn set_avail_in(strm: &mut Self::Stream, avail: usize);
+    fn set_avail_in(strm: &mut Session<'_, Self::Stream>, avail: usize);
 
     // ---- the one-shot wrappers ---------------------------------------------------------------
 
@@ -1232,7 +1247,11 @@ impl Side for Port {
         }
     }
 
-    fn deflate_init(strm: &mut Self::Stream, level: c_int, window_bits: c_int) -> c_int {
+    fn deflate_init(
+        strm: &mut Session<'_, Self::Stream>,
+        level: c_int,
+        window_bits: c_int,
+    ) -> c_int {
         // The gate supplies the facade's own `ZLIB_VERSION` and `size_of::<z_stream>()`, which is
         // obligation (e) discharged where the two cannot be crossed with the reference's pair.
         port::deflate_init2(
@@ -1245,13 +1264,16 @@ impl Side for Port {
         )
     }
 
-    fn deflate_set_dictionary(strm: &mut Self::Stream, dictionary: &[u8]) -> c_int {
+    fn deflate_set_dictionary(strm: &mut Session<'_, Self::Stream>, dictionary: &[u8]) -> c_int {
         // The dictionary crosses as a slice, so its length cannot disagree with its pointer. The
         // library copies what it keeps into the window rather than retaining what it was given.
         port::deflate_set_dictionary(strm, dictionary)
     }
 
-    fn deflate_set_header(strm: &mut Self::Stream, head: &mut Self::Header) -> c_int {
+    fn deflate_set_header<'r>(
+        strm: &mut Session<'r, Self::Stream>,
+        head: &'r mut Self::Header,
+    ) -> c_int {
         // The library RETAINS the pointer to `head` until the header has been fully emitted, which
         // is why the caller keeps both the header and the buffers it points into alive for the whole
         // stream. The gate cannot express that lifetime, so it is this side's obligation.
@@ -1259,7 +1281,7 @@ impl Side for Port {
     }
 
     fn deflate(
-        strm: &mut Self::Stream,
+        strm: &mut Session<'_, Self::Stream>,
         window: Option<&[u8]>,
         out: &mut [u8],
         flush: c_int,
@@ -1278,25 +1300,25 @@ impl Side for Port {
         }
     }
 
-    fn deflate_bound(strm: &mut Self::Stream, source_len: usize) -> u64 {
+    fn deflate_bound(strm: &mut Session<'_, Self::Stream>, source_len: usize) -> u64 {
         // `deflateBound` reads `wrap`, `strstart`, `w_bits` and `hash_bits` out of the state block
         // and writes nothing; it touches neither window. `Some(..)` is the gate's live-stream form.
         widen_ulong(port::deflate_bound(Some(strm), narrow_ulong(source_len)))
     }
 
-    fn deflate_end(strm: &mut Self::Stream) -> c_int {
+    fn deflate_end(strm: &mut Session<'_, Self::Stream>) -> c_int {
         // `deflateEnd` frees the state through the same allocator that produced it and nulls
         // `state`, so a second call is a documented no-op rather than a double free.
         port::deflate_end(strm)
     }
 
-    fn inflate_init(strm: &mut Self::Stream, window_bits: c_int) -> c_int {
+    fn inflate_init(strm: &mut Session<'_, Self::Stream>, window_bits: c_int) -> c_int {
         // The version/size pair is the gate's, exactly as for `deflate_init`.
         port::inflate_init2(strm, window_bits)
     }
 
     fn inflate(
-        strm: &mut Self::Stream,
+        strm: &mut Session<'_, Self::Stream>,
         window: Option<&[u8]>,
         out: &mut [u8],
         flush: c_int,
@@ -1313,12 +1335,15 @@ impl Side for Port {
         }
     }
 
-    fn inflate_set_dictionary(strm: &mut Self::Stream, dictionary: &[u8]) -> c_int {
+    fn inflate_set_dictionary(strm: &mut Session<'_, Self::Stream>, dictionary: &[u8]) -> c_int {
         // As for `Port::deflate_set_dictionary`: the dictionary crosses as a slice.
         port::inflate_set_dictionary(strm, dictionary)
     }
 
-    fn inflate_get_header(strm: &mut Self::Stream, head: &mut Self::Header) -> c_int {
+    fn inflate_get_header<'r>(
+        strm: &mut Session<'r, Self::Stream>,
+        head: &'r mut Self::Header,
+    ) -> c_int {
         // Unsafe-site category 6 of AAP §0.6.1: the library writes through `head->extra`,
         // `head->name` and `head->comment` as it parses, so each non-null pointer must address at
         // least the matching `*_max` writable bytes. [`HeaderBuffers`] on this side is what sizes
@@ -1328,29 +1353,29 @@ impl Side for Port {
         port::inflate_get_header(strm, head)
     }
 
-    fn inflate_reset2(strm: &mut Self::Stream, window_bits: c_int) -> c_int {
+    fn inflate_reset2(strm: &mut Session<'_, Self::Stream>, window_bits: c_int) -> c_int {
         // `inflateReset2` may reallocate the window through the stream's own allocator and writes
         // only the state block.
         port::inflate_reset2(strm, window_bits)
     }
 
-    fn inflate_sync(strm: &mut Self::Stream) -> c_int {
+    fn inflate_sync(strm: &mut Session<'_, Self::Stream>) -> c_int {
         // `inflateSync` scans forward through the `avail_in` bytes at `next_in` looking for a flush
         // point and writes no output at all, so it reads the window the previous call left installed.
         port::inflate_sync(strm)
     }
 
-    fn inflate_sync_point(strm: &mut Self::Stream) -> c_int {
+    fn inflate_sync_point(strm: &mut Session<'_, Self::Stream>) -> c_int {
         // Reads two state members and writes nothing.
         port::inflate_sync_point(strm)
     }
 
-    fn inflate_end(strm: &mut Self::Stream) -> c_int {
+    fn inflate_end(strm: &mut Session<'_, Self::Stream>) -> c_int {
         // As for `Port::deflate_end`.
         port::inflate_end(strm)
     }
 
-    fn snapshot(strm: &Self::Stream) -> Snapshot {
+    fn snapshot(strm: &Session<'_, Self::Stream>) -> Snapshot {
         Snapshot {
             total_in: widen_ulong(strm.total_in),
             total_out: widen_ulong(strm.total_out),
@@ -1359,7 +1384,7 @@ impl Side for Port {
         }
     }
 
-    fn set_avail_in(strm: &mut Self::Stream, avail: usize) {
+    fn set_avail_in(strm: &mut Session<'_, Self::Stream>, avail: usize) {
         strm.avail_in = narrow_avail(avail);
     }
 
@@ -1509,7 +1534,11 @@ impl Side for Reference {
         }
     }
 
-    fn deflate_init(strm: &mut Self::Stream, level: c_int, window_bits: c_int) -> c_int {
+    fn deflate_init(
+        strm: &mut Session<'_, Self::Stream>,
+        level: c_int,
+        window_bits: c_int,
+    ) -> c_int {
         // The gate passes the oracle's own version string -- what `c_zlibVersion` points at -- and
         // `size_of` of the oracle's mirror, which is obligation (e) on this side. `deflateInit2` is a
         // `zlib.h` macro rather than a symbol, so the `_`-suffixed form is what the gate calls.
@@ -1523,18 +1552,21 @@ impl Side for Reference {
         )
     }
 
-    fn deflate_set_dictionary(strm: &mut Self::Stream, dictionary: &[u8]) -> c_int {
+    fn deflate_set_dictionary(strm: &mut Session<'_, Self::Stream>, dictionary: &[u8]) -> c_int {
         // As for the port's gate: the dictionary crosses as a slice.
         oracle::deflate_set_dictionary(strm, dictionary)
     }
 
-    fn deflate_set_header(strm: &mut Self::Stream, head: &mut Self::Header) -> c_int {
+    fn deflate_set_header<'r>(
+        strm: &mut Session<'r, Self::Stream>,
+        head: &'r mut Self::Header,
+    ) -> c_int {
         // As for the port's gate, including the retained `head` pointer this side must keep alive.
         oracle::deflate_set_header(strm, head)
     }
 
     fn deflate(
-        strm: &mut Self::Stream,
+        strm: &mut Session<'_, Self::Stream>,
         window: Option<&[u8]>,
         out: &mut [u8],
         flush: c_int,
@@ -1551,7 +1583,7 @@ impl Side for Reference {
         }
     }
 
-    fn deflate_bound(strm: &mut Self::Stream, source_len: usize) -> u64 {
+    fn deflate_bound(strm: &mut Session<'_, Self::Stream>, source_len: usize) -> u64 {
         // Reads the state block and writes nothing. `Some(..)` is the gate's live-stream form.
         widen_ulong_oracle(oracle::deflate_bound(
             Some(strm),
@@ -1559,18 +1591,18 @@ impl Side for Reference {
         ))
     }
 
-    fn deflate_end(strm: &mut Self::Stream) -> c_int {
+    fn deflate_end(strm: &mut Session<'_, Self::Stream>) -> c_int {
         // As for the port's gate.
         oracle::deflate_end(strm)
     }
 
-    fn inflate_init(strm: &mut Self::Stream, window_bits: c_int) -> c_int {
+    fn inflate_init(strm: &mut Session<'_, Self::Stream>, window_bits: c_int) -> c_int {
         // The version/size pair is the gate's, exactly as for `Reference::deflate_init`.
         oracle::inflate_init2(strm, window_bits)
     }
 
     fn inflate(
-        strm: &mut Self::Stream,
+        strm: &mut Session<'_, Self::Stream>,
         window: Option<&[u8]>,
         out: &mut [u8],
         flush: c_int,
@@ -1587,39 +1619,42 @@ impl Side for Reference {
         }
     }
 
-    fn inflate_set_dictionary(strm: &mut Self::Stream, dictionary: &[u8]) -> c_int {
+    fn inflate_set_dictionary(strm: &mut Session<'_, Self::Stream>, dictionary: &[u8]) -> c_int {
         // As for the port's gate.
         oracle::inflate_set_dictionary(strm, dictionary)
     }
 
-    fn inflate_get_header(strm: &mut Self::Stream, head: &mut Self::Header) -> c_int {
+    fn inflate_get_header<'r>(
+        strm: &mut Session<'r, Self::Stream>,
+        head: &'r mut Self::Header,
+    ) -> c_int {
         // The reference half of unsafe-site category 6. The buffer caps [`HeaderBuffers`] sets are
         // what keep the C code's `state->head->extra_max` clamps within the caller's memory, and
         // `head` must outlive every `inflate` call on this stream because the pointer is retained.
         oracle::inflate_get_header(strm, head)
     }
 
-    fn inflate_reset2(strm: &mut Self::Stream, window_bits: c_int) -> c_int {
+    fn inflate_reset2(strm: &mut Session<'_, Self::Stream>, window_bits: c_int) -> c_int {
         // As for the port's gate.
         oracle::inflate_reset2(strm, window_bits)
     }
 
-    fn inflate_sync(strm: &mut Self::Stream) -> c_int {
+    fn inflate_sync(strm: &mut Session<'_, Self::Stream>) -> c_int {
         // As for the port's gate: it scans the window the previous call left installed.
         oracle::inflate_sync(strm)
     }
 
-    fn inflate_sync_point(strm: &mut Self::Stream) -> c_int {
+    fn inflate_sync_point(strm: &mut Session<'_, Self::Stream>) -> c_int {
         // Reads two state members and writes nothing.
         oracle::inflate_sync_point(strm)
     }
 
-    fn inflate_end(strm: &mut Self::Stream) -> c_int {
+    fn inflate_end(strm: &mut Session<'_, Self::Stream>) -> c_int {
         // As for the port's gate.
         oracle::inflate_end(strm)
     }
 
-    fn snapshot(strm: &Self::Stream) -> Snapshot {
+    fn snapshot(strm: &Session<'_, Self::Stream>) -> Snapshot {
         Snapshot {
             total_in: widen_ulong_oracle(strm.total_in),
             total_out: widen_ulong_oracle(strm.total_out),
@@ -1628,7 +1663,7 @@ impl Side for Reference {
         }
     }
 
-    fn set_avail_in(strm: &mut Self::Stream, avail: usize) {
+    fn set_avail_in(strm: &mut Session<'_, Self::Stream>, avail: usize) {
         strm.avail_in = narrow_avail_oracle(avail);
     }
 
@@ -1806,7 +1841,7 @@ fn deflate_run<S: Side>(
 ) -> (Run, Option<u64>) {
     // Boxed because a `z_stream` must not be relocated once `deflateInit2_` has stored its
     // back-pointer -- see the obligations block above.
-    let mut stream = Box::new(S::stream());
+    let mut stream = Session::new(S::stream());
     let init = S::deflate_init(&mut stream, level, window_bits);
     assert!(
         init == Z_OK,
@@ -1929,7 +1964,7 @@ fn inflate_run<S: Side>(
     dictionary: Option<&[u8]>,
     chunking: Chunking,
 ) -> (Run, DictionaryHandshake) {
-    let mut stream = Box::new(S::stream());
+    let mut stream = Session::new(S::stream());
     let init = S::inflate_init(&mut stream, window_bits);
     assert!(
         init == Z_OK,
@@ -3859,8 +3894,8 @@ fn long_distance_payload(random: &[u8]) -> Vec<u8> {
 #[test]
 fn window_bits_guard_rails_agree() {
     for &(bits, deflate_expected, inflate_expected) in WINDOW_BITS_GUARD_RAILS {
-        let mut port = Box::new(<Port as Side>::stream());
-        let mut reference = Box::new(<Reference as Side>::stream());
+        let mut port = Session::new(<Port as Side>::stream());
+        let mut reference = Session::new(<Reference as Side>::stream());
         let port_status = Port::deflate_init(&mut port, DEFAULT_LEVEL, bits);
         let reference_status = Reference::deflate_init(&mut reference, DEFAULT_LEVEL, bits);
         assert_status_parity(
@@ -3883,8 +3918,8 @@ fn window_bits_guard_rails_agree() {
             Reference::deflate_end(&mut reference),
         );
 
-        let mut port = Box::new(<Port as Side>::stream());
-        let mut reference = Box::new(<Reference as Side>::stream());
+        let mut port = Session::new(<Port as Side>::stream());
+        let mut reference = Session::new(<Reference as Side>::stream());
         let port_status = Port::inflate_init(&mut port, bits);
         let reference_status = Reference::inflate_init(&mut reference, bits);
         assert_status_parity(
@@ -3957,7 +3992,7 @@ struct MemberReport {
 /// be compliant with the gzip standard (RFC 1952)". So the reset is the caller's job, and this is what
 /// a compliant caller does.
 fn inflate_members<S: Side>(stream: &[u8], window_bits: c_int) -> MemberReport {
-    let mut strm = Box::new(S::stream());
+    let mut strm = Session::new(S::stream());
     let init = S::inflate_init(&mut strm, window_bits);
     assert!(
         init == Z_OK,
@@ -4109,7 +4144,13 @@ fn concatenated_gzip_members_cross_in_both_directions() {
 /// first `deflate` (`zlib.h` L724-L740), and because the header struct has to outlive every one of
 /// those calls -- obligation (f).
 fn gzip_stream_with_header<S: Side>(input: &[u8], spec: &mut HeaderSpec) -> Vec<u8> {
-    let mut strm = Box::new(S::stream());
+    // ★ THE HEADER IS DECLARED FIRST, and the compiler is what requires it. `deflateSetHeader`
+    // hands the library a pointer it keeps until the header has been emitted, so `Session` holds
+    // the header borrowed for its own whole life; declaring the header after the session makes it
+    // dropped while still borrowed, which is E0597 rather than a comment. The obligation used to be
+    // stated in prose here and enforced by nothing.
+    let mut header = S::write_header(spec);
+    let mut strm = Session::new(S::stream());
     let bits = Container::Gzip.deflate_window_bits(DEFAULT_WINDOW_SIZE);
     let init = S::deflate_init(&mut strm, DEFAULT_LEVEL, bits);
     assert!(
@@ -4119,7 +4160,6 @@ fn gzip_stream_with_header<S: Side>(input: &[u8], spec: &mut HeaderSpec) -> Vec<
         got = status(init),
     );
 
-    let mut header = S::write_header(spec);
     let set = S::deflate_set_header(&mut strm, &mut header);
     assert!(
         set == Z_OK,
@@ -4184,7 +4224,15 @@ struct HeaderPass {
 /// absence of a terminating zero". That clamp is AAP 0.6.1's unsafe-site category 6 and historically the
 /// source of gzip-header overflow defects, so the undersized case is the one that matters.
 fn read_gzip_header<S: Side>(stream: &[u8], cap: usize) -> HeaderPass {
-    let mut strm = Box::new(S::stream());
+    // ★ DECLARATION ORDER IS THE CONTRACT, and it is now checked. The buffers outlive the header and
+    // the header outlives the stream, which is what makes the pointers inside the header valid for
+    // every `inflate` call below -- obligation (h). `Session` holds the header borrowed for its own
+    // whole life, so writing these three lines in any other order is E0597 instead of a comment
+    // saying they must not be. `inflate.c` writes THROUGH `head->extra`, `head->name` and
+    // `head->comment` as it parses, so this is the retention that matters most in the whole harness.
+    let mut buffers = HeaderBuffers::new(cap);
+    let mut header = S::read_header(&mut buffers);
+    let mut strm = Session::new(S::stream());
     let bits = Container::Gzip.inflate_window_bits(DEFAULT_WINDOW_SIZE);
     let init = S::inflate_init(&mut strm, bits);
     assert!(
@@ -4194,10 +4242,6 @@ fn read_gzip_header<S: Side>(stream: &[u8], cap: usize) -> HeaderPass {
         got = status(init),
     );
 
-    // The buffers outlive both the header and the stream, which is what makes the pointers inside the
-    // header valid for every `inflate` call below -- obligation (f).
-    let mut buffers = HeaderBuffers::new(cap);
-    let mut header = S::read_header(&mut buffers);
     let requested = S::inflate_get_header(&mut strm, &mut header);
 
     let mut scratch = vec![0_u8; DEFAULT_INFLATE_WINDOW];
@@ -4221,8 +4265,13 @@ fn read_gzip_header<S: Side>(stream: &[u8], cap: usize) -> HeaderPass {
         );
     };
 
-    let report = S::header_report(&header);
+    // The stream is ended, and THEN the session is dropped, and only then is the header read. The
+    // order is forced: the session borrows the header exclusively, so reading it while the session
+    // is alive is E0502 -- which is the right answer, because until `inflateEnd` has run the
+    // library may still write through that pointer.
     let end = S::inflate_end(&mut strm);
+    drop(strm);
+    let report = S::header_report(&header);
     HeaderPass {
         requested,
         report,
@@ -4596,8 +4645,8 @@ fn a_dictionary_is_refused_for_gzip_identically() {
     let dictionary = &sample(&corpus, DICTIONARY_FIXTURE).bytes;
     let gzip_bits = Container::Gzip.deflate_window_bits(DEFAULT_WINDOW_SIZE);
 
-    let mut port = Box::new(<Port as Side>::stream());
-    let mut reference = Box::new(<Reference as Side>::stream());
+    let mut port = Session::new(<Port as Side>::stream());
+    let mut reference = Session::new(<Reference as Side>::stream());
     assert_status_parity(
         "deflateInit2_ for the gzip container",
         Z_OK,
@@ -4934,7 +4983,7 @@ fn damaged_stream<S: Side>(payload: &[u8], head: usize) -> Vec<u8> {
         payload.len() > head,
         "the payload must be longer than the {head}-byte head the flush covers"
     );
-    let mut strm = Box::new(S::stream());
+    let mut strm = Session::new(S::stream());
     let init = S::deflate_init(&mut strm, Z_DEFAULT_COMPRESSION, DEFAULT_WINDOW_SIZE);
     assert!(
         init == Z_OK,
@@ -5032,7 +5081,7 @@ fn sync_recover<S: Side>(stream: &[u8]) -> SyncPass {
         stream.len() > ZLIB_HEADER_BYTES,
         "the stream must be longer than its own header"
     );
-    let mut strm = Box::new(S::stream());
+    let mut strm = Session::new(S::stream());
     let init = S::inflate_init(&mut strm, DEFAULT_WINDOW_SIZE);
     assert!(
         init == Z_OK,
@@ -5589,6 +5638,44 @@ fn armed() -> bool {
     }
 }
 
+/// The exact number of crossings [`exhaustive_interoperability_matrix`] must perform.
+///
+/// ★ THE PRODUCT IS PINNED, NOT MERELY POSITIVE. This sweep used to end at
+/// `assert!(crossings > 0)`, and the CI step that runs it accepted any positive count it could
+/// parse out of the log. Between them that admitted every silent narrowing this suite exists to
+/// prevent: deleting a level, dropping the raw container, reducing `WINDOW_SIZES` to `[15]`,
+/// removing a fixture from `FIXTURES`, or making `chunkings_for` answer one chunking would all have
+/// left a green run advertising itself as "the full interoperability product". The number below is
+/// what the dimensions multiply out to, [`EXHAUSTIVE_CROSSING_DIMENSIONS`] proves the multiplication
+/// from the constants themselves, and the sweep asserts the count it actually performed against
+/// both -- so a dimension that shrinks fails with the arithmetic in the message rather than passing.
+///
+/// 2 directions x 10 levels x 7 window sizes x 3 containers x 39 fixture-chunkings = 16,380, where
+/// the 39 is 9 fixtures at 4 [`CHUNKINGS`] plus `window_boundary.bin` at 3 [`CHUNKINGS_LARGE`]
+/// (it is the one fixture above [`LARGE_FIXTURE_BYTES`]). Measured at 4.5 s in release.
+const EXHAUSTIVE_CROSSINGS: usize = 16_380;
+
+/// The cardinality of every dimension the exhaustive sweep multiplies, as a name and a count.
+///
+/// Kept beside [`EXHAUSTIVE_CROSSINGS`] so that a shrunken dimension is reported as itself -- "the
+/// `windowBits` dimension carries 1 value, not 7" -- instead of as an opaque total that no longer
+/// matches. The fixture-chunking count is a sum rather than a product because `chunkings_for`
+/// answers a shorter list for a fixture above [`LARGE_FIXTURE_BYTES`], which is why it cannot be
+/// checked as two independent factors.
+fn exhaustive_crossing_dimensions(corpus: &[Sample]) -> [(&'static str, usize, usize); 5] {
+    let fixture_chunkings: usize = corpus
+        .iter()
+        .map(|sample| chunkings_for(sample.bytes.len()).len())
+        .sum();
+    [
+        ("direction", DIRECTIONS.len(), 2),
+        ("level", LEVELS.len(), 10),
+        ("windowBits", WINDOW_SIZES.len(), 7),
+        ("container", CONTAINERS.len(), 3),
+        ("fixture x chunking", fixture_chunkings, 39),
+    ]
+}
+
 /// The full cross product: every level, every window size, every container, every fixture, every
 /// chunking, in both directions.
 ///
@@ -5598,6 +5685,8 @@ fn armed() -> bool {
 /// runs it, and expensive enough in debug -- where a bare `cargo test --workspace` lives -- to keep
 /// behind the variable rather than let it dominate that run. Every crossing decompresses as well as
 /// compresses, and every one is asserted byte-exact.
+///
+/// The accounting is part of the test: see [`EXHAUSTIVE_CROSSINGS`].
 #[test]
 #[ignore = "the full interoperability product; armed by ZLIB_RS_INTEROP_EXHAUSTIVE, run by the \
               differential CI job"]
@@ -5606,6 +5695,25 @@ fn exhaustive_interoperability_matrix() {
         return;
     }
     let corpus = load_corpus();
+
+    // Every dimension is checked BEFORE the sweep runs, so a narrowed one is reported by name in a
+    // second rather than after the product has been enumerated.
+    let mut product = 1_usize;
+    for (name, actual, expected) in exhaustive_crossing_dimensions(&corpus) {
+        assert!(
+            actual == expected,
+            "the {name} dimension carries {actual} value(s) and the pinned product is built on \
+             {expected}; the exhaustive interoperability sweep must not narrow silently -- if the \
+             change is deliberate, update EXHAUSTIVE_CROSSINGS and this table in the same commit"
+        );
+        product *= actual;
+    }
+    assert!(
+        product == EXHAUSTIVE_CROSSINGS,
+        "the dimensions multiply out to {product} crossings and EXHAUSTIVE_CROSSINGS says \
+         {EXHAUSTIVE_CROSSINGS}; the constant and the table disagree"
+    );
+
     let started = std::time::Instant::now();
     let mut crossings = 0;
     for &direction in DIRECTIONS {
@@ -5634,5 +5742,12 @@ fn exhaustive_interoperability_matrix() {
         "exhaustive interoperability matrix: {crossings} crossings in {elapsed:.1} s",
         elapsed = started.elapsed().as_secs_f64(),
     );
-    assert!(crossings > 0, "the sweep enumerated nothing");
+    // The count the sweep PERFORMED, against the count the dimensions promise. The two can only
+    // differ if a loop stopped early or skipped a case, which no `continue` in this file does today
+    // and which this assertion is what keeps true.
+    assert!(
+        crossings == EXHAUSTIVE_CROSSINGS,
+        "the sweep performed {crossings} crossings and the pinned product is \
+         {EXHAUSTIVE_CROSSINGS}; a loop skipped or repeated cases"
+    );
 }

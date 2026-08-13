@@ -35,9 +35,13 @@
 //! whole point of a differential test.
 //!
 //! The two `z_stream` types are **distinct Rust types** with identical layout:
-//! `crates/zlib-rs-differential/src/oracle.rs` transcribes its own `#[repr(C)]` mirror because the
-//! two shipped crates are dev-dependencies and so are invisible to this crate's `lib` target. One
-//! value of each type is constructed and neither is ever transmuted into the other.
+//! `crates/zlib-rs-differential/src/oracle.rs` transcribes its own `#[repr(C)]` mirror rather than
+//! reusing the facade's, so that the reference side is declared from the C headers alone and a
+//! mistake in the port's own mirror cannot cancel out. (The two shipped crates are ordinary
+//! `[dependencies]` of this harness, not dev-dependencies, so both surfaces are reachable from its
+//! `lib` target as well as from here -- which is what lets the gates live in `src/port.rs` and
+//! `src/oracle.rs` instead of in this file.) One value of each type is constructed and neither is
+//! ever transmuted into the other.
 //!
 //! Both sides run with `zalloc`, `zfree` and `opaque` null, so each exercises its own internal
 //! default allocator, and the whole `z_stream` is zeroed before use -- exactly the
@@ -112,7 +116,11 @@
 //! that a bare `cargo test --workspace` in debug stays cheap, and why the response to an exhausted
 //! CI budget is to shard further rather than to narrow the matrix. Level 0 is the cheapest shard
 //! because `deflate_stored` does no match finding at all. What the default sweep gives up is
-//! enumerated by [`exhaustive_chunking_matrix`]; see [`DEFAULT_TINY_WINDOW_LIMIT`].
+//! enumerated by the ten [`exhaustive_configuration_matrix_level_0`]-style shards, which sweep
+//! [`CHUNKINGS_ALL`] in full and raise the fixture-size limit while doing it; see
+//! [`DEFAULT_TINY_WINDOW_LIMIT`] and [`EXHAUSTIVE_TINY_WINDOW_LIMIT`] for the one dimension the two
+//! sweeps size differently, and [`exhaustive_shards_enumerate_the_whole_matrix`] for the arithmetic
+//! that the shards' product is the whole matrix.
 //!
 //! # Matrix size
 //!
@@ -159,11 +167,16 @@
 //!   here being meaningful: a single mistyped digit in a transcribed table changes the emitted
 //!   bytes for essentially every input, and would surface here as thousands of failing cells
 //!   pointing at none of them.
-//! * **Under neither sanitizer, by design, and for two different reasons.** Miri interprets Rust
-//!   MIR and cannot execute the compiled C oracle, so the Miri gate is scoped to `-p zlib-rs`. The
-//!   nightly `AddressSanitizer` gate is scoped to `-p libz-rs-sys` and the three relinked C
-//!   drivers, and does not select this crate. Both are CI job scopes rather than anything to work
-//!   around here; what this file relies on instead is that a divergence fails a comparison loudly.
+//! * **Outside Miri, inside AddressSanitizer.** Miri interprets Rust MIR and cannot execute the
+//!   compiled C oracle at all, so the Miri gate is scoped to `-p zlib-rs` and this suite can never
+//!   run under it. The nightly `AddressSanitizer` gate DOES run it: `rust.yml`'s `asan` job runs
+//!   `cargo +nightly test -p zlib-rs-differential --target x86_64-unknown-linux-gnu` with
+//!   `RUSTFLAGS=-Zsanitizer=address` and the oracle's own C compiled `-fsanitize=address`, so the
+//!   default sweep below executes with both sides instrumented. That step alone sets
+//!   `detect_leaks=0`, because the C oracle keeps `local` tables alive for the life of the process
+//!   by design; every other check is in force. The exhaustive shards are not part of that job --
+//!   they are the `differential-exhaustive` job's work, uninstrumented, because instrumenting ten
+//!   million cells buys nothing the default sweep has not already shown.
 
 // The workspace lint table denies the panic-prone quartet, which is right for library code and
 // wrong for a test: a test asserts, a failed assertion panics, and slicing a fixture at an offset
@@ -2349,7 +2362,7 @@ fn algorithm_family_representatives() -> Vec<c_int> {
 /// The variable that arms the two exhaustive sweeps, named to the tree's `ZLIB_RS_*` convention.
 const ENV_EXHAUSTIVE: &str = "ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE";
 
-/// The value that additionally lifts the fixture-size constraint inside the chunking sweep.
+/// The value that additionally lifts the fixture-size constraint on the tiny output windows.
 ///
 /// Not a manual-only mode: the nightly `schedule` run of `.github/workflows/rust.yml`'s
 /// `differential-exhaustive` job sets it unconditionally, which is what makes the whole
@@ -2505,7 +2518,7 @@ fn armed(what: &str) -> bool {
              CI must run: {ENV_EXHAUSTIVE}=1 cargo test --locked -p zlib-rs-differential \
              --release --test byte_identical -- --ignored --test-threads 4\n      \
              set {ENV_EXHAUSTIVE}={ENV_EXHAUSTIVE_FULL} to additionally lift the fixture-size \
-             constraint inside the chunking sweep."
+             constraint on the tiny output windows."
         );
         return false;
     }
@@ -2797,80 +2810,6 @@ fn cell_shards_partition_the_product() {
             "with {count} shards, {wrong} of {product} cell ordinals were selected by a number of \
              shards other than exactly one; the shards must partition the product"
         );
-    }
-
-    assert!(
-        Shard::WHOLE.is_whole() && Shard::WHOLE.selects(0) && Shard::WHOLE.selects(12_345),
-        "the unsharded case must select every cell"
-    );
-
-    // No aliasing against the enumeration's innermost dimension. The sweep walks the ten fixtures
-    // innermost, so `ordinal % 10` is the fixture index; a slice that never selects some of those
-    // residues is a biased sample of the product, which is what a plain `ordinal % count` produced
-    // for every even count before [`SHARD_MIX`] was introduced.
-    let count = 64;
-    let product = 100_000_usize;
-    let fixtures = 10_usize;
-    let mut missing = Vec::new();
-    for residue in 0..fixtures {
-        let hits = (0..product)
-            .filter(|&ordinal| Shard { index: 1, count }.selects(ordinal))
-            .filter(|&ordinal| ordinal % fixtures == residue)
-            .count();
-        if hits == 0 {
-            missing.push(residue);
-        }
-    }
-    assert!(
-        missing.is_empty(),
-        "slice 1 of {count} selected no cell at all for fixture index(es) {missing:?}, so a partial \
-         run of the slices would be a biased sample of the product rather than a smaller one"
-    );
-
-    // And roughly even shares, so that splitting a product across jobs actually splits the work.
-    let expected = product / count;
-    let worst = (1..=count)
-        .map(|index| {
-            (0..product)
-                .filter(|&ordinal| Shard { index, count }.selects(ordinal))
-                .count()
-        })
-        .map(|share| share.abs_diff(expected))
-        .max()
-        .unwrap_or(0);
-    assert!(
-        worst * 5 <= expected,
-        "the most lopsided of {count} slices differs from the even share of {expected} cells by \
-         {worst}, more than 20%; the slices are meant to divide the work, not merely the product"
-    );
-}
-
-/// The full chunking set, including the one-byte output window, over every fixture.
-///
-/// The configuration set here spans every level, all three container formats, all five strategies
-/// and the extreme `memLevel`s -- [`representative_configurations`] -- because it is the *chunking*
-/// dimension this sweep exists to enumerate exhaustively, and the product of both full sets is what
-/// the module docs record as unaffordable.
-///
-/// This sweep is also where the cells the *default* sweep holds back are enumerated: it raises the
-/// tiny-window fixture limit from [`DEFAULT_TINY_WINDOW_LIMIT`] to
-/// [`EXHAUSTIVE_TINY_WINDOW_LIMIT`], which brings `random.bin` and `repetitive.bin` under every
-/// chunking including the one-byte windows.
-///
-/// # The one constraint, and how to lift it
-///
-/// A tiny window costs one `deflate` call per byte through it, and `window_boundary.bin` is 66,560
-/// incompressible bytes, so a one-byte window over it is some 66,600 calls per side for a single
-/// cell. It is therefore the one fixture [`EXHAUSTIVE_TINY_WINDOW_LIMIT`] holds back from the four
-/// tiniest chunkings; every larger window still covers it.
-/// `ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE=full` raises the limit to `usize::MAX` and pays for the
-/// unabridged run.
-#[test]
-#[ignore = "the full chunking sweep; armed by ZLIB_RS_DIFFERENTIAL_EXHAUSTIVE, run by the \
-              differential-exhaustive CI job"]
-fn exhaustive_chunking_matrix() {
-    if !armed("exhaustive_chunking_matrix") {
-        return;
     }
 
     assert!(

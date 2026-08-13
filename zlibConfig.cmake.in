@@ -44,38 +44,28 @@ else(ZLIB_FIND_COMPONENTS)
     endforeach(_component_config IN LISTS _ZLIB_supported_components)
 endif(ZLIB_FIND_COMPONENTS)
 
-# The static archive's native runtime dependencies, when the installed libz.a is
-# the Rust one.
+# THE STATIC ARCHIVE'S NATIVE RUNTIME DEPENDENCIES ARE PUBLISHED, AND NOT HERE.
 #
-# This has to be done here rather than on the installed export itself, and the
-# reason is worth stating because it looks like the wrong place.  With
-# -DZLIB_BUILD_RUST=ON the Rust libz.a is installed by a FILES rule that lands on
-# the same name as the C archive, while the CMake export set that produces
-# ZLIB-static.cmake is still generated from the C target -- one file describing
-# whichever archive is installed there.  So the interface libraries cannot be
-# attached to that export without also attaching them to the C build's, where they
-# would be wrong: the C libz.a needs no companion libraries at all.  Appending
-# them here keeps the two configurations honest, because this file is generated
-# per build and the list below is empty in the C one.
+# When the installed libz.a is the Rust one it does not stand alone: it carries the
+# Rust standard library's own object code, whose undefined references reach into libc
+# and its neighbours, and a static archive cannot record that the way a shared object
+# records DT_NEEDED.  So the consumer has to be told, and it is -- through the
+# INTERFACE_LINK_LIBRARIES of the ZLIB::ZLIBSTATIC target that ZLIB-static.cmake
+# defines.  CMakeLists.txt attaches the probed set to the exported target before that
+# file is generated, and asserts that the property it wrote is exactly the probed set.
 #
-# The set is target-specific and is derived at configure time by
-# `rustc --crate-type staticlib --print native-static-libs' -- never hardcoded --
-# and it is the same set zlib.pc's private link line advertises to pkg-config
-# consumers.  A Rust staticlib carries the Rust standard library's own references
-# and a static archive cannot record a dependency the way a shared object records
-# DT_NEEDED, which is why the consumer has to be told.  Shared consumers need
-# none of this: ZLIB::ZLIB resolves through the SONAME and its own DT_NEEDED.
+# THIS FILE DELIBERATELY ADDS NOTHING TO IT.  An earlier revision appended the same
+# list again here, on the reasoning that the export was generated from the C target
+# and could not carry a Rust-specific interface; the export-time writer closed that,
+# and with both in place a measured consumer received every `-l' flag TWICE.  Two
+# writers for one property is the defect -- neither can see what the other did, and
+# nothing can then assert the final set -- so there is exactly one, and it is the one
+# that also owns the assertion.  Read ZLIB-static.cmake to see which case an
+# installation is: in C mode the property is absent, because a C libz.a needs nothing
+# beside it.
 #
-# APPEND, never set: the export may already have published an interface, and
-# replacing it would silently drop whatever was there.
-set(_ZLIB_static_native_libs "@ZLIB_RUST_NATIVE_STATIC_LIBS@")
-
-if(_ZLIB_static_native_libs AND TARGET ZLIB::ZLIBSTATIC)
-    string(REPLACE " " ";" _ZLIB_static_native_libs
-                   "${_ZLIB_static_native_libs}")
-    set_property(
-        TARGET ZLIB::ZLIBSTATIC APPEND
-        PROPERTY INTERFACE_LINK_LIBRARIES ${_ZLIB_static_native_libs})
-endif(_ZLIB_static_native_libs AND TARGET ZLIB::ZLIBSTATIC)
-
-unset(_ZLIB_static_native_libs)
+# The set itself is target-specific and derived at configure time by
+# `rustc --crate-type staticlib --print native-static-libs' -- never hardcoded -- and
+# it is the same set zlib.pc's private link line advertises to pkg-config consumers.
+# Shared consumers need none of it: ZLIB::ZLIB resolves through the SONAME and its own
+# DT_NEEDED.

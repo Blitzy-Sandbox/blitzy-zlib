@@ -6,23 +6,47 @@
 # important thing about it is what it does *not* do:
 #
 #   * it is NEVER invoked by `cargo test`;
-#   * it NEVER FETCHES from CI -- see the exact boundary below;
+#   * NO GATE EVER FETCHES through it -- see the exact boundary below;
 #   * it is referenced from no `Cargo.toml`, from no `build.rs` and from no file
 #     under `tests/`;
 #   * it has no side effect of any kind -- not a directory, not a temporary
-#     file, not a single byte of network traffic -- unless a human runs it
-#     WITHOUT `--verify-only`.
+#     file, not a single byte of network traffic -- unless a human runs it with
+#     NEITHER `--verify-only` NOR `--pin-status`.
 #
-# THE EXACT CI BOUNDARY, because "never invoked by CI" used to be written here
-# and was not true.  The `bench` job of `.github/workflows/rust.yml` invokes this
-# script in exactly one mode, `--verify-only`, which "fetches nothing and writes
-# nothing" (see `verify_only` below) and therefore reaches no network and touches
-# no path.  It NEVER invokes it in fetching mode, and the workflow fails closed
-# when the corpus it was told to expect is absent rather than downloading it:
-# provisioning is done from outside the workflow, by a human or by a cache entry
-# keyed on the pinned digest.  That is what AAP 0.6.4.4 asks for -- the corpus is
-# opt-in "so `cargo test` and CI never require the network" -- and a side-effect
-# free verification does not require one.
+# THE EXACT CI BOUNDARY, because a looser sentence used to stand here and was not
+# true.  Two jobs of `.github/workflows/rust.yml` name this script, and they are
+# different kinds of thing:
+#
+#   * `bench`, which MEASURES, invokes it in exactly TWO modes, and neither of them
+#     fetches or writes anything:
+#
+#       - `--pin-status`, unconditionally, on every runner.  It prints what
+#         ./silesia.pin records and exits, reaching no network, no destination and
+#         no unpacker.  What it is FOR is the workflow's arming decision: the pin, a
+#         committed and reviewed file, is what says whether this repository carries
+#         an approved corpus identity at all.  That used to be an optional
+#         repository variable nobody had to set, which meant a required check could
+#         go green having never measured the corpus AAP 0.8.4 names.
+#       - `--verify-only`, when a corpus has been provisioned into the job's cache.
+#         It "fetches nothing and writes nothing" (see `verify_only` below) and
+#         therefore reaches no network and touches no path.
+#
+#     It NEVER invokes it in fetching mode, and it fails closed when the corpus it
+#     was told to expect is absent rather than downloading it.  On a schedule or a
+#     published release that absence is fatal, because AAP 0.8.4 states the
+#     throughput bar against this corpus; on a hosted runner it is announced as a
+#     warning, because a hosted runner's throughput verdict is informational anyway.
+#   * `silesia-provision`, which measures NOTHING and gates NOTHING, invokes it in
+#     fetching mode -- once, to populate the cache the job above restores.  It is
+#     reachable only from `workflow_dispatch` with its `provision_silesia` input
+#     enabled, so a push, a pull request, the nightly schedule and a release can
+#     none of them reach it.  A human enabling that input is the human this header
+#     means.
+#
+# So the property AAP 0.6.4.4 asks for is intact, and it is worth stating exactly:
+# the corpus is opt-in "so `cargo test` and CI never require the network".  No
+# gate requires a download; a side-effect-free verification does not require one;
+# and the one job that does download is not a gate and is not automatic.
 #
 # Those are not aspirations, they are the property that keeps this crate's
 # test suite hermetic.  The correctness gates here must be reproducible from a
@@ -36,7 +60,13 @@
 # yesterday.  If you are adding automation and find yourself wanting this corpus,
 # the answer is to make the automation skip, exactly as the benchmarks do -- or,
 # if it must know whether a corpus provisioned elsewhere is the pinned one, to ask
-# with `--verify-only`, which is the one mode that neither fetches nor writes.
+# with `--verify-only`, or whether one is pinned at all, with `--pin-status`.
+# Those two are the modes that neither fetch nor write.  What it is NOT is to add a
+# second fetching caller: `silesia-provision` exists so that a maintainer can
+# satisfy the acceptance gate from the Actions tab, and one human-dispatched
+# provisioning path is the whole of the licence.  A fetching call reachable from a
+# push, a pull request, a schedule or a release would make every gate contingent on
+# a remote host again, which is the property these paragraphs exist to protect.
 #
 # WHY IT EXISTS
 #
@@ -83,15 +113,29 @@
 # be waived: there is no flag to skip it, no environment variable that disables
 # it, and a mismatch is always fatal.
 #
-# THE DIGEST IS UNPINNED, SO EVERY INVOCATION MUST SUPPLY ONE.  Upstream
-# publishes the archive but no digest for it, so SILESIA_SHA256_EXPECTED below is
-# left at the sentinel `UNPINNED` and this script FAILS CLOSED -- it refuses to
-# fetch anything at all -- until a digest arrives.  A bare
-# `./fetch_silesia.sh` therefore does not download anything; it exits non-zero
-# and tells you this.  That is deliberate: accepting an unverified download would
-# defeat the purpose of the check, and writing in a digest computed from a single
-# unauthenticated download would look authoritative while being nothing sounder
-# than trust-on-first-use.
+# ★ THE DIGEST IS PINNED, IN ./silesia.pin, AND THE NEXT PARAGRAPH SAYS WHAT THAT
+# IS WORTH.  This block used to say the opposite -- that SILESIA_SHA256_EXPECTED
+# was left at the sentinel `UNPINNED` and every invocation had to supply a digest
+# -- and that was true until the pin file arrived.  It is no longer: a bare
+# `./fetch_silesia.sh` reads ./silesia.pin, enforces the digest, member count,
+# per-member size, expanded size and expansion ratio it records, and downloads.
+# The sentinel survives for the case the pin file is absent, where this script
+# still FAILS CLOSED and refuses to fetch anything at all.
+#
+# What changed is WHO decides, not how strict the check is.  A digest that had to
+# be remembered on every invocation made the AAP's own acceptance corpus depend on
+# a person's memory, and it let a required CI check go green having verified
+# nothing.  A committed, reviewed file decides instead -- and it is `grep`-able by
+# the workflow, which is what lets CI tell an armed run from an unarmed one.
+#
+# ★ WHAT THE PIN IS AND IS NOT.  It is category 3 below: a digest computed from
+# one download on one machine.  It detects CORRUPTION and it is trust-on-first-use;
+# it is NOT authentication, and pinning it in a reviewed file does not make it so.
+# Anyone who needs authentication must bring evidence from a channel independent of
+# the download -- per-member digests through ZLIB_RS_SILESIA_MEMBER_SHA256, or an
+# archive digest from an independent source through `--sha256`, both of which
+# outrank the pin.  The pin is honest about its own strength; do not let its
+# presence in a committed file be read as more.
 #
 # WHAT A DIGEST DOES AND DOES NOT ESTABLISH.  A digest computed from the same
 # download it is checking against detects CORRUPTION -- a truncated transfer, a
@@ -105,10 +149,12 @@
 #      distribution package, a colleague's existing copy -- checked with
 #      ZLIB_RS_SILESIA_MEMBER_SHA256.  These also survive upstream rebuilding
 #      the zip, which an archive digest does not.
-#   2. An archive digest obtained from such a source and pinned below.
+#   2. An archive digest obtained from such a source, passed with `--sha256` or
+#      through ZLIB_RS_SILESIA_SHA256, or written into ./silesia.pin in a fork.
 #   3. An archive digest computed from your own download: corruption detection
 #      only.  Fine for a throughput measurement on a machine you control, and
-#      it must not be mistaken for more than that.
+#      it must not be mistaken for more than that.  **This is what ./silesia.pin
+#      holds**, and ./README.md records the same caveat.
 #
 # The inventory check (ZLIB_RS_SILESIA_MEMBERS) and the extraction hardening in
 # `unpack_archive` are independent of all of this and always run: they bound what
@@ -122,9 +168,12 @@
 #   2. Compute its digest:
 #        sha256sum silesia.zip            # or: shasum -a 256 silesia.zip
 #   3. Cross-check that value against an independent source if you can, then
-#      either pin it in SILESIA_SHA256_EXPECTED below -- one place, one line,
-#      visible in a diff and reviewable -- or supply it on every invocation:
+#      either write it into ./silesia.pin -- one file, one line, visible in a
+#      diff and reviewable -- or supply it on the invocation, which outranks the
+#      pin:
 #        ZLIB_RS_SILESIA_SHA256=<64-hex-digest> ./fetch_silesia.sh
+#      Run `./fetch_silesia.sh --pin-status` to see what is pinned right now and
+#      which ceilings that pin implies.
 #
 # -----------------------------------------------------------------------------
 # WHAT IT COSTS AND WHERE IT LANDS
@@ -194,15 +243,77 @@ ZLIB_RS_SILESIA_URL=${ZLIB_RS_SILESIA_URL:-https://sun.aei.polsl.pl/~sdeor/corpu
 # not a valid SHA-256, so it can never be confused with one.
 SILESIA_SHA256_SENTINEL='UNPINNED'
 
-# THE ONE PLACE A MAINTAINER PINS THE DIGEST -- tier 3, the lowest-precedence
-# of the three sources, used when neither --sha256 nor the environment supplies
-# one.  See the CHECKSUM POLICY block above for why it does not ship pinned.
+# ★ THE PIN FILE -- tier 3, and no longer a sentinel.
 #
-# Pin it only together with the ZLIB_RS_SILESIA_URL default above: a digest
-# without the URL it was taken from asserts nothing.  While this reads UNPINNED
-# a digest must come from --sha256 or from the environment, and without either
-# the script fetches nothing and vouches for nothing.
+# This used to read `SILESIA_SHA256_EXPECTED="$SILESIA_SHA256_SENTINEL"`, i.e.
+# the literal string UNPINNED, so a run that did not pass --sha256 or set the
+# environment variable was refused.  That made the AAP's own acceptance corpus
+# depend on something a person had to remember, and it let a required CI check
+# go green having verified nothing.
+#
+# The digest now lives in ./silesia.pin, next to this script, committed and
+# reviewed like code.  A file rather than a shell variable for two reasons: the
+# workflow needs to read the same value to decide whether the acceptance tier is
+# armed, and it can `grep` a `key=value` file without either it or this script
+# having to parse the other; and a pin belongs with the size and member bounds it
+# implies, which a single variable cannot hold.
+#
+# Overridable so a fork or a mirror can point at its own pin, but note that
+# `--sha256` and the environment still take precedence -- see
+# `select_expected_digest`, where all three tiers are ordered in one place.
+ZLIB_RS_SILESIA_PIN=${ZLIB_RS_SILESIA_PIN:-}
+
+# Populated by `load_pin` from the pin file.  Empty means no pin was readable,
+# which is a refusal for a fetch and a note for `--pin-status`.
+pin_path=''
+pin_url=''
+pin_sha256=''
+pin_archive_bytes=''
+pin_member_count=''
+pin_expanded_bytes=''
+pin_max_member_bytes=''
+pin_compression_ratio=''
+
+# Tier 3 of the digest sources, kept as a variable so the precedence chain in
+# `select_expected_digest` reads the same way it always did.  Set from the pin
+# file by `load_pin`; the sentinel survives only when no pin could be read.
 SILESIA_SHA256_EXPECTED="$SILESIA_SHA256_SENTINEL"
+
+# ★ Multiplier applied to the pinned bounds before they are enforced.
+#
+# The pin records the approved archive exactly.  Enforcing those numbers as hard
+# equalities would refuse a mirror that recompressed the same twelve files, which
+# is a legitimate thing to accept deliberately (that is what the per-member
+# manifest in ./silesia.sha256 is for).  So the SIZE bounds are enforced with this
+# much slack while the DIGEST stays exact: the slack is what makes the bounds a
+# resource ceiling rather than a second, weaker identity check.
+#
+# Two, i.e. twice the approved size.  Large enough that no honest repackaging of
+# the same corpus trips it, small enough that the ceiling still bounds the disk a
+# hostile archive can consume to roughly 135 MB downloaded and 404 MiB expanded --
+# which is the point of having one (CWE-400).
+SILESIA_BOUND_SLACK=2
+
+# Absolute fallback ceilings, used only when no pin is readable.
+#
+# `--verify-only` against a pre-provisioned directory does not need a pin, and a
+# fork may legitimately delete one; neither case should leave the extraction
+# unbounded.  These are the pinned figures times the slack above, written out, so
+# that the no-pin path enforces exactly what the pinned path would have.
+SILESIA_FALLBACK_ARCHIVE_BYTES=136365488
+SILESIA_FALLBACK_EXPANDED_BYTES=423877160
+SILESIA_FALLBACK_MEMBER_BYTES=102440960
+SILESIA_FALLBACK_MEMBER_COUNT=24
+
+# ★ Ceiling on declared-expanded-bytes divided by bytes actually downloaded.
+#
+# The bound that catches a zip bomb whose per-member and total declared sizes are each
+# individually believable but whose expansion factor is not. The approved corpus
+# expands 3.11x (see compression_ratio in the pin), so twenty is generous by a factor
+# of six -- deliberately, because a mirror storing the corpus with a stronger
+# compressor legitimately raises the ratio -- and it still refuses the classic bomb,
+# which expands by six or more orders of magnitude.
+SILESIA_MAX_EXPANSION_RATIO=20
 
 # Per-invocation override of the expected digest, tier 2 of the three sources
 # listed in the CHECKSUM POLICY block.  Case-insensitive; it must be exactly 64
@@ -217,6 +328,25 @@ ZLIB_RS_SILESIA_SHA256=${ZLIB_RS_SILESIA_SHA256:-}
 # so upstream repackaging cannot confuse the check.  It is dot-prefixed to
 # mark it as metadata rather than corpus data.
 STAMP_NAME='.fetch_silesia.stamp'
+
+# The pin file's name, beside this script.  See ZLIB_RS_SILESIA_PIN above and
+# `load_pin` below for what it contains and how it is read.
+PIN_NAME='silesia.pin'
+
+# The per-member digest manifest's name, beside this script.  Offered as the
+# default for --manifest so that the committed manifest is what a bare run checks
+# against, rather than something a caller has to remember to point at.
+MANIFEST_NAME='silesia.sha256'
+
+# The ceilings `resolve_bounds` fills in, and the source it names in a diagnostic.
+# Declared here, empty, so that every one of them is a defined name from the first
+# line of `main` onward and a reference to one before it is resolved is an empty
+# string rather than an unbound-variable failure under `set -u`.
+max_archive_bytes=''
+max_expanded_bytes=''
+max_member_bytes=''
+max_member_count=''
+bounds_source=''
 
 # The member files the Silesia corpus consists of, and the inventory the
 # extracted payload is checked against.  Upstream publishes twelve files, each
@@ -244,16 +374,44 @@ STAMP_NAME='.fetch_silesia.stamp'
 # or set it to `-` to skip the inventory check as a deliberate, visible choice.
 ZLIB_RS_SILESIA_MEMBERS=${ZLIB_RS_SILESIA_MEMBERS:-dickens mozilla mr nci ooffice osdb reymont sao samba webster x-ray xml}
 
-# Optional path to a `sha256sum`-format manifest of PER-MEMBER digests.  When
-# supplied, every listed member is hashed after extraction and must match.
+# Path to a `sha256sum`-format manifest of PER-MEMBER digests.  Every listed
+# member is hashed and must match: after extraction on a fetch, and against the
+# installed directory under --verify-only.
 #
-# This is the check that makes the download authenticated rather than merely
-# intact: the archive digest below can only ever be trust-on-first-use unless it
-# reaches you through a channel independent of the download itself, whereas a
-# member manifest obtained from a paper, a distribution package or a colleague's
-# machine is independent evidence, and it keeps working when upstream rebuilds
-# the zip.  Unset by default, because this repository has no authenticated source
-# for those digests to ship.
+# WHAT THIS AUTHENTICATES THAT THE ARCHIVE DIGEST CANNOT.  Both checks can
+# authenticate, and they authenticate different things, so neither is "the only
+# one that does".  The archive digest below authenticates ONE EXACT ARCHIVE: from
+# a value that reached you through a channel independent of the download, it
+# proves you hold precisely those bytes.  What it cannot survive is repackaging --
+# zip archives are not reproducible, so a rebuilt archive of the identical twelve
+# files has a different digest and cannot be told apart from a hostile one.  A
+# member manifest authenticates the EXTRACTED CONTENT, independently of how the
+# archive was packed, so it carries across mirrors and rebuilds; obtained from a
+# paper, a distribution package or a colleague's machine, it is independent
+# evidence about the files themselves.  Both are trust-on-first-use if their
+# value came from the download's own channel; neither bootstraps trust alone.
+#
+# ★ It used to say "unset by default, because this repository has no authenticated
+# source for those digests to ship". It ships them now: ./silesia.sha256 carries all
+# twelve, computed from the extracted contents of the archive whose digest
+# ./silesia.pin records and verified with `sha256sum --check`. `main` selects that
+# file when this variable is empty, so a bare run performs the per-member check
+# rather than skipping it, and an explicit value still wins.
+#
+# The trust-on-first-use caveat above is unchanged and is worth restating plainly:
+# these digests are evidence that the corpus has not changed since it was pinned
+# here, not evidence that what was pinned is what the Silesia authors published. For
+# the latter, obtain the digests independently and pass them.
+#
+# OPTIONAL ON A FETCH, REQUIRED BY --verify-only.  A fetch hashes the archive it
+# downloaded against a pinned digest before unpacking it, so the members are
+# established either way and a manifest is supplementary.  --verify-only fetches
+# nothing, and the archive is not retained, so its digest can never be recomputed
+# from an installed directory: the manifest is the only thing that mode can read
+# which does not come from inside the directory it is being asked to vouch for.
+# There, the manifest must cover every name in the inventory, and
+# ZLIB_RS_SILESIA_MEMBER_SHA256=- is the only way to waive it -- after which the
+# report says in so many words that it establishes nothing about the bytes.
 ZLIB_RS_SILESIA_MEMBER_SHA256=${ZLIB_RS_SILESIA_MEMBER_SHA256:-}
 
 # Basename used for the archive while it sits in the staging directory.  Kept
@@ -275,6 +433,8 @@ unpacker=''
 # digest sources and outranks both the environment and the pinned constant.
 opt_force=0
 opt_verify_only=0
+# Report what ./silesia.pin carries and exit, touching nothing.  See `pin_status`.
+opt_pin_status=0
 opt_sha256=''
 
 # Set by `resolve_destination`: the directory the corpus is installed into, and
@@ -396,42 +556,66 @@ payload_present() {
 # path redirects it to stderr instead.
 usage() {
     cat <<'EOF'
-Usage: fetch_silesia.sh --sha256 <digest> [--force] [--verify-only]
+Usage: fetch_silesia.sh [--sha256 <digest>] [--force] [--verify-only]
+       fetch_silesia.sh --pin-status
        fetch_silesia.sh [-h|--help]
 
 Fetches the Silesia compression corpus for the repository-root benchmark
-suites.  OPT-IN ONLY: nothing in this repository runs this script for you, and
-no correctness gate depends on what it produces.  Running it is never required
--- `cargo test` does not need it, and `cargo bench` reports and skips when the
-corpus is absent.
+suites.  OPT-IN ONLY: FETCHING is something a human does deliberately, nothing
+in this repository does it for you, and no correctness gate depends on what it
+produces.  Running it is never required -- `cargo test` does not need it, and
+`cargo bench` reports and skips when the corpus is absent.
 
-An expected SHA-256 is REQUIRED on every run, including --verify-only.  It has
-to be supplied because upstream publishes no digest for this archive and zip
-archives are not reproducible, so there is no single correct value to ship.
-See the CHECKSUM POLICY block at the top of this script for the full reasoning
-and for how to obtain a digest you can trust.
+VERIFYING is what CI does do with this script, in two modes and neither of them a
+fetch: the `bench` job of .github/workflows/rust.yml runs --pin-status on every
+runner, and --verify-only against a corpus that was provisioned outside the
+workflow, from a cache keyed on the pinned digest or from ZLIB_RS_SILESIA_DIR.
+Both reach no network, write nothing and obtain nothing; the workflow fails closed
+rather than downloading.
+
+An expected SHA-256 is REQUIRED on every fetch or verify operation, --verify-only
+included.  (--help and an argument error are not operations on a corpus and need
+none.)  The committed ./silesia.pin supplies one, so no flag and no variable is
+needed for the archive that pin approves; --sha256 and ZLIB_RS_SILESIA_SHA256
+outrank it, for a mirror or a repackaging with a different digest.  If the pin is
+absent and neither is given, the run is refused rather than trusted -- upstream
+publishes no digest for this archive and zip archives are not reproducible, so
+there is no value that could be assumed.  See the CHECKSUM POLICY block at the top
+of this script for the full reasoning, and --pin-status for what is pinned now.
 
 Options:
   --sha256 <hex> Expected SHA-256 of the archive: exactly 64 hex digits,
-                 case-insensitive.  Outranks ZLIB_RS_SILESIA_SHA256 and the
-                 SILESIA_SHA256_EXPECTED constant.  There is no way to skip
-                 the check and no value that disables it.
+                 case-insensitive.  Outranks ZLIB_RS_SILESIA_SHA256, which in
+                 turn outranks ./silesia.pin.  Optional only because the pin
+                 supplies a value; there is no way to skip the check and no
+                 value that disables it.
   --force        Re-fetch even when the destination is already populated,
                  replacing whatever is there.  Also required to overwrite a
                  populated destination that carries no stamp from a previous
                  successful run.  It does not weaken verification: the fresh
                  download is checked exactly as any other.
+  --pin-status   Print what ./silesia.pin records -- the approved archive's
+                 URL, digest, size and member bounds -- and the ceilings this
+                 run would enforce, then exit.  Downloads nothing, creates
+                 nothing and reads no destination, so it is safe to run
+                 anywhere.  This is what CI reads to decide whether the
+                 acceptance tier is armed.
   --verify-only  Report on an existing download and exit without fetching
                  anything.  Exits non-zero when the destination is missing,
                  incomplete, carries an unreadable stamp, or was fetched from
                  a URL or digest other than the ones expected now.
                  "Incomplete" is judged against ZLIB_RS_SILESIA_MEMBERS, the
                  same inventory a fetch applies, so a destination holding
-                 eleven of the twelve members fails here.  The archive is not
-                 retained after a fetch, so this re-checks the recorded stamp
-                 against what you expect and confirms the inventory is
-                 complete; it does not recompute a digest over the unpacked
-                 corpus files.
+                 eleven of the twelve members fails here.
+                 REQUIRES ZLIB_RS_SILESIA_MEMBER_SHA256, because everything
+                 else this mode can read -- the stamp, the names, the
+                 inventory -- comes from inside the directory being vouched
+                 for, and the archive is not retained after a fetch, so its
+                 digest cannot be recomputed here.  With a manifest every
+                 member is hashed and compared, and the manifest must cover
+                 the whole inventory.  Set the variable to `-` to waive that
+                 and accept a stamp-and-inventory report instead; the output
+                 then says so explicitly.
   -h, --help     Print this text and exit 0.  Touches no network and creates
                  no files.
 
@@ -463,11 +647,34 @@ Environment:
                            twelve Silesia members.  Set to `-` to skip the
                            inventory check.
   ZLIB_RS_SILESIA_MEMBER_SHA256
-                           Optional path to a sha256sum-format manifest of
-                           per-member digests.  When set, every listed member is
-                           hashed after extraction and must match.  This is the
-                           only check here that can authenticate rather than
-                           merely detect corruption.
+                           Path to a sha256sum-format manifest of per-member
+                           digests.  Every listed member is hashed and must
+                           match.  Optional on a fetch, which verifies the
+                           archive it downloaded; REQUIRED by --verify-only,
+                           which downloads nothing and where the manifest must
+                           cover every member named by ZLIB_RS_SILESIA_MEMBERS.
+                           Set it to `-` to waive the check deliberately and
+                           visibly.  Defaults to the committed ./silesia.sha256.
+
+                           What it adds, stated exactly, because the two checks
+                           authenticate DIFFERENT things and neither is the only
+                           one that authenticates.  The archive digest
+                           (--sha256) authenticates one exact archive: if the
+                           value came from a channel you trust, matching it
+                           proves you have the very bytes that value describes,
+                           and no substitution or corruption in transit can
+                           pass.  What it cannot survive is repackaging -- zip
+                           archives are not reproducible, so a rebuilt archive
+                           of the identical twelve files has a different digest
+                           and is indistinguishable from a hostile one.  This
+                           manifest authenticates the EXTRACTED CONTENT instead:
+                           it is independent of how the archive was packed, so
+                           it carries across mirrors and rebuilds where the
+                           archive digest cannot, and it is the only expectation
+                           --verify-only can read that does not come from inside
+                           the directory being checked.  Both depend on the
+                           value reaching you through a trustworthy channel;
+                           neither can bootstrap trust on its own.
 
 Space: roughly 65 MiB downloaded and a few hundred megabytes unpacked; allow
 about 300 MiB free in the destination's filesystem.
@@ -485,7 +692,10 @@ value you obtained and cross-checked:
       ./crates/zlib-rs-differential/corpus/fetch_silesia.sh
 
   # Confirm an existing download is the one you expect, without refetching.
+  # The manifest is what makes this a statement about the bytes; replace it
+  # with ZLIB_RS_SILESIA_MEMBER_SHA256=- to accept a stamp-only report.
   ZLIB_RS_SILESIA_DIR=/var/cache/silesia \
+  ZLIB_RS_SILESIA_MEMBER_SHA256=/path/to/silesia.sha256 \
       ./crates/zlib-rs-differential/corpus/fetch_silesia.sh --verify-only \
       --sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
@@ -512,6 +722,10 @@ parse_arguments() {
                 ;;
             --force)
                 opt_force=1
+                shift
+                ;;
+            --pin-status)
+                opt_pin_status=1
                 shift
                 ;;
             --verify-only)
@@ -542,20 +756,44 @@ parse_arguments() {
     fi
 }
 
-# Tool probing.  Each family degrades to a sensible alternative and otherwise
-# fails closed with a message naming what to install.  All of it happens before
-# any network access or filesystem mutation, so a machine missing a tool learns
-# that immediately instead of after a 65 MiB download.
-probe_tools() {
-    if have curl; then
-        downloader='curl'
-    elif have wget; then
-        downloader='wget'
-    else
-        die "no downloader found; install curl (preferred) or wget"
+# True when $1 -- `curl' or `wget' -- accepts the option this script uses to
+# confine HTTP redirects to https://.
+#
+# Asked of the installed binary rather than derived from a version number:
+# distributions patch both tools, and `--help' is the only authority on what the
+# program in $PATH actually accepts.  curl's option list moved behind
+# `--help all' in 7.74, so both spellings are consulted and the output of the
+# two is searched together; `--help' short-circuits before any transfer in every
+# curl that has ever shipped, so neither invocation reaches the network.
+downloader_confines_redirects() {
+    case "$1" in
+        curl)
+            { curl --help all 2>/dev/null; curl --help 2>/dev/null; } |
+                grep -q -- '--proto-redir'
+            ;;
+        wget)
+            # BOTH options, because under wget the guarantee takes both. --https-only
+            # constrains the scheme but was MEASURED not to stop a 302 downgrade -- it
+            # governs recursive link following -- so the redirect is refused outright
+            # with --max-redirect=0, and a wget that does not accept that option cannot
+            # make the guarantee either.
+            wget --help 2>/dev/null | grep -q -- '--https-only' &&
+                wget --help 2>/dev/null | grep -q -- '--max-redirect'
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# SHA-256 tool probing, on its own so that --verify-only can reach it without
+# also demanding a downloader and a zip extractor it will never use.  Idempotent
+# and cheap, so callers may probe defensively.
+#
+# sha256sum is coreutils; shasum ships with macOS, which has no sha256sum.
+probe_digest_tool() {
+    if [ -n "$digest_tool" ]; then
+        return 0
     fi
 
-    # sha256sum is coreutils; shasum ships with macOS, which has no sha256sum.
     if have sha256sum; then
         digest_tool='sha256sum'
     elif have shasum; then
@@ -563,6 +801,41 @@ probe_tools() {
     else
         die "no SHA-256 tool found; install sha256sum (coreutils) or shasum"
     fi
+}
+
+# Tool probing.  Each family degrades to a sensible alternative and otherwise
+# fails closed with a message naming what to install.  All of it happens before
+# any network access or filesystem mutation, so a machine missing a tool learns
+# that immediately instead of after a 65 MiB download.
+probe_tools() {
+    # HTTPS is required of the URL *and* of every hop a redirect leads through,
+    # so the tool selected here has to be able to enforce the second half.  Both
+    # tools follow redirects by default, and an allowlisted scheme on the command
+    # line buys nothing on its own: a 302 to http:// would be followed silently,
+    # which is precisely the downgrade `validate_url' refuses to accept in the
+    # value it was handed.  curl expresses the restriction as --proto/
+    # --proto-redir; wget cannot express "follow only https redirects" at all --
+    # --https-only was measured following a 302 downgrade, because it governs
+    # recursive link following -- so under wget the hop is refused outright with
+    # --max-redirect=0.  A build of either tool that does not accept what it needs
+    # cannot make the guarantee and is passed over rather than used without it.
+    if have curl && downloader_confines_redirects curl; then
+        downloader='curl'
+    elif have wget && downloader_confines_redirects wget; then
+        downloader='wget'
+    elif have curl || have wget; then
+        die "a downloader is installed, but not one that can confine redirects to
+       https://: curl needs --proto-redir (7.20.0 and later) and wget needs both
+       --https-only and --max-redirect, and neither tool accepts what it needs here.
+       Without it a redirect could move this download to plain http, so the
+       fetch is refused rather than performed unprotected.  Install a current
+       curl, or provision the corpus yourself and point ZLIB_RS_SILESIA_DIR at
+       it -- --verify-only needs no downloader at all."
+    else
+        die "no downloader found; install curl (preferred) or wget"
+    fi
+
+    probe_digest_tool
 
     # The archive is a zip.  GNU tar cannot read zip archives, so it is not an
     # acceptable fallback here and is deliberately not probed for; bsdtar
@@ -622,10 +895,18 @@ is_sha256() {
 #      forge additional fields.
 #
 # `https://` is required rather than merely allowed.  The archive is verified by
-# pinned SHA-256 afterwards, so plain http is not a confidentiality or integrity
-# hole in itself, but there is no reason to accept a downgrade, and refusing
-# `file://` and every other scheme keeps this from becoming a way to make the
-# script read an arbitrary local path.
+# pinned SHA-256 afterwards, so plain http would still be *detected* if it were
+# tampered with, but detection afterwards is not a reason to accept cleartext,
+# and refusing `file://` and every other scheme keeps this from becoming a way to
+# make the script read an arbitrary local path.
+#
+# WHAT THIS CHECK CANNOT DO, so that it is not mistaken for the whole of the
+# transport policy: it sees only the value the caller supplied, and both
+# downloaders follow redirects.  An https:// value that is answered with
+# `Location: http://...` would satisfy every test in this function.  The hop is
+# constrained where the hop is visible -- `download_archive` passes
+# `--proto '=https' --proto-redir '=https'` to curl and `--https-only` to wget --
+# and the two halves are only a policy together.
 is_safe_url() {
     # Scheme, and a non-empty remainder after it.
     case "$1" in
@@ -692,6 +973,142 @@ is_safe_member() {
 #
 # The sentinel is treated as "absent" wherever it appears, so a half-finished
 # pin cannot masquerade as a digest.
+# ★ Read ./silesia.pin into the `pin_*` variables, and tier 3 of the digest chain.
+#
+# Deliberately hand-parsed with `case` and `read` rather than sourced. Sourcing a
+# configuration file executes it, so a pin file would become a place to run code
+# from -- which is the wrong property for the one file whose whole job is to be
+# trusted. This reads `key=value`, ignores `#` comments and blank lines, refuses a
+# key it does not know, and assigns nothing it did not recognise.
+#
+# Every numeric field is validated here rather than where it is used, so a
+# malformed pin fails once, early, and by name.
+#
+# Returns 0 when a pin was read, 1 when no pin file exists. A pin file that exists
+# but is malformed is fatal: silently continuing without bounds would be worse than
+# having none, because the caller would believe it had them.
+load_pin() {
+    if [ -n "$ZLIB_RS_SILESIA_PIN" ]; then
+        pin_path=$ZLIB_RS_SILESIA_PIN
+    else
+        pin_path="${script_dir}/${PIN_NAME}"
+    fi
+
+    if [ ! -f "$pin_path" ]; then
+        # A fork may legitimately delete it, and `--verify-only` against a
+        # pre-provisioned directory does not need one. The fallback ceilings still
+        # apply, so the extraction is bounded either way.
+        if [ -n "$ZLIB_RS_SILESIA_PIN" ]; then
+            die "the pin file named by ZLIB_RS_SILESIA_PIN does not exist:
+       '$pin_path'
+
+       Naming a pin that is not there is a mistake rather than a request to
+       proceed without one, so this is refused.  Unset the variable to fall
+       back to ${PIN_NAME} beside this script."
+        fi
+        pin_path=''
+        return 1
+    fi
+
+    # `IFS=` and `-r` so a value keeps its spaces and its backslashes; the
+    # `|| [ -n "$_line" ]` tail reads a final line with no newline after it.
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        case "$_line" in
+            '#'* | '') continue ;;
+        esac
+        _key=${_line%%=*}
+        _value=${_line#*=}
+        case "$_key" in
+            url) pin_url=$_value ;;
+            sha256) pin_sha256=$(lowercase "$_value") ;;
+            archive_bytes) pin_archive_bytes=$_value ;;
+            member_count) pin_member_count=$_value ;;
+            expanded_bytes) pin_expanded_bytes=$_value ;;
+            max_member_bytes) pin_max_member_bytes=$_value ;;
+            compression_ratio) pin_compression_ratio=$_value ;;
+            *)
+                die "$pin_path names a field this script does not know:
+       '$_key'
+
+       A pin the script cannot fully interpret is refused rather than
+       partly applied: the fields it did not understand might have been
+       the bounds.  Add the field to load_pin, or remove it."
+                ;;
+        esac
+    done < "$pin_path"
+
+    if ! is_sha256 "$pin_sha256"; then
+        die "$pin_path does not carry a valid 64-character hexadecimal
+       sha256= field: '$pin_sha256'"
+    fi
+    for _field in archive_bytes:"$pin_archive_bytes" \
+        member_count:"$pin_member_count" \
+        expanded_bytes:"$pin_expanded_bytes" \
+        max_member_bytes:"$pin_max_member_bytes"; do
+        _name=${_field%%:*}
+        _number=${_field#*:}
+        if ! is_positive_integer "$_number"; then
+            die "$pin_path carries a $_name= field that is not a positive
+       integer: '$_number'"
+        fi
+    done
+    case "$pin_url" in
+        https://?*) ;;
+        *)
+            die "$pin_path carries a url= field that is not an https URL:
+       '$pin_url'
+
+       A digest without the URL it was taken from asserts nothing about
+       where the bytes came from, so the two are validated together."
+            ;;
+    esac
+
+    SILESIA_SHA256_EXPECTED=$pin_sha256
+    return 0
+}
+
+# Whether $1 is a non-empty run of digits denoting a positive value.
+#
+# Written out rather than delegated to `test -gt`, which accepts leading `+`, a
+# leading `-`, and surrounding whitespace on some shells, and whose failure mode on
+# a non-number is a diagnostic on stderr rather than a false return.
+is_positive_integer() {
+    case "$1" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    [ "$1" != "0" ] && return 0
+    return 1
+}
+
+# Multiply $1 by SILESIA_BOUND_SLACK, the ceiling actually enforced for a bound the
+# pin states exactly.  See SILESIA_BOUND_SLACK for why the size bounds get slack
+# while the digest does not.
+bound_with_slack() {
+    printf '%s' "$(( $1 * SILESIA_BOUND_SLACK ))"
+}
+
+# ★ The four ceilings this run will enforce, resolved once from the pin or from the
+# fallbacks, into `max_*`.
+#
+# Resolved in one place so that no call site can enforce a bound the others do not
+# know about, and so the diagnostic each violation prints can name where its number
+# came from.
+resolve_bounds() {
+    if [ -n "$pin_archive_bytes" ]; then
+        max_archive_bytes=$(bound_with_slack "$pin_archive_bytes")
+        max_expanded_bytes=$(bound_with_slack "$pin_expanded_bytes")
+        max_member_bytes=$(bound_with_slack "$pin_max_member_bytes")
+        max_member_count=$(bound_with_slack "$pin_member_count")
+        bounds_source="${PIN_NAME} x ${SILESIA_BOUND_SLACK}"
+    else
+        max_archive_bytes=$SILESIA_FALLBACK_ARCHIVE_BYTES
+        max_expanded_bytes=$SILESIA_FALLBACK_EXPANDED_BYTES
+        max_member_bytes=$SILESIA_FALLBACK_MEMBER_BYTES
+        max_member_count=$SILESIA_FALLBACK_MEMBER_COUNT
+        bounds_source="this script's built-in fallbacks"
+    fi
+}
+
 select_expected_digest() {
     expected_sha256=''
     expected_sha256_source=''
@@ -1047,20 +1464,93 @@ validate_url() {
 }
 download_archive() {
     info "Downloading $ZLIB_RS_SILESIA_URL"
-    info "  via $downloader into the staging directory"
+    info "  via $downloader into the staging directory, https only"
 
     # `--` ends option parsing in both tools; see `validate_url` for why that
     # matters.  The output path needs no such guard: `normalise_destination`
     # makes the destination absolute and the staging directory is created
     # inside its parent, so "$1" always begins with '/'.
+    info "  transfer ceiling ${max_archive_bytes} bytes, from ${bounds_source}"
+
+    # ★ THE TRANSFER CEILING, enforced by the downloader itself.
+    #
+    # `--max-filesize` and `--quota` make the tool stop rather than this script
+    # notice afterwards, which is the whole point: an integrity check that runs
+    # after the disk is full has protected nothing (CWE-400).  Both act on the
+    # advertised length where the server gives one and on the running total where
+    # it does not, so a server that lies about `Content-Length` is still bounded.
+    #
+    # Neither option is a substitute for the digest, and neither is treated as one.
+    # They bound the RESOURCE; `verify_archive` establishes the IDENTITY, and it
+    # still runs, still compares the full 64 hex digits, and still refuses on any
+    # mismatch.
+    #
+    # ★ THE REDIRECT IS PART OF THE TRANSPORT, AND VALIDATING THE URL DOES NOT
+    # CONSTRAIN IT.  `validate_url` and `is_safe_url` only ever see the value the
+    # caller supplied, so they establish that the FIRST request is https.  Both
+    # tools follow redirects by default, and a 30x answer names the next URL --
+    # so an https:// input could be answered with `Location: http://...` and the
+    # 65 MiB would arrive in clear text, over a hop nothing in this script had
+    # looked at.  The pinned SHA-256 would still detect tampering, which is
+    # exactly the point worth being precise about: DETECTION AFTER THE FACT IS
+    # NOT THE SAME AS NOT ACCEPTING THE DOWNGRADE.  A cleartext transfer is
+    # observable and modifiable in flight whatever is checked afterwards, and a
+    # fetch that has to be re-run because it was intercepted is a worse outcome
+    # than one that refuses the hop.
+    #
+    # So the protocol restriction is stated to the tool, which is the only thing
+    # that sees the redirect chain:
+    #
+    #   curl  --proto '=https' limits the protocols curl will use at all, and
+    #         --proto-redir '=https' limits those it will follow a redirect TO.
+    #         Both are needed: the first does not govern redirect targets.
+    #         Measured: with a 302 to an http URL, curl 8.14 refuses with
+    #         `Protocol "http" disabled (in redirect)' and writes no file.
+    #   wget  is the fallback, and it CANNOT express "follow only https
+    #         redirects" for a single download.  --https-only is passed and is
+    #         worth passing -- it constrains the URL scheme and any recursive
+    #         retrieval -- but measured against the same 302, GNU wget 1.25
+    #         followed the downgrade and saved the cleartext body anyway,
+    #         because that option governs recursive-mode link following.  So the
+    #         redirect is refused OUTRIGHT here with --max-redirect=0: under
+    #         wget this script does not follow redirects at all, rather than
+    #         following one it has not been able to constrain.  The upstream
+    #         archive answers 200 with no redirect (verified), so this costs the
+    #         documented path nothing; a mirror that does redirect is handled by
+    #         passing the final https URL in ZLIB_RS_SILESIA_URL, or by
+    #         installing curl, which `probe_tools` already prefers.
     case "$downloader" in
         curl)
-            curl -fSL --retry 3 -o "$1" -- "$ZLIB_RS_SILESIA_URL" ||
-                die "download failed: $ZLIB_RS_SILESIA_URL"
+            curl -fSL --proto '=https' --proto-redir '=https' --retry 3 \
+                 --max-filesize "$max_archive_bytes" \
+                 -o "$1" -- "$ZLIB_RS_SILESIA_URL" ||
+                die "download failed: $ZLIB_RS_SILESIA_URL
+       curl was restricted to https for both the request and any redirect it
+       was asked to follow (--proto '=https' --proto-redir '=https').  A
+       redirect to plain http is refused here rather than accepted and
+       checksummed afterwards, so if the archive has moved to an http host,
+       find an https URL for it and pass it in ZLIB_RS_SILESIA_URL.
+
+       It was also held to the ${max_archive_bytes}-byte transfer ceiling from
+       ${bounds_source}.  A larger archive is not the corpus this repository
+       approved; if upstream legitimately grew, re-pin ${PIN_NAME} rather than
+       raising the ceiling on its own."
             ;;
         wget)
-            wget -O "$1" -- "$ZLIB_RS_SILESIA_URL" ||
-                die "download failed: $ZLIB_RS_SILESIA_URL"
+            wget --https-only --max-redirect=0 --quota="$max_archive_bytes" \
+                 -O "$1" -- "$ZLIB_RS_SILESIA_URL" ||
+                die "download failed: $ZLIB_RS_SILESIA_URL
+       wget was restricted to https and to NO redirects at all
+       (--https-only --max-redirect=0), because wget cannot be told to follow
+       only https redirects for a single download -- so a redirect it could not
+       constrain is refused instead of followed.  If the answer was a redirect,
+       resolve it yourself and pass the final https URL:
+           ZLIB_RS_SILESIA_URL=<final https url> $0 --sha256 <digest>
+       or install curl, which this script prefers and which can restrict the
+       redirect chain itself.
+
+       It was also held to the ${max_archive_bytes}-byte transfer ceiling from
+       ${bounds_source}.  See ${PIN_NAME}."
             ;;
         *)
             die "internal error: no downloader selected"
@@ -1074,6 +1564,39 @@ download_archive() {
         die "the download produced an empty file; check the URL:
        $ZLIB_RS_SILESIA_URL"
     fi
+
+    # ★ And again on what actually landed, because `--quota` is advisory in one
+    # documented case: wget applies it between files rather than mid-file, so a
+    # single oversized file can exceed it.  Checking the result closes that gap for
+    # both tools with one test, and it runs before the digest so an oversized
+    # download is refused without hashing it.
+    _got=$(file_size "$1")
+    if [ -n "$_got" ] && [ "$_got" -gt "$max_archive_bytes" ]; then
+        rm -f "$1"
+        die "the download is ${_got} bytes, above the ${max_archive_bytes}-byte
+       ceiling from ${bounds_source}; it has been deleted and nothing was
+       extracted.  See ${PIN_NAME}."
+    fi
+    info "  received ${_got} bytes"
+}
+
+# The size of file $1 in bytes, or the empty string if it cannot be determined.
+#
+# `stat` is not POSIX and its two dialects take different flags, so both are tried
+# and `wc -c` is the fallback that works everywhere. Returning empty rather than
+# guessing keeps every caller's bound check explicit about the unknown case: a
+# ceiling that silently passes because the size could not be read is worse than one
+# that says so.
+file_size() {
+    if have stat; then
+        stat -c '%s' "$1" 2>/dev/null && return 0
+        stat -f '%z' "$1" 2>/dev/null && return 0
+    fi
+    if have wc; then
+        wc -c < "$1" 2>/dev/null | tr -d ' \t'
+        return 0
+    fi
+    printf ''
 }
 
 verify_archive() {
@@ -1378,7 +1901,121 @@ MEMBER_NAMES
 $_member_modes
 MEMBER_MODES
 
+    # ★ THE ARCHIVE-METADATA CEILINGS, all four, from the archive's own headers and
+    # before a single byte is extracted.
+    #
+    # This is the CWE-400 half of this function, and it is separate from the path
+    # checks above because it answers a different question: those ask "could a member
+    # escape?", this asks "how much disk can this archive consume if I let it?". The
+    # answer has to be computed from what the archive DECLARES, because by the time an
+    # extraction has told you the truth it has already used the disk.
+    #
+    # The count bound uses the tally the loop above already produced. The size bounds
+    # come from `member_sizes`, which reads the same listings.
+    if [ "$_member_count" -gt "$max_member_count" ]; then
+        die "the archive declares $_member_count members, above the ceiling of
+       $max_member_count from ${bounds_source}.  The approved corpus has
+       twelve.  Nothing has been extracted.  See ${PIN_NAME}."
+    fi
+
+    assert_declared_sizes_are_bounded "$_archive"
+
     info "  ok: $_member_count members, every path relative and contained"
+    info "  ok: declared expanded size ${_declared_total} bytes, within \
+${max_expanded_bytes}"
+}
+
+# ★ Bound the archive's DECLARED expanded size, per member and in total.
+#
+# Sets `_declared_total`. Reads the uncompressed size out of the verbose listing both
+# unpackers already produce, so it costs no extra pass over the archive and no
+# extraction.
+#
+# Three separate bounds, because each catches something the others do not:
+#
+#   * per-member, so one member claiming 400 MiB inside a total that happens to add
+#     up is still refused;
+#   * total, so a thousand small members are refused as surely as one big one;
+#   * ratio of declared expansion to bytes actually downloaded, which is the bound
+#     that catches a zip bomb whose per-member and total figures are individually
+#     believable but whose expansion factor is not. The approved corpus expands 3.11x;
+#     the ceiling is generous at 20x and still refuses the classic bomb, which
+#     expands by six or more orders of magnitude.
+#
+# A listing this function cannot parse is NOT treated as a pass. The sizes are
+# refused as unreadable and the run stops: a ceiling that silently does not apply is
+# the failure mode this whole function exists to remove.
+assert_declared_sizes_are_bounded() {
+    _declared_total=0
+    _declared_max=0
+    _sized=0
+
+    case "$unpacker" in
+        # `unzip -Z1 -l` is not a listing this can use; the plain `unzip -Z` form
+        # already in `_member_modes` puts the uncompressed size in field 4 of a
+        # `ls -l`-shaped line. `unzip -l` puts it in field 1, which is easier to
+        # parse and is what is used here.
+        unzip) _size_listing=$(unzip -l "$_archive") || listing_failed 'unzip -l' ;;
+        bsdtar) _size_listing=$_member_modes ;;
+        *) die "internal error: no unpacker selected" ;;
+    esac
+
+    while IFS= read -r _line; do
+        case "$unpacker" in
+            unzip)
+                # Data lines begin with whitespace then the size; the header, the
+                # separator rules and the trailing total do not match this shape.
+                _size=$(printf '%s\n' "$_line" |
+                    sed -n 's/^ *\([0-9][0-9]*\)  *[0-9][0-9-]*-[0-9][0-9-]*.*$/\1/p')
+                ;;
+            bsdtar)
+                # `bsdtar -tvf` is `ls -l`-shaped: mode, links, owner, group, size.
+                _size=$(printf '%s\n' "$_line" |
+                    sed -n 's/^[-dhl][rwxsStT-]*  *[0-9]*  *[^ ][^ ]*  *[^ ][^ ]*  *\([0-9][0-9]*\).*$/\1/p')
+                ;;
+        esac
+        if [ -z "$_size" ]; then
+            continue
+        fi
+        _sized=$((_sized + 1))
+        if [ "$_size" -gt "$max_member_bytes" ]; then
+            die "the archive declares a $_size-byte member, above the per-member
+       ceiling of $max_member_bytes bytes from ${bounds_source}.  Nothing has
+       been extracted.  See ${PIN_NAME}."
+        fi
+        if [ "$_size" -gt "$_declared_max" ]; then
+            _declared_max=$_size
+        fi
+        _declared_total=$((_declared_total + _size))
+        if [ "$_declared_total" -gt "$max_expanded_bytes" ]; then
+            die "the archive declares at least $_declared_total expanded bytes,
+       above the ceiling of $max_expanded_bytes from ${bounds_source}.
+       Nothing has been extracted.  See ${PIN_NAME}."
+        fi
+    done <<SIZE_LISTING
+$_size_listing
+SIZE_LISTING
+
+    if [ "$_sized" -eq 0 ]; then
+        die "no member size could be read from the $unpacker listing, so the
+       expanded-size ceiling could not be applied.  This is refused rather
+       than skipped: an unenforced ceiling is worse than none, because the
+       caller believes it applied.  Report the listing format."
+    fi
+
+    # The expansion-ratio bound. Integer arithmetic throughout -- there is no float
+    # in POSIX shell and none is wanted here -- so the comparison is
+    # declared > downloaded * ratio rather than a division.
+    _archive_bytes=$(file_size "$_archive")
+    if [ -n "$_archive_bytes" ] && [ "$_archive_bytes" -gt 0 ]; then
+        if [ "$_declared_total" -gt \
+            "$((_archive_bytes * SILESIA_MAX_EXPANSION_RATIO))" ]; then
+            die "the archive is $_archive_bytes bytes and declares
+       $_declared_total expanded bytes, an expansion of more than
+       ${SILESIA_MAX_EXPANSION_RATIO}x.  The approved corpus expands about
+       3.1x.  Nothing has been extracted."
+        fi
+    fi
 }
 
 # Refuse the extracted tree unless it is only regular files and directories.
@@ -1458,8 +2095,13 @@ member_inventory_matches() {
 }
 
 verify_member_inventory() {
+    # Silent on the opt-out path on purpose: `main` warns about it once, at the
+    # entry point, so that the paths which never reach this function -- the
+    # idempotent short-circuit and --verify-only, both of which decide through
+    # `member_inventory_matches` -- are covered by the same one warning rather
+    # than by none.  Warning again here would only make it twice for the fetch
+    # path and still nothing for those two.
     if [ "$ZLIB_RS_SILESIA_MEMBERS" = '-' ]; then
-        warn "inventory check skipped by request (ZLIB_RS_SILESIA_MEMBERS=-)"
         return 0
     fi
 
@@ -1492,19 +2134,36 @@ verify_member_inventory() {
         tr -d ' ') expected members are present and nothing else is"
 }
 
-# Verify each extracted member against a digest manifest, when one is supplied.
+# Verify each member of the tree at $1 against a digest manifest.
 #
-# This is the check that upgrades the archive digest from "these bytes arrived
-# intact" to "these bytes are the corpus somebody I trust described".  It is
-# optional because this repository cannot ship digests it has no authenticated
-# source for -- see the CHECKSUM POLICY block -- but when a manifest IS available
-# it is strictly better than the archive digest alone, because it survives
-# upstream repackaging the archive.
+# This is the check that upgrades "these bytes arrived intact" to "these bytes
+# are the corpus somebody I trust described".  On a FETCH it is optional and
+# supplementary: the archive was hashed against a pinned digest moments earlier,
+# so the members are already established, and a manifest merely adds evidence
+# that survives upstream repackaging the archive.  On --verify-only it is the
+# ONLY byte evidence obtainable at all -- the archive is not retained, so its
+# digest can never be recomputed -- which is why that mode requires it.
 #
 # ZLIB_RS_SILESIA_MEMBER_SHA256 names a file in `sha256sum` format
 # ("<64 hex>  <name>", two spaces).  Only the basename of each entry is used, so
-# a manifest written against a different directory layout still applies.
+# a manifest written against a different directory layout still applies.  A value
+# of `-` is the deliberate, visible waiver, spelled the same way as the one
+# ZLIB_RS_SILESIA_MEMBERS accepts.
+#
+# $2, when it is the word `complete', additionally requires the manifest to cover
+# every member of the expected inventory.  Callers pass it when this check is the
+# only one standing: a manifest listing one of the twelve authenticates one of
+# the twelve, and reporting that as "verified" would be the same overstatement
+# this function exists to remove.  A fetch does not pass it, because there the
+# archive digest already covers everything the manifest does not.
 verify_member_digests() {
+    if [ "$ZLIB_RS_SILESIA_MEMBER_SHA256" = '-' ]; then
+        warn "per-member digest check waived by request"
+        warn "(ZLIB_RS_SILESIA_MEMBER_SHA256=-), so nothing below is a statement"
+        warn "about the corpus BYTES"
+        return 0
+    fi
+
     if [ -z "$ZLIB_RS_SILESIA_MEMBER_SHA256" ]; then
         return 0
     fi
@@ -1514,7 +2173,17 @@ verify_member_digests() {
         die "ZLIB_RS_SILESIA_MEMBER_SHA256 does not name a readable file:
        '$_manifest'"
 
+    # --verify-only reaches this without having probed for a downloader or an
+    # extractor it will never use, so the one tool this needs is probed here.
+    probe_digest_tool
+
     info "Checking per-member digests against $_manifest"
+
+    # Counted, and the names collected, so that "ok" cannot be printed over a
+    # manifest that authenticated nothing.  An empty file, or one holding only
+    # comments, used to reach the closing `info' unchallenged.
+    _checked=0
+    _checked_names=''
 
     while IFS= read -r _line; do
         case "$_line" in
@@ -1532,17 +2201,62 @@ verify_member_digests() {
 
         _path=$(find "$1" -type f -name "$_entry" -print | head -n 1)
         [ -n "$_path" ] ||
-            die "$_manifest lists '$_entry', which the archive did not contain"
+            die "$_manifest lists '$_entry', which
+         $1
+       does not contain"
 
         compute_digest "$(dirname "$_path")" "$(basename "$_path")"
         if [ "$computed_sha256" != "$(lowercase "$_want")" ]; then
             die "member '$_entry' does not match $_manifest
          expected: $(lowercase "$_want")
-         actual:   $computed_sha256"
+         actual:   $computed_sha256
+       These are not the bytes the manifest describes.  Do not measure with
+       them: replace the corpus with --force, or find out why they differ."
         fi
+
+        _checked=$((_checked + 1))
+        _checked_names="$_checked_names$_entry
+"
     done < "$_manifest"
 
-    info "  ok: every member listed in the manifest matches"
+    if [ "$_checked" -eq 0 ]; then
+        die "$_manifest lists no digests at all (every line is blank or a
+       comment), so it authenticates nothing.  A manifest that cannot fail is
+       not a check: supply the real one, or set
+       ZLIB_RS_SILESIA_MEMBER_SHA256=- to waive this deliberately."
+    fi
+
+    # Coverage, when the caller says this check stands alone.  Compared name by
+    # name rather than by count, so a manifest listing `dickens' twice cannot
+    # stand in for a manifest listing `dickens' and `mozilla'.
+    if [ "${2-}" = complete ] && [ "$ZLIB_RS_SILESIA_MEMBERS" != '-' ]; then
+        _missing=''
+        # Unquoted on purpose: the variable is a space-separated list and word
+        # splitting is how a `for' reads one.  No suppression is needed here,
+        # unlike the `printf' uses of the same variable elsewhere, because
+        # ShellCheck does not object to splitting in this position.
+        for _member in $ZLIB_RS_SILESIA_MEMBERS; do
+            case "
+$_checked_names" in
+                *"
+$_member
+"*) ;;
+                *) _missing="$_missing $_member" ;;
+            esac
+        done
+
+        if [ -n "$_missing" ]; then
+            die "$_manifest does not cover the whole expected inventory, and here
+       it is the only evidence about the corpus bytes, so a partial manifest
+       would report more than it checked.
+         unlisted:$_missing
+       Either extend the manifest to every member named by
+       ZLIB_RS_SILESIA_MEMBERS, or waive the check deliberately with
+       ZLIB_RS_SILESIA_MEMBER_SHA256=-."
+        fi
+    fi
+
+    info "  ok: $_checked member(s) match the digests in the manifest"
 }
 
 unpack_archive() {
@@ -1722,6 +2436,20 @@ assert_stamp_matches_expected() {
 # compared both against the stamp.  Supplying a digest is therefore mandatory
 # here too: verifying against nothing is not verification, it is trusting a file
 # that the attacker being defended against could have written.
+#
+# AND THE SAME ARGUMENT APPLIES ONE LEVEL DOWN, WHICH IS WHY A MEMBER MANIFEST IS
+# REQUIRED HERE.  The stamp records the URL and the archive digest of the fetch
+# that produced this directory -- but the stamp is a plain file INSIDE that
+# directory, and so is every corpus member, and so are their names.  Everything
+# compared above therefore comes from the artifact being vouched for, which makes
+# a clean report on a tampered, half-restored or stale directory entirely
+# possible: rewrite a member and the stamp still matches, because the archive
+# those bytes came from is not retained and its digest can never be recomputed
+# here.  The one piece of evidence that can come from outside is a per-member
+# digest manifest, so this mode demands one -- or an explicit `-' waiver, which
+# is recorded in the report so that a weaker check is never mistaken for the
+# stronger one.  A fetch needs no manifest: it hashes the archive it actually
+# downloaded against a pinned digest before unpacking a byte of it.
 verify_only() {
     # Idempotent, and `main` has already done it: repeated here so the ordering
     # guarantee belongs to this function rather than to its caller.
@@ -1754,6 +2482,23 @@ verify_only() {
     # only, so this stays a mode that writes nothing and reaches no network.
     verify_member_inventory "$destination" installed
 
+    # Demanded before anything is reported, so that the refusal names the missing
+    # input rather than arriving after a page of reassuring output.
+    if [ -z "$ZLIB_RS_SILESIA_MEMBER_SHA256" ]; then
+        die "--verify-only cannot say anything about the corpus BYTES without
+       ZLIB_RS_SILESIA_MEMBER_SHA256, and everything else it can check --
+       the stamp, the file names, the inventory -- lives inside the very
+       directory it is being asked to vouch for.  The archive is not retained
+       after a fetch, so its digest cannot be recomputed here either.  So:
+         * point ZLIB_RS_SILESIA_MEMBER_SHA256 at a sha256sum-format manifest
+           covering every member, which is the check that authenticates them
+           against evidence from outside this directory; or
+         * set ZLIB_RS_SILESIA_MEMBER_SHA256=- to accept a stamp-and-inventory
+           report as a deliberate, visible choice.
+       A fetch needs neither: it verifies the archive it downloaded against
+       the expected digest before unpacking it."
+    fi
+
     report_existing
     info "  stamp:   well formed, and the payload is the complete pinned inventory"
 
@@ -1761,16 +2506,98 @@ verify_only() {
     info "  archive: matches the expected URL"
     info "  digest:  matches the expected archive digest"
 
-    # Said plainly rather than implied: the archive is not kept after a fetch, so
-    # this confirms the recorded fetch and the completeness of its inventory, not
-    # the bytes of the individual corpus files.
-    info "Verified.  Note that the archive is not retained after a fetch, so"
-    info "this checks the recorded fetch and the inventory rather than"
-    info "re-hashing the corpus."
+    # The bytes.  `complete' because here this is the only evidence there is, so
+    # a manifest covering part of the inventory must not report as if it covered
+    # all of it.
+    verify_member_digests "$destination" complete
+
+    # Said plainly rather than implied, and said differently in the two cases,
+    # because the difference between them is the whole point of the requirement
+    # above.
+    if [ "$ZLIB_RS_SILESIA_MEMBER_SHA256" = '-' ]; then
+        info "Verified AS FAR AS THE STAMP GOES.  The archive is not retained"
+        info "after a fetch, and the per-member digest check was waived, so this"
+        info "confirms the recorded fetch and the inventory -- both read from"
+        info "inside this directory -- and nothing about the corpus bytes."
+    else
+        info "Verified, bytes included.  The archive is not retained after a"
+        info "fetch, so its digest was not recomputed; every member was hashed"
+        info "and matched against the manifest instead, which is evidence from"
+        info "outside this directory."
+    fi
+}
+
+# ★ Report the pin and the ceilings, and exit.  Reads nothing else and writes nothing.
+#
+# The output is `key=value` on stdout, one per line, deliberately the same shape as
+# the pin file itself, so that `.github/workflows/rust.yml` can read it with `grep`
+# and a shell can read it with `eval`-free `read`. Anything advisory goes to stderr
+# through `info`, so stdout stays machine-readable.
+#
+# `armed=yes|no` is the field CI acts on: it says whether this repository carries an
+# approved corpus identity at all. That is the difference between "the acceptance
+# measurement was not taken" and "the acceptance measurement cannot be taken here",
+# and before the pin file existed there was no way to tell them apart.
+pin_status() {
+    if load_pin; then
+        resolve_bounds
+        printf 'armed=yes\n'
+        printf 'pin=%s\n' "$pin_path"
+        printf 'url=%s\n' "$pin_url"
+        printf 'sha256=%s\n' "$pin_sha256"
+        printf 'archive_bytes=%s\n' "$pin_archive_bytes"
+        printf 'member_count=%s\n' "$pin_member_count"
+        printf 'expanded_bytes=%s\n' "$pin_expanded_bytes"
+        printf 'max_member_bytes=%s\n' "$pin_max_member_bytes"
+        printf 'compression_ratio=%s\n' "$pin_compression_ratio"
+    else
+        resolve_bounds
+        printf 'armed=no\n'
+        printf 'pin=\n'
+    fi
+    printf 'enforced_archive_bytes=%s\n' "$max_archive_bytes"
+    printf 'enforced_expanded_bytes=%s\n' "$max_expanded_bytes"
+    printf 'enforced_member_bytes=%s\n' "$max_member_bytes"
+    printf 'enforced_member_count=%s\n' "$max_member_count"
+    printf 'bounds_source=%s\n' "$bounds_source"
+
+    if [ -f "${script_dir}/${MANIFEST_NAME}" ]; then
+        printf 'manifest=%s\n' "${script_dir}/${MANIFEST_NAME}"
+    else
+        printf 'manifest=\n'
+    fi
 }
 
 main() {
     parse_arguments "$@"
+
+    # ★ Before anything else, and before the URL is even looked at: --pin-status
+    # answers a question about this repository rather than about a corpus, so it must
+    # not be able to fail on a destination, a tool or a URL.
+    if [ "$opt_pin_status" -eq 1 ]; then
+        pin_status
+        return 0
+    fi
+
+    # The pin supplies tier 3 of the digest chain and all four resource ceilings, so
+    # it is read before `resolve_expected_digest` consults that chain and before any
+    # path that downloads or extracts consults a bound. A missing pin is tolerated
+    # here -- `resolve_expected_digest` will refuse the run if no tier supplied a
+    # digest, and `resolve_bounds` falls back to the built-in ceilings -- so that
+    # `--verify-only` against a pre-provisioned directory keeps working in a fork
+    # that carries no pin.
+    load_pin || true
+    resolve_bounds
+
+    # The committed per-member manifest is the default rather than something a
+    # caller has to remember to point at. An explicit --manifest still wins, and a
+    # fork that deleted the file gets the same behaviour as before: no per-member
+    # check.
+    if [ -z "$ZLIB_RS_SILESIA_MEMBER_SHA256" ] &&
+        [ -f "${script_dir}/${MANIFEST_NAME}" ]; then
+        ZLIB_RS_SILESIA_MEMBER_SHA256="${script_dir}/${MANIFEST_NAME}"
+        info "using the committed per-member manifest ${MANIFEST_NAME}"
+    fi
 
     # The download URL is validated here, before anything else looks at it.
     # ZLIB_RS_SILESIA_URL is caller-supplied and reaches a command line, the
@@ -1781,6 +2608,23 @@ main() {
        acceptable download URL. It must begin with https:// and contain no
        whitespace or control characters.
          value: $ZLIB_RS_SILESIA_URL"
+
+    # THE INVENTORY-BYPASS WARNING BELONGS HERE, ONCE, FOR EVERY MODE.  It used
+    # to live only in `verify_member_inventory`, which three of this script's
+    # paths never reach: `--verify-only` on a stamped directory and the
+    # idempotent "there is nothing to do" short-circuit both decide through
+    # `destination_is_complete`, which consults the quiet predicate
+    # `member_inventory_matches` instead -- and that returns 0 without a word
+    # when the check is opted out.  So a run with the check disabled could report
+    # success having verified nothing about WHICH files are present, while the
+    # documentation promised a warning.  Announcing it at the entry point covers
+    # every path, including the ones that exit before any inventory is examined,
+    # and it is emitted exactly once because nothing downstream repeats it.
+    if [ "$ZLIB_RS_SILESIA_MEMBERS" = '-' ]; then
+        warn "inventory check disabled by request (ZLIB_RS_SILESIA_MEMBERS=-):"
+        warn "  no path in this run will check WHICH files the payload holds, so"
+        warn "  \"complete\" here means stamped and non-empty and nothing more."
+    fi
 
     resolve_destination
 
@@ -1811,6 +2655,12 @@ main() {
                 # digest must both be the ones expected now, or this is some
                 # other corpus and skipping the fetch would be wrong.
                 assert_stamp_matches_expected
+                # And when a manifest is available, the members are hashed on
+                # this path too.  Nothing is downloaded here, so the stamp is
+                # exactly as self-referential as it is under --verify-only; the
+                # manifest is not REQUIRED here only because this invocation is
+                # able to refetch, which --verify-only by definition is not.
+                verify_member_digests "$destination"
                 report_existing
                 info "Already fetched from the expected archive and verified"
                 info "against the expected digest, so there is nothing to do."
@@ -1857,7 +2707,15 @@ main() {
         info "    ZLIB_RS_SILESIA_DIR=$destination \\"
         info "        cargo bench --manifest-path benches/Cargo.toml"
     fi
-    info "Nothing else reads it: no test, no build script, and no CI job."
+    # Precisely, because "no CI job" was written here and is not true.  No
+    # automated path FETCHES this corpus: no test, no build script, and no CI
+    # job.  Reading a corpus provisioned some other way is a different matter --
+    # the benchmark suites read this directory, and the `bench' job of
+    # .github/workflows/rust.yml runs this script against it in --verify-only,
+    # the one mode that neither fetches nor writes.
+    info "No test and no build script reads it, and no automated path fetches"
+    info "it.  The benchmarks read it, and CI asks about a corpus provisioned"
+    info "elsewhere with --verify-only."
 }
 
 main "$@"

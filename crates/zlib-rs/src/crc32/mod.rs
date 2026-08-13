@@ -141,7 +141,7 @@
 //! # Backend selection is a throughput decision only
 //!
 //! [`crc32()`] folds its input through one backend, chosen at build time by the crate's `simd`
-//! feature: `Simd` when it is on, [`Braid`] when it is off. Both are required to return the
+//! feature: `StrideBraid` when it is on, [`Braid`] when it is off. Both are required to return the
 //! *identical* value for every input and every starting value, so the choice can never be
 //! observed in the output -- only in the time taken. [`Generic`] stays reachable as well, so that
 //! the differential suite, the fuzz targets and the benchmarks can pin a computation to the
@@ -150,7 +150,7 @@
 //! Short inputs take the same path they take in C whichever backend is selected, because each
 //! wide backend falls back on its own: [`Braid`] delegates the whole buffer to [`Generic`] below
 //! `N * W + W - 1` bytes -- 47 where `W` is 8, 19 where it is 4 -- reproducing the threshold at
-//! `crc32.c` L640, and `Simd` delegates to [`Braid`] below its own slightly larger threshold.
+//! `crc32.c` L640, and `StrideBraid` delegates to [`Braid`] below its own slightly larger threshold.
 //!
 //! There is no run-time dispatch here, and none is needed: the vectorization-friendly backend is
 //! written in portable safe integer arithmetic with no architecture intrinsic to guard, so a
@@ -161,7 +161,7 @@
 //! a correctness guard.
 //!
 //! Selection is therefore entirely a build-time matter, and precisely: **the Cargo feature `simd`
-//! on this crate is the only thing that compiles the `Simd` backend in.** The `ZLIB_RS_SIMD` environment
+//! on this crate is the only thing that compiles the `StrideBraid` backend in.** The `ZLIB_RS_SIMD` environment
 //! toggle is read once, at build time, by `crates/libz-rs-sys/build.rs`, which republishes it as
 //! `cfg(zlib_rs_simd)` for the *facade* crate -- a build script cannot enable a Cargo feature, so
 //! it does not and cannot map the variable onto `simd`, and nothing under `crates/zlib-rs/src/`
@@ -359,13 +359,13 @@ pub use self::combine::crc32_combine_op;
 /// suite, the fuzz targets and the benchmarks can pin a computation to it and compare.
 pub use self::generic::Generic;
 
-/// The optional throughput-oriented backend -- see [`simd::Simd`].
+/// The optional throughput-oriented backend -- see [`simd::StrideBraid`].
 ///
 /// Present only when the crate's `simd` feature is enabled, and interchangeable with [`Braid`]
 /// and [`Generic`] wherever it is. It contains no architecture intrinsic, so it needs no
 /// support query and no run-time dispatch.
 #[cfg(feature = "simd")]
-pub use self::simd::Simd;
+pub use self::simd::StrideBraid;
 
 /// Word-sized big-endian CRC-32 table -- see [`tables::CRC_BIG_TABLE`].
 ///
@@ -495,9 +495,9 @@ const _: () = {
 
 /// The backend [`crc32`] folds its input through, chosen at build time.
 ///
-/// `Simd` when the crate's `simd` feature is enabled, [`Braid`] otherwise. The alias is private
+/// `StrideBraid` when the crate's `simd` feature is enabled, [`Braid`] otherwise. The alias is private
 /// because it is an implementation detail of dispatch: a caller that needs one *specific* engine
-/// names [`Generic`], [`Braid`] or `Simd` itself and reaches it through [`Crc32Backend`], which is
+/// names [`Generic`], [`Braid`] or `StrideBraid` itself and reaches it through [`Crc32Backend`], which is
 /// what the differential suite, the fuzz targets and the benchmarks do.
 ///
 /// Selection is output-neutral by contract -- see [`Crc32Backend`] -- so this alias can change
@@ -508,7 +508,7 @@ const _: () = {
 /// it cannot enable a Cargo feature, so it verifies that the feature agrees with the request and
 /// fails the build if it does not.
 #[cfg(feature = "simd")]
-type Selected = Simd;
+type Selected = StrideBraid;
 
 /// The backend [`crc32`] folds its input through, chosen at build time.
 ///
@@ -633,7 +633,7 @@ mod tests {
     };
 
     #[cfg(feature = "simd")]
-    use super::Simd;
+    use super::StrideBraid;
 
     /// Smallest input for which the braided path is entered, `crc32.c` L640.
     ///
@@ -1010,9 +1010,9 @@ mod tests {
 
                 #[cfg(feature = "simd")]
                 assert_eq!(
-                    through::<Simd>(start, buf),
+                    through::<StrideBraid>(start, buf),
                     reference,
-                    "Simd disagrees with Generic at start {start:#010x}, len {len}"
+                    "StrideBraid disagrees with Generic at start {start:#010x}, len {len}"
                 );
 
                 assert_eq!(
@@ -1035,8 +1035,8 @@ mod tests {
 
         #[cfg(feature = "simd")]
         {
-            assert_eq!(Simd::NAME, "simd");
-            assert_eq!(<Selected as Crc32Backend>::NAME, "simd");
+            assert_eq!(StrideBraid::NAME, "stride-braid");
+            assert_eq!(<Selected as Crc32Backend>::NAME, StrideBraid::NAME);
         }
 
         #[cfg(not(feature = "simd"))]

@@ -300,7 +300,8 @@ fn as_uint(value: i32) -> u32 {
 /// The views are [`VIEW_LEN`] bytes long and no offset used here exceeds
 /// `MAX_MATCH`, so [`None`] is unreachable; it is returned rather than
 /// panicking because a compression library must not abort its caller's process.
-#[inline]
+#[allow(clippy::inline_always)]
+#[inline(always)]
 fn byte_at(view: &[u8], offset: usize) -> Option<u8> {
     view.get(offset).copied()
 }
@@ -328,17 +329,26 @@ fn byte_at(view: &[u8], offset: usize) -> Option<u8> {
 /// `cur_match` and `strstart` are both non-zero whenever the chain head is not
 /// `NIL` — so no reachable input reaches the fallback, and returning [`None`]
 /// rather than panicking honours the no-panic requirement.
-#[inline]
+#[allow(clippy::inline_always)]
+#[inline(always)]
 fn byte_below<W>(window: &Window<W>, base: usize, best_len: i32) -> Option<u8>
 where
     W: AsRef<[u8]> + AsMut<[u8]>,
 {
-    // `base + best_len - 1`, evaluated where the intermediate may legitimately
-    // be negative. `i64` holds every value exactly: `base` is a window offset
-    // below `2 * 32768` and `best_len` is at most `MAX_MATCH`.
-    let base = i64::try_from(base).ok()?;
-    let index = base.checked_add(i64::from(best_len))?.checked_sub(1)?;
-    window.byte(usize::try_from(index).ok()?)
+    // `base + best_len - 1`, in wrapping `usize` arithmetic, which is exact for every
+    // reachable input and correct for the one unreachable one.
+    //
+    // ★ The i64 round trip this replaces was not wrong, it was expensive: two conversions,
+    // two checked operations and a fallible narrowing, once per hash-chain candidate, on the
+    // path C walks with one pointer subtraction. The only value that can make
+    // `base + best_len` less than one is `base == 0 && best_len == 0` -- `best_len` is
+    // non-negative, as the assertion in `search` records -- and that wraps to a colossal
+    // index which `get` refuses, yielding the same `None` the checked form yielded. Every
+    // other input is below `2 * 32768 + 258` and cannot wrap at all.
+    let index = base
+        .wrapping_add(best_len.unsigned_abs() as usize)
+        .wrapping_sub(1);
+    window.byte(index)
 }
 
 /// Sets `match_start` to the longest match starting at the current string and
@@ -530,6 +540,14 @@ where
             break 'search;
         };
 
+        // The whole window, once, so that a candidate's view is a sub-slice of a value the
+        // walk already holds rather than a fresh bounds-checked derivation per candidate; see
+        // the note at the point of use. `window_size()` is the allocation's own length, so
+        // this cannot fail.
+        let Some(whole) = window.region(0, window.window_size()) else {
+            break 'search;
+        };
+
         // `Byte scan_end1 = scan[best_len - 1];` (L1413)
         // `Byte scan_end  = scan[best_len];`     (L1414)
         let Some(best_offset) = as_offset(best_len) else {
@@ -585,7 +603,18 @@ where
             // check and a slice construction for every link of every hash chain, to obtain a value
             // that could not differ. The bytes read are the same bytes.
             let scan = scan_init;
-            let Some(mat) = window.region(candidate, VIEW_LEN) else {
+            // ★ The candidate's view comes out of the ONE window view taken before the walk,
+            // not from a fresh `region` call per candidate. `region` costs a checked addition
+            // and a range check to build a slice whose bounds are already implied: the walk
+            // only runs when `scan_init` succeeded, which establishes
+            // `strstart + VIEW_LEN <= window.len()`, and every candidate satisfies
+            // `candidate < strstart` (the `Assert(cur_match < s->strstart, "no future")` of
+            // L1435, and the `limit` test that ends the walk), so
+            // `candidate + VIEW_LEN < strstart + VIEW_LEN <= window.len()` holds for every
+            // candidate the walk can reach. Slicing the whole-window view therefore reads the
+            // same bytes with one range check instead of two, and the `None` arm below is the
+            // same unreachable arm it was before.
+            let Some(mat) = whole.get(candidate..).and_then(|tail| tail.get(..VIEW_LEN)) else {
                 break 'chain;
             };
 

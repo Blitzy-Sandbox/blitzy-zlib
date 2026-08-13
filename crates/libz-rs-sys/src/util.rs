@@ -600,7 +600,8 @@ const SPRINTF_RETURNS_VOID_BIT: uLong = 0;
 /// requires bit 27 clear to mean both names are present in `libz.a` **and** in the
 /// packaged `libz.so.<ZLIB_VERSION>` (and bit 27 set to mean both are absent), and
 /// `cargo_cdylib_matches_its_measured_shape` pins the development artifact's deviation
-/// so it cannot widen unnoticed. Anyone tempted to "fix" the bit for the `cdylib` should
+/// so it cannot widen unnoticed -- measured, that deviation is now exactly these two
+/// names: the cdylib exports 93 of the 95 contract functions and no internal helper. Anyone tempted to "fix" the bit for the `cdylib` should
 /// read those two first: clearing it there would misdescribe the static and packaged
 /// libraries, which are the ones a consumer installs.
 ///
