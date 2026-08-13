@@ -98,45 +98,17 @@ if(ZLIB_BUILD_RUST)
     endif(NOT EXISTS "${ZLIB_CARGO_EXECUTABLE}" OR IS_DIRECTORY
                                                    "${ZLIB_CARGO_EXECUTABLE}")
 
-    execute_process(
-        COMMAND ${ZLIB_CARGO_EXECUTABLE} --version
-        RESULT_VARIABLE ZLIB_CARGO_PROBE_RESULT
-        OUTPUT_VARIABLE ZLIB_CARGO_PROBE_STDOUT
-        ERROR_VARIABLE ZLIB_CARGO_PROBE_STDERR)
-
-    if(NOT ZLIB_CARGO_PROBE_RESULT EQUAL 0)
-        message(
-            FATAL_ERROR
-                "ZLIB_CARGO_EXECUTABLE is set to\n"
-                "    ${ZLIB_CARGO_EXECUTABLE}\n"
-                "which exists but could not be run: `--version' failed with "
-                "${ZLIB_CARGO_PROBE_RESULT}.\n"
-                "${ZLIB_CARGO_PROBE_STDERR}"
-                "It has to be a cargo this machine can execute, not merely a "
-                "file of that name.\n"
-                "Leave it unset to have PATH searched, or name a working "
-                "cargo:\n"
-                "    cmake -S . -B build -DZLIB_BUILD_RUST=ON "
-                "-DZLIB_CARGO_EXECUTABLE=/opt/rust/bin/cargo\n"
-                "Configuring with -DZLIB_BUILD_RUST=OFF (the default) builds "
-                "the C library and needs no cargo.")
-    endif(NOT ZLIB_CARGO_PROBE_RESULT EQUAL 0)
-
-    string(STRIP "${ZLIB_CARGO_PROBE_STDOUT}" ZLIB_CARGO_VERSION_LINE)
-    message(STATUS "Rust build: ${ZLIB_CARGO_EXECUTABLE} "
-                   "(${ZLIB_CARGO_VERSION_LINE})")
-
-    if(IS_DIRECTORY "${ZLIB_CARGO_EXECUTABLE}")
-        message(
-            FATAL_ERROR
-                "ZLIB_CARGO_EXECUTABLE names the DIRECTORY\n"
-                "    ${ZLIB_CARGO_EXECUTABLE}\n"
-                "It has to be the cargo executable itself. Append the "
-                "executable name:\n"
-                "    -DZLIB_CARGO_EXECUTABLE=${ZLIB_CARGO_EXECUTABLE}/cargo")
-    endif(IS_DIRECTORY "${ZLIB_CARGO_EXECUTABLE}")
-
-    # ★ RUN IT, do not merely find it. `EXISTS` answers "there is a file with that
+    # ★ ONE PROBE, and there used to be two. This block was preceded by an
+    # identical `--version` execute_process with its own FATAL_ERROR and its own
+    # STATUS line, and between the two sat a standalone `if(IS_DIRECTORY ...)`
+    # check that could never fire: the guard above already rejects a directory at
+    # the EXISTS stage, and even without it the first probe would have failed
+    # first, because a directory cannot be executed. So the file ran cargo twice to
+    # answer one question and carried an unreachable branch whose message a reader
+    # would reasonably assume was doing something. Both are gone; this is the
+    # single validation path, and it is the one that was already documented.
+    #
+    # RUN IT, do not merely find it. `EXISTS` answers "there is a file with that
     # name", which a directory, a text file, a broken script and a binary for the
     # wrong architecture all satisfy -- and each of them configures successfully and
     # then fails in the middle of a build with a command line instead of an
@@ -342,6 +314,38 @@ if(ZLIB_BUILD_RUST)
                 "pass -DCMAKE_OBJCOPY=/path/to/objcopy, or configure with "
                 "-DZLIB_BUILD_SHARED=OFF to stage only the static library.")
     endif(ZLIB_BUILD_SHARED AND NOT CMAKE_OBJCOPY)
+
+    # The two host tools the artifact-inventory gate needs, and they are hard
+    # requirements of the shared Rust path for the same reason objcopy above is:
+    # this path relinks a Rust staticlib, that archive carries members of the
+    # precompiled std sysroot, and those members appear in no lock file -- so
+    # cargo-deny cannot see them and only the finished artifact can be asked what
+    # it contains.  Measured before the demand-driven selection below replaced
+    # --whole-archive: the packaged library held miniz_oxide and adler2, an
+    # entire second DEFLATE decoder, which deny.toml bans by name.  A packaging
+    # path that cannot run its own audit is how that shipped, so a missing
+    # interpreter is a configure error here rather than a skipped step.
+    find_program(ZLIB_RUST_PYTHON_EXECUTABLE NAMES python3 python)
+
+    if(ZLIB_BUILD_SHARED AND NOT ZLIB_RUST_PYTHON_EXECUTABLE)
+        message(
+            FATAL_ERROR
+                "ZLIB_BUILD_RUST audits the packaged shared library with "
+                ".github/scripts/artifact_inventory_gate.py and CMake found no "
+                "Python 3 to run it.  Install python3, pass "
+                "-DZLIB_RUST_PYTHON_EXECUTABLE=/path/to/python3, or configure "
+                "with -DZLIB_BUILD_SHARED=OFF to stage only the static "
+                "library.")
+    endif(ZLIB_BUILD_SHARED AND NOT ZLIB_RUST_PYTHON_EXECUTABLE)
+
+    if(ZLIB_BUILD_SHARED AND NOT CMAKE_NM)
+        message(
+            FATAL_ERROR
+                "ZLIB_BUILD_RUST audits the packaged shared library's symbol "
+                "table and CMake found no nm for this toolchain.  Install "
+                "binutils, pass -DCMAKE_NM=/path/to/nm, or configure with "
+                "-DZLIB_BUILD_SHARED=OFF to stage only the static library.")
+    endif(ZLIB_BUILD_SHARED AND NOT CMAKE_NM)
 
     # ZLIB_RS_SIMD=0|1 is the build-time toggle the port documents for the
     # alternative checksum backends -- portable integer code shaped so that LLVM
@@ -1151,6 +1155,21 @@ endif(NOT zlib_rust_cargo_status EQUAL 0)
 
     list(REMOVE_DUPLICATES ZLIB_RUST_PUBLIC_SYMBOLS)
     list(SORT ZLIB_RUST_PUBLIC_SYMBOLS)
+
+    # The same set again, as the linker flags that make member selection
+    # demand-driven.  See the relink command below for why that replaced
+    # --whole-archive; the short version is that "every member" meant every
+    # member of std as well, and the artifact carried a second DEFLATE decoder
+    # and 183 dynamic imports -- posix_spawnp, execvp, socket, chroot, setuid
+    # among them -- that a compression library has no use for.  Naming what is
+    # wanted pulls each export's member and, transitively, only what those
+    # members need.
+    set(ZLIB_RUST_NEEDED_SYMBOL_FLAGS "")
+
+    foreach(symbol IN LISTS ZLIB_RUST_PUBLIC_SYMBOLS)
+        list(APPEND ZLIB_RUST_NEEDED_SYMBOL_FLAGS -Wl,-u,${symbol})
+    endforeach(symbol IN LISTS ZLIB_RUST_PUBLIC_SYMBOLS)
+
     set(ZLIB_RUST_SYMBOL_FILE ${zlib_BINARY_DIR}/zlib-rust-public.syms)
     string(REPLACE ";" "\n" ZLIB_RUST_SYMBOL_TEXT "${ZLIB_RUST_PUBLIC_SYMBOLS}")
     file(WRITE ${ZLIB_RUST_SYMBOL_FILE}.in "${ZLIB_RUST_SYMBOL_TEXT}\n")
@@ -1282,17 +1301,38 @@ endif(NOT zlib_rust_cargo_status EQUAL 0)
 
     if(ZLIB_BUILD_SHARED)
         # Step two: turn that archive into an installable shared library.
-        # --whole-archive is required because a shared library pulls nothing out
-        # of an archive unless something already references it, so without it
-        # the result would be empty.  objcopy then localises everything outside
-        # the published set -- measured: it is what keeps the Rust runtime's
+        #
+        # A shared library pulls nothing out of an archive unless something
+        # already references it, so the selection has to be stated.  ★ IT IS
+        # STATED AS DEMAND -- one -Wl,-u, per published name, assembled into
+        # ZLIB_RUST_NEEDED_SYMBOL_FLAGS above -- AND NOT AS --whole-archive,
+        # WHICH IS WHAT THIS USED TO PASS.  "Every member" included every member
+        # of std, and the artifact that produced carried a whole second DEFLATE
+        # decoder (miniz_oxide, with adler2) and imported 183 dynamic symbols,
+        # posix_spawnp, execvp, fork, socket, connect, chroot, setuid, dlsym and
+        # getrandom among them.  None of that is reachable from zlib's API and
+        # all of it is surface a distribution's auditors must account for.
+        # Naming the exports instead pulls each one's member and, transitively,
+        # only what those members need: measured here as 4 577 152 bytes against
+        # 6 537 144, with 54 imports instead of 183, and with the export set and
+        # the sixteen version nodes unchanged.
+        #
+        # --gc-sections on the final link then drops what selection kept but
+        # nothing reaches, and it doubles as the reachability proof the artifact
+        # inventory relies on: what survives it is referenced from an exported
+        # entry point.  Makefile.in performs the identical two steps and
+        # tolerates a linker that rejects --gc-sections by relinking without it;
+        # here the flag is passed unconditionally, because this path already
+        # requires a GNU-compatible ld for --version-script.
+        #
+        # objcopy between the two steps localises everything outside the
+        # published set -- measured: it is what keeps the Rust runtime's
         # rust_eh_personality out of the dynamic table -- and drops the debug
-        # sections --whole-archive just pulled in, for the reasons set out where
-        # ZLIB_RUST_STRIP_DEBUG is decided; both are done in the one pass over
-        # the object.  The final link applies the same SONAME and the same
-        # zlib.map the C shared target above receives.  The intermediate object
-        # is large and of no further use, so it is removed rather than left
-        # behind.
+        # sections in the same pass, for the reasons set out where
+        # ZLIB_RUST_STRIP_DEBUG is decided.  The final link applies the same
+        # SONAME and the same zlib.map the C shared target above receives.  The
+        # intermediate object is large and of no further use, so it is removed
+        # rather than left behind.
         #
         # ★ THE NATIVE LIBRARY SET IS ON THE FINAL LINK LINE, last, in the order
         # rustc printed it.  What is being linked is a whole Rust staticlib, whose
@@ -1311,21 +1351,35 @@ endif(NOT zlib_rust_cargo_status EQUAL 0)
             OUTPUT ${ZLIB_RUST_LIBRARY}
             COMMAND
                 ${CMAKE_C_COMPILER} ${ZLIB_RUST_CC_FLAGS} -r -nostdlib -o
-                ${ZLIB_RUST_DROPIN_DIR}/libz-whole.o -Wl,--whole-archive
-                ${ZLIB_RUST_ARCHIVE} -Wl,--no-whole-archive
+                ${ZLIB_RUST_DROPIN_DIR}/libz-whole.o
+                ${ZLIB_RUST_NEEDED_SYMBOL_FLAGS} ${ZLIB_RUST_ARCHIVE}
             COMMAND
                 ${CMAKE_OBJCOPY} --keep-global-symbols=${ZLIB_RUST_SYMBOL_FILE}
                 ${ZLIB_RUST_STRIP_DEBUG} ${ZLIB_RUST_DROPIN_DIR}/libz-whole.o
             COMMAND
                 ${CMAKE_C_COMPILER} ${ZLIB_RUST_CC_FLAGS} ${ZLIB_RUST_LD_FLAGS}
                 -shared -fPIC -Wl,-soname,${ZLIB_RUST_SONAME}
-                -Wl,--version-script=${zlib_SOURCE_DIR}/zlib.map -o
+                -Wl,--version-script=${zlib_SOURCE_DIR}/zlib.map
+                -Wl,--gc-sections -o
                 ${ZLIB_RUST_LIBRARY} ${ZLIB_RUST_DROPIN_DIR}/libz-whole.o
                 ${ZLIB_RUST_NATIVE_STATIC_LIBS_LIST}
             COMMAND ${CMAKE_COMMAND} -E remove -f
                     ${ZLIB_RUST_DROPIN_DIR}/libz-whole.o
+            # The audit, on the finished library and as part of producing it, so
+            # that a build cannot yield an artifact nobody looked inside.  It
+            # fails the build on an undeclared crate or on a forbidden dynamic
+            # import; see the script's own head for what those are and why.  It
+            # runs here rather than in a test target because the C-consumption
+            # fixtures under test/ configure this file again and install what it
+            # stages, so an audit that only ran under ctest would be skipped by
+            # exactly the paths that hand the library to someone else.
+            COMMAND
+                ${ZLIB_RUST_PYTHON_EXECUTABLE}
+                ${zlib_SOURCE_DIR}/.github/scripts/artifact_inventory_gate.py
+                --library ${ZLIB_RUST_LIBRARY} --nm ${CMAKE_NM}
             DEPENDS ${ZLIB_RUST_ARCHIVE} ${zlib_SOURCE_DIR}/zlib.map
                     ${ZLIB_RUST_SYMBOL_FILE}
+                    ${zlib_SOURCE_DIR}/.github/scripts/artifact_inventory_gate.py
             COMMENT "Relinking ${ZLIB_RUST_SHARED_LIBV} through zlib.map"
             VERBATIM)
         list(APPEND ZLIB_RUST_ARTIFACTS ${ZLIB_RUST_LIBRARY})

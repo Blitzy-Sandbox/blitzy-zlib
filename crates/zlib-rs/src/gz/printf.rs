@@ -45,14 +45,16 @@
 //! actual C call with actual varargs. So the acceptance evidence for these two functions has to be
 //! a compiled C caller that passes real arguments and checks the bytes written -- not a symbol diff.
 //!
-//! **Resolution: option 1, with the C translation unit kept out of the CARGO build.**
+//! **Resolution: option 1, with exactly one SHIPPED C translation unit and no
+//! `[build-dependencies]`.** (`csrc/` holds two files; the second, `gzvprintf_probe.c`, is a
+//! test-only varargs probe and reaches no artifact.)
 //! `crates/libz-rs-sys/csrc/gzprintf_shim.c` owns nothing but `va_start`/`va_end` and `vsnprintf`,
 //! and calls the two `pub(crate)` adapters in `crates/libz-rs-sys/src/gz.rs` that wrap this module.
-//! It is compiled by the PACKAGING layer -- `Makefile.in`'s `rust` target, which already runs a C
-//! compiler to relink the archive through `zlib.map` -- and never by `build.rs`, so
-//! `cargo build --release` still works on a machine with no C toolchain (AAP §0.6.4.1). That is how
-//! option 1's cost is bounded: the shipped *shared library* carries one C translation unit, and the
-//! Rust build of the crate carries none.
+//! `crates/libz-rs-sys/build.rs` compiles it with the platform C compiler, invoked directly rather
+//! than through a crate, so the AAP's frozen dependency inventory is untouched and §0.6.4.1's rule
+//! that the C *reference sources* are the differential crate's business alone still holds. "Who
+//! compiles the shim" below carries the full account. That is how option 1's cost is bounded: one
+//! translation unit, whose entire content is the two things Rust cannot express.
 //!
 //! What the shim is, precisely: it DEFINES `gzprintf` and `gzvprintf`, so `va_start`/`va_end` stay
 //! the C compiler's business and are correct by construction on every target, and it runs
@@ -70,12 +72,18 @@
 //! the driver passes.
 //!
 //! ONE QUALIFICATION REMAINS, and it is about the artifact rather than the mechanism: a bare
-//! `cargo build` produces a library WITHOUT these two symbols, because nothing in that build
-//! compiles the shim. A caller of `gzprintf` linked against the cargo output gets an undefined
-//! reference. `make rust` is the command that produces the complete library, and
-//! `crates/libz-rs-sys/Cargo.toml` states the same distinction where a reader of the manifest will
-//! meet it.
-
+//! `cargo build` produces a *shared* library WITHOUT these two symbols. The shim is compiled and
+//! archived either way -- `nm --defined-only target/release/libz.a` shows `gzprintf_shim.o`
+//! defining both `gzprintf` and `gzvprintf` -- but rustc's cdylib link retains only what something
+//! reaches, and nothing in Rust calls either name, so the member is dropped and
+//! `nm -D --defined-only --extern-only target/release/libz.so` reports neither. That is the same
+//! demand-driven selection the packaging layer relies on deliberately; here it subtracts, because
+//! the demand for these two comes from a C caller the cdylib link cannot see. A consumer of
+//! `gzprintf` linked against the cargo *cdylib* therefore gets an undefined reference, while one
+//! linked against the cargo *staticlib* resolves it. `make rust` names both symbols in the link and
+//! produces the complete shared library -- measured on the staged artifact:
+//! `gzprintf` and `gzvprintf@@ZLIB_1.2.7.1` are both present. `crates/libz-rs-sys/Cargo.toml`
+//! states the same distinction where a reader of the manifest will meet it.
 //!
 //! What is left behind, and lives here, is the part that actually matters for correctness: the
 //! guard chain, the double-sized input buffer's geometry, the overflow sentinel, and the

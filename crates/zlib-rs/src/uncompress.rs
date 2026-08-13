@@ -124,7 +124,7 @@ use crate::allocate::GlobalAllocator;
 use crate::config::Z_NO_FLUSH;
 use crate::error::ReturnCode;
 use crate::inflate::{inflate, inflate_end, inflate_init, InflateStream};
-use crate::read_buf::{OneShotSource, OutputRegion};
+use crate::read_buf::{OneShotSink, OneShotSource, OutputRegion};
 
 /// The largest number of bytes handed to the decoder in one call.
 ///
@@ -286,21 +286,23 @@ pub fn uncompress2_z_into(dest: &mut OutputRegion<'_>, source: &[u8]) -> Decompr
     uncompress2_z_from(dest, &mut { source })
 }
 
-/// [`uncompress2_z_into`] over an input the caller supplies a window at a time.
+/// [`uncompress2_z_into`] over an input the caller supplies a window at a time and a
+/// destination it supplies a round at a time.
 ///
 /// The body of `uncompr.c` L24-L79 lives here and nowhere else; [`uncompress2_z_into`] is the
-/// slice-shaped front for it. See [`OneShotSource`] for the one caller that needs the other
-/// shape and why. A slice supplier reports `usize::MAX` for its window, so the ordinary path is
+/// slice-shaped front for it. See [`OneShotSource`] and [`OneShotSink`] for the one caller
+/// that needs the other shapes and why. A slice supplier reports `usize::MAX` for its window
+/// and an [`OutputRegion`] sink hands out the reborrow it always did, so the ordinary path is
 /// byte-for-byte the loop it always was.
 #[allow(clippy::unnecessary_min_or_max)]
-pub fn uncompress2_z_from<S: OneShotSource>(
-    dest: &mut OutputRegion<'_>,
+pub fn uncompress2_z_from<D: OneShotSink + ?Sized, S: OneShotSource + ?Sized>(
+    dest: &mut D,
     source: &mut S,
 ) -> Decompressed {
     // Captured before the first reborrow of `dest`, and the origin of every
     // bound below. These are C's entry values of `*sourceLen` and `*destLen`.
     let source_len = source.total();
-    let dest_len = dest.len();
+    let dest_len = dest.total();
 
     // L40-L41. `len` and `left` are the residuals: input not yet handed to the
     // decoder, and destination room not yet handed to it. They are *not* the
@@ -386,7 +388,17 @@ pub fn uncompress2_z_from<S: OneShotSource>(
         // exactly what the sub-window spans. It also keeps [`OutputRegion`]'s promise about
         // its write-only variant exact, since every write lands at or after the sub-window's
         // own base.
-        let mut window = dest.reborrow(next_out, out_end.saturating_sub(next_out));
+        //
+        // ★ **It is also taken here, per round, and dropped at the end of this iteration.**
+        // The order is a soundness requirement, not a style: the window above may have been
+        // copied out of memory this destination covers, and a copy taken while an exclusive
+        // borrow of that memory was live would invalidate the borrow. [`OneShotSink`] carries
+        // the whole argument. `None` cannot occur -- the bounds established above put the
+        // range inside the destination -- and is reported rather than asserted so that this
+        // function stays panic-free on every path.
+        let Some(mut window) = dest.window(next_out, out_end.saturating_sub(next_out)) else {
+            break ReturnCode::BUF_ERROR;
+        };
         let mut stream = InflateStream::with_region(input, window.reborrow(0, window.len()));
         // ★ Zero, and the window starts *at* `next_in`; see the same note in
         // `crate::compress::compress2_z_from` for why the cursor moved out of the stream and

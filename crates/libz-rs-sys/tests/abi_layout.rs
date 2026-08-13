@@ -157,7 +157,8 @@
 //! * **`zlibCompileFlags()`.** It belongs to `c_api_parity.rs`, which derives the
 //!   expected value from `size_of` rather than hardcoding the measured `0xa9`.
 //! * **The `ENOUGH_*` and `codetype` values in their facade spelling.**
-//!   `crates/libz-rs-sys/src/types.rs` L943-L989 declares them `pub(crate)`, so an
+//!   `crates/libz-rs-sys/src/types.rs` declares `ENOUGH_LENS`, `ENOUGH_DISTS`,
+//!   `ENOUGH`, `CODES`, `LENS` and `DISTS` `pub(crate)`, so an
 //!   integration test — compiled as a separate crate — cannot name them, and
 //!   reaching them would take a visibility change this file must not make. The
 //!   compile-time counterpart already pins them. §5 asserts the same numbers
@@ -167,7 +168,8 @@
 //!   internal prefix exactly as `test/infcover.c` does, but it needs `unsafe` to
 //!   reach a private item, which AAP §0.7.1 (a) forbids. §9 pins the same
 //!   arithmetic with a `#[repr(C)]` mirror instead; the facade's own state prefix
-//!   is separately pinned by `types.rs` L2903-L2928 and its unit tests.
+//!   is separately pinned by the `const` assertions beneath `types.rs`'s
+//!   `StatePrefix` declaration and by its unit tests.
 //!
 //! # Properties of this file worth stating
 //!
@@ -233,7 +235,8 @@ use core::ffi::c_char;
 use std::ffi::CStr;
 
 // The C ABI surface under test. Every one of these is re-exported at the crate
-// root by `crates/libz-rs-sys/src/lib.rs` L1028-L1031; the `types` module itself is
+// root by the `pub use crate::types::{…}` block in `crates/libz-rs-sys/src/lib.rs`;
+// the `types` module itself is
 // private, so this list is the only Rust path to them.
 use libz_rs_sys::{
     alloc_func, charf, code, free_func, gzFile, gzFile_s, gz_header, gz_headerp, in_func,
@@ -241,8 +244,8 @@ use libz_rs_sys::{
     z_off64_t, z_off_t, z_size_t, z_stream, z_streamp, Byte, Bytef, MAX_MEM_LEVEL, MAX_WBITS,
 };
 
-// The version identity, gated exactly as `crates/libz-rs-sys/src/lib.rs` L1036
-// gates it: with `libz-compat` off there is no introspection module to take it
+// The version identity, gated on `libz-compat` exactly as
+// `crates/libz-rs-sys/src/lib.rs` gates the `util` module that owns it: with `libz-compat` off there is no introspection module to take it
 // from, and `--no-default-features` must still compile.
 #[cfg(feature = "libz-compat")]
 use libz_rs_sys::{
@@ -252,8 +255,8 @@ use libz_rs_sys::{
 
 // The safe core, which is already this package's sole first-party dependency, so
 // naming it adds nothing to the dependency graph — the same reasoning
-// `crates/libz-rs-sys/src/layout_assertions.rs` L190-L203 applies to its own two
-// `zlib_rs` imports. Cargo passes a test target the union of `[dependencies]` and
+// `crates/libz-rs-sys/src/layout_assertions.rs` applies to its own two `zlib_rs`
+// imports, in its module header's "No added dependency" bullet. Cargo passes a test target the union of `[dependencies]` and
 // `[dev-dependencies]`, so these paths resolve under every feature set, including
 // `--no-default-features` (verified).
 //
@@ -474,9 +477,9 @@ const C_MAX_MEM_LEVEL: c_int = 9;
 /// declared in a *private* header, and the port's counterpart —
 /// `crates/libz-rs-sys/src/types.rs`'s `StatePrefix` — is `pub(crate)`, so an
 /// integration test cannot name it and must not be given a way to. That is not a
-/// gap: `types.rs` L2903-L2928 pins `StatePrefix` with `const` assertions (`strm`
-/// at 0, the validity tag at 8, size 16) and its own unit tests repeat them at run
-/// time.
+/// gap: `types.rs` pins `StatePrefix` with `const` assertions beneath its
+/// declaration (`strm` at 0, the validity tag at 8, size 16) and its own unit tests
+/// repeat them at run time.
 ///
 /// What this mirror pins is the *other* half of the agreement, and the half no
 /// assertion inside the crate can state: that the C declaration order in
@@ -1039,8 +1042,8 @@ fn gz_file_s_prefix_ilp32() {
 /// This is the *other* end of the agreement §4 pins. `crates/zlib-rs/src/gz/state.rs`
 /// declares `GzFileExposed` `#[repr(C)]` and makes it `GzState`'s first member, so it
 /// is the structure a caller's `gzgetc` macro actually reaches into at run time.
-/// `crates/libz-rs-sys/src/types.rs` L793-L808 already asserts the agreement at
-/// compile time; confirming it here means the check also runs under the nightly
+/// `crates/libz-rs-sys/src/types.rs` already asserts the agreement at compile time,
+/// beneath its own `gzFile_s` declaration; confirming it here means the check also runs under the nightly
 /// AddressSanitizer job, where the pointer arithmetic in question is live.
 ///
 /// Gated on `gz` exactly as the import is: `zlib_rs::gz` needs `zlib-rs/std`, which
@@ -1107,10 +1110,10 @@ fn code_struct_layout() {
     // offsets different.
     //
     // The port relies on that being *unpromised* rather than working around it. The
-    // exported `inflate_table` (`crates/libz-rs-sys/src/inflate.rs` L2821-L2825 and
-    // L3008-L3023) never reinterprets a caller's `code *` as a `*mut Code`: it builds
-    // into a local `[Code]` arena and copies each entry out through
-    // `impl From<Code> for code` (`types.rs` L883), which moves the three fields by
+    // exported `inflate_table` (`crates/libz-rs-sys/src/inflate.rs`) never
+    // reinterprets a caller's `code *` as a `*mut Code`: it builds into a local
+    // `[Code]` arena and copies each entry out through `impl From<Code> for code`
+    // (`types.rs`, beside the `code` declaration), which moves the three fields by
     // name. So the only thing C ever reads is the `#[repr(C)]` `code` above, whose
     // 0/1/2 offsets are asserted, and the core keeps the freedom to lay `Code` out
     // however it wants.
@@ -1128,7 +1131,8 @@ fn code_struct_layout() {
 /// on the port agreeing.
 ///
 /// ★ **Asserted through the core's public `usize` forms.** The facade's own
-/// `c_uint` twins are `pub(crate)` (`crates/libz-rs-sys/src/types.rs` L943-L962), so
+/// `c_uint` twins are `pub(crate)` (`ENOUGH_LENS`, `ENOUGH_DISTS` and `ENOUGH` in
+/// `crates/libz-rs-sys/src/types.rs`), so
 /// an integration test cannot name them and this file must not add a visibility
 /// change to reach them; `layout_assertions.rs` §4 already pins those. The core's
 /// `zlib_rs::inflate::inftrees` constants hold the same three numbers and *are*
@@ -1378,7 +1382,7 @@ fn version_string_and_vernum() {
     );
 
     // SAFETY: `zlibVersion` returns `ZLIB_VERSION.as_ptr()`
-    // (`crates/libz-rs-sys/src/util.rs` L382-L391), which is the address of a
+    // (`zlibVersion` in `crates/libz-rs-sys/src/util.rs`), which is the address of a
     // `&'static CStr` built from the C string literal `c"1.3.2.1-motley"`. It is
     // therefore non-null (asserted above as well), correctly aligned for `c_char`,
     // NUL-terminated, valid for reads for the whole program's lifetime, and never
@@ -1464,8 +1468,9 @@ fn bounds_constants() {
 //
 //  `crates/libz-rs-sys/src/layout_assertions.rs` does not cover this, which is why
 //  it is here: the facade's own state prefix is pinned inside the crate
-//  (`types.rs` L2903-L2928 place the validity tag at offset 8 and the whole prefix
-//  at 16 bytes), and this section pins the C side of the same agreement using only
+//  (the `const` assertions beneath `types.rs`'s `StatePrefix` place the validity tag
+//  at offset 8 and the whole prefix at 16 bytes), and this section pins the C side of
+//  the same agreement using only
 //  public types.
 
 /// `struct inflate_state`'s first four members lay out at 0, 8, 12 and 16.

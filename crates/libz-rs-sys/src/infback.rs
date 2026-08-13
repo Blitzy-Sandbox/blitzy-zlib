@@ -295,8 +295,8 @@ use zlib_rs::config::validate_inflate_back_window_bits;
 use zlib_rs::error::ReturnCode;
 use zlib_rs::infback::{
     inflate_back_end as core_inflate_back_end, inflate_back_init as core_inflate_back_init,
-    inflate_back_into as core_inflate_back_into, InflateBackInput, InflateBackOutput,
-    OutputFailure,
+    inflate_back_with as core_inflate_back_with, InflateBackInput, InflateBackOutput,
+    InflateBackWindow, OutputFailure, OwnedWindow,
 };
 use zlib_rs::inflate::{InflateState, Mode};
 use zlib_rs::read_buf::OutputRegion;
@@ -511,6 +511,86 @@ impl StagedMapping {
     }
 }
 
+/// Lends the caller's window to the decoder, either once for the call or once per write
+/// cycle, according to whether the caller's input lives inside it.
+///
+/// ★ **The second arm is a soundness requirement, and the first exists so that nothing pays
+/// for it.** When `(next_in, avail_in)` overlaps the window, the region is served by
+/// [`StagedCallerInput`], which copies each chunk out of the window through the caller's own
+/// pointer. A read through that pointer while an exclusive borrow of the same bytes is live
+/// invalidates the borrow, so every later write through it is undefined behaviour -- and a
+/// *bounded* stage means the read happens once per chunk rather than once per call, so
+/// sequencing the first copy ahead of a call-long borrow is not enough. On that arm the
+/// window is therefore rebuilt from `(window, window_len)` for each write cycle and released
+/// before the next pull; `zlib_rs::infback::InflateBackWindow` carries the full argument.
+///
+/// On every other path -- which is every call `test/infcover.c` makes and every call a
+/// conforming application makes -- the [`Owned`](Self::Owned) arm holds the one region the
+/// decoder always had, high-water mark and all.
+enum BackWindow<'w> {
+    /// One region for the whole call: the caller's input is disjoint from the window, or
+    /// there is none.
+    Owned(OwnedWindow<'w>),
+    /// A region per write cycle, rebuilt from the caller's pointer, because the caller's
+    /// input lies inside the window.
+    PerCycle {
+        /// The window `inflateBackInit_` recorded.
+        base: *mut Bytef,
+        /// Its extent, after [`InflateBackWindow::restrict`] applied `wsize`.
+        len: usize,
+        /// The high-water mark the previous cycle's region reported, carried forward so the
+        /// decoder can still read its own output back. It only ever originates from
+        /// `OutputRegion::written`, which is what keeps the reinterpretation sound across a
+        /// rebuild -- see `OutputRegion::write_only_written`.
+        written: usize,
+    },
+}
+
+impl InflateBackWindow for BackWindow<'_> {
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Owned(owned) => owned.capacity(),
+            Self::PerCycle { len, .. } => *len,
+        }
+    }
+
+    fn restrict(&mut self, len: usize) -> bool {
+        match self {
+            Self::Owned(owned) => owned.restrict(len),
+            Self::PerCycle { len: extent, .. } => {
+                if len > *extent {
+                    return false;
+                }
+                *extent = len;
+                true
+            }
+        }
+    }
+
+    fn with<R>(&mut self, f: impl FnOnce(&mut OutputRegion<'_>) -> R) -> R {
+        match self {
+            Self::Owned(owned) => owned.with(f),
+            Self::PerCycle { base, len, written } => {
+                // SAFETY: unsafe-site category 2 -- slice reconstruction, once per write
+                // cycle. `base` is the pointer `inflateBackInit_` established non-null and
+                // `len` is the `wsize` extent it computed, which `inflateBack`'s contract
+                // makes live, writable and left alone by the application for the duration of
+                // the call (`zlib.h` L1174-L1175). It is the only view of those bytes at this
+                // instant: the staged input is copied before this is built and after it has
+                // been dropped, which is the whole reason this arm exists.
+                let slots = unsafe { window_slots_mut(*base, narrow_avail(*len)) };
+                // The mark travels through `OutputRegion::written` and back, so the promise
+                // that the reinterpretation is applied only to slots a region has written
+                // holds across the rebuild.
+                let mut region = OutputRegion::write_only_written(slots, init_view(), *written);
+                let outcome = f(&mut region);
+                *written = region.written();
+                outcome
+            }
+        }
+    }
+}
+
 /// Serves the caller's staged input region in bounded windows, then defers to the caller's own
 /// `in()`.
 ///
@@ -534,8 +614,28 @@ struct StagedCallerInput<'s, 'w> {
     total: usize,
     /// How many have been served so far.
     served: usize,
-    /// The bounded copy one window lives in.
-    stage: OverlapStage,
+    /// The bounded copy one window lives in, reached through a **raw pointer** rather than
+    /// held here.
+    ///
+    /// ★ **The indirection is a soundness requirement, and it is the second half of C-02's
+    /// root cause.** The core takes this value by move, so it becomes a field of its own
+    /// `Backer` -- and the slice `next_chunk` returns points into the stage. Were the stage a
+    /// field here, that slice would be a shared borrow of memory the `Backer` owns, and the
+    /// very next `&mut self` method call on the `Backer` would retag the whole structure and
+    /// invalidate it; the decoder then reads its input through an invalidated borrow, which
+    /// is undefined behaviour. Miri reports it exactly, as a `SharedReadOnly` tag lost to a
+    /// "Unique function-entry retag" covering the `Backer`.
+    ///
+    /// A raw pointer is not retagged, so the stage stays where it is created -- a local of
+    /// [`inflateBack`]'s own frame, in a different allocation from the `Backer` -- and the
+    /// slice's provenance survives every method call the decoder makes.
+    ///
+    /// # Safety invariant
+    ///
+    /// It addresses a live [`OverlapStage`] that outlives the core call and that nothing else
+    /// borrows. [`inflateBack`] establishes both by holding the stage in a binding declared
+    /// before the call and never touching it during one.
+    stage: *mut OverlapStage,
     /// Where the current window's mapping is published for the epilogue to read.
     mapping: &'s StagedMapping,
     /// The caller's own `in()`, reached once the staged region is exhausted.
@@ -547,14 +647,22 @@ impl<'i> InflateBackInput<'i> for StagedCallerInput<'_, '_> {
         if self.served < self.total {
             let take = OverlapStage::chunk_len(self.total.saturating_sub(self.served));
             let at = self.origin.wrapping_add(self.served);
-            // SAFETY: unsafe-site category 2 -- `OverlapStage::fill`'s contract, which is the
-            // one `inflateBack` already places on the caller: `total` bytes are readable at
-            // `origin` and the application must leave them alone for the duration of the call
-            // (`zlib.h` L1174-L1179), so the `take` bytes at `origin + served` are readable.
-            // No mutable borrow of them exists: the only mutable borrow this call creates is
-            // over the caller's *window*, and this type exists precisely because the two
-            // regions overlap, so the input region is never borrowed mutably at all.
-            let view = unsafe { self.stage.fill(at, take) };
+            // SAFETY: unsafe-site category 2, twice over.
+            //
+            // The stage: `self.stage` addresses a live `OverlapStage` that outlives this call
+            // and that nothing else borrows, by this field's own invariant, so `&mut *` on it
+            // is the only borrow of it in existence. Reaching it through a raw pointer is what
+            // keeps the returned slice's provenance out of the `Backer` this value lives in --
+            // the field documentation carries the argument.
+            //
+            // The copy: `OverlapStage::fill`'s contract is the one `inflateBack` already
+            // places on the caller -- `total` bytes are readable at `origin` and the
+            // application must leave them alone for the duration of the call (`zlib.h`
+            // L1174-L1179), so the `take` bytes at `origin + served` are readable. No mutable
+            // borrow of them exists **at this instant**: the caller's window is borrowed one
+            // write cycle at a time on this path (see `BackWindow`), and the decoder pulls
+            // input only between cycles, so the copy and the window borrow never coexist.
+            let view = unsafe { (*self.stage).fill(at, take) };
             self.mapping
                 .current
                 .set(Some((at, view.as_ptr(), view.len())));
@@ -568,7 +676,7 @@ impl<'i> InflateBackInput<'i> for StagedCallerInput<'_, '_> {
     }
 }
 
-/// Watches the C-visible mode slot across a callback, and latches a hostile write./// Watches the C-visible mode slot across a callback, and latches a hostile write.
+/// Watches the C-visible mode slot across a callback, and latches a hostile write.
 ///
 /// One of these is shared by the two adapters for the duration of a single
 /// [`inflateBack`] call, which is why the interior mutability is a [`Cell`]: both
@@ -1294,22 +1402,46 @@ pub unsafe extern "C" fn inflateBack(
         // nothing may, so the decoder gets slots plus the reinterpretation to apply once it
         // has written them. See `types::window_slots_mut`.
         //
-        // SAFETY: unsafe-site category 2 -- slice reconstruction, once per call.
-        // `window` is the pointer `inflateBackInit_` recorded, which it established
-        // non-null, and `window_len` is the `1 << windowBits` extent it computed; this
-        // function's contract requires that region to be live and writable and to be
-        // left alone by the application for the duration of the call, which is exactly
-        // `zlib.h` L1174-L1175's obligation. Only one such view exists: the core keeps
-        // no window of its own, and the staged input and every callback chunk is either
-        // proved disjoint from it or copied before it becomes a reference.
-        let slots = unsafe { window_slots_mut(window_ptr, narrow_avail(window_len)) };
-        let window = OutputRegion::write_only(slots, init_view());
+        // ★ **How long the borrow lasts is decided by `direct`, and it is a soundness
+        // decision.** When the caller's input was proved disjoint from the window (or there
+        // is none), one region serves the whole call, exactly as it always did. When it
+        // overlaps, the region is rebuilt per write cycle so that no borrow of the window is
+        // live at the instant `StagedCallerInput` copies a chunk out of it -- see
+        // [`BackWindow`], which carries the argument in full.
+        //
+        let window = if direct.is_some() {
+            // SAFETY: unsafe-site category 2 -- slice reconstruction, once per call on this
+            // arm. `window` is the pointer `inflateBackInit_` recorded, which it established
+            // non-null, and `window_len` is the `1 << windowBits` extent it computed; this
+            // function's contract requires that region to be live and writable and to be
+            // left alone by the application for the duration of the call, which is exactly
+            // `zlib.h` L1174-L1175's obligation. Only one such view exists: the core keeps
+            // no window of its own, and every callback chunk is either proved disjoint from
+            // it or declined before it becomes a reference.
+            let slots = unsafe { window_slots_mut(window_ptr, narrow_avail(window_len)) };
+            BackWindow::Owned(OwnedWindow::new(OutputRegion::write_only(
+                slots,
+                init_view(),
+            )))
+        } else {
+            BackWindow::PerCycle {
+                base: window_ptr,
+                len: window_len,
+                written: 0,
+            }
+        };
 
         // L215: `state->mode = TYPE;`, published into the C-visible slot too, so a
         // callback that reads the mode sees a live value. The core performs the same
         // assignment on its own copy at the top of `inflate_back`.
         let watch = ModeWatch::new(slot);
         watch.publish(Mode::Type.as_raw());
+
+        // The bounded stage, held in a binding of THIS frame so that it outlives the core
+        // call and lives in a different allocation from the core's own `Backer`. See
+        // `StagedCallerInput::stage` for why the second property is a soundness requirement
+        // and not merely tidy ownership.
+        let mut input_stage = OverlapStage::new();
 
         // L226-L568: the state machine and its epilogue, both inside the core.
         let caller_input = CallerInput {
@@ -1319,7 +1451,7 @@ pub unsafe extern "C" fn inflateBack(
             window: window_ptr.cast_const(),
             window_len,
         };
-        let result = core_inflate_back_into(
+        let result = core_inflate_back_with(
             state,
             window,
             direct.flatten(),
@@ -1330,7 +1462,15 @@ pub unsafe extern "C" fn inflateBack(
                 // own to serve and forwards every `next_chunk` to the caller's `in()`.
                 total: if direct.is_some() { 0 } else { staged_len },
                 served: 0,
-                stage: OverlapStage::new(),
+                // `core::ptr::addr_of_mut!` rather than `&raw mut`, which is Rust 1.82
+                // syntax and this workspace's floor is 1.80. The two are the same
+                // operation, and which one is used is a soundness matter, not a
+                // stylistic one: neither forms a reference, so the stage is never
+                // retagged here. A `&mut input_stage as *mut _` would form one, and the
+                // pointer would then be derived from a borrow that ends on this line --
+                // see `StagedCallerInput::stage` for why that would reintroduce exactly
+                // the aliasing violation this field exists to prevent.
+                stage: core::ptr::addr_of_mut!(input_stage),
                 mapping: &mapping,
                 inner: caller_input,
             },

@@ -47,6 +47,35 @@
 # appearing in that list, which turns any crate carrying one into a hard error.
 # There is deliberately no GPL, LGPL, AGPL or MPL entry anywhere in this file.
 #
+# ★ WHAT THIS FILE STRUCTURALLY CANNOT SEE, AND WHAT COVERS IT INSTEAD
+#
+# cargo-deny reads manifests and lock files.  The artifact this project ships is
+# not assembled from those alone: `make rust' and the CMake Rust path both relink
+# a Rust `staticlib', and that archive carries members of the PRECOMPILED std
+# SYSROOT.  Those members were compiled when the toolchain was built, they appear
+# in no Cargo.lock, and no configuration in this file can reach them.
+#
+# That is not a theoretical gap.  The `bans' section below denies `miniz_oxide' by
+# name, with the reason "third-party Rust DEFLATE implementation" -- and the
+# packaged libz.so.1.3.2.1-motley contained it anyway, together with `adler2':
+# `miniz_oxide::inflate::core::decompress' and friends, a second DEFLATE decoder
+# inside zlib, arriving through std's default panic hook, which symbolises a
+# backtrace through addr2line, gimli and object, and object decompresses
+# compressed debug sections with miniz_oxide.  Every check in this file passed
+# for as long as that was true, because every check in this file was looking at
+# the wrong thing.
+#
+# The cover for it is `.github/scripts/artifact_inventory_gate.py', which asks the
+# BUILT LIBRARY rather than a manifest: it recovers each symbol's originating
+# crate from Rust's v0 mangling, refuses any crate this tree has not declared,
+# records the licence of each declared one -- the only place the sysroot members'
+# licensing is written down, since `cargo deny list' will never enumerate them --
+# and refuses a set of dynamic imports that no zlib entry point reaches.  Run it
+# with `make rust-inventory' after `make rust'; the CMake path runs it as part of
+# producing the library, and the `dropin' job of .github/workflows/rust.yml runs
+# it in CI.  Neither tool replaces the other: this file governs what may enter the
+# build, and that one governs what actually left it.
+#
 # One graph is deliberately not covered: fuzz/ declares its own [workspace] and
 # is listed under `exclude` in the root Cargo.toml, so nothing it pulls in
 # reaches the audit below.  It is audited separately, by its own configuration,
@@ -278,6 +307,11 @@ deny = [
     # implementation; a second one in the graph would either shadow it or silently
     # answer for it in a test that was meant to exercise this one.
     { crate = "flate2", use-instead = "libz-rs-sys", reason = "third-party DEFLATE front end; this workspace is the implementation, not a consumer of one" },
+    # ★ This entry bans miniz_oxide from the CARGO GRAPH and it does that job
+    # correctly -- but it did not, and cannot, keep it out of the shipped library.
+    # A copy arrives with the precompiled std sysroot, which is outside every
+    # lock file this tool reads.  See "WHAT THIS FILE STRUCTURALLY CANNOT SEE"
+    # above; artifact_inventory_gate.py is what covers it.
     { crate = "miniz_oxide", use-instead = "zlib-rs", reason = "third-party Rust DEFLATE implementation" },
     { crate = "deflate", use-instead = "zlib-rs", reason = "third-party Rust DEFLATE encoder" },
     { crate = "inflate", use-instead = "zlib-rs", reason = "third-party Rust DEFLATE decoder" },

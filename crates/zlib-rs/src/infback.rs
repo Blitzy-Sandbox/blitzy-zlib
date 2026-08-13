@@ -778,6 +778,106 @@ where
     inflate_back_into(state, OutputRegion::init(window), next_in, input, output)
 }
 
+/// Lends [`inflate_back`] the caller's window for one write cycle at a time.
+///
+/// # ★ Why the window is a provider and not a region
+///
+/// `inflateBack`'s window is the output buffer, and on one path it is also where the
+/// caller's *input* lives: `zlib.h` L1163-L1179 describes the window and
+/// `(next_in, avail_in)` independently and never requires them to be distinct, so a C
+/// caller may legitimately point its input at bytes inside the window it supplied. The
+/// facade serves that by copying each input chunk into a bounded stage -- and a copy taken
+/// through the caller's own pointer while an exclusive borrow of the same memory is live
+/// invalidates that borrow, making every later write through it undefined behaviour,
+/// whether or not the two are ever used together.
+///
+/// A single call-long `&mut` over the window therefore cannot serve that path, however
+/// carefully the first copy is sequenced ahead of it: the stage is bounded, so the copy
+/// happens again for every chunk. This trait is what makes the alternative expressible.
+/// The decoder asks for the window each time it is about to write or read it back, and the
+/// borrow it gets dies before the next input pull.
+///
+/// # The two implementations
+///
+/// | Implementor | Supplied by | What a cycle yields |
+/// |---|---|---|
+/// | [`OwnedWindow`] | Rust callers, this crate's own buffers, every test, and the facade's **disjoint** path | the one region, lent out by reference -- so the ordinary path is byte-for-byte what it was before this trait existed, high-water mark included |
+/// | the facade's overlapping provider | `crates/libz-rs-sys` | a region rebuilt from the caller's pointer for that cycle alone, carrying the mark forward with [`OutputRegion::write_only_written`] |
+///
+/// # Contract
+///
+/// [`InflateBackWindow::capacity`] is the storage's whole extent and must not change during
+/// a call. [`InflateBackWindow::restrict`] narrows every later region to the first `len`
+/// slots and answers `false` when the storage is shorter than that -- it is how `wsize` is
+/// applied to a generous caller's buffer. [`InflateBackWindow::with`] must lend the *same*
+/// storage every time, with every slot a previous cycle wrote still holding what it wrote:
+/// the decoder reads its own output back, both for the flush through `out()` and for a match
+/// that reaches into the previous cycle's bytes, so a provider that handed out different
+/// memory or forgot the mark would produce wrong output rather than merely be slower.
+pub trait InflateBackWindow {
+    /// Bytes of window storage this provider holds, before any restriction.
+    fn capacity(&self) -> usize;
+
+    /// Restricts every later region to the first `len` slots, reporting whether it fitted.
+    fn restrict(&mut self, len: usize) -> bool;
+
+    /// Lends the window for the duration of `f`.
+    fn with<R>(&mut self, f: impl FnOnce(&mut OutputRegion<'_>) -> R) -> R;
+}
+
+/// The provider every Rust caller has: one [`OutputRegion`], lent out unchanged.
+///
+/// It exists so that the ordinary path pays nothing for the boundary's problem. `with` is a
+/// single call through a `&mut`, which inlines away, and the region is never rebuilt -- so
+/// its high-water mark, its storage variant and every bound the decoder checks are exactly
+/// what they were when the window was a plain field of `Backer`.
+#[derive(Debug)]
+pub struct OwnedWindow<'w> {
+    /// The window itself. An [`Option`] only so that [`InflateBackWindow::restrict`] can
+    /// consume the region and put the narrower one back; it is [`Some`] at every other
+    /// moment, and a [`None`] would lend an empty window rather than panic.
+    region: Option<OutputRegion<'w>>,
+}
+
+impl<'w> OwnedWindow<'w> {
+    /// Wraps a region as the provider for one [`inflate_back`] call.
+    #[must_use]
+    pub fn new(region: OutputRegion<'w>) -> Self {
+        Self {
+            region: Some(region),
+        }
+    }
+}
+
+impl InflateBackWindow for OwnedWindow<'_> {
+    fn capacity(&self) -> usize {
+        self.region.as_ref().map_or(0, OutputRegion::len)
+    }
+
+    fn restrict(&mut self, len: usize) -> bool {
+        let Some(region) = self.region.take() else {
+            return false;
+        };
+        match region.into_prefix(len) {
+            Some(narrowed) => {
+                self.region = Some(narrowed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn with<R>(&mut self, f: impl FnOnce(&mut OutputRegion<'_>) -> R) -> R {
+        match self.region.as_mut() {
+            Some(region) => f(region),
+            // Unreachable: `restrict` is the only operation that empties the slot and it
+            // refills it on success, failing the call otherwise. An empty region is the one
+            // answer that cannot be unsound -- every write reports that it moved nothing.
+            None => f(&mut OutputRegion::empty()),
+        }
+    }
+}
+
 /// [`inflate_back`] over storage that is only guaranteed *writable*.
 ///
 /// # ★ Why this form exists, and why the C boundary needs it
@@ -803,6 +903,11 @@ where
 ///
 /// [`inflate_back`] is this function with [`OutputRegion::init`] applied, which is what
 /// every Rust caller and every test wants.
+///
+/// This form takes the region by value and lends it through an [`OwnedWindow`], so it is
+/// [`inflate_back_with`] for the overwhelmingly common case where one borrow of the window
+/// serves the whole call. A caller whose input may lie *inside* the window -- which is the C
+/// ABI facade, and only it -- needs the other form; [`InflateBackWindow`] states why.
 #[must_use]
 pub fn inflate_back_into<'a, 'i, A, I, O>(
     state: &mut InflateState<'a, A>,
@@ -816,7 +921,32 @@ where
     I: InflateBackInput<'i>,
     O: InflateBackOutput,
 {
-    let Some(window) = window_prefix(state, window) else {
+    inflate_back_with(state, OwnedWindow::new(window), next_in, input, output)
+}
+
+/// [`inflate_back_into`] over a window the caller lends one write cycle at a time.
+///
+/// The body of `infback.c` L200-L568 reaches the window only through this provider, which is
+/// what lets the C ABI facade serve an input region that lies inside the window it decodes
+/// into: the borrow is taken around each write and released before the next input pull, so a
+/// bounded copy of the input never coexists with an exclusive borrow of the same bytes.
+/// [`InflateBackWindow`] carries the whole argument, including why a call-long borrow cannot
+/// serve that path however carefully the first copy is ordered.
+#[must_use]
+pub fn inflate_back_with<'a, 'i, A, I, O, W>(
+    state: &mut InflateState<'a, A>,
+    window: W,
+    next_in: Option<&'i [u8]>,
+    input: I,
+    output: O,
+) -> InflateBackResult<'i>
+where
+    A: Allocator<'a>,
+    I: InflateBackInput<'i>,
+    O: InflateBackOutput,
+    W: InflateBackWindow,
+{
+    let Some((window, wlen)) = window_prefix(state, window) else {
         // C would proceed with `put == NULL` and `left == 0` here and loop forever
         // inside `ROOM()`; refusing the call is the same "state was not properly
         // initialized" outcome `zlib.h` L1203 describes, and it terminates.
@@ -826,7 +956,7 @@ where
             msg: None,
         };
     };
-    run(state, window, next_in, input, output)
+    run(state, window, wlen, next_in, input, output)
 }
 
 /// The exactly-`wsize`-byte prefix of `window` this state may use as its
@@ -850,15 +980,18 @@ where
 /// window (`infback.c` L51 allocates only the state), so a state whose slot is
 /// occupied was not built by [`inflate_back_init`] -- and proceeding would mean two
 /// live views of two different buffers both claiming to be "the window".
-fn window_prefix<'w, 'a, A: Allocator<'a>>(
+fn window_prefix<'a, A: Allocator<'a>, W: InflateBackWindow>(
     state: &InflateState<'a, A>,
-    window: OutputRegion<'w>,
-) -> Option<OutputRegion<'w>> {
+    mut window: W,
+) -> Option<(W, usize)> {
     let expected = usize::try_from(state.wsize).ok()?;
     if expected == 0 || !state.window.is_absent() {
         return None;
     }
-    window.into_prefix(expected)
+    if !window.restrict(expected) {
+        return None;
+    }
+    Some((window, expected))
 }
 
 /// Resets the state, runs the state machine, and performs the `inf_leave`
@@ -869,9 +1002,10 @@ fn window_prefix<'w, 'a, A: Allocator<'a>>(
 /// from a label: the final flush at L562-L566 has **one** call site, and no
 /// early return can skip it, because `Backer::run` returns a value rather than
 /// jumping.
-fn run<'a, 'i, A, I, O>(
+fn run<'a, 'i, A, I, O, W>(
     state: &mut InflateState<'a, A>,
-    window: OutputRegion<'_>,
+    window: W,
+    wlen: usize,
     next_in: Option<&'i [u8]>,
     input: I,
     output: O,
@@ -880,6 +1014,7 @@ where
     A: Allocator<'a>,
     I: InflateBackInput<'i>,
     O: InflateBackOutput,
+    W: InflateBackWindow,
 {
     // L215-L217: reset the state.
     state.mode = Mode::Type;
@@ -897,6 +1032,7 @@ where
         chunk: next_in,
         consumed: 0,
         window,
+        wlen,
         put: 0,
         input,
         output,
@@ -928,7 +1064,7 @@ where
 /// `inflate_fast` can find them, and to reload them afterwards. Here the fields
 /// *are* the canonical copy, and `inflate_fast` is handed `&mut` references to
 /// them, so there is nothing to spill and nothing to reload.
-struct Backer<'i, 'w, I, O> {
+struct Backer<'i, I, O, W> {
     /// The input run currently being decoded: C's `next`, before any of it has
     /// been consumed.
     ///
@@ -941,16 +1077,29 @@ struct Backer<'i, 'w, I, O> {
     consumed: usize,
 
     /// The caller's window, which is also the output buffer
-    /// (`zlib.h` L1141-L1144). Its length is `state.wsize`.
+    /// (`zlib.h` L1141-L1144), lent out one write cycle at a time.
     ///
-    /// An [`OutputRegion`] rather than a `&mut [u8]` because a C caller's window arrives
-    /// as storage: see [`inflate_back_into`]. For a Rust caller the region is
-    /// [`OutputRegion::init`] and every operation below is the plain slice operation it
-    /// used to be.
-    window: OutputRegion<'w>,
+    /// A provider rather than an [`OutputRegion`] field, and that is a soundness
+    /// requirement rather than an indirection: on the path where the caller's input lies
+    /// inside the window, no borrow of the window may exist while an input chunk is copied
+    /// out of it. [`InflateBackWindow`] states the whole argument, and [`OwnedWindow`] is
+    /// what every Rust caller passes, for which `with` is one call through a `&mut` and the
+    /// region is never rebuilt.
+    ///
+    /// A C caller's window arrives as *storage* rather than as values -- see
+    /// [`inflate_back_into`] -- so the region behind the provider is
+    /// [`OutputRegion::write_only`]; for a Rust caller it is [`OutputRegion::init`] and
+    /// every operation below is the plain slice operation it used to be.
+    window: W,
 
-    /// C's `put`, as an index into [`Self::window`]. C's `left` is
-    /// `window.len() - put`.
+    /// `state.wsize`, i.e. the window's length after [`window_prefix`] applied it.
+    ///
+    /// Held here rather than asked of the provider each time, because C's `left` is derived
+    /// from it on the hottest path in the decoder and because it cannot change during a
+    /// call: [`InflateBackWindow::restrict`] fixed it before the state machine started.
+    wlen: usize,
+
+    /// C's `put`, as an index into the window. C's `left` is `wlen - put`.
     put: usize,
 
     /// The `in()` callback together with C's opaque `in_desc`.
@@ -963,10 +1112,11 @@ struct Backer<'i, 'w, I, O> {
     msg: Option<&'static str>,
 }
 
-impl<'i, I, O> Backer<'i, '_, I, O>
+impl<'i, I, O, W> Backer<'i, I, O, W>
 where
     I: InflateBackInput<'i>,
     O: InflateBackOutput,
+    W: InflateBackWindow,
 {
     /// C's `have`: input bytes still unread in the current chunk.
     #[inline]
@@ -980,7 +1130,7 @@ where
     /// C's `left`: window bytes still unwritten before the next flush.
     #[inline]
     fn left(&self) -> usize {
-        self.window.len().saturating_sub(self.put)
+        self.wlen.saturating_sub(self.put)
     }
 
     /// The unused input, as [`InflateBackResult::next_in`] reports it
@@ -1100,13 +1250,17 @@ where
         self.put = 0;
         state.whave = state.wsize;
         // C hands `out()` the whole window (`infback.c` L156). Reached only when `left()`
-        // is zero, i.e. `put == window.len()`, so every slot in the region has been
-        // written by this very call and the high-water mark covers all of it -- which is
-        // what makes `initialized` return the whole window rather than a prefix of it.
-        let whole = self.window.len();
-        self.output
-            .write_out(self.window.initialized(whole))
-            .is_ok()
+        // is zero, i.e. `put == wlen`, so every slot in the region has been written by this
+        // very call and the high-water mark covers all of it -- which is what makes
+        // `initialized` return the whole window rather than a prefix of it.
+        //
+        // The borrow lasts exactly as long as the callback, which is what `zlib.h`
+        // L1175-L1177 already forbids the callback from writing through; the address it
+        // receives is the caller's own window either way, because the region is over it.
+        let whole = self.wlen;
+        let output = &mut self.output;
+        self.window
+            .with(|region| output.write_out(region.initialized(whole)).is_ok())
     }
 
     /// Writes one literal byte into the window (`infback.c` L456-L457).
@@ -1114,7 +1268,8 @@ where
     /// The caller has just run [`Self::room`], so `put` addresses a free byte and
     /// the accessor cannot fail.
     fn put_byte(&mut self, byte: u8) -> bool {
-        if !self.window.write_byte_at(self.put, byte) {
+        let at = self.put;
+        if !self.window.with(|region| region.write_byte_at(at, byte)) {
             return false;
         }
         self.put = self.put.saturating_add(1);
@@ -1141,12 +1296,21 @@ where
         // C's `out(out_desc, state->window, state->wsize - left)` (L563): the `put` bytes
         // this call wrote and no more. Every one of them raised the region's high-water
         // mark, so `initialized` yields exactly them.
-        let written = self.window.initialized(self.put);
-        if written.len() != self.put {
-            // Unreachable: `put` is only ever advanced by a successful write.
+        let put = self.put;
+        let output = &mut self.output;
+        let flushed = self.window.with(|region| {
+            let written = region.initialized(put);
+            if written.len() != put {
+                // Unreachable: `put` is only ever advanced by a successful write. `None`
+                // reports it without disturbing the status, as the early return did.
+                return None;
+            }
+            Some(output.write_out(written).is_err())
+        });
+        let Some(failed) = flushed else {
             return ret;
-        }
-        if self.output.write_out(written).is_err() && ret == ReturnCode::STREAM_END {
+        };
+        if failed && ret == ReturnCode::STREAM_END {
             return ReturnCode::BUF_ERROR;
         }
         ret
@@ -1171,10 +1335,11 @@ where
     }
 }
 
-impl<'i, I, O> Backer<'i, '_, I, O>
+impl<'i, I, O, W> Backer<'i, I, O, W>
 where
     I: InflateBackInput<'i>,
     O: InflateBackOutput,
+    W: InflateBackWindow,
 {
     /// `for (;;) switch (state->mode) { ... }` (`infback.c` L226-L558).
     ///
@@ -1387,7 +1552,8 @@ where
         let Some(dest_end) = self.put.checked_add(copy) else {
             return false;
         };
-        if !self.window.write_slice_at(self.put, source) {
+        let at = self.put;
+        if !self.window.with(|region| region.write_slice_at(at, source)) {
             return false;
         }
         self.consumed = source_end;
@@ -1396,10 +1562,11 @@ where
     }
 }
 
-impl<'i, I, O> Backer<'i, '_, I, O>
+impl<'i, I, O, W> Backer<'i, I, O, W>
 where
     I: InflateBackInput<'i>,
     O: InflateBackOutput,
+    W: InflateBackWindow,
 {
     /// Locates one code in the root table, pulling input until the entry it
     /// selects says it has enough bits.
@@ -1493,10 +1660,11 @@ where
     }
 }
 
-impl<'i, I, O> Backer<'i, '_, I, O>
+impl<'i, I, O, W> Backer<'i, I, O, W>
 where
     I: InflateBackInput<'i>,
     O: InflateBackOutput,
+    W: InflateBackWindow,
 {
     /// Reads a dynamic block's header and builds its two decode tables,
     /// RFC 1951 §3.2.7.
@@ -1832,10 +2000,11 @@ struct Repeat {
     count: usize,
 }
 
-impl<'i, I, O> Backer<'i, '_, I, O>
+impl<'i, I, O, W> Backer<'i, I, O, W>
 where
     I: InflateBackInput<'i>,
     O: InflateBackOutput,
+    W: InflateBackWindow,
 {
     /// Decodes one literal, one length/distance pair, or an end-of-block code,
     /// RFC 1951 §3.2.5.
@@ -1956,18 +2125,28 @@ where
             // Unreachable: `have() >= 6` implies a chunk exists.
             return Step::Leave(ReturnCode::BUF_ERROR);
         };
-        // L426. Equal to `self.window.len()`, which `window_prefix` established.
+        // L426. Equal to `self.wlen`, which `window_prefix` established.
         let start = to_index(u64::from(state.wsize));
         // The region is moved into the cursor for the duration of the call and moved back
         // out afterwards, which is how `deflate` and `inflate` hand their own output to a
-        // cursor as well. `OutputRegion::empty` is the placeholder that keeps `self` whole
-        // while the real one is away; nothing can observe it, because `inflate_fast` is the
-        // only thing running and it holds the cursor.
-        let region = core::mem::replace(&mut self.window, OutputRegion::empty());
-        let mut output = OutputCursor::from_region(region, self.put);
-        let exit = inflate_fast(state, chunk, &mut self.consumed, &mut output, start);
-        let (region, written) = output.into_region();
-        self.window = region;
+        // cursor as well. `OutputRegion::empty` is the placeholder that keeps the lent
+        // region's slot whole while the real one is away; nothing can observe it, because
+        // `inflate_fast` is the only thing running and it holds the cursor.
+        //
+        // The lease spans the whole of `inflate_fast`, which is right: it neither pulls
+        // input through the callback nor calls `out()`, so no copy of the caller's input can
+        // be taken while this borrow is live. It reads its own history out of the window,
+        // which is the reason the borrow has to be one region rather than one per byte.
+        let put = self.put;
+        let consumed = &mut self.consumed;
+        let (exit, written) = self.window.with(|region| {
+            let taken = core::mem::replace(region, OutputRegion::empty());
+            let mut output = OutputCursor::from_region(taken, put);
+            let exit = inflate_fast(state, chunk, consumed, &mut output, start);
+            let (taken, written) = output.into_region();
+            *region = taken;
+            (exit, written)
+        });
         self.put = written;
         // C's `inflate_fast` writes `strm->msg` in place on its three error paths
         // and leaves it alone otherwise, so this assignment is conditional too.
@@ -2083,7 +2262,7 @@ where
             // L527-L535.
             let offset = to_index(u64::from(state.offset));
             let left = self.left();
-            let span = self.window.len().saturating_sub(offset);
+            let span = self.wlen.saturating_sub(offset);
             let (from, available) = if span < left {
                 (self.put.saturating_add(span), left.saturating_sub(span))
             } else {
@@ -2096,7 +2275,11 @@ where
             state.length = state.length.saturating_sub(to_count(copy));
 
             // L539-L541.
-            if !self.window.duplicate_within(from, self.put, copy) {
+            let to = self.put;
+            if !self
+                .window
+                .with(|region| region.duplicate_within(from, to, copy))
+            {
                 // Unreachable: both ranges were shown above to end at or before
                 // the window's last byte.
                 return Step::Leave(ReturnCode::BUF_ERROR);

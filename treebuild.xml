@@ -148,16 +148,21 @@
                            the C oracle is declared.  [lib] name = "z" with
                            crate-type = ["cdylib", "staticlib", "rlib"] makes Cargo
                            emit libz.so and libz.a from one definition of the
-                           exported surface.  csrc/ holds three C translation
-                           units, and only two of them ship: gzprintf_shim.c, the
-                           variadic gzprintf and gzvprintf, and inftrees_shim.c,
-                           the codetype prototype of inflate_table.  Both are archived
-                           into the libz.a rustc emits, because stable Rust can
-                           declare neither.  The third, gzvprintf_probe.c, builds a
-                           va_list and forwards it to gzvprintf, which no Rust
-                           caller can do; it reaches TEST TARGETS ONLY, through
-                           rustc-link-arg-tests, and is never part of the shipped
-                           library.
+                           exported surface.  csrc/ holds TWO C translation units
+                           and exactly ONE of them ships: gzprintf_shim.c, which
+                           defines the variadic gzprintf and the va_list-taking
+                           gzvprintf, is archived into the libz.a rustc emits,
+                           because stable Rust can declare neither form.  The
+                           other, gzvprintf_probe.c, builds a va_list and forwards
+                           it to gzvprintf, which no Rust caller can do; it reaches
+                           TEST TARGETS ONLY, through rustc-link-arg-tests, and is
+                           never part of the shipped library.  There is no
+                           inftrees_shim.c: an earlier revision of this file
+                           described one, presenting inftrees.h's codetype
+                           prototype, and it was removed once inflate_table was
+                           defined in Rust over a validated plain int -- an
+                           enumerator of 0..2 is passed exactly as an int, so no C
+                           was needed for it.
                            build.rs handles what belongs to the build: it emits the
                            link arguments, publishes one cfg, compiles those two
                            shipped C units plus the test-only probe, and prunes

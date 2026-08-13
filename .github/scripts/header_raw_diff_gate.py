@@ -11,13 +11,13 @@ AAP 0.8.6 freezes a command:
 and AAP 0.4.2.3 says divergence in any public signature fails the build. That command's
 output cannot be empty, and `cbindgen.toml` says why in eleven enumerated rules -- D1
 decoration, D3 includes, D5 large-file duplicates, D7 ordering, D8 comment text, D9 `#endif`
-labels, D10 `extern "C"` scaffolding, and so on. Measured on this tree it is **6,020 lines in
+labels, D10 `extern "C"` scaffolding, and so on. Measured on this tree it is **roughly six thousand lines in
 a single hunk**: the two files share so few consecutive lines that `diff` finds no alignment
 at all, so essentially every line of each file appears.
 
 The workflow used to run that command, write the output to an artifact, and describe it as
 "necessarily non-empty ... the artifact is how a reviewer confirms that what it contains is
-only those reasons." Nothing confirmed it. A reviewer confirming 6,020 lines by eye, once,
+only those reasons." Nothing confirmed it. A reviewer confirming six thousand lines by eye, once,
 is not a gate, and the claim "only those reasons" was the one thing never checked.
 
 # What this asserts, and what it does not

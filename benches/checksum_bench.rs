@@ -93,8 +93,11 @@
 //! `tests/byte_identical.rs` that AAP §0.4.1.4 places beside it; those run under `cargo test`,
 //! where a failure is an error and names the offending index or configuration. Here a mismatch
 //! prints a diagnostic naming the algorithm, the case and both values, and the case is skipped --
-//! because a benchmark that aborts tells a developer nothing about the other ninety-four cases, and
-//! because a suite nobody can run is a suite nobody runs.
+//! because a benchmark that aborts tells a developer nothing about the rest of the sweep, and
+//! because a suite nobody can run is a suite nobody runs. The exact number of cases is not stated
+//! here on purpose: it depends on which fixtures are present and on whether the `simd` feature is
+//! compiled in, so every group publishes its own `expected=` and `cases=` and the gate reads those
+//! rather than a figure in a comment.
 //!
 //! # Running it
 //!
@@ -163,13 +166,30 @@
 //!
 //! # Code generation
 //!
-//! Cargo's `bench` profile inherits `[profile.release]`, which the repository root sets to
-//! `lto = "fat"`, `codegen-units = 1` and `opt-level = 3`, so these measurements are taken
-//! against the same code generation as the shipped library. `panic = "abort"` is ignored for
-//! bench targets -- cargo does not honour the key there -- which is expected and harmless.
-//! Profiles are honoured only in the workspace root, so nothing here declares one and none is
-//! needed. `-Cllvm-args=-enable-dfa-jump-thread` is an opt-in `RUSTFLAGS` lever for performance
-//! runs and is deliberately not committed to any manifest.
+//! ★ **`benches/` is its OWN Cargo workspace**, not a member of the root one -- the root
+//! `Cargo.toml` lists only the three `crates/` members -- so `cargo metadata` reports
+//! `workspace_root` as `benches/` and the profiles that apply are the ones
+//! `benches/Cargo.toml` declares itself. It declares three, and which one produced a given
+//! measurement matters enough that a log states it:
+//!
+//! * `[profile.release]` -- `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, matching the
+//!   repository root's release profile, so a measurement taken under it is taken against the
+//!   same code generation as the shipped library.
+//! * `[profile.bench]` -- inherits `release`, and is what `cargo bench` selects by default.
+//! * `[profile.bench-parity]` -- inherits `bench` but sets `lto = false` and
+//!   `codegen-units = 16`, which is deliberately **not** the shipped codegen: it is
+//!   comparable to the way the C oracle is built. CI measures it as its own matrix cell,
+//!   and AAP 0.8.4's limit is decided on the *worse-for-the-port* of the two profiles'
+//!   ratios, so a case that only passes under whole-program optimisation does not pass.
+//!
+//! `ZLIB_RS_BENCH_RUST_PROFILE` carries the selected profile name into the build, because
+//! cargo does not expose it to a build script; the differential crate's build script
+//! cross-checks it and bakes it in, so every summary line reports the profile it came from.
+//! `panic = "abort"` is ignored for bench targets -- cargo does not honour the key there --
+//! which is expected and harmless.
+//!
+//! `-Cllvm-args=-enable-dfa-jump-thread` is an opt-in `RUSTFLAGS` lever for performance runs
+//! and is deliberately not committed to any manifest.
 //!
 //! # Inputs
 //!
@@ -2135,6 +2155,15 @@ impl AcceptanceLedger {
 /// Zero without the feature. A feature-off run still prints both `BACKEND-SUMMARY` lines, with
 /// `expected=0`, so that a consumer can require one line per family in every run and read the
 /// count rather than having to interpret an absent line.
+///
+/// ★ **The gate needs four of these lengths to have been MEASURABLE, not merely expected.**
+/// `.github/scripts/bench_gate.py`'s `BACKEND_MIN_CASES = 4` refuses a verdict drawn from fewer,
+/// because a case whose two identical null runs differ by more than its
+/// `BACKEND_TOLERANCE_CEILING` is reported `unmeasured` rather than given a ratio -- so on a
+/// sufficiently noisy machine every case could be refused and `over=0` misread as a pass. That is
+/// why [`ACCEPTANCE_SWEEP`] carries nine lengths rather than a handful: the four longest alone
+/// (256 bytes upward) clear the floor on a shared runner, and the committed figures show only the
+/// sub-65-nanosecond cases being refused.
 #[cfg(feature = "simd")]
 const fn acceptance_expected() -> u32 {
     #[allow(clippy::cast_possible_truncation)]

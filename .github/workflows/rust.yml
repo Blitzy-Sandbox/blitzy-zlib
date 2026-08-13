@@ -6,25 +6,43 @@
 # consumer already linked against `libz` keeps working with no edit and no
 # recompilation.  Every claim in that sentence is checked by a job below.
 #
-# ★ THE JOB INVENTORY, and it is the whole of it -- EIGHTEEN jobs, in the order
+# ★ THE JOB INVENTORY, and it is the whole of it -- TWENTY-TWO jobs, in the order
 # they appear in this file.  Anything not on this list does not exist here, and
 # every name here can be found as a `<name>:` key under `jobs:`:
 #
 #     build-test   format   lint     deny      msrv     integer-models
 #     features     simd     differential       differential-exhaustive
-#     symbols      header   dropin   miri      asan     fuzz
-#     cmake-rust   bench
+#     symbols      header   dropin   platform-abi-macos platform-abi-windows
+#     miri         miri-harness       miri-facade        asan
+#     fuzz         cmake-rust         bench
 #
-# Three of the seven `make rust*` targets are invoked from here, so those parts
-# are reproducible by hand exactly as CI runs them: `make rust` (build-test's
-# sibling jobs `symbols`, `header`, `dropin` and `cmake-rust`), `make rust-header`
-# (`header`) and `make rust-pc` (`symbols`, `dropin`).  `make rust-test`,
-# `make rust-symbols`, `make rust-msrv` and `make rust-clean` are NOT invoked
-# here: the jobs that cover the same ground -- `dropin`, `symbols` and `msrv` --
-# drive the compilers directly so that the CI transcript names each assertion
-# individually.  Run the make targets locally as well; they are the same checks
-# with a different reporting surface, and Makefile.in's header comment states for
-# each one what it does and does not establish.
+# This list is CHECKED rather than maintained by hand: check 8 of
+# .github/scripts/docs_consistency_gate.py compares it against the `jobs:` keys in
+# BOTH directions and fails on either a job missing from it or a name on it that no
+# longer exists.  It said EIGHTEEN while twenty-two were declared -- `miri-harness`,
+# `miri-facade` and the two `platform-abi-*` jobs were absent from it -- which is
+# exactly the drift a header inventory invites and the reason it is now gated.
+#
+# THE `make rust*` TARGETS.  Nine exist; SEVEN are named in this file, so those
+# parts are reproducible by hand exactly as CI runs them:
+#
+#     make rust          `symbols`, `header`, `dropin`, `cmake-rust`
+#     make rust-header   `header`
+#     make rust-pc       `symbols`, `dropin`
+#     make rust-test     named in prose as the local equivalent
+#     make rust-symbols  likewise
+#     make rust-msrv     likewise
+#     make rust-clean    likewise
+#
+# The four named only in prose are NOT run as steps: the jobs covering the same
+# ground -- `dropin`, `symbols` and `msrv` -- drive the compilers directly so that
+# the CI transcript names each assertion individually.  `make rust-simd` and
+# `make rust-inventory` are the two not named here at all; the `simd` and `dropin`
+# jobs invoke their gate scripts -- simd_vector_gate.py and
+# artifact_inventory_gate.py -- directly instead, for the same reason.  Run every
+# target locally as well; they are the same checks with a different reporting
+# surface, and Makefile.in's header comment states for each one what it does and
+# does not establish.
 #
 # What each job enforces, by the quality-bar constraint it answers:
 #
@@ -103,8 +121,11 @@
 #                       comparable to the way the C oracle is BUILT, and the
 #                       shipped profile with the vectorised checksum backends;
 #                     * self-tests the gate against a committed synthetic log
-#                       before trusting it, 35 cases including deliberate
-#                       failures, because a gate that cannot fail is not a gate;
+#                       before trusting it -- including deliberate failures,
+#                       because a gate that cannot fail is not a gate.  The case
+#                       count is deliberately not repeated here: it said 35 while
+#                       the suite ran 49, and the suite prints its own total on
+#                       every run, which is the figure to read;
 #                     * GATES the measurements with `.github/scripts/bench_gate.py`
 #                       -- a committed program, not a heredoc -- which validates
 #                       each suite's own declared inventory, enforces the AAP
@@ -255,20 +276,6 @@ on:
         options:
           - '1'
           - 'full'
-      provision_silesia:
-        description: >-
-          Fetch the pinned Silesia corpus and populate the `silesia-<digest>`
-          cache that the acceptance gate reads. This is the ONE path in this
-          workflow that reaches the network, it exists only so the requirement
-          the schedule and release events impose can be satisfied from here, and
-          it is reachable only by a human choosing it on this screen -- never from
-          a push, a pull request, the schedule or a release. It refuses unless the
-          repository variable ZLIB_RS_SILESIA_SHA256 pins a digest, and it
-          verifies what it fetched against that pin before saving anything. No
-          gate ever fetches: see `crates/zlib-rs-differential/corpus/fetch_silesia.sh`.
-        default: false
-        required: false
-        type: boolean
 
 # Least privilege, declared once at the top so that it applies to every job and a
 # new job cannot inherit more than it needs.  Nothing here writes to the
@@ -1131,6 +1138,38 @@ jobs:
         set -eu
         ZLIB_RS_SIMD=1 cargo build --locked -p libz-rs-sys --features simd
         ZLIB_RS_SIMD=0 cargo build --locked -p libz-rs-sys
+
+    - name: Run test cases (the feature really vectorizes what it claims)
+      # ★ WHAT THIS CLOSES.  AAP 0.5.1.4 describes this feature as enabling
+      # "vectorized CRC-32 and Adler-32 backends", and until now nothing measured
+      # whether either backend WAS vectorized.  One of them was not: the file, the
+      # Cargo feature and the backend type were all called `simd' while the compiled
+      # CRC-32 body contained ZERO vector instructions.  Naming is not evidence.
+      #
+      # `.github/scripts/simd_vector_gate.py' disassembles the release library built
+      # with --features simd, counts instructions and vector instructions per backend
+      # symbol, and fails when either disagrees with what the tree claims.  It fails in
+      # BOTH directions deliberately: losing Adler-32's vectorization is a regression,
+      # and GAINING it in CRC-32 means several sentences in
+      # crates/zlib-rs/src/crc32/simd.rs, README and rust/README.md have become true and
+      # must be rewritten.  Neither can now happen quietly.
+      #
+      # It does not measure throughput -- benches/checksum_bench.rs and
+      # .github/scripts/bench_gate.py own that, and they own it the right way round: a
+      # backend slower than the one it replaces fails there however many vector
+      # instructions it contains.
+      #
+      # CARGO_TARGET_DIR is isolated because libz-rs-sys is `[lib] name = "z"', so cargo
+      # writes an UNHASHED libz.so and a differently-featured build in the shared
+      # directory would overwrite the one another step measured.
+      shell: bash
+      run: |
+        set -eu
+        CARGO_TARGET_DIR=target/simd cargo build --locked --release \
+          -p libz-rs-sys --features simd
+        python3 .github/scripts/simd_vector_gate.py \
+          --library target/simd/release/libz.so \
+          --expect adler32=vectorized --expect crc32=scalar
 
     - name: Run test cases (the toggle rejects a contradiction)
       # A toggle that accepts a contradiction is a toggle that does nothing, and
@@ -2225,7 +2264,7 @@ jobs:
   # conditional `#include` of zconf.h, cannot reproduce the function-like macros
   # or the conditional large-file duplicate declaration blocks, and alphabetises
   # what zlib.h orders thematically -- so that diff is permanently non-empty
-  # (6,008 lines here) and wiring its exit status up would give a gate that is
+  # (thousands of lines here) and wiring its exit status up would give a gate that is
   # always red or quietly ignored.  It IS run, and written to
   # target/header-gate/aap-0.8.6-raw.diff with the job's artifacts.
   #
@@ -2672,14 +2711,14 @@ jobs:
         # The claim printed above -- "its content is only the reasons cbindgen.toml
         # enumerates" -- was, until this pass existed, a claim: the diff was written
         # to disk and nothing checked it, so a NEW divergence of any kind became one
-        # more line in a 6,020-line artifact nobody could be expected to re-read.
+        # more line in a six-thousand-line artifact nobody could re-read.
         # This turns the claim into an assertion.
         #
         # It cannot classify the raw diff directly, because D8 (comment text) is most
         # of it and doc prose has no syntax to recognise -- a line reading `# Safety`
         # or "Declared at zlib.h L254" is indistinguishable from anything else.  So
         # the comparison is redone on COMMENT-STRIPPED, blank-collapsed copies of the
-        # same two files: D8 then disappears by construction, 6,020 lines become 740,
+        # same two files: D8 then disappears by construction, thousands of lines become 740,
         # and what is left is classifiable line by line.  The raw diff itself is still
         # produced and published exactly as AAP 0.8.6 spells it; this is an ADDITIONAL
         # artifact, aap-0.8.6-classified.diff, with a category for every line.
@@ -3112,7 +3151,7 @@ jobs:
       # non-empty by construction (D1, D3, D5, D7, D8, D9, D10) and so cannot be
       # asserted empty.  That reasoning is sound and the conclusion did not follow:
       # "this diff is allowed to be non-empty" is not "no line of it needs
-      # checking".  A reader was left to confirm by eye that its 6,020 lines
+      # checking".  A reader was left to confirm by eye that its six thousand lines
       # contained only accepted divergence, which is not a gate.
       #
       # HOW IT IS GATED INSTEAD.  Every changed line is classified against the
@@ -3151,6 +3190,76 @@ jobs:
           --allow-extra wcstombs \
           --signature-evidence target/header-gate/signatures.diff \
           --write-diff target/header-gate/aap-0.8.6-raw.diff
+
+    - name: Run test cases (AAP 0.8.6's comparison, post-processed to an EXACTLY EMPTY diff)
+      # WHAT THIS ADDS OVER THE STEP ABOVE, which is the whole reason it exists.
+      # That step proves every one of the raw diff's lines belongs to a class
+      # some named mechanism checks, with zero residue.  This one proves the
+      # stronger statement AAP 0.8.6 actually invites a reader to look for: a
+      # comparison that is EMPTY.  "Non-empty, but every line is explained" leans
+      # on the classifier's rules being complete; "empty" does not lean on
+      # anything, so both are worth having and neither replaces the other.
+      #
+      # HOW IT IS EMPTY WITHOUT WEAKENING ANYTHING.  Not by filtering the diff and
+      # not by touching zlib.h, which is immutable under AAP 0.8.1 directive 2 and
+      # is opened read-only.  Both sides are PROJECTED through cc and c++ into one
+      # canonical rendering of what the contract promises, and the two renderings
+      # are diffed: 95 function types via decltype(&f) mangled and demangled, 19
+      # public typedef widths, 3 caller-visible structs, their 30 fields' offsets
+      # and widths, and 38 integer macros by value -- 185 records, every one a
+      # value a compiler produced rather than text a header happens to contain.
+      #
+      # That is what removes the noise honestly.  Comment prose, blank lines,
+      # declaration ORDER, typedef SPELLING (uLong vs unsigned long) and macro
+      # spelling (0x1321 vs 4897, (-5) vs -5) are dropped because a C consumer
+      # cannot observe any of them; the scaffolding dropped with them -- #include,
+      # extern "C", the #if blocks -- is exactly what the eight standalone dialect
+      # compiles above already cover.  A difference in how a type is SPELLED
+      # therefore cannot create a false failure, and a difference in what a type IS
+      # cannot hide behind a matching spelling.  A textual diff of two headers has
+      # neither property.
+      #
+      # THE RAW DIFF IS STILL PUBLISHED, by --write-raw-diff, so this gate adds a
+      # measurement instead of concealing the difference it normalises.
+      #
+      # THE ALLOWANCES ARE THE MEASURED ONES AND EACH CARRIES ITS REASON: gzopen_w
+      # is declared only under _WIN32, and charf/intf/uIntf are public typedefs
+      # cbindgen prunes because no prototype references them -- tests/abi_layout.rs
+      # pins all three by size instead, so nothing is lost.  A reason is mandatory,
+      # and an allowance that is no longer needed FAILS: the gate preprocesses the
+      # generated side and rejects an allowance for a name that side now declares,
+      # so an allowance cannot outlive its cause and quietly shrink the comparison.
+      run: |
+        set -eu
+        mkdir -p target/header-gate
+        python3 .github/scripts/header_contract_projection_gate.py \
+          --reference zlib.h \
+          --generated generated_zlib.h \
+          --out-dir target/header-gate \
+          --allow-absent-function 'gzopen_w=declared only under _WIN32 (zlib.h L2041), so no consumer off Windows can reference it' \
+          --allow-absent-type 'charf=cbindgen prunes public typedefs that no prototype references; pinned by tests/abi_layout.rs instead' \
+          --allow-absent-type 'intf=the same pruning; pinned by tests/abi_layout.rs instead' \
+          --allow-absent-type 'uIntf=the same pruning; pinned by tests/abi_layout.rs instead' \
+          --write-raw-diff target/header-gate/aap-0.8.6-raw.diff
+
+    - name: Run test cases (the projection gate rejects a perturbed contract)
+      # An empty diff is only evidence if a real divergence would break it, and
+      # that is a property of the gate rather than of the tree -- so it is proven
+      # rather than argued.  --self-test edits a scratch COPY of the generated
+      # header four times over (a changed parameter type, a changed macro value, a
+      # narrowed struct field, a narrowed public typedef) and requires the gate to
+      # FAIL on each; a perturbation that matches nothing is itself a failure, so
+      # the negative control cannot rot into a no-op when a spelling changes.
+      # zlib.h and the real artifact are never written.
+      run: |
+        set -eu
+        python3 .github/scripts/header_contract_projection_gate.py \
+          --self-test \
+          --generated generated_zlib.h \
+          --allow-absent-function 'gzopen_w=declared only under _WIN32' \
+          --allow-absent-type 'charf=pruned by cbindgen' \
+          --allow-absent-type 'intf=pruned by cbindgen' \
+          --allow-absent-type 'uIntf=pruned by cbindgen'
 
     - name: Verify the working tree is unmodified
       # The assertion that makes the target/ redirection above meaningful.  Six
@@ -3497,6 +3606,117 @@ jobs:
         "$D/infcover_rust"
         echo "drop-in replacement: PASS"
 
+    # The audit of the artifact this job has just staged and just proved a
+    # consumer binds.  It belongs here rather than in a job of its own because
+    # the thing under audit is precisely what the steps above produced: the
+    # relinked, version-scripted library with the gzprintf shim, not cargo's own
+    # cdylib.
+    #
+    # WHY IT EXISTS.  deny.toml bans miniz_oxide by name, and the packaged
+    # library contained it anyway -- a whole second DEFLATE decoder inside zlib
+    # -- because a relinked Rust staticlib carries members of the precompiled
+    # std sysroot, those members appear in no lock file, and cargo-deny reads
+    # lock files.  Only the finished artifact can be asked what it holds.  The
+    # same blind spot let the library declare 183 dynamic imports, among them
+    # posix_spawnp, execvp, fork, socket, connect, chroot, setuid and dlsym.
+    # ★ THE HAZARD, DEMONSTRATED RATHER THAN DESCRIBED.  crates/libz-rs-sys emits
+    # -Wl,-soname,libz.so.1, so cargo's own libz.so records that SONAME while no
+    # file of that name sits beside it; a consumer linked -L against cargo's
+    # directory therefore builds and then binds the SYSTEM libz.  That is CWE-426,
+    # and the tree warns about it in three places -- but a warning nobody executes
+    # is a warning that stops being true without anyone noticing.
+    #
+    # This step runs all three cases and asserts each outcome.  The discriminator is
+    # the version string, which is decisive: the port answers ZLIB_VERSION from
+    # zlib.h and the system library answers its own, so `1.3.1' against
+    # `1.3.2.1-motley' names which library actually ran.  AAP 0.8.6's `ln -sf' is
+    # case B, and this is the only place that documented command is executed.
+    - name: Run test cases (cargo's raw output binds the WRONG library, on purpose)
+      run: |
+        set -eu
+        ZVER=$(sed -n 's/^.*define ZLIB_VERSION "\(.*\)".*$/\1/p' zlib.h)
+        [ -n "$ZVER" ] || { echo "::error::no ZLIB_VERSION in zlib.h"; exit 1; }
+
+        W="$RUNNER_TEMP/m10"
+        rm -rf "$W"
+        mkdir -p "$W"
+        cat > "$W/ver.c" <<'EOF'
+        #include <stdio.h>
+        #include "zlib.h"
+        int main(void) { printf("%s\n", zlibVersion()); return 0; }
+        EOF
+
+        # A minimal consumer on purpose: test/example.c calls gzprintf, which the
+        # cdylib cannot export, so it fails to LINK and never reaches the loader --
+        # which would hide the hazard behind an unrelated error.
+        build() {
+          gcc -O2 -I. -o "$W/$1" "$W/ver.c" -L "$2" -lz -Wl,-rpath,"$PWD/$2"
+        }
+
+        SYS=0
+
+        echo "--- A: cargo's directory, no versioned alias (the hazard) ---"
+        build a target/release
+        ldd "$W/a" | grep libz || true
+        GOT=$("$W/a")
+        echo "reports: $GOT"
+        if [ "$GOT" = "$ZVER" ]; then
+          echo "::error::A consumer linked against cargo's raw output reported $GOT,"
+          echo "::error::the port's own version.  That means a versioned alias has"
+          echo "::error::appeared in cargo's directory -- which is what"
+          echo "::error::dropin_chain.rs::cargo_s_own_directory_is_not_mistakable_for_a_drop_in"
+          echo "::error::forbids, and for measured reasons: read its doc comment."
+          exit 1
+        fi
+        SYS=1
+
+        echo "--- B: same directory, with AAP 0.8.6's ln -sf (the documented fix) ---"
+        ln -sf libz.so target/release/libz.so.1
+        build b target/release
+        ldd "$W/b" | grep libz || true
+        GOT=$("$W/b")
+        echo "reports: $GOT"
+        rm -f target/release/libz.so.1
+        [ "$GOT" = "$ZVER" ] || {
+          echo "::error::with the alias staged the consumer still reported $GOT rather"
+          echo "::error::than $ZVER, so the documented mitigation no longer works."
+          exit 1
+        }
+
+        echo "--- C: what make rust staged (what consumers should use) ---"
+        build c target/dropin
+        ldd "$W/c" | grep libz || true
+        GOT=$("$W/c")
+        echo "reports: $GOT"
+        [ "$GOT" = "$ZVER" ] || {
+          echo "::error::a consumer of the STAGED drop-in reported $GOT rather than"
+          echo "::error::$ZVER.  The staged tree is not being bound; check the chain."
+          exit 1
+        }
+
+        [ "$SYS" = 1 ]
+        echo "provider integrity: hazard reproduced, both mitigations effective"
+
+    - name: Run test cases (the packaged artifact holds only declared code)
+      run: |
+        set -eu
+        SOV="$DROPIN_SOV"
+        python3 .github/scripts/artifact_inventory_gate.py \
+          --library "target/dropin/$SOV"
+
+        # Independent of the gate's own verdict: the selection change that made
+        # the artifact auditable has to still be in force.  A library importing
+        # more than a hundred symbols has gone back to whole-archive even if
+        # every crate inside it happens to be declared.
+        N=$(nm -D --undefined-only "target/dropin/$SOV" | wc -l)
+        echo "dynamic imports: $N"
+        [ "$N" -lt 100 ] || {
+          echo "::error::target/dropin/$SOV imports $N symbols.  Demand-driven"
+          echo "::error::member selection plus --gc-sections yields about 54; a"
+          echo "::error::count this high means the relink pulls all of std again."
+          exit 1
+        }
+
     - name: Run test cases (static pkg-config consumer)
       # The drivers above are linked by hand.  A real consumer asks pkg-config,
       # and that is where the two implementations genuinely differ: a Rust
@@ -3787,10 +4007,15 @@ jobs:
 
         nm -gU "$D/libz.$ZVER.dylib" | awk 'NF>=3 {print $3}' | sed 's/^_//' \
           | grep -E '^[A-Za-z_][A-Za-z0-9_]*$' | sort -u > "$D/exports.syms"
+        # --expect-abi complete: this job stages the dylib with -force_load, which
+        # pulls in EVERY archive member including the C shim's, so gzprintf and
+        # gzvprintf ARE exported here.  Declaring it is what makes losing them a
+        # failure rather than a line in a log.
         python3 .github/scripts/platform_abi_gate.py \
           --platform macos \
           --exports "$D/exports.syms" \
-          --artifact "$D/libz.$ZVER.dylib"
+          --artifact "$D/libz.$ZVER.dylib" \
+          --expect-abi complete
 
     - name: Run test cases (the unmodified C drivers, linked and run)
       # test/example.c, test/minigzip.c and test/infcover.c compiled with ZERO
@@ -3904,12 +4129,24 @@ jobs:
   # not: the PE analogue of zlib.map is win32/zlib.def, which AAP 0.2.2.3 places
   # out of scope, and build.rs emits no export list for PE in consequence.  What
   # IS in scope, and is what this job establishes, needs none of that file --
-  # cargo produces z.dll and its import library z.dll.lib, and a C consumer can
-  # link against them without recompiling the library, which is the claim this
-  # port makes.  The two names that cannot cross that boundary, gzprintf and
-  # gzvprintf, are the C shim's; .github/scripts/platform_abi_gate.py records
-  # their absence WITH the reason and the citation, so it is accounted for rather
-  # than unnoticed.
+  # cargo produces z.dll and its import library z.dll.lib, and a C consumer that
+  # does not call gzprintf or gzvprintf can link against them without recompiling
+  # the library.
+  #
+  # THE ABI CLASS, STATED RATHER THAN IMPLIED.  z.dll does not export gzprintf or
+  # gzvprintf, so the Windows ABI is a documented SUBSET of the contract, not a
+  # complete drop-in: zlib.h declares both unconditionally, so a Windows consumer
+  # that calls either FAILS TO LINK.  The mechanism is not PE-specific, and saying
+  # "cannot cross a PE boundary" would hide the actual fix -- csrc/gzprintf_shim.c
+  # is compiled and archived on every target, but a cdylib link retains only what
+  # something reaches and nothing in Rust calls either name.  The same thing is
+  # measurable on ELF: cargo's libz.a defines both, cargo's libz.so exports
+  # neither, and `make rust` closes it by naming them in the relink.  PE has no
+  # such packaging step only because win32/zlib.def is out of scope.  So
+  # .github/scripts/platform_abi_gate.py classifies this as a PACKAGING_GAP,
+  # distinct from gzopen_w's NOT_ON_PLATFORM absence on Linux, and this job passes
+  # --expect-abi subset.  That flag fails in BOTH directions, so closing the gap
+  # fails the job until the sentences claiming a subset are rewritten.
   #
   # WHY IT IS WORTH A JOB ANYWAY.  Two things about this platform can be checked
   # NOWHERE else in the workspace.  `gzopen_w` is declared only under _WIN32 and
@@ -3969,10 +4206,19 @@ jobs:
         sed -n 's/^[[:space:]]*Name:[[:space:]]*//p' "$D/coff-exports.txt" \
           | grep -E '^[A-Za-z_][A-Za-z0-9_]*$' | sort -u > "$D/exports.syms"
         echo "z.dll exports $(wc -l < "$D/exports.syms" | tr -d ' ') name(s)"
+        # ★ --expect-abi subset, and the word is load-bearing.  This is cargo's own
+        # cdylib, and a rustc-linked cdylib cannot re-export a symbol arriving from a
+        # native archive -- so z.dll does NOT export gzprintf or gzvprintf, and a
+        # Windows consumer that calls either CANNOT LINK against it.  The gate used to
+        # list those two as expected absences and pass, which read as "fine".  It now
+        # classifies: SUBSET is printed with the consumer consequence spelled out, the
+        # declaration below is what pins it, and closing the PE packaging gap makes
+        # this step FAIL until the prose that records the gap is corrected.
         python3 .github/scripts/platform_abi_gate.py \
           --platform windows \
           --exports "$D/exports.syms" \
-          --artifact target/release/z.dll
+          --artifact target/release/z.dll \
+          --expect-abi subset
 
         # gzopen_w explicitly and by itself, because this is the ONLY job in the
         # workspace that can assert it: it is declared under _WIN32 (zlib.h
@@ -4612,6 +4858,126 @@ jobs:
         name: miri-${{ matrix.slug }}
         path: |
           target/miri.log
+        retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 10b. Miri over the FACADE -- the crate where every raw pointer actually is.
+  #
+  # ★ WHY THIS JOB EXISTS, stated plainly because its absence had a measured
+  # cost.  Job 10 interprets `crates/zlib-rs`, which carries
+  # `#![forbid(unsafe_code)]`; job 10a interprets the differential harness.
+  # Neither reaches `crates/libz-rs-sys` -- the ONE crate permitted `unsafe`, and
+  # the crate that reconstructs slices from caller pointer/length pairs, hands out
+  # the opaque `state` round-trip and invokes caller-supplied `zalloc`/`zfree`.
+  # So the workspace's unsafe surface was the one part of it no interpreter ever
+  # saw.
+  #
+  # Two Critical aliasing defects lived there and CI was green throughout: the
+  # one-shot overlap path formed a shared reference over the caller's source
+  # through the caller's own pointer while a mutable borrow of the caller's
+  # destination was live, and `inflateBack` held a whole-window `&mut` across
+  # every input callback.  Both are undefined behaviour, both were reproduced by
+  # `cargo +nightly miri test -p libz-rs-sys --test alias_overlap` in minutes, and
+  # neither could have been caught by any amount of ordinary testing: the reads
+  # and writes involved are individually in bounds, so nothing crashes and every
+  # answer is correct.  A green suite is not evidence about aliasing; an
+  # interpreter that tracks borrows is.
+  #
+  # WHAT IT RUNS.  `tests/alias_overlap.rs`, which is written for this purpose:
+  # each case drives MORE THAN ONE `OVERLAP_STAGE_BYTES` window of input, because
+  # a single window is exactly the case a wrong design still gets right -- the
+  # first copy happens before the first borrow either way, and it is the second
+  # and later copies that are undefined.  It also checks the ANSWERS, not just the
+  # borrows, so it cannot pass over a build that staged correctly and computed
+  # nonsense.
+  #
+  # COST, measured on this tree rather than estimated: 15 tests, 392 seconds, zero
+  # undefined behaviour.  The 60-minute budget is therefore roughly nine times the
+  # observed cost, which leaves room for the file to grow without anyone having to
+  # revisit this number.
+  #
+  # `-Zmiri-disable-isolation` is required and is not a relaxation of the
+  # borrow checking this job exists for.  Isolation blocks the clock and
+  # environment queries the test harness makes; the aliasing model is unaffected
+  # by it, and Stacked Borrows is what is being asked for here.
+  # ---------------------------------------------------------------------------
+  miri-facade:
+    name: Miri, C ABI facade
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        persist-credentials: false
+
+    - name: Install Rust toolchain
+      run: |
+        rustup toolchain install nightly --profile minimal --component miri,rust-src
+        cargo +nightly miri --version
+
+    - name: Run test cases
+      # CARGO_TARGET_DIR is isolated because `libz-rs-sys` is `[lib] name = "z"`
+      # and therefore writes an UNHASHED `libz.rlib`: a Miri build sharing a
+      # directory with an ordinary one poisons whichever ran second.  Every
+      # non-default build in this workspace does the same thing for the same
+      # reason.
+      env:
+        CARGO_TARGET_DIR: target/miri-facade
+        MIRIFLAGS: -Zmiri-disable-isolation
+      run: |
+        set -euo pipefail
+        mkdir -p target
+        cargo +nightly miri test -p libz-rs-sys --test alias_overlap 2>&1 \
+          | tee target/miri-facade.log
+
+    - name: Run test cases (prove the interpreter saw the boundary)
+      # The same discipline as the two Miri jobs above: a passing log is not
+      # evidence unless it also shows that the tests RAN.  A filter that stops
+      # matching, a target renamed, or a harness that exits before the cases would
+      # each leave "0 passed" and a zero exit status, which reads as a pass.
+      run: |
+        set -euo pipefail
+        LOG=target/miri-facade.log
+        [ -s "$LOG" ] || { echo "::error::$LOG is missing or empty"; exit 1; }
+
+        line=$(grep -E '^test result:' "$LOG" | tail -1)
+        [ -n "$line" ] || { echo "::error::no test result line in $LOG"; exit 1; }
+        echo "miri facade: $line"
+
+        passed=$(printf '%s\n' "$line" | sed -E 's/.* ([0-9]+) passed.*/\1/')
+        failed=$(printf '%s\n' "$line" | sed -E 's/.* ([0-9]+) failed.*/\1/')
+
+        if [ "$failed" -ne 0 ]; then
+          echo "::error::$failed interpreted test(s) failed under Miri. In this job"
+          echo "::error::that most likely means UNDEFINED BEHAVIOUR at the C ABI"
+          echo "::error::boundary rather than a wrong answer -- read the log for the"
+          echo "::error::borrow-stack diagnostic, which names the offending pointer."
+          exit 1
+        fi
+        if [ "$passed" -lt 15 ]; then
+          echo "::error::only $passed test(s) were interpreted, and alias_overlap.rs"
+          echo "::error::held 15 when this gate was written. Either a case was removed"
+          echo "::error::-- which needs saying, because each one covers a distinct"
+          echo "::error::entry point's staging path -- or the target was renamed and"
+          echo "::error::this job no longer reaches it, in which case it is proving"
+          echo "::error::nothing at all."
+          exit 1
+        fi
+        if grep -q 'Undefined Behavior' "$LOG"; then
+          echo "::error::Miri reported undefined behaviour even though the harness"
+          echo "::error::reported success. Read the log."
+          exit 1
+        fi
+        echo "miri facade: $passed interpreted test(s), no undefined behaviour"
+
+    - name: Upload build errors
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      if: failure()
+      with:
+        name: miri-facade
+        path: |
+          target/miri-facade.log
         retention-days: 7
 
   # ---------------------------------------------------------------------------
@@ -6052,20 +6418,96 @@ jobs:
         # admin-settable rather than attacker-settable, so this is defence in depth --
         # but it costs one line and removes the class entirely.
         ZLIB_RS_BENCH_RUNNER_NAME: ${{ vars.ZLIB_RS_BENCH_RUNNER }}
+        # ★ THE SAME EXPRESSION THIS JOB'S `runs-on` USES, evaluated again here so the
+        # classification can be made from what was actually SELECTED rather than from
+        # what is merely configured.  That distinction was the bug: the test was
+        # `[ -n "$ZLIB_RS_BENCH_RUNNER_NAME" ]`, and that variable is a repository
+        # variable which is nonempty on EVERY event once an admin sets it -- including
+        # a pull request, where `runs-on` deliberately resolves to `ubuntu-latest`.
+        # So every PR bench job announced "designated ... overruns FAIL this job" and
+        # gated a 10% limit on a hosted runner measured at a 6.8% run-to-run swing,
+        # which is precisely the outcome the paragraph above says it exists to prevent.
+        #
+        # Keep this expression identical to `runs-on`.  The consistency check below
+        # is what enforces that: if the two ever disagree about which machine this is,
+        # the job fails rather than guessing.
+        ZLIB_RS_BENCH_RUNNER_SELECTED: >-
+          ${{ (github.event_name == 'schedule'
+          || github.event_name == 'workflow_dispatch'
+          || (github.event_name == 'push'
+          && github.ref == format('refs/heads/{0}',
+          github.event.repository.default_branch)))
+          && vars.ZLIB_RS_BENCH_RUNNER || 'ubuntu-latest' }}
+        # What the runner says about ITSELF: `github-hosted`, `self-hosted`, or a
+        # future value.  This is the third, independent axis -- a label can name
+        # anything, so the label alone cannot prove the machine is not hosted.
+        ZLIB_RS_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        ZLIB_RS_EVENT_NAME: ${{ github.event_name }}
       run: |
         set -eu
-        designated=${ZLIB_RS_BENCH_RUNNER_NAME:-}
-        if [ -n "$designated" ]; then
-          authoritative=true
-          echo "runner: designated ($designated) -- throughput overruns FAIL this job"
+        configured=${ZLIB_RS_BENCH_RUNNER_NAME:-}
+        selected=${ZLIB_RS_BENCH_RUNNER_SELECTED:-}
+        environment=${ZLIB_RS_RUNNER_ENVIRONMENT:-}
+        event=${ZLIB_RS_EVENT_NAME:-}
+        echo "event=$event selected-runner=$selected runner.environment=$environment"
+        echo "configured ZLIB_RS_BENCH_RUNNER=${configured:-(unset)}"
+
+        # AUTHORITY REQUIRES ALL THREE, and each one rules out a different way of
+        # being wrong:
+        #
+        #   1. the event is one the allowlist admits          -- a PR cannot claim it
+        #   2. `runs-on` selected the DESIGNATED runner       -- not `ubuntu-latest`
+        #   3. the runner reports itself as not github-hosted -- the label is not a
+        #                                                        promise about the host
+        #
+        # Any one of them failing makes the numbers informational.  That is the
+        # conservative direction: a machine that cannot measure to 10% must not fail a
+        # required check, and a machine that can is opted into deliberately.
+        authoritative=false
+        reason=
+        if [ -z "$configured" ]; then
+          reason="ZLIB_RS_BENCH_RUNNER is unset, so there is no designated runner"
+        elif [ "$selected" = "ubuntu-latest" ] || [ "$selected" != "$configured" ]; then
+          reason="event '$event' selected '$selected' rather than the designated '$configured'"
+        elif [ "$environment" = "github-hosted" ]; then
+          reason="the selected runner reports runner.environment=github-hosted"
+        elif [ -z "$environment" ]; then
+          reason="runner.environment is empty, so this machine's class cannot be established"
         else
-          authoritative=false
-          echo "::notice::this job is running on a hosted runner, so its throughput"
-          echo "::notice::numbers are INFORMATIONAL: an overrun is reported and does not"
-          echo "::notice::fail the job. Set the ZLIB_RS_BENCH_RUNNER repository variable"
-          echo "::notice::to a dedicated runner to make this an authoritative gate."
+          authoritative=true
+        fi
+
+        if [ "$authoritative" = "true" ]; then
+          echo "runner: designated ($selected, runner.environment=$environment) --"
+          echo "runner: throughput overruns FAIL this job"
+        else
+          echo "::notice::this job's throughput numbers are INFORMATIONAL: an overrun is"
+          echo "::notice::reported and does not fail the job, because $reason."
+          echo "::notice::Set the ZLIB_RS_BENCH_RUNNER repository variable to a dedicated"
+          echo "::notice::self-hosted runner and trigger this job from schedule,"
+          echo "::notice::workflow_dispatch, or a push to the default branch to make it an"
+          echo "::notice::authoritative gate."
         fi
         echo "authoritative=$authoritative" >> "$GITHUB_OUTPUT"
+
+        # The consistency assertion that keeps the duplicated expression honest.  A
+        # self-hosted machine reached from an event the allowlist does not admit would
+        # mean `runs-on` and the `env:` expression above have drifted apart, and that
+        # is the exact shape of the hole the allowlist closed -- so it fails loudly
+        # rather than being absorbed into "informational".
+        case "$event" in
+          schedule|workflow_dispatch|push) trusted=true ;;
+          *) trusted=false ;;
+        esac
+        if [ "$trusted" = "false" ] && [ "$environment" != "github-hosted" ] \
+           && [ -n "$environment" ]; then
+          echo "::error::event '$event' is not in the allowlist, yet this job is running"
+          echo "::error::on a runner reporting runner.environment=$environment. The"
+          echo "::error::runs-on expression and the ZLIB_RS_BENCH_RUNNER_SELECTED"
+          echo "::error::expression have drifted apart, which is how untrusted code"
+          echo "::error::reaches a persistent machine. Make them identical again."
+          exit 1
+        fi
 
         # ★ MEASUREMENT-ALTERING FLAGS ARE REJECTED, not merely discouraged.
         #
@@ -6348,11 +6790,14 @@ jobs:
     # at all; the corpus reaches it by a cache entry keyed on the pin, or from a
     # runner that already holds it and names it in ZLIB_RS_SILESIA_DIR.
     #
-    # Fetching lives in exactly one place, the `silesia-provision` job at the end of
-    # this file, which measures nothing, gates nothing, and runs only when a human
-    # dispatches this workflow with its input enabled.  The distinction that matters
-    # is not "this workflow never downloads" but "no gate depends on a download",
-    # and that is what holds.
+    # ★ AND FETCHING LIVES NOWHERE IN THIS WORKFLOW AT ALL.  A `silesia-provision`
+    # job used to sit at the end of this file and fetch, on the reasoning that "the
+    # distinction that matters is not 'this workflow never downloads' but 'no gate
+    # depends on a download'".  That distinction is not the one AAP 0.6.4.4 and
+    # 0.3.1 draw: they say the script is opt-in and never invoked by CI, which is a
+    # property of the workflow rather than of the invoking job's role.  The job is
+    # removed, and both sentences hold now -- no gate depends on a download AND this
+    # workflow never downloads.  Provisioning is done by hand, off-workflow.
     #
     # ★ AND WHEN ARMED IT FAILS CLOSED.  The old shape could reach the acceptance
     # steps, find nothing, download nothing (or download something broken) and
@@ -6377,13 +6822,13 @@ jobs:
     # fork runs neither this repository's schedule nor its releases.  What the
     # exception never licensed was SHIPPING without the number.
     #
-    # The requirement is satisfiable from here rather than only from outside: the
-    # `silesia-provision` job at the end of this file fetches the pinned corpus once
-    # and populates the cache this job restores, and it is reachable only by a human
-    # enabling an input -- never by a push, a pull request, the schedule or a
-    # release.  Every invocation of the script in THIS job remains `--verify-only`,
-    # so no gate here reaches the network.  The network-free refusal test above
-    # still proves, on every push, that armed mode really does refuse absence.
+    # The requirement is satisfied from OUTSIDE this workflow, which is where AAP
+    # 0.6.4.4 puts it: a human runs corpus/fetch_silesia.sh on a trusted machine and
+    # then either names the result in ZLIB_RS_SILESIA_DIR on a runner that holds it,
+    # or populates the pin-keyed cache this job restores.  Every invocation of the
+    # script here is `--pin-status` or `--verify-only`, neither of which reaches the
+    # network.  The network-free refusal test above still proves, on every push, that
+    # armed mode really does refuse absence rather than papering over it.
     # -------------------------------------------------------------------------
     - name: Restore cached corpus
       # Keyed on the pinned checksum, so the cache can only serve the exact corpus
@@ -6436,7 +6881,16 @@ jobs:
       # writes the former into $RUNNER_TEMP and points the latter at it, which is why
       # a repository variable can configure a script that reads a file.
       env:
-        SILESIA_SHA256: ${{ vars.ZLIB_RS_SILESIA_SHA256 }}
+        # ★ FROM THE `pin` STEP, NOT FROM `vars.` DIRECTLY.  This read
+        # `${{ vars.ZLIB_RS_SILESIA_SHA256 }}`, which is a DIFFERENT authority from the
+        # one the cache key uses: the `pin` step resolves the committed
+        # corpus/silesia.pin FIRST and lets the repository variable override it, so with
+        # the pin armed and the variable unset -- the normal arrangement, since the pin
+        # exists precisely so nobody has to remember a variable -- this was EMPTY while
+        # `steps.pin.outputs.sha256` held the real digest.  The cache was then restored
+        # under `silesia-<pin digest>` while this step reasoned about `silesia-` with
+        # nothing after it.  One authority, read in one place, resolved once.
+        SILESIA_SHA256: ${{ steps.pin.outputs.sha256 }}
         SILESIA_MEMBER_MANIFEST: ${{ vars.ZLIB_RS_SILESIA_MEMBER_MANIFEST }}
         # Whether this event ACCEPTS the port or merely checks a change.  A schedule
         # and a published release do; a push, a pull request and a hand dispatch do
@@ -6559,13 +7013,14 @@ jobs:
           echo "::error::all. The committed minimal corpus is not a substitute and this job"
           echo "::error::will not report a pass earned on it."
           echo "::error::"
-          echo "::error::To satisfy this: run this workflow from the Actions tab with the"
-          echo "::error::'provision_silesia' input enabled -- that job fetches the pinned"
-          echo "::error::corpus once and populates the silesia-<digest> cache this job reads"
-          echo "::error::-- or populate that cache yourself, or set ZLIB_RS_SILESIA_DIR on a"
-          echo "::error::runner that already holds the corpus. No GATE downloads it: AAP"
-          echo "::error::0.6.4.4 and the header of"
-          echo "::error::crates/zlib-rs-differential/corpus/fetch_silesia.sh."
+          echo "::error::To satisfy this, provision the corpus OUTSIDE this workflow --"
+          echo "::error::nothing in CI fetches it, by AAP 0.6.4.4 -- and then either set"
+          echo "::error::ZLIB_RS_SILESIA_DIR on a runner that holds it, or populate the"
+          echo "::error::silesia-<digest> cache this job restores. Run"
+          echo "::error::crates/zlib-rs-differential/corpus/fetch_silesia.sh by hand on a"
+          echo "::error::trusted machine: it is opt-in precisely so that neither cargo test"
+          echo "::error::nor any CI job requires the network. This job only ever invokes it"
+          echo "::error::as --verify-only, the mode that fetches nothing and writes nothing."
           echo "::error::"
           echo "::error::Do NOT resolve this by removing the requirement: no other gate in"
           echo "::error::this workspace measures Silesia, so disarming it would leave the"
@@ -6580,11 +7035,12 @@ jobs:
         echo "::warning::on the designated release runner, and on a schedule or a release,"
         echo "::warning::the same condition FAILS the job -- so the omission cannot reach an"
         echo "::warning::accepted build."
-        echo "::warning::To arm it: enable the 'provision_silesia' input on a manual run of"
-        echo "::warning::this workflow (the one path here that fetches, and only when a human"
-        echo "::warning::asks), or provision the corpus outside this workflow, and re-run."
-        echo "::warning::No gate downloads it -- AAP 0.6.4.4 and the header of"
-        echo "::warning::crates/zlib-rs-differential/corpus/fetch_silesia.sh."
+        echo "::warning::To arm it: provision the corpus outside this workflow and re-run."
+        echo "::warning::NO job here fetches it -- AAP 0.6.4.4 makes the corpus opt-in so"
+        echo "::warning::that neither cargo test nor CI requires the network, and every"
+        echo "::warning::invocation of crates/zlib-rs-differential/corpus/fetch_silesia.sh"
+        echo "::warning::in this file is --verify-only. Run that script by hand on a trusted"
+        echo "::warning::machine, then set ZLIB_RS_SILESIA_DIR or populate the cache."
 
     - name: Run test cases (verify the provisioned Silesia corpus, never fetch it)
       # `--verify-only` and ONLY `--verify-only`.  The script's own words for that
@@ -6613,7 +7069,12 @@ jobs:
       # the digest are both data, and a `${{ ... }}` in a `run:` block is text
       # substituted into the program before the shell parses it.
       env:
-        ZLIB_RS_SILESIA_SHA256: ${{ vars.ZLIB_RS_SILESIA_SHA256 }}
+        # The same single authority the cache key was built from, so the digest this
+        # error message names is the digest that was actually looked up.  Reading
+        # `vars.ZLIB_RS_SILESIA_SHA256` here printed `silesia-` with an empty digest
+        # whenever the committed pin was the thing doing the arming, which sent a
+        # reader looking for a cache entry that was never the one requested.
+        ZLIB_RS_SILESIA_SHA256: ${{ steps.pin.outputs.sha256 }}
         ZLIB_RS_SILESIA_MEMBER_SHA256: ${{ steps.acceptance.outputs.manifest }}
         CORPUS_CACHE_HIT: ${{ steps.corpus.outputs.cache-hit }}
       run: |
@@ -6690,142 +7151,4 @@ jobs:
           target/bench/
           target/criterion/
           target/criterion-minimal/
-        retention-days: 7
-
-
-  # ---------------------------------------------------------------------------
-  # 15. Silesia provisioning: the ONE path in this workflow that reaches the
-  # network, and it is reachable only by a human choosing it.
-  #
-  # WHY IT EXISTS.  The `bench` job above now FAILS on a schedule or a published
-  # release when no pinned Silesia corpus can be verified, because AAP 0.8.4
-  # states the throughput and memory bars against that corpus and AAP 0.6.4.6
-  # reads them from it by name.  A requirement nobody can satisfy is not a
-  # requirement, it is a permanently red job -- and the only ways to satisfy it
-  # used to be off-workflow: populate a cache by hand, or hold the corpus on a
-  # self-hosted runner.  This job is the in-tree way, so the gate is enforceable
-  # rather than merely strict.
-  #
-  # HOW IT STAYS INSIDE AAP 0.6.4.4.  That section makes the corpus opt-in "so
-  # `cargo test` and CI never require the network", and
-  # crates/zlib-rs-differential/corpus/fetch_silesia.sh states the boundary in its
-  # own header.  Nothing here weakens either, because this job is not a gate and
-  # cannot be reached by one:
-  #
-  #   * `if:` restricts it to `workflow_dispatch` AND the `provision_silesia`
-  #     input being enabled, so a push, a pull request, the nightly schedule and a
-  #     release can none of them reach it.  A hand dispatch that leaves the input
-  #     alone cannot either -- the default is false.
-  #   * It measures nothing and gates nothing.  It fetches, verifies against the
-  #     pin, and saves a cache.  No test, bench or gate result depends on it
-  #     having run.
-  #   * Every OTHER invocation of the script in this file remains `--verify-only`,
-  #     the mode the script documents as fetching nothing and writing nothing.
-  #
-  # So the property that matters -- no gate requires the network -- is unchanged,
-  # and the property that was missing -- a human can provision from here -- exists.
-  # ---------------------------------------------------------------------------
-  silesia-provision:
-    name: Provision the Silesia corpus (manual)
-    if: github.event_name == 'workflow_dispatch' && inputs.provision_silesia
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-      with:
-        # SEC hardening: the job needs the tree, never the credential.  See the
-        # `permissions` block at the top of this file.
-        persist-credentials: false
-
-    - name: Run test cases (refuse to provision without a pin)
-      # First, because everything after it is meaningless otherwise.  The digest is
-      # both the integrity check and the cache key, so without it this job would
-      # fetch something it cannot validate and store it under a name the gate does
-      # not look for -- the script says it plainly: verifying against nothing is not
-      # verification.
-      run: |
-        set -eu
-        if [ -z "${{ vars.ZLIB_RS_SILESIA_SHA256 }}" ]; then
-          echo "::error::the repository variable ZLIB_RS_SILESIA_SHA256 is unset, so there"
-          echo "::error::is nothing to verify a download against and no key to store it"
-          echo "::error::under -- the same digest is the pin AND the cache key the bench"
-          echo "::error::job's restore step reads. Set it to the SHA-256 of the Silesia"
-          echo "::error::archive first, then re-run this job. Obtain the digest from the"
-          echo "::error::corpus provenance recorded in"
-          echo "::error::crates/zlib-rs-differential/corpus/README.md."
-          exit 1
-        fi
-        echo "pin: ${{ vars.ZLIB_RS_SILESIA_SHA256 }}"
-
-    - name: Restore cached corpus
-      # Asked first so a re-dispatch is cheap and, more importantly, so this job
-      # does not re-download a corpus that is already stored under this exact pin.
-      # No restore-keys, for the same reason the bench job has none: an older
-      # corpus is not a substitute for the pinned one.
-      id: corpus
-      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: target/silesia
-        key: silesia-${{ vars.ZLIB_RS_SILESIA_SHA256 }}
-
-    - name: Run test cases (fetch only on a miss, then verify against the pin)
-      # THE ONE NETWORKED STEP IN THIS FILE.  It runs the script without
-      # `--verify-only`, which is the mode its header reserves for "a human runs
-      # it" -- and a human enabling an input on the Actions screen is that human.
-      # Immediately afterwards the same script is run in `--verify-only` mode, so
-      # what gets cached is only ever a corpus that satisfies the pin, the recorded
-      # provenance and the complete twelve-member inventory.
-      #
-      # On a cache HIT nothing is fetched: the corpus is verified and the job is
-      # already done, which is also how a maintainer can use this job to CHECK an
-      # existing cache entry without spending the download.
-      env:
-        ZLIB_RS_SILESIA_SHA256: ${{ vars.ZLIB_RS_SILESIA_SHA256 }}
-      run: |
-        set -eu
-        SCRIPT=crates/zlib-rs-differential/corpus/fetch_silesia.sh
-        if [ "${{ steps.corpus.outputs.cache-hit }}" = "true" ]; then
-          echo "cache hit for silesia-$ZLIB_RS_SILESIA_SHA256: nothing to fetch."
-          sh "$SCRIPT" --verify-only
-        else
-          echo "cache miss for silesia-$ZLIB_RS_SILESIA_SHA256: fetching once, as dispatched."
-          sh "$SCRIPT" --sha256 "$ZLIB_RS_SILESIA_SHA256"
-          # Independent of the fetch's own checks, and the same mode the gate uses,
-          # so what is saved is what the gate will later accept.
-          sh "$SCRIPT" --verify-only
-        fi
-        ls -l target/silesia
-        du -sh target/silesia
-
-    - name: Run test cases (save the verified corpus under its pin)
-      # Only on a miss -- saving over an existing key is rejected by the cache
-      # service anyway, and attempting it would turn a successful verification into
-      # a confusing failure.  The key is the pin, so the bench job's restore, which
-      # has no restore-keys, can only ever hit the corpus this step verified.
-      if: steps.corpus.outputs.cache-hit != 'true'
-      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: target/silesia
-        key: silesia-${{ vars.ZLIB_RS_SILESIA_SHA256 }}
-
-    - name: Run test cases (report what the acceptance gate will now find)
-      run: |
-        set -eu
-        echo "the silesia-${{ vars.ZLIB_RS_SILESIA_SHA256 }} cache now holds a corpus that"
-        echo "satisfies the pin, its recorded provenance and the complete pinned inventory."
-        echo "The next scheduled run, and any published release, will measure the AAP 0.8.4"
-        echo "throughput and memory bars on it rather than failing for want of it."
-        echo "Nothing else in this workflow fetches: every other invocation of"
-        echo "fetch_silesia.sh here is --verify-only."
-
-    - name: Upload build errors
-      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-      if: failure()
-      with:
-        name: silesia-provision
-        # The stamp and whatever members landed, which is what diagnoses a failed
-        # verification: the script records the URL and archive digest it saw.
-        path: |
-          target/silesia/
         retention-days: 7

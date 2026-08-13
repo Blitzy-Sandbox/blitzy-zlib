@@ -233,7 +233,7 @@ use zlib_rs::compress::{
 };
 use zlib_rs::config::{normalize_deflate_level, Z_DEFAULT_COMPRESSION};
 use zlib_rs::error::ReturnCode;
-use zlib_rs::read_buf::{OneShotSource, OutputRegion};
+use zlib_rs::read_buf::{OneShotSink, OneShotSource, OutputRegion};
 use zlib_rs::uncompress::uncompress2_z_from as core_uncompress2_z_from;
 
 use crate::panic_guard::{fallback, guard, guard_code};
@@ -417,6 +417,13 @@ unsafe fn dest_slice<'a>(dest: *mut Bytef, len: usize) -> OutputRegion<'a> {
 /// it could be undone. So the input is copied first, while no mutable borrow of the output
 /// exists, and the operation reads the copy.
 ///
+/// ★ **"While no mutable borrow exists" has to hold for every window, not just the first**,
+/// and that is what [`one_shot_output`] is for. A bounded stage means the copy is repeated --
+/// once per window -- so it is not enough to sequence the first copy ahead of a call-long
+/// borrow of the destination: such a borrow would still be live when the second window was
+/// taken, and a read through the caller's own pointer would invalidate it. On this arm the
+/// destination is therefore borrowed a round at a time, so the two never coexist at all.
+///
 /// ★ **The copy is bounded**, which is the difference between this and the allocated snapshot
 /// it replaces: it is a fixed stage the core is handed one window at a time, so an
 /// overlapping call's peak memory no longer grows with the caller's own `sourceLen`. See
@@ -521,13 +528,118 @@ impl OneShotSource for OneShotInput {
                 // `stage_one_shot_input`'s own: `total` bytes are readable at `origin` and
                 // nothing mutates them for the duration of the call, so the `len` bytes at
                 // `origin + at` are readable too, `end <= total` having just been established.
-                // No mutable borrow of that region exists -- the only mutable borrow this
-                // module creates is over the caller's *output*, and the whole reason this arm
-                // exists is that the two regions overlap, so the input is never borrowed
-                // mutably at all. `len` is at most `OVERLAP_STAGE_BYTES` because
-                // `max_window` says so and the core honours it, so the returned slice is
-                // exactly `len` bytes.
+                //
+                // ★ No mutable borrow of that region exists **at this instant**, and that is
+                // the whole invariant rather than a restatement of the obvious. The output
+                // borrow on this path is [`OneShotOutput::Rounds`], which the core takes only
+                // *after* this call returns and drops at the end of the round, before the next
+                // one; so a read here is not a foreign access to a live exclusive borrow. It
+                // is the ordering `OneShotSink` exists to make expressible, and the reason a
+                // call-long output region would be undefined behaviour on this arm however
+                // little the two were used together.
+                //
+                // `len` is at most `OVERLAP_STAGE_BYTES` because `max_window` says so and the
+                // core honours it, so the returned slice is exactly `len` bytes.
                 Some(unsafe { stage.fill(origin.wrapping_add(at), len) })
+            }
+        }
+    }
+}
+
+/// Builds the destination provider that matches the input decision
+/// [`stage_one_shot_input`] took.
+///
+/// ★ **Why the destination has a provider at all, and why this is a soundness requirement.**
+/// On the staged path the core copies each input window out of memory this destination also
+/// covers, and Rust's aliasing rules forbid a read through the caller's own pointer while an
+/// exclusive borrow of that memory is live -- whether or not either is ever used again. The
+/// copy therefore has to happen with **no** borrow of the destination in existence, and a
+/// single call-long [`OutputRegion`] cannot offer that. [`OneShotSink`] does: the core takes
+/// a region for one round, immediately after that round's window, and drops it before the
+/// next window is copied. This function is the two answers to it.
+///
+/// On the disjoint path -- every conforming call, and every call the differential corpus
+/// makes -- the region is built exactly once, as it always was, and the core's per-round ask
+/// is the reborrow it always took.
+///
+/// # Safety
+///
+/// `dest` and `dest_len` must satisfy [`dest_slice`]'s contract: either the length is zero,
+/// or that many bytes are writable at `dest` and nothing else views them for the duration of
+/// the call. On the [`OneShotOutput::Rounds`] arm the same obligation is discharged once per
+/// round instead of once per call, which is what makes it compatible with the input copy.
+#[must_use]
+unsafe fn one_shot_output(
+    dest: *mut Bytef,
+    dest_len: usize,
+    staged: &OneShotInput,
+) -> OneShotOutput {
+    match staged {
+        // SAFETY: unsafe-site category 2 -- `dest_slice`'s contract is this function's,
+        // forwarded unweakened. This arm is reached only when the input was proved disjoint
+        // from the destination, so the single call-long borrow cannot alias anything the
+        // core reads.
+        OneShotInput::Direct(_) => OneShotOutput::Whole(unsafe { dest_slice(dest, dest_len) }),
+        OneShotInput::Staged { .. } => OneShotOutput::Rounds {
+            base: dest,
+            total: dest_len,
+        },
+    }
+}
+
+/// What [`one_shot_output`] decided, in the shape the core asks its destination for.
+enum OneShotOutput {
+    /// The ranges are disjoint; one region over the caller's buffer serves the whole call.
+    Whole(OutputRegion<'static>),
+    /// The ranges overlap; a region is rebuilt from the caller's pointer for each round and
+    /// dies with it, so that no borrow of the destination is live when the next input window
+    /// is copied.
+    Rounds {
+        /// The caller's `dest`, i.e. C's `next_out` for this one-shot call.
+        base: *mut Bytef,
+        /// `*destLen` on entry: the caller's whole extent, and the bound every round's
+        /// range is checked against.
+        total: usize,
+    },
+}
+
+impl OneShotSink for OneShotOutput {
+    fn total(&self) -> usize {
+        match self {
+            Self::Whole(region) => region.len(),
+            Self::Rounds { total, .. } => *total,
+        }
+    }
+
+    fn window(&mut self, at: usize, len: usize) -> Option<OutputRegion<'_>> {
+        let end = at.checked_add(len)?;
+        match self {
+            Self::Whole(region) => Some(region.reborrow(at, len)),
+            Self::Rounds { base, total } => {
+                if end > *total {
+                    return None;
+                }
+                if len == 0 {
+                    // No room asked for, so no slice is formed -- the same rule
+                    // `dest_slice` applies to a zero `*destLen`, and it is what keeps a
+                    // one-past-the-end pointer out of `from_raw_parts_mut`.
+                    return Some(OutputRegion::empty());
+                }
+                // SAFETY: unsafe-site category 2 -- reconstruction from a pointer/length
+                // pair, once per round. `base` is non-null with a non-zero `total` on this
+                // arm, because `stage_one_shot_input` only reports an overlap for two
+                // non-empty ranges, so `base.wrapping_add(at)` is in bounds by the
+                // `end <= total` test above and `len` bytes there are writable by this
+                // type's contract. It is the ONLY view of those bytes in existence: the
+                // input arrives through `OverlapStage`, which copies before this is built
+                // and after it has been dropped, and this borrow dies with the round.
+                let slots = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        base.wrapping_add(at).cast::<MaybeUninit<u8>>(),
+                        len,
+                    )
+                };
+                Some(OutputRegion::write_only(slots, init_view()))
             }
         }
     }
@@ -663,16 +775,23 @@ pub unsafe extern "C" fn compress2_z(
         // below, after this returns.
         let mut staged = unsafe { stage_one_shot_input(dest, dest_len, source, sourceLen) };
 
-        // Both views are built exactly once, inside a block that ends before the count is
-        // written back -- which is what lets a `destLen` inside `dest` be written safely,
+        // Both providers are built exactly once, inside a block that ends before the count
+        // is written back -- which is what lets a `destLen` inside `dest` be written safely,
         // and is where C writes it (L63, after the loop). The helpers additionally map the
-        // zero-length cases to genuine empty slices rather than to a dangling pointer.
+        // zero-length cases to genuine empty slices rather than to a dangling pointer, and
+        // the destination provider decides once, from the same address comparison the input
+        // did, whether the caller's buffer is borrowed for the call or for a round.
         let report = {
-            // SAFETY: unsafe-site category 2 -- slice reconstruction. The guard above
-            // established that `dest` is non-null whenever `dest_len` is non-zero, and
-            // the caller's contract makes those bytes writable; the only other view that
-            // could have covered them has been replaced by a copy.
-            let mut output = unsafe { dest_slice(dest, dest_len) };
+            // SAFETY: unsafe-site category 2 -- `one_shot_output`'s contract. `dest` is
+            // non-null whenever `dest_len` is non-zero by the guard above, and the caller's
+            // contract makes those bytes writable. On the disjoint arm one region covers
+            // the whole call and the input was proved not to touch it; on the overlapping
+            // arm no borrow of it exists between rounds, which is what lets the input be
+            // copied out of the same memory.
+            //
+            // ★ The provider is held in a binding that outlives the core call, because the
+            // regions it hands out borrow from it.
+            let mut output = unsafe { one_shot_output(dest, dest_len, &staged) };
             core_compress2_z_from(&mut output, &mut staged, level)
         };
 
@@ -775,11 +894,16 @@ pub unsafe extern "C" fn compress2(
         let mut staged = unsafe { stage_one_shot_input(dest, dest_len, source, source_len) };
 
         let report = {
-            // SAFETY: unsafe-site category 2 -- slice reconstruction. `dest` is non-null
-            // whenever `dest_len` is non-zero by the guard above, and the caller's
-            // contract makes those bytes writable; the only other view that could have
-            // covered them has been replaced by a copy.
-            let mut output = unsafe { dest_slice(dest, dest_len) };
+            // SAFETY: unsafe-site category 2 -- `one_shot_output`'s contract. `dest` is
+            // non-null whenever `dest_len` is non-zero by the guard above, and the caller's
+            // contract makes those bytes writable. On the disjoint arm one region covers
+            // the whole call and the input was proved not to touch it; on the overlapping
+            // arm no borrow of it exists between rounds, which is what lets the input be
+            // copied out of the same memory.
+            //
+            // ★ The provider is held in a binding that outlives the core call, because the
+            // regions it hands out borrow from it.
+            let mut output = unsafe { one_shot_output(dest, dest_len, &staged) };
             core_compress2_z_from(&mut output, &mut staged, level)
         };
 
@@ -1034,16 +1158,21 @@ pub unsafe extern "C" fn uncompress2_z(
         // `source_len` bytes and no mutable borrow of it exists yet.
         let mut staged = unsafe { stage_one_shot_input(dest, dest_len, source, source_len) };
 
-        // Both views are built exactly once, inside a block that ends before either count
+        // Both providers are built exactly once, inside a block that ends before either count
         // is written back. An empty output slice is additionally what discharges
         // `uncompr.c` L42-L43's "next_out cannot be NULL", with no scratch space to
         // manufacture.
         let report = {
-            // SAFETY: unsafe-site category 2 -- slice reconstruction. The guard above
-            // established that `dest` is non-null whenever `dest_len` is non-zero, and
-            // the caller's contract makes those bytes writable; the only other view that
-            // could have covered them has been replaced by a copy.
-            let mut output = unsafe { dest_slice(dest, dest_len) };
+            // SAFETY: unsafe-site category 2 -- `one_shot_output`'s contract. `dest` is
+            // non-null whenever `dest_len` is non-zero by the guard above, and the caller's
+            // contract makes those bytes writable. On the disjoint arm one region covers
+            // the whole call and the input was proved not to touch it; on the overlapping
+            // arm no borrow of it exists between rounds, which is what lets the input be
+            // copied out of the same memory.
+            //
+            // ★ The provider is held in a binding that outlives the core call, because the
+            // regions it hands out borrow from it.
+            let mut output = unsafe { one_shot_output(dest, dest_len, &staged) };
             core_uncompress2_z_from(&mut output, &mut staged)
         };
 
@@ -1151,11 +1280,16 @@ pub unsafe extern "C" fn uncompress2(
         let mut staged = unsafe { stage_one_shot_input(dest, dest_len, source, source_len) };
 
         let report = {
-            // SAFETY: unsafe-site category 2 -- slice reconstruction. `dest` is non-null
-            // whenever `dest_len` is non-zero by the guard above, and the caller's
-            // contract makes those bytes writable; the only other view that could have
-            // covered them has been replaced by a copy.
-            let mut output = unsafe { dest_slice(dest, dest_len) };
+            // SAFETY: unsafe-site category 2 -- `one_shot_output`'s contract. `dest` is
+            // non-null whenever `dest_len` is non-zero by the guard above, and the caller's
+            // contract makes those bytes writable. On the disjoint arm one region covers
+            // the whole call and the input was proved not to touch it; on the overlapping
+            // arm no borrow of it exists between rounds, which is what lets the input be
+            // copied out of the same memory.
+            //
+            // ★ The provider is held in a binding that outlives the core call, because the
+            // regions it hands out borrow from it.
+            let mut output = unsafe { one_shot_output(dest, dest_len, &staged) };
             core_uncompress2_z_from(&mut output, &mut staged)
         };
 
@@ -2539,11 +2673,30 @@ mod tests {
     /// Corrupt input is `Z_DATA_ERROR`, and the entry points do not panic on it.
     ///
     /// This is the local, deterministic check that the boundary forwards the status.
-    /// The exhaustive form of the property -- arbitrary bytes rather than five
-    /// chosen ones -- would need a fuzz target, and `fuzz/` declares a manifest but
-    /// holds none, so nothing in the tree drives these entry points with random
-    /// input. What holds it up instead is structural: the decoder is safe Rust, so a
-    /// malformed stream is a status code rather than a memory-safety event.
+    /// The exhaustive form -- arbitrary bytes rather than five chosen ones -- is
+    /// where the coverage is uneven, and it is worth stating narrowly rather than
+    /// with the sweeping claim that used to stand here ("`fuzz/` declares a manifest
+    /// but holds none"), which was simply wrong: `fuzz/fuzz_targets/` holds five
+    /// targets.
+    ///
+    /// What they do and do not reach, measured:
+    ///
+    /// * The **compress** family IS driven with arbitrary input --
+    ///   `fuzz_deflate.rs` calls `compress`, `compress2` and `compress_z` across a
+    ///   structured configuration space.
+    /// * The **uncompress** family is NOT: no fuzz target calls `uncompress`,
+    ///   `uncompress2` or either `_z` form, so this deterministic test and the
+    ///   differential suites are what cover them. `fuzz_inflate.rs` does drive the
+    ///   streaming decoder with arbitrary bytes, which exercises the same underlying
+    ///   inflate machinery through a different entry point.
+    /// * The **overlapping source and destination** path is covered by
+    ///   `tests/alias_overlap.rs` under Miri rather than by fuzzing, because the
+    ///   property there is aliasing rather than input validity and a fuzzer cannot
+    ///   observe a borrow-stack violation.
+    ///
+    /// What holds the uncompress gap up meanwhile is structural: the decoder is safe
+    /// Rust, so a malformed stream is a status code rather than a memory-safety
+    /// event.
     #[test]
     fn uncompress_rejects_corrupt_input_without_panicking() {
         let corrupt: [&[u8]; 5] = [

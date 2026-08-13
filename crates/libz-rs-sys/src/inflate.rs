@@ -143,12 +143,20 @@
 //! # Panic discipline
 //!
 //! `inflate` is the library's primary untrusted-input surface: it must never panic,
-//! hang or over-read for any input, however malformed, and no fuzz target in the
-//! tree exercises that -- the property is structural. No `unwrap`, `expect`,
-//! `panic!` or panicking index appears in this
+//! hang or over-read for any input, however malformed. That property is held up two
+//! ways, and this paragraph used to deny the first of them ("no fuzz target in the
+//! tree exercises that"), which was wrong --
+//! `fuzz/fuzz_targets/fuzz_inflate.rs` exists precisely to drive this entry point
+//! with arbitrary bytes, and `fuzz_inflate_back.rs` does the same for the callback
+//! path.
+//!
+//! So: **fuzzing** searches for an input that breaks it, at the AAP 0.8.4 budget of
+//! at least 300 seconds per target, and **structure** is why one is not expected to
+//! be found. No `unwrap`, `expect`, `panic!` or panicking index appears in this
 //! module, every fallible step answers a [`ReturnCode`], and each body is wrapped
 //! by [`crate::panic_guard`] so that a panic which somehow occurred would abort
-//! rather than unwind into a C caller.
+//! rather than unwind into a C caller. Neither argument replaces the other: fuzzing
+//! cannot prove absence, and a structural argument is only as good as its audit.
 //!
 //! # Error messages
 //!
@@ -201,7 +209,8 @@ use crate::types::{
     checked_state_mut, code, code_type_from_raw, commit_state, copy_stream, discard_reserved_state,
     gz_headerp, input_slice, install_state, output_region, publish_state, ranges_are_disjoint,
     reserve_state, streams_are_disjoint, take_state, uInt, uLong, widen, z_stream, z_streamp,
-    Bytef, HeaderRanges, OutputScratch, OverlapStage, StateBlock, StateKind, StreamAllocator,
+    Bytef, HeaderRanges, OutputScratch, OutputSegment, OverlapStage, StateBlock, StateKind,
+    StreamAllocator,
 };
 use crate::{Z_BLOCK, Z_NO_FLUSH};
 
@@ -281,6 +290,39 @@ struct InflateSlot {
     /// It is also what makes [`message_ptr`]'s table scan avoidable in the common
     /// case: the pointer is rewritten only when this value changes.
     msg: Option<&'static str>,
+}
+
+/// Where one round of the decoder writes its output.
+///
+/// ★ **Three segments, one of them staged.** A caller may point a `gz_header` field buffer
+/// anywhere inside its own output range -- `zlib.h` L1070-L1096 permits it and says nothing
+/// about the stream's pointers -- and the nine header states *write* through those buffers,
+/// so the bytes a field covers cannot be written through an exclusive borrow of the caller's
+/// memory at the same time. Only those bytes need to move: the head before the span and the
+/// tail after it are the caller's own buffer, written directly, and only the span itself goes
+/// through an [`OutputScratch`] block that [`OutputScratch::stage`] sizes from the span rather
+/// than from `avail_out`.
+///
+/// Which of the three a round gets is [`OutputScratch::segment`]'s answer, and a call with no
+/// overlap at all gets `Caller { cap: usize::MAX }` on its single round -- the whole of
+/// `avail_out`, exactly as before segments existed.
+#[cfg(feature = "libz-compat")]
+enum OutputPlan<'s> {
+    /// The caller's own range, from its current `next_out`, for at most `cap` bytes.
+    Caller {
+        /// The largest number of bytes this round may be offered. [`usize::MAX`] means "no
+        /// cap".
+        cap: usize,
+    },
+    /// The staging block, positioned `done` bytes into the entry-point call's production.
+    Staged {
+        /// The block, borrowed for this round only.
+        scratch: &'s mut OutputScratch,
+        /// How many bytes this entry-point call has produced into the caller's output range
+        /// before this round. Both the region's offset inside the block and the commit's
+        /// running total derive from it, so neither can be forgotten independently.
+        done: usize,
+    },
 }
 
 /// A validated stream plus its state, with the mode tag already synchronised.
@@ -521,16 +563,26 @@ impl Session<'_> {
     /// override simply leaves the residue for the next window. [`OverlapStage`] produces it
     /// and documents the reasoning.
     ///
-    /// # `staged_output`
+    /// # `output`
     ///
     /// The same answer for the other direction, and the case it serves is a `gz_header` field
     /// buffer that overlaps `(next_out, avail_out)` — see [`Session::header_alias_plan`]. The
     /// nine header states write *through* those buffers (`inflate.c` L607-L613, L624-L627,
     /// L659-L662), so a shared `Cell` view of them cannot coexist with an exclusive borrow of
-    /// an output region covering the same bytes. [`Some`] substitutes a block this library owns
-    /// for that borrow; the bytes the decoder produces are copied into the caller's buffer
-    /// below, before the cursors are advanced. It must be exactly `avail_out` bytes long,
-    /// because the core's cursor into it becomes an offset into the caller's buffer.
+    /// an output region covering the same bytes.
+    ///
+    /// [`OutputPlan::Staged`] substitutes a block this library owns for that borrow; the bytes
+    /// the decoder produces are copied into the caller's buffer below, before the cursors are
+    /// advanced. The block covers only the *overlapping span*, so the plan also carries `done`
+    /// — how many bytes this entry-point call has already produced — and the region begins at
+    /// that offset inside the block. That is what keeps a second round from restarting at the
+    /// block's base and committing over the first round's output at the caller's own
+    /// `next_out`.
+    ///
+    /// [`OutputPlan::Caller`] borrows the caller's own range, capped: a call whose header field
+    /// sits part-way into that range writes the head before the span directly, and the cap is
+    /// what stops that round at the span's first byte. Every ordinary call passes
+    /// [`usize::MAX`], which is the whole of `avail_out` and exactly what it always was.
     ///
     /// # Safety
     ///
@@ -541,12 +593,13 @@ impl Session<'_> {
     /// When it is [`Some`], the caller's input region is not borrowed at all and only the
     /// override's own bytes are read, so the two regions may overlap freely. When
     /// `staged_output` is [`None`] the output region must likewise be disjoint from every
-    /// `gz_header` field buffer this call writes through; when it is [`Some`] that requirement
-    /// is discharged by construction, because the caller's output region is not borrowed.
+    /// `gz_header` field buffer this call writes through; when it is [`OutputPlan::Staged`]
+    /// that requirement is discharged by construction, because the caller's output region is
+    /// not borrowed.
     unsafe fn with_buffers<F>(
         &mut self,
         input_override: Option<&'static [u8]>,
-        staged_output: Option<&mut OutputScratch>,
+        output: OutputPlan<'_>,
         body: F,
     ) -> ReturnCode
     where
@@ -596,22 +649,32 @@ impl Session<'_> {
             // contract, so the shared and mutable borrows cannot alias.
             None => unsafe { input_slice(next_in, avail_in) },
         };
-        let mut staged_output = staged_output;
-        let output = match staged_output.as_deref_mut() {
+        let mut plan = output;
+        let output = match &mut plan {
             // The overlapping-header path: the decoder writes into a block this library owns
             // and the commit below moves the produced bytes into the caller's buffer, so no
             // borrow of the caller's output region is formed at all. `OutputScratch` documents
             // why a staged write rather than a refusal.
             //
             // SAFETY: unsafe-site category 2 -- `OutputScratch::region`'s contract. The block
-            // is live for the whole call, is `avail_out` bytes long, and the region is taken
-            // exactly once, so nothing else views those bytes while the decoder holds it.
-            Some(staged) => unsafe { staged.region() },
+            // is live for the whole call, the region is taken exactly once per round, and the
+            // offset `done` places it past whatever earlier rounds produced, so nothing else
+            // views those bytes while the decoder holds it.
+            OutputPlan::Staged { scratch, done } => unsafe { scratch.region(*done) },
             // SAFETY: unsafe-site category 2, as above -- and the output is **write-only**
             // storage rather than a byte slice, because `avail_out` bytes of room is all
             // `zlib.h` L94-L95 promises about it. `output_region` states that argument in
-            // full. On this arm no header field overlaps it, by this function's contract.
-            None => unsafe { output_region(next_out, avail_out) },
+            // full. On this arm no header field overlaps the bytes it covers, by this
+            // function's contract: `cap` stops it at the span's first byte when the span is
+            // ahead of `next_out`, and is `usize::MAX` when there is no span at all.
+            OutputPlan::Caller { cap } => {
+                let extent = widen(avail_out).min(*cap);
+                // SAFETY: as the block comment above states -- `output_region`'s contract,
+                // discharged by this function's own: `next_out` is writable for `avail_out`
+                // bytes and `extent` is at most that, no header field overlaps the bytes it
+                // covers, and this is the only mutable view of them.
+                unsafe { output_region(next_out, narrow_uInt(extent)) }
+            }
         };
 
         let mut stream = InflateStream {
@@ -635,13 +698,14 @@ impl Session<'_> {
         // The staged output reaches the caller's buffer here: after the last use of `stream`,
         // so no borrow of the staging block is live, and before the cursors below are advanced,
         // so the copy lands at the address this call started from.
-        if let Some(staged) = staged_output.as_deref() {
-            // SAFETY: unsafe-site category 2 -- `OutputScratch::commit`'s contract. `produced`
-            // is the core's own cursor into the region built over that block, that region is
-            // out of use, and the caller's `next_out` is writable for `avail_out` bytes by this
-            // function's contract.
+        if let OutputPlan::Staged { scratch, done } = &plan {
+            // SAFETY: unsafe-site category 2 -- `OutputScratch::commit`'s contract. The count
+            // is `done` -- what earlier rounds produced -- plus the core's own cursor into the
+            // region built over that block, so it is the running total the commit is defined
+            // against; that region is out of use; and the caller's `next_out` is writable for
+            // `avail_out` bytes by this function's contract.
             unsafe {
-                staged.commit(produced);
+                scratch.commit(*done, done.saturating_add(produced));
             }
         }
 
@@ -1000,15 +1064,24 @@ impl Session<'_> {
     /// address arithmetic on members read raw -- which is what lets it run before the first
     /// borrow exists.
     ///
+    /// # What the two halves of the answer are
+    ///
+    /// The input half is a [`bool`], because the whole of a window is snapshotted or none of
+    /// it is. The output half is the *span* -- `(begin, end)` offsets from `next_out` -- because
+    /// only the bytes a field covers need to move: [`HeaderRanges::overlap_span`] carries the
+    /// argument, and [`OutputScratch::stage`] is sized from it, so the hidden allocation is
+    /// proportional to the fields the caller placed inside its output range rather than to the
+    /// `avail_out` it chose.
+    ///
     /// # Safety
     ///
     /// [`Session::header_fields`]' contract, and `self.strm` must be the live, validated
     /// stream [`entry`] produced with its four buffer members initialised.
     #[must_use]
-    unsafe fn header_alias_plan(&self) -> (bool, bool) {
+    unsafe fn header_alias_plan(&self) -> (bool, Option<(usize, usize)>) {
         // SAFETY: unsafe-site category 6 -- `header_fields`' contract is this function's.
         let Some(fields) = (unsafe { self.header_fields() }) else {
-            return (false, false);
+            return (false, None);
         };
         let ranges = HeaderRanges::of(fields.map(|(base, capacity)| {
             if base.is_null() {
@@ -1033,7 +1106,7 @@ impl Session<'_> {
 
         (
             ranges.overlap(next_in, widen(avail_in)),
-            ranges.overlap(next_out.cast_const(), widen(avail_out)),
+            ranges.overlap_span(next_out.cast_const(), widen(avail_out)),
         )
     }
 
@@ -1687,22 +1760,30 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
             // SAFETY: unsafe-site categories 1 and 6 -- `header_alias_plan`'s contract is this
             // function's; it reads the header's own members and the stream's four buffer
             // members through raw places and dereferences neither buffer pointer.
-            let (header_over_input, header_over_output) = unsafe { session.header_alias_plan() };
+            let (header_over_input, header_output_span) = unsafe { session.header_alias_plan() };
             // SAFETY: the stream is the validated one `entry` produced, so its four buffer
             // members are readable as plain scalars; nothing is dereferenced through them.
             let overlapping = unsafe { session.buffers_overlap() } || header_over_input;
 
             // ★ **Why the output stage still allocates when the input stage does not.** The
-            // input stage is bounded -- a window at a time is enough, because the loop below
-            // feeds every window -- so it lives on the stack and cannot fail. The output has no
-            // such freedom: the core must be handed the caller's whole `avail_out` extent in one
-            // region or a single call would stop short of what C's would produce, so the block
-            // is `avail_out` bytes and has to come from the stream's own allocator. That is also
-            // the right place for it: it is the caller's own number, so a custom arena must see
-            // it and `test/infcover.c`'s `mem_limit` must be able to refuse it. This path is
-            // reached only when a caller has pointed a `gz_header` field into its own output
-            // range, which no disjoint call ever does.
-            let mut staged_output = if header_over_output {
+            // input stage is bounded by construction -- a window at a time is enough, because
+            // the loop below feeds every window -- so it lives on the stack and cannot fail.
+            // The output block has to outlive several rounds and be copied back, which a stack
+            // buffer in this frame could not be sized for, so it comes from the stream's own
+            // allocator. That is also the right place for it: a custom arena must see it and
+            // `test/infcover.c`'s `mem_limit` must be able to refuse it.
+            //
+            // What it is *not* sized from is the caller's `avail_out`. It covers the
+            // **overlapping span** -- the hull of the bytes a `gz_header` field shares with the
+            // output range -- and the head before it and the tail after it are written straight
+            // into the caller's buffer by rounds that take no staging at all. Sizing the block
+            // from `avail_out` instead put a number the caller chooses, routinely megabytes, on
+            // top of the reference implementation's per-stream footprint, outside the 15%
+            // AAP 0.8.4 allows and invisible in the caller's own accounting except as a
+            // `zalloc` call it never asked for. `HeaderRanges::overlap_span` carries the
+            // argument. This path is reached only when a caller has pointed a `gz_header` field
+            // into its own output range, which no disjoint call ever does.
+            let mut staged_output = if let Some((begin, end)) = header_output_span {
                 // SAFETY: unsafe-site category 4 -- `StreamAllocator::from_stream_ptr`'s
                 // contract. `strm` is the validated stream `entry` produced, and the three
                 // hook members are read through raw places; a stream that published no hooks
@@ -1712,15 +1793,19 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
                     .unwrap_or_else(StreamAllocator::internal);
                 // SAFETY: unsafe-site category 2 -- `OutputScratch::stage`'s contract.
                 // `next_out` is non-null (the guard above rejected a null one) and writable
-                // for `avail_out` bytes by this function's contract, and it stays so until the
-                // commit inside `with_buffers`; nothing of the caller's is read or written
-                // here.
-                let staged = unsafe {
-                    let avail_out = core::ptr::addr_of!((*strm).avail_out).read();
-                    OutputScratch::stage(&allocator, next_out, avail_out)
-                };
+                // for `avail_out` bytes by this function's contract -- `end` is an offset the
+                // span lies within, so it is at most that -- and it stays so until the commit
+                // inside `with_buffers`; nothing of the caller's is read or written here.
+                let staged = unsafe { OutputScratch::stage(&allocator, next_out, begin, end) };
                 if staged.is_none() {
-                    return fallback::STREAM_ERROR_CODE;
+                    // ★ `Z_MEM_ERROR`, not `Z_STREAM_ERROR`. This is an allocation refusal, and
+                    // `zlib.h` L515-L516 lists `Z_MEM_ERROR if there was not enough memory`
+                    // among `inflate`'s own results -- the status C reaches when `updatewindow`
+                    // cannot obtain the sliding window (`inflate.c` L1078-L1081) -- so a caller
+                    // that already handles a memory refusal from this entry point handles this
+                    // one, and `test/infcover.c`'s `mem_limit` sees the answer it forces.
+                    // `Z_STREAM_ERROR` would have told the caller its stream was corrupt.
+                    return fallback::MEM_ERROR_CODE;
                 }
                 staged.map(|staged| (staged, allocator))
             } else {
@@ -1739,13 +1824,26 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
                 session.bind_header_fields();
             }
 
+            // How many bytes this entry-point call has produced into the caller's output range
+            // so far, counted from the `next_out` the span and the staging block were measured
+            // against. It decides which segment the next round writes through and where inside
+            // the block that round begins, so no round can restart at the block's base and
+            // overwrite what an earlier one produced. `entry_room` bounds it: an output *segment*
+            // boundary is not the caller's `avail_out` running out, and only a staged call can
+            // reach one.
+            let mut out_done = 0_usize;
+            // SAFETY: unsafe-site category 1 -- one member read through a raw place on the
+            // validated stream, forming no reference.
+            let entry_room = widen(unsafe { core::ptr::addr_of!((*strm).avail_out).read() });
+
             let outcome = loop {
-                // SAFETY: unsafe-site category 1 -- two members read through raw places on the
+                // SAFETY: unsafe-site category 1 -- three members read through raw places on the
                 // validated stream, forming no reference.
-                let (round_in, round_avail) = unsafe {
+                let (round_in, round_avail, round_room) = unsafe {
                     (
                         core::ptr::addr_of!((*strm).next_in).read(),
                         core::ptr::addr_of!((*strm).avail_in).read(),
+                        core::ptr::addr_of!((*strm).avail_out).read(),
                     )
                 };
                 let remaining = widen(round_avail);
@@ -1774,28 +1872,63 @@ pub unsafe extern "C" fn inflate(strm: z_streamp, flush: c_int) -> c_int {
                     Z_NO_FLUSH
                 };
 
+                // Which part of the caller's output range this round writes through. With no
+                // staging -- every ordinary call -- it is the whole of what is left, uncapped,
+                // and the round is the one it always was.
+                let (plan, region_len) = match staged_output.as_mut() {
+                    Some((scratch, _)) => match scratch.segment(out_done) {
+                        OutputSegment::Staged { len } => (
+                            OutputPlan::Staged {
+                                scratch,
+                                done: out_done,
+                            },
+                            len,
+                        ),
+                        OutputSegment::Caller { cap } => {
+                            (OutputPlan::Caller { cap }, widen(round_room).min(cap))
+                        }
+                    },
+                    None => (OutputPlan::Caller { cap: usize::MAX }, widen(round_room)),
+                };
+
                 // L497-L1152: the whole engine, with `LOAD`/`RESTORE` and the epilogue
                 // handled by `with_buffers`.
                 //
                 // SAFETY: the stream is the validated one and its two regions are readable and
                 // writable by this function's contract; they are either disjoint or the input
                 // is replaced by `staged`, and the output is either disjoint from every header
-                // buffer this call writes through or replaced by `staged_output`, which is what
-                // `with_buffers` requires.
+                // buffer this call writes through or replaced by the staging block `plan`
+                // carries, which is what `with_buffers` requires.
                 let outcome = unsafe {
-                    let staged_output = staged_output.as_mut().map(|(staged, _)| staged);
-                    session.with_buffers(staged, staged_output, |state, stream| {
+                    session.with_buffers(staged, plan, |state, stream| {
                         core_inflate(state, stream, chunk_flush)
                     })
                 };
 
-                if last || outcome != ReturnCode::OK {
+                // SAFETY: unsafe-site category 1 -- two members read through raw places, as
+                // above. `with_buffers` has already written both advanced values.
+                let (left, room_left) = unsafe {
+                    (
+                        widen(core::ptr::addr_of!((*strm).avail_in).read()),
+                        widen(core::ptr::addr_of!((*strm).avail_out).read()),
+                    )
+                };
+                let round_produced = widen(round_room).saturating_sub(room_left);
+                out_done = out_done.saturating_add(round_produced);
+
+                // ★ An output *segment* boundary is not the caller's `avail_out` running out.
+                // When the round filled the segment it was given and the caller still has room,
+                // another round follows over the next segment -- the head before the span, the
+                // span, then the tail -- because C's single call would have written straight
+                // through all three. Without this test a staged call would stop at the first
+                // boundary and produce less than C's would.
+                let segment_boundary =
+                    region_len != 0 && round_produced == region_len && out_done < entry_room;
+
+                if (last || outcome != ReturnCode::OK) && !segment_boundary {
                     break outcome;
                 }
-                // SAFETY: unsafe-site category 1 -- one member read through a raw place, as
-                // above. `with_buffers` has already written the advanced value.
-                let left = widen(unsafe { core::ptr::addr_of!((*strm).avail_in).read() });
-                if remaining.saturating_sub(left) != take {
+                if remaining.saturating_sub(left) != take && !segment_boundary {
                     // The window was not fully consumed -- the output filled, or a
                     // `Z_BLOCK`/`Z_TREES` boundary was reached. Either way this is a state C
                     // reaches from its single call, and it is already published.
@@ -6742,7 +6875,7 @@ mod tests {
         };
         assert_eq!(
             plan,
-            (false, false),
+            (false, None),
             "disjoint header buffers must plan no copying"
         );
 

@@ -78,17 +78,23 @@
 #      `ZLIB_BUILD_RUST` option — it stages `libz.so`/`libz.a` from this crate and
 #      points the exported `ZLIB::ZLIB` and `ZLIB::ZLIBSTATIC` targets at them.
 #      `README-cmake.md` documents the option.
-#   4. `Makefile.in`'s `rust`, `rust-test`, `rust-symbols`, `rust-header`,
-#      `rust-msrv`, `rust-pc` and `rust-clean` targets, all seven of which exist.
+#   4. `Makefile.in`'s `rust`, `rust-pc`, `rust-test`, `rust-symbols`,
+#      `rust-header`, `rust-simd`, `rust-inventory`, `rust-msrv` and `rust-clean`
+#      targets, all nine of which exist -- `grep -oE '^rust[a-z-]*:' Makefile.in`
+#      is the authority, and this list is checked against it by
+#      `.github/scripts/docs_consistency_gate.py` through the same claim in
+#      `rust/README.md`.
 #   5. `zlib.pc`'s `Libs: ... -lz` — which requires `libz.so` / `libz.a`.
 #
 # Related files, and the boundary of this manifest's responsibility:
 #   * `build.rs`    — five jobs: it validates the `ZLIB_RS_SIMD` request against
 #                     the resolved `simd` feature, compiles the two C translation
-#                     units in `csrc/` and emits `-l static=` for the archive they
-#                     go into (which is what makes cargo's `libz.a` define all 95
-#                     contract functions, and what sets `cfg(zlib_rs_gzprintf)` and
-#                     with it `zlibCompileFlags()` bit 27), emits
+#                     units in `csrc/` -- of which only `gzprintf_shim.c` ships, and
+#                     `gzvprintf_probe.c` reaches test targets alone -- and emits
+#                     `-l static=` for the archive the shipped one goes into (which
+#                     is what makes cargo's `libz.a` define all 95 contract
+#                     functions, and what sets `cfg(zlib_rs_gzprintf)` and with it
+#                     `zlibCompileFlags()` bit 27), emits
 #                     `-Wl,-soname,libz.so.1` WHEN `libz-compat` is on (an
 #                     artifact with no exported surface must not claim to be
 #                     `libz.so.1`), locates and
@@ -197,9 +203,9 @@ homepage = "https://zlib.net/"
 #   * `rlib`      -> required so `zlib-rs-differential`, the `benches/` package,
 #                    the `fuzz/` package and this crate's own `tests/*.rs` can
 #                    depend on it as a normal Rust library.  Omitting it would break
-#                    all seven integration tests in `tests/`, the three criterion
-#                    suites and all five fuzz targets, every one of which links this
-#                    crate as an ordinary Rust dependency.
+#                    every integration test in `tests/`, the three criterion suites
+#                    and all five fuzz targets, each of which links this crate as an
+#                    ordinary Rust dependency.
 [lib]
 name = "z"
 crate-type = ["cdylib", "staticlib", "rlib"]
@@ -374,8 +380,9 @@ libc = { version = "0.2.189", optional = true }
 #   * The AAP freezes the dependency inventory and records `cc` as a
 #     build-dependency of `crates/zlib-rs-differential` ONLY, "never a dependency
 #     of `zlib-rs` or `libz-rs-sys`".  `build.rs` DOES compile this crate's own two
-#     C translation units — it has to, because three of the declarations the
-#     contract fixes cannot be written in stable Rust — and it does so by invoking
+#     C translation units — it has to, because two of the declarations the
+#     contract fixes cannot be written in stable Rust, `gzprintf` being variadic and
+#     `gzvprintf` taking a `va_list` — and it does so by invoking
 #     the platform compiler through `std::process::Command`.  No crate is added to
 #     the inventory, and no line of the reference C library is compiled here: the
 #     rule that the C sources are the differential crate's business alone is
@@ -440,18 +447,30 @@ workspace = true
 #                        that combination is allowed.
 # * [[bin]]            — this crate is a library only.
 # * [dev-dependencies] — still nothing to add, and now for a stronger reason than
-#                        when this list was first written: all SEVEN integration
-#                        tests are written -- `abi_layout.rs`, `symbol_parity.rs`,
-#                        `c_api_parity.rs`, `gz_memory.rs`, `gz_printf.rs`,
-#                        `write_only_window.rs` and `rust_api_surface.rs`, which
-#                        is what `cargo metadata` reports for this package -- and
-#                        they need `std` and nothing else.  `symbol_parity.rs`
-#                        reaches its tools the same way, shelling out to `nm` and
-#                        `readelf` through `std::process::Command` rather than
-#                        linking a crate to parse ELF; `gz_printf.rs` drives the
-#                        variadic `gzprintf`/`gzvprintf` through the C probe in
-#                        `csrc/`, and `write_only_window.rs` holds the one
-#                        `unsafe` slice cast outside `src/`.
+#                        when this list was first written: every integration test in
+#                        `tests/` is written, and each needs `std` and nothing else.
+#
+#                        ★ THE INVENTORY IS NOT REPEATED HERE, DELIBERATELY.  This
+#                        comment used to name SEVEN files and assert that that was
+#                        "what `cargo metadata` reports for this package", and by the
+#                        time it was read `cargo metadata` reported NINE: it had
+#                        missed `dropin_chain.rs` when that was added and
+#                        `alias_overlap.rs` when that was.  A hand-maintained copy of
+#                        a list the tool already owns has exactly one failure mode and
+#                        it took it.  `cargo metadata --format-version 1` and
+#                        `ls crates/libz-rs-sys/tests/` are the authority; the guide
+#                        in `rust/README.md` carries the annotated list, and
+#                        `.github/scripts/docs_consistency_gate.py` fails if that list
+#                        and the directory disagree -- so the enumeration exists once,
+#                        in the one place a gate can check it.
+#
+#                        What is worth recording here is why none of them needs a
+#                        dev-dependency: `symbol_parity.rs` shells out to `nm` and
+#                        `readelf` through `std::process::Command` rather than linking
+#                        a crate to parse ELF; `gz_printf.rs` drives the variadic
+#                        `gzprintf`/`gzvprintf` through the C probe in `csrc/`; and
+#                        `write_only_window.rs` holds the one `unsafe` slice cast
+#                        outside `src/`.
 # * links              — the two files in `csrc/` are this crate's own translation
 #                        units, bundled into this crate's own archive.  Neither is
 #                        a system library another package could also claim, and

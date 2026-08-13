@@ -61,7 +61,14 @@ use core::marker::PhantomData;
 ///
 /// # Example
 ///
-/// ```ignore
+/// Illustrative rather than compilable: `header_pointing_at` is a stand-in for whatever builds a
+/// `gz_header` over the caller's buffers, and no such helper exists here. The fence is `text` for
+/// that reason -- as `ignore` it was still compiled by `cargo test --doc -- --include-ignored`,
+/// where it failed with `E0433` and three `E0425`s. `tests/` and
+/// `retention_compile_fail/` hold the forms that really are compiled, and the second holds the
+/// ones that must *not* compile.
+///
+/// ```text
 /// // The header is declared FIRST.  Swap the two lines and this does not compile.
 /// let mut header = header_pointing_at(&mut buffers);
 /// let mut session = port::Session::new(port::zeroed_stream());

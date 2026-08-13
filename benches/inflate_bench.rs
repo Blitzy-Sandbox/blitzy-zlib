@@ -257,12 +257,27 @@
 //!
 //! # Code generation
 //!
-//! Cargo's `bench` profile inherits `[profile.release]`, which the repository root sets to
-//! `lto = "fat"`, `codegen-units = 1` and `opt-level = 3`, so these measurements are taken
-//! against the same code generation as the shipped library. `panic = "abort"` is ignored for
-//! bench targets — cargo does not honour the key there — which is expected and harmless.
-//! Profiles are honoured only in the workspace root, so nothing here declares one and none is
-//! needed.
+//! ★ **`benches/` is its OWN Cargo workspace**, not a member of the root one -- the root
+//! `Cargo.toml` lists only the three `crates/` members -- so `cargo metadata` reports
+//! `workspace_root` as `benches/` and the profiles that apply are the ones
+//! `benches/Cargo.toml` declares itself. It declares three, and which one produced a given
+//! measurement matters enough that a log states it:
+//!
+//! * `[profile.release]` -- `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, matching the
+//!   repository root's release profile, so a measurement taken under it is taken against the
+//!   same code generation as the shipped library.
+//! * `[profile.bench]` -- inherits `release`, and is what `cargo bench` selects by default.
+//! * `[profile.bench-parity]` -- inherits `bench` but sets `lto = false` and
+//!   `codegen-units = 16`, which is deliberately **not** the shipped codegen: it is
+//!   comparable to the way the C oracle is built. CI measures it as its own matrix cell,
+//!   and AAP 0.8.4's limit is decided on the *worse-for-the-port* of the two profiles'
+//!   ratios, so a case that only passes under whole-program optimisation does not pass.
+//!
+//! `ZLIB_RS_BENCH_RUST_PROFILE` carries the selected profile name into the build, because
+//! cargo does not expose it to a build script; the differential crate's build script
+//! cross-checks it and bakes it in, so every summary line reports the profile it came from.
+//! `panic = "abort"` is ignored for bench targets -- cargo does not honour the key there --
+//! which is expected and harmless.
 //!
 //! `-Cllvm-args=-enable-dfa-jump-thread` is the output-neutral codegen lever AAP §0.3.2.4
 //! measured at roughly a 10% gain for small chunked input, which is exactly the shape the
@@ -775,7 +790,7 @@ struct Fixture {
 
 /// The tier-1 corpus, loaded once for the whole process.
 ///
-/// The [`OnceLock`] is what makes "reported once" literal: four groups ask for overlapping fixture
+/// The [`OnceLock`] is what makes "reported once" literal: five groups ask for overlapping fixture
 /// sets and none of them should reprint a diagnostic. All ten committed fixtures together are under
 /// 92 KiB, so caching them costs nothing; the tier-2 corpus is hundreds of megabytes and is
 /// deliberately *not* cached this way -- see [`silesia_members`].
@@ -2158,7 +2173,7 @@ fn throughput_bytes(len: usize) -> Option<Throughput> {
 /// Samples per row.
 ///
 /// 50 rather than criterion's default 100. Cost scales as rows x samples x per-sample time, and this
-/// file registers rows across five groups, so criterion's 100 samples at its default five-second
+/// file registers rows across six groups, so criterion's 100 samples at its default five-second
 /// measurement would put a full run far enough past a coffee break that it stops being run. Fifty
 /// samples still gives criterion enough to resample from for a usable confidence interval, and
 /// criterion refuses fewer than ten outright.

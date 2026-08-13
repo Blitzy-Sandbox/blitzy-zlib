@@ -77,7 +77,9 @@
 #                                REFERENCE IMPLEMENTATION is an oracle rather
 #                                than a build dependency.  That is a different
 #                                claim from "no C is compiled": the facade's own
-#                                build.rs compiles the two shims in its csrc/, so
+#                                build.rs compiles the one shipped shim in its
+#                                csrc/ -- gzprintf_shim.c; the sibling
+#                                gzvprintf_probe.c reaches test targets only -- so
 #                                a C compiler and an archiver are prerequisites
 #                                of the default facade build too, and only
 #                                `cargo build -p zlib-rs` needs neither.  Driving

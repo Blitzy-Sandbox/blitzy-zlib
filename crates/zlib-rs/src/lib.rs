@@ -666,12 +666,17 @@ pub use crate::adler32::adler32;
 #[cfg(feature = "rust-api")]
 pub use crate::adler32::adler32_z;
 
-/// Concatenates two Adler-32 checksums.
-///
-/// Backs both `adler32_combine` and `adler32_combine64` in the facade, because the two differ
-/// only in the C type of their length argument.
+/// Concatenates two Adler-32 checksums, at checksum width -- see [`adler32::adler32_combine`].
 #[cfg(feature = "rust-api")]
 pub use crate::adler32::adler32_combine;
+
+/// Concatenates two Adler-32 checksums at the width the reference computes in.
+///
+/// Backs both `adler32_combine` and `adler32_combine64` in the facade, because the two differ
+/// only in the C type of their length argument -- and because answering in `uLong` needs the
+/// 64-bit result an LP64 C build produces. See [`adler32::adler32_combine_wide`].
+#[cfg(feature = "rust-api")]
+pub use crate::adler32::adler32_combine_wide;
 
 /// The swappable Adler-32 backend -- see [`adler32::Adler32Backend`].
 #[cfg(feature = "rust-api")]

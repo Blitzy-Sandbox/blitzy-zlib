@@ -966,3 +966,122 @@ fn the_verifier_rejects_every_documented_perturbation() {
         cases.len() - 1
     );
 }
+
+/// ★ **M-10, the other direction: cargo's own output directory must NOT look like a drop-in.**
+///
+/// Every test above verifies what `make rust` *stages*. This one verifies what cargo *emits*, and
+/// it asserts an absence, which is unusual enough to justify.
+///
+/// The hazard is CWE-426, and it is not hypothetical -- it was reproduced while this test was
+/// written. `crates/libz-rs-sys/build.rs` emits `-Wl,-soname,libz.so.1`, so cargo's `libz.so`
+/// records that SONAME while no file of that name sits beside it. A C program linked
+/// `-L target/release -lz -Wl,-rpath,target/release` therefore builds, and then the loader --
+/// searching for the literal name `libz.so.1`, not finding it there, and continuing -- binds
+/// `/lib/<arch>/libz.so.1`. Measured: such a program printed `1.3.1`, the *system C zlib's*
+/// version, while its author believed it was exercising this port. Creating the alias corrects it
+/// (the same program then printed `1.3.2.1-motley`), and that `ln -sf` is exactly what AAP 0.8.6
+/// prescribes before its drop-in validation.
+///
+/// # So why is the alias asserted ABSENT rather than created?
+///
+/// Because staging it *in cargo's directory* was tried, shipped, and measured to be worse. Three
+/// harms, and the third is decisive:
+///
+/// 1. a build script runs *before* the link and cannot tell `cargo check` from `cargo build`, so
+///    `cargo check`, any failed build and `cargo clean -p` each left the name behind as a dangling
+///    link -- which the loader skips exactly as if it were absent, restoring the original hazard;
+/// 2. a `--no-default-features` build left a **zero-export** `libz.so` at the end of that link, and
+///    the alias then pointed at it;
+/// 3. cargo puts that directory first on the library search path of every build script it launches,
+///    and the host binutils record `DT_NEEDED libz.so.1` -- so `as`, `ar`, `nm` and `rustc`
+///    themselves loaded this incomplete library. Measured: up to 32 `no version information
+///    available` notices in one build, and a hard `as: symbol lookup error: undefined symbol:
+///    deflate`.
+///
+/// Harm 3 follows from the *name existing at all*, whatever it points at, so no amount of care in
+/// creating it helps. The alias therefore belongs only where a post-link step can put it, which is
+/// what `Makefile.in`'s `rust` target and the `CMake` block do.
+///
+/// # What this test is for
+///
+/// It makes the invariant enforced instead of merely written down. Anyone who reintroduces the
+/// alias in cargo's directory -- a reasonable-looking fix for a real hazard -- fails here and reads
+/// the three measured harms above before going further. It also requires the notice `build.rs`
+/// writes to be present and current, since that notice is the only thing standing between a
+/// developer and the wrong library.
+#[test]
+fn cargo_s_own_directory_is_not_mistakable_for_a_drop_in() {
+    const NOTICE: &str = "README-cargo-artifacts.txt";
+
+    let mut checked = 0_usize;
+    for profile in ["debug", "release"] {
+        let directory = target_root().join(profile);
+        let library = directory.join("libz.so");
+        if !library.is_file() {
+            println!("{profile}: no libz.so here, nothing to check");
+            continue;
+        }
+        checked += 1;
+
+        // The versioned names, in every spelling the packaged tree uses.
+        for alias in [
+            "libz.so.1".to_owned(),
+            format!("libz.so.{}", zlib_version()),
+            "libz.so.1.dylib".to_owned(),
+            format!("libz.{}.dylib", zlib_version()),
+        ] {
+            let path = directory.join(&alias);
+            assert!(
+                !path.exists() && path.symlink_metadata().is_err(),
+                "{} exists.  Cargo's output directory must not carry a versioned libz name, \
+                 even pointing at a good library: cargo puts this directory first on the \
+                 library search path of every build script it launches, and the host \
+                 binutils record `DT_NEEDED libz.so.1', so `as', `ar', `nm' and `rustc' load \
+                 it while building this very crate -- measured, up to a hard `as: symbol \
+                 lookup error: undefined symbol: deflate'.  Read the doc comment on this \
+                 test before removing this assertion; the hazard it looks like a fix for is \
+                 real, and this is not the fix.  The alias belongs where a POST-link step can \
+                 create it: `make rust' and the CMake block both do.",
+                path.display()
+            );
+        }
+
+        // And the notice, which is the mitigation that IS available here.
+        let notice = directory.join(NOTICE);
+        let body = fs::read_to_string(&notice).unwrap_or_else(|error| {
+            panic!(
+                "{} is missing or unreadable ({error}).  build.rs writes it, and it is the \
+                 only thing in this directory that tells a reader libz.so is not installable.",
+                notice.display()
+            )
+        });
+        for required in [
+            "is NOT the installable shared library",
+            "make rust",
+            "libz.so.1",
+        ] {
+            assert!(
+                body.contains(required),
+                "{} no longer says {required:?}.  The notice and build.rs's \
+                 ARTIFACT_NOTICE_TEXT have diverged, or the notice is stale -- delete the \
+                 file and rebuild.",
+                notice.display()
+            );
+        }
+        println!("{profile}: no versioned alias, notice present and current");
+    }
+
+    if checked == 0 {
+        // An absence proved against an empty directory is not evidence, so this cannot be
+        // silently green -- but nor can it be an unconditional failure: `cargo test` builds
+        // test binaries and an rlib, and produces no `cdylib` at all unless something asked
+        // for one, so a plain `cargo test` run legitimately has nothing here to look at.
+        // That is precisely the distinction ZLIB_RS_REQUIRE_PACKAGED draws, so it decides,
+        // exactly as it does for the staged-tree gates above.
+        unavailable(
+            "neither target/debug nor target/release holds a libz.so, so the absence of a \
+             versioned alias beside it proves nothing. Run `cargo build -p libz-rs-sys' \
+             first",
+        );
+    }
+}

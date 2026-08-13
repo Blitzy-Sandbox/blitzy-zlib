@@ -1,26 +1,36 @@
 //! The ABI gate: every struct size, field offset and integer width the C
 //! contract fixes, asserted at compile time so that drift is a build failure.
 //!
-//! This module contains **no runtime code at all** — no functions, no data, no
-//! exports. It is a wall of `const _: () = assert!(…)` items, and its entire
-//! value is negative: a future edit that perturbs a layout stops the build
-//! instead of silently corrupting the memory of every program that links the
-//! result. A wrong number here is not a bug that shows up as a wrong answer.
-//! It is a wrong *address*, computed inside caller object code this port cannot
-//! recompile, and it corrupts whatever happens to live there.
+//! This module contributes **no code to the artifact**. It is a wall of
+//! `const _: () = assert!(…)` items plus, in §7, a set of functions that exist
+//! only to be type-checked — never called, never codegen'd, and absent from `nm`
+//! on the compiled library. Its entire value is negative: a future edit that
+//! perturbs a layout stops the build instead of silently corrupting the memory of
+//! every program that links the result. A wrong number here is not a bug that
+//! shows up as a wrong answer. It is a wrong *address*, computed inside caller
+//! object code this port cannot recompile, and it corrupts whatever happens to
+//! live there.
 //!
-//! `zlib.h` and `zconf.h` are immutable, and four mechanisms are meant to enforce
-//! that mechanically rather than by review: these compile-time assertions, a
-//! cbindgen header comparison, an `nm` symbol-parity diff against the 111-symbol
-//! reference surface, and the `c-std.yml` sweep proving the unchanged header still
-//! compiles from C89 through gnu2x. Two of the four run on their own: this module,
-//! because declaring it is what evaluates its `const` items, and `c-std.yml`,
-//! because it is an in-tree workflow. The other two do not. `cbindgen` generates a
-//! header but the normalised comparison `cbindgen.toml` specifies is not
-//! implemented anywhere, and the `nm` diff exists only as `Makefile.in`'s
-//! `rust-symbols` target, which nothing invokes automatically. So this module is
-//! the one mechanism a build cannot skip -- which is also why its coverage has to
-//! be exhaustive rather than representative.
+//! `zlib.h` and `zconf.h` are immutable, and four mechanisms enforce that
+//! mechanically rather than by review: these compile-time assertions, a cbindgen
+//! header comparison, an `nm` symbol-parity diff against the 111-symbol reference
+//! surface, and the `c-std.yml` sweep proving the unchanged header still compiles
+//! from C89 through gnu2x.
+//!
+//! ★ An earlier version of this paragraph reported the last three as aspirations —
+//! "the normalised comparison `cbindgen.toml` specifies is not implemented
+//! anywhere", and the `nm` diff as something "nothing invokes automatically". Both
+//! statements have been false for some time. The header comparison is
+//! `Makefile.in`'s `rust-header` target and the `header` job of
+//! `.github/workflows/rust.yml`; the symbol diff is `rust-symbols` and the
+//! `symbols` job, and it also exists as `tests/symbol_parity.rs`, so `cargo test`
+//! runs it. All four are wired.
+//!
+//! What remains true, and is the reason this module's coverage has to be
+//! exhaustive rather than representative, is that this is the only one of the four
+//! a **build** cannot skip: declaring the module is what evaluates its items. The
+//! other three are jobs and targets, and a consumer building from a tarball runs
+//! none of them.
 //!
 //! # ★ The two-tier scheme, and why the implications may not be "simplified"
 //!
@@ -31,13 +41,15 @@
 //! bug wearing the costume of a safety check: correct on the target it was
 //! measured on, and a hard build failure on a target where the layout is right.
 //!
-//! Every assertion below therefore belongs to exactly one of three tiers.
+//! Every assertion below therefore belongs to exactly one of five tiers.
 //!
 //! | Tier | Form | Checks on | Catches |
 //! |---|---|---|---|
-//! | **Absolute, LP64** | `!IS_LP64 \|\| <exact number>` | LP64 only | any drift at all |
-//! | **Absolute, LLP64** | `!IS_LLP64 \|\| <exact number>` | LLP64 only | any drift at all |
+//! | **Absolute, LP64** | `!IS_LP64 \|\| <exact number>` | LP64 only | any drift the numbers move |
+//! | **Absolute, LLP64** | `!IS_LLP64 \|\| <exact number>` | LLP64 only | any drift the numbers move |
+//! | **Absolute, ILP32** | `!IS_ILP32 \|\| <exact number>` | ILP32 only | any drift the numbers move |
 //! | **Relational** | `<offset/size relationship>` | every target | reordered, inserted, removed or widened fields |
+//! | **Field type** (§7) | `fn f(s: &T) -> <exact type> { s.field }` | every target | **any** re-type, including one no offset moves |
 //!
 //! The absolutes are written as implications — read `!IS_LP64 || X` as
 //! "under LP64, X" — because that is the one form that is simultaneously exact
@@ -65,28 +77,45 @@
 //!
 //! | Target | Model | Gate | Result |
 //! |---|---|---|---|
-//! | `x86_64-unknown-linux-gnu` | LP64 | `IS_LP64` | LP64 absolutes + relational; clean |
-//! | `x86_64-pc-windows-gnu` | LLP64 | `IS_LLP64` | LLP64 absolutes + relational; clean |
-//! | `i686-unknown-linux-gnu` | ILP32 | neither | relational tier only; clean |
+//! | `x86_64-unknown-linux-gnu` | LP64 | `IS_LP64` | LP64 absolutes + relational + field type; clean |
+//! | `x86_64-pc-windows-gnu` | LLP64 | `IS_LLP64` | LLP64 absolutes + relational + field type; clean |
+//! | `i686-unknown-linux-gnu` | ILP32 | `IS_ILP32` | ILP32 absolutes + relational + field type; clean |
 //!
-//! and, with both gates false, reordering two `z_stream` fields or widening one
-//! still fails the build, because both move a later offset.
+//! and, with every absolute gate false, reordering two `z_stream` fields or
+//! widening one still fails the build, because both move a later offset.
 //!
-//! ## ★ The one thing the relational tier cannot see
+//! ## ★ The thing NO offset-based tier can see, and what actually covers it
 //!
 //! State the limit honestly rather than trust a tier further than it goes: a
-//! *narrowing* re-type that the target's padding entirely absorbs is invisible
-//! to offset arithmetic. Making `total_in` a `u8` on ILP32 leaves it at offset
-//! 8, `next_out` still lands at 12 because a pointer needs 4-byte alignment, and
-//! every link in the chain still holds. Two other mechanisms cover that case,
-//! which is why neither is optional:
+//! *narrowing* re-type that the target's padding entirely absorbs moves no offset
+//! and changes no size, so it is invisible to **every** assertion expressed in
+//! offsets — the relational tier and the absolute tiers alike.
 //!
-//! * On the measured target the absolute tier catches it immediately and loudly
-//!   — that exact `u8` substitution fires **14** of the assertions below.
-//! * On *any* target the cbindgen header comparison catches it, because the generated
-//!   declaration reads `uint8_t total_in;` where `zlib.h` says `uLong total_in;`. That
-//!   comparison is the `header` job of `.github/workflows/rust.yml`, reachable locally
-//!   as `make rust-header`, so the second net is a gate rather than a habit.
+//! An earlier version of this block said the absolute tier covered it. **It does
+//! not, and the counterexample was measured rather than argued.** Change
+//! `z_stream`'s last field, `reserved`, from `uLong` to `u8` and build for
+//! `i686-unknown-linux-gnu`: the struct is still 56 bytes, `reserved` is still at
+//! offset 52, and *every* size and offset assertion in this file passes — because
+//! the three bytes the field gave up become tail padding that the 4-byte alignment
+//! required anyway. On LP64 the same substitution does move offsets, which is
+//! precisely why the gap was easy to miss from a 64-bit host, and why an ILP32
+//! absolute tier — which this file now also carries, and which earns its place on
+//! the reordering and widening cases — is not the answer to it.
+//!
+//! Two mechanisms cover it, and the first is the one a build cannot skip:
+//!
+//! * **§7, the field-type tier.** Each field is returned from a function annotated
+//!   with the type the contract fixes, and Rust does not coerce in return position,
+//!   so a re-typed field fails with `error[E0308]: mismatched types` on every
+//!   target whatever the padding does. Verified against the `reserved` case above:
+//!   with §7 present that build produces exactly **one** error in the whole crate,
+//!   and it is §7's. Nothing else in the codebase noticed.
+//! * **The cbindgen header comparison**, because the generated declaration reads
+//!   `uint8_t reserved;` where `zlib.h` says `uLong reserved;`. That is the `header`
+//!   job of `.github/workflows/rust.yml`, reachable locally as `make rust-header`.
+//!   It is a real second net — but it lives in a different job, so a green
+//!   cross-compile on its own never proved anything about layout, which is what
+//!   made §7 necessary rather than merely tidy.
 //!
 //! # ★ MSRV: every `offset_of!` is exactly one field deep
 //!
@@ -277,9 +306,52 @@ const IS_LP64: bool = size_of::<*const c_void>() == 8 && size_of::<c_ulong>() ==
 #[allow(dead_code)]
 const IS_LLP64: bool = size_of::<*const c_void>() == 8 && size_of::<c_ulong>() == 4;
 
-// The two models cannot both hold, and this is asserted rather than asserted-by-
-// comment so that a future third gate cannot be written in a way that overlaps.
+/// True on ILP32: 4-byte pointers and a 4-byte `unsigned long`.
+///
+/// ★ **This tier exists because the relational tier was the only cover ILP32 had, and it is
+/// provably not enough.** The module documentation names the gap: a *narrowing* re-type that
+/// the target's padding entirely absorbs moves no later offset, so every relational link
+/// still holds. On ILP32 that gap is at its widest, because every field of `z_stream` is
+/// four bytes wide and four-byte aligned — so making `total_in` a `u8` leaves `next_out` at
+/// 12 exactly as before, and nothing in the relational chain can tell. The two mechanisms
+/// the documentation offered instead were the LP64 absolute tier (which does not run here)
+/// and the cbindgen comparison (which does, but in a different job, so a green cross-compile
+/// proved nothing about layout). Exact numbers close it, and they cost nothing on any other
+/// target because the gate is false there.
+///
+/// The numbers are **measured, not derived**: `gcc -m32 -D_LARGEFILE64_SOURCE=1` on the
+/// unmodified `zlib.h`, reading `sizeof`, `_Alignof` and `offsetof` back. `z_stream` is 56
+/// bytes at align 4 with offsets 0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52;
+/// `gz_header` is 52 at align 4 with offsets 0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44,
+/// 48; and `struct gzFile_s` is 16 at align 4 with `have` 0, `next` 4, `pos` 8. Note the
+/// last one: `pos` is `z_off64_t`, eight bytes, and it sits at offset 8 with the struct
+/// sized 16 rather than 24 — because the i386 ABI aligns `long long` to 4, not 8. That is
+/// exactly the kind of fact a derivation from LP64 gets wrong, and it is why these were
+/// read off a compiler.
+///
+/// `i686-unknown-linux-gnu` is the target this is exercised on, in its own
+/// `CARGO_TARGET_DIR`, by the `integer-models` job of `.github/workflows/rust.yml`.
+//
+// ★ `#[allow(dead_code)]` for the same measured reason as `IS_LP64` above.
+#[allow(dead_code)]
+const IS_ILP32: bool = size_of::<*const c_void>() == 4 && size_of::<c_ulong>() == 4;
+
+// No two models can hold at once, and this is asserted rather than asserted-by-comment so
+// that a future fourth gate cannot be written in a way that overlaps.
 const _: () = assert!(!(IS_LP64 && IS_LLP64));
+const _: () = assert!(!(IS_LP64 && IS_ILP32));
+const _: () = assert!(!(IS_LLP64 && IS_ILP32));
+
+// And at least one of them holds on any target this port supports, so the absolute tier is
+// never silently skipped everywhere at once.  A target with, say, 2-byte pointers would
+// reach this and say so, rather than compiling with relational cover alone.
+const _: () = assert!(
+    IS_LP64 || IS_LLP64 || IS_ILP32,
+    "this target's integer model is none of LP64, LLP64 or ILP32, so no absolute layout \
+     tier applies and only the relational assertions would run.  Measure the three structs \
+     on it and add a fourth tier rather than relying on relational cover, which cannot see \
+     a narrowing that padding absorbs."
+);
 
 // =============================================================================
 //  §1  `z_stream` — `zlib.h` L90-L110.  Measured: 112 bytes, align 8
@@ -362,6 +434,42 @@ const _: () = assert!(!IS_LLP64 || offset_of!(z_stream, reserved) == 80);
 const _: () = assert!(
     !IS_LLP64
         || size_of::<z_stream>() - (offset_of!(z_stream, reserved) + size_of::<c_ulong>()) == 4
+);
+
+// ---- Tier 1c: exact, under ILP32 --------------------------------------------
+//
+//  Read off `gcc -m32 -D_LARGEFILE64_SOURCE=1` on the unmodified `zlib.h`; see
+//  `IS_ILP32` for why this tier exists and why relational cover alone is not
+//  enough here.  Every field is four bytes wide and four-byte aligned, so the
+//  offsets are simply 0, 4, 8, … and the struct has NO tail padding at all --
+//  which is itself worth pinning, because it means any change to a field width
+//  changes `size_of` and cannot hide.
+
+const _: () = assert!(!IS_ILP32 || size_of::<z_stream>() == 56);
+const _: () = assert!(!IS_ILP32 || align_of::<z_stream>() == 4);
+
+const _: () = assert!(!IS_ILP32 || offset_of!(z_stream, next_in) == 0);
+const _: () = assert!(!IS_ILP32 || offset_of!(z_stream, avail_in) == 4);
+const _: () = assert!(!IS_ILP32 || offset_of!(z_stream, total_in) == 8);
+const _: () = assert!(!IS_ILP32 || offset_of!(z_stream, next_out) == 12);
+const _: () = assert!(!IS_ILP32 || offset_of!(z_stream, avail_out) == 16);
+const _: () = assert!(!IS_ILP32 || offset_of!(z_stream, total_out) == 20);
+const _: () = assert!(!IS_ILP32 || offset_of!(z_stream, msg) == 24);
+const _: () = assert!(!IS_ILP32 || offset_of!(z_stream, state) == 28);
+const _: () = assert!(!IS_ILP32 || offset_of!(z_stream, zalloc) == 32);
+const _: () = assert!(!IS_ILP32 || offset_of!(z_stream, zfree) == 36);
+const _: () = assert!(!IS_ILP32 || offset_of!(z_stream, opaque) == 40);
+const _: () = assert!(!IS_ILP32 || offset_of!(z_stream, data_type) == 44);
+const _: () = assert!(!IS_ILP32 || offset_of!(z_stream, adler) == 48);
+const _: () = assert!(!IS_ILP32 || offset_of!(z_stream, reserved) == 52);
+
+// Zero tail padding, stated as the identity it is: the last field ends exactly at
+// the end of the struct.  This is the assertion that makes a padding-absorbed
+// narrowing impossible here rather than merely unlikely -- shrink any field and
+// `size_of` drops below 56, which the first assertion in this block catches.
+const _: () = assert!(
+    !IS_ILP32
+        || size_of::<z_stream>() - (offset_of!(z_stream, reserved) + size_of::<c_ulong>()) == 0
 );
 
 // ---- Tier 2: the general case, on every target ------------------------------
@@ -536,6 +644,36 @@ const _: () = assert!(
     !IS_LLP64 || size_of::<gz_header>() - (offset_of!(gz_header, done) + size_of::<c_int>()) == 4
 );
 
+// ---- Tier 1c: exact, under ILP32 --------------------------------------------
+//
+//  Read off `gcc -m32` on the unmodified header, as for `z_stream`.  Every field
+//  is four bytes wide -- the three pointers, the four `uInt`s, the four `int`s
+//  and the one `uLong` alike -- so the offsets run 0, 4, 8, ... with NO tail
+//  padding, and 52 is the total.  See `IS_ILP32` for why an exact tier is needed
+//  here rather than relational cover alone.
+
+const _: () = assert!(!IS_ILP32 || size_of::<gz_header>() == 52);
+const _: () = assert!(!IS_ILP32 || align_of::<gz_header>() == 4);
+
+const _: () = assert!(!IS_ILP32 || offset_of!(gz_header, text) == 0);
+const _: () = assert!(!IS_ILP32 || offset_of!(gz_header, time) == 4);
+const _: () = assert!(!IS_ILP32 || offset_of!(gz_header, xflags) == 8);
+const _: () = assert!(!IS_ILP32 || offset_of!(gz_header, os) == 12);
+const _: () = assert!(!IS_ILP32 || offset_of!(gz_header, extra) == 16);
+const _: () = assert!(!IS_ILP32 || offset_of!(gz_header, extra_len) == 20);
+const _: () = assert!(!IS_ILP32 || offset_of!(gz_header, extra_max) == 24);
+const _: () = assert!(!IS_ILP32 || offset_of!(gz_header, name) == 28);
+const _: () = assert!(!IS_ILP32 || offset_of!(gz_header, name_max) == 32);
+const _: () = assert!(!IS_ILP32 || offset_of!(gz_header, comment) == 36);
+const _: () = assert!(!IS_ILP32 || offset_of!(gz_header, comm_max) == 40);
+const _: () = assert!(!IS_ILP32 || offset_of!(gz_header, hcrc) == 44);
+const _: () = assert!(!IS_ILP32 || offset_of!(gz_header, done) == 48);
+
+// No tail padding, so a narrowed field cannot hide inside it.
+const _: () = assert!(
+    !IS_ILP32 || size_of::<gz_header>() - (offset_of!(gz_header, done) + size_of::<c_int>()) == 0
+);
+
 // ---- Tier 2: the general case, on every target ------------------------------
 
 const _: () = assert!(offset_of!(gz_header, text) == 0);
@@ -625,10 +763,12 @@ const _: () = assert!(size_of::<gz_headerp>() == size_of::<*mut c_void>());
 //
 //  Coordination with the core, which is where the state actually lives:
 //
-//   * `crates/zlib-rs/src/gz/state.rs` L303-L319 asserts the same absolutes
-//     (24 / 0 / 8 / 16) on its own `GzFileExposed`, and L325-L333 the relational
-//     forms, including `offset_of!(GzState, x) == 0` for the outer struct.
-//   * `crates/libz-rs-sys/src/types.rs` L700-L712 joins the two declarations,
+//   * `crates/zlib-rs/src/gz/state.rs` asserts the same absolutes (24 / 0 / 8 /
+//     16) on its own `GzFileExposed` in its `layout_64` module, which also pins
+//     `offset_of!(GzState, x) == 0` for the outer struct, and states the
+//     relational forms unconditionally beneath it.
+//   * `crates/libz-rs-sys/src/types.rs` joins the two declarations, immediately
+//     below its `gzFile_s` definition,
 //     asserting equal size, equal alignment and equal offsets for all three
 //     fields — the one assertion no other module can make, because no other
 //     module imports both types.
@@ -661,6 +801,23 @@ const _: () = assert!(!IS_LLP64 || offset_of!(gzFile_s, have) == 0);
 const _: () = assert!(!IS_LLP64 || offset_of!(gzFile_s, next) == 8);
 const _: () = assert!(!IS_LLP64 || offset_of!(gzFile_s, pos) == 16);
 
+// ---- Tier 1c: exact, under ILP32 --------------------------------------------
+//
+//  ★ THE ONE SET OF NUMBERS A DERIVATION FROM LP64 GETS WRONG.  `pos` is
+//  `z_off64_t` -- eight bytes on every model -- and on a 64-bit target that
+//  forces it to offset 16 and the struct to 24.  On i386 it does NOT: the ABI
+//  aligns `long long` to 4, not 8, so `pos` sits at 8 and the struct is 16.  Read
+//  off `gcc -m32 -D_LARGEFILE64_SOURCE=1`, not calculated, for exactly that
+//  reason.  These three offsets are the ones the `gzgetc` MACRO compiles into
+//  caller object code (`zlib.h` L1966-L1968), so on a 32-bit consumer a wrong
+//  number here corrupts memory in code this port cannot recompile.
+
+const _: () = assert!(!IS_ILP32 || size_of::<gzFile_s>() == 16);
+const _: () = assert!(!IS_ILP32 || align_of::<gzFile_s>() == 4);
+const _: () = assert!(!IS_ILP32 || offset_of!(gzFile_s, have) == 0);
+const _: () = assert!(!IS_ILP32 || offset_of!(gzFile_s, next) == 4);
+const _: () = assert!(!IS_ILP32 || offset_of!(gzFile_s, pos) == 8);
+
 // ---- Tier 2: the general case, on every target ------------------------------
 //
 //  On a 32-bit target the prefix collapses to `have` at 0, `next` at 4 and `pos`
@@ -684,8 +841,9 @@ const _: () = assert!(size_of::<z_off64_t>() == 8);
 // `gzFile` (`zlib.h` L1354) must stay thin: it is the caller's whole handle.
 const _: () = assert!(size_of::<gzFile>() == size_of::<*mut c_void>());
 
-// The agreement `crates/zlib-rs/src/gz/state.rs` L204-L212 explicitly asks the
-// facade to make: "must const-assert `size_of::<z_off64_t>() == size_of::<ZOff64>()`
+// The agreement the doc comment on `crates/zlib-rs/src/gz/state.rs`'s `ZOff64`
+// explicitly asks the facade to make: "must const-assert
+// `size_of::<z_off64_t>() == size_of::<ZOff64>()`
 // so that a platform where the two disagree fails to build rather than silently
 // truncating a file position."  The core fixes `ZOff64` at `i64` because
 // `gzFile_s::pos` is part of the caller-visible `gzgetc` prefix and cannot be
@@ -835,8 +993,8 @@ const _: () = assert!(align_of::<uInt>() == align_of::<c_uint>());
 // The header's own floor: "16 bits or more".
 const _: () = assert!(size_of::<uInt>() >= 2);
 // Every entry point in this crate widens a `uInt` count to `usize` to index a
-// slice, so the widening must be lossless.  `types.rs` L324 relies on the same
-// relationship for the same reason.
+// slice, so the widening must be lossless.  `types.rs` relies on the same
+// relationship for the same reason, beside its `uInt` alias.
 const _: () = assert!(size_of::<uInt>() <= size_of::<usize>());
 
 // ---- `uLong` — `zconf.h` L406, "unsigned long, 32 bits or more" -------------
@@ -884,8 +1042,8 @@ const _: () = assert!(size_of::<z_off_t>() <= size_of::<z_off64_t>());
 //  and `crc32_z`, and of `gzfread` and `gzfwrite`.  `zconf.h` L265 resolves it to
 //  `size_t` on any ordinary `STDC` build, so it must be exactly `usize`: a
 //  narrower or wider spelling would change those signatures rather than merely
-//  their range.  `types.rs` L329 asserts the size for that reason; the alignment
-//  is added here to complete the pairing.
+//  their range.  `types.rs` asserts the size for that reason beside its
+//  `z_size_t` alias; the alignment is added here to complete the pairing.
 const _: () = assert!(!IS_LP64 || size_of::<z_size_t>() == 8);
 const _: () = assert!(size_of::<z_size_t>() == size_of::<usize>());
 const _: () = assert!(align_of::<z_size_t>() == align_of::<usize>());
@@ -914,8 +1072,8 @@ const _: () = assert!(align_of::<Bytef>() == 1);
 //
 //  Every exported function that reports a status returns a C `int`, and the
 //  `Z_*` constants are `int`s.  Pinning it to 32 bits is what lets a `ReturnCode`
-//  and a state tag round-trip through the boundary unchanged; `types.rs` L1818
-//  asserts the same equality where it converts tags.
+//  and a state tag round-trip through the boundary unchanged; `types.rs` asserts
+//  the same equality beside its `StatePrefix` declaration, where it converts tags.
 //
 //  The `i32` equality is stated unconditionally rather than under the gate, and
 //  the distinction is deliberate: C guarantees only "at least 16 bits", and Rust
@@ -1053,3 +1211,184 @@ const _: () = assert!(
 //  111 globals (95 functions of type `T` plus the 16 version nodes of type `A`,
 //  under the SONAME `libz.so.1`).  The diff is an exact match in both directions:
 //  an extra export fails it exactly as a missing one does.
+
+// =============================================================================
+//  §7  Field TYPES — the tier that closes the narrowing gap, on every target
+// =============================================================================
+//
+//  ★ THIS SECTION EXISTS BECAUSE THE OTHER TWO TIERS PROVABLY CANNOT SEE A
+//  NARROWING, AND THE MODULE DOCUMENTATION ABOVE UNDERSTATED THAT.  It said the
+//  relational tier is blind to "a narrowing re-type that the target's padding
+//  entirely absorbs", and offered the absolute tier as the cover.  Measured, that
+//  cover is incomplete in exactly the case it was claimed for:
+//
+//      #[repr(C)] struct { *const u8, u32, c_ulong, *mut u8, c_ulong }   -- ILP32
+//      size 20, third field at 8, fourth at 12
+//      ... with the third field narrowed to u8:
+//      size 20, third field at 8, fourth at 12          <-- IDENTICAL
+//
+//  Three bytes of padding appear where the field shrank, so `size_of`, every
+//  offset and every relational link are bit-for-bit unchanged.  An exact ILP32
+//  tier -- which this file now also carries, and which is worth having for the
+//  reordering and widening cases -- does not help: it asserts precisely the
+//  numbers that did not move.  On LP64 the same substitution DOES move offsets,
+//  because `uLong` is 8 bytes there and `u8` is 1, which is why the gap was easy
+//  to miss from a 64-bit host.
+//
+//  What sees it is the TYPE SYSTEM.  Each item below is a function that returns a
+//  field, annotated with the type the contract fixes.  Rust does not coerce in
+//  return position, so a field whose type is no longer exactly that fails to
+//  compile with E0308 -- on every target, whatever the padding does.  Verified
+//  both ways on `i686-unknown-linux-gnu`, where the offsets are blind: narrowed,
+//  `error[E0308]: mismatched types`; correct, clean.
+//
+//  These are functions, so this file is no longer literally free of them -- but
+//  they are nested inside `const` items, are never called, and are never
+//  codegen'd: `nm` on the compiled artifact reports none of these names.  The
+//  cost is a type-check; the benefit is the one net that no target's padding can
+//  slip through.
+//
+//  The `alloc_func` and `free_func` fields are deliberately included.  They are
+//  `Option<unsafe extern "C" fn(..)>`, and that is not decoration: it is what
+//  encodes `Z_NULL` as `None` while staying FFI-safe and pointer-sized.  A change
+//  to a bare `fn` pointer would keep every offset and break the null contract.
+
+const _: () = {
+    // §1  `z_stream` -- `zlib.h` L90-L110.
+    #[allow(dead_code)]
+    fn next_in(s: &z_stream) -> *const Bytef {
+        s.next_in
+    }
+    #[allow(dead_code)]
+    fn avail_in(s: &z_stream) -> uInt {
+        s.avail_in
+    }
+    #[allow(dead_code)]
+    fn total_in(s: &z_stream) -> uLong {
+        s.total_in
+    }
+    #[allow(dead_code)]
+    fn next_out(s: &z_stream) -> *mut Bytef {
+        s.next_out
+    }
+    #[allow(dead_code)]
+    fn avail_out(s: &z_stream) -> uInt {
+        s.avail_out
+    }
+    #[allow(dead_code)]
+    fn total_out(s: &z_stream) -> uLong {
+        s.total_out
+    }
+    #[allow(dead_code)]
+    fn msg(s: &z_stream) -> *const c_char {
+        s.msg
+    }
+    #[allow(dead_code)]
+    fn state(s: &z_stream) -> *mut internal_state {
+        s.state
+    }
+    #[allow(dead_code)]
+    fn zalloc(s: &z_stream) -> alloc_func {
+        s.zalloc
+    }
+    #[allow(dead_code)]
+    fn zfree(s: &z_stream) -> free_func {
+        s.zfree
+    }
+    #[allow(dead_code)]
+    fn opaque(s: &z_stream) -> voidpf {
+        s.opaque
+    }
+    #[allow(dead_code)]
+    fn data_type(s: &z_stream) -> c_int {
+        s.data_type
+    }
+    #[allow(dead_code)]
+    fn adler(s: &z_stream) -> uLong {
+        s.adler
+    }
+    #[allow(dead_code)]
+    fn reserved(s: &z_stream) -> uLong {
+        s.reserved
+    }
+};
+
+const _: () = {
+    // §2  `gz_header` -- `zlib.h` L118-L133.  The three `*_max` fields are the
+    // clamps `inflateGetHeader` writes within, so their width is a bounds check
+    // the caller performs on this port's behalf.
+    #[allow(dead_code)]
+    fn text(h: &gz_header) -> c_int {
+        h.text
+    }
+    #[allow(dead_code)]
+    fn time(h: &gz_header) -> uLong {
+        h.time
+    }
+    #[allow(dead_code)]
+    fn xflags(h: &gz_header) -> c_int {
+        h.xflags
+    }
+    #[allow(dead_code)]
+    fn os(h: &gz_header) -> c_int {
+        h.os
+    }
+    #[allow(dead_code)]
+    fn extra(h: &gz_header) -> *mut Bytef {
+        h.extra
+    }
+    #[allow(dead_code)]
+    fn extra_len(h: &gz_header) -> uInt {
+        h.extra_len
+    }
+    #[allow(dead_code)]
+    fn extra_max(h: &gz_header) -> uInt {
+        h.extra_max
+    }
+    #[allow(dead_code)]
+    fn name(h: &gz_header) -> *mut Bytef {
+        h.name
+    }
+    #[allow(dead_code)]
+    fn name_max(h: &gz_header) -> uInt {
+        h.name_max
+    }
+    #[allow(dead_code)]
+    fn comment(h: &gz_header) -> *mut Bytef {
+        h.comment
+    }
+    #[allow(dead_code)]
+    fn comm_max(h: &gz_header) -> uInt {
+        h.comm_max
+    }
+    #[allow(dead_code)]
+    fn hcrc(h: &gz_header) -> c_int {
+        h.hcrc
+    }
+    #[allow(dead_code)]
+    fn done(h: &gz_header) -> c_int {
+        h.done
+    }
+};
+
+const _: () = {
+    // §3  `struct gzFile_s` -- `zlib.h` L1957.  The highest-stakes three in the
+    // file: the `gzgetc` MACRO (L1966-L1968) decrements `have`, increments `pos`
+    // and post-increments `next` inside CALLER object code, so a width change
+    // here is a wrong address computed in a translation unit this port cannot
+    // recompile.  `pos` in particular is `z_off64_t` -- eight bytes on every
+    // model, including the 32-bit ones -- and narrowing it to a 32-bit offset
+    // would keep `have` and `next` exactly where they are.
+    #[allow(dead_code)]
+    fn have(g: &gzFile_s) -> c_uint {
+        g.have
+    }
+    #[allow(dead_code)]
+    fn next(g: &gzFile_s) -> *mut u8 {
+        g.next
+    }
+    #[allow(dead_code)]
+    fn pos(g: &gzFile_s) -> z_off64_t {
+        g.pos
+    }
+};

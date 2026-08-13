@@ -534,29 +534,31 @@ The latest zlib FAQ is at https://zlib.net/zlib_faq.html
     so each operation is scoped on its own, and each block carries a comment
     naming the invariant that makes it sound.
 
-    Counted rather than characterised: 1,153 occurrences across nine files
-    under crates/libz-rs-sys/src/ when this was last counted, and none anywhere
-    else in the shipped library.  crates/zlib-rs has zero, enforced by the
-    compiler rather than by counting.  The counts here are a snapshot; the shape
-    of the claim is what matters, and
+    Located rather than counted: in the shipped library every occurrence is
+    under crates/libz-rs-sys/src/ and none is anywhere else.  crates/zlib-rs has
+    zero, enforced by the compiler rather than by counting.  A total is
+    deliberately not quoted -- this tree documents itself heavily, so the figure
+    moves whenever a comment is written, and a stale number here would read as a
+    finding about the code rather than about this answer.  The shape of the claim
+    is what matters, and
 
         grep -rn --include='*.rs' -E 'unsafe *(\{|fn|extern|impl)' crates fuzz benches \
           | grep -vE ':[0-9]+:[[:space:]]*(//|/\*|\*)'
 
     is how to check it against the tree in front of you.  The second stage
-    matters: the pattern matches prose as readily as code, and this tree
-    documents itself heavily, so without it the same command reports about
-    thirty extra hits -- including a few in crates that provably contain none,
-    because a doc comment quoting an unsafe block is a match.  With it, the
-    three figures in this answer sum to exactly what it prints.
+    matters: the pattern matches prose as readily as code, so without it the
+    same command reports meaningfully more -- including hits in crates that
+    provably contain none, because a doc comment quoting an unsafe block is a
+    match.  With it, it counts constructs.
 
     Outside the shipped library, unsafe appears in three dev-only places and
     each is unavoidable.  crates/zlib-rs-differential/src/oracle.rs declares
     the C oracle the differential tests compare against, and
     crates/zlib-rs-differential/src/port.rs holds the safe boundary gates that
     the differential suites, the benchmarks and all five fuzz targets use to
-    drive the C ABI -- 273 occurrences between the two.  The suites under
-    crates/libz-rs-sys/tests/ have 101 more, for a reason that is structural
+    drive the C ABI.  (Its third module, src/retain.rs, has none: it is a
+    lifetime discipline rather than a boundary.)  The suites under
+    crates/libz-rs-sys/tests/ have unsafe too, for a reason that is structural
     rather than stylistic: calling an extern "C" function is itself an unsafe
     operation, so a test that exercises the facade's own entry points cannot
     avoid an unsafe block however safe the code under test is.  The gates sit

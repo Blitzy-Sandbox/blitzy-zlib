@@ -4,33 +4,111 @@
 //! `simd` feature. It reformulates the braided section of `crc32_z` (`crc32.c`
 //! L637-L920); it does not define a different checksum.
 //!
-//! # ★ This is not SIMD, and the backend is no longer named as though it were
+//! # ★ This is not SIMD, the backend is no longer named as though it were, and a gate now says so
 //!
 //! The file is `simd.rs` and the Cargo feature is `simd` because AAP §0.3.1 fixes this path in the
 //! target layout and §0.5.1.4 fixes the feature name; neither is renamed. **Everything else was.**
 //! The backend type is [`StrideBraid`], its [`Crc32Backend::NAME`] is `"stride-braid"`, and the
-//! entry point is [`crc32_stride_braid`] -- because a review of the compiled `x86_64` release
-//! library found this code's body to contain **zero** vector instructions, and it was previously
-//! called `Simd` / `"simd"` / `crc32_simd`. It is 487 instructions of `mov`, `xor`, `shr` and
-//! `movzbl`: portable integer work that exposes instruction-level parallelism and that LLVM may or
-//! may not autovectorize on a given target. The sibling `adler32/simd.rs` is genuinely different --
-//! its body compiles to 91 SSE2 instructions (`paddd`, `pshufd`, `punpck*`) on the same host -- and
-//! conflating the two is what the old name did.
+//! entry point is [`crc32_stride_braid`] -- because the compiled `x86_64` release library's copy of
+//! this code's body contains **zero** vector instructions, and it was previously called
+//! `Simd` / `"simd"` / `crc32_simd`. It is 348 instructions of `mov`, `xor`, `shr` and `movzbl`:
+//! portable integer work that exposes instruction-level parallelism. The sibling
+//! `adler32/simd.rs` is genuinely different -- 91 of its 326 instructions name an SSE2 register
+//! (`paddd`, `pshufd`, `punpck*`) on the same host -- and conflating the two is what the old name
+//! did.
 //!
-//! The next section says why real vector code is not reachable from here at all.
+//! ★ **Those two numbers are now measured by a committed gate rather than by a one-off review.**
+//! `.github/scripts/simd_vector_gate.py` disassembles the release library built with
+//! `--features simd`, counts instructions and vector instructions per backend symbol, and fails
+//! when either disagrees with what this tree claims. It is reachable as `make rust-simd` and runs
+//! in the `simd` job of `.github/workflows/rust.yml`. It fails in **both** directions on purpose:
+//! losing Adler-32's vectorization is a regression, and *gaining* it here means the paragraphs
+//! below have become false and have to be rewritten. That is why
+//! [`fold_braided_body`] must keep a symbol of its own -- see the note about `#[inline]` at the
+//! foot of this block -- since a body inlined away cannot be measured.
 //!
-//! # Why the implementation is portable integer code
+//! # Why real vector code is not reachable from here, measured rather than asserted
 //!
-//! The crate-wide prohibition on unchecked operations rules out the standard
-//! architecture intrinsics, and stable Rust at the MSRV of 1.80 has no stable portable
-//! vector API. The useful option left is fixed-width, independent integer work that LLVM
-//! can autovectorize. The workspace release profile helps that shape along with `lto = "fat"`,
-//! `codegen-units = 1` and `opt-level = 3` -- and **only** those. `-C target-cpu` is *not* set
-//! anywhere in this repository: there is no `.cargo/config.toml`, and neither `Cargo.toml` nor
-//! `rust-toolchain.toml` sets it, so builds target the default baseline for the triple unless the
-//! person building passes it themselves. Do not write code here that depends on a raised baseline.
-//! Table loads also remain scalar because portable Rust has no gather operation; the gain comes
-//! from independent accumulators and from shortening the serial final combine and byte tail.
+//! Three mechanisms could produce a vectorized CRC-32, and each is blocked by a specific,
+//! citable constraint rather than by a lack of effort:
+//!
+//! * **`core::arch` carry-less multiply.** Blocked at **every released version**, not merely at the
+//!   declared MSRV, and for two independent reasons -- both established by compiling against this
+//!   host's stable 1.97.1 rather than recalled. `#![forbid(unsafe_code)]` (AAP §0.7.1 (a)) rejects
+//!   even the *declaration* of an `unsafe fn` (`error: declaration of an 'unsafe' function`), and:
+//!     1. the load and store intrinsics are still `unsafe fn` outright, because they dereference a
+//!        raw pointer -- `_mm_loadu_si128` and `_mm_storeu_si128` each fail with E0133 "call to
+//!        unsafe function" -- and there is no way to get bytes into a vector register without one;
+//!     2. calling any `#[target_feature]` function from ordinary code is itself unsafe -- E0133
+//!        "call to function `kernel` with `#[target_feature]` is unsafe" -- so wrapping the kernel
+//!        in `#[target_feature(enable = "sse2")]`, which *does* let the arithmetic intrinsics be
+//!        written inside it, only relocates the rejection to the call site.
+//!
+//!   ★ An earlier draft of this very block said an MSRV of 1.87 or later would suffice, on the
+//!   grounds that many `core::arch` intrinsics stopped being `unsafe fn` there. The compile check
+//!   above disproves it: 1.97.1 is well past 1.87 and still refuses both calls. **Raising the MSRV
+//!   does not close this finding**, and a reader should not be sent down that path.
+//!   Containment here is also one of the prompt's twelve critical directives and a stated security
+//!   requirement, not a stylistic preference.
+//! * **`core::simd`.** This is the mechanism AAP §0.2.2.2 names, and it is the one that would
+//!   actually work: the whole lane-parallel shape -- `Simd::from_slice`, `^=`, `reduce_xor` --
+//!   compiles under `#![forbid(unsafe_code)]` with no raw pointer anywhere and emits 25 vector
+//!   instructions, measured on this host. It is blocked by stabilization alone: `portable_simd` is
+//!   still unstable (E0658) on 1.99.0-nightly of 2026-08-11, and this workspace is stable-channel
+//!   with `rust-version = "1.80"` (AAP §0.7.1 (h)). So §0.2.2.2 and §0.7.1 (h) cannot both be
+//!   honoured for CRC-32, and §0.7.1 (h) is the one §0.7.1 elevates to a rule.
+//!
+//! ★ **Which authority settles it.** The two constraints above are not merely derived AAP prose;
+//! both are the requester's own words, preserved verbatim in AAP §0.8.5 so that no later
+//! interpretation can displace them. The build environment is "Rust stable 1.80+", which excludes a
+//! nightly-only API, and the security requirement is "zero unsafe Rust outside a narrowly scoped,
+//! documented C-ABI boundary layer", which excludes an intrinsic kernel in this crate. §0.5.1.4's
+//! description of the feature as enabling a "vectorized CRC-32" is a derived summary in a feature
+//! table. Where a verbatim requirement and a derived description cannot both hold, the verbatim one
+//! governs -- so the code below is what the constraints permit, and the shortfall against §0.5.1.4
+//! is recorded as a divergence rather than closed by breaking one of them.
+//! * **Autovectorization.** A table-driven CRC needs a **gather**: 256-entry rows indexed by a
+//!   byte. Portable Rust has no gather on any target, so the loads are scalar by construction, and
+//!   what remains after them is a handful of exclusive-ors that LLVM correctly declines to
+//!   vectorize -- assembling a vector from four unrelated scalar loads costs more than the three
+//!   XORs it would save. This was tried, not assumed: a transposed lane layout reduced through
+//!   contiguous halving `zip`s -- the canonical autovectorizable shape -- compiled to 398
+//!   instructions with **zero** vector instructions, 50 more than the arrangement below and no
+//!   faster.
+//!
+//! ★ **The vectorizable alternative was written and timed.** A table-free, lane-parallel
+//! formulation -- sixteen contiguous blocks, each folded with the eight-step bitwise LFSR, combined
+//! afterwards exactly as `crc32_combine` combines any two blocks -- does vectorize, and
+//! substantially: 92 of its 398 instructions name an SSE2 register. On the same
+//! `x86_64-unknown-linux-gnu` host, `-O3 -C lto=fat -C codegen-units=1`, it runs at 1.93, 2.03 and
+//! 2.44 ns/byte at 4 KiB, 64 KiB and 1 MiB against the table braid's 0.32, 0.24 and 0.26 --
+//! **6 to 9 times slower**. The reason is arithmetic rather than incidental: a table step buys
+//! eight bits of progress for about two instructions, while a bitwise step buys the same eight bits
+//! for about thirty-two, and dividing by four lanes leaves it eight against two. Shipping it would
+//! trade a measured throughput lever for a measured throughput loss in order to satisfy a
+//! description of the mechanism rather than of the result.
+//!
+//! So the position is recorded rather than papered over: the `simd` feature delivers a genuinely
+//! vectorized **Adler-32** backend and a genuinely faster but **non-vectorized** CRC-32 backend,
+//! both output-neutral, and the gate above is what keeps that statement true. Closing the gap needs
+//! a decision this file cannot take, and there are exactly two candidates. Either `portable_simd`
+//! stabilizes and the MSRV moves to whichever release carries it, which costs no `unsafe` at all and
+//! is what AAP §0.2.2.2 already describes; or AAP §0.7.1 (a) gains an audited exception for a
+//! `#[target_feature]` kernel reached through an `unsafe` dispatch. The second is worth weighing
+//! rather than dismissing -- with `pclmulqdq` reachable a folding CRC-32 is roughly an order of
+//! magnitude *faster* than this braid -- but it widens the attack surface of a memory-safety port,
+//! which is the one thing this port exists to narrow. What is not a candidate is quietly renaming a
+//! scalar function, which is what was here before.
+//!
+//! # What the implementation therefore is
+//!
+//! Fixed-width, independent integer work. The workspace release profile helps that shape along
+//! with `lto = "fat"`, `codegen-units = 1` and `opt-level = 3` -- and **only** those.
+//! `-C target-cpu` is *not* set anywhere in this repository: there is no `.cargo/config.toml`, and
+//! neither `Cargo.toml` nor `rust-toolchain.toml` sets it, so builds target the default baseline
+//! for the triple unless the person building passes it themselves. Do not write code here that
+//! depends on a raised baseline. The gain comes from independent accumulators and from shortening
+//! the serial final combine and byte tail.
 //!
 //! No run-time target-feature probe is performed here -- **none at all**, in contrast to
 //! `adler32/simd.rs`, which exposes an `is_supported()` its parent consults purely as a
@@ -65,11 +143,13 @@
 //!
 //! This backend beats `braid.rs` at every length measured, and that is now a result rather than an
 //! intent. `benches/checksum_bench.rs` carries the measurement as an enforced acceptance sweep --
-//! `crc32_acceptance`, seven lengths from 16 bytes to 1 MiB, each a median of nine paired
-//! order-alternating rounds against `braid` -- and `.github/scripts/bench_gate.py` fails the bench
-//! job on two conditions: the candidate may not be slower than `braid` at *any* measured length,
-//! and it must be at least 10% faster at one of them. The second condition exists because a
-//! backend that merely forwarded to `braid` would satisfy the first one perfectly.
+//! `crc32_acceptance`, the nine lengths of `ACCEPTANCE_SWEEP` from 16 bytes to 1 MiB, each a median
+//! of nine paired order-alternating rounds against `braid` -- and `.github/scripts/bench_gate.py`
+//! fails the bench job on two conditions about speed: the candidate may not be slower than `braid`
+//! at *any* measured length, and it must be at least 10% faster at one of them (`BACKEND_BENEFIT`
+//! is 0.90). The second exists because a backend that merely forwarded to `braid` would satisfy
+//! the first one perfectly. A third, independent condition -- enough lengths actually measured --
+//! is described with the *unmeasured* rows below.
 //!
 //! Measured on `x86_64-unknown-linux-gnu`, `--release --features simd`, as
 //! `candidate_ns / baseline_ns`. **One run of record** -- `crc32_acceptance` reporting

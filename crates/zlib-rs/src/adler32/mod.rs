@@ -215,7 +215,7 @@ mod simd;
 ///
 /// Re-exported here so that the whole Adler-32 surface is reachable from one path, and
 /// because `libz-rs-sys` backs both `adler32_combine` and `adler32_combine64` with it.
-pub use self::combine::adler32_combine;
+pub use self::combine::{adler32_combine, adler32_combine_wide};
 
 /// The scalar reference backend -- see [`generic::Adler32Generic`].
 ///

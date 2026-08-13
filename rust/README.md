@@ -198,9 +198,25 @@ by one job each:
   compile a C consumer plus the unmodified `test/minigzip.c` against cargo's import
   library and run them. That consumer also expands the `gzgetc` MACRO, so the
   caller-visible `gzFile_s` layout is checked by a second compiler against a library
-  rustc built. A packaged Windows *install* stays out of scope: its mechanism is
-  `win32/zlib.def`, which the AAP excludes, and the visible consequence is that
-  `z.dll` does not export `gzprintf`/`gzvprintf`.
+  rustc built.
+
+  ★ **The Windows ABI is a documented SUBSET of the contract, not a complete
+  drop-in.** `z.dll` does not export `gzprintf`/`gzvprintf`: the shim that defines
+  them is compiled and archived, but nothing in Rust reaches either name, so no
+  cdylib link retains the member, and closing that on Windows needs
+  `win32/zlib.def`, which AAP §0.2.2.3 excludes. The consumer consequence is
+  concrete and worth stating plainly -- `zlib.h` declares both unconditionally, so a
+  Windows program that calls `gzprintf` **fails to link**. That is a property of
+  this port's PACKAGING, and it is categorically different from `gzopen_w`'s absence
+  on Linux, which is a property of the PLATFORM: `gzopen_w` is declared only under
+  `_WIN32`, so no Linux consumer can reference it and nothing there is missing.
+  `.github/scripts/platform_abi_gate.py` distinguishes the two kinds by name
+  (`PACKAGING_GAP` against `NOT_ON_PLATFORM`) and takes a required
+  `--expect-abi complete|subset`; the Windows invocation passes `subset` and the
+  macOS one `complete`. It fails in **both** directions, so if the PE gap is ever
+  closed the job fails until this paragraph is rewritten -- gaining completeness
+  would make the sentences above false, and a silent upgrade is exactly what that
+  flag exists to prevent.
 
 macOS additionally gets the CMake **static** Rust path: the `macOS Clang Rust` row
 of `.github/workflows/cmake.yml` configures `-DZLIB_BUILD_RUST=ON
@@ -304,11 +320,12 @@ one does and does not establish:
     make rust-symbols  # diff the staged symbol set against a built C library
     make rust-pc       # emit the pkg-config descriptor and gate a consumer
     make rust-header   # regenerate the C header with cbindgen and gate it
+    make rust-simd     # measure the simd feature's vector content and gate it
     make rust-msrv     # cargo check the workspace and the shipped pair on 1.80
     make rust-clean    # remove what the Rust targets produced
 
 Sequencing is worth stating. The `Makefile` shipped in this tree is a stub that
-asks you to run `./configure` first, but it forwards all seven Rust targets to
+asks you to run `./configure` first, but it forwards all eight Rust targets to
 `Makefile.in` rather than refusing them, so they work on an unconfigured tree:
 they name the staged library from `ZLIB_VERSION` in `zlib.h` rather than from
 `Makefile.in`'s unconfigured default, and they supply the relink flags
@@ -445,11 +462,37 @@ a `cargo build -p zlib-rs -p libz-rs-sys` at all. That is the property to check
 when adding one, not whether the table is spelled `dev-dependencies`. `libc` is different: it is a real, optional
 dependency of the facade, and a default build links it, because a `gzFile` is a
 real file descriptor and the descriptor-level calls and `O_*` constants behind it
-are platform facts rather than algorithms. None of this puts third-party *code*
-in the distribution -- nothing is vendored and there are no submodules, so the
-statement at the foot of the top-level `README` about the sources in this tree
-stands unchanged; `libc` is a declared dependency resolved from the registry at
-build time, and `deny.toml` is what governs what may be declared. The explicit
+are platform facts rather than algorithms. Nothing is vendored and there are no
+submodules, so the statement at the foot of the top-level `README` about the
+sources in this tree stands unchanged; `libc` is a declared dependency resolved
+from the registry at build time, and `deny.toml` is what governs what may be
+declared.
+
+★ **What none of the above tells you is what is inside the shipped library, and an
+earlier version of this paragraph claimed it did.** It said that none of this puts
+third-party code in the distribution. That is true of the *Cargo graph* and false
+of the *artifact*: `libz.so` is relinked out of a Rust `staticlib`, which carries
+members of the precompiled `std` sysroot, and those members are in no lock file
+and outside everything `deny.toml` can reach. Measured on the packaged library,
+thirteen crates are present -- `zlib_rs` and `z` (the facade's lib target name),
+`core`, `alloc`, `std`, `__rustc`, and then `gimli`, `addr2line`, `object`,
+`rustc_demangle`, `memchr`, **`miniz_oxide` and `adler2`**. The last two are a
+second DEFLATE decoder inside zlib, which `deny.toml` bans by name and got anyway:
+`std`'s default panic hook symbolises a backtrace, `addr2line` and `gimli` read
+DWARF for it, `object` decompresses compressed debug sections, and it uses
+`miniz_oxide` to do so. It is unreachable from any zlib entry point and decodes no
+zlib stream, and it cannot be removed while `std` is linked -- that needs
+`panic_immediate_abort`, which needs a rebuilt `std`, which needs nightly
+`-Zbuild-std`; `panic = "abort"` does not help, because the hook still runs first.
+
+So it is declared instead of denied. `.github/scripts/artifact_inventory_gate.py`
+reads the built library, recovers each symbol's crate from Rust's `v0` mangling,
+and fails on any crate the tree has not written down -- with its licence, which
+this is the only record of, since `cargo deny list` will never enumerate a sysroot
+member. It also fails on a set of dynamic imports no zlib entry point reaches.
+Reach it with `make rust-inventory` after `make rust`; the CMake path runs it as
+part of producing the library, and the `dropin` CI job runs it too. The
+[packaging](#packaging) section has the measured figures. The explicit
 `libc` feature exists so
 that the dependency is a stable part of the facade's surface and a downstream
 `--features libc` keeps resolving; enabling it alone changes nothing observable,
@@ -472,7 +515,7 @@ comes out, and on `x86_64` the answer is not the same for the two:
 | | vector instructions in the release library | run-time probe |
 |---|---|---|
 | **Adler-32** (`adler32::simd::Simd`) | **91** -- `paddd`, `pshufd`, `punpck*`, SSE2 only, so no raised `-C target-cpu` baseline is needed | `is_supported()`, an SSE2 check that is a throughput hint and not a correctness gate |
-| **CRC-32** (`crc32::simd::StrideBraid`) | **zero** -- 487 instructions of `mov`, `xor`, `shr` and `movzbl` | none at all |
+| **CRC-32** (`crc32::simd::StrideBraid`) | **zero** -- 348 instructions of `mov`, `xor`, `shr` and `movzbl` | none at all |
 
 The CRC-32 backend is therefore a **scalar** reformulation and is named for what
 it is. Its type is `StrideBraid`, its `Crc32Backend::NAME` is `"stride-braid"`
@@ -481,10 +524,51 @@ and the Cargo feature is still `simd` because AAP §0.3.1 and §0.5.1.4 fix thos
 two names, and everything a reader can rename was renamed. It wins by exposing
 instruction-level parallelism and by replacing the braided algorithm's serial
 byte epilogue -- up to `N * W - 1` steps in `crc32.c` -- with at most `W - 1`.
-Genuine vector CRC-32 needs the carry-less-multiply intrinsics, which
-`#![forbid(unsafe_code)]` rules out, and stable Rust at the 1.80 MSRV has no
-portable vector API to reach for instead; that is a divergence from AAP §0.4.1.2,
-which described this path as a "carry-less-multiply" one.
+Genuine vector CRC-32 needs either the carry-less-multiply intrinsics or a
+portable vector API, and both are out of reach here. `#![forbid(unsafe_code)]`
+rejects even the *declaration* of an `unsafe fn`, and -- checked by compiling
+against stable 1.97.1, not recalled -- `core::arch` stays unreachable at **every
+released version** rather than merely at the MSRV, on two independent counts: the
+load and store intrinsics are still `unsafe fn` because they dereference a raw
+pointer, and calling any `#[target_feature]` function from ordinary code is itself
+unsafe. `core::simd`, the API AAP §0.2.2.2 names, is the mechanism that *would*
+work -- the lane-parallel shape compiles under `#![forbid(unsafe_code)]` with no
+raw pointer and emits 25 vector instructions -- and is blocked by stabilisation
+alone, still unstable on 1.99.0-nightly against a stable-channel MSRV of 1.80
+(§0.7.1 (h)). That is a divergence from AAP §0.4.1.2, which described this path as
+a "carry-less-multiply" one, and from §0.5.1.4, which describes the feature as
+enabling a vectorised CRC-32.
+
+★ **The vectorisable alternative was written and timed rather than dismissed.** A
+table-free, lane-parallel formulation -- sixteen contiguous blocks, each folded
+with the eight-step bitwise LFSR, recombined exactly as `crc32_combine` recombines
+any two blocks -- *does* vectorise, and well: 92 of its 398 instructions name an
+SSE2 register. On the same host it runs at 1.93, 2.03 and 2.44 ns/byte at 4 KiB,
+64 KiB and 1 MiB against the table braid's 0.32, 0.24 and 0.26 -- **6 to 9 times
+slower**, because a table step buys eight bits of progress for about two
+instructions while a bitwise step buys the same eight for about thirty-two, and
+dividing by four lanes still leaves eight against two. Shipping it would trade a
+measured throughput lever for a measured throughput loss to satisfy a description
+of the mechanism rather than of the result, so the position is recorded here and
+enforced by a gate instead. Closing it properly needs a decision this tree cannot
+take on its own, and there are exactly two candidates: `portable_simd` stabilises
+and the MSRV moves to whichever release carries it, costing no `unsafe` at all; or
+AAP §0.7.1 (a) gains an audited exception for a `#[target_feature]` kernel reached
+through an `unsafe` dispatch -- with `pclmulqdq` reachable, a folding CRC-32 would
+be roughly an order of magnitude *faster* than the braid, which is why the choice
+is worth making deliberately rather than by default. Raising the MSRV alone does
+**not** close it; see the compile evidence above.
+
+★ **Both numbers in the table above are gated.**
+`.github/scripts/simd_vector_gate.py` disassembles the release library built with
+`--features simd`, counts instructions and vector instructions per backend symbol,
+and fails when either disagrees with this table. It runs as a step of the `simd`
+job and as `make rust-simd`, and it fails in **both** directions on purpose:
+losing Adler-32's vectorisation is a regression, and *gaining* it in CRC-32 means
+the paragraph above has become false and must be rewritten. It asserts vector
+content only -- throughput stays with `benches/checksum_bench.rs` and
+`.github/scripts/bench_gate.py`, which fail a candidate that is slower than the
+backend it replaces however many vector instructions it contains.
 
 Both wins are **measured and enforced** rather than asserted. On
 `x86_64-unknown-linux-gnu`, candidate time over portable-backend time, each figure
@@ -1004,7 +1088,7 @@ that never does. The default sweep takes eight of the fifteen -- one of each
 *shape* -- so that no kind of boundary goes unexercised on a bare `cargo test`; the
 exhaustive shards sweep all fifteen.
 
-### The three test files ###
+### The four test files ###
 
 * `tests/byte_identical.rs` -- the Rust output bytes equal the C output bytes,
   across the matrix above. This is where the previous section's eight decision
@@ -1018,6 +1102,15 @@ exhaustive shards sweep all fifteen.
 * `tests/table_equality.rs` -- the ported `const` tables against the C arrays from
   `crc32.h`, `trees.h` and `inffixed.h`, element for element. Cheapest and
   highest-signal check in the workspace; run it before any algorithmic debugging.
+* `tests/checksum_width.rs` -- the combine family at full `uLong` width, deliberately
+  *outside* the domain `zlib.h` documents. `adler32.c` accumulates into
+  `unsigned long`, so on LP64 its result is 64 bits wide, and for arguments that are
+  not genuine Adler-32 checksums it really uses 33 of them. No comparison of bytes,
+  streams or tables can see that: a legitimate checksum never reaches the region, so
+  the other three files pass whichever width the port computes in. This one compares
+  the two implementations on the arguments where they differ, and asserts that at
+  least one vector produced a result above 32 bits -- otherwise the comparison would
+  have proved nothing.
 
 ### Miri cannot run these ###
 
@@ -1043,12 +1136,22 @@ because a committed file can be compiled, linted, diffed, reviewed and -- decisi
 synthetic log and twenty-nine broken variants of it, before any measurement),
 `.github/scripts/header_raw_diff_gate.py`,
 `.github/scripts/platform_abi_gate.py` (shared by both packaged-ABI jobs),
-`.github/scripts/retention_compile_fail.py` and
+`.github/scripts/retention_compile_fail.py`,
+`.github/scripts/simd_vector_gate.py` (which disassembles the `--features simd`
+release library and holds each checksum backend to the vector content this file
+claims for it),
+`.github/scripts/artifact_inventory_gate.py` (which reads the packaged library's
+symbol table, recovers each symbol's originating crate from Rust's `v0` mangling,
+and refuses an undeclared crate or a forbidden dynamic import -- the one check
+that can see the precompiled `std` sysroot members `deny.toml` structurally
+cannot) and
 `.github/scripts/docs_consistency_gate.py`, which checks the claims in THIS file
 against the tree -- job names, script paths, the job count and split, the
-documented `ZLIB_RS_*` toggles and the CMake options it names -- because a guide
-describing executable gates is a second copy of facts that rots silently, and this
-one had rotted in ten places at once. One shell gate sits beside them,
+documented `ZLIB_RS_*` toggles, the CMake options it names, the facade's
+integration-test inventory and the `rust*` make targets, the last two in *both*
+directions -- because a guide describing executable gates is a second copy of
+facts that rots silently, and this one had rotted in ten places at once. One shell
+gate sits beside them,
 `.github/scripts/whitespace_gate.sh`; the drop-in chain gate that used to be a
 second one is now `crates/libz-rs-sys/tests/dropin_chain.rs`, so `cargo test`
 runs it, `cargo clippy -- -D warnings` lints it and `cargo fmt --check` formats
@@ -1061,11 +1164,25 @@ it -- none of which a script under `.github/` ever got.
     cargo test --locked --workspace --release --all-features
 
 The unit tests of all three crates plus the integration suites under
-`crates/*/tests/`. `crates/libz-rs-sys/tests/` carries `abi_layout.rs`,
-`c_api_parity.rs`, `dropin_chain.rs`, `gz_memory.rs`, `gz_printf.rs`,
-`rust_api_surface.rs`, `symbol_parity.rs` and `write_only_window.rs`. Two of
-those are artifact gates rather than API tests: `symbol_parity.rs` is the `nm`
-parity gate in test form, and `dropin_chain.rs` is the installable-chain gate --
+`crates/*/tests/`. `crates/libz-rs-sys/tests/` carries nine files:
+`abi_layout.rs`, `alias_overlap.rs`, `c_api_parity.rs`, `dropin_chain.rs`,
+`gz_memory.rs`, `gz_printf.rs`, `rust_api_surface.rs`, `symbol_parity.rs` and
+`write_only_window.rs`. That list is not maintained by hand -- the facade's
+manifest used to keep its own copy, said seven, and had missed two additions by
+the time anyone read it, so `.github/scripts/docs_consistency_gate.py` now fails
+if this list and the directory disagree in either direction.
+
+`alias_overlap.rs` is the aliasing suite, and it is the one to run under Miri: it
+drives the four one-shot entry points and `inflateBack` with the caller's input
+and output *overlapping*, across more of the buffer than the internal staging
+window covers, so that the copy-then-decompress path runs many times in a single
+call. That is the shape in which a mutable borrow of the destination held across
+an input refill is undefined behaviour, and it is invisible to an ordinary test
+run because the bytes still come out right.
+
+Two of the nine are artifact gates rather than API tests: `symbol_parity.rs` is
+the `nm` parity gate in test form, and `dropin_chain.rs` is the installable-chain
+gate --
 it reads the descriptor `make rust` stages, asserts each symlink by its literal
 target text *and* its canonical destination, requires an ELF inspector and proves
 the recorded SONAME against the alias that was staged, and self-tests itself
@@ -1099,6 +1216,39 @@ differential section for why the oracle is out of reach. Read the result as "no
 undefined behaviour observed while interpreting this test suite": Miri is an
 interpreter, not a prover, and what a test does not execute it does not analyse.
 
+### Miri, over the C ABI facade ###
+
+    cargo +nightly miri test -p libz-rs-sys --test alias_overlap
+
+★ **This is the job whose absence had a measured cost, so it is worth stating why
+it exists rather than just that it does.** The job above interprets
+`crates/zlib-rs`, which carries `#![forbid(unsafe_code)]` and so has no boundary
+to get wrong; `miri-harness` interprets the differential harness. Neither reaches
+`crates/libz-rs-sys` — the one crate permitted `unsafe`, the crate that
+reconstructs slices from caller pointer/length pairs, performs the opaque `state`
+round-trip and calls caller-supplied `zalloc`/`zfree`. The workspace's entire
+unsafe surface was the one part of it no interpreter ever saw.
+
+Two Critical aliasing defects lived there while CI was green: the one-shot overlap
+path formed a shared reference over the caller's source *through the caller's own
+pointer* while a mutable borrow of the caller's destination was live, and
+`inflateBack` held a whole-window `&mut` across every input callback. Both are
+undefined behaviour; both were reproduced by the command above in minutes. Neither
+was reachable by ordinary testing, and that is the general lesson rather than an
+accident of these two: the reads and writes involved are individually in bounds,
+so nothing crashes and every answer is correct. **A green suite is not evidence
+about aliasing.** An interpreter that tracks borrow stacks is.
+
+`tests/alias_overlap.rs` is written for that purpose. Every case drives more than
+one `OVERLAP_STAGE_BYTES` window of input, because a single window is exactly the
+case a wrong design still gets right — the first copy happens before the first
+borrow either way, and it is the second and later copies, taken while a call-long
+borrow would still have been live, that are undefined. It checks the answers too,
+so it cannot pass over a build that staged correctly and computed nonsense.
+Measured: **15 tests, 392 seconds, zero undefined behaviour**, and the job's budget
+is roughly nine times that. `-Zmiri-disable-isolation` is needed for the harness's
+clock and environment queries and does not relax the aliasing model.
+
 ### AddressSanitizer, over the boundary ###
 
     RUSTFLAGS=-Zsanitizer=address RUSTDOCFLAGS=-Zsanitizer=address \
@@ -1106,9 +1256,23 @@ interpreter, not a prover, and what a test does not execute it does not analyse.
       cargo +nightly test --locked -p libz-rs-sys \
         -Zbuild-std --target x86_64-unknown-linux-gnu
 
-Scoped to the facade, which is where raw pointers actually exist. The division of
-labour is the point: **Miri exercises the safe core, ASan exercises the boundary
-layer.**
+Scoped to the facade, which is where raw pointers actually exist.
+
+★ **The division of labour is NOT "Miri for the core, ASan for the boundary", and
+believing it was is what let two Critical defects ship green.** That formulation
+sounds complete and is not, because the two tools answer different questions rather
+than covering different halves of the code. ASan detects an access outside an
+allocation; it does not track Rust's borrow stacks, so a read through a raw pointer
+that invalidates a live `&mut` over a *different, valid* region is invisible to it —
+exactly the shape of both aliasing defects. The accurate statement is:
+
+* **Miri** answers "does this violate Rust's aliasing model?", and it must therefore
+  run over BOTH the safe core and the facade. `miri` does the first, `miri-facade`
+  the second.
+* **ASan** answers "does this touch memory it does not own?", over the facade and
+  the relinked C drivers, including through `std` when `-Zbuild-std` is used.
+
+Both are required over the boundary and neither substitutes for the other.
 
 Three flags in there are load-bearing. `RUSTDOCFLAGS` must be set as well as
 `RUSTFLAGS` -- with only the latter, the library is instrumented but the doctest
@@ -1257,7 +1421,7 @@ Two things to know before reading the raw `diff` output. It is necessarily
 non-empty -- cbindgen cannot emit comments, the declaration macros or the
 function-like macros -- but "non-empty" is no longer the same as "unchecked", and
 this file used to say the artifact existed so a reviewer could confirm by eye that
-the difference was only that. A reviewer confirming 6,020 lines by eye is not a
+the difference was only that. A reviewer confirming roughly six thousand lines by eye is not a
 gate. `.github/scripts/header_raw_diff_gate.py` now classifies every changed line
 against the divergence rules `cbindgen.toml` enumerates, and each rule names the
 OTHER mechanism that checks that class exhaustively -- the standalone
@@ -1274,6 +1438,42 @@ declaration" says nothing about the types inside it -- `int deflate(z_streamp, i
 and `int deflate(z_streamp, long)` are both declarations -- it requires the
 resolved-signature diff's own product to exist and be empty before it will pass, so
 that deferral is checked rather than assumed.
+
+★ **And there is now a comparison that IS empty.**
+`.github/scripts/header_contract_projection_gate.py` supplies the stronger
+statement, because "non-empty, but every line is explained" leans on the
+classifier's rules being complete while "empty" leans on nothing. It does not
+filter the diff and it does not touch `zlib.h`, which is immutable and opened
+read-only. Instead it *projects* both sides through `cc` and `c++` into one
+canonical rendering of what the contract promises, and diffs the two renderings:
+95 function types via `decltype(&f)` mangled and read back demangled, 19 public
+typedef widths, the 3 caller-visible structs, their 30 fields' offsets and widths,
+and 38 integer macros by value. **185 records, and the diff is exactly empty.**
+
+What that projection drops is dropped because a C consumer cannot observe it:
+comment prose, blank lines, declaration order, typedef spelling (`uLong` against
+`unsigned long`) and macro spelling (`0x1321` against `4897`, `(-5)` against `-5`).
+The scaffolding dropped with it -- `#include`, `extern "C"`, the `#if` blocks -- is
+exactly what the eight standalone dialect compiles already cover. Because every
+record is a value a compiler produced rather than text a header contains, a
+difference in how a type is *spelled* cannot create a false failure and a
+difference in what a type *is* cannot hide behind a matching spelling. A textual
+diff of two headers has neither property, which is why both gates run.
+
+Three things keep it from passing vacuously. Missing `cc`, `c++` or `nm` is a
+failure rather than a skip, since a projection built by a compiler has no reduced
+form. Minimum record counts per category are enforced, because an empty diff of two
+near-empty files is not evidence. And every allowance -- `gzopen_w`, declared only
+under `_WIN32`, plus `charf`, `intf` and `uIntf`, which cbindgen prunes because no
+prototype references them and which `tests/abi_layout.rs` pins by size instead --
+must carry a written reason, is printed on success, and **fails once it is no longer
+needed**: the gate preprocesses the generated side and rejects an allowance for a
+name that side now declares, so an allowance cannot outlive its cause and quietly
+shrink the comparison. Its `--self-test` mode proves the gate fails on a changed
+parameter type, a changed macro value, a narrowed struct field and a narrowed
+typedef, and treats a perturbation that matches nothing as a failure too, so the
+negative control cannot rot into a no-op. The raw whole-file diff stays published
+beside it, so this adds a measurement rather than concealing what it normalises.
 
 And `generated_zlib.h` is git-ignored scratch output that must never be committed:
 its header guard is `ZLIB_H` on purpose, so it would shadow the real header if it
@@ -1332,6 +1532,32 @@ tested*. The hand form is:
         -L target/dropin -lz -Wl,-rpath,"$PWD/target/dropin"
     ldd ./example_rust | grep libz    # must name the staged file, not the system one
     ./example_rust
+
+★ **The `minigzip` round trip is staged through files rather than piped, and the
+reason is worth knowing before writing a similar check anywhere else.** It used to
+be the obvious three-line form:
+
+    echo hello world | ./minigziprust | ./minigziprust -d
+
+A POSIX pipeline exits with the status of its **last** command only, so a failing
+compressor left the decompressor running on empty or truncated input — where
+exiting 0 is entirely possible — and the pipeline reported success. The recovered
+bytes were never compared with the original either: they went to stdout, so a
+decompressor that emitted the wrong bytes passed as well. Measured against three
+stand-in programs, each broken in one way:
+
+| broken behaviour | old pipeline | the four checks now |
+|---|---|---|
+| compressor exits nonzero | exit 1 | exit 1, names the compressor |
+| compressor writes nothing | **exit 0** | exit 1, names the empty stream |
+| wrong bytes recovered | **exit 0** | exit 1, `cmp` reports the difference |
+
+Two false passes out of three, and the third was caught only incidentally, because
+`gzip -d` happens to reject empty input — a decompressor that tolerated it would
+have passed that case too. So the target now checks the compressor's exit status,
+that its output is non-empty, the decompressor's exit status, and `cmp` of the
+recovered file against the original, which is the only one of the four that catches
+a failure in which both programs exit 0 and the bytes simply differ.
 
 `infcover.c` is disproportionately valuable here, for three reasons that are hard
 to reproduce deliberately. Its instrumented allocator fills every allocation with
@@ -1419,22 +1645,32 @@ touches the network. The other two modes are read-only, and CI runs both:
 
 | mode | reaches the network | writes anything | invoked by CI |
 |---|---|---|---|
-| *(no mode flag)* -- fetch | **yes** | yes, the corpus | only by a hand dispatch |
+| *(no mode flag)* -- fetch | **yes** | yes, the corpus | **never, on any event** |
 | `--verify-only` | no | no | yes, when a cache restore claims a corpus |
 | `--pin-status` | no | no | yes, unconditionally, on every runner |
 
-Two workflow jobs name it, and the distinction between them is the one that
-matters -- it is not "no workflow references it" but **"no gate depends on a
-download"**:
+One workflow job names it, and the distinction that governs is the one that
+matters, and it is the strict reading: **no workflow invokes it in fetching mode at
+all**, which is what AAP §0.6.4.4 and §0.3.1 mean by "never invoked by `cargo test`
+or CI".
 
-* `bench`, which measures, invokes it only as `--verify-only`, the mode that
-  fetches nothing and writes nothing. It uses it to decide whether a corpus
-  provisioned elsewhere is the pinned one.
-* `silesia-provision`, which measures nothing and gates nothing, invokes it in
-  fetching mode -- once, to populate the cache `bench` restores. It is reachable
-  only by dispatching the workflow by hand with its `provision_silesia` input
-  enabled, so a push, a pull request, the nightly schedule and a release can none
-  of them reach it.
+Exactly one job names the script, and it never fetches:
+
+* `bench`, which measures, invokes it only as `--pin-status` (which reads the
+  committed `silesia.pin` and exits) and `--verify-only` (the mode that "fetches
+  nothing and writes nothing"). It uses them to decide whether a corpus provisioned
+  elsewhere is the pinned one, and it fails closed when one is required and absent.
+
+★ A provisioning job (`silesia-provision`, since removed and named here only so the
+change is traceable) used to sit at the end of the workflow and fetch, guarded
+by a `workflow_dispatch` input, on the weaker reading that what mattered was only
+"no gate depends on a download". That job has been **removed**. The weaker reading
+is not what the AAP says, and the workflow's own header simultaneously claimed "no
+job downloads a benchmark corpus" -- so the tree asserted both halves of a
+contradiction. Provisioning is now entirely off-workflow: run
+`crates/zlib-rs-differential/corpus/fetch_silesia.sh` by hand on a trusted machine,
+then either set `ZLIB_RS_SILESIA_DIR` on a runner that holds the result or populate
+the pin-keyed cache `bench` restores.
 
 **The Silesia measurement is required where it counts.** AAP 0.8.4 states the
 throughput and memory bars against this corpus, so on a `schedule` or a published
@@ -1581,11 +1817,10 @@ silently degrading: a separate step proves the refusal path by running the bench
 with `ZLIB_RS_SILESIA_REQUIRED=1` against an empty directory and checking that they
 decline to report a figure.
 
-**No CI job downloads the corpus** on any automatic event: a cache miss leaves the
-tier unarmed rather than reaching the network, which is the two-tier rule AAP
-§0.6.4.4 sets, and the one job that does fetch -- `silesia-provision` -- is reachable
-only by a hand dispatch and gates nothing. What an unarmed tier costs is stated
-rather than hidden: it is a *warning* on an ordinary push to a hosted runner, and a
+**No CI job downloads the corpus, on any event whatever** -- not automatic, and not
+by hand dispatch either, since the job that once did was removed. A cache miss
+leaves the tier unarmed rather than reaching the network, which is the two-tier rule
+AAP §0.6.4.4 sets. What an unarmed tier costs is stated rather than hidden: it is a *warning* on an ordinary push to a hosted runner, and a
 *failure* on the designated release runner and on a schedule or a release, so the
 acceptance measurement cannot be quietly skipped where it is supposed to happen.
 
@@ -1607,10 +1842,11 @@ here however large the win, so read that section before optimising anything unde
     make rust
     make rust-test
     make rust-symbols
+    make rust-inventory
     make rust-pc
 
-`make rust` relinks cargo's complete static archive through `zlib.map` with the
-right SONAME and stages the installable set under `target/dropin/`:
+`make rust` relinks cargo's static archive through `zlib.map` with the right
+SONAME and stages the installable set under `target/dropin/`:
 
     libz.so.1.3.2.1-motley     the real file
     libz.so.1                  symlink to it, and the SONAME
@@ -1621,6 +1857,46 @@ That is the same set, the same SONAME and the same symlink topology the C build
 installs, so a consumer resolves the library identically either way. The installed
 `zlib.h` and generated `zconf.h` are byte-identical to the C build's, since
 neither is modified.
+
+<a name="packaging"></a>
+
+### Which archive members the relink takes, and why it is not all of them ###
+
+A shared library pulls nothing out of an archive unless something references it,
+so the relink has to state its selection. It states it as **demand**: one
+`-Wl,-u,<name>` per name `zlib.h` declares, which makes the linker take the member
+defining each export and, transitively, only what those members need.
+`--gc-sections` on the final link then drops whatever selection kept that nothing
+reachable references.
+
+★ **This used to be `--whole-archive`, and replacing it is a supply-chain fix
+rather than a size optimisation.** "Every member, including the ones nothing
+references" meant every member of `std` as well, and `std`'s members are not a
+menu this project chose from. Measured on the same sources and the same `zlib.map`:
+
+| selection | size | exports | version nodes | dynamic imports |
+|---|---:|---:|---:|---:|
+| `--whole-archive` | 6,537,144 | 95 | 16 | 183 |
+| demand + `--gc-sections` | 4,577,152 | 95 | 16 | 54 |
+
+The export set and the sixteen version nodes are identical, so nothing a consumer
+can observe changed. What changed is what the library carries and what it is
+allowed to do: the 129 imports that went away include `posix_spawnp`, `execvp`,
+`fork`, `socket`, `connect`, `chroot`, `setuid`, `dlsym` and `getrandom` -- none of
+which any zlib entry point reaches, and every one of which a distribution auditing
+`libz.so.1` would otherwise have had to account for. Four crates went away with
+them (`libc`, `std_detect`, `f16`, `f128`).
+
+The two flags are also the **reachability proof** the inventory gate depends on.
+`--gc-sections` removes precisely the unreferenced sections, so whatever survives
+is referenced from an exported entry point — which is why `make rust-inventory`
+can describe the surviving `miniz_oxide` as reachable-but-unreachable-from-zlib
+without having to prove it a second time. The CMake path performs the identical two
+steps and additionally strips debug sections, which is why its library is smaller
+again (712,408 bytes here). `Makefile.in` tolerates a linker that rejects
+`--gc-sections` by relinking without it, at a cost in size and nothing else;
+emptying `RUSTNEEDFLAG` is refused outright, because the library that produces
+exports no zlib at all.
 
 The versioned name is **derived, not hardcoded**. It comes from `ZLIB_VERSION` in
 `zlib.h`, which is `"1.3.2.1-motley"` (`ZLIB_VERNUM` is `0x1321`); `configure`

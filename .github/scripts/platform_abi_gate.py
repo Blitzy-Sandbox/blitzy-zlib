@@ -54,21 +54,44 @@ ZEXTERN_STATEMENT = re.compile(r"\bZEXTERN\b[^;]*;", re.S)
 # function name to a naive scan.
 NOT_A_NAME = frozenset({"ZEXTERN", "ZEXPORT", "ZEXPORTVA", "FAR", "OF", "z_const", "const"})
 
+# The two KINDS of absence, which this table used to conflate and which a consumer
+# experiences as completely different things.
+#
+# ★ THAT CONFLATION WAS THE DEFECT.  `gzopen_w` is missing from a Linux library because
+# `zlib.h` declares it only under `_WIN32` -- there is no such symbol to export, and a
+# Linux consumer cannot reference it either, so the library is COMPLETE.  `gzprintf` is
+# missing from the Windows DLL for an entirely different reason: the symbol exists, a
+# Windows consumer can and does call it, `zlib.h` declares it unconditionally, and this
+# port's PE packaging simply does not export it.  A consumer that calls `gzprintf` gets a
+# link error.  Both were listed in one dict with prose reasons and both were reported as
+# "absent, and expected to be", so the gate passed either way and could not say which of
+# the two situations it had measured.
+NOT_ON_PLATFORM = "not-on-platform"
+PACKAGING_GAP = "packaging-gap"
+
 # Names the contract declares that a given platform's artifact may legitimately not
-# export.  Every entry carries the reason, and the reason is printed, so widening this
+# export, each with its KIND and its reason.  Every entry is printed, so widening this
 # table is visible in the log rather than silent.  A name listed here is tolerated in
 # EITHER direction: the gate reports whether it was in fact present.
-PLATFORM_ABSENCES: dict[str, dict[str, str]] = {
+#
+# The kinds are what let the gate CLASSIFY rather than merely tolerate: an artifact with
+# no live `PACKAGING_GAP` absence is a complete drop-in ABI, one with any is a subset, and
+# `--expect-abi` requires the caller to say which it is getting.
+PLATFORM_ABSENCES: dict[str, dict[str, tuple[str, str]]] = {
     "linux": {
         "gzopen_w": (
+            NOT_ON_PLATFORM,
             "declared only under _WIN32 (zlib.h L2042) and implemented `#[cfg(windows)]`, "
-            "so it is not a symbol a Linux build can export"
+            "so it is not a symbol a Linux build can export -- and not one a Linux "
+            "consumer can reference either",
         ),
     },
     "macos": {
         "gzopen_w": (
+            NOT_ON_PLATFORM,
             "declared only under _WIN32 (zlib.h L2042) and implemented `#[cfg(windows)]`, "
-            "so it is not a symbol a macOS build can export"
+            "so it is not a symbol a macOS build can export -- and not one a macOS "
+            "consumer can reference either",
         ),
     },
     "windows": {
@@ -80,15 +103,19 @@ PLATFORM_ABSENCES: dict[str, dict[str, str]] = {
         # ELF drop-in gets them because `make rust` relinks the whole archive; nothing
         # equivalent is wired for PE, so their absence here is expected rather than new.
         "gzprintf": (
+            PACKAGING_GAP,
             "lives in csrc/gzprintf_shim.c (variadic; stable Rust cannot define it) and a "
             "rustc-linked cdylib cannot re-export a native-archive symbol -- see "
             "crates/libz-rs-sys/build.rs; the PE analogue of zlib.map (win32/zlib.def) is "
-            "out of scope per AAP 0.2.2.3"
+            "out of scope per AAP 0.2.2.3.  A Windows consumer that calls gzprintf CANNOT "
+            "LINK against this DLL",
         ),
         "gzvprintf": (
+            PACKAGING_GAP,
             "lives in csrc/gzprintf_shim.c (takes a va_list) and a rustc-linked cdylib "
             "cannot re-export a native-archive symbol -- see crates/libz-rs-sys/build.rs; "
-            "the PE analogue of zlib.map (win32/zlib.def) is out of scope per AAP 0.2.2.3"
+            "the PE analogue of zlib.map (win32/zlib.def) is out of scope per AAP 0.2.2.3.  "
+            "A Windows consumer that calls gzvprintf CANNOT LINK against this DLL",
         ),
     },
 }
@@ -141,6 +168,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--platform", required=True, choices=sorted(PLATFORM_ABSENCES))
     parser.add_argument("--exports", default=None, help="measured export names, one per line")
+    parser.add_argument(
+        "--expect-abi",
+        choices=("complete", "subset"),
+        default=None,
+        help=(
+            "the ABI class this artifact is expected to have, and the reason this gate "
+            "CLASSIFIES rather than merely tolerates absences. `complete' means every "
+            "contract function a consumer on this platform can reference is exported, so "
+            "any documented call links. `subset' means at least one is not, so a consumer "
+            "calling it fails to link -- which is a real limitation and must be declared "
+            "rather than discovered. Required when --exports is given; a mismatch in "
+            "EITHER direction fails, because gaining a complete ABI means the prose saying "
+            "otherwise has become false."
+        ),
+    )
     parser.add_argument("--contract", default="zlib.h", help="the immutable contract header")
     parser.add_argument(
         "--emit-exported-symbols-list",
@@ -183,7 +225,7 @@ def main() -> int:
                      f"{arguments.contract}; the contract scan is wrong")
         exported = sorted(contract & defined)
         absences = PLATFORM_ABSENCES[arguments.platform]
-        unexplained = sorted(contract - defined - set(absences))
+        unexplained = sorted(contract - defined - set(absences))  # keys, kinds unused here
         if unexplained:
             sys.exit(
                 f"error: the archive defines {len(unexplained)} fewer contract function(s) "
@@ -248,12 +290,19 @@ def main() -> int:
 
     missing = sorted(contract - exports)
     unexplained = [name for name in missing if name not in absences]
+    live_gaps = []
     for name in missing:
         if name in absences:
-            print(f"  absent, and expected to be: {name} -- {absences[name]}")
+            kind, reason = absences[name]
+            print(f"  absent, and expected to be [{kind}]: {name} -- {reason}")
+            if kind == PACKAGING_GAP:
+                live_gaps.append(name)
     for name in sorted(absences):
         if name in exports:
-            print(f"  present, though this platform is allowed to omit it: {name}")
+            kind, _reason = absences[name]
+            print(
+                f"  present, though this platform is allowed to omit it [{kind}]: {name}"
+            )
     if unexplained:
         print(
             f"\nerror: {artifact} does not export {len(unexplained)} contract function(s): "
@@ -316,9 +365,60 @@ def main() -> int:
         )
         return 1
 
+    # ---- the classification ------------------------------------------------------
+    #
+    # Everything above establishes that nothing is missing WITHOUT AN ENTRY.  This
+    # establishes what the entries add up to, which is the part a consumer cares about and
+    # the part that used to go unstated: an artifact with a live PACKAGING_GAP is not a
+    # complete drop-in ABI, however well documented the gap is.
+    measured = "subset" if live_gaps else "complete"
+    if measured == "complete":
+        print(
+            f"\n  ABI class: COMPLETE -- every contract function a consumer on this platform "
+            f"can reference is exported, so any documented call links against {artifact}."
+        )
+    else:
+        print(
+            f"\n  ABI class: SUBSET -- {len(live_gaps)} contract function(s) that a consumer "
+            f"on this platform CAN reference are not exported: {', '.join(sorted(live_gaps))}. "
+            f"A consumer calling one of them fails to link against {artifact} and must be "
+            f"rebuilt against a library that has it. This is a real limitation of this "
+            f"port's packaging on this format, not a property of the platform."
+        )
+
+    if arguments.expect_abi is None:
+        sys.exit(
+            "error: --expect-abi is required with --exports. The measurement above is only "
+            "half the check: the tree has to declare which ABI class it believes it ships, "
+            "so that gaining or losing completeness cannot happen quietly. Pass "
+            f"--expect-abi {measured} if that is what this platform is meant to be, and "
+            "make sure the prose in rust-toolchain.toml and rust/README.md agrees."
+        )
+
+    if measured != arguments.expect_abi:
+        if measured == "subset":
+            print(
+                f"\nerror: --expect-abi complete was declared, and the measured ABI is a "
+                f"SUBSET: {', '.join(sorted(live_gaps))} is/are not exported.\n"
+                f"       This is a regression in packaging, not a documentation problem. A "
+                f"consumer that calls one of those names cannot link, which is the single "
+                f"thing this port promises will not happen."
+            )
+        else:
+            print(
+                f"\nerror: --expect-abi subset was declared, and the measured ABI is "
+                f"COMPLETE.\n"
+                f"       That is good news and still a failure, because sentences in this "
+                f"tree now say something false: rust-toolchain.toml's target matrix, "
+                f"rust/README.md and crates/libz-rs-sys/build.rs all record the gap. Update "
+                f"them and change --expect-abi to complete."
+            )
+        return 1
+
     print(
         f"\nPASS: every contract function this platform can export is exported by {artifact}, "
-        f"and every exported name is accounted for by zlib.h or zlib.map."
+        f"every exported name is accounted for by zlib.h or zlib.map, and the ABI class is "
+        f"{measured} as declared."
     )
     return 0
 

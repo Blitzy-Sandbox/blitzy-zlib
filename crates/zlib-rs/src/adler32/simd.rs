@@ -93,10 +93,22 @@
 //! dependent adds per byte it replaces. The arrangement below pays for them once per `NMAX`
 //! block instead, which is the design reason this backend is worth compiling at all.
 //!
-//! **Read the throughput reasoning in this module as design intent, not as result.** No
-//! benchmark artifact is committed in this repository yet -- the `benches/` directory does not
-//! exist -- so nothing here has been substantiated by a reproducible measurement, and no claim
-//! below should be relied on as one.
+//! **The throughput reasoning in this module is a measured result, and it is enforced.** An
+//! earlier version of this paragraph said the opposite -- that no benchmark artifact was
+//! committed and that the `benches/` directory did not exist -- and it was left behind when both
+//! arrived, contradicting the measured tables further down this same file.
+//! `benches/checksum_bench.rs` carries the measurement as the `adler32_acceptance` sweep, nine
+//! paired order-alternating rounds at each of nine lengths from 16 bytes to 1 MiB, and
+//! `.github/scripts/bench_gate.py` fails the bench job on any of three grounds: this backend is
+//! slower than `generic` beyond the case's own noise allowance at *any* measured length; or its
+//! best ratio never reaches the 0.90 improvement bar, so a second code path behind a feature flag
+//! failed to earn the compile-time cost it adds; or fewer than four lengths could be measured at
+//! all, which is an inconclusive run rather than a pass. The per-length figures of
+//! record are tabulated under [`LANE_THRESHOLD_LEN`], and the same run is quoted by the top-level
+//! `README` and by `rust/README.md` so the three cannot drift apart. Separately,
+//! `.github/scripts/simd_vector_gate.py` disassembles the release library and asserts that this
+//! backend really does contain vector instructions -- 91 of 326 on `x86_64` -- so "vectorized" is
+//! a measurement here too and not a file name.
 //!
 //! Number the whole sub-chunks of a block `t = 0 .. m-1` and the byte offsets within one
 //! sub-chunk `i = 0 .. k-1`, so byte `b_(t,i)` sits at position `j = k*t + i` of the

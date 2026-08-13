@@ -61,6 +61,18 @@
 //! `make rust` stages, and check with `ldd` — `make rust-test` does exactly that
 //! and refuses to infer the binding from a passing run.
 //!
+//! ★ **Both halves of that are now enforced rather than asserted here**, because a
+//! hazard described in a doc comment is one nobody trips over until they do.
+//! `tests/dropin_chain.rs::cargo_s_own_directory_is_not_mistakable_for_a_drop_in`
+//! fails if a versioned alias ever appears in cargo's output directory or if
+//! `build.rs`'s notice goes missing — its doc comment carries the three measured
+//! harms, so the next person to "fix" the hazard by adding the alias reads why that
+//! makes it worse before doing it. And the `dropin` job of
+//! `.github/workflows/rust.yml` *reproduces* the hazard: it links the same minimal
+//! consumer three ways and asserts that cargo's directory yields the system
+//! library's version string while AAP 0.8.6's `ln -sf` and the staged tree both
+//! yield `ZLIB_VERSION`. Measured there: `1.3.1` against `1.3.2.1-motley`.
+//!
 //! The archive is complete because `build.rs` compiles this crate's one shipped C
 //! translation unit — `csrc/gzprintf_shim.c`, which defines the variadic `gzprintf`
 //! and the `va_list`-taking `gzvprintf` — and emits `-l static=` for the archive it

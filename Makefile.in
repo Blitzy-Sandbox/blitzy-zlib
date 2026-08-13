@@ -502,6 +502,36 @@ RUSTOBJCOPY=objcopy
 # run is reported rather than fatal -- the archive is already staged and correct
 # by then, and only the advice would be missing.
 RUSTC=rustc
+# `make rust-simd' -- the vector-content gate.  AAP 0.5.1.4 describes the `simd'
+# feature as enabling "vectorized CRC-32 and Adler-32 backends", and whether a
+# backend IS vectorized is a property of the compiled object rather than of its
+# file name.  One of the two was not, and nothing could have noticed: the gate
+# below disassembles the release library built with --features simd and asserts,
+# per backend, the vector content the tree claims.  See the script's own
+# documentation for what it does not assert -- throughput belongs to
+# benches/checksum_bench.rs and .github/scripts/bench_gate.py.
+#
+# The build goes to its own subdirectory of $(RUSTTARGETDIR) for the reason
+# rust-msrv states in full: libz-rs-sys is `[lib] name = "z"', so cargo writes an
+# UNHASHED libz.so, and a differently-featured build in the shared directory
+# poisons the one `make rust' staged.
+RUSTSIMDDIR=$(RUSTTARGETDIR)/simd
+RUSTSIMDGATE=$(SRCDIR).github/scripts/simd_vector_gate.py
+RUSTSIMDEXPECT=--expect adler32=vectorized --expect crc32=scalar
+RUSTPYTHON=python3
+
+# The artifact-inventory gate: what the PACKAGED library actually contains, asked
+# of the library rather than of a manifest.  deny.toml is the supply-chain
+# authority for the Cargo graph and a strict one -- it bans miniz_oxide by name --
+# but a relinked Rust staticlib also carries members of the precompiled std
+# sysroot, which appear in no lock file and which cargo-deny therefore cannot
+# see.  Measured on this tree before the selection change above: the packaged
+# library held miniz_oxide and adler2, a second DEFLATE decoder inside zlib,
+# banned three files away and shipped anyway.  This gate reads the symbol table,
+# recovers each symbol's crate from Rust's v0 mangling, and refuses an undeclared
+# one; it also refuses a set of dynamic imports -- process creation, privilege
+# change, chroot, sockets, dlsym -- that no zlib entry point reaches.
+RUSTINVGATE=$(SRCDIR).github/scripts/artifact_inventory_gate.py
 RUSTSHIMDIR=$(SRCDIR)crates/libz-rs-sys/csrc
 RUSTSHIMSYMS= gzprintf gzvprintf
 RUSTSHIMFLAGS=-fPIC -DPIC
@@ -530,8 +560,26 @@ RUSTVERNODES=16
 RUSTHEADERWARNOK=Can.t find (c_ulong|usize|wchar_t)\.
 RUSTHEADERNOGEN=$(RUSTWINONLY)
 RUSTHEADEREXTRAOK=
+# The projection gate that turns AAP 0.8.6's frozen command into an EXACTLY EMPTY
+# diff.  The raw whole-file diff runs to thousands of lines and cannot be empty -- two headers
+# with different prose and different ordering share almost no consecutive lines --
+# so this compares what the contract PROMISES instead of the text that states it:
+# every function's resolved type, every public typedef's width, all three
+# caller-visible structs and their 30 fields, and every integer macro's value, each
+# produced by compiling both sides rather than by reading them.  The raw diff is
+# still published beside it as evidence, and header_raw_diff_gate.py still accounts
+# for every one of its lines.
+RUSTHEADERPROJGATE=$(SRCDIR).github/scripts/header_contract_projection_gate.py
+RUSTHEADERPROJDIR=target/header-gate
+# Names absent from the generated side, each with the reason.  A reason is
+# MANDATORY -- the gate refuses an allowance without one -- and an allowance that is
+# no longer needed is itself a failure, so neither can outlive its cause.
+RUSTHEADERPROJNOFN=gzopen_w=declared only under _WIN32 (zlib.h L2041), so no consumer off Windows can reference it
+RUSTHEADERPROJNOTYPE=charf=cbindgen prunes public typedefs that no prototype references; pinned by tests/abi_layout.rs instead
+RUSTHEADERPROJNOTYPE2=intf=the same pruning; pinned by tests/abi_layout.rs instead
+RUSTHEADERPROJNOTYPE3=uIntf=the same pruning; pinned by tests/abi_layout.rs instead
 RUSTHEADERSCRATCH=$(RUSTHEADER).warn $(RUSTHEADER).log $(RUSTHEADER).probe.c \
-	$(RUSTHEADER).ref $(RUSTHEADER).gen
+	$(RUSTHEADER).ref $(RUSTHEADER).gen $(RUSTHEADER).proj
 RUSTC=rustc
 # The ELF inspectors this file will accept for proving DT_SONAME, in preference
 # order.  It is a LIST rather than a single tool because the proof is REQUIRED --
@@ -572,16 +620,56 @@ RUSTPCGATE=$(RUSTLIBDIR)/pc-gate
 # There is not: an enumerator of 0..2 is passed exactly as an int, so
 # crates/libz-rs-sys/src/inflate.rs defines that name in Rust with a validated
 # c_int and test/infcover.c resolves it at link time.
-# The GNU ld spellings for "take every member of this archive, including the
-# ones nothing references yet".  They are separate variables so that a platform
-# with a different linker can override them -- Mach-O's ld wants `-all_load' and
-# no closing flag:
-#    make rust RUSTWHOLEARCHIVE=-all_load RUSTNOWHOLEARCHIVE=
-# The Rust staticlib is the only source of the port's exported symbols, and a
-# shared library links nothing from an archive unless something asks for it, so
-# without this the relinked library would be empty.
-RUSTWHOLEARCHIVE=-Wl,--whole-archive
-RUSTNOWHOLEARCHIVE=-Wl,--no-whole-archive
+# How the archive's members are selected for the relink, and how the result is
+# then pruned.  ★ THIS USED TO BE `--whole-archive', AND THE CHANGE IS A
+# SUPPLY-CHAIN FIX RATHER THAN A SIZE OPTIMISATION.
+#
+# The problem `--whole-archive' solves is real: a shared library links nothing
+# out of an archive unless something asks for it, and the Rust staticlib is the
+# only source of the port's exported symbols, so a plain link produced an empty
+# library.  But "take every member, including the ones nothing references"
+# takes the whole of std as well, and std's archive members are not a menu the
+# port chose from.  Measured on this tree, the whole-archive artifact carried
+# reachable-looking copies of miniz_oxide and adler2 -- a second, entirely
+# unused DEFLATE decoder inside zlib -- and imported 183 dynamic symbols, among
+# them posix_spawnp, execvp, fork, socket, connect, chroot, setuid, dlsym and
+# getrandom.  A compression library has no business referencing any of those,
+# and every one of them is attack surface a distribution's auditors would have
+# to account for.
+#
+# So membership is now demand-driven, exactly as an ordinary link would be, with
+# the demand stated explicitly: $(RUSTNEEDFLAG)<name> for each name the public
+# contract declares (the list is derived from zlib.h itself, into public.syms,
+# a few lines below), which makes the linker pull the member that defines each
+# export and, transitively, everything those members actually need.  Nothing
+# else comes along.  $(RUSTGCFLAG) then drops the sections that survived
+# selection but that nothing reachable references.
+#
+# The two together are also the REACHABILITY PROOF, which is why the artifact
+# gate can be honest about what remains: --gc-sections removes precisely the
+# unreferenced sections, so whatever is still in the finished library is
+# referenced from an exported entry point.  What remains of miniz_oxide is
+# reached from std's default panic hook, through backtrace symbolisation and
+# object's decompression of compressed debug sections; it cannot be removed
+# while std is linked, and `make rust-inventory' declares it rather than
+# pretending otherwise.
+#
+# Measured, x86_64-unknown-linux-gnu, same sources and same zlib.map:
+#
+#     selection            size       exports  nodes  libc imports
+#     --whole-archive      6 537 144  95       16     183
+#     demand + --gc-sections  4 577 152  95       16      54
+#
+# Both spellings are separate variables so a platform with a different linker
+# can override them.  A linker that rejects --gc-sections is handled in the
+# recipe by relinking without it, which costs size and nothing else.  Emptying
+# $(RUSTNEEDFLAG) is refused outright rather than silently falling back, because
+# the failure it produces -- a library that links, loads, and exports no zlib --
+# is one a name-based check downstream would report as "everything missing"
+# without saying why.  Mach-O's ld spells -u the same way but has no
+# --gc-sections; pass RUSTGCFLAG= there.
+RUSTNEEDFLAG=-Wl,-u,
+RUSTGCFLAG=-Wl,--gc-sections
 
 # The containment guard for the two directory variables that reach a recursive
 # delete.  RUSTTARGETDIR and RUSTLIBDIR are ordinary make variables and may be
@@ -927,7 +1015,7 @@ cover: infcover
 # under any of these names cannot reintroduce the same trap.  The forwarding copy
 # of these targets in the pre-configure `Makefile' carries the same declaration
 # and the same reason; keep the two in step.
-.PHONY: rust rust-pc rust-test rust-symbols rust-header rust-msrv rust-clean
+.PHONY: rust rust-pc rust-test rust-symbols rust-header rust-simd rust-inventory rust-msrv rust-clean
 
 rust:
 	@if test -z "$(CARGO)"; then \
@@ -1164,13 +1252,34 @@ rust:
 	  echo '		script is applied.  That is an explicit choice for a format that'; \
 	  echo '		has no such concept; the export-set comparison still runs.'; \
 	fi; \
-	echo "$(CC) -r -nostdlib -o $(RUSTLIBDIR)/libz-whole.o $(RUSTWHOLEARCHIVE) $(RUSTLIBDIR)/$(STATICLIB) $(RUSTNOWHOLEARCHIVE)"; \
+	NEED=''; \
+	if test -n '$(RUSTNEEDFLAG)'; then \
+	  NEED=`sed 's|^|$(RUSTNEEDFLAG)|' $(RUSTLIBDIR)/public.syms | tr '\n' ' '`; \
+	fi; \
+	if test -z "$$NEED"; then \
+	  echo "make rust: no archive-member selection flags are set, so the relink" >&2; \
+	  echo "make rust: below would take nothing out of $(STATICLIB) and stage an" >&2; \
+	  echo "make rust: EMPTY library that loads and exports no zlib at all.  Set" >&2; \
+	  echo "make rust: RUSTNEEDFLAG to this linker's spelling of -u." >&2; \
+	  exit 1; \
+	fi; \
+	echo "$(CC) -r -nostdlib -o $(RUSTLIBDIR)/libz-whole.o <$(RUSTNEEDFLAG)name for each of `wc -l < $(RUSTLIBDIR)/public.syms | tr -d ' '` public names> $(RUSTLIBDIR)/$(STATICLIB)"; \
 	$(CC) -r -nostdlib -o $(RUSTLIBDIR)/libz-whole.o \
-	  $(RUSTWHOLEARCHIVE) $(RUSTLIBDIR)/$(STATICLIB) $(RUSTNOWHOLEARCHIVE); \
+	  $$NEED $(RUSTLIBDIR)/$(STATICLIB); \
 	$(RUSTNM) --defined-only --extern-only --format=posix \
 	  $(RUSTLIBDIR)/libz-whole.o \
 	  | awk '$$2 ~ /^[TDBRGSi]$$/ { print $$1 }' | sed -n '/^_/!p' | sort -u \
 	  > $(RUSTLIBDIR)/whole.syms; \
+	if test ! -s $(RUSTLIBDIR)/whole.syms; then \
+	  echo "make rust: the partial link of $(STATICLIB) defines NO external symbol." >&2; \
+	  echo "make rust: Member selection took nothing, so the shared link below would" >&2; \
+	  echo "make rust: stage a library that loads and exports no zlib.  Either" >&2; \
+	  echo "make rust: RUSTNEEDFLAG is not this linker's spelling of -u, or the" >&2; \
+	  echo "make rust: archive is not the one cargo built.  Stopping here rather than" >&2; \
+	  echo "make rust: reporting 95 missing exports several steps later." >&2; \
+	  rm -f -- $(RUSTLIBDIR)/libz-whole.o; \
+	  exit 1; \
+	fi; \
 	comm -23 $(RUSTLIBDIR)/whole.syms $(RUSTLIBDIR)/public.syms \
 	  > $(RUSTLIBDIR)/hidden.syms; \
 	if test -s $(RUSTLIBDIR)/hidden.syms; then \
@@ -1178,25 +1287,28 @@ rust:
 	  $(RUSTOBJCOPY) --localize-symbols=$(RUSTLIBDIR)/hidden.syms \
 	    $(RUSTLIBDIR)/libz-whole.o; \
 	fi; \
-	echo "$$LDS $(SFLAGS)$$EXTRA $$VSARG -o $(RUSTLIBDIR)/$$SOV $(RUSTLIBDIR)/libz-whole.o $(LDSHAREDLIBC) $(LDFLAGS) $$NSL"; \
-	if $$LDS $(SFLAGS) $$EXTRA $$VSARG -Wl,--undefined-version \
+	GC='$(RUSTGCFLAG)'; \
+	echo "$$LDS $(SFLAGS)$$EXTRA $$VSARG $$GC -o $(RUSTLIBDIR)/$$SOV $(RUSTLIBDIR)/libz-whole.o $(LDSHAREDLIBC) $(LDFLAGS) $$NSL"; \
+	if $$LDS $(SFLAGS) $$EXTRA $$VSARG $$GC -Wl,--undefined-version \
 	    -o "$(RUSTLIBDIR)/$$SOV" $(RUSTLIBDIR)/libz-whole.o \
 	    $(LDSHAREDLIBC) $(LDFLAGS) $$NSL 2> $(RUSTLIBDIR)/relink.log; then \
 	  :; \
-	elif $$LDS $(SFLAGS) $$EXTRA $$VSARG -o "$(RUSTLIBDIR)/$$SOV" \
+	elif $$LDS $(SFLAGS) $$EXTRA $$VSARG $$GC -o "$(RUSTLIBDIR)/$$SOV" \
 	    $(RUSTLIBDIR)/libz-whole.o $(LDSHAREDLIBC) $(LDFLAGS) $$NSL \
 	    2>> $(RUSTLIBDIR)/relink.log; then \
 	  echo 'note: the linker rejected --undefined-version; relinked without it'; \
-	elif test -n "$$rustvs" && $(LDSHARED) $(SFLAGS) -Wl,--undefined-version \
-	    -o $(RUSTLIBDIR)/$(SHAREDLIBV) $(RUSTLIBDIR)/libz-whole.o \
+	elif test -n "$$GC" && $$LDS $(SFLAGS) $$EXTRA $$VSARG \
+	    -Wl,--undefined-version -o "$(RUSTLIBDIR)/$$SOV" \
+	    $(RUSTLIBDIR)/libz-whole.o $(LDSHAREDLIBC) $(LDFLAGS) $$NSL \
+	    2>> $(RUSTLIBDIR)/relink.log; then \
+	  echo 'note: this linker rejected $(RUSTGCFLAG); relinked without it, so the'; \
+	  echo 'note: staged library keeps sections nothing reaches and is larger.'; \
+	  GC=''; \
+	elif test -n "$$GC" && $$LDS $(SFLAGS) $$EXTRA $$VSARG \
+	    -o "$(RUSTLIBDIR)/$$SOV" $(RUSTLIBDIR)/libz-whole.o \
 	    $(LDSHAREDLIBC) $(LDFLAGS) $$NSL 2>> $(RUSTLIBDIR)/relink.log; then \
-	  echo 'note: this linker rejects --version-script; relinked without one'; \
-	  : > $(RUSTLIBDIR)/unversioned; \
-	elif test -n "$$rustvs" && $(LDSHARED) $(SFLAGS) \
-	    -o $(RUSTLIBDIR)/$(SHAREDLIBV) $(RUSTLIBDIR)/libz-whole.o \
-	    $(LDSHAREDLIBC) $(LDFLAGS) $$NSL 2>> $(RUSTLIBDIR)/relink.log; then \
-	  echo 'note: this linker rejects --version-script and --undefined-version'; \
-	  : > $(RUSTLIBDIR)/unversioned; \
+	  echo 'note: this linker rejected both $(RUSTGCFLAG) and --undefined-version'; \
+	  GC=''; \
 	else \
 	  cat $(RUSTLIBDIR)/relink.log; \
 	  rm -f -- $(RUSTLIBDIR)/libz-whole.o $(RUSTLIBDIR)/relink.log; \
@@ -1938,6 +2050,41 @@ rust-pc: rust
 # Rust definition against inftrees.h's `codetype' prototype, which is why this
 # target rather than a cargo test is where it is verified.
 #
+# ★ THE gzip ROUND TRIP IS STAGED THROUGH FILES, NOT A PIPELINE, and it is worth
+# saying why because the pipeline version looked perfectly ordinary.  This was
+#
+#     echo hello world | ./minigziprust | ./minigziprust -d
+#
+# and a POSIX pipeline exits with the status of its LAST command only.  So if the
+# COMPRESSOR failed, the decompressor still ran -- on empty or truncated input,
+# where exiting 0 is entirely possible -- and the pipeline reported success.  The
+# recovered bytes were never compared with anything either: they went to stdout, so
+# a decompressor emitting the wrong bytes, or none at all, passed too.  Two
+# independent ways for a broken library to earn a green gate, in three lines that
+# read like a smoke test.
+#
+# Four checks replace it, each testing one thing directly: the compressor's own
+# exit status; that its output is NON-EMPTY, because a decompressor fed nothing can
+# legitimately succeed; the decompressor's own exit status; and `cmp' of the
+# recovered file against the original, which is the only one of the four that
+# catches a correctness failure where both programs exit 0 and the bytes differ.
+#
+# MEASURED, against three stand-in programs each broken in one way:
+#
+#   broken behaviour              old pipeline   these four checks
+#   compressor exits nonzero      exit 1         exit 1, names the compressor
+#   compressor writes nothing     EXIT 0         exit 1, names the empty stream
+#   wrong bytes recovered         EXIT 0         exit 1, `cmp' reports the difference
+#
+# Two false passes out of three, and the third was caught only incidentally -- the
+# pipeline's last command happened to fail because `gzip -d' rejects empty input.
+# A decompressor that tolerated empty input would have made that one pass too, so
+# the old form did not reliably catch even the case it appeared to.
+#
+# This is the same defect class as the `rust-simd' recipe's first version, which
+# ended in a `| sed' that always succeeded; the note there records it.  Both are
+# reasons to distrust any recipe whose verdict is the tail of a pipeline.
+#
 # PACKAGE METADATA IS COVERED, by prerequisite rather than by this recipe.
 # `rust-pc' is the second prerequisite, so a green `rust-test' also means the
 # pkg-config descriptor for the staged library was generated and a C consumer was
@@ -2060,8 +2207,33 @@ rust-test: rust rust-pc
 	      echo 'warning: no ldd, cannot confirm which libz was bound'; \
 	    fi; \
 	  fi; \
-	  echo hello world | ${QEMU_RUN} "$$RUSTLIB/minigziprust$(EXE)" | \
-	    ${QEMU_RUN} "$$RUSTLIB/minigziprust$(EXE)" -d; \
+	  printf 'hello world\n' > "$$RUSTLIB/plain.txt"; \
+	  if ! ${QEMU_RUN} "$$RUSTLIB/minigziprust$(EXE)" \
+	       < "$$RUSTLIB/plain.txt" > "$$RUSTLIB/plain.gz"; then \
+	    echo 'make rust-test: minigzip FAILED while compressing.' >&2; \
+	    exit 1; \
+	  fi; \
+	  if ! test -s "$$RUSTLIB/plain.gz"; then \
+	    echo 'make rust-test: minigzip exited 0 but produced an EMPTY stream.' >&2; \
+	    echo 'make rust-test: a compressor that writes nothing is not a working' >&2; \
+	    echo 'make rust-test: compressor, and a decompressor fed nothing can still' >&2; \
+	    echo 'make rust-test: succeed -- which is exactly how this gate used to pass.' >&2; \
+	    exit 1; \
+	  fi; \
+	  if ! ${QEMU_RUN} "$$RUSTLIB/minigziprust$(EXE)" -d \
+	       < "$$RUSTLIB/plain.gz" > "$$RUSTLIB/plain.out"; then \
+	    echo 'make rust-test: minigzip FAILED while decompressing.' >&2; \
+	    exit 1; \
+	  fi; \
+	  if ! cmp -- "$$RUSTLIB/plain.txt" "$$RUSTLIB/plain.out"; then \
+	    echo 'make rust-test: the round trip did not reproduce its input.  Both' >&2; \
+	    echo 'make rust-test: programs exited 0, so this is a CORRECTNESS failure' >&2; \
+	    echo 'make rust-test: rather than a crash: the bytes differ.' >&2; \
+	    exit 1; \
+	  fi; \
+	  echo "make rust-test: gzip round trip OK (`wc -c < "$$RUSTLIB/plain.txt"`" \
+	    "bytes -> `wc -c < "$$RUSTLIB/plain.gz"` -> compared equal)"; \
+	  rm -f -- "$$RUSTLIB/plain.txt" "$$RUSTLIB/plain.gz" "$$RUSTLIB/plain.out"; \
 	  ${QEMU_RUN} "$$RUSTLIB/examplerust$(EXE)" "$$RUSTLIB/tmprust.gz"; \
 	  rm -f -- "$$RUSTLIB/tmprust.gz"; \
 	  ${QEMU_RUN} "$$RUSTLIB/infcoverrust$(EXE)"; \
@@ -2435,6 +2607,43 @@ rust-header:
 	  echo '		*** zlib Rust header gate FAILED ***'; \
 	  exit 1; \
 	fi; \
+	if ! command -v $(RUSTPYTHON) >/dev/null 2>&1; then \
+	  echo 'make rust-header: $(RUSTPYTHON) is unavailable, so the canonical' >&2; \
+	  echo 'make rust-header: contract projection -- the check that makes AAP' >&2; \
+	  echo "make rust-header: 0.8.6's diff EMPTY rather than merely explained --" >&2; \
+	  echo 'make rust-header: cannot run.  Name one:' >&2; \
+	  echo 'make rust-header:     make rust-header RUSTPYTHON=python3.13' >&2; \
+	  echo '		*** zlib Rust header gate FAILED ***'; \
+	  exit 1; \
+	fi; \
+	if ! test -f '$(RUSTHEADERPROJGATE)'; then \
+	  echo 'make rust-header: $(RUSTHEADERPROJGATE) is missing.' >&2; \
+	  echo '		*** zlib Rust header gate FAILED ***'; \
+	  exit 1; \
+	fi; \
+	mkdir -p '$(RUSTHEADERPROJDIR)'; \
+	if $(RUSTPYTHON) '$(RUSTHEADERPROJGATE)' \
+	     --reference "$$srcroot/zlib.h" \
+	     --generated '$(RUSTHEADER)' \
+	     --out-dir '$(RUSTHEADERPROJDIR)' \
+	     --cc '$(CC)' --cxx '$(RUSTHEADERCXX)' \
+	     --allow-absent-function '$(RUSTHEADERPROJNOFN)' \
+	     --allow-absent-type '$(RUSTHEADERPROJNOTYPE)' \
+	     --allow-absent-type '$(RUSTHEADERPROJNOTYPE2)' \
+	     --allow-absent-type '$(RUSTHEADERPROJNOTYPE3)' \
+	     --write-raw-diff '$(RUSTHEADERPROJDIR)/aap-0.8.6-raw.diff' \
+	     > '$(RUSTHEADER).proj' 2>&1; then \
+	  sed 's/^/	/' '$(RUSTHEADER).proj'; \
+	else \
+	  sed 's/^/	/' '$(RUSTHEADER).proj' >&2; \
+	  echo 'make rust-header: the canonical contract projections differ.  Each' >&2; \
+	  echo 'make rust-header: record above is a value a compiler produced from' >&2; \
+	  echo 'make rust-header: each header, so a difference is a real divergence' >&2; \
+	  echo 'make rust-header: in the contract and not a spelling or ordering' >&2; \
+	  echo 'make rust-header: artifact.  zlib.h is frozen: fix the Rust side.' >&2; \
+	  echo '		*** zlib Rust header gate FAILED ***'; \
+	  exit 1; \
+	fi; \
 	rm -f -- $(RUSTHEADERSCRATCH); \
 	echo '		*** zlib Rust header gate OK ***'
 
@@ -2486,6 +2695,143 @@ rust-header:
 # fingerprints, so a stable build followed by this gate would rebuild the world
 # twice; a separate directory keeps the warm stable cache warm.
 #
+# `make rust-simd' -- what the `simd' feature actually compiles to.
+#
+# WHY THIS EXISTS.  The feature, the module file and the backend type were all named
+# `simd' while the compiled CRC-32 body contained ZERO vector instructions, and no
+# gate anywhere measured it.  Naming is not evidence; a disassembly is.  This target
+# builds the release library with --features simd into its own target directory and
+# hands it to .github/scripts/simd_vector_gate.py, which counts instructions and
+# vector instructions per backend symbol and fails when either disagrees with
+# $(RUSTSIMDEXPECT).
+#
+# It fails in BOTH directions on purpose.  Losing Adler-32's vectorization is a
+# regression; GAINING it in CRC-32 is a documentation change -- several sentences in
+# crates/zlib-rs/src/crc32/simd.rs, README and rust/README.md would have become
+# true and have to be rewritten -- so the gate refuses to let either happen quietly.
+#
+# It needs python3 and objdump.  Both are named as variables so a platform that
+# spells either differently can satisfy this without editing the file, and a missing
+# one is an error rather than a skip: a gate that silently passes when its instrument
+# is absent is worse than no gate, because the badge stays green.
+#
+# ★ THE GATE'S OUTPUT IS STAGED TO A FILE AND ITS STATUS TESTED DIRECTLY, and it is
+# worth saying why rather than leaving it to look like a style choice.  The first
+# version of this recipe ended `$(RUSTPYTHON) ... | sed 's/^/<tab>/''.  A POSIX
+# pipeline exits with the status of its LAST command, so `sed' -- which always
+# succeeds -- was the status `set -e' saw, and the target printed the gate's own
+# `FAIL:' line and then `*** OK ***' and exited 0.  Measured, by asking for
+# crc32=vectorized against a backend that is scalar.  That is the same defect this
+# repository's `rust-test' target was reported for, reintroduced two hundred lines
+# away while fixing it; indentation is never worth a gate that cannot fail.
+rust-simd:
+	@set -e; \
+	srcroot=`cd "$(SRCDIR)." && pwd`; \
+	if test -z "$(CARGO)"; then \
+	  echo 'make rust-simd: no Rust toolchain -- $$(CARGO) is empty' >&2; \
+	  echo 'make rust-simd: install cargo, then re-run ./configure, or name it:' >&2; \
+	  echo 'make rust-simd:     make rust-simd CARGO=cargo' >&2; \
+	  exit 1; \
+	fi; \
+	if ! command -v $(CARGO) > /dev/null 2>&1; then \
+	  echo 'make rust-simd: $$(CARGO) is set to `$(CARGO)'"'"', which is not an executable' >&2; \
+	  exit 1; \
+	fi; \
+	if ! command -v $(RUSTPYTHON) > /dev/null 2>&1; then \
+	  echo 'make rust-simd: $$(RUSTPYTHON) is set to `$(RUSTPYTHON)'"'"', which is not an' >&2; \
+	  echo 'make rust-simd: executable.  The gate is a Python script; name an interpreter:' >&2; \
+	  echo 'make rust-simd:     make rust-simd RUSTPYTHON=/path/to/python3' >&2; \
+	  exit 1; \
+	fi; \
+	if test ! -f "$$srcroot/.github/scripts/simd_vector_gate.py"; then \
+	  echo 'make rust-simd: $(RUSTSIMDGATE) is missing' >&2; \
+	  exit 1; \
+	fi; \
+	echo "	$(CARGO) build --release -p libz-rs-sys --features simd"; \
+	CARGO_TARGET_DIR='$(RUSTSIMDDIR)' $(CARGO) build --release --manifest-path \
+	  "$$srcroot/Cargo.toml" -p libz-rs-sys --features simd; \
+	lib='$(RUSTSIMDDIR)/release/libz.so'; \
+	if test ! -f "$$lib"; then lib='$(RUSTSIMDDIR)/release/libz.dylib'; fi; \
+	if test ! -f "$$lib"; then \
+	  echo 'make rust-simd: no shared library under $(RUSTSIMDDIR)/release' >&2; \
+	  exit 1; \
+	fi; \
+	echo "	$(RUSTPYTHON) $(RUSTSIMDGATE) --library $$lib"; \
+	if $(RUSTPYTHON) "$$srcroot/.github/scripts/simd_vector_gate.py" \
+	    --library "$$lib" $(RUSTSIMDEXPECT) > '$(RUSTSIMDDIR)/gate.log' 2>&1; then \
+	  sed 's/^/	/' '$(RUSTSIMDDIR)/gate.log'; \
+	  echo '		*** zlib Rust SIMD vector content OK ***'; \
+	else \
+	  sed 's/^/	/' '$(RUSTSIMDDIR)/gate.log'; \
+	  echo '		*** zlib Rust SIMD vector content FAILED ***' >&2; \
+	  exit 1; \
+	fi
+
+# `make rust-inventory' -- what the packaged library actually contains.
+#
+# WHY THIS EXISTS.  See $(RUSTINVGATE) above and the head of the script itself: a
+# relinked Rust staticlib carries precompiled std sysroot members, those members
+# are in no lock file, and the artifact this repository shipped therefore held a
+# second DEFLATE decoder -- miniz_oxide, with adler2 -- that deny.toml bans by
+# name and cargo-deny structurally could not see.  Manifest-derived checks cannot
+# close that; only an artifact-derived one can.
+#
+# It reads $(RUSTLIBDIR), so it needs `make rust' to have run.  It says so rather
+# than building the library itself, because the thing under audit is the staged
+# drop-in and silently rebuilding it would let this target pass against something
+# other than what is about to be installed.
+rust-inventory:
+	@set -e; \
+	srcroot=`cd "$(SRCDIR)." && pwd`; \
+	if ! command -v $(RUSTPYTHON) > /dev/null 2>&1; then \
+	  echo 'make rust-inventory: $$(RUSTPYTHON) is set to `$(RUSTPYTHON)'"'"', which is' >&2; \
+	  echo 'make rust-inventory: not an executable.  The gate is a Python script:' >&2; \
+	  echo 'make rust-inventory:     make rust-inventory RUSTPYTHON=/path/to/python3' >&2; \
+	  exit 1; \
+	fi; \
+	if test ! -f "$$srcroot/.github/scripts/artifact_inventory_gate.py"; then \
+	  echo 'make rust-inventory: $(RUSTINVGATE) is missing' >&2; \
+	  exit 1; \
+	fi; \
+	if ! command -v $(RUSTNM) > /dev/null 2>&1; then \
+	  echo 'make rust-inventory: $$(RUSTNM) is set to `$(RUSTNM)'"'"', which is not an' >&2; \
+	  echo 'make rust-inventory: executable.  This gate reads the built artifact, so a' >&2; \
+	  echo 'make rust-inventory: symbol reader is a requirement, not an optional extra.' >&2; \
+	  exit 1; \
+	fi; \
+	if test ! -f '$(RUSTLIBDIR)/soname.stage'; then \
+	  echo 'make rust-inventory: $(RUSTLIBDIR)/soname.stage is missing, so nothing has' >&2; \
+	  echo 'make rust-inventory: been staged here.  Run `make rust'"'"' first; this target' >&2; \
+	  echo 'make rust-inventory: audits what that recipe staged and deliberately does' >&2; \
+	  echo 'make rust-inventory: not build it, so that it cannot pass against a library' >&2; \
+	  echo 'make rust-inventory: other than the one about to be installed.' >&2; \
+	  exit 1; \
+	fi; \
+	SOV=`sed -n 1p '$(RUSTLIBDIR)/soname.stage'`; \
+	VSMODE=`sed -n 3p '$(RUSTLIBDIR)/soname.stage'`; \
+	if test "$$VSMODE" = static; then \
+	  echo '	configured --static: no shared library was staged, and an archive has'; \
+	  echo '	no dynamic imports to audit.  Nothing to check.'; \
+	  exit 0; \
+	fi; \
+	lib="$(RUSTLIBDIR)/$$SOV"; \
+	if test ! -f "$$lib"; then \
+	  echo "make rust-inventory: $$lib is missing, although soname.stage names it." >&2; \
+	  echo 'make rust-inventory: Run `make rust'"'"' and fix what it reports.' >&2; \
+	  exit 1; \
+	fi; \
+	echo "	$(RUSTPYTHON) $(RUSTINVGATE) --library $$lib"; \
+	if $(RUSTPYTHON) "$$srcroot/.github/scripts/artifact_inventory_gate.py" \
+	    --library "$$lib" --nm $(RUSTNM) \
+	    > '$(RUSTLIBDIR)/inventory.log' 2>&1; then \
+	  sed 's/^/	/' '$(RUSTLIBDIR)/inventory.log'; \
+	  echo '		*** zlib Rust artifact inventory OK ***'; \
+	else \
+	  sed 's/^/	/' '$(RUSTLIBDIR)/inventory.log'; \
+	  echo '		*** zlib Rust artifact inventory FAILED ***' >&2; \
+	  exit 1; \
+	fi
+
 # `+$(RUSTMSRV)' is a rustup argument.  When cargo is not rustup's shim, or the
 # toolchain is not installed, the command fails and this recipe names the remedy
 # rather than reporting a pass -- an MSRV gate that silently skips is worse than
@@ -2908,7 +3254,7 @@ distclean: clean zconf # zconf.h.cmakein
 	printf '# runs nothing while still exiting 0.  That is a silent no-op, which is worse\n' >> Makefile ; \
 	printf '# than an error.  The whole family is declared rather than just `rust'"'"', so a\n' >> Makefile ; \
 	printf '# later addition under any of these names cannot reintroduce the same trap.\n' >> Makefile ; \
-	printf '.PHONY: all distclean rust rust-pc rust-test rust-symbols rust-header rust-msrv rust-clean\n' >> Makefile ; \
+	printf '.PHONY: all distclean rust rust-pc rust-test rust-symbols rust-header rust-simd rust-inventory rust-msrv rust-clean\n' >> Makefile ; \
 	printf '\n' >> Makefile ; \
 	printf '# .NOTPARALLEL is REQUIRED here too, and for a reason make cannot see for itself.\n' >> Makefile ; \
 	printf '# Every rule below dispatches to a SEPARATE sub-make, and inside Makefile.in\n' >> Makefile ; \
@@ -2927,6 +3273,8 @@ distclean: clean zconf # zconf.h.cmakein
 	printf '\nrust-test:\n\t$$(MAKE) -f Makefile.in rust-test\n' >> Makefile ; \
 	printf '\nrust-symbols:\n\t$$(MAKE) -f Makefile.in rust-symbols\n' >> Makefile ; \
 	printf '\nrust-header:\n\t$$(MAKE) -f Makefile.in rust-header\n' >> Makefile ; \
+	printf '\nrust-simd:\n\t$$(MAKE) -f Makefile.in rust-simd\n' >> Makefile ; \
+	printf '\nrust-inventory:\n\t$$(MAKE) -f Makefile.in rust-inventory\n' >> Makefile ; \
 	printf '\nrust-msrv:\n\t$$(MAKE) -f Makefile.in rust-msrv\n' >> Makefile ; \
 	printf '\nrust-clean:\n\t$$(MAKE) -f Makefile.in rust-clean\n' >> Makefile ; \
 	touch -r $(SRCDIR)Makefile.in Makefile ; fi

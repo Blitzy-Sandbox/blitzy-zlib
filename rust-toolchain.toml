@@ -142,10 +142,26 @@
 #                   places out of scope.  The visible consequence is that `z.dll`
 #                   does not export `gzprintf` or `gzvprintf` -- both live in the C
 #                   shim, and a rustc-linked cdylib cannot re-export a
-#                   native-archive symbol -- so
-#                   `.github/scripts/platform_abi_gate.py` records those two
-#                   absences with their reason rather than letting them pass
-#                   unnoticed.  The Mach-O branch of that build script IS now
+#                   native-archive symbol -- so a Windows consumer that CALLS
+#                   either of those two functions cannot link against `z.dll` and
+#                   has to keep using a C zlib.  State it that way round: the
+#                   Windows ABI is a documented SUBSET of the contract, not a
+#                   complete drop-in.
+#
+#                   `.github/scripts/platform_abi_gate.py` now says so mechanically
+#                   rather than tolerantly.  It distinguishes an absence that is a
+#                   property of the PLATFORM -- `gzopen_w` on Linux and macOS,
+#                   which `zlib.h` declares only under `_WIN32`, so no consumer
+#                   there can reference it and the library is complete -- from one
+#                   that is a property of this port's PACKAGING, which is what
+#                   these two are.  It then classifies the artifact `complete' or
+#                   `subset', prints the consumer consequence, and requires the
+#                   caller to declare which it expects: `platform-abi-windows`
+#                   passes `--expect-abi subset` and `platform-abi-macos` passes
+#                   `--expect-abi complete`, since that job stages its dylib with
+#                   `-force_load` and therefore does export the shim's two.  A
+#                   mismatch fails in BOTH directions, so closing the PE gap fails
+#                   the job until this paragraph is rewritten.  The Mach-O branch of that build script IS now
 #                   exercised, by `platform-abi-macos`, which stages that format's
 #                   shared library outside Make and CMake -- both of which refuse
 #                   it, since their packaging rules are ELF-only.

@@ -14,8 +14,8 @@
 #     NEITHER `--verify-only` NOR `--pin-status`.
 #
 # THE EXACT CI BOUNDARY, because a looser sentence used to stand here and was not
-# true.  Two jobs of `.github/workflows/rust.yml` name this script, and they are
-# different kinds of thing:
+# true.  Exactly ONE job of `.github/workflows/rust.yml` names this script, and it
+# never fetches:
 #
 #   * `bench`, which MEASURES, invokes it in exactly TWO modes, and neither of them
 #     fetches or writes anything:
@@ -36,17 +36,28 @@
 #     published release that absence is fatal, because AAP 0.8.4 states the
 #     throughput bar against this corpus; on a hosted runner it is announced as a
 #     warning, because a hosted runner's throughput verdict is informational anyway.
-#   * `silesia-provision`, which measures NOTHING and gates NOTHING, invokes it in
-#     fetching mode -- once, to populate the cache the job above restores.  It is
-#     reachable only from `workflow_dispatch` with its `provision_silesia` input
-#     enabled, so a push, a pull request, the nightly schedule and a release can
-#     none of them reach it.  A human enabling that input is the human this header
-#     means.
+#
+# ★ AND THERE IS NO SECOND CALLER.  There used to be a `silesia-provision` job here
+# that invoked this script in FETCHING mode from a `workflow_dispatch` input, on the
+# reasoning that it gated nothing and so stayed inside AAP 0.6.4.4.  It has been
+# REMOVED, because that reasoning does not survive the text: AAP 0.6.4.4 and 0.3.1
+# say this script is opt-in and "never invoked by `cargo test` or CI" -- a property
+# of the WORKFLOW, not of whether the invoking job happens to gate something.  A
+# fetching path in CI is a fetching path in CI.  The same file also claimed in its
+# own header that "No job downloads a benchmark corpus", so the tree asserted both
+# halves of a contradiction at once.
+#
+# Provisioning is therefore entirely off-workflow, which is what the AAP intends: a
+# human runs this script by hand on a trusted machine, then either sets
+# ZLIB_RS_SILESIA_DIR on a runner that holds the result or populates the
+# `silesia-<digest>` cache the `bench` job restores.  The acceptance gate still
+# REQUIRES the corpus on a schedule, on a release and on the designated runner --
+# it fails closed and prints those instructions rather than downloading anything.
 #
 # So the property AAP 0.6.4.4 asks for is intact, and it is worth stating exactly:
-# the corpus is opt-in "so `cargo test` and CI never require the network".  No
-# gate requires a download; a side-effect-free verification does not require one;
-# and the one job that does download is not a gate and is not automatic.
+# the corpus is opt-in "so `cargo test` and CI never require the network".  No gate
+# requires a download, a side-effect-free verification does not require one, and
+# NOTHING in any workflow downloads it at all.
 #
 # Those are not aspirations, they are the property that keeps this crate's
 # test suite hermetic.  The correctness gates here must be reproducible from a
@@ -62,11 +73,12 @@
 # if it must know whether a corpus provisioned elsewhere is the pinned one, to ask
 # with `--verify-only`, or whether one is pinned at all, with `--pin-status`.
 # Those two are the modes that neither fetch nor write.  What it is NOT is to add a
-# second fetching caller: `silesia-provision` exists so that a maintainer can
-# satisfy the acceptance gate from the Actions tab, and one human-dispatched
-# provisioning path is the whole of the licence.  A fetching call reachable from a
-# push, a pull request, a schedule or a release would make every gate contingent on
-# a remote host again, which is the property these paragraphs exist to protect.
+# fetching caller of ANY kind, however carefully hedged -- not from a push, a pull
+# request, a schedule, a release, and not from a hand-dispatched input either.  One
+# was added once, guarded by every condition available, and it still made the tree
+# contradict itself and the AAP.  A fetching call anywhere in a workflow makes the
+# gates contingent on a remote host, which is the property these paragraphs exist to
+# protect.  Provisioning belongs outside CI.
 #
 # WHY IT EXISTS
 #

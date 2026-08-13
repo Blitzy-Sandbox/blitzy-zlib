@@ -57,53 +57,42 @@
 //! particular it is not a panic: callers such as the reference coverage harness rely on the
 //! checksum entry points never terminating the process.
 //!
-//! # PRECONDITION on `adler1` and `adler2`, and the one divergence that follows from it
+//! # Two widths, because the reference computes in `unsigned long`
 //!
-//! **Precondition (part of this function's public contract): each of `adler1` and `adler2` must be
-//! a genuine Adler-32 checksum -- both of its 16-bit halves strictly below [`super::BASE`]
-//! (`65_521`).** Every value this crate produces satisfies it by construction, because both halves
-//! of every checksum the engine computes are reduced modulo `BASE` before they are packed.
+//! The reference accumulates into `unsigned long` and returns `uLong`, so on LP64 its result is a
+//! **64-bit** value. Within the domain the exported function is documented for that makes no
+//! difference: each of `adler1` and `adler2` is a genuine Adler-32 checksum -- both 16-bit halves
+//! strictly below [`super::BASE`] (`65_521`) -- and then both internal sums finish below `0xffff`
+//! and the packed result occupies exactly 32 bits.
 //!
-//! Inside that precondition this function agrees with the reference implementation **bit for bit
-//! on every target**, and the paragraphs below do not apply. Outside it there is one divergence,
-//! and it is stated here rather than glossed, because the previous wording claimed exact
-//! compatibility while in fact truncating.
+//! Outside that domain it does. When *both* arguments carry a high half at or above `BASE`, the
+//! internal `sum2` can finish above `0xffff` -- brute-force search over the reachable
+//! `(rem, sum2_pre)` space puts its maximum at `65_548` -- so `sum1 | (sum2 << 16)` carries a bit
+//! at position 32 and the true result needs **33 bits**. Three witnesses are pinned in the test
+//! vectors below, where an LP64 reference build returns `0x1_000b_ffef`, `0x1_000b_fffd` and
+//! `0x1_000a_ffef`. `sum1` can exceed `0xffff` for the same reason and by the same bound, so the
+//! two fields of the packed word genuinely overlap there; the reference lets them, and so does
+//! this.
 //!
-//! ## What goes wrong outside the precondition
+//! Two entry points therefore exist, and which one a caller wants follows from the width it is
+//! answering in:
 //!
-//! The reference accumulates into `unsigned long`. When *both* arguments carry a high half at or
-//! above `BASE`, the internal `sum2` can finish above `0xffff` -- brute-force search over the
-//! reachable `(rem, sum2_pre)` space puts its maximum at `65_548` -- so `sum1 | (sum2 << 16)`
-//! carries a bit at position 32 and the true result needs **33 bits**. Three witnesses are pinned
-//! in the test vectors below, where the reference returns `0x1_000b_ffef`, `0x1_000b_fffd` and
-//! `0x1_000a_ffef`. Two million pseudo-random *in-contract* triples produced no such result, which
-//! is the expected outcome: the precondition is exactly what rules it out.
+//! * [`adler32_combine_wide`] returns `u64`. It is what the C ABI facade calls, because
+//!   `crates/libz-rs-sys` has to answer in `uLong`: on LP64 the `u64` reaches the caller intact,
+//!   and on LLP64 Windows or ILP32 the facade's narrowing cast discards the same high bits a
+//!   32-bit `unsigned long` would have discarded on its own. Every intermediate of the algorithm
+//!   is proved below to fit a `u32` -- only the final packing can exceed one -- so truncating the
+//!   64-bit result is identical to computing the whole thing in 32-bit arithmetic, which is what
+//!   makes one function serve both integer models exactly.
+//! * [`adler32_combine`] returns `u32`, the width of an Adler-32 checksum and the width the rest
+//!   of this engine works in. It is the truncation of the wide form, which is the same value on
+//!   every in-domain argument and is what the idiomatic Rust surface should offer: a type that
+//!   cannot hold a non-checksum.
 //!
-//! This function returns `u32`, the width of an Adler-32 checksum and the width the rest of the
-//! engine works in, so for those arguments it yields the **low 32 bits** of the reference value.
-//!
-//! **That is a known, bounded divergence from an LP64 C build, not equivalence with it.** It
-//! coincides with what the reference computes only on a target whose `unsigned long` is 32 bits
-//! wide -- LLP64 Windows, or ILP32 -- and on LP64, which is the only configuration this port has
-//! been verified on, an LP64 C build returns the wider value while this returns the truncated one.
-//! The divergence is confined to arguments that are not Adler-32 checksums, for which `zlib.h`
-//! promises nothing.
-//!
-//! ## Why it is left as a documented precondition rather than removed
-//!
-//! Both alternatives were considered and each is worse here:
-//!
-//! * **Assert the precondition.** A `debug_assert!` is a panic, and AAP 0.7.1(f) forbids panics in
-//!   library paths. The C entry point validates nothing, and the reference coverage harness relies
-//!   on the checksum functions never terminating the process, so aborting a C caller that passed a
-//!   junk `uLong` would itself be a behaviour change -- and a worse one than a truncated result.
-//! * **Widen the return to `u64`** so the facade's `as c_ulong` reproduces both integer models
-//!   exactly. This is the technically complete fix, and the decision belongs to
-//!   `crates/libz-rs-sys/src/checksum.rs`, because that is the file that owns the `uLong`
-//!   mapping. It is not taken unilaterally from here: it changes a public signature of this
-//!   crate, so it has to change on both sides of the boundary at once.
-//!
-//! Widening the result back to `uLong` for the caller is the facade's responsibility either way.
+//! Nothing is asserted and nothing is rejected, exactly as `adler32.c` L133-L155 asserts and
+//! rejects nothing. A `debug_assert!` would be a panic, AAP 0.7.1(f) forbids panics in library
+//! paths, and the reference coverage harness relies on the checksum entry points never
+//! terminating the process.
 //!
 //! # Why the C statement order is preserved
 //!
@@ -176,20 +165,46 @@ const _: () = assert!(
 /// adler32_combine(1, a, n) == a
 /// ```
 ///
-/// # Precondition
+/// # Domain
 ///
-/// `adler1` and `adler2` must each be a genuine Adler-32 checksum, meaning both 16-bit halves of
-/// each are strictly below [`super::BASE`]. Every checksum this crate produces satisfies that. The
-/// function is total -- it cannot panic and it validates nothing, exactly as
-/// `adler32.c` L133-L155 does not -- but for arguments that violate the precondition the returned
-/// `u32` is the low 32 bits of a value an LP64 C build reports in full. See *PRECONDITION on
-/// `adler1` and `adler2`* in the module documentation for the exact bound, the pinned witnesses,
-/// and why the divergence is documented rather than asserted or widened away.
+/// `adler1` and `adler2` are each expected to be a genuine Adler-32 checksum, meaning both 16-bit
+/// halves of each are strictly below [`super::BASE`]. Every checksum this crate produces
+/// satisfies that, and within it this function's `u32` result is the reference's result on every
+/// target. The function is nonetheless total -- it cannot panic and it validates nothing, exactly
+/// as `adler32.c` L133-L155 does not -- and for arguments outside that domain it returns the low
+/// 32 bits of a 33-bit value. [`adler32_combine_wide`] returns the whole of it, and the C ABI
+/// facade calls that one; see *Two widths* in the module documentation.
 ///
-/// A negative `len2` is *not* a precondition violation: it is part of the contract and yields the
+/// A negative `len2` is *not* outside the domain: it is part of the contract and yields the
 /// `0xffff_ffff` sentinel, matching the reference on every target.
 #[must_use]
+#[allow(clippy::cast_possible_truncation)]
 pub fn adler32_combine(adler1: u32, adler2: u32, len2: i64) -> u32 {
+    // The truncation is the point: this is the checksum-width face of the pair, and on every
+    // argument the exported C function is documented for the wide result already fits.
+    adler32_combine_(adler1, adler2, len2) as u32
+}
+
+/// Combines two Adler-32 checksums at the full width the reference computes in.
+///
+/// Identical to [`adler32_combine`] except in the width of the result: this is the value an LP64
+/// C build returns, which needs up to 33 bits for arguments that are not Adler-32 checksums.
+/// `crates/libz-rs-sys/src/checksum.rs` calls this and narrows to `uLong`, which reproduces LP64
+/// exactly and reproduces a 32-bit `unsigned long` exactly as well -- every intermediate of the
+/// algorithm is proved to fit a `u32`, so narrowing the packed result and computing the packing in
+/// 32 bits give the same bits.
+///
+/// # Arguments
+///
+/// As [`adler32_combine`]: the two checksums and the length of the *second* sequence only.
+///
+/// # Returns
+///
+/// The Adler-32 checksum of `seq1` followed by `seq2`, or the sentinel `0xffff_ffff` when `len2`
+/// is negative -- `adler32.c` L140's `0xffffffffUL`, which is that same 32-bit pattern in a
+/// 64-bit `unsigned long`. Never panics, for any combination of arguments.
+#[must_use]
+pub fn adler32_combine_wide(adler1: u32, adler2: u32, len2: i64) -> u64 {
     adler32_combine_(adler1, adler2, len2)
 }
 
@@ -204,7 +219,7 @@ pub fn adler32_combine(adler1: u32, adler2: u32, len2: i64) -> u32 {
 /// comes from and states the bound that keeps it inside `u32`. The argument and accumulator names
 /// are the reference implementation's own, because fidelity that has to be auditable against
 /// the C source is better served by identical naming than by invented synonyms.
-fn adler32_combine_(adler1: u32, adler2: u32, len2: i64) -> u32 {
+fn adler32_combine_(adler1: u32, adler2: u32, len2: i64) -> u64 {
     // Step 1 -- `adler32.c` lines 138-140: `if (len2 < 0) return 0xffffffffUL;`
     //
     // "for negative len, return invalid adler32 as a clue for debugging". This must stay first:
@@ -283,12 +298,17 @@ fn adler32_combine_(adler1: u32, adler2: u32, len2: i64) -> u32 {
 
     // Step 8 -- `adler32.c` line 154: `return sum1 | (sum2 << 16);`
     //
-    // Repack the two sums into one Adler-32 word. For legitimate arguments both are below `BASE`
-    // and so occupy sixteen bits each, giving an exact packing; the out-of-contract case in which
-    // they do not is the truncation discussed under *Domain of the 32-bit result* in the module
-    // documentation. The shift amount is a constant `16`, well inside the width of `u32`, so this
-    // cannot panic.
-    sum1 | (sum2 << 16)
+    // Repack the two sums into one Adler-32 word, **in the width the reference packs in**. C's
+    // `sum1` and `sum2` are `unsigned long`, so on LP64 this statement is 64-bit arithmetic; for
+    // legitimate arguments both sums are below `BASE` and occupy sixteen bits each, so the width
+    // is invisible, and for the out-of-domain arguments described under *Two widths* in the module
+    // documentation each can reach `65_548` and the packed value needs 33 bits. Widening here is
+    // what lets one body serve LP64 and a 32-bit `unsigned long` alike: `adler32_combine`
+    // truncates to `u32` and the facade truncates to `uLong`, and a truncated left shift equals a
+    // left shift of the truncation, so neither can differ from C's own arithmetic.
+    //
+    // The shift amount is a constant `16`, well inside the width of `u64`, so this cannot panic.
+    u64::from(sum1) | (u64::from(sum2) << 16)
 }
 
 #[cfg(test)]
@@ -306,7 +326,7 @@ mod tests {
         clippy::indexing_slicing
     )]
 
-    use super::{adler32_combine, BASE};
+    use super::{adler32_combine, adler32_combine_wide, BASE};
     use alloc::vec::Vec;
 
     /// Largest block the reference Adler-32 loop may run before reducing, from `adler32.c` line
@@ -573,14 +593,16 @@ mod tests {
             (0xfff0_fff0, 0xfff0_fff0, 0, 0xffef_ffee),
             (0x0000_ffff, 0x0000_ffff, 65_521, 0x0001_000c),
             (0x1234_5678, 0x9abc_def0, -1, 0xffff_ffff),
-            // The three witnesses for the module documentation's PRECONDITION section: both
+            // The three witnesses for the module documentation's *Two widths* section: both
             // arguments carry a high half at or above `BASE`, which is the only way the reference
-            // implementation's `unsigned long` result can exceed 32 bits. It returns
-            // 0x1_000b_ffef, 0x1_000b_fffd and 0x1_000a_ffef here. The expected values below are
-            // those truncated to 32 bits -- what this function computes, and what a C build whose
-            // `unsigned long` is 32 bits wide computes, but NOT what the LP64 C build this port is
-            // verified against returns. These vectors therefore pin the documented divergence
-            // deliberately; they are not evidence of agreement.
+            // implementation's `unsigned long` result can exceed 32 bits. An LP64 reference build
+            // returns 0x1_000b_ffef, 0x1_000b_fffd and 0x1_000a_ffef here; the values below are
+            // those truncated to 32 bits, which is what this `u32` face is *for* and what a C build
+            // whose `unsigned long` is 32 bits wide returns. `the_wide_face_keeps_the_bit_the_narrow
+            // _one_drops` below pins the untruncated values, `adler32_combine` is asserted to be the
+            // wide face's truncation on every vector in this table, and
+            // `crates/zlib-rs-differential/tests/checksum_width.rs` compares the wide face against
+            // the C library itself -- so all three widths are now measured rather than described.
             (0xffff_fff0, 0xffff_0000, 1, 0x000b_ffef),
             (0xffff_fff0, 0xffff_ffff, 1, 0x000b_fffd),
             (0xfffe_fff0, 0xffff_0000, 1, 0x000a_ffef),
@@ -592,6 +614,75 @@ mod tests {
                 expected,
                 "adler32_combine({adler1:#010x}, {adler2:#010x}, {len2})"
             );
+            // The narrow face is defined as the wide one truncated, and nothing else. Asserting it
+            // over the whole table is what keeps the two from drifting apart if either body is ever
+            // edited on its own.
+            assert_eq!(
+                adler32_combine(adler1, adler2, len2),
+                adler32_combine_wide(adler1, adler2, len2) as u32,
+                "the two faces disagree at ({adler1:#010x}, {adler2:#010x}, {len2})"
+            );
+        }
+    }
+
+    /// The wide face keeps the 33rd bit that the checksum-width face necessarily drops.
+    ///
+    /// These are the three values an LP64 C build returns for the out-of-domain witnesses at the
+    /// foot of `VECTORS`, and reproducing them is what the C ABI facade needs in order to answer in
+    /// `uLong` without truncating on this target.
+    /// `crates/zlib-rs-differential/tests/checksum_width.rs` checks the same three against the
+    /// reference library rather than against these literals.
+    #[test]
+    fn the_wide_face_keeps_the_bit_the_narrow_one_drops() {
+        const WIDE: &[(u32, u32, i64, u64)] = &[
+            (0xffff_fff0, 0xffff_0000, 1, 0x1_000b_ffef),
+            (0xffff_fff0, 0xffff_ffff, 1, 0x1_000b_fffd),
+            (0xfffe_fff0, 0xffff_0000, 1, 0x1_000a_ffef),
+        ];
+
+        for &(adler1, adler2, len2, expected) in WIDE {
+            let wide = adler32_combine_wide(adler1, adler2, len2);
+            assert_eq!(
+                wide, expected,
+                "adler32_combine_wide({adler1:#010x}, {adler2:#010x}, {len2})"
+            );
+            assert!(
+                u32::try_from(wide).is_err(),
+                "this witness is only interesting if it exceeds 32 bits"
+            );
+            assert_eq!(
+                adler32_combine(adler1, adler2, len2),
+                wide as u32,
+                "the narrow face must be the truncation and not a second computation"
+            );
+        }
+    }
+
+    /// Every in-domain argument fits 32 bits, so the two faces are the same number there.
+    ///
+    /// This is the property that makes the narrow face a legitimate public API rather than a lossy
+    /// convenience: within the domain `zlib.h` L1837-L1846 documents, nothing is lost.
+    #[test]
+    fn the_two_faces_agree_on_every_genuine_checksum() {
+        // Both halves of each argument strictly below `BASE`, which is the domain.
+        for high1 in [0_u32, 1, 2, BASE - 1, BASE / 2] {
+            for low1 in [0_u32, 1, BASE - 1] {
+                for high2 in [0_u32, 1, BASE - 1] {
+                    for low2 in [0_u32, 1, 2, BASE - 1] {
+                        let adler1 = (high1 << 16) | low1;
+                        let adler2 = (high2 << 16) | low2;
+                        for len2 in [0_i64, 1, 65_520, 65_521, 1 << 32, i64::MAX] {
+                            let wide = adler32_combine_wide(adler1, adler2, len2);
+                            assert!(
+                                u32::try_from(wide).is_ok(),
+                                "an in-domain combine must fit 32 bits: \
+                                 ({adler1:#010x}, {adler2:#010x}, {len2}) gave {wide:#x}"
+                            );
+                            assert_eq!(u64::from(adler32_combine(adler1, adler2, len2)), wide);
+                        }
+                    }
+                }
+            }
         }
     }
 

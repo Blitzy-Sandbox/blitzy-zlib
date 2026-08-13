@@ -120,9 +120,20 @@
 //!                   point.  ONE of this crate's two files where `unsafe` appears.
 //! src/port.rs    -> one safe gate per libz-rs-sys entry point, the gzFile handle, the
 //!                   inflateBack callback bridge and the instrumented allocator.  THE OTHER.
-//! src/lib.rs     -> this file: crate docs + `pub mod oracle;` and `pub mod port;`.  No unsafe
-//!                   and no logic -- but see the ATTRIBUTES note below for why it still cannot
-//!                   carry `#![forbid(unsafe_code)]`.
+//! src/retain.rs  -> the RETENTION DISCIPLINE, and it is load-bearing rather than a convenience.
+//!                   Three entry points keep a caller pointer past the call that installed it --
+//!                   the `gz_header` of deflateSetHeader/inflateGetHeader, the inflateBack
+//!                   window, and the ledger behind `opaque` -- and a `&mut` whose borrow ends
+//!                   with the call cannot express that, so SAFE code was free to drop or move
+//!                   storage the library still points into.  `Session` owns the stream and
+//!                   holds every retained allocation borrowed for the stream's whole life, which
+//!                   turns "declare the storage before the stream" from a comment into a
+//!                   compile error.  Contains NO unsafe and makes no library call of its own;
+//!                   `retention_compile_fail/` holds the programs that must not compile, and
+//!                   the `miri-harness` job interprets this module's own tests.
+//! src/lib.rs     -> this file: crate docs + `pub mod oracle;`, `pub mod port;` and
+//!                   `pub mod retain;`.  No unsafe and no logic -- but see the ATTRIBUTES note
+//!                   below for why it still cannot carry `#![forbid(unsafe_code)]`.
 //! build.rs       -> the C oracle build.  No unsafe, and carries `#![forbid(unsafe_code)]`.
 //! tests/*.rs     -> import `zlib_rs_differential::{oracle, port}` (this crate's lib target) and
 //!                   `zlib_rs::*` for the idiomatic surface.  ALL differential, interop and

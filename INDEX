@@ -89,9 +89,9 @@ benches/                        dev-only criterion suites, their own excluded pa
 fuzz/                           dev-only cargo fuzz targets, its own workspace
 rust/README.md                  the developer guide for all of the above
 See README for the build commands and the Cargo feature matrix, rust/README.md for
-the developer guide, Makefile.in for the seven targets rust, rust-pc, rust-test,
-rust-symbols, rust-header, rust-msrv and rust-clean, and
-.github/workflows/rust.yml for the eighteen jobs that gate them.
+the developer guide, Makefile.in for the nine targets rust, rust-pc, rust-test,
+rust-symbols, rust-header, rust-simd, rust-inventory, rust-msrv and rust-clean,
+and .github/workflows/rust.yml for the twenty-two jobs that gate them.
 .github/scripts/ holds the gate programs those jobs invoke rather than inline:
 bench_gate.py with its self-test and fixture, and whitespace_gate.sh.  The staged
 symlink chain is verified instead by crates/libz-rs-sys/tests/dropin_chain.rs, a

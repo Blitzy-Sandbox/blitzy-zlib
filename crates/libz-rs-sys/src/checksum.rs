@@ -265,6 +265,42 @@ fn widen_offset<T: Into<i64>>(len2: T) -> i64 {
     len2.into()
 }
 
+/// Narrows the 64-bit result of a combine to the caller's `uLong`, as C's own arithmetic does.
+///
+/// ★ **This is the fix for the one place where `uLong` mattered.** `adler32_combine_` accumulates
+/// into `unsigned long` and returns `uLong` (`adler32.c` L133-L155), so on LP64 its result is a
+/// 64-bit value -- and for arguments that are not genuine Adler-32 checksums it genuinely uses 33
+/// of those bits, because the internal `sum1` and `sum2` can each reach `65_548` and the packed
+/// word `sum1 | (sum2 << 16)` then overlaps them. Reading the core's result as `u32` and widening
+/// it truncated that value on the one integer model the port is verified on. Taking the core's
+/// wide result and narrowing *here* reproduces both models exactly: on LP64 `uLong` is 64 bits and
+/// this is the identity, and on LLP64 Windows or ILP32 it discards precisely the bits a 32-bit
+/// `unsigned long` would never have held. Every intermediate of the algorithm is proved in
+/// `zlib_rs::adler32::combine` to fit a `u32`, so narrowing the packed result and packing in 32
+/// bits give the same bits -- which is what lets one core body serve every target.
+///
+/// Not shared with [`widen_checksum`], which stays the right conversion for the genuinely 32-bit
+/// results of `adler32`, `crc32` and the CRC-32 combines: those never exceed 32 bits, so widening
+/// is exact there and a narrowing cast would say something false about them.
+// `cast_possible_truncation` is the documented intent: it reproduces the width of C's own
+// `unsigned long`. `trivial_numeric_casts` and `unnecessary_cast` join it because on LP64 --
+// this target -- `uLong` *is* `u64` and the expression is `u64 as u64`, while on i686 and LLP64
+// Windows it is a genuine narrowing; there is no single spelling that is lint-free on both, since
+// `uLong::from` would be a `useless_conversion` where the widths match and `uLong::try_from` an
+// error arm that must never be taken. The allowance is scoped to this one-line function so it
+// cannot hide a narrowing anywhere else. Written as comments rather than the attribute's `reason`
+// field, which was stabilised in Rust 1.81 and so fails to compile on the declared 1.80 floor.
+#[inline]
+#[must_use]
+#[allow(
+    trivial_numeric_casts,
+    clippy::unnecessary_cast,
+    clippy::cast_possible_truncation
+)]
+const fn narrow_combined(value: u64) -> uLong {
+    value as uLong
+}
+
 // ---------------------------------------------------------------------------
 // Slice reconstruction -- unsafe-site category 2
 // ---------------------------------------------------------------------------
@@ -455,10 +491,20 @@ pub unsafe extern "C" fn adler32_z(adler: uLong, buf: *const Bytef, len: z_size_
 ///
 /// This and [`adler32_combine64`] delegate to one core function and therefore cannot
 /// disagree.
+///
+/// # Width
+///
+/// The core is called through its **wide** face and the result is narrowed here by
+/// [`narrow_combined`], not widened from a `u32`. That is what makes this exact on LP64 for
+/// arguments that are not genuine Adler-32 checksums, where the reference's `unsigned long`
+/// arithmetic produces a 33-bit value; see [`narrow_combined`] for the whole argument. Bits at or
+/// above position 32 of `adler1` and `adler2` are discarded on the way in, and that is faithful:
+/// the algorithm reads only the two 16-bit halves of each (`adler32.c` L145-L149), so C ignores
+/// those bits too.
 #[no_mangle]
 pub extern "C" fn adler32_combine(adler1: uLong, adler2: uLong, len2: z_off_t) -> uLong {
     guard(|| {
-        widen_checksum(rs_adler32::adler32_combine(
+        narrow_combined(rs_adler32::adler32_combine_wide(
             narrow_checksum(adler1),
             narrow_checksum(adler2),
             widen_offset(len2),
@@ -478,12 +524,13 @@ pub extern "C" fn adler32_combine(adler1: uLong, adler2: uLong, len2: z_off_t) -
 /// configuration, including the `Z_WANT64` re-declaration at `zlib.h` L2010 -- unlike
 /// `gzseek64` and its neighbours, which degrade to `z_off_t` there.
 ///
-/// Semantics, including the `0xffff_ffff` sentinel for a negative `len2`, are
-/// [`adler32_combine`]'s exactly; both delegate to one core function.
+/// Semantics, including the `0xffff_ffff` sentinel for a negative `len2` and the `uLong`-width
+/// result [`narrow_combined`] produces, are [`adler32_combine`]'s exactly; both delegate to one
+/// core function.
 #[no_mangle]
 pub extern "C" fn adler32_combine64(adler1: uLong, adler2: uLong, len2: z_off64_t) -> uLong {
     guard(|| {
-        widen_checksum(rs_adler32::adler32_combine(
+        narrow_combined(rs_adler32::adler32_combine_wide(
             narrow_checksum(adler1),
             narrow_checksum(adler2),
             widen_offset(len2),

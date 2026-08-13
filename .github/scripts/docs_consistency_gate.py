@@ -59,6 +59,16 @@ NON_JOB_TERMS = {
     "libfuzzer-sys", "libz-compat", "libz-rs-sys", "macos-latest", "pkg-config",
     "rust-api", "rust-version", "ubuntu-latest", "zlib-rs", "zlib-rs-benches",
     "zlib-rs-differential", "zlib-rs-fuzz",
+    # A job that USED to exist and is named in the guide only so its removal is
+    # traceable. `silesia-provision` fetched the Silesia corpus from a
+    # `workflow_dispatch` input, which contradicted AAP 0.6.4.4's rule that the
+    # corpus is opt-in and never invoked by CI -- and contradicted the workflow's
+    # own header claim that no job downloads a corpus. It was removed; the guide
+    # explains the change rather than pretending the job never existed, and this
+    # entry is what keeps that explanation from reading as a stale reference.
+    # Listing it here is the deliberate, reviewable alternative to deleting the
+    # history from the guide.
+    "silesia-provision",
 }
 
 NUMBER_WORDS = {
@@ -176,7 +186,32 @@ def main() -> int:
                 f"the guide names .github/scripts/{script}, which does not exist. A gate "
                 f"described but absent reads as coverage that is not there."
             )
-    print(f"script paths: {len(scripts)} named, all present")
+    # And the other direction, which is the one that actually rots. A gate the guide does
+    # not name is a gate a reader does not know runs, and adding one is precisely when the
+    # documentation is easiest to forget. Directories and fixture data are not gates, so
+    # only executable script files count.
+    scripts_dir = WORKFLOWS.parent / "scripts"
+    on_disk_scripts = sorted(
+        entry.name
+        for entry in scripts_dir.iterdir()
+        if entry.is_file() and entry.suffix in {".py", ".sh"}
+    )
+    if len(on_disk_scripts) < 5:
+        sys.exit(
+            f"error: only {len(on_disk_scripts)} script(s) found under {scripts_dir}; "
+            f"that scan has stopped working"
+        )
+    for script in on_disk_scripts:
+        checked += 1
+        if script not in scripts:
+            failures.append(
+                f".github/scripts/{script} exists but {README} never names it. A gate the "
+                f"guide does not mention is a check nobody knows runs."
+            )
+    print(
+        f"script paths: {len(scripts)} named by the guide, all present; "
+        f"{len(on_disk_scripts)} on disk, all named"
+    )
 
     # 3. The job count and the platform split, both stated in words.
     rust_jobs = jobs["rust.yml"]
@@ -274,6 +309,150 @@ def main() -> int:
                 f"declare."
             )
     print(f"CMake options: {len(named_options & declared_options)} named, all declared")
+
+    # 6. The facade's integration-test inventory, both directions.
+    #
+    # ★ WHY BOTH DIRECTIONS.  `crates/libz-rs-sys/Cargo.toml` used to enumerate the test
+    # files itself and assert that the list was "what `cargo metadata` reports for this
+    # package".  It named seven; cargo reported nine.  It had missed `dropin_chain.rs`
+    # when that arrived and `alias_overlap.rs` when that did, and nothing could notice,
+    # because a hand-kept copy of a list the tool already owns is checked by nobody.  The
+    # enumeration now lives once, in the guide, and this check is what keeps it honest:
+    # a file the guide does not name is undocumented coverage, and a name the guide
+    # carries with no file behind it is coverage that does not exist.  The manifest points
+    # here rather than repeating the list.
+    facade_tests_dir = CMAKELISTS.parent / "crates" / "libz-rs-sys" / "tests"
+    on_disk = {path.name for path in facade_tests_dir.glob("*.rs")}
+    if len(on_disk) < 5:
+        sys.exit(
+            f"error: only {len(on_disk)} test file(s) found under {facade_tests_dir}; "
+            f"that scan has stopped working"
+        )
+    named_tests = {
+        name for name in re.findall(r"`([A-Za-z0-9_]+\.rs)`", guide) if name in on_disk
+    } | {
+        # Also count a bare `--test <name>` invocation, which is how the guide quotes
+        # several of them in command form rather than as a file name.
+        f"{name}.rs"
+        for name in re.findall(r"--test\s+([A-Za-z0-9_]+)", guide)
+        if f"{name}.rs" in on_disk
+    }
+    for name in sorted(on_disk):
+        checked += 1
+        if name not in named_tests:
+            failures.append(
+                f"crates/libz-rs-sys/tests/{name} exists but {README} never names it. An "
+                f"integration test the guide does not mention is coverage nobody knows "
+                f"about, and the manifest now defers to the guide for this list."
+            )
+    print(
+        f"facade tests: {len(on_disk)} file(s) on disk, all named by the guide"
+    )
+
+    # 7. The `rust*` make targets the guide names must exist in Makefile.in.
+    makefile_in = read(CMAKELISTS.parent / "Makefile.in")
+    declared_targets = set(re.findall(r"(?m)^(rust[a-z-]*):", makefile_in))
+    if len(declared_targets) < 5:
+        sys.exit(
+            "error: fewer than five `rust*` targets found in Makefile.in; that scan has "
+            "stopped working"
+        )
+    named_targets = set(re.findall(r"make\s+(rust[a-z-]*)", guide))
+    for target in sorted(named_targets):
+        checked += 1
+        if target not in declared_targets:
+            failures.append(
+                f"the guide tells a reader to run `make {target}`, which Makefile.in does "
+                f"not define."
+            )
+    for target in sorted(declared_targets):
+        checked += 1
+        if target not in named_targets:
+            failures.append(
+                f"Makefile.in defines the target `{target}`, which {README} never tells "
+                f"anyone to run. A gate reachable only by reading the makefile is a gate "
+                f"that does not get run."
+            )
+    print(
+        f"make targets: {len(declared_targets)} `rust*` target(s) in Makefile.in, all "
+        f"named by the guide"
+    )
+
+    # 8. rust.yml's OWN job inventory, against rust.yml's own `jobs:` keys.
+    #
+    # Every check above compares the guide with the tree. This one compares a file with
+    # ITSELF, and it is here because that is where the drift actually happened: the
+    # workflow's header carried a "★ THE JOB INVENTORY, and it is the whole of it"
+    # block naming EIGHTEEN jobs while twenty-two were declared below it -- two Miri
+    # jobs and both platform-abi jobs were missing. A header inventory is the most
+    # inviting thing in a file to leave behind, and the most authoritative-looking.
+    rust_yml_text = read(JOB_SOURCES["rust.yml"])
+    rust_yml_jobs = jobs["rust.yml"]
+    inventory_start = rust_yml_text.find("THE JOB INVENTORY")
+    if inventory_start < 0:
+        failures.append(
+            f"rust.yml no longer carries a 'THE JOB INVENTORY' block. It is "
+            f"what a reader uses to know what runs; restore it, or remove this check "
+            f"deliberately rather than by deleting the block."
+        )
+    else:
+        # The block ends where the `make rust*` section begins. Bounding it explicitly
+        # rather than by "the next blank comment line" matters: the list spans several
+        # lines WITH blank comment lines between them, so the looser rule truncated it
+        # after the first row and reported every job below that as missing.
+        window = rust_yml_text[inventory_start:]
+        end = window.find("`make rust*` TARGETS")
+        if end < 0:
+            end = window.find("What each job enforces")
+        window = window[: end if end > 0 else 4000]
+        # ★ ONLY THE LIST ROWS, not the prose around them. The rows are the deeply
+        # indented comment lines (`#     name   name`); the paragraphs in the same
+        # window discuss job names too, and searching the whole window let a job be
+        # "named" by a sentence explaining that it had once been missing. Measured: with
+        # the whole window, deleting `miri-facade` from the list did NOT fail this check,
+        # because the paragraph below the list mentions it. A gate that passes on the
+        # text describing its own past failure is not a gate.
+        inventory = "\n".join(
+            line for line in window.splitlines() if re.match(r"^#\s{4,}\S", line)
+        )
+        if not inventory.strip():
+            failures.append(
+                "rust.yml's job inventory block has no indented list rows, so this "
+                "check had nothing to compare. Restore the list, or remove the check."
+            )
+        for job in sorted(rust_yml_jobs):
+            checked += 1
+            if not re.search(rf"(?<![\w-]){re.escape(job)}(?![\w-])", inventory):
+                failures.append(
+                    f"rust.yml declares a job `{job}` that its own header "
+                    f"inventory does not name. That block says it is 'the whole of it', "
+                    f"so a job missing from it makes the file wrong about itself."
+                )
+        for name in sorted(set(re.findall(r"\b([a-z][a-z0-9-]{3,})\b", inventory))):
+            if name in NON_JOB_TERMS or name in all_jobs:
+                continue
+            # Only flag tokens that LOOK like a stale job name. Two kinds of hyphenated
+            # token in this block are prose and must not be reported, and both were
+            # measured rather than guessed:
+            #   * a NUMBER WORD -- the block opens "TWENTY-TWO jobs";
+            #   * a PREFIX of a real job name -- the block writes `platform-abi-*` to
+            #     mean both of them, and `platform-abi` is not itself a job.
+            if name in NUMBER_WORDS:
+                continue
+            if any(job.startswith(name + "-") for job in all_jobs):
+                continue
+            if "-" in name and name not in all_jobs:
+                checked += 1
+                failures.append(
+                    f"rust.yml's header inventory names `{name}`, which is "
+                    f"not a declared job. Either it was renamed or removed, or it is "
+                    f"prose that reads like a job name -- both mislead a reader who "
+                    f"trusts the block."
+                )
+    print(
+        f"workflow self-inventory: all {len(rust_yml_jobs)} job(s) rust.yml declares are "
+        f"named by its own header block"
+    )
 
     if failures:
         print(f"\nerror: {len(failures)} claim(s) in {README} no longer match the tree:")

@@ -49,21 +49,20 @@ Where unsafe lives is worth stating by count rather than in round numbers,
 because "the only crate permitted to write unsafe" is a statement about the
 SHIPPED library and is often read as a statement about the whole tree.
 
-In the shipped library, every occurrence is under crates/libz-rs-sys/src/ --
-1,153 of them across nine files when this was last counted, none anywhere else.
-Re-derive the numbers rather than trusting them, and use this command rather
-than the obvious one:
+In the shipped library, every occurrence is under crates/libz-rs-sys/src/, and
+none anywhere else.  No total is quoted here on purpose: this tree documents
+itself heavily, so the figure moves whenever a comment is written, and a stale
+number in a README reads as a finding about the code rather than about the
+README.  Derive it, with this command rather than the obvious one:
 
     grep -rn --include='*.rs' -E 'unsafe *(\{|fn|extern|impl)' crates fuzz benches \
       | grep -vE ':[0-9]+:[[:space:]]*(//|/\*|\*)'
 
-The second stage is not decoration.  This tree documents itself heavily, and the
-pattern matches PROSE as readily as code: at the time of writing the unfiltered
-command reports 1,554 hits where the filtered one reports 1,527, and five of the
-difference fall in crates that provably contain no unsafe at all -- a doc comment
-quoting "unsafe { vsnprintf(...) }" is a match.  With the filter it counts
-constructs, and the three figures given here sum to exactly what it prints.
-Treat any count in a document as a snapshot; the command is the authority.
+The second stage is not decoration.  The pattern matches PROSE as readily as
+code -- a doc comment quoting "unsafe { vsnprintf(...) }" is a match -- and some
+of those matches fall in crates that provably contain no unsafe at all, so the
+unfiltered command reports meaningfully more than the filtered one.  With the
+filter it counts constructs.  The command is the authority; a document is not.
 
 crates/zlib-rs, which is the whole of the algorithm, carries
 #![forbid(unsafe_code)] and therefore has zero -- checked by the compiler on
@@ -73,10 +72,12 @@ any number.
 Outside the shipped library, three dev-only places have unsafe, and each is
 unavoidable rather than tolerated.  crates/zlib-rs-differential/src/oracle.rs
 declares the C oracle and src/port.rs holds the safe boundary gates that
-everything else drives the C ABI through (273 occurrences between them); and the
-suites under crates/libz-rs-sys/tests/ have 101, because CALLING an extern "C"
+everything else drives the C ABI through; and the suites under
+crates/libz-rs-sys/tests/ have unsafe too, because CALLING an extern "C"
 function is itself an unsafe operation, so a test that exercises the facade's own
 entry points cannot avoid an unsafe block however safe the code under test is.
+(src/retain.rs is the differential crate's third module and has none: it is a
+lifetime discipline, not a boundary.)
 Those gates are deliberately not part of the shipped facade: AAP 0.6.1 fixes that
 facade's unsafe at exactly the six unavoidable C-ABI site categories, and a test
 harness is not one of them.  The facade's own crate documentation states those
@@ -155,10 +156,11 @@ What ./configure adds is the C library build that "make rust-symbols" diffs
 against, and a $(CARGO) recorded for you (unconfigured, name it yourself with
 "make rust CARGO=cargo").
 
-Four more targets complete the set:
+Five more targets complete the set:
 
     make rust-pc       # emit the pkg-config descriptor and gate a consumer
     make rust-header   # regenerate the C header with cbindgen and gate it
+    make rust-simd     # measure the simd feature's vector content and gate it
     make rust-msrv     # check the two shipped crates on the 1.80 floor
     make rust-clean    # remove what the Rust targets produced
 
@@ -200,7 +202,7 @@ The answer is target-specific, so run it for the target you are building.
 
 "make rust-header" wants cbindgen as well as a cargo reachable on PATH, and
 "make rust-clean" wants no cargo at all.  The comment at the top of Makefile.in
-describes all seven targets, including what each one does and does not
+describes all eight targets, including what each one does and does not
 establish.
 
 CMake can point the exported ZLIB::ZLIB and ZLIB::ZLIBSTATIC targets at the
@@ -374,7 +376,7 @@ compiler and the target, and on x86_64 the answer differs between them:
              run-time probe in either module, an is_supported() SSE2 check,
              which is a throughput hint and not a correctness gate.
 
-  CRC-32     Does not vectorise.  Its body is 487 instructions of mov, xor, shr
+  CRC-32     Does not vectorise.  Its body is 348 instructions of mov, xor, shr
              and movzbl -- zero vector instructions in the same library -- so it
              is a scalar reformulation, not a SIMD one, and it is named for what
              it is: the backend is "stride-braid", it performs no run-time
@@ -382,7 +384,15 @@ compiler and the target, and on x86_64 the answer differs between them:
              parallelism and by shortening the serial byte tail of the braided
              algorithm in crc32.c.  Genuine vector CRC-32 would need the
              carry-less-multiply intrinsics, which the core's safety rule rules
-             out.
+             out; the alternative that portable Rust CAN vectorise was written and
+             timed, and it is 6 to 9 times SLOWER than this one, so the trade is
+             recorded rather than taken.  See rust/README.md and
+             crates/zlib-rs/src/crc32/simd.rs for the measurement.
+
+Both figures above are measured by a committed gate, not by a one-off reading:
+.github/scripts/simd_vector_gate.py disassembles the release library built with
+--features simd and fails if either backend's vector content stops matching what
+this file says.  It is reachable as `make rust-simd'.
 
 Both are therefore correct on a machine with no vector unit whatsoever, and what
 the feature promises is the answer: both compute the same checksums as the

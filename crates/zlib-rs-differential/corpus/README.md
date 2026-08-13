@@ -42,8 +42,16 @@ contract, and every consumer is written to conform to it.
 corpus/
 ├── README.md            this file — the published contract
 ├── fetch_silesia.sh     opt-in; fetches only when a human runs it, never from CI
+├── silesia.pin          the approved tier-2 archive identity — the ONE pin authority
+├── silesia.sha256       per-member digests, checked by `--verify-only` when present
 └── minimal/             the ten committed fixtures
 ```
+
+Those are the whole of what is committed here: four files and the ten fixtures. `silesia.pin`
+and `silesia.sha256` are listed because they are *inputs to a gate* rather than documentation —
+`--pin-status` reads the first on every `bench` run, and `--verify-only` reads the second when
+a corpus has been provisioned. Nothing else in this folder is tracked; the corpus a human
+fetches lands outside the repository and is never committed.
 
 ## The two tiers
 

@@ -235,11 +235,30 @@ describes are not.)
   libz.so   is NOT the installable shared library.  rustc attaches its own
             anonymous version script to every cdylib link, so zlib.map cannot be
             layered on: this object carries 0 of the 16 zlib symbol-version
-            nodes, does not export gzprintf or gzvprintf (both variadic, so they
-            live in the C shim, whose objects a cdylib cannot re-export), and does
-            export internals that zlib.map hides -- the two _zlib_rs_gzprintf_*
-            helpers and inflate_table.  Measured: 96 dynamic globals against the
-            C library's 111.  No build-script argument can change any of that.
+            nodes, and it does not export gzprintf or gzvprintf -- both are
+            variadic, so they live in the C shim, and a cdylib cannot re-export a
+            symbol defined by an archive object it links.  Measured: 93 dynamic
+            globals, against the C library's 111.  No build-script argument can
+            change either fact.
+
+            What it does NOT do, contrary to what this note used to say, is leak
+            internals: it exports exactly those 93 names and nothing else, so
+            neither inflate_table nor the two _zlib_rs_gzprintf_* helpers appears
+            in its dynamic table.  Measured with `comm' against the ZEXTERN set.
+            The leak that sentence described was real when it was written and was
+            fixed without the sentence being updated; it is corrected here rather
+            than deleted, so that a reader who remembers the old claim can see
+            what became of it.
+
+            The counts above belong to named sets and are not interchangeable.
+            zlib.h yields 101 ZEXTERN-shaped matches; five of those -- deflateInit,
+            deflateInit2, inflateInit, inflateInit2 and inflateBackInit -- are
+            documentation comments showing the effective signature of a MACRO, so
+            96 is the number of real declarations; gzopen_w is behind
+            `#if defined(_WIN32)', so 95 is the number a non-Windows build can
+            define; and 93 is that minus the two variadic names above.  95
+            functions plus the 16 version nodes is where the C library's 111
+            comes from.
 
   libz.rlib is a Rust library, for Rust dependents.  It exports no C symbol.
 
@@ -304,6 +323,20 @@ const ENV_SIMD: &str = "ZLIB_RS_SIMD";
 // target compiler generically, and `CC` is the ordinary variable.  With none of them
 // set the platform default is used -- `cc` everywhere except MSVC, where it is
 // `cl.exe`.  `CFLAGS` follows the same cascade.
+//
+// ★ EVERY ONE OF THESE IS A COMMAND, NOT A PROGRAM NAME, and `split_command' below is
+// what makes that true.  `CC="ccache gcc"', `CC="sccache cc"', `CC="gcc -m32"',
+// `CC="clang --target=aarch64-linux-gnu"' and `CC="zig cc"' are all ordinary things to
+// find in an environment, and `Makefile.in' exports CC, CFLAGS and AR into the cargo
+// build -- so a tree configured with a compiler cache reached this script with a value
+// containing a space.  Handing that to Command::new asks the operating system to
+// execute a file whose name literally contains the space, and it answers `No such file
+// or directory' while naming a program nobody installed.  Quoting inside CFLAGS is
+// honoured for the same reason: `-I'/opt/my sdk'' and `-DBANNER="a b"' are ordinary,
+// and whitespace splitting turns each into two broken arguments.  What is NOT done is
+// any other shell behaviour -- no expansion, no globbing, no substitution -- because
+// this code runs with the building user's privileges on every machine that builds the
+// library.
 const ENV_CC: &str = "CC";
 const ENV_TARGET_CC: &str = "TARGET_CC";
 const ENV_CFLAGS: &str = "CFLAGS";
@@ -618,9 +651,25 @@ enum SharedObjectFormat {
     // and the unmodified `test/minigzip.c` against cargo's import library and
     // runs them.  So the `#[cfg(windows)]` items in the source (`gzopen_w`, the
     // `_WIN32` entries in cbindgen.toml's `[defines]`) are exercised rather than
-    // merely present -- while the two names that cannot cross a PE cdylib
-    // boundary, `gzprintf` and `gzvprintf`, are recorded as expected absences by
-    // `.github/scripts/platform_abi_gate.py` rather than passing unnoticed.
+    // merely present.
+    //
+    // ★ What is NOT verified there, stated as the class it belongs to: `z.dll`
+    // does not export `gzprintf`/`gzvprintf`, so the Windows ABI is a documented
+    // SUBSET of the contract rather than a complete drop-in, and a Windows
+    // consumer that calls either -- `zlib.h` declares both unconditionally --
+    // fails to link.  The mechanism is NOT PE-specific and it is worth being
+    // exact, because blaming the format hides the fix: `csrc/gzprintf_shim.c` is
+    // compiled and archived on every target, but a cdylib link retains only what
+    // something reaches, and nothing in Rust calls either name.  Measured on ELF
+    // for the same reason: `nm --defined-only target/release/libz.a` shows
+    // `gzprintf_shim.o` defining both, while
+    // `nm -D --defined-only --extern-only target/release/libz.so` shows neither.
+    // ELF closes it in PACKAGING -- `Makefile.in`'s `rust` target names both in
+    // the relink, and the staged library exports them -- and PE has no such step
+    // only because `win32/zlib.def` is out of scope.  So this is a
+    // `PACKAGING_GAP` in `.github/scripts/platform_abi_gate.py`'s vocabulary,
+    // classified apart from `gzopen_w`'s `NOT_ON_PLATFORM` absence on Linux, and
+    // `platform-abi-windows` passes `--expect-abi subset` to say so.
     Pe,
     // Everything else: wasm, emscripten, AIX, HP-UX, bare metal.  Emitting an
     // ELF-only argument here would break the link, so nothing is emitted.
@@ -998,7 +1047,8 @@ fn compile_shim(source: &Path, out_dir: &Path, repo_root: &Path, msvc: bool) -> 
     let _ = fs::remove_file(&object);
 
     let compiler = tool_from_env(ENV_CC, ENV_TARGET_CC, if msvc { "cl" } else { "cc" });
-    let mut command = std::process::Command::new(&compiler);
+    let compiler_name = compiler.display();
+    let mut command = compiler.command();
     if msvc {
         command
             .arg("/nologo")
@@ -1023,11 +1073,11 @@ fn compile_shim(source: &Path, out_dir: &Path, repo_root: &Path, msvc: bool) -> 
     command.args(flags_from_env(ENV_CFLAGS, ENV_TARGET_CFLAGS));
     command.arg(source);
 
-    run_tool(&mut command, &compiler, "compile", source);
+    run_tool(&mut command, &compiler_name, "compile", source);
     assert!(
         object.is_file(),
         "{} reported success but produced no object file at {}",
-        compiler,
+        compiler_name,
         object.display()
     );
     object
@@ -1046,7 +1096,8 @@ fn archive_shims(objects: &[PathBuf], out_dir: &Path, msvc: bool) -> PathBuf {
     let _ = fs::remove_file(&archive);
 
     let archiver = tool_from_env(ENV_AR, ENV_TARGET_AR, if msvc { "lib" } else { "ar" });
-    let mut command = std::process::Command::new(&archiver);
+    let archiver_name = archiver.display();
+    let mut command = archiver.command();
     if msvc {
         command
             .arg("/nologo")
@@ -1058,41 +1109,213 @@ fn archive_shims(objects: &[PathBuf], out_dir: &Path, msvc: bool) -> PathBuf {
     }
     command.args(objects);
 
-    run_tool(&mut command, &archiver, "archive", &archive);
+    run_tool(&mut command, &archiver_name, "archive", &archive);
     assert!(
         archive.is_file(),
         "{} reported success but produced no archive at {}",
-        archiver,
+        archiver_name,
         archive.display()
     );
     archive
 }
 
-/// Resolves one tool name through the `<VAR>_<target>` / `TARGET_<VAR>` / `<VAR>`
-/// cascade, falling back to the platform default.
-fn tool_from_env(base: &str, target_key: &str, default: &str) -> String {
+/// One resolved tool: the program to execute, and the arguments that came with it.
+///
+/// ★ The second field is why this is a struct and not a `String`. `CC` is very
+/// commonly a *command* rather than a program name -- `ccache gcc`, `sccache cc`,
+/// `gcc -m32`, `clang --target=aarch64-linux-gnu`, `zig cc` -- and the same is true of
+/// `AR`. Handing the whole value to [`std::process::Command::new`] asks the operating
+/// system to execute a file whose name literally contains a space, which fails with
+/// `No such file or directory` and a message naming a program nobody installed.
+/// `Makefile.in` exports `CC` and `AR` into the cargo build, so anyone who configured
+/// this tree with a compiler cache reached that failure.
+struct Tool {
+    /// The executable.
+    program: String,
+
+    /// Arguments that were part of the variable's value, in order, before this build
+    /// script's own.
+    leading: Vec<String>,
+}
+
+impl Tool {
+    /// Starts a [`std::process::Command`] for this tool with its leading arguments applied.
+    fn command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new(&self.program);
+        command.args(&self.leading);
+        command
+    }
+
+    /// How to name this tool in a diagnostic: the command as the caller wrote it.
+    fn display(&self) -> String {
+        if self.leading.is_empty() {
+            self.program.clone()
+        } else {
+            format!("{} {}", self.program, self.leading.join(" "))
+        }
+    }
+}
+
+/// Resolves one tool through the `<VAR>_<target>` / `TARGET_<VAR>` / `<VAR>` cascade,
+/// falling back to the platform default, and splits the result into program and
+/// arguments.
+fn tool_from_env(base: &str, target_key: &str, default: &str) -> Tool {
     let target = env::var("TARGET").unwrap_or_default().replace('-', "_");
-    env::var(format!("{base}_{target}"))
+    let raw = env::var(format!("{base}_{target}"))
         .or_else(|_| env::var(target_key))
         .or_else(|_| env::var(base))
         .map(|value| value.trim().to_owned())
         .ok()
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| default.to_owned())
+        .unwrap_or_else(|| default.to_owned());
+
+    let mut words = split_command(&raw, base).into_iter();
+    let program = words.next().unwrap_or_else(|| {
+        panic!(
+            "{base} is set to `{raw}', which contains no program name.  Set it to the \
+             compiler to run, optionally followed by arguments."
+        )
+    });
+    Tool {
+        program,
+        leading: words.collect(),
+    }
 }
 
-/// Resolves one flag list through the same cascade, split on whitespace.
-///
-/// Whitespace splitting is what every other consumer of `CFLAGS` does; a flag with an
-/// embedded space has to be passed through a response file or a wrapper script, which
-/// is also true of `make`.
+/// Resolves one flag list through the same cascade, split the same way.
 fn flags_from_env(base: &str, target_key: &str) -> Vec<String> {
     let target = env::var("TARGET").unwrap_or_default().replace('-', "_");
     let raw = env::var(format!("{base}_{target}"))
         .or_else(|_| env::var(target_key))
         .or_else(|_| env::var(base))
         .unwrap_or_default();
-    raw.split_whitespace().map(str::to_owned).collect()
+    split_command(&raw, base)
+}
+
+/// Splits one environment variable into arguments the way a POSIX shell would word-split
+/// it, and does **nothing else**.
+///
+/// Quoting is honoured because the alternative silently mis-splits: `-I'/opt/my sdk'`
+/// and `-DBANNER="a b"` are ordinary things to find in `CFLAGS`, and
+/// `str::split_whitespace` turns each into two broken arguments -- an include path that
+/// does not exist and a macro definition that does not compile. The previous version of
+/// this function split on whitespace and argued that `make` behaves the same way. It
+/// does not: `make` hands the value to a shell, which is precisely what performs this
+/// splitting.
+///
+/// What it deliberately does NOT do is anything else a shell would. There is no
+/// variable expansion, no `~`, no globbing, no command substitution, no operator
+/// handling: a `$(...)` or a backtick in `CFLAGS` arrives at the compiler as those
+/// literal characters. A build script runs with the invoking user's privileges on
+/// every machine that builds this library, so evaluating a string as shell here would
+/// turn a stray environment variable into arbitrary code execution. Splitting is safe
+/// and sufficient; evaluating is neither.
+///
+/// The rules, which are the shell's for the constructs it accepts:
+///
+/// * unquoted runs of whitespace separate arguments, and leading or trailing whitespace
+///   produces no empty argument;
+/// * `'...'` is literal throughout -- no escape has any meaning inside it;
+/// * `"..."` is literal except that a backslash before `"` or `\` escapes it;
+/// * outside quotes, a backslash escapes the next character, whatever it is;
+/// * quotes may open and close mid-argument, so `-DA="b c"d` is the single argument
+///   `-DA=b cd`, exactly as a shell would produce.
+///
+/// An unterminated quote is a hard error rather than a guess, because both guesses are
+/// wrong in a way the compiler reports as something else entirely.
+fn split_command(raw: &str, source: &str) -> Vec<String> {
+    /// Which quoting context the scanner is in.
+    enum Quote {
+        /// Outside quotes: whitespace separates, backslash escapes.
+        None,
+        /// Inside `'`: everything is literal.
+        Single,
+        /// Inside `"`: backslash escapes `"` and `\`.
+        Double,
+    }
+
+    let mut words = Vec::new();
+    let mut current = String::new();
+    // Distinguishes "no argument started" from "an argument that is the empty string",
+    // which is what makes `CFLAGS=''` produce nothing while `CFLAGS='""'` produces one
+    // empty argument -- the same distinction a shell draws.
+    let mut started = false;
+    let mut quote = Quote::None;
+    let mut characters = raw.chars();
+
+    while let Some(character) = characters.next() {
+        match quote {
+            Quote::None => match character {
+                c if c.is_whitespace() => {
+                    if started {
+                        words.push(std::mem::take(&mut current));
+                        started = false;
+                    }
+                }
+                '\'' => {
+                    started = true;
+                    quote = Quote::Single;
+                }
+                '"' => {
+                    started = true;
+                    quote = Quote::Double;
+                }
+                '\\' => {
+                    started = true;
+                    if let Some(escaped) = characters.next() {
+                        current.push(escaped);
+                    } else {
+                        panic!(
+                            "{source} is set to `{raw}', which ends in a lone backslash.  \
+                             Remove it, or double it to pass a literal backslash."
+                        );
+                    }
+                }
+                c => {
+                    started = true;
+                    current.push(c);
+                }
+            },
+            Quote::Single => match character {
+                '\'' => quote = Quote::None,
+                c => current.push(c),
+            },
+            Quote::Double => match character {
+                '"' => quote = Quote::None,
+                '\\' => match characters.next() {
+                    Some(escaped @ ('"' | '\\')) => current.push(escaped),
+                    Some(other) => {
+                        current.push('\\');
+                        current.push(other);
+                    }
+                    None => panic!(
+                        "{source} is set to `{raw}', which ends in a lone backslash inside \
+                         a double-quoted string."
+                    ),
+                },
+                c => current.push(c),
+            },
+        }
+    }
+
+    match quote {
+        Quote::None => {}
+        Quote::Single => panic!(
+            "{source} is set to `{raw}', which has an unterminated single quote.  Close \
+             it; guessing where it ended would pass the compiler an argument you did not \
+             write."
+        ),
+        Quote::Double => panic!(
+            "{source} is set to `{raw}', which has an unterminated double quote.  Close \
+             it; guessing where it ended would pass the compiler an argument you did not \
+             write."
+        ),
+    }
+
+    if started {
+        words.push(current);
+    }
+    words
 }
 
 /// Runs one tool invocation, turning both failure modes into an explanatory panic.
@@ -1115,9 +1338,12 @@ fn run_tool(command: &mut std::process::Command, tool: &str, action: &str, subje
         Err(error) => panic!(
             "could not run `{tool}` to {action} {}: {error}. A C compiler and archiver \
              are required to build this crate with the `libz-compat` and `gz` features, \
-             because three of the declarations `zlib.h` and `inftrees.h` fix cannot be \
-             written in stable Rust. Name them if they are not on PATH under their usual \
-             names:\n    CC=<compiler> AR=<archiver> cargo build",
+             because two of the declarations `zlib.h` fixes cannot be written in stable \
+             Rust: `gzprintf` is variadic and `gzvprintf` takes a `va_list`. Both `CC` \
+             and `AR` may be commands rather than bare program names -- `CC=\"ccache \
+             gcc\"` is split into program and arguments, and quoting in `CFLAGS` is \
+             honoured -- so name them however your toolchain is spelled:\n    \
+             CC=<compiler> AR=<archiver> cargo build",
             subject.display()
         ),
     }

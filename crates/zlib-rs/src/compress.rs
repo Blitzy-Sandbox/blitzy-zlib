@@ -190,7 +190,7 @@ use crate::allocate::GlobalAllocator;
 use crate::config::{Flush, Z_DEFAULT_COMPRESSION};
 use crate::deflate::{deflate, deflate_end, deflate_init, DeflateStream};
 use crate::error::ReturnCode;
-use crate::read_buf::{OneShotSource, OutputRegion};
+use crate::read_buf::{OneShotSink, OneShotSource, OutputRegion};
 
 /// The bound arithmetic shifts a length right by 25 (`compress.c` L93), so
 /// `usize` has to be wide enough for that to be defined.
@@ -350,23 +350,26 @@ pub fn compress2_z_into(dest: &mut OutputRegion<'_>, source: &[u8], level: i32) 
     compress2_z_from(dest, &mut { source }, level)
 }
 
-/// [`compress2_z_into`] over an input the caller supplies a window at a time.
+/// [`compress2_z_into`] over an input the caller supplies a window at a time and a
+/// destination it supplies a round at a time.
 ///
 /// The body of `compress.c` L24-L66 lives here and nowhere else; [`compress2_z_into`] is the
-/// slice-shaped front for it. See [`OneShotSource`] for the one caller that needs the other
-/// shape and why: the C ABI facade serves an overlapping `source`/`dest` pair by copying the
-/// input into a **bounded** stage, and a bounded stage can only be handed over a window at a
-/// time. A slice supplier reports `usize::MAX` for its window, so the ordinary path is
+/// slice-shaped front for it. See [`OneShotSource`] and [`OneShotSink`] for the one caller
+/// that needs the other shapes and why: the C ABI facade serves an overlapping
+/// `source`/`dest` pair by copying the input into a **bounded** stage, a bounded stage can
+/// only be handed over a window at a time, and the copy may only be taken while no borrow of
+/// the destination exists. A slice supplier reports `usize::MAX` for its window and an
+/// [`OutputRegion`] sink hands out the reborrow it always did, so the ordinary path is
 /// byte-for-byte the loop it always was, with C's own `uInt`-sized chunking and nothing else.
 #[allow(clippy::unnecessary_min_or_max)]
-pub fn compress2_z_from<S: OneShotSource>(
-    dest: &mut OutputRegion<'_>,
+pub fn compress2_z_from<D: OneShotSink + ?Sized, S: OneShotSource + ?Sized>(
+    dest: &mut D,
     source: &mut S,
     level: i32,
 ) -> Compressed {
-    // Captured before the first reborrow of `dest`, and the origin of every bound
+    // Captured before the first borrow of `dest`, and the origin of every bound
     // below. These are C's entry values of `*destLen` and `sourceLen`.
-    let dest_len = dest.len();
+    let dest_len = dest.total();
     let source_len = source.total();
 
     // L35-L36: `left = *destLen; *destLen = 0;`
@@ -458,7 +461,17 @@ pub fn compress2_z_from<S: OneShotSource>(
         // write-only variant exact: every write a sub-region performs is at or after its own
         // base, so "everything below the high-water mark has been written" needs no appeal to
         // what an earlier iteration did.
-        let mut window = dest.reborrow(next_out, out_end.saturating_sub(next_out));
+        //
+        // ★ **It is also taken here, per round, and dropped at the end of this iteration.**
+        // The order is a soundness requirement, not a style: the window above may have been
+        // copied out of memory this destination covers, and a copy taken while an exclusive
+        // borrow of that memory was live would invalidate the borrow. [`OneShotSink`] carries
+        // the whole argument. `None` cannot occur -- the bounds established above put the
+        // range inside the destination -- and is reported rather than asserted so that this
+        // function stays panic-free on every path.
+        let Some(mut window) = dest.window(next_out, out_end.saturating_sub(next_out)) else {
+            break ReturnCode::BUF_ERROR;
+        };
         let mut stream = DeflateStream::with_region(input, window.reborrow(0, window.len()));
         // ★ Zero, and the window starts *at* `next_in`, where before the whole prefix was
         // handed over with the cursor pre-positioned. The bytes the encoder reads are the same

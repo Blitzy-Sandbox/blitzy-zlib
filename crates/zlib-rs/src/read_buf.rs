@@ -544,6 +544,62 @@ impl<'o> OutputRegion<'o> {
         }
     }
 
+    /// A region over write-only storage whose first `written` slots already hold values,
+    /// because a *previous* region over the same slots reported them written.
+    ///
+    /// # ★ Why this exists, and why it does not weaken the promise
+    ///
+    /// One caller needs it: [`crate::infback::InflateBackWindow`], the provider through which
+    /// `inflateBack`'s window reaches the decoder. On the path where the caller's input lies
+    /// *inside* that window, the window may not be borrowed while an input chunk is copied
+    /// out of it -- so the borrow is taken and dropped once per write cycle rather than held
+    /// for the call, and the high-water mark has to survive the gap between two of them.
+    ///
+    /// The mark is not an assertion the provider invents. It is one this type produced:
+    /// [`OutputRegion::written`] reads it off the region that is ending, and this constructor
+    /// puts it back on the region that replaces it, over the same slots. So the property
+    /// [`InitView`] relies on -- "the view is applied only to slots a region has itself
+    /// written" -- holds transitively across the rebuild, which is the whole reason the pair
+    /// is a pair and neither half is offered on its own.
+    ///
+    /// # Contract
+    ///
+    /// `written` must be a mark [`OutputRegion::written`] reported for a region over **the
+    /// same** slots, and no other writer may have shortened what those slots hold in between.
+    /// A larger `written` would have [`OutputRegion::initialized`] hand [`InitView`] a slot
+    /// that holds nothing; a smaller one merely hides bytes and produces wrong output. The
+    /// value is clamped to the slice's length, so it cannot address past the end whatever is
+    /// passed.
+    #[must_use]
+    pub fn write_only_written(
+        slots: &'o mut [MaybeUninit<u8>],
+        view: InitView,
+        written: usize,
+    ) -> Self {
+        let filled = written.min(slots.len());
+        Self {
+            storage: Storage::WriteOnly {
+                slots,
+                view,
+                filled,
+            },
+        }
+    }
+
+    /// How many leading slots this region has established hold values.
+    ///
+    /// For [`OutputRegion::init`] that is all of them -- byte storage holds bytes by
+    /// definition. For [`OutputRegion::write_only`] it is the high-water mark the write
+    /// methods have raised, which is exactly what [`OutputRegion::write_only_written`] takes
+    /// back; see there for the one caller that needs the round trip.
+    #[must_use]
+    pub fn written(&self) -> usize {
+        match &self.storage {
+            Storage::Init(buf) => buf.len(),
+            Storage::WriteOnly { filled, .. } => *filled,
+        }
+    }
+
     /// An empty region, used where a region has to be moved out of a structure and put
     /// back -- [`crate::deflate::deflate`] and [`crate::inflate::inflate`] both do that so
     /// their cursor can own its storage for the duration of the call.
@@ -894,8 +950,8 @@ pub(crate) fn duplicate_forward<T: Copy>(
 /// # It owns its region
 ///
 /// The region is held by value, not by reference, so a cursor is a complete handle on the
-/// caller's buffer and hands out no view of it. [`DeflateStream`](crate::DeflateStream) and
-/// [`InflateStream`](crate::InflateStream) keep the region and the position as two separate
+/// caller's buffer and hands out no view of it. [`DeflateStream`](crate::deflate::DeflateStream)
+/// and [`InflateStream`](crate::inflate::InflateStream) keep the region and the position as two separate
 /// members -- because a caller resuming a stream sets `next_out` itself -- and move the
 /// region in and out around a call with [`OutputCursor::from_region`] and
 /// [`OutputCursor::into_region`].
@@ -1493,6 +1549,71 @@ impl OneShotSource for &[u8] {
     fn window(&mut self, at: usize, len: usize) -> Option<&[u8]> {
         let end = at.checked_add(len)?;
         self.get(at..end)
+    }
+}
+
+/// Supplies a one-shot wrapper's destination one round at a time, so that no borrow of it
+/// need be held across a refill of the input.
+///
+/// # ★ Why this exists, and it is a soundness requirement rather than a convenience
+///
+/// [`OneShotSource`] exists because the C ABI facade has to serve a `source`/`dest` pair
+/// that **overlaps**, and it serves it by copying each input window into a bounded stage
+/// before handing it over. That copy forms a shared borrow of the caller's input region --
+/// which, on the overlapping path, is memory the destination also covers. Rust's aliasing
+/// rules do not care that the two are never *used* at the same moment: a read through a
+/// pointer that is not derived from a live exclusive borrow invalidates that borrow, so
+/// every write performed through it afterwards is undefined behaviour.
+///
+/// The consequence is an ordering obligation that a single, call-long exclusive borrow of
+/// the destination cannot satisfy: **at the instant a window of overlapping input is copied,
+/// no borrow of the destination may exist.** This trait is what makes that expressible. The
+/// engine asks for the destination once per round, immediately after the round's input
+/// window has been obtained, and the borrow it gets back dies at the end of that round --
+/// before the next window is taken.
+///
+/// # The two implementations, and why the ordinary path is untouched
+///
+/// | Implementor | Supplied by | What a round yields |
+/// |---|---|---|
+/// | [`OutputRegion`] | Rust callers, this crate's own buffers, every test, and the facade's **disjoint** path | a [`OutputRegion::reborrow`] of the one region, exactly as before this trait existed |
+/// | the facade's overlapping provider | `crates/libz-rs-sys` | a region rebuilt from `(dest, *destLen)` for that round alone |
+///
+/// So a disjoint call -- which is every call the differential corpus makes, and every call
+/// a conforming application makes -- performs the same reborrow of the same region it always
+/// did, and the engine's loop is byte-for-byte the loop it always was.
+///
+/// # Contract
+///
+/// [`OneShotSink::total`] is the destination's whole extent, C's `*destLen` on entry, and it
+/// must not change during a call. [`OneShotSink::window`] must answer a region over exactly
+/// the `len` slots at offset `at` of that destination, or [`None`] when that range does not
+/// lie wholly inside it. Each returned region is written from its own base, so it needs no
+/// high-water mark carried over from an earlier round -- and none is: the engines here never
+/// read back a byte an earlier round produced, because the decoder's history lives in its
+/// own window and the encoder never reads its output at all.
+pub trait OneShotSink {
+    /// Total bytes of room the call was given, i.e. C's `*destLen` on entry.
+    fn total(&self) -> usize;
+
+    /// A region over the `len` slots at `at`, or [`None`] when that range does not lie
+    /// wholly inside the destination.
+    ///
+    /// The returned borrow is used for one round of the engine and dropped before the next
+    /// input window is taken, which is what lets an overlapping provider rebuild it.
+    fn window(&mut self, at: usize, len: usize) -> Option<OutputRegion<'_>>;
+}
+
+impl OneShotSink for OutputRegion<'_> {
+    fn total(&self) -> usize {
+        self.len()
+    }
+
+    /// The reborrow the one-shot loops have always taken. A range outside the region
+    /// yields an empty sub-region rather than [`None`], because [`OutputRegion::reborrow`]
+    /// clamps -- and the loops' own bounds make the clamp unreachable.
+    fn window(&mut self, at: usize, len: usize) -> Option<OutputRegion<'_>> {
+        Some(self.reborrow(at, len))
     }
 }
 

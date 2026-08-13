@@ -13,8 +13,11 @@
 #
 # The comparison itself lives in `tests/`: `byte_identical.rs` compares emitted bytes
 # across the configuration matrix, `roundtrip_interop.rs` crosses streams in both
-# directions, and `table_equality.rs` compares the ported constant tables against the
-# C arrays element for element. So "compressed output is byte-identical to the
+# directions, `table_equality.rs` compares the ported constant tables against the
+# C arrays element for element, and `checksum_width.rs` compares the combine family
+# at full `uLong` width -- the one property none of the other three can see, because
+# it is the width of an integer rather than a byte in a stream or an entry in a
+# table. So "compressed output is byte-identical to the
 # reference" is a measured result here rather than an unmeasured requirement, with the
 # one qualification that decides what a green run means: the DEFAULT run covers a
 # sampled matrix in seconds, and the exhaustive sweeps are `#[ignore]`d and armed by
@@ -86,8 +89,8 @@
 # one, so the benches reach the C oracle this crate's build script produces
 # without anything being duplicated or rebuilt.
 #
-# `tests/` holds `byte_identical.rs`, `roundtrip_interop.rs` and
-# `table_equality.rs`, and they run: `cargo test -p zlib-rs-differential` compares
+# `tests/` holds `byte_identical.rs`, `roundtrip_interop.rs`, `table_equality.rs`
+# and `checksum_width.rs`, and they run: `cargo test -p zlib-rs-differential` compares
 # the two implementations through the oracle archive that `build.rs` produces. So
 # the claims below are observations of what these suites do, not a contract they
 # were still to be written against. Both are worth stating plainly, because a
@@ -295,8 +298,9 @@ libz_rs_sys = { package = "libz-rs-sys", path = "../libz-rs-sys", version = "1.3
 # still built by the build script below -- only the bench targets moved.
 #
 # This crate's own tests need no dev-dependency at all: `byte_identical.rs`,
-# `roundtrip_interop.rs` and `table_equality.rs` use `std`, this crate's `oracle`/`port` modules
-# and nothing else, per AAP §0.7.1(i). Keep it that way -- an assertion helper crate here would be
+# `roundtrip_interop.rs`, `table_equality.rs` and `checksum_width.rs` use `std`, this crate's
+# `oracle`/`port` modules and nothing else, per AAP §0.7.1(i). Keep it that way -- an assertion
+# helper crate here would be
 # a third-party dependency in the graph of the crate that defines the oracle.
 
 # CLIPPY IS DELIBERATELY NOT PART OF THE MSRV GATE, and this is measured rather than

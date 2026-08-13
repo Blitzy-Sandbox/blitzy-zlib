@@ -165,7 +165,10 @@ jobs:
         QEMU_RUN: ${{ matrix.qemu-run }}
 
     - name: Upload build errors
-      uses: actions/upload-artifact@v6
+      # SHA-pinned rather than left on the mutable `@v6` major tag, matching the
+      # sixteen other artifact uploads in this repository so one revision is used
+      # throughout.
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       if: failure()
       with:
         name: ${{ matrix.name }} (configure)

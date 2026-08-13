@@ -21,6 +21,29 @@ name: OSS-Fuzz
 # pull-request diff, so broader triggers would leave it nothing to work from.
 on: [pull_request]
 
+# LEAST PRIVILEGE, STATED RATHER THAN INHERITED.  With no `permissions:` block a
+# workflow receives the repository's DEFAULT token scope, which on many
+# repositories is read/write across contents, issues, packages, deployments and
+# more.  That default is the wrong one here for a specific reason rather than a
+# general one: this job builds and RUNS a fuzzer over the pull request's own tree,
+# so it deliberately executes unreviewed contributor code, and it does so inside
+# Docker actions whose base image is upstream-tracked (see the note below).
+# Handing that combination a writable token means a crash in an untrusted target,
+# or a change in an image nobody here controls, would be holding credentials that
+# can modify the repository.
+#
+# `contents: read` is the whole requirement, and each step was checked against it:
+# the two CIFuzz actions clone and build, and `actions/upload-artifact` v4 and
+# later upload through the Actions runtime service using ACTIONS_RUNTIME_TOKEN
+# rather than GITHUB_TOKEN, so it needs no additional scope.  Nothing here
+# comments on a pull request, opens an issue, pushes a tag or publishes a package.
+#
+# A GITHUB_TOKEN on a `pull_request` event is read-only for forks regardless, but
+# it is NOT read-only for a branch pushed inside this repository, which is the case
+# this block actually constrains.
+permissions:
+  contents: read
+
 # WHY THE TWO CIFUZZ ACTIONS CARRY A COMMIT SHA RATHER THAN `@master`.  A tag or a
 # branch is a mutable pointer: whoever can move it decides what code runs in this
 # job, and CIFuzz runs with the pull request's tree already checked out.  A full
@@ -35,14 +58,30 @@ on: [pull_request]
 # infra/cifuzz/, then update both pins together, because the two actions share the
 # same infra/ tree and a split pin would run two revisions of it.
 #
-# One thing the pin does NOT freeze, and it is worth being precise rather than
-# reassuring: both are Docker actions (`runs.using: docker`) built from
-# infra/build_fuzzers.Dockerfile and infra/run_fuzzers.Dockerfile, which derive from
-# an OSS-Fuzz base image by tag.  Pinning the SHA freezes the action definition and
-# its Dockerfile; the base image that Dockerfile pulls remains upstream-tracked, as
-# it must be for CIFuzz to keep working against the live OSS-Fuzz project.  The pin
-# closes the mutable-source-code hole, not the whole supply chain, and no
-# repository-side setting can close the rest of it.
+# WHAT THE PIN DOES NOT FREEZE, stated precisely because a reassuring version of
+# this paragraph would be the actual risk.  Both are Docker actions
+# (`runs.using: docker`) built from infra/build_fuzzers.Dockerfile and
+# infra/run_fuzzers.Dockerfile, which derive from an OSS-Fuzz base image BY TAG.
+# Pinning the SHA freezes the action definition and its Dockerfile; the base image
+# that Dockerfile pulls remains upstream-tracked, as it must be for CIFuzz to keep
+# working against the live OSS-Fuzz project.
+#
+# So the executable boundary of this job is pinned in three of its four layers and
+# unpinnable in the fourth, and it is worth naming them individually:
+#
+#   1. the action source                   PINNED, by full commit SHA, both actions
+#   2. the artifact-upload action          PINNED, by full commit SHA
+#   3. the Dockerfiles built from that SHA PINNED, they travel with the source
+#   4. the OSS-Fuzz base image they FROM   NOT PINNED -- upstream, by tag
+#
+# Layer 4 cannot be closed from this repository: the `FROM` line lives in upstream's
+# Dockerfile, `uses:` offers no digest override for a Docker action's base, and
+# rewriting it would mean vendoring OSS-Fuzz's infrastructure and losing the thing
+# CIFuzz is for.  What bounds it instead is the `permissions:` block above --
+# `contents: read` and nothing else -- so a compromised or merely changed base image
+# runs with a token that cannot modify this repository.  That is a mitigation of the
+# consequence, not a closure of the hole, and it is recorded as such rather than
+# counted as one.
 jobs:
   Fuzzing:
     runs-on: ubuntu-latest
@@ -62,7 +101,15 @@ jobs:
         dry-run: false
 
     - name: Upload Crash
-      uses: actions/upload-artifact@v6
+      # SHA-pinned like everything else that executes here.  `@v6` is a mutable major
+      # tag: whoever can move it decides what code runs in a job that has just fuzzed
+      # unreviewed contributor code and is about to handle its crash artifacts.  This
+      # was the one `uses:` in this file still naming a tag while the two CIFuzz
+      # actions above were already pinned, so the file's own stated policy -- "a tag
+      # or a branch is a mutable pointer" -- did not hold for all three.  The SHA is
+      # the same v6.0.0 commit the other fifteen upload steps in this repository use,
+      # so there is one artifact-upload revision across the whole tree.
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       if: failure()
       with:
         name: artifacts

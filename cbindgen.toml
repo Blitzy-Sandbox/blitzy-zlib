@@ -1064,21 +1064,30 @@ bitflags = false
 
 [defines]
 
-# The three features declared by crates/libz-rs-sys/Cargo.toml. `libz-compat`
-# and `gz` are default-on; `simd` is default-off and gates no exported item
-# today, but is mapped so that gating one cannot introduce a warning.
+# The FOUR features declared by crates/libz-rs-sys/Cargo.toml's [features]
+# table, which is the source of truth for this block: `libz-compat` and `gz`
+# are default-on (`default = ["libz-compat", "gz"]`), `simd` and `libc` are
+# default-off.  All four are mapped.
 #
-# There is deliberately no `feature = libc` entry.  That feature was declared
-# with no consumer anywhere in the crate and has been removed; a mapping for a
-# feature Cargo does not know is dead configuration, and dead configuration in
-# this file reads as though a gated surface exists when none does.  If the gz
-# layer ever needs `libc` back, restore the feature in the manifest and the
-# mapping here together -- `make rust-header` will otherwise warn on the first
-# item gated behind it, which is exactly the signal that says the pair has
-# drifted apart.
+# `simd` and `libc` gate no exported item today, and they are mapped anyway for
+# the same reason: a mapping costs nothing, while a MISSING one makes cbindgen
+# warn on the first item ever gated behind that feature, and `make rust-header`
+# treats an unexpected cbindgen notice as a failure.  Mapping now means adding
+# a `#[cfg(feature = ...)]` later is a one-line change rather than a broken gate.
+#
+# ★ What `libc` actually is, since its shape invites the wrong assumption: it is
+# a feature whose only effect is to activate the OPTIONAL `libc` dependency
+# (`libc = ["dep:libc"]`, and `libc = { version = "0.2.189", optional = true }`).
+# `gz` activates the same dependency through its own `dep:libc`, which is why the
+# default build already has it.  No source file anywhere in the workspace contains
+# `#[cfg(feature = "libc")]` -- verified -- so no declaration's presence depends on
+# it and this mapping renders nothing today.  That is a statement about the current
+# sources, not a promise: if an item is ever gated behind it, this entry is what
+# keeps the generated header honest about the fact.
 "feature = libz-compat" = "ZLIB_RS_LIBZ_COMPAT"
 "feature = gz" = "ZLIB_RS_GZ"
 "feature = simd" = "ZLIB_RS_SIMD"
+"feature = libc" = "ZLIB_RS_LIBC"
 
 # Windows-only items, chief among them `gzopen_w` (zlib.h L2042), which the
 # reference header gates on `#if defined(_WIN32) && !defined(Z_SOLO)`. All

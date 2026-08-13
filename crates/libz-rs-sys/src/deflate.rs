@@ -175,8 +175,8 @@ use crate::types::{
     checked_state, checked_state_mut, commit_state, copy_stream, discard_reserved_state,
     gz_headerp, input_slice, output_region, publish_state, ranges_are_disjoint, reserve_state,
     streams_are_disjoint, take_state_with, uLong, widen, z_size_t, z_stream, z_streamp, Bytef,
-    HeaderRanges, OutputScratch, OverlapStage, StateBlock, StateKind, StreamAllocator,
-    OVERLAP_STAGE_BYTES,
+    HeaderRanges, OutputScratch, OutputSegment, OverlapStage, StateBlock, StateKind,
+    StreamAllocator, OVERLAP_STAGE_BYTES,
 };
 use crate::util::error_message;
 use crate::{Z_BLOCK, Z_NO_FLUSH};
@@ -1005,6 +1005,7 @@ unsafe fn borrow_stream(
     entry: &StreamFields,
     input_override: Option<&'static [u8]>,
     output_override: Option<OutputRegion<'static>>,
+    output_cap: usize,
 ) -> DeflateStream<'static, 'static> {
     let input = match input_override {
         Some(captured) => captured,
@@ -1017,8 +1018,16 @@ unsafe fn borrow_stream(
         None => unsafe { input_slice(entry.next_in, entry.avail_in) },
     };
 
-    let output = match output_override {
-        Some(staged) => staged,
+    // `output_cap` narrows the caller's own range, and only a call whose `gz_header` overlaps
+    // that range ever passes anything but `usize::MAX`: such a call writes the overlapping span
+    // through staging, so the round that writes the head before it must stop at the span's
+    // first byte. Every other call is offered the whole `avail_out`, exactly as it always was.
+    // Narrowing cannot lose information, because the result is at most `avail_out`, which is a
+    // `uInt` already.
+    let output = if let Some(staged) = output_override {
+        staged
+    } else {
+        let extent = widen(entry.avail_out).min(output_cap);
         // SAFETY: unsafe-site category 2 -- as above, for the output. The same zero-length
         // rule applies; a null `next_out` has already been rejected by the entry point on the
         // paths where C rejects it, and yields an empty region on the paths where C does not,
@@ -1026,7 +1035,7 @@ unsafe fn borrow_stream(
         // this function's contract, and this is the only mutable view of it. It is
         // **write-only** storage rather than a byte slice, because `avail_out` bytes of room
         // is all `zlib.h` L94-L95 promises; `output_region` states the argument in full.
-        None => unsafe { output_region(entry.next_out, entry.avail_out) },
+        unsafe { output_region(entry.next_out, narrow_uInt(extent)) }
     };
 
     entry.scalars.into_stream(input, output)
@@ -1037,7 +1046,8 @@ unsafe fn borrow_stream(
 /// Two independent decisions, because the two overlaps are independent: a `gz_header` field
 /// may sit inside the caller's input, inside its output, or inside both. [`header_alias_plan`]
 /// makes them, the entry point performs them -- the input through [`OverlapStage`], the output
-/// through [`OutputScratch`] -- and both are [`false`] for every ordinary call.
+/// through [`OutputScratch`] -- and for every ordinary call the first is [`false`] and the
+/// second is [`None`], so nothing is copied and nothing is allocated.
 #[derive(Clone, Copy)]
 struct AliasPlan {
     /// Whether the caller's input must be read from an [`OverlapStage`] copy rather than
@@ -1052,12 +1062,19 @@ struct AliasPlan {
     /// is a property of the core rather than of this module, and the cost of not relying on
     /// it is one address comparison per call.
     snapshot_input: bool,
-    /// Whether the core must write output into staging rather than the caller's buffer.
+    /// The sub-range of `(next_out, avail_out)` the core must write into staging rather than
+    /// into the caller's buffer, as `(begin, end)` offsets; [`None`] when no header field
+    /// overlaps the output at all.
     ///
-    /// True when a header field overlaps `(next_out, avail_out)`. Here there is nothing
-    /// optional about it: the output region is **exclusive**, so a `Cell` view over one of
-    /// its bytes is undefined behaviour whether or not either is used.
-    stage_output: bool,
+    /// [`Some`] is not optional in the way `snapshot_input`'s second disjunct is: the output
+    /// region is **exclusive**, so a `Cell` view over one of its bytes is undefined behaviour
+    /// whether or not either is used. What *is* deliberate is that this is a span rather than
+    /// a flag: the head before it and the tail after it are written straight into the caller's
+    /// buffer, and the span itself is covered by successive staging windows of at most
+    /// [`OVERLAP_STAGE_BYTES`], so the hidden allocation is a constant rather than anything the
+    /// caller chooses -- neither its `avail_out` nor its `name_max`. See
+    /// [`HeaderRanges::overlap_span`] and [`OutputScratch::stage`].
+    stage_output: Option<(usize, usize)>,
 }
 
 /// Compares the `gz_header` field ranges with the caller's stream ranges.
@@ -1078,7 +1095,7 @@ unsafe fn header_alias_plan(slot: &DeflateSlot, entry: &StreamFields) -> AliasPl
     AliasPlan {
         snapshot_input: entry.buffers_overlap()
             || ranges.overlap(entry.next_in, widen(entry.avail_in)),
-        stage_output: ranges.overlap(entry.next_out.cast_const(), widen(entry.avail_out)),
+        stage_output: ranges.overlap_span(entry.next_out.cast_const(), widen(entry.avail_out)),
     }
 }
 
@@ -2620,12 +2637,25 @@ pub unsafe extern "C" fn deflateParams(strm: z_streamp, level: c_int, strategy: 
         // SAFETY: unsafe-site category 6 -- `header_alias_plan`'s contract is this function's,
         // and it is evaluated before the first borrow exists.
         let plan = unsafe { header_alias_plan(block.state(), &entry) };
-        // ★ The output stage still allocates where the input stage does not: the core must be
-        // handed the caller's whole `avail_out` extent in one region, so the block is
-        // `avail_out` bytes and has to come from the stream's own allocator -- the caller's own
-        // number, which a custom arena must see and `test/infcover.c`'s `mem_limit` must be able
-        // to refuse. A refusal is the one remaining disjunct of `pointers_rejected`.
-        let mut output_stage = if plan.stage_output && !entry.next_out.is_null() {
+        // ★ The output stage still allocates where the input stage does not, and it is bounded
+        // by the **overlapping span** rather than by the caller's `avail_out`: the head before
+        // the span and the tail after it are written straight into the caller's buffer by rounds
+        // that take no staging at all, so the hidden allocation is proportional to the header
+        // fields the caller placed there and not to a number it chose. `OutputScratch::stage`
+        // carries the argument. It comes from the stream's own allocator, which a custom arena
+        // must see and `test/infcover.c`'s `mem_limit` must be able to refuse; a refusal is the
+        // one remaining disjunct of `pointers_rejected`.
+        // ★ Gated on the same predicate the pre-feed is. When L790-L791's condition is false C
+        // never reaches the internal `deflate` at all, so nothing of the caller's output is
+        // written, no header field view is formed, and there is nothing to stage -- allocating
+        // then would put a `zalloc` call, and a possible refusal, on a path that in C does not
+        // touch a byte. The plan itself is still computed, because it is address arithmetic and
+        // costs three comparisons.
+        let output_span = plan.stage_output.filter(|_| {
+            !entry.next_out.is_null()
+                && core_deflate_params_will_flush(&block.state().state, level, strategy)
+        });
+        let mut output_stage = if let Some((begin, end)) = output_span {
             // SAFETY: unsafe-site category 4 -- `StreamAllocator::from_stream_ptr`'s contract
             // is this function's: `strm` is live, and the three hook members are read through
             // raw places. A stream that published no hooks falls back to the internal
@@ -2635,18 +2665,37 @@ pub unsafe extern "C" fn deflateParams(strm: z_streamp, level: c_int, strategy: 
             // SAFETY: unsafe-site category 2 -- `OutputScratch::stage`'s contract. `next_out`
             // is non-null by the test above and writable for `avail_out` bytes by this
             // function's contract, and nothing of the caller's is read or written here.
-            unsafe { OutputScratch::stage(&allocator, entry.next_out, entry.avail_out) }
+            unsafe { OutputScratch::stage(&allocator, entry.next_out, begin, end) }
                 .map(|staged| (staged, allocator))
         } else {
             None
         };
-        let pointers_rejected = entry.next_out.is_null()
-            || (entry.avail_in != 0 && entry.next_in.is_null())
-            || (plan.stage_output && !entry.next_out.is_null() && output_stage.is_none());
+        if output_span.is_some() && output_stage.is_none() {
+            // ★ `Z_MEM_ERROR`, for the reason `deflate` states in full: an allocation was
+            // refused, `zlib.h` L742-L748 omits the value from this function's list because C's
+            // `deflateParams` allocates nothing rather than because the header forbids it, and
+            // `Z_STREAM_ERROR` would describe an intact stream as inconsistent. Nothing has been
+            // read, written or changed at this point -- no block was obtained, so none has to go
+            // back -- which is the same "the parameters are not changed" guarantee L745-L747
+            // gives for `Z_BUF_ERROR`, and no message is recorded, as C records none for a
+            // memory failure.
+            return fallback::MEM_ERROR_CODE;
+        }
+        let pointers_rejected =
+            entry.next_out.is_null() || (entry.avail_in != 0 && entry.next_in.is_null());
 
         // Held in a binding that outlives every stream view built from it, as
         // `OverlapStage::fill` requires.
         let mut stage = OverlapStage::new();
+
+        // How many bytes this entry-point call has produced into the caller's output range so
+        // far, counted from the `next_out` the plan and the staging block were built against.
+        // It is the authority for two things: which output segment the next round writes
+        // through, and where inside the staging block that round begins -- so no round can
+        // restart at the block's base and overwrite what an earlier one produced. Both loops
+        // below advance it, which is why it is declared once, here, ahead of them.
+        let mut out_done = 0_usize;
+        let entry_room = widen(entry.avail_out);
 
         // ★ **The pre-feed.** `deflateParams` reaches the caller's input through one inner
         // `deflate(strm, Z_BLOCK)` (`deflate.c` L794), and that call consumes *all* of it --
@@ -2685,21 +2734,34 @@ pub unsafe extern "C" fn deflateParams(strm: z_streamp, level: c_int, strategy: 
                 // one is over the output.
                 let staged = unsafe { stage.fill(round.next_in, take) };
                 // The output side of the same discipline: when a header field sits inside the
-                // caller's output range the pre-feed rounds must write the staging block too,
-                // or they would write the caller's buffer while the `Cell` views over it are
-                // live. Each round takes a region over the block's unwritten tail.
-                //
-                // SAFETY: unsafe-site category 2 -- `OutputScratch::region`'s contract: any
-                // previous round's region is out of use, this one is handed straight to
-                // `borrow_stream` and is dead by the end of the iteration.
-                let staged_output = output_stage
-                    .as_mut()
-                    .map(|(staged, _)| unsafe { staged.region() });
+                // caller's output range the round that writes *the span* must write the staging
+                // block, or it would write the caller's buffer while the `Cell` views over it
+                // are live. The head before the span and the tail after it are the caller's own
+                // buffer, capped so a round stops at the span's first byte rather than running
+                // into it. With no staging at all -- every ordinary call -- this is the whole of
+                // what is left, uncapped, and the round is the one it always was.
+                let (staged_output, region_len) = match output_stage.as_mut() {
+                    Some((scratch, _)) => match scratch.segment(out_done) {
+                        // SAFETY: unsafe-site category 2 -- `OutputScratch::region`'s contract:
+                        // one region per round, handed straight to `borrow_stream`, dead by the
+                        // end of this iteration and committed before the next region is taken.
+                        OutputSegment::Staged { len } => {
+                            // SAFETY: unsafe-site category 2 -- `OutputScratch::region`'s
+                            // contract: one region per round, handed straight to
+                            // `borrow_stream`, out of use again by this round's commit.
+                            let region = unsafe { scratch.region(out_done) };
+                            (Some(region), len)
+                        }
+                        OutputSegment::Caller { cap } => (None, widen(round.avail_out).min(cap)),
+                    },
+                    None => (None, widen(round.avail_out)),
+                };
                 // SAFETY: unsafe-site category 2 -- slice reconstruction, once, through the
                 // shared helper, with the input supplied as the staged copy so the two borrows
                 // cannot overlap, and the output either disjoint from every header field this
                 // call reads or replaced by `staged_output`.
-                let mut stream = unsafe { borrow_stream(&round, Some(staged), staged_output) };
+                let mut stream =
+                    unsafe { borrow_stream(&round, Some(staged), staged_output, region_len) };
                 // SAFETY: unsafe-site category 6 -- `with_header_while_emitting`'s contract is
                 // this function's, exactly as for the inner call below.
                 let fed = unsafe {
@@ -2715,12 +2777,28 @@ pub unsafe extern "C" fn deflateParams(strm: z_streamp, level: c_int, strategy: 
                 unsafe {
                     publish(strm, &round, &stream, fed);
                 }
-                // This round's output production joins the staging block's cursor, so the next
-                // region -- and the final commit -- begin after it. `stream` is dead by here.
-                if let Some((staged, _)) = output_stage.as_mut() {
-                    staged.advance(produced);
+                // The staged bytes reach the caller's buffer here, after the last use of
+                // `stream` and before the next region is taken -- which is required rather than
+                // optional: the next region may belong to the next window of the span, and each
+                // window is reused only once its bytes have landed.
+                if let Some((staged, _)) = output_stage.as_ref() {
+                    // SAFETY: unsafe-site category 2 -- `OutputScratch::commit`'s contract:
+                    // this round's region is out of use, `out_done` is the count that region
+                    // was taken with, and the caller's output range is still writable.
+                    unsafe {
+                        staged.commit(out_done, out_done.saturating_add(produced));
+                    }
                 }
-                if consumed != take || fed != ReturnCode::OK {
+                // This round's production joins the running count, so the next region -- and
+                // the next commit -- begins after it. `stream` is dead by here.
+                out_done = out_done.saturating_add(produced);
+                // ★ An output *segment* boundary is not the caller's `avail_out` running out,
+                // and only a staged call can reach one: the round filled the segment it was
+                // given while the caller still has room, so the next round continues over the
+                // next segment rather than handing a half-flushed stream to the inner call.
+                let segment_boundary =
+                    region_len != 0 && produced == region_len && out_done < entry_room;
+                if (consumed != take || fed != ReturnCode::OK) && !segment_boundary {
                     // No progress is possible -- the output filled, or the core refused. Let
                     // the inner call see what is left, which is what C's single call would have
                     // been left holding too.
@@ -2729,114 +2807,159 @@ pub unsafe extern "C" fn deflateParams(strm: z_streamp, level: c_int, strategy: 
             }
         }
 
-        // Re-read once more: the pre-feed, if it ran, advanced the caller's members, and every
-        // number below has to describe what is left rather than what arrived.
+        // ★ **The inner call, one output segment at a time.** `deflateParams` reaches the
+        // caller's output through one internal `deflate(strm, Z_BLOCK)` (`deflate.c` L794), and
+        // when a `gz_header` field sits inside that output range the round which writes the
+        // overlapping span has to write the staging block instead. The head before the span and
+        // the tail after it are the caller's own buffer, so the call becomes at most three
+        // rounds -- head, span, tail -- and the loop advances between them.
         //
-        // SAFETY: unsafe-site category 1 -- as above.
-        let entry = unsafe { StreamFields::read(strm) };
-        // At most one chunk, which after the pre-feed is all that remains. When the gate above
-        // said the inner call will not run, this view may be a truncated prefix of a larger
-        // `avail_in` -- harmless precisely because nothing reads it: L791's condition is false,
-        // so neither the inner `deflate` nor L797's `avail_in` test is reached.
-        //
-        let captured_input = if plan.snapshot_input {
-            // SAFETY: unsafe-site category 2 -- `OverlapStage::fill`'s contract, which is this
-            // function's own: `avail_in` bytes are readable at `next_in` for the duration of the
-            // call, and no mutable borrow of them exists, because this arm is reached only when
-            // the two ranges overlap and so the input region is never borrowed mutably at all.
-            // `fill` clamps the length it copies to the stage's own capacity.
-            Some(unsafe { stage.fill(entry.next_in, widen(entry.avail_in)) })
-        } else {
-            None
-        };
-        // The same, for the staging block: the region is taken once, `staged` outlives `stream`,
-        // and the commit runs after the last use of `stream`. Not taken at all on the rejected
-        // path, where two empty slices travel instead and nothing may reach the caller's
-        // pointers.
-        let staged_output = if pointers_rejected {
-            None
-        } else {
-            output_stage.as_mut().map(|(staged, _)| {
-                // SAFETY: unsafe-site category 2 -- `OutputScratch::region`'s contract, as in
-                // `deflate`: over the tail the pre-feed left, and untouched until the commit
-                // below.
-                unsafe { staged.region() }
-            })
-        };
+        // Retrying is sound because `deflate.c` L797 returns `Z_BUF_ERROR` **before** L799-L813
+        // assigns the new parameters, and `zlib.h` L742-L748 says so in as many words: "in the
+        // case of a Z_BUF_ERROR, the parameters are not changed". So a retried call re-evaluates
+        // L790-L791's condition, still finds it true, and resumes the same internal
+        // `deflate(strm, Z_BLOCK)` from the pending buffer it left. Every other status is final
+        // and breaks on the first round, which is what every ordinary call does: with no staging
+        // `region_len` is the whole of `avail_out`, so `segment_boundary` below is false and
+        // this loop runs exactly once.
+        let code = loop {
+            // Re-read: the pre-feed, if it ran, advanced the caller's members, and so did any
+            // earlier round of this loop. Every number below has to describe what is left rather
+            // than what arrived.
+            //
+            // SAFETY: unsafe-site category 1 -- as above.
+            let entry = unsafe { StreamFields::read(strm) };
+            // At most one chunk, which after the pre-feed is all that remains. When the gate
+            // above said the inner call will not run, this view may be a truncated prefix of a
+            // larger `avail_in` -- harmless precisely because nothing reads it: L791's condition
+            // is false, so neither the inner `deflate` nor L797's `avail_in` test is reached.
+            let captured_input = if plan.snapshot_input {
+                // SAFETY: unsafe-site category 2 -- `OverlapStage::fill`'s contract, which is
+                // this function's own: `avail_in` bytes are readable at `next_in` for the
+                // duration of the call, and no mutable borrow of them exists -- this round's
+                // only mutable borrow is created below, after this copy, and the previous
+                // round's is dead. `fill` clamps the length it copies to the stage's own
+                // capacity.
+                Some(unsafe { stage.fill(entry.next_in, widen(entry.avail_in)) })
+            } else {
+                None
+            };
+            // The same discipline on the output side, one segment per round. Not taken at all on
+            // the rejected path, where two empty slices travel instead and nothing may reach the
+            // caller's pointers.
+            let (staged_output, region_len) = if pointers_rejected {
+                (None, 0)
+            } else {
+                match output_stage.as_mut() {
+                    Some((scratch, _)) => match scratch.segment(out_done) {
+                        // SAFETY: unsafe-site category 2 -- `OutputScratch::region`'s contract,
+                        // as in `deflate`: one region per round, over the block's unwritten
+                        // tail, out of use again by this iteration's commit.
+                        OutputSegment::Staged { len } => {
+                            // SAFETY: unsafe-site category 2 -- `OutputScratch::region`'s
+                            // contract: one region per round, handed straight to
+                            // `borrow_stream`, out of use again by this round's commit.
+                            let region = unsafe { scratch.region(out_done) };
+                            (Some(region), len)
+                        }
+                        OutputSegment::Caller { cap } => (None, widen(entry.avail_out).min(cap)),
+                    },
+                    None => (None, widen(entry.avail_out)),
+                }
+            };
 
-        let mut stream = if pointers_rejected {
-            // C refuses this pointer state at L993, before it has read or written a byte
-            // through either pointer, so nothing may travel through them here either. Two empty
-            // slices deliver that: if the parameters reach the inner `deflate` at all it now
-            // refuses on `avail_out == 0` at L995 -- C's own refusal, one test later, having
-            // likewise emitted nothing, consumed nothing and left the state alone -- and the
-            // rewrite below restores C's status. If the parameters do *not* reach it, the empty
-            // slices are never looked at and the answer is C's `Z_OK` either way.
-            entry.scalars.into_stream(&[], OutputRegion::empty())
-        } else {
-            // SAFETY: unsafe-site category 2 -- slice reconstruction, once, through the shared
-            // helper. `entry` came from `StreamFields::read` on this live stream, and this
-            // function's contract makes both buffers valid for their counts with the output
-            // unaliased; the input is either disjoint from it or replaced by `captured_input`,
-            // and the output is either disjoint from every header field the internal `deflate`
-            // reads or replaced by `staged_output`.
-            unsafe { borrow_stream(&entry, captured_input, staged_output) }
-        };
+            let mut stream = if pointers_rejected {
+                // C refuses this pointer state at L993, before it has read or written a byte
+                // through either pointer, so nothing may travel through them here either. Two
+                // empty slices deliver that: if the parameters reach the inner `deflate` at all
+                // it now refuses on `avail_out == 0` at L995 -- C's own refusal, one test later,
+                // having likewise emitted nothing, consumed nothing and left the state alone --
+                // and the rewrite below restores C's status. If the parameters do *not* reach
+                // it, the empty slices are never looked at and the answer is C's `Z_OK` either
+                // way.
+                entry.scalars.into_stream(&[], OutputRegion::empty())
+            } else {
+                // SAFETY: unsafe-site category 2 -- slice reconstruction, once, through the
+                // shared helper. `entry` came from `StreamFields::read` on this live stream, and
+                // this function's contract makes both buffers valid for their counts with the
+                // output unaliased; the input is either disjoint from it or replaced by
+                // `captured_input`, and the output is either disjoint from every header field
+                // the internal `deflate` reads or replaced by `staged_output`.
+                unsafe { borrow_stream(&entry, captured_input, staged_output, region_len) }
+            };
 
-        // The header view has to be present for this call, and only for this one of the
-        // two paths. `deflateParams` flushes the current block by calling
-        // `deflate(strm, Z_BLOCK)` itself (`deflate.c` L794), and that internal call is
-        // an ordinary `deflate`: if the gzip header is only partly written -- a first
-        // `deflate` that ran out of output space mid-name leaves the status in a header
-        // stage and `s->gzindex` part-way through -- it resumes emitting it, reading
-        // every field through `s->gzhead`. Without the view the core would emit the
-        // *default* header instead of the caller's, mid-stream. The path above cannot
-        // reach the internal call at all, because `last_flush == -2` is exactly the
-        // condition L791 tests to skip it, so it reads nothing and needs nothing.
-        //
-        // SAFETY: unsafe-site category 6 -- `with_header_while_emitting`'s contract is
-        // this function's: `head` is null or the pointer the caller passed to
-        // `deflateSetHeader`, which `zlib.h` L838-L845 requires to stay live and
-        // readable while the header is being emitted -- which is exactly the window in
-        // which that helper reads it.
-        let mut code = unsafe {
-            with_header_while_emitting(block.state_mut(), |state| {
-                core_deflate_params(state, &mut stream, level, strategy)
-            })
-        };
-        sync_tag(block);
+            // The header view has to be present for this call, and only for this one of the
+            // two paths. `deflateParams` flushes the current block by calling
+            // `deflate(strm, Z_BLOCK)` itself (`deflate.c` L794), and that internal call is
+            // an ordinary `deflate`: if the gzip header is only partly written -- a first
+            // `deflate` that ran out of output space mid-name leaves the status in a header
+            // stage and `s->gzindex` part-way through -- it resumes emitting it, reading
+            // every field through `s->gzhead`. Without the view the core would emit the
+            // *default* header instead of the caller's, mid-stream. The path above cannot
+            // reach the internal call at all, because `last_flush == -2` is exactly the
+            // condition L791 tests to skip it, so it reads nothing and needs nothing.
+            //
+            // SAFETY: unsafe-site category 6 -- `with_header_while_emitting`'s contract is
+            // this function's: `head` is null or the pointer the caller passed to
+            // `deflateSetHeader`, which `zlib.h` L838-L845 requires to stay live and
+            // readable while the header is being emitted -- which is exactly the window in
+            // which that helper reads it.
+            let mut code = unsafe {
+                with_header_while_emitting(block.state_mut(), |state| {
+                    core_deflate_params(state, &mut stream, level, strategy)
+                })
+            };
+            sync_tag(block);
 
-        if pointers_rejected && stream.msg.is_some() {
-            // A recorded message can only have come from the inner `deflate` call at L795,
-            // because `deflateParams`' own `Z_BUF_ERROR` at L797 records nothing. So the inner
-            // call ran and refused -- and with the caller's pointers in this state, C's refusal
-            // is `ERR_RETURN(strm, Z_STREAM_ERROR)` (L993). Both the status and the message that
-            // macro records are therefore the ones to publish, whichever status the core itself
-            // arrived at once `deflateParams` was done with the inner call's answer.
-            code = ReturnCode::STREAM_ERROR;
-            stream.msg = Some(code.msg());
-        }
-
-        // SAFETY: unsafe-site category 1 -- the write-back, with `entry` the fields read on
-        // entry and `stream` the view built from them, on a non-null, aligned, live stream. On
-        // the rewritten path the four buffer members are unchanged, exactly as in C: the inner
-        // `deflate` refuses before it moves either cursor.
-        unsafe {
-            publish(strm, &entry, &stream, code);
-        }
-
-        // The staged output, when there was any, reaches the caller's buffer here -- after the
-        // last use of `stream` and before the block goes back. On the rejected path no region
-        // was taken, so `commit` copies the zero bytes the empty stream produced and the
-        // caller's buffer is left exactly as C leaves it.
-        if let Some((staged, _)) = output_stage.as_ref() {
-            // SAFETY: unsafe-site category 2 -- `OutputScratch::commit`'s contract, as in
-            // `deflate`: the cursor is the core's own, the region is out of use, every pre-feed
-            // round's count has been recorded, and the caller's output range is still writable.
-            unsafe {
-                staged.commit(stream.next_out);
+            if pointers_rejected && stream.msg.is_some() {
+                // A recorded message can only have come from the inner `deflate` call at L795,
+                // because `deflateParams`' own `Z_BUF_ERROR` at L797 records nothing. So the
+                // inner call ran and refused -- and with the caller's pointers in this state,
+                // C's refusal is `ERR_RETURN(strm, Z_STREAM_ERROR)` (L993). Both the status and
+                // the message that macro records are therefore the ones to publish, whichever
+                // status the core itself arrived at once `deflateParams` was done with the
+                // inner call's answer.
+                code = ReturnCode::STREAM_ERROR;
+                stream.msg = Some(code.msg());
             }
-        }
+
+            let round_produced = stream.next_out;
+
+            // SAFETY: unsafe-site category 1 -- the write-back, with `entry` the fields read at
+            // the top of this round and `stream` the view built from them, on a non-null,
+            // aligned, live stream. On the rewritten path the four buffer members are
+            // unchanged, exactly as in C: the inner `deflate` refuses before it moves either
+            // cursor.
+            unsafe {
+                publish(strm, &entry, &stream, code);
+            }
+
+            // The staged output, when there was any, reaches the caller's buffer here -- after
+            // the last use of `stream` and before the next region is taken or the block goes
+            // back. On the rejected path no region was taken and the empty stream produced
+            // nothing, so nothing is copied and the caller's buffer is left exactly as C leaves
+            // it.
+            if let Some((staged, _)) = output_stage.as_ref() {
+                // SAFETY: unsafe-site category 2 -- `OutputScratch::commit`'s contract, as in
+                // `deflate`: this round's region is out of use, `out_done` is the count that
+                // region was taken with, and the caller's output range is still writable.
+                unsafe {
+                    staged.commit(out_done, out_done.saturating_add(round_produced));
+                }
+            }
+
+            out_done = out_done.saturating_add(round_produced);
+
+            let segment_boundary =
+                region_len != 0 && round_produced == region_len && out_done < entry_room;
+            if !(segment_boundary && code == ReturnCode::BUF_ERROR) {
+                // Either this was the last segment, or the status is one a further segment
+                // cannot change. `Z_BUF_ERROR` with a segment still to come is the one case
+                // that continues, and it makes strict progress: `out_done` grew by
+                // `region_len`, which is non-zero, and is bounded by `entry_room`.
+                break code;
+            }
+        };
 
         // The staging block goes back to the allocator it came from -- after the last use of the
         // view built over it, so no borrow of the block is live when it is released, and before
@@ -3142,14 +3265,18 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
         // buffer pointer. The plan is made before the first borrow exists, which is the only
         // point at which it can still be acted on.
         let plan = unsafe { header_alias_plan(block.state(), &entry) };
-        // ★ The output stage still allocates where the input stage does not: the core must be
-        // handed the caller's whole `avail_out` extent in one region or a single call would stop
-        // short of what C's would produce, so the block is `avail_out` bytes -- the caller's own
-        // number -- and comes from the stream's own allocator, where a custom arena sees it and
-        // `test/infcover.c`'s `mem_limit` can refuse it. A refusal is reported exactly as an
+        // ★ The output stage still allocates where the input stage does not -- the block has to
+        // outlive several core calls and be copied back, which a stack buffer in this frame
+        // could not be sized for -- but it is bounded by the **overlapping span** rather than by
+        // the caller's `avail_out`: the head before the span and the tail after it are written
+        // straight into the caller's buffer by rounds that take no staging at all, so the hidden
+        // allocation is proportional to the header fields the caller placed there and not to a
+        // number it chose. `HeaderRanges::overlap_span` and `OutputScratch::stage` carry the
+        // argument. It comes from the stream's own allocator, where a custom arena sees it and
+        // `test/infcover.c`'s `mem_limit` can refuse it; a refusal is reported exactly as an
         // invalid pointer pair is, message included. This path is reached only when a caller has
         // pointed a `gz_header` field into its own output range.
-        let mut output_stage = if plan.stage_output {
+        let mut output_stage = if let Some((begin, end)) = plan.stage_output {
             // SAFETY: unsafe-site category 4 -- `StreamAllocator::from_stream_ptr`'s contract
             // is this function's: `strm` is live, and the three hook members are read through
             // raw places. A stream that published no hooks falls back to the internal
@@ -3160,31 +3287,31 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
             // is non-null (guard 2 above) and writable for `avail_out` bytes by this
             // function's contract, and it stays so until the commit below; nothing of the
             // caller's is read or written here.
-            let staged =
-                unsafe { OutputScratch::stage(&allocator, entry.next_out, entry.avail_out) };
+            let staged = unsafe { OutputScratch::stage(&allocator, entry.next_out, begin, end) };
             if staged.is_none() {
-                // SAFETY: unsafe-site category 1 -- one member written through a raw place on
-                // a non-null, aligned, live stream, with a `'static` NUL-terminated string.
-                unsafe {
-                    write_msg(strm, Some(error_message(ReturnCode::STREAM_ERROR.as_i32())));
-                }
-                return fallback::STREAM_ERROR_CODE;
+                // ★ `Z_MEM_ERROR`, not `Z_STREAM_ERROR`. An allocation was refused, and that is
+                // what the status has to say. `zlib.h` L354-L361 does not list `Z_MEM_ERROR`
+                // among `deflate`'s results, and the reason is that C's `deflate` allocates
+                // nothing -- the absence records what the reference *can* return, not a value
+                // the header forbids, and the same header attaches exactly this meaning to
+                // `Z_MEM_ERROR` on a deflate stream at L273-L275 (`deflateInit2`), L629-L631
+                // (`deflateSetDictionary`) and L1000-L1002 (`deflateCopy`). `Z_STREAM_ERROR`
+                // would instead tell the application that its `z_stream` "was inconsistent",
+                // which is false: the stream is intact and the call is retryable once memory is
+                // available or `avail_out` no longer overlaps the header. This path is reachable
+                // only for a caller that pointed a `gz_header` field into its own output range
+                // *and* whose allocator refused a one-kibibyte request, which is the state
+                // `test/infcover.c`'s `mem_limit` forces deliberately.
+                //
+                // No message is written, because C records none for a memory failure: the
+                // `Z_MEM_ERROR` paths of `deflateInit2_` and `inflate` (`inflate.c` L1078-L1081)
+                // leave `strm->msg` exactly as the caller left it, and so does this one.
+                return fallback::MEM_ERROR_CODE;
             }
             staged.map(|staged| (staged, allocator))
         } else {
             None
         };
-        // The output side's ownership discipline: the region borrows the staging block for a
-        // fabricated `'static`, `staged` outlives every `stream` built below, and `commit` runs
-        // only after the last use of the last one. Taken once, here, because the loop's rounds
-        // are successive writes into the *same* staging block, exactly as they would be
-        // successive writes into the caller's own buffer.
-        let mut staged_output = output_stage.as_mut().map(|(staged, _)| {
-            // SAFETY: unsafe-site category 2 -- `OutputScratch::region`'s contract. Called
-            // once, and neither the region nor the block is touched again until the commit
-            // below.
-            unsafe { staged.region() }
-        });
         // ★ **One caller call is still one consumption of the whole input.** The stage carries
         // `OVERLAP_STAGE_BYTES` at a time, so an overlapping call becomes a loop of core calls
         // over successive windows of the caller's input, `Z_NO_FLUSH` on every one but the last
@@ -3213,10 +3340,13 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
         let chunkable = (Z_NO_FLUSH..=Z_BLOCK).contains(&flush);
 
         let mut round = entry;
-        // The loop yields the status and the *last* round's output production, which `commit`
-        // needs; every earlier round's is recorded into the staging block's own cursor as the
-        // loop goes.
-        let (code, produced) = loop {
+        // How many bytes this entry-point call has produced into the caller's output range so
+        // far. It is the authority for two things: which output segment the next round writes
+        // through, and where inside the staging block that round begins -- so no round can
+        // restart at the block's base and overwrite what an earlier one produced.
+        let mut out_done = 0_usize;
+        let entry_room = widen(entry.avail_out);
+        let code = loop {
             let remaining = widen(round.avail_in);
             // The disjoint path -- every call the differential corpus makes -- is one round
             // over the caller's own buffer with the caller's own flush, and the two branches
@@ -3238,6 +3368,23 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
                 None
             };
 
+            // Which part of the caller's output range this round writes through. With no
+            // staging -- every ordinary call -- it is the whole of what is left, uncapped, and
+            // the loop below therefore behaves exactly as it did before segments existed.
+            let (staged_output, region_len) = match output_stage.as_mut() {
+                Some((scratch, _)) => match scratch.segment(out_done) {
+                    OutputSegment::Staged { len } => {
+                        // SAFETY: unsafe-site category 2 -- `OutputScratch::region`'s contract:
+                        // one region per round, handed straight to `borrow_stream`, dead by the
+                        // end of this iteration and committed before the next region is taken.
+                        let region = unsafe { scratch.region(out_done) };
+                        (Some(region), len)
+                    }
+                    OutputSegment::Caller { cap } => (None, widen(round.avail_out).min(cap)),
+                },
+                None => (None, widen(round.avail_out)),
+            };
+
             // Guards 3 and 4, and everything after them, are the core's.
             //
             // SAFETY: unsafe-site category 2 -- slice reconstruction, once, through the shared
@@ -3249,7 +3396,7 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
             // `staged_output`, which owns its bytes. `flush` is passed through unchanged rather
             // than pre-converted, so the core applies its own canonical validation to the same
             // value C validates.
-            let mut stream = unsafe { borrow_stream(&round, staged, staged_output.take()) };
+            let mut stream = unsafe { borrow_stream(&round, staged, staged_output, region_len) };
             let chunk_flush = if last { flush } else { Z_NO_FLUSH };
 
             // SAFETY: unsafe-site category 6 -- `with_header_while_emitting`'s contract is
@@ -3277,22 +3424,40 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
                 publish(strm, &round, &stream, code);
             }
 
-            if last || consumed != take || code != ReturnCode::OK {
+            // The staged bytes reach the caller's buffer here, after the last use of `stream`
+            // -- so no borrow of the block is live -- and before the next region is taken,
+            // which is required rather than optional: the next region may belong to the next
+            // window of the span, and each window is reused only once its bytes have landed.
+            if let Some((scratch, _)) = output_stage.as_ref() {
+                // SAFETY: unsafe-site category 2 -- `OutputScratch::commit`'s contract: the
+                // round's region is out of use, `out_done` is the count that region was taken
+                // with, and the caller's output range is still writable.
+                unsafe {
+                    scratch.commit(out_done, out_done.saturating_add(round_produced));
+                }
+            }
+
+            out_done = out_done.saturating_add(round_produced);
+
+            if code != ReturnCode::OK {
+                // The core refused, or the stream ended. Already published.
+                break code;
+            }
+
+            // ★ **An output SEGMENT boundary is not the caller's `avail_out` running out**,
+            // and only a staged call can reach one. When the round filled the segment it was
+            // given and the caller still has room, another round follows over the next
+            // segment: the head before the span, the span, then the tail. Without this test a
+            // staged call would stop at the first boundary and produce less than C's single
+            // call would.
+            let segment_boundary =
+                region_len != 0 && round_produced == region_len && out_done < entry_room;
+
+            if (last || consumed != take) && !segment_boundary {
                 // Either that was the caller's whole input, or no further progress is possible
                 // -- the output filled, or the core refused. Both are states C reaches from its
                 // single call, and both are already published.
-                break (code, round_produced);
-            }
-
-            // Another round follows, so this one's output production joins the staging block's
-            // cursor and the next `region` begins after it. `stream` is dead by here -- the
-            // `publish` above was its last use -- so no borrow of the block is live.
-            if let Some((staged, _)) = output_stage.as_mut() {
-                staged.advance(round_produced);
-                // SAFETY: unsafe-site category 2 -- `OutputScratch::region`'s contract: the
-                // previous region is out of use, and this one is not touched again until the
-                // next round hands it to `borrow_stream`.
-                staged_output = Some(unsafe { staged.region() });
+                break code;
             }
 
             // Re-read, because `publish` has just advanced the caller's four buffer members:
@@ -3303,21 +3468,6 @@ pub unsafe extern "C" fn deflate(strm: z_streamp, flush: c_int) -> c_int {
             // initialised for the reason given there.
             round = unsafe { StreamFields::read(strm) };
         };
-
-        // The staged output, when there was any, reaches the caller's buffer here -- after the
-        // last round's `publish`, so no borrow of the staging block is live, and before the
-        // release below, so the bytes are copied out of a block this frame still owns.
-        // `publish` has already advanced the caller's `next_out` past the produced bytes; the
-        // copy uses the address recorded on entry, which is where they belong, and the count is
-        // every round's production because `advance` recorded the earlier ones.
-        if let Some((staged, _)) = output_stage.as_ref() {
-            // SAFETY: unsafe-site category 2 -- `OutputScratch::commit`'s contract. The final
-            // round's region is out of use, every earlier round's count has been recorded, and
-            // the caller's `next_out` is still writable for `avail_out` bytes.
-            unsafe {
-                staged.commit(produced);
-            }
-        }
 
         // The staging block goes back to the stream's own allocator after its commit and before
         // this frame returns, so a tracking allocator sees one strictly nested allocate/free
@@ -3997,7 +4147,7 @@ mod tests {
             header_alias_plan(block.state(), &entry)
         };
         assert!(
-            !plan.snapshot_input && !plan.stage_output,
+            !plan.snapshot_input && plan.stage_output.is_none(),
             "disjoint buffers must plan no copying"
         );
 

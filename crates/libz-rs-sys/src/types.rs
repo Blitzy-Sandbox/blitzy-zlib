@@ -16,9 +16,19 @@
 //!
 //! Produced with `gcc -I. -D_LARGEFILE64_SOURCE=1` over the real headers on
 //! `x86_64-unknown-linux-gnu`, reading `sizeof` and `offsetof` directly. The
-//! permanent compile-time assertions over these numbers live in
-//! `layout_assertions.rs`; this module carries only the two *cross-crate
-//! agreement* assertions that no other module is in a position to make.
+//! permanent compile-time assertions over the *contract* types measured below
+//! live in `layout_assertions.rs`. The assertions this module carries are the
+//! ones no other module is in a position to make, and they are of two kinds:
+//!
+//! - **Cross-crate agreement** between a `#[repr(C)]` mirror declared here and
+//!   the core crate's own form of the same thing -- [`gzFile_s`] against
+//!   `zlib_rs::gz::state::GzFileExposed`, and [`code`] against
+//!   `zlib_rs::inflate::inftrees::Code`. `layout_assertions.rs` cannot make
+//!   these, because the pairing is what this module establishes.
+//! - **Invariants of the private types declared here**, which are not part of
+//!   the contract and so have no place among the contract assertions:
+//!   `StatePrefix`'s layout and its distinct per-flavour cookies, the fill
+//!   pattern's byte-wise uniformity, and the `code_type_from_raw` round-trip.
 //!
 //! ★ **Every absolute number in the table below is an LP64 measurement, not a
 //! portable fact.** `uLong`, `z_size_t`, `z_off_t` and pointers all change width
@@ -114,7 +124,7 @@
 //! carries `#![deny(unsafe_op_in_unsafe_fn)]`, so every unsafe operation sits in
 //! an explicit block with a `// SAFETY:` comment naming its invariant. The type
 //! and struct declarations below need no `unsafe` at all. The unsafe work in
-//! this module is confined to three of the six categories the crate
+//! this module is confined to four of the six categories the crate
 //! documentation enumerates, and each is provided *once* so that it has exactly
 //! one auditable implementation:
 //!
@@ -123,6 +133,11 @@
 //! | 1 -- stream-pointer validation | [`StreamAllocator::from_stream_ptr`], [`copy_stream`], [`streams_are_disjoint`] |
 //! | 2 -- input/output slice reconstruction | [`input_slice`], [`output_slots_mut`], [`output_region`] |
 //! | 3 -- the opaque `state` round-trip | [`StateBlock`], [`install_state`], [`checked_state`], [`checked_state_mut`], [`take_state`] |
+//! | 4 -- invoking `zalloc` and `zfree` | [`StreamAllocator`] |
+//!
+//! Categories 5 (C strings and varargs) and 6 (writing through a caller's
+//! [`gz_header`]) belong to `gz.rs`, `util.rs` and `inflate.rs`, which own the
+//! entry points that need them.
 //!
 //! ★ **No constructor for a `&z_stream` or a `&mut z_stream` exists here, and
 //! none may be added.** One did, and it was removed: two `unsafe` helpers that
@@ -142,11 +157,6 @@
 //! [`z_stream::state`] through raw places and take [`z_streamp`] throughout;
 //! [`checked_state`] carries the full account, including the Miri diagnostic that
 //! a `&mut z_stream` in that position produces.
-//! | 4 -- invoking `zalloc` and `zfree` | [`StreamAllocator`] |
-//!
-//! Categories 5 (C strings and varargs) and 6 (writing through a caller's
-//! [`gz_header`]) belong to `gz.rs`, `util.rs` and `inflate.rs`, which own the
-//! entry points that need them.
 //!
 //! # cbindgen
 //!
@@ -2354,6 +2364,17 @@ pub(crate) const OVERLAP_STAGE_BYTES: usize = 1024;
 /// core is handed the chunk plus a `&mut [u8]` over the caller's output, and those two never
 /// overlap.
 ///
+/// ★ **"While no mutable borrow exists" is a per-chunk obligation**, and getting that wrong
+/// is undefined behaviour rather than a lapse of tidiness. A bounded stage carries one chunk,
+/// so an overlapping call takes the copy repeatedly; a borrow of the caller's output that
+/// spanned the whole core call would be live for every copy after the first, and a read
+/// through the caller's own pointer while it was live would invalidate it -- making every
+/// subsequent write through it undefined however little the two were used together. So every
+/// entry point that stages input also borrows the caller's output a round at a time:
+/// `zlib_rs::read_buf::OneShotSink` for the four one-shot wrappers,
+/// `zlib_rs::infback::InflateBackWindow` for `inflateBack`, and the per-round
+/// `OutputScratch::region` for the header-aliasing paths in `deflate` and `inflate`.
+///
 /// ★ **What a bounded stage changes, stated plainly.** The whole input no longer reaches the
 /// core in one piece, so an overlapping call becomes a sequence of core calls over
 /// [`OVERLAP_STAGE_BYTES`] windows. Callers cannot observe the seam: every entry point still
@@ -2548,6 +2569,59 @@ impl HeaderRanges {
             .iter()
             .any(|&(field, field_len)| !ranges_are_disjoint(field, field_len, base, len))
     }
+
+    /// The smallest sub-range of `[base, base + len)` that contains every byte a present
+    /// field shares with it, as `(begin, end)` offsets from `base`; [`None`] when no field
+    /// shares a byte.
+    ///
+    /// ★ **This is what selects the staging, and confines it.** [`OutputScratch`] used to be
+    /// allocated at the caller's whole `avail_out`, which is a number the caller chooses and
+    /// can be megabytes, so a `gz_header` field pointed into a large output buffer put a
+    /// caller-controlled amount of hidden memory on top of the reference implementation's
+    /// per-stream footprint -- outside the 15% AAP 0.8.4 allows, and invisible in the caller's
+    /// own accounting except as a `zalloc` call it did not ask for. The bytes that actually
+    /// need moving are the ones a field covers, and this is that span: the head before it and
+    /// the tail after it are written straight into the caller's buffer, because no field view
+    /// touches them.
+    ///
+    /// The span alone would not be a *bound*, because `extra_max`, `name_max` and `comm_max`
+    /// are the caller's numbers too. [`OutputScratch::stage`] therefore allocates at most one
+    /// [`OVERLAP_STAGE_BYTES`] window and covers the span with as many of them as it takes; the
+    /// span's job is to say **where** staging is needed and where it is not.
+    ///
+    /// The span is the union's *hull* rather than each field separately, because the core is
+    /// handed one contiguous region at a time. Three fields spread across the range therefore
+    /// stage the gaps between them as well, which is the price of contiguity and costs nothing
+    /// in memory, only in the number of rounds.
+    ///
+    /// Nothing is dereferenced: this is arithmetic on addresses, exactly as
+    /// [`HeaderRanges::overlap`] is, so it runs at the one moment its answer can still be
+    /// acted on -- before any borrow exists.
+    #[must_use]
+    pub(crate) fn overlap_span(&self, base: *const Bytef, len: usize) -> Option<(usize, usize)> {
+        let base_addr = base as usize;
+        let end_addr = base_addr.checked_add(len)?;
+        let mut span: Option<(usize, usize)> = None;
+        for &(field, field_len) in &self.ranges {
+            if ranges_are_disjoint(field, field_len, base, len) {
+                continue;
+            }
+            let field_addr = field as usize;
+            // The intersection, in addresses. Both ends are inside `[base_addr, end_addr]`
+            // because the ranges are known to overlap.
+            let lo = field_addr.max(base_addr);
+            let hi = field_addr.saturating_add(field_len).min(end_addr);
+            if hi <= lo {
+                continue;
+            }
+            let (begin, finish) = (lo - base_addr, hi - base_addr);
+            span = Some(match span {
+                Some((have_begin, have_end)) => (have_begin.min(begin), have_end.max(finish)),
+                None => (begin, finish),
+            });
+        }
+        span
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2586,177 +2660,282 @@ impl HeaderRanges {
 /// states and the output writes and is unspecified; this is the more defined of the two, and
 /// the header bytes win only where the two ranges genuinely coincide.
 ///
+/// # What it costs
+///
+/// One window of at most [`OVERLAP_STAGE_BYTES`], whatever the caller's `avail_out` and whatever
+/// capacity it advertised for the field -- [`OutputScratch::stage`] carries the argument for why
+/// both of those had to stop deciding it, and `crates/libz-rs-sys/tests/alias_overlap.rs`
+/// measures the result through an injected `zalloc`. The span is covered by successive windows,
+/// one core round each.
+///
 /// Allocation goes through the stream's own `zalloc` for the reasons [`OverlapStage`]
 /// states in full, and the block goes back through the same `zfree` before the entry point
 /// returns, so a tracking allocator sees one strictly nested pair -- what
-/// `test/infcover.c`'s `mem_done()` checks. A refusal arrives as [`None`] and is reported,
-/// never worked around.
+/// `test/infcover.c`'s `mem_done()` checks. A refusal arrives as [`None`] and is reported as
+/// `Z_MEM_ERROR`, never worked around.
 #[cfg(feature = "libz-compat")]
 pub(crate) struct OutputScratch {
-    /// The staging block, `avail_out` bytes exactly. An [`Option`] because the release takes
-    /// the block out through the slot.
+    /// The staging window. An [`Option`] because the release takes the block out through the
+    /// slot.
     bytes: Option<Buffer<'static, u8>>,
-    /// The caller's `next_out`, where [`OutputScratch::commit`] copies the produced bytes.
-    destination: *mut Bytef,
-    /// The caller's `avail_out`, which is both the block's length and the extent the first
-    /// region handed to the core advertises.
-    extent: uInt,
-    /// How many bytes of the block earlier rounds have already produced.
-    ///
-    /// ★ **Why a cursor exists at all.** An entry point that stages its output may still run
-    /// the core more than once: an overlapping `(next_in, avail_in)` pair is served as a
-    /// sequence of [`OverlapStage`] windows, and each window is a separate core call. Every
-    /// one of those calls needs a region, and the second must begin where the first stopped or
-    /// it would overwrite what the first produced. So [`OutputScratch::region`] hands out the
-    /// *unwritten tail*, [`OutputScratch::advance`] records each round's production, and
-    /// [`OutputScratch::commit`] copies the accumulated total. A single-call entry point never
-    /// calls `advance`, so its cursor stays at zero and the behaviour is exactly what it was
-    /// when the block could only be handed out whole.
-    produced: usize,
+    /// The caller's `next_out` as this entry-point call found it. Every offset below, and
+    /// [`OutputScratch::commit`]'s destination, is measured from it.
+    base: *mut Bytef,
+    /// The overlapping span, as `(begin, end)` offsets from [`OutputScratch::base`]. Only
+    /// these bytes go through staging; the head before `begin` and the tail from `end` on are
+    /// written straight into the caller's buffer.
+    span: (usize, usize),
+    /// The window's length -- `min(span length, OVERLAP_STAGE_BYTES)`. The span is covered by
+    /// as many consecutive windows of this length as it takes, so the block's size is a
+    /// **constant** rather than anything the caller chooses.
+    window: usize,
 }
 
 #[cfg(feature = "libz-compat")]
 impl OutputScratch {
-    /// Allocates `avail_out` bytes of staging for the caller's output range, or reports
-    /// that the allocation failed.
+    /// Allocates a staging window for the sub-range `[begin, end)` of the caller's output
+    /// range, or reports that the allocation failed.
     ///
-    /// The block is requested as `avail_out` items of one byte, which is the shape
-    /// `ZALLOC(strm, avail_out, 1)` would have.
+    /// The block is requested as `min(end - begin, OVERLAP_STAGE_BYTES)` items of one byte,
+    /// which is the shape `ZALLOC(strm, n, 1)` would have.
+    ///
+    /// ★ **A constant, not the caller's number.** Two earlier sizings were wrong for the same
+    /// reason. Sizing the block from `avail_out` put a number the *caller* chooses -- routinely
+    /// megabytes -- on top of the reference implementation's per-stream footprint, outside the
+    /// 15% AAP 0.8.4 allows and invisible in the caller's own accounting except as a `zalloc`
+    /// call it never asked for. Sizing it from the span alone moves the same problem to
+    /// `extra_max`/`name_max`/`comm_max`, which the caller also chooses: a `name_max` of one
+    /// mebibyte with `name` inside the output range would stage a mebibyte.
+    ///
+    /// So the window is capped at [`OVERLAP_STAGE_BYTES`] -- the same bound
+    /// [`OverlapStage`] uses on the input side, and for the same reason -- and the span is
+    /// covered by consecutive windows of that size, one core round each.
+    /// [`OutputScratch::segment`] hands them out and [`OutputScratch::commit`] empties each one
+    /// into the caller's buffer before the next is filled. The hidden allocation is therefore
+    /// at most one kibibyte for any caller, any header and any `avail_out`, and it is released
+    /// before the entry point returns.
+    ///
+    /// It still comes from the *stream's* allocator rather than the stack, so a custom arena
+    /// sees it and `test/infcover.c`'s `mem_limit` can refuse it, and so the frames of
+    /// `deflate` and `inflate` do not grow by a kibibyte for every ordinary call that never
+    /// reaches this path.
     ///
     /// # Safety
     ///
-    /// `next_out` must be non-null and writable for `avail_out` bytes -- the ordinary C
-    /// contract for a non-zero `avail_out` -- and it must stay so until
-    /// [`OutputScratch::commit`] has run. Nothing is read or written here: the caller's
-    /// region is not touched until the commit, which is what makes this safe to call while
-    /// the header field views over the same bytes are being formed.
+    /// `next_out` must be non-null and writable for at least `end` bytes -- the ordinary C
+    /// contract for an `avail_out` of at least that -- and it must stay so until the last
+    /// [`OutputScratch::commit`] has run. Nothing is read or written here: the caller's region
+    /// is not touched until a commit, which is what makes this safe to call while the header
+    /// field views over the same bytes are being formed.
     ///
     /// The value must be released with [`OutputScratch::release`], passing the same
     /// `allocator`, before it is dropped.
     pub(crate) unsafe fn stage(
         allocator: &StreamAllocator,
         next_out: *mut Bytef,
-        avail_out: uInt,
+        begin: usize,
+        end: usize,
     ) -> Option<Self> {
-        let block = allocator.allocate_bytes(widen(avail_out), 1)?;
+        let extent = end.checked_sub(begin)?;
+        let window = extent.min(OVERLAP_STAGE_BYTES);
+        let block = allocator.allocate_bytes(window, 1)?;
         Some(Self {
             bytes: Some(block),
-            destination: next_out,
-            extent: avail_out,
-            produced: 0,
+            base: next_out,
+            span: (begin, end),
+            window,
         })
     }
 
-    /// The staging block as the write-only region the core writes output through.
+    /// The offset at which the staging window covering `done` begins.
     ///
-    /// Built with [`output_region`], the same helper the caller's own buffer goes through,
-    /// so the core cannot tell the two apart and no second construction of an
-    /// [`OutputRegion`] exists to drift from the first.
+    /// The windows tile the span from its first byte, so this is the span's start plus a whole
+    /// number of window lengths. It is what makes both [`OutputScratch::region`] and
+    /// [`OutputScratch::commit`] able to work out where in the block a given produced count
+    /// sits without either of them keeping a cursor of its own -- the mistake that let one
+    /// caller's rounds overwrite each other's output.
+    fn window_start(&self, done: usize) -> usize {
+        let (begin, _) = self.span;
+        if self.window == 0 || done <= begin {
+            return begin;
+        }
+        let into_span = done - begin;
+        begin + (into_span / self.window) * self.window
+    }
+
+    /// The window's end offset, clamped to the span's own end.
+    fn window_end(&self, done: usize) -> usize {
+        let (_, end) = self.span;
+        self.window_start(done).saturating_add(self.window).min(end)
+    }
+
+    /// Which segment of the caller's output range the next round writes through, given how
+    /// many bytes this entry-point call has produced so far.
+    ///
+    /// The segments are the head before the span, then one window per `OVERLAP_STAGE_BYTES` of
+    /// the span, then the tail after it; only the windows are staged. One round is issued per
+    /// segment, and the loops that drive them continue while a *segment* boundary -- rather
+    /// than the caller's own `avail_out` -- is what stopped the core.
+    pub(crate) fn segment(&self, done: usize) -> OutputSegment {
+        let (begin, end) = self.span;
+        if done < begin {
+            return OutputSegment::Caller {
+                cap: begin.saturating_sub(done),
+            };
+        }
+        if done >= end || self.window == 0 {
+            return OutputSegment::Caller { cap: usize::MAX };
+        }
+        match self.window_end(done).checked_sub(done) {
+            Some(len) if len != 0 => OutputSegment::Staged { len },
+            // Unreachable: `done < end` and the window covering it ends at `done` only if the
+            // window length is zero, which the test above already excluded. An uncapped
+            // caller-side segment is the one answer that cannot be unsound, and the library may
+            // not contain an operation that could panic (AAP 0.7.1 (f)).
+            _ => OutputSegment::Caller { cap: usize::MAX },
+        }
+    }
+
+    /// The unwritten tail of the current staging window, as the write-only region the core
+    /// writes output through, given the same `done` count [`OutputScratch::segment`] was asked
+    /// with.
+    ///
+    /// ★ **The cursor is derived, never accumulated.** An earlier design kept a `produced`
+    /// field that each round had to advance, and one of the two callers did not -- so every
+    /// round after the first restarted at the block's base and its commit wrote over the
+    /// previous round's output, at the caller's own `next_out`. Deriving the offset from the
+    /// count the caller's stream already carries removes the step that could be forgotten.
+    ///
+    /// Built with [`output_region`], the same helper the caller's own buffer goes through, so
+    /// the core cannot tell the two apart and no second construction of an [`OutputRegion`]
+    /// exists to drift from the first.
     ///
     /// # Safety
     ///
-    /// Call this **once**, and neither use the returned region nor touch `self` in any
-    /// other way after [`OutputScratch::commit`] has run: the region borrows the block
+    /// Call this once per round, and neither use the returned region nor touch `self` in any
+    /// other way after that round's [`OutputScratch::commit`]: the region borrows the block
     /// mutably for a fabricated `'static`, and the caller owns the ordering that keeps any
     /// two of them apart.
     #[must_use]
-    pub(crate) unsafe fn region(&mut self) -> OutputRegion<'static> {
-        let produced = self.produced;
+    pub(crate) unsafe fn region(&mut self, done: usize) -> OutputRegion<'static> {
+        let lo = done.saturating_sub(self.window_start(done));
+        let hi = self
+            .window_end(done)
+            .saturating_sub(self.window_start(done));
         let Some(block) = self.bytes.as_mut() else {
             // Released already, which this function's contract forbids. An empty region is
             // the one answer that cannot be unsound.
             return OutputRegion::write_only(&mut [], init_view());
         };
-        let Some(tail) = block.as_mut_slice().get_mut(produced..) else {
-            // `produced` can only have come from `advance`, which clamps it to the block's
-            // length, so this is unreachable -- and an empty region is the one answer that
-            // cannot be unsound. `get_mut` rather than an index because library code may not
-            // contain an operation that could panic (AAP 0.7.1 (f)).
+        let Some(tail) = block.as_mut_slice().get_mut(lo..hi) else {
+            // Unreachable: `lo` is `done`'s offset inside the window covering it and `hi` is
+            // that window's length, both at most the block's own length. An empty region is
+            // the one answer that cannot be unsound, and `get_mut` rather than an index because
+            // library code may not contain an operation that could panic (AAP 0.7.1 (f)).
             return OutputRegion::write_only(&mut [], init_view());
         };
         let remaining = tail.len();
         let base = tail.as_mut_ptr();
-        // `remaining` is at most `self.extent`, which came from a `uInt`, so the narrowing
-        // cannot lose information; `unwrap_or` keeps the expression panic-free rather than
-        // relying on that.
-        let extent = uInt::try_from(remaining).unwrap_or(self.extent);
+        // `remaining` is at most `OVERLAP_STAGE_BYTES`, so the narrowing cannot lose
+        // information; `unwrap_or` keeps the expression panic-free rather than relying on that.
+        let extent = uInt::try_from(remaining).unwrap_or(uInt::MAX);
         // SAFETY: unsafe-site category 2 -- `output_region`'s contract, discharged over
         // memory this value owns rather than the caller's: `base` is non-null and valid for
-        // `extent` bytes, because it is the tail of a block `stage` allocated `self.extent`
-        // bytes of and `extent` is that tail's own length, and nothing else borrows the
-        // block while the region lives -- this method's own contract. A zero extent yields
-        // an empty region without forming a slice, as it does for a caller's buffer.
+        // `extent` bytes, because it is a sub-slice of the block `stage` allocated and
+        // `extent` is that sub-slice's own length, and nothing else borrows the block while
+        // the region lives -- this method's own contract. A zero extent yields an empty
+        // region without forming a slice, as it does for a caller's buffer.
         unsafe { output_region(base, extent) }
     }
 
-    /// Records that a round produced `produced` bytes, so the next
-    /// [`OutputScratch::region`] begins after them.
+    /// Copies the bytes one round produced into the current window out to the caller's output
+    /// range.
     ///
-    /// Call this once per core call, with the count that call wrote through the region it
-    /// was given, and only after that region has fallen out of use. An entry point that
-    /// runs the core once never needs it: [`OutputScratch::commit`] is given the same total
-    /// either way.
-    pub(crate) fn advance(&mut self, produced: usize) {
-        let capacity = self
-            .bytes
-            .as_ref()
-            .map_or(0, |block| block.as_slice().len());
-        // Saturating and clamped rather than checked: the count comes from the core's own
-        // cursor into a region built over this block, so it cannot carry the sum past the
-        // capacity -- and library code may not panic (AAP 0.7.1 (f)).
-        self.produced = self.produced.saturating_add(produced).min(capacity);
-    }
-
-    /// Copies the bytes the call produced into the caller's output range.
+    /// `before` is the entry point's running produced count as the round began -- the number
+    /// [`OutputScratch::region`] was given -- and `after` is that count plus what the round
+    /// wrote. The bytes land at the caller's `next_out + before`, which is where the core would
+    /// have written them directly, so the caller observes the same bytes at the same addresses.
+    ///
+    /// Running it after every staged round is required rather than optional: the next round's
+    /// region may belong to the next window, and each window is reused only once its bytes have
+    /// reached the caller.
     ///
     /// # Safety
     ///
-    /// `produced` must be the number of bytes the core wrote through the *last* region
-    /// [`OutputScratch::region`] returned -- every earlier round's count having been recorded
-    /// with [`OutputScratch::advance`] -- that region must no longer be in use, and the
-    /// caller's `next_out` must still be writable for `avail_out` bytes -- the same
-    /// obligation that let [`OutputScratch::stage`] record it.
-    pub(crate) unsafe fn commit(&self, produced: usize) {
+    /// Every region [`OutputScratch::region`] returned must be out of use, `before` must be the
+    /// count that round's region was taken with, and the caller's output range must still be
+    /// writable to `after` bytes -- the same obligation that let [`OutputScratch::stage`]
+    /// record `base`.
+    pub(crate) unsafe fn commit(&self, before: usize, after: usize) {
         let Some(block) = self.bytes.as_ref() else {
             return;
         };
-        // Earlier rounds' output, plus this one's. `advance` accounts for every round but the
-        // last, whose count arrives here, so the sum is the whole production.
-        let produced = self.produced.saturating_add(produced);
-        let staged = block.as_slice();
-        // `min` rather than an assertion: the count comes from the core's own cursor into a
-        // region built over this block, so it cannot exceed the length -- and the library
-        // may not contain an operation that could panic (AAP 0.7.1 (f)), so the impossible
-        // case is clamped rather than checked.
-        let Some(written) = staged.get(..produced.min(staged.len())) else {
-            return;
-        };
-        if written.is_empty() {
+        let count = after.saturating_sub(before);
+        if count == 0 {
             return;
         }
+        let lo = before.saturating_sub(self.window_start(before));
+        let staged = block.as_slice();
+        // `get` rather than an index: the counts come from the caller's own stream accounting
+        // over regions built from this block, so the range cannot leave it -- and the library
+        // may not contain an operation that could panic (AAP 0.7.1 (f)), so the impossible case
+        // reports nothing rather than aborting.
+        let Some(written) = lo
+            .checked_add(count)
+            .and_then(|hi| staged.get(lo..hi))
+            .filter(|written| !written.is_empty())
+        else {
+            return;
+        };
         // SAFETY: unsafe-site category 2 -- one copy from storage this value owns into the
-        // caller's output range. The source is `written.len()` initialised bytes of this
-        // block; the destination is the caller's `next_out`, writable for `self.extent`
-        // bytes by this function's contract and for at least `written.len()` of them
-        // because every region the core wrote through was a window of this block, whose
-        // whole length is that same extent. The
-        // two are separate allocations -- the block came from the allocator, the
-        // destination is the caller's -- so they cannot overlap, and no Rust reference to
-        // either exists: the region is out of use by contract, and the destination is
-        // reached through the caller's own pointer.
+        // caller's output range. `before` is at most `after`, which this function's contract
+        // makes writable from `base`, so the offset lands inside the caller's buffer; the
+        // destination is writable for `count` bytes for the same reason. The source is
+        // `written.len()` initialised bytes of this block. The two are separate allocations --
+        // the block came from the allocator, the destination is the caller's -- so they cannot
+        // overlap, and no Rust reference to either exists: every region is out of use by
+        // contract, and the destination is reached through the caller's own pointer.
         unsafe {
-            core::ptr::copy_nonoverlapping(written.as_ptr(), self.destination, written.len());
+            core::ptr::copy_nonoverlapping(written.as_ptr(), self.base.add(before), written.len());
         }
     }
 
     /// Returns the block to the allocator it came from.
     ///
-    /// Must be called with the allocator [`OutputScratch::stage`] was given, after
+    /// Must be called with the allocator [`OutputScratch::stage`] was given, after the last
     /// [`OutputScratch::commit`] and after every borrow taken through
     /// [`OutputScratch::region`] has ended.
     pub(crate) fn release(&mut self, allocator: &StreamAllocator) {
         allocator.deallocate_bytes(&mut self.bytes);
     }
+}
+
+/// Which part of the caller's output range one round of the core writes through.
+///
+/// See [`OutputScratch::segment`], which decides it, and [`OutputScratch::stage`] for why
+/// there are three parts rather than one.
+#[cfg(feature = "libz-compat")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum OutputSegment {
+    /// The caller's own buffer, from its current `next_out`, for at most `cap` bytes.
+    ///
+    /// [`usize::MAX`] means "no cap", which is what every round of a call with no staging at
+    /// all gets -- and is why such a call is one round over one region, exactly as it was
+    /// before segments existed.
+    Caller {
+        /// The largest number of bytes this round may be offered.
+        cap: usize,
+    },
+    /// The staging block, through [`OutputScratch::region`], whose unwritten tail is `len`
+    /// bytes long.
+    ///
+    /// The length is reported here as well as being the region's own, because a caller that
+    /// hands the block to a helper by mutable reference cannot measure the region afterwards
+    /// -- and the length is what decides whether the round stopped at a segment boundary.
+    Staged {
+        /// The number of bytes this round may be offered.
+        len: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
